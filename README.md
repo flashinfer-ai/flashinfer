@@ -1,2 +1,3 @@
-# KV-Parallel-FlashAttention
-kv_parallel_flashattn
+# FlashInfer: Accelerate FlashAttention Inference with KV-Parallelism
+
+

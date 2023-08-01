@@ -1,0 +1,28 @@
+cmake_minimum_required(VERSION 3.18)
+project(flashinfer CUDA CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CUDA_STANDARD 17)
+
+set(CMAKE_CUDA_ARCHITECTURES native)
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules")
+add_subdirectory(3rdparty/nvbench)
+add_subdirectory(3rdparty/googletest)
+find_package(Thrust REQUIRED)
+
+set(
+  FLASHINFER_INCLUDE_DIR
+  ${PROJECT_SOURCE_DIR}/include
+)
+
+file(GLOB_RECURSE BENCHMAKR_SRCS ${PROJECT_SOURCE_DIR}/src/bench.cu)
+add_executable(flashinfer_benchmark ${BENCHMAKR_SRCS})
+target_include_directories(flashinfer_benchmark PRIVATE ${FLASHINFER_INCLUDE_DIR})
+target_include_directories(flashinfer_benchmark PRIVATE ${PROJECT_SOURCE_DIR}/3rdparty/nvbench)
+target_link_libraries(flashinfer_benchmark PRIVATE nvbench::main)
+
+file(GLOB_RECURSE TEST_SRCS ${PROJECT_SOURCE_DIR}/src/test.cu)
+add_executable(flashinfer_tests ${TEST_SRCS})
+target_include_directories(flashinfer_tests PRIVATE ${FLASHINFER_INCLUDE_DIR})
+target_include_directories(flashinfer_tests PRIVATE ${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
+target_link_libraries(flashinfer_tests PRIVATE gtest gtest_main)
