@@ -10,9 +10,9 @@ void bench_kv_parallel_flashattn_decode(nvbench::state &state) {
   thrust::device_vector<dtype_in> K(seq_len * num_heads * head_dim);
   thrust::device_vector<dtype_in> V(seq_len * num_heads * head_dim);
   thrust::device_vector<dtype_out> O(num_heads * head_dim);
-  thrust::device_vector<float> m_global(num_heads * seq_len);
-  thrust::device_vector<float> d_global(num_heads * seq_len);
-  thrust::device_vector<int> mutex(num_heads * seq_len);
+  thrust::device_vector<float> m_global(num_heads * head_dim);
+  thrust::device_vector<float> d_global(num_heads * head_dim);
+  thrust::device_vector<int> mutex(num_heads * head_dim);
 
   // Provide throughput information:
   state.add_global_memory_reads<dtype_in>(num_heads * head_dim + 2 * seq_len * num_heads * head_dim,
@@ -40,7 +40,7 @@ CREATE_BENCH_F16F16(2048, 32, 128);
 CREATE_BENCH_F16F16(4096, 32, 128);
 CREATE_BENCH_F16F16(8192, 32, 128);
 CREATE_BENCH_F16F16(16384, 32, 128);
-CREATE_BENCH_F16F16(32768, 32, 128);
+CREATE_BENCH_F16F16(32768, 32, 256);
 
 NVBENCH_BENCH(bench_kv_parallel_flashattn_decode_f16f16_128_32_128);
 NVBENCH_BENCH(bench_kv_parallel_flashattn_decode_f16f16_256_32_128);
@@ -50,4 +50,4 @@ NVBENCH_BENCH(bench_kv_parallel_flashattn_decode_f16f16_2048_32_128);
 NVBENCH_BENCH(bench_kv_parallel_flashattn_decode_f16f16_4096_32_128);
 NVBENCH_BENCH(bench_kv_parallel_flashattn_decode_f16f16_8192_32_128);
 NVBENCH_BENCH(bench_kv_parallel_flashattn_decode_f16f16_16384_32_128);
-NVBENCH_BENCH(bench_kv_parallel_flashattn_decode_f16f16_32768_32_128);
+NVBENCH_BENCH(bench_kv_parallel_flashattn_decode_f16f16_32768_32_256);

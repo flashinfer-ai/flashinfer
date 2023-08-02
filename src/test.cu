@@ -12,7 +12,7 @@ thrust::host_vector<dtype_out> cpu_mha_reference(thrust::host_vector<dtype_in> q
   thrust::host_vector<dtype_out> o(num_heads * head_dim);
   thrust::host_vector<float> att(num_heads * seq_len);
   for (int i = 0; i < num_heads; ++i) {
-    float max_val = -MAXFLOAT;
+    float max_val = -INFINITY;
     for (int j = 0; j < seq_len; ++j) {
       att[i * seq_len + j] = 0.;
       for (int k_ = 0; k_ < head_dim; ++k_) {
@@ -49,9 +49,9 @@ void _TestDecodingKernelCorrectness(int num_heads, int seq_len, int head_dim) {
   thrust::device_vector<half> V(seq_len * num_heads * head_dim);
   thrust::device_vector<half> O(num_heads * head_dim);
 
-  thrust::device_vector<float> m_global(num_heads * seq_len);
-  thrust::device_vector<float> d_global(num_heads * seq_len);
-  thrust::device_vector<int> mutex(num_heads * seq_len);
+  thrust::device_vector<float> m_global(num_heads * head_dim);
+  thrust::device_vector<float> d_global(num_heads * head_dim);
+  thrust::device_vector<int> mutex(num_heads * head_dim);
 
   utils::thrust_normal_init(Q);
   utils::thrust_normal_init(K);
@@ -88,9 +88,8 @@ void _TestDecodingKernelCorrectness(int num_heads, int seq_len, int head_dim) {
 
 TEST(FlashInferCorrectnessTest, DecodingKernelCorrectnessTest) {
   for (int num_heads : {32}) {
-    for (int seq_len : {129, 257, 512, 1024, 2048, 4096, 8192, 16384, 32768}) {
-      //   for (int head_dim : {64, 128, 256}) {
-      for (int head_dim : {128}) {
+    for (int seq_len : {1, 3, 9, 27, 81, 129, 257, 512, 1024, 2048, 4096, 8192, 16384, 32768}) {
+      for (int head_dim : {64, 128, 256}) {
         _TestDecodingKernelCorrectness(num_heads, seq_len, head_dim);
       }
     }
