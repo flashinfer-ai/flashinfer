@@ -59,7 +59,7 @@ __global__ void decoding_kernel(DTypeIn *__restrict__ q, DTypeIn *__restrict__ k
   int num_heads = gridDim.x;
 
   __shared__ DTypeIn q_smem[128];
-  __shared__ float qk_smem[128];
+  __shared__ float qk_smem[kv_chunk_size];
 
   float m = -MAXFLOAT;
   float d = 0;
@@ -181,10 +181,11 @@ void decoding_dispatch(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut *o, float *m
   // skip: shape check
   int suggested_kv_chunk_size = 1;
   const int max_num_threadblocks = 1024;
-  while (((seq_len + suggested_kv_chunk_size - 1) / suggested_kv_chunk_size) * head_dim >
+  while (((seq_len + suggested_kv_chunk_size - 1) / suggested_kv_chunk_size) * num_heads >
          max_num_threadblocks) {
     suggested_kv_chunk_size *= 2;
   }
+  // std::cout << "suggested_kv_chunk_size: " << suggested_kv_chunk_size << std::endl;
 
   dim3 nblks = dim3(num_heads, (seq_len + suggested_kv_chunk_size - 1) / suggested_kv_chunk_size);
   dim3 nthrs = dim3(32, head_dim / 32);
