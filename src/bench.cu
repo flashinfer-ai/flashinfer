@@ -40,7 +40,7 @@ CREATE_BENCH_F16F16(2048, 32, 128);
 CREATE_BENCH_F16F16(4096, 32, 128);
 CREATE_BENCH_F16F16(8192, 32, 128);
 CREATE_BENCH_F16F16(16384, 32, 128);
-CREATE_BENCH_F16F16(32768, 32, 256);
+CREATE_BENCH_F16F16(32768, 32, 128);
 
 NVBENCH_BENCH(bench_kv_parallel_flashattn_decode_f16f16_128_32_128);
 NVBENCH_BENCH(bench_kv_parallel_flashattn_decode_f16f16_256_32_128);
@@ -50,4 +50,4 @@ NVBENCH_BENCH(bench_kv_parallel_flashattn_decode_f16f16_2048_32_128);
 NVBENCH_BENCH(bench_kv_parallel_flashattn_decode_f16f16_4096_32_128);
 NVBENCH_BENCH(bench_kv_parallel_flashattn_decode_f16f16_8192_32_128);
 NVBENCH_BENCH(bench_kv_parallel_flashattn_decode_f16f16_16384_32_128);
-NVBENCH_BENCH(bench_kv_parallel_flashattn_decode_f16f16_32768_32_256);
+NVBENCH_BENCH(bench_kv_parallel_flashattn_decode_f16f16_32768_32_128);

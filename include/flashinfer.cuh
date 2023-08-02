@@ -13,22 +13,53 @@ namespace flashinfer {
 namespace {
 
 template <typename T>
-__device__ T warpReduceSum(T val) {
+__device__ T warpReduceSum(T val, unsigned int mask = 0xffffffff) {
 #pragma unroll
   for (int offset = warpSize / 2; offset > 0; offset /= 2) {
-    val += __shfl_down_sync(0xffffffff, val, offset);
+    val += __shfl_down_sync(mask, val, offset);
   }
-  val = __shfl_sync(0xffffffff, val, 0);
+  val = __shfl_sync(mask, val, 0);
   return val;
 }
 
+template <int num_warps>
+__device__ __forceinline__ float crossWarpReduceSum(volatile float *warp_local) {
+  return 0.f;
+}
+
+template <>
+__device__ __forceinline__ float crossWarpReduceSum<1>(volatile float *warp_local) {
+  return warp_local[0];
+}
+
+template <>
+__device__ __forceinline__ float crossWarpReduceSum<2>(volatile float *warp_local) {
+  return warp_local[0] + warp_local[1];
+}
+
+template <>
+__device__ __forceinline__ float crossWarpReduceSum<4>(volatile float *warp_local) {
+  return warp_local[0] + warp_local[1] + warp_local[2] + warp_local[3];
+}
+
+template <>
+__device__ __forceinline__ float crossWarpReduceSum<8>(volatile float *warp_local) {
+  return warp_local[0] + warp_local[1] + warp_local[2] + warp_local[3] +\
+         warp_local[4] + warp_local[5] + warp_local[6] + warp_local[7];
+}
+
+// template <typename T>
+// __device__ __forceinline__ T crossWarpReduceSum<1, T>(volatile T *warp_local) {
+//   return warp_local[0];
+// }
+
 }  // namespace
 
-template <typename DTypeIn>
+template <int num_warps, typename DTypeIn>
 __device__ __forceinline__ void update_local_states(
     float &m, float &d, float &o_local, DTypeIn *kv_smem, DTypeIn *q_smem, int head_dim,
     int compute_stage_idx, cooperative_groups::thread_block &block, int batch_size,
-    size_t *k_shared_offset, size_t *v_shared_offset, volatile float *x_warp_local) {
+    const size_t *k_shared_offset, const size_t *v_shared_offset, volatile float *x_warp_local) {
 #pragma unroll
   for (int j = 0; j < batch_size; ++j) {
     float x =
@@ -36,11 +67,7 @@ __device__ __forceinline__ void update_local_states(
         float(q_smem[block.thread_rank()]);
     x_warp_local[threadIdx.y] = warpReduceSum(x);
     block.sync();
-    x = 0.f;
-#pragma unroll
-    for (int k = 0; k < blockDim.y; ++k) {
-      x += x_warp_local[k];
-    }
+    x = crossWarpReduceSum<num_warps>(x_warp_local);
     float m_prev = m, d_prev = d;
     m = max(m, x);
     d = d * exp(m_prev - m) + exp(x - m);
@@ -64,7 +91,7 @@ __device__ __forceinline__ void update_local_states(
  * \param head_dim A integer indicates the head dimension
  * \param kv_chunk_size A integer indicates the kv-chunk size
  */
-template <typename DTypeIn, typename DTypeOut>
+template <int num_warps, typename DTypeIn, typename DTypeOut>
 __global__ void decoding_kernel(DTypeIn *__restrict__ q, DTypeIn *__restrict__ k,
                                 DTypeIn *__restrict__ v, DTypeOut *__restrict__ o,
                                 float *__restrict__ m_global, float *__restrict__ d_global,
@@ -130,16 +157,18 @@ __global__ void decoding_kernel(DTypeIn *__restrict__ q, DTypeIn *__restrict__ k
 
     // pipeline stage 1: compute m, d, o_local
     pipeline.consumer_wait();
-    update_local_states(m, d, o_local, kv_smem, q_smem, head_dim, compute_stage_idx, block,
-                        batch_size, k_shared_offset, v_shared_offset, x_warp_local);
+    update_local_states<num_warps>(m, d, o_local, kv_smem, q_smem, head_dim, compute_stage_idx,
+                                   block, batch_size, k_shared_offset, v_shared_offset,
+                                   x_warp_local);
     pipeline.consumer_release();
     compute_stage_idx ^= 1;
     copy_stage_idx ^= 1;
   }
 
   pipeline.consumer_wait();
-  update_local_states(m, d, o_local, kv_smem, q_smem, head_dim, compute_stage_idx, block,
-                      effective_batch_size, k_shared_offset, v_shared_offset, x_warp_local);
+  update_local_states<num_warps>(m, d, o_local, kv_smem, q_smem, head_dim, compute_stage_idx, block,
+                                 effective_batch_size, k_shared_offset, v_shared_offset,
+                                 x_warp_local);
   pipeline.consumer_release();
   block.sync();
 
@@ -166,9 +195,9 @@ __global__ void decoding_kernel(DTypeIn *__restrict__ q, DTypeIn *__restrict__ k
 inline int get_heuristic_max_num_threadblocks(int seq_len) {
   if (seq_len <= 1024) {
     return 256;
-  } else if (seq_len <= 2048) {
-    return 512;
   } else if (seq_len <= 4096) {
+    return 512;
+  } else if (seq_len <= 8192) {
     return 1024;
   } else {
     return 2048;
@@ -178,6 +207,8 @@ inline int get_heuristic_max_num_threadblocks(int seq_len) {
 template <typename DTypeIn, typename DTypeOut>
 void decoding_dispatch(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut *o, float *m_global,
                        float *d_global, int *mutex, int num_heads, int seq_len, int head_dim) {
+  assert(head_dim % 32 == 0);
+  assert(head_dim < 1024);
   int max_num_threadblocks = get_heuristic_max_num_threadblocks(seq_len);
   int suggested_kv_chunk_size = 16;
   while (((seq_len + suggested_kv_chunk_size - 1) / suggested_kv_chunk_size) * num_heads >
@@ -188,11 +219,34 @@ void decoding_dispatch(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut *o, float *m
   dim3 nblks = dim3(num_heads, (seq_len + suggested_kv_chunk_size - 1) / suggested_kv_chunk_size);
   dim3 nthrs = dim3(32, head_dim / 32);
   size_t shmem_size =
-      sizeof(DTypeIn) * (4 * 4 * head_dim + head_dim) * sizeof(DTypeIn) + sizeof(float) * nblks.y;
-  auto kernel = decoding_kernel<DTypeIn, DTypeOut>;
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536);
-  kernel<<<nblks, nthrs, shmem_size>>>(q, k, v, o, m_global, d_global, mutex, seq_len, head_dim,
-                                       suggested_kv_chunk_size);
+      sizeof(DTypeIn) * (4 * 4 * head_dim + head_dim) * sizeof(DTypeIn) + sizeof(float) * nthrs.y;
+
+  if (nthrs.y == 1) {
+    auto kernel = decoding_kernel<1, DTypeIn, DTypeOut>;
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536);
+    kernel<<<nblks, nthrs, shmem_size>>>(q, k, v, o, m_global, d_global, mutex, seq_len, head_dim,
+                                         suggested_kv_chunk_size);
+  } else if (nthrs.y == 2) {
+    auto kernel = decoding_kernel<2, DTypeIn, DTypeOut>;
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536);
+    kernel<<<nblks, nthrs, shmem_size>>>(q, k, v, o, m_global, d_global, mutex, seq_len, head_dim,
+                                         suggested_kv_chunk_size);
+
+  } else if (nthrs.y == 4) {
+    auto kernel = decoding_kernel<4, DTypeIn, DTypeOut>;
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536);
+    kernel<<<nblks, nthrs, shmem_size>>>(q, k, v, o, m_global, d_global, mutex, seq_len, head_dim,
+                                         suggested_kv_chunk_size);
+
+  } else if (nthrs.y == 8) {
+    auto kernel = decoding_kernel<8, DTypeIn, DTypeOut>;
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536);
+    kernel<<<nblks, nthrs, shmem_size>>>(q, k, v, o, m_global, d_global, mutex, seq_len, head_dim,
+                                         suggested_kv_chunk_size);
+
+  } else {
+    std::cerr << "Unsupported head_dim: " << head_dim << std::endl;
+  }
 }
 
 }  // namespace flashinfer
