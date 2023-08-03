@@ -36,8 +36,8 @@ __device__ __forceinline__ T crossWarpReduceSum(volatile T *warp_local) {
 
 template <int num_warps, typename DTypeIn>
 __device__ __forceinline__ void update_local_states(
-    float &m, float &d, float &o_local, DTypeIn *kv_smem, DTypeIn *q_smem, int head_dim,
-    int compute_stage_idx, cooperative_groups::thread_block &block, int batch_size,
+    float &m, float &d, float &o_local, DTypeIn *kv_smem, DTypeIn *q_smem, float sm_scale,
+    int head_dim, int compute_stage_idx, cooperative_groups::thread_block &block, int batch_size,
     const size_t *k_shared_offset, const size_t *v_shared_offset, volatile float *x_warp_local) {
 #pragma unroll
   for (int j = 0; j < batch_size; ++j) {
@@ -46,7 +46,7 @@ __device__ __forceinline__ void update_local_states(
         float(q_smem[block.thread_rank()]);
     x_warp_local[threadIdx.y] = warpReduceSum(x);
     block.sync();
-    x = crossWarpReduceSum<num_warps>(x_warp_local);
+    x = crossWarpReduceSum<num_warps>(x_warp_local) * sm_scale;
     float m_prev = m, d_prev = d;
     m = max(m, x);
     d = d * exp(m_prev - m) + exp(x - m);
@@ -65,7 +65,8 @@ __device__ __forceinline__ void update_local_states(
  * \param o [num_heads, head_dim] The output matrix
  * \param m_global [num_heads, head_dim] The m state used in online-softmax
  * \param d_global [num_heads, head_dim] The d state used in online-softmax
- * \param mutex [num_heads, head_dim] The mutex used to sync m/d/o for all threadblocks.
+ * \param mutex [num_heads, head_dim] The mutex used to sync m/d/o for all threadblocks
+ * \param sm_scale A float indicates the scale applied to pre-softmax logits
  * \param seq_len A integer indicates the sequence length
  * \param head_dim A integer indicates the head dimension
  * \param kv_chunk_size A integer indicates the kv-chunk size
@@ -74,7 +75,7 @@ template <int num_warps, typename DTypeIn, typename DTypeOut>
 __global__ void decoding_kernel(DTypeIn *__restrict__ q, DTypeIn *__restrict__ k,
                                 DTypeIn *__restrict__ v, DTypeOut *__restrict__ o,
                                 float *__restrict__ m_global, float *__restrict__ d_global,
-                                int *__restrict__ mutex, int seq_len, int head_dim,
+                                int *__restrict__ mutex, float sm_scale, int seq_len, int head_dim,
                                 int kv_chunk_size) {
   auto block = cooperative_groups::this_thread_block();
 
@@ -136,18 +137,18 @@ __global__ void decoding_kernel(DTypeIn *__restrict__ q, DTypeIn *__restrict__ k
 
     // pipeline stage 1: compute m, d, o_local
     pipeline.consumer_wait();
-    update_local_states<num_warps>(m, d, o_local, kv_smem, q_smem, head_dim, compute_stage_idx,
-                                   block, batch_size, k_shared_offset, v_shared_offset,
-                                   x_warp_local);
+    update_local_states<num_warps>(m, d, o_local, kv_smem, q_smem, sm_scale, head_dim,
+                                   compute_stage_idx, block, batch_size, k_shared_offset,
+                                   v_shared_offset, x_warp_local);
     pipeline.consumer_release();
     compute_stage_idx ^= 1;
     copy_stage_idx ^= 1;
   }
 
   pipeline.consumer_wait();
-  update_local_states<num_warps>(m, d, o_local, kv_smem, q_smem, head_dim, compute_stage_idx, block,
-                                 effective_batch_size, k_shared_offset, v_shared_offset,
-                                 x_warp_local);
+  update_local_states<num_warps>(m, d, o_local, kv_smem, q_smem, sm_scale, head_dim,
+                                 compute_stage_idx, block, effective_batch_size, k_shared_offset,
+                                 v_shared_offset, x_warp_local);
   pipeline.consumer_release();
   block.sync();
 
@@ -185,7 +186,8 @@ inline int get_heuristic_max_num_threadblocks(int seq_len) {
 
 template <typename DTypeIn, typename DTypeOut>
 void decoding_dispatch(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut *o, float *m_global,
-                       float *d_global, int *mutex, int num_heads, int seq_len, int head_dim) {
+                       float *d_global, int *mutex, int num_heads, int seq_len, int head_dim,
+                       float sm_scale = 1.f, cudaStream_t stream = nullptr) {
   assert(head_dim % 32 == 0);
   assert(head_dim < 1024);
   int max_num_threadblocks = get_heuristic_max_num_threadblocks(seq_len);
@@ -194,7 +196,6 @@ void decoding_dispatch(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut *o, float *m
          max_num_threadblocks) {
     suggested_kv_chunk_size *= 2;
   }
-
   dim3 nblks = dim3(num_heads, (seq_len + suggested_kv_chunk_size - 1) / suggested_kv_chunk_size);
   dim3 nthrs = dim3(32, head_dim / 32);
   size_t shmem_size =
@@ -202,26 +203,22 @@ void decoding_dispatch(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut *o, float *m
 
   if (nthrs.y == 1) {
     auto kernel = decoding_kernel<1, DTypeIn, DTypeOut>;
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536);
-    kernel<<<nblks, nthrs, shmem_size>>>(q, k, v, o, m_global, d_global, mutex, seq_len, head_dim,
-                                         suggested_kv_chunk_size);
+    kernel<<<nblks, nthrs, shmem_size, stream>>>(q, k, v, o, m_global, d_global, mutex, sm_scale,
+                                                 seq_len, head_dim, suggested_kv_chunk_size);
   } else if (nthrs.y == 2) {
     auto kernel = decoding_kernel<2, DTypeIn, DTypeOut>;
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536);
-    kernel<<<nblks, nthrs, shmem_size>>>(q, k, v, o, m_global, d_global, mutex, seq_len, head_dim,
-                                         suggested_kv_chunk_size);
+    kernel<<<nblks, nthrs, shmem_size, stream>>>(q, k, v, o, m_global, d_global, mutex, sm_scale,
+                                                 seq_len, head_dim, suggested_kv_chunk_size);
 
   } else if (nthrs.y == 4) {
     auto kernel = decoding_kernel<4, DTypeIn, DTypeOut>;
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536);
-    kernel<<<nblks, nthrs, shmem_size>>>(q, k, v, o, m_global, d_global, mutex, seq_len, head_dim,
-                                         suggested_kv_chunk_size);
+    kernel<<<nblks, nthrs, shmem_size, stream>>>(q, k, v, o, m_global, d_global, mutex, sm_scale,
+                                                 seq_len, head_dim, suggested_kv_chunk_size);
 
   } else if (nthrs.y == 8) {
     auto kernel = decoding_kernel<8, DTypeIn, DTypeOut>;
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536);
-    kernel<<<nblks, nthrs, shmem_size>>>(q, k, v, o, m_global, d_global, mutex, seq_len, head_dim,
-                                         suggested_kv_chunk_size);
+    kernel<<<nblks, nthrs, shmem_size, stream>>>(q, k, v, o, m_global, d_global, mutex, sm_scale,
+                                                 seq_len, head_dim, suggested_kv_chunk_size);
 
   } else {
     std::cerr << "Unsupported head_dim: " << head_dim << std::endl;

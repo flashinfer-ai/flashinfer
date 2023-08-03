@@ -8,7 +8,7 @@ template <typename dtype_in, typename dtype_out>
 thrust::host_vector<dtype_out> cpu_mha_reference(thrust::host_vector<dtype_in> q,
                                                  thrust::host_vector<dtype_in> k,
                                                  thrust::host_vector<dtype_in> v, int num_heads,
-                                                 int seq_len, int head_dim) {
+                                                 int seq_len, int head_dim, float sm_scale = 1.f) {
   thrust::host_vector<dtype_out> o(num_heads * head_dim);
   thrust::host_vector<float> att(num_heads * seq_len);
   for (int i = 0; i < num_heads; ++i) {
@@ -16,8 +16,8 @@ thrust::host_vector<dtype_out> cpu_mha_reference(thrust::host_vector<dtype_in> q
     for (int j = 0; j < seq_len; ++j) {
       att[i * seq_len + j] = 0.;
       for (int k_ = 0; k_ < head_dim; ++k_) {
-        att[i * seq_len + j] +=
-            float(q[i * head_dim + k_]) * float(k[j * num_heads * head_dim + i * head_dim + k_]);
+        att[i * seq_len + j] += float(q[i * head_dim + k_]) *
+                                float(k[j * num_heads * head_dim + i * head_dim + k_]) * sm_scale;
       }
       max_val = std::max(max_val, att[i * seq_len + j]);
     }
