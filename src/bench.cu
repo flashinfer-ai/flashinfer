@@ -32,6 +32,8 @@ void bench_kv_parallel_flashattn_decode(nvbench::state &state) {
   auto bench_kv_parallel_flashattn_decode_f16f16_##SEQLEN##_##NUMHEADS##_##HEADDIM = \
       bench_kv_parallel_flashattn_decode<half, half, SEQLEN, NUMHEADS, HEADDIM>;
 
+CREATE_BENCH_F16F16(32, 32, 128);
+CREATE_BENCH_F16F16(64, 32, 128);
 CREATE_BENCH_F16F16(128, 32, 128);
 CREATE_BENCH_F16F16(256, 32, 128);
 CREATE_BENCH_F16F16(512, 32, 128);
@@ -42,6 +44,8 @@ CREATE_BENCH_F16F16(8192, 32, 128);
 CREATE_BENCH_F16F16(16384, 32, 128);
 CREATE_BENCH_F16F16(32768, 32, 128);
 
+NVBENCH_BENCH(bench_kv_parallel_flashattn_decode_f16f16_32_32_128);
+NVBENCH_BENCH(bench_kv_parallel_flashattn_decode_f16f16_64_32_128);
 NVBENCH_BENCH(bench_kv_parallel_flashattn_decode_f16f16_128_32_128);
 NVBENCH_BENCH(bench_kv_parallel_flashattn_decode_f16f16_256_32_128);
 NVBENCH_BENCH(bench_kv_parallel_flashattn_decode_f16f16_512_32_128);

@@ -22,36 +22,15 @@ __device__ T warpReduceSum(T val, unsigned int mask = 0xffffffff) {
   return val;
 }
 
-template <int num_warps>
-__device__ __forceinline__ float crossWarpReduceSum(volatile float *warp_local) {
-  return 0.f;
+template <int num_warps, typename T>
+__device__ __forceinline__ T crossWarpReduceSum(volatile T *warp_local) {
+  T sum = 0.f;
+#pragma unroll
+  for (int i = 0; i < num_warps; ++i) {
+    sum += warp_local[i];
+  }
+  return sum;
 }
-
-template <>
-__device__ __forceinline__ float crossWarpReduceSum<1>(volatile float *warp_local) {
-  return warp_local[0];
-}
-
-template <>
-__device__ __forceinline__ float crossWarpReduceSum<2>(volatile float *warp_local) {
-  return warp_local[0] + warp_local[1];
-}
-
-template <>
-__device__ __forceinline__ float crossWarpReduceSum<4>(volatile float *warp_local) {
-  return warp_local[0] + warp_local[1] + warp_local[2] + warp_local[3];
-}
-
-template <>
-__device__ __forceinline__ float crossWarpReduceSum<8>(volatile float *warp_local) {
-  return warp_local[0] + warp_local[1] + warp_local[2] + warp_local[3] +\
-         warp_local[4] + warp_local[5] + warp_local[6] + warp_local[7];
-}
-
-// template <typename T>
-// __device__ __forceinline__ T crossWarpReduceSum<1, T>(volatile T *warp_local) {
-//   return warp_local[0];
-// }
 
 }  // namespace
 
