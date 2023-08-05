@@ -65,7 +65,7 @@ void _TestDecodingKernelCorrectness(int num_heads, int seq_len, int head_dim) {
       cpu_mha_reference<half, half>(thrust::host_vector<half>(Q), thrust::host_vector<half>(K),
                                     thrust::host_vector<half>(V), num_heads, seq_len, head_dim);
 
-  flashinfer::decoding_dispatch(
+  flashinfer::SingleDecodeWithKVCache(
       thrust::raw_pointer_cast(Q.data()), thrust::raw_pointer_cast(K.data()),
       thrust::raw_pointer_cast(V.data()), thrust::raw_pointer_cast(O.data()),
       thrust::raw_pointer_cast(m_global.data()), thrust::raw_pointer_cast(d_global.data()),

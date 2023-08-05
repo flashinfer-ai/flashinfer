@@ -20,7 +20,7 @@ void bench_flashinfer_decode(nvbench::state &state) {
   state.add_global_memory_writes<dtype_out>(num_heads * head_dim);
 
   state.exec([&](nvbench::launch &launch) {
-    flashinfer::decoding_dispatch(
+    flashinfer::SingleDecodeWithKVCache(
         thrust::raw_pointer_cast(Q.data()), thrust::raw_pointer_cast(K.data()),
         thrust::raw_pointer_cast(V.data()), thrust::raw_pointer_cast(O.data()),
         thrust::raw_pointer_cast(m_global.data()), thrust::raw_pointer_cast(d_global.data()),
