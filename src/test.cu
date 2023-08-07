@@ -24,8 +24,9 @@ template <typename dtype_in, typename dtype_out>
 thrust::host_vector<dtype_out> cpu_mha_reference(
     const thrust::host_vector<dtype_in>& q, thrust::host_vector<dtype_in>& k,
     const thrust::host_vector<dtype_in>& v, int num_heads, int seq_len, int head_dim,
-    float sm_scale = 1.f, flashinfer::RotaryMode rotary_mode = flashinfer::RotaryMode::kNone,
+    flashinfer::RotaryMode rotary_mode = flashinfer::RotaryMode::kNone,
     float rotary_pi_inv_ratio = 1.f) {
+  float sm_scale = 1.f / std::sqrt(float(head_dim));
   thrust::host_vector<dtype_out> o(num_heads * head_dim);
   thrust::host_vector<float> att(num_heads * seq_len);
   thrust::host_vector<dtype_in> q_rotary_local(head_dim);
@@ -113,10 +114,10 @@ void _TestDecodingKernelCorrectness(int num_heads, int seq_len, int head_dim,
   thrust::device_vector<float> d_global(num_heads * head_dim);
   thrust::device_vector<int> mutex(num_heads * head_dim);
 
-  // utils::thrust_normal_init(Q);
-  utils::thrust_zero_init(Q);
+  utils::thrust_normal_init(Q);
   utils::thrust_normal_init(K);
   utils::thrust_normal_init(V);
+  utils::thrust_zero_init(O);
   thrust::fill(m_global.begin(), m_global.end(), -INFINITY);
   thrust::fill(d_global.begin(), d_global.end(), 0.f);
   thrust::fill(mutex.begin(), mutex.end(), 0);
@@ -124,13 +125,13 @@ void _TestDecodingKernelCorrectness(int num_heads, int seq_len, int head_dim,
   thrust::host_vector<T> K_ref_host = K;
   thrust::host_vector<T> o_ref_host =
       cpu_mha_reference<T, T>(thrust::host_vector<T>(Q), K_ref_host, thrust::host_vector<T>(V),
-                              num_heads, seq_len, head_dim, 1.f, rotary_mode);
+                              num_heads, seq_len, head_dim, rotary_mode);
 
   flashinfer::SingleDecodeWithKVCache(
       thrust::raw_pointer_cast(Q.data()), thrust::raw_pointer_cast(K.data()),
       thrust::raw_pointer_cast(V.data()), thrust::raw_pointer_cast(O.data()),
       thrust::raw_pointer_cast(m_global.data()), thrust::raw_pointer_cast(d_global.data()),
-      thrust::raw_pointer_cast(mutex.data()), num_heads, seq_len, head_dim, 1.f, rotary_mode);
+      thrust::raw_pointer_cast(mutex.data()), num_heads, seq_len, head_dim, rotary_mode);
 
   thrust::host_vector<T> o_host = O;
   thrust::host_vector<T> K_host = K;
@@ -164,8 +165,8 @@ TEST(FlashInferCorrectnessTest, DecodingKernelCorrectnessTest) {
     for (int seq_len : {1, 3, 9, 27, 81, 129, 257, 512, 1024, 2048, 4096, 8192, 16384, 32768}) {
       for (int head_dim : {64, 128, 256}) {
         for (unsigned int rotary_mode : {0U, 1U, 2U}) {
-          _TestDecodingKernelCorrectness<half>(num_heads, seq_len, head_dim,
-                                               flashinfer::RotaryMode(rotary_mode));
+          _TestDecodingKernelCorrectness<float>(num_heads, seq_len, head_dim,
+                                                flashinfer::RotaryMode(rotary_mode));
         }
       }
     }
