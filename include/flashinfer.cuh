@@ -318,34 +318,33 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     }                                                                   \
   }
 
-#define SWITCH_H_CHUNK_SIZE(h_chunk_size, H_CHUNK_SIZE, ...)		\
-  switch(h_chunk_size) {                                        \
-    case 1: {                                                   \
-      constexpr int H_CHUNK_SIZE = 1;                           \
-      __VA_ARGS__                                               \
-      break;                                                    \
-    }                                                           \
-    case 2: {                                                   \
-      constexpr int H_CHUNK_SIZE = 2;                           \
-      __VA_ARGS__                                               \
-      break;                                                    \
-    }                                                           \
-    case 4: {                                                   \
-      constexpr int H_CHUNK_SIZE = 4;                           \
-      __VA_ARGS__                                               \
-      break;                                                    \
-    }                                                           \
-    case 8: {                                                   \
-      constexpr int H_CHUNK_SIZE = 8;                           \
-      __VA_ARGS__                                               \
-      break;                                                    \
-    }                                                           \
-    default: {                                                  \
+#define SWITCH_H_CHUNK_SIZE(h_chunk_size, H_CHUNK_SIZE, ...)                  \
+  switch (h_chunk_size) {                                                     \
+    case 1: {                                                                 \
+      constexpr int H_CHUNK_SIZE = 1;                                         \
+      __VA_ARGS__                                                             \
+      break;                                                                  \
+    }                                                                         \
+    case 2: {                                                                 \
+      constexpr int H_CHUNK_SIZE = 2;                                         \
+      __VA_ARGS__                                                             \
+      break;                                                                  \
+    }                                                                         \
+    case 4: {                                                                 \
+      constexpr int H_CHUNK_SIZE = 4;                                         \
+      __VA_ARGS__                                                             \
+      break;                                                                  \
+    }                                                                         \
+    case 8: {                                                                 \
+      constexpr int H_CHUNK_SIZE = 8;                                         \
+      __VA_ARGS__                                                             \
+      break;                                                                  \
+    }                                                                         \
+    default: {                                                                \
       std::cerr << "Unsupported h_chunk_size: " << h_chunk_size << std::endl; \
       abort();                                                                \
     }                                                                         \
   }
- 
 
 #define SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, ...)                        \
   switch (rotary_mode) {                                                         \
@@ -407,9 +406,10 @@ void SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut *o, fl
   assert(head_dim <= 1024);
   float sm_scale = 1.f / sqrtf(float(head_dim));
   int max_num_threadblocks = get_heuristic_max_num_threadblocks(seq_len);
-  int h_chunk_size = (seq_len <= 64) ? 1: ((seq_len <= 2048) ? 2: 4);
+  int h_chunk_size = (seq_len <= 64) ? 1 : ((seq_len <= 2048) ? 2 : 4);
   int suggested_kv_chunk_size = 4;
-  while (((seq_len + suggested_kv_chunk_size - 1) / suggested_kv_chunk_size) * num_heads / h_chunk_size >
+  while (((seq_len + suggested_kv_chunk_size - 1) / suggested_kv_chunk_size) * num_heads /
+             h_chunk_size >
          max_num_threadblocks) {
     suggested_kv_chunk_size *= 2;
   }
@@ -420,14 +420,16 @@ void SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut *o, fl
                       sizeof(float) * nthrs.y;
 
   SWITCH_NUM_WARPS(
-      nthrs.y, NUM_WARPS, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
-        SWITCH_H_CHUNK_SIZE(h_chunk_size, H_CHUNK_SIZE, {
-        auto kernel = SingleDecodeWithKVCacheKernel<NUM_WARPS, H_CHUNK_SIZE, DTypeIn, DTypeOut, ROTARY_MODE>;
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536);
-        kernel<<<nblks, nthrs, shmem_size, stream>>>(q, k, v, o, m_global, d_global, mutex,
-                                                     sm_scale, seq_len, head_dim,
-                                                     rotary_pi_inv_ratio, suggested_kv_chunk_size);
-      })})});
+      nthrs.y, NUM_WARPS,
+      {SWITCH_ROTARY_MODE(
+          rotary_mode, ROTARY_MODE, {SWITCH_H_CHUNK_SIZE(h_chunk_size, H_CHUNK_SIZE, {
+            auto kernel = SingleDecodeWithKVCacheKernel<NUM_WARPS, H_CHUNK_SIZE, DTypeIn, DTypeOut,
+                                                        ROTARY_MODE>;
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536);
+            kernel<<<nblks, nthrs, shmem_size, stream>>>(
+                q, k, v, o, m_global, d_global, mutex, sm_scale, seq_len, head_dim,
+                rotary_pi_inv_ratio, suggested_kv_chunk_size);
+          })})});
 }
 
 }  // namespace flashinfer
