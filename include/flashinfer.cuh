@@ -374,8 +374,11 @@ inline int get_heuristic_max_num_threadblocks(int seq_len) {
     return 128;
   } else if (seq_len <= 2048) {
     return 256;
+  } else if (seq_len <= 16384) {
+    return 512;
+  } else {
+    return 1024;
   }
-  return 512;
 }
 
 /*!
