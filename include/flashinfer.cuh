@@ -98,35 +98,43 @@ __device__ __forceinline__ float apply_rotary(T *input, int offset, float inv_ra
  * \tparam apply_rotary_to_k A boolean indicates whether to apply rotary positional embeddings to k
  * \tparam DTypeIn A template type indicates the input data type
  */
-template <int num_warps, int h_chunk_size, bool apply_rotary_to_k, typename DTypeIn>
+template <bool compute_qk, int num_warps, int h_chunk_size, bool apply_rotary_to_k,
+          typename DTypeIn>
 __device__ __forceinline__ void update_local_states(
-    float *m, float *d, float *o_local, DTypeIn *kv_smem, float *q_local, float sm_scale,
+    float *m, float *d, float *o_local, float *x, DTypeIn *kv_smem, float *q_local, float sm_scale,
     size_t head_dim, size_t compute_stage_idx, size_t rotary_offset, float rotary_pi_inv_ratio,
-    const size_t *k_shared_offset, const size_t *v_shared_offset, volatile float *x_warp_local) {
+    const size_t *kv_shared_offset, volatile float *x_warp_local) {
   auto block = cooperative_groups::this_thread_block();
+
+  if (compute_qk) {
 #pragma unroll
-  for (size_t j = 0; j < h_chunk_size; ++j) {
-    float k_local = 0.f;
-    if (apply_rotary_to_k) {
-      // do not inplace update
-      k_local = apply_rotary<false>(kv_smem + k_shared_offset[compute_stage_idx] + j * head_dim,
-                                    rotary_offset, rotary_pi_inv_ratio);
-    } else {
-      k_local =
-          float(kv_smem[k_shared_offset[compute_stage_idx] + j * head_dim + block.thread_rank()]);
+    for (size_t j = 0; j < h_chunk_size; ++j) {
+      float k_local = 0.f;
+      if (apply_rotary_to_k) {
+        // do not inplace update
+        k_local = apply_rotary<false>(kv_smem + kv_shared_offset[compute_stage_idx] + j * head_dim,
+                                      rotary_offset, rotary_pi_inv_ratio);
+      } else {
+        k_local = float(
+            kv_smem[kv_shared_offset[compute_stage_idx] + j * head_dim + block.thread_rank()]);
+      }
+      x[j] = k_local * q_local[j];
+      int warp_idx = block.thread_index().y;
+      x_warp_local[warp_idx] = warpReduceSum(x[j]);
+      block.sync();
+      x[j] = crossWarpReduceSum<num_warps>(x_warp_local) * sm_scale;
     }
-    float x = k_local * q_local[j];
-    int warp_idx = block.thread_index().y;
-    x_warp_local[warp_idx] = warpReduceSum(x);
-    block.sync();
-    x = crossWarpReduceSum<num_warps>(x_warp_local) * sm_scale;
-    float m_prev = m[j], d_prev = d[j];
-    m[j] = max(m[j], x);
-    d[j] = d[j] * exp(m_prev - m[j]) + exp(x - m[j]);
-    o_local[j] =
-        o_local[j] * (exp(m_prev - m[j]) * d_prev / d[j]) +
-        float(kv_smem[v_shared_offset[compute_stage_idx] + j * head_dim + block.thread_rank()]) *
-            (exp(x - m[j]) / d[j]);
+  } else {
+#pragma unroll
+    for (size_t j = 0; j < h_chunk_size; ++j) {
+      float m_prev = m[j], d_prev = d[j];
+      m[j] = max(m[j], x[j]);
+      d[j] = d[j] * exp(m_prev - m[j]) + exp(x[j] - m[j]);
+      o_local[j] =
+          o_local[j] * (exp(m_prev - m[j]) * d_prev / d[j]) +
+          float(kv_smem[kv_shared_offset[compute_stage_idx] + j * head_dim + block.thread_rank()]) *
+              (exp(x[j] - m[j]) / d[j]);
+    }
   }
 }
 
@@ -165,14 +173,14 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   size_t head_idx_start = grid.block_index().x * h_chunk_size;
   size_t kv_chunk_idx = grid.block_index().y;
   size_t num_heads = grid.dim_blocks().x * h_chunk_size;
-  constexpr size_t stages_count = 2;
+  constexpr size_t stages_count = 4;
 
   extern __shared__ char smem[];
-  DTypeIn *kv_smem = (DTypeIn *)smem;  // 2 * stages_count * h_chunk_size * head_dim
-  DTypeIn *q_smem = (DTypeIn *)(smem + (2 * stages_count * h_chunk_size * head_dim) *
+  DTypeIn *kv_smem = (DTypeIn *)smem;  // stages_count * h_chunk_size * head_dim
+  DTypeIn *q_smem = (DTypeIn *)(smem + (stages_count * h_chunk_size * head_dim) *
                                            sizeof(DTypeIn));  // h_chunk_size * head_dim
   float *x_warp_local =
-      (float *)(smem + (2 * stages_count * h_chunk_size * head_dim + h_chunk_size * head_dim) *
+      (float *)(smem + (stages_count * h_chunk_size * head_dim + h_chunk_size * head_dim) *
                            sizeof(DTypeIn));
 
   // load q tile
@@ -212,21 +220,24 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   kv_chunk_size = min(kv_chunk_size, seq_len - chunk_start);
 
   // load k tiles and v tiles
-  size_t k_shared_offset[stages_count] = {0U, 2U * h_chunk_size * head_dim};
-  size_t v_shared_offset[stages_count] = {h_chunk_size * head_dim, 3U * h_chunk_size * head_dim};
+  size_t kv_shared_offset[stages_count] = {
+      0U, 1U * h_chunk_size * head_dim, 2U * h_chunk_size * head_dim, 3U * h_chunk_size * head_dim};
 
   // pipelining k/v tiles loading and m/d/o_local computation
   auto pipeline = cuda::make_pipeline();
   pipeline.producer_acquire();
-  cuda::memcpy_async(block, kv_smem + k_shared_offset[0], k_tile,
+  cuda::memcpy_async(block, kv_smem + kv_shared_offset[0], k_tile,
                      sizeof(DTypeIn) * h_chunk_size * head_dim, pipeline);
-  cuda::memcpy_async(block, kv_smem + v_shared_offset[0], v_tile,
+  pipeline.producer_commit();
+  pipeline.producer_acquire();
+  cuda::memcpy_async(block, kv_smem + kv_shared_offset[1], v_tile,
                      sizeof(DTypeIn) * h_chunk_size * head_dim, pipeline);
   pipeline.producer_commit();
 
   float m[h_chunk_size];
   float d[h_chunk_size];
   float o_local[h_chunk_size];
+  float x[h_chunk_size];
 
 #pragma unroll
   for (size_t j = 0; j < h_chunk_size; ++j) {
@@ -235,40 +246,53 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     o_local[j] = 0.f;
   }
 
-  size_t compute_stage_idx = 0, copy_stage_idx = 1;
+  size_t compute_stage_idx = 0, copy_stage_idx = 2;
   size_t batch = 1;
   for (batch = 1; batch < kv_chunk_size; ++batch) {
     // pipeline stage 0: load k/v tiles
     pipeline.producer_acquire();
-    cuda::memcpy_async(block, kv_smem + k_shared_offset[copy_stage_idx],
+    cuda::memcpy_async(block, kv_smem + kv_shared_offset[copy_stage_idx],
                        k_tile + batch * num_heads * head_dim,
                        sizeof(DTypeIn) * h_chunk_size * head_dim, pipeline);
-    cuda::memcpy_async(block, kv_smem + v_shared_offset[copy_stage_idx],
+    pipeline.producer_commit();
+    copy_stage_idx = (copy_stage_idx + 1) % stages_count;
+    pipeline.producer_acquire();
+    cuda::memcpy_async(block, kv_smem + kv_shared_offset[copy_stage_idx],
                        v_tile + batch * num_heads * head_dim,
                        sizeof(DTypeIn) * h_chunk_size * head_dim, pipeline);
     pipeline.producer_commit();
+    copy_stage_idx = (copy_stage_idx + 1) % stages_count;
 
     // pipeline stage 1: compute m, d, o_local
     pipeline.consumer_wait();
-    update_local_states<num_warps, h_chunk_size, rotary_mode == RotaryMode::kApplyRotary>(
-        m, d, o_local, kv_smem, q_local, sm_scale, head_dim, compute_stage_idx,
-        batch + chunk_start - 1, rotary_pi_inv_ratio, k_shared_offset, v_shared_offset,
-        x_warp_local);
+    update_local_states<true, num_warps, h_chunk_size, rotary_mode == RotaryMode::kApplyRotary>(
+        m, d, o_local, x, kv_smem, q_local, sm_scale, head_dim, compute_stage_idx,
+        batch + chunk_start - 1, rotary_pi_inv_ratio, kv_shared_offset, x_warp_local);
     pipeline.consumer_release();
-    compute_stage_idx ^= 1;
-    copy_stage_idx ^= 1;
+    compute_stage_idx = (compute_stage_idx + 1) % stages_count;
+    pipeline.consumer_wait();
+    update_local_states<false, num_warps, h_chunk_size, rotary_mode == RotaryMode::kApplyRotary>(
+        m, d, o_local, x, kv_smem, q_local, sm_scale, head_dim, compute_stage_idx,
+        batch + chunk_start - 1, rotary_pi_inv_ratio, kv_shared_offset, x_warp_local);
+    pipeline.consumer_release();
+    compute_stage_idx = (compute_stage_idx + 1) % stages_count;
   }
 
   pipeline.consumer_wait();
-  update_local_states<num_warps, h_chunk_size, rotary_mode == RotaryMode::kApplyRotary>(
-      m, d, o_local, kv_smem, q_local, sm_scale, head_dim, compute_stage_idx,
-      batch + chunk_start - 1, rotary_pi_inv_ratio, k_shared_offset, v_shared_offset, x_warp_local);
+  update_local_states<true, num_warps, h_chunk_size, rotary_mode == RotaryMode::kApplyRotary>(
+      m, d, o_local, x, kv_smem, q_local, sm_scale, head_dim, compute_stage_idx,
+      batch + chunk_start - 1, rotary_pi_inv_ratio, kv_shared_offset, x_warp_local);
+  pipeline.consumer_release();
+  compute_stage_idx = (compute_stage_idx + 1) % stages_count;
+  pipeline.consumer_wait();
+  update_local_states<false, num_warps, h_chunk_size, rotary_mode == RotaryMode::kApplyRotary>(
+      m, d, o_local, x, kv_smem, q_local, sm_scale, head_dim, compute_stage_idx,
+      batch + chunk_start - 1, rotary_pi_inv_ratio, kv_shared_offset, x_warp_local);
   pipeline.consumer_release();
   block.sync();
 
 #pragma unroll
-  for (int j_ = 0; j_ < h_chunk_size; ++j_) {
-    int j = (j_ + grid.block_rank()) % h_chunk_size;
+  for (int j = 0; j < h_chunk_size; ++j) {
     int head_idx = head_idx_start + j;
     // critical region to sync m/d/o_smem for all ctas
     // acquire lock
@@ -409,7 +433,7 @@ void SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut *o, fl
   assert(head_dim <= 1024);
   float sm_scale = 1.f / sqrtf(float(head_dim));
   int max_num_threadblocks = get_heuristic_max_num_threadblocks(seq_len);
-  int h_chunk_size = (seq_len <= 64) ? 1 : ((seq_len <= 2048) ? 2 : 4);
+  int h_chunk_size = 4;  //(seq_len <= 64) ? 1 : ((seq_len <= 2048) ? 2 : 4);
   int suggested_kv_chunk_size = 4;
   while (((seq_len + suggested_kv_chunk_size - 1) / suggested_kv_chunk_size) * num_heads /
              h_chunk_size >
