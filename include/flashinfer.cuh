@@ -108,7 +108,7 @@ __device__ __forceinline__ void update_local_states(
 
   if (compute_qk) {
 #pragma unroll
-    for (size_t j = 0; j < h_chunk_size; ++j) {
+    for (size_t j = 0; j < 1; ++j) {
       float k_local = 0.f;
       if (apply_rotary_to_k) {
         // do not inplace update
@@ -126,7 +126,7 @@ __device__ __forceinline__ void update_local_states(
     }
   } else {
 #pragma unroll
-    for (size_t j = 0; j < h_chunk_size; ++j) {
+    for (size_t j = 0; j < 1; ++j) {
       float m_prev = m[j], d_prev = d[j];
       m[j] = max(m[j], x[j]);
       d[j] = d[j] * exp(m_prev - m[j]) + exp(x[j] - m[j]);
@@ -296,8 +296,8 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     int head_idx = head_idx_start + j;
     // critical region to sync m/d/o_smem for all ctas
     // acquire lock
-    while (atomicCAS(mutex + head_idx * head_dim + block.thread_rank(), 0, 1) != 0)
-      ;
+    // while (atomicCAS(mutex + head_idx * head_dim + block.thread_rank(), 0, 1) != 0)
+    //  ;
     float m_prev = m_global[head_idx * head_dim + block.thread_rank()];
     float d_prev = d_global[head_idx * head_dim + block.thread_rank()];
     float m_now = max(m_prev, m[j]);
@@ -308,9 +308,9 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
         DTypeOut(float(o[head_idx * head_dim + block.thread_rank()]) * (d_prev / d_now) *
                      exp(m_prev - m_now) +
                  o_local[j] * (d[j] / d_now) * exp(m[j] - m_now));
-    __threadfence();
+    //__threadfence();
     // release lock
-    atomicExch(mutex + head_idx * head_dim + block.thread_rank(), 0);
+    //atomicExch(mutex + head_idx * head_dim + block.thread_rank(), 0);
   }
 }
 
@@ -398,10 +398,12 @@ inline int get_heuristic_max_num_threadblocks(int seq_len) {
     return 128;
   } else if (seq_len <= 2048) {
     return 256;
-  } else if (seq_len <= 16384) {
+  } else if (seq_len <= 4096) {
     return 512;
-  } else {
+  } else if (seq_len <= 8192) {
     return 1024;
+  } else {
+    return 2048;
   }
 }
 
