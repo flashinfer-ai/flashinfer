@@ -101,40 +101,60 @@ __device__ __forceinline__ float apply_rotary(T *input, int offset, float inv_ra
 template <bool compute_qk, int num_warps, int h_chunk_size, bool apply_rotary_to_k,
           typename DTypeIn>
 __device__ __forceinline__ void update_local_states(
-    float *m, float *d, float *o_local, float *x, DTypeIn *kv_smem, float *q_local, float sm_scale,
+    float &m, float &d, float4 &o_local, float &x, DTypeIn *kv_smem, DTypeIn *q_smem, float sm_scale,
     size_t head_dim, size_t compute_stage_idx, size_t rotary_offset, float rotary_pi_inv_ratio,
     const size_t *kv_shared_offset, volatile float *x_warp_local) {
   auto block = cooperative_groups::this_thread_block();
 
   if (compute_qk) {
-#pragma unroll
-    for (size_t j = 0; j < 1; ++j) {
-      float k_local = 0.f;
-      if (apply_rotary_to_k) {
-        // do not inplace update
-        k_local = apply_rotary<false>(kv_smem + kv_shared_offset[compute_stage_idx] + j * head_dim,
-                                      rotary_offset, rotary_pi_inv_ratio);
-      } else {
-        k_local = float(
-            kv_smem[kv_shared_offset[compute_stage_idx] + j * head_dim + block.thread_rank()]);
-      }
-      x[j] = k_local * q_local[j];
-      int warp_idx = block.thread_index().y;
-      x_warp_local[warp_idx] = warpReduceSum(x[j]);
-      block.sync();
-      x[j] = crossWarpReduceSum<num_warps>(x_warp_local) * sm_scale;
-    }
+    size_t j = threadIdx.y;
+    uint2 k_local_pack4 = *(uint2 *)(kv_smem + kv_shared_offset[compute_stage_idx] + j * head_dim +
+                                      threadIdx.x * sizeof(uint2) / sizeof(DTypeIn));
+    uint2 q_local_pack4 = *(uint2 *)(q_smem + j * head_dim + threadIdx.x * sizeof(uint2) / sizeof(DTypeIn));
+    half2 qk_local_pack2 = __hmul2(*(half2 *)(&k_local_pack4.x), *(half2 *)(&q_local_pack4.x)) + __hmul2(*(half2 *)(&k_local_pack4.y), *(half2 *)(&q_local_pack4.y));
+    qk_local_pack2 = warpReduceSum(qk_local_pack2);
+    x = qk_local_pack2.x + qk_local_pack2.y;
+    // x[j] = qk_local_pack2.x + qk_local_pack2.y;
+    // x[j] = warpReduceSum(x[j]);
+    block.sync();
+// #pragma unroll
+//     for (size_t j = 0; j < 1; ++j) {
+//       float k_local = 0.f;
+//       if (apply_rotary_to_k) {
+//         // do not inplace update
+//         k_local = apply_rotary<false>(kv_smem + kv_shared_offset[compute_stage_idx] + j * head_dim,
+//                                       rotary_offset, rotary_pi_inv_ratio);
+//       } else {
+//         k_local = float(
+//             kv_smem[kv_shared_offset[compute_stage_idx] + j * head_dim + block.thread_rank()]);
+//       }
+//       x[j] = k_local * q_local[j];
+//       int warp_idx = block.thread_index().y;
+//       x_warp_local[warp_idx] = warpReduceSum(x[j]);
+//       block.sync();
+//       x[j] = crossWarpReduceSum<num_warps>(x_warp_local) * sm_scale;
+//     }
   } else {
-#pragma unroll
-    for (size_t j = 0; j < 1; ++j) {
-      float m_prev = m[j], d_prev = d[j];
-      m[j] = max(m[j], x[j]);
-      d[j] = d[j] * exp(m_prev - m[j]) + exp(x[j] - m[j]);
-      o_local[j] =
-          o_local[j] * (exp(m_prev - m[j]) * d_prev / d[j]) +
-          float(kv_smem[kv_shared_offset[compute_stage_idx] + j * head_dim + block.thread_rank()]) *
-              (exp(x[j] - m[j]) / d[j]);
-    }
+    size_t j = threadIdx.y;
+    float m_prev = m, d_prev = d;
+    uint2 v_local_pack4 = *(uint2 *)(kv_smem + kv_shared_offset[compute_stage_idx] + j * head_dim +
+                                     threadIdx.x * sizeof(uint2) / sizeof(DTypeIn));
+    m = max(m, x);
+    d = d * exp(m_prev - m) + exp(x - m);
+    o_local.x = o_local.x * (exp(m_prev - m) * d_prev / d) + float((*(half2 *)(&v_local_pack4.x)).x) * (exp(x - m) / d);
+    o_local.y = o_local.y * (exp(m_prev - m) * d_prev / d) + float((*(half2 *)(&v_local_pack4.x)).y) * (exp(x - m) / d);
+    o_local.z = o_local.z * (exp(m_prev - m) * d_prev / d) + float((*(half2 *)(&v_local_pack4.y)).x) * (exp(x - m) / d);
+    o_local.w = o_local.w * (exp(m_prev - m) * d_prev / d) + float((*(half2 *)(&v_local_pack4.y)).y) * (exp(x - m) / d);
+// #pragma unroll
+//     for (size_t j = 0; j < 4; ++j) {
+//       float m_prev = m[j], d_prev = d[j];
+//       m[j] = max(m[j], x[j]);
+//       d[j] = d[j] * exp(m_prev - m[j]) + exp(x[j] - m[j]);
+//       o_local[j] =
+//           o_local[j] * (exp(m_prev - m[j]) * d_prev / d[j]) +
+//           float(kv_smem[kv_shared_offset[compute_stage_idx] + j * head_dim + block.thread_rank()]) *
+//               (exp(x[j] - m[j]) / d[j]);
+//     }
   }
 }
 
@@ -190,14 +210,11 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
         q[(head_idx_start + j) * head_dim + block.thread_rank()];
   }
   block.sync();
-  float q_local[h_chunk_size];
 #pragma unroll
   for (size_t j = 0; j < h_chunk_size; ++j) {
     if (rotary_mode == RotaryMode::kApplyRotary ||
         rotary_mode == RotaryMode::kApplyRotaryUpdateLastK) {
-      q_local[j] = apply_rotary<false>(q_smem + j * head_dim, seq_len - 1, rotary_pi_inv_ratio);
-    } else {
-      q_local[j] = q_smem[j * head_dim + block.thread_rank()];
+      apply_rotary<true>(q_smem + j * head_dim, seq_len - 1, rotary_pi_inv_ratio);
     }
   }
   // apply rotary to q
@@ -234,17 +251,10 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
                      sizeof(DTypeIn) * h_chunk_size * head_dim, pipeline);
   pipeline.producer_commit();
 
-  float m[h_chunk_size];
-  float d[h_chunk_size];
-  float o_local[h_chunk_size];
-  float x[h_chunk_size];
-
-#pragma unroll
-  for (size_t j = 0; j < h_chunk_size; ++j) {
-    m[j] = -INFINITY;
-    d[j] = 0.f;
-    o_local[j] = 0.f;
-  }
+  float m = -INFINITY;
+  float d = 0.f;
+  float4 o_local = make_float4(0.f, 0.f, 0.f, 0.f);
+  float x;
 
   size_t compute_stage_idx = 0, copy_stage_idx = 2;
   size_t batch = 1;
@@ -266,13 +276,13 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     // pipeline stage 1: compute m, d, o_local
     pipeline.consumer_wait();
     update_local_states<true, num_warps, h_chunk_size, rotary_mode == RotaryMode::kApplyRotary>(
-        m, d, o_local, x, kv_smem, q_local, sm_scale, head_dim, compute_stage_idx,
+        m, d, o_local, x, kv_smem, q_smem, sm_scale, head_dim, compute_stage_idx,
         batch + chunk_start - 1, rotary_pi_inv_ratio, kv_shared_offset, x_warp_local);
     pipeline.consumer_release();
     compute_stage_idx = (compute_stage_idx + 1) % stages_count;
     pipeline.consumer_wait();
     update_local_states<false, num_warps, h_chunk_size, rotary_mode == RotaryMode::kApplyRotary>(
-        m, d, o_local, x, kv_smem, q_local, sm_scale, head_dim, compute_stage_idx,
+        m, d, o_local, x, kv_smem, q_smem, sm_scale, head_dim, compute_stage_idx,
         batch + chunk_start - 1, rotary_pi_inv_ratio, kv_shared_offset, x_warp_local);
     pipeline.consumer_release();
     compute_stage_idx = (compute_stage_idx + 1) % stages_count;
@@ -280,38 +290,43 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
 
   pipeline.consumer_wait();
   update_local_states<true, num_warps, h_chunk_size, rotary_mode == RotaryMode::kApplyRotary>(
-      m, d, o_local, x, kv_smem, q_local, sm_scale, head_dim, compute_stage_idx,
+      m, d, o_local, x, kv_smem, q_smem, sm_scale, head_dim, compute_stage_idx,
       batch + chunk_start - 1, rotary_pi_inv_ratio, kv_shared_offset, x_warp_local);
   pipeline.consumer_release();
   compute_stage_idx = (compute_stage_idx + 1) % stages_count;
   pipeline.consumer_wait();
   update_local_states<false, num_warps, h_chunk_size, rotary_mode == RotaryMode::kApplyRotary>(
-      m, d, o_local, x, kv_smem, q_local, sm_scale, head_dim, compute_stage_idx,
+      m, d, o_local, x, kv_smem, q_smem, sm_scale, head_dim, compute_stage_idx,
       batch + chunk_start - 1, rotary_pi_inv_ratio, kv_shared_offset, x_warp_local);
   pipeline.consumer_release();
   block.sync();
 
 #pragma unroll
-  for (int j = 0; j < h_chunk_size; ++j) {
-    int head_idx = head_idx_start + j;
-    // critical region to sync m/d/o_smem for all ctas
-    // acquire lock
-    // while (atomicCAS(mutex + head_idx * head_dim + block.thread_rank(), 0, 1) != 0)
-    //  ;
-    float m_prev = m_global[head_idx * head_dim + block.thread_rank()];
-    float d_prev = d_global[head_idx * head_dim + block.thread_rank()];
-    float m_now = max(m_prev, m[j]);
-    float d_now = d_prev * exp(m_prev - m_now) + d[j] * exp(m[j] - m_now);
-    m_global[head_idx * head_dim + block.thread_rank()] = m_now;
-    d_global[head_idx * head_dim + block.thread_rank()] = d_now;
-    o[head_idx * head_dim + block.thread_rank()] =
-        DTypeOut(float(o[head_idx * head_dim + block.thread_rank()]) * (d_prev / d_now) *
-                     exp(m_prev - m_now) +
-                 o_local[j] * (d[j] / d_now) * exp(m[j] - m_now));
-    //__threadfence();
-    // release lock
-    //atomicExch(mutex + head_idx * head_dim + block.thread_rank(), 0);
-  }
+  size_t j = threadIdx.y;
+  int head_idx = head_idx_start + j;
+  // critical region to sync m/d/o_smem for all ctas
+  // acquire lock
+  // while (atomicCAS(mutex + head_idx * head_dim + block.thread_rank(), 0, 1) != 0)
+  //  ;
+  float m_prev = m_global[head_idx];
+  float d_prev = d_global[head_idx];
+  float m_now = max(m_prev, m);
+  float d_now = d_prev * exp(m_prev - m_now) + d * exp(m - m_now);
+  m_global[head_idx] = m_now;
+  d_global[head_idx] = d_now;
+  uint2 o_pack4 = *(uint2 *)(o + head_idx * head_dim + threadIdx.x * sizeof(uint2) / sizeof(DTypeOut));
+  (*(half2 *)(&o_pack4.x)).x = DTypeOut((float)(*(half2 *)(&o_pack4.x)).x * (d_prev / d_now) * exp(m_prev - m_now) + o_local.x * (d / d_now) * exp(m - m_now));
+  (*(half2 *)(&o_pack4.x)).y = DTypeOut((float)(*(half2 *)(&o_pack4.x)).y * (d_prev / d_now) * exp(m_prev - m_now) + o_local.y * (d / d_now) * exp(m - m_now));
+  (*(half2 *)(&o_pack4.y)).x = DTypeOut((float)(*(half2 *)(&o_pack4.y)).x * (d_prev / d_now) * exp(m_prev - m_now) + o_local.z * (d / d_now) * exp(m - m_now));
+  (*(half2 *)(&o_pack4.y)).y = DTypeOut((float)(*(half2 *)(&o_pack4.y)).y * (d_prev / d_now) * exp(m_prev - m_now) + o_local.w * (d / d_now) * exp(m - m_now));
+  *(uint2 *)(o + head_idx * head_dim + threadIdx.x * sizeof(uint2) / sizeof(DTypeOut)) = o_pack4;
+  // o[head_idx * head_dim + block.thread_rank()] =
+  //     DTypeOut(float(o[head_idx * head_dim + block.thread_rank()]) * (d_prev / d_now) *
+  //                   exp(m_prev - m_now) +
+  //               o_local * (d / d_now) * exp(m[j] - m_now));
+  //__threadfence();
+  // release lock
+  //atomicExch(mutex + head_idx * head_dim + block.thread_rank(), 0);
 }
 
 #define SWITCH_NUM_WARPS(num_warps, NUM_WARPS, ...)                     \
