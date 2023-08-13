@@ -306,8 +306,8 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   int head_idx = head_idx_start + j;
   // critical region to sync m/d/o_smem for all ctas
   // acquire lock
-  // while (atomicCAS(mutex + head_idx * head_dim + block.thread_rank(), 0, 1) != 0)
-  //  ;
+  while (atomicCAS(mutex + head_idx * 32 + threadIdx.x, 0, 1) != 0)
+    ;
   float m_prev = m_global[head_idx];
   float d_prev = d_global[head_idx];
   float m_now = max(m_prev, m);
@@ -324,9 +324,9 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   //     DTypeOut(float(o[head_idx * head_dim + block.thread_rank()]) * (d_prev / d_now) *
   //                   exp(m_prev - m_now) +
   //               o_local * (d / d_now) * exp(m[j] - m_now));
-  //__threadfence();
+  __threadfence();
   // release lock
-  //atomicExch(mutex + head_idx * head_dim + block.thread_rank(), 0);
+  atomicExch(mutex + head_idx * 32 + threadIdx.x, 0);
 }
 
 #define SWITCH_NUM_WARPS(num_warps, NUM_WARPS, ...)                     \
