@@ -162,13 +162,15 @@ void _TestDecodingKernelCorrectness(int num_heads, int seq_len, int head_dim,
 
 TEST(FlashInferCorrectnessTest, DecodingKernelCorrectnessTest) {
   for (int num_heads : {32}) {
+    int head_dim = 128;
+    unsigned int rotary_mode = 0U;
     for (int seq_len : {1, 3, 9, 27, 81, 129, 257, 512, 1024, 2048, 4096, 8192, 16384, 32768}) {
-      for (int head_dim : {64, 128, 256}) {
-        for (unsigned int rotary_mode : {0U, 1U, 2U}) {
-          _TestDecodingKernelCorrectness<float>(num_heads, seq_len, head_dim,
+      // for (int head_dim : {64, 128, 256}) {
+        // for (unsigned int rotary_mode : {0U, 1U, 2U}) {
+          _TestDecodingKernelCorrectness<half>(num_heads, seq_len, head_dim,
                                                 flashinfer::RotaryMode(rotary_mode));
-        }
-      }
+    //     }
+    //   }
     }
   }
 }

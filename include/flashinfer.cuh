@@ -103,7 +103,7 @@ template <bool compute_qk, int num_warps, int h_chunk_size, bool apply_rotary_to
 __device__ __forceinline__ void update_local_states(
     float &m, float &d, float4 &o_local, float &x, DTypeIn *kv_smem, DTypeIn *q_smem, float sm_scale,
     size_t head_dim, size_t compute_stage_idx, size_t rotary_offset, float rotary_pi_inv_ratio,
-    const size_t *kv_shared_offset, volatile float *x_warp_local) {
+    const size_t *kv_shared_offset) {
   auto block = cooperative_groups::this_thread_block();
 
   if (compute_qk) {
@@ -111,29 +111,12 @@ __device__ __forceinline__ void update_local_states(
     uint2 k_local_pack4 = *(uint2 *)(kv_smem + kv_shared_offset[compute_stage_idx] + j * head_dim +
                                       threadIdx.x * sizeof(uint2) / sizeof(DTypeIn));
     uint2 q_local_pack4 = *(uint2 *)(q_smem + j * head_dim + threadIdx.x * sizeof(uint2) / sizeof(DTypeIn));
-    half2 qk_local_pack2 = __hmul2(*(half2 *)(&k_local_pack4.x), *(half2 *)(&q_local_pack4.x)) + __hmul2(*(half2 *)(&k_local_pack4.y), *(half2 *)(&q_local_pack4.y));
-    qk_local_pack2 = warpReduceSum(qk_local_pack2);
-    x = qk_local_pack2.x + qk_local_pack2.y;
-    // x[j] = qk_local_pack2.x + qk_local_pack2.y;
-    // x[j] = warpReduceSum(x[j]);
+    x = float(((half2 *)(&q_local_pack4.x))->x) * float(((half2 *)(&k_local_pack4.x))->x) +\
+        float(((half2 *)(&q_local_pack4.x))->y) * float(((half2 *)(&k_local_pack4.x))->y) +\
+        float(((half2 *)(&q_local_pack4.y))->x) * float(((half2 *)(&k_local_pack4.y))->x) +\
+        float(((half2 *)(&q_local_pack4.y))->y) * float(((half2 *)(&k_local_pack4.y))->y);
+    x = warpReduceSum(x) * sm_scale;
     block.sync();
-// #pragma unroll
-//     for (size_t j = 0; j < 1; ++j) {
-//       float k_local = 0.f;
-//       if (apply_rotary_to_k) {
-//         // do not inplace update
-//         k_local = apply_rotary<false>(kv_smem + kv_shared_offset[compute_stage_idx] + j * head_dim,
-//                                       rotary_offset, rotary_pi_inv_ratio);
-//       } else {
-//         k_local = float(
-//             kv_smem[kv_shared_offset[compute_stage_idx] + j * head_dim + block.thread_rank()]);
-//       }
-//       x[j] = k_local * q_local[j];
-//       int warp_idx = block.thread_index().y;
-//       x_warp_local[warp_idx] = warpReduceSum(x[j]);
-//       block.sync();
-//       x[j] = crossWarpReduceSum<num_warps>(x_warp_local) * sm_scale;
-//     }
   } else {
     size_t j = threadIdx.y;
     float m_prev = m, d_prev = d;
@@ -141,20 +124,10 @@ __device__ __forceinline__ void update_local_states(
                                      threadIdx.x * sizeof(uint2) / sizeof(DTypeIn));
     m = max(m, x);
     d = d * exp(m_prev - m) + exp(x - m);
-    o_local.x = o_local.x * (exp(m_prev - m) * d_prev / d) + float((*(half2 *)(&v_local_pack4.x)).x) * (exp(x - m) / d);
-    o_local.y = o_local.y * (exp(m_prev - m) * d_prev / d) + float((*(half2 *)(&v_local_pack4.x)).y) * (exp(x - m) / d);
-    o_local.z = o_local.z * (exp(m_prev - m) * d_prev / d) + float((*(half2 *)(&v_local_pack4.y)).x) * (exp(x - m) / d);
-    o_local.w = o_local.w * (exp(m_prev - m) * d_prev / d) + float((*(half2 *)(&v_local_pack4.y)).y) * (exp(x - m) / d);
-// #pragma unroll
-//     for (size_t j = 0; j < 4; ++j) {
-//       float m_prev = m[j], d_prev = d[j];
-//       m[j] = max(m[j], x[j]);
-//       d[j] = d[j] * exp(m_prev - m[j]) + exp(x[j] - m[j]);
-//       o_local[j] =
-//           o_local[j] * (exp(m_prev - m[j]) * d_prev / d[j]) +
-//           float(kv_smem[kv_shared_offset[compute_stage_idx] + j * head_dim + block.thread_rank()]) *
-//               (exp(x[j] - m[j]) / d[j]);
-//     }
+    o_local.x = o_local.x * (exp(m_prev - m) * d_prev / d) + float(((half2 *)(&v_local_pack4.x))->x) * (exp(x - m) / d);
+    o_local.y = o_local.y * (exp(m_prev - m) * d_prev / d) + float(((half2 *)(&v_local_pack4.x))->y) * (exp(x - m) / d);
+    o_local.z = o_local.z * (exp(m_prev - m) * d_prev / d) + float(((half2 *)(&v_local_pack4.y))->x) * (exp(x - m) / d);
+    o_local.w = o_local.w * (exp(m_prev - m) * d_prev / d) + float(((half2 *)(&v_local_pack4.y))->y) * (exp(x - m) / d);
   }
 }
 
@@ -199,9 +172,6 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   DTypeIn *kv_smem = (DTypeIn *)smem;  // stages_count * h_chunk_size * head_dim
   DTypeIn *q_smem = (DTypeIn *)(smem + (stages_count * h_chunk_size * head_dim) *
                                            sizeof(DTypeIn));  // h_chunk_size * head_dim
-  float *x_warp_local =
-      (float *)(smem + (stages_count * h_chunk_size * head_dim + h_chunk_size * head_dim) *
-                           sizeof(DTypeIn));
 
   // load q tile
 #pragma unroll
@@ -277,13 +247,13 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     pipeline.consumer_wait();
     update_local_states<true, num_warps, h_chunk_size, rotary_mode == RotaryMode::kApplyRotary>(
         m, d, o_local, x, kv_smem, q_smem, sm_scale, head_dim, compute_stage_idx,
-        batch + chunk_start - 1, rotary_pi_inv_ratio, kv_shared_offset, x_warp_local);
+        batch + chunk_start - 1, rotary_pi_inv_ratio, kv_shared_offset);
     pipeline.consumer_release();
     compute_stage_idx = (compute_stage_idx + 1) % stages_count;
     pipeline.consumer_wait();
     update_local_states<false, num_warps, h_chunk_size, rotary_mode == RotaryMode::kApplyRotary>(
         m, d, o_local, x, kv_smem, q_smem, sm_scale, head_dim, compute_stage_idx,
-        batch + chunk_start - 1, rotary_pi_inv_ratio, kv_shared_offset, x_warp_local);
+        batch + chunk_start - 1, rotary_pi_inv_ratio, kv_shared_offset);
     pipeline.consumer_release();
     compute_stage_idx = (compute_stage_idx + 1) % stages_count;
   }
@@ -291,13 +261,13 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   pipeline.consumer_wait();
   update_local_states<true, num_warps, h_chunk_size, rotary_mode == RotaryMode::kApplyRotary>(
       m, d, o_local, x, kv_smem, q_smem, sm_scale, head_dim, compute_stage_idx,
-      batch + chunk_start - 1, rotary_pi_inv_ratio, kv_shared_offset, x_warp_local);
+      batch + chunk_start - 1, rotary_pi_inv_ratio, kv_shared_offset);
   pipeline.consumer_release();
   compute_stage_idx = (compute_stage_idx + 1) % stages_count;
   pipeline.consumer_wait();
   update_local_states<false, num_warps, h_chunk_size, rotary_mode == RotaryMode::kApplyRotary>(
       m, d, o_local, x, kv_smem, q_smem, sm_scale, head_dim, compute_stage_idx,
-      batch + chunk_start - 1, rotary_pi_inv_ratio, kv_shared_offset, x_warp_local);
+      batch + chunk_start - 1, rotary_pi_inv_ratio, kv_shared_offset);
   pipeline.consumer_release();
   block.sync();
 
@@ -308,22 +278,18 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   // acquire lock
   while (atomicCAS(mutex + head_idx * 32 + threadIdx.x, 0, 1) != 0)
     ;
-  float m_prev = m_global[head_idx];
-  float d_prev = d_global[head_idx];
+  float m_prev = m_global[head_idx * 32 + threadIdx.x];
+  float d_prev = d_global[head_idx * 32 + threadIdx.x];
   float m_now = max(m_prev, m);
   float d_now = d_prev * exp(m_prev - m_now) + d * exp(m - m_now);
-  m_global[head_idx] = m_now;
-  d_global[head_idx] = d_now;
+  m_global[head_idx * 32 + threadIdx.x] = m_now;
+  d_global[head_idx * 32 + threadIdx.x] = d_now;
   uint2 o_pack4 = *(uint2 *)(o + head_idx * head_dim + threadIdx.x * sizeof(uint2) / sizeof(DTypeOut));
-  (*(half2 *)(&o_pack4.x)).x = DTypeOut((float)(*(half2 *)(&o_pack4.x)).x * (d_prev / d_now) * exp(m_prev - m_now) + o_local.x * (d / d_now) * exp(m - m_now));
-  (*(half2 *)(&o_pack4.x)).y = DTypeOut((float)(*(half2 *)(&o_pack4.x)).y * (d_prev / d_now) * exp(m_prev - m_now) + o_local.y * (d / d_now) * exp(m - m_now));
-  (*(half2 *)(&o_pack4.y)).x = DTypeOut((float)(*(half2 *)(&o_pack4.y)).x * (d_prev / d_now) * exp(m_prev - m_now) + o_local.z * (d / d_now) * exp(m - m_now));
-  (*(half2 *)(&o_pack4.y)).y = DTypeOut((float)(*(half2 *)(&o_pack4.y)).y * (d_prev / d_now) * exp(m_prev - m_now) + o_local.w * (d / d_now) * exp(m - m_now));
+  ((half2 *)(&o_pack4.x))->x = DTypeOut((float)((half2 *)(&o_pack4.x))->x * (d_prev / d_now) * exp(m_prev - m_now) + o_local.x * (d / d_now) * exp(m - m_now));
+  ((half2 *)(&o_pack4.x))->y = DTypeOut((float)((half2 *)(&o_pack4.x))->y * (d_prev / d_now) * exp(m_prev - m_now) + o_local.y * (d / d_now) * exp(m - m_now));
+  ((half2 *)(&o_pack4.y))->x = DTypeOut((float)((half2 *)(&o_pack4.y))->x * (d_prev / d_now) * exp(m_prev - m_now) + o_local.z * (d / d_now) * exp(m - m_now));
+  ((half2 *)(&o_pack4.y))->y = DTypeOut((float)((half2 *)(&o_pack4.y))->y * (d_prev / d_now) * exp(m_prev - m_now) + o_local.w * (d / d_now) * exp(m - m_now));
   *(uint2 *)(o + head_idx * head_dim + threadIdx.x * sizeof(uint2) / sizeof(DTypeOut)) = o_pack4;
-  // o[head_idx * head_dim + block.thread_rank()] =
-  //     DTypeOut(float(o[head_idx * head_dim + block.thread_rank()]) * (d_prev / d_now) *
-  //                   exp(m_prev - m_now) +
-  //               o_local * (d / d_now) * exp(m[j] - m_now));
   __threadfence();
   // release lock
   atomicExch(mutex + head_idx * 32 + threadIdx.x, 0);
@@ -450,8 +416,8 @@ void SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut *o, fl
   assert(head_dim <= 1024);
   float sm_scale = 1.f / sqrtf(float(head_dim));
   int max_num_threadblocks = get_heuristic_max_num_threadblocks(seq_len);
-  int h_chunk_size = 4;  //(seq_len <= 64) ? 1 : ((seq_len <= 2048) ? 2 : 4);
-  int suggested_kv_chunk_size = 4;
+  int h_chunk_size = 4;
+  int suggested_kv_chunk_size = 8;
   while (((seq_len + suggested_kv_chunk_size - 1) / suggested_kv_chunk_size) * num_heads /
              h_chunk_size >
          max_num_threadblocks) {
@@ -460,8 +426,7 @@ void SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut *o, fl
   dim3 nblks = dim3(num_heads / h_chunk_size,
                     (seq_len + suggested_kv_chunk_size - 1) / suggested_kv_chunk_size);
   dim3 nthrs = dim3(32, head_dim / 32);
-  size_t shmem_size = sizeof(DTypeIn) * (4 * h_chunk_size * head_dim + h_chunk_size * head_dim) +
-                      sizeof(float) * nthrs.y;
+  size_t shmem_size = sizeof(DTypeIn) * (4 * h_chunk_size * head_dim + h_chunk_size * head_dim);
 
   SWITCH_NUM_WARPS(
       nthrs.y, NUM_WARPS,
