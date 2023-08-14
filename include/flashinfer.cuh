@@ -100,20 +100,23 @@ __device__ __forceinline__ float apply_rotary(T *input, int offset, float inv_ra
  */
 template <bool compute_qk, int num_warps, int h_chunk_size, bool apply_rotary_to_k,
           typename DTypeIn>
-__device__ __forceinline__ void update_local_states(
-    float &m, float &d, float4 &o_local, float &x, DTypeIn *kv_smem, DTypeIn *q_smem, float sm_scale,
-    size_t head_dim, size_t compute_stage_idx, size_t rotary_offset, float rotary_pi_inv_ratio,
-    const size_t *kv_shared_offset) {
+__device__ __forceinline__ void update_local_states(float &m, float &d, float4 &o_local, float &x,
+                                                    DTypeIn *kv_smem, DTypeIn *q_smem,
+                                                    float sm_scale, size_t head_dim,
+                                                    size_t compute_stage_idx, size_t rotary_offset,
+                                                    float rotary_pi_inv_ratio,
+                                                    const size_t *kv_shared_offset) {
   auto block = cooperative_groups::this_thread_block();
 
   if (compute_qk) {
     size_t j = threadIdx.y;
     uint2 k_local_pack4 = *(uint2 *)(kv_smem + kv_shared_offset[compute_stage_idx] + j * head_dim +
-                                      threadIdx.x * sizeof(uint2) / sizeof(DTypeIn));
-    uint2 q_local_pack4 = *(uint2 *)(q_smem + j * head_dim + threadIdx.x * sizeof(uint2) / sizeof(DTypeIn));
-    x = float(((half2 *)(&q_local_pack4.x))->x) * float(((half2 *)(&k_local_pack4.x))->x) +\
-        float(((half2 *)(&q_local_pack4.x))->y) * float(((half2 *)(&k_local_pack4.x))->y) +\
-        float(((half2 *)(&q_local_pack4.y))->x) * float(((half2 *)(&k_local_pack4.y))->x) +\
+                                     threadIdx.x * sizeof(uint2) / sizeof(DTypeIn));
+    uint2 q_local_pack4 =
+        *(uint2 *)(q_smem + j * head_dim + threadIdx.x * sizeof(uint2) / sizeof(DTypeIn));
+    x = float(((half2 *)(&q_local_pack4.x))->x) * float(((half2 *)(&k_local_pack4.x))->x) +
+        float(((half2 *)(&q_local_pack4.x))->y) * float(((half2 *)(&k_local_pack4.x))->y) +
+        float(((half2 *)(&q_local_pack4.y))->x) * float(((half2 *)(&k_local_pack4.y))->x) +
         float(((half2 *)(&q_local_pack4.y))->y) * float(((half2 *)(&k_local_pack4.y))->y);
     x = warpReduceSum(x) * sm_scale;
     block.sync();
@@ -124,10 +127,14 @@ __device__ __forceinline__ void update_local_states(
                                      threadIdx.x * sizeof(uint2) / sizeof(DTypeIn));
     m = max(m, x);
     d = d * exp(m_prev - m) + exp(x - m);
-    o_local.x = o_local.x * (exp(m_prev - m) * d_prev / d) + float(((half2 *)(&v_local_pack4.x))->x) * (exp(x - m) / d);
-    o_local.y = o_local.y * (exp(m_prev - m) * d_prev / d) + float(((half2 *)(&v_local_pack4.x))->y) * (exp(x - m) / d);
-    o_local.z = o_local.z * (exp(m_prev - m) * d_prev / d) + float(((half2 *)(&v_local_pack4.y))->x) * (exp(x - m) / d);
-    o_local.w = o_local.w * (exp(m_prev - m) * d_prev / d) + float(((half2 *)(&v_local_pack4.y))->y) * (exp(x - m) / d);
+    o_local.x = o_local.x * (exp(m_prev - m) * d_prev / d) +
+                float(((half2 *)(&v_local_pack4.x))->x) * (exp(x - m) / d);
+    o_local.y = o_local.y * (exp(m_prev - m) * d_prev / d) +
+                float(((half2 *)(&v_local_pack4.x))->y) * (exp(x - m) / d);
+    o_local.z = o_local.z * (exp(m_prev - m) * d_prev / d) +
+                float(((half2 *)(&v_local_pack4.y))->x) * (exp(x - m) / d);
+    o_local.w = o_local.w * (exp(m_prev - m) * d_prev / d) +
+                float(((half2 *)(&v_local_pack4.y))->y) * (exp(x - m) / d);
   }
 }
 
@@ -228,6 +235,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
 
   size_t compute_stage_idx = 0, copy_stage_idx = 2;
   size_t batch = 1;
+#pragma unroll 2
   for (batch = 1; batch < kv_chunk_size; ++batch) {
     // pipeline stage 0: load k/v tiles
     pipeline.producer_acquire();
@@ -284,11 +292,20 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   float d_now = d_prev * exp(m_prev - m_now) + d * exp(m - m_now);
   m_global[head_idx * 32 + threadIdx.x] = m_now;
   d_global[head_idx * 32 + threadIdx.x] = d_now;
-  uint2 o_pack4 = *(uint2 *)(o + head_idx * head_dim + threadIdx.x * sizeof(uint2) / sizeof(DTypeOut));
-  ((half2 *)(&o_pack4.x))->x = DTypeOut((float)((half2 *)(&o_pack4.x))->x * (d_prev / d_now) * exp(m_prev - m_now) + o_local.x * (d / d_now) * exp(m - m_now));
-  ((half2 *)(&o_pack4.x))->y = DTypeOut((float)((half2 *)(&o_pack4.x))->y * (d_prev / d_now) * exp(m_prev - m_now) + o_local.y * (d / d_now) * exp(m - m_now));
-  ((half2 *)(&o_pack4.y))->x = DTypeOut((float)((half2 *)(&o_pack4.y))->x * (d_prev / d_now) * exp(m_prev - m_now) + o_local.z * (d / d_now) * exp(m - m_now));
-  ((half2 *)(&o_pack4.y))->y = DTypeOut((float)((half2 *)(&o_pack4.y))->y * (d_prev / d_now) * exp(m_prev - m_now) + o_local.w * (d / d_now) * exp(m - m_now));
+  uint2 o_pack4 =
+      *(uint2 *)(o + head_idx * head_dim + threadIdx.x * sizeof(uint2) / sizeof(DTypeOut));
+  ((half2 *)(&o_pack4.x))->x =
+      DTypeOut((float)((half2 *)(&o_pack4.x))->x * (d_prev / d_now) * exp(m_prev - m_now) +
+               o_local.x * (d / d_now) * exp(m - m_now));
+  ((half2 *)(&o_pack4.x))->y =
+      DTypeOut((float)((half2 *)(&o_pack4.x))->y * (d_prev / d_now) * exp(m_prev - m_now) +
+               o_local.y * (d / d_now) * exp(m - m_now));
+  ((half2 *)(&o_pack4.y))->x =
+      DTypeOut((float)((half2 *)(&o_pack4.y))->x * (d_prev / d_now) * exp(m_prev - m_now) +
+               o_local.z * (d / d_now) * exp(m - m_now));
+  ((half2 *)(&o_pack4.y))->y =
+      DTypeOut((float)((half2 *)(&o_pack4.y))->y * (d_prev / d_now) * exp(m_prev - m_now) +
+               o_local.w * (d / d_now) * exp(m - m_now));
   *(uint2 *)(o + head_idx * head_dim + threadIdx.x * sizeof(uint2) / sizeof(DTypeOut)) = o_pack4;
   __threadfence();
   // release lock
@@ -377,7 +394,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
 inline int get_heuristic_max_num_threadblocks(int seq_len) {
   if (seq_len <= 128) {
     return 64;
-  } else if (seq_len <= 512) {
+  } else if (seq_len <= 2048) {
     return 128;
   }
   return 256;
