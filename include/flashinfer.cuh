@@ -375,17 +375,12 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   }
 
 inline int get_heuristic_max_num_threadblocks(int seq_len) {
-  if (seq_len <= 512) {
+  if (seq_len <= 128) {
+    return 64;
+  } else if (seq_len <= 512) {
     return 128;
-  } else if (seq_len <= 2048) {
-    return 256;
-  } else if (seq_len <= 4096) {
-    return 512;
-  } else if (seq_len <= 8192) {
-    return 1024;
-  } else {
-    return 2048;
   }
+  return 256;
 }
 
 /*!
@@ -417,7 +412,7 @@ void SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut *o, fl
   float sm_scale = 1.f / sqrtf(float(head_dim));
   int max_num_threadblocks = get_heuristic_max_num_threadblocks(seq_len);
   int h_chunk_size = 4;
-  int suggested_kv_chunk_size = 8;
+  int suggested_kv_chunk_size = 4;
   while (((seq_len + suggested_kv_chunk_size - 1) / suggested_kv_chunk_size) * num_heads /
              h_chunk_size >
          max_num_threadblocks) {
