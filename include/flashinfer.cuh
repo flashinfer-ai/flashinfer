@@ -22,16 +22,6 @@ __device__ T warpReduceSum(T val, unsigned int mask = 0xffffffff) {
   return val;
 }
 
-template <int num_warps, typename T>
-__device__ __forceinline__ T crossWarpReduceSum(volatile T *warp_local) {
-  T sum = 0.f;
-#pragma unroll
-  for (int i = 0; i < num_warps; ++i) {
-    sum += warp_local[i];
-  }
-  return sum;
-}
-
 }  // namespace
 
 /*!
@@ -94,12 +84,10 @@ __device__ __forceinline__ float apply_rotary(T *input, int offset, float inv_ra
 
 /*!
  * \brief Update flashattention local states: m, d, o_local.
- * \tparam num_warps A integer indicates the number of warps used in the kernel
  * \tparam apply_rotary_to_k A boolean indicates whether to apply rotary positional embeddings to k
  * \tparam DTypeIn A template type indicates the input data type
  */
-template <bool compute_qk, int num_warps, int h_chunk_size, bool apply_rotary_to_k,
-          typename DTypeIn>
+template <bool compute_qk, bool apply_rotary_to_k, typename DTypeIn>
 __device__ __forceinline__ void update_local_states(float &m, float &d, float4 &o_local, float &x,
                                                     DTypeIn *kv_smem, DTypeIn *q_smem,
                                                     float sm_scale, size_t head_dim,
@@ -159,8 +147,7 @@ __device__ __forceinline__ void update_local_states(float &m, float &d, float4 &
  *   used in PI(Position Interpolation) for ROPE (Rotary Positional Embeddings).
  * \param kv_chunk_size A integer indicates the kv-chunk size
  */
-template <int num_warps, int h_chunk_size, typename DTypeIn, typename DTypeOut,
-          RotaryMode rotary_mode>
+template <typename DTypeIn, typename DTypeOut, RotaryMode rotary_mode>
 __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *__restrict__ k,
                                               DTypeIn *__restrict__ v, DTypeOut *__restrict__ o,
                                               float *__restrict__ m_global,
@@ -170,10 +157,11 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   auto block = cooperative_groups::this_thread_block();
   auto grid = cooperative_groups::this_grid();
 
+  constexpr size_t h_chunk_size = 4;
+  constexpr size_t stages_count = 4;
   size_t head_idx_start = grid.block_index().x * h_chunk_size;
   size_t kv_chunk_idx = grid.block_index().y;
   size_t num_heads = grid.dim_blocks().x * h_chunk_size;
-  constexpr size_t stages_count = 4;
 
   extern __shared__ char smem[];
   DTypeIn *kv_smem = (DTypeIn *)smem;  // stages_count * h_chunk_size * head_dim
@@ -253,13 +241,13 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
 
     // pipeline stage 1: compute m, d, o_local
     pipeline.consumer_wait();
-    update_local_states<true, num_warps, h_chunk_size, rotary_mode == RotaryMode::kApplyRotary>(
+    update_local_states<true, rotary_mode == RotaryMode::kApplyRotary>(
         m, d, o_local, x, kv_smem, q_smem, sm_scale, head_dim, compute_stage_idx,
         batch + chunk_start - 1, rotary_pi_inv_ratio, kv_shared_offset);
     pipeline.consumer_release();
     compute_stage_idx = (compute_stage_idx + 1) % stages_count;
     pipeline.consumer_wait();
-    update_local_states<false, num_warps, h_chunk_size, rotary_mode == RotaryMode::kApplyRotary>(
+    update_local_states<false, rotary_mode == RotaryMode::kApplyRotary>(
         m, d, o_local, x, kv_smem, q_smem, sm_scale, head_dim, compute_stage_idx,
         batch + chunk_start - 1, rotary_pi_inv_ratio, kv_shared_offset);
     pipeline.consumer_release();
@@ -267,19 +255,18 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   }
 
   pipeline.consumer_wait();
-  update_local_states<true, num_warps, h_chunk_size, rotary_mode == RotaryMode::kApplyRotary>(
+  update_local_states<true, rotary_mode == RotaryMode::kApplyRotary>(
       m, d, o_local, x, kv_smem, q_smem, sm_scale, head_dim, compute_stage_idx,
       batch + chunk_start - 1, rotary_pi_inv_ratio, kv_shared_offset);
   pipeline.consumer_release();
   compute_stage_idx = (compute_stage_idx + 1) % stages_count;
   pipeline.consumer_wait();
-  update_local_states<false, num_warps, h_chunk_size, rotary_mode == RotaryMode::kApplyRotary>(
+  update_local_states<false, rotary_mode == RotaryMode::kApplyRotary>(
       m, d, o_local, x, kv_smem, q_smem, sm_scale, head_dim, compute_stage_idx,
       batch + chunk_start - 1, rotary_pi_inv_ratio, kv_shared_offset);
   pipeline.consumer_release();
   block.sync();
 
-#pragma unroll
   size_t j = threadIdx.y;
   int head_idx = head_idx_start + j;
   // critical region to sync m/d/o_smem for all ctas
@@ -311,62 +298,6 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   // release lock
   atomicExch(mutex + head_idx * 32 + threadIdx.x, 0);
 }
-
-#define SWITCH_NUM_WARPS(num_warps, NUM_WARPS, ...)                     \
-  switch (num_warps) {                                                  \
-    case 1: {                                                           \
-      constexpr int NUM_WARPS = 1;                                      \
-      __VA_ARGS__                                                       \
-      break;                                                            \
-    }                                                                   \
-    case 2: {                                                           \
-      constexpr int NUM_WARPS = 2;                                      \
-      __VA_ARGS__                                                       \
-      break;                                                            \
-    }                                                                   \
-    case 4: {                                                           \
-      constexpr int NUM_WARPS = 4;                                      \
-      __VA_ARGS__                                                       \
-      break;                                                            \
-    }                                                                   \
-    case 8: {                                                           \
-      constexpr int NUM_WARPS = 8;                                      \
-      __VA_ARGS__                                                       \
-      break;                                                            \
-    }                                                                   \
-    default: {                                                          \
-      std::cerr << "Unsupported num_warps: " << num_warps << std::endl; \
-      abort();                                                          \
-    }                                                                   \
-  }
-
-#define SWITCH_H_CHUNK_SIZE(h_chunk_size, H_CHUNK_SIZE, ...)                  \
-  switch (h_chunk_size) {                                                     \
-    case 1: {                                                                 \
-      constexpr int H_CHUNK_SIZE = 1;                                         \
-      __VA_ARGS__                                                             \
-      break;                                                                  \
-    }                                                                         \
-    case 2: {                                                                 \
-      constexpr int H_CHUNK_SIZE = 2;                                         \
-      __VA_ARGS__                                                             \
-      break;                                                                  \
-    }                                                                         \
-    case 4: {                                                                 \
-      constexpr int H_CHUNK_SIZE = 4;                                         \
-      __VA_ARGS__                                                             \
-      break;                                                                  \
-    }                                                                         \
-    case 8: {                                                                 \
-      constexpr int H_CHUNK_SIZE = 8;                                         \
-      __VA_ARGS__                                                             \
-      break;                                                                  \
-    }                                                                         \
-    default: {                                                                \
-      std::cerr << "Unsupported h_chunk_size: " << h_chunk_size << std::endl; \
-      abort();                                                                \
-    }                                                                         \
-  }
 
 #define SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, ...)                        \
   switch (rotary_mode) {                                                         \
@@ -429,6 +360,7 @@ void SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut *o, fl
   float sm_scale = 1.f / sqrtf(float(head_dim));
   int max_num_threadblocks = get_heuristic_max_num_threadblocks(seq_len);
   int h_chunk_size = 4;
+  int stages_count = 4;
   int suggested_kv_chunk_size = 4;
   while (((seq_len + suggested_kv_chunk_size - 1) / suggested_kv_chunk_size) * num_heads /
              h_chunk_size >
@@ -437,20 +369,17 @@ void SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut *o, fl
   }
   dim3 nblks = dim3(num_heads / h_chunk_size,
                     (seq_len + suggested_kv_chunk_size - 1) / suggested_kv_chunk_size);
-  dim3 nthrs = dim3(32, head_dim / 32);
-  size_t shmem_size = sizeof(DTypeIn) * (4 * h_chunk_size * head_dim + h_chunk_size * head_dim);
+  dim3 nthrs = dim3(32, 4);
+  size_t shmem_size =
+      sizeof(DTypeIn) * (stages_count * h_chunk_size * head_dim + h_chunk_size * head_dim);
 
-  SWITCH_NUM_WARPS(
-      nthrs.y, NUM_WARPS,
-      {SWITCH_ROTARY_MODE(
-          rotary_mode, ROTARY_MODE, {SWITCH_H_CHUNK_SIZE(h_chunk_size, H_CHUNK_SIZE, {
-            auto kernel = SingleDecodeWithKVCacheKernel<NUM_WARPS, H_CHUNK_SIZE, DTypeIn, DTypeOut,
-                                                        ROTARY_MODE>;
-            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536);
-            kernel<<<nblks, nthrs, shmem_size, stream>>>(
-                q, k, v, o, m_global, d_global, mutex, sm_scale, seq_len, head_dim,
-                rotary_pi_inv_ratio, suggested_kv_chunk_size);
-          })})});
+  SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
+    auto kernel = SingleDecodeWithKVCacheKernel<DTypeIn, DTypeOut, ROTARY_MODE>;
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536);
+    kernel<<<nblks, nthrs, shmem_size, stream>>>(q, k, v, o, m_global, d_global, mutex, sm_scale,
+                                                 seq_len, head_dim, rotary_pi_inv_ratio,
+                                                 suggested_kv_chunk_size);
+  });
 }
 
 }  // namespace flashinfer
