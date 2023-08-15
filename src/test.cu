@@ -5,14 +5,15 @@
 #include "utils.cuh"
 
 template <typename T>
-inline void cpu_inplace_apply_rotary(thrust::host_vector<T>& input, int offset, float inv_ratio) {
-  int D = input.size();
+inline void cpu_inplace_apply_rotary(thrust::host_vector<T>& input, size_t offset,
+                                     size_t inv_ratio) {
+  size_t D = input.size();
   thrust::host_vector<T> permuted_input(input);
-  for (int k = 0; k < D; ++k) {
+  for (size_t k = 0; k < D; ++k) {
     permuted_input[k] = (k < D / 2) ? -float(input[k + D / 2]) : float(input[k - D / 2]);
   }
 
-  for (int k = 0; k < D; ++k) {
+  for (size_t k = 0; k < D; ++k) {
     float inv_freq = (offset * inv_ratio) * (std::pow(1e-4, float(2 * (k % (D / 2))) / float(D)));
     float cos = std::cos(inv_freq);
     float sin = std::sin(inv_freq);
@@ -23,7 +24,7 @@ inline void cpu_inplace_apply_rotary(thrust::host_vector<T>& input, int offset, 
 template <typename dtype_in, typename dtype_out>
 thrust::host_vector<dtype_out> cpu_mha_reference(
     const thrust::host_vector<dtype_in>& q, thrust::host_vector<dtype_in>& k,
-    const thrust::host_vector<dtype_in>& v, int num_heads, int seq_len, int head_dim,
+    const thrust::host_vector<dtype_in>& v, size_t num_heads, size_t seq_len, size_t head_dim,
     flashinfer::RotaryMode rotary_mode = flashinfer::RotaryMode::kNone,
     float rotary_pi_inv_ratio = 1.f) {
   float sm_scale = 1.f / std::sqrt(float(head_dim));
@@ -31,18 +32,18 @@ thrust::host_vector<dtype_out> cpu_mha_reference(
   thrust::host_vector<float> att(num_heads * seq_len);
   thrust::host_vector<dtype_in> q_rotary_local(head_dim);
   thrust::host_vector<dtype_in> k_rotary_local(head_dim);
-  for (int i = 0; i < num_heads; ++i) {
+  for (size_t i = 0; i < num_heads; ++i) {
     float max_val = -INFINITY;
     if (rotary_mode == flashinfer::RotaryMode::kApplyRotary ||
         rotary_mode == flashinfer::RotaryMode::kApplyRotaryUpdateLastK) {
       thrust::copy_n(thrust::host, q.begin() + i * head_dim, head_dim, q_rotary_local.begin());
       cpu_inplace_apply_rotary(q_rotary_local, seq_len - 1, rotary_pi_inv_ratio);
     }
-    for (int j = 0; j < seq_len; ++j) {
+    for (size_t j = 0; j < seq_len; ++j) {
       att[i * seq_len + j] = 0.;
       switch (rotary_mode) {
         case flashinfer::RotaryMode::kNone: {
-          for (int k_ = 0; k_ < head_dim; ++k_) {
+          for (size_t k_ = 0; k_ < head_dim; ++k_) {
             att[i * seq_len + j] += float(q[i * head_dim + k_]) *
                                     float(k[j * num_heads * head_dim + i * head_dim + k_]) *
                                     sm_scale;
@@ -53,7 +54,7 @@ thrust::host_vector<dtype_out> cpu_mha_reference(
           thrust::copy_n(thrust::host, k.begin() + j * num_heads * head_dim + i * head_dim,
                          head_dim, k_rotary_local.begin());
           cpu_inplace_apply_rotary(k_rotary_local, j, rotary_pi_inv_ratio);
-          for (int k_ = 0; k_ < head_dim; ++k_) {
+          for (size_t k_ = 0; k_ < head_dim; ++k_) {
             att[i * seq_len + j] +=
                 float(q_rotary_local[k_]) * float(k_rotary_local[k_]) * sm_scale;
           }
@@ -67,7 +68,7 @@ thrust::host_vector<dtype_out> cpu_mha_reference(
             thrust::copy_n(thrust::host, k_rotary_local.begin(), head_dim,
                            k.begin() + j * num_heads * head_dim + i * head_dim);
           }
-          for (int k_ = 0; k_ < head_dim; ++k_) {
+          for (size_t k_ = 0; k_ < head_dim; ++k_) {
             att[i * seq_len + j] +=
                 float(q_rotary_local[k_]) * float(k_rotary_local[k_]) * sm_scale;
           }
@@ -82,18 +83,18 @@ thrust::host_vector<dtype_out> cpu_mha_reference(
     }
     // exp minus max
     float denom = 0;
-    for (int j = 0; j < seq_len; ++j) {
+    for (size_t j = 0; j < seq_len; ++j) {
       att[i * seq_len + j] = std::exp(att[i * seq_len + j] - max_val);
       denom += att[i * seq_len + j];
     }
     // divide by denom
-    for (int j = 0; j < seq_len; ++j) {
+    for (size_t j = 0; j < seq_len; ++j) {
       att[i * seq_len + j] /= denom;
     }
 
-    for (int k_ = 0; k_ < head_dim; ++k_) {
+    for (size_t k_ = 0; k_ < head_dim; ++k_) {
       float o_float = 0.;
-      for (int j = 0; j < seq_len; ++j) {
+      for (size_t j = 0; j < seq_len; ++j) {
         o_float += att[i * seq_len + j] * float(v[j * num_heads * head_dim + i * head_dim + k_]);
       }
       o[i * head_dim + k_] = dtype_out(o_float);
@@ -103,7 +104,7 @@ thrust::host_vector<dtype_out> cpu_mha_reference(
 }
 
 template <typename T>
-void _TestDecodingKernelCorrectness(int num_heads, int seq_len, int head_dim,
+void _TestDecodingKernelCorrectness(size_t num_heads, size_t seq_len, size_t head_dim,
                                     flashinfer::RotaryMode rotary_mode) {
   thrust::device_vector<T> Q(num_heads * head_dim);
   thrust::device_vector<T> K(seq_len * num_heads * head_dim);
@@ -138,13 +139,13 @@ void _TestDecodingKernelCorrectness(int num_heads, int seq_len, int head_dim,
   thrust::host_vector<float> m_host = m_global;
   thrust::host_vector<float> d_host = d_global;
 
-  int num_result_errors_atol_1e_3_rtol_1e_3 = 0, num_updated_k_errors_atol_1e_3_rtol_1e_3 = 0;
-  for (int i = 0; i < num_heads * head_dim; ++i) {
+  size_t num_result_errors_atol_1e_3_rtol_1e_3 = 0, num_updated_k_errors_atol_1e_3_rtol_1e_3 = 0;
+  for (size_t i = 0; i < num_heads * head_dim; ++i) {
     num_updated_k_errors_atol_1e_3_rtol_1e_3 +=
         (!utils::isclose(float(K_host[(seq_len - 1) * num_heads * head_dim + i]),
                          float(K_ref_host[(seq_len - 1) * num_heads * head_dim + i]), 1e-3, 1e-3));
   }
-  for (int i = 0; i < num_heads * head_dim; ++i) {
+  for (size_t i = 0; i < num_heads * head_dim; ++i) {
     num_result_errors_atol_1e_3_rtol_1e_3 +=
         (!utils::isclose(float(o_host[i]), float(o_ref_host[i]), 1e-3, 1e-3));
   }
@@ -161,16 +162,16 @@ void _TestDecodingKernelCorrectness(int num_heads, int seq_len, int head_dim,
 }
 
 TEST(FlashInferCorrectnessTest, DecodingKernelCorrectnessTest) {
-  for (int num_heads : {32}) {
-    int head_dim = 128;
+  for (size_t num_heads : {32}) {
+    size_t head_dim = 128;
     unsigned int rotary_mode = 0U;
-    for (int seq_len : {1, 3, 9, 27, 81, 129, 257, 512, 1024, 2048, 4096, 8192, 16384, 32768}) {
-      // for (int head_dim : {64, 128, 256}) {
-        // for (unsigned int rotary_mode : {0U, 1U, 2U}) {
-          _TestDecodingKernelCorrectness<half>(num_heads, seq_len, head_dim,
-                                                flashinfer::RotaryMode(rotary_mode));
-    //     }
-    //   }
+    for (size_t seq_len : {1, 3, 9, 27, 81, 129, 257, 512, 1024, 2048, 4096, 8192, 16384, 32768}) {
+      // for (size_t head_dim : {64, 128, 256}) {
+      // for (unsigned int rotary_mode : {0U, 1U, 2U}) {
+      _TestDecodingKernelCorrectness<half>(num_heads, seq_len, head_dim,
+                                           flashinfer::RotaryMode(rotary_mode));
+      //     }
+      //   }
     }
   }
 }

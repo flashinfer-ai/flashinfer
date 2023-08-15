@@ -1,7 +1,9 @@
 #ifndef FLASHINFER_CUH_
 #define FLASHINFER_CUH_
 #include <cooperative_groups/memcpy_async.h>
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <cuda/pipeline>
@@ -65,10 +67,10 @@ inline std::string RotaryModeToString(const RotaryMode &rotary_mode) {
  *   in position interpolation for ROPE(Rotary Positional Embeddings).
  */
 template <bool inplace_update, typename T>
-__device__ __forceinline__ float apply_rotary(T *input, int offset, float inv_ratio) {
+__device__ __forceinline__ float apply_rotary(T *input, size_t offset, float inv_ratio) {
   auto block = cooperative_groups::this_thread_block();
-  unsigned int d = block.thread_rank();
-  unsigned int D = block.num_threads();
+  size_t d = block.thread_rank();
+  size_t D = block.num_threads();
   float inv_freq = (offset * inv_ratio) * powf(1e-4, float(2 * (d % (D / 2))) / float(D));
   float cos = cosf(inv_freq);
   float sin = sinf(inv_freq);
@@ -352,21 +354,16 @@ inline int get_heuristic_max_num_threadblocks(int seq_len) {
  */
 template <typename DTypeIn, typename DTypeOut>
 void SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut *o, float *m_global,
-                             float *d_global, int *mutex, int num_heads, int seq_len, int head_dim,
-                             RotaryMode rotary_mode = RotaryMode::kNone,
+                             float *d_global, int *mutex, size_t num_heads, size_t seq_len,
+                             size_t head_dim, RotaryMode rotary_mode = RotaryMode::kNone,
                              float rotary_pi_inv_ratio = 1.f, cudaStream_t stream = nullptr) {
-  assert(head_dim % 32 == 0);
-  assert(head_dim <= 1024);
-  float sm_scale = 1.f / sqrtf(float(head_dim));
-  int max_num_threadblocks = get_heuristic_max_num_threadblocks(seq_len);
-  int h_chunk_size = 4;
-  int stages_count = 4;
-  int suggested_kv_chunk_size = 4;
-  while (((seq_len + suggested_kv_chunk_size - 1) / suggested_kv_chunk_size) * num_heads /
-             h_chunk_size >
-         max_num_threadblocks) {
-    suggested_kv_chunk_size *= 2;
-  }
+  constexpr size_t h_chunk_size = 4;
+  constexpr size_t stages_count = 4;
+  const float sm_scale = 1.f / sqrtf(float(head_dim));
+  assert(head_dim % h_chunk_size == 0);
+
+  size_t suggested_kv_chunk_size = std::max<size_t>(
+      4U, seq_len * num_heads / h_chunk_size / get_heuristic_max_num_threadblocks(seq_len));
   dim3 nblks = dim3(num_heads / h_chunk_size,
                     (seq_len + suggested_kv_chunk_size - 1) / suggested_kv_chunk_size);
   dim3 nthrs = dim3(32, 4);
@@ -375,7 +372,6 @@ void SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut *o, fl
 
   SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
     auto kernel = SingleDecodeWithKVCacheKernel<DTypeIn, DTypeOut, ROTARY_MODE>;
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 65536);
     kernel<<<nblks, nthrs, shmem_size, stream>>>(q, k, v, o, m_global, d_global, mutex, sm_scale,
                                                  seq_len, head_dim, rotary_pi_inv_ratio,
                                                  suggested_kv_chunk_size);

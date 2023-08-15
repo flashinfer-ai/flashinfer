@@ -3,7 +3,7 @@
 #include <flashinfer.cuh>
 #include <nvbench/nvbench.cuh>
 
-template <typename dtype_in, typename dtype_out, int seq_len, int num_heads, int head_dim>
+template <typename dtype_in, typename dtype_out, size_t seq_len, size_t num_heads, size_t head_dim>
 void bench_flashinfer_decode(nvbench::state &state) {
   // Allocate input data:
   thrust::device_vector<dtype_in> Q(num_heads * head_dim);
