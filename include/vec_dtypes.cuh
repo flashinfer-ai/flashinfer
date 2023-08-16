@@ -17,6 +17,7 @@ struct vec_t {
   TVM_XINLINE void fill(float_t val);
   TVM_XINLINE void load(const float_t *ptr);
   TVM_XINLINE void store(float_t *ptr);
+  TVM_XINLINE static void memcpy(float_t *dst, const float_t *src);
 };
 
 // half x 1
@@ -28,6 +29,7 @@ struct vec_t<half, 1> {
   TVM_XINLINE void fill(half val);
   TVM_XINLINE void load(const half *ptr);
   TVM_XINLINE void store(half *ptr);
+  TVM_XINLINE static void memcpy(half *dst, const half *src);
 };
 
 TVM_XINLINE void vec_t<half, 1>::fill(half val) { data = val; }
@@ -35,6 +37,8 @@ TVM_XINLINE void vec_t<half, 1>::fill(half val) { data = val; }
 TVM_XINLINE void vec_t<half, 1>::load(const half *ptr) { data = *ptr; }
 
 TVM_XINLINE void vec_t<half, 1>::store(half *ptr) { *ptr = data; }
+
+TVM_XINLINE void vec_t<half, 1>::memcpy(half *dst, const half *src) { *dst = *src; }
 
 // half x 2
 template <>
@@ -45,6 +49,7 @@ struct vec_t<half, 2> {
   TVM_XINLINE void fill(half val);
   TVM_XINLINE void load(const half *ptr);
   TVM_XINLINE void store(half *ptr);
+  TVM_XINLINE static void memcpy(half *dst, const half *src);
 };
 
 TVM_XINLINE void vec_t<half, 2>::fill(half val) { data = make_half2(val, val); }
@@ -52,6 +57,10 @@ TVM_XINLINE void vec_t<half, 2>::fill(half val) { data = make_half2(val, val); }
 TVM_XINLINE void vec_t<half, 2>::load(const half *ptr) { data = *((half2 *)ptr); }
 
 TVM_XINLINE void vec_t<half, 2>::store(half *ptr) { *((half2 *)ptr) = data; }
+
+TVM_XINLINE void vec_t<half, 2>::memcpy(half *dst, const half *src) {
+  *((half2 *)dst) = *((half2 *)src);
+}
 
 // half x 4
 
@@ -63,6 +72,7 @@ struct vec_t<half, 4> {
   TVM_XINLINE void fill(half val);
   TVM_XINLINE void load(const half *ptr);
   TVM_XINLINE void store(half *ptr);
+  TVM_XINLINE static void memcpy(half *dst, const half *src);
 };
 
 TVM_XINLINE void vec_t<half, 4>::fill(half val) {
@@ -74,6 +84,10 @@ TVM_XINLINE void vec_t<half, 4>::load(const half *ptr) { data = *((uint2 *)ptr);
 
 TVM_XINLINE void vec_t<half, 4>::store(half *ptr) { *((uint2 *)ptr) = data; }
 
+TVM_XINLINE void vec_t<half, 4>::memcpy(half *dst, const half *src) {
+  *((uint2 *)dst) = *((uint2 *)src);
+}
+
 // half x 8
 
 template <>
@@ -84,6 +98,7 @@ struct vec_t<half, 8> {
   TVM_XINLINE void fill(half val);
   TVM_XINLINE void load(const half *ptr);
   TVM_XINLINE void store(half *ptr);
+  TVM_XINLINE static void memcpy(half *dst, const half *src);
 };
 
 TVM_XINLINE void vec_t<half, 8>::fill(half val) {
@@ -97,6 +112,10 @@ TVM_XINLINE void vec_t<half, 8>::load(const half *ptr) { data = *((uint4 *)ptr);
 
 TVM_XINLINE void vec_t<half, 8>::store(half *ptr) { *((uint4 *)ptr) = data; }
 
+TVM_XINLINE void vec_t<half, 8>::memcpy(half *dst, const half *src) {
+  *((uint4 *)dst) = *((uint4 *)src);
+}
+
 // float x 1
 
 template <>
@@ -107,6 +126,7 @@ struct vec_t<float, 1> {
   TVM_XINLINE void fill(float val);
   TVM_XINLINE void load(const float *ptr);
   TVM_XINLINE void store(float *ptr);
+  TVM_XINLINE static void memcpy(float *dst, const float *src);
 };
 
 TVM_XINLINE void vec_t<float, 1>::fill(float val) { data = val; }
@@ -114,6 +134,8 @@ TVM_XINLINE void vec_t<float, 1>::fill(float val) { data = val; }
 TVM_XINLINE void vec_t<float, 1>::load(const float *ptr) { data = *ptr; }
 
 TVM_XINLINE void vec_t<float, 1>::store(float *ptr) { *ptr = data; }
+
+TVM_XINLINE void vec_t<float, 1>::memcpy(float *dst, const float *src) { *dst = *src; }
 
 // float x 2
 
@@ -125,6 +147,7 @@ struct vec_t<float, 2> {
   TVM_XINLINE void fill(float val);
   TVM_XINLINE void load(const float *ptr);
   TVM_XINLINE void store(float *ptr);
+  TVM_XINLINE static void memcpy(float *dst, const float *src);
 };
 
 TVM_XINLINE void vec_t<float, 2>::fill(float val) { data = make_float2(val, val); }
@@ -132,6 +155,10 @@ TVM_XINLINE void vec_t<float, 2>::fill(float val) { data = make_float2(val, val)
 TVM_XINLINE void vec_t<float, 2>::load(const float *ptr) { data = *((float2 *)ptr); }
 
 TVM_XINLINE void vec_t<float, 2>::store(float *ptr) { *((float2 *)ptr) = data; }
+
+TVM_XINLINE void vec_t<float, 2>::memcpy(float *dst, const float *src) {
+  *((float2 *)dst) = *((float2 *)src);
+}
 
 // float x 4
 
@@ -143,6 +170,7 @@ struct vec_t<float, 4> {
   TVM_XINLINE void fill(float val);
   TVM_XINLINE void load(const float *ptr);
   TVM_XINLINE void store(float *ptr);
+  TVM_XINLINE static void memcpy(float *dst, const float *src);
 };
 
 TVM_XINLINE void vec_t<float, 4>::fill(float val) { data = make_float4(val, val, val, val); }
@@ -150,6 +178,10 @@ TVM_XINLINE void vec_t<float, 4>::fill(float val) { data = make_float4(val, val,
 TVM_XINLINE void vec_t<float, 4>::load(const float *ptr) { data = *((float4 *)ptr); }
 
 TVM_XINLINE void vec_t<float, 4>::store(float *ptr) { *((float4 *)ptr) = data; }
+
+TVM_XINLINE void vec_t<float, 4>::memcpy(float *dst, const float *src) {
+  *((float4 *)dst) = *((float4 *)src);
+}
 
 template <>
 struct vec_t<float, 8> {
@@ -159,6 +191,7 @@ struct vec_t<float, 8> {
   TVM_XINLINE void fill(float val);
   TVM_XINLINE void load(const float *ptr);
   TVM_XINLINE void store(float *ptr);
+  TVM_XINLINE static void memcpy(float *dst, const float *src);
 };
 
 TVM_XINLINE void vec_t<float, 8>::fill(float val) {
@@ -171,6 +204,10 @@ TVM_XINLINE void vec_t<float, 8>::fill(float val) {
 TVM_XINLINE void vec_t<float, 8>::load(const float *ptr) { data = *((ulonglong4 *)ptr); }
 
 TVM_XINLINE void vec_t<float, 8>::store(float *ptr) { *((ulonglong4 *)ptr) = data; }
+
+TVM_XINLINE void vec_t<float, 8>::memcpy(float *dst, const float *src) {
+  *((ulonglong4 *)dst) = *((ulonglong4 *)src);
+}
 
 }  // namespace flashinfer
 

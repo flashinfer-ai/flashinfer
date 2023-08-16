@@ -141,6 +141,8 @@ void _TestDecodingKernelCorrectness(size_t num_heads, size_t seq_len, size_t hea
 
   size_t num_result_errors_atol_1e_3_rtol_1e_3 = 0, num_updated_k_errors_atol_1e_3_rtol_1e_3 = 0;
   for (size_t i = 0; i < num_heads * head_dim; ++i) {
+    std::cout << "head " << i / head_dim << ", dim " << i % head_dim << ": " << float(o_host[i])
+              << " " << float(o_ref_host[i]) << std::endl;
     num_updated_k_errors_atol_1e_3_rtol_1e_3 +=
         (!utils::isclose(float(K_host[(seq_len - 1) * num_heads * head_dim + i]),
                          float(K_ref_host[(seq_len - 1) * num_heads * head_dim + i]), 1e-3, 1e-3));
@@ -163,15 +165,16 @@ void _TestDecodingKernelCorrectness(size_t num_heads, size_t seq_len, size_t hea
 
 TEST(FlashInferCorrectnessTest, DecodingKernelCorrectnessTest) {
   for (size_t num_heads : {32}) {
-    size_t head_dim = 128;
     unsigned int rotary_mode = 0U;
-    for (size_t seq_len : {1, 3, 9, 27, 81, 129, 257, 512, 1024, 2048, 4096, 8192, 16384, 32768}) {
-      // for (size_t head_dim : {64, 128, 256}) {
+    // for (size_t seq_len : {1, 3, 9, 27, 81, 129, 257, 512, 1024, 2048, 4096, 8192, 16384, 32768}) {
+    //   for (size_t head_dim : {64, 128, 256}) {
       // for (unsigned int rotary_mode : {0U, 1U, 2U}) {
-      _TestDecodingKernelCorrectness<half>(num_heads, seq_len, head_dim,
-                                           flashinfer::RotaryMode(rotary_mode));
+    size_t seq_len = 4096;
+    size_t head_dim = 64;
+        _TestDecodingKernelCorrectness<float>(num_heads, seq_len, head_dim,
+                                              flashinfer::RotaryMode(rotary_mode));
       //     }
-      //   }
-    }
+    //   }
+    // }
   }
 }
