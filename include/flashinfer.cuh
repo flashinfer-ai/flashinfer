@@ -129,6 +129,7 @@ __device__ __forceinline__ void update_local_states(
     float m_prev = m, d_prev = d;
     vec_t<DTypeIn, vec_size> v_vec;
     v_vec.load(smem + kv_shared_offset[compute_stage_idx] + j * head_dim + threadIdx.x * vec_size);
+    block.sync();
     m = max(m, x);
     d = d * exp(m_prev - m) + exp(x - m);
 #pragma unroll
@@ -178,14 +179,14 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
 
   extern __shared__ DTypeIn smem[];
 
+  size_t j = threadIdx.y, head_idx = head_idx_start + j;
   // load q tile
   vec_t<DTypeIn, vec_size>::memcpy(
-      smem + threadIdx.y * head_dim + threadIdx.x * vec_size,
-      q + head_idx_start * head_dim + threadIdx.y * head_dim + threadIdx.x * vec_size);
+      smem + j * head_dim + threadIdx.x * vec_size,
+      q + head_idx * head_dim + threadIdx.x * vec_size);
 
   // apply rotary to q
   vec_t<DTypeIn, vec_size> q_vec;
-  size_t j = threadIdx.y;
   if constexpr (rotary_mode == RotaryMode::kApplyRotary ||
       rotary_mode == RotaryMode::kApplyRotaryUpdateLastK) {
     q_vec = apply_rotary<false, vec_size>(smem + j * head_dim, seq_len - 1, head_dim,
@@ -193,6 +194,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   } else {
     q_vec.load(smem + j * head_dim + threadIdx.x * vec_size);
   }
+  block.sync();
 
   size_t chunk_start = kv_chunk_idx * kv_chunk_size;
   DTypeIn *k_glob = k + (chunk_start * num_heads + head_idx_start) * head_dim,
@@ -202,7 +204,6 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   if constexpr (rotary_mode == RotaryMode::kApplyRotaryUpdateLastK) {
     // for decoding, only do this for the last row in kv-cache
     if (seq_len <= chunk_start + kv_chunk_size) {
-      size_t j = threadIdx.y;
       apply_rotary<true, vec_size>(
           k_glob + ((seq_len - 1 - chunk_start) * num_heads + j) * head_dim, seq_len - 1, head_dim,
           rotary_pi_inv_ratio);
@@ -277,8 +278,6 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   pipeline.consumer_release();
   block.sync();
 
-  // size_t j = threadIdx.y;
-  int head_idx = head_idx_start + j;
   // critical region to sync m/d/o_smem for all ctas
   // acquire lock
   while (atomicCAS(mutex + head_idx * 32 + threadIdx.x, 0, 1) != 0)
@@ -388,7 +387,7 @@ void SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut *o, fl
                              float rotary_pi_inv_ratio = 1.f, cudaStream_t stream = nullptr) {
   constexpr size_t h_chunk_size = 4;
   constexpr size_t stages_count = 4;
-  const float sm_scale = 1.f / sqrtf(float(head_dim));
+  const float sm_scale = 1.f / std::sqrt(float(head_dim));
   assert(head_dim % h_chunk_size == 0);
 
   const size_t suggested_kv_chunk_size = std::max<size_t>(

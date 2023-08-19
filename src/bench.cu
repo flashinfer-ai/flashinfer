@@ -10,9 +10,9 @@ void bench_flashinfer_decode(nvbench::state &state) {
   thrust::device_vector<dtype_in> K(seq_len * num_heads * head_dim);
   thrust::device_vector<dtype_in> V(seq_len * num_heads * head_dim);
   thrust::device_vector<dtype_out> O(num_heads * head_dim);
-  thrust::device_vector<float> m_global(num_heads * head_dim);
-  thrust::device_vector<float> d_global(num_heads * head_dim);
-  thrust::device_vector<int> mutex(num_heads * head_dim);
+  thrust::device_vector<float> m_global(num_heads * 32);
+  thrust::device_vector<float> d_global(num_heads * 32);
+  thrust::device_vector<int> mutex(num_heads * 32);
 
   // Provide throughput information:
   state.add_global_memory_reads<dtype_in>(num_heads * head_dim + 2 * seq_len * num_heads * head_dim,
