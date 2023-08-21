@@ -33,3 +33,12 @@ add_executable(flashinfer_tests ${TEST_SRCS})
 target_include_directories(flashinfer_tests PRIVATE ${FLASHINFER_INCLUDE_DIR})
 target_include_directories(flashinfer_tests PRIVATE ${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
 target_link_libraries(flashinfer_tests PRIVATE gtest gtest_main)
+
+
+file(GLOB_RECURSE TVM_BINDING_SRCS ${PROJECT_SOURCE_DIR}/src/tvm_wrapper.cu)
+add_library(tvm_binding OBJECT ${TVM_BINDING_SRCS})
+target_include_directories(tvm_binding PRIVATE ${FLASHINFER_INCLUDE_DIR})
+target_include_directories(tvm_binding PRIVATE ${PROJECT_SOURCE_DIR}/3rdparty/tvm/include)
+target_include_directories(tvm_binding PRIVATE ${PROJECT_SOURCE_DIR}/3rdparty/tvm/3rdparty/dlpack/include)
+target_include_directories(tvm_binding PRIVATE ${PROJECT_SOURCE_DIR}/3rdparty/tvm/3rdparty/dmlc-core/include)
+target_compile_options(tvm_binding PRIVATE -Xcompiler=-fPIC)
