@@ -3,7 +3,9 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#ifdef USE_FP8
 #include <cuda_fp8.h>
+#endif
 #include <cuda_runtime.h>
 
 namespace flashinfer {
@@ -19,6 +21,120 @@ struct vec_t {
   TVM_XINLINE void store(float_t *ptr);
   TVM_XINLINE static void memcpy(float_t *dst, const float_t *src);
 };
+
+#ifdef USE_FP8
+/******************* vec_t<__nv_fp8_e4m3> *******************/
+// __nv_fp8_e4m3 x 1
+template <>
+struct vec_t<__nv_fp8_e4m3, 1> {
+  __nv_fp8_e4m3 data;
+
+  TVM_XINLINE __nv_fp8_e4m3 &operator[](size_t i) { return ((__nv_fp8_e4m3 *)(&data))[i]; }
+  TVM_XINLINE void fill(__nv_fp8_e4m3 val);
+  TVM_XINLINE void load(const __nv_fp8_e4m3 *ptr);
+  TVM_XINLINE void store(__nv_fp8_e4m3 *ptr);
+  TVM_XINLINE static void memcpy(__nv_fp8_e4m3 *dst, const __nv_fp8_e4m3 *src);
+};
+
+TVM_XINLINE void vec_t<__nv_fp8_e4m3, 1>::fill(__nv_fp8_e4m3 val) { data = val; }
+
+TVM_XINLINE void vec_t<__nv_fp8_e4m3, 1>::load(const __nv_fp8_e4m3 *ptr) { data = *ptr; }
+
+TVM_XINLINE void vec_t<__nv_fp8_e4m3, 1>::store(__nv_fp8_e4m3 *ptr) { *ptr = data; }
+
+TVM_XINLINE void vec_t<__nv_fp8_e4m3, 1>::memcpy(__nv_fp8_e4m3 *dst, const __nv_fp8_e4m3 *src) {
+  *dst = *src;
+}
+
+// __nv_fp8_e4m3 x 2
+template <>
+struct vec_t<__nv_fp8_e4m3, 2> {
+  __nv_fp8x2_e4m3 data;
+
+  TVM_XINLINE __nv_fp8_e4m3 &operator[](size_t i) { return ((__nv_fp8_e4m3 *)(&data))[i]; }
+  TVM_XINLINE void fill(__nv_fp8_e4m3 val);
+  TVM_XINLINE void load(const __nv_fp8_e4m3 *ptr);
+  TVM_XINLINE void store(__nv_fp8_e4m3 *ptr);
+  TVM_XINLINE static void memcpy(__nv_fp8_e4m3 *dst, const __nv_fp8_e4m3 *src);
+};
+
+TVM_XINLINE void vec_t<__nv_fp8_e4m3, 2>::fill(__nv_fp8_e4m3 val) {
+  data.__x = (__nv_fp8x2_storage_t(val.__x) << 8) | __nv_fp8x2_storage_t(val.__x);
+}
+
+TVM_XINLINE void vec_t<__nv_fp8_e4m3, 2>::load(const __nv_fp8_e4m3 *ptr) {
+  data = *((__nv_fp8x2_e4m3 *)ptr);
+}
+
+TVM_XINLINE void vec_t<__nv_fp8_e4m3, 2>::store(__nv_fp8_e4m3 *ptr) {
+  *((__nv_fp8x2_e4m3 *)ptr) = data;
+}
+
+TVM_XINLINE void vec_t<__nv_fp8_e4m3, 2>::memcpy(__nv_fp8_e4m3 *dst, const __nv_fp8_e4m3 *src) {
+  *((__nv_fp8x2_e4m3 *)dst) = *((__nv_fp8x2_e4m3 *)src);
+}
+
+// __nv_fp8_e4m3 x 4
+
+template <>
+struct vec_t<__nv_fp8_e4m3, 4> {
+  __nv_fp8x4_e4m3 data;
+
+  TVM_XINLINE __nv_fp8_e4m3 &operator[](size_t i) { return ((__nv_fp8_e4m3 *)(&data))[i]; }
+  TVM_XINLINE void fill(__nv_fp8_e4m3 val);
+  TVM_XINLINE void load(const __nv_fp8_e4m3 *ptr);
+  TVM_XINLINE void store(__nv_fp8_e4m3 *ptr);
+  TVM_XINLINE static void memcpy(__nv_fp8_e4m3 *dst, const __nv_fp8_e4m3 *src);
+};
+
+TVM_XINLINE void vec_t<__nv_fp8_e4m3, 4>::fill(__nv_fp8_e4m3 val) {
+  data.__x = (__nv_fp8x4_storage_t(val.__x) << 24) | (__nv_fp8x4_storage_t(val.__x) << 16) |
+             (__nv_fp8x4_storage_t(val.__x) << 8) | __nv_fp8x4_storage_t(val.__x);
+}
+
+TVM_XINLINE void vec_t<__nv_fp8_e4m3, 4>::load(const __nv_fp8_e4m3 *ptr) {
+  data = *((__nv_fp8x4_e4m3 *)ptr);
+}
+
+TVM_XINLINE void vec_t<__nv_fp8_e4m3, 4>::store(__nv_fp8_e4m3 *ptr) {
+  *((__nv_fp8x4_e4m3 *)ptr) = data;
+}
+
+TVM_XINLINE void vec_t<__nv_fp8_e4m3, 4>::memcpy(__nv_fp8_e4m3 *dst, const __nv_fp8_e4m3 *src) {
+  *((__nv_fp8x4_e4m3 *)dst) = *((__nv_fp8x4_e4m3 *)src);
+}
+
+// __nv_fp8_e4m3 x 8
+
+template <>
+struct vec_t<__nv_fp8_e4m3, 8> {
+  uint2 data;
+
+  TVM_XINLINE __nv_fp8_e4m3 &operator[](size_t i) { return ((__nv_fp8_e4m3 *)(&data))[i]; }
+  TVM_XINLINE void fill(__nv_fp8_e4m3 val);
+  TVM_XINLINE void load(const __nv_fp8_e4m3 *ptr);
+  TVM_XINLINE void store(__nv_fp8_e4m3 *ptr);
+  TVM_XINLINE static void memcpy(__nv_fp8_e4m3 *dst, const __nv_fp8_e4m3 *src);
+};
+
+TVM_XINLINE void vec_t<__nv_fp8_e4m3, 8>::fill(__nv_fp8_e4m3 val) {
+  ((__nv_fp8x4_e4m3 *)(data.x))->__x =
+      (__nv_fp8x4_storage_t(val.__x) << 24) | (__nv_fp8x4_storage_t(val.__x) << 16) |
+      (__nv_fp8x4_storage_t(val.__x) << 8) | __nv_fp8x4_storage_t(val.__x);
+  ((__nv_fp8x4_e4m3 *)(data.y))->__x =
+      (__nv_fp8x4_storage_t(val.__x) << 24) | (__nv_fp8x4_storage_t(val.__x) << 16) |
+      (__nv_fp8x4_storage_t(val.__x) << 8) | __nv_fp8x4_storage_t(val.__x);
+}
+
+TVM_XINLINE void vec_t<__nv_fp8_e4m3, 8>::load(const __nv_fp8_e4m3 *ptr) { data = *((uint2 *)ptr); }
+
+TVM_XINLINE void vec_t<__nv_fp8_e4m3, 8>::store(__nv_fp8_e4m3 *ptr) { *((uint2 *)ptr) = data; }
+
+TVM_XINLINE void vec_t<__nv_fp8_e4m3, 8>::memcpy(__nv_fp8_e4m3 *dst, const __nv_fp8_e4m3 *src) {
+  *((__nv_fp8_e4m3 *)dst) = *((__nv_fp8_e4m3 *)src);
+}
+
+#endif
 
 /******************* vec_t<half> *******************/
 
@@ -156,7 +272,9 @@ struct vec_t<nv_bfloat16, 2> {
 
 TVM_XINLINE void vec_t<nv_bfloat16, 2>::fill(nv_bfloat16 val) { data = make_bfloat162(val, val); }
 
-TVM_XINLINE void vec_t<nv_bfloat16, 2>::load(const nv_bfloat16 *ptr) { data = *((nv_bfloat162 *)ptr); }
+TVM_XINLINE void vec_t<nv_bfloat16, 2>::load(const nv_bfloat16 *ptr) {
+  data = *((nv_bfloat162 *)ptr);
+}
 
 TVM_XINLINE void vec_t<nv_bfloat16, 2>::store(nv_bfloat16 *ptr) { *((nv_bfloat162 *)ptr) = data; }
 
