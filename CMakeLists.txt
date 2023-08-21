@@ -4,6 +4,8 @@ project(flashinfer CUDA CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 
+set(FLASHINFER_USE_FP8 ON CACHE STRING "Whether compile fp8 kernels or not.")
+
 set(CMAKE_CUDA_ARCHITECTURES native)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules")
 add_subdirectory(3rdparty/nvbench)
@@ -14,6 +16,11 @@ set(
   FLASHINFER_INCLUDE_DIR
   ${PROJECT_SOURCE_DIR}/include
 )
+
+if(FLASHINFER_USE_FP8)
+  message(STATUS "Compile fp8 kernels.")
+  add_definitions(-DFLASHINFER_USE_FP8)
+endif(FLASHINFER_USE_FP8)
 
 file(GLOB_RECURSE BENCHMAKR_SRCS ${PROJECT_SOURCE_DIR}/src/bench.cu)
 add_executable(flashinfer_benchmark ${BENCHMAKR_SRCS})

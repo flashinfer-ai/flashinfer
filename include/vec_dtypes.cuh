@@ -3,7 +3,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#ifdef USE_FP8
+#ifdef FLASHINFER_USE_FP8
 #include <cuda_fp8.h>
 #endif
 #include <cuda_runtime.h>
@@ -22,7 +22,7 @@ struct vec_t {
   TVM_XINLINE static void memcpy(float_t *dst, const float_t *src);
 };
 
-#ifdef USE_FP8
+#ifdef FLASHINFER_USE_FP8
 /******************* vec_t<__nv_fp8_e4m3> *******************/
 
 // __nv_fp8_e4m3 x 1
@@ -119,10 +119,10 @@ struct vec_t<__nv_fp8_e4m3, 8> {
 };
 
 TVM_XINLINE void vec_t<__nv_fp8_e4m3, 8>::fill(__nv_fp8_e4m3 val) {
-  ((__nv_fp8x4_e4m3 *)(data.x))->__x =
+  ((__nv_fp8x4_e4m3 *)(&data.x))->__x =
       (__nv_fp8x4_storage_t(val.__x) << 24) | (__nv_fp8x4_storage_t(val.__x) << 16) |
       (__nv_fp8x4_storage_t(val.__x) << 8) | __nv_fp8x4_storage_t(val.__x);
-  ((__nv_fp8x4_e4m3 *)(data.y))->__x =
+  ((__nv_fp8x4_e4m3 *)(&data.y))->__x =
       (__nv_fp8x4_storage_t(val.__x) << 24) | (__nv_fp8x4_storage_t(val.__x) << 16) |
       (__nv_fp8x4_storage_t(val.__x) << 8) | __nv_fp8x4_storage_t(val.__x);
 }
@@ -231,10 +231,10 @@ struct vec_t<__nv_fp8_e5m2, 8> {
 };
 
 TVM_XINLINE void vec_t<__nv_fp8_e5m2, 8>::fill(__nv_fp8_e5m2 val) {
-  ((__nv_fp8x4_e5m2 *)(data.x))->__x =
+  ((__nv_fp8x4_e5m2 *)(&data.x))->__x =
       (__nv_fp8x4_storage_t(val.__x) << 24) | (__nv_fp8x4_storage_t(val.__x) << 16) |
       (__nv_fp8x4_storage_t(val.__x) << 8) | __nv_fp8x4_storage_t(val.__x);
-  ((__nv_fp8x4_e5m2 *)(data.y))->__x =
+  ((__nv_fp8x4_e5m2 *)(&data.y))->__x =
       (__nv_fp8x4_storage_t(val.__x) << 24) | (__nv_fp8x4_storage_t(val.__x) << 16) |
       (__nv_fp8x4_storage_t(val.__x) << 8) | __nv_fp8x4_storage_t(val.__x);
 }

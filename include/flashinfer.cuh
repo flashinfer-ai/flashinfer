@@ -354,10 +354,10 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
         auto kernel = SingleDecodeWithKVCacheKernel<DTypeIn, DTypeOut, VEC_SIZE, ROTARY_MODE>;
         int num_blocks_per_sm = 0;
         int num_thrs = 128;
-        cudaDeviceProp deviceProp;
-        cudaGetDeviceProperties(&deviceProp, 0);
+        cudaDeviceProp device_prop;
+        cudaGetDeviceProperties(&device_prop, 0);
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, num_thrs, shmem);
-        size_t max_num_blks = size_t(num_blocks_per_sm) * deviceProp.multiProcessorCount;
+        size_t max_num_blks = size_t(num_blocks_per_sm) * device_prop.multiProcessorCount;
         size_t max_num_kv_chunks = max_num_blks / (num_heads / h_chunk_size);
         // minimum kv-chunk size is 4
         size_t kv_chunk_size = max((seq_len + max_num_kv_chunks - 1UL) / max_num_kv_chunks, 4UL);
