@@ -17,11 +17,14 @@ void bench_flashinfer_decode(nvbench::state &state) {
                                           "DataSize");
   state.add_global_memory_writes<dtype_out>(num_heads * head_dim);
 
-  state.exec([&](nvbench::launch &launch) {
+  state.exec(nvbench::exec_tag::timer, [&](nvbench::launch &launch, auto &timer) {
+    timer.start();
     flashinfer::SingleDecodeWithKVCache(
         thrust::raw_pointer_cast(Q.data()), thrust::raw_pointer_cast(K.data()),
         thrust::raw_pointer_cast(V.data()), thrust::raw_pointer_cast(O.data()),
-        thrust::raw_pointer_cast(tmp.data()), num_heads, seq_len, head_dim);
+        thrust::raw_pointer_cast(tmp.data()), num_heads, seq_len, head_dim,
+        flashinfer::RotaryMode::kNone, 1.f, launch.get_stream());
+    timer.stop();
   });
 }
 
