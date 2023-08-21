@@ -20,6 +20,8 @@ struct vec_t {
   TVM_XINLINE static void memcpy(float_t *dst, const float_t *src);
 };
 
+/******************* vec_t<half> *******************/
+
 // half x 1
 template <>
 struct vec_t<half, 1> {
@@ -115,6 +117,108 @@ TVM_XINLINE void vec_t<half, 8>::store(half *ptr) { *((uint4 *)ptr) = data; }
 TVM_XINLINE void vec_t<half, 8>::memcpy(half *dst, const half *src) {
   *((uint4 *)dst) = *((uint4 *)src);
 }
+
+/******************* vec_t<nv_bfloat16> *******************/
+
+// nv_bfloat16 x 1
+template <>
+struct vec_t<nv_bfloat16, 1> {
+  nv_bfloat16 data;
+
+  TVM_XINLINE nv_bfloat16 &operator[](size_t i) { return ((nv_bfloat16 *)(&data))[i]; }
+  TVM_XINLINE void fill(nv_bfloat16 val);
+  TVM_XINLINE void load(const nv_bfloat16 *ptr);
+  TVM_XINLINE void store(nv_bfloat16 *ptr);
+  TVM_XINLINE static void memcpy(nv_bfloat16 *dst, const nv_bfloat16 *src);
+};
+
+TVM_XINLINE void vec_t<nv_bfloat16, 1>::fill(nv_bfloat16 val) { data = val; }
+
+TVM_XINLINE void vec_t<nv_bfloat16, 1>::load(const nv_bfloat16 *ptr) { data = *ptr; }
+
+TVM_XINLINE void vec_t<nv_bfloat16, 1>::store(nv_bfloat16 *ptr) { *ptr = data; }
+
+TVM_XINLINE void vec_t<nv_bfloat16, 1>::memcpy(nv_bfloat16 *dst, const nv_bfloat16 *src) {
+  *dst = *src;
+}
+
+// nv_bfloat16 x 2
+template <>
+struct vec_t<nv_bfloat16, 2> {
+  nv_bfloat162 data;
+
+  TVM_XINLINE nv_bfloat16 &operator[](size_t i) { return ((nv_bfloat16 *)(&data))[i]; }
+  TVM_XINLINE void fill(nv_bfloat16 val);
+  TVM_XINLINE void load(const nv_bfloat16 *ptr);
+  TVM_XINLINE void store(nv_bfloat16 *ptr);
+  TVM_XINLINE static void memcpy(nv_bfloat16 *dst, const nv_bfloat16 *src);
+};
+
+TVM_XINLINE void vec_t<nv_bfloat16, 2>::fill(nv_bfloat16 val) { data = make_bfloat162(val, val); }
+
+TVM_XINLINE void vec_t<nv_bfloat16, 2>::load(const nv_bfloat16 *ptr) { data = *((nv_bfloat162 *)ptr); }
+
+TVM_XINLINE void vec_t<nv_bfloat16, 2>::store(nv_bfloat16 *ptr) { *((nv_bfloat162 *)ptr) = data; }
+
+TVM_XINLINE void vec_t<nv_bfloat16, 2>::memcpy(nv_bfloat16 *dst, const nv_bfloat16 *src) {
+  *((nv_bfloat162 *)dst) = *((nv_bfloat162 *)src);
+}
+
+// nv_bfloat16 x 4
+
+template <>
+struct vec_t<nv_bfloat16, 4> {
+  uint2 data;
+
+  TVM_XINLINE nv_bfloat16 &operator[](size_t i) { return ((nv_bfloat16 *)(&data))[i]; }
+  TVM_XINLINE void fill(nv_bfloat16 val);
+  TVM_XINLINE void load(const nv_bfloat16 *ptr);
+  TVM_XINLINE void store(nv_bfloat16 *ptr);
+  TVM_XINLINE static void memcpy(nv_bfloat16 *dst, const nv_bfloat16 *src);
+};
+
+TVM_XINLINE void vec_t<nv_bfloat16, 4>::fill(nv_bfloat16 val) {
+  *(nv_bfloat162 *)(&data.x) = make_bfloat162(val, val);
+  *(nv_bfloat162 *)(&data.y) = make_bfloat162(val, val);
+}
+
+TVM_XINLINE void vec_t<nv_bfloat16, 4>::load(const nv_bfloat16 *ptr) { data = *((uint2 *)ptr); }
+
+TVM_XINLINE void vec_t<nv_bfloat16, 4>::store(nv_bfloat16 *ptr) { *((uint2 *)ptr) = data; }
+
+TVM_XINLINE void vec_t<nv_bfloat16, 4>::memcpy(nv_bfloat16 *dst, const nv_bfloat16 *src) {
+  *((uint2 *)dst) = *((uint2 *)src);
+}
+
+// nv_bfloat16 x 8
+
+template <>
+struct vec_t<nv_bfloat16, 8> {
+  uint4 data;
+
+  TVM_XINLINE nv_bfloat16 &operator[](size_t i) { return ((nv_bfloat16 *)(&data))[i]; }
+  TVM_XINLINE void fill(nv_bfloat16 val);
+  TVM_XINLINE void load(const nv_bfloat16 *ptr);
+  TVM_XINLINE void store(nv_bfloat16 *ptr);
+  TVM_XINLINE static void memcpy(nv_bfloat16 *dst, const nv_bfloat16 *src);
+};
+
+TVM_XINLINE void vec_t<nv_bfloat16, 8>::fill(nv_bfloat16 val) {
+  *(nv_bfloat162 *)(&data.x) = make_bfloat162(val, val);
+  *(nv_bfloat162 *)(&data.y) = make_bfloat162(val, val);
+  *(nv_bfloat162 *)(&data.z) = make_bfloat162(val, val);
+  *(nv_bfloat162 *)(&data.w) = make_bfloat162(val, val);
+}
+
+TVM_XINLINE void vec_t<nv_bfloat16, 8>::load(const nv_bfloat16 *ptr) { data = *((uint4 *)ptr); }
+
+TVM_XINLINE void vec_t<nv_bfloat16, 8>::store(nv_bfloat16 *ptr) { *((uint4 *)ptr) = data; }
+
+TVM_XINLINE void vec_t<nv_bfloat16, 8>::memcpy(nv_bfloat16 *dst, const nv_bfloat16 *src) {
+  *((uint4 *)dst) = *((uint4 *)src);
+}
+
+/******************* vec_t<float> *******************/
 
 // float x 1
 
