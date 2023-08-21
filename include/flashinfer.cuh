@@ -60,8 +60,8 @@ inline std::string RotaryModeToString(const RotaryMode &rotary_mode) {
 /*!
  * \brief Apply ROPE(Rotary Positional Embeddings) to input[0: head_dim], return
  *   thread-local result.
+ * \tparam vec_size A template integer indicates the vector size used in the kernel.
  * \tparam T A template type indicates the input data type
- * \tparam inplace_update A boolean indicates whether to update the input data inplace
  * \param input A pointer to the start of input data
  * \param offset A integer indicates the offset of the position in ROPE(Rotary Positional
  *   Embeddings).
@@ -92,17 +92,15 @@ __device__ __forceinline__ vec_t<T, vec_size> apply_rotary(T *input, size_t offs
 /*!
  * \brief FlashAttention decoding cuda kernel with kv-cache for a single sequence, fused with
  *   rotary positional embeddings (if applicable).
- * \tparam num_warps A integer indicates the number of warps used in the kernel
  * \tparam DTypeIn A template type indicates the input data type
  * \tparam DTypeOut A template type indicates the output data type
+ * \tparam vec_size A template integer indicates the vector size used in the kernel.
  * \tparam rotary_mode The rotary mode used in the kernel.
  * \param q [num_heads, head_dim] The query matrix
  * \param k [seq_len, num_heads, head_dim] The key matrix in kv-cache
  * \param v [seq_len, num_heads, head_dim] The value matrix in kv-cache
  * \param o [num_heads, head_dim] The output matrix
- * \param m_global [num_heads, head_dim] The m state used in online-softmax
- * \param d_global [num_heads, head_dim] The d state used in online-softmax
- * \param mutex [num_heads, head_dim] The mutex used to sync m/d/o for all threadblocks
+ * \param tmp Used-allocated temporary buffer used in the kernel, recommended size is 8MB.
  * \param sm_scale A float indicates the scale applied to pre-softmax logits
  * \param seq_len A integer indicates the sequence length
  * \param head_dim A integer indicates the head dimension
@@ -320,15 +318,6 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     }                                                                            \
   }
 
-inline int get_heuristic_max_num_threadblocks(int seq_len) {
-  if (seq_len <= 128) {
-    return 64;
-  } else if (seq_len <= 2048) {
-    return 128;
-  }
-  return 999;
-}
-
 /*!
  * \brief FlashAttention decoding with kv-cache for a single sequence.
  * \tparam DTypeIn A template type indicates the input data type
@@ -337,12 +326,10 @@ inline int get_heuristic_max_num_threadblocks(int seq_len) {
  * \param k [seq_len, num_heads, head_dim] The key matrix in kv-cache
  * \param v [seq_len, num_heads, head_dim] The value matrix in kv-cache
  * \param o [num_heads, head_dim] The output matrix
- * \param m_global [num_heads, head_dim] The m state used in online-softmax
- * \param d_global [num_heads, head_dim] The d state used in online-softmax
- * \param mutex [num_heads, head_dim] The mutex used to sync m/d/o for all threadblocks
+ * \param tmp Used-allocated temporary buffer used in the kernel, recommended size is 8MB.
  * \param num_heads A integer indicates the number of heads
  * \param seq_len A integer indicates the sequence length
- * \param head_dim A integer indicates the head dimension
+ * \param head_dim A integer indicates the head dimension,
  * \param rotary_mode The rotary mode used in the kernel.
  * \param rotary_pi_inv_ratio A floating point number indicate the inverse of scaling ratio
  *   used in PI(Position Interpolation) for ROPE (Rotary Positional Embeddings).
