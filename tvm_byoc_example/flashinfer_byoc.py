@@ -2,10 +2,8 @@ import os
 import tvm
 from tvm.script import ir as I, relax as R, tir as T
 
-
-def FlashInferIRModuleGen(
-    dtype_in: str, dtype_out: str, rotary_mode: int = 0, rope_inv_scale: float = 1.0
-) -> tvm.IRModule:
+# fmt: off
+def FlashInferIRModuleGen(dtype_in: str, dtype_out: str, rotary_mode: int = 0, rope_inv_scale: float = 1.0) -> tvm.IRModule:
     @I.ir_module
     class FlashInferIRModule:
         @R.function
@@ -17,6 +15,7 @@ def FlashInferIRModuleGen(
         ) -> R.Tensor(("seq_len", "num_heads", "head_dim"), dtype_out):
             num_heads = T.int64()
             head_dim = T.int64()
+            dtype = dtype_in
             with R.dataflow():
                 o = R.call_dps_packed(
                     "FlashInferSingleDecodeWithKVCache",

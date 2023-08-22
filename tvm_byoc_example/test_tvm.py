@@ -17,6 +17,7 @@ def _gen_ref(seq_len, num_heads, head_dim, dtype, rope=False):
     q_np = np.random.randn(num_heads, head_dim).astype(dtype)
     k_np = np.random.randn(seq_len, num_heads, head_dim).astype(dtype)
     v_np = np.random.randn(seq_len, num_heads, head_dim).astype(dtype)
+    tmp_np = np.zeros((2 * 1024 * 1024,), "float32")
 
     if rope:
         q_np = f_rope(q_np)
@@ -29,7 +30,7 @@ def _gen_ref(seq_len, num_heads, head_dim, dtype, rope=False):
     s_np = softmax(p_np, axis=-1)
     o_np = np.reshape(s_np @ v_np_T, [num_heads, head_dim])
 
-    return q_np, k_np, v_np, o_np
+    return q_np, k_np, v_np, tmp_np, o_np
 
 
 def test_decode(seq_len, num_heads, head_dim, dtype):
@@ -39,9 +40,9 @@ def test_decode(seq_len, num_heads, head_dim, dtype):
     dev = tvm.device("cuda", 0)
     vm = tvm.relax.VirtualMachine(ex, dev)
     f = vm["decode"]
-    q, k, v, ref = _gen_ref(seq_len, num_heads, head_dim, dtype)
+    q, k, v, tmp, ref = _gen_ref(seq_len, num_heads, head_dim, dtype)
 
-    inputs = [tvm.nd.array(t, dev) for t in [q, k, v]]
+    inputs = [tvm.nd.array(t, dev) for t in [q, k, v, tmp]]
     o = f(*inputs).numpy()
     nans = np.count_nonzero(np.isnan(o))
     assert nans == 0, f"nans = {nans}"
@@ -84,7 +85,7 @@ def test_fused_updated_rope_decode(seq_len, num_heads, head_dim, dtype):
 
 
 if __name__ == "__main__":
-    # test_decode(16, 32, 128, "float32")
+    test_decode(16, 32, 128, "float32")
     test_decode(16, 32, 128, "float16")
     # test_fused_rope_decode(16384, 32, 128, "float32")
     # test_fused_rope_decode(16, 32, 128, "float16")
