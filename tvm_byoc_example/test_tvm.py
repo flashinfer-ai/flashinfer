@@ -2,7 +2,7 @@ import tvm
 import numpy as np
 from tvm.script import ir as I, relax as R, tir as T
 from scipy.special import softmax
-from flashinfer import IRModuleGen
+from flashinfer_byoc import FlashInferIRModuleGen
 
 
 def _gen_ref(seq_len, num_heads, head_dim, dtype, rope=False):
@@ -33,7 +33,7 @@ def _gen_ref(seq_len, num_heads, head_dim, dtype, rope=False):
 
 
 def test_decode(seq_len, num_heads, head_dim, dtype):
-    mod = IRModuleGen(dtype)
+    mod = FlashInferIRModuleGen(dtype, dtype)
     ex = tvm.relax.build(mod, "cuda")
 
     dev = tvm.device("cuda", 0)
@@ -50,7 +50,7 @@ def test_decode(seq_len, num_heads, head_dim, dtype):
 
 
 def test_fused_rope_decode(seq_len, num_heads, head_dim, dtype):
-    mod = IRModuleGen(dtype)
+    mod = FlashInferIRModuleGen(dtype, dtype)
     ex = tvm.relax.build(mod, "cuda")
 
     dev = tvm.device("cuda", 0)
@@ -67,7 +67,7 @@ def test_fused_rope_decode(seq_len, num_heads, head_dim, dtype):
 
 
 def test_fused_updated_rope_decode(seq_len, num_heads, head_dim, dtype):
-    mod = IRModuleGen(dtype)
+    mod = FlashInferIRModuleGen(dtype, dtype)
     ex = tvm.relax.build(mod, "cuda")
 
     dev = tvm.device("cuda", 0)
@@ -80,13 +80,13 @@ def test_fused_updated_rope_decode(seq_len, num_heads, head_dim, dtype):
     nans = np.count_nonzero(np.isnan(o))
     assert nans == 0, f"nans = {nans}"
 
-    # np.testing.assert_allclose(o, ref, rtol=1e-3, atol=1e-3, verbose=True)
+    np.testing.assert_allclose(o, ref, rtol=1e-3, atol=1e-3, verbose=True)
 
 
 if __name__ == "__main__":
     # test_decode(16, 32, 128, "float32")
-    # test_decode(16, 32, 128, "float16")
-    test_fused_rope_decode(16, 32, 128, "float32")
+    test_decode(16, 32, 128, "float16")
+    # test_fused_rope_decode(16384, 32, 128, "float32")
     # test_fused_rope_decode(16, 32, 128, "float16")
     # test_fused_updated_rope_decode(16, 32, 128, "float32")
     # test_fused_updated_rope_decode(16, 32, 128, "float16")
