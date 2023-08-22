@@ -342,10 +342,9 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
                                     RotaryMode rotary_mode = RotaryMode::kNone,
                                     float rotary_pi_inv_ratio = 1.f,
                                     cudaStream_t stream = nullptr) {
-  constexpr size_t h_chunk_size = 4;
-  constexpr size_t stages_count = 4;
   const float sm_scale = 1.f / std::sqrt(float(head_dim));
-  assert(head_dim % h_chunk_size == 0);
+  constexpr size_t h_chunk_size = 4;
+  assert(num_heads % h_chunk_size == 0);
 
   SWITCH_HEAD_DIM(
       head_dim, HEAD_DIM, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {

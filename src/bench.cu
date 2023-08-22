@@ -19,11 +19,14 @@ void bench_flashinfer_decode(nvbench::state &state) {
 
   state.exec(nvbench::exec_tag::timer, [&](nvbench::launch &launch, auto &timer) {
     timer.start();
-    flashinfer::SingleDecodeWithKVCache(
+    cudaError_t status = flashinfer::SingleDecodeWithKVCache(
         thrust::raw_pointer_cast(Q.data()), thrust::raw_pointer_cast(K.data()),
         thrust::raw_pointer_cast(V.data()), thrust::raw_pointer_cast(O.data()),
         thrust::raw_pointer_cast(tmp.data()), num_heads, seq_len, head_dim,
         flashinfer::RotaryMode::kNone, 1.f, launch.get_stream());
+    if (status != cudaSuccess) {
+      state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
+    }
     timer.stop();
   });
 }
