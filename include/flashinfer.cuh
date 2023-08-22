@@ -125,7 +125,6 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   size_t num_kv_chunks = grid.dim_blocks().y;
   size_t num_heads = grid.dim_blocks().x * h_chunk_size;
 
-  // extern __shared__ DTypeIn smem[];
   __shared__ DTypeIn smem[stages_count * h_chunk_size * head_dim];
 
   size_t j = threadIdx.y, head_idx = head_idx_start + j;
