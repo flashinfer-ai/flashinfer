@@ -94,7 +94,7 @@ __device__ __forceinline__ vec_t<T, vec_size> apply_rotary(T *input, size_t offs
  *   rotary positional embeddings (if applicable).
  * \tparam DTypeIn A template type indicates the input data type
  * \tparam DTypeOut A template type indicates the output data type
- * \tparam vec_size A template integer indicates the vector size used in the kernel.
+ * \tparam head_dim The head dimension used in the kernel.
  * \tparam rotary_mode The rotary mode used in the kernel.
  * \param q [num_heads, head_dim] The query matrix
  * \param k [seq_len, num_heads, head_dim] The key matrix in kv-cache
@@ -108,23 +108,25 @@ __device__ __forceinline__ vec_t<T, vec_size> apply_rotary(T *input, size_t offs
  *   used in PI(Position Interpolation) for ROPE (Rotary Positional Embeddings).
  * \param kv_chunk_size A integer indicates the kv-chunk size
  */
-template <typename DTypeIn, typename DTypeOut, size_t vec_size, RotaryMode rotary_mode>
+template <typename DTypeIn, typename DTypeOut, size_t head_dim, RotaryMode rotary_mode>
 __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *__restrict__ k,
                                               DTypeIn *__restrict__ v, DTypeOut *__restrict__ o,
                                               float *__restrict__ tmp, float sm_scale,
-                                              size_t seq_len, size_t head_dim,
-                                              float rotary_pi_inv_ratio, size_t kv_chunk_size) {
+                                              size_t seq_len, float rotary_pi_inv_ratio,
+                                              size_t kv_chunk_size) {
   auto block = cooperative_groups::this_thread_block();
   auto grid = cooperative_groups::this_grid();
 
   constexpr size_t h_chunk_size = 4;
   constexpr size_t stages_count = 4;
+  constexpr size_t vec_size = head_dim / 32;
   size_t head_idx_start = grid.block_index().x * h_chunk_size;
   size_t kv_chunk_idx = grid.block_index().y;
   size_t num_kv_chunks = grid.dim_blocks().y;
   size_t num_heads = grid.dim_blocks().x * h_chunk_size;
 
-  extern __shared__ DTypeIn smem[];
+  // extern __shared__ DTypeIn smem[];
+  __shared__ DTypeIn smem[stages_count * h_chunk_size * head_dim];
 
   size_t j = threadIdx.y, head_idx = head_idx_start + j;
   // apply rotary to q
@@ -267,30 +269,30 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   }
 }
 
-#define SWITCH_VEC_SIZE(vec_size, VEC_SIZE, ...)                      \
-  switch (vec_size) {                                                 \
-    case 1: {                                                         \
-      constexpr size_t VEC_SIZE = 1;                                  \
+#define SWITCH_HEAD_DIM(head_dim, HEAD_DIM, ...)                      \
+  switch (head_dim) {                                                 \
+    case 32: {                                                        \
+      constexpr size_t HEAD_DIM = 32;                                 \
       __VA_ARGS__                                                     \
       break;                                                          \
     }                                                                 \
-    case 2: {                                                         \
-      constexpr size_t VEC_SIZE = 2;                                  \
+    case 64: {                                                        \
+      constexpr size_t HEAD_DIM = 64;                                 \
       __VA_ARGS__                                                     \
       break;                                                          \
     }                                                                 \
-    case 4: {                                                         \
-      constexpr size_t VEC_SIZE = 4;                                  \
+    case 128: {                                                       \
+      constexpr size_t HEAD_DIM = 128;                                \
       __VA_ARGS__                                                     \
       break;                                                          \
     }                                                                 \
-    case 8: {                                                         \
-      constexpr size_t VEC_SIZE = 8;                                  \
+    case 256: {                                                       \
+      constexpr size_t HEAD_DIM = 256;                                \
       __VA_ARGS__                                                     \
       break;                                                          \
     }                                                                 \
     default: {                                                        \
-      std::cerr << "Unsupported vec_size: " << vec_size << std::endl; \
+      std::cerr << "Unsupported head_dim: " << head_dim << std::endl; \
       abort();                                                        \
     }                                                                 \
   }
@@ -346,17 +348,14 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
   const float sm_scale = 1.f / std::sqrt(float(head_dim));
   assert(head_dim % h_chunk_size == 0);
 
-  const size_t shmem = sizeof(DTypeIn) * (stages_count * h_chunk_size * head_dim);
-  const size_t vec_size = head_dim / 32;
-
-  SWITCH_VEC_SIZE(
-      vec_size, VEC_SIZE, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
-        auto kernel = SingleDecodeWithKVCacheKernel<DTypeIn, DTypeOut, VEC_SIZE, ROTARY_MODE>;
+  SWITCH_HEAD_DIM(
+      head_dim, HEAD_DIM, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
+        auto kernel = SingleDecodeWithKVCacheKernel<DTypeIn, DTypeOut, HEAD_DIM, ROTARY_MODE>;
         int num_blocks_per_sm = 0;
         int num_thrs = 128;
         cudaDeviceProp device_prop;
         cudaGetDeviceProperties(&device_prop, 0);
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, num_thrs, shmem);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, num_thrs, 0);
         size_t max_num_blks = size_t(num_blocks_per_sm) * device_prop.multiProcessorCount;
         size_t max_num_kv_chunks = max_num_blks / (num_heads / h_chunk_size);
         // minimum kv-chunk size is 4
@@ -371,10 +370,9 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
                         (void *)&tmp,
                         (void *)&sm_scale,
                         (void *)&seq_len,
-                        (void *)&head_dim,
                         (void *)&rotary_pi_inv_ratio,
                         (void *)&kv_chunk_size};
-        return cudaLaunchCooperativeKernel((void *)kernel, nblks, nthrs, args, shmem, stream);
+        return cudaLaunchCooperativeKernel((void *)kernel, nblks, nthrs, args, 0, stream);
       })});
 }
 
