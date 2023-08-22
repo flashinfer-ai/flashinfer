@@ -104,7 +104,7 @@ __device__ __forceinline__ vec_t<T, vec_size> apply_rotary(T *input, size_t offs
  * \param sm_scale A float indicates the scale applied to pre-softmax logits
  * \param seq_len A integer indicates the sequence length
  * \param head_dim A integer indicates the head dimension
- * \param rotary_pi_inv_ratio A floating point number indicate the inverse of scaling ratio
+ * \param rope_inv_scale A floating point number indicate the inverse of scaling ratio
  *   used in PI(Position Interpolation) for ROPE (Rotary Positional Embeddings).
  * \param kv_chunk_size A integer indicates the kv-chunk size
  */
@@ -112,7 +112,7 @@ template <typename DTypeIn, typename DTypeOut, size_t head_dim, RotaryMode rotar
 __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *__restrict__ k,
                                               DTypeIn *__restrict__ v, DTypeOut *__restrict__ o,
                                               float *__restrict__ tmp, float sm_scale,
-                                              size_t seq_len, float rotary_pi_inv_ratio,
+                                              size_t seq_len, float rope_inv_scale,
                                               size_t kv_chunk_size) {
   auto block = cooperative_groups::this_thread_block();
   auto grid = cooperative_groups::this_grid();
@@ -133,8 +133,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   if constexpr (rotary_mode == RotaryMode::kApplyRotary ||
                 rotary_mode == RotaryMode::kApplyRotaryUpdateLastK) {
     // apply rotary embedding to q matrix
-    q_vec =
-        apply_rotary<vec_size>(q + head_idx * head_dim, seq_len - 1, head_dim, rotary_pi_inv_ratio);
+    q_vec = apply_rotary<vec_size>(q + head_idx * head_dim, seq_len - 1, head_dim, rope_inv_scale);
   } else {
     // do not apply rotary embedding to q matrix
     q_vec.load(q + head_idx * head_dim + threadIdx.x * vec_size);
@@ -190,12 +189,12 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
       if constexpr (rotary_mode == RotaryMode::kApplyRotary) {
         // apply rotary embedding for all rows in k matrix of kv-cache
         k_vec = apply_rotary<vec_size>(smem + kv_shared_offset[compute_stage_idx] + j * head_dim,
-                                       head_kv_idx, head_dim, rotary_pi_inv_ratio);
+                                       head_kv_idx, head_dim, rope_inv_scale);
       } else if constexpr (rotary_mode == RotaryMode::kApplyRotaryUpdateLastK) {
         // apply rotary embedding for the newly appended rows in k matrix of kv-cache
         if (head_kv_idx == seq_len - 1) {
           k_vec = apply_rotary<vec_size>(smem + kv_shared_offset[compute_stage_idx] + j * head_dim,
-                                         head_kv_idx, head_dim, rotary_pi_inv_ratio);
+                                         head_kv_idx, head_dim, rope_inv_scale);
           k_vec.store(k_glob + (head_kv_idx * num_heads + j) * head_dim + threadIdx.x * vec_size);
         } else {
           k_vec.load(smem + kv_shared_offset[compute_stage_idx] + j * head_dim +
@@ -332,7 +331,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
  * \param seq_len A integer indicates the sequence length
  * \param head_dim A integer indicates the head dimension,
  * \param rotary_mode The rotary mode used in the kernel.
- * \param rotary_pi_inv_ratio A floating point number indicate the inverse of scaling ratio
+ * \param rope_inv_scale A floating point number indicate the inverse of scaling ratio
  *   used in PI(Position Interpolation) for ROPE (Rotary Positional Embeddings).
  * \param stream The cuda stream to launch the kernel
  */
@@ -340,8 +339,7 @@ template <typename DTypeIn, typename DTypeOut>
 cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut *o, float *tmp,
                                     size_t num_heads, size_t seq_len, size_t head_dim,
                                     RotaryMode rotary_mode = RotaryMode::kNone,
-                                    float rotary_pi_inv_ratio = 1.f,
-                                    cudaStream_t stream = nullptr) {
+                                    float rope_inv_scale = 1.f, cudaStream_t stream = nullptr) {
   const float sm_scale = 1.f / std::sqrt(float(head_dim));
   constexpr size_t h_chunk_size = 4;
   assert(num_heads % h_chunk_size == 0);
@@ -368,7 +366,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
                         (void *)&tmp,
                         (void *)&sm_scale,
                         (void *)&seq_len,
-                        (void *)&rotary_pi_inv_ratio,
+                        (void *)&rope_inv_scale,
                         (void *)&kv_chunk_size};
         return cudaLaunchCooperativeKernel((void *)kernel, nblks, nthrs, args, 0, stream);
       })});

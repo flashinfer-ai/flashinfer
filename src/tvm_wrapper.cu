@@ -26,7 +26,7 @@ using tvm::runtime::ShapeTuple;
   }
 
 int _FlashInferSingleDecodeWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, DLTensor* o,
-                                       DLTensor* tmp) {
+                                       DLTensor* tmp, int64_t rotary_mode, double rope_inv_scale) {
   CHECK_EQ(q->ndim, 2);
   size_t num_heads = q->shape[0];
   size_t head_dim = q->shape[1];
@@ -48,7 +48,8 @@ int _FlashInferSingleDecodeWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, DL
   SWITCH_TVM_CUDA_DTYPE(q->dtype, dtype_in, {SWITCH_TVM_CUDA_DTYPE(o->dtype, dtype_out, {
                           flashinfer::SingleDecodeWithKVCache(
                               (dtype_in*)q->data, (dtype_in*)k->data, (dtype_in*)v->data,
-                              (dtype_out*)o->data, (float*)tmp->data, num_heads, seq_len, head_dim);
+                              (dtype_out*)o->data, (float*)tmp->data, num_heads, seq_len, head_dim,
+                              flashinfer::RotaryMode(rotary_mode), rope_inv_scale);
                         })});
 
   return 0;
