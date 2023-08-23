@@ -172,7 +172,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     if (tail_kv_idx < min(chunk_start + kv_chunk_size, seq_len)) {
       pipeline.producer_acquire();
       cuda::memcpy_async(block, smem + kv_shared_offset[copy_stage_idx],
-                         k_glob + tail_kv_idx * num_heads * head_dim,
+                         (tail % 2 == 0 ? k_glob: v_glob) + tail_kv_idx * num_heads * head_dim,
                          sizeof(DTypeIn) * h_chunk_size * head_dim, pipeline);
       pipeline.producer_commit();
       ++tail;
