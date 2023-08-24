@@ -93,6 +93,26 @@ __device__ __forceinline__ vec_t<float, vec_size> apply_rotary(const T *input, s
   return vec;
 }
 
+/*!
+ * \brief Load k tile from smem and compute qk
+ * \tparam rotary_mode The rotary mode used in the kernel.
+ * \tparam T A template type indicates the input data type
+ * \tparam vec_size A template integer indicates the vector size used in the kernel.
+ * \param smem A pointer to the start of shared memory
+ * \param q_vec A vector of float indicates the thread-local query vector
+ * \param kv_shared_offset An array of size_t indicates the k/v tiles offset in shared memory of
+ * different pipeline stages \param offset A integer indicates the offset of the position in RoPE
+ * (Rotary Positional Embeddings) \param compute_stage_idx A integer indicates the compute stage
+ * index in the pipeline \param seq_len A integer indicates the sequence length \param num_heads A
+ * integer indicates the number of heads \param head_dim A integer indicates the head dimension
+ * \param sm_scale A float indicates the scale applied to pre-softmax logits
+ * \param rope_inv_scale A floating number indicate the multiplicative inverse of scaling ratio
+ *   used in PI(Position Interpolation) of RoPE (Rotary Positional Embeddings).
+ * \param rope_inv_theta A floating number indicate the multiplicative inverse of "theta"
+ *   used in RoPE (Rotary Positional Embeddings).
+ * \param k_glob A pointer to the start of global memory of k matrix in kv-cache
+ * \param x A float indicates the thread-local result of qk
+ */
 template <RotaryMode rotary_mode, typename T, size_t vec_size>
 __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec_size> &q_vec,
                                            const size_t *kv_shared_offset, size_t offset,
@@ -129,6 +149,19 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
   x = warpReduceSum(x);
 }
 
+/*!
+ * \brief Load v tile from shared memory and update partial m,d,o status
+ * \tparam T A template type indicates the input data type
+ * \tparam vec_size A template integer indicates the vector size used in the kernel.
+ * \param smem A pointer to the start of shared memory
+ * \param x A float indicates the pre-softmax logits
+ * \param kv_shared_offset An array of size_t indicates the k/v tiles offset in shared memory of
+ * different pipeline stages. \param compute_stage_idx A integer indicates the compute stage index
+ * in the pipeline \param head_dim A integer indicates the head dimension \param m A float indicates
+ * the thread-local maximum value of pre-softmax logits \param d A float indicates the thread-local
+ * sum of exp(pre-softmax logits - m) \param o A vector of float indicates the thread-local output
+ * vector
+ */
 template <typename T, size_t vec_size>
 __device__ __forceinline__ void update_partial_mdo(const T *smem, float x,
                                                    const size_t *kv_shared_offset,
@@ -188,7 +221,6 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   __shared__ DTypeIn smem[stages_count * h_chunk_size * head_dim];
 
   size_t j = threadIdx.y, head_idx = head_idx_start + j;
-  // apply rotary to q
   vec_t<float, vec_size> q_vec;
   if constexpr (rotary_mode == RotaryMode::kApplyRotary ||
                 rotary_mode == RotaryMode::kApplyRotaryUpdateLastK) {
