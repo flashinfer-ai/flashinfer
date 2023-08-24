@@ -3,7 +3,7 @@ import tvm
 from tvm.script import ir as I, relax as R, tir as T
 
 # fmt: off
-def FlashInferIRModuleGen(dtype_in: str, dtype_out: str, rotary_mode: int = 0, rope_inv_scale: float = 1.0) -> tvm.IRModule:
+def FlashInferIRModuleGen(dtype_in: str, dtype_out: str, rotary_mode: int = 0, rope_scale: float = 1.0, rope_theta: float = 1e4) -> tvm.IRModule:
     @I.ir_module
     class FlashInferIRModule:
         @R.function
@@ -19,7 +19,7 @@ def FlashInferIRModuleGen(dtype_in: str, dtype_out: str, rotary_mode: int = 0, r
             with R.dataflow():
                 o = R.call_dps_packed(
                     "FlashInferSingleDecodeWithKVCache",
-                    (q, k, v, tmp, rotary_mode, rope_inv_scale),
+                    (q, k, v, tmp, rotary_mode, rope_scale, rope_theta),
                     out_sinfo=R.Tensor((num_heads, head_dim), dtype_out),
                 )
                 R.output(o)

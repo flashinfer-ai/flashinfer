@@ -11,30 +11,23 @@ using tvm::runtime::DataType;
 using tvm::runtime::NDArray;
 using tvm::runtime::ShapeTuple;
 
-#define SWITCH_TVM_CUDA_DTYPE(dl_dtype, cuda_dtype, ...)      \
-  if (dl_dtype.code == kDLFloat && dl_dtype.bits == 16)       \
-  {                                                           \
-    using cuda_dtype = half;                                  \
-    __VA_ARGS__                                               \
-  }                                                           \
-  else if (dl_dtype.code == kDLFloat && dl_dtype.bits == 32)  \
-  {                                                           \
-    using cuda_dtype = float;                                 \
-    __VA_ARGS__                                               \
-  }                                                           \
-  else if (dl_dtype.code == kDLBfloat && dl_dtype.bits == 16) \
-  {                                                           \
-    using cuda_dtype = nv_bfloat16;                           \
-    __VA_ARGS__                                               \
-  }                                                           \
-  else                                                        \
-  {                                                           \
-    LOG(FATAL) << "Unsupported data type " << dl_dtype.code;  \
+#define SWITCH_TVM_CUDA_DTYPE(dl_dtype, cuda_dtype, ...)          \
+  if (dl_dtype.code == kDLFloat && dl_dtype.bits == 16) {         \
+    using cuda_dtype = half;                                      \
+    __VA_ARGS__                                                   \
+  } else if (dl_dtype.code == kDLFloat && dl_dtype.bits == 32) {  \
+    using cuda_dtype = float;                                     \
+    __VA_ARGS__                                                   \
+  } else if (dl_dtype.code == kDLBfloat && dl_dtype.bits == 16) { \
+    using cuda_dtype = nv_bfloat16;                               \
+    __VA_ARGS__                                                   \
+  } else {                                                        \
+    LOG(FATAL) << "Unsupported data type " << dl_dtype.code;      \
   }
 
-int _FlashInferSingleDecodeWithKVCache(DLTensor *q, DLTensor *k, DLTensor *v,
-                                       DLTensor *tmp, int64_t rotary_mode, double rope_inv_scale, DLTensor *o)
-{
+int _FlashInferSingleDecodeWithKVCache(DLTensor *q, DLTensor *k, DLTensor *v, DLTensor *tmp,
+                                       int64_t rotary_mode, double rope_scale, double rope_theta,
+                                       DLTensor *o) {
   CHECK_EQ(q->ndim, 2);
   size_t num_heads = q->shape[0];
   size_t head_dim = q->shape[1];
@@ -50,18 +43,20 @@ int _FlashInferSingleDecodeWithKVCache(DLTensor *q, DLTensor *k, DLTensor *v,
   CHECK_EQ(o->shape[0], num_heads);
   CHECK_EQ(o->shape[1], head_dim);
 
-  // CHECK(q->dtype ==  k->dtype);
-  // CHECK(q->dtype ==  v->dtype);
+  CHECK(q->dtype.lanes == 1 && k->dtype.lanes == 1 && v->dtype.lanes == 1);
+  CHECK(q->dtype.bits == k->dtype.bits && q->dtype.code == k->dtype.code);
+  CHECK(q->dtype.bits == v->dtype.bits && q->dtype.code == v->dtype.code);
 
-  SWITCH_TVM_CUDA_DTYPE(q->dtype, dtype_in, {SWITCH_TVM_CUDA_DTYPE(o->dtype, dtype_out, {
-                          cudaError_t status = flashinfer::SingleDecodeWithKVCache(
-                              (dtype_in *)q->data, (dtype_in *)k->data, (dtype_in *)v->data,
-                              (dtype_out *)o->data, (float *)tmp->data, num_heads, seq_len, head_dim,
-                              flashinfer::RotaryMode(rotary_mode), rope_inv_scale);
-                          if (status != cudaSuccess) {
-                            LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
-                          }
-                        })});
+  SWITCH_TVM_CUDA_DTYPE(
+      q->dtype, dtype_in, {SWITCH_TVM_CUDA_DTYPE(o->dtype, dtype_out, {
+        cudaError_t status = flashinfer::SingleDecodeWithKVCache(
+            (dtype_in *)q->data, (dtype_in *)k->data, (dtype_in *)v->data, (dtype_out *)o->data,
+            (float *)tmp->data, num_heads, seq_len, head_dim, flashinfer::RotaryMode(rotary_mode),
+            rope_scale, rope_theta);
+        if (status != cudaSuccess) {
+          LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
+        }
+      })});
   return 0;
 }
 

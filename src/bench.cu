@@ -23,7 +23,7 @@ void bench_flashinfer_decode(nvbench::state &state) {
         thrust::raw_pointer_cast(Q.data()), thrust::raw_pointer_cast(K.data()),
         thrust::raw_pointer_cast(V.data()), thrust::raw_pointer_cast(O.data()),
         thrust::raw_pointer_cast(tmp.data()), num_heads, seq_len, head_dim,
-        flashinfer::RotaryMode::kNone, 1.f, launch.get_stream());
+        flashinfer::RotaryMode::kNone, 1.f, 1e4, launch.get_stream());
     if (status != cudaSuccess) {
       state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
     }

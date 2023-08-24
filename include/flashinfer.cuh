@@ -29,7 +29,7 @@ __device__ T warpReduceSum(T val, unsigned int mask = 0xffffffff) {
 }  // namespace
 
 /*!
- * \brief An enumeration class that defines different modes for applying ROPE(Rotary Positional
+ * \brief An enumeration class that defines different modes for applying RoPE (Rotary Positional
  * Embeddings).
  */
 enum class RotaryMode {
@@ -58,19 +58,22 @@ inline std::string RotaryModeToString(const RotaryMode &rotary_mode) {
 }
 
 /*!
- * \brief Apply ROPE(Rotary Positional Embeddings) to input[0: head_dim], return
+ * \brief Apply RoPE (Rotary Positional Embeddings) to input[0: head_dim], return
  *   thread-local result.
  * \tparam vec_size A template integer indicates the vector size used in the kernel.
  * \tparam T A template type indicates the input data type
  * \param input A pointer to the start of input data
- * \param offset A integer indicates the offset of the position in ROPE(Rotary Positional
+ * \param offset A integer indicates the offset of the position in RoPE (Rotary Positional
  *   Embeddings).
- * \param inv_ratio A floating point number indicate the inverse of scaling ratio used
- *   in position interpolation for ROPE(Rotary Positional Embeddings).
+ * \param inv_scale A floating number indicate the multiplicative inverse of scaling ratio used
+ *   in position interpolation for RoPE (Rotary Positional Embeddings).
+ * \param inv_theta A floating number indicate the multiplicative inverse of "theta"
+ *   used in RoPE (Rotary Positional Embeddings).
  */
 template <size_t vec_size, typename T>
 __device__ __forceinline__ vec_t<float, vec_size> apply_rotary(const T *input, size_t offset,
-                                                               size_t head_dim, float inv_ratio) {
+                                                               size_t head_dim, float inv_ratio,
+                                                               float inv_theta) {
   vec_t<float, vec_size> permuted_vec, vec;
   vec.cast_load(input + threadIdx.x * vec_size);
   permuted_vec.cast_load(input + ((threadIdx.x < warpSize / 2)
@@ -81,7 +84,7 @@ __device__ __forceinline__ vec_t<float, vec_size> apply_rotary(const T *input, s
   for (size_t i = 0; i < vec_size; ++i) {
     size_t d = threadIdx.x * vec_size + i;
     float inv_freq =
-        (offset * inv_ratio) * powf(1e-4, float(2 * (d % (head_dim / 2))) / float(head_dim));
+        (offset * inv_ratio) * powf(inv_theta, float(2 * (d % (head_dim / 2))) / float(head_dim));
     float cos = cosf(inv_freq);
     float sin = sinf(inv_freq);
     vec[i] = float(vec[i]) * cos +
@@ -95,18 +98,19 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
                                            const size_t *kv_shared_offset, size_t offset,
                                            size_t compute_stage_idx, size_t seq_len,
                                            size_t num_heads, size_t head_dim, float sm_scale,
-                                           float rope_inv_scale, T *k_glob, float &x) {
+                                           float rope_inv_scale, float rope_inv_theta, T *k_glob,
+                                           float &x) {
   vec_t<float, vec_size> k_vec;
   size_t j = threadIdx.y;
   if constexpr (rotary_mode == RotaryMode::kApplyRotary) {
     // apply rotary embedding for all rows in k matrix of kv-cache
     k_vec = apply_rotary<vec_size>(smem + kv_shared_offset[compute_stage_idx] + j * head_dim,
-                                   offset, head_dim, rope_inv_scale);
+                                   offset, head_dim, rope_inv_scale, rope_inv_theta);
   } else if constexpr (rotary_mode == RotaryMode::kApplyRotaryUpdateLastK) {
     // apply rotary embedding for the newly appended rows in k matrix of kv-cache
     if (offset == seq_len - 1) {
       k_vec = apply_rotary<vec_size>(smem + kv_shared_offset[compute_stage_idx] + j * head_dim,
-                                     offset, head_dim, rope_inv_scale);
+                                     offset, head_dim, rope_inv_scale, rope_inv_theta);
       k_vec.cast_store(k_glob + (offset * num_heads + j) * head_dim + threadIdx.x * vec_size);
     } else {
       k_vec.cast_load(smem + kv_shared_offset[compute_stage_idx] + j * head_dim +
@@ -158,8 +162,10 @@ __device__ __forceinline__ void update_partial_mdo(const T *smem, float x,
  * \param sm_scale A float indicates the scale applied to pre-softmax logits
  * \param seq_len A integer indicates the sequence length
  * \param head_dim A integer indicates the head dimension
- * \param rope_inv_scale A floating point number indicate the inverse of scaling ratio
- *   used in PI(Position Interpolation) for ROPE (Rotary Positional Embeddings).
+ * \param rope_inv_scale A floating number indicate the multiplicative inverse of scaling ratio
+ *   used in PI(Position Interpolation) for RoPE (Rotary Positional Embeddings).
+ * \param rope_inv_theta A floating number indicate the multiplicative inverse of "theta"
+ *   used in RoPE (Rotary Positional Embeddings).
  * \param kv_chunk_size A integer indicates the kv-chunk size
  */
 template <typename DTypeIn, typename DTypeOut, size_t head_dim, RotaryMode rotary_mode>
@@ -167,7 +173,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
                                               DTypeIn *__restrict__ v, DTypeOut *__restrict__ o,
                                               float *__restrict__ tmp, float sm_scale,
                                               size_t seq_len, float rope_inv_scale,
-                                              size_t kv_chunk_size) {
+                                              float rope_inv_theta, size_t kv_chunk_size) {
   auto block = cooperative_groups::this_thread_block();
   auto grid = cooperative_groups::this_grid();
 
@@ -187,7 +193,8 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   if constexpr (rotary_mode == RotaryMode::kApplyRotary ||
                 rotary_mode == RotaryMode::kApplyRotaryUpdateLastK) {
     // apply rotary embedding to q matrix
-    q_vec = apply_rotary<vec_size>(q + head_idx * head_dim, seq_len - 1, head_dim, rope_inv_scale);
+    q_vec = apply_rotary<vec_size>(q + head_idx * head_dim, seq_len - 1, head_dim, rope_inv_scale,
+                                   rope_inv_theta);
   } else {
     // do not apply rotary embedding to q matrix
     q_vec.cast_load(q + head_idx * head_dim + threadIdx.x * vec_size);
@@ -235,7 +242,8 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     pipeline.consumer_wait();
     block.sync();
     compute_qk<rotary_mode>(smem, q_vec, kv_shared_offset, kv_idx - 1, compute_stage_idx, seq_len,
-                            num_heads, head_dim, sm_scale, rope_inv_scale, k_glob, x);
+                            num_heads, head_dim, sm_scale, rope_inv_scale, rope_inv_theta, k_glob,
+                            x);
     block.sync();
     pipeline.consumer_release();
     compute_stage_idx = (compute_stage_idx + 1) % stages_count;
@@ -262,7 +270,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   block.sync();
   compute_qk<rotary_mode>(smem, q_vec, kv_shared_offset, chunk_start + kv_chunk_size - 1,
                           compute_stage_idx, seq_len, num_heads, head_dim, sm_scale, rope_inv_scale,
-                          k_glob, x);
+                          rope_inv_theta, k_glob, x);
   block.sync();
   pipeline.consumer_release();
   compute_stage_idx = (compute_stage_idx + 1) % stages_count;
@@ -370,18 +378,23 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
  * \param seq_len A integer indicates the sequence length
  * \param head_dim A integer indicates the head dimension,
  * \param rotary_mode The rotary mode used in the kernel.
- * \param rope_inv_scale A floating point number indicate the inverse of scaling ratio
- *   used in PI(Position Interpolation) for ROPE (Rotary Positional Embeddings).
+ * \param rope_scale A floating point number indicate the scaling ratio used in RoPE interpolation.
+ * \param rope_theta A floating point number indicate the "theta" used in RoPE.
+ *   used in PI (Position Interpolation) for RoPE (Rotary Positional Embeddings).
  * \param stream The cuda stream to launch the kernel
  */
 template <typename DTypeIn, typename DTypeOut>
 cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut *o, float *tmp,
                                     size_t num_heads, size_t seq_len, size_t head_dim,
                                     RotaryMode rotary_mode = RotaryMode::kNone,
-                                    float rope_inv_scale = 1.f, cudaStream_t stream = nullptr) {
+                                    float rope_scale = 1.f, float rope_theta = 1e4,
+                                    cudaStream_t stream = nullptr) {
   const float sm_scale = 1.f / std::sqrt(float(head_dim));
   constexpr size_t h_chunk_size = 4;
   assert(num_heads % h_chunk_size == 0);
+
+  const float rope_inv_scale = 1.f / rope_scale;
+  const float rope_inv_theta = 1.f / rope_theta;
 
   SWITCH_HEAD_DIM(
       head_dim, HEAD_DIM, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
@@ -406,6 +419,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
                         (void *)&sm_scale,
                         (void *)&seq_len,
                         (void *)&rope_inv_scale,
+                        (void *)&rope_inv_theta,
                         (void *)&kv_chunk_size};
         return cudaLaunchCooperativeKernel((void *)kernel, nblks, nthrs, args, 0, stream);
       })});
