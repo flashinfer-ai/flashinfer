@@ -10,24 +10,15 @@
 namespace utils {
 
 template <typename T>
-struct thrust_prg {
-  float mean, std;
-
-  __host__ __device__ thrust_prg(float mean = 0.f, float std = 1.f) : mean(mean), std(std){};
-
-  __host__ __device__ float operator()(const unsigned int n) const {
-    thrust::default_random_engine rng;
-    thrust::random::normal_distribution<float> dist(mean, std);
-    rng.discard(n);
-
-    return T(dist(rng));
-  }
-};
-
-template <typename T>
 void thrust_normal_init(thrust::device_vector<T>& vec, float mean = 0.f, float std = 1.f) {
-  thrust::counting_iterator<unsigned int> counter(0);
-  thrust::transform(counter, counter + vec.size(), vec.begin(), thrust_prg<T>(mean, std));
+  thrust::host_vector<T> host_vec(vec.size());
+  std::random_device rd{};
+  std::mt19937 gen{rd()};
+  std::normal_distribution d{mean, std};
+  for (size_t i = 0; i < vec.size(); ++i) {
+    host_vec[i] = d(gen);
+  }
+  vec = host_vec;
 }
 
 template <typename T>
@@ -38,7 +29,12 @@ void thrust_zero_init(thrust::device_vector<T>& vec) {
 template <typename T>
 void thrust_normal_init(thrust::host_vector<T>& vec, float mean = 0.f, float std = 1.f) {
   thrust::counting_iterator<unsigned int> counter(0);
-  thrust::transform(counter, counter + vec.size(), vec.begin(), thrust_prg<T>(mean, std));
+  std::random_device rd{};
+  std::mt19937 gen{rd()};
+  std::normal_distribution d{mean, std};
+  for (size_t i = 0; i < vec.size(); ++i) {
+    vec[i] = d(gen);
+  }
 }
 
 template <typename T>
