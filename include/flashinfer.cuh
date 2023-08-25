@@ -59,7 +59,7 @@ inline std::string RotaryModeToString(const RotaryMode &rotary_mode) {
 
 /*!
  * \brief Apply RoPE (Rotary Positional Embeddings) to input[0: head_dim], return
- *   thread-local result.
+ *   thread-local vector.
  * \tparam vec_size A template integer indicates the vector size used in the kernel.
  * \tparam T A template type indicates the input data type
  * \param input A pointer to the start of input data
@@ -87,8 +87,8 @@ __device__ __forceinline__ vec_t<float, vec_size> apply_rotary(const T *input, s
         (offset * inv_ratio) * powf(inv_theta, float(2 * (d % (head_dim / 2))) / float(head_dim));
     float cos = cosf(inv_freq);
     float sin = sinf(inv_freq);
-    vec[i] = float(vec[i]) * cos +
-             float((threadIdx.x < warpSize / 2) ? -permuted_vec[i] : permuted_vec[i]) * sin;
+    vec[i] =
+        vec[i] * cos + ((threadIdx.x < warpSize / 2) ? -permuted_vec[i] : permuted_vec[i]) * sin;
   }
   return vec;
 }
@@ -398,6 +398,11 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   }
 
 /*!
+ * \brief A heuristic function of minimum kv-chunk size given input sequence length.
+ */
+inline size_t get_min_kv_chunk_size(size_t seq_len) { return min(64UL, max(4UL, seq_len / 8)); }
+
+/*!
  * \brief FlashAttention decoding with kv-cache for a single sequence.
  * \tparam DTypeIn A template type indicates the input data type
  * \tparam DTypeOut A template type indicates the output data type
@@ -438,8 +443,8 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, num_thrs, 0);
         size_t max_num_blks = size_t(num_blocks_per_sm) * device_prop.multiProcessorCount;
         size_t max_num_kv_chunks = max_num_blks / (num_heads / h_chunk_size);
-        // minimum kv-chunk size is 4
-        size_t kv_chunk_size = max((seq_len + max_num_kv_chunks - 1UL) / max_num_kv_chunks, 4UL);
+        size_t kv_chunk_size = max((seq_len + max_num_kv_chunks - 1UL) / max_num_kv_chunks,
+                                   get_min_kv_chunk_size(seq_len));
         dim3 nblks = dim3(num_heads / h_chunk_size, (seq_len + kv_chunk_size - 1) / kv_chunk_size);
         assert(nblks.x > 0 && nblks.y > 0);
         dim3 nthrs = dim3(32, 4);
