@@ -71,9 +71,8 @@ inline std::string RotaryModeToString(const RotaryMode &rotary_mode) {
  *   used in RoPE (Rotary Positional Embeddings).
  */
 template <size_t vec_size, typename T>
-__device__ __forceinline__ vec_t<float, vec_size> apply_rotary(const T *input, size_t offset,
-                                                               size_t head_dim, float inv_ratio,
-                                                               float inv_theta) {
+__device__ __forceinline__ vec_t<float, vec_size> apply_rotary(
+    const T *input, size_t offset, const vec_t<float, vec_size> &inv_freq, size_t head_dim) {
   vec_t<float, vec_size> permuted_vec, vec;
   vec.cast_load(input + threadIdx.x * vec_size);
   permuted_vec.cast_load(input + ((threadIdx.x < warpSize / 2)
@@ -82,11 +81,9 @@ __device__ __forceinline__ vec_t<float, vec_size> apply_rotary(const T *input, s
 
 #pragma unroll
   for (size_t i = 0; i < vec_size; ++i) {
-    size_t d = threadIdx.x * vec_size + i;
-    float inv_freq =
-        (offset * inv_ratio) * powf(inv_theta, float(2 * (d % (head_dim / 2))) / float(head_dim));
-    float cos = cosf(inv_freq);
-    float sin = sinf(inv_freq);
+    float freq = float(offset) * inv_freq[i];
+    float cos = cosf(freq);
+    float sin = sinf(freq);
     vec[i] =
         vec[i] * cos + ((threadIdx.x < warpSize / 2) ? -permuted_vec[i] : permuted_vec[i]) * sin;
   }
@@ -119,6 +116,7 @@ __device__ __forceinline__ vec_t<float, vec_size> apply_rotary(const T *input, s
  */
 template <RotaryMode rotary_mode, typename T, size_t vec_size>
 __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec_size> &q_vec,
+                                           const vec_t<float, vec_size> &inv_freq,
                                            const size_t *kv_shared_offset, size_t offset,
                                            size_t compute_stage_idx, size_t seq_len,
                                            size_t num_heads, size_t head_dim, float sm_scale,
@@ -129,12 +127,12 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
   if constexpr (rotary_mode == RotaryMode::kApplyRotary) {
     // apply rotary embedding for all rows in k matrix of kv-cache
     k_vec = apply_rotary<vec_size>(smem + kv_shared_offset[compute_stage_idx] + j * head_dim,
-                                   offset, head_dim, rope_inv_scale, rope_inv_theta);
+                                   offset, inv_freq, head_dim);
   } else if constexpr (rotary_mode == RotaryMode::kApplyRotaryUpdateLastK) {
     // apply rotary embedding for the newly appended rows in k matrix of kv-cache
     if (offset == seq_len - 1) {
       k_vec = apply_rotary<vec_size>(smem + kv_shared_offset[compute_stage_idx] + j * head_dim,
-                                     offset, head_dim, rope_inv_scale, rope_inv_theta);
+                                     offset, inv_freq, head_dim);
       k_vec.cast_store(k_glob + (offset * num_heads + j) * head_dim + threadIdx.x * vec_size);
     } else {
       k_vec.cast_load(smem + kv_shared_offset[compute_stage_idx] + j * head_dim +
@@ -226,11 +224,17 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
 
   size_t j = threadIdx.y, head_idx = head_idx_start + j;
   vec_t<float, vec_size> q_vec;
+  vec_t<float, vec_size> inv_freq;
   if constexpr (rotary_mode == RotaryMode::kApplyRotary ||
                 rotary_mode == RotaryMode::kApplyRotaryUpdateLastK) {
+#pragma unroll
+    for (size_t i = 0; i < vec_size; ++i) {
+      inv_freq[i] = rope_inv_scale *
+                 powf(rope_inv_theta,
+                      float(2 * ((threadIdx.x * vec_size + i) % (head_dim / 2))) / float(head_dim));
+    }
     // apply rotary embedding to q matrix
-    q_vec = apply_rotary<vec_size>(q + head_idx * head_dim, seq_len - 1, head_dim, rope_inv_scale,
-                                   rope_inv_theta);
+    q_vec = apply_rotary<vec_size>(q + head_idx * head_dim, seq_len - 1, inv_freq, head_dim);
   } else {
     // do not apply rotary embedding to q matrix
     q_vec.cast_load(q + head_idx * head_dim + threadIdx.x * vec_size);
@@ -277,9 +281,9 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     // compute stage: compute qk
     pipeline.consumer_wait();
     block.sync();
-    compute_qk<rotary_mode>(smem, q_vec, kv_shared_offset, kv_idx - 1, compute_stage_idx, seq_len,
-                            num_heads, head_dim, sm_scale, rope_inv_scale, rope_inv_theta, k_glob,
-                            x);
+    compute_qk<rotary_mode>(smem, q_vec, inv_freq, kv_shared_offset, kv_idx - 1, compute_stage_idx,
+                            seq_len, num_heads, head_dim, sm_scale, rope_inv_scale, rope_inv_theta,
+                            k_glob, x);
     block.sync();
     pipeline.consumer_release();
     compute_stage_idx = (compute_stage_idx + 1) % stages_count;
@@ -304,7 +308,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   // compute stage: compute qk
   pipeline.consumer_wait();
   block.sync();
-  compute_qk<rotary_mode>(smem, q_vec, kv_shared_offset, chunk_start + kv_chunk_size - 1,
+  compute_qk<rotary_mode>(smem, q_vec, inv_freq, kv_shared_offset, chunk_start + kv_chunk_size - 1,
                           compute_stage_idx, seq_len, num_heads, head_dim, sm_scale, rope_inv_scale,
                           rope_inv_theta, k_glob, x);
   block.sync();
