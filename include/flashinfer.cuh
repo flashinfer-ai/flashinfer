@@ -63,16 +63,13 @@ inline std::string RotaryModeToString(const RotaryMode &rotary_mode) {
  * \tparam vec_size A template integer indicates the vector size used in the kernel.
  * \tparam T A template type indicates the input data type
  * \param input A pointer to the start of input data
+ * \param inv_freq A vector of float indicates the multiplicative inverse of frequency
  * \param offset A integer indicates the offset of the position in RoPE (Rotary Positional
  *   Embeddings).
- * \param inv_scale A floating number indicate the multiplicative inverse of scaling ratio used
- *   in position interpolation for RoPE (Rotary Positional Embeddings).
- * \param inv_theta A floating number indicate the multiplicative inverse of "theta"
- *   used in RoPE (Rotary Positional Embeddings).
  */
 template <size_t vec_size, typename T>
 __device__ __forceinline__ vec_t<float, vec_size> apply_rotary(
-    const T *input, size_t offset, const vec_t<float, vec_size> &inv_freq, size_t head_dim) {
+    const T *input, const vec_t<float, vec_size> &inv_freq, size_t offset, size_t head_dim) {
   vec_t<float, vec_size> permuted_vec, vec;
   vec.cast_load(input + threadIdx.x * vec_size);
   permuted_vec.cast_load(input + ((threadIdx.x < warpSize / 2)
@@ -82,8 +79,8 @@ __device__ __forceinline__ vec_t<float, vec_size> apply_rotary(
 #pragma unroll
   for (size_t i = 0; i < vec_size; ++i) {
     float freq = float(offset) * inv_freq[i];
-    float cos = cosf(freq);
-    float sin = sinf(freq);
+    float cos, sin;
+    __sincosf(freq, &sin, &cos);
     vec[i] =
         vec[i] * cos + ((threadIdx.x < warpSize / 2) ? -permuted_vec[i] : permuted_vec[i]) * sin;
   }
@@ -127,12 +124,12 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
   if constexpr (rotary_mode == RotaryMode::kApplyRotary) {
     // apply rotary embedding for all rows in k matrix of kv-cache
     k_vec = apply_rotary<vec_size>(smem + kv_shared_offset[compute_stage_idx] + j * head_dim,
-                                   offset, inv_freq, head_dim);
+                                   inv_freq, offset, head_dim);
   } else if constexpr (rotary_mode == RotaryMode::kApplyRotaryUpdateLastK) {
     // apply rotary embedding for the newly appended rows in k matrix of kv-cache
     if (offset == seq_len - 1) {
       k_vec = apply_rotary<vec_size>(smem + kv_shared_offset[compute_stage_idx] + j * head_dim,
-                                     offset, inv_freq, head_dim);
+                                     inv_freq, offset, head_dim);
       k_vec.cast_store(k_glob + (offset * num_heads + j) * head_dim + threadIdx.x * vec_size);
     } else {
       k_vec.cast_load(smem + kv_shared_offset[compute_stage_idx] + j * head_dim +
@@ -158,11 +155,13 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
  * \param smem A pointer to the start of shared memory
  * \param x A float indicates the pre-softmax logits
  * \param kv_shared_offset An array of size_t indicates the k/v tiles offset in shared memory of
- * different pipeline stages. \param compute_stage_idx A integer indicates the compute stage index
- * in the pipeline \param head_dim A integer indicates the head dimension \param m A float indicates
- * the thread-local maximum value of pre-softmax logits \param d A float indicates the thread-local
- * sum of exp(pre-softmax logits - m) \param o A vector of float indicates the thread-local output
- * vector
+ *   different pipeline stages.
+ * \param compute_stage_idx A integer indicates the compute stage index
+ *   in the pipeline
+ * \param head_dim A integer indicates the head dimension
+ * \param m A float indicates the thread-local maximum value of pre-softmax logits
+ * \param d A float indicates the thread-local sum of exp(pre-softmax logits - m)
+ * \param o A vector of float indicates the thread-local output vector
  */
 template <typename T, size_t vec_size>
 __device__ __forceinline__ void update_partial_mdo(const T *smem, float x,
@@ -175,10 +174,10 @@ __device__ __forceinline__ void update_partial_mdo(const T *smem, float x,
   v_vec.cast_load(smem + kv_shared_offset[compute_stage_idx] + j * head_dim +
                   threadIdx.x * vec_size);
   m = max(m, x);
-  d = d * exp(m_prev - m) + exp(x - m);
+  d = d * __expf(m_prev - m) + __expf(x - m);
 #pragma unroll
   for (size_t i = 0; i < vec_size; ++i) {
-    o[i] = o[i] * (exp(m_prev - m) * d_prev / d) + v_vec[i] * (exp(x - m) / d);
+    o[i] = o[i] * (__expf(m_prev - m) * d_prev / d) + v_vec[i] * (__expf(x - m) / d);
   }
 }
 
@@ -229,12 +228,13 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
                 rotary_mode == RotaryMode::kApplyRotaryUpdateLastK) {
 #pragma unroll
     for (size_t i = 0; i < vec_size; ++i) {
-      inv_freq[i] = rope_inv_scale *
-                 powf(rope_inv_theta,
-                      float(2 * ((threadIdx.x * vec_size + i) % (head_dim / 2))) / float(head_dim));
+      inv_freq[i] =
+          rope_inv_scale *
+          __powf(rope_inv_theta,
+                 float(2 * ((threadIdx.x * vec_size + i) % (head_dim / 2))) / float(head_dim));
     }
     // apply rotary embedding to q matrix
-    q_vec = apply_rotary<vec_size>(q + head_idx * head_dim, seq_len - 1, inv_freq, head_dim);
+    q_vec = apply_rotary<vec_size>(q + head_idx * head_dim, inv_freq, seq_len - 1, head_dim);
   } else {
     // do not apply rotary embedding to q matrix
     q_vec.cast_load(q + head_idx * head_dim + threadIdx.x * vec_size);
@@ -338,12 +338,12 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
       m = md_tmp[(batch * num_heads + head_idx) * 2];
       d = md_tmp[(batch * num_heads + head_idx) * 2 + 1];
       m_now = max(m_prev, m);
-      d_now = d_prev * exp(m_prev - m_now) + d * exp(m - m_now);
+      d_now = d_prev * __expf(m_prev - m_now) + d * __expf(m - m_now);
       o_vec.load(tmp + (batch * num_heads + head_idx) * head_dim + threadIdx.x * vec_size);
 #pragma unroll
       for (size_t i = 0; i < vec_size; ++i) {
-        o_vec_acc[i] = o_vec_acc[i] * (d_prev / d_now) * exp(m_prev - m_now) +
-                       o_vec[i] * (d / d_now) * exp(m - m_now);
+        o_vec_acc[i] = o_vec_acc[i] * (d_prev / d_now) * __expf(m_prev - m_now) +
+                       o_vec[i] * (d / d_now) * __expf(m - m_now);
       }
       m_prev = m_now;
       d_prev = d_now;
