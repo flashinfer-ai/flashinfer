@@ -400,7 +400,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
 /*!
  * \brief A heuristic function of minimum kv-chunk size given input sequence length.
  */
-inline size_t get_min_kv_chunk_size(size_t seq_len) { return min(64UL, max(4UL, seq_len / 8)); }
+inline size_t get_min_kv_chunk_size(size_t seq_len) { return min(64UL, max(4UL, seq_len / 16)); }
 
 /*!
  * \brief FlashAttention decoding with kv-cache for a single sequence.
