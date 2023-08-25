@@ -101,10 +101,14 @@ __device__ __forceinline__ vec_t<float, vec_size> apply_rotary(const T *input, s
  * \param smem A pointer to the start of shared memory
  * \param q_vec A vector of float indicates the thread-local query vector
  * \param kv_shared_offset An array of size_t indicates the k/v tiles offset in shared memory of
- * different pipeline stages \param offset A integer indicates the offset of the position in RoPE
- * (Rotary Positional Embeddings) \param compute_stage_idx A integer indicates the compute stage
- * index in the pipeline \param seq_len A integer indicates the sequence length \param num_heads A
- * integer indicates the number of heads \param head_dim A integer indicates the head dimension
+ *   different pipeline stages
+ * \param offset A integer indicates the offset of the position in RoPE
+ *   (Rotary Positional Embeddings)
+ * \param compute_stage_idx A integer indicates the compute stage
+ *   index in the pipeline
+ * \param seq_len A integer indicates the sequence length
+ * \param num_heads A integer indicates the number of heads
+ * \param head_dim A integer indicates the head dimension
  * \param sm_scale A float indicates the scale applied to pre-softmax logits
  * \param rope_inv_scale A floating number indicate the multiplicative inverse of scaling ratio
  *   used in PI(Position Interpolation) of RoPE (Rotary Positional Embeddings).

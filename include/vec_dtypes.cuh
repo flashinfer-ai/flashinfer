@@ -968,6 +968,126 @@ FLASHINFER_INLINE void cast_from_impl(const vec_t<float, vec_size> &src,
   }
 }
 
+template <size_t vec_size>
+FLASHINFER_INLINE void cast_from_impl(const vec_t<__nv_fp8_e4m3, vec_size> &src,
+                                      vec_t<float, vec_size> &dst) {
+  if constexpr (vec_size == 1) {
+    dst.data = float(src.data);
+  } else if constexpr (vec_size == 2) {
+    *(float2 *)(&dst.data) = float2(*(__nv_fp8x2_e4m3 *)(&src.data));
+  } else {
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 4; ++i) {
+      ((float4 *)(&dst.data))[i] = float4(((__nv_fp8x4_e4m3 *)(&src.data))[i]);
+    }
+  }
+}
+
+template <size_t vec_size>
+FLASHINFER_INLINE void cast_from_impl(const vec_t<__nv_fp8_e4m3, vec_size> &src,
+                                      vec_t<half, vec_size> &dst) {
+  if constexpr (vec_size == 1) {
+    dst.data = float(src.data);
+  } else {
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 2; ++i) {
+      ((half2 *)(&dst.data))[i] = half2(((__nv_fp8x2_e4m3 *)(&src.data))[i]);
+    }
+  }
+}
+
+template <size_t vec_size>
+FLASHINFER_INLINE void cast_from_impl(const vec_t<float, vec_size> &src,
+                                      vec_t<__nv_fp8_e4m3, vec_size> &dst) {
+  if constexpr (vec_size == 1) {
+    dst.data = __nv_fp8_e4m3(src.data);
+  } else if constexpr (vec_size == 2) {
+    *(__nv_fp8x2_e4m3 *)(&dst.data) = __nv_fp8x2_e4m3(*(float2 *)(&src.data));
+  } else {
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 4; ++i) {
+      ((__nv_fp8x4_e4m3 *)(&dst.data))[i] = __nv_fp8x4_e4m3(((float4 *)(&src.data))[i]);
+    }
+  }
+}
+
+template <size_t vec_size>
+FLASHINFER_INLINE void cast_from_impl(const vec_t<half, vec_size> &src,
+                                      vec_t<__nv_fp8_e4m3, vec_size> &dst) {
+  if constexpr (vec_size == 1) {
+    dst.data = __nv_fp8_e4m3(src.data);
+  } else if constexpr (vec_size == 2) {
+    *(__nv_fp8x2_e4m3 *)(&dst.data) = __nv_fp8x2_e4m3(*(half2 *)(&src.data));
+  } else {
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 4; ++i) {
+      // NOTE(Zihao): need to double check if we properly handle flo and fhi
+      ((__nv_fp8x4_e4m3 *)(&dst.data))[i] =
+          __nv_fp8x4_e4m3(((half2 *)(&src.data))[i * 2 + 1], ((half2 *)(&src.data))[i * 2]);
+    }
+  }
+}
+
+template <size_t vec_size>
+FLASHINFER_INLINE void cast_from_impl(const vec_t<__nv_fp8_e5m2, vec_size> &src,
+                                      vec_t<float, vec_size> &dst) {
+  if constexpr (vec_size == 1) {
+    dst.data = float(src.data);
+  } else if constexpr (vec_size == 2) {
+    *(float2 *)(&dst.data) = float2(*(__nv_fp8x2_e5m2 *)(&src.data));
+  } else {
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 4; ++i) {
+      ((float4 *)(&dst.data))[i] = float4(((__nv_fp8x4_e5m2 *)(&src.data))[i]);
+    }
+  }
+}
+
+template <size_t vec_size>
+FLASHINFER_INLINE void cast_from_impl(const vec_t<__nv_fp8_e5m2, vec_size> &src,
+                                      vec_t<half, vec_size> &dst) {
+  if constexpr (vec_size == 1) {
+    dst.data = float(src.data);
+  } else {
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 2; ++i) {
+      ((half2 *)(&dst.data))[i] = half2(((__nv_fp8x2_e5m2 *)(&src.data))[i]);
+    }
+  }
+}
+
+template <size_t vec_size>
+FLASHINFER_INLINE void cast_from_impl(const vec_t<float, vec_size> &src,
+                                      vec_t<__nv_fp8_e5m2, vec_size> &dst) {
+  if constexpr (vec_size == 1) {
+    dst.data = __nv_fp8_e5m2(src.data);
+  } else if constexpr (vec_size == 2) {
+    *(__nv_fp8x2_e5m2 *)(&dst.data) = __nv_fp8x2_e5m2(*(float2 *)(&src.data));
+  } else {
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 4; ++i) {
+      ((__nv_fp8x4_e5m2 *)(&dst.data))[i] = __nv_fp8x4_e5m2(((float4 *)(&src.data))[i]);
+    }
+  }
+}
+
+template <size_t vec_size>
+FLASHINFER_INLINE void cast_from_impl(const vec_t<half, vec_size> &src,
+                                      vec_t<__nv_fp8_e5m2, vec_size> &dst) {
+  if constexpr (vec_size == 1) {
+    dst.data = __nv_fp8_e4m3(src.data);
+  } else if constexpr (vec_size == 2) {
+    *(__nv_fp8x2_e5m2 *)(&dst.data) = __nv_fp8x2_e5m2(*(half2 *)(&src.data));
+  } else {
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 4; ++i) {
+      // NOTE(Zihao): need to double check if we properly handle flo and fhi
+      ((__nv_fp8x4_e5m2 *)(&dst.data))[i] =
+          __nv_fp8x4_e5m2(((half2 *)(&src.data))[i * 2 + 1], ((half2 *)(&src.data))[i * 2]);
+    }
+  }
+}
+
 }  // namespace flashinfer
 
 #endif  // VEC_DTYPES_CUH_
