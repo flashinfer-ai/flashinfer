@@ -72,7 +72,7 @@ __device__ __forceinline__ vec_t<float, vec_size> apply_rotary(
     const T *input, const vec_t<float, vec_size> &inv_freq, size_t offset, size_t head_dim) {
   vec_t<float, vec_size> permuted_vec, vec;
   vec.cast_load(input + threadIdx.x * vec_size);
-  permuted_vec.cast_load(input + ((threadIdx.x < warpSize / 2)
+  permuted_vec.cast_load(input + ((threadIdx.x * vec_size < head_dim / 2)
                                       ? threadIdx.x * vec_size + head_dim / 2
                                       : threadIdx.x * vec_size - head_dim / 2));
 
@@ -81,8 +81,8 @@ __device__ __forceinline__ vec_t<float, vec_size> apply_rotary(
     float freq = float(offset) * inv_freq[i];
     float cos, sin;
     __sincosf(freq, &sin, &cos);
-    vec[i] =
-        vec[i] * cos + ((threadIdx.x < warpSize / 2) ? -permuted_vec[i] : permuted_vec[i]) * sin;
+    vec[i] = vec[i] * cos +
+             ((threadIdx.x * vec_size < head_dim / 2) ? -permuted_vec[i] : permuted_vec[i]) * sin;
   }
   return vec;
 }
@@ -145,7 +145,7 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
   for (size_t i = 0; i < vec_size; ++i) {
     x += q_vec[i] * k_vec[i] * sm_scale;
   }
-  x = warpReduceSum(x);
+  x = warpReduceSum(x, ((1UL << blockDim.x) - 1UL) << (threadIdx.y * blockDim.x % warpSize));
 }
 
 /*!
