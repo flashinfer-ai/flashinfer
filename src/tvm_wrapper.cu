@@ -21,6 +21,12 @@ using tvm::runtime::ShapeTuple;
   } else if (dl_dtype.code == kDLBfloat && dl_dtype.bits == 16) { \
     using cuda_dtype = nv_bfloat16;                               \
     __VA_ARGS__                                                   \
+  } else if (dl_dtype.code == DataType::kE4M3Float) {             \
+    using cuda_dtype = __nv_fp8_e4m3;                             \
+    __VA_ARGS__                                                   \
+  } else if (dl_dtype.code == DataType::kE5M2Float) {             \
+    using cuda_dtype = __nv_fp8_e5m2;                             \
+    __VA_ARGS__                                                   \
   } else {                                                        \
     LOG(FATAL) << "Unsupported data type " << dl_dtype.code;      \
   }
