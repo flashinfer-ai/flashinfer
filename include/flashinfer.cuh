@@ -1,6 +1,6 @@
 #ifndef FLASHINFER_CUH_
 #define FLASHINFER_CUH_
-#include <cooperative_groups/memcpy_async.h>
+#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -14,19 +14,7 @@
 
 namespace flashinfer {
 
-namespace {
-
-template <typename T>
-__device__ T warpReduceSum(T val, unsigned int mask = 0xffffffff) {
-#pragma unroll
-  for (int offset = warpSize / 2; offset > 0; offset /= 2) {
-    val += __shfl_down_sync(mask, val, offset);
-  }
-  val = __shfl_sync(mask, val, 0);
-  return val;
-}
-
-}  // namespace
+namespace cg = cooperative_groups;
 
 /*!
  * \brief An enumeration class that defines different modes for applying RoPE (Rotary Positional
@@ -145,7 +133,13 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
   for (size_t i = 0; i < vec_size; ++i) {
     x += q_vec[i] * k_vec[i] * sm_scale;
   }
-  x = warpReduceSum(x, ((1UL << blockDim.x) - 1UL) << (threadIdx.y * blockDim.x % warpSize));
+  constexpr size_t group_size = sizeof(T) * 8;
+  cg::thread_block_tile g = cg::tiled_partition<group_size>(cg::this_thread_block());
+#pragma unroll
+  for (size_t offset = group_size / 2; offset > 0; offset /= 2) {
+    x += g.shfl_down(x, offset);
+  }
+  x = g.shfl(x, 0);
 }
 
 /*!
@@ -208,12 +202,12 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
                                               float *__restrict__ tmp, float sm_scale,
                                               size_t seq_len, float rope_inv_scale,
                                               float rope_inv_theta, size_t kv_chunk_size) {
-  auto block = cooperative_groups::this_thread_block();
-  auto grid = cooperative_groups::this_grid();
+  auto block = cg::this_thread_block();
+  auto grid = cg::this_grid();
 
-  constexpr size_t h_chunk_size = 4;
+  constexpr size_t h_chunk_size = 128 / (sizeof(DTypeIn) * 8);
   constexpr size_t stages_count = 4;
-  constexpr size_t vec_size = head_dim / 32;
+  constexpr size_t vec_size = head_dim / (8 * sizeof(DTypeIn));
   size_t head_idx_start = grid.block_index().x * h_chunk_size;
   size_t kv_chunk_idx = grid.block_index().y;
   size_t num_kv_chunks = grid.dim_blocks().y;
@@ -239,6 +233,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     // do not apply rotary embedding to q matrix
     q_vec.cast_load(q + head_idx * head_dim + threadIdx.x * vec_size);
   }
+  block.sync();
 
   size_t chunk_start = kv_chunk_idx * kv_chunk_size;
   DTypeIn *k_glob = k + head_idx_start * head_dim, *v_glob = v + head_idx_start * head_dim;
@@ -435,7 +430,6 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
                                     float rope_scale = 1.f, float rope_theta = 1e4,
                                     cudaStream_t stream = nullptr) {
   const float sm_scale = 1.f / std::sqrt(float(head_dim));
-  constexpr size_t h_chunk_size = 4;
   assert(num_heads % h_chunk_size == 0);
 
   const float rope_inv_scale = 1.f / rope_scale;
@@ -444,6 +438,9 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
   SWITCH_HEAD_DIM(
       head_dim, HEAD_DIM, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
         auto kernel = SingleDecodeWithKVCacheKernel<DTypeIn, DTypeOut, HEAD_DIM, ROTARY_MODE>;
+        int tx = sizeof(DTypeIn) * 8;
+        int h_chunk_size = 128 / tx;
+        int ty = h_chunk_size;
         int num_blocks_per_sm = 0;
         int num_thrs = 128;
         cudaDeviceProp device_prop;
@@ -455,7 +452,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
                                    get_min_kv_chunk_size(seq_len));
         dim3 nblks = dim3(num_heads / h_chunk_size, (seq_len + kv_chunk_size - 1) / kv_chunk_size);
         assert(nblks.x > 0 && nblks.y > 0);
-        dim3 nthrs = dim3(32, 4);
+        dim3 nthrs = dim3(tx, ty);
         void *args[] = {(void *)&q,
                         (void *)&k,
                         (void *)&v,
