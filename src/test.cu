@@ -1,14 +1,15 @@
 #include <gtest/gtest.h>
 
 #include <flashinfer.cuh>
+#include <type_traits>
 
 #include "utils.cuh"
 
 template <typename T>
-inline void cpu_inplace_apply_rotary(thrust::host_vector<T>& input, size_t offset, float rope_scale,
-                                     float rope_theta) {
-  size_t D = input.size();
-  thrust::host_vector<T> permuted_input(input);
+inline thrust::host_vector<float> cpu_apply_rotary(const T* input, size_t D, size_t offset,
+                                                   float rope_scale, float rope_theta) {
+  thrust::host_vector<float> rst(D);
+  thrust::host_vector<float> permuted_input(D);
   for (size_t k = 0; k < D; ++k) {
     permuted_input[k] = (k < D / 2) ? -float(input[k + D / 2]) : float(input[k - D / 2]);
   }
@@ -18,8 +19,9 @@ inline void cpu_inplace_apply_rotary(thrust::host_vector<T>& input, size_t offse
         (offset / rope_scale) / (std::pow(rope_theta, float(2 * (k % (D / 2))) / float(D)));
     float cos = std::cos(inv_freq);
     float sin = std::sin(inv_freq);
-    input[k] = cos * float(input[k]) + sin * float(permuted_input[k]);
+    rst[k] = cos * float(input[k]) + sin * permuted_input[k];
   }
+  return std::move(rst);
 }
 
 template <typename dtype_in, typename dtype_out>
@@ -31,14 +33,14 @@ thrust::host_vector<dtype_out> cpu_mha_reference(
   float sm_scale = 1.f / std::sqrt(float(head_dim));
   thrust::host_vector<dtype_out> o(num_heads * head_dim);
   thrust::host_vector<float> att(num_heads * seq_len);
-  thrust::host_vector<dtype_in> q_rotary_local(head_dim);
-  thrust::host_vector<dtype_in> k_rotary_local(head_dim);
+  thrust::host_vector<float> q_rotary_local(head_dim);
+  thrust::host_vector<float> k_rotary_local(head_dim);
   for (size_t i = 0; i < num_heads; ++i) {
     float max_val = -INFINITY;
     if (rotary_mode == flashinfer::RotaryMode::kApplyRotary ||
         rotary_mode == flashinfer::RotaryMode::kApplyRotaryUpdateLastK) {
-      thrust::copy_n(thrust::host, q.begin() + i * head_dim, head_dim, q_rotary_local.begin());
-      cpu_inplace_apply_rotary(q_rotary_local, seq_len - 1, rope_scale, rope_theta);
+      q_rotary_local = std::move(cpu_apply_rotary(thrust::raw_pointer_cast(q.data()) + i * head_dim,
+                                                  head_dim, seq_len - 1, rope_scale, rope_theta));
     }
     for (size_t j = 0; j < seq_len; ++j) {
       att[i * seq_len + j] = 0.;
@@ -52,26 +54,29 @@ thrust::host_vector<dtype_out> cpu_mha_reference(
           break;
         }
         case flashinfer::RotaryMode::kApplyRotary: {
-          thrust::copy_n(thrust::host, k.begin() + j * num_heads * head_dim + i * head_dim,
-                         head_dim, k_rotary_local.begin());
-          cpu_inplace_apply_rotary(k_rotary_local, j, rope_scale, rope_theta);
+          k_rotary_local = std::move(cpu_apply_rotary(
+              thrust::raw_pointer_cast(k.data()) + j * num_heads * head_dim + i * head_dim,
+              head_dim, j, rope_scale, rope_theta));
           for (size_t k_ = 0; k_ < head_dim; ++k_) {
-            att[i * seq_len + j] +=
-                float(q_rotary_local[k_]) * float(k_rotary_local[k_]) * sm_scale;
+            att[i * seq_len + j] += q_rotary_local[k_] * k_rotary_local[k_] * sm_scale;
           }
           break;
         }
         case flashinfer::RotaryMode::kApplyRotaryUpdateLastK: {
-          thrust::copy_n(thrust::host, k.begin() + j * num_heads * head_dim + i * head_dim,
-                         head_dim, k_rotary_local.begin());
           if (j == seq_len - 1) {
-            cpu_inplace_apply_rotary(k_rotary_local, j, rope_scale, rope_theta);
-            thrust::copy_n(thrust::host, k_rotary_local.begin(), head_dim,
-                           k.begin() + j * num_heads * head_dim + i * head_dim);
+            k_rotary_local = std::move(cpu_apply_rotary(
+                thrust::raw_pointer_cast(k.data()) + j * num_heads * head_dim + i * head_dim,
+                head_dim, j, rope_scale, rope_theta));
+            thrust::transform(k_rotary_local.begin(), k_rotary_local.end(),
+                              k.begin() + j * num_heads * head_dim + i * head_dim,
+                              [](float x) { return dtype_in(x); });
+          } else {
+            thrust::transform(k.begin() + j * num_heads * head_dim + i * head_dim,
+                              k.begin() + j * num_heads * head_dim + (i + 1) * head_dim,
+                              k_rotary_local.begin(), [](dtype_in x) { return float(x); });
           }
           for (size_t k_ = 0; k_ < head_dim; ++k_) {
-            att[i * seq_len + j] +=
-                float(q_rotary_local[k_]) * float(k_rotary_local[k_]) * sm_scale;
+            att[i * seq_len + j] += q_rotary_local[k_] * k_rotary_local[k_] * sm_scale;
           }
           break;
         }
@@ -137,35 +142,57 @@ void _TestDecodingKernelCorrectness(size_t num_heads, size_t seq_len, size_t hea
   size_t num_result_errors_atol_1e_3_rtol_1e_3 = 0, num_updated_k_errors_atol_1e_3_rtol_1e_3 = 0;
 
   for (size_t i = 0; i < num_heads * head_dim; ++i) {
-    num_updated_k_errors_atol_1e_3_rtol_1e_3 +=
-        (!utils::isclose(float(K_host[(seq_len - 1) * num_heads * head_dim + i]),
-                         float(K_ref_host[(seq_len - 1) * num_heads * head_dim + i]), 1e-3, 1e-3));
-  }
-  for (size_t i = 0; i < num_heads * head_dim; ++i) {
     num_result_errors_atol_1e_3_rtol_1e_3 +=
         (!utils::isclose(float(o_host[i]), float(o_ref_host[i]), 1e-3, 1e-3));
   }
   float result_accuracy =
-            1. - float(num_result_errors_atol_1e_3_rtol_1e_3) / float(num_heads * head_dim),
-        updated_k_accuracy =
-            1. - float(num_updated_k_errors_atol_1e_3_rtol_1e_3) / float(num_heads * head_dim);
+      1. - float(num_result_errors_atol_1e_3_rtol_1e_3) / float(num_heads * head_dim);
   std::cout << "num_heads=" << num_heads << ", seq_len=" << seq_len << ", head_dim=" << head_dim
             << ", rotary_mode=" << flashinfer::RotaryModeToString(rotary_mode)
-            << ", result accuracy (atol=1e-3, rtol=1e-3): " << result_accuracy << " "
-            << ", updated_k accuracy (atol=1e-3, rtol=1e-3): " << updated_k_accuracy << std::endl;
+            << ", result accuracy (atol=1e-3, rtol=1e-3): " << result_accuracy;
+  if (rotary_mode == flashinfer::RotaryMode::kApplyRotaryUpdateLastK &&
+      (std::is_same<T, half>::value || std::is_same<T, float>::value)) {
+    // only check updated K correctness for kApplyRotaryUpdateLastK mode and data type fp16 and fp32
+    for (size_t i = 0; i < num_heads * head_dim; ++i) {
+      num_updated_k_errors_atol_1e_3_rtol_1e_3 += (!utils::isclose(
+          float(K_host[(seq_len - 1) * num_heads * head_dim + i]),
+          float(K_ref_host[(seq_len - 1) * num_heads * head_dim + i]), 1e-3, 1e-3));
+    }
+    float updated_k_accuracy =
+        1. - float(num_updated_k_errors_atol_1e_3_rtol_1e_3) / float(num_heads * head_dim);
+    std::cout << " ; updated_k accuracy (atol=1e-3, rtol=1e-3): " << updated_k_accuracy;
+    EXPECT_GT(updated_k_accuracy, 0.90) << "Updated K correctness test failed.";
+  }
+  std::cout << std::endl;
   EXPECT_GT(result_accuracy, 0.90) << "Result correctness test failed.";
-  EXPECT_GT(updated_k_accuracy, 0.90) << "Updated K correctness test failed.";
 }
 
-TEST(FlashInferCorrectnessTest, DecodingKernelCorrectnessTest) {
+template <typename T>
+void TestDecodeKernelCorrectness() {
   for (size_t num_heads : {32}) {
     for (size_t seq_len : {1, 3, 9, 27, 81, 129, 257, 512, 1024, 2048, 4096, 8192, 16384, 32768}) {
       for (size_t head_dim : {64, 128, 256}) {
         for (unsigned int rotary_mode : {0U, 1U, 2U}) {
-          _TestDecodingKernelCorrectness<half>(num_heads, seq_len, head_dim,
-                                               flashinfer::RotaryMode(rotary_mode));
+          _TestDecodingKernelCorrectness<T>(num_heads, seq_len, head_dim,
+                                            flashinfer::RotaryMode(rotary_mode));
         }
       }
     }
   }
+}
+
+TEST(FlashInferCorrectnessTest, DecodingKernelCorrectnessTestBF16) {
+  TestDecodeKernelCorrectness<nv_bfloat16>();
+}
+TEST(FlashInferCorrectnessTest, DecodingKernelCorrectnessTestFP16) {
+  TestDecodeKernelCorrectness<half>();
+}
+TEST(FlashInferCorrectnessTest, DecodingKernelCorrectnessTestE4M3) {
+  TestDecodeKernelCorrectness<__nv_fp8_e4m3>();
+}
+TEST(FlashInferCorrectnessTest, DecodingKernelCorrectnessTestE5M2) {
+  TestDecodeKernelCorrectness<__nv_fp8_e5m2>();
+}
+TEST(FlashInferCorrectnessTest, DecodingKernelCorrectnessTestFP32) {
+  TestDecodeKernelCorrectness<float>();
 }

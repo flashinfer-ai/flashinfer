@@ -1,4 +1,6 @@
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <thrust/device_vector.h>
 #include <thrust/execution_policy.h>
@@ -16,7 +18,7 @@ void thrust_normal_init(thrust::device_vector<T>& vec, float mean = 0.f, float s
   std::mt19937 gen{rd()};
   std::normal_distribution d{mean, std};
   for (size_t i = 0; i < vec.size(); ++i) {
-    host_vec[i] = d(gen);
+    host_vec[i] = T(d(gen));
   }
   vec = host_vec;
 }
