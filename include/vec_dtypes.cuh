@@ -1176,7 +1176,7 @@ template <size_t vec_size>
 FLASHINFER_INLINE void cast_from_impl(const vec_t<half, vec_size> &src,
                                       vec_t<__nv_fp8_e5m2, vec_size> &dst) {
   if constexpr (vec_size == 1) {
-    dst.data = __nv_fp8_e4m3(src.data);
+    dst.data = __nv_fp8_e5m2(src.data);
   } else if constexpr (vec_size == 2) {
     *(__nv_fp8x2_e5m2 *)(&dst.data) = __nv_fp8x2_e5m2(*(half2 *)(&src.data));
   } else {
