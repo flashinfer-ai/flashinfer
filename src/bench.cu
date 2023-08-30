@@ -14,8 +14,8 @@ void bench_flashinfer_decode(nvbench::state &state) {
 
   // Provide throughput information:
   state.add_global_memory_reads<dtype_in>(num_heads * head_dim + 2 * seq_len * num_heads * head_dim,
-                                          "DataSize");
-  state.add_global_memory_writes<dtype_out>(num_heads * head_dim);
+                                          "Read");
+  state.add_global_memory_writes<dtype_out>(num_heads * head_dim, "Write");
 
   state.exec(nvbench::exec_tag::timer, [&](nvbench::launch &launch, auto &timer) {
     timer.start();
@@ -23,7 +23,7 @@ void bench_flashinfer_decode(nvbench::state &state) {
         thrust::raw_pointer_cast(Q.data()), thrust::raw_pointer_cast(K.data()),
         thrust::raw_pointer_cast(V.data()), thrust::raw_pointer_cast(O.data()),
         thrust::raw_pointer_cast(tmp.data()), num_heads, seq_len, head_dim,
-        flashinfer::RotaryMode::kApplyRotary, 1.f, 1e4, launch.get_stream());
+        flashinfer::RotaryMode::kNone, 1.f, 1e4, launch.get_stream());
     if (status != cudaSuccess) {
       state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
     }
@@ -33,7 +33,7 @@ void bench_flashinfer_decode(nvbench::state &state) {
 
 #define CREATE_BENCH_F16F16(SEQLEN, NUMHEADS, HEADDIM)                    \
   auto bench_flashinfer_decode_f16f16_##SEQLEN##_##NUMHEADS##_##HEADDIM = \
-      bench_flashinfer_decode<__nv_fp8_e5m2, half, SEQLEN, NUMHEADS, HEADDIM>;
+      bench_flashinfer_decode<half, half, SEQLEN, NUMHEADS, HEADDIM>;
 
 CREATE_BENCH_F16F16(32, 32, 128);
 CREATE_BENCH_F16F16(64, 32, 128);
