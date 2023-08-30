@@ -100,8 +100,8 @@ __device__ __forceinline__ vec_t<float, vec_size> apply_rotary(
  * \param mask
  * \param x A float indicates the thread-local result of qk  TODO(Zihao): fix doc
  */
-template <RotaryMode rotary_mode, size_t head_dim, size_t vec_size, size_t blockdim_x,
-          size_t blockdim_y, size_t blockdim_z, typename T>
+template <RotaryMode rotary_mode, size_t head_dim, size_t vec_size, size_t bdx, size_t bdy,
+          size_t bdz, typename T>
 __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec_size> &q_vec,
                                            const vec_t<float, vec_size> &inv_freq,
                                            const size_t *kv_shared_offset, size_t offset,
@@ -111,27 +111,27 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
                                            float *x_shared) {
   vec_t<float, vec_size> k_vec;
   size_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
-  size_t head_idx_start = blockIdx.x * blockdim_y, head_idx = head_idx_start + ty;
+  size_t head_idx_start = blockIdx.x * bdy, head_idx = head_idx_start + ty;
   size_t kv_idx = offset + tz;
   if constexpr (rotary_mode == RotaryMode::kApplyRotary) {
     // apply rotary embedding for all rows in k matrix of kv-cache
     k_vec = apply_rotary<vec_size>(
-        smem + kv_shared_offset[compute_stage_idx] + (tz * blockdim_y + ty) * head_dim, inv_freq,
-        kv_idx, head_dim);
+        smem + kv_shared_offset[compute_stage_idx] + (tz * bdy + ty) * head_dim, inv_freq, kv_idx,
+        head_dim);
   } else if constexpr (rotary_mode == RotaryMode::kApplyRotaryUpdateLastK) {
     // apply rotary embedding for the newly appended rows in k matrix of kv-cache
     if (kv_idx == seq_len - 1) {
       k_vec = apply_rotary<vec_size>(
-          smem + kv_shared_offset[compute_stage_idx] + (tz * blockdim_y + ty) * head_dim, inv_freq,
-          kv_idx, head_dim);
+          smem + kv_shared_offset[compute_stage_idx] + (tz * bdy + ty) * head_dim, inv_freq, kv_idx,
+          head_dim);
       k_vec.cast_store(k_glob + (kv_idx * num_heads + head_idx) * head_dim + tx * vec_size);
     } else {
-      k_vec.cast_load(smem + kv_shared_offset[compute_stage_idx] +
-                      (tz * blockdim_y + ty) * head_dim + tx * vec_size);
+      k_vec.cast_load(smem + kv_shared_offset[compute_stage_idx] + (tz * bdy + ty) * head_dim +
+                      tx * vec_size);
     }
   } else {
     // do not apply rotary embedding
-    k_vec.cast_load(smem + kv_shared_offset[compute_stage_idx] + (tz * blockdim_y + ty) * head_dim +
+    k_vec.cast_load(smem + kv_shared_offset[compute_stage_idx] + (tz * bdy + ty) * head_dim +
                     tx * vec_size);
   }
   float x = 0.f;
@@ -139,13 +139,13 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
   for (size_t i = 0; i < vec_size; ++i) {
     x += q_vec[i] * k_vec[i] * sm_scale;
   }
-  cg::thread_block_tile g = cg::tiled_partition<blockdim_x>(cg::this_thread_block());
+  cg::thread_block_tile g = cg::tiled_partition<bdx>(cg::this_thread_block());
 #pragma unroll
-  for (size_t offset = blockdim_x / 2; offset > 0; offset /= 2) {
+  for (size_t offset = bdx / 2; offset > 0; offset /= 2) {
     x += g.shfl_down(x, offset);
   }
   x = g.shfl(x, 0);
-  x_shared[tz * blockdim_y + ty] = mask ? x : -INFINITY;
+  x_shared[tz * bdy + ty] = mask ? x : -INFINITY;
 }
 
 /*!
@@ -163,8 +163,7 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
  * \param d A float indicates the thread-local sum of exp(pre-softmax logits - m)
  * \param o A vector of float indicates the thread-local output vector
  */
-template <size_t head_dim, size_t vec_size, size_t blockdim_x, size_t blockdim_y, size_t blockdim_z,
-          typename T>
+template <size_t head_dim, size_t vec_size, size_t bdx, size_t bdy, size_t bdz, typename T>
 __device__ __forceinline__ void update_partial_mdo(const T *smem, const float *x_shared,
                                                    const size_t *kv_shared_offset,
                                                    size_t compute_stage_idx, float &m, float &d,
@@ -172,10 +171,10 @@ __device__ __forceinline__ void update_partial_mdo(const T *smem, const float *x
   vec_t<float, vec_size> v_vec;
   size_t tx = threadIdx.x, ty = threadIdx.y;
 #pragma unroll
-  for (size_t j = 0; j < blockdim_z; ++j) {
-    v_vec.cast_load(smem + kv_shared_offset[compute_stage_idx] + (j * blockdim_y + ty) * head_dim +
+  for (size_t j = 0; j < bdz; ++j) {
+    v_vec.cast_load(smem + kv_shared_offset[compute_stage_idx] + (j * bdy + ty) * head_dim +
                     tx * vec_size);
-    float x = x_shared[j * blockdim_y + ty], m_prev = m, d_prev = d;
+    float x = x_shared[j * bdy + ty], m_prev = m, d_prev = d;
     m = max(m, x);
     d = d * __expf(m_prev - m) + __expf(x - m);
 #pragma unroll
@@ -206,8 +205,8 @@ __device__ __forceinline__ void update_partial_mdo(const T *smem, const float *x
  *   used in RoPE (Rotary Positional Embeddings).
  * \param kv_chunk_size A integer indicates the kv-chunk size
  */
-template <RotaryMode rotary_mode, size_t head_dim, size_t vec_size, size_t blockdim_x,
-          size_t blockdim_y, size_t blockdim_z, typename DTypeIn, typename DTypeOut>
+template <RotaryMode rotary_mode, size_t head_dim, size_t vec_size, size_t bdx, size_t bdy,
+          size_t bdz, typename DTypeIn, typename DTypeOut>
 __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *__restrict__ k,
                                               DTypeIn *__restrict__ v, DTypeOut *__restrict__ o,
                                               float *__restrict__ tmp, float sm_scale,
@@ -218,13 +217,13 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
 
   constexpr size_t stages_count = 4;
   // TODO(Zihao): consider switch blockIdx.x and blockIdx.y
-  size_t head_idx_start = blockIdx.x * blockdim_y;
+  size_t head_idx_start = blockIdx.x * bdy;
   size_t kv_chunk_idx = blockIdx.y;
   size_t num_kv_chunks = gridDim.y;
-  size_t num_heads = gridDim.x * blockdim_y;
+  size_t num_heads = gridDim.x * bdy;
 
-  __shared__ DTypeIn smem[stages_count * blockdim_z * blockdim_y * head_dim];
-  __shared__ float x_shared[blockdim_z * blockdim_y];
+  __shared__ DTypeIn smem[stages_count * bdz * bdy * head_dim];
+  __shared__ float x_shared[bdz * bdy];
 
   size_t tx = threadIdx.x, ty = threadIdx.y, head_idx = head_idx_start + ty, tz = threadIdx.z;
   vec_t<float, vec_size> q_vec;
@@ -250,27 +249,24 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   size_t chunk_end = chunk_start + kv_chunk_size;
 
   // load k tiles and v tiles
-  size_t kv_shared_offset[stages_count] = {0U, 1U * blockdim_z * blockdim_y * head_dim,
-                                           2U * blockdim_z * blockdim_y * head_dim,
-                                           3U * blockdim_z * blockdim_y * head_dim};
+  size_t kv_shared_offset[stages_count] = {0U, 1U * bdz * bdy * head_dim, 2U * bdz * bdy * head_dim,
+                                           3U * bdz * bdy * head_dim};
 
   // pipelining k/v tiles loading and m/d/o computation
   auto pipeline = cuda::make_pipeline();
   const auto frag_shape = cuda::aligned_size_t<alignof(float4)>(sizeof(DTypeIn) * vec_size);
   pipeline.producer_acquire();
   if (tz < kv_chunk_size) {
-    cuda::memcpy_async(
-        smem + kv_shared_offset[0] + (tz * blockdim_y + ty) * head_dim + tx * vec_size,
-        k + ((chunk_start + tz) * num_heads + head_idx) * head_dim + tx * vec_size, frag_shape,
-        pipeline);
+    cuda::memcpy_async(smem + kv_shared_offset[0] + (tz * bdy + ty) * head_dim + tx * vec_size,
+                       k + ((chunk_start + tz) * num_heads + head_idx) * head_dim + tx * vec_size,
+                       frag_shape, pipeline);
   }
   pipeline.producer_commit();
   pipeline.producer_acquire();
   if (tz < kv_chunk_size) {
-    cuda::memcpy_async(
-        smem + kv_shared_offset[1] + (tz * blockdim_y + ty) * head_dim + tx * vec_size,
-        v + ((chunk_start + tz) * num_heads + head_idx) * head_dim + tx * vec_size, frag_shape,
-        pipeline);
+    cuda::memcpy_async(smem + kv_shared_offset[1] + (tz * bdy + ty) * head_dim + tx * vec_size,
+                       v + ((chunk_start + tz) * num_heads + head_idx) * head_dim + tx * vec_size,
+                       frag_shape, pipeline);
   }
   pipeline.producer_commit();
 
@@ -282,15 +278,14 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   size_t copy_stage_idx = 2, compute_stage_idx = 0, batch;
 
 #pragma unroll 2
-  for (batch = 1; batch < (kv_chunk_size + blockdim_z - 1) / blockdim_z; ++batch) {
-    size_t kv_idx = chunk_start + batch * blockdim_z + tz;
+  for (batch = 1; batch < (kv_chunk_size + bdz - 1) / bdz; ++batch) {
+    size_t kv_idx = chunk_start + batch * bdz + tz;
     // load stage: load k tiles
     pipeline.producer_acquire();
     if (kv_idx < chunk_end) {
-      cuda::memcpy_async(smem + kv_shared_offset[copy_stage_idx] +
-                             (tz * blockdim_y + ty) * head_dim + tx * vec_size,
-                         k + (kv_idx * num_heads + head_idx) * head_dim + tx * vec_size, frag_shape,
-                         pipeline);
+      cuda::memcpy_async(
+          smem + kv_shared_offset[copy_stage_idx] + (tz * bdy + ty) * head_dim + tx * vec_size,
+          k + (kv_idx * num_heads + head_idx) * head_dim + tx * vec_size, frag_shape, pipeline);
     }
     pipeline.producer_commit();
     copy_stage_idx = (copy_stage_idx + 1) % stages_count;
@@ -298,10 +293,10 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     // compute stage: compute qk
     pipeline.consumer_wait();
     block.sync();
-    compute_qk<rotary_mode, head_dim, vec_size, blockdim_x, blockdim_y, blockdim_z>(
-        smem, q_vec, inv_freq, kv_shared_offset, chunk_start + (batch - 1) * blockdim_z,
-        compute_stage_idx, seq_len, num_heads, sm_scale, rope_inv_scale, rope_inv_theta, k,
-        chunk_start + (batch - 1) * blockdim_z + tz < chunk_end, x_shared);
+    compute_qk<rotary_mode, head_dim, vec_size, bdx, bdy, bdz>(
+        smem, q_vec, inv_freq, kv_shared_offset, chunk_start + (batch - 1) * bdz, compute_stage_idx,
+        seq_len, num_heads, sm_scale, rope_inv_scale, rope_inv_theta, k,
+        chunk_start + (batch - 1) * bdz + tz < chunk_end, x_shared);
     block.sync();
     pipeline.consumer_release();
     compute_stage_idx = (compute_stage_idx + 1) % stages_count;
@@ -309,10 +304,9 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     // load stage: load v tiles
     pipeline.producer_acquire();
     if (kv_idx < chunk_end) {
-      cuda::memcpy_async(smem + kv_shared_offset[copy_stage_idx] +
-                             (tz * blockdim_y + ty) * head_dim + tx * vec_size,
-                         v + (kv_idx * num_heads + head_idx) * head_dim + tx * vec_size, frag_shape,
-                         pipeline);
+      cuda::memcpy_async(
+          smem + kv_shared_offset[copy_stage_idx] + (tz * bdy + ty) * head_dim + tx * vec_size,
+          v + (kv_idx * num_heads + head_idx) * head_dim + tx * vec_size, frag_shape, pipeline);
     }
     pipeline.producer_commit();
     copy_stage_idx = (copy_stage_idx + 1) % stages_count;
@@ -320,8 +314,8 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     // compute stage: update partial m,d,o status
     pipeline.consumer_wait();
     block.sync();
-    update_partial_mdo<head_dim, vec_size, blockdim_x, blockdim_y, blockdim_z>(
-        smem, x_shared, kv_shared_offset, compute_stage_idx, m, d, o_vec);
+    update_partial_mdo<head_dim, vec_size, bdx, bdy, bdz>(smem, x_shared, kv_shared_offset,
+                                                          compute_stage_idx, m, d, o_vec);
     block.sync();
     pipeline.consumer_release();
     compute_stage_idx = (compute_stage_idx + 1) % stages_count;
@@ -330,18 +324,18 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   // compute stage: compute qk
   pipeline.consumer_wait();
   block.sync();
-  compute_qk<rotary_mode, head_dim, vec_size, blockdim_x, blockdim_y, blockdim_z>(
-      smem, q_vec, inv_freq, kv_shared_offset, chunk_start + (batch - 1) * blockdim_z,
-      compute_stage_idx, seq_len, num_heads, sm_scale, rope_inv_scale, rope_inv_theta, k,
-      chunk_start + (batch - 1) * blockdim_z + tz < chunk_end, x_shared);
+  compute_qk<rotary_mode, head_dim, vec_size, bdx, bdy, bdz>(
+      smem, q_vec, inv_freq, kv_shared_offset, chunk_start + (batch - 1) * bdz, compute_stage_idx,
+      seq_len, num_heads, sm_scale, rope_inv_scale, rope_inv_theta, k,
+      chunk_start + (batch - 1) * bdz + tz < chunk_end, x_shared);
   block.sync();
   pipeline.consumer_release();
   compute_stage_idx = (compute_stage_idx + 1) % stages_count;
   // compute stage: update partial m,d,o status
   pipeline.consumer_wait();
   block.sync();
-  update_partial_mdo<head_dim, vec_size, blockdim_x, blockdim_y, blockdim_z>(
-      smem, x_shared, kv_shared_offset, compute_stage_idx, m, d, o_vec);
+  update_partial_mdo<head_dim, vec_size, bdx, bdy, bdz>(smem, x_shared, kv_shared_offset,
+                                                        compute_stage_idx, m, d, o_vec);
   block.sync();
   pipeline.consumer_release();
   compute_stage_idx = (compute_stage_idx + 1) % stages_count;
@@ -462,24 +456,24 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
   SWITCH_HEAD_DIM(
       head_dim, HEAD_DIM, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
         constexpr size_t vec_size = std::max(16 / sizeof(DTypeIn), HEAD_DIM / 32);
-        constexpr size_t blockdim_x = HEAD_DIM / vec_size;
-        constexpr size_t blockdim_y = 32 / blockdim_x;
-        constexpr size_t blockdim_z = 4;
-        auto kernel = SingleDecodeWithKVCacheKernel<ROTARY_MODE, HEAD_DIM, vec_size, blockdim_x,
-                                                    blockdim_y, blockdim_z, DTypeIn, DTypeOut>;
+        constexpr size_t bdx = HEAD_DIM / vec_size;
+        constexpr size_t bdy = 32 / bdx;
+        constexpr size_t bdz = 4;
+        auto kernel = SingleDecodeWithKVCacheKernel<ROTARY_MODE, HEAD_DIM, vec_size, bdx, bdy, bdz,
+                                                    DTypeIn, DTypeOut>;
         int num_blocks_per_sm = 0;
         int num_thrs = 128;
         cudaDeviceProp device_prop;
         cudaGetDeviceProperties(&device_prop, 0);
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, num_thrs, 0);
         size_t max_num_blks = size_t(num_blocks_per_sm) * device_prop.multiProcessorCount;
-        size_t max_num_kv_chunks = max_num_blks / (num_heads / blockdim_y);
+        size_t max_num_kv_chunks = max_num_blks / (num_heads / bdy);
         size_t kv_chunk_size =
             max((seq_len + max_num_kv_chunks - 1UL) / max_num_kv_chunks,
-                min(64UL, max(4UL, seq_len / max(1UL, (64UL * blockdim_y / num_heads)))));
-        dim3 nblks = dim3(num_heads / blockdim_y, (seq_len + kv_chunk_size - 1) / kv_chunk_size);
+                min(64UL, max(4UL, seq_len / max(1UL, (64UL * bdy / num_heads)))));
+        dim3 nblks = dim3(num_heads / bdy, (seq_len + kv_chunk_size - 1) / kv_chunk_size);
         assert(nblks.x > 0 && nblks.y > 0);
-        dim3 nthrs = dim3(blockdim_x, blockdim_y, blockdim_z);
+        dim3 nthrs = dim3(bdx, bdy, bdz);
         void *args[] = {(void *)&q,
                         (void *)&k,
                         (void *)&v,
