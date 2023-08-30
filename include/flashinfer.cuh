@@ -117,13 +117,13 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
     // apply rotary embedding for all rows in k matrix of kv-cache
     k_vec = apply_rotary<vec_size>(
         smem + kv_shared_offset[compute_stage_idx] + (tz * blockdim_y + ty) * head_dim, inv_freq,
-        offset, head_dim);
+        kv_idx, head_dim);
   } else if constexpr (rotary_mode == RotaryMode::kApplyRotaryUpdateLastK) {
     // apply rotary embedding for the newly appended rows in k matrix of kv-cache
     if (kv_idx == seq_len - 1) {
       k_vec = apply_rotary<vec_size>(
           smem + kv_shared_offset[compute_stage_idx] + (tz * blockdim_y + ty) * head_dim, inv_freq,
-          offset, head_dim);
+          kv_idx, head_dim);
       k_vec.cast_store(k_glob + (kv_idx * num_heads + head_idx) * head_dim + tx * vec_size);
     } else {
       k_vec.cast_load(smem + kv_shared_offset[compute_stage_idx] +
@@ -474,8 +474,9 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, num_thrs, 0);
         size_t max_num_blks = size_t(num_blocks_per_sm) * device_prop.multiProcessorCount;
         size_t max_num_kv_chunks = max_num_blks / (num_heads / blockdim_y);
-        size_t kv_chunk_size = max((seq_len + max_num_kv_chunks - 1UL) / max_num_kv_chunks,
-                                   min(64UL, max(4UL, seq_len / (64 * blockdim_y / num_heads))));
+        size_t kv_chunk_size =
+            max((seq_len + max_num_kv_chunks - 1UL) / max_num_kv_chunks,
+                min(64UL, max(4UL, seq_len / max(1UL, (64UL * blockdim_y / num_heads)))));
         dim3 nblks = dim3(num_heads / blockdim_y, (seq_len + kv_chunk_size - 1) / kv_chunk_size);
         assert(nblks.x > 0 && nblks.y > 0);
         dim3 nthrs = dim3(blockdim_x, blockdim_y, blockdim_z);
