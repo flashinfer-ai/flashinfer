@@ -3,7 +3,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#ifdef FLASHINFER_USE_FP8
+#ifdef FLASHINFER_ENABLE_FP8
 #include <cuda_fp8.h>
 #endif
 #include <cuda_runtime.h>
@@ -63,7 +63,7 @@ FLASHINFER_INLINE void cast_store_impl(const vec_t<src_float_t, vec_size> &src,
   }
 }
 
-#ifdef FLASHINFER_USE_FP8
+#ifdef FLASHINFER_ENABLE_FP8
 /******************* vec_t<__nv_fp8_e4m3> *******************/
 
 // __nv_fp8_e4m3 x 1
@@ -1067,7 +1067,7 @@ FLASHINFER_INLINE void cast_from_impl(const vec_t<float, vec_size> &src,
   }
 }
 
-#ifdef FLASHINFER_USE_FP8
+#ifdef FLASHINFER_ENABLE_FP8
 
 template <size_t vec_size>
 FLASHINFER_INLINE void cast_from_impl(const vec_t<__nv_fp8_e4m3, vec_size> &src,
@@ -1189,7 +1189,7 @@ FLASHINFER_INLINE void cast_from_impl(const vec_t<half, vec_size> &src,
   }
 }
 
-#endif  // FLASHINFER_USE_FP8
+#endif  // FLASHINFER_ENABLE_FP8
 
 }  // namespace flashinfer
 
