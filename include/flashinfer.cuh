@@ -76,30 +76,44 @@ __device__ __forceinline__ vec_t<float, vec_size> apply_rotary(
 }
 
 template <size_t vec_size>
-__device__ __forceinline__ void merge_state(float &m, float &d, vec_t<float, vec_size> &o,
-                                            float other_m, float other_d,
-                                            const vec_t<float, vec_size> &other_o) {
-  float m_prev = m, d_prev = d;
-  m = max(m_prev, other_m);
-  d = d_prev * __expf(m_prev - m) + other_d * __expf(other_m - m);
-#pragma unroll
-  for (size_t i = 0; i < vec_size; ++i) {
-    o[i] =
-        o[i] * __expf(m_prev - m) * (d_prev / d) + other_o[i] * __expf(other_m - m) * (other_d / d);
-  }
-}
+struct state_t {
+  float m, d;
+  vec_t<float, vec_size> o;
 
-template <size_t vec_size>
-__device__ __forceinline__ void merge_state(float &m, float &d, vec_t<float, vec_size> &o, float x,
-                                            const vec_t<float, vec_size> &v) {
-  float m_prev = m, d_prev = d;
-  m = max(m, x);
-  d = d * __expf(m_prev - m) + __expf(x - m);
-#pragma unroll
-  for (size_t i = 0; i < vec_size; ++i) {
-    o[i] = o[i] * (__expf(m_prev - m) * d_prev / d) + v[i] * (__expf(x - m) / d);
+  __device__ __forceinline__ void init() {
+    m = -1e5;
+    d = 0.f;
+    o.fill(0.f);
   }
-}
+
+  __device__ __forceinline__ state_t() { init(); }
+
+  __device__ __forceinline__ void merge(float other_m, float other_d,
+                                        const vec_t<float, vec_size> &other_o) {
+    float m_prev = m, d_prev = d;
+    m = max(m_prev, other_m);
+    d = d_prev * __expf(m_prev - m) + other_d * __expf(other_m - m);
+#pragma unroll
+    for (size_t i = 0; i < vec_size; ++i) {
+      o[i] = o[i] * __expf(m_prev - m) * (d_prev / d) +
+             other_o[i] * __expf(other_m - m) * (other_d / d);
+    }
+  }
+
+  __device__ __forceinline__ void merge(const state_t<vec_size> &other) {
+    merge(other.m, other.d, other.o);
+  }
+
+  __device__ __forceinline__ void merge(float x, const vec_t<float, vec_size> &v) {
+    float m_prev = m, d_prev = d;
+    m = max(m, x);
+    d = d * __expf(m_prev - m) + __expf(x - m);
+#pragma unroll
+    for (size_t i = 0; i < vec_size; ++i) {
+      o[i] = o[i] * (__expf(m_prev - m) * d_prev / d) + v[i] * (__expf(x - m) / d);
+    }
+  }
+};
 
 /*!
  * \brief Load k tile from smem and compute qk
@@ -122,9 +136,9 @@ __device__ __forceinline__ void merge_state(float &m, float &d, vec_t<float, vec
  *   used in PI(Position Interpolation) of RoPE (Rotary Positional Embeddings).
  * \param rope_inv_theta A floating number indicate the multiplicative inverse of "theta"
  *   used in RoPE (Rotary Positional Embeddings).
- * \param k_glob A pointer to the start of global memory of k matrix in kv-cache
- * \param mask
- * \param x A float indicates the thread-local result of qk  TODO(Zihao): fix doc
+ * \param k A pointer to the start of global memory of k matrix in kv-cache
+ * \param mask   TODO(Zihao): fix doc
+ * \param x A float indicates the thread-local result of qk
  */
 template <RotaryMode rotary_mode, size_t head_dim, size_t vec_size, size_t bdx, size_t bdy,
           size_t bdz, typename T>
@@ -133,8 +147,7 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
                                            const size_t *kv_shared_offset, size_t offset,
                                            size_t compute_stage_idx, size_t seq_len,
                                            size_t num_heads, float sm_scale, float rope_inv_scale,
-                                           float rope_inv_theta, T *k_glob, bool mask,
-                                           float *x_shared) {
+                                           float rope_inv_theta, T *k, bool mask, float &x) {
   vec_t<float, vec_size> k_vec;
   size_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
   size_t head_idx_start = blockIdx.x * bdy, head_idx = head_idx_start + ty;
@@ -145,12 +158,12 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
         smem + kv_shared_offset[compute_stage_idx] + (tz * bdy + ty) * head_dim, inv_freq, kv_idx,
         head_dim);
   } else if constexpr (rotary_mode == RotaryMode::kApplyRotaryUpdateLastK) {
-    // apply rotary embedding for the newly appended rows in k matrix of kv-cache
+    // inplace update rotary embedding for the newly appended rows in k matrix of kv-cache
     if (kv_idx == seq_len - 1) {
       k_vec = apply_rotary<vec_size>(
           smem + kv_shared_offset[compute_stage_idx] + (tz * bdy + ty) * head_dim, inv_freq, kv_idx,
           head_dim);
-      k_vec.cast_store(k_glob + (kv_idx * num_heads + head_idx) * head_dim + tx * vec_size);
+      k_vec.cast_store(k + (kv_idx * num_heads + head_idx) * head_dim + tx * vec_size);
     } else {
       k_vec.cast_load(smem + kv_shared_offset[compute_stage_idx] + (tz * bdy + ty) * head_dim +
                       tx * vec_size);
@@ -160,7 +173,7 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
     k_vec.cast_load(smem + kv_shared_offset[compute_stage_idx] + (tz * bdy + ty) * head_dim +
                     tx * vec_size);
   }
-  float x = 0.f;
+  x = 0.f;
 #pragma unroll
   for (size_t i = 0; i < vec_size; ++i) {
     x += q_vec[i] * k_vec[i] * sm_scale;
@@ -171,7 +184,7 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
     x += g.shfl_down(x, offset);
   }
   x = g.shfl(x, 0);
-  x_shared[tz * bdy + ty] = mask ? x : -INFINITY;
+  x = mask ? x : -1e5;
 }
 
 /*!
@@ -190,17 +203,31 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
  * \param o A vector of float indicates the thread-local output vector
  */
 template <size_t head_dim, size_t vec_size, size_t bdx, size_t bdy, size_t bdz, typename T>
-__device__ __forceinline__ void update_partial_mdo(const T *smem, const float *x_shared,
+__device__ __forceinline__ void update_partial_mdo(const T *smem, const float x,
                                                    const size_t *kv_shared_offset,
-                                                   size_t compute_stage_idx, float &m, float &d,
-                                                   vec_t<float, vec_size> &o) {
+                                                   size_t compute_stage_idx, state_t<vec_size> &s) {
   vec_t<float, vec_size> v_vec;
-  size_t tx = threadIdx.x, ty = threadIdx.y;
+  size_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
+  v_vec.cast_load(smem + kv_shared_offset[compute_stage_idx] + (tz * bdy + ty) * head_dim +
+                  tx * vec_size);
+  s.merge(x, v_vec);
+}
+
+template <size_t head_dim, size_t vec_size, size_t bdx, size_t bdy, size_t bdz>
+__device__ __forceinline__ void sync_state(state_t<vec_size> &s, float *smem, float *smem_md) {
+  auto block = cg::this_thread_block();
+  size_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
+  s.o.store(smem + (tz * bdy + ty) * head_dim + tx * vec_size);
+  smem_md[(tz * bdy + ty) * 2] = s.m;
+  smem_md[(tz * bdy + ty) * 2 + 1] = s.d;
+  block.sync();
+  s.init();
 #pragma unroll
   for (size_t j = 0; j < bdz; ++j) {
-    v_vec.cast_load(smem + kv_shared_offset[compute_stage_idx] + (j * bdy + ty) * head_dim +
-                    tx * vec_size);
-    merge_state(m, d, o, x_shared[j * bdy + ty], v_vec);
+    float mj = smem_md[(j * bdy + ty) * 2], dj = smem_md[(j * bdy + ty) * 2 + 1];
+    vec_t<float, vec_size> oj;
+    oj.load(smem + (j * bdy + ty) * head_dim + tx * vec_size);
+    s.merge(mj, dj, oj);
   }
 }
 
@@ -236,14 +263,14 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   auto grid = cg::this_grid();
 
   constexpr size_t stages_count = 4;
-  // TODO(Zihao): consider switch blockIdx.x and blockIdx.y
   size_t head_idx_start = blockIdx.x * bdy;
   size_t kv_chunk_idx = blockIdx.y;
   size_t num_kv_chunks = gridDim.y;
   size_t num_heads = gridDim.x * bdy;
 
+  static_assert(stages_count >= sizeof(float) / sizeof(DTypeIn));
   __shared__ DTypeIn smem[stages_count * bdz * bdy * head_dim];
-  __shared__ float x_shared[bdz * bdy];
+  __shared__ float smem_md[2 * bdz * bdy];
 
   size_t tx = threadIdx.x, ty = threadIdx.y, head_idx = head_idx_start + ty, tz = threadIdx.z;
   vec_t<float, vec_size> q_vec;
@@ -290,11 +317,8 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   }
   pipeline.producer_commit();
 
-  float m_partial = -INFINITY;
-  float d_partial = 0.f;
-  vec_t<float, vec_size> o_partial;
-  o_partial.fill(0.f);
-
+  state_t<vec_size> s_partial;
+  float x = 0.f;
   size_t copy_stage_idx = 2, compute_stage_idx = 0, batch;
 
 #pragma unroll 2
@@ -316,7 +340,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     compute_qk<rotary_mode, head_dim, vec_size, bdx, bdy, bdz>(
         smem, q_vec, inv_freq, kv_shared_offset, chunk_start + (batch - 1) * bdz, compute_stage_idx,
         seq_len, num_heads, sm_scale, rope_inv_scale, rope_inv_theta, k,
-        chunk_start + (batch - 1) * bdz + tz < chunk_end, x_shared);
+        chunk_start + (batch - 1) * bdz + tz < chunk_end, x);
     block.sync();
     pipeline.consumer_release();
     compute_stage_idx = (compute_stage_idx + 1) % stages_count;
@@ -334,54 +358,66 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     // compute stage: update partial m,d,o status
     pipeline.consumer_wait();
     block.sync();
-    update_partial_mdo<head_dim, vec_size, bdx, bdy, bdz>(
-        smem, x_shared, kv_shared_offset, compute_stage_idx, m_partial, d_partial, o_partial);
+    update_partial_mdo<head_dim, vec_size, bdx, bdy, bdz>(smem, x, kv_shared_offset,
+                                                          compute_stage_idx, s_partial);
     block.sync();
     pipeline.consumer_release();
     compute_stage_idx = (compute_stage_idx + 1) % stages_count;
   }
+
   // last two compute stages
-  // compute stage: compute qk
-  pipeline.consumer_wait();
-  block.sync();
-  compute_qk<rotary_mode, head_dim, vec_size, bdx, bdy, bdz>(
-      smem, q_vec, inv_freq, kv_shared_offset, chunk_start + (batch - 1) * bdz, compute_stage_idx,
-      seq_len, num_heads, sm_scale, rope_inv_scale, rope_inv_theta, k,
-      chunk_start + (batch - 1) * bdz + tz < chunk_end, x_shared);
-  block.sync();
-  pipeline.consumer_release();
-  compute_stage_idx = (compute_stage_idx + 1) % stages_count;
-  // compute stage: update partial m,d,o status
-  pipeline.consumer_wait();
-  block.sync();
-  update_partial_mdo<head_dim, vec_size, bdx, bdy, bdz>(
-      smem, x_shared, kv_shared_offset, compute_stage_idx, m_partial, d_partial, o_partial);
-  block.sync();
-  pipeline.consumer_release();
-  compute_stage_idx = (compute_stage_idx + 1) % stages_count;
+  {
+    // compute stage: compute qk
+    pipeline.consumer_wait();
+    block.sync();
+    compute_qk<rotary_mode, head_dim, vec_size, bdx, bdy, bdz>(
+        smem, q_vec, inv_freq, kv_shared_offset, chunk_start + (batch - 1) * bdz, compute_stage_idx,
+        seq_len, num_heads, sm_scale, rope_inv_scale, rope_inv_theta, k,
+        chunk_start + (batch - 1) * bdz + tz < chunk_end, x);
+    block.sync();
+    pipeline.consumer_release();
+    compute_stage_idx = (compute_stage_idx + 1) % stages_count;
+    // compute stage: update partial m,d,o status
+    pipeline.consumer_wait();
+    block.sync();
+    update_partial_mdo<head_dim, vec_size, bdx, bdy, bdz>(smem, x, kv_shared_offset,
+                                                          compute_stage_idx, s_partial);
+    block.sync();
+    pipeline.consumer_release();
+    compute_stage_idx = (compute_stage_idx + 1) % stages_count;
+  }
+
+  // sync partial state of all warps inside a threadblock
+  sync_state<head_dim, vec_size, bdx, bdy, bdz>(s_partial, reinterpret_cast<float *>(smem),
+                                                smem_md);
 
   // update tmp buffer
-  o_partial.store(tmp + (kv_chunk_idx * num_heads + head_idx) * head_dim + tx * vec_size);
-  float *md_tmp = tmp + num_kv_chunks * num_heads * head_dim;
-  if (tz == 0) {
-    md_tmp[(kv_chunk_idx * num_heads + head_idx) * 2] = m_partial;
-    md_tmp[(kv_chunk_idx * num_heads + head_idx) * 2 + 1] = d_partial;
-  }
+  s_partial.o.store(tmp + (kv_chunk_idx * num_heads + head_idx) * head_dim + tx * vec_size);
+  float *tmp_md = tmp + num_kv_chunks * num_heads * head_dim;
+  tmp_md[(kv_chunk_idx * num_heads + head_idx) * 2] = s_partial.m;
+  tmp_md[(kv_chunk_idx * num_heads + head_idx) * 2 + 1] = s_partial.d;
   grid.sync();
 
-  if (kv_chunk_idx == 0 && tz == 0) {
-    float m_global = -INFINITY, d_global = 0.f;
-    vec_t<float, vec_size> o_global;
-    for (size_t batch = 0; batch < num_kv_chunks; ++batch) {
-      m_partial = md_tmp[(batch * num_heads + head_idx) * 2];
-      d_partial = md_tmp[(batch * num_heads + head_idx) * 2 + 1];
-      o_partial.load(tmp + (batch * num_heads + head_idx) * head_dim + tx * vec_size);
-
-      merge_state(m_global, d_global, o_global, m_partial, d_partial, o_partial);
+  // sync global states
+  if (kv_chunk_idx == 0) {
+    state_t<vec_size> s_global;
+#pragma unroll 2
+    for (size_t batch = 0; batch < (num_kv_chunks + bdz - 1) / bdz; ++batch) {
+      size_t kv_chunk_idx = batch * bdz + tz;
+      if (kv_chunk_idx < num_kv_chunks) {
+        s_partial.m = tmp_md[(kv_chunk_idx * num_heads + head_idx) * 2];
+        s_partial.d = tmp_md[(kv_chunk_idx * num_heads + head_idx) * 2 + 1];
+        s_partial.o.load(tmp + (kv_chunk_idx * num_heads + head_idx) * head_dim + tx * vec_size);
+        s_global.merge(s_partial);
+      }
     }
-    o_global.cast_store(o + head_idx * head_dim + tx * vec_size);
-    tmp[head_idx] = m_global;
-    tmp[num_heads + head_idx] = d_global;
+    block.sync();
+    // sync partial state of all warps inside a threadblock
+    sync_state<head_dim, vec_size, bdx, bdy, bdz>(s_global, reinterpret_cast<float *>(smem),
+                                                  smem_md);
+    s_global.o.cast_store(o + head_idx * head_dim + tx * vec_size);
+    tmp[head_idx] = s_global.m;
+    tmp[num_heads + head_idx] = s_global.d;
   }
 }
 
