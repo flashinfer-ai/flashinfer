@@ -377,6 +377,14 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     }                                                                            \
   }
 
+#define CUDA_CALL(func, ...) \
+  {                          \
+    cudaError_t e = (func);  \
+    if (e != cudaSuccess) {  \
+      return e;              \
+    }                        \
+  }
+
 /*!
  * \brief FlashAttention decoding with kv-cache for a single sequence
  * \tparam DTypeIn A template type indicates the input data type
@@ -400,7 +408,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
                                     size_t num_heads, size_t seq_len, size_t head_dim,
                                     RotaryMode rotary_mode = RotaryMode::kNone,
                                     float rope_scale = 1.f, float rope_theta = 1e4,
-                                    cudaStream_t stream = nullptr) {
+                                    cudaStream_t stream = nullptr, size_t dev_id = 0) {
   const float sm_scale = 1.f / std::sqrt(float(head_dim));
   const float rope_inv_scale = 1.f / rope_scale;
   const float rope_inv_theta = 1.f / rope_theta;
@@ -414,11 +422,11 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
         auto kernel = SingleDecodeWithKVCacheKernel<ROTARY_MODE, HEAD_DIM, vec_size, bdx, bdy, bdz,
                                                     DTypeIn, DTypeOut>;
         int num_blocks_per_sm = 0;
-        int num_thrs = 128;
-        cudaDeviceProp device_prop;
-        cudaGetDeviceProperties(&device_prop, 0);
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, num_thrs, 0);
-        size_t max_num_blks = size_t(num_blocks_per_sm) * device_prop.multiProcessorCount;
+        int num_sm = 0;
+        CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
+        CUDA_CALL(
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, 128, 0));
+        size_t max_num_blks = size_t(num_blocks_per_sm) * size_t(num_sm);
         size_t max_num_kv_chunks = max_num_blks / (num_heads / bdy);
         size_t kv_chunk_size =
             max((seq_len + max_num_kv_chunks - 1UL) / max_num_kv_chunks,
@@ -436,7 +444,8 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
                         (void *)&rope_inv_scale,
                         (void *)&rope_inv_theta,
                         (void *)&kv_chunk_size};
-        return cudaLaunchCooperativeKernel((void *)kernel, nblks, nthrs, args, 0, stream);
+        CUDA_CALL(cudaLaunchCooperativeKernel((void *)kernel, nblks, nthrs, args, 0, stream));
+        return cudaSuccess;
       })});
 }
 
