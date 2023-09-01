@@ -8,38 +8,37 @@
 namespace flashinfer {
 
 /*!
- * \brief An enumeration class that defines different modes for applying RoPE (Rotary Positional
- * Embeddings).
+ * \brief An enumeration class that defines different modes for applying RoPE
+ * (Rotary Positional Embeddings).
  */
 enum class RotaryMode {
   // No rotary positional embeddings
   kNone = 0U,
-  // Apply rotary positional embeddings to q and all rows in k matrix of kv-cache, while keeping the
-  // kv-cache unchanged.
+  // Apply rotary positional embeddings to q and all rows in k matrix of
+  // kv-cache.
   kApplyRotary = 1U,
-  // Apply rotary positional embeddings to q and the newly appended rows in k matrix of kv-cache,
-  // and write
-  // back the updated rows in k matrix of kv-cache.
-  kApplyRotaryUpdateLastK = 2U,
 };
 
+/*!
+ * \brief Convert RotaryMode to string
+ * \param rotary_mode A RotaryMode value
+ */
 inline std::string RotaryModeToString(const RotaryMode &rotary_mode) {
   switch (rotary_mode) {
     case RotaryMode::kNone:
       return "None";
     case RotaryMode::kApplyRotary:
       return "ApplyRotary";
-    case RotaryMode::kApplyRotaryUpdateLastK:
-      return "ApplyRotaryUpdateLastK";
     default:
       return "Unknown";
   }
 }
 
 /*!
- * \brief Apply RoPE (Rotary Positional Embeddings) to input[0: head_dim], return
- *   thread-local vector.
- * \tparam vec_size A template integer indicates the vector size used in the kernel.
+ * \brief Apply RoPE (Rotary Positional Embeddings) to input[0: head_dim],
+ *   return thread-local vector
+ * \tparam vec_size A template integer indicates the vector size used
+ *   in the kernel
  * \tparam T A template type indicates the input data type
  * \param input A pointer to the start of input data
  * \param inv_freq A vector of float indicates the multiplicative inverse of frequency

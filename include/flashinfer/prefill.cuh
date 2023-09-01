@@ -10,12 +10,10 @@
 #include <iostream>
 #include <random>
 
-#include "vec_dtypes.cuh"
 #include "rope.cuh"
 #include "state.cuh"
+#include "vec_dtypes.cuh"
 
-namespace flashinfer {
+namespace flashinfer {} // namespace flashinfer
 
-}  // namespace flashinfer
-
-#endif  // FLASHINFER_PREFILL_CUH_
+#endif // FLASHINFER_PREFILL_CUH_

@@ -4,4 +4,4 @@
 #include "flashinfer/decode.cuh"
 #include "flashinfer/prefill.cuh"
 
-#endif  // FLASHINFER_CUH_
+#endif // FLASHINFER_CUH_

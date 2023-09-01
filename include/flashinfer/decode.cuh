@@ -10,9 +10,9 @@
 #include <iostream>
 #include <random>
 
-#include "vec_dtypes.cuh"
 #include "rope.cuh"
 #include "state.cuh"
+#include "vec_dtypes.cuh"
 
 namespace flashinfer {
 
@@ -20,27 +20,30 @@ namespace cg = cooperative_groups;
 
 /*!
  * \brief Load k tile from smem and compute qk
- * \tparam rotary_mode The rotary mode used in the kernel.
+ * \tparam rotary_mode The rotary mode used in the kernel
+ * \tparam head_dim A template integer indicates the head dimension
+ * \tparam vec_size A template integer indicates the vector size
+ * \tparam bdx A template integer indicates the block size in x dimension
+ * \tparam bdy A template integer indicates the block size in y dimension
+ * \tparam bdz A template integer indicates the block size in z dimension
  * \tparam T A template type indicates the input data type
- * \tparam vec_size A template integer indicates the vector size used in the kernel.
  * \param smem A pointer to the start of shared memory
  * \param q_vec A vector of float indicates the thread-local query vector
- * \param kv_shared_offset An array of size_t indicates the k/v tiles offset in shared memory of
- *   different pipeline stages
- * \param offset A integer indicates the offset of the position in RoPE
- *   (Rotary Positional Embeddings)
- * \param compute_stage_idx A integer indicates the compute stage
- *   index in the pipeline
+ * \param inv_freq A vector of float indicates the thread-local inverse frequency
+ * \param kv_shared_offset An array of size_t indicates the k/v tiles offset in shared
+ *   memory of different pipeline stages
+ * \param offset A integer indicates the warp-local offset of the position in RoPE (Rotary
+ *   Positional Embeddings)
+ * \param compute_stage_idx A integer indicates the compute stage index in
+ *   the pipeline
  * \param seq_len A integer indicates the sequence length
  * \param num_heads A integer indicates the number of heads
- * \param head_dim A integer indicates the head dimension
  * \param sm_scale A float indicates the scale applied to pre-softmax logits
- * \param rope_inv_scale A floating number indicate the multiplicative inverse of scaling ratio
- *   used in PI(Position Interpolation) of RoPE (Rotary Positional Embeddings).
+ * \param rope_inv_scale A floating number indicate the multiplicative inverse of scaling
+ *   ratio used in PI(Position Interpolation) of RoPE (Rotary Positional Embeddings)
  * \param rope_inv_theta A floating number indicate the multiplicative inverse of "theta"
- *   used in RoPE (Rotary Positional Embeddings).
- * \param k A pointer to the start of global memory of k matrix in kv-cache
- * \param mask   TODO(Zihao): fix doc
+ *   used in RoPE (Rotary Positional Embeddings)
+ * \param mask A boolean indicates whether the position is valid
  * \param x A float indicates the thread-local result of qk
  */
 template <RotaryMode rotary_mode, size_t head_dim, size_t vec_size, size_t bdx, size_t bdy,
@@ -50,27 +53,15 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
                                            const size_t *kv_shared_offset, size_t offset,
                                            size_t compute_stage_idx, size_t seq_len,
                                            size_t num_heads, float sm_scale, float rope_inv_scale,
-                                           float rope_inv_theta, T *k, bool mask, float &x) {
+                                           float rope_inv_theta, bool mask, float &x) {
   vec_t<float, vec_size> k_vec;
   size_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
-  size_t head_idx_start = blockIdx.x * bdy, head_idx = head_idx_start + ty;
   size_t kv_idx = offset + tz;
   if constexpr (rotary_mode == RotaryMode::kApplyRotary) {
     // apply rotary embedding for all rows in k matrix of kv-cache
     k_vec = apply_rotary<vec_size>(
         smem + kv_shared_offset[compute_stage_idx] + (tz * bdy + ty) * head_dim, inv_freq, kv_idx,
         head_dim);
-  } else if constexpr (rotary_mode == RotaryMode::kApplyRotaryUpdateLastK) {
-    // inplace update rotary embedding for the newly appended rows in k matrix of kv-cache
-    if (kv_idx == seq_len - 1) {
-      k_vec = apply_rotary<vec_size>(
-          smem + kv_shared_offset[compute_stage_idx] + (tz * bdy + ty) * head_dim, inv_freq, kv_idx,
-          head_dim);
-      k_vec.cast_store(k + (kv_idx * num_heads + head_idx) * head_dim + tx * vec_size);
-    } else {
-      k_vec.cast_load(smem + kv_shared_offset[compute_stage_idx] + (tz * bdy + ty) * head_dim +
-                      tx * vec_size);
-    }
   } else {
     // do not apply rotary embedding
     k_vec.cast_load(smem + kv_shared_offset[compute_stage_idx] + (tz * bdy + ty) * head_dim +
@@ -91,24 +82,25 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
 }
 
 /*!
- * \brief Load v tile from shared memory and update partial m,d,o status
+ * \brief Load v tile from shared memory and update partial state
+ * \tparam head_dim A template integer indicates the head dimension
+ * \tparam vec_size A template integer indicates the vector size
+ * \tparam bdx A template integer indicates the block size in x dimension
+ * \tparam bdy A template integer indicates the block size in y dimension
+ * \tparam bdz A template integer indicates the block size in z dimension
  * \tparam T A template type indicates the input data type
- * \tparam vec_size A template integer indicates the vector size used in the kernel.
  * \param smem A pointer to the start of shared memory
- * \param x A float indicates the pre-softmax logits TODO(Zihao): fix docstring
- * \param kv_shared_offset An array of size_t indicates the k/v tiles offset in shared memory of
- *   different pipeline stages.
- * \param compute_stage_idx A integer indicates the compute stage index
- *   in the pipeline
- * \param head_dim A integer indicates the head dimension
- * \param m A float indicates the thread-local maximum value of pre-softmax logits
- * \param d A float indicates the thread-local sum of exp(pre-softmax logits - m)
- * \param o A vector of float indicates the thread-local output vector
+ * \param x A float indicates the pre-softmax logits
+ * \param kv_shared_offset An array of size_t indicates the k/v tiles offset in shared
+ *   memory of different pipeline stages.
+ * \param compute_stage_idx A integer indicates the compute stage index in the pipeline
+ * \param s The flashattention state to be updated
  */
 template <size_t head_dim, size_t vec_size, size_t bdx, size_t bdy, size_t bdz, typename T>
-__device__ __forceinline__ void update_partial_mdo(const T *smem, const float x,
-                                                   const size_t *kv_shared_offset,
-                                                   size_t compute_stage_idx, state_t<vec_size> &s) {
+__device__ __forceinline__ void update_partial_state(const T *smem, const float x,
+                                                     const size_t *kv_shared_offset,
+                                                     size_t compute_stage_idx,
+                                                     state_t<vec_size> &s) {
   vec_t<float, vec_size> v_vec;
   size_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
   v_vec.cast_load(smem + kv_shared_offset[compute_stage_idx] + (tz * bdy + ty) * head_dim +
@@ -116,6 +108,17 @@ __device__ __forceinline__ void update_partial_mdo(const T *smem, const float x,
   s.merge(x, v_vec);
 }
 
+/*!
+ * \brief Synchronize the state of all warps inside a threadblock
+ * \tparam head_dim A template integer indicates the head dimension
+ * \tparam vec_size A template integer indicates the vector size
+ * \tparam bdx A template integer indicates the block size in x dimension
+ * \tparam bdy A template integer indicates the block size in y dimension
+ * \tparam bdz A template integer indicates the block size in z dimension
+ * \param s The warp local state
+ * \param smem The pointer to shared memory buffer for o
+ * \param smem_md The pointer to shared memory buffer for m/d
+ */
 template <size_t head_dim, size_t vec_size, size_t bdx, size_t bdy, size_t bdz>
 __device__ __forceinline__ void sync_state(state_t<vec_size> &s, float *smem, float *smem_md) {
   auto block = cg::this_thread_block();
@@ -135,24 +138,29 @@ __device__ __forceinline__ void sync_state(state_t<vec_size> &s, float *smem, fl
 }
 
 /*!
- * \brief FlashAttention decoding cuda kernel with kv-cache for a single sequence, fused with
- *   rotary positional embeddings (if applicable).
+ * \brief FlashAttention decoding cuda kernel with kv-cache for a single
+ * sequence, fused with RoPE.
+ * \tparam rotary_mode The rotary mode
+ * \tparam head_dim A template integer indicates the head dimension
+ * \tparam vec_size A template integer indicates the vector size
+ * \tparam bdx A template integer indicates the block size in x dimension
+ * \tparam bdy A template integer indicates the block size in y dimension
+ * \tparam bdz A template integer indicates the block size in z dimension
  * \tparam DTypeIn A template type indicates the input data type
  * \tparam DTypeOut A template type indicates the output data type
- * \tparam head_dim The head dimension used in the kernel.
- * \tparam rotary_mode The rotary mode used in the kernel.
  * \param q [num_heads, head_dim] The query matrix
  * \param k [seq_len, num_heads, head_dim] The key matrix in kv-cache
  * \param v [seq_len, num_heads, head_dim] The value matrix in kv-cache
  * \param o [num_heads, head_dim] The output matrix
- * \param tmp Used-allocated temporary buffer used in the kernel, recommended size is 8MB.
+ * \param tmp Used-allocated temporary buffer
  * \param sm_scale A float indicates the scale applied to pre-softmax logits
  * \param seq_len A integer indicates the sequence length
  * \param head_dim A integer indicates the head dimension
- * \param rope_inv_scale A floating number indicate the multiplicative inverse of scaling ratio
- *   used in PI(Position Interpolation) for RoPE (Rotary Positional Embeddings).
- * \param rope_inv_theta A floating number indicate the multiplicative inverse of "theta"
- *   used in RoPE (Rotary Positional Embeddings).
+ * \param rope_inv_scale A floating number indicate the multiplicative inverse
+ *   of scaling ratio used in PI(Position Interpolation) for RoPE (Rotary
+ *   Positional Embeddings)
+ * \param rope_inv_theta A floating number indicate the multiplicative inverse
+ *   of "theta" used in RoPE (Rotary Positional Embeddings)
  * \param kv_chunk_size A integer indicates the kv-chunk size
  */
 template <RotaryMode rotary_mode, size_t head_dim, size_t vec_size, size_t bdx, size_t bdy,
@@ -178,8 +186,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   size_t tx = threadIdx.x, ty = threadIdx.y, head_idx = head_idx_start + ty, tz = threadIdx.z;
   vec_t<float, vec_size> q_vec;
   vec_t<float, vec_size> inv_freq;
-  if constexpr (rotary_mode == RotaryMode::kApplyRotary ||
-                rotary_mode == RotaryMode::kApplyRotaryUpdateLastK) {
+  if constexpr (rotary_mode == RotaryMode::kApplyRotary) {
 #pragma unroll
     for (size_t i = 0; i < vec_size; ++i) {
       inv_freq[i] = rope_inv_scale *
@@ -202,7 +209,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   size_t kv_shared_offset[stages_count] = {0U, 1U * bdz * bdy * head_dim, 2U * bdz * bdy * head_dim,
                                            3U * bdz * bdy * head_dim};
 
-  // pipelining k/v tiles loading and m/d/o computation
+  // pipelining k/v tiles loading and state updating
   auto pipeline = cuda::make_pipeline();
   const auto frag_shape = cuda::aligned_size_t<alignof(float4)>(sizeof(DTypeIn) * vec_size);
   pipeline.producer_acquire();
@@ -242,7 +249,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     block.sync();
     compute_qk<rotary_mode, head_dim, vec_size, bdx, bdy, bdz>(
         smem, q_vec, inv_freq, kv_shared_offset, chunk_start + (batch - 1) * bdz, compute_stage_idx,
-        seq_len, num_heads, sm_scale, rope_inv_scale, rope_inv_theta, k,
+        seq_len, num_heads, sm_scale, rope_inv_scale, rope_inv_theta,
         chunk_start + (batch - 1) * bdz + tz < chunk_end, x);
     block.sync();
     pipeline.consumer_release();
@@ -258,11 +265,11 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     pipeline.producer_commit();
     copy_stage_idx = (copy_stage_idx + 1) % stages_count;
 
-    // compute stage: update partial m,d,o status
+    // compute stage: update partial state
     pipeline.consumer_wait();
     block.sync();
-    update_partial_mdo<head_dim, vec_size, bdx, bdy, bdz>(smem, x, kv_shared_offset,
-                                                          compute_stage_idx, s_partial);
+    update_partial_state<head_dim, vec_size, bdx, bdy, bdz>(smem, x, kv_shared_offset,
+                                                            compute_stage_idx, s_partial);
     block.sync();
     pipeline.consumer_release();
     compute_stage_idx = (compute_stage_idx + 1) % stages_count;
@@ -275,16 +282,16 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     block.sync();
     compute_qk<rotary_mode, head_dim, vec_size, bdx, bdy, bdz>(
         smem, q_vec, inv_freq, kv_shared_offset, chunk_start + (batch - 1) * bdz, compute_stage_idx,
-        seq_len, num_heads, sm_scale, rope_inv_scale, rope_inv_theta, k,
+        seq_len, num_heads, sm_scale, rope_inv_scale, rope_inv_theta,
         chunk_start + (batch - 1) * bdz + tz < chunk_end, x);
     block.sync();
     pipeline.consumer_release();
     compute_stage_idx = (compute_stage_idx + 1) % stages_count;
-    // compute stage: update partial m,d,o status
+    // compute stage: update partial state
     pipeline.consumer_wait();
     block.sync();
-    update_partial_mdo<head_dim, vec_size, bdx, bdy, bdz>(smem, x, kv_shared_offset,
-                                                          compute_stage_idx, s_partial);
+    update_partial_state<head_dim, vec_size, bdx, bdy, bdz>(smem, x, kv_shared_offset,
+                                                            compute_stage_idx, s_partial);
     block.sync();
     pipeline.consumer_release();
     compute_stage_idx = (compute_stage_idx + 1) % stages_count;
@@ -364,11 +371,6 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
       __VA_ARGS__                                                                \
       break;                                                                     \
     }                                                                            \
-    case RotaryMode::kApplyRotaryUpdateLastK: {                                  \
-      constexpr RotaryMode ROTARY_MODE = RotaryMode::kApplyRotaryUpdateLastK;    \
-      __VA_ARGS__                                                                \
-      break;                                                                     \
-    }                                                                            \
     default: {                                                                   \
       std::cerr << "Unsupported rotary_mode: " << int(rotary_mode) << std::endl; \
       abort();                                                                   \
@@ -376,21 +378,21 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   }
 
 /*!
- * \brief FlashAttention decoding with kv-cache for a single sequence.
+ * \brief FlashAttention decoding with kv-cache for a single sequence
  * \tparam DTypeIn A template type indicates the input data type
  * \tparam DTypeOut A template type indicates the output data type
  * \param q [num_heads, head_dim] The query matrix
  * \param k [seq_len, num_heads, head_dim] The key matrix in kv-cache
  * \param v [seq_len, num_heads, head_dim] The value matrix in kv-cache
  * \param o [num_heads, head_dim] The output matrix
- * \param tmp Used-allocated temporary buffer used in the kernel, recommended size is 8MB.
+ * \param tmp Used-allocated temporary buffer
  * \param num_heads A integer indicates the number of heads
  * \param seq_len A integer indicates the sequence length
- * \param head_dim A integer indicates the head dimension,
- * \param rotary_mode The rotary mode used in the kernel.
- * \param rope_scale A floating point number indicate the scaling ratio used in RoPE interpolation.
- * \param rope_theta A floating point number indicate the "theta" used in RoPE.
- *   used in PI (Position Interpolation) for RoPE (Rotary Positional Embeddings).
+ * \param head_dim A integer indicates the head dimension
+ * \param rotary_mode The rotary mode
+ * \param rope_scale A floating point number indicate the scaling ratio
+ *   used in RoPE Interpolation.
+ * \param rope_theta A floating point number indicate the "theta" used in RoPE
  * \param stream The cuda stream to launch the kernel
  */
 template <typename DTypeIn, typename DTypeOut>
