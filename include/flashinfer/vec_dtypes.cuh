@@ -673,7 +673,7 @@ struct vec_t<half, vec_size> {
   FLASHINFER_INLINE const half &operator[](size_t i) const { return ((const half *)data)[i]; }
   FLASHINFER_INLINE void fill(half val) {
 #pragma unroll
-    for (size_t i = 0; i < vec_size; ++i) {
+    for (size_t i = 0; i < vec_size / 8; ++i) {
       *(half2 *)(&(data[i].x)) = make_half2(val, val);
       *(half2 *)(&(data[i].y)) = make_half2(val, val);
       *(half2 *)(&(data[i].z)) = make_half2(val, val);
