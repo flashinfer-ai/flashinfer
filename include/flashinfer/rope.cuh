@@ -41,13 +41,12 @@ inline std::string RotaryModeToString(const RotaryMode &rotary_mode) {
  *   in the kernel
  * \tparam T A template type indicates the input data type
  * \param input A pointer to the start of input data
- * \param inv_freq A vector of float indicates the multiplicative inverse of frequency
- * \param offset A integer indicates the offset of the position in RoPE (Rotary Positional
- *   Embeddings).
+ * \param rotary_emb A vector of float indicates the thread-local rotary embedding
+ * \param offset A integer indicates the offset of the position in RoPE
  */
-template <size_t vec_size, typename T>
+template <size_t head_dim, size_t vec_size, typename T>
 __device__ __forceinline__ vec_t<float, vec_size> apply_rotary(
-    const T *input, const vec_t<float, vec_size> &inv_freq, size_t offset, size_t head_dim) {
+    const T *input, const vec_t<float, vec_size> &rotary_emb, size_t offset) {
   vec_t<float, vec_size> permuted_vec, vec;
   vec.cast_load(input + threadIdx.x * vec_size);
   permuted_vec.cast_load(input + ((threadIdx.x * vec_size < head_dim / 2)
@@ -56,9 +55,9 @@ __device__ __forceinline__ vec_t<float, vec_size> apply_rotary(
 
 #pragma unroll
   for (size_t i = 0; i < vec_size; ++i) {
-    float freq = float(offset) * inv_freq[i];
+    float embed = float(offset) * rotary_emb[i];
     float cos, sin;
-    __sincosf(freq, &sin, &cos);
+    __sincosf(embed, &sin, &cos);
     vec[i] = vec[i] * cos +
              ((threadIdx.x * vec_size < head_dim / 2) ? -permuted_vec[i] : permuted_vec[i]) * sin;
   }

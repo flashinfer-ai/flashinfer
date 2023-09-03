@@ -106,10 +106,12 @@ void _TestDecodingKernelCorrectness(size_t num_heads, size_t seq_len, size_t hea
   utils::thrust_normal_init(V);
   utils::thrust_zero_init(O);
 
-  thrust::host_vector<T> K_ref_host = K;
+  auto Q_host = thrust::host_vector<T>(Q);
+  auto K_host = thrust::host_vector<T>(K);
+  auto V_host = thrust::host_vector<T>(V);
+
   thrust::host_vector<T> o_ref_host =
-      cpu_mha_reference<T, T>(thrust::host_vector<T>(Q), K_ref_host, thrust::host_vector<T>(V),
-                              num_heads, seq_len, head_dim, rotary_mode);
+      cpu_mha_reference<T, T>(Q_host, K_host, V_host, num_heads, seq_len, head_dim, rotary_mode);
 
   flashinfer::SingleDecodeWithKVCache(
       thrust::raw_pointer_cast(Q.data()), thrust::raw_pointer_cast(K.data()),
@@ -117,12 +119,14 @@ void _TestDecodingKernelCorrectness(size_t num_heads, size_t seq_len, size_t hea
       thrust::raw_pointer_cast(tmp.data()), num_heads, seq_len, head_dim, rotary_mode);
 
   thrust::host_vector<T> o_host = O;
-  thrust::host_vector<T> K_host = K;
   thrust::host_vector<float> tmp_host = tmp;
 
   size_t num_result_errors_atol_1e_3_rtol_1e_3 = 0;
-
+  bool nan_detected = false;
   for (size_t i = 0; i < num_heads * head_dim; ++i) {
+    if (isnan(float(o_host[i]))) {
+      nan_detected = true;
+    }
     num_result_errors_atol_1e_3_rtol_1e_3 +=
         (!utils::isclose(float(o_host[i]), float(o_ref_host[i]), 1e-3, 1e-3));
   }
@@ -132,6 +136,7 @@ void _TestDecodingKernelCorrectness(size_t num_heads, size_t seq_len, size_t hea
             << ", rotary_mode=" << flashinfer::RotaryModeToString(rotary_mode)
             << ", result accuracy (atol=1e-3, rtol=1e-3): " << result_accuracy << std::endl;
   EXPECT_GT(result_accuracy, 0.90) << "Result correctness test failed.";
+  EXPECT_EQ(nan_detected, false) << "NaN detected.";
 }
 
 template <typename T>

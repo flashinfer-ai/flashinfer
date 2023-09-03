@@ -11,7 +11,7 @@ def FlashInferIRModuleGen(dtype_in: str, dtype_out: str, rotary_mode: int = 0, r
             q: R.Tensor(("num_heads", "head_dim"), dtype_in),
             k: R.Tensor(("seq_len", "num_heads", "head_dim"), dtype_in),
             v: R.Tensor(("seq_len", "num_heads", "head_dim"), dtype_in),
-            tmp: R.Tensor((2 * 1024 * 1024,), "float32"),
+            tmp: R.Tensor((8 * 1024 * 1024,), "float32"),
         ) -> R.Tensor(("seq_len", "num_heads", "head_dim"), dtype_out):
             num_heads = T.int64()
             head_dim = T.int64()

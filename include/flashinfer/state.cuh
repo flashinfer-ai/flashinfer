@@ -16,7 +16,7 @@ struct state_t {
   vec_t<float, vec_size> o; /* the weighted sum of v: exp(pre-softmax logit - m) * v / d  */
 
   __device__ __forceinline__ void init() {
-    m = -1e5;
+    m = -5e4;
     d = 0.f;
     o.fill(0.f);
   }
@@ -56,7 +56,7 @@ struct state_t {
    */
   __device__ __forceinline__ void merge(float x, const vec_t<float, vec_size> &v) {
     float m_prev = m, d_prev = d;
-    m = max(m, x);
+    m = max(m_prev, x);
     d = d * __expf(m_prev - m) + __expf(x - m);
 #pragma unroll
     for (size_t i = 0; i < vec_size; ++i) {

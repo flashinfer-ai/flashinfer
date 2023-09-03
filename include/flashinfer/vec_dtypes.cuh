@@ -89,7 +89,6 @@ struct vec_t<__nv_fp8_e4m3, 1> {
   FLASHINFER_INLINE void cast_store(T *ptr) const {
     cast_store_impl(*this, ptr);
   }
-
 };
 
 FLASHINFER_INLINE void vec_t<__nv_fp8_e4m3, 1>::fill(__nv_fp8_e4m3 val) { data = val; }

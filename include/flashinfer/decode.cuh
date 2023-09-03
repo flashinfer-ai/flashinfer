@@ -29,39 +29,30 @@ namespace cg = cooperative_groups;
  * \tparam T A template type indicates the input data type
  * \param smem A pointer to the start of shared memory
  * \param q_vec A vector of float indicates the thread-local query vector
- * \param inv_freq A vector of float indicates the thread-local inverse frequency
+ * \param rotary_emb A vector of float indicates the thread-local rotary embedding
  * \param kv_shared_offset An array of size_t indicates the k/v tiles offset in shared
  *   memory of different pipeline stages
- * \param offset A integer indicates the warp-local offset of the position in RoPE (Rotary
- *   Positional Embeddings)
+ * \param offset A integer indicates the warp-local offset of the position in kv-cache.
  * \param compute_stage_idx A integer indicates the compute stage index in
  *   the pipeline
- * \param seq_len A integer indicates the sequence length
  * \param num_heads A integer indicates the number of heads
  * \param sm_scale A float indicates the scale applied to pre-softmax logits
- * \param rope_inv_scale A floating number indicate the multiplicative inverse of scaling
- *   ratio used in PI(Position Interpolation) of RoPE (Rotary Positional Embeddings)
- * \param rope_inv_theta A floating number indicate the multiplicative inverse of "theta"
- *   used in RoPE (Rotary Positional Embeddings)
- * \param mask A boolean indicates whether the position is valid
  * \param x A float indicates the thread-local result of qk
  */
 template <RotaryMode rotary_mode, size_t head_dim, size_t vec_size, size_t bdx, size_t bdy,
           size_t bdz, typename T>
 __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec_size> &q_vec,
-                                           const vec_t<float, vec_size> &inv_freq,
+                                           const vec_t<float, vec_size> &rotary_emb,
                                            const size_t *kv_shared_offset, size_t offset,
-                                           size_t compute_stage_idx, size_t seq_len,
-                                           size_t num_heads, float sm_scale, float rope_inv_scale,
-                                           float rope_inv_theta, bool mask, float &x) {
+                                           size_t compute_stage_idx, size_t num_heads,
+                                           float sm_scale, float &x) {
   vec_t<float, vec_size> k_vec;
   size_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
-  size_t kv_idx = offset + tz;
   if constexpr (rotary_mode == RotaryMode::kApplyRotary) {
     // apply rotary embedding for all rows in k matrix of kv-cache
-    k_vec = apply_rotary<vec_size>(
-        smem + kv_shared_offset[compute_stage_idx] + (tz * bdy + ty) * head_dim, inv_freq, kv_idx,
-        head_dim);
+    k_vec = apply_rotary<head_dim, vec_size>(
+        smem + kv_shared_offset[compute_stage_idx] + (tz * bdy + ty) * head_dim, rotary_emb,
+        offset + tz);
   } else {
     // do not apply rotary embedding
     k_vec.cast_load(smem + kv_shared_offset[compute_stage_idx] + (tz * bdy + ty) * head_dim +
@@ -78,7 +69,6 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
     x += g.shfl_down(x, offset);
   }
   x = g.shfl(x, 0);
-  x = mask ? x : -1e5;
 }
 
 /*!
@@ -94,18 +84,23 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
  * \param kv_shared_offset An array of size_t indicates the k/v tiles offset in shared
  *   memory of different pipeline stages.
  * \param compute_stage_idx A integer indicates the compute stage index in the pipeline
+ * \param offset A integer indicates the warp-local offset of the position in kv-cache
+ * \param chunk_end A integer indicates the end position of the kv-chunk in
+ *   current threadblock
  * \param s The flashattention state to be updated
  */
 template <size_t head_dim, size_t vec_size, size_t bdx, size_t bdy, size_t bdz, typename T>
 __device__ __forceinline__ void update_partial_state(const T *smem, const float x,
                                                      const size_t *kv_shared_offset,
-                                                     size_t compute_stage_idx,
-                                                     state_t<vec_size> &s) {
+                                                     size_t compute_stage_idx, size_t offset,
+                                                     size_t chunk_end, state_t<vec_size> &s) {
   vec_t<float, vec_size> v_vec;
   size_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
   v_vec.cast_load(smem + kv_shared_offset[compute_stage_idx] + (tz * bdy + ty) * head_dim +
                   tx * vec_size);
-  s.merge(x, v_vec);
+  if (offset + tz < chunk_end) {
+    s.merge(x, v_vec);
+  }
 }
 
 /*!
@@ -174,27 +169,29 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   auto grid = cg::this_grid();
 
   constexpr size_t stages_count = 4;
-  size_t head_idx_start = blockIdx.x * bdy;
-  size_t kv_chunk_idx = blockIdx.y;
-  size_t num_kv_chunks = gridDim.y;
-  size_t num_heads = gridDim.x * bdy;
+  size_t head_idx_start = blockIdx.y * bdy;
+  size_t kv_chunk_idx = blockIdx.x;
+  size_t num_kv_chunks = gridDim.x;
+  size_t num_heads = gridDim.y * bdy;
 
+  static_assert(bdx * bdy * bdz == 128);
+  static_assert(bdx * vec_size == head_dim);
   static_assert(stages_count >= sizeof(float) / sizeof(DTypeIn));
   __shared__ DTypeIn smem[stages_count * bdz * bdy * head_dim];
   __shared__ float smem_md[2 * bdz * bdy];
 
   size_t tx = threadIdx.x, ty = threadIdx.y, head_idx = head_idx_start + ty, tz = threadIdx.z;
   vec_t<float, vec_size> q_vec;
-  vec_t<float, vec_size> inv_freq;
+  vec_t<float, vec_size> rotary_emb;
   if constexpr (rotary_mode == RotaryMode::kApplyRotary) {
 #pragma unroll
     for (size_t i = 0; i < vec_size; ++i) {
-      inv_freq[i] = rope_inv_scale *
-                    __powf(rope_inv_theta,
-                           float(2 * ((tx * vec_size + i) % (head_dim / 2))) / float(head_dim));
+      rotary_emb[i] =
+          rope_inv_scale *
+          powf(rope_inv_theta, float(2 * ((tx * vec_size + i) % (head_dim / 2))) / float(head_dim));
     }
     // apply rotary embedding to q matrix
-    q_vec = apply_rotary<vec_size>(q + head_idx * head_dim, inv_freq, seq_len - 1, head_dim);
+    q_vec = apply_rotary<head_dim, vec_size>(q + head_idx * head_dim, rotary_emb, seq_len - 1);
   } else {
     // do not apply rotary embedding to q matrix
     q_vec.cast_load(q + head_idx * head_dim + tx * vec_size);
@@ -248,9 +245,8 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     pipeline.consumer_wait();
     block.sync();
     compute_qk<rotary_mode, head_dim, vec_size, bdx, bdy, bdz>(
-        smem, q_vec, inv_freq, kv_shared_offset, chunk_start + (batch - 1) * bdz, compute_stage_idx,
-        seq_len, num_heads, sm_scale, rope_inv_scale, rope_inv_theta,
-        chunk_start + (batch - 1) * bdz + tz < chunk_end, x);
+        smem, q_vec, rotary_emb, kv_shared_offset, chunk_start + (batch - 1) * bdz,
+        compute_stage_idx, num_heads, sm_scale, x);
     block.sync();
     pipeline.consumer_release();
     compute_stage_idx = (compute_stage_idx + 1) % stages_count;
@@ -268,8 +264,9 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     // compute stage: update partial state
     pipeline.consumer_wait();
     block.sync();
-    update_partial_state<head_dim, vec_size, bdx, bdy, bdz>(smem, x, kv_shared_offset,
-                                                            compute_stage_idx, s_partial);
+    update_partial_state<head_dim, vec_size, bdx, bdy, bdz>(
+        smem, x, kv_shared_offset, compute_stage_idx, chunk_start + (batch - 1) * bdz, chunk_end,
+        s_partial);
     block.sync();
     pipeline.consumer_release();
     compute_stage_idx = (compute_stage_idx + 1) % stages_count;
@@ -277,21 +274,22 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
 
   // last two compute stages
   {
+    batch = (kv_chunk_size + bdz - 1) / bdz;
     // compute stage: compute qk
     pipeline.consumer_wait();
     block.sync();
     compute_qk<rotary_mode, head_dim, vec_size, bdx, bdy, bdz>(
-        smem, q_vec, inv_freq, kv_shared_offset, chunk_start + (batch - 1) * bdz, compute_stage_idx,
-        seq_len, num_heads, sm_scale, rope_inv_scale, rope_inv_theta,
-        chunk_start + (batch - 1) * bdz + tz < chunk_end, x);
+        smem, q_vec, rotary_emb, kv_shared_offset, chunk_start + (batch - 1) * bdz,
+        compute_stage_idx, num_heads, sm_scale, x);
     block.sync();
     pipeline.consumer_release();
     compute_stage_idx = (compute_stage_idx + 1) % stages_count;
     // compute stage: update partial state
     pipeline.consumer_wait();
     block.sync();
-    update_partial_state<head_dim, vec_size, bdx, bdy, bdz>(smem, x, kv_shared_offset,
-                                                            compute_stage_idx, s_partial);
+    update_partial_state<head_dim, vec_size, bdx, bdy, bdz>(
+        smem, x, kv_shared_offset, compute_stage_idx, chunk_start + (batch - 1) * bdz, chunk_end,
+        s_partial);
     block.sync();
     pipeline.consumer_release();
     compute_stage_idx = (compute_stage_idx + 1) % stages_count;
@@ -431,7 +429,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
         size_t kv_chunk_size =
             max((seq_len + max_num_kv_chunks - 1UL) / max_num_kv_chunks,
                 min(64UL, max(4UL, seq_len / max(1UL, (64UL * bdy / num_heads)))));
-        dim3 nblks = dim3(num_heads / bdy, (seq_len + kv_chunk_size - 1) / kv_chunk_size);
+        dim3 nblks = dim3((seq_len + kv_chunk_size - 1) / kv_chunk_size, num_heads / bdy);
         assert(nblks.x > 0 && nblks.y > 0);
         dim3 nthrs = dim3(bdx, bdy, bdz);
         void *args[] = {(void *)&q,
