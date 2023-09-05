@@ -32,8 +32,8 @@ using tvm::runtime::ShapeTuple;
   }
 
 int _FlashInferSingleDecodeWithKVCache(DLTensor *q, DLTensor *k, DLTensor *v, DLTensor *tmp,
-                                       int64_t rotary_mode, double rope_scale, double rope_theta,
-                                       DLTensor *o) {
+                                       int64_t qkv_layout, int64_t rotary_mode, double rope_scale,
+                                       double rope_theta, DLTensor *o) {
   CHECK_EQ(q->device.device_type, kDLCUDA) << "The device of q matrix must be CUDA.";
   CHECK_EQ(k->device.device_type, kDLCUDA) << "The device of k matrix must be CUDA.";
   CHECK_EQ(v->device.device_type, kDLCUDA) << "The device of v matrix must be CUDA.";
@@ -69,8 +69,8 @@ int _FlashInferSingleDecodeWithKVCache(DLTensor *q, DLTensor *k, DLTensor *v, DL
       q->dtype, dtype_in, {SWITCH_TVM_CUDA_DTYPE(o->dtype, dtype_out, {
         cudaError_t status = flashinfer::SingleDecodeWithKVCache(
             (dtype_in *)q->data, (dtype_in *)k->data, (dtype_in *)v->data, (dtype_out *)o->data,
-            (float *)tmp->data, num_heads, seq_len, head_dim, flashinfer::RotaryMode(rotary_mode),
-            rope_scale, rope_theta, 0, dev_id);
+            (float *)tmp->data, num_heads, seq_len, head_dim, flashinfer::QKVLayout(qkv_layout),
+            flashinfer::RotaryMode(rotary_mode), rope_scale, rope_theta, 0, dev_id);
         if (status != cudaSuccess) {
           LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
         }
