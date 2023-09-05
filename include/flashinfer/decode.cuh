@@ -744,7 +744,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
           size_t max_num_kv_chunks = max_num_blks / (num_heads / bdy);
           size_t kv_chunk_size =
               max((seq_len + max_num_kv_chunks - 1UL) / max_num_kv_chunks,
-                  min(64UL, max(8UL, seq_len / max(1UL, (64UL * bdy / num_heads)))));
+                  min(64UL, max(4UL, seq_len / max(1UL, (64UL * bdy / num_heads)))));
           dim3 nblks = dim3((seq_len + kv_chunk_size - 1) / kv_chunk_size, num_heads / bdy);
           assert(nblks.x > 0 && nblks.y > 0);
           dim3 nthrs = dim3(bdx, bdy, bdz);
@@ -777,7 +777,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
           size_t max_num_kv_chunks = max_num_blks / num_heads;
           size_t kv_chunk_size =
               max((seq_len + max_num_kv_chunks - 1UL) / max_num_kv_chunks,
-                  min(128UL, max(32UL, seq_len / max(1UL, (128UL / num_heads)))));
+                  min(128UL, max(16UL, seq_len / max(1UL, (128UL / num_heads)))));
           dim3 nblks = dim3((seq_len + kv_chunk_size - 1) / kv_chunk_size, num_heads);
           assert(nblks.x > 0 && nblks.y > 0);
           dim3 nthrs = dim3(bdx, bdy);
