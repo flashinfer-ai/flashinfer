@@ -19,6 +19,16 @@ namespace flashinfer {
 namespace cg = cooperative_groups;
 
 /*!
+ * \brief The Layout of QKV matrices
+ */
+enum class QKVLayout {
+  // [seq_len, num_heads, head_dim]
+  kNHD,
+  // [num_heads, head_dim, seq_len]
+  kHND,
+};
+
+/*!
  * \brief Load k tile from smem and compute qk
  * \tparam rotary_mode The rotary mode used in the kernel
  * \tparam head_dim A template integer indicates the head dimension
@@ -84,21 +94,19 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
  * \param kv_shared_offset An array of size_t indicates the k/v tiles offset in shared
  *   memory of different pipeline stages.
  * \param compute_stage_idx A integer indicates the compute stage index in the pipeline
- * \param offset A integer indicates the warp-local offset of the position in kv-cache
- * \param chunk_end A integer indicates the end position of the kv-chunk in
- *   current threadblock
+ * \param pred_guard A boolean indicates whether the current thread is in the valid range
  * \param s The flashattention state to be updated
  */
 template <size_t head_dim, size_t vec_size, size_t bdx, size_t bdy, size_t bdz, typename T>
 __device__ __forceinline__ void update_partial_state(const T *smem, const float x,
                                                      const size_t *kv_shared_offset,
-                                                     size_t compute_stage_idx, size_t offset,
-                                                     size_t chunk_end, state_t<vec_size> &s) {
+                                                     size_t compute_stage_idx, bool pred_guard,
+                                                     state_t<vec_size> &s) {
   vec_t<float, vec_size> v_vec;
   size_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
   v_vec.cast_load(smem + kv_shared_offset[compute_stage_idx] + (tz * bdy + ty) * head_dim +
                   tx * vec_size);
-  if (offset + tz < chunk_end) {
+  if (pred_guard) {
     s.merge(x, v_vec);
   }
 }
@@ -210,14 +218,15 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   auto pipeline = cuda::make_pipeline();
   const auto frag_shape = cuda::aligned_size_t<alignof(float4)>(sizeof(DTypeIn) * vec_size);
   pipeline.producer_acquire();
-  if (tz < kv_chunk_size) {
+  bool producer_pred_guard = tz < kv_chunk_size, consumer_pred_guard;
+  if (producer_pred_guard) {
     cuda::memcpy_async(smem + kv_shared_offset[0] + (tz * bdy + ty) * head_dim + tx * vec_size,
                        k + ((chunk_start + tz) * num_heads + head_idx) * head_dim + tx * vec_size,
                        frag_shape, pipeline);
   }
   pipeline.producer_commit();
   pipeline.producer_acquire();
-  if (tz < kv_chunk_size) {
+  if (producer_pred_guard) {
     cuda::memcpy_async(smem + kv_shared_offset[1] + (tz * bdy + ty) * head_dim + tx * vec_size,
                        v + ((chunk_start + tz) * num_heads + head_idx) * head_dim + tx * vec_size,
                        frag_shape, pipeline);
@@ -231,9 +240,11 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
 #pragma unroll 2
   for (batch = 1; batch < (kv_chunk_size + bdz - 1) / bdz; ++batch) {
     size_t kv_idx = chunk_start + batch * bdz + tz;
+    producer_pred_guard = kv_idx < chunk_end;
+    consumer_pred_guard = kv_idx - bdz < chunk_end;
     // load stage: load k tiles
     pipeline.producer_acquire();
-    if (kv_idx < chunk_end) {
+    if (producer_pred_guard) {
       cuda::memcpy_async(
           smem + kv_shared_offset[copy_stage_idx] + (tz * bdy + ty) * head_dim + tx * vec_size,
           k + (kv_idx * num_heads + head_idx) * head_dim + tx * vec_size, frag_shape, pipeline);
@@ -253,7 +264,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
 
     // load stage: load v tiles
     pipeline.producer_acquire();
-    if (kv_idx < chunk_end) {
+    if (producer_pred_guard) {
       cuda::memcpy_async(
           smem + kv_shared_offset[copy_stage_idx] + (tz * bdy + ty) * head_dim + tx * vec_size,
           v + (kv_idx * num_heads + head_idx) * head_dim + tx * vec_size, frag_shape, pipeline);
@@ -265,8 +276,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     pipeline.consumer_wait();
     block.sync();
     update_partial_state<head_dim, vec_size, bdx, bdy, bdz>(
-        smem, x, kv_shared_offset, compute_stage_idx, chunk_start + (batch - 1) * bdz, chunk_end,
-        s_partial);
+        smem, x, kv_shared_offset, compute_stage_idx, consumer_pred_guard, s_partial);
     block.sync();
     pipeline.consumer_release();
     compute_stage_idx = (compute_stage_idx + 1) % stages_count;
@@ -275,6 +285,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   // last two compute stages
   {
     batch = (kv_chunk_size + bdz - 1) / bdz;
+    consumer_pred_guard = (batch - 1) * bdz + tz < kv_chunk_size;
     // compute stage: compute qk
     pipeline.consumer_wait();
     block.sync();
@@ -288,8 +299,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     pipeline.consumer_wait();
     block.sync();
     update_partial_state<head_dim, vec_size, bdx, bdy, bdz>(
-        smem, x, kv_shared_offset, compute_stage_idx, chunk_start + (batch - 1) * bdz, chunk_end,
-        s_partial);
+        smem, x, kv_shared_offset, compute_stage_idx, consumer_pred_guard, s_partial);
     block.sync();
     pipeline.consumer_release();
     compute_stage_idx = (compute_stage_idx + 1) % stages_count;
@@ -331,11 +341,6 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
 
 #define SWITCH_HEAD_DIM(head_dim, HEAD_DIM, ...)                      \
   switch (head_dim) {                                                 \
-    case 32: {                                                        \
-      constexpr size_t HEAD_DIM = 32;                                 \
-      __VA_ARGS__                                                     \
-      break;                                                          \
-    }                                                                 \
     case 64: {                                                        \
       constexpr size_t HEAD_DIM = 64;                                 \
       __VA_ARGS__                                                     \
