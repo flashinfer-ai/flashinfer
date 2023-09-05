@@ -3,8 +3,14 @@
 #include <flashinfer.cuh>
 #include <nvbench/nvbench.cuh>
 
-template <typename dtype_in, typename dtype_out, size_t seq_len, size_t num_heads, size_t head_dim>
+using flashinfer::QKVLayout;
+using flashinfer::RotaryMode;
+
+template <typename dtype_in, typename dtype_out, size_t rotary_mode, size_t layout>
 void bench_flashinfer_decode(nvbench::state &state) {
+  size_t seq_len = state.get_int64("seq_len");
+  size_t num_heads = state.get_int64("num_heads");
+  size_t head_dim = state.get_int64("head_dim");
   // Allocate input data:
   thrust::device_vector<dtype_in> Q(num_heads * head_dim);
   thrust::device_vector<dtype_in> K(seq_len * num_heads * head_dim);
@@ -22,8 +28,8 @@ void bench_flashinfer_decode(nvbench::state &state) {
     cudaError_t status = flashinfer::SingleDecodeWithKVCache(
         thrust::raw_pointer_cast(Q.data()), thrust::raw_pointer_cast(K.data()),
         thrust::raw_pointer_cast(V.data()), thrust::raw_pointer_cast(O.data()),
-        thrust::raw_pointer_cast(tmp.data()), num_heads, seq_len, head_dim,
-        flashinfer::RotaryMode::kNone, 1.f, 1e4, launch.get_stream());
+        thrust::raw_pointer_cast(tmp.data()), num_heads, seq_len, head_dim, QKVLayout(layout),
+        RotaryMode(rotary_mode), 1.f, 1e4, launch.get_stream());
     if (status != cudaSuccess) {
       state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
     }
@@ -31,30 +37,24 @@ void bench_flashinfer_decode(nvbench::state &state) {
   });
 }
 
-#define CREATE_BENCH_F16F16(SEQLEN, NUMHEADS, HEADDIM)                    \
-  auto bench_flashinfer_decode_f16f16_##SEQLEN##_##NUMHEADS##_##HEADDIM = \
-      bench_flashinfer_decode<__nv_fp8_e5m2, half, SEQLEN, NUMHEADS, HEADDIM>;
+#define STR_HELPER(x) #x
+#define STR(x) STR_HELPER(x)
+#define BENCH_FLASHINFER_DECODE(dtype_in, dtype_out, rotary_mode, layout)                       \
+  auto bench_flashinfer_decode_##dtype_in##_##dtype_out##_##rotary_mode##_##layout##_ =         \
+      bench_flashinfer_decode<dtype_in, dtype_out, rotary_mode, layout>;                        \
+  NVBENCH_BENCH(bench_flashinfer_decode_##dtype_in##_##dtype_out##_##rotary_mode##_##layout##_) \
+      .set_name(("bench_flashinfer_" STR(dtype_in) "_" STR(dtype_out) "_") +                    \
+                flashinfer::RotaryModeToString(RotaryMode(rotary_mode)) + "_" +                 \
+                flashinfer::QKVLayoutToString(QKVLayout(layout)))                               \
+      .add_int64_axis("seq_len", {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768}) \
+      .add_int64_axis("num_heads", {32})                                                        \
+      .add_int64_axis("head_dim", {128})
 
-CREATE_BENCH_F16F16(32, 32, 128);
-CREATE_BENCH_F16F16(64, 32, 128);
-CREATE_BENCH_F16F16(128, 32, 128);
-CREATE_BENCH_F16F16(256, 32, 128);
-CREATE_BENCH_F16F16(512, 32, 128);
-CREATE_BENCH_F16F16(1024, 32, 128);
-CREATE_BENCH_F16F16(2048, 32, 128);
-CREATE_BENCH_F16F16(4096, 32, 128);
-CREATE_BENCH_F16F16(8192, 32, 128);
-CREATE_BENCH_F16F16(16384, 32, 128);
-CREATE_BENCH_F16F16(32768, 32, 128);
-
-NVBENCH_BENCH(bench_flashinfer_decode_f16f16_32_32_128);
-NVBENCH_BENCH(bench_flashinfer_decode_f16f16_64_32_128);
-NVBENCH_BENCH(bench_flashinfer_decode_f16f16_128_32_128);
-NVBENCH_BENCH(bench_flashinfer_decode_f16f16_256_32_128);
-NVBENCH_BENCH(bench_flashinfer_decode_f16f16_512_32_128);
-NVBENCH_BENCH(bench_flashinfer_decode_f16f16_1024_32_128);
-NVBENCH_BENCH(bench_flashinfer_decode_f16f16_2048_32_128);
-NVBENCH_BENCH(bench_flashinfer_decode_f16f16_4096_32_128);
-NVBENCH_BENCH(bench_flashinfer_decode_f16f16_8192_32_128);
-NVBENCH_BENCH(bench_flashinfer_decode_f16f16_16384_32_128);
-NVBENCH_BENCH(bench_flashinfer_decode_f16f16_32768_32_128);
+BENCH_FLASHINFER_DECODE(half, half, 0U, 0U);
+BENCH_FLASHINFER_DECODE(half, half, 0U, 1U);
+BENCH_FLASHINFER_DECODE(half, half, 1U, 0U);
+BENCH_FLASHINFER_DECODE(half, half, 1U, 1U);
+BENCH_FLASHINFER_DECODE(__nv_fp8_e5m2, half, 0U, 0U);
+BENCH_FLASHINFER_DECODE(__nv_fp8_e5m2, half, 0U, 1U);
+BENCH_FLASHINFER_DECODE(__nv_fp8_e5m2, half, 1U, 0U);
+BENCH_FLASHINFER_DECODE(__nv_fp8_e5m2, half, 1U, 1U);
