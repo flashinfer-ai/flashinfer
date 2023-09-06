@@ -11,6 +11,7 @@
 #include <random>
 
 #include "layout.cuh"
+#include "page.cuh"
 #include "rope.cuh"
 #include "state.cuh"
 #include "vec_dtypes.cuh"
@@ -323,6 +324,191 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     tmp[head_idx] = s_global.m;
     tmp[num_heads + head_idx] = s_global.d;
   }
+}
+
+/*!
+ * \brief FlashAttention decoding cuda kernel with PagedKVCcache for batch requests,
+ *   fused with RoPE.
+ * \tparam rotary_mode The rotary mode
+ * \tparam head_dim A template integer indicates the head dimension
+ * \tparam vec_size A template integer indicates the vector size
+ * \tparam bdx A template integer indicates the block size in x dimension
+ * \tparam bdy A template integer indicates the block size in y dimension
+ * \tparam DTypeIn A template type indicates the input data type
+ * \tparam DTypeOut A template type indicates the output data type
+ * \param q [batch_size, num_heads, head_dim] The query matrix
+ * \param paged_kv The PagedKVCache data structure
+ * \param page_indptr [batch_size + 1] The page indptr array, with the first element 0
+ * \param page_indices [nnz_pages] The page indices array
+ * \param last_page_offset [batch_size] The offset of the last page for each request in the batch
+ * \param o [num_heads, head_dim] The output matrix
+ * \param sm_scale A float indicates the scale applied to pre-softmax logits
+ * \param rope_inv_scale A floating number indicate the multiplicative inverse
+ *   of scaling ratio used in PI(Position Interpolation) for RoPE (Rotary
+ *   Positional Embeddings)
+ * \param rope_inv_theta A floating number indicate the multiplicative inverse
+ *   of "theta" used in RoPE (Rotary Positional Embeddings)
+ */
+template <RotaryMode rotary_mode, size_t head_dim, size_t vec_size, size_t bdx, size_t bdy,
+          typename DTypeIn, typename DTypeOut>
+__global__ void BatchDecodeWithPagedKVCacheKernel(
+    DTypeIn *__restrict__ q, paged_kv_t<DTypeIn> paged_kv, size_t *__restrict__ page_indptr,
+    size_t *__restrict__ page_indices, size_t *__restrict__ last_page_offset,
+    DTypeOut *__restrict__ o, float sm_scale, float rope_inv_scale, float rope_inv_theta) {
+  auto block = cg::this_thread_block();
+  auto grid = cg::this_grid();
+
+  constexpr size_t stages_count = 4;
+  size_t batch_idx = blockIdx.x;
+  size_t batch_size = gridDim.x;
+  size_t head_idx = blockIdx.y;
+  size_t num_heads = gridDim.y;
+  size_t cur_page_indptr_begin = page_indptr[batch_idx],
+         cur_page_indptr_end = page_indptr[batch_idx + 1];
+  size_t cur_last_page_offset = last_page_offset[batch_idx];
+  size_t seq_len =
+      (cur_page_indptr_end - cur_page_indptr_begin - 1) * paged_kv.page_size + cur_last_page_offset;
+
+  static_assert(bdx * bdy == 128);
+  static_assert(bdx * vec_size == head_dim);
+  static_assert(stages_count >= sizeof(float) / sizeof(DTypeIn));
+  __shared__ DTypeIn smem[stages_count * bdy * head_dim];
+  __shared__ float smem_md[2 * bdy];
+
+  size_t tx = threadIdx.x, ty = threadIdx.y;
+  vec_t<float, vec_size> q_vec;
+  vec_t<float, vec_size> rotary_emb;
+  if constexpr (rotary_mode == RotaryMode::kApplyRotary) {
+#pragma unroll
+    for (size_t i = 0; i < vec_size; ++i) {
+      rotary_emb[i] =
+          rope_inv_scale *
+          powf(rope_inv_theta, float(2 * ((tx * vec_size + i) % (head_dim / 2))) / float(head_dim));
+    }
+    // apply rotary embedding to q matrix
+    q_vec = apply_rotary<head_dim, vec_size>(q + head_idx * head_dim, rotary_emb, seq_len - 1);
+  } else {
+    // do not apply rotary embedding to q matrix
+    q_vec.cast_load(q + head_idx * head_dim + tx * vec_size);
+  }
+  block.sync();
+
+  // load k tiles and v tiles
+  size_t kv_shared_offset[stages_count] = {0U, 1U * bdy * head_dim, 2U * bdy * head_dim,
+                                           3U * bdy * head_dim};
+
+  // pipelining k/v tiles loading and state updating
+  auto pipeline = cuda::make_pipeline();
+  const auto frag_shape = cuda::aligned_size_t<alignof(float4)>(sizeof(DTypeIn) * vec_size);
+  pipeline.producer_acquire();
+  bool producer_pred_guard = ty < seq_len, consumer_pred_guard = true;
+  size_t page_idx = page_indices[cur_page_indptr_begin];
+  if (producer_pred_guard) {
+    cuda::memcpy_async(smem + kv_shared_offset[0] + ty * head_dim + tx * vec_size,
+                       paged_kv.data + paged_kv.get_k_offset(page_idx, head_idx, ty, tx * vec_size),
+                       frag_shape, pipeline);
+  }
+  pipeline.producer_commit();
+  pipeline.producer_acquire();
+  if (producer_pred_guard) {
+    cuda::memcpy_async(smem + kv_shared_offset[1] + ty * head_dim + tx * vec_size,
+                       paged_kv.data + paged_kv.get_v_offset(page_idx, head_idx, ty, tx * vec_size),
+                       frag_shape, pipeline);
+  }
+  pipeline.producer_commit();
+
+  state_t<vec_size> s;
+  float x = 0.f;
+  size_t copy_stage_idx = 2, compute_stage_idx = 0, batch, producer_kv_idx, consumer_kv_idx;
+
+  for (size_t indptr = cur_page_indptr_begin; indptr < cur_page_indptr_end; ++indptr) {
+    page_idx = page_indices[indptr];
+    size_t valid_page_size = paged_kv.page_size;
+    if (indptr == cur_page_indptr_end - 1) {
+      valid_page_size = cur_last_page_offset;
+    }
+
+#pragma unroll 2
+    for (batch = (indptr == cur_page_indptr_begin); batch < (valid_page_size + bdy - 1) / bdy;
+         ++batch) {
+      size_t cur_page_producer_kv_idx = batch * bdy + ty;
+      consumer_kv_idx =
+          (indptr - cur_page_indptr_begin) * paged_kv.page_size + (batch - 1) * bdy + ty;
+      producer_pred_guard = cur_page_producer_kv_idx < valid_page_size;
+      consumer_pred_guard = true;
+      pipeline.producer_acquire();
+      if (producer_pred_guard) {
+        cuda::memcpy_async(
+            smem + kv_shared_offset[copy_stage_idx] + ty * head_dim + tx * vec_size,
+            paged_kv.data +
+                paged_kv.get_k_offset(page_idx, head_idx, cur_page_producer_kv_idx, tx * vec_size),
+            frag_shape, pipeline);
+      }
+      pipeline.producer_commit();
+      copy_stage_idx = (copy_stage_idx + 1) % stages_count;
+
+      // compute stage: compute qk
+      pipeline.consumer_wait();
+      block.sync();
+      compute_qk<rotary_mode, head_dim, vec_size, bdx, bdy>(
+          smem, q_vec, rotary_emb, kv_shared_offset, consumer_kv_idx, compute_stage_idx, num_heads,
+          sm_scale, x);
+      block.sync();
+      pipeline.consumer_release();
+      compute_stage_idx = (compute_stage_idx + 1) % stages_count;
+
+      // load stage: load v tiles
+      pipeline.producer_acquire();
+      if (producer_pred_guard) {
+        cuda::memcpy_async(
+            smem + kv_shared_offset[copy_stage_idx] + ty * head_dim + tx * vec_size,
+            paged_kv.data +
+                paged_kv.get_v_offset(page_idx, head_idx, cur_page_producer_kv_idx, tx * vec_size),
+            frag_shape, pipeline);
+      }
+      pipeline.producer_commit();
+      copy_stage_idx = (copy_stage_idx + 1) % stages_count;
+
+      // compute stage: update partial state
+      pipeline.consumer_wait();
+      block.sync();
+      update_partial_state<head_dim, vec_size, bdx, bdy>(smem, x, kv_shared_offset,
+                                                         compute_stage_idx, consumer_pred_guard, s);
+      block.sync();
+      pipeline.consumer_release();
+      compute_stage_idx = (compute_stage_idx + 1) % stages_count;
+    }
+  }
+
+  // last two compute stages
+  {
+    consumer_kv_idx = (cur_page_indptr_end - cur_page_indptr_begin - 1) * paged_kv.page_size +
+                      (batch - 1) * bdy + ty;
+    consumer_pred_guard = consumer_kv_idx < cur_last_page_offset;
+    // compute stage: compute qk
+    pipeline.consumer_wait();
+    block.sync();
+    compute_qk<rotary_mode, head_dim, vec_size, bdx, bdy>(smem, q_vec, rotary_emb, kv_shared_offset,
+                                                          consumer_kv_idx, compute_stage_idx,
+                                                          num_heads, sm_scale, x);
+    block.sync();
+    pipeline.consumer_release();
+    compute_stage_idx = (compute_stage_idx + 1) % stages_count;
+    // compute stage: update partial state
+    pipeline.consumer_wait();
+    block.sync();
+    update_partial_state<head_dim, vec_size, bdx, bdy>(smem, x, kv_shared_offset, compute_stage_idx,
+                                                       consumer_pred_guard, s);
+    block.sync();
+    pipeline.consumer_release();
+    compute_stage_idx = (compute_stage_idx + 1) % stages_count;
+  }
+
+  // sync partial state of all warps inside a threadblock
+  sync_state<head_dim, vec_size, bdx, bdy>(s, reinterpret_cast<float *>(smem), smem_md);
+
+  // update global states
+  s.o.cast_store(o + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
 }
 
 }  // namespace HND
@@ -726,6 +912,8 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
   const float rope_inv_scale = 1.f / rope_scale;
   const float rope_inv_theta = 1.f / rope_theta;
 
+  CUDA_CALL(cudaSetDevice(dev_id));
+
   if (qkv_layout == QKVLayout::kNHD) {
     SWITCH_HEAD_DIM(
         head_dim, HEAD_DIM, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
@@ -797,6 +985,60 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
     std::cerr << "Unsupported qkv_layout: " << int(qkv_layout) << std::endl;
     abort();
   }
+  return cudaSuccess;
+}
+
+/*!
+ * \brief FlashAttention decoding cuda kernel with paged kv-cache for batched requests
+ * \tparam DTypeIn A template type indicates the input data type
+ * \tparam DTypeOut A template type indicates the output data type
+ * \param q [batch_size, num_heads, head_dim] The query matrix
+ * \param paged_kv The paged kv cache data structure
+ * \param page_indptr [batch_size + 1] The page indptr array, with the first element 0
+ * \param page_indices [nnz_pages] The page indices array
+ * \param last_page_offset [batch_size] The offset of the last page for each request in the batch
+ * \param o [batch_size, num_heads, head_dim] The output matrix
+ * \param tmp Used-allocated temporary buffer
+ * \param batch_size A integer indicates the batch size
+ * \param num_heads A integer indicates the number of heads
+ * \param head_dim A integer indicates the head dimension
+ * \param qkv_layout The layout of q/k/v matrices.
+ */
+template <typename DTypeIn, typename DTypeOut>
+cudaError_t BatchDecodeWithPagedKVCache(DTypeIn *q, paged_kv_t<DTypeIn> paged_kv,
+                                        size_t *page_indptr, size_t *page_indices,
+                                        size_t *last_page_offset, DTypeOut *o, float *tmp,
+                                        size_t batch_size,
+                                        RotaryMode rotary_mode = RotaryMode::kNone,
+                                        float rope_scale = 1.f, float rope_theta = 1e4,
+                                        cudaStream_t stream = nullptr, size_t dev_id = 0) {
+  const float sm_scale = 1.f / std::sqrt(float(paged_kv.head_dim));
+  const float rope_inv_scale = 1.f / rope_scale;
+  const float rope_inv_theta = 1.f / rope_theta;
+
+  CUDA_CALL(cudaSetDevice(dev_id));
+
+  SWITCH_HEAD_DIM(paged_kv.head_dim, HEAD_DIM, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
+                    constexpr size_t vec_size = std::max(16 / sizeof(DTypeIn), HEAD_DIM / 32);
+                    constexpr size_t bdx = HEAD_DIM / vec_size;
+                    constexpr size_t bdy = 128 / bdx;
+                    dim3 nblks(batch_size, paged_kv.num_heads);
+                    dim3 nthrs(bdx, bdy);
+                    auto kernel =
+                        HND::BatchDecodeWithPagedKVCacheKernel<ROTARY_MODE, HEAD_DIM, vec_size, bdx,
+                                                               bdy, DTypeIn, DTypeOut>;
+                    void *args[] = {(void *)&q,
+                                    (void *)&paged_kv,
+                                    (void *)&page_indptr,
+                                    (void *)&page_indices,
+                                    (void *)&last_page_offset,
+                                    (void *)&o,
+                                    (void *)&sm_scale,
+                                    (void *)&rope_inv_scale,
+                                    (void *)&rope_inv_theta};
+                    CUDA_CALL(cudaLaunchKernel((void *)kernel, nblks, nthrs, args, 0, stream));
+                  })});
+
   return cudaSuccess;
 }
 
