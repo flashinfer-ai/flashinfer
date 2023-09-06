@@ -153,7 +153,7 @@ void _TestDecodingKernelCorrectness(size_t num_heads, size_t seq_len, size_t hea
 }
 
 template <typename T>
-void TestDecodeKernelCorrectness() {
+void TestSingleDecodeKernelCorrectness() {
   for (size_t num_heads : {32}) {
     for (size_t seq_len : {1, 3, 9, 27, 81, 129, 257, 512, 1024, 2048, 4096, 8192, 16384, 32768}) {
       for (size_t head_dim : {64, 128, 256}) {
@@ -169,18 +169,18 @@ void TestDecodeKernelCorrectness() {
   }
 }
 
-TEST(FlashInferCorrectnessTest, DecodingKernelCorrectnessTestBF16) {
-  TestDecodeKernelCorrectness<nv_bfloat16>();
+TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestBF16) {
+  TestSingleDecodeKernelCorrectness<nv_bfloat16>();
 }
-TEST(FlashInferCorrectnessTest, DecodingKernelCorrectnessTestFP16) {
-  TestDecodeKernelCorrectness<half>();
+TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestFP16) {
+  TestSingleDecodeKernelCorrectness<half>();
 }
-TEST(FlashInferCorrectnessTest, DecodingKernelCorrectnessTestE4M3) {
-  TestDecodeKernelCorrectness<__nv_fp8_e4m3>();
+TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestE4M3) {
+  TestSingleDecodeKernelCorrectness<__nv_fp8_e4m3>();
 }
-TEST(FlashInferCorrectnessTest, DecodingKernelCorrectnessTestE5M2) {
-  TestDecodeKernelCorrectness<__nv_fp8_e5m2>();
+TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestE5M2) {
+  TestSingleDecodeKernelCorrectness<__nv_fp8_e5m2>();
 }
-TEST(FlashInferCorrectnessTest, DecodingKernelCorrectnessTestFP32) {
-  TestDecodeKernelCorrectness<float>();
+TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestFP32) {
+  TestSingleDecodeKernelCorrectness<float>();
 }
