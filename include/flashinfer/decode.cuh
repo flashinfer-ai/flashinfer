@@ -1000,9 +1000,12 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
  * \param o [batch_size, num_heads, head_dim] The output matrix
  * \param tmp Used-allocated temporary buffer
  * \param batch_size A integer indicates the batch size
- * \param num_heads A integer indicates the number of heads
- * \param head_dim A integer indicates the head dimension
- * \param qkv_layout The layout of q/k/v matrices.
+ * \param rotary_mode The rotary mode
+ * \param rope_scale A floating point number indicate the scaling ratio
+ *   used in RoPE Interpolation.
+ * \param rope_theta A floating point number indicate the "theta" used in RoPE
+ * \param stream The cuda stream to launch the kernel
+ * \param dev_id The device id
  */
 template <typename DTypeIn, typename DTypeOut>
 cudaError_t BatchDecodeWithPagedKVCache(DTypeIn *q, paged_kv_t<DTypeIn> paged_kv,
