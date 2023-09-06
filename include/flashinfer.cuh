@@ -5,6 +5,5 @@
 #include "flashinfer/layout.cuh"
 #include "flashinfer/prefill.cuh"
 #include "flashinfer/rope.cuh"
-#include "flashinfer/page.cuh"
 
 #endif  // FLASHINFER_CUH_
