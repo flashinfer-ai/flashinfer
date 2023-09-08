@@ -630,6 +630,7 @@ __device__ __forceinline__ void sync_state(state_t<vec_size> &s, float *smem, fl
 /*!
  * \brief FlashAttention decoding cuda kernel with kv-cache for a single
  * sequence, fused with RoPE. Using NHD layout for q/k/v matrices.
+ * \tparam Whether to use cooperative kernel or not
  * \tparam rotary_mode The rotary mode
  * \tparam head_dim A template integer indicates the head dimension
  * \tparam vec_size A template integer indicates the vector size
@@ -653,8 +654,8 @@ __device__ __forceinline__ void sync_state(state_t<vec_size> &s, float *smem, fl
  *   of "theta" used in RoPE (Rotary Positional Embeddings)
  * \param kv_chunk_size A integer indicates the kv-chunk size
  */
-template <RotaryMode rotary_mode, size_t head_dim, size_t vec_size, size_t bdx, size_t bdy,
-          size_t bdz, typename DTypeIn, typename DTypeOut>
+template <bool cooperative, RotaryMode rotary_mode, size_t head_dim, size_t vec_size, size_t bdx,
+          size_t bdy, size_t bdz, typename DTypeIn, typename DTypeOut>
 __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *__restrict__ k,
                                               DTypeIn *__restrict__ v, DTypeOut *__restrict__ o,
                                               float *__restrict__ tmp, float sm_scale,
@@ -804,28 +805,33 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   float *tmp_md = tmp + num_kv_chunks * num_heads * head_dim;
   tmp_md[(kv_chunk_idx * num_heads + head_idx) * 2] = s_partial.m;
   tmp_md[(kv_chunk_idx * num_heads + head_idx) * 2 + 1] = s_partial.d;
-  grid.sync();
 
-  // sync global states
-  if (kv_chunk_idx == 0) {
-    state_t<vec_size> s_global;
+  if constexpr (cooperative) {
+    grid.sync();
+
+    // sync global states
+    if (kv_chunk_idx == 0) {
+      state_t<vec_size> s_global;
 #pragma unroll 2
-    for (size_t batch = 0; batch < (num_kv_chunks + bdz - 1) / bdz; ++batch) {
-      size_t kv_chunk_idx = batch * bdz + tz;
-      if (kv_chunk_idx < num_kv_chunks) {
-        s_partial.m = tmp_md[(kv_chunk_idx * num_heads + head_idx) * 2];
-        s_partial.d = tmp_md[(kv_chunk_idx * num_heads + head_idx) * 2 + 1];
-        s_partial.o.load(tmp + (kv_chunk_idx * num_heads + head_idx) * head_dim + tx * vec_size);
-        s_global.merge(s_partial);
+      for (size_t batch = 0; batch < (num_kv_chunks + bdz - 1) / bdz; ++batch) {
+        size_t kv_chunk_idx = batch * bdz + tz;
+        if (kv_chunk_idx < num_kv_chunks) {
+          s_partial.m = tmp_md[(kv_chunk_idx * num_heads + head_idx) * 2];
+          s_partial.d = tmp_md[(kv_chunk_idx * num_heads + head_idx) * 2 + 1];
+          s_partial.o.load(tmp + (kv_chunk_idx * num_heads + head_idx) * head_dim + tx * vec_size);
+          s_global.merge(s_partial);
+        }
       }
+      block.sync();
+      // sync partial state of all warps inside a threadblock
+      sync_state<head_dim, vec_size, bdx, bdy, bdz>(s_global, reinterpret_cast<float *>(smem),
+                                                    smem_md);
+      s_global.o.cast_store(o + head_idx * head_dim + tx * vec_size);
+      tmp[head_idx] = s_global.m;
+      tmp[num_heads + head_idx] = s_global.d;
     }
-    block.sync();
-    // sync partial state of all warps inside a threadblock
-    sync_state<head_dim, vec_size, bdx, bdy, bdz>(s_global, reinterpret_cast<float *>(smem),
-                                                  smem_md);
-    s_global.o.cast_store(o + head_idx * head_dim + tx * vec_size);
-    tmp[head_idx] = s_global.m;
-    tmp[num_heads + head_idx] = s_global.d;
+  } else {
+    s_partial.o.cast_store(o + head_idx * head_dim + tx * vec_size);
   }
 }
 
@@ -921,32 +927,50 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
           constexpr size_t bdx = HEAD_DIM / vec_size;
           constexpr size_t bdy = 32 / bdx;
           constexpr size_t bdz = 4;
-          auto kernel = NHD::SingleDecodeWithKVCacheKernel<ROTARY_MODE, HEAD_DIM, vec_size, bdx,
-                                                           bdy, bdz, DTypeIn, DTypeOut>;
-          int num_blocks_per_sm = 0;
-          int num_sm = 0;
-          CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
-          CUDA_CALL(
-              cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, 128, 0));
-          size_t max_num_blks = size_t(num_blocks_per_sm) * size_t(num_sm);
-          size_t max_num_kv_chunks = max_num_blks / (num_heads / bdy);
-          size_t kv_chunk_size =
-              max((seq_len + max_num_kv_chunks - 1UL) / max_num_kv_chunks,
-                  min(64UL, max(4UL, seq_len / max(1UL, (64UL * bdy / num_heads)))));
-          dim3 nblks = dim3((seq_len + kv_chunk_size - 1) / kv_chunk_size, num_heads / bdy);
-          assert(nblks.x > 0 && nblks.y > 0);
-          dim3 nthrs = dim3(bdx, bdy, bdz);
-          void *args[] = {(void *)&q,
-                          (void *)&k,
-                          (void *)&v,
-                          (void *)&o,
-                          (void *)&tmp,
-                          (void *)&sm_scale,
-                          (void *)&seq_len,
-                          (void *)&rope_inv_scale,
-                          (void *)&rope_inv_theta,
-                          (void *)&kv_chunk_size};
-          CUDA_CALL(cudaLaunchCooperativeKernel((void *)kernel, nblks, nthrs, args, 0, stream));
+          if (seq_len <= 64) {
+            auto kernel = NHD::SingleDecodeWithKVCacheKernel<false, ROTARY_MODE, HEAD_DIM, vec_size,
+                                                             bdx, bdy, bdz, DTypeIn, DTypeOut>;
+            dim3 nblks = dim3(1, num_heads / bdy);
+            dim3 nthrs = dim3(bdx, bdy, bdz);
+            void *args[] = {(void *)&q,
+                            (void *)&k,
+                            (void *)&v,
+                            (void *)&o,
+                            (void *)&tmp,
+                            (void *)&sm_scale,
+                            (void *)&seq_len,
+                            (void *)&rope_inv_scale,
+                            (void *)&rope_inv_theta,
+                            (void *)&seq_len};
+            CUDA_CALL(cudaLaunchKernel((void *)kernel, nblks, nthrs, args, 0, stream));
+          } else {
+            auto kernel = NHD::SingleDecodeWithKVCacheKernel<true, ROTARY_MODE, HEAD_DIM, vec_size,
+                                                             bdx, bdy, bdz, DTypeIn, DTypeOut>;
+            int num_blocks_per_sm = 0;
+            int num_sm = 0;
+            CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
+            CUDA_CALL(
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, 128, 0));
+            size_t max_num_blks = size_t(num_blocks_per_sm) * size_t(num_sm);
+            size_t max_num_kv_chunks = max_num_blks / (num_heads / bdy);
+            size_t kv_chunk_size =
+                max((seq_len + max_num_kv_chunks - 1UL) / max_num_kv_chunks,
+                    min(64UL, max(4UL, seq_len / max(1UL, (64UL * bdy / num_heads)))));
+            dim3 nblks = dim3((seq_len + kv_chunk_size - 1) / kv_chunk_size, num_heads / bdy);
+            assert(nblks.x > 0 && nblks.y > 0);
+            dim3 nthrs = dim3(bdx, bdy, bdz);
+            void *args[] = {(void *)&q,
+                            (void *)&k,
+                            (void *)&v,
+                            (void *)&o,
+                            (void *)&tmp,
+                            (void *)&sm_scale,
+                            (void *)&seq_len,
+                            (void *)&rope_inv_scale,
+                            (void *)&rope_inv_theta,
+                            (void *)&kv_chunk_size};
+            CUDA_CALL(cudaLaunchCooperativeKernel((void *)kernel, nblks, nthrs, args, 0, stream));
+          }
         })});
   } else if (qkv_layout == QKVLayout::kHND) {
     SWITCH_HEAD_DIM(
