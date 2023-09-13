@@ -204,8 +204,9 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   // pipelining k/v tiles loading and state updating
   auto pipeline = cuda::make_pipeline();
   const auto frag_shape = cuda::aligned_size_t<alignof(float4)>(sizeof(DTypeIn) * vec_size);
+  size_t producer_kv_idx = chunk_start + ty, consumer_kv_idx;
+  bool producer_pred_guard = producer_kv_idx < chunk_end, consumer_pred_guard = true;
   pipeline.producer_acquire();
-  bool producer_pred_guard = ty < kv_chunk_size, consumer_pred_guard;
   if (producer_pred_guard) {
     cuda::memcpy_async(smem + kv_shared_offset[0] + ty * head_dim + tx * vec_size,
                        k + (head_idx * seq_len + (chunk_start + ty)) * head_dim + tx * vec_size,
@@ -222,14 +223,14 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
 
   state_t<vec_size> s_partial;
   float x = 0.f;
-  size_t copy_stage_idx = 2, compute_stage_idx = 0, batch, producer_kv_idx, consumer_kv_idx;
+  size_t copy_stage_idx = 2, compute_stage_idx = 0, batch;
 
 #pragma unroll 2
   for (batch = 1; batch < (kv_chunk_size + bdy - 1) / bdy; ++batch) {
+    consumer_kv_idx = producer_kv_idx;
+    consumer_pred_guard = producer_pred_guard;
     producer_kv_idx = chunk_start + batch * bdy + ty;
-    consumer_kv_idx = chunk_start + (batch - 1) * bdy + ty;
     producer_pred_guard = producer_kv_idx < chunk_end;
-    consumer_pred_guard = true;
     // load stage: load k tiles
     pipeline.producer_acquire();
     if (producer_pred_guard) {
@@ -272,8 +273,8 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
 
   // last two compute stages
   {
-    consumer_kv_idx = chunk_start + (batch - 1) * bdy + ty;
-    consumer_pred_guard = consumer_kv_idx < chunk_end;
+    consumer_kv_idx = producer_kv_idx;
+    consumer_pred_guard = producer_pred_guard;
     // compute stage: compute qk
     pipeline.consumer_wait();
     block.sync();
@@ -396,10 +397,10 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(DTypeIn *__restrict__ q,
   // pipelining k/v tiles loading and state updating
   auto pipeline = cuda::make_pipeline();
   const auto frag_shape = cuda::aligned_size_t<alignof(float4)>(sizeof(DTypeIn) * vec_size);
-  pipeline.producer_acquire();
   size_t producer_kv_idx = ty, consumer_kv_idx;
   bool producer_pred_guard = producer_kv_idx < seq_len, consumer_pred_guard = true;
   size_t page_idx = paged_kv.indices[cur_page_indptr_begin];
+  pipeline.producer_acquire();
   if (producer_pred_guard) {
     cuda::memcpy_async(smem + kv_shared_offset[0] + ty * head_dim + tx * vec_size,
                        paged_kv.data + paged_kv.get_k_offset(page_idx, head_idx, ty, tx * vec_size),
@@ -701,8 +702,9 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   // pipelining k/v tiles loading and state updating
   auto pipeline = cuda::make_pipeline();
   const auto frag_shape = cuda::aligned_size_t<alignof(float4)>(sizeof(DTypeIn) * vec_size);
+  size_t producer_kv_idx = chunk_start + tz, consumer_kv_idx;
+  bool producer_pred_guard = producer_kv_idx < chunk_end, consumer_pred_guard = true;
   pipeline.producer_acquire();
-  bool producer_pred_guard = tz < kv_chunk_size, consumer_pred_guard;
   if (producer_pred_guard) {
     cuda::memcpy_async(smem + kv_shared_offset[0] + (tz * bdy + ty) * head_dim + tx * vec_size,
                        k + ((chunk_start + tz) * num_heads + head_idx) * head_dim + tx * vec_size,
@@ -719,14 +721,14 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
 
   state_t<vec_size> s_partial;
   float x = 0.f;
-  size_t copy_stage_idx = 2, compute_stage_idx = 0, batch, producer_kv_idx, consumer_kv_idx;
+  size_t copy_stage_idx = 2, compute_stage_idx = 0, batch;
 
 #pragma unroll 2
   for (batch = 1; batch < (kv_chunk_size + bdz - 1) / bdz; ++batch) {
+    consumer_kv_idx = producer_kv_idx;
+    consumer_pred_guard = producer_pred_guard;
     producer_kv_idx = chunk_start + batch * bdz + tz;
-    consumer_kv_idx = chunk_start + (batch - 1) * bdz + tz;
     producer_pred_guard = producer_kv_idx < chunk_end;
-    consumer_pred_guard = true;
     // load stage: load k tiles
     pipeline.producer_acquire();
     if (producer_pred_guard) {
@@ -771,8 +773,8 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
 
   // last two compute stages
   {
-    consumer_kv_idx = chunk_start + (batch - 1) * bdz + tz;
-    consumer_pred_guard = consumer_kv_idx < chunk_end;
+    consumer_kv_idx = producer_kv_idx;
+    consumer_pred_guard = producer_pred_guard;
     // compute stage: compute qk
     pipeline.consumer_wait();
     block.sync();
