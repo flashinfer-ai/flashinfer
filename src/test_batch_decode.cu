@@ -9,14 +9,14 @@
 template <typename T>
 void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, size_t num_heads,
                                          size_t head_dim, flashinfer::RotaryMode rotary_mode) {
-  std::vector<size_t> seq_lens(batch_size);
+  std::vector<int32_t> seq_lens(batch_size);
   utils::vec_randint_(seq_lens, 1, 256);
   std::vector<T> q;
   std::vector<T> o_ref;
   std::vector<T> kv_data;
-  std::vector<size_t> kv_indptr{0};
-  std::vector<size_t> kv_indices;
-  std::vector<size_t> kv_last_page_offset;
+  std::vector<int32_t> kv_indptr{0};
+  std::vector<int32_t> kv_indices;
+  std::vector<int32_t> kv_last_page_offset;
   size_t page_counter = 0;
 
   for (size_t i = 0; i < batch_size; ++i) {
@@ -78,19 +78,20 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
 
   // copy data to device
   thrust::device_vector<T> kv_data_device(kv_data);
-  thrust::device_vector<size_t> kv_indptr_device(kv_indptr);
-  thrust::device_vector<size_t> kv_indices_device(kv_indices);
-  thrust::device_vector<size_t> kv_last_page_offset_device(kv_last_page_offset);
+  thrust::device_vector<int32_t> kv_indptr_device(kv_indptr);
+  thrust::device_vector<int32_t> kv_indices_device(kv_indices);
+  thrust::device_vector<int32_t> kv_last_page_offset_device(kv_last_page_offset);
   thrust::device_vector<T> q_device(q);
   thrust::device_vector<T> o_device(o_ref.size());
   thrust::device_vector<float> tmp(8 * 1024 * 1024);
 
   // create paged_kv object
-  flashinfer::paged_kv_t<T> paged_kv(page_counter, 1, 0, num_heads, page_size, head_dim, batch_size,
-                                     thrust::raw_pointer_cast(kv_data_device.data()),
-                                     thrust::raw_pointer_cast(kv_indptr_device.data()),
-                                     thrust::raw_pointer_cast(kv_indices_device.data()),
-                                     thrust::raw_pointer_cast(kv_last_page_offset_device.data()));
+  flashinfer::paged_kv_t<T, int32_t> paged_kv(
+      page_counter, 1, 0, num_heads, page_size, head_dim, batch_size,
+      thrust::raw_pointer_cast(kv_data_device.data()),
+      thrust::raw_pointer_cast(kv_indptr_device.data()),
+      thrust::raw_pointer_cast(kv_indices_device.data()),
+      thrust::raw_pointer_cast(kv_last_page_offset_device.data()));
 
   // compute gpu result
   flashinfer::BatchDecodeWithPagedKVCache<T, T>(thrust::raw_pointer_cast(q_device.data()), paged_kv,

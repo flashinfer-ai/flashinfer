@@ -31,6 +31,17 @@ using tvm::runtime::ShapeTuple;
     LOG(FATAL) << "Unsupported data type " << dl_dtype.code;      \
   }
 
+#define SWITCH_TVM_CUDA_IDTYPE(dl_dtype, cuda_dtype, ...)      \
+  if (dl_dtype.code == kDLInt && dl_dtype.bits == 32) {        \
+    using cuda_dtype = int32_t;                                \
+    __VA_ARGS__                                                \
+  } else if (dl_dtype.code == kDLInt && dl_dtype.bits == 64) { \
+    using cuda_dtype = int64_t;                                \
+    __VA_ARGS__                                                \
+  } else {                                                     \
+    LOG(FATAL) << "Unsupported data type " << dl_dtype.code;   \
+  }
+
 int _FlashInferSingleDecodeWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, DLTensor* tmp,
                                        int64_t qkv_layout, int64_t rotary_mode, double rope_scale,
                                        double rope_theta, DLTensor* o) {
@@ -105,6 +116,12 @@ void _FlashInferBatchDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
 
   CHECK(q_data->dtype.lanes == 1 && pages->dtype.lanes == 1 && output->dtype.lanes == 1);
   CHECK(q_data->dtype.bits == pages->dtype.bits && q_data->dtype.code == pages->dtype.code);
+  CHECK(page_table_indptr->dtype.lanes == 1 && page_table_values->dtype.lanes == 1 &&
+        last_page_offset->dtype.lanes == 1);
+  CHECK(page_table_indptr->dtype.bits == page_table_values->dtype.bits &&
+        page_table_indptr->dtype.bits == last_page_offset->dtype.bits &&
+        page_table_indptr->dtype.code == page_table_values->dtype.code &&
+        page_table_indptr->dtype.code == last_page_offset->dtype.code);
 
   CHECK_EQ(pages->ndim, 7);
   CHECK_LT(layer_id, pages->shape[1]);
@@ -137,19 +154,22 @@ void _FlashInferBatchDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
   CHECK_EQ(output->shape[3], nfeat);
 
   SWITCH_TVM_CUDA_DTYPE(
-      pages->dtype, dtype_in, {SWITCH_TVM_CUDA_DTYPE(output->dtype, dtype_out, {
-        flashinfer::paged_kv_t<dtype_in> cache(npage, nlayer, layer_id, nhead, page_size, nfeat,
-                                               num_total_seqs, static_cast<dtype_in*>(pages->data),
-                                               static_cast<size_t*>(page_table_indptr->data),
-                                               static_cast<size_t*>(page_table_values->data),
-                                               static_cast<size_t*>(last_page_offset->data));
-        cudaError_t status = flashinfer::BatchDecodeWithPagedKVCache<dtype_in, dtype_out>(
-            (dtype_in*)q_data->data, cache, static_cast<dtype_out*>(output->data), nullptr,
-            flashinfer::RotaryMode::kNone, 1.0f, 1e4, 0, q_data->device.device_id);
-        if (status != cudaSuccess) {
-          LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
-        }
-      })});
+      pages->dtype, dtype_in,
+      {SWITCH_TVM_CUDA_DTYPE(
+          output->dtype, dtype_out, {SWITCH_TVM_CUDA_IDTYPE(page_table_values->dtype, dtype_idx, {
+            flashinfer::paged_kv_t<dtype_in, dtype_idx> cache(
+                npage, nlayer, layer_id, nhead, page_size, nfeat, num_total_seqs,
+                static_cast<dtype_in*>(pages->data),
+                static_cast<dtype_idx*>(page_table_indptr->data),
+                static_cast<dtype_idx*>(page_table_values->data),
+                static_cast<dtype_idx*>(last_page_offset->data));
+            cudaError_t status = flashinfer::BatchDecodeWithPagedKVCache<dtype_in, dtype_out>(
+                (dtype_in*)q_data->data, cache, static_cast<dtype_out*>(output->data), nullptr,
+                flashinfer::RotaryMode::kNone, 1.0f, 1e4, 0, q_data->device.device_id);
+            if (status != cudaSuccess) {
+              LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
+            }
+          })})});
 }
 
 TVM_DLL_EXPORT_TYPED_FUNC(FlashInferBatchDecodeWithPagedKVCache,

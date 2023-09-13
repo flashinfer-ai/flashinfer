@@ -337,6 +337,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
  * \tparam bdy A template integer indicates the block size in y dimension
  * \tparam DTypeIn A template type indicates the input data type
  * \tparam DTypeOut A template type indicates the output data type
+ * \tparam IdType A template type indicates the index data type
  * \param q [batch_size, num_heads, head_dim] The query matrix
  * \param paged_kv The PagedKVCache data structure
  * \param o [num_heads, head_dim] The output matrix
@@ -348,9 +349,9 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
  *   of "theta" used in RoPE (Rotary Positional Embeddings)
  */
 template <RotaryMode rotary_mode, size_t head_dim, size_t vec_size, size_t bdx, size_t bdy,
-          typename DTypeIn, typename DTypeOut>
+          typename DTypeIn, typename DTypeOut, typename IdType>
 __global__ void BatchDecodeWithPagedKVCacheKernel(DTypeIn *__restrict__ q,
-                                                  paged_kv_t<DTypeIn> paged_kv,
+                                                  paged_kv_t<DTypeIn, IdType> paged_kv,
                                                   DTypeOut *__restrict__ o, float sm_scale,
                                                   float rope_inv_scale, float rope_inv_theta) {
   auto block = cg::this_thread_block();
@@ -1015,6 +1016,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
  * \brief FlashAttention decoding cuda kernel with paged kv-cache for batched requests
  * \tparam DTypeIn A template type indicates the input data type
  * \tparam DTypeOut A template type indicates the output data type
+ * \tparam IdType A template type indicates the index data type used in paged kv-cache
  * \param q [batch_size, num_heads, head_dim] The query matrix
  * \param paged_kv The paged kv cache data structure
  * \param o [batch_size, num_heads, head_dim] The output matrix
@@ -1026,9 +1028,10 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
  * \param stream The cuda stream to launch the kernel
  * \param dev_id The device id
  */
-template <typename DTypeIn, typename DTypeOut>
-cudaError_t BatchDecodeWithPagedKVCache(DTypeIn *q, paged_kv_t<DTypeIn> paged_kv, DTypeOut *o,
-                                        float *tmp, RotaryMode rotary_mode = RotaryMode::kNone,
+template <typename DTypeIn, typename DTypeOut, typename IdType>
+cudaError_t BatchDecodeWithPagedKVCache(DTypeIn *q, paged_kv_t<DTypeIn, IdType> paged_kv,
+                                        DTypeOut *o, float *tmp,
+                                        RotaryMode rotary_mode = RotaryMode::kNone,
                                         float rope_scale = 1.f, float rope_theta = 1e4,
                                         cudaStream_t stream = nullptr, size_t dev_id = 0) {
   const float sm_scale = 1.f / std::sqrt(float(paged_kv.head_dim));
@@ -1045,7 +1048,7 @@ cudaError_t BatchDecodeWithPagedKVCache(DTypeIn *q, paged_kv_t<DTypeIn> paged_kv
         dim3 nblks(paged_kv.batch_size, paged_kv.num_heads);
         dim3 nthrs(bdx, bdy);
         auto kernel = HND::BatchDecodeWithPagedKVCacheKernel<ROTARY_MODE, HEAD_DIM, vec_size, bdx,
-                                                             bdy, DTypeIn, DTypeOut>;
+                                                             bdy, DTypeIn, DTypeOut, IdType>;
         void *args[] = {(void *)&q,        (void *)&paged_kv,       (void *)&o,
                         (void *)&sm_scale, (void *)&rope_inv_scale, (void *)&rope_inv_theta};
         CUDA_CALL(cudaLaunchKernel((void *)kernel, nblks, nthrs, args, 0, stream));
