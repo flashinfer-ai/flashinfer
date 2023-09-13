@@ -1019,7 +1019,6 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
  * \param paged_kv The paged kv cache data structure
  * \param o [batch_size, num_heads, head_dim] The output matrix
  * \param tmp Used-allocated temporary buffer
- * \param batch_size A integer indicates the batch size
  * \param rotary_mode The rotary mode
  * \param rope_scale A floating point number indicate the scaling ratio
  *   used in RoPE Interpolation.
@@ -1029,8 +1028,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
  */
 template <typename DTypeIn, typename DTypeOut>
 cudaError_t BatchDecodeWithPagedKVCache(DTypeIn *q, paged_kv_t<DTypeIn> paged_kv, DTypeOut *o,
-                                        float *tmp, size_t batch_size,
-                                        RotaryMode rotary_mode = RotaryMode::kNone,
+                                        float *tmp, RotaryMode rotary_mode = RotaryMode::kNone,
                                         float rope_scale = 1.f, float rope_theta = 1e4,
                                         cudaStream_t stream = nullptr, size_t dev_id = 0) {
   const float sm_scale = 1.f / std::sqrt(float(paged_kv.head_dim));
@@ -1044,7 +1042,7 @@ cudaError_t BatchDecodeWithPagedKVCache(DTypeIn *q, paged_kv_t<DTypeIn> paged_kv
         constexpr size_t vec_size = std::max(16 / sizeof(DTypeIn), HEAD_DIM / 32);
         constexpr size_t bdx = HEAD_DIM / vec_size;
         constexpr size_t bdy = 128 / bdx;
-        dim3 nblks(batch_size, paged_kv.num_heads);
+        dim3 nblks(paged_kv.batch_size, paged_kv.num_heads);
         dim3 nthrs(bdx, bdy);
         auto kernel = HND::BatchDecodeWithPagedKVCacheKernel<ROTARY_MODE, HEAD_DIM, vec_size, bdx,
                                                              bdy, DTypeIn, DTypeOut>;

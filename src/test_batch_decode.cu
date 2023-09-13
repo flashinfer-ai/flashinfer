@@ -95,8 +95,7 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
   // compute gpu result
   flashinfer::BatchDecodeWithPagedKVCache<T, T>(thrust::raw_pointer_cast(q_device.data()), paged_kv,
                                                 thrust::raw_pointer_cast(o_device.data()),
-                                                thrust::raw_pointer_cast(tmp.data()), batch_size,
-                                                rotary_mode);
+                                                thrust::raw_pointer_cast(tmp.data()), rotary_mode);
 
   // compare result
   thrust::host_vector<T> o_host = o_device;

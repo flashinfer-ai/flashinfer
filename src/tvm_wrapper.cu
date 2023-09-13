@@ -139,13 +139,13 @@ void _FlashInferBatchDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
   SWITCH_TVM_CUDA_DTYPE(
       pages->dtype, dtype_in, {SWITCH_TVM_CUDA_DTYPE(output->dtype, dtype_out, {
         flashinfer::paged_kv_t<dtype_in> cache(npage, nlayer, layer_id, nhead, page_size, nfeat,
-                                               static_cast<dtype_in*>(pages->data));
-        cudaError_t status = flashinfer::BatchDecodeWithPagedKVCache(
-            (dtype_in*)q_data->data, cache, static_cast<size_t*>(page_table_indptr->data),
-            static_cast<size_t*>(page_table_values->data),
-            static_cast<size_t*>(last_page_offset->data), static_cast<dtype_out*>(output->data),
-            nullptr, num_total_seqs, flashinfer::RotaryMode::kNone, 1.0f, 1e4, 0,
-            q_data->device.device_id);
+                                               num_total_seqs, static_cast<dtype_in*>(pages->data),
+                                               static_cast<size_t*>(page_table_indptr->data),
+                                               static_cast<size_t*>(page_table_values->data),
+                                               static_cast<size_t*>(last_page_offset->data));
+        cudaError_t status = flashinfer::BatchDecodeWithPagedKVCache<dtype_in, dtype_out>(
+            (dtype_in*)q_data->data, cache, static_cast<dtype_out*>(output->data), nullptr,
+            flashinfer::RotaryMode::kNone, 1.0f, 1e4, 0, q_data->device.device_id);
         if (status != cudaSuccess) {
           LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
         }
