@@ -398,7 +398,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(DTypeIn *__restrict__ q,
   auto pipeline = cuda::make_pipeline();
   const auto frag_shape = cuda::aligned_size_t<alignof(float4)>(sizeof(DTypeIn) * vec_size);
   size_t producer_kv_idx = ty, consumer_kv_idx;
-  bool producer_pred_guard = producer_kv_idx < seq_len, consumer_pred_guard = true;
+  bool producer_pred_guard = producer_kv_idx < min(seq_len, paged_kv.page_size),
+       consumer_pred_guard = true;
   size_t page_idx = paged_kv.indices[cur_page_indptr_begin];
   pipeline.producer_acquire();
   if (producer_pred_guard) {
@@ -427,9 +428,9 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(DTypeIn *__restrict__ q,
 #pragma unroll 2
     for (batch = (page_iter == cur_page_indptr_begin); batch < (valid_page_size + bdy - 1) / bdy;
          ++batch) {
-      size_t cur_page_producer_kv_idx = batch * bdy + ty;
       consumer_kv_idx = producer_kv_idx;
       consumer_pred_guard = producer_pred_guard;
+      size_t cur_page_producer_kv_idx = batch * bdy + ty;
       producer_kv_idx =
           cur_page_producer_kv_idx + (page_iter - cur_page_indptr_begin) * paged_kv.page_size;
       producer_pred_guard = cur_page_producer_kv_idx < valid_page_size;

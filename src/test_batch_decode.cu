@@ -121,7 +121,7 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
 
 template <typename T>
 void TestBatchDecodeKernelCorrectness() {
-  for (size_t page_size : {16}) {
+  for (size_t page_size : {1, 3, 7, 16}) {
     for (size_t batch_size : {1, 7, 37, 61}) {
       for (size_t num_heads : {32}) {
         for (size_t head_dim : {64, 128, 256}) {
