@@ -14,36 +14,33 @@
 namespace utils {
 
 template <typename T>
-void thrust_normal_init(thrust::device_vector<T>& vec, float mean = 0.f, float std = 1.f) {
-  thrust::host_vector<T> host_vec(vec.size());
+void vec_normal_(std::vector<T>& vec, float mean = 0.f, float std = 1.f) {
   std::random_device rd{};
   std::mt19937 gen{rd()};
   std::normal_distribution d{mean, std};
   for (size_t i = 0; i < vec.size(); ++i) {
-    host_vec[i] = T(d(gen));
+    vec[i] = T(d(gen));
   }
-  vec = host_vec;
 }
 
 template <typename T>
-void thrust_zero_init(thrust::device_vector<T>& vec) {
-  thrust::fill(vec.begin(), vec.end(), T(0));
+void vec_zero_(std::vector<T>& vec) {
+  std::fill(vec.begin(), vec.end(), T(0));
 }
 
 template <typename T>
-void thrust_normal_init(thrust::host_vector<T>& vec, float mean = 0.f, float std = 1.f) {
-  thrust::counting_iterator<unsigned int> counter(0);
+void vec_fill_(std::vector<T>& vec, T val) {
+  std::fill(vec.begin(), vec.end(), val);
+}
+
+template <typename T>
+void vec_randint_(std::vector<T>& vec, int low, int high) {
   std::random_device rd{};
   std::mt19937 gen{rd()};
-  std::normal_distribution d{mean, std};
+  std::uniform_int_distribution d{low, high};
   for (size_t i = 0; i < vec.size(); ++i) {
-    vec[i] = d(gen);
+    vec[i] = T(d(gen));
   }
-}
-
-template <typename T>
-void thrust_zero_init(thrust::host_vector<T>& vec) {
-  thrust::fill(vec.begin(), vec.end(), T(0));
 }
 
 template <typename T>

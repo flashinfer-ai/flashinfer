@@ -3,30 +3,30 @@
 #include <flashinfer.cuh>
 #include <type_traits>
 
-#include "utils.h"
 #include "cpu_reference.h"
+#include "utils.h"
 
 template <typename T>
 void _TestDecodingKernelCorrectness(size_t num_heads, size_t seq_len, size_t head_dim,
                                     flashinfer::QKVLayout qkv_layout,
                                     flashinfer::RotaryMode rotary_mode) {
-  thrust::device_vector<T> Q(num_heads * head_dim);
-  thrust::device_vector<T> K(seq_len * num_heads * head_dim);
-  thrust::device_vector<T> V(seq_len * num_heads * head_dim);
-  thrust::device_vector<T> O(num_heads * head_dim);
+  std::vector<T> Q_host(num_heads * head_dim);
+  std::vector<T> K_host(seq_len * num_heads * head_dim);
+  std::vector<T> V_host(seq_len * num_heads * head_dim);
+  std::vector<T> O_host(num_heads * head_dim);
 
+  utils::vec_normal_(Q_host);
+  utils::vec_normal_(K_host);
+  utils::vec_normal_(V_host);
+  utils::vec_zero_(O_host);
+
+  thrust::device_vector<T> Q(Q_host);
+  thrust::device_vector<T> K(K_host);
+  thrust::device_vector<T> V(V_host);
+  thrust::device_vector<T> O(O_host);
   thrust::device_vector<float> tmp(512 * num_heads * head_dim);
 
-  utils::thrust_normal_init(Q);
-  utils::thrust_normal_init(K);
-  utils::thrust_normal_init(V);
-  utils::thrust_zero_init(O);
-
-  auto Q_host = thrust::host_vector<T>(Q);
-  auto K_host = thrust::host_vector<T>(K);
-  auto V_host = thrust::host_vector<T>(V);
-
-  thrust::host_vector<T> o_ref_host = cpu_reference::single_mha<T, T>(
+  std::vector<T> o_ref_host = cpu_reference::single_mha<T, T>(
       Q_host, K_host, V_host, num_heads, seq_len, head_dim, qkv_layout, rotary_mode);
 
   flashinfer::SingleDecodeWithKVCache(

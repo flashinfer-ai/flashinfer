@@ -7,10 +7,10 @@
 namespace cpu_reference {
 
 template <typename T>
-inline thrust::host_vector<float> apply_rotary(const T* input, size_t D, size_t offset,
-                                               float rope_scale, float rope_theta) {
-  thrust::host_vector<float> rst(D);
-  thrust::host_vector<float> permuted_input(D);
+inline std::vector<float> apply_rotary(const T* input, size_t D, size_t offset, float rope_scale,
+                                       float rope_theta) {
+  std::vector<float> rst(D);
+  std::vector<float> permuted_input(D);
   for (size_t k = 0; k < D; ++k) {
     permuted_input[k] = (k < D / 2) ? -float(input[k + D / 2]) : float(input[k - D / 2]);
   }
@@ -26,17 +26,17 @@ inline thrust::host_vector<float> apply_rotary(const T* input, size_t D, size_t 
 }
 
 template <typename dtype_in, typename dtype_out>
-thrust::host_vector<dtype_out> single_mha(
-    const thrust::host_vector<dtype_in>& q, thrust::host_vector<dtype_in>& k,
-    const thrust::host_vector<dtype_in>& v, size_t num_heads, size_t seq_len, size_t head_dim,
+std::vector<dtype_out> single_mha(
+    const std::vector<dtype_in>& q, const std::vector<dtype_in>& k, const std::vector<dtype_in>& v,
+    size_t num_heads, size_t seq_len, size_t head_dim,
     flashinfer::QKVLayout qkv_layout = flashinfer::QKVLayout::kNHD,
     flashinfer::RotaryMode rotary_mode = flashinfer::RotaryMode::kNone, float rope_scale = 1.f,
     float rope_theta = 1e4) {
   float sm_scale = 1.f / std::sqrt(float(head_dim));
-  thrust::host_vector<dtype_out> o(num_heads * head_dim);
-  thrust::host_vector<float> att(num_heads * seq_len);
-  thrust::host_vector<float> q_rotary_local(head_dim);
-  thrust::host_vector<float> k_rotary_local(head_dim);
+  std::vector<dtype_out> o(num_heads * head_dim);
+  std::vector<float> att(num_heads * seq_len);
+  std::vector<float> q_rotary_local(head_dim);
+  std::vector<float> k_rotary_local(head_dim);
   auto kv_offset = [&](size_t h, size_t n, size_t d) -> size_t {
     if (qkv_layout == flashinfer::QKVLayout::kNHD) {
       return n * num_heads * head_dim + h * head_dim + d;
@@ -51,9 +51,8 @@ thrust::host_vector<dtype_out> single_mha(
   for (size_t i = 0; i < num_heads; ++i) {
     float max_val = -INFINITY;
     if (rotary_mode == flashinfer::RotaryMode::kApplyRotary) {
-      q_rotary_local =
-          std::move(cpu_reference::apply_rotary(thrust::raw_pointer_cast(q.data()) + i * head_dim,
-                                                head_dim, seq_len - 1, rope_scale, rope_theta));
+      q_rotary_local = std::move(cpu_reference::apply_rotary(q.data() + i * head_dim, head_dim,
+                                                             seq_len - 1, rope_scale, rope_theta));
     }
     for (size_t j = 0; j < seq_len; ++j) {
       att[i * seq_len + j] = 0.;
@@ -66,9 +65,8 @@ thrust::host_vector<dtype_out> single_mha(
           break;
         }
         case flashinfer::RotaryMode::kApplyRotary: {
-          k_rotary_local = std::move(
-              cpu_reference::apply_rotary(thrust::raw_pointer_cast(k.data()) + kv_offset(i, j, 0),
-                                          head_dim, j, rope_scale, rope_theta));
+          k_rotary_local = std::move(cpu_reference::apply_rotary(
+              k.data() + kv_offset(i, j, 0), head_dim, j, rope_scale, rope_theta));
           for (size_t k_ = 0; k_ < head_dim; ++k_) {
             att[i * seq_len + j] += q_rotary_local[k_] * k_rotary_local[k_] * sm_scale;
           }
