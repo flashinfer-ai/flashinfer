@@ -14,6 +14,7 @@
 #include "page.cuh"
 #include "rope.cuh"
 #include "state.cuh"
+#include "utils.cuh"
 #include "vec_dtypes.cuh"
 
 namespace flashinfer {
@@ -123,16 +124,6 @@ __device__ __forceinline__ void sync_state(state_t<vec_size> &s, float *smem, fl
     vec_t<float, vec_size> oj;
     oj.load(smem + j * head_dim + tx * vec_size);
     s.merge(mj, dj, oj);
-  }
-}
-
-template <QKVLayout qkv_layout>
-__device__ __forceinline__ size_t get_kv_offset(size_t pos, size_t head_idx, size_t feat_idx,
-                                                size_t seq_len, size_t num_heads, size_t head_dim) {
-  if constexpr (qkv_layout == QKVLayout::kHND) {
-    return (head_idx * seq_len + pos) * head_dim + feat_idx;
-  } else {
-    return (pos * num_heads + head_idx) * head_dim + feat_idx;
   }
 }
 
@@ -528,73 +519,6 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(DTypeIn *__restrict__ q,
   s.o.cast_store(o + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
 }
 
-#define SWITCH_QKV_LAYOUT(qkv_layout, QKV_LAYOUT, ...)                         \
-  switch (qkv_layout) {                                                        \
-    case QKVLayout::kNHD: {                                                    \
-      constexpr QKVLayout QKV_LAYOUT = QKVLayout::kNHD;                        \
-      __VA_ARGS__                                                              \
-      break;                                                                   \
-    }                                                                          \
-    case QKVLayout::kHND: {                                                    \
-      constexpr QKVLayout QKV_LAYOUT = QKVLayout::kHND;                        \
-      __VA_ARGS__                                                              \
-      break;                                                                   \
-    }                                                                          \
-    default: {                                                                 \
-      std::cerr << "Unsupported qkv_layout: " << int(qkv_layout) << std::endl; \
-      abort();                                                                 \
-    }                                                                          \
-  }
-
-#define SWITCH_HEAD_DIM(head_dim, HEAD_DIM, ...)                      \
-  switch (head_dim) {                                                 \
-    case 64: {                                                        \
-      constexpr size_t HEAD_DIM = 64;                                 \
-      __VA_ARGS__                                                     \
-      break;                                                          \
-    }                                                                 \
-    case 128: {                                                       \
-      constexpr size_t HEAD_DIM = 128;                                \
-      __VA_ARGS__                                                     \
-      break;                                                          \
-    }                                                                 \
-    case 256: {                                                       \
-      constexpr size_t HEAD_DIM = 256;                                \
-      __VA_ARGS__                                                     \
-      break;                                                          \
-    }                                                                 \
-    default: {                                                        \
-      std::cerr << "Unsupported head_dim: " << head_dim << std::endl; \
-      abort();                                                        \
-    }                                                                 \
-  }
-
-#define SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, ...)                        \
-  switch (rotary_mode) {                                                         \
-    case RotaryMode::kNone: {                                                    \
-      constexpr RotaryMode ROTARY_MODE = RotaryMode::kNone;                      \
-      __VA_ARGS__                                                                \
-      break;                                                                     \
-    }                                                                            \
-    case RotaryMode::kApplyRotary: {                                             \
-      constexpr RotaryMode ROTARY_MODE = RotaryMode::kApplyRotary;               \
-      __VA_ARGS__                                                                \
-      break;                                                                     \
-    }                                                                            \
-    default: {                                                                   \
-      std::cerr << "Unsupported rotary_mode: " << int(rotary_mode) << std::endl; \
-      abort();                                                                   \
-    }                                                                            \
-  }
-
-#define CUDA_CALL(func, ...) \
-  {                          \
-    cudaError_t e = (func);  \
-    if (e != cudaSuccess) {  \
-      return e;              \
-    }                        \
-  }
-
 /*!
  * \brief FlashAttention decoding with kv-cache for a single sequence
  * \tparam DTypeIn A template type indicates the input data type
@@ -627,7 +551,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
   const float rope_inv_scale = 1.f / rope_scale;
   const float rope_inv_theta = 1.f / rope_theta;
 
-  CUDA_CALL(cudaSetDevice(dev_id));
+  FLASHINFER_CUDA_CALL(cudaSetDevice(dev_id));
 
   SWITCH_HEAD_DIM(
       head_dim, HEAD_DIM,
@@ -652,16 +576,17 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
                               (void *)&rope_inv_scale,
                               (void *)&rope_inv_theta,
                               (void *)&seq_len};
-              CUDA_CALL(cudaLaunchKernel((void *)kernel, nblks, nthrs, args, 0, stream));
+              FLASHINFER_CUDA_CALL(cudaLaunchKernel((void *)kernel, nblks, nthrs, args, 0, stream));
             } else {
               // use cooperative kernel
               auto kernel = SingleDecodeWithKVCacheKernel<QKV_LAYOUT, true, ROTARY_MODE, HEAD_DIM,
                                                           vec_size, bdx, bdy, DTypeIn, DTypeOut>;
               int num_blocks_per_sm = 0;
               int num_sm = 0;
-              CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
-              CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
-                                                                      128, 0));
+              FLASHINFER_CUDA_CALL(
+                  cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
+              FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm,
+                                                                                 kernel, 128, 0));
               size_t max_num_blks = size_t(num_blocks_per_sm) * size_t(num_sm);
               size_t max_num_kv_chunks = max_num_blks / num_heads;
               size_t kv_chunk_size =
@@ -680,7 +605,8 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
                               (void *)&rope_inv_scale,
                               (void *)&rope_inv_theta,
                               (void *)&kv_chunk_size};
-              CUDA_CALL(cudaLaunchCooperativeKernel((void *)kernel, nblks, nthrs, args, 0, stream));
+              FLASHINFER_CUDA_CALL(
+                  cudaLaunchCooperativeKernel((void *)kernel, nblks, nthrs, args, 0, stream));
             }
           })})});
   return cudaSuccess;
@@ -712,7 +638,7 @@ cudaError_t BatchDecodeWithPagedKVCache(DTypeIn *q, paged_kv_t<DTypeIn, IdType> 
   const float rope_inv_scale = 1.f / rope_scale;
   const float rope_inv_theta = 1.f / rope_theta;
 
-  CUDA_CALL(cudaSetDevice(dev_id));
+  FLASHINFER_CUDA_CALL(cudaSetDevice(dev_id));
 
   SWITCH_HEAD_DIM(
       paged_kv.head_dim, HEAD_DIM, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
@@ -725,7 +651,7 @@ cudaError_t BatchDecodeWithPagedKVCache(DTypeIn *q, paged_kv_t<DTypeIn, IdType> 
                                                         DTypeIn, DTypeOut, IdType>;
         void *args[] = {(void *)&q,        (void *)&paged_kv,       (void *)&o,
                         (void *)&sm_scale, (void *)&rope_inv_scale, (void *)&rope_inv_theta};
-        CUDA_CALL(cudaLaunchKernel((void *)kernel, nblks, nthrs, args, 0, stream));
+        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void *)kernel, nblks, nthrs, args, 0, stream));
       })});
 
   return cudaSuccess;

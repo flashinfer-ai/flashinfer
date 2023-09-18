@@ -134,7 +134,6 @@ void _FlashInferBatchDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
   CHECK_GE(layer_id, 0);
   CHECK_EQ(pages->shape[2], 1) << "Page chunk size should be fixed to 1 right now.";
   CHECK_EQ(pages->shape[3], 2);
-  int64_t npage = pages->shape[0];
   int64_t nlayer = pages->shape[1];
   int64_t nhead = pages->shape[4];
   int64_t nfeat = pages->shape[6];
@@ -164,7 +163,7 @@ void _FlashInferBatchDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
       {SWITCH_TVM_CUDA_DTYPE(
           output->dtype, dtype_out, {SWITCH_TVM_CUDA_IDTYPE(page_table_values->dtype, dtype_idx, {
             flashinfer::paged_kv_t<dtype_in, dtype_idx> cache(
-                npage, nlayer, layer_id, nhead, page_size, nfeat, num_total_seqs,
+                nlayer, layer_id, nhead, page_size, nfeat, num_total_seqs,
                 static_cast<dtype_in*>(pages->data),
                 static_cast<dtype_idx*>(page_table_indptr->data),
                 static_cast<dtype_idx*>(page_table_values->data),

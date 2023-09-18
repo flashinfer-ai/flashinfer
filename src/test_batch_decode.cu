@@ -11,6 +11,10 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
                                          size_t head_dim, flashinfer::RotaryMode rotary_mode) {
   std::vector<int32_t> seq_lens(batch_size);
   utils::vec_randint_(seq_lens, 1, 256);
+  std::vector<int32_t> append_indptr{0};
+  for (size_t i = 0; i < batch_size; ++i) {
+    append_indptr.push_back(append_indptr.back() + seq_lens[i]);
+  }
   std::vector<T> q;
   std::vector<T> o_ref;
   std::vector<T> kv_data;
@@ -19,19 +23,22 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
   std::vector<int32_t> kv_last_page_offset;
   size_t page_counter = 0;
 
+  std::vector<std::vector<T>> keys, values;
   for (size_t i = 0; i < batch_size; ++i) {
     size_t seq_len = seq_lens[i];
     size_t num_pages = (seq_len + page_size - 1) / page_size;
     size_t last_page_offset = (seq_len - 1) % page_size + 1;
-    std::vector<T> qi(num_heads * head_dim), ki(num_heads * seq_len * head_dim),
-        vi(num_heads * seq_len * head_dim);
+    std::vector<T> qi(num_heads * head_dim), ki(seq_len * num_heads * head_dim),
+        vi(seq_len * num_heads * head_dim);
     utils::vec_normal_(qi);
     utils::vec_normal_(ki);
     utils::vec_normal_(vi);
 
     // compute reference output
     std::vector<T> o_ref_i = cpu_reference::single_mha<T, T>(
-        qi, ki, vi, num_heads, seq_len, head_dim, flashinfer::QKVLayout::kHND, rotary_mode);
+        qi, ki, vi, num_heads, seq_len, head_dim, flashinfer::QKVLayout::kNHD, rotary_mode);
+    keys.push_back(ki);
+    values.push_back(vi);
     // append new q and o_ref
     q.insert(q.end(), qi.begin(), qi.end());
     o_ref.insert(o_ref.end(), o_ref_i.begin(), o_ref_i.end());
@@ -41,40 +48,19 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
     for (size_t j = 0; j < num_pages; ++j) {
       kv_indices.push_back(page_counter++);
     }
-    // append new pages to kv_data
-    // step 1. first append (num_pages - 1) full pages
-    for (size_t j = 0; j < num_pages - 1; ++j) {
-      for (size_t h = 0; h < num_heads; ++h) {
-        kv_data.insert(kv_data.end(),
-                       ki.begin() + h * seq_len * head_dim + j * page_size * head_dim,
-                       ki.begin() + h * seq_len * head_dim + (j + 1) * page_size * head_dim);
-      }
-      for (size_t h = 0; h < num_heads; ++h) {
-        kv_data.insert(kv_data.end(),
-                       vi.begin() + h * seq_len * head_dim + j * page_size * head_dim,
-                       vi.begin() + h * seq_len * head_dim + (j + 1) * page_size * head_dim);
-      }
-    }
-    // step 2. then append last page
-    std::vector<T> padding((page_size - last_page_offset) * head_dim);
-    for (size_t h = 0; h < num_heads; ++h) {
-      kv_data.insert(kv_data.end(),
-                     ki.begin() + h * seq_len * head_dim + (num_pages - 1) * page_size * head_dim,
-                     ki.begin() + h * seq_len * head_dim + (num_pages - 1) * page_size * head_dim +
-                         last_page_offset * head_dim);
-      kv_data.insert(kv_data.end(), padding.begin(), padding.end());
-    }
-    for (size_t h = 0; h < num_heads; ++h) {
-      kv_data.insert(kv_data.end(),
-                     vi.begin() + h * seq_len * head_dim + (num_pages - 1) * page_size * head_dim,
-                     vi.begin() + h * seq_len * head_dim + (num_pages - 1) * page_size * head_dim +
-                         last_page_offset * head_dim);
-      kv_data.insert(kv_data.end(), padding.begin(), padding.end());
-    }
   }
-  assert(kv_data.size() == page_counter * 1 * 2 * num_heads * page_size * head_dim);
+  kv_data.resize(page_counter * 1 * 2 * num_heads * page_size * head_dim);
+  utils::vec_zero_(kv_data);
   assert(q.size() == batch_size * num_heads * head_dim);
   assert(o_ref.size() == batch_size * num_heads * head_dim);
+
+  flashinfer::paged_kv_t<T, int32_t> paged_kv_cpu(
+    1, 0, num_heads, page_size, head_dim, batch_size, kv_data.data(),
+    kv_indptr.data(), kv_indices.data(), kv_last_page_offset.data()
+  );
+  cpu_reference::append_paged_kv_cache<T, int32_t>(
+    paged_kv_cpu, keys, values, append_indptr
+  );
 
   // copy data to device
   thrust::device_vector<T> kv_data_device(kv_data);
@@ -87,7 +73,7 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
 
   // create paged_kv object
   flashinfer::paged_kv_t<T, int32_t> paged_kv(
-      page_counter, 1, 0, num_heads, page_size, head_dim, batch_size,
+      1, 0, num_heads, page_size, head_dim, batch_size,
       thrust::raw_pointer_cast(kv_data_device.data()),
       thrust::raw_pointer_cast(kv_indptr_device.data()),
       thrust::raw_pointer_cast(kv_indices_device.data()),

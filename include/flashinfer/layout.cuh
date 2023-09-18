@@ -30,5 +30,15 @@ inline std::string QKVLayoutToString(const QKVLayout &qkv_layout) {
   }
 }
 
+template <QKVLayout qkv_layout>
+__device__ __forceinline__ size_t get_kv_offset(size_t pos, size_t head_idx, size_t feat_idx,
+                                                size_t seq_len, size_t num_heads, size_t head_dim) {
+  if constexpr (qkv_layout == QKVLayout::kHND) {
+    return (head_idx * seq_len + pos) * head_dim + feat_idx;
+  } else {
+    return (pos * num_heads + head_idx) * head_dim + feat_idx;
+  }
+}
+
 }  // namespace flashinfer
 #endif  // FLASHINFER_LAYOUT_CUH_
