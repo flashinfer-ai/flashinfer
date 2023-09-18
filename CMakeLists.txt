@@ -54,6 +54,13 @@ if (FLASHINFER_DECODE)
   target_include_directories(test_single_decode PRIVATE ${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
   target_link_libraries(test_single_decode PRIVATE gtest gtest_main)
 
+  message(STATUS "Compile batch decode kernel benchmarks.")
+  file(GLOB_RECURSE BENCH_DECODE_SRCS ${PROJECT_SOURCE_DIR}/src/bench_batch_decode.cu)
+  add_executable(bench_batch_decode ${BENCH_DECODE_SRCS})
+  target_include_directories(bench_batch_decode PRIVATE ${FLASHINFER_INCLUDE_DIR})
+  target_include_directories(bench_batch_decode PRIVATE ${PROJECT_SOURCE_DIR}/3rdparty/nvbench)
+  target_link_libraries(bench_batch_decode PRIVATE nvbench::main)
+
   message(STATUS "Compile batch decode kernel tests.")
   file(GLOB_RECURSE TEST_DECODE_SRCS ${PROJECT_SOURCE_DIR}/src/test_batch_decode.cu)
   add_executable(test_batch_decode ${TEST_DECODE_SRCS})
