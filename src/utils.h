@@ -44,6 +44,11 @@ void vec_randint_(std::vector<T>& vec, int low, int high) {
 }
 
 template <typename T>
+size_t vec_bytes(const T& vec) {
+  return vec.size() * sizeof(typename T::value_type);
+}
+
+template <typename T>
 bool isclose(T a, T b, float rtol = 1e-5, float atol = 1e-8) {
   return fabs(a - b) <= (atol + rtol * fabs(b));
 }
