@@ -436,7 +436,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOu
                                                          num_frags_y, num_frags_z, num_stages_smem,
                                                          num_warps, DTypeIn, DTypeOut>;
             dim3 nblks((q_len + (num_rows_per_cta - 1)) / (num_rows_per_cta), num_heads);
-            dim3 nthrs(32, 8);
+            dim3 nthrs(32, num_warps);
             size_t smem_size =
                 2 * num_stages_smem * num_frags_z * mma::frag_size * head_dim * sizeof(DTypeIn);
             tensor_info_t<LAYOUT> qkv_info(q_len, kv_len, num_heads, HEAD_DIM);
