@@ -61,8 +61,8 @@
       __VA_ARGS__                                                                \
       break;                                                                     \
     }                                                                            \
-    case RotaryMode::kApplyRotary: {                                             \
-      constexpr RotaryMode ROTARY_MODE = RotaryMode::kApplyRotary;               \
+    case RotaryMode::kLlama: {                                                   \
+      constexpr RotaryMode ROTARY_MODE = RotaryMode::kLlama;                     \
       __VA_ARGS__                                                                \
       break;                                                                     \
     }                                                                            \

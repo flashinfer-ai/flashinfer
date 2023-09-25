@@ -35,9 +35,8 @@ namespace {
  * \param offset A integer indicates the offset of the position in RoPE
  */
 template <size_t vec_size, size_t bdx, typename T>
-__device__ __forceinline__ vec_t<float, vec_size> apply_rotary(const T *x,
-                                                               const vec_t<float, vec_size> &freq,
-                                                               size_t offset) {
+__device__ __forceinline__ vec_t<float, vec_size> apply_llama_rope(
+    const T *x, const vec_t<float, vec_size> &freq, size_t offset) {
   constexpr size_t head_dim = vec_size * bdx;
   vec_t<float, vec_size> permuted_vec, vec;
   vec.cast_load(x + threadIdx.x * vec_size);
@@ -84,10 +83,10 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
   constexpr size_t head_dim = bdx * vec_size;
   vec_t<float, vec_size> k_vec;
   size_t tx = threadIdx.x, ty = threadIdx.y;
-  if constexpr (rotary_mode == RotaryMode::kApplyRotary) {
+  if constexpr (rotary_mode == RotaryMode::kLlama) {
     // apply rotary embedding for all rows in k matrix of kv-cache
-    k_vec = apply_rotary<vec_size, bdx>(smem + kv_shared_offset[compute_stage_idx] + ty * head_dim,
-                                        freq, kv_idx);
+    k_vec = apply_llama_rope<vec_size, bdx>(
+        smem + kv_shared_offset[compute_stage_idx] + ty * head_dim, freq, kv_idx);
   } else {
     // do not apply rotary embedding
     k_vec.cast_load(smem + kv_shared_offset[compute_stage_idx] + ty * head_dim + tx * vec_size);
@@ -215,7 +214,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   size_t tx = threadIdx.x, ty = threadIdx.y;
   vec_t<float, vec_size> q_vec;
   vec_t<float, vec_size> freq;
-  if constexpr (rotary_mode == RotaryMode::kApplyRotary) {
+  if constexpr (rotary_mode == RotaryMode::kLlama) {
 #pragma unroll
     for (size_t i = 0; i < vec_size; ++i) {
       freq[i] =
@@ -223,7 +222,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
           powf(rope_inv_theta, float(2 * ((tx * vec_size + i) % (head_dim / 2))) / float(head_dim));
     }
     // apply rotary embedding to q matrix
-    q_vec = apply_rotary<vec_size, bdx>(q + head_idx * head_dim, freq, seq_len - 1);
+    q_vec = apply_llama_rope<vec_size, bdx>(q + head_idx * head_dim, freq, seq_len - 1);
   } else {
     // do not apply rotary embedding to q matrix
     q_vec.cast_load(q + head_idx * head_dim + tx * vec_size);
@@ -414,7 +413,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(DTypeIn *__restrict__ q,
   size_t tx = threadIdx.x, ty = threadIdx.y;
   vec_t<float, vec_size> q_vec;
   vec_t<float, vec_size> freq;
-  if constexpr (rotary_mode == RotaryMode::kApplyRotary) {
+  if constexpr (rotary_mode == RotaryMode::kLlama) {
 #pragma unroll
     for (size_t i = 0; i < vec_size; ++i) {
       freq[i] = rope_inv_scale *
@@ -422,8 +421,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(DTypeIn *__restrict__ q,
                        float(2 * ((tx * vec_size + i) % (head_dim / 2))) / float(head_dim));
     }
     // apply rotary embedding to q matrix
-    q_vec = apply_rotary<vec_size, bdx>(q + (batch_idx * num_heads + head_idx) * head_dim, freq,
-                                        seq_len - 1);
+    q_vec = apply_llama_rope<vec_size, bdx>(q + (batch_idx * num_heads + head_idx) * head_dim, freq,
+                                            seq_len - 1);
   } else {
     // do not apply rotary embedding to q matrix
     q_vec.cast_load(q + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);

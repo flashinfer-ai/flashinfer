@@ -26,9 +26,9 @@ constexpr size_t warp_size = 32;
 namespace {
 
 template <bool row_major, typename T>
-__device__ __forceinline__ void apply_rotary(T *x_first_half, T *x_second_half,
-                                             const float *freq_first_half,
-                                             const float *freq_second_half, size_t offset) {
+__device__ __forceinline__ void apply_llama_rope(T *x_first_half, T *x_second_half,
+                                                 const float *freq_first_half,
+                                                 const float *freq_second_half, size_t offset) {
 #pragma unroll
   for (size_t reg_id = 0; reg_id < 8; ++reg_id) {
     float cos_first_half, sin_first_half, cos_second_half, sin_second_half, tmp;
@@ -115,15 +115,15 @@ __device__ __forceinline__ void consume_k(
       k_smem->ldmatrix_m8n8x4(kv_frag[fy][fz], i, j);
     }
   }
-  if constexpr (rotary_mode == RotaryMode::kApplyRotary) {
+  if constexpr (rotary_mode == RotaryMode::kLlama) {
     // apply rotary embedding
 #pragma unroll
     for (size_t fyi = 0; fyi < num_frags_y / 2; ++fyi) {
 #pragma unroll
       for (size_t fz = 0; fz < num_frags_z; ++fz) {
         size_t kv_idx = kv_idx_base + fz * mma::frag_size + tx / 4;
-        apply_rotary<false, T>((T *)kv_frag[fyi][fz], (T *)kv_frag[fyi + num_frags_y / 2][fz],
-                               rope_freq[fyi], rope_freq[fyi + num_frags_y / 2], kv_idx);
+        apply_llama_rope<false, T>((T *)kv_frag[fyi][fz], (T *)kv_frag[fyi + num_frags_y / 2][fz],
+                                   rope_freq[fyi], rope_freq[fyi + num_frags_y / 2], kv_idx);
       }
     }
   }
@@ -287,7 +287,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   float d[num_frags_x][2]{0.f};
   float o_scale[num_frags_x][2];
   float rope_freq[num_frags_y][4];
-  if constexpr (rotary_mode == RotaryMode::kApplyRotary) {
+  if constexpr (rotary_mode == RotaryMode::kLlama) {
 #pragma unroll
     for (size_t fy = 0; fy < num_frags_y; ++fy) {
 #pragma unroll
@@ -326,13 +326,13 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
       q_smem.ldmatrix_m8n8x4(q_frag[fx][fyo * 2 + 1], i, j + 2);
     }
     block.sync();
-    if constexpr (rotary_mode == RotaryMode::kApplyRotary) {
+    if constexpr (rotary_mode == RotaryMode::kLlama) {
       // apply rotary embedding
 #pragma unroll
       for (size_t fyi = 0; fyi < num_frags_y / 2; ++fyi) {
-        apply_rotary<true, DTypeIn>((DTypeIn *)q_frag[fx][fyi],
-                                    (DTypeIn *)q_frag[fx][fyi + num_frags_y / 2], rope_freq[fyi],
-                                    rope_freq[fyi + num_frags_y / 2], q_idx + (kv_len - q_len));
+        apply_llama_rope<true, DTypeIn>(
+            (DTypeIn *)q_frag[fx][fyi], (DTypeIn *)q_frag[fx][fyi + num_frags_y / 2],
+            rope_freq[fyi], rope_freq[fyi + num_frags_y / 2], q_idx + (kv_len - q_len));
       }
     }
   }

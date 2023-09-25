@@ -9,8 +9,8 @@ namespace cpu_reference {
 using namespace flashinfer;
 
 template <typename T>
-inline std::vector<float> apply_rotary(const T* input, size_t D, size_t offset, float rope_scale,
-                                       float rope_theta) {
+inline std::vector<float> apply_llama_rope(const T* input, size_t D, size_t offset,
+                                           float rope_scale, float rope_theta) {
   std::vector<float> rst(D);
   std::vector<float> permuted_input(D);
   for (size_t k = 0; k < D; ++k) {
@@ -44,8 +44,8 @@ std::vector<dtype_out> single_mha(const std::vector<dtype_in>& q, const std::vec
     for (size_t head_idx = 0; head_idx < num_heads; ++head_idx) {
       for (size_t q_idx = 0; q_idx < q_len; ++q_idx) {
         float max_val = -5e4;
-        if (rotary_mode == RotaryMode::kApplyRotary) {
-          q_rotary_local = std::move(cpu_reference::apply_rotary(
+        if (rotary_mode == RotaryMode::kLlama) {
+          q_rotary_local = std::move(cpu_reference::apply_llama_rope(
               q.data() + qkv_info.get_qo_elem_offset(q_idx, head_idx, 0), head_dim,
               q_idx + kv_len - q_len, rope_scale, rope_theta));
         }
@@ -60,8 +60,8 @@ std::vector<dtype_out> single_mha(const std::vector<dtype_in>& q, const std::vec
               }
               break;
             }
-            case RotaryMode::kApplyRotary: {
-              k_rotary_local = std::move(cpu_reference::apply_rotary(
+            case RotaryMode::kLlama: {
+              k_rotary_local = std::move(cpu_reference::apply_llama_rope(
                   k.data() + qkv_info.get_kv_elem_offset(kv_idx, head_idx, 0), head_dim, kv_idx,
                   rope_scale, rope_theta));
               for (size_t feat_idx = 0; feat_idx < head_dim; ++feat_idx) {
