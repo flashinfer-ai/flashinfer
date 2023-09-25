@@ -1,10 +1,12 @@
 #include <gtest/gtest.h>
 
-#include <flashinfer.cuh>
+#include <flashinfer/decode.cuh>
 #include <type_traits>
 
 #include "cpu_reference.h"
 #include "utils.h"
+
+using namespace flashinfer;
 
 template <typename T>
 void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, size_t num_heads,
@@ -36,7 +38,7 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
 
     // compute reference output
     std::vector<T> o_ref_i = cpu_reference::single_mha<T, T>(
-        qi, ki, vi, num_heads, seq_len, head_dim, flashinfer::QKVLayout::kNHD, rotary_mode);
+        qi, ki, vi, 1, seq_len, num_heads, head_dim, QKVLayout::kNHD, rotary_mode);
     keys.push_back(ki);
     values.push_back(vi);
     // append new q and o_ref
@@ -54,13 +56,10 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
   assert(q.size() == batch_size * num_heads * head_dim);
   assert(o_ref.size() == batch_size * num_heads * head_dim);
 
-  flashinfer::paged_kv_t<T, int32_t> paged_kv_cpu(
-    1, 0, num_heads, page_size, head_dim, batch_size, kv_data.data(),
-    kv_indptr.data(), kv_indices.data(), kv_last_page_offset.data()
-  );
-  cpu_reference::append_paged_kv_cache<T, int32_t>(
-    paged_kv_cpu, keys, values, append_indptr
-  );
+  flashinfer::paged_kv_t<T, int32_t> paged_kv_cpu(1, 0, num_heads, page_size, head_dim, batch_size,
+                                                  kv_data.data(), kv_indptr.data(),
+                                                  kv_indices.data(), kv_last_page_offset.data());
+  cpu_reference::append_paged_kv_cache<T, int32_t>(paged_kv_cpu, keys, values, append_indptr);
 
   // copy data to device
   thrust::device_vector<T> kv_data_device(kv_data);

@@ -13,22 +13,22 @@
     }                                   \
   }
 
-#define SWITCH_QKV_LAYOUT(qkv_layout, QKV_LAYOUT, ...)                         \
-  switch (qkv_layout) {                                                        \
-    case QKVLayout::kNHD: {                                                    \
-      constexpr QKVLayout QKV_LAYOUT = QKVLayout::kNHD;                        \
-      __VA_ARGS__                                                              \
-      break;                                                                   \
-    }                                                                          \
-    case QKVLayout::kHND: {                                                    \
-      constexpr QKVLayout QKV_LAYOUT = QKVLayout::kHND;                        \
-      __VA_ARGS__                                                              \
-      break;                                                                   \
-    }                                                                          \
-    default: {                                                                 \
-      std::cerr << "Unsupported qkv_layout: " << int(qkv_layout) << std::endl; \
-      abort();                                                                 \
-    }                                                                          \
+#define SWITCH_LAYOUT(layout, LAYOUT, ...)                                 \
+  switch (layout) {                                                        \
+    case QKVLayout::kNHD: {                                                \
+      constexpr QKVLayout LAYOUT = QKVLayout::kNHD;                        \
+      __VA_ARGS__                                                          \
+      break;                                                               \
+    }                                                                      \
+    case QKVLayout::kHND: {                                                \
+      constexpr QKVLayout LAYOUT = QKVLayout::kHND;                        \
+      __VA_ARGS__                                                          \
+      break;                                                               \
+    }                                                                      \
+    default: {                                                             \
+      std::cerr << "Unsupported qkv_layout: " << int(layout) << std::endl; \
+      abort();                                                             \
+    }                                                                      \
   }
 
 #define SWITCH_HEAD_DIM(head_dim, HEAD_DIM, ...)                      \

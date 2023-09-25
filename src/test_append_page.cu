@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include <flashinfer.cuh>
+#include <flashinfer/page.cuh>
 #include <type_traits>
 
 #include "cpu_reference.h"

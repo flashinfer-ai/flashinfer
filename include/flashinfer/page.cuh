@@ -59,16 +59,16 @@ struct paged_kv_t {
         indices(indices),
         last_page_offset(last_page_offset) {}
 
-  __host__ __device__ __forceinline__ size_t get_k_offset(size_t page_idx, size_t head_idx,
-                                                          size_t entry_idx, size_t feat_idx) {
+  __host__ __device__ __forceinline__ size_t get_k_elem_offset(size_t page_idx, size_t head_idx,
+                                                               size_t entry_idx, size_t feat_idx) {
     return (((page_idx * num_layers + layer_idx) * 2 * num_heads + head_idx) * page_size +
             entry_idx) *
                head_dim +
            feat_idx;
   }
 
-  __host__ __device__ __forceinline__ size_t get_v_offset(size_t page_idx, size_t head_idx,
-                                                          size_t entry_idx, size_t feat_idx) {
+  __host__ __device__ __forceinline__ size_t get_v_elem_offset(size_t page_idx, size_t head_idx,
+                                                               size_t entry_idx, size_t feat_idx) {
     return ((((page_idx * num_layers + layer_idx) * 2 + 1) * num_heads + head_idx) * page_size +
             entry_idx) *
                head_dim +
@@ -93,11 +93,11 @@ __global__ void AppendPagedKVCacheDecodeKernel(paged_kv_t<DType, IdType> paged_k
   size_t entry_idx = (seq_len - 1) % paged_kv.page_size;
 
   vec_t<DType, vec_size>::memcpy(
-      paged_kv.data + paged_kv.get_k_offset(page_idx, head_idx, entry_idx, tx * vec_size),
+      paged_kv.data + paged_kv.get_k_elem_offset(page_idx, head_idx, entry_idx, tx * vec_size),
       key + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
 
   vec_t<DType, vec_size>::memcpy(
-      paged_kv.data + paged_kv.get_v_offset(page_idx, head_idx, entry_idx, tx * vec_size),
+      paged_kv.data + paged_kv.get_v_elem_offset(page_idx, head_idx, entry_idx, tx * vec_size),
       value + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
 }
 
@@ -124,11 +124,11 @@ __global__ void AppendPagedKVCachePrefillKernel(paged_kv_t<DType, IdType> paged_
     size_t entry_idx = page_seq_idx % paged_kv.page_size;
 
     vec_t<DType, vec_size>::memcpy(
-        paged_kv.data + paged_kv.get_k_offset(page_idx, head_idx, entry_idx, tx * vec_size),
+        paged_kv.data + paged_kv.get_k_elem_offset(page_idx, head_idx, entry_idx, tx * vec_size),
         key + ((append_indptr[batch_idx] + j) * num_heads + head_idx) * head_dim + tx * vec_size);
 
     vec_t<DType, vec_size>::memcpy(
-        paged_kv.data + paged_kv.get_v_offset(page_idx, head_idx, entry_idx, tx * vec_size),
+        paged_kv.data + paged_kv.get_v_elem_offset(page_idx, head_idx, entry_idx, tx * vec_size),
         value + ((append_indptr[batch_idx] + j) * num_heads + head_idx) * head_dim + tx * vec_size);
   }
 }

@@ -1,7 +1,7 @@
 #include <thrust/device_vector.h>
 
 #include <cstdint>
-#include <flashinfer.cuh>
+#include <flashinfer/decode.cuh>
 #include <nvbench/nvbench.cuh>
 #include <vector>
 
@@ -37,8 +37,7 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
   thrust::device_vector<int32_t> kv_indptr(kv_indptr_host);
   thrust::device_vector<int32_t> kv_indices(kv_indicies_host);
   thrust::device_vector<int32_t> kv_last_page_offset(kv_last_page_offset_host);
-  flashinfer::paged_kv_t<T, int32_t> paged_kv(0,  // NOTE(lqchen): num_pages is unused.
-                                              num_layers, layer_idx, num_heads, page_size, head_dim,
+  flashinfer::paged_kv_t<T, int32_t> paged_kv(num_layers, layer_idx, num_heads, page_size, head_dim,
                                               batch_size, thrust::raw_pointer_cast(kv_data.data()),
                                               thrust::raw_pointer_cast(kv_indptr.data()),
                                               thrust::raw_pointer_cast(kv_indices.data()),
