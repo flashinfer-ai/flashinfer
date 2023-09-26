@@ -9,13 +9,13 @@
 #include <iostream>
 #include <random>
 
+#include "cp_async.cuh"
 #include "layout.cuh"
 #include "mma.cuh"
 #include "permuted_smem.cuh"
 #include "rope.cuh"
 #include "state.cuh"
 #include "utils.cuh"
-#include "cp_async.cuh"
 
 namespace flashinfer {
 
@@ -60,9 +60,9 @@ __device__ __forceinline__ void apply_llama_rope(T *x_first_half, T *x_second_ha
 
 template <size_t num_frags_y, size_t num_frags_z, size_t num_warps, size_t stride, QKVLayout layout,
           typename T>
-__device__ __forceinline__ void produce_kv(
-    permuted_smem_t<stride, T> *smem, T *gmem, const tensor_info_t<layout> &qkv_info,
-    size_t kv_idx_base, size_t kv_len, size_t head_idx) {
+__device__ __forceinline__ void produce_kv(permuted_smem_t<stride, T> *smem, T *gmem,
+                                           const tensor_info_t<layout> &qkv_info,
+                                           size_t kv_idx_base, size_t kv_len, size_t head_idx) {
   size_t tx = threadIdx.x, ty = threadIdx.y;
   auto block = cg::this_thread_block();
 #pragma unroll
@@ -70,181 +70,10 @@ __device__ __forceinline__ void produce_kv(
     size_t i = 8 * ((step * num_warps + ty) / (num_frags_y / 2)) + tx / 4,
            j = ((step * num_warps + ty) % (num_frags_y / 2)) * 4 + tx % 4;
     size_t kv_idx = kv_idx_base + i, feat_idx = j * bank_capacity<T>();
-    smem->load_bank_async(i, j, gmem + qkv_info.get_kv_elem_offset(kv_idx, head_idx, feat_idx), kv_idx < kv_len);
+    smem->load_bank_async(i, j, gmem + qkv_info.get_kv_elem_offset(kv_idx, head_idx, feat_idx),
+                          kv_idx < kv_len);
   }
   block.sync();
-  cp_async::commit_group();
-}
-
-template <RotaryMode rotary_mode, size_t num_frags_x, size_t num_frags_y, size_t num_frags_z,
-          size_t num_warps, size_t stride, typename T>
-__device__ __forceinline__ void consume_k(
-    uint32_t q_frag[][num_frags_y][4], uint32_t kv_frag[][num_frags_z][4],
-    float x_frag[][num_frags_z][8], uint32_t att_frag[][num_frags_z][4], float m[][2], float d[][2],
-    float o_scale[][2], float rope_freq[][4], permuted_smem_t<stride, T> *k_smem,
-    size_t kv_idx_base, size_t q_len, size_t kv_len, float sm_scale) {
-  auto block = cg::this_thread_block();
-  constexpr size_t rows_per_warp = num_frags_x * mma::frag_size;
-  size_t tx = threadIdx.x, ty = threadIdx.y;
-  size_t bx = blockIdx.x;
-
-  // init x_frag with 0
-#pragma unroll
-  for (size_t fx = 0; fx < num_frags_x; ++fx) {
-#pragma unroll
-    for (size_t fz = 0; fz < num_frags_z; ++fz) {
-#pragma unroll
-      for (size_t reg_id = 0; reg_id < 8; ++reg_id) {
-        x_frag[fx][fz][reg_id] = 0.f;
-      }
-    }
-  }
-
-  // load k tile from smem to reg
-#pragma unroll
-  for (size_t fy = 0; fy < num_frags_y; ++fy) {
-#pragma unroll
-    for (size_t fz = 0; fz < num_frags_z; ++fz) {
-      size_t i = mma::frag_size * fz + 8 * (tx / 16) + tx % 8, j = fy * 2 + (tx % 16) / 8;
-      k_smem->ldmatrix_m8n8x4(kv_frag[fy][fz], i, j);
-    }
-  }
-  if constexpr (rotary_mode == RotaryMode::kLlama) {
-    // apply rotary embedding
-#pragma unroll
-    for (size_t fyi = 0; fyi < num_frags_y / 2; ++fyi) {
-#pragma unroll
-      for (size_t fz = 0; fz < num_frags_z; ++fz) {
-        size_t kv_idx = kv_idx_base + fz * mma::frag_size + tx / 4;
-        apply_llama_rope<false, T>((T *)kv_frag[fyi][fz], (T *)kv_frag[fyi + num_frags_y / 2][fz],
-                                   rope_freq[fyi], rope_freq[fyi + num_frags_y / 2], kv_idx);
-      }
-    }
-  }
-  block.sync();
-
-  // compute q*k^T
-#pragma unroll
-  for (size_t fx = 0; fx < num_frags_x; ++fx) {
-#pragma unroll
-    for (size_t fy = 0; fy < num_frags_y; ++fy) {
-#pragma unroll
-      for (size_t fz = 0; fz < num_frags_z; ++fz) {
-        mma::mma_sync_m16n16k16_row_col_f16f16f32<T>(x_frag[fx][fz], q_frag[fx][fy],
-                                                     kv_frag[fy][fz]);
-      }
-    }
-  }
-  block.sync();
-
-  // multiply sm_scale and apply mask
-#pragma unroll
-  for (size_t fx = 0; fx < num_frags_x; ++fx) {
-#pragma unroll
-    for (size_t fz = 0; fz < num_frags_z; ++fz) {
-#pragma unroll
-      for (size_t reg_id = 0; reg_id < 8; ++reg_id) {
-        size_t q_idx = (bx * num_warps + ty) * rows_per_warp + fx * mma::frag_size +
-                       8 * ((reg_id % 4) / 2) + tx / 4,
-               kv_idx =
-                   kv_idx_base + fz * mma::frag_size + 8 * (reg_id / 4) + 2 * (tx % 4) + reg_id % 2;
-        bool predicate = (q_idx - q_len < kv_idx - kv_len || q_idx >= q_len || kv_idx >= kv_len);
-        x_frag[fx][fz][reg_id] = predicate ? -5e4 : x_frag[fx][fz][reg_id] * sm_scale;
-      }
-    }
-  }
-
-  // compute m,d states in online softmax
-  cg::thread_block_tile g = cg::tiled_partition<4>(block);
-#pragma unroll
-  for (size_t fx = 0; fx < num_frags_x; ++fx) {
-#pragma unroll
-    for (size_t j = 0; j < 2; ++j) {
-      o_scale[fx][j] = 0.f;
-#pragma unroll
-      for (size_t fz = 0; fz < num_frags_z; ++fz) {
-        float m_local = max(max(x_frag[fx][fz][j * 2 + 0], x_frag[fx][fz][j * 2 + 1]),
-                            max(x_frag[fx][fz][j * 2 + 4], x_frag[fx][fz][j * 2 + 5]));
-        float d_local = __expf(x_frag[fx][fz][j * 2 + 0] - m_local) +
-                        __expf(x_frag[fx][fz][j * 2 + 1] - m_local) +
-                        __expf(x_frag[fx][fz][j * 2 + 4] - m_local) +
-                        __expf(x_frag[fx][fz][j * 2 + 5] - m_local);
-#pragma unroll
-        for (size_t offset = 2; offset > 0; offset /= 2) {
-          merge_md(m_local, d_local, g.shfl_down(m_local, offset), g.shfl_down(d_local, offset));
-        }
-        m_local = g.shfl(m_local, 0);
-        d_local = g.shfl(d_local, 0);
-        float m_prev = m[fx][j], d_prev = d[fx][j];
-        merge_md(m[fx][j], d[fx][j], m_local, d_local);
-        o_scale[fx][j] += (m_prev + __logf(d_prev)) - (m[fx][j] + __logf(d[fx][j]));
-      }
-      o_scale[fx][j] = __expf(o_scale[fx][j]);
-    }
-  }
-  block.sync();
-
-  // compute att_frag
-#pragma unroll
-  for (size_t fx = 0; fx < num_frags_x; ++fx) {
-#pragma unroll
-    for (size_t fz = 0; fz < num_frags_z; ++fz) {
-#pragma unroll
-      for (size_t reg_id = 0; reg_id < 4; ++reg_id) {
-        vec_t<T, 2> tmp;
-#pragma unroll
-        for (size_t j = 0; j < 2; ++j) {
-          tmp[j] = __expf(x_frag[fx][fz][reg_id * 2 + j] - m[fx][reg_id % 2]) / d[fx][reg_id % 2];
-        }
-        tmp.store((T *)&att_frag[fx][fz][reg_id]);
-      }
-    }
-  }
-  block.sync();
-}
-
-template <size_t num_frags_x, size_t num_frags_y, size_t num_frags_z, size_t stride, typename T>
-__device__ __forceinline__ void consume_v(
-    uint32_t kv_frag[][num_frags_z][4], uint32_t att_frag[][num_frags_z][4],
-    float o_frag[][num_frags_y][8], float o_scale[][2], permuted_smem_t<stride, T> *v_smem) {
-  auto block = cg::this_thread_block();
-  size_t tx = threadIdx.x, ty = threadIdx.y;
-
-  // load v tile from smem to reg
-#pragma unroll
-  for (size_t fy = 0; fy < num_frags_y; ++fy) {
-#pragma unroll
-    for (size_t fz = 0; fz < num_frags_z; ++fz) {
-      size_t i = mma::frag_size * fz + tx % 16, j = fy * 2 + tx / 16;
-      v_smem->ldmatrix_m8n8x4_trans(kv_frag[fy][fz], i, j);
-    }
-  }
-
-  // scale o_frag
-#pragma unroll
-  for (size_t fx = 0; fx < num_frags_x; ++fx) {
-#pragma unroll
-    for (size_t fy = 0; fy < num_frags_y; ++fy) {
-#pragma unroll
-      for (size_t reg_id = 0; reg_id < 8; ++reg_id) {
-        o_frag[fx][fy][reg_id] *= o_scale[fx][(reg_id % 4) / 2];
-      }
-    }
-  }
-  block.sync();
-
-  // compute sfm*v
-#pragma unroll
-  for (size_t fx = 0; fx < num_frags_x; ++fx) {
-#pragma unroll
-    for (size_t fy = 0; fy < num_frags_y; ++fy) {
-#pragma unroll
-      for (size_t fz = 0; fz < num_frags_z; ++fz) {
-        mma::mma_sync_m16n16k16_row_col_f16f16f32<T>(o_frag[fx][fy], att_frag[fx][fz],
-                                                     kv_frag[fy][fz]);
-      }
-    }
-  }
 }
 
 template <QKVLayout layout, RotaryMode rotary_mode, size_t num_frags_x, size_t num_frags_y,
@@ -337,38 +166,185 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     v_smem[i].base = (DTypeIn *)(smem + (num_stages_smem + i) * num_frags_z * mma::frag_size *
                                             head_dim * sizeof(DTypeIn));
   }
+
+  size_t producer_kv_idx_base = 0, copy_stage_idx = 0;
   for (size_t iter = 0; iter < num_stages_smem - 1; ++iter) {
     produce_kv<num_frags_y, num_frags_z, num_warps>(k_smem + iter, k, qkv_info,
-                                                    iter * (mma::frag_size * num_frags_z), kv_len,
-                                                    head_idx);
+                                                    producer_kv_idx_base, kv_len, head_idx);
     produce_kv<num_frags_y, num_frags_z, num_warps>(v_smem + iter, v, qkv_info,
-                                                    iter * (mma::frag_size * num_frags_z), kv_len,
-                                                    head_idx);
+                                                    producer_kv_idx_base, kv_len, head_idx);
+
+    cp_async::commit_group();
+    producer_kv_idx_base += mma::frag_size * num_frags_z;
+    copy_stage_idx += 1;
   }
 
-  size_t copy_stage_idx = num_stages_smem - 1, compute_stage_idx = 0;
-  size_t producer_kv_idx_base = (num_stages_smem - 1) * (mma::frag_size * num_frags_z);
-  size_t consumer_kv_idx_base = 0;
-
+  size_t consumer_kv_idx_base = 0, compute_stage_idx = 0;
 #pragma unroll 4
-  for (size_t iter = 0; iter < (kv_len + (mma::frag_size * num_frags_z - 1)) / (mma::frag_size * num_frags_z); ++iter) {
+  for (size_t iter = 0;
+       iter < (kv_len + (mma::frag_size * num_frags_z - 1)) / (mma::frag_size * num_frags_z);
+       ++iter) {
     produce_kv<num_frags_y, num_frags_z, num_warps>(k_smem + copy_stage_idx, k, qkv_info,
                                                     producer_kv_idx_base, kv_len, head_idx);
-    cp_async::wait_group<2 * num_stages_smem - 1>();
-    consume_k<rotary_mode, num_frags_x, num_frags_y, num_frags_z, num_warps>(
-        q_frag, kv_frag, x_frag, att_frag, m, d, o_scale, rope_freq, k_smem + compute_stage_idx,
-        consumer_kv_idx_base, q_len, kv_len, sm_scale);
     produce_kv<num_frags_y, num_frags_z, num_warps>(v_smem + copy_stage_idx, v, qkv_info,
                                                     producer_kv_idx_base, kv_len, head_idx);
-    cp_async::wait_group<2 * num_stages_smem - 1>();
-    consume_v<num_frags_x, num_frags_y, num_frags_z>(kv_frag, att_frag, o_frag, o_scale,
-                                                     v_smem + compute_stage_idx);
+    cp_async::commit_group();
+    cp_async::wait_group<num_stages_smem - 1>();
+    block.sync();
+    // init x_frag with 0
+#pragma unroll
+    for (size_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+      for (size_t fz = 0; fz < num_frags_z; ++fz) {
+#pragma unroll
+        for (size_t reg_id = 0; reg_id < 8; ++reg_id) {
+          x_frag[fx][fz][reg_id] = 0.f;
+        }
+      }
+    }
+
+    // load k tile from smem to reg
+#pragma unroll
+    for (size_t fy = 0; fy < num_frags_y; ++fy) {
+#pragma unroll
+      for (size_t fz = 0; fz < num_frags_z; ++fz) {
+        size_t i = mma::frag_size * fz + 8 * (tx / 16) + tx % 8, j = fy * 2 + (tx % 16) / 8;
+        k_smem[compute_stage_idx].ldmatrix_m8n8x4(kv_frag[fy][fz], i, j);
+      }
+    }
+    if constexpr (rotary_mode == RotaryMode::kLlama) {
+      // apply rotary embedding
+#pragma unroll
+      for (size_t fyi = 0; fyi < num_frags_y / 2; ++fyi) {
+#pragma unroll
+        for (size_t fz = 0; fz < num_frags_z; ++fz) {
+          size_t kv_idx = consumer_kv_idx_base + fz * mma::frag_size + tx / 4;
+          apply_llama_rope<false, DTypeIn>(
+              (DTypeIn *)kv_frag[fyi][fz], (DTypeIn *)kv_frag[fyi + num_frags_y / 2][fz],
+              rope_freq[fyi], rope_freq[fyi + num_frags_y / 2], kv_idx);
+        }
+      }
+    }
+    block.sync();
+
+    // compute q*k^T
+#pragma unroll
+    for (size_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+      for (size_t fy = 0; fy < num_frags_y; ++fy) {
+#pragma unroll
+        for (size_t fz = 0; fz < num_frags_z; ++fz) {
+          mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(x_frag[fx][fz], q_frag[fx][fy],
+                                                             kv_frag[fy][fz]);
+        }
+      }
+    }
+    block.sync();
+
+    // multiply sm_scale and apply mask
+#pragma unroll
+    for (size_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+      for (size_t fz = 0; fz < num_frags_z; ++fz) {
+#pragma unroll
+        for (size_t reg_id = 0; reg_id < 8; ++reg_id) {
+          size_t q_idx = (bx * num_warps + ty) * rows_per_warp + fx * mma::frag_size +
+                         8 * ((reg_id % 4) / 2) + tx / 4,
+                 kv_idx = consumer_kv_idx_base + fz * mma::frag_size + 8 * (reg_id / 4) +
+                          2 * (tx % 4) + reg_id % 2;
+          bool predicate = (q_idx - q_len < kv_idx - kv_len || q_idx >= q_len || kv_idx >= kv_len);
+          x_frag[fx][fz][reg_id] = predicate ? -5e4 : x_frag[fx][fz][reg_id] * sm_scale;
+        }
+      }
+    }
+
+    // compute m,d states in online softmax
+    cg::thread_block_tile g = cg::tiled_partition<4>(block);
+#pragma unroll
+    for (size_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+      for (size_t j = 0; j < 2; ++j) {
+        o_scale[fx][j] = 0.f;
+#pragma unroll
+        for (size_t fz = 0; fz < num_frags_z; ++fz) {
+          float m_local = max(max(x_frag[fx][fz][j * 2 + 0], x_frag[fx][fz][j * 2 + 1]),
+                              max(x_frag[fx][fz][j * 2 + 4], x_frag[fx][fz][j * 2 + 5]));
+          float d_local = __expf(x_frag[fx][fz][j * 2 + 0] - m_local) +
+                          __expf(x_frag[fx][fz][j * 2 + 1] - m_local) +
+                          __expf(x_frag[fx][fz][j * 2 + 4] - m_local) +
+                          __expf(x_frag[fx][fz][j * 2 + 5] - m_local);
+#pragma unroll
+          for (size_t offset = 2; offset > 0; offset /= 2) {
+            merge_md(m_local, d_local, g.shfl_down(m_local, offset), g.shfl_down(d_local, offset));
+          }
+          m_local = g.shfl(m_local, 0);
+          d_local = g.shfl(d_local, 0);
+          float m_prev = m[fx][j], d_prev = d[fx][j];
+          merge_md(m[fx][j], d[fx][j], m_local, d_local);
+          o_scale[fx][j] += (m_prev + __logf(d_prev)) - (m[fx][j] + __logf(d[fx][j]));
+        }
+        o_scale[fx][j] = __expf(o_scale[fx][j]);
+      }
+    }
+    block.sync();
+
+    // compute att_frag
+#pragma unroll
+    for (size_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+      for (size_t fz = 0; fz < num_frags_z; ++fz) {
+#pragma unroll
+        for (size_t reg_id = 0; reg_id < 4; ++reg_id) {
+          vec_t<DTypeIn, 2> tmp;
+#pragma unroll
+          for (size_t j = 0; j < 2; ++j) {
+            tmp[j] = __expf(x_frag[fx][fz][reg_id * 2 + j] - m[fx][reg_id % 2]) / d[fx][reg_id % 2];
+          }
+          tmp.store((DTypeIn *)&att_frag[fx][fz][reg_id]);
+        }
+      }
+    }
+    // load v tile from smem to reg
+#pragma unroll
+    for (size_t fy = 0; fy < num_frags_y; ++fy) {
+#pragma unroll
+      for (size_t fz = 0; fz < num_frags_z; ++fz) {
+        size_t i = mma::frag_size * fz + tx % 16, j = fy * 2 + tx / 16;
+        v_smem[compute_stage_idx].ldmatrix_m8n8x4_trans(kv_frag[fy][fz], i, j);
+      }
+    }
+
+    // scale o_frag
+#pragma unroll
+    for (size_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+      for (size_t fy = 0; fy < num_frags_y; ++fy) {
+#pragma unroll
+        for (size_t reg_id = 0; reg_id < 8; ++reg_id) {
+          o_frag[fx][fy][reg_id] *= o_scale[fx][(reg_id % 4) / 2];
+        }
+      }
+    }
+    block.sync();
+
+    // compute sfm*v
+#pragma unroll
+    for (size_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+      for (size_t fy = 0; fy < num_frags_y; ++fy) {
+#pragma unroll
+        for (size_t fz = 0; fz < num_frags_z; ++fz) {
+          mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(o_frag[fx][fy], att_frag[fx][fz],
+                                                             kv_frag[fy][fz]);
+        }
+      }
+    }
+    block.sync();
     copy_stage_idx = (copy_stage_idx + 1) % num_stages_smem;
     compute_stage_idx = (compute_stage_idx + 1) % num_stages_smem;
     producer_kv_idx_base += mma::frag_size * num_frags_z;
     consumer_kv_idx_base += mma::frag_size * num_frags_z;
   }
-  block.sync();
 
   // write back
   // NOTE(Zihao): suboptimal, will optimize later
