@@ -8,6 +8,7 @@
 #include <cuda/pipeline>
 
 #include "mma.cuh"
+#include "cp_async.cuh"
 
 namespace flashinfer {
 
@@ -54,11 +55,11 @@ __device__ __forceinline__ void load_bank(T *smem_base, size_t is, size_t js, co
   *get_smem_ptr<stride>(smem_base, is, js) = *reinterpret_cast<const bank_t *>(gptr);
 }
 
-template <size_t stride, cuda::thread_scope Scope, typename T>
-__device__ __forceinline__ void load_bank_async(T *smem_base, size_t is, size_t js, const T *gptr,
-                                                cuda::pipeline<Scope> &pipe) {
+template <size_t stride, typename T>
+__device__ __forceinline__ void load_bank_async(T *smem_base, size_t is, size_t js, const T *gptr, bool predicate) {
   bank_t *smem_ptr = get_smem_ptr<stride>(smem_base, is, js);
-  cuda::memcpy_async(smem_ptr, gptr, cuda::aligned_size_t<alignof(bank_t)>(sizeof(bank_t)), pipe);
+  cp_async::pred_load_128(smem_ptr, reinterpret_cast<const bank_t *>(gptr), predicate);
+
 }
 
 }  // namespace permuted_smem_impl
@@ -80,10 +81,8 @@ struct permuted_smem_t {
   __device__ __forceinline__ void load_bank(size_t is, size_t js, const T *gptr) {
     permuted_smem_impl::load_bank<stride>(base, is, js, gptr);
   }
-  template <cuda::thread_scope Scope>
-  __device__ __forceinline__ void load_bank_async(size_t is, size_t js, const T *gptr,
-                                                  cuda::pipeline<Scope> &pipe) {
-    permuted_smem_impl::load_bank_async<stride>(base, is, js, gptr, pipe);
+  __device__ __forceinline__ void load_bank_async(size_t is, size_t js, const T *gptr, bool predicate) {
+    permuted_smem_impl::load_bank_async<stride>(base, is, js, gptr, predicate);
   }
 };
 

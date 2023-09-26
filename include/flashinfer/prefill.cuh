@@ -6,7 +6,6 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
-#include <cuda/pipeline>
 #include <iostream>
 #include <random>
 
@@ -16,6 +15,7 @@
 #include "rope.cuh"
 #include "state.cuh"
 #include "utils.cuh"
+#include "cp_async.cuh"
 
 namespace flashinfer {
 
@@ -62,22 +62,18 @@ template <size_t num_frags_y, size_t num_frags_z, size_t num_warps, size_t strid
           typename T>
 __device__ __forceinline__ void produce_kv(
     permuted_smem_t<stride, T> *smem, T *gmem, const tensor_info_t<layout> &qkv_info,
-    size_t kv_idx_base, size_t kv_len, size_t head_idx,
-    cuda::pipeline<cuda::thread_scope::thread_scope_thread> *pipe) {
+    size_t kv_idx_base, size_t kv_len, size_t head_idx) {
   size_t tx = threadIdx.x, ty = threadIdx.y;
   auto block = cg::this_thread_block();
-  pipe->producer_acquire();
 #pragma unroll
   for (size_t step = 0; step < num_frags_z * num_frags_y / num_warps; ++step) {
     size_t i = 8 * ((step * num_warps + ty) / (num_frags_y / 2)) + tx / 4,
            j = ((step * num_warps + ty) % (num_frags_y / 2)) * 4 + tx % 4;
     size_t kv_idx = kv_idx_base + i, feat_idx = j * bank_capacity<T>();
-    if (kv_idx < kv_len) {
-      smem->load_bank(i, j, gmem + qkv_info.get_kv_elem_offset(kv_idx, head_idx, feat_idx));
-    }
+    smem->load_bank_async(i, j, gmem + qkv_info.get_kv_elem_offset(kv_idx, head_idx, feat_idx), kv_idx < kv_len);
   }
   block.sync();
-  pipe->producer_commit();
+  cp_async::commit_group();
 }
 
 template <RotaryMode rotary_mode, size_t num_frags_x, size_t num_frags_y, size_t num_frags_z,
@@ -86,14 +82,12 @@ __device__ __forceinline__ void consume_k(
     uint32_t q_frag[][num_frags_y][4], uint32_t kv_frag[][num_frags_z][4],
     float x_frag[][num_frags_z][8], uint32_t att_frag[][num_frags_z][4], float m[][2], float d[][2],
     float o_scale[][2], float rope_freq[][4], permuted_smem_t<stride, T> *k_smem,
-    size_t kv_idx_base, size_t q_len, size_t kv_len, float sm_scale,
-    cuda::pipeline<cuda::thread_scope::thread_scope_thread> *pipe) {
+    size_t kv_idx_base, size_t q_len, size_t kv_len, float sm_scale) {
   auto block = cg::this_thread_block();
   constexpr size_t rows_per_warp = num_frags_x * mma::frag_size;
   size_t tx = threadIdx.x, ty = threadIdx.y;
   size_t bx = blockIdx.x;
 
-  pipe->consumer_wait();
   // init x_frag with 0
 #pragma unroll
   for (size_t fx = 0; fx < num_frags_x; ++fx) {
@@ -207,18 +201,15 @@ __device__ __forceinline__ void consume_k(
     }
   }
   block.sync();
-  pipe->consumer_release();
 }
 
 template <size_t num_frags_x, size_t num_frags_y, size_t num_frags_z, size_t stride, typename T>
 __device__ __forceinline__ void consume_v(
     uint32_t kv_frag[][num_frags_z][4], uint32_t att_frag[][num_frags_z][4],
-    float o_frag[][num_frags_y][8], float o_scale[][2], permuted_smem_t<stride, T> *v_smem,
-    cuda::pipeline<cuda::thread_scope::thread_scope_thread> *pipe) {
+    float o_frag[][num_frags_y][8], float o_scale[][2], permuted_smem_t<stride, T> *v_smem) {
   auto block = cg::this_thread_block();
   size_t tx = threadIdx.x, ty = threadIdx.y;
 
-  pipe->consumer_wait();
   // load v tile from smem to reg
 #pragma unroll
   for (size_t fy = 0; fy < num_frags_y; ++fy) {
@@ -254,7 +245,6 @@ __device__ __forceinline__ void consume_v(
       }
     }
   }
-  pipe->consumer_wait();
 }
 
 template <QKVLayout layout, RotaryMode rotary_mode, size_t num_frags_x, size_t num_frags_y,
@@ -347,15 +337,13 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     v_smem[i].base = (DTypeIn *)(smem + (num_stages_smem + i) * num_frags_z * mma::frag_size *
                                             head_dim * sizeof(DTypeIn));
   }
-  auto pipe = cuda::make_pipeline();
-  size_t batch = 0;
-  for (batch = 0; batch < num_stages_smem - 1; ++batch) {
-    produce_kv<num_frags_y, num_frags_z, num_warps>(k_smem + batch, k, qkv_info,
-                                                    batch * (mma::frag_size * num_frags_z), kv_len,
-                                                    head_idx, &pipe);
-    produce_kv<num_frags_y, num_frags_z, num_warps>(v_smem + batch, v, qkv_info,
-                                                    batch * (mma::frag_size * num_frags_z), kv_len,
-                                                    head_idx, &pipe);
+  for (size_t iter = 0; iter < num_stages_smem - 1; ++iter) {
+    produce_kv<num_frags_y, num_frags_z, num_warps>(k_smem + iter, k, qkv_info,
+                                                    iter * (mma::frag_size * num_frags_z), kv_len,
+                                                    head_idx);
+    produce_kv<num_frags_y, num_frags_z, num_warps>(v_smem + iter, v, qkv_info,
+                                                    iter * (mma::frag_size * num_frags_z), kv_len,
+                                                    head_idx);
   }
 
   size_t copy_stage_idx = num_stages_smem - 1, compute_stage_idx = 0;
@@ -363,30 +351,22 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   size_t consumer_kv_idx_base = 0;
 
 #pragma unroll 4
-  for (batch = num_stages_smem - 1;
-       batch < (kv_len + (mma::frag_size * num_frags_z - 1)) / (mma::frag_size * num_frags_z);
-       ++batch) {
+  for (size_t iter = 0; iter < (kv_len + (mma::frag_size * num_frags_z - 1)) / (mma::frag_size * num_frags_z); ++iter) {
     produce_kv<num_frags_y, num_frags_z, num_warps>(k_smem + copy_stage_idx, k, qkv_info,
-                                                    producer_kv_idx_base, kv_len, head_idx, &pipe);
+                                                    producer_kv_idx_base, kv_len, head_idx);
+    cp_async::wait_group<2 * num_stages_smem - 1>();
     consume_k<rotary_mode, num_frags_x, num_frags_y, num_frags_z, num_warps>(
         q_frag, kv_frag, x_frag, att_frag, m, d, o_scale, rope_freq, k_smem + compute_stage_idx,
-        consumer_kv_idx_base, q_len, kv_len, sm_scale, &pipe);
+        consumer_kv_idx_base, q_len, kv_len, sm_scale);
     produce_kv<num_frags_y, num_frags_z, num_warps>(v_smem + copy_stage_idx, v, qkv_info,
-                                                    producer_kv_idx_base, kv_len, head_idx, &pipe);
+                                                    producer_kv_idx_base, kv_len, head_idx);
+    cp_async::wait_group<2 * num_stages_smem - 1>();
     consume_v<num_frags_x, num_frags_y, num_frags_z>(kv_frag, att_frag, o_frag, o_scale,
-                                                     v_smem + compute_stage_idx, &pipe);
+                                                     v_smem + compute_stage_idx);
     copy_stage_idx = (copy_stage_idx + 1) % num_stages_smem;
     compute_stage_idx = (compute_stage_idx + 1) % num_stages_smem;
     producer_kv_idx_base += mma::frag_size * num_frags_z;
     consumer_kv_idx_base += mma::frag_size * num_frags_z;
-  }
-
-  for (batch = 0; batch < num_stages_smem - 1; ++batch) {
-    consume_k<rotary_mode, num_frags_x, num_frags_y, num_frags_z, num_warps>(
-        q_frag, kv_frag, x_frag, att_frag, m, d, o_scale, rope_freq, k_smem + compute_stage_idx,
-        consumer_kv_idx_base, q_len, kv_len, sm_scale, &pipe);
-    consume_v<num_frags_x, num_frags_y, num_frags_z>(kv_frag, att_frag, o_frag, o_scale,
-                                                     v_smem + compute_stage_idx, &pipe);
   }
   block.sync();
 
@@ -430,7 +410,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOu
             constexpr size_t num_frags_y = HEAD_DIM / mma::frag_size;
             constexpr size_t num_frags_z = 2;
             constexpr size_t num_warps = 8UL;
-            constexpr size_t num_stages_smem = 2;
+            constexpr size_t num_stages_smem = 4;
             constexpr size_t num_rows_per_cta = num_warps * num_frags_x * mma::frag_size;
             auto kernel = SinglePrefillWithKVCacheKernel<LAYOUT, ROTARY_MODE, num_frags_x,
                                                          num_frags_y, num_frags_z, num_stages_smem,
