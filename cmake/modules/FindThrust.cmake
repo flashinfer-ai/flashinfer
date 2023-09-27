@@ -52,10 +52,9 @@ if( THRUST_INCLUDE_DIR )
     "${version}"
     )
   
-  string( REGEX MATCH "^[0-9]" major ${version} )
-  string( REGEX REPLACE "^${major}00" "" version "${version}" )
-  string( REGEX MATCH "^[0-9]" minor ${version} )
-  string( REGEX REPLACE "^${minor}0" "" version "${version}" )
+  math(EXPR major "${version} / 100000")
+  math(EXPR minor "(${version} / 100) % 1000")
+  math(EXPR version "${version} % 100")
   set( THRUST_VERSION "${major}.${minor}.${version}")
   set( THRUST_MAJOR_VERSION "${major}")
   set( THRUST_MINOR_VERSION "${minor}")
