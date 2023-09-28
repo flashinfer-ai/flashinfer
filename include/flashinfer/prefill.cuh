@@ -84,12 +84,13 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
                                                float *__restrict__ tmp,
                                                tensor_info_t<layout> qkv_info, float sm_scale,
                                                float rope_inv_scale, float rope_inv_theta) {
-  size_t q_len = qkv_info.q_len;
+  size_t qo_len = qkv_info.qo_len;
   size_t kv_len = qkv_info.kv_len;
   size_t tx = threadIdx.x, ty = threadIdx.y;
   size_t bx = blockIdx.x, head_idx = blockIdx.y;
   size_t num_heads = gridDim.y;
   auto block = cg::this_thread_block();
+  cg::thread_block_tile g = cg::tiled_partition<4>(block);
 
   constexpr size_t rows_per_warp = num_frags_x * mma::frag_size;
   constexpr size_t head_dim = num_frags_y * mma::frag_size;
@@ -132,10 +133,10 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
       // load q fragment from gmem to smem
       size_t feat_idx = (fyo * 4 + tx % 4) * bank_capacity<DTypeIn>();
       size_t i = ty * mma::frag_size + tx / 4, j = tx % 4;
-      if (q_idx < q_len) {
+      if (q_idx < qo_len) {
         q_smem.load_bank(i, j, q + qkv_info.get_qo_elem_offset(q_idx, head_idx, feat_idx));
       }
-      if (q_idx + 8 < q_len) {
+      if (q_idx + 8 < qo_len) {
         q_smem.load_bank(i + 8, j, q + qkv_info.get_qo_elem_offset(q_idx + 8, head_idx, feat_idx));
       }
       // load q fragment from smem to reg
@@ -151,7 +152,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
       for (size_t fyi = 0; fyi < num_frags_y / 2; ++fyi) {
         apply_llama_rope<true, DTypeIn>(
             (DTypeIn *)q_frag[fx][fyi], (DTypeIn *)q_frag[fx][fyi + num_frags_y / 2],
-            rope_freq[fyi], rope_freq[fyi + num_frags_y / 2], q_idx + (kv_len - q_len));
+            rope_freq[fyi], rope_freq[fyi + num_frags_y / 2], q_idx + (kv_len - qo_len));
       }
     }
   }
@@ -252,14 +253,14 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
                          8 * ((reg_id % 4) / 2) + tx / 4,
                  kv_idx = consumer_kv_idx_base + fz * mma::frag_size + 8 * (reg_id / 4) +
                           2 * (tx % 4) + reg_id % 2;
-          bool predicate = (q_idx - q_len < kv_idx - kv_len || q_idx >= q_len || kv_idx >= kv_len);
+          bool predicate =
+              (q_idx - qo_len < kv_idx - kv_len || q_idx >= qo_len || kv_idx >= kv_len);
           x_frag[fx][fz][reg_id] = predicate ? -5e4 : x_frag[fx][fz][reg_id] * sm_scale;
         }
       }
     }
 
     // compute m,d states in online softmax
-    cg::thread_block_tile g = cg::tiled_partition<4>(block);
 #pragma unroll
     for (size_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
@@ -383,7 +384,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
         size_t i = ty * rows_per_warp + fx * mma::frag_size + tx % 16, j = fy * 2 + tx / 16;
         size_t o_idx = (bx * num_warps + ty) * rows_per_warp + fx * mma::frag_size + tx % 16,
                feat_idx = (fy * 2 + tx / 16) * bank_capacity<DTypeOut>();
-        if (o_idx < q_len) {
+        if (o_idx < qo_len) {
           o_smem.store_bank(i, j, o + qkv_info.get_qo_elem_offset(o_idx, head_idx, feat_idx));
         }
       }
@@ -395,8 +396,8 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
 
 template <typename DTypeIn, typename DTypeOut>
 cudaError_t SinglePrefillWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut *o, float *tmp,
-                                     size_t num_heads, size_t q_len, size_t kv_len, size_t head_dim,
-                                     QKVLayout layout = QKVLayout::kNHD,
+                                     size_t num_heads, size_t qo_len, size_t kv_len,
+                                     size_t head_dim, QKVLayout layout = QKVLayout::kNHD,
                                      RotaryMode rotary_mode = RotaryMode::kNone,
                                      float rope_scale = 1.f, float rope_theta = 1e4,
                                      cudaStream_t stream = nullptr) {
@@ -417,11 +418,11 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOu
             auto kernel = SinglePrefillWithKVCacheKernel<LAYOUT, ROTARY_MODE, num_frags_x,
                                                          num_frags_y, num_frags_z, num_stages_smem,
                                                          num_warps, DTypeIn, DTypeOut>;
-            dim3 nblks((q_len + (num_rows_per_cta - 1)) / (num_rows_per_cta), num_heads);
+            dim3 nblks((qo_len + (num_rows_per_cta - 1)) / (num_rows_per_cta), num_heads);
             dim3 nthrs(32, num_warps);
             size_t smem_size =
                 2 * num_stages_smem * num_frags_z * mma::frag_size * head_dim * sizeof(DTypeIn);
-            tensor_info_t<LAYOUT> qkv_info(q_len, kv_len, num_heads, HEAD_DIM);
+            tensor_info_t<LAYOUT> qkv_info(qo_len, kv_len, num_heads, HEAD_DIM);
             void *args[] = {(void *)&q,
                             (void *)&k,
                             (void *)&v,

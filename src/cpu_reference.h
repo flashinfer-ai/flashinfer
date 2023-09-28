@@ -29,25 +29,25 @@ inline std::vector<float> apply_llama_rope(const T* input, size_t D, size_t offs
 
 template <typename dtype_in, typename dtype_out>
 std::vector<dtype_out> single_mha(const std::vector<dtype_in>& q, const std::vector<dtype_in>& k,
-                                  const std::vector<dtype_in>& v, size_t q_len, size_t kv_len,
+                                  const std::vector<dtype_in>& v, size_t qo_len, size_t kv_len,
                                   size_t num_heads, size_t head_dim, QKVLayout layout,
                                   RotaryMode rotary_mode = RotaryMode::kNone,
                                   float rope_scale = 1.f, float rope_theta = 1e4) {
-  assert(q_len <= kv_len);
+  assert(qo_len <= kv_len);
   float sm_scale = 1.f / std::sqrt(float(head_dim));
-  std::vector<dtype_out> o(q_len * num_heads * head_dim);
+  std::vector<dtype_out> o(qo_len * num_heads * head_dim);
   std::vector<float> att(kv_len);
   std::vector<float> q_rotary_local(head_dim);
   std::vector<float> k_rotary_local(head_dim);
   SWITCH_LAYOUT(layout, LAYOUT, {
-    tensor_info_t<LAYOUT> qkv_info(q_len, kv_len, num_heads, head_dim);
+    tensor_info_t<LAYOUT> qkv_info(qo_len, kv_len, num_heads, head_dim);
     for (size_t head_idx = 0; head_idx < num_heads; ++head_idx) {
-      for (size_t q_idx = 0; q_idx < q_len; ++q_idx) {
+      for (size_t q_idx = 0; q_idx < qo_len; ++q_idx) {
         float max_val = -5e4;
         if (rotary_mode == RotaryMode::kLlama) {
           q_rotary_local = std::move(cpu_reference::apply_llama_rope(
               q.data() + qkv_info.get_qo_elem_offset(q_idx, head_idx, 0), head_dim,
-              q_idx + kv_len - q_len, rope_scale, rope_theta));
+              q_idx + kv_len - qo_len, rope_scale, rope_theta));
         }
         for (size_t kv_idx = 0; kv_idx < kv_len; ++kv_idx) {
           att[kv_idx] = 0.;
@@ -75,7 +75,7 @@ std::vector<dtype_out> single_mha(const std::vector<dtype_in>& q, const std::vec
             }
           }
           // apply mask
-          if (q_idx - q_len < kv_idx - kv_len) {
+          if (q_idx - qo_len < kv_idx - kv_len) {
             att[kv_idx] = -5e4;
           }
           max_val = std::max(max_val, att[kv_idx]);
