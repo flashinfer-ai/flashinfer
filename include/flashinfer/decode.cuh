@@ -10,6 +10,7 @@
 #include <iostream>
 #include <random>
 
+#include "cp_async.cuh"
 #include "layout.cuh"
 #include "page.cuh"
 #include "rope.cuh"
@@ -76,20 +77,18 @@ __device__ __forceinline__ vec_t<float, vec_size> apply_llama_rope(
  */
 template <RotaryMode rotary_mode, size_t vec_size, size_t bdx, typename T>
 __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec_size> &q_vec,
-                                           const vec_t<float, vec_size> &freq,
-                                           const size_t *kv_shared_offset, size_t kv_idx,
+                                           const vec_t<float, vec_size> &freq, size_t kv_idx,
                                            size_t compute_stage_idx, size_t num_heads,
                                            float sm_scale, float &x) {
   constexpr size_t head_dim = bdx * vec_size;
+  size_t tx = threadIdx.x;
   vec_t<float, vec_size> k_vec;
-  size_t tx = threadIdx.x, ty = threadIdx.y;
   if constexpr (rotary_mode == RotaryMode::kLlama) {
     // apply rotary embedding for all rows in k matrix of kv-cache
-    k_vec = apply_llama_rope<vec_size, bdx>(
-        smem + kv_shared_offset[compute_stage_idx] + ty * head_dim, freq, kv_idx);
+    k_vec = apply_llama_rope<vec_size, bdx>(smem, freq, kv_idx);
   } else {
     // do not apply rotary embedding
-    k_vec.cast_load(smem + kv_shared_offset[compute_stage_idx] + ty * head_dim + tx * vec_size);
+    k_vec.cast_load(smem + tx * vec_size);
   }
   x = 0.f;
 #pragma unroll
@@ -119,13 +118,12 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
  */
 template <size_t vec_size, size_t bdx, typename T>
 __device__ __forceinline__ void update_partial_state(const T *smem, const float x,
-                                                     const size_t *kv_shared_offset,
                                                      size_t compute_stage_idx, bool pred_guard,
                                                      state_t<vec_size> &s) {
   constexpr size_t head_dim = bdx * vec_size;
   vec_t<float, vec_size> v_vec;
   size_t tx = threadIdx.x, ty = threadIdx.y;
-  v_vec.cast_load(smem + kv_shared_offset[compute_stage_idx] + ty * head_dim + tx * vec_size);
+  v_vec.cast_load(smem + tx * vec_size);
   if (pred_guard) {
     s.merge(v_vec, x);
   }
@@ -198,7 +196,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   auto block = cg::this_thread_block();
   auto grid = cg::this_grid();
 
-  constexpr size_t stages_count = 4;
+  constexpr size_t num_stages_smem = 4;
   constexpr size_t head_dim = bdx * vec_size;
   size_t head_idx = blockIdx.y;
   size_t kv_chunk_idx = blockIdx.x;
@@ -207,8 +205,8 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   size_t seq_len = kv_info.kv_len;
 
   static_assert(bdx * bdy == 128);
-  static_assert(stages_count >= sizeof(float) / sizeof(DTypeIn));
-  __shared__ DTypeIn smem[stages_count * bdy * head_dim];
+  // static_assert(num_stages_smem >= sizeof(float) / sizeof(DTypeIn));
+  __shared__ DTypeIn smem[2 * num_stages_smem * bdy * head_dim];
   __shared__ float smem_md[2 * bdy];
 
   size_t tx = threadIdx.x, ty = threadIdx.y;
@@ -233,99 +231,59 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   kv_chunk_size = min(kv_chunk_size, seq_len - chunk_start);
   size_t chunk_end = chunk_start + kv_chunk_size;
 
-  // load k tiles and v tiles
-  size_t kv_shared_offset[stages_count] = {0U, 1U * bdy * head_dim, 2U * bdy * head_dim,
-                                           3U * bdy * head_dim};
+  // preload k tiles and v tiles
+  size_t producer_kv_idx_base = chunk_start + ty, copy_stage_idx = 0;
+  constexpr size_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
+#pragma unroll
+  for (size_t iter = 0; iter < num_stages_smem - 1; ++iter) {
+    size_t producer_kv_idx = producer_kv_idx_base;
+    cp_async::pred_load<vec_bits, true>(
+        smem + (copy_stage_idx * bdy + ty) * head_dim + tx * vec_size,
+        k + kv_info.get_kv_elem_offset(producer_kv_idx, head_idx, tx * vec_size),
+        producer_kv_idx < chunk_end);
+    cp_async::pred_load<vec_bits, true>(
+        smem + (num_stages_smem * bdy * head_dim) + (copy_stage_idx * bdy + ty) * head_dim +
+            tx * vec_size,
+        v + kv_info.get_kv_elem_offset(producer_kv_idx, head_idx, tx * vec_size),
+        producer_kv_idx < chunk_end);
+    cp_async::commit_group();
+    producer_kv_idx_base += bdy;
+    copy_stage_idx += 1;
+  }
 
   // pipelining k/v tiles loading and state updating
-  auto pipeline = cuda::make_pipeline();
-  const auto frag_shape = cuda::aligned_size_t<alignof(float4)>(sizeof(DTypeIn) * vec_size);
-  size_t producer_kv_idx = chunk_start + ty, consumer_kv_idx;
-  bool producer_pred_guard = producer_kv_idx < chunk_end, consumer_pred_guard = true;
-  pipeline.producer_acquire();
-  if (producer_pred_guard) {
-    cuda::memcpy_async(smem + kv_shared_offset[0] + ty * head_dim + tx * vec_size,
-                       k + kv_info.get_kv_elem_offset(producer_kv_idx, head_idx, tx * vec_size),
-                       frag_shape, pipeline);
-  }
-  pipeline.producer_commit();
-  pipeline.producer_acquire();
-  if (producer_pred_guard) {
-    cuda::memcpy_async(smem + kv_shared_offset[1] + ty * head_dim + tx * vec_size,
-                       v + kv_info.get_kv_elem_offset(producer_kv_idx, head_idx, tx * vec_size),
-                       frag_shape, pipeline);
-  }
-  pipeline.producer_commit();
-
+  size_t consumer_kv_idx_base = chunk_start + ty, compute_stage_idx = 0;
   state_t<vec_size> s_partial;
   float x = 0.f;
-  size_t copy_stage_idx = 2, compute_stage_idx = 0, batch;
 
-#pragma unroll 2
-  for (batch = 1; batch < (kv_chunk_size + bdy - 1) / bdy; ++batch) {
-    consumer_kv_idx = producer_kv_idx;
-    consumer_pred_guard = producer_pred_guard;
-    producer_kv_idx = chunk_start + batch * bdy + ty;
-    producer_pred_guard = producer_kv_idx < chunk_end;
-    // load stage: load k tiles
-    pipeline.producer_acquire();
-    if (producer_pred_guard) {
-      cuda::memcpy_async(smem + kv_shared_offset[copy_stage_idx] + ty * head_dim + tx * vec_size,
-                         k + kv_info.get_kv_elem_offset(producer_kv_idx, head_idx, tx * vec_size),
-                         frag_shape, pipeline);
-    }
-    pipeline.producer_commit();
-    copy_stage_idx = (copy_stage_idx + 1) % stages_count;
-
-    // compute stage: compute qk
-    pipeline.consumer_wait();
+#pragma unroll 4
+  for (size_t iter = 0; iter < (kv_chunk_size + bdy - 1) / bdy; ++iter) {
+    size_t producer_kv_idx = producer_kv_idx_base, consumer_kv_idx = consumer_kv_idx_base;
+    // load stage
+    cp_async::pred_load<vec_bits, true>(
+        smem + (copy_stage_idx * bdy + ty) * head_dim + tx * vec_size,
+        k + kv_info.get_kv_elem_offset(producer_kv_idx, head_idx, tx * vec_size),
+        producer_kv_idx < chunk_end);
+    cp_async::pred_load<vec_bits, true>(
+        smem + (num_stages_smem * bdy * head_dim) + (copy_stage_idx * bdy + ty) * head_dim +
+            tx * vec_size,
+        v + kv_info.get_kv_elem_offset(producer_kv_idx, head_idx, tx * vec_size),
+        producer_kv_idx < chunk_end);
+    cp_async::commit_group();
+    // compute stage
+    cp_async::wait_group<num_stages_smem - 1>();
     block.sync();
-    compute_qk<rotary_mode, vec_size, bdx>(smem, q_vec, freq, kv_shared_offset, consumer_kv_idx,
-                                           compute_stage_idx, num_heads, sm_scale, x);
+    compute_qk<rotary_mode, vec_size, bdx>(smem + (compute_stage_idx * bdy + ty) * head_dim, q_vec,
+                                           freq, consumer_kv_idx, compute_stage_idx, num_heads,
+                                           sm_scale, x);
+    update_partial_state<vec_size, bdx>(
+        smem + (num_stages_smem * bdy * head_dim) + (compute_stage_idx * bdy + ty) * head_dim, x,
+        compute_stage_idx, consumer_kv_idx < chunk_end, s_partial);
     block.sync();
-    pipeline.consumer_release();
-    compute_stage_idx = (compute_stage_idx + 1) % stages_count;
-
-    // load stage: load v tiles
-    pipeline.producer_acquire();
-    if (producer_pred_guard) {
-      cuda::memcpy_async(smem + kv_shared_offset[copy_stage_idx] + ty * head_dim + tx * vec_size,
-                         v + kv_info.get_kv_elem_offset(producer_kv_idx, head_idx, tx * vec_size),
-                         frag_shape, pipeline);
-    }
-    pipeline.producer_commit();
-    copy_stage_idx = (copy_stage_idx + 1) % stages_count;
-
-    // compute stage: update partial state
-    pipeline.consumer_wait();
-    block.sync();
-    update_partial_state<vec_size, bdx>(smem, x, kv_shared_offset, compute_stage_idx,
-                                        consumer_pred_guard, s_partial);
-    block.sync();
-    pipeline.consumer_release();
-    compute_stage_idx = (compute_stage_idx + 1) % stages_count;
-  }
-
-  // last two compute stages
-  {
-    consumer_kv_idx = producer_kv_idx;
-    consumer_pred_guard = producer_pred_guard;
-    // compute stage: compute qk
-    pipeline.consumer_wait();
-    block.sync();
-    compute_qk<rotary_mode, vec_size, bdx>(smem, q_vec, freq, kv_shared_offset, consumer_kv_idx,
-                                           compute_stage_idx, num_heads, sm_scale, x);
-    block.sync();
-    pipeline.consumer_release();
-    compute_stage_idx = (compute_stage_idx + 1) % stages_count;
-    // compute stage: update partial state
-    pipeline.consumer_wait();
-    block.sync();
-    update_partial_state<vec_size, bdx>(smem, x, kv_shared_offset, compute_stage_idx,
-                                        consumer_pred_guard, s_partial);
-    block.sync();
-    pipeline.consumer_release();
-    compute_stage_idx = (compute_stage_idx + 1) % stages_count;
+    copy_stage_idx = (copy_stage_idx + 1) % num_stages_smem;
+    compute_stage_idx = (compute_stage_idx + 1) % num_stages_smem;
+    producer_kv_idx_base += bdy;
+    consumer_kv_idx_base += bdy;
   }
 
   // sync partial state of all warps inside a threadblock
@@ -342,9 +300,9 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     // sync global states
     if (kv_chunk_idx == 0) {
       state_t<vec_size> s_global;
-#pragma unroll 2
-      for (size_t batch = 0; batch < (num_kv_chunks + bdy - 1) / bdy; ++batch) {
-        size_t kv_chunk_idx = batch * bdy + ty;
+#pragma unroll 4
+      for (size_t iter = 0; iter < (num_kv_chunks + bdy - 1) / bdy; ++iter) {
+        size_t kv_chunk_idx = iter * bdy + ty;
         if (kv_chunk_idx < num_kv_chunks) {
           s_partial.m = tmp_md[(head_idx * num_kv_chunks + kv_chunk_idx) * 2];
           s_partial.d = tmp_md[(head_idx * num_kv_chunks + kv_chunk_idx) * 2 + 1];
@@ -394,7 +352,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(DTypeIn *__restrict__ q,
                                                   float rope_inv_scale, float rope_inv_theta) {
   auto block = cg::this_thread_block();
 
-  constexpr size_t stages_count = 4;
+  constexpr size_t num_stages_smem = 4;
   constexpr size_t head_dim = bdx * vec_size;
   size_t batch_idx = blockIdx.x;
   size_t head_idx = blockIdx.y;
@@ -406,8 +364,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(DTypeIn *__restrict__ q,
       (cur_page_indptr_end - cur_page_indptr_begin - 1) * paged_kv.page_size + cur_last_page_offset;
 
   static_assert(bdx * bdy == 128);
-  static_assert(stages_count >= sizeof(float) / sizeof(DTypeIn));
-  __shared__ DTypeIn smem[stages_count * bdy * head_dim];
+  __shared__ DTypeIn smem[2 * num_stages_smem * bdy * head_dim];
   __shared__ float smem_md[2 * bdy];
 
   size_t tx = threadIdx.x, ty = threadIdx.y;
@@ -429,116 +386,103 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(DTypeIn *__restrict__ q,
   }
   block.sync();
 
-  // load k tiles and v tiles
-  size_t kv_shared_offset[stages_count] = {0U, 1U * bdy * head_dim, 2U * bdy * head_dim,
-                                           3U * bdy * head_dim};
-
-  // pipelining k/v tiles loading and state updating
-  auto pipeline = cuda::make_pipeline();
-  const auto frag_shape = cuda::aligned_size_t<alignof(float4)>(sizeof(DTypeIn) * vec_size);
-  size_t producer_kv_idx = ty, consumer_kv_idx;
-  bool producer_pred_guard = producer_kv_idx < min(seq_len, paged_kv.page_size),
-       consumer_pred_guard = true;
-  size_t page_idx = paged_kv.indices[cur_page_indptr_begin];
-  pipeline.producer_acquire();
-  if (producer_pred_guard) {
-    cuda::memcpy_async(
-        smem + kv_shared_offset[0] + ty * head_dim + tx * vec_size,
-        paged_kv.data + paged_kv.get_k_elem_offset(page_idx, head_idx, ty, tx * vec_size),
-        frag_shape, pipeline);
+  // preload k/v tiles
+  size_t producer_entry_base = ty, copy_stage_idx = 0;
+  constexpr size_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
+  size_t producer_page_iter = cur_page_indptr_begin;
+  size_t producer_page_idx = paged_kv.indices[producer_page_iter];
+  size_t producer_valid_page_size = paged_kv.get_valid_page_size(batch_idx, producer_page_iter);
+  size_t kv_idx_base[num_stages_smem]{0};
+  size_t valid_page_size[num_stages_smem]{0};
+  kv_idx_base[copy_stage_idx] = producer_entry_base;
+  valid_page_size[copy_stage_idx] = producer_valid_page_size;
+#pragma unroll
+  for (size_t iter = 0; iter < num_stages_smem - 1; ++iter) {
+    bool producer_pred_guard = (producer_entry_base < producer_valid_page_size) &&
+                               (producer_page_iter < cur_page_indptr_end);
+    cp_async::pred_load<vec_bits, true>(
+        smem + (copy_stage_idx * bdy + ty) * head_dim + tx * vec_size,
+        paged_kv.data + paged_kv.get_k_elem_offset(producer_page_idx, head_idx, producer_entry_base,
+                                                   tx * vec_size),
+        producer_pred_guard);
+    cp_async::pred_load<vec_bits, true>(
+        smem + (num_stages_smem * bdy * head_dim) + (copy_stage_idx * bdy + ty) * head_dim +
+            tx * vec_size,
+        paged_kv.data + paged_kv.get_v_elem_offset(producer_page_idx, head_idx, producer_entry_base,
+                                                   tx * vec_size),
+        producer_pred_guard);
+    cp_async::commit_group();
+    copy_stage_idx += 1;
+    producer_entry_base += bdy;
+    if ((producer_entry_base - ty) >= producer_valid_page_size) {
+      producer_entry_base = ty;
+      producer_page_iter += 1;
+      if (producer_page_iter < cur_page_indptr_end) {
+        producer_page_idx = paged_kv.indices[producer_page_iter];
+        producer_valid_page_size = paged_kv.get_valid_page_size(batch_idx, producer_page_iter);
+      } else {
+        producer_valid_page_size = 0;
+      }
+    }
+    kv_idx_base[copy_stage_idx] =
+        producer_entry_base + (producer_page_iter - cur_page_indptr_begin) * paged_kv.page_size;
+    valid_page_size[copy_stage_idx] = producer_valid_page_size;
   }
-  pipeline.producer_commit();
-  pipeline.producer_acquire();
-  if (producer_pred_guard) {
-    cuda::memcpy_async(
-        smem + kv_shared_offset[1] + ty * head_dim + tx * vec_size,
-        paged_kv.data + paged_kv.get_v_elem_offset(page_idx, head_idx, ty, tx * vec_size),
-        frag_shape, pipeline);
-  }
-  pipeline.producer_commit();
 
   state_t<vec_size> s;
   float x = 0.f;
-  size_t copy_stage_idx = 2, compute_stage_idx = 0, batch;
+  size_t consumer_kv_idx_base = 0, compute_stage_idx = 0;
 
-  for (size_t page_iter = cur_page_indptr_begin; page_iter < cur_page_indptr_end; ++page_iter) {
-    page_idx = paged_kv.indices[page_iter];
-    size_t valid_page_size =
-        (page_iter == cur_page_indptr_end - 1) ? cur_last_page_offset : paged_kv.page_size;
-
-#pragma unroll 2
-    for (batch = (page_iter == cur_page_indptr_begin); batch < (valid_page_size + bdy - 1) / bdy;
-         ++batch) {
-      consumer_kv_idx = producer_kv_idx;
-      consumer_pred_guard = producer_pred_guard;
-      size_t cur_page_producer_kv_idx = batch * bdy + ty;
-      producer_kv_idx =
-          cur_page_producer_kv_idx + (page_iter - cur_page_indptr_begin) * paged_kv.page_size;
-      producer_pred_guard = cur_page_producer_kv_idx < valid_page_size;
+  for (size_t consumer_page_iter = cur_page_indptr_begin; consumer_page_iter < cur_page_indptr_end;
+       ++consumer_page_iter) {
+    size_t consumer_valid_page_size = valid_page_size[compute_stage_idx];
+#pragma unroll 4
+    for (size_t iter = 0; iter < (consumer_valid_page_size + bdy - 1) / bdy; ++iter) {
       // load stage: load k tiles
-      pipeline.producer_acquire();
-      if (producer_pred_guard) {
-        cuda::memcpy_async(
-            smem + kv_shared_offset[copy_stage_idx] + ty * head_dim + tx * vec_size,
-            paged_kv.data + paged_kv.get_k_elem_offset(page_idx, head_idx, cur_page_producer_kv_idx,
-                                                       tx * vec_size),
-            frag_shape, pipeline);
-      }
-      pipeline.producer_commit();
-      copy_stage_idx = (copy_stage_idx + 1) % stages_count;
+      bool producer_pred_guard = (producer_entry_base < producer_valid_page_size) &&
+                                 (producer_page_iter < cur_page_indptr_end);
+      cp_async::pred_load<vec_bits, true>(
+          smem + (copy_stage_idx * bdy + ty) * head_dim + tx * vec_size,
+          paged_kv.data + paged_kv.get_k_elem_offset(producer_page_idx, head_idx,
+                                                     producer_entry_base, tx * vec_size),
+          producer_pred_guard);
+      cp_async::pred_load<vec_bits, true>(
+          smem + (num_stages_smem * bdy * head_dim) + (copy_stage_idx * bdy + ty) * head_dim +
+              tx * vec_size,
+          paged_kv.data + paged_kv.get_v_elem_offset(producer_page_idx, head_idx,
+                                                     producer_entry_base, tx * vec_size),
+          producer_pred_guard);
+      cp_async::commit_group();
 
       // compute stage: compute qk
-      pipeline.consumer_wait();
+      consumer_kv_idx_base = kv_idx_base[compute_stage_idx];
+      bool consumer_pred_guard = (iter * bdy + ty < consumer_valid_page_size);
+      cp_async::wait_group<num_stages_smem - 1>();
       block.sync();
-      compute_qk<rotary_mode, vec_size, bdx>(smem, q_vec, freq, kv_shared_offset, consumer_kv_idx,
-                                             compute_stage_idx, num_heads, sm_scale, x);
+      compute_qk<rotary_mode, vec_size, bdx>(smem + (compute_stage_idx * bdy + ty) * head_dim,
+                                             q_vec, freq, consumer_kv_idx_base, compute_stage_idx,
+                                             num_heads, sm_scale, x);
+      update_partial_state<vec_size, bdx>(
+          smem + (num_stages_smem * bdy * head_dim) + (compute_stage_idx * bdy + ty) * head_dim, x,
+          compute_stage_idx, consumer_pred_guard, s);
       block.sync();
-      pipeline.consumer_release();
-      compute_stage_idx = (compute_stage_idx + 1) % stages_count;
-
-      // load stage: load v tiles
-      pipeline.producer_acquire();
-      if (producer_pred_guard) {
-        cuda::memcpy_async(
-            smem + kv_shared_offset[copy_stage_idx] + ty * head_dim + tx * vec_size,
-            paged_kv.data + paged_kv.get_v_elem_offset(page_idx, head_idx, cur_page_producer_kv_idx,
-                                                       tx * vec_size),
-            frag_shape, pipeline);
+      copy_stage_idx = (copy_stage_idx + 1) % num_stages_smem;
+      compute_stage_idx = (compute_stage_idx + 1) % num_stages_smem;
+      producer_entry_base += bdy;
+      if ((producer_entry_base - ty) >= producer_valid_page_size) {
+        producer_entry_base = ty;
+        producer_page_iter += 1;
+        if (producer_page_iter < cur_page_indptr_end) {
+          producer_page_idx = paged_kv.indices[producer_page_iter];
+          producer_valid_page_size = paged_kv.get_valid_page_size(batch_idx, producer_page_iter);
+        } else {
+          producer_valid_page_size = 0;
+        }
       }
-      pipeline.producer_commit();
-      copy_stage_idx = (copy_stage_idx + 1) % stages_count;
-
-      // compute stage: update partial state
-      pipeline.consumer_wait();
-      block.sync();
-      update_partial_state<vec_size, bdx>(smem, x, kv_shared_offset, compute_stage_idx,
-                                          consumer_pred_guard, s);
-      block.sync();
-      pipeline.consumer_release();
-      compute_stage_idx = (compute_stage_idx + 1) % stages_count;
+      kv_idx_base[copy_stage_idx] =
+          producer_entry_base + (producer_page_iter - cur_page_indptr_begin) * paged_kv.page_size;
+      valid_page_size[copy_stage_idx] = producer_valid_page_size;
     }
-  }
-
-  // last two compute stages
-  {
-    consumer_kv_idx = producer_kv_idx;
-    consumer_pred_guard = producer_pred_guard;
-    // compute stage: compute qk
-    pipeline.consumer_wait();
-    block.sync();
-    compute_qk<rotary_mode, vec_size, bdx>(smem, q_vec, freq, kv_shared_offset, consumer_kv_idx,
-                                           compute_stage_idx, num_heads, sm_scale, x);
-    block.sync();
-    pipeline.consumer_release();
-    compute_stage_idx = (compute_stage_idx + 1) % stages_count;
-    // compute stage: update partial state
-    pipeline.consumer_wait();
-    block.sync();
-    update_partial_state<vec_size, bdx>(smem, x, kv_shared_offset, compute_stage_idx,
-                                        consumer_pred_guard, s);
-    block.sync();
-    pipeline.consumer_release();
-    compute_stage_idx = (compute_stage_idx + 1) % stages_count;
   }
 
   // sync partial state of all warps inside a threadblock

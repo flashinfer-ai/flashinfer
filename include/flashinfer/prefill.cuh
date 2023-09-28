@@ -347,24 +347,41 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   }
 
   // write back
-  // NOTE(Zihao): suboptimal, will optimize later
+  permuted_smem_t<head_dim / bank_capacity<DTypeIn>(), DTypeIn> o_smem((DTypeIn *)smem);
 #pragma unroll
   for (size_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
     for (size_t fy = 0; fy < num_frags_y; ++fy) {
 #pragma unroll
       for (size_t reg_id = 0; reg_id < 4; ++reg_id) {
-        size_t i =
-            (bx * num_warps + ty) * rows_per_warp + fx * mma::frag_size + tx / 4 + 8 * (reg_id % 2);
-        size_t j = fy * mma::frag_size + 8 * (reg_id / 2) + 2 * (tx % 4);
-        vec_t<float, 2> tmp;
-        tmp.load(&o_frag[fx][fy][reg_id * 2]);
-        if (i < q_len) {
-          tmp.cast_store(o + qkv_info.get_qo_elem_offset(i, head_idx, j));
-        }
+        // size_t i = mma::frag_size * fz + 8 * (tx / 16) + tx % 8, j = fy * 2 + (tx % 16) / 8;
+        // o_smem.stmatrix_m8n8x4(o_frag[fx][fy], i, j);
+        size_t i = (ty * num_frags_x + fx) * mma::frag_size + 8 * (reg_id % 2) + tx / 4,
+               j = fy * 2 + reg_id / 2;
+        vec_t<DTypeOut, 2> o_vec;
+        o_vec.cast_load((DTypeOut *)&o_frag[fx][fy][reg_id * 2]);
+        o_vec.store((DTypeOut *)o_smem.get_ptr(i, j) + tx % 4);
       }
     }
   }
+  // NOTE(Zihao): suboptimal, will optimize later
+// #pragma unroll
+//   for (size_t fx = 0; fx < num_frags_x; ++fx) {
+// #pragma unroll
+//     for (size_t fy = 0; fy < num_frags_y; ++fy) {
+// #pragma unroll
+//       for (size_t reg_id = 0; reg_id < 4; ++reg_id) {
+//         size_t i =
+//             (bx * num_warps + ty) * rows_per_warp + fx * mma::frag_size + tx / 4 + 8 * (reg_id % 2);
+//         size_t j = fy * mma::frag_size + 8 * (reg_id / 2) + 2 * (tx % 4);
+//         vec_t<float, 2> tmp;
+//         tmp.load(&o_frag[fx][fy][reg_id * 2]);
+//         if (i < q_len) {
+//           tmp.cast_store(o + qkv_info.get_qo_elem_offset(i, head_idx, j));
+//         }
+//       }
+//     }
+//   }
 }
 
 template <typename DTypeIn, typename DTypeOut>

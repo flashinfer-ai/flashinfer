@@ -45,11 +45,11 @@ void _TestSinglePrefillKernelCorrectness(size_t q_len, size_t kv_len, size_t num
     }
     num_results_error_atol_1e_3_rtol_1e_3 +=
         (!utils::isclose(float(o_ref[i]), float(o_h[i]), 1e-3, 1e-3));
-    // if (!utils::isclose(float(o_ref[i]), float(o_h[i]), 1e-3, 1e-3)) {
-    //   std::cout << "row=" << i / head_dim << ", rol=" << i % head_dim << ", ref=" <<
-    //   float(o_ref[i]) << ", result=" << float(o_h[i])
-    //             << std::endl;
-    // }
+    if (!utils::isclose(float(o_ref[i]), float(o_h[i]), 1e-3, 1e-3)) {
+      std::cout << "row=" << i / head_dim << ", rol=" << i % head_dim << ", ref=" <<
+      float(o_ref[i]) << ", result=" << float(o_h[i])
+                << std::endl;
+    }
   }
 
   float result_accuracy = 1. - float(num_results_error_atol_1e_3_rtol_1e_3) / float(o_ref.size());

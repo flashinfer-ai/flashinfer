@@ -74,6 +74,14 @@ struct paged_kv_t {
                head_dim +
            feat_idx;
   }
+
+  __host__ __device__ __forceinline__ size_t get_valid_page_size(size_t batch_idx, size_t page_iter) {
+    if (page_iter == indptr[batch_idx + 1] - 1) {
+      return last_page_offset[batch_idx];
+    } else {
+      return page_size;
+    }
+  }
 };
 
 template <size_t head_dim, size_t vec_size, size_t bdx, size_t bdy, typename DType, typename IdType>
