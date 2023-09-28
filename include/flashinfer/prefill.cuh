@@ -347,41 +347,50 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   }
 
   // write back
-  permuted_smem_t<head_dim / bank_capacity<DTypeIn>(), DTypeIn> o_smem((DTypeIn *)smem);
+  permuted_smem_t<head_dim / bank_capacity<DTypeOut>(), DTypeOut> o_smem((DTypeIn *)smem);
+  if constexpr (std::is_same<DTypeOut, float>::value) {
+    // TODO(Zihao)
+  } else if constexpr (sizeof(DTypeOut) == 2) {
+    uint32_t o_frag_f16[num_frags_x][num_frags_y][4];
 #pragma unroll
-  for (size_t fx = 0; fx < num_frags_x; ++fx) {
+    for (size_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
-    for (size_t fy = 0; fy < num_frags_y; ++fy) {
+      for (size_t fy = 0; fy < num_frags_y; ++fy) {
 #pragma unroll
-      for (size_t reg_id = 0; reg_id < 4; ++reg_id) {
-        // size_t i = mma::frag_size * fz + 8 * (tx / 16) + tx % 8, j = fy * 2 + (tx % 16) / 8;
-        // o_smem.stmatrix_m8n8x4(o_frag[fx][fy], i, j);
-        size_t i = (ty * num_frags_x + fx) * mma::frag_size + 8 * (reg_id % 2) + tx / 4,
-               j = fy * 2 + reg_id / 2;
-        vec_t<DTypeOut, 2> o_vec;
-        o_vec.cast_load((DTypeOut *)&o_frag[fx][fy][reg_id * 2]);
-        o_vec.store((DTypeOut *)o_smem.get_ptr(i, j) + tx % 4);
+        for (size_t reg_id = 0; reg_id < 4; ++reg_id) {
+          vec_t<DTypeOut, 2> tmp;
+          tmp.cast_load(&o_frag[fx][fy][reg_id * 2]);
+          tmp.store((DTypeOut *)&o_frag_f16[fx][fy][reg_id]);
+        }
       }
     }
+#pragma unroll
+    for (size_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+      for (size_t fy = 0; fy < num_frags_y; ++fy) {
+#pragma unroll
+        for (size_t reg_id = 0; reg_id < 4; ++reg_id) {
+          size_t i = ty * rows_per_warp + fx * mma::frag_size + 8 * (reg_id % 2) + tx / 4,
+                 j = fy * 2 + (reg_id / 2);
+          ((uint32_t *)o_smem.get_ptr(i, j))[tx % 4] = o_frag_f16[fx][fy][reg_id];
+        }
+      }
+    }
+#pragma unroll
+    for (size_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+      for (size_t fy = 0; fy < num_frags_y; ++fy) {
+        size_t i = ty * rows_per_warp + fx * mma::frag_size + tx % 16, j = fy * 2 + tx / 16;
+        size_t o_idx = (bx * num_warps + ty) * rows_per_warp + fx * mma::frag_size + tx % 16,
+               feat_idx = (fy * 2 + tx / 16) * bank_capacity<DTypeOut>();
+        if (o_idx < q_len) {
+          o_smem.store_bank(i, j, o + qkv_info.get_qo_elem_offset(o_idx, head_idx, feat_idx));
+        }
+      }
+    }
+  } else {
+    // NOTE(Zihao): Not implemented yet.
   }
-  // NOTE(Zihao): suboptimal, will optimize later
-// #pragma unroll
-//   for (size_t fx = 0; fx < num_frags_x; ++fx) {
-// #pragma unroll
-//     for (size_t fy = 0; fy < num_frags_y; ++fy) {
-// #pragma unroll
-//       for (size_t reg_id = 0; reg_id < 4; ++reg_id) {
-//         size_t i =
-//             (bx * num_warps + ty) * rows_per_warp + fx * mma::frag_size + tx / 4 + 8 * (reg_id % 2);
-//         size_t j = fy * mma::frag_size + 8 * (reg_id / 2) + 2 * (tx % 4);
-//         vec_t<float, 2> tmp;
-//         tmp.load(&o_frag[fx][fy][reg_id * 2]);
-//         if (i < q_len) {
-//           tmp.cast_store(o + qkv_info.get_qo_elem_offset(i, head_idx, j));
-//         }
-//       }
-//     }
-//   }
 }
 
 template <typename DTypeIn, typename DTypeOut>

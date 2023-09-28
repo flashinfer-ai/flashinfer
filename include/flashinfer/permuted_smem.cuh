@@ -7,8 +7,8 @@
 
 #include <cuda/pipeline>
 
-#include "mma.cuh"
 #include "cp_async.cuh"
+#include "mma.cuh"
 
 namespace flashinfer {
 
@@ -51,18 +51,25 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t *R, T *smem_base,
 }
 
 template <size_t stride, typename T>
-__device__ __forceinline__ void load_bank(T *smem_base, size_t is, size_t js, const T *gptr) {
-  *get_smem_ptr<stride>(smem_base, is, js) = *reinterpret_cast<const bank_t *>(gptr);
+__device__ __forceinline__ void stmatrix_m8n8x4(uint32_t *R, T *smem_base, size_t i, size_t j) {
+  bank_t *smem_ptr = get_smem_ptr<stride>(smem_base, i, j);
+  mma::stmatrix_m8n8x4(R, smem_ptr);
 }
 
 template <size_t stride, typename T>
-__device__ __forceinline__ void store_bank(T *smem_base, size_t is, size_t js, T *gptr) {
-  *reinterpret_cast<bank_t *>(gptr) = *get_smem_ptr<stride>(smem_base, is, js);
+__device__ __forceinline__ void load_bank(T *smem_base, size_t i, size_t j, const T *gptr) {
+  *get_smem_ptr<stride>(smem_base, i, j) = *reinterpret_cast<const bank_t *>(gptr);
 }
 
 template <size_t stride, typename T>
-__device__ __forceinline__ void load_bank_async(T *smem_base, size_t is, size_t js, const T *gptr, bool predicate) {
-  bank_t *smem_ptr = get_smem_ptr<stride>(smem_base, is, js);
+__device__ __forceinline__ void store_bank(T *smem_base, size_t i, size_t j, T *gptr) {
+  *reinterpret_cast<bank_t *>(gptr) = *get_smem_ptr<stride>(smem_base, i, j);
+}
+
+template <size_t stride, typename T>
+__device__ __forceinline__ void load_bank_async(T *smem_base, size_t i, size_t j, const T *gptr,
+                                                bool predicate) {
+  bank_t *smem_ptr = get_smem_ptr<stride>(smem_base, i, j);
   cp_async::pred_load_128<true>(smem_ptr, reinterpret_cast<const bank_t *>(gptr), predicate);
 }
 
@@ -82,11 +89,18 @@ struct permuted_smem_t {
   __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t *R, size_t i, size_t j) {
     permuted_smem_impl::ldmatrix_m8n8x4_trans<stride>(R, base, i, j);
   }
-  __device__ __forceinline__ void load_bank(size_t is, size_t js, const T *gptr) {
-    permuted_smem_impl::load_bank<stride>(base, is, js, gptr);
+  __device__ __forceinline__ void stmatrix_m8n8x4(uint32_t *R, size_t i, size_t j) {
+    permuted_smem_impl::stmatrix_m8n8x4<stride>(R, base, i, j);
   }
-  __device__ __forceinline__ void load_bank_async(size_t is, size_t js, const T *gptr, bool predicate) {
-    permuted_smem_impl::load_bank_async<stride>(base, is, js, gptr, predicate);
+  __device__ __forceinline__ void load_bank(size_t i, size_t j, const T *gptr) {
+    permuted_smem_impl::load_bank<stride>(base, i, j, gptr);
+  }
+  __device__ __forceinline__ void load_bank_async(size_t i, size_t j, const T *gptr,
+                                                  bool predicate) {
+    permuted_smem_impl::load_bank_async<stride>(base, i, j, gptr, predicate);
+  }
+  __device__ __forceinline__ void store_bank(size_t i, size_t j, T *gptr) {
+    permuted_smem_impl::store_bank<stride>(base, i, j, gptr);
   }
 };
 
