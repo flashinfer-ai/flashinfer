@@ -101,9 +101,9 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   float x_frag[num_frags_z][8];
   uint32_t att_frag[num_frags_z][4];
   float o_frag[num_frags_y][8]{0.f};
+  float m_prev[2]{-5e4};
   float m[2]{-5e4};
   float d[2]{0.f};
-  float o_scale[2];
   float rope_freq[num_frags_y][4];
   if constexpr (rotary_mode == RotaryMode::kLlama) {
 #pragma unroll
@@ -246,7 +246,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     // compute m,d states in online softmax
 #pragma unroll
     for (size_t j = 0; j < 2; ++j) {
-      o_scale[j] = 0.f;
+      m_prev[j] = m[j];
 #pragma unroll
       for (size_t fz = 0; fz < num_frags_z; ++fz) {
         float m_local = max(max(x_frag[fz][j * 2 + 0], x_frag[fz][j * 2 + 1]),
@@ -260,11 +260,8 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
         }
         m_local = g.shfl(m_local, 0);
         d_local = g.shfl(d_local, 0);
-        float m_prev = m[j], d_prev = d[j];
         merge_md(m[j], d[j], m_local, d_local);
-        o_scale[j] += (m_prev + __logf(d_prev)) - (m[j] + __logf(d[j]));
       }
-      o_scale[j] = __expf(o_scale[j]);
     }
     block.sync();
 
@@ -276,7 +273,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
         vec_t<DTypeIn, 2> tmp;
 #pragma unroll
         for (size_t j = 0; j < 2; ++j) {
-          tmp[j] = __expf(x_frag[fz][reg_id * 2 + j] - m[reg_id % 2]) / d[reg_id % 2];
+          tmp[j] = __expf(x_frag[fz][reg_id * 2 + j] - m[reg_id % 2]);
         }
         tmp.store((DTypeIn *)&att_frag[fz][reg_id]);
       }
@@ -296,7 +293,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     for (size_t fy = 0; fy < num_frags_y; ++fy) {
 #pragma unroll
       for (size_t reg_id = 0; reg_id < 8; ++reg_id) {
-        o_frag[fy][reg_id] *= o_scale[(reg_id % 4) / 2];
+        o_frag[fy][reg_id] *= __expf(m_prev[(reg_id % 4) / 2] - m[(reg_id % 4) / 2]);
       }
     }
     block.sync();
@@ -315,6 +312,15 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     compute_stage_idx = (compute_stage_idx + 1) % num_stages_smem;
     producer_kv_idx_base += mma::frag_size * num_frags_z;
     consumer_kv_idx_base += mma::frag_size * num_frags_z;
+  }
+
+  // divide d
+#pragma unroll
+  for (size_t fy = 0; fy < num_frags_y; ++fy) {
+#pragma unroll
+    for (size_t reg_id = 0; reg_id < 8; ++reg_id) {
+      o_frag[fy][reg_id] *= __fdividef(1.f, d[(reg_id % 4) / 2]);
+    }
   }
 
   // write back
