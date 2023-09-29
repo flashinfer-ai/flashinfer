@@ -73,6 +73,12 @@ __device__ __forceinline__ void load_bank_async(T *smem_base, size_t i, size_t j
   cp_async::pred_load_128<true>(smem_ptr, reinterpret_cast<const bank_t *>(gptr), predicate);
 }
 
+template <size_t stride, typename T>
+__device__ __forceinline__ void load_bank_async(T *smem_base, size_t i, size_t j, const T *gptr) {
+  bank_t *smem_ptr = get_smem_ptr<stride>(smem_base, i, j);
+  cp_async::load_128<true>(smem_ptr, reinterpret_cast<const bank_t *>(gptr));
+}
+
 }  // namespace permuted_smem_impl
 
 template <size_t stride, typename T>
@@ -98,6 +104,9 @@ struct permuted_smem_t {
   __device__ __forceinline__ void load_bank_async(size_t i, size_t j, const T *gptr,
                                                   bool predicate) {
     permuted_smem_impl::load_bank_async<stride>(base, i, j, gptr, predicate);
+  }
+  __device__ __forceinline__ void load_bank_async(size_t i, size_t j, const T *gptr) {
+    permuted_smem_impl::load_bank_async<stride>(base, i, j, gptr);
   }
   __device__ __forceinline__ void store_bank(size_t i, size_t j, T *gptr) {
     permuted_smem_impl::store_bank<stride>(base, i, j, gptr);
