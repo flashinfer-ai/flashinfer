@@ -164,6 +164,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   }
 
   size_t producer_kv_idx_base = 0, copy_stage_idx = 0;
+#pragma unroll
   for (size_t iter = 0; iter < num_stages_smem - 1; ++iter) {
     produce_kv<num_frags_y, num_frags_z, num_warps>(k_smem + iter, k, qkv_info,
                                                     producer_kv_idx_base, kv_len, head_idx);
@@ -176,7 +177,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   }
 
   size_t consumer_kv_idx_base = 0, compute_stage_idx = 0;
-#pragma unroll 4
+#pragma unroll 8
   for (size_t iter = 0;
        iter < (kv_len + (mma::frag_size * num_frags_z - 1)) / (mma::frag_size * num_frags_z);
        ++iter) {
@@ -278,6 +279,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
         tmp.store((DTypeIn *)&att_frag[fz][reg_id]);
       }
     }
+
     // load v tile from smem to reg
 #pragma unroll
     for (size_t fy = 0; fy < num_frags_y; ++fy) {
