@@ -177,9 +177,10 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   }
 
   size_t consumer_kv_idx_base = 0, compute_stage_idx = 0;
+  size_t effective_kv_len = min(kv_len, kv_len - qo_len + ((bx + 1) * num_warps) * mma::frag_size);
 #pragma unroll 8
-  for (size_t iter = 0;
-       iter < (kv_len + (mma::frag_size * num_frags_z - 1)) / (mma::frag_size * num_frags_z);
+  for (size_t iter = 0; iter < (effective_kv_len + (mma::frag_size * num_frags_z - 1)) /
+                                   (mma::frag_size * num_frags_z);
        ++iter) {
     produce_kv<num_frags_y, num_frags_z, num_warps>(k_smem + copy_stage_idx, k, qkv_info,
                                                     producer_kv_idx_base, kv_len, head_idx);
