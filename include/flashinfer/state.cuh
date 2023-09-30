@@ -5,13 +5,6 @@
 
 namespace flashinfer {
 
-__device__ __forceinline__ void merge_md(float &m, float &d, const float other_m,
-                                         const float other_d) {
-  float m_prev = m, d_prev = d;
-  m = max(m_prev, other_m);
-  d = d_prev * __expf(m_prev - m) + other_d * __expf(other_m - m);
-}
-
 /*!
  * \brief The flashattention state.
  * \tparam vec_size The size of the vector used in o.

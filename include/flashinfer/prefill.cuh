@@ -262,16 +262,28 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
       for (size_t fz = 0; fz < num_frags_z; ++fz) {
         float m_local = max(max(x_frag[fz][j * 2 + 0], x_frag[fz][j * 2 + 1]),
                             max(x_frag[fz][j * 2 + 4], x_frag[fz][j * 2 + 5]));
-        float d_local =
-            __expf(x_frag[fz][j * 2 + 0] - m_local) + __expf(x_frag[fz][j * 2 + 1] - m_local) +
-            __expf(x_frag[fz][j * 2 + 4] - m_local) + __expf(x_frag[fz][j * 2 + 5] - m_local);
 #pragma unroll
         for (size_t offset = 2; offset > 0; offset /= 2) {
-          merge_md(m_local, d_local, g.shfl_down(m_local, offset), g.shfl_down(d_local, offset));
+          m_local = max(m_local, g.shfl_down(m_local, offset));
         }
         m_local = g.shfl(m_local, 0);
+        m[j] = max(m[j], m_local);
+      }
+      d[j] *= __expf(m_prev[j] - m[j]);
+#pragma unroll
+      for (size_t fz = 0; fz < num_frags_z; ++fz) {
+        x_frag[fz][j * 2 + 0] = __expf(x_frag[fz][j * 2 + 0] - m[j]);
+        x_frag[fz][j * 2 + 1] = __expf(x_frag[fz][j * 2 + 1] - m[j]);
+        x_frag[fz][j * 2 + 4] = __expf(x_frag[fz][j * 2 + 4] - m[j]);
+        x_frag[fz][j * 2 + 5] = __expf(x_frag[fz][j * 2 + 5] - m[j]);
+        float d_local = x_frag[fz][j * 2 + 0] + x_frag[fz][j * 2 + 1] + x_frag[fz][j * 2 + 4] +
+                        x_frag[fz][j * 2 + 5];
+#pragma unroll
+        for (size_t offset = 2; offset > 0; offset /= 2) {
+          d_local += g.shfl_down(d_local, offset);
+        }
         d_local = g.shfl(d_local, 0);
-        merge_md(m[j], d[j], m_local, d_local);
+        d[j] += d_local;
       }
     }
     block.sync();
@@ -282,10 +294,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
 #pragma unroll
       for (size_t reg_id = 0; reg_id < 4; ++reg_id) {
         vec_t<DTypeIn, 2> tmp;
-#pragma unroll
-        for (size_t j = 0; j < 2; ++j) {
-          tmp[j] = __expf(x_frag[fz][reg_id * 2 + j] - m[reg_id % 2]);
-        }
+        tmp.cast_load(&x_frag[fz][reg_id * 2]);
         tmp.store((DTypeIn *)&att_frag[fz][reg_id]);
       }
     }
