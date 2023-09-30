@@ -153,6 +153,21 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   }
   block.sync();
 
+  // multiply q by sm_scale
+  vec_t<DTypeIn, 2> sm_scale2;
+  sm_scale2.fill(sm_scale);
+#pragma unroll
+  for (size_t fy = 0; fy < num_frags_y; ++fy) {
+#pragma unroll
+    for (size_t reg_id = 0; reg_id < 4; ++reg_id) {
+      vec_t<DTypeIn, 2> tmp;
+      tmp.load((DTypeIn *)&q_frag[fy][reg_id]);
+      tmp.data = tmp.data * sm_scale2.data;
+      tmp.store((DTypeIn *)&q_frag[fy][reg_id]);
+    }
+  }
+  block.sync();
+
   permuted_smem_t<head_dim / bank_capacity<DTypeIn>(), DTypeIn> k_smem[num_stages_smem];
   permuted_smem_t<head_dim / bank_capacity<DTypeIn>(), DTypeIn> v_smem[num_stages_smem];
 #pragma unroll
@@ -189,12 +204,16 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     cp_async::commit_group();
     cp_async::wait_group<num_stages_smem - 1>();
     block.sync();
-    // init x_frag with 0
+    // init x_frag with -inf or 0 by applying mask
 #pragma unroll
     for (size_t fz = 0; fz < num_frags_z; ++fz) {
 #pragma unroll
       for (size_t reg_id = 0; reg_id < 8; ++reg_id) {
-        x_frag[fz][reg_id] = 0.f;
+        size_t q_idx = (bx * num_warps + ty) * mma::frag_size + 8 * ((reg_id % 4) / 2) + tx / 4,
+               kv_idx = consumer_kv_idx_base + fz * mma::frag_size + 8 * (reg_id / 4) +
+                        2 * (tx % 4) + reg_id % 2;
+        bool predicate = (q_idx - qo_len < kv_idx - kv_len || q_idx >= qo_len || kv_idx >= kv_len);
+        x_frag[fz][reg_id] = predicate ? -5e4 : 0.f;
       }
     }
 
@@ -231,19 +250,6 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
       }
     }
     block.sync();
-
-    // multiply sm_scale and apply mask
-#pragma unroll
-    for (size_t fz = 0; fz < num_frags_z; ++fz) {
-#pragma unroll
-      for (size_t reg_id = 0; reg_id < 8; ++reg_id) {
-        size_t q_idx = (bx * num_warps + ty) * mma::frag_size + 8 * ((reg_id % 4) / 2) + tx / 4,
-               kv_idx = consumer_kv_idx_base + fz * mma::frag_size + 8 * (reg_id / 4) +
-                        2 * (tx % 4) + reg_id % 2;
-        bool predicate = (q_idx - qo_len < kv_idx - kv_len || q_idx >= qo_len || kv_idx >= kv_len);
-        x_frag[fz][reg_id] = predicate ? -5e4 : x_frag[fz][reg_id] * sm_scale;
-      }
-    }
 
     // compute m,d states in online softmax
 #pragma unroll
