@@ -29,7 +29,7 @@ void _TestDecodingKernelCorrectness(size_t num_heads, size_t seq_len, size_t hea
   std::vector<T> o_ref_host;
 
   o_ref_host = cpu_reference::single_mha<T, T>(Q_host, K_host, V_host, 1, seq_len, num_heads,
-                                               head_dim, layout, rotary_mode);
+                                               head_dim, false, layout, rotary_mode);
 
   SingleDecodeWithKVCache(thrust::raw_pointer_cast(Q.data()), thrust::raw_pointer_cast(K.data()),
                           thrust::raw_pointer_cast(V.data()), thrust::raw_pointer_cast(O.data()),

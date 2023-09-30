@@ -81,8 +81,9 @@ template <QKVLayout layout, RotaryMode rotary_mode, size_t num_frags_y, size_t n
 __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *__restrict__ k,
                                                DTypeIn *__restrict__ v, DTypeOut *__restrict__ o,
                                                float *__restrict__ tmp,
-                                               tensor_info_t<layout> qkv_info, float sm_scale,
-                                               float rope_inv_scale, float rope_inv_theta) {
+                                               tensor_info_t<layout> qkv_info, bool causal,
+                                               float sm_scale, float rope_inv_scale,
+                                               float rope_inv_theta) {
   size_t qo_len = qkv_info.qo_len;
   size_t kv_len = qkv_info.kv_len;
   size_t tx = threadIdx.x, ty = threadIdx.y;
@@ -192,7 +193,8 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   }
 
   size_t consumer_kv_idx_base = 0, compute_stage_idx = 0;
-  size_t effective_kv_len = min(kv_len, kv_len - qo_len + ((bx + 1) * num_warps) * mma::frag_size);
+  size_t effective_kv_len =
+      causal ? min(kv_len, kv_len - qo_len + ((bx + 1) * num_warps) * mma::frag_size) : kv_len;
 #pragma unroll 8
   for (size_t iter = 0; iter < (effective_kv_len + (mma::frag_size * num_frags_z - 1)) /
                                    (mma::frag_size * num_frags_z);
@@ -212,7 +214,8 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
         size_t q_idx = (bx * num_warps + ty) * mma::frag_size + 8 * ((reg_id % 4) / 2) + tx / 4,
                kv_idx = consumer_kv_idx_base + fz * mma::frag_size + 8 * (reg_id / 4) +
                         2 * (tx % 4) + reg_id % 2;
-        bool predicate = (q_idx - qo_len < kv_idx - kv_len || q_idx >= qo_len || kv_idx >= kv_len);
+        bool predicate =
+            ((causal && q_idx - qo_len < kv_idx - kv_len) || q_idx >= qo_len || kv_idx >= kv_len);
         x_frag[fz][reg_id] = predicate ? -5e4 : 0.f;
       }
     }
@@ -372,7 +375,8 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
 template <typename DTypeIn, typename DTypeOut>
 cudaError_t SinglePrefillWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut *o, float *tmp,
                                      size_t num_heads, size_t qo_len, size_t kv_len,
-                                     size_t head_dim, QKVLayout layout = QKVLayout::kNHD,
+                                     size_t head_dim, bool causal = true,
+                                     QKVLayout layout = QKVLayout::kNHD,
                                      RotaryMode rotary_mode = RotaryMode::kNone,
                                      float rope_scale = 1.f, float rope_theta = 1e4,
                                      cudaStream_t stream = nullptr) {
@@ -403,6 +407,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOu
                             (void *)&o,
                             (void *)&tmp,
                             (void *)&qkv_info,
+                            (void *)&causal,
                             (void *)&sm_scale,
                             (void *)&rope_inv_scale,
                             (void *)&rope_inv_theta};

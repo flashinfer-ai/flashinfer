@@ -38,7 +38,7 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
 
     // compute reference output
     std::vector<T> o_ref_i = cpu_reference::single_mha<T, T>(
-        qi, ki, vi, 1, seq_len, num_heads, head_dim, QKVLayout::kNHD, rotary_mode);
+        qi, ki, vi, 1, seq_len, num_heads, head_dim, false, QKVLayout::kNHD, rotary_mode);
     keys.push_back(ki);
     values.push_back(vi);
     // append new q and o_ref

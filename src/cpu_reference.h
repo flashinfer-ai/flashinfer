@@ -30,7 +30,8 @@ inline std::vector<float> apply_llama_rope(const T* input, size_t D, size_t offs
 template <typename dtype_in, typename dtype_out>
 std::vector<dtype_out> single_mha(const std::vector<dtype_in>& q, const std::vector<dtype_in>& k,
                                   const std::vector<dtype_in>& v, size_t qo_len, size_t kv_len,
-                                  size_t num_heads, size_t head_dim, QKVLayout layout,
+                                  size_t num_heads, size_t head_dim, bool causal = true,
+                                  QKVLayout layout = QKVLayout::kHND,
                                   RotaryMode rotary_mode = RotaryMode::kNone,
                                   float rope_scale = 1.f, float rope_theta = 1e4) {
   assert(qo_len <= kv_len);
@@ -75,7 +76,7 @@ std::vector<dtype_out> single_mha(const std::vector<dtype_in>& q, const std::vec
             }
           }
           // apply mask
-          if (q_idx - qo_len < kv_idx - kv_len) {
+          if (causal && q_idx - qo_len < kv_idx - kv_len) {
             att[kv_idx] = -5e4;
           }
           max_val = std::max(max_val, att[kv_idx]);
