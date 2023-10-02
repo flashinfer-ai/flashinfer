@@ -243,7 +243,6 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
         }
       }
     }
-    block.sync();
 
     // compute q*k^T
 #pragma unroll
@@ -253,7 +252,6 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
         mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(x_frag[fz], q_frag[fy], kv_frag[fy][fz]);
       }
     }
-    block.sync();
 
     // compute m,d states in online softmax
 #pragma unroll
