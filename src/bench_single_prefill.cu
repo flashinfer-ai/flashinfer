@@ -45,12 +45,12 @@ void bench_flashinfer_single_prefill(nvbench::state &state) {
       bench_flashinfer_single_prefill<dtype_in, dtype_out, rotary_mode, layout>;                \
   NVBENCH_BENCH(                                                                                \
       bench_flashinfer_single_prefill_##dtype_in##_##dtype_out##_##rotary_mode##_##layout##_)   \
-      .set_name(("bench_flashinfer_single_prefill_" STR(dtype_in) "_" STR(dtype_out) "_") +      \
+      .set_name(("bench_flashinfer_single_prefill_" STR(dtype_in) "_" STR(dtype_out) "_") +     \
                 flashinfer::RotaryModeToString(RotaryMode(rotary_mode)) + "_" +                 \
                 flashinfer::QKVLayoutToString(QKVLayout(layout)))                               \
       .add_int64_axis("seq_len", {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768}) \
       .add_int64_axis("num_heads", {32})                                                        \
-      .add_int64_axis("head_dim", {128})                                                        \                 
+      .add_int64_axis("head_dim", {128})                                                        \
       .add_int64_axis("causal", {0, 1})
 
 BENCH_FLASHINFER_PREFILL(half, half, 0U, 0U);
