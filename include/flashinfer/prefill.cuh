@@ -105,6 +105,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   float m_prev[2]{-5e4};
   float m[2]{-5e4};
   float d[2]{0.f};
+  float o_scale[2]{0.f};
   float rope_freq[num_frags_y][4];
   if constexpr (rotary_mode == RotaryMode::kLlama) {
 #pragma unroll
@@ -269,7 +270,8 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
         m_local = g.shfl(m_local, 0);
         m[j] = max(m[j], m_local);
       }
-      d[j] *= __expf(m_prev[j] - m[j]);
+      o_scale[j] = __expf(m_prev[j] - m[j]);
+      d[j] *= o_scale[j];
 #pragma unroll
       for (size_t fz = 0; fz < num_frags_z; ++fz) {
         x_frag[fz][j * 2 + 0] = __expf(x_frag[fz][j * 2 + 0] - m[j]);
@@ -286,7 +288,6 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
         d[j] += d_local;
       }
     }
-    block.sync();
 
     // compute att_frag
 #pragma unroll
@@ -314,10 +315,9 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     for (size_t fy = 0; fy < num_frags_y; ++fy) {
 #pragma unroll
       for (size_t reg_id = 0; reg_id < 8; ++reg_id) {
-        o_frag[fy][reg_id] *= __expf(m_prev[(reg_id % 4) / 2] - m[(reg_id % 4) / 2]);
+        o_frag[fy][reg_id] *= o_scale[(reg_id % 4) / 2];
       }
     }
-    block.sync();
 
     // compute sfm*v
 #pragma unroll
