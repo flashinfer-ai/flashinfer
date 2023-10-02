@@ -182,15 +182,15 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
 
   size_t producer_kv_idx_base = 0, copy_stage_idx = 0;
 #pragma unroll
-  for (size_t iter = 0; iter < num_stages_smem - 1; ++iter) {
+  for (size_t iter = 0; iter < num_stages_smem; ++iter) {
     produce_kv<num_frags_y, num_frags_z, num_warps>(k_smem + iter, k, qkv_info,
                                                     producer_kv_idx_base, kv_len, head_idx);
+    cp_async::commit_group();
     produce_kv<num_frags_y, num_frags_z, num_warps>(v_smem + iter, v, qkv_info,
                                                     producer_kv_idx_base, kv_len, head_idx);
-
     cp_async::commit_group();
     producer_kv_idx_base += mma::frag_size * num_frags_z;
-    copy_stage_idx += 1;
+    copy_stage_idx = (copy_stage_idx + 1) % num_stages_smem;
   }
 
   size_t consumer_kv_idx_base = 0, compute_stage_idx = 0;
@@ -200,12 +200,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   for (size_t iter = 0; iter < (effective_kv_len + (mma::frag_size * num_frags_z - 1)) /
                                    (mma::frag_size * num_frags_z);
        ++iter) {
-    produce_kv<num_frags_y, num_frags_z, num_warps>(k_smem + copy_stage_idx, k, qkv_info,
-                                                    producer_kv_idx_base, kv_len, head_idx);
-    produce_kv<num_frags_y, num_frags_z, num_warps>(v_smem + copy_stage_idx, v, qkv_info,
-                                                    producer_kv_idx_base, kv_len, head_idx);
-    cp_async::commit_group();
-    cp_async::wait_group<num_stages_smem - 1>();
+    cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
     // init x_frag with -inf or 0 by applying mask
 #pragma unroll
@@ -298,6 +293,20 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
       }
     }
 
+    // scale o_frag
+#pragma unroll
+    for (size_t fy = 0; fy < num_frags_y; ++fy) {
+#pragma unroll
+      for (size_t reg_id = 0; reg_id < 8; ++reg_id) {
+        o_frag[fy][reg_id] *= o_scale[(reg_id % 4) / 2];
+      }
+    }
+    block.sync();
+    produce_kv<num_frags_y, num_frags_z, num_warps>(k_smem + copy_stage_idx, k, qkv_info,
+                                                    producer_kv_idx_base, kv_len, head_idx);
+    cp_async::commit_group();
+    cp_async::wait_group<2 * num_stages_smem - 1>();
+    block.sync();
     // load v tile from smem to reg
 #pragma unroll
     for (size_t fy = 0; fy < num_frags_y; ++fy) {
@@ -305,15 +314,6 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
       for (size_t fz = 0; fz < num_frags_z; ++fz) {
         size_t i = mma::frag_size * fz + tx % 16, j = fy * 2 + tx / 16;
         v_smem[compute_stage_idx].ldmatrix_m8n8x4_trans(kv_frag[fy][fz], i, j);
-      }
-    }
-
-    // scale o_frag
-#pragma unroll
-    for (size_t fy = 0; fy < num_frags_y; ++fy) {
-#pragma unroll
-      for (size_t reg_id = 0; reg_id < 8; ++reg_id) {
-        o_frag[fy][reg_id] *= o_scale[(reg_id % 4) / 2];
       }
     }
 
@@ -327,6 +327,9 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
       }
     }
     block.sync();
+    produce_kv<num_frags_y, num_frags_z, num_warps>(v_smem + copy_stage_idx, v, qkv_info,
+                                                    producer_kv_idx_base, kv_len, head_idx);
+    cp_async::commit_group();
     copy_stage_idx = (copy_stage_idx + 1) % num_stages_smem;
     compute_stage_idx = (compute_stage_idx + 1) % num_stages_smem;
     producer_kv_idx_base += mma::frag_size * num_frags_z;
@@ -398,7 +401,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOu
             constexpr size_t num_frags_y = HEAD_DIM / mma::frag_size;
             constexpr size_t num_frags_z = 2;
             constexpr size_t num_warps = 8UL;
-            constexpr size_t num_stages_smem = 4;
+            constexpr size_t num_stages_smem = 2;
             constexpr size_t num_rows_per_cta = num_warps * mma::frag_size;
             auto kernel =
                 SinglePrefillWithKVCacheKernel<LAYOUT, ROTARY_MODE, num_frags_y, num_frags_z,
