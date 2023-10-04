@@ -125,7 +125,7 @@ void _TestPagedKVCacheToRaggedTensorCorrectness(size_t page_size, size_t batch_s
                                                 size_t num_heads, size_t head_dim) {
   size_t num_pages_per_request = 10;
   size_t max_num_pages = batch_size * num_pages_per_request;
-  std::vector<T> kv_data_cpu(2 * max_num_pages * page_size * num_heads * head_dim);
+  std::vector<T> kv_data_cpu(max_num_pages * 2 * page_size * num_heads * head_dim);
   utils::vec_normal_(kv_data_cpu);
 
   std::vector<int32_t> paged_kv_indptr_host(batch_size + 1);
@@ -151,17 +151,25 @@ void _TestPagedKVCacheToRaggedTensorCorrectness(size_t page_size, size_t batch_s
                                       paged_kv_last_page_offset_host.data());
 
   for (size_t i = 0; i < batch_size; ++i) {
-    for (size_t h = 0; h < num_heads; ++h) {
-      for (size_t j = 0; j < num_pages_per_request; ++j) {
+    for (size_t j = 0; j < num_pages_per_request; ++j) {
+      for (size_t h = 0; h < num_heads; ++h) {
         for (size_t entry_idx = 0; entry_idx < page_size; ++entry_idx) {
-        std::copy(
-            kv_data_cpu.begin() + paged_kv_cpu.get_k_elem_offset(i + j * batch_size, h, entry_idx, 0),
-            kv_data_cpu.begin() + paged_kv_cpu.get_k_elem_offset(i + j * batch_size, h, entry_idx + 1, 0),
-            key_ref.begin() + (((i * num_pages_per_request + j) * page_size + entry_idx) * num_heads + h) * head_dim);
-        std::copy(
-            kv_data_cpu.begin() + paged_kv_cpu.get_v_elem_offset(i + j * batch_size, h, entry_idx, 0),
-            kv_data_cpu.begin() + paged_kv_cpu.get_v_elem_offset(i + j * batch_size, h, entry_idx + 1, 0),
-            value_ref.begin() + (((i * num_pages_per_request + j) * page_size + entry_idx) * num_heads + h) * head_dim);
+          std::copy(
+              kv_data_cpu.begin() +
+                  paged_kv_cpu.get_k_elem_offset(i + j * batch_size, h, entry_idx, 0),
+              kv_data_cpu.begin() +
+                  paged_kv_cpu.get_k_elem_offset(i + j * batch_size, h, entry_idx + 1, 0),
+              key_ref.begin() +
+                  (((i * num_pages_per_request + j) * page_size + entry_idx) * num_heads + h) *
+                      head_dim);
+          std::copy(
+              kv_data_cpu.begin() +
+                  paged_kv_cpu.get_v_elem_offset(i + j * batch_size, h, entry_idx, 0),
+              kv_data_cpu.begin() +
+                  paged_kv_cpu.get_v_elem_offset(i + j * batch_size, h, entry_idx + 1, 0),
+              value_ref.begin() +
+                  (((i * num_pages_per_request + j) * page_size + entry_idx) * num_heads + h) *
+                      head_dim);
         }
       }
     }
@@ -178,20 +186,23 @@ void _TestPagedKVCacheToRaggedTensorCorrectness(size_t page_size, size_t batch_s
       thrust::raw_pointer_cast(paged_kv_indices_gpu.data()),
       thrust::raw_pointer_cast(paged_kv_last_page_offset_gpu.data()));
 
-  thrust::device_vector<T> key(batch_size * num_pages_per_request * page_size * num_heads * head_dim);
-  thrust::device_vector<T> value(batch_size * num_pages_per_request * page_size * num_heads * head_dim);
-  thrust::device_vector<int32_t> kv_indptr(batch_size + 1);
+  std::vector<int32_t> kv_indptr_h(batch_size + 1);
+  PagedKVCacheToRaggedTensorComputeIndptr<T, int32_t>(paged_kv_gpu, kv_indptr_h);
+  for (size_t i = 0; i < kv_indptr_h.size(); ++i) {
+    EXPECT_EQ(kv_indptr_h[i], kv_indptr_ref[i]);
+  }
+
+  thrust::device_vector<T> key(batch_size * num_pages_per_request * page_size * num_heads *
+                               head_dim);
+  thrust::device_vector<T> value(batch_size * num_pages_per_request * page_size * num_heads *
+                                 head_dim);
+  thrust::device_vector<int32_t> kv_indptr = kv_indptr_h;
   PagedKVCacheToRaggedTensor<T, int32_t>(paged_kv_gpu, thrust::raw_pointer_cast(key.data()),
                                          thrust::raw_pointer_cast(value.data()),
                                          thrust::raw_pointer_cast(kv_indptr.data()));
 
   thrust::host_vector<T> key_h(key);
   thrust::host_vector<T> value_h(value);
-  thrust::host_vector<int32_t> kv_indptr_h(kv_indptr);
-
-  for (size_t i = 0; i < kv_indptr_h.size(); ++i) {
-    EXPECT_EQ(kv_indptr_h[i], kv_indptr_ref[i]);
-  }
   size_t num_result_errors_atol_1e_3_rtol_1e_3 = 0;
   bool nan_detected = false;
   for (size_t i = 0; i < key_h.size(); ++i) {
@@ -242,26 +253,42 @@ void TestPagedKVCacheToRaggedTensorCorrectness() {
   }
 }
 
-// TEST(FlashInferCorrectnessTest, AppendPagedKVKernelCorrectnessTestFP16) {
-//   TestAppendPagedKVKernelCorrectness<half>();
-// }
+TEST(FlashInferCorrectnessTest, AppendPagedKVKernelCorrectnessTestFP16) {
+  TestAppendPagedKVKernelCorrectness<half>();
+}
 
-// TEST(FlashInferCorrectnessTest, AppendPagedKVKernelCorrectnessTestBF16) {
-//   TestAppendPagedKVKernelCorrectness<__nv_bfloat16>();
-// }
+TEST(FlashInferCorrectnessTest, AppendPagedKVKernelCorrectnessTestBF16) {
+  TestAppendPagedKVKernelCorrectness<__nv_bfloat16>();
+}
 
-// TEST(FlashInferCorrectnessTest, AppendPagedKVKernelCorrectnessTestFP32) {
-//   TestAppendPagedKVKernelCorrectness<float>();
-// }
+TEST(FlashInferCorrectnessTest, AppendPagedKVKernelCorrectnessTestFP32) {
+  TestAppendPagedKVKernelCorrectness<float>();
+}
+
+TEST(FlashInferCorrectnessTest, AppendPagedKVKernelCorrectnessTestE4M3) {
+  TestAppendPagedKVKernelCorrectness<__nv_fp8_e4m3>();
+}
+
+TEST(FlashInferCorrectnessTest, AppendPagedKVKernelCorrectnessTestE5M2) {
+  TestAppendPagedKVKernelCorrectness<__nv_fp8_e5m2>();
+}
 
 TEST(FlashInferCorrectnessTest, PagedKVCacheToRaggedTensorCorrectnessTestFP16) {
   TestPagedKVCacheToRaggedTensorCorrectness<half>();
 }
 
-// TEST(FlashInferCorrectnessTest, AppendPagedKVKernelCorrectnessTestE4M3) {
-//   TestAppendPagedKVKernelCorrectness<__nv_fp8_e4m3>();
-// }
+TEST(FlashInferCorrectnessTest, PagedKVCacheToRaggedTensorCorrectnessTestBF16) {
+  TestPagedKVCacheToRaggedTensorCorrectness<__nv_bfloat16>();
+}
 
-// TEST(FlashInferCorrectnessTest, AppendPagedKVKernelCorrectnessTestE5M2) {
-//   TestAppendPagedKVKernelCorrectness<__nv_fp8_e5m2>();
-// }
+TEST(FlashInferCorrectnessTest, PagedKVCacheToRaggedTensorCorrectnessTestFP32) {
+  TestPagedKVCacheToRaggedTensorCorrectness<float>();
+}
+
+TEST(FlashInferCorrectnessTest, PagedKVCacheToRaggedTensorCorrectnessTestE4M3) {
+  TestPagedKVCacheToRaggedTensorCorrectness<__nv_fp8_e4m3>();
+}
+
+TEST(FlashInferCorrectnessTest, PagedKVCacheToRaggedTensorCorrectnessTestE5M2) {
+  TestPagedKVCacheToRaggedTensorCorrectness<__nv_fp8_e5m2>();
+}
