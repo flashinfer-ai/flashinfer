@@ -234,27 +234,26 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   size_t chunk_end = chunk_start + kv_chunk_size;
 
   // preload k tiles and v tiles
-  size_t producer_kv_idx_base = chunk_start + ty, copy_stage_idx = 0;
+  size_t producer_kv_idx_base = chunk_start + ty;
   constexpr size_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
 #pragma unroll
   for (size_t iter = 0; iter < num_stages_smem; ++iter) {
     size_t producer_kv_idx = producer_kv_idx_base;
     cp_async::pred_load<vec_bits, true>(
-        k_smem + (copy_stage_idx * bdy + ty) * head_dim + tx * vec_size,
+        k_smem + (iter * bdy + ty) * head_dim + tx * vec_size,
         k + kv_info.get_kv_elem_offset(producer_kv_idx, head_idx, tx * vec_size),
         producer_kv_idx < chunk_end);
     cp_async::commit_group();
     cp_async::pred_load<vec_bits, true>(
-        v_smem + (copy_stage_idx * bdy + ty) * head_dim + tx * vec_size,
+        v_smem + (iter * bdy + ty) * head_dim + tx * vec_size,
         v + kv_info.get_kv_elem_offset(producer_kv_idx, head_idx, tx * vec_size),
         producer_kv_idx < chunk_end);
     cp_async::commit_group();
     producer_kv_idx_base += bdy;
-    copy_stage_idx += (copy_stage_idx + 1) % num_stages_smem;
   }
 
   // pipelining k/v tiles loading and state updating
-  size_t consumer_kv_idx_base = chunk_start + ty, compute_stage_idx = 0;
+  size_t consumer_kv_idx_base = chunk_start + ty, stage_idx = 0;
   state_t<vec_size> s_partial;
   float x = 0.f;
 
@@ -264,13 +263,12 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     // compute qk
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    compute_qk<rotary_mode, vec_size, bdx>(k_smem + (compute_stage_idx * bdy + ty) * head_dim,
-                                           q_vec, freq, consumer_kv_idx, compute_stage_idx,
-                                           num_heads, sm_scale, x);
+    compute_qk<rotary_mode, vec_size, bdx>(k_smem + (stage_idx * bdy + ty) * head_dim, q_vec, freq,
+                                           consumer_kv_idx, stage_idx, num_heads, sm_scale, x);
     block.sync();
     // load k
     cp_async::pred_load<vec_bits, true>(
-        k_smem + (copy_stage_idx * bdy + ty) * head_dim + tx * vec_size,
+        k_smem + (stage_idx * bdy + ty) * head_dim + tx * vec_size,
         k + kv_info.get_kv_elem_offset(producer_kv_idx, head_idx, tx * vec_size),
         producer_kv_idx < chunk_end);
     cp_async::commit_group();
@@ -278,19 +276,18 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     // update m/d/o state
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    update_partial_state<vec_size, bdx>(v_smem + (compute_stage_idx * bdy + ty) * head_dim, x,
-                                        compute_stage_idx, consumer_kv_idx < chunk_end, s_partial);
+    update_partial_state<vec_size, bdx>(v_smem + (stage_idx * bdy + ty) * head_dim, x, stage_idx,
+                                        consumer_kv_idx < chunk_end, s_partial);
     block.sync();
 
     // load v
     cp_async::pred_load<vec_bits, true>(
-        v_smem + (copy_stage_idx * bdy + ty) * head_dim + tx * vec_size,
+        v_smem + (stage_idx * bdy + ty) * head_dim + tx * vec_size,
         v + kv_info.get_kv_elem_offset(producer_kv_idx, head_idx, tx * vec_size),
         producer_kv_idx < chunk_end);
     cp_async::commit_group();
 
-    copy_stage_idx = (copy_stage_idx + 1) % num_stages_smem;
-    compute_stage_idx = (compute_stage_idx + 1) % num_stages_smem;
+    stage_idx = (stage_idx + 1) % num_stages_smem;
     producer_kv_idx_base += bdy;
     consumer_kv_idx_base += bdy;
   }
