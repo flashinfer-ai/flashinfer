@@ -196,7 +196,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   auto block = cg::this_thread_block();
   auto grid = cg::this_grid();
 
-  constexpr size_t num_stages_smem = 4;
+  constexpr size_t num_stages_smem = 2;
   constexpr size_t head_dim = bdx * vec_size;
   size_t head_idx = blockIdx.y;
   size_t kv_chunk_idx = blockIdx.x;
@@ -207,6 +207,8 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   static_assert(bdx * bdy == 128);
   // static_assert(num_stages_smem >= sizeof(float) / sizeof(DTypeIn));
   __shared__ DTypeIn smem[2 * num_stages_smem * bdy * head_dim];
+  DTypeIn *k_smem = smem;
+  DTypeIn *v_smem = smem + num_stages_smem * bdy * head_dim;
   __shared__ float smem_md[2 * bdy];
 
   size_t tx = threadIdx.x, ty = threadIdx.y;
@@ -235,20 +237,20 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   size_t producer_kv_idx_base = chunk_start + ty, copy_stage_idx = 0;
   constexpr size_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
 #pragma unroll
-  for (size_t iter = 0; iter < num_stages_smem - 1; ++iter) {
+  for (size_t iter = 0; iter < num_stages_smem; ++iter) {
     size_t producer_kv_idx = producer_kv_idx_base;
     cp_async::pred_load<vec_bits, true>(
-        smem + (copy_stage_idx * bdy + ty) * head_dim + tx * vec_size,
+        k_smem + (copy_stage_idx * bdy + ty) * head_dim + tx * vec_size,
         k + kv_info.get_kv_elem_offset(producer_kv_idx, head_idx, tx * vec_size),
         producer_kv_idx < chunk_end);
+    cp_async::commit_group();
     cp_async::pred_load<vec_bits, true>(
-        smem + (num_stages_smem * bdy * head_dim) + (copy_stage_idx * bdy + ty) * head_dim +
-            tx * vec_size,
+        v_smem + (copy_stage_idx * bdy + ty) * head_dim + tx * vec_size,
         v + kv_info.get_kv_elem_offset(producer_kv_idx, head_idx, tx * vec_size),
         producer_kv_idx < chunk_end);
     cp_async::commit_group();
     producer_kv_idx_base += bdy;
-    copy_stage_idx += 1;
+    copy_stage_idx += (copy_stage_idx + 1) % num_stages_smem;
   }
 
   // pipelining k/v tiles loading and state updating
@@ -259,32 +261,41 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
 #pragma unroll 4
   for (size_t iter = 0; iter < (kv_chunk_size + bdy - 1) / bdy; ++iter) {
     size_t producer_kv_idx = producer_kv_idx_base, consumer_kv_idx = consumer_kv_idx_base;
-    // load stage
+    // compute qk
+    cp_async::wait_group<2 * num_stages_smem - 1>();
+    block.sync();
+    compute_qk<rotary_mode, vec_size, bdx>(k_smem + (compute_stage_idx * bdy + ty) * head_dim,
+                                           q_vec, freq, consumer_kv_idx, compute_stage_idx,
+                                           num_heads, sm_scale, x);
+    block.sync();
+    // load k
     cp_async::pred_load<vec_bits, true>(
-        smem + (copy_stage_idx * bdy + ty) * head_dim + tx * vec_size,
+        k_smem + (copy_stage_idx * bdy + ty) * head_dim + tx * vec_size,
         k + kv_info.get_kv_elem_offset(producer_kv_idx, head_idx, tx * vec_size),
         producer_kv_idx < chunk_end);
+    cp_async::commit_group();
+
+    // update m/d/o state
+    cp_async::wait_group<2 * num_stages_smem - 1>();
+    block.sync();
+    update_partial_state<vec_size, bdx>(v_smem + (compute_stage_idx * bdy + ty) * head_dim, x,
+                                        compute_stage_idx, consumer_kv_idx < chunk_end, s_partial);
+    block.sync();
+
+    // load v
     cp_async::pred_load<vec_bits, true>(
-        smem + (num_stages_smem * bdy * head_dim) + (copy_stage_idx * bdy + ty) * head_dim +
-            tx * vec_size,
+        v_smem + (copy_stage_idx * bdy + ty) * head_dim + tx * vec_size,
         v + kv_info.get_kv_elem_offset(producer_kv_idx, head_idx, tx * vec_size),
         producer_kv_idx < chunk_end);
     cp_async::commit_group();
-    // compute stage
-    cp_async::wait_group<num_stages_smem - 1>();
-    block.sync();
-    compute_qk<rotary_mode, vec_size, bdx>(smem + (compute_stage_idx * bdy + ty) * head_dim, q_vec,
-                                           freq, consumer_kv_idx, compute_stage_idx, num_heads,
-                                           sm_scale, x);
-    update_partial_state<vec_size, bdx>(
-        smem + (num_stages_smem * bdy * head_dim) + (compute_stage_idx * bdy + ty) * head_dim, x,
-        compute_stage_idx, consumer_kv_idx < chunk_end, s_partial);
-    block.sync();
+
     copy_stage_idx = (copy_stage_idx + 1) % num_stages_smem;
     compute_stage_idx = (compute_stage_idx + 1) % num_stages_smem;
     producer_kv_idx_base += bdy;
     consumer_kv_idx_base += bdy;
   }
+  cp_async::wait_group<0>();
+  block.sync();
 
   // sync partial state of all warps inside a threadblock
   sync_state<vec_size, bdx, bdy>(s_partial, reinterpret_cast<float *>(smem), smem_md);
