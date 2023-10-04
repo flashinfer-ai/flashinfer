@@ -64,7 +64,6 @@ __device__ __forceinline__ void produce_kv(permuted_smem_t<stride, T> *smem, T *
                                            const tensor_info_t<layout> &qkv_info,
                                            size_t kv_idx_base, size_t kv_len, size_t head_idx) {
   size_t tx = threadIdx.x, ty = threadIdx.y;
-  auto block = cg::this_thread_block();
 #pragma unroll
   for (size_t step = 0; step < num_frags_z * num_frags_y / num_warps; ++step) {
     size_t i = 8 * ((step * num_warps + ty) / (num_frags_y / 2)) + tx / 4,
@@ -73,7 +72,6 @@ __device__ __forceinline__ void produce_kv(permuted_smem_t<stride, T> *smem, T *
     smem->load_bank_async(i, j, gmem + qkv_info.get_kv_elem_offset(kv_idx, head_idx, feat_idx),
                           kv_idx < kv_len);
   }
-  block.sync();
 }
 
 template <QKVLayout layout, RotaryMode rotary_mode, size_t num_frags_y, size_t num_frags_z,
@@ -84,11 +82,11 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
                                                tensor_info_t<layout> qkv_info, bool causal,
                                                float sm_scale, float rope_inv_scale,
                                                float rope_inv_theta) {
-  size_t qo_len = qkv_info.qo_len;
-  size_t kv_len = qkv_info.kv_len;
-  size_t tx = threadIdx.x, ty = threadIdx.y;
-  size_t bx = blockIdx.x, head_idx = blockIdx.y;
-  size_t num_heads = gridDim.y;
+  const size_t qo_len = qkv_info.qo_len;
+  const size_t kv_len = qkv_info.kv_len;
+  const size_t tx = threadIdx.x, ty = threadIdx.y;
+  const size_t bx = blockIdx.x, head_idx = blockIdx.y;
+  const size_t num_heads = gridDim.y;
   auto block = cg::this_thread_block();
   cg::thread_block_tile g = cg::tiled_partition<4>(block);
 
@@ -195,7 +193,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
 
   size_t consumer_kv_idx_base = 0, compute_stage_idx = 0;
   size_t effective_kv_len =
-      causal ? min(kv_len, kv_len - qo_len + ((bx + 1) * num_warps) * mma::frag_size) : kv_len;
+      causal ? min(kv_len, (kv_len - qo_len) + ((bx + 1) * num_warps) * mma::frag_size) : kv_len;
 #pragma unroll 8
   for (size_t iter = 0; iter < (effective_kv_len + (mma::frag_size * num_frags_z - 1)) /
                                    (mma::frag_size * num_frags_z);
@@ -335,6 +333,8 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     producer_kv_idx_base += mma::frag_size * num_frags_z;
     consumer_kv_idx_base += mma::frag_size * num_frags_z;
   }
+  cp_async::wait_group<0>();
+  block.sync();
 
   // divide d
 #pragma unroll
