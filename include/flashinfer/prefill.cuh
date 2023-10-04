@@ -13,6 +13,7 @@
 #include "layout.cuh"
 #include "math.cuh"
 #include "mma.cuh"
+#include "page.cuh"
 #include "permuted_smem.cuh"
 #include "rope.cuh"
 #include "state.cuh"
@@ -400,6 +401,50 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOu
             FLASHINFER_CUDA_CALL(
                 cudaLaunchKernel((void *)kernel, nblks, nthrs, args, smem_size, stream));
           })})});
+  return cudaSuccess;
+}
+
+template <typename DTypeIn, typename DTypeOut, typename IdType>
+cudaError_t BatchPrefillWithPagedKVCache(DTypeIn *q, paged_kv_t<DTypeIn, IdType> paged_kv,
+                                         IdType *q_indptr, DTypeOut *o, float *tmp,
+                                         bool causal = true,
+                                         RotaryMode rotary_mode = RotaryMode::kNone,
+                                         float rope_scale = 1.f, float rope_theta = 1e4,
+                                         cudaStream_t stream = nullptr, size_t dev_id = 0) {
+  const float sm_scale = 1.f / std::sqrt(float(paged_kv.head_dim));
+  const float rope_inv_scale = 1.f / rope_scale;
+  const float rope_inv_theta = 1.f / rope_theta;
+
+  FLASHINFER_CUDA_CALL(cudaSetDevice(dev_id));
+  std::vector<IdType> q_indptr_h(paged_kv.batch_size + 1);
+  std::vector<IdType> kv_indptr_h(paged_kv.batch_size + 1);
+
+  DTypeIn *keys = nullptr, *values = nullptr;
+  IdType *kv_indptr = nullptr;
+  FLASHINFER_CUDA_CALL(cudaMallocAsync(&keys, 2 * 1024 * 1024 * sizeof(DTypeIn), stream));
+  FLASHINFER_CUDA_CALL(cudaMallocAsync(&values, 2 * 1024 * 1024 * sizeof(DTypeIn), stream));
+  FLASHINFER_CUDA_CALL(cudaMallocAsync(&kv_indptr, 2 * 1024 * 1024 * sizeof(IdType), stream));
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(q_indptr_h.data(), q_indptr,
+                                       sizeof(IdType) * (paged_kv.batch_size + 1),
+                                       cudaMemcpyDeviceToHost, stream));
+  FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
+  PagedKVCacheToRaggedTensor(paged_kv, keys, values, kv_indptr, stream);
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(kv_indptr_h.data(), kv_indptr,
+                                       sizeof(IdType) * (paged_kv.batch_size + 1),
+                                       cudaMemcpyDeviceToHost, stream));
+  FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
+
+  for (size_t batch_idx = 0; batch_idx < paged_kv.batch_size; ++batch_idx) {
+    SinglePrefillWithKVCache(
+        q + q_indptr_h[batch_idx] * paged_kv.num_heads * paged_kv.head_dim,
+        keys + kv_indptr_h[batch_idx] * paged_kv.num_heads * paged_kv.head_dim,
+        values + kv_indptr_h[batch_idx] * paged_kv.num_heads * paged_kv.head_dim,
+        o + q_indptr_h[batch_idx] * paged_kv.num_heads * paged_kv.head_dim, nullptr,
+        paged_kv.num_heads, q_indptr_h[batch_idx + 1] - q_indptr_h[batch_idx],
+        kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx], paged_kv.head_dim, causal,
+        QKVLayout::kNHD, rotary_mode, rope_scale, rope_theta, stream, dev_id);
+  }
+
   return cudaSuccess;
 }
 

@@ -75,7 +75,8 @@ struct paged_kv_t {
            feat_idx;
   }
 
-  __host__ __device__ __forceinline__ size_t get_valid_page_size(size_t batch_idx, size_t page_iter) {
+  __host__ __device__ __forceinline__ size_t get_valid_page_size(size_t batch_idx,
+                                                                 size_t page_iter) {
     if (page_iter == indptr[batch_idx + 1] - 1) {
       return last_page_offset[batch_idx];
     } else {
@@ -141,6 +142,28 @@ __global__ void AppendPagedKVCachePrefillKernel(paged_kv_t<DType, IdType> paged_
   }
 }
 
+template <size_t head_dim, size_t vec_size, size_t bdx, size_t bdy, typename DType, typename IdType>
+__global__ void PagedKVCacheToRaggedTensorKernel(paged_kv_t<DType, IdType> paged_kv,
+                                                 DType* __restrict__ key, DType* __restrict__ value,
+                                                 IdType* __restrict__ kv_indptr) {
+  size_t tx = threadIdx.x, ty = threadIdx.y;
+  size_t num_heads = paged_kv.num_heads;
+  size_t batch_idx = blockIdx.x / (num_heads / bdy);
+  size_t head_idx = (blockIdx.x % (num_heads / bdy)) * bdy + ty;
+
+#pragma unroll 2
+  for (size_t j = 0; j < kv_indptr[batch_idx + 1] - kv_indptr[batch_idx]; ++j) {
+    size_t page_idx = j / paged_kv.page_size;
+    size_t entry_idx = j % paged_kv.page_size;
+    vec_t<DType, vec_size>::memcpy(
+        key + ((kv_indptr[batch_idx] + j) * num_heads + head_idx) * head_dim + tx * vec_size,
+        paged_kv.data + paged_kv.get_k_elem_offset(page_idx, head_idx, entry_idx, tx * vec_size));
+    vec_t<DType, vec_size>::memcpy(
+        value + ((kv_indptr[batch_idx] + j) * num_heads + head_idx) * head_dim + tx * vec_size,
+        paged_kv.data + paged_kv.get_v_elem_offset(page_idx, head_idx, entry_idx, tx * vec_size));
+  }
+}
+
 template <typename DType, typename IdType>
 cudaError_t AppendPagedKVCacheDecode(paged_kv_t<DType, IdType> paged_kv, DType* key, DType* value,
                                      cudaStream_t stream = nullptr, size_t dev_id = 0) {
@@ -179,6 +202,54 @@ cudaError_t AppendPagedKVCachePrefill(paged_kv_t<DType, IdType> paged_kv, DType*
     dim3 nthrs(bdx, bdy);
     auto kernel = AppendPagedKVCachePrefillKernel<HEAD_DIM, vec_size, bdx, bdy, DType, IdType>;
     void* args[] = {(void*)&paged_kv, (void*)&key, (void*)&value, (void*)&append_indptr};
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+  });
+  return cudaSuccess;
+}
+
+template <typename DType, typename IdType>
+cudaError_t PagedKVCacheToRaggedTensor(paged_kv_t<DType, IdType> paged_kv, DType* key, DType* value,
+                                       IdType* kv_indptr, cudaStream_t stream = nullptr,
+                                       size_t dev_id = 0) {
+  FLASHINFER_CUDA_CALL(cudaSetDevice(dev_id));
+  const size_t head_dim = paged_kv.head_dim;
+  const size_t batch_size = paged_kv.batch_size;
+  const size_t num_heads = paged_kv.num_heads;
+  const size_t page_size = paged_kv.page_size;
+  std::vector<IdType> paged_kv_indptr_host(batch_size + 1),
+      paged_kv_last_page_offset_host(batch_size), kv_indptr_host(batch_size + 1);
+
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(paged_kv_indptr_host.data(), paged_kv.indptr,
+                                       sizeof(IdType) * (batch_size + 1), cudaMemcpyDeviceToHost,
+                                       stream));
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(paged_kv_last_page_offset_host.data(),
+                                       paged_kv.last_page_offset, sizeof(IdType) * batch_size,
+                                       cudaMemcpyDeviceToHost, stream));
+
+  FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
+
+  kv_indptr_host[0] = 0;
+  for (size_t i = 0; i < batch_size; ++i) {
+    kv_indptr_host[i + 1] =
+        kv_indptr_host[i] +
+        (paged_kv_indptr_host[i + 1] - paged_kv_indptr_host[i] - 1) * page_size +
+        paged_kv_last_page_offset_host[i];
+  }
+
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(kv_indptr, kv_indptr_host.data(),
+                                       sizeof(IdType) * (batch_size + 1), cudaMemcpyHostToDevice,
+                                       stream));
+  FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
+
+  SWITCH_HEAD_DIM(head_dim, HEAD_DIM, {
+    constexpr size_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
+    constexpr size_t bdx = HEAD_DIM / vec_size;
+    constexpr size_t bdy = 128 / bdx;
+    assert(num_heads % bdy == 0);
+    dim3 nblks(batch_size * num_heads / bdy);
+    dim3 nthrs(bdx, bdy);
+    auto kernel = PagedKVCacheToRaggedTensorKernel<HEAD_DIM, vec_size, bdx, bdy, DType, IdType>;
+    void* args[] = {(void*)&paged_kv, (void*)&key, (void*)&value, (void*)&kv_indptr};
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
   });
   return cudaSuccess;
