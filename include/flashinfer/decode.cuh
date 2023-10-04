@@ -108,6 +108,7 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
  * \tparam vec_size A template integer indicates the vector size
  * \tparam bdx A template integer indicates the block size in x dimension
  * \tparam T A template type indicates the input data type
+ * \tparam norm_on_the_fly Whether to normalize on the fly or not
  * \param smem A pointer to the start of shared memory
  * \param x A float indicates the pre-softmax logits
  * \param kv_shared_offset An array of size_t indicates the k/v tiles offset in shared
@@ -116,10 +117,10 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
  * \param pred_guard A boolean indicates whether the current thread is in the valid range
  * \param s The flashattention state to be updated
  */
-template <size_t vec_size, size_t bdx, typename T>
+template <size_t vec_size, size_t bdx, typename T, bool norm_on_the_fly>
 __device__ __forceinline__ void update_partial_state(const T *smem, const float x,
                                                      size_t compute_stage_idx, bool pred_guard,
-                                                     state_t<vec_size> &s) {
+                                                     state_t<vec_size, norm_on_the_fly> &s) {
   constexpr size_t head_dim = bdx * vec_size;
   vec_t<float, vec_size> v_vec;
   size_t tx = threadIdx.x, ty = threadIdx.y;
@@ -134,12 +135,14 @@ __device__ __forceinline__ void update_partial_state(const T *smem, const float 
  * \tparam vec_size A template integer indicates the vector size
  * \tparam bdx A template integer indicates the block size in x dimension
  * \tparam bdy A template integer indicates the block size in y dimension
+ * \tparam norm_on_the_fly Whether to normalize on the fly or not
  * \param s The warp local state
  * \param smem The pointer to shared memory buffer for o
  * \param smem_md The pointer to shared memory buffer for m/d
  */
-template <size_t vec_size, size_t bdx, size_t bdy>
-__device__ __forceinline__ void sync_state(state_t<vec_size> &s, float *smem, float *smem_md) {
+template <size_t vec_size, size_t bdx, size_t bdy, bool norm_on_the_fly>
+__device__ __forceinline__ void sync_state(state_t<vec_size, norm_on_the_fly> &s, float *smem,
+                                           float *smem_md) {
   constexpr size_t head_dim = bdx * vec_size;
   auto block = cg::this_thread_block();
   size_t tx = threadIdx.x, ty = threadIdx.y;
@@ -164,6 +167,7 @@ __device__ __forceinline__ void sync_state(state_t<vec_size> &s, float *smem, fl
  * sequence, fused with RoPE.
  * \tparam layout The layout of k/v matrices (NHD or HND)
  * \tparam cooperative Whether to use cooperative kernel or not
+ * \tparam norm_on_the_fly Whether to normalize on the fly or not
  * \tparam rotary_mode The rotary mode
  * \tparam vec_size A template integer indicates the vector size
  * \tparam bdx A template integer indicates the block size in x dimension
@@ -185,8 +189,8 @@ __device__ __forceinline__ void sync_state(state_t<vec_size> &s, float *smem, fl
  *   of "theta" used in RoPE (Rotary Positional Embeddings)
  * \param kv_chunk_size A integer indicates the kv-chunk size
  */
-template <QKVLayout layout, bool cooperative, RotaryMode rotary_mode, size_t vec_size, size_t bdx,
-          size_t bdy, typename DTypeIn, typename DTypeOut>
+template <QKVLayout layout, bool cooperative, bool norm_on_the_fly, RotaryMode rotary_mode,
+          size_t vec_size, size_t bdx, size_t bdy, typename DTypeIn, typename DTypeOut>
 __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *__restrict__ k,
                                               DTypeIn *__restrict__ v, DTypeOut *__restrict__ o,
                                               float *__restrict__ tmp,
@@ -254,7 +258,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
 
   // pipelining k/v tiles loading and state updating
   size_t consumer_kv_idx_base = chunk_start + ty, stage_idx = 0;
-  state_t<vec_size> s_partial;
+  state_t<vec_size, norm_on_the_fly> s_partial;
   float x = 0.f;
 
 #pragma unroll 4
@@ -307,7 +311,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
 
     // sync global states
     if (kv_chunk_idx == 0) {
-      state_t<vec_size> s_global;
+      state_t<vec_size, norm_on_the_fly> s_global;
 #pragma unroll 4
       for (size_t iter = 0; iter < (num_kv_chunks + bdy - 1) / bdy; ++iter) {
         size_t kv_chunk_idx = iter * bdy + ty;
@@ -322,11 +326,13 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
       block.sync();
       // sync partial state of all warps inside a threadblock
       sync_state<vec_size, bdx, bdy>(s_global, reinterpret_cast<float *>(smem), smem_md);
+      s_global.normalize();
       s_global.o.cast_store(o + head_idx * head_dim + tx * vec_size);
       tmp[head_idx] = s_global.m;
       tmp[num_heads + head_idx] = s_global.d;
     }
   } else {
+    s_partial.normalize();
     s_partial.o.cast_store(o + head_idx * head_dim + tx * vec_size);
   }
 }
@@ -357,7 +363,7 @@ __forceinline__ __device__ void AdvancePageIterator(
  * \brief FlashAttention decoding cuda kernel with PagedKVCcache for batch requests,
  *   fused with RoPE.
  * \tparam rotary_mode The rotary mode
- * \tparam head_dim A template integer indicates the head dimension
+ * \tparam norm_on_the_fly Whether to normalize on the fly or not
  * \tparam vec_size A template integer indicates the vector size
  * \tparam bdx A template integer indicates the block size in x dimension
  * \tparam bdy A template integer indicates the block size in y dimension
@@ -374,8 +380,8 @@ __forceinline__ __device__ void AdvancePageIterator(
  * \param rope_inv_theta A floating number indicate the multiplicative inverse
  *   of "theta" used in RoPE (Rotary Positional Embeddings)
  */
-template <RotaryMode rotary_mode, size_t vec_size, size_t bdx, size_t bdy, typename DTypeIn,
-          typename DTypeOut, typename IdType>
+template <RotaryMode rotary_mode, bool norm_on_the_fly, size_t vec_size, size_t bdx, size_t bdy,
+          typename DTypeIn, typename DTypeOut, typename IdType>
 __global__ void BatchDecodeWithPagedKVCacheKernel(DTypeIn *__restrict__ q,
                                                   paged_kv_t<DTypeIn, IdType> paged_kv,
                                                   DTypeOut *__restrict__ o, float sm_scale,
@@ -449,7 +455,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(DTypeIn *__restrict__ q,
     producer_entry_base += bdy;
   }
 
-  state_t<vec_size> s;
+  state_t<vec_size, norm_on_the_fly> s;
   float x = 0.f;
   size_t consumer_kv_idx_base = 0;
 
@@ -505,6 +511,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(DTypeIn *__restrict__ q,
 
   // sync partial state of all warps inside a threadblock
   sync_state<vec_size, bdx, bdy>(s, reinterpret_cast<float *>(smem), smem_md);
+  s.normalize();
 
   // update global states
   s.o.cast_store(o + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
@@ -541,6 +548,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
   const float sm_scale = 1.f / std::sqrt(float(head_dim));
   const float rope_inv_scale = 1.f / rope_scale;
   const float rope_inv_theta = 1.f / rope_theta;
+  constexpr bool norm_on_the_fly = false;
 
   FLASHINFER_CUDA_CALL(cudaSetDevice(dev_id));
 
@@ -554,8 +562,9 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
             tensor_info_t<QKV_LAYOUT> kv_info(1, seq_len, num_heads, head_dim);
             if (seq_len <= 128) {
               // no need to use cooperative kernel
-              auto kernel = SingleDecodeWithKVCacheKernel<QKV_LAYOUT, false, ROTARY_MODE, vec_size,
-                                                          bdx, bdy, DTypeIn, DTypeOut>;
+              auto kernel =
+                  SingleDecodeWithKVCacheKernel<QKV_LAYOUT, false, norm_on_the_fly, ROTARY_MODE,
+                                                vec_size, bdx, bdy, DTypeIn, DTypeOut>;
               dim3 nblks = dim3(1, num_heads);
               dim3 nthrs = dim3(bdx, bdy);
               void *args[] = {(void *)&q,
@@ -571,8 +580,9 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
               FLASHINFER_CUDA_CALL(cudaLaunchKernel((void *)kernel, nblks, nthrs, args, 0, stream));
             } else {
               // use cooperative kernel
-              auto kernel = SingleDecodeWithKVCacheKernel<QKV_LAYOUT, true, ROTARY_MODE, vec_size,
-                                                          bdx, bdy, DTypeIn, DTypeOut>;
+              auto kernel =
+                  SingleDecodeWithKVCacheKernel<QKV_LAYOUT, true, norm_on_the_fly, ROTARY_MODE,
+                                                vec_size, bdx, bdy, DTypeIn, DTypeOut>;
               int num_blocks_per_sm = 0;
               int num_sm = 0;
               FLASHINFER_CUDA_CALL(
@@ -629,6 +639,7 @@ cudaError_t BatchDecodeWithPagedKVCache(DTypeIn *q, paged_kv_t<DTypeIn, IdType> 
   const float sm_scale = 1.f / std::sqrt(float(paged_kv.head_dim));
   const float rope_inv_scale = 1.f / rope_scale;
   const float rope_inv_theta = 1.f / rope_theta;
+  constexpr bool norm_on_the_fly = false;
 
   FLASHINFER_CUDA_CALL(cudaSetDevice(dev_id));
 
@@ -639,8 +650,8 @@ cudaError_t BatchDecodeWithPagedKVCache(DTypeIn *q, paged_kv_t<DTypeIn, IdType> 
         constexpr size_t bdy = 128 / bdx;
         dim3 nblks(paged_kv.batch_size, paged_kv.num_heads);
         dim3 nthrs(bdx, bdy);
-        auto kernel = BatchDecodeWithPagedKVCacheKernel<ROTARY_MODE, vec_size, bdx, bdy, DTypeIn,
-                                                        DTypeOut, IdType>;
+        auto kernel = BatchDecodeWithPagedKVCacheKernel<ROTARY_MODE, norm_on_the_fly, vec_size, bdx,
+                                                        bdy, DTypeIn, DTypeOut, IdType>;
         void *args[] = {(void *)&q,        (void *)&paged_kv,       (void *)&o,
                         (void *)&sm_scale, (void *)&rope_inv_scale, (void *)&rope_inv_theta};
         FLASHINFER_CUDA_CALL(cudaLaunchKernel((void *)kernel, nblks, nthrs, args, 0, stream));
