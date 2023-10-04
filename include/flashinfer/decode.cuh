@@ -331,6 +331,28 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   }
 }
 
+template <typename DType, typename IdType>
+__forceinline__ __device__ void AdvancePageIterator(
+    paged_kv_t<DType, IdType> paged_kv, size_t *kv_idx_base, size_t *valid_page_size,
+    size_t &producer_valid_page_size, size_t &producer_entry_base, size_t &producer_page_iter,
+    size_t &producer_page_idx, size_t cur_page_indptr_begin, size_t cur_page_indptr_end,
+    size_t batch_idx, size_t stage_idx) {
+  const size_t ty = threadIdx.y;
+  if (producer_entry_base >= producer_valid_page_size) {
+    producer_entry_base = 0;
+    producer_page_iter += 1;
+    if (producer_page_iter < cur_page_indptr_end) {
+      producer_page_idx = paged_kv.indices[producer_page_iter];
+      producer_valid_page_size = paged_kv.get_valid_page_size(batch_idx, producer_page_iter);
+    } else {
+      producer_valid_page_size = 0;
+    }
+  }
+  kv_idx_base[stage_idx] =
+      producer_entry_base + ty + (producer_page_iter - cur_page_indptr_begin) * paged_kv.page_size;
+  valid_page_size[stage_idx] = producer_valid_page_size;
+}
+
 /*!
  * \brief FlashAttention decoding cuda kernel with PagedKVCcache for batch requests,
  *   fused with RoPE.
@@ -360,7 +382,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(DTypeIn *__restrict__ q,
                                                   float rope_inv_scale, float rope_inv_theta) {
   auto block = cg::this_thread_block();
 
-  constexpr size_t num_stages_smem = 4;
+  constexpr size_t num_stages_smem = 2;
   constexpr size_t head_dim = bdx * vec_size;
   size_t batch_idx = blockIdx.x;
   size_t head_idx = blockIdx.y;
@@ -373,6 +395,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(DTypeIn *__restrict__ q,
 
   static_assert(bdx * bdy == 128);
   __shared__ DTypeIn smem[2 * num_stages_smem * bdy * head_dim];
+  DTypeIn *k_smem = smem;
+  DTypeIn *v_smem = smem + num_stages_smem * bdy * head_dim;
   __shared__ float smem_md[2 * bdy];
 
   size_t tx = threadIdx.x, ty = threadIdx.y;
@@ -395,103 +419,89 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(DTypeIn *__restrict__ q,
   block.sync();
 
   // preload k/v tiles
-  size_t producer_entry_base = ty, copy_stage_idx = 0;
+  size_t producer_entry_base = 0, stage_idx = 0;
   constexpr size_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
   size_t producer_page_iter = cur_page_indptr_begin;
   size_t producer_page_idx = paged_kv.indices[producer_page_iter];
   size_t producer_valid_page_size = paged_kv.get_valid_page_size(batch_idx, producer_page_iter);
   size_t kv_idx_base[num_stages_smem]{0};
   size_t valid_page_size[num_stages_smem]{0};
-  kv_idx_base[copy_stage_idx] = producer_entry_base;
-  valid_page_size[copy_stage_idx] = producer_valid_page_size;
 #pragma unroll
-  for (size_t iter = 0; iter < num_stages_smem - 1; ++iter) {
-    bool producer_pred_guard = (producer_entry_base < producer_valid_page_size) &&
+  for (size_t iter = 0; iter < num_stages_smem; ++iter) {
+    AdvancePageIterator(paged_kv, kv_idx_base, valid_page_size, producer_valid_page_size,
+                        producer_entry_base, producer_page_iter, producer_page_idx,
+                        cur_page_indptr_begin, cur_page_indptr_end, batch_idx, stage_idx);
+    bool producer_pred_guard = (producer_entry_base + ty < producer_valid_page_size) &&
                                (producer_page_iter < cur_page_indptr_end);
     cp_async::pred_load<vec_bits, true>(
-        smem + (copy_stage_idx * bdy + ty) * head_dim + tx * vec_size,
-        paged_kv.data + paged_kv.get_k_elem_offset(producer_page_idx, head_idx, producer_entry_base,
-                                                   tx * vec_size),
-        producer_pred_guard);
-    cp_async::pred_load<vec_bits, true>(
-        smem + (num_stages_smem * bdy * head_dim) + (copy_stage_idx * bdy + ty) * head_dim +
-            tx * vec_size,
-        paged_kv.data + paged_kv.get_v_elem_offset(producer_page_idx, head_idx, producer_entry_base,
-                                                   tx * vec_size),
+        k_smem + (stage_idx * bdy + ty) * head_dim + tx * vec_size,
+        paged_kv.data + paged_kv.get_k_elem_offset(producer_page_idx, head_idx,
+                                                   producer_entry_base + ty, tx * vec_size),
         producer_pred_guard);
     cp_async::commit_group();
-    copy_stage_idx += 1;
+    cp_async::pred_load<vec_bits, true>(
+        v_smem + (stage_idx * bdy + ty) * head_dim + tx * vec_size,
+        paged_kv.data + paged_kv.get_v_elem_offset(producer_page_idx, head_idx,
+                                                   producer_entry_base + ty, tx * vec_size),
+        producer_pred_guard);
+    cp_async::commit_group();
+    stage_idx = (stage_idx + 1) % num_stages_smem;
     producer_entry_base += bdy;
-    if ((producer_entry_base - ty) >= producer_valid_page_size) {
-      producer_entry_base = ty;
-      producer_page_iter += 1;
-      if (producer_page_iter < cur_page_indptr_end) {
-        producer_page_idx = paged_kv.indices[producer_page_iter];
-        producer_valid_page_size = paged_kv.get_valid_page_size(batch_idx, producer_page_iter);
-      } else {
-        producer_valid_page_size = 0;
-      }
-    }
-    kv_idx_base[copy_stage_idx] =
-        producer_entry_base + (producer_page_iter - cur_page_indptr_begin) * paged_kv.page_size;
-    valid_page_size[copy_stage_idx] = producer_valid_page_size;
   }
 
   state_t<vec_size> s;
   float x = 0.f;
-  size_t consumer_kv_idx_base = 0, compute_stage_idx = 0;
+  size_t consumer_kv_idx_base = 0;
 
   for (size_t consumer_page_iter = cur_page_indptr_begin; consumer_page_iter < cur_page_indptr_end;
        ++consumer_page_iter) {
-    size_t consumer_valid_page_size = valid_page_size[compute_stage_idx];
+    size_t consumer_valid_page_size = valid_page_size[stage_idx];
 #pragma unroll 4
     for (size_t iter = 0; iter < (consumer_valid_page_size + bdy - 1) / bdy; ++iter) {
-      // load stage: load k tiles
-      bool producer_pred_guard = (producer_entry_base < producer_valid_page_size) &&
+      consumer_kv_idx_base = kv_idx_base[stage_idx];
+      bool consumer_pred_guard = (iter * bdy + ty < consumer_valid_page_size);
+      AdvancePageIterator(paged_kv, kv_idx_base, valid_page_size, producer_valid_page_size,
+                          producer_entry_base, producer_page_iter, producer_page_idx,
+                          cur_page_indptr_begin, cur_page_indptr_end, batch_idx, stage_idx);
+      bool producer_pred_guard = (producer_entry_base + ty < producer_valid_page_size) &&
                                  (producer_page_iter < cur_page_indptr_end);
+      // compute qk
+      cp_async::wait_group<2 * num_stages_smem - 1>();
+      block.sync();
+      compute_qk<rotary_mode, vec_size, bdx>(k_smem + (stage_idx * bdy + ty) * head_dim, q_vec,
+                                             freq, consumer_kv_idx_base, stage_idx, num_heads,
+                                             sm_scale, x);
+      block.sync();
+
+      // load k tiles
       cp_async::pred_load<vec_bits, true>(
-          smem + (copy_stage_idx * bdy + ty) * head_dim + tx * vec_size,
+          k_smem + (stage_idx * bdy + ty) * head_dim + tx * vec_size,
           paged_kv.data + paged_kv.get_k_elem_offset(producer_page_idx, head_idx,
-                                                     producer_entry_base, tx * vec_size),
-          producer_pred_guard);
-      cp_async::pred_load<vec_bits, true>(
-          smem + (num_stages_smem * bdy * head_dim) + (copy_stage_idx * bdy + ty) * head_dim +
-              tx * vec_size,
-          paged_kv.data + paged_kv.get_v_elem_offset(producer_page_idx, head_idx,
-                                                     producer_entry_base, tx * vec_size),
+                                                     producer_entry_base + ty, tx * vec_size),
           producer_pred_guard);
       cp_async::commit_group();
 
-      // compute stage: compute qk
-      consumer_kv_idx_base = kv_idx_base[compute_stage_idx];
-      bool consumer_pred_guard = (iter * bdy + ty < consumer_valid_page_size);
-      cp_async::wait_group<num_stages_smem - 1>();
+      // update m/d/o states
+      cp_async::wait_group<2 * num_stages_smem - 1>();
       block.sync();
-      compute_qk<rotary_mode, vec_size, bdx>(smem + (compute_stage_idx * bdy + ty) * head_dim,
-                                             q_vec, freq, consumer_kv_idx_base, compute_stage_idx,
-                                             num_heads, sm_scale, x);
-      update_partial_state<vec_size, bdx>(
-          smem + (num_stages_smem * bdy * head_dim) + (compute_stage_idx * bdy + ty) * head_dim, x,
-          compute_stage_idx, consumer_pred_guard, s);
+      update_partial_state<vec_size, bdx>(v_smem + (stage_idx * bdy + ty) * head_dim, x, stage_idx,
+                                          consumer_pred_guard, s);
       block.sync();
-      copy_stage_idx = (copy_stage_idx + 1) % num_stages_smem;
-      compute_stage_idx = (compute_stage_idx + 1) % num_stages_smem;
+
+      // load v tiles
+      cp_async::pred_load<vec_bits, true>(
+          v_smem + (stage_idx * bdy + ty) * head_dim + tx * vec_size,
+          paged_kv.data + paged_kv.get_v_elem_offset(producer_page_idx, head_idx,
+                                                     producer_entry_base + ty, tx * vec_size),
+          producer_pred_guard);
+      cp_async::commit_group();
+
+      stage_idx = (stage_idx + 1) % num_stages_smem;
       producer_entry_base += bdy;
-      if ((producer_entry_base - ty) >= producer_valid_page_size) {
-        producer_entry_base = ty;
-        producer_page_iter += 1;
-        if (producer_page_iter < cur_page_indptr_end) {
-          producer_page_idx = paged_kv.indices[producer_page_iter];
-          producer_valid_page_size = paged_kv.get_valid_page_size(batch_idx, producer_page_iter);
-        } else {
-          producer_valid_page_size = 0;
-        }
-      }
-      kv_idx_base[copy_stage_idx] =
-          producer_entry_base + (producer_page_iter - cur_page_indptr_begin) * paged_kv.page_size;
-      valid_page_size[copy_stage_idx] = producer_valid_page_size;
     }
   }
+  cp_async::wait_group<0>();
+  block.sync();
 
   // sync partial state of all warps inside a threadblock
   sync_state<vec_size, bdx, bdy>(s, reinterpret_cast<float *>(smem), smem_md);
