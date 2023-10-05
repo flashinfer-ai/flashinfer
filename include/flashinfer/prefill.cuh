@@ -178,20 +178,20 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
                                             head_dim * sizeof(DTypeIn));
   }
 
-  size_t producer_kv_idx_base = 0, copy_stage_idx = 0;
+  size_t producer_kv_idx_base = 0, stage_idx = 0;
 #pragma unroll
   for (size_t iter = 0; iter < num_stages_smem; ++iter) {
-    produce_kv<num_frags_y, num_frags_z, num_warps>(k_smem + iter, k, qkv_info,
+    produce_kv<num_frags_y, num_frags_z, num_warps>(k_smem + stage_idx, k, qkv_info,
                                                     producer_kv_idx_base, kv_len, head_idx);
     cp_async::commit_group();
-    produce_kv<num_frags_y, num_frags_z, num_warps>(v_smem + iter, v, qkv_info,
+    produce_kv<num_frags_y, num_frags_z, num_warps>(v_smem + stage_idx, v, qkv_info,
                                                     producer_kv_idx_base, kv_len, head_idx);
     cp_async::commit_group();
     producer_kv_idx_base += mma::frag_size * num_frags_z;
-    copy_stage_idx = (copy_stage_idx + 1) % num_stages_smem;
+    stage_idx = (stage_idx + 1) % num_stages_smem;
   }
 
-  size_t consumer_kv_idx_base = 0, compute_stage_idx = 0;
+  size_t consumer_kv_idx_base = 0;
   size_t effective_kv_len =
       causal ? min(kv_len, (kv_len - qo_len) + ((bx + 1) * num_warps) * mma::frag_size) : kv_len;
 #pragma unroll 8
@@ -220,7 +220,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
 #pragma unroll
       for (size_t fz = 0; fz < num_frags_z; ++fz) {
         size_t i = mma::frag_size * fz + 8 * (tx / 16) + tx % 8, j = fy * 2 + (tx % 16) / 8;
-        k_smem[compute_stage_idx].ldmatrix_m8n8x4(kv_frag[fy][fz], i, j);
+        k_smem[stage_idx].ldmatrix_m8n8x4(kv_frag[fy][fz], i, j);
       }
     }
     if constexpr (rotary_mode == RotaryMode::kLlama) {
@@ -300,7 +300,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
       }
     }
     block.sync();
-    produce_kv<num_frags_y, num_frags_z, num_warps>(k_smem + copy_stage_idx, k, qkv_info,
+    produce_kv<num_frags_y, num_frags_z, num_warps>(k_smem + stage_idx, k, qkv_info,
                                                     producer_kv_idx_base, kv_len, head_idx);
     cp_async::commit_group();
     cp_async::wait_group<2 * num_stages_smem - 1>();
@@ -311,7 +311,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
 #pragma unroll
       for (size_t fz = 0; fz < num_frags_z; ++fz) {
         size_t i = mma::frag_size * fz + tx % 16, j = fy * 2 + tx / 16;
-        v_smem[compute_stage_idx].ldmatrix_m8n8x4_trans(kv_frag[fy][fz], i, j);
+        v_smem[stage_idx].ldmatrix_m8n8x4_trans(kv_frag[fy][fz], i, j);
       }
     }
 
@@ -325,11 +325,10 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
       }
     }
     block.sync();
-    produce_kv<num_frags_y, num_frags_z, num_warps>(v_smem + copy_stage_idx, v, qkv_info,
+    produce_kv<num_frags_y, num_frags_z, num_warps>(v_smem + stage_idx, v, qkv_info,
                                                     producer_kv_idx_base, kv_len, head_idx);
     cp_async::commit_group();
-    copy_stage_idx = (copy_stage_idx + 1) % num_stages_smem;
-    compute_stage_idx = (compute_stage_idx + 1) % num_stages_smem;
+    stage_idx = (stage_idx + 1) % num_stages_smem;
     producer_kv_idx_base += mma::frag_size * num_frags_z;
     consumer_kv_idx_base += mma::frag_size * num_frags_z;
   }
@@ -341,7 +340,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   for (size_t fy = 0; fy < num_frags_y; ++fy) {
 #pragma unroll
     for (size_t reg_id = 0; reg_id < 8; ++reg_id) {
-      o_frag[fy][reg_id] *= __fdividef(1.f, d[(reg_id % 4) / 2]);
+      o_frag[fy][reg_id] = __fdividef(o_frag[fy][reg_id], d[(reg_id % 4) / 2]);
     }
   }
 
