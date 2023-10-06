@@ -194,7 +194,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   size_t consumer_kv_idx_base = 0;
   size_t effective_kv_len =
       causal ? min(kv_len, (kv_len - qo_len) + ((bx + 1) * num_warps) * mma::frag_size) : kv_len;
-#pragma unroll 8
+#pragma unroll 16
   for (size_t iter = 0; iter < (effective_kv_len + (mma::frag_size * num_frags_z - 1)) /
                                    (mma::frag_size * num_frags_z);
        ++iter) {
@@ -399,7 +399,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOu
           rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(layout, LAYOUT, {
             constexpr size_t num_frags_y = HEAD_DIM / mma::frag_size;
             constexpr size_t num_frags_z = 2;
-            constexpr size_t num_warps = 8UL;
+            constexpr size_t num_warps = 4UL;
             constexpr size_t num_stages_smem = 2;
             constexpr size_t num_rows_per_cta = num_warps * mma::frag_size;
             auto kernel =
