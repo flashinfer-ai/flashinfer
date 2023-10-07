@@ -10,6 +10,7 @@
 #include <iostream>
 #include <random>
 
+#include "math.cuh"
 #include "cp_async.cuh"
 #include "layout.cuh"
 #include "page.cuh"
@@ -95,12 +96,10 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
   for (size_t i = 0; i < vec_size; ++i) {
     x += q_vec[i] * k_vec[i] * sm_scale;
   }
-  cg::thread_block_tile g = cg::tiled_partition<bdx>(cg::this_thread_block());
 #pragma unroll
   for (size_t offset = bdx / 2; offset > 0; offset /= 2) {
-    x += g.shfl_down(x, offset);
+    x += math::shfl_xor_sync(x, offset);
   }
-  x = g.shfl(x, 0);
 }
 
 /*!
@@ -199,6 +198,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
                                               size_t kv_chunk_size) {
   auto block = cg::this_thread_block();
   auto grid = cg::this_grid();
+  sm_scale *= math::log2e;
 
   constexpr size_t num_stages_smem = 2;
   constexpr size_t head_dim = bdx * vec_size;
@@ -387,6 +387,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(DTypeIn *__restrict__ q,
                                                   DTypeOut *__restrict__ o, float sm_scale,
                                                   float rope_inv_scale, float rope_inv_theta) {
   auto block = cg::this_thread_block();
+  sm_scale *= math::log2e;
 
   constexpr size_t num_stages_smem = 2;
   constexpr size_t head_dim = bdx * vec_size;

@@ -1,6 +1,7 @@
 #ifndef FLASHINFER_STATE_CUH_
 #define FLASHINFER_STATE_CUH_
 
+#include "math.cuh"
 #include "vec_dtypes.cuh"
 
 namespace flashinfer {
@@ -36,17 +37,17 @@ struct state_t {
                                         float other_d) {
     float m_prev = m, d_prev = d;
     m = max(m_prev, other_m);
-    d = d_prev * __expf(m_prev - m) + other_d * __expf(other_m - m);
+    d = d_prev * math::ptx_exp2(m_prev - m) + other_d * math::ptx_exp2(other_m - m);
     if constexpr (norm_on_the_fly) {
 #pragma unroll
       for (size_t i = 0; i < vec_size; ++i) {
-        o[i] = o[i] * __expf(m_prev - m) * (d_prev / d) +
-               other_o[i] * __expf(other_m - m) * (other_d / d);
+        o[i] = o[i] * math::ptx_exp2(m_prev - m) * (d_prev / d) +
+               other_o[i] * math::ptx_exp2(other_m - m) * (other_d / d);
       }
     } else {
 #pragma unroll
       for (size_t i = 0; i < vec_size; ++i) {
-        o[i] = o[i] * __expf(m_prev - m) + other_o[i] * __expf(other_m - m);
+        o[i] = o[i] * math::ptx_exp2(m_prev - m) + other_o[i] * math::ptx_exp2(other_m - m);
       }
     }
   }
@@ -67,16 +68,17 @@ struct state_t {
   __device__ __forceinline__ void merge(const vec_t<float, vec_size> &other_o, float x) {
     float m_prev = m, d_prev = d;
     m = max(m_prev, x);
-    d = d * __expf(m_prev - m) + __expf(x - m);
+    d = d * math::ptx_exp2(m_prev - m) + math::ptx_exp2(x - m);
     if constexpr (norm_on_the_fly) {
 #pragma unroll
       for (size_t i = 0; i < vec_size; ++i) {
-        o[i] = o[i] * (__expf(m_prev - m) * d_prev / d) + other_o[i] * (__expf(x - m) / d);
+        o[i] = o[i] * (math::ptx_exp2(m_prev - m) * d_prev / d) +
+               other_o[i] * (math::ptx_exp2(x - m) / d);
       }
     } else {
 #pragma unroll
       for (size_t i = 0; i < vec_size; ++i) {
-        o[i] = o[i] * __expf(m_prev - m) + other_o[i] * __expf(x - m);
+        o[i] = o[i] * math::ptx_exp2(m_prev - m) + other_o[i] * math::ptx_exp2(x - m);
       }
     }
   }

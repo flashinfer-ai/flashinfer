@@ -11,6 +11,7 @@
 
 #include "cp_async.cuh"
 #include "layout.cuh"
+#include "math.cuh"
 #include "mma.cuh"
 #include "permuted_smem.cuh"
 #include "rope.cuh"
@@ -29,7 +30,6 @@ template <bool row_major, typename T>
 __device__ __forceinline__ void apply_llama_rope(T *x_first_half, T *x_second_half,
                                                  const float *freq_first_half,
                                                  const float *freq_second_half, size_t offset) {
-#pragma unroll
   for (size_t reg_id = 0; reg_id < 8; ++reg_id) {
     float cos_first_half, sin_first_half, cos_second_half, sin_second_half, tmp;
     size_t i, j;
@@ -64,7 +64,7 @@ __device__ __forceinline__ void produce_kv(permuted_smem_t<stride, T> *smem, T *
                                            const tensor_info_t<layout> &qkv_info,
                                            size_t kv_idx_base, size_t kv_len, size_t head_idx) {
   size_t tx = threadIdx.x, ty = threadIdx.y;
-#pragma unroll
+
   for (size_t step = 0; step < num_frags_z * num_frags_y / num_warps; ++step) {
     size_t i = 8 * ((step * num_warps + ty) / (num_frags_y / 2)) + tx / 4,
            j = ((step * num_warps + ty) % (num_frags_y / 2)) * 4 + tx % 4;
@@ -82,13 +82,13 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
                                                tensor_info_t<layout> qkv_info, bool causal,
                                                float sm_scale, float rope_inv_scale,
                                                float rope_inv_theta) {
+  sm_scale *= math::log2e;
   const size_t qo_len = qkv_info.qo_len;
   const size_t kv_len = qkv_info.kv_len;
   const size_t tx = threadIdx.x, ty = threadIdx.y;
   const size_t bx = blockIdx.x, head_idx = blockIdx.y;
   const size_t num_heads = gridDim.y;
   auto block = cg::this_thread_block();
-  cg::thread_block_tile g = cg::tiled_partition<4>(block);
 
   constexpr size_t head_dim = num_frags_y * mma::frag_size;
   static_assert(num_frags_z * num_frags_y % num_warps == 0);
@@ -106,9 +106,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   float o_scale[2]{0.f};
   float rope_freq[num_frags_y][4];
   if constexpr (rotary_mode == RotaryMode::kLlama) {
-#pragma unroll
     for (size_t fy = 0; fy < num_frags_y; ++fy) {
-#pragma unroll
       for (size_t j = 0; j < 4; ++j) {
         rope_freq[fy][j] =
             rope_inv_scale *
@@ -124,7 +122,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   // cooperative fetch q fragment from gmem to reg
   permuted_smem_t<4, DTypeIn> q_smem((DTypeIn *)smem);
   size_t q_idx = (bx * num_warps + ty) * mma::frag_size + tx / 4;
-#pragma unroll
+
   for (size_t fyo = 0; fyo < num_frags_y / 2; ++fyo) {
     // load q fragment from gmem to smem
     size_t feat_idx = (fyo * 4 + tx % 4) * bank_capacity<DTypeIn>();
@@ -144,7 +142,6 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   block.sync();
   if constexpr (rotary_mode == RotaryMode::kLlama) {
     // apply rotary embedding
-#pragma unroll
     for (size_t fyi = 0; fyi < num_frags_y / 2; ++fyi) {
       apply_llama_rope<true, DTypeIn>((DTypeIn *)q_frag[fyi],
                                       (DTypeIn *)q_frag[fyi + num_frags_y / 2], rope_freq[fyi],
@@ -156,9 +153,8 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   // multiply q by sm_scale
   vec_t<DTypeIn, 2> sm_scale2;
   sm_scale2.fill(sm_scale);
-#pragma unroll
+
   for (size_t fy = 0; fy < num_frags_y; ++fy) {
-#pragma unroll
     for (size_t reg_id = 0; reg_id < 4; ++reg_id) {
       vec_t<DTypeIn, 2> tmp;
       tmp.load((DTypeIn *)&q_frag[fy][reg_id]);
@@ -170,7 +166,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
 
   permuted_smem_t<head_dim / bank_capacity<DTypeIn>(), DTypeIn> k_smem[num_stages_smem];
   permuted_smem_t<head_dim / bank_capacity<DTypeIn>(), DTypeIn> v_smem[num_stages_smem];
-#pragma unroll
+
   for (size_t i = 0; i < num_stages_smem; ++i) {
     k_smem[i].base =
         (DTypeIn *)(smem + i * num_frags_z * mma::frag_size * head_dim * sizeof(DTypeIn));
@@ -179,7 +175,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   }
 
   size_t producer_kv_idx_base = 0, stage_idx = 0;
-#pragma unroll
+
   for (size_t iter = 0; iter < num_stages_smem; ++iter) {
     produce_kv<num_frags_y, num_frags_z, num_warps>(k_smem + stage_idx, k, qkv_info,
                                                     producer_kv_idx_base, kv_len, head_idx);
@@ -194,16 +190,15 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   size_t consumer_kv_idx_base = 0;
   size_t effective_kv_len =
       causal ? min(kv_len, (kv_len - qo_len) + ((bx + 1) * num_warps) * mma::frag_size) : kv_len;
-#pragma unroll 16
+#pragma unroll 4
   for (size_t iter = 0; iter < (effective_kv_len + (mma::frag_size * num_frags_z - 1)) /
                                    (mma::frag_size * num_frags_z);
        ++iter) {
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
     // init x_frag with -inf or 0 by applying mask
-#pragma unroll
+
     for (size_t fz = 0; fz < num_frags_z; ++fz) {
-#pragma unroll
       for (size_t reg_id = 0; reg_id < 8; ++reg_id) {
         size_t q_idx = (bx * num_warps + ty) * mma::frag_size + 8 * ((reg_id % 4) / 2) + tx / 4,
                kv_idx = consumer_kv_idx_base + fz * mma::frag_size + 8 * (reg_id / 4) +
@@ -215,9 +210,8 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     }
 
     // load k tile from smem to reg
-#pragma unroll
+
     for (size_t fy = 0; fy < num_frags_y; ++fy) {
-#pragma unroll
       for (size_t fz = 0; fz < num_frags_z; ++fz) {
         size_t i = mma::frag_size * fz + 8 * (tx / 16) + tx % 8, j = fy * 2 + (tx % 16) / 8;
         k_smem[stage_idx].ldmatrix_m8n8x4(kv_frag[fy][fz], i, j);
@@ -225,9 +219,8 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     }
     if constexpr (rotary_mode == RotaryMode::kLlama) {
       // apply rotary embedding
-#pragma unroll
+
       for (size_t fyi = 0; fyi < num_frags_y / 2; ++fyi) {
-#pragma unroll
         for (size_t fz = 0; fz < num_frags_z; ++fz) {
           size_t kv_idx = consumer_kv_idx_base + fz * mma::frag_size + tx / 4;
           apply_llama_rope<false, DTypeIn>(
@@ -238,52 +231,43 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     }
 
     // compute q*k^T
-#pragma unroll
+
     for (size_t fy = 0; fy < num_frags_y; ++fy) {
-#pragma unroll
       for (size_t fz = 0; fz < num_frags_z; ++fz) {
         mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(x_frag[fz], q_frag[fy], kv_frag[fy][fz]);
       }
     }
 
     // compute m,d states in online softmax
-#pragma unroll
+
     for (size_t j = 0; j < 2; ++j) {
       m_prev[j] = m[j];
-#pragma unroll
+
       for (size_t fz = 0; fz < num_frags_z; ++fz) {
         float m_local = max(max(x_frag[fz][j * 2 + 0], x_frag[fz][j * 2 + 1]),
                             max(x_frag[fz][j * 2 + 4], x_frag[fz][j * 2 + 5]));
-#pragma unroll
-        for (size_t offset = 2; offset > 0; offset /= 2) {
-          m_local = max(m_local, g.shfl_down(m_local, offset));
-        }
-        m_local = g.shfl(m_local, 0);
+        m_local = max(m_local, math::shfl_xor_sync(m_local, 0x2));
+        m_local = max(m_local, math::shfl_xor_sync(m_local, 0x1));
         m[j] = max(m[j], m_local);
       }
-      o_scale[j] = __expf(m_prev[j] - m[j]);
+      o_scale[j] = math::ptx_exp2(m_prev[j] - m[j]);
       d[j] *= o_scale[j];
-#pragma unroll
+
       for (size_t fz = 0; fz < num_frags_z; ++fz) {
-        x_frag[fz][j * 2 + 0] = __expf(x_frag[fz][j * 2 + 0] - m[j]);
-        x_frag[fz][j * 2 + 1] = __expf(x_frag[fz][j * 2 + 1] - m[j]);
-        x_frag[fz][j * 2 + 4] = __expf(x_frag[fz][j * 2 + 4] - m[j]);
-        x_frag[fz][j * 2 + 5] = __expf(x_frag[fz][j * 2 + 5] - m[j]);
+        x_frag[fz][j * 2 + 0] = math::ptx_exp2(x_frag[fz][j * 2 + 0] - m[j]);
+        x_frag[fz][j * 2 + 1] = math::ptx_exp2(x_frag[fz][j * 2 + 1] - m[j]);
+        x_frag[fz][j * 2 + 4] = math::ptx_exp2(x_frag[fz][j * 2 + 4] - m[j]);
+        x_frag[fz][j * 2 + 5] = math::ptx_exp2(x_frag[fz][j * 2 + 5] - m[j]);
         float d_local = x_frag[fz][j * 2 + 0] + x_frag[fz][j * 2 + 1] + x_frag[fz][j * 2 + 4] +
                         x_frag[fz][j * 2 + 5];
-#pragma unroll
-        for (size_t offset = 2; offset > 0; offset /= 2) {
-          d_local += g.shfl_down(d_local, offset);
-        }
-        d_local = g.shfl(d_local, 0);
+        d_local += math::shfl_xor_sync(d_local, 0x2);
+        d_local += math::shfl_xor_sync(d_local, 0x1);
         d[j] += d_local;
       }
     }
 
     // compute att_frag
-#pragma unroll
     for (size_t fz = 0; fz < num_frags_z; ++fz) {
-#pragma unroll
       for (size_t reg_id = 0; reg_id < 4; ++reg_id) {
         vec_t<DTypeIn, 2> tmp;
         tmp.cast_load(&x_frag[fz][reg_id * 2]);
@@ -292,9 +276,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     }
 
     // scale o_frag
-#pragma unroll
     for (size_t fy = 0; fy < num_frags_y; ++fy) {
-#pragma unroll
       for (size_t reg_id = 0; reg_id < 8; ++reg_id) {
         o_frag[fy][reg_id] *= o_scale[(reg_id % 4) / 2];
       }
@@ -305,10 +287,9 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     cp_async::commit_group();
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
+
     // load v tile from smem to reg
-#pragma unroll
     for (size_t fy = 0; fy < num_frags_y; ++fy) {
-#pragma unroll
       for (size_t fz = 0; fz < num_frags_z; ++fz) {
         size_t i = mma::frag_size * fz + tx % 16, j = fy * 2 + tx / 16;
         v_smem[stage_idx].ldmatrix_m8n8x4_trans(kv_frag[fy][fz], i, j);
@@ -316,9 +297,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     }
 
     // compute sfm*v
-#pragma unroll
     for (size_t fy = 0; fy < num_frags_y; ++fy) {
-#pragma unroll
       for (size_t fz = 0; fz < num_frags_z; ++fz) {
         mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(o_frag[fy], att_frag[fz],
                                                            kv_frag[fy][fz]);
@@ -336,9 +315,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   block.sync();
 
   // divide d
-#pragma unroll
   for (size_t fy = 0; fy < num_frags_y; ++fy) {
-#pragma unroll
     for (size_t reg_id = 0; reg_id < 8; ++reg_id) {
       o_frag[fy][reg_id] = __fdividef(o_frag[fy][reg_id], d[(reg_id % 4) / 2]);
     }
@@ -350,24 +327,22 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     // TODO(Zihao)
   } else if constexpr (sizeof(DTypeOut) == 2) {
     uint32_t o_frag_f16[num_frags_y][4];
-#pragma unroll
+
     for (size_t fy = 0; fy < num_frags_y; ++fy) {
-#pragma unroll
       for (size_t reg_id = 0; reg_id < 4; ++reg_id) {
         vec_t<DTypeOut, 2> tmp;
         tmp.cast_load(&o_frag[fy][reg_id * 2]);
         tmp.store((DTypeOut *)&o_frag_f16[fy][reg_id]);
       }
     }
-#pragma unroll
+
     for (size_t fy = 0; fy < num_frags_y; ++fy) {
-#pragma unroll
       for (size_t reg_id = 0; reg_id < 4; ++reg_id) {
         size_t i = ty * mma::frag_size + 8 * (reg_id % 2) + tx / 4, j = fy * 2 + (reg_id / 2);
         ((uint32_t *)o_smem.get_ptr(i, j))[tx % 4] = o_frag_f16[fy][reg_id];
       }
     }
-#pragma unroll
+
     for (size_t fy = 0; fy < num_frags_y; ++fy) {
       size_t i = ty * mma::frag_size + tx % 16, j = fy * 2 + tx / 16;
       size_t o_idx = (bx * num_warps + ty) * mma::frag_size + tx % 16,
