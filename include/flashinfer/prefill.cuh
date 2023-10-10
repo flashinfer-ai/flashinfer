@@ -364,10 +364,11 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOu
                                      QKVLayout layout = QKVLayout::kNHD,
                                      RotaryMode rotary_mode = RotaryMode::kNone,
                                      float rope_scale = 1.f, float rope_theta = 1e4,
-                                     cudaStream_t stream = nullptr) {
+                                     cudaStream_t stream = nullptr, size_t dev_id = 0) {
   const float sm_scale = 1.f / std::sqrt(float(head_dim));
   const float rope_inv_scale = 1.f / rope_scale;
   const float rope_inv_theta = 1.f / rope_theta;
+  FLASHINFER_CUDA_CALL(cudaSetDevice(dev_id));
 
   SWITCH_HEAD_DIM(
       head_dim, HEAD_DIM,
