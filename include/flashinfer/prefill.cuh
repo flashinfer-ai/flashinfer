@@ -382,6 +382,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOu
             auto kernel =
                 SinglePrefillWithKVCacheKernel<LAYOUT, ROTARY_MODE, num_frags_y, num_frags_z,
                                                num_stages_smem, num_warps, DTypeIn, DTypeOut>;
+            
             dim3 nblks((qo_len + (num_rows_per_cta - 1)) / (num_rows_per_cta), num_heads);
             dim3 nthrs(32, num_warps);
             size_t smem_size =
@@ -437,9 +438,9 @@ cudaError_t BatchPrefillWithPagedKVCache(DTypeIn *q, paged_kv_t<DTypeIn, IdType>
   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(q_indptr_h.data(), q_indptr,
                                        sizeof(IdType) * (paged_kv.batch_size + 1),
                                        cudaMemcpyDeviceToHost, stream));
-  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(kv_indptr_h.data(), kv_indptr,
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(kv_indptr, kv_indptr_h.data(),
                                        sizeof(IdType) * (paged_kv.batch_size + 1),
-                                       cudaMemcpyDeviceToHost, stream));
+                                       cudaMemcpyHostToDevice, stream));
   FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
   FLASHINFER_CUDA_CALL(PagedKVCacheToRaggedTensor(paged_kv, keys, values, kv_indptr, stream));
   FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
