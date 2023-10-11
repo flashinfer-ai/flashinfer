@@ -11,35 +11,20 @@ using tvm::runtime::DataType;
 using tvm::runtime::NDArray;
 using tvm::runtime::ShapeTuple;
 
-#define SWITCH_TVM_CUDA_DTYPE(dl_dtype, cuda_dtype, ...)          \
-  if (dl_dtype.code == kDLFloat && dl_dtype.bits == 16) {         \
-    using cuda_dtype = half;                                      \
-    __VA_ARGS__                                                   \
-  } else if (dl_dtype.code == kDLFloat && dl_dtype.bits == 32) {  \
-    using cuda_dtype = float;                                     \
-    __VA_ARGS__                                                   \
-  } else if (dl_dtype.code == kDLBfloat && dl_dtype.bits == 16) { \
-    using cuda_dtype = nv_bfloat16;                               \
-    __VA_ARGS__                                                   \
-  } else if (dl_dtype.code == DataType::kE4M3Float) {             \
-    using cuda_dtype = __nv_fp8_e4m3;                             \
-    __VA_ARGS__                                                   \
-  } else if (dl_dtype.code == DataType::kE5M2Float) {             \
-    using cuda_dtype = __nv_fp8_e5m2;                             \
-    __VA_ARGS__                                                   \
-  } else {                                                        \
-    LOG(FATAL) << "Unsupported data type " << dl_dtype.code;      \
+#define SWITCH_TVM_CUDA_DTYPE(dl_dtype, cuda_dtype, ...)     \
+  if (dl_dtype.code == kDLFloat && dl_dtype.bits == 16) {    \
+    using cuda_dtype = half;                                 \
+    __VA_ARGS__                                              \
+  } else {                                                   \
+    LOG(FATAL) << "Unsupported data type " << dl_dtype.code; \
   }
 
-#define SWITCH_TVM_CUDA_IDTYPE(dl_dtype, cuda_dtype, ...)      \
-  if (dl_dtype.code == kDLInt && dl_dtype.bits == 32) {        \
-    using cuda_dtype = int32_t;                                \
-    __VA_ARGS__                                                \
-  } else if (dl_dtype.code == kDLInt && dl_dtype.bits == 64) { \
-    using cuda_dtype = int64_t;                                \
-    __VA_ARGS__                                                \
-  } else {                                                     \
-    LOG(FATAL) << "Unsupported data type " << dl_dtype.code;   \
+#define SWITCH_TVM_CUDA_IDTYPE(dl_dtype, cuda_dtype, ...)    \
+  if (dl_dtype.code == kDLInt && dl_dtype.bits == 32) {      \
+    using cuda_dtype = int32_t;                              \
+    __VA_ARGS__                                              \
+  } else {                                                   \
+    LOG(FATAL) << "Unsupported data type " << dl_dtype.code; \
   }
 
 int _FlashInferSingleDecodeWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, DLTensor* tmp,
@@ -193,7 +178,8 @@ void _FlashInferAttentionWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
                   static_cast<dtype_idx*>(page_table_values->data),
                   static_cast<dtype_idx*>(last_page_offset->data));
               cudaError_t status = flashinfer::BatchDecodeWithPagedKVCache<dtype_in, dtype_out>(
-                  (dtype_in*)q_data->data, cache, static_cast<dtype_out*>(output->data), nullptr,
+                  static_cast<dtype_in*>(q_data->data), cache,
+                  static_cast<dtype_out*>(output->data), static_cast<float*>(tmp_buffer->data),
                   flashinfer::RotaryMode(rotary_mode), rope_scale, rope_theta, 0,
                   q_data->device.device_id);
               if (status != cudaSuccess) {
@@ -203,7 +189,31 @@ void _FlashInferAttentionWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
   } else {
     CHECK_EQ(q_data->shape[0], 1);
     CHECK_EQ(q_data->shape[1], total_append_length);
-    LOG(FATAL) << "Prefill kernel is not connected right now";
+    for (int length : append_lengths) {
+      CHECK(length == 0 || length == total_append_length)
+          << "Only single-sequence prefill is supported for now.";
+    }
+    SWITCH_TVM_CUDA_DTYPE(
+        pages->dtype, dtype_in,
+        {SWITCH_TVM_CUDA_DTYPE(
+            output->dtype, dtype_out, {SWITCH_TVM_CUDA_IDTYPE(page_table_values->dtype, dtype_idx, {
+              flashinfer::paged_kv_t<dtype_in, dtype_idx> cache(
+                  nlayer, layer_id, nhead, page_size, nfeat, num_total_seqs,
+                  static_cast<dtype_in*>(pages->data),
+                  static_cast<dtype_idx*>(page_table_indptr->data),
+                  static_cast<dtype_idx*>(page_table_values->data),
+                  static_cast<dtype_idx*>(last_page_offset->data));
+              cudaError_t status =
+                  flashinfer::BatchPrefillWithPagedKVCache<dtype_in, dtype_out, dtype_idx>(
+                      static_cast<dtype_in*>(q_data->data), cache,
+                      static_cast<dtype_idx*>(append_length_indptr->data),
+                      static_cast<dtype_out*>(output->data), static_cast<float*>(tmp_buffer->data),
+                      /*causal=*/true, flashinfer::RotaryMode(rotary_mode), rope_scale, rope_theta,
+                      0, q_data->device.device_id);
+              if (status != cudaSuccess) {
+                LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
+              }
+            })})});
   }
 }
 
