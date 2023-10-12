@@ -114,6 +114,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     m_prev[i] = -5e4;
     m[i] = -5e4;
     d[i] = 0.f;
+    o_scale[i] = 0.f;
   }
   float rope_freq[num_frags_y][4];
   if constexpr (rotary_mode == RotaryMode::kLlama) {
@@ -208,20 +209,13 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
     // init x_frag with -inf or 0 by applying mask
-
     for (size_t fz = 0; fz < num_frags_z; ++fz) {
       for (size_t reg_id = 0; reg_id < 8; ++reg_id) {
-        size_t q_idx = (bx * num_warps + ty) * mma::frag_size + 8 * ((reg_id % 4) / 2) + tx / 4,
-               kv_idx = consumer_kv_idx_base + fz * mma::frag_size + 8 * (reg_id / 4) +
-                        2 * (tx % 4) + reg_id % 2;
-        bool predicate =
-            ((causal && q_idx - qo_len < kv_idx - kv_len) || q_idx >= qo_len || kv_idx >= kv_len);
-        x_frag[fz][reg_id] = predicate ? -5e4 : 0.f;
+        x_frag[fz][reg_id] = 0.f;
       }
     }
 
     // load k tile from smem to reg
-
     for (size_t fy = 0; fy < num_frags_y; ++fy) {
       for (size_t fz = 0; fz < num_frags_z; ++fz) {
         size_t i = mma::frag_size * fz + 8 * (tx / 16) + tx % 8, j = fy * 2 + (tx % 16) / 8;
@@ -249,8 +243,18 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
       }
     }
 
-    // compute m,d states in online softmax
+    for (size_t fz = 0; fz < num_frags_z; ++fz) {
+      for (size_t reg_id = 0; reg_id < 8; ++reg_id) {
+        size_t q_idx = (bx * num_warps + ty) * mma::frag_size + 8 * ((reg_id % 4) / 2) + tx / 4,
+               kv_idx = consumer_kv_idx_base + fz * mma::frag_size + 8 * (reg_id / 4) +
+                        2 * (tx % 4) + reg_id % 2;
+        bool predicate =
+            ((causal && q_idx - qo_len < kv_idx - kv_len) || q_idx >= qo_len || kv_idx >= kv_len);
+        x_frag[fz][reg_id] = predicate ? -5e4 : x_frag[fz][reg_id];
+      }
+    }
 
+    // compute m,d states in online softmax
     for (size_t j = 0; j < 2; ++j) {
       m_prev[j] = m[j];
 
@@ -279,11 +283,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
 
     // compute att_frag
     for (size_t fz = 0; fz < num_frags_z; ++fz) {
-      for (size_t reg_id = 0; reg_id < 4; ++reg_id) {
-        vec_t<DTypeIn, 2> tmp;
-        tmp.cast_load(&x_frag[fz][reg_id * 2]);
-        tmp.store((DTypeIn *)&att_frag[fz][reg_id]);
-      }
+      vec_cast<DTypeIn, float, 8>((DTypeIn *)&att_frag[fz], x_frag[fz]);
     }
 
     // scale o_frag
@@ -340,11 +340,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     uint32_t o_frag_f16[num_frags_y][4];
 
     for (size_t fy = 0; fy < num_frags_y; ++fy) {
-      for (size_t reg_id = 0; reg_id < 4; ++reg_id) {
-        vec_t<DTypeOut, 2> tmp;
-        tmp.cast_load(&o_frag[fy][reg_id * 2]);
-        tmp.store((DTypeOut *)&o_frag_f16[fy][reg_id]);
-      }
+      vec_cast<DTypeOut, float, 8>((DTypeOut *)&o_frag_f16[fy], o_frag[fy]);
     }
 
     for (size_t fy = 0; fy < num_frags_y; ++fy) {
