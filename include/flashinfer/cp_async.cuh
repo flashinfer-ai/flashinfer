@@ -21,7 +21,7 @@ __device__ __forceinline__ void wait_group() {
 }
 
 template <bool prefetch, typename T>
-__device__ __forceinline__ void load_128(T* smem_ptr, const T* gmem_ptr) {
+__device__ __forceinline__ void load_128b(T* smem_ptr, const T* gmem_ptr) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDACC_VER_MAJOR__ >= 11)
 
   uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
@@ -38,7 +38,7 @@ __device__ __forceinline__ void load_128(T* smem_ptr, const T* gmem_ptr) {
 }
 
 template <bool prefetch, typename T>
-__device__ __forceinline__ void pred_load_128(T* smem_ptr, const T* gmem_ptr, bool predicate) {
+__device__ __forceinline__ void pred_load_128b(T* smem_ptr, const T* gmem_ptr, bool predicate) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDACC_VER_MAJOR__ >= 11)
 
   uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
@@ -70,10 +70,10 @@ template <size_t num_bits, bool prefetch, typename T>
 __device__ __forceinline__ void load(T* smem_ptr, const T* gmem_ptr) {
   static_assert(num_bits == 128 || num_bits == 256, "num_bits must be 128 or 256");
   if constexpr (num_bits == 128) {
-    load_128<prefetch>(smem_ptr, gmem_ptr);
+    load_128b<prefetch>(smem_ptr, gmem_ptr);
   } else {
-    load_128<prefetch>(smem_ptr, gmem_ptr);
-    load_128<prefetch>(smem_ptr + 16 / sizeof(T), gmem_ptr + 16 / sizeof(T));
+    load_128b<prefetch>(smem_ptr, gmem_ptr);
+    load_128b<prefetch>(smem_ptr + 16 / sizeof(T), gmem_ptr + 16 / sizeof(T));
   }
 }
 
@@ -81,10 +81,10 @@ template <size_t num_bits, bool prefetch, typename T>
 __device__ __forceinline__ void pred_load(T* smem_ptr, const T* gmem_ptr, bool predicate) {
   static_assert(num_bits == 128 || num_bits == 256, "num_bits must be 128 or 256");
   if constexpr (num_bits == 128) {
-    pred_load_128<prefetch>(smem_ptr, gmem_ptr, predicate);
+    pred_load_128b<prefetch>(smem_ptr, gmem_ptr, predicate);
   } else {
-    pred_load_128<prefetch>(smem_ptr, gmem_ptr, predicate);
-    pred_load_128<prefetch>(smem_ptr + 16 / sizeof(T), gmem_ptr + 16 / sizeof(T), predicate);
+    pred_load_128b<prefetch>(smem_ptr, gmem_ptr, predicate);
+    pred_load_128b<prefetch>(smem_ptr + 16 / sizeof(T), gmem_ptr + 16 / sizeof(T), predicate);
   }
 }
 

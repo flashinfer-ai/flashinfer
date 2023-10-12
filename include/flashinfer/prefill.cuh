@@ -72,8 +72,8 @@ __device__ __forceinline__ void produce_kv(permuted_smem_t<stride, T> *smem, T *
   for (uint32_t step = 0; step < num_frags_z * num_frags_y / num_warps; ++step) {
     uint32_t i = 8 * ((step * num_warps + ty) / (num_frags_y / 2)) + tx / 4,
              j = ((step * num_warps + ty) % (num_frags_y / 2)) * 4 + tx % 4;
-    uint32_t kv_idx = kv_idx_base + i, feat_idx = j * bank_capacity<T>();
-    smem->load_bank_async(i, j, gmem + qkv_info.get_kv_elem_offset(kv_idx, head_idx, feat_idx),
+    uint32_t kv_idx = kv_idx_base + i, feat_idx = j * cell_capacity<T>();
+    smem->load_128b_async(i, j, gmem + qkv_info.get_kv_elem_offset(kv_idx, head_idx, feat_idx),
                           kv_idx < kv_len);
   }
 }
@@ -146,13 +146,13 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
 #pragma unroll
   for (uint32_t fyo = 0; fyo < num_frags_y / 2; ++fyo) {
     // load q fragment from gmem to smem
-    uint32_t feat_idx = (fyo * 4 + tx % 4) * bank_capacity<DTypeIn>();
+    uint32_t feat_idx = (fyo * 4 + tx % 4) * cell_capacity<DTypeIn>();
     uint32_t i = ty * mma::frag_size + tx / 4, j = tx % 4;
     if (q_idx < qo_len) {
-      q_smem.load_bank(i, j, q + qkv_info.get_qo_elem_offset(q_idx, head_idx, feat_idx));
+      q_smem.load_128b(i, j, q + qkv_info.get_qo_elem_offset(q_idx, head_idx, feat_idx));
     }
     if (q_idx + 8 < qo_len) {
-      q_smem.load_bank(i + 8, j, q + qkv_info.get_qo_elem_offset(q_idx + 8, head_idx, feat_idx));
+      q_smem.load_128b(i + 8, j, q + qkv_info.get_qo_elem_offset(q_idx + 8, head_idx, feat_idx));
     }
     // load q fragment from smem to reg
     i = ty * mma::frag_size + tx % mma::frag_size;
@@ -188,8 +188,8 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   }
   block.sync();
 
-  permuted_smem_t<head_dim / bank_capacity<DTypeIn>(), DTypeIn> k_smem[num_stages_smem];
-  permuted_smem_t<head_dim / bank_capacity<DTypeIn>(), DTypeIn> v_smem[num_stages_smem];
+  permuted_smem_t<head_dim / cell_capacity<DTypeIn>(), DTypeIn> k_smem[num_stages_smem];
+  permuted_smem_t<head_dim / cell_capacity<DTypeIn>(), DTypeIn> v_smem[num_stages_smem];
 
 #pragma unroll
   for (uint32_t i = 0; i < num_stages_smem; ++i) {
@@ -364,7 +364,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   }
 
   // write back
-  permuted_smem_t<head_dim / bank_capacity<DTypeOut>(), DTypeOut> o_smem((DTypeIn *)smem);
+  permuted_smem_t<head_dim / cell_capacity<DTypeOut>(), DTypeOut> o_smem((DTypeIn *)smem);
   if constexpr (std::is_same<DTypeOut, float>::value) {
     // TODO(Zihao)
   } else if constexpr (sizeof(DTypeOut) == 2) {
@@ -388,9 +388,9 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
       uint32_t i = ty * mma::frag_size + tx % 16, j = fy * 2 + tx / 16;
       uint32_t o_idx = (bx * num_warps + ty) * mma::frag_size + tx % 16,
-               feat_idx = (fy * 2 + tx / 16) * bank_capacity<DTypeOut>();
+               feat_idx = (fy * 2 + tx / 16) * cell_capacity<DTypeOut>();
       if (o_idx < qo_len) {
-        o_smem.store_bank(i, j, o + qkv_info.get_qo_elem_offset(o_idx, head_idx, feat_idx));
+        o_smem.store_128b(i, j, o + qkv_info.get_qo_elem_offset(o_idx, head_idx, feat_idx));
       }
     }
   } else {
