@@ -100,11 +100,21 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   uint32_t kv_frag[num_frags_y][num_frags_z][4];
   float x_frag[num_frags_z][8];
   uint32_t att_frag[num_frags_z][4];
-  float o_frag[num_frags_y][8]{0.f};
-  float m_prev[2]{-5e4};
-  float m[2]{-5e4};
-  float d[2]{0.f};
-  float o_scale[2]{0.f};
+  float o_frag[num_frags_y][8];
+  float m_prev[2];
+  float m[2];
+  float d[2];
+  float o_scale[2];
+  for (size_t i = 0; i < num_frags_y; ++i) {
+    for (size_t j = 0; j < 8; ++j) {
+      o_frag[i][j] = 0.f;
+    }
+  }
+  for (size_t i = 0; i < 2; ++i) {
+    m_prev[i] = -5e4;
+    m[i] = -5e4;
+    d[i] = 0.f;
+  }
   float rope_freq[num_frags_y][4];
   if constexpr (rotary_mode == RotaryMode::kLlama) {
     for (size_t fy = 0; fy < num_frags_y; ++fy) {
@@ -382,7 +392,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOu
             auto kernel =
                 SinglePrefillWithKVCacheKernel<LAYOUT, ROTARY_MODE, num_frags_y, num_frags_z,
                                                num_stages_smem, num_warps, DTypeIn, DTypeOut>;
-            
+
             dim3 nblks((qo_len + (num_rows_per_cta - 1)) / (num_rows_per_cta), num_heads);
             dim3 nthrs(32, num_warps);
             size_t smem_size =
