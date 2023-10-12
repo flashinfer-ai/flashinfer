@@ -119,15 +119,14 @@ void _FlashInferAttentionWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
         page_table_indptr->dtype.code == last_page_offset->dtype.code &&
         page_table_indptr->dtype.code == append_length_indptr->dtype.code);
 
-  CHECK_EQ(pages->ndim, 7);
+  CHECK_EQ(pages->ndim, 6);
   CHECK_LT(layer_id, pages->shape[1]);
   CHECK_GE(layer_id, 0);
-  CHECK_EQ(pages->shape[2], 1) << "Page chunk size should be fixed to 1 right now.";
-  CHECK_EQ(pages->shape[3], 2);
+  CHECK_EQ(pages->shape[2], 2);
   int64_t nlayer = pages->shape[1];
-  int64_t nhead = pages->shape[4];
-  int64_t nfeat = pages->shape[6];
-  int64_t page_size = pages->shape[5];
+  int64_t nhead = pages->shape[3];
+  int64_t nfeat = pages->shape[5];
+  int64_t page_size = pages->shape[4];
 
   CHECK_EQ(last_page_offset->ndim, 1);
   int64_t num_total_seqs = last_page_offset->shape[0];
