@@ -20,35 +20,39 @@ constexpr __host__ __device__ __forceinline__ uint32_t cell_capacity() {
   return sizeof(cell_t) / sizeof(T);
 }
 
-template <uint32_t stride, typename T>
-struct permuted_smem_t {
-  T __align__(16) * base;
+struct smem_t {
+  cell_t *base;
   uint32_t offset;
-  __device__ __forceinline__ permuted_smem_t() : base(nullptr) {}
-  __device__ __forceinline__ permuted_smem_t(T *base) : base(base) {}
+  __device__ __forceinline__ smem_t() : base(nullptr) {}
+  template <typename T>
+  __device__ __forceinline__ smem_t(T *base) : base((cell_t *)base) {}
 
-  static __device__ __forceinline__ uint32_t get_offset(uint32_t i, uint32_t j) {
+  template <uint32_t stride>
+  static __device__ __forceinline__ uint32_t get_permuted_offset(uint32_t i, uint32_t j) {
     return (i / 2) * stride * 2 + (j / 4) * 8 + (i % 2) * 4 + ((j % 4) ^ ((i / 2) % 4));
   }
 
   __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t *R) {
-    cell_t *smem_ptr = (cell_t *)base + offset;
+    cell_t *smem_ptr = base + offset;
     mma::ldmatrix_m8n8x4(R, smem_ptr);
   }
   __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t *R) {
-    cell_t *smem_ptr = (cell_t *)base + offset;
+    cell_t *smem_ptr = base + offset;
     mma::ldmatrix_m8n8x4_trans(R, smem_ptr);
   }
+  template <typename T>
   __device__ __forceinline__ void load_128b_async(const T *gptr, bool predicate) {
-    cell_t *smem_ptr = (cell_t *)base + offset;
+    cell_t *smem_ptr = base + offset;
     cp_async::pred_load_128b<true>(smem_ptr, reinterpret_cast<const cell_t *>(gptr), predicate);
   }
+  template <typename T>
   __device__ __forceinline__ void load_128b_async(const T *gptr) {
-    cell_t *smem_ptr = (cell_t *)base + offset;
+    cell_t *smem_ptr = base + offset;
     cp_async::load_128b<true>(smem_ptr, reinterpret_cast<const cell_t *>(gptr));
   }
+  template <typename T>
   __device__ __forceinline__ void store_128b(T *gptr) {
-    *reinterpret_cast<cell_t *>(gptr) = *((cell_t *)base + offset);
+    *reinterpret_cast<cell_t *>(gptr) = *(base + offset);
   }
 };
 

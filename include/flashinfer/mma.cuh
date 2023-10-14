@@ -11,8 +11,6 @@ namespace flashinfer {
 
 namespace mma {
 
-constexpr uint32_t frag_size = 16;
-
 template <typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t *R, T *smem_ptr) {
   uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
