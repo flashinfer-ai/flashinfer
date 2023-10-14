@@ -318,18 +318,10 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
           x_frag[fx][fz][j * 2 + 1] = math::ptx_exp2(x_frag[fx][fz][j * 2 + 1] - m[fx][j]);
           x_frag[fx][fz][j * 2 + 4] = math::ptx_exp2(x_frag[fx][fz][j * 2 + 4] - m[fx][j]);
           x_frag[fx][fz][j * 2 + 5] = math::ptx_exp2(x_frag[fx][fz][j * 2 + 5] - m[fx][j]);
-          float d_local = x_frag[fx][fz][j * 2 + 0] + x_frag[fx][fz][j * 2 + 1] +
-                          x_frag[fx][fz][j * 2 + 4] + x_frag[fx][fz][j * 2 + 5];
-          d_local += math::shfl_xor_sync(d_local, 0x2);
-          d_local += math::shfl_xor_sync(d_local, 0x1);
-          d[fx][j] += d_local;
+          d[fx][j] += x_frag[fx][fz][j * 2 + 0] + x_frag[fx][fz][j * 2 + 1] +
+                      x_frag[fx][fz][j * 2 + 4] + x_frag[fx][fz][j * 2 + 5];
         }
       }
-    }
-
-    // compute att_frag
-#pragma unroll
-    for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
       for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
         vec_cast<DTypeIn, float, 8>((DTypeIn *)&a_frag[fx][fz], x_frag[fx][fz]);
@@ -391,6 +383,15 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   }
   cp_async::wait_group<0>();
   block.sync();
+
+#pragma unroll
+  for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+    for (uint32_t j = 0; j < 2; ++j) {
+      d[fx][j] += math::shfl_xor_sync(d[fx][j], 0x2);
+      d[fx][j] += math::shfl_xor_sync(d[fx][j], 0x1);
+    }
+  }
 
   // divide d
 #pragma unroll
@@ -479,7 +480,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOu
                 constexpr uint32_t num_frags_z = 2;
                 constexpr uint32_t num_warps = 4UL;
                 constexpr uint32_t num_stages_smem = 1;
-                constexpr uint32_t num_stages_frag = 2;
+                constexpr uint32_t num_stages_frag = 3;
                 constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
                 auto kernel =
                     SinglePrefillWithKVCacheKernel<CAUSAL, LAYOUT, ROTARY_MODE, num_frags_x,
