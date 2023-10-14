@@ -60,8 +60,8 @@ __device__ __forceinline__ void apply_llama_rope(T *x_first_half, T *x_second_ha
 
 }  // namespace
 
-template <uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps, QKVLayout layout,
-          typename T>
+template <bool predictive, uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps,
+          QKVLayout layout, typename T>
 __device__ __forceinline__ void produce_kv(smem_t *smem, T *gmem,
                                            const tensor_info_t<layout> &qkv_info,
                                            uint32_t kv_idx_base, uint32_t kv_len,
@@ -79,7 +79,11 @@ __device__ __forceinline__ void produce_kv(smem_t *smem, T *gmem,
   for (uint32_t i = 0; i < num_frags_z * 4 / num_warps; ++i) {
 #pragma unroll
     for (uint32_t j = 0; j < num_frags_y / 4; ++j) {
-      smem->load_128b_async(gptr, kv_idx < kv_len);
+      if constexpr (predictive) {
+        smem->load_128b_async(gptr, kv_idx < kv_len);
+      } else {
+        smem->load_128b_async(gptr);
+      }
       smem->offset += 16;
       gptr += 8 * cell_capacity<T>();
     }
@@ -177,24 +181,28 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
                               head_dim * sizeof(DTypeIn));
   }
 
-#pragma unroll
-  for (uint32_t iter = 0; iter < num_stages_smem; ++iter) {
-    const uint32_t stage_idx = iter;
-    produce_kv<num_frags_y, num_frags_z, num_warps>(k_smem + stage_idx, k, qkv_info,
-                                                    iter * 16 * num_frags_z, kv_len, head_idx);
-    cp_async::commit_group();
-    produce_kv<num_frags_y, num_frags_z, num_warps>(v_smem + stage_idx, v, qkv_info,
-                                                    iter * 16 * num_frags_z, kv_len, head_idx);
-    cp_async::commit_group();
-  }
-
-  const uint32_t num_iterations =
+  uint32_t iter =
       ((causal ? min(kv_len, (kv_len - qo_len) + ((bx + 1) * num_frags_x * num_warps) * 16)
                : kv_len) +
        16 * num_frags_z - 1) /
-      (16 * num_frags_z);
+          (16 * num_frags_z) -
+      1;
+
+#pragma unroll
+  for (uint32_t i = 0; i < num_stages_smem; ++i) {
+    if (iter >= i) {
+      const uint32_t stage_idx = (iter - i) % num_stages_smem;
+      produce_kv<true, num_frags_y, num_frags_z, num_warps>(
+          k_smem + stage_idx, k, qkv_info, (iter - i) * 16 * num_frags_z, kv_len, head_idx);
+      cp_async::commit_group();
+      produce_kv<true, num_frags_y, num_frags_z, num_warps>(
+          v_smem + stage_idx, v, qkv_info, (iter - i) * 16 * num_frags_z, kv_len, head_idx);
+      cp_async::commit_group();
+    }
+  }
+
 #pragma unroll 2
-  for (uint32_t iter = 0; iter < num_iterations; ++iter) {
+  for (; iter != -1; --iter) {
     const uint32_t stage_idx = iter % num_stages_smem;
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
@@ -329,10 +337,12 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     }
 
     block.sync();
-    produce_kv<num_frags_y, num_frags_z, num_warps>(k_smem + stage_idx, k, qkv_info,
-                                                    (iter + num_stages_smem) * 16 * num_frags_z,
-                                                    kv_len, head_idx);
-    cp_async::commit_group();
+    if (iter >= num_stages_smem) {
+      produce_kv<false, num_frags_y, num_frags_z, num_warps>(
+          k_smem + stage_idx, k, qkv_info, (iter - num_stages_smem) * 16 * num_frags_z, kv_len,
+          head_idx);
+      cp_async::commit_group();
+    }
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
 
@@ -376,10 +386,12 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
       }
     }
     block.sync();
-    produce_kv<num_frags_y, num_frags_z, num_warps>(v_smem + stage_idx, v, qkv_info,
-                                                    (iter + num_stages_smem) * 16 * num_frags_z,
-                                                    kv_len, head_idx);
-    cp_async::commit_group();
+    if (iter >= num_stages_smem) {
+      produce_kv<false, num_frags_y, num_frags_z, num_warps>(
+          v_smem + stage_idx, v, qkv_info, (iter - num_stages_smem) * 16 * num_frags_z, kv_len,
+          head_idx);
+      cp_async::commit_group();
+    }
   }
   cp_async::wait_group<0>();
   block.sync();
