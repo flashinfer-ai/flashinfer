@@ -64,12 +64,12 @@ template <uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps, QKVLay
           typename T>
 __device__ __forceinline__ void produce_kv(smem_t *smem, T *gmem,
                                            const tensor_info_t<layout> &qkv_info,
-                                           int32_t kv_idx_base, uint32_t kv_len,
+                                           uint32_t kv_idx_base, uint32_t kv_len,
                                            uint32_t head_idx) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   constexpr uint32_t num_cells_per_head_in = num_frags_y * 16 / cell_capacity<T>();
 
-  int32_t kv_idx = kv_idx_base + ty * 4 + (tx % 16) / 4;
+  uint32_t kv_idx = kv_idx_base + ty * 4 + (tx % 16) / 4;
   smem->offset = smem_t::get_permuted_offset<num_cells_per_head_in>(ty * 4 + (tx % 16) / 4,
                                                                     (tx / 16) * 4 + tx % 4);
   T *gptr = gmem + qkv_info.get_kv_elem_offset(kv_idx, head_idx,
@@ -79,7 +79,7 @@ __device__ __forceinline__ void produce_kv(smem_t *smem, T *gmem,
   for (uint32_t i = 0; i < num_frags_z * 4 / num_warps; ++i) {
 #pragma unroll
     for (uint32_t j = 0; j < num_frags_y / 4; ++j) {
-      smem->load_128b_async(gptr, kv_idx < kv_len && kv_idx >= 0);
+      smem->load_128b_async(gptr, kv_idx < kv_len);
       smem->offset += 16;
       gptr += 8 * cell_capacity<T>();
     }
@@ -188,29 +188,28 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
                               head_dim * sizeof(DTypeIn));
   }
 
-  int32_t iter =
+  const uint32_t num_iterations =
       ((causal ? min(kv_len, (kv_len - qo_len) + ((bx + 1) * num_frags_x * num_warps) * 16)
                : kv_len) +
        16 * num_frags_z - 1) /
-          (16 * num_frags_z) -
-      1;
-  const uint32_t mask_iter =
+      (16 * num_frags_z);
+  const uint32_t mask_iteration =
       (causal ? (kv_len + bx * num_warps * num_frags_x - qo_len) / (16 * num_frags_z)
               : kv_len / (16 * num_frags_z));
 
 #pragma unroll
-  for (uint32_t i = 0; i < num_stages_smem; ++i) {
-    const uint32_t stage_idx = (iter - i) % num_stages_smem;
-    produce_kv<num_frags_y, num_frags_z, num_warps>(
-        k_smem + stage_idx, k, qkv_info, (iter - i) * 16 * num_frags_z, kv_len, head_idx);
+  for (uint32_t iter = 0; iter < num_stages_smem; ++iter) {
+    const uint32_t stage_idx = iter;
+    produce_kv<num_frags_y, num_frags_z, num_warps>(k_smem + stage_idx, k, qkv_info,
+                                                    iter * 16 * num_frags_z, kv_len, head_idx);
     cp_async::commit_group();
-    produce_kv<num_frags_y, num_frags_z, num_warps>(
-        v_smem + stage_idx, v, qkv_info, (iter - i) * 16 * num_frags_z, kv_len, head_idx);
+    produce_kv<num_frags_y, num_frags_z, num_warps>(v_smem + stage_idx, v, qkv_info,
+                                                    iter * 16 * num_frags_z, kv_len, head_idx);
     cp_async::commit_group();
   }
 
 #pragma unroll 1
-  for (; iter != -1; --iter) {
+  for (uint32_t iter = 0; iter < num_iterations; ++iter) {
     const uint32_t stage_idx = iter % num_stages_smem;
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
@@ -283,7 +282,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     }
 
     // apply mask
-    if (iter >= mask_iter) {
+    if (iter >= mask_iteration) {
       uint32_t q_idx_base = ((bx * num_warps + ty) * num_frags_x) * 16 + tx / 4,
                kv_idx_base = iter * 16 * num_frags_z + 2 * (tx % 4);
 #pragma unroll
@@ -295,7 +294,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
             const uint32_t q_idx = q_idx_base + 8 * ((reg_id % 4) / 2),
                            kv_idx = kv_idx_base + 8 * (reg_id / 4) + reg_id % 2;
             const bool predicate =
-                ((causal && q_idx - qo_len < kv_idx - kv_len) || kv_idx >= kv_len);
+                ((causal && kv_idx > kv_len + q_idx - qo_len) || kv_idx >= kv_len);
             x_frag[fx][fz][reg_id] = predicate ? -5e4 : x_frag[fx][fz][reg_id];
           }
           kv_idx_base += 16;
@@ -348,7 +347,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
 
     block.sync();
     produce_kv<num_frags_y, num_frags_z, num_warps>(k_smem + stage_idx, k, qkv_info,
-                                                    (iter - num_stages_smem) * 16 * num_frags_z,
+                                                    (iter + num_stages_smem) * 16 * num_frags_z,
                                                     kv_len, head_idx);
     cp_async::commit_group();
     cp_async::wait_group<2 * num_stages_smem - 1>();
@@ -394,7 +393,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     }
     block.sync();
     produce_kv<num_frags_y, num_frags_z, num_warps>(v_smem + stage_idx, v, qkv_info,
-                                                    (iter - num_stages_smem) * 16 * num_frags_z,
+                                                    (iter + num_stages_smem) * 16 * num_frags_z,
                                                     kv_len, head_idx);
     cp_async::commit_group();
   }
