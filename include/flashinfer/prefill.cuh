@@ -71,7 +71,7 @@ __device__ __forceinline__ void produce_kv(smem_t *smem, T *gmem,
 
   int32_t kv_idx = kv_idx_base + ty * 4 + (tx % 16) / 4;
   smem->offset = smem_t::get_permuted_offset<num_cells_per_head_in>(ty * 4 + (tx % 16) / 4,
-                                                                  (tx / 16) * 4 + tx % 4);
+                                                                    (tx / 16) * 4 + tx % 4);
   T *gptr = gmem + qkv_info.get_kv_elem_offset(kv_idx, head_idx,
                                                ((tx / 16) * 4 + tx % 4) * cell_capacity<T>());
 
@@ -227,10 +227,10 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     }
 
     // load k tile from smem to reg
-    q_smem.offset =
-        smem_t::get_permuted_offset<num_cells_per_head_in>(ty * num_frags_x * 16 + tx % 16, tx / 16);
-    k_smem[stage_idx].offset = smem_t::get_permuted_offset<num_cells_per_head_in>(
-        8 * (tx / 16) + tx % 8, (tx % 16) / 8);
+    q_smem.offset = smem_t::get_permuted_offset<num_cells_per_head_in>(
+        ty * num_frags_x * 16 + tx % 16, tx / 16);
+    k_smem[stage_idx].offset =
+        smem_t::get_permuted_offset<num_cells_per_head_in>(8 * (tx / 16) + tx % 8, (tx % 16) / 8);
 #pragma unroll
     for (uint32_t fy = 0; fy < num_stages_frag; ++fy) {
       const uint32_t frag_stage_idx = fy;
@@ -294,7 +294,8 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
           for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
             const uint32_t q_idx = q_idx_base + 8 * ((reg_id % 4) / 2),
                            kv_idx = kv_idx_base + 8 * (reg_id / 4) + reg_id % 2;
-            const bool predicate = ((causal && q_idx - qo_len < kv_idx - kv_len) || kv_idx >= kv_len);
+            const bool predicate =
+                ((causal && q_idx - qo_len < kv_idx - kv_len) || kv_idx >= kv_len);
             x_frag[fx][fz][reg_id] = predicate ? -5e4 : x_frag[fx][fz][reg_id];
           }
           kv_idx_base += 16;
@@ -354,8 +355,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     block.sync();
 
     // load v tile from smem to reg
-    v_smem[stage_idx].offset =
-        smem_t::get_permuted_offset<num_cells_per_head_in>(tx % 16, tx / 16);
+    v_smem[stage_idx].offset = smem_t::get_permuted_offset<num_cells_per_head_in>(tx % 16, tx / 16);
 #pragma unroll
     for (uint32_t fy = 0; fy < num_stages_frag; ++fy) {
       const uint32_t frag_stage_idx = fy;
