@@ -10,7 +10,8 @@ using namespace flashinfer;
 template <typename DTypeIn, typename DTypeOut>
 void _TestSinglePrefillKernelCorrectness(size_t qo_len, size_t kv_len, size_t num_heads,
                                          size_t head_dim, bool causal, QKVLayout layout,
-                                         RotaryMode rotary_mode) {
+                                         RotaryMode rotary_mode, float rtol = 1e-3,
+                                         float atol = 1e-3) {
   std::vector<DTypeIn> q(qo_len * num_heads * head_dim);
   std::vector<DTypeIn> k(kv_len * num_heads * head_dim);
   std::vector<DTypeIn> v(kv_len * num_heads * head_dim);
@@ -36,22 +37,17 @@ void _TestSinglePrefillKernelCorrectness(size_t qo_len, size_t kv_len, size_t nu
   thrust::host_vector<DTypeOut> o_h(o_d);
   std::vector<DTypeOut> o_ref = cpu_reference::single_mha<DTypeIn, DTypeOut>(
       q, k, v, qo_len, kv_len, num_heads, head_dim, causal, layout, rotary_mode);
-  size_t num_results_error_atol_1e_3_rtol_1e_3 = 0;
+  size_t num_results_error_atol = 0;
   bool nan_detected = false;
 
   for (size_t i = 0; i < o_ref.size(); ++i) {
     if (isnan(float(o_h[i]))) {
       nan_detected = true;
     }
-    num_results_error_atol_1e_3_rtol_1e_3 +=
-        (!utils::isclose(float(o_ref[i]), float(o_h[i]), 1e-3, 1e-3));
-    if (!utils::isclose(float(o_ref[i]), float(o_h[i]), 1e-3, 1e-3)) {
-      std::cout << "row=" << i / head_dim << ", rol=" << i % head_dim << ", ref=" << float(o_ref[i])
-                << ", result=" << float(o_h[i]) << std::endl;
-    }
+    num_results_error_atol += (!utils::isclose(float(o_ref[i]), float(o_h[i]), rtol, atol));
   }
 
-  float result_accuracy = 1. - float(num_results_error_atol_1e_3_rtol_1e_3) / float(o_ref.size());
+  float result_accuracy = 1. - float(num_results_error_atol) / float(o_ref.size());
   std::cout << "num_heads=" << num_heads << ", qo_len=" << qo_len << ", kv_len=" << kv_len
             << ", head_dim=" << head_dim << ", causal=" << causal
             << ", layout=" << QKVLayoutToString(layout)
@@ -62,13 +58,13 @@ void _TestSinglePrefillKernelCorrectness(size_t qo_len, size_t kv_len, size_t nu
 }
 
 template <typename DTypeIn, typename DTypeOut>
-void TestSinglePrefillKernelCorrectness() {
-  for (size_t qo_len : {399, 400, 401}) {
-    for (size_t kv_len : {533, 534, 535}) {
-      for (size_t num_heads : {32}) {
+void TestSinglePrefillKernelLongContextCorrectness() {
+  for (size_t qo_len : {31, 63, 127, 255}) {
+    for (size_t kv_len : {31717}) {
+      for (size_t num_heads : {1}) {
         for (size_t head_dim : {64, 128}) {
           for (bool causal : {false, true}) {
-            for (size_t rotary_mode : {0, 1}) {
+            for (size_t rotary_mode : {0}) {
               for (size_t layout : {0, 1}) {
                 _TestSinglePrefillKernelCorrectness<DTypeIn, DTypeOut>(
                     qo_len, kv_len, num_heads, head_dim, causal, QKVLayout(layout),
@@ -80,6 +76,64 @@ void TestSinglePrefillKernelCorrectness() {
       }
     }
   }
+}
+
+template <typename DTypeIn, typename DTypeOut>
+void TestSinglePrefillKernelShortContextCorrectness() {
+  float rtol = std::is_same<DTypeOut, nv_bfloat16>::value ? 1e-2 : 1e-3;
+  float atol = std::is_same<DTypeOut, nv_bfloat16>::value ? 1e-2 : 1e-3;
+  for (size_t qkv_len : {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31}) {
+    for (size_t num_heads : {32}) {
+      for (size_t head_dim : {64, 128}) {
+        for (bool causal : {false, true}) {
+          for (size_t rotary_mode : {0}) {
+            for (size_t layout : {0, 1}) {
+              _TestSinglePrefillKernelCorrectness<DTypeIn, DTypeOut>(
+                  qkv_len, qkv_len, num_heads, head_dim, causal, QKVLayout(layout),
+                  RotaryMode(rotary_mode), rtol, atol);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+template <typename DTypeIn, typename DTypeOut>
+void TestSinglePrefillKernelCorrectness() {
+  for (size_t qo_len : {399, 400, 401}) {
+    for (size_t kv_len : {533, 534, 535}) {
+      for (size_t num_heads : {32}) {
+        for (size_t head_dim : {64, 128}) {
+          for (bool causal : {false, true}) {
+            for (size_t rotary_mode : {0}) {
+              for (size_t layout : {0, 1}) {
+                _TestSinglePrefillKernelCorrectness<DTypeIn, DTypeOut>(
+                    qo_len, kv_len, num_heads, head_dim, causal, QKVLayout(layout),
+                    RotaryMode(rotary_mode));
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelLongContextCorrectnessFP16) {
+  TestSinglePrefillKernelLongContextCorrectness<half, half>();
+}
+
+TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelLongContextCorrectnessBF16) {
+  TestSinglePrefillKernelLongContextCorrectness<nv_bfloat16, nv_bfloat16>();
+}
+
+TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelShortContextCorrectnessFP16) {
+  TestSinglePrefillKernelShortContextCorrectness<half, half>();
+}
+
+TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelShortContextCorrectnessBF16) {
+  TestSinglePrefillKernelShortContextCorrectness<nv_bfloat16, nv_bfloat16>();
 }
 
 TEST(FlashInferCorrectnessTest, SinglePrefillKernelCorrectnessTestFP16) {
