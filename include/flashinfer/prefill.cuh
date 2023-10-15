@@ -377,7 +377,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
       }
 
       if (fy + num_stages_frag < num_frags_y) {
-#pragma
+#pragma unroll
         for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
           v_smem[stage_idx].ldmatrix_m8n8x4_trans(b_frag[fz][frag_stage_idx]);
           v_smem[stage_idx].offset += 16 * num_cells_per_head_in;
