@@ -95,8 +95,8 @@ template <bool causal, QKVLayout layout, RotaryMode rotary_mode, uint32_t num_fr
 __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *__restrict__ k,
                                                DTypeIn *__restrict__ v, DTypeOut *__restrict__ o,
                                                float *__restrict__ tmp,
-                                               const tensor_info_t<layout> qkv_info, const float sm_scale,
-                                               const float rope_inv_scale,
+                                               const tensor_info_t<layout> qkv_info,
+                                               const float sm_scale, const float rope_inv_scale,
                                                const float rope_inv_theta) {
   vec_t<DTypeIn, 2> sm_scale2;
   sm_scale2.fill(sm_scale * math::log2e);
@@ -171,9 +171,11 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
 #pragma unroll
   for (uint32_t i = 0; i < num_frags_x * 16 * head_dim / 64; ++i) {
     vec_t<DTypeIn, 2> tmp;
-    tmp.load((DTypeIn *)(q_smem.base + ty * num_frags_x * 16 * num_cells_per_head_in) + i * 64 + tx * 2);
+    tmp.load((DTypeIn *)(q_smem.base + ty * num_frags_x * 16 * num_cells_per_head_in) + i * 64 +
+             tx * 2);
     tmp.data = tmp.data * sm_scale2.data;
-    tmp.store((DTypeIn *)(q_smem.base + ty * num_frags_x * 16 * num_cells_per_head_in) + i * 64 + tx * 2);
+    tmp.store((DTypeIn *)(q_smem.base + ty * num_frags_x * 16 * num_cells_per_head_in) + i * 64 +
+              tx * 2);
   }
 
   smem_t k_smem[num_stages_smem];
@@ -193,6 +195,9 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
        16 * num_frags_z - 1) /
           (16 * num_frags_z) -
       1;
+  const uint32_t mask_iter =
+      (causal ? (kv_len + bx * num_warps * num_frags_x - qo_len) / (16 * num_frags_z)
+              : kv_len / (16 * num_frags_z));
 
 #pragma unroll
   for (uint32_t i = 0; i < num_stages_smem; ++i) {
@@ -279,24 +284,26 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     }
 
     // apply mask
-    uint32_t q_idx_base = ((bx * num_warps + ty) * num_frags_x) * 16 + tx / 4,
-             kv_idx_base = iter * 16 * num_frags_z + 2 * (tx % 4);
+    if (iter >= mask_iter) {
+      uint32_t q_idx_base = ((bx * num_warps + ty) * num_frags_x) * 16 + tx / 4,
+               kv_idx_base = iter * 16 * num_frags_z + 2 * (tx % 4);
 #pragma unroll
-    for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+      for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
-      for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
+        for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
 #pragma unroll
-        for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
-          const uint32_t q_idx = q_idx_base + 8 * ((reg_id % 4) / 2),
-                         kv_idx = kv_idx_base + 8 * (reg_id / 4) + reg_id % 2;
-          const bool predicate =
-              ((causal && q_idx - qo_len < kv_idx - kv_len) || q_idx >= qo_len || kv_idx >= kv_len);
-          x_frag[fx][fz][reg_id] = predicate ? -5e4 : x_frag[fx][fz][reg_id];
+          for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+            const uint32_t q_idx = q_idx_base + 8 * ((reg_id % 4) / 2),
+                           kv_idx = kv_idx_base + 8 * (reg_id / 4) + reg_id % 2;
+            const bool predicate = ((causal && q_idx - qo_len < kv_idx - kv_len) ||
+                                    q_idx >= qo_len || kv_idx >= kv_len);
+            x_frag[fx][fz][reg_id] = predicate ? -5e4 : x_frag[fx][fz][reg_id];
+          }
+          kv_idx_base += 16;
         }
-        kv_idx_base += 16;
+        kv_idx_base -= num_frags_z * 16;
+        q_idx_base += 16;
       }
-      kv_idx_base -= num_frags_z * 16;
-      q_idx_base += 16;
     }
 
     // compute m,d states in online softmax
