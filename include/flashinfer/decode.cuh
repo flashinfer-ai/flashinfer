@@ -10,9 +10,9 @@
 #include <iostream>
 #include <random>
 
-#include "math.cuh"
 #include "cp_async.cuh"
 #include "layout.cuh"
+#include "math.cuh"
 #include "page.cuh"
 #include "rope.cuh"
 #include "state.cuh"
@@ -37,8 +37,10 @@ namespace {
  * \param offset A integer indicates the offset of the position in RoPE
  */
 template <size_t vec_size, size_t bdx, typename T>
-__device__ __forceinline__ vec_t<float, vec_size> apply_llama_rope(
-    const T *x, const vec_t<float, vec_size> &freq, size_t offset) {
+__device__ __forceinline__ vec_t<float, vec_size> apply_llama_rope(const T *x,
+                                                                   vec_t<float, vec_size> &sin_vec,
+                                                                   vec_t<float, vec_size> &cos_vec,
+                                                                   size_t offset) {
   constexpr size_t head_dim = vec_size * bdx;
   vec_t<float, vec_size> permuted_vec, vec;
   vec.cast_load(x + threadIdx.x * vec_size);
@@ -48,11 +50,9 @@ __device__ __forceinline__ vec_t<float, vec_size> apply_llama_rope(
 
 #pragma unroll
   for (size_t i = 0; i < vec_size; ++i) {
-    float embed = float(offset) * freq[i];
-    float cos, sin;
-    __sincosf(embed, &sin, &cos);
-    vec[i] = vec[i] * cos +
-             ((threadIdx.x * vec_size < head_dim / 2) ? -permuted_vec[i] : permuted_vec[i]) * sin;
+    vec[i] =
+        vec[i] * cos_vec[i] +
+        ((threadIdx.x * vec_size < head_dim / 2) ? -permuted_vec[i] : permuted_vec[i]) * sin_vec[i];
   }
   return vec;
 }
@@ -78,7 +78,12 @@ __device__ __forceinline__ vec_t<float, vec_size> apply_llama_rope(
  */
 template <RotaryMode rotary_mode, size_t vec_size, size_t bdx, typename T>
 __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec_size> &q_vec,
-                                           const vec_t<float, vec_size> &freq, size_t kv_idx,
+                                           const vec_t<float, vec_size> &freq,
+                                           vec_t<float, vec_size> &sin_vec,
+                                           vec_t<float, vec_size> &cos_vec,
+                                           const vec_t<float, vec_size> &sin_delta,
+                                           const vec_t<float, vec_size> &cos_delta,
+                                           size_t kv_idx,
                                            size_t compute_stage_idx, size_t num_heads,
                                            float sm_scale, float &x) {
   constexpr size_t head_dim = bdx * vec_size;
@@ -86,7 +91,13 @@ __device__ __forceinline__ void compute_qk(const T *smem, const vec_t<float, vec
   vec_t<float, vec_size> k_vec;
   if constexpr (rotary_mode == RotaryMode::kLlama) {
     // apply rotary embedding for all rows in k matrix of kv-cache
-    k_vec = apply_llama_rope<vec_size, bdx>(smem, freq, kv_idx);
+#pragma unroll
+    for (size_t i = 0; i < vec_size; ++i) {
+      float last_sin_vec = sin_vec[i];
+      sin_vec[i] = last_sin_vec * cos_delta[i] + cos_vec[i] * sin_delta[i];
+      cos_vec[i] = cos_vec[i] * cos_delta[i] - last_sin_vec * sin_delta[i];
+    }
+    k_vec = apply_llama_rope<vec_size, bdx>(smem, sin_vec, cos_vec, kv_idx);
   } else {
     // do not apply rotary embedding
     k_vec.cast_load(smem + tx * vec_size);
@@ -218,15 +229,20 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
   size_t tx = threadIdx.x, ty = threadIdx.y;
   vec_t<float, vec_size> q_vec;
   vec_t<float, vec_size> freq;
+  vec_t<float, vec_size> sin_vec, cos_vec;
+  vec_t<float, vec_size> sin_delta, cos_delta;
   if constexpr (rotary_mode == RotaryMode::kLlama) {
 #pragma unroll
     for (size_t i = 0; i < vec_size; ++i) {
       freq[i] =
           rope_inv_scale *
           powf(rope_inv_theta, float(2 * ((tx * vec_size + i) % (head_dim / 2))) / float(head_dim));
+      __sincosf(freq[i] * (seq_len - 1), &sin_vec[i], &cos_vec[i]);
+      __sincosf(freq[i] * bdy, &sin_delta[i], &cos_delta[i]);
     }
     // apply rotary embedding to q matrix
-    q_vec = apply_llama_rope<vec_size, bdx>(q + head_idx * head_dim, freq, seq_len - 1);
+    q_vec = apply_llama_rope<vec_size, bdx>(q + head_idx * head_dim, sin_vec[i], cos_vec[i],
+                                            seq_len - 1);
   } else {
     // do not apply rotary embedding to q matrix
     q_vec.cast_load(q + head_idx * head_dim + tx * vec_size);
@@ -256,6 +272,14 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     producer_kv_idx_base += bdy;
   }
 
+  // init sin_vec and cos_vec for apply rope to k
+  if constexpr (rotary_mode == RotaryMode::kLlama) {
+#pragma unroll
+    for (size_t i = 0; i < vec_size; ++i) {
+      __sincosf(freq[i] * ty, &sin_vec[i], &cos_vec[i]);
+    }
+  }
+
   // pipelining k/v tiles loading and state updating
   size_t consumer_kv_idx_base = chunk_start + ty, stage_idx = 0;
   state_t<vec_size, norm_on_the_fly> s_partial;
@@ -268,6 +292,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
     compute_qk<rotary_mode, vec_size, bdx>(k_smem + (stage_idx * bdy + ty) * head_dim, q_vec, freq,
+                                           sin_vec, cos_vec, sin_delta, cos_delta,
                                            consumer_kv_idx, stage_idx, num_heads, sm_scale, x);
     block.sync();
     // load k
@@ -476,7 +501,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(DTypeIn *__restrict__ q,
       cp_async::wait_group<2 * num_stages_smem - 1>();
       block.sync();
       compute_qk<rotary_mode, vec_size, bdx>(k_smem + (stage_idx * bdy + ty) * head_dim, q_vec,
-                                             freq, consumer_kv_idx_base, stage_idx, num_heads,
+                                             freq,
+                                             consumer_kv_idx_base, stage_idx, num_heads,
                                              sm_scale, x);
       block.sync();
 
