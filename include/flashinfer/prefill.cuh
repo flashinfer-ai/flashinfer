@@ -64,13 +64,13 @@ template <uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps, QKVLay
           typename T>
 __device__ __forceinline__ void produce_kv(smem_t *smem, T *gmem,
                                            const tensor_info_t<layout> &qkv_info,
-                                           uint32_t kv_idx_base, uint32_t kv_len,
+                                           int32_t kv_idx_base, uint32_t kv_len,
                                            uint32_t head_idx) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   constexpr uint32_t num_cells_per_head_in = num_frags_y * 16 / cell_capacity<T>();
 
-  uint32_t kv_idx = kv_idx_base + ty * 4 + (tx % 16) / 4;
-  smem->offset = smem->get_permuted_offset<num_cells_per_head_in>(ty * 4 + (tx % 16) / 4,
+  int32_t kv_idx = kv_idx_base + ty * 4 + (tx % 16) / 4;
+  smem->offset = smem_t::get_permuted_offset<num_cells_per_head_in>(ty * 4 + (tx % 16) / 4,
                                                                   (tx / 16) * 4 + tx % 4);
   T *gptr = gmem + qkv_info.get_kv_elem_offset(kv_idx, head_idx,
                                                ((tx / 16) * 4 + tx % 4) * cell_capacity<T>());
@@ -105,7 +105,6 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   const uint32_t kv_len = qkv_info.kv_len;
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
   const uint32_t bx = blockIdx.x, head_idx = blockIdx.y;
-  const uint32_t num_heads = gridDim.y;
   auto block = cg::this_thread_block();
 
   constexpr uint32_t head_dim = num_frags_y * 16;
@@ -145,7 +144,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   smem_t q_smem(smem);
   uint32_t q_idx = (bx * num_warps + ty) * num_frags_x * 16 + tx / 4;
   q_smem.offset =
-      q_smem.get_permuted_offset<num_cells_per_head_in>(ty * num_frags_x * 16 + tx / 4, tx % 4);
+      smem_t::get_permuted_offset<num_cells_per_head_in>(ty * num_frags_x * 16 + tx / 4, tx % 4);
   DTypeIn *q_ptr =
       q + qkv_info.get_qo_elem_offset(q_idx, head_idx, (tx % 4) * cell_capacity<DTypeIn>());
 #pragma unroll
@@ -189,7 +188,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
                               head_dim * sizeof(DTypeIn));
   }
 
-  uint32_t iter =
+  int32_t iter =
       ((causal ? min(kv_len, (kv_len - qo_len) + ((bx + 1) * num_frags_x * num_warps) * 16)
                : kv_len) +
        16 * num_frags_z - 1) /
@@ -229,8 +228,8 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
 
     // load k tile from smem to reg
     q_smem.offset =
-        q_smem.get_permuted_offset<num_cells_per_head_in>(ty * num_frags_x * 16 + tx % 16, tx / 16);
-    k_smem[stage_idx].offset = k_smem[stage_idx].get_permuted_offset<num_cells_per_head_in>(
+        smem_t::get_permuted_offset<num_cells_per_head_in>(ty * num_frags_x * 16 + tx % 16, tx / 16);
+    k_smem[stage_idx].offset = smem_t::get_permuted_offset<num_cells_per_head_in>(
         8 * (tx / 16) + tx % 8, (tx % 16) / 8);
 #pragma unroll
     for (uint32_t fy = 0; fy < num_stages_frag; ++fy) {
@@ -356,7 +355,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
 
     // load v tile from smem to reg
     v_smem[stage_idx].offset =
-        v_smem[stage_idx].get_permuted_offset<num_cells_per_head_in>(tx % 16, tx / 16);
+        smem_t::get_permuted_offset<num_cells_per_head_in>(tx % 16, tx / 16);
 #pragma unroll
     for (uint32_t fy = 0; fy < num_stages_frag; ++fy) {
       const uint32_t frag_stage_idx = fy;
@@ -429,7 +428,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     // TODO(Zihao)
   } else if constexpr (sizeof(DTypeOut) == 2) {
     o_smem.offset =
-        o_smem.get_permuted_offset<num_cells_per_head_out>(ty * num_frags_x * 16 + tx / 4, 0);
+        smem_t::get_permuted_offset<num_cells_per_head_out>(ty * num_frags_x * 16 + tx / 4, 0);
 #pragma unroll
     for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
@@ -450,7 +449,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
       o_smem.offset += 16 * num_cells_per_head_out - num_frags_y * 4;
     }
 
-    o_smem.offset = o_smem.get_permuted_offset<num_cells_per_head_out>(
+    o_smem.offset = smem_t::get_permuted_offset<num_cells_per_head_out>(
         ty * num_frags_x * 16 + tx % 16, tx / 16);
     uint32_t o_idx = (bx * num_warps + ty) * num_frags_x * 16 + tx % 16;
     DTypeOut *o_ptr =
@@ -505,7 +504,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOu
                                                    num_frags_y, num_frags_z, num_stages_smem,
                                                    num_stages_frag, num_warps, DTypeIn, DTypeOut>;
 
-                dim3 nblks((qo_len + (num_rows_per_cta - 1)) / (num_rows_per_cta), num_heads);
+                dim3 nblks((qo_len + (num_rows_per_cta - 1)) / num_rows_per_cta, num_heads);
                 dim3 nthrs(32, num_warps);
                 uint32_t smem_size = (num_frags_x * num_warps + 2 * num_stages_smem * num_frags_z) *
                                      16 * head_dim * sizeof(DTypeIn);
