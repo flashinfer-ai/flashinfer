@@ -95,10 +95,12 @@ template <bool causal, QKVLayout layout, RotaryMode rotary_mode, uint32_t num_fr
 __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *__restrict__ k,
                                                DTypeIn *__restrict__ v, DTypeOut *__restrict__ o,
                                                float *__restrict__ tmp,
-                                               const tensor_info_t<layout> qkv_info, float sm_scale,
+                                               const tensor_info_t<layout> qkv_info, const float sm_scale,
                                                const float rope_inv_scale,
                                                const float rope_inv_theta) {
-  sm_scale *= math::log2e;
+  vec_t<DTypeIn, 2> sm_scale2;
+  sm_scale2.fill(sm_scale * math::log2e);
+
   const uint32_t qo_len = qkv_info.qo_len;
   const uint32_t kv_len = qkv_info.kv_len;
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
@@ -165,6 +167,14 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   cp_async::commit_group();
   cp_async::wait_group<0>();
   block.sync();
+
+#pragma unroll
+  for (uint32_t i = 0; i < num_frags_x * 16 * head_dim / 64; ++i) {
+    vec_t<DTypeIn, 2> tmp;
+    tmp.load((DTypeIn *)(q_smem.base + ty * num_frags_x * 16 * num_cells_per_head_in) + i * 64 + tx * 2);
+    tmp.data = tmp.data * sm_scale2.data;
+    tmp.store((DTypeIn *)(q_smem.base + ty * num_frags_x * 16 * num_cells_per_head_in) + i * 64 + tx * 2);
+  }
 
   smem_t k_smem[num_stages_smem];
   smem_t v_smem[num_stages_smem];
@@ -281,7 +291,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
                          kv_idx = kv_idx_base + 8 * (reg_id / 4) + reg_id % 2;
           const bool predicate =
               ((causal && q_idx - qo_len < kv_idx - kv_len) || q_idx >= qo_len || kv_idx >= kv_len);
-          x_frag[fx][fz][reg_id] = predicate ? -5e4 : x_frag[fx][fz][reg_id] * sm_scale;
+          x_frag[fx][fz][reg_id] = predicate ? -5e4 : x_frag[fx][fz][reg_id];
         }
         kv_idx_base += 16;
       }

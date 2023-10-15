@@ -29,8 +29,8 @@ __device__ __forceinline__ void load_128b(T* smem_ptr, const T* gmem_ptr) {
     asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2, %3;\n" ::"r"(smem_int_ptr),
                  "l"(gmem_ptr), "n"(16), "r"(16));
   } else {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], %2;\n" ::"r"(smem_int_ptr), "l"(gmem_ptr),
-                 "n"(16));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], %2, %3;\n" ::"r"(smem_int_ptr), "l"(gmem_ptr),
+                 "n"(16), "r"(16));
   }
 #else
   *((uint4*)smem_ptr) = *((uint4*)gmem_ptr);
