@@ -62,18 +62,18 @@ __device__ __forceinline__ void apply_llama_rope(T *x_first_half, T *x_second_ha
 
 template <uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps, QKVLayout layout,
           typename T>
-__device__ __forceinline__ void produce_kv(smem_t *smem, T *gmem,
+__device__ __forceinline__ void produce_kv(smem_t *smem, T *gptr,
                                            const tensor_info_t<layout> &qkv_info,
-                                           uint32_t kv_idx_base, uint32_t kv_len,
-                                           uint32_t head_idx) {
-  uint32_t tx = threadIdx.x, ty = threadIdx.y;
+                                           const uint32_t kv_idx_base, const uint32_t kv_len,
+                                           const uint32_t head_idx, const uint32_t tx,
+                                           const uint32_t ty) {
   constexpr uint32_t num_cells_per_head_in = num_frags_y * 16 / cell_capacity<T>();
 
   uint32_t kv_idx = kv_idx_base + ty * 4 + (tx % 16) / 4;
   smem->offset = smem_t::get_permuted_offset<num_cells_per_head_in>(ty * 4 + (tx % 16) / 4,
                                                                     (tx / 16) * 4 + tx % 4);
-  T *gptr = gmem + qkv_info.get_kv_elem_offset(kv_idx, head_idx,
-                                               ((tx / 16) * 4 + tx % 4) * cell_capacity<T>());
+  gptr +=
+      qkv_info.get_kv_elem_offset(kv_idx, head_idx, ((tx / 16) * 4 + tx % 4) * cell_capacity<T>());
 
 #pragma unroll
   for (uint32_t i = 0; i < num_frags_z * 4 / num_warps; ++i) {
@@ -200,11 +200,11 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
 #pragma unroll
   for (uint32_t iter = 0; iter < num_stages_smem; ++iter) {
     const uint32_t stage_idx = iter;
-    produce_kv<num_frags_y, num_frags_z, num_warps>(k_smem + stage_idx, k, qkv_info,
-                                                    iter * 16 * num_frags_z, kv_len, head_idx);
+    produce_kv<num_frags_y, num_frags_z, num_warps>(
+        k_smem + stage_idx, k, qkv_info, iter * 16 * num_frags_z, kv_len, head_idx, tx, ty);
     cp_async::commit_group();
-    produce_kv<num_frags_y, num_frags_z, num_warps>(v_smem + stage_idx, v, qkv_info,
-                                                    iter * 16 * num_frags_z, kv_len, head_idx);
+    produce_kv<num_frags_y, num_frags_z, num_warps>(
+        v_smem + stage_idx, v, qkv_info, iter * 16 * num_frags_z, kv_len, head_idx, tx, ty);
     cp_async::commit_group();
   }
 
@@ -347,7 +347,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     block.sync();
     produce_kv<num_frags_y, num_frags_z, num_warps>(k_smem + stage_idx, k, qkv_info,
                                                     (iter + num_stages_smem) * 16 * num_frags_z,
-                                                    kv_len, head_idx);
+                                                    kv_len, head_idx, tx, ty);
     cp_async::commit_group();
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
@@ -393,7 +393,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     block.sync();
     produce_kv<num_frags_y, num_frags_z, num_warps>(v_smem + stage_idx, v, qkv_info,
                                                     (iter + num_stages_smem) * 16 * num_frags_z,
-                                                    kv_len, head_idx);
+                                                    kv_len, head_idx, tx, ty);
     cp_async::commit_group();
   }
   cp_async::wait_group<0>();
@@ -495,7 +495,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOu
                 constexpr uint32_t num_frags_z = 2;
                 constexpr uint32_t num_warps = 4UL;
                 constexpr uint32_t num_stages_smem = 1;
-                constexpr uint32_t num_stages_frag = 3;
+                constexpr uint32_t num_stages_frag = 4;
                 constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
                 auto kernel =
                     SinglePrefillWithKVCacheKernel<CAUSAL, LAYOUT, ROTARY_MODE, num_frags_x,
