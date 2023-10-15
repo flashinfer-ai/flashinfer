@@ -293,8 +293,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
           for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
             const uint32_t q_idx = q_idx_base + 8 * ((reg_id % 4) / 2),
                            kv_idx = kv_idx_base + 8 * (reg_id / 4) + reg_id % 2;
-            const bool predicate =
-                ((causal && kv_idx > kv_len + q_idx - qo_len) || kv_idx >= kv_len);
+            const bool predicate = causal ? kv_idx > kv_len + q_idx - qo_len : kv_idx >= kv_len;
             x_frag[fx][fz][reg_id] = predicate ? -5e4 : x_frag[fx][fz][reg_id];
           }
           kv_idx_base += 16;
