@@ -495,6 +495,10 @@ cudaError_t BatchPrefillWithPagedKVCache(DTypeIn *q, paged_kv_t<DTypeIn, IdType>
                              kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx], head_dim, causal,
                              QKVLayout::kNHD, rotary_mode, rope_scale, rope_theta, stream, dev_id);
   }
+  FLASHINFER_CUDA_CALL(cudaFreeAsync(keys, stream));
+  FLASHINFER_CUDA_CALL(cudaFreeAsync(values, stream));
+  FLASHINFER_CUDA_CALL(cudaFreeAsync(kv_indptr, stream));
+  FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
 
   return cudaSuccess;
 }
