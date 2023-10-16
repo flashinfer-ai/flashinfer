@@ -31,10 +31,13 @@ struct smem_t {
   static __device__ __forceinline__ uint32_t get_permuted_offset(uint32_t i, uint32_t j) {
     return (i / 2) * stride * 2 + (j / 4) * 8 + (i % 2) * 4 + ((j % 4) ^ ((i / 2) % 4));
   }
-
   __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t *R) {
     cell_t *smem_ptr = base + offset;
     mma::ldmatrix_m8n8x4(R, smem_ptr);
+  }
+  __device__ __forceinline__ void stmatrix_m8n8x4(uint32_t *R) {
+    cell_t *smem_ptr = base + offset;
+    mma::stmatrix_m8n8x4(R, smem_ptr);
   }
   __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t *R) {
     cell_t *smem_ptr = base + offset;

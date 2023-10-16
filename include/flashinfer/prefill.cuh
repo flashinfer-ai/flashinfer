@@ -29,8 +29,8 @@ namespace {
 
 template <bool row_major, typename T>
 __device__ __forceinline__ void apply_llama_rope(T *x_first_half, T *x_second_half,
-                                                 const float *freq_first_half,
-                                                 const float *freq_second_half, uint32_t offset) {
+                                                 const float *rope_freq, uint32_t offset,
+                                                 float scale = 1.f) {
 #pragma unroll
   for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
     float cos_first_half, sin_first_half, cos_second_half, sin_second_half, tmp;
@@ -48,13 +48,15 @@ __device__ __forceinline__ void apply_llama_rope(T *x_first_half, T *x_second_ha
       i = reg_id / 4;
       j = (reg_id % 4) / 2;
     }
-    __sincosf(float(offset + 8 * i) * freq_first_half[2 * j + reg_id % 2], &sin_first_half,
+    __sincosf(float(offset + 8 * i) * rope_freq[2 * j + reg_id % 2], &sin_first_half,
               &cos_first_half);
-    __sincosf(float(offset + 8 * i) * freq_second_half[2 * j + reg_id % 2], &sin_second_half,
+    __sincosf(float(offset + 8 * i) * rope_freq[2 * j + reg_id % 2], &sin_second_half,
               &cos_second_half);
     tmp = x_first_half[reg_id];
-    x_first_half[reg_id] = tmp * cos_first_half - (float)x_second_half[reg_id] * sin_first_half;
-    x_second_half[reg_id] = (float)x_second_half[reg_id] * cos_second_half + tmp * sin_second_half;
+    x_first_half[reg_id] =
+        (tmp * cos_first_half - (float)x_second_half[reg_id] * sin_first_half) * scale;
+    x_second_half[reg_id] =
+        ((float)x_second_half[reg_id] * cos_second_half + tmp * sin_second_half) * scale;
   }
 }
 
@@ -92,12 +94,10 @@ __device__ __forceinline__ void produce_kv(smem_t *smem, T *gptr,
 template <bool causal, QKVLayout layout, RotaryMode rotary_mode, uint32_t num_frags_x,
           uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_stages_smem,
           uint32_t num_stages_frag, uint32_t num_warps, typename DTypeIn, typename DTypeOut>
-__global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *__restrict__ k,
-                                               DTypeIn *__restrict__ v, DTypeOut *__restrict__ o,
-                                               float *__restrict__ tmp,
-                                               const tensor_info_t<layout> qkv_info,
-                                               const float sm_scale, const float rope_inv_scale,
-                                               const float rope_inv_theta) {
+__global__ void SinglePrefillWithKVCacheKernel(
+    DTypeIn *__restrict__ q, DTypeIn *__restrict__ k, DTypeIn *__restrict__ v,
+    DTypeOut *__restrict__ o, float *__restrict__ tmp, const tensor_info_t<layout> qkv_info,
+    const float sm_scale, const float log2_rope_inv_scale, const float log2_rope_inv_theta) {
   vec_t<DTypeIn, 2> sm_scale2;
   sm_scale2.fill(sm_scale * math::log2e);
 
@@ -121,6 +121,21 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   float o_frag[num_frags_x][num_frags_y][8];
   float m[num_frags_x][2];
   float d[num_frags_x][2];
+  float rope_freq[num_frags_y / 2][4];
+  if constexpr (rotary_mode == RotaryMode::kLlama) {
+    static_assert(num_stages_frag % 2 == 0);
+#pragma unroll
+    for (uint32_t fy = 0; fy < num_frags_y / 2; ++fy) {
+#pragma unroll
+      for (uint32_t j = 0; j < 4; ++j) {
+        rope_freq[fy][j] = math::ptx_exp2(
+            log2_rope_inv_scale +
+            log2_rope_inv_theta *
+                float(2 * ((fy * 16 + (j / 2) * 8 + (tx % 4) * 2 + (j % 2)) % (head_dim / 2))) /
+                float(head_dim));
+      }
+    }
+  }
 #pragma unroll
   for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
@@ -167,14 +182,36 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   cp_async::wait_group<0>();
   block.sync();
 
+  if constexpr (rotary_mode == RotaryMode::kLlama) {
+    q_idx = (bx * num_warps + ty) * num_frags_x * 16 + tx / 4;
+    q_smem.offset = smem_t::get_permuted_offset<num_cells_per_head_in>(
+        ty * num_frags_x * 16 + tx % 16, tx / 16);
+    for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+      for (uint32_t fyi = 0; fyi < num_frags_y / 2; ++fyi) {
+        q_smem.ldmatrix_m8n8x4(a_frag[fx][0]);
+        q_smem.offset += num_frags_y * 2;
+        q_smem.ldmatrix_m8n8x4(a_frag[fx][1]);
+        apply_llama_rope<true, DTypeIn>((DTypeIn *)a_frag[fx][0], (DTypeIn *)a_frag[fx][1],
+                                        rope_freq[fyi], q_idx + kv_len - qo_len,
+                                        sm_scale * math::log2e);
+        q_smem.stmatrix_m8n8x4(a_frag[fx][1]);
+        q_smem.offset -= num_frags_y * 2;
+        q_smem.stmatrix_m8n8x4(a_frag[fx][0]);
+        q_smem.offset = (q_smem.offset ^ 0x2) + (fyi & 0x1) * 8;
+      }
+      q_smem.offset += 16 * num_cells_per_head_in - 2 * num_frags_y;
+      q_idx += 16;
+    }
+  } else {
 #pragma unroll
-  for (uint32_t i = 0; i < num_frags_x * 16 * head_dim / 64; ++i) {
-    vec_t<DTypeIn, 2> tmp;
-    tmp.load((DTypeIn *)(q_smem.base + ty * num_frags_x * 16 * num_cells_per_head_in) + i * 64 +
-             tx * 2);
-    tmp.data = tmp.data * sm_scale2.data;
-    tmp.store((DTypeIn *)(q_smem.base + ty * num_frags_x * 16 * num_cells_per_head_in) + i * 64 +
-              tx * 2);
+    for (uint32_t i = 0; i < num_frags_x * 16 * head_dim / 64; ++i) {
+      vec_t<DTypeIn, 2> tmp;
+      tmp.load((DTypeIn *)(q_smem.base + ty * num_frags_x * 16 * num_cells_per_head_in) + i * 64 +
+               tx * 2);
+      tmp.data = tmp.data * sm_scale2.data;
+      tmp.store((DTypeIn *)(q_smem.base + ty * num_frags_x * 16 * num_cells_per_head_in) + i * 64 +
+                tx * 2);
+    }
   }
 
   smem_t k_smem[num_stages_smem];
@@ -225,44 +262,92 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
       }
     }
 
-    // load k tile from smem to reg
-    q_smem.offset = smem_t::get_permuted_offset<num_cells_per_head_in>(
-        ty * num_frags_x * 16 + tx % 16, tx / 16);
-    k_smem[stage_idx].offset =
-        smem_t::get_permuted_offset<num_cells_per_head_in>(8 * (tx / 16) + tx % 8, (tx % 16) / 8);
+    if constexpr (rotary_mode == RotaryMode::kLlama) {
+      // apply rotary on the fly
+      // load k tile from smem to reg
+      q_smem.offset = smem_t::get_permuted_offset<num_cells_per_head_in>(
+          ty * num_frags_x * 16 + tx % 16, tx / 16);
+      k_smem[stage_idx].offset =
+          smem_t::get_permuted_offset<num_cells_per_head_in>(8 * (tx / 16) + tx % 8, (tx % 16) / 8);
 #pragma unroll
-    for (uint32_t fy = 0; fy < num_stages_frag; ++fy) {
-      const uint32_t frag_stage_idx = fy;
+      for (uint32_t fyi = 0; fyi < num_stages_frag / 2; ++fyi) {
+        const uint32_t frag_stage_idx = fyi * 2;
 #pragma unroll
-      for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
-        q_smem.ldmatrix_m8n8x4(a_frag[fx][frag_stage_idx]);
-        q_smem.offset += 16 * num_cells_per_head_in;
-      }
-#pragma unroll
-      for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
-        k_smem[stage_idx].ldmatrix_m8n8x4(b_frag[fz][frag_stage_idx]);
-        k_smem[stage_idx].offset += 16 * num_cells_per_head_in;
-      }
-      q_smem.offset =
-          (q_smem.offset ^ 0x2) + (fy & 0x1) * 8 - num_frags_x * 16 * num_cells_per_head_in;
-      k_smem[stage_idx].offset = (k_smem[stage_idx].offset ^ 0x2) + (fy & 0x1) * 8 -
-                                 num_frags_z * 16 * num_cells_per_head_in;
-    }
-
-    // compute q*k^T
-#pragma unroll
-    for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
-      const uint32_t frag_stage_idx = fy % num_stages_frag;
-#pragma unroll
-      for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+        for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+          q_smem.ldmatrix_m8n8x4(a_frag[fx][frag_stage_idx]);
+          q_smem.offset += num_frags_y * 2;
+          q_smem.ldmatrix_m8n8x4(a_frag[fx][frag_stage_idx + 1]);
+          q_smem.offset += 16 * num_cells_per_head_in - num_frags_y * 2;
+        }
+        uint32_t kv_idx = iter * 16 * num_frags_z + tx / 4;
 #pragma unroll
         for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
-          mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
-              x_frag[fx][fz], a_frag[fx][frag_stage_idx], b_frag[fz][frag_stage_idx]);
+          k_smem[stage_idx].ldmatrix_m8n8x4(b_frag[fz][frag_stage_idx]);
+          k_smem[stage_idx].offset += num_frags_y * 2;
+          k_smem[stage_idx].ldmatrix_m8n8x4(b_frag[fz][frag_stage_idx + 1]);
+          k_smem[stage_idx].offset += 16 * num_cells_per_head_in - num_frags_y * 2;
+          apply_llama_rope<false, DTypeIn>((DTypeIn *)b_frag[fz][frag_stage_idx],
+                                           (DTypeIn *)b_frag[fz][frag_stage_idx + 1],
+                                           rope_freq[fyi], kv_idx);
+          kv_idx += 16;
         }
+        q_smem.offset =
+            (q_smem.offset ^ 0x2) + (fyi & 0x1) * 8 - num_frags_x * 16 * num_cells_per_head_in;
+        k_smem[stage_idx].offset = (k_smem[stage_idx].offset ^ 0x2) + (fyi & 0x1) * 8 -
+                                   num_frags_z * 16 * num_cells_per_head_in;
       }
 
-      if (fy + num_stages_frag < num_frags_y) {
+      // compute q*k^T
+#pragma unroll
+      for (uint32_t fyi = 0; fyi < num_frags_y / 2; ++fyi) {
+        const uint32_t frag_stage_idx = (fyi * 2) % num_stages_frag;
+#pragma unroll
+        for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+          for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
+            mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
+                x_frag[fx][fz], a_frag[fx][frag_stage_idx], b_frag[fz][frag_stage_idx]);
+            mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
+                x_frag[fx][fz], a_frag[fx][frag_stage_idx + 1], b_frag[fz][frag_stage_idx + 1]);
+          }
+        }
+
+        if (fyi * 2 + num_stages_frag < num_frags_y) {
+#pragma unroll
+          for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+            q_smem.ldmatrix_m8n8x4(a_frag[fx][frag_stage_idx]);
+            q_smem.offset += num_frags_y * 2;
+            q_smem.ldmatrix_m8n8x4(a_frag[fx][frag_stage_idx + 1]);
+            q_smem.offset += 16 * num_cells_per_head_in - num_frags_y * 2;
+          }
+          uint32_t kv_idx = iter * 16 * num_frags_z + tx / 4;
+#pragma unroll
+          for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
+            k_smem[stage_idx].ldmatrix_m8n8x4(b_frag[fz][frag_stage_idx]);
+            k_smem[stage_idx].offset += num_frags_y * 2;
+            k_smem[stage_idx].ldmatrix_m8n8x4(b_frag[fz][frag_stage_idx + 1]);
+            k_smem[stage_idx].offset += 16 * num_cells_per_head_in - num_frags_y * 2;
+            apply_llama_rope<false, DTypeIn>((DTypeIn *)b_frag[fz][frag_stage_idx],
+                                             (DTypeIn *)b_frag[fz][frag_stage_idx + 1],
+                                             rope_freq[fyi + num_stages_frag / 2], kv_idx);
+            kv_idx += 16;
+          }
+          q_smem.offset = (q_smem.offset ^ 0x2) + ((fyi + (num_stages_frag / 2)) & 0x1) * 8 -
+                          num_frags_x * 16 * num_cells_per_head_in;
+          k_smem[stage_idx].offset = (k_smem[stage_idx].offset ^ 0x2) +
+                                     ((fyi + (num_stages_frag / 2)) & 0x1) * 8 -
+                                     num_frags_z * 16 * num_cells_per_head_in;
+        }
+      }
+    } else {
+      // load k tile from smem to reg
+      q_smem.offset = smem_t::get_permuted_offset<num_cells_per_head_in>(
+          ty * num_frags_x * 16 + tx % 16, tx / 16);
+      k_smem[stage_idx].offset =
+          smem_t::get_permuted_offset<num_cells_per_head_in>(8 * (tx / 16) + tx % 8, (tx % 16) / 8);
+#pragma unroll
+      for (uint32_t fy = 0; fy < num_stages_frag; ++fy) {
+        const uint32_t frag_stage_idx = fy;
 #pragma unroll
         for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
           q_smem.ldmatrix_m8n8x4(a_frag[fx][frag_stage_idx]);
@@ -273,11 +358,42 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
           k_smem[stage_idx].ldmatrix_m8n8x4(b_frag[fz][frag_stage_idx]);
           k_smem[stage_idx].offset += 16 * num_cells_per_head_in;
         }
-        q_smem.offset = (q_smem.offset ^ 0x2) + ((fy + num_stages_frag) & 0x1) * 8 -
-                        num_frags_x * 16 * num_cells_per_head_in;
-        k_smem[stage_idx].offset = (k_smem[stage_idx].offset ^ 0x2) +
-                                   ((fy + num_stages_frag) & 0x1) * 8 -
+        q_smem.offset =
+            (q_smem.offset ^ 0x2) + (fy & 0x1) * 8 - num_frags_x * 16 * num_cells_per_head_in;
+        k_smem[stage_idx].offset = (k_smem[stage_idx].offset ^ 0x2) + (fy & 0x1) * 8 -
                                    num_frags_z * 16 * num_cells_per_head_in;
+      }
+
+      // compute q*k^T
+#pragma unroll
+      for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
+        const uint32_t frag_stage_idx = fy % num_stages_frag;
+#pragma unroll
+        for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+          for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
+            mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
+                x_frag[fx][fz], a_frag[fx][frag_stage_idx], b_frag[fz][frag_stage_idx]);
+          }
+        }
+
+        if (fy + num_stages_frag < num_frags_y) {
+#pragma unroll
+          for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+            q_smem.ldmatrix_m8n8x4(a_frag[fx][frag_stage_idx]);
+            q_smem.offset += 16 * num_cells_per_head_in;
+          }
+#pragma unroll
+          for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
+            k_smem[stage_idx].ldmatrix_m8n8x4(b_frag[fz][frag_stage_idx]);
+            k_smem[stage_idx].offset += 16 * num_cells_per_head_in;
+          }
+          q_smem.offset = (q_smem.offset ^ 0x2) + ((fy + num_stages_frag) & 0x1) * 8 -
+                          num_frags_x * 16 * num_cells_per_head_in;
+          k_smem[stage_idx].offset = (k_smem[stage_idx].offset ^ 0x2) +
+                                     ((fy + num_stages_frag) & 0x1) * 8 -
+                                     num_frags_z * 16 * num_cells_per_head_in;
+        }
       }
     }
 
@@ -293,7 +409,8 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
           for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
             const uint32_t q_idx = q_idx_base + 8 * ((reg_id % 4) / 2),
                            kv_idx = kv_idx_base + 8 * (reg_id / 4) + reg_id % 2;
-            const bool predicate = causal ? kv_idx > kv_len + q_idx - qo_len : kv_idx >= kv_len;
+            const bool predicate =
+                (causal ? kv_idx > kv_len + q_idx - qo_len : kv_idx >= kv_len);
             x_frag[fx][fz][reg_id] = predicate ? -5e4 : x_frag[fx][fz][reg_id];
           }
           kv_idx_base += 16;
@@ -480,8 +597,8 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOu
                                      float rope_scale = 1.f, float rope_theta = 1e4,
                                      cudaStream_t stream = nullptr, uint32_t dev_id = 0) {
   const float sm_scale = 1.f / std::sqrt(float(head_dim));
-  const float rope_inv_scale = 1.f / rope_scale;
-  const float rope_inv_theta = 1.f / rope_theta;
+  const float log2_rope_inv_scale = -std::log2f(rope_scale);
+  const float log2_rope_inv_theta = -std::log2f(rope_theta);
   FLASHINFER_CUDA_CALL(cudaSetDevice(dev_id));
 
   SWITCH_CAUSAL(
@@ -514,8 +631,8 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOu
                                 (void *)&tmp,
                                 (void *)&qkv_info,
                                 (void *)&sm_scale,
-                                (void *)&rope_inv_scale,
-                                (void *)&rope_inv_theta};
+                                (void *)&log2_rope_inv_scale,
+                                (void *)&log2_rope_inv_theta};
                 FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
                     kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
                 FLASHINFER_CUDA_CALL(
@@ -531,9 +648,6 @@ cudaError_t BatchPrefillWithPagedKVCache(DTypeIn *q, paged_kv_t<DTypeIn, IdType>
                                          RotaryMode rotary_mode = RotaryMode::kNone,
                                          float rope_scale = 1.f, float rope_theta = 1e4,
                                          cudaStream_t stream = nullptr, uint32_t dev_id = 0) {
-  const float sm_scale = 1.f / std::sqrt(float(paged_kv.head_dim));
-  const float rope_inv_scale = 1.f / rope_scale;
-  const float rope_inv_theta = 1.f / rope_theta;
   const uint32_t num_heads = paged_kv.num_heads;
   const uint32_t head_dim = paged_kv.head_dim;
   const uint32_t batch_size = paged_kv.batch_size;

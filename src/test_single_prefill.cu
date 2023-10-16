@@ -59,12 +59,12 @@ void _TestSinglePrefillKernelCorrectness(size_t qo_len, size_t kv_len, size_t nu
 
 template <typename DTypeIn, typename DTypeOut>
 void TestSinglePrefillKernelLongContextCorrectness() {
-  for (size_t qo_len : {31, 63, 127, 255}) {
+  for (size_t qo_len : {1, 31, 63, 127}) {
     for (size_t kv_len : {31717}) {
       for (size_t num_heads : {1}) {
         for (size_t head_dim : {64, 128}) {
           for (bool causal : {false, true}) {
-            for (size_t rotary_mode : {0}) {
+            for (size_t rotary_mode : {0, 1}) {
               for (size_t layout : {0, 1}) {
                 _TestSinglePrefillKernelCorrectness<DTypeIn, DTypeOut>(
                     qo_len, kv_len, num_heads, head_dim, causal, QKVLayout(layout),
@@ -82,11 +82,11 @@ template <typename DTypeIn, typename DTypeOut>
 void TestSinglePrefillKernelShortContextCorrectness() {
   float rtol = std::is_same<DTypeOut, nv_bfloat16>::value ? 1e-2 : 1e-3;
   float atol = std::is_same<DTypeOut, nv_bfloat16>::value ? 1e-2 : 1e-3;
-  for (size_t qkv_len : {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31}) {
+  for (size_t qkv_len : {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37}) {
     for (size_t num_heads : {32}) {
       for (size_t head_dim : {64, 128}) {
         for (bool causal : {false, true}) {
-          for (size_t rotary_mode : {0}) {
+          for (size_t rotary_mode : {0, 1}) {
             for (size_t layout : {0, 1}) {
               _TestSinglePrefillKernelCorrectness<DTypeIn, DTypeOut>(
                   qkv_len, qkv_len, num_heads, head_dim, causal, QKVLayout(layout),
@@ -103,10 +103,10 @@ template <typename DTypeIn, typename DTypeOut>
 void TestSinglePrefillKernelCorrectness() {
   for (size_t qo_len : {399, 400, 401}) {
     for (size_t kv_len : {533, 534, 535}) {
-      for (size_t num_heads : {32}) {
+      for (size_t num_heads : {12}) {
         for (size_t head_dim : {64, 128}) {
           for (bool causal : {false, true}) {
-            for (size_t rotary_mode : {0}) {
+            for (size_t rotary_mode : {0, 1}) {
               for (size_t layout : {0, 1}) {
                 _TestSinglePrefillKernelCorrectness<DTypeIn, DTypeOut>(
                     qo_len, kv_len, num_heads, head_dim, causal, QKVLayout(layout),

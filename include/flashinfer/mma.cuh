@@ -34,7 +34,18 @@ __device__ __forceinline__ void stmatrix_m8n8x4(uint32_t *R, T *smem_ptr) {
   asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                : "r"(smem_int_ptr), "r"(R[0]), "r"(R[1]), "r"(R[2]), "r"(R[3]));
 #else
-  // NOTE(Zihao): Not implemented yet.
+  const uint32_t tx = threadIdx.x;
+  uint4 word;
+#pragma unroll
+  for (uint32_t reg_id = 0; reg_id < 4; ++reg_id) {
+    word.x = __shfl_sync(0xffffffff, R[reg_id], (tx % 8) * 4);
+    word.y = __shfl_sync(0xffffffff, R[reg_id], (tx % 8) * 4 + 1);
+    word.z = __shfl_sync(0xffffffff, R[reg_id], (tx % 8) * 4 + 2);
+    word.w = __shfl_sync(0xffffffff, R[reg_id], (tx % 8) * 4 + 3);
+    if (tx / 8 == reg_id) {
+      *(uint4 *)smem_ptr = word;
+    }
+  }
 #endif
 }
 
