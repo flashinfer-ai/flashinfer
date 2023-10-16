@@ -11,8 +11,6 @@ using utils::vec_bytes;
 
 template <typename T>
 void bench_flashinfer_batch_decode(nvbench::state& state) {
-  constexpr size_t num_qo_heads = 32;
-  constexpr size_t num_kv_heads = 32;
   constexpr size_t head_dim = 128;
   constexpr size_t num_layers = 3;
   constexpr size_t layer_idx = 1;
@@ -20,6 +18,8 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
   size_t seqlen = state.get_int64("seqlen");
   size_t batch_size = state.get_int64("batch_size");
   size_t page_size = state.get_int64("page_size");
+  size_t num_qo_heads = state.get_int64("num_qo_heads");
+  size_t num_kv_heads = state.get_int64("num_kv_heads");
 
   // KV cache:
   auto pages_per_seq = (seqlen + page_size - 1) / page_size;
@@ -76,6 +76,8 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
                       {1,   2,   3,   4,   5,   6,   7,   8,   9,   10,  11,  12,  13,  14,    \
                        15,  16,  20,  24,  28,  32,  40,  48,  56,  64,  80,  96,  112, 128,   \
                        160, 192, 224, 256, 320, 384, 448, 512, 640, 768, 896, 1024})           \
-      .add_int64_axis("page_size", {4, 8, 16, 32, 64})
+      .add_int64_axis("page_size", {4, 8, 16, 32, 64})                                         \
+      .add_int64_axis("num_qo_heads", {32})                                                    \
+      .add_int64_axis("num_kv_heads", {32, 4})
 
 BENCH_FLASHINFER_BATCH_DECODE(half);
