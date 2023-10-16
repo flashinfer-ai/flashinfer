@@ -409,8 +409,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
           for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
             const uint32_t q_idx = q_idx_base + 8 * ((reg_id % 4) / 2),
                            kv_idx = kv_idx_base + 8 * (reg_id / 4) + reg_id % 2;
-            const bool predicate =
-                (causal ? kv_idx > kv_len + q_idx - qo_len : kv_idx >= kv_len);
+            const bool predicate = (causal ? kv_idx > kv_len + q_idx - qo_len : kv_idx >= kv_len);
             x_frag[fx][fz][reg_id] = predicate ? -5e4 : x_frag[fx][fz][reg_id];
           }
           kv_idx_base += 16;
@@ -612,7 +611,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOu
                 constexpr uint32_t num_frags_z = 2;
                 constexpr uint32_t num_warps = 4UL;
                 constexpr uint32_t num_stages_smem = 1;
-                constexpr uint32_t num_stages_frag = 4;
+                constexpr uint32_t num_stages_frag = (ROTARY_MODE == RotaryMode::kLlama) ? 2 : 4;
                 constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
                 auto kernel =
                     SinglePrefillWithKVCacheKernel<CAUSAL, LAYOUT, ROTARY_MODE, num_frags_x,
