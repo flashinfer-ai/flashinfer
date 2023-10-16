@@ -424,15 +424,14 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
 #pragma unroll
       for (uint32_t j = 0; j < 2; ++j) {
         float m_prev = m[fx][j];
-
 #pragma unroll
         for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
           float m_local = max(max(x_frag[fx][fz][j * 2 + 0], x_frag[fx][fz][j * 2 + 1]),
                               max(x_frag[fx][fz][j * 2 + 4], x_frag[fx][fz][j * 2 + 5]));
-          m_local = max(m_local, math::shfl_xor_sync(m_local, 0x2));
-          m_local = max(m_local, math::shfl_xor_sync(m_local, 0x1));
           m[fx][j] = max(m[fx][j], m_local);
         }
+        m[fx][j] = max(m[fx][j], math::shfl_xor_sync(m[fx][j], 0x2));
+        m[fx][j] = max(m[fx][j], math::shfl_xor_sync(m[fx][j], 0x1));
         float o_scale = math::ptx_exp2(m_prev - m[fx][j]);
         d[fx][j] *= o_scale;
 #pragma unroll
