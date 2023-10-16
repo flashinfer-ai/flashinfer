@@ -6,10 +6,13 @@
 using flashinfer::QKVLayout;
 using flashinfer::RotaryMode;
 
-template <typename dtype_in, typename dtype_out>
+template <typename dtype_in, typename dtype_out, bool append>
 void bench_flashinfer_single_prefill(nvbench::state &state) {
-  size_t qo_len = state.get_int64("seq_len");
-  size_t kv_len = state.get_int64("seq_len");
+  size_t kv_len = state.get_int64("kv_len");
+  size_t qo_len = kv_len;
+  if (append) {
+    qo_len = state.get_int64("qo_len");
+  }
   size_t num_qo_heads = state.get_int64("num_qo_heads");
   size_t num_kv_heads = state.get_int64("num_kv_heads");
   size_t head_dim = state.get_int64("head_dim");
@@ -40,21 +43,43 @@ void bench_flashinfer_single_prefill(nvbench::state &state) {
     }
     timer.stop();
   });
+
+  const auto measured_mean = static_cast<nvbench::float32_t>(
+      state.get_summary("nv/cold/time/gpu/mean").get_float64("value"));
+  auto &summ = state.add_summary("nv/tflops");
+  summ.set_string("description", "Achieved TFlops/s");
+  summ.set_string("name", "TFlops/s");
+  summ.set_float64("value", qo_len * kv_len * 4 * num_qo_heads * head_dim / measured_mean / 1e12);
 }
 
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
-#define BENCH_FLASHINFER_PREFILL(dtype_in, dtype_out)                                           \
-  auto bench_flashinfer_single_prefill_##dtype_in##_##dtype_out##_ =                            \
-      bench_flashinfer_single_prefill<dtype_in, dtype_out>;                                     \
-  NVBENCH_BENCH(bench_flashinfer_single_prefill_##dtype_in##_##dtype_out##_)                    \
-      .set_name(("bench_flashinfer_single_prefill_" STR(dtype_in) "_" STR(dtype_out) "_"))      \
-      .add_int64_axis("seq_len", {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768}) \
-      .add_int64_axis("num_qo_heads", {32})                                                     \
-      .add_int64_axis("num_kv_heads", {32})                                                     \
-      .add_int64_axis("head_dim", {128})                                                        \
-      .add_int64_axis("causal", {0, 1})                                                         \
-      .add_int64_axis("layout", {0, 1})                                                         \
+#define BENCH_FLASHINFER_PREFILL(dtype_in, dtype_out)                                          \
+  auto bench_flashinfer_single_prefill_##dtype_in##_##dtype_out##_ =                           \
+      bench_flashinfer_single_prefill<dtype_in, dtype_out, false>;                             \
+  NVBENCH_BENCH(bench_flashinfer_single_prefill_##dtype_in##_##dtype_out##_)                   \
+      .set_name(("bench_flashinfer_single_prefill_" STR(dtype_in) "_" STR(dtype_out) "_"))     \
+      .add_int64_axis("kv_len", {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768}) \
+      .add_int64_axis("num_qo_heads", {32})                                                    \
+      .add_int64_axis("num_kv_heads", {32})                                                    \
+      .add_int64_axis("head_dim", {128})                                                       \
+      .add_int64_axis("causal", {0, 1})                                                        \
+      .add_int64_axis("layout", {0, 1})                                                        \
+      .add_int64_axis("rotary_mode", {0, 1})
+
+#define BENCH_FLASHINFER_APPEND_PREFILL(dtype_in, dtype_out)                                      \
+  auto bench_flashinfer_single_append_prefill_##dtype_in##_##dtype_out##_ =                       \
+      bench_flashinfer_single_prefill<dtype_in, dtype_out, true>;                                 \
+  NVBENCH_BENCH(bench_flashinfer_single_append_prefill_##dtype_in##_##dtype_out##_)               \
+      .set_name(("bench_flashinfer_single_append_prefill_" STR(dtype_in) "_" STR(dtype_out) "_")) \
+      .add_int64_axis("qo_len", {128})                                                            \
+      .add_int64_axis("kv_len", {128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768})            \
+      .add_int64_axis("num_qo_heads", {32})                                                       \
+      .add_int64_axis("num_kv_heads", {32})                                                       \
+      .add_int64_axis("head_dim", {128})                                                          \
+      .add_int64_axis("causal", {0, 1})                                                           \
+      .add_int64_axis("layout", {0, 1})                                                           \
       .add_int64_axis("rotary_mode", {0, 1})
 
 BENCH_FLASHINFER_PREFILL(half, half);
+BENCH_FLASHINFER_APPEND_PREFILL(half, half);
