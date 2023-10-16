@@ -33,7 +33,7 @@ __device__ __forceinline__ void apply_llama_rope(T *x_first_half, T *x_second_ha
                                                  float scale = 1.f) {
 #pragma unroll
   for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
-    float cos_first_half, sin_first_half, cos_second_half, sin_second_half, tmp;
+    float cos, sin, tmp;
     uint32_t i, j;
     if constexpr (row_major) {
       // 0 1 | 4 5
@@ -48,15 +48,10 @@ __device__ __forceinline__ void apply_llama_rope(T *x_first_half, T *x_second_ha
       i = reg_id / 4;
       j = (reg_id % 4) / 2;
     }
-    __sincosf(float(offset + 8 * i) * rope_freq[2 * j + reg_id % 2], &sin_first_half,
-              &cos_first_half);
-    __sincosf(float(offset + 8 * i) * rope_freq[2 * j + reg_id % 2], &sin_second_half,
-              &cos_second_half);
+    __sincosf(float(offset + 8 * i) * rope_freq[2 * j + reg_id % 2], &sin, &cos);
     tmp = x_first_half[reg_id];
-    x_first_half[reg_id] =
-        (tmp * cos_first_half - (float)x_second_half[reg_id] * sin_first_half) * scale;
-    x_second_half[reg_id] =
-        ((float)x_second_half[reg_id] * cos_second_half + tmp * sin_second_half) * scale;
+    x_first_half[reg_id] = (tmp * cos - (float)x_second_half[reg_id] * sin) * scale;
+    x_second_half[reg_id] = ((float)x_second_half[reg_id] * cos + tmp * sin) * scale;
   }
 }
 
