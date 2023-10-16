@@ -9,12 +9,12 @@
 using namespace flashinfer;
 
 template <typename T>
-void _TestDecodingKernelCorrectness(size_t num_heads, size_t seq_len, size_t head_dim,
-                                    QKVLayout layout, RotaryMode rotary_mode) {
-  std::vector<T> Q_host(num_heads * head_dim);
-  std::vector<T> K_host(seq_len * num_heads * head_dim);
-  std::vector<T> V_host(seq_len * num_heads * head_dim);
-  std::vector<T> O_host(num_heads * head_dim);
+void _TestDecodingKernelCorrectness(size_t num_qo_heads, size_t num_kv_heads, size_t seq_len,
+                                    size_t head_dim, QKVLayout layout, RotaryMode rotary_mode) {
+  std::vector<T> Q_host(num_qo_heads * head_dim);
+  std::vector<T> K_host(seq_len * num_kv_heads * head_dim);
+  std::vector<T> V_host(seq_len * num_kv_heads * head_dim);
+  std::vector<T> O_host(num_qo_heads * head_dim);
 
   utils::vec_normal_(Q_host);
   utils::vec_normal_(K_host);
@@ -25,23 +25,23 @@ void _TestDecodingKernelCorrectness(size_t num_heads, size_t seq_len, size_t hea
   thrust::device_vector<T> K(K_host);
   thrust::device_vector<T> V(V_host);
   thrust::device_vector<T> O(O_host);
-  thrust::device_vector<float> tmp(512 * num_heads * head_dim);
+  thrust::device_vector<float> tmp(512 * num_qo_heads * head_dim);
   std::vector<T> o_ref_host;
 
-  o_ref_host = cpu_reference::single_mha<T, T>(Q_host, K_host, V_host, 1, seq_len, num_heads,
-                                               head_dim, false, layout, rotary_mode);
+  o_ref_host = cpu_reference::single_mha<T, T>(Q_host, K_host, V_host, 1, seq_len, num_qo_heads,
+                                               num_kv_heads, head_dim, false, layout, rotary_mode);
 
   SingleDecodeWithKVCache(thrust::raw_pointer_cast(Q.data()), thrust::raw_pointer_cast(K.data()),
                           thrust::raw_pointer_cast(V.data()), thrust::raw_pointer_cast(O.data()),
-                          thrust::raw_pointer_cast(tmp.data()), num_heads, seq_len, head_dim,
-                          layout, rotary_mode);
+                          thrust::raw_pointer_cast(tmp.data()), num_qo_heads, num_kv_heads, seq_len,
+                          head_dim, layout, rotary_mode);
 
   thrust::host_vector<T> o_host = O;
   thrust::host_vector<float> tmp_host = tmp;
 
   size_t num_result_errors_atol_1e_3_rtol_1e_3 = 0;
   bool nan_detected = false;
-  for (size_t i = 0; i < num_heads * head_dim; ++i) {
+  for (size_t i = 0; i < num_qo_heads * head_dim; ++i) {
     if (isnan(float(o_host[i]))) {
       nan_detected = true;
     }
@@ -49,8 +49,9 @@ void _TestDecodingKernelCorrectness(size_t num_heads, size_t seq_len, size_t hea
         (!utils::isclose(float(o_host[i]), float(o_ref_host[i]), 1e-3, 1e-3));
   }
   float result_accuracy =
-      1. - float(num_result_errors_atol_1e_3_rtol_1e_3) / float(num_heads * head_dim);
-  std::cout << "num_heads=" << num_heads << ", seq_len=" << seq_len << ", head_dim=" << head_dim
+      1. - float(num_result_errors_atol_1e_3_rtol_1e_3) / float(num_qo_heads * head_dim);
+  std::cout << "num_qo_heads=" << num_qo_heads << ", num_kv_heads=" << num_kv_heads
+            << ", seq_len=" << seq_len << ", head_dim=" << head_dim
             << ", layout=" << QKVLayoutToString(layout)
             << ", rotary_mode=" << RotaryModeToString(rotary_mode)
             << ", result accuracy (atol=1e-3, rtol=1e-3): " << result_accuracy << std::endl;
@@ -60,13 +61,16 @@ void _TestDecodingKernelCorrectness(size_t num_heads, size_t seq_len, size_t hea
 
 template <typename T>
 void TestSingleDecodeKernelCorrectness() {
-  for (size_t num_heads : {32}) {
-    for (size_t seq_len : {1, 3, 9, 27, 81, 129, 257, 512, 1024, 2048, 4096, 8192, 16384, 32768}) {
-      for (size_t head_dim : {64, 128, 256}) {
-        for (unsigned int layout : {0U, 1U}) {
-          for (unsigned int rotary_mode : {0U, 1U}) {
-            _TestDecodingKernelCorrectness<T>(num_heads, seq_len, head_dim, QKVLayout(layout),
-                                              RotaryMode(rotary_mode));
+  for (size_t num_qo_heads : {32}) {
+    for (size_t num_kv_heads : {4, 32}) {
+      for (size_t seq_len :
+           {1, 3, 9, 27, 81, 129, 257, 512, 1024, 2048, 4096, 8192, 16384, 32768}) {
+        for (size_t head_dim : {64, 128, 256}) {
+          for (unsigned int layout : {0U, 1U}) {
+            for (unsigned int rotary_mode : {0U, 1U}) {
+              _TestDecodingKernelCorrectness<T>(num_qo_heads, num_kv_heads, seq_len, head_dim,
+                                                QKVLayout(layout), RotaryMode(rotary_mode));
+            }
           }
         }
       }

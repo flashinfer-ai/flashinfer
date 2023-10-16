@@ -30,80 +30,83 @@ inline std::vector<float> apply_llama_rope(const T* input, size_t D, size_t offs
 template <typename dtype_in, typename dtype_out>
 std::vector<dtype_out> single_mha(const std::vector<dtype_in>& q, const std::vector<dtype_in>& k,
                                   const std::vector<dtype_in>& v, size_t qo_len, size_t kv_len,
-                                  size_t num_heads, size_t head_dim, bool causal = true,
-                                  QKVLayout layout = QKVLayout::kHND,
+                                  size_t num_q_heads, size_t num_kv_heads, size_t head_dim,
+                                  bool causal = true, QKVLayout layout = QKVLayout::kHND,
                                   RotaryMode rotary_mode = RotaryMode::kNone,
                                   float rope_scale = 1.f, float rope_theta = 1e4) {
   assert(qo_len <= kv_len);
+  assert(num_q_heads % num_kv_heads == 0);
   float sm_scale = 1.f / std::sqrt(float(head_dim));
-  std::vector<dtype_out> o(qo_len * num_heads * head_dim);
+  std::vector<dtype_out> o(qo_len * num_q_heads * head_dim);
   std::vector<float> att(kv_len);
   std::vector<float> q_rotary_local(head_dim);
   std::vector<float> k_rotary_local(head_dim);
-  SWITCH_LAYOUT(layout, LAYOUT, {
-    tensor_info_t<LAYOUT> qkv_info(qo_len, kv_len, num_heads, head_dim);
-    for (size_t head_idx = 0; head_idx < num_heads; ++head_idx) {
-      for (size_t q_idx = 0; q_idx < qo_len; ++q_idx) {
-        float max_val = -5e4;
-        if (rotary_mode == RotaryMode::kLlama) {
-          q_rotary_local = std::move(cpu_reference::apply_llama_rope(
-              q.data() + qkv_info.get_qo_elem_offset(q_idx, head_idx, 0), head_dim,
-              q_idx + kv_len - qo_len, rope_scale, rope_theta));
-        }
-        for (size_t kv_idx = 0; kv_idx < kv_len; ++kv_idx) {
-          att[kv_idx] = 0.;
-          switch (rotary_mode) {
-            case RotaryMode::kNone: {
-              for (size_t feat_idx = 0; feat_idx < head_dim; ++feat_idx) {
-                att[kv_idx] += float(q[qkv_info.get_qo_elem_offset(q_idx, head_idx, feat_idx)]) *
-                               float(k[qkv_info.get_kv_elem_offset(kv_idx, head_idx, feat_idx)]) *
-                               sm_scale;
+  SWITCH_GQA_GROUP_SIZE(
+      num_q_heads / num_kv_heads, GROUP_SIZE, {SWITCH_LAYOUT(layout, LAYOUT, {
+        tensor_info_t<LAYOUT, GROUP_SIZE> info(qo_len, kv_len, num_kv_heads, head_dim);
+        for (size_t qo_head_idx = 0; qo_head_idx < info.get_num_qo_heads(); ++qo_head_idx) {
+          const size_t kv_head_idx = qo_head_idx / GROUP_SIZE;
+          for (size_t q_idx = 0; q_idx < qo_len; ++q_idx) {
+            float max_val = -5e4;
+            if (rotary_mode == RotaryMode::kLlama) {
+              q_rotary_local = std::move(cpu_reference::apply_llama_rope(
+                  q.data() + info.get_qo_elem_offset(q_idx, qo_head_idx, 0), head_dim,
+                  q_idx + kv_len - qo_len, rope_scale, rope_theta));
+            }
+            for (size_t kv_idx = 0; kv_idx < kv_len; ++kv_idx) {
+              att[kv_idx] = 0.;
+              switch (rotary_mode) {
+                case RotaryMode::kNone: {
+                  for (size_t feat_idx = 0; feat_idx < head_dim; ++feat_idx) {
+                    att[kv_idx] +=
+                        float(q[info.get_qo_elem_offset(q_idx, qo_head_idx, feat_idx)]) *
+                        float(k[info.get_kv_elem_offset(kv_idx, kv_head_idx, feat_idx)]) * sm_scale;
+                  }
+                  break;
+                }
+                case RotaryMode::kLlama: {
+                  k_rotary_local = std::move(cpu_reference::apply_llama_rope(
+                      k.data() + info.get_kv_elem_offset(kv_idx, kv_head_idx, 0), head_dim, kv_idx,
+                      rope_scale, rope_theta));
+                  for (size_t feat_idx = 0; feat_idx < head_dim; ++feat_idx) {
+                    att[kv_idx] += q_rotary_local[feat_idx] * k_rotary_local[feat_idx] * sm_scale;
+                  }
+                  break;
+                }
+                default: {
+                  std::cerr << "Unsupported rotary mode." << std::endl;
+                  abort();
+                }
               }
-              break;
-            }
-            case RotaryMode::kLlama: {
-              k_rotary_local = std::move(cpu_reference::apply_llama_rope(
-                  k.data() + qkv_info.get_kv_elem_offset(kv_idx, head_idx, 0), head_dim, kv_idx,
-                  rope_scale, rope_theta));
-              for (size_t feat_idx = 0; feat_idx < head_dim; ++feat_idx) {
-                att[kv_idx] += q_rotary_local[feat_idx] * k_rotary_local[feat_idx] * sm_scale;
+              // apply mask
+              if (causal && kv_idx > kv_len + q_idx - qo_len) {
+                att[kv_idx] = -5e4;
               }
-              break;
+              max_val = std::max(max_val, att[kv_idx]);
             }
-            default: {
-              std::cerr << "Unsupported rotary mode." << std::endl;
-              abort();
+            // exp minus max
+            float denom = 0;
+            for (size_t kv_idx = 0; kv_idx < kv_len; ++kv_idx) {
+              att[kv_idx] = std::exp(att[kv_idx] - max_val);
+              denom += att[kv_idx];
+            }
+
+            // divide by denom
+            for (size_t kv_idx = 0; kv_idx < kv_len; ++kv_idx) {
+              att[kv_idx] /= denom;
+            }
+
+            for (size_t feat_idx = 0; feat_idx < head_dim; ++feat_idx) {
+              float o_float = 0.;
+              for (size_t kv_idx = 0; kv_idx < kv_len; ++kv_idx) {
+                o_float +=
+                    att[kv_idx] * float(v[info.get_kv_elem_offset(kv_idx, kv_head_idx, feat_idx)]);
+              }
+              o[info.get_qo_elem_offset(q_idx, qo_head_idx, feat_idx)] = dtype_out(o_float);
             }
           }
-          // apply mask
-          if (causal && kv_idx > kv_len + q_idx - qo_len) {
-            att[kv_idx] = -5e4;
-          }
-          max_val = std::max(max_val, att[kv_idx]);
         }
-        // exp minus max
-        float denom = 0;
-        for (size_t kv_idx = 0; kv_idx < kv_len; ++kv_idx) {
-          att[kv_idx] = std::exp(att[kv_idx] - max_val);
-          denom += att[kv_idx];
-        }
-
-        // divide by denom
-        for (size_t kv_idx = 0; kv_idx < kv_len; ++kv_idx) {
-          att[kv_idx] /= denom;
-        }
-
-        for (size_t feat_idx = 0; feat_idx < head_dim; ++feat_idx) {
-          float o_float = 0.;
-          for (size_t kv_idx = 0; kv_idx < kv_len; ++kv_idx) {
-            o_float +=
-                att[kv_idx] * float(v[qkv_info.get_kv_elem_offset(kv_idx, head_idx, feat_idx)]);
-          }
-          o[qkv_info.get_qo_elem_offset(q_idx, head_idx, feat_idx)] = dtype_out(o_float);
-        }
-      }
-    }
-  });
+      })});
   return std::move(o);
 }
 

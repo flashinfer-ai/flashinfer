@@ -43,18 +43,18 @@ int _FlashInferSingleDecodeWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, DL
   CHECK_EQ(o->device.device_id, dev_id) << "The device id of q and o matrix doesn't match.";
 
   CHECK_EQ(q->ndim, 2);
-  size_t num_heads = q->shape[0];
+  size_t num_qo_heads = q->shape[0];
   size_t head_dim = q->shape[1];
   CHECK_EQ(k->ndim, 3);
+  size_t num_kv_heads = k->shape[1];
   size_t seq_len = k->shape[0];
-  CHECK_EQ(k->shape[1], num_heads);
   CHECK_EQ(k->shape[2], head_dim);
   CHECK_EQ(v->ndim, 3);
   CHECK_EQ(v->shape[0], seq_len);
-  CHECK_EQ(v->shape[1], num_heads);
+  CHECK_EQ(v->shape[1], num_kv_heads);
   CHECK_EQ(v->shape[2], head_dim);
   CHECK_EQ(o->ndim, 2);
-  CHECK_EQ(o->shape[0], num_heads);
+  CHECK_EQ(o->shape[0], num_qo_heads);
   CHECK_EQ(o->shape[1], head_dim);
 
   CHECK(q->dtype.lanes == 1 && k->dtype.lanes == 1 && v->dtype.lanes == 1);
@@ -65,8 +65,9 @@ int _FlashInferSingleDecodeWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, DL
       q->dtype, dtype_in, {SWITCH_TVM_CUDA_DTYPE(o->dtype, dtype_out, {
         cudaError_t status = flashinfer::SingleDecodeWithKVCache(
             (dtype_in*)q->data, (dtype_in*)k->data, (dtype_in*)v->data, (dtype_out*)o->data,
-            (float*)tmp->data, num_heads, seq_len, head_dim, flashinfer::QKVLayout(qkv_layout),
-            flashinfer::RotaryMode(rotary_mode), rope_scale, rope_theta, 0, dev_id);
+            (float*)tmp->data, num_qo_heads, num_kv_heads, seq_len, head_dim,
+            flashinfer::QKVLayout(qkv_layout), flashinfer::RotaryMode(rotary_mode), rope_scale,
+            rope_theta, 0, dev_id);
         if (status != cudaSuccess) {
           LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
         }
@@ -124,7 +125,8 @@ void _FlashInferAttentionWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
   CHECK_GE(layer_id, 0);
   CHECK_EQ(pages->shape[2], 2);
   int64_t nlayer = pages->shape[1];
-  int64_t nhead = pages->shape[3];
+  int64_t nhead_kv = pages->shape[3];
+  int64_t nhead_qo = q_data->shape[2];
   int64_t nfeat = pages->shape[5];
   int64_t page_size = pages->shape[4];
 
@@ -157,9 +159,8 @@ void _FlashInferAttentionWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
   CHECK_EQ(output->ndim, 4);
   CHECK_EQ(q_data->shape[0], output->shape[0]);
   CHECK_EQ(q_data->shape[1], output->shape[1]);
-  CHECK_EQ(q_data->shape[2], nhead);
   CHECK_EQ(q_data->shape[3], nfeat);
-  CHECK_EQ(output->shape[2], nhead);
+  CHECK_EQ(output->shape[2], nhead_qo);
   CHECK_EQ(output->shape[3], nfeat);
 
   // - Detect the decode pattern: all append lenghts are 1.
@@ -171,7 +172,7 @@ void _FlashInferAttentionWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
         {SWITCH_TVM_CUDA_DTYPE(
             output->dtype, dtype_out, {SWITCH_TVM_CUDA_IDTYPE(page_table_values->dtype, dtype_idx, {
               flashinfer::paged_kv_t<dtype_in, dtype_idx> cache(
-                  nlayer, layer_id, nhead, page_size, nfeat, num_total_seqs,
+                  nlayer, layer_id, nhead_kv, page_size, nfeat, num_total_seqs,
                   static_cast<dtype_in*>(pages->data),
                   static_cast<dtype_idx*>(page_table_indptr->data),
                   static_cast<dtype_idx*>(page_table_values->data),
@@ -179,7 +180,7 @@ void _FlashInferAttentionWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
               cudaError_t status = flashinfer::BatchDecodeWithPagedKVCache<dtype_in, dtype_out>(
                   static_cast<dtype_in*>(q_data->data), cache,
                   static_cast<dtype_out*>(output->data), static_cast<float*>(tmp_buffer->data),
-                  flashinfer::RotaryMode(rotary_mode), rope_scale, rope_theta, 0,
+                  nhead_qo, flashinfer::RotaryMode(rotary_mode), rope_scale, rope_theta, 0,
                   q_data->device.device_id);
               if (status != cudaSuccess) {
                 LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
@@ -197,7 +198,7 @@ void _FlashInferAttentionWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
         {SWITCH_TVM_CUDA_DTYPE(
             output->dtype, dtype_out, {SWITCH_TVM_CUDA_IDTYPE(page_table_values->dtype, dtype_idx, {
               flashinfer::paged_kv_t<dtype_in, dtype_idx> cache(
-                  nlayer, layer_id, nhead, page_size, nfeat, num_total_seqs,
+                  nlayer, layer_id, nhead_kv, page_size, nfeat, num_total_seqs,
                   static_cast<dtype_in*>(pages->data),
                   static_cast<dtype_idx*>(page_table_indptr->data),
                   static_cast<dtype_idx*>(page_table_values->data),
@@ -207,6 +208,7 @@ void _FlashInferAttentionWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
                       static_cast<dtype_in*>(q_data->data), cache,
                       static_cast<dtype_idx*>(append_length_indptr->data),
                       static_cast<dtype_out*>(output->data), static_cast<float*>(tmp_buffer->data),
+                      nhead_qo,
                       /*causal=*/true, flashinfer::RotaryMode(rotary_mode), rope_scale, rope_theta,
                       0, q_data->device.device_id);
               if (status != cudaSuccess) {

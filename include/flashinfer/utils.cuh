@@ -13,6 +13,17 @@
     }                                   \
   }
 
+#define SWITCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, ...)              \
+  if (group_size == 1) {                                                \
+    constexpr size_t GROUP_SIZE = 1;                                    \
+    __VA_ARGS__                                                         \
+  } else if (group_size == 8) {                                         \
+    constexpr size_t GROUP_SIZE = 8;                                    \
+    __VA_ARGS__                                                         \
+  } else {                                                              \
+    std::cerr << "Unsupported group_size: " << group_size << std::endl; \
+  }
+
 #define SWITCH_CAUSAL(causal, CAUSAL, ...) \
   if (causal) {                            \
     constexpr bool CAUSAL = true;          \
