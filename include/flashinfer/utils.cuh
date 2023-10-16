@@ -13,6 +13,15 @@
     }                                   \
   }
 
+#define SWITCH_CAUSAL(causal, CAUSAL, ...) \
+  if (causal) {                            \
+    constexpr bool CAUSAL = true;          \
+    __VA_ARGS__                            \
+  } else {                                 \
+    constexpr bool CAUSAL = false;         \
+    __VA_ARGS__                            \
+  }
+
 #define SWITCH_LAYOUT(layout, LAYOUT, ...)                                 \
   switch (layout) {                                                        \
     case QKVLayout::kNHD: {                                                \

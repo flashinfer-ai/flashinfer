@@ -11,7 +11,7 @@ namespace flashinfer {
 enum class QKVLayout {
   // [seq_len, num_heads, head_dim]
   kNHD = 0U,
-  // [num_heads, head_dim, seq_len]
+  // [num_heads, seq_len, head_dim]
   kHND = 1U,
 };
 
@@ -36,16 +36,19 @@ struct tensor_info_t {
                                                     uint32_t num_heads, uint32_t head_dim)
       : qo_len(qo_len), kv_len(kv_len), num_heads(num_heads), head_dim(head_dim) {}
 
-  __host__ __device__ __forceinline__ uint32_t get_qo_elem_offset(uint32_t query_idx,
-                                                                  uint32_t head_idx,
-                                                                  uint32_t feat_idx) const {
+  __host__ __device__ __forceinline__ size_t get_qo_elem_offset(uint32_t query_idx,
+                                                                uint32_t head_idx,
+                                                                uint32_t feat_idx) const {
     return get_elem_offset_impl<layout>(query_idx, head_idx, feat_idx, qo_len, num_heads, head_dim);
   }
 
-  __host__ __device__ __forceinline__ uint32_t get_kv_elem_offset(uint32_t kv_idx,
-                                                                  uint32_t head_idx,
-                                                                  uint32_t feat_idx) const {
+  __host__ __device__ __forceinline__ size_t get_kv_elem_offset(uint32_t kv_idx, uint32_t head_idx,
+                                                                uint32_t feat_idx) const {
     return get_elem_offset_impl<layout>(kv_idx, head_idx, feat_idx, kv_len, num_heads, head_dim);
+  }
+
+  __host__ __device__ __forceinline__ size_t get_n_stride() const {
+    return layout == QKVLayout::kHND ? head_dim : num_heads * head_dim;
   }
 };
 
