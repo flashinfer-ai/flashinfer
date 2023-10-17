@@ -49,7 +49,11 @@ void bench_flashinfer_single_prefill(nvbench::state &state) {
   auto &summ = state.add_summary("nv/tflops");
   summ.set_string("description", "Achieved TFlops/s");
   summ.set_string("name", "TFlops/s");
-  summ.set_float64("value", qo_len * kv_len * 4 * num_qo_heads * head_dim / measured_mean / 1e12);
+  float tflops = qo_len * kv_len * 4 * num_qo_heads * head_dim / measured_mean / 1e12;
+  if (causal) {
+    tflops /= 2;
+  }
+  summ.set_float64("value", tflops);
 }
 
 #define STR_HELPER(x) #x
