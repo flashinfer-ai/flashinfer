@@ -8,4 +8,4 @@ set(FLASHINFER_PREFILL ON)
 set(FLASHINFER_DECODE ON)
 # Set target cuda architectures for tests/benchmarks, defaults to native (which is new in CMake 3.24, you can configure it manually if you are using older CMake).
 # Example: "80;86;90;90"
-set(CMAKE_CUDA_ARCHITECTURES native)
+set(FLASHINFER_CUDA_ARCHITECTURES native)
