@@ -252,7 +252,7 @@ cudaError_t PagedKVCacheToRaggedTensor(paged_kv_t<DType, IdType> paged_kv, DType
   const uint32_t page_size = paged_kv.page_size;
 
   SWITCH_HEAD_DIM(head_dim, HEAD_DIM, {
-    constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
+    constexpr uint32_t vec_size = std::max(16U / sizeof(DType), HEAD_DIM / 32U);
     constexpr uint32_t bdx = HEAD_DIM / vec_size;
     constexpr uint32_t bdy = 128 / bdx;
     assert(num_heads % bdy == 0);

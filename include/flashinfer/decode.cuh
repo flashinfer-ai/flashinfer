@@ -582,6 +582,18 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
   }
 }
 
+constexpr uint32_t get_heuristic_num_threads(uint32_t group_size, uint32_t sizeof_dtype) {
+  if (group_size == 8U) {
+    if (sizeof_dtype == 1U) {
+      return 256U;  // not enough registers for 512 threads
+    } else {
+      return 512U;
+    }
+  } else {
+    return 128U;
+  }
+}
+
 template <typename DTypeIn, typename DTypeOut>
 cudaError_t SingleDecodeWithKVCacheGetTemporaryMemorySize(
     uint32_t &tmp_size, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t seq_len,
@@ -596,11 +608,13 @@ cudaError_t SingleDecodeWithKVCacheGetTemporaryMemorySize(
             head_dim, HEAD_DIM,
             {SWITCH_ROTARY_MODE(
                 rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(layout, QKV_LAYOUT, {
-                  constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
+                  constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
                   constexpr uint32_t num_stages_smem = 2U;
                   constexpr uint32_t bdx = HEAD_DIM / vec_size;
+                  static_assert(bdx <= 32U);
                   constexpr uint32_t bdy = GROUP_SIZE;
-                  constexpr uint32_t num_threads = GROUP_SIZE == 8 ? 512U : 128U;
+                  constexpr uint32_t num_threads =
+                      get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeIn));
                   constexpr uint32_t bdz = num_threads / (bdx * bdy);
                   constexpr bool norm_on_the_fly = false;
                   const uint32_t smem_size =
@@ -673,11 +687,13 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut
           head_dim, HEAD_DIM,
           {SWITCH_ROTARY_MODE(
               rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(layout, QKV_LAYOUT, {
-                constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
+                constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
                 constexpr uint32_t num_stages_smem = 2U;
                 constexpr uint32_t bdx = HEAD_DIM / vec_size;
+                static_assert(bdx <= 32U);
                 constexpr uint32_t bdy = GROUP_SIZE;
-                constexpr uint32_t num_threads = GROUP_SIZE == 8 ? 512U : 128U;
+                constexpr uint32_t num_threads =
+                    get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeIn));
                 constexpr uint32_t bdz = num_threads / (bdx * bdy);
                 tensor_info_t<QKV_LAYOUT, GROUP_SIZE> info(1, seq_len, num_kv_heads, head_dim);
                 const uint32_t smem_size =
@@ -873,11 +889,12 @@ cudaError_t BatchDecodeWithPagedKVCache(DTypeIn *q, paged_kv_t<DTypeIn, IdType> 
       num_qo_heads / num_kv_heads, GROUP_SIZE,
       {SWITCH_HEAD_DIM(
           head_dim, HEAD_DIM, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
-            constexpr uint32_t vec_size = std::max(16 / sizeof(DTypeIn), HEAD_DIM / 32);
+            constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
             constexpr uint32_t num_stages_smem = 2;
             constexpr uint32_t bdx = HEAD_DIM / vec_size;
+            static_assert(bdx <= 32);
             constexpr uint32_t bdy = GROUP_SIZE;
-            constexpr uint32_t num_threads = GROUP_SIZE == 8 ? 512U : 128U;
+            constexpr uint32_t num_threads = get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeIn));
             constexpr uint32_t bdz = num_threads / (bdx * bdy);
             const uint32_t smem_size =
                 2 * num_stages_smem * bdy * bdz * head_dim * sizeof(DTypeIn) +
