@@ -23,8 +23,12 @@ flashinfer_option(FLASHINFER_PREFILL "Whether to compile prefill kernel tests/be
 flashinfer_option(FLASHINFER_DECODE "Whether to compile decode kernel tests/benchmarks or not." ON)
 flashinfer_option(FLASHINFER_PAGE "Whether to compile page kernel tests/benchmarks or not." ON)
 flashinfer_option(FLASHINFER_TVM_BINDING "Whether to compile tvm binding or not." OFF)
+# "native" is a special value for CMAKE_CUDA_ARCHITECTURES which means use the architectures of the host's GPU.
+# it's new in CMake 3.24, if you are using an older of CMake or you want to use a different value, you can
+# set its value through config.cmake or -DCMAKE_CUDA_ARCHITECTURES=... through command-line.
+# Supported CUDA architctures include 80;86;89;90
+flashinfer_option(CMAKE_CUDA_ARCHITECTURES "Target CUDA architectures for tests/benchmarks." native)
 
-set(CMAKE_CUDA_ARCHITECTURES native)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules")
 add_subdirectory(3rdparty/nvbench)
 add_subdirectory(3rdparty/googletest)
