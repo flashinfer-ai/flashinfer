@@ -675,10 +675,11 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
 }
 
 template <typename DTypeIn, typename DTypeOut>
-cudaError_t SinglePrefillWithKVCacheGetTemporaryMemorySize(
-    uint32_t &tmp_size, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t qo_len,
-    uint32_t kv_len, uint32_t head_dim, bool causal = true, QKVLayout layout = QKVLayout::kNHD,
-    RotaryMode rotary_mode = RotaryMode::kNone, uint32_t dev_id = 0) {
+cudaError_t SinglePrefillWithKVCacheWorkEstimation(
+    uint32_t &tmp_size, uint32_t &max_grid_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
+    uint32_t qo_len, uint32_t kv_len, uint32_t head_dim, bool causal = true,
+    QKVLayout layout = QKVLayout::kNHD, RotaryMode rotary_mode = RotaryMode::kNone,
+    cudaStream_t stream = nullptr, uint32_t dev_id = 0) {
   SWITCH_NUM_FRAGS_X(
       qo_len > 64, NUM_FRAGS_X,
       {SWITCH_GQA_GROUP_SIZE(
@@ -711,6 +712,7 @@ cudaError_t SinglePrefillWithKVCacheGetTemporaryMemorySize(
                             &num_sm, cudaDevAttrMultiProcessorCount, dev_id));
                         FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                             &num_blocks_per_sm, cooperative_kernel, num_threads, smem_size));
+                        max_grid_size = num_blocks_per_sm * num_sm;
                         uint32_t num_chunks =
                             min((num_blocks_per_sm * num_sm) /
                                     (num_qo_heads * (qo_len + (num_rows_per_cta - 1)) /
@@ -784,7 +786,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOu
                                      num_rows_per_cta),
                                 kv_len / 512);
 
-                        if (num_chunks <= 1) {
+                        if (num_chunks <= 1 || tmp == nullptr) {
                           // Enough parallelism, do not use cooperative groups
                           auto kernel = SinglePrefillWithKVCacheKernel<
                               false, GROUP_SIZE, CAUSAL, LAYOUT, ROTARY_MODE, num_frags_x,

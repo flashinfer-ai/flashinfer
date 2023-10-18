@@ -21,6 +21,7 @@ struct paged_kv_t {
   uint32_t page_size;
   uint32_t head_dim;
   uint32_t batch_size;
+
   // [max_num_pages * num_layers * 2 * num_heads * page_size * head_dim]
   // The flattened key-value cache
   DType* data;
@@ -30,6 +31,13 @@ struct paged_kv_t {
   IdType* indices;
   // [batch_size] The offset of the last page for each request in the batch
   IdType* last_page_offset;
+
+  /* ------------ Auxliary Information Used in Cooperative Kernels ------------ */
+  IdType* cooperative_indptr;
+  IdType* batch_idx_map;
+  IdType* chunk_start;
+  IdType* seq_lens_before_split;
+
   /*!
    * \brief Construct a paged key-value cache
    * \param num_layers The number of layers
@@ -57,7 +65,46 @@ struct paged_kv_t {
         data(data),
         indptr(indptr),
         indices(indices),
-        last_page_offset(last_page_offset) {}
+        last_page_offset(last_page_offset),
+        cooperative_indptr(nullptr),
+        batch_idx_map(nullptr),
+        chunk_start(nullptr),
+        seq_lens_before_split(nullptr) {}
+
+  /*!
+   * \brief Construct a paged key-value cache with auxiliary information for cooperative kernels
+   * \param num_layers The number of layers
+   * \param layer_idx The index of the layer
+   * \param num_heads The number of heads
+   * \param page_size The size of each page
+   * \param head_dim The dimension of each head
+   * \param batch_size The batch size
+   * \param data The flattened key-value cache
+   * \param indptr The page indptr array
+   * \param indices The page indices array
+   * \param last_page_offset The offset of the last page for each request in the batch
+   */
+  __host__ __device__ __forceinline__ paged_kv_t(uint32_t num_layers, uint32_t layer_idx,
+                                                 uint32_t num_heads, uint32_t page_size,
+                                                 uint32_t head_dim, uint32_t batch_size,
+                                                 DType* data, IdType* indptr, IdType* indices,
+                                                 IdType* last_page_offset,
+                                                 IdType* cooperative_indptr, IdType* batch_idx_map,
+                                                 IdType* chunk_start, IdType* seq_lens_before_split)
+      : num_layers(num_layers),
+        layer_idx(layer_idx),
+        num_heads(num_heads),
+        page_size(page_size),
+        head_dim(head_dim),
+        batch_size(batch_size),
+        data(data),
+        indptr(indptr),
+        indices(indices),
+        last_page_offset(last_page_offset),
+        cooperative_indptr(cooperative_indptr),
+        batch_idx_map(batch_idx_map),
+        chunk_start(chunk_start),
+        seq_lens_before_split(seq_lens_before_split) {}
 
   __host__ __device__ __forceinline__ size_t get_k_elem_offset(size_t page_idx, size_t head_idx,
                                                                size_t entry_idx, size_t feat_idx) {

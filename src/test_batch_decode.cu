@@ -11,7 +11,7 @@ using namespace flashinfer;
 template <typename T>
 void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, size_t num_qo_heads,
                                          size_t num_kv_heads, size_t head_dim,
-                                         flashinfer::RotaryMode rotary_mode) {
+                                         flashinfer::RotaryMode rotary_mode, bool cooperative) {
   std::vector<int32_t> seq_lens(batch_size);
   utils::vec_randint_(seq_lens, 1, 256);
   std::vector<int32_t> append_indptr{0};
@@ -70,7 +70,6 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
   thrust::device_vector<int32_t> kv_last_page_offset_device(kv_last_page_offset);
   thrust::device_vector<T> q_device(q);
   thrust::device_vector<T> o_device(o_ref.size());
-  thrust::device_vector<float> tmp(8 * 1024 * 1024);
 
   // create paged_kv object
   flashinfer::paged_kv_t<T, int32_t> paged_kv(
@@ -80,11 +79,48 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
       thrust::raw_pointer_cast(kv_indices_device.data()),
       thrust::raw_pointer_cast(kv_last_page_offset_device.data()));
 
-  // compute gpu result
-  flashinfer::BatchDecodeWithPagedKVCache<T, T>(thrust::raw_pointer_cast(q_device.data()), paged_kv,
-                                                thrust::raw_pointer_cast(o_device.data()),
-                                                thrust::raw_pointer_cast(tmp.data()), num_qo_heads,
-                                                rotary_mode);
+  if (!cooperative) {
+    // use non-cooperative kernel
+    cudaError_t status = flashinfer::BatchDecodeWithPagedKVCache<T, T>(
+        thrust::raw_pointer_cast(q_device.data()), paged_kv,
+        thrust::raw_pointer_cast(o_device.data()), nullptr, num_qo_heads, rotary_mode);
+    EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
+  } else {
+    // use cooperative kernel
+    uint32_t tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size;
+    cudaError_t status = flashinfer::BatchDecodeWithPagedKVCacheWorkEstimation<T, T>(
+        tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size, paged_kv, num_qo_heads,
+        rotary_mode);
+    EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
+    if (tmp_size == 0) {
+      GTEST_SKIP() << "Cooperative kernel not supported in this setting.";
+    }
+    thrust::device_vector<float> tmp(tmp_size);
+    thrust::device_vector<int32_t> new_indptr(new_batch_size + 1);
+    thrust::device_vector<int32_t> new_last_page_offset(new_batch_size);
+    thrust::device_vector<int32_t> cooperative_indptr(new_batch_size + 1);
+    thrust::device_vector<int32_t> batch_idx_map(new_batch_size);
+    thrust::device_vector<int32_t> chunk_start(new_batch_size);
+    thrust::device_vector<int32_t> seq_lens_before_split(new_batch_size);
+
+    flashinfer::paged_kv_t<T, int32_t> new_paged_kv = paged_kv;
+    new_paged_kv.batch_size = new_batch_size;
+    new_paged_kv.indptr = thrust::raw_pointer_cast(new_indptr.data());
+    new_paged_kv.last_page_offset = thrust::raw_pointer_cast(new_last_page_offset.data());
+    new_paged_kv.cooperative_indptr = thrust::raw_pointer_cast(cooperative_indptr.data());
+    new_paged_kv.batch_idx_map = thrust::raw_pointer_cast(batch_idx_map.data());
+    new_paged_kv.chunk_start = thrust::raw_pointer_cast(chunk_start.data());
+    new_paged_kv.seq_lens_before_split = thrust::raw_pointer_cast(seq_lens_before_split.data());
+
+    flashinfer::SplitPagedKVCache(batch_size, kv_indptr.data(), kv_last_page_offset.data(),
+                                  max_num_pages_per_batch, &new_paged_kv);
+
+    status = flashinfer::BatchDecodeWithPagedKVCache<T, T>(
+        thrust::raw_pointer_cast(q_device.data()), new_paged_kv,
+        thrust::raw_pointer_cast(o_device.data()), thrust::raw_pointer_cast(tmp.data()),
+        num_qo_heads, rotary_mode);
+    EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
+  }
 
   // compare result
   thrust::host_vector<T> o_host = o_device;
@@ -118,7 +154,26 @@ void TestBatchDecodeKernelCorrectness() {
             for (size_t rotary_mode : {0U, 1U}) {
               _TestBatchDecodingKernelCorrectness<T>(page_size, batch_size, num_qo_heads,
                                                      num_kv_heads, head_dim,
-                                                     flashinfer::RotaryMode(rotary_mode));
+                                                     flashinfer::RotaryMode(rotary_mode), false);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+template <typename T>
+void TestCooperativeBatchDecodeKernelCorrectness() {
+  for (size_t page_size : {1, 3, 7, 16}) {
+    for (size_t batch_size : {1, 2, 4, 8}) {
+      for (size_t num_qo_heads : {32}) {
+        for (size_t num_kv_heads : {32, 4}) {
+          for (size_t head_dim : {64, 128}) {
+            for (size_t rotary_mode : {0U, 1U}) {
+              _TestBatchDecodingKernelCorrectness<T>(page_size, batch_size, num_qo_heads,
+                                                     num_kv_heads, head_dim,
+                                                     flashinfer::RotaryMode(rotary_mode), true);
             }
           }
         }
@@ -145,4 +200,8 @@ TEST(FlashInferCorrectnessTest, TestBatchDecodeKernelCorrectnessE4M3) {
 
 TEST(FlashInferCorrectnessTest, TestBatchDecodeKernelCorrectnessE5M2) {
   TestBatchDecodeKernelCorrectness<__nv_fp8_e5m2>();
+}
+
+TEST(FlashInferCorrectnessTest, TestCooperativeBatchDecodeKernelCorrectnessTestFP16) {
+  TestCooperativeBatchDecodeKernelCorrectness<half>();
 }
