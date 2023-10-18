@@ -27,6 +27,10 @@ constexpr uint32_t warp_size = 32;
 
 namespace {
 
+__device__ __forceinline__ uint32_t sub_if_greater_or_zero(uint32_t x, uint32_t y) {
+  return (x > y) ? x - y : 0U;
+}
+
 template <bool row_major, typename T>
 __device__ __forceinline__ void apply_llama_rope(T *x_first_half, T *x_second_half,
                                                  const float *rope_freq, uint32_t offset,
@@ -86,8 +90,8 @@ __device__ __forceinline__ void produce_kv(smem_t *smem, T *gptr,
   }
 }
 
-template <uint32_t group_size, bool causal, QKVLayout layout, RotaryMode rotary_mode,
-          uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z,
+template <bool cooperative, uint32_t group_size, bool causal, QKVLayout layout,
+          RotaryMode rotary_mode, uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z,
           uint32_t num_stages_smem, uint32_t num_stages_frag, uint32_t num_warps, typename DTypeIn,
           typename DTypeOut>
 __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn *__restrict__ k,
@@ -103,7 +107,12 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   const uint32_t qo_len = qkv_info.qo_len;
   const uint32_t kv_len = qkv_info.kv_len;
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
-  const uint32_t bx = blockIdx.x, qo_head_idx = blockIdx.y, kv_head_idx = qo_head_idx / group_size;
+  const uint32_t bx = blockIdx.x, chunk_idx = blockIdx.y, qo_head_idx = blockIdx.z,
+                 kv_head_idx = qo_head_idx / group_size;
+  const uint32_t num_chunks = gridDim.y;
+  const uint32_t chunk_size = cooperative ? (kv_len + num_chunks - 1) / num_chunks : kv_len;
+  const uint32_t chunk_start = cooperative ? chunk_idx * chunk_size : 0;
+  const uint32_t chunk_end = cooperative ? min((chunk_idx + 1) * chunk_size, kv_len) : kv_len;
   auto block = cg::this_thread_block();
 
   constexpr uint32_t head_dim = num_frags_y * 16;
@@ -225,22 +234,30 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
   }
 
   const uint32_t num_iterations =
-      ((causal ? min(kv_len, (kv_len - qo_len) + ((bx + 1) * num_frags_x * num_warps) * 16)
-               : kv_len) +
+      ((causal ? min(chunk_end - chunk_start,
+                     sub_if_greater_or_zero(
+                         kv_len - qo_len + ((bx + 1) * num_frags_x * num_warps) * 16, chunk_start))
+               : chunk_end - chunk_start) +
        16 * num_frags_z - 1) /
       (16 * num_frags_z);
+
   const uint32_t mask_iteration =
-      (causal ? (kv_len + bx * num_warps * num_frags_x - qo_len) / (16 * num_frags_z)
-              : kv_len / (16 * num_frags_z));
+      (causal ? min(chunk_end - chunk_start,
+                    sub_if_greater_or_zero(kv_len + bx * num_warps * num_frags_x - qo_len,
+                                           chunk_start))
+              : (chunk_end - chunk_start)) /
+      (16 * num_frags_z);
 
 #pragma unroll
   for (uint32_t iter = 0; iter < num_stages_smem; ++iter) {
     const uint32_t stage_idx = iter;
-    produce_kv<num_frags_y, num_frags_z, num_warps>(
-        k_smem + stage_idx, k, qkv_info, iter * 16 * num_frags_z, kv_len, kv_head_idx, tx, ty);
+    produce_kv<num_frags_y, num_frags_z, num_warps>(k_smem + stage_idx, k, qkv_info,
+                                                    chunk_start + iter * 16 * num_frags_z,
+                                                    chunk_end, kv_head_idx, tx, ty);
     cp_async::commit_group();
-    produce_kv<num_frags_y, num_frags_z, num_warps>(
-        v_smem + stage_idx, v, qkv_info, iter * 16 * num_frags_z, kv_len, kv_head_idx, tx, ty);
+    produce_kv<num_frags_y, num_frags_z, num_warps>(v_smem + stage_idx, v, qkv_info,
+                                                    chunk_start + iter * 16 * num_frags_z,
+                                                    chunk_end, kv_head_idx, tx, ty);
     cp_async::commit_group();
   }
 
@@ -278,7 +295,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
           q_smem.ldmatrix_m8n8x4(a_frag[fx][frag_stage_idx + 1]);
           q_smem.offset += 16 * num_cells_per_head_in - num_frags_y * 2;
         }
-        uint32_t kv_idx = iter * 16 * num_frags_z + tx / 4;
+        uint32_t kv_idx = chunk_start + iter * 16 * num_frags_z + tx / 4;
 #pragma unroll
         for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
           k_smem[stage_idx].ldmatrix_m8n8x4(b_frag[fz][frag_stage_idx]);
@@ -319,7 +336,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
             q_smem.ldmatrix_m8n8x4(a_frag[fx][frag_stage_idx + 1]);
             q_smem.offset += 16 * num_cells_per_head_in - num_frags_y * 2;
           }
-          uint32_t kv_idx = iter * 16 * num_frags_z + tx / 4;
+          uint32_t kv_idx = chunk_start + iter * 16 * num_frags_z + tx / 4;
 #pragma unroll
           for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
             k_smem[stage_idx].ldmatrix_m8n8x4(b_frag[fz][frag_stage_idx]);
@@ -399,7 +416,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     // apply mask
     if (iter >= mask_iteration) {
       uint32_t q_idx_base = ((bx * num_warps + ty) * num_frags_x) * 16 + tx / 4,
-               kv_idx_base = iter * 16 * num_frags_z + 2 * (tx % 4);
+               kv_idx_base = chunk_start + iter * 16 * num_frags_z + 2 * (tx % 4);
 #pragma unroll
       for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
@@ -408,8 +425,10 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
           for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
             const uint32_t q_idx = q_idx_base + 8 * ((reg_id % 4) / 2),
                            kv_idx = kv_idx_base + 8 * (reg_id / 4) + reg_id % 2;
-            const bool predicate = (causal ? kv_idx > kv_len + q_idx - qo_len : kv_idx >= kv_len);
-            x_frag[fx][fz][reg_id] = predicate ? -5e4 : x_frag[fx][fz][reg_id];
+            const bool out_of_boundary =
+                (causal ? (kv_idx > kv_len + q_idx - qo_len || (cooperative && kv_idx >= chunk_end))
+                        : kv_idx >= chunk_end);
+            x_frag[fx][fz][reg_id] = out_of_boundary ? -5e4 : x_frag[fx][fz][reg_id];
           }
           kv_idx_base += 16;
         }
@@ -459,9 +478,9 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     }
 
     block.sync();
-    produce_kv<num_frags_y, num_frags_z, num_warps>(k_smem + stage_idx, k, qkv_info,
-                                                    (iter + num_stages_smem) * 16 * num_frags_z,
-                                                    kv_len, kv_head_idx, tx, ty);
+    produce_kv<num_frags_y, num_frags_z, num_warps>(
+        k_smem + stage_idx, k, qkv_info, chunk_start + (iter + num_stages_smem) * 16 * num_frags_z,
+        kv_len, kv_head_idx, tx, ty);
     cp_async::commit_group();
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
@@ -505,9 +524,9 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
       }
     }
     block.sync();
-    produce_kv<num_frags_y, num_frags_z, num_warps>(v_smem + stage_idx, v, qkv_info,
-                                                    (iter + num_stages_smem) * 16 * num_frags_z,
-                                                    kv_len, kv_head_idx, tx, ty);
+    produce_kv<num_frags_y, num_frags_z, num_warps>(
+        v_smem + stage_idx, v, qkv_info, chunk_start + (iter + num_stages_smem) * 16 * num_frags_z,
+        kv_len, kv_head_idx, tx, ty);
     cp_async::commit_group();
   }
   cp_async::wait_group<0>();
@@ -519,6 +538,76 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
     for (uint32_t j = 0; j < 2; ++j) {
       d[fx][j] += math::shfl_xor_sync(d[fx][j], 0x2);
       d[fx][j] += math::shfl_xor_sync(d[fx][j], 0x1);
+    }
+  }
+
+  if constexpr (cooperative) {
+    // aggregate global state
+    auto grid = cg::this_grid();
+#pragma unroll
+    for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+      for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
+        vec_t<float, 8>::memcpy(
+            tmp + ((fx * num_frags_y + fy) * grid.size() + grid.thread_rank()) * 8, o_frag[fx][fy]);
+#pragma unroll
+        for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+          o_frag[fx][fy][reg_id] = 0.f;
+        }
+      }
+    }
+    float *tmp_md = tmp + num_frags_x * num_frags_y * 8 * grid.size();
+#pragma unroll
+    for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+      for (uint32_t j = 0; j < 2; ++j) {
+        *(float2 *)&tmp_md[((fx * 2 + j) * grid.size() + grid.thread_rank()) * 2] =
+            make_float2(m[fx][j], d[fx][j]);
+        m[fx][j] = -5e4;
+        d[fx][j] = 0.f;
+      }
+    }
+
+    grid.sync();
+
+    for (uint32_t iter = 0; iter < num_chunks; ++iter) {
+      float other_scale[num_frags_x][2];
+#pragma unroll
+      for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+        for (uint32_t j = 0; j < 2; ++j) {
+          float2 md = *(float2 *)&tmp_md[((fx * 2 + j) * grid.size() +
+                                          ((qo_head_idx * num_chunks + iter) * gridDim.x + bx) *
+                                              block.num_threads() +
+                                          block.thread_rank()) *
+                                         2];
+          float mi = md.x, di = md.y, m_prev = m[fx][j];
+          m[fx][j] = max(m_prev, mi);
+          float o_scale = math::ptx_exp2(m_prev - m[fx][j]);
+          other_scale[fx][j] = math::ptx_exp2(mi - m[fx][j]);
+          d[fx][j] = d[fx][j] * o_scale + di * other_scale[fx][j];
+#pragma unroll
+          for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
+            o_frag[fx][fy][j * 2 + 0] *= o_scale;
+            o_frag[fx][fy][j * 2 + 1] *= o_scale;
+            o_frag[fx][fy][j * 2 + 4] *= o_scale;
+            o_frag[fx][fy][j * 2 + 5] *= o_scale;
+          }
+        }
+#pragma unroll
+        for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
+          vec_t<float, 8> o_frag_i;
+          o_frag_i.load(
+              tmp + ((fx * num_frags_y + fy) * grid.size() +
+                     ((qo_head_idx * num_chunks + iter) * gridDim.x + bx) * block.num_threads() +
+                     block.thread_rank()) *
+                        8);
+#pragma unroll
+          for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+            o_frag[fx][fy][reg_id] += o_frag_i[reg_id] * other_scale[fx][(reg_id % 4) / 2];
+          }
+        }
+      }
     }
   }
 
@@ -586,6 +675,62 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn *__restrict__ q, DTypeIn 
 }
 
 template <typename DTypeIn, typename DTypeOut>
+cudaError_t SinglePrefillWithKVCacheGetTemporaryMemorySize(
+    uint32_t &tmp_size, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t qo_len,
+    uint32_t kv_len, uint32_t head_dim, bool causal = true, QKVLayout layout = QKVLayout::kNHD,
+    RotaryMode rotary_mode = RotaryMode::kNone, uint32_t dev_id = 0) {
+  SWITCH_NUM_FRAGS_X(
+      qo_len > 64, NUM_FRAGS_X,
+      {SWITCH_GQA_GROUP_SIZE(
+          num_qo_heads / num_kv_heads, GROUP_SIZE,
+          {SWITCH_CAUSAL(
+              causal, CAUSAL,
+              {SWITCH_HEAD_DIM(
+                  head_dim, HEAD_DIM,
+                  {SWITCH_ROTARY_MODE(
+                      rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(layout, LAYOUT, {
+                        constexpr uint32_t num_frags_x = NUM_FRAGS_X;
+                        constexpr uint32_t num_frags_y = HEAD_DIM / 16;
+                        constexpr uint32_t num_frags_z = 2;
+                        constexpr uint32_t num_warps = 4UL;
+                        constexpr uint32_t num_stages_smem = 1;
+                        constexpr uint32_t num_threads = num_warps * warp_size;
+                        constexpr uint32_t num_stages_frag =
+                            (ROTARY_MODE == RotaryMode::kLlama) ? 2 : 4;
+                        constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
+                        auto cooperative_kernel = SinglePrefillWithKVCacheKernel<
+                            true, GROUP_SIZE, CAUSAL, LAYOUT, ROTARY_MODE, num_frags_x, num_frags_y,
+                            num_frags_z, num_stages_smem, num_stages_frag, num_warps, DTypeIn,
+                            DTypeOut>;
+                        uint32_t smem_size =
+                            (num_frags_x * num_warps + 2 * num_stages_smem * num_frags_z) * 16 *
+                            head_dim * sizeof(DTypeIn);
+                        int num_blocks_per_sm = 0;
+                        int num_sm = 0;
+                        FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
+                            &num_sm, cudaDevAttrMultiProcessorCount, dev_id));
+                        FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                            &num_blocks_per_sm, cooperative_kernel, num_threads, smem_size));
+                        uint32_t num_chunks =
+                            min((num_blocks_per_sm * num_sm) /
+                                    (num_qo_heads * (qo_len + (num_rows_per_cta - 1)) /
+                                     num_rows_per_cta),
+                                kv_len / 512);
+                        if (num_chunks > 1) {
+                          uint32_t grid_size =
+                              32 * num_warps *
+                              ((qo_len + (num_rows_per_cta - 1)) / num_rows_per_cta) * num_chunks *
+                              num_qo_heads;
+                          tmp_size = sizeof(float) *
+                                     (4 * num_frags_x + num_frags_x * num_frags_y * 8) * grid_size;
+                        } else {
+                          tmp_size = 0;
+                        }
+                      })})})})})});
+  return cudaSuccess;
+}
+
+template <typename DTypeIn, typename DTypeOut>
 cudaError_t SinglePrefillWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOut *o, float *tmp,
                                      uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t qo_len,
                                      uint32_t kv_len, uint32_t head_dim, bool causal = true,
@@ -597,50 +742,91 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn *q, DTypeIn *k, DTypeIn *v, DTypeOu
   const float log2_rope_inv_scale = -std::log2f(rope_scale);
   const float log2_rope_inv_theta = -std::log2f(rope_theta);
   FLASHINFER_CUDA_CALL(cudaSetDevice(dev_id));
+  assert(kv_len >= qo_len);
 
-  SWITCH_GQA_GROUP_SIZE(
-      num_qo_heads / num_kv_heads, GROUP_SIZE,
-      {SWITCH_CAUSAL(
-          causal, CAUSAL,
-          {SWITCH_HEAD_DIM(
-              head_dim, HEAD_DIM,
-              {SWITCH_ROTARY_MODE(
-                  rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(layout, LAYOUT, {
-                    constexpr uint32_t num_frags_x = 2;
-                    constexpr uint32_t num_frags_y = HEAD_DIM / 16;
-                    constexpr uint32_t num_frags_z = 2;
-                    constexpr uint32_t num_warps = 4UL;
-                    constexpr uint32_t num_stages_smem = 1;
-                    constexpr uint32_t num_stages_frag =
-                        (ROTARY_MODE == RotaryMode::kLlama) ? 2 : 4;
-                    constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
-                    auto kernel =
-                        SinglePrefillWithKVCacheKernel<GROUP_SIZE, CAUSAL, LAYOUT, ROTARY_MODE,
-                                                       num_frags_x, num_frags_y, num_frags_z,
-                                                       num_stages_smem, num_stages_frag, num_warps,
-                                                       DTypeIn, DTypeOut>;
+  SWITCH_NUM_FRAGS_X(
+      qo_len > 64, NUM_FRAGS_X,
+      {SWITCH_GQA_GROUP_SIZE(
+          num_qo_heads / num_kv_heads, GROUP_SIZE,
+          {SWITCH_CAUSAL(
+              causal, CAUSAL,
+              {SWITCH_HEAD_DIM(
+                  head_dim, HEAD_DIM,
+                  {SWITCH_ROTARY_MODE(
+                      rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(layout, LAYOUT, {
+                        constexpr uint32_t num_frags_x = NUM_FRAGS_X;
+                        constexpr uint32_t num_frags_y = HEAD_DIM / 16;
+                        constexpr uint32_t num_frags_z = 2;
+                        constexpr uint32_t num_warps = 4UL;
+                        constexpr uint32_t num_stages_smem = 1;
+                        constexpr uint32_t num_threads = num_warps * warp_size;
+                        constexpr uint32_t num_stages_frag =
+                            (ROTARY_MODE == RotaryMode::kLlama) ? 2 : 4;
+                        constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
+                        auto cooperative_kernel = SinglePrefillWithKVCacheKernel<
+                            true, GROUP_SIZE, CAUSAL, LAYOUT, ROTARY_MODE, num_frags_x, num_frags_y,
+                            num_frags_z, num_stages_smem, num_stages_frag, num_warps, DTypeIn,
+                            DTypeOut>;
+                        tensor_info_t<LAYOUT, GROUP_SIZE> qkv_info(qo_len, kv_len, num_kv_heads,
+                                                                   HEAD_DIM);
+                        uint32_t smem_size =
+                            (num_frags_x * num_warps + 2 * num_stages_smem * num_frags_z) * 16 *
+                            head_dim * sizeof(DTypeIn);
+                        int num_blocks_per_sm = 0;
+                        int num_sm = 0;
+                        FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
+                            &num_sm, cudaDevAttrMultiProcessorCount, dev_id));
+                        FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                            &num_blocks_per_sm, cooperative_kernel, num_threads, smem_size));
+                        uint32_t num_chunks =
+                            min((num_blocks_per_sm * num_sm) /
+                                    (num_qo_heads * (qo_len + (num_rows_per_cta - 1)) /
+                                     num_rows_per_cta),
+                                kv_len / 512);
 
-                    dim3 nblks((qo_len + (num_rows_per_cta - 1)) / num_rows_per_cta, num_qo_heads);
-                    dim3 nthrs(32, num_warps);
-                    uint32_t smem_size =
-                        (num_frags_x * num_warps + 2 * num_stages_smem * num_frags_z) * 16 *
-                        head_dim * sizeof(DTypeIn);
-                    tensor_info_t<LAYOUT, GROUP_SIZE> qkv_info(qo_len, kv_len, num_kv_heads,
-                                                               HEAD_DIM);
-                    void *args[] = {(void *)&q,
-                                    (void *)&k,
-                                    (void *)&v,
-                                    (void *)&o,
-                                    (void *)&tmp,
-                                    (void *)&qkv_info,
-                                    (void *)&sm_scale,
-                                    (void *)&log2_rope_inv_scale,
-                                    (void *)&log2_rope_inv_theta};
-                    FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
-                        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-                    FLASHINFER_CUDA_CALL(
-                        cudaLaunchKernel((void *)kernel, nblks, nthrs, args, smem_size, stream));
-                  })})})})});
+                        if (num_chunks <= 1) {
+                          // Enough parallelism, do not use cooperative groups
+                          auto kernel = SinglePrefillWithKVCacheKernel<
+                              false, GROUP_SIZE, CAUSAL, LAYOUT, ROTARY_MODE, num_frags_x,
+                              num_frags_y, num_frags_z, num_stages_smem, num_stages_frag, num_warps,
+                              DTypeIn, DTypeOut>;
+                          void *args[] = {(void *)&q,
+                                          (void *)&k,
+                                          (void *)&v,
+                                          (void *)&o,
+                                          (void *)&tmp,
+                                          (void *)&qkv_info,
+                                          (void *)&sm_scale,
+                                          (void *)&log2_rope_inv_scale,
+                                          (void *)&log2_rope_inv_theta};
+                          dim3 nblks((qo_len + (num_rows_per_cta - 1)) / num_rows_per_cta, 1,
+                                     num_qo_heads);
+                          dim3 nthrs(32, num_warps);
+                          FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
+                              kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+                          FLASHINFER_CUDA_CALL(cudaLaunchKernel((void *)kernel, nblks, nthrs, args,
+                                                                smem_size, stream));
+                        } else {
+                          // Use cooperative groups to increase occupancy
+                          void *args[] = {(void *)&q,
+                                          (void *)&k,
+                                          (void *)&v,
+                                          (void *)&o,
+                                          (void *)&tmp,
+                                          (void *)&qkv_info,
+                                          (void *)&sm_scale,
+                                          (void *)&log2_rope_inv_scale,
+                                          (void *)&log2_rope_inv_theta};
+                          dim3 nblks((qo_len + (num_rows_per_cta - 1)) / num_rows_per_cta,
+                                     num_chunks, num_qo_heads);
+                          dim3 nthrs(32, num_warps);
+                          FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
+                              cooperative_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                              smem_size));
+                          FLASHINFER_CUDA_CALL(cudaLaunchCooperativeKernel(
+                              (void *)cooperative_kernel, nblks, nthrs, args, smem_size, stream));
+                        }
+                      })})})})})});
   return cudaSuccess;
 }
 

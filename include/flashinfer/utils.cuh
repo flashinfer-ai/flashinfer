@@ -13,6 +13,15 @@
     }                                   \
   }
 
+#define SWITCH_NUM_FRAGS_X(greater_than_64, NUM_FRAGS_X, ...) \
+  if (greater_than_64) {                                      \
+    constexpr size_t NUM_FRAGS_X = 2;                         \
+    __VA_ARGS__                                               \
+  } else {                                                    \
+    constexpr size_t NUM_FRAGS_X = 1;                         \
+    __VA_ARGS__                                               \
+  }
+
 #define SWITCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, ...)              \
   if (group_size == 1) {                                                \
     constexpr size_t GROUP_SIZE = 1;                                    \

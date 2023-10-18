@@ -39,6 +39,7 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
   thrust::device_vector<int32_t> kv_indptr(kv_indptr_host);
   thrust::device_vector<int32_t> kv_indices(kv_indicies_host);
   thrust::device_vector<int32_t> kv_last_page_offset(kv_last_page_offset_host);
+  thrust::device_vector<float> tmp(4 * 1024 * 1024);
   flashinfer::paged_kv_t<T, int32_t> paged_kv(
       num_layers, layer_idx, num_kv_heads, page_size, head_dim, batch_size,
       thrust::raw_pointer_cast(kv_data.data()), thrust::raw_pointer_cast(kv_indptr.data()),
@@ -54,10 +55,10 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
       "Read");
   state.add_global_memory_writes<uint8_t>(vec_bytes(o), "Write");
 
-  state.exec([&](nvbench::launch&) {
+  state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     cudaError_t status = flashinfer::BatchDecodeWithPagedKVCache<T, T>(
         thrust::raw_pointer_cast(q.data()), paged_kv, thrust::raw_pointer_cast(o.data()),
-        nullptr,  // NOTE(lqchen): tmp is unused.
+        thrust::raw_pointer_cast(tmp.data()),
         num_qo_heads, rotary_mode);
     if (status != cudaSuccess) {
       state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
