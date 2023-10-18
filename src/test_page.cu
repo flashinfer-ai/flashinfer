@@ -100,7 +100,7 @@ void _TestAppendPagedKVKernelCorrectness(size_t page_size, size_t batch_size, si
           << cudaGetErrorString(status);
     } else {
       // call decode kernel
-      cudaErro_t status =
+      cudaError_t status =
           AppendPagedKVCacheDecode(paged_kv_gpu, thrust::raw_pointer_cast(keys_gpu.data()),
                                    thrust::raw_pointer_cast(values_gpu.data()));
       EXPECT_EQ(status, cudaSuccess)
