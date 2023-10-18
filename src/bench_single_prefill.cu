@@ -10,6 +10,9 @@ template <typename dtype_in, typename dtype_out, bool append>
 void bench_flashinfer_single_prefill(nvbench::state &state) {
   size_t kv_len = state.get_int64("kv_len");
   size_t qo_len = kv_len;
+  if (qo_len > kv_len) {
+    state.skip("qo_len > kv_len");
+  }
   if (append) {
     qo_len = state.get_int64("qo_len");
   }
@@ -19,6 +22,7 @@ void bench_flashinfer_single_prefill(nvbench::state &state) {
   size_t rotary_mode = state.get_int64("rotary_mode");
   size_t layout = state.get_int64("layout");
   bool causal = state.get_int64("causal");
+  bool cooperative = state.get_int64("cooperative");
   // Allocate input data:
   thrust::device_vector<dtype_in> Q(qo_len * num_qo_heads * head_dim);
   thrust::device_vector<dtype_in> K(kv_len * num_kv_heads * head_dim);
@@ -35,9 +39,10 @@ void bench_flashinfer_single_prefill(nvbench::state &state) {
     timer.start();
     cudaError_t status = flashinfer::SinglePrefillWithKVCache<dtype_in, dtype_out>(
         thrust::raw_pointer_cast(Q.data()), thrust::raw_pointer_cast(K.data()),
-        thrust::raw_pointer_cast(V.data()), thrust::raw_pointer_cast(O.data()), nullptr,
-        num_qo_heads, num_kv_heads, qo_len, kv_len, head_dim, causal, QKVLayout(layout),
-        RotaryMode(rotary_mode), 1.f, 1e4, launch.get_stream());
+        thrust::raw_pointer_cast(V.data()), thrust::raw_pointer_cast(O.data()),
+        cooperative ? thrust::raw_pointer_cast(tmp.data()) : nullptr, num_qo_heads, num_kv_heads,
+        qo_len, kv_len, head_dim, causal, QKVLayout(layout), RotaryMode(rotary_mode), 1.f, 1e4,
+        launch.get_stream());
     if (status != cudaSuccess) {
       state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
     }
@@ -69,7 +74,8 @@ void bench_flashinfer_single_prefill(nvbench::state &state) {
       .add_int64_axis("head_dim", {128})                                                       \
       .add_int64_axis("causal", {0, 1})                                                        \
       .add_int64_axis("layout", {0, 1})                                                        \
-      .add_int64_axis("rotary_mode", {0, 1})
+      .add_int64_axis("rotary_mode", {0, 1})                                                   \
+      .add_int64_axis("cooperative", {1})
 
 #define BENCH_FLASHINFER_APPEND_PREFILL(dtype_in, dtype_out)                                  \
   auto bench_flashinfer_single_append_prefill_##dtype_in##_##dtype_out##_ =                   \
@@ -83,7 +89,8 @@ void bench_flashinfer_single_prefill(nvbench::state &state) {
       .add_int64_axis("head_dim", {128})                                                      \
       .add_int64_axis("causal", {0, 1})                                                       \
       .add_int64_axis("layout", {0, 1})                                                       \
-      .add_int64_axis("rotary_mode", {0, 1})
+      .add_int64_axis("rotary_mode", {0, 1})                                                  \
+      .add_int64_axis("cooperative", {0, 1})
 
 BENCH_FLASHINFER_PREFILL(half, half);
 BENCH_FLASHINFER_APPEND_PREFILL(half, half);

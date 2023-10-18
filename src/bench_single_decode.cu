@@ -12,6 +12,7 @@ void bench_flashinfer_single_decode(nvbench::state &state) {
   size_t num_qo_heads = state.get_int64("num_qo_heads");
   size_t num_kv_heads = state.get_int64("num_kv_heads");
   size_t head_dim = state.get_int64("head_dim");
+  bool cooperative = state.get_int64("cooperative");
   // Allocate input data:
   thrust::device_vector<dtype_in> Q(num_qo_heads * head_dim);
   thrust::device_vector<dtype_in> K(seq_len * num_kv_heads * head_dim);
@@ -29,8 +30,9 @@ void bench_flashinfer_single_decode(nvbench::state &state) {
     cudaError_t status = flashinfer::SingleDecodeWithKVCache(
         thrust::raw_pointer_cast(Q.data()), thrust::raw_pointer_cast(K.data()),
         thrust::raw_pointer_cast(V.data()), thrust::raw_pointer_cast(O.data()),
-        thrust::raw_pointer_cast(tmp.data()), num_qo_heads, num_kv_heads, seq_len, head_dim,
-        QKVLayout(layout), RotaryMode(rotary_mode), 1.f, 1e4, launch.get_stream());
+        cooperative ? thrust::raw_pointer_cast(tmp.data()) : nullptr, num_qo_heads, num_kv_heads,
+        seq_len, head_dim, QKVLayout(layout), RotaryMode(rotary_mode), 1.f, 1e4,
+        launch.get_stream());
     if (status != cudaSuccess) {
       state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
     }
@@ -51,7 +53,8 @@ void bench_flashinfer_single_decode(nvbench::state &state) {
       .add_int64_axis("seq_len", {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768}) \
       .add_int64_axis("num_qo_heads", {32})                                                     \
       .add_int64_axis("num_kv_heads", {32, 4})                                                  \
-      .add_int64_axis("head_dim", {128})
+      .add_int64_axis("head_dim", {128})                                                        \
+      .add_int64_axis("cooperative", {1})
 
 BENCH_FLASHINFER_SINGLE_DECODE(half, half, 0U, 0U);
 BENCH_FLASHINFER_SINGLE_DECODE(half, half, 0U, 1U);
