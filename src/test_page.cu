@@ -91,18 +91,18 @@ void _TestAppendPagedKVKernelCorrectness(size_t page_size, size_t batch_size, si
     }
     if (round % 2 == 0) {
       // call prefill kernel
-      cudaError_t status = FLASHINFER_CUDA_CALL(
+      cudaError_t status =
           AppendPagedKVCachePrefill(paged_kv_gpu, thrust::raw_pointer_cast(keys_gpu.data()),
                                     thrust::raw_pointer_cast(values_gpu.data()),
-                                    thrust::raw_pointer_cast(append_indptr_gpu.data())));
+                                    thrust::raw_pointer_cast(append_indptr_gpu.data()));
       EXPECT_EQ(status, cudaSuccess)
           << "AppendPagedKVCachePrefill kernel launch failed, error message: "
           << cudaGetErrorString(status);
     } else {
       // call decode kernel
-      cudaErro_t status = FLASHINFER_CUDA_CALL(
+      cudaErro_t status =
           AppendPagedKVCacheDecode(paged_kv_gpu, thrust::raw_pointer_cast(keys_gpu.data()),
-                                   thrust::raw_pointer_cast(values_gpu.data())));
+                                   thrust::raw_pointer_cast(values_gpu.data()));
       EXPECT_EQ(status, cudaSuccess)
           << "AppendPagedKVCacheDecode kernel launch failed, error message: "
           << cudaGetErrorString(status);
@@ -195,8 +195,8 @@ void _TestPagedKVCacheToRaggedTensorCorrectness(size_t page_size, size_t batch_s
       thrust::raw_pointer_cast(paged_kv_last_page_offset_gpu.data()));
 
   std::vector<int32_t> kv_indptr_h(batch_size + 1);
-  cudaError_t status = FLASHINFER_CUDA_CALL(
-      PagedKVCacheToRaggedTensorComputeIndptr<T, int32_t>(paged_kv_gpu, kv_indptr_h));
+  cudaError_t status =
+      PagedKVCacheToRaggedTensorComputeIndptr<T, int32_t>(paged_kv_gpu, kv_indptr_h);
   EXPECT_EQ(status, cudaSuccess)
       << "PagedKVCacheToRaggedTensorComputeIndptr kernel launch failed, error message: "
       << cudaGetErrorString(status);
@@ -210,9 +210,9 @@ void _TestPagedKVCacheToRaggedTensorCorrectness(size_t page_size, size_t batch_s
   thrust::device_vector<T> value(batch_size * num_pages_per_request * page_size * num_heads *
                                  head_dim);
   thrust::device_vector<int32_t> kv_indptr = kv_indptr_h;
-  FLASHINFER_CUDA_CALL(PagedKVCacheToRaggedTensor<T, int32_t>(
+  status = PagedKVCacheToRaggedTensor<T, int32_t>(
       paged_kv_gpu, thrust::raw_pointer_cast(key.data()), thrust::raw_pointer_cast(value.data()),
-      thrust::raw_pointer_cast(kv_indptr.data())));
+      thrust::raw_pointer_cast(kv_indptr.data()));
   EXPECT_EQ(status, cudaSuccess)
       << "PagedKVCacheToRaggedTensor kernel launch failed, error message: "
       << cudaGetErrorString(status);
