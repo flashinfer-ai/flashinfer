@@ -31,11 +31,13 @@ void _TestDecodingKernelCorrectness(size_t num_qo_heads, size_t num_kv_heads, si
   o_ref_host = cpu_reference::single_mha<T, T>(Q_host, K_host, V_host, 1, seq_len, num_qo_heads,
                                                num_kv_heads, head_dim, false, layout, rotary_mode);
 
-  auto status = SingleDecodeWithKVCache(thrust::raw_pointer_cast(Q.data()), thrust::raw_pointer_cast(K.data()),
-                          thrust::raw_pointer_cast(V.data()), thrust::raw_pointer_cast(O.data()),
-                          thrust::raw_pointer_cast(tmp.data()), num_qo_heads, num_kv_heads, seq_len,
-                          head_dim, layout, rotary_mode);
-  std::cout << "status=" << cudaGetErrorString(status) << std::endl;
+  cudaError_t status = SingleDecodeWithKVCache(
+      thrust::raw_pointer_cast(Q.data()), thrust::raw_pointer_cast(K.data()),
+      thrust::raw_pointer_cast(V.data()), thrust::raw_pointer_cast(O.data()),
+      thrust::raw_pointer_cast(tmp.data()), num_qo_heads, num_kv_heads, seq_len, head_dim, layout,
+      rotary_mode);
+  EXPECT_EQ(status, cudaSuccess) << "SingleDecodeWithKVCache kernel launch failed, error message: "
+                                 << cudaGetErrorString(status);
 
   thrust::host_vector<T> o_host = O;
   thrust::host_vector<float> tmp_host = tmp;
@@ -48,10 +50,6 @@ void _TestDecodingKernelCorrectness(size_t num_qo_heads, size_t num_kv_heads, si
     }
     num_result_errors_atol_1e_3_rtol_1e_3 +=
         (!utils::isclose(float(o_host[i]), float(o_ref_host[i]), 1e-2, 1e-2));
-    if (!utils::isclose(float(o_host[i]), float(o_ref_host[i]), 1e-2, 1e-2)) {
-      std::cout << "i=" << i << ", o_host[i]=" << float(o_host[i])
-                << ", o_ref_host[i]=" << float(o_ref_host[i]) << std::endl;
-    }
   }
   float result_accuracy =
       1. - float(num_result_errors_atol_1e_3_rtol_1e_3) / float(num_qo_heads * head_dim);
