@@ -83,18 +83,18 @@ void TestSingleDecodeKernelCorrectness() {
   }
 }
 
-// TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestBF16) {
-//   TestSingleDecodeKernelCorrectness<nv_bfloat16>();
-// }
-// TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestFP16) {
-//   TestSingleDecodeKernelCorrectness<half>();
-// }
+TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestBF16) {
+  TestSingleDecodeKernelCorrectness<nv_bfloat16>();
+}
+TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestFP16) {
+  TestSingleDecodeKernelCorrectness<half>();
+}
 TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestE4M3) {
   TestSingleDecodeKernelCorrectness<__nv_fp8_e4m3>();
 }
 TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestE5M2) {
   TestSingleDecodeKernelCorrectness<__nv_fp8_e5m2>();
 }
-// TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestFP32) {
-//   TestSingleDecodeKernelCorrectness<float>();
-// }
+TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestFP32) {
+  TestSingleDecodeKernelCorrectness<float>();
+}
