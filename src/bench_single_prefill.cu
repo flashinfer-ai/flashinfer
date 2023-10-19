@@ -25,11 +25,11 @@ template <typename dtype_in, typename dtype_out, bool append>
 void bench_flashinfer_single_prefill(nvbench::state& state) {
   size_t kv_len = state.get_int64("kv_len");
   size_t qo_len = kv_len;
-  if (qo_len > kv_len) {
-    state.skip("qo_len > kv_len");
-  }
   if (append) {
     qo_len = state.get_int64("qo_len");
+    if (qo_len > kv_len) {
+      state.skip("qo_len > kv_len");
+    }
   }
   size_t num_qo_heads = state.get_int64("num_qo_heads");
   size_t num_kv_heads = state.get_int64("num_kv_heads");
@@ -76,10 +76,13 @@ void bench_flashinfer_single_prefill(nvbench::state& state) {
   auto& summ = state.add_summary("nv/tflops");
   summ.set_string("description", "Achieved TFlops/s");
   summ.set_string("name", "TFlops/s");
-  float tflops =
-      qo_len * kv_len * 4 * num_qo_heads * head_dim / measured_mean / 1e12;
+  float tflops;
   if (causal) {
-    tflops /= 2;
+    tflops = qo_len * (2 * kv_len - qo_len) * 2 * num_qo_heads * head_dim /
+             measured_mean / 1e12;
+  } else {
+    tflops =
+        qo_len * kv_len * 4 * num_qo_heads * head_dim / measured_mean / 1e12;
   }
   summ.set_float64("value", tflops);
 }
