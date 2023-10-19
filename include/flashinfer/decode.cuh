@@ -674,7 +674,7 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(
     QKVLayout layout = QKVLayout::kNHD,
     RotaryMode rotary_mode = RotaryMode::kNone, cudaStream_t stream = nullptr,
     uint32_t dev_id = 0) {
-  if (seq_len <= 64U) {
+  if (seq_len <= 128U) {
     tmp_size = 0;
   } else {
     SWITCH_GQA_GROUP_SIZE(
@@ -780,7 +780,7 @@ cudaError_t SingleDecodeWithKVCache(
                 const uint32_t smem_size = 2U * num_stages_smem * bdy * bdz *
                                                head_dim * sizeof(DTypeIn) +
                                            2U * bdy * bdz * sizeof(float);
-                if (seq_len <= 64U || tmp == nullptr) {
+                if (seq_len <= 128U || tmp == nullptr) {
                   // no need to use cooperative kernel
                   auto kernel = SingleDecodeWithKVCacheKernel<
                       QKV_LAYOUT, false, norm_on_the_fly, ROTARY_MODE,
