@@ -275,6 +275,7 @@ void _TestPagedKVCacheToRaggedTensorCorrectness(size_t page_size,
   std::cout << "page_size=" << page_size << ", batch_size=" << batch_size
             << ", num_heads=" << num_heads << ", head_dim=" << head_dim
             << ", result_accuracy=" << result_accuracy << std::endl;
+  EXPECT_FALSE(nan_detected) << "Nan detected in the result.";
   EXPECT_GT(result_accuracy, 0.99) << "Result correctness test failed.";
 }
 
