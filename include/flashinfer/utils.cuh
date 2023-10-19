@@ -98,22 +98,23 @@
     }                                                                 \
   }
 
-#define SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, ...)                        \
-  switch (rotary_mode) {                                                         \
-    case RotaryMode::kNone: {                                                    \
-      constexpr RotaryMode ROTARY_MODE = RotaryMode::kNone;                      \
-      __VA_ARGS__                                                                \
-      break;                                                                     \
-    }                                                                            \
-    case RotaryMode::kLlama: {                                                   \
-      constexpr RotaryMode ROTARY_MODE = RotaryMode::kLlama;                     \
-      __VA_ARGS__                                                                \
-      break;                                                                     \
-    }                                                                            \
-    default: {                                                                   \
-      std::cerr << "Unsupported rotary_mode: " << int(rotary_mode) << std::endl; \
-      abort();                                                                   \
-    }                                                                            \
+#define SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, ...)          \
+  switch (rotary_mode) {                                           \
+    case RotaryMode::kNone: {                                      \
+      constexpr RotaryMode ROTARY_MODE = RotaryMode::kNone;        \
+      __VA_ARGS__                                                  \
+      break;                                                       \
+    }                                                              \
+    case RotaryMode::kLlama: {                                     \
+      constexpr RotaryMode ROTARY_MODE = RotaryMode::kLlama;       \
+      __VA_ARGS__                                                  \
+      break;                                                       \
+    }                                                              \
+    default: {                                                     \
+      std::cerr << "Unsupported rotary_mode: " << int(rotary_mode) \
+                << std::endl;                                      \
+      abort();                                                     \
+    }                                                              \
   }
 
 #endif  // FLASHINFER_UTILS_CUH_
