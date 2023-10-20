@@ -827,8 +827,7 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
                   head_dim, HEAD_DIM,
                   {SWITCH_ROTARY_MODE(
                       rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(layout, LAYOUT, {
-                        constexpr bool pin_q_in_reg =
-                            ROTARY_MODE == RotaryMode::kNone;
+                        constexpr bool pin_q_in_reg = false;
                         constexpr uint32_t num_frags_x = NUM_FRAGS_X;
                         constexpr uint32_t num_frags_y = HEAD_DIM / 16;
                         constexpr uint32_t num_frags_z = 2;
@@ -909,8 +908,7 @@ cudaError_t SinglePrefillWithKVCache(
                   head_dim, HEAD_DIM,
                   {SWITCH_ROTARY_MODE(
                       rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(layout, LAYOUT, {
-                        constexpr bool pin_q_in_reg =
-                            ROTARY_MODE == RotaryMode::kNone;
+                        constexpr bool pin_q_in_reg = false;
                         constexpr uint32_t num_frags_x = NUM_FRAGS_X;
                         constexpr uint32_t num_frags_y = HEAD_DIM / 16;
                         constexpr uint32_t num_frags_z = 2;
