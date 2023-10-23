@@ -61,6 +61,22 @@ struct smem_t {
     mma::ldmatrix_m8n8x4_trans(R, smem_ptr);
   }
   template <typename T>
+  __device__ __forceinline__ void ldmatrix_m8n8x4(vec_t<T, 8>* v) {
+    cell_t* smem_ptr = base + offset;
+    mma::ldmatrix_m8n8x4(v, smem_ptr);
+  }
+  template <typename T>
+  __device__ __forceinline__ void stmatrix_m8n8x4(vec_t<T, 8>* v) {
+    cell_t* smem_ptr = base + offset;
+    mma::stmatrix_m8n8x4(v, smem_ptr);
+  }
+  template <typename T>
+  __device__ __forceinline__ void ldmatrix_m8n8x4_trans(vec_t<T, 8>* v) {
+    cell_t* smem_ptr = base + offset;
+    mma::ldmatrix_m8n8x4_trans(v, smem_ptr);
+  }
+
+  template <typename T>
   __device__ __forceinline__ void load_128b_async(const T* gptr,
                                                   bool predicate) {
     cell_t* smem_ptr = base + offset;

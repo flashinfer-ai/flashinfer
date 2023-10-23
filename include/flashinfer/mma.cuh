@@ -22,12 +22,14 @@
 
 #include <type_traits>
 
+#include "vec_dtypes.cuh"
+
 namespace flashinfer {
 
 namespace mma {
 
-template <typename T>
-__device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
+// template <typename T>
+__device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t* R, uint4* smem_ptr) {
   uint32_t smem_int_ptr =
       static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   asm volatile(
@@ -37,8 +39,15 @@ __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
 }
 
 template <typename T>
+__device__ __forceinline__ void ldmatrix_m8n8x4(vec_t<T, 8>* v,
+                                                uint4* smem_ptr) {
+  static_assert(sizeof(T) == 2, "T must be half/bfloat16");
+  ldmatrix_m8n8x4((uint32_t*)v->ptr(), smem_ptr);
+}
+
+// template <typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t* R,
-                                                      T* smem_ptr) {
+                                                      uint4* smem_ptr) {
   uint32_t smem_int_ptr =
       static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   asm volatile(
@@ -48,7 +57,14 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t* R,
 }
 
 template <typename T>
-__device__ __forceinline__ void stmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
+__device__ __forceinline__ void ldmatrix_m8n8x4_trans(vec_t<T, 8>* v,
+                                                      uint4* smem_ptr) {
+  static_assert(sizeof(T) == 2, "T must be half/bfloat16");
+  ldmatrix_m8n8x4_trans((uint32_t*)v->ptr(), smem_ptr);
+}
+
+// template <typename T>
+__device__ __forceinline__ void stmatrix_m8n8x4(uint32_t* R, uint4* smem_ptr) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && \
     (__CUDACC_VER_MAJOR__ >= 11)
   uint32_t smem_int_ptr =
@@ -70,6 +86,13 @@ __device__ __forceinline__ void stmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
     }
   }
 #endif
+}
+
+template <typename T>
+__device__ __forceinline__ void stmatrix_m8n8x4(vec_t<T, 8>* v,
+                                                uint4* smem_ptr) {
+  static_assert(sizeof(T) == 2, "T must be half/bfloat16");
+  stmatrix_m8n8x4((uint32_t*)v->ptr(), smem_ptr);
 }
 
 template <typename T>
@@ -114,6 +137,13 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(
         : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[2]), "r"(B[3]),
           "f"(C[4]), "f"(C[5]), "f"(C[6]), "f"(C[7]));
   }
+}
+
+template <typename T>
+__device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(
+    vec_t<float, 8>* C, vec_t<T, 8>* A, vec_t<T, 8>* B) {
+  mma_sync_m16n16k16_row_col_f16f16f32<T>(C->ptr(), (uint32_t*)A->ptr(),
+                                          (uint32_t*)B->ptr());
 }
 
 }  // namespace mma
