@@ -406,32 +406,16 @@ __global__ void SinglePrefillWithKVCacheKernel(
         const uint32_t frag_stage_idx = (fyi * 2) % num_stages_frag;
 #pragma unroll
         for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
-          if (fx % 2 == 0) {
 #pragma unroll
-            for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
-              mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
-                  x_frag[fx][fz],
-                  q_frag[fx][pin_q_in_reg ? fyi : frag_stage_idx],
-                  b_frag[fz][frag_stage_idx]);
-              mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
-                  x_frag[fx][fz],
-                  q_frag[fx][pin_q_in_reg ? fyi + num_frags_y / 2
-                                          : frag_stage_idx + 1],
-                  b_frag[fz][frag_stage_idx + 1]);
-            }
-          } else {
-#pragma unroll
-            for (int32_t fz = num_frags_z - 1; fz >= 0; --fz) {
-              mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
-                  x_frag[fx][fz],
-                  q_frag[fx][pin_q_in_reg ? fyi : frag_stage_idx],
-                  b_frag[fz][frag_stage_idx]);
-              mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
-                  x_frag[fx][fz],
-                  q_frag[fx][pin_q_in_reg ? fyi + num_frags_y / 2
-                                          : frag_stage_idx + 1],
-                  b_frag[fz][frag_stage_idx + 1]);
-            }
+          for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
+            mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
+                x_frag[fx][fz], q_frag[fx][pin_q_in_reg ? fyi : frag_stage_idx],
+                b_frag[fz][frag_stage_idx]);
+            mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
+                x_frag[fx][fz],
+                q_frag[fx][pin_q_in_reg ? fyi + num_frags_y / 2
+                                        : frag_stage_idx + 1],
+                b_frag[fz][frag_stage_idx + 1]);
           }
         }
 
@@ -505,22 +489,11 @@ __global__ void SinglePrefillWithKVCacheKernel(
         const uint32_t frag_stage_idx = fy % num_stages_frag;
 #pragma unroll
         for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
-          if (fx % 2 == 0) {
 #pragma unroll
-            for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
-              mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
-                  x_frag[fx][fz],
-                  q_frag[fx][pin_q_in_reg ? fy : frag_stage_idx],
-                  b_frag[fz][frag_stage_idx]);
-            }
-          } else {
-#pragma unroll
-            for (int32_t fz = num_frags_z - 1; fz >= 0; --fz) {
-              mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
-                  x_frag[fx][fz],
-                  q_frag[fx][pin_q_in_reg ? fy : frag_stage_idx],
-                  b_frag[fz][frag_stage_idx]);
-            }
+          for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
+            mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
+                x_frag[fx][fz], q_frag[fx][pin_q_in_reg ? fy : frag_stage_idx],
+                b_frag[fz][frag_stage_idx]);
           }
         }
 
