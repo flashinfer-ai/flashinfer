@@ -231,7 +231,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
           apply_llama_rope<true, DTypeIn>(
               (DTypeIn*)q_frag[fx][fyi],
               (DTypeIn*)q_frag[fx][num_frags_y / 2 + fyi], rope_freq[fyi],
-              q_idx + kv_len - qo_len, sm_scale * math::log2e);
+              q_idx + kv_len - qo_len, sm_scale);
         }
       } else {
 #pragma unroll
@@ -263,7 +263,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
           q_smem.ldmatrix_m8n8x4(q_frag_local[1]);
           apply_llama_rope<true, DTypeIn>(
               (DTypeIn*)q_frag_local[0], (DTypeIn*)q_frag_local[1],
-              rope_freq[fyi], q_idx + kv_len - qo_len, sm_scale * math::log2e);
+              rope_freq[fyi], q_idx + kv_len - qo_len, sm_scale);
           q_smem.stmatrix_m8n8x4(q_frag_local[1]);
           q_smem.offset -= num_frags_y * 2;
           q_smem.stmatrix_m8n8x4(q_frag_local[0]);
