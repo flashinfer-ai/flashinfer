@@ -692,25 +692,28 @@ __global__ void SinglePrefillWithKVCacheKernel(
     }
 
     o_smem.offset = smem_t::get_permuted_offset<num_cells_per_head_out>(
-        ty * num_frags_x * 16 + tx % 16, tx / 16);
-    uint32_t o_idx = (bx * num_warps + ty) * num_frags_x * 16 + tx % 16;
+        ty * num_frags_x * 16 + tx / 4, tx % 4);
+    uint32_t o_idx = (bx * num_warps + ty) * num_frags_x * 16 + tx / 4;
     DTypeOut* o_ptr =
         o + qkv_info.get_qo_elem_offset(o_idx, qo_head_idx,
-                                        tx / 16 * cell_capacity<DTypeOut>());
+                                        (tx % 4) * cell_capacity<DTypeOut>());
 #pragma unroll
     for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
-      for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
-        if (o_idx < qo_len) {
-          o_smem.store_128b(o_ptr);
+      for (uint32_t j = 0; j < 2; ++j) {
+#pragma unroll
+        for (uint32_t fyo = 0; fyo < num_frags_y / 2; ++fyo) {
+          if (o_idx < qo_len) {
+            o_smem.store_128b(o_ptr);
+          }
+          o_ptr += 4 * cell_capacity<DTypeOut>();
+          o_smem.offset += 8;
         }
-        o_ptr += 2 * cell_capacity<DTypeOut>();
-        o_smem.offset = (o_smem.offset ^ 0x2) + (fy & 0x1) * 8;
+        o_idx += 8;
+        o_smem.offset += 8 * num_cells_per_head_out - 4 * num_frags_y;
+        o_ptr += 8 * qkv_info.get_n_stride() -
+                 2 * num_frags_y * cell_capacity<DTypeOut>();
       }
-      o_idx += 16;
-      o_ptr += qkv_info.get_n_stride() * 16 -
-               2 * num_frags_y * cell_capacity<DTypeOut>();
-      o_smem.offset += 16 * num_cells_per_head_out - num_frags_y * 4;
     }
   } else {
     // NOTE(Zihao): Not implemented yet.
