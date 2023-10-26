@@ -116,11 +116,9 @@ template <bool pin_q_in_reg, bool cooperative, uint32_t group_size, bool causal,
 __global__ void SinglePrefillWithKVCacheKernel(
     DTypeIn* __restrict__ q, DTypeIn* __restrict__ k, DTypeIn* __restrict__ v,
     DTypeOut* __restrict__ o, float* __restrict__ tmp,
-    const tensor_info_t<layout, group_size> qkv_info, const float sm_scale,
+    const tensor_info_t<layout, group_size> qkv_info, float sm_scale,
     const float log2_rope_inv_scale, const float log2_rope_inv_theta) {
-  vec_t<DTypeIn, 2> sm_scale2;
-  sm_scale2.fill(sm_scale * math::log2e);
-
+  sm_scale *= math::log2e;
   const uint32_t qo_len = qkv_info.qo_len;
   const uint32_t kv_len = qkv_info.kv_len;
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
@@ -241,13 +239,13 @@ __global__ void SinglePrefillWithKVCacheKernel(
       } else {
 #pragma unroll
         for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
+          vec_t<DTypeIn, 8> tmp;
+          tmp.load((DTypeIn*)q_frag[fx][fy]);
 #pragma unroll
-          for (uint32_t reg_id = 0; reg_id < 4; ++reg_id) {
-            vec_t<DTypeIn, 2> tmp;
-            tmp.load((DTypeIn*)&q_frag[fx][fy][reg_id]);
-            tmp.data = tmp.data * sm_scale2.data;
-            tmp.store((DTypeIn*)&q_frag[fx][fy][reg_id]);
+          for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+            tmp[reg_id] *= sm_scale;
           }
+          tmp.store((DTypeIn*)q_frag[fx][fy]);
         }
       }
       q_idx += 16;
@@ -278,15 +276,18 @@ __global__ void SinglePrefillWithKVCacheKernel(
       }
     } else {
 #pragma unroll
-      for (uint32_t i = 0; i < num_frags_x * 16 * head_dim / 64; ++i) {
-        vec_t<DTypeIn, 2> tmp;
+      for (uint32_t i = 0; i < num_frags_x * 16 * head_dim / 256; ++i) {
+        vec_t<DTypeIn, 8> tmp;
         tmp.load((DTypeIn*)(q_smem.base +
                             ty * num_frags_x * 16 * num_cells_per_head_in) +
-                 i * 64 + tx * 2);
-        tmp.data = tmp.data * sm_scale2.data;
+                 i * 256 + tx * 8);
+#pragma unroll
+        for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+          tmp[reg_id] *= sm_scale;
+        }
         tmp.store((DTypeIn*)(q_smem.base +
                              ty * num_frags_x * 16 * num_cells_per_head_in) +
-                  i * 64 + tx * 2);
+                  i * 256 + tx * 8);
       }
     }
   }
