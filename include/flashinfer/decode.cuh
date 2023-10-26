@@ -1084,7 +1084,7 @@ cudaError_t BatchDecodeWithPagedKVCache(
                 smem_size));
             uint32_t max_grid_size = num_blocks_per_sm * num_sm;
 
-            if (batch_size * num_kv_heads >= max_grid_size || tmp == nullptr) {
+            if (tmp == nullptr) {
               // do not use cooperative kernel
               dim3 nblks(batch_size, num_kv_heads);
               dim3 nthrs(bdx, bdy, bdz);
