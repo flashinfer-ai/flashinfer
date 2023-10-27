@@ -143,11 +143,13 @@ __global__ void SinglePrefillWithKVCacheKernel(
 
   extern __shared__ uint8_t smem[];
 
+  // only used when pin_q_in_reg is true
   uint32_t q_frag[num_frags_x][num_frags_y][4];
   float x_frag[num_frags_x][num_frags_z][8];
   float o_frag[num_frags_x][num_frags_y][8];
   float m[num_frags_x][2];
   float d[num_frags_x][2];
+  // only used when rotary_mode == RotaryMode::kLlama
   float rope_freq[num_frags_y / 2][4];
   if constexpr (rotary_mode == RotaryMode::kLlama) {
 #pragma unroll
@@ -412,7 +414,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
                                    num_frags_z * 16 * num_cells_per_head_in;
       }
     } else {
-      uint32_t a_frag[num_frags_x][4], b_frag[4];
+      uint32_t a_frag[4], b_frag[4];
 
       // load k tile from smem to reg
       if constexpr (!pin_q_in_reg) {
@@ -426,26 +428,41 @@ __global__ void SinglePrefillWithKVCacheKernel(
       // compute q*k^T
 #pragma unroll
       for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
+        // serpentine order
         if constexpr (!pin_q_in_reg) {
-#pragma unroll
-          for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
-            q_smem.ldmatrix_m8n8x4(a_frag[fx]);
-            q_smem.offset += 16 * num_cells_per_head_in;
-          }
-          q_smem.offset = (q_smem.offset ^ 0x2) + (fy & 0x1) * 8 -
-                          num_frags_x * 16 * num_cells_per_head_in;
+          q_smem.ldmatrix_m8n8x4(a_frag);
         }
-
 #pragma unroll
         for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
           k_smem[stage_idx].ldmatrix_m8n8x4(b_frag);
           k_smem[stage_idx].offset += 16 * num_cells_per_head_in;
 #pragma unroll
-          for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+          for (uint32_t i = 0; i < num_frags_x; ++i) {
+            uint32_t fx;
+            if (fz % 2 == 0) {
+              fx = i;
+            } else {
+              fx = num_frags_x - 1 - i;
+            }
             mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
-                x_frag[fx][fz], pin_q_in_reg ? q_frag[fx][fy] : a_frag[fx],
-                b_frag);
+                x_frag[fx][fz], pin_q_in_reg ? q_frag[fx][fy] : a_frag, b_frag);
+            if (i != 0) {
+              if constexpr (!pin_q_in_reg) {
+                if (fz % 2 == 0) {
+                  q_smem.offset += 16 * num_cells_per_head_in;
+                } else {
+                  q_smem.offset -= 16 * num_cells_per_head_in;
+                }
+                q_smem.ldmatrix_m8n8x4(a_frag);
+              }
+            }
           }
+        }
+        if constexpr (!pin_q_in_reg) {
+          if (num_frags_z % 2 == 1) {
+            q_smem.offset -= (num_frags_x - 1) * 16 * num_cells_per_head_in;
+          }
+          q_smem.offset = (q_smem.offset ^ 0x2) + (fy & 0x1) * 8;
         }
         k_smem[stage_idx].offset = (k_smem[stage_idx].offset ^ 0x2) +
                                    (fy & 0x1) * 8 -
@@ -537,19 +554,28 @@ __global__ void SinglePrefillWithKVCacheKernel(
     // compute sfm*v
 #pragma unroll
     for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
-      uint32_t a_frag[num_frags_x][4];
-#pragma unroll
-      for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
-        vec_cast<DTypeIn, float, 8>((DTypeIn*)a_frag[fx], x_frag[fx][fz]);
-      }
+      uint32_t a_frag[4];
+      // serpentine order
+      vec_cast<DTypeIn, float, 8>((DTypeIn*)a_frag, x_frag[0][fz]);
 #pragma unroll
       for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
         uint32_t b_frag[4];
         v_smem[stage_idx].ldmatrix_m8n8x4_trans(b_frag);
 #pragma unroll
-        for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
-          mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
-              o_frag[fx][fy], a_frag[fx], b_frag);
+        for (uint32_t i = 0; i < num_frags_x; ++i) {
+          uint32_t fx;
+          if (fy % 2 == 0) {
+            fx = i;
+          } else {
+            fx = num_frags_x - 1 - i;
+          }
+
+          mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(o_frag[fx][fy],
+                                                             a_frag, b_frag);
+
+          if (i != 0) {
+            vec_cast<DTypeIn, float, 8>((DTypeIn*)a_frag, x_frag[fx][fz]);
+          }
         }
         v_smem[stage_idx].offset =
             (v_smem[stage_idx].offset ^ 0x2) + (fy & 0x1) * 8;
