@@ -729,8 +729,7 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
     uint32_t& tmp_size, uint32_t& max_grid_size, uint32_t num_qo_heads,
     uint32_t num_kv_heads, uint32_t qo_len, uint32_t kv_len, uint32_t head_dim,
     bool causal = true, QKVLayout layout = QKVLayout::kNHD,
-    RotaryMode rotary_mode = RotaryMode::kNone, cudaStream_t stream = nullptr,
-    uint32_t dev_id = 0) {
+    RotaryMode rotary_mode = RotaryMode::kNone, cudaStream_t stream = nullptr) {
   SWITCH_NUM_FRAGS_X(
       qo_len > 64, NUM_FRAGS_X,
       {SWITCH_GQA_GROUP_SIZE(
@@ -765,6 +764,8 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
                             16 * head_dim * sizeof(DTypeIn);
                         int num_blocks_per_sm = 0;
                         int num_sm = 0;
+                        int dev_id = 0;
+                        FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
                         FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
                             &num_sm, cudaDevAttrMultiProcessorCount, dev_id));
                         FLASHINFER_CUDA_CALL(
@@ -802,12 +803,10 @@ cudaError_t SinglePrefillWithKVCache(
     uint32_t kv_len, uint32_t head_dim, bool causal = true,
     QKVLayout layout = QKVLayout::kNHD,
     RotaryMode rotary_mode = RotaryMode::kNone, float rope_scale = 1.f,
-    float rope_theta = 1e4, cudaStream_t stream = nullptr,
-    uint32_t dev_id = 0) {
+    float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   const float sm_scale = 1.f / std::sqrt(float(head_dim));
   const float log2_rope_inv_scale = -std::log2f(rope_scale);
   const float log2_rope_inv_theta = -std::log2f(rope_theta);
-  FLASHINFER_CUDA_CALL(cudaSetDevice(dev_id));
   assert(kv_len >= qo_len);
 
   SWITCH_NUM_FRAGS_X(
@@ -846,6 +845,8 @@ cudaError_t SinglePrefillWithKVCache(
                             16 * head_dim * sizeof(DTypeIn);
                         int num_blocks_per_sm = 0;
                         int num_sm = 0;
+                        int dev_id = 0;
+                        FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
                         FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
                             &num_sm, cudaDevAttrMultiProcessorCount, dev_id));
                         FLASHINFER_CUDA_CALL(
@@ -918,18 +919,16 @@ cudaError_t BatchPrefillWithPagedKVCache(
     DTypeIn* q, paged_kv_t<DTypeIn, IdType> paged_kv, IdType* q_indptr,
     DTypeOut* o, float* tmp, uint32_t num_qo_heads, bool causal = true,
     RotaryMode rotary_mode = RotaryMode::kNone, float rope_scale = 1.f,
-    float rope_theta = 1e4, cudaStream_t stream = nullptr,
-    uint32_t dev_id = 0) {
+    float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   const uint32_t num_kv_heads = paged_kv.num_heads;
   const uint32_t head_dim = paged_kv.head_dim;
   const uint32_t batch_size = paged_kv.batch_size;
 
-  FLASHINFER_CUDA_CALL(cudaSetDevice(dev_id));
   std::vector<IdType> q_indptr_h(paged_kv.batch_size + 1);
   std::vector<IdType> kv_indptr_h(paged_kv.batch_size + 1);
 
-  FLASHINFER_CUDA_CALL(PagedKVCacheToRaggedTensorComputeIndptr(
-      paged_kv, kv_indptr_h, stream, dev_id));
+  FLASHINFER_CUDA_CALL(
+      PagedKVCacheToRaggedTensorComputeIndptr(paged_kv, kv_indptr_h, stream));
   uint32_t nnz = kv_indptr_h.back();
 
   DTypeIn *keys = nullptr, *values = nullptr;
@@ -960,7 +959,7 @@ cudaError_t BatchPrefillWithPagedKVCache(
         num_qo_heads, num_kv_heads,
         q_indptr_h[batch_idx + 1] - q_indptr_h[batch_idx],
         kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx], head_dim, causal,
-        QKVLayout::kNHD, rotary_mode, rope_scale, rope_theta, stream, dev_id);
+        QKVLayout::kNHD, rotary_mode, rope_scale, rope_theta, stream);
   }
   FLASHINFER_CUDA_CALL(cudaFreeAsync(keys, stream));
   FLASHINFER_CUDA_CALL(cudaFreeAsync(values, stream));

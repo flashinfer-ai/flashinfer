@@ -252,9 +252,7 @@ __global__ void PagedKVCacheToRaggedTensorKernel(
 template <typename DType, typename IdType>
 cudaError_t AppendPagedKVCacheDecode(paged_kv_t<DType, IdType> paged_kv,
                                      DType* key, DType* value,
-                                     cudaStream_t stream = nullptr,
-                                     uint32_t dev_id = 0) {
-  FLASHINFER_CUDA_CALL(cudaSetDevice(dev_id));
+                                     cudaStream_t stream = nullptr) {
   uint32_t head_dim = paged_kv.head_dim;
   uint32_t batch_size = paged_kv.batch_size;
   uint32_t num_heads = paged_kv.num_heads;
@@ -278,9 +276,7 @@ template <typename DType, typename IdType>
 cudaError_t AppendPagedKVCachePrefill(paged_kv_t<DType, IdType> paged_kv,
                                       DType* key, DType* value,
                                       IdType* append_indptr,
-                                      cudaStream_t stream = nullptr,
-                                      uint32_t dev_id = 0) {
-  FLASHINFER_CUDA_CALL(cudaSetDevice(dev_id));
+                                      cudaStream_t stream = nullptr) {
   uint32_t head_dim = paged_kv.head_dim;
   uint32_t batch_size = paged_kv.batch_size;
   uint32_t num_heads = paged_kv.num_heads;
@@ -304,7 +300,7 @@ cudaError_t AppendPagedKVCachePrefill(paged_kv_t<DType, IdType> paged_kv,
 template <typename DType, typename IdType>
 cudaError_t PagedKVCacheToRaggedTensorComputeIndptr(
     paged_kv_t<DType, IdType> paged_kv, std::vector<IdType>& kv_indptr_host,
-    cudaStream_t stream = nullptr, uint32_t dev_id = 0) {
+    cudaStream_t stream = nullptr) {
   const uint32_t batch_size = paged_kv.batch_size;
   const uint32_t page_size = paged_kv.page_size;
   std::vector<IdType> paged_kv_indptr_host(batch_size + 1),
@@ -336,9 +332,7 @@ template <typename DType, typename IdType>
 cudaError_t PagedKVCacheToRaggedTensor(paged_kv_t<DType, IdType> paged_kv,
                                        DType* key, DType* value,
                                        IdType* kv_indptr,
-                                       cudaStream_t stream = nullptr,
-                                       uint32_t dev_id = 0) {
-  FLASHINFER_CUDA_CALL(cudaSetDevice(dev_id));
+                                       cudaStream_t stream = nullptr) {
   const uint32_t head_dim = paged_kv.head_dim;
   const uint32_t batch_size = paged_kv.batch_size;
   const uint32_t num_heads = paged_kv.num_heads;

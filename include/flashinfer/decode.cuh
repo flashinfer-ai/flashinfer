@@ -672,8 +672,7 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(
     uint32_t& tmp_size, uint32_t& max_grid_size, uint32_t num_qo_heads,
     uint32_t num_kv_heads, uint32_t seq_len, uint32_t head_dim,
     QKVLayout layout = QKVLayout::kNHD,
-    RotaryMode rotary_mode = RotaryMode::kNone, cudaStream_t stream = nullptr,
-    uint32_t dev_id = 0) {
+    RotaryMode rotary_mode = RotaryMode::kNone, cudaStream_t stream = nullptr) {
   if (seq_len <= 128U) {
     tmp_size = 0;
   } else {
@@ -703,6 +702,8 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(
                       DTypeOut>;
                   int num_blocks_per_sm = 0;
                   int num_sm = 0;
+                  int dev_id = 0;
+                  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
                   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
                       &num_sm, cudaDevAttrMultiProcessorCount, dev_id));
                   FLASHINFER_CUDA_CALL(
@@ -750,15 +751,12 @@ cudaError_t SingleDecodeWithKVCache(
     uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t seq_len,
     uint32_t head_dim, QKVLayout layout = QKVLayout::kNHD,
     RotaryMode rotary_mode = RotaryMode::kNone, float rope_scale = 1.f,
-    float rope_theta = 1e4, cudaStream_t stream = nullptr,
-    uint32_t dev_id = 0) {
+    float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   const float sm_scale = 1.f / std::sqrt(float(head_dim));
   const float rope_inv_scale = 1.f / rope_scale;
   const float rope_inv_theta = 1.f / rope_theta;
   constexpr bool norm_on_the_fly = false;
   assert(num_qo_heads % num_kv_heads == 0);
-
-  FLASHINFER_CUDA_CALL(cudaSetDevice(dev_id));
 
   SWITCH_GQA_GROUP_SIZE(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
@@ -816,6 +814,8 @@ cudaError_t SingleDecodeWithKVCache(
 
                   int num_blocks_per_sm = 0;
                   int num_sm = 0;
+                  int dev_id = 0;
+                  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
                   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
                       &num_sm, cudaDevAttrMultiProcessorCount, dev_id));
                   FLASHINFER_CUDA_CALL(
@@ -961,8 +961,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
     uint32_t& tmp_size, uint32_t& max_grid_size,
     uint32_t& max_num_pages_per_batch, uint32_t& new_batch_size,
     const paged_kv_t<DTypeIn, IdType>& paged_kv, uint32_t num_qo_heads,
-    RotaryMode rotary_mode = RotaryMode::kNone, cudaStream_t stream = nullptr,
-    uint32_t dev_id = 0) {
+    RotaryMode rotary_mode = RotaryMode::kNone, cudaStream_t stream = nullptr) {
   constexpr bool norm_on_the_fly = false;
   const uint32_t head_dim = paged_kv.head_dim;
   const uint32_t batch_size = paged_kv.batch_size;
@@ -989,6 +988,8 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
                 bdx, bdy, bdz, DTypeIn, DTypeOut, IdType>;
             int num_blocks_per_sm = 0;
             int num_sm = 0;
+            int dev_id = 0;
+            FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
             FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
                 &num_sm, cudaDevAttrMultiProcessorCount, dev_id));
             FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
@@ -1036,14 +1037,14 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
  * output \param rotary_mode The rotary mode \param rope_scale A floating point
  * number indicate the scaling ratio used in RoPE Interpolation. \param
  * rope_theta A floating point number indicate the "theta" used in RoPE \param
- * stream The cuda stream to launch the kernel \param dev_id The device id
+ * stream The cuda stream to launch the kernel
  */
 template <typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCache(
     DTypeIn* q, paged_kv_t<DTypeIn, IdType> paged_kv, DTypeOut* o, float* tmp,
     uint32_t num_qo_heads, RotaryMode rotary_mode = RotaryMode::kNone,
     float rope_scale = 1.f, float rope_theta = 1e4,
-    cudaStream_t stream = nullptr, uint32_t dev_id = 0) {
+    cudaStream_t stream = nullptr) {
   const float sm_scale = 1.f / std::sqrt(float(paged_kv.head_dim));
   const float rope_inv_scale = 1.f / rope_scale;
   const float rope_inv_theta = 1.f / rope_theta;
@@ -1052,8 +1053,6 @@ cudaError_t BatchDecodeWithPagedKVCache(
   const uint32_t head_dim = paged_kv.head_dim;
   const uint32_t batch_size = paged_kv.batch_size;
   assert(num_qo_heads % num_kv_heads == 0);
-
-  FLASHINFER_CUDA_CALL(cudaSetDevice(dev_id));
 
   SWITCH_GQA_GROUP_SIZE(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
@@ -1071,18 +1070,6 @@ cudaError_t BatchDecodeWithPagedKVCache(
             const uint32_t smem_size =
                 2 * num_stages_smem * bdy * bdz * head_dim * sizeof(DTypeIn) +
                 2 * bdy * bdz * sizeof(float);
-
-            auto cooperative_kernel = BatchDecodeWithPagedKVCacheKernel<
-                true, ROTARY_MODE, norm_on_the_fly, num_stages_smem, vec_size,
-                bdx, bdy, bdz, DTypeIn, DTypeOut, IdType>;
-            int num_blocks_per_sm = 0;
-            int num_sm = 0;
-            FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
-                &num_sm, cudaDevAttrMultiProcessorCount, dev_id));
-            FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &num_blocks_per_sm, cooperative_kernel, num_threads,
-                smem_size));
-            uint32_t max_grid_size = num_blocks_per_sm * num_sm;
 
             if (tmp == nullptr) {
               // do not use cooperative kernel
@@ -1109,6 +1096,9 @@ cudaError_t BatchDecodeWithPagedKVCache(
               assert(paged_kv.batch_idx_map != nullptr);
               assert(paged_kv.chunk_start != nullptr);
               assert(paged_kv.seq_lens_before_split != nullptr);
+              auto cooperative_kernel = BatchDecodeWithPagedKVCacheKernel<
+                  true, ROTARY_MODE, norm_on_the_fly, num_stages_smem, vec_size,
+                  bdx, bdy, bdz, DTypeIn, DTypeOut, IdType>;
               FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
                   cooperative_kernel,
                   cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
