@@ -86,12 +86,13 @@ __device__ __forceinline__ void produce_kv(
     const tensor_info_t<layout, group_size>& qkv_info,
     const uint32_t kv_idx_base, const uint32_t kv_len, const uint32_t head_idx,
     const uint32_t tx, const uint32_t ty) {
-  constexpr uint32_t num_cells_per_head_in =
+  constexpr uint32_t num_cells_per_in_channel =
       num_frags_y * 16 / cell_capacity<T>();
 
   uint32_t kv_idx = kv_idx_base + ty * 4 + tx / 8;
-  smem[stage_idx].offset = smem_t::get_permuted_offset<num_cells_per_head_in>(
-      ty * 4 + tx / 8, tx % 8);
+  smem[stage_idx].offset =
+      smem_t::get_permuted_offset<num_cells_per_in_channel>(ty * 4 + tx / 8,
+                                                            tx % 8);
   gptr += qkv_info.get_kv_elem_offset(kv_idx, head_idx,
                                       (tx % 8) * cell_capacity<T>());
 
@@ -105,7 +106,7 @@ __device__ __forceinline__ void produce_kv(
     }
     kv_idx += num_warps * 4;
     smem[stage_idx].offset +=
-        num_warps * 4 * num_cells_per_head_in - 4 * num_frags_y;
+        num_warps * 4 * num_cells_per_in_channel - 4 * num_frags_y;
     gptr += num_warps * 4 * qkv_info.get_n_stride() -
             2 * num_frags_y * cell_capacity<T>();
   }
@@ -119,12 +120,13 @@ __device__ __forceinline__ void produce_half_k(
     const uint32_t kv_idx_base, const uint32_t kv_len, const uint32_t head_idx,
     const uint32_t tx, const uint32_t ty) {
   static_assert(num_frags_y % 8 == 0);
-  constexpr uint32_t num_cells_per_head_in =
+  constexpr uint32_t num_cells_per_in_channel =
       num_frags_y * 8 / cell_capacity<T>();
 
   uint32_t kv_idx = kv_idx_base + ty * 4 + tx / 8;
-  smem[stage_idx].offset = smem_t::get_permuted_offset<num_cells_per_head_in>(
-      ty * 4 + tx / 8, tx % 8);
+  smem[stage_idx].offset =
+      smem_t::get_permuted_offset<num_cells_per_in_channel>(ty * 4 + tx / 8,
+                                                            tx % 8);
   gptr += qkv_info.get_kv_elem_offset(
       kv_idx, head_idx,
       (num_frags_y * stage_idx + (tx % 8)) * cell_capacity<T>());
@@ -139,7 +141,7 @@ __device__ __forceinline__ void produce_half_k(
     }
     kv_idx += num_warps * 4;
     smem[stage_idx].offset +=
-        num_warps * 4 * num_cells_per_head_in - 2 * num_frags_y;
+        num_warps * 4 * num_cells_per_in_channel - 2 * num_frags_y;
     gptr += num_warps * 4 * qkv_info.get_n_stride() -
             num_frags_y * cell_capacity<T>();
   }
@@ -152,13 +154,13 @@ __device__ __forceinline__ void produce_half_v(
     const tensor_info_t<layout, group_size>& qkv_info,
     const uint32_t kv_idx_base, const uint32_t kv_len, const uint32_t head_idx,
     const uint32_t tx, const uint32_t ty) {
-  constexpr uint32_t num_cells_per_head_in =
+  constexpr uint32_t num_cells_per_in_channel =
       num_frags_y * 16 / cell_capacity<T>();
 
-  uint32_t kv_idx =
-      kv_idx_base + num_frags_z * 8 * qkv_info.get_n_stride() + ty * 4 + tx / 8;
-  smem[stage_idx].offset = smem_t::get_permuted_offset<num_cells_per_head_in>(
-      ty * 4 + tx / 8, tx % 8);
+  uint32_t kv_idx = kv_idx_base + stage_idx * num_frags_z * 8 + ty * 4 + tx / 8;
+  smem[stage_idx].offset =
+      smem_t::get_permuted_offset<num_cells_per_in_channel>(ty * 4 + tx / 8,
+                                                            tx % 8);
   gptr += qkv_info.get_kv_elem_offset(kv_idx, head_idx,
                                       (tx % 8) * cell_capacity<T>());
 
@@ -172,7 +174,7 @@ __device__ __forceinline__ void produce_half_v(
     }
     kv_idx += num_warps * 4;
     smem[stage_idx].offset +=
-        num_warps * 4 * num_cells_per_head_in - 4 * num_frags_y;
+        num_warps * 4 * num_cells_per_in_channel - 4 * num_frags_y;
     gptr += num_warps * 4 * qkv_info.get_n_stride() -
             2 * num_frags_y * cell_capacity<T>();
   }
@@ -207,9 +209,9 @@ __global__ void SinglePrefillWithKVCacheKernel(
   constexpr uint32_t head_dim = num_frags_y * 16;
   constexpr bool halve_kv_smem =
       (num_frags_x == 2 && num_frags_y == 8 && num_frags_z == 4);
-  constexpr uint32_t num_cells_per_head_in =
+  constexpr uint32_t num_cells_per_in_channel =
       head_dim / cell_capacity<DTypeIn>();
-  constexpr uint32_t num_cells_per_head_out =
+  constexpr uint32_t num_cells_per_out_channel =
       head_dim / cell_capacity<DTypeOut>();
 
   static_assert(num_frags_z * num_frags_y % num_warps == 0);
@@ -257,7 +259,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
   // cooperative fetch q fragment from gmem to reg
   smem_t q_smem(smem);
   uint32_t q_idx = (bx * num_warps + ty) * num_frags_x * 16 + tx / 4;
-  q_smem.offset = smem_t::get_permuted_offset<num_cells_per_head_in>(
+  q_smem.offset = smem_t::get_permuted_offset<num_cells_per_in_channel>(
       ty * num_frags_x * 16 + tx / 4, tx % 4);
   DTypeIn* q_ptr =
       q + qkv_info.get_qo_elem_offset(q_idx, qo_head_idx,
@@ -274,7 +276,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
         q_ptr += 4 * cell_capacity<DTypeIn>();
       }
       q_idx += 8;
-      q_smem.offset += 8 * num_cells_per_head_in - 4 * num_frags_y;
+      q_smem.offset += 8 * num_cells_per_in_channel - 4 * num_frags_y;
       q_ptr += 8 * qkv_info.get_n_stride() -
                2 * num_frags_y * cell_capacity<DTypeIn>();
     }
@@ -285,7 +287,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
 
   if constexpr (rotary_mode == RotaryMode::kLlama) {
     uint32_t q_frag_local[2][4];
-    q_smem.offset = smem_t::get_permuted_offset<num_cells_per_head_in>(
+    q_smem.offset = smem_t::get_permuted_offset<num_cells_per_in_channel>(
         ty * num_frags_x * 16 + tx % 16, tx / 16);
     q_idx = (bx * num_warps + ty) * num_frags_x * 16 + tx / 4;
 #pragma unroll
@@ -303,7 +305,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
         q_smem.stmatrix_m8n8x4(q_frag_local[0]);
         q_smem.offset = (q_smem.offset ^ 0x2) + (fyi & 0x1) * 8;
       }
-      q_smem.offset += 16 * num_cells_per_head_in - 2 * num_frags_y;
+      q_smem.offset += 16 * num_cells_per_in_channel - 2 * num_frags_y;
       q_idx += 16;
     }
   } else {
@@ -311,14 +313,14 @@ __global__ void SinglePrefillWithKVCacheKernel(
     for (uint32_t i = 0; i < num_frags_x * 16 * head_dim / 256; ++i) {
       vec_t<DTypeIn, 8> tmp;
       tmp.load((DTypeIn*)(q_smem.base +
-                          ty * num_frags_x * 16 * num_cells_per_head_in) +
+                          ty * num_frags_x * 16 * num_cells_per_in_channel) +
                i * 256 + tx * 8);
 #pragma unroll
       for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
         tmp[reg_id] *= sm_scale;
       }
       tmp.store((DTypeIn*)(q_smem.base +
-                           ty * num_frags_x * 16 * num_cells_per_head_in) +
+                           ty * num_frags_x * 16 * num_cells_per_in_channel) +
                 i * 256 + tx * 8);
     }
   }
@@ -350,38 +352,39 @@ __global__ void SinglePrefillWithKVCacheKernel(
               : (chunk_end - chunk_start)) /
       (16 * num_frags_z);
 
-  if constexpr (halve_kv_smem) {
-    produce_half_k<num_frags_y, num_frags_z, num_warps>(
-        kv_smem, 0, k, qkv_info, chunk_start, chunk_end, kv_head_idx, tx, ty);
-    cp_async::commit_group();
-    produce_half_k<num_frags_y, num_frags_z, num_warps>(
-        kv_smem, 1, k, qkv_info, chunk_start, chunk_end, kv_head_idx, tx, ty);
-    cp_async::commit_group();
-  } else {
+  if constexpr (!halve_kv_smem) {
     produce_kv<num_frags_y, num_frags_z, num_warps>(
         kv_smem, 0, k, qkv_info, chunk_start, chunk_end, kv_head_idx, tx, ty);
     cp_async::commit_group();
     produce_kv<num_frags_y, num_frags_z, num_warps>(
         kv_smem, 1, v, qkv_info, chunk_start, chunk_end, kv_head_idx, tx, ty);
     cp_async::commit_group();
+  } else {
+    produce_half_k<num_frags_y, num_frags_z, num_warps>(
+        kv_smem, 0, k, qkv_info, chunk_start, chunk_end, kv_head_idx, tx, ty);
+    cp_async::commit_group();
+    produce_half_k<num_frags_y, num_frags_z, num_warps>(
+        kv_smem, 1, k, qkv_info, chunk_start, chunk_end, kv_head_idx, tx, ty);
+    cp_async::commit_group();
   }
 
 #pragma unroll 1
   for (uint32_t iter = 0; iter < num_iterations; ++iter) {
-    if constexpr (!halve_kv_smem) {
-      cp_async::wait_group<2 * num_stages_smem - 1>();
-      block.sync();
-      // init x_frag with 0
+    // init x_frag with 0
 #pragma unroll
-      for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+    for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
-        for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
+      for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
 #pragma unroll
-          for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
-            x_frag[fx][fz][reg_id] = 0.f;
-          }
+        for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+          x_frag[fx][fz][reg_id] = 0.f;
         }
       }
+    }
+
+    if (!halve_kv_smem) {
+      cp_async::wait_group<1>();
+      block.sync();
     }
 
     if constexpr (rotary_mode == RotaryMode::kLlama) {
@@ -390,9 +393,9 @@ __global__ void SinglePrefillWithKVCacheKernel(
       uint32_t a_frag[num_frags_x][2][4];
       uint32_t b_frag[2][4];
       // apply rotary on the fly
-      q_smem.offset = smem_t::get_permuted_offset<num_cells_per_head_in>(
+      q_smem.offset = smem_t::get_permuted_offset<num_cells_per_in_channel>(
           ty * num_frags_x * 16 + tx % 16, tx / 16);
-      kv_smem[0].offset = smem_t::get_permuted_offset<num_cells_per_head_in>(
+      kv_smem[0].offset = smem_t::get_permuted_offset<num_cells_per_in_channel>(
           8 * (tx / 16) + tx % 8, (tx % 16) / 8);
 
       // compute q*k^T
@@ -403,10 +406,10 @@ __global__ void SinglePrefillWithKVCacheKernel(
           q_smem.ldmatrix_m8n8x4(a_frag[fx][0]);
           q_smem.offset += num_frags_y * 2;
           q_smem.ldmatrix_m8n8x4(a_frag[fx][1]);
-          q_smem.offset += 16 * num_cells_per_head_in - num_frags_y * 2;
+          q_smem.offset += 16 * num_cells_per_in_channel - num_frags_y * 2;
         }
         q_smem.offset = (q_smem.offset ^ 0x2) + (fyi & 0x1) * 8 -
-                        num_frags_x * 16 * num_cells_per_head_in;
+                        num_frags_x * 16 * num_cells_per_in_channel;
         uint32_t kv_idx = chunk_start + iter * 16 * num_frags_z + tx / 4;
 
 #pragma unroll
@@ -414,7 +417,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
           kv_smem[0].ldmatrix_m8n8x4(b_frag[0]);
           kv_smem[0].offset += num_frags_y * 2;
           kv_smem[0].ldmatrix_m8n8x4(b_frag[1]);
-          kv_smem[0].offset += 16 * num_cells_per_head_in - num_frags_y * 2;
+          kv_smem[0].offset += 16 * num_cells_per_in_channel - num_frags_y * 2;
           apply_llama_rope<false, DTypeIn>(
               (DTypeIn*)b_frag[0], (DTypeIn*)b_frag[1], rope_freq[fyi], kv_idx);
           kv_idx += 16;
@@ -427,38 +430,39 @@ __global__ void SinglePrefillWithKVCacheKernel(
           }
         }
         kv_smem[0].offset = (kv_smem[0].offset ^ 0x2) + (fyi & 0x1) * 8 -
-                            num_frags_z * 16 * num_cells_per_head_in;
+                            num_frags_z * 16 * num_cells_per_in_channel;
       }
     } else {
       // rotary_mode == RotaryMode::kNone
       uint32_t a_frag[num_frags_x][4], b_frag[4];
-      q_smem.offset = smem_t::get_permuted_offset<num_cells_per_head_in>(
-          ty * num_frags_x * 16 + tx % 16, tx / 16);
-      constexpr uint32_t num_cells_per_channel_half = num_cells_per_head_in / 2;
 
       if constexpr (halve_kv_smem) {
+        constexpr uint32_t num_cells_per_half_in_channel =
+            num_cells_per_in_channel / 2;
+        q_smem.offset = smem_t::get_permuted_offset<num_cells_per_in_channel>(
+            ty * num_frags_x * 16 + tx % 16, tx / 16);
 #pragma unroll
         for (uint32_t stage_idx = 0; stage_idx < num_stages_smem; ++stage_idx) {
-          cp_async::wait_group<num_stages_smem - 1>();
+          cp_async::wait_group<1>();
           block.sync();
 
           kv_smem[stage_idx].offset =
-              smem_t::get_permuted_offset<num_cells_per_channel_half>(
+              smem_t::get_permuted_offset<num_cells_per_half_in_channel>(
                   8 * (tx / 16) + tx % 8, (tx % 16) / 8);
 #pragma unroll
           for (uint32_t fyi = 0; fyi < num_frags_y / 2; ++fyi) {
 #pragma unroll
             for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
               q_smem.ldmatrix_m8n8x4(a_frag[fx]);
-              q_smem.offset += 16 * num_cells_per_head_in;
+              q_smem.offset += 16 * num_cells_per_in_channel;
             }
             q_smem.offset = (q_smem.offset ^ 0x2) + (fyi & 0x1) * 8 -
-                            num_frags_x * 16 * num_cells_per_head_in;
+                            num_frags_x * 16 * num_cells_per_in_channel;
 
 #pragma unroll
             for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
               kv_smem[stage_idx].ldmatrix_m8n8x4(b_frag);
-              kv_smem[stage_idx].offset += 16 * num_cells_per_channel_half;
+              kv_smem[stage_idx].offset += 16 * num_cells_per_half_in_channel;
 #pragma unroll
               for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
                 mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
@@ -467,35 +471,38 @@ __global__ void SinglePrefillWithKVCacheKernel(
             }
             kv_smem[stage_idx].offset =
                 (kv_smem[stage_idx].offset ^ 0x2) + (fyi & 0x1) * 8 -
-                num_frags_z * 16 * num_cells_per_channel_half;
+                num_frags_z * 16 * num_cells_per_half_in_channel;
           }
 
           block.sync();
           produce_half_v<num_frags_y, num_frags_z, num_warps>(
-              kv_smem, stage_idx, v, qkv_info, iter * 16 * num_frags_z,
-              chunk_end, kv_head_idx, tx, ty);
+              kv_smem, stage_idx, v, qkv_info,
+              chunk_start + iter * 16 * num_frags_z, chunk_end, kv_head_idx, tx,
+              ty);
           cp_async::commit_group();
         }
       } else {
         // not halve kv smem
-        kv_smem[0].offset = smem_t::get_permuted_offset<num_cells_per_head_in>(
-            8 * (tx / 16) + tx % 8, (tx % 16) / 8);
-
+        q_smem.offset = smem_t::get_permuted_offset<num_cells_per_in_channel>(
+            ty * num_frags_x * 16 + tx % 16, tx / 16);
+        kv_smem[0].offset =
+            smem_t::get_permuted_offset<num_cells_per_in_channel>(
+                8 * (tx / 16) + tx % 8, (tx % 16) / 8);
         // compute q*k^T
 #pragma unroll
         for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
 #pragma unroll
           for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
             q_smem.ldmatrix_m8n8x4(a_frag[fx]);
-            q_smem.offset += 16 * num_cells_per_head_in;
+            q_smem.offset += 16 * num_cells_per_in_channel;
           }
           q_smem.offset = (q_smem.offset ^ 0x2) + (fy & 0x1) * 8 -
-                          num_frags_x * 16 * num_cells_per_head_in;
+                          num_frags_x * 16 * num_cells_per_in_channel;
 
 #pragma unroll
           for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
             kv_smem[0].ldmatrix_m8n8x4(b_frag);
-            kv_smem[0].offset += 16 * num_cells_per_head_in;
+            kv_smem[0].offset += 16 * num_cells_per_in_channel;
 #pragma unroll
             for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
               mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
@@ -503,7 +510,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
             }
           }
           kv_smem[0].offset = (kv_smem[0].offset ^ 0x2) + (fy & 0x1) * 8 -
-                              num_frags_z * 16 * num_cells_per_head_in;
+                              num_frags_z * 16 * num_cells_per_in_channel;
         }
       }
     }
@@ -578,14 +585,13 @@ __global__ void SinglePrefillWithKVCacheKernel(
 
     if constexpr (halve_kv_smem) {
       static_assert(num_frags_z % 2 == 0);
-      cp_async::wait_group<2 * num_stages_smem - 1>();
-      block.sync();
-
 #pragma unroll
       for (uint32_t stage_idx = 0; stage_idx < num_stages_smem; ++stage_idx) {
+        cp_async::wait_group<1>();
+        block.sync();
         kv_smem[stage_idx].offset =
-            smem_t::get_permuted_offset<num_cells_per_head_in>(tx % 16,
-                                                               tx / 16);
+            smem_t::get_permuted_offset<num_cells_per_in_channel>(tx % 16,
+                                                                  tx / 16);
 #pragma unroll
         for (uint32_t fzi = 0; fzi < num_frags_z / 2; ++fzi) {
           const uint32_t fz = stage_idx * (num_frags_z / 2) + fzi;
@@ -607,7 +613,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
                 (kv_smem[stage_idx].offset ^ 0x2) + (fy & 0x1) * 8;
           }
           kv_smem[stage_idx].offset +=
-              16 * num_cells_per_head_in - 4 * num_frags_y;
+              16 * num_cells_per_in_channel - 4 * num_frags_y;
         }
 
         block.sync();
@@ -624,12 +630,12 @@ __global__ void SinglePrefillWithKVCacheKernel(
           kv_smem, 0, k, qkv_info, chunk_start + (iter + 1) * 16 * num_frags_z,
           chunk_end, kv_head_idx, tx, ty);
       cp_async::commit_group();
-      cp_async::wait_group<2 * num_stages_smem - 1>();
+      cp_async::wait_group<1>();
       block.sync();
 
       // load v tile from smem to reg
-      kv_smem[1].offset =
-          smem_t::get_permuted_offset<num_cells_per_head_in>(tx % 16, tx / 16);
+      kv_smem[1].offset = smem_t::get_permuted_offset<num_cells_per_in_channel>(
+          tx % 16, tx / 16);
 
       // compute sfm*v
 #pragma unroll
@@ -650,12 +656,12 @@ __global__ void SinglePrefillWithKVCacheKernel(
           }
           kv_smem[1].offset = (kv_smem[1].offset ^ 0x2) + (fy & 0x1) * 8;
         }
-        kv_smem[1].offset += 16 * num_cells_per_head_in - 4 * num_frags_y;
+        kv_smem[1].offset += 16 * num_cells_per_in_channel - 4 * num_frags_y;
       }
       block.sync();
       produce_kv<num_frags_y, num_frags_z, num_warps>(
           kv_smem, 1, v, qkv_info, chunk_start + (iter + 1) * 16 * num_frags_z,
-          kv_len, kv_head_idx, tx, ty);
+          chunk_end, kv_head_idx, tx, ty);
       cp_async::commit_group();
     }
   }
@@ -762,7 +768,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
 
   // write back
   smem_t o_smem(smem);
-  o_smem.offset = smem_t::get_permuted_offset<num_cells_per_head_out>(
+  o_smem.offset = smem_t::get_permuted_offset<num_cells_per_out_channel>(
       ty * num_frags_x * 16 + tx / 4, 0);
 #pragma unroll
   for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
@@ -772,7 +778,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
           (DTypeOut*)(o_smem.base + o_smem.offset) + (tx % 4) * 2,
           &o_frag[fx][fy][0]);
       vec_cast<DTypeOut, float, 2>((DTypeOut*)(o_smem.base + o_smem.offset +
-                                               8 * num_cells_per_head_out) +
+                                               8 * num_cells_per_out_channel) +
                                        (tx % 4) * 2,
                                    &o_frag[fx][fy][2]);
       vec_cast<DTypeOut, float, 2>(
@@ -780,15 +786,15 @@ __global__ void SinglePrefillWithKVCacheKernel(
           &o_frag[fx][fy][4]);
       vec_cast<DTypeOut, float, 2>(
           (DTypeOut*)(o_smem.base + (o_smem.offset ^ 0x1) +
-                      8 * num_cells_per_head_out) +
+                      8 * num_cells_per_out_channel) +
               (tx % 4) * 2,
           &o_frag[fx][fy][6]);
       o_smem.offset = (o_smem.offset ^ 0x2) + (fy & 0x1) * 8;
     }
-    o_smem.offset += 16 * num_cells_per_head_out - num_frags_y * 4;
+    o_smem.offset += 16 * num_cells_per_out_channel - num_frags_y * 4;
   }
 
-  o_smem.offset = smem_t::get_permuted_offset<num_cells_per_head_out>(
+  o_smem.offset = smem_t::get_permuted_offset<num_cells_per_out_channel>(
       ty * num_frags_x * 16 + tx / 4, tx % 4);
   uint32_t o_idx = (bx * num_warps + ty) * num_frags_x * 16 + tx / 4;
   DTypeOut* o_ptr =
@@ -807,7 +813,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
         o_smem.offset += 8;
       }
       o_idx += 8;
-      o_smem.offset += 8 * num_cells_per_head_out - 4 * num_frags_y;
+      o_smem.offset += 8 * num_cells_per_out_channel - 4 * num_frags_y;
       o_ptr += 8 * qkv_info.get_n_stride() -
                2 * num_frags_y * cell_capacity<DTypeOut>();
     }
