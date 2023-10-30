@@ -88,11 +88,11 @@ __device__ __forceinline__ void produce_kv(
   constexpr uint32_t num_cells_per_head_in =
       num_frags_y * 16 / cell_capacity<T>();
 
-  uint32_t kv_idx = kv_idx_base + ty * 4 + (tx % 16) / 4;
+  uint32_t kv_idx = kv_idx_base + ty * 4 + tx / 8;
   smem->offset = smem_t::get_permuted_offset<num_cells_per_head_in>(
-      ty * 4 + (tx % 16) / 4, (tx / 16) * 4 + tx % 4);
-  gptr += qkv_info.get_kv_elem_offset(
-      kv_idx, head_idx, ((tx / 16) * 4 + tx % 4) * cell_capacity<T>());
+      ty * 4 + tx / 8, tx % 8);
+  gptr += qkv_info.get_kv_elem_offset(kv_idx, head_idx,
+                                      (tx % 8) * cell_capacity<T>());
 
 #pragma unroll
   for (uint32_t i = 0; i < num_frags_z * 4 / num_warps; ++i) {
