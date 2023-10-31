@@ -1047,6 +1047,9 @@ cudaError_t BatchPrefillWithPagedKVCache(
   FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
 
   for (uint32_t batch_idx = 0; batch_idx < paged_kv.batch_size; ++batch_idx) {
+    if (q_indptr_h[batch_idx] == q_indptr_h[batch_idx + 1]) {
+      continue;
+    }
     SinglePrefillWithKVCache(
         q + q_indptr_h[batch_idx] * num_qo_heads * head_dim,
         keys + kv_indptr_h[batch_idx] * num_kv_heads * head_dim,
