@@ -84,8 +84,9 @@ template <uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps,
 __device__ __forceinline__ void produce_kv(
     smem_t* smem, uint32_t stage_idx, T* gptr,
     const tensor_info_t<layout, group_size>& qkv_info,
-    const uint32_t kv_idx_base, const uint32_t kv_len, const uint32_t head_idx,
-    const uint32_t tx, const uint32_t ty) {
+    const uint32_t kv_idx_base, const uint32_t kv_len,
+    const uint32_t head_idx) {
+  const uint32_t tx = threadIdx.x, ty = threadIdx.y;
   constexpr uint32_t num_cells_per_in_channel =
       num_frags_y * 16 / cell_capacity<T>();
 
@@ -117,9 +118,10 @@ template <uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps,
 __device__ __forceinline__ void produce_half_k(
     smem_t* smem, uint32_t stage_idx, T* gptr,
     const tensor_info_t<layout, group_size>& qkv_info,
-    const uint32_t kv_idx_base, const uint32_t kv_len, const uint32_t head_idx,
-    const uint32_t tx, const uint32_t ty) {
+    const uint32_t kv_idx_base, const uint32_t kv_len,
+    const uint32_t head_idx) {
   static_assert(num_frags_y % 8 == 0);
+  const uint32_t tx = threadIdx.x, ty = threadIdx.y;
   constexpr uint32_t num_cells_per_in_channel =
       num_frags_y * 8 / cell_capacity<T>();
 
@@ -152,8 +154,9 @@ template <uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps,
 __device__ __forceinline__ void produce_half_v(
     smem_t* smem, uint32_t stage_idx, T* gptr,
     const tensor_info_t<layout, group_size>& qkv_info,
-    const uint32_t kv_idx_base, const uint32_t kv_len, const uint32_t head_idx,
-    const uint32_t tx, const uint32_t ty) {
+    const uint32_t kv_idx_base, const uint32_t kv_len,
+    const uint32_t head_idx) {
+  const uint32_t tx = threadIdx.x, ty = threadIdx.y;
   constexpr uint32_t num_cells_per_in_channel =
       num_frags_y * 16 / cell_capacity<T>();
 
@@ -354,34 +357,22 @@ __global__ void SinglePrefillWithKVCacheKernel(
 
   if constexpr (!halve_kv_smem) {
     produce_kv<num_frags_y, num_frags_z, num_warps>(
-        kv_smem, 0, k, qkv_info, chunk_start, chunk_end, kv_head_idx, tx, ty);
+        kv_smem, 0, k, qkv_info, chunk_start, chunk_end, kv_head_idx);
     cp_async::commit_group();
     produce_kv<num_frags_y, num_frags_z, num_warps>(
-        kv_smem, 1, v, qkv_info, chunk_start, chunk_end, kv_head_idx, tx, ty);
+        kv_smem, 1, v, qkv_info, chunk_start, chunk_end, kv_head_idx);
     cp_async::commit_group();
   } else {
     produce_half_k<num_frags_y, num_frags_z, num_warps>(
-        kv_smem, 0, k, qkv_info, chunk_start, chunk_end, kv_head_idx, tx, ty);
+        kv_smem, 0, k, qkv_info, chunk_start, chunk_end, kv_head_idx);
     cp_async::commit_group();
     produce_half_k<num_frags_y, num_frags_z, num_warps>(
-        kv_smem, 1, k, qkv_info, chunk_start, chunk_end, kv_head_idx, tx, ty);
+        kv_smem, 1, k, qkv_info, chunk_start, chunk_end, kv_head_idx);
     cp_async::commit_group();
   }
 
 #pragma unroll 1
   for (uint32_t iter = 0; iter < num_iterations; ++iter) {
-    // init x_frag with 0
-#pragma unroll
-    for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
-#pragma unroll
-      for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
-#pragma unroll
-        for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
-          x_frag[fx][fz][reg_id] = 0.f;
-        }
-      }
-    }
-
     if (!halve_kv_smem) {
       cp_async::wait_group<1>();
       block.sync();
@@ -423,10 +414,17 @@ __global__ void SinglePrefillWithKVCacheKernel(
           kv_idx += 16;
 #pragma unroll
           for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
-            mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
-                x_frag[fx][fz], a_frag[fx][0], b_frag[0]);
-            mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
-                x_frag[fx][fz], a_frag[fx][1], b_frag[1]);
+            if (fyi == 0) {
+              mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn, true>(
+                  x_frag[fx][fz], a_frag[fx][0], b_frag[0]);
+              mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
+                  x_frag[fx][fz], a_frag[fx][1], b_frag[1]);
+            } else {
+              mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
+                  x_frag[fx][fz], a_frag[fx][0], b_frag[0]);
+              mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
+                  x_frag[fx][fz], a_frag[fx][1], b_frag[1]);
+            }
           }
         }
         kv_smem[0].offset = (kv_smem[0].offset ^ 0x2) + (fyi & 0x1) * 8 -
@@ -441,6 +439,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
             num_cells_per_in_channel / 2;
         q_smem.offset = smem_t::get_permuted_offset<num_cells_per_in_channel>(
             ty * num_frags_x * 16 + tx % 16, tx / 16);
+
 #pragma unroll
         for (uint32_t stage_idx = 0; stage_idx < num_stages_smem; ++stage_idx) {
           cp_async::wait_group<1>();
@@ -465,8 +464,13 @@ __global__ void SinglePrefillWithKVCacheKernel(
               kv_smem[stage_idx].offset += 16 * num_cells_per_half_in_channel;
 #pragma unroll
               for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
-                mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
-                    x_frag[fx][fz], a_frag[fx], b_frag);
+                if (stage_idx ==0 && fyi == 0) {
+                  mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn, true>(
+                      x_frag[fx][fz], a_frag[fx], b_frag);
+                } else {
+                  mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
+                      x_frag[fx][fz], a_frag[fx], b_frag);
+                }
               }
             }
             kv_smem[stage_idx].offset =
@@ -477,8 +481,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
           block.sync();
           produce_half_v<num_frags_y, num_frags_z, num_warps>(
               kv_smem, stage_idx, v, qkv_info,
-              chunk_start + iter * 16 * num_frags_z, chunk_end, kv_head_idx, tx,
-              ty);
+              chunk_start + iter * 16 * num_frags_z, chunk_end, kv_head_idx);
           cp_async::commit_group();
         }
       } else {
@@ -505,8 +508,13 @@ __global__ void SinglePrefillWithKVCacheKernel(
             kv_smem[0].offset += 16 * num_cells_per_in_channel;
 #pragma unroll
             for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
-              mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
-                  x_frag[fx][fz], a_frag[fx], b_frag);
+              if (fy == 0) {
+                mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn, true>(
+                    x_frag[fx][fz], a_frag[fx], b_frag);
+              } else {
+                mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(
+                    x_frag[fx][fz], a_frag[fx], b_frag);
+              }
             }
           }
           kv_smem[0].offset = (kv_smem[0].offset ^ 0x2) + (fy & 0x1) * 8 -
@@ -619,8 +627,8 @@ __global__ void SinglePrefillWithKVCacheKernel(
         block.sync();
         produce_half_k<num_frags_y, num_frags_z, num_warps>(
             kv_smem, stage_idx, k, qkv_info,
-            chunk_start + (iter + 1) * 16 * num_frags_z, chunk_end, kv_head_idx,
-            tx, ty);
+            chunk_start + (iter + 1) * 16 * num_frags_z, chunk_end,
+            kv_head_idx);
         cp_async::commit_group();
       }
     } else {
@@ -628,7 +636,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
       block.sync();
       produce_kv<num_frags_y, num_frags_z, num_warps>(
           kv_smem, 0, k, qkv_info, chunk_start + (iter + 1) * 16 * num_frags_z,
-          chunk_end, kv_head_idx, tx, ty);
+          chunk_end, kv_head_idx);
       cp_async::commit_group();
       cp_async::wait_group<1>();
       block.sync();
@@ -661,7 +669,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
       block.sync();
       produce_kv<num_frags_y, num_frags_z, num_warps>(
           kv_smem, 1, v, qkv_info, chunk_start + (iter + 1) * 16 * num_frags_z,
-          chunk_end, kv_head_idx, tx, ty);
+          chunk_end, kv_head_idx);
       cp_async::commit_group();
     }
   }
