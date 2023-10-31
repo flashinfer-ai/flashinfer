@@ -222,7 +222,7 @@ void _FlashInferAttentionWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
                   flashinfer::BatchDecodeWithPagedKVCache<dtype_in, dtype_out>(
                       static_cast<dtype_in*>(q_data->data), cache,
                       static_cast<dtype_out*>(output->data),
-                      static_cast<float*>(tmp_buffer->data), nhead_qo,
+                      nullptr, nhead_qo,
                       flashinfer::RotaryMode(rotary_mode), rope_scale,
                       rope_theta, 0);
               if (status != cudaSuccess) {
@@ -254,7 +254,7 @@ void _FlashInferAttentionWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
                       static_cast<dtype_in*>(q_data->data), cache,
                       static_cast<dtype_idx*>(append_length_indptr->data),
                       static_cast<dtype_out*>(output->data),
-                      static_cast<float*>(tmp_buffer->data), nhead_qo,
+                      nullptr, nhead_qo,
                       /*causal=*/true, flashinfer::RotaryMode(rotary_mode),
                       rope_scale, rope_theta, 0);
               if (status != cudaSuccess) {
