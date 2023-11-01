@@ -274,13 +274,13 @@ __global__ void SingleDecodeWithKVCacheKernel(
   constexpr uint32_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
 #pragma unroll
   for (uint32_t iter = 0; iter < num_stages_smem; ++iter) {
-    cp_async::pred_load<vec_bits, true>(
+    cp_async::pred_load<vec_bits, true, false>(
         k_smem + ((iter * bdz + tz) * bdy + ty) * head_dim + tx * vec_size,
         k + info.get_kv_elem_offset(producer_kv_idx_base + tz * bdy + ty,
                                     kv_head_idx, tx * vec_size),
         producer_kv_idx_base + tz * bdy + ty < chunk_end);
     cp_async::commit_group();
-    cp_async::pred_load<vec_bits, true>(
+    cp_async::pred_load<vec_bits, true, false>(
         v_smem + ((iter * bdz + tz) * bdy + ty) * head_dim + tx * vec_size,
         v + info.get_kv_elem_offset(producer_kv_idx_base + tz * bdy + ty,
                                     kv_head_idx, tx * vec_size),
@@ -305,7 +305,7 @@ __global__ void SingleDecodeWithKVCacheKernel(
         consumer_kv_idx_base, stage_idx, sm_scale, x);
     block.sync();
     // load k
-    cp_async::pred_load<vec_bits, true>(
+    cp_async::pred_load<vec_bits, true, false>(
         k_smem + ((stage_idx * bdz + tz) * bdy + ty) * head_dim + tx * vec_size,
         k + info.get_kv_elem_offset(producer_kv_idx_base + tz * bdy + ty,
                                     kv_head_idx, tx * vec_size),
@@ -321,7 +321,7 @@ __global__ void SingleDecodeWithKVCacheKernel(
     block.sync();
 
     // load v
-    cp_async::pred_load<vec_bits, true>(
+    cp_async::pred_load<vec_bits, true, false>(
         v_smem + ((stage_idx * bdz + tz) * bdy + ty) * head_dim + tx * vec_size,
         v + info.get_kv_elem_offset(producer_kv_idx_base + tz * bdy + ty,
                                     kv_head_idx, tx * vec_size),
@@ -515,14 +515,14 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
     bool producer_pred_guard =
         (producer_entry_base + tz * bdy + ty < producer_valid_page_size) &&
         (producer_page_iter < cur_page_indptr_end);
-    cp_async::pred_load<vec_bits, true>(
+    cp_async::pred_load<vec_bits, true, false>(
         k_smem + ((stage_idx * bdz + tz) * bdy + ty) * head_dim + tx * vec_size,
         paged_kv.data + paged_kv.get_k_elem_offset(
                             producer_page_idx, kv_head_idx,
                             producer_entry_base + tz * bdy + ty, tx * vec_size),
         producer_pred_guard);
     cp_async::commit_group();
-    cp_async::pred_load<vec_bits, true>(
+    cp_async::pred_load<vec_bits, true, false>(
         v_smem + ((stage_idx * bdz + tz) * bdy + ty) * head_dim + tx * vec_size,
         paged_kv.data + paged_kv.get_v_elem_offset(
                             producer_page_idx, kv_head_idx,
@@ -561,7 +561,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
       block.sync();
 
       // load k tiles
-      cp_async::pred_load<vec_bits, true>(
+      cp_async::pred_load<vec_bits, true, false>(
           k_smem + ((stage_idx * bdz + tz) * bdy + ty) * head_dim +
               tx * vec_size,
           paged_kv.data +
@@ -580,7 +580,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
       block.sync();
 
       // load v tiles
-      cp_async::pred_load<vec_bits, true>(
+      cp_async::pred_load<vec_bits, true, false>(
           v_smem + ((stage_idx * bdz + tz) * bdy + ty) * head_dim +
               tx * vec_size,
           paged_kv.data +
