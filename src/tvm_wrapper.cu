@@ -267,3 +267,6 @@ void _FlashInferAttentionWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
 
 TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionWithPagedKVCache,
                           _FlashInferAttentionWithPagedKVCache);
+
+TVM_REGISTER_GLOBAL("paged_kv_cache.attention_kernel")
+    .set_body_typed(_FlashInferAttentionWithPagedKVCache);
