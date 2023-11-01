@@ -770,6 +770,10 @@ cudaError_t SinglePrefillWithKVCache(
                             uint32_t smem_size =
                                 (num_frags_x * num_warps + num_frags_z * 2) *
                                 16 * head_dim * sizeof(DTypeIn);
+                            FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
+                                cooperative_kernel,
+                                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                smem_size));
                             int num_blocks_per_sm = 0;
                             int num_sm = 0;
                             FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
@@ -828,10 +832,6 @@ cudaError_t SinglePrefillWithKVCache(
                                              num_rows_per_cta,
                                          num_chunks, num_qo_heads);
                               dim3 nthrs(32, num_warps);
-                              FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
-                                  cooperative_kernel,
-                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                  smem_size));
                               FLASHINFER_CUDA_CALL(cudaLaunchCooperativeKernel(
                                   (void*)cooperative_kernel, nblks, nthrs, args,
                                   smem_size, stream));
