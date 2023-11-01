@@ -1,6 +1,2 @@
-# FlashInfer: Accelerate FlashAttention Inference with KV-Parallelism
+# FlashInfer: Kernel Library for LLM Serving
 
-However, FlashAttention
-
-
-## 
