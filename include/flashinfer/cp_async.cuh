@@ -67,22 +67,16 @@ __device__ __forceinline__ void pred_load_128b(T* smem_ptr, const T* gmem_ptr,
 
   uint32_t smem_int_ptr =
       static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  int src_in_bytes = predicate ? 16 : 0;
   if constexpr (prefetch) {
     asm volatile(
-        "{\n"
-        " .reg .pred p;\n"
-        " setp.ne.b32 p, %0, 0;\n"
-        " @p cp.async.cg.shared.global.L2::128B [%1], [%2], %3;\n"
-        "}\n" ::"r"((int)predicate),
-        "r"(smem_int_ptr), "l"(gmem_ptr), "n"(16));
+        "cp.async.cg.shared.global.L2::128B [%0], [%1], %2, %3;\n" ::"r"(
+            smem_int_ptr),
+        "l"(gmem_ptr), "n"(16), "r"(src_in_bytes));
   } else {
     asm volatile(
-        "{\n"
-        " .reg .pred p;\n"
-        " setp.ne.b32 p, %0, 0;\n"
-        " @p cp.async.cg.shared.global [%1], [%2], %3;\n"
-        "}\n" ::"r"((int)predicate),
-        "r"(smem_int_ptr), "l"(gmem_ptr), "n"(16));
+        "cp.async.cg.shared.global [%0], [%1], %2, %3;\n" ::"r"(smem_int_ptr),
+        "l"(gmem_ptr), "n"(16), "r"(src_in_bytes));
   }
 #else
   if (predicate) {
