@@ -60,17 +60,18 @@ struct smem_t {
     cell_t* smem_ptr = base + offset;
     mma::ldmatrix_m8n8x4_trans(R, smem_ptr);
   }
-  template <typename T>
+  template <bool fill_zero, typename T>
   __device__ __forceinline__ void load_128b_async(const T* gptr,
                                                   bool predicate) {
     cell_t* smem_ptr = base + offset;
-    cp_async::pred_load_128b<true>(
+    cp_async::pred_load_128b<true, fill_zero>(
         smem_ptr, reinterpret_cast<const cell_t*>(gptr), predicate);
   }
-  template <typename T>
+  template <bool fill_zero, typename T>
   __device__ __forceinline__ void load_128b_async(const T* gptr) {
     cell_t* smem_ptr = base + offset;
-    cp_async::load_128b<true>(smem_ptr, reinterpret_cast<const cell_t*>(gptr));
+    cp_async::load_128b<true, fill_zero>(smem_ptr,
+                                         reinterpret_cast<const cell_t*>(gptr));
   }
   template <typename T>
   __device__ __forceinline__ void store_128b(T* gptr) {

@@ -79,8 +79,8 @@ __device__ __forceinline__ void apply_llama_rope(T* x_first_half,
 
 }  // namespace
 
-template <uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps,
-          QKVLayout layout, uint32_t group_size, typename T>
+template <bool fill_zero, uint32_t num_frags_y, uint32_t num_frags_z,
+          uint32_t num_warps, QKVLayout layout, uint32_t group_size, typename T>
 __device__ __forceinline__ void produce_kv(
     smem_t* smem, uint32_t stage_idx, T* gptr,
     const tensor_info_t<layout, group_size>& qkv_info,
@@ -101,7 +101,7 @@ __device__ __forceinline__ void produce_kv(
   for (uint32_t i = 0; i < num_frags_z * 4 / num_warps; ++i) {
 #pragma unroll
     for (uint32_t j = 0; j < num_frags_y / 4; ++j) {
-      smem[stage_idx].load_128b_async(gptr, kv_idx < kv_len);
+      smem[stage_idx].load_128b_async<fill_zero>(gptr, kv_idx < kv_len);
       smem[stage_idx].offset += 16;
       gptr += 8 * cell_capacity<T>();
     }
@@ -137,7 +137,7 @@ __device__ __forceinline__ void produce_half_k(
   for (uint32_t i = 0; i < num_frags_z * 4 / num_warps; ++i) {
 #pragma unroll
     for (uint32_t j = 0; j < num_frags_y / 8; ++j) {
-      smem[stage_idx].load_128b_async(gptr, kv_idx < kv_len);
+      smem[stage_idx].load_128b_async<false>(gptr, kv_idx < kv_len);
       smem[stage_idx].offset += 16;
       gptr += 8 * cell_capacity<T>();
     }
@@ -171,7 +171,7 @@ __device__ __forceinline__ void produce_half_v(
   for (uint32_t i = 0; i < num_frags_z * 2 / num_warps; ++i) {
 #pragma unroll
     for (uint32_t j = 0; j < num_frags_y / 4; ++j) {
-      smem[stage_idx].load_128b_async(gptr, kv_idx < kv_len);
+      smem[stage_idx].load_128b_async<true>(gptr, kv_idx < kv_len);
       smem[stage_idx].offset += 16;
       gptr += 8 * cell_capacity<T>();
     }
@@ -274,7 +274,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
 #pragma unroll
       for (uint32_t fyo = 0; fyo < num_frags_y / 2; ++fyo) {
         // load q fragment from gmem to smem
-        q_smem.load_128b_async(q_ptr, q_idx < qo_len);
+        q_smem.load_128b_async<false>(q_ptr, q_idx < qo_len);
         q_smem.offset += 8;
         q_ptr += 4 * cell_capacity<DTypeIn>();
       }
@@ -356,10 +356,10 @@ __global__ void SinglePrefillWithKVCacheKernel(
       (16 * num_frags_z);
 
   if constexpr (!halve_kv_smem) {
-    produce_kv<num_frags_y, num_frags_z, num_warps>(
+    produce_kv<false, num_frags_y, num_frags_z, num_warps>(
         kv_smem, 0, k, qkv_info, chunk_start, chunk_end, kv_head_idx);
     cp_async::commit_group();
-    produce_kv<num_frags_y, num_frags_z, num_warps>(
+    produce_kv<true, num_frags_y, num_frags_z, num_warps>(
         kv_smem, 1, v, qkv_info, chunk_start, chunk_end, kv_head_idx);
     cp_async::commit_group();
   } else {
@@ -464,7 +464,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
               kv_smem[stage_idx].offset += 16 * num_cells_per_half_in_channel;
 #pragma unroll
               for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
-                if (stage_idx ==0 && fyi == 0) {
+                if (stage_idx == 0 && fyi == 0) {
                   mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn, true>(
                       x_frag[fx][fz], a_frag[fx], b_frag);
                 } else {
@@ -634,7 +634,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
     } else {
       // not halve kv smem
       block.sync();
-      produce_kv<num_frags_y, num_frags_z, num_warps>(
+      produce_kv<false, num_frags_y, num_frags_z, num_warps>(
           kv_smem, 0, k, qkv_info, chunk_start + (iter + 1) * 16 * num_frags_z,
           chunk_end, kv_head_idx);
       cp_async::commit_group();
@@ -667,7 +667,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
         kv_smem[1].offset += 16 * num_cells_per_in_channel - 4 * num_frags_y;
       }
       block.sync();
-      produce_kv<num_frags_y, num_frags_z, num_warps>(
+      produce_kv<true, num_frags_y, num_frags_z, num_warps>(
           kv_smem, 1, v, qkv_info, chunk_start + (iter + 1) * 16 * num_frags_z,
           chunk_end, kv_head_idx);
       cp_async::commit_group();

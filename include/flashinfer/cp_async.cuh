@@ -59,7 +59,7 @@ __device__ __forceinline__ void load_128b(T* smem_ptr, const T* gmem_ptr) {
 #endif
 }
 
-template <bool prefetch, typename T>
+template <bool prefetch, bool fill_zero, typename T>
 __device__ __forceinline__ void pred_load_128b(T* smem_ptr, const T* gmem_ptr,
                                                bool predicate) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && \
@@ -67,20 +67,44 @@ __device__ __forceinline__ void pred_load_128b(T* smem_ptr, const T* gmem_ptr,
 
   uint32_t smem_int_ptr =
       static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-  int src_in_bytes = predicate ? 16 : 0;
-  if constexpr (prefetch) {
-    asm volatile(
-        "cp.async.cg.shared.global.L2::128B [%0], [%1], %2, %3;\n" ::"r"(
-            smem_int_ptr),
-        "l"(gmem_ptr), "n"(16), "r"(src_in_bytes));
+  if constexpr (fill_zero) {
+    int src_in_bytes = predicate ? 16 : 0;
+    if constexpr (prefetch) {
+      asm volatile(
+          "cp.async.cg.shared.global.L2::128B [%0], [%1], %2, %3;\n" ::"r"(
+              smem_int_ptr),
+          "l"(gmem_ptr), "n"(16), "r"(src_in_bytes));
+    } else {
+      asm volatile(
+          "cp.async.cg.shared.global [%0], [%1], %2, %3;\n" ::"r"(smem_int_ptr),
+          "l"(gmem_ptr), "n"(16), "r"(src_in_bytes));
+    }
   } else {
-    asm volatile(
-        "cp.async.cg.shared.global [%0], [%1], %2, %3;\n" ::"r"(smem_int_ptr),
-        "l"(gmem_ptr), "n"(16), "r"(src_in_bytes));
+    if constexpr (prefetch) {
+      asm volatile(
+          "{\n"
+          " .reg .pred p;\n"
+          " setp.ne.b32 p, %0, 0;\n"
+          " @p cp.async.cg.shared.global.L2::128B [%1], [%2], %3;\n"
+          "}\n" ::"r"((int)predicate),
+          "r"(smem_int_ptr), "l"(gmem_ptr), "n"(16));
+    } else {
+      asm volatile(
+          "{\n"
+          " .reg .pred p;\n"
+          " setp.ne.b32 p, %0, 0;\n"
+          " @p cp.async.cg.shared.global [%1], [%2], %3;\n"
+          "}\n" ::"r"((int)predicate),
+          "r"(smem_int_ptr), "l"(gmem_ptr), "n"(16));
+    }
   }
 #else
   if (predicate) {
     *((uint4*)smem_ptr) = *((uint4*)gmem_ptr);
+  } else {
+    if constexpr (fill_zero) {
+      *((uint4*)smem_ptr) = make_uint4(0, 0, 0, 0);
+    }
   }
 #endif
 }
