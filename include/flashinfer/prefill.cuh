@@ -446,6 +446,10 @@ __global__ void SinglePrefillWithKVCacheKernel(
       }
     }
 
+    // Disable instruction reordering across this fence to mitigate register
+    // spill
+    __threadfence_block();
+
     block.sync();
     produce_kv<false, num_frags_y, num_frags_z, num_warps>(
         &k_smem, k, qkv_info, chunk_start + (iter + 1) * 16 * num_frags_z,
