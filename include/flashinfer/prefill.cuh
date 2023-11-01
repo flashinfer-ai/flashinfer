@@ -650,62 +650,93 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
     uint32_t num_kv_heads, uint32_t qo_len, uint32_t kv_len, uint32_t head_dim,
     bool causal = true, QKVLayout layout = QKVLayout::kNHD,
     RotaryMode rotary_mode = RotaryMode::kNone, cudaStream_t stream = nullptr) {
+  assert(kv_len >= qo_len);
+
   SWITCH_NUM_FRAGS_X(
-      qo_len > 64, NUM_FRAGS_X,
+      qo_len > 64, num_frags_x,
       {SWITCH_GQA_GROUP_SIZE(
           num_qo_heads / num_kv_heads, GROUP_SIZE,
           {SWITCH_CAUSAL(
-              causal, CAUSAL,
-              {SWITCH_HEAD_DIM(
-                  head_dim, HEAD_DIM,
-                  {SWITCH_ROTARY_MODE(
-                      rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(layout, LAYOUT, {
-                        constexpr uint32_t num_frags_x = NUM_FRAGS_X;
-                        constexpr uint32_t num_frags_y = HEAD_DIM / 16;
-                        constexpr uint32_t num_frags_z = 4;
-                        constexpr uint32_t num_warps = 4UL;
-                        constexpr uint32_t num_threads = num_warps * warp_size;
-                        constexpr uint32_t num_rows_per_cta =
-                            num_frags_x * num_warps * 16;
-                        auto cooperative_kernel =
-                            SinglePrefillWithKVCacheKernel<
-                                true, GROUP_SIZE, CAUSAL, LAYOUT, ROTARY_MODE,
-                                num_frags_x, num_frags_y, num_frags_z,
-                                num_warps, DTypeIn, DTypeOut>;
-                        uint32_t smem_size =
-                            (num_frags_x * num_warps + 2 * num_frags_z) * 16 *
-                            head_dim * sizeof(DTypeIn);
-                        int num_blocks_per_sm = 0;
-                        int num_sm = 0;
-                        int dev_id = 0;
-                        FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
-                        FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
-                            &num_sm, cudaDevAttrMultiProcessorCount, dev_id));
-                        FLASHINFER_CUDA_CALL(
-                            cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                                &num_blocks_per_sm, cooperative_kernel,
-                                num_threads, smem_size));
-                        max_grid_size = num_blocks_per_sm * num_sm;
-                        uint32_t num_chunks =
-                            min((num_blocks_per_sm * num_sm) /
-                                    (num_qo_heads *
-                                     (qo_len + (num_rows_per_cta - 1)) /
-                                     num_rows_per_cta),
-                                kv_len / 512);
-                        if (num_chunks > 1) {
-                          uint32_t grid_size =
-                              32 * num_warps *
-                              ((qo_len + (num_rows_per_cta - 1)) /
-                               num_rows_per_cta) *
-                              num_chunks * num_qo_heads;
-                          tmp_size = sizeof(float) *
-                                     (4 * num_frags_x +
-                                      num_frags_x * num_frags_y * 8) *
-                                     grid_size;
-                        } else {
-                          tmp_size = 0;
-                        }
-                      })})})})})});
+              causal, CAUSAL, {SWITCH_HEAD_DIM_PREFILL(head_dim, HEAD_DIM, {
+                constexpr uint32_t num_frags_y = HEAD_DIM / 16;
+                SWITCH_ROTARY_MODE(
+                    rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(layout, LAYOUT, {
+                      int dev_id = 0;
+                      FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+                      int max_smem_per_sm = 0;
+                      FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
+                          &max_smem_per_sm,
+                          cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
+                      // we expect each sm execute two threadblocks
+                      const int max_smem_per_threadblock = max_smem_per_sm / 2;
+
+                      constexpr uint32_t num_warps = 4UL;
+                      const uint32_t max_num_frags_z_reg =
+                          (HEAD_DIM == 128 && num_frags_x == 2 &&
+                           ROTARY_MODE == RotaryMode::kLlama)
+                              ? 2
+                              : 4;
+                      const uint32_t max_num_frags_z_smem =
+                          (max_smem_per_threadblock /
+                               (16 * head_dim * sizeof(DTypeIn)) -
+                           num_frags_x * num_warps) /
+                          2;
+
+                      // control num_frags_z for maximum warp occupancy
+                      SWITCH_NUM_FRAGS_Z(
+                          min(max_num_frags_z_smem, max_num_frags_z_reg),
+                          num_frags_z, {
+                            constexpr uint32_t num_threads =
+                                num_warps * warp_size;
+                            constexpr uint32_t num_rows_per_cta =
+                                num_frags_x * num_warps * 16;
+                            auto cooperative_kernel =
+                                SinglePrefillWithKVCacheKernel<
+                                    true, GROUP_SIZE, CAUSAL, LAYOUT,
+                                    ROTARY_MODE, num_frags_x, num_frags_y,
+                                    num_frags_z, num_warps, DTypeIn, DTypeOut>;
+                            tensor_info_t<LAYOUT, GROUP_SIZE> qkv_info(
+                                qo_len, kv_len, num_kv_heads, HEAD_DIM);
+                            uint32_t smem_size =
+                                (num_frags_x * num_warps + num_frags_z * 2) *
+                                16 * head_dim * sizeof(DTypeIn);
+                            FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
+                                cooperative_kernel,
+                                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                smem_size));
+                            int num_blocks_per_sm = 0;
+                            int num_sm = 0;
+                            FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
+                                &num_sm, cudaDevAttrMultiProcessorCount,
+                                dev_id));
+                            FLASHINFER_CUDA_CALL(
+                                cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                                    &num_blocks_per_sm, cooperative_kernel,
+                                    num_threads, smem_size));
+                            uint32_t num_chunks =
+                                min((num_blocks_per_sm * num_sm) /
+                                        (num_qo_heads *
+                                         (qo_len + (num_rows_per_cta - 1)) /
+                                         num_rows_per_cta),
+                                    kv_len / 512);
+
+                            max_grid_size = num_blocks_per_sm * num_sm;
+                            if (num_chunks > 1) {
+                              uint32_t grid_size =
+                                  32 * num_warps *
+                                  ((qo_len + (num_rows_per_cta - 1)) /
+                                   num_rows_per_cta) *
+                                  num_chunks * num_qo_heads;
+                              tmp_size = sizeof(float) *
+                                         (4 * num_frags_x +
+                                          num_frags_x * num_frags_y * 8) *
+                                         grid_size;
+                            } else {
+                              tmp_size = 0;
+                            }
+                          })
+                    })})
+              })})})});
   return cudaSuccess;
 }
 
