@@ -39,10 +39,25 @@ constexpr uint32_t warp_size = 32;
 
 namespace {
 
+/*!
+ * \brief Return x - y if x > y, otherwise return 0.
+ */
 __device__ __forceinline__ uint32_t sub_if_greater_or_zero(uint32_t x, uint32_t y) {
   return (x > y) ? x - y : 0U;
 }
 
+/*!
+ * \brief Apply Llama style rotary embedding to two 16x16 fragments.
+ * \tparam row_major Whether the input fragments are row major or not.
+ * \tparam T The data type of the input fragments.
+ * \param x_first_half First fragment x[offset:offset+16, j*16:(j+1)*16]
+ * \param x_second_half Second fragment x[offset:offset*16, j*16+d/2:(j+1)*16+d/2]
+ * \param rope_freq Rope frequency
+ * \param offset The offset of the first row in both fragments.
+ * \param scale A scale factor applied to the result (used to multiply sm_scale).
+ * \note The sin/cos computation is slow, especially for A100 GPUs which has low
+ *   non tensor-ops flops, will optimize in the future.
+ */
 template <bool row_major, typename T>
 __device__ __forceinline__ void apply_llama_rope(T* x_first_half, T* x_second_half,
                                                  const float* rope_freq, uint32_t offset,
@@ -73,6 +88,22 @@ __device__ __forceinline__ void apply_llama_rope(T* x_first_half, T* x_second_ha
 
 }  // namespace
 
+/*!
+ * \brief Produce k/v fragments from global memory to shared memory.
+ * \tparam fill_zero Whether to fill zero for out-of-boundary elements in pred_load.
+ * \tparam num_frags_y The number of fragments in y dimension.
+ * \tparam num_frags_z The number of fragments in z dimension.
+ * \tparam num_warps The number of warps in the threadblock.
+ * \tparam layout The layout of the input tensor.
+ * \tparam group_size The number of qo heads that maps to a kv head (used in GQA).
+ * \tparam T The data type of the input tensor.
+ * \param smem The shared memory to store kv fragments.
+ * \param gptr The global memory pointer.
+ * \param qkv_info The tensor info of the input tensor.
+ * \param kv_idx_base The base kv index.
+ * \param kv_len The length of kv tensor.
+ * \param head_idx The index of the kv head.
+ */
 template <bool fill_zero, uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps,
           QKVLayout layout, uint32_t group_size, typename T>
 __device__ __forceinline__ void produce_kv(smem_t* smem, T* gptr,
@@ -100,6 +131,31 @@ __device__ __forceinline__ void produce_kv(smem_t* smem, T* gptr,
   }
 }
 
+/*!
+ * \brief FlashAttention prefill CUDA kernel for a single request.
+ * \tparam cooperative Whether to use cooperative kernel (split kv_len into chunks).
+ * \tparam group_size The number of qo heads that maps to a kv head (used in GQA).
+ * \tparam causal Whether to use causal attention.
+ * \tparam layout The layout of the input tensor.
+ * \tparam rotary_mode The rotary mode.
+ * \tparam num_frags_x The number of fragments in x dimension.
+ * \tparam num_frags_y The number of fragments in y dimension.
+ * \tparam num_frags_z The number of fragments in z dimension.
+ * \tparam num_warps The number of warps in the threadblock.
+ * \tparam DTypeIn The data type of the input tensor.
+ * \tparam DTypeOut The data type of the output tensor.
+ * \param q The query tensor.
+ * \param k The key tensor.
+ * \param v The value tensor.
+ * \param o The output tensor.
+ * \param tmp The temporary buffer (used in cooperative kernels).
+ * \param qkv_info The tensor info of the input tensor.
+ * \param sm_scale The scale factor applied to the softmax score.
+ * \param log2_rope_inv_scale log2(1/(rope_scale)), where rope_scale is the scaling
+ *   factor used in RoPE interpolation.
+ * \param log2_rope_inv_theta log2(1/(rope_theta)), where rope_theta is the theta
+ *   used in RoPE.
+ */
 template <bool cooperative, uint32_t group_size, bool causal, QKVLayout layout,
           RotaryMode rotary_mode, uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z,
           uint32_t num_warps, typename DTypeIn, typename DTypeOut>
@@ -412,8 +468,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
       }
     }
 
-    // Disable instruction reordering across this fence to mitigate register
-    // spill
+    // Disable instruction reordering across this fence to mitigate register spill
     __threadfence_block();
 
     block.sync();
@@ -593,6 +648,23 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
   }
 }
 
+/*!
+ * \brief Estimate the temporary storage size for SinglePrefillWithKVCacheKernel, and the maximum
+ *   grid size that can be used in a cooperative kernel.
+ * \tparam DTypeIn The data type of input
+ * \tparam DTypeOut The data type of output
+ * \param tmp_size The estimated temporary storage size, return 0 if not use cooperative kernel.
+ * \param max_grid_size The maximum grid size that can be used in a cooperative kernel.
+ * \param num_qo_heads The number of query and output heads.
+ * \param num_kv_heads The number of key and value heads.
+ * \param qo_len The length of query and output.
+ * \param kv_len The length of key and value.
+ * \param head_dim The dimension of each head.
+ * \param causal Whether to use causal attention.
+ * \param layout The layout of input and output.
+ * \param rotary_mode The rotary mode.
+ * \param stream The cuda stream to execute the kernel on.
+ */
 template <typename DTypeIn, typename DTypeOut>
 cudaError_t SinglePrefillWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& max_grid_size,
                                                    uint32_t num_qo_heads, uint32_t num_kv_heads,
@@ -675,6 +747,27 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t&
   return cudaSuccess;
 }
 
+/*!
+ * \brief FlashAttention prefill CUDA function for a single request.
+ * \tparam DTypeIn The data type of input
+ * \tparam DTypeOut The data type of output
+ * \param q The query tensor.
+ * \param k The key tensor.
+ * \param v The value tensor.
+ * \param o The output tensor.
+ * \param tmp The temporary storage (only used for cooperative kernel).
+ * \param num_qo_heads The number of query and output heads.
+ * \param num_kv_heads The number of key and value heads.
+ * \param qo_len The length of query and output.
+ * \param kv_len The length of key and value.
+ * \param head_dim The dimension of each head.
+ * \param causal Whether to use causal attention.
+ * \param layout The layout of input and output.
+ * \param rotary_mode The rotary mode.
+ * \param rope_scale The scaling factor used in RoPE interpolation.
+ * \param rope_theta The theta used in RoPE.
+ * \param stream The cuda stream to execute the kernel on.
+ */
 template <typename DTypeIn, typename DTypeOut>
 cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o, float* tmp,
                                      uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t qo_len,
@@ -788,6 +881,25 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOu
   return cudaSuccess;
 }
 
+/*!
+ * \brief FlashAttention prefill CUDA function for multiple requests.
+ * \tparam DTypeIn The data type of input
+ * \tparam DTypeOut The data type of output
+ * \tparam IdType The data type of index
+ * \param q The query tensor.
+ * \param paged_kv The paged kv-cache data structure.
+ * \param q_indptr The index pointer of queries.
+ * \param o The output tensor.
+ * \param tmp The temporary storage (only used for cooperative kernel).
+ * \param num_qo_heads The number of query and output heads.
+ * \param causal Whether to use causal attention.
+ * \param rotary_mode The rotary mode.
+ * \param rope_scale The scaling factor used in RoPE interpolation.
+ * \param rope_theta The theta used in RoPE.
+ * \param stream The cuda stream to execute the kernel on.
+ * \note This implementation is not optimized, we will provide a much faster implementation in the
+ *   future.
+ */
 template <typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithPagedKVCache(DTypeIn* q, paged_kv_t<DTypeIn, IdType> paged_kv,
                                          IdType* q_indptr, DTypeOut* o, float* tmp,
