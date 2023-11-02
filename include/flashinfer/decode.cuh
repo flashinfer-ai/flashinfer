@@ -73,21 +73,22 @@ __device__ __forceinline__ vec_t<float, vec_size> apply_llama_rope(
 }
 
 /*!
- * \brief Load k tile from smem and compute qk.
+ * \brief Load k tile from smem and compute qk
  * \tparam rotary_mode The rotary mode used in the kernel
  * \tparam head_dim A template integer indicates the head dimension
  * \tparam vec_size A template integer indicates the vector size
  * \tparam bdx A template integer indicates the block size in x dimension
+ * \tparam bdy A template integer indicates the block size in y dimension
  * \tparam T A template type indicates the input data type
  * \param smem A pointer to the start of shared memory
  * \param q_vec A vector of float indicates the thread-local query vector
  * \param freq A vector of float indicates the thread-local rope frequency
  * \param kv_shared_offset An array of uint32_t indicates the k/v tiles offset
- * in shared memory of different pipeline stages \param kv_idx A integer
- * indicates the thread-local kv position in kv-cache. \param compute_stage_idx
- * A integer indicates the compute stage index in the pipeline \param sm_scale A
- * float indicates the scale applied to pre-softmax logits \param x A float
- * indicates the thread-local result of qk
+ *   in shared memory of different pipeline stages
+ * \param kv_idx A integer indicates the thread-local kv position in kv-cache
+ * \param compute_stage_idx A integer indicates the compute stage index in the pipeline
+ * \param sm_scale A float indicates the scale applied to pre-softmax logits
+ * \param x A float indicates the thread-local result of qk
  */
 template <RotaryMode rotary_mode, uint32_t vec_size, uint32_t bdx, uint32_t bdy, typename T>
 __device__ __forceinline__ void compute_qk(const T* smem, const vec_t<float, vec_size>& q_vec,
@@ -118,18 +119,19 @@ __device__ __forceinline__ void compute_qk(const T* smem, const vec_t<float, vec
 }
 
 /*!
- * \brief Load v tile from shared memory and update partial state.
+ * \brief Load v tile from shared memory and update partial state
  * \tparam vec_size A template integer indicates the vector size
  * \tparam bdx A template integer indicates the block size in x dimension
+ * \tparam bdy A template integer indicates the block size in y dimension
  * \tparam T A template type indicates the input data type
  * \tparam norm_on_the_fly Whether to normalize on the fly or not
  * \param smem A pointer to the start of shared memory
  * \param x A float indicates the pre-softmax logits
  * \param kv_shared_offset An array of uint32_t indicates the k/v tiles offset
- * in shared memory of different pipeline stages. \param compute_stage_idx A
- * integer indicates the compute stage index in the pipeline \param pred_guard A
- * boolean indicates whether the current thread is in the valid range \param s
- * The flashattention state to be updated
+ * in shared memory of different pipeline stages
+ * \param compute_stage_idx A integer indicates the compute stage index in the pipeline
+ * \param pred_guard A boolean indicates whether the current thread is in the valid range
+ * \param s The flashattention state to be updated
  */
 template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, typename T, bool norm_on_the_fly>
 __device__ __forceinline__ void update_partial_state(const T* smem, const float* x,
@@ -182,8 +184,7 @@ __device__ __forceinline__ void sync_state(state_t<vec_size, norm_on_the_fly>& s
 }  // namespace
 
 /*!
- * \brief FlashAttention decoding cuda kernel with kv-cache for a single
- * sequence, fused with RoPE.
+ * \brief FlashAttention decoding cuda kernel with kv-cache for a single request
  * \tparam layout The layout of k/v matrices (NHD or HND)
  * \tparam cooperative Whether to use cooperative kernel or not
  * \tparam norm_on_the_fly Whether to normalize on the fly or not
@@ -201,10 +202,10 @@ __device__ __forceinline__ void sync_state(state_t<vec_size, norm_on_the_fly>& s
  * \param info The tensor info of k/v matrices
  * \param sm_scale A float indicates the scale applied to pre-softmax logits
  * \param head_dim A integer indicates the head dimension
- * \param rope_inv_scale A floating number indicate the multiplicative inverse
+ * \param rope_rcp_scale A floating number indicate the reciprocal
  *   of scaling ratio used in PI(Position Interpolation) for RoPE (Rotary
  *   Positional Embeddings)
- * \param rope_inv_theta A floating number indicate the multiplicative inverse
+ * \param rope_rcp_theta A floating number indicate the reciprocal
  *   of "theta" used in RoPE (Rotary Positional Embeddings)
  * \param kv_chunk_size A integer indicates the kv-chunk size
  */
@@ -215,7 +216,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
                                               DTypeIn* __restrict__ v, DTypeOut* __restrict__ o,
                                               float* __restrict__ tmp,
                                               tensor_info_t<layout, bdy> info, float sm_scale,
-                                              float rope_inv_scale, float rope_inv_theta,
+                                              float rope_rcp_scale, float rope_rcp_theta,
                                               uint32_t kv_chunk_size) {
   auto block = cg::this_thread_block();
   auto grid = cg::this_grid();
@@ -241,8 +242,8 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
       freq[i] =
-          rope_inv_scale *
-          powf(rope_inv_theta, float(2 * ((tx * vec_size + i) % (head_dim / 2))) / float(head_dim));
+          rope_rcp_scale *
+          powf(rope_rcp_theta, float(2 * ((tx * vec_size + i) % (head_dim / 2))) / float(head_dim));
     }
     // apply rotary embedding to q matrix
     q_vec = apply_llama_rope<vec_size, bdx>(q + info.get_qo_elem_offset(0, qo_head_idx, 0), freq,
@@ -360,6 +361,22 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
   }
 }
 
+/*!
+ * \brief Advance the page iterator
+ * \tparam DType A template type indicates the input data type
+ * \tparam IdType A template type indicates the index data type
+ * \param paged_kv The PagedKVCache data structure
+ * \param kv_idx_base The k/v tiles offset in shared memory of different pipeline stages
+ * \param valid_page_size The valid page size of different pipeline stages
+ * \param producer_valid_page_size The valid page size of the producer
+ * \param producer_entry_base The entry base of the producer
+ * \param producer_page_iter The page iterator of the producer
+ * \param producer_page_idx The page index of the producer
+ * \param cur_page_indptr_begin The begin index of the current page indptr
+ * \param cur_page_indptr_end The end index of the current page indptr
+ * \param batch_idx The batch index
+ * \param stage_idx The stage index
+ */
 template <typename DType, typename IdType>
 __forceinline__ __device__ void AdvancePageIterator(
     paged_kv_t<DType, IdType> paged_kv, uint32_t* kv_idx_base, uint32_t* valid_page_size,
@@ -382,24 +399,25 @@ __forceinline__ __device__ void AdvancePageIterator(
 }
 
 /*!
- * \brief FlashAttention decoding cuda kernel with PagedKVCcache for batch
- * requests, fused with RoPE. \tparam cooperative Whether to use cooperative
- * kernel or not \tparam rotary_mode The rotary mode \tparam norm_on_the_fly
- * Whether to normalize on the fly or not \tparam vec_size A template integer
- * indicates the vector size \tparam bdx A template integer indicates the block
- * size in x dimension \tparam bdy A template integer indicates the block size
- * in y dimension \tparam bdz A template integer indicates the block size in z
- * dimension \tparam DTypeIn A template type indicates the input data type
+ * \brief FlashAttention decoding cuda kernel with PagedKVCcache for multiple requests
+ * \tparam cooperative Whether to use cooperative kernel or not
+ * \tparam rotary_mode The rotary mode
+ * \tparam norm_on_the_fly Whether to normalize on the fly or not
+ * \tparam vec_size A template integer indicates the vector size
+ * \tparam bdx A template integer indicates the block size in x dimension
+ * \tparam bdy A template integer indicates the block size in y dimension
+ * \tparam bdz A template integer indicates the block size in z dimension
+ * \tparam DTypeIn A template type indicates the input data type
  * \tparam DTypeOut A template type indicates the output data type
  * \tparam IdType A template type indicates the index data type
  * \param q [batch_size, num_qo_heads, head_dim] The query matrix
  * \param paged_kv The PagedKVCache data structure
  * \param o [num_qo_heads, head_dim] The output matrix
  * \param sm_scale A float indicates the scale applied to pre-softmax logits
- * \param rope_inv_scale A floating number indicate the multiplicative inverse
+ * \param rope_rcp_scale A floating number indicate the reciprocal
  *   of scaling ratio used in PI(Position Interpolation) for RoPE (Rotary
  *   Positional Embeddings)
- * \param rope_inv_theta A floating number indicate the multiplicative inverse
+ * \param rope_rcp_theta A floating number indicate the reciprocal
  *   of "theta" used in RoPE (Rotary Positional Embeddings)
  */
 template <bool cooperative, RotaryMode rotary_mode, bool norm_on_the_fly, uint32_t num_stages_smem,
@@ -408,8 +426,8 @@ template <bool cooperative, RotaryMode rotary_mode, bool norm_on_the_fly, uint32
 __global__ void BatchDecodeWithPagedKVCacheKernel(DTypeIn* __restrict__ q,
                                                   paged_kv_t<DTypeIn, IdType> paged_kv,
                                                   DTypeOut* __restrict__ o, float* __restrict__ tmp,
-                                                  float sm_scale, float rope_inv_scale,
-                                                  float rope_inv_theta) {
+                                                  float sm_scale, float rope_rcp_scale,
+                                                  float rope_rcp_theta) {
   auto block = cg::this_thread_block();
   sm_scale *= math::log2e;
 
@@ -438,8 +456,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(DTypeIn* __restrict__ q,
   if constexpr (rotary_mode == RotaryMode::kLlama) {
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
-      freq[i] = rope_inv_scale *
-                __powf(rope_inv_theta,
+      freq[i] = rope_rcp_scale *
+                __powf(rope_rcp_theta,
                        float(2 * ((tx * vec_size + i) % (head_dim / 2))) / float(head_dim));
     }
     // apply rotary embedding to q matrix
@@ -596,6 +614,11 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(DTypeIn* __restrict__ q,
   }
 }
 
+/*!
+ * \brief Get the heuristic number of threads per threadblock
+ * \param group_size The number of qo heads that maps to the same kv head in GQA.
+ * \param sizeof_dtype The size (in terms of bytes) of the input data type
+ */
 constexpr uint32_t get_heuristic_num_threads(uint32_t group_size, uint32_t sizeof_dtype) {
   if (group_size == 8U) {
     if (sizeof_dtype == 1U) {
@@ -608,6 +631,22 @@ constexpr uint32_t get_heuristic_num_threads(uint32_t group_size, uint32_t sizeo
   }
 }
 
+/*!
+ * \brief Esitmate the temporary buffer size and the maximum grid size for the
+ *   cooperative SingleDecodeWithKVCache kernel
+ * \tparam DTypeIn A template type indicates the input data type
+ * \tparam DTypeOut A template type indicates the output data type
+ * \param tmp_size The estimated temporary buffer size, return 0 if not use cooperative kernel
+ * \param max_grid_size The maximum grid size that can be used in a cooperative kernel
+ * \param num_qo_heads A integer indicates the number of heads of query and output
+ * \param num_kv_heads A integer indicates the number of heads of key and value
+ * \param seq_len A integer indicates the sequence length
+ * \param head_dim A integer indicates the head dimension
+ * \param layout The layout of q/k/v matrices
+ * \param rotary_mode The rotary mode
+ * \param stream The cuda stream to launch the kernel
+ * \return status Indicates whether CUDA calls are successful
+ */
 template <typename DTypeIn, typename DTypeOut>
 cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& max_grid_size,
                                                   uint32_t num_qo_heads, uint32_t num_kv_heads,
@@ -663,24 +702,26 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& 
 }
 
 /*!
- * \brief FlashAttention decoding with kv-cache for a single sequence
+ * \brief FlashAttention decoding with kv-cache for a single request
  * \tparam DTypeIn A template type indicates the input data type
  * \tparam DTypeOut A template type indicates the output data type
  * \param q The query matrix, shape: [num_qo_heads, head_dim]
  * \param k The key matrix in kv-cache, shape: [seq_len, num_kv_heads, head_dim]
  *   for NHD layout, [num_kv_heads, head_dim, seq_len] for HND layout
  * \param v The value matrix in kv-cache, shape: [seq_len, num_kv_heads,
- * head_dim] for NHD layout, [num_kv_heads, head_dim, seq_len] for HND layout
+ *   head_dim] for NHD layout, [num_kv_heads, head_dim, seq_len] for HND layout
  * \param o The output matrix, shape: [num_qo_heads, head_dim]
  * \param tmp Used-allocated temporary buffer
- * \param num_qo_heads A integer indicates the number of heads of query and
- * output \param num_kv_heads A integer indicates the number of heads of key and
- * value \param seq_len A integer indicates the sequence length \param head_dim
- * A integer indicates the head dimension \param layout The layout of q/k/v
- * matrices. \param rotary_mode The rotary mode \param rope_scale A floating
- * point number indicate the scaling ratio used in RoPE Interpolation. \param
- * rope_theta A floating point number indicate the "theta" used in RoPE \param
- * stream The cuda stream to launch the kernel
+ * \param num_qo_heads A integer indicates the number of heads of query and output
+ * \param num_kv_heads A integer indicates the number of heads of key and value
+ * \param seq_len A integer indicates the sequence length
+ * \param head_dim A integer indicates the head dimension
+ * \param layout The layout of q/k/v matrices
+ * \param rotary_mode The rotary mode
+ * \param rope_scale The scaling factor used in RoPE Interpolation
+ * \param rope_theta The theta used in RoPE
+ * \param stream The cuda stream to launch the kernel
+ * \return status Indicates whether CUDA calls are successful
  */
 template <typename DTypeIn, typename DTypeOut>
 cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o, float* tmp,
@@ -690,8 +731,8 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                                     float rope_scale = 1.f, float rope_theta = 1e4,
                                     cudaStream_t stream = nullptr) {
   const float sm_scale = 1.f / std::sqrt(float(head_dim));
-  const float rope_inv_scale = 1.f / rope_scale;
-  const float rope_inv_theta = 1.f / rope_theta;
+  const float rope_rcp_scale = 1.f / rope_scale;
+  const float rope_rcp_theta = 1.f / rope_theta;
   constexpr bool norm_on_the_fly = false;
   assert(num_qo_heads % num_kv_heads == 0);
 
@@ -731,8 +772,8 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                                   (void*)&tmp,
                                   (void*)&info,
                                   (void*)&sm_scale,
-                                  (void*)&rope_inv_scale,
-                                  (void*)&rope_inv_theta,
+                                  (void*)&rope_rcp_scale,
+                                  (void*)&rope_rcp_theta,
                                   (void*)&seq_len};
                   FLASHINFER_CUDA_CALL(
                       cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
@@ -769,8 +810,8 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                                   (void*)&tmp,
                                   (void*)&info,
                                   (void*)&sm_scale,
-                                  (void*)&rope_inv_scale,
-                                  (void*)&rope_inv_theta,
+                                  (void*)&rope_rcp_scale,
+                                  (void*)&rope_rcp_theta,
                                   (void*)&kv_chunk_size};
                   FLASHINFER_CUDA_CALL(cudaLaunchCooperativeKernel((void*)kernel, nblks, nthrs,
                                                                    args, smem_size, stream));
@@ -779,6 +820,18 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
   return cudaSuccess;
 }
 
+/*!
+ * \brief Split Paged KV-Cache into multiple chunks on KV sequence length
+ * \tparam DTypeIn A template type indicates the input data type
+ * \tparam IdType A template type indicates the index data type
+ * \param old_batch_size The batch size of the old Paged KV-Cache
+ * \param old_page_indptr_h The host-side page indptr of the old Paged KV-Cache
+ * \param old_last_page_offset_h The host-side last page offset of the old Paged KV-Cache
+ * \param max_num_pages_per_batch The maximum number of pages per batch
+ * \param new_paged_kv_d The device-side new Paged KV-Cache
+ * \param stream The cuda stream to launch the kernel
+ * \return status Indicates whether CUDA calls are successful
+ */
 template <typename DTypeIn, typename IdType>
 cudaError_t SplitPagedKVCache(uint32_t old_batch_size, const IdType* old_page_indptr_h,
                               const IdType* old_last_page_offset_h,
@@ -838,13 +891,16 @@ cudaError_t SplitPagedKVCache(uint32_t old_batch_size, const IdType* old_page_in
 
 /*!
  * \brief Compute the maximum number of pages per batch and the new batch size
- * after we split Paged KV-Cache into multiple chunks on KV sequence length
- * dimension. \param max_grid_size The maximum grid size of the kernel \param
- * num_kv_heads The number of KV heads \param num_pages The number of pages per
- * request in the batch \param max_num_pages_per_batch_lb The pre-set lower
- * bound of maximum number of pages per batch, default to 1 \return
- * (max_num_pages_per_batch, new_batch_size) The number of pages per batch and
- * the new batch size after the split.
+ *   after we split Paged KV-Cache into multiple chunks on KV sequence length
+ *   dimension.
+ * \tparam IdType A template type indicates the index data type
+ * \param max_grid_size The maximum grid size of the kernel
+ * \param num_kv_heads The number of KV heads
+ * \param num_pages The number of pages per request in the batch
+ * \param max_num_pages_per_batch_lb The pre-set lower bound of maximum number of
+ *   pages per batch, default to 1
+ * \return (max_num_pages_per_batch, new_batch_size) The number of pages per batch and
+ *   the new batch size after the split.
  */
 template <typename IdType>
 std::pair<uint32_t, uint32_t> SplitPagedKVCacheBinarySearchMinNumPagePerBatch(
@@ -874,6 +930,22 @@ std::pair<uint32_t, uint32_t> SplitPagedKVCacheBinarySearchMinNumPagePerBatch(
   return {low, new_batch_size};
 }
 
+/*!
+ * \brief Estimate the temporary buffer size and the maximum grid size for the
+ *   cooperative BatchDecodeWithPagedKVCache kernel
+ * \tparam DTypeIn A template type indicates the input data type
+ * \tparam DTypeOut A template type indicates the output data type
+ * \tparam IdType A template type indicates the index data type
+ * \param tmp_size The estimated temporary buffer size, return 0 if not use cooperative kernel
+ * \param max_grid_size The maximum grid size that can be used in a cooperative kernel
+ * \param max_num_pages_per_batch The maximum number of pages per batch
+ * \param new_batch_size The new batch size after the split
+ * \param paged_kv The paged kv cache data structure
+ * \param num_qo_heads A integer indicates the number of heads of query and output
+ * \param rotary_mode The rotary mode
+ * \param stream The cuda stream to launch the kernel
+ * \return status Indicates whether CUDA calls are successful
+ */
 template <typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
     uint32_t& tmp_size, uint32_t& max_grid_size, uint32_t& max_num_pages_per_batch,
@@ -935,19 +1007,20 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
 }
 
 /*!
- * \brief FlashAttention decoding cuda kernel with paged kv-cache for batched
- * requests \tparam DTypeIn A template type indicates the input data type
+ * \brief FlashAttention decoding cuda kernel with paged kv-cache for batched requests
+ * \tparam DTypeIn A template type indicates the input data type
  * \tparam DTypeOut A template type indicates the output data type
- * \tparam IdType A template type indicates the index data type used in paged
- * kv-cache \param q [batch_size, num_qo_heads, head_dim] The query matrix
+ * \tparam IdType A template type indicates the index data type used in paged kv-cache
+ * \param q [batch_size, num_qo_heads, head_dim] The query matrix
  * \param paged_kv The paged kv cache data structure
  * \param o [batch_size, num_qo_heads, head_dim] The output matrix
  * \param tmp Used-allocated temporary buffer
- * \param num_qo_heads A integer indicates the number of heads of query and
- * output \param rotary_mode The rotary mode \param rope_scale A floating point
- * number indicate the scaling ratio used in RoPE Interpolation. \param
- * rope_theta A floating point number indicate the "theta" used in RoPE \param
- * stream The cuda stream to launch the kernel
+ * \param num_qo_heads A integer indicates the number of heads of query and output
+ * \param rotary_mode The rotary mode
+ * \param rope_scale The scaling ratio used in RoPE Interpolation.
+ * \param rope_theta A floating point number indicate the "theta" used in RoPE
+ * \param stream The cuda stream to launch the kernel
+ * \return status Indicates whether CUDA calls are successful
  */
 template <typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCache(DTypeIn* q, paged_kv_t<DTypeIn, IdType> paged_kv,
@@ -956,8 +1029,8 @@ cudaError_t BatchDecodeWithPagedKVCache(DTypeIn* q, paged_kv_t<DTypeIn, IdType> 
                                         float rope_scale = 1.f, float rope_theta = 1e4,
                                         cudaStream_t stream = nullptr) {
   const float sm_scale = 1.f / std::sqrt(float(paged_kv.head_dim));
-  const float rope_inv_scale = 1.f / rope_scale;
-  const float rope_inv_theta = 1.f / rope_theta;
+  const float rope_rcp_scale = 1.f / rope_scale;
+  const float rope_rcp_theta = 1.f / rope_theta;
   constexpr bool norm_on_the_fly = false;
   const uint32_t num_kv_heads = paged_kv.num_heads;
   const uint32_t head_dim = paged_kv.head_dim;
@@ -993,8 +1066,8 @@ cudaError_t BatchDecodeWithPagedKVCache(DTypeIn* q, paged_kv_t<DTypeIn, IdType> 
                               (void*)&o,
                               (void*)&tmp,
                               (void*)&sm_scale,
-                              (void*)&rope_inv_scale,
-                              (void*)&rope_inv_theta};
+                              (void*)&rope_rcp_scale,
+                              (void*)&rope_rcp_theta};
               FLASHINFER_CUDA_CALL(
                   cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
             } else {
@@ -1014,8 +1087,8 @@ cudaError_t BatchDecodeWithPagedKVCache(DTypeIn* q, paged_kv_t<DTypeIn, IdType> 
                               (void*)&o,
                               (void*)&tmp,
                               (void*)&sm_scale,
-                              (void*)&rope_inv_scale,
-                              (void*)&rope_inv_theta};
+                              (void*)&rope_rcp_scale,
+                              (void*)&rope_rcp_theta};
               dim3 nblks(batch_size, num_kv_heads);
               dim3 nthrs(bdx, bdy, bdz);
               FLASHINFER_CUDA_CALL(cudaLaunchCooperativeKernel((void*)cooperative_kernel, nblks,

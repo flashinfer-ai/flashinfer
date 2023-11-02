@@ -151,9 +151,9 @@ __device__ __forceinline__ void produce_kv(smem_t* smem, T* gptr,
  * \param tmp The temporary buffer (used in cooperative kernels).
  * \param qkv_info The tensor info of the input tensor.
  * \param sm_scale The scale factor applied to the softmax score.
- * \param log2_rope_inv_scale log2(1/(rope_scale)), where rope_scale is the scaling
+ * \param log2_rope_rcp_scale log2(1/(rope_scale)), where rope_scale is the scaling
  *   factor used in RoPE interpolation.
- * \param log2_rope_inv_theta log2(1/(rope_theta)), where rope_theta is the theta
+ * \param log2_rope_rcp_theta log2(1/(rope_theta)), where rope_theta is the theta
  *   used in RoPE.
  */
 template <bool cooperative, uint32_t group_size, bool causal, QKVLayout layout,
@@ -163,8 +163,8 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
                                                DTypeIn* __restrict__ v, DTypeOut* __restrict__ o,
                                                float* __restrict__ tmp,
                                                const tensor_info_t<layout, group_size> qkv_info,
-                                               float sm_scale, const float log2_rope_inv_scale,
-                                               const float log2_rope_inv_theta) {
+                                               float sm_scale, const float log2_rope_rcp_scale,
+                                               const float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
   sm_scale *= math::log2e;
@@ -198,8 +198,8 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
 #pragma unroll
       for (uint32_t j = 0; j < 4; ++j) {
         rope_freq[fy][j] = math::ptx_exp2(
-            log2_rope_inv_scale +
-            log2_rope_inv_theta *
+            log2_rope_rcp_scale +
+            log2_rope_rcp_theta *
                 float(2 * ((fy * 16 + (j / 2) * 8 + (tx % 4) * 2 + (j % 2)) % (head_dim / 2))) /
                 float(head_dim));
       }
@@ -649,8 +649,8 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
 }
 
 /*!
- * \brief Estimate the temporary storage size for SinglePrefillWithKVCacheKernel, and the maximum
- *   grid size that can be used in a cooperative kernel.
+ * \brief Estimate the temporary storage size and the maximum grid size for the
+ *   cooperative SinglePrefillWithKVCacheKernel
  * \tparam DTypeIn The data type of input
  * \tparam DTypeOut The data type of output
  * \param tmp_size The estimated temporary storage size, return 0 if not use cooperative kernel.
@@ -777,8 +777,8 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOu
                                      float rope_scale = 1.f, float rope_theta = 1e4,
                                      cudaStream_t stream = nullptr) {
   const float sm_scale = 1.f / std::sqrt(float(head_dim));
-  const float log2_rope_inv_scale = -std::log2f(rope_scale);
-  const float log2_rope_inv_theta = -std::log2f(rope_theta);
+  const float log2_rope_rcp_scale = -std::log2f(rope_scale);
+  const float log2_rope_rcp_theta = -std::log2f(rope_theta);
   assert(kv_len >= qo_len);
 
   SWITCH_NUM_FRAGS_X(
@@ -848,8 +848,8 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOu
                                               (void*)&tmp,
                                               (void*)&qkv_info,
                                               (void*)&sm_scale,
-                                              (void*)&log2_rope_inv_scale,
-                                              (void*)&log2_rope_inv_theta};
+                                              (void*)&log2_rope_rcp_scale,
+                                              (void*)&log2_rope_rcp_theta};
                               dim3 nblks((qo_len + (num_rows_per_cta - 1)) / num_rows_per_cta, 1,
                                          num_qo_heads);
                               dim3 nthrs(32, num_warps);
@@ -866,8 +866,8 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOu
                                               (void*)&tmp,
                                               (void*)&qkv_info,
                                               (void*)&sm_scale,
-                                              (void*)&log2_rope_inv_scale,
-                                              (void*)&log2_rope_inv_theta};
+                                              (void*)&log2_rope_rcp_scale,
+                                              (void*)&log2_rope_rcp_theta};
                               dim3 nblks((qo_len + (num_rows_per_cta - 1)) / num_rows_per_cta,
                                          num_chunks, num_qo_heads);
                               dim3 nthrs(32, num_warps);
