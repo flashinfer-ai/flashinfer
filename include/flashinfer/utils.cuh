@@ -17,6 +17,8 @@
 #define FLASHINFER_UTILS_CUH_
 #include <cuda_runtime.h>
 
+#include <iostream>
+
 #include "layout.cuh"
 #include "rope.cuh"
 
@@ -26,6 +28,21 @@
     if (e != cudaSuccess) {             \
       return e;                         \
     }                                   \
+  }
+
+#define SWITCH_PAGE_SIZE(page_size, PAGE_SIZE, ...) \
+  if (page_size == 8) {                             \
+    constexpr size_t PAGE_SIZE = 8;                 \
+    __VA_ARGS__                                     \
+  } else if (page_size == 16) {                     \
+    constexpr size_t PAGE_SIZE = 16;                \
+    __VA_ARGS__                                     \
+  } else if (page_size == 32) {                     \
+    constexpr size_t PAGE_SIZE = 32;                \
+    __VA_ARGS__                                     \
+  } else {                                          \
+    constexpr size_t PAGE_SIZE = 0;                 \
+    __VA_ARGS__                                     \
   }
 
 #define SWITCH_NUM_FRAGS_X(greater_than_64, NUM_FRAGS_X, ...) \
