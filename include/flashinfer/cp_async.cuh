@@ -22,12 +22,20 @@ namespace flashinfer {
 
 namespace cp_async {
 
+/*!
+ * \brief Wrapper of PTX cp.async.commit_group instruction, commit all prior uncommitted
+ *   cp.async instructions to a group
+ */
 __device__ __forceinline__ void commit_group() {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDACC_VER_MAJOR__ >= 11)
   asm volatile("cp.async.commit_group;\n" ::);
 #endif
 }
 
+/*!
+ * \brief Wrapper of PTX cp.async.wait_group instruction
+ * \tparam n Wait till most recent n groups are committed
+ */
 template <size_t n>
 __device__ __forceinline__ void wait_group() {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDACC_VER_MAJOR__ >= 11)
@@ -35,6 +43,14 @@ __device__ __forceinline__ void wait_group() {
 #endif
 }
 
+/*!
+ * \brief Wrapper of PTX cp.async.cg.shared.global instruction, asynchronously copy data from
+ *   global memory to shared memory
+ * \tparam prefetch Whether to fetch additional data from global memory to L2
+ * \tparam T Data type
+ * \param smem_ptr Pointer to shared memory
+ * \param gmem_ptr Pointer to global memory
+ */
 template <bool prefetch, typename T>
 __device__ __forceinline__ void load_128b(T* smem_ptr, const T* gmem_ptr) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDACC_VER_MAJOR__ >= 11)
@@ -52,6 +68,17 @@ __device__ __forceinline__ void load_128b(T* smem_ptr, const T* gmem_ptr) {
 #endif
 }
 
+/*!
+ * \brief Wrapper of PTX cp.async.cg.shared.global instruction, asynchronously copy data from
+ *   global memory to shared memory with predicate.
+ * \tparam prefetch Whether to fetch additional data from global memory to L2
+ * \tparam fill_zero Whether to fill zero to shared memory when predicate is false
+ * \tparam T Data type
+ * \param smem_ptr Pointer to shared memory
+ * \param gmem_ptr Pointer to global memory
+ * \param predicate Predicate value
+ * \note fill zero is slower than not fill zero
+ */
 template <bool prefetch, bool fill_zero, typename T>
 __device__ __forceinline__ void pred_load_128b(T* smem_ptr, const T* gmem_ptr, bool predicate) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDACC_VER_MAJOR__ >= 11)
@@ -96,6 +123,14 @@ __device__ __forceinline__ void pred_load_128b(T* smem_ptr, const T* gmem_ptr, b
 #endif
 }
 
+/*!
+ * \brief Load specified number of bits per thread from global memory to shared memory
+ * \tparam num_bits Number of bits to load, must be 128 or 256
+ * \tparam prefetch Whether to fetch additional data from global memory to L2
+ * \tparam T Data type
+ * \param smem_ptr Pointer to shared memory
+ * \param gmem_ptr Pointer to global memory
+ */
 template <size_t num_bits, bool prefetch, typename T>
 __device__ __forceinline__ void load(T* smem_ptr, const T* gmem_ptr) {
   static_assert(num_bits == 128 || num_bits == 256, "num_bits must be 128 or 256");
@@ -107,6 +142,18 @@ __device__ __forceinline__ void load(T* smem_ptr, const T* gmem_ptr) {
   }
 }
 
+/*!
+ * \brief Load specified number of bits per thread from global memory to shared memory with
+ *   predicate
+ * \tparam num_bits Number of bits to load, must be 128 or 256
+ * \tparam prefetch Whether to fetch additional data from global memory to L2
+ * \tparam fill_zero Whether to fill zero to shared memory when predicate is false
+ * \tparam T Data type
+ * \param smem_ptr Pointer to shared memory
+ * \param gmem_ptr Pointer to global memory
+ * \param predicate Predicate value
+ * \note fill zero is slower than not fill zero
+ */
 template <size_t num_bits, bool prefetch, bool fill_zero, typename T>
 __device__ __forceinline__ void pred_load(T* smem_ptr, const T* gmem_ptr, bool predicate) {
   static_assert(num_bits == 128 || num_bits == 256, "num_bits must be 128 or 256");

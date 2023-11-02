@@ -30,22 +30,38 @@ namespace flashinfer {
 // Each cell is 4 bytes.
 using cell_t = uint4;
 
+/*!
+ * \brief Compute the number of elements that can be stored in a cell.
+ * \tparam T The data type of the elements.
+ */
 template <typename T>
 constexpr __host__ __device__ __forceinline__ uint32_t cell_capacity() {
   return sizeof(cell_t) / sizeof(T);
 }
 
+/*!
+ * \brief The shared memory wrapper.
+ */
 struct smem_t {
+  // The base pointer.
   cell_t* base;
+  // The offset.
   uint32_t offset;
   __device__ __forceinline__ smem_t() : base(nullptr) {}
   template <typename T>
   __device__ __forceinline__ smem_t(T* base) : base((cell_t*)base) {}
 
+  /*!
+   * \brief Compute the element offset given coordinates in a permuted shared memory.
+   * \tparam stride The stride (in terms of cells) in the permuted shared memory.
+   * \param i The row index.
+   * \param j The column index.
+   */
   template <uint32_t stride>
   static __device__ __forceinline__ uint32_t get_permuted_offset(uint32_t i, uint32_t j) {
     return (i / 2) * stride * 2 + (j / 4) * 8 + (i % 2) * 4 + ((j % 4) ^ ((i / 2) % 4));
   }
+  
   __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t* R) {
     cell_t* smem_ptr = base + offset;
     mma::ldmatrix_m8n8x4(R, smem_ptr);

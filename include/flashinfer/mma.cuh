@@ -26,6 +26,13 @@ namespace flashinfer {
 
 namespace mma {
 
+/*!
+ * \brief Wrapper of PTX ldmatrix m8n8.x4 instruction, loads data from shared memory
+ *   to fragment
+ * \tparam T data type of the fragment
+ * \param R pointer to the fragment
+ * \param smem_ptr pointer to the shared memory
+ */
 template <typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
   uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
@@ -34,6 +41,13 @@ __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
                : "r"(smem_int_ptr));
 }
 
+/*!
+ * \brief Wrapper of PTX ldmatrix m8n8.x4 transposed instruction, loads data from
+ *   shared memory to fragment and transposes the fragment
+ * \tparam T data type of the fragment
+ * \param R pointer to the fragment
+ * \param smem_ptr pointer to the shared memory
+ */
 template <typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t* R, T* smem_ptr) {
   uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
@@ -42,6 +56,13 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t* R, T* smem_ptr) 
                : "r"(smem_int_ptr));
 }
 
+/*!
+ * \brief Wrapper of PTX stmatrix m8n8.x4 instruction, stores data from fragment
+ *   to shared memory
+ * \tparam T data type of the fragment
+ * \param R pointer to the fragment
+ * \param smem_ptr pointer to the shared memory
+ */
 template <typename T>
 __device__ __forceinline__ void stmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDACC_VER_MAJOR__ >= 11)
@@ -64,6 +85,15 @@ __device__ __forceinline__ void stmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
 #endif
 }
 
+/*!
+ * \brief Wrapper of two mma m16n8k16 instructions for row major and column major f16 matrix
+ *   multiplication, accumulated in f32.
+ * \tparam T data type of the fragment
+ * \tparam init whether to initialize the accumulator with zero
+ * \param C pointer to the accumulator
+ * \param A pointer to the fragment of matrix A
+ * \param B pointer to the fragment of matrix B
+ */
 template <typename T, bool init = false>
 __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, uint32_t* A,
                                                                      uint32_t* B) {

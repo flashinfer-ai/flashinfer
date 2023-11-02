@@ -365,7 +365,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
  * \brief Advance the page iterator
  * \tparam DType A template type indicates the input data type
  * \tparam IdType A template type indicates the index data type
- * \param paged_kv The PagedKVCache data structure
+ * \param paged_kv The paged kv-cache data structure
  * \param kv_idx_base The k/v tiles offset in shared memory of different pipeline stages
  * \param valid_page_size The valid page size of different pipeline stages
  * \param producer_valid_page_size The valid page size of the producer
@@ -399,7 +399,7 @@ __forceinline__ __device__ void AdvancePageIterator(
 }
 
 /*!
- * \brief FlashAttention decoding cuda kernel with PagedKVCcache for multiple requests
+ * \brief FlashAttention decoding cuda kernel with paged kv-cache for multiple requests
  * \tparam cooperative Whether to use cooperative kernel or not
  * \tparam rotary_mode The rotary mode
  * \tparam norm_on_the_fly Whether to normalize on the fly or not
@@ -411,7 +411,7 @@ __forceinline__ __device__ void AdvancePageIterator(
  * \tparam DTypeOut A template type indicates the output data type
  * \tparam IdType A template type indicates the index data type
  * \param q [batch_size, num_qo_heads, head_dim] The query matrix
- * \param paged_kv The PagedKVCache data structure
+ * \param paged_kv The paged kv-cache data structure
  * \param o [num_qo_heads, head_dim] The output matrix
  * \param sm_scale A float indicates the scale applied to pre-softmax logits
  * \param rope_rcp_scale A floating number indicate the reciprocal

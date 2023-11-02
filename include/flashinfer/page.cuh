@@ -47,8 +47,7 @@ struct paged_kv_t {
   // [batch_size] The offset of the last page for each request in the batch
   IdType* last_page_offset;
 
-  /* ------------ Auxliary Information Used in Cooperative Kernels ------------
-   */
+  /* ------------ Auxliary Information Used in Cooperative Kernels ------------ */
   IdType* cooperative_indptr;
   IdType* batch_idx_map;
   IdType* chunk_start;
@@ -65,8 +64,7 @@ struct paged_kv_t {
    * \param data The flattened key-value cache
    * \param indptr The page indptr array
    * \param indices The page indices array
-   * \param last_page_offset The offset of the last page for each request in the
-   * batch
+   * \param last_page_offset The offset of the last page for each request in the batch
    */
   __host__ __device__ __forceinline__ paged_kv_t(uint32_t num_layers, uint32_t layer_idx,
                                                  uint32_t num_heads, uint32_t page_size,
@@ -89,16 +87,21 @@ struct paged_kv_t {
         seq_lens_before_split(nullptr) {}
 
   /*!
-   * \brief Construct a paged key-value cache with auxiliary information for
-   * cooperative kernels \param num_layers The number of layers \param layer_idx
-   * The index of the layer \param num_heads The number of heads \param
-   * page_size The size of each page \param head_dim The dimension of each head
+   * \brief Construct a paged key-value cache with auxiliary information for cooperative kernels
+   * \param num_layers The number of layers
+   * \param layer_idx The index of the layer
+   * \param num_heads The number of heads
+   * \param page_size The size of each page
+   * \param head_dim The dimension of each head
    * \param batch_size The batch size
    * \param data The flattened key-value cache
    * \param indptr The page indptr array
    * \param indices The page indices array
-   * \param last_page_offset The offset of the last page for each request in the
-   * batch
+   * \param last_page_offset The offset of the last page for each request in the batch
+   * \param cooperative_indptr The page indptr array for cooperative kernels
+   * \param batch_idx_map The batch index map from for cooperative kernels
+   * \param chunk_start The chunk start array for cooperative kernels
+   * \param seq_lens_before_split The sequence length before split for cooperative kernels
    */
   __host__ __device__ __forceinline__ paged_kv_t(uint32_t num_layers, uint32_t layer_idx,
                                                  uint32_t num_heads, uint32_t page_size,
@@ -148,6 +151,18 @@ struct paged_kv_t {
   }
 };
 
+/*!
+ * \brief CUDA kernel to append new keys/values to the paged key-value cache in the decode phase
+ * \tparam head_dim The dimension of each head
+ * \tparam vec_size The vector size used in the kernel
+ * \tparam bdx The block dimension in x
+ * \tparam bdy The block dimension in y
+ * \tparam DType The data type of the key-value cache
+ * \tparam IdType The index data type of the kv-cache
+ * \param paged_kv The paged key-value cache
+ * \param key The key to be appended
+ * \param value The value to be appended
+ */
 template <uint32_t head_dim, uint32_t vec_size, uint32_t bdx, uint32_t bdy, typename DType,
           typename IdType>
 __global__ void AppendPagedKVCacheDecodeKernel(paged_kv_t<DType, IdType> paged_kv,
@@ -174,6 +189,19 @@ __global__ void AppendPagedKVCacheDecodeKernel(paged_kv_t<DType, IdType> paged_k
       value + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
 }
 
+/*!
+ * \brief CUDA kernel to append new keys/values to the paged key-value cache in the prefill phase
+ * \tparam head_dim The dimension of each head
+ * \tparam vec_size The vector size used in the kernel
+ * \tparam bdx The block dimension in x
+ * \tparam bdy The block dimension in y
+ * \tparam DType The data type of the key-value cache
+ * \tparam IdType The index data type of the kv-cache
+ * \param paged_kv The paged key-value cache
+ * \param key The key to be appended
+ * \param value The value to be appended
+ * \param append_indptr The indptr array of the appended ragged tensor
+ */
 template <uint32_t head_dim, uint32_t vec_size, uint32_t bdx, uint32_t bdy, typename DType,
           typename IdType>
 __global__ void AppendPagedKVCachePrefillKernel(paged_kv_t<DType, IdType> paged_kv,
@@ -207,6 +235,20 @@ __global__ void AppendPagedKVCachePrefillKernel(paged_kv_t<DType, IdType> paged_
   }
 }
 
+/*!
+ * \brief CUDA kernel to convert the paged key-value cache to a ragged tensor
+ * \tparam head_dim The dimension of each head
+ * \tparam vec_size The vector size used in the kernel
+ * \tparam bdx The block dimension in x
+ * \tparam bdy The block dimension in y
+ * \tparam DType The data type of the key-value cache
+ * \tparam IdType The index data type of the kv-cache
+ * \param paged_kv The paged key-value cache
+ * \param key The key to be appended
+ * \param value The value to be appended
+ * \param kv_indptr The indptr array of the ragged tensor
+ * \return status Indicates whether CUDA calls are successful
+ */
 template <uint32_t head_dim, uint32_t vec_size, uint32_t bdx, uint32_t bdy, typename DType,
           typename IdType>
 __global__ void PagedKVCacheToRaggedTensorKernel(paged_kv_t<DType, IdType> paged_kv,
@@ -230,6 +272,16 @@ __global__ void PagedKVCacheToRaggedTensorKernel(paged_kv_t<DType, IdType> paged
   }
 }
 
+/*!
+ * \brief Append new keys/values to the paged key-value cache in the decode phase
+ * \tparam DType The data type of the key-value cache
+ * \tparam IdType The index data type of the kv-cache
+ * \param paged_kv The paged key-value cache
+ * \param key The key to be appended
+ * \param value The value to be appended
+ * \param stream The CUDA stream to execute kernels.
+ * \return status Indicates whether CUDA calls are successful
+ */
 template <typename DType, typename IdType>
 cudaError_t AppendPagedKVCacheDecode(paged_kv_t<DType, IdType> paged_kv, DType* key, DType* value,
                                      cudaStream_t stream = nullptr) {
@@ -250,6 +302,17 @@ cudaError_t AppendPagedKVCacheDecode(paged_kv_t<DType, IdType> paged_kv, DType* 
   return cudaSuccess;
 }
 
+/*!
+ * \brief Append new keys/values to the paged key-value cache in the prefill phase
+ * \tparam DType The data type of the key-value cache
+ * \tparam IdType The index data type of the kv-cache
+ * \param paged_kv The paged key-value cache
+ * \param key The key to be appended
+ * \param value The value to be appended
+ * \param append_indptr The indptr array of the appended ragged tensor
+ * \param stream The CUDA stream to execute kernels.
+ * \return status Indicates whether CUDA calls are successful
+ */
 template <typename DType, typename IdType>
 cudaError_t AppendPagedKVCachePrefill(paged_kv_t<DType, IdType> paged_kv, DType* key, DType* value,
                                       IdType* append_indptr, cudaStream_t stream = nullptr) {
@@ -270,6 +333,15 @@ cudaError_t AppendPagedKVCachePrefill(paged_kv_t<DType, IdType> paged_kv, DType*
   return cudaSuccess;
 }
 
+/*!
+ * \brief Compute the index pointers of the ragged tensor converted from paged key-value
+ * \tparam DType The data type of the key-value cache
+ * \tparam IdType The index data type of the kv-cache
+ * \param paged_kv The paged key-value cache
+ * \param kv_indptr The indptr array of the ragged tensor (output)
+ * \param stream The CUDA stream to execute kernels.
+ * \return status Indicates whether CUDA calls are successful
+ */
 template <typename DType, typename IdType>
 cudaError_t PagedKVCacheToRaggedTensorComputeIndptr(paged_kv_t<DType, IdType> paged_kv,
                                                     std::vector<IdType>& kv_indptr_host,
@@ -300,6 +372,17 @@ cudaError_t PagedKVCacheToRaggedTensorComputeIndptr(paged_kv_t<DType, IdType> pa
   return cudaSuccess;
 }
 
+/*!
+ * \brief Convert the paged key-value cache to a ragged tensor
+ * \tparam DType The data type of the key-value cache
+ * \tparam IdType The index data type of the kv-cache
+ * \param paged_kv The paged key-value cache
+ * \param key The key to be appended
+ * \param value The value to be appended
+ * \param kv_indptr The indptr array of the ragged tensor
+ * \param stream The CUDA stream to execute kernels.
+ * \return status Indicates whether CUDA calls are successful
+ */
 template <typename DType, typename IdType>
 cudaError_t PagedKVCacheToRaggedTensor(paged_kv_t<DType, IdType> paged_kv, DType* key, DType* value,
                                        IdType* kv_indptr, cudaStream_t stream = nullptr) {

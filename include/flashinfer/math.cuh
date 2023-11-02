@@ -21,20 +21,35 @@
 namespace flashinfer {
 namespace math {
 
+// log2(e)
 constexpr float log2e = 1.44269504088896340736f;
 
+/*!
+ * \brief Wrapper of PTX ex2.approx instruction, which computes 2^x
+ * \param x input
+ */
 __forceinline__ __device__ float ptx_exp2(float x) {
   float y;
   asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
   return y;
 }
 
+/*!
+ * \brief Wrapper of PTX lg2.approx instruction, which computes log2(x)
+ * \param x input
+ */
 __forceinline__ __device__ float ptx_lg2(float x) {
   float y;
   asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
   return y;
 }
 
+/*!
+ * \brief Wrapper of PTX shfl.sync.bfly instruction, which performs a butterfly shuffle
+ *   between threads in a warp.
+ * \param x The value in the source lane
+ * \param delta The delta to perform thread index xor with: y[i] <- x[i ^ delta]
+ */
 __forceinline__ __device__ float shfl_xor_sync(float x, int delta) {
   float y;
   asm volatile("shfl.sync.bfly.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(y) : "f"(x), "r"(delta));

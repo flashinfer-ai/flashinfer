@@ -25,8 +25,8 @@ namespace flashinfer {
  * \brief The flashattention state.
  * \tparam vec_size The size of the vector used in o.
  * \tparam norm_on_the_fly Whether to normalize the state on the fly. If true,
- * the state will be normalized when merge() is called. If false, the state will
- * be normalized when normalize() is called.
+ *   the state will be normalized when merge() is called. If false, the state will
+ *   be normalized when normalize() is called.
  */
 template <size_t vec_size, bool norm_on_the_fly>
 struct state_t {

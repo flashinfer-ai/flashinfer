@@ -22,7 +22,7 @@ namespace flashinfer {
 
 /*!
  * \brief An enumeration class that defines different modes for applying RoPE
- * (Rotary Positional Embeddings).
+ *   (Rotary Positional Embeddings).
  */
 enum class RotaryMode {
   // No rotary positional embeddings

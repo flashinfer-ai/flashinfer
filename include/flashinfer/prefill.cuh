@@ -664,6 +664,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
  * \param layout The layout of input and output.
  * \param rotary_mode The rotary mode.
  * \param stream The cuda stream to execute the kernel on.
+ * \return status Indicates whether CUDA calls are successful
  */
 template <typename DTypeIn, typename DTypeOut>
 cudaError_t SinglePrefillWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& max_grid_size,
@@ -767,6 +768,7 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t&
  * \param rope_scale The scaling factor used in RoPE interpolation.
  * \param rope_theta The theta used in RoPE.
  * \param stream The cuda stream to execute the kernel on.
+ * \return status Indicates whether CUDA calls are successful
  */
 template <typename DTypeIn, typename DTypeOut>
 cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o, float* tmp,
@@ -897,6 +899,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOu
  * \param rope_scale The scaling factor used in RoPE interpolation.
  * \param rope_theta The theta used in RoPE.
  * \param stream The cuda stream to execute the kernel on.
+ * \return status Indicates whether CUDA calls are successful
  * \note This implementation is not optimized, we will provide a much faster implementation in the
  *   future.
  */
