@@ -37,9 +37,7 @@ __forceinline__ __device__ float ptx_lg2(float x) {
 
 __forceinline__ __device__ float shfl_xor_sync(float x, int delta) {
   float y;
-  asm volatile("shfl.sync.bfly.b32 %0, %1, %2, 0x1f, 0xffffffff;"
-               : "=f"(y)
-               : "f"(x), "r"(delta));
+  asm volatile("shfl.sync.bfly.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(y) : "f"(x), "r"(delta));
   return y;
 }
 

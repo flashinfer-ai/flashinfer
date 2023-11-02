@@ -47,29 +47,22 @@ void bench_flashinfer_single_prefill(nvbench::state& state) {
 
   // Provide throughput information:
   state.add_global_memory_reads<dtype_in>(
-      (2 * qo_len * num_qo_heads + 2 * kv_len * num_kv_heads) * head_dim,
-      "Read");
-  state.add_global_memory_writes<dtype_out>(qo_len * num_qo_heads * head_dim,
-                                            "Write");
+      (2 * qo_len * num_qo_heads + 2 * kv_len * num_kv_heads) * head_dim, "Read");
+  state.add_global_memory_writes<dtype_out>(qo_len * num_qo_heads * head_dim, "Write");
 
-  state.exec(
-      nvbench::exec_tag::timer, [&](nvbench::launch& launch, auto& timer) {
-        timer.start();
-        cudaError_t status =
-            flashinfer::SinglePrefillWithKVCache<dtype_in, dtype_out>(
-                thrust::raw_pointer_cast(Q.data()),
-                thrust::raw_pointer_cast(K.data()),
-                thrust::raw_pointer_cast(V.data()),
-                thrust::raw_pointer_cast(O.data()),
-                cooperative ? thrust::raw_pointer_cast(tmp.data()) : nullptr,
-                num_qo_heads, num_kv_heads, qo_len, kv_len, head_dim, causal,
-                QKVLayout(layout), RotaryMode(rotary_mode), 1.f, 1e4,
-                launch.get_stream());
-        if (status != cudaSuccess) {
-          state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
-        }
-        timer.stop();
-      });
+  state.exec(nvbench::exec_tag::timer, [&](nvbench::launch& launch, auto& timer) {
+    timer.start();
+    cudaError_t status = flashinfer::SinglePrefillWithKVCache<dtype_in, dtype_out>(
+        thrust::raw_pointer_cast(Q.data()), thrust::raw_pointer_cast(K.data()),
+        thrust::raw_pointer_cast(V.data()), thrust::raw_pointer_cast(O.data()),
+        cooperative ? thrust::raw_pointer_cast(tmp.data()) : nullptr, num_qo_heads, num_kv_heads,
+        qo_len, kv_len, head_dim, causal, QKVLayout(layout), RotaryMode(rotary_mode), 1.f, 1e4,
+        launch.get_stream());
+    if (status != cudaSuccess) {
+      state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
+    }
+    timer.stop();
+  });
 
   const auto measured_mean = static_cast<nvbench::float32_t>(
       state.get_summary("nv/cold/time/gpu/mean").get_float64("value"));
@@ -78,49 +71,42 @@ void bench_flashinfer_single_prefill(nvbench::state& state) {
   summ.set_string("name", "TFlops/s");
   float tflops;
   if (causal) {
-    tflops = qo_len * (2 * kv_len - qo_len) * 2 * num_qo_heads * head_dim /
-             measured_mean / 1e12;
+    tflops = qo_len * (2 * kv_len - qo_len) * 2 * num_qo_heads * head_dim / measured_mean / 1e12;
   } else {
-    tflops =
-        qo_len * kv_len * 4 * num_qo_heads * head_dim / measured_mean / 1e12;
+    tflops = qo_len * kv_len * 4 * num_qo_heads * head_dim / measured_mean / 1e12;
   }
   summ.set_float64("value", tflops);
 }
 
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
-#define BENCH_FLASHINFER_PREFILL(dtype_in, dtype_out)                        \
-  auto bench_flashinfer_single_prefill_##dtype_in##_##dtype_out##_ =         \
-      bench_flashinfer_single_prefill<dtype_in, dtype_out, false>;           \
-  NVBENCH_BENCH(bench_flashinfer_single_prefill_##dtype_in##_##dtype_out##_) \
-      .set_name(("bench_flashinfer_single_prefill_" STR(dtype_in) "_" STR(   \
-          dtype_out)))                                                       \
-      .add_int64_axis("kv_len", {32, 64, 128, 256, 512, 1024, 2048, 4096,    \
-                                 8192, 16384, 32768})                        \
-      .add_int64_axis("num_qo_heads", {32})                                  \
-      .add_int64_axis("num_kv_heads", {32})                                  \
-      .add_int64_axis("head_dim", {128})                                     \
-      .add_int64_axis("causal", {0, 1})                                      \
-      .add_int64_axis("layout", {0, 1})                                      \
-      .add_int64_axis("rotary_mode", {0, 1})                                 \
+#define BENCH_FLASHINFER_PREFILL(dtype_in, dtype_out)                                          \
+  auto bench_flashinfer_single_prefill_##dtype_in##_##dtype_out##_ =                           \
+      bench_flashinfer_single_prefill<dtype_in, dtype_out, false>;                             \
+  NVBENCH_BENCH(bench_flashinfer_single_prefill_##dtype_in##_##dtype_out##_)                   \
+      .set_name(("bench_flashinfer_single_prefill_" STR(dtype_in) "_" STR(dtype_out)))         \
+      .add_int64_axis("kv_len", {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768}) \
+      .add_int64_axis("num_qo_heads", {32})                                                    \
+      .add_int64_axis("num_kv_heads", {32})                                                    \
+      .add_int64_axis("head_dim", {128})                                                       \
+      .add_int64_axis("causal", {0, 1})                                                        \
+      .add_int64_axis("layout", {0, 1})                                                        \
+      .add_int64_axis("rotary_mode", {0, 1})                                                   \
       .add_int64_axis("cooperative", {1})
 
-#define BENCH_FLASHINFER_APPEND_PREFILL(dtype_in, dtype_out)                 \
-  auto bench_flashinfer_single_append_prefill_##dtype_in##_##dtype_out##_ =  \
-      bench_flashinfer_single_prefill<dtype_in, dtype_out, true>;            \
-  NVBENCH_BENCH(                                                             \
-      bench_flashinfer_single_append_prefill_##dtype_in##_##dtype_out##_)    \
-      .set_name(("bench_flashinfer_single_append_prefill_" STR(              \
-          dtype_in) "_" STR(dtype_out)))                                     \
-      .add_int64_axis("qo_len", {128})                                       \
-      .add_int64_axis("kv_len",                                              \
-                      {128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768}) \
-      .add_int64_axis("num_qo_heads", {32})                                  \
-      .add_int64_axis("num_kv_heads", {32})                                  \
-      .add_int64_axis("head_dim", {128})                                     \
-      .add_int64_axis("causal", {0, 1})                                      \
-      .add_int64_axis("layout", {0, 1})                                      \
-      .add_int64_axis("rotary_mode", {0, 1})                                 \
+#define BENCH_FLASHINFER_APPEND_PREFILL(dtype_in, dtype_out)                                  \
+  auto bench_flashinfer_single_append_prefill_##dtype_in##_##dtype_out##_ =                   \
+      bench_flashinfer_single_prefill<dtype_in, dtype_out, true>;                             \
+  NVBENCH_BENCH(bench_flashinfer_single_append_prefill_##dtype_in##_##dtype_out##_)           \
+      .set_name(("bench_flashinfer_single_append_prefill_" STR(dtype_in) "_" STR(dtype_out))) \
+      .add_int64_axis("qo_len", {128})                                                        \
+      .add_int64_axis("kv_len", {128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768})        \
+      .add_int64_axis("num_qo_heads", {32})                                                   \
+      .add_int64_axis("num_kv_heads", {32})                                                   \
+      .add_int64_axis("head_dim", {128})                                                      \
+      .add_int64_axis("causal", {0, 1})                                                       \
+      .add_int64_axis("layout", {0, 1})                                                       \
+      .add_int64_axis("rotary_mode", {0, 1})                                                  \
       .add_int64_axis("cooperative", {0, 1})
 
 BENCH_FLASHINFER_PREFILL(half, half);

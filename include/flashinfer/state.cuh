@@ -51,12 +51,11 @@ struct state_t {
    * \param other_d The sum of exp(pre-softmax logits - m) of the other state.
    * \param other_o The weighted sum of v of the other state.
    */
-  __device__ __forceinline__ void merge(const vec_t<float, vec_size>& other_o,
-                                        float other_m, float other_d) {
+  __device__ __forceinline__ void merge(const vec_t<float, vec_size>& other_o, float other_m,
+                                        float other_d) {
     float m_prev = m, d_prev = d;
     m = max(m_prev, other_m);
-    d = d_prev * math::ptx_exp2(m_prev - m) +
-        other_d * math::ptx_exp2(other_m - m);
+    d = d_prev * math::ptx_exp2(m_prev - m) + other_d * math::ptx_exp2(other_m - m);
     if constexpr (norm_on_the_fly) {
 #pragma unroll
       for (size_t i = 0; i < vec_size; ++i) {
@@ -66,8 +65,7 @@ struct state_t {
     } else {
 #pragma unroll
       for (size_t i = 0; i < vec_size; ++i) {
-        o[i] = o[i] * math::ptx_exp2(m_prev - m) +
-               other_o[i] * math::ptx_exp2(other_m - m);
+        o[i] = o[i] * math::ptx_exp2(m_prev - m) + other_o[i] * math::ptx_exp2(other_m - m);
       }
     }
   }
@@ -76,8 +74,7 @@ struct state_t {
    * \brief Merge the state with another state.
    * \param other The other state.
    */
-  __device__ __forceinline__ void merge(
-      const state_t<vec_size, norm_on_the_fly>& other) {
+  __device__ __forceinline__ void merge(const state_t<vec_size, norm_on_the_fly>& other) {
     merge(other.o, other.m, other.d);
   }
 
@@ -86,8 +83,7 @@ struct state_t {
    * \param x The pre-softmax logit.
    * \param v The value vector.
    */
-  __device__ __forceinline__ void merge(const vec_t<float, vec_size>& other_o,
-                                        float x) {
+  __device__ __forceinline__ void merge(const vec_t<float, vec_size>& other_o, float x) {
     float m_prev = m, d_prev = d;
     m = max(m_prev, x);
     d = d * math::ptx_exp2(m_prev - m) + math::ptx_exp2(x - m);
@@ -100,8 +96,7 @@ struct state_t {
     } else {
 #pragma unroll
       for (size_t i = 0; i < vec_size; ++i) {
-        o[i] = o[i] * math::ptx_exp2(m_prev - m) +
-               other_o[i] * math::ptx_exp2(x - m);
+        o[i] = o[i] * math::ptx_exp2(m_prev - m) + other_o[i] * math::ptx_exp2(x - m);
       }
     }
   }
