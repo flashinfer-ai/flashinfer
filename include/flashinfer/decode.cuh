@@ -292,6 +292,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
                                                 q_vec, freq, consumer_kv_idx_base, stage_idx,
                                                 sm_scale, x);
     block.sync();
+
     // load k
     cp_async::pred_load<vec_bits, true, false>(
         k_smem + ((stage_idx * bdz + tz) * bdy + ty) * head_dim + tx * vec_size,

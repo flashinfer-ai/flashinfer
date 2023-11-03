@@ -471,7 +471,6 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
     // Disable instruction reordering across this fence to mitigate register spill
     __threadfence_block();
 
-    block.sync();
     produce_kv<false, num_frags_y, num_frags_z, num_warps>(
         &k_smem, k, qkv_info, chunk_start + (iter + 1) * 16 * num_frags_z, chunk_end, kv_head_idx);
     cp_async::commit_group();
@@ -501,7 +500,6 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
       }
       v_smem.offset += 16 * num_cells_per_in_channel - 4 * num_frags_y;
     }
-    block.sync();
     produce_kv<true, num_frags_y, num_frags_z, num_warps>(
         &v_smem, v, qkv_info, chunk_start + (iter + 1) * 16 * num_frags_z, chunk_end, kv_head_idx);
     cp_async::commit_group();
