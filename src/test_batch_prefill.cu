@@ -118,7 +118,6 @@ void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t head_d
       thrust::host_vector<T> o_host(o_device);
       size_t num_result_errors_atol_1e_3_rtol_1e_3 = 0;
       bool nan_detected = false;
-      std::cout << q_len * num_qo_heads * head_dim << std::endl;
       for (size_t i = 0; i < q_len * num_qo_heads * head_dim; ++i) {
         if (std::isnan(float(o_host[i]))) {
           nan_detected = true;
