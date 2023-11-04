@@ -31,9 +31,9 @@ void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t head_d
   uint32_t page_size = 16;
   uint32_t batch_size = 4;
   std::vector<std::vector<std::vector<T>>> keys, values;
-  std::vector<int32_t> q_lens{0, 0, 0, 12}, kv_lens{7, 16, 14, 12};
-  // utils::vec_randint_(q_lens, 1, 15);
-  // utils::vec_randint_(kv_lens, 15, 27);
+  std::vector<int32_t> q_lens(batch_size), kv_lens(batch_size);
+  utils::vec_randint_(q_lens, 1, 15);
+  utils::vec_randint_(kv_lens, 15, 27);
   std::vector<int32_t> append_indptr{0};
   for (size_t request_idx = 0; request_idx < batch_size; ++request_idx) {
     append_indptr.push_back(append_indptr.back() + kv_lens[request_idx]);
@@ -50,8 +50,8 @@ void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t head_d
       size_t num_pages = (kv_len + page_size - 1) / page_size;
       size_t last_page_offset = (kv_len - 1) % page_size + 1;
       std::vector<T> k(kv_len * num_kv_heads * head_dim), v(kv_len * num_kv_heads * head_dim);
-      utils::vec_normal_(k, 0, 10);
-      utils::vec_normal_(v, 0, 10);
+      utils::vec_normal_(k);
+      utils::vec_normal_(v);
       keys_layer.push_back(k);
       values_layer.push_back(v);
       kv_last_page_offset.push_back(last_page_offset);
