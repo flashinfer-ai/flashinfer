@@ -61,7 +61,7 @@ struct smem_t {
   static __device__ __forceinline__ uint32_t get_permuted_offset(uint32_t i, uint32_t j) {
     return (i / 2) * stride * 2 + (j / 4) * 8 + (i % 2) * 4 + ((j % 4) ^ ((i / 2) % 4));
   }
-  
+
   __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t* R) {
     cell_t* smem_ptr = base + offset;
     mma::ldmatrix_m8n8x4(R, smem_ptr);
@@ -77,13 +77,13 @@ struct smem_t {
   template <bool fill_zero, typename T>
   __device__ __forceinline__ void load_128b_async(const T* gptr, bool predicate) {
     cell_t* smem_ptr = base + offset;
-    cp_async::pred_load_128b<true, fill_zero>(smem_ptr, reinterpret_cast<const cell_t*>(gptr),
-                                              predicate);
+    cp_async::pred_load_128b<false, fill_zero>(smem_ptr, reinterpret_cast<const cell_t*>(gptr),
+                                               predicate);
   }
   template <typename T>
   __device__ __forceinline__ void load_128b_async(const T* gptr) {
     cell_t* smem_ptr = base + offset;
-    cp_async::load_128b<true>(smem_ptr, reinterpret_cast<const cell_t*>(gptr));
+    cp_async::load_128b<false>(smem_ptr, reinterpret_cast<const cell_t*>(gptr));
   }
   template <typename T>
   __device__ __forceinline__ void store_128b(T* gptr) {
