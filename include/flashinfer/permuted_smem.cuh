@@ -45,8 +45,6 @@ constexpr __host__ __device__ __forceinline__ uint32_t cell_capacity() {
 struct smem_t {
   // The base pointer.
   cell_t* base;
-  // The offset.
-  uint32_t offset;
   __device__ __forceinline__ smem_t() : base(nullptr) {}
   template <typename T>
   __device__ __forceinline__ smem_t(T* base) : base((cell_t*)base) {}
@@ -62,31 +60,31 @@ struct smem_t {
     return (i / 2) * stride * 2 + (j / 4) * 8 + (i % 2) * 4 + ((j % 4) ^ ((i / 2) % 4));
   }
 
-  __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t* R) {
+  __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t offset, uint32_t* R) {
     cell_t* smem_ptr = base + offset;
     mma::ldmatrix_m8n8x4(R, smem_ptr);
   }
-  __device__ __forceinline__ void stmatrix_m8n8x4(uint32_t* R) {
+  __device__ __forceinline__ void stmatrix_m8n8x4(uint32_t offset, uint32_t* R) {
     cell_t* smem_ptr = base + offset;
     mma::stmatrix_m8n8x4(R, smem_ptr);
   }
-  __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t* R) {
+  __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t offset, uint32_t* R) {
     cell_t* smem_ptr = base + offset;
     mma::ldmatrix_m8n8x4_trans(R, smem_ptr);
   }
   template <bool fill_zero, typename T>
-  __device__ __forceinline__ void load_128b_async(const T* gptr, bool predicate) {
+  __device__ __forceinline__ void load_128b_async(uint32_t offset, const T* gptr, bool predicate) {
     cell_t* smem_ptr = base + offset;
     cp_async::pred_load_128b<false, fill_zero>(smem_ptr, reinterpret_cast<const cell_t*>(gptr),
                                                predicate);
   }
   template <typename T>
-  __device__ __forceinline__ void load_128b_async(const T* gptr) {
+  __device__ __forceinline__ void load_128b_async(uint32_t offset, const T* gptr) {
     cell_t* smem_ptr = base + offset;
     cp_async::load_128b<false>(smem_ptr, reinterpret_cast<const cell_t*>(gptr));
   }
   template <typename T>
-  __device__ __forceinline__ void store_128b(T* gptr) {
+  __device__ __forceinline__ void store_128b(uint32_t offset, T* gptr) {
     *reinterpret_cast<cell_t*>(gptr) = *(base + offset);
   }
 };
