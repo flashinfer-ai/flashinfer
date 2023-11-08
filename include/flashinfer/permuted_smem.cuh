@@ -75,13 +75,13 @@ struct smem_t {
   template <bool fill_zero, typename T>
   __device__ __forceinline__ void load_128b_async(uint32_t offset, const T* gptr, bool predicate) {
     cell_t* smem_ptr = base + offset;
-    cp_async::pred_load_128b<false, fill_zero>(smem_ptr, reinterpret_cast<const cell_t*>(gptr),
-                                               predicate);
+    cp_async::pred_load_128b<true, fill_zero>(smem_ptr, reinterpret_cast<const cell_t*>(gptr),
+                                              predicate);
   }
   template <typename T>
   __device__ __forceinline__ void load_128b_async(uint32_t offset, const T* gptr) {
     cell_t* smem_ptr = base + offset;
-    cp_async::load_128b<false>(smem_ptr, reinterpret_cast<const cell_t*>(gptr));
+    cp_async::load_128b<true>(smem_ptr, reinterpret_cast<const cell_t*>(gptr));
   }
   template <typename T>
   __device__ __forceinline__ void store_128b(uint32_t offset, T* gptr) {
