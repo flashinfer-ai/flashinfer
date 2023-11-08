@@ -327,89 +327,67 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
     block.sync();
 
     if constexpr (rotary_mode == RotaryMode::kLlama) {
-      // apply rotary
-      uint32_t a_frag[num_frags_x][2][4];
-      uint32_t b_frag[2][4];
-
-      // compute q*k^T
+      uint32_t k_frag_local[2][4];
+      uint32_t kv_idx = chunk_start + (iter * num_frags_z + ty / 2) * 16 + tx / 4;
+      k_smem_offset_r =
+          (k_smem_offset_r ^ (0x2 * (ty % 2))) + (ty / 2) * 16 * num_cells_per_in_channel;
 #pragma unroll
-      for (uint32_t fyi = 0; fyi < num_frags_y / 2; ++fyi) {
+      for (uint32_t i = 0; i < num_frags_z / 2; ++i) {
+        // uint32_t fz = ty / 2 + i * 2;
 #pragma unroll
-        for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
-          q_smem.ldmatrix_m8n8x4(q_smem_offset_r, a_frag[fx][0]);
-          q_smem_offset_r += num_frags_y * 2;
-          q_smem.ldmatrix_m8n8x4(q_smem_offset_r, a_frag[fx][1]);
-          q_smem_offset_r += 16 * num_cells_per_in_channel - num_frags_y * 2;
-        }
-        q_smem_offset_r =
-            (q_smem_offset_r ^ 0x2) + (fyi & 0x1) * 8 - num_frags_x * 16 * num_cells_per_in_channel;
-        uint32_t kv_idx = chunk_start + iter * 16 * num_frags_z + tx / 4;
-
-#pragma unroll
-        for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
-          k_smem.ldmatrix_m8n8x4(k_smem_offset_r, b_frag[0]);
+        for (uint32_t j = 0; j < num_frags_y / 4; ++j) {
+          uint32_t fyi = (ty % 2) + j * 2;
+          k_smem.ldmatrix_m8n8x4(k_smem_offset_r, k_frag_local[0]);
           k_smem_offset_r += num_frags_y * 2;
-          k_smem.ldmatrix_m8n8x4(k_smem_offset_r, b_frag[1]);
-          k_smem_offset_r += 16 * num_cells_per_in_channel - num_frags_y * 2;
-          apply_llama_rope<false, DTypeIn>((DTypeIn*)b_frag[0], (DTypeIn*)b_frag[1], rope_freq[fyi],
-                                           kv_idx);
-          kv_idx += 16;
-#pragma unroll
-          for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
-            if (fyi == 0) {
-              mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn, true>(x_frag[fx][fz],
-                                                                       a_frag[fx][0], b_frag[0]);
-              mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(x_frag[fx][fz], a_frag[fx][1],
-                                                                 b_frag[1]);
-            } else {
-              mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(x_frag[fx][fz], a_frag[fx][0],
-                                                                 b_frag[0]);
-              mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(x_frag[fx][fz], a_frag[fx][1],
-                                                                 b_frag[1]);
-            }
-          }
+          k_smem.ldmatrix_m8n8x4(k_smem_offset_r, k_frag_local[1]);
+          apply_llama_rope<false, DTypeIn>((DTypeIn*)k_frag_local[0], (DTypeIn*)k_frag_local[1],
+                                           rope_freq[fyi], kv_idx);
+          k_smem.stmatrix_m8n8x4(k_smem_offset_r, k_frag_local[1]);
+          k_smem_offset_r -= num_frags_y * 2;
+          k_smem.stmatrix_m8n8x4(k_smem_offset_r, k_frag_local[0]);
+          k_smem_offset_r += 8;
         }
-        k_smem_offset_r =
-            (k_smem_offset_r ^ 0x2) + (fyi & 0x1) * 8 - num_frags_z * 16 * num_cells_per_in_channel;
+        k_smem_offset_r += 32 * num_cells_per_in_channel - 2 * num_frags_y;
+        kv_idx += 32;
       }
-      q_smem_offset_r -= num_frags_y * 2;
-      k_smem_offset_r -= num_frags_y * 2;
-    } else {
-      // rotary_mode == RotaryMode::kNone
-      uint32_t a_frag[num_frags_x][4], b_frag[4];
+      k_smem_offset_r = (k_smem_offset_r ^ (0x2 * (ty % 2))) -
+                        ((ty / 2) + num_frags_z) * 16 * num_cells_per_in_channel;
+      block.sync();
+    }
 
-      // compute q*k^T
+    // rotary_mode == RotaryMode::kNone
+    uint32_t a_frag[num_frags_x][4], b_frag[4];
+
+    // compute q*k^T
 #pragma unroll
-      for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
+    for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
+#pragma unroll
+      for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+        q_smem.ldmatrix_m8n8x4(q_smem_offset_r, a_frag[fx]);
+        q_smem_offset_r += 16 * num_cells_per_in_channel;
+      }
+      q_smem_offset_r =
+          (q_smem_offset_r ^ 0x2) + (fy & 0x1) * 8 - num_frags_x * 16 * num_cells_per_in_channel;
+
+#pragma unroll
+      for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
+        k_smem.ldmatrix_m8n8x4(k_smem_offset_r, b_frag);
+        k_smem_offset_r += 16 * num_cells_per_in_channel;
 #pragma unroll
         for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
-          q_smem.ldmatrix_m8n8x4(q_smem_offset_r, a_frag[fx]);
-          q_smem_offset_r += 16 * num_cells_per_in_channel;
-        }
-        q_smem_offset_r =
-            (q_smem_offset_r ^ 0x2) + (fy & 0x1) * 8 - num_frags_x * 16 * num_cells_per_in_channel;
-
-#pragma unroll
-        for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
-          k_smem.ldmatrix_m8n8x4(k_smem_offset_r, b_frag);
-          k_smem_offset_r += 16 * num_cells_per_in_channel;
-#pragma unroll
-          for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
-            if (fy == 0) {
-              mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn, true>(x_frag[fx][fz], a_frag[fx],
-                                                                       b_frag);
-            } else {
-              mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(x_frag[fx][fz], a_frag[fx],
-                                                                 b_frag);
-            }
+          if (fy == 0) {
+            mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn, true>(x_frag[fx][fz], a_frag[fx],
+                                                                     b_frag);
+          } else {
+            mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeIn>(x_frag[fx][fz], a_frag[fx], b_frag);
           }
         }
-        k_smem_offset_r =
-            (k_smem_offset_r ^ 0x2) + (fy & 0x1) * 8 - num_frags_z * 16 * num_cells_per_in_channel;
       }
-      q_smem_offset_r -= num_frags_y * 4;
-      k_smem_offset_r -= num_frags_y * 4;
+      k_smem_offset_r =
+          (k_smem_offset_r ^ 0x2) + (fy & 0x1) * 8 - num_frags_z * 16 * num_cells_per_in_channel;
     }
+    q_smem_offset_r -= num_frags_y * 4;
+    k_smem_offset_r -= num_frags_y * 4;
 
     // apply mask
     if (iter >= mask_iteration) {
