@@ -63,10 +63,6 @@ void _TestSinglePrefillKernelCorrectness(size_t qo_len, size_t kv_len, size_t nu
       nan_detected = true;
     }
     num_results_error_atol += (!utils::isclose(float(o_ref[i]), float(o_h[i]), rtol, atol));
-    if (!utils::isclose(float(o_ref[i]), float(o_h[i]), rtol, atol)) {
-      std::cout << "i=" << i << ", o_ref=" << float(o_ref[i]) << ", o_h=" << float(o_h[i])
-                << std::endl;
-    }
   }
 
   float result_accuracy = 1. - float(num_results_error_atol) / float(o_ref.size());
