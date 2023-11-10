@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_BUFFER_MANAGER_CUH_
-#define FLASHINFER_BUFFER_MANAGER_CUH_
+#ifndef FLASHINFER_WRAPPER_CUH_
+#define FLASHINFER_WRAPPER_CUH_
 
 #include <memory>
 #include <mutex>
@@ -177,6 +177,7 @@ class BatchDecodeBufferManager {
   void SetCUDAStream(cudaStream_t stream) { stream_ = stream; }
 
   BatchDecodeBufferManager() : allocated_buffer_size_(0U), cached_tmp_buffer_{}, stream_(nullptr) {}
+  ~BatchDecodeBufferManager() { ClearCache(); }
 
  private:
   uint32_t allocated_buffer_size_;
@@ -192,13 +193,15 @@ cudaError_t BatchDecodeWithPagedKVCache(
     cudaStream_t stream = nullptr) {
   auto value = buf_manager->Get(paged_kv, num_qo_heads, rotary_mode);
   paged_kv_t new_paged_kv = paged_kv;
-  new_paged_kv.batch_size = value.new_batch_size;
-  new_paged_kv.indptr = value.new_indptr();
-  new_paged_kv.last_page_offset = value.new_last_page_offset();
-  new_paged_kv.cooperative_indptr = value.cooperative_indptr();
-  new_paged_kv.batch_idx_map = value.batch_idx_map();
-  new_paged_kv.chunk_start = value.chunk_start();
-  new_paged_kv.seq_lens_before_split = value.seq_lens_before_split();
+  if (value.float_buffer != nullptr) {
+    new_paged_kv.batch_size = value.new_batch_size;
+    new_paged_kv.indptr = value.new_indptr();
+    new_paged_kv.last_page_offset = value.new_last_page_offset();
+    new_paged_kv.cooperative_indptr = value.cooperative_indptr();
+    new_paged_kv.batch_idx_map = value.batch_idx_map();
+    new_paged_kv.chunk_start = value.chunk_start();
+    new_paged_kv.seq_lens_before_split = value.seq_lens_before_split();
+  }
   return BatchDecodeWithPagedKVCache<DTypeIn, DTypeOut, IdType>(
       q, new_paged_kv, o, value.float_buffer, num_qo_heads, rotary_mode, rope_scale, rope_theta,
       stream);
@@ -206,4 +209,4 @@ cudaError_t BatchDecodeWithPagedKVCache(
 
 }  // namespace flashinfer
 
-#endif  // FLASHINFER_BUFFER_MANAGER_CUH_
+#endif  // FLASHINFER_WRAPPER_CUH_

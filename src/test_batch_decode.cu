@@ -15,7 +15,7 @@
  */
 #include <gtest/gtest.h>
 
-#include <flashinfer/buffer_manager.cuh>
+#include <flashinfer/wrapper.cuh>
 #include <flashinfer/decode.cuh>
 #include <type_traits>
 

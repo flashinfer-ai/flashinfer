@@ -21,5 +21,6 @@
 #include "flashinfer/page.cuh"
 #include "flashinfer/prefill.cuh"
 #include "flashinfer/rope.cuh"
+#include "flashinfer/wrapper.cuh"
 
 #endif  // FLASHINFER_CUH_

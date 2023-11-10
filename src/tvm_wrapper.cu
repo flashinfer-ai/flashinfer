@@ -98,7 +98,6 @@ void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data, DLTensor* pag
                                                  DLTensor* last_page_offset,      //
                                                  DLTensor* append_length_indptr,  //
                                                  int64_t layer_id,                //
-                                                 DLTensor* tmp_buffer,            //
                                                  DLTensor* output,                //
                                                  int64_t rotary_mode = 0,         //
                                                  double rope_scale = 1.0f,        //
@@ -113,7 +112,6 @@ void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data, DLTensor* pag
       << "The device of last_page_offset matrix must be CUDA.";
   CHECK_EQ(append_length_indptr->device.device_type, kDLCUDA)
       << "The device of append_length_indptr matrix must be CUDA.";
-  CHECK_EQ(tmp_buffer->device.device_type, kDLCUDA) << "The device of the tmp buffer must be CUDA.";
   CHECK_EQ(output->device.device_type, kDLCUDA) << "The device of output must be CUDA.";
 
   int32_t dev_id = q_data->device.device_id;
@@ -122,7 +120,6 @@ void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data, DLTensor* pag
   CHECK_EQ(page_table_values->device.device_id, dev_id);
   CHECK_EQ(last_page_offset->device.device_id, dev_id);
   CHECK_EQ(append_length_indptr->device.device_id, dev_id);
-  CHECK_EQ(tmp_buffer->device.device_id, dev_id);
   CHECK_EQ(output->device.device_id, dev_id);
 
   CHECK(q_data->dtype.lanes == 1 && pages->dtype.lanes == 1 && output->dtype.lanes == 1);
@@ -188,13 +185,14 @@ void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data, DLTensor* pag
           })})});
 }
 
+flashinfer::BatchDecodeBufferManager<half, half, int32_t> buf_mgr_f16f16i32;
+
 void _FlashInferAttentionDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
                                                 DLTensor* page_table_indptr,     //
                                                 DLTensor* page_table_values,     //
                                                 DLTensor* last_page_offset,      //
                                                 DLTensor* append_length_indptr,  //
                                                 int64_t layer_id,                //
-                                                DLTensor* tmp_buffer,            //
                                                 DLTensor* output,                //
                                                 int64_t rotary_mode = 0,         //
                                                 double rope_scale = 1.0f,        //
@@ -209,7 +207,6 @@ void _FlashInferAttentionDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* page
       << "The device of last_page_offset matrix must be CUDA.";
   CHECK_EQ(append_length_indptr->device.device_type, kDLCUDA)
       << "The device of append_length_indptr matrix must be CUDA.";
-  CHECK_EQ(tmp_buffer->device.device_type, kDLCUDA) << "The device of the tmp buffer must be CUDA.";
   CHECK_EQ(output->device.device_type, kDLCUDA) << "The device of output must be CUDA.";
 
   int32_t dev_id = q_data->device.device_id;
@@ -218,7 +215,6 @@ void _FlashInferAttentionDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* page
   CHECK_EQ(page_table_values->device.device_id, dev_id);
   CHECK_EQ(last_page_offset->device.device_id, dev_id);
   CHECK_EQ(append_length_indptr->device.device_id, dev_id);
-  CHECK_EQ(tmp_buffer->device.device_id, dev_id);
   CHECK_EQ(output->device.device_id, dev_id);
 
   CHECK(q_data->dtype.lanes == 1 && pages->dtype.lanes == 1 && output->dtype.lanes == 1);
@@ -272,9 +268,11 @@ void _FlashInferAttentionDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* page
                 static_cast<dtype_idx*>(page_table_indptr->data),
                 static_cast<dtype_idx*>(page_table_values->data),
                 static_cast<dtype_idx*>(last_page_offset->data));
-            cudaError_t status = flashinfer::BatchDecodeWithPagedKVCache<dtype_in, dtype_out>(
-                static_cast<dtype_in*>(q_data->data), cache, static_cast<dtype_out*>(output->data),
-                nullptr, nhead_qo, flashinfer::RotaryMode(rotary_mode), rope_scale, rope_theta, 0);
+            cudaError_t status =
+                flashinfer::BatchDecodeWithPagedKVCache<dtype_in, dtype_out, dtype_idx>(
+                    &buf_mgr_f16f16i32, static_cast<dtype_in*>(q_data->data), cache,
+                    static_cast<dtype_out*>(output->data), nhead_qo,
+                    flashinfer::RotaryMode(rotary_mode), rope_scale, rope_theta, 0);
             if (status != cudaSuccess) {
               LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
             }

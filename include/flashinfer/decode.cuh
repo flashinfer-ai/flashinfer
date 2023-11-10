@@ -1022,7 +1022,12 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
                   std::tie(max_num_pages_per_batch, new_batch_size) =
                       SplitPagedKVCacheBinarySearchMinNumPagePerBatch(
                           max_grid_size, num_kv_heads, num_pages, 128 / paged_kv.page_size);
-                  tmp_size = num_qo_heads * new_batch_size * (head_dim + 2);
+                  if (new_batch_size == batch_size) {
+                    // do not use cooperative kernel for short sequence
+                    tmp_size = 0;
+                  } else {
+                    tmp_size = num_qo_heads * new_batch_size * (head_dim + 2);
+                  }
                 }
               })})})});
   return cudaSuccess;
