@@ -92,16 +92,17 @@ int _FlashInferSingleDecodeWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, DL
 
 TVM_DLL_EXPORT_TYPED_FUNC(FlashInferSingleDecodeWithKVCache, _FlashInferSingleDecodeWithKVCache);
 
-void _FlashInferAttentionWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
-                                          DLTensor* page_table_indptr, DLTensor* page_table_values,
-                                          DLTensor* last_page_offset,      //
-                                          DLTensor* append_length_indptr,  //
-                                          int64_t layer_id,                //
-                                          DLTensor* tmp_buffer,            //
-                                          DLTensor* output,                //
-                                          int64_t rotary_mode = 0,         //
-                                          double rope_scale = 1.0f,        //
-                                          double rope_theta = 1e4) {
+void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
+                                                 DLTensor* page_table_indptr,     //
+                                                 DLTensor* page_table_values,     //
+                                                 DLTensor* last_page_offset,      //
+                                                 DLTensor* append_length_indptr,  //
+                                                 int64_t layer_id,                //
+                                                 DLTensor* tmp_buffer,            //
+                                                 DLTensor* output,                //
+                                                 int64_t rotary_mode = 0,         //
+                                                 double rope_scale = 1.0f,        //
+                                                 double rope_theta = 1e4) {
   CHECK_EQ(q_data->device.device_type, kDLCUDA) << "The device of q_data must be CUDA.";
   CHECK_EQ(pages->device.device_type, kDLCUDA) << "The device of kv pages must be CUDA.";
   CHECK_EQ(page_table_indptr->device.device_type, kDLCUDA)
@@ -150,21 +151,6 @@ void _FlashInferAttentionWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
 
   CHECK_EQ(append_length_indptr->ndim, 1);
   CHECK_EQ(append_length_indptr->shape[0], num_total_seqs + 1);
-  int total_append_length;
-
-  std::vector<int> append_lengths;
-  SWITCH_TVM_CUDA_IDTYPE(append_length_indptr->dtype, dtype_idx, {
-    std::vector<dtype_idx> append_length_indptr_vec;
-    append_length_indptr_vec.resize(num_total_seqs + 1);
-    cudaMemcpy(append_length_indptr_vec.data(), static_cast<dtype_idx*>(append_length_indptr->data),
-               (num_total_seqs + 1) * sizeof(dtype_idx), cudaMemcpyDeviceToHost);
-
-    for (int i = 0; i < num_total_seqs; ++i) {
-      CHECK_LE(append_length_indptr_vec[i], append_length_indptr_vec[i + 1]);
-      append_lengths.push_back(append_length_indptr_vec[i + 1] - append_length_indptr_vec[i]);
-    }
-    total_append_length = static_cast<int>(append_length_indptr_vec[num_total_seqs]);
-  });
 
   CHECK_EQ(page_table_indptr->ndim, 1);
   CHECK_EQ(page_table_indptr->shape[0], num_total_seqs + 1);
@@ -172,67 +158,137 @@ void _FlashInferAttentionWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
 
   CHECK_EQ(q_data->ndim, 4);
   CHECK_EQ(output->ndim, 4);
+  CHECK_EQ(q_data->shape[0], 1);
   CHECK_EQ(q_data->shape[0], output->shape[0]);
   CHECK_EQ(q_data->shape[1], output->shape[1]);
   CHECK_EQ(q_data->shape[3], nfeat);
   CHECK_EQ(output->shape[2], nhead_qo);
   CHECK_EQ(output->shape[3], nfeat);
 
-  // - Detect the decode pattern: all append lenghts are 1.
-  if (std::all_of(append_lengths.begin(), append_lengths.end(),
-                  [](int length) { return length == 1; }) &&
-      q_data->shape[0] == num_total_seqs && q_data->shape[1] == 1) {
-    SWITCH_TVM_CUDA_DTYPE(
-        pages->dtype, dtype_in,
-        {SWITCH_TVM_CUDA_DTYPE(
-            output->dtype, dtype_out, {SWITCH_TVM_CUDA_IDTYPE(page_table_values->dtype, dtype_idx, {
-              flashinfer::paged_kv_t<dtype_in, dtype_idx> cache(
-                  nlayer, layer_id, nhead_kv, page_size, nfeat, num_total_seqs,
-                  static_cast<dtype_in*>(pages->data),
-                  static_cast<dtype_idx*>(page_table_indptr->data),
-                  static_cast<dtype_idx*>(page_table_values->data),
-                  static_cast<dtype_idx*>(last_page_offset->data));
-              cudaError_t status = flashinfer::BatchDecodeWithPagedKVCache<dtype_in, dtype_out>(
-                  static_cast<dtype_in*>(q_data->data), cache,
-                  static_cast<dtype_out*>(output->data), nullptr, nhead_qo,
-                  flashinfer::RotaryMode(rotary_mode), rope_scale, rope_theta, 0);
-              if (status != cudaSuccess) {
-                LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
-              }
-            })})});
-  } else {
-    CHECK_EQ(q_data->shape[0], 1);
-    CHECK_EQ(q_data->shape[1], total_append_length);
-    for (int length : append_lengths) {
-      CHECK(length == 0 || length == total_append_length)
-          << "Only single-sequence prefill is supported for now.";
-    }
-    SWITCH_TVM_CUDA_DTYPE(
-        pages->dtype, dtype_in,
-        {SWITCH_TVM_CUDA_DTYPE(
-            output->dtype, dtype_out, {SWITCH_TVM_CUDA_IDTYPE(page_table_values->dtype, dtype_idx, {
-              flashinfer::paged_kv_t<dtype_in, dtype_idx> cache(
-                  nlayer, layer_id, nhead_kv, page_size, nfeat, num_total_seqs,
-                  static_cast<dtype_in*>(pages->data),
-                  static_cast<dtype_idx*>(page_table_indptr->data),
-                  static_cast<dtype_idx*>(page_table_values->data),
-                  static_cast<dtype_idx*>(last_page_offset->data));
-              cudaError_t status =
-                  flashinfer::BatchPrefillWithPagedKVCache<dtype_in, dtype_out, dtype_idx>(
-                      static_cast<dtype_in*>(q_data->data), cache,
-                      static_cast<dtype_idx*>(append_length_indptr->data),
-                      static_cast<dtype_out*>(output->data), nullptr, nhead_qo,
-                      /*causal=*/true, flashinfer::RotaryMode(rotary_mode), rope_scale, rope_theta,
-                      0);
-              if (status != cudaSuccess) {
-                LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
-              }
-            })})});
-  }
+  SWITCH_TVM_CUDA_DTYPE(
+      pages->dtype, dtype_in,
+      {SWITCH_TVM_CUDA_DTYPE(
+          output->dtype, dtype_out, {SWITCH_TVM_CUDA_IDTYPE(page_table_values->dtype, dtype_idx, {
+            flashinfer::paged_kv_t<dtype_in, dtype_idx> cache(
+                nlayer, layer_id, nhead_kv, page_size, nfeat, num_total_seqs,
+                static_cast<dtype_in*>(pages->data),
+                static_cast<dtype_idx*>(page_table_indptr->data),
+                static_cast<dtype_idx*>(page_table_values->data),
+                static_cast<dtype_idx*>(last_page_offset->data));
+            cudaError_t status =
+                flashinfer::BatchPrefillWithPagedKVCache<dtype_in, dtype_out, dtype_idx>(
+                    static_cast<dtype_in*>(q_data->data), cache,
+                    static_cast<dtype_idx*>(append_length_indptr->data),
+                    static_cast<dtype_out*>(output->data), nullptr, nhead_qo,
+                    /*causal=*/true, flashinfer::RotaryMode(rotary_mode), rope_scale, rope_theta,
+                    0);
+            if (status != cudaSuccess) {
+              LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
+            }
+          })})});
 }
 
-TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionWithPagedKVCache,
-                          _FlashInferAttentionWithPagedKVCache);
+void _FlashInferAttentionDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
+                                                DLTensor* page_table_indptr,     //
+                                                DLTensor* page_table_values,     //
+                                                DLTensor* last_page_offset,      //
+                                                DLTensor* append_length_indptr,  //
+                                                int64_t layer_id,                //
+                                                DLTensor* tmp_buffer,            //
+                                                DLTensor* output,                //
+                                                int64_t rotary_mode = 0,         //
+                                                double rope_scale = 1.0f,        //
+                                                double rope_theta = 1e4) {
+  CHECK_EQ(q_data->device.device_type, kDLCUDA) << "The device of q_data must be CUDA.";
+  CHECK_EQ(pages->device.device_type, kDLCUDA) << "The device of kv pages must be CUDA.";
+  CHECK_EQ(page_table_indptr->device.device_type, kDLCUDA)
+      << "The device of page_table_indptr matrix must be CUDA.";
+  CHECK_EQ(page_table_values->device.device_type, kDLCUDA)
+      << "The device of page_table_values matrix must be CUDA.";
+  CHECK_EQ(last_page_offset->device.device_type, kDLCUDA)
+      << "The device of last_page_offset matrix must be CUDA.";
+  CHECK_EQ(append_length_indptr->device.device_type, kDLCUDA)
+      << "The device of append_length_indptr matrix must be CUDA.";
+  CHECK_EQ(tmp_buffer->device.device_type, kDLCUDA) << "The device of the tmp buffer must be CUDA.";
+  CHECK_EQ(output->device.device_type, kDLCUDA) << "The device of output must be CUDA.";
 
-TVM_REGISTER_GLOBAL("paged_kv_cache.attention_kernel")
-    .set_body_typed(_FlashInferAttentionWithPagedKVCache);
+  int32_t dev_id = q_data->device.device_id;
+  CHECK_EQ(pages->device.device_id, dev_id);
+  CHECK_EQ(page_table_indptr->device.device_id, dev_id);
+  CHECK_EQ(page_table_values->device.device_id, dev_id);
+  CHECK_EQ(last_page_offset->device.device_id, dev_id);
+  CHECK_EQ(append_length_indptr->device.device_id, dev_id);
+  CHECK_EQ(tmp_buffer->device.device_id, dev_id);
+  CHECK_EQ(output->device.device_id, dev_id);
+
+  CHECK(q_data->dtype.lanes == 1 && pages->dtype.lanes == 1 && output->dtype.lanes == 1);
+  CHECK(q_data->dtype.bits == pages->dtype.bits && q_data->dtype.code == pages->dtype.code);
+  CHECK(page_table_indptr->dtype.lanes == 1 && page_table_values->dtype.lanes == 1 &&
+        last_page_offset->dtype.lanes == 1 && append_length_indptr->dtype.lanes == 1);
+  CHECK(page_table_indptr->dtype.bits == page_table_values->dtype.bits &&
+        page_table_indptr->dtype.bits == last_page_offset->dtype.bits &&
+        page_table_indptr->dtype.bits == append_length_indptr->dtype.bits &&
+        page_table_indptr->dtype.code == page_table_values->dtype.code &&
+        page_table_indptr->dtype.code == last_page_offset->dtype.code &&
+        page_table_indptr->dtype.code == append_length_indptr->dtype.code);
+
+  CHECK_EQ(pages->ndim, 6);
+  CHECK_LT(layer_id, pages->shape[1]);
+  CHECK_GE(layer_id, 0);
+  CHECK_EQ(pages->shape[2], 2);
+  int64_t nlayer = pages->shape[1];
+  int64_t nhead_kv = pages->shape[3];
+  int64_t nhead_qo = q_data->shape[2];
+  int64_t nfeat = pages->shape[5];
+  int64_t page_size = pages->shape[4];
+
+  CHECK_EQ(last_page_offset->ndim, 1);
+  int64_t num_total_seqs = last_page_offset->shape[0];
+
+  CHECK_EQ(append_length_indptr->ndim, 1);
+  CHECK_EQ(append_length_indptr->shape[0], num_total_seqs + 1);
+
+  CHECK_EQ(page_table_indptr->ndim, 1);
+  CHECK_EQ(page_table_indptr->shape[0], num_total_seqs + 1);
+  CHECK_EQ(page_table_values->ndim, 1);
+
+  CHECK_EQ(q_data->ndim, 4);
+  CHECK_EQ(output->ndim, 4);
+  CHECK_EQ(q_data->shape[0], num_total_seqs);
+  CHECK_EQ(q_data->shape[0], output->shape[0]);
+  CHECK_EQ(q_data->shape[1], 1);
+  CHECK_EQ(q_data->shape[1], output->shape[1]);
+  CHECK_EQ(q_data->shape[3], nfeat);
+  CHECK_EQ(output->shape[2], nhead_qo);
+  CHECK_EQ(output->shape[3], nfeat);
+
+  SWITCH_TVM_CUDA_DTYPE(
+      pages->dtype, dtype_in,
+      {SWITCH_TVM_CUDA_DTYPE(
+          output->dtype, dtype_out, {SWITCH_TVM_CUDA_IDTYPE(page_table_values->dtype, dtype_idx, {
+            flashinfer::paged_kv_t<dtype_in, dtype_idx> cache(
+                nlayer, layer_id, nhead_kv, page_size, nfeat, num_total_seqs,
+                static_cast<dtype_in*>(pages->data),
+                static_cast<dtype_idx*>(page_table_indptr->data),
+                static_cast<dtype_idx*>(page_table_values->data),
+                static_cast<dtype_idx*>(last_page_offset->data));
+            cudaError_t status = flashinfer::BatchDecodeWithPagedKVCache<dtype_in, dtype_out>(
+                static_cast<dtype_in*>(q_data->data), cache, static_cast<dtype_out*>(output->data),
+                nullptr, nhead_qo, flashinfer::RotaryMode(rotary_mode), rope_scale, rope_theta, 0);
+            if (status != cudaSuccess) {
+              LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
+            }
+          })})});
+}
+
+TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionPrefillWithPagedKVCache,
+                          _FlashInferAttentionPrefillWithPagedKVCache);
+
+TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionDecodeWithPagedKVCache,
+                          _FlashInferAttentionDecodeWithPagedKVCache);
+
+TVM_REGISTER_GLOBAL("paged_kv_cache.attention_kernel_prefill")
+    .set_body_typed(_FlashInferAttentionPrefillWithPagedKVCache);
+
+TVM_REGISTER_GLOBAL("paged_kv_cache.attention_kernel_decode")
+    .set_body_typed(_FlashInferAttentionDecodeWithPagedKVCache);
