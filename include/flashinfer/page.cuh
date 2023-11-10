@@ -54,6 +54,25 @@ struct paged_kv_t {
   IdType* seq_lens_before_split;
 
   /*!
+   * \brief Construct an empty paged key-value cache
+   */
+  __host__ __device__ __forceinline__ paged_kv_t()
+      : num_layers(0),
+        layer_idx(0),
+        num_heads(0),
+        page_size(0),
+        head_dim(0),
+        batch_size(0),
+        data(nullptr),
+        indptr(nullptr),
+        indices(nullptr),
+        last_page_offset(nullptr),
+        cooperative_indptr(nullptr),
+        batch_idx_map(nullptr),
+        chunk_start(nullptr),
+        seq_lens_before_split(nullptr) {}
+
+  /*!
    * \brief Construct a paged key-value cache
    * \param num_layers The number of layers
    * \param layer_idx The index of the layer

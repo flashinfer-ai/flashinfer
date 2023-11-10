@@ -15,6 +15,7 @@
  */
 #include <gtest/gtest.h>
 
+#include <flashinfer/buffer_manager.cuh>
 #include <flashinfer/decode.cuh>
 #include <type_traits>
 
@@ -93,6 +94,7 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
       thrust::raw_pointer_cast(kv_indptr_device.data()),
       thrust::raw_pointer_cast(kv_indices_device.data()),
       thrust::raw_pointer_cast(kv_last_page_offset_device.data()));
+  flashinfer::BatchDecodeBufferManager<T, T, int32_t> buf_mgr;
 
   if (!cooperative) {
     // use non-cooperative kernel
@@ -101,42 +103,11 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
         thrust::raw_pointer_cast(o_device.data()), nullptr, num_qo_heads, rotary_mode);
     EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
   } else {
-    // use cooperative kernel
-    uint32_t tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size;
-    cudaError_t status = flashinfer::BatchDecodeWithPagedKVCacheWorkEstimation<T, T>(
-        tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size, paged_kv, num_qo_heads,
-        rotary_mode);
-    EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
-    if (tmp_size == 0) {
-      GTEST_SKIP() << "Cooperative kernel not supported in this setting.";
-    }
-    thrust::device_vector<float> tmp(tmp_size);
-    thrust::device_vector<int32_t> new_indptr(new_batch_size + 1);
-    thrust::device_vector<int32_t> new_last_page_offset(new_batch_size);
-    thrust::device_vector<int32_t> cooperative_indptr(new_batch_size + 1);
-    thrust::device_vector<int32_t> batch_idx_map(new_batch_size);
-    thrust::device_vector<int32_t> chunk_start(new_batch_size);
-    thrust::device_vector<int32_t> seq_lens_before_split(new_batch_size);
-
-    flashinfer::paged_kv_t<T, int32_t> new_paged_kv = paged_kv;
-    new_paged_kv.batch_size = new_batch_size;
-    new_paged_kv.indptr = thrust::raw_pointer_cast(new_indptr.data());
-    new_paged_kv.last_page_offset = thrust::raw_pointer_cast(new_last_page_offset.data());
-    new_paged_kv.cooperative_indptr = thrust::raw_pointer_cast(cooperative_indptr.data());
-    new_paged_kv.batch_idx_map = thrust::raw_pointer_cast(batch_idx_map.data());
-    new_paged_kv.chunk_start = thrust::raw_pointer_cast(chunk_start.data());
-    new_paged_kv.seq_lens_before_split = thrust::raw_pointer_cast(seq_lens_before_split.data());
-
-    flashinfer::SplitPagedKVCache(batch_size, kv_indptr.data(), kv_last_page_offset.data(),
-                                  max_num_pages_per_batch, &new_paged_kv);
-
-    status = flashinfer::BatchDecodeWithPagedKVCache<T, T>(
-        thrust::raw_pointer_cast(q_device.data()), new_paged_kv,
-        thrust::raw_pointer_cast(o_device.data()), thrust::raw_pointer_cast(tmp.data()),
-        num_qo_heads, rotary_mode);
+    cudaError_t status = flashinfer::BatchDecodeWithPagedKVCache<T, T>(
+        &buf_mgr, thrust::raw_pointer_cast(q_device.data()), paged_kv,
+        thrust::raw_pointer_cast(o_device.data()), num_qo_heads, rotary_mode);
     EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
   }
-
   // compare result
   thrust::host_vector<T> o_host = o_device;
   size_t num_result_errors_atol_1e_3_rtol_1e_3 = 0;

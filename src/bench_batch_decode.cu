@@ -16,6 +16,7 @@
 #include <thrust/device_vector.h>
 
 #include <cstdint>
+#include <flashinfer/buffer_manager.cuh>
 #include <flashinfer/decode.cuh>
 #include <nvbench/nvbench.cuh>
 #include <vector>
@@ -68,43 +69,21 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
           vec_bytes(kv_indptr) + vec_bytes(kv_indices) + vec_bytes(kv_last_page_offset),
       "Read");
   state.add_global_memory_writes<uint8_t>(vec_bytes(o), "Write");
+  flashinfer::BatchDecodeBufferManager<T, T, int32_t> buf_mgr;
 
   if (cooperative) {
-    uint32_t tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size;
-    cudaError_t status = flashinfer::BatchDecodeWithPagedKVCacheWorkEstimation<T, T>(
-        tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size, paged_kv, num_qo_heads,
-        rotary_mode);
-
+    // first run to warm up
+    cudaError_t status = flashinfer::BatchDecodeWithPagedKVCache<T, T>(
+        &buf_mgr, thrust::raw_pointer_cast(q.data()), paged_kv, thrust::raw_pointer_cast(o.data()),
+        num_qo_heads, rotary_mode);
     if (status != cudaSuccess) {
       state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
     }
-    if (tmp_size == 0) {
-      state.skip("Cooperative kernel not supported in this setting.");
-    }
-    thrust::device_vector<float> tmp(tmp_size);
-    thrust::device_vector<int32_t> new_indptr(new_batch_size + 1);
-    thrust::device_vector<int32_t> new_last_page_offset(new_batch_size);
-    thrust::device_vector<int32_t> cooperative_indptr(new_batch_size + 1);
-    thrust::device_vector<int32_t> batch_idx_map(new_batch_size);
-    thrust::device_vector<int32_t> chunk_start(new_batch_size);
-    thrust::device_vector<int32_t> seq_lens_before_split(new_batch_size);
 
-    flashinfer::paged_kv_t<T, int32_t> new_paged_kv = paged_kv;
-    new_paged_kv.batch_size = new_batch_size;
-    new_paged_kv.indptr = thrust::raw_pointer_cast(new_indptr.data());
-    new_paged_kv.last_page_offset = thrust::raw_pointer_cast(new_last_page_offset.data());
-    new_paged_kv.cooperative_indptr = thrust::raw_pointer_cast(cooperative_indptr.data());
-    new_paged_kv.batch_idx_map = thrust::raw_pointer_cast(batch_idx_map.data());
-    new_paged_kv.chunk_start = thrust::raw_pointer_cast(chunk_start.data());
-    new_paged_kv.seq_lens_before_split = thrust::raw_pointer_cast(seq_lens_before_split.data());
-
-    flashinfer::SplitPagedKVCache(batch_size, kv_indptr_host.data(),
-                                  kv_last_page_offset_host.data(), max_num_pages_per_batch,
-                                  &new_paged_kv);
     state.exec([&](nvbench::launch&) {
       cudaError_t status = flashinfer::BatchDecodeWithPagedKVCache<T, T>(
-          thrust::raw_pointer_cast(q.data()), new_paged_kv, thrust::raw_pointer_cast(o.data()),
-          thrust::raw_pointer_cast(tmp.data()), num_qo_heads, rotary_mode);
+          &buf_mgr, thrust::raw_pointer_cast(q.data()), paged_kv,
+          thrust::raw_pointer_cast(o.data()), num_qo_heads, rotary_mode);
       if (status != cudaSuccess) {
         state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
       }
