@@ -718,9 +718,9 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& 
  * \tparam DTypeOut A template type indicates the output data type
  * \param q The query matrix, shape: [num_qo_heads, head_dim]
  * \param k The key matrix in kv-cache, shape: [seq_len, num_kv_heads, head_dim]
- *   for NHD layout, [num_kv_heads, head_dim, seq_len] for HND layout
+ *   for NHD layout, [num_kv_heads, seq_len, head_dim] for HND layout
  * \param v The value matrix in kv-cache, shape: [seq_len, num_kv_heads,
- *   head_dim] for NHD layout, [num_kv_heads, head_dim, seq_len] for HND layout
+ *   head_dim] for NHD layout, [num_kv_heads, seq_len, head_dim] for HND layout
  * \param o The output matrix, shape: [num_qo_heads, head_dim]
  * \param tmp Used-allocated temporary buffer
  * \param num_qo_heads A integer indicates the number of heads of query and output
