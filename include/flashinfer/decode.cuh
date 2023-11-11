@@ -973,6 +973,14 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
   const uint32_t head_dim = paged_kv.head_dim;
   const uint32_t batch_size = paged_kv.batch_size;
   const uint32_t num_kv_heads = paged_kv.num_heads;
+
+  // Only apply for batch size over 2 at this moment.
+  if (batch_size >= 2) {
+    tmp_size = 0;
+    new_batch_size = batch_size;
+    return cudaSuccess;
+  }
+
   SWITCH_GQA_GROUP_SIZE(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
       {SWITCH_HEAD_DIM(
@@ -1012,16 +1020,15 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
                 } else {
                   // compute max_num_pages_per_batch and new_batch_size
                   std::vector<IdType> page_indptr_h(batch_size + 1), num_pages(batch_size);
-                  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(page_indptr_h.data(), paged_kv.indptr,
-                                                       sizeof(IdType) * (batch_size + 1),
-                                                       cudaMemcpyDeviceToHost, stream));
-                  FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
+                  FLASHINFER_CUDA_CALL(cudaMemcpy(page_indptr_h.data(), paged_kv.indptr,
+                                                  sizeof(IdType) * (batch_size + 1),
+                                                  cudaMemcpyDeviceToHost));
                   for (uint32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
                     num_pages[batch_idx] = page_indptr_h[batch_idx + 1] - page_indptr_h[batch_idx];
                   }
                   std::tie(max_num_pages_per_batch, new_batch_size) =
                       SplitPagedKVCacheBinarySearchMinNumPagePerBatch(
-                          max_grid_size, num_kv_heads, num_pages, 128 / paged_kv.page_size);
+                          max_grid_size, num_kv_heads, num_pages, 512 / paged_kv.page_size);
                   if (new_batch_size == batch_size) {
                     // do not use cooperative kernel for short sequence
                     tmp_size = 0;
