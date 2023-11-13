@@ -16,8 +16,8 @@
 #include <thrust/device_vector.h>
 
 #include <cstdint>
-#include <flashinfer/wrapper.cuh>
 #include <flashinfer/decode.cuh>
+#include <flashinfer/wrapper.cuh>
 #include <nvbench/nvbench.cuh>
 #include <vector>
 
@@ -29,7 +29,7 @@ template <typename T>
 void bench_flashinfer_batch_decode(nvbench::state& state) {
   constexpr size_t head_dim = 128;
   constexpr size_t num_layers = 3;
-  constexpr size_t layer_idx = 1;
+  constexpr size_t layer_idx = 0;
   constexpr auto rotary_mode = flashinfer::RotaryMode::kNone;
   size_t seqlen = state.get_int64("seqlen");
   size_t batch_size = state.get_int64("batch_size");
@@ -79,6 +79,7 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
     if (status != cudaSuccess) {
       state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
     }
+    paged_kv.layer_idx = 1;
 
     state.exec([&](nvbench::launch&) {
       cudaError_t status = flashinfer::BatchDecodeWithPagedKVCache<T, T>(

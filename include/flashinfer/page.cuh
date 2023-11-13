@@ -16,13 +16,15 @@
 #ifndef FLASHINFER_PAGE_CUH_
 #define FLASHINFER_PAGE_CUH_
 
+#include <utility>
+
 #include "layout.cuh"
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
 
 namespace flashinfer {
 
-enum class AccessType {
+enum class AccessMode {
   kProtective = 0U,    // Check whether page_iter is out of range
   kNonProtective = 1U  // Do not check whether page_iter is out of range
 };
@@ -176,31 +178,41 @@ struct paged_kv_t {
     }
   }
 
-  template <AccessType access_type>
-  __device__ __forceinline__ DType* get_k_ptr(uint32_t page_iter, uint32_t head_idx,
-                                              uint32_t entry_idx, uint32_t feat_idx) const {
-    if constexpr (access_type == AccessType::kProtective) {
+  __host__ __device__ __forceinline__ uint32_t kv_offset_delta() const {
+    return num_heads * page_size * head_dim;
+  }
+
+  template <AccessMode access_mode = AccessMode::kNonProtective>
+  __host__ __device__ __forceinline__ DType* get_k_ptr(uint32_t page_iter, uint32_t head_idx,
+                                                       uint32_t entry_idx,
+                                                       uint32_t feat_idx) const {
+    if constexpr (access_mode == AccessMode::kProtective) {
       if (page_iter < indptr[batch_size]) {
         return data + get_k_elem_offset(indices[page_iter], head_idx, entry_idx, feat_idx);
+        ;
       } else {
         return data;
       }
     } else {
       return data + get_k_elem_offset(indices[page_iter], head_idx, entry_idx, feat_idx);
+      ;
     }
   }
 
-  template <AccessType access_type>
-  __device__ __forceinline__ DType* get_v_ptr(uint32_t page_iter, uint32_t head_idx,
-                                              uint32_t entry_idx, uint32_t feat_idx) const {
-    if constexpr (access_type == AccessType::kProtective) {
+  template <AccessMode access_mode = AccessMode::kNonProtective>
+  __host__ __device__ __forceinline__ DType* get_v_ptr(uint32_t page_iter, uint32_t head_idx,
+                                                       uint32_t entry_idx,
+                                                       uint32_t feat_idx) const {
+    if constexpr (access_mode == AccessMode::kProtective) {
       if (page_iter < indptr[batch_size]) {
         return data + get_v_elem_offset(indices[page_iter], head_idx, entry_idx, feat_idx);
+        ;
       } else {
         return data;
       }
     } else {
       return data + get_v_elem_offset(indices[page_iter], head_idx, entry_idx, feat_idx);
+      ;
     }
   }
 };
@@ -230,17 +242,16 @@ __global__ void AppendPagedKVCacheDecodeKernel(paged_kv_t<DType, IdType> paged_k
       (paged_kv.indptr[batch_idx + 1] - paged_kv.indptr[batch_idx] - 1) * paged_kv.page_size +
       paged_kv.last_page_offset[batch_idx];
 
-  uint32_t page_idx =
-      paged_kv.indices[paged_kv.indptr[batch_idx] + (seq_len - 1) / paged_kv.page_size];
+  uint32_t page_iter = paged_kv.indptr[batch_idx] + (seq_len - 1) / paged_kv.page_size;
   uint32_t entry_idx = (seq_len - 1) % paged_kv.page_size;
 
+  DType* k_ptr = paged_kv.get_k_ptr(page_iter, head_idx, entry_idx, tx * vec_size);
+  DType* v_ptr = k_ptr + paged_kv.kv_offset_delta();
   vec_t<DType, vec_size>::memcpy(
-      paged_kv.data + paged_kv.get_k_elem_offset(page_idx, head_idx, entry_idx, tx * vec_size),
-      key + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
+      k_ptr, key + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
 
   vec_t<DType, vec_size>::memcpy(
-      paged_kv.data + paged_kv.get_v_elem_offset(page_idx, head_idx, entry_idx, tx * vec_size),
-      value + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
+      v_ptr, value + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
 }
 
 /*!
@@ -275,16 +286,17 @@ __global__ void AppendPagedKVCachePrefillKernel(paged_kv_t<DType, IdType> paged_
 #pragma unroll 2
   for (uint32_t j = 0; j < append_seq_len; ++j) {
     uint32_t page_seq_idx = j + append_start;
-    uint32_t page_idx =
-        paged_kv.indices[paged_kv.indptr[batch_idx] + page_seq_idx / paged_kv.page_size];
+    uint32_t page_iter = paged_kv.indptr[batch_idx] + page_seq_idx / paged_kv.page_size;
     uint32_t entry_idx = page_seq_idx % paged_kv.page_size;
 
+    DType* k_ptr = paged_kv.get_k_ptr(page_iter, head_idx, entry_idx, tx * vec_size);
+    DType* v_ptr = k_ptr + paged_kv.kv_offset_delta();
     vec_t<DType, vec_size>::memcpy(
-        paged_kv.data + paged_kv.get_k_elem_offset(page_idx, head_idx, entry_idx, tx * vec_size),
+        k_ptr,
         key + ((append_indptr[batch_idx] + j) * num_heads + head_idx) * head_dim + tx * vec_size);
 
     vec_t<DType, vec_size>::memcpy(
-        paged_kv.data + paged_kv.get_v_elem_offset(page_idx, head_idx, entry_idx, tx * vec_size),
+        v_ptr,
         value + ((append_indptr[batch_idx] + j) * num_heads + head_idx) * head_dim + tx * vec_size);
   }
 }
@@ -315,14 +327,17 @@ __global__ void PagedKVCacheToRaggedTensorKernel(paged_kv_t<DType, IdType> paged
 
 #pragma unroll 2
   for (uint32_t j = 0; j < kv_indptr[batch_idx + 1] - kv_indptr[batch_idx]; ++j) {
-    uint32_t page_idx = paged_kv.indices[paged_kv.indptr[batch_idx] + j / paged_kv.page_size];
+    uint32_t page_iter = paged_kv.indptr[batch_idx] + j / paged_kv.page_size;
     uint32_t entry_idx = j % paged_kv.page_size;
+
+    DType* k_ptr = paged_kv.get_k_ptr(page_iter, head_idx, entry_idx, tx * vec_size);
+    DType* v_ptr = k_ptr + paged_kv.kv_offset_delta();
     vec_t<DType, vec_size>::memcpy(
         key + ((kv_indptr[batch_idx] + j) * num_heads + head_idx) * head_dim + tx * vec_size,
-        paged_kv.data + paged_kv.get_k_elem_offset(page_idx, head_idx, entry_idx, tx * vec_size));
+        k_ptr);
     vec_t<DType, vec_size>::memcpy(
         value + ((kv_indptr[batch_idx] + j) * num_heads + head_idx) * head_dim + tx * vec_size,
-        paged_kv.data + paged_kv.get_v_elem_offset(page_idx, head_idx, entry_idx, tx * vec_size));
+        v_ptr);
   }
 }
 

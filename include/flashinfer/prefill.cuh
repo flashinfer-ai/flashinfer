@@ -154,9 +154,9 @@ __device__ __forceinline__ void page_produce_kv(smem_t smem, uint32_t* smem_offs
     const uint32_t page_iter = page_iter_base + (4 * num_warps * i + ty * 4) / page_size;
     const uint32_t entry_idx = (4 * num_warps * i + ty * 4) % page_size + tx / 8;
     DType* gptr = produce_v
-                      ? (paged_kv.template get_v_ptr<AccessType::kProtective>(
+                      ? (paged_kv.template get_v_ptr<AccessMode::kProtective>(
                             page_iter, kv_head_idx, entry_idx, (tx % 8) * cell_capacity<DType>()))
-                      : (paged_kv.template get_k_ptr<AccessType::kProtective>(
+                      : (paged_kv.template get_k_ptr<AccessMode::kProtective>(
                             page_iter, kv_head_idx, entry_idx, (tx % 8) * cell_capacity<DType>()));
 #pragma unroll
     for (uint32_t j = 0; j < num_frags_y / 4; ++j) {

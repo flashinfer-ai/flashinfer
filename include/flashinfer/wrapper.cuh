@@ -135,6 +135,24 @@ class BatchDecodeBufferManager {
   cudaStream_t stream_;
 };
 
+/*!
+ * \brief Wrapper of BatchDecodeWithPagedKVCache function, and caches the temporary buffer
+ *   for cooperative kernels.
+ * \tparam DTypeIn The data type of input tensor.
+ * \tparam DTypeOut The data type of output tensor.
+ * \tparam IdType The data type of index tensor.
+ * \param buf_manager The buffer manager.
+ * \param q The input tensor.
+ * \param paged_kv The paged key-value tensor.
+ * \param o The output tensor.
+ * \param num_qo_heads The number of heads.
+ * \param rotary_mode The rotary mode.
+ * \param rope_scale The scale of rope.
+ * \param rope_theta The theta of rope.
+ * \param stream The CUDA stream.
+ * \note This wrapper function only computes the temporary buffer size and allocates the
+ *   temporary buffer when layer_idx is 0.
+ */
 template <typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCache(
     BatchDecodeBufferManager<DTypeIn, DTypeOut, IdType>* buf_manager, DTypeIn* q,
