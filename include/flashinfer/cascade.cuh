@@ -16,13 +16,10 @@
 #ifndef FLASHINFER_CASCADE_CUH_
 #define FLASHINFER_CASCADE_CUH_
 
-#include "prefill.cuh"
 #include "decode.cuh"
+#include "prefill.cuh"
 #include "state.cuh"
 
-namespace flashinfer{
-
-
-}  // namespace flashinfer
+namespace flashinfer {}  // namespace flashinfer
 
 #endif  // FLASHINFER_CASCADE_CUH_

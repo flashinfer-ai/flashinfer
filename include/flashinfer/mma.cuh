@@ -39,6 +39,11 @@ namespace mma {
 #endif
 #endif
 
+enum class MMAMode {
+  kInit = 0U,
+  kInplaceUpdate = 1U,
+};
+
 /*!
  * \brief Wrapper of PTX ldmatrix m8n8.x4 instruction, loads data from shared memory
  *   to fragment
@@ -111,16 +116,16 @@ __device__ __forceinline__ void stmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
  * \brief Wrapper of two mma m16n8k16 instructions for row major and column major f16 matrix
  *   multiplication, accumulated in f32.
  * \tparam T data type of the fragment
- * \tparam init whether to initialize the accumulator with zero
+ * \tparam mma_mode whether we are initializing the accumulator or updating it
  * \param C pointer to the accumulator
  * \param A pointer to the fragment of matrix A
  * \param B pointer to the fragment of matrix B
  */
-template <typename T, bool init = false>
+template <typename T, MMAMode mma_mode = MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, uint32_t* A,
                                                                      uint32_t* B) {
 #if defined(FLASHINFER_MMA_F16F16F32_M16N8K16_ENABLED)
-  if constexpr (init) {
+  if constexpr (mma_mode == MMAMode::kInit) {
     if constexpr (std::is_same<T, half>::value) {
       asm volatile(
           "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
@@ -203,7 +208,7 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
   }
 #elif defined(FLASHINFER_MMA_F16F16F32_M16N8K8_ENABLED)
   static_assert(std::is_same<T, half>::value, "bf16 mma instruction is not supported on sm_75");
-  if constexpr (init) {
+  if constexpr (mma_mode == MMAMode::kInit) {
     asm volatile(
         "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
         "{%0,  %1,  %2,  %3},"

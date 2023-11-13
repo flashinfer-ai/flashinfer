@@ -22,6 +22,11 @@
 
 namespace flashinfer {
 
+enum class AccessType {
+  kProtective = 0U,    // Check whether page_iter is out of range
+  kNonProtective = 1U  // Do not check whether page_iter is out of range
+};
+
 /*!
  * \brief Paged key-value cache
  * \tparam DType The data type of the key-value cache
@@ -171,11 +176,10 @@ struct paged_kv_t {
     }
   }
 
-  template <bool out_of_bound_return_null>
-  __host__ __device__ __forceinline__ DType* get_k_ptr(uint32_t page_iter, uint32_t head_idx,
-                                                       uint32_t entry_idx,
-                                                       uint32_t feat_idx) const {
-    if constexpr (out_of_bound_return_null) {
+  template <AccessType access_type>
+  __device__ __forceinline__ DType* get_k_ptr(uint32_t page_iter, uint32_t head_idx,
+                                              uint32_t entry_idx, uint32_t feat_idx) const {
+    if constexpr (access_type == AccessType::kProtective) {
       if (page_iter < indptr[batch_size]) {
         return data + get_k_elem_offset(indices[page_iter], head_idx, entry_idx, feat_idx);
       } else {
@@ -186,11 +190,10 @@ struct paged_kv_t {
     }
   }
 
-  template <bool out_of_bound_return_null>
-  __host__ __device__ __forceinline__ DType* get_v_ptr(uint32_t page_iter, uint32_t head_idx,
-                                                       uint32_t entry_idx,
-                                                       uint32_t feat_idx) const {
-    if constexpr (out_of_bound_return_null) {
+  template <AccessType access_type>
+  __device__ __forceinline__ DType* get_v_ptr(uint32_t page_iter, uint32_t head_idx,
+                                              uint32_t entry_idx, uint32_t feat_idx) const {
+    if constexpr (access_type == AccessType::kProtective) {
       if (page_iter < indptr[batch_size]) {
         return data + get_v_elem_offset(indices[page_iter], head_idx, entry_idx, feat_idx);
       } else {
