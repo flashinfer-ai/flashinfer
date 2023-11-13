@@ -145,7 +145,8 @@ struct paged_kv_t {
         seq_lens_before_split(seq_lens_before_split) {}
 
   __host__ __device__ __forceinline__ size_t get_k_elem_offset(size_t page_idx, size_t head_idx,
-                                                               size_t entry_idx, size_t feat_idx) {
+                                                               size_t entry_idx,
+                                                               size_t feat_idx) const {
     return (((page_idx * num_layers + layer_idx) * 2 * num_heads + head_idx) * page_size +
             entry_idx) *
                head_dim +
@@ -153,7 +154,8 @@ struct paged_kv_t {
   }
 
   __host__ __device__ __forceinline__ size_t get_v_elem_offset(size_t page_idx, size_t head_idx,
-                                                               size_t entry_idx, size_t feat_idx) {
+                                                               size_t entry_idx,
+                                                               size_t feat_idx) const {
     return ((((page_idx * num_layers + layer_idx) * 2 + 1) * num_heads + head_idx) * page_size +
             entry_idx) *
                head_dim +
@@ -161,11 +163,41 @@ struct paged_kv_t {
   }
 
   __host__ __device__ __forceinline__ uint32_t get_valid_page_size(uint32_t batch_idx,
-                                                                   uint32_t page_iter) {
+                                                                   uint32_t page_iter) const {
     if (page_iter == indptr[batch_idx + 1] - 1) {
       return last_page_offset[batch_idx];
     } else {
       return page_size;
+    }
+  }
+
+  template <bool out_of_bound_return_null>
+  __host__ __device__ __forceinline__ DType* get_k_ptr(uint32_t page_iter, uint32_t head_idx,
+                                                       uint32_t entry_idx,
+                                                       uint32_t feat_idx) const {
+    if constexpr (out_of_bound_return_null) {
+      if (page_iter < indptr[batch_size]) {
+        return data + get_k_elem_offset(indices[page_iter], head_idx, entry_idx, feat_idx);
+      } else {
+        return data;
+      }
+    } else {
+      return data + get_k_elem_offset(indices[page_iter], head_idx, entry_idx, feat_idx);
+    }
+  }
+
+  template <bool out_of_bound_return_null>
+  __host__ __device__ __forceinline__ DType* get_v_ptr(uint32_t page_iter, uint32_t head_idx,
+                                                       uint32_t entry_idx,
+                                                       uint32_t feat_idx) const {
+    if constexpr (out_of_bound_return_null) {
+      if (page_iter < indptr[batch_size]) {
+        return data + get_v_elem_offset(indices[page_iter], head_idx, entry_idx, feat_idx);
+      } else {
+        return data;
+      }
+    } else {
+      return data + get_v_elem_offset(indices[page_iter], head_idx, entry_idx, feat_idx);
     }
   }
 };

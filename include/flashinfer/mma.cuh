@@ -26,6 +26,19 @@ namespace flashinfer {
 
 namespace mma {
 
+#if (__CUDACC_VER_MAJOR__ >= 11)
+#if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900))
+#define FLASHINFER_STMATRIX_M8N8X4_ENABLED
+#endif
+#if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 800))
+#define FLASHINFER_MMA_F16F16F32_M16N8K16_ENABLED
+#endif
+#if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 750))
+#define FLASHINFER_MMA_F16F16F32_M16N8K8_ENABLED
+#define FLASHINFER_LDMATRIX_M8N8X4_ENABLED
+#endif
+#endif
+
 /*!
  * \brief Wrapper of PTX ldmatrix m8n8.x4 instruction, loads data from shared memory
  *   to fragment
@@ -35,10 +48,14 @@ namespace mma {
  */
 template <typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
+#ifdef FLASHINFER_LDMATRIX_M8N8X4_ENABLED
   uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                : "=r"(R[0]), "=r"(R[1]), "=r"(R[2]), "=r"(R[3])
                : "r"(smem_int_ptr));
+#else
+#error "Unsupported CUDA architecture for ldmatrix instruction"
+#endif
 }
 
 /*!
@@ -50,10 +67,14 @@ __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
  */
 template <typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t* R, T* smem_ptr) {
+#ifdef FLASHINFER_LDMATRIX_M8N8X4_ENABLED
   uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   asm volatile("ldmatrix.sync.aligned.trans.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                : "=r"(R[0]), "=r"(R[1]), "=r"(R[2]), "=r"(R[3])
                : "r"(smem_int_ptr));
+#else
+#error "Unsupported CUDA architecture for ldmatrix instruction"
+#endif
 }
 
 /*!
@@ -65,11 +86,12 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t* R, T* smem_ptr) 
  */
 template <typename T>
 __device__ __forceinline__ void stmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDACC_VER_MAJOR__ >= 11)
+#ifdef FLASHINFER_STMATRIX_M8N8X4_ENABLED
   uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
                : "r"(smem_int_ptr), "r"(R[0]), "r"(R[1]), "r"(R[2]), "r"(R[3]));
 #else
+  // Fallback implementation, slower than PTX instruction
   const uint32_t tx = threadIdx.x;
   uint4 word;
 #pragma unroll
@@ -97,6 +119,7 @@ __device__ __forceinline__ void stmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
 template <typename T, bool init = false>
 __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, uint32_t* A,
                                                                      uint32_t* B) {
+#if defined(FLASHINFER_MMA_F16F16F32_M16N8K16_ENABLED)
   if constexpr (init) {
     if constexpr (std::is_same<T, half>::value) {
       asm volatile(
@@ -178,6 +201,78 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
             "f"(C[6]), "f"(C[7]));
     }
   }
+#elif defined(FLASHINFER_MMA_F16F16F32_M16N8K8_ENABLED)
+  static_assert(std::is_same<T, half>::value, "bf16 mma instruction is not supported on sm_75");
+  if constexpr (init) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,  %1,  %2,  %3},"
+        "{%4,  %5},"
+        "{%6},"
+        "{%7, %8, %9, %10};\n"
+        : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
+        : "r"(A[0]), "r"(A[1]), "r"(B[0]), "f"(0.f), "f"(0.f), "f"(0.f), "f"(0.f));
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,  %1,  %2,  %3},"
+        "{%4,  %5},"
+        "{%6},"
+        "{%7, %8, %9, %10};\n"
+        : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
+        : "r"(A[2]), "r"(A[3]), "r"(B[1]), "f"(0.f), "f"(0.f), "f"(0.f), "f"(0.f));
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,  %1,  %2,  %3},"
+        "{%4,  %5},"
+        "{%6},"
+        "{%7, %8, %9, %10};\n"
+        : "=f"(C[4]), "=f"(C[5]), "=f"(C[6]), "=f"(C[7])
+        : "r"(A[0]), "r"(A[1]), "r"(B[2]), "f"(0.f), "f"(0.f), "f"(0.f), "f"(0.f));
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,  %1,  %2,  %3},"
+        "{%4,  %5},"
+        "{%6},"
+        "{%7, %8, %9, %10};\n"
+        : "=f"(C[4]), "=f"(C[5]), "=f"(C[6]), "=f"(C[7])
+        : "r"(A[2]), "r"(A[3]), "r"(B[3]), "f"(0.f), "f"(0.f), "f"(0.f), "f"(0.f));
+  } else {
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,  %1,  %2,  %3},"
+        "{%4,  %5},"
+        "{%6},"
+        "{%7, %8, %9, %10};\n"
+        : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
+        : "r"(A[0]), "r"(A[1]), "r"(B[0]), "f"(C[0]), "f"(C[1]), "f"(C[2]), "f"(C[3]));
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,  %1,  %2,  %3},"
+        "{%4,  %5},"
+        "{%6},"
+        "{%7, %8, %9, %10};\n"
+        : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
+        : "r"(A[2]), "r"(A[3]), "r"(B[1]), "f"(C[0]), "f"(C[1]), "f"(C[2]), "f"(C[3]));
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,  %1,  %2,  %3},"
+        "{%4,  %5},"
+        "{%6},"
+        "{%7, %8, %9, %10};\n"
+        : "=f"(C[4]), "=f"(C[5]), "=f"(C[6]), "=f"(C[7])
+        : "r"(A[0]), "r"(A[1]), "r"(B[2]), "f"(C[4]), "f"(C[5]), "f"(C[6]), "f"(C[7]));
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,  %1,  %2,  %3},"
+        "{%4,  %5},"
+        "{%6},"
+        "{%7, %8, %9, %10};\n"
+        : "=f"(C[4]), "=f"(C[5]), "=f"(C[6]), "=f"(C[7])
+        : "r"(A[2]), "r"(A[3]), "r"(B[3]), "f"(C[4]), "f"(C[5]), "f"(C[6]), "f"(C[7]));
+  }
+#else
+#error "Unsupported CUDA architecture for mma instruction"
+#endif
 }
 
 }  // namespace mma

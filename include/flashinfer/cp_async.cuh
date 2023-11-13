@@ -22,12 +22,18 @@ namespace flashinfer {
 
 namespace cp_async {
 
+#if (__CUDACC_VER_MAJOR__ >= 11)
+#if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 800))
+#define FLASHINFER_CP_ASYNC_ENABLED
+#endif
+#endif
+
 /*!
  * \brief Wrapper of PTX cp.async.commit_group instruction, commit all prior uncommitted
  *   cp.async instructions to a group
  */
 __device__ __forceinline__ void commit_group() {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDACC_VER_MAJOR__ >= 11)
+#ifdef FLASHINFER_CP_ASYNC_ENABLED
   asm volatile("cp.async.commit_group;\n" ::);
 #endif
 }
@@ -38,7 +44,7 @@ __device__ __forceinline__ void commit_group() {
  */
 template <size_t n>
 __device__ __forceinline__ void wait_group() {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDACC_VER_MAJOR__ >= 11)
+#ifdef FLASHINFER_CP_ASYNC_ENABLED
   asm volatile("cp.async.wait_group %0;\n" ::"n"(n));
 #endif
 }
@@ -53,8 +59,7 @@ __device__ __forceinline__ void wait_group() {
  */
 template <bool prefetch, typename T>
 __device__ __forceinline__ void load_128b(T* smem_ptr, const T* gmem_ptr) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDACC_VER_MAJOR__ >= 11)
-
+#ifdef FLASHINFER_CP_ASYNC_ENABLED
   uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   if constexpr (prefetch) {
     asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2, %3;\n" ::"r"(smem_int_ptr),
@@ -81,8 +86,7 @@ __device__ __forceinline__ void load_128b(T* smem_ptr, const T* gmem_ptr) {
  */
 template <bool prefetch, bool fill_zero, typename T>
 __device__ __forceinline__ void pred_load_128b(T* smem_ptr, const T* gmem_ptr, bool predicate) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDACC_VER_MAJOR__ >= 11)
-
+#ifdef FLASHINFER_CP_ASYNC_ENABLED
   uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   if constexpr (fill_zero) {
     int src_in_bytes = predicate ? 16 : 0;
