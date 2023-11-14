@@ -470,13 +470,23 @@ __device__ __forceinline__ void sync_d_state(float (*d)[2]) {
 
 template <uint32_t num_frags_x, uint32_t num_frags_y>
 __device__ __forceinline__ void normalize_d(float (*o_frag)[num_frags_y][8], float (*d)[2]) {
+  float d_rcp[num_frags_x][2];
+  // compute reciprocal of d
+#pragma unroll
+  for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+    for (uint32_t j = 0; j < 2; ++j) {
+      d_rcp[fx][j] = math::ptx_rcp(d[fx][j]);
+    }
+  }
+
 #pragma unroll
   for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
     for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
 #pragma unroll
       for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
-        o_frag[fx][fy][reg_id] = __fdividef(o_frag[fx][fy][reg_id], d[fx][(reg_id % 4) / 2]);
+        o_frag[fx][fy][reg_id] = o_frag[fx][fy][reg_id] * d_rcp[fx][(reg_id % 4) / 2];
       }
     }
   }

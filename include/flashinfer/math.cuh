@@ -45,6 +45,16 @@ __forceinline__ __device__ float ptx_lg2(float x) {
 }
 
 /*!
+ * \brief Wrapper of PTX rcp.approx instruction, which computes 1/x
+ * \param x input
+ */
+__forceinline__ __device__ float ptx_rcp(float x) {
+  float y;
+  asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+
+/*!
  * \brief Wrapper of PTX shfl.sync.bfly instruction, which performs a butterfly shuffle
  *   between threads in a warp.
  * \param x The value in the source lane
