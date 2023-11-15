@@ -660,7 +660,8 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& 
                                                   QKVLayout layout = QKVLayout::kNHD,
                                                   RotaryMode rotary_mode = RotaryMode::kNone,
                                                   cudaStream_t stream = nullptr) {
-  if (seq_len <= 128U) {
+  const uint32_t GROUP_SIZE = num_qo_heads / num_kv_heads;
+  if (seq_len <= 128U / uint32_t(std::sqrt(GROUP_SIZE))) {
     tmp_size = 0;
   } else {
     SWITCH_GQA_GROUP_SIZE(
@@ -696,10 +697,9 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& 
                       &num_blocks_per_sm, kernel, num_threads, smem_size));
                   max_grid_size = uint32_t(num_blocks_per_sm) * uint32_t(num_sm);
                   uint32_t max_num_kv_chunks = max_grid_size / num_kv_heads;
-                  uint32_t kv_chunk_size = max(
-                      (seq_len + max_num_kv_chunks - 1U) / max_num_kv_chunks,
-                      min(num_threads,
-                          max(num_threads / 8, seq_len / max(1U, (num_threads / num_kv_heads)))));
+                  uint32_t kv_chunk_size =
+                      max((seq_len + max_num_kv_chunks - 1U) / max_num_kv_chunks,
+                          uint32_t(std::sqrt(seq_len / GROUP_SIZE)) * 4);
                   uint32_t num_kv_chunks = (seq_len + kv_chunk_size - 1) / kv_chunk_size;
                   tmp_size = num_qo_heads * num_kv_chunks * (head_dim + 2);
                 })})})});
@@ -760,7 +760,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                 const uint32_t smem_size =
                     2U * num_stages_smem * bdy * bdz * head_dim * sizeof(DTypeIn) +
                     2U * bdy * bdz * sizeof(float);
-                if (seq_len <= 128U || tmp == nullptr) {
+                if (seq_len <= 128U / uint32_t(std::sqrt(GROUP_SIZE)) || tmp == nullptr) {
                   // no need to use cooperative kernel
                   auto kernel =
                       SingleDecodeWithKVCacheKernel<QKV_LAYOUT, false, norm_on_the_fly, ROTARY_MODE,
@@ -802,10 +802,9 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                       &num_blocks_per_sm, kernel, num_threads, smem_size));
                   uint32_t max_grid_size = uint32_t(num_blocks_per_sm) * uint32_t(num_sm);
                   uint32_t max_num_kv_chunks = max_grid_size / num_kv_heads;
-                  uint32_t kv_chunk_size = max(
-                      (seq_len + max_num_kv_chunks - 1U) / max_num_kv_chunks,
-                      min(num_threads,
-                          max(num_threads / 8, seq_len / max(1U, (num_threads / num_kv_heads)))));
+                  uint32_t kv_chunk_size =
+                      max((seq_len + max_num_kv_chunks - 1U) / max_num_kv_chunks,
+                          uint32_t(std::sqrt(seq_len / GROUP_SIZE)) * 4);
                   dim3 nblks = dim3((seq_len + kv_chunk_size - 1) / kv_chunk_size, num_kv_heads);
                   assert(nblks.x > 0 && nblks.y > 0);
                   dim3 nthrs = dim3(bdx, bdy, bdz);
