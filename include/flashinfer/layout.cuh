@@ -71,8 +71,6 @@ struct tensor_info_t {
                                         head_dim);
   }
 
-  __host__ __device__ __forceinline__ size_t get_n_stride() const { return get_kv_n_stride(); }
-
   __host__ __device__ __forceinline__ size_t get_qo_n_stride() const {
     return layout == QKVLayout::kHND ? head_dim : get_num_qo_heads() * head_dim;
   }
