@@ -45,6 +45,27 @@ __forceinline__ __device__ float ptx_lg2(float x) {
 }
 
 /*!
+ * \brief Wrapper of PTX ex2.approx.f16x2 instruction, which computes 2^x
+ * \param x input
+ */
+__forceinline__ __device__ half2 ptx_exp2(half2 x) {
+  uint32_t y_u32;
+  uint32_t x_u32 = *(uint32_t*)&x;
+  asm volatile("ex2.approx.f16x2 %0, %1;" : "=r"(y_u32) : "r"(x_u32));
+  return *(half2*)&y_u32;
+}
+
+/*!
+ * \brief Wrapper of PTX ex2.approx.f16 instruction, which computes 2^x
+ * \param x input
+ */
+__forceinline__ __device__ half ptx_exp2(half x) {
+  ushort y_u16;
+  asm volatile("ex2.approx.f16 %0, %1;" : "=h"(y_u16) : "h"(__half_as_ushort(x)));
+  return __ushort_as_half(y_u16);
+}
+
+/*!
  * \brief Wrapper of PTX rcp.approx instruction, which computes 1/x
  * \param x input
  */
