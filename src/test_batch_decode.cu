@@ -15,8 +15,8 @@
  */
 #include <gtest/gtest.h>
 
-#include <flashinfer/wrapper.cuh>
 #include <flashinfer/decode.cuh>
+#include <flashinfer/wrapper.cuh>
 #include <type_traits>
 
 #include "cpu_reference.h"

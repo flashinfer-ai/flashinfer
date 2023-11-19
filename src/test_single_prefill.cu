@@ -26,7 +26,8 @@ template <typename DTypeIn, typename DTypeOut>
 void _TestSinglePrefillKernelCorrectness(size_t qo_len, size_t kv_len, size_t num_qo_heads,
                                          size_t num_kv_heads, size_t head_dim, bool causal,
                                          QKVLayout layout, RotaryMode rotary_mode,
-                                         float rtol = 1e-3, float atol = 1e-3) {
+                                         bool allow_fp16_qk_reduction, float rtol = 1e-3,
+                                         float atol = 1e-3) {
   std::vector<DTypeIn> q(qo_len * num_qo_heads * head_dim);
   std::vector<DTypeIn> k(kv_len * num_kv_heads * head_dim);
   std::vector<DTypeIn> v(kv_len * num_kv_heads * head_dim);
@@ -47,7 +48,7 @@ void _TestSinglePrefillKernelCorrectness(size_t qo_len, size_t kv_len, size_t nu
       thrust::raw_pointer_cast(q_d.data()), thrust::raw_pointer_cast(k_d.data()),
       thrust::raw_pointer_cast(v_d.data()), thrust::raw_pointer_cast(o_d.data()),
       thrust::raw_pointer_cast(tmp_d.data()), num_qo_heads, num_kv_heads, qo_len, kv_len, head_dim,
-      causal, layout, rotary_mode);
+      causal, layout, rotary_mode, allow_fp16_qk_reduction);
 
   EXPECT_EQ(status, cudaSuccess) << "SinglePrefillWithKVCache kernel launch failed, error message: "
                                  << cudaGetErrorString(status);
@@ -76,7 +77,7 @@ void _TestSinglePrefillKernelCorrectness(size_t qo_len, size_t kv_len, size_t nu
 }
 
 template <typename DTypeIn, typename DTypeOut>
-void TestSinglePrefillKernelLongContextCorrectness() {
+void TestSinglePrefillKernelLongContextCorrectness(bool allow_fp16_qk_reduction) {
   for (size_t qo_len : {1, 31, 63, 127}) {
     for (size_t kv_len : {31717}) {
       for (size_t num_heads : {1}) {
@@ -86,7 +87,7 @@ void TestSinglePrefillKernelLongContextCorrectness() {
               for (size_t layout : {0, 1}) {
                 _TestSinglePrefillKernelCorrectness<DTypeIn, DTypeOut>(
                     qo_len, kv_len, num_heads, num_heads, head_dim, causal, QKVLayout(layout),
-                    RotaryMode(rotary_mode));
+                    RotaryMode(rotary_mode), allow_fp16_qk_reduction);
               }
             }
           }
@@ -97,7 +98,7 @@ void TestSinglePrefillKernelLongContextCorrectness() {
 }
 
 template <typename DTypeIn, typename DTypeOut>
-void TestSinglePrefillKernelShortContextCorrectness() {
+void TestSinglePrefillKernelShortContextCorrectness(bool allow_fp16_qk_reduction) {
   float rtol = std::is_same<DTypeOut, nv_bfloat16>::value ? 1e-2 : 1e-3;
   float atol = std::is_same<DTypeOut, nv_bfloat16>::value ? 1e-2 : 1e-3;
   for (size_t qkv_len : {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37}) {
@@ -108,7 +109,7 @@ void TestSinglePrefillKernelShortContextCorrectness() {
             for (size_t layout : {0, 1}) {
               _TestSinglePrefillKernelCorrectness<DTypeIn, DTypeOut>(
                   qkv_len, qkv_len, num_heads, num_heads, head_dim, causal, QKVLayout(layout),
-                  RotaryMode(rotary_mode), rtol, atol);
+                  RotaryMode(rotary_mode), allow_fp16_qk_reduction, rtol, atol);
             }
           }
         }
@@ -118,7 +119,7 @@ void TestSinglePrefillKernelShortContextCorrectness() {
 }
 
 template <typename DTypeIn, typename DTypeOut>
-void TestSinglePrefillKernelCorrectness() {
+void TestSinglePrefillKernelCorrectness(bool allow_fp16_qk_reduction) {
   for (size_t qo_len : {399, 400, 401}) {
     for (size_t kv_len : {533, 534, 535}) {
       for (size_t num_heads : {12}) {
@@ -128,7 +129,7 @@ void TestSinglePrefillKernelCorrectness() {
               for (size_t layout : {0, 1}) {
                 _TestSinglePrefillKernelCorrectness<DTypeIn, DTypeOut>(
                     qo_len, kv_len, num_heads, num_heads, head_dim, causal, QKVLayout(layout),
-                    RotaryMode(rotary_mode));
+                    RotaryMode(rotary_mode), allow_fp16_qk_reduction);
               }
             }
           }
@@ -139,25 +140,37 @@ void TestSinglePrefillKernelCorrectness() {
 }
 
 TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelLongContextCorrectnessFP16) {
-  TestSinglePrefillKernelLongContextCorrectness<half, half>();
+  TestSinglePrefillKernelLongContextCorrectness<half, half>(false);
+}
+
+TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelLongContextCorrectnessFP16QKHalfAccum) {
+  TestSinglePrefillKernelLongContextCorrectness<half, half>(true);
 }
 
 TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelLongContextCorrectnessBF16) {
-  TestSinglePrefillKernelLongContextCorrectness<nv_bfloat16, nv_bfloat16>();
+  TestSinglePrefillKernelLongContextCorrectness<nv_bfloat16, nv_bfloat16>(false);
 }
 
 TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelShortContextCorrectnessFP16) {
-  TestSinglePrefillKernelShortContextCorrectness<half, half>();
+  TestSinglePrefillKernelShortContextCorrectness<half, half>(false);
+}
+
+TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelShortContextCorrectnessFP16QKHalfAccum) {
+  TestSinglePrefillKernelShortContextCorrectness<half, half>(true);
 }
 
 TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelShortContextCorrectnessBF16) {
-  TestSinglePrefillKernelShortContextCorrectness<nv_bfloat16, nv_bfloat16>();
+  TestSinglePrefillKernelShortContextCorrectness<nv_bfloat16, nv_bfloat16>(false);
 }
 
 TEST(FlashInferCorrectnessTest, SinglePrefillKernelCorrectnessTestFP16) {
-  TestSinglePrefillKernelCorrectness<half, half>();
+  TestSinglePrefillKernelCorrectness<half, half>(false);
+}
+
+TEST(FlashInferCorrectnessTest, SinglePrefillKernelCorrectnessTestFP16QKHalfAccum) {
+  TestSinglePrefillKernelCorrectness<half, half>(true);
 }
 
 TEST(FlashInferCorrectnessTest, SinglePrefillKernelCorrectnessTestBF16) {
-  TestSinglePrefillKernelCorrectness<nv_bfloat16, nv_bfloat16>();
+  TestSinglePrefillKernelCorrectness<nv_bfloat16, nv_bfloat16>(false);
 }

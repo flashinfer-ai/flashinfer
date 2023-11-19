@@ -16,6 +16,7 @@
 #ifndef FLASHINFER_MATH_CUH_
 #define FLASHINFER_MATH_CUH_
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 namespace flashinfer {
@@ -23,6 +24,10 @@ namespace math {
 
 // log2(e)
 constexpr float log2e = 1.44269504088896340736f;
+
+__forceinline__ __device__ half2 uint32_as_half2(uint32_t x) { return *(half2*)&x; }
+
+__forceinline__ __device__ uint32_t half2_as_uint32(half2 x) { return *(uint32_t*)&x; }
 
 /*!
  * \brief Wrapper of PTX ex2.approx instruction, which computes 2^x
@@ -50,9 +55,9 @@ __forceinline__ __device__ float ptx_lg2(float x) {
  */
 __forceinline__ __device__ half2 ptx_exp2(half2 x) {
   uint32_t y_u32;
-  uint32_t x_u32 = *(uint32_t*)&x;
+  uint32_t x_u32 = half2_as_uint32(x);
   asm volatile("ex2.approx.f16x2 %0, %1;" : "=r"(y_u32) : "r"(x_u32));
-  return *(half2*)&y_u32;
+  return uint32_as_half2(y_u32);
 }
 
 /*!
