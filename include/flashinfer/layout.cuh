@@ -78,6 +78,14 @@ struct tensor_info_t {
   __host__ __device__ __forceinline__ size_t get_kv_n_stride() const {
     return layout == QKVLayout::kHND ? head_dim : num_kv_heads * head_dim;
   }
+
+  __host__ __device__ __forceinline__ size_t get_qo_h_stride() const {
+    return layout == QKVLayout::kNHD ? head_dim : qo_len * head_dim;
+  }
+
+  __host__ __device__ __forceinline__ size_t get_kv_h_stride() const {
+    return layout == QKVLayout::kNHD ? head_dim : kv_len * head_dim;
+  }
 };
 
 /*!
