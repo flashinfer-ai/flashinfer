@@ -24,10 +24,9 @@
 using namespace flashinfer;
 
 template <typename T>
-void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t head_dim, bool causal,
+void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t num_qo_heads, size_t head_dim, bool causal,
                                               RotaryMode rotary_mode,
                                               bool allow_fp16_qk_reduction) {
-  size_t num_qo_heads = num_kv_heads;
   uint32_t num_layers = 13;
   uint32_t page_size = 16;
   uint32_t batch_size = 9;
@@ -130,6 +129,7 @@ void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t head_d
       float result_accuracy = 1. - float(num_result_errors_atol_1e_3_rtol_1e_3) /
                                        max(float(q_len * num_qo_heads * head_dim), 1.f);
       std::cout << "layer_idx=" << layer_idx << ", request_idx=" << request_idx
+                << ", num_qo_heads=" << num_qo_heads
                 << ", num_kv_heads=" << num_kv_heads << ", q_len=" << q_len << ", kv_len=" << kv_len
                 << ", head_dim=" << head_dim << ", causal=" << causal
                 << ", rotary_mode=" << RotaryModeToString(rotary_mode)
@@ -141,10 +141,9 @@ void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t head_d
 }
 
 template <typename T>
-void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads, size_t head_dim,
+void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads,size_t num_qo_heads, size_t head_dim,
                                                     bool causal, RotaryMode rotary_mode,
                                                     bool allow_fp16_qk_reduction) {
-  size_t num_qo_heads = num_kv_heads;
   uint32_t num_layers = 3;
   uint32_t page_size = 16;
   uint32_t batch_size = 7;
@@ -258,7 +257,9 @@ void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads, size_t 
     }
     float result_accuracy =
         1. - float(num_result_errors_atol_1e_3_rtol_1e_3) / max(float(o_concat_ref.size()), 1.f);
-    std::cout << "layer_idx=" << layer_idx << ", num_kv_heads=" << num_kv_heads
+    std::cout << "layer_idx=" << layer_idx
+              << ", num_qo_heads=" << num_qo_heads
+              << ", num_kv_heads=" << num_kv_heads
               << ", head_dim=" << head_dim << ", causal=" << causal
               << ", rotary_mode=" << RotaryModeToString(rotary_mode)
               << ", result_accuracy=" << result_accuracy << std::endl;
@@ -268,10 +269,9 @@ void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads, size_t 
 }
 
 template <typename T>
-void _TestBatchPrefillKernelLongContextCorrectness(size_t num_kv_heads, size_t head_dim,
+void _TestBatchPrefillKernelLongContextCorrectness(size_t num_kv_heads,size_t num_qo_heads, size_t head_dim,
                                                    bool causal, RotaryMode rotary_mode,
                                                    bool allow_fp16_qk_reduction) {
-  size_t num_qo_heads = num_kv_heads;
   uint32_t page_size = 16;
   std::vector<std::vector<std::vector<T>>> keys, values;
   std::vector<int32_t> q_lens{63}, kv_lens{2047};
@@ -345,7 +345,8 @@ void _TestBatchPrefillKernelLongContextCorrectness(size_t num_kv_heads, size_t h
   }
   float result_accuracy = 1. - float(num_result_errors_atol_1e_3_rtol_1e_3) /
                                    max(float(q_lens[0] * num_qo_heads * head_dim), 1.f);
-  std::cout << ", num_kv_heads=" << num_kv_heads << ", q_len=" << q_lens[0]
+  std::cout << ", num_qo_heads=" << num_qo_heads
+            << ", num_kv_heads=" << num_kv_heads << ", q_len=" << q_lens[0]
             << ", kv_len=" << kv_lens[0] << ", head_dim=" << head_dim << ", causal=" << causal
             << ", rotary_mode=" << RotaryModeToString(rotary_mode)
             << ", result_accuracy=" << result_accuracy << std::endl;
@@ -355,42 +356,48 @@ void _TestBatchPrefillKernelLongContextCorrectness(size_t num_kv_heads, size_t h
 
 template <typename T>
 void TestBatchPrefillKernelOneHotCorrectness(bool allow_fp16_qk_reduction) {
-  for (size_t num_kv_heads : {32}) {
+  for (size_t num_kv_heads : {4, 32}) {
+    for (size_t num_qo_heads: {32}) {
     for (size_t head_dim : {64, 128}) {
       for (size_t causal : {false, true}) {
         for (size_t rotary_mode : {0, 1}) {
           _TestBatchPrefillKernelOneHotCorrectness<T>(
-              num_kv_heads, head_dim, causal, RotaryMode(rotary_mode), allow_fp16_qk_reduction);
+              num_kv_heads, num_qo_heads, head_dim, causal, RotaryMode(rotary_mode), allow_fp16_qk_reduction);
         }
       }
     }
+  }
   }
 }
 
 template <typename T>
 void TestBatchPrefillKernelShortContextCorrectness(bool allow_fp16_qk_reduction) {
-  for (size_t num_kv_heads : {32}) {
+  for (size_t num_kv_heads : {4, 32}) {
+    for (size_t num_qo_heads: {32}) {
     for (size_t head_dim : {64, 128}) {
       for (size_t causal : {false, true}) {
         for (size_t rotary_mode : {0, 1}) {
           _TestBatchPrefillKernelShortContextCorrectness<T>(
-              num_kv_heads, head_dim, causal, RotaryMode(rotary_mode), allow_fp16_qk_reduction);
+              num_kv_heads, num_qo_heads, head_dim, causal, RotaryMode(rotary_mode), allow_fp16_qk_reduction);
         }
       }
     }
+  }
   }
 }
 
 template <typename T>
 void TestBatchPrefillKernelLongContextCorrectness(bool allow_fp16_qk_reduction) {
-  for (size_t num_kv_heads : {1}) {
+  for (size_t num_kv_heads : {1, 8}) {
+    for (size_t num_qo_heads: {8}) {
     for (size_t head_dim : {64, 128}) {
       for (size_t causal : {false, true}) {
         for (size_t rotary_mode : {0, 1}) {
           _TestBatchPrefillKernelLongContextCorrectness<T>(
-              num_kv_heads, head_dim, causal, RotaryMode(rotary_mode), allow_fp16_qk_reduction);
+              num_kv_heads, num_qo_heads, head_dim, causal, RotaryMode(rotary_mode), allow_fp16_qk_reduction);
         }
       }
+    }
     }
   }
 }
