@@ -84,12 +84,24 @@ __forceinline__ __device__ float ptx_rcp(float x) {
  * \brief Wrapper of PTX shfl.sync.bfly instruction, which performs a butterfly shuffle
  *   between threads in a warp.
  * \param x The value in the source lane
- * \param delta The delta to perform thread index xor with: y[i] <- x[i ^ delta]
+ * \param lane_mask The mask to perform thread index xor with: y[i] <- x[i ^ delta]
  */
-__forceinline__ __device__ float shfl_xor_sync(float x, int delta) {
+__forceinline__ __device__ float shfl_xor_sync(float x, int lane_mask) {
   float y;
-  asm volatile("shfl.sync.bfly.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(y) : "f"(x), "r"(delta));
+  asm volatile("shfl.sync.bfly.b32 %0, %1, %2, 0x1f, 0xffffffff;"
+               : "=f"(y)
+               : "f"(x), "r"(lane_mask));
   return y;
+}
+
+/*!
+ * \brief Wrapper of PTX shfl.sync.bfly instruction on half2, which performs a butterfly
+ *   shuffle between threads in a warp.
+ * \param x The value in the source lane
+ * \param lane_mask The mask to perform thread index xor with: y[i] <- x[i ^ lane_mask]
+ */
+__forceinline__ __device__ half2 shfl_xor_sync(half2 x, int lane_mask) {
+  return __shfl_xor_sync(0xffffffff, x, lane_mask);
 }
 
 }  // namespace math

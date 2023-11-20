@@ -439,25 +439,28 @@ __device__ __forceinline__ void update_mdo_states(DTypeQKAccum (*x_frag)[num_fra
   } else if constexpr (std::is_same<DTypeQKAccum, half>::value) {
 #pragma unroll
     for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+      half m_prev[2];
 #pragma unroll
       for (uint32_t j = 0; j < 2; ++j) {
-        half2 m_prev = make_half2(m[fx][j], m[fx][j]);
+        m_prev[j] = m[fx][j];
 #pragma unroll
         for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
           half2 m_local =
               __hmax2(*(half2*)&x_frag[fx][fz][j * 2], *(half2*)&x_frag[fx][fz][j * 2 + 4]);
           m[fx][j] = __hmax(m[fx][j], __hmax(m_local.x, m_local.y));
         }
-        m[fx][j] = __hmax(m[fx][j], half(math::shfl_xor_sync(float(m[fx][j]), 0x2)));
-        m[fx][j] = __hmax(m[fx][j], half(math::shfl_xor_sync(float(m[fx][j]), 0x1)));
+      }
+      *(half2*)&m[fx] = __hmax2(*(half2*)&m[fx], math::shfl_xor_sync(*(half2*)&m[fx], 0x2));
+      *(half2*)&m[fx] = __hmax2(*(half2*)&m[fx], math::shfl_xor_sync(*(half2*)&m[fx], 0x1));
+#pragma unroll
+      for (uint32_t j = 0; j < 2; ++j) {
         half2 m2 = make_half2(m[fx][j], m[fx][j]);
 #pragma unroll
         for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
-          *(half2*)&x_frag[fx][fz][j * 2] = math::ptx_exp2(*(half2*)&x_frag[fx][fz][j * 2] - m2);
-          *(half2*)&x_frag[fx][fz][j * 2 + 4] =
-              math::ptx_exp2(*(half2*)&x_frag[fx][fz][j * 2 + 4] - m2);
+          *(half2*)&x_frag[fx][fz][j * 2] -= m2;
+          *(half2*)&x_frag[fx][fz][j * 2 + 4] -= m2;
         }
-        float o_scale = math::ptx_exp2(float(m_prev.x - m[fx][j]));
+        float o_scale = math::ptx_exp2(float(m_prev[j] - m[fx][j]));
         d[fx][j] *= o_scale;
 #pragma unroll
         for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
@@ -503,9 +506,15 @@ __device__ __forceinline__ void compute_sfm_v(smem_t* v_smem, uint32_t* v_smem_o
     }
     *v_smem_offset_r -= 16 * num_frags_z * num_cells_per_in_channel;
   } else if constexpr (std::is_same<DTypeQKAccum, half>::value) {
-    // __threadfence_block();
 #pragma unroll
     for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
+#pragma unroll
+      for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+        *(half2*)&x_frag[fx][fz][0] = math::ptx_exp2(*(half2*)&x_frag[fx][fz][0]);
+        *(half2*)&x_frag[fx][fz][4] = math::ptx_exp2(*(half2*)&x_frag[fx][fz][4]);
+        *(half2*)&x_frag[fx][fz][2] = math::ptx_exp2(*(half2*)&x_frag[fx][fz][2]);
+        *(half2*)&x_frag[fx][fz][6] = math::ptx_exp2(*(half2*)&x_frag[fx][fz][6]);
+      }
 #pragma unroll
       for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
         uint32_t b_frag[4];

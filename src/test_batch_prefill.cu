@@ -25,7 +25,8 @@ using namespace flashinfer;
 
 template <typename T>
 void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t head_dim, bool causal,
-                                              RotaryMode rotary_mode) {
+                                              RotaryMode rotary_mode,
+                                              bool allow_fp16_qk_reduction) {
   size_t num_qo_heads = num_kv_heads;
   uint32_t num_layers = 13;
   uint32_t page_size = 16;
@@ -111,7 +112,8 @@ void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t head_d
         auto status = BatchPrefillWithPagedKVCache<T, T, int32_t>(
             thrust::raw_pointer_cast(q_device.data()), paged_kv,
             thrust::raw_pointer_cast(q_indptr_device.data()),
-            thrust::raw_pointer_cast(o_device.data()), nullptr, num_qo_heads, causal, rotary_mode);
+            thrust::raw_pointer_cast(o_device.data()), nullptr, num_qo_heads, causal, rotary_mode,
+            allow_fp16_qk_reduction);
         EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
       }
 
@@ -140,7 +142,8 @@ void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t head_d
 
 template <typename T>
 void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads, size_t head_dim,
-                                                    bool causal, RotaryMode rotary_mode) {
+                                                    bool causal, RotaryMode rotary_mode,
+                                                    bool allow_fp16_qk_reduction) {
   size_t num_qo_heads = num_kv_heads;
   uint32_t num_layers = 3;
   uint32_t page_size = 16;
@@ -238,7 +241,8 @@ void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads, size_t 
       auto status = BatchPrefillWithPagedKVCache<T, T, int32_t>(
           thrust::raw_pointer_cast(q_device.data()), paged_kv,
           thrust::raw_pointer_cast(q_indptr_device.data()),
-          thrust::raw_pointer_cast(o_device.data()), nullptr, num_qo_heads, causal, rotary_mode);
+          thrust::raw_pointer_cast(o_device.data()), nullptr, num_qo_heads, causal, rotary_mode,
+          allow_fp16_qk_reduction);
       EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
     }
 
@@ -265,7 +269,8 @@ void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads, size_t 
 
 template <typename T>
 void _TestBatchPrefillKernelLongContextCorrectness(size_t num_kv_heads, size_t head_dim,
-                                                   bool causal, RotaryMode rotary_mode) {
+                                                   bool causal, RotaryMode rotary_mode,
+                                                   bool allow_fp16_qk_reduction) {
   size_t num_qo_heads = num_kv_heads;
   uint32_t page_size = 16;
   std::vector<std::vector<std::vector<T>>> keys, values;
@@ -324,7 +329,7 @@ void _TestBatchPrefillKernelLongContextCorrectness(size_t num_kv_heads, size_t h
     auto status = BatchPrefillWithPagedKVCache<T, T, int32_t>(
         thrust::raw_pointer_cast(q_device.data()), paged_kv,
         thrust::raw_pointer_cast(q_indptr_device.data()), thrust::raw_pointer_cast(o_device.data()),
-        nullptr, num_qo_heads, causal, rotary_mode);
+        nullptr, num_qo_heads, causal, rotary_mode, allow_fp16_qk_reduction);
     EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
   }
 
@@ -349,13 +354,13 @@ void _TestBatchPrefillKernelLongContextCorrectness(size_t num_kv_heads, size_t h
 }
 
 template <typename T>
-void TestBatchPrefillKernelOneHotCorrectness() {
+void TestBatchPrefillKernelOneHotCorrectness(bool allow_fp16_qk_reduction) {
   for (size_t num_kv_heads : {32}) {
     for (size_t head_dim : {64, 128}) {
       for (size_t causal : {false, true}) {
         for (size_t rotary_mode : {0, 1}) {
-          _TestBatchPrefillKernelOneHotCorrectness<T>(num_kv_heads, head_dim, causal,
-                                                      RotaryMode(rotary_mode));
+          _TestBatchPrefillKernelOneHotCorrectness<T>(
+              num_kv_heads, head_dim, causal, RotaryMode(rotary_mode), allow_fp16_qk_reduction);
         }
       }
     }
@@ -363,13 +368,13 @@ void TestBatchPrefillKernelOneHotCorrectness() {
 }
 
 template <typename T>
-void TestBatchPrefillKernelShortContextCorrectness() {
+void TestBatchPrefillKernelShortContextCorrectness(bool allow_fp16_qk_reduction) {
   for (size_t num_kv_heads : {32}) {
     for (size_t head_dim : {64, 128}) {
       for (size_t causal : {false, true}) {
         for (size_t rotary_mode : {0, 1}) {
-          _TestBatchPrefillKernelShortContextCorrectness<T>(num_kv_heads, head_dim, causal,
-                                                            RotaryMode(rotary_mode));
+          _TestBatchPrefillKernelShortContextCorrectness<T>(
+              num_kv_heads, head_dim, causal, RotaryMode(rotary_mode), allow_fp16_qk_reduction);
         }
       }
     }
@@ -377,13 +382,13 @@ void TestBatchPrefillKernelShortContextCorrectness() {
 }
 
 template <typename T>
-void TestBatchPrefillKernelLongContextCorrectness() {
+void TestBatchPrefillKernelLongContextCorrectness(bool allow_fp16_qk_reduction) {
   for (size_t num_kv_heads : {1}) {
     for (size_t head_dim : {64, 128}) {
       for (size_t causal : {false, true}) {
         for (size_t rotary_mode : {0, 1}) {
-          _TestBatchPrefillKernelLongContextCorrectness<T>(num_kv_heads, head_dim, causal,
-                                                           RotaryMode(rotary_mode));
+          _TestBatchPrefillKernelLongContextCorrectness<T>(
+              num_kv_heads, head_dim, causal, RotaryMode(rotary_mode), allow_fp16_qk_reduction);
         }
       }
     }
@@ -391,13 +396,25 @@ void TestBatchPrefillKernelLongContextCorrectness() {
 }
 
 TEST(FlashInferCorrectnessTest, BatchPrefillShortContextTestFP16) {
-  TestBatchPrefillKernelShortContextCorrectness<half>();
+  TestBatchPrefillKernelShortContextCorrectness<half>(false);
+}
+
+TEST(FlashInferCorrectnessTest, BatchPrefillShortContextTestFP16QKHalfAccum) {
+  TestBatchPrefillKernelShortContextCorrectness<half>(false);
 }
 
 TEST(FlashInferCorrectnessTest, BatchPrefillLongContextTestFP16) {
-  TestBatchPrefillKernelLongContextCorrectness<half>();
+  TestBatchPrefillKernelLongContextCorrectness<half>(false);
+}
+
+TEST(FlashInferCorrectnessTest, BatchPrefillLongContextTestFP16QKHalfAccum) {
+  TestBatchPrefillKernelLongContextCorrectness<half>(true);
 }
 
 TEST(FlashInferCorrectnessTest, BatchPrefillKernelCorrectnessTestOneHotFP16) {
-  TestBatchPrefillKernelOneHotCorrectness<half>();
+  TestBatchPrefillKernelOneHotCorrectness<half>(false);
+}
+
+TEST(FlashInferCorrectnessTest, BatchPrefillKernelCorrectnessTestOneHotFP16QKHalfAccum) {
+  TestBatchPrefillKernelOneHotCorrectness<half>(true);
 }
