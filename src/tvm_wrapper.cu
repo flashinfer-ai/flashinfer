@@ -25,6 +25,7 @@
 using tvm::runtime::DataType;
 using tvm::runtime::NDArray;
 using tvm::runtime::ShapeTuple;
+using namespace flashinfer;
 
 #define SWITCH_TVM_CUDA_DTYPE(dl_dtype, cuda_dtype, ...)     \
   if (dl_dtype.code == kDLFloat && dl_dtype.bits == 16) {    \
@@ -162,30 +163,32 @@ void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data, DLTensor* pag
   CHECK_EQ(output->shape[2], nhead_qo);
   CHECK_EQ(output->shape[3], nfeat);
 
+  constexpr PageStorage page_storage = PageStorage::kIndices;
+
   SWITCH_TVM_CUDA_DTYPE(
       pages->dtype, dtype_in,
       {SWITCH_TVM_CUDA_DTYPE(
           output->dtype, dtype_out, {SWITCH_TVM_CUDA_IDTYPE(page_table_values->dtype, dtype_idx, {
-            flashinfer::paged_kv_t<PageStorage::kIndices, dtype_in, dtype_idx> cache(
+            paged_kv_t<page_storage, dtype_in, dtype_idx> cache(
                 nlayer, layer_id, nhead_kv, page_size, nfeat, num_total_seqs,
                 static_cast<dtype_in*>(pages->data),
                 static_cast<dtype_idx*>(page_table_values->data),
                 static_cast<dtype_idx*>(page_table_indptr->data),
                 static_cast<dtype_idx*>(last_page_offset->data));
             cudaError_t status =
-                flashinfer::BatchPrefillWithPagedKVCache<dtype_in, dtype_out, dtype_idx>(
+                BatchPrefillWithPagedKVCache<page_storage, dtype_in, dtype_out, dtype_idx>(
                     static_cast<dtype_in*>(q_data->data), cache,
                     static_cast<dtype_idx*>(append_length_indptr->data),
                     static_cast<dtype_out*>(output->data), nullptr, nhead_qo,
-                    /*causal=*/true, flashinfer::RotaryMode(rotary_mode), rope_scale, rope_theta,
-                    0);
+                    /*causal=*/true, RotaryMode(rotary_mode), /*allow_fp16_qk_reduction=*/false,
+                    rope_scale, rope_theta, 0);
             if (status != cudaSuccess) {
               LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
             }
           })})});
 }
 
-flashinfer::BatchDecodeBufferManager<half, half, int32_t> buf_mgr_f16f16i32;
+BatchDecodeBufferManager<PageStorage::kIndices, half, half, int32_t> buf_mgr_f16f16i32;
 
 void _FlashInferAttentionDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
                                                 DLTensor* page_table_indptr,     //
@@ -258,21 +261,23 @@ void _FlashInferAttentionDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* page
   CHECK_EQ(output->shape[2], nhead_qo);
   CHECK_EQ(output->shape[3], nfeat);
 
+  constexpr PageStorage page_storage = PageStorage::kIndices;
+
   SWITCH_TVM_CUDA_DTYPE(
       pages->dtype, dtype_in,
       {SWITCH_TVM_CUDA_DTYPE(
           output->dtype, dtype_out, {SWITCH_TVM_CUDA_IDTYPE(page_table_values->dtype, dtype_idx, {
-            flashinfer::paged_kv_t<PageStorage::kIndices, dtype_in, dtype_idx> cache(
+            paged_kv_t<page_storage, dtype_in, dtype_idx> cache(
                 nlayer, layer_id, nhead_kv, page_size, nfeat, num_total_seqs,
                 static_cast<dtype_in*>(pages->data),
                 static_cast<dtype_idx*>(page_table_values->data),
                 static_cast<dtype_idx*>(page_table_indptr->data),
                 static_cast<dtype_idx*>(last_page_offset->data));
             cudaError_t status =
-                flashinfer::BatchDecodeWithPagedKVCache<dtype_in, dtype_out, dtype_idx>(
+                BatchDecodeWithPagedKVCache<page_storage, dtype_in, dtype_out, dtype_idx>(
                     &buf_mgr_f16f16i32, static_cast<dtype_in*>(q_data->data), cache,
-                    static_cast<dtype_out*>(output->data), nhead_qo,
-                    flashinfer::RotaryMode(rotary_mode), rope_scale, rope_theta, 0);
+                    static_cast<dtype_out*>(output->data), nhead_qo, RotaryMode(rotary_mode),
+                    rope_scale, rope_theta, 0);
             if (status != cudaSuccess) {
               LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
             }
