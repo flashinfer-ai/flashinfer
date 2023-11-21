@@ -972,13 +972,6 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
   const uint32_t batch_size = paged_kv.batch_size;
   const uint32_t num_kv_heads = paged_kv.num_heads;
 
-  // Only apply for batch size over 2 at this moment.
-  if (batch_size >= 2) {
-    tmp_size = 0;
-    new_batch_size = batch_size;
-    return cudaSuccess;
-  }
-
   SWITCH_GQA_GROUP_SIZE(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
       {SWITCH_HEAD_DIM(
