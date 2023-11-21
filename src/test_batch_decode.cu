@@ -74,9 +74,9 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
   assert(q.size() == batch_size * num_qo_heads * head_dim);
   assert(o_ref.size() == batch_size * num_qo_heads * head_dim);
 
-  flashinfer::paged_kv_t<T, int32_t> paged_kv_cpu(1, 0, num_kv_heads, page_size, head_dim,
-                                                  batch_size, kv_data.data(), kv_indptr.data(),
-                                                  kv_indices.data(), kv_last_page_offset.data());
+  flashinfer::paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv_cpu(
+      1, 0, num_kv_heads, page_size, head_dim, batch_size, kv_data.data(), kv_indices.data(),
+      kv_indptr.data(), kv_last_page_offset.data());
   cpu_reference::append_paged_kv_cache<T, int32_t>(paged_kv_cpu, keys, values, append_indptr);
 
   // copy data to device
@@ -88,22 +88,22 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
   thrust::device_vector<T> o_device(o_ref.size());
 
   // create paged_kv object
-  flashinfer::paged_kv_t<T, int32_t> paged_kv(
+  flashinfer::paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv(
       1, 0, num_kv_heads, page_size, head_dim, batch_size,
       thrust::raw_pointer_cast(kv_data_device.data()),
-      thrust::raw_pointer_cast(kv_indptr_device.data()),
       thrust::raw_pointer_cast(kv_indices_device.data()),
+      thrust::raw_pointer_cast(kv_indptr_device.data()),
       thrust::raw_pointer_cast(kv_last_page_offset_device.data()));
-  flashinfer::BatchDecodeBufferManager<T, T, int32_t> buf_mgr;
+  flashinfer::BatchDecodeBufferManager<PageStorage::kIndices, T, T, int32_t> buf_mgr;
 
   if (!cooperative) {
     // use non-cooperative kernel
-    cudaError_t status = flashinfer::BatchDecodeWithPagedKVCache<T, T>(
+    cudaError_t status = flashinfer::BatchDecodeWithPagedKVCache<PageStorage::kIndices, T, T>(
         thrust::raw_pointer_cast(q_device.data()), paged_kv,
         thrust::raw_pointer_cast(o_device.data()), nullptr, num_qo_heads, rotary_mode);
     EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
   } else {
-    cudaError_t status = flashinfer::BatchDecodeWithPagedKVCache<T, T>(
+    cudaError_t status = flashinfer::BatchDecodeWithPagedKVCache<PageStorage::kIndices, T, T>(
         &buf_mgr, thrust::raw_pointer_cast(q_device.data()), paged_kv,
         thrust::raw_pointer_cast(o_device.data()), num_qo_heads, rotary_mode);
     EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));

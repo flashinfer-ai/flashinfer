@@ -135,9 +135,9 @@ __device__ __forceinline__ void produce_kv(smem_t smem, uint32_t* smem_offset, T
 }
 
 template <bool produce_v, uint32_t page_size, uint32_t num_warps, uint32_t num_frags_y,
-          uint32_t num_frags_z, typename DType, typename IdType>
+          uint32_t num_frags_z, PageStorage page_storage, typename DType, typename IdType>
 __device__ __forceinline__ void page_produce_kv(smem_t smem, uint32_t* smem_offset,
-                                                paged_kv_t<DType, IdType>& paged_kv,
+                                                paged_kv_t<page_storage, DType, IdType>& paged_kv,
                                                 const uint32_t kv_idx_base,
                                                 const uint32_t page_iter_base,
                                                 const uint32_t kv_len) {
@@ -700,7 +700,8 @@ __device__ __forceinline__ void write_o_reg_gmem(
       }
       *o_idx += (8 / group_size);
       o_smem_offset_w += 8 * num_cells_per_out_channel - 4 * num_frags_y;
-      *o_ptr += (8 / group_size) * qkv_info.get_qo_n_stride() - 2 * num_frags_y * cell_capacity<DTypeOut>();
+      *o_ptr += (8 / group_size) * qkv_info.get_qo_n_stride() -
+                2 * num_frags_y * cell_capacity<DTypeOut>();
     }
   }
 }
@@ -810,15 +811,17 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
   const uint32_t num_iterations =
       ((causal ? min(chunk_end - chunk_start,
                      sub_if_greater_or_zero(
-                         kv_len - qo_len + ((bx + 1) * num_frags_x * num_warps) * (16 / group_size), chunk_start))
+                         kv_len - qo_len + ((bx + 1) * num_frags_x * num_warps) * (16 / group_size),
+                         chunk_start))
                : chunk_end - chunk_start) +
        16 * num_frags_z - 1) /
       (16 * num_frags_z);
 
   const uint32_t mask_iteration =
       (causal ? min(chunk_end - chunk_start,
-                    sub_if_greater_or_zero(kv_len + bx * num_warps * num_frags_x * (16 / group_size) - qo_len,
-                                           chunk_start))
+                    sub_if_greater_or_zero(
+                        kv_len + bx * num_warps * num_frags_x * (16 / group_size) - qo_len,
+                        chunk_start))
               : (chunk_end - chunk_start)) /
       (16 * num_frags_z);
 
@@ -900,12 +903,13 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
 
 template <uint32_t group_size, uint32_t page_size, bool causal, RotaryMode rotary_mode,
           uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps,
-          typename DTypeIn, typename DTypeQKAccum, typename DTypeOut, typename IdType>
+          PageStorage page_storage, typename DTypeIn, typename DTypeQKAccum, typename DTypeOut,
+          typename IdType>
 __global__ void BatchPrefillWithPagedKVCacheKernel(
     IdType* __restrict__ request_indices, IdType* __restrict__ tile_indices,
-    DTypeIn* __restrict__ q, paged_kv_t<DTypeIn, IdType> paged_kv, IdType* __restrict__ qo_indptr,
-    DTypeOut* __restrict__ o, float* __restrict__ tmp, float sm_scale,
-    const float log2_rope_rcp_scale, const float log2_rope_rcp_theta) {
+    DTypeIn* __restrict__ q, paged_kv_t<page_storage, DTypeIn, IdType> paged_kv,
+    IdType* __restrict__ qo_indptr, DTypeOut* __restrict__ o, float* __restrict__ tmp,
+    float sm_scale, const float log2_rope_rcp_scale, const float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
   sm_scale *= math::log2e;
@@ -997,13 +1001,16 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
   cp_async::commit_group();
 
   const uint32_t num_iterations =
-      ((causal ? min(kv_len, kv_len - qo_len + ((tile_idx + 1) * num_frags_x * num_warps) * (16 / group_size))
+      ((causal ? min(kv_len, kv_len - qo_len +
+                                 ((tile_idx + 1) * num_frags_x * num_warps) * (16 / group_size))
                : kv_len) +
        16 * num_frags_z - 1) /
       (16 * num_frags_z);
 
   const uint32_t mask_iteration =
-      (causal ? min(kv_len + tile_idx * num_warps * num_frags_x * (16 / group_size) - qo_len, kv_len) : kv_len) /
+      (causal
+           ? min(kv_len + tile_idx * num_warps * num_frags_x * (16 / group_size) - qo_len, kv_len)
+           : kv_len) /
       (16 * num_frags_z);
 
 #pragma unroll
@@ -1154,7 +1161,7 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
                                     min((num_blocks_per_sm * num_sm) /
                                             (num_kv_heads *
                                              ((qo_len * group_size + (num_rows_per_cta - 1)) /
-                                             num_rows_per_cta)),
+                                              num_rows_per_cta)),
                                         kv_len / 2048);
 
                                 max_grid_size = num_blocks_per_sm * num_sm;
@@ -1276,9 +1283,9 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOu
                                     min((num_blocks_per_sm * num_sm) /
                                             (num_kv_heads *
                                              ((qo_len * group_size + (num_rows_per_cta - 1)) /
-                                             num_rows_per_cta)),
+                                              num_rows_per_cta)),
                                         kv_len / 2048);
-                                
+
                                 if (num_chunks <= 1 || tmp == nullptr) {
                                   // Enough parallelism, do not use cooperative
                                   // groups
@@ -1331,6 +1338,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOu
 
 /*!
  * \brief Fallback implementation of FlashAttention prefill CUDA function for multiple requests,
+ * \tparam page_storage Whether to store indices or pointers of each active page
  * \tparam DTypeIn The data type of input
  * \tparam DTypeOut The data type of output
  * \tparam IdType The data type of index
@@ -1349,14 +1357,12 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOu
  * \return status Indicates whether CUDA calls are successful
  * \note This implementation executes requests one by one, which is not efficient.
  */
-template <typename DTypeIn, typename DTypeOut, typename IdType>
-cudaError_t BatchPrefillWithPagedKVCacheFallback(DTypeIn* q, paged_kv_t<DTypeIn, IdType> paged_kv,
-                                                 IdType* qo_indptr, DTypeOut* o, float* tmp,
-                                                 uint32_t num_qo_heads, bool causal = true,
-                                                 RotaryMode rotary_mode = RotaryMode::kNone,
-                                                 bool allow_fp16_qk_reduction = false,
-                                                 float rope_scale = 1.f, float rope_theta = 1e4,
-                                                 cudaStream_t stream = nullptr) {
+template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
+cudaError_t BatchPrefillWithPagedKVCacheFallback(
+    DTypeIn* q, paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, IdType* qo_indptr, DTypeOut* o,
+    float* tmp, uint32_t num_qo_heads, bool causal = true,
+    RotaryMode rotary_mode = RotaryMode::kNone, bool allow_fp16_qk_reduction = false,
+    float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   const uint32_t num_kv_heads = paged_kv.num_heads;
   const uint32_t head_dim = paged_kv.head_dim;
   const uint32_t batch_size = paged_kv.batch_size;
@@ -1405,14 +1411,12 @@ cudaError_t BatchPrefillWithPagedKVCacheFallback(DTypeIn* q, paged_kv_t<DTypeIn,
   return cudaSuccess;
 }
 
-template <typename DTypeIn, typename DTypeOut, typename IdType>
-cudaError_t BatchPrefillWithPagedKVCache(DTypeIn* q, paged_kv_t<DTypeIn, IdType> paged_kv,
-                                         IdType* qo_indptr, DTypeOut* o, float* tmp,
-                                         uint32_t num_qo_heads, bool causal = true,
-                                         RotaryMode rotary_mode = RotaryMode::kNone,
-                                         bool allow_fp16_qk_reduction = false,
-                                         float rope_scale = 1.f, float rope_theta = 1e4,
-                                         cudaStream_t stream = nullptr) {
+template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
+cudaError_t BatchPrefillWithPagedKVCache(
+    DTypeIn* q, paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, IdType* qo_indptr, DTypeOut* o,
+    float* tmp, uint32_t num_qo_heads, bool causal = true,
+    RotaryMode rotary_mode = RotaryMode::kNone, bool allow_fp16_qk_reduction = false,
+    float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   const float sm_scale = 1.f / std::sqrt(float(paged_kv.head_dim));
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
@@ -1476,7 +1480,8 @@ cudaError_t BatchPrefillWithPagedKVCache(DTypeIn* q, paged_kv_t<DTypeIn, IdType>
                         constexpr uint32_t num_frags_z = 2;
                         auto kernel = BatchPrefillWithPagedKVCacheKernel<
                             GROUP_SIZE, PAGE_SIZE, CAUSAL, ROTARY_MODE, num_frags_x, num_frags_y,
-                            num_frags_z, num_warps, DTypeIn, DTypeQKAccum, DTypeOut, IdType>;
+                            num_frags_z, num_warps, page_storage, DTypeIn, DTypeQKAccum, DTypeOut,
+                            IdType>;
                         uint32_t smem_size = (num_frags_x * num_warps + num_frags_z * 2) * 16 *
                                              head_dim * sizeof(DTypeIn);
                         FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(

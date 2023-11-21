@@ -24,6 +24,12 @@
 
 namespace flashinfer {
 
+enum class PageStorage {
+  kIndices = 0U,  // Store the pointer to the buffer allocated for paged kv-cache, and indices of
+                  // each active offset.
+  kPointer = 1U,  // Store the pointers to each active page.
+};
+
 enum class AccessMode {
   kProtective = 0U,    // Check whether page_iter is out of range
   kNonProtective = 1U  // Do not check whether page_iter is out of range
@@ -31,11 +37,12 @@ enum class AccessMode {
 
 /*!
  * \brief Paged key-value cache
+ * \tparam page_storage Whether to store indices or pointers of each active page
  * \tparam DType The data type of the key-value cache
  * \tparam IdType The index data type of the kv-cache
  * \note layout: [max_num_pages, num_layers, 2, num_heads, page_size, head_dim]
  */
-template <typename DType, typename IdType>
+template <PageStorage page_storage, typename DType, typename IdType>
 struct paged_kv_t {
   uint32_t num_layers;
   uint32_t layer_idx;
@@ -44,21 +51,36 @@ struct paged_kv_t {
   uint32_t head_dim;
   uint32_t batch_size;
 
+  // The flattened key-value cache, used when page_storage == kIndices
   // [max_num_pages * num_layers * 2 * num_heads * page_size * head_dim]
-  // The flattened key-value cache
   DType* data;
-  // [batch_size + 1] The page indptr array, with the first element 0
-  IdType* indptr;
-  // [nnz_pages] The page indices array
+  // [nnz_pages] The page indices array, used when page_storage == kIndices
   IdType* indices;
+  // [nnz_pages] The page pointers array, used when page_storage == kPointer
+  DType** ptrs;
+
+  // [batch_size + 1] The page indptr array, with the first element 0, the last element nnz_pages
+  IdType* indptr;
   // [batch_size] The offset of the last page for each request in the batch
   IdType* last_page_offset;
 
   /* ------------ Auxliary Information Used in Cooperative Kernels ------------ */
-  IdType* cooperative_indptr;
-  IdType* batch_idx_map;
-  IdType* chunk_start;
-  IdType* seq_lens_before_split;
+  IdType* cooperative_aux_info;
+  __host__ __device__ __forceinline__ IdType* cooperative_indptr() const {
+    return cooperative_aux_info;
+  }
+
+  __host__ __device__ __forceinline__ IdType* batch_idx_map() const {
+    return cooperative_aux_info + batch_size + 1;
+  }
+
+  __host__ __device__ __forceinline__ IdType* chunk_start() const {
+    return cooperative_aux_info + 2 * batch_size + 1;
+  }
+
+  __host__ __device__ __forceinline__ IdType* seq_lens_before_split() const {
+    return cooperative_aux_info + 3 * batch_size + 1;
+  }
 
   /*!
    * \brief Construct an empty paged key-value cache
@@ -71,16 +93,14 @@ struct paged_kv_t {
         head_dim(0),
         batch_size(0),
         data(nullptr),
-        indptr(nullptr),
         indices(nullptr),
+        ptrs(nullptr),
+        indptr(nullptr),
         last_page_offset(nullptr),
-        cooperative_indptr(nullptr),
-        batch_idx_map(nullptr),
-        chunk_start(nullptr),
-        seq_lens_before_split(nullptr) {}
+        cooperative_aux_info(nullptr) {}
 
   /*!
-   * \brief Construct a paged key-value cache
+   * \brief Construct a paged key-value cache for non-cooperative kernels
    * \param num_layers The number of layers
    * \param layer_idx The index of the layer
    * \param num_heads The number of heads
@@ -88,14 +108,15 @@ struct paged_kv_t {
    * \param head_dim The dimension of each head
    * \param batch_size The batch size
    * \param data The flattened key-value cache
-   * \param indptr The page indptr array
    * \param indices The page indices array
+   * \param indptr The page indptr array
    * \param last_page_offset The offset of the last page for each request in the batch
+   * \note This constructor should only be used when page_storage == kIndices
    */
   __host__ __device__ __forceinline__ paged_kv_t(uint32_t num_layers, uint32_t layer_idx,
                                                  uint32_t num_heads, uint32_t page_size,
                                                  uint32_t head_dim, uint32_t batch_size,
-                                                 DType* data, IdType* indptr, IdType* indices,
+                                                 DType* data, IdType* indices, IdType* indptr,
                                                  IdType* last_page_offset)
       : num_layers(num_layers),
         layer_idx(layer_idx),
@@ -104,13 +125,39 @@ struct paged_kv_t {
         head_dim(head_dim),
         batch_size(batch_size),
         data(data),
-        indptr(indptr),
         indices(indices),
+        indptr(indptr),
         last_page_offset(last_page_offset),
-        cooperative_indptr(nullptr),
-        batch_idx_map(nullptr),
-        chunk_start(nullptr),
-        seq_lens_before_split(nullptr) {}
+        cooperative_aux_info(nullptr) {}
+
+  /*!
+   * \brief Construct a paged key-value cache for non-cooperative kernels
+   * \param num_layers The number of layers
+   * \param layer_idx The index of the layer
+   * \param num_heads The number of heads
+   * \param page_size The size of each page
+   * \param head_dim The dimension of each head
+   * \param batch_size The batch size
+   * \param ptrs The array of pointers to each active page
+   * \param indptr The page indptr array
+   * \param last_page_offset The offset of the last page for each request in the batch
+   * \note This constructor should only be used when page_storage == kIndices
+   */
+  __host__ __device__ __forceinline__ paged_kv_t(uint32_t num_layers, uint32_t layer_idx,
+                                                 uint32_t num_heads, uint32_t page_size,
+                                                 uint32_t head_dim, uint32_t batch_size,
+                                                 DType** ptrs, IdType* indptr,
+                                                 IdType* last_page_offset)
+      : num_layers(num_layers),
+        layer_idx(layer_idx),
+        num_heads(num_heads),
+        page_size(page_size),
+        head_dim(head_dim),
+        batch_size(batch_size),
+        ptrs(ptrs),
+        indptr(indptr),
+        last_page_offset(last_page_offset),
+        cooperative_aux_info(nullptr) {}
 
   /*!
    * \brief Construct a paged key-value cache with auxiliary information for cooperative kernels
@@ -121,21 +168,18 @@ struct paged_kv_t {
    * \param head_dim The dimension of each head
    * \param batch_size The batch size
    * \param data The flattened key-value cache
-   * \param indptr The page indptr array
    * \param indices The page indices array
+   * \param indptr The page indptr array
    * \param last_page_offset The offset of the last page for each request in the batch
-   * \param cooperative_indptr The page indptr array for cooperative kernels
-   * \param batch_idx_map The batch index map from for cooperative kernels
-   * \param chunk_start The chunk start array for cooperative kernels
-   * \param seq_lens_before_split The sequence length before split for cooperative kernels
+   * \param cooperative_aux_info The auxiliary information used in cooperative kernels
+   * \note This constructor should only be used when page_storage == kIndices
    */
   __host__ __device__ __forceinline__ paged_kv_t(uint32_t num_layers, uint32_t layer_idx,
                                                  uint32_t num_heads, uint32_t page_size,
                                                  uint32_t head_dim, uint32_t batch_size,
-                                                 DType* data, IdType* indptr, IdType* indices,
+                                                 DType* data, IdType* indices, IdType* indptr,
                                                  IdType* last_page_offset,
-                                                 IdType* cooperative_indptr, IdType* batch_idx_map,
-                                                 IdType* chunk_start, IdType* seq_lens_before_split)
+                                                 IdType* cooperative_aux_info)
       : num_layers(num_layers),
         layer_idx(layer_idx),
         num_heads(num_heads),
@@ -143,14 +187,50 @@ struct paged_kv_t {
         head_dim(head_dim),
         batch_size(batch_size),
         data(data),
-        indptr(indptr),
         indices(indices),
+        indptr(indptr),
         last_page_offset(last_page_offset),
-        cooperative_indptr(cooperative_indptr),
-        batch_idx_map(batch_idx_map),
-        chunk_start(chunk_start),
-        seq_lens_before_split(seq_lens_before_split) {}
+        cooperative_aux_info(cooperative_aux_info) {}
 
+  /*!
+   * \brief Construct a paged key-value cache with auxiliary information for cooperative kernels
+   * \param num_layers The number of layers
+   * \param layer_idx The index of the layer
+   * \param num_heads The number of heads
+   * \param page_size The size of each page
+   * \param head_dim The dimension of each head
+   * \param batch_size The batch size
+   * \param ptrs The array of pointers to each active page
+   * \param indptr The page indptr array
+   * \param last_page_offset The offset of the last page for each request in the batch
+   * \param cooperative_aux_info The auxiliary information used in cooperative kernels
+   * \note This constructor should only be used when page_storage == kIndices
+   */
+  __host__ __device__ __forceinline__ paged_kv_t(uint32_t num_layers, uint32_t layer_idx,
+                                                 uint32_t num_heads, uint32_t page_size,
+                                                 uint32_t head_dim, uint32_t batch_size,
+                                                 DType** ptrs, IdType* indptr,
+                                                 IdType* last_page_offset,
+                                                 IdType* cooperative_aux_info)
+      : num_layers(num_layers),
+        layer_idx(layer_idx),
+        num_heads(num_heads),
+        page_size(page_size),
+        head_dim(head_dim),
+        batch_size(batch_size),
+        ptrs(ptrs),
+        indptr(indptr),
+        last_page_offset(last_page_offset),
+        cooperative_aux_info(cooperative_aux_info) {}
+
+  /*!
+   * \brief Compute the offset of k element in the allocated buffer.
+   * \param page_idx The page index
+   * \param head_idx The head index
+   * \param entry_idx The page entry index
+   * \param feat_idx The feature index
+   * \note This function should only be used when page_storage == kIndices
+   */
   __host__ __device__ __forceinline__ size_t get_k_elem_offset(size_t page_idx, size_t head_idx,
                                                                size_t entry_idx,
                                                                size_t feat_idx) const {
@@ -160,12 +240,45 @@ struct paged_kv_t {
            feat_idx;
   }
 
+  /*!
+   * \brief Compute the offset of k element inside the page.
+   * \param head_idx The head index
+   * \param entry_idx The page entry index
+   * \param feat_idx The feature index
+   */
+  __host__ __device__ __forceinline__ size_t get_k_elem_offset_in_page(size_t head_idx,
+                                                                       size_t entry_idx,
+                                                                       size_t feat_idx) const {
+    return ((layer_idx * 2 * num_heads + head_idx) * page_size + entry_idx) * head_dim + feat_idx;
+  }
+
+  /*!
+   * \brief Compute the offset of v element in the allocated buffer.
+   * \param page_idx The page index
+   * \param head_idx The head index
+   * \param entry_idx The page entry index
+   * \param feat_idx The feature index
+   * \note This function should only be used when page_storage == kIndices
+   */
   __host__ __device__ __forceinline__ size_t get_v_elem_offset(size_t page_idx, size_t head_idx,
                                                                size_t entry_idx,
                                                                size_t feat_idx) const {
     return ((((page_idx * num_layers + layer_idx) * 2 + 1) * num_heads + head_idx) * page_size +
             entry_idx) *
                head_dim +
+           feat_idx;
+  }
+
+  /*!
+   * \brief Compute the offset of v element inside the page.
+   * \param head_idx The head index
+   * \param entry_idx The page entry index
+   * \param feat_idx The feature index
+   */
+  __host__ __device__ __forceinline__ size_t get_v_elem_offset_in_page(size_t head_idx,
+                                                                       size_t entry_idx,
+                                                                       size_t feat_idx) const {
+    return (((layer_idx * 2 + 1) * num_heads + head_idx) * page_size + entry_idx) * head_dim +
            feat_idx;
   }
 
@@ -186,16 +299,26 @@ struct paged_kv_t {
   __host__ __device__ __forceinline__ DType* get_k_ptr(uint32_t page_iter, uint32_t head_idx,
                                                        uint32_t entry_idx,
                                                        uint32_t feat_idx) const {
-    if constexpr (access_mode == AccessMode::kProtective) {
-      if (page_iter < indptr[batch_size]) {
-        return data + get_k_elem_offset(indices[page_iter], head_idx, entry_idx, feat_idx);
-        ;
+    if constexpr (page_storage == PageStorage::kIndices) {
+      if constexpr (access_mode == AccessMode::kProtective) {
+        if (page_iter < indptr[batch_size]) {
+          return data + get_k_elem_offset(indices[page_iter], head_idx, entry_idx, feat_idx);
+        } else {
+          return data;
+        }
       } else {
-        return data;
+        return data + get_k_elem_offset(indices[page_iter], head_idx, entry_idx, feat_idx);
       }
     } else {
-      return data + get_k_elem_offset(indices[page_iter], head_idx, entry_idx, feat_idx);
-      ;
+      if constexpr (access_mode == AccessMode::kProtective) {
+        if (page_iter < indptr[batch_size]) {
+          return ptrs[page_iter] + get_k_elem_offset_in_page(head_idx, entry_idx, feat_idx);
+        } else {
+          return ptrs[0];
+        }
+      } else {
+        return ptrs[page_iter] + get_k_elem_offset_in_page(head_idx, entry_idx, feat_idx);
+      }
     }
   }
 
@@ -203,16 +326,26 @@ struct paged_kv_t {
   __host__ __device__ __forceinline__ DType* get_v_ptr(uint32_t page_iter, uint32_t head_idx,
                                                        uint32_t entry_idx,
                                                        uint32_t feat_idx) const {
-    if constexpr (access_mode == AccessMode::kProtective) {
-      if (page_iter < indptr[batch_size]) {
-        return data + get_v_elem_offset(indices[page_iter], head_idx, entry_idx, feat_idx);
-        ;
+    if constexpr (page_storage == PageStorage::kIndices) {
+      if constexpr (access_mode == AccessMode::kProtective) {
+        if (page_iter < indptr[batch_size]) {
+          return data + get_v_elem_offset(indices[page_iter], head_idx, entry_idx, feat_idx);
+        } else {
+          return data;
+        }
       } else {
-        return data;
+        return data + get_v_elem_offset(indices[page_iter], head_idx, entry_idx, feat_idx);
       }
     } else {
-      return data + get_v_elem_offset(indices[page_iter], head_idx, entry_idx, feat_idx);
-      ;
+      if constexpr (access_mode == AccessMode::kProtective) {
+        if (page_iter < indptr[batch_size]) {
+          return ptrs[page_iter] + get_v_elem_offset_in_page(head_idx, entry_idx, feat_idx);
+        } else {
+          return ptrs[0];
+        }
+      } else {
+        return ptrs[page_iter] + get_v_elem_offset_in_page(head_idx, entry_idx, feat_idx);
+      }
     }
   }
 };
@@ -223,15 +356,16 @@ struct paged_kv_t {
  * \tparam vec_size The vector size used in the kernel
  * \tparam bdx The block dimension in x
  * \tparam bdy The block dimension in y
+ * \tparam page_storage Whether to store indices or pointers of each active page
  * \tparam DType The data type of the key-value cache
  * \tparam IdType The index data type of the kv-cache
  * \param paged_kv The paged key-value cache
  * \param key The key to be appended
  * \param value The value to be appended
  */
-template <uint32_t head_dim, uint32_t vec_size, uint32_t bdx, uint32_t bdy, typename DType,
-          typename IdType>
-__global__ void AppendPagedKVCacheDecodeKernel(paged_kv_t<DType, IdType> paged_kv,
+template <uint32_t head_dim, uint32_t vec_size, uint32_t bdx, uint32_t bdy,
+          PageStorage page_storage, typename DType, typename IdType>
+__global__ void AppendPagedKVCacheDecodeKernel(paged_kv_t<page_storage, DType, IdType> paged_kv,
                                                DType* __restrict__ key, DType* __restrict__ value) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t num_heads = paged_kv.num_heads;
@@ -260,6 +394,7 @@ __global__ void AppendPagedKVCacheDecodeKernel(paged_kv_t<DType, IdType> paged_k
  * \tparam vec_size The vector size used in the kernel
  * \tparam bdx The block dimension in x
  * \tparam bdy The block dimension in y
+ * \tparam page_storage Whether to store indices or pointers of each active page
  * \tparam DType The data type of the key-value cache
  * \tparam IdType The index data type of the kv-cache
  * \param paged_kv The paged key-value cache
@@ -267,9 +402,9 @@ __global__ void AppendPagedKVCacheDecodeKernel(paged_kv_t<DType, IdType> paged_k
  * \param value The value to be appended
  * \param append_indptr The indptr array of the appended ragged tensor
  */
-template <uint32_t head_dim, uint32_t vec_size, uint32_t bdx, uint32_t bdy, typename DType,
-          typename IdType>
-__global__ void AppendPagedKVCachePrefillKernel(paged_kv_t<DType, IdType> paged_kv,
+template <uint32_t head_dim, uint32_t vec_size, uint32_t bdx, uint32_t bdy,
+          PageStorage page_storage, typename DType, typename IdType>
+__global__ void AppendPagedKVCachePrefillKernel(paged_kv_t<page_storage, DType, IdType> paged_kv,
                                                 DType* __restrict__ key, DType* __restrict__ value,
                                                 IdType* __restrict__ append_indptr) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
@@ -307,6 +442,7 @@ __global__ void AppendPagedKVCachePrefillKernel(paged_kv_t<DType, IdType> paged_
  * \tparam vec_size The vector size used in the kernel
  * \tparam bdx The block dimension in x
  * \tparam bdy The block dimension in y
+ * \tparam page_storage Whether to store indices or pointers of each active page
  * \tparam DType The data type of the key-value cache
  * \tparam IdType The index data type of the kv-cache
  * \param paged_kv The paged key-value cache
@@ -315,9 +451,9 @@ __global__ void AppendPagedKVCachePrefillKernel(paged_kv_t<DType, IdType> paged_
  * \param kv_indptr The indptr array of the ragged tensor
  * \return status Indicates whether CUDA calls are successful
  */
-template <uint32_t head_dim, uint32_t vec_size, uint32_t bdx, uint32_t bdy, typename DType,
-          typename IdType>
-__global__ void PagedKVCacheToRaggedTensorKernel(paged_kv_t<DType, IdType> paged_kv,
+template <uint32_t head_dim, uint32_t vec_size, uint32_t bdx, uint32_t bdy,
+          PageStorage page_storage, typename DType, typename IdType>
+__global__ void PagedKVCacheToRaggedTensorKernel(paged_kv_t<page_storage, DType, IdType> paged_kv,
                                                  DType* __restrict__ key, DType* __restrict__ value,
                                                  IdType* __restrict__ kv_indptr) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
@@ -343,6 +479,7 @@ __global__ void PagedKVCacheToRaggedTensorKernel(paged_kv_t<DType, IdType> paged
 
 /*!
  * \brief Append new keys/values to the paged key-value cache in the decode phase
+ * \tparam page_storage Whether to store indices or pointers of each active page
  * \tparam DType The data type of the key-value cache
  * \tparam IdType The index data type of the kv-cache
  * \param paged_kv The paged key-value cache
@@ -351,9 +488,9 @@ __global__ void PagedKVCacheToRaggedTensorKernel(paged_kv_t<DType, IdType> paged
  * \param stream The CUDA stream to execute kernels.
  * \return status Indicates whether CUDA calls are successful
  */
-template <typename DType, typename IdType>
-cudaError_t AppendPagedKVCacheDecode(paged_kv_t<DType, IdType> paged_kv, DType* key, DType* value,
-                                     cudaStream_t stream = nullptr) {
+template <PageStorage page_storage, typename DType, typename IdType>
+cudaError_t AppendPagedKVCacheDecode(paged_kv_t<page_storage, DType, IdType> paged_kv, DType* key,
+                                     DType* value, cudaStream_t stream = nullptr) {
   uint32_t head_dim = paged_kv.head_dim;
   uint32_t batch_size = paged_kv.batch_size;
   uint32_t num_heads = paged_kv.num_heads;
@@ -373,6 +510,7 @@ cudaError_t AppendPagedKVCacheDecode(paged_kv_t<DType, IdType> paged_kv, DType* 
 
 /*!
  * \brief Append new keys/values to the paged key-value cache in the prefill phase
+ * \tparam page_storage Whether to store indices or pointers of each active page
  * \tparam DType The data type of the key-value cache
  * \tparam IdType The index data type of the kv-cache
  * \param paged_kv The paged key-value cache
@@ -382,9 +520,10 @@ cudaError_t AppendPagedKVCacheDecode(paged_kv_t<DType, IdType> paged_kv, DType* 
  * \param stream The CUDA stream to execute kernels.
  * \return status Indicates whether CUDA calls are successful
  */
-template <typename DType, typename IdType>
-cudaError_t AppendPagedKVCachePrefill(paged_kv_t<DType, IdType> paged_kv, DType* key, DType* value,
-                                      IdType* append_indptr, cudaStream_t stream = nullptr) {
+template <PageStorage page_storage, typename DType, typename IdType>
+cudaError_t AppendPagedKVCachePrefill(paged_kv_t<page_storage, DType, IdType> paged_kv, DType* key,
+                                      DType* value, IdType* append_indptr,
+                                      cudaStream_t stream = nullptr) {
   uint32_t head_dim = paged_kv.head_dim;
   uint32_t batch_size = paged_kv.batch_size;
   uint32_t num_heads = paged_kv.num_heads;
@@ -404,6 +543,7 @@ cudaError_t AppendPagedKVCachePrefill(paged_kv_t<DType, IdType> paged_kv, DType*
 
 /*!
  * \brief Compute the index pointers of the ragged tensor converted from paged key-value
+ * \tparam page_storage Whether to store indices or pointers of each active page
  * \tparam DType The data type of the key-value cache
  * \tparam IdType The index data type of the kv-cache
  * \param paged_kv The paged key-value cache
@@ -411,10 +551,10 @@ cudaError_t AppendPagedKVCachePrefill(paged_kv_t<DType, IdType> paged_kv, DType*
  * \param stream The CUDA stream to execute kernels.
  * \return status Indicates whether CUDA calls are successful
  */
-template <typename DType, typename IdType>
-cudaError_t PagedKVCacheToRaggedTensorComputeIndptr(paged_kv_t<DType, IdType> paged_kv,
-                                                    std::vector<IdType>& kv_indptr_host,
-                                                    cudaStream_t stream = nullptr) {
+template <PageStorage page_storage, typename DType, typename IdType>
+cudaError_t PagedKVCacheToRaggedTensorComputeIndptr(
+    paged_kv_t<page_storage, DType, IdType> paged_kv, std::vector<IdType>& kv_indptr_host,
+    cudaStream_t stream = nullptr) {
   const uint32_t batch_size = paged_kv.batch_size;
   const uint32_t page_size = paged_kv.page_size;
   std::vector<IdType> paged_kv_indptr_host(batch_size + 1),
@@ -443,6 +583,7 @@ cudaError_t PagedKVCacheToRaggedTensorComputeIndptr(paged_kv_t<DType, IdType> pa
 
 /*!
  * \brief Convert the paged key-value cache to a ragged tensor
+ * \tparam page_storage Whether to store indices or pointers of each active page
  * \tparam DType The data type of the key-value cache
  * \tparam IdType The index data type of the kv-cache
  * \param paged_kv The paged key-value cache
@@ -452,9 +593,10 @@ cudaError_t PagedKVCacheToRaggedTensorComputeIndptr(paged_kv_t<DType, IdType> pa
  * \param stream The CUDA stream to execute kernels.
  * \return status Indicates whether CUDA calls are successful
  */
-template <typename DType, typename IdType>
-cudaError_t PagedKVCacheToRaggedTensor(paged_kv_t<DType, IdType> paged_kv, DType* key, DType* value,
-                                       IdType* kv_indptr, cudaStream_t stream = nullptr) {
+template <PageStorage page_storage, typename DType, typename IdType>
+cudaError_t PagedKVCacheToRaggedTensor(paged_kv_t<page_storage, DType, IdType> paged_kv, DType* key,
+                                       DType* value, IdType* kv_indptr,
+                                       cudaStream_t stream = nullptr) {
   const uint32_t head_dim = paged_kv.head_dim;
   const uint32_t batch_size = paged_kv.batch_size;
   const uint32_t num_heads = paged_kv.num_heads;
@@ -467,7 +609,8 @@ cudaError_t PagedKVCacheToRaggedTensor(paged_kv_t<DType, IdType> paged_kv, DType
     assert(num_heads % bdy == 0);
     dim3 nblks(batch_size * num_heads / bdy);
     dim3 nthrs(bdx, bdy);
-    auto kernel = PagedKVCacheToRaggedTensorKernel<HEAD_DIM, vec_size, bdx, bdy, DType, IdType>;
+    auto kernel =
+        PagedKVCacheToRaggedTensorKernel<HEAD_DIM, vec_size, bdx, bdy, page_storage, DType, IdType>;
     void* args[] = {(void*)&paged_kv, (void*)&key, (void*)&value, (void*)&kv_indptr};
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
   });

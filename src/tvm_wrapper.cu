@@ -166,11 +166,11 @@ void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data, DLTensor* pag
       pages->dtype, dtype_in,
       {SWITCH_TVM_CUDA_DTYPE(
           output->dtype, dtype_out, {SWITCH_TVM_CUDA_IDTYPE(page_table_values->dtype, dtype_idx, {
-            flashinfer::paged_kv_t<dtype_in, dtype_idx> cache(
+            flashinfer::paged_kv_t<PageStorage::kIndices, dtype_in, dtype_idx> cache(
                 nlayer, layer_id, nhead_kv, page_size, nfeat, num_total_seqs,
                 static_cast<dtype_in*>(pages->data),
-                static_cast<dtype_idx*>(page_table_indptr->data),
                 static_cast<dtype_idx*>(page_table_values->data),
+                static_cast<dtype_idx*>(page_table_indptr->data),
                 static_cast<dtype_idx*>(last_page_offset->data));
             cudaError_t status =
                 flashinfer::BatchPrefillWithPagedKVCache<dtype_in, dtype_out, dtype_idx>(
@@ -262,11 +262,11 @@ void _FlashInferAttentionDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* page
       pages->dtype, dtype_in,
       {SWITCH_TVM_CUDA_DTYPE(
           output->dtype, dtype_out, {SWITCH_TVM_CUDA_IDTYPE(page_table_values->dtype, dtype_idx, {
-            flashinfer::paged_kv_t<dtype_in, dtype_idx> cache(
+            flashinfer::paged_kv_t<PageStorage::kIndices, dtype_in, dtype_idx> cache(
                 nlayer, layer_id, nhead_kv, page_size, nfeat, num_total_seqs,
                 static_cast<dtype_in*>(pages->data),
-                static_cast<dtype_idx*>(page_table_indptr->data),
                 static_cast<dtype_idx*>(page_table_values->data),
+                static_cast<dtype_idx*>(page_table_indptr->data),
                 static_cast<dtype_idx*>(last_page_offset->data));
             cudaError_t status =
                 flashinfer::BatchDecodeWithPagedKVCache<dtype_in, dtype_out, dtype_idx>(

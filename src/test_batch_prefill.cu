@@ -24,8 +24,8 @@
 using namespace flashinfer;
 
 template <typename T>
-void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t num_qo_heads, size_t head_dim, bool causal,
-                                              RotaryMode rotary_mode,
+void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t num_qo_heads,
+                                              size_t head_dim, bool causal, RotaryMode rotary_mode,
                                               bool allow_fp16_qk_reduction) {
   uint32_t num_layers = 13;
   uint32_t page_size = 16;
@@ -65,9 +65,9 @@ void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t num_qo
   }
 
   kv_data.resize(page_counter * num_layers * 2 * num_kv_heads * page_size * head_dim);
-  flashinfer::paged_kv_t<T, int32_t> paged_kv_cpu(num_layers, 0, num_kv_heads, page_size, head_dim,
-                                                  batch_size, kv_data.data(), kv_indptr.data(),
-                                                  kv_indices.data(), kv_last_page_offset.data());
+  flashinfer::paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv_cpu(
+      num_layers, 0, num_kv_heads, page_size, head_dim, batch_size, kv_data.data(),
+      kv_indices.data(), kv_indptr.data(), kv_last_page_offset.data());
   for (uint32_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
     paged_kv_cpu.layer_idx = layer_idx;
     cpu_reference::append_paged_kv_cache<T, int32_t>(paged_kv_cpu, keys[layer_idx],
@@ -81,10 +81,10 @@ void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t num_qo
   thrust::device_vector<int32_t> kv_last_page_offset_device(kv_last_page_offset);
 
   // create paged_kv object
-  flashinfer::paged_kv_t<T, int32_t> paged_kv = paged_kv_cpu;
+  flashinfer::paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv = paged_kv_cpu;
   paged_kv.data = thrust::raw_pointer_cast(kv_data_device.data());
-  paged_kv.indptr = thrust::raw_pointer_cast(kv_indptr_device.data());
   paged_kv.indices = thrust::raw_pointer_cast(kv_indices_device.data());
+  paged_kv.indptr = thrust::raw_pointer_cast(kv_indptr_device.data());
   paged_kv.last_page_offset = thrust::raw_pointer_cast(kv_last_page_offset_device.data());
 
   for (uint32_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
@@ -108,7 +108,7 @@ void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t num_qo
       thrust::device_vector<T> o_device(q_len * num_qo_heads * head_dim);
 
       for (uint32_t num_runs = 0; num_runs < 10; ++num_runs) {
-        auto status = BatchPrefillWithPagedKVCache<T, T, int32_t>(
+        auto status = BatchPrefillWithPagedKVCache<PageStorage::kIndices, T, T, int32_t>(
             thrust::raw_pointer_cast(q_device.data()), paged_kv,
             thrust::raw_pointer_cast(q_indptr_device.data()),
             thrust::raw_pointer_cast(o_device.data()), nullptr, num_qo_heads, causal, rotary_mode,
@@ -129,10 +129,9 @@ void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t num_qo
       float result_accuracy = 1. - float(num_result_errors_atol_1e_3_rtol_1e_3) /
                                        max(float(q_len * num_qo_heads * head_dim), 1.f);
       std::cout << "layer_idx=" << layer_idx << ", request_idx=" << request_idx
-                << ", num_qo_heads=" << num_qo_heads
-                << ", num_kv_heads=" << num_kv_heads << ", q_len=" << q_len << ", kv_len=" << kv_len
-                << ", head_dim=" << head_dim << ", causal=" << causal
-                << ", rotary_mode=" << RotaryModeToString(rotary_mode)
+                << ", num_qo_heads=" << num_qo_heads << ", num_kv_heads=" << num_kv_heads
+                << ", q_len=" << q_len << ", kv_len=" << kv_len << ", head_dim=" << head_dim
+                << ", causal=" << causal << ", rotary_mode=" << RotaryModeToString(rotary_mode)
                 << ", result_accuracy=" << result_accuracy << std::endl;
       EXPECT_GT(result_accuracy, 0.99) << "Result correctness test failed.";
       EXPECT_EQ(nan_detected, false) << "NaN detected in output.";
@@ -141,8 +140,9 @@ void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t num_qo
 }
 
 template <typename T>
-void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads,size_t num_qo_heads, size_t head_dim,
-                                                    bool causal, RotaryMode rotary_mode,
+void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads, size_t num_qo_heads,
+                                                    size_t head_dim, bool causal,
+                                                    RotaryMode rotary_mode,
                                                     bool allow_fp16_qk_reduction) {
   uint32_t num_layers = 3;
   uint32_t page_size = 16;
@@ -186,9 +186,9 @@ void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads,size_t n
   }
 
   kv_data.resize(page_counter * num_layers * 2 * num_kv_heads * page_size * head_dim);
-  flashinfer::paged_kv_t<T, int32_t> paged_kv_cpu(num_layers, 0, num_kv_heads, page_size, head_dim,
-                                                  batch_size, kv_data.data(), kv_indptr.data(),
-                                                  kv_indices.data(), kv_last_page_offset.data());
+  flashinfer::paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv_cpu(
+      num_layers, 0, num_kv_heads, page_size, head_dim, batch_size, kv_data.data(),
+      kv_indices.data(), kv_indptr.data(), kv_last_page_offset.data());
   for (uint32_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
     paged_kv_cpu.layer_idx = layer_idx;
     cpu_reference::append_paged_kv_cache<T, int32_t>(paged_kv_cpu, keys[layer_idx],
@@ -202,10 +202,10 @@ void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads,size_t n
   thrust::device_vector<int32_t> kv_last_page_offset_device(kv_last_page_offset);
 
   // create paged_kv object
-  flashinfer::paged_kv_t<T, int32_t> paged_kv = paged_kv_cpu;
+  flashinfer::paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv = paged_kv_cpu;
   paged_kv.data = thrust::raw_pointer_cast(kv_data_device.data());
-  paged_kv.indptr = thrust::raw_pointer_cast(kv_indptr_device.data());
   paged_kv.indices = thrust::raw_pointer_cast(kv_indices_device.data());
+  paged_kv.indptr = thrust::raw_pointer_cast(kv_indptr_device.data());
   paged_kv.last_page_offset = thrust::raw_pointer_cast(kv_last_page_offset_device.data());
 
   for (uint32_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
@@ -237,7 +237,7 @@ void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads,size_t n
     thrust::device_vector<T> o_device(o_concat_ref.size());
 
     for (uint32_t num_runs = 0; num_runs < 10; ++num_runs) {
-      auto status = BatchPrefillWithPagedKVCache<T, T, int32_t>(
+      auto status = BatchPrefillWithPagedKVCache<PageStorage::kIndices, T, T, int32_t>(
           thrust::raw_pointer_cast(q_device.data()), paged_kv,
           thrust::raw_pointer_cast(q_indptr_device.data()),
           thrust::raw_pointer_cast(o_device.data()), nullptr, num_qo_heads, causal, rotary_mode,
@@ -257,11 +257,9 @@ void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads,size_t n
     }
     float result_accuracy =
         1. - float(num_result_errors_atol_1e_3_rtol_1e_3) / max(float(o_concat_ref.size()), 1.f);
-    std::cout << "layer_idx=" << layer_idx
-              << ", num_qo_heads=" << num_qo_heads
-              << ", num_kv_heads=" << num_kv_heads
-              << ", head_dim=" << head_dim << ", causal=" << causal
-              << ", rotary_mode=" << RotaryModeToString(rotary_mode)
+    std::cout << "layer_idx=" << layer_idx << ", num_qo_heads=" << num_qo_heads
+              << ", num_kv_heads=" << num_kv_heads << ", head_dim=" << head_dim
+              << ", causal=" << causal << ", rotary_mode=" << RotaryModeToString(rotary_mode)
               << ", result_accuracy=" << result_accuracy << std::endl;
     EXPECT_GT(result_accuracy, 0.99) << "Result correctness test failed.";
     EXPECT_EQ(nan_detected, false) << "NaN detected in output.";
@@ -269,8 +267,9 @@ void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads,size_t n
 }
 
 template <typename T>
-void _TestBatchPrefillKernelLongContextCorrectness(size_t num_kv_heads,size_t num_qo_heads, size_t head_dim,
-                                                   bool causal, RotaryMode rotary_mode,
+void _TestBatchPrefillKernelLongContextCorrectness(size_t num_kv_heads, size_t num_qo_heads,
+                                                   size_t head_dim, bool causal,
+                                                   RotaryMode rotary_mode,
                                                    bool allow_fp16_qk_reduction) {
   uint32_t page_size = 16;
   std::vector<std::vector<std::vector<T>>> keys, values;
@@ -295,9 +294,9 @@ void _TestBatchPrefillKernelLongContextCorrectness(size_t num_kv_heads,size_t nu
   }
 
   kv_data.resize(page_counter * 1 * 2 * num_kv_heads * page_size * head_dim);
-  flashinfer::paged_kv_t<T, int32_t> paged_kv_cpu(1, 0, num_kv_heads, page_size, head_dim, 1,
-                                                  kv_data.data(), kv_indptr.data(),
-                                                  kv_indices.data(), kv_last_page_offset.data());
+  flashinfer::paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv_cpu(
+      1, 0, num_kv_heads, page_size, head_dim, 1, kv_data.data(), kv_indices.data(),
+      kv_indptr.data(), kv_last_page_offset.data());
   cpu_reference::append_paged_kv_cache<T, int32_t>(paged_kv_cpu, {k}, {v}, append_indptr);
 
   // copy data to device
@@ -307,10 +306,10 @@ void _TestBatchPrefillKernelLongContextCorrectness(size_t num_kv_heads,size_t nu
   thrust::device_vector<int32_t> kv_last_page_offset_device(kv_last_page_offset);
 
   // create paged_kv object
-  flashinfer::paged_kv_t<T, int32_t> paged_kv = paged_kv_cpu;
+  flashinfer::paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv = paged_kv_cpu;
   paged_kv.data = thrust::raw_pointer_cast(kv_data_device.data());
-  paged_kv.indptr = thrust::raw_pointer_cast(kv_indptr_device.data());
   paged_kv.indices = thrust::raw_pointer_cast(kv_indices_device.data());
+  paged_kv.indptr = thrust::raw_pointer_cast(kv_indptr_device.data());
   paged_kv.last_page_offset = thrust::raw_pointer_cast(kv_last_page_offset_device.data());
 
   // create one-hot queries
@@ -326,7 +325,7 @@ void _TestBatchPrefillKernelLongContextCorrectness(size_t num_kv_heads,size_t nu
   thrust::device_vector<T> o_device(q_lens[0] * num_qo_heads * head_dim);
 
   for (uint32_t num_runs = 0; num_runs < 10; ++num_runs) {
-    auto status = BatchPrefillWithPagedKVCache<T, T, int32_t>(
+    auto status = BatchPrefillWithPagedKVCache<PageStorage::kIndices, T, T, int32_t>(
         thrust::raw_pointer_cast(q_device.data()), paged_kv,
         thrust::raw_pointer_cast(q_indptr_device.data()), thrust::raw_pointer_cast(o_device.data()),
         nullptr, num_qo_heads, causal, rotary_mode, allow_fp16_qk_reduction);
@@ -345,10 +344,9 @@ void _TestBatchPrefillKernelLongContextCorrectness(size_t num_kv_heads,size_t nu
   }
   float result_accuracy = 1. - float(num_result_errors_atol_1e_3_rtol_1e_3) /
                                    max(float(q_lens[0] * num_qo_heads * head_dim), 1.f);
-  std::cout << ", num_qo_heads=" << num_qo_heads
-            << ", num_kv_heads=" << num_kv_heads << ", q_len=" << q_lens[0]
-            << ", kv_len=" << kv_lens[0] << ", head_dim=" << head_dim << ", causal=" << causal
-            << ", rotary_mode=" << RotaryModeToString(rotary_mode)
+  std::cout << ", num_qo_heads=" << num_qo_heads << ", num_kv_heads=" << num_kv_heads
+            << ", q_len=" << q_lens[0] << ", kv_len=" << kv_lens[0] << ", head_dim=" << head_dim
+            << ", causal=" << causal << ", rotary_mode=" << RotaryModeToString(rotary_mode)
             << ", result_accuracy=" << result_accuracy << std::endl;
   EXPECT_GT(result_accuracy, 0.99) << "Result correctness test failed.";
   EXPECT_EQ(nan_detected, false) << "NaN detected in output.";
@@ -357,47 +355,50 @@ void _TestBatchPrefillKernelLongContextCorrectness(size_t num_kv_heads,size_t nu
 template <typename T>
 void TestBatchPrefillKernelOneHotCorrectness(bool allow_fp16_qk_reduction) {
   for (size_t num_kv_heads : {4, 32}) {
-    for (size_t num_qo_heads: {32}) {
-    for (size_t head_dim : {64, 128}) {
-      for (size_t causal : {false, true}) {
-        for (size_t rotary_mode : {0, 1}) {
-          _TestBatchPrefillKernelOneHotCorrectness<T>(
-              num_kv_heads, num_qo_heads, head_dim, causal, RotaryMode(rotary_mode), allow_fp16_qk_reduction);
+    for (size_t num_qo_heads : {32}) {
+      for (size_t head_dim : {64, 128}) {
+        for (size_t causal : {false, true}) {
+          for (size_t rotary_mode : {0, 1}) {
+            _TestBatchPrefillKernelOneHotCorrectness<T>(num_kv_heads, num_qo_heads, head_dim,
+                                                        causal, RotaryMode(rotary_mode),
+                                                        allow_fp16_qk_reduction);
+          }
         }
       }
     }
-  }
   }
 }
 
 template <typename T>
 void TestBatchPrefillKernelShortContextCorrectness(bool allow_fp16_qk_reduction) {
   for (size_t num_kv_heads : {4, 32}) {
-    for (size_t num_qo_heads: {32}) {
-    for (size_t head_dim : {64, 128}) {
-      for (size_t causal : {false, true}) {
-        for (size_t rotary_mode : {0, 1}) {
-          _TestBatchPrefillKernelShortContextCorrectness<T>(
-              num_kv_heads, num_qo_heads, head_dim, causal, RotaryMode(rotary_mode), allow_fp16_qk_reduction);
+    for (size_t num_qo_heads : {32}) {
+      for (size_t head_dim : {64, 128}) {
+        for (size_t causal : {false, true}) {
+          for (size_t rotary_mode : {0, 1}) {
+            _TestBatchPrefillKernelShortContextCorrectness<T>(num_kv_heads, num_qo_heads, head_dim,
+                                                              causal, RotaryMode(rotary_mode),
+                                                              allow_fp16_qk_reduction);
+          }
         }
       }
     }
-  }
   }
 }
 
 template <typename T>
 void TestBatchPrefillKernelLongContextCorrectness(bool allow_fp16_qk_reduction) {
   for (size_t num_kv_heads : {1, 8}) {
-    for (size_t num_qo_heads: {8}) {
-    for (size_t head_dim : {64, 128}) {
-      for (size_t causal : {false, true}) {
-        for (size_t rotary_mode : {0, 1}) {
-          _TestBatchPrefillKernelLongContextCorrectness<T>(
-              num_kv_heads, num_qo_heads, head_dim, causal, RotaryMode(rotary_mode), allow_fp16_qk_reduction);
+    for (size_t num_qo_heads : {8}) {
+      for (size_t head_dim : {64, 128}) {
+        for (size_t causal : {false, true}) {
+          for (size_t rotary_mode : {0, 1}) {
+            _TestBatchPrefillKernelLongContextCorrectness<T>(num_kv_heads, num_qo_heads, head_dim,
+                                                             causal, RotaryMode(rotary_mode),
+                                                             allow_fp16_qk_reduction);
+          }
         }
       }
-    }
     }
   }
 }

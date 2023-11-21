@@ -26,21 +26,7 @@
 
 namespace flashinfer {
 
-namespace {
-
-/*!
- * \brief Combine hash values.
- * \note Adopted from boost::hash_combine.
- */
-template <class T>
-void hash_combine(std::size_t& seed, const T& v) {
-  std::hash<T> hasher;
-  seed ^= hasher(v) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-}
-
-}  // namespace
-
-template <typename DTypeIn, typename DTypeOut, typename IdType>
+template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
 class BatchDecodeBufferManager {
  public:
   struct Value {
@@ -56,6 +42,14 @@ class BatchDecodeBufferManager {
     IdType* new_last_page_offset() const {
       if (int_buffer != nullptr) {
         return int_buffer + new_batch_size + 1;
+      } else {
+        return nullptr;
+      }
+    }
+    // cooperative_aux_info starts with cooperative_indptr
+    IdType* cooperative_aux_info() const {
+      if (int_buffer != nullptr) {
+        return int_buffer + 2 * new_batch_size + 1;
       } else {
         return nullptr;
       }
@@ -90,12 +84,12 @@ class BatchDecodeBufferManager {
     }
   };
 
-  Value Get(const paged_kv_t<DTypeIn, IdType>& paged_kv, uint32_t num_qo_heads,
+  Value Get(const paged_kv_t<page_storage, DTypeIn, IdType>& paged_kv, uint32_t num_qo_heads,
             RotaryMode rotary_mode) {
     if (paged_kv.layer_idx == 0) {
       FreeValue();
       uint32_t tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size;
-      BatchDecodeWithPagedKVCacheWorkEstimation<DTypeIn, DTypeOut, IdType>(
+      BatchDecodeWithPagedKVCacheWorkEstimation<page_storage, DTypeIn, DTypeOut, IdType>(
           tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size, paged_kv, num_qo_heads,
           rotary_mode, stream_);
       value_.new_batch_size = new_batch_size;
@@ -138,6 +132,7 @@ class BatchDecodeBufferManager {
 /*!
  * \brief Wrapper of BatchDecodeWithPagedKVCache function, and caches the temporary buffer
  *   for cooperative kernels.
+ * \tparam page_storage Whether to store indices or pointers of each active page
  * \tparam DTypeIn The data type of input tensor.
  * \tparam DTypeOut The data type of output tensor.
  * \tparam IdType The data type of index tensor.
@@ -153,24 +148,21 @@ class BatchDecodeBufferManager {
  * \note This wrapper function only computes the temporary buffer size and allocates the
  *   temporary buffer when layer_idx is 0.
  */
-template <typename DTypeIn, typename DTypeOut, typename IdType>
+template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCache(
-    BatchDecodeBufferManager<DTypeIn, DTypeOut, IdType>* buf_manager, DTypeIn* q,
-    paged_kv_t<DTypeIn, IdType> paged_kv, DTypeOut* o, uint32_t num_qo_heads,
+    BatchDecodeBufferManager<page_storage, DTypeIn, DTypeOut, IdType>* buf_manager, DTypeIn* q,
+    paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, DTypeOut* o, uint32_t num_qo_heads,
     RotaryMode rotary_mode = RotaryMode::kNone, float rope_scale = 1.f, float rope_theta = 1e4,
     cudaStream_t stream = nullptr) {
   auto value = buf_manager->Get(paged_kv, num_qo_heads, rotary_mode);
-  paged_kv_t new_paged_kv = paged_kv;
+  paged_kv_t<page_storage, DTypeIn, IdType> new_paged_kv = paged_kv;
   if (value.float_buffer != nullptr) {
     new_paged_kv.batch_size = value.new_batch_size;
     new_paged_kv.indptr = value.new_indptr();
     new_paged_kv.last_page_offset = value.new_last_page_offset();
-    new_paged_kv.cooperative_indptr = value.cooperative_indptr();
-    new_paged_kv.batch_idx_map = value.batch_idx_map();
-    new_paged_kv.chunk_start = value.chunk_start();
-    new_paged_kv.seq_lens_before_split = value.seq_lens_before_split();
+    new_paged_kv.cooperative_aux_info = value.cooperative_aux_info();
   }
-  return BatchDecodeWithPagedKVCache<DTypeIn, DTypeOut, IdType>(
+  return BatchDecodeWithPagedKVCache<page_storage, DTypeIn, DTypeOut, IdType>(
       q, new_paged_kv, o, value.float_buffer, num_qo_heads, rotary_mode, rope_scale, rope_theta,
       stream);
 }
