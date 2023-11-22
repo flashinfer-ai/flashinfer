@@ -210,8 +210,8 @@ void _TestPagedKVCacheToRaggedTensorCorrectness(size_t page_size, size_t batch_s
       thrust::raw_pointer_cast(paged_kv_last_page_offset_gpu.data()));
 
   std::vector<int32_t> kv_indptr_h(batch_size + 1);
-  cudaError_t status =
-      PagedKVCacheToRaggedTensorComputeIndptr<T, int32_t>(paged_kv_gpu, kv_indptr_h);
+  cudaError_t status = PagedKVCacheToRaggedTensorComputeIndptr<PageStorage::kIndices, T, int32_t>(
+      paged_kv_gpu, kv_indptr_h);
   EXPECT_EQ(status, cudaSuccess) << "PagedKVCacheToRaggedTensorComputeIndptr "
                                     "kernel launch failed, error message: "
                                  << cudaGetErrorString(status);
@@ -225,7 +225,7 @@ void _TestPagedKVCacheToRaggedTensorCorrectness(size_t page_size, size_t batch_s
   thrust::device_vector<T> value(batch_size * num_pages_per_request * page_size * num_heads *
                                  head_dim);
   thrust::device_vector<int32_t> kv_indptr = kv_indptr_h;
-  status = PagedKVCacheToRaggedTensor<T, int32_t>(
+  status = PagedKVCacheToRaggedTensor<PageStorage::kIndices, T, int32_t>(
       paged_kv_gpu, thrust::raw_pointer_cast(key.data()), thrust::raw_pointer_cast(value.data()),
       thrust::raw_pointer_cast(kv_indptr.data()));
   EXPECT_EQ(status, cudaSuccess)

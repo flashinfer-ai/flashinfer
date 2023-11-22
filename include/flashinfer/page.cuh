@@ -501,7 +501,8 @@ cudaError_t AppendPagedKVCacheDecode(paged_kv_t<page_storage, DType, IdType> pag
     assert(num_heads % bdy == 0);
     dim3 nblks(batch_size * num_heads / bdy);
     dim3 nthrs(bdx, bdy);
-    auto kernel = AppendPagedKVCacheDecodeKernel<HEAD_DIM, vec_size, bdx, bdy, DType, IdType>;
+    auto kernel =
+        AppendPagedKVCacheDecodeKernel<HEAD_DIM, vec_size, bdx, bdy, page_storage, DType, IdType>;
     void* args[] = {(void*)&paged_kv, (void*)&key, (void*)&value};
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
   });
@@ -534,7 +535,8 @@ cudaError_t AppendPagedKVCachePrefill(paged_kv_t<page_storage, DType, IdType> pa
     assert(num_heads % bdy == 0);
     dim3 nblks(batch_size * num_heads / bdy);
     dim3 nthrs(bdx, bdy);
-    auto kernel = AppendPagedKVCachePrefillKernel<HEAD_DIM, vec_size, bdx, bdy, DType, IdType>;
+    auto kernel =
+        AppendPagedKVCachePrefillKernel<HEAD_DIM, vec_size, bdx, bdy, page_storage, DType, IdType>;
     void* args[] = {(void*)&paged_kv, (void*)&key, (void*)&value, (void*)&append_indptr};
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
   });
