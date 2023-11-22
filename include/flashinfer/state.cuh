@@ -24,11 +24,8 @@ namespace flashinfer {
 /*!
  * \brief The flashattention state.
  * \tparam vec_size The size of the vector used in o.
- * \tparam norm_on_the_fly Whether to normalize the state on the fly. If true,
- *   the state will be normalized when merge() is called. If false, the state will
- *   be normalized when normalize() is called.
  */
-template <size_t vec_size, bool norm_on_the_fly>
+template <size_t vec_size>
 struct state_t {
   /* the weighted sum of v: exp(pre-softmax logit - m) * v / d  */
   vec_t<float, vec_size> o;
@@ -56,17 +53,9 @@ struct state_t {
     float m_prev = m, d_prev = d;
     m = max(m_prev, other_m);
     d = d_prev * math::ptx_exp2(m_prev - m) + other_d * math::ptx_exp2(other_m - m);
-    if constexpr (norm_on_the_fly) {
 #pragma unroll
-      for (size_t i = 0; i < vec_size; ++i) {
-        o[i] = o[i] * math::ptx_exp2(m_prev - m) * (d_prev / d) +
-               other_o[i] * math::ptx_exp2(other_m - m) * (other_d / d);
-      }
-    } else {
-#pragma unroll
-      for (size_t i = 0; i < vec_size; ++i) {
-        o[i] = o[i] * math::ptx_exp2(m_prev - m) + other_o[i] * math::ptx_exp2(other_m - m);
-      }
+    for (size_t i = 0; i < vec_size; ++i) {
+      o[i] = o[i] * math::ptx_exp2(m_prev - m) + other_o[i] * math::ptx_exp2(other_m - m);
     }
   }
 
@@ -74,7 +63,7 @@ struct state_t {
    * \brief Merge the state with another state.
    * \param other The other state.
    */
-  __device__ __forceinline__ void merge(const state_t<vec_size, norm_on_the_fly>& other) {
+  __device__ __forceinline__ void merge(const state_t<vec_size>& other) {
     merge(other.o, other.m, other.d);
   }
 
@@ -84,30 +73,20 @@ struct state_t {
    * \param v The value vector.
    */
   __device__ __forceinline__ void merge(const vec_t<float, vec_size>& other_o, float x) {
-    float m_prev = m, d_prev = d;
+    float m_prev = m;
     m = max(m_prev, x);
     d = d * math::ptx_exp2(m_prev - m) + math::ptx_exp2(x - m);
-    if constexpr (norm_on_the_fly) {
 #pragma unroll
-      for (size_t i = 0; i < vec_size; ++i) {
-        o[i] = o[i] * (math::ptx_exp2(m_prev - m) * d_prev / d) +
-               other_o[i] * (math::ptx_exp2(x - m) / d);
-      }
-    } else {
-#pragma unroll
-      for (size_t i = 0; i < vec_size; ++i) {
-        o[i] = o[i] * math::ptx_exp2(m_prev - m) + other_o[i] * math::ptx_exp2(x - m);
-      }
+    for (size_t i = 0; i < vec_size; ++i) {
+      o[i] = o[i] * math::ptx_exp2(m_prev - m) + other_o[i] * math::ptx_exp2(x - m);
     }
   }
 
   __device__ __forceinline__ void normalize() {
-    if constexpr (!norm_on_the_fly) {
-      // only normalize by d when not normalized on the fly
+    // only normalize by d when not normalized on the fly
 #pragma unroll
-      for (size_t i = 0; i < vec_size; ++i) {
-        o[i] = __fdividef(o[i], d);
-      }
+    for (size_t i = 0; i < vec_size; ++i) {
+      o[i] = __fdividef(o[i], d);
     }
   }
 };
