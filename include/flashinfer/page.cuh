@@ -497,7 +497,7 @@ cudaError_t AppendPagedKVCacheDecode(paged_kv_t<page_storage, DType, IdType> pag
   SWITCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
     constexpr uint32_t bdx = HEAD_DIM / vec_size;
-    constexpr uint32_t bdy = 128 / bdx;
+    constexpr uint32_t bdy = 1;
     assert(num_heads % bdy == 0);
     dim3 nblks(batch_size * num_heads / bdy);
     dim3 nthrs(bdx, bdy);
@@ -531,7 +531,7 @@ cudaError_t AppendPagedKVCachePrefill(paged_kv_t<page_storage, DType, IdType> pa
   SWITCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
     constexpr uint32_t bdx = HEAD_DIM / vec_size;
-    constexpr uint32_t bdy = 128 / bdx;
+    constexpr uint32_t bdy = 1;
     assert(num_heads % bdy == 0);
     dim3 nblks(batch_size * num_heads / bdy);
     dim3 nthrs(bdx, bdy);
