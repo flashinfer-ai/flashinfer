@@ -95,10 +95,13 @@ __device__ __forceinline__ vec_t<float, vec_size> apply_llama_rope(
  * \param x A float indicates the thread-local result of qk
  */
 template <RotaryMode rotary_mode, uint32_t vec_size, uint32_t bdx, uint32_t bdy, typename T>
-__device__ __forceinline__ void compute_qk(const T* smem, const vec_t<float, vec_size>& q_vec,
+__device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage_idx,
+                                           const vec_t<float, vec_size>& q_vec,
                                            const vec_t<float, vec_size>& freq, uint32_t kv_idx_base,
-                                           uint32_t compute_stage_idx, float sm_scale, float* x) {
+                                           uint32_t iter_base, uint32_t iter_bound, float sm_scale,
+                                           float* x, state_t<vec_size>& s) {
   uint32_t tx = threadIdx.x, tz = threadIdx.z;
+  float m_prev = s.m;
 #pragma unroll
   for (uint32_t iy = 0; iy < bdy; ++iy) {
     vec_t<float, vec_size> k_vec;
@@ -119,6 +122,20 @@ __device__ __forceinline__ void compute_qk(const T* smem, const vec_t<float, vec
     for (uint32_t offset = bdx / 2; offset > 0; offset /= 2) {
       x[iy] += math::shfl_xor_sync(x[iy], offset);
     }
+    x[iy] = (iter_base + tz * bdy + iy < iter_bound) ? x[iy] : -5e4;
+    s.m = max(s.m, x[iy]);
+  }
+
+  float o_scale = math::ptx_exp2(m_prev - s.m);
+  s.d *= o_scale;
+#pragma unroll
+  for (uint32_t iy = 0; iy < bdy; ++iy) {
+    x[iy] = math::ptx_exp2(x[iy] - s.m);
+    s.d += x[iy];
+  }
+#pragma unroll
+  for (uint32_t i = 0; i < vec_size; ++i) {
+    s.o[i] = s.o[i] * o_scale;
   }
 }
 
@@ -133,21 +150,20 @@ __device__ __forceinline__ void compute_qk(const T* smem, const vec_t<float, vec
  * \param kv_shared_offset An array of uint32_t indicates the k/v tiles offset
  * in shared memory of different pipeline stages
  * \param compute_stage_idx A integer indicates the compute stage index in the pipeline
- * \param pred_guard A boolean indicates whether the current thread is in the valid range
  * \param s The flashattention state to be updated
  */
 template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, typename T>
 __device__ __forceinline__ void update_partial_state(const T* smem, const float* x,
                                                      uint32_t compute_stage_idx,
-                                                     uint32_t kv_idx_base, uint32_t kv_idx_bound,
                                                      state_t<vec_size>& s) {
-  uint32_t tx = threadIdx.x, tz = threadIdx.z;
+  uint32_t tx = threadIdx.x;
 #pragma unroll
   for (uint32_t iy = 0; iy < bdy; ++iy) {
     vec_t<float, vec_size> v_vec;
     v_vec.cast_load(smem + (iy * bdx + tx) * vec_size);
-    if (kv_idx_base + tz * bdy + iy < kv_idx_bound) {
-      s.merge(v_vec, x[iy]);
+#pragma unroll
+    for (uint32_t i = 0; i < vec_size; ++i) {
+      s.o[i] = s.o[i] + x[iy] * v_vec[i];
     }
   }
 }
@@ -269,7 +285,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
                                     tx * vec_size),
         producer_kv_idx_base + tz * bdy + ty < chunk_end);
     cp_async::commit_group();
-    cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+    cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
         v_smem + ((iter * bdz + tz) * bdy + ty) * head_dim + tx * vec_size,
         v + info.get_kv_elem_offset(producer_kv_idx_base + tz * bdy + ty, kv_head_idx,
                                     tx * vec_size),
@@ -288,9 +304,9 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
     // compute qk
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    compute_qk<rotary_mode, vec_size, bdx, bdy>(k_smem + (stage_idx * bdz + tz) * bdy * head_dim,
-                                                q_vec, freq, consumer_kv_idx_base, stage_idx,
-                                                sm_scale, x);
+    compute_qk<rotary_mode, vec_size, bdx, bdy>(
+        k_smem + (stage_idx * bdz + tz) * bdy * head_dim, stage_idx, q_vec, freq,
+        consumer_kv_idx_base, iter * bdy * bdz, kv_chunk_size, sm_scale, x, s_partial);
     block.sync();
     // load k
     cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
@@ -304,11 +320,11 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
     update_partial_state<vec_size, bdx, bdy>(v_smem + (stage_idx * bdz + tz) * bdy * head_dim, x,
-                                             stage_idx, consumer_kv_idx_base, chunk_end, s_partial);
+                                             stage_idx, s_partial);
     block.sync();
 
     // load v
-    cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+    cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
         v_smem + ((stage_idx * bdz + tz) * bdy + ty) * head_dim + tx * vec_size,
         v + info.get_kv_elem_offset(producer_kv_idx_base + tz * bdy + ty, kv_head_idx,
                                     tx * vec_size),
@@ -510,7 +526,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
         k_smem + ((stage_idx * bdz + tz) * bdy + ty) * head_dim + tx * vec_size, k_ptr,
         producer_pred_guard);
     cp_async::commit_group();
-    cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+    cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
         v_smem + ((stage_idx * bdz + tz) * bdy + ty) * head_dim + tx * vec_size, v_ptr,
         producer_pred_guard);
     cp_async::commit_group();
@@ -539,8 +555,9 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
           cp_async::wait_group<2 * num_stages_smem - 1>();
           block.sync();
           compute_qk<rotary_mode, vec_size, bdx, bdy>(
-              k_smem + (stage_idx * bdz + tz) * bdy * head_dim, q_vec, freq,
-              cur_chunk_start + consumer_kv_idx_base, stage_idx, sm_scale, x);
+              k_smem + (stage_idx * bdz + tz) * bdy * head_dim, stage_idx, q_vec, freq,
+              cur_chunk_start + consumer_kv_idx_base, iter * bdy * bdz, consumer_valid_page_size,
+              sm_scale, x, s);
           block.sync();
 
           DTypeIn* k_ptr = paged_kv.get_k_ptr(producer_page_iter, kv_head_idx,
@@ -556,12 +573,11 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
           cp_async::wait_group<2 * num_stages_smem - 1>();
           block.sync();
           update_partial_state<vec_size, bdx, bdy>(v_smem + (stage_idx * bdz + tz) * bdy * head_dim,
-                                                   x, stage_idx, iter * bdy * bdz,
-                                                   consumer_valid_page_size, s);
+                                                   x, stage_idx, s);
           block.sync();
 
           // load v tiles
-          cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+          cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
               v_smem + ((stage_idx * bdz + tz) * bdy + ty) * head_dim + tx * vec_size, v_ptr,
               producer_pred_guard);
           cp_async::commit_group();
@@ -617,23 +633,6 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
 }
 
 /*!
- * \brief Get the heuristic number of threads per threadblock
- * \param group_size The number of qo heads that maps to the same kv head in GQA.
- * \param sizeof_dtype The size (in terms of bytes) of the input data type
- */
-constexpr uint32_t get_heuristic_num_threads(uint32_t group_size, uint32_t sizeof_dtype) {
-  if (group_size == 8U) {
-    if (sizeof_dtype == 1U) {
-      return 256U;  // not enough registers for 512 threads
-    } else {
-      return 512U;
-    }
-  } else {
-    return 128U;
-  }
-}
-
-/*!
  * \brief Esitmate the temporary buffer size and the maximum grid size for the
  *   cooperative SingleDecodeWithKVCache kernel
  * \tparam DTypeIn A template type indicates the input data type
@@ -671,8 +670,7 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& 
                   constexpr uint32_t bdx = HEAD_DIM / vec_size;
                   static_assert(bdx <= 32U);
                   constexpr uint32_t bdy = GROUP_SIZE;
-                  constexpr uint32_t num_threads =
-                      get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeIn));
+                  constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
                   constexpr uint32_t bdz = num_threads / (bdx * bdy);
                   const uint32_t smem_size =
                       2U * num_stages_smem * bdy * bdz * head_dim * sizeof(DTypeIn) +
@@ -750,8 +748,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                 constexpr uint32_t bdx = HEAD_DIM / vec_size;
                 static_assert(bdx <= 32U);
                 constexpr uint32_t bdy = GROUP_SIZE;
-                constexpr uint32_t num_threads =
-                    get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeIn));
+                constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
                 constexpr uint32_t bdz = num_threads / (bdx * bdy);
                 tensor_info_t<QKV_LAYOUT, GROUP_SIZE> info(1, seq_len, num_kv_heads, head_dim);
                 const uint32_t smem_size =
@@ -980,8 +977,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
                 constexpr uint32_t bdx = HEAD_DIM / vec_size;
                 static_assert(bdx <= 32);
                 constexpr uint32_t bdy = GROUP_SIZE;
-                constexpr uint32_t num_threads =
-                    get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeIn));
+                constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
                 constexpr uint32_t bdz = num_threads / (bdx * bdy);
                 const uint32_t smem_size =
                     2 * num_stages_smem * bdy * bdz * head_dim * sizeof(DTypeIn) +
@@ -1075,8 +1071,7 @@ cudaError_t BatchDecodeWithPagedKVCache(DTypeIn* q,
                 constexpr uint32_t bdx = HEAD_DIM / vec_size;
                 static_assert(bdx <= 32);
                 constexpr uint32_t bdy = GROUP_SIZE;
-                constexpr uint32_t num_threads =
-                    get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeIn));
+                constexpr uint32_t num_threads = std::max(256U, bdx * bdy);
                 constexpr uint32_t bdz = num_threads / (bdx * bdy);
                 const uint32_t smem_size =
                     2 * num_stages_smem * bdy * bdz * head_dim * sizeof(DTypeIn) +
