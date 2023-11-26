@@ -733,7 +733,11 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
   const float sm_scale = 1.f / std::sqrt(float(head_dim));
   const float rope_rcp_scale = 1.f / rope_scale;
   const float rope_rcp_theta = 1.f / rope_theta;
-  assert(num_qo_heads % num_kv_heads == 0);
+  if (num_qo_heads % num_kv_heads != 0) {
+    std::cerr << "num_qo_heads " << num_qo_heads << " is not a multiple of num_kv_heads "
+              << num_kv_heads << std::endl;
+    abort();
+  }
 
   SWITCH_GQA_GROUP_SIZE(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
@@ -797,7 +801,11 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                       max((seq_len + max_num_kv_chunks - 1U) / max_num_kv_chunks,
                           uint32_t(std::sqrt(seq_len / GROUP_SIZE)) * 4);
                   dim3 nblks = dim3((seq_len + kv_chunk_size - 1) / kv_chunk_size, num_kv_heads);
-                  assert(nblks.x > 0 && nblks.y > 0);
+                  if (nblks.x == 0 || nblks.y == 0) {
+                    std::cerr << "Invalid kernel configuration: nblks=(" << nblks.x << ","
+                              << nblks.y << ")" << std::endl;
+                    abort();
+                  }
                   dim3 nthrs = dim3(bdx, bdy, bdz);
                   void* args[] = {(void*)&q,
                                   (void*)&k,
@@ -1050,7 +1058,11 @@ cudaError_t BatchDecodeWithPagedKVCache(DTypeIn* q,
   const uint32_t num_kv_heads = paged_kv.num_heads;
   const uint32_t head_dim = paged_kv.head_dim;
   const uint32_t batch_size = paged_kv.batch_size;
-  assert(num_qo_heads % num_kv_heads == 0);
+  if (num_qo_heads % num_kv_heads != 0) {
+    std::cerr << "num_qo_heads " << num_qo_heads << " is not a multiple of num_kv_heads "
+              << num_kv_heads << std::endl;
+    abort();
+  }
 
   SWITCH_GQA_GROUP_SIZE(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
@@ -1091,10 +1103,12 @@ cudaError_t BatchDecodeWithPagedKVCache(DTypeIn* q,
                       cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
                 } else {
                   // use cooperative kernel
-                  assert(paged_kv.cooperative_indptr != nullptr);
-                  assert(paged_kv.batch_idx_map != nullptr);
-                  assert(paged_kv.chunk_start != nullptr);
-                  assert(paged_kv.seq_lens_before_split != nullptr);
+                  if (paged_kv.cooperative_aux_info == nullptr) {
+                    std::cerr
+                        << "cooperative_aux_info is not defined for cooperative BatchDecode kernel."
+                        << std::endl;
+                    abort();
+                  }
                   auto cooperative_kernel =
                       BatchDecodeWithPagedKVCacheKernel<true, ROTARY_MODE, PAGE_SIZE,
                                                         num_stages_smem, vec_size, bdx, bdy, bdz,
