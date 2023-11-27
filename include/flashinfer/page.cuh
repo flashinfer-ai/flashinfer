@@ -16,9 +16,9 @@
 #ifndef FLASHINFER_PAGE_CUH_
 #define FLASHINFER_PAGE_CUH_
 
-#include <utility>
+#include <cassert>
+#include <vector>
 
-#include "layout.cuh"
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
 
