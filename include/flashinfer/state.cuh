@@ -67,21 +67,6 @@ struct state_t {
     merge(other.o, other.m, other.d);
   }
 
-  /*!
-   * \brief Merge the state with a single pre-softmax logit and value vector.
-   * \param x The pre-softmax logit.
-   * \param v The value vector.
-   */
-  __device__ __forceinline__ void merge(const vec_t<float, vec_size>& other_o, float x) {
-    float m_prev = m;
-    m = max(m_prev, x);
-    d = d * math::ptx_exp2(m_prev - m) + math::ptx_exp2(x - m);
-#pragma unroll
-    for (size_t i = 0; i < vec_size; ++i) {
-      o[i] = o[i] * math::ptx_exp2(m_prev - m) + other_o[i] * math::ptx_exp2(x - m);
-    }
-  }
-
   __device__ __forceinline__ void normalize() {
     // only normalize by d when not normalized on the fly
 #pragma unroll
