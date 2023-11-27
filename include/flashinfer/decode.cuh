@@ -538,6 +538,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
   float x[bdy];
   uint32_t consumer_kv_idx_base = 0;
 
+#pragma unroll 2
   for (uint32_t consumer_page_iter = cur_page_indptr_begin;
        consumer_page_iter < cur_page_indptr_end; ++consumer_page_iter) {
     uint32_t consumer_valid_page_size = valid_page_size[stage_idx];
@@ -633,6 +634,23 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
 }
 
 /*!
+ * \brief Get the heuristic number of threads per threadblock
+ * \param group_size The number of qo heads that maps to the same kv head in GQA.
+ * \param sizeof_dtype The size (in terms of bytes) of the input data type
+ */
+constexpr uint32_t get_heuristic_num_threads(uint32_t group_size, uint32_t sizeof_dtype) {
+  if (group_size == 8U) {
+    if (sizeof_dtype == 1U) {
+      return 256U;  // not enough registers for 512 threads
+    } else {
+      return 512U;
+    }
+  } else {
+    return 128U;
+  }
+}
+
+/*!
  * \brief Esitmate the temporary buffer size and the maximum grid size for the
  *   cooperative SingleDecodeWithKVCache kernel
  * \tparam DTypeIn A template type indicates the input data type
@@ -670,7 +688,8 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& 
                   constexpr uint32_t bdx = HEAD_DIM / vec_size;
                   static_assert(bdx <= 32U);
                   constexpr uint32_t bdy = GROUP_SIZE;
-                  constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
+                  constexpr uint32_t num_threads =
+                      std::max(get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeIn)), bdx * bdy);
                   constexpr uint32_t bdz = num_threads / (bdx * bdy);
                   const uint32_t smem_size =
                       2U * num_stages_smem * bdy * bdz * head_dim * sizeof(DTypeIn) +
@@ -748,7 +767,8 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                 constexpr uint32_t bdx = HEAD_DIM / vec_size;
                 static_assert(bdx <= 32U);
                 constexpr uint32_t bdy = GROUP_SIZE;
-                constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
+                constexpr uint32_t num_threads =
+                    std::max(get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeIn)), bdx * bdy);
                 constexpr uint32_t bdz = num_threads / (bdx * bdy);
                 tensor_info_t<QKV_LAYOUT, GROUP_SIZE> info(1, seq_len, num_kv_heads, head_dim);
                 const uint32_t smem_size =
@@ -1071,7 +1091,7 @@ cudaError_t BatchDecodeWithPagedKVCache(DTypeIn* q,
                 constexpr uint32_t bdx = HEAD_DIM / vec_size;
                 static_assert(bdx <= 32);
                 constexpr uint32_t bdy = GROUP_SIZE;
-                constexpr uint32_t num_threads = std::max(256U, bdx * bdy);
+                constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
                 constexpr uint32_t bdz = num_threads / (bdx * bdy);
                 const uint32_t smem_size =
                     2 * num_stages_smem * bdy * bdz * head_dim * sizeof(DTypeIn) +

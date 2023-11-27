@@ -29,7 +29,7 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
                                          size_t num_kv_heads, size_t head_dim,
                                          flashinfer::RotaryMode rotary_mode, bool cooperative) {
   std::vector<int32_t> seq_lens(batch_size);
-  utils::vec_randint_(seq_lens, 1, 256);
+  utils::vec_randint_(seq_lens, 1, 1024);
   std::vector<int32_t> append_indptr{0};
   for (size_t i = 0; i < batch_size; ++i) {
     append_indptr.push_back(append_indptr.back() + seq_lens[i]);
