@@ -39,7 +39,7 @@ class BatchDecodeBufferManager {
       int_buffer = nullptr;
     }
     IdType* new_indptr() const { return int_buffer; }
-    IdType* new_last_page_offset() const {
+    IdType* new_last_page_len() const {
       if (int_buffer != nullptr) {
         return int_buffer + new_batch_size + 1;
       } else {
@@ -97,7 +97,7 @@ class BatchDecodeBufferManager {
         cudaMallocAsync(&value_.float_buffer, sizeof(float) * tmp_size, stream_);
         cudaMallocAsync(&value_.int_buffer, sizeof(IdType) * (6 * new_batch_size + 2), stream_);
         SplitPagedCacheKVComputeAuxiliaryInfo(
-            max_num_pages_per_batch, paged_kv, value_.new_indptr(), value_.new_last_page_offset(),
+            max_num_pages_per_batch, paged_kv, value_.new_indptr(), value_.new_last_page_len(),
             value_.cooperative_indptr(), value_.batch_idx_map(), value_.chunk_start(),
             value_.seq_lens_before_split(), stream_);
       }
@@ -159,7 +159,7 @@ cudaError_t BatchDecodeWithPagedKVCache(
   if (value.float_buffer != nullptr) {
     new_paged_kv.batch_size = value.new_batch_size;
     new_paged_kv.indptr = value.new_indptr();
-    new_paged_kv.last_page_offset = value.new_last_page_offset();
+    new_paged_kv.last_page_len = value.new_last_page_len();
     new_paged_kv.cooperative_aux_info = value.cooperative_aux_info();
   }
   return BatchDecodeWithPagedKVCache<page_storage, DTypeIn, DTypeOut, IdType>(

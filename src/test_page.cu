@@ -38,8 +38,8 @@ void _TestAppendPagedKVKernelCorrectness(size_t page_size, size_t batch_size, si
   std::vector<int32_t> seq_len(batch_size);
   utils::vec_fill_(seq_len, 0);
   std::vector<std::vector<int32_t>> page_indices(batch_size);
-  std::vector<int32_t> last_page_offset(batch_size);
-  utils::vec_fill_(last_page_offset, 0);
+  std::vector<int32_t> last_page_len(batch_size);
+  utils::vec_fill_(last_page_len, 0);
   size_t page_counter = 0;
 
   for (size_t round = 0; round < 2 * num_conv_rounds; ++round) {
@@ -56,11 +56,11 @@ void _TestAppendPagedKVKernelCorrectness(size_t page_size, size_t batch_size, si
       append_indptr.push_back(append_indptr.back() + append_len[i]);
       seq_len[i] += append_len[i];
       for (size_t j = 0; j < append_len[i]; ++j) {
-        if (last_page_offset[i] % page_size == 0) {
+        if (last_page_len[i] % page_size == 0) {
           page_indices[i].push_back(page_counter++);
-          last_page_offset[i] = 1;
+          last_page_len[i] = 1;
         } else {
-          last_page_offset[i] += 1;
+          last_page_len[i] += 1;
         }
       }
       std::vector<T> ki(append_len[i] * num_heads * head_dim),
@@ -81,17 +81,17 @@ void _TestAppendPagedKVKernelCorrectness(size_t page_size, size_t batch_size, si
     }
     paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv_cpu(
         1, 0, num_heads, page_size, head_dim, batch_size, kv_data_cpu.data(), indices_cpu.data(),
-        indptr_cpu.data(), last_page_offset.data());
+        indptr_cpu.data(), last_page_len.data());
     cpu_reference::append_paged_kv_cache(paged_kv_cpu, keys, values, append_indptr);
 
     thrust::device_vector<int32_t> indptr_gpu(indptr_cpu);
     thrust::device_vector<int32_t> indices_gpu(indices_cpu);
-    thrust::device_vector<int32_t> last_page_offset_gpu(last_page_offset);
+    thrust::device_vector<int32_t> last_page_len_gpu(last_page_len);
     paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv_gpu(
         1, 0, num_heads, page_size, head_dim, batch_size,
         thrust::raw_pointer_cast(kv_data_gpu.data()), thrust::raw_pointer_cast(indices_gpu.data()),
         thrust::raw_pointer_cast(indptr_gpu.data()),
-        thrust::raw_pointer_cast(last_page_offset_gpu.data()));
+        thrust::raw_pointer_cast(last_page_len_gpu.data()));
 
     thrust::device_vector<int32_t> append_indptr_gpu(append_indptr);
     thrust::device_vector<T> keys_gpu(append_indptr.back() * num_heads * head_dim);
@@ -153,7 +153,7 @@ void _TestPagedKVCacheToRaggedTensorCorrectness(size_t page_size, size_t batch_s
 
   std::vector<int32_t> paged_kv_indptr_host(batch_size + 1);
   std::vector<int32_t> paged_kv_indices_host(batch_size * num_pages_per_request);
-  std::vector<int32_t> paged_kv_last_page_offset_host(batch_size);
+  std::vector<int32_t> paged_kv_last_page_len_host(batch_size);
   std::vector<int32_t> kv_indptr_ref(batch_size + 1);
   std::vector<T> key_ref(batch_size * num_pages_per_request * page_size * num_heads * head_dim);
   std::vector<T> value_ref(batch_size * num_pages_per_request * page_size * num_heads * head_dim);
@@ -162,7 +162,7 @@ void _TestPagedKVCacheToRaggedTensorCorrectness(size_t page_size, size_t batch_s
     for (size_t j = 0; j < num_pages_per_request; ++j) {
       paged_kv_indices_host[i * num_pages_per_request + j] = i + j * batch_size;
     }
-    paged_kv_last_page_offset_host[i] = page_size;
+    paged_kv_last_page_len_host[i] = page_size;
     kv_indptr_ref[i] = page_size * num_pages_per_request * i;
   }
   paged_kv_indptr_host[batch_size] = batch_size * num_pages_per_request;
@@ -171,7 +171,7 @@ void _TestPagedKVCacheToRaggedTensorCorrectness(size_t page_size, size_t batch_s
   paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv_cpu(
       1, 0, num_heads, page_size, head_dim, batch_size, kv_data_cpu.data(),
       paged_kv_indices_host.data(), paged_kv_indptr_host.data(),
-      paged_kv_last_page_offset_host.data());
+      paged_kv_last_page_len_host.data());
 
   for (size_t i = 0; i < batch_size; ++i) {
     for (size_t j = 0; j < num_pages_per_request; ++j) {
@@ -201,13 +201,13 @@ void _TestPagedKVCacheToRaggedTensorCorrectness(size_t page_size, size_t batch_s
   thrust::device_vector<T> kv_data_gpu(kv_data_cpu);
   thrust::device_vector<int32_t> paged_kv_indptr_gpu(paged_kv_indptr_host);
   thrust::device_vector<int32_t> paged_kv_indices_gpu(paged_kv_indices_host);
-  thrust::device_vector<int32_t> paged_kv_last_page_offset_gpu(paged_kv_last_page_offset_host);
+  thrust::device_vector<int32_t> paged_kv_last_page_len_gpu(paged_kv_last_page_len_host);
   paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv_gpu(
       1, 0, num_heads, page_size, head_dim, batch_size,
       thrust::raw_pointer_cast(kv_data_gpu.data()),
       thrust::raw_pointer_cast(paged_kv_indices_gpu.data()),
       thrust::raw_pointer_cast(paged_kv_indptr_gpu.data()),
-      thrust::raw_pointer_cast(paged_kv_last_page_offset_gpu.data()));
+      thrust::raw_pointer_cast(paged_kv_last_page_len_gpu.data()));
 
   std::vector<int32_t> kv_indptr_h(batch_size + 1);
   cudaError_t status = PagedKVCacheToRaggedTensorComputeIndptr<PageStorage::kIndices, T, int32_t>(

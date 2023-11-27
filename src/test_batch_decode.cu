@@ -39,14 +39,14 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
   std::vector<T> kv_data;
   std::vector<int32_t> kv_indptr{0};
   std::vector<int32_t> kv_indices;
-  std::vector<int32_t> kv_last_page_offset;
+  std::vector<int32_t> kv_last_page_len;
   size_t page_counter = 0;
 
   std::vector<std::vector<T>> keys, values;
   for (size_t i = 0; i < batch_size; ++i) {
     size_t seq_len = seq_lens[i];
     size_t num_pages = (seq_len + page_size - 1) / page_size;
-    size_t last_page_offset = (seq_len - 1) % page_size + 1;
+    size_t last_page_len = (seq_len - 1) % page_size + 1;
     std::vector<T> qi(num_qo_heads * head_dim), ki(seq_len * num_kv_heads * head_dim),
         vi(seq_len * num_kv_heads * head_dim);
     utils::vec_normal_(qi);
@@ -62,8 +62,8 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
     // append new q and o_ref
     q.insert(q.end(), qi.begin(), qi.end());
     o_ref.insert(o_ref.end(), o_ref_i.begin(), o_ref_i.end());
-    // append new kv_indptr, kv_indices and kv_last_page_offset
-    kv_last_page_offset.push_back(last_page_offset);
+    // append new kv_indptr, kv_indices and kv_last_page_len
+    kv_last_page_len.push_back(last_page_len);
     kv_indptr.push_back(kv_indptr.back() + num_pages);
     for (size_t j = 0; j < num_pages; ++j) {
       kv_indices.push_back(page_counter++);
@@ -76,14 +76,14 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
 
   flashinfer::paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv_cpu(
       1, 0, num_kv_heads, page_size, head_dim, batch_size, kv_data.data(), kv_indices.data(),
-      kv_indptr.data(), kv_last_page_offset.data());
+      kv_indptr.data(), kv_last_page_len.data());
   cpu_reference::append_paged_kv_cache<T, int32_t>(paged_kv_cpu, keys, values, append_indptr);
 
   // copy data to device
   thrust::device_vector<T> kv_data_device(kv_data);
   thrust::device_vector<int32_t> kv_indptr_device(kv_indptr);
   thrust::device_vector<int32_t> kv_indices_device(kv_indices);
-  thrust::device_vector<int32_t> kv_last_page_offset_device(kv_last_page_offset);
+  thrust::device_vector<int32_t> kv_last_page_len_device(kv_last_page_len);
   thrust::device_vector<T> q_device(q);
   thrust::device_vector<T> o_device(o_ref.size());
 
@@ -93,7 +93,7 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
       thrust::raw_pointer_cast(kv_data_device.data()),
       thrust::raw_pointer_cast(kv_indices_device.data()),
       thrust::raw_pointer_cast(kv_indptr_device.data()),
-      thrust::raw_pointer_cast(kv_last_page_offset_device.data()));
+      thrust::raw_pointer_cast(kv_last_page_len_device.data()));
   flashinfer::BatchDecodeBufferManager<PageStorage::kIndices, T, T, int32_t> buf_mgr;
 
   if (!cooperative) {

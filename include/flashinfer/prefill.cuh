@@ -924,7 +924,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
   const uint32_t qo_len = qo_indptr[request_idx + 1] - qo_indptr[request_idx],
                  kv_len = (paged_kv.indptr[request_idx + 1] - paged_kv.indptr[request_idx] - 1) *
                               paged_kv.page_size +
-                          paged_kv.last_page_offset[request_idx];
+                          paged_kv.last_page_len[request_idx];
   const uint32_t qo_upper_bound = min(qo_len, (tile_idx + 1) * (num_rows_per_cta / group_size));
 
   constexpr bool cooperative = false;

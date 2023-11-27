@@ -463,11 +463,11 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
   const uint32_t cur_chunk_start = cooperative ? paged_kv.chunk_start()[batch_idx] : 0U;
   const uint32_t cur_page_indptr_begin = paged_kv.indptr[batch_idx],
                  cur_page_indptr_end = paged_kv.indptr[batch_idx + 1];
-  const uint32_t cur_last_page_offset = paged_kv.last_page_offset[batch_idx];
+  const uint32_t cur_last_page_len = paged_kv.last_page_len[batch_idx];
   const uint32_t seq_len =
       cooperative ? paged_kv.seq_lens_before_split()[batch_idx]
                   : (cur_page_indptr_end - cur_page_indptr_begin - 1) * paged_kv.page_size +
-                        cur_last_page_offset;
+                        cur_last_page_len;
 
   extern __shared__ uint8_t smem[];
   DTypeIn* k_smem = (DTypeIn*)smem;
@@ -848,7 +848,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
  * \tparam IdType A template type indicates the index data type
  * \param old_batch_size The batch size of the old Paged KV-Cache
  * \param old_page_indptr_h The host-side page indptr of the old Paged KV-Cache
- * \param old_last_page_offset_h The host-side last page offset of the old Paged KV-Cache
+ * \param old_last_page_len_h The host-side last page offset of the old Paged KV-Cache
  * \param max_num_pages_per_batch The maximum number of pages per batch
  * \param new_paged_kv_d The device-side new Paged KV-Cache
  * \param stream The cuda stream to launch the kernel
@@ -858,20 +858,20 @@ template <PageStorage page_storage, typename DTypeIn, typename IdType>
 cudaError_t SplitPagedCacheKVComputeAuxiliaryInfo(
     uint32_t max_num_pages_per_batch,
     const paged_kv_t<page_storage, DTypeIn, IdType>& old_paged_kv_d, IdType* new_indptr_d,
-    IdType* new_last_page_offset_d, IdType* cooperative_indptr_d, IdType* batch_idx_map_d,
+    IdType* new_last_page_len_d, IdType* cooperative_indptr_d, IdType* batch_idx_map_d,
     IdType* chunk_start_d, IdType* seq_lens_before_split_d, cudaStream_t stream = nullptr) {
   uint32_t page_size = old_paged_kv_d.page_size;
   uint32_t old_batch_size = old_paged_kv_d.batch_size;
-  std::vector<IdType> new_page_indptr_h{0}, new_last_page_offset_h, cooperative_indptr_h{0},
+  std::vector<IdType> new_page_indptr_h{0}, new_last_page_len_h, cooperative_indptr_h{0},
       batch_idx_map_h, chunk_start_h, seq_lens_before_split_h;
 
-  std::vector<IdType> old_indptr_h(old_batch_size + 1), old_last_page_offset_h(old_batch_size);
+  std::vector<IdType> old_indptr_h(old_batch_size + 1), old_last_page_len_h(old_batch_size);
   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(old_indptr_h.data(), old_paged_kv_d.indptr,
                                        sizeof(IdType) * (old_batch_size + 1),
                                        cudaMemcpyDeviceToHost, stream));
-  FLASHINFER_CUDA_CALL(
-      cudaMemcpyAsync(old_last_page_offset_h.data(), old_paged_kv_d.last_page_offset,
-                      sizeof(IdType) * old_batch_size, cudaMemcpyDeviceToHost, stream));
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(old_last_page_len_h.data(), old_paged_kv_d.last_page_len,
+                                       sizeof(IdType) * old_batch_size, cudaMemcpyDeviceToHost,
+                                       stream));
   FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
 
   for (uint32_t batch_idx = 0; batch_idx < old_batch_size; batch_idx++) {
@@ -880,12 +880,12 @@ cudaError_t SplitPagedCacheKVComputeAuxiliaryInfo(
         max_num_pages_per_batch;
     uint32_t seq_len_before_split =
         (old_indptr_h[batch_idx + 1] - old_indptr_h[batch_idx] - 1) * page_size +
-        old_last_page_offset_h[batch_idx];
+        old_last_page_len_h[batch_idx];
     for (uint32_t j = 0; j < cooperative_indptr_delta; ++j) {
       bool is_last = (j + 1) == cooperative_indptr_delta;
       new_page_indptr_h.push_back(min(old_indptr_h[batch_idx] + (j + 1) * max_num_pages_per_batch,
                                       old_indptr_h[batch_idx + 1]));
-      new_last_page_offset_h.push_back(is_last ? old_last_page_offset_h[batch_idx] : page_size);
+      new_last_page_len_h.push_back(is_last ? old_last_page_len_h[batch_idx] : page_size);
       batch_idx_map_h.push_back(batch_idx);
       if (j == 0) {
         cooperative_indptr_h.push_back(cooperative_indptr_h.back() + cooperative_indptr_delta);
@@ -900,8 +900,8 @@ cudaError_t SplitPagedCacheKVComputeAuxiliaryInfo(
   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(new_indptr_d, new_page_indptr_h.data(),
                                        sizeof(IdType) * new_page_indptr_h.size(),
                                        cudaMemcpyHostToDevice, stream));
-  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(new_last_page_offset_d, new_last_page_offset_h.data(),
-                                       sizeof(IdType) * new_last_page_offset_h.size(),
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(new_last_page_len_d, new_last_page_len_h.data(),
+                                       sizeof(IdType) * new_last_page_len_h.size(),
                                        cudaMemcpyHostToDevice, stream));
   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(cooperative_indptr_d, cooperative_indptr_h.data(),
                                        sizeof(IdType) * cooperative_indptr_h.size(),

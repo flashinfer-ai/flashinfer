@@ -139,7 +139,7 @@ void append_paged_kv_cache(paged_kv_t<PageStorage::kIndices, T, IdxType> page_cp
     const std::vector<T>& vi = values[i];
     size_t append_seq_len = append_indptr[i + 1] - append_indptr[i];
     size_t num_pages_i = page_cpu.indptr[i + 1] - page_cpu.indptr[i];
-    size_t seq_len = (num_pages_i - 1) * page_size + page_cpu.last_page_offset[i];
+    size_t seq_len = (num_pages_i - 1) * page_size + page_cpu.last_page_len[i];
     assert(append_seq_len <= seq_len);
     size_t append_start = seq_len - append_seq_len;
 

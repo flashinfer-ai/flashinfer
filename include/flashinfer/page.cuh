@@ -62,7 +62,7 @@ struct paged_kv_t {
   // [batch_size + 1] The page indptr array, with the first element 0, the last element nnz_pages
   IdType* indptr;
   // [batch_size] The offset of the last page for each request in the batch
-  IdType* last_page_offset;
+  IdType* last_page_len;
 
   /* ------------ Auxliary Information Used in Cooperative Kernels ------------ */
   IdType* cooperative_aux_info;
@@ -96,7 +96,7 @@ struct paged_kv_t {
         indices(nullptr),
         ptrs(nullptr),
         indptr(nullptr),
-        last_page_offset(nullptr),
+        last_page_len(nullptr),
         cooperative_aux_info(nullptr) {}
 
   /*!
@@ -110,14 +110,14 @@ struct paged_kv_t {
    * \param data The flattened key-value cache
    * \param indices The page indices array
    * \param indptr The page indptr array
-   * \param last_page_offset The offset of the last page for each request in the batch
+   * \param last_page_len The offset of the last page for each request in the batch
    * \note This constructor should only be used when page_storage == kIndices
    */
   __host__ __device__ __forceinline__ paged_kv_t(uint32_t num_layers, uint32_t layer_idx,
                                                  uint32_t num_heads, uint32_t page_size,
                                                  uint32_t head_dim, uint32_t batch_size,
                                                  DType* data, IdType* indices, IdType* indptr,
-                                                 IdType* last_page_offset)
+                                                 IdType* last_page_len)
       : num_layers(num_layers),
         layer_idx(layer_idx),
         num_heads(num_heads),
@@ -127,7 +127,7 @@ struct paged_kv_t {
         data(data),
         indices(indices),
         indptr(indptr),
-        last_page_offset(last_page_offset),
+        last_page_len(last_page_len),
         cooperative_aux_info(nullptr) {}
 
   /*!
@@ -140,14 +140,14 @@ struct paged_kv_t {
    * \param batch_size The batch size
    * \param ptrs The array of pointers to each active page
    * \param indptr The page indptr array
-   * \param last_page_offset The offset of the last page for each request in the batch
+   * \param last_page_len The offset of the last page for each request in the batch
    * \note This constructor should only be used when page_storage == kIndices
    */
   __host__ __device__ __forceinline__ paged_kv_t(uint32_t num_layers, uint32_t layer_idx,
                                                  uint32_t num_heads, uint32_t page_size,
                                                  uint32_t head_dim, uint32_t batch_size,
                                                  DType** ptrs, IdType* indptr,
-                                                 IdType* last_page_offset)
+                                                 IdType* last_page_len)
       : num_layers(num_layers),
         layer_idx(layer_idx),
         num_heads(num_heads),
@@ -156,7 +156,7 @@ struct paged_kv_t {
         batch_size(batch_size),
         ptrs(ptrs),
         indptr(indptr),
-        last_page_offset(last_page_offset),
+        last_page_len(last_page_len),
         cooperative_aux_info(nullptr) {}
 
   /*!
@@ -170,7 +170,7 @@ struct paged_kv_t {
    * \param data The flattened key-value cache
    * \param indices The page indices array
    * \param indptr The page indptr array
-   * \param last_page_offset The offset of the last page for each request in the batch
+   * \param last_page_len The offset of the last page for each request in the batch
    * \param cooperative_aux_info The auxiliary information used in cooperative kernels
    * \note This constructor should only be used when page_storage == kIndices
    */
@@ -178,7 +178,7 @@ struct paged_kv_t {
                                                  uint32_t num_heads, uint32_t page_size,
                                                  uint32_t head_dim, uint32_t batch_size,
                                                  DType* data, IdType* indices, IdType* indptr,
-                                                 IdType* last_page_offset,
+                                                 IdType* last_page_len,
                                                  IdType* cooperative_aux_info)
       : num_layers(num_layers),
         layer_idx(layer_idx),
@@ -189,7 +189,7 @@ struct paged_kv_t {
         data(data),
         indices(indices),
         indptr(indptr),
-        last_page_offset(last_page_offset),
+        last_page_len(last_page_len),
         cooperative_aux_info(cooperative_aux_info) {}
 
   /*!
@@ -202,7 +202,7 @@ struct paged_kv_t {
    * \param batch_size The batch size
    * \param ptrs The array of pointers to each active page
    * \param indptr The page indptr array
-   * \param last_page_offset The offset of the last page for each request in the batch
+   * \param last_page_len The offset of the last page for each request in the batch
    * \param cooperative_aux_info The auxiliary information used in cooperative kernels
    * \note This constructor should only be used when page_storage == kIndices
    */
@@ -210,7 +210,7 @@ struct paged_kv_t {
                                                  uint32_t num_heads, uint32_t page_size,
                                                  uint32_t head_dim, uint32_t batch_size,
                                                  DType** ptrs, IdType* indptr,
-                                                 IdType* last_page_offset,
+                                                 IdType* last_page_len,
                                                  IdType* cooperative_aux_info)
       : num_layers(num_layers),
         layer_idx(layer_idx),
@@ -220,7 +220,7 @@ struct paged_kv_t {
         batch_size(batch_size),
         ptrs(ptrs),
         indptr(indptr),
-        last_page_offset(last_page_offset),
+        last_page_len(last_page_len),
         cooperative_aux_info(cooperative_aux_info) {}
 
   /*!
@@ -285,7 +285,7 @@ struct paged_kv_t {
   __host__ __device__ __forceinline__ uint32_t get_valid_page_size(uint32_t batch_idx,
                                                                    uint32_t page_iter) const {
     if (page_iter == indptr[batch_idx + 1] - 1) {
-      return last_page_offset[batch_idx];
+      return last_page_len[batch_idx];
     } else {
       return page_size;
     }
@@ -374,7 +374,7 @@ __global__ void AppendPagedKVCacheDecodeKernel(paged_kv_t<page_storage, DType, I
 
   uint32_t seq_len =
       (paged_kv.indptr[batch_idx + 1] - paged_kv.indptr[batch_idx] - 1) * paged_kv.page_size +
-      paged_kv.last_page_offset[batch_idx];
+      paged_kv.last_page_len[batch_idx];
 
   uint32_t page_iter = paged_kv.indptr[batch_idx] + (seq_len - 1) / paged_kv.page_size;
   uint32_t entry_idx = (seq_len - 1) % paged_kv.page_size;
@@ -414,7 +414,7 @@ __global__ void AppendPagedKVCachePrefillKernel(paged_kv_t<page_storage, DType, 
 
   uint32_t seq_len =
       (paged_kv.indptr[batch_idx + 1] - paged_kv.indptr[batch_idx] - 1) * paged_kv.page_size +
-      paged_kv.last_page_offset[batch_idx];
+      paged_kv.last_page_len[batch_idx];
   uint32_t append_seq_len = append_indptr[batch_idx + 1] - append_indptr[batch_idx];
   uint32_t append_start = seq_len - append_seq_len;
 
@@ -559,16 +559,15 @@ cudaError_t PagedKVCacheToRaggedTensorComputeIndptr(
     cudaStream_t stream = nullptr) {
   const uint32_t batch_size = paged_kv.batch_size;
   const uint32_t page_size = paged_kv.page_size;
-  std::vector<IdType> paged_kv_indptr_host(batch_size + 1),
-      paged_kv_last_page_offset_host(batch_size);
+  std::vector<IdType> paged_kv_indptr_host(batch_size + 1), paged_kv_last_page_len_host(batch_size);
   kv_indptr_host.resize(batch_size + 1);
 
   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(paged_kv_indptr_host.data(), paged_kv.indptr,
                                        sizeof(IdType) * (batch_size + 1), cudaMemcpyDeviceToHost,
                                        stream));
-  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(paged_kv_last_page_offset_host.data(),
-                                       paged_kv.last_page_offset, sizeof(IdType) * batch_size,
-                                       cudaMemcpyDeviceToHost, stream));
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(paged_kv_last_page_len_host.data(), paged_kv.last_page_len,
+                                       sizeof(IdType) * batch_size, cudaMemcpyDeviceToHost,
+                                       stream));
 
   FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
 
@@ -577,7 +576,7 @@ cudaError_t PagedKVCacheToRaggedTensorComputeIndptr(
     kv_indptr_host[i + 1] =
         kv_indptr_host[i] +
         (paged_kv_indptr_host[i + 1] - paged_kv_indptr_host[i] - 1) * page_size +
-        paged_kv_last_page_offset_host[i];
+        paged_kv_last_page_len_host[i];
   }
 
   return cudaSuccess;
