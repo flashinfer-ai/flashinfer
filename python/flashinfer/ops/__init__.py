@@ -46,3 +46,33 @@ def single_decode_with_kv_cache(
         rope_scale,
         rope_theta,
     )
+
+
+def single_prefill_with_kv_cache(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    causal: bool = False,
+    rotary_mode: str = "NONE",
+    tensor_layout: str = "NHD",
+    allow_fp16_qk_reduction: bool = False,
+    rope_scale: Optional[float] = None,
+    rope_theta: Optional[float] = None,
+):
+    tmp = _get_cache_buf("single_prefill_with_kv_cache", 8 * 1024 * 1024, q.device)
+    if rope_scale is None:
+        rope_scale = 1.0
+    if rope_theta is None:
+        rope_theta = 1e4
+    return _kernels.single_decode_with_kv_cache(
+        q,
+        k,
+        v,
+        tmp,
+        causal,
+        getattr(TensorLayout, tensor_layout),
+        getattr(RotaryMode, rotary_mode),
+        allow_fp16_qk_reduction,
+        rope_scale,
+        rope_theta,
+    )
