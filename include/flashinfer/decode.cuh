@@ -1044,6 +1044,72 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
   return cudaSuccess;
 }
 
+template <uint32_t PAGE_SIZE, uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage,
+          RotaryMode ROTARY_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
+cudaError_t BatchDecodeWithPagedKVCacheDispatched(
+    DTypeIn* q, paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, DTypeOut* o, float* tmp,
+    float rope_scale, float rope_theta, cudaStream_t stream) {
+  const float sm_scale = 1.f / std::sqrt(float(HEAD_DIM));
+  const float rope_rcp_scale = 1.f / rope_scale;
+  const float rope_rcp_theta = 1.f / rope_theta;
+  const uint32_t num_kv_heads = paged_kv.num_heads;
+  const uint32_t batch_size = paged_kv.batch_size;
+
+  constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
+  constexpr uint32_t num_stages_smem = 2;
+  constexpr uint32_t bdx = HEAD_DIM / vec_size;
+  static_assert(bdx <= 32);
+  constexpr uint32_t bdy = GROUP_SIZE;
+  constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
+  constexpr uint32_t bdz = num_threads / (bdx * bdy);
+  const uint32_t smem_size =
+      2 * num_stages_smem * bdy * bdz * HEAD_DIM * sizeof(DTypeIn) + 2 * bdy * bdz * sizeof(float);
+
+  if (tmp == nullptr) {
+    // do not use cooperative kernel
+    dim3 nblks(batch_size, num_kv_heads);
+    dim3 nthrs(bdx, bdy, bdz);
+    auto kernel =
+        BatchDecodeWithPagedKVCacheKernel<false, ROTARY_MODE, PAGE_SIZE, num_stages_smem, vec_size,
+                                          bdx, bdy, bdz, page_storage, DTypeIn, DTypeOut, IdType>;
+    FLASHINFER_CUDA_CALL(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    void* args[] = {(void*)&q,
+                    (void*)&paged_kv,
+                    (void*)&o,
+                    (void*)&tmp,
+                    (void*)&sm_scale,
+                    (void*)&rope_rcp_scale,
+                    (void*)&rope_rcp_theta};
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  } else {
+    // use cooperative kernel
+    if (paged_kv.cooperative_aux_info == nullptr) {
+      std::cerr << "cooperative_aux_info is not defined for cooperative BatchDecode kernel."
+                << std::endl;
+      abort();
+    }
+    auto cooperative_kernel =
+        BatchDecodeWithPagedKVCacheKernel<true, ROTARY_MODE, PAGE_SIZE, num_stages_smem, vec_size,
+                                          bdx, bdy, bdz, page_storage, DTypeIn, DTypeOut, IdType>;
+    FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
+        cooperative_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    void* args[] = {(void*)&q,
+                    (void*)&paged_kv,
+                    (void*)&o,
+                    (void*)&tmp,
+                    (void*)&sm_scale,
+                    (void*)&rope_rcp_scale,
+                    (void*)&rope_rcp_theta};
+    dim3 nblks(batch_size, num_kv_heads);
+    dim3 nthrs(bdx, bdy, bdz);
+    FLASHINFER_CUDA_CALL(cudaLaunchCooperativeKernel((void*)cooperative_kernel, nblks, nthrs, args,
+                                                     smem_size, stream));
+  }
+
+  return cudaSuccess;
+}
+
 /*!
  * \brief FlashAttention decoding cuda kernel with paged kv-cache for batched requests
  * \tparam page_storage Whether to store indices or pointers of each active page
@@ -1068,9 +1134,6 @@ cudaError_t BatchDecodeWithPagedKVCache(DTypeIn* q,
                                         RotaryMode rotary_mode = RotaryMode::kNone,
                                         float rope_scale = 1.f, float rope_theta = 1e4,
                                         cudaStream_t stream = nullptr) {
-  const float sm_scale = 1.f / std::sqrt(float(paged_kv.head_dim));
-  const float rope_rcp_scale = 1.f / rope_scale;
-  const float rope_rcp_theta = 1.f / rope_theta;
   const uint32_t num_kv_heads = paged_kv.num_heads;
   const uint32_t head_dim = paged_kv.head_dim;
   const uint32_t batch_size = paged_kv.batch_size;
@@ -1086,62 +1149,10 @@ cudaError_t BatchDecodeWithPagedKVCache(DTypeIn* q,
           head_dim, HEAD_DIM,
           {SWITCH_ROTARY_MODE(
               rotary_mode, ROTARY_MODE, {SWITCH_PAGE_SIZE(paged_kv.page_size, PAGE_SIZE, {
-                constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
-                constexpr uint32_t num_stages_smem = 2;
-                constexpr uint32_t bdx = HEAD_DIM / vec_size;
-                static_assert(bdx <= 32);
-                constexpr uint32_t bdy = GROUP_SIZE;
-                constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
-                constexpr uint32_t bdz = num_threads / (bdx * bdy);
-                const uint32_t smem_size =
-                    2 * num_stages_smem * bdy * bdz * head_dim * sizeof(DTypeIn) +
-                    2 * bdy * bdz * sizeof(float);
-
-                if (tmp == nullptr) {
-                  // do not use cooperative kernel
-                  dim3 nblks(batch_size, num_kv_heads);
-                  dim3 nthrs(bdx, bdy, bdz);
-                  auto kernel =
-                      BatchDecodeWithPagedKVCacheKernel<false, ROTARY_MODE, PAGE_SIZE,
-                                                        num_stages_smem, vec_size, bdx, bdy, bdz,
-                                                        page_storage, DTypeIn, DTypeOut, IdType>;
-                  FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
-                      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-                  void* args[] = {(void*)&q,
-                                  (void*)&paged_kv,
-                                  (void*)&o,
-                                  (void*)&tmp,
-                                  (void*)&sm_scale,
-                                  (void*)&rope_rcp_scale,
-                                  (void*)&rope_rcp_theta};
-                  FLASHINFER_CUDA_CALL(
-                      cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-                } else {
-                  // use cooperative kernel
-                  if (paged_kv.cooperative_aux_info == nullptr) {
-                    std::cerr
-                        << "cooperative_aux_info is not defined for cooperative BatchDecode kernel."
-                        << std::endl;
-                    abort();
-                  }
-                  auto cooperative_kernel =
-                      BatchDecodeWithPagedKVCacheKernel<true, ROTARY_MODE, PAGE_SIZE,
-                                                        num_stages_smem, vec_size, bdx, bdy, bdz,
-                                                        page_storage, DTypeIn, DTypeOut, IdType>;
-                  FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
-                      cooperative_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-                  void* args[] = {(void*)&q,
-                                  (void*)&paged_kv,
-                                  (void*)&o,
-                                  (void*)&tmp,
-                                  (void*)&sm_scale,
-                                  (void*)&rope_rcp_scale,
-                                  (void*)&rope_rcp_theta};
-                  dim3 nblks(batch_size, num_kv_heads);
-                  dim3 nthrs(bdx, bdy, bdz);
-                  FLASHINFER_CUDA_CALL(cudaLaunchCooperativeKernel((void*)cooperative_kernel, nblks,
-                                                                   nthrs, args, smem_size, stream));
-                }
+                return BatchDecodeWithPagedKVCacheDispatched<PAGE_SIZE, GROUP_SIZE, HEAD_DIM,
+                                                             page_storage, ROTARY_MODE, DTypeIn,
+                                                             DTypeOut, IdType>(
+                    q, paged_kv, o, tmp, rope_scale, rope_theta, stream);
               })})})});
 
   return cudaSuccess;
