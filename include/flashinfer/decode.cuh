@@ -503,8 +503,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
                         cur_page_indptr_end, batch_idx, stage_idx);
     bool producer_pred_guard = (producer_entry_base + tz * bdy + ty < producer_valid_page_size) &&
                                (producer_page_iter < cur_page_indptr_end);
-    DTypeIn* k_ptr = paged_kv.get_k_ptr(producer_page_iter, kv_head_idx,
-                                        producer_entry_base + tz * bdy + ty, tx * vec_size);
+    DTypeIn* k_ptr = paged_kv.template get_k_ptr<AccessMode::kProtective>(
+        producer_page_iter, kv_head_idx, producer_entry_base + tz * bdy + ty, tx * vec_size);
     DTypeIn* v_ptr = k_ptr + paged_kv.kv_offset_delta();
     cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
         k_smem + ((stage_idx * bdz + tz) * bdy + ty) * head_dim + tx * vec_size, k_ptr,
@@ -543,8 +543,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
               cur_chunk_start + consumer_kv_idx_base, stage_idx, sm_scale, x);
           block.sync();
 
-          DTypeIn* k_ptr = paged_kv.get_k_ptr(producer_page_iter, kv_head_idx,
-                                              producer_entry_base + tz * bdy + ty, tx * vec_size);
+          DTypeIn* k_ptr = paged_kv.template get_k_ptr<AccessMode::kProtective>(
+              producer_page_iter, kv_head_idx, producer_entry_base + tz * bdy + ty, tx * vec_size);
           DTypeIn* v_ptr = k_ptr + paged_kv.kv_offset_delta();
           // load k tiles
           cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
