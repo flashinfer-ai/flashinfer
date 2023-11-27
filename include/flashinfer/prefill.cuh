@@ -1411,17 +1411,85 @@ cudaError_t BatchPrefillWithPagedKVCacheFallback(
   return cudaSuccess;
 }
 
+template <uint32_t PAGE_SIZE, uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage,
+          RotaryMode ROTARY_MODE, bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL, typename DTypeIn,
+          typename DTypeOut, typename IdType>
+cudaError_t BatchPrefillWithPagedKVCacheDispatched(
+    DTypeIn* q, paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, IdType* qo_indptr, DTypeOut* o,
+    float* tmp, uint32_t num_qo_heads, float rope_scale, float rope_theta, cudaStream_t stream) {
+  const float sm_scale = 1.f / std::sqrt(float(paged_kv.head_dim));
+  const float log2_rope_rcp_scale = -std::log2f(rope_scale);
+  const float log2_rope_rcp_theta = -std::log2f(rope_theta);
+  constexpr uint32_t num_warps = 4;
+  const uint32_t num_kv_heads = paged_kv.num_heads;
+  const uint32_t batch_size = paged_kv.batch_size;
+  const uint32_t group_size = num_qo_heads / num_kv_heads;
+  std::vector<IdType> qo_indptr_h(batch_size + 1);
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(qo_indptr_h.data(), qo_indptr,
+                                       sizeof(IdType) * (batch_size + 1), cudaMemcpyDeviceToHost,
+                                       stream));
+  FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
+  const uint32_t total_q_len = qo_indptr_h.back();
+  const bool avg_len_greater_than_64 = total_q_len > 64 * batch_size;
+  SWITCH_NUM_FRAGS_X(avg_len_greater_than_64, num_frags_x, {
+    constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
+    std::vector<IdType> request_indices, tile_indices;
+    uint32_t num_blks_x = 0;
+    for (uint32_t i = 0; i < batch_size; ++i) {
+      for (uint32_t j = qo_indptr_h[i] * group_size; j < qo_indptr_h[i + 1] * group_size;
+           j += num_rows_per_cta) {
+        request_indices.push_back(i);
+        tile_indices.push_back((j - qo_indptr_h[i] * group_size) / num_rows_per_cta);
+        ++num_blks_x;
+      }
+    }
+
+    IdType *request_indices_d = nullptr, *tile_indices_d = nullptr;
+    cudaMallocAsync(&request_indices_d, sizeof(IdType) * request_indices.size(), stream);
+    cudaMallocAsync(&tile_indices_d, sizeof(IdType) * tile_indices.size(), stream);
+    cudaMemcpyAsync(request_indices_d, request_indices.data(),
+                    sizeof(IdType) * request_indices.size(), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(tile_indices_d, tile_indices.data(), sizeof(IdType) * tile_indices.size(),
+                    cudaMemcpyHostToDevice, stream);
+
+    dim3 nblks(num_blks_x, 1, num_kv_heads);
+    dim3 nthrs(32, num_warps);
+
+    constexpr uint32_t num_frags_y = HEAD_DIM / 16;
+    using DTypeQKAccum =
+        typename std::conditional<ALLOW_FP16_QK_REDUCTION && std::is_same<DTypeIn, half>::value,
+                                  half, float>::type;
+
+    constexpr uint32_t num_frags_z = 2;
+    auto kernel =
+        BatchPrefillWithPagedKVCacheKernel<GROUP_SIZE, PAGE_SIZE, CAUSAL, ROTARY_MODE, num_frags_x,
+                                           num_frags_y, num_frags_z, num_warps, page_storage,
+                                           DTypeIn, DTypeQKAccum, DTypeOut, IdType>;
+    uint32_t smem_size =
+        (num_frags_x * num_warps + num_frags_z * 2) * 16 * HEAD_DIM * sizeof(DTypeIn);
+    FLASHINFER_CUDA_CALL(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    void* args[] = {(void*)&request_indices_d,
+                    (void*)&tile_indices_d,
+                    (void*)&q,
+                    (void*)&paged_kv,
+                    (void*)&qo_indptr,
+                    (void*)&o,
+                    (void*)&tmp,
+                    (void*)&sm_scale,
+                    (void*)&log2_rope_rcp_scale,
+                    (void*)&log2_rope_rcp_theta};
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  });
+  return cudaSuccess;
+}
+
 template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithPagedKVCache(
     DTypeIn* q, paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, IdType* qo_indptr, DTypeOut* o,
     float* tmp, uint32_t num_qo_heads, bool causal = true,
     RotaryMode rotary_mode = RotaryMode::kNone, bool allow_fp16_qk_reduction = false,
     float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {
-  const float sm_scale = 1.f / std::sqrt(float(paged_kv.head_dim));
-  const float log2_rope_rcp_scale = -std::log2f(rope_scale);
-  const float log2_rope_rcp_theta = -std::log2f(rope_theta);
-  constexpr uint32_t num_warps = 4;
-
   SWITCH_PAGE_SIZE(paged_kv.page_size, PAGE_SIZE, {
     if constexpr (PAGE_SIZE == 0) {
       // use fallback implementation
@@ -1433,74 +1501,19 @@ cudaError_t BatchPrefillWithPagedKVCache(
       const uint32_t head_dim = paged_kv.head_dim;
       const uint32_t batch_size = paged_kv.batch_size;
       const uint32_t group_size = num_qo_heads / num_kv_heads;
-      std::vector<IdType> qo_indptr_h(batch_size + 1);
-      FLASHINFER_CUDA_CALL(cudaMemcpyAsync(qo_indptr_h.data(), qo_indptr,
-                                           sizeof(IdType) * (batch_size + 1),
-                                           cudaMemcpyDeviceToHost, stream));
-      FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
-      const uint32_t total_q_len = qo_indptr_h.back();
-      const bool avg_len_greater_than_64 = total_q_len > 64 * batch_size;
-      SWITCH_NUM_FRAGS_X(avg_len_greater_than_64, num_frags_x, {
-        constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
-        std::vector<IdType> request_indices, tile_indices;
-        uint32_t num_blks_x = 0;
-        for (uint32_t i = 0; i < batch_size; ++i) {
-          for (uint32_t j = qo_indptr_h[i] * group_size; j < qo_indptr_h[i + 1] * group_size;
-               j += num_rows_per_cta) {
-            request_indices.push_back(i);
-            tile_indices.push_back((j - qo_indptr_h[i] * group_size) / num_rows_per_cta);
-            ++num_blks_x;
-          }
-        }
-
-        IdType *request_indices_d = nullptr, *tile_indices_d = nullptr;
-        cudaMallocAsync(&request_indices_d, sizeof(IdType) * request_indices.size(), stream);
-        cudaMallocAsync(&tile_indices_d, sizeof(IdType) * tile_indices.size(), stream);
-        cudaMemcpyAsync(request_indices_d, request_indices.data(),
-                        sizeof(IdType) * request_indices.size(), cudaMemcpyHostToDevice, stream);
-        cudaMemcpyAsync(tile_indices_d, tile_indices.data(), sizeof(IdType) * tile_indices.size(),
-                        cudaMemcpyHostToDevice, stream);
-
-        dim3 nblks(num_blks_x, 1, num_kv_heads);
-        dim3 nthrs(32, num_warps);
-
-        SWITCH_ALLOW_FP16_QK_REDUCTION(
-            allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
-            {SWITCH_GQA_GROUP_SIZE(
-                group_size, GROUP_SIZE,
-                {SWITCH_CAUSAL(
-                    causal, CAUSAL, {SWITCH_HEAD_DIM_PREFILL(head_dim, HEAD_DIM, {
-                      constexpr uint32_t num_frags_y = HEAD_DIM / 16;
-                      SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
-                        using DTypeQKAccum =
-                            typename std::conditional<ALLOW_FP16_QK_REDUCTION &&
-                                                          std::is_same<DTypeIn, half>::value,
-                                                      half, float>::type;
-
-                        constexpr uint32_t num_frags_z = 2;
-                        auto kernel = BatchPrefillWithPagedKVCacheKernel<
-                            GROUP_SIZE, PAGE_SIZE, CAUSAL, ROTARY_MODE, num_frags_x, num_frags_y,
-                            num_frags_z, num_warps, page_storage, DTypeIn, DTypeQKAccum, DTypeOut,
-                            IdType>;
-                        uint32_t smem_size = (num_frags_x * num_warps + num_frags_z * 2) * 16 *
-                                             head_dim * sizeof(DTypeIn);
-                        FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
-                            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-                        void* args[] = {(void*)&request_indices_d,
-                                        (void*)&tile_indices_d,
-                                        (void*)&q,
-                                        (void*)&paged_kv,
-                                        (void*)&qo_indptr,
-                                        (void*)&o,
-                                        (void*)&tmp,
-                                        (void*)&sm_scale,
-                                        (void*)&log2_rope_rcp_scale,
-                                        (void*)&log2_rope_rcp_theta};
-                        FLASHINFER_CUDA_CALL(
-                            cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-                      })
-                    })})})})
-      });
+      SWITCH_ALLOW_FP16_QK_REDUCTION(
+          allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
+          {SWITCH_GQA_GROUP_SIZE(
+              group_size, GROUP_SIZE,
+              {SWITCH_CAUSAL(causal, CAUSAL,
+                             {SWITCH_HEAD_DIM_PREFILL(
+                                 head_dim, HEAD_DIM, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
+                                   return BatchPrefillWithPagedKVCacheDispatched<
+                                       PAGE_SIZE, GROUP_SIZE, HEAD_DIM, page_storage, ROTARY_MODE,
+                                       ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
+                                       q, paged_kv, qo_indptr, o, tmp, num_qo_heads, rope_scale,
+                                       rope_theta, stream);
+                                 })})})})});
     }
   });
   return cudaSuccess;
