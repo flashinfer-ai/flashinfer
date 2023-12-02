@@ -377,6 +377,132 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
   }
 }
 
+template <bool return_lse, QKVLayout layout, RotaryMode rotary_mode, uint32_t num_stages_smem,
+          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename DTypeIn,
+          typename DTypeOut>
+__global__ void BatchDecodeWithPaddedKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* __restrict__ k,
+                                                   DTypeIn* __restrict__ v,
+                                                   DTypeOut* __restrict__ o,
+                                                   float* __restrict__ lse,
+                                                   tensor_info_t<layout, bdy> info, float sm_scale,
+                                                   float rope_rcp_scale, float rope_rcp_theta) {
+  auto block = cg::this_thread_block();
+  sm_scale *= math::log2e;
+
+  constexpr uint32_t head_dim = bdx * vec_size;
+  uint32_t kv_head_idx = blockIdx.y;
+  uint32_t qo_head_idx = kv_head_idx * bdy + threadIdx.y;
+  uint32_t batch_idx = blockIdx.x;
+  uint32_t num_qo_heads = info.get_num_qo_heads();
+  uint32_t num_kv_heads = info.get_num_kv_heads();
+  uint32_t seq_len = info.kv_len;
+
+  extern __shared__ uint8_t smem[];
+  DTypeIn* k_smem = (DTypeIn*)smem;
+  DTypeIn* v_smem = (DTypeIn*)(smem + num_stages_smem * bdy * bdz * head_dim * sizeof(DTypeIn));
+  float* smem_md = (float*)(smem + 2 * num_stages_smem * bdy * bdz * head_dim * sizeof(DTypeIn));
+
+  uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
+  vec_t<float, vec_size> q_vec;
+  vec_t<float, vec_size> freq;
+  if constexpr (rotary_mode == RotaryMode::kLlama) {
+#pragma unroll
+    for (uint32_t i = 0; i < vec_size; ++i) {
+      freq[i] =
+          rope_rcp_scale *
+          powf(rope_rcp_theta, float(2 * ((tx * vec_size + i) % (head_dim / 2))) / float(head_dim));
+    }
+    // apply rotary embedding to q matrix
+    q_vec = apply_llama_rope<vec_size, bdx>(
+        q + batch_idx * num_qo_heads * head_dim + info.get_qo_elem_offset(0, qo_head_idx, 0), freq,
+        seq_len - 1);
+  } else {
+    // do not apply rotary embedding to q matrix
+    q_vec.cast_load(q + batch_idx * num_qo_heads * head_dim +
+                    info.get_qo_elem_offset(0, qo_head_idx, tx * vec_size));
+  }
+  block.sync();
+
+  // preload k tiles and v tiles
+  uint32_t producer_kv_idx_base = 0;
+  constexpr uint32_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
+#pragma unroll
+  for (uint32_t iter = 0; iter < num_stages_smem; ++iter) {
+    cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+        k_smem + ((iter * bdz + tz) * bdy + ty) * head_dim + tx * vec_size,
+        k + batch_idx * seq_len * num_kv_heads * head_dim +
+            info.get_kv_elem_offset(producer_kv_idx_base + tz * bdy + ty, kv_head_idx,
+                                    tx * vec_size),
+        producer_kv_idx_base + tz * bdy + ty < seq_len);
+    cp_async::commit_group();
+    cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
+        v_smem + ((iter * bdz + tz) * bdy + ty) * head_dim + tx * vec_size,
+        v + batch_idx * seq_len * num_kv_heads * head_dim +
+            info.get_kv_elem_offset(producer_kv_idx_base + tz * bdy + ty, kv_head_idx,
+                                    tx * vec_size),
+        producer_kv_idx_base + tz * bdy + ty < seq_len);
+    cp_async::commit_group();
+    producer_kv_idx_base += bdy * bdz;
+  }
+
+  // pipelining k/v tiles loading and state updating
+  uint32_t consumer_kv_idx_base = 0, stage_idx = 0;
+  state_t<vec_size> s_partial;
+  float x[bdy];
+
+#pragma unroll 4
+  for (uint32_t iter = 0; iter < (seq_len + bdy * bdz - 1) / (bdy * bdz); ++iter) {
+    // compute qk
+    cp_async::wait_group<2 * num_stages_smem - 1>();
+    block.sync();
+    compute_qk<rotary_mode, vec_size, bdx, bdy>(k_smem + (stage_idx * bdz + tz) * bdy * head_dim,
+                                                stage_idx, q_vec, freq, consumer_kv_idx_base,
+                                                iter * bdy * bdz, seq_len, sm_scale, x, s_partial);
+    block.sync();
+    // load k
+    cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+        k_smem + ((stage_idx * bdz + tz) * bdy + ty) * head_dim + tx * vec_size,
+        k + batch_idx * seq_len * num_kv_heads * head_dim +
+            info.get_kv_elem_offset(producer_kv_idx_base + tz * bdy + ty, kv_head_idx,
+                                    tx * vec_size),
+        producer_kv_idx_base + tz * bdy + ty < seq_len);
+    cp_async::commit_group();
+
+    // update m/d/o state
+    cp_async::wait_group<2 * num_stages_smem - 1>();
+    block.sync();
+    update_partial_state<vec_size, bdx, bdy>(v_smem + (stage_idx * bdz + tz) * bdy * head_dim, x,
+                                             stage_idx, s_partial);
+    block.sync();
+
+    // load v
+    cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
+        v_smem + ((stage_idx * bdz + tz) * bdy + ty) * head_dim + tx * vec_size,
+        v + batch_idx * seq_len * num_kv_heads * head_dim +
+            info.get_kv_elem_offset(producer_kv_idx_base + tz * bdy + ty, kv_head_idx,
+                                    tx * vec_size),
+        producer_kv_idx_base + tz * bdy + ty < seq_len);
+    cp_async::commit_group();
+
+    stage_idx = (stage_idx + 1) % num_stages_smem;
+    producer_kv_idx_base += bdy * bdz;
+    consumer_kv_idx_base += bdy * bdz;
+  }
+  cp_async::wait_group<0>();
+  block.sync();
+
+  // sync partial state of all warps inside a threadblock
+  sync_state<vec_size, bdx, bdy, bdz>(s_partial, reinterpret_cast<float*>(smem), smem_md);
+
+  s_partial.normalize();
+  s_partial.o.cast_store(o + batch_idx * num_qo_heads * head_dim +
+                         info.get_qo_elem_offset(0, qo_head_idx, tx * vec_size));
+
+  if constexpr (return_lse) {
+    lse[batch_idx * num_qo_heads + qo_head_idx] = math::ptx_log2(s_partial.d) + s_partial.m;
+  }
+}
+
 /*!
  * \brief Advance the page iterator
  * \tparam page_storage Whether to store indices or pointers of each active page
@@ -1155,6 +1281,80 @@ cudaError_t BatchDecodeWithPagedKVCache(DTypeIn* q,
                     q, paged_kv, o, tmp, rope_scale, rope_theta, stream);
               })})})});
 
+  return cudaSuccess;
+}
+
+template <bool RETURN_LSE, uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout LAYOUT,
+          RotaryMode ROTARY_MODE, typename DTypeIn, typename DTypeOut>
+cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeIn* o,
+                                                   float* tmp, float* lse, uint32_t batch_size,
+                                                   uint32_t padded_kv_len, uint32_t num_qo_heads,
+                                                   float rope_scale, float rope_theta,
+                                                   cudaStream_t stream) {
+  const float sm_scale = 1.f / std::sqrt(float(HEAD_DIM));
+  const float rope_rcp_scale = 1.f / rope_scale;
+  const float rope_rcp_theta = 1.f / rope_theta;
+  const uint32_t num_kv_heads = num_qo_heads / GROUP_SIZE;
+
+  constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
+  constexpr uint32_t num_stages_smem = 2;
+  constexpr uint32_t bdx = HEAD_DIM / vec_size;
+  static_assert(bdx <= 32);
+  constexpr uint32_t bdy = GROUP_SIZE;
+  constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
+  constexpr uint32_t bdz = num_threads / (bdx * bdy);
+
+  const uint32_t smem_size =
+      2 * num_stages_smem * bdy * bdz * HEAD_DIM * sizeof(DTypeIn) + 2 * bdy * bdz * sizeof(float);
+
+  dim3 nblks(batch_size, num_kv_heads);
+  dim3 nthrs(bdx, bdy, bdz);
+  auto kernel = BatchDecodeWithPaddedKVCacheKernel<RETURN_LSE, LAYOUT, ROTARY_MODE, num_stages_smem,
+                                                   vec_size, bdx, bdy, bdz, DTypeIn, DTypeOut>;
+  FLASHINFER_CUDA_CALL(
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+  tensor_info_t<LAYOUT, GROUP_SIZE> info(1, padded_kv_len, num_kv_heads, HEAD_DIM);
+  void* args[] = {(void*)&q,
+                  (void*)&k,
+                  (void*)&v,
+                  (void*)&o,
+                  (void*)&lse,
+                  (void*)&info,
+                  (void*)&sm_scale,
+                  (void*)&rope_rcp_scale,
+                  (void*)&rope_rcp_theta};
+  FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  return cudaSuccess;
+}
+
+template <typename DTypeIn, typename DTypeOut>
+cudaError_t BatchDecodeWithPaddedKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeIn* o, float* tmp,
+                                         float* lse, uint32_t batch_size, uint32_t padded_kv_len,
+                                         uint32_t num_qo_heads, uint32_t num_kv_heads,
+                                         uint32_t head_dim, bool return_lse = false,
+                                         QKVLayout layout = QKVLayout::kNHD,
+                                         RotaryMode rotary_mode = RotaryMode::kNone,
+                                         float rope_scale = 1.f, float rope_theta = 1e4,
+                                         cudaStream_t stream = nullptr) {
+  if (num_qo_heads % num_kv_heads != 0) {
+    std::cerr << "num_qo_heads " << num_qo_heads << " is not a multiple of num_kv_heads "
+              << num_kv_heads << std::endl;
+    abort();
+  }
+
+  SWITCH_RETURN_LSE(
+      return_lse, RETURN_LSE,
+      {SWITCH_GQA_GROUP_SIZE(
+          num_qo_heads / num_kv_heads, GROUP_SIZE,
+          {SWITCH_HEAD_DIM(
+              head_dim, HEAD_DIM,
+              {SWITCH_ROTARY_MODE(
+                  rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(layout, LAYOUT, {
+                    return BatchDecodeWithPaddedKVCacheDispatched<
+                        RETURN_LSE, GROUP_SIZE, HEAD_DIM, LAYOUT, ROTARY_MODE, DTypeIn, DTypeOut>(
+                        q, k, v, o, tmp, lse, batch_size, padded_kv_len, num_qo_heads, rope_scale,
+                        rope_theta, stream);
+                  })})})})});
   return cudaSuccess;
 }
 

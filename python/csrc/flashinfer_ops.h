@@ -24,4 +24,23 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
 torch::Tensor single_prefill_with_kv_cache(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                                            torch::Tensor tmp, bool causal, unsigned int layout,
                                            unsigned int rotary_mode, bool allow_fp16_qk_reduction,
-                                           float rope_scale, float rope_thet);
+                                           float rope_scale, float rope_theta);
+
+std::vector<torch::Tensor> single_prefill_with_kv_cache_return_lse(
+    torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor tmp, bool causal,
+    unsigned int layout, unsigned int rotary_mode, bool allow_fp16_qk_reduction, float rope_scale,
+    float rope_theta);
+
+torch::Tensor merge_state(torch::Tensor v_a, torch::Tensor s_a, torch::Tensor v_b,
+                          torch::Tensor s_b);
+
+torch::Tensor merge_states(torch::Tensor v, torch::Tensor s);
+
+torch::Tensor batch_decode_with_padded_kv_cache(torch::Tensor q, torch::Tensor k_padded,
+                                                torch::Tensor v_padded, unsigned int layout,
+                                                unsigned int rotary_mode, float sm_scale,
+                                                float rope_scale, float rope_theta);
+
+std::vector<torch::Tensor> batch_decode_with_padded_kv_cache_return_lse(
+    torch::Tensor q, torch::Tensor k_padded, torch::Tensor v_padded, unsigned int layout,
+    unsigned int rotary_mode, float sm_scale, float rope_scale, float rope_theta);

@@ -51,6 +51,8 @@ ext_modules.append(
         sources=[
             "csrc/single_decode.cu",
             "csrc/single_prefill.cu",
+            "csrc/cascade.cu",
+            "csrc/batch_decode.cu",
             "csrc/flashinfer_ops.cc",
         ],
         include_dirs=[

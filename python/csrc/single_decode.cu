@@ -32,9 +32,9 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
   CHECK_DIM(3, v);
   CHECK_SHAPE(k, v);
   CHECK_EQ(q.size(1), k.size(2));
-  size_t num_qo_heads = q.size(0);
-  size_t head_dim = q.size(1);
-  size_t kv_len, num_kv_heads;
+  unsigned int num_qo_heads = q.size(0);
+  unsigned int head_dim = q.size(1);
+  unsigned int kv_len, num_kv_heads;
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
   if (kv_layout == QKVLayout::kNHD) {
     kv_len = k.size(0);
@@ -51,8 +51,11 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
         static_cast<c_type*>(v.data_ptr()), static_cast<c_type*>(o.data_ptr()),
         static_cast<float*>(tmp.data_ptr()), num_qo_heads, num_kv_heads, kv_len, head_dim,
         kv_layout, RotaryMode(rotary_mode), rope_scale, rope_theta, nullptr);
-    return status == cudaSuccess;
+    TORCH_CHECK(status == cudaSuccess, "SingleDecodeWithKVCache kernel launch failed, error: " +
+                                           std::string(cudaGetErrorString(status)));
+    return true;
   });
 
+  TORCH_CHECK(success, "SingleDecodeWithKVCache kernel launch failed, error: unsupported dtype");
   return o;
 }
