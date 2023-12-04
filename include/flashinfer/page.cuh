@@ -59,21 +59,6 @@ struct paged_kv_t {
   // [nnz_pages] The page pointers array, used when page_storage == kPointer
   DType** ptrs;
 
-  /*
-   2
-   3
-   2
-
-   0 2 3+2 2+3+2
-
-   1
-   12
-   8
-
-   (2 - 1) * 16 + 1
-   (3 - 1) * 16 + 12
-   (2 - 1) * 16 + 8
-   */
   // [batch_size + 1] The page indptr array, with the first element 0, the last element nnz_pages
   IdType* indptr;
   // [batch_size] The offset of the last page for each request in the batch
