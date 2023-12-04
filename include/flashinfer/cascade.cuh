@@ -88,6 +88,7 @@ __global__ void MergeStatesKernel(DTypeIn* __restrict__ v, float* __restrict__ s
   float m = -5e4, d = 0.f;
 
   vec_t<float, vec_size> v_vec_o;
+  v_vec_o.fill(0.f);
   for (uint32_t j = 0; j < num_index_sets; ++j) {
     float s_val = s[(j * batch_size + batch_idx) * num_heads + head_idx];
     vec_t<float, vec_size> v_j;
@@ -97,10 +98,15 @@ __global__ void MergeStatesKernel(DTypeIn* __restrict__ v, float* __restrict__ s
     m = max(m, s_val);
     float o_scale = math::ptx_exp2(m_prev - m);
     float v_j_scale = math::ptx_exp2(s_val - m);
+    d = d * o_scale + v_j_scale;
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
       v_vec_o[i] = v_vec_o[i] * o_scale + v_j[i] * v_j_scale;
     }
+  }
+#pragma unroll
+  for (uint32_t i = 0; i < vec_size; ++i) {
+    v_vec_o[i] = __fdividef(v_vec_o[i], d);
   }
   v_vec_o.cast_store(v_merged + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
 }
@@ -156,7 +162,7 @@ cudaError_t MergeStates(DTypeIn* v, float* s, DTypeOut* v_merged, uint32_t num_i
   SWITCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
     constexpr uint32_t bdx = HEAD_DIM / vec_size;
-    constexpr uint32_t bdy = 128 / vec_size;
+    constexpr uint32_t bdy = 128 / bdx;
     assert(num_heads % bdy == 0);
     dim3 nblks(batch_size * num_heads / bdy);
     dim3 nthrs(bdx, bdy);
