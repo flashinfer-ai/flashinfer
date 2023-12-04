@@ -360,8 +360,8 @@ struct paged_kv_t {
  * \param key The key to be appended
  * \param value The value to be appended
  */
-template <uint32_t head_dim, uint32_t vec_size,
-          PageStorage page_storage, typename DType, typename IdType>
+template <uint32_t head_dim, uint32_t vec_size, PageStorage page_storage, typename DType,
+          typename IdType>
 __global__ void AppendPagedKVCacheDecodeKernel(paged_kv_t<page_storage, DType, IdType> paged_kv,
                                                DType* __restrict__ key, DType* __restrict__ value) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
@@ -397,8 +397,8 @@ __global__ void AppendPagedKVCacheDecodeKernel(paged_kv_t<page_storage, DType, I
  * \param value The value to be appended
  * \param append_indptr The indptr array of the appended ragged tensor
  */
-template <uint32_t head_dim, uint32_t vec_size,
-          PageStorage page_storage, typename DType, typename IdType>
+template <uint32_t head_dim, uint32_t vec_size, PageStorage page_storage, typename DType,
+          typename IdType>
 __global__ void AppendPagedKVCachePrefillKernel(paged_kv_t<page_storage, DType, IdType> paged_kv,
                                                 DType* __restrict__ key, DType* __restrict__ value,
                                                 IdType* __restrict__ append_indptr) {
@@ -444,8 +444,8 @@ __global__ void AppendPagedKVCachePrefillKernel(paged_kv_t<page_storage, DType, 
  * \param kv_indptr The indptr array of the ragged tensor
  * \return status Indicates whether CUDA calls are successful
  */
-template <uint32_t head_dim, uint32_t vec_size,
-          PageStorage page_storage, typename DType, typename IdType>
+template <uint32_t head_dim, uint32_t vec_size, PageStorage page_storage, typename DType,
+          typename IdType>
 __global__ void PagedKVCacheToRaggedTensorKernel(paged_kv_t<page_storage, DType, IdType> paged_kv,
                                                  DType* __restrict__ key, DType* __restrict__ value,
                                                  IdType* __restrict__ kv_indptr) {
@@ -493,8 +493,7 @@ cudaError_t AppendPagedKVCacheDecode(paged_kv_t<page_storage, DType, IdType> pag
     uint32_t bdy = num_heads;
     dim3 nblks(batch_size);
     dim3 nthrs(bdx, bdy);
-    auto kernel =
-        AppendPagedKVCacheDecodeKernel<HEAD_DIM, vec_size, page_storage, DType, IdType>;
+    auto kernel = AppendPagedKVCacheDecodeKernel<HEAD_DIM, vec_size, page_storage, DType, IdType>;
     void* args[] = {(void*)&paged_kv, (void*)&key, (void*)&value};
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
   });
@@ -526,8 +525,7 @@ cudaError_t AppendPagedKVCachePrefill(paged_kv_t<page_storage, DType, IdType> pa
     uint32_t bdy = num_heads;
     dim3 nblks(batch_size);
     dim3 nthrs(bdx, bdy);
-    auto kernel =
-        AppendPagedKVCachePrefillKernel<HEAD_DIM, vec_size, page_storage, DType, IdType>;
+    auto kernel = AppendPagedKVCachePrefillKernel<HEAD_DIM, vec_size, page_storage, DType, IdType>;
     void* args[] = {(void*)&paged_kv, (void*)&key, (void*)&value, (void*)&append_indptr};
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
   });
@@ -600,8 +598,7 @@ cudaError_t PagedKVCacheToRaggedTensor(paged_kv_t<page_storage, DType, IdType> p
     uint32_t bdy = num_heads;
     dim3 nblks(batch_size);
     dim3 nthrs(bdx, bdy);
-    auto kernel =
-        PagedKVCacheToRaggedTensorKernel<HEAD_DIM, vec_size, page_storage, DType, IdType>;
+    auto kernel = PagedKVCacheToRaggedTensorKernel<HEAD_DIM, vec_size, page_storage, DType, IdType>;
     void* args[] = {(void*)&paged_kv, (void*)&key, (void*)&value, (void*)&kv_indptr};
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
   });

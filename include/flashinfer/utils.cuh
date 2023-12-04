@@ -49,7 +49,10 @@
   }
 
 #define SWITCH_PAGE_SIZE(page_size, PAGE_SIZE, ...) \
-  if (page_size == 8) {                             \
+  if (page_size == 1) {                             \
+    constexpr size_t PAGE_SIZE = 1;                 \
+    __VA_ARGS__                                     \
+  } else if (page_size == 8) {                      \
     constexpr size_t PAGE_SIZE = 8;                 \
     __VA_ARGS__                                     \
   } else if (page_size == 16) {                     \

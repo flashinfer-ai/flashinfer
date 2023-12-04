@@ -145,29 +145,50 @@ __device__ __forceinline__ void page_produce_kv(smem_t smem, uint32_t* smem_offs
       produce_v ? SharedMemFillMode::kFillZero : SharedMemFillMode::kNoFill;
   constexpr uint32_t head_dim = num_frags_y * 16;
   constexpr uint32_t num_cells_per_in_channel = head_dim / cell_capacity<DType>();
-  static_assert(page_size % 4 == 0);
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
   const uint32_t kv_head_idx = blockIdx.z;
   uint32_t kv_idx = kv_idx_base + ty * 4 + tx / 8;
+  if constexpr (page_size % 4 == 0) {
 #pragma unroll
-  for (uint32_t i = 0; i < num_frags_z * 4 / num_warps; ++i) {
-    const uint32_t page_iter = page_iter_base + (4 * num_warps * i + ty * 4) / page_size;
-    const uint32_t entry_idx = (4 * num_warps * i + ty * 4) % page_size + tx / 8;
-    DType* gptr = produce_v
-                      ? (paged_kv.template get_v_ptr<AccessMode::kProtective>(
-                            page_iter, kv_head_idx, entry_idx, (tx % 8) * cell_capacity<DType>()))
-                      : (paged_kv.template get_k_ptr<AccessMode::kProtective>(
-                            page_iter, kv_head_idx, entry_idx, (tx % 8) * cell_capacity<DType>()));
+    for (uint32_t i = 0; i < num_frags_z * 4 / num_warps; ++i) {
+      const uint32_t page_iter = page_iter_base + (4 * num_warps * i + ty * 4) / page_size;
+      const uint32_t entry_idx = (4 * num_warps * i + ty * 4) % page_size + tx / 8;
+      DType* gptr =
+          produce_v ? (paged_kv.template get_v_ptr<AccessMode::kProtective>(
+                          page_iter, kv_head_idx, entry_idx, (tx % 8) * cell_capacity<DType>()))
+                    : (paged_kv.template get_k_ptr<AccessMode::kProtective>(
+                          page_iter, kv_head_idx, entry_idx, (tx % 8) * cell_capacity<DType>()));
 #pragma unroll
-    for (uint32_t j = 0; j < num_frags_y / 4; ++j) {
-      smem.load_128b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
-      *smem_offset += 16;
-      gptr += 8 * cell_capacity<DType>();
+      for (uint32_t j = 0; j < num_frags_y / 4; ++j) {
+        smem.load_128b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
+        *smem_offset += 16;
+        gptr += 8 * cell_capacity<DType>();
+      }
+      kv_idx += num_warps * 4;
+      *smem_offset += num_warps * 4 * num_cells_per_in_channel - 4 * num_frags_y;
     }
-    kv_idx += num_warps * 4;
-    *smem_offset += num_warps * 4 * num_cells_per_in_channel - 4 * num_frags_y;
+    *smem_offset -= num_frags_z * 16 * num_cells_per_in_channel;
+  } else {
+#pragma unroll
+    for (uint32_t i = 0; i < num_frags_z * 4 / num_warps; ++i) {
+      const uint32_t page_iter = page_iter_base + (4 * num_warps * i + ty * 4 + tx / 8) / page_size;
+      const uint32_t entry_idx = (4 * num_warps * i + ty * 4 + tx / 8) % page_size;
+      DType* gptr =
+          produce_v ? (paged_kv.template get_v_ptr<AccessMode::kProtective>(
+                          page_iter, kv_head_idx, entry_idx, (tx % 8) * cell_capacity<DType>()))
+                    : (paged_kv.template get_k_ptr<AccessMode::kProtective>(
+                          page_iter, kv_head_idx, entry_idx, (tx % 8) * cell_capacity<DType>()));
+#pragma unroll
+      for (uint32_t j = 0; j < num_frags_y / 4; ++j) {
+        smem.load_128b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
+        *smem_offset += 16;
+        gptr += 8 * cell_capacity<DType>();
+      }
+      kv_idx += num_warps * 4;
+      *smem_offset += num_warps * 4 * num_cells_per_in_channel - 4 * num_frags_y;
+    }
+    *smem_offset -= num_frags_z * 16 * num_cells_per_in_channel;
   }
-  *smem_offset -= num_frags_z * 16 * num_cells_per_in_channel;
 }
 
 template <uint32_t num_frags_y>
