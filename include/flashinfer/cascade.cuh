@@ -26,8 +26,6 @@ namespace flashinfer {
 
 /*!
  * \brief The CUDA kernel that merges the self-attention state of two index sets A and B.
- * \tparam bdx The block size of x dimension.
- * \tparam bdy The block size of y dimension.
  * \tparam vec_size The vector size used in the kernel.
  * \tparam DTypeIn The data type of v_a and v_b.
  * \tparam DTypeOut The data type of v_merged.
@@ -36,16 +34,18 @@ namespace flashinfer {
  * \param v_b The partial v of index set B. (n, h, d)
  * \param s_b The logsumexp value of index set B. (n, h)
  * \param v_merged The merged v of index set A union B. (n, h, d)
+ * \param num_heads The number of heads of v_a and v_b.
+ * \param head_dim The dimension of each head.
  * \note Both s_a and s_b are logsumexp values with base 2.
  */
-template <uint32_t bdx, uint32_t bdy, uint32_t vec_size, typename DTypeIn, typename DTypeOut>
+template <uint32_t vec_size, typename DTypeIn, typename DTypeOut>
 __global__ void MergeStateKernel(DTypeIn* __restrict__ v_a, float* __restrict__ s_a,
                                  DTypeIn* __restrict__ v_b, float* __restrict__ s_b,
-                                 DTypeOut* __restrict__ v_merged, uint32_t num_heads) {
+                                 DTypeOut* __restrict__ v_merged, uint32_t num_heads,
+                                 uint32_t head_dim) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
-  uint32_t batch_idx = blockIdx.x / (num_heads / bdy);
-  uint32_t head_idx = (blockIdx.x % (num_heads / bdy)) * bdy + ty;
-  constexpr uint32_t head_dim = bdx * vec_size;
+  uint32_t batch_idx = blockIdx.x;
+  uint32_t head_idx = ty;
 
   float s_a_val = s_a[batch_idx * num_heads + head_idx];
   float s_b_val = s_b[batch_idx * num_heads + head_idx];
@@ -66,25 +66,24 @@ __global__ void MergeStateKernel(DTypeIn* __restrict__ v_a, float* __restrict__ 
 
 /*!
  * \brief The CUDA kernel that merges self-attention states of a list of index sets.
- * \param bdx The block size of x dimension.
- * \param bdy The block size of y dimension.
  * \param vec_size The vector size used in the kernel.
  * \tparam DTypeIn The data type of v.
  * \tparam DTypeOut The data type of v_merged.
  * \param v The partial v of index sets. (num_index_sets, n, h, d)
  * \param s The logsumexp value of index sets. (num_index_sets, n, h)
  * \param v_merged The merged v of index sets union. (n, h, d)
+ * \param num_heads The number of heads of v.
+ * \param head_dim The dimension of each head.
  * \note s are logsumexp values with base 2.
  */
-template <uint32_t bdx, uint32_t bdy, uint32_t vec_size, typename DTypeIn, typename DTypeOut>
+template <uint32_t vec_size, typename DTypeIn, typename DTypeOut>
 __global__ void MergeStatesKernel(DTypeIn* __restrict__ v, float* __restrict__ s,
                                   DTypeOut* __restrict__ v_merged, uint32_t num_index_sets,
-                                  uint32_t num_heads) {
+                                  uint32_t num_heads, uint32_t head_dim) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
-  uint32_t batch_idx = blockIdx.x / (num_heads / bdy);
-  uint32_t batch_size = gridDim.x / (num_heads / bdy);
-  uint32_t head_idx = (blockIdx.x % (num_heads / bdy)) * bdy + ty;
-  constexpr uint32_t head_dim = bdx * vec_size;
+  uint32_t batch_size = gridDim.x;
+  uint32_t batch_idx = blockIdx.x;
+  uint32_t head_idx = ty;
   float m = -5e4, d = 0.f;
 
   vec_t<float, vec_size> v_vec_o;
@@ -123,6 +122,8 @@ __global__ void MergeStatesKernel(DTypeIn* __restrict__ v, float* __restrict__ s
  * \param batch_size The batch size of self-attention states.
  * \param num_heads The number of heads of v_a and v_b.
  * \param head_dim The dimension of each head.
+ * \param stream The CUDA stream to execute the kernel.
+ * \return status Indicates whether CUDA calls are successful
  * \note Both s_a and s_b are logsumexp values with base 2.
  */
 template <typename DTypeIn, typename DTypeOut>
@@ -131,13 +132,12 @@ cudaError_t MergeState(DTypeIn* v_a, float* s_a, DTypeIn* v_b, float* s_b, DType
                        cudaStream_t stream = nullptr) {
   SWITCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
-    constexpr uint32_t bdx = HEAD_DIM / vec_size;
-    constexpr uint32_t bdy = 128 / bdx;
-    assert(num_heads % bdy == 0);
-    dim3 nblks(batch_size * num_heads / bdy);
+    uint32_t bdx = HEAD_DIM / vec_size;
+    uint32_t bdy = num_heads;
+    dim3 nblks(batch_size);
     dim3 nthrs(bdx, bdy);
-    auto kernel = MergeStateKernel<bdx, bdy, vec_size, DTypeIn, DTypeOut>;
-    void* args[] = {&v_a, &s_a, &v_b, &s_b, &v_merged, &num_heads};
+    auto kernel = MergeStateKernel<vec_size, DTypeIn, DTypeOut>;
+    void* args[] = {&v_a, &s_a, &v_b, &s_b, &v_merged, &num_heads, &head_dim};
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
   });
   return cudaSuccess;
@@ -152,8 +152,11 @@ cudaError_t MergeState(DTypeIn* v_a, float* s_a, DTypeIn* v_b, float* s_b, DType
  * \param v_merged The merged v of index sets union. (n, h, d)
  * \param num_index_sets The number of index sets.
  * \param batch_size The batch size of self-attention states.
- * \param num_heads The number of heads of v_a and v_b.
+ * \param num_heads The number of heads of v.
  * \param head_dim The dimension of each head.
+ * \param stream The CUDA stream to execute the kernel.
+ * \return status Indicates whether CUDA calls are successful
+ * \note s are logsumexp values with base 2.
  */
 template <typename DTypeIn, typename DTypeOut>
 cudaError_t MergeStates(DTypeIn* v, float* s, DTypeOut* v_merged, uint32_t num_index_sets,
@@ -161,13 +164,12 @@ cudaError_t MergeStates(DTypeIn* v, float* s, DTypeOut* v_merged, uint32_t num_i
                         cudaStream_t stream = nullptr) {
   SWITCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
-    constexpr uint32_t bdx = HEAD_DIM / vec_size;
-    constexpr uint32_t bdy = 128 / bdx;
-    assert(num_heads % bdy == 0);
-    dim3 nblks(batch_size * num_heads / bdy);
+    uint32_t bdx = HEAD_DIM / vec_size;
+    uint32_t bdy = num_heads;
+    dim3 nblks(batch_size);
     dim3 nthrs(bdx, bdy);
-    auto kernel = MergeStatesKernel<bdx, bdy, vec_size, DTypeIn, DTypeOut>;
-    void* args[] = {&v, &s, &v_merged, &num_index_sets, &num_heads};
+    auto kernel = MergeStatesKernel<vec_size, DTypeIn, DTypeOut>;
+    void* args[] = {&v, &s, &v_merged, &num_index_sets, &num_heads, &head_dim};
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
   });
   return cudaSuccess;

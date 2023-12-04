@@ -1111,7 +1111,10 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
     uint32_t qo_len, uint32_t kv_len, uint32_t head_dim, bool causal = true,
     QKVLayout layout = QKVLayout::kNHD, RotaryMode rotary_mode = RotaryMode::kNone,
     bool allow_fp16_qk_reduction = false, cudaStream_t stream = nullptr) {
-  assert(kv_len >= qo_len);
+  if (kv_len >= qo_len && causal) {
+    std::cerr << "When causal is true, kv_len must be smaller than qo_len" << std::endl;
+    abort();
+  }
   const uint32_t group_size = num_qo_heads / num_kv_heads;
 
   SWITCH_ALLOW_FP16_QK_REDUCTION(
@@ -1234,7 +1237,10 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOu
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
   const uint32_t group_size = num_qo_heads / num_kv_heads;
-  assert(kv_len >= qo_len);
+  if (kv_len >= qo_len && causal) {
+    std::cerr << "When causal is true, kv_len must be smaller than qo_len" << std::endl;
+    abort();
+  }
 
   float* lse = nullptr;
   SWITCH_ALLOW_FP16_QK_REDUCTION(
@@ -1390,7 +1396,10 @@ cudaError_t SinglePrefillWithKVCacheReturnLSE(
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
   const uint32_t group_size = num_qo_heads / num_kv_heads;
-  assert(kv_len >= qo_len);
+  if (kv_len >= qo_len && causal) {
+    std::cerr << "When causal is true, kv_len must be smaller than qo_len" << std::endl;
+    abort();
+  }
 
   SWITCH_ALLOW_FP16_QK_REDUCTION(
       allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
