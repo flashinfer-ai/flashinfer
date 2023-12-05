@@ -1258,8 +1258,8 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOu
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
   const uint32_t group_size = num_qo_heads / num_kv_heads;
-  if (kv_len >= qo_len && causal) {
-    std::cerr << "When causal is true, kv_len must be smaller than qo_len" << std::endl;
+  if (kv_len < qo_len && causal) {
+    std::cerr << "When causal is true, kv_len must be greater than or equal to qo_len" << std::endl;
     abort();
   }
 
@@ -1417,8 +1417,8 @@ cudaError_t SinglePrefillWithKVCacheReturnLSE(
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
   const uint32_t group_size = num_qo_heads / num_kv_heads;
-  if (kv_len >= qo_len && causal) {
-    std::cerr << "When causal is true, kv_len must be smaller than qo_len" << std::endl;
+  if (kv_len < qo_len && causal) {
+    std::cerr << "When causal is true, kv_len must be greater than or equal to qo_len" << std::endl;
     abort();
   }
 
