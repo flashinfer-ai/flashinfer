@@ -1132,8 +1132,8 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
     uint32_t qo_len, uint32_t kv_len, uint32_t head_dim, bool causal = true,
     QKVLayout layout = QKVLayout::kNHD, RotaryMode rotary_mode = RotaryMode::kNone,
     bool allow_fp16_qk_reduction = false, cudaStream_t stream = nullptr) {
-  if (kv_len >= qo_len && causal) {
-    std::cerr << "When causal is true, kv_len must be smaller than qo_len" << std::endl;
+  if (kv_len < qo_len && causal) {
+    std::cerr << "When causal is true, kv_len must be greater than or equal to qo_len" << std::endl;
     abort();
   }
   const uint32_t group_size = num_qo_heads / num_kv_heads;
