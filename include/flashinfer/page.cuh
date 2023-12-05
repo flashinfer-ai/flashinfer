@@ -281,69 +281,60 @@ struct paged_kv_t {
            feat_idx;
   }
 
-  __host__ __device__ __forceinline__ uint32_t get_valid_page_size(uint32_t batch_idx,
-                                                                   uint32_t page_iter) const {
-    if (page_iter == indptr[batch_idx + 1] - 1) {
-      return last_page_len[batch_idx];
-    } else {
-      return page_size;
-    }
-  }
-
   __host__ __device__ __forceinline__ uint32_t kv_offset_delta() const {
     return num_heads * page_size * head_dim;
   }
 
   template <AccessMode access_mode = AccessMode::kNonProtective>
-  __host__ __device__ __forceinline__ DType* get_k_ptr(uint32_t page_iter, uint32_t head_idx,
-                                                       uint32_t entry_idx,
-                                                       uint32_t feat_idx) const {
+  __device__ __forceinline__ DType* get_k_ptr(uint32_t page_iter, uint32_t head_idx,
+                                              uint32_t entry_idx, uint32_t feat_idx) const {
     if constexpr (page_storage == PageStorage::kIndices) {
       if constexpr (access_mode == AccessMode::kProtective) {
-        if (page_iter < indptr[batch_size]) {
-          return data + get_k_elem_offset(indices[page_iter], head_idx, entry_idx, feat_idx);
+        if (page_iter < __ldg(indptr + batch_size)) {
+          return data +
+                 get_k_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
         } else {
           return data;
         }
       } else {
-        return data + get_k_elem_offset(indices[page_iter], head_idx, entry_idx, feat_idx);
+        return data + get_k_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
       }
     } else {
       if constexpr (access_mode == AccessMode::kProtective) {
-        if (page_iter < indptr[batch_size]) {
-          return ptrs[page_iter] + get_k_elem_offset_in_page(head_idx, entry_idx, feat_idx);
+        if (page_iter < __ldg(indptr + batch_size)) {
+          return __ldg(ptrs + page_iter) + get_k_elem_offset_in_page(head_idx, entry_idx, feat_idx);
         } else {
-          return ptrs[0];
+          return __ldg(ptrs);
         }
       } else {
-        return ptrs[page_iter] + get_k_elem_offset_in_page(head_idx, entry_idx, feat_idx);
+        return __ldg(ptrs + page_iter) + get_k_elem_offset_in_page(head_idx, entry_idx, feat_idx);
       }
     }
   }
 
   template <AccessMode access_mode = AccessMode::kNonProtective>
-  __host__ __device__ __forceinline__ DType* get_v_ptr(uint32_t page_iter, uint32_t head_idx,
-                                                       uint32_t entry_idx,
-                                                       uint32_t feat_idx) const {
+  __device__ __forceinline__ DType* get_v_ptr(uint32_t page_iter, uint32_t head_idx,
+                                              uint32_t entry_idx, uint32_t feat_idx) const {
     if constexpr (page_storage == PageStorage::kIndices) {
       if constexpr (access_mode == AccessMode::kProtective) {
-        if (page_iter < indptr[batch_size]) {
-          return data + get_v_elem_offset(indices[page_iter], head_idx, entry_idx, feat_idx);
+        if (page_iter < __ldg(indptr + batch_size)) {
+          return data +
+                 get_v_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
         } else {
           return data;
         }
       } else {
-        return data + get_v_elem_offset(indices[page_iter], head_idx, entry_idx, feat_idx);
+        return data + get_v_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
       }
     } else {
       if constexpr (access_mode == AccessMode::kProtective) {
-        if (page_iter < indptr[batch_size]) {
-          return ptrs[page_iter] + get_v_elem_offset_in_page(head_idx, entry_idx, feat_idx);
+        if (page_iter < __ldg(indptr + batch_size)) {
+          return __ldg(ptrs + page_iter) + get_v_elem_offset_in_page(head_idx, entry_idx, feat_idx);
         } else {
-          return ptrs[0];
+          return __ldg(ptrs);
         }
       } else {
-        return ptrs[page_iter] + get_v_elem_offset_in_page(head_idx, entry_idx, feat_idx);
+        return __ldg(ptrs + page_iter) + get_v_elem_offset_in_page(head_idx, entry_idx, feat_idx);
       }
     }
   }

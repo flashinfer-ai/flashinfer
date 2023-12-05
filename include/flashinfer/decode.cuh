@@ -504,51 +504,6 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(DTypeIn* __restrict__ q, DTyp
 }
 
 /*!
- * \brief Advance the page iterator
- * \tparam page_storage Whether to store indices or pointers of each active page
- * \tparam DType A template type indicates the input data type
- * \tparam IdType A template type indicates the index data type
- * \param paged_kv The paged kv-cache data structure
- * \param kv_idx_base The k/v tiles offset in shared memory of different pipeline stages
- * \param valid_page_size The valid page size of different pipeline stages
- * \param producer_valid_page_size The valid page size of the producer
- * \param producer_entry_base The entry base of the producer
- * \param producer_page_iter The page iterator of the producer
- * \param cur_page_indptr_begin The begin index of the current page indptr
- * \param cur_page_indptr_end The end index of the current page indptr
- * \param batch_idx The batch index
- * \param stage_idx The stage index
- */
-template <PageStorage page_storage, typename DType, typename IdType>
-__forceinline__ __device__ void AdvancePageIterator(
-    paged_kv_t<page_storage, DType, IdType> paged_kv, uint32_t* kv_idx_base,
-    uint32_t* valid_page_size, uint32_t& producer_valid_page_size, uint32_t& producer_entry_base,
-    uint32_t& producer_page_iter, uint32_t cur_page_indptr_begin, uint32_t cur_page_indptr_end,
-    uint32_t batch_idx, uint32_t stage_idx) {
-  if (producer_entry_base >= producer_valid_page_size) {
-    producer_entry_base = 0;
-    producer_page_iter += 1;
-    if (producer_page_iter < cur_page_indptr_end) {
-      producer_valid_page_size = paged_kv.get_valid_page_size(batch_idx, producer_page_iter);
-    } else {
-      producer_valid_page_size = 0;
-    }
-  }
-  kv_idx_base[stage_idx] =
-      producer_entry_base + (producer_page_iter - cur_page_indptr_begin) * paged_kv.page_size;
-  valid_page_size[stage_idx] = producer_valid_page_size;
-}
-
-#define FOR_LOOP_UNROLL_IF_CONST_RANGE(i, CONST_RANGE, RUNTIME_RANGE, ...)       \
-  if constexpr (CONST_RANGE == 0) {                                              \
-    for (uint32_t i = 0; i < RUNTIME_RANGE; ++i) {                               \
-      __VA_ARGS__                                                                \
-    }                                                                            \
-  } else {                                                                       \
-    _Pragma("unroll") for (uint32_t i = 0; i < CONST_RANGE; ++i) { __VA_ARGS__ } \
-  }
-
-/*!
  * \brief FlashAttention decoding cuda kernel with paged kv-cache for multiple requests
  * \tparam cooperative Whether to use cooperative kernel or not
  * \tparam rotary_mode The rotary mode
@@ -590,10 +545,9 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
   const uint32_t cur_page_indptr_begin = paged_kv.indptr[batch_idx],
                  cur_page_indptr_end = paged_kv.indptr[batch_idx + 1];
   const uint32_t cur_last_page_len = paged_kv.last_page_len[batch_idx];
-  const uint32_t seq_len =
-      cooperative ? paged_kv.seq_lens_before_split()[batch_idx]
-                  : (cur_page_indptr_end - cur_page_indptr_begin - 1) * paged_kv.page_size +
-                        cur_last_page_len;
+  const uint32_t kv_chunk_len =
+      (cur_page_indptr_end - cur_page_indptr_begin - 1) * paged_kv.page_size + cur_last_page_len;
+  const uint32_t seq_len = cooperative ? paged_kv.seq_lens_before_split()[batch_idx] : kv_chunk_len;
 
   extern __shared__ uint8_t smem[];
   DTypeIn* k_smem = (DTypeIn*)smem;
@@ -632,86 +586,67 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
   block.sync();
 
   // preload k/v tiles
-  uint32_t producer_entry_base = 0, stage_idx = 0;
+  uint32_t stage_idx = 0;
   constexpr uint32_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
-  uint32_t producer_page_iter = cur_page_indptr_begin;
-  uint32_t producer_valid_page_size = paged_kv.get_valid_page_size(batch_idx, producer_page_iter);
-  uint32_t kv_idx_base[num_stages_smem]{0};
-  uint32_t valid_page_size[num_stages_smem]{0};
+
 #pragma unroll
   for (uint32_t iter = 0; iter < num_stages_smem; ++iter) {
-    AdvancePageIterator(paged_kv, kv_idx_base, valid_page_size, producer_valid_page_size,
-                        producer_entry_base, producer_page_iter, cur_page_indptr_begin,
-                        cur_page_indptr_end, batch_idx, stage_idx);
-    bool producer_pred_guard = (producer_entry_base + tz * bdy + ty < producer_valid_page_size) &&
-                               (producer_page_iter < cur_page_indptr_end);
     DTypeIn* k_ptr = paged_kv.template get_k_ptr<AccessMode::kProtective>(
-        producer_page_iter, kv_head_idx, producer_entry_base + tz * bdy + ty, tx * vec_size);
+        cur_page_indptr_begin + ((iter * bdz + tz) * bdy + ty) / paged_kv.page_size, kv_head_idx,
+        ((iter * bdz + tz) * bdy + ty) % paged_kv.page_size, tx * vec_size);
     DTypeIn* v_ptr = k_ptr + paged_kv.kv_offset_delta();
     cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
         k_smem + ((stage_idx * bdz + tz) * bdy + ty) * head_dim + tx * vec_size, k_ptr,
-        producer_pred_guard);
+        (iter * bdz + tz) * bdy + ty < kv_chunk_len);
     cp_async::commit_group();
     cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
         v_smem + ((stage_idx * bdz + tz) * bdy + ty) * head_dim + tx * vec_size, v_ptr,
-        producer_pred_guard);
+        (iter * bdz + tz) * bdy + ty < kv_chunk_len);
     cp_async::commit_group();
     stage_idx = (stage_idx + 1) % num_stages_smem;
-    producer_entry_base += bdy * bdz;
   }
 
   state_t<vec_size> s;
   float x[bdy];
-  uint32_t consumer_kv_idx_base = 0;
 
-#pragma unroll 2
-  for (uint32_t consumer_page_iter = cur_page_indptr_begin;
-       consumer_page_iter < cur_page_indptr_end; ++consumer_page_iter) {
-    uint32_t consumer_valid_page_size = valid_page_size[stage_idx];
-    FOR_LOOP_UNROLL_IF_CONST_RANGE(
-        iter, (const_page_size + (bdy * bdz) - 1) / (bdy * bdz),
-        (consumer_valid_page_size + (bdy * bdz) - 1) / (bdy * bdz), {
-          consumer_kv_idx_base = kv_idx_base[stage_idx];
-          AdvancePageIterator(paged_kv, kv_idx_base, valid_page_size, producer_valid_page_size,
-                              producer_entry_base, producer_page_iter, cur_page_indptr_begin,
-                              cur_page_indptr_end, batch_idx, stage_idx);
-          bool producer_pred_guard =
-              (producer_entry_base + tz * bdy + ty < producer_valid_page_size) &&
-              (producer_page_iter < cur_page_indptr_end);
-          // compute qk
-          cp_async::wait_group<2 * num_stages_smem - 1>();
-          block.sync();
-          compute_qk<rotary_mode, vec_size, bdx, bdy>(
-              k_smem + (stage_idx * bdz + tz) * bdy * head_dim, stage_idx, q_vec, freq,
-              cur_chunk_start + consumer_kv_idx_base, iter * bdy * bdz, consumer_valid_page_size,
-              sm_scale, x, s);
-          block.sync();
+#pragma unroll 4
+  for (uint32_t iter = 0; iter < (kv_chunk_len + bdy * bdz - 1) / (bdy * bdz); ++iter) {
+    const bool producer_pred_guard =
+        ((iter + num_stages_smem) * bdz + tz) * bdy + ty < kv_chunk_len;
+    // compute qk
+    cp_async::wait_group<2 * num_stages_smem - 1>();
+    block.sync();
+    compute_qk<rotary_mode, vec_size, bdx, bdy>(
+        k_smem + (stage_idx * bdz + tz) * bdy * head_dim, stage_idx, q_vec, freq,
+        cur_chunk_start + iter * bdy * bdz, iter * bdy * bdz, kv_chunk_len, sm_scale, x, s);
+    block.sync();
 
-          DTypeIn* k_ptr = paged_kv.template get_k_ptr<AccessMode::kProtective>(
-              producer_page_iter, kv_head_idx, producer_entry_base + tz * bdy + ty, tx * vec_size);
-          DTypeIn* v_ptr = k_ptr + paged_kv.kv_offset_delta();
-          // load k tiles
-          cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
-              k_smem + ((stage_idx * bdz + tz) * bdy + ty) * head_dim + tx * vec_size, k_ptr,
-              producer_pred_guard);
-          cp_async::commit_group();
+    DTypeIn* k_ptr = paged_kv.template get_k_ptr<AccessMode::kProtective>(
+        cur_page_indptr_begin +
+            (((iter + num_stages_smem) * bdz + tz) * bdy + ty) / paged_kv.page_size,
+        kv_head_idx, (((iter + num_stages_smem) * bdz + tz) * bdy + ty) % paged_kv.page_size,
+        tx * vec_size);
+    DTypeIn* v_ptr = k_ptr + paged_kv.kv_offset_delta();
+    // load k tiles
+    cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+        k_smem + ((stage_idx * bdz + tz) * bdy + ty) * head_dim + tx * vec_size, k_ptr,
+        producer_pred_guard);
+    cp_async::commit_group();
 
-          // update m/d/o states
-          cp_async::wait_group<2 * num_stages_smem - 1>();
-          block.sync();
-          update_partial_state<vec_size, bdx, bdy>(v_smem + (stage_idx * bdz + tz) * bdy * head_dim,
-                                                   x, stage_idx, s);
-          block.sync();
+    // update m/d/o states
+    cp_async::wait_group<2 * num_stages_smem - 1>();
+    block.sync();
+    update_partial_state<vec_size, bdx, bdy>(v_smem + (stage_idx * bdz + tz) * bdy * head_dim, x,
+                                             stage_idx, s);
+    block.sync();
 
-          // load v tiles
-          cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
-              v_smem + ((stage_idx * bdz + tz) * bdy + ty) * head_dim + tx * vec_size, v_ptr,
-              producer_pred_guard);
-          cp_async::commit_group();
+    // load v tiles
+    cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
+        v_smem + ((stage_idx * bdz + tz) * bdy + ty) * head_dim + tx * vec_size, v_ptr,
+        producer_pred_guard);
+    cp_async::commit_group();
 
-          stage_idx = (stage_idx + 1) % num_stages_smem;
-          producer_entry_base += bdy * bdz;
-        });
+    stage_idx = (stage_idx + 1) % num_stages_smem;
   }
   cp_async::wait_group<0>();
   block.sync();
@@ -1119,7 +1054,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
           {SWITCH_ROTARY_MODE(
               rotary_mode, ROTARY_MODE, {SWITCH_PAGE_SIZE(paged_kv.page_size, PAGE_SIZE, {
                 constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
-                constexpr uint32_t num_stages_smem = 2;
+                constexpr uint32_t num_stages_smem = 2U;
                 constexpr uint32_t bdx = HEAD_DIM / vec_size;
                 static_assert(bdx <= 32);
                 constexpr uint32_t bdy = GROUP_SIZE;
@@ -1182,7 +1117,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
   const uint32_t batch_size = paged_kv.batch_size;
 
   constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
-  constexpr uint32_t num_stages_smem = 2;
+  constexpr uint32_t num_stages_smem = 2U;
   constexpr uint32_t bdx = HEAD_DIM / vec_size;
   static_assert(bdx <= 32);
   constexpr uint32_t bdy = GROUP_SIZE;
@@ -1297,7 +1232,7 @@ cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DType
   const uint32_t num_kv_heads = num_qo_heads / GROUP_SIZE;
 
   constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
-  constexpr uint32_t num_stages_smem = 2;
+  constexpr uint32_t num_stages_smem = 2U;
   constexpr uint32_t bdx = HEAD_DIM / vec_size;
   static_assert(bdx <= 32);
   constexpr uint32_t bdy = GROUP_SIZE;
