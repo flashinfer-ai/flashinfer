@@ -22,6 +22,7 @@
 
 #include <flashinfer.cuh>
 
+using tvm::runtime::Array;
 using tvm::runtime::DataType;
 using tvm::runtime::NDArray;
 using tvm::runtime::ShapeTuple;
@@ -43,20 +44,92 @@ using namespace flashinfer;
     LOG(FATAL) << "Unsupported data type " << dl_dtype.code; \
   }
 
-int _FlashInferSingleDecodeWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, DLTensor* tmp,
-                                       int64_t qkv_layout, int64_t rotary_mode, double rope_scale,
-                                       double rope_theta, DLTensor* o) {
+Array<NDArray> _CreateTemporaryBufferPerGPU() {
+  auto* pf = tvm::runtime::Registry::Get("runtime.GetCudaDeviceCount");
+  ICHECK(pf != nullptr);
+  int n_gpus = (*pf)();
+  Array<NDArray> buffers;
+  for (int i = 0; i < n_gpus; ++i) {
+    buffers.push_back(tvm::runtime::NDArray::Empty(ShapeTuple({4096 * 4096}), DataType::Float(16),
+                                                   tvm::Device{kDLCUDA, i}));
+  }
+  return buffers;
+}
+
+NDArray _GetTemporaryBufferOnGPU(tvm::Device dev) {
+  thread_local Array<NDArray> buffers = _CreateTemporaryBufferPerGPU();
+  CHECK_EQ(dev.device_type, kDLCUDA);
+  CHECK_LT(dev.device_id, buffers.size());
+  return buffers[dev.device_id];
+}
+
+int _FlashInferSinglePrefillWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, bool causal,
+                                        int64_t qkv_layout, int64_t rotary_mode,
+                                        bool allow_fp16_qk_reduction, double rope_scale,
+                                        double rope_theta, DLTensor* o) {
   CHECK_EQ(q->device.device_type, kDLCUDA) << "The device of q matrix must be CUDA.";
   CHECK_EQ(k->device.device_type, kDLCUDA) << "The device of k matrix must be CUDA.";
   CHECK_EQ(v->device.device_type, kDLCUDA) << "The device of v matrix must be CUDA.";
-  CHECK_EQ(tmp->device.device_type, kDLCUDA) << "The device of tmp matrix must be CUDA.";
   CHECK_EQ(o->device.device_type, kDLCUDA) << "The device of o matrix must be CUDA.";
 
   size_t dev_id = q->device.device_id;
   CHECK_EQ(k->device.device_id, dev_id) << "The device id of q and k matrix doesn't match.";
   CHECK_EQ(v->device.device_id, dev_id) << "The device id of q and v matrix doesn't match.";
-  CHECK_EQ(tmp->device.device_id, dev_id) << "The device id of q and tmp matrix doesn't match.";
   CHECK_EQ(o->device.device_id, dev_id) << "The device id of q and o matrix doesn't match.";
+
+  NDArray tmp = _GetTemporaryBufferOnGPU(q->device);
+
+  CHECK_EQ(q->ndim, 3);
+  size_t qo_len = q->shape[0];
+  size_t num_qo_heads = q->shape[1];
+  size_t head_dim = q->shape[2];
+  CHECK_EQ(k->ndim, 3);
+  size_t kv_len = k->shape[0];
+  size_t num_kv_heads = k->shape[1];
+  CHECK_EQ(k->shape[2], head_dim);
+  CHECK_EQ(v->ndim, 3);
+  CHECK_EQ(v->shape[0], kv_len);
+  CHECK_EQ(v->shape[1], num_kv_heads);
+  CHECK_EQ(v->shape[2], head_dim);
+  CHECK_EQ(o->ndim, 3);
+  CHECK_EQ(o->shape[0], qo_len);
+  CHECK_EQ(o->shape[1], num_qo_heads);
+  CHECK_EQ(o->shape[2], head_dim);
+
+  CHECK(q->dtype.lanes == 1 && k->dtype.lanes == 1 && v->dtype.lanes == 1);
+  CHECK(q->dtype.bits == k->dtype.bits && q->dtype.code == k->dtype.code);
+  CHECK(q->dtype.bits == v->dtype.bits && q->dtype.code == v->dtype.code);
+
+  SWITCH_TVM_CUDA_DTYPE(
+      q->dtype, dtype_in, {SWITCH_TVM_CUDA_DTYPE(o->dtype, dtype_out, {
+        cudaError_t status = flashinfer::SinglePrefillWithKVCache(
+            (dtype_in*)q->data, (dtype_in*)k->data, (dtype_in*)v->data, (dtype_out*)o->data,
+            (float*)tmp->data, num_qo_heads, num_kv_heads, qo_len, kv_len, head_dim, causal,
+            flashinfer::QKVLayout(qkv_layout), flashinfer::RotaryMode(rotary_mode),
+            allow_fp16_qk_reduction, rope_scale, rope_theta, 0);
+        if (status != cudaSuccess) {
+          LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
+        }
+      })});
+  return 0;
+}
+
+TVM_DLL_EXPORT_TYPED_FUNC(FlashInferSinglePrefillWithKVCache, _FlashInferSinglePrefillWithKVCache);
+
+int _FlashInferSingleDecodeWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, int64_t qkv_layout,
+                                       int64_t rotary_mode, double rope_scale, double rope_theta,
+                                       DLTensor* o) {
+  CHECK_EQ(q->device.device_type, kDLCUDA) << "The device of q matrix must be CUDA.";
+  CHECK_EQ(k->device.device_type, kDLCUDA) << "The device of k matrix must be CUDA.";
+  CHECK_EQ(v->device.device_type, kDLCUDA) << "The device of v matrix must be CUDA.";
+  CHECK_EQ(o->device.device_type, kDLCUDA) << "The device of o matrix must be CUDA.";
+
+  size_t dev_id = q->device.device_id;
+  CHECK_EQ(k->device.device_id, dev_id) << "The device id of q and k matrix doesn't match.";
+  CHECK_EQ(v->device.device_id, dev_id) << "The device id of q and v matrix doesn't match.";
+  CHECK_EQ(o->device.device_id, dev_id) << "The device id of q and o matrix doesn't match.";
+
+  NDArray tmp = _GetTemporaryBufferOnGPU(q->device);
 
   CHECK_EQ(q->ndim, 2);
   size_t num_qo_heads = q->shape[0];
