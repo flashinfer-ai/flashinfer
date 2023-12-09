@@ -758,7 +758,7 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& 
             {SWITCH_ROTARY_MODE(
                 rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(layout, QKV_LAYOUT, {
                   constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
-                  constexpr uint32_t num_stages_smem = 4U;
+                  constexpr uint32_t num_stages_smem = 2U;
                   constexpr uint32_t bdx = HEAD_DIM / vec_size;
                   static_assert(bdx <= 32U);
                   constexpr uint32_t bdy = GROUP_SIZE;
@@ -837,7 +837,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
           {SWITCH_ROTARY_MODE(
               rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(layout, QKV_LAYOUT, {
                 constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
-                constexpr uint32_t num_stages_smem = 4U;
+                constexpr uint32_t num_stages_smem = 2U;
                 constexpr uint32_t bdx = HEAD_DIM / vec_size;
                 static_assert(bdx <= 32U);
                 constexpr uint32_t bdy = GROUP_SIZE;
@@ -1067,7 +1067,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
           {SWITCH_ROTARY_MODE(
               rotary_mode, ROTARY_MODE, {SWITCH_PAGE_SIZE(paged_kv.page_size, PAGE_SIZE, {
                 constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
-                constexpr uint32_t num_stages_smem = 4U;
+                constexpr uint32_t num_stages_smem = 2U;
                 constexpr uint32_t bdx = HEAD_DIM / vec_size;
                 static_assert(bdx <= 32);
                 constexpr uint32_t bdy = GROUP_SIZE;
@@ -1130,7 +1130,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
   const uint32_t batch_size = paged_kv.batch_size;
 
   constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
-  constexpr uint32_t num_stages_smem = 4U;
+  constexpr uint32_t num_stages_smem = 2U;
   constexpr uint32_t bdx = HEAD_DIM / vec_size;
   static_assert(bdx <= 32);
   constexpr uint32_t bdy = GROUP_SIZE;
