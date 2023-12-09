@@ -29,11 +29,6 @@ enum class PageStorage {
   kPointer = 1U,  // Store the pointers to each active page.
 };
 
-enum class AccessMode {
-  kProtective = 0U,    // Check whether page_iter is out of range
-  kNonProtective = 1U  // Do not check whether page_iter is out of range
-};
-
 /*!
  * \brief Paged key-value cache
  * \tparam page_storage Whether to store indices or pointers of each active page
@@ -285,56 +280,56 @@ struct paged_kv_t {
     return num_heads * page_size * head_dim;
   }
 
-  template <AccessMode access_mode = AccessMode::kNonProtective>
-  __device__ __forceinline__ DType* get_k_ptr(uint32_t page_iter, uint32_t head_idx,
+  __device__ __forceinline__ DType* get_k_ptr(IdType page_iter, uint32_t head_idx,
                                               uint32_t entry_idx, uint32_t feat_idx) const {
     if constexpr (page_storage == PageStorage::kIndices) {
-      if constexpr (access_mode == AccessMode::kProtective) {
-        if (page_iter < __ldg(indptr + batch_size)) {
-          return data +
-                 get_k_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
-        } else {
-          return data;
-        }
-      } else {
+      return data + get_k_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
+    } else {
+      return __ldg(ptrs + page_iter) + get_k_elem_offset_in_page(head_idx, entry_idx, feat_idx);
+    }
+  }
+
+  __device__ __forceinline__ DType* protective_get_k_ptr(IdType page_iter, uint32_t head_idx,
+                                                         uint32_t entry_idx, uint32_t feat_idx,
+                                                         IdType last_indptr) const {
+    if constexpr (page_storage == PageStorage::kIndices) {
+      if (page_iter < last_indptr) {
         return data + get_k_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
+      } else {
+        return data;
       }
     } else {
-      if constexpr (access_mode == AccessMode::kProtective) {
-        if (page_iter < __ldg(indptr + batch_size)) {
-          return __ldg(ptrs + page_iter) + get_k_elem_offset_in_page(head_idx, entry_idx, feat_idx);
-        } else {
-          return __ldg(ptrs);
-        }
-      } else {
+      if (page_iter < last_indptr) {
         return __ldg(ptrs + page_iter) + get_k_elem_offset_in_page(head_idx, entry_idx, feat_idx);
+      } else {
+        return __ldg(ptrs);
       }
     }
   }
 
-  template <AccessMode access_mode = AccessMode::kNonProtective>
-  __device__ __forceinline__ DType* get_v_ptr(uint32_t page_iter, uint32_t head_idx,
+  __device__ __forceinline__ DType* get_v_ptr(IdType page_iter, uint32_t head_idx,
                                               uint32_t entry_idx, uint32_t feat_idx) const {
     if constexpr (page_storage == PageStorage::kIndices) {
-      if constexpr (access_mode == AccessMode::kProtective) {
-        if (page_iter < __ldg(indptr + batch_size)) {
-          return data +
-                 get_v_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
-        } else {
-          return data;
-        }
-      } else {
+      return data + get_v_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
+    } else {
+      return __ldg(ptrs + page_iter) + get_v_elem_offset_in_page(head_idx, entry_idx, feat_idx);
+    }
+  }
+
+  __device__ __forceinline__ DType* protective_get_v_ptr(IdType page_iter, uint32_t head_idx,
+                                                         uint32_t entry_idx, uint32_t feat_idx,
+                                                         IdType last_indptr) const {
+    if constexpr (page_storage == PageStorage::kIndices) {
+      if (page_iter < last_indptr) {
         return data + get_v_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
+      } else {
+        return data;
       }
     } else {
-      if constexpr (access_mode == AccessMode::kProtective) {
-        if (page_iter < __ldg(indptr + batch_size)) {
-          return __ldg(ptrs + page_iter) + get_v_elem_offset_in_page(head_idx, entry_idx, feat_idx);
-        } else {
-          return __ldg(ptrs);
-        }
-      } else {
+      if (page_iter < last_indptr) {
         return __ldg(ptrs + page_iter) + get_v_elem_offset_in_page(head_idx, entry_idx, feat_idx);
+      } else {
+        return __ldg(ptrs);
       }
     }
   }

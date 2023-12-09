@@ -140,7 +140,7 @@ __device__ __forceinline__ void page_produce_kv(smem_t smem, uint32_t* smem_offs
                                                 paged_kv_t<page_storage, DType, IdType>& paged_kv,
                                                 const uint32_t kv_idx_base,
                                                 const uint32_t page_iter_base,
-                                                const uint32_t kv_len) {
+                                                const uint32_t kv_len, const IdType last_indptr) {
   constexpr SharedMemFillMode fill_mode =
       produce_v ? SharedMemFillMode::kFillZero : SharedMemFillMode::kNoFill;
   constexpr uint32_t head_dim = num_frags_y * 16;
@@ -154,10 +154,10 @@ __device__ __forceinline__ void page_produce_kv(smem_t smem, uint32_t* smem_offs
       const uint32_t page_iter = page_iter_base + (4 * num_warps * i + ty * 4) / page_size;
       const uint32_t entry_idx = (4 * num_warps * i + ty * 4) % page_size + tx / 8;
       DType* gptr =
-          produce_v ? (paged_kv.template get_v_ptr<AccessMode::kProtective>(
-                          page_iter, kv_head_idx, entry_idx, (tx % 8) * cell_capacity<DType>()))
-                    : (paged_kv.template get_k_ptr<AccessMode::kProtective>(
-                          page_iter, kv_head_idx, entry_idx, (tx % 8) * cell_capacity<DType>()));
+          produce_v ? paged_kv.protective_get_v_ptr(page_iter, kv_head_idx, entry_idx,
+                                                    (tx % 8) * cell_capacity<DType>(), last_indptr)
+                    : paged_kv.protective_get_k_ptr(page_iter, kv_head_idx, entry_idx,
+                                                    (tx % 8) * cell_capacity<DType>(), last_indptr);
 #pragma unroll
       for (uint32_t j = 0; j < num_frags_y / 4; ++j) {
         smem.load_128b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
@@ -174,10 +174,10 @@ __device__ __forceinline__ void page_produce_kv(smem_t smem, uint32_t* smem_offs
       const uint32_t page_iter = page_iter_base + (4 * num_warps * i + ty * 4 + tx / 8) / page_size;
       const uint32_t entry_idx = (4 * num_warps * i + ty * 4 + tx / 8) % page_size;
       DType* gptr =
-          produce_v ? (paged_kv.template get_v_ptr<AccessMode::kProtective>(
-                          page_iter, kv_head_idx, entry_idx, (tx % 8) * cell_capacity<DType>()))
-                    : (paged_kv.template get_k_ptr<AccessMode::kProtective>(
-                          page_iter, kv_head_idx, entry_idx, (tx % 8) * cell_capacity<DType>()));
+          produce_v ? paged_kv.protective_get_v_ptr(page_iter, kv_head_idx, entry_idx,
+                                                    (tx % 8) * cell_capacity<DType>(), last_indptr)
+                    : paged_kv.protective_get_k_ptr(page_iter, kv_head_idx, entry_idx,
+                                                    (tx % 8) * cell_capacity<DType>(), last_indptr);
 #pragma unroll
       for (uint32_t j = 0; j < num_frags_y / 4; ++j) {
         smem.load_128b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
@@ -1027,13 +1027,14 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
                smem_t::get_permuted_offset<num_cells_per_in_channel>(tx % 16, tx / 16),
            kv_smem_offset_w =
                smem_t::get_permuted_offset<num_cells_per_in_channel>(ty * 4 + tx / 8, tx % 8);
+  const IdType last_indptr = paged_kv.indptr[paged_kv.batch_size];
 
   uint32_t page_iter_base = paged_kv.indptr[request_idx];
   page_produce_kv<false, page_size, num_warps, num_frags_y, num_frags_z>(
-      k_smem, &kv_smem_offset_w, paged_kv, kv_idx_base, page_iter_base, kv_len);
+      k_smem, &kv_smem_offset_w, paged_kv, kv_idx_base, page_iter_base, kv_len, last_indptr);
   cp_async::commit_group();
   page_produce_kv<true, page_size, num_warps, num_frags_y, num_frags_z>(
-      v_smem, &kv_smem_offset_w, paged_kv, kv_idx_base, page_iter_base, kv_len);
+      v_smem, &kv_smem_offset_w, paged_kv, kv_idx_base, page_iter_base, kv_len, last_indptr);
   cp_async::commit_group();
 
   const uint32_t num_iterations =
@@ -1077,7 +1078,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
     page_iter_base += 16 * num_frags_z / page_size;
     kv_idx_base += 16 * num_frags_z;
     page_produce_kv<false, page_size, num_warps, num_frags_y, num_frags_z>(
-        k_smem, &kv_smem_offset_w, paged_kv, kv_idx_base, page_iter_base, kv_len);
+        k_smem, &kv_smem_offset_w, paged_kv, kv_idx_base, page_iter_base, kv_len, last_indptr);
     cp_async::commit_group();
     cp_async::wait_group<1>();
     block.sync();
@@ -1088,7 +1089,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
 
     block.sync();
     page_produce_kv<true, page_size, num_warps, num_frags_y, num_frags_z>(
-        v_smem, &kv_smem_offset_w, paged_kv, kv_idx_base, page_iter_base, kv_len);
+        v_smem, &kv_smem_offset_w, paged_kv, kv_idx_base, page_iter_base, kv_len, last_indptr);
     cp_async::commit_group();
   }
   cp_async::wait_group<0>();
