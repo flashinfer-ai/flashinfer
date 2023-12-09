@@ -44,7 +44,7 @@ void bench_flashinfer_single_prefill(nvbench::state& state) {
   thrust::device_vector<dtype_in> K(kv_len * num_kv_heads * head_dim);
   thrust::device_vector<dtype_in> V(kv_len * num_kv_heads * head_dim);
   thrust::device_vector<dtype_out> O(qo_len * num_qo_heads * head_dim);
-  thrust::device_vector<float> tmp(4 * 1024 * 1024);
+  thrust::device_vector<float> tmp(8 * 1024 * 1024);
 
   // Provide throughput information:
   state.add_global_memory_reads<dtype_in>(
