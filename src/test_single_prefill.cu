@@ -47,8 +47,9 @@ void _TestSinglePrefillKernelCorrectness(size_t qo_len, size_t kv_len, size_t nu
   cudaError_t status = flashinfer::SinglePrefillWithKVCache<DTypeIn, DTypeOut>(
       thrust::raw_pointer_cast(q_d.data()), thrust::raw_pointer_cast(k_d.data()),
       thrust::raw_pointer_cast(v_d.data()), thrust::raw_pointer_cast(o_d.data()),
-      thrust::raw_pointer_cast(tmp_d.data()), num_qo_heads, num_kv_heads, qo_len, kv_len, head_dim,
-      causal, layout, rotary_mode, allow_fp16_qk_reduction);
+      thrust::raw_pointer_cast(tmp_d.data()),
+      /*lse=*/nullptr, num_qo_heads, num_kv_heads, qo_len, kv_len, head_dim, causal, layout,
+      rotary_mode, allow_fp16_qk_reduction);
 
   EXPECT_EQ(status, cudaSuccess) << "SinglePrefillWithKVCache kernel launch failed, error message: "
                                  << cudaGetErrorString(status);

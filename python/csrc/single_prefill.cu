@@ -52,9 +52,9 @@ torch::Tensor single_prefill_with_kv_cache(torch::Tensor q, torch::Tensor k, tor
     cudaError_t status = SinglePrefillWithKVCache(
         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
         static_cast<c_type*>(v.data_ptr()), static_cast<c_type*>(o.data_ptr()),
-        static_cast<float*>(tmp.data_ptr()), num_qo_heads, num_kv_heads, qo_len, kv_len, head_dim,
-        causal, qkv_layout, RotaryMode(rotary_mode), allow_fp16_qk_reduction, rope_scale,
-        rope_theta, nullptr);
+        static_cast<float*>(tmp.data_ptr()), /*lse=*/nullptr, num_qo_heads, num_kv_heads, qo_len,
+        kv_len, head_dim, causal, qkv_layout, RotaryMode(rotary_mode), allow_fp16_qk_reduction,
+        rope_scale, rope_theta, nullptr);
     TORCH_CHECK(status == cudaSuccess, "SinglePrefillWithKVCache kernel launch failed, error: " +
                                            std::string(cudaGetErrorString(status)));
     return true;
@@ -94,19 +94,17 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache_return_lse(
   auto lse = torch::empty({qo_len, num_qo_heads}, q.options().dtype(torch::kFloat32));
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
-    cudaError_t status = SinglePrefillWithKVCacheReturnLSE(
+    cudaError_t status = SinglePrefillWithKVCache(
         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
         static_cast<c_type*>(v.data_ptr()), static_cast<c_type*>(o.data_ptr()),
         static_cast<float*>(tmp.data_ptr()), static_cast<float*>(lse.data_ptr()), num_qo_heads,
         num_kv_heads, qo_len, kv_len, head_dim, causal, qkv_layout, RotaryMode(rotary_mode),
         allow_fp16_qk_reduction, rope_scale, rope_theta, nullptr);
-    TORCH_CHECK(status == cudaSuccess,
-                "SinglePrefillWithKVCacheReturnLSE kernel launch failed, error: " +
-                    std::string(cudaGetErrorString(status)));
+    TORCH_CHECK(status == cudaSuccess, "SinglePrefillWithKVCache kernel launch failed, error: " +
+                                           std::string(cudaGetErrorString(status)));
     return true;
   });
 
-  TORCH_CHECK(success,
-              "SinglePrefillWithKVCacheReturnLSE kernel launch failed, error: unknown dtype");
+  TORCH_CHECK(success, "SinglePrefillWithKVCache kernel launch failed, error: unknown dtype");
   return {o, lse};
 }

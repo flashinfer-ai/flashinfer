@@ -1280,8 +1280,7 @@ template <typename DTypeIn, typename DTypeOut>
 cudaError_t BatchDecodeWithPaddedKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeIn* o, float* tmp,
                                          float* lse, uint32_t batch_size, uint32_t padded_kv_len,
                                          uint32_t num_qo_heads, uint32_t num_kv_heads,
-                                         uint32_t head_dim, bool return_lse = false,
-                                         QKVLayout layout = QKVLayout::kNHD,
+                                         uint32_t head_dim, QKVLayout layout = QKVLayout::kNHD,
                                          RotaryMode rotary_mode = RotaryMode::kNone,
                                          float rope_scale = 1.f, float rope_theta = 1e4,
                                          cudaStream_t stream = nullptr) {
@@ -1291,6 +1290,7 @@ cudaError_t BatchDecodeWithPaddedKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTy
     abort();
   }
 
+  const bool return_lse = (lse != nullptr);
   SWITCH_RETURN_LSE(
       return_lse, RETURN_LSE,
       {SWITCH_GQA_GROUP_SIZE(

@@ -156,7 +156,8 @@ void bench_flashinfer_batch_decode_with_prefill(nvbench::state& state) {
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     cudaError_t status = BatchPrefillWithPagedKVCache(
         thrust::raw_pointer_cast(q.data()), paged_kv, thrust::raw_pointer_cast(qo_indptr_d.data()),
-        thrust::raw_pointer_cast(o.data()), /*tmp=*/nullptr, num_qo_heads,
+        thrust::raw_pointer_cast(o.data()), /*tmp=*/nullptr,
+        /*lse=*/nullptr, num_qo_heads,
         /*causal=*/false, rotary_mode);
   });
 }

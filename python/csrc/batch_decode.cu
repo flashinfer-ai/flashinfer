@@ -53,8 +53,8 @@ torch::Tensor batch_decode_with_padded_kv_cache(torch::Tensor q, torch::Tensor k
         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k_padded.data_ptr()),
         static_cast<c_type*>(v_padded.data_ptr()), static_cast<c_type*>(o.data_ptr()),
         /*tmp=*/nullptr,
-        /*lse=*/nullptr, batch_size, padded_kv_len, num_qo_heads, num_kv_heads, head_dim,
-        /*return_lse=*/false, kv_layout, RotaryMode(rotary_mode), rope_scale, rope_theta);
+        /*lse=*/nullptr, batch_size, padded_kv_len, num_qo_heads, num_kv_heads, head_dim, kv_layout,
+        RotaryMode(rotary_mode), rope_scale, rope_theta);
     TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPaddedKVCache failed with error code ",
                 status);
     return true;
@@ -97,8 +97,7 @@ std::vector<torch::Tensor> batch_decode_with_padded_kv_cache_return_lse(
         static_cast<c_type*>(v_padded.data_ptr()), static_cast<c_type*>(o.data_ptr()),
         /*tmp=*/nullptr,
         /*lse=*/static_cast<float*>(lse.data_ptr()), batch_size, padded_kv_len, num_qo_heads,
-        num_kv_heads, head_dim,
-        /*return_lse=*/true, kv_layout, RotaryMode(rotary_mode), rope_scale, rope_theta);
+        num_kv_heads, head_dim, kv_layout, RotaryMode(rotary_mode), rope_scale, rope_theta);
     TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPaddedKVCache failed with error code ",
                 status);
     return true;

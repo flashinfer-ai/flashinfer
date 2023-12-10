@@ -86,7 +86,8 @@ void bench_flashinfer_single_decode_with_prefill(nvbench::state& state) {
     cudaError_t status = flashinfer::SinglePrefillWithKVCache(
         thrust::raw_pointer_cast(Q.data()), thrust::raw_pointer_cast(K.data()),
         thrust::raw_pointer_cast(V.data()), thrust::raw_pointer_cast(O.data()),
-        cooperative ? thrust::raw_pointer_cast(tmp.data()) : nullptr, num_qo_heads, num_kv_heads,
+        /*tmp=*/cooperative ? thrust::raw_pointer_cast(tmp.data()) : nullptr,
+        /*lse=*/nullptr, num_qo_heads, num_kv_heads,
         /*qo_len=*/1,
         /*kv_len=*/seq_len, head_dim,
         /*causal=*/false, QKVLayout(layout), RotaryMode(rotary_mode),

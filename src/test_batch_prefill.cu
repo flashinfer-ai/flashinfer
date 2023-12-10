@@ -111,8 +111,8 @@ void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t num_qo
         auto status = BatchPrefillWithPagedKVCache<PageStorage::kIndices, T, T, int32_t>(
             thrust::raw_pointer_cast(q_device.data()), paged_kv,
             thrust::raw_pointer_cast(q_indptr_device.data()),
-            thrust::raw_pointer_cast(o_device.data()), nullptr, num_qo_heads, causal, rotary_mode,
-            allow_fp16_qk_reduction);
+            thrust::raw_pointer_cast(o_device.data()), /*tmp=*/nullptr,
+            /*lse=*/nullptr, num_qo_heads, causal, rotary_mode, allow_fp16_qk_reduction);
         EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
       }
 
@@ -240,8 +240,8 @@ void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads, size_t 
       auto status = BatchPrefillWithPagedKVCache<PageStorage::kIndices, T, T, int32_t>(
           thrust::raw_pointer_cast(q_device.data()), paged_kv,
           thrust::raw_pointer_cast(q_indptr_device.data()),
-          thrust::raw_pointer_cast(o_device.data()), nullptr, num_qo_heads, causal, rotary_mode,
-          allow_fp16_qk_reduction);
+          thrust::raw_pointer_cast(o_device.data()), /*tmp=*/nullptr,
+          /*lse=*/nullptr, num_qo_heads, causal, rotary_mode, allow_fp16_qk_reduction);
       EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
     }
 
@@ -328,7 +328,8 @@ void _TestBatchPrefillKernelLongContextCorrectness(size_t num_kv_heads, size_t n
     auto status = BatchPrefillWithPagedKVCache<PageStorage::kIndices, T, T, int32_t>(
         thrust::raw_pointer_cast(q_device.data()), paged_kv,
         thrust::raw_pointer_cast(q_indptr_device.data()), thrust::raw_pointer_cast(o_device.data()),
-        nullptr, num_qo_heads, causal, rotary_mode, allow_fp16_qk_reduction);
+        /*tmp=*/nullptr, /*lse=*/nullptr, num_qo_heads, causal, rotary_mode,
+        allow_fp16_qk_reduction);
     EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
   }
 

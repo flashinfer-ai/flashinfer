@@ -104,9 +104,10 @@ int _FlashInferSinglePrefillWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, b
       q->dtype, dtype_in, {SWITCH_TVM_CUDA_DTYPE(o->dtype, dtype_out, {
         cudaError_t status = flashinfer::SinglePrefillWithKVCache(
             (dtype_in*)q->data, (dtype_in*)k->data, (dtype_in*)v->data, (dtype_out*)o->data,
-            (float*)tmp->data, num_qo_heads, num_kv_heads, qo_len, kv_len, head_dim, causal,
-            flashinfer::QKVLayout(qkv_layout), flashinfer::RotaryMode(rotary_mode),
-            allow_fp16_qk_reduction, rope_scale, rope_theta, 0);
+            (float*)tmp->data, /*lse=*/nullptr, num_qo_heads, num_kv_heads, qo_len, kv_len,
+            head_dim, causal, flashinfer::QKVLayout(qkv_layout),
+            flashinfer::RotaryMode(rotary_mode), allow_fp16_qk_reduction, rope_scale, rope_theta,
+            0);
         if (status != cudaSuccess) {
           LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
         }
@@ -252,7 +253,8 @@ void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data, DLTensor* pag
                 BatchPrefillWithPagedKVCache<page_storage, dtype_in, dtype_out, dtype_idx>(
                     static_cast<dtype_in*>(q_data->data), cache,
                     static_cast<dtype_idx*>(append_length_indptr->data),
-                    static_cast<dtype_out*>(output->data), nullptr, nhead_qo,
+                    static_cast<dtype_out*>(output->data), /*tmp=*/nullptr, /*lse=*/nullptr,
+                    nhead_qo,
                     /*causal=*/true, RotaryMode(rotary_mode), /*allow_fp16_qk_reduction=*/false,
                     rope_scale, rope_theta, 0);
             if (status != cudaSuccess) {
