@@ -42,6 +42,8 @@ struct state_t {
 
   __device__ __forceinline__ state_t() { init(); }
 
+  __device__ __forceinline__ float get_lse() const { return m + math::ptx_log2(d); }
+
   /*!
    * \brief Merge the state with another state.
    * \param other_m The maximum value of pre-softmax logits of the other state.
