@@ -498,6 +498,7 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(DTypeIn* __restrict__ q, DTyp
   st_local.o.cast_store(o + batch_idx * num_qo_heads * head_dim +
                         info.get_qo_elem_offset(0, qo_head_idx, tx * vec_size));
 
+  // write lse
   if constexpr (return_lse) {
     lse[batch_idx * num_qo_heads + qo_head_idx] = st_local.get_lse();
   }
@@ -505,6 +506,7 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(DTypeIn* __restrict__ q, DTyp
 
 /*!
  * \brief FlashAttention decoding cuda kernel with paged kv-cache for multiple requests
+ * \tparam return_lse Whether to return the logsumexp values
  * \tparam cooperative Whether to use cooperative kernel or not
  * \tparam rotary_mode The rotary mode
  * \tparam const_page_size Compiled-time determined page size, if set to 0, use runtime page size
@@ -519,6 +521,8 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(DTypeIn* __restrict__ q, DTyp
  * \param q [batch_size, num_qo_heads, head_dim] The query matrix
  * \param paged_kv The paged kv-cache data structure
  * \param o [num_qo_heads, head_dim] The output matrix
+ * \param tmp Used-allocated temporary buffer
+ * \param lse The logsumexp values
  * \param sm_scale A float indicates the scale applied to pre-softmax logits
  * \param rope_rcp_scale A floating number indicate the reciprocal
  *   of scaling ratio used in PI(Position Interpolation) for RoPE (Rotary
@@ -526,13 +530,13 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(DTypeIn* __restrict__ q, DTyp
  * \param rope_rcp_theta A floating number indicate the reciprocal
  *   of "theta" used in RoPE (Rotary Positional Embeddings)
  */
-template <bool cooperative, RotaryMode rotary_mode, uint32_t const_page_size,
+template <bool return_lse, bool cooperative, RotaryMode rotary_mode, uint32_t const_page_size,
           uint32_t num_stages_smem, uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz,
           PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
 __global__ void BatchDecodeWithPagedKVCacheKernel(
     DTypeIn* __restrict__ q, paged_kv_t<page_storage, DTypeIn, IdType> paged_kv,
-    DTypeOut* __restrict__ o, float* __restrict__ tmp, float sm_scale, float rope_rcp_scale,
-    float rope_rcp_theta) {
+    DTypeOut* __restrict__ o, float* __restrict__ tmp, float* __restrict__ lse, float sm_scale,
+    float rope_rcp_scale, float rope_rcp_theta) {
   auto block = cg::this_thread_block();
   sm_scale *= math::log2e;
 
@@ -705,6 +709,11 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
   } else {
     st.normalize();
     st.o.cast_store(o + (batch_idx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
+  }
+
+  // write lse
+  if constexpr (return_lse) {
+    lse[batch_idx * num_qo_heads + qo_head_idx] = st.get_lse();
   }
 }
 
@@ -1037,6 +1046,7 @@ std::pair<uint32_t, uint32_t> SplitPagedKVCacheBinarySearchMinNumPagePerBatch(
 /*!
  * \brief Estimate the temporary buffer size and the maximum grid size for the
  *   cooperative BatchDecodeWithPagedKVCache kernel
+ * \tparam return_lse Whether to return the logsumexp values
  * \tparam page_storage Whether to store indices or pointers of each active page
  * \tparam DTypeIn A template type indicates the input data type
  * \tparam DTypeOut A template type indicates the output data type
@@ -1051,7 +1061,8 @@ std::pair<uint32_t, uint32_t> SplitPagedKVCacheBinarySearchMinNumPagePerBatch(
  * \param stream The cuda stream to launch the kernel
  * \return status Indicates whether CUDA calls are successful
  */
-template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
+template <bool return_lse, PageStorage page_storage, typename DTypeIn, typename DTypeOut,
+          typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
     uint32_t& tmp_size, uint32_t& max_grid_size, uint32_t& max_num_pages_per_batch,
     uint32_t& new_batch_size, const paged_kv_t<page_storage, DTypeIn, IdType>& paged_kv,
@@ -1079,9 +1090,9 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
                     std::max(num_threads * sizeof(DTypeIn*), 2 * bdy * bdz * sizeof(float));
 
                 auto cooperative_kernel =
-                    BatchDecodeWithPagedKVCacheKernel<true, ROTARY_MODE, PAGE_SIZE, num_stages_smem,
-                                                      vec_size, bdx, bdy, bdz, page_storage,
-                                                      DTypeIn, DTypeOut, IdType>;
+                    BatchDecodeWithPagedKVCacheKernel<return_lse, true, ROTARY_MODE, PAGE_SIZE,
+                                                      num_stages_smem, vec_size, bdx, bdy, bdz,
+                                                      page_storage, DTypeIn, DTypeOut, IdType>;
                 int num_blocks_per_sm = 0;
                 int num_sm = 0;
                 int dev_id = 0;
@@ -1119,11 +1130,12 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
   return cudaSuccess;
 }
 
-template <uint32_t PAGE_SIZE, uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage,
-          RotaryMode ROTARY_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
+template <bool RETURN_LSE, uint32_t PAGE_SIZE, uint32_t GROUP_SIZE, uint32_t HEAD_DIM,
+          PageStorage page_storage, RotaryMode ROTARY_MODE, typename DTypeIn, typename DTypeOut,
+          typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     DTypeIn* q, paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, DTypeOut* o, float* tmp,
-    float rope_scale, float rope_theta, cudaStream_t stream) {
+    float* lse, float rope_scale, float rope_theta, cudaStream_t stream) {
   const float sm_scale = 1.f / std::sqrt(float(HEAD_DIM));
   const float rope_rcp_scale = 1.f / rope_scale;
   const float rope_rcp_theta = 1.f / rope_theta;
@@ -1145,15 +1157,16 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     // do not use cooperative kernel
     dim3 nblks(batch_size, num_kv_heads);
     dim3 nthrs(bdx, bdy, bdz);
-    auto kernel =
-        BatchDecodeWithPagedKVCacheKernel<false, ROTARY_MODE, PAGE_SIZE, num_stages_smem, vec_size,
-                                          bdx, bdy, bdz, page_storage, DTypeIn, DTypeOut, IdType>;
+    auto kernel = BatchDecodeWithPagedKVCacheKernel<RETURN_LSE, false, ROTARY_MODE, PAGE_SIZE,
+                                                    num_stages_smem, vec_size, bdx, bdy, bdz,
+                                                    page_storage, DTypeIn, DTypeOut, IdType>;
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     void* args[] = {(void*)&q,
                     (void*)&paged_kv,
                     (void*)&o,
                     (void*)&tmp,
+                    (void*)&lse,
                     (void*)&sm_scale,
                     (void*)&rope_rcp_scale,
                     (void*)&rope_rcp_theta};
@@ -1166,14 +1179,16 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
       abort();
     }
     auto cooperative_kernel =
-        BatchDecodeWithPagedKVCacheKernel<true, ROTARY_MODE, PAGE_SIZE, num_stages_smem, vec_size,
-                                          bdx, bdy, bdz, page_storage, DTypeIn, DTypeOut, IdType>;
+        BatchDecodeWithPagedKVCacheKernel<RETURN_LSE, true, ROTARY_MODE, PAGE_SIZE, num_stages_smem,
+                                          vec_size, bdx, bdy, bdz, page_storage, DTypeIn, DTypeOut,
+                                          IdType>;
     FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
         cooperative_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     void* args[] = {(void*)&q,
                     (void*)&paged_kv,
                     (void*)&o,
                     (void*)&tmp,
+                    (void*)&lse,
                     (void*)&sm_scale,
                     (void*)&rope_rcp_scale,
                     (void*)&rope_rcp_theta};
@@ -1196,6 +1211,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
  * \param paged_kv The paged kv cache data structure
  * \param o [batch_size, num_qo_heads, head_dim] The output matrix
  * \param tmp Used-allocated temporary buffer
+ * \param lse The logsumexp values.
  * \param num_qo_heads A integer indicates the number of heads of query and output
  * \param rotary_mode The rotary mode
  * \param rope_scale The scaling ratio used in RoPE Interpolation.
@@ -1206,7 +1222,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
 template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCache(DTypeIn* q,
                                         paged_kv_t<page_storage, DTypeIn, IdType> paged_kv,
-                                        DTypeOut* o, float* tmp, uint32_t num_qo_heads,
+                                        DTypeOut* o, float* tmp, float* lse, uint32_t num_qo_heads,
                                         RotaryMode rotary_mode = RotaryMode::kNone,
                                         float rope_scale = 1.f, float rope_theta = 1e4,
                                         cudaStream_t stream = nullptr) {
@@ -1219,17 +1235,21 @@ cudaError_t BatchDecodeWithPagedKVCache(DTypeIn* q,
     abort();
   }
 
-  SWITCH_GQA_GROUP_SIZE(
-      num_qo_heads / num_kv_heads, GROUP_SIZE,
-      {SWITCH_HEAD_DIM(
-          head_dim, HEAD_DIM,
-          {SWITCH_ROTARY_MODE(
-              rotary_mode, ROTARY_MODE, {SWITCH_PAGE_SIZE(paged_kv.page_size, PAGE_SIZE, {
-                return BatchDecodeWithPagedKVCacheDispatched<PAGE_SIZE, GROUP_SIZE, HEAD_DIM,
-                                                             page_storage, ROTARY_MODE, DTypeIn,
-                                                             DTypeOut, IdType>(
-                    q, paged_kv, o, tmp, rope_scale, rope_theta, stream);
-              })})})});
+  const bool return_lse = (lse != nullptr);
+
+  SWITCH_RETURN_LSE(
+      return_lse, RETURN_LSE,
+      {SWITCH_GQA_GROUP_SIZE(
+          num_qo_heads / num_kv_heads, GROUP_SIZE,
+          {SWITCH_HEAD_DIM(
+              head_dim, HEAD_DIM,
+              {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE,
+                                  {SWITCH_PAGE_SIZE(paged_kv.page_size, PAGE_SIZE, {
+                                    return BatchDecodeWithPagedKVCacheDispatched<
+                                        RETURN_LSE, PAGE_SIZE, GROUP_SIZE, HEAD_DIM, page_storage,
+                                        ROTARY_MODE, DTypeIn, DTypeOut, IdType>(
+                                        q, paged_kv, o, tmp, lse, rope_scale, rope_theta, stream);
+                                  })})})})});
 
   return cudaSuccess;
 }

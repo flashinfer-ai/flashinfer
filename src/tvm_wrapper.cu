@@ -351,8 +351,8 @@ void _FlashInferAttentionDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* page
             cudaError_t status =
                 BatchDecodeWithPagedKVCache<page_storage, dtype_in, dtype_out, dtype_idx>(
                     &buf_mgr_f16f16i32, static_cast<dtype_in*>(q_data->data), cache,
-                    static_cast<dtype_out*>(output->data), nhead_qo, RotaryMode(rotary_mode),
-                    rope_scale, rope_theta, 0);
+                    static_cast<dtype_out*>(output->data),
+                    /*lse=*/nullptr, nhead_qo, RotaryMode(rotary_mode), rope_scale, rope_theta, 0);
             if (status != cudaSuccess) {
               LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
             }

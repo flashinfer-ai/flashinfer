@@ -77,7 +77,7 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
     // first run to warm up
     cudaError_t status = BatchDecodeWithPagedKVCache<PageStorage::kIndices, T, T>(
         &buf_mgr, thrust::raw_pointer_cast(q.data()), paged_kv, thrust::raw_pointer_cast(o.data()),
-        num_qo_heads, rotary_mode);
+        /*lse=*/nullptr, num_qo_heads, rotary_mode);
     if (status != cudaSuccess) {
       state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
     }
@@ -86,7 +86,7 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
     state.exec([&](nvbench::launch&) {
       cudaError_t status = BatchDecodeWithPagedKVCache<PageStorage::kIndices, T, T>(
           &buf_mgr, thrust::raw_pointer_cast(q.data()), paged_kv,
-          thrust::raw_pointer_cast(o.data()), num_qo_heads, rotary_mode);
+          thrust::raw_pointer_cast(o.data()), /*lse=*/nullptr, num_qo_heads, rotary_mode);
       if (status != cudaSuccess) {
         state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
       }
@@ -95,7 +95,7 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
     state.exec([&](nvbench::launch&) {
       cudaError_t status = BatchDecodeWithPagedKVCache<PageStorage::kIndices, T, T>(
           thrust::raw_pointer_cast(q.data()), paged_kv, thrust::raw_pointer_cast(o.data()), nullptr,
-          num_qo_heads, rotary_mode);
+          /*lse=*/nullptr, num_qo_heads, rotary_mode);
       if (status != cudaSuccess) {
         state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
       }

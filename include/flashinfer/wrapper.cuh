@@ -89,7 +89,7 @@ class BatchDecodeBufferManager {
     if (paged_kv.layer_idx == 0) {
       FreeValue();
       uint32_t tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size;
-      BatchDecodeWithPagedKVCacheWorkEstimation<page_storage, DTypeIn, DTypeOut, IdType>(
+      BatchDecodeWithPagedKVCacheWorkEstimation<false, page_storage, DTypeIn, DTypeOut, IdType>(
           tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size, paged_kv, num_qo_heads,
           rotary_mode, stream_);
       value_.new_batch_size = new_batch_size;
@@ -140,6 +140,7 @@ class BatchDecodeBufferManager {
  * \param q The input tensor.
  * \param paged_kv The paged key-value tensor.
  * \param o The output tensor.
+ * \param lse The logsumexp values.
  * \param num_qo_heads The number of heads.
  * \param rotary_mode The rotary mode.
  * \param rope_scale The scale of rope.
@@ -151,9 +152,9 @@ class BatchDecodeBufferManager {
 template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCache(
     BatchDecodeBufferManager<page_storage, DTypeIn, DTypeOut, IdType>* buf_manager, DTypeIn* q,
-    paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, DTypeOut* o, uint32_t num_qo_heads,
-    RotaryMode rotary_mode = RotaryMode::kNone, float rope_scale = 1.f, float rope_theta = 1e4,
-    cudaStream_t stream = nullptr) {
+    paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, DTypeOut* o, float* lse,
+    uint32_t num_qo_heads, RotaryMode rotary_mode = RotaryMode::kNone, float rope_scale = 1.f,
+    float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   auto value = buf_manager->Get(paged_kv, num_qo_heads, rotary_mode);
   paged_kv_t<page_storage, DTypeIn, IdType> new_paged_kv = paged_kv;
   if (value.float_buffer != nullptr) {
@@ -163,8 +164,8 @@ cudaError_t BatchDecodeWithPagedKVCache(
     new_paged_kv.cooperative_aux_info = value.cooperative_aux_info();
   }
   return BatchDecodeWithPagedKVCache<page_storage, DTypeIn, DTypeOut, IdType>(
-      q, new_paged_kv, o, value.float_buffer, num_qo_heads, rotary_mode, rope_scale, rope_theta,
-      stream);
+      q, new_paged_kv, o, value.float_buffer, lse, num_qo_heads, rotary_mode, rope_scale,
+      rope_theta, stream);
 }
 
 }  // namespace flashinfer
