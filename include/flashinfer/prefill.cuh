@@ -399,7 +399,7 @@ __device__ __forceinline__ void compute_qk(smem_t* q_smem, uint32_t* q_smem_offs
 
 template <bool cooperative, bool causal, uint32_t group_size, uint32_t num_warps,
           uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z, typename DTypeQKAccum>
-__device__ __forceinline__ void mask_x(const uint32_t qo_idx_base, const uint32_t kv_idx_base,
+__device__ __forceinline__ void mask_s(const uint32_t qo_idx_base, const uint32_t kv_idx_base,
                                        const uint32_t qo_len, const uint32_t kv_len,
                                        const uint32_t chunk_end,
                                        DTypeQKAccum (*s_frag)[num_frags_z][8]) {
@@ -882,7 +882,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
 
     // apply mask
     if (iter >= mask_iteration) {
-      mask_x<cooperative, causal, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
+      mask_s<cooperative, causal, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
           qo_idx_base, kv_idx_base, qo_len, kv_len, chunk_end, s_frag);
     }
 
@@ -1071,7 +1071,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
 
     // apply mask
     if (iter >= mask_iteration) {
-      mask_x<cooperative, causal, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
+      mask_s<cooperative, causal, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
           qo_idx_base, kv_idx_base, qo_len, kv_len, kv_len, s_frag);
     }
 
