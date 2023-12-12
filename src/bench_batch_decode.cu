@@ -30,8 +30,6 @@ using namespace flashinfer;
 template <typename T>
 void bench_flashinfer_batch_decode(nvbench::state& state) {
   constexpr size_t head_dim = 128;
-  constexpr size_t num_layers = 3;
-  constexpr size_t layer_idx = 0;
   constexpr auto rotary_mode = RotaryMode::kNone;
   size_t seqlen = state.get_int64("seqlen");
   size_t batch_size = state.get_int64("batch_size");
@@ -53,15 +51,13 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
     kv_indptr_host.push_back(kv_indptr_host.back() + pages_per_seq);
     kv_last_page_len_host.push_back((seqlen - 1) % page_size + 1);
   }
-  thrust::device_vector<T> kv_data(num_pages * num_layers * 2 * num_kv_heads * page_size *
-                                   head_dim);
+  thrust::device_vector<T> kv_data(num_pages * 2 * num_kv_heads * page_size * head_dim);
   thrust::device_vector<int32_t> kv_indptr(kv_indptr_host);
   thrust::device_vector<int32_t> kv_indices(kv_indicies_host);
   thrust::device_vector<int32_t> kv_last_page_len(kv_last_page_len_host);
   paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv(
-      num_layers, layer_idx, num_kv_heads, page_size, head_dim, batch_size,
-      thrust::raw_pointer_cast(kv_data.data()), thrust::raw_pointer_cast(kv_indices.data()),
-      thrust::raw_pointer_cast(kv_indptr.data()),
+      num_kv_heads, page_size, head_dim, batch_size, thrust::raw_pointer_cast(kv_data.data()),
+      thrust::raw_pointer_cast(kv_indices.data()), thrust::raw_pointer_cast(kv_indptr.data()),
       thrust::raw_pointer_cast(kv_last_page_len.data()));
   // Allocate input data:
   thrust::device_vector<T> q(batch_size * num_qo_heads * head_dim);
@@ -74,15 +70,8 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
   BatchDecodeBufferManager<PageStorage::kIndices, T, T, int32_t> buf_mgr;
 
   if (cooperative) {
-    // first run to warm up
-    cudaError_t status = BatchDecodeWithPagedKVCache<PageStorage::kIndices, T, T>(
-        &buf_mgr, thrust::raw_pointer_cast(q.data()), paged_kv, thrust::raw_pointer_cast(o.data()),
-        /*lse=*/nullptr, num_qo_heads, rotary_mode);
-    if (status != cudaSuccess) {
-      state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
-    }
-    paged_kv.layer_idx = 1;
-
+    // begin forward
+    buf_mgr.begin_forward(paged_kv, num_qo_heads, rotary_mode);
     state.exec([&](nvbench::launch&) {
       cudaError_t status = BatchDecodeWithPagedKVCache<PageStorage::kIndices, T, T>(
           &buf_mgr, thrust::raw_pointer_cast(q.data()), paged_kv,
@@ -106,8 +95,6 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
 template <typename T>
 void bench_flashinfer_batch_decode_with_prefill(nvbench::state& state) {
   constexpr size_t head_dim = 128;
-  constexpr size_t num_layers = 1;
-  constexpr size_t layer_idx = 0;
   constexpr auto rotary_mode = RotaryMode::kNone;
   size_t seqlen = state.get_int64("seqlen");
   size_t batch_size = state.get_int64("batch_size");
@@ -128,15 +115,13 @@ void bench_flashinfer_batch_decode_with_prefill(nvbench::state& state) {
     kv_indptr_host.push_back(kv_indptr_host.back() + pages_per_seq);
     kv_last_page_len_host.push_back((seqlen - 1) % page_size + 1);
   }
-  thrust::device_vector<T> kv_data(num_pages * num_layers * 2 * num_kv_heads * page_size *
-                                   head_dim);
+  thrust::device_vector<T> kv_data(num_pages * 2 * num_kv_heads * page_size * head_dim);
   thrust::device_vector<int32_t> kv_indptr(kv_indptr_host);
   thrust::device_vector<int32_t> kv_indices(kv_indicies_host);
   thrust::device_vector<int32_t> kv_last_page_len(kv_last_page_len_host);
   paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv(
-      num_layers, layer_idx, num_kv_heads, page_size, head_dim, batch_size,
-      thrust::raw_pointer_cast(kv_data.data()), thrust::raw_pointer_cast(kv_indices.data()),
-      thrust::raw_pointer_cast(kv_indptr.data()),
+      num_kv_heads, page_size, head_dim, batch_size, thrust::raw_pointer_cast(kv_data.data()),
+      thrust::raw_pointer_cast(kv_indices.data()), thrust::raw_pointer_cast(kv_indptr.data()),
       thrust::raw_pointer_cast(kv_last_page_len.data()));
 
   // Allocate input data:

@@ -34,19 +34,17 @@ enum class PageStorage {
  * \tparam page_storage Whether to store indices or pointers of each active page
  * \tparam DType The data type of the key-value cache
  * \tparam IdType The index data type of the kv-cache
- * \note layout: [max_num_pages, num_layers, 2, num_heads, page_size, head_dim]
+ * \note layout: [nmax_num_pages, 2, num_heads, page_size, head_dim]
  */
 template <PageStorage page_storage, typename DType, typename IdType>
 struct paged_kv_t {
-  uint32_t num_layers;
-  uint32_t layer_idx;
   uint32_t num_heads;
   uint32_t page_size;
   uint32_t head_dim;
   uint32_t batch_size;
 
   // The flattened key-value cache, used when page_storage == kIndices
-  // [max_num_pages * num_layers * 2 * num_heads * page_size * head_dim]
+  // [max_num_pages * 2 * num_heads * page_size * head_dim]
   DType* data;
   // [nnz_pages] The page indices array, used when page_storage == kIndices
   IdType* indices;
@@ -80,9 +78,7 @@ struct paged_kv_t {
    * \brief Construct an empty paged key-value cache
    */
   __host__ __device__ __forceinline__ paged_kv_t()
-      : num_layers(0),
-        layer_idx(0),
-        num_heads(0),
+      : num_heads(0),
         page_size(0),
         head_dim(0),
         batch_size(0),
@@ -95,8 +91,6 @@ struct paged_kv_t {
 
   /*!
    * \brief Construct a paged key-value cache for non-cooperative kernels
-   * \param num_layers The number of layers
-   * \param layer_idx The index of the layer
    * \param num_heads The number of heads
    * \param page_size The size of each page
    * \param head_dim The dimension of each head
@@ -107,14 +101,11 @@ struct paged_kv_t {
    * \param last_page_len The offset of the last page for each request in the batch
    * \note This constructor should only be used when page_storage == kIndices
    */
-  __host__ __device__ __forceinline__ paged_kv_t(uint32_t num_layers, uint32_t layer_idx,
-                                                 uint32_t num_heads, uint32_t page_size,
+  __host__ __device__ __forceinline__ paged_kv_t(uint32_t num_heads, uint32_t page_size,
                                                  uint32_t head_dim, uint32_t batch_size,
                                                  DType* data, IdType* indices, IdType* indptr,
                                                  IdType* last_page_len)
-      : num_layers(num_layers),
-        layer_idx(layer_idx),
-        num_heads(num_heads),
+      : num_heads(num_heads),
         page_size(page_size),
         head_dim(head_dim),
         batch_size(batch_size),
@@ -126,8 +117,6 @@ struct paged_kv_t {
 
   /*!
    * \brief Construct a paged key-value cache for non-cooperative kernels
-   * \param num_layers The number of layers
-   * \param layer_idx The index of the layer
    * \param num_heads The number of heads
    * \param page_size The size of each page
    * \param head_dim The dimension of each head
@@ -137,14 +126,11 @@ struct paged_kv_t {
    * \param last_page_len The offset of the last page for each request in the batch
    * \note This constructor should only be used when page_storage == kIndices
    */
-  __host__ __device__ __forceinline__ paged_kv_t(uint32_t num_layers, uint32_t layer_idx,
-                                                 uint32_t num_heads, uint32_t page_size,
+  __host__ __device__ __forceinline__ paged_kv_t(uint32_t num_heads, uint32_t page_size,
                                                  uint32_t head_dim, uint32_t batch_size,
                                                  DType** ptrs, IdType* indptr,
                                                  IdType* last_page_len)
-      : num_layers(num_layers),
-        layer_idx(layer_idx),
-        num_heads(num_heads),
+      : num_heads(num_heads),
         page_size(page_size),
         head_dim(head_dim),
         batch_size(batch_size),
@@ -155,8 +141,6 @@ struct paged_kv_t {
 
   /*!
    * \brief Construct a paged key-value cache with auxiliary information for cooperative kernels
-   * \param num_layers The number of layers
-   * \param layer_idx The index of the layer
    * \param num_heads The number of heads
    * \param page_size The size of each page
    * \param head_dim The dimension of each head
@@ -168,15 +152,12 @@ struct paged_kv_t {
    * \param cooperative_aux_info The auxiliary information used in cooperative kernels
    * \note This constructor should only be used when page_storage == kIndices
    */
-  __host__ __device__ __forceinline__ paged_kv_t(uint32_t num_layers, uint32_t layer_idx,
-                                                 uint32_t num_heads, uint32_t page_size,
+  __host__ __device__ __forceinline__ paged_kv_t(uint32_t num_heads, uint32_t page_size,
                                                  uint32_t head_dim, uint32_t batch_size,
                                                  DType* data, IdType* indices, IdType* indptr,
                                                  IdType* last_page_len,
                                                  IdType* cooperative_aux_info)
-      : num_layers(num_layers),
-        layer_idx(layer_idx),
-        num_heads(num_heads),
+      : num_heads(num_heads),
         page_size(page_size),
         head_dim(head_dim),
         batch_size(batch_size),
@@ -188,8 +169,6 @@ struct paged_kv_t {
 
   /*!
    * \brief Construct a paged key-value cache with auxiliary information for cooperative kernels
-   * \param num_layers The number of layers
-   * \param layer_idx The index of the layer
    * \param num_heads The number of heads
    * \param page_size The size of each page
    * \param head_dim The dimension of each head
@@ -200,15 +179,12 @@ struct paged_kv_t {
    * \param cooperative_aux_info The auxiliary information used in cooperative kernels
    * \note This constructor should only be used when page_storage == kIndices
    */
-  __host__ __device__ __forceinline__ paged_kv_t(uint32_t num_layers, uint32_t layer_idx,
-                                                 uint32_t num_heads, uint32_t page_size,
+  __host__ __device__ __forceinline__ paged_kv_t(uint32_t num_heads, uint32_t page_size,
                                                  uint32_t head_dim, uint32_t batch_size,
                                                  DType** ptrs, IdType* indptr,
                                                  IdType* last_page_len,
                                                  IdType* cooperative_aux_info)
-      : num_layers(num_layers),
-        layer_idx(layer_idx),
-        num_heads(num_heads),
+      : num_heads(num_heads),
         page_size(page_size),
         head_dim(head_dim),
         batch_size(batch_size),
@@ -228,10 +204,7 @@ struct paged_kv_t {
   __host__ __device__ __forceinline__ size_t get_k_elem_offset(size_t page_idx, size_t head_idx,
                                                                size_t entry_idx,
                                                                size_t feat_idx) const {
-    return (((page_idx * num_layers + layer_idx) * 2 * num_heads + head_idx) * page_size +
-            entry_idx) *
-               head_dim +
-           feat_idx;
+    return ((page_idx * 2 * num_heads + head_idx) * page_size + entry_idx) * head_dim + feat_idx;
   }
 
   /*!
@@ -243,7 +216,7 @@ struct paged_kv_t {
   __host__ __device__ __forceinline__ size_t get_k_elem_offset_in_page(size_t head_idx,
                                                                        size_t entry_idx,
                                                                        size_t feat_idx) const {
-    return ((layer_idx * 2 * num_heads + head_idx) * page_size + entry_idx) * head_dim + feat_idx;
+    return (head_idx * page_size + entry_idx) * head_dim + feat_idx;
   }
 
   /*!
@@ -257,9 +230,7 @@ struct paged_kv_t {
   __host__ __device__ __forceinline__ size_t get_v_elem_offset(size_t page_idx, size_t head_idx,
                                                                size_t entry_idx,
                                                                size_t feat_idx) const {
-    return ((((page_idx * num_layers + layer_idx) * 2 + 1) * num_heads + head_idx) * page_size +
-            entry_idx) *
-               head_dim +
+    return (((page_idx * 2 + 1) * num_heads + head_idx) * page_size + entry_idx) * head_dim +
            feat_idx;
   }
 
@@ -272,8 +243,7 @@ struct paged_kv_t {
   __host__ __device__ __forceinline__ size_t get_v_elem_offset_in_page(size_t head_idx,
                                                                        size_t entry_idx,
                                                                        size_t feat_idx) const {
-    return (((layer_idx * 2 + 1) * num_heads + head_idx) * page_size + entry_idx) * head_dim +
-           feat_idx;
+    return ((num_heads + head_idx) * page_size + entry_idx) * head_dim + feat_idx;
   }
 
   __host__ __device__ __forceinline__ uint32_t kv_offset_delta() const {

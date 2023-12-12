@@ -172,7 +172,6 @@ void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data, DLTensor* pag
                                                  DLTensor* page_table_values,     //
                                                  DLTensor* last_page_len,         //
                                                  DLTensor* append_length_indptr,  //
-                                                 int64_t layer_id,                //
                                                  DLTensor* output,                //
                                                  int64_t rotary_mode = 0,         //
                                                  double rope_scale = 1.0f,        //
@@ -208,15 +207,12 @@ void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data, DLTensor* pag
         page_table_indptr->dtype.code == last_page_len->dtype.code &&
         page_table_indptr->dtype.code == append_length_indptr->dtype.code);
 
-  CHECK_EQ(pages->ndim, 6);
-  CHECK_LT(layer_id, pages->shape[1]);
-  CHECK_GE(layer_id, 0);
-  CHECK_EQ(pages->shape[2], 2);
-  int64_t nlayer = pages->shape[1];
-  int64_t nhead_kv = pages->shape[3];
+  CHECK_EQ(pages->ndim, 5);
+  CHECK_EQ(pages->shape[1], 2);
+  int64_t nhead_kv = pages->shape[2];
   int64_t nhead_qo = q_data->shape[2];
-  int64_t nfeat = pages->shape[5];
-  int64_t page_size = pages->shape[4];
+  int64_t nfeat = pages->shape[4];
+  int64_t page_size = pages->shape[3];
 
   CHECK_EQ(last_page_len->ndim, 1);
   int64_t num_total_seqs = last_page_len->shape[0];
@@ -244,8 +240,7 @@ void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data, DLTensor* pag
       {SWITCH_TVM_CUDA_DTYPE(
           output->dtype, dtype_out, {SWITCH_TVM_CUDA_IDTYPE(page_table_values->dtype, dtype_idx, {
             paged_kv_t<page_storage, dtype_in, dtype_idx> cache(
-                nlayer, layer_id, nhead_kv, page_size, nfeat, num_total_seqs,
-                static_cast<dtype_in*>(pages->data),
+                nhead_kv, page_size, nfeat, num_total_seqs, static_cast<dtype_in*>(pages->data),
                 static_cast<dtype_idx*>(page_table_values->data),
                 static_cast<dtype_idx*>(page_table_indptr->data),
                 static_cast<dtype_idx*>(last_page_len->data));
@@ -270,7 +265,6 @@ void _FlashInferAttentionDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* page
                                                 DLTensor* page_table_values,     //
                                                 DLTensor* last_page_len,         //
                                                 DLTensor* append_length_indptr,  //
-                                                int64_t layer_id,                //
                                                 DLTensor* output,                //
                                                 int64_t rotary_mode = 0,         //
                                                 double rope_scale = 1.0f,        //
@@ -306,15 +300,12 @@ void _FlashInferAttentionDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* page
         page_table_indptr->dtype.code == last_page_len->dtype.code &&
         page_table_indptr->dtype.code == append_length_indptr->dtype.code);
 
-  CHECK_EQ(pages->ndim, 6);
-  CHECK_LT(layer_id, pages->shape[1]);
-  CHECK_GE(layer_id, 0);
-  CHECK_EQ(pages->shape[2], 2);
-  int64_t nlayer = pages->shape[1];
-  int64_t nhead_kv = pages->shape[3];
+  CHECK_EQ(pages->ndim, 5);
+  CHECK_EQ(pages->shape[1], 2);
+  int64_t nhead_kv = pages->shape[2];
   int64_t nhead_qo = q_data->shape[2];
-  int64_t nfeat = pages->shape[5];
-  int64_t page_size = pages->shape[4];
+  int64_t nfeat = pages->shape[4];
+  int64_t page_size = pages->shape[3];
 
   CHECK_EQ(last_page_len->ndim, 1);
   int64_t num_total_seqs = last_page_len->shape[0];
@@ -343,8 +334,7 @@ void _FlashInferAttentionDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* page
       {SWITCH_TVM_CUDA_DTYPE(
           output->dtype, dtype_out, {SWITCH_TVM_CUDA_IDTYPE(page_table_values->dtype, dtype_idx, {
             paged_kv_t<page_storage, dtype_in, dtype_idx> cache(
-                nlayer, layer_id, nhead_kv, page_size, nfeat, num_total_seqs,
-                static_cast<dtype_in*>(pages->data),
+                nhead_kv, page_size, nfeat, num_total_seqs, static_cast<dtype_in*>(pages->data),
                 static_cast<dtype_idx*>(page_table_values->data),
                 static_cast<dtype_idx*>(page_table_indptr->data),
                 static_cast<dtype_idx*>(last_page_len->data));
@@ -359,14 +349,42 @@ void _FlashInferAttentionDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* page
           })})});
 }
 
+void _FlashInferAttentionDecodeWithPagedKVCacheBeginForward(
+    DLTensor* page_table_indptr, DLTensor* page_table_values, DLTensor* last_page_len,
+    int64_t num_qo_heads, int64_t num_kv_heads, int64_t rotary_mode = 0) {
+  constexpr PageStorage page_storage = PageStorage::kIndices;
+  using dtype_in = half;
+  using dtype_idx = int32_t;
+  paged_kv_t<page_storage, dtype_in, dtype_idx> cache;
+  cache.indptr = static_cast<dtype_idx*>(page_table_indptr->data);
+  cache.indices = static_cast<dtype_idx*>(page_table_values->data);
+  cache.last_page_len = static_cast<dtype_idx*>(last_page_len->data);
+  cache.num_heads = num_kv_heads;
+  buf_mgr_f16f16i32.begin_forward(cache, num_qo_heads, RotaryMode(rotary_mode));
+}
+
+void _FlashInferAttentionDecodeWithPagedKVCacheEndForward() { buf_mgr_f16f16i32.end_forward(); }
+
 TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionPrefillWithPagedKVCache,
                           _FlashInferAttentionPrefillWithPagedKVCache);
 
 TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionDecodeWithPagedKVCache,
                           _FlashInferAttentionDecodeWithPagedKVCache);
 
+TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionDecodeWithPagedKVCacheBeginForward,
+                          _FlashInferAttentionDecodeWithPagedKVCacheBeginForward);
+
+TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionDecodeWithPagedKVCacheEndForward,
+                          _FlashInferAttentionDecodeWithPagedKVCacheEndForward);
+
 TVM_REGISTER_GLOBAL("paged_kv_cache.attention_kernel_prefill")
     .set_body_typed(_FlashInferAttentionPrefillWithPagedKVCache);
 
 TVM_REGISTER_GLOBAL("paged_kv_cache.attention_kernel_decode")
     .set_body_typed(_FlashInferAttentionDecodeWithPagedKVCache);
+
+TVM_REGISTER_GLOBAL("paged_kv_cache.attention_kernel_decode_begin_forward")
+    .set_body_typed(_FlashInferAttentionDecodeWithPagedKVCacheBeginForward);
+
+TVM_REGISTER_GLOBAL("paged_kv_cache.attention_kernel_decode_end_forward")
+    .set_body_typed(_FlashInferAttentionDecodeWithPagedKVCacheEndForward);

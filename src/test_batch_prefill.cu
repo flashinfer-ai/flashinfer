@@ -28,9 +28,7 @@ void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t num_qo
                                               size_t page_size, size_t head_dim, bool causal,
                                               RotaryMode rotary_mode,
                                               bool allow_fp16_qk_reduction) {
-  uint32_t num_layers = 13;
   uint32_t batch_size = 9;
-  std::vector<std::vector<std::vector<T>>> keys, values;
   std::vector<int32_t> q_lens(batch_size), kv_lens(batch_size);
   utils::vec_randint_(q_lens, 1, 15);
   utils::vec_randint_(kv_lens, 15, 257);
@@ -43,36 +41,29 @@ void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t num_qo
   std::vector<int32_t> kv_indices;
   std::vector<int32_t> kv_last_page_len;
   size_t page_counter = 0;
-  for (uint32_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
-    std::vector<std::vector<T>> keys_layer, values_layer;
-    for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
-      size_t kv_len = kv_lens[request_idx];
-      size_t num_pages = (kv_len + page_size - 1) / page_size;
-      size_t last_page_len = (kv_len - 1) % page_size + 1;
-      std::vector<T> k(kv_len * num_kv_heads * head_dim), v(kv_len * num_kv_heads * head_dim);
-      utils::vec_normal_(k);
-      utils::vec_normal_(v);
-      keys_layer.push_back(k);
-      values_layer.push_back(v);
-      kv_last_page_len.push_back(last_page_len);
-      kv_indptr.push_back(kv_indptr.back() + num_pages);
-      for (size_t j = 0; j < num_pages; ++j) {
-        kv_indices.push_back(page_counter++);
-      }
+
+  std::vector<std::vector<T>> key, value;
+  for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
+    size_t kv_len = kv_lens[request_idx];
+    size_t num_pages = (kv_len + page_size - 1) / page_size;
+    size_t last_page_len = (kv_len - 1) % page_size + 1;
+    std::vector<T> k(kv_len * num_kv_heads * head_dim), v(kv_len * num_kv_heads * head_dim);
+    utils::vec_normal_(k);
+    utils::vec_normal_(v);
+    key.push_back(k);
+    value.push_back(v);
+    kv_last_page_len.push_back(last_page_len);
+    kv_indptr.push_back(kv_indptr.back() + num_pages);
+    for (size_t j = 0; j < num_pages; ++j) {
+      kv_indices.push_back(page_counter++);
     }
-    keys.push_back(keys_layer);
-    values.push_back(values_layer);
   }
 
-  kv_data.resize(page_counter * num_layers * 2 * num_kv_heads * page_size * head_dim);
+  kv_data.resize(page_counter * 2 * num_kv_heads * page_size * head_dim);
   flashinfer::paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv_cpu(
-      num_layers, 0, num_kv_heads, page_size, head_dim, batch_size, kv_data.data(),
-      kv_indices.data(), kv_indptr.data(), kv_last_page_len.data());
-  for (uint32_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
-    paged_kv_cpu.layer_idx = layer_idx;
-    cpu_reference::append_paged_kv_cache<T, int32_t>(paged_kv_cpu, keys[layer_idx],
-                                                     values[layer_idx], append_indptr);
-  }
+      num_kv_heads, page_size, head_dim, batch_size, kv_data.data(), kv_indices.data(),
+      kv_indptr.data(), kv_last_page_len.data());
+  cpu_reference::append_paged_kv_cache<T, int32_t>(paged_kv_cpu, key, value, append_indptr);
 
   // copy data to device
   thrust::device_vector<T> kv_data_device(kv_data);
@@ -87,56 +78,52 @@ void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t num_qo
   paged_kv.indptr = thrust::raw_pointer_cast(kv_indptr_device.data());
   paged_kv.last_page_len = thrust::raw_pointer_cast(kv_last_page_len_device.data());
 
-  for (uint32_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
-    paged_kv.layer_idx = layer_idx;
-    for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
-      // create one-hot queries
-      int32_t q_len = q_lens[request_idx], kv_len = kv_lens[request_idx];
-      std::vector<int32_t> q_indptr{0};
-      for (uint32_t i = 0; i < batch_size; ++i) {
-        q_indptr.push_back(i >= request_idx ? q_len : 0);
-      }
-      std::vector<T> q(q_len * num_qo_heads * head_dim);
-      utils::vec_normal_(q);
-
-      std::vector<T> o_ref = cpu_reference::single_mha<T, T>(
-          q, keys[layer_idx][request_idx], values[layer_idx][request_idx], q_len, kv_len,
-          num_qo_heads, num_kv_heads, head_dim, causal, QKVLayout::kNHD, rotary_mode);
-
-      thrust::device_vector<int32_t> q_indptr_device(q_indptr);
-      thrust::device_vector<T> q_device(q);
-      thrust::device_vector<T> o_device(q_len * num_qo_heads * head_dim);
-
-      for (uint32_t num_runs = 0; num_runs < 10; ++num_runs) {
-        auto status = BatchPrefillWithPagedKVCache<PageStorage::kIndices, T, T, int32_t>(
-            thrust::raw_pointer_cast(q_device.data()), paged_kv,
-            thrust::raw_pointer_cast(q_indptr_device.data()),
-            thrust::raw_pointer_cast(o_device.data()), /*tmp=*/nullptr,
-            /*lse=*/nullptr, num_qo_heads, causal, rotary_mode, allow_fp16_qk_reduction);
-        EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
-      }
-
-      thrust::host_vector<T> o_host(o_device);
-      size_t num_result_errors_atol_1e_3_rtol_1e_3 = 0;
-      bool nan_detected = false;
-      for (size_t i = 0; i < q_len * num_qo_heads * head_dim; ++i) {
-        if (std::isnan(float(o_host[i]))) {
-          nan_detected = true;
-        }
-        num_result_errors_atol_1e_3_rtol_1e_3 +=
-            (!utils::isclose(float(o_host[i]), float(o_ref[i]), 1e-3, 1e-3));
-      }
-      float result_accuracy = 1. - float(num_result_errors_atol_1e_3_rtol_1e_3) /
-                                       max(float(q_len * num_qo_heads * head_dim), 1.f);
-      std::cout << "layer_idx=" << layer_idx << ", request_idx=" << request_idx
-                << ", page_size=" << page_size << ", num_qo_heads=" << num_qo_heads
-                << ", num_kv_heads=" << num_kv_heads << ", q_len=" << q_len << ", kv_len=" << kv_len
-                << ", head_dim=" << head_dim << ", causal=" << causal
-                << ", rotary_mode=" << RotaryModeToString(rotary_mode)
-                << ", result_accuracy=" << result_accuracy << std::endl;
-      EXPECT_GT(result_accuracy, 0.99) << "Result correctness test failed.";
-      EXPECT_EQ(nan_detected, false) << "NaN detected in output.";
+  for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
+    // create one-hot queries
+    int32_t q_len = q_lens[request_idx], kv_len = kv_lens[request_idx];
+    std::vector<int32_t> q_indptr{0};
+    for (uint32_t i = 0; i < batch_size; ++i) {
+      q_indptr.push_back(i >= request_idx ? q_len : 0);
     }
+    std::vector<T> q(q_len * num_qo_heads * head_dim);
+    utils::vec_normal_(q);
+
+    std::vector<T> o_ref = cpu_reference::single_mha<T, T>(
+        q, key[request_idx], value[request_idx], q_len, kv_len, num_qo_heads, num_kv_heads,
+        head_dim, causal, QKVLayout::kNHD, rotary_mode);
+
+    thrust::device_vector<int32_t> q_indptr_device(q_indptr);
+    thrust::device_vector<T> q_device(q);
+    thrust::device_vector<T> o_device(q_len * num_qo_heads * head_dim);
+
+    for (uint32_t num_runs = 0; num_runs < 10; ++num_runs) {
+      auto status = BatchPrefillWithPagedKVCache<PageStorage::kIndices, T, T, int32_t>(
+          thrust::raw_pointer_cast(q_device.data()), paged_kv,
+          thrust::raw_pointer_cast(q_indptr_device.data()),
+          thrust::raw_pointer_cast(o_device.data()), /*tmp=*/nullptr,
+          /*lse=*/nullptr, num_qo_heads, causal, rotary_mode, allow_fp16_qk_reduction);
+      EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
+    }
+
+    thrust::host_vector<T> o_host(o_device);
+    size_t num_result_errors_atol_1e_3_rtol_1e_3 = 0;
+    bool nan_detected = false;
+    for (size_t i = 0; i < q_len * num_qo_heads * head_dim; ++i) {
+      if (std::isnan(float(o_host[i]))) {
+        nan_detected = true;
+      }
+      num_result_errors_atol_1e_3_rtol_1e_3 +=
+          (!utils::isclose(float(o_host[i]), float(o_ref[i]), 1e-3, 1e-3));
+    }
+    float result_accuracy = 1. - float(num_result_errors_atol_1e_3_rtol_1e_3) /
+                                     max(float(q_len * num_qo_heads * head_dim), 1.f);
+    std::cout << "request_idx=" << request_idx << ", page_size=" << page_size
+              << ", num_qo_heads=" << num_qo_heads << ", num_kv_heads=" << num_kv_heads
+              << ", q_len=" << q_len << ", kv_len=" << kv_len << ", head_dim=" << head_dim
+              << ", causal=" << causal << ", rotary_mode=" << RotaryModeToString(rotary_mode)
+              << ", result_accuracy=" << result_accuracy << std::endl;
+    EXPECT_GT(result_accuracy, 0.99) << "Result correctness test failed.";
+    EXPECT_EQ(nan_detected, false) << "NaN detected in output.";
   }
 }
 
@@ -145,9 +132,7 @@ void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads, size_t 
                                                     size_t page_size, size_t head_dim, bool causal,
                                                     RotaryMode rotary_mode,
                                                     bool allow_fp16_qk_reduction) {
-  uint32_t num_layers = 3;
   uint32_t batch_size = 7;
-  std::vector<std::vector<std::vector<T>>> keys, values;
   std::vector<int32_t> q_lens(batch_size);
   utils::vec_randint_(q_lens, 1, 512);
   std::vector<int32_t> kv_lens(q_lens);
@@ -164,36 +149,28 @@ void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads, size_t 
   std::vector<int32_t> kv_indices;
   std::vector<int32_t> kv_last_page_len;
   size_t page_counter = 0;
-  for (uint32_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
-    std::vector<std::vector<T>> keys_layer, values_layer;
-    for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
-      size_t kv_len = kv_lens[request_idx];
-      size_t num_pages = (kv_len + page_size - 1) / page_size;
-      size_t last_page_len = (kv_len - 1) % page_size + 1;
-      std::vector<T> k(kv_len * num_kv_heads * head_dim), v(kv_len * num_kv_heads * head_dim);
-      utils::vec_normal_(k);
-      utils::vec_normal_(v);
-      keys_layer.push_back(k);
-      values_layer.push_back(v);
-      kv_last_page_len.push_back(last_page_len);
-      kv_indptr.push_back(kv_indptr.back() + num_pages);
-      for (size_t j = 0; j < num_pages; ++j) {
-        kv_indices.push_back(page_counter++);
-      }
+  std::vector<std::vector<T>> key, value;
+  for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
+    size_t kv_len = kv_lens[request_idx];
+    size_t num_pages = (kv_len + page_size - 1) / page_size;
+    size_t last_page_len = (kv_len - 1) % page_size + 1;
+    std::vector<T> k(kv_len * num_kv_heads * head_dim), v(kv_len * num_kv_heads * head_dim);
+    utils::vec_normal_(k);
+    utils::vec_normal_(v);
+    key.push_back(k);
+    value.push_back(v);
+    kv_last_page_len.push_back(last_page_len);
+    kv_indptr.push_back(kv_indptr.back() + num_pages);
+    for (size_t j = 0; j < num_pages; ++j) {
+      kv_indices.push_back(page_counter++);
     }
-    keys.push_back(keys_layer);
-    values.push_back(values_layer);
   }
 
-  kv_data.resize(page_counter * num_layers * 2 * num_kv_heads * page_size * head_dim);
+  kv_data.resize(page_counter * 2 * num_kv_heads * page_size * head_dim);
   flashinfer::paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv_cpu(
-      num_layers, 0, num_kv_heads, page_size, head_dim, batch_size, kv_data.data(),
-      kv_indices.data(), kv_indptr.data(), kv_last_page_len.data());
-  for (uint32_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
-    paged_kv_cpu.layer_idx = layer_idx;
-    cpu_reference::append_paged_kv_cache<T, int32_t>(paged_kv_cpu, keys[layer_idx],
-                                                     values[layer_idx], append_indptr);
-  }
+      num_kv_heads, page_size, head_dim, batch_size, kv_data.data(), kv_indices.data(),
+      kv_indptr.data(), kv_last_page_len.data());
+  cpu_reference::append_paged_kv_cache<T, int32_t>(paged_kv_cpu, key, value, append_indptr);
 
   // copy data to device
   thrust::device_vector<T> kv_data_device(kv_data);
@@ -208,63 +185,59 @@ void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads, size_t 
   paged_kv.indptr = thrust::raw_pointer_cast(kv_indptr_device.data());
   paged_kv.last_page_len = thrust::raw_pointer_cast(kv_last_page_len_device.data());
 
-  for (uint32_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
-    paged_kv.layer_idx = layer_idx;
-    std::vector<std::vector<T>> q, o_ref;
-    for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
-      int32_t q_len = q_lens[request_idx];
-      std::vector<T> qi(q_len * num_qo_heads * head_dim);
-      utils::vec_normal_(qi);
-      q.push_back(qi);
-    }
-    for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
-      // create one-hot queries
-      int32_t q_len = q_lens[request_idx], kv_len = kv_lens[request_idx];
-      std::vector<T> o_ref_i = cpu_reference::single_mha<T, T>(
-          q[request_idx], keys[layer_idx][request_idx], values[layer_idx][request_idx], q_len,
-          kv_len, num_qo_heads, num_kv_heads, head_dim, causal, QKVLayout::kNHD, rotary_mode);
-      o_ref.push_back(o_ref_i);
-    }
-
-    std::vector<T> q_concat, o_concat_ref;
-    for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
-      q_concat.insert(q_concat.end(), q[request_idx].begin(), q[request_idx].end());
-      o_concat_ref.insert(o_concat_ref.end(), o_ref[request_idx].begin(), o_ref[request_idx].end());
-    }
-    thrust::device_vector<T> q_device(q_concat);
-
-    thrust::device_vector<int32_t> q_indptr_device(q_indptr);
-    thrust::device_vector<T> o_device(o_concat_ref.size());
-
-    for (uint32_t num_runs = 0; num_runs < 10; ++num_runs) {
-      auto status = BatchPrefillWithPagedKVCache<PageStorage::kIndices, T, T, int32_t>(
-          thrust::raw_pointer_cast(q_device.data()), paged_kv,
-          thrust::raw_pointer_cast(q_indptr_device.data()),
-          thrust::raw_pointer_cast(o_device.data()), /*tmp=*/nullptr,
-          /*lse=*/nullptr, num_qo_heads, causal, rotary_mode, allow_fp16_qk_reduction);
-      EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
-    }
-
-    thrust::host_vector<T> o_host(o_device);
-    size_t num_result_errors_atol_1e_3_rtol_1e_3 = 0;
-    bool nan_detected = false;
-    for (size_t i = 0; i < o_concat_ref.size(); ++i) {
-      if (std::isnan(float(o_host[i]))) {
-        nan_detected = true;
-      }
-      num_result_errors_atol_1e_3_rtol_1e_3 +=
-          (!utils::isclose(float(o_host[i]), float(o_concat_ref[i]), 1e-3, 1e-3));
-    }
-    float result_accuracy =
-        1. - float(num_result_errors_atol_1e_3_rtol_1e_3) / max(float(o_concat_ref.size()), 1.f);
-    std::cout << "layer_idx=" << layer_idx << ", page_size=" << page_size
-              << ", num_qo_heads=" << num_qo_heads << ", num_kv_heads=" << num_kv_heads
-              << ", head_dim=" << head_dim << ", causal=" << causal
-              << ", rotary_mode=" << RotaryModeToString(rotary_mode)
-              << ", result_accuracy=" << result_accuracy << std::endl;
-    EXPECT_GT(result_accuracy, 0.99) << "Result correctness test failed.";
-    EXPECT_EQ(nan_detected, false) << "NaN detected in output.";
+  std::vector<std::vector<T>> q, o_ref;
+  for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
+    int32_t q_len = q_lens[request_idx];
+    std::vector<T> qi(q_len * num_qo_heads * head_dim);
+    utils::vec_normal_(qi);
+    q.push_back(qi);
   }
+  for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
+    // create one-hot queries
+    int32_t q_len = q_lens[request_idx], kv_len = kv_lens[request_idx];
+    std::vector<T> o_ref_i = cpu_reference::single_mha<T, T>(
+        q[request_idx], key[request_idx], value[request_idx], q_len, kv_len, num_qo_heads,
+        num_kv_heads, head_dim, causal, QKVLayout::kNHD, rotary_mode);
+    o_ref.push_back(o_ref_i);
+  }
+
+  std::vector<T> q_concat, o_concat_ref;
+  for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
+    q_concat.insert(q_concat.end(), q[request_idx].begin(), q[request_idx].end());
+    o_concat_ref.insert(o_concat_ref.end(), o_ref[request_idx].begin(), o_ref[request_idx].end());
+  }
+  thrust::device_vector<T> q_device(q_concat);
+
+  thrust::device_vector<int32_t> q_indptr_device(q_indptr);
+  thrust::device_vector<T> o_device(o_concat_ref.size());
+
+  for (uint32_t num_runs = 0; num_runs < 10; ++num_runs) {
+    auto status = BatchPrefillWithPagedKVCache<PageStorage::kIndices, T, T, int32_t>(
+        thrust::raw_pointer_cast(q_device.data()), paged_kv,
+        thrust::raw_pointer_cast(q_indptr_device.data()), thrust::raw_pointer_cast(o_device.data()),
+        /*tmp=*/nullptr,
+        /*lse=*/nullptr, num_qo_heads, causal, rotary_mode, allow_fp16_qk_reduction);
+    EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
+  }
+
+  thrust::host_vector<T> o_host(o_device);
+  size_t num_result_errors_atol_1e_3_rtol_1e_3 = 0;
+  bool nan_detected = false;
+  for (size_t i = 0; i < o_concat_ref.size(); ++i) {
+    if (std::isnan(float(o_host[i]))) {
+      nan_detected = true;
+    }
+    num_result_errors_atol_1e_3_rtol_1e_3 +=
+        (!utils::isclose(float(o_host[i]), float(o_concat_ref[i]), 1e-3, 1e-3));
+  }
+  float result_accuracy =
+      1. - float(num_result_errors_atol_1e_3_rtol_1e_3) / max(float(o_concat_ref.size()), 1.f);
+  std::cout << "page_size=" << page_size << ", num_qo_heads=" << num_qo_heads
+            << ", num_kv_heads=" << num_kv_heads << ", head_dim=" << head_dim
+            << ", causal=" << causal << ", rotary_mode=" << RotaryModeToString(rotary_mode)
+            << ", result_accuracy=" << result_accuracy << std::endl;
+  EXPECT_GT(result_accuracy, 0.99) << "Result correctness test failed.";
+  EXPECT_EQ(nan_detected, false) << "NaN detected in output.";
 }
 
 template <typename T>
@@ -295,8 +268,8 @@ void _TestBatchPrefillKernelLongContextCorrectness(size_t num_kv_heads, size_t n
 
   kv_data.resize(page_counter * 1 * 2 * num_kv_heads * page_size * head_dim);
   flashinfer::paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv_cpu(
-      1, 0, num_kv_heads, page_size, head_dim, 1, kv_data.data(), kv_indices.data(),
-      kv_indptr.data(), kv_last_page_len.data());
+      num_kv_heads, page_size, head_dim, 1, kv_data.data(), kv_indices.data(), kv_indptr.data(),
+      kv_last_page_len.data());
   cpu_reference::append_paged_kv_cache<T, int32_t>(paged_kv_cpu, {k}, {v}, append_indptr);
 
   // copy data to device

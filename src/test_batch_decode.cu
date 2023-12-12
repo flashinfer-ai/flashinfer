@@ -69,13 +69,13 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
       kv_indices.push_back(page_counter++);
     }
   }
-  kv_data.resize(page_counter * 1 * 2 * num_kv_heads * page_size * head_dim);
+  kv_data.resize(page_counter * 2 * num_kv_heads * page_size * head_dim);
   utils::vec_zero_(kv_data);
   assert(q.size() == batch_size * num_qo_heads * head_dim);
   assert(o_ref.size() == batch_size * num_qo_heads * head_dim);
 
   flashinfer::paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv_cpu(
-      1, 0, num_kv_heads, page_size, head_dim, batch_size, kv_data.data(), kv_indices.data(),
+      num_kv_heads, page_size, head_dim, batch_size, kv_data.data(), kv_indices.data(),
       kv_indptr.data(), kv_last_page_len.data());
   cpu_reference::append_paged_kv_cache<T, int32_t>(paged_kv_cpu, keys, values, append_indptr);
 
@@ -89,12 +89,13 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
 
   // create paged_kv object
   flashinfer::paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv(
-      1, 0, num_kv_heads, page_size, head_dim, batch_size,
+      num_kv_heads, page_size, head_dim, batch_size,
       thrust::raw_pointer_cast(kv_data_device.data()),
       thrust::raw_pointer_cast(kv_indices_device.data()),
       thrust::raw_pointer_cast(kv_indptr_device.data()),
       thrust::raw_pointer_cast(kv_last_page_len_device.data()));
   flashinfer::BatchDecodeBufferManager<PageStorage::kIndices, T, T, int32_t> buf_mgr;
+  buf_mgr.begin_forward(paged_kv, num_qo_heads, rotary_mode);
 
   if (!cooperative) {
     // use non-cooperative kernel
