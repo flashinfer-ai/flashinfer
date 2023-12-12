@@ -27,7 +27,7 @@
 
 namespace flashinfer {
 
-#define FLASHINFER_INLINE inline __attribute__((always_inline)) __device__ __host__
+#define FLASHINFER_INLINE inline __attribute__((always_inline)) __device__
 
 template <typename float_t, size_t vec_size>
 struct vec_t {
