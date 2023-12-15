@@ -30,6 +30,15 @@
     }                                   \
   }
 
+#define SWITCH_SPLIT_QO_INDPTR(split_qo_indptr, SPLIT_QO_INDPTR, ...) \
+  if (split_qo_indptr) {                                              \
+    constexpr bool SPLIT_QO_INDPTR = true;                            \
+    __VA_ARGS__                                                       \
+  } else {                                                            \
+    constexpr bool SPLIT_QO_INDPTR = false;                           \
+    __VA_ARGS__                                                       \
+  }
+
 #define SWITCH_RETURN_LSE(return_lse, RETURN_LSE, ...) \
   if (return_lse) {                                    \
     constexpr bool RETURN_LSE = true;                  \
