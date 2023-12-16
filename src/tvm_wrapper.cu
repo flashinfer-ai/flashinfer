@@ -79,22 +79,24 @@ int _FlashInferSinglePrefillWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, b
 
   NDArray tmp = _GetTemporaryBufferOnGPU(q->device);
 
-  CHECK_EQ(q->ndim, 3);
-  size_t qo_len = q->shape[0];
-  size_t num_qo_heads = q->shape[1];
-  size_t head_dim = q->shape[2];
-  CHECK_EQ(k->ndim, 3);
-  size_t kv_len = k->shape[0];
-  size_t num_kv_heads = k->shape[1];
-  CHECK_EQ(k->shape[2], head_dim);
-  CHECK_EQ(v->ndim, 3);
-  CHECK_EQ(v->shape[0], kv_len);
-  CHECK_EQ(v->shape[1], num_kv_heads);
-  CHECK_EQ(v->shape[2], head_dim);
-  CHECK_EQ(o->ndim, 3);
-  CHECK_EQ(o->shape[0], qo_len);
-  CHECK_EQ(o->shape[1], num_qo_heads);
-  CHECK_EQ(o->shape[2], head_dim);
+  CHECK_GE(q->ndim, 3);
+  size_t qo_len = q->shape[q->ndim - 3];
+  size_t num_qo_heads = q->shape[q->ndim - 2];
+  size_t head_dim = q->shape[q->ndim - 1];
+
+  CHECK_GE(k->ndim, 3);
+  size_t kv_len = k->shape[k->ndim - 3];
+  size_t num_kv_heads = k->shape[k->ndim - 2];
+  CHECK_EQ(head_dim, k->shape[k->ndim - 1]);
+
+  CHECK_GE(v->ndim, 3);
+  CHECK_EQ(kv_len, v->shape[v->ndim - 3]);
+  CHECK_EQ(num_kv_heads, v->shape[v->ndim - 2]);
+  CHECK_EQ(head_dim, v->shape[v->ndim - 1]);
+
+  CHECK_GE(o->ndim, 2);
+  CHECK_EQ(qo_len, o->shape[o->ndim - 2]);
+  CHECK_EQ(num_qo_heads * head_dim, o->shape[o->ndim - 1]);
 
   CHECK(q->dtype.lanes == 1 && k->dtype.lanes == 1 && v->dtype.lanes == 1);
   CHECK(q->dtype.bits == k->dtype.bits && q->dtype.code == k->dtype.code);
@@ -132,20 +134,22 @@ int _FlashInferSingleDecodeWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, in
 
   NDArray tmp = _GetTemporaryBufferOnGPU(q->device);
 
-  CHECK_EQ(q->ndim, 2);
-  size_t num_qo_heads = q->shape[0];
-  size_t head_dim = q->shape[1];
-  CHECK_EQ(k->ndim, 3);
-  size_t num_kv_heads = k->shape[1];
-  size_t seq_len = k->shape[0];
-  CHECK_EQ(k->shape[2], head_dim);
-  CHECK_EQ(v->ndim, 3);
-  CHECK_EQ(v->shape[0], seq_len);
-  CHECK_EQ(v->shape[1], num_kv_heads);
-  CHECK_EQ(v->shape[2], head_dim);
-  CHECK_EQ(o->ndim, 2);
-  CHECK_EQ(o->shape[0], num_qo_heads);
-  CHECK_EQ(o->shape[1], head_dim);
+  CHECK_GE(q->ndim, 2);
+  size_t num_qo_heads = q->shape[q->ndim - 2];
+  size_t head_dim = q->shape[q->ndim - 1];
+
+  CHECK_GE(k->ndim, 3);
+  size_t seq_len = k->shape[k->ndim - 3];
+  size_t num_kv_heads = k->shape[k->ndim - 2];
+  CHECK_EQ(head_dim, k->shape[k->ndim - 1]);
+
+  CHECK_GE(v->ndim, 3);
+  CHECK_EQ(seq_len, v->shape[v->ndim - 3]);
+  CHECK_EQ(num_kv_heads, v->shape[v->ndim - 2]);
+  CHECK_EQ(head_dim, v->shape[v->ndim - 1]);
+
+  CHECK_GE(o->ndim, 1);
+  CHECK_EQ(num_qo_heads * head_dim, o->shape[o->ndim - 1]);
 
   CHECK(q->dtype.lanes == 1 && k->dtype.lanes == 1 && v->dtype.lanes == 1);
   CHECK(q->dtype.bits == k->dtype.bits && q->dtype.code == k->dtype.code);
