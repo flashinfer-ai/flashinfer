@@ -29,7 +29,7 @@ namespace flashinfer {
  * \tparam vec_size The vector size used in the kernel.
  * \tparam DTypeIn The data type of v_a and v_b.
  * \tparam DTypeOut The data type of v_merged.
- * \param s_a The partial v of index set A. (n, h, d)
+ * \param v_a The partial v of index set A. (n, h, d)
  * \param s_a The logsumexp value of index set A. (n, h)
  * \param v_b The partial v of index set B. (n, h, d)
  * \param s_b The logsumexp value of index set B. (n, h)

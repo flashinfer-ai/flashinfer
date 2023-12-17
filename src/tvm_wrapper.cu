@@ -48,11 +48,14 @@ Array<NDArray> _CreateTemporaryBufferPerGPU() {
   auto* pf = tvm::runtime::Registry::Get("runtime.GetCudaDeviceCount");
   ICHECK(pf != nullptr);
   int n_gpus = (*pf)();
+  int device_id = -1;
+  cudaGetDevice(&device_id);
   Array<NDArray> buffers;
   for (int i = 0; i < n_gpus; ++i) {
     buffers.push_back(tvm::runtime::NDArray::Empty(ShapeTuple({4096 * 4096}), DataType::Float(16),
                                                    tvm::Device{kDLCUDA, i}));
   }
+  cudaSetDevice(device_id);
   return buffers;
 }
 
@@ -79,22 +82,24 @@ int _FlashInferSinglePrefillWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, b
 
   NDArray tmp = _GetTemporaryBufferOnGPU(q->device);
 
-  CHECK_EQ(q->ndim, 3);
-  size_t qo_len = q->shape[0];
-  size_t num_qo_heads = q->shape[1];
-  size_t head_dim = q->shape[2];
-  CHECK_EQ(k->ndim, 3);
-  size_t kv_len = k->shape[0];
-  size_t num_kv_heads = k->shape[1];
-  CHECK_EQ(k->shape[2], head_dim);
-  CHECK_EQ(v->ndim, 3);
-  CHECK_EQ(v->shape[0], kv_len);
-  CHECK_EQ(v->shape[1], num_kv_heads);
-  CHECK_EQ(v->shape[2], head_dim);
-  CHECK_EQ(o->ndim, 3);
-  CHECK_EQ(o->shape[0], qo_len);
-  CHECK_EQ(o->shape[1], num_qo_heads);
-  CHECK_EQ(o->shape[2], head_dim);
+  CHECK_GE(q->ndim, 3);
+  size_t qo_len = q->shape[q->ndim - 3];
+  size_t num_qo_heads = q->shape[q->ndim - 2];
+  size_t head_dim = q->shape[q->ndim - 1];
+
+  CHECK_GE(k->ndim, 3);
+  size_t kv_len = k->shape[k->ndim - 3];
+  size_t num_kv_heads = k->shape[k->ndim - 2];
+  CHECK_EQ(head_dim, k->shape[k->ndim - 1]);
+
+  CHECK_GE(v->ndim, 3);
+  CHECK_EQ(kv_len, v->shape[v->ndim - 3]);
+  CHECK_EQ(num_kv_heads, v->shape[v->ndim - 2]);
+  CHECK_EQ(head_dim, v->shape[v->ndim - 1]);
+
+  CHECK_GE(o->ndim, 2);
+  CHECK_EQ(qo_len, o->shape[o->ndim - 2]);
+  CHECK_EQ(num_qo_heads * head_dim, o->shape[o->ndim - 1]);
 
   CHECK(q->dtype.lanes == 1 && k->dtype.lanes == 1 && v->dtype.lanes == 1);
   CHECK(q->dtype.bits == k->dtype.bits && q->dtype.code == k->dtype.code);
@@ -132,20 +137,22 @@ int _FlashInferSingleDecodeWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, in
 
   NDArray tmp = _GetTemporaryBufferOnGPU(q->device);
 
-  CHECK_EQ(q->ndim, 2);
-  size_t num_qo_heads = q->shape[0];
-  size_t head_dim = q->shape[1];
-  CHECK_EQ(k->ndim, 3);
-  size_t num_kv_heads = k->shape[1];
-  size_t seq_len = k->shape[0];
-  CHECK_EQ(k->shape[2], head_dim);
-  CHECK_EQ(v->ndim, 3);
-  CHECK_EQ(v->shape[0], seq_len);
-  CHECK_EQ(v->shape[1], num_kv_heads);
-  CHECK_EQ(v->shape[2], head_dim);
-  CHECK_EQ(o->ndim, 2);
-  CHECK_EQ(o->shape[0], num_qo_heads);
-  CHECK_EQ(o->shape[1], head_dim);
+  CHECK_GE(q->ndim, 2);
+  size_t num_qo_heads = q->shape[q->ndim - 2];
+  size_t head_dim = q->shape[q->ndim - 1];
+
+  CHECK_GE(k->ndim, 3);
+  size_t seq_len = k->shape[k->ndim - 3];
+  size_t num_kv_heads = k->shape[k->ndim - 2];
+  CHECK_EQ(head_dim, k->shape[k->ndim - 1]);
+
+  CHECK_GE(v->ndim, 3);
+  CHECK_EQ(seq_len, v->shape[v->ndim - 3]);
+  CHECK_EQ(num_kv_heads, v->shape[v->ndim - 2]);
+  CHECK_EQ(head_dim, v->shape[v->ndim - 1]);
+
+  CHECK_GE(o->ndim, 1);
+  CHECK_EQ(num_qo_heads * head_dim, o->shape[o->ndim - 1]);
 
   CHECK(q->dtype.lanes == 1 && k->dtype.lanes == 1 && v->dtype.lanes == 1);
   CHECK(q->dtype.bits == k->dtype.bits && q->dtype.code == k->dtype.code);
@@ -365,6 +372,49 @@ void _FlashInferAttentionDecodeWithPagedKVCacheBeginForward(
 
 void _FlashInferAttentionDecodeWithPagedKVCacheEndForward() { buf_mgr_f16f16i32.end_forward(); }
 
+void _FlashInferMergeState(DLTensor* v_a, DLTensor* s_a, DLTensor* v_b, DLTensor* s_b,
+                           DLTensor* v_merged) {
+  CHECK_EQ(v_a->device.device_type, kDLCUDA) << "The device of v_a must be CUDA.";
+  CHECK_EQ(s_a->device.device_type, kDLCUDA) << "The device of s_a must be CUDA.";
+  CHECK_EQ(v_b->device.device_type, kDLCUDA) << "The device of v_b must be CUDA.";
+  CHECK_EQ(s_b->device.device_type, kDLCUDA) << "The device of s_b must be CUDA.";
+  CHECK_EQ(v_merged->device.device_type, kDLCUDA) << "The device of v_merged must be CUDA.";
+  int32_t dev_id = v_a->device.device_id;
+  CHECK_EQ(s_a->device.device_id, dev_id);
+  CHECK_EQ(v_b->device.device_id, dev_id);
+  CHECK_EQ(s_b->device.device_id, dev_id);
+  CHECK_EQ(v_merged->device.device_id, dev_id);
+
+  CHECK(v_a->dtype.lanes == 1 && s_a->dtype.lanes == 1 && v_b->dtype.lanes == 1 &&
+        s_b->dtype.lanes == 1 && v_merged->dtype.lanes == 1);
+  CHECK(v_a->dtype.bits == v_b->dtype.bits && v_a->dtype.code == v_b->dtype.code);
+  CHECK(s_a->dtype.bits == 32 && s_a->dtype.code == kDLFloat);
+  CHECK(s_b->dtype.bits == 32 && s_b->dtype.code == kDLFloat);
+
+  CHECK_EQ(v_a->ndim, 3);
+  int64_t batch_size = v_a->shape[0];
+  int64_t num_heads = v_a->shape[1];
+  int64_t head_dim = v_a->shape[2];
+  CHECK_EQ(s_a->shape[0], batch_size);
+  CHECK_EQ(s_a->shape[1], num_heads);
+  CHECK_EQ(v_b->shape[0], batch_size);
+  CHECK_EQ(v_b->shape[1], num_heads);
+  CHECK_EQ(v_b->shape[2], head_dim);
+  CHECK_EQ(s_b->shape[0], batch_size);
+  CHECK_EQ(s_b->shape[1], num_heads);
+
+  SWITCH_TVM_CUDA_DTYPE(
+      v_a->dtype, dtype_in, {SWITCH_TVM_CUDA_DTYPE(v_merged->dtype, dtype_out, {
+        cudaError_t status =
+            MergeState(static_cast<dtype_in*>(v_a->data), static_cast<float*>(s_a->data),
+                       static_cast<dtype_in*>(v_b->data), static_cast<float*>(s_b->data),
+                       static_cast<dtype_out*>(v_merged->data), batch_size, num_heads, head_dim);
+        if (status != cudaSuccess) {
+          LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
+        }
+      })});
+}
+
 TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionPrefillWithPagedKVCache,
                           _FlashInferAttentionPrefillWithPagedKVCache);
 
@@ -377,6 +427,8 @@ TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionDecodeWithPagedKVCacheBeginForward,
 TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionDecodeWithPagedKVCacheEndForward,
                           _FlashInferAttentionDecodeWithPagedKVCacheEndForward);
 
+TVM_DLL_EXPORT_TYPED_FUNC(FlashInferMergeState, _FlashInferMergeState);
+
 TVM_REGISTER_GLOBAL("paged_kv_cache.attention_kernel_prefill")
     .set_body_typed(_FlashInferAttentionPrefillWithPagedKVCache);
 
@@ -388,3 +440,5 @@ TVM_REGISTER_GLOBAL("paged_kv_cache.attention_kernel_decode_begin_forward")
 
 TVM_REGISTER_GLOBAL("paged_kv_cache.attention_kernel_decode_end_forward")
     .set_body_typed(_FlashInferAttentionDecodeWithPagedKVCacheEndForward);
+
+TVM_REGISTER_GLOBAL("flashinfer.merge_state").set_body_typed(_FlashInferMergeState);

@@ -940,10 +940,10 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
   }
 }
 
-template <bool return_lse, uint32_t group_size, uint32_t page_size, bool causal,
-          RotaryMode rotary_mode, uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z,
-          uint32_t num_warps, PageStorage page_storage, typename DTypeIn, typename DTypeQKAccum,
-          typename DTypeOut, typename IdType>
+template <bool return_lse, bool split_qo_indptr, uint32_t group_size, uint32_t page_size,
+          bool causal, RotaryMode rotary_mode, uint32_t num_frags_x, uint32_t num_frags_y,
+          uint32_t num_frags_z, uint32_t num_warps, PageStorage page_storage, typename DTypeIn,
+          typename DTypeQKAccum, typename DTypeOut, typename IdType>
 __global__ void BatchPrefillWithPagedKVCacheKernel(
     IdType* __restrict__ request_indices, IdType* __restrict__ tile_indices,
     DTypeIn* __restrict__ q, paged_kv_t<page_storage, DTypeIn, IdType> paged_kv,
@@ -959,7 +959,8 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
 
   const uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y, kv_head_idx = blockIdx.z;
   const uint32_t num_kv_heads = gridDim.z, num_qo_heads = num_kv_heads * group_size;
-  const uint32_t request_idx = request_indices[bx], tile_idx = tile_indices[bx];
+  const uint32_t request_idx = split_qo_indptr ? request_indices[bx] : bx,
+                 tile_idx = split_qo_indptr ? tile_indices[bx] : 0;
   constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
   const uint32_t qo_len = qo_indptr[request_idx + 1] - qo_indptr[request_idx],
                  kv_len = (paged_kv.indptr[request_idx + 1] - paged_kv.indptr[request_idx] - 1) *
@@ -1513,7 +1514,12 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
     std::vector<IdType> request_indices, tile_indices;
     uint32_t num_blks_x = 0;
+    bool split_qo_indptr = false;
     for (uint32_t i = 0; i < batch_size; ++i) {
+      if ((qo_indptr_h[i + 1] - qo_indptr_h[i]) * group_size > num_rows_per_cta ||
+          qo_indptr_h[i + 1] == qo_indptr_h[i]) {
+        split_qo_indptr = true;
+      }
       for (uint32_t j = qo_indptr_h[i] * group_size; j < qo_indptr_h[i + 1] * group_size;
            j += num_rows_per_cta) {
         request_indices.push_back(i);
@@ -1523,12 +1529,14 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     }
 
     IdType *request_indices_d = nullptr, *tile_indices_d = nullptr;
-    cudaMallocAsync(&request_indices_d, sizeof(IdType) * request_indices.size(), stream);
-    cudaMallocAsync(&tile_indices_d, sizeof(IdType) * tile_indices.size(), stream);
-    cudaMemcpyAsync(request_indices_d, request_indices.data(),
-                    sizeof(IdType) * request_indices.size(), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(tile_indices_d, tile_indices.data(), sizeof(IdType) * tile_indices.size(),
-                    cudaMemcpyHostToDevice, stream);
+    if (split_qo_indptr) {
+      cudaMallocAsync(&request_indices_d, sizeof(IdType) * request_indices.size(), stream);
+      cudaMallocAsync(&tile_indices_d, sizeof(IdType) * tile_indices.size(), stream);
+      cudaMemcpyAsync(request_indices_d, request_indices.data(),
+                      sizeof(IdType) * request_indices.size(), cudaMemcpyHostToDevice, stream);
+      cudaMemcpyAsync(tile_indices_d, tile_indices.data(), sizeof(IdType) * tile_indices.size(),
+                      cudaMemcpyHostToDevice, stream);
+    }
 
     dim3 nblks(num_blks_x, 1, num_kv_heads);
     dim3 nthrs(32, num_warps);
@@ -1539,26 +1547,34 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
                                   half, float>::type;
 
     constexpr uint32_t num_frags_z = 2;
-    auto kernel =
-        BatchPrefillWithPagedKVCacheKernel<RETURN_LSE, GROUP_SIZE, PAGE_SIZE, CAUSAL, ROTARY_MODE,
-                                           num_frags_x, num_frags_y, num_frags_z, num_warps,
-                                           page_storage, DTypeIn, DTypeQKAccum, DTypeOut, IdType>;
-    uint32_t smem_size =
-        (num_frags_x * num_warps + num_frags_z * 2) * 16 * HEAD_DIM * sizeof(DTypeIn);
-    FLASHINFER_CUDA_CALL(
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    void* args[] = {(void*)&request_indices_d,
-                    (void*)&tile_indices_d,
-                    (void*)&q,
-                    (void*)&paged_kv,
-                    (void*)&qo_indptr,
-                    (void*)&o,
-                    (void*)&tmp,
-                    (void*)&lse,
-                    (void*)&sm_scale,
-                    (void*)&log2_rope_rcp_scale,
-                    (void*)&log2_rope_rcp_theta};
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+    SWITCH_SPLIT_QO_INDPTR(split_qo_indptr, SPLIT_QO_INDPTR, {
+      auto kernel =
+          BatchPrefillWithPagedKVCacheKernel<RETURN_LSE, SPLIT_QO_INDPTR, GROUP_SIZE, PAGE_SIZE,
+                                             CAUSAL, ROTARY_MODE, num_frags_x, num_frags_y,
+                                             num_frags_z, num_warps, page_storage, DTypeIn,
+                                             DTypeQKAccum, DTypeOut, IdType>;
+      uint32_t smem_size =
+          (num_frags_x * num_warps + num_frags_z * 2) * 16 * HEAD_DIM * sizeof(DTypeIn);
+      FLASHINFER_CUDA_CALL(
+          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      void* args[] = {(void*)&request_indices_d,
+                      (void*)&tile_indices_d,
+                      (void*)&q,
+                      (void*)&paged_kv,
+                      (void*)&qo_indptr,
+                      (void*)&o,
+                      (void*)&tmp,
+                      (void*)&lse,
+                      (void*)&sm_scale,
+                      (void*)&log2_rope_rcp_scale,
+                      (void*)&log2_rope_rcp_theta};
+      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+    });
+
+    if (split_qo_indptr) {
+      FLASHINFER_CUDA_CALL(cudaFreeAsync(request_indices_d, stream));
+      FLASHINFER_CUDA_CALL(cudaFreeAsync(tile_indices_d, stream));
+    }
   });
   return cudaSuccess;
 }
