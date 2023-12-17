@@ -963,8 +963,6 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
   constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
   const uint32_t qo_len = qo_indptr[request_idx + 1] - qo_indptr[request_idx],
                  kv_len = kv_indptr[request_idx + 1] - kv_indptr[request_idx];
-  const uint32_t chunk_start = 0;
-  const uint32_t chunk_end = kv_len;
   const tensor_info_t<layout, group_size> qkv_info(qo_len, kv_len, num_kv_heads, head_dim);
   const uint32_t qo_upper_bound = min(qo_len, (tile_idx + 1) * (num_rows_per_cta / group_size));
 
@@ -1025,20 +1023,16 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
   }
 
   const uint32_t num_iterations =
-      ((causal ? min(chunk_end - chunk_start,
-                     sub_if_greater_or_zero(
-                         kv_len - qo_len + ((bx + 1) * num_frags_x * num_warps) * (16 / group_size),
-                         chunk_start))
-               : chunk_end - chunk_start) +
+      ((causal ? min(kv_len, kv_len - qo_len +
+                                 ((tile_idx + 1) * num_frags_x * num_warps) * (16 / group_size))
+               : kv_len) +
        16 * num_frags_z - 1) /
       (16 * num_frags_z);
 
   const uint32_t mask_iteration =
-      (causal ? min(chunk_end - chunk_start,
-                    sub_if_greater_or_zero(
-                        kv_len + bx * num_warps * num_frags_x * (16 / group_size) - qo_len,
-                        chunk_start))
-              : (chunk_end - chunk_start)) /
+      (causal
+           ? min(kv_len + tile_idx * num_warps * num_frags_x * (16 / group_size) - qo_len, kv_len)
+           : kv_len) /
       (16 * num_frags_z);
 
   smem_t k_smem(smem + (num_warps * num_frags_x) * 16 * head_dim * sizeof(DTypeIn)),
@@ -1059,10 +1053,10 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
                                       kv_head_idx, (tx % 8) * cell_capacity<DTypeIn>());
 
   produce_kv<SharedMemFillMode::kNoFill, num_warps, num_frags_y, num_frags_z>(
-      k_smem, &kv_smem_offset_w, &k_ptr, kv_n_stride, kv_idx_base, chunk_end);
+      k_smem, &kv_smem_offset_w, &k_ptr, kv_n_stride, kv_idx_base, kv_len);
   cp_async::commit_group();
   produce_kv<SharedMemFillMode::kFillZero, num_warps, num_frags_y, num_frags_z>(
-      v_smem, &kv_smem_offset_w, &v_ptr, kv_n_stride, kv_idx_base, chunk_end);
+      v_smem, &kv_smem_offset_w, &v_ptr, kv_n_stride, kv_idx_base, kv_len);
   cp_async::commit_group();
 
 #pragma unroll 1
@@ -1083,7 +1077,7 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
     // apply mask
     if (iter >= mask_iteration) {
       mask_s<cooperative, causal, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
-          qo_idx_base, kv_idx_base, qo_len, kv_len, chunk_end, s_frag);
+          qo_idx_base, kv_idx_base, qo_len, kv_len, kv_len, s_frag);
     }
 
     // compute m,d states in online softmax
@@ -1092,7 +1086,7 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
     block.sync();
     kv_idx_base += 16 * num_frags_z;
     produce_kv<SharedMemFillMode::kNoFill, num_warps, num_frags_y, num_frags_z>(
-        k_smem, &kv_smem_offset_w, &k_ptr, kv_n_stride, kv_idx_base, chunk_end);
+        k_smem, &kv_smem_offset_w, &k_ptr, kv_n_stride, kv_idx_base, kv_len);
     cp_async::commit_group();
     cp_async::wait_group<1>();
     block.sync();
@@ -1103,7 +1097,7 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
 
     block.sync();
     produce_kv<SharedMemFillMode::kFillZero, num_warps, num_frags_y, num_frags_z>(
-        v_smem, &kv_smem_offset_w, &v_ptr, kv_n_stride, kv_idx_base, chunk_end);
+        v_smem, &kv_smem_offset_w, &v_ptr, kv_n_stride, kv_idx_base, kv_len);
     cp_async::commit_group();
   }
   cp_async::wait_group<0>();
@@ -1129,7 +1123,8 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
         const uint32_t num_qo_heads = qkv_info.get_num_qo_heads();
         const uint32_t qo_idx = qo_idx_base + (tx / 4 + j * 8 + fx * 16) / group_size;
         if (qo_idx < qo_len) {
-          lse[qo_idx * num_qo_heads + qo_head_idx] = math::ptx_log2(d[fx][j]) + float(m[fx][j]);
+          lse[(qo_indptr[request_idx] + qo_idx) * num_qo_heads + qo_head_idx] =
+              math::ptx_log2(d[fx][j]) + float(m[fx][j]);
         }
       }
     }
@@ -1709,7 +1704,7 @@ cudaError_t BatchPrefillWithRaggedKVCache(
           allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
           {SWITCH_GQA_GROUP_SIZE(
               num_qo_heads / num_kv_heads, GROUP_SIZE,
-              {{SWITCH_CAUSAL(
+              {SWITCH_CAUSAL(
                   causal, CAUSAL,
                   {SWITCH_HEAD_DIM_PREFILL(
                       head_dim, HEAD_DIM,
@@ -1720,7 +1715,7 @@ cudaError_t BatchPrefillWithRaggedKVCache(
                                            IdType>(q, qo_indptr, k, v, kv_indptr, o, tmp, lse,
                                                    batch_size, num_kv_heads, rope_scale, rope_theta,
                                                    stream);
-                                     })})})})}})})});
+                                     })})})})})})});
   return cudaSuccess;
 }
 
