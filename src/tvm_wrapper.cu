@@ -48,11 +48,14 @@ Array<NDArray> _CreateTemporaryBufferPerGPU() {
   auto* pf = tvm::runtime::Registry::Get("runtime.GetCudaDeviceCount");
   ICHECK(pf != nullptr);
   int n_gpus = (*pf)();
+  int device_id = -1;
+  cudaGetDevice(&device_id);
   Array<NDArray> buffers;
   for (int i = 0; i < n_gpus; ++i) {
     buffers.push_back(tvm::runtime::NDArray::Empty(ShapeTuple({4096 * 4096}), DataType::Float(16),
                                                    tvm::Device{kDLCUDA, i}));
   }
+  cudaSetDevice(device_id);
   return buffers;
 }
 
