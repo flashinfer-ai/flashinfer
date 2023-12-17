@@ -940,6 +940,202 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
   }
 }
 
+template <bool return_lse, bool split_qo_indptr, uint32_t group_size, bool causal, QKVLayout layout,
+          RotaryMode rotary_mode, uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z,
+          uint32_t num_warps, typename DTypeIn, typename DTypeQKAccum, typename DTypeOut,
+          typename IdType>
+__global__ void BatchPrefillWithRaggedKVCacheKernel(
+    DTypeIn* __restrict__ q, IdType* __restrict__ request_indices,
+    IdType* __restrict__ tile_indices, IdType* __restrict__ qo_indptr, DTypeIn* __restrict__ k,
+    DTypeIn* __restrict__ v, IdType* __restrict__ kv_indptr, DTypeOut* __restrict__ o,
+    float* __restrict__ tmp, float* __restrict__ lse, const uint32_t batch_size, float sm_scale,
+    const float log2_rope_rcp_scale, const float log2_rope_rcp_theta) {
+  static_assert(sizeof(DTypeIn) == 2);
+  static_assert(sizeof(DTypeOut) == 2);
+  sm_scale *= math::log2e;
+  constexpr uint32_t head_dim = num_frags_y * 16;
+
+  auto block = cg::this_thread_block();
+  const uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y, kv_head_idx = blockIdx.z;
+  const uint32_t num_kv_heads = gridDim.z, num_qo_heads = num_kv_heads * group_size;
+  const uint32_t request_idx = split_qo_indptr ? request_indices[bx] : bx,
+                 tile_idx = split_qo_indptr ? tile_indices[bx] : 0;
+  constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
+  const uint32_t qo_len = qo_indptr[request_idx + 1] - qo_indptr[request_idx],
+                 kv_len = kv_indptr[request_idx + 1] - kv_indptr[request_idx];
+  const uint32_t chunk_start = 0;
+  const uint32_t chunk_end = kv_len;
+  const tensor_info_t<layout, group_size> qkv_info(qo_len, kv_len, num_kv_heads, head_dim);
+  const uint32_t qo_upper_bound = min(qo_len, (tile_idx + 1) * (num_rows_per_cta / group_size));
+
+  constexpr bool cooperative = false;
+  constexpr uint32_t num_cells_per_in_channel = head_dim / cell_capacity<DTypeIn>();
+  constexpr uint32_t num_cells_per_out_channel = head_dim / cell_capacity<DTypeOut>();
+
+  static_assert(num_frags_z * num_frags_y % num_warps == 0);
+  static_assert(8 % group_size == 0);
+
+  extern __shared__ uint8_t smem[];
+
+  DTypeQKAccum s_frag[num_frags_x][num_frags_z][8];
+  float o_frag[num_frags_x][num_frags_y][8];
+  DTypeQKAccum m[num_frags_x][2];
+  float d[num_frags_x][2];
+  float rope_freq[num_frags_y / 2][4];
+
+  if constexpr (rotary_mode == RotaryMode::kLlama) {
+    init_rope_freq<num_frags_y>(rope_freq, log2_rope_rcp_scale, log2_rope_rcp_theta);
+  }
+  init_states<num_frags_x, num_frags_y>(o_frag, m, d);
+
+  const uint32_t qo_idx_base =
+      tile_idx * (num_rows_per_cta / group_size) + ty * num_frags_x * (16 / group_size);
+  uint32_t kv_idx_base = 0;
+  const uint32_t kv_n_stride = qkv_info.get_kv_n_stride();
+  smem_t qo_smem(smem);
+  uint32_t qo_idx = qo_idx_base + (tx / 4) / group_size;
+  DTypeIn* q_ptr = q +
+                   ((qo_indptr[request_idx] + qo_idx) * num_qo_heads + kv_head_idx * group_size +
+                    (tx / 4) % group_size) *
+                       head_dim +
+                   (tx % 4) * cell_capacity<DTypeIn>();
+  DTypeIn* o_ptr = o +
+                   ((qo_indptr[request_idx] + qo_idx) * num_qo_heads + kv_head_idx * group_size +
+                    (tx / 4) % group_size) *
+                       head_dim +
+                   (tx % 4) * cell_capacity<DTypeOut>();
+
+  uint32_t q_smem_offset_r = smem_t::get_permuted_offset<num_cells_per_in_channel>(
+      ty * num_frags_x * 16 + tx % 16, tx / 16);
+
+  load_q_global_smem<group_size, num_frags_x, num_frags_y>(&qo_idx, qo_upper_bound, &q_ptr,
+                                                           qkv_info, &qo_smem);
+
+  cp_async::commit_group();
+  cp_async::wait_group<0>();
+  block.sync();
+
+  if constexpr (rotary_mode == RotaryMode::kLlama) {
+    qo_idx = qo_idx_base + (tx / 4) / group_size;
+    q_smem_inplace_apply_rotary_multiply_sm_scale<group_size, num_warps, num_frags_x, num_frags_y,
+                                                  DTypeIn>(&qo_idx, qo_len, kv_len, &qo_smem,
+                                                           &q_smem_offset_r, rope_freq, sm_scale);
+  } else {
+    q_smem_inplace_multiply_sm_scale<num_frags_x, num_frags_y, DTypeIn>(&qo_smem, sm_scale);
+  }
+
+  const uint32_t num_iterations =
+      ((causal ? min(chunk_end - chunk_start,
+                     sub_if_greater_or_zero(
+                         kv_len - qo_len + ((bx + 1) * num_frags_x * num_warps) * (16 / group_size),
+                         chunk_start))
+               : chunk_end - chunk_start) +
+       16 * num_frags_z - 1) /
+      (16 * num_frags_z);
+
+  const uint32_t mask_iteration =
+      (causal ? min(chunk_end - chunk_start,
+                    sub_if_greater_or_zero(
+                        kv_len + bx * num_warps * num_frags_x * (16 / group_size) - qo_len,
+                        chunk_start))
+              : (chunk_end - chunk_start)) /
+      (16 * num_frags_z);
+
+  smem_t k_smem(smem + (num_warps * num_frags_x) * 16 * head_dim * sizeof(DTypeIn)),
+      v_smem(smem + (num_warps * num_frags_x + num_frags_z) * 16 * head_dim * sizeof(DTypeIn));
+
+  uint32_t k_smem_offset_r = smem_t::get_permuted_offset<num_cells_per_in_channel>(
+               8 * (tx / 16) + tx % 8, (tx % 16) / 8),
+           v_smem_offset_r =
+               smem_t::get_permuted_offset<num_cells_per_in_channel>(tx % 16, tx / 16),
+           kv_smem_offset_w =
+               smem_t::get_permuted_offset<num_cells_per_in_channel>(ty * 4 + tx / 8, tx % 8);
+
+  DTypeIn* k_ptr =
+      k + qkv_info.get_kv_elem_offset(kv_indptr[request_idx] + kv_idx_base + ty * 4 + tx / 8,
+                                      kv_head_idx, (tx % 8) * cell_capacity<DTypeIn>());
+  DTypeIn* v_ptr =
+      v + qkv_info.get_kv_elem_offset(kv_indptr[request_idx] + kv_idx_base + ty * 4 + tx / 8,
+                                      kv_head_idx, (tx % 8) * cell_capacity<DTypeIn>());
+
+  produce_kv<SharedMemFillMode::kNoFill, num_warps, num_frags_y, num_frags_z>(
+      k_smem, &kv_smem_offset_w, &k_ptr, kv_n_stride, kv_idx_base, chunk_end);
+  cp_async::commit_group();
+  produce_kv<SharedMemFillMode::kFillZero, num_warps, num_frags_y, num_frags_z>(
+      v_smem, &kv_smem_offset_w, &v_ptr, kv_n_stride, kv_idx_base, chunk_end);
+  cp_async::commit_group();
+
+#pragma unroll 1
+  for (uint32_t iter = 0; iter < num_iterations; ++iter) {
+    cp_async::wait_group<1>();
+    block.sync();
+
+    if constexpr (rotary_mode == RotaryMode::kLlama) {
+      k_smem_inplace_apply_rotary<num_frags_y, num_frags_z, DTypeIn>(kv_idx_base, &k_smem,
+                                                                     &k_smem_offset_r, rope_freq);
+      block.sync();
+    }
+
+    // rotary_mode == RotaryMode::kNone
+    compute_qk<num_frags_x, num_frags_y, num_frags_z, DTypeIn>(&qo_smem, &q_smem_offset_r, &k_smem,
+                                                               &k_smem_offset_r, s_frag);
+
+    // apply mask
+    if (iter >= mask_iteration) {
+      mask_s<cooperative, causal, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
+          qo_idx_base, kv_idx_base, qo_len, kv_len, chunk_end, s_frag);
+    }
+
+    // compute m,d states in online softmax
+    update_mdo_states<num_frags_x, num_frags_y, num_frags_z>(s_frag, o_frag, m, d);
+
+    block.sync();
+    kv_idx_base += 16 * num_frags_z;
+    produce_kv<SharedMemFillMode::kNoFill, num_warps, num_frags_y, num_frags_z>(
+        k_smem, &kv_smem_offset_w, &k_ptr, kv_n_stride, kv_idx_base, chunk_end);
+    cp_async::commit_group();
+    cp_async::wait_group<1>();
+    block.sync();
+
+    // compute sfm*v
+    compute_sfm_v<num_frags_x, num_frags_y, num_frags_z, DTypeIn>(&v_smem, &v_smem_offset_r, s_frag,
+                                                                  o_frag, d);
+
+    block.sync();
+    produce_kv<SharedMemFillMode::kFillZero, num_warps, num_frags_y, num_frags_z>(
+        v_smem, &kv_smem_offset_w, &v_ptr, kv_n_stride, kv_idx_base, chunk_end);
+    cp_async::commit_group();
+  }
+  cp_async::wait_group<0>();
+  block.sync();
+
+  // sync d state between consecutive 4-threads in a warp
+  sync_d_state<num_frags_x>(d);
+
+  // normalize d
+  normalize_d<num_frags_x, num_frags_y>(o_frag, d);
+
+  // write back
+  qo_idx = qo_idx_base + (tx / 4) / group_size;
+  write_o_reg_gmem<num_frags_x, num_frags_y>(o_frag, &qo_smem, &o_ptr, &qo_idx, qo_len, qkv_info);
+
+  // write lse
+  if constexpr (return_lse) {
+#pragma unroll
+    for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+      for (uint32_t j = 0; j < 2; ++j) {
+        const uint32_t qo_head_idx = kv_head_idx * group_size + (tx / 4) % group_size;
+        const uint32_t num_qo_heads = qkv_info.get_num_qo_heads();
+        const uint32_t qo_idx = qo_idx_base + (tx / 4 + j * 8 + fx * 16) / group_size;
+        if (qo_idx < qo_len) {
+          lse[qo_idx * num_qo_heads + qo_head_idx] = math::ptx_log2(d[fx][j]) + float(m[fx][j]);
+        }
+      }
+    }
+  }
+}
+
 template <bool return_lse, bool split_qo_indptr, uint32_t group_size, uint32_t page_size,
           bool causal, RotaryMode rotary_mode, uint32_t num_frags_x, uint32_t num_frags_y,
           uint32_t num_frags_z, uint32_t num_warps, PageStorage page_storage, typename DTypeIn,
@@ -1410,6 +1606,124 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOu
   return cudaSuccess;
 }
 
+template <bool RETURN_LSE, uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout LAYOUT,
+          RotaryMode ROTARY_MODE, bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL, typename DTypeIn,
+          typename DTypeOut, typename IdType>
+cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
+    DTypeIn* q, IdType* __restrict__ qo_indptr, DTypeIn* k, DTypeIn* v,
+    IdType* __restrict__ kv_indptr, DTypeOut* __restrict__ o, float* __restrict__ tmp,
+    float* __restrict__ lse, const uint32_t batch_size, const uint32_t num_kv_heads,
+    const float rope_scale, const float rope_theta, cudaStream_t stream = nullptr) {
+  const float sm_scale = 1.f / std::sqrt(float(HEAD_DIM));
+  const float log2_rope_rcp_scale = -std::log2f(rope_scale);
+  const float log2_rope_rcp_theta = -std::log2f(rope_theta);
+  constexpr uint32_t num_warps = 4;
+  std::vector<IdType> qo_indptr_h(batch_size + 1);
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(qo_indptr_h.data(), qo_indptr,
+                                       sizeof(IdType) * (batch_size + 1), cudaMemcpyDeviceToHost,
+                                       stream));
+  FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
+  const uint32_t total_q_len = qo_indptr_h.back();
+  const bool avg_len_greater_than_64 = total_q_len > 64 * batch_size;
+  SWITCH_NUM_FRAGS_X(avg_len_greater_than_64, num_frags_x, {
+    constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
+    std::vector<IdType> request_indices, tile_indices;
+    uint32_t num_blks_x = 0;
+    bool split_qo_indptr = false;
+    for (uint32_t i = 0; i < batch_size; ++i) {
+      if ((qo_indptr_h[i + 1] - qo_indptr_h[i]) * GROUP_SIZE > num_rows_per_cta ||
+          qo_indptr_h[i + 1] == qo_indptr_h[i]) {
+        split_qo_indptr = true;
+      }
+      for (uint32_t j = qo_indptr_h[i] * GROUP_SIZE; j < qo_indptr_h[i + 1] * GROUP_SIZE;
+           j += num_rows_per_cta) {
+        request_indices.push_back(i);
+        tile_indices.push_back((j - qo_indptr_h[i] * GROUP_SIZE) / num_rows_per_cta);
+        ++num_blks_x;
+      }
+    }
+
+    IdType *request_indices_d = nullptr, *tile_indices_d = nullptr;
+    if (split_qo_indptr) {
+      cudaMallocAsync(&request_indices_d, sizeof(IdType) * request_indices.size(), stream);
+      cudaMallocAsync(&tile_indices_d, sizeof(IdType) * tile_indices.size(), stream);
+      cudaMemcpyAsync(request_indices_d, request_indices.data(),
+                      sizeof(IdType) * request_indices.size(), cudaMemcpyHostToDevice, stream);
+      cudaMemcpyAsync(tile_indices_d, tile_indices.data(), sizeof(IdType) * tile_indices.size(),
+                      cudaMemcpyHostToDevice, stream);
+    }
+
+    dim3 nblks(num_blks_x, 1, num_kv_heads);
+    dim3 nthrs(32, num_warps);
+    constexpr uint32_t num_frags_y = HEAD_DIM / 16;
+    using DTypeQKAccum =
+        typename std::conditional<ALLOW_FP16_QK_REDUCTION && std::is_same<DTypeIn, half>::value,
+                                  half, float>::type;
+
+    constexpr uint32_t num_frags_z = 2;
+    SWITCH_SPLIT_QO_INDPTR(split_qo_indptr, SPLIT_QO_INDPTR, {
+      auto kernel = BatchPrefillWithRaggedKVCacheKernel<
+          RETURN_LSE, SPLIT_QO_INDPTR, GROUP_SIZE, CAUSAL, LAYOUT, ROTARY_MODE, num_frags_x,
+          num_frags_y, num_frags_z, num_warps, DTypeIn, DTypeQKAccum, DTypeOut, IdType>;
+      uint32_t smem_size =
+          (num_frags_x * num_warps + num_frags_z * 2) * 16 * HEAD_DIM * sizeof(DTypeIn);
+      FLASHINFER_CUDA_CALL(
+          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      void* args[] = {(void*)&q,
+                      (void*)&request_indices_d,
+                      (void*)&tile_indices_d,
+                      (void*)&qo_indptr,
+                      (void*)&k,
+                      (void*)&v,
+                      (void*)&kv_indptr,
+                      (void*)&o,
+                      (void*)&tmp,
+                      (void*)&lse,
+                      (void*)&batch_size,
+                      (void*)&sm_scale,
+                      (void*)&log2_rope_rcp_scale,
+                      (void*)&log2_rope_rcp_theta};
+      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+    });
+
+    if (split_qo_indptr) {
+      FLASHINFER_CUDA_CALL(cudaFreeAsync(request_indices_d, stream));
+      FLASHINFER_CUDA_CALL(cudaFreeAsync(tile_indices_d, stream));
+    }
+  });
+  return cudaSuccess;
+}
+
+template <typename DTypeIn, typename DTypeOut, typename IdType>
+cudaError_t BatchPrefillWithRaggedKVCache(
+    DTypeIn* q, IdType* qo_indptr, DTypeIn* k, DTypeIn* v, IdType* kv_indptr, DTypeOut* o,
+    float* tmp, float* lse, const uint32_t batch_size, const uint32_t num_qo_heads,
+    const uint32_t num_kv_heads, const uint32_t head_dim, bool causal = true,
+    QKVLayout layout = QKVLayout::kNHD, RotaryMode rotary_mode = RotaryMode::kNone,
+    bool allow_fp16_qk_reduction = false, const float rope_scale = 1.f,
+    const float rope_theta = 1e4, cudaStream_t stream = nullptr) {
+  const bool return_lse = (lse != nullptr);
+  SWITCH_RETURN_LSE(
+      return_lse, RETURN_LSE,
+      {SWITCH_ALLOW_FP16_QK_REDUCTION(
+          allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
+          {SWITCH_GQA_GROUP_SIZE(
+              num_qo_heads / num_kv_heads, GROUP_SIZE,
+              {{SWITCH_CAUSAL(
+                  causal, CAUSAL,
+                  {SWITCH_HEAD_DIM_PREFILL(
+                      head_dim, HEAD_DIM,
+                      {SWITCH_LAYOUT(layout, LAYOUT, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
+                                       return BatchPrefillWithRaggedKVCacheDispatched<
+                                           RETURN_LSE, GROUP_SIZE, HEAD_DIM, LAYOUT, ROTARY_MODE,
+                                           ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut,
+                                           IdType>(q, qo_indptr, k, v, kv_indptr, o, tmp, lse,
+                                                   batch_size, num_kv_heads, rope_scale, rope_theta,
+                                                   stream);
+                                     })})})})}})})});
+  return cudaSuccess;
+}
+
 /*!
  * \brief Fallback implementation of FlashAttention prefill CUDA function for multiple requests,
  * \tparam page_storage Whether to store indices or pointers of each active page
@@ -1441,7 +1755,6 @@ cudaError_t BatchPrefillWithPagedKVCacheFallback(
   const uint32_t num_kv_heads = paged_kv.num_heads;
   const uint32_t head_dim = paged_kv.head_dim;
   const uint32_t batch_size = paged_kv.batch_size;
-  const bool return_lse = (lse != nullptr);
 
   std::vector<IdType> qo_indptr_h(paged_kv.batch_size + 1);
   std::vector<IdType> kv_indptr_h(paged_kv.batch_size + 1);
@@ -1466,21 +1779,26 @@ cudaError_t BatchPrefillWithPagedKVCacheFallback(
   FLASHINFER_CUDA_CALL(PagedKVCacheToRaggedTensor(paged_kv, keys, values, kv_indptr, stream));
   FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
 
-  for (uint32_t batch_idx = 0; batch_idx < paged_kv.batch_size; ++batch_idx) {
-    if (qo_indptr_h[batch_idx] == qo_indptr_h[batch_idx + 1]) {
-      continue;
-    }
-    SinglePrefillWithKVCache(
-        q + qo_indptr_h[batch_idx] * num_qo_heads * head_dim,
-        keys + kv_indptr_h[batch_idx] * num_kv_heads * head_dim,
-        values + kv_indptr_h[batch_idx] * num_kv_heads * head_dim,
-        o + qo_indptr_h[batch_idx] * num_qo_heads * head_dim,
-        /*tmp=*/nullptr,
-        /*lse=*/return_lse ? lse + qo_indptr_h[batch_idx] * num_qo_heads : nullptr, num_qo_heads,
-        num_kv_heads, qo_indptr_h[batch_idx + 1] - qo_indptr_h[batch_idx],
-        kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx], head_dim, causal, QKVLayout::kNHD,
-        rotary_mode, allow_fp16_qk_reduction, rope_scale, rope_theta, stream);
-  }
+  BatchPrefillWithRaggedKVCache<DTypeIn, DTypeOut, IdType>(
+      q, qo_indptr, keys, values, kv_indptr, o, tmp, lse, batch_size, num_qo_heads, num_kv_heads,
+      head_dim, causal, QKVLayout::kNHD, rotary_mode, allow_fp16_qk_reduction, rope_scale,
+      rope_theta, stream);
+
+  // for (uint32_t batch_idx = 0; batch_idx < paged_kv.batch_size; ++batch_idx) {
+  //   if (qo_indptr_h[batch_idx] == qo_indptr_h[batch_idx + 1]) {
+  //     continue;
+  //   }
+  //   SinglePrefillWithKVCache(
+  //       q + qo_indptr_h[batch_idx] * num_qo_heads * head_dim,
+  //       keys + kv_indptr_h[batch_idx] * num_kv_heads * head_dim,
+  //       values + kv_indptr_h[batch_idx] * num_kv_heads * head_dim,
+  //       o + qo_indptr_h[batch_idx] * num_qo_heads * head_dim,
+  //       /*tmp=*/nullptr,
+  //       /*lse=*/return_lse ? lse + qo_indptr_h[batch_idx] * num_qo_heads : nullptr, num_qo_heads,
+  //       num_kv_heads, qo_indptr_h[batch_idx + 1] - qo_indptr_h[batch_idx],
+  //       kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx], head_dim, causal, QKVLayout::kNHD,
+  //       rotary_mode, allow_fp16_qk_reduction, rope_scale, rope_theta, stream);
+  // }
   FLASHINFER_CUDA_CALL(cudaFreeAsync(keys, stream));
   FLASHINFER_CUDA_CALL(cudaFreeAsync(values, stream));
   FLASHINFER_CUDA_CALL(cudaFreeAsync(kv_indptr, stream));
