@@ -65,6 +65,43 @@ __global__ void MergeStateKernel(DTypeIn* __restrict__ v_a, float* __restrict__ 
 }
 
 /*!
+ * \brief The CUDA kernel that merges the self-attention state with another state in-place.
+ * \tparam vec_size The vector size used in the kernel.
+ * \tparam DType The data type of v and v_other.
+ * \param v The partial v to be updated in-place. (n, h, d)
+ * \param s The logsumexp value to be updated in-place. (n, h)
+ * \param v_other The other v to be merged. (n, h, d)
+ * \param s_other The other logsumexp value to be merged. (n, h)
+ * \param num_heads The number of heads of v and v_other.
+ * \param head_dim The dimension of each head.
+ * \note Both s and s_other are logsumexp values with base 2.
+ */
+template <uint32_t vec_size, typename DType>
+__global__ void MergeStateInPlaceKernel(DType* __restrict__ v, float* __restrict__ s,
+                                        DType* __restrict__ v_other, float* __restrict__ s_other,
+                                        uint32_t num_heads, uint32_t head_dim) {
+  uint32_t tx = threadIdx.x, ty = threadIdx.y;
+  uint32_t batch_idx = blockIdx.x;
+  uint32_t head_idx = ty;
+
+  float s_val = s[batch_idx * num_heads + head_idx];
+  float s_other_val = s_other[batch_idx * num_heads + head_idx];
+  float s_max = max(s_val, s_other_val);
+  s_val = math::ptx_exp2(s_val - s_max);
+  s_other_val = math::ptx_exp2(s_other_val - s_max);
+  float scale = s_val / (s_val + s_other_val);
+  float other_scale = s_other_val / (s_val + s_other_val);
+  vec_t<float, vec_size> v_vec, v_other_vec;
+  v_vec.cast_load(v + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
+  v_other_vec.cast_load(v_other + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
+#pragma unroll
+  for (uint32_t i = 0; i < vec_size; ++i) {
+    v_vec[i] = scale * v_vec[i] + other_scale * v_other_vec[i];
+  }
+  v_vec.cast_store(v + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
+}
+
+/*!
  * \brief The CUDA kernel that merges self-attention states of a list of index sets.
  * \param vec_size The vector size used in the kernel.
  * \tparam DTypeIn The data type of v.
@@ -138,6 +175,37 @@ cudaError_t MergeState(DTypeIn* v_a, float* s_a, DTypeIn* v_b, float* s_b, DType
     dim3 nthrs(bdx, bdy);
     auto kernel = MergeStateKernel<vec_size, DTypeIn, DTypeOut>;
     void* args[] = {&v_a, &s_a, &v_b, &s_b, &v_merged, &num_heads, &head_dim};
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+  });
+  return cudaSuccess;
+}
+
+/*!
+ * \brief Merge the self-attention state with another state in place.
+ * \tparam DType The data type of v and v_other.
+ * \param v The partial v to be updated in-place. (n, h, d)
+ * \param s The logsumexp value to be updated in-place. (n, h)
+ * \param v_other The other v to be merged. (n, h, d)
+ * \param s_other The other logsumexp value to be merged. (n, h)
+ * \param batch_size The batch size of self-attention states.
+ * \param num_heads The number of heads of v and v_other.
+ * \param head_dim The dimension of each head.
+ * \param stream The CUDA stream to execute the kernel.
+ * \return status Indicates whether CUDA calls are successful
+ * \note Both s and s_other are logsumexp values with base 2.
+ */
+template <typename DType>
+cudaError_t MergeStateInPlace(DType* v, float* s, DType* v_other, float* s_other,
+                              uint32_t batch_size, uint32_t num_heads, uint32_t head_dim,
+                              cudaStream_t stream = nullptr) {
+  SWITCH_HEAD_DIM(head_dim, HEAD_DIM, {
+    constexpr uint32_t vec_size = std::max(16U / sizeof(DType), HEAD_DIM / 32U);
+    uint32_t bdx = HEAD_DIM / vec_size;
+    uint32_t bdy = num_heads;
+    dim3 nblks(batch_size);
+    dim3 nthrs(bdx, bdy);
+    auto kernel = MergeStateInPlaceKernel<vec_size, DType>;
+    void* args[] = {&v, &s, &v_other, &s_other, &num_heads, &head_dim};
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
   });
   return cudaSuccess;

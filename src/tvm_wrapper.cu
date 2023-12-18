@@ -492,6 +492,46 @@ void _FlashInferMergeState(DLTensor* v_a, DLTensor* s_a, DLTensor* v_b, DLTensor
       })});
 }
 
+void _FlashInferMergeStateInPlace(DLTensor* v, DLTensor* s, DLTensor* v_other, DLTensor* s_other) {
+  CHECK_EQ(v->device.device_type, kDLCUDA) << "The device of v must be CUDA.";
+  CHECK_EQ(s->device.device_type, kDLCUDA) << "The device of s must be CUDA.";
+  CHECK_EQ(v_other->device.device_type, kDLCUDA) << "The device of v_other must be CUDA.";
+  CHECK_EQ(s_other->device.device_type, kDLCUDA) << "The device of s_other must be CUDA.";
+  int32_t dev_id = v->device.device_id;
+  CHECK_EQ(s->device.device_id, dev_id);
+  CHECK_EQ(v_other->device.device_id, dev_id);
+  CHECK_EQ(s_other->device.device_id, dev_id);
+
+  CHECK(v->dtype.lanes == 1 && s->dtype.lanes == 1 && v_other->dtype.lanes == 1 &&
+        s_other->dtype.lanes == 1);
+  CHECK(v->dtype.bits == v_other->dtype.bits && v->dtype.code == v_other->dtype.code);
+  CHECK(s->dtype.bits == 32 && s->dtype.code == kDLFloat);
+  CHECK(s_other->dtype.bits == 32 && s_other->dtype.code == kDLFloat);
+
+  CHECK_EQ(v->ndim, 3);
+  int64_t batch_size = v->shape[0];
+  int64_t num_heads = v->shape[1];
+  int64_t head_dim = v->shape[2];
+  CHECK_EQ(s->shape[0], batch_size);
+  CHECK_EQ(s->shape[1], num_heads);
+  CHECK_EQ(v_other->shape[0], batch_size);
+  CHECK_EQ(v_other->shape[1], num_heads);
+  CHECK_EQ(v_other->shape[2], head_dim);
+  CHECK_EQ(s_other->shape[0], batch_size);
+  CHECK_EQ(s_other->shape[1], num_heads);
+  CHECK_EQ(s_other->shape[2], head_dim);
+
+  SWITCH_TVM_CUDA_DTYPE(v->dtype, dtype, {
+    cudaError_t status =
+        MergeStateInPlace(static_cast<dtype*>(v->data), static_cast<float*>(s->data),
+                          static_cast<dtype*>(v_other->data), static_cast<float*>(s_other->data),
+                          batch_size, num_heads, head_dim);
+    if (status != cudaSuccess) {
+      LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
+    }
+  });
+}
+
 TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionPrefillWithPagedKVCache,
                           _FlashInferAttentionPrefillWithPagedKVCache);
 
@@ -508,6 +548,8 @@ TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionPrefillWithRaggedKVCache,
                           _FlashInferAttentionPrefillWithRaggedKVCache);
 
 TVM_DLL_EXPORT_TYPED_FUNC(FlashInferMergeState, _FlashInferMergeState);
+
+TVM_DLL_EXPORT_TYPED_FUNC(FlashInferMergeStateInPlace, _FlashInferMergeStateInPlace);
 
 // TODO(Zihao): Unify the symbol names
 TVM_REGISTER_GLOBAL("paged_kv_cache.attention_kernel_prefill")
@@ -526,3 +568,5 @@ TVM_REGISTER_GLOBAL("flashinfer.attention_kernel_prefill_with_ragged_kv_cache")
     .set_body_typed(_FlashInferAttentionPrefillWithRaggedKVCache);
 
 TVM_REGISTER_GLOBAL("flashinfer.merge_state").set_body_typed(_FlashInferMergeState);
+
+TVM_REGISTER_GLOBAL("flashinfer.merge_state_in_place").set_body_typed(_FlashInferMergeStateInPlace);
