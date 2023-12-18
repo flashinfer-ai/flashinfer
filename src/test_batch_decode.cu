@@ -16,7 +16,7 @@
 #include <gtest/gtest.h>
 
 #include <flashinfer/decode.cuh>
-#include <flashinfer/wrapper.cuh>
+#include <flashinfer/handler.cuh>
 #include <type_traits>
 
 #include "cpu_reference.h"
@@ -94,8 +94,8 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
       thrust::raw_pointer_cast(kv_indices_device.data()),
       thrust::raw_pointer_cast(kv_indptr_device.data()),
       thrust::raw_pointer_cast(kv_last_page_len_device.data()));
-  flashinfer::BatchDecodeBufferManager<PageStorage::kIndices, T, T, int32_t> buf_mgr;
-  buf_mgr.begin_forward(paged_kv, false, num_qo_heads, rotary_mode);
+  flashinfer::BatchDecodeHandler<PageStorage::kIndices, T, T, int32_t> handler;
+  handler.begin_forward(paged_kv, false, num_qo_heads, rotary_mode);
 
   if (!cooperative) {
     // use non-cooperative kernel
@@ -106,7 +106,7 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
     EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
   } else {
     cudaError_t status = flashinfer::BatchDecodeWithPagedKVCache<PageStorage::kIndices, T, T>(
-        &buf_mgr, thrust::raw_pointer_cast(q_device.data()), paged_kv,
+        &handler, thrust::raw_pointer_cast(q_device.data()), paged_kv,
         thrust::raw_pointer_cast(o_device.data()), /*lse=*/nullptr, num_qo_heads, rotary_mode);
     EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
   }

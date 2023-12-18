@@ -267,9 +267,13 @@ void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data,
           })})});
 }
 
-BatchDecodeBufferManager<PageStorage::kIndices, half, half, int32_t> buf_mgr_f16f16i32;
+// Creates a pool of handlers with a fixed size to independently handle decoding forward passes.
+constexpr uint32_t max_num_handlers = 8;
+thread_local BatchDecodeHandler<PageStorage::kIndices, half, half, int32_t>
+    f16f16i32_handlers[max_num_handlers];
 
-void _FlashInferAttentionDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
+void _FlashInferAttentionDecodeWithPagedKVCache(int64_t handler_id, DLTensor* q_data,
+                                                DLTensor* pages,
                                                 DLTensor* page_table_indptr,  //
                                                 DLTensor* page_table_values,  //
                                                 DLTensor* last_page_len,      //
@@ -278,6 +282,7 @@ void _FlashInferAttentionDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* page
                                                 int64_t rotary_mode = 0,      //
                                                 double rope_scale = 1.0f,     //
                                                 double rope_theta = 1e4) {
+  CHECK_LT(handler_id, max_num_handlers) << "The handler id must be less than " << max_num_handlers;
   CHECK_EQ(q_data->device.device_type, kDLCUDA) << "The device of q_data must be CUDA.";
   CHECK_EQ(pages->device.device_type, kDLCUDA) << "The device of kv pages must be CUDA.";
   CHECK_EQ(page_table_indptr->device.device_type, kDLCUDA)
@@ -339,7 +344,7 @@ void _FlashInferAttentionDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* page
                 static_cast<dtype_idx*>(last_page_len->data));
             cudaError_t status =
                 BatchDecodeWithPagedKVCache<page_storage, dtype_in, dtype_out, dtype_idx>(
-                    &buf_mgr_f16f16i32, static_cast<dtype_in*>(q_data->data), cache,
+                    &f16f16i32_handlers[handler_id], static_cast<dtype_in*>(q_data->data), cache,
                     static_cast<dtype_out*>(output->data),
                     /*lse=*/static_cast<float*>(lse->data), nhead_qo, RotaryMode(rotary_mode),
                     rope_scale, rope_theta, 0);
@@ -350,8 +355,11 @@ void _FlashInferAttentionDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* page
 }
 
 void _FlashInferAttentionDecodeWithPagedKVCacheBeginForward(
-    DLTensor* page_table_indptr, DLTensor* page_table_values, DLTensor* last_page_len,
-    int64_t return_lse, int64_t num_qo_heads, int64_t num_kv_heads, int64_t rotary_mode = 0) {
+    int64_t handler_idx, DLTensor* page_table_indptr, DLTensor* page_table_values,
+    DLTensor* last_page_len, int64_t return_lse, int64_t num_qo_heads, int64_t num_kv_heads,
+    int64_t rotary_mode) {
+  CHECK_LT(handler_idx, max_num_handlers)
+      << "The handler id must be less than " << max_num_handlers;
   constexpr PageStorage page_storage = PageStorage::kIndices;
   using dtype_in = half;
   using dtype_idx = int32_t;
@@ -360,10 +368,14 @@ void _FlashInferAttentionDecodeWithPagedKVCacheBeginForward(
   cache.indices = static_cast<dtype_idx*>(page_table_values->data);
   cache.last_page_len = static_cast<dtype_idx*>(last_page_len->data);
   cache.num_heads = num_kv_heads;
-  buf_mgr_f16f16i32.begin_forward(cache, bool(return_lse), num_qo_heads, RotaryMode(rotary_mode));
+  f16f16i32_handlers[handler_idx].begin_forward(cache, bool(return_lse), num_qo_heads,
+                                                RotaryMode(rotary_mode));
 }
 
-void _FlashInferAttentionDecodeWithPagedKVCacheEndForward() { buf_mgr_f16f16i32.end_forward(); }
+void _FlashInferAttentionDecodeWithPagedKVCacheEndForward(int64_t handler_id) {
+  CHECK_LT(handler_id, max_num_handlers) << "The handler id must be less than " << max_num_handlers;
+  f16f16i32_handlers[handler_id].end_forward();
+}
 
 void _FlashInferAttentionPrefillWithRaggedKVCache(DLTensor* q_data, DLTensor* qo_indptr,
                                                   DLTensor* k_data, DLTensor* v_data,

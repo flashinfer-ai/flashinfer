@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_WRAPPER_CUH_
-#define FLASHINFER_WRAPPER_CUH_
+#ifndef FLASHINFER_HANDLER_CUH_
+#define FLASHINFER_HANDLER_CUH_
 
 #include <memory>
 #include <mutex>
@@ -27,7 +27,7 @@
 namespace flashinfer {
 
 template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
-class BatchDecodeBufferManager {
+class BatchDecodeHandler {
  public:
   float* get_float_buffer() const { return float_buffer_; }
   IdType* new_indptr() const { return int_buffer_; }
@@ -116,13 +116,13 @@ class BatchDecodeBufferManager {
 
   void SetCUDAStream(cudaStream_t stream) { stream_ = stream; }
 
-  BatchDecodeBufferManager()
+  BatchDecodeHandler()
       : new_batch_size_(0U),
         float_buffer_(nullptr),
         int_buffer_(nullptr),
         forward_started_(false),
         stream_(nullptr) {}
-  ~BatchDecodeBufferManager() { end_forward(); }
+  ~BatchDecodeHandler() { end_forward(); }
 
  private:
   uint32_t new_batch_size_;
@@ -139,7 +139,7 @@ class BatchDecodeBufferManager {
  * \tparam DTypeIn The data type of input tensor.
  * \tparam DTypeOut The data type of output tensor.
  * \tparam IdType The data type of index tensor.
- * \param buf_manager The buffer manager.
+ * \param handler The handler for the batch decode forward request.
  * \param q The input tensor.
  * \param paged_kv The paged key-value tensor.
  * \param o The output tensor.
@@ -150,26 +150,26 @@ class BatchDecodeBufferManager {
  * \param rope_theta The theta of rope.
  * \param stream The CUDA stream.
  * \note This wrapper function should be only called after we call begin_forward function in the
- *   BatchDecodeBufferManager.
+ *   BatchDecodeHandler.
  */
 template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCache(
-    BatchDecodeBufferManager<page_storage, DTypeIn, DTypeOut, IdType>* buf_manager, DTypeIn* q,
+    BatchDecodeHandler<page_storage, DTypeIn, DTypeOut, IdType>* handler, DTypeIn* q,
     paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, DTypeOut* o, float* lse,
     uint32_t num_qo_heads, RotaryMode rotary_mode = RotaryMode::kNone, float rope_scale = 1.f,
     float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   paged_kv_t<page_storage, DTypeIn, IdType> new_paged_kv = paged_kv;
-  float* tmp = buf_manager->get_float_buffer();
-  if (buf_manager->forward_started()) {
+  float* tmp = handler->get_float_buffer();
+  if (handler->forward_started()) {
     if (tmp != nullptr) {
       // create auxiliary information for cooperative kernels
-      new_paged_kv.batch_size = buf_manager->get_new_batch_size();
-      new_paged_kv.indptr = buf_manager->new_indptr();
-      new_paged_kv.last_page_len = buf_manager->new_last_page_len();
-      new_paged_kv.cooperative_aux_info = buf_manager->cooperative_aux_info();
+      new_paged_kv.batch_size = handler->get_new_batch_size();
+      new_paged_kv.indptr = handler->new_indptr();
+      new_paged_kv.last_page_len = handler->new_last_page_len();
+      new_paged_kv.cooperative_aux_info = handler->cooperative_aux_info();
     }
   } else {
-    std::cerr << "Please call BatchDecodeBufferManager's begin_forward() before calling "
+    std::cerr << "Please call BatchDecodeHandler's begin_forward() before calling "
                  "BatchDecodeWithPagedKVCache()"
               << std::endl;
     abort();
@@ -180,4 +180,4 @@ cudaError_t BatchDecodeWithPagedKVCache(
 
 }  // namespace flashinfer
 
-#endif  // FLASHINFER_WRAPPER_CUH_
+#endif  // FLASHINFER_HANDLER_CUH_

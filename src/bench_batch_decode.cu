@@ -17,8 +17,8 @@
 
 #include <cstdint>
 #include <flashinfer/decode.cuh>
+#include <flashinfer/handler.cuh>
 #include <flashinfer/prefill.cuh>
-#include <flashinfer/wrapper.cuh>
 #include <nvbench/nvbench.cuh>
 #include <vector>
 
@@ -67,14 +67,14 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
           vec_bytes(kv_indptr) + vec_bytes(kv_indices) + vec_bytes(kv_last_page_len),
       "Read");
   state.add_global_memory_writes<uint8_t>(vec_bytes(o), "Write");
-  BatchDecodeBufferManager<PageStorage::kIndices, T, T, int32_t> buf_mgr;
+  BatchDecodeHandler<PageStorage::kIndices, T, T, int32_t> handler;
 
   if (cooperative) {
     // begin forward
-    buf_mgr.begin_forward(paged_kv, false, num_qo_heads, rotary_mode);
+    handler.begin_forward(paged_kv, false, num_qo_heads, rotary_mode);
     state.exec([&](nvbench::launch&) {
       cudaError_t status = BatchDecodeWithPagedKVCache<PageStorage::kIndices, T, T>(
-          &buf_mgr, thrust::raw_pointer_cast(q.data()), paged_kv,
+          &handler, thrust::raw_pointer_cast(q.data()), paged_kv,
           thrust::raw_pointer_cast(o.data()), /*lse=*/nullptr, num_qo_heads, rotary_mode);
       if (status != cudaSuccess) {
         state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
