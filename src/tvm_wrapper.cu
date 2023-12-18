@@ -180,6 +180,8 @@ void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data, DLTensor* pag
                                                  DLTensor* last_page_len,         //
                                                  DLTensor* append_length_indptr,  //
                                                  DLTensor* output,                //
+                                                 DLTensor* lse,                   //
+                                                 int64_t causal = 1,              //
                                                  int64_t rotary_mode = 0,         //
                                                  double rope_scale = 1.0f,        //
                                                  double rope_theta = 1e4) {
@@ -231,6 +233,8 @@ void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data, DLTensor* pag
   CHECK_EQ(page_table_indptr->shape[0], num_total_seqs + 1);
   CHECK_EQ(page_table_values->ndim, 1);
 
+  // TODO(Zihao): check the options of lse
+  // why q_data->ndim has to be 4?
   CHECK_EQ(q_data->ndim, 4);
   CHECK_EQ(output->ndim, 4);
   CHECK_EQ(q_data->shape[0], 1);
@@ -255,9 +259,9 @@ void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data, DLTensor* pag
                 BatchPrefillWithPagedKVCache<page_storage, dtype_in, dtype_out, dtype_idx>(
                     static_cast<dtype_in*>(q_data->data), cache,
                     static_cast<dtype_idx*>(append_length_indptr->data),
-                    static_cast<dtype_out*>(output->data), /*tmp=*/nullptr, /*lse=*/nullptr,
-                    nhead_qo,
-                    /*causal=*/true, RotaryMode(rotary_mode), /*allow_fp16_qk_reduction=*/false,
+                    static_cast<dtype_out*>(output->data), /*tmp=*/nullptr,
+                    /*lse=*/static_cast<float*>(lse->data), nhead_qo,
+                    /*causal=*/causal, RotaryMode(rotary_mode), /*allow_fp16_qk_reduction=*/false,
                     rope_scale, rope_theta, 0);
             if (status != cudaSuccess) {
               LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
@@ -273,6 +277,7 @@ void _FlashInferAttentionDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* page
                                                 DLTensor* last_page_len,         //
                                                 DLTensor* append_length_indptr,  //
                                                 DLTensor* output,                //
+                                                DLTensor* lse,                   //
                                                 int64_t rotary_mode = 0,         //
                                                 double rope_scale = 1.0f,        //
                                                 double rope_theta = 1e4) {
@@ -324,6 +329,8 @@ void _FlashInferAttentionDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* page
   CHECK_EQ(page_table_indptr->shape[0], num_total_seqs + 1);
   CHECK_EQ(page_table_values->ndim, 1);
 
+  // TODO(Zihao): check the options of lse
+  // why q_data->ndim has to be 4?
   CHECK_EQ(q_data->ndim, 4);
   CHECK_EQ(output->ndim, 4);
   CHECK_EQ(q_data->shape[0], num_total_seqs);
@@ -349,7 +356,8 @@ void _FlashInferAttentionDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* page
                 BatchDecodeWithPagedKVCache<page_storage, dtype_in, dtype_out, dtype_idx>(
                     &buf_mgr_f16f16i32, static_cast<dtype_in*>(q_data->data), cache,
                     static_cast<dtype_out*>(output->data),
-                    /*lse=*/nullptr, nhead_qo, RotaryMode(rotary_mode), rope_scale, rope_theta, 0);
+                    /*lse=*/static_cast<float*>(lse->data), nhead_qo, RotaryMode(rotary_mode),
+                    rope_scale, rope_theta, 0);
             if (status != cudaSuccess) {
               LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
             }
@@ -358,7 +366,7 @@ void _FlashInferAttentionDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* page
 
 void _FlashInferAttentionDecodeWithPagedKVCacheBeginForward(
     DLTensor* page_table_indptr, DLTensor* page_table_values, DLTensor* last_page_len,
-    int64_t num_qo_heads, int64_t num_kv_heads, int64_t rotary_mode = 0) {
+    int64_t return_lse, int64_t num_qo_heads, int64_t num_kv_heads, int64_t rotary_mode = 0) {
   constexpr PageStorage page_storage = PageStorage::kIndices;
   using dtype_in = half;
   using dtype_idx = int32_t;
@@ -367,7 +375,7 @@ void _FlashInferAttentionDecodeWithPagedKVCacheBeginForward(
   cache.indices = static_cast<dtype_idx*>(page_table_values->data);
   cache.last_page_len = static_cast<dtype_idx*>(last_page_len->data);
   cache.num_heads = num_kv_heads;
-  buf_mgr_f16f16i32.begin_forward(cache, num_qo_heads, RotaryMode(rotary_mode));
+  buf_mgr_f16f16i32.begin_forward(cache, bool(return_lse), num_qo_heads, RotaryMode(rotary_mode));
 }
 
 void _FlashInferAttentionDecodeWithPagedKVCacheEndForward() { buf_mgr_f16f16i32.end_forward(); }
@@ -375,6 +383,7 @@ void _FlashInferAttentionDecodeWithPagedKVCacheEndForward() { buf_mgr_f16f16i32.
 void _FlashInferAttentionPrefillWithRaggedKVCache(DLTensor* q_data, DLTensor* qo_indptr,
                                                   DLTensor* k_data, DLTensor* v_data,
                                                   DLTensor* kv_indptr, DLTensor* output,
+                                                  DLTensor* lse, int64_t causal = 1,
                                                   int64_t rotary_mode = 0, double rope_scale = 1.0f,
                                                   double rope_theta = 1e4) {
   CHECK_EQ(q_data->device.device_type, kDLCUDA) << "The device of q_data must be CUDA.";
@@ -390,16 +399,21 @@ void _FlashInferAttentionPrefillWithRaggedKVCache(DLTensor* q_data, DLTensor* qo
   CHECK_EQ(v_data->device.device_id, dev_id);
   CHECK_EQ(kv_indptr->device.device_id, dev_id);
   CHECK_EQ(output->device.device_id, dev_id);
+  CHECK_EQ(lse->device.device_id, dev_id);
 
   CHECK(q_data->dtype.lanes == 1 && qo_indptr->dtype.lanes == 1 && k_data->dtype.lanes == 1 &&
-        v_data->dtype.lanes == 1 && kv_indptr->dtype.lanes == 1 && output->dtype.lanes == 1);
+        v_data->dtype.lanes == 1 && kv_indptr->dtype.lanes == 1 && output->dtype.lanes == 1 &&
+        lse->dtype.lanes == 1);
   CHECK(q_data->dtype.bits == k_data->dtype.bits && q_data->dtype.code == v_data->dtype.code);
   CHECK(qo_indptr->dtype.bits == kv_indptr->dtype.bits);
+  CHECK(lse->dtype.bits == 32);
   CHECK(q_data->dtype.code == k_data->dtype.code && q_data->dtype.code == v_data->dtype.code);
   CHECK(qo_indptr->dtype.code == kv_indptr->dtype.code);
+  CHECK(lse->dtype.code == kDLFloat);
 
   CHECK_EQ(q_data->ndim, 3);  // qo_nnz, nhead_qo, nfeat
   CHECK_EQ(output->ndim, 3);  // qo_nnz, nhead_qo, nfeat
+  CHECK_EQ(lse->ndim, 2);     // qo_nnz, nhead_qo
   CHECK_EQ(k_data->ndim, 3);  // kv_nnz, nhead_kv, nfeat
   CHECK_EQ(v_data->ndim, 3);  // kv_nnz, nhead_kv, nfeat
   int64_t nhead_qo = q_data->shape[1];
@@ -408,6 +422,8 @@ void _FlashInferAttentionPrefillWithRaggedKVCache(DLTensor* q_data, DLTensor* qo
   CHECK_EQ(output->shape[0], q_data->shape[0]);
   CHECK_EQ(output->shape[1], nhead_qo);
   CHECK_EQ(output->shape[2], nfeat);
+  CHECK_EQ(lse->shape[0], q_data->shape[0]);
+  CHECK_EQ(lse->shape[1], nhead_qo);
   CHECK_EQ(k_data->shape[2], nfeat);
   CHECK_EQ(v_data->shape[0], k_data->shape[0]);
   CHECK_EQ(v_data->shape[1], nhead_kv);
@@ -427,8 +443,8 @@ void _FlashInferAttentionPrefillWithRaggedKVCache(DLTensor* q_data, DLTensor* qo
                 static_cast<dtype_in*>(k_data->data), static_cast<dtype_in*>(v_data->data),
                 static_cast<dtype_idx*>(kv_indptr->data), static_cast<dtype_out*>(output->data),
                 /*tmp=*/nullptr,
-                /*lse=*/nullptr, batch_size, nhead_qo, nhead_kv, nfeat,
-                /*causal=*/true, QKVLayout::kNHD, RotaryMode(rotary_mode),
+                /*lse=*/static_cast<float*>(lse->data), batch_size, nhead_qo, nhead_kv, nfeat,
+                /*causal=*/bool(causal), QKVLayout::kNHD, RotaryMode(rotary_mode),
                 /*allow_fp16_qk_reduction=*/false, rope_scale, rope_theta, 0);
           })})})
 }
@@ -493,6 +509,7 @@ TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionPrefillWithRaggedKVCache,
 
 TVM_DLL_EXPORT_TYPED_FUNC(FlashInferMergeState, _FlashInferMergeState);
 
+// TODO(Zihao): Unify the symbol names
 TVM_REGISTER_GLOBAL("paged_kv_cache.attention_kernel_prefill")
     .set_body_typed(_FlashInferAttentionPrefillWithPagedKVCache);
 
