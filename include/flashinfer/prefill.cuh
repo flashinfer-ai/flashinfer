@@ -876,7 +876,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
       block.sync();
     }
 
-    // rotary_mode == RotaryMode::kNone
+    // compute attention score
     compute_qk<num_frags_x, num_frags_y, num_frags_z, DTypeIn>(&qo_smem, &q_smem_offset_r, &k_smem,
                                                                &k_smem_offset_r, s_frag);
 
@@ -1070,7 +1070,7 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
       block.sync();
     }
 
-    // rotary_mode == RotaryMode::kNone
+    // compute attention score
     compute_qk<num_frags_x, num_frags_y, num_frags_z, DTypeIn>(&qo_smem, &q_smem_offset_r, &k_smem,
                                                                &k_smem_offset_r, s_frag);
 
@@ -1257,7 +1257,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
       block.sync();
     }
 
-    // rotary_mode == RotaryMode::kNone
+    // compute attention score
     compute_qk<num_frags_x, num_frags_y, num_frags_z, DTypeIn>(&qo_smem, &q_smem_offset_r, &k_smem,
                                                                &k_smem_offset_r, s_frag);
 
