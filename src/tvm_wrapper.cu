@@ -174,16 +174,17 @@ int _FlashInferSingleDecodeWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, in
 
 TVM_DLL_EXPORT_TYPED_FUNC(FlashInferSingleDecodeWithKVCache, _FlashInferSingleDecodeWithKVCache);
 
-void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
-                                                 DLTensor* page_table_indptr,     //
-                                                 DLTensor* page_table_values,     //
-                                                 DLTensor* last_page_len,         //
-                                                 DLTensor* append_length_indptr,  //
-                                                 DLTensor* output,                //
-                                                 DLTensor* lse,                   //
-                                                 int64_t causal = 1,              //
-                                                 int64_t rotary_mode = 0,         //
-                                                 double rope_scale = 1.0f,        //
+void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data,
+                                                 DLTensor* qo_indptr,          //
+                                                 DLTensor* pages,              //
+                                                 DLTensor* page_table_indptr,  //
+                                                 DLTensor* page_table_values,  //
+                                                 DLTensor* last_page_len,      //
+                                                 DLTensor* output,             //
+                                                 DLTensor* lse,                //
+                                                 int64_t causal = 1,           //
+                                                 int64_t rotary_mode = 0,      //
+                                                 double rope_scale = 1.0f,     //
                                                  double rope_theta = 1e4) {
   CHECK_EQ(q_data->device.device_type, kDLCUDA) << "The device of q_data must be CUDA.";
   CHECK_EQ(pages->device.device_type, kDLCUDA) << "The device of kv pages must be CUDA.";
@@ -193,8 +194,8 @@ void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data, DLTensor* pag
       << "The device of page_table_values matrix must be CUDA.";
   CHECK_EQ(last_page_len->device.device_type, kDLCUDA)
       << "The device of last_page_len matrix must be CUDA.";
-  CHECK_EQ(append_length_indptr->device.device_type, kDLCUDA)
-      << "The device of append_length_indptr matrix must be CUDA.";
+  CHECK_EQ(qo_indptr->device.device_type, kDLCUDA)
+      << "The device of qo_indptr matrix must be CUDA.";
   CHECK_EQ(output->device.device_type, kDLCUDA) << "The device of output must be CUDA.";
 
   int32_t dev_id = q_data->device.device_id;
@@ -202,47 +203,44 @@ void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data, DLTensor* pag
   CHECK_EQ(page_table_indptr->device.device_id, dev_id);
   CHECK_EQ(page_table_values->device.device_id, dev_id);
   CHECK_EQ(last_page_len->device.device_id, dev_id);
-  CHECK_EQ(append_length_indptr->device.device_id, dev_id);
+  CHECK_EQ(qo_indptr->device.device_id, dev_id);
   CHECK_EQ(output->device.device_id, dev_id);
 
   CHECK(q_data->dtype.lanes == 1 && pages->dtype.lanes == 1 && output->dtype.lanes == 1);
   CHECK(q_data->dtype.bits == pages->dtype.bits && q_data->dtype.code == pages->dtype.code);
   CHECK(page_table_indptr->dtype.lanes == 1 && page_table_values->dtype.lanes == 1 &&
-        last_page_len->dtype.lanes == 1 && append_length_indptr->dtype.lanes == 1);
+        last_page_len->dtype.lanes == 1 && qo_indptr->dtype.lanes == 1);
   CHECK(page_table_indptr->dtype.bits == page_table_values->dtype.bits &&
         page_table_indptr->dtype.bits == last_page_len->dtype.bits &&
-        page_table_indptr->dtype.bits == append_length_indptr->dtype.bits &&
+        page_table_indptr->dtype.bits == qo_indptr->dtype.bits &&
         page_table_indptr->dtype.code == page_table_values->dtype.code &&
         page_table_indptr->dtype.code == last_page_len->dtype.code &&
-        page_table_indptr->dtype.code == append_length_indptr->dtype.code);
+        page_table_indptr->dtype.code == qo_indptr->dtype.code);
 
   CHECK_EQ(pages->ndim, 5);
   CHECK_EQ(pages->shape[1], 2);
   int64_t nhead_kv = pages->shape[2];
-  int64_t nhead_qo = q_data->shape[2];
+  int64_t nhead_qo = q_data->shape[1];
   int64_t nfeat = pages->shape[4];
   int64_t page_size = pages->shape[3];
 
   CHECK_EQ(last_page_len->ndim, 1);
   int64_t num_total_seqs = last_page_len->shape[0];
 
-  CHECK_EQ(append_length_indptr->ndim, 1);
-  CHECK_EQ(append_length_indptr->shape[0], num_total_seqs + 1);
+  CHECK_EQ(qo_indptr->ndim, 1);
+  CHECK_EQ(qo_indptr->shape[0], num_total_seqs + 1);
 
   CHECK_EQ(page_table_indptr->ndim, 1);
   CHECK_EQ(page_table_indptr->shape[0], num_total_seqs + 1);
   CHECK_EQ(page_table_values->ndim, 1);
 
-  // TODO(Zihao): check the options of lse
-  // why q_data->ndim has to be 4?
-  CHECK_EQ(q_data->ndim, 4);
-  CHECK_EQ(output->ndim, 4);
+  CHECK_EQ(q_data->ndim, 3);
+  CHECK_EQ(output->ndim, 3);
   CHECK_EQ(q_data->shape[0], 1);
   CHECK_EQ(q_data->shape[0], output->shape[0]);
-  CHECK_EQ(q_data->shape[1], output->shape[1]);
-  CHECK_EQ(q_data->shape[3], nfeat);
-  CHECK_EQ(output->shape[2], nhead_qo);
-  CHECK_EQ(output->shape[3], nfeat);
+  CHECK_EQ(q_data->shape[2], nfeat);
+  CHECK_EQ(output->shape[1], nhead_qo);
+  CHECK_EQ(output->shape[2], nfeat);
 
   constexpr PageStorage page_storage = PageStorage::kIndices;
 
@@ -258,8 +256,8 @@ void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data, DLTensor* pag
             cudaError_t status =
                 BatchPrefillWithPagedKVCache<page_storage, dtype_in, dtype_out, dtype_idx>(
                     static_cast<dtype_in*>(q_data->data), cache,
-                    static_cast<dtype_idx*>(append_length_indptr->data),
-                    static_cast<dtype_out*>(output->data), /*tmp=*/nullptr,
+                    static_cast<dtype_idx*>(qo_indptr->data), static_cast<dtype_out*>(output->data),
+                    /*tmp=*/nullptr,
                     /*lse=*/static_cast<float*>(lse->data), nhead_qo,
                     /*causal=*/causal, RotaryMode(rotary_mode), /*allow_fp16_qk_reduction=*/false,
                     rope_scale, rope_theta, 0);
@@ -272,14 +270,13 @@ void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data, DLTensor* pag
 BatchDecodeBufferManager<PageStorage::kIndices, half, half, int32_t> buf_mgr_f16f16i32;
 
 void _FlashInferAttentionDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* pages,
-                                                DLTensor* page_table_indptr,     //
-                                                DLTensor* page_table_values,     //
-                                                DLTensor* last_page_len,         //
-                                                DLTensor* append_length_indptr,  //
-                                                DLTensor* output,                //
-                                                DLTensor* lse,                   //
-                                                int64_t rotary_mode = 0,         //
-                                                double rope_scale = 1.0f,        //
+                                                DLTensor* page_table_indptr,  //
+                                                DLTensor* page_table_values,  //
+                                                DLTensor* last_page_len,      //
+                                                DLTensor* output,             //
+                                                DLTensor* lse,                //
+                                                int64_t rotary_mode = 0,      //
+                                                double rope_scale = 1.0f,     //
                                                 double rope_theta = 1e4) {
   CHECK_EQ(q_data->device.device_type, kDLCUDA) << "The device of q_data must be CUDA.";
   CHECK_EQ(pages->device.device_type, kDLCUDA) << "The device of kv pages must be CUDA.";
@@ -289,8 +286,6 @@ void _FlashInferAttentionDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* page
       << "The device of page_table_values matrix must be CUDA.";
   CHECK_EQ(last_page_len->device.device_type, kDLCUDA)
       << "The device of last_page_len matrix must be CUDA.";
-  CHECK_EQ(append_length_indptr->device.device_type, kDLCUDA)
-      << "The device of append_length_indptr matrix must be CUDA.";
   CHECK_EQ(output->device.device_type, kDLCUDA) << "The device of output must be CUDA.";
 
   int32_t dev_id = q_data->device.device_id;
@@ -298,19 +293,16 @@ void _FlashInferAttentionDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* page
   CHECK_EQ(page_table_indptr->device.device_id, dev_id);
   CHECK_EQ(page_table_values->device.device_id, dev_id);
   CHECK_EQ(last_page_len->device.device_id, dev_id);
-  CHECK_EQ(append_length_indptr->device.device_id, dev_id);
   CHECK_EQ(output->device.device_id, dev_id);
 
   CHECK(q_data->dtype.lanes == 1 && pages->dtype.lanes == 1 && output->dtype.lanes == 1);
   CHECK(q_data->dtype.bits == pages->dtype.bits && q_data->dtype.code == pages->dtype.code);
   CHECK(page_table_indptr->dtype.lanes == 1 && page_table_values->dtype.lanes == 1 &&
-        last_page_len->dtype.lanes == 1 && append_length_indptr->dtype.lanes == 1);
+        last_page_len->dtype.lanes == 1);
   CHECK(page_table_indptr->dtype.bits == page_table_values->dtype.bits &&
         page_table_indptr->dtype.bits == last_page_len->dtype.bits &&
-        page_table_indptr->dtype.bits == append_length_indptr->dtype.bits &&
         page_table_indptr->dtype.code == page_table_values->dtype.code &&
-        page_table_indptr->dtype.code == last_page_len->dtype.code &&
-        page_table_indptr->dtype.code == append_length_indptr->dtype.code);
+        page_table_indptr->dtype.code == last_page_len->dtype.code);
 
   CHECK_EQ(pages->ndim, 5);
   CHECK_EQ(pages->shape[1], 2);
@@ -322,24 +314,17 @@ void _FlashInferAttentionDecodeWithPagedKVCache(DLTensor* q_data, DLTensor* page
   CHECK_EQ(last_page_len->ndim, 1);
   int64_t num_total_seqs = last_page_len->shape[0];
 
-  CHECK_EQ(append_length_indptr->ndim, 1);
-  CHECK_EQ(append_length_indptr->shape[0], num_total_seqs + 1);
-
   CHECK_EQ(page_table_indptr->ndim, 1);
   CHECK_EQ(page_table_indptr->shape[0], num_total_seqs + 1);
   CHECK_EQ(page_table_values->ndim, 1);
 
-  // TODO(Zihao): check the options of lse
-  // why q_data->ndim has to be 4?
-  CHECK_EQ(q_data->ndim, 4);
-  CHECK_EQ(output->ndim, 4);
-  CHECK_EQ(q_data->shape[0], num_total_seqs);
+  CHECK_EQ(q_data->ndim, 3);
+  CHECK_EQ(output->ndim, 3);
+  CHECK_EQ(q_data->shape[0], 1);
   CHECK_EQ(q_data->shape[0], output->shape[0]);
-  CHECK_EQ(q_data->shape[1], 1);
-  CHECK_EQ(q_data->shape[1], output->shape[1]);
-  CHECK_EQ(q_data->shape[3], nfeat);
-  CHECK_EQ(output->shape[2], nhead_qo);
-  CHECK_EQ(output->shape[3], nfeat);
+  CHECK_EQ(q_data->shape[2], nfeat);
+  CHECK_EQ(output->shape[1], nhead_qo);
+  CHECK_EQ(output->shape[2], nfeat);
 
   constexpr PageStorage page_storage = PageStorage::kIndices;
 
