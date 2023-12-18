@@ -1779,21 +1779,6 @@ cudaError_t BatchPrefillWithPagedKVCacheFallback(
       head_dim, causal, QKVLayout::kNHD, rotary_mode, allow_fp16_qk_reduction, rope_scale,
       rope_theta, stream);
 
-  // for (uint32_t batch_idx = 0; batch_idx < paged_kv.batch_size; ++batch_idx) {
-  //   if (qo_indptr_h[batch_idx] == qo_indptr_h[batch_idx + 1]) {
-  //     continue;
-  //   }
-  //   SinglePrefillWithKVCache(
-  //       q + qo_indptr_h[batch_idx] * num_qo_heads * head_dim,
-  //       keys + kv_indptr_h[batch_idx] * num_kv_heads * head_dim,
-  //       values + kv_indptr_h[batch_idx] * num_kv_heads * head_dim,
-  //       o + qo_indptr_h[batch_idx] * num_qo_heads * head_dim,
-  //       /*tmp=*/nullptr,
-  //       /*lse=*/return_lse ? lse + qo_indptr_h[batch_idx] * num_qo_heads : nullptr, num_qo_heads,
-  //       num_kv_heads, qo_indptr_h[batch_idx + 1] - qo_indptr_h[batch_idx],
-  //       kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx], head_dim, causal, QKVLayout::kNHD,
-  //       rotary_mode, allow_fp16_qk_reduction, rope_scale, rope_theta, stream);
-  // }
   FLASHINFER_CUDA_CALL(cudaFreeAsync(keys, stream));
   FLASHINFER_CUDA_CALL(cudaFreeAsync(values, stream));
   FLASHINFER_CUDA_CALL(cudaFreeAsync(kv_indptr, stream));
