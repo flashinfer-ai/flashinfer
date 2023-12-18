@@ -134,7 +134,7 @@ void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads, size_t 
                                                     bool allow_fp16_qk_reduction) {
   uint32_t batch_size = 7;
   std::vector<int32_t> q_lens(batch_size);
-  utils::vec_randint_(q_lens, 1, 512);
+  utils::vec_randint_(q_lens, 1, 64);
   std::vector<int32_t> kv_lens(q_lens);
   std::vector<int32_t> q_indptr{0};
   for (uint32_t i = 0; i < batch_size; ++i) {
@@ -331,7 +331,7 @@ template <typename T>
 void TestBatchPrefillKernelOneHotCorrectness(bool allow_fp16_qk_reduction) {
   for (size_t num_kv_heads : {4, 32}) {
     for (size_t num_qo_heads : {32}) {
-      for (size_t page_size : {1, 16}) {
+      for (size_t page_size : {1, 7, 16}) {
         for (size_t head_dim : {64, 128}) {
           for (size_t causal : {false, true}) {
             for (size_t rotary_mode : {0, 1}) {
@@ -350,7 +350,7 @@ template <typename T>
 void TestBatchPrefillKernelShortContextCorrectness(bool allow_fp16_qk_reduction) {
   for (size_t num_kv_heads : {4, 32}) {
     for (size_t num_qo_heads : {32}) {
-      for (size_t page_size : {1, 16}) {
+      for (size_t page_size : {1, 7, 16}) {
         for (size_t head_dim : {64, 128}) {
           for (size_t causal : {false, true}) {
             for (size_t rotary_mode : {0, 1}) {
@@ -369,7 +369,7 @@ template <typename T>
 void TestBatchPrefillKernelLongContextCorrectness(bool allow_fp16_qk_reduction) {
   for (size_t num_kv_heads : {1, 8}) {
     for (size_t num_qo_heads : {8}) {
-      for (size_t page_size : {1, 16}) {
+      for (size_t page_size : {1, 7, 16}) {
         for (size_t head_dim : {64, 128}) {
           for (size_t causal : {false, true}) {
             for (size_t rotary_mode : {0, 1}) {

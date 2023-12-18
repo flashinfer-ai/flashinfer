@@ -75,12 +75,15 @@ class BatchDecodeBufferManager {
     }
   }
 
-  void begin_forward(const paged_kv_t<page_storage, DTypeIn, IdType>& paged_kv,
+  void begin_forward(const paged_kv_t<page_storage, DTypeIn, IdType>& paged_kv, bool return_lse,
                      uint32_t num_qo_heads, RotaryMode rotary_mode) {
     uint32_t tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size;
-    BatchDecodeWithPagedKVCacheWorkEstimation<false, page_storage, DTypeIn, DTypeOut, IdType>(
-        tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size, paged_kv, num_qo_heads,
-        rotary_mode, stream_);
+    SWITCH_RETURN_LSE(return_lse, RETURN_LSE, {
+      BatchDecodeWithPagedKVCacheWorkEstimation<RETURN_LSE, page_storage, DTypeIn, DTypeOut,
+                                                IdType>(
+          tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size, paged_kv, num_qo_heads,
+          rotary_mode, stream_);
+    });
     new_batch_size_ = new_batch_size;
     if (tmp_size > 0) {
       cudaMallocAsync(&float_buffer_, sizeof(float) * tmp_size, stream_);
