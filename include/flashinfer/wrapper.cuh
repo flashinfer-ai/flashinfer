@@ -156,11 +156,15 @@ cudaError_t BatchDecodeWithPagedKVCache(
     uint32_t num_qo_heads, RotaryMode rotary_mode = RotaryMode::kNone, float rope_scale = 1.f,
     float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   paged_kv_t<page_storage, DTypeIn, IdType> new_paged_kv = paged_kv;
+  float* tmp = buf_manager->get_float_buffer();
   if (buf_manager->forward_started()) {
-    new_paged_kv.batch_size = buf_manager->get_new_batch_size();
-    new_paged_kv.indptr = buf_manager->new_indptr();
-    new_paged_kv.last_page_len = buf_manager->new_last_page_len();
-    new_paged_kv.cooperative_aux_info = buf_manager->cooperative_aux_info();
+    if (tmp != nullptr) {
+      // create auxiliary information for cooperative kernels
+      new_paged_kv.batch_size = buf_manager->get_new_batch_size();
+      new_paged_kv.indptr = buf_manager->new_indptr();
+      new_paged_kv.last_page_len = buf_manager->new_last_page_len();
+      new_paged_kv.cooperative_aux_info = buf_manager->cooperative_aux_info();
+    }
   } else {
     std::cerr << "Please call BatchDecodeBufferManager's begin_forward() before calling "
                  "BatchDecodeWithPagedKVCache()"
@@ -168,8 +172,7 @@ cudaError_t BatchDecodeWithPagedKVCache(
     abort();
   }
   return BatchDecodeWithPagedKVCache<page_storage, DTypeIn, DTypeOut, IdType>(
-      q, new_paged_kv, o, buf_manager->get_float_buffer(), lse, num_qo_heads, rotary_mode,
-      rope_scale, rope_theta, stream);
+      q, new_paged_kv, o, tmp, lse, num_qo_heads, rotary_mode, rope_scale, rope_theta, stream);
 }
 
 }  // namespace flashinfer
