@@ -285,7 +285,7 @@ void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data,
                 static_cast<dtype_idx*>(page_table_indptr->data),
                 static_cast<dtype_idx*>(last_page_len->data));
             cudaError_t status =
-                BatchPrefillWithPagedKVCache<page_storage, dtype_in, dtype_out, dtype_idx>(
+                _BatchPrefillWithPagedKVCache<page_storage, dtype_in, dtype_out, dtype_idx>(
                     static_cast<dtype_in*>(q_data->data), cache,
                     static_cast<dtype_idx*>(qo_indptr->data), static_cast<dtype_out*>(output->data),
                     /*tmp=*/nullptr,
