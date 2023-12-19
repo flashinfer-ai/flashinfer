@@ -185,24 +185,28 @@ cudaError_t _BatchPrefillWithPagedKVCache(
     RotaryMode rotary_mode = RotaryMode::kNone, bool allow_fp16_qk_reduction = false,
     float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   SWITCH_PAGE_SIZE(paged_kv.page_size, PAGE_SIZE, {
-    CHECK(PAGE_SIZE != 0) << "Unsupported page size " << paged_kv.page_size;
-    const uint32_t num_kv_heads = paged_kv.num_heads;
-    const uint32_t head_dim = paged_kv.head_dim;
-    const uint32_t batch_size = paged_kv.batch_size;
-    const uint32_t group_size = num_qo_heads / num_kv_heads;
-    CHECK(lse != nullptr) << "The lse buffer must be provided";
-    CHECK(head_dim == 128) << "The head dimension must be 128";
-    CHECK(allow_fp16_qk_reduction == false) << "The fp16 qk reduction is not supported";
-    SWITCH_GQA_GROUP_SIZE(
-        group_size, GROUP_SIZE,
-        {SWITCH_CAUSAL(causal, CAUSAL, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
-                         return BatchPrefillWithPagedKVCacheDispatched<
-                             /*return_lse=*/true, PAGE_SIZE, GROUP_SIZE, /*head_dim=*/128,
-                             page_storage, ROTARY_MODE,
-                             /*allow_fp16_qk_reduction=*/false, CAUSAL, DTypeIn, DTypeOut, IdType>(
-                             q, paged_kv, qo_indptr, o, tmp, lse, num_qo_heads, rope_scale,
-                             rope_theta, stream);
-                       })})})
+    if constexpr (PAGE_SIZE == 0) {
+      LOG(FATAL) << "Unsupported page size " << paged_kv.page_size;
+    } else {
+      const uint32_t num_kv_heads = paged_kv.num_heads;
+      const uint32_t head_dim = paged_kv.head_dim;
+      const uint32_t batch_size = paged_kv.batch_size;
+      const uint32_t group_size = num_qo_heads / num_kv_heads;
+      CHECK(lse != nullptr) << "The lse buffer must be provided";
+      CHECK(head_dim == 128) << "The head dimension must be 128";
+      CHECK(allow_fp16_qk_reduction == false) << "The fp16 qk reduction is not supported";
+      SWITCH_GQA_GROUP_SIZE(
+          group_size, GROUP_SIZE,
+          {SWITCH_CAUSAL(
+              causal, CAUSAL, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
+                return BatchPrefillWithPagedKVCacheDispatched<
+                    /*return_lse=*/true, PAGE_SIZE, GROUP_SIZE, /*head_dim=*/128, page_storage,
+                    ROTARY_MODE,
+                    /*allow_fp16_qk_reduction=*/false, CAUSAL, DTypeIn, DTypeOut, IdType>(
+                    q, paged_kv, qo_indptr, o, tmp, lse, num_qo_heads, rope_scale, rope_theta,
+                    stream);
+              })})});
+    }
   });
   return cudaSuccess;
 }
