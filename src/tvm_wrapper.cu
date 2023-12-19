@@ -625,6 +625,24 @@ void _FlashInferMergeStateInPlace(DLTensor* v, DLTensor* s, DLTensor* v_other, D
   });
 }
 
+void _FlashInferBatchQKVApplyRotaryInPlace(DLTensor* q, DLTensor* k, DLTensor* v, DLTensor* indptr,
+                                           DLTensor* offsets, int64_t batch_size,
+                                           int64_t num_qo_heads, int64_t num_kv_heads,
+                                           int64_t head_dim, int64_t qkv_layout, double rope_scale,
+                                           double rope_theta) {
+  SWITCH_TVM_CUDA_DTYPE(
+      q->dtype, dtype, {SWITCH_TVM_CUDA_IDTYPE(indptr->dtype, idtype, {
+        cudaError_t status = BatchQKVApplyRotaryInPlace(
+            static_cast<dtype*>(q->data), static_cast<dtype*>(k->data),
+            static_cast<dtype*>(v->data), static_cast<idtype*>(indptr->data),
+            static_cast<idtype*>(offsets->data), batch_size, num_qo_heads, num_kv_heads, head_dim,
+            QKVLayout(qkv_layout), rope_scale, rope_theta);
+        if (status != cudaSuccess) {
+          LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
+        }
+      })});
+}
+
 TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionPrefillWithPagedKVCache,
                           _FlashInferAttentionPrefillWithPagedKVCache);
 
@@ -643,6 +661,9 @@ TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionPrefillWithRaggedKVCache,
 TVM_DLL_EXPORT_TYPED_FUNC(FlashInferMergeState, _FlashInferMergeState);
 
 TVM_DLL_EXPORT_TYPED_FUNC(FlashInferMergeStateInPlace, _FlashInferMergeStateInPlace);
+
+TVM_DLL_EXPORT_TYPED_FUNC(FlashInferBatchQKVApplyRotaryInPlace,
+                          _FlashInferBatchQKVApplyRotaryInPlace);
 
 // TODO(Zihao): Unify the symbol names
 TVM_REGISTER_GLOBAL("paged_kv_cache.attention_kernel_prefill")
@@ -663,3 +684,6 @@ TVM_REGISTER_GLOBAL("flashinfer.attention_kernel_prefill_with_ragged_kv_cache")
 TVM_REGISTER_GLOBAL("flashinfer.merge_state").set_body_typed(_FlashInferMergeState);
 
 TVM_REGISTER_GLOBAL("flashinfer.merge_state_in_place").set_body_typed(_FlashInferMergeStateInPlace);
+
+TVM_REGISTER_GLOBAL("flashinfer.batch_qkv_apply_rotary_in_place")
+    .set_body_typed(_FlashInferBatchQKVApplyRotaryInPlace);

@@ -68,9 +68,9 @@ enum class FragLayout {
  *   non tensor-ops flops, will optimize in the future.
  */
 template <FragLayout frag_layout, uint32_t group_size, typename T>
-__device__ __forceinline__ void apply_llama_rope(T* x_first_half, T* x_second_half,
-                                                 const float* rope_freq, uint32_t offset,
-                                                 float scale = 1.f) {
+__device__ __forceinline__ void frag_apply_llama_rope(T* x_first_half, T* x_second_half,
+                                                      const float* rope_freq, uint32_t offset,
+                                                      float scale = 1.f) {
 #pragma unroll
   for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
     float cos, sin, tmp;
@@ -278,7 +278,7 @@ __device__ __forceinline__ void q_smem_inplace_apply_rotary_multiply_sm_scale(
       q_smem->ldmatrix_m8n8x4(*q_smem_offset_r, q_frag_local[0]);
       *q_smem_offset_r += num_frags_y * 2;
       q_smem->ldmatrix_m8n8x4(*q_smem_offset_r, q_frag_local[1]);
-      apply_llama_rope<FragLayout::kRowMajor, group_size, DTypeIn>(
+      frag_apply_llama_rope<FragLayout::kRowMajor, group_size, DTypeIn>(
           (DTypeIn*)q_frag_local[0], (DTypeIn*)q_frag_local[1], rope_freq[fyi],
           *q_idx + kv_len - qo_len, sm_scale);
       q_smem->stmatrix_m8n8x4(*q_smem_offset_r, q_frag_local[1]);
@@ -333,7 +333,7 @@ __device__ __forceinline__ void k_smem_inplace_apply_rotary(const uint32_t kv_id
       k_smem->ldmatrix_m8n8x4(*k_smem_offset_r, k_frag_local[0]);
       *k_smem_offset_r += num_frags_y * 2;
       k_smem->ldmatrix_m8n8x4(*k_smem_offset_r, k_frag_local[1]);
-      apply_llama_rope<FragLayout::kColMajor, 1, DTypeIn>(
+      frag_apply_llama_rope<FragLayout::kColMajor, 1, DTypeIn>(
           (DTypeIn*)k_frag_local[0], (DTypeIn*)k_frag_local[1], rope_freq[fyi], kv_idx);
       k_smem->stmatrix_m8n8x4(*k_smem_offset_r, k_frag_local[1]);
       *k_smem_offset_r -= num_frags_y * 2;

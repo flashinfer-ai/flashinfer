@@ -19,9 +19,6 @@
 
 #include <iostream>
 
-#include "layout.cuh"
-#include "rope.cuh"
-
 #define FLASHINFER_CUDA_CALL(func, ...) \
   {                                     \
     cudaError_t e = (func);             \
