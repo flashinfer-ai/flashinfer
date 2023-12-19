@@ -236,8 +236,6 @@ void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data,
 
   CHECK_EQ(q_data->ndim, 3);
   CHECK_EQ(output->ndim, 3);
-  CHECK_EQ(q_data->shape[0], 1);
-  CHECK_EQ(q_data->shape[0], output->shape[0]);
   CHECK_EQ(q_data->shape[2], nfeat);
   CHECK_EQ(output->shape[1], nhead_qo);
   CHECK_EQ(output->shape[2], nfeat);
@@ -312,7 +310,6 @@ void _FlashInferAttentionDecodeWithPagedKVCache(int64_t handler_id, DLTensor* q_
   CHECK_EQ(pages->ndim, 5);
   CHECK_EQ(pages->shape[1], 2);
   int64_t nhead_kv = pages->shape[2];
-  int64_t nhead_qo = q_data->shape[2];
   int64_t nfeat = pages->shape[4];
   int64_t page_size = pages->shape[3];
 
@@ -325,9 +322,10 @@ void _FlashInferAttentionDecodeWithPagedKVCache(int64_t handler_id, DLTensor* q_
 
   CHECK_EQ(q_data->ndim, 3);
   CHECK_EQ(output->ndim, 3);
-  CHECK_EQ(q_data->shape[0], 1);
+  CHECK_GE(q_data->shape[0], 1);
   CHECK_EQ(q_data->shape[0], output->shape[0]);
   CHECK_EQ(q_data->shape[2], nfeat);
+  int64_t nhead_qo = q_data->shape[1];
   CHECK_EQ(output->shape[1], nhead_qo);
   CHECK_EQ(output->shape[2], nfeat);
 
@@ -357,7 +355,7 @@ void _FlashInferAttentionDecodeWithPagedKVCache(int64_t handler_id, DLTensor* q_
 void _FlashInferAttentionDecodeWithPagedKVCacheBeginForward(
     int64_t handler_idx, DLTensor* page_table_indptr, DLTensor* page_table_values,
     DLTensor* last_page_len, int64_t return_lse, int64_t num_qo_heads, int64_t num_kv_heads,
-    int64_t rotary_mode) {
+    int64_t head_dim, int64_t page_size, int64_t rotary_mode) {
   CHECK_LT(handler_idx, max_num_handlers)
       << "The handler id must be less than " << max_num_handlers;
   constexpr PageStorage page_storage = PageStorage::kIndices;
@@ -368,6 +366,8 @@ void _FlashInferAttentionDecodeWithPagedKVCacheBeginForward(
   cache.indices = static_cast<dtype_idx*>(page_table_values->data);
   cache.last_page_len = static_cast<dtype_idx*>(last_page_len->data);
   cache.num_heads = num_kv_heads;
+  cache.head_dim = head_dim;
+  cache.page_size = page_size;
   f16f16i32_handlers[handler_idx].begin_forward(cache, bool(return_lse), num_qo_heads,
                                                 RotaryMode(rotary_mode));
 }
