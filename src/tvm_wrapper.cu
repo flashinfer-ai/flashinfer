@@ -625,7 +625,7 @@ void _FlashInferMergeStateInPlace(DLTensor* v, DLTensor* s, DLTensor* v_other, D
   });
 }
 
-void _FlashInferBatchQKVApplyRotaryInPlace(DLTensor* q, DLTensor* k, DLTensor* v, DLTensor* indptr,
+void _FlashInferBatchQKVApplyRotaryInPlace(DLTensor* q, DLTensor* k, DLTensor* indptr,
                                            DLTensor* offsets, int64_t batch_size,
                                            int64_t num_qo_heads, int64_t num_kv_heads,
                                            int64_t head_dim, int64_t qkv_layout, double rope_scale,
@@ -634,9 +634,8 @@ void _FlashInferBatchQKVApplyRotaryInPlace(DLTensor* q, DLTensor* k, DLTensor* v
       q->dtype, dtype, {SWITCH_TVM_CUDA_IDTYPE(indptr->dtype, idtype, {
         cudaError_t status = BatchQKVApplyRotaryInPlace(
             static_cast<dtype*>(q->data), static_cast<dtype*>(k->data),
-            static_cast<dtype*>(v->data), static_cast<idtype*>(indptr->data),
-            static_cast<idtype*>(offsets->data), batch_size, num_qo_heads, num_kv_heads, head_dim,
-            QKVLayout(qkv_layout), rope_scale, rope_theta);
+            static_cast<idtype*>(indptr->data), static_cast<idtype*>(offsets->data), batch_size,
+            num_qo_heads, num_kv_heads, head_dim, QKVLayout(qkv_layout), rope_scale, rope_theta);
         if (status != cudaSuccess) {
           LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
         }
