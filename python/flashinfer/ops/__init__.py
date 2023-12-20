@@ -225,6 +225,9 @@ def merge_state(
     V : torch.Tensor
         The merged attention output (equivalent to attention with merged KV-segment [A: B]).
         Shape: [batch_size, num_heads, head_dim]
+    S : torch.Tensor
+        The logsumexp value from the merged KV-segment [A: B].
+        Shape: [batch_size, num_heads]
     """
     return _kernels.merge_state(v_a, s_a, v_b, s_b)
 
@@ -246,6 +249,9 @@ def merge_states(v: torch.Tensor, s: torch.Tensor):
     V : torch.Tensor
         The merged attention output.
         Shape: [batch_size, num_heads, head_dim]
+    S : torch.Tensor
+        The logsumexp value from the merged KV-segments.
+        Shape: [batch_size, num_heads]
     """
     return _kernels.merge_states(v, s)
 
@@ -421,4 +427,4 @@ def batch_decode_with_shared_prefix_padded_kv_cache(
         rope_scale=rope_scale,
         rope_theta=rope_theta,
     )
-    return merge_state(V_shared, S_shared, V_unique, S_unique)
+    return merge_state(V_shared, S_shared, V_unique, S_unique)[0]

@@ -34,6 +34,7 @@ namespace flashinfer {
  * \param v_b The partial v of index set B. (n, h, d)
  * \param s_b The logsumexp value of index set B. (n, h)
  * \param v_merged The merged v of index set A union B. (n, h, d)
+ * \param s_merged The merged logsumexp value of index set A union B. (n, h)
  * \param num_heads The number of heads of v_a and v_b.
  * \param head_dim The dimension of each head.
  * \note Both s_a and s_b are logsumexp values with base 2.
@@ -41,8 +42,8 @@ namespace flashinfer {
 template <uint32_t vec_size, typename DTypeIn, typename DTypeOut>
 __global__ void MergeStateKernel(DTypeIn* __restrict__ v_a, float* __restrict__ s_a,
                                  DTypeIn* __restrict__ v_b, float* __restrict__ s_b,
-                                 DTypeOut* __restrict__ v_merged, uint32_t num_heads,
-                                 uint32_t head_dim) {
+                                 DTypeOut* __restrict__ v_merged, float* __restrict__ s_merged,
+                                 uint32_t num_heads, uint32_t head_dim) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t batch_idx = blockIdx.x;
   uint32_t head_idx = ty;
@@ -62,6 +63,7 @@ __global__ void MergeStateKernel(DTypeIn* __restrict__ v_a, float* __restrict__ 
     v_vec_o[i] = a_scale * v_vec_a[i] + b_scale * v_vec_b[i];
   }
   v_vec_o.cast_store(v_merged + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
+  s_merged[batch_idx * num_heads + head_idx] = math::ptx_log2(s_a_val + s_b_val) + s_max;
 }
 
 /*!
@@ -99,6 +101,7 @@ __global__ void MergeStateInPlaceKernel(DType* __restrict__ v, float* __restrict
     v_vec[i] = scale * v_vec[i] + other_scale * v_other_vec[i];
   }
   v_vec.cast_store(v + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
+  s[batch_idx * num_heads + head_idx] = math::ptx_log2(s_val + s_other_val) + s_max;
 }
 
 /*!
@@ -109,14 +112,15 @@ __global__ void MergeStateInPlaceKernel(DType* __restrict__ v, float* __restrict
  * \param v The partial v of index sets. (num_index_sets, n, h, d)
  * \param s The logsumexp value of index sets. (num_index_sets, n, h)
  * \param v_merged The merged v of index sets union. (n, h, d)
+ * \param s_merged The merged logsumexp value of index sets union. (n, h)
  * \param num_heads The number of heads of v.
  * \param head_dim The dimension of each head.
  * \note s are logsumexp values with base 2.
  */
 template <uint32_t vec_size, typename DTypeIn, typename DTypeOut>
 __global__ void MergeStatesKernel(DTypeIn* __restrict__ v, float* __restrict__ s,
-                                  DTypeOut* __restrict__ v_merged, uint32_t num_index_sets,
-                                  uint32_t num_heads, uint32_t head_dim) {
+                                  DTypeOut* __restrict__ v_merged, float* __restrict__ s_merged,
+                                  uint32_t num_index_sets, uint32_t num_heads, uint32_t head_dim) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t batch_size = gridDim.x;
   uint32_t batch_idx = blockIdx.x;
@@ -145,6 +149,7 @@ __global__ void MergeStatesKernel(DTypeIn* __restrict__ v, float* __restrict__ s
     v_vec_o[i] = __fdividef(v_vec_o[i], d);
   }
   v_vec_o.cast_store(v_merged + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
+  s_merged[batch_idx * num_heads + head_idx] = math::ptx_log2(d) + m;
 }
 
 /*!
@@ -156,6 +161,7 @@ __global__ void MergeStatesKernel(DTypeIn* __restrict__ v, float* __restrict__ s
  * \param v_b The partial v of index set B. (n, h, d)
  * \param s_b The logsumexp value of index set B. (n, h)
  * \param v_merged The merged v of index set A union B. (n, h, d)
+ * \param s_merged The merged logsumexp value of index set A union B. (n, h)
  * \param batch_size The batch size of self-attention states.
  * \param num_heads The number of heads of v_a and v_b.
  * \param head_dim The dimension of each head.
@@ -165,7 +171,7 @@ __global__ void MergeStatesKernel(DTypeIn* __restrict__ v, float* __restrict__ s
  */
 template <typename DTypeIn, typename DTypeOut>
 cudaError_t MergeState(DTypeIn* v_a, float* s_a, DTypeIn* v_b, float* s_b, DTypeOut* v_merged,
-                       uint32_t batch_size, uint32_t num_heads, uint32_t head_dim,
+                       float* s_merged, uint32_t batch_size, uint32_t num_heads, uint32_t head_dim,
                        cudaStream_t stream = nullptr) {
   SWITCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
@@ -174,7 +180,7 @@ cudaError_t MergeState(DTypeIn* v_a, float* s_a, DTypeIn* v_b, float* s_b, DType
     dim3 nblks(batch_size);
     dim3 nthrs(bdx, bdy);
     auto kernel = MergeStateKernel<vec_size, DTypeIn, DTypeOut>;
-    void* args[] = {&v_a, &s_a, &v_b, &s_b, &v_merged, &num_heads, &head_dim};
+    void* args[] = {&v_a, &s_a, &v_b, &s_b, &v_merged, &s_merged, &num_heads, &head_dim};
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
   });
   return cudaSuccess;
@@ -218,6 +224,7 @@ cudaError_t MergeStateInPlace(DType* v, float* s, DType* v_other, float* s_other
  * \param v The partial v of index sets. (num_index_sets, n, h, d)
  * \param s The logsumexp value of index sets. (num_index_sets, n, h)
  * \param v_merged The merged v of index sets union. (n, h, d)
+ * \param s_merged The merged logsumexp value of index sets union. (n, h)
  * \param num_index_sets The number of index sets.
  * \param batch_size The batch size of self-attention states.
  * \param num_heads The number of heads of v.
@@ -227,9 +234,9 @@ cudaError_t MergeStateInPlace(DType* v, float* s, DType* v_other, float* s_other
  * \note s are logsumexp values with base 2.
  */
 template <typename DTypeIn, typename DTypeOut>
-cudaError_t MergeStates(DTypeIn* v, float* s, DTypeOut* v_merged, uint32_t num_index_sets,
-                        uint32_t batch_size, uint32_t num_heads, uint32_t head_dim,
-                        cudaStream_t stream = nullptr) {
+cudaError_t MergeStates(DTypeIn* v, float* s, DTypeOut* v_merged, float* s_merged,
+                        uint32_t num_index_sets, uint32_t batch_size, uint32_t num_heads,
+                        uint32_t head_dim, cudaStream_t stream = nullptr) {
   SWITCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
     uint32_t bdx = HEAD_DIM / vec_size;
@@ -237,7 +244,7 @@ cudaError_t MergeStates(DTypeIn* v, float* s, DTypeOut* v_merged, uint32_t num_i
     dim3 nblks(batch_size);
     dim3 nthrs(bdx, bdy);
     auto kernel = MergeStatesKernel<vec_size, DTypeIn, DTypeOut>;
-    void* args[] = {&v, &s, &v_merged, &num_index_sets, &num_heads, &head_dim};
+    void* args[] = {&v, &s, &v_merged, &s_merged, &num_index_sets, &num_heads, &head_dim};
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
   });
   return cudaSuccess;

@@ -20,8 +20,8 @@
 
 using namespace flashinfer;
 
-torch::Tensor merge_state(torch::Tensor v_a, torch::Tensor s_a, torch::Tensor v_b,
-                          torch::Tensor s_b) {
+std::vector<torch::Tensor> merge_state(torch::Tensor v_a, torch::Tensor s_a, torch::Tensor v_b,
+                                       torch::Tensor s_b) {
   CHECK_INPUT(v_a);
   CHECK_INPUT(s_a);
   CHECK_INPUT(v_b);
@@ -40,22 +40,24 @@ torch::Tensor merge_state(torch::Tensor v_a, torch::Tensor s_a, torch::Tensor v_
   unsigned int num_heads = v_a.size(1);
   unsigned int head_dim = v_a.size(2);
   auto v_merged = torch::empty_like(v_a, v_a.options());
+  auto s_merged = torch::empty({batch_size, num_heads}, s_a.options());
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(v_a.scalar_type(), c_type, [&] {
     cudaError_t status =
         MergeState(static_cast<c_type*>(v_a.data_ptr()), static_cast<float*>(s_a.data_ptr()),
                    static_cast<c_type*>(v_b.data_ptr()), static_cast<float*>(s_b.data_ptr()),
-                   static_cast<c_type*>(v_merged.data_ptr()), batch_size, num_heads, head_dim);
+                   static_cast<c_type*>(v_merged.data_ptr()),
+                   static_cast<float*>(s_merged.data_ptr()), batch_size, num_heads, head_dim);
     TORCH_CHECK(status == cudaSuccess,
                 "MergeState kernel launch failed: ", cudaGetErrorString(status));
     return true;
   });
 
   TORCH_CHECK(success, "MergeState kernel launch failed: unsupported data type");
-  return v_merged;
+  return {v_merged, s_merged};
 }
 
-torch::Tensor merge_states(torch::Tensor v, torch::Tensor s) {
+std::vector<torch::Tensor> merge_states(torch::Tensor v, torch::Tensor s) {
   CHECK_INPUT(v);
   CHECK_INPUT(s);
   CHECK_DIM(4, v);
@@ -69,16 +71,18 @@ torch::Tensor merge_states(torch::Tensor v, torch::Tensor s) {
   unsigned int head_dim = v.size(3);
   s = s.to(torch::kFloat32);
   auto v_merged = torch::empty({batch_size, num_heads, head_dim}, v.options());
+  auto s_merged = torch::empty({batch_size, num_heads}, s.options());
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(v.scalar_type(), c_type, [&] {
     cudaError_t status = MergeStates(
         static_cast<c_type*>(v.data_ptr()), static_cast<float*>(s.data_ptr()),
-        static_cast<c_type*>(v_merged.data_ptr()), num_index_sets, batch_size, num_heads, head_dim);
+        static_cast<c_type*>(v_merged.data_ptr()), static_cast<float*>(s_merged.data_ptr()),
+        num_index_sets, batch_size, num_heads, head_dim);
     TORCH_CHECK(status == cudaSuccess,
                 "MergeStates kernel launch failed: ", cudaGetErrorString(status));
     return true;
   });
 
   TORCH_CHECK(success, "MergeStates kernel launch failed: unsupported data type");
-  return v_merged;
+  return {v_merged, s_merged};
 }

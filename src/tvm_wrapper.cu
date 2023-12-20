@@ -543,23 +543,26 @@ void _FlashInferAttentionPrefillWithRaggedKVCache(DLTensor* q_data, DLTensor* qo
 }
 
 void _FlashInferMergeState(DLTensor* v_a, DLTensor* s_a, DLTensor* v_b, DLTensor* s_b,
-                           DLTensor* v_merged) {
+                           DLTensor* v_merged, DLTensor* s_merged) {
   CHECK_EQ(v_a->device.device_type, kDLCUDA) << "The device of v_a must be CUDA.";
   CHECK_EQ(s_a->device.device_type, kDLCUDA) << "The device of s_a must be CUDA.";
   CHECK_EQ(v_b->device.device_type, kDLCUDA) << "The device of v_b must be CUDA.";
   CHECK_EQ(s_b->device.device_type, kDLCUDA) << "The device of s_b must be CUDA.";
   CHECK_EQ(v_merged->device.device_type, kDLCUDA) << "The device of v_merged must be CUDA.";
+  CHECK_EQ(s_merged->device.device_type, kDLCUDA) << "The device of s_merged must be CUDA.";
   int32_t dev_id = v_a->device.device_id;
   CHECK_EQ(s_a->device.device_id, dev_id);
   CHECK_EQ(v_b->device.device_id, dev_id);
   CHECK_EQ(s_b->device.device_id, dev_id);
   CHECK_EQ(v_merged->device.device_id, dev_id);
+  CHECK_EQ(s_merged->device.device_id, dev_id);
 
   CHECK(v_a->dtype.lanes == 1 && s_a->dtype.lanes == 1 && v_b->dtype.lanes == 1 &&
-        s_b->dtype.lanes == 1 && v_merged->dtype.lanes == 1);
+        s_b->dtype.lanes == 1 && v_merged->dtype.lanes == 1 && s_merged->dtype.lanes == 1);
   CHECK(v_a->dtype.bits == v_b->dtype.bits && v_a->dtype.code == v_b->dtype.code);
   CHECK(s_a->dtype.bits == 32 && s_a->dtype.code == kDLFloat);
   CHECK(s_b->dtype.bits == 32 && s_b->dtype.code == kDLFloat);
+  CHECK(s_merged->dtype.bits == 32 && s_merged->dtype.code == kDLFloat);
 
   CHECK_EQ(v_a->ndim, 3);
   int64_t batch_size = v_a->shape[0];
@@ -572,17 +575,23 @@ void _FlashInferMergeState(DLTensor* v_a, DLTensor* s_a, DLTensor* v_b, DLTensor
   CHECK_EQ(v_b->shape[2], head_dim);
   CHECK_EQ(s_b->shape[0], batch_size);
   CHECK_EQ(s_b->shape[1], num_heads);
+  CHECK_EQ(v_merged->shape[0], batch_size);
+  CHECK_EQ(v_merged->shape[1], num_heads);
+  CHECK_EQ(v_merged->shape[2], head_dim);
+  CHECK_EQ(s_merged->shape[0], batch_size);
+  CHECK_EQ(s_merged->shape[1], num_heads);
 
-  SWITCH_TVM_CUDA_DTYPE(
-      v_a->dtype, dtype_in, {SWITCH_TVM_CUDA_DTYPE(v_merged->dtype, dtype_out, {
-        cudaError_t status =
-            MergeState(static_cast<dtype_in*>(v_a->data), static_cast<float*>(s_a->data),
-                       static_cast<dtype_in*>(v_b->data), static_cast<float*>(s_b->data),
-                       static_cast<dtype_out*>(v_merged->data), batch_size, num_heads, head_dim);
-        if (status != cudaSuccess) {
-          LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
-        }
-      })});
+  SWITCH_TVM_CUDA_DTYPE(v_a->dtype, dtype_in, {SWITCH_TVM_CUDA_DTYPE(v_merged->dtype, dtype_out, {
+                          cudaError_t status = MergeState(
+                              static_cast<dtype_in*>(v_a->data), static_cast<float*>(s_a->data),
+                              static_cast<dtype_in*>(v_b->data), static_cast<float*>(s_b->data),
+                              static_cast<dtype_out*>(v_merged->data),
+                              static_cast<float*>(s_merged->data), batch_size, num_heads, head_dim);
+                          if (status != cudaSuccess) {
+                            LOG(FATAL)
+                                << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
+                          }
+                        })});
 }
 
 void _FlashInferMergeStateInPlace(DLTensor* v, DLTensor* s, DLTensor* v_other, DLTensor* s_other) {
