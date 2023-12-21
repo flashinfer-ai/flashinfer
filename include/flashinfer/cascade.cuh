@@ -125,7 +125,7 @@ __global__ void MergeStatesKernel(DTypeIn* __restrict__ v, float* __restrict__ s
   uint32_t batch_size = gridDim.x;
   uint32_t batch_idx = blockIdx.x;
   uint32_t head_idx = ty;
-  float m = -5e4, d = 0.f;
+  float m = -5e4, d = 1.f;
 
   vec_t<float, vec_size> v_vec_o;
   v_vec_o.fill(0.f);

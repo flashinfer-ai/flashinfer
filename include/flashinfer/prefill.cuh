@@ -228,7 +228,7 @@ __device__ __forceinline__ void init_states(float (*o_frag)[num_frags_y][8], DTy
 #pragma unroll
     for (uint32_t j = 0; j < 2; ++j) {
       m[fx][j] = DTypeQKAccum(-5e4);
-      d[fx][j] = 0.f;
+      d[fx][j] = 1.f;
     }
   }
 }
@@ -626,7 +626,7 @@ __device__ __forceinline__ void grid_sync_mdo_states(float (*o_frag)[num_frags_y
       *(float2*)&tmp_md[(((fx * 2 + j) * grid.size() + grid.thread_rank())) * 2] =
           make_float2(float(m[fx][j]), d[fx][j]);
       m[fx][j] = DTypeQKAccum(-5e4);
-      d[fx][j] = 0.f;
+      d[fx][j] = 1.f;
     }
   }
 
