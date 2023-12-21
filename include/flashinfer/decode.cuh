@@ -539,7 +539,10 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
                  cur_page_indptr_end = paged_kv.indptr[batch_idx + 1];
   const uint32_t cur_last_page_len = paged_kv.last_page_len[batch_idx];
   const uint32_t kv_chunk_len =
-      (cur_page_indptr_end - cur_page_indptr_begin - 1) * paged_kv.page_size + cur_last_page_len;
+      cur_page_indptr_begin != cur_page_indptr_end
+          ? (cur_page_indptr_end - cur_page_indptr_begin - 1) * paged_kv.page_size +
+                cur_last_page_len
+          : 0;
   const uint32_t seq_len = cooperative ? paged_kv.seq_lens_before_split()[batch_idx] : kv_chunk_len;
 
   extern __shared__ uint8_t smem[];
