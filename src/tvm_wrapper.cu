@@ -611,6 +611,9 @@ void _FlashInferMergeStateInPlace(DLTensor* v, DLTensor* s, DLTensor* v_other, D
   CHECK(s_other->dtype.bits == 32 && s_other->dtype.code == kDLFloat);
 
   CHECK_EQ(v->ndim, 3);
+  CHECK_EQ(v_other->ndim, 3);
+  CHECK_EQ(s->ndim, 2);        // qo_nnz, nhead_qo
+  CHECK_EQ(s_other->ndim, 2);  // qo_nnz, nhead_qo
   int64_t batch_size = v->shape[0];
   int64_t num_heads = v->shape[1];
   int64_t head_dim = v->shape[2];
@@ -621,7 +624,6 @@ void _FlashInferMergeStateInPlace(DLTensor* v, DLTensor* s, DLTensor* v_other, D
   CHECK_EQ(v_other->shape[2], head_dim);
   CHECK_EQ(s_other->shape[0], batch_size);
   CHECK_EQ(s_other->shape[1], num_heads);
-  CHECK_EQ(s_other->shape[2], head_dim);
 
   SWITCH_TVM_CUDA_DTYPE(v->dtype, dtype, {
     cudaError_t status =
