@@ -33,8 +33,11 @@ flashinfer_option(FLASHINFER_CUDA_ARCHITECTURES "CUDA architectures of tests/ben
 set(CMAKE_CUDA_ARCHITECTURES ${FLASHINFER_CUDA_ARCHITECTURES})
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules")
-add_subdirectory(3rdparty/nvbench)
-add_subdirectory(3rdparty/googletest)
+if(FLASHINFER_PREFILL OR FLASHINFER_DECODE OR FLASHINFER_PAGE)
+  message(STATUS "NVBench and GoogleTest enabled")
+  add_subdirectory(3rdparty/nvbench)
+  add_subdirectory(3rdparty/googletest)
+endif(FLASHINFER_PREFILL OR FLASHINFER_DECODE OR FLASHINFER_PAGE)
 find_package(Thrust REQUIRED)
 
 set(
