@@ -72,13 +72,15 @@
     __VA_ARGS__                                     \
   }
 
-#define SWITCH_NUM_FRAGS_X(greater_than_64, NUM_FRAGS_X, ...) \
-  if (greater_than_64) {                                      \
-    constexpr size_t NUM_FRAGS_X = 2;                         \
-    __VA_ARGS__                                               \
-  } else {                                                    \
-    constexpr size_t NUM_FRAGS_X = 1;                         \
-    __VA_ARGS__                                               \
+#define SWITCH_NUM_FRAGS_X(num_frags_x, NUM_FRAGS_X, ...)                 \
+  if (num_frags_x == 1) {                                                 \
+    constexpr size_t NUM_FRAGS_X = 1;                                     \
+    __VA_ARGS__                                                           \
+  } else if (num_frags_x == 2) {                                          \
+    constexpr size_t NUM_FRAGS_X = 2;                                     \
+    __VA_ARGS__                                                           \
+  } else {                                                                \
+    std::cerr << "Unsupported num_frags_x: " << num_frags_x << std::endl; \
   }
 
 #define SWITCH_NUM_FRAGS_Z(max_frags_z, NUM_FRAGS_Z, ...)                 \
@@ -188,5 +190,20 @@
       abort();                                                                   \
     }                                                                            \
   }
+
+namespace flashinfer {
+
+bool is_device_ptr(const void* ptr) {
+  cudaPointerAttributes attrs;
+  FLASHINFER_CUDA_CALL(cudaPointerGetAttributes(&attrs, ptr));
+  return attrs.type == cudaMemoryTypeDevice;
+}
+
+template <typename T>
+T ceil_div(T x, T y) {
+  return (x + y - 1) / y;
+}
+
+}  // namespace flashinfer
 
 #endif  // FLASHINFER_UTILS_CUH_

@@ -204,44 +204,44 @@ int _FlashInferSingleDecodeWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, in
 
 TVM_DLL_EXPORT_TYPED_FUNC(FlashInferSingleDecodeWithKVCache, _FlashInferSingleDecodeWithKVCache);
 
+constexpr uint32_t max_num_handlers = 8;
+thread_local BatchPrefillHandler<int32_t> batch_prefill_paged_kv_handlers[max_num_handlers];
+thread_local BatchPrefillHandler<int32_t> batch_prefill_ragged_kv_handler;
+
 /*!
  * \brief The BatchPrefillWithKVCache function with some parameters fixed at compile time
  *    to accelerate the dispatching.
  */
 template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
-cudaError_t _BatchPrefillWithPagedKVCache(
-    DTypeIn* q, paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, IdType* qo_indptr, DTypeOut* o,
-    float* tmp, float* lse, uint32_t num_qo_heads, bool causal = true,
-    RotaryMode rotary_mode = RotaryMode::kNone, bool allow_fp16_qk_reduction = false,
-    float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {
-  SWITCH_PAGE_SIZE(paged_kv.page_size, PAGE_SIZE, {
-    if constexpr (PAGE_SIZE == 0) {
-      LOG(FATAL) << "Unsupported page size " << paged_kv.page_size;
-    } else {
-      const uint32_t num_kv_heads = paged_kv.num_heads;
-      const uint32_t head_dim = paged_kv.head_dim;
-      const uint32_t batch_size = paged_kv.batch_size;
-      const uint32_t group_size = num_qo_heads / num_kv_heads;
-      CHECK(lse != nullptr) << "The lse buffer must be provided";
-      CHECK(head_dim == 128) << "The head dimension must be 128";
-      CHECK(allow_fp16_qk_reduction == false) << "The fp16 qk reduction is not supported";
-      SWITCH_GQA_GROUP_SIZE(
-          group_size, GROUP_SIZE,
-          {SWITCH_CAUSAL(
-              causal, CAUSAL, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
-                return BatchPrefillWithPagedKVCacheDispatched<
-                    /*return_lse=*/true, PAGE_SIZE, GROUP_SIZE, /*head_dim=*/128, page_storage,
-                    ROTARY_MODE,
-                    /*allow_fp16_qk_reduction=*/false, CAUSAL, DTypeIn, DTypeOut, IdType>(
-                    q, paged_kv, qo_indptr, o, tmp, lse, num_qo_heads, rope_scale, rope_theta,
-                    stream);
-              })})});
-    }
-  });
+cudaError_t _BatchPrefillWithPagedKVCache(BatchPrefillHandler<IdType>* handler, DTypeIn* q,
+                                          paged_kv_t<page_storage, DTypeIn, IdType> paged_kv,
+                                          IdType* qo_indptr, DTypeOut* o, float* lse,
+                                          uint32_t num_qo_heads, bool causal = true,
+                                          RotaryMode rotary_mode = RotaryMode::kNone,
+                                          bool allow_fp16_qk_reduction = false,
+                                          float rope_scale = 1.f, float rope_theta = 1e4,
+                                          cudaStream_t stream = nullptr) {
+  CHECK(lse != nullptr) << "The lse buffer must be provided";
+  CHECK(allow_fp16_qk_reduction == false) << "The fp16 qk reduction is not supported";
+  CHECK(paged_kv.head_dim == 128) << "The head dimension must be 128";
+  const uint32_t num_kv_heads = paged_kv.num_heads;
+  const uint32_t head_dim = paged_kv.head_dim;
+  const uint32_t batch_size = paged_kv.batch_size;
+  const uint32_t group_size = num_qo_heads / num_kv_heads;
+  SWITCH_GQA_GROUP_SIZE(
+      group_size, GROUP_SIZE,
+      {SWITCH_CAUSAL(
+          causal, CAUSAL, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
+            return BatchPrefillWithPagedKVCacheDispatched<
+                page_storage, /*return_lse=*/true, GROUP_SIZE, /*head_dim=*/128, ROTARY_MODE,
+                /*allow_fp16_qk_reduction=*/false, CAUSAL, DTypeIn, DTypeOut, IdType>(
+                handler, q, paged_kv, qo_indptr, o, lse, num_qo_heads, rope_scale, rope_theta,
+                stream);
+          })})});
   return cudaSuccess;
 }
 
-void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data,
+void _FlashInferAttentionPrefillWithPagedKVCache(int64_t handler_id, DLTensor* q_data,
                                                  DLTensor* qo_indptr,          //
                                                  DLTensor* pages,              //
                                                  DLTensor* page_table_indptr,  //
@@ -253,6 +253,7 @@ void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data,
                                                  int64_t rotary_mode = 0,      //
                                                  double rope_scale = 1.0f,     //
                                                  double rope_theta = 1e4) {
+  CHECK(handler_id < max_num_handlers) << "The handler id must be less than " << max_num_handlers;
   CHECK_EQ(q_data->device.device_type, kDLCUDA) << "The device of q_data must be CUDA.";
   CHECK_EQ(pages->device.device_type, kDLCUDA) << "The device of kv pages must be CUDA.";
   CHECK_EQ(page_table_indptr->device.device_type, kDLCUDA)
@@ -320,9 +321,9 @@ void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data,
                 static_cast<dtype_idx*>(last_page_len->data));
             cudaError_t status =
                 _BatchPrefillWithPagedKVCache<page_storage, dtype_in, dtype_out, dtype_idx>(
+                    &batch_prefill_paged_kv_handlers[handler_id],
                     static_cast<dtype_in*>(q_data->data), cache,
                     static_cast<dtype_idx*>(qo_indptr->data), static_cast<dtype_out*>(output->data),
-                    /*tmp=*/nullptr,
                     /*lse=*/static_cast<float*>(lse->data), nhead_qo,
                     /*causal=*/causal, RotaryMode(rotary_mode), /*allow_fp16_qk_reduction=*/false,
                     rope_scale, rope_theta, 0);
@@ -332,10 +333,27 @@ void _FlashInferAttentionPrefillWithPagedKVCache(DLTensor* q_data,
           })})});
 }
 
+void _FlashInferAttentionPrefillWithPagedKVCacheBeginForward(int64_t handler_idx,
+                                                             DLTensor* qo_indptr,
+                                                             int64_t batch_size,
+                                                             int64_t num_qo_heads,
+                                                             int64_t num_kv_heads) {
+  CHECK(handler_idx < max_num_handlers) << "The handler id must be less than " << max_num_handlers;
+  const uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
+  SWITCH_TVM_CUDA_IDTYPE(qo_indptr->dtype, dtype_idx, {
+    batch_prefill_paged_kv_handlers[handler_idx].begin_forward(
+        static_cast<dtype_idx*>(qo_indptr->data), batch_size, gqa_group_size);
+  });
+}
+
+void _FlashInferAttentionPrefillWithPagedKVCacheEndForward(int64_t handler_idx) {
+  CHECK(handler_idx < max_num_handlers) << "The handler id must be less than " << max_num_handlers;
+  batch_prefill_paged_kv_handlers[handler_idx].end_forward();
+}
+
 // Creates a pool of handlers with a fixed size to independently handle decoding forward passes.
-constexpr uint32_t max_num_handlers = 8;
 thread_local BatchDecodeHandler<PageStorage::kIndices, half, half, int32_t>
-    f16f16i32_handlers[max_num_handlers];
+    batch_decode_handlers[max_num_handlers];
 
 void _FlashInferAttentionDecodeWithPagedKVCache(int64_t handler_id, DLTensor* q_data,
                                                 DLTensor* pages,
@@ -409,7 +427,7 @@ void _FlashInferAttentionDecodeWithPagedKVCache(int64_t handler_id, DLTensor* q_
                 static_cast<dtype_idx*>(last_page_len->data));
             cudaError_t status =
                 BatchDecodeWithPagedKVCache<page_storage, dtype_in, dtype_out, dtype_idx>(
-                    &f16f16i32_handlers[handler_id], static_cast<dtype_in*>(q_data->data), cache,
+                    &batch_decode_handlers[handler_id], static_cast<dtype_in*>(q_data->data), cache,
                     static_cast<dtype_out*>(output->data),
                     /*lse=*/static_cast<float*>(lse->data), nhead_qo, RotaryMode(rotary_mode),
                     rope_scale, rope_theta, 0);
@@ -435,13 +453,13 @@ void _FlashInferAttentionDecodeWithPagedKVCacheBeginForward(
   cache.num_heads = num_kv_heads;
   cache.head_dim = head_dim;
   cache.page_size = page_size;
-  f16f16i32_handlers[handler_idx].begin_forward(cache, bool(return_lse), num_qo_heads,
-                                                RotaryMode(rotary_mode));
+  batch_decode_handlers[handler_idx].begin_forward(cache, bool(return_lse), num_qo_heads,
+                                                   RotaryMode(rotary_mode));
 }
 
 void _FlashInferAttentionDecodeWithPagedKVCacheEndForward(int64_t handler_id) {
   CHECK_LT(handler_id, max_num_handlers) << "The handler id must be less than " << max_num_handlers;
-  f16f16i32_handlers[handler_id].end_forward();
+  batch_decode_handlers[handler_id].end_forward();
 }
 
 /*!
@@ -450,26 +468,26 @@ void _FlashInferAttentionDecodeWithPagedKVCacheEndForward(int64_t handler_id) {
  */
 template <typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t _BatchPrefillWithRaggedKVCache(
-    DTypeIn* q, IdType* qo_indptr, DTypeIn* k, DTypeIn* v, IdType* kv_indptr, DTypeOut* o,
-    float* tmp, float* lse, const uint32_t batch_size, const uint32_t num_qo_heads,
-    const uint32_t num_kv_heads, const uint32_t head_dim, bool causal = true,
-    QKVLayout layout = QKVLayout::kNHD, RotaryMode rotary_mode = RotaryMode::kNone,
-    bool allow_fp16_qk_reduction = false, const float rope_scale = 1.f,
-    const float rope_theta = 1e4, cudaStream_t stream = nullptr) {
+    BatchPrefillHandler<IdType>* handler, DTypeIn* q, IdType* qo_indptr, DTypeIn* k, DTypeIn* v,
+    IdType* kv_indptr, DTypeOut* o, float* lse, const uint32_t batch_size,
+    const uint32_t num_qo_heads, const uint32_t num_kv_heads, const uint32_t head_dim,
+    bool causal = true, QKVLayout layout = QKVLayout::kNHD,
+    RotaryMode rotary_mode = RotaryMode::kNone, bool allow_fp16_qk_reduction = false,
+    const float rope_scale = 1.f, const float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   CHECK(lse != nullptr) << "The lse buffer must be provided";
   CHECK(head_dim == 128) << "The head dimension must be 128";
   CHECK(layout == QKVLayout::kNHD) << "The layout must be NHD";
   CHECK(allow_fp16_qk_reduction == false) << "The fp16 qk reduction is not supported";
   SWITCH_GQA_GROUP_SIZE(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
-      {SWITCH_CAUSAL(causal, CAUSAL, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
-                       return BatchPrefillWithRaggedKVCacheDispatched<
-                           /*return_lse=*/true, GROUP_SIZE, /*head_dim=*/128,
-                           /*layout=*/QKVLayout::kNHD, ROTARY_MODE,
-                           /*allow_fp16_qk_reduction=*/false, CAUSAL, DTypeIn, DTypeOut, IdType>(
-                           q, qo_indptr, k, v, kv_indptr, o, tmp, lse, batch_size, num_kv_heads,
-                           rope_scale, rope_theta, stream);
-                     })})});
+      {SWITCH_CAUSAL(
+          causal, CAUSAL, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
+            return BatchPrefillWithRaggedKVCacheDispatched<
+                /*return_lse=*/true, GROUP_SIZE, /*head_dim=*/128, /*layout=*/QKVLayout::kNHD,
+                ROTARY_MODE, /*allow_fp16_qk_reduction=*/false, CAUSAL, DTypeIn, DTypeOut, IdType>(
+                handler, q, qo_indptr, k, v, kv_indptr, o, lse, batch_size, num_kv_heads,
+                rope_scale, rope_theta, stream);
+          })})});
   return cudaSuccess;
 }
 
@@ -532,14 +550,29 @@ void _FlashInferAttentionPrefillWithRaggedKVCache(DLTensor* q_data, DLTensor* qo
       {SWITCH_TVM_CUDA_DTYPE(
           output->dtype, dtype_out, {SWITCH_TVM_CUDA_IDTYPE(qo_indptr->dtype, dtype_idx, {
             cudaError_t status = _BatchPrefillWithRaggedKVCache<dtype_in, dtype_out, dtype_idx>(
-                static_cast<dtype_in*>(q_data->data), static_cast<dtype_idx*>(qo_indptr->data),
-                static_cast<dtype_in*>(k_data->data), static_cast<dtype_in*>(v_data->data),
-                static_cast<dtype_idx*>(kv_indptr->data), static_cast<dtype_out*>(output->data),
-                /*tmp=*/nullptr,
+                &batch_prefill_ragged_kv_handler, static_cast<dtype_in*>(q_data->data),
+                static_cast<dtype_idx*>(qo_indptr->data), static_cast<dtype_in*>(k_data->data),
+                static_cast<dtype_in*>(v_data->data), static_cast<dtype_idx*>(kv_indptr->data),
+                static_cast<dtype_out*>(output->data),
                 /*lse=*/static_cast<float*>(lse->data), batch_size, nhead_qo, nhead_kv, nfeat,
                 /*causal=*/bool(causal), QKVLayout::kNHD, RotaryMode(rotary_mode),
                 /*allow_fp16_qk_reduction=*/false, rope_scale, rope_theta, 0);
           })})})
+}
+
+void _FlashInferAttentionPrefillWithRaggedKVCacheBeginForward(DLTensor* qo_indptr,
+                                                              int64_t batch_size,
+                                                              int64_t num_qo_heads,
+                                                              int64_t num_kv_heads) {
+  const uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
+  SWITCH_TVM_CUDA_IDTYPE(qo_indptr->dtype, dtype_idx, {
+    batch_prefill_ragged_kv_handler.begin_forward(static_cast<dtype_idx*>(qo_indptr->data),
+                                                  batch_size, gqa_group_size);
+  });
+}
+
+void _FlashInferAttentionPrefillWithRaggedKVCacheEndForward() {
+  batch_prefill_ragged_kv_handler.end_forward();
 }
 
 void _FlashInferMergeState(DLTensor* v_a, DLTensor* s_a, DLTensor* v_b, DLTensor* s_b,
@@ -656,6 +689,12 @@ void _FlashInferBatchQKApplyRotaryInPlace(DLTensor* q, DLTensor* k, DLTensor* in
 TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionPrefillWithPagedKVCache,
                           _FlashInferAttentionPrefillWithPagedKVCache);
 
+TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionPrefillWithPagedKVCacheBeginForward,
+                          _FlashInferAttentionPrefillWithPagedKVCacheBeginForward);
+
+TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionPrefillWithPagedKVCacheEndForward,
+                          _FlashInferAttentionPrefillWithPagedKVCacheEndForward);
+
 TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionDecodeWithPagedKVCache,
                           _FlashInferAttentionDecodeWithPagedKVCache);
 
@@ -668,6 +707,12 @@ TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionDecodeWithPagedKVCacheEndForward,
 TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionPrefillWithRaggedKVCache,
                           _FlashInferAttentionPrefillWithRaggedKVCache);
 
+TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionPrefillWithRaggedKVCacheBeginForward,
+                          _FlashInferAttentionPrefillWithRaggedKVCacheBeginForward);
+
+TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionPrefillWithRaggedKVCacheEndForward,
+                          _FlashInferAttentionPrefillWithRaggedKVCacheEndForward);
+
 TVM_DLL_EXPORT_TYPED_FUNC(FlashInferMergeState, _FlashInferMergeState);
 
 TVM_DLL_EXPORT_TYPED_FUNC(FlashInferMergeStateInPlace, _FlashInferMergeStateInPlace);
@@ -678,6 +723,12 @@ TVM_DLL_EXPORT_TYPED_FUNC(FlashInferBatchQKApplyRotaryInPlace,
 // TODO(Zihao): Unify the symbol names
 TVM_REGISTER_GLOBAL("paged_kv_cache.attention_kernel_prefill")
     .set_body_typed(_FlashInferAttentionPrefillWithPagedKVCache);
+
+TVM_REGISTER_GLOBAL("paged_kv_cache.attention_kernel_prefill_begin_forward")
+    .set_body_typed(_FlashInferAttentionPrefillWithPagedKVCacheBeginForward);
+
+TVM_REGISTER_GLOBAL("paged_kv_cache.attention_kernel_prefill_end_forward")
+    .set_body_typed(_FlashInferAttentionPrefillWithPagedKVCacheEndForward);
 
 TVM_REGISTER_GLOBAL("paged_kv_cache.attention_kernel_decode")
     .set_body_typed(_FlashInferAttentionDecodeWithPagedKVCache);
@@ -690,6 +741,12 @@ TVM_REGISTER_GLOBAL("paged_kv_cache.attention_kernel_decode_end_forward")
 
 TVM_REGISTER_GLOBAL("flashinfer.attention_kernel_prefill_with_ragged_kv_cache")
     .set_body_typed(_FlashInferAttentionPrefillWithRaggedKVCache);
+
+TVM_REGISTER_GLOBAL("flashinfer.attention_kernel_prefill_with_ragged_kv_cache_begin_forward")
+    .set_body_typed(_FlashInferAttentionPrefillWithRaggedKVCacheBeginForward);
+
+TVM_REGISTER_GLOBAL("flashinfer.attention_kernel_prefill_with_ragged_kv_cache_end_forward")
+    .set_body_typed(_FlashInferAttentionPrefillWithRaggedKVCacheEndForward);
 
 TVM_REGISTER_GLOBAL("flashinfer.merge_state").set_body_typed(_FlashInferMergeState);
 

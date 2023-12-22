@@ -22,7 +22,9 @@
 #include <vector>
 
 #include "decode.cuh"
+#include "prefill.cuh"
 #include "rope.cuh"
+#include "utils.cuh"
 
 namespace flashinfer {
 
@@ -132,6 +134,67 @@ class BatchDecodeHandler {
   cudaStream_t stream_;
 };
 
+template <typename IdType>
+class BatchPrefillHandler {
+ public:
+  IdType* get_request_indices() const { return request_indices_; }
+
+  IdType* get_tile_indices() const { return tile_indices_; }
+
+  uint32_t get_num_frags_x() const { return num_frags_x_; }
+
+  uint32_t get_num_qo_tiles() const { return num_qo_tiles_; }
+
+  bool forward_started() const { return request_indices_ != nullptr; }
+
+  void begin_forward(IdType* qo_indptr, uint32_t batch_size, uint32_t gqa_group_size) {
+    std::vector<IdType> request_indices_h, tile_indices_h;
+    std::tie(num_frags_x_, num_qo_tiles_, request_indices_h, tile_indices_h) =
+        split_qo_indptr(qo_indptr, batch_size, gqa_group_size, stream_);
+    cudaMallocAsync(&request_indices_, sizeof(IdType) * request_indices_h.size(), stream_);
+    cudaMallocAsync(&tile_indices_, sizeof(IdType) * tile_indices_h.size(), stream_);
+    cudaMemcpyAsync(request_indices_, request_indices_h.data(),
+                    sizeof(IdType) * request_indices_h.size(), cudaMemcpyHostToDevice, stream_);
+    cudaMemcpyAsync(tile_indices_, tile_indices_h.data(), sizeof(IdType) * tile_indices_h.size(),
+                    cudaMemcpyHostToDevice, stream_);
+  }
+
+  void end_forward() {
+    forward_started_ = false;
+    num_frags_x_ = 0U;
+    num_qo_tiles_ = 0U;
+    if (request_indices_ != nullptr) {
+      cudaFreeAsync(request_indices_, stream_);
+      request_indices_ = nullptr;
+    }
+    if (tile_indices_ != nullptr) {
+      cudaFreeAsync(tile_indices_, stream_);
+      tile_indices_ = nullptr;
+    }
+  }
+
+  cudaStream_t GetCUDAStream() const { return stream_; }
+
+  void SetCUDAStream(cudaStream_t stream) { stream_ = stream; }
+
+  BatchPrefillHandler()
+      : request_indices_(nullptr),
+        tile_indices_(nullptr),
+        num_frags_x_(0U),
+        num_qo_tiles_(0U),
+        forward_started_(false),
+        stream_(nullptr) {}
+  ~BatchPrefillHandler() { end_forward(); }
+
+ private:
+  IdType* request_indices_;
+  IdType* tile_indices_;
+  uint32_t num_frags_x_;
+  uint32_t num_qo_tiles_;
+  bool forward_started_;
+  cudaStream_t stream_;
+};
+
 /*!
  * \brief Wrapper of BatchDecodeWithPagedKVCache function, and caches the temporary buffer
  *   for cooperative kernels.
@@ -178,6 +241,86 @@ cudaError_t BatchDecodeWithPagedKVCache(
       q, new_paged_kv, o, tmp, lse, num_qo_heads, rotary_mode, rope_scale, rope_theta, stream);
 }
 
-}  // namespace flashinfer
+template <PageStorage page_storage, bool RETURN_LSE, uint32_t GROUP_SIZE, uint32_t HEAD_DIM,
+          RotaryMode ROTARY_MODE, bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL, typename DTypeIn,
+          typename DTypeOut, typename IdType>
+cudaError_t BatchPrefillWithPagedKVCacheDispatched(
+    BatchPrefillHandler<IdType>* handler, DTypeIn* q,
+    paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, IdType* qo_indptr, DTypeOut* o, float* lse,
+    uint32_t num_qo_heads, float rope_scale = 1.f, float rope_theta = 1e4,
+    cudaStream_t stream = nullptr) {
+  float* tmp = nullptr;
+  IdType* request_indices = nullptr;
+  IdType* tile_indices = nullptr;
+  uint32_t num_frags_x = 0U;
+  uint32_t num_qo_tiles = 0U;
+  if (handler->forward_started()) {
+    request_indices = handler->get_request_indices();
+    tile_indices = handler->get_tile_indices();
+    num_frags_x = handler->get_num_frags_x();
+    num_qo_tiles = handler->get_num_qo_tiles();
+  } else {
+    std::cerr << "Please call BatchPrefillHandler's begin_forward() before calling "
+                 "BatchPrefillWithPagedKVCache()"
+              << std::endl;
+    abort();
+  }
 
+  SWITCH_NUM_FRAGS_X(
+      num_frags_x, NUM_FRAGS_X, {SWITCH_PAGE_SIZE(paged_kv.page_size, PAGE_SIZE, {
+        if constexpr (PAGE_SIZE == 0) {
+          return BatchPrefillWithPagedKVCacheFallbackDispatched<
+              page_storage, RETURN_LSE, NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM, ROTARY_MODE,
+              ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
+              q, request_indices, tile_indices, qo_indptr, paged_kv, o, tmp, lse, num_qo_tiles,
+              rope_scale, rope_theta, stream);
+        } else {
+          return BatchPrefillWithPagedKVCacheDispatched<
+              page_storage, RETURN_LSE, NUM_FRAGS_X, PAGE_SIZE, GROUP_SIZE, HEAD_DIM, ROTARY_MODE,
+              ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
+              q, request_indices, tile_indices, qo_indptr, paged_kv, o, tmp, lse, num_qo_tiles,
+              rope_scale, rope_theta, stream);
+        }
+      })});
+  return cudaSuccess;
+}
+
+template <bool RETURN_LSE, uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout LAYOUT,
+          RotaryMode ROTARY_MODE, bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL, typename DTypeIn,
+          typename DTypeOut, typename IdType>
+cudaError_t BatchPrefillWithRaggedKVCacheDispatched(BatchPrefillHandler<IdType>* handler,
+                                                    DTypeIn* q, IdType* qo_indptr, DTypeIn* k,
+                                                    DTypeIn* v, IdType* kv_indptr, DTypeOut* o,
+                                                    float* lse, const uint32_t batch_size,
+                                                    const uint32_t num_kv_heads,
+                                                    const float rope_scale, const float rope_theta,
+                                                    cudaStream_t stream = nullptr) {
+  float* tmp = nullptr;
+  IdType* request_indices = nullptr;
+  IdType* tile_indices = nullptr;
+  uint32_t num_frags_x = 0U;
+  uint32_t num_qo_tiles = 0U;
+  if (handler->forward_started()) {
+    request_indices = handler->get_request_indices();
+    tile_indices = handler->get_tile_indices();
+    num_frags_x = handler->get_num_frags_x();
+    num_qo_tiles = handler->get_num_qo_tiles();
+  } else {
+    std::cerr << "Please call BatchPrefillHandler's begin_forward() before calling "
+                 "BatchPrefillWithRaggedKVCache()"
+              << std::endl;
+    abort();
+  }
+
+  SWITCH_NUM_FRAGS_X(num_frags_x, NUM_FRAGS_X, {
+    return BatchPrefillWithRaggedKVCacheDispatched<RETURN_LSE, NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM,
+                                                   LAYOUT, ROTARY_MODE, ALLOW_FP16_QK_REDUCTION,
+                                                   CAUSAL, DTypeIn, DTypeOut, IdType>(
+        q, request_indices, tile_indices, qo_indptr, k, v, kv_indptr, o, tmp, lse, batch_size,
+        num_qo_tiles, num_kv_heads, rope_scale, rope_theta, stream);
+  });
+  return cudaSuccess;
+}
+
+}  // namespace flashinfer
 #endif  // FLASHINFER_HANDLER_CUH_
