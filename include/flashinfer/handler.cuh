@@ -151,8 +151,8 @@ class BatchPrefillHandler {
     std::vector<IdType> request_indices_h, tile_indices_h;
     std::tie(num_frags_x_, num_qo_tiles_, request_indices_h, tile_indices_h) =
         split_qo_indptr(qo_indptr, batch_size, gqa_group_size, stream_);
-    cudaMallocAsync(&request_indices_, sizeof(IdType) * request_indices_h.size(), stream_);
-    cudaMallocAsync(&tile_indices_, sizeof(IdType) * tile_indices_h.size(), stream_);
+    cudaMalloc(&request_indices_, sizeof(IdType) * request_indices_h.size());
+    cudaMalloc(&tile_indices_, sizeof(IdType) * tile_indices_h.size());
     cudaMemcpyAsync(request_indices_, request_indices_h.data(),
                     sizeof(IdType) * request_indices_h.size(), cudaMemcpyHostToDevice, stream_);
     cudaMemcpyAsync(tile_indices_, tile_indices_h.data(), sizeof(IdType) * tile_indices_h.size(),
