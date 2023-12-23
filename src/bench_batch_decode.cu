@@ -73,7 +73,7 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
     // begin forward
     handler.BeginForward(paged_kv, false, num_qo_heads, rotary_mode);
     state.exec([&](nvbench::launch&) {
-      cudaError_t status = BatchDecodeWithPagedKVCache<PageStorage::kIndices, T, T>(
+      cudaError_t status = BatchDecodeWithPagedKVCacheWrapper<PageStorage::kIndices, T, T>(
           &handler, thrust::raw_pointer_cast(q.data()), paged_kv,
           thrust::raw_pointer_cast(o.data()), /*lse=*/nullptr, num_qo_heads, rotary_mode);
       if (status != cudaSuccess) {

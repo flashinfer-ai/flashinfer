@@ -217,7 +217,7 @@ class BatchPrefillHandler {
  *   BatchDecodeHandler.
  */
 template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
-cudaError_t BatchDecodeWithPagedKVCache(
+cudaError_t BatchDecodeWithPagedKVCacheWrapper(
     BatchDecodeHandler<page_storage, DTypeIn, DTypeOut, IdType>* handler, DTypeIn* q,
     paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, DTypeOut* o, float* lse,
     uint32_t num_qo_heads, RotaryMode rotary_mode = RotaryMode::kNone, float rope_scale = 1.f,
@@ -234,7 +234,7 @@ cudaError_t BatchDecodeWithPagedKVCache(
     }
   } else {
     std::cerr << "Please call BatchDecodeHandler's BeginForward() before calling "
-                 "BatchDecodeWithPagedKVCache()"
+                 "BatchDecodeWithPagedKVCacheWrapper()"
               << std::endl;
     abort();
   }
@@ -245,7 +245,7 @@ cudaError_t BatchDecodeWithPagedKVCache(
 template <PageStorage page_storage, bool RETURN_LSE, uint32_t GROUP_SIZE, uint32_t HEAD_DIM,
           RotaryMode ROTARY_MODE, bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL, typename DTypeIn,
           typename DTypeOut, typename IdType>
-cudaError_t BatchPrefillWithPagedKVCacheDispatched(
+cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
     BatchPrefillHandler<IdType>* handler, DTypeIn* q,
     paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, IdType* qo_indptr, DTypeOut* o, float* lse,
     uint32_t num_qo_heads, float rope_scale = 1.f, float rope_theta = 1e4,
@@ -262,7 +262,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     num_qo_tiles = handler->GetNumQOTiles();
   } else {
     std::cerr << "Please call BatchPrefillHandler's BeginForward() before calling "
-                 "BatchPrefillWithPagedKVCache()"
+                 "BatchPrefillWithPagedKVCacheWrapper()"
               << std::endl;
     abort();
   }
@@ -289,13 +289,11 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
 template <bool RETURN_LSE, uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout LAYOUT,
           RotaryMode ROTARY_MODE, bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL, typename DTypeIn,
           typename DTypeOut, typename IdType>
-cudaError_t BatchPrefillWithRaggedKVCacheDispatched(BatchPrefillHandler<IdType>* handler,
-                                                    DTypeIn* q, IdType* qo_indptr, DTypeIn* k,
-                                                    DTypeIn* v, IdType* kv_indptr, DTypeOut* o,
-                                                    float* lse, const uint32_t batch_size,
-                                                    const uint32_t num_kv_heads,
-                                                    const float rope_scale, const float rope_theta,
-                                                    cudaStream_t stream = nullptr) {
+cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
+    BatchPrefillHandler<IdType>* handler, DTypeIn* q, IdType* qo_indptr, DTypeIn* k, DTypeIn* v,
+    IdType* kv_indptr, DTypeOut* o, float* lse, const uint32_t batch_size,
+    const uint32_t num_kv_heads, const float rope_scale, const float rope_theta,
+    cudaStream_t stream = nullptr) {
   float* tmp = nullptr;
   IdType* request_indices = nullptr;
   IdType* tile_indices = nullptr;
@@ -308,7 +306,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(BatchPrefillHandler<IdType>*
     num_qo_tiles = handler->GetNumQOTiles();
   } else {
     std::cerr << "Please call BatchPrefillHandler's BeginForward() before calling "
-                 "BatchPrefillWithRaggedKVCache()"
+                 "BatchPrefillWithRaggedKVWrapperCache()"
               << std::endl;
     abort();
   }

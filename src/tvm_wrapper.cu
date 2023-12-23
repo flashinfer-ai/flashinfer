@@ -209,18 +209,18 @@ thread_local BatchPrefillHandler<int32_t> batch_prefill_paged_kv_handlers[max_nu
 thread_local BatchPrefillHandler<int32_t> batch_prefill_ragged_kv_handler;
 
 /*!
- * \brief The BatchPrefillWithKVCache function with some parameters fixed at compile time
+ * \brief The BatchPrefillWithKVCacheWrapper function with some parameters fixed at compile time
  *    to accelerate the dispatching.
  */
 template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
-cudaError_t _BatchPrefillWithPagedKVCache(BatchPrefillHandler<IdType>* handler, DTypeIn* q,
-                                          paged_kv_t<page_storage, DTypeIn, IdType> paged_kv,
-                                          IdType* qo_indptr, DTypeOut* o, float* lse,
-                                          uint32_t num_qo_heads, bool causal = true,
-                                          RotaryMode rotary_mode = RotaryMode::kNone,
-                                          bool allow_fp16_qk_reduction = false,
-                                          float rope_scale = 1.f, float rope_theta = 1e4,
-                                          cudaStream_t stream = nullptr) {
+cudaError_t _BatchPrefillWithPagedKVCacheWrapper(BatchPrefillHandler<IdType>* handler, DTypeIn* q,
+                                                 paged_kv_t<page_storage, DTypeIn, IdType> paged_kv,
+                                                 IdType* qo_indptr, DTypeOut* o, float* lse,
+                                                 uint32_t num_qo_heads, bool causal = true,
+                                                 RotaryMode rotary_mode = RotaryMode::kNone,
+                                                 bool allow_fp16_qk_reduction = false,
+                                                 float rope_scale = 1.f, float rope_theta = 1e4,
+                                                 cudaStream_t stream = nullptr) {
   CHECK(lse != nullptr) << "The lse buffer must be provided";
   CHECK(allow_fp16_qk_reduction == false) << "The fp16 qk reduction is not supported";
   CHECK(paged_kv.head_dim == 128) << "The head dimension must be 128";
@@ -232,7 +232,7 @@ cudaError_t _BatchPrefillWithPagedKVCache(BatchPrefillHandler<IdType>* handler, 
       group_size, GROUP_SIZE,
       {SWITCH_CAUSAL(
           causal, CAUSAL, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
-            return BatchPrefillWithPagedKVCacheDispatched<
+            return BatchPrefillWithPagedKVCacheWrapperDispatched<
                 page_storage, /*return_lse=*/true, GROUP_SIZE, /*head_dim=*/128, ROTARY_MODE,
                 /*allow_fp16_qk_reduction=*/false, CAUSAL, DTypeIn, DTypeOut, IdType>(
                 handler, q, paged_kv, qo_indptr, o, lse, num_qo_heads, rope_scale, rope_theta,
@@ -320,7 +320,7 @@ void _FlashInferAttentionPrefillWithPagedKVCache(int64_t handler_id, DLTensor* q
                 static_cast<dtype_idx*>(page_table_indptr->data),
                 static_cast<dtype_idx*>(last_page_len->data));
             cudaError_t status =
-                _BatchPrefillWithPagedKVCache<page_storage, dtype_in, dtype_out, dtype_idx>(
+                _BatchPrefillWithPagedKVCacheWrapper<page_storage, dtype_in, dtype_out, dtype_idx>(
                     &batch_prefill_paged_kv_handlers[handler_id],
                     static_cast<dtype_in*>(q_data->data), cache,
                     static_cast<dtype_idx*>(qo_indptr->data), static_cast<dtype_out*>(output->data),
@@ -426,7 +426,7 @@ void _FlashInferAttentionDecodeWithPagedKVCache(int64_t handler_id, DLTensor* q_
                 static_cast<dtype_idx*>(page_table_indptr->data),
                 static_cast<dtype_idx*>(last_page_len->data));
             cudaError_t status =
-                BatchDecodeWithPagedKVCache<page_storage, dtype_in, dtype_out, dtype_idx>(
+                BatchDecodeWithPagedKVCacheWrapper<page_storage, dtype_in, dtype_out, dtype_idx>(
                     &batch_decode_handlers[handler_id], static_cast<dtype_in*>(q_data->data), cache,
                     static_cast<dtype_out*>(output->data),
                     /*lse=*/static_cast<float*>(lse->data), nhead_qo, RotaryMode(rotary_mode),
@@ -463,11 +463,11 @@ void _FlashInferAttentionDecodeWithPagedKVCacheEndForward(int64_t handler_id) {
 }
 
 /*!
- * \brief The BatchPrefillWithRaggedKVCache function with some parameters fixed at compile time
- *    to accelerate the dispatching.
+ * \brief The BatchPrefillWithRaggedKVCacheWrapper function with some parameters fixed at compile
+ * time to accelerate the dispatching.
  */
 template <typename DTypeIn, typename DTypeOut, typename IdType>
-cudaError_t _BatchPrefillWithRaggedKVCache(
+cudaError_t _BatchPrefillWithRaggedKVCacheWrapper(
     BatchPrefillHandler<IdType>* handler, DTypeIn* q, IdType* qo_indptr, DTypeIn* k, DTypeIn* v,
     IdType* kv_indptr, DTypeOut* o, float* lse, const uint32_t batch_size,
     const uint32_t num_qo_heads, const uint32_t num_kv_heads, const uint32_t head_dim,
@@ -482,7 +482,7 @@ cudaError_t _BatchPrefillWithRaggedKVCache(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
       {SWITCH_CAUSAL(
           causal, CAUSAL, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
-            return BatchPrefillWithRaggedKVCacheDispatched<
+            return BatchPrefillWithRaggedKVCacheWrapperDispatched<
                 /*return_lse=*/true, GROUP_SIZE, /*head_dim=*/128, /*layout=*/QKVLayout::kNHD,
                 ROTARY_MODE, /*allow_fp16_qk_reduction=*/false, CAUSAL, DTypeIn, DTypeOut, IdType>(
                 handler, q, qo_indptr, k, v, kv_indptr, o, lse, batch_size, num_kv_heads,
@@ -549,14 +549,15 @@ void _FlashInferAttentionPrefillWithRaggedKVCache(DLTensor* q_data, DLTensor* qo
       q_data->dtype, dtype_in,
       {SWITCH_TVM_CUDA_DTYPE(
           output->dtype, dtype_out, {SWITCH_TVM_CUDA_IDTYPE(qo_indptr->dtype, dtype_idx, {
-            cudaError_t status = _BatchPrefillWithRaggedKVCache<dtype_in, dtype_out, dtype_idx>(
-                &batch_prefill_ragged_kv_handler, static_cast<dtype_in*>(q_data->data),
-                static_cast<dtype_idx*>(qo_indptr->data), static_cast<dtype_in*>(k_data->data),
-                static_cast<dtype_in*>(v_data->data), static_cast<dtype_idx*>(kv_indptr->data),
-                static_cast<dtype_out*>(output->data),
-                /*lse=*/static_cast<float*>(lse->data), batch_size, nhead_qo, nhead_kv, nfeat,
-                /*causal=*/bool(causal), QKVLayout::kNHD, RotaryMode(rotary_mode),
-                /*allow_fp16_qk_reduction=*/false, rope_scale, rope_theta, 0);
+            cudaError_t status =
+                _BatchPrefillWithRaggedKVCacheWrapper<dtype_in, dtype_out, dtype_idx>(
+                    &batch_prefill_ragged_kv_handler, static_cast<dtype_in*>(q_data->data),
+                    static_cast<dtype_idx*>(qo_indptr->data), static_cast<dtype_in*>(k_data->data),
+                    static_cast<dtype_in*>(v_data->data), static_cast<dtype_idx*>(kv_indptr->data),
+                    static_cast<dtype_out*>(output->data),
+                    /*lse=*/static_cast<float*>(lse->data), batch_size, nhead_qo, nhead_kv, nfeat,
+                    /*causal=*/bool(causal), QKVLayout::kNHD, RotaryMode(rotary_mode),
+                    /*allow_fp16_qk_reduction=*/false, rope_scale, rope_theta, 0);
           })})})
 }
 
