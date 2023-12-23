@@ -31,9 +31,9 @@ namespace flashinfer {
 template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
 class BatchDecodeHandler {
  public:
-  float* get_float_buffer() const { return float_buffer_; }
-  IdType* new_indptr() const { return int_buffer_; }
-  IdType* new_last_page_len() const {
+  float* GetTempFloatBuffer() const { return float_buffer_; }
+  IdType* GetNewIndPtr() const { return int_buffer_; }
+  IdType* GetNewLastPageLen() const {
     if (int_buffer_ != nullptr) {
       return int_buffer_ + new_batch_size_ + 1;
     } else {
@@ -41,35 +41,35 @@ class BatchDecodeHandler {
     }
   }
   // cooperative_aux_info starts with cooperative_indptr
-  IdType* cooperative_aux_info() const {
+  IdType* GetCooperativeAuxInfo() const {
     if (int_buffer_ != nullptr) {
       return int_buffer_ + 2 * new_batch_size_ + 1;
     } else {
       return nullptr;
     }
   }
-  IdType* cooperative_indptr() const {
+  IdType* GetCooperativeIndPtr() const {
     if (int_buffer_ != nullptr) {
       return int_buffer_ + 2 * new_batch_size_ + 1;
     } else {
       return nullptr;
     }
   }
-  IdType* batch_idx_map() const {
+  IdType* GetBatchIndexMap() const {
     if (int_buffer_ != nullptr) {
       return int_buffer_ + 3 * new_batch_size_ + 2;
     } else {
       return nullptr;
     }
   }
-  IdType* chunk_start() const {
+  IdType* GetChunkStartPos() const {
     if (int_buffer_ != nullptr) {
       return int_buffer_ + 4 * new_batch_size_ + 2;
     } else {
       return nullptr;
     }
   }
-  IdType* seq_lens_before_split() const {
+  IdType* GetSeqLengthsBeforeSplit() const {
     if (int_buffer_ != nullptr) {
       return int_buffer_ + 5 * new_batch_size_ + 2;
     } else {
@@ -77,8 +77,8 @@ class BatchDecodeHandler {
     }
   }
 
-  void begin_forward(const paged_kv_t<page_storage, DTypeIn, IdType>& paged_kv, bool return_lse,
-                     uint32_t num_qo_heads, RotaryMode rotary_mode) {
+  void BeginForward(const paged_kv_t<page_storage, DTypeIn, IdType>& paged_kv, bool return_lse,
+                    uint32_t num_qo_heads, RotaryMode rotary_mode) {
     uint32_t tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size;
     SWITCH_RETURN_LSE(return_lse, RETURN_LSE, {
       BatchDecodeWithPagedKVCacheWorkEstimation<RETURN_LSE, page_storage, DTypeIn, DTypeOut,
@@ -90,14 +90,15 @@ class BatchDecodeHandler {
     if (tmp_size > 0) {
       cudaMallocAsync(&float_buffer_, sizeof(float) * tmp_size, stream_);
       cudaMallocAsync(&int_buffer_, sizeof(IdType) * (6 * new_batch_size + 2), stream_);
-      SplitPagedCacheKVComputeAuxiliaryInfo(
-          max_num_pages_per_batch, paged_kv, new_indptr(), new_last_page_len(),
-          cooperative_indptr(), batch_idx_map(), chunk_start(), seq_lens_before_split(), stream_);
+      SplitPagedCacheKVComputeAuxiliaryInfo(max_num_pages_per_batch, paged_kv, GetNewIndPtr(),
+                                            GetNewLastPageLen(), GetCooperativeIndPtr(),
+                                            GetBatchIndexMap(), GetChunkStartPos(),
+                                            GetSeqLengthsBeforeSplit(), stream_);
     }
     forward_started_ = true;
   }
 
-  void end_forward() {
+  void EndForward() {
     forward_started_ = false;
     new_batch_size_ = 0;
     if (float_buffer_ != nullptr) {
@@ -110,9 +111,9 @@ class BatchDecodeHandler {
     }
   }
 
-  bool forward_started() const { return forward_started_; }
+  bool IsForwardStarted() const { return forward_started_; }
 
-  uint32_t get_new_batch_size() const { return new_batch_size_; }
+  uint32_t GetNewBatchSize() const { return new_batch_size_; }
 
   cudaStream_t GetCUDAStream() const { return stream_; }
 
@@ -124,7 +125,7 @@ class BatchDecodeHandler {
         int_buffer_(nullptr),
         forward_started_(false),
         stream_(nullptr) {}
-  ~BatchDecodeHandler() { end_forward(); }
+  ~BatchDecodeHandler() { EndForward(); }
 
  private:
   uint32_t new_batch_size_;
@@ -137,17 +138,17 @@ class BatchDecodeHandler {
 template <typename IdType>
 class BatchPrefillHandler {
  public:
-  IdType* get_request_indices() const { return request_indices_; }
+  IdType* GetRequestIndices() const { return request_indices_; }
 
-  IdType* get_tile_indices() const { return tile_indices_; }
+  IdType* GetTileIndices() const { return tile_indices_; }
 
-  uint32_t get_num_frags_x() const { return num_frags_x_; }
+  uint32_t GetNumFragsX() const { return num_frags_x_; }
 
-  uint32_t get_num_qo_tiles() const { return num_qo_tiles_; }
+  uint32_t GetNumQOTiles() const { return num_qo_tiles_; }
 
-  bool forward_started() const { return request_indices_ != nullptr; }
+  bool IsForwardStarted() const { return request_indices_ != nullptr; }
 
-  void begin_forward(IdType* qo_indptr, uint32_t batch_size, uint32_t gqa_group_size) {
+  void BeginForward(IdType* qo_indptr, uint32_t batch_size, uint32_t gqa_group_size) {
     std::vector<IdType> request_indices_h, tile_indices_h;
     std::tie(num_frags_x_, num_qo_tiles_, request_indices_h, tile_indices_h) =
         split_qo_indptr(qo_indptr, batch_size, gqa_group_size, stream_);
@@ -159,7 +160,7 @@ class BatchPrefillHandler {
                     cudaMemcpyHostToDevice, stream_);
   }
 
-  void end_forward() {
+  void EndForward() {
     forward_started_ = false;
     num_frags_x_ = 0U;
     num_qo_tiles_ = 0U;
@@ -184,7 +185,7 @@ class BatchPrefillHandler {
         num_qo_tiles_(0U),
         forward_started_(false),
         stream_(nullptr) {}
-  ~BatchPrefillHandler() { end_forward(); }
+  ~BatchPrefillHandler() { EndForward(); }
 
  private:
   IdType* request_indices_;
@@ -212,7 +213,7 @@ class BatchPrefillHandler {
  * \param rope_scale The scale of rope.
  * \param rope_theta The theta of rope.
  * \param stream The CUDA stream.
- * \note This wrapper function should be only called after we call begin_forward function in the
+ * \note This wrapper function should be only called after we call BeginForward function in the
  *   BatchDecodeHandler.
  */
 template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
@@ -222,17 +223,17 @@ cudaError_t BatchDecodeWithPagedKVCache(
     uint32_t num_qo_heads, RotaryMode rotary_mode = RotaryMode::kNone, float rope_scale = 1.f,
     float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   paged_kv_t<page_storage, DTypeIn, IdType> new_paged_kv = paged_kv;
-  float* tmp = handler->get_float_buffer();
-  if (handler->forward_started()) {
+  float* tmp = handler->GetTempFloatBuffer();
+  if (handler->IsForwardStarted()) {
     if (tmp != nullptr) {
       // create auxiliary information for cooperative kernels
-      new_paged_kv.batch_size = handler->get_new_batch_size();
-      new_paged_kv.indptr = handler->new_indptr();
-      new_paged_kv.last_page_len = handler->new_last_page_len();
-      new_paged_kv.cooperative_aux_info = handler->cooperative_aux_info();
+      new_paged_kv.batch_size = handler->GetNewBatchSize();
+      new_paged_kv.indptr = handler->GetNewIndPtr();
+      new_paged_kv.last_page_len = handler->GetNewLastPageLen();
+      new_paged_kv.cooperative_aux_info = handler->GetCooperativeAuxInfo();
     }
   } else {
-    std::cerr << "Please call BatchDecodeHandler's begin_forward() before calling "
+    std::cerr << "Please call BatchDecodeHandler's BeginForward() before calling "
                  "BatchDecodeWithPagedKVCache()"
               << std::endl;
     abort();
@@ -254,13 +255,13 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
   IdType* tile_indices = nullptr;
   uint32_t num_frags_x = 0U;
   uint32_t num_qo_tiles = 0U;
-  if (handler->forward_started()) {
-    request_indices = handler->get_request_indices();
-    tile_indices = handler->get_tile_indices();
-    num_frags_x = handler->get_num_frags_x();
-    num_qo_tiles = handler->get_num_qo_tiles();
+  if (handler->IsForwardStarted()) {
+    request_indices = handler->GetRequestIndices();
+    tile_indices = handler->GetTileIndices();
+    num_frags_x = handler->GetNumFragsX();
+    num_qo_tiles = handler->GetNumQOTiles();
   } else {
-    std::cerr << "Please call BatchPrefillHandler's begin_forward() before calling "
+    std::cerr << "Please call BatchPrefillHandler's BeginForward() before calling "
                  "BatchPrefillWithPagedKVCache()"
               << std::endl;
     abort();
@@ -300,13 +301,13 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(BatchPrefillHandler<IdType>*
   IdType* tile_indices = nullptr;
   uint32_t num_frags_x = 0U;
   uint32_t num_qo_tiles = 0U;
-  if (handler->forward_started()) {
-    request_indices = handler->get_request_indices();
-    tile_indices = handler->get_tile_indices();
-    num_frags_x = handler->get_num_frags_x();
-    num_qo_tiles = handler->get_num_qo_tiles();
+  if (handler->IsForwardStarted()) {
+    request_indices = handler->GetRequestIndices();
+    tile_indices = handler->GetTileIndices();
+    num_frags_x = handler->GetNumFragsX();
+    num_qo_tiles = handler->GetNumQOTiles();
   } else {
-    std::cerr << "Please call BatchPrefillHandler's begin_forward() before calling "
+    std::cerr << "Please call BatchPrefillHandler's BeginForward() before calling "
                  "BatchPrefillWithRaggedKVCache()"
               << std::endl;
     abort();

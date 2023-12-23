@@ -341,14 +341,14 @@ void _FlashInferAttentionPrefillWithPagedKVCacheBeginForward(int64_t handler_idx
   CHECK(handler_idx < max_num_handlers) << "The handler id must be less than " << max_num_handlers;
   const uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
   SWITCH_TVM_CUDA_IDTYPE(qo_indptr->dtype, dtype_idx, {
-    batch_prefill_paged_kv_handlers[handler_idx].begin_forward(
+    batch_prefill_paged_kv_handlers[handler_idx].BeginForward(
         static_cast<dtype_idx*>(qo_indptr->data), batch_size, gqa_group_size);
   });
 }
 
 void _FlashInferAttentionPrefillWithPagedKVCacheEndForward(int64_t handler_idx) {
   CHECK(handler_idx < max_num_handlers) << "The handler id must be less than " << max_num_handlers;
-  batch_prefill_paged_kv_handlers[handler_idx].end_forward();
+  batch_prefill_paged_kv_handlers[handler_idx].EndForward();
 }
 
 // Creates a pool of handlers with a fixed size to independently handle decoding forward passes.
@@ -453,13 +453,13 @@ void _FlashInferAttentionDecodeWithPagedKVCacheBeginForward(
   cache.num_heads = num_kv_heads;
   cache.head_dim = head_dim;
   cache.page_size = page_size;
-  batch_decode_handlers[handler_idx].begin_forward(cache, bool(return_lse), num_qo_heads,
-                                                   RotaryMode(rotary_mode));
+  batch_decode_handlers[handler_idx].BeginForward(cache, bool(return_lse), num_qo_heads,
+                                                  RotaryMode(rotary_mode));
 }
 
 void _FlashInferAttentionDecodeWithPagedKVCacheEndForward(int64_t handler_id) {
   CHECK_LT(handler_id, max_num_handlers) << "The handler id must be less than " << max_num_handlers;
-  batch_decode_handlers[handler_id].end_forward();
+  batch_decode_handlers[handler_id].EndForward();
 }
 
 /*!
@@ -566,13 +566,13 @@ void _FlashInferAttentionPrefillWithRaggedKVCacheBeginForward(DLTensor* qo_indpt
                                                               int64_t num_kv_heads) {
   const uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
   SWITCH_TVM_CUDA_IDTYPE(qo_indptr->dtype, dtype_idx, {
-    batch_prefill_ragged_kv_handler.begin_forward(static_cast<dtype_idx*>(qo_indptr->data),
-                                                  batch_size, gqa_group_size);
+    batch_prefill_ragged_kv_handler.BeginForward(static_cast<dtype_idx*>(qo_indptr->data),
+                                                 batch_size, gqa_group_size);
   });
 }
 
 void _FlashInferAttentionPrefillWithRaggedKVCacheEndForward() {
-  batch_prefill_ragged_kv_handler.end_forward();
+  batch_prefill_ragged_kv_handler.EndForward();
 }
 
 void _FlashInferMergeState(DLTensor* v_a, DLTensor* s_a, DLTensor* v_b, DLTensor* s_b,
