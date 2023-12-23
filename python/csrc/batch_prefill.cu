@@ -46,11 +46,11 @@ torch::Tensor batch_prefill_with_paged_kv_cache(
   unsigned int num_kv_heads, num_qo_heads;
   QKVLayout qkv_layout = static_cast<QKVLayout>(layout);
   if (qkv_layout == QKVLayout::kNHD) {
-    num_kv_heads = kv_data.size(2);
-    num_qo_heads = q.size(2);
-  } else {
     num_kv_heads = kv_data.size(1);
     num_qo_heads = q.size(1);
+  } else { 
+    num_kv_heads = kv_data.size(0);
+    num_qo_heads = q.size(0);
   }
 
   auto o = torch::empty_like(q, q.options());
