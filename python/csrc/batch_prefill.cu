@@ -27,29 +27,34 @@ torch::Tensor batch_prefill_with_paged_kv_cache(
     float rope_theta) {
   CHECK_INPUT(q);                 // [sum(extend_len), num_qo_heads, head_dim]
   CHECK_INPUT(q_indptr);          // [batch_size + 1]
-  CHECK_INPUT(kv_data);           // [total_kv_tokens, num_kv_heads, head_dim]
+  CHECK_INPUT(kv_data);           // [max_num_pages, 2, num_kv_heads, page_size, head_dim]
   CHECK_INPUT(kv_indptr);         // [batch_size + 1]
   CHECK_INPUT(kv_indices);        // [sum(seq_len)]
   CHECK_INPUT(kv_last_page_len);  // [batch_size]
   CHECK_DIM(3, q);
   CHECK_DIM(1, q_indptr);
-  CHECK_DIM(3, kv_data);
   CHECK_DIM(1, kv_indptr);
   CHECK_DIM(1, kv_indices);
   CHECK_DIM(1, kv_last_page_len);
   CHECK_EQ(q_indptr.size(0), kv_indptr.size(0));
   CHECK_EQ(kv_indptr.size(0), kv_last_page_len.size(0) + 1);
-  CHECK_EQ(q.size(2), kv_data.size(2));
+  if (kv_data.dim() == 5) {
+    CHECK_EQ(q.size(2), kv_data.size(4));
+  } else {
+    CHECK_DIM(4, kv_data);
+    CHECK_EQ(1, page_size);
+    CHECK_EQ(q.size(2), kv_data.size(3));
+  }
 
   unsigned int batch_size = q_indptr.size(0) - 1;
   unsigned int head_dim = q.size(2);
   unsigned int num_kv_heads, num_qo_heads;
   QKVLayout qkv_layout = static_cast<QKVLayout>(layout);
   if (qkv_layout == QKVLayout::kNHD) {
-    num_kv_heads = kv_data.size(1);
+    num_kv_heads = kv_data.size(kv_data.dim() - 2);
     num_qo_heads = q.size(1);
-  } else { 
-    num_kv_heads = kv_data.size(0);
+  } else {
+    num_kv_heads = kv_data.size(2);
     num_qo_heads = q.size(0);
   }
 
