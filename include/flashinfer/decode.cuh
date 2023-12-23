@@ -279,9 +279,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
   float s[bdy * tile_size_per_bdx];
 
 #pragma unroll 2
-  for (uint32_t iter = 0;
-       iter < (kv_chunk_size + tile_size_per_bdx * bdy * bdz - 1) / (tile_size_per_bdx * bdy * bdz);
-       ++iter) {
+  for (uint32_t iter = 0; iter < ceil_div(kv_chunk_size, tile_size_per_bdx * bdy * bdz); ++iter) {
     // compute qk
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
@@ -344,7 +342,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
     if (kv_chunk_idx == 0) {
       state_t<vec_size> st_global;
 #pragma unroll 2
-      for (uint32_t iter = 0; iter < (num_kv_chunks + bdz - 1) / bdz; ++iter) {
+      for (uint32_t iter = 0; iter < ceil_div(num_kv_chunks, bdz); ++iter) {
         uint32_t kv_chunk_idx = iter * bdz + tz;
         if (kv_chunk_idx < num_kv_chunks) {
           float2 md = *(float2*)&tmp_md[(qo_head_idx * num_kv_chunks + kv_chunk_idx) * 2];
@@ -441,7 +439,7 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(DTypeIn* __restrict__ q, DTyp
   float s[bdy];
 
 #pragma unroll 4
-  for (uint32_t iter = 0; iter < (seq_len + bdy * bdz - 1) / (bdy * bdz); ++iter) {
+  for (uint32_t iter = 0; iter < ceil_div(seq_len, bdy * bdz); ++iter) {
     // compute qk
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
@@ -631,9 +629,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
   float s[bdy * tile_size_per_bdx];
 
 #pragma unroll 2
-  for (uint32_t iter = 0;
-       iter < (kv_chunk_len + tile_size_per_bdx * bdy * bdz - 1) / (tile_size_per_bdx * bdy * bdz);
-       ++iter) {
+  for (uint32_t iter = 0; iter < ceil_div(kv_chunk_len, tile_size_per_bdx * bdy * bdz); ++iter) {
     if ((iter + num_stages_smem) % bdx == 0) {
 #pragma unroll
       for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
@@ -719,7 +715,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
       state_t<vec_size> st_global;
       const uint32_t num_pages = cooperative_indptr_end - cooperative_indptr_begin;
 #pragma unroll 2
-      for (uint32_t iter = 0; iter < (num_pages + bdz - 1) / bdz; ++iter) {
+      for (uint32_t iter = 0; iter < ceil_div(num_pages, bdz); ++iter) {
         uint32_t kv_chunk_idx = cooperative_indptr_begin + iter * bdz + tz;
         if (kv_chunk_idx < cooperative_indptr_end) {
           float2 md = *(float2*)&tmp_md[(qo_head_idx * paged_kv.batch_size + kv_chunk_idx) * 2];
@@ -826,9 +822,8 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& 
                       &num_blocks_per_sm, kernel, num_threads, smem_size));
                   max_grid_size = uint32_t(num_blocks_per_sm) * uint32_t(num_sm);
                   uint32_t max_num_kv_chunks = max_grid_size / num_kv_heads;
-                  uint32_t kv_chunk_size =
-                      max((seq_len + max_num_kv_chunks - 1U) / max_num_kv_chunks, 256);
-                  uint32_t num_kv_chunks = (seq_len + kv_chunk_size - 1) / kv_chunk_size;
+                  uint32_t kv_chunk_size = max(ceil_div(seq_len, max_num_kv_chunks), 256);
+                  uint32_t num_kv_chunks = ceil_div(seq_len, kv_chunk_size);
                   tmp_size = num_qo_heads * num_kv_chunks * (head_dim + 2);
                 })})})});
   }
@@ -934,9 +929,8 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                       &num_blocks_per_sm, kernel, num_threads, smem_size));
                   uint32_t max_grid_size = uint32_t(num_blocks_per_sm) * uint32_t(num_sm);
                   uint32_t max_num_kv_chunks = max_grid_size / num_kv_heads;
-                  uint32_t kv_chunk_size =
-                      max((seq_len + max_num_kv_chunks - 1U) / max_num_kv_chunks, 256);
-                  dim3 nblks = dim3((seq_len + kv_chunk_size - 1) / kv_chunk_size, num_kv_heads);
+                  uint32_t kv_chunk_size = max(ceil_div(seq_len, max_num_kv_chunks), 256);
+                  dim3 nblks = dim3(ceil_div(seq_len, kv_chunk_size), num_kv_heads);
                   if (nblks.x == 0 || nblks.y == 0) {
                     std::cerr << "Invalid kernel configuration: nblks=(" << nblks.x << ","
                               << nblks.y << ")" << std::endl;
@@ -995,8 +989,7 @@ cudaError_t SplitPagedCacheKVComputeAuxiliaryInfo(
 
   for (uint32_t batch_idx = 0; batch_idx < old_batch_size; batch_idx++) {
     uint32_t cooperative_indptr_delta =
-        (old_indptr_h[batch_idx + 1] - old_indptr_h[batch_idx] + max_num_pages_per_batch - 1) /
-        max_num_pages_per_batch;
+        ceil_div(old_indptr_h[batch_idx + 1] - old_indptr_h[batch_idx], max_num_pages_per_batch);
     uint32_t seq_len_before_split =
         (old_indptr_h[batch_idx + 1] - old_indptr_h[batch_idx] - 1) * page_size +
         old_last_page_len_h[batch_idx];
@@ -1063,7 +1056,7 @@ std::pair<uint32_t, uint32_t> SplitPagedKVCacheBinarySearchMinNumPagePerBatch(
     uint32_t mid = (low + high) / 2;
     new_batch_size = 0;
     for (const IdType& elem : num_pages) {
-      new_batch_size += (elem + mid - 1) / mid;
+      new_batch_size += ceil_div(elem, mid);
     }
     if (new_batch_size * num_kv_heads > max_grid_size) {
       low = mid + 1;
@@ -1073,7 +1066,7 @@ std::pair<uint32_t, uint32_t> SplitPagedKVCacheBinarySearchMinNumPagePerBatch(
   }
   new_batch_size = 0;
   for (const IdType& elem : num_pages) {
-    new_batch_size += (elem + low - 1) / low;
+    new_batch_size += ceil_div(elem, low);
   }
   return {low, new_batch_size};
 }

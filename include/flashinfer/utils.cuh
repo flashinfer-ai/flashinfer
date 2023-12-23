@@ -199,8 +199,8 @@ bool is_device_ptr(const void* ptr) {
   return attrs.type == cudaMemoryTypeDevice;
 }
 
-template <typename T>
-T ceil_div(T x, T y) {
+template <typename T1, typename T2>
+__forceinline__ __device__ __host__ T1 ceil_div(const T1 x, const T2 y) {
   return (x + y - 1) / y;
 }
 

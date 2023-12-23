@@ -775,7 +775,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
   const uint32_t bx = blockIdx.x, chunk_idx = blockIdx.y, kv_head_idx = blockIdx.z;
   const uint32_t num_chunks = gridDim.y;
-  const uint32_t chunk_size = cooperative ? (kv_len + num_chunks - 1) / num_chunks : kv_len;
+  const uint32_t chunk_size = cooperative ? ceil_div(kv_len, num_chunks) : kv_len;
   const uint32_t chunk_start = cooperative ? chunk_idx * chunk_size : 0;
   const uint32_t chunk_end = cooperative ? min((chunk_idx + 1) * chunk_size, kv_len) : kv_len;
   auto block = cg::this_thread_block();
@@ -833,14 +833,13 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
   smem_t k_smem(smem + (num_warps * num_frags_x) * 16 * head_dim * sizeof(DTypeIn)),
       v_smem(smem + (num_warps * num_frags_x + num_frags_z) * 16 * head_dim * sizeof(DTypeIn));
 
-  const uint32_t num_iterations =
-      ((causal ? min(chunk_end - chunk_start,
-                     sub_if_greater_or_zero(
-                         kv_len - qo_len + ((bx + 1) * num_frags_x * num_warps) * (16 / group_size),
-                         chunk_start))
-               : chunk_end - chunk_start) +
-       16 * num_frags_z - 1) /
-      (16 * num_frags_z);
+  const uint32_t num_iterations = ceil_div(
+      causal ? min(chunk_end - chunk_start,
+                   sub_if_greater_or_zero(
+                       kv_len - qo_len + ((bx + 1) * num_frags_x * num_warps) * (16 / group_size),
+                       chunk_start))
+             : chunk_end - chunk_start,
+      16 * num_frags_z);
 
   const uint32_t mask_iteration =
       (causal ? min(chunk_end - chunk_start,
@@ -1023,12 +1022,11 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
     q_smem_inplace_multiply_sm_scale<num_frags_x, num_frags_y, DTypeIn>(&qo_smem, sm_scale);
   }
 
-  const uint32_t num_iterations =
-      ((causal ? min(kv_len, kv_len - qo_len +
-                                 ((tile_idx + 1) * num_frags_x * num_warps) * (16 / group_size))
-               : kv_len) +
-       16 * num_frags_z - 1) /
-      (16 * num_frags_z);
+  const uint32_t num_iterations = ceil_div(
+      (causal ? min(kv_len, kv_len - qo_len +
+                                ((tile_idx + 1) * num_frags_x * num_warps) * (16 / group_size))
+              : kv_len),
+      16 * num_frags_z);
 
   const uint32_t mask_iteration =
       (causal
@@ -1233,12 +1231,11 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
       v_smem, &kv_smem_offset_w, paged_kv, kv_idx_base, page_iter_base, kv_len, last_indptr);
   cp_async::commit_group();
 
-  const uint32_t num_iterations =
-      ((causal ? min(kv_len, kv_len - qo_len +
-                                 ((tile_idx + 1) * num_frags_x * num_warps) * (16 / group_size))
-               : kv_len) +
-       16 * num_frags_z - 1) /
-      (16 * num_frags_z);
+  const uint32_t num_iterations = ceil_div(
+      (causal ? min(kv_len, kv_len - qo_len +
+                                ((tile_idx + 1) * num_frags_x * num_warps) * (16 / group_size))
+              : kv_len),
+      16 * num_frags_z);
 
   const uint32_t mask_iteration =
       (causal
@@ -1413,17 +1410,15 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
                                 uint32_t num_chunks =
                                     min((num_blocks_per_sm * num_sm) /
                                             (num_kv_heads *
-                                             ((qo_len * group_size + (num_rows_per_cta - 1)) /
-                                              num_rows_per_cta)),
+                                             ceil_div(qo_len * group_size, num_rows_per_cta)),
                                         kv_len / 2048);
 
                                 max_grid_size = num_blocks_per_sm * num_sm;
                                 if (num_chunks > 1) {
                                   uint32_t grid_size =
                                       32 * num_warps *
-                                      ((qo_len * group_size + (num_rows_per_cta - 1)) /
-                                       num_rows_per_cta) *
-                                      num_chunks * num_qo_heads;
+                                      ceil_div(qo_len * group_size, num_rows_per_cta) * num_chunks *
+                                      num_qo_heads;
                                   tmp_size = sizeof(float) *
                                              (4 * num_frags_x + num_frags_x * num_frags_y * 8) *
                                              grid_size;
@@ -1494,10 +1489,10 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
       FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
       FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
           &num_blocks_per_sm, cooperative_kernel, num_threads, smem_size));
-      uint32_t num_chunks = min(
-          (num_blocks_per_sm * num_sm) /
-              (num_kv_heads * ((qo_len * GROUP_SIZE + (num_rows_per_cta - 1)) / num_rows_per_cta)),
-          kv_len / 2048);
+      uint32_t num_chunks =
+          min((num_blocks_per_sm * num_sm) /
+                  (num_kv_heads * ceil_div(qo_len * GROUP_SIZE, num_rows_per_cta)),
+              kv_len / 2048);
 
       if (num_chunks <= 1 || tmp == nullptr) {
         // Enough parallelism, do not use cooperative
@@ -1516,8 +1511,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
                         (void*)&sm_scale,
                         (void*)&log2_rope_rcp_scale,
                         (void*)&log2_rope_rcp_theta};
-        dim3 nblks(((qo_len * GROUP_SIZE) + (num_rows_per_cta - 1)) / num_rows_per_cta, 1,
-                   num_kv_heads);
+        dim3 nblks(ceil_div(qo_len * GROUP_SIZE, num_rows_per_cta), 1, num_kv_heads);
         dim3 nthrs(32, num_warps);
         FLASHINFER_CUDA_CALL(
             cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -1535,8 +1529,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
                         (void*)&sm_scale,
                         (void*)&log2_rope_rcp_scale,
                         (void*)&log2_rope_rcp_theta};
-        dim3 nblks(((qo_len * GROUP_SIZE) + (num_rows_per_cta - 1)) / num_rows_per_cta, num_chunks,
-                   num_kv_heads);
+        dim3 nblks(ceil_div(qo_len * GROUP_SIZE, num_rows_per_cta), num_chunks, num_kv_heads);
         dim3 nthrs(32, num_warps);
         FLASHINFER_CUDA_CALL(cudaLaunchCooperativeKernel((void*)cooperative_kernel, nblks, nthrs,
                                                          args, smem_size, stream));
