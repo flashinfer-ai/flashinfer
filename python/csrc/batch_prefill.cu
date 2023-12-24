@@ -69,7 +69,7 @@ torch::Tensor batch_prefill_with_paged_kv_cache(
             /*lse=*/nullptr, num_qo_heads, causal, RotaryMode(rotary_mode), allow_fp16_qk_reduction,
             rope_scale, rope_theta);
     TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithPagedKVCache failed with error code ",
-                status);
+                cudaGetErrorString(status));
     return true;
   });
 
