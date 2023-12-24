@@ -23,8 +23,7 @@ using namespace flashinfer;
 torch::Tensor batch_prefill_with_paged_kv_cache(
     torch::Tensor q, torch::Tensor q_indptr, torch::Tensor kv_data, torch::Tensor kv_indptr,
     torch::Tensor kv_indices, torch::Tensor kv_last_page_len, unsigned int page_size, bool causal,
-    unsigned int layout, unsigned int rotary_mode, bool allow_fp16_qk_reduction, float rope_scale,
-    float rope_theta) {
+    unsigned int rotary_mode, bool allow_fp16_qk_reduction, float rope_scale, float rope_theta) {
   CHECK_INPUT(q);                 // [sum(extend_len), num_qo_heads, head_dim]
   CHECK_INPUT(q_indptr);          // [batch_size + 1]
   CHECK_INPUT(kv_data);           // [max_num_pages, 2, num_kv_heads, page_size, head_dim]
@@ -48,15 +47,12 @@ torch::Tensor batch_prefill_with_paged_kv_cache(
 
   unsigned int batch_size = q_indptr.size(0) - 1;
   unsigned int head_dim = q.size(2);
+
+  // default [..., num_kv_heads, page_size, head_dim] for kv_data
+  // [sum(extend_lens), num_qo_heads, head_dim] for q
   unsigned int num_kv_heads, num_qo_heads;
-  QKVLayout qkv_layout = static_cast<QKVLayout>(layout);
-  if (qkv_layout == QKVLayout::kNHD) {
-    num_kv_heads = kv_data.size(kv_data.dim() - 2);
-    num_qo_heads = q.size(1);
-  } else {
-    num_kv_heads = kv_data.size(2);
-    num_qo_heads = q.size(0);
-  }
+  num_qo_heads = q.size(1);
+  num_kv_heads = kv_data.size(2);
 
   auto o = torch::empty_like(q, q.options());
 
