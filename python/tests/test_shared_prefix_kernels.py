@@ -35,8 +35,9 @@ def test_batch_decode_with_shared_prefix_padded_kv_cache(
 @pytest.mark.parametrize("batch_size", [12, 17])
 @pytest.mark.parametrize("kv_len", [54, 97])
 @pytest.mark.parametrize("qo_len", [37, 17])
-@pytest.mark.parametrize("num_kv_heads", [1, 8, 16])
-@pytest.mark.parametrize("num_qo_head", [1, 8, 16])
+@pytest.mark.parametrize("page_size", [1, 8, 16])
+@pytest.mark.parametrize("num_kv_heads", [8, 16])
+@pytest.mark.parametrize("num_qo_head", [8, 16])
 @pytest.mark.parametrize("head_dim", [128])
 def test_batch_prefill_with_paged_kv_cache(
     batch_size,
@@ -57,7 +58,7 @@ def test_batch_prefill_with_paged_kv_cache(
     kv_indptr = torch.arange(0, batch_size + 1).to(0) * num_pages_per_seq
     kv_indices = torch.arange(0, total_num_pages).to(0)
     kv_last_page_len = torch.full(
-        (batch_size,), kv_len % page_size, dtype=torch.int32
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
     ).to(0)
 
     o = flashinfer.ops.batch_prefill_with_paged_kv_cache(
@@ -76,10 +77,10 @@ def test_batch_prefill_with_paged_kv_cache(
             [
                 kv_data[kv_indptr[i] : kv_indptr[i + 1] - 1, 0]
                 .permute(0, 2, 1, 3)
-                .view(-1, num_kv_heads, head_dim),
+                .reshape(-1, num_kv_heads, head_dim),
                 kv_data[kv_indptr[i + 1] - 1, 0, :, : kv_last_page_len[i]]
                 .permute(1, 0, 2)
-                .view(-1, num_kv_heads, head_dim),
+                .reshape(-1, num_kv_heads, head_dim),
             ],
             dim=0,
         )
@@ -87,19 +88,21 @@ def test_batch_prefill_with_paged_kv_cache(
             [
                 kv_data[kv_indptr[i] : kv_indptr[i + 1] - 1, 1]
                 .permute(0, 2, 1, 3)
-                .view(-1, num_kv_heads, head_dim),
+                .reshape(-1, num_kv_heads, head_dim),
                 kv_data[kv_indptr[i + 1] - 1, 1, :, : kv_last_page_len[i]]
                 .permute(1, 0, 2)
-                .view(-1, num_kv_heads, head_dim),
+                .reshape(-1, num_kv_heads, head_dim),
             ],
             dim=0,
         )
-        o_ref_i = flashinfer.ops.single_prefill_with_kv_cache_return_lse(qi, ki, vi)
-        o_i_np = o[i].cpu().numpy()
+        o_ref_i = flashinfer.ops.single_prefill_with_kv_cache(qi, ki, vi, True)
+        o_i_np = o[q_indptr[i] : q_indptr[i + 1]].cpu().numpy()
         o_ref_i_np = o_ref_i.cpu().numpy()
         numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":
+    torch.manual_seed(0)
     test_batch_decode_with_shared_prefix_padded_kv_cache(12, 37, 54, 8, 128)
-    test_batch_prefill_with_paged_kv_cache(12, 54, 37, 128, 8, 8, 128)
+    test_batch_prefill_with_paged_kv_cache(12, 54, 37, 8, 8, 8, 128)
+    test_batch_prefill_with_paged_kv_cache(12, 54, 37, 1, 8, 8, 128)

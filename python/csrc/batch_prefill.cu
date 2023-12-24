@@ -66,8 +66,8 @@ torch::Tensor batch_prefill_with_paged_kv_cache(
             static_cast<c_type*>(q.data_ptr()), paged_kv,
             static_cast<int32_t*>(q_indptr.data_ptr()), static_cast<c_type*>(o.data_ptr()),
             /*tmp=*/nullptr,
-            /*lse=*/nullptr, num_qo_heads, causal, RotaryMode(rotary_mode),
-            allow_fp16_qk_reduction);
+            /*lse=*/nullptr, num_qo_heads, causal, RotaryMode(rotary_mode), allow_fp16_qk_reduction,
+            rope_scale, rope_theta);
     TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithPagedKVCache failed with error code ",
                 status);
     return true;
