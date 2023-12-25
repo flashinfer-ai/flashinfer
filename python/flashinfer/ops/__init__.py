@@ -1,9 +1,11 @@
-import torch
 import math
+from typing import Optional
+
+import torch
 
 import flashinfer.ops._kernels as _kernels
+
 from .utils import RotaryMode, TensorLayout
-from typing import Optional
 
 _cache_buf = {}
 
@@ -428,3 +430,37 @@ def batch_decode_with_shared_prefix_padded_kv_cache(
         rope_theta=rope_theta,
     )
     return merge_state(V_shared, S_shared, V_unique, S_unique)[0]
+
+
+def batch_prefill_with_paged_kv_cache(
+    q: torch.Tensor,
+    q_indptr: torch.Tensor,
+    kv_data: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
+    page_size: int,
+    casual: bool = True,
+    rotary_mode: str = "NONE",
+    allow_fp16_qk_reduction: bool = False,
+    rope_scale: Optional[float] = None,
+    rope_theta: Optional[float] = None,
+):
+    if rope_scale is None:
+        rope_scale = 1.0
+    if rope_theta is None:
+        rope_theta = 1e4
+    return _kernels.batch_prefill_with_paged_kv_cache(
+        q,
+        q_indptr,
+        kv_data,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        page_size,
+        casual,
+        getattr(RotaryMode, rotary_mode),
+        allow_fp16_qk_reduction,
+        rope_scale,
+        rope_theta,
+    )

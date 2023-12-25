@@ -31,4 +31,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("batch_decode_with_padded_kv_cache_return_lse",
         &batch_decode_with_padded_kv_cache_return_lse,
         "Multi-request batch decode with padded KV-Cache operator, return logsumexp");
+  m.def("batch_prefill_with_paged_kv_cache", &batch_prefill_with_paged_kv_cache,
+        "Multi-request batch prefill with paged KV-Cache operator");
 }

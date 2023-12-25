@@ -54,6 +54,7 @@ ext_modules.append(
             "csrc/cascade.cu",
             "csrc/batch_decode.cu",
             "csrc/flashinfer_ops.cc",
+            "csrc/batch_prefill.cu",
         ],
         include_dirs=[
             str(root.resolve().parent / "include"),

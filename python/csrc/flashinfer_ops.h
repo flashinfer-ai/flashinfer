@@ -44,3 +44,8 @@ torch::Tensor batch_decode_with_padded_kv_cache(torch::Tensor q, torch::Tensor k
 std::vector<torch::Tensor> batch_decode_with_padded_kv_cache_return_lse(
     torch::Tensor q, torch::Tensor k_padded, torch::Tensor v_padded, unsigned int layout,
     unsigned int rotary_mode, float sm_scale, float rope_scale, float rope_theta);
+
+torch::Tensor batch_prefill_with_paged_kv_cache(
+    torch::Tensor q, torch::Tensor q_indptr, torch::Tensor kv_data, torch::Tensor kv_indptr,
+    torch::Tensor kv_indices, torch::Tensor kv_last_page_len, unsigned int page_size, bool causal,
+    unsigned int rotary_mode, bool allow_fp16_qk_reduction, float rope_scale, float rope_theta);
