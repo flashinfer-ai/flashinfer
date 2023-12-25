@@ -1,8 +1,9 @@
 import math
 from typing import Optional
 
-import flashinfer.ops._kernels as _kernels
 import torch
+
+import flashinfer.ops._kernels as _kernels
 
 from .utils import RotaryMode, TensorLayout
 
