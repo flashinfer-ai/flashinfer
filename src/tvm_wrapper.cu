@@ -755,3 +755,7 @@ TVM_REGISTER_GLOBAL("flashinfer.merge_state_in_place").set_body_typed(_FlashInfe
 
 TVM_REGISTER_GLOBAL("flashinfer.batch_qk_apply_rotary_in_place")
     .set_body_typed(_FlashInferBatchQKApplyRotaryInPlace);
+
+TVM_REGISTER_GLOBAL("flashinfer.single_prefill")
+    .set_body_typed(_FlashInferSinglePrefillWithKVCache);
+TVM_REGISTER_GLOBAL("flashinfer.single_decode").set_body_typed(_FlashInferSingleDecodeWithKVCache);
