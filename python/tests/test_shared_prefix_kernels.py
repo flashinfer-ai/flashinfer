@@ -36,8 +36,8 @@ def test_batch_decode_with_shared_prefix_padded_kv_cache(
 @pytest.mark.parametrize("kv_len", [54, 97])
 @pytest.mark.parametrize("qo_len", [37, 17])
 @pytest.mark.parametrize("page_size", [1, 8, 16])
-@pytest.mark.parametrize("num_kv_heads", [8, 16])
-@pytest.mark.parametrize("num_qo_head", [8, 16])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
 @pytest.mark.parametrize("head_dim", [128])
 def test_batch_prefill_with_paged_kv_cache(
     batch_size,
@@ -45,18 +45,18 @@ def test_batch_prefill_with_paged_kv_cache(
     qo_len,
     page_size,
     num_kv_heads,
-    num_qo_head,
+    num_qo_heads,
     head_dim,
 ):
-    q = torch.randn(batch_size * qo_len, num_qo_head, head_dim).to(0).half()
-    q_indptr = torch.arange(0, batch_size + 1).to(0) * qo_len
+    q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
+    q_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size
     kv_data = (
         torch.randn(total_num_pages, 2, num_kv_heads, page_size, head_dim).to(0).half()
     )
-    kv_indptr = torch.arange(0, batch_size + 1).to(0) * num_pages_per_seq
-    kv_indices = torch.arange(0, total_num_pages).to(0)
+    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * num_pages_per_seq
+    kv_indices = torch.arange(0, total_num_pages).to(0).int()
     kv_last_page_len = torch.full(
         (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
     ).to(0)
