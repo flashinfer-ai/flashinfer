@@ -1,7 +1,8 @@
-import flashinfer
-import torch
-import pytest
 import numpy
+import pytest
+import torch
+
+import flashinfer
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])

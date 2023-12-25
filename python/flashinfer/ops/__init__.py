@@ -1,9 +1,10 @@
-import torch
 import math
+from typing import Optional
 
 import flashinfer.ops._kernels as _kernels
+import torch
+
 from .utils import RotaryMode, TensorLayout
-from typing import Optional
 
 _cache_buf = {}
 
