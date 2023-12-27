@@ -87,14 +87,13 @@ cudaError_t _SinglePrefillWithKVCacheNoLSE(DTypeIn* q, DTypeIn* k, DTypeIn* v, D
       allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
       {SWITCH_GQA_GROUP_SIZE(
           group_size, GROUP_SIZE,
-          {SWITCH_CAUSAL(
-              causal, CAUSAL, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
-                SinglePrefillWithKVCacheDispatched<
-                    /*return_lse=*/true, GROUP_SIZE, /*head_dim=*/128, /*layout=*/QKVLayout::kNHD,
-                    ROTARY_MODE, ALLOW_FP16_QK_REDUCTION, CAUSAL>(q, k, v, o, tmp, /*lse=*/nullptr,
-                                                                  num_kv_heads, qo_len, kv_len,
-                                                                  rope_scale, rope_theta, stream);
-              })})})});
+          {SWITCH_CAUSAL(causal, CAUSAL, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
+                           SinglePrefillWithKVCacheDispatched<
+                               GROUP_SIZE, /*head_dim=*/128, /*layout=*/QKVLayout::kNHD,
+                               ROTARY_MODE, ALLOW_FP16_QK_REDUCTION, CAUSAL>(
+                               q, k, v, o, tmp, /*lse=*/nullptr, num_kv_heads, qo_len, kv_len,
+                               rope_scale, rope_theta, stream);
+                         })})})});
   return cudaSuccess;
 }
 
@@ -227,14 +226,13 @@ cudaError_t _BatchPrefillWithPagedKVCacheWrapper(
   const uint32_t group_size = num_qo_heads / num_kv_heads;
   SWITCH_GQA_GROUP_SIZE(
       group_size, GROUP_SIZE,
-      {SWITCH_CAUSAL(
-          causal, CAUSAL, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
-            return BatchPrefillWithPagedKVCacheWrapperDispatched<
-                page_storage, /*return_lse=*/true, GROUP_SIZE, /*head_dim=*/128, ROTARY_MODE,
-                /*allow_fp16_qk_reduction=*/false, CAUSAL, DTypeIn, DTypeOut, IdType>(
-                handler, q, paged_kv, qo_indptr, o, lse, num_qo_heads, rope_scale, rope_theta,
-                stream);
-          })})});
+      {SWITCH_CAUSAL(causal, CAUSAL, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
+                       return BatchPrefillWithPagedKVCacheWrapperDispatched<
+                           page_storage, GROUP_SIZE, /*head_dim=*/128, ROTARY_MODE,
+                           /*allow_fp16_qk_reduction=*/false, CAUSAL, DTypeIn, DTypeOut, IdType>(
+                           handler, q, paged_kv, qo_indptr, o, lse, num_qo_heads, rope_scale,
+                           rope_theta, stream);
+                     })})});
   return cudaSuccess;
 }
 
@@ -434,9 +432,8 @@ void _FlashInferAttentionDecodeWithPagedKVCache(int64_t handler_id, DLTensor* q_
 }
 
 void _FlashInferAttentionDecodeWithPagedKVCacheBeginForward(
-    int64_t handler_idx, DLTensor* page_table_indptr, DLTensor* last_page_len, int64_t return_lse,
-    int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim, int64_t page_size,
-    int64_t rotary_mode) {
+    int64_t handler_idx, DLTensor* page_table_indptr, DLTensor* last_page_len, int64_t num_qo_heads,
+    int64_t num_kv_heads, int64_t head_dim, int64_t page_size, int64_t rotary_mode) {
   CHECK_LT(handler_idx, max_num_handlers)
       << "The handler id must be less than " << max_num_handlers;
   constexpr PageStorage page_storage = PageStorage::kIndices;
@@ -448,7 +445,7 @@ void _FlashInferAttentionDecodeWithPagedKVCacheBeginForward(
     batch_decode_handlers[handler_idx].BeginForward<page_storage, dtype_in, dtype_in, dtype_idx>(
         static_cast<dtype_idx*>(page_table_indptr->data),
         static_cast<dtype_idx*>(last_page_len->data), batch_size, num_qo_heads, num_kv_heads,
-        head_dim, page_size, RotaryMode(rotary_mode), bool(return_lse));
+        head_dim, page_size, RotaryMode(rotary_mode));
   });
 }
 
@@ -475,14 +472,13 @@ cudaError_t _BatchPrefillWithRaggedKVCacheWrapper(
   CHECK(allow_fp16_qk_reduction == false) << "The fp16 qk reduction is not supported";
   SWITCH_GQA_GROUP_SIZE(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
-      {SWITCH_CAUSAL(
-          causal, CAUSAL, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
-            return BatchPrefillWithRaggedKVCacheWrapperDispatched<
-                /*return_lse=*/true, GROUP_SIZE, /*head_dim=*/128, /*layout=*/QKVLayout::kNHD,
-                ROTARY_MODE, /*allow_fp16_qk_reduction=*/false, CAUSAL, DTypeIn, DTypeOut, IdType>(
-                handler, q, qo_indptr, k, v, kv_indptr, o, lse, batch_size, num_kv_heads,
-                rope_scale, rope_theta, stream);
-          })})});
+      {SWITCH_CAUSAL(causal, CAUSAL, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
+                       return BatchPrefillWithRaggedKVCacheWrapperDispatched<
+                           GROUP_SIZE, /*head_dim=*/128, /*layout=*/QKVLayout::kNHD, ROTARY_MODE,
+                           /*allow_fp16_qk_reduction=*/false, CAUSAL, DTypeIn, DTypeOut, IdType>(
+                           handler, q, qo_indptr, k, v, kv_indptr, o, lse, batch_size, num_kv_heads,
+                           rope_scale, rope_theta, stream);
+                     })})});
   return cudaSuccess;
 }
 

@@ -88,14 +88,11 @@ class BatchDecodeHandler {
   template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
   void BeginForward(IdType* indptr, IdType* last_page_len, uint32_t batch_size,
                     uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
-                    uint32_t page_size, RotaryMode rotary_mode, bool return_lse) {
+                    uint32_t page_size, RotaryMode rotary_mode) {
     uint32_t tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size;
-    SWITCH_RETURN_LSE(return_lse, RETURN_LSE, {
-      BatchDecodeWithPagedKVCacheWorkEstimation<RETURN_LSE, page_storage, DTypeIn, DTypeOut,
-                                                IdType>(
-          tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size, batch_size, indptr,
-          num_qo_heads, num_kv_heads, head_dim, page_size, rotary_mode, stream_);
-    });
+    BatchDecodeWithPagedKVCacheWorkEstimation<page_storage, DTypeIn, DTypeOut, IdType>(
+        tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size, batch_size, indptr,
+        num_qo_heads, num_kv_heads, head_dim, page_size, rotary_mode, stream_);
     new_batch_size_ = new_batch_size;
     if (tmp_size > 0) {
       cudaMallocAsync(&float_buffer_, sizeof(float) * tmp_size, stream_);
@@ -260,9 +257,9 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapper(BatchDecodeHandler* handler, DTyp
       q, new_paged_kv, o, tmp, lse, num_qo_heads, rotary_mode, rope_scale, rope_theta, stream);
 }
 
-template <PageStorage page_storage, bool RETURN_LSE, uint32_t GROUP_SIZE, uint32_t HEAD_DIM,
-          RotaryMode ROTARY_MODE, bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL, typename DTypeIn,
-          typename DTypeOut, typename IdType>
+template <PageStorage page_storage, uint32_t GROUP_SIZE, uint32_t HEAD_DIM, RotaryMode ROTARY_MODE,
+          bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL, typename DTypeIn, typename DTypeOut,
+          typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
     BatchPrefillHandler* handler, DTypeIn* q, paged_kv_t<page_storage, DTypeIn, IdType> paged_kv,
     IdType* qo_indptr, DTypeOut* o, float* lse, uint32_t num_qo_heads, float rope_scale = 1.f,
@@ -288,13 +285,13 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
       num_frags_x, NUM_FRAGS_X, {SWITCH_PAGE_SIZE(paged_kv.page_size, PAGE_SIZE, {
         if constexpr (PAGE_SIZE == 0) {
           return BatchPrefillWithPagedKVCacheFallbackDispatched<
-              page_storage, RETURN_LSE, NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM, ROTARY_MODE,
-              ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
-              q, request_indices, tile_indices, qo_indptr, paged_kv, o, tmp, lse, num_qo_tiles,
-              rope_scale, rope_theta, stream);
+              page_storage, NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM, ROTARY_MODE, ALLOW_FP16_QK_REDUCTION,
+              CAUSAL, DTypeIn, DTypeOut, IdType>(q, request_indices, tile_indices, qo_indptr,
+                                                 paged_kv, o, tmp, lse, num_qo_tiles, rope_scale,
+                                                 rope_theta, stream);
         } else {
           return BatchPrefillWithPagedKVCacheDispatched<
-              page_storage, RETURN_LSE, NUM_FRAGS_X, PAGE_SIZE, GROUP_SIZE, HEAD_DIM, ROTARY_MODE,
+              page_storage, NUM_FRAGS_X, PAGE_SIZE, GROUP_SIZE, HEAD_DIM, ROTARY_MODE,
               ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
               q, request_indices, tile_indices, qo_indptr, paged_kv, o, tmp, lse, num_qo_tiles,
               rope_scale, rope_theta, stream);
@@ -303,9 +300,9 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
   return cudaSuccess;
 }
 
-template <bool RETURN_LSE, uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout LAYOUT,
-          RotaryMode ROTARY_MODE, bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL, typename DTypeIn,
-          typename DTypeOut, typename IdType>
+template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout LAYOUT, RotaryMode ROTARY_MODE,
+          bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL, typename DTypeIn, typename DTypeOut,
+          typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
     BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, DTypeIn* k, DTypeIn* v,
     IdType* kv_indptr, DTypeOut* o, float* lse, const uint32_t batch_size,
@@ -329,9 +326,9 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
   }
 
   SWITCH_NUM_FRAGS_X(num_frags_x, NUM_FRAGS_X, {
-    return BatchPrefillWithRaggedKVCacheDispatched<RETURN_LSE, NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM,
-                                                   LAYOUT, ROTARY_MODE, ALLOW_FP16_QK_REDUCTION,
-                                                   CAUSAL, DTypeIn, DTypeOut, IdType>(
+    return BatchPrefillWithRaggedKVCacheDispatched<NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM, LAYOUT,
+                                                   ROTARY_MODE, ALLOW_FP16_QK_REDUCTION, CAUSAL,
+                                                   DTypeIn, DTypeOut, IdType>(
         q, request_indices, tile_indices, qo_indptr, k, v, kv_indptr, o, tmp, lse, batch_size,
         num_qo_tiles, num_kv_heads, rope_scale, rope_theta, stream);
   });

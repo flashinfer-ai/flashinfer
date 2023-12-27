@@ -36,15 +36,6 @@
     __VA_ARGS__                                                       \
   }
 
-#define SWITCH_RETURN_LSE(return_lse, RETURN_LSE, ...) \
-  if (return_lse) {                                    \
-    constexpr bool RETURN_LSE = true;                  \
-    __VA_ARGS__                                        \
-  } else {                                             \
-    constexpr bool RETURN_LSE = false;                 \
-    __VA_ARGS__                                        \
-  }
-
 #define SWITCH_ALLOW_FP16_QK_REDUCTION(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, ...) \
   if (allow_fp16_qk_reduction) {                                                              \
     constexpr bool ALLOW_FP16_QK_REDUCTION = true;                                            \

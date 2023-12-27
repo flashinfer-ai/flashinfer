@@ -97,7 +97,7 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
   flashinfer::BatchDecodeHandler handler;
   handler.BeginForward<PageStorage::kIndices, T, T, int32_t>(
       kv_indptr.data(), kv_last_page_len.data(), batch_size, num_qo_heads, num_kv_heads, head_dim,
-      page_size, rotary_mode, /*return_lse=*/false);
+      page_size, rotary_mode);
 
   if (!cooperative) {
     // use non-cooperative kernel

@@ -365,9 +365,8 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
   }
 }
 
-template <bool return_lse, QKVLayout layout, RotaryMode rotary_mode, uint32_t num_stages_smem,
-          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename DTypeIn,
-          typename DTypeOut>
+template <QKVLayout layout, RotaryMode rotary_mode, uint32_t num_stages_smem, uint32_t vec_size,
+          uint32_t bdx, uint32_t bdy, uint32_t bdz, typename DTypeIn, typename DTypeOut>
 __global__ void BatchDecodeWithPaddedKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* __restrict__ k,
                                                    DTypeIn* __restrict__ v,
                                                    DTypeOut* __restrict__ o,
@@ -487,14 +486,13 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(DTypeIn* __restrict__ q, DTyp
                         info.get_qo_elem_offset(0, qo_head_idx, tx * vec_size));
 
   // write lse
-  if constexpr (return_lse) {
+  if (lse != nullptr) {
     lse[batch_idx * num_qo_heads + qo_head_idx] = st_local.get_lse();
   }
 }
 
 /*!
  * \brief FlashAttention decoding cuda kernel with paged kv-cache for multiple requests
- * \tparam return_lse Whether to return the logsumexp values
  * \tparam cooperative Whether to use cooperative kernel or not
  * \tparam rotary_mode The rotary mode
  * \tparam vec_size A template integer indicates the vector size
@@ -517,7 +515,7 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(DTypeIn* __restrict__ q, DTyp
  * \param rope_rcp_theta A floating number indicate the reciprocal
  *   of "theta" used in RoPE (Rotary Positional Embeddings)
  */
-template <bool return_lse, bool cooperative, RotaryMode rotary_mode, uint32_t num_stages_smem,
+template <bool cooperative, RotaryMode rotary_mode, uint32_t num_stages_smem,
           uint32_t tile_size_per_bdx, uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz,
           PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
 __global__ void BatchDecodeWithPagedKVCacheKernel(
@@ -740,7 +738,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
   }
 
   // write lse
-  if constexpr (return_lse) {
+  if (lse != nullptr) {
     lse[batch_idx * num_qo_heads + qo_head_idx] = st.get_lse();
   }
 }
@@ -1078,7 +1076,6 @@ std::pair<uint32_t, uint32_t> SplitPagedKVCacheBinarySearchMinNumPagePerBatch(
 /*!
  * \brief Estimate the temporary buffer size and the maximum grid size for the
  *   cooperative BatchDecodeWithPagedKVCache kernel
- * \tparam return_lse Whether to return the logsumexp values
  * \tparam page_storage Whether to store indices or pointers of each active page
  * \tparam DTypeIn A template type indicates the input data type
  * \tparam DTypeOut A template type indicates the output data type
@@ -1093,8 +1090,7 @@ std::pair<uint32_t, uint32_t> SplitPagedKVCacheBinarySearchMinNumPagePerBatch(
  * \param stream The cuda stream to launch the kernel
  * \return status Indicates whether CUDA calls are successful
  */
-template <bool return_lse, PageStorage page_storage, typename DTypeIn, typename DTypeOut,
-          typename IdType>
+template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
     uint32_t& tmp_size, uint32_t& max_grid_size, uint32_t& max_num_pages_per_batch,
     uint32_t& new_batch_size, uint32_t batch_size, IdType* kv_indptr, const uint32_t num_qo_heads,
@@ -1118,7 +1114,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
                          2 * bdy * bdz * sizeof(float));
 
             auto cooperative_kernel =
-                BatchDecodeWithPagedKVCacheKernel<return_lse, true, ROTARY_MODE, num_stages_smem,
+                BatchDecodeWithPagedKVCacheKernel<true, ROTARY_MODE, num_stages_smem,
                                                   tile_size_per_bdx, vec_size, bdx, bdy, bdz,
                                                   page_storage, DTypeIn, DTypeOut, IdType>;
             int num_blocks_per_sm = 0;
@@ -1161,8 +1157,8 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
   return cudaSuccess;
 }
 
-template <bool RETURN_LSE, uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage,
-          RotaryMode ROTARY_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
+template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, RotaryMode ROTARY_MODE,
+          typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     DTypeIn* q, paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, DTypeOut* o, float* tmp,
     float* lse, float rope_scale, float rope_theta, cudaStream_t stream) {
@@ -1188,7 +1184,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     // do not use cooperative kernel
     dim3 nblks(batch_size, num_kv_heads);
     dim3 nthrs(bdx, bdy, bdz);
-    auto kernel = BatchDecodeWithPagedKVCacheKernel<RETURN_LSE, false, ROTARY_MODE, num_stages_smem,
+    auto kernel = BatchDecodeWithPagedKVCacheKernel<false, ROTARY_MODE, num_stages_smem,
                                                     tile_size_per_bdx, vec_size, bdx, bdy, bdz,
                                                     page_storage, DTypeIn, DTypeOut, IdType>;
     FLASHINFER_CUDA_CALL(
@@ -1210,9 +1206,9 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
       abort();
     }
     auto cooperative_kernel =
-        BatchDecodeWithPagedKVCacheKernel<RETURN_LSE, true, ROTARY_MODE, num_stages_smem,
-                                          tile_size_per_bdx, vec_size, bdx, bdy, bdz, page_storage,
-                                          DTypeIn, DTypeOut, IdType>;
+        BatchDecodeWithPagedKVCacheKernel<true, ROTARY_MODE, num_stages_smem, tile_size_per_bdx,
+                                          vec_size, bdx, bdy, bdz, page_storage, DTypeIn, DTypeOut,
+                                          IdType>;
     FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
         cooperative_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     void* args[] = {(void*)&q,
@@ -1266,24 +1262,20 @@ cudaError_t BatchDecodeWithPagedKVCache(DTypeIn* q,
     abort();
   }
 
-  const bool return_lse = (lse != nullptr);
-
-  SWITCH_RETURN_LSE(
-      return_lse, RETURN_LSE,
-      {SWITCH_GQA_GROUP_SIZE(
-          num_qo_heads / num_kv_heads, GROUP_SIZE,
-          {SWITCH_HEAD_DIM(head_dim, HEAD_DIM, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
-                             return BatchDecodeWithPagedKVCacheDispatched<
-                                 RETURN_LSE, GROUP_SIZE, HEAD_DIM, page_storage, ROTARY_MODE,
-                                 DTypeIn, DTypeOut, IdType>(q, paged_kv, o, tmp, lse, rope_scale,
-                                                            rope_theta, stream);
-                           })})})});
+  SWITCH_GQA_GROUP_SIZE(
+      num_qo_heads / num_kv_heads, GROUP_SIZE,
+      {SWITCH_HEAD_DIM(
+          head_dim, HEAD_DIM, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
+            return BatchDecodeWithPagedKVCacheDispatched<GROUP_SIZE, HEAD_DIM, page_storage,
+                                                         ROTARY_MODE, DTypeIn, DTypeOut, IdType>(
+                q, paged_kv, o, tmp, lse, rope_scale, rope_theta, stream);
+          })})});
 
   return cudaSuccess;
 }
 
-template <bool RETURN_LSE, uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout LAYOUT,
-          RotaryMode ROTARY_MODE, typename DTypeIn, typename DTypeOut>
+template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout LAYOUT, RotaryMode ROTARY_MODE,
+          typename DTypeIn, typename DTypeOut>
 cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeIn* o,
                                                    float* tmp, float* lse, uint32_t batch_size,
                                                    uint32_t padded_kv_len, uint32_t num_qo_heads,
@@ -1307,8 +1299,8 @@ cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DType
 
   dim3 nblks(batch_size, num_kv_heads);
   dim3 nthrs(bdx, bdy, bdz);
-  auto kernel = BatchDecodeWithPaddedKVCacheKernel<RETURN_LSE, LAYOUT, ROTARY_MODE, num_stages_smem,
-                                                   vec_size, bdx, bdy, bdz, DTypeIn, DTypeOut>;
+  auto kernel = BatchDecodeWithPaddedKVCacheKernel<LAYOUT, ROTARY_MODE, num_stages_smem, vec_size,
+                                                   bdx, bdy, bdz, DTypeIn, DTypeOut>;
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
   tensor_info_t<LAYOUT, GROUP_SIZE> info(1, padded_kv_len, num_kv_heads, HEAD_DIM);
@@ -1339,20 +1331,16 @@ cudaError_t BatchDecodeWithPaddedKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTy
     abort();
   }
 
-  const bool return_lse = (lse != nullptr);
-  SWITCH_RETURN_LSE(
-      return_lse, RETURN_LSE,
-      {SWITCH_GQA_GROUP_SIZE(
-          num_qo_heads / num_kv_heads, GROUP_SIZE,
-          {SWITCH_HEAD_DIM(
-              head_dim, HEAD_DIM,
-              {SWITCH_ROTARY_MODE(
-                  rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(layout, LAYOUT, {
-                    return BatchDecodeWithPaddedKVCacheDispatched<
-                        RETURN_LSE, GROUP_SIZE, HEAD_DIM, LAYOUT, ROTARY_MODE, DTypeIn, DTypeOut>(
-                        q, k, v, o, tmp, lse, batch_size, padded_kv_len, num_qo_heads, rope_scale,
-                        rope_theta, stream);
-                  })})})})});
+  SWITCH_GQA_GROUP_SIZE(
+      num_qo_heads / num_kv_heads, GROUP_SIZE,
+      {SWITCH_HEAD_DIM(
+          head_dim, HEAD_DIM,
+          {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(layout, LAYOUT, {
+                                return BatchDecodeWithPaddedKVCacheDispatched<
+                                    GROUP_SIZE, HEAD_DIM, LAYOUT, ROTARY_MODE, DTypeIn, DTypeOut>(
+                                    q, k, v, o, tmp, lse, batch_size, padded_kv_len, num_qo_heads,
+                                    rope_scale, rope_theta, stream);
+                              })})})});
   return cudaSuccess;
 }
 
