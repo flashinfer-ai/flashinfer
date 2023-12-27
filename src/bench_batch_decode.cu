@@ -139,11 +139,13 @@ void bench_flashinfer_batch_decode_with_prefill(nvbench::state& state) {
           vec_bytes(kv_indptr) + vec_bytes(kv_indices) + vec_bytes(kv_last_page_len),
       "Read");
   state.add_global_memory_writes<uint8_t>(vec_bytes(o), "Write");
+  BatchPrefillHandler handler;
+  handler.BeginForward(qo_indptr_h.data(), batch_size, num_qo_heads / num_kv_heads);
 
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
-    cudaError_t status = BatchPrefillWithPagedKVCache(
-        thrust::raw_pointer_cast(q.data()), paged_kv, thrust::raw_pointer_cast(qo_indptr_d.data()),
-        thrust::raw_pointer_cast(o.data()), /*tmp=*/nullptr,
+    cudaError_t status = BatchPrefillWithPagedKVCacheWrapper(
+        &handler, thrust::raw_pointer_cast(q.data()), thrust::raw_pointer_cast(qo_indptr_d.data()),
+        paged_kv, thrust::raw_pointer_cast(o.data()),
         /*lse=*/nullptr, num_qo_heads,
         /*causal=*/false, rotary_mode);
   });

@@ -213,10 +213,11 @@ thread_local BatchPrefillHandler batch_prefill_ragged_kv_handler;
  */
 template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t _BatchPrefillWithPagedKVCacheWrapper(
-    BatchPrefillHandler* handler, DTypeIn* q, paged_kv_t<page_storage, DTypeIn, IdType> paged_kv,
-    IdType* qo_indptr, DTypeOut* o, float* lse, uint32_t num_qo_heads, bool causal = true,
-    RotaryMode rotary_mode = RotaryMode::kNone, bool allow_fp16_qk_reduction = false,
-    float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {
+    BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr,
+    paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, DTypeOut* o, float* lse,
+    uint32_t num_qo_heads, bool causal = true, RotaryMode rotary_mode = RotaryMode::kNone,
+    bool allow_fp16_qk_reduction = false, float rope_scale = 1.f, float rope_theta = 1e4,
+    cudaStream_t stream = nullptr) {
   CHECK(lse != nullptr) << "The lse buffer must be provided";
   CHECK(allow_fp16_qk_reduction == false) << "The fp16 qk reduction is not supported";
   CHECK(paged_kv.head_dim == 128) << "The head dimension must be 128";
@@ -230,7 +231,7 @@ cudaError_t _BatchPrefillWithPagedKVCacheWrapper(
                        return BatchPrefillWithPagedKVCacheWrapperDispatched<
                            page_storage, GROUP_SIZE, /*head_dim=*/128, ROTARY_MODE,
                            /*allow_fp16_qk_reduction=*/false, CAUSAL, DTypeIn, DTypeOut, IdType>(
-                           handler, q, paged_kv, qo_indptr, o, lse, num_qo_heads, rope_scale,
+                           handler, q, qo_indptr, paged_kv, o, lse, num_qo_heads, rope_scale,
                            rope_theta, stream);
                      })})});
   return cudaSuccess;
@@ -317,8 +318,8 @@ void _FlashInferAttentionPrefillWithPagedKVCache(int64_t handler_id, DLTensor* q
             cudaError_t status =
                 _BatchPrefillWithPagedKVCacheWrapper<page_storage, dtype_in, dtype_out, dtype_idx>(
                     &batch_prefill_paged_kv_handlers[handler_id],
-                    static_cast<dtype_in*>(q_data->data), cache,
-                    static_cast<dtype_idx*>(qo_indptr->data), static_cast<dtype_out*>(output->data),
+                    static_cast<dtype_in*>(q_data->data), static_cast<dtype_idx*>(qo_indptr->data),
+                    cache, static_cast<dtype_out*>(output->data),
                     /*lse=*/static_cast<float*>(lse->data), nhead_qo,
                     /*causal=*/causal, RotaryMode(rotary_mode), /*allow_fp16_qk_reduction=*/false,
                     rope_scale, rope_theta, 0);

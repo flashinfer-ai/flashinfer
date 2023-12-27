@@ -1836,7 +1836,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
 
 template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithPagedKVCache(
-    DTypeIn* q, paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, IdType* qo_indptr, DTypeOut* o,
+    DTypeIn* q, IdType* qo_indptr, paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, DTypeOut* o,
     float* tmp, float* lse, uint32_t num_qo_heads, bool causal = true,
     RotaryMode rotary_mode = RotaryMode::kNone, bool allow_fp16_qk_reduction = false,
     float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {

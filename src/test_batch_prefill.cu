@@ -98,8 +98,8 @@ void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t num_qo
 
     for (uint32_t num_runs = 0; num_runs < 10; ++num_runs) {
       auto status = BatchPrefillWithPagedKVCache<PageStorage::kIndices, T, T, int32_t>(
-          thrust::raw_pointer_cast(q_device.data()), paged_kv,
-          thrust::raw_pointer_cast(q_indptr_device.data()),
+          thrust::raw_pointer_cast(q_device.data()),
+          thrust::raw_pointer_cast(q_indptr_device.data()), paged_kv,
           thrust::raw_pointer_cast(o_device.data()), /*tmp=*/nullptr,
           /*lse=*/nullptr, num_qo_heads, causal, rotary_mode, allow_fp16_qk_reduction);
       EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
@@ -213,8 +213,8 @@ void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads, size_t 
 
   for (uint32_t num_runs = 0; num_runs < 10; ++num_runs) {
     auto status = BatchPrefillWithPagedKVCache<PageStorage::kIndices, T, T, int32_t>(
-        thrust::raw_pointer_cast(q_device.data()), paged_kv,
-        thrust::raw_pointer_cast(q_indptr_device.data()), thrust::raw_pointer_cast(o_device.data()),
+        thrust::raw_pointer_cast(q_device.data()), thrust::raw_pointer_cast(q_indptr_device.data()),
+        paged_kv, thrust::raw_pointer_cast(o_device.data()),
         /*tmp=*/nullptr,
         /*lse=*/nullptr, num_qo_heads, causal, rotary_mode, allow_fp16_qk_reduction);
     EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
@@ -299,8 +299,8 @@ void _TestBatchPrefillKernelLongContextCorrectness(size_t num_kv_heads, size_t n
 
   for (uint32_t num_runs = 0; num_runs < 10; ++num_runs) {
     auto status = BatchPrefillWithPagedKVCache<PageStorage::kIndices, T, T, int32_t>(
-        thrust::raw_pointer_cast(q_device.data()), paged_kv,
-        thrust::raw_pointer_cast(q_indptr_device.data()), thrust::raw_pointer_cast(o_device.data()),
+        thrust::raw_pointer_cast(q_device.data()), thrust::raw_pointer_cast(q_indptr_device.data()),
+        paged_kv, thrust::raw_pointer_cast(o_device.data()),
         /*tmp=*/nullptr, /*lse=*/nullptr, num_qo_heads, causal, rotary_mode,
         allow_fp16_qk_reduction);
     EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
