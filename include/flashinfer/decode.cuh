@@ -956,8 +956,6 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
 
 /*!
  * \brief Split Paged KV-Cache into multiple chunks on KV sequence length
- * \tparam page_storage Whether to store indices or pointers of each active page
- * \tparam DTypeIn A template type indicates the input data type
  * \tparam IdType A template type indicates the index data type
  * \param old_batch_size The batch size of the old Paged KV-Cache
  * \param old_page_indptr_h The host-side page indptr of the old Paged KV-Cache
@@ -967,25 +965,31 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
  * \param stream The cuda stream to launch the kernel
  * \return status Indicates whether CUDA calls are successful
  */
-template <PageStorage page_storage, typename DTypeIn, typename IdType>
+template <typename IdType>
 cudaError_t SplitPagedCacheKVComputeAuxiliaryInfo(
-    uint32_t max_num_pages_per_batch,
-    const paged_kv_t<page_storage, DTypeIn, IdType>& old_paged_kv_d, IdType* new_indptr_d,
+    const uint32_t max_num_pages_per_batch, const uint32_t old_batch_size, const uint32_t page_size,
+    IdType* old_indptr, IdType* old_last_page_len, IdType* new_indptr_d,
     IdType* new_last_page_len_d, IdType* cooperative_indptr_d, IdType* batch_idx_map_d,
     IdType* chunk_start_d, IdType* seq_lens_before_split_d, cudaStream_t stream = nullptr) {
-  uint32_t page_size = old_paged_kv_d.page_size;
-  uint32_t old_batch_size = old_paged_kv_d.batch_size;
   std::vector<IdType> new_page_indptr_h{0}, new_last_page_len_h, cooperative_indptr_h{0},
       batch_idx_map_h, chunk_start_h, seq_lens_before_split_h;
 
   std::vector<IdType> old_indptr_h(old_batch_size + 1), old_last_page_len_h(old_batch_size);
-  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(old_indptr_h.data(), old_paged_kv_d.indptr,
-                                       sizeof(IdType) * (old_batch_size + 1),
-                                       cudaMemcpyDeviceToHost, stream));
-  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(old_last_page_len_h.data(), old_paged_kv_d.last_page_len,
-                                       sizeof(IdType) * old_batch_size, cudaMemcpyDeviceToHost,
-                                       stream));
-  FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
+  if (is_device_ptr(old_indptr)) {
+    FLASHINFER_CUDA_CALL(cudaMemcpyAsync(old_indptr_h.data(), old_indptr,
+                                         sizeof(IdType) * (old_batch_size + 1),
+                                         cudaMemcpyDeviceToHost, stream));
+  } else {
+    old_indptr_h.assign(old_indptr, old_indptr + old_batch_size + 1);
+  }
+  if (is_device_ptr(old_last_page_len)) {
+    FLASHINFER_CUDA_CALL(cudaMemcpyAsync(old_last_page_len_h.data(), old_last_page_len,
+                                         sizeof(IdType) * old_batch_size, cudaMemcpyDeviceToHost,
+                                         stream));
+    FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
+  } else {
+    old_last_page_len_h.assign(old_last_page_len, old_last_page_len + old_batch_size);
+  }
 
   for (uint32_t batch_idx = 0; batch_idx < old_batch_size; batch_idx++) {
     uint32_t cooperative_indptr_delta =
@@ -1093,13 +1097,9 @@ template <bool return_lse, PageStorage page_storage, typename DTypeIn, typename 
           typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
     uint32_t& tmp_size, uint32_t& max_grid_size, uint32_t& max_num_pages_per_batch,
-    uint32_t& new_batch_size, const paged_kv_t<page_storage, DTypeIn, IdType>& paged_kv,
-    uint32_t num_qo_heads, RotaryMode rotary_mode = RotaryMode::kNone,
-    cudaStream_t stream = nullptr) {
-  const uint32_t head_dim = paged_kv.head_dim;
-  const uint32_t batch_size = paged_kv.batch_size;
-  const uint32_t num_kv_heads = paged_kv.num_heads;
-
+    uint32_t& new_batch_size, uint32_t batch_size, IdType* kv_indptr, const uint32_t num_qo_heads,
+    const uint32_t num_kv_heads, const uint32_t head_dim, const uint32_t page_size,
+    const RotaryMode rotary_mode = RotaryMode::kNone, cudaStream_t stream = nullptr) {
   SWITCH_GQA_GROUP_SIZE(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
       {SWITCH_HEAD_DIM(
@@ -1130,7 +1130,6 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
             FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                 &num_blocks_per_sm, cooperative_kernel, num_threads, smem_size));
             max_grid_size = num_blocks_per_sm * num_sm;
-            const uint32_t num_kv_heads = paged_kv.num_heads;
             if (batch_size * num_kv_heads >= max_grid_size) {
               // do not use cooperative kernel
               tmp_size = 0;
@@ -1138,15 +1137,19 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
             } else {
               // compute max_num_pages_per_batch and new_batch_size
               std::vector<IdType> page_indptr_h(batch_size + 1), num_pages(batch_size);
-              FLASHINFER_CUDA_CALL(cudaMemcpy(page_indptr_h.data(), paged_kv.indptr,
-                                              sizeof(IdType) * (batch_size + 1),
-                                              cudaMemcpyDeviceToHost));
+              if (is_device_ptr(kv_indptr)) {
+                FLASHINFER_CUDA_CALL(cudaMemcpy(page_indptr_h.data(), kv_indptr,
+                                                sizeof(IdType) * (batch_size + 1),
+                                                cudaMemcpyDeviceToHost));
+              } else {
+                page_indptr_h.assign(kv_indptr, kv_indptr + batch_size + 1);
+              }
               for (uint32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
                 num_pages[batch_idx] = page_indptr_h[batch_idx + 1] - page_indptr_h[batch_idx];
               }
               std::tie(max_num_pages_per_batch, new_batch_size) =
-                  SplitPagedKVCacheBinarySearchMinNumPagePerBatch(
-                      max_grid_size, num_kv_heads, num_pages, 512 / paged_kv.page_size);
+                  SplitPagedKVCacheBinarySearchMinNumPagePerBatch(max_grid_size, num_kv_heads,
+                                                                  num_pages, 512 / page_size);
               if (new_batch_size == batch_size) {
                 // do not use cooperative kernel for short sequence
                 tmp_size = 0;

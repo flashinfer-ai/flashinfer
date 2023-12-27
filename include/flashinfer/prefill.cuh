@@ -1603,7 +1603,7 @@ std::tuple<IdType, IdType, std::vector<IdType>, std::vector<IdType>> split_qo_in
     cudaMemcpyAsync(qo_indptr_h.data(), qo_indptr, sizeof(IdType) * (batch_size + 1),
                     cudaMemcpyDeviceToHost, stream);
   } else {
-    std::copy(qo_indptr, qo_indptr + batch_size + 1, qo_indptr_h.data());
+    qo_indptr_h.assign(qo_indptr, qo_indptr + batch_size + 1);
   }
 
   const uint32_t total_q_len = qo_indptr_h[batch_size];
