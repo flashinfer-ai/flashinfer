@@ -107,6 +107,7 @@ class BatchDecodeHandler {
           GetSeqLengthsBeforeSplit<IdType>(), stream_));
     }
     forward_started_ = true;
+    return cudaSuccess;
   }
 
   cudaError_t EndForward() {
@@ -120,6 +121,7 @@ class BatchDecodeHandler {
       FLASHINFER_CUDA_CALL(cudaFreeAsync(int_buffer_, stream_));
       int_buffer_ = nullptr;
     }
+    return cudaSuccess;
   }
 
   bool IsForwardStarted() const { return forward_started_; }
@@ -177,6 +179,7 @@ class BatchPrefillHandler {
     FLASHINFER_CUDA_CALL(cudaMemcpyAsync(tile_indices_, tile_indices_h.data(),
                                          sizeof(IdType) * tile_indices_h.size(),
                                          cudaMemcpyHostToDevice, stream_));
+    return cudaSuccess;
   }
 
   cudaError_t EndForward() {
@@ -191,6 +194,7 @@ class BatchPrefillHandler {
       FLASHINFER_CUDA_CALL(cudaFreeAsync(tile_indices_, stream_));
       tile_indices_ = nullptr;
     }
+    return cudaSuccess;
   }
 
   cudaStream_t GetCUDAStream() const { return stream_; }
