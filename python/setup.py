@@ -53,7 +53,7 @@ ext_modules.append(
             "csrc/single_prefill.cu",
             "csrc/cascade.cu",
             "csrc/batch_decode.cu",
-            "csrc/flashinfer_ops.cc",
+            "csrc/flashinfer_ops.cu",
             "csrc/batch_prefill.cu",
         ],
         include_dirs=[

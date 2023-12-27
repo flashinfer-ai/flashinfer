@@ -36,8 +36,7 @@ def test_batch_prefill_with_paged_kv_cache(
     num_qo_heads,
     head_dim,
 ):
-    q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
-    q_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
+    q = torch.randn(batch_size, num_qo_heads, head_dim).to(0).half()
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size
     kv_data = (
@@ -49,18 +48,12 @@ def test_batch_prefill_with_paged_kv_cache(
         (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
     ).to(0)
 
-    o = flashinfer.ops.batch_prefill_with_paged_kv_cache(
-        q,
-        q_indptr,
-        kv_data,
-        kv_indptr,
-        kv_indices,
-        kv_last_page_len,
-        page_size,
-    )
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper()
+    wrapper.begin_forward(kv_indptr, kv_last_page_len, batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, "NONE", "float16")
+    o = wrapper.forward(q, kv_indptr, kv_indices, kv_last_page_len, kv_data)
 
     for i in range(batch_size):
-        qi = q[q_indptr[i] : q_indptr[i + 1]]
+        qi = q[i]
         ki = torch.cat(
             [
                 kv_data[kv_indptr[i] : kv_indptr[i + 1] - 1, 0]
@@ -83,8 +76,8 @@ def test_batch_prefill_with_paged_kv_cache(
             ],
             dim=0,
         )
-        o_ref_i = flashinfer.ops.single_prefill_with_kv_cache(qi, ki, vi, True)
-        o_i_np = o[q_indptr[i] : q_indptr[i + 1]].cpu().numpy()
+        o_ref_i = flashinfer.ops.single_decode_with_kv_cache(qi, ki, vi)
+        o_i_np = o[i].cpu().numpy()
         o_ref_i_np = o_ref_i.cpu().numpy()
         numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
 

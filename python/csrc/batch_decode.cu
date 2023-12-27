@@ -105,3 +105,92 @@ std::vector<torch::Tensor> batch_decode_with_padded_kv_cache_return_lse(
   TORCH_CHECK(success, "BatchDecodeWithPaddedKVCache kernel launch failed: supported data type");
   return {o, lse};
 }
+
+void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
+    torch::Tensor indptr, torch::Tensor last_page_len, unsigned int batch_size,
+    unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int head_dim,
+    unsigned int page_size, unsigned int rotary_mode, torch::Tensor empty_data) {
+  // NOTE(zihao): not necessary to be CUDA tensor
+  CHECK_CONTIGUOUS(indptr);
+  CHECK_CONTIGUOUS(last_page_len);
+  CHECK_DIM(1, indptr);
+  CHECK_DIM(1, last_page_len);
+  CHECK_EQ(indptr.scalar_type(), torch::kInt32);
+  CHECK_EQ(indptr.scalar_type(), torch::kInt32);
+
+  bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(empty_data.scalar_type(), c_type, [&] {
+    handler_.BeginForward<PageStorage::kIndices, c_type, c_type, int32_t>(
+        static_cast<int32_t*>(indptr.data_ptr()), static_cast<int32_t*>(last_page_len.data_ptr()),
+        batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, RotaryMode(rotary_mode));
+    // TORCH_CHECK(cudaGetLastError() == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error
+    // ",
+    //             cudaGetErrorString(cudaGetLastError()));
+    return true;
+  });
+
+  TORCH_CHECK(success, "BatchDecodeWithPagedKVCache failed to dispatch with dtype ",
+              empty_data.scalar_type());
+}
+
+void BatchDecodeWithPagedKVCachePyTorchWrapper::EndForward() { handler_.EndForward(); }
+
+std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
+    torch::Tensor q, torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
+    torch::Tensor paged_kv_last_page_len, torch::Tensor paged_kv_data, unsigned int rotary_mode,
+    float rope_scale, float rope_theta, bool return_lse) {
+  CHECK_INPUT(q);
+  CHECK_INPUT(paged_kv_indptr);
+  CHECK_INPUT(paged_kv_indices);
+  CHECK_INPUT(paged_kv_last_page_len);
+  CHECK_INPUT(paged_kv_data);
+  CHECK_DIM(3, q);                       // (B, H_qo, D)
+  CHECK_DIM(1, paged_kv_indptr);         // (B+1,)
+  CHECK_DIM(1, paged_kv_indices);        // (nnz,)
+  CHECK_DIM(1, paged_kv_last_page_len);  // (B,)
+  CHECK_DIM(5, paged_kv_data);           // (num_max_pages, 2, H_kv, page_size, head_dim)
+  int64_t batch_size = q.size(0);
+  int64_t num_qo_heads = q.size(1);
+  int64_t head_dim = q.size(2);
+  int64_t num_kv_heads = paged_kv_data.size(2);
+  int64_t page_size = paged_kv_data.size(3);
+  CHECK_EQ(paged_kv_indptr.size(0), batch_size + 1);
+  CHECK_EQ(paged_kv_last_page_len.size(0), batch_size);
+  CHECK_EQ(paged_kv_data.size(1), 2);
+  CHECK_EQ(paged_kv_data.size(4), head_dim);
+  // TODO(Zihao): support dispatching to different data types
+  CHECK_EQ(paged_kv_indptr.scalar_type(), torch::kInt32);
+  CHECK_EQ(paged_kv_indices.scalar_type(), torch::kInt32);
+  CHECK_EQ(paged_kv_last_page_len.scalar_type(), torch::kInt32);
+
+  torch::Tensor o = torch::empty_like(q, q.options());
+  torch::Tensor lse;
+  if (return_lse) {
+    lse = torch::empty({batch_size, num_qo_heads}, q.options()).to(torch::kFloat32);
+  }
+  bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
+    paged_kv_t<PageStorage::kIndices, c_type, int32_t> paged_kv(
+        num_kv_heads, page_size, head_dim, batch_size,
+        static_cast<c_type*>(paged_kv_data.data_ptr()),
+        static_cast<int32_t*>(paged_kv_indices.data_ptr()),
+        static_cast<int32_t*>(paged_kv_indptr.data_ptr()),
+        static_cast<int32_t*>(paged_kv_last_page_len.data_ptr()));
+    cudaError_t status =
+        BatchDecodeWithPagedKVCacheWrapper<PageStorage::kIndices, c_type, c_type, int32_t>(
+            &handler_, static_cast<c_type*>(q.data_ptr()), paged_kv,
+            static_cast<c_type*>(o.data_ptr()),
+            /*lse=*/(return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr), num_qo_heads,
+            RotaryMode(rotary_mode), rope_scale, rope_theta, /*stream=*/nullptr);
+    TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
+                cudaGetErrorString(status));
+    return true;
+  });
+
+  TORCH_CHECK(success, "BatchDecodeWithPagedKVCache failed to dispatch with dtype ",
+              q.scalar_type());
+
+  if (return_lse) {
+    return {o, lse};
+  } else {
+    return {o};
+  }
+}

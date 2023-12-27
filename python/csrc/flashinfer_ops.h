@@ -16,6 +16,8 @@
 #pragma once
 #include <torch/extension.h>
 
+#include <flashinfer.cuh>
+
 torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                                           torch::Tensor tmp, unsigned int rotary_mode,
                                           unsigned int layout, float sm_scale, float rope_scale,
@@ -49,3 +51,23 @@ torch::Tensor batch_prefill_with_paged_kv_cache(
     torch::Tensor q, torch::Tensor q_indptr, torch::Tensor kv_data, torch::Tensor kv_indptr,
     torch::Tensor kv_indices, torch::Tensor kv_last_page_len, unsigned int page_size, bool causal,
     unsigned int rotary_mode, bool allow_fp16_qk_reduction, float rope_scale, float rope_theta);
+
+class BatchDecodeWithPagedKVCachePyTorchWrapper {
+ public:
+  static BatchDecodeWithPagedKVCachePyTorchWrapper Create() {
+    return BatchDecodeWithPagedKVCachePyTorchWrapper();
+  }
+  void BeginForward(torch::Tensor indptr, torch::Tensor last_page_len, unsigned int batch_size,
+                    unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int head_dim,
+                    unsigned int page_size, unsigned int rotary_mode, torch::Tensor empty_data);
+  void EndForward();
+  std::vector<torch::Tensor> Forward(torch::Tensor q, torch::Tensor paged_kv_indptr,
+                                     torch::Tensor paged_kv_indices,
+                                     torch::Tensor paged_kv_last_page_len,
+                                     torch::Tensor paged_kv_data, unsigned int rotary_mode,
+                                     float rope_scale, float rope_theta, bool return_lse);
+
+ private:
+  BatchDecodeWithPagedKVCachePyTorchWrapper() {}
+  flashinfer::BatchDecodeHandler handler_;
+};

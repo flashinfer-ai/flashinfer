@@ -13,9 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "flashinfer_ops.h"
-
 #include <torch/extension.h>
+
+#include "flashinfer_ops.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("single_decode_with_kv_cache", &single_decode_with_kv_cache,
@@ -33,4 +33,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Multi-request batch decode with padded KV-Cache operator, return logsumexp");
   m.def("batch_prefill_with_paged_kv_cache", &batch_prefill_with_paged_kv_cache,
         "Multi-request batch prefill with paged KV-Cache operator");
+  py::class_<BatchDecodeWithPagedKVCachePyTorchWrapper>(m,
+                                                        "BatchDecodeWithPagedKVCachePyTorchWrapper")
+      .def(py::init([]() { return BatchDecodeWithPagedKVCachePyTorchWrapper::Create(); }))
+      .def("begin_forward", &BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward)
+      .def("end_forward", &BatchDecodeWithPagedKVCachePyTorchWrapper::EndForward)
+      .def("forward", &BatchDecodeWithPagedKVCachePyTorchWrapper::Forward);
 }

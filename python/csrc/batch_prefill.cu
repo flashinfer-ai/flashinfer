@@ -37,6 +37,10 @@ torch::Tensor batch_prefill_with_paged_kv_cache(
   CHECK_DIM(1, kv_last_page_len);
   CHECK_EQ(q_indptr.size(0), kv_indptr.size(0));
   CHECK_EQ(kv_indptr.size(0), kv_last_page_len.size(0) + 1);
+  // TODO(Zihao): support dispatching to different index data types.
+  CHECK_EQ(kv_indptr.scalar_type(), torch::kInt32);
+  CHECK_EQ(kv_indices.scalar_type(), torch::kInt32);
+  CHECK_EQ(kv_last_page_len.scalar_type(), torch::kInt32);
   if (kv_data.dim() == 5) {
     CHECK_EQ(q.size(2), kv_data.size(4));
   } else {

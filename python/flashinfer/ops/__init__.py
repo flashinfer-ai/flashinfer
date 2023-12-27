@@ -1,3 +1,18 @@
+"""
+Copyright (c) 2023 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
 import math
 from typing import Optional
 
@@ -464,3 +479,105 @@ def batch_prefill_with_paged_kv_cache(
         rope_scale,
         rope_theta,
     )
+
+
+class BatchDecodeWithPagedKVCacheWrapper:
+    r"""Wrapper class for batch_decode_with_paged_kv_cache kernel.
+
+    To accelerate computation, FlashInfer's batch decode operators creates some
+    auxiliary data structures, these data structures can be reused across multiple
+    batch decode calls (e.g. different Transformer layers). This wrapper class manages
+    the lifecycle of these data structures.
+    """
+
+    def __init__(self):
+        self._wrapper = _kernels.BatchDecodeWithPagedKVCachePyTorchWrapper()
+
+    def begin_forward(
+        self,
+        indptr: torch.Tensor,
+        last_page_len: torch.Tensor,
+        batch_size: int,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        page_size: int,
+        rotary_mode: str = "NONE",
+        data_type: str = "float16",
+    ):
+        r"""The begin_forward method should be called before any batch decode calls,
+        auxiliary data structures will be created during this call and cached for
+        multiple forward calls.
+        """
+
+        # NOTE(Zihao): the following tensor acts as placeholder to pass dtype info
+        empty_data = torch.empty(0, dtype=getattr(torch, data_type))
+        self._wrapper.begin_forward(
+            indptr,
+            last_page_len,
+            batch_size,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            getattr(RotaryMode, rotary_mode),
+            empty_data,
+        )
+
+    def end_forward(self):
+        r"""The end_forward method can clear the cached data structures."""
+        self._wrapper.end_forward()
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+        paged_kv_data: torch.Tensor,
+        rotary_mode: str = "NONE",
+        rope_scale: Optional[float] = None,
+        rope_theta: Optional[float] = None,
+    ):
+        if rope_scale is None:
+            rope_scale = 1.0
+        if rope_theta is None:
+            rope_theta = 1e4
+        return self._wrapper.forward(
+            q,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            paged_kv_data,
+            getattr(RotaryMode, rotary_mode),
+            rope_scale,
+            rope_theta,
+            False,
+        )[0]
+
+    def forward_return_lse(
+        self,
+        q: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+        paged_kv_data: torch.Tensor,
+        rotary_mode: str = "NONE",
+        rope_scale: Optional[float] = None,
+        rope_theta: Optional[float] = None,
+    ):
+        if rope_scale is None:
+            rope_scale = 1.0
+        if rope_theta is None:
+            rope_theta = 1e4
+        return self._wrapper.forward(
+            q,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            paged_kv_data,
+            getattr(RotaryMode, rotary_mode),
+            rope_scale,
+            rope_theta,
+            True,
+        )

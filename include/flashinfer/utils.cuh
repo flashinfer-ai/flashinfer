@@ -184,7 +184,7 @@
 
 namespace flashinfer {
 
-bool is_device_ptr(const void* ptr) {
+inline bool is_device_ptr(const void* ptr) {
   cudaPointerAttributes attrs;
   FLASHINFER_CUDA_CALL(cudaPointerGetAttributes(&attrs, ptr));
   return attrs.type == cudaMemoryTypeDevice;
