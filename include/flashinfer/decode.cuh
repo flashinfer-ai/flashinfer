@@ -807,9 +807,9 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& 
                                              2U * bdy * bdz * sizeof(float);
 
                   auto kernel =
-                      SingleDecodeWithKVCacheKernel<QKV_LAYOUT, true, ROTARY_MODE, num_stages_smem,
-                                                    tile_size_per_bdx, vec_size, bdx, bdy, bdz,
-                                                    DTypeIn, DTypeOut>;
+                      SingleDecodeWithKVCacheKernel<QKV_LAYOUT, /*cooperative=*/true, ROTARY_MODE,
+                                                    num_stages_smem, tile_size_per_bdx, vec_size,
+                                                    bdx, bdy, bdz, DTypeIn, DTypeOut>;
                   int num_blocks_per_sm = 0;
                   int num_sm = 0;
                   int dev_id = 0;
@@ -888,9 +888,9 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                 if (seq_len <= 256 || tmp == nullptr) {
                   // no need to use cooperative kernel
                   auto kernel =
-                      SingleDecodeWithKVCacheKernel<QKV_LAYOUT, false, ROTARY_MODE, num_stages_smem,
-                                                    tile_size_per_bdx, vec_size, bdx, bdy, bdz,
-                                                    DTypeIn, DTypeOut>;
+                      SingleDecodeWithKVCacheKernel<QKV_LAYOUT, /*cooperative=*/false, ROTARY_MODE,
+                                                    num_stages_smem, tile_size_per_bdx, vec_size,
+                                                    bdx, bdy, bdz, DTypeIn, DTypeOut>;
                   FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
                       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -911,9 +911,9 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                 } else {
                   // use cooperative kernel
                   auto kernel =
-                      SingleDecodeWithKVCacheKernel<QKV_LAYOUT, true, ROTARY_MODE, num_stages_smem,
-                                                    tile_size_per_bdx, vec_size, bdx, bdy, bdz,
-                                                    DTypeIn, DTypeOut>;
+                      SingleDecodeWithKVCacheKernel<QKV_LAYOUT, /*cooperative=*/true, ROTARY_MODE,
+                                                    num_stages_smem, tile_size_per_bdx, vec_size,
+                                                    bdx, bdy, bdz, DTypeIn, DTypeOut>;
                   FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
                       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -1184,9 +1184,10 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     // do not use cooperative kernel
     dim3 nblks(batch_size, num_kv_heads);
     dim3 nthrs(bdx, bdy, bdz);
-    auto kernel = BatchDecodeWithPagedKVCacheKernel<false, ROTARY_MODE, num_stages_smem,
-                                                    tile_size_per_bdx, vec_size, bdx, bdy, bdz,
-                                                    page_storage, DTypeIn, DTypeOut, IdType>;
+    auto kernel =
+        BatchDecodeWithPagedKVCacheKernel</*cooperative=*/false, ROTARY_MODE, num_stages_smem,
+                                          tile_size_per_bdx, vec_size, bdx, bdy, bdz, page_storage,
+                                          DTypeIn, DTypeOut, IdType>;
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     void* args[] = {(void*)&q,

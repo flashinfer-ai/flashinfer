@@ -1472,9 +1472,9 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
       constexpr uint32_t num_threads = num_warps * warp_size;
       constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
       auto cooperative_kernel =
-          SinglePrefillWithKVCacheKernel<true, GROUP_SIZE, CAUSAL, LAYOUT, ROTARY_MODE, num_frags_x,
-                                         num_frags_y, num_frags_z, num_warps, DTypeIn, DTypeQKAccum,
-                                         DTypeOut>;
+          SinglePrefillWithKVCacheKernel</*cooperative=*/true, GROUP_SIZE, CAUSAL, LAYOUT,
+                                         ROTARY_MODE, num_frags_x, num_frags_y, num_frags_z,
+                                         num_warps, DTypeIn, DTypeQKAccum, DTypeOut>;
       tensor_info_t<LAYOUT, GROUP_SIZE> qkv_info(qo_len, kv_len, num_kv_heads, HEAD_DIM);
       uint32_t smem_size =
           (num_frags_x * num_warps + num_frags_z * 2) * 16 * HEAD_DIM * sizeof(DTypeIn);
@@ -1493,9 +1493,10 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
       if (num_chunks <= 1 || tmp == nullptr) {
         // Enough parallelism, do not use cooperative
         // groups
-        auto kernel = SinglePrefillWithKVCacheKernel<false, GROUP_SIZE, CAUSAL, LAYOUT, ROTARY_MODE,
-                                                     num_frags_x, num_frags_y, num_frags_z,
-                                                     num_warps, DTypeIn, DTypeQKAccum, DTypeOut>;
+        auto kernel =
+            SinglePrefillWithKVCacheKernel</*cooperative=*/false, GROUP_SIZE, CAUSAL, LAYOUT,
+                                           ROTARY_MODE, num_frags_x, num_frags_y, num_frags_z,
+                                           num_warps, DTypeIn, DTypeQKAccum, DTypeOut>;
         void* args[] = {(void*)&q,
                         (void*)&k,
                         (void*)&v,
