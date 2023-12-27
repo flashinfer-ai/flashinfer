@@ -27,6 +27,7 @@ import flashinfer
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
 @pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("use_wrapper", [True, False])
 def test_batch_prefill_with_paged_kv_cache(
     batch_size,
     kv_len,
@@ -35,6 +36,7 @@ def test_batch_prefill_with_paged_kv_cache(
     num_kv_heads,
     num_qo_heads,
     head_dim,
+    use_wrapper,
 ):
     q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
     q_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
@@ -49,15 +51,21 @@ def test_batch_prefill_with_paged_kv_cache(
         (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
     ).to(0)
 
-    o = flashinfer.ops.batch_prefill_with_paged_kv_cache(
-        q,
-        q_indptr,
-        kv_data,
-        kv_indptr,
-        kv_indices,
-        kv_last_page_len,
-        page_size,
-    )
+    if use_wrapper:
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper()
+        wrapper.begin_forward(q_indptr, batch_size, num_qo_heads, num_kv_heads)
+        o = wrapper.forward(
+            q, q_indptr, kv_data, kv_indptr, kv_indices, kv_last_page_len
+        )
+    else:
+        o = flashinfer.batch_prefill_with_paged_kv_cache(
+            q,
+            q_indptr,
+            kv_data,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+        )
 
     for i in range(batch_size):
         qi = q[q_indptr[i] : q_indptr[i + 1]]
@@ -90,5 +98,5 @@ def test_batch_prefill_with_paged_kv_cache(
 
 
 if __name__ == "__main__":
-    test_batch_prefill_with_paged_kv_cache(12, 54, 37, 8, 8, 8, 128)
-    test_batch_prefill_with_paged_kv_cache(12, 54, 37, 1, 8, 8, 128)
+    test_batch_prefill_with_paged_kv_cache(12, 54, 37, 8, 8, 8, 128, False)
+    test_batch_prefill_with_paged_kv_cache(12, 54, 37, 1, 8, 8, 128, False)

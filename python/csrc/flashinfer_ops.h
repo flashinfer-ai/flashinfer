@@ -49,8 +49,8 @@ std::vector<torch::Tensor> batch_decode_with_padded_kv_cache_return_lse(
 
 torch::Tensor batch_prefill_with_paged_kv_cache(
     torch::Tensor q, torch::Tensor q_indptr, torch::Tensor kv_data, torch::Tensor kv_indptr,
-    torch::Tensor kv_indices, torch::Tensor kv_last_page_len, unsigned int page_size, bool causal,
-    unsigned int rotary_mode, bool allow_fp16_qk_reduction, float rope_scale, float rope_theta);
+    torch::Tensor kv_indices, torch::Tensor kv_last_page_len, bool causal, unsigned int rotary_mode,
+    bool allow_fp16_qk_reduction, float rope_scale, float rope_theta);
 
 class BatchDecodeWithPagedKVCachePyTorchWrapper {
  public:
@@ -69,4 +69,24 @@ class BatchDecodeWithPagedKVCachePyTorchWrapper {
  private:
   BatchDecodeWithPagedKVCachePyTorchWrapper() {}
   flashinfer::BatchDecodeHandler handler_;
+};
+
+class BatchPrefillWithPagedKVCachePyTorchWrapper {
+ public:
+  static BatchPrefillWithPagedKVCachePyTorchWrapper Create() {
+    return BatchPrefillWithPagedKVCachePyTorchWrapper();
+  }
+  void BeginForward(torch::Tensor qo_indptr, unsigned int batch_size, unsigned int num_qo_heads,
+                    unsigned int num_kv_heads);
+  void EndForward();
+  std::vector<torch::Tensor> Forward(torch::Tensor q, torch::Tensor qo_indptr,
+                                     torch::Tensor paged_kv_data, torch::Tensor paged_kv_indptr,
+                                     torch::Tensor paged_kv_indices,
+                                     torch::Tensor paged_kv_last_page_len, bool causal,
+                                     unsigned int rotary_mode, bool allow_fp16_qk_reduction,
+                                     float rope_scale, float rope_theta, bool return_lse);
+
+ private:
+  BatchPrefillWithPagedKVCachePyTorchWrapper() {}
+  flashinfer::BatchPrefillHandler handler_;
 };

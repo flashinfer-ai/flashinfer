@@ -25,6 +25,15 @@ from .utils import RotaryMode, TensorLayout
 _cache_buf = {}
 
 
+def _expand_5d(x: torch.Tensor):
+    if not x.ndim in [4, 5]:
+        raise ValueError("x must be 4D or 5D")
+    if x.ndim == 4:
+        # page_size == 1, expand to 5D on the 2nd last dimension
+        return x.unsqueeze(-2)
+    return x
+
+
 def _get_cache_buf(name: str, bytes: int, device: torch.device):
     key = (name, device)
     buf = _cache_buf.get(key)
@@ -454,7 +463,6 @@ def batch_prefill_with_paged_kv_cache(
     kv_indptr: torch.Tensor,
     kv_indices: torch.Tensor,
     kv_last_page_len: torch.Tensor,
-    page_size: int,
     casual: bool = True,
     rotary_mode: str = "NONE",
     allow_fp16_qk_reduction: bool = False,
@@ -465,6 +473,7 @@ def batch_prefill_with_paged_kv_cache(
         rope_scale = 1.0
     if rope_theta is None:
         rope_theta = 1e4
+    kv_data = _expand_5d(kv_data)
     return _kernels.batch_prefill_with_paged_kv_cache(
         q,
         q_indptr,
@@ -472,7 +481,6 @@ def batch_prefill_with_paged_kv_cache(
         kv_indptr,
         kv_indices,
         kv_last_page_len,
-        page_size,
         casual,
         getattr(RotaryMode, rotary_mode),
         allow_fp16_qk_reduction,
@@ -543,6 +551,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
+        paged_kv_data = _expand_5d(paged_kv_data)
         return self._wrapper.forward(
             q,
             paged_kv_data,
@@ -570,6 +579,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
+        paged_kv_data = _expand_5d(paged_kv_data)
         return self._wrapper.forward(
             q,
             paged_kv_data,
@@ -577,6 +587,93 @@ class BatchDecodeWithPagedKVCacheWrapper:
             paged_kv_indices,
             paged_kv_last_page_len,
             getattr(RotaryMode, rotary_mode),
+            rope_scale,
+            rope_theta,
+            True,
+        )
+
+
+class BatchPrefillWithPagedKVCacheWrapper:
+    r""" """
+
+    def __init__(self):
+        self._wrapper = _kernels.BatchPrefillWithPagedKVCachePyTorchWrapper()
+
+    def begin_forward(
+        self,
+        qo_indptr: torch.Tensor,
+        batch_size: int,
+        num_qo_heads: int,
+        num_kv_heads: int,
+    ):
+        self._wrapper.begin_forward(qo_indptr, batch_size, num_qo_heads, num_kv_heads)
+
+    def end_forward(self):
+        self._wrapper.end_forward()
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        qo_indptr: torch.Tensor,
+        paged_kv_data: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+        causal: bool = True,
+        rotary_mode: str = "NONE",
+        allow_fp16_qk_reduction: bool = False,
+        rope_scale: Optional[float] = None,
+        rope_theta: Optional[float] = None,
+    ):
+        if rope_scale is None:
+            rope_scale = 1.0
+        if rope_theta is None:
+            rope_theta = 1e4
+        paged_kv_data = _expand_5d(paged_kv_data)
+        return self._wrapper.forward(
+            q,
+            qo_indptr,
+            paged_kv_data,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            causal,
+            getattr(RotaryMode, rotary_mode),
+            allow_fp16_qk_reduction,
+            rope_scale,
+            rope_theta,
+            False,
+        )[0]
+
+    def forward_return_lse(
+        self,
+        q: torch.Tensor,
+        qo_indptr: torch.Tensor,
+        paged_kv_data: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+        causal: bool = True,
+        rotary_mode: str = "NONE",
+        allow_fp16_qk_reduction: bool = False,
+        rope_scale: Optional[float] = None,
+        rope_theta: Optional[float] = None,
+    ):
+        if rope_scale is None:
+            rope_scale = 1.0
+        if rope_theta is None:
+            rope_theta = 1e4
+        paged_kv_data = _expand_5d(paged_kv_data)
+        return self._wrapper.forward(
+            q,
+            qo_indptr,
+            paged_kv_data,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            causal,
+            getattr(RotaryMode, rotary_mode),
+            allow_fp16_qk_reduction,
             rope_scale,
             rope_theta,
             True,

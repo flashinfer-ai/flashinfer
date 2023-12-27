@@ -26,6 +26,7 @@ from .ops import (
     single_prefill_with_kv_cache,
     single_prefill_with_kv_cache_return_lse,
     BatchDecodeWithPagedKVCacheWrapper,
+    BatchPrefillWithPagedKVCacheWrapper,
 )
 
 __version__ = "0.0.1"

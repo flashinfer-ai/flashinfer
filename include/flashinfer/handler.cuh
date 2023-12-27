@@ -309,13 +309,39 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
   return cudaSuccess;
 }
 
+template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
+cudaError_t BatchPrefillWithPagedKVCacheWrapper(
+    BatchPrefillHandler* handler, DTypeIn* q, paged_kv_t<page_storage, DTypeIn, IdType> paged_kv,
+    IdType* qo_indptr, DTypeOut* o, float* lse, uint32_t num_qo_heads, bool causal = true,
+    RotaryMode rotary_mode = RotaryMode::kNone, bool allow_fp16_qk_reduction = false,
+    float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {
+  const uint32_t num_kv_heads = paged_kv.num_heads;
+  const uint32_t head_dim = paged_kv.head_dim;
+  SWITCH_GQA_GROUP_SIZE(
+      num_qo_heads / num_kv_heads, GROUP_SIZE,
+      {SWITCH_HEAD_DIM(
+          head_dim, HEAD_DIM,
+          {SWITCH_CAUSAL(causal, CAUSAL,
+                         {SWITCH_ROTARY_MODE(
+                             rotary_mode, ROTARY_MODE,
+                             {SWITCH_ALLOW_FP16_QK_REDUCTION(
+                                 allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
+                                   return BatchPrefillWithPagedKVCacheWrapperDispatched<
+                                       page_storage, GROUP_SIZE, HEAD_DIM, ROTARY_MODE,
+                                       ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
+                                       handler, q, paged_kv, qo_indptr, o, lse, num_qo_heads,
+                                       rope_scale, rope_theta, stream);
+                                 })})})})});
+  return cudaSuccess;
+}
+
 template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout LAYOUT, RotaryMode ROTARY_MODE,
           bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL, typename DTypeIn, typename DTypeOut,
           typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
     BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, DTypeIn* k, DTypeIn* v,
     IdType* kv_indptr, DTypeOut* o, float* lse, const uint32_t batch_size,
-    const uint32_t num_kv_heads, const float rope_scale, const float rope_theta,
+    const uint32_t num_kv_heads, const float rope_scale = 1.f, const float rope_theta = 1e4,
     cudaStream_t stream = nullptr) {
   float* tmp = nullptr;
   IdType* request_indices = nullptr;
@@ -341,6 +367,33 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
         q, request_indices, tile_indices, qo_indptr, k, v, kv_indptr, o, tmp, lse, batch_size,
         num_qo_tiles, num_kv_heads, rope_scale, rope_theta, stream);
   });
+  return cudaSuccess;
+}
+
+template <typename DTypeIn, typename DTypeOut, typename IdType>
+cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
+    BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, DTypeIn* k, DTypeIn* v,
+    IdType* kv_indptr, DTypeOut* o, float* lse, const uint32_t batch_size,
+    const uint32_t num_qo_heads, const uint32_t num_kv_heads, const uint32_t head_dim,
+    bool causal = true, RotaryMode rotary_mode = RotaryMode::kNone,
+    bool allow_fp16_qk_reduction = false, const float rope_scale = 1.f,
+    const float rope_theta = 1e4, cudaStream_t stream = nullptr) {
+  constexpr QKVLayout LAYOUT = QKVLayout::kNHD;
+  SWITCH_GQA_GROUP_SIZE(
+      num_qo_heads / num_kv_heads, GROUP_SIZE,
+      {SWITCH_HEAD_DIM(
+          head_dim, HEAD_DIM,
+          {SWITCH_CAUSAL(causal, CAUSAL,
+                         {SWITCH_ROTARY_MODE(
+                             rotary_mode, ROTARY_MODE,
+                             {SWITCH_ALLOW_FP16_QK_REDUCTION(
+                                 allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
+                                   return BatchPrefillWithRaggedKVCacheWrapperDispatched<
+                                       GROUP_SIZE, HEAD_DIM, LAYOUT, ROTARY_MODE,
+                                       ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
+                                       handler, q, qo_indptr, k, v, kv_indptr, o, lse, batch_size,
+                                       num_kv_heads, rope_scale, rope_theta, stream);
+                                 })})})})});
   return cudaSuccess;
 }
 

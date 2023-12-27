@@ -1669,9 +1669,8 @@ cudaError_t BatchPrefillWithRaggedKVCache(
     DTypeIn* q, IdType* qo_indptr, DTypeIn* k, DTypeIn* v, IdType* kv_indptr, DTypeOut* o,
     float* tmp, float* lse, const uint32_t batch_size, const uint32_t num_qo_heads,
     const uint32_t num_kv_heads, const uint32_t head_dim, bool causal = true,
-    QKVLayout layout = QKVLayout::kNHD, RotaryMode rotary_mode = RotaryMode::kNone,
-    bool allow_fp16_qk_reduction = false, const float rope_scale = 1.f,
-    const float rope_theta = 1e4, cudaStream_t stream = nullptr) {
+    RotaryMode rotary_mode = RotaryMode::kNone, bool allow_fp16_qk_reduction = false,
+    const float rope_scale = 1.f, const float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   const uint32_t group_size = num_qo_heads / num_kv_heads;
 
   uint32_t num_frags_x, num_qo_tiles;
@@ -1693,25 +1692,23 @@ cudaError_t BatchPrefillWithRaggedKVCache(
                                        sizeof(IdType) * tile_indices_h.size(),
                                        cudaMemcpyHostToDevice, stream));
 
+  constexpr QKVLayout LAYOUT = QKVLayout::kNHD;
   SWITCH_NUM_FRAGS_X(
       num_frags_x, NUM_FRAGS_X,
       {SWITCH_ALLOW_FP16_QK_REDUCTION(
           allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
           {SWITCH_GQA_GROUP_SIZE(
               num_qo_heads / num_kv_heads, GROUP_SIZE,
-              {SWITCH_CAUSAL(
-                  causal, CAUSAL,
-                  {SWITCH_HEAD_DIM_PREFILL(
-                      head_dim, HEAD_DIM,
-                      {SWITCH_LAYOUT(layout, LAYOUT, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
-                                       return BatchPrefillWithRaggedKVCacheDispatched<
-                                           NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM, LAYOUT, ROTARY_MODE,
-                                           ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut,
-                                           IdType>(q, request_indices_d, tile_indices_d, qo_indptr,
-                                                   k, v, kv_indptr, o, tmp, lse, batch_size,
-                                                   num_qo_tiles, num_kv_heads, rope_scale,
-                                                   rope_theta, stream);
-                                     })})})})})})});
+              {SWITCH_CAUSAL(causal, CAUSAL,
+                             {SWITCH_HEAD_DIM_PREFILL(
+                                 head_dim, HEAD_DIM, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
+                                   return BatchPrefillWithRaggedKVCacheDispatched<
+                                       NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM, LAYOUT, ROTARY_MODE,
+                                       ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
+                                       q, request_indices_d, tile_indices_d, qo_indptr, k, v,
+                                       kv_indptr, o, tmp, lse, batch_size, num_qo_tiles,
+                                       num_kv_heads, rope_scale, rope_theta, stream);
+                                 })})})})})});
 
   FLASHINFER_CUDA_CALL(cudaFreeAsync(request_indices_d, stream));
   FLASHINFER_CUDA_CALL(cudaFreeAsync(tile_indices_d, stream));
