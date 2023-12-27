@@ -134,28 +134,28 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
 void BatchDecodeWithPagedKVCachePyTorchWrapper::EndForward() { handler_.EndForward(); }
 
 std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
-    torch::Tensor q, torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
-    torch::Tensor paged_kv_last_page_len, torch::Tensor paged_kv_data, unsigned int rotary_mode,
+    torch::Tensor q, torch::Tensor paged_kv_data, torch::Tensor paged_kv_indptr,
+    torch::Tensor paged_kv_indices, torch::Tensor paged_kv_last_page_len, unsigned int rotary_mode,
     float rope_scale, float rope_theta, bool return_lse) {
   CHECK_INPUT(q);
+  CHECK_INPUT(paged_kv_data);
   CHECK_INPUT(paged_kv_indptr);
   CHECK_INPUT(paged_kv_indices);
   CHECK_INPUT(paged_kv_last_page_len);
-  CHECK_INPUT(paged_kv_data);
   CHECK_DIM(3, q);                       // (B, H_qo, D)
+  CHECK_DIM(1, paged_kv_last_page_len);  // (B,)
   CHECK_DIM(1, paged_kv_indptr);         // (B+1,)
   CHECK_DIM(1, paged_kv_indices);        // (nnz,)
-  CHECK_DIM(1, paged_kv_last_page_len);  // (B,)
   CHECK_DIM(5, paged_kv_data);           // (num_max_pages, 2, H_kv, page_size, head_dim)
   int64_t batch_size = q.size(0);
   int64_t num_qo_heads = q.size(1);
   int64_t head_dim = q.size(2);
   int64_t num_kv_heads = paged_kv_data.size(2);
   int64_t page_size = paged_kv_data.size(3);
-  CHECK_EQ(paged_kv_indptr.size(0), batch_size + 1);
-  CHECK_EQ(paged_kv_last_page_len.size(0), batch_size);
   CHECK_EQ(paged_kv_data.size(1), 2);
   CHECK_EQ(paged_kv_data.size(4), head_dim);
+  CHECK_EQ(paged_kv_indptr.size(0), batch_size + 1);
+  CHECK_EQ(paged_kv_last_page_len.size(0), batch_size);
   // TODO(Zihao): support dispatching to different data types
   CHECK_EQ(paged_kv_indptr.scalar_type(), torch::kInt32);
   CHECK_EQ(paged_kv_indices.scalar_type(), torch::kInt32);

@@ -531,10 +531,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
     def forward(
         self,
         q: torch.Tensor,
+        paged_kv_data: torch.Tensor,
         paged_kv_indptr: torch.Tensor,
         paged_kv_indices: torch.Tensor,
         paged_kv_last_page_len: torch.Tensor,
-        paged_kv_data: torch.Tensor,
         rotary_mode: str = "NONE",
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
@@ -545,10 +545,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             rope_theta = 1e4
         return self._wrapper.forward(
             q,
+            paged_kv_data,
             paged_kv_indptr,
             paged_kv_indices,
             paged_kv_last_page_len,
-            paged_kv_data,
             getattr(RotaryMode, rotary_mode),
             rope_scale,
             rope_theta,
@@ -558,10 +558,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
     def forward_return_lse(
         self,
         q: torch.Tensor,
+        paged_kv_data: torch.Tensor,
         paged_kv_indptr: torch.Tensor,
         paged_kv_indices: torch.Tensor,
         paged_kv_last_page_len: torch.Tensor,
-        paged_kv_data: torch.Tensor,
         rotary_mode: str = "NONE",
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
@@ -572,10 +572,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             rope_theta = 1e4
         return self._wrapper.forward(
             q,
+            paged_kv_data,
             paged_kv_indptr,
             paged_kv_indices,
             paged_kv_last_page_len,
-            paged_kv_data,
             getattr(RotaryMode, rotary_mode),
             rope_scale,
             rope_theta,

@@ -49,8 +49,18 @@ def test_batch_prefill_with_paged_kv_cache(
     ).to(0)
 
     wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper()
-    wrapper.begin_forward(kv_indptr, kv_last_page_len, batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, "NONE", "float16")
-    o = wrapper.forward(q, kv_indptr, kv_indices, kv_last_page_len, kv_data)
+    wrapper.begin_forward(
+        kv_indptr,
+        kv_last_page_len,
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        "NONE",
+        "float16",
+    )
+    o = wrapper.forward(q, kv_data, kv_indptr, kv_indices, kv_last_page_len)
 
     for i in range(batch_size):
         qi = q[i]

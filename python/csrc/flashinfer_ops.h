@@ -61,10 +61,9 @@ class BatchDecodeWithPagedKVCachePyTorchWrapper {
                     unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int head_dim,
                     unsigned int page_size, unsigned int rotary_mode, torch::Tensor empty_data);
   void EndForward();
-  std::vector<torch::Tensor> Forward(torch::Tensor q, torch::Tensor paged_kv_indptr,
-                                     torch::Tensor paged_kv_indices,
-                                     torch::Tensor paged_kv_last_page_len,
-                                     torch::Tensor paged_kv_data, unsigned int rotary_mode,
+  std::vector<torch::Tensor> Forward(torch::Tensor q, torch::Tensor paged_kv_data,
+                                     torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
+                                     torch::Tensor paged_kv_last_page_len, unsigned int rotary_mode,
                                      float rope_scale, float rope_theta, bool return_lse);
 
  private:
