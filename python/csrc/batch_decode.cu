@@ -119,12 +119,11 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
   CHECK_EQ(indptr.scalar_type(), torch::kInt32);
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(empty_data.scalar_type(), c_type, [&] {
-    handler_.BeginForward<PageStorage::kIndices, c_type, c_type, int32_t>(
+    cudaError_t status = handler_.BeginForward<PageStorage::kIndices, c_type, c_type, int32_t>(
         static_cast<int32_t*>(indptr.data_ptr()), static_cast<int32_t*>(last_page_len.data_ptr()),
         batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, RotaryMode(rotary_mode));
-    // TORCH_CHECK(cudaGetLastError() == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error
-    // ",
-    //             cudaGetErrorString(cudaGetLastError()));
+    TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
+                cudaGetErrorString(status));
     return true;
   });
 

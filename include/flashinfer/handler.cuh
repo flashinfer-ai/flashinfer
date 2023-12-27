@@ -86,35 +86,38 @@ class BatchDecodeHandler {
   }
 
   template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
-  void BeginForward(IdType* indptr, IdType* last_page_len, uint32_t batch_size,
-                    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
-                    uint32_t page_size, RotaryMode rotary_mode) {
+  cudaError_t BeginForward(IdType* indptr, IdType* last_page_len, uint32_t batch_size,
+                           uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
+                           uint32_t page_size, RotaryMode rotary_mode) {
     uint32_t tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size;
-    BatchDecodeWithPagedKVCacheWorkEstimation<page_storage, DTypeIn, DTypeOut, IdType>(
+    auto work_estimation_func =
+        BatchDecodeWithPagedKVCacheWorkEstimation<page_storage, DTypeIn, DTypeOut, IdType>;
+    FLASHINFER_CUDA_CALL(work_estimation_func(
         tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size, batch_size, indptr,
-        num_qo_heads, num_kv_heads, head_dim, page_size, rotary_mode, stream_);
+        num_qo_heads, num_kv_heads, head_dim, page_size, rotary_mode, stream_));
     new_batch_size_ = new_batch_size;
     if (tmp_size > 0) {
-      cudaMallocAsync(&float_buffer_, sizeof(float) * tmp_size, stream_);
-      cudaMallocAsync(&int_buffer_, sizeof(IdType) * (6 * new_batch_size + 2), stream_);
-      SplitPagedCacheKVComputeAuxiliaryInfo(
+      FLASHINFER_CUDA_CALL(cudaMallocAsync(&float_buffer_, sizeof(float) * tmp_size, stream_));
+      FLASHINFER_CUDA_CALL(
+          cudaMallocAsync(&int_buffer_, sizeof(IdType) * (6 * new_batch_size + 2), stream_));
+      FLASHINFER_CUDA_CALL(SplitPagedCacheKVComputeAuxiliaryInfo(
           max_num_pages_per_batch, batch_size, page_size, indptr, last_page_len,
           GetNewIndPtr<IdType>(), GetNewLastPageLen<IdType>(), GetCooperativeIndPtr<IdType>(),
           GetBatchIndexMap<IdType>(), GetChunkStartPos<IdType>(),
-          GetSeqLengthsBeforeSplit<IdType>(), stream_);
+          GetSeqLengthsBeforeSplit<IdType>(), stream_));
     }
     forward_started_ = true;
   }
 
-  void EndForward() {
+  cudaError_t EndForward() {
     forward_started_ = false;
     new_batch_size_ = 0;
     if (float_buffer_ != nullptr) {
-      cudaFreeAsync(float_buffer_, stream_);
+      FLASHINFER_CUDA_CALL(cudaFreeAsync(float_buffer_, stream_));
       float_buffer_ = nullptr;
     }
     if (int_buffer_ != nullptr) {
-      cudaFreeAsync(int_buffer_, stream_);
+      FLASHINFER_CUDA_CALL(cudaFreeAsync(int_buffer_, stream_));
       int_buffer_ = nullptr;
     }
   }
@@ -162,28 +165,30 @@ class BatchPrefillHandler {
   bool IsForwardStarted() const { return request_indices_ != nullptr; }
 
   template <typename IdType>
-  void BeginForward(IdType* qo_indptr, uint32_t batch_size, uint32_t gqa_group_size) {
+  cudaError_t BeginForward(IdType* qo_indptr, uint32_t batch_size, uint32_t gqa_group_size) {
     std::vector<IdType> request_indices_h, tile_indices_h;
     std::tie(num_frags_x_, num_qo_tiles_, request_indices_h, tile_indices_h) =
         split_qo_indptr(qo_indptr, batch_size, gqa_group_size, stream_);
-    cudaMalloc(&request_indices_, sizeof(IdType) * request_indices_h.size());
-    cudaMalloc(&tile_indices_, sizeof(IdType) * tile_indices_h.size());
-    cudaMemcpyAsync(request_indices_, request_indices_h.data(),
-                    sizeof(IdType) * request_indices_h.size(), cudaMemcpyHostToDevice, stream_);
-    cudaMemcpyAsync(tile_indices_, tile_indices_h.data(), sizeof(IdType) * tile_indices_h.size(),
-                    cudaMemcpyHostToDevice, stream_);
+    FLASHINFER_CUDA_CALL(cudaMalloc(&request_indices_, sizeof(IdType) * request_indices_h.size()));
+    FLASHINFER_CUDA_CALL(cudaMalloc(&tile_indices_, sizeof(IdType) * tile_indices_h.size()));
+    FLASHINFER_CUDA_CALL(cudaMemcpyAsync(request_indices_, request_indices_h.data(),
+                                         sizeof(IdType) * request_indices_h.size(),
+                                         cudaMemcpyHostToDevice, stream_));
+    FLASHINFER_CUDA_CALL(cudaMemcpyAsync(tile_indices_, tile_indices_h.data(),
+                                         sizeof(IdType) * tile_indices_h.size(),
+                                         cudaMemcpyHostToDevice, stream_));
   }
 
-  void EndForward() {
+  cudaError_t EndForward() {
     forward_started_ = false;
     num_frags_x_ = 0U;
     num_qo_tiles_ = 0U;
     if (request_indices_ != nullptr) {
-      cudaFreeAsync(request_indices_, stream_);
+      FLASHINFER_CUDA_CALL(cudaFreeAsync(request_indices_, stream_));
       request_indices_ = nullptr;
     }
     if (tile_indices_ != nullptr) {
-      cudaFreeAsync(tile_indices_, stream_);
+      FLASHINFER_CUDA_CALL(cudaFreeAsync(tile_indices_, stream_));
       tile_indices_ = nullptr;
     }
   }
