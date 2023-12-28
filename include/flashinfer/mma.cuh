@@ -291,7 +291,7 @@ __device__ __forceinline__ void rowsum_f16f16f32(float* d, DType* s) {
 #if defined(FLASHINFER_MMA_F16F16F32_M16N8K16_ENABLED)
   static_assert(sizeof(DType) == 2, "DType must be 16bit floating data type");
   uint32_t* s_u32 = (uint32_t*)(s);
-  float placeholder_0, placeholder_1;
+  volatile float placeholder_0, placeholder_1;
   if constexpr (std::is_same<DType, half>::value) {
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
