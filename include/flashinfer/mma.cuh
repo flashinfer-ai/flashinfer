@@ -284,6 +284,41 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
 }
 
 /*!
+ * \brief Use mma instructions to compute rowsum.
+ */
+template <typename DType>
+__device__ __forceinline__ void rowsum_f16f16f32(float* d, DType* s) {
+#if defined(FLASHINFER_MMA_F16F16F32_M16N8K16_ENABLED)
+  static_assert(sizeof(DType) == 2, "DType must be 16bit floating data type");
+  uint32_t* s_u32 = (uint32_t*)(s);
+  float placeholder_0, placeholder_1;
+  if constexpr (std::is_same<DType, half>::value) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,  %1,  %2,  %3},"
+        "{%4,  %5,  %6,  %7},"
+        "{%8,  %9},"
+        "{%10, %11, %12, %13};\n"
+        : "=f"(d[0]), "=f"(placeholder_0), "=f"(d[1]), "=f"(placeholder_1)
+        : "r"(s_u32[0]), "r"(s_u32[1]), "r"(s_u32[2]), "r"(s_u32[3]), "r"(1006648320),
+          "r"(1006648320), "f"(d[0]), "f"(0.f), "f"(d[1]), "f"(0.f));
+  } else {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,  %1,  %2,  %3},"
+        "{%4,  %5,  %6,  %7},"
+        "{%8,  %9},"
+        "{%10, %11, %12, %13};\n"
+        : "=f"(d[0]), "=f"(placeholder_0), "=f"(d[1]), "=f"(placeholder_1)
+        : "r"(s_u32[0]), "r"(s_u32[1]), "r"(s_u32[2]), "r"(s_u32[3]), "r"(1006648320),
+          "r"(1006648320), "f"(d[0]), "f"(0.f), "f"(d[1]), "f"(0.f));
+  }
+#else
+#error "Unsupported CUDA architecture for mma instruction"
+#endif
+}
+
+/*!
  * \brief Wrapper of two mma m16n8k16 instructions for row major and column major f16 matrix
  *   multiplication, accumulated in f16.
  * \tparam mma_mode whether we are initializing the accumulator or updating it
