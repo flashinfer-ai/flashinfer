@@ -291,27 +291,32 @@ __device__ __forceinline__ void rowsum_f16f16f32(float* d, DType* s) {
 #if defined(FLASHINFER_MMA_F16F16F32_M16N8K16_ENABLED)
   static_assert(sizeof(DType) == 2, "DType must be 16bit floating data type");
   uint32_t* s_u32 = (uint32_t*)(s);
-  volatile float placeholder_0, placeholder_1;
   if constexpr (std::is_same<DType, half>::value) {
     asm volatile(
+        "{\n"
+        ".reg .f32 ph;\n"
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-        "{%0,  %1,  %2,  %3},"
-        "{%4,  %5,  %6,  %7},"
-        "{%8,  %9},"
-        "{%10, %11, %12, %13};\n"
-        : "=f"(d[0]), "=f"(placeholder_0), "=f"(d[1]), "=f"(placeholder_1)
+        "{%0,  ph,  %1,  ph},"
+        "{%2,  %3,  %4,  %5},"
+        "{%6,  %7},"
+        "{%8,  0.,  %9,  0.};\n"
+        "}\n"
+        : "=f"(d[0]), "=f"(d[1])
         : "r"(s_u32[0]), "r"(s_u32[1]), "r"(s_u32[2]), "r"(s_u32[3]), "r"(1006648320),
-          "r"(1006648320), "f"(d[0]), "f"(0.f), "f"(d[1]), "f"(0.f));
+          "r"(1006648320), "f"(d[0]), "f"(d[1]));
   } else {
     asm volatile(
+        "{\n"
+        ".reg .f32 ph;\n"
         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{%0,  %1,  %2,  %3},"
-        "{%4,  %5,  %6,  %7},"
-        "{%8,  %9},"
-        "{%10, %11, %12, %13};\n"
-        : "=f"(d[0]), "=f"(placeholder_0), "=f"(d[1]), "=f"(placeholder_1)
+        "{%0,  ph,  %1,  ph},"
+        "{%2,  %3,  %4,  %5},"
+        "{%6,  %7},"
+        "{%8,  0.,  %9,  0.};\n"
+        "}\n"
+        : "=f"(d[0]), "=f"(d[1])
         : "r"(s_u32[0]), "r"(s_u32[1]), "r"(s_u32[2]), "r"(s_u32[3]), "r"(1006648320),
-          "r"(1006648320), "f"(d[0]), "f"(0.f), "f"(d[1]), "f"(0.f));
+          "r"(1006648320), "f"(d[0]), "f"(d[1]));
   }
 #else
 #error "Unsupported CUDA architecture for mma instruction"
