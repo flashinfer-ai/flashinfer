@@ -27,7 +27,7 @@ import flashinfer
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
 @pytest.mark.parametrize("head_dim", [128])
-def test_batch_prefill_with_paged_kv_cache(
+def test_batch_decode_with_paged_kv_cache(
     batch_size,
     kv_len,
     qo_len,
@@ -93,5 +93,5 @@ def test_batch_prefill_with_paged_kv_cache(
 
 
 if __name__ == "__main__":
-    test_batch_prefill_with_paged_kv_cache(12, 54, 37, 8, 8, 8, 128)
-    test_batch_prefill_with_paged_kv_cache(12, 54, 37, 1, 8, 8, 128)
+    test_batch_decode_with_paged_kv_cache(12, 54, 37, 8, 8, 8, 128)
+    test_batch_decode_with_paged_kv_cache(12, 54, 37, 1, 8, 8, 128)
