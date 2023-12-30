@@ -337,8 +337,11 @@ void _FlashInferAttentionPrefillWithPagedKVCacheBeginForward(int64_t handler_idx
   CHECK(handler_idx < max_num_handlers) << "The handler id must be less than " << max_num_handlers;
   const uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
   SWITCH_TVM_CUDA_IDTYPE(qo_indptr->dtype, dtype_idx, {
-    batch_prefill_paged_kv_handlers[handler_idx].BeginForward(
+    cudaError_t status = batch_prefill_paged_kv_handlers[handler_idx].BeginForward(
         static_cast<dtype_idx*>(qo_indptr->data), batch_size, gqa_group_size);
+    if (status != cudaSuccess) {
+      LOG(FATAL) << "FlashInfer prefill BeginForward error " << cudaGetErrorString(status);
+    }
   });
 }
 
@@ -443,10 +446,15 @@ void _FlashInferAttentionDecodeWithPagedKVCacheBeginForward(
   using dtype_in = half;
   const uint32_t batch_size = page_table_indptr->shape[0] - 1;
   SWITCH_TVM_CUDA_IDTYPE(page_table_indptr->dtype, dtype_idx, {
-    batch_decode_handlers[handler_idx].BeginForward<page_storage, dtype_in, dtype_in, dtype_idx>(
-        static_cast<dtype_idx*>(page_table_indptr->data),
-        static_cast<dtype_idx*>(last_page_len->data), batch_size, num_qo_heads, num_kv_heads,
-        head_dim, page_size, RotaryMode(rotary_mode));
+    cudaError_t status =
+        batch_decode_handlers[handler_idx]
+            .BeginForward<page_storage, dtype_in, dtype_in, dtype_idx>(
+                static_cast<dtype_idx*>(page_table_indptr->data),
+                static_cast<dtype_idx*>(last_page_len->data), batch_size, num_qo_heads,
+                num_kv_heads, head_dim, page_size, RotaryMode(rotary_mode));
+    if (status != cudaSuccess) {
+      LOG(FATAL) << "FlashInfer decode BeginForward error " << cudaGetErrorString(status);
+    }
   });
 }
 
@@ -559,8 +567,12 @@ void _FlashInferAttentionPrefillWithRaggedKVCacheBeginForward(DLTensor* qo_indpt
                                                               int64_t num_kv_heads) {
   const uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
   SWITCH_TVM_CUDA_IDTYPE(qo_indptr->dtype, dtype_idx, {
-    batch_prefill_ragged_kv_handler.BeginForward(static_cast<dtype_idx*>(qo_indptr->data),
-                                                 batch_size, gqa_group_size);
+    cudaError_t status = batch_prefill_ragged_kv_handler.BeginForward(
+        static_cast<dtype_idx*>(qo_indptr->data), batch_size, gqa_group_size);
+    if (status != cudaSuccess) {
+      LOG(FATAL) << "FlashInfer PrefillWithRaggedKVCache BeginForward error "
+                 << cudaGetErrorString(status);
+    }
   });
 }
 
