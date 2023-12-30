@@ -1077,7 +1077,7 @@ std::pair<uint32_t, uint32_t> SplitPagedKVCacheBinarySearchMinNumPagePerBatch(
   }
   new_batch_size = 0;
   for (const IdType& elem : num_pages) {
-    new_batch_size += ceil_div(elem, low);
+    new_batch_size += ceil_div(std::max(elem, 1), low);
   }
   return {low, new_batch_size};
 }
