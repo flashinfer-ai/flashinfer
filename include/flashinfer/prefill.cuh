@@ -805,7 +805,6 @@ __global__ void SinglePrefillWithKVCacheKernel(
   const uint32_t qo_idx_base = ((bx * num_warps + ty) * num_frags_x * 16) / group_size;
   const uint32_t kv_n_stride = qkv_info.get_kv_n_stride(), qo_n_stride = qkv_info.get_qo_n_stride(),
                  qo_h_stride = qkv_info.get_qo_h_stride();
-  uint32_t kv_idx_base = chunk_start;
   smem_t qo_smem(smem);
   DTypeIn* q_ptr_base = q + qkv_info.get_qo_elem_offset(qo_idx_base, kv_head_idx * group_size,
                                                         (tx % 8) * cell_capacity<DTypeIn>());
@@ -848,9 +847,9 @@ __global__ void SinglePrefillWithKVCacheKernel(
               : (chunk_end - chunk_start)) /
       (16 * num_frags_z);
 
-  DTypeIn* k_ptr = k + qkv_info.get_kv_elem_offset(kv_idx_base + ty * 4 + tx / 8, kv_head_idx,
+  DTypeIn* k_ptr = k + qkv_info.get_kv_elem_offset(chunk_start + ty * 4 + tx / 8, kv_head_idx,
                                                    (tx % 8) * cell_capacity<DTypeIn>());
-  DTypeIn* v_ptr = v + qkv_info.get_kv_elem_offset(kv_idx_base + ty * 4 + tx / 8, kv_head_idx,
+  DTypeIn* v_ptr = v + qkv_info.get_kv_elem_offset(chunk_start + ty * 4 + tx / 8, kv_head_idx,
                                                    (tx % 8) * cell_capacity<DTypeIn>());
   uint32_t k_smem_offset_r = smem_t::get_permuted_offset<num_cells_per_in_channel>(
                8 * (tx / 16) + tx % 8, (tx % 16) / 8),
@@ -859,10 +858,10 @@ __global__ void SinglePrefillWithKVCacheKernel(
            kv_smem_offset_w =
                smem_t::get_permuted_offset<num_cells_per_in_channel>(ty * 4 + tx / 8, tx % 8);
   produce_kv<SharedMemFillMode::kNoFill, num_warps, num_frags_y, num_frags_z>(
-      k_smem, &kv_smem_offset_w, &k_ptr, kv_n_stride, kv_idx_base, chunk_end);
+      k_smem, &kv_smem_offset_w, &k_ptr, kv_n_stride, chunk_start, chunk_end);
   cp_async::commit_group();
   produce_kv<SharedMemFillMode::kFillZero, num_warps, num_frags_y, num_frags_z>(
-      v_smem, &kv_smem_offset_w, &v_ptr, kv_n_stride, kv_idx_base, chunk_end);
+      v_smem, &kv_smem_offset_w, &v_ptr, kv_n_stride, chunk_start, chunk_end);
   cp_async::commit_group();
 
 #pragma unroll 1
@@ -871,8 +870,8 @@ __global__ void SinglePrefillWithKVCacheKernel(
     block.sync();
 
     if constexpr (rotary_mode == RotaryMode::kLlama) {
-      k_smem_inplace_apply_rotary<num_frags_y, num_frags_z, DTypeIn>(kv_idx_base, &k_smem,
-                                                                     &k_smem_offset_r, rope_freq);
+      k_smem_inplace_apply_rotary<num_frags_y, num_frags_z, DTypeIn>(
+          chunk_start + iter * 16 * num_frags_z, &k_smem, &k_smem_offset_r, rope_freq);
       block.sync();
     }
 
@@ -883,16 +882,16 @@ __global__ void SinglePrefillWithKVCacheKernel(
     // apply mask
     if (iter >= mask_iteration) {
       mask_s<cooperative, causal, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
-          qo_idx_base, kv_idx_base, qo_len, kv_len, chunk_end, s_frag);
+          qo_idx_base, chunk_start + iter * 16 * num_frags_z, qo_len, kv_len, chunk_end, s_frag);
     }
 
     // compute m,d states in online softmax
     update_mdo_states<num_frags_x, num_frags_y, num_frags_z>(s_frag, o_frag, m, d);
 
     block.sync();
-    kv_idx_base += 16 * num_frags_z;
     produce_kv<SharedMemFillMode::kNoFill, num_warps, num_frags_y, num_frags_z>(
-        k_smem, &kv_smem_offset_w, &k_ptr, kv_n_stride, kv_idx_base, chunk_end);
+        k_smem, &kv_smem_offset_w, &k_ptr, kv_n_stride, chunk_start + (iter + 1) * 16 * num_frags_z,
+        chunk_end);
     cp_async::commit_group();
     cp_async::wait_group<1>();
     block.sync();
@@ -903,7 +902,8 @@ __global__ void SinglePrefillWithKVCacheKernel(
 
     block.sync();
     produce_kv<SharedMemFillMode::kFillZero, num_warps, num_frags_y, num_frags_z>(
-        v_smem, &kv_smem_offset_w, &v_ptr, kv_n_stride, kv_idx_base, chunk_end);
+        v_smem, &kv_smem_offset_w, &v_ptr, kv_n_stride, chunk_start + (iter + 1) * 16 * num_frags_z,
+        chunk_end);
     cp_async::commit_group();
   }
   cp_async::wait_group<0>();
@@ -954,7 +954,7 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
 
   auto block = cg::this_thread_block();
   const uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y, kv_head_idx = blockIdx.z;
-  const uint32_t num_kv_heads = gridDim.z, num_qo_heads = num_kv_heads * group_size;
+  const uint32_t num_kv_heads = gridDim.z;
   const uint32_t request_idx = request_indices[bx], tile_idx = tile_indices[bx];
   constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
   const uint32_t qo_len = qo_indptr[request_idx + 1] - qo_indptr[request_idx],
@@ -983,7 +983,6 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
   init_states<num_frags_x, num_frags_y>(o_frag, m, d);
 
   const uint32_t qo_idx_base = ((tile_idx * num_warps + ty) * num_frags_x * 16) / group_size;
-  uint32_t kv_idx_base = 0;
   const uint32_t kv_n_stride = qkv_info.get_kv_n_stride(), qo_n_stride = qkv_info.get_qo_n_stride(),
                  qo_h_stride = qkv_info.get_qo_h_stride();
   smem_t qo_smem(smem);
@@ -1036,17 +1035,17 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
                smem_t::get_permuted_offset<num_cells_per_in_channel>(ty * 4 + tx / 8, tx % 8);
 
   DTypeIn* k_ptr =
-      k + qkv_info.get_kv_elem_offset(kv_indptr[request_idx] + kv_idx_base + ty * 4 + tx / 8,
-                                      kv_head_idx, (tx % 8) * cell_capacity<DTypeIn>());
+      k + qkv_info.get_kv_elem_offset(kv_indptr[request_idx] + ty * 4 + tx / 8, kv_head_idx,
+                                      (tx % 8) * cell_capacity<DTypeIn>());
   DTypeIn* v_ptr =
-      v + qkv_info.get_kv_elem_offset(kv_indptr[request_idx] + kv_idx_base + ty * 4 + tx / 8,
-                                      kv_head_idx, (tx % 8) * cell_capacity<DTypeIn>());
+      v + qkv_info.get_kv_elem_offset(kv_indptr[request_idx] + ty * 4 + tx / 8, kv_head_idx,
+                                      (tx % 8) * cell_capacity<DTypeIn>());
 
   produce_kv<SharedMemFillMode::kNoFill, num_warps, num_frags_y, num_frags_z>(
-      k_smem, &kv_smem_offset_w, &k_ptr, kv_n_stride, kv_idx_base, kv_len);
+      k_smem, &kv_smem_offset_w, &k_ptr, kv_n_stride, 0, kv_len);
   cp_async::commit_group();
   produce_kv<SharedMemFillMode::kFillZero, num_warps, num_frags_y, num_frags_z>(
-      v_smem, &kv_smem_offset_w, &v_ptr, kv_n_stride, kv_idx_base, kv_len);
+      v_smem, &kv_smem_offset_w, &v_ptr, kv_n_stride, 0, kv_len);
   cp_async::commit_group();
 
 #pragma unroll 1
@@ -1055,8 +1054,8 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
     block.sync();
 
     if constexpr (rotary_mode == RotaryMode::kLlama) {
-      k_smem_inplace_apply_rotary<num_frags_y, num_frags_z, DTypeIn>(kv_idx_base, &k_smem,
-                                                                     &k_smem_offset_r, rope_freq);
+      k_smem_inplace_apply_rotary<num_frags_y, num_frags_z, DTypeIn>(
+          iter * 16 * num_frags_z, &k_smem, &k_smem_offset_r, rope_freq);
       block.sync();
     }
 
@@ -1067,16 +1066,15 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
     // apply mask
     if (iter >= mask_iteration) {
       mask_s<cooperative, causal, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
-          qo_idx_base, kv_idx_base, qo_len, kv_len, kv_len, s_frag);
+          qo_idx_base, iter * 16 * num_frags_z, qo_len, kv_len, kv_len, s_frag);
     }
 
     // compute m,d states in online softmax
     update_mdo_states<num_frags_x, num_frags_y, num_frags_z>(s_frag, o_frag, m, d);
 
     block.sync();
-    kv_idx_base += 16 * num_frags_z;
     produce_kv<SharedMemFillMode::kNoFill, num_warps, num_frags_y, num_frags_z>(
-        k_smem, &kv_smem_offset_w, &k_ptr, kv_n_stride, kv_idx_base, kv_len);
+        k_smem, &kv_smem_offset_w, &k_ptr, kv_n_stride, (iter + 1) * 16 * num_frags_z, kv_len);
     cp_async::commit_group();
     cp_async::wait_group<1>();
     block.sync();
@@ -1087,7 +1085,7 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
 
     block.sync();
     produce_kv<SharedMemFillMode::kFillZero, num_warps, num_frags_y, num_frags_z>(
-        v_smem, &kv_smem_offset_w, &v_ptr, kv_n_stride, kv_idx_base, kv_len);
+        v_smem, &kv_smem_offset_w, &v_ptr, kv_n_stride, (iter + 1) * 16 * num_frags_z, kv_len);
     cp_async::commit_group();
   }
   cp_async::wait_group<0>();
@@ -1166,7 +1164,6 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
   init_states<num_frags_x, num_frags_y>(o_frag, m, d);
 
   const uint32_t qo_idx_base = ((tile_idx * num_warps + ty) * num_frags_x * 16) / group_size;
-  uint32_t kv_idx_base = 0;
   const uint32_t kv_n_stride = get_n_stride_impl<QKVLayout::kNHD, head_dim>(num_kv_heads),
                  qo_n_stride = get_n_stride_impl<QKVLayout::kNHD, head_dim>(num_qo_heads),
                  qo_h_stride = get_h_stride_impl<QKVLayout::kNHD, head_dim>(qo_len);
@@ -1208,10 +1205,10 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
 
   uint32_t page_iter_base = paged_kv.indptr[request_idx];
   page_produce_kv<false, page_size, num_warps, num_frags_y, num_frags_z>(
-      k_smem, &kv_smem_offset_w, paged_kv, kv_idx_base, page_iter_base, kv_len, last_indptr);
+      k_smem, &kv_smem_offset_w, paged_kv, 0, page_iter_base, kv_len, last_indptr);
   cp_async::commit_group();
   page_produce_kv<true, page_size, num_warps, num_frags_y, num_frags_z>(
-      v_smem, &kv_smem_offset_w, paged_kv, kv_idx_base, page_iter_base, kv_len, last_indptr);
+      v_smem, &kv_smem_offset_w, paged_kv, 0, page_iter_base, kv_len, last_indptr);
   cp_async::commit_group();
 
   const uint32_t num_iterations = ceil_div(
@@ -1232,8 +1229,8 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
     block.sync();
 
     if constexpr (rotary_mode == RotaryMode::kLlama) {
-      k_smem_inplace_apply_rotary<num_frags_y, num_frags_z, DTypeIn>(kv_idx_base, &k_smem,
-                                                                     &k_smem_offset_r, rope_freq);
+      k_smem_inplace_apply_rotary<num_frags_y, num_frags_z, DTypeIn>(
+          iter * 16 * num_frags_z, &k_smem, &k_smem_offset_r, rope_freq);
       block.sync();
     }
 
@@ -1244,7 +1241,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
     // apply mask
     if (iter >= mask_iteration) {
       mask_s<cooperative, causal, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
-          qo_idx_base, kv_idx_base, qo_len, kv_len, kv_len, s_frag);
+          qo_idx_base, iter * 16 * num_frags_z, qo_len, kv_len, kv_len, s_frag);
     }
 
     // compute m,d states in online softmax
@@ -1252,9 +1249,9 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
 
     block.sync();
     page_iter_base += 16 * num_frags_z / page_size;
-    kv_idx_base += 16 * num_frags_z;
     page_produce_kv<false, page_size, num_warps, num_frags_y, num_frags_z>(
-        k_smem, &kv_smem_offset_w, paged_kv, kv_idx_base, page_iter_base, kv_len, last_indptr);
+        k_smem, &kv_smem_offset_w, paged_kv, (iter + 1) * 16 * num_frags_z, page_iter_base, kv_len,
+        last_indptr);
     cp_async::commit_group();
     cp_async::wait_group<1>();
     block.sync();
@@ -1265,7 +1262,8 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
 
     block.sync();
     page_produce_kv<true, page_size, num_warps, num_frags_y, num_frags_z>(
-        v_smem, &kv_smem_offset_w, paged_kv, kv_idx_base, page_iter_base, kv_len, last_indptr);
+        v_smem, &kv_smem_offset_w, paged_kv, (iter + 1) * 16 * num_frags_z, page_iter_base, kv_len,
+        last_indptr);
     cp_async::commit_group();
   }
   cp_async::wait_group<0>();
