@@ -992,22 +992,31 @@ cudaError_t SplitPagedCacheKVComputeAuxiliaryInfo(
   for (uint32_t batch_idx = 0; batch_idx < old_batch_size; batch_idx++) {
     uint32_t cooperative_indptr_delta =
         ceil_div(old_indptr_h[batch_idx + 1] - old_indptr_h[batch_idx], max_num_pages_per_batch);
-    uint32_t seq_len_before_split =
-        (old_indptr_h[batch_idx + 1] - old_indptr_h[batch_idx] - 1) * page_size +
-        old_last_page_len_h[batch_idx];
-    for (uint32_t j = 0; j < cooperative_indptr_delta; ++j) {
-      bool is_last = (j + 1) == cooperative_indptr_delta;
-      new_page_indptr_h.push_back(min(old_indptr_h[batch_idx] + (j + 1) * max_num_pages_per_batch,
-                                      old_indptr_h[batch_idx + 1]));
-      new_last_page_len_h.push_back(is_last ? old_last_page_len_h[batch_idx] : page_size);
+    if (cooperative_indptr_delta == 0) {
+      new_page_indptr_h.push_back(old_indptr_h[batch_idx]);
+      new_last_page_len_h.push_back(0);
       batch_idx_map_h.push_back(batch_idx);
-      if (j == 0) {
-        cooperative_indptr_h.push_back(cooperative_indptr_h.back() + cooperative_indptr_delta);
-      } else {
-        cooperative_indptr_h.push_back(cooperative_indptr_h.back());
+      cooperative_indptr_h.push_back(cooperative_indptr_h.back());
+      chunk_start_h.push_back(0);
+      seq_lens_before_split_h.push_back(0);
+    } else {
+      uint32_t seq_len_before_split =
+          (old_indptr_h[batch_idx + 1] - old_indptr_h[batch_idx] - 1) * page_size +
+          old_last_page_len_h[batch_idx];
+      for (uint32_t j = 0; j < cooperative_indptr_delta; ++j) {
+        bool is_last = (j + 1) == cooperative_indptr_delta;
+        new_page_indptr_h.push_back(min(old_indptr_h[batch_idx] + (j + 1) * max_num_pages_per_batch,
+                                        old_indptr_h[batch_idx + 1]));
+        new_last_page_len_h.push_back(is_last ? old_last_page_len_h[batch_idx] : page_size);
+        batch_idx_map_h.push_back(batch_idx);
+        if (j == 0) {
+          cooperative_indptr_h.push_back(cooperative_indptr_h.back() + cooperative_indptr_delta);
+        } else {
+          cooperative_indptr_h.push_back(cooperative_indptr_h.back());
+        }
+        chunk_start_h.push_back(j * max_num_pages_per_batch * page_size);
+        seq_lens_before_split_h.push_back(seq_len_before_split);
       }
-      chunk_start_h.push_back(j * max_num_pages_per_batch * page_size);
-      seq_lens_before_split_h.push_back(seq_len_before_split);
     }
   }
 
