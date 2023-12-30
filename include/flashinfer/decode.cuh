@@ -200,9 +200,9 @@ template <QKVLayout layout, bool cooperative, RotaryMode rotary_mode, uint32_t n
 __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* __restrict__ k,
                                               DTypeIn* __restrict__ v, DTypeOut* __restrict__ o,
                                               float* __restrict__ tmp,
-                                              tensor_info_t<layout, bdy> info, float sm_scale,
-                                              float rope_rcp_scale, float rope_rcp_theta,
-                                              uint32_t kv_chunk_size) {
+                                              tensor_info_t<layout, bdy, bdx * vec_size> info,
+                                              float sm_scale, float rope_rcp_scale,
+                                              float rope_rcp_theta, uint32_t kv_chunk_size) {
   auto block = cg::this_thread_block();
   auto grid = cg::this_grid();
   sm_scale *= math::log2e;
@@ -371,8 +371,9 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(DTypeIn* __restrict__ q, DTyp
                                                    DTypeIn* __restrict__ v,
                                                    DTypeOut* __restrict__ o,
                                                    float* __restrict__ lse,
-                                                   tensor_info_t<layout, bdy> info, float sm_scale,
-                                                   float rope_rcp_scale, float rope_rcp_theta) {
+                                                   tensor_info_t<layout, bdy, bdx * vec_size> info,
+                                                   float sm_scale, float rope_rcp_scale,
+                                                   float rope_rcp_theta) {
   auto block = cg::this_thread_block();
   sm_scale *= math::log2e;
 
@@ -880,7 +881,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                 constexpr uint32_t num_threads =
                     std::max(get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeIn)), bdx * bdy);
                 constexpr uint32_t bdz = num_threads / (bdx * bdy);
-                tensor_info_t<QKV_LAYOUT, GROUP_SIZE> info(1, seq_len, num_kv_heads, head_dim);
+                tensor_info_t<QKV_LAYOUT, GROUP_SIZE, HEAD_DIM> info(1, seq_len, num_kv_heads);
                 constexpr uint32_t tile_size_per_bdx = 8U / GROUP_SIZE;
                 const uint32_t smem_size = 2U * num_stages_smem * bdy * tile_size_per_bdx * bdz *
                                                head_dim * sizeof(DTypeIn) +
@@ -1313,7 +1314,7 @@ cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DType
                                                    bdx, bdy, bdz, DTypeIn, DTypeOut>;
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-  tensor_info_t<LAYOUT, GROUP_SIZE> info(1, padded_kv_len, num_kv_heads, HEAD_DIM);
+  tensor_info_t<LAYOUT, GROUP_SIZE, HEAD_DIM> info(1, padded_kv_len, num_kv_heads);
   void* args[] = {(void*)&q,
                   (void*)&k,
                   (void*)&v,
