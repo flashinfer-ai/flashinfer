@@ -57,33 +57,65 @@ struct smem_t {
    */
   template <uint32_t stride>
   static __device__ __forceinline__ uint32_t get_permuted_offset(uint32_t i, uint32_t j) {
-    return (i / 2) * stride * 2 + (j / 4) * 8 + (i % 2) * 4 + ((j % 4) ^ ((i / 2) % 4));
+    return i * stride + (j ^ (i % 8));
+  }
+
+  template <uint32_t step_size>
+  static __device__ __forceinline__ uint32_t advance_offset_by_column(uint32_t offset,
+                                                                      uint32_t step_idx) {
+    if constexpr (step_size == 2) {
+      return (offset ^ (0x2 + (0x4 * (step_idx % 2 == 1)))) + (step_idx % 4 == 3) * 8;
+    } else if constexpr (step_size == 4) {
+      return (offset ^ 0x4) + (step_idx % 2 == 1) * 8;
+    } else if constexpr (step_size % 8 == 0) {
+      return offset + step_size;
+    } else {
+      // Note(Zihao): not implemented yet.
+      return 0;
+    }
+  }
+
+  template <uint32_t step_size, uint32_t row_stride>
+  static __device__ __forceinline__ uint32_t advance_offset_by_row(uint32_t offset) {
+    if constexpr (step_size == 4) {
+      return (offset ^ 0x4) + step_size * row_stride;
+    } else if constexpr (step_size % 8 == 0) {
+      return offset + step_size * row_stride;
+    } else {
+      // NOTE(Zihao): not implemented yet.
+      return 0;
+    }
   }
 
   __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t offset, uint32_t* R) {
     cell_t* smem_ptr = base + offset;
     mma::ldmatrix_m8n8x4(R, smem_ptr);
   }
+
   __device__ __forceinline__ void stmatrix_m8n8x4(uint32_t offset, uint32_t* R) {
     cell_t* smem_ptr = base + offset;
     mma::stmatrix_m8n8x4(R, smem_ptr);
   }
+
   __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t offset, uint32_t* R) {
     cell_t* smem_ptr = base + offset;
     mma::ldmatrix_m8n8x4_trans(R, smem_ptr);
   }
+
   template <cp_async::SharedMemFillMode fill_mode, typename T>
   __device__ __forceinline__ void load_128b_async(uint32_t offset, const T* gptr, bool predicate) {
     cell_t* smem_ptr = base + offset;
     cp_async::pred_load_128b<cp_async::PrefetchMode::kPrefetch, fill_mode>(
         smem_ptr, reinterpret_cast<const cell_t*>(gptr), predicate);
   }
+
   template <typename T>
   __device__ __forceinline__ void load_128b_async(uint32_t offset, const T* gptr) {
     cell_t* smem_ptr = base + offset;
     cp_async::load_128b<cp_async::PrefetchMode::kPrefetch>(smem_ptr,
                                                            reinterpret_cast<const cell_t*>(gptr));
   }
+
   template <typename T>
   __device__ __forceinline__ void store_128b(uint32_t offset, T* gptr) {
     *reinterpret_cast<cell_t*>(gptr) = *(base + offset);

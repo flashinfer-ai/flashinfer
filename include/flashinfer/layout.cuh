@@ -30,15 +30,25 @@ enum class QKVLayout {
   kHND = 1U,
 };
 
-template <QKVLayout layout>
+template <QKVLayout layout, size_t head_dim>
 __host__ __device__ __forceinline__ size_t get_elem_offset_impl(size_t elem_idx, size_t head_idx,
                                                                 size_t feat_idx, size_t seq_len,
-                                                                size_t num_heads, size_t head_dim) {
+                                                                size_t num_heads) {
   if constexpr (layout == QKVLayout::kHND) {
     return (head_idx * seq_len + elem_idx) * head_dim + feat_idx;
   } else {
     return (elem_idx * num_heads + head_idx) * head_dim + feat_idx;
   }
+}
+
+template <QKVLayout layout, uint32_t head_dim>
+__host__ __device__ __forceinline__ uint32_t get_n_stride_impl(uint32_t num_heads) {
+  return layout == QKVLayout::kHND ? head_dim : num_heads * head_dim;
+}
+
+template <QKVLayout layout, uint32_t head_dim>
+__host__ __device__ __forceinline__ uint32_t get_h_stride_impl(uint32_t seq_len) {
+  return layout == QKVLayout::kNHD ? head_dim : seq_len * head_dim;
 }
 
 template <QKVLayout layout, uint32_t group_size, uint32_t head_dim>
@@ -59,31 +69,31 @@ struct tensor_info_t {
   __host__ __device__ __forceinline__ size_t get_qo_elem_offset(uint32_t qo_idx,
                                                                 uint32_t qo_head_idx,
                                                                 uint32_t feat_idx) const {
-    return get_elem_offset_impl<layout>(qo_idx, qo_head_idx, feat_idx, qo_len, get_num_qo_heads(),
-                                        head_dim);
+    return get_elem_offset_impl<layout, head_dim>(qo_idx, qo_head_idx, feat_idx, qo_len,
+                                                  get_num_qo_heads());
   }
 
   __host__ __device__ __forceinline__ size_t get_kv_elem_offset(uint32_t kv_idx,
                                                                 uint32_t kv_head_idx,
                                                                 uint32_t feat_idx) const {
-    return get_elem_offset_impl<layout>(kv_idx, kv_head_idx, feat_idx, kv_len, num_kv_heads,
-                                        head_dim);
+    return get_elem_offset_impl<layout, head_dim>(kv_idx, kv_head_idx, feat_idx, kv_len,
+                                                  num_kv_heads);
   }
 
   __host__ __device__ __forceinline__ uint32_t get_qo_n_stride() const {
-    return layout == QKVLayout::kHND ? head_dim : get_num_qo_heads() * head_dim;
+    return get_n_stride_impl<layout, head_dim>(get_num_qo_heads());
   }
 
   __host__ __device__ __forceinline__ uint32_t get_kv_n_stride() const {
-    return layout == QKVLayout::kHND ? head_dim : num_kv_heads * head_dim;
+    return get_n_stride_impl<layout, head_dim>(num_kv_heads);
   }
 
   __host__ __device__ __forceinline__ uint32_t get_qo_h_stride() const {
-    return layout == QKVLayout::kNHD ? head_dim : qo_len * head_dim;
+    return get_h_stride_impl<layout, head_dim>(qo_len);
   }
 
   __host__ __device__ __forceinline__ uint32_t get_kv_h_stride() const {
-    return layout == QKVLayout::kNHD ? head_dim : kv_len * head_dim;
+    return get_h_stride_impl<layout, head_dim>(kv_len);
   }
 };
 
