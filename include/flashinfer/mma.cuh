@@ -315,8 +315,8 @@ __device__ __forceinline__ void rowsum_f16f16f32(float* d, DType* s) {
         "{%8,  0.,  %9,  0.};\n"
         "}\n"
         : "=f"(d[0]), "=f"(d[1])
-        : "r"(s_u32[0]), "r"(s_u32[1]), "r"(s_u32[2]), "r"(s_u32[3]), "r"(1006648320),
-          "r"(1006648320), "f"(d[0]), "f"(d[1]));
+        : "r"(s_u32[0]), "r"(s_u32[1]), "r"(s_u32[2]), "r"(s_u32[3]), "r"(1065369472),
+          "r"(1065369472), "f"(d[0]), "f"(d[1]));
   }
 #else
 #error "Unsupported CUDA architecture for mma instruction"
