@@ -160,8 +160,8 @@ __device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, f
 #pragma unroll
     for (uint32_t j = 0; j < bdz; ++j) {
       float mz = smem_md[(j * bdy + ty) * 2], dz = smem_md[(j * bdy + ty) * 2 + 1];
-      vec_t<float, vec_sje> oz;
-      oz.load(smem + (j * bdy + ty) * head_dim + tx * vec_sje);
+      vec_t<float, vec_size> oz;
+      oz.load(smem + (j * bdy + ty) * head_dim + tx * vec_size);
       st.merge(oz, mz, dz);
     }
   }
