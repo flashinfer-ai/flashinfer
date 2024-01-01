@@ -153,29 +153,31 @@ void bench_flashinfer_batch_decode_with_prefill(nvbench::state& state) {
 
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
-#define BENCH_FLASHINFER_BATCH_DECODE(dtype)                                                   \
-  auto bench_flashinfer_batch_decode_##dtype##_ = bench_flashinfer_batch_decode<dtype>;        \
-  NVBENCH_BENCH(bench_flashinfer_batch_decode_##dtype##_)                                      \
-      .set_name("bench_flashinfer_batch_decode_" STR(dtype))                                   \
-      .add_int64_axis("seqlen", {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768}) \
-      .add_int64_axis("batch_size",                                                            \
-                      {1,   2,   3,   4,   5,   6,   7,   8,   9,   10,  11,  12,  13,  14,    \
-                       15,  16,  20,  24,  28,  32,  40,  48,  56,  64,  80,  96,  112, 128,   \
-                       160, 192, 224, 256, 320, 384, 448, 512, 640, 768, 896, 1024})           \
-      .add_int64_axis("page_size", {4, 8, 16, 32, 64})                                         \
-      .add_int64_axis("num_qo_heads", {32})                                                    \
-      .add_int64_axis("num_kv_heads", {32, 4})                                                 \
+#define BENCH_FLASHINFER_BATCH_DECODE(dtype)                                                 \
+  auto bench_flashinfer_batch_decode_##dtype##_ = bench_flashinfer_batch_decode<dtype>;      \
+  NVBENCH_BENCH(bench_flashinfer_batch_decode_##dtype##_)                                    \
+      .set_name("bench_flashinfer_batch_decode_" STR(dtype))                                 \
+      .add_int64_axis("seqlen",                                                              \
+                      {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536})  \
+      .add_int64_axis("batch_size",                                                          \
+                      {1,   2,   3,   4,   5,   6,   7,   8,   9,   10,  11,  12,  13,  14,  \
+                       15,  16,  20,  24,  28,  32,  40,  48,  56,  64,  80,  96,  112, 128, \
+                       160, 192, 224, 256, 320, 384, 448, 512, 640, 768, 896, 1024})         \
+      .add_int64_axis("page_size", {4, 8, 16, 32, 64})                                       \
+      .add_int64_axis("num_qo_heads", {32})                                                  \
+      .add_int64_axis("num_kv_heads", {32, 4})                                               \
       .add_int64_axis("cooperative", {0, 1})
 
-#define BENCH_FLASHINFER_BATCH_DECODE_WITH_PREFILL(dtype)                                      \
-  auto bench_flashinfer_batch_decode_with_prefill_##dtype##_ =                                 \
-      bench_flashinfer_batch_decode_with_prefill<dtype>;                                       \
-  NVBENCH_BENCH(bench_flashinfer_batch_decode_with_prefill_##dtype##_)                         \
-      .set_name("bench_flashinfer_batch_decode_with_prefill_" STR(dtype))                      \
-      .add_int64_axis("seqlen", {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768}) \
-      .add_int64_axis("batch_size", {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024})             \
-      .add_int64_axis("page_size", {16})                                                       \
-      .add_int64_axis("num_qo_heads", {32})                                                    \
+#define BENCH_FLASHINFER_BATCH_DECODE_WITH_PREFILL(dtype)                                   \
+  auto bench_flashinfer_batch_decode_with_prefill_##dtype##_ =                              \
+      bench_flashinfer_batch_decode_with_prefill<dtype>;                                    \
+  NVBENCH_BENCH(bench_flashinfer_batch_decode_with_prefill_##dtype##_)                      \
+      .set_name("bench_flashinfer_batch_decode_with_prefill_" STR(dtype))                   \
+      .add_int64_axis("seqlen",                                                             \
+                      {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536}) \
+      .add_int64_axis("batch_size", {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024})          \
+      .add_int64_axis("page_size", {16})                                                    \
+      .add_int64_axis("num_qo_heads", {32})                                                 \
       .add_int64_axis("num_kv_heads", {32, 4})
 
 BENCH_FLASHINFER_BATCH_DECODE(half);
