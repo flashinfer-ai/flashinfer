@@ -44,28 +44,6 @@ using namespace flashinfer;
     LOG(FATAL) << "Unsupported data type " << dl_dtype.code; \
   }
 
-Array<NDArray> _CreateTemporaryBufferPerGPU() {
-  auto* pf = tvm::runtime::Registry::Get("runtime.GetCudaDeviceCount");
-  ICHECK(pf != nullptr);
-  int n_gpus = (*pf)();
-  int device_id = -1;
-  cudaGetDevice(&device_id);
-  Array<NDArray> buffers;
-  for (int i = 0; i < n_gpus; ++i) {
-    buffers.push_back(tvm::runtime::NDArray::Empty(ShapeTuple({4096 * 4096}), DataType::Float(16),
-                                                   tvm::Device{kDLCUDA, i}));
-  }
-  cudaSetDevice(device_id);
-  return buffers;
-}
-
-NDArray _GetTemporaryBufferOnGPU(tvm::Device dev) {
-  thread_local Array<NDArray> buffers = _CreateTemporaryBufferPerGPU();
-  CHECK_EQ(dev.device_type, kDLCUDA);
-  CHECK_LT(dev.device_id, buffers.size());
-  return buffers[dev.device_id];
-}
-
 /*!
  * \brief The SinglePrefillWithKVCache function with some parameters fixed at compile time
  *   to accelerate the dispatching.
@@ -97,10 +75,11 @@ cudaError_t _SinglePrefillWithKVCacheNoLSE(DTypeIn* q, DTypeIn* k, DTypeIn* v, D
   return cudaSuccess;
 }
 
-int _FlashInferSinglePrefillWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, bool causal,
-                                        int64_t qkv_layout, int64_t rotary_mode,
+int _FlashInferSinglePrefillWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, DLTensor* tmp,
+                                        bool causal, int64_t qkv_layout, int64_t rotary_mode,
                                         bool allow_fp16_qk_reduction, double rope_scale,
                                         double rope_theta, DLTensor* o) {
+  // `tmp` is user-provided scratch space of at least 16MB, e.g. 4 * 1024 * 1024 float32.
   CHECK_EQ(q->device.device_type, kDLCUDA) << "The device of q matrix must be CUDA.";
   CHECK_EQ(k->device.device_type, kDLCUDA) << "The device of k matrix must be CUDA.";
   CHECK_EQ(v->device.device_type, kDLCUDA) << "The device of v matrix must be CUDA.";
@@ -110,8 +89,6 @@ int _FlashInferSinglePrefillWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, b
   CHECK_EQ(k->device.device_id, dev_id) << "The device id of q and k matrix doesn't match.";
   CHECK_EQ(v->device.device_id, dev_id) << "The device id of q and v matrix doesn't match.";
   CHECK_EQ(o->device.device_id, dev_id) << "The device id of q and o matrix doesn't match.";
-
-  NDArray tmp = _GetTemporaryBufferOnGPU(q->device);
 
   CHECK_GE(q->ndim, 3);
   size_t qo_len = q->shape[q->ndim - 3];
@@ -150,11 +127,10 @@ int _FlashInferSinglePrefillWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, b
   return 0;
 }
 
-TVM_DLL_EXPORT_TYPED_FUNC(FlashInferSinglePrefillWithKVCache, _FlashInferSinglePrefillWithKVCache);
-
-int _FlashInferSingleDecodeWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, int64_t qkv_layout,
-                                       int64_t rotary_mode, double rope_scale, double rope_theta,
-                                       DLTensor* o) {
+int _FlashInferSingleDecodeWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, DLTensor* tmp,
+                                       int64_t qkv_layout, int64_t rotary_mode, double rope_scale,
+                                       double rope_theta, DLTensor* o) {
+  // `tmp` is user-provided scratch space of at least 16MB, e.g. 4 * 1024 * 1024 float32.
   CHECK_EQ(q->device.device_type, kDLCUDA) << "The device of q matrix must be CUDA.";
   CHECK_EQ(k->device.device_type, kDLCUDA) << "The device of k matrix must be CUDA.";
   CHECK_EQ(v->device.device_type, kDLCUDA) << "The device of v matrix must be CUDA.";
@@ -164,8 +140,6 @@ int _FlashInferSingleDecodeWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, in
   CHECK_EQ(k->device.device_id, dev_id) << "The device id of q and k matrix doesn't match.";
   CHECK_EQ(v->device.device_id, dev_id) << "The device id of q and v matrix doesn't match.";
   CHECK_EQ(o->device.device_id, dev_id) << "The device id of q and o matrix doesn't match.";
-
-  NDArray tmp = _GetTemporaryBufferOnGPU(q->device);
 
   CHECK_GE(q->ndim, 2);
   size_t num_qo_heads = q->shape[q->ndim - 2];
@@ -200,8 +174,6 @@ int _FlashInferSingleDecodeWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, in
       })});
   return 0;
 }
-
-TVM_DLL_EXPORT_TYPED_FUNC(FlashInferSingleDecodeWithKVCache, _FlashInferSingleDecodeWithKVCache);
 
 constexpr uint32_t max_num_handlers = 8;
 thread_local BatchPrefillHandler batch_prefill_paged_kv_handlers[max_num_handlers];
@@ -690,40 +662,6 @@ void _FlashInferBatchQKApplyRotaryInPlace(DLTensor* q, DLTensor* k, DLTensor* in
         }
       })});
 }
-
-TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionPrefillWithPagedKVCache,
-                          _FlashInferAttentionPrefillWithPagedKVCache);
-
-TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionPrefillWithPagedKVCacheBeginForward,
-                          _FlashInferAttentionPrefillWithPagedKVCacheBeginForward);
-
-TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionPrefillWithPagedKVCacheEndForward,
-                          _FlashInferAttentionPrefillWithPagedKVCacheEndForward);
-
-TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionDecodeWithPagedKVCache,
-                          _FlashInferAttentionDecodeWithPagedKVCache);
-
-TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionDecodeWithPagedKVCacheBeginForward,
-                          _FlashInferAttentionDecodeWithPagedKVCacheBeginForward);
-
-TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionDecodeWithPagedKVCacheEndForward,
-                          _FlashInferAttentionDecodeWithPagedKVCacheEndForward);
-
-TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionPrefillWithRaggedKVCache,
-                          _FlashInferAttentionPrefillWithRaggedKVCache);
-
-TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionPrefillWithRaggedKVCacheBeginForward,
-                          _FlashInferAttentionPrefillWithRaggedKVCacheBeginForward);
-
-TVM_DLL_EXPORT_TYPED_FUNC(FlashInferAttentionPrefillWithRaggedKVCacheEndForward,
-                          _FlashInferAttentionPrefillWithRaggedKVCacheEndForward);
-
-TVM_DLL_EXPORT_TYPED_FUNC(FlashInferMergeState, _FlashInferMergeState);
-
-TVM_DLL_EXPORT_TYPED_FUNC(FlashInferMergeStateInPlace, _FlashInferMergeStateInPlace);
-
-TVM_DLL_EXPORT_TYPED_FUNC(FlashInferBatchQKApplyRotaryInPlace,
-                          _FlashInferBatchQKApplyRotaryInPlace);
 
 // TODO(Zihao): Unify the symbol names
 TVM_REGISTER_GLOBAL("paged_kv_cache.attention_kernel_prefill")
