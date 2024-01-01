@@ -27,16 +27,16 @@
 
 namespace flashinfer {
 
-// Each cell is 4 bytes.
-using cell_t = uint4;
+// Use 128bit as the granularity to fetch/store data per thread to maximize memory bandwidth
+using b128_t = uint4;
 
 /*!
- * \brief Compute the number of elements that can be stored in a cell.
+ * \brief Compute the number of elements that can be stored in a b128_t.
  * \tparam T The data type of the elements.
  */
 template <typename T>
-constexpr __host__ __device__ __forceinline__ uint32_t cell_capacity() {
-  return sizeof(cell_t) / sizeof(T);
+constexpr __host__ __device__ __forceinline__ uint32_t num_elems_per_128b() {
+  return sizeof(b128_t) / sizeof(T);
 }
 
 /*!
@@ -44,14 +44,14 @@ constexpr __host__ __device__ __forceinline__ uint32_t cell_capacity() {
  */
 struct smem_t {
   // The base pointer.
-  cell_t* base;
+  b128_t* base;
   __device__ __forceinline__ smem_t() : base(nullptr) {}
   template <typename T>
-  __device__ __forceinline__ smem_t(T* base) : base((cell_t*)base) {}
+  __device__ __forceinline__ smem_t(T* base) : base((b128_t*)base) {}
 
   /*!
    * \brief Compute the element offset given coordinates in a permuted shared memory.
-   * \tparam stride The stride (in terms of cells) in the permuted shared memory.
+   * \tparam stride The stride (in terms of b128_t's) in the permuted shared memory.
    * \param i The row index.
    * \param j The column index.
    */
@@ -88,37 +88,37 @@ struct smem_t {
   }
 
   __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t offset, uint32_t* R) {
-    cell_t* smem_ptr = base + offset;
+    b128_t* smem_ptr = base + offset;
     mma::ldmatrix_m8n8x4(R, smem_ptr);
   }
 
   __device__ __forceinline__ void stmatrix_m8n8x4(uint32_t offset, uint32_t* R) {
-    cell_t* smem_ptr = base + offset;
+    b128_t* smem_ptr = base + offset;
     mma::stmatrix_m8n8x4(R, smem_ptr);
   }
 
   __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t offset, uint32_t* R) {
-    cell_t* smem_ptr = base + offset;
+    b128_t* smem_ptr = base + offset;
     mma::ldmatrix_m8n8x4_trans(R, smem_ptr);
   }
 
   template <cp_async::SharedMemFillMode fill_mode, typename T>
   __device__ __forceinline__ void load_128b_async(uint32_t offset, const T* gptr, bool predicate) {
-    cell_t* smem_ptr = base + offset;
+    b128_t* smem_ptr = base + offset;
     cp_async::pred_load_128b<cp_async::PrefetchMode::kPrefetch, fill_mode>(
-        smem_ptr, reinterpret_cast<const cell_t*>(gptr), predicate);
+        smem_ptr, reinterpret_cast<const b128_t*>(gptr), predicate);
   }
 
   template <typename T>
   __device__ __forceinline__ void load_128b_async(uint32_t offset, const T* gptr) {
-    cell_t* smem_ptr = base + offset;
+    b128_t* smem_ptr = base + offset;
     cp_async::load_128b<cp_async::PrefetchMode::kPrefetch>(smem_ptr,
-                                                           reinterpret_cast<const cell_t*>(gptr));
+                                                           reinterpret_cast<const b128_t*>(gptr));
   }
 
   template <typename T>
   __device__ __forceinline__ void store_128b(uint32_t offset, T* gptr) {
-    *reinterpret_cast<cell_t*>(gptr) = *(base + offset);
+    *reinterpret_cast<b128_t*>(gptr) = *(base + offset);
   }
 };
 
