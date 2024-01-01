@@ -50,7 +50,7 @@ namespace {
  * \tparam head_dim A template integer indicates the head dimension
  * \tparam vec_size A template integer indicates the vector size
  * \tparam bdx A template integer indicates the block size in x dimension
- * \tparam bdy A template integer indicates the block size in y dimension
+ * \tparam tile_size A template integer indicates the tile size per (bdx * bdy) threads.
  * \tparam T A template type indicates the input data type
  * \param smem A pointer to the start of shared memory
  * \param q_vec A vector of float indicates the thread-local query vector
@@ -63,7 +63,7 @@ namespace {
  * \param s A float indicates the thread-local result of qk
  * \param st The self-attention state to be updated
  */
-template <RotaryMode rotary_mode, uint32_t vec_size, uint32_t bdx, uint32_t bdy, typename T>
+template <RotaryMode rotary_mode, uint32_t vec_size, uint32_t bdx, uint32_t tile_size, typename T>
 __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage_idx,
                                            const vec_t<float, vec_size>& q_vec,
                                            const vec_t<float, vec_size>& freq, uint32_t kv_idx_base,
@@ -72,35 +72,35 @@ __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage
   uint32_t tx = threadIdx.x, tz = threadIdx.z;
   float m_prev = st.m;
 #pragma unroll
-  for (uint32_t iy = 0; iy < bdy; ++iy) {
+  for (uint32_t j = 0; j < tile_size; ++j) {
     vec_t<float, vec_size> k_vec;
     if constexpr (rotary_mode == RotaryMode::kLlama) {
       // apply rotary embedding for all rows in k matrix of kv-cache
-      k_vec = vec_apply_llama_rope<vec_size, bdx>(smem + iy * bdx * vec_size, freq,
-                                                  kv_idx_base + tz * bdy + iy);
+      k_vec = vec_apply_llama_rope<vec_size, bdx>(smem + j * bdx * vec_size, freq,
+                                                  kv_idx_base + tz * tile_size + j);
     } else {
       // do not apply rotary embedding
-      k_vec.cast_load(smem + (iy * bdx + tx) * vec_size);
+      k_vec.cast_load(smem + (j * bdx + tx) * vec_size);
     }
-    s[iy] = 0.f;
+    s[j] = 0.f;
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
-      s[iy] += q_vec[i] * k_vec[i] * sm_scale;
+      s[j] += q_vec[i] * k_vec[i] * sm_scale;
     }
 #pragma unroll
     for (uint32_t offset = bdx / 2; offset > 0; offset /= 2) {
-      s[iy] += math::shfl_xor_sync(s[iy], offset);
+      s[j] += math::shfl_xor_sync(s[j], offset);
     }
-    s[iy] = (iter_base + tz * bdy + iy < iter_bound) ? s[iy] : -5e4;
-    st.m = max(st.m, s[iy]);
+    s[j] = (iter_base + tz * tile_size + j < iter_bound) ? s[j] : -5e4;
+    st.m = max(st.m, s[j]);
   }
 
   float o_scale = math::ptx_exp2(m_prev - st.m);
   st.d *= o_scale;
 #pragma unroll
-  for (uint32_t iy = 0; iy < bdy; ++iy) {
-    s[iy] = math::ptx_exp2(s[iy] - st.m);
-    st.d += s[iy];
+  for (uint32_t j = 0; j < tile_size; ++j) {
+    s[j] = math::ptx_exp2(s[j] - st.m);
+    st.d += s[j];
   }
 #pragma unroll
   for (uint32_t i = 0; i < vec_size; ++i) {
@@ -112,7 +112,7 @@ __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage
  * \brief Load v tile from shared memory and update local state
  * \tparam vec_size A template integer indicates the vector size
  * \tparam bdx A template integer indicates the block size in x dimension
- * \tparam bdy A template integer indicates the block size in y dimension
+ * \tparam tile_size A template integer indicates the tile size per (bdx * bdy) threads.
  * \tparam T A template type indicates the input data type
  * \param smem A pointer to the start of shared memory
  * \param s A float indicates the pre-softmax attention score
@@ -121,18 +121,18 @@ __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage
  * \param compute_stage_idx A integer indicates the compute stage index in the pipeline
  * \param st The flashattention state to be updated
  */
-template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, typename T>
+template <uint32_t vec_size, uint32_t bdx, uint32_t tile_size, typename T>
 __device__ __forceinline__ void update_local_state(const T* smem, const float* s,
                                                    uint32_t compute_stage_idx,
                                                    state_t<vec_size>& st) {
   uint32_t tx = threadIdx.x;
 #pragma unroll
-  for (uint32_t iy = 0; iy < bdy; ++iy) {
+  for (uint32_t j = 0; j < tile_size; ++j) {
     vec_t<float, vec_size> v_vec;
-    v_vec.cast_load(smem + (iy * bdx + tx) * vec_size);
+    v_vec.cast_load(smem + (j * bdx + tx) * vec_size);
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
-      st.o[i] = st.o[i] + s[iy] * v_vec[i];
+      st.o[i] = st.o[i] + s[j] * v_vec[i];
     }
   }
 }
@@ -158,10 +158,10 @@ __device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, f
     block.sync();
     st.init();
 #pragma unroll
-    for (uint32_t iz = 0; iz < bdz; ++iz) {
-      float mz = smem_md[(iz * bdy + ty) * 2], dz = smem_md[(iz * bdy + ty) * 2 + 1];
+    for (uint32_t j = 0; j < bdz; ++j) {
+      float mz = smem_md[(j * bdy + ty) * 2], dz = smem_md[(j * bdy + ty) * 2 + 1];
       vec_t<float, vec_size> oz;
-      oz.load(smem + (iz * bdy + ty) * head_dim + tx * vec_size);
+      oz.load(smem + (j * bdy + ty) * head_dim + tx * vec_size);
       st.merge(oz, mz, dz);
     }
   }
