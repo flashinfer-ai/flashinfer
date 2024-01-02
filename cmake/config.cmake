@@ -8,6 +8,10 @@ set(FLASHINFER_PREFILL ON)
 set(FLASHINFER_DECODE ON)
 # Whether to compile page kernel tests/benchmarks or not.
 set(FLASHINFER_PAGE ON)
-# Set target cuda architectures for tests/benchmarks, defaults to native (which is new in CMake 3.24, you can configure it manually if you are using older CMake).
-# Example: "80;86;90;90"
+# Set target cuda architectures for tests/benchmarks, defaults to native.
+# "native" is a special value for CMAKE_CUDA_ARCHITECTURES which means use the architectures of the host's GPU.
+# it's new in CMake 3.24, if you are using an older of CMake or you want to use a different value, you can
+# set its value here. Supported CUDA architctures include 80;86;89;90
+# Example:
+# set(FLASHINFER_CUDA_ARCHITECTURES 80)
 set(FLASHINFER_CUDA_ARCHITECTURES native)

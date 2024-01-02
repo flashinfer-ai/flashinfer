@@ -24,18 +24,13 @@ flashinfer_option(FLASHINFER_DECODE "Whether to compile decode kernel tests/benc
 flashinfer_option(FLASHINFER_PAGE "Whether to compile page kernel tests/benchmarks or not." ON)
 flashinfer_option(FLASHINFER_TVM_BINDING "Whether to compile tvm binding or not." OFF)
 flashinfer_option(FLASHINFER_TVM_HOME "The path to tvm for building tvm binding." "")
-# "native" is a special value for CMAKE_CUDA_ARCHITECTURES which means use the architectures of the host's GPU.
-# it's new in CMake 3.24, if you are using an older of CMake or you want to use a different value, you can
-# set its value through config.cmake or -DCMAKE_CUDA_ARCHITECTURES=... through command-line.
-# Supported CUDA architctures include 80;86;89;90
-flashinfer_option(FLASHINFER_CUDA_ARCHITECTURES "CUDA architectures of tests/benchmarks" native)
 
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES ${FLASHINFER_CUDA_ARCHITECTURES})
+if(DEFINED FLASHINFER_CUDA_ARCHITECTURES)
   message(STATUS "CMAKE_CUDA_ARCHITECTURES set to ${FLASHINFER_CUDA_ARCHITECTURES}.")
-else(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  message(STATUS "External CMAKE_CUDA_ARCHITECTURES exists. Ignore FLASHINFER_CUDA_ARCHITECTURES.")
-endif(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES ${FLASHINFER_CUDA_ARCHITECTURES})
+else(DEFINED FLASHINFER_CUDA_ARCHITECTURES)
+  message(STATUS "CMAKE_CUDA_ARCHITECTURES is ${CMAKE_CUDA_ARCHITECTURES}")
+endif(DEFINED FLASHINFER_CUDA_ARCHITECTURES)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules")
 if(FLASHINFER_PREFILL OR FLASHINFER_DECODE OR FLASHINFER_PAGE)
