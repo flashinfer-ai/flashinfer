@@ -69,6 +69,7 @@ ext_modules.append(
 setuptools.setup(
     name="flashinfer",
     version=get_version(root / "flashinfer/__init__.py"),
+    packages=setuptools.find_packages(),
     author="FlashInfer team",
     license="Apache License 2.0",
     description="FlashInfer: Kernel Library for LLM Serving",
