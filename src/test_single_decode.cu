@@ -80,7 +80,7 @@ void _TestDecodingKernelCorrectness(size_t num_qo_heads, size_t num_kv_heads, si
 template <typename T>
 void TestSingleDecodeKernelCorrectness() {
   for (size_t num_qo_heads : {32}) {
-    for (size_t num_kv_heads : {4, 32}) {
+    for (size_t num_kv_heads : {4, 8, 32}) {
       for (size_t seq_len :
            {1, 3, 9, 27, 81, 129, 257, 512, 1024, 2048, 4096, 8192, 16384, 32768}) {
         for (size_t head_dim : {64, 128, 256}) {

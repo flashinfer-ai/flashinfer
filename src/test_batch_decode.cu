@@ -140,7 +140,7 @@ void TestBatchDecodeKernelCorrectness() {
   for (size_t page_size : {1, 3, 7, 16}) {
     for (size_t batch_size : {1, 7, 37, 61}) {
       for (size_t num_qo_heads : {32}) {
-        for (size_t num_kv_heads : {32, 4}) {
+        for (size_t num_kv_heads : {32, 8, 4}) {
           for (size_t head_dim : {64, 128, 256}) {
             for (size_t rotary_mode : {0U, 1U}) {
               _TestBatchDecodingKernelCorrectness<T>(page_size, batch_size, num_qo_heads,
@@ -159,7 +159,7 @@ void TestCooperativeBatchDecodeKernelCorrectness() {
   for (size_t page_size : {1, 3, 7, 16}) {
     for (size_t batch_size : {1, 2, 4, 8}) {
       for (size_t num_qo_heads : {32}) {
-        for (size_t num_kv_heads : {32, 4}) {
+        for (size_t num_kv_heads : {32, 8, 4}) {
           for (size_t head_dim : {64, 128}) {
             for (size_t rotary_mode : {0U, 1U}) {
               _TestBatchDecodingKernelCorrectness<T>(page_size, batch_size, num_qo_heads,

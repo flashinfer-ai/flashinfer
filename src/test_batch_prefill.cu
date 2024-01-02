@@ -211,14 +211,12 @@ void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads, size_t 
   thrust::device_vector<int32_t> q_indptr_device(q_indptr);
   thrust::device_vector<T> o_device(o_concat_ref.size());
 
-  for (uint32_t num_runs = 0; num_runs < 10; ++num_runs) {
-    auto status = BatchPrefillWithPagedKVCache<PageStorage::kIndices, T, T, int32_t>(
-        thrust::raw_pointer_cast(q_device.data()), thrust::raw_pointer_cast(q_indptr_device.data()),
-        paged_kv, thrust::raw_pointer_cast(o_device.data()),
-        /*tmp=*/nullptr,
-        /*lse=*/nullptr, num_qo_heads, causal, rotary_mode, allow_fp16_qk_reduction);
-    EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
-  }
+  auto status = BatchPrefillWithPagedKVCache<PageStorage::kIndices, T, T, int32_t>(
+      thrust::raw_pointer_cast(q_device.data()), thrust::raw_pointer_cast(q_indptr_device.data()),
+      paged_kv, thrust::raw_pointer_cast(o_device.data()),
+      /*tmp=*/nullptr,
+      /*lse=*/nullptr, num_qo_heads, causal, rotary_mode, allow_fp16_qk_reduction);
+  EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
 
   thrust::host_vector<T> o_host(o_device);
   size_t num_result_errors_atol_1e_3_rtol_1e_3 = 0;
@@ -297,14 +295,11 @@ void _TestBatchPrefillKernelLongContextCorrectness(size_t num_kv_heads, size_t n
   thrust::device_vector<T> q_device(q);
   thrust::device_vector<T> o_device(q_lens[0] * num_qo_heads * head_dim);
 
-  for (uint32_t num_runs = 0; num_runs < 10; ++num_runs) {
-    auto status = BatchPrefillWithPagedKVCache<PageStorage::kIndices, T, T, int32_t>(
-        thrust::raw_pointer_cast(q_device.data()), thrust::raw_pointer_cast(q_indptr_device.data()),
-        paged_kv, thrust::raw_pointer_cast(o_device.data()),
-        /*tmp=*/nullptr, /*lse=*/nullptr, num_qo_heads, causal, rotary_mode,
-        allow_fp16_qk_reduction);
-    EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
-  }
+  auto status = BatchPrefillWithPagedKVCache<PageStorage::kIndices, T, T, int32_t>(
+      thrust::raw_pointer_cast(q_device.data()), thrust::raw_pointer_cast(q_indptr_device.data()),
+      paged_kv, thrust::raw_pointer_cast(o_device.data()),
+      /*tmp=*/nullptr, /*lse=*/nullptr, num_qo_heads, causal, rotary_mode, allow_fp16_qk_reduction);
+  EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
 
   thrust::host_vector<T> o_host(o_device);
   size_t num_result_errors_atol_1e_3_rtol_1e_3 = 0;
@@ -329,7 +324,7 @@ void _TestBatchPrefillKernelLongContextCorrectness(size_t num_kv_heads, size_t n
 
 template <typename T>
 void TestBatchPrefillKernelOneHotCorrectness(bool allow_fp16_qk_reduction) {
-  for (size_t num_kv_heads : {4, 32}) {
+  for (size_t num_kv_heads : {4, 8, 32}) {
     for (size_t num_qo_heads : {32}) {
       for (size_t page_size : {1, 7, 16}) {
         for (size_t head_dim : {64, 128}) {
@@ -348,7 +343,7 @@ void TestBatchPrefillKernelOneHotCorrectness(bool allow_fp16_qk_reduction) {
 
 template <typename T>
 void TestBatchPrefillKernelShortContextCorrectness(bool allow_fp16_qk_reduction) {
-  for (size_t num_kv_heads : {4, 32}) {
+  for (size_t num_kv_heads : {4, 8, 32}) {
     for (size_t num_qo_heads : {32}) {
       for (size_t page_size : {1, 7, 16}) {
         for (size_t head_dim : {64, 128}) {
@@ -367,7 +362,7 @@ void TestBatchPrefillKernelShortContextCorrectness(bool allow_fp16_qk_reduction)
 
 template <typename T>
 void TestBatchPrefillKernelLongContextCorrectness(bool allow_fp16_qk_reduction) {
-  for (size_t num_kv_heads : {1, 8}) {
+  for (size_t num_kv_heads : {1, 2, 8}) {
     for (size_t num_qo_heads : {8}) {
       for (size_t page_size : {1, 7, 16}) {
         for (size_t head_dim : {64, 128}) {
