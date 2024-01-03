@@ -26,6 +26,8 @@
 #include <thrust/random.h>
 #include <thrust/transform.h>
 
+#include <random>
+
 namespace utils {
 
 template <typename T>
@@ -33,6 +35,16 @@ void vec_normal_(std::vector<T>& vec, float mean = 0.f, float std = 1.f) {
   std::random_device rd{};
   std::mt19937 gen{rd()};
   std::normal_distribution d{mean, std};
+  for (size_t i = 0; i < vec.size(); ++i) {
+    vec[i] = T(d(gen));
+  }
+}
+
+template <typename T>
+void vec_uniform_(std::vector<T>& vec, float a = 0.f, float b = 1.f) {
+  std::random_device rd{};
+  std::mt19937 gen{rd()};
+  std::uniform_real_distribution d{a, b};
   for (size_t i = 0; i < vec.size(); ++i) {
     vec[i] = T(d(gen));
   }

@@ -16,13 +16,18 @@
 #ifndef FLASHINFER_CASCADE_CUH_
 #define FLASHINFER_CASCADE_CUH_
 
-#include "decode.cuh"
+#include <cooperative_groups.h>
+
+#include "cp_async.cuh"
 #include "math.cuh"
-#include "prefill.cuh"
 #include "state.cuh"
 #include "utils.cuh"
 
 namespace flashinfer {
+
+namespace cg = cooperative_groups;
+using cp_async::PrefetchMode;
+using cp_async::SharedMemFillMode;
 
 /*!
  * \brief The CUDA kernel that merges the self-attention state of two index sets A and B.
@@ -55,14 +60,14 @@ __global__ void MergeStateKernel(DTypeIn* __restrict__ v_a, float* __restrict__ 
   s_b_val = math::ptx_exp2(s_b_val - s_max);
   float a_scale = s_a_val / (s_a_val + s_b_val);
   float b_scale = s_b_val / (s_a_val + s_b_val);
-  vec_t<float, vec_size> v_vec_a, v_vec_b, v_vec_o;
-  v_vec_a.cast_load(v_a + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
-  v_vec_b.cast_load(v_b + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
+  vec_t<float, vec_size> v_a_vec, v_b_vec, v_merged_vec;
+  v_a_vec.cast_load(v_a + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
+  v_b_vec.cast_load(v_b + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
 #pragma unroll
   for (uint32_t i = 0; i < vec_size; ++i) {
-    v_vec_o[i] = a_scale * v_vec_a[i] + b_scale * v_vec_b[i];
+    v_merged_vec[i] = a_scale * v_a_vec[i] + b_scale * v_b_vec[i];
   }
-  v_vec_o.cast_store(v_merged + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
+  v_merged_vec.cast_store(v_merged + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
   s_merged[batch_idx * num_heads + head_idx] = math::ptx_log2(s_a_val + s_b_val) + s_max;
 }
 
@@ -118,7 +123,7 @@ __global__ void MergeStateInPlaceKernel(DType* __restrict__ v, float* __restrict
  * \note s are logsumexp values with base 2.
  */
 template <uint32_t vec_size, typename DTypeIn, typename DTypeOut>
-__global__ void MergeStatesKernel(DTypeIn* __restrict__ v, float* __restrict__ s,
+__global__ void MergeStatesKernel(DTypeIn* __restrict__ V, float* __restrict__ S,
                                   DTypeOut* __restrict__ v_merged, float* __restrict__ s_merged,
                                   uint32_t num_index_sets, uint32_t num_heads, uint32_t head_dim) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
@@ -127,28 +132,30 @@ __global__ void MergeStatesKernel(DTypeIn* __restrict__ v, float* __restrict__ s
   uint32_t head_idx = ty;
   float m = -5e4, d = 1.f;
 
-  vec_t<float, vec_size> v_vec_o;
-  v_vec_o.fill(0.f);
-  for (uint32_t j = 0; j < num_index_sets; ++j) {
-    float s_val = s[(j * batch_size + batch_idx) * num_heads + head_idx];
-    vec_t<float, vec_size> v_j;
-    v_j.cast_load(v + ((j * batch_size + batch_idx) * num_heads + head_idx) * head_dim +
-                  tx * vec_size);
+  vec_t<float, vec_size> v_merged_vec;
+  v_merged_vec.fill(0.f);
+#pragma unroll 2
+  for (uint32_t iter = 0; iter < num_index_sets; ++iter) {
+    float s = S[(iter * batch_size + batch_idx) * num_heads + head_idx];
+    vec_t<float, vec_size> v;
+    v.cast_load(V + ((iter * batch_size + batch_idx) * num_heads + head_idx) * head_dim +
+                tx * vec_size);
     float m_prev = m;
-    m = max(m, s_val);
+    m = max(m, s);
     float o_scale = math::ptx_exp2(m_prev - m);
-    float v_j_scale = math::ptx_exp2(s_val - m);
-    d = d * o_scale + v_j_scale;
+    float v_scale = math::ptx_exp2(s - m);
+    d = d * o_scale + v_scale;
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
-      v_vec_o[i] = v_vec_o[i] * o_scale + v_j[i] * v_j_scale;
+      v_merged_vec[i] = v_merged_vec[i] * o_scale + v[i] * v_scale;
     }
   }
+
 #pragma unroll
   for (uint32_t i = 0; i < vec_size; ++i) {
-    v_vec_o[i] = __fdividef(v_vec_o[i], d);
+    v_merged_vec[i] = __fdividef(v_merged_vec[i], d);
   }
-  v_vec_o.cast_store(v_merged + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
+  v_merged_vec.cast_store(v_merged + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
   s_merged[batch_idx * num_heads + head_idx] = math::ptx_log2(d) + m;
 }
 
