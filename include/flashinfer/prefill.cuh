@@ -1373,15 +1373,14 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
                                 uint32_t smem_size = (num_frags_x * num_warps + num_frags_z * 2) *
                                                      16 * head_dim * sizeof(DTypeIn);
                                 FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
-                                    cooperative_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    split_kv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     smem_size));
                                 int num_blocks_per_sm = 0;
                                 int num_sm = 0;
                                 FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
                                     &num_sm, cudaDevAttrMultiProcessorCount, dev_id));
                                 FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                                    &num_blocks_per_sm, cooperative_kernel, num_threads,
-                                    smem_size));
+                                    &num_blocks_per_sm, split_kv_kernel, num_threads, smem_size));
                                 uint32_t num_chunks =
                                     min((num_blocks_per_sm * num_sm) /
                                             (num_kv_heads *
