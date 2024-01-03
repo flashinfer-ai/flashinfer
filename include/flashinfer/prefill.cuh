@@ -914,7 +914,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
                                                          qo_len, qo_n_stride, qo_h_stride);
 
   // write lse
-  if (lse != nullptr) {
+  if (lse != nullptr || split_kv) {
 #pragma unroll
     for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
