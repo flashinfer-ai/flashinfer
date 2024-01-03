@@ -19,10 +19,10 @@ endif()
 # and add set(OPTION VALUE) to override these build options.
 # Alernatively, use cmake -DOPTION=VALUE through command-line.
 flashinfer_option(FLASHINFER_ENABLE_FP8 "Whether to compile fp8 kernels or not." ON)
-flashinfer_option(FLASHINFER_PREFILL "Whether to compile prefill kernel tests/benchmarks or not." ON)
-flashinfer_option(FLASHINFER_DECODE "Whether to compile decode kernel tests/benchmarks or not." ON)
-flashinfer_option(FLASHINFER_PAGE "Whether to compile page kernel tests/benchmarks or not." ON)
-flashinfer_option(FLASHINFER_CASCADE "Whether to compile cascade kernel tests/benchmarks or not." ON)
+flashinfer_option(FLASHINFER_PREFILL "Whether to compile prefill kernel tests/benchmarks or not." OFF)
+flashinfer_option(FLASHINFER_DECODE "Whether to compile decode kernel tests/benchmarks or not." OFF)
+flashinfer_option(FLASHINFER_PAGE "Whether to compile page kernel tests/benchmarks or not." OFF)
+flashinfer_option(FLASHINFER_CASCADE "Whether to compile cascade kernel tests/benchmarks or not." OFF)
 flashinfer_option(FLASHINFER_TVM_BINDING "Whether to compile tvm binding or not." OFF)
 flashinfer_option(FLASHINFER_TVM_HOME "The path to tvm for building tvm binding." "")
 
