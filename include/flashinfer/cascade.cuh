@@ -68,7 +68,9 @@ __global__ void MergeStateKernel(DTypeIn* __restrict__ v_a, float* __restrict__ 
     v_merged_vec[i] = a_scale * v_a_vec[i] + b_scale * v_b_vec[i];
   }
   v_merged_vec.cast_store(v_merged + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
-  s_merged[batch_idx * num_heads + head_idx] = math::ptx_log2(s_a_val + s_b_val) + s_max;
+  if (s_merged != nullptr) {
+    s_merged[batch_idx * num_heads + head_idx] = math::ptx_log2(s_a_val + s_b_val) + s_max;
+  }
 }
 
 /*!
@@ -106,7 +108,9 @@ __global__ void MergeStateInPlaceKernel(DType* __restrict__ v, float* __restrict
     v_vec[i] = scale * v_vec[i] + other_scale * v_other_vec[i];
   }
   v_vec.cast_store(v + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
-  s[batch_idx * num_heads + head_idx] = math::ptx_log2(s_val + s_other_val) + s_max;
+  if (s != nullptr) {
+    s[batch_idx * num_heads + head_idx] = math::ptx_log2(s_val + s_other_val) + s_max;
+  }
 }
 
 /*!
@@ -156,7 +160,9 @@ __global__ void MergeStatesKernel(DTypeIn* __restrict__ V, float* __restrict__ S
     v_merged_vec[i] = __fdividef(v_merged_vec[i], d);
   }
   v_merged_vec.cast_store(v_merged + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
-  s_merged[batch_idx * num_heads + head_idx] = math::ptx_log2(d) + m;
+  if (s_merged != nullptr) {
+    s_merged[batch_idx * num_heads + head_idx] = math::ptx_log2(d) + m;
+  }
 }
 
 /*!
