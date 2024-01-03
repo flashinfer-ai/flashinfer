@@ -19,12 +19,17 @@
 
 #include <iostream>
 
-#define FLASHINFER_CUDA_CALL(func, ...) \
-  {                                     \
-    cudaError_t e = (func);             \
-    if (e != cudaSuccess) {             \
-      return e;                         \
-    }                                   \
+#define STR_HELPER(x) #x
+#define STR(x) STR_HELPER(x)
+
+#define FLASHINFER_CUDA_CALL(func, ...)                                                     \
+  {                                                                                         \
+    cudaError_t e = (func);                                                                 \
+    if (e != cudaSuccess) {                                                                 \
+      std::cerr << "CUDA Error: " << cudaGetErrorString(e) << " (" << e << ") " << __FILE__ \
+                << ": line " << __LINE__ << " at function " << STR(func) << std::endl;      \
+      return e;                                                                             \
+    }                                                                                       \
   }
 
 #define SWITCH_SPLIT_QO_INDPTR(split_qo_indptr, SPLIT_QO_INDPTR, ...) \
