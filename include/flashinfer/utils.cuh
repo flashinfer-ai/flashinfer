@@ -80,10 +80,13 @@
   }
 
 #define SWITCH_NUM_FRAGS_Z(max_frags_z, NUM_FRAGS_Z, ...)                 \
-  if (max_frags_z == 4) {                                                 \
+  if (max_frags_z >= 6) {                                                 \
+    constexpr size_t NUM_FRAGS_Z = 6;                                     \
+    __VA_ARGS__                                                           \
+  } else if (max_frags_z >= 4) {                                          \
     constexpr size_t NUM_FRAGS_Z = 4;                                     \
     __VA_ARGS__                                                           \
-  } else if (max_frags_z == 2) {                                          \
+  } else if (max_frags_z >= 2) {                                          \
     constexpr size_t NUM_FRAGS_Z = 2;                                     \
     __VA_ARGS__                                                           \
   } else {                                                                \

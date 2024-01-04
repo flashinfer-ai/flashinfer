@@ -1353,7 +1353,7 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
                               (HEAD_DIM == 128 && num_frags_x == 2 &&
                                ROTARY_MODE == RotaryMode::kLlama && !allow_fp16_qk_reduction)
                                   ? 2
-                                  : 4;
+                                  : (8 / num_frags_x);
                           const uint32_t max_num_frags_z_smem =
                               (max_smem_per_threadblock / (16 * head_dim * sizeof(DTypeIn)) -
                                num_frags_x * num_warps) /
@@ -1440,7 +1440,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
         (HEAD_DIM == 128 && num_frags_x == 2 && ROTARY_MODE == RotaryMode::kLlama &&
          !ALLOW_FP16_QK_REDUCTION)
             ? 2
-            : 4;
+            : (8 / num_frags_x);
     const uint32_t max_num_frags_z_smem =
         (max_smem_per_threadblock / (16 * HEAD_DIM * sizeof(DTypeIn)) - num_frags_x * num_warps) /
         2;
