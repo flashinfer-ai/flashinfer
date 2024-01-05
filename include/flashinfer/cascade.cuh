@@ -113,6 +113,25 @@ __global__ void MergeStateInPlaceKernel(DType* __restrict__ v, float* __restrict
   }
 }
 
+template <uint32_t bdx, uint32_t bdy, uint32_t vec_size, typename DTypeIn>
+__device__ __forceinline__ void threadblock_sync_state(state_t<vec_size>& st, DTypeIn* v_smem,
+                                                       float* s_smem) {
+  const uint32_t tx = threadIdx.x, ty = threadIdx.y;
+  constexpr uint32_t head_dim = vec_size * bdx;
+  st.o.cast_store(v_smem + ty * head_dim + tx * vec_size);
+  s_smem[ty] = st.get_lse();
+  st.init();
+  __syncthreads();
+
+#pragma unroll
+  for (uint32_t iter = 0; iter < bdy; ++iter) {
+    float s = s_smem[iter];
+    vec_t<float, vec_size> v;
+    v.cast_load(v_smem + iter * head_dim + tx * vec_size);
+    st.merge(v, s, 1);
+  }
+}
+
 /*!
  * \brief The CUDA kernel that merges self-attention states of a list of index sets.
  * \param vec_size The vector size used in the kernel.
@@ -126,42 +145,70 @@ __global__ void MergeStateInPlaceKernel(DType* __restrict__ v, float* __restrict
  * \param head_dim The dimension of each head.
  * \note s are logsumexp values with base 2.
  */
-template <uint32_t vec_size, typename DTypeIn, typename DTypeOut>
+template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t num_smem_stages, typename DTypeIn,
+          typename DTypeOut>
 __global__ void MergeStatesKernel(DTypeIn* __restrict__ V, float* __restrict__ S,
                                   DTypeOut* __restrict__ v_merged, float* __restrict__ s_merged,
-                                  uint32_t num_index_sets, uint32_t num_heads, uint32_t head_dim) {
+                                  uint32_t num_index_sets, uint32_t num_heads) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t batch_size = gridDim.x;
   uint32_t batch_idx = blockIdx.x;
-  uint32_t head_idx = ty;
-  float m = -5e4, d = 1.f;
+  uint32_t head_idx = blockIdx.y;
+  state_t<vec_size> st;
+  constexpr uint32_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
+  constexpr uint32_t head_dim = vec_size * bdx;
 
-  vec_t<float, vec_size> v_merged_vec;
-  v_merged_vec.fill(0.f);
-#pragma unroll 2
-  for (uint32_t iter = 0; iter < num_index_sets; ++iter) {
-    float s = S[(iter * batch_size + batch_idx) * num_heads + head_idx];
-    vec_t<float, vec_size> v;
-    v.cast_load(V + ((iter * batch_size + batch_idx) * num_heads + head_idx) * head_dim +
-                tx * vec_size);
-    float m_prev = m;
-    m = max(m, s);
-    float o_scale = math::ptx_exp2(m_prev - m);
-    float v_scale = math::ptx_exp2(s - m);
-    d = d * o_scale + v_scale;
+  extern __shared__ uint8_t smem[];
+  DTypeIn* v_smem = (DTypeIn*)smem;
+  float* s_smem = (float*)(smem + num_smem_stages * bdy * head_dim * sizeof(DTypeIn));
+
 #pragma unroll
-    for (uint32_t i = 0; i < vec_size; ++i) {
-      v_merged_vec[i] = v_merged_vec[i] * o_scale + v[i] * v_scale;
+  for (uint32_t iter = 0; iter < num_smem_stages; ++iter) {
+    cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+        v_smem + (iter * bdy + ty) * head_dim + tx * vec_size,
+        V + (((iter * bdy + ty) * batch_size + batch_idx) * num_heads + head_idx) * head_dim +
+            tx * vec_size,
+        (iter * bdy + ty) < num_index_sets);
+    cp_async::commit_group();
+  }
+#pragma unroll 4
+  for (uint32_t iter = 0; iter < ceil_div(num_index_sets, bdy); ++iter) {
+    if (iter % bdx == 0) {
+      s_smem[ty * bdx + tx] =
+          iter * bdy + (ty * bdx + tx) < num_index_sets
+              ? S[((iter * bdy + ty * bdx + tx) * batch_size + batch_idx) * num_heads + head_idx]
+              : 0.f;
+      __syncthreads();
+    }
+    cp_async::wait_group<num_smem_stages - 1>();
+    __syncthreads();
+    vec_t<float, vec_size> v;
+    v.cast_load(v_smem + ((iter % num_smem_stages) * bdy + ty) * head_dim + tx * vec_size);
+    __syncthreads();
+    cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+        v_smem + ((iter % num_smem_stages) * bdy + ty) * head_dim + tx * vec_size,
+        V +
+            ((((iter + num_smem_stages) * bdy + ty) * batch_size + batch_idx) * num_heads +
+             head_idx) *
+                head_dim +
+            tx * vec_size,
+        (iter + num_smem_stages) * bdy + ty < num_index_sets);
+    cp_async::commit_group();
+    if (iter * bdy + ty < num_index_sets) {
+      float s = s_smem[(iter % bdx) * bdy + ty];
+      st.merge(v, s, 1);
     }
   }
+  cp_async::wait_group<0>();
+  __syncthreads();
 
-#pragma unroll
-  for (uint32_t i = 0; i < vec_size; ++i) {
-    v_merged_vec[i] = __fdividef(v_merged_vec[i], d);
-  }
-  v_merged_vec.cast_store(v_merged + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
+  st.normalize();
+  threadblock_sync_state<bdx, bdy, vec_size>(st, v_smem, s_smem);
+  st.normalize();
+
+  st.o.cast_store(v_merged + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
   if (s_merged != nullptr) {
-    s_merged[batch_idx * num_heads + head_idx] = math::ptx_log2(d) + m;
+    s_merged[batch_idx * num_heads + head_idx] = st.get_lse();
   }
 }
 
@@ -252,13 +299,17 @@ cudaError_t MergeStates(DTypeIn* v, float* s, DTypeOut* v_merged, float* s_merge
                         uint32_t head_dim, cudaStream_t stream = nullptr) {
   SWITCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
-    uint32_t bdx = HEAD_DIM / vec_size;
-    uint32_t bdy = num_heads;
-    dim3 nblks(batch_size);
+    constexpr uint32_t num_threads = 128;
+    constexpr uint32_t bdx = HEAD_DIM / vec_size;
+    constexpr uint32_t bdy = num_threads / bdx;
+    dim3 nblks(batch_size, num_heads);
     dim3 nthrs(bdx, bdy);
-    auto kernel = MergeStatesKernel<vec_size, DTypeIn, DTypeOut>;
-    void* args[] = {&v, &s, &v_merged, &s_merged, &num_index_sets, &num_heads, &head_dim};
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+    constexpr uint32_t num_smem_stages = 4;
+    auto kernel = MergeStatesKernel<vec_size, bdx, bdy, num_smem_stages, DTypeIn, DTypeOut>;
+    void* args[] = {&v, &s, &v_merged, &s_merged, &num_index_sets, &num_heads};
+    uint32_t smem_size =
+        num_smem_stages * bdy * head_dim * sizeof(DTypeIn) + num_threads * sizeof(float);
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
   });
   return cudaSuccess;
 }
