@@ -145,15 +145,61 @@ __device__ __forceinline__ void threadblock_sync_state(state_t<vec_size>& st, DT
  * \param head_dim The dimension of each head.
  * \note s are logsumexp values with base 2.
  */
-template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t num_smem_stages, typename DTypeIn,
-          typename DTypeOut>
+template <uint32_t vec_size, typename DTypeIn, typename DTypeOut>
 __global__ void MergeStatesKernel(DTypeIn* __restrict__ V, float* __restrict__ S,
                                   DTypeOut* __restrict__ v_merged, float* __restrict__ s_merged,
-                                  uint32_t num_index_sets, uint32_t num_heads) {
+                                  uint32_t num_index_sets, uint32_t num_heads, uint32_t head_dim) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t batch_size = gridDim.x;
   uint32_t batch_idx = blockIdx.x;
-  uint32_t head_idx = blockIdx.y;
+  uint32_t head_idx = ty;
+  state_t<vec_size> st;
+
+  vec_t<float, vec_size> v_merged_vec;
+  v_merged_vec.fill(0.f);
+#pragma unroll 2
+  for (uint32_t iter = 0; iter < num_index_sets; ++iter) {
+    float s = S[(iter * batch_size + batch_idx) * num_heads + head_idx];
+    vec_t<float, vec_size> v;
+    v.cast_load(V + ((iter * batch_size + batch_idx) * num_heads + head_idx) * head_dim +
+                tx * vec_size);
+    st.merge(v, s, 1);
+  }
+
+  st.normalize();
+  st.o.cast_store(v_merged + (batch_idx * num_heads + head_idx) * head_dim + tx * vec_size);
+  if (s_merged != nullptr) {
+    s_merged[batch_idx * num_heads + head_idx] = st.get_lse();
+  }
+}
+
+/*!
+ * \brief The CUDA kernel that merges self-attention states of a list of index sets,
+ *   accelerated for larget number of index sets.
+ * \param vec_size The vector size used in the kernel.
+ * \param bdx The blockDim.x used in the kernel.
+ * \param bdy The blockDim.y used in the kernel.
+ * \param num_smem_stages The number of stages of shared memory used in the kernel.
+ * \tparam DTypeIn The data type of v.
+ * \tparam DTypeOut The data type of v_merged.
+ * \param v The partial v of index sets. (num_index_sets, n, h, d)
+ * \param s The logsumexp value of index sets. (num_index_sets, n, h)
+ * \param v_merged The merged v of index sets union. (n, h, d)
+ * \param s_merged The merged logsumexp value of index sets union. (n, h)
+ * \param num_heads The number of heads of v.
+ * \param head_dim The dimension of each head.
+ * \note s are logsumexp values with base 2.
+ */
+template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t num_smem_stages, typename DTypeIn,
+          typename DTypeOut>
+__global__ void MergeStatesLargeNumIndexSetsKernel(DTypeIn* __restrict__ V, float* __restrict__ S,
+                                                   DTypeOut* __restrict__ v_merged,
+                                                   float* __restrict__ s_merged,
+                                                   uint32_t num_index_sets, uint32_t num_heads) {
+  uint32_t tx = threadIdx.x, ty = threadIdx.y;
+  uint32_t batch_size = gridDim.y;
+  uint32_t batch_idx = blockIdx.y;
+  uint32_t head_idx = blockIdx.x;
   state_t<vec_size> st;
   constexpr uint32_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
   constexpr uint32_t head_dim = vec_size * bdx;
@@ -299,17 +345,29 @@ cudaError_t MergeStates(DTypeIn* v, float* s, DTypeOut* v_merged, float* s_merge
                         uint32_t head_dim, cudaStream_t stream = nullptr) {
   SWITCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
-    constexpr uint32_t num_threads = 128;
     constexpr uint32_t bdx = HEAD_DIM / vec_size;
-    constexpr uint32_t bdy = num_threads / bdx;
-    dim3 nblks(batch_size, num_heads);
-    dim3 nthrs(bdx, bdy);
-    constexpr uint32_t num_smem_stages = 4;
-    auto kernel = MergeStatesKernel<vec_size, bdx, bdy, num_smem_stages, DTypeIn, DTypeOut>;
-    void* args[] = {&v, &s, &v_merged, &s_merged, &num_index_sets, &num_heads};
-    uint32_t smem_size =
-        num_smem_stages * bdy * head_dim * sizeof(DTypeIn) + num_threads * sizeof(float);
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+    if (num_index_sets > 2 * (128 / bdx)) {
+      constexpr uint32_t num_threads = 128;
+      constexpr uint32_t bdy = num_threads / bdx;
+      dim3 nblks(num_heads, batch_size);
+      dim3 nthrs(bdx, bdy);
+      constexpr uint32_t num_smem_stages = 4;
+      auto kernel = MergeStatesLargeNumIndexSetsKernel<vec_size, bdx, bdy, num_smem_stages, DTypeIn,
+                                                       DTypeOut>;
+      void* args[] = {&v, &s, &v_merged, &s_merged, &num_index_sets, &num_heads};
+      uint32_t smem_size =
+          num_smem_stages * bdy * head_dim * sizeof(DTypeIn) + num_threads * sizeof(float);
+      FLASHINFER_CUDA_CALL(
+          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+    } else {
+      uint32_t bdy = num_heads;
+      dim3 nblks(batch_size);
+      dim3 nthrs(bdx, bdy);
+      auto kernel = MergeStatesKernel<vec_size, DTypeIn, DTypeOut>;
+      void* args[] = {&v, &s, &v_merged, &s_merged, &num_index_sets, &num_heads, &head_dim};
+      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+    }
   });
   return cudaSuccess;
 }
