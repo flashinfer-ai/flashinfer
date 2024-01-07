@@ -235,16 +235,16 @@ def merge_state(
     ----------
     v_a : torch.Tensor
         The attention output from the KV segment A.
-        Shape: [batch_size, num_heads, head_dim]
+        Shape: [seq_len, num_heads, head_dim]
     s_a : torch.Tensor
         The logsumexp value from the KV segment A.
-        Shape: [batch_size, num_heads]
+        Shape: [seq_len, num_heads]
     v_b : torch.Tensor
         The attention output from the KV segment B.
-        Shape: [batch_size, num_heads, head_dim]
+        Shape: [seq_len, num_heads, head_dim]
     s_b : torch.Tensor
         The logsumexp value from the KV segment B.
-        Shape: [batch_size, num_heads]
+        Shape: [seq_len, num_heads]
 
     Returns
     -------
@@ -265,19 +265,19 @@ def merge_states(v: torch.Tensor, s: torch.Tensor):
     ----------
     v : torch.Tensor
         The attention output from the KV segments.
-        Shape: [num_kv_segments, batch_size, num_heads, head_dim]
+        Shape: [num_kv_segments, seq_len, num_heads, head_dim]
     s : torch.Tensor
         The logsumexp value from the KV segments.
-        Shape: [num_kv_segments, batch_size, num_heads]
+        Shape: [num_kv_segments, seq_len, num_heads]
 
     Returns
     -------
     V : torch.Tensor
         The merged attention output.
-        Shape: [batch_size, num_heads, head_dim]
+        Shape: [seq_len, num_heads, head_dim]
     S : torch.Tensor
         The logsumexp value from the merged KV-segments.
-        Shape: [batch_size, num_heads]
+        Shape: [seq_len, num_heads]
     """
     return _kernels.merge_states(v, s)
 
