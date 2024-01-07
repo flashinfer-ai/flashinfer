@@ -1385,7 +1385,7 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
                                     min((num_blocks_per_sm * num_sm) /
                                             (num_kv_heads *
                                              ceil_div(qo_len * group_size, num_rows_per_cta)),
-                                        kv_len / 512);
+                                        kv_len / 256);
 
                                 max_grid_size = num_blocks_per_sm * num_sm;
                                 if (num_chunks > 1) {
@@ -1466,7 +1466,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
       uint32_t num_chunks =
           min((num_blocks_per_sm * num_sm) /
                   (num_kv_heads * ceil_div(qo_len * GROUP_SIZE, num_rows_per_cta)),
-              kv_len / 512);
+              kv_len / 256);
 
       if (num_chunks <= 1 || tmp == nullptr) {
         // Enough parallelism, do not split-kv
