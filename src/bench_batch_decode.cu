@@ -140,7 +140,7 @@ void bench_flashinfer_batch_decode_with_prefill(nvbench::state& state) {
       "Read");
   state.add_global_memory_writes<uint8_t>(vec_bytes(o), "Write");
   BatchPrefillHandler handler;
-  handler.BeginForward(qo_indptr_h.data(), batch_size, num_qo_heads / num_kv_heads);
+  handler.BeginForward(qo_indptr_h.data(), batch_size, num_qo_heads, num_kv_heads);
 
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     cudaError_t status = BatchPrefillWithPagedKVCacheWrapper(
