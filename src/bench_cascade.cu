@@ -67,82 +67,24 @@ void bench_two_level_single_prefix_cascade_decode(nvbench::state& state) {
   const auto head_dim = state.get_int64("head_dim");
 
   constexpr uint32_t page_size = 16;
-  uint32_t num_pages = ((shared_prefix_length + unique_kv_length * batch_size) / page_size);
-  std::vector<T> shared_k_h(shared_prefix_length * num_kv_heads * head_dim);
-  std::vector<T> shared_v_h(shared_prefix_length * num_kv_heads * head_dim);
-  std::vector<T> q_h(batch_size * num_qo_heads * head_dim);
 
-  utils::vec_normal_(shared_k_h);
-  utils::vec_normal_(shared_v_h);
-  utils::vec_normal_(q_h);
+  std::vector<std::vector<T>> testcase_float_data;
+  std::vector<std::vector<int32_t>> testcase_int_data;
+  std::tie(testcase_float_data, testcase_int_data) = utils::create_shared_prefix_testcase_data<T>(
+      batch_size, shared_prefix_length, unique_kv_length,
+      /*qo_append_length=*/1, num_qo_heads, num_kv_heads, head_dim, page_size);
 
-  std::vector<int32_t> kv_indptr_combined_h{0};
-  std::vector<int32_t> kv_indptr_unique_h{0};
-  std::vector<int32_t> kv_last_page_len_combined_h;
-  std::vector<int32_t> kv_last_page_len_unique_h;
+  std::vector<T> q_h = std::move(testcase_float_data[0]),
+                 shared_k_h = std::move(testcase_float_data[1]),
+                 shared_v_h = std::move(testcase_float_data[2]),
+                 kv_data_h = std::move(testcase_float_data[3]);
 
-  for (uint32_t request_id = 0; request_id < batch_size; ++request_id) {
-    kv_indptr_combined_h.push_back(kv_indptr_combined_h.back() +
-                                   (shared_prefix_length + unique_kv_length) / page_size);
-    kv_indptr_unique_h.push_back(kv_indptr_unique_h.back() + unique_kv_length / page_size);
-    kv_last_page_len_combined_h.push_back(page_size);
-    kv_last_page_len_unique_h.push_back(page_size);
-  }
-
-  std::vector<int32_t> kv_indices_combined(kv_indptr_combined_h.back());
-  std::vector<int32_t> kv_indices_unique(kv_indptr_unique_h.back());
-
-  std::vector<T> kv_data_h(num_pages * 2 * num_kv_heads * page_size * head_dim);
-  uint32_t page_id = 0;
-
-  for (; page_id < (shared_prefix_length / page_size); page_id++) {
-    for (uint32_t entry_idx = 0; entry_idx < page_size; entry_idx++) {
-      for (uint32_t head_idx = 0; head_idx < num_kv_heads; head_idx++) {
-        std::copy(
-            shared_k_h.begin() +
-                ((page_id * page_size + entry_idx) * num_kv_heads + head_idx) * head_dim,
-            shared_k_h.begin() +
-                ((page_id * page_size + entry_idx) * num_kv_heads + head_idx + 1) * head_dim,
-            kv_data_h.begin() +
-                (((page_id * 2 + 0) * num_kv_heads + head_idx) * page_size + entry_idx) * head_dim);
-        std::copy(
-            shared_v_h.begin() +
-                ((page_id * page_size + entry_idx) * num_kv_heads + head_idx) * head_dim,
-            shared_v_h.begin() +
-                ((page_id * page_size + entry_idx) * num_kv_heads + head_idx + 1) * head_dim,
-            kv_data_h.begin() +
-                (((page_id * 2 + 1) * num_kv_heads + head_idx) * page_size + entry_idx) * head_dim);
-      }
-    }
-    for (uint32_t request_id = 0; request_id < batch_size; ++request_id) {
-      kv_indices_combined[request_id * ((shared_prefix_length + unique_kv_length) / page_size) +
-                          page_id] = page_id;
-    }
-  }
-
-  for (uint32_t request_id = 0; request_id < batch_size; ++request_id) {
-    for (uint32_t page_iter = 0; page_iter < (unique_kv_length / page_size);
-         ++page_iter, ++page_id) {
-      for (uint32_t entry_idx = 0; entry_idx < page_size; entry_idx++) {
-        for (uint32_t head_idx = 0; head_idx < num_kv_heads; head_idx++) {
-          std::vector<T> k(head_dim), v(head_dim);
-          utils::vec_normal_(k);
-          utils::vec_normal_(v);
-          std::copy(k.begin(), k.end(),
-                    kv_data_h.begin() +
-                        (((page_id * 2 + 0) * num_kv_heads + head_idx) * page_size + entry_idx) *
-                            head_dim);
-          std::copy(v.begin(), v.end(),
-                    kv_data_h.begin() +
-                        (((page_id * 2 + 1) * num_kv_heads + head_idx) * page_size + entry_idx) *
-                            head_dim);
-        }
-      }
-      kv_indices_combined[request_id * ((shared_prefix_length + unique_kv_length) / page_size) +
-                          (shared_prefix_length / page_size) + page_iter] = page_id;
-      kv_indices_unique[request_id * (unique_kv_length / page_size) + page_iter] = page_id;
-    }
-  }
+  std::vector<int32_t> kv_indices_combined_h = std::move(testcase_int_data[1]),
+                       kv_indices_unique_h = std::move(testcase_int_data[2]),
+                       kv_indptr_combined_h = std::move(testcase_int_data[3]),
+                       kv_indptr_unique_h = std::move(testcase_int_data[4]),
+                       kv_last_page_len_combined_h = std::move(testcase_int_data[5]),
+                       kv_last_page_len_unique_h = std::move(testcase_int_data[6]);
 
   thrust::device_vector<T> kv_data_d(kv_data_h);
   thrust::device_vector<T> q_d(q_h);
@@ -152,16 +94,13 @@ void bench_two_level_single_prefix_cascade_decode(nvbench::state& state) {
   state.add_global_memory_writes<T>(q_h.size(), "Write");
 
   if (use_cascade) {
-    thrust::device_vector<T> shared_k_d(shared_k_h);
-    thrust::device_vector<T> shared_v_d(shared_v_h);
-    thrust::device_vector<T> o_cascade_0_d(q_h.size());
-    thrust::device_vector<T> o_cascade_1_d(q_h.size());
-    thrust::device_vector<float> tmp_0_d(8 * 1024 * 1024);
-    thrust::device_vector<float> lse_cascade_0_d(batch_size * num_qo_heads);
-    thrust::device_vector<float> lse_cascade_1_d(batch_size * num_qo_heads);
-    thrust::device_vector<int32_t> kv_indptr_unique_d(kv_indptr_unique_h);
-    thrust::device_vector<int32_t> kv_indices_unique_d(kv_indices_unique);
-    thrust::device_vector<int32_t> kv_last_page_len_unique_d(kv_last_page_len_unique_h);
+    thrust::device_vector<T> shared_k_d(shared_k_h), shared_v_d(shared_v_h),
+        o_cascade_0_d(q_h.size()), o_cascade_1_d(q_h.size());
+    thrust::device_vector<float> tmp_0_d(8 * 1024 * 1024),
+        lse_cascade_0_d(batch_size * num_qo_heads), lse_cascade_1_d(batch_size * num_qo_heads);
+    thrust::device_vector<int32_t> kv_indptr_unique_d(kv_indptr_unique_h),
+        kv_indices_unique_d(kv_indices_unique_h),
+        kv_last_page_len_unique_d(kv_last_page_len_unique_h);
     paged_kv_t<page_storage, T, int32_t> paged_kv_casacde_d(
         num_kv_heads, page_size, head_dim, batch_size, thrust::raw_pointer_cast(kv_data_d.data()),
         thrust::raw_pointer_cast(kv_indices_unique_d.data()),
@@ -213,9 +152,9 @@ void bench_two_level_single_prefix_cascade_decode(nvbench::state& state) {
     });
   } else {
     thrust::device_vector<T> o_baseline_d(q_h.size());
-    thrust::device_vector<int32_t> kv_indptr_combined_d(kv_indptr_combined_h);
-    thrust::device_vector<int32_t> kv_indices_combined_d(kv_indices_combined);
-    thrust::device_vector<int32_t> kv_last_page_len_combined_d(kv_last_page_len_combined_h);
+    thrust::device_vector<int32_t> kv_indptr_combined_d(kv_indptr_combined_h),
+        kv_indices_combined_d(kv_indices_combined_h),
+        kv_last_page_len_combined_d(kv_last_page_len_combined_h);
     paged_kv_t<page_storage, T, int32_t> paged_kv_baseline_d(
         num_kv_heads, page_size, head_dim, batch_size, thrust::raw_pointer_cast(kv_data_d.data()),
         thrust::raw_pointer_cast(kv_indices_combined_d.data()),
@@ -234,6 +173,132 @@ void bench_two_level_single_prefix_cascade_decode(nvbench::state& state) {
           /*lse=*/nullptr, num_qo_heads, RotaryMode::kNone);
       if (status != cudaSuccess) {
         state.skip("Cascade implementation decode failed with error: " +
+                   std::string(cudaGetErrorString(status)));
+      }
+      timer.stop();
+    });
+  }
+}
+
+template <typename T>
+void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
+  const auto batch_size = state.get_int64("batch_size");
+  const auto shared_prefix_length = state.get_int64("shared_prefix_length");
+  const auto unique_kv_length = state.get_int64("unique_kv_length");
+  const auto qo_append_length = state.get_int64("qo_append_length");
+  const auto num_kv_heads = state.get_int64("num_kv_heads");
+  const auto num_qo_heads = state.get_int64("num_qo_heads");
+  const auto use_cascade = state.get_int64("use_cascade");
+  const auto head_dim = state.get_int64("head_dim");
+
+  constexpr uint32_t page_size = 16;
+
+  std::vector<std::vector<T>> testcase_float_data;
+  std::vector<std::vector<int32_t>> testcase_int_data;
+  std::tie(testcase_float_data, testcase_int_data) = utils::create_shared_prefix_testcase_data<T>(
+      batch_size, shared_prefix_length, unique_kv_length, qo_append_length, num_qo_heads,
+      num_kv_heads, head_dim, page_size);
+
+  std::vector<T> q_h = std::move(testcase_float_data[0]),
+                 shared_k_h = std::move(testcase_float_data[1]),
+                 shared_v_h = std::move(testcase_float_data[2]),
+                 kv_data_h = std::move(testcase_float_data[3]);
+
+  std::vector<int32_t> qo_indptr_h = std::move(testcase_int_data[0]),
+                       kv_indices_combined_h = std::move(testcase_int_data[1]),
+                       kv_indices_unique_h = std::move(testcase_int_data[2]),
+                       kv_indptr_combined_h = std::move(testcase_int_data[3]),
+                       kv_indptr_unique_h = std::move(testcase_int_data[4]),
+                       kv_last_page_len_combined_h = std::move(testcase_int_data[5]),
+                       kv_last_page_len_unique_h = std::move(testcase_int_data[6]);
+
+  thrust::device_vector<T> kv_data_d(kv_data_h);
+  thrust::device_vector<T> q_d(q_h);
+  thrust::device_vector<int32_t> qo_indptr_d(qo_indptr_h);
+  constexpr PageStorage page_storage = PageStorage::kIndices;
+
+  state.add_global_memory_reads<T>(kv_data_h.size() + q_h.size(), "Read");
+  state.add_global_memory_writes<T>(q_h.size(), "Write");
+
+  if (use_cascade) {
+    thrust::device_vector<T> shared_k_d(shared_k_h), shared_v_d(shared_v_h),
+        o_cascade_0_d(q_h.size()), o_cascade_1_d(q_h.size());
+    thrust::device_vector<float> tmp_0_d(8 * 1024 * 1024),
+        lse_cascade_0_d((batch_size * qo_append_length) * num_qo_heads),
+        lse_cascade_1_d((batch_size * qo_append_length) * num_qo_heads);
+    thrust::device_vector<int32_t> kv_indptr_unique_d(kv_indptr_unique_h),
+        kv_indices_unique_d(kv_indices_unique_h),
+        kv_last_page_len_unique_d(kv_last_page_len_unique_h);
+    paged_kv_t<page_storage, T, int32_t> paged_kv_casacde_d(
+        num_kv_heads, page_size, head_dim, batch_size, thrust::raw_pointer_cast(kv_data_d.data()),
+        thrust::raw_pointer_cast(kv_indices_unique_d.data()),
+        thrust::raw_pointer_cast(kv_indptr_unique_d.data()),
+        thrust::raw_pointer_cast(kv_last_page_len_unique_d.data()));
+    BatchPrefillHandler cascade_handler;
+    cascade_handler.BeginForward(qo_indptr_h.data(), batch_size, num_qo_heads / num_kv_heads);
+    state.exec(nvbench::exec_tag::timer, [&](nvbench::launch& launch, auto& timer) {
+      timer.start();
+      cudaError_t status = SinglePrefillWithKVCache(
+          thrust::raw_pointer_cast(q_d.data()), thrust::raw_pointer_cast(shared_k_d.data()),
+          thrust::raw_pointer_cast(shared_v_d.data()),
+          thrust::raw_pointer_cast(o_cascade_0_d.data()), thrust::raw_pointer_cast(tmp_0_d.data()),
+          thrust::raw_pointer_cast(lse_cascade_0_d.data()), num_qo_heads, num_kv_heads,
+          /*qo_len=*/batch_size * qo_append_length,
+          /*kv_len=*/shared_prefix_length, head_dim,
+          /*causal=*/false, /*layout=*/QKVLayout::kNHD,
+          /*rotary_mode=*/RotaryMode::kNone, /*allow_fp16_qk_reduction=*/false);
+
+      if (status != cudaSuccess) {
+        state.skip("Cascade implementation prefill failed with error: " +
+                   std::string(cudaGetErrorString(status)));
+      }
+
+      status = BatchPrefillWithPagedKVCacheWrapper<page_storage, T, T, int32_t>(
+          &cascade_handler, thrust::raw_pointer_cast(q_d.data()),
+          thrust::raw_pointer_cast(qo_indptr_d.data()), paged_kv_casacde_d,
+          thrust::raw_pointer_cast(o_cascade_1_d.data()),
+          thrust::raw_pointer_cast(lse_cascade_1_d.data()), num_qo_heads, /*causal=*/true,
+          RotaryMode::kNone, /*allow_fp16_qk_reduction=*/false);
+
+      if (status != cudaSuccess) {
+        state.skip("Cascade implementation unique kv prefill failed with error: " +
+                   std::string(cudaGetErrorString(status)));
+      }
+
+      status = MergeStateInPlace(thrust::raw_pointer_cast(o_cascade_0_d.data()),
+                                 thrust::raw_pointer_cast(lse_cascade_0_d.data()),
+                                 thrust::raw_pointer_cast(o_cascade_1_d.data()),
+                                 thrust::raw_pointer_cast(lse_cascade_1_d.data()), batch_size,
+                                 num_qo_heads, head_dim);
+      if (status != cudaSuccess) {
+        state.skip("Cascade implementation merge failed with error: " +
+                   std::string(cudaGetErrorString(status)));
+      }
+      timer.stop();
+    });
+  } else {
+    thrust::device_vector<T> o_baseline_d(q_h.size());
+    thrust::device_vector<int32_t> kv_indptr_combined_d(kv_indptr_combined_h),
+        kv_indices_combined_d(kv_indices_combined_h),
+        kv_last_page_len_combined_d(kv_last_page_len_combined_h);
+    paged_kv_t<page_storage, T, int32_t> paged_kv_baseline_d(
+        num_kv_heads, page_size, head_dim, batch_size, thrust::raw_pointer_cast(kv_data_d.data()),
+        thrust::raw_pointer_cast(kv_indices_combined_d.data()),
+        thrust::raw_pointer_cast(kv_indptr_combined_d.data()),
+        thrust::raw_pointer_cast(kv_last_page_len_combined_d.data()));
+    BatchPrefillHandler baseline_handler;
+    baseline_handler.BeginForward(qo_indptr_h.data(), batch_size, num_qo_heads / num_kv_heads);
+    state.exec(nvbench::exec_tag::timer, [&](nvbench::launch& launch, auto& timer) {
+      timer.start();
+      cudaError_t status = BatchPrefillWithPagedKVCacheWrapper<page_storage, T, T, int32_t>(
+          &baseline_handler, thrust::raw_pointer_cast(q_d.data()),
+          thrust::raw_pointer_cast(qo_indptr_d.data()), paged_kv_baseline_d,
+          thrust::raw_pointer_cast(o_baseline_d.data()),
+          /*lse=*/nullptr, num_qo_heads, /*causal=*/true, RotaryMode::kNone,
+          /*allow_fp16_qk_reduction=*/false);
+
+      if (status != cudaSuccess) {
+        state.skip("Baseline implementation failed with error: " +
                    std::string(cudaGetErrorString(status)));
       }
       timer.stop();
@@ -265,5 +330,20 @@ void bench_two_level_single_prefix_cascade_decode(nvbench::state& state) {
       .add_int64_axis("use_cascade", {1, 0})                                    \
       .add_int64_axis("head_dim", {128})
 
+#define BENCH_FLASHINFER_TWO_LEVEL_SINGLE_PREFIX_CASCADE_APPEND_KERNELS(T)      \
+  auto bench_flashinfer_two_level_single_prefix_cascade_append_##T##_ =         \
+      bench_two_level_single_prefix_cascade_append<T>;                          \
+  NVBENCH_BENCH(bench_flashinfer_two_level_single_prefix_cascade_append_##T##_) \
+      .set_name("flashinfer_two_level_single_prefix_cascade_append_" STR(T))    \
+      .add_int64_axis("batch_size", {1, 8, 16, 64, 128, 256})                   \
+      .add_int64_axis("shared_prefix_length", {1024, 2048, 8192, 32768})        \
+      .add_int64_axis("unique_kv_length", {128, 256, 512, 1024, 2048})          \
+      .add_int64_axis("qo_append_length", {128})                                \
+      .add_int64_axis("num_kv_heads", {32})                                     \
+      .add_int64_axis("num_qo_heads", {32})                                     \
+      .add_int64_axis("use_cascade", {1, 0})                                    \
+      .add_int64_axis("head_dim", {128})
+
 BENCH_FLASHINFER_MERGE_KERNELS(half);
 BENCH_FLASHINFER_TWO_LEVEL_SINGLE_PREFIX_CASCADE_DECODE_KERNELS(half);
+BENCH_FLASHINFER_TWO_LEVEL_SINGLE_PREFIX_CASCADE_APPEND_KERNELS(half);
