@@ -268,8 +268,8 @@ void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
       status = MergeStateInPlace(thrust::raw_pointer_cast(o_cascade_0_d.data()),
                                  thrust::raw_pointer_cast(lse_cascade_0_d.data()),
                                  thrust::raw_pointer_cast(o_cascade_1_d.data()),
-                                 thrust::raw_pointer_cast(lse_cascade_1_d.data()), batch_size,
-                                 num_qo_heads, head_dim);
+                                 thrust::raw_pointer_cast(lse_cascade_1_d.data()),
+                                 batch_size * qo_append_length, num_qo_heads, head_dim);
       if (status != cudaSuccess) {
         state.skip("Cascade implementation merge failed with error: " +
                    std::string(cudaGetErrorString(status)));
