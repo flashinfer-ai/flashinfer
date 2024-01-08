@@ -732,15 +732,18 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
       st_global.o.cast_store(
           o + (paged_kv.batch_idx_map()[batch_idx] * num_qo_heads + qo_head_idx) * head_dim +
           tx * vec_size);
+      // write lse
+      if (lse != nullptr) {
+        lse[batch_idx * num_qo_heads + qo_head_idx] = st_global.get_lse();
+      }
     }
   } else {
     st.normalize();
     st.o.cast_store(o + (batch_idx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
-  }
-
-  // write lse
-  if (lse != nullptr) {
-    lse[batch_idx * num_qo_heads + qo_head_idx] = st.get_lse();
+    // write lse
+    if (lse != nullptr) {
+      lse[batch_idx * num_qo_heads + qo_head_idx] = st.get_lse();
+    }
   }
 }
 
