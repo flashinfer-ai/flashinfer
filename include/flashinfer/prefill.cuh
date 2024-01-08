@@ -1732,7 +1732,6 @@ cudaError_t BatchPrefillWithPagedKVCacheFallbackDispatched(
   const uint32_t head_dim = paged_kv.head_dim;
   const uint32_t batch_size = paged_kv.batch_size;
 
-  std::vector<IdType> qo_indptr_h(paged_kv.batch_size + 1);
   std::vector<IdType> kv_indptr_h(paged_kv.batch_size + 1);
 
   FLASHINFER_CUDA_CALL(PagedKVCacheToRaggedTensorComputeIndptr(paged_kv, kv_indptr_h, stream));
@@ -1745,15 +1744,10 @@ cudaError_t BatchPrefillWithPagedKVCacheFallbackDispatched(
   FLASHINFER_CUDA_CALL(
       cudaMallocAsync(&values, nnz * num_kv_heads * head_dim * sizeof(DTypeIn), stream));
   FLASHINFER_CUDA_CALL(cudaMallocAsync(&kv_indptr, (batch_size + 1) * sizeof(IdType), stream));
-  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(qo_indptr_h.data(), qo_indptr,
-                                       sizeof(IdType) * (paged_kv.batch_size + 1),
-                                       cudaMemcpyDeviceToHost, stream));
   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(kv_indptr, kv_indptr_h.data(),
                                        sizeof(IdType) * (paged_kv.batch_size + 1),
                                        cudaMemcpyHostToDevice, stream));
-  FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
   FLASHINFER_CUDA_CALL(PagedKVCacheToRaggedTensor(paged_kv, keys, values, kv_indptr, stream));
-  FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
 
   BatchPrefillWithRaggedKVCacheDispatched<num_frags_x, GROUP_SIZE, HEAD_DIM, LAYOUT, ROTARY_MODE,
                                           ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut,
@@ -1764,7 +1758,6 @@ cudaError_t BatchPrefillWithPagedKVCacheFallbackDispatched(
   FLASHINFER_CUDA_CALL(cudaFreeAsync(keys, stream));
   FLASHINFER_CUDA_CALL(cudaFreeAsync(values, stream));
   FLASHINFER_CUDA_CALL(cudaFreeAsync(kv_indptr, stream));
-  FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
 
   return cudaSuccess;
 }
