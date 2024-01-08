@@ -981,15 +981,12 @@ cudaError_t SplitPagedCacheKVComputeAuxiliaryInfo(
     FLASHINFER_CUDA_CALL(cudaMemcpyAsync(old_indptr_h.data(), old_indptr,
                                          sizeof(IdType) * (old_batch_size + 1),
                                          cudaMemcpyDeviceToHost, stream));
-  } else {
-    old_indptr_h.assign(old_indptr, old_indptr + old_batch_size + 1);
-  }
-  if (is_device_ptr(old_last_page_len)) {
     FLASHINFER_CUDA_CALL(cudaMemcpyAsync(old_last_page_len_h.data(), old_last_page_len,
                                          sizeof(IdType) * old_batch_size, cudaMemcpyDeviceToHost,
                                          stream));
     FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
   } else {
+    old_indptr_h.assign(old_indptr, old_indptr + old_batch_size + 1);
     old_last_page_len_h.assign(old_last_page_len, old_last_page_len + old_batch_size);
   }
 

@@ -507,14 +507,18 @@ cudaError_t PagedKVCacheToRaggedTensorComputeIndptr(
   std::vector<IdType> paged_kv_indptr_host(batch_size + 1), paged_kv_last_page_len_host(batch_size);
   kv_indptr_host.resize(batch_size + 1);
 
-  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(paged_kv_indptr_host.data(), paged_kv.indptr,
-                                       sizeof(IdType) * (batch_size + 1), cudaMemcpyDeviceToHost,
-                                       stream));
-  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(paged_kv_last_page_len_host.data(), paged_kv.last_page_len,
-                                       sizeof(IdType) * batch_size, cudaMemcpyDeviceToHost,
-                                       stream));
-
-  FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
+  if (is_device_ptr(paged_kv.indptr)) {
+    FLASHINFER_CUDA_CALL(cudaMemcpyAsync(paged_kv_indptr_host.data(), paged_kv.indptr,
+                                         sizeof(IdType) * (batch_size + 1), cudaMemcpyDeviceToHost,
+                                         stream));
+    FLASHINFER_CUDA_CALL(cudaMemcpyAsync(paged_kv_last_page_len_host.data(), paged_kv.last_page_len,
+                                         sizeof(IdType) * batch_size, cudaMemcpyDeviceToHost,
+                                         stream));
+    FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
+  } else {
+    paged_kv_indptr_host.assign(paged_kv.indptr, paged_kv.indptr + batch_size + 1);
+    paged_kv_last_page_len_host.assign(paged_kv.last_page_len, paged_kv.last_page_len + batch_size);
+  }
 
   kv_indptr_host[0] = 0;
   for (uint32_t i = 0; i < batch_size; ++i) {
