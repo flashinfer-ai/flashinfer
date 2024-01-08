@@ -16,6 +16,8 @@
 #include <thrust/device_vector.h>
 
 #include <flashinfer/cascade.cuh>
+#include <flashinfer/prefill.cuh>
+#include <flashinfer/decode.cuh>
 #include <nvbench/nvbench.cuh>
 
 #include "utils.h"
@@ -51,6 +53,18 @@ void bench_merge_states(nvbench::state& state) {
   });
 }
 
+template <typename T>
+void bench_two_level_single_prefix_cascade_decode(nvbench::state& state) {
+  const auto batch_size = state.get_int64("batch_size");
+  const auto shared_prefix_length = state.get_int64("shared_prefix_length");
+  const auto unique_kv_length = state.get_int64("unique_kv_length");
+  const auto num_kv_heads = state.get_int64("num_kv_heads");
+  const auto num_qo_heads = state.get_int64("num_qo_heads");
+  const auto use_cascade = state.get_int64("use_cascade");
+  const auto head_dim = state.get_int64("head_dim");
+
+}
+
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
 #define BENCH_FLASHINFER_MERGE_KERNELS(T)                               \
@@ -59,7 +73,21 @@ void bench_merge_states(nvbench::state& state) {
       .set_name("flashinfer_merge_states_" STR(T))                      \
       .add_int64_axis("num_index_sets", {2, 16, 64, 128, 256})          \
       .add_int64_axis("batch_size", {1, 2, 4, 8, 16, 32, 64, 128, 256}) \
-      .add_int64_axis("num_heads", {32})                                \
+      .add_int64_axis("num_kv_heads", {32})                             \
+      .add_int64_axis("head_dim", {128})
+
+#define BENCH_FLASHINFER_TWO_LEVEL_SINGLE_PREFIX_CASCADE_DECODE_KERNELS(T)      \
+  auto bench_flashinfer_two_level_single_prefix_cascade_decode_##T##_ =         \
+      bench_two_level_single_prefix_cascade_decode<T>;                          \
+  NVBENCH_BENCH(bench_flashinfer_two_level_single_prefix_cascade_decode_##T##_) \
+      .set_name("flashinfer_two_level_single_prefix_cascade_decode_" STR(T))    \
+      .add_int64_axis("batch_size", {1, 8, 16, 64, 128, 256})                   \
+      .add_int64_axis("shared_prefix_length", {1024, 2048, 8192, 32768})        \
+      .add_int64_axis("unique_kv_length", {128, 256, 512, 1024, 2048})          \
+      .add_int64_axis("num_kv_heads", {32})                                     \
+      .add_int64_axis("num_qo_heads", {32})                                     \
+      .add_int64_axis("use_cascade", {1, 0})                                    \
       .add_int64_axis("head_dim", {128})
 
 BENCH_FLASHINFER_MERGE_KERNELS(half);
+BENCH_FLASHINFER_TWO_LEVEL_SINGLE_PREFIX_CASCADE_DECODE_KERNELS(half);
