@@ -282,8 +282,8 @@ void _TestTwoLevelSinglePrefixCascadeAppendCorrectness(size_t batch_size,
       thrust::raw_pointer_cast(kv_last_page_len_unique_d.data()));
 
   BatchPrefillHandler baseline_handler, cascade_handler;
-  baseline_handler.BeginForward(qo_indptr_h.data(), batch_size, num_qo_heads / num_kv_heads);
-  cascade_handler.BeginForward(qo_indptr_h.data(), batch_size, num_qo_heads / num_kv_heads);
+  baseline_handler.BeginForward(qo_indptr_h.data(), batch_size, num_qo_heads, num_kv_heads);
+  cascade_handler.BeginForward(qo_indptr_h.data(), batch_size, num_qo_heads, num_kv_heads);
 
   cudaError_t status = BatchPrefillWithPagedKVCacheWrapper<page_storage, T, T, int32_t>(
       &baseline_handler, thrust::raw_pointer_cast(q_d.data()),

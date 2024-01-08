@@ -167,7 +167,13 @@ class BatchPrefillHandler {
   bool IsForwardStarted() const { return request_indices_ != nullptr; }
 
   template <typename IdType>
-  cudaError_t BeginForward(IdType* qo_indptr, uint32_t batch_size, uint32_t gqa_group_size) {
+  cudaError_t BeginForward(IdType* qo_indptr, uint32_t batch_size, uint32_t num_qo_heads,
+                           uint32_t num_kv_heads) {
+    if (num_qo_heads % num_kv_heads != 0) {
+      std::cerr << "num_qo_heads should be divisible by num_kv_heads" << std::endl;
+      abort();
+    }
+    uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
     std::vector<IdType> request_indices_h, tile_indices_h;
     std::tie(num_frags_x_, num_qo_tiles_, request_indices_h, tile_indices_h) =
         split_qo_indptr(qo_indptr, batch_size, gqa_group_size, stream_);

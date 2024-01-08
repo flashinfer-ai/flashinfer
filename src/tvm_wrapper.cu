@@ -307,10 +307,9 @@ void _FlashInferAttentionPrefillWithPagedKVCacheBeginForward(int64_t handler_idx
                                                              int64_t num_qo_heads,
                                                              int64_t num_kv_heads) {
   CHECK(handler_idx < max_num_handlers) << "The handler id must be less than " << max_num_handlers;
-  const uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
   SWITCH_TVM_CUDA_IDTYPE(qo_indptr->dtype, dtype_idx, {
     cudaError_t status = batch_prefill_paged_kv_handlers[handler_idx].BeginForward(
-        static_cast<dtype_idx*>(qo_indptr->data), batch_size, gqa_group_size);
+        static_cast<dtype_idx*>(qo_indptr->data), batch_size, num_qo_heads, num_kv_heads);
     if (status != cudaSuccess) {
       LOG(FATAL) << "FlashInfer prefill BeginForward error " << cudaGetErrorString(status);
     }
@@ -537,10 +536,9 @@ void _FlashInferAttentionPrefillWithRaggedKVCacheBeginForward(DLTensor* qo_indpt
                                                               int64_t batch_size,
                                                               int64_t num_qo_heads,
                                                               int64_t num_kv_heads) {
-  const uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
   SWITCH_TVM_CUDA_IDTYPE(qo_indptr->dtype, dtype_idx, {
     cudaError_t status = batch_prefill_ragged_kv_handler.BeginForward(
-        static_cast<dtype_idx*>(qo_indptr->data), batch_size, gqa_group_size);
+        static_cast<dtype_idx*>(qo_indptr->data), batch_size, num_qo_heads, num_kv_heads);
     if (status != cudaSuccess) {
       LOG(FATAL) << "FlashInfer PrefillWithRaggedKVCache BeginForward error "
                  << cudaGetErrorString(status);

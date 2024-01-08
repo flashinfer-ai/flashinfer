@@ -91,7 +91,7 @@ void BatchPrefillWithPagedKVCachePyTorchWrapper::BeginForward(torch::Tensor qo_i
   CHECK_EQ(qo_indptr.scalar_type(), torch::kInt32);
 
   cudaError_t status = handler_.BeginForward(static_cast<int32_t*>(qo_indptr.data_ptr()),
-                                             batch_size, num_qo_heads / num_kv_heads);
+                                             batch_size, num_qo_heads, num_kv_heads);
   TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithPagedKVCache failed with error ",
               cudaGetErrorString(status));
 }
