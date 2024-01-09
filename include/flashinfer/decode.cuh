@@ -160,35 +160,29 @@ __device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, f
   constexpr uint32_t head_dim = bdx * vec_size;
   auto block = cg::this_thread_block();
   uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
-  if constexpr (sync_range == SyncRange::kSyncBdz && bdz > 1) {
-    if constexpr (bdz > 1) {
-      st.o.store(smem + (tz * bdy + ty) * head_dim + tx * vec_size);
-      smem_md[(tz * bdy + ty) * 2] = st.m;
-      smem_md[(tz * bdy + ty) * 2 + 1] = st.d;
-      block.sync();
-      st.init();
+  st.o.store(smem + (tz * bdy + ty) * head_dim + tx * vec_size);
+  smem_md[(tz * bdy + ty) * 2] = st.m;
+  smem_md[(tz * bdy + ty) * 2 + 1] = st.d;
+  block.sync();
+  st.init();
+  if constexpr (sync_range == SyncRange::kSyncBdz) {
 #pragma unroll
-      for (uint32_t j = 0; j < bdz; ++j) {
-        float m = smem_md[(j * bdy + ty) * 2], d = smem_md[(j * bdy + ty) * 2 + 1];
-        vec_t<float, vec_size> o;
-        o.load(smem + (j * bdy + ty) * head_dim + tx * vec_size);
-        st.merge(o, m, d);
-      }
-    } else if constexpr (sync_range == SyncRange::kSyncBdyBdz && bdy * bdz > 1) {
-      st.o.store(smem + (tz * bdy + ty) * head_dim + tx * vec_size);
-      smem_md[(tz * bdy + ty) * 2] = st.m;
-      smem_md[(tz * bdy + ty) * 2 + 1] = st.d;
-      block.sync();
-      st.init();
+    for (uint32_t j = 0; j < bdz; ++j) {
+      float m = smem_md[(j * bdy + ty) * 2], d = smem_md[(j * bdy + ty) * 2 + 1];
+      vec_t<float, vec_size> o;
+      o.load(smem + (j * bdy + ty) * head_dim + tx * vec_size);
+      st.merge(o, m, d);
+    }
+  } else if constexpr (sync_range == SyncRange::kSyncBdyBdz) {
 #pragma unroll
-      for (uint32_t j = 0; j < bdy * bdz; ++j) {
-        float m = smem_md[j * 2], d = smem_md[j * 2 + 1];
-        vec_t<float, vec_size> o;
-        o.load(smem + j * head_dim + tx * vec_size);
-        st.merge(o, m, d);
-      }
+    for (uint32_t j = 0; j < bdy * bdz; ++j) {
+      float m = smem_md[j * 2], d = smem_md[j * 2 + 1];
+      vec_t<float, vec_size> o;
+      o.load(smem + j * head_dim + tx * vec_size);
+      st.merge(o, m, d);
     }
   }
+}
 
 }  // namespace
 
