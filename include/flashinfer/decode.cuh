@@ -379,9 +379,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
         sync_state<vec_size, bdx, bdy, bdz, SyncRange::kSyncBdyBdz>(
             st_global, reinterpret_cast<float*>(smem), smem_md);
         st_global.normalize();
-        if (bdy == 0 && bdz == 0) {
-          st_global.o.cast_store(o + info.get_qo_elem_offset(0, qo_head_idx, tx * vec_size));
-        }
+        st_global.o.cast_store(o + info.get_qo_elem_offset(0, qo_head_idx, tx * vec_size));
       }
     }
   } else {
@@ -781,7 +779,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
  * \param sizeof_dtype The size (in terms of bytes) of the input data type
  */
 constexpr uint32_t get_heuristic_num_threads(uint32_t group_size, uint32_t sizeof_dtype) {
-  if (group_size == 8U) {
+  if (group_size > 1U) {
     if (sizeof_dtype == 1U) {
       return 256U;  // not enough registers for 512 threads
     } else {
@@ -816,7 +814,7 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& 
                                                   RotaryMode rotary_mode = RotaryMode::kNone,
                                                   cudaStream_t stream = nullptr) {
   const uint32_t GROUP_SIZE = num_qo_heads / num_kv_heads;
-  if (seq_len <= 128U / uint32_t(std::sqrt(GROUP_SIZE))) {
+  if (seq_len < 128U) {
     tmp_size = 0;
   } else {
     SWITCH_GQA_GROUP_SIZE(
@@ -917,7 +915,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                 const uint32_t smem_size = 2U * num_stages_smem * bdy * tile_size_per_bdx * bdz *
                                                head_dim * sizeof(DTypeIn) +
                                            2U * bdy * bdz * sizeof(float);
-                if (seq_len <= 256 || tmp == nullptr) {
+                if (seq_len < 128 || tmp == nullptr) {
                   // no need to use cooperative kernel
                   auto kernel =
                       SingleDecodeWithKVCacheKernel<QKV_LAYOUT, /*cooperative=*/false, ROTARY_MODE,
@@ -959,7 +957,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                       &num_blocks_per_sm, kernel, num_threads, smem_size));
                   uint32_t max_grid_size = uint32_t(num_blocks_per_sm) * uint32_t(num_sm);
                   uint32_t max_num_kv_chunks = max_grid_size / num_kv_heads;
-                  uint32_t kv_chunk_size = max(ceil_div(seq_len, max_num_kv_chunks), 256);
+                  uint32_t kv_chunk_size = max(ceil_div(seq_len, max_num_kv_chunks), 16);
                   dim3 nblks = dim3(ceil_div(seq_len, kv_chunk_size), num_kv_heads);
                   if (nblks.x == 0 || nblks.y == 0) {
                     std::cerr << "Invalid kernel configuration: nblks=(" << nblks.x << ","
