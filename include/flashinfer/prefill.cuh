@@ -1619,30 +1619,47 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
       typename std::conditional<ALLOW_FP16_QK_REDUCTION && std::is_same<DTypeIn, half>::value, half,
                                 float>::type;
 
-  constexpr uint32_t num_frags_z = 2;
-  auto kernel =
-      BatchPrefillWithRaggedKVCacheKernel<GROUP_SIZE, CAUSAL, LAYOUT, ROTARY_MODE, num_frags_x,
-                                          num_frags_y, num_frags_z, num_warps, DTypeIn,
-                                          DTypeQKAccum, DTypeOut, IdType>;
-  uint32_t smem_size =
-      (num_frags_x * num_warps + num_frags_z * 2) * 16 * HEAD_DIM * sizeof(DTypeIn);
-  FLASHINFER_CUDA_CALL(
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-  void* args[] = {(void*)&q,
-                  (void*)&request_indices,
-                  (void*)&tile_indices,
-                  (void*)&qo_indptr,
-                  (void*)&k,
-                  (void*)&v,
-                  (void*)&kv_indptr,
-                  (void*)&o,
-                  (void*)&tmp,
-                  (void*)&lse,
-                  (void*)&batch_size,
-                  (void*)&sm_scale,
-                  (void*)&log2_rope_rcp_scale,
-                  (void*)&log2_rope_rcp_theta};
-  FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  int dev_id = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+  int max_smem_per_sm = 0;
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_smem_per_sm,
+                                              cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
+  // we expect each sm execute two threadblocks
+  const int max_smem_per_threadblock = max_smem_per_sm / 2;
+
+  const uint32_t max_num_frags_z_reg =
+      (HEAD_DIM == 128 && num_frags_x == 2 && ROTARY_MODE == RotaryMode::kLlama &&
+       !ALLOW_FP16_QK_REDUCTION)
+          ? 2
+          : 4;
+  const uint32_t max_num_frags_z_smem =
+      (max_smem_per_threadblock / (16 * HEAD_DIM * sizeof(DTypeIn)) - num_frags_x * num_warps) / 2;
+
+  SWITCH_NUM_FRAGS_Z(min(max_num_frags_z_smem, max_num_frags_z_reg), num_frags_z, {
+    auto kernel =
+        BatchPrefillWithRaggedKVCacheKernel<GROUP_SIZE, CAUSAL, LAYOUT, ROTARY_MODE, num_frags_x,
+                                            num_frags_y, num_frags_z, num_warps, DTypeIn,
+                                            DTypeQKAccum, DTypeOut, IdType>;
+    uint32_t smem_size =
+        (num_frags_x * num_warps + num_frags_z * 2) * 16 * HEAD_DIM * sizeof(DTypeIn);
+    FLASHINFER_CUDA_CALL(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    void* args[] = {(void*)&q,
+                    (void*)&request_indices,
+                    (void*)&tile_indices,
+                    (void*)&qo_indptr,
+                    (void*)&k,
+                    (void*)&v,
+                    (void*)&kv_indptr,
+                    (void*)&o,
+                    (void*)&tmp,
+                    (void*)&lse,
+                    (void*)&batch_size,
+                    (void*)&sm_scale,
+                    (void*)&log2_rope_rcp_scale,
+                    (void*)&log2_rope_rcp_theta};
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  });
   return cudaSuccess;
 }
 
@@ -1784,28 +1801,44 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
       typename std::conditional<ALLOW_FP16_QK_REDUCTION && std::is_same<DTypeIn, half>::value, half,
                                 float>::type;
 
-  constexpr uint32_t num_frags_z = 2;
-  auto kernel =
-      BatchPrefillWithPagedKVCacheKernel<GROUP_SIZE, PAGE_SIZE, CAUSAL, ROTARY_MODE, num_frags_x,
-                                         num_frags_y, num_frags_z, num_warps, page_storage, DTypeIn,
-                                         DTypeQKAccum, DTypeOut, IdType>;
-  uint32_t smem_size =
-      (num_frags_x * num_warps + num_frags_z * 2) * 16 * HEAD_DIM * sizeof(DTypeIn);
-  FLASHINFER_CUDA_CALL(
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-  void* args[] = {(void*)&request_indices,
-                  (void*)&tile_indices,
-                  (void*)&q,
-                  (void*)&paged_kv,
-                  (void*)&qo_indptr,
-                  (void*)&o,
-                  (void*)&tmp,
-                  (void*)&lse,
-                  (void*)&sm_scale,
-                  (void*)&log2_rope_rcp_scale,
-                  (void*)&log2_rope_rcp_theta};
-  FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  int dev_id = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+  int max_smem_per_sm = 0;
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_smem_per_sm,
+                                              cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
+  // we expect each sm execute two threadblocks
+  const int max_smem_per_threadblock = max_smem_per_sm / 2;
 
+  const uint32_t max_num_frags_z_reg =
+      (HEAD_DIM == 128 && num_frags_x == 2 && ROTARY_MODE == RotaryMode::kLlama &&
+       !ALLOW_FP16_QK_REDUCTION)
+          ? 2
+          : 4;
+  const uint32_t max_num_frags_z_smem =
+      (max_smem_per_threadblock / (16 * HEAD_DIM * sizeof(DTypeIn)) - num_frags_x * num_warps) / 2;
+
+  SWITCH_NUM_FRAGS_Z(min(max_num_frags_z_smem, max_num_frags_z_reg), num_frags_z, {
+    auto kernel =
+        BatchPrefillWithPagedKVCacheKernel<GROUP_SIZE, PAGE_SIZE, CAUSAL, ROTARY_MODE, num_frags_x,
+                                           num_frags_y, num_frags_z, num_warps, page_storage,
+                                           DTypeIn, DTypeQKAccum, DTypeOut, IdType>;
+    uint32_t smem_size =
+        (num_frags_x * num_warps + num_frags_z * 2) * 16 * HEAD_DIM * sizeof(DTypeIn);
+    FLASHINFER_CUDA_CALL(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    void* args[] = {(void*)&request_indices,
+                    (void*)&tile_indices,
+                    (void*)&q,
+                    (void*)&paged_kv,
+                    (void*)&qo_indptr,
+                    (void*)&o,
+                    (void*)&tmp,
+                    (void*)&lse,
+                    (void*)&sm_scale,
+                    (void*)&log2_rope_rcp_scale,
+                    (void*)&log2_rope_rcp_theta};
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  });
   return cudaSuccess;
 }
 
