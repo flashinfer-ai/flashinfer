@@ -137,7 +137,7 @@ __device__ __forceinline__ void update_local_state(const T* smem, const float* s
   }
 }
 
-enum class SyncRange {
+enum class MergeRange {
   // synchronize the state on the blockDim.z dimension
   kSyncBdz = 0U,
   // synchronize the state on the blockDim.y * blockDim.z dimension
@@ -145,18 +145,22 @@ enum class SyncRange {
 };
 
 /*!
- * \brief Synchronize the state of all warps inside a threadblock.
+ * \brief Merge the state of different threadIdx.y/yz inside a threadblock.
  * \tparam vec_size A template integer indicates the vector size
  * \tparam bdx A template integer indicates the block size in x dimension
  * \tparam bdy A template integer indicates the block size in y dimension
  * \tparam bdz A template integer indicates the block size in z dimension
- * \tparam sync_range A template enum indicates the range of synchronization
+ * \tparam merge_range A template enum indicates the range of synchronization
+ * \tparam sync_all_threads A template bool indicates whether to broadcast the merged state
+ *   to all threads or only the first threadIdx.y/yz.
  * \param st The warp local state
  * \param smem The pointer to shared memory buffer for o
  * \param smem_md The pointer to shared memory buffer for m/d
  */
-template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, SyncRange sync_range>
-__device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, float* smem_md) {
+template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, MergeRange merge_range,
+          bool sync_all_threads>
+__device__ __forceinline__ void threadblock_merge_state(state_t<vec_size>& st, float* smem,
+                                                        float* smem_md) {
   constexpr uint32_t head_dim = bdx * vec_size;
   auto block = cg::this_thread_block();
   uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
@@ -165,21 +169,25 @@ __device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, f
   smem_md[(tz * bdy + ty) * 2 + 1] = st.d;
   block.sync();
   st.init();
-  if constexpr (sync_range == SyncRange::kSyncBdz) {
+  if constexpr (merge_range == MergeRange::kSyncBdz) {
+    if (sync_all_threads || tz == 0) {
 #pragma unroll
-    for (uint32_t j = 0; j < bdz; ++j) {
-      float m = smem_md[(j * bdy + ty) * 2], d = smem_md[(j * bdy + ty) * 2 + 1];
-      vec_t<float, vec_size> o;
-      o.load(smem + (j * bdy + ty) * head_dim + tx * vec_size);
-      st.merge(o, m, d);
+      for (uint32_t j = 0; j < bdz; ++j) {
+        float m = smem_md[(j * bdy + ty) * 2], d = smem_md[(j * bdy + ty) * 2 + 1];
+        vec_t<float, vec_size> o;
+        o.load(smem + (j * bdy + ty) * head_dim + tx * vec_size);
+        st.merge(o, m, d);
+      }
     }
-  } else if constexpr (sync_range == SyncRange::kSyncBdyBdz) {
+  } else if constexpr (merge_range == MergeRange::kSyncBdyBdz) {
+    if (sync_all_threads || (ty == 0 && tz == 0)) {
 #pragma unroll
-    for (uint32_t j = 0; j < bdy * bdz; ++j) {
-      float m = smem_md[j * 2], d = smem_md[j * 2 + 1];
-      vec_t<float, vec_size> o;
-      o.load(smem + j * head_dim + tx * vec_size);
-      st.merge(o, m, d);
+      for (uint32_t j = 0; j < bdy * bdz; ++j) {
+        float m = smem_md[j * 2], d = smem_md[j * 2 + 1];
+        vec_t<float, vec_size> o;
+        o.load(smem + j * head_dim + tx * vec_size);
+        st.merge(o, m, d);
+      }
     }
   }
 }
@@ -345,8 +353,8 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
   block.sync();
 
   // sync local state of all warps inside a threadblock
-  sync_state<vec_size, bdx, bdy, bdz, SyncRange::kSyncBdz>(st_local, reinterpret_cast<float*>(smem),
-                                                           smem_md);
+  threadblock_merge_state<vec_size, bdx, bdy, bdz, MergeRange::kSyncBdz, true>(
+      st_local, reinterpret_cast<float*>(smem), smem_md);
 
   if constexpr (cooperative) {
     // update tmp buffer
@@ -376,7 +384,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
         }
         block.sync();
         // sync local state of all warps inside a threadblock
-        sync_state<vec_size, bdx, bdy, bdz, SyncRange::kSyncBdyBdz>(
+        threadblock_merge_state<vec_size, bdx, bdy, bdz, MergeRange::kSyncBdyBdz, false>(
             st_global, reinterpret_cast<float*>(smem), smem_md);
         st_global.normalize();
         if (bdy == 0 && bdz == 0) {
@@ -505,8 +513,8 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(DTypeIn* __restrict__ q, DTyp
   block.sync();
 
   // sync local state of all warps inside a threadblock
-  sync_state<vec_size, bdx, bdy, bdz, SyncRange::kSyncBdz>(st_local, reinterpret_cast<float*>(smem),
-                                                           smem_md);
+  threadblock_merge_state<vec_size, bdx, bdy, bdz, MergeRange::kSyncBdz, true>(
+      st_local, reinterpret_cast<float*>(smem), smem_md);
 
   st_local.normalize();
   st_local.o.cast_store(o + batch_idx * num_qo_heads * head_dim +
@@ -722,8 +730,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
   block.sync();
 
   // sync local state of all warps inside a threadblock
-  sync_state<vec_size, bdx, bdy, bdz, SyncRange::kSyncBdz>(st, reinterpret_cast<float*>(smem),
-                                                           smem_md);
+  threadblock_merge_state<vec_size, bdx, bdy, bdz, MergeRange::kSyncBdz, true>(
+      st, reinterpret_cast<float*>(smem), smem_md);
 
   if constexpr (cooperative) {
     auto grid = cg::this_grid();
@@ -754,7 +762,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
       }
       block.sync();
       // sync local state of all warps inside a threadblock
-      sync_state<vec_size, bdx, bdy, bdz, SyncRange::kSyncBdz>(
+      threadblock_merge_state<vec_size, bdx, bdy, bdz, MergeRange::kSyncBdz, true>(
           st_global, reinterpret_cast<float*>(smem), smem_md);
       st_global.normalize();
       st_global.o.cast_store(
@@ -816,7 +824,7 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& 
                                                   RotaryMode rotary_mode = RotaryMode::kNone,
                                                   cudaStream_t stream = nullptr) {
   const uint32_t GROUP_SIZE = num_qo_heads / num_kv_heads;
-  if (seq_len <= 128U / uint32_t(std::sqrt(GROUP_SIZE))) {
+  if (seq_len <= 256) {
     tmp_size = 0;
   } else {
     SWITCH_GQA_GROUP_SIZE(
