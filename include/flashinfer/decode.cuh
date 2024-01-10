@@ -362,7 +362,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
       qo_head_idx = (i * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x;
       if (qo_head_idx < num_qo_heads) {
         state_t<vec_size> st_global;
-#pragma unroll 2
+#pragma unroll 1
         for (uint32_t iter = 0; iter < ceil_div(num_kv_chunks, bdy * bdz); ++iter) {
           uint32_t kv_chunk_idx = (iter * bdz + tz) * bdy + ty;
           if (kv_chunk_idx < num_kv_chunks) {
@@ -379,7 +379,9 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
         sync_state<vec_size, bdx, bdy, bdz, SyncRange::kSyncBdyBdz>(
             st_global, reinterpret_cast<float*>(smem), smem_md);
         st_global.normalize();
-        st_global.o.cast_store(o + info.get_qo_elem_offset(0, qo_head_idx, tx * vec_size));
+        if (bdy == 0 && bdz == 0) {
+          st_global.o.cast_store(o + info.get_qo_elem_offset(0, qo_head_idx, tx * vec_size));
+        }
       }
     }
   } else {
@@ -779,8 +781,15 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
  * \param sizeof_dtype The size (in terms of bytes) of the input data type
  */
 constexpr uint32_t get_heuristic_num_threads(uint32_t group_size, uint32_t sizeof_dtype) {
-  // TODO(Zihao): remove this function after the refactor.
-  return 128U;
+  if (group_size == 8U) {
+    if (sizeof_dtype == 1U) {
+      return 256U;  // not enough registers for 512 threads
+    } else {
+      return 512U;
+    }
+  } else {
+    return 128U;
+  }
 }
 
 /*!
