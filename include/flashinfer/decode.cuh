@@ -842,6 +842,16 @@ __forceinline__ __device__ __host__ uint32_t GetSingleDecodeKernelSmemSize(uint3
          2U * bdy * bdz * sizeof(float);
 }
 
+uint32_t GetNumThreads(uint32_t suggested_num_threads) {
+  if (suggested_num_threads > 512) {
+    return 512;
+  } else if (suggested_num_threads > 256) {
+    return 256;
+  } else {
+    return 128;
+  }
+}
+
 /*!
  * \brief FlashAttention decoding with kv-cache for a single request
  * \tparam DTypeIn A template type indicates the input data type
@@ -904,6 +914,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                   int min_grid_size, num_threads = 0;
                   FLASHINFER_CUDA_CALL(cudaOccupancyMaxPotentialBlockSizeVariableSMem(
                       &min_grid_size, &num_threads, (void*)kernel, f_smem_size));
+                  num_threads = GetNumThreads(num_threads);
                   const uint32_t bdz = num_threads / (bdx * bdy);
                   const uint32_t smem_size = f_smem_size(num_threads);
                   FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
@@ -933,6 +944,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                   int min_grid_size = 0, num_threads = 0;
                   FLASHINFER_CUDA_CALL(cudaOccupancyMaxPotentialBlockSizeVariableSMem(
                       &min_grid_size, &num_threads, (void*)kernel, f_smem_size));
+                  num_threads = GetNumThreads(num_threads);
                   const uint32_t bdz = num_threads / (bdx * bdy);
                   const uint32_t smem_size = f_smem_size(num_threads);
 
