@@ -146,9 +146,10 @@ __device__ __forceinline__ void update_local_state(const T* smem, const float* s
  * \param smem The pointer to shared memory buffer for o
  * \param smem_md The pointer to shared memory buffer for m/d
  */
-template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz>
+template <uint32_t vec_size, uint32_t bdx, uint32_t bdy>
 __device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, float* smem_md) {
-  if constexpr (bdz > 1) {
+  const uint32_t bdz = blockDim.z;
+  if (bdz > 1) {
     constexpr uint32_t head_dim = bdx * vec_size;
     auto block = cg::this_thread_block();
     uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
@@ -157,7 +158,6 @@ __device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, f
     smem_md[(tz * bdy + ty) * 2 + 1] = st.d;
     block.sync();
     st.init();
-#pragma unroll
     for (uint32_t j = 0; j < bdz; ++j) {
       float mz = smem_md[(j * bdy + ty) * 2], dz = smem_md[(j * bdy + ty) * 2 + 1];
       vec_t<float, vec_size> oz;
@@ -195,7 +195,7 @@ __device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, f
  * \param kv_chunk_size A integer indicates the kv-chunk size
  */
 template <QKVLayout layout, bool cooperative, RotaryMode rotary_mode, uint32_t num_stages_smem,
-          uint32_t tile_size_per_bdx, uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz,
+          uint32_t tile_size_per_bdx, uint32_t vec_size, uint32_t bdx, uint32_t bdy,
           typename DTypeIn, typename DTypeOut>
 __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* __restrict__ k,
                                               DTypeIn* __restrict__ v, DTypeOut* __restrict__ o,
@@ -208,6 +208,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
   sm_scale *= math::log2e;
 
   constexpr uint32_t head_dim = bdx * vec_size;
+  const uint32_t bdz = blockDim.z;
   uint32_t kv_head_idx = blockIdx.y;
   uint32_t qo_head_idx = kv_head_idx * bdy + threadIdx.y;
   uint32_t kv_chunk_idx = blockIdx.x;
@@ -328,7 +329,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
   block.sync();
 
   // sync local state of all warps inside a threadblock
-  sync_state<vec_size, bdx, bdy, bdz>(st_local, reinterpret_cast<float*>(smem), smem_md);
+  sync_state<vec_size, bdx, bdy>(st_local, reinterpret_cast<float*>(smem), smem_md);
 
   if constexpr (cooperative) {
     // update tmp buffer
@@ -355,7 +356,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
       }
       block.sync();
       // sync local state of all warps inside a threadblock
-      sync_state<vec_size, bdx, bdy, bdz>(st_global, reinterpret_cast<float*>(smem), smem_md);
+      sync_state<vec_size, bdx, bdy>(st_global, reinterpret_cast<float*>(smem), smem_md);
       st_global.normalize();
       st_global.o.cast_store(o + info.get_qo_elem_offset(0, qo_head_idx, tx * vec_size));
     }
@@ -366,7 +367,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
 }
 
 template <QKVLayout layout, RotaryMode rotary_mode, uint32_t num_stages_smem, uint32_t vec_size,
-          uint32_t bdx, uint32_t bdy, uint32_t bdz, typename DTypeIn, typename DTypeOut>
+          uint32_t bdx, uint32_t bdy, typename DTypeIn, typename DTypeOut>
 __global__ void BatchDecodeWithPaddedKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* __restrict__ k,
                                                    DTypeIn* __restrict__ v,
                                                    DTypeOut* __restrict__ o,
@@ -378,6 +379,7 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(DTypeIn* __restrict__ q, DTyp
   sm_scale *= math::log2e;
 
   constexpr uint32_t head_dim = bdx * vec_size;
+  const uint32_t bdz = blockDim.z;
   uint32_t kv_head_idx = blockIdx.y;
   uint32_t qo_head_idx = kv_head_idx * bdy + threadIdx.y;
   uint32_t batch_idx = blockIdx.x;
@@ -480,7 +482,7 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(DTypeIn* __restrict__ q, DTyp
   block.sync();
 
   // sync local state of all warps inside a threadblock
-  sync_state<vec_size, bdx, bdy, bdz>(st_local, reinterpret_cast<float*>(smem), smem_md);
+  sync_state<vec_size, bdx, bdy>(st_local, reinterpret_cast<float*>(smem), smem_md);
 
   st_local.normalize();
   st_local.o.cast_store(o + batch_idx * num_qo_heads * head_dim +
@@ -499,7 +501,6 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(DTypeIn* __restrict__ q, DTyp
  * \tparam vec_size A template integer indicates the vector size
  * \tparam bdx A template integer indicates the block size in x dimension
  * \tparam bdy A template integer indicates the block size in y dimension
- * \tparam bdz A template integer indicates the block size in z dimension
  * \tparam page_storage Whether to store indices or pointers of each active page
  * \tparam DTypeIn A template type indicates the input data type
  * \tparam DTypeOut A template type indicates the output data type
@@ -517,7 +518,7 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(DTypeIn* __restrict__ q, DTyp
  *   of "theta" used in RoPE (Rotary Positional Embeddings)
  */
 template <bool cooperative, RotaryMode rotary_mode, uint32_t num_stages_smem,
-          uint32_t tile_size_per_bdx, uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz,
+          uint32_t tile_size_per_bdx, uint32_t vec_size, uint32_t bdx, uint32_t bdy,
           PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
 __global__ void BatchDecodeWithPagedKVCacheKernel(
     DTypeIn* __restrict__ q, paged_kv_t<page_storage, DTypeIn, IdType> paged_kv,
@@ -527,6 +528,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
   sm_scale *= math::log2e;
 
   constexpr uint32_t head_dim = bdx * vec_size;
+  const uint32_t bdz = blockDim.z;
   const uint32_t batch_idx = blockIdx.x;
   const uint32_t kv_head_idx = blockIdx.y;
   const uint32_t qo_head_idx = kv_head_idx * bdy + threadIdx.y;
@@ -696,7 +698,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
   block.sync();
 
   // sync local state of all warps inside a threadblock
-  sync_state<vec_size, bdx, bdy, bdz>(st, reinterpret_cast<float*>(smem), smem_md);
+  sync_state<vec_size, bdx, bdy>(st, reinterpret_cast<float*>(smem), smem_md);
 
   if constexpr (cooperative) {
     auto grid = cg::this_grid();
@@ -727,7 +729,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
       }
       block.sync();
       // sync local state of all warps inside a threadblock
-      sync_state<vec_size, bdx, bdy, bdz>(st_global, reinterpret_cast<float*>(smem), smem_md);
+      sync_state<vec_size, bdx, bdy>(st_global, reinterpret_cast<float*>(smem), smem_md);
       st_global.normalize();
       st_global.o.cast_store(
           o + (paged_kv.batch_idx_map()[batch_idx] * num_qo_heads + qo_head_idx) * head_dim +
@@ -813,7 +815,7 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& 
                   auto kernel =
                       SingleDecodeWithKVCacheKernel<QKV_LAYOUT, /*cooperative=*/true, ROTARY_MODE,
                                                     num_stages_smem, tile_size_per_bdx, vec_size,
-                                                    bdx, bdy, bdz, DTypeIn, DTypeOut>;
+                                                    bdx, bdy, DTypeIn, DTypeOut>;
                   int num_blocks_per_sm = 0;
                   int num_sm = 0;
                   int dev_id = 0;
@@ -894,7 +896,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                   auto kernel =
                       SingleDecodeWithKVCacheKernel<QKV_LAYOUT, /*cooperative=*/false, ROTARY_MODE,
                                                     num_stages_smem, tile_size_per_bdx, vec_size,
-                                                    bdx, bdy, bdz, DTypeIn, DTypeOut>;
+                                                    bdx, bdy, DTypeIn, DTypeOut>;
                   FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
                       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -917,7 +919,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                   auto kernel =
                       SingleDecodeWithKVCacheKernel<QKV_LAYOUT, /*cooperative=*/true, ROTARY_MODE,
                                                     num_stages_smem, tile_size_per_bdx, vec_size,
-                                                    bdx, bdy, bdz, DTypeIn, DTypeOut>;
+                                                    bdx, bdy, DTypeIn, DTypeOut>;
                   FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
                       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -1125,7 +1127,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
 
             auto cooperative_kernel =
                 BatchDecodeWithPagedKVCacheKernel<true, ROTARY_MODE, num_stages_smem,
-                                                  tile_size_per_bdx, vec_size, bdx, bdy, bdz,
+                                                  tile_size_per_bdx, vec_size, bdx, bdy,
                                                   page_storage, DTypeIn, DTypeOut, IdType>;
             int num_blocks_per_sm = 0;
             int num_sm = 0;
@@ -1196,7 +1198,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     dim3 nthrs(bdx, bdy, bdz);
     auto kernel =
         BatchDecodeWithPagedKVCacheKernel</*cooperative=*/false, ROTARY_MODE, num_stages_smem,
-                                          tile_size_per_bdx, vec_size, bdx, bdy, bdz, page_storage,
+                                          tile_size_per_bdx, vec_size, bdx, bdy, page_storage,
                                           DTypeIn, DTypeOut, IdType>;
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -1218,7 +1220,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     }
     auto cooperative_kernel =
         BatchDecodeWithPagedKVCacheKernel<true, ROTARY_MODE, num_stages_smem, tile_size_per_bdx,
-                                          vec_size, bdx, bdy, bdz, page_storage, DTypeIn, DTypeOut,
+                                          vec_size, bdx, bdy, page_storage, DTypeIn, DTypeOut,
                                           IdType>;
     FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
         cooperative_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -1311,7 +1313,7 @@ cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DType
   dim3 nblks(batch_size, num_kv_heads);
   dim3 nthrs(bdx, bdy, bdz);
   auto kernel = BatchDecodeWithPaddedKVCacheKernel<LAYOUT, ROTARY_MODE, num_stages_smem, vec_size,
-                                                   bdx, bdy, bdz, DTypeIn, DTypeOut>;
+                                                   bdx, bdy, DTypeIn, DTypeOut>;
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
   tensor_info_t<LAYOUT, GROUP_SIZE, HEAD_DIM> info(1, padded_kv_len, num_kv_heads);
