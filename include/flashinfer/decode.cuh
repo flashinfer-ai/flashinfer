@@ -843,9 +843,9 @@ __forceinline__ __device__ __host__ uint32_t GetSingleDecodeKernelSmemSize(uint3
 }
 
 uint32_t GetNumThreads(uint32_t suggested_num_threads) {
-  if (suggested_num_threads > 512) {
+  if (suggested_num_threads >= 512) {
     return 512;
-  } else if (suggested_num_threads > 256) {
+  } else if (suggested_num_threads >= 256) {
     return 256;
   } else {
     return 128;
