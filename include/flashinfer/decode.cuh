@@ -834,6 +834,14 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& 
   return cudaSuccess;
 }
 
+template <uint32_t head_dim, uint32_t num_stages_smem, uint32_t bdx, uint32_t bdy,
+          uint32_t tile_size_per_bdx, typename DTypeIn>
+__forceinline__ __device__ __host__ uint32_t GetSmemSize(uint32_t num_threads) {
+  const int bdz = ceil_div(num_threads, bdx * bdy);
+  return 2U * num_stages_smem * bdy * tile_size_per_bdx * bdz * head_dim * sizeof(DTypeIn) +
+         2U * bdy * bdz * sizeof(float);
+}
+
 /*!
  * \brief FlashAttention decoding with kv-cache for a single request
  * \tparam DTypeIn A template type indicates the input data type
@@ -883,20 +891,21 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                 constexpr uint32_t bdx = HEAD_DIM / vec_size;
                 static_assert(bdx <= 32U);
                 constexpr uint32_t bdy = GROUP_SIZE;
-                constexpr uint32_t num_threads =
-                    std::max(get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeIn)), bdx * bdy);
-                constexpr uint32_t bdz = num_threads / (bdx * bdy);
                 tensor_info_t<QKV_LAYOUT, GROUP_SIZE, HEAD_DIM> info(1, seq_len, num_kv_heads);
                 constexpr uint32_t tile_size_per_bdx = 8U / GROUP_SIZE;
-                const uint32_t smem_size = 2U * num_stages_smem * bdy * tile_size_per_bdx * bdz *
-                                               head_dim * sizeof(DTypeIn) +
-                                           2U * bdy * bdz * sizeof(float);
+                auto f_smem_size =
+                    GetSmemSize<HEAD_DIM, num_stages_smem, bdx, bdy, tile_size_per_bdx, DTypeIn>;
                 if (seq_len <= 256 || tmp == nullptr) {
                   // no need to use cooperative kernel
                   auto kernel =
                       SingleDecodeWithKVCacheKernel<QKV_LAYOUT, /*cooperative=*/false, ROTARY_MODE,
                                                     num_stages_smem, tile_size_per_bdx, vec_size,
                                                     bdx, bdy, DTypeIn, DTypeOut>;
+                  int num_threads = 0;
+                  cudaOccupancyMaxPotentialBlockSizeVariableSMem(nullptr, &num_threads,
+                                                                 (void*)kernel, f_smem_size);
+                  const uint32_t bdz = ceil_div(num_threads, bdx * bdy);
+                  const uint32_t smem_size = f_smem_size(num_threads);
                   FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
                       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -920,6 +929,13 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                       SingleDecodeWithKVCacheKernel<QKV_LAYOUT, /*cooperative=*/true, ROTARY_MODE,
                                                     num_stages_smem, tile_size_per_bdx, vec_size,
                                                     bdx, bdy, DTypeIn, DTypeOut>;
+
+                  int num_threads = 0;
+                  cudaOccupancyMaxPotentialBlockSizeVariableSMem(nullptr, &num_threads,
+                                                                 (void*)kernel, f_smem_size);
+                  const uint32_t bdz = ceil_div(num_threads, bdx * bdy);
+                  const uint32_t smem_size = f_smem_size(num_threads);
+
                   FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
                       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
