@@ -836,7 +836,7 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& 
 
 template <uint32_t head_dim, uint32_t num_stages_smem, uint32_t bdx, uint32_t bdy,
           uint32_t tile_size_per_bdx, typename DTypeIn>
-__forceinline__ __device__ __host__ uint32_t GetSmemSize(uint32_t num_threads) {
+__forceinline__ __device__ __host__ uint32_t GetSingleDecodeKernelSmemSize(uint32_t num_threads) {
   const int bdz = ceil_div(num_threads, bdx * bdy);
   return 2U * num_stages_smem * bdy * tile_size_per_bdx * bdz * head_dim * sizeof(DTypeIn) +
          2U * bdy * bdz * sizeof(float);
@@ -893,17 +893,17 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                 constexpr uint32_t bdy = GROUP_SIZE;
                 tensor_info_t<QKV_LAYOUT, GROUP_SIZE, HEAD_DIM> info(1, seq_len, num_kv_heads);
                 constexpr uint32_t tile_size_per_bdx = 8U / GROUP_SIZE;
-                auto f_smem_size =
-                    GetSmemSize<HEAD_DIM, num_stages_smem, bdx, bdy, tile_size_per_bdx, DTypeIn>;
+                auto f_smem_size = GetSingleDecodeKernelSmemSize<HEAD_DIM, num_stages_smem, bdx,
+                                                                 bdy, tile_size_per_bdx, DTypeIn>;
                 if (seq_len <= 256 || tmp == nullptr) {
                   // no need to use cooperative kernel
                   auto kernel =
                       SingleDecodeWithKVCacheKernel<QKV_LAYOUT, /*cooperative=*/false, ROTARY_MODE,
                                                     num_stages_smem, tile_size_per_bdx, vec_size,
                                                     bdx, bdy, DTypeIn, DTypeOut>;
-                  int num_threads = 0;
-                  cudaOccupancyMaxPotentialBlockSizeVariableSMem(nullptr, &num_threads,
-                                                                 (void*)kernel, f_smem_size);
+                  int min_grid_size, num_threads = 0;
+                  FLASHINFER_CUDA_CALL(cudaOccupancyMaxPotentialBlockSizeVariableSMem(
+                      &min_grid_size, &num_threads, (void*)kernel, f_smem_size));
                   const uint32_t bdz = ceil_div(num_threads, bdx * bdy);
                   const uint32_t smem_size = f_smem_size(num_threads);
                   FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
@@ -930,9 +930,9 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                                                     num_stages_smem, tile_size_per_bdx, vec_size,
                                                     bdx, bdy, DTypeIn, DTypeOut>;
 
-                  int num_threads = 0;
-                  cudaOccupancyMaxPotentialBlockSizeVariableSMem(nullptr, &num_threads,
-                                                                 (void*)kernel, f_smem_size);
+                  int min_grid_size = 0, num_threads = 0;
+                  FLASHINFER_CUDA_CALL(cudaOccupancyMaxPotentialBlockSizeVariableSMem(
+                      &min_grid_size, &num_threads, (void*)kernel, f_smem_size));
                   const uint32_t bdz = ceil_div(num_threads, bdx * bdy);
                   const uint32_t smem_size = f_smem_size(num_threads);
 
