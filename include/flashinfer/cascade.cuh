@@ -280,7 +280,6 @@ __global__ void VariableLengthMergeStatesKernel(DTypeIn* __restrict__ V, float* 
                                                 IdType* indptr, DTypeOut* __restrict__ v_merged,
                                                 float* __restrict__ s_merged, uint32_t num_heads) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
-  uint32_t seq_len = gridDim.x;
   uint32_t pos = blockIdx.x;
   uint32_t head_idx = blockIdx.y;
   state_t<vec_size> st;
