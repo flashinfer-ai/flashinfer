@@ -150,7 +150,6 @@ __global__ void MergeStatesKernel(DTypeIn* __restrict__ V, float* __restrict__ S
                                   DTypeOut* __restrict__ v_merged, float* __restrict__ s_merged,
                                   uint32_t num_index_sets, uint32_t num_heads, uint32_t head_dim) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
-  uint32_t seq_len = gridDim.x;
   uint32_t pos = blockIdx.x;
   uint32_t head_idx = ty;
   state_t<vec_size> st;
@@ -159,9 +158,10 @@ __global__ void MergeStatesKernel(DTypeIn* __restrict__ V, float* __restrict__ S
   v_merged_vec.fill(0.f);
 #pragma unroll 2
   for (uint32_t iter = 0; iter < num_index_sets; ++iter) {
-    float s = S[(iter * seq_len + pos) * num_heads + head_idx];
+    float s = S[(pos * num_index_sets + iter) * num_heads + head_idx];
     vec_t<float, vec_size> v;
-    v.cast_load(V + ((iter * seq_len + pos) * num_heads + head_idx) * head_dim + tx * vec_size);
+    v.cast_load(V + ((pos * num_index_sets + iter) * num_heads + head_idx) * head_dim +
+                tx * vec_size);
     st.merge(v, s, 1);
   }
 
@@ -196,7 +196,6 @@ __global__ void MergeStatesLargeNumIndexSetsKernel(DTypeIn* __restrict__ V, floa
                                                    float* __restrict__ s_merged,
                                                    uint32_t num_index_sets, uint32_t num_heads) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
-  uint32_t seq_len = gridDim.x;
   uint32_t pos = blockIdx.x;
   uint32_t head_idx = blockIdx.y;
   state_t<vec_size> st;
@@ -461,6 +460,8 @@ cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* indptr, DTyp
                                       uint32_t head_dim, cudaStream_t stream = nullptr) {
   SWITCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
+    constexpr uint32_t bdx = HEAD_DIM / vec_size;
+    constexpr uint32_t num_threads = 128;
     constexpr uint32_t bdy = num_threads / bdx;
     dim3 nblks(seq_len, num_heads);
     dim3 nthrs(bdx, bdy);
@@ -468,10 +469,12 @@ cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* indptr, DTyp
     auto kernel = VariableLengthMergeStatesKernel<vec_size, bdx, bdy, num_smem_stages, DTypeIn,
                                                   DTypeOut, IdType>;
     void* args[] = {&v, &s, &indptr, &v_merged, &s_merged, &num_heads};
-    uint32_t smem_size = FLASHINFER_CUDA_CALL(
+    uint32_t smem_size =
+        num_smem_stages * bdy * head_dim * sizeof(DTypeIn) + num_threads * sizeof(float);
+    FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-  })
+  });
   return cudaSuccess;
 }
 

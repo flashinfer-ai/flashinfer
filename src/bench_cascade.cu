@@ -28,20 +28,20 @@ using namespace flashinfer;
 template <typename T>
 void bench_merge_states(nvbench::state& state) {
   const auto num_index_sets = state.get_int64("num_index_sets");
-  const auto batch_size = state.get_int64("batch_size");
+  const auto seq_len = state.get_int64("seq_len");
   const auto num_heads = state.get_int64("num_heads");
   const auto head_dim = state.get_int64("head_dim");
 
-  std::vector<T> V_host(num_index_sets * batch_size * num_heads * head_dim);
-  std::vector<float> S_host(num_index_sets * batch_size * num_heads);
+  std::vector<T> V_host(seq_len * num_index_sets * num_heads * head_dim);
+  std::vector<float> S_host(seq_len * num_index_sets * num_heads);
 
   utils::vec_normal_(V_host);
   utils::vec_uniform_(S_host, 5, 10);
 
   thrust::device_vector<T> V_device(V_host);
   thrust::device_vector<float> S_device(S_host);
-  thrust::device_vector<T> V_merged(batch_size * num_heads * head_dim);
-  thrust::device_vector<float> S_merged(batch_size * num_heads);
+  thrust::device_vector<T> V_merged(seq_len * num_heads * head_dim);
+  thrust::device_vector<float> S_merged(seq_len * num_heads);
 
   state.add_global_memory_reads<T>(V_host.size(), "Read");
   state.add_global_memory_writes<T>(V_merged.size(), "Write");
@@ -51,7 +51,7 @@ void bench_merge_states(nvbench::state& state) {
     cudaError_t status = MergeStates(
         thrust::raw_pointer_cast(V_device.data()), thrust::raw_pointer_cast(S_device.data()),
         thrust::raw_pointer_cast(V_merged.data()), thrust::raw_pointer_cast(S_merged.data()),
-        num_index_sets, batch_size, num_heads, head_dim);
+        num_index_sets, seq_len, num_heads, head_dim);
     timer.stop();
   });
 }
