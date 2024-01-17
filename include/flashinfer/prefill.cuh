@@ -416,8 +416,8 @@ __device__ __forceinline__ void compute_qk(smem_t* q_smem, uint32_t* q_smem_offs
   *k_smem_offset_r -= num_frags_y * 2;
 }
 
-template <bool split_kv, bool causal, uint32_t group_size, uint32_t num_warps, uint32_t num_frags_x,
-          uint32_t num_frags_y, uint32_t num_frags_z, typename DTypeQKAccum>
+template <bool partition_kv, bool causal, uint32_t group_size, uint32_t num_warps,
+          uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z, typename DTypeQKAccum>
 __device__ __forceinline__ void mask_s(const uint32_t qo_idx_base, const uint32_t kv_idx_base,
                                        const uint32_t qo_len, const uint32_t kv_len,
                                        const uint32_t chunk_end,
@@ -434,7 +434,7 @@ __device__ __forceinline__ void mask_s(const uint32_t qo_idx_base, const uint32_
                        kv_idx =
                            kv_idx_base + fz * 16 + 2 * (tx % 4) + 8 * (reg_id / 4) + reg_id % 2;
         const bool out_of_boundary =
-            (causal ? (kv_idx > kv_len + q_idx - qo_len || (split_kv && kv_idx >= chunk_end))
+            (causal ? (kv_idx > kv_len + q_idx - qo_len || (partition_kv && kv_idx >= chunk_end))
                     : kv_idx >= chunk_end);
         s_frag[fx][fz][reg_id] = out_of_boundary ? DTypeQKAccum(-5e4) : s_frag[fx][fz][reg_id];
       }
@@ -731,7 +731,7 @@ __device__ __forceinline__ void write_o_reg_gmem(float (*o_frag)[num_frags_y][8]
 
 /*!
  * \brief FlashAttention prefill CUDA kernel for a single request.
- * \tparam split_kv Whether to split kv_len into chunks.
+ * \tparam partition_kv Whether to split kv_len into chunks.
  * \tparam group_size The number of qo heads that maps to a kv head (used in GQA).
  * \tparam causal Whether to use causal attention.
  * \tparam layout The layout of the input tensor.
@@ -746,7 +746,7 @@ __device__ __forceinline__ void write_o_reg_gmem(float (*o_frag)[num_frags_y][8]
  * \param k The key tensor.
  * \param v The value tensor.
  * \param o The output tensor.
- * \param tmp The temporary buffer (used when split_kv is true).
+ * \param tmp The temporary buffer (used when partition_kv is true).
  * \param lse The logsumexp value.
  * \param qkv_info The tensor info of the input tensor.
  * \param sm_scale The scale factor applied to the softmax score.
@@ -755,9 +755,9 @@ __device__ __forceinline__ void write_o_reg_gmem(float (*o_frag)[num_frags_y][8]
  * \param log2_rope_rcp_theta log2(1/(rope_theta)), where rope_theta is the theta
  *   used in RoPE.
  */
-template <bool split_kv, uint32_t group_size, bool causal, QKVLayout layout, RotaryMode rotary_mode,
-          uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps,
-          typename DTypeIn, typename DTypeQKAccum, typename DTypeOut>
+template <bool partition_kv, uint32_t group_size, bool causal, QKVLayout layout,
+          RotaryMode rotary_mode, uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z,
+          uint32_t num_warps, typename DTypeIn, typename DTypeQKAccum, typename DTypeOut>
 __global__ void SinglePrefillWithKVCacheKernel(
     DTypeIn* __restrict__ q, DTypeIn* __restrict__ k, DTypeIn* __restrict__ v,
     DTypeOut* __restrict__ o, void* __restrict__ tmp, float* __restrict__ lse,
@@ -771,9 +771,9 @@ __global__ void SinglePrefillWithKVCacheKernel(
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
   const uint32_t bx = blockIdx.x, chunk_idx = blockIdx.y, kv_head_idx = blockIdx.z;
   const uint32_t num_chunks = gridDim.y;
-  const uint32_t chunk_size = split_kv ? ceil_div(kv_len, num_chunks) : kv_len;
-  const uint32_t chunk_start = split_kv ? chunk_idx * chunk_size : 0;
-  const uint32_t chunk_end = split_kv ? min((chunk_idx + 1) * chunk_size, kv_len) : kv_len;
+  const uint32_t chunk_size = partition_kv ? ceil_div(kv_len, num_chunks) : kv_len;
+  const uint32_t chunk_start = partition_kv ? chunk_idx * chunk_size : 0;
+  const uint32_t chunk_end = partition_kv ? min((chunk_idx + 1) * chunk_size, kv_len) : kv_len;
   auto block = cg::this_thread_block();
 
   constexpr uint32_t head_dim = num_frags_y * 16;
@@ -803,11 +803,12 @@ __global__ void SinglePrefillWithKVCacheKernel(
   DTypeIn* q_ptr_base = q + qkv_info.get_qo_elem_offset(qo_idx_base, kv_head_idx * group_size,
                                                         (tx % 8) * num_elems_per_128b<DTypeIn>());
   DTypeOut* o_ptr_base =
-      split_kv ? ((DTypeOut*)tmp) + chunk_idx * qkv_info.get_num_qo_heads() * head_dim +
-                     qkv_info.get_qo_elem_offset(qo_idx_base * num_chunks, kv_head_idx * group_size,
-                                                 (tx % 8) * num_elems_per_128b<DTypeOut>())
-               : o + qkv_info.get_qo_elem_offset(qo_idx_base, kv_head_idx * group_size,
-                                                 (tx % 8) * num_elems_per_128b<DTypeOut>());
+      partition_kv
+          ? ((DTypeOut*)tmp) + chunk_idx * qkv_info.get_num_qo_heads() * head_dim +
+                qkv_info.get_qo_elem_offset(qo_idx_base * num_chunks, kv_head_idx * group_size,
+                                            (tx % 8) * num_elems_per_128b<DTypeOut>())
+          : o + qkv_info.get_qo_elem_offset(qo_idx_base, kv_head_idx * group_size,
+                                            (tx % 8) * num_elems_per_128b<DTypeOut>());
   uint32_t q_smem_offset_r =
       smem_t::get_permuted_offset<channel_size_128b_in>(ty * num_frags_x * 16 + tx % 16, tx / 16);
 
@@ -878,7 +879,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
 
     // apply mask
     if (iter >= mask_iteration) {
-      mask_s<split_kv, causal, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
+      mask_s<partition_kv, causal, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
           qo_idx_base, chunk_start + iter * 16 * num_frags_z, qo_len, kv_len, chunk_end, s_frag);
     }
 
@@ -912,10 +913,10 @@ __global__ void SinglePrefillWithKVCacheKernel(
   // write back
   write_o_reg_gmem<group_size, num_frags_x, num_frags_y>(
       o_frag, &qo_smem, o_ptr_base, qo_idx_base, qo_len,
-      split_kv ? qo_n_stride * num_chunks : qo_n_stride, qo_h_stride);
+      partition_kv ? qo_n_stride * num_chunks : qo_n_stride, qo_h_stride);
 
   // write lse
-  if (lse != nullptr || split_kv) {
+  if (lse != nullptr || partition_kv) {
 #pragma unroll
     for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
@@ -925,7 +926,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
         const uint32_t num_qo_heads = qkv_info.get_num_qo_heads();
         const uint32_t qo_idx = qo_idx_base + (tx / 4 + j * 8 + fx * 16) / group_size;
         if (qo_idx < qo_len) {
-          if constexpr (split_kv) {
+          if constexpr (partition_kv) {
             float* tmp_lse =
                 (float*)(((DTypeOut*)tmp) + qo_len * num_chunks * num_qo_heads * head_dim);
             tmp_lse[(qo_idx * num_chunks + chunk_idx) * num_qo_heads + qo_head_idx] =
@@ -963,7 +964,7 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
   const tensor_info_t<layout, group_size, num_frags_y * 16> qkv_info(qo_len, kv_len, num_kv_heads);
   const uint32_t qo_upper_bound = min(qo_len, (tile_idx + 1) * (num_rows_per_cta / group_size));
 
-  constexpr bool split_kv = false;
+  constexpr bool partition_kv = false;
   constexpr uint32_t channel_size_128b_in = head_dim / num_elems_per_128b<DTypeIn>();
   constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeOut>();
 
@@ -1065,7 +1066,7 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
 
     // apply mask
     if (iter >= mask_iteration) {
-      mask_s<split_kv, causal, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
+      mask_s<partition_kv, causal, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
           qo_idx_base, iter * 16 * num_frags_z, qo_len, kv_len, kv_len, s_frag);
     }
 
@@ -1142,7 +1143,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
                           paged_kv.last_page_len[request_idx];
   const uint32_t qo_upper_bound = min(qo_len, (tile_idx + 1) * (num_rows_per_cta / group_size));
 
-  constexpr bool split_kv = false;
+  constexpr bool partition_kv = false;
   constexpr uint32_t head_dim = num_frags_y * 16;
   constexpr uint32_t channel_size_128b_in = head_dim / num_elems_per_128b<DTypeIn>();
   constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeOut>();
@@ -1239,7 +1240,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
 
     // apply mask
     if (iter >= mask_iteration) {
-      mask_s<split_kv, causal, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
+      mask_s<partition_kv, causal, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
           qo_idx_base, iter * 16 * num_frags_z, qo_len, kv_len, kv_len, s_frag);
     }
 
@@ -1365,8 +1366,8 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
                               min(max_num_frags_z_smem, max_num_frags_z_reg), num_frags_z, {
                                 constexpr uint32_t num_threads = num_warps * warp_size;
                                 constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
-                                auto split_kv_kernel = SinglePrefillWithKVCacheKernel<
-                                    /*split_kv=*/true, GROUP_SIZE, CAUSAL, LAYOUT, ROTARY_MODE,
+                                auto partition_kv_kernel = SinglePrefillWithKVCacheKernel<
+                                    /*partition_kv=*/true, GROUP_SIZE, CAUSAL, LAYOUT, ROTARY_MODE,
                                     num_frags_x, num_frags_y, num_frags_z, num_warps, DTypeIn,
                                     DTypeQKAccum, DTypeOut>;
                                 tensor_info_t<LAYOUT, GROUP_SIZE, HEAD_DIM> qkv_info(qo_len, kv_len,
@@ -1374,14 +1375,15 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
                                 uint32_t smem_size = (num_frags_x * num_warps + num_frags_z * 2) *
                                                      16 * head_dim * sizeof(DTypeIn);
                                 FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
-                                    split_kv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    smem_size));
+                                    partition_kv_kernel,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
                                 int num_blocks_per_sm = 0;
                                 int num_sm = 0;
                                 FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
                                     &num_sm, cudaDevAttrMultiProcessorCount, dev_id));
                                 FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                                    &num_blocks_per_sm, split_kv_kernel, num_threads, smem_size));
+                                    &num_blocks_per_sm, partition_kv_kernel, num_threads,
+                                    smem_size));
                                 uint32_t num_chunks =
                                     min((num_blocks_per_sm * num_sm) /
                                             (num_kv_heads *
@@ -1450,20 +1452,20 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
     SWITCH_NUM_FRAGS_Z(min(max_num_frags_z_smem, max_num_frags_z_reg), num_frags_z, {
       constexpr uint32_t num_threads = num_warps * warp_size;
       constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
-      auto split_kv_kernel =
-          SinglePrefillWithKVCacheKernel</*split_kv=*/true, GROUP_SIZE, CAUSAL, LAYOUT, ROTARY_MODE,
-                                         num_frags_x, num_frags_y, num_frags_z, num_warps, DTypeIn,
-                                         DTypeQKAccum, DTypeOut>;
+      auto partition_kv_kernel =
+          SinglePrefillWithKVCacheKernel</*partition_kv=*/true, GROUP_SIZE, CAUSAL, LAYOUT,
+                                         ROTARY_MODE, num_frags_x, num_frags_y, num_frags_z,
+                                         num_warps, DTypeIn, DTypeQKAccum, DTypeOut>;
       tensor_info_t<LAYOUT, GROUP_SIZE, HEAD_DIM> qkv_info(qo_len, kv_len, num_kv_heads);
       uint32_t smem_size =
           (num_frags_x * num_warps + num_frags_z * 2) * 16 * HEAD_DIM * sizeof(DTypeIn);
       FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
-          split_kv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+          partition_kv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
       int num_blocks_per_sm = 0;
       int num_sm = 0;
       FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
       FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-          &num_blocks_per_sm, split_kv_kernel, num_threads, smem_size));
+          &num_blocks_per_sm, partition_kv_kernel, num_threads, smem_size));
       uint32_t num_chunks =
           min((num_blocks_per_sm * num_sm) /
                   (num_kv_heads * ceil_div(qo_len * GROUP_SIZE, num_rows_per_cta)),
@@ -1472,7 +1474,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
       if (num_chunks <= 1 || tmp == nullptr) {
         // Enough parallelism, do not split-kv
         auto kernel =
-            SinglePrefillWithKVCacheKernel</*split_kv=*/false, GROUP_SIZE, CAUSAL, LAYOUT,
+            SinglePrefillWithKVCacheKernel</*partition_kv=*/false, GROUP_SIZE, CAUSAL, LAYOUT,
                                            ROTARY_MODE, num_frags_x, num_frags_y, num_frags_z,
                                            num_warps, DTypeIn, DTypeQKAccum, DTypeOut>;
         void* args[] = {(void*)&q,
@@ -1506,7 +1508,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
         dim3 nblks(ceil_div(qo_len * GROUP_SIZE, num_rows_per_cta), num_chunks, num_kv_heads);
         dim3 nthrs(32, num_warps);
         FLASHINFER_CUDA_CALL(
-            cudaLaunchKernel((void*)split_kv_kernel, nblks, nthrs, args, smem_size, stream));
+            cudaLaunchKernel((void*)partition_kv_kernel, nblks, nthrs, args, smem_size, stream));
         const uint32_t num_qo_heads = num_kv_heads * GROUP_SIZE;
         FLASHINFER_CUDA_CALL(
             MergeStates((DTypeOut*)tmp,

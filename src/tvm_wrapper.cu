@@ -166,8 +166,8 @@ int _FlashInferSingleDecodeWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, DL
       q->dtype, dtype_in, {SWITCH_TVM_CUDA_DTYPE(o->dtype, dtype_out, {
         cudaError_t status = SingleDecodeWithKVCache(
             (dtype_in*)q->data, (dtype_in*)k->data, (dtype_in*)v->data, (dtype_out*)o->data,
-            (float*)tmp->data, num_qo_heads, num_kv_heads, seq_len, head_dim, QKVLayout(qkv_layout),
-            RotaryMode(rotary_mode), rope_scale, rope_theta, 0);
+            (dtype_out*)tmp->data, num_qo_heads, num_kv_heads, seq_len, head_dim,
+            QKVLayout(qkv_layout), RotaryMode(rotary_mode), rope_scale, rope_theta, 0);
         if (status != cudaSuccess) {
           LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
         }

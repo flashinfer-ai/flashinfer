@@ -30,6 +30,36 @@ enum class PageStorage {
 };
 
 /*!
+ * \brief The auxiliary information about kv sequence partitioning
+ */
+template <typename IdType>
+struct kv_partition_info_t {
+  uint32_t batch_size_before_partition;
+  IdType* chunk_indptr;
+  IdType* batch_idx_map;
+  IdType* chunk_start_pos;
+  IdType* seq_lens_before_partition;
+
+  __host__ __device__ __forceinline__ kv_partition_info_t(uint32_t batch_size_before_partition,
+                                                          IdType* chunk_indptr,
+                                                          IdType* batch_idx_map,
+                                                          IdType* chunk_start_pos,
+                                                          IdType* seq_lens_before_partition)
+      : batch_size_before_partition(batch_size_before_partition),
+        chunk_indptr(chunk_indptr),
+        batch_idx_map(batch_idx_map),
+        chunk_start_pos(chunk_start_pos),
+        seq_lens_before_partition(seq_lens_before_partition) {}
+
+  __host__ __device__ __forceinline__ kv_partition_info_t()
+      : batch_size_before_partition(0),
+        chunk_indptr(nullptr),
+        batch_idx_map(nullptr),
+        chunk_start_pos(nullptr),
+        seq_lens_before_partition(nullptr) {}
+};
+
+/*!
  * \brief Paged key-value cache
  * \tparam page_storage Whether to store indices or pointers of each active page
  * \tparam DType The data type of the key-value cache
@@ -56,24 +86,6 @@ struct paged_kv_t {
   // [batch_size] The offset of the last page for each request in the batch
   IdType* last_page_len;
 
-  /* ------------ Auxliary Information Used in Cooperative Kernels ------------ */
-  IdType* cooperative_aux_info;
-  __host__ __device__ __forceinline__ IdType* cooperative_indptr() const {
-    return cooperative_aux_info;
-  }
-
-  __host__ __device__ __forceinline__ IdType* batch_idx_map() const {
-    return cooperative_aux_info + batch_size + 1;
-  }
-
-  __host__ __device__ __forceinline__ IdType* chunk_start() const {
-    return cooperative_aux_info + 2 * batch_size + 1;
-  }
-
-  __host__ __device__ __forceinline__ IdType* seq_lens_before_split() const {
-    return cooperative_aux_info + 3 * batch_size + 1;
-  }
-
   /*!
    * \brief Construct an empty paged key-value cache
    */
@@ -86,11 +98,10 @@ struct paged_kv_t {
         indices(nullptr),
         ptrs(nullptr),
         indptr(nullptr),
-        last_page_len(nullptr),
-        cooperative_aux_info(nullptr) {}
+        last_page_len(nullptr) {}
 
   /*!
-   * \brief Construct a paged key-value cache for non-cooperative kernels
+   * \brief Construct a paged key-value cache
    * \param num_heads The number of heads
    * \param page_size The size of each page
    * \param head_dim The dimension of each head
@@ -112,11 +123,10 @@ struct paged_kv_t {
         data(data),
         indices(indices),
         indptr(indptr),
-        last_page_len(last_page_len),
-        cooperative_aux_info(nullptr) {}
+        last_page_len(last_page_len) {}
 
   /*!
-   * \brief Construct a paged key-value cache for non-cooperative kernels
+   * \brief Construct a paged key-value cache
    * \param num_heads The number of heads
    * \param page_size The size of each page
    * \param head_dim The dimension of each head
@@ -135,63 +145,7 @@ struct paged_kv_t {
         head_dim(head_dim),
         batch_size(batch_size),
         ptrs(ptrs),
-        indptr(indptr),
-        last_page_len(last_page_len),
-        cooperative_aux_info(nullptr) {}
-
-  /*!
-   * \brief Construct a paged key-value cache with auxiliary information for cooperative kernels
-   * \param num_heads The number of heads
-   * \param page_size The size of each page
-   * \param head_dim The dimension of each head
-   * \param batch_size The batch size
-   * \param data The flattened key-value cache
-   * \param indices The page indices array
-   * \param indptr The page indptr array
-   * \param last_page_len The offset of the last page for each request in the batch
-   * \param cooperative_aux_info The auxiliary information used in cooperative kernels
-   * \note This constructor should only be used when page_storage == kIndices
-   */
-  __host__ __device__ __forceinline__ paged_kv_t(uint32_t num_heads, uint32_t page_size,
-                                                 uint32_t head_dim, uint32_t batch_size,
-                                                 DType* data, IdType* indices, IdType* indptr,
-                                                 IdType* last_page_len,
-                                                 IdType* cooperative_aux_info)
-      : num_heads(num_heads),
-        page_size(page_size),
-        head_dim(head_dim),
-        batch_size(batch_size),
-        data(data),
-        indices(indices),
-        indptr(indptr),
-        last_page_len(last_page_len),
-        cooperative_aux_info(cooperative_aux_info) {}
-
-  /*!
-   * \brief Construct a paged key-value cache with auxiliary information for cooperative kernels
-   * \param num_heads The number of heads
-   * \param page_size The size of each page
-   * \param head_dim The dimension of each head
-   * \param batch_size The batch size
-   * \param ptrs The array of pointers to each active page
-   * \param indptr The page indptr array
-   * \param last_page_len The offset of the last page for each request in the batch
-   * \param cooperative_aux_info The auxiliary information used in cooperative kernels
-   * \note This constructor should only be used when page_storage == kIndices
-   */
-  __host__ __device__ __forceinline__ paged_kv_t(uint32_t num_heads, uint32_t page_size,
-                                                 uint32_t head_dim, uint32_t batch_size,
-                                                 DType** ptrs, IdType* indptr,
-                                                 IdType* last_page_len,
-                                                 IdType* cooperative_aux_info)
-      : num_heads(num_heads),
-        page_size(page_size),
-        head_dim(head_dim),
-        batch_size(batch_size),
-        ptrs(ptrs),
-        indptr(indptr),
-        last_page_len(last_page_len),
-        cooperative_aux_info(cooperative_aux_info) {}
+        indptr(indptr) {}
 
   /*!
    * \brief Compute the offset of k element in the allocated buffer.
