@@ -228,6 +228,10 @@ __global__ void MergeStatesLargeNumIndexSetsKernel(DTypeIn* __restrict__ V, floa
     __syncthreads();
     vec_t<float, vec_size> v;
     v.cast_load(v_smem + ((iter % num_smem_stages) * bdy + ty) * head_dim + tx * vec_size);
+    if (iter * bdy + ty < num_index_sets) {
+      float s = s_smem[(iter % bdx) * bdy + ty];
+      st.merge(v, s, 1);
+    }
     __syncthreads();
     cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
         v_smem + ((iter % num_smem_stages) * bdy + ty) * head_dim + tx * vec_size,
@@ -238,10 +242,6 @@ __global__ void MergeStatesLargeNumIndexSetsKernel(DTypeIn* __restrict__ V, floa
             tx * vec_size,
         (iter + num_smem_stages) * bdy + ty < num_index_sets);
     cp_async::commit_group();
-    if (iter * bdy + ty < num_index_sets) {
-      float s = s_smem[(iter % bdx) * bdy + ty];
-      st.merge(v, s, 1);
-    }
   }
   cp_async::wait_group<0>();
   __syncthreads();
@@ -266,7 +266,7 @@ __global__ void MergeStatesLargeNumIndexSetsKernel(DTypeIn* __restrict__ V, floa
  * \tparam DTypeIn The data type of v.
  * \tparam DTypeOut The data type of v_merged.
  * \param V The partial v of index sets. (nnz, h, d)
- * \param S The logsumexp value of index sets. (nnz, n, h)
+ * \param S The logsumexp value of index sets. (nnz, h)
  * \param indptr The start offsets of each position in the variable length array.
  * \param v_merged The merged v of index sets union. (n, h, d)
  * \param s_merged The merged logsumexp value of index sets union. (n, h)
@@ -312,6 +312,10 @@ __global__ void VariableLengthMergeStatesKernel(DTypeIn* __restrict__ V, float* 
     __syncthreads();
     vec_t<float, vec_size> v;
     v.cast_load(v_smem + ((iter % num_smem_stages) * bdy + ty) * head_dim + tx * vec_size);
+    if (iter * bdy + ty < num_index_sets) {
+      float s = s_smem[(iter % bdx) * bdy + ty];
+      st.merge(v, s, 1);
+    }
     __syncthreads();
     cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
         v_smem + ((iter % num_smem_stages) * bdy + ty) * head_dim + tx * vec_size,
@@ -321,10 +325,6 @@ __global__ void VariableLengthMergeStatesKernel(DTypeIn* __restrict__ V, float* 
             tx * vec_size,
         (iter + num_smem_stages) * bdy + ty < num_index_sets);
     cp_async::commit_group();
-    if (iter * bdy + ty < num_index_sets) {
-      float s = s_smem[(iter % bdx) * bdy + ty];
-      st.merge(v, s, 1);
-    }
   }
   cp_async::wait_group<0>();
   __syncthreads();

@@ -525,18 +525,18 @@ void TestTwoLevelSinglePrefixCascadeAppendCorrectness() {
   }
 }
 
-// TEST(FlashInferCorrectnessTest, MergeKernelCorrectnessTestFP16) {
-//   TestMergeKernelCorrectness<half>();
-// }
+TEST(FlashInferCorrectnessTest, MergeKernelCorrectnessTestFP16) {
+  TestMergeKernelCorrectness<half>();
+}
 
 TEST(FlashInferCorrectnessTest, VariableLengthMergeKernelCorrectnessTestFP16) {
   TestVariableLengthMergeKernelCorrectness<half>();
 }
 
-// TEST(FlashInferCorrectnessTest, TwoLevelSinglePrefixCascadeDecodeTestFP16) {
-//   TestTwoLevelSinglePrefixCascadeDecodeCorrectness<half>();
-// }
+TEST(FlashInferCorrectnessTest, TwoLevelSinglePrefixCascadeDecodeTestFP16) {
+  TestTwoLevelSinglePrefixCascadeDecodeCorrectness<half>();
+}
 
-// TEST(FlashInferCorrectnessTest, TwoLevelSinglePrefixCascadeAppendTestFP16) {
-//   TestTwoLevelSinglePrefixCascadeAppendCorrectness<half>();
-// }
+TEST(FlashInferCorrectnessTest, TwoLevelSinglePrefixCascadeAppendTestFP16) {
+  TestTwoLevelSinglePrefixCascadeAppendCorrectness<half>();
+}
