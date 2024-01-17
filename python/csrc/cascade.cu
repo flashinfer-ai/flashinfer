@@ -65,8 +65,8 @@ std::vector<torch::Tensor> merge_states(torch::Tensor v, torch::Tensor s) {
   CHECK_EQ(v.size(0), s.size(0));
   CHECK_EQ(v.size(1), s.size(1));
   CHECK_EQ(v.size(2), s.size(2));
-  unsigned int num_index_sets = v.size(0);
-  unsigned int seq_len = v.size(1);
+  unsigned int seq_len = v.size(0);
+  unsigned int num_index_sets = v.size(1);
   unsigned int num_heads = v.size(2);
   unsigned int head_dim = v.size(3);
   s = s.to(torch::kFloat32);

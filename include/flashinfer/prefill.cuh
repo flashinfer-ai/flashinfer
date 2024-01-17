@@ -803,8 +803,8 @@ __global__ void SinglePrefillWithKVCacheKernel(
   DTypeIn* q_ptr_base = q + qkv_info.get_qo_elem_offset(qo_idx_base, kv_head_idx * group_size,
                                                         (tx % 8) * num_elems_per_128b<DTypeIn>());
   DTypeOut* o_ptr_base =
-      split_kv ? ((DTypeOut*)tmp) + chunk_idx * qo_len * qkv_info.get_num_qo_heads() * head_dim +
-                     qkv_info.get_qo_elem_offset(qo_idx_base, kv_head_idx * group_size,
+      split_kv ? ((DTypeOut*)tmp) + chunk_idx * qkv_info.get_num_qo_heads() * head_dim +
+                     qkv_info.get_qo_elem_offset(qo_idx_base * num_chunks, kv_head_idx * group_size,
                                                  (tx % 8) * num_elems_per_128b<DTypeOut>())
                : o + qkv_info.get_qo_elem_offset(qo_idx_base, kv_head_idx * group_size,
                                                  (tx % 8) * num_elems_per_128b<DTypeOut>());
@@ -910,8 +910,9 @@ __global__ void SinglePrefillWithKVCacheKernel(
   normalize_d<num_frags_x, num_frags_y>(o_frag, d);
 
   // write back
-  write_o_reg_gmem<group_size, num_frags_x, num_frags_y>(o_frag, &qo_smem, o_ptr_base, qo_idx_base,
-                                                         qo_len, qo_n_stride, qo_h_stride);
+  write_o_reg_gmem<group_size, num_frags_x, num_frags_y>(
+      o_frag, &qo_smem, o_ptr_base, qo_idx_base, qo_len,
+      split_kv ? qo_n_stride * num_chunks : qo_n_stride, qo_h_stride);
 
   // write lse
   if (lse != nullptr || split_kv) {
@@ -926,8 +927,8 @@ __global__ void SinglePrefillWithKVCacheKernel(
         if (qo_idx < qo_len) {
           if constexpr (split_kv) {
             float* tmp_lse =
-                (float*)(((DTypeOut*)tmp) + num_chunks * qo_len * num_qo_heads * head_dim);
-            tmp_lse[(chunk_idx * qo_len + qo_idx) * num_qo_heads + qo_head_idx] =
+                (float*)(((DTypeOut*)tmp) + qo_len * num_chunks * num_qo_heads * head_dim);
+            tmp_lse[(qo_idx * num_chunks + chunk_idx) * num_qo_heads + qo_head_idx] =
                 math::ptx_log2(d[fx][j]) + float(m[fx][j]);
           } else {
             lse[qo_idx * num_qo_heads + qo_head_idx] = math::ptx_log2(d[fx][j]) + float(m[fx][j]);

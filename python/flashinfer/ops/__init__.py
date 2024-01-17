@@ -265,10 +265,10 @@ def merge_states(v: torch.Tensor, s: torch.Tensor):
     ----------
     v : torch.Tensor
         The attention output from the KV segments.
-        Shape: [num_kv_segments, seq_len, num_heads, head_dim]
+        Shape: [seq_len, num_kv_segments, num_heads, head_dim]
     s : torch.Tensor
         The logsumexp value from the KV segments.
-        Shape: [num_kv_segments, seq_len, num_heads]
+        Shape: [seq_len, num_kv_segments, num_heads]
 
     Returns
     -------
