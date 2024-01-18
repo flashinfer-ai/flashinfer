@@ -733,7 +733,7 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& 
                                                   RotaryMode rotary_mode = RotaryMode::kNone,
                                                   cudaStream_t stream = nullptr) {
   const uint32_t GROUP_SIZE = num_qo_heads / num_kv_heads;
-  if (seq_len <= 128U / uint32_t(std::sqrt(GROUP_SIZE))) {
+  if (seq_len <= 256U) {
     tmp_size = 0;
   } else {
     SWITCH_GQA_GROUP_SIZE(
@@ -1099,7 +1099,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
               }
               std::tie(max_num_pages_per_batch, new_batch_size) =
                   SplitPagedKVCacheBinarySearchMinNumPagePerBatch(max_grid_size, num_kv_heads,
-                                                                  num_pages, 512 / page_size);
+                                                                  num_pages, 128 / page_size);
               if (new_batch_size == batch_size) {
                 // do not use partition-kv kernel for short sequence
                 tmp_size = 0;
