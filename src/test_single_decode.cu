@@ -40,7 +40,7 @@ void _TestDecodingKernelCorrectness(size_t num_qo_heads, size_t num_kv_heads, si
   thrust::device_vector<T> K(K_host);
   thrust::device_vector<T> V(V_host);
   thrust::device_vector<T> O(O_host);
-  thrust::device_vector<float> tmp(512 * num_qo_heads * head_dim);
+  thrust::device_vector<T> tmp(16 * 1024 * 1024);
   std::vector<T> o_ref_host;
 
   o_ref_host = cpu_reference::single_mha<T, T>(Q_host, K_host, V_host, 1, seq_len, num_qo_heads,
@@ -55,7 +55,7 @@ void _TestDecodingKernelCorrectness(size_t num_qo_heads, size_t num_kv_heads, si
                                  << cudaGetErrorString(status);
 
   thrust::host_vector<T> o_host = O;
-  thrust::host_vector<float> tmp_host = tmp;
+  thrust::host_vector<T> tmp_host = tmp;
 
   size_t num_result_errors_atol_1e_3_rtol_1e_3 = 0;
   bool nan_detected = false;
