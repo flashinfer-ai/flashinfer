@@ -99,7 +99,7 @@ class BatchDecodeHandler {
       FLASHINFER_CUDA_CALL(cudaMallocAsync(
           &int_buffer_, sizeof(IdType) * (5 * new_batch_size + batch_size_before_partition_ + 2),
           stream_));
-      FLASHINFER_CUDA_CALL(SplitPagedCacheKVComputeAuxiliaryInfo(
+      FLASHINFER_CUDA_CALL(PartitionKVCacheComputeAuxiliaryInfo(
           max_num_pages_per_batch, batch_size, page_size, indptr, last_page_len,
           GetNewIndPtr<IdType>(), GetNewLastPageLen<IdType>(), GetChunkIndPtr<IdType>(),
           GetBatchIdxMap<IdType>(), GetChunkStartPos<IdType>(),
