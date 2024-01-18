@@ -918,7 +918,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
  * \return status Indicates whether CUDA calls are successful
  */
 template <typename IdType>
-cudaError_t PartitionPagedCacheKVComputeAuxiliaryInfo(
+cudaError_t PartitionPagedKVCacheComputeAuxiliaryInfo(
     const uint32_t max_num_pages_per_batch, const uint32_t old_batch_size, const uint32_t page_size,
     IdType* old_indptr, IdType* old_last_page_len, IdType* new_indptr_d,
     IdType* new_last_page_len_d, IdType* chunk_indptr_d, IdType* batch_idx_map_d,
