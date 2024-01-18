@@ -58,7 +58,7 @@ class BatchDecodeHandler {
   IdType* GetBatchIdxMap() const {
     if (int_buffer_ != nullptr) {
       return ((IdType*)int_buffer_) + 2 * batch_size_after_partition_ +
-             batch_size_before_partition_ + 1;
+             batch_size_before_partition_ + 2;
     } else {
       return nullptr;
     }
