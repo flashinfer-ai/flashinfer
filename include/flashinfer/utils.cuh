@@ -44,6 +44,21 @@
   }
 #endif
 
+#define SWITCH_DEVICE_PTR(maybe_device_ptr, host_ptr, length, stream, ...)                    \
+  using ptr_t = decltype(maybe_device_ptr);                                                   \
+  using elem_t = std::remove_pointer_t<ptr_t>;                                                \
+  if (is_device_ptr(maybe_device_ptr)) {                                                      \
+    std::vector<elem_t> host_vec(length);                                                     \
+    ptr_t host_ptr = host_vec.data();                                                        \
+    FLASHINFER_CUDA_CALL(cudaMemcpyAsync(host_ptr, maybe_device_ptr, sizeof(elem_t) * length, \
+                                         cudaMemcpyDeviceToHost, stream));                    \
+    FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));                                      \
+    __VA_ARGS__                                                                               \
+  } else {                                                                                    \
+    ptr_t host_ptr = maybe_device_ptr;                                                       \
+    __VA_ARGS__                                                                               \
+  }
+
 #define SWITCH_SPLIT_QO_INDPTR(split_qo_indptr, SPLIT_QO_INDPTR, ...) \
   if (split_qo_indptr) {                                              \
     constexpr bool SPLIT_QO_INDPTR = true;                            \

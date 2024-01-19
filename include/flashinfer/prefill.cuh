@@ -1928,9 +1928,10 @@ cudaError_t BatchPrefillWithPagedKVCache(
 
   uint32_t num_frags_x, num_qo_tiles;
   std::vector<IdType> request_indices_h, tile_indices_h;
-  std::tie(num_frags_x, num_qo_tiles, request_indices_h, tile_indices_h) =
-      split_qo_indptr(qo_indptr, batch_size, group_size, stream);
-
+  SWITCH_DEVICE_PTR(qo_indptr, qo_indptr_h, batch_size + 1, stream, {
+    std::tie(num_frags_x, num_qo_tiles, request_indices_h, tile_indices_h) =
+        split_qo_indptr(qo_indptr_h, batch_size, group_size, stream);
+  });
   IdType* request_indices_d;
   IdType* tile_indices_d;
 
