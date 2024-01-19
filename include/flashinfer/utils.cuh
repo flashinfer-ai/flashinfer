@@ -49,13 +49,13 @@
   using elem_t = std::remove_pointer_t<ptr_t>;                                                \
   if (is_device_ptr(maybe_device_ptr)) {                                                      \
     std::vector<elem_t> host_vec(length);                                                     \
-    ptr_t host_ptr = host_vec.data();                                                        \
+    ptr_t host_ptr = host_vec.data();                                                         \
     FLASHINFER_CUDA_CALL(cudaMemcpyAsync(host_ptr, maybe_device_ptr, sizeof(elem_t) * length, \
                                          cudaMemcpyDeviceToHost, stream));                    \
     FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));                                      \
     __VA_ARGS__                                                                               \
   } else {                                                                                    \
-    ptr_t host_ptr = maybe_device_ptr;                                                       \
+    ptr_t host_ptr = maybe_device_ptr;                                                        \
     __VA_ARGS__                                                                               \
   }
 
