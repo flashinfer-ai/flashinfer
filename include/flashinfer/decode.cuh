@@ -924,25 +924,11 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
 template <typename IdType>
 cudaError_t PartitionPagedKVCacheComputeAuxiliaryInfo(
     const uint32_t max_num_pages_per_batch, const uint32_t old_batch_size, const uint32_t page_size,
-    IdType* old_indptr, IdType* old_last_page_len, IdType* new_indptr_d,
+    IdType* old_indptr_h, IdType* old_last_page_len_h, IdType* new_indptr_d,
     IdType* new_last_page_len_d, IdType* chunk_indptr_d, IdType* batch_idx_map_d,
     IdType* chunk_start_d, IdType* seq_lens_before_partition_d, cudaStream_t stream = nullptr) {
   std::vector<IdType> new_page_indptr_h{0}, new_last_page_len_h, chunk_indptr_h{0}, batch_idx_map_h,
       chunk_start_pos_h, seq_lens_before_partition_h;
-
-  std::vector<IdType> old_indptr_h(old_batch_size + 1), old_last_page_len_h(old_batch_size);
-  if (is_device_ptr(old_indptr)) {
-    FLASHINFER_CUDA_CALL(cudaMemcpyAsync(old_indptr_h.data(), old_indptr,
-                                         sizeof(IdType) * (old_batch_size + 1),
-                                         cudaMemcpyDeviceToHost, stream));
-    FLASHINFER_CUDA_CALL(cudaMemcpyAsync(old_last_page_len_h.data(), old_last_page_len,
-                                         sizeof(IdType) * old_batch_size, cudaMemcpyDeviceToHost,
-                                         stream));
-    FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
-  } else {
-    old_indptr_h.assign(old_indptr, old_indptr + old_batch_size + 1);
-    old_last_page_len_h.assign(old_last_page_len, old_last_page_len + old_batch_size);
-  }
 
   for (uint32_t batch_idx = 0; batch_idx < old_batch_size; batch_idx++) {
     uint32_t num_chunks =
@@ -992,16 +978,16 @@ cudaError_t PartitionPagedKVCacheComputeAuxiliaryInfo(
 }
 
 /*!
- * \brief Compute the maximum number of pages per batch and the new batch size
+ * \brief Compute the number of pages per batch and the new batch size
  *   after we partition Paged KV-Cache into multiple chunks on KV sequence length
  *   dimension.
  * \tparam IdType A template type indicates the index data type
  * \param max_grid_size The maximum grid size of the kernel
  * \param num_kv_heads The number of KV heads
  * \param num_pages The number of pages per request in the batch
- * \param max_num_pages_per_batch_lb The pre-set lower bound of maximum number of
+ * \param min_num_pages_per_batch The pre-set minimum number of
  *   pages per batch, default to 1
- * \return (max_num_pages_per_batch, new_batch_size) The number of pages per batch and
+ * \return (num_pages_per_batch, new_batch_size) The number of pages per batch and
  *   the new batch size after the partition.
  */
 template <typename IdType>
@@ -1052,7 +1038,7 @@ std::pair<uint32_t, uint32_t> PartitionPagedKVCacheBinarySearchMinNumPagePerBatc
 template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
     uint32_t& tmp_size, uint32_t& max_grid_size, uint32_t& max_num_pages_per_batch,
-    uint32_t& new_batch_size, uint32_t batch_size, IdType* kv_indptr, const uint32_t num_qo_heads,
+    uint32_t& new_batch_size, uint32_t batch_size, IdType* kv_indptr_h, const uint32_t num_qo_heads,
     const uint32_t num_kv_heads, const uint32_t head_dim, const uint32_t page_size,
     const RotaryMode rotary_mode = RotaryMode::kNone, cudaStream_t stream = nullptr) {
   SWITCH_GQA_GROUP_SIZE(
@@ -1091,16 +1077,9 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
               new_batch_size = batch_size;
             } else {
               // compute max_num_pages_per_batch and new_batch_size
-              std::vector<IdType> page_indptr_h(batch_size + 1), num_pages(batch_size);
-              if (is_device_ptr(kv_indptr)) {
-                FLASHINFER_CUDA_CALL(cudaMemcpy(page_indptr_h.data(), kv_indptr,
-                                                sizeof(IdType) * (batch_size + 1),
-                                                cudaMemcpyDeviceToHost));
-              } else {
-                page_indptr_h.assign(kv_indptr, kv_indptr + batch_size + 1);
-              }
+              std::vector<IdType> num_pages(batch_size);
               for (uint32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-                num_pages[batch_idx] = page_indptr_h[batch_idx + 1] - page_indptr_h[batch_idx];
+                num_pages[batch_idx] = kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx];
               }
               std::tie(max_num_pages_per_batch, new_batch_size) =
                   PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(max_grid_size, num_kv_heads,

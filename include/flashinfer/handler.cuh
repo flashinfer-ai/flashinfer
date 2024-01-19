@@ -90,21 +90,27 @@ class BatchDecodeHandler {
     uint32_t tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size;
     auto work_estimation_func =
         BatchDecodeWithPagedKVCacheWorkEstimation<page_storage, DTypeIn, DTypeOut, IdType>;
-    FLASHINFER_CUDA_CALL(work_estimation_func(
-        tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size, batch_size, indptr,
-        num_qo_heads, num_kv_heads, head_dim, page_size, rotary_mode, stream_));
-    batch_size_after_partition_ = new_batch_size;
-    if (tmp_size > 0) {
-      FLASHINFER_CUDA_CALL(cudaMallocAsync(&float_buffer_, tmp_size, stream_));
-      FLASHINFER_CUDA_CALL(cudaMallocAsync(
-          &int_buffer_, sizeof(IdType) * (5 * new_batch_size + batch_size_before_partition_ + 2),
-          stream_));
-      FLASHINFER_CUDA_CALL(PartitionPagedKVCacheComputeAuxiliaryInfo(
-          max_num_pages_per_batch, batch_size, page_size, indptr, last_page_len,
-          GetNewIndPtr<IdType>(), GetNewLastPageLen<IdType>(), GetChunkIndPtr<IdType>(),
-          GetBatchIdxMap<IdType>(), GetChunkStartPos<IdType>(),
-          GetSeqLengthsBeforePartition<IdType>(), stream_));
-    }
+
+    SWITCH_DEVICE_PTR(indptr, indptr_h, batch_size + 1, stream_, {
+      SWITCH_DEVICE_PTR(last_page_len, last_page_len_h, batch_size, stream_, {
+        FLASHINFER_CUDA_CALL(work_estimation_func(
+            tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size, batch_size, indptr_h,
+            num_qo_heads, num_kv_heads, head_dim, page_size, rotary_mode, stream_));
+        batch_size_after_partition_ = new_batch_size;
+        if (tmp_size > 0) {
+          FLASHINFER_CUDA_CALL(cudaMallocAsync(&float_buffer_, tmp_size, stream_));
+          FLASHINFER_CUDA_CALL(cudaMallocAsync(
+              &int_buffer_,
+              sizeof(IdType) * (5 * new_batch_size + batch_size_before_partition_ + 2), stream_));
+          FLASHINFER_CUDA_CALL(PartitionPagedKVCacheComputeAuxiliaryInfo(
+              max_num_pages_per_batch, batch_size, page_size, indptr_h, last_page_len_h,
+              GetNewIndPtr<IdType>(), GetNewLastPageLen<IdType>(), GetChunkIndPtr<IdType>(),
+              GetBatchIdxMap<IdType>(), GetChunkStartPos<IdType>(),
+              GetSeqLengthsBeforePartition<IdType>(), stream_));
+        }
+      });
+    });
+
     forward_started_ = true;
     return cudaSuccess;
   }
@@ -180,8 +186,10 @@ class BatchPrefillHandler {
     }
     uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
     std::vector<IdType> request_indices_h, tile_indices_h;
-    std::tie(num_frags_x_, num_qo_tiles_, request_indices_h, tile_indices_h) =
-        split_qo_indptr(qo_indptr, batch_size, gqa_group_size, stream_);
+    SWITCH_DEVICE_PTR(qo_indptr, qo_indptr_h, batch_size + 1, stream_, {
+      std::tie(num_frags_x_, num_qo_tiles_, request_indices_h, tile_indices_h) =
+          split_qo_indptr(qo_indptr_h, batch_size, gqa_group_size, stream_);
+    });
     FLASHINFER_CUDA_CALL(cudaMalloc(&request_indices_, sizeof(IdType) * request_indices_h.size()));
     FLASHINFER_CUDA_CALL(cudaMalloc(&tile_indices_, sizeof(IdType) * tile_indices_h.size()));
     FLASHINFER_CUDA_CALL(cudaMemcpyAsync(request_indices_, request_indices_h.data(),

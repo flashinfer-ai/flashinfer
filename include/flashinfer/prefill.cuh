@@ -46,6 +46,78 @@ constexpr uint32_t warp_size = 32;
 
 namespace {
 
+template <typename IdType>
+cudaError_t PrefillPartitionPagedKVCacheComputeAuxiliaryInfo(
+    const uint32_t max_num_pages_per_batch, const uint32_t old_batch_size, const uint32_t page_size,
+    IdType* qo_indptr_h, IdType* old_kv_indptr_h, IdType* old_kv_last_page_len_h,
+    IdType* new_kv_indptr_d, IdType* new_kv_last_page_len_d, IdType* chunk_indptr_d,
+    IdType* batch_idx_map_d, IdType* chunk_start_d, IdType* seq_lens_before_partition_d,
+    cudaStream_t stream = nullptr) {
+  std::vector<IdType> new_kv_indptr_h{0}, new_kv_last_page_len_h, chunk_indptr_h{0},
+      batch_idx_map_h, chunk_start_pos_h, seq_lens_before_partition_h;
+
+  for (uint32_t batch_idx = 0; batch_idx < old_batch_size; batch_idx++) {
+    uint32_t num_chunks = ceil_div(old_kv_indptr_h[batch_idx + 1] - old_kv_indptr_h[batch_idx],
+                                   max_num_pages_per_batch);
+    for (uint32_t row_idx = qo_indptr_h[batch_idx]; row_idx < qo_indptr_h[batch_idx + 1];
+         ++row_idx) {
+      chunk_indptr_h.push_back(chunk_indptr_h.back() + num_chunks);
+    }
+    if (num_chunks == 0) {
+      new_kv_indptr_h.push_back(old_kv_indptr_h[batch_idx]);
+      new_kv_last_page_len_h.push_back(0);
+      batch_idx_map_h.push_back(batch_idx);
+      chunk_start_pos_h.push_back(0);
+      seq_lens_before_partition_h.push_back(0);
+    } else {
+      uint32_t seq_len_before_partition =
+          (old_kv_indptr_h[batch_idx + 1] - old_kv_indptr_h[batch_idx] - 1) * page_size +
+          old_kv_last_page_len_h[batch_idx];
+      for (uint32_t j = 0; j < num_chunks; ++j) {
+        bool is_last = (j + 1) == num_chunks;
+        new_kv_indptr_h.push_back(
+            min(old_kv_indptr_h[batch_idx] + (j + 1) * max_num_pages_per_batch,
+                old_kv_indptr_h[batch_idx + 1]));
+        new_kv_last_page_len_h.push_back(is_last ? old_kv_last_page_len_h[batch_idx] : page_size);
+        batch_idx_map_h.push_back(batch_idx);
+        chunk_start_pos_h.push_back(j * max_num_pages_per_batch * page_size);
+        seq_lens_before_partition_h.push_back(seq_len_before_partition);
+      }
+    }
+  }
+
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(new_kv_indptr_d, new_kv_indptr_h.data(),
+                                       sizeof(IdType) * new_kv_indptr_h.size(),
+                                       cudaMemcpyHostToDevice, stream));
+
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(new_kv_last_page_len_d, new_kv_last_page_len_h.data(),
+                                       sizeof(IdType) * new_kv_last_page_len_h.size(),
+                                       cudaMemcpyHostToDevice, stream));
+
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(chunk_indptr_d, chunk_indptr_h.data(),
+                                       sizeof(IdType) * chunk_indptr_h.size(),
+                                       cudaMemcpyHostToDevice, stream));
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(batch_idx_map_d, batch_idx_map_h.data(),
+                                       sizeof(IdType) * batch_idx_map_h.size(),
+                                       cudaMemcpyHostToDevice, stream));
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(chunk_start_d, chunk_start_pos_h.data(),
+                                       sizeof(IdType) * chunk_start_pos_h.size(),
+                                       cudaMemcpyHostToDevice, stream));
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(
+      seq_lens_before_partition_d, seq_lens_before_partition_h.data(),
+      sizeof(IdType) * seq_lens_before_partition_h.size(), cudaMemcpyHostToDevice, stream));
+
+  return cudaSuccess;
+}
+
+template <typename IdType>
+cudaError_t PrefillPartitionRaggedKVCacheComputeAuxiliaryInfo(const uint32_t old_batch_size,
+                                                              IdType* qo_indptr, IdType* kv_indptr,
+                                                              IdType* chunk_size) {
+  // TODO(Zihao)
+  return cudaSuccess;
+}
+
 /*!
  * \brief Return x - y if x > y, otherwise return 0.
  */
@@ -1296,11 +1368,11 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
 
 /*!
  * \brief Estimate the temporary storage size and the maximum grid size for the
- *   cooperative SinglePrefillWithKVCacheKernel
+ *   partition-kv SinglePrefillWithKVCacheKernel
  * \tparam DTypeIn The data type of input
  * \tparam DTypeOut The data type of output
- * \param tmp_size The estimated temporary storage size, return 0 if not use cooperative kernel.
- * \param max_grid_size The maximum grid size that can be used in a cooperative kernel.
+ * \param tmp_size The estimated temporary storage size, return 0 if not use partition-kv kernel.
+ * \param max_grid_size The maximum grid size that can be used in a partition-kv kernel.
  * \param num_qo_heads The number of query and output heads.
  * \param num_kv_heads The number of key and value heads.
  * \param qo_len The length of query and output.
@@ -1498,7 +1570,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
       } else {
-        // Use cooperative groups to increase occupancy
+        // Partition-kv to increase occupancy
         void* args[] = {(void*)&q,
                         (void*)&k,
                         (void*)&v,
@@ -1532,7 +1604,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
  * \param k The key tensor.
  * \param v The value tensor.
  * \param o The output tensor.
- * \param tmp The temporary storage (only used for cooperative kernel).
+ * \param tmp The temporary storage (only used for partiton-kv kernel).
  * \param lse The logsumexp values.
  * \param num_qo_heads The number of query and output heads.
  * \param num_kv_heads The number of key and value heads.
@@ -1577,16 +1649,10 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOu
 
 template <typename IdType>
 std::tuple<IdType, IdType, std::vector<IdType>, std::vector<IdType>> split_qo_indptr(
-    IdType* qo_indptr, uint32_t batch_size, uint32_t gqa_group_size,
+    IdType* qo_indptr_h, uint32_t batch_size, uint32_t gqa_group_size,
     cudaStream_t stream = nullptr) {
   constexpr uint32_t num_warps = 4;
-  std::vector<IdType> qo_indptr_h(batch_size + 1), request_indices, tile_indices;
-  if (is_device_ptr((void*)qo_indptr)) {
-    cudaMemcpyAsync(qo_indptr_h.data(), qo_indptr, sizeof(IdType) * (batch_size + 1),
-                    cudaMemcpyDeviceToHost, stream);
-  } else {
-    qo_indptr_h.assign(qo_indptr, qo_indptr + batch_size + 1);
-  }
+  std::vector<IdType> request_indices, tile_indices;
 
   const uint32_t total_q_len = qo_indptr_h[batch_size];
   const bool avg_len_greater_than_64 = total_q_len * gqa_group_size > 64 * batch_size;
@@ -1731,7 +1797,7 @@ cudaError_t BatchPrefillWithRaggedKVCache(
  * \param paged_kv The paged kv-cache data structure.
  * \param qo_indptr The index pointer of queries.
  * \param o The output tensor.
- * \param tmp The temporary storage (only used for cooperative kernel).
+ * \param tmp The temporary storage (only used for partition-kv kernel).
  * \param lse The logsumexp value.
  * \param num_qo_heads The number of query and output heads.
  * \param causal Whether to use causal attention.

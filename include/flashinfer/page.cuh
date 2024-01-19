@@ -30,6 +30,19 @@ enum class PageStorage {
 };
 
 /*!
+ * \brief The auxiliary information about qo sequence partitioning
+ */
+template <typename IdType>
+struct qo_partition_info_t {
+  IdType* request_indices;
+  IdType* tile_indices;
+
+  __host__ __device__ __forceinline__ qo_partition_info_t(IdType* request_indices,
+                                                          IdType* tile_indices)
+      : request_indices(request_indices), tile_indices(tile_indices) {}
+};
+
+/*!
  * \brief The auxiliary information about kv sequence partitioning
  */
 template <typename IdType>
