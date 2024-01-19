@@ -1746,12 +1746,19 @@ cudaError_t BatchPrefillWithRaggedKVCache(
   const uint32_t group_size = num_qo_heads / num_kv_heads;
 
   uint32_t num_frags_x, num_qo_tiles;
-  std::vector<IdType> request_indices_h, tile_indices_h;
+  std::vector<IdType> qo_indptr_h(batch_size + 1), request_indices_h, tile_indices_h;
 
-  SWITCH_DEVICE_PTR(qo_indptr, qo_indptr_h, batch_size + 1, stream, {
-    std::tie(num_frags_x, num_qo_tiles, request_indices_h, tile_indices_h) =
-        split_qo_indptr(qo_indptr_h, batch_size, group_size, stream);
-  });
+  if (is_device_ptr(qo_indptr)) {
+    FLASHINFER_CUDA_CALL(cudaMemcpyAsync(qo_indptr_h.data(), qo_indptr,
+                                         sizeof(IdType) * (batch_size + 1), cudaMemcpyDeviceToHost,
+                                         stream));
+    FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
+  } else {
+    qo_indptr_h.assign(qo_indptr, qo_indptr + batch_size + 1);
+  }
+
+  std::tie(num_frags_x, num_qo_tiles, request_indices_h, tile_indices_h) =
+      split_qo_indptr(qo_indptr_h.data(), batch_size, group_size, stream);
   IdType* request_indices_d;
   IdType* tile_indices_d;
 
@@ -1929,11 +1936,20 @@ cudaError_t BatchPrefillWithPagedKVCache(
   const uint32_t group_size = num_qo_heads / num_kv_heads;
 
   uint32_t num_frags_x, num_qo_tiles;
-  std::vector<IdType> request_indices_h, tile_indices_h;
-  SWITCH_DEVICE_PTR(qo_indptr, qo_indptr_h, batch_size + 1, stream, {
-    std::tie(num_frags_x, num_qo_tiles, request_indices_h, tile_indices_h) =
-        split_qo_indptr(qo_indptr_h, batch_size, group_size, stream);
-  });
+  std::vector<IdType> qo_indptr_h(batch_size + 1), request_indices_h, tile_indices_h;
+
+  if (is_device_ptr(qo_indptr)) {
+    FLASHINFER_CUDA_CALL(cudaMemcpyAsync(qo_indptr_h.data(), qo_indptr,
+                                         sizeof(IdType) * (batch_size + 1), cudaMemcpyDeviceToHost,
+                                         stream));
+    FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
+  } else {
+    qo_indptr_h.assign(qo_indptr, qo_indptr + batch_size + 1);
+  }
+
+  std::tie(num_frags_x, num_qo_tiles, request_indices_h, tile_indices_h) =
+      split_qo_indptr(qo_indptr_h.data(), batch_size, group_size, stream);
+
   IdType* request_indices_d;
   IdType* tile_indices_d;
 
