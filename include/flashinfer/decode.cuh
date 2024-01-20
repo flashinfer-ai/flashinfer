@@ -1288,7 +1288,7 @@ cudaError_t BatchDecodeWithPaddedKVCache(
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " is not a multiple of num_kv_heads "
-            << num_kv_heads;
+            << num_kv_heads << std::endl;
     throw std::invalid_argument(err_msg.str());
   }
 
