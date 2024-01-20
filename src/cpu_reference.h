@@ -16,6 +16,7 @@
 #pragma once
 
 #include <flashinfer.cuh>
+#include <stdexcept>
 
 #include "utils.h"
 
@@ -93,8 +94,9 @@ std::vector<dtype_out> single_mha(const std::vector<dtype_in>& q, const std::vec
                       break;
                     }
                     default: {
-                      std::cerr << "Unsupported rotary mode." << std::endl;
-                      abort();
+                      std::ostringstream err_msg;
+                      err_msg << "Unsupported rotary mode.";
+                      throw std::invalid_argument(err_msg.str());
                     }
                   }
                   // apply mask
