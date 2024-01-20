@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - main
-  pull_request:
-    
 
 # Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
 permissions:
@@ -39,9 +37,7 @@ jobs:
         python -m pip install -r docs/requirements.txt
 
     - name: Bulid Documentation
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # if: github.ref == 'refs/heads/main'
+      if: github.ref == 'refs/heads/main'
       run: |
         cd docs
         make html
@@ -55,3 +51,4 @@ jobs:
     - name: Deploy to GitHub Pages
       id: deployment
       uses: actions/deploy-pages@v4
+
