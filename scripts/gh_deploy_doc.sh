@@ -14,6 +14,7 @@ git fetch
 git checkout -B gh-pages origin/gh-pages
 echo "3rdparty/" >> .gitignore
 rm -rf docs/
+rm -rf 3rdparty
 echo "docs.flashinfer.ai" > CNAME
 
 DATE=`date`
