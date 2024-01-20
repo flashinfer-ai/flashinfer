@@ -26,10 +26,10 @@ jobs:
 
     - name: Deploying on GitHub Pages
       env:
-        GITHUB_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       if: github.ref == 'refs/heads/main'
       run: |
         git config --global user.name 'Git bot'
         git config --global user.email 'bot@noreply.github.com'
-        git remote set-url origin https://$GITHUB_TOKEN@github.com/$GITHUB_REPOSITORY
+        git remote set-url origin https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git
         ./scripts/gh_deploy_doc.sh
