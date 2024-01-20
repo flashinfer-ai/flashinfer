@@ -173,8 +173,10 @@ class BatchPrefillHandler {
   cudaError_t BeginForward(IdType* qo_indptr, uint32_t batch_size, uint32_t num_qo_heads,
                            uint32_t num_kv_heads) {
     if (num_qo_heads % num_kv_heads != 0) {
-      std::cerr << "num_qo_heads should be divisible by num_kv_heads" << std::endl;
-      abort();
+      std::ostringstream err_msg;
+      err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
+              << num_kv_heads;
+      throw std::invalid_argument(err_msg.str());
     }
     uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
     std::vector<IdType> request_indices_h, tile_indices_h;
@@ -271,10 +273,10 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapper(BatchDecodeHandler* handler, DTyp
       kv_partition_info.seq_lens_before_partition = handler->GetSeqLengthsBeforePartition<IdType>();
     }
   } else {
-    std::cerr << "Please call BatchDecodeHandler's BeginForward() before calling "
-                 "BatchDecodeWithPagedKVCacheWrapper()"
-              << std::endl;
-    abort();
+    std::ostringstream err_msg;
+    err_msg << "Please call BatchDecodeHandler's BeginForward() before calling "
+               "BatchDecodeWithPagedKVCacheWrapper()";
+    throw std::runtime_error(err_msg.str());
   }
   return BatchDecodeWithPagedKVCache<page_storage, DTypeIn, DTypeOut, IdType>(
       q, new_paged_kv, kv_partition_info, o, tmp, lse, num_qo_heads, rotary_mode, rope_scale,
@@ -300,10 +302,10 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
     num_frags_x = handler->GetNumFragsX();
     num_qo_tiles = handler->GetNumQOTiles();
   } else {
-    std::cerr << "Please call BatchPrefillHandler's BeginForward() before calling "
-                 "BatchPrefillWithPagedKVCacheWrapper()"
-              << std::endl;
-    abort();
+    std::ostringstream err_msg;
+    err_msg << "Please call BatchPrefillHandler's BeginForward() before calling "
+               "BatchPrefillWithPagedKVCacheWrapper()";
+    throw std::runtime_error(err_msg.str());
   }
 
   SWITCH_NUM_FRAGS_X(
@@ -371,10 +373,10 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
     num_frags_x = handler->GetNumFragsX();
     num_qo_tiles = handler->GetNumQOTiles();
   } else {
-    std::cerr << "Please call BatchPrefillHandler's BeginForward() before calling "
-                 "BatchPrefillWithRaggedKVWrapperCache()"
-              << std::endl;
-    abort();
+    std::ostringstream err_msg;
+    err_msg << "Please call BatchPrefillHandler's BeginForward() before calling "
+               "BatchPrefillWithRaggedKVWrapperCache()";
+    throw std::runtime_error(err_msg.str());
   }
 
   SWITCH_NUM_FRAGS_X(num_frags_x, NUM_FRAGS_X, {

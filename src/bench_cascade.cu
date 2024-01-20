@@ -308,13 +308,13 @@ void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
 
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
-#define BENCH_FLASHINFER_MERGE_KERNELS(T)                               \
-  auto bench_flashinfer_merge_states_##T##_ = bench_merge_states<T>;    \
-  NVBENCH_BENCH(bench_flashinfer_merge_states_##T##_)                   \
-      .set_name("flashinfer_merge_states_" STR(T))                      \
-      .add_int64_axis("num_index_sets", {2, 16, 64, 128, 256})          \
-      .add_int64_axis("seq_len", {1, 2, 4, 8, 16, 32, 64, 128, 256})    \
-      .add_int64_axis("num_heads", {32})                                \
+#define BENCH_FLASHINFER_MERGE_KERNELS(T)                            \
+  auto bench_flashinfer_merge_states_##T##_ = bench_merge_states<T>; \
+  NVBENCH_BENCH(bench_flashinfer_merge_states_##T##_)                \
+      .set_name("flashinfer_merge_states_" STR(T))                   \
+      .add_int64_axis("num_index_sets", {2, 16, 64, 128, 256})       \
+      .add_int64_axis("seq_len", {1, 2, 4, 8, 16, 32, 64, 128, 256}) \
+      .add_int64_axis("num_heads", {32})                             \
       .add_int64_axis("head_dim", {128})
 
 #define BENCH_FLASHINFER_TWO_LEVEL_SINGLE_PREFIX_CASCADE_DECODE_KERNELS(T)      \

@@ -811,9 +811,10 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
   const float rope_rcp_scale = 1.f / rope_scale;
   const float rope_rcp_theta = 1.f / rope_theta;
   if (num_qo_heads % num_kv_heads != 0) {
-    std::cerr << "num_qo_heads " << num_qo_heads << " is not a multiple of num_kv_heads "
-              << num_kv_heads << std::endl;
-    abort();
+    std::ostringstream err_msg;
+    err_msg << "num_qo_heads " << num_qo_heads << " is not a multiple of num_kv_heads "
+            << num_kv_heads;
+    throw std::invalid_argument(err_msg.str());
   }
 
   SWITCH_GQA_GROUP_SIZE(
@@ -881,9 +882,10 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                   uint32_t num_chunks = ceil_div(seq_len, kv_chunk_size);
                   dim3 nblks = dim3(num_chunks, num_kv_heads);
                   if (nblks.x == 0 || nblks.y == 0) {
-                    std::cerr << "Invalid kernel configuration: nblks=(" << nblks.x << ","
-                              << nblks.y << ")" << std::endl;
-                    abort();
+                    std::ostringstream err_msg;
+                    err_msg << "Invalid kernel configuration: nblks=(" << nblks.x << "," << nblks.y
+                            << ")";
+                    throw std::runtime_error(err_msg.str());
                   }
                   dim3 nthrs = dim3(bdx, bdy, bdz);
                   void* args[] = {(void*)&q,
@@ -1216,9 +1218,10 @@ cudaError_t BatchDecodeWithPagedKVCache(DTypeIn* q,
   const uint32_t head_dim = paged_kv.head_dim;
   const uint32_t batch_size = paged_kv.batch_size;
   if (num_qo_heads % num_kv_heads != 0) {
-    std::cerr << "num_qo_heads " << num_qo_heads << " is not a multiple of num_kv_heads "
-              << num_kv_heads << std::endl;
-    abort();
+    std::ostringstream err_msg;
+    err_msg << "num_qo_heads " << num_qo_heads << " is not a multiple of num_kv_heads "
+            << num_kv_heads;
+    throw std::invalid_argument(err_msg.str());
   }
 
   SWITCH_GQA_GROUP_SIZE(
@@ -1283,9 +1286,10 @@ cudaError_t BatchDecodeWithPaddedKVCache(
     QKVLayout layout = QKVLayout::kNHD, RotaryMode rotary_mode = RotaryMode::kNone,
     float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   if (num_qo_heads % num_kv_heads != 0) {
-    std::cerr << "num_qo_heads " << num_qo_heads << " is not a multiple of num_kv_heads "
-              << num_kv_heads << std::endl;
-    abort();
+    std::ostringstream err_msg;
+    err_msg << "num_qo_heads " << num_qo_heads << " is not a multiple of num_kv_heads "
+            << num_kv_heads << std::endl;
+    throw std::invalid_argument(err_msg.str());
   }
 
   SWITCH_GQA_GROUP_SIZE(

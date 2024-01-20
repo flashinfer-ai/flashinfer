@@ -1320,8 +1320,9 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
     QKVLayout layout = QKVLayout::kNHD, RotaryMode rotary_mode = RotaryMode::kNone,
     bool allow_fp16_qk_reduction = false, cudaStream_t stream = nullptr) {
   if (kv_len < qo_len && causal) {
-    std::cerr << "When causal is true, kv_len must be greater than or equal to qo_len" << std::endl;
-    abort();
+    std::ostringstream err_msg;
+    err_msg << "When causal is true, kv_len must be greater than or equal to qo_len" << std::endl;
+    throw std::invalid_argument(err_msg.str());
   }
   const uint32_t group_size = num_qo_heads / num_kv_heads;
 
@@ -1420,8 +1421,9 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
   if (kv_len < qo_len && CAUSAL) {
-    std::cerr << "When causal is true, kv_len must be greater than or equal to qo_len" << std::endl;
-    abort();
+    std::ostringstream err_msg;
+    err_msg << "When causal is true, kv_len must be greater than or equal to qo_len" << std::endl;
+    throw std::invalid_argument(err_msg.str());
   }
 
   constexpr uint32_t num_frags_y = HEAD_DIM / 16;
