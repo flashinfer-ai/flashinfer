@@ -41,7 +41,7 @@ jobs:
     - name: Bulid Documentation
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      if: github.ref == 'refs/heads/main'
+      # if: github.ref == 'refs/heads/main'
       run: |
         cd docs
         make html
