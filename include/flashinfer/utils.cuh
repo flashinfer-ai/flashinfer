@@ -24,6 +24,7 @@
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
 
+#ifndef NDEBUG
 #define FLASHINFER_CUDA_CALL(func, ...)                                                     \
   {                                                                                         \
     cudaError_t e = (func);                                                                 \
@@ -33,6 +34,15 @@
       return e;                                                                             \
     }                                                                                       \
   }
+#else
+#define FLASHINFER_CUDA_CALL(func, ...) \
+  {                                     \
+    cudaError_t e = (func);             \
+    if (e != cudaSuccess) {             \
+      return e;                         \
+    }                                   \
+  }
+#endif
 
 #define SWITCH_SPLIT_QO_INDPTR(split_qo_indptr, SPLIT_QO_INDPTR, ...) \
   if (split_qo_indptr) {                                              \
