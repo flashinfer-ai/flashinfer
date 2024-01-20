@@ -4,10 +4,9 @@
 
 set -euxo pipefail
 
-mkdir -p tmp
 cd docs
 make html
-mv _build/html/* ../tmp/
+mv _build/html/* ..
 cd ..
 
 git grep --cached -l '' | xargs rm
@@ -16,6 +15,7 @@ git checkout -B gh-pages origin/gh-pages
 echo "3rdparty/" >> .gitignore
 rm -rf docs/
 mv tmp docs
+echo "docs.flashinfer.ai" > CNAME
 
 DATE=`date`
 git add . && git commit -am "Build at ${DATE}"
