@@ -47,9 +47,55 @@ constexpr uint32_t warp_size = 32;
 namespace {
 
 template <typename IdType>
+std::vector<uint32_t> PrefillPartitionPagedKVCacheBinarySearchMinNumPagePerBatch(
+  IdType *qo_indptr_h,
+  IdType *paged_kv_indptr_h,
+  uint32_t max_grid_size,
+  uint32_t old_batch_size,
+  uint32_t gqa_group_size,
+  uint32_t min_num_pages_per_batch
+) {
+  constexpr uint32_t num_warps = 4;
+  size_t total_qo_kv = 0;
+  std::vector<IdType> new_pages(old_batch_size);
+  for (uint32_t batch_idx = 0; batch_idx < old_batch_size; ++batch_idx) {
+    num_pages[batch_idx] = paged_kv_indptr_h[batch_idx + 1] - paged_kv_indptr_h[batch_idx];
+  }
+  for (uint32_t batch_idx = 0; batch_idx < old_batch_size; ++batch_idx) {
+    total_qo_kv += (qo_indptr[batch_idx + 1] - qo_indptr[batch_idx]) * num_pages[batch_idx];
+  }
+  const uint32_t num_frags_x = total_qo_kv * gqa_group_size > (paged_kv_indptr_h[batch_size] * 64) ? 2 : 1; 
+  const uint32_t qo_tile_size = num_frags_x * num_warps * 16;
+
+  return {num_frags_x};
+}
+
+template <typename IdType>
+std::vector<uint32_t> PrefillPartitionRaggedKVCacheBinarySearchChunkSize(
+  IdType *qo_indptr,
+  IdType *kv_indptr,
+  uint32_t max_grid_size,
+  uint32_t old_batch_size,
+  uint32_t num_qo_heads,
+  uint32_t num_kv_heads,
+  uint32_t min_chunk_size
+) {
+  constexpr uint32_t num_warps = 4;
+  size_t total_qo_kv = 0;
+  std::vector<IdType> (old);
+  for (uint32_t batch_idx = 0; batch_idx < old_batch_size; ++batch_idx) {
+    total_qo_kv += (qo_indptr[batch_idx + 1] - qo_indptr[batch_idx]) * (paged_kv_indptr_h[batch_idx + 1] - paged_kv_indptr_h[batch_idx]);
+  }
+  const uint32_t num_frags_x = total_qo_kv * gqa_group_size > (total_kv * 64) ? 2 : 1;
+  const uint32_t qo_tile_size = num_frags_x * num_warps * 16;
+
+  return {num_frags_x};
+}
+
+template <typename IdType>
 cudaError_t PrefillPartitionPagedKVCacheComputeAuxiliaryInfo(
     const uint32_t max_num_pages_per_batch, const uint32_t old_batch_size, const uint32_t page_size,
-    IdType* qo_indptr_h, IdType* old_kv_indptr_h, IdType* old_kv_last_page_len_h,
+    IdType* qo_indptr_h, IdType* old_paged_kv_indptr_h, IdType* old_kv_last_page_len_h,
     IdType* new_kv_indptr_d, IdType* new_kv_last_page_len_d, IdType* chunk_indptr_d,
     IdType* batch_idx_map_d, IdType* chunk_start_d, IdType* seq_lens_before_partition_d,
     cudaStream_t stream = nullptr) {
@@ -57,27 +103,27 @@ cudaError_t PrefillPartitionPagedKVCacheComputeAuxiliaryInfo(
       batch_idx_map_h, chunk_start_pos_h, seq_lens_before_partition_h;
 
   for (uint32_t batch_idx = 0; batch_idx < old_batch_size; batch_idx++) {
-    uint32_t num_chunks = ceil_div(old_kv_indptr_h[batch_idx + 1] - old_kv_indptr_h[batch_idx],
+    uint32_t num_chunks = ceil_div(old_paged_kv_indptr_h[batch_idx + 1] - old_paged_kv_indptr_h[batch_idx],
                                    max_num_pages_per_batch);
     for (uint32_t row_idx = qo_indptr_h[batch_idx]; row_idx < qo_indptr_h[batch_idx + 1];
          ++row_idx) {
       chunk_indptr_h.push_back(chunk_indptr_h.back() + num_chunks);
     }
     if (num_chunks == 0) {
-      new_kv_indptr_h.push_back(old_kv_indptr_h[batch_idx]);
+      new_kv_indptr_h.push_back(old_paged_kv_indptr_h[batch_idx]);
       new_kv_last_page_len_h.push_back(0);
       batch_idx_map_h.push_back(batch_idx);
       chunk_start_pos_h.push_back(0);
       seq_lens_before_partition_h.push_back(0);
     } else {
       uint32_t seq_len_before_partition =
-          (old_kv_indptr_h[batch_idx + 1] - old_kv_indptr_h[batch_idx] - 1) * page_size +
+          (old_paged_kv_indptr_h[batch_idx + 1] - old_paged_kv_indptr_h[batch_idx] - 1) * page_size +
           old_kv_last_page_len_h[batch_idx];
       for (uint32_t j = 0; j < num_chunks; ++j) {
         bool is_last = (j + 1) == num_chunks;
         new_kv_indptr_h.push_back(
-            min(old_kv_indptr_h[batch_idx] + (j + 1) * max_num_pages_per_batch,
-                old_kv_indptr_h[batch_idx + 1]));
+            min(old_paged_kv_indptr_h[batch_idx] + (j + 1) * max_num_pages_per_batch,
+                old_paged_kv_indptr_h[batch_idx + 1]));
         new_kv_last_page_len_h.push_back(is_last ? old_kv_last_page_len_h[batch_idx] : page_size);
         batch_idx_map_h.push_back(batch_idx);
         chunk_start_pos_h.push_back(j * max_num_pages_per_batch * page_size);
