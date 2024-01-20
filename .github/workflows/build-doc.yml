@@ -1,0 +1,35 @@
+name: Build FlashInfer Docs
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  test_linux:
+    name: Deploy Docs
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+      with:
+        submodules: recursive
+
+    - name: Configuring build Environment
+      run: |
+        sudo apt-get update
+        python -m pip install -U pip wheel
+
+    - name: Installing dependencies
+      run: |
+        python -m pip install -r requirements.txt
+
+    - name: Deploying on GitHub Pages
+      env:
+        GITHUB_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
+      if: github.ref == 'refs/heads/main'
+      run: |
+        git config --global user.name 'Git bot'
+        git config --global user.email 'bot@noreply.github.com'
+        git remote set-url origin https://$GITHUB_TOKEN@github.com/$GITHUB_REPOSITORY
+        ./scripts/gh_deploy_doc.sh
