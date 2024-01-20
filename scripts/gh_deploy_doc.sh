@@ -4,9 +4,9 @@
 
 set -euxo pipefail
 
+mkdir -p tmp
 cd docs
 make html
-mkdir -p tmp
 mv _build/html/* ../tmp/
 rm -rf _build/
 cd ..
