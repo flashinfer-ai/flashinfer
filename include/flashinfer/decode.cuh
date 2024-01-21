@@ -750,7 +750,8 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& 
                   constexpr uint32_t num_threads =
                       std::max(get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeIn)), bdx * bdy);
                   constexpr uint32_t bdz = num_threads / (bdx * bdy);
-                  constexpr uint32_t tile_size_per_bdx = 8U / GROUP_SIZE;
+                  constexpr uint32_t tile_size_per_bdx =
+                      GROUP_SIZE == 1 ? (sizeof(DTypeIn) == 1 ? 2U : 8U) : 1U;
                   const uint32_t smem_size = 2U * num_stages_smem * bdy * tile_size_per_bdx * bdz *
                                                  head_dim * sizeof(DTypeIn) +
                                              2U * bdy * bdz * sizeof(float);
@@ -832,7 +833,8 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                     std::max(get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeIn)), bdx * bdy);
                 constexpr uint32_t bdz = num_threads / (bdx * bdy);
                 tensor_info_t<QKV_LAYOUT, GROUP_SIZE, HEAD_DIM> info(1, seq_len, num_kv_heads);
-                constexpr uint32_t tile_size_per_bdx = 8U / GROUP_SIZE;
+                constexpr uint32_t tile_size_per_bdx =
+                    GROUP_SIZE == 1 ? (sizeof(DTypeIn) == 1 ? 2U : 8U) : 1U;
                 const uint32_t smem_size = 2U * num_stages_smem * bdy * tile_size_per_bdx * bdz *
                                                head_dim * sizeof(DTypeIn) +
                                            2U * bdy * bdz * sizeof(float);
@@ -1064,7 +1066,8 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
             constexpr uint32_t bdy = GROUP_SIZE;
             constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
             constexpr uint32_t bdz = num_threads / (bdx * bdy);
-            constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? 4U : 1U;
+            constexpr uint32_t tile_size_per_bdx =
+                GROUP_SIZE == 1 ? (sizeof(DTypeIn) == 1 ? 2U : 4U) : 1U;
             const uint32_t smem_size =
                 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim * sizeof(DTypeIn) +
                 std::max(tile_size_per_bdx * num_threads * sizeof(DTypeIn*),
@@ -1134,7 +1137,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
   constexpr uint32_t bdy = GROUP_SIZE;
   constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
   constexpr uint32_t bdz = num_threads / (bdx * bdy);
-  constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? 4U : 1U;
+  constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeIn) == 1 ? 2U : 4U) : 1U;
   const uint32_t smem_size =
       2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * HEAD_DIM * sizeof(DTypeIn) +
       std::max(tile_size_per_bdx * num_threads * sizeof(DTypeIn*), 2 * bdy * bdz * sizeof(float));
