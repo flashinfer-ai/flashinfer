@@ -48,48 +48,102 @@ namespace {
 
 template <typename IdType>
 std::vector<uint32_t> PrefillPartitionPagedKVCacheBinarySearchMinNumPagePerBatch(
-  IdType *qo_indptr_h,
-  IdType *paged_kv_indptr_h,
-  uint32_t max_grid_size,
-  uint32_t old_batch_size,
-  uint32_t gqa_group_size,
-  uint32_t min_num_pages_per_batch
-) {
+    IdType* qo_indptr_h, IdType* paged_kv_indptr_h, uint32_t max_grid_size, uint32_t old_batch_size,
+    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t min_num_pages_per_batch) {
   constexpr uint32_t num_warps = 4;
+  const uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
   size_t total_qo_kv = 0;
-  std::vector<IdType> new_pages(old_batch_size);
+  std::vector<IdType> qo_length(old_batch_size);
+  std::vector<IdType> num_kv_pages(old_batch_size);
   for (uint32_t batch_idx = 0; batch_idx < old_batch_size; ++batch_idx) {
-    num_pages[batch_idx] = paged_kv_indptr_h[batch_idx + 1] - paged_kv_indptr_h[batch_idx];
+    num_kv_pages[batch_idx] = paged_kv_indptr_h[batch_idx + 1] - paged_kv_indptr_h[batch_idx];
+    qo_length[batch_idx] = qo_indptr_h[batch_idx + 1] - qo_indptr_h[batch_idx];
   }
   for (uint32_t batch_idx = 0; batch_idx < old_batch_size; ++batch_idx) {
-    total_qo_kv += (qo_indptr[batch_idx + 1] - qo_indptr[batch_idx]) * num_pages[batch_idx];
+    total_qo_kv += qo_length[batch_idx] * num_kv_pages[batch_idx];
   }
-  const uint32_t num_frags_x = total_qo_kv * gqa_group_size > (paged_kv_indptr_h[batch_size] * 64) ? 2 : 1; 
+  const uint32_t num_frags_x =
+      total_qo_kv * gqa_group_size > (paged_kv_indptr_h[old_batch_size] * 64) ? 2 : 1;
   const uint32_t qo_tile_size = num_frags_x * num_warps * 16;
 
-  return {num_frags_x};
+  uint32_t low = min_num_pages_per_batch, high = 0;
+  for (const IdType& elem : num_kv_pages) {
+    high = max(high, elem);
+  }
+  uint32_t num_threadblocks, new_batch_size;
+  while (low < high) {
+    uint32_t mid = (low + high) / 2;
+    num_threadblocks = 0;
+    for (uint32_t batch_idx = 0; batch_idx < old_batch_size; ++batch_idx) {
+      num_threadblocks +=
+          ceil_div(qo_length[batch_idx], qo_tile_size) * ceil_div(num_kv_pages[batch_idx], mid);
+    }
+    if (num_threadblocks > max_grid_size) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  const uint32_t num_pages_per_batch = low;
+  num_threadblocks = 0;
+  new_batch_size = 0;
+  for (uint32_t batch_idx = 0; batch_idx < old_batch_size; ++batch_idx) {
+    num_threadblocks += ceil_div(qo_length[batch_idx], qo_tile_size) *
+                        ceil_div(num_kv_pages[batch_idx], num_pages_per_batch);
+    new_batch_size += ceil_div(num_kv_pages[batch_idx], num_pages_per_batch);
+  }
+
+  return {num_frags_x, num_pages_per_batch, num_threadblocks, new_batch_size};
 }
 
 template <typename IdType>
 std::vector<uint32_t> PrefillPartitionRaggedKVCacheBinarySearchChunkSize(
-  IdType *qo_indptr,
-  IdType *kv_indptr,
-  uint32_t max_grid_size,
-  uint32_t old_batch_size,
-  uint32_t num_qo_heads,
-  uint32_t num_kv_heads,
-  uint32_t min_chunk_size
-) {
+    IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t max_grid_size, uint32_t old_batch_size,
+    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t min_chunk_size) {
   constexpr uint32_t num_warps = 4;
+  const uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
   size_t total_qo_kv = 0;
-  std::vector<IdType> (old);
+  std::vector<IdType> qo_length(old_batch_size);
+  std::vector<IdType> kv_length(old_batch_size);
   for (uint32_t batch_idx = 0; batch_idx < old_batch_size; ++batch_idx) {
-    total_qo_kv += (qo_indptr[batch_idx + 1] - qo_indptr[batch_idx]) * (paged_kv_indptr_h[batch_idx + 1] - paged_kv_indptr_h[batch_idx]);
+    qo_length[batch_idx] = qo_indptr_h[batch_idx + 1] - qo_indptr_h[batch_idx];
+    kv_length[batch_idx] = kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx];
   }
-  const uint32_t num_frags_x = total_qo_kv * gqa_group_size > (total_kv * 64) ? 2 : 1;
+  for (uint32_t batch_idx = 0; batch_idx < old_batch_size; ++batch_idx) {
+    total_qo_kv += qo_length[batch_idx] * kv_length[batch_idx];
+  }
+  const uint32_t num_frags_x =
+      total_qo_kv * gqa_group_size > (kv_indptr_h[old_batch_size] * 64) ? 2 : 1;
   const uint32_t qo_tile_size = num_frags_x * num_warps * 16;
 
-  return {num_frags_x};
+  uint32_t low = min_chunk_size, high = 0;
+  for (const IdType& elem : kv_length) {
+    high = max(high, elem);
+  }
+  uint32_t num_threadblocks, new_batch_size;
+  while (low < high) {
+    uint32_t mid = (low + high) / 2;
+    num_threadblocks = 0;
+    for (uint32_t batch_idx = 0; batch_idx < old_batch_size; ++batch_idx) {
+      num_threadblocks +=
+          ceil_div(qo_length[batch_idx], qo_tile_size) * ceil_div(kv_length[batch_idx], mid);
+    }
+    if (num_threadblocks > max_grid_size) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  const uint32_t chunk_size = low;
+  num_threadblocks = 0;
+  new_batch_size = 0;
+  for (uint32_t batch_idx = 0; batch_idx < old_batch_size; ++batch_idx) {
+    num_threadblocks +=
+        ceil_div(qo_length[batch_idx], qo_tile_size) * ceil_div(kv_length[batch_idx], chunk_size);
+    new_batch_size += ceil_div(kv_length[batch_idx], chunk_size);
+  }
+
+  return {num_frags_x, chunk_size, num_threadblocks, new_batch_size};
 }
 
 template <typename IdType>
@@ -103,8 +157,9 @@ cudaError_t PrefillPartitionPagedKVCacheComputeAuxiliaryInfo(
       batch_idx_map_h, chunk_start_pos_h, seq_lens_before_partition_h;
 
   for (uint32_t batch_idx = 0; batch_idx < old_batch_size; batch_idx++) {
-    uint32_t num_chunks = ceil_div(old_paged_kv_indptr_h[batch_idx + 1] - old_paged_kv_indptr_h[batch_idx],
-                                   max_num_pages_per_batch);
+    uint32_t num_chunks =
+        ceil_div(old_paged_kv_indptr_h[batch_idx + 1] - old_paged_kv_indptr_h[batch_idx],
+                 max_num_pages_per_batch);
     for (uint32_t row_idx = qo_indptr_h[batch_idx]; row_idx < qo_indptr_h[batch_idx + 1];
          ++row_idx) {
       chunk_indptr_h.push_back(chunk_indptr_h.back() + num_chunks);
@@ -117,7 +172,8 @@ cudaError_t PrefillPartitionPagedKVCacheComputeAuxiliaryInfo(
       seq_lens_before_partition_h.push_back(0);
     } else {
       uint32_t seq_len_before_partition =
-          (old_paged_kv_indptr_h[batch_idx + 1] - old_paged_kv_indptr_h[batch_idx] - 1) * page_size +
+          (old_paged_kv_indptr_h[batch_idx + 1] - old_paged_kv_indptr_h[batch_idx] - 1) *
+              page_size +
           old_kv_last_page_len_h[batch_idx];
       for (uint32_t j = 0; j < num_chunks; ++j) {
         bool is_last = (j + 1) == num_chunks;
