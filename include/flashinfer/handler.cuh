@@ -87,7 +87,7 @@ class BatchDecodeHandler {
                            uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
                            uint32_t page_size, RotaryMode rotary_mode) {
     batch_size_before_partition_ = batch_size;
-    uint32_t tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size;
+    uint32_t tmp_size, max_num_pages_per_batch, new_batch_size;
     auto work_estimation_func =
         BatchDecodeWithPagedKVCacheWorkEstimation<page_storage, DTypeIn, DTypeOut, IdType>;
 
@@ -106,8 +106,8 @@ class BatchDecodeHandler {
     }
 
     FLASHINFER_CUDA_CALL(work_estimation_func(
-        tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size, batch_size,
-        indptr_h.data(), num_qo_heads, num_kv_heads, head_dim, page_size, rotary_mode, stream_));
+        tmp_size, max_num_pages_per_batch, new_batch_size, batch_size, indptr_h.data(),
+        num_qo_heads, num_kv_heads, head_dim, page_size, rotary_mode, stream_));
     batch_size_after_partition_ = new_batch_size;
     if (tmp_size > 0) {
       FLASHINFER_CUDA_CALL(cudaMallocAsync(&float_buffer_, tmp_size, stream_));

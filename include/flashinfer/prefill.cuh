@@ -47,140 +47,125 @@ constexpr uint32_t warp_size = 32;
 namespace {
 
 template <typename IdType>
-std::vector<uint32_t> PrefillPartitionPagedKVCacheBinarySearchMinNumPagePerBatch(
-    IdType* qo_indptr_h, IdType* paged_kv_indptr_h, uint32_t max_grid_size, uint32_t old_batch_size,
-    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t min_num_pages_per_batch) {
-  constexpr uint32_t num_warps = 4;
+uint32_t BatchPrefillComputeQOTileSize(IdType* qo_length, IdType* kv_length,
+                                       const uint32_t batch_size, const uint32_t num_qo_heads,
+                                       const uint32_t num_kv_heads) {
+  size_t total_qo_kv = 0, total_kv = 0;
   const uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
-  size_t total_qo_kv = 0;
-  std::vector<IdType> qo_length(old_batch_size);
-  std::vector<IdType> num_kv_pages(old_batch_size);
-  for (uint32_t batch_idx = 0; batch_idx < old_batch_size; ++batch_idx) {
-    num_kv_pages[batch_idx] = paged_kv_indptr_h[batch_idx + 1] - paged_kv_indptr_h[batch_idx];
-    qo_length[batch_idx] = qo_indptr_h[batch_idx + 1] - qo_indptr_h[batch_idx];
+  for (uint32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+    total_qo_kv += qo_length[batch_idx] * kv_length[batch_idx];
+    total_kv += kv_length[batch_idx];
   }
-  for (uint32_t batch_idx = 0; batch_idx < old_batch_size; ++batch_idx) {
-    total_qo_kv += qo_length[batch_idx] * num_kv_pages[batch_idx];
-  }
-  const uint32_t num_frags_x =
-      total_qo_kv * gqa_group_size > (paged_kv_indptr_h[old_batch_size] * 64) ? 2 : 1;
-  const uint32_t qo_tile_size = num_frags_x * num_warps * 16;
+  return total_qo_kv * gqa_group_size > (total_kv * 64) ? 64 : 128;
+}
 
+template <typename IdType>
+std::vector<uint32_t> PrefillPartitionPagedKVCacheBinarySearchMinNumPagePerBatch(
+    IdType* qo_length, IdType* num_kv_pages, const uint32_t qo_tile_size,
+    const uint32_t max_grid_size, const uint32_t batch_size_before_partition,
+    const uint32_t num_qo_heads, const uint32_t num_kv_heads,
+    const uint32_t min_num_pages_per_batch) {
   uint32_t low = min_num_pages_per_batch, high = 0;
   for (const IdType& elem : num_kv_pages) {
     high = max(high, elem);
   }
-  uint32_t num_threadblocks, new_batch_size;
+  uint32_t grid_size, new_batch_size;
   while (low < high) {
     uint32_t mid = (low + high) / 2;
-    num_threadblocks = 0;
-    for (uint32_t batch_idx = 0; batch_idx < old_batch_size; ++batch_idx) {
-      num_threadblocks +=
+    grid_size = 0;
+    for (uint32_t batch_idx = 0; batch_idx < batch_size_before_partition; ++batch_idx) {
+      grid_size +=
           ceil_div(qo_length[batch_idx], qo_tile_size) * ceil_div(num_kv_pages[batch_idx], mid);
     }
-    if (num_threadblocks > max_grid_size) {
+    if (grid_size > max_grid_size) {
       low = mid + 1;
     } else {
       high = mid;
     }
   }
   const uint32_t num_pages_per_batch = low;
-  num_threadblocks = 0;
+  grid_size = 0;
   new_batch_size = 0;
-  for (uint32_t batch_idx = 0; batch_idx < old_batch_size; ++batch_idx) {
-    num_threadblocks += ceil_div(qo_length[batch_idx], qo_tile_size) *
-                        ceil_div(num_kv_pages[batch_idx], num_pages_per_batch);
+  for (uint32_t batch_idx = 0; batch_idx < batch_size_before_partition; ++batch_idx) {
+    grid_size += ceil_div(qo_length[batch_idx], qo_tile_size) *
+                 ceil_div(num_kv_pages[batch_idx], num_pages_per_batch);
     new_batch_size += ceil_div(num_kv_pages[batch_idx], num_pages_per_batch);
   }
 
-  return {num_frags_x, num_pages_per_batch, num_threadblocks, new_batch_size};
+  return {num_pages_per_batch, grid_size, new_batch_size};
 }
 
 template <typename IdType>
 std::vector<uint32_t> PrefillPartitionRaggedKVCacheBinarySearchChunkSize(
-    IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t max_grid_size, uint32_t old_batch_size,
-    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t min_chunk_size) {
-  constexpr uint32_t num_warps = 4;
-  const uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
-  size_t total_qo_kv = 0;
-  std::vector<IdType> qo_length(old_batch_size);
-  std::vector<IdType> kv_length(old_batch_size);
-  for (uint32_t batch_idx = 0; batch_idx < old_batch_size; ++batch_idx) {
-    qo_length[batch_idx] = qo_indptr_h[batch_idx + 1] - qo_indptr_h[batch_idx];
-    kv_length[batch_idx] = kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx];
-  }
-  for (uint32_t batch_idx = 0; batch_idx < old_batch_size; ++batch_idx) {
-    total_qo_kv += qo_length[batch_idx] * kv_length[batch_idx];
-  }
-  const uint32_t num_frags_x =
-      total_qo_kv * gqa_group_size > (kv_indptr_h[old_batch_size] * 64) ? 2 : 1;
-  const uint32_t qo_tile_size = num_frags_x * num_warps * 16;
-
+    IdType* qo_length, IdType* kv_length, const uint32_t qo_tile_size, const uint32_t max_grid_size,
+    const uint32_t batch_size_before_partition, const uint32_t num_qo_heads,
+    const uint32_t num_kv_heads, const uint32_t min_chunk_size) {
   uint32_t low = min_chunk_size, high = 0;
   for (const IdType& elem : kv_length) {
     high = max(high, elem);
   }
-  uint32_t num_threadblocks, new_batch_size;
+  uint32_t grid_size, new_batch_size;
   while (low < high) {
     uint32_t mid = (low + high) / 2;
-    num_threadblocks = 0;
-    for (uint32_t batch_idx = 0; batch_idx < old_batch_size; ++batch_idx) {
-      num_threadblocks +=
+    grid_size = 0;
+    for (uint32_t batch_idx = 0; batch_idx < batch_size_before_partition; ++batch_idx) {
+      grid_size +=
           ceil_div(qo_length[batch_idx], qo_tile_size) * ceil_div(kv_length[batch_idx], mid);
     }
-    if (num_threadblocks > max_grid_size) {
+    if (grid_size > max_grid_size) {
       low = mid + 1;
     } else {
       high = mid;
     }
   }
   const uint32_t chunk_size = low;
-  num_threadblocks = 0;
+  grid_size = 0;
   new_batch_size = 0;
-  for (uint32_t batch_idx = 0; batch_idx < old_batch_size; ++batch_idx) {
-    num_threadblocks +=
+  for (uint32_t batch_idx = 0; batch_idx < batch_size_before_partition; ++batch_idx) {
+    grid_size +=
         ceil_div(qo_length[batch_idx], qo_tile_size) * ceil_div(kv_length[batch_idx], chunk_size);
     new_batch_size += ceil_div(kv_length[batch_idx], chunk_size);
   }
 
-  return {num_frags_x, chunk_size, num_threadblocks, new_batch_size};
+  return {chunk_size, grid_size, new_batch_size};
 }
 
 template <typename IdType>
 cudaError_t PrefillPartitionPagedKVCacheComputeAuxiliaryInfo(
-    const uint32_t max_num_pages_per_batch, const uint32_t old_batch_size, const uint32_t page_size,
-    IdType* qo_indptr_h, IdType* old_paged_kv_indptr_h, IdType* old_kv_last_page_len_h,
-    IdType* new_kv_indptr_d, IdType* new_kv_last_page_len_d, IdType* chunk_indptr_d,
-    IdType* batch_idx_map_d, IdType* chunk_start_d, IdType* seq_lens_before_partition_d,
-    cudaStream_t stream = nullptr) {
-  std::vector<IdType> new_kv_indptr_h{0}, new_kv_last_page_len_h, chunk_indptr_h{0},
-      batch_idx_map_h, chunk_start_pos_h, seq_lens_before_partition_h;
+    const uint32_t max_num_pages_per_batch, const uint32_t batch_size_before_partition,
+    const uint32_t page_size, IdType* qo_indptr_h, IdType* paged_kv_indptr_before_partiton_h,
+    IdType* kv_last_page_len_before_partition_h, IdType* kv_indptr_after_partition_d,
+    IdType* kv_last_page_len_after_partition_d, IdType* chunk_indptr_d, IdType* batch_idx_map_d,
+    IdType* chunk_start_d, IdType* seq_lens_before_partition_d, cudaStream_t stream = nullptr) {
+  std::vector<IdType> paged_kv_indptr_after_partition_h{0}, kv_last_page_len_after_partition_h,
+      chunk_indptr_h{0}, batch_idx_map_h, chunk_start_pos_h, seq_lens_before_partition_h;
 
-  for (uint32_t batch_idx = 0; batch_idx < old_batch_size; batch_idx++) {
-    uint32_t num_chunks =
-        ceil_div(old_paged_kv_indptr_h[batch_idx + 1] - old_paged_kv_indptr_h[batch_idx],
-                 max_num_pages_per_batch);
+  for (uint32_t batch_idx = 0; batch_idx < batch_size_before_partition; batch_idx++) {
+    uint32_t num_chunks = ceil_div(paged_kv_indptr_before_partiton_h[batch_idx + 1] -
+                                       paged_kv_indptr_before_partiton_h[batch_idx],
+                                   max_num_pages_per_batch);
     for (uint32_t row_idx = qo_indptr_h[batch_idx]; row_idx < qo_indptr_h[batch_idx + 1];
          ++row_idx) {
       chunk_indptr_h.push_back(chunk_indptr_h.back() + num_chunks);
     }
     if (num_chunks == 0) {
-      new_kv_indptr_h.push_back(old_paged_kv_indptr_h[batch_idx]);
-      new_kv_last_page_len_h.push_back(0);
+      paged_kv_indptr_after_partition_h.push_back(paged_kv_indptr_before_partiton_h[batch_idx]);
+      kv_last_page_len_after_partition_h.push_back(0);
       batch_idx_map_h.push_back(batch_idx);
       chunk_start_pos_h.push_back(0);
       seq_lens_before_partition_h.push_back(0);
     } else {
-      uint32_t seq_len_before_partition =
-          (old_paged_kv_indptr_h[batch_idx + 1] - old_paged_kv_indptr_h[batch_idx] - 1) *
-              page_size +
-          old_kv_last_page_len_h[batch_idx];
+      uint32_t seq_len_before_partition = (paged_kv_indptr_before_partiton_h[batch_idx + 1] -
+                                           paged_kv_indptr_before_partiton_h[batch_idx] - 1) *
+                                              page_size +
+                                          kv_last_page_len_before_partition_h[batch_idx];
       for (uint32_t j = 0; j < num_chunks; ++j) {
         bool is_last = (j + 1) == num_chunks;
-        new_kv_indptr_h.push_back(
-            min(old_paged_kv_indptr_h[batch_idx] + (j + 1) * max_num_pages_per_batch,
-                old_paged_kv_indptr_h[batch_idx + 1]));
-        new_kv_last_page_len_h.push_back(is_last ? old_kv_last_page_len_h[batch_idx] : page_size);
+        paged_kv_indptr_after_partition_h.push_back(
+            min(paged_kv_indptr_before_partiton_h[batch_idx] + (j + 1) * max_num_pages_per_batch,
+                paged_kv_indptr_before_partiton_h[batch_idx + 1]));
+        kv_last_page_len_after_partition_h.push_back(
+            is_last ? kv_last_page_len_before_partition_h[batch_idx] : page_size);
         batch_idx_map_h.push_back(batch_idx);
         chunk_start_pos_h.push_back(j * max_num_pages_per_batch * page_size);
         seq_lens_before_partition_h.push_back(seq_len_before_partition);
@@ -188,13 +173,13 @@ cudaError_t PrefillPartitionPagedKVCacheComputeAuxiliaryInfo(
     }
   }
 
-  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(new_kv_indptr_d, new_kv_indptr_h.data(),
-                                       sizeof(IdType) * new_kv_indptr_h.size(),
-                                       cudaMemcpyHostToDevice, stream));
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(
+      kv_indptr_after_partition_d, paged_kv_indptr_after_partition_h.data(),
+      sizeof(IdType) * paged_kv_indptr_after_partition_h.size(), cudaMemcpyHostToDevice, stream));
 
-  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(new_kv_last_page_len_d, new_kv_last_page_len_h.data(),
-                                       sizeof(IdType) * new_kv_last_page_len_h.size(),
-                                       cudaMemcpyHostToDevice, stream));
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(
+      kv_last_page_len_after_partition_d, kv_last_page_len_after_partition_h.data(),
+      sizeof(IdType) * kv_last_page_len_after_partition_h.size(), cudaMemcpyHostToDevice, stream));
 
   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(chunk_indptr_d, chunk_indptr_h.data(),
                                        sizeof(IdType) * chunk_indptr_h.size(),
@@ -213,9 +198,9 @@ cudaError_t PrefillPartitionPagedKVCacheComputeAuxiliaryInfo(
 }
 
 template <typename IdType>
-cudaError_t PrefillPartitionRaggedKVCacheComputeAuxiliaryInfo(const uint32_t old_batch_size,
-                                                              IdType* qo_indptr, IdType* kv_indptr,
-                                                              IdType* chunk_size) {
+cudaError_t PrefillPartitionRaggedKVCacheComputeAuxiliaryInfo(
+    const uint32_t batch_size_before_partition, IdType* qo_indptr, IdType* kv_indptr,
+    IdType* chunk_size) {
   // TODO(Zihao)
   return cudaSuccess;
 }
@@ -1838,6 +1823,41 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
   return cudaSuccess;
 }
 
+/*!
+ * \brief Estimate the temporary storage size and the maximum grid size for the partition-kv
+ *   BatchPrefillWithRaggedKVCacheKernel
+ */
+template <typename DTypeIn, typename DTypeOut, typename IdType>
+cudaError_t BatchPrefillWithRaggedKVCacheWorkEstimation(
+    uint32_t& qo_tile_size, uint32_t& tmp_size, uint32_t& chunk_size, uint32_t& new_batch_size,
+    uint32_t& grid_size, IdType* qo_indptr_h, IdType* kv_indptr_h, const uint32_t batch_size,
+    const uint32_t num_qo_heads, const uint32_t num_kv_heads, const uint32_t head_dim,
+    bool causal = true, QKVLayout layout = QKVLayout::kNHD,
+    RotaryMode rotary_mode = RotaryMode::kNone, bool allow_fp16_qk_reduction = false,
+    cudaStream_t stream = nullptr) {
+  if (num_qo_heads % num_kv_heads != 0) {
+    std::ostringstream err_msg;
+    err_msg << "num_qo_heads " << num_qo_heads << " is not a multiple of num_kv_heads "
+            << num_kv_heads;
+    throw std::invalid_argument(err_msg.str());
+  }
+  std::vector<IdType> qo_length(batch_size), kv_length(batch_size);
+  for (uint32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+    qo_length[batch_idx] = qo_indptr_h[batch_idx + 1] - qo_indptr_h[batch_idx];
+    kv_length[batch_idx] = kv_indptr_h[batch_idx + 1] - qo_indptr_h[batch_idx];
+    if (kv_length[batch_idx] < qo_length[batch_idx] && causal) {
+      std::ostringstream err_msg;
+      err_msg = "When causal is true, kv_len must be greater than or equal to qo_len, got kv_len "
+                << kv_length[batch_idx] << " and qo_len " << qo_length[batch_idx]
+                << " at batch_idx " << batch_idx;
+      throw std::runtime_error(err_msg.str());
+    }
+  }
+  qo_tile_size = BatchPrefillComputeQOTileSize(qo_length.data(), kv_length.data(), batch_size,
+                                               num_qo_heads, num_kv_heads);
+  // TODO(Zihao)
+}
+
 template <typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCache(
     DTypeIn* q, IdType* qo_indptr, DTypeIn* k, DTypeIn* v, IdType* kv_indptr, DTypeOut* o,
@@ -2024,6 +2044,42 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
   });
   return cudaSuccess;
+}
+
+/*!
+ * \brief Estimate the temporary storage size and the maximum grid size for the partition-kv
+ *   BatchPrefillWithRaggedKVCacheKernel
+ */
+template <typename DTypeIn, typename DTypeOut, typename IdType>
+cudaError_t BatchPrefillWithPagedKVCacheWorkEstimation(
+    uint32_t& qo_tile_size, uint32_t& tmp_size, uint32_t& chunk_size, uint32_t& new_batch_size,
+    uint32_t& grid_size, IdType* qo_indptr_h, IdType* paged_kv_indptr_h, IdType* kv_last_page_len_h,
+    const uint32_t batch_size, const uint32_t num_qo_heads, const uint32_t num_kv_heads,
+    const uint32_t head_dim, const uint32_t page_size, bool causal = true,
+    QKVLayout layout = QKVLayout::kNHD, RotaryMode rotary_mode = RotaryMode::kNone,
+    bool allow_fp16_qk_reduction = false, cudaStream_t stream = nullptr) {
+  if (num_qo_heads % num_kv_heads != 0) {
+    std::ostringstream err_msg;
+    err_msg << "num_qo_heads " << num_qo_heads << " is not a multiple of num_kv_heads "
+            << num_kv_heads;
+    throw std::invalid_argument(err_msg.str());
+  }
+  std::vector<IdType> qo_length(batch_size), num_kv_pages(batch_size);
+  for (uint32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+    qo_length[batch_idx] = qo_indptr_h[batch_idx + 1] - qo_indptr_h[batch_idx];
+    num_kv_pages[batch_idx] = paged_kv_indptr_h[batch_idx + 1] - paged_kv_indptr_h[batch_idx];
+    uint32_t kv_length = num_kv_pages[batch_idx] * page_size + kv_last_page_len_h[batch_idx];
+    if (kv_length < qo_length[batch_idx] && causal) {
+      std::ostringstream err_msg;
+      err_msg << "When causal is true, kv_len must be greater than or equal to qo_len, got kv_len "
+              << kv_length << " and qo_len " << qo_length[batch_idx] << " at batch_idx "
+              << batch_idx;
+      throw std::runtime_error(err_msg.str());
+    }
+  }
+  qo_tile_size = BatchPrefillComputeQOTileSize(qo_length.data(), num_kv_pages.data(), batch_size,
+                                               num_qo_heads, num_kv_heads);
+  // TODO(Zihao)
 }
 
 template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
