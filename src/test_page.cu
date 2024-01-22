@@ -23,7 +23,7 @@
 
 using namespace flashinfer;
 
-template <typename T>
+template <QKVLayout kv_layout, typename T>
 void _TestAppendPagedKVKernelCorrectness(size_t page_size, size_t batch_size, size_t num_heads,
                                          size_t head_dim) {
   // number of conversation rounds
@@ -79,15 +79,15 @@ void _TestAppendPagedKVKernelCorrectness(size_t page_size, size_t batch_size, si
       }
       indptr_cpu.push_back(indptr_cpu.back() + page_indices[i].size());
     }
-    paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv_cpu(
+    paged_kv_t<PageStorage::kIndices, kv_layout, T, int32_t> paged_kv_cpu(
         num_heads, page_size, head_dim, batch_size, kv_data_cpu.data(), indices_cpu.data(),
         indptr_cpu.data(), last_page_len.data());
-    cpu_reference::append_paged_kv_cache(paged_kv_cpu, keys, values, append_indptr);
+    cpu_reference::append_paged_kv_cache<kv_layout>(paged_kv_cpu, keys, values, append_indptr);
 
     thrust::device_vector<int32_t> indptr_gpu(indptr_cpu);
     thrust::device_vector<int32_t> indices_gpu(indices_cpu);
     thrust::device_vector<int32_t> last_page_len_gpu(last_page_len);
-    paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv_gpu(
+    paged_kv_t<PageStorage::kIndices, kv_layout, T, int32_t> paged_kv_gpu(
         num_heads, page_size, head_dim, batch_size, thrust::raw_pointer_cast(kv_data_gpu.data()),
         thrust::raw_pointer_cast(indices_gpu.data()), thrust::raw_pointer_cast(indptr_gpu.data()),
         thrust::raw_pointer_cast(last_page_len_gpu.data()));
@@ -135,14 +135,14 @@ void _TestAppendPagedKVKernelCorrectness(size_t page_size, size_t batch_size, si
   }
   float result_accuracy =
       1. - float(num_result_errors_atol_1e_3_rtol_1e_3) / float(kv_data_cpu.size());
-  std::cout << "page_size=" << page_size << ", batch_size=" << batch_size
-            << ", num_heads=" << num_heads << ", head_dim=" << head_dim
-            << ", result_accuracy=" << result_accuracy << std::endl;
+  std::cout << "kv_layout=" << QKVLayoutToString(kv_layout) << ", page_size=" << page_size
+            << ", batch_size=" << batch_size << ", num_heads=" << num_heads
+            << ", head_dim=" << head_dim << ", result_accuracy=" << result_accuracy << std::endl;
   EXPECT_GT(result_accuracy, 0.99) << "Result correctness test failed.";
   EXPECT_EQ(nan_detected, false) << "Nan detected in the result.";
 }
 
-template <typename T>
+template <QKVLayout kv_layout, typename T>
 void _TestPagedKVCacheToRaggedTensorCorrectness(size_t page_size, size_t batch_size,
                                                 size_t num_heads, size_t head_dim) {
   size_t num_pages_per_request = 10;
@@ -167,30 +167,53 @@ void _TestPagedKVCacheToRaggedTensorCorrectness(size_t page_size, size_t batch_s
   paged_kv_indptr_host[batch_size] = batch_size * num_pages_per_request;
   kv_indptr_ref[batch_size] = page_size * num_pages_per_request * batch_size;
 
-  paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv_cpu(
+  paged_kv_t<PageStorage::kIndices, kv_layout, T, int32_t> paged_kv_cpu(
       num_heads, page_size, head_dim, batch_size, kv_data_cpu.data(), paged_kv_indices_host.data(),
       paged_kv_indptr_host.data(), paged_kv_last_page_len_host.data());
 
   for (size_t i = 0; i < batch_size; ++i) {
     for (size_t j = 0; j < num_pages_per_request; ++j) {
-      for (size_t h = 0; h < num_heads; ++h) {
+      if constexpr (kv_layout == QKVLayout::kHND) {
+        for (size_t h = 0; h < num_heads; ++h) {
+          for (size_t entry_idx = 0; entry_idx < page_size; ++entry_idx) {
+            std::copy(
+                kv_data_cpu.begin() +
+                    paged_kv_cpu.get_k_elem_offset(i + j * batch_size, h, entry_idx, 0),
+                kv_data_cpu.begin() +
+                    paged_kv_cpu.get_k_elem_offset(i + j * batch_size, h, entry_idx + 1, 0),
+                key_ref.begin() +
+                    (((i * num_pages_per_request + j) * page_size + entry_idx) * num_heads + h) *
+                        head_dim);
+            std::copy(
+                kv_data_cpu.begin() +
+                    paged_kv_cpu.get_v_elem_offset(i + j * batch_size, h, entry_idx, 0),
+                kv_data_cpu.begin() +
+                    paged_kv_cpu.get_v_elem_offset(i + j * batch_size, h, entry_idx + 1, 0),
+                value_ref.begin() +
+                    (((i * num_pages_per_request + j) * page_size + entry_idx) * num_heads + h) *
+                        head_dim);
+          }
+        }
+      } else {
         for (size_t entry_idx = 0; entry_idx < page_size; ++entry_idx) {
-          std::copy(
-              kv_data_cpu.begin() +
-                  paged_kv_cpu.get_k_elem_offset(i + j * batch_size, h, entry_idx, 0),
-              kv_data_cpu.begin() +
-                  paged_kv_cpu.get_k_elem_offset(i + j * batch_size, h, entry_idx + 1, 0),
-              key_ref.begin() +
-                  (((i * num_pages_per_request + j) * page_size + entry_idx) * num_heads + h) *
-                      head_dim);
-          std::copy(
-              kv_data_cpu.begin() +
-                  paged_kv_cpu.get_v_elem_offset(i + j * batch_size, h, entry_idx, 0),
-              kv_data_cpu.begin() +
-                  paged_kv_cpu.get_v_elem_offset(i + j * batch_size, h, entry_idx + 1, 0),
-              value_ref.begin() +
-                  (((i * num_pages_per_request + j) * page_size + entry_idx) * num_heads + h) *
-                      head_dim);
+          for (size_t h = 0; h < num_heads; ++h) {
+            std::copy(
+                kv_data_cpu.begin() +
+                    paged_kv_cpu.get_k_elem_offset(i + j * batch_size, h, entry_idx, 0),
+                kv_data_cpu.begin() +
+                    paged_kv_cpu.get_k_elem_offset(i + j * batch_size, h + 1, entry_idx, 0),
+                key_ref.begin() +
+                    (((i * num_pages_per_request + j) * page_size + entry_idx) * num_heads + h) *
+                        head_dim);
+            std::copy(
+                kv_data_cpu.begin() +
+                    paged_kv_cpu.get_v_elem_offset(i + j * batch_size, h, entry_idx, 0),
+                kv_data_cpu.begin() +
+                    paged_kv_cpu.get_v_elem_offset(i + j * batch_size, h + 1, entry_idx, 0),
+                value_ref.begin() +
+                    (((i * num_pages_per_request + j) * page_size + entry_idx) * num_heads + h) *
+                        head_dim);
+          }
         }
       }
     }
@@ -200,15 +223,16 @@ void _TestPagedKVCacheToRaggedTensorCorrectness(size_t page_size, size_t batch_s
   thrust::device_vector<int32_t> paged_kv_indptr_gpu(paged_kv_indptr_host);
   thrust::device_vector<int32_t> paged_kv_indices_gpu(paged_kv_indices_host);
   thrust::device_vector<int32_t> paged_kv_last_page_len_gpu(paged_kv_last_page_len_host);
-  paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv_gpu(
+  paged_kv_t<PageStorage::kIndices, kv_layout, T, int32_t> paged_kv_gpu(
       num_heads, page_size, head_dim, batch_size, thrust::raw_pointer_cast(kv_data_gpu.data()),
       thrust::raw_pointer_cast(paged_kv_indices_gpu.data()),
       thrust::raw_pointer_cast(paged_kv_indptr_gpu.data()),
       thrust::raw_pointer_cast(paged_kv_last_page_len_gpu.data()));
 
   std::vector<int32_t> kv_indptr_h(batch_size + 1);
-  cudaError_t status = PagedKVCacheToRaggedTensorComputeIndptr<PageStorage::kIndices, T, int32_t>(
-      paged_kv_gpu, kv_indptr_h);
+  cudaError_t status =
+      PagedKVCacheToRaggedTensorComputeIndptr<PageStorage::kIndices, kv_layout, T, int32_t>(
+          paged_kv_gpu, kv_indptr_h);
   EXPECT_EQ(status, cudaSuccess) << "PagedKVCacheToRaggedTensorComputeIndptr "
                                     "kernel launch failed, error message: "
                                  << cudaGetErrorString(status);
@@ -222,7 +246,7 @@ void _TestPagedKVCacheToRaggedTensorCorrectness(size_t page_size, size_t batch_s
   thrust::device_vector<T> value(batch_size * num_pages_per_request * page_size * num_heads *
                                  head_dim);
   thrust::device_vector<int32_t> kv_indptr = kv_indptr_h;
-  status = PagedKVCacheToRaggedTensor<PageStorage::kIndices, T, int32_t>(
+  status = PagedKVCacheToRaggedTensor<PageStorage::kIndices, kv_layout, T, int32_t>(
       paged_kv_gpu, thrust::raw_pointer_cast(key.data()), thrust::raw_pointer_cast(value.data()),
       thrust::raw_pointer_cast(kv_indptr.data()));
   EXPECT_EQ(status, cudaSuccess)
@@ -249,9 +273,9 @@ void _TestPagedKVCacheToRaggedTensorCorrectness(size_t page_size, size_t batch_s
   }
   float result_accuracy =
       1. - float(num_result_errors_atol_1e_3_rtol_1e_3) / float(key_h.size() + value_h.size());
-  std::cout << "page_size=" << page_size << ", batch_size=" << batch_size
-            << ", num_heads=" << num_heads << ", head_dim=" << head_dim
-            << ", result_accuracy=" << result_accuracy << std::endl;
+  std::cout << "kv_layout=" << QKVLayoutToString(kv_layout) << ", page_size=" << page_size
+            << ", batch_size=" << batch_size << ", num_heads=" << num_heads
+            << ", head_dim=" << head_dim << ", result_accuracy=" << result_accuracy << std::endl;
   EXPECT_FALSE(nan_detected) << "Nan detected in the result.";
   EXPECT_GT(result_accuracy, 0.99) << "Result correctness test failed.";
 }
@@ -261,8 +285,13 @@ void TestAppendPagedKVKernelCorrectness() {
   for (size_t page_size : {1, 3, 7, 17}) {
     for (size_t batch_size : {1, 2, 3, 5, 7, 23, 79, 91}) {
       for (size_t num_heads : {32}) {
-        for (size_t head_dim : {64, 128, 256}) {
-          _TestAppendPagedKVKernelCorrectness<T>(page_size, batch_size, num_heads, head_dim);
+        for (QKVLayout kv_layout : {QKVLayout::kNHD, QKVLayout::kHND}) {
+          for (size_t head_dim : {64, 128, 256}) {
+            SWITCH_LAYOUT(kv_layout, KV_LAYOUT, {
+              _TestAppendPagedKVKernelCorrectness<KV_LAYOUT, T>(page_size, batch_size, num_heads,
+                                                                head_dim);
+            });
+          }
         }
       }
     }
@@ -274,8 +303,13 @@ void TestPagedKVCacheToRaggedTensorCorrectness() {
   for (size_t page_size : {1, 3, 7, 17}) {
     for (size_t batch_size : {1, 2, 3, 5, 7, 23, 79, 91}) {
       for (size_t num_heads : {32}) {
-        for (size_t head_dim : {64, 128, 256}) {
-          _TestPagedKVCacheToRaggedTensorCorrectness<T>(page_size, batch_size, num_heads, head_dim);
+        for (QKVLayout kv_layout : {QKVLayout::kNHD, QKVLayout::kHND}) {
+          for (size_t head_dim : {64, 128, 256}) {
+            SWITCH_LAYOUT(kv_layout, KV_LAYOUT, {
+              _TestPagedKVCacheToRaggedTensorCorrectness<KV_LAYOUT, T>(page_size, batch_size,
+                                                                       num_heads, head_dim);
+            });
+          }
         }
       }
     }

@@ -139,9 +139,9 @@ __device__ __forceinline__ void produce_kv(smem_t smem, uint32_t* smem_offset, T
 }
 
 template <bool produce_v, uint32_t page_size, uint32_t num_warps, uint32_t num_frags_y,
-          uint32_t num_frags_z, PageStorage page_storage, typename DType, typename IdType>
+          uint32_t num_frags_z, PageStorage page_storage, QKVLayout kv_layout, typename DType, typename IdType>
 __device__ __forceinline__ void page_produce_kv(smem_t smem, uint32_t* smem_offset,
-                                                paged_kv_t<page_storage, DType, IdType>& paged_kv,
+                                                paged_kv_t<page_storage, kv_layout, DType, IdType>& paged_kv,
                                                 const uint32_t kv_idx_base,
                                                 const uint32_t page_iter_base,
                                                 const uint32_t kv_len, const IdType last_indptr) {
@@ -1121,11 +1121,11 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
 
 template <uint32_t group_size, uint32_t page_size, bool causal, RotaryMode rotary_mode,
           uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps,
-          PageStorage page_storage, typename DTypeIn, typename DTypeQKAccum, typename DTypeOut,
+          PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeQKAccum, typename DTypeOut,
           typename IdType>
 __global__ void BatchPrefillWithPagedKVCacheKernel(
     IdType* __restrict__ request_indices, IdType* __restrict__ tile_indices,
-    DTypeIn* __restrict__ q, paged_kv_t<page_storage, DTypeIn, IdType> paged_kv,
+    DTypeIn* __restrict__ q, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
     IdType* __restrict__ qo_indptr, DTypeOut* __restrict__ o, float* __restrict__ tmp,
     float* __restrict__ lse, float sm_scale, const float log2_rope_rcp_scale,
     const float log2_rope_rcp_theta) {
@@ -1743,12 +1743,12 @@ cudaError_t BatchPrefillWithRaggedKVCache(
  * \return status Indicates whether CUDA calls are successful
  * \note This implementation executes requests one by one, which is not efficient.
  */
-template <PageStorage page_storage, uint32_t num_frags_x, uint32_t GROUP_SIZE, uint32_t HEAD_DIM,
+template <PageStorage page_storage, QKVLayout kv_layout, uint32_t num_frags_x, uint32_t GROUP_SIZE, uint32_t HEAD_DIM,
           RotaryMode ROTARY_MODE, bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL, typename DTypeIn,
           typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheFallbackDispatched(
     DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr,
-    paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, DTypeOut* o, float* tmp, float* lse,
+    paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, DTypeOut* o, float* tmp, float* lse,
     uint32_t num_qo_tiles, float rope_scale = 1.f, float rope_theta = 1e4,
     cudaStream_t stream = nullptr) {
   constexpr QKVLayout KV_LAYOUT = QKVLayout::kNHD;
@@ -1786,12 +1786,12 @@ cudaError_t BatchPrefillWithPagedKVCacheFallbackDispatched(
   return cudaSuccess;
 }
 
-template <PageStorage page_storage, uint32_t num_frags_x, uint32_t PAGE_SIZE, uint32_t GROUP_SIZE,
+template <PageStorage page_storage, QKVLayout kv_layout, uint32_t num_frags_x, uint32_t PAGE_SIZE, uint32_t GROUP_SIZE,
           uint32_t HEAD_DIM, RotaryMode ROTARY_MODE, bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL,
           typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr,
-    paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, DTypeOut* o, float* tmp, float* lse,
+    paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, DTypeOut* o, float* tmp, float* lse,
     uint32_t num_qo_tiles, float rope_scale, float rope_theta, cudaStream_t stream) {
   const float sm_scale = 1.f / std::sqrt(float(paged_kv.head_dim));
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
@@ -1849,9 +1849,9 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
   return cudaSuccess;
 }
 
-template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
+template <PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithPagedKVCache(
-    DTypeIn* q, IdType* qo_indptr, paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, DTypeOut* o,
+    DTypeIn* q, IdType* qo_indptr, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, DTypeOut* o,
     float* tmp, float* lse, uint32_t num_qo_heads, bool causal = true,
     RotaryMode rotary_mode = RotaryMode::kNone, bool allow_fp16_qk_reduction = false,
     float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {

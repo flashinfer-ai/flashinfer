@@ -15,7 +15,8 @@
  */
 #pragma once
 
-#include <flashinfer.cuh>
+#include <flashinfer/page.cuh>
+#include <flashinfer/rope.cuh>
 #include <stdexcept>
 
 #include "utils.h"
@@ -131,8 +132,8 @@ std::vector<dtype_out> single_mha(const std::vector<dtype_in>& q, const std::vec
   return std::move(o);
 }
 
-template <typename T, typename IdxType>
-void append_paged_kv_cache(paged_kv_t<PageStorage::kIndices, T, IdxType> page_cpu,
+template <QKVLayout kv_layout, typename T, typename IdxType>
+void append_paged_kv_cache(paged_kv_t<PageStorage::kIndices, kv_layout, T, IdxType> page_cpu,
                            const std::vector<std::vector<T>>& keys,
                            const std::vector<std::vector<T>>& values,
                            const std::vector<IdxType>& append_indptr) {

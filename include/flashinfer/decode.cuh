@@ -494,9 +494,9 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(
  */
 template <bool partition_kv, RotaryMode rotary_mode, uint32_t num_stages_smem,
           uint32_t tile_size_per_bdx, uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz,
-          PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
+          PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeOut, typename IdType>
 __global__ void BatchDecodeWithPagedKVCacheKernel(
-    DTypeIn* __restrict__ q, paged_kv_t<page_storage, DTypeIn, IdType> paged_kv,
+    DTypeIn* __restrict__ q, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* __restrict__ o,
     DTypeOut* __restrict__ tmp, float* __restrict__ lse, float sm_scale, float rope_rcp_scale,
     float rope_rcp_theta) {
@@ -1115,10 +1115,10 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
   return cudaSuccess;
 }
 
-template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, RotaryMode ROTARY_MODE,
+template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, QKVLayout kv_layout, RotaryMode ROTARY_MODE,
           typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(
-    DTypeIn* q, paged_kv_t<page_storage, DTypeIn, IdType> paged_kv,
+    DTypeIn* q, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, DTypeOut* tmp, float* lse,
     float rope_scale, float rope_theta, cudaStream_t stream) {
   const float sm_scale = 1.f / std::sqrt(float(HEAD_DIM));
@@ -1207,9 +1207,9 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
  * \param stream The cuda stream to launch the kernel
  * \return status Indicates whether CUDA calls are successful
  */
-template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
+template <PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCache(DTypeIn* q,
-                                        paged_kv_t<page_storage, DTypeIn, IdType> paged_kv,
+                                        paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
                                         kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o,
                                         DTypeOut* tmp, float* lse, uint32_t num_qo_heads,
                                         RotaryMode rotary_mode = RotaryMode::kNone,
@@ -1229,7 +1229,7 @@ cudaError_t BatchDecodeWithPagedKVCache(DTypeIn* q,
       num_qo_heads / num_kv_heads, GROUP_SIZE,
       {SWITCH_HEAD_DIM(
           head_dim, HEAD_DIM, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
-            return BatchDecodeWithPagedKVCacheDispatched<GROUP_SIZE, HEAD_DIM, page_storage,
+            return BatchDecodeWithPagedKVCacheDispatched<GROUP_SIZE, HEAD_DIM, page_storage, kv_layout,
                                                          ROTARY_MODE, DTypeIn, DTypeOut, IdType>(
                 q, paged_kv, kv_partition_info, o, tmp, lse, rope_scale, rope_theta, stream);
           })})});
