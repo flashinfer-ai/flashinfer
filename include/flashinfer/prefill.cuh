@@ -46,6 +46,13 @@ constexpr uint32_t warp_size = 32;
 
 namespace {
 
+template <bool ALLOW_FP16_QK_REDUCTION, typename DTypeIn>
+struct QKAccum {
+  using DType =
+      typename std::conditional<ALLOW_FP16_QK_REDUCTION && std::is_same<DTypeIn, half>::value, half,
+                                float>::type;
+};
+
 template <typename IdType>
 uint32_t BatchPrefillComputeQOTileSize(IdType* qo_length, IdType* kv_length,
                                        const uint32_t batch_size, const uint32_t gqa_group_size) {
@@ -77,7 +84,7 @@ cudaError_t ComputeNumFragsZ(const uint32_t head_dim, const uint32_t num_frags_x
 }
 
 template <typename IdType>
-std::vector<uint32_t> PrefillPartitionPagedKVCacheBinarySearchMinNumPagePerBatch(
+std::vector<uint32_t> PrefillPartitionPagedKVCacheBinarySearchNumPagePerBatch(
     IdType* qo_length, IdType* num_kv_pages, const uint32_t qo_tile_size,
     const uint32_t max_grid_size, const uint32_t batch_size_before_partition,
     const uint32_t gqa_group_size, const uint32_t min_num_pages_per_batch) {
@@ -1532,9 +1539,7 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
                     SWITCH_ROTARY_MODE(
                         rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(layout, LAYOUT, {
                           using DTypeQKAccum =
-                              typename std::conditional<ALLOW_FP16_QK_REDUCTION &&
-                                                            std::is_same<DTypeIn, half>::value,
-                                                        half, float>::type;
+                              typename QKAccum<ALLOW_FP16_QK_REDUCTION, DTypeIn>::DType;
 
                           constexpr uint32_t num_warps = 4;
                           int max_num_frags_z;
@@ -1602,9 +1607,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
   constexpr uint32_t num_frags_y = HEAD_DIM / 16;
   constexpr uint32_t num_warps = 4;
   SWITCH_NUM_FRAGS_X((qo_len * GROUP_SIZE > 64 ? 2 : 1), num_frags_x, {
-    using DTypeQKAccum =
-        typename std::conditional<ALLOW_FP16_QK_REDUCTION && std::is_same<DTypeIn, half>::value,
-                                  half, float>::type;
+    using DTypeQKAccum = typename QKAccum<ALLOW_FP16_QK_REDUCTION, DTypeIn>::DType;
 
     int max_num_frags_z = 0;
     FLASHINFER_CUDA_CALL(ComputeNumFragsZ<DTypeIn>(HEAD_DIM, num_frags_x, ROTARY_MODE,
@@ -1771,9 +1774,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
   dim3 nblks(num_qo_tiles, 1, num_kv_heads);
   dim3 nthrs(32, num_warps);
   constexpr uint32_t num_frags_y = HEAD_DIM / 16;
-  using DTypeQKAccum =
-      typename std::conditional<ALLOW_FP16_QK_REDUCTION && std::is_same<DTypeIn, half>::value, half,
-                                float>::type;
+  using DTypeQKAccum = typename QKAccum<ALLOW_FP16_QK_REDUCTION, DTypeIn>::DType;
 
   int max_num_frags_z = 0;
   FLASHINFER_CUDA_CALL(ComputeNumFragsZ<DTypeIn>(HEAD_DIM, num_frags_x, ROTARY_MODE,
@@ -1920,9 +1921,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
   dim3 nthrs(32, num_warps);
 
   constexpr uint32_t num_frags_y = HEAD_DIM / 16;
-  using DTypeQKAccum =
-      typename std::conditional<ALLOW_FP16_QK_REDUCTION && std::is_same<DTypeIn, half>::value, half,
-                                float>::type;
+  using DTypeQKAccum = typename QKAccum<ALLOW_FP16_QK_REDUCTION, DTypeIn>::DType;
 
   int max_num_frags_z = 0;
   FLASHINFER_CUDA_CALL(ComputeNumFragsZ<DTypeIn>(HEAD_DIM, num_frags_x, ROTARY_MODE,
@@ -1958,12 +1957,13 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
  */
 template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheWorkEstimation(
-    uint32_t& qo_tile_size, uint32_t& tmp_size, uint32_t& chunk_size, uint32_t& new_batch_size,
-    uint32_t& grid_size, IdType* qo_indptr_h, IdType* paged_kv_indptr_h, IdType* kv_last_page_len_h,
-    const uint32_t batch_size, const uint32_t num_qo_heads, const uint32_t num_kv_heads,
-    const uint32_t head_dim, const uint32_t page_size, bool causal = true,
-    QKVLayout layout = QKVLayout::kNHD, RotaryMode rotary_mode = RotaryMode::kNone,
-    bool allow_fp16_qk_reduction = false, cudaStream_t stream = nullptr) {
+    uint32_t& qo_tile_size, uint32_t& tmp_size, uint32_t& num_pages_per_batch,
+    uint32_t& batch_size_after_partition, uint32_t& grid_size, IdType* qo_indptr_h,
+    IdType* paged_kv_indptr_h, IdType* kv_last_page_len_h, const uint32_t batch_size,
+    const uint32_t num_qo_heads, const uint32_t num_kv_heads, const uint32_t head_dim,
+    const uint32_t page_size, bool causal = true, QKVLayout layout = QKVLayout::kNHD,
+    RotaryMode rotary_mode = RotaryMode::kNone, bool allow_fp16_qk_reduction = false,
+    cudaStream_t stream = nullptr) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " is not a multiple of num_kv_heads "
@@ -1987,21 +1987,44 @@ cudaError_t BatchPrefillWithPagedKVCacheWorkEstimation(
   qo_tile_size = BatchPrefillComputeQOTileSize(qo_length.data(), num_kv_pages.data(), batch_size,
                                                num_qo_heads / num_kv_heads);
 
-  SWITCH_NUM_FRAGS_X(
-      qo_tile_size / 64, num_frags_x,
-      {SWITCH_ALLOW_FP16_QK_REDUCTION(
-          allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
-          {SWITCH_GQA_GROUP_SIZE(
+  constexpr uint32_t num_warps = 4;
+  SWITCH_NUM_FRAGS_X(qo_tile_size / 64, num_frags_x, {
+    int max_num_frags_z;
+    FLASHINFER_CUDA_CALL(ComputeNumFragsZ<DTypeIn>(head_dim, num_frags_x, rotary_mode,
+                                                   allow_fp16_qk_reduction, &max_num_frags_z));
+    SWITCH_NUM_FRAGS_Z(
+        max_num_frags_z, num_frags_z,
+        {SWITCH_ALLOW_FP16_QK_REDUCTION(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
+          using DTypeQKAccum = typename QKAccum<ALLOW_FP16_QK_REDUCTION, DTypeIn>::DType;
+          SWITCH_GQA_GROUP_SIZE(
               gqa_group_size, GROUP_SIZE,
-              {SWITCH_CAUSAL(causal, CAUSAL,
-                             {SWITCH_HEAD_DIM_PREFILL(
-                                 head_dim, HEAD_DIM,
-                                 {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE,
-                                                     {SWITCH_PAGE_SIZE(page_size, PAGE_SIZE,
-                                                                       {
-                                                                           // TODO(Zihao)
-                                                                       })})})})})})});
-  // TODO(Zihao)
+              {SWITCH_CAUSAL(
+                  causal, CAUSAL, {SWITCH_HEAD_DIM_PREFILL(head_dim, HEAD_DIM, {
+                    constexpr uint32_t num_frags_y = HEAD_DIM / 16;
+                    SWITCH_ROTARY_MODE(
+                        rotary_mode, ROTARY_MODE, {SWITCH_PAGE_SIZE(page_size, PAGE_SIZE, {
+                          auto kernel = BatchPrefillWithPagedKVCacheKernel<
+                              /*partition_kv=*/true, GROUP_SIZE, PAGE_SIZE, CAUSAL, ROTARY_MODE,
+                              num_frags_x, num_frags_y, num_frags_z, num_warps, page_storage,
+                              DTypeIn, DTypeQKAccum>;
+                          int max_grid_size = 0;
+                          const uint32_t num_threads = num_warps * warp_size;
+                          const uint32_t smem_size = (num_frags_x * num_warps + num_frags_z * 2) *
+                                                     16 * head_dim * sizeof(DTypeIn);
+                          FLASHINFER_CUDA_CALL(get_max_grid_size((void*)kernel, num_threads,
+                                                                 smem_size, &max_grid_size));
+                          std::vector<uint32_t> rv =
+                              PrefillPartitionPagedKVCacheBinarySearchNumPagePerBatch(
+                                  qo_length.data(), num_kv_pages.data(), qo_tile_size,
+                                  max_grid_size, batch_size, gqa_group_size, 128 / page_size);
+                          num_pages_per_batch = rv[0];
+                          grid_size = rv[1];
+                          batch_size_after_partition = rv[2];
+                        })})
+                  })})})
+        })})
+  });
+  return cudaSuccess;
 }
 
 template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
