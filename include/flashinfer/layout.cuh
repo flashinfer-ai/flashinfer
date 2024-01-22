@@ -70,14 +70,14 @@ struct tensor_info_t {
                                                                 uint32_t qo_head_idx,
                                                                 uint32_t feat_idx) const {
     return get_elem_offset_impl<QKVLayout::kNHD, head_dim>(qo_idx, qo_head_idx, feat_idx, qo_len,
-                                                  get_num_qo_heads());
+                                                           get_num_qo_heads());
   }
 
   __host__ __device__ __forceinline__ size_t get_kv_elem_offset(uint32_t kv_idx,
                                                                 uint32_t kv_head_idx,
                                                                 uint32_t feat_idx) const {
     return get_elem_offset_impl<kv_layout, head_dim>(kv_idx, kv_head_idx, feat_idx, kv_len,
-                                                  num_kv_heads);
+                                                     num_kv_heads);
   }
 
   __host__ __device__ __forceinline__ uint32_t get_qo_n_stride() const {

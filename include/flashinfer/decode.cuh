@@ -345,13 +345,11 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
 
 template <QKVLayout kv_layout, RotaryMode rotary_mode, uint32_t num_stages_smem, uint32_t vec_size,
           uint32_t bdx, uint32_t bdy, uint32_t bdz, typename DTypeIn, typename DTypeOut>
-__global__ void BatchDecodeWithPaddedKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* __restrict__ k,
-                                                   DTypeIn* __restrict__ v,
-                                                   DTypeOut* __restrict__ o,
-                                                   float* __restrict__ lse,
-                                                   tensor_info_t<kv_layout, bdy, bdx * vec_size> info,
-                                                   float sm_scale, float rope_rcp_scale,
-                                                   float rope_rcp_theta) {
+__global__ void BatchDecodeWithPaddedKVCacheKernel(
+    DTypeIn* __restrict__ q, DTypeIn* __restrict__ k, DTypeIn* __restrict__ v,
+    DTypeOut* __restrict__ o, float* __restrict__ lse,
+    tensor_info_t<kv_layout, bdy, bdx * vec_size> info, float sm_scale, float rope_rcp_scale,
+    float rope_rcp_theta) {
   auto block = cg::this_thread_block();
   sm_scale *= math::log2e;
 
@@ -1264,8 +1262,8 @@ cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DType
 
   dim3 nblks(batch_size, num_kv_heads);
   dim3 nthrs(bdx, bdy, bdz);
-  auto kernel = BatchDecodeWithPaddedKVCacheKernel<KV_LAYOUT, ROTARY_MODE, num_stages_smem, vec_size,
-                                                   bdx, bdy, bdz, DTypeIn, DTypeOut>;
+  auto kernel = BatchDecodeWithPaddedKVCacheKernel<KV_LAYOUT, ROTARY_MODE, num_stages_smem,
+                                                   vec_size, bdx, bdy, bdz, DTypeIn, DTypeOut>;
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
   tensor_info_t<KV_LAYOUT, GROUP_SIZE, HEAD_DIM> info(1, padded_kv_len, num_kv_heads);
@@ -1299,12 +1297,13 @@ cudaError_t BatchDecodeWithPaddedKVCache(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
       {SWITCH_HEAD_DIM(
           head_dim, HEAD_DIM,
-          {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(kv_layout, KV_LAYOUT, {
-                                return BatchDecodeWithPaddedKVCacheDispatched<
-                                    GROUP_SIZE, HEAD_DIM, KV_LAYOUT, ROTARY_MODE, DTypeIn, DTypeOut>(
-                                    q, k, v, o, tmp, lse, batch_size, padded_kv_len, num_qo_heads,
-                                    rope_scale, rope_theta, stream);
-                              })})})});
+          {SWITCH_ROTARY_MODE(
+              rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(kv_layout, KV_LAYOUT, {
+                return BatchDecodeWithPaddedKVCacheDispatched<GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
+                                                              ROTARY_MODE, DTypeIn, DTypeOut>(
+                    q, k, v, o, tmp, lse, batch_size, padded_kv_len, num_qo_heads, rope_scale,
+                    rope_theta, stream);
+              })})})});
   return cudaSuccess;
 }
 

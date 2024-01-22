@@ -43,14 +43,15 @@ void _TestDecodingKernelCorrectness(size_t num_qo_heads, size_t num_kv_heads, si
   thrust::device_vector<T> tmp(16 * 1024 * 1024);
   std::vector<T> o_ref_host;
 
-  o_ref_host = cpu_reference::single_mha<T, T>(Q_host, K_host, V_host, 1, seq_len, num_qo_heads,
-                                               num_kv_heads, head_dim, false, kv_layout, rotary_mode);
+  o_ref_host =
+      cpu_reference::single_mha<T, T>(Q_host, K_host, V_host, 1, seq_len, num_qo_heads,
+                                      num_kv_heads, head_dim, false, kv_layout, rotary_mode);
 
   cudaError_t status = SingleDecodeWithKVCache(
       thrust::raw_pointer_cast(Q.data()), thrust::raw_pointer_cast(K.data()),
       thrust::raw_pointer_cast(V.data()), thrust::raw_pointer_cast(O.data()),
-      thrust::raw_pointer_cast(tmp.data()), num_qo_heads, num_kv_heads, seq_len, head_dim, kv_layout,
-      rotary_mode);
+      thrust::raw_pointer_cast(tmp.data()), num_qo_heads, num_kv_heads, seq_len, head_dim,
+      kv_layout, rotary_mode);
   EXPECT_EQ(status, cudaSuccess) << "SingleDecodeWithKVCache kernel launch failed, error message: "
                                  << cudaGetErrorString(status);
 

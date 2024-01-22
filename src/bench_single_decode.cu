@@ -112,7 +112,7 @@ void bench_flashinfer_single_decode_with_prefill(nvbench::state& state) {
       .add_int64_axis("num_kv_heads", {32, 4})                                              \
       .add_int64_axis("head_dim", {128})                                                    \
       .add_int64_axis("rotary_mode", {0, 1})                                                \
-      .add_int64_axis("kv_layout", {0, 1})                                                     \
+      .add_int64_axis("kv_layout", {0, 1})                                                  \
       .add_int64_axis("cooperative", {1})
 
 #define BENCH_FLASHINFER_SINGLE_DECODE_WITH_PREFILL(dtype_in, dtype_out)                           \
@@ -126,7 +126,7 @@ void bench_flashinfer_single_decode_with_prefill(nvbench::state& state) {
       .add_int64_axis("num_kv_heads", {32, 4})                                                     \
       .add_int64_axis("head_dim", {128})                                                           \
       .add_int64_axis("rotary_mode", {0, 1})                                                       \
-      .add_int64_axis("kv_layout", {0, 1})                                                            \
+      .add_int64_axis("kv_layout", {0, 1})                                                         \
       .add_int64_axis("cooperative", {1})
 
 BENCH_FLASHINFER_SINGLE_DECODE(half, half);

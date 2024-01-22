@@ -961,7 +961,8 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
   constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
   const uint32_t qo_len = qo_indptr[request_idx + 1] - qo_indptr[request_idx],
                  kv_len = kv_indptr[request_idx + 1] - kv_indptr[request_idx];
-  const tensor_info_t<kv_layout, group_size, num_frags_y * 16> qkv_info(qo_len, kv_len, num_kv_heads);
+  const tensor_info_t<kv_layout, group_size, num_frags_y * 16> qkv_info(qo_len, kv_len,
+                                                                        num_kv_heads);
   const uint32_t qo_upper_bound = min(qo_len, (tile_idx + 1) * (num_rows_per_cta / group_size));
 
   constexpr bool partition_kv = false;
@@ -1368,11 +1369,11 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
                                 constexpr uint32_t num_threads = num_warps * warp_size;
                                 constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
                                 auto partition_kv_kernel = SinglePrefillWithKVCacheKernel<
-                                    /*partition_kv=*/true, GROUP_SIZE, CAUSAL, KV_LAYOUT, ROTARY_MODE,
-                                    num_frags_x, num_frags_y, num_frags_z, num_warps, DTypeIn,
-                                    DTypeQKAccum, DTypeOut>;
-                                tensor_info_t<KV_LAYOUT, GROUP_SIZE, HEAD_DIM> qkv_info(qo_len, kv_len,
-                                                                                     num_kv_heads);
+                                    /*partition_kv=*/true, GROUP_SIZE, CAUSAL, KV_LAYOUT,
+                                    ROTARY_MODE, num_frags_x, num_frags_y, num_frags_z, num_warps,
+                                    DTypeIn, DTypeQKAccum, DTypeOut>;
+                                tensor_info_t<KV_LAYOUT, GROUP_SIZE, HEAD_DIM> qkv_info(
+                                    qo_len, kv_len, num_kv_heads);
                                 uint32_t smem_size = (num_frags_x * num_warps + num_frags_z * 2) *
                                                      16 * head_dim * sizeof(DTypeIn);
                                 FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
@@ -1560,17 +1561,17 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOu
       allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
       {SWITCH_GQA_GROUP_SIZE(
           group_size, GROUP_SIZE,
-          {SWITCH_CAUSAL(
-              causal, CAUSAL,
-              {SWITCH_HEAD_DIM_PREFILL(
-                  head_dim, HEAD_DIM,
-                  {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(kv_layout, KV_LAYOUT, {
-                                        SinglePrefillWithKVCacheDispatched<
-                                            GROUP_SIZE, HEAD_DIM, KV_LAYOUT, ROTARY_MODE,
-                                            ALLOW_FP16_QK_REDUCTION, CAUSAL>(
-                                            q, k, v, o, tmp, lse, num_kv_heads, qo_len, kv_len,
-                                            rope_scale, rope_theta, stream);
-                                      })})})})})});
+          {SWITCH_CAUSAL(causal, CAUSAL,
+                         {SWITCH_HEAD_DIM_PREFILL(
+                             head_dim, HEAD_DIM,
+                             {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE,
+                                                 {SWITCH_LAYOUT(kv_layout, KV_LAYOUT, {
+                                                   SinglePrefillWithKVCacheDispatched<
+                                                       GROUP_SIZE, HEAD_DIM, KV_LAYOUT, ROTARY_MODE,
+                                                       ALLOW_FP16_QK_REDUCTION, CAUSAL>(
+                                                       q, k, v, o, tmp, lse, num_kv_heads, qo_len,
+                                                       kv_len, rope_scale, rope_theta, stream);
+                                                 })})})})})});
   return cudaSuccess;
 }
 
