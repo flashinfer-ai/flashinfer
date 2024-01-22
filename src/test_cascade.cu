@@ -303,7 +303,7 @@ void _TestTwoLevelSinglePrefixCascadeDecodeCorrectness(size_t batch_size,
       thrust::raw_pointer_cast(shared_v_d.data()), thrust::raw_pointer_cast(o_cascade_0_d.data()),
       thrust::raw_pointer_cast(tmp_0_d.data()), thrust::raw_pointer_cast(lse_cascade_0_d.data()),
       num_qo_heads, num_kv_heads, /*qo_len=*/batch_size, /*kv_len=*/shared_prefix_length, head_dim,
-      /*causal=*/false, /*layout=*/QKVLayout::kNHD,
+      /*causal=*/false, /*kv_layout=*/QKVLayout::kNHD,
       /*rotary_mode=*/RotaryMode::kNone, /*allow_fp16_qk_reduction=*/false);
 
   EXPECT_EQ(status, cudaSuccess) << "Cascade implementation prefill failed with error: "
@@ -416,7 +416,7 @@ void _TestTwoLevelSinglePrefixCascadeAppendCorrectness(size_t batch_size,
       thrust::raw_pointer_cast(tmp_0_d.data()), thrust::raw_pointer_cast(lse_cascade_0_d.data()),
       num_qo_heads, num_kv_heads, /*qo_len=*/batch_size * qo_append_length,
       /*kv_len=*/shared_prefix_length, head_dim,
-      /*causal=*/false, /*layout=*/QKVLayout::kNHD,
+      /*causal=*/false, /*kv_layout=*/QKVLayout::kNHD,
       /*rotary_mode=*/RotaryMode::kNone, /*allow_fp16_qk_reduction=*/false);
 
   EXPECT_EQ(status, cudaSuccess)

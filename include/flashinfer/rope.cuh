@@ -82,7 +82,7 @@ __device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope(
   return vec;
 }
 
-template <uint32_t head_dim, uint32_t vec_size, uint32_t bdx, QKVLayout layout, typename DType,
+template <uint32_t head_dim, uint32_t vec_size, uint32_t bdx, typename DType,
           typename IdType>
 __global__ void BatchQKApplyRotaryInPlaceKernel(DType* __restrict__ q, DType* __restrict__ k,
                                                 IdType* __restrict__ indptr,
@@ -110,7 +110,7 @@ __global__ void BatchQKApplyRotaryInPlaceKernel(DType* __restrict__ q, DType* __
       vec_t<float, vec_size> q_vec;
       if (i * bdy + ty < seq_len) {
         DType* q_ptr =
-            q + get_elem_offset_impl<layout, head_dim>(indptr[batch_idx] + i * bdy + ty,
+            q + get_elem_offset_impl<QKVLayout::kNHD, head_dim>(indptr[batch_idx] + i * bdy + ty,
                                                        qo_head_idx, 0, seq_len, num_qo_heads);
         q_vec = vec_apply_llama_rope<vec_size, bdx>(q_ptr, freq, offset + i * bdy + ty);
         q_vec.cast_store(q_ptr + tx * vec_size);
@@ -127,7 +127,7 @@ __global__ void BatchQKApplyRotaryInPlaceKernel(DType* __restrict__ q, DType* __
       vec_t<float, vec_size> k_vec;
       if (i * bdy + ty < seq_len) {
         DType* k_ptr =
-            k + get_elem_offset_impl<layout, head_dim>(indptr[batch_idx] + i * bdy + ty,
+            k + get_elem_offset_impl<QKVLayout::kNHD, head_dim>(indptr[batch_idx] + i * bdy + ty,
                                                        kv_head_idx, 0, seq_len, num_kv_heads);
         k_vec = vec_apply_llama_rope<vec_size, bdx>(k_ptr, freq, offset + i * bdy + ty);
         k_vec.cast_store(k_ptr + tx * vec_size);
@@ -141,13 +141,13 @@ cudaError_t BatchQKApplyRotaryInPlace(DType* __restrict__ q, DType* __restrict__
                                       IdType* __restrict__ indptr, IdType* __restrict__ offsets,
                                       uint32_t batch_size, uint32_t num_qo_heads,
                                       uint32_t num_kv_heads, uint32_t head_dim,
-                                      QKVLayout layout = QKVLayout::kNHD, float rope_scale = 1.f,
+                                      float rope_scale = 1.f,
                                       float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   float rope_rcp_scale = 1.0f / rope_scale;
   float rope_rcp_theta = 1.0f / rope_theta;
 
   SWITCH_HEAD_DIM(
-      head_dim, HEAD_DIM, {SWITCH_LAYOUT(layout, LAYOUT, {
+      head_dim, HEAD_DIM, {
         constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
         constexpr uint32_t bdx = HEAD_DIM / vec_size;
         uint32_t num_threads = std::max(128U, bdx);
@@ -155,7 +155,7 @@ cudaError_t BatchQKApplyRotaryInPlace(DType* __restrict__ q, DType* __restrict__
         dim3 nblks(batch_size * (num_qo_heads + num_kv_heads));
         dim3 nthrs(bdx, bdy);
         auto kernel =
-            BatchQKApplyRotaryInPlaceKernel<HEAD_DIM, vec_size, bdx, LAYOUT, DType, IdType>;
+            BatchQKApplyRotaryInPlaceKernel<HEAD_DIM, vec_size, bdx, DType, IdType>;
         void* args[] = {(void*)&q,
                         (void*)&k,
                         (void*)&indptr,
@@ -166,7 +166,7 @@ cudaError_t BatchQKApplyRotaryInPlace(DType* __restrict__ q, DType* __restrict__
                         (void*)&rope_rcp_scale,
                         (void*)&rope_rcp_theta};
         FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
-      })});
+      });
 
   return cudaSuccess;
 }

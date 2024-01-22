@@ -172,7 +172,7 @@ __device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, f
 
 /*!
  * \brief FlashAttention decoding cuda kernel with kv-cache for a single request
- * \tparam layout The layout of k/v matrices (NHD or HND)
+ * \tparam kv_layout The layout of k/v matrices (NHD or HND)
  * \tparam partition_kv Whether to partition kv-cache on sequence length dimension or not
  * \tparam rotary_mode The rotary mode
  * \tparam vec_size A template integer indicates the vector size
@@ -195,13 +195,13 @@ __device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, f
  *   of "theta" used in RoPE (Rotary Positional Embeddings)
  * \param kv_chunk_size A integer indicates the kv-chunk size
  */
-template <QKVLayout layout, bool partition_kv, RotaryMode rotary_mode, uint32_t num_stages_smem,
+template <QKVLayout kv_layout, bool partition_kv, RotaryMode rotary_mode, uint32_t num_stages_smem,
           uint32_t tile_size_per_bdx, uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz,
           typename DTypeIn, typename DTypeOut>
 __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* __restrict__ k,
                                               DTypeIn* __restrict__ v, DTypeOut* __restrict__ o,
                                               DTypeOut* __restrict__ tmp,
-                                              tensor_info_t<layout, bdy, bdx * vec_size> info,
+                                              tensor_info_t<kv_layout, bdy, bdx * vec_size> info,
                                               float sm_scale, float rope_rcp_scale,
                                               float rope_rcp_theta, uint32_t kv_chunk_size) {
   auto block = cg::this_thread_block();
@@ -343,13 +343,13 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
   }
 }
 
-template <QKVLayout layout, RotaryMode rotary_mode, uint32_t num_stages_smem, uint32_t vec_size,
+template <QKVLayout kv_layout, RotaryMode rotary_mode, uint32_t num_stages_smem, uint32_t vec_size,
           uint32_t bdx, uint32_t bdy, uint32_t bdz, typename DTypeIn, typename DTypeOut>
 __global__ void BatchDecodeWithPaddedKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* __restrict__ k,
                                                    DTypeIn* __restrict__ v,
                                                    DTypeOut* __restrict__ o,
                                                    float* __restrict__ lse,
-                                                   tensor_info_t<layout, bdy, bdx * vec_size> info,
+                                                   tensor_info_t<kv_layout, bdy, bdx * vec_size> info,
                                                    float sm_scale, float rope_rcp_scale,
                                                    float rope_rcp_theta) {
   auto block = cg::this_thread_block();
@@ -720,7 +720,7 @@ constexpr uint32_t get_heuristic_num_threads(uint32_t group_size, uint32_t sizeo
  * \param num_kv_heads A integer indicates the number of heads of key and value
  * \param seq_len A integer indicates the sequence length
  * \param head_dim A integer indicates the head dimension
- * \param layout The layout of q/k/v matrices
+ * \param kv_layout The layout of k/v matrices
  * \param rotary_mode The rotary mode
  * \param stream The cuda stream to launch the kernel
  * \return status Indicates whether CUDA calls are successful
@@ -729,7 +729,7 @@ template <typename DTypeIn, typename DTypeOut>
 cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& max_grid_size,
                                                   uint32_t num_qo_heads, uint32_t num_kv_heads,
                                                   uint32_t seq_len, uint32_t head_dim,
-                                                  QKVLayout layout = QKVLayout::kNHD,
+                                                  QKVLayout kv_layout = QKVLayout::kNHD,
                                                   RotaryMode rotary_mode = RotaryMode::kNone,
                                                   cudaStream_t stream = nullptr) {
   const uint32_t GROUP_SIZE = num_qo_heads / num_kv_heads;
@@ -741,7 +741,7 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& 
         {SWITCH_HEAD_DIM(
             head_dim, HEAD_DIM,
             {SWITCH_ROTARY_MODE(
-                rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(layout, QKV_LAYOUT, {
+                rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(kv_layout, KV_LAYOUT, {
                   constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
                   constexpr uint32_t num_stages_smem = 2U;
                   constexpr uint32_t bdx = HEAD_DIM / vec_size;
@@ -757,7 +757,7 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& 
                                              2U * bdy * bdz * sizeof(float);
 
                   auto kernel =
-                      SingleDecodeWithKVCacheKernel<QKV_LAYOUT, /*partition_kv=*/true, ROTARY_MODE,
+                      SingleDecodeWithKVCacheKernel<KV_LAYOUT, /*partition_kv=*/true, ROTARY_MODE,
                                                     num_stages_smem, tile_size_per_bdx, vec_size,
                                                     bdx, bdy, bdz, DTypeIn, DTypeOut>;
                   int num_blocks_per_sm = 0;
@@ -794,7 +794,7 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& 
  * \param num_kv_heads A integer indicates the number of heads of key and value
  * \param seq_len A integer indicates the sequence length
  * \param head_dim A integer indicates the head dimension
- * \param layout The layout of q/k/v matrices
+ * \param kv_layout The layout of q/k/v matrices
  * \param rotary_mode The rotary mode
  * \param rope_scale The scaling factor used in RoPE Interpolation
  * \param rope_theta The theta used in RoPE
@@ -804,7 +804,7 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& 
 template <typename DTypeIn, typename DTypeOut>
 cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o, DTypeOut* tmp,
                                     uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t seq_len,
-                                    uint32_t head_dim, QKVLayout layout = QKVLayout::kNHD,
+                                    uint32_t head_dim, QKVLayout kv_layout = QKVLayout::kNHD,
                                     RotaryMode rotary_mode = RotaryMode::kNone,
                                     float rope_scale = 1.f, float rope_theta = 1e4,
                                     cudaStream_t stream = nullptr) {
@@ -823,7 +823,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
       {SWITCH_HEAD_DIM(
           head_dim, HEAD_DIM,
           {SWITCH_ROTARY_MODE(
-              rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(layout, QKV_LAYOUT, {
+              rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(kv_layout, KV_LAYOUT, {
                 constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
                 constexpr uint32_t num_stages_smem = 2U;
                 constexpr uint32_t bdx = HEAD_DIM / vec_size;
@@ -832,7 +832,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                 constexpr uint32_t num_threads =
                     std::max(get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeIn)), bdx * bdy);
                 constexpr uint32_t bdz = num_threads / (bdx * bdy);
-                tensor_info_t<QKV_LAYOUT, GROUP_SIZE, HEAD_DIM> info(1, seq_len, num_kv_heads);
+                tensor_info_t<KV_LAYOUT, GROUP_SIZE, HEAD_DIM> info(1, seq_len, num_kv_heads);
                 constexpr uint32_t tile_size_per_bdx =
                     GROUP_SIZE == 1 ? (sizeof(DTypeIn) == 1 ? 2U : 8U) : 1U;
                 const uint32_t smem_size = 2U * num_stages_smem * bdy * tile_size_per_bdx * bdz *
@@ -841,7 +841,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                 if (seq_len <= 256 || tmp == nullptr) {
                   // no need to use partition-kv kernel
                   auto kernel =
-                      SingleDecodeWithKVCacheKernel<QKV_LAYOUT, /*partition_kv=*/false, ROTARY_MODE,
+                      SingleDecodeWithKVCacheKernel<KV_LAYOUT, /*partition_kv=*/false, ROTARY_MODE,
                                                     num_stages_smem, tile_size_per_bdx, vec_size,
                                                     bdx, bdy, bdz, DTypeIn, DTypeOut>;
                   FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
@@ -864,7 +864,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                 } else {
                   // use partition-kv kernel
                   auto kernel =
-                      SingleDecodeWithKVCacheKernel<QKV_LAYOUT, /*partition_kv=*/true, ROTARY_MODE,
+                      SingleDecodeWithKVCacheKernel<KV_LAYOUT, /*partition_kv=*/true, ROTARY_MODE,
                                                     num_stages_smem, tile_size_per_bdx, vec_size,
                                                     bdx, bdy, bdz, DTypeIn, DTypeOut>;
                   FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
@@ -1239,7 +1239,7 @@ cudaError_t BatchDecodeWithPagedKVCache(DTypeIn* q,
   return cudaSuccess;
 }
 
-template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout LAYOUT, RotaryMode ROTARY_MODE,
+template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT, RotaryMode ROTARY_MODE,
           typename DTypeIn, typename DTypeOut>
 cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeIn* o,
                                                    float* tmp, float* lse, uint32_t batch_size,
@@ -1264,11 +1264,11 @@ cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DType
 
   dim3 nblks(batch_size, num_kv_heads);
   dim3 nthrs(bdx, bdy, bdz);
-  auto kernel = BatchDecodeWithPaddedKVCacheKernel<LAYOUT, ROTARY_MODE, num_stages_smem, vec_size,
+  auto kernel = BatchDecodeWithPaddedKVCacheKernel<KV_LAYOUT, ROTARY_MODE, num_stages_smem, vec_size,
                                                    bdx, bdy, bdz, DTypeIn, DTypeOut>;
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-  tensor_info_t<LAYOUT, GROUP_SIZE, HEAD_DIM> info(1, padded_kv_len, num_kv_heads);
+  tensor_info_t<KV_LAYOUT, GROUP_SIZE, HEAD_DIM> info(1, padded_kv_len, num_kv_heads);
   void* args[] = {(void*)&q,
                   (void*)&k,
                   (void*)&v,
@@ -1286,7 +1286,7 @@ template <typename DTypeIn, typename DTypeOut>
 cudaError_t BatchDecodeWithPaddedKVCache(
     DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeIn* o, DTypeOut* tmp, float* lse, uint32_t batch_size,
     uint32_t padded_kv_len, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
-    QKVLayout layout = QKVLayout::kNHD, RotaryMode rotary_mode = RotaryMode::kNone,
+    QKVLayout kv_layout = QKVLayout::kNHD, RotaryMode rotary_mode = RotaryMode::kNone,
     float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
@@ -1299,9 +1299,9 @@ cudaError_t BatchDecodeWithPaddedKVCache(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
       {SWITCH_HEAD_DIM(
           head_dim, HEAD_DIM,
-          {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(layout, LAYOUT, {
+          {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(kv_layout, KV_LAYOUT, {
                                 return BatchDecodeWithPaddedKVCacheDispatched<
-                                    GROUP_SIZE, HEAD_DIM, LAYOUT, ROTARY_MODE, DTypeIn, DTypeOut>(
+                                    GROUP_SIZE, HEAD_DIM, KV_LAYOUT, ROTARY_MODE, DTypeIn, DTypeOut>(
                                     q, k, v, o, tmp, lse, batch_size, padded_kv_len, num_qo_heads,
                                     rope_scale, rope_theta, stream);
                               })})})});

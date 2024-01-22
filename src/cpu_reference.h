@@ -47,7 +47,7 @@ template <typename dtype_in, typename dtype_out>
 std::vector<dtype_out> single_mha(const std::vector<dtype_in>& q, const std::vector<dtype_in>& k,
                                   const std::vector<dtype_in>& v, size_t qo_len, size_t kv_len,
                                   size_t num_q_heads, size_t num_kv_heads, size_t head_dim,
-                                  bool causal = true, QKVLayout layout = QKVLayout::kHND,
+                                  bool causal = true, QKVLayout kv_layout = QKVLayout::kHND,
                                   RotaryMode rotary_mode = RotaryMode::kNone,
                                   float rope_scale = 1.f, float rope_theta = 1e4) {
   assert(qo_len <= kv_len);
@@ -60,8 +60,8 @@ std::vector<dtype_out> single_mha(const std::vector<dtype_in>& q, const std::vec
   SWITCH_GQA_GROUP_SIZE(
       num_q_heads / num_kv_heads, GROUP_SIZE,
       {SWITCH_LAYOUT(
-          layout, LAYOUT, {SWITCH_HEAD_DIM(head_dim, HEAD_DIM, {
-            tensor_info_t<LAYOUT, GROUP_SIZE, HEAD_DIM> info(qo_len, kv_len, num_kv_heads);
+          kv_layout, KV_LAYOUT, {SWITCH_HEAD_DIM(head_dim, HEAD_DIM, {
+            tensor_info_t<KV_LAYOUT, GROUP_SIZE, HEAD_DIM> info(qo_len, kv_len, num_kv_heads);
             for (size_t qo_head_idx = 0; qo_head_idx < info.get_num_qo_heads(); ++qo_head_idx) {
               const size_t kv_head_idx = qo_head_idx / GROUP_SIZE;
               for (size_t q_idx = 0; q_idx < qo_len; ++q_idx) {

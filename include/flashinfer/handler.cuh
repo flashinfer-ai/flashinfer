@@ -354,7 +354,7 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
   return cudaSuccess;
 }
 
-template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout LAYOUT, RotaryMode ROTARY_MODE,
+template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT, RotaryMode ROTARY_MODE,
           bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL, typename DTypeIn, typename DTypeOut,
           typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
@@ -380,7 +380,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
   }
 
   SWITCH_NUM_FRAGS_X(num_frags_x, NUM_FRAGS_X, {
-    return BatchPrefillWithRaggedKVCacheDispatched<NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM, LAYOUT,
+    return BatchPrefillWithRaggedKVCacheDispatched<NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
                                                    ROTARY_MODE, ALLOW_FP16_QK_REDUCTION, CAUSAL,
                                                    DTypeIn, DTypeOut, IdType>(
         q, request_indices, tile_indices, qo_indptr, k, v, kv_indptr, o, tmp, lse, batch_size,
@@ -397,7 +397,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
     bool causal = true, RotaryMode rotary_mode = RotaryMode::kNone,
     bool allow_fp16_qk_reduction = false, const float rope_scale = 1.f,
     const float rope_theta = 1e4, cudaStream_t stream = nullptr) {
-  constexpr QKVLayout LAYOUT = QKVLayout::kNHD;
+  constexpr QKVLayout KV_LAYOUT = QKVLayout::kNHD;
   SWITCH_GQA_GROUP_SIZE(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
       {SWITCH_HEAD_DIM(
@@ -408,7 +408,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
                              {SWITCH_ALLOW_FP16_QK_REDUCTION(
                                  allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
                                    return BatchPrefillWithRaggedKVCacheWrapperDispatched<
-                                       GROUP_SIZE, HEAD_DIM, LAYOUT, ROTARY_MODE,
+                                       GROUP_SIZE, HEAD_DIM, KV_LAYOUT, ROTARY_MODE,
                                        ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
                                        handler, q, qo_indptr, k, v, kv_indptr, o, lse, batch_size,
                                        num_kv_heads, rope_scale, rope_theta, stream);

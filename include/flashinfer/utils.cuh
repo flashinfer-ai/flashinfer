@@ -125,23 +125,23 @@
     __VA_ARGS__                            \
   }
 
-#define SWITCH_LAYOUT(layout, LAYOUT, ...)                  \
-  switch (layout) {                                         \
-    case QKVLayout::kNHD: {                                 \
-      constexpr QKVLayout LAYOUT = QKVLayout::kNHD;         \
-      __VA_ARGS__                                           \
-      break;                                                \
-    }                                                       \
-    case QKVLayout::kHND: {                                 \
-      constexpr QKVLayout LAYOUT = QKVLayout::kHND;         \
-      __VA_ARGS__                                           \
-      break;                                                \
-    }                                                       \
-    default: {                                              \
-      std::ostringstream err_msg;                           \
-      err_msg << "Unsupported qkv_layout: " << int(layout); \
-      throw std::invalid_argument(err_msg.str());           \
-    }                                                       \
+#define SWITCH_LAYOUT(layout, LAYOUT, ...)              \
+  switch (layout) {                                     \
+    case QKVLayout::kNHD: {                             \
+      constexpr QKVLayout LAYOUT = QKVLayout::kNHD;     \
+      __VA_ARGS__                                       \
+      break;                                            \
+    }                                                   \
+    case QKVLayout::kHND: {                             \
+      constexpr QKVLayout LAYOUT = QKVLayout::kHND;     \
+      __VA_ARGS__                                       \
+      break;                                            \
+    }                                                   \
+    default: {                                          \
+      std::ostringstream err_msg;                       \
+      err_msg << "Unsupported layout: " << int(layout); \
+      throw std::invalid_argument(err_msg.str());       \
+    }                                                   \
   }
 
 #define SWITCH_HEAD_DIM(head_dim, HEAD_DIM, ...)       \
