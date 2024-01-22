@@ -87,11 +87,26 @@ class BatchDecodeHandler {
                            uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
                            uint32_t page_size, RotaryMode rotary_mode) {
     batch_size_before_partition_ = batch_size;
-    uint32_t tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size;
+    uint32_t tmp_size, max_num_pages_per_batch, new_batch_size;
     auto work_estimation_func =
         BatchDecodeWithPagedKVCacheWorkEstimation<page_storage, DTypeIn, DTypeOut, IdType>;
+
+    std::vector<IdType> indptr_h(batch_size + 1), last_page_len_h(batch_size);
+    if (is_device_ptr(indptr)) {
+      FLASHINFER_CUDA_CALL(cudaMemcpyAsync(indptr_h.data(), indptr,
+                                           sizeof(IdType) * (batch_size + 1),
+                                           cudaMemcpyDeviceToHost, stream_));
+      FLASHINFER_CUDA_CALL(cudaMemcpyAsync(last_page_len_h.data(), last_page_len,
+                                           sizeof(IdType) * batch_size, cudaMemcpyDeviceToHost,
+                                           stream_));
+      FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream_));
+    } else {
+      indptr_h.assign(indptr, indptr + batch_size + 1);
+      last_page_len_h.assign(last_page_len, last_page_len + batch_size);
+    }
+
     FLASHINFER_CUDA_CALL(work_estimation_func(
-        tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size, batch_size, indptr,
+        tmp_size, max_num_pages_per_batch, new_batch_size, batch_size, indptr_h.data(),
         num_qo_heads, num_kv_heads, head_dim, page_size, rotary_mode, stream_));
     batch_size_after_partition_ = new_batch_size;
     if (tmp_size > 0) {
@@ -100,11 +115,12 @@ class BatchDecodeHandler {
           &int_buffer_, sizeof(IdType) * (5 * new_batch_size + batch_size_before_partition_ + 2),
           stream_));
       FLASHINFER_CUDA_CALL(PartitionPagedKVCacheComputeAuxiliaryInfo(
-          max_num_pages_per_batch, batch_size, page_size, indptr, last_page_len,
+          max_num_pages_per_batch, batch_size, page_size, indptr_h.data(), last_page_len_h.data(),
           GetNewIndPtr<IdType>(), GetNewLastPageLen<IdType>(), GetChunkIndPtr<IdType>(),
           GetBatchIdxMap<IdType>(), GetChunkStartPos<IdType>(),
           GetSeqLengthsBeforePartition<IdType>(), stream_));
     }
+
     forward_started_ = true;
     return cudaSuccess;
   }
@@ -179,9 +195,18 @@ class BatchPrefillHandler {
       throw std::invalid_argument(err_msg.str());
     }
     uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
-    std::vector<IdType> request_indices_h, tile_indices_h;
+    std::vector<IdType> qo_indptr_h(batch_size + 1), request_indices_h, tile_indices_h;
+    if (is_device_ptr(qo_indptr)) {
+      FLASHINFER_CUDA_CALL(cudaMemcpyAsync(qo_indptr_h.data(), qo_indptr,
+                                           sizeof(IdType) * (batch_size + 1),
+                                           cudaMemcpyDeviceToHost, stream_));
+      FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream_));
+    } else {
+      qo_indptr_h.assign(qo_indptr, qo_indptr + batch_size + 1);
+    }
+
     std::tie(num_frags_x_, num_qo_tiles_, request_indices_h, tile_indices_h) =
-        split_qo_indptr(qo_indptr, batch_size, gqa_group_size, stream_);
+        split_qo_indptr(qo_indptr_h.data(), batch_size, gqa_group_size, stream_);
     FLASHINFER_CUDA_CALL(cudaMalloc(&request_indices_, sizeof(IdType) * request_indices_h.size()));
     FLASHINFER_CUDA_CALL(cudaMalloc(&tile_indices_, sizeof(IdType) * tile_indices_h.size()));
     FLASHINFER_CUDA_CALL(cudaMemcpyAsync(request_indices_, request_indices_h.data(),
@@ -308,22 +333,13 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
     throw std::runtime_error(err_msg.str());
   }
 
-  SWITCH_NUM_FRAGS_X(
-      num_frags_x, NUM_FRAGS_X, {SWITCH_PAGE_SIZE(paged_kv.page_size, PAGE_SIZE, {
-        if constexpr (PAGE_SIZE == 0) {
-          return BatchPrefillWithPagedKVCacheFallbackDispatched<
-              page_storage, NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM, ROTARY_MODE, ALLOW_FP16_QK_REDUCTION,
-              CAUSAL, DTypeIn, DTypeOut, IdType>(q, request_indices, tile_indices, qo_indptr,
-                                                 paged_kv, o, tmp, lse, num_qo_tiles, rope_scale,
-                                                 rope_theta, stream);
-        } else {
-          return BatchPrefillWithPagedKVCacheDispatched<
-              page_storage, NUM_FRAGS_X, PAGE_SIZE, GROUP_SIZE, HEAD_DIM, ROTARY_MODE,
-              ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
-              q, request_indices, tile_indices, qo_indptr, paged_kv, o, tmp, lse, num_qo_tiles,
-              rope_scale, rope_theta, stream);
-        }
-      })});
+  SWITCH_NUM_FRAGS_X(num_frags_x, NUM_FRAGS_X, {SWITCH_PAGE_SIZE(paged_kv.page_size, PAGE_SIZE, {
+                       return BatchPrefillWithPagedKVCacheDispatched<
+                           page_storage, NUM_FRAGS_X, PAGE_SIZE, GROUP_SIZE, HEAD_DIM, ROTARY_MODE,
+                           ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
+                           q, request_indices, tile_indices, qo_indptr, paged_kv, o, tmp, lse,
+                           num_qo_tiles, rope_scale, rope_theta, stream);
+                     })});
   return cudaSuccess;
 }
 

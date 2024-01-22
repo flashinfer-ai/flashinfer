@@ -62,58 +62,81 @@
     __VA_ARGS__                                                                               \
   }
 
-#define SWITCH_PAGE_SIZE(page_size, PAGE_SIZE, ...) \
-  if (page_size == 1) {                             \
-    constexpr size_t PAGE_SIZE = 1;                 \
-    __VA_ARGS__                                     \
-  } else if (page_size == 8) {                      \
-    constexpr size_t PAGE_SIZE = 8;                 \
-    __VA_ARGS__                                     \
-  } else if (page_size == 16) {                     \
-    constexpr size_t PAGE_SIZE = 16;                \
-    __VA_ARGS__                                     \
-  } else if (page_size == 32) {                     \
-    constexpr size_t PAGE_SIZE = 32;                \
-    __VA_ARGS__                                     \
-  } else {                                          \
-    constexpr size_t PAGE_SIZE = 0;                 \
-    __VA_ARGS__                                     \
+#define SWITCH_PAGE_SIZE(page_size, PAGE_SIZE, ...)                                 \
+  switch (page_size) {                                                              \
+    case 1: {                                                                       \
+      constexpr size_t PAGE_SIZE = 1;                                               \
+      __VA_ARGS__                                                                   \
+      break;                                                                        \
+    }                                                                               \
+    case 8: {                                                                       \
+      constexpr size_t PAGE_SIZE = 8;                                               \
+      __VA_ARGS__                                                                   \
+      break;                                                                        \
+    }                                                                               \
+    case 16: {                                                                      \
+      constexpr size_t PAGE_SIZE = 16;                                              \
+      __VA_ARGS__                                                                   \
+      break;                                                                        \
+    }                                                                               \
+    case 32: {                                                                      \
+      constexpr size_t PAGE_SIZE = 32;                                              \
+      __VA_ARGS__                                                                   \
+      break;                                                                        \
+    }                                                                               \
+    default: {                                                                      \
+      std::ostringstream err_msg;                                                   \
+      err_msg << "Unsupported page_size for prefill/append kernels: " << page_size; \
+      throw std::invalid_argument(err_msg.str());                                   \
+    }                                                                               \
   }
 
-#define SWITCH_NUM_FRAGS_X(num_frags_x, NUM_FRAGS_X, ...)                 \
-  if (num_frags_x == 1) {                                                 \
-    constexpr size_t NUM_FRAGS_X = 1;                                     \
-    __VA_ARGS__                                                           \
-  } else if (num_frags_x == 2) {                                          \
-    constexpr size_t NUM_FRAGS_X = 2;                                     \
-    __VA_ARGS__                                                           \
-  } else {                                                                \
-    std::cerr << "Unsupported num_frags_x: " << num_frags_x << std::endl; \
+#define SWITCH_NUM_FRAGS_X(num_frags_x, NUM_FRAGS_X, ...)    \
+  switch (num_frags_x) {                                     \
+    case 1: {                                                \
+      constexpr size_t NUM_FRAGS_X = 1;                      \
+      __VA_ARGS__                                            \
+      break;                                                 \
+    }                                                        \
+    case 2: {                                                \
+      constexpr size_t NUM_FRAGS_X = 2;                      \
+      __VA_ARGS__                                            \
+      break;                                                 \
+    }                                                        \
+    default: {                                               \
+      std::ostringstream err_msg;                            \
+      err_msg << "Unsupported num_frags_x: " << num_frags_x; \
+      throw std::runtime_error(err_msg.str());               \
+    }                                                        \
   }
 
-#define SWITCH_NUM_FRAGS_Z(max_frags_z, NUM_FRAGS_Z, ...)                 \
-  if (max_frags_z == 4) {                                                 \
-    constexpr size_t NUM_FRAGS_Z = 4;                                     \
-    __VA_ARGS__                                                           \
-  } else if (max_frags_z == 2) {                                          \
-    constexpr size_t NUM_FRAGS_Z = 2;                                     \
-    __VA_ARGS__                                                           \
-  } else {                                                                \
-    std::cerr << "Unsupported max_frags_z: " << max_frags_z << std::endl; \
+#define SWITCH_NUM_FRAGS_Z(max_frags_z, NUM_FRAGS_Z, ...)  \
+  if (max_frags_z >= 4) {                                  \
+    constexpr size_t NUM_FRAGS_Z = 4;                      \
+    __VA_ARGS__                                            \
+  } else if (max_frags_z >= 2) {                           \
+    constexpr size_t NUM_FRAGS_Z = 2;                      \
+    __VA_ARGS__                                            \
+  } else {                                                 \
+    std::ostringstream err_msg;                            \
+    err_msg << "Unsupported max_frags_z: " << max_frags_z; \
+    throw std::runtime_error(err_msg.str());               \
   }
 
-#define SWITCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, ...)              \
-  if (group_size == 1) {                                                \
-    constexpr size_t GROUP_SIZE = 1;                                    \
-    __VA_ARGS__                                                         \
-  } else if (group_size == 4) {                                         \
-    constexpr size_t GROUP_SIZE = 4;                                    \
-    __VA_ARGS__                                                         \
-  } else if (group_size == 8) {                                         \
-    constexpr size_t GROUP_SIZE = 8;                                    \
-    __VA_ARGS__                                                         \
-  } else {                                                              \
-    std::cerr << "Unsupported group_size: " << group_size << std::endl; \
+#define SWITCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, ...) \
+  if (group_size == 1) {                                   \
+    constexpr size_t GROUP_SIZE = 1;                       \
+    __VA_ARGS__                                            \
+  } else if (group_size == 4) {                            \
+    constexpr size_t GROUP_SIZE = 4;                       \
+    __VA_ARGS__                                            \
+  } else if (group_size == 8) {                            \
+    constexpr size_t GROUP_SIZE = 8;                       \
+    __VA_ARGS__                                            \
+  } else {                                                 \
+    std::ostringstream err_msg;                            \
+    err_msg << "Unsupported group_size: " << group_size;   \
+    throw std::runtime_error(err_msg.str());               \
   }
 
 #define SWITCH_CAUSAL(causal, CAUSAL, ...) \
@@ -217,6 +240,30 @@ inline bool is_device_ptr(const void* ptr) {
 template <typename T1, typename T2>
 __forceinline__ __device__ __host__ T1 ceil_div(const T1 x, const T2 y) {
   return (x + y - 1) / y;
+}
+
+template <typename T>
+cudaError_t get_max_smem_per_sm(T* max_smem_per_sm) {
+  int dev_id = 0;
+  int _max_smem_per_sm = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&_max_smem_per_sm,
+                                              cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
+  *max_smem_per_sm = _max_smem_per_sm;
+  return cudaSuccess;
+}
+
+template <typename T>
+cudaError_t get_max_grid_size(const void* func, int num_threads, int smem_size, T* max_grid_size) {
+  int dev_id = 0;
+  int num_blocks_per_sm = 0;
+  int num_sm = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
+  FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, func,
+                                                                     num_threads, smem_size));
+  *max_grid_size = num_blocks_per_sm * num_sm;
+  return cudaSuccess;
 }
 
 }  // namespace flashinfer
