@@ -1933,71 +1933,6 @@ cudaError_t BatchPrefillWithRaggedKVCache(
   return cudaSuccess;
 }
 
-/*!
- * \brief Fallback implementation of FlashAttention prefill CUDA function for multiple requests,
- * \tparam page_storage Whether to store indices or pointers of each active page
- * \tparam DTypeIn The data type of input
- * \tparam DTypeOut The data type of output
- * \tparam IdType The data type of index
- * \param q The query tensor.
- * \param paged_kv The paged kv-cache data structure.
- * \param qo_indptr The index pointer of queries.
- * \param o The output tensor.
- * \param tmp The temporary storage (only used for partition-kv kernel).
- * \param lse The logsumexp value.
- * \param num_qo_heads The number of query and output heads.
- * \param causal Whether to use causal attention.
- * \param rotary_mode The rotary mode.
- * \param allow_fp16_qk_reduction Whether to allow accumulating q*k^T with fp16.
- * \param rope_scale The scaling factor used in RoPE interpolation.
- * \param rope_theta The theta used in RoPE.
- * \param stream The cuda stream to execute the kernel on.
- * \return status Indicates whether CUDA calls are successful
- * \note This implementation executes requests one by one, which is not efficient.
- */
-template <PageStorage page_storage, uint32_t num_frags_x, uint32_t GROUP_SIZE, uint32_t HEAD_DIM,
-          RotaryMode ROTARY_MODE, bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL, typename DTypeIn,
-          typename DTypeOut, typename IdType>
-cudaError_t BatchPrefillWithPagedKVCacheFallbackDispatched(
-    DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr,
-    paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, DTypeOut* o, float* tmp, float* lse,
-    uint32_t num_qo_tiles, float rope_scale = 1.f, float rope_theta = 1e4,
-    cudaStream_t stream = nullptr) {
-  constexpr QKVLayout LAYOUT = QKVLayout::kNHD;
-  const uint32_t num_kv_heads = paged_kv.num_heads;
-  const uint32_t head_dim = paged_kv.head_dim;
-  const uint32_t batch_size = paged_kv.batch_size;
-
-  std::vector<IdType> kv_indptr_h(paged_kv.batch_size + 1);
-
-  FLASHINFER_CUDA_CALL(PagedKVCacheToRaggedTensorComputeIndptr(paged_kv, kv_indptr_h, stream));
-  uint32_t nnz = kv_indptr_h.back();
-
-  DTypeIn *keys = nullptr, *values = nullptr;
-  IdType* kv_indptr = nullptr;
-  FLASHINFER_CUDA_CALL(
-      cudaMallocAsync(&keys, nnz * num_kv_heads * head_dim * sizeof(DTypeIn), stream));
-  FLASHINFER_CUDA_CALL(
-      cudaMallocAsync(&values, nnz * num_kv_heads * head_dim * sizeof(DTypeIn), stream));
-  FLASHINFER_CUDA_CALL(cudaMallocAsync(&kv_indptr, (batch_size + 1) * sizeof(IdType), stream));
-  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(kv_indptr, kv_indptr_h.data(),
-                                       sizeof(IdType) * (paged_kv.batch_size + 1),
-                                       cudaMemcpyHostToDevice, stream));
-  FLASHINFER_CUDA_CALL(PagedKVCacheToRaggedTensor(paged_kv, keys, values, kv_indptr, stream));
-
-  BatchPrefillWithRaggedKVCacheDispatched<num_frags_x, GROUP_SIZE, HEAD_DIM, LAYOUT, ROTARY_MODE,
-                                          ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut,
-                                          IdType>(
-      q, request_indices, tile_indices, qo_indptr, keys, values, kv_indptr, o, tmp, lse, batch_size,
-      num_qo_tiles, num_kv_heads, rope_scale, rope_theta, stream);
-
-  FLASHINFER_CUDA_CALL(cudaFreeAsync(keys, stream));
-  FLASHINFER_CUDA_CALL(cudaFreeAsync(values, stream));
-  FLASHINFER_CUDA_CALL(cudaFreeAsync(kv_indptr, stream));
-
-  return cudaSuccess;
-}
-
 template <PageStorage page_storage, uint32_t num_frags_x, uint32_t PAGE_SIZE, uint32_t GROUP_SIZE,
           uint32_t HEAD_DIM, RotaryMode ROTARY_MODE, bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL,
           typename DTypeIn, typename DTypeOut, typename IdType>
@@ -2153,24 +2088,16 @@ cudaError_t BatchPrefillWithPagedKVCache(
                       head_dim, HEAD_DIM,
                       {SWITCH_ROTARY_MODE(
                           rotary_mode, ROTARY_MODE,
-                          {SWITCH_PAGE_SIZE(
-                              paged_kv.page_size, PAGE_SIZE,
-                              {
-                                if constexpr (PAGE_SIZE == 0) {
-                                  return BatchPrefillWithPagedKVCacheFallbackDispatched<
-                                      page_storage, NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM, ROTARY_MODE,
-                                      ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
-                                      q, request_indices_d, tile_indices_d, qo_indptr, paged_kv, o,
-                                      tmp, lse, num_qo_tiles, rope_scale, rope_theta, stream);
-                                } else {
-                                  return BatchPrefillWithPagedKVCacheDispatched<
-                                      page_storage, NUM_FRAGS_X, PAGE_SIZE, GROUP_SIZE, HEAD_DIM,
-                                      ROTARY_MODE, ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn,
-                                      DTypeOut, IdType>(
-                                      q, request_indices_d, tile_indices_d, qo_indptr, paged_kv, o,
-                                      tmp, lse, num_qo_tiles, rope_scale, rope_theta, stream);
-                                }
-                              })
+                          {SWITCH_PAGE_SIZE(paged_kv.page_size, PAGE_SIZE,
+                                            {
+                                              return BatchPrefillWithPagedKVCacheDispatched<
+                                                  page_storage, NUM_FRAGS_X, PAGE_SIZE, GROUP_SIZE,
+                                                  HEAD_DIM, ROTARY_MODE, ALLOW_FP16_QK_REDUCTION,
+                                                  CAUSAL, DTypeIn, DTypeOut, IdType>(
+                                                  q, request_indices_d, tile_indices_d, qo_indptr,
+                                                  paged_kv, o, tmp, lse, num_qo_tiles, rope_scale,
+                                                  rope_theta, stream);
+                                            })
 
                           })})})})})});
 
