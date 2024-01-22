@@ -242,6 +242,30 @@ __forceinline__ __device__ __host__ T1 ceil_div(const T1 x, const T2 y) {
   return (x + y - 1) / y;
 }
 
+template <typename T>
+cudaError_t get_max_smem_per_sm(T* max_smem_per_sm) {
+  int dev_id = 0;
+  int _max_smem_per_sm = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&_max_smem_per_sm,
+                                              cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
+  *max_smem_per_sm = _max_smem_per_sm;
+  return cudaSuccess;
+}
+
+template <typename T>
+cudaError_t get_max_grid_size(const void* func, int num_threads, int smem_size, T* max_grid_size) {
+  int dev_id = 0;
+  int num_blocks_per_sm = 0;
+  int num_sm = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
+  FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, func,
+                                                                     num_threads, smem_size));
+  *max_grid_size = num_blocks_per_sm * num_sm;
+  return cudaSuccess;
+}
+
 }  // namespace flashinfer
 
 #endif  // FLASHINFER_UTILS_CUH_
