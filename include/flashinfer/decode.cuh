@@ -997,7 +997,7 @@ cudaError_t PartitionPagedKVCacheComputeAuxiliaryInfo(
  *   the batch size after the partition.
  */
 template <typename IdType>
-std::pair<uint32_t, uint32_t> PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(
+std::pair<uint32_t, uint32_t> PartitionPagedKVCacheBinarySearchNumPagePerBatch(
     const uint32_t max_grid_size, const uint32_t num_kv_heads, const std::vector<IdType>& num_pages,
     const uint32_t min_num_pages_per_batch = 1) {
   uint32_t low = min_num_pages_per_batch, high = 0;
@@ -1009,7 +1009,7 @@ std::pair<uint32_t, uint32_t> PartitionPagedKVCacheBinarySearchMinNumPagePerBatc
     uint32_t mid = (low + high) / 2;
     batch_size_after_partition = 0;
     for (const IdType& elem : num_pages) {
-      batch_size_after_partition += ceil_div(elem, mid);
+      batch_size_after_partition += ceil_div(std::max(elem, 1), mid);
     }
     if (batch_size_after_partition * num_kv_heads > max_grid_size) {
       low = mid + 1;
@@ -1087,7 +1087,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
                 num_pages[batch_idx] = kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx];
               }
               std::tie(num_pages_per_batch, batch_size_after_partition) =
-                  PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(max_grid_size, num_kv_heads,
+                  PartitionPagedKVCacheBinarySearchNumPagePerBatch(max_grid_size, num_kv_heads,
                                                                       num_pages, 128 / page_size);
               if (batch_size_after_partition == batch_size) {
                 // do not use partition-kv kernel for short sequence
