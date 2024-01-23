@@ -1283,11 +1283,13 @@ cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DType
 }
 
 template <typename DTypeIn, typename DTypeOut>
-cudaError_t BatchDecodeWithPaddedKVCache(
-    DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeIn* o, DTypeOut* tmp, float* lse, uint32_t batch_size,
-    uint32_t padded_kv_len, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
-    QKVLayout kv_layout = QKVLayout::kNHD, RotaryMode rotary_mode = RotaryMode::kNone,
-    float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {
+cudaError_t BatchDecodeWithPaddedKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeIn* o, float* tmp,
+                                         float* lse, uint32_t batch_size, uint32_t padded_kv_len,
+                                         uint32_t num_qo_heads, uint32_t num_kv_heads,
+                                         uint32_t head_dim, QKVLayout kv_layout = QKVLayout::kNHD,
+                                         RotaryMode rotary_mode = RotaryMode::kNone,
+                                         float rope_scale = 1.f, float rope_theta = 1e4,
+                                         cudaStream_t stream = nullptr) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " is not a multiple of num_kv_heads "

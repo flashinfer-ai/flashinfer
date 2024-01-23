@@ -25,12 +25,19 @@ from .utils import RotaryMode, TensorLayout
 _cache_buf = {}
 
 
-def _expand_5d(x: torch.Tensor):
+def _expand_5d(x: torch.Tensor, kv_layout: str):
     if not x.ndim in [4, 5]:
         raise ValueError("x must be 4D or 5D")
     if x.ndim == 4:
-        # page_size == 1, expand to 5D on the 2nd last dimension
-        return x.unsqueeze(-2)
+        # page_size == 1
+        if kv_layout == "NHD":
+            # expand to 5D on the 3nd last dimension
+            return x.unsqueeze(-3)
+        elif kv_layout == "HND":
+            # expand to 5D on the 2nd last dimension
+            return x.unsqueeze(-2)
+        else:
+            raise KeyError("Invalid kv_layout {}".format(kv_layout))
     return x
 
 
@@ -41,6 +48,16 @@ def _get_cache_buf(name: str, bytes: int, device: torch.device):
         buf = torch.empty(bytes, dtype=torch.uint8, device=device)
         _cache_buf[key] = buf
     return buf
+
+
+def _check_rotary_mode(rotary_mode: str):
+    if not hasattr(RotaryMode, rotary_mode):
+        raise KeyError("Invalid rotary_mode {}".format(rotary_mode))
+
+
+def _check_kv_layout(kv_layout: str):
+    if not hasattr(TensorLayout, kv_layout):
+        raise KeyError("Invalide kv_layout {}".format(kv_layout))
 
 
 def single_decode_with_kv_cache(
@@ -77,6 +94,8 @@ def single_decode_with_kv_cache(
     rope_theta : Optional[float]
         The theta used in RoPE, if not provided, will be set to 1e4.
     """
+    _check(rotary_mode)
+    _check(kv_layout)
     tmp = _get_cache_buf("single_decode_with_kv_cache_tmp", 8 * 1024 * 1024, q.device)
     if sm_scale is None:
         head_dim = q.shape[-1]
@@ -137,6 +156,8 @@ def single_prefill_with_kv_cache(
     rope_theta : Optional[float]
         The theta used in RoPE, if not provided, will be set to 1e4.
     """
+    _check(rotary_mode)
+    _check(kv_layout)
     tmp = _get_cache_buf("single_prefill_with_kv_cache_tmp", 8 * 1024 * 1024, q.device)
     if rope_scale is None:
         rope_scale = 1.0
@@ -205,6 +226,8 @@ def single_prefill_with_kv_cache_return_lse(
         The logsumexp value.
         Shape: [qo_len, num_qo_heads]
     """
+    _check(rotary_mode)
+    _check(kv_layout)
     tmp = _get_cache_buf(
         "single_prefill_with_kv_cache_return_lse_tmp", 8 * 1024 * 1024, q.device
     )
@@ -432,6 +455,7 @@ def batch_decode_with_shared_prefix_padded_kv_cache(
     V : torch.Tensor
         Shape: [batch_size, num_heads, head_dim]
     """
+    _check(kv_layout)
     V_shared, S_shared = single_prefill_with_kv_cache_return_lse(
         q,
         k_shared,
@@ -470,11 +494,13 @@ def batch_prefill_with_paged_kv_cache(
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
 ):
+    _check(rotary_mode)
+    _check(kv_layout)
     if rope_scale is None:
         rope_scale = 1.0
     if rope_theta is None:
         rope_theta = 1e4
-    kv_data = _expand_5d(kv_data)
+    kv_data = _expand_5d(kv_data, kv_layout)
     return _kernels.batch_prefill_with_paged_kv_cache(
         q,
         q_indptr,
@@ -501,6 +527,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
     """
 
     def __init__(self, kv_layout: str = "NHD"):
+        _check(kv_layout)
+        self.kv_layout = kv_layout
         self._wrapper = _kernels.BatchDecodeWithPagedKVCachePyTorchWrapper(
             getattr(TensorLayout, kv_layout)
         )
@@ -551,11 +579,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
     ):
+        _check(rotary_mode)
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
-        paged_kv_data = _expand_5d(paged_kv_data)
+        paged_kv_data = _expand_5d(paged_kv_data, self.kv_layout)
         return self._wrapper.forward(
             q,
             paged_kv_data,
@@ -579,11 +608,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
     ):
+        _check(rotary_mode)
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
-        paged_kv_data = _expand_5d(paged_kv_data)
+        paged_kv_data = _expand_5d(paged_kv_data, self.kv_layout)
         return self._wrapper.forward(
             q,
             paged_kv_data,
@@ -601,6 +631,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
     r""" """
 
     def __init__(self, kv_layout: str = "NHD"):
+        _check(kv_layout)
+        self.kv_layout = kv_layout
         self._wrapper = _kernels.BatchPrefillWithPagedKVCachePyTorchWrapper(
             getattr(TensorLayout, kv_layout)
         )
@@ -631,11 +663,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
     ):
+        _check(rotary_mode)
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
-        paged_kv_data = _expand_5d(paged_kv_data)
+        paged_kv_data = _expand_5d(paged_kv_data, self.kv_layout)
         return self._wrapper.forward(
             q,
             qo_indptr,
@@ -665,11 +698,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
     ):
+        _check(rotary_mode)
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
-        paged_kv_data = _expand_5d(paged_kv_data)
+        paged_kv_data = _expand_5d(paged_kv_data, self.kv_layout)
         return self._wrapper.forward(
             q,
             qo_indptr,

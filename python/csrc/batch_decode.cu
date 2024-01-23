@@ -186,12 +186,12 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
           static_cast<int32_t*>(paged_kv_indices.data_ptr()),
           static_cast<int32_t*>(paged_kv_indptr.data_ptr()),
           static_cast<int32_t*>(paged_kv_last_page_len.data_ptr()));
-      cudaError_t status =
-          BatchDecodeWithPagedKVCacheWrapper<PageStorage::kIndices, c_type, c_type, int32_t>(
-              &handler_, static_cast<c_type*>(q.data_ptr()), paged_kv,
-              static_cast<c_type*>(o.data_ptr()),
-              /*lse=*/(return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr), num_qo_heads,
-              RotaryMode(rotary_mode), rope_scale, rope_theta, /*stream=*/nullptr);
+      cudaError_t status = BatchDecodeWithPagedKVCacheWrapper<PageStorage::kIndices, KV_LAYOUT,
+                                                              c_type, c_type, int32_t>(
+          &handler_, static_cast<c_type*>(q.data_ptr()), paged_kv,
+          static_cast<c_type*>(o.data_ptr()),
+          /*lse=*/(return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr), num_qo_heads,
+          RotaryMode(rotary_mode), rope_scale, rope_theta, /*stream=*/nullptr);
       TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
                   cudaGetErrorString(status));
     });

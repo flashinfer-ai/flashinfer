@@ -52,7 +52,7 @@ def test_batch_prefill_with_paged_kv_cache(
     ).to(0)
 
     if use_wrapper:
-        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper()
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper("HND")
         wrapper.begin_forward(q_indptr, batch_size, num_qo_heads, num_kv_heads)
         o = wrapper.forward(
             q, q_indptr, kv_data, kv_indptr, kv_indices, kv_last_page_len
@@ -65,6 +65,7 @@ def test_batch_prefill_with_paged_kv_cache(
             kv_indptr,
             kv_indices,
             kv_last_page_len,
+            kv_layout="HND",
         )
 
     for i in range(batch_size):
