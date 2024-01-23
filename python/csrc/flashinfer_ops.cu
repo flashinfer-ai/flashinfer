@@ -35,13 +35,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Multi-request batch prefill with paged KV-Cache operator");
   py::class_<BatchDecodeWithPagedKVCachePyTorchWrapper>(m,
                                                         "BatchDecodeWithPagedKVCachePyTorchWrapper")
-      .def(py::init(&BatchDecodeWithPagedKVCachePyTorchWrapper::Create()))
+      .def(py::init(&BatchDecodeWithPagedKVCachePyTorchWrapper::Create))
       .def("begin_forward", &BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward)
       .def("end_forward", &BatchDecodeWithPagedKVCachePyTorchWrapper::EndForward)
       .def("forward", &BatchDecodeWithPagedKVCachePyTorchWrapper::Forward);
   py::class_<BatchPrefillWithPagedKVCachePyTorchWrapper>(
       m, "BatchPrefillWithPagedKVCachePyTorchWrapper")
-      .def(py::init(&BatchPrefillWithPagedKVCachePyTorchWrapper::Create()))
+      .def(py::init(&BatchPrefillWithPagedKVCachePyTorchWrapper::Create))
       .def("begin_forward", &BatchPrefillWithPagedKVCachePyTorchWrapper::BeginForward)
       .def("end_forward", &BatchPrefillWithPagedKVCachePyTorchWrapper::EndForward)
       .def("forward", &BatchPrefillWithPagedKVCachePyTorchWrapper::Forward);

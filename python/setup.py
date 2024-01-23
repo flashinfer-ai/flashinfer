@@ -61,7 +61,7 @@ ext_modules.append(
         ],
         extra_compile_args={
             "cxx": ["-O3"],
-            "nvcc": ["-O3"],
+            "nvcc": ["-O3", "--threads", "8"],
         },
     )
 )

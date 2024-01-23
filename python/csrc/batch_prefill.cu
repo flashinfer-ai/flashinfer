@@ -45,9 +45,10 @@ torch::Tensor batch_prefill_with_paged_kv_cache(
   CHECK_EQ(kv_indices.scalar_type(), torch::kInt32);
   CHECK_EQ(kv_last_page_len.scalar_type(), torch::kInt32);
   CHECK_EQ(q.size(2), kv_data.size(4));
+  QKVLayout kv_layout = QKVLayout(layout);
 
   unsigned int page_size, num_kv_heads;
-  if (kv_layout_ == QKVLayout::kHND) {
+  if (kv_layout == QKVLayout::kHND) {
     num_kv_heads = kv_data.size(2);
     page_size = kv_data.size(3);
   } else {
@@ -132,11 +133,11 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
   int64_t head_dim = q.size(2);
   int64_t num_kv_heads, page_size;
   if (kv_layout_ == QKVLayout::kHND) {
-    int64_t num_kv_heads = paged_kv_data.size(2);
-    int64_t page_size = paged_kv_data.size(3);
+    num_kv_heads = paged_kv_data.size(2);
+    page_size = paged_kv_data.size(3);
   } else {
-    int64_t page_size = paged_kv_data.size(2);
-    int64_t num_kv_heads = paged_kv_data.size(3);
+    page_size = paged_kv_data.size(2);
+    num_kv_heads = paged_kv_data.size(3);
   }
   CHECK_EQ(num_qo_heads % num_kv_heads, 0);
   CHECK_EQ(qo_indptr.size(0), batch_size + 1);
