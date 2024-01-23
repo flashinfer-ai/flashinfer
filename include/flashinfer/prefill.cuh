@@ -139,12 +139,12 @@ __device__ __forceinline__ void produce_kv(smem_t smem, uint32_t* smem_offset, T
 }
 
 template <bool produce_v, uint32_t page_size, uint32_t num_warps, uint32_t num_frags_y,
-          uint32_t num_frags_z, PageStorage page_storage, QKVLayout kv_layout, typename DType, typename IdType>
-__device__ __forceinline__ void page_produce_kv(smem_t smem, uint32_t* smem_offset,
-                                                paged_kv_t<page_storage, kv_layout, DType, IdType>& paged_kv,
-                                                const uint32_t kv_idx_base,
-                                                const uint32_t page_iter_base,
-                                                const uint32_t kv_len, const IdType last_indptr) {
+          uint32_t num_frags_z, PageStorage page_storage, QKVLayout kv_layout, typename DType,
+          typename IdType>
+__device__ __forceinline__ void page_produce_kv(
+    smem_t smem, uint32_t* smem_offset,
+    paged_kv_t<page_storage, kv_layout, DType, IdType>& paged_kv, const uint32_t kv_idx_base,
+    const uint32_t page_iter_base, const uint32_t kv_len, const IdType last_indptr) {
   constexpr SharedMemFillMode fill_mode =
       produce_v ? SharedMemFillMode::kFillZero : SharedMemFillMode::kNoFill;
   constexpr uint32_t head_dim = num_frags_y * 16;
@@ -1121,8 +1121,8 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
 
 template <uint32_t group_size, uint32_t page_size, bool causal, RotaryMode rotary_mode,
           uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps,
-          PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeQKAccum, typename DTypeOut,
-          typename IdType>
+          PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeQKAccum,
+          typename DTypeOut, typename IdType>
 __global__ void BatchPrefillWithPagedKVCacheKernel(
     IdType* __restrict__ request_indices, IdType* __restrict__ tile_indices,
     DTypeIn* __restrict__ q, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
@@ -1743,13 +1743,13 @@ cudaError_t BatchPrefillWithRaggedKVCache(
  * \return status Indicates whether CUDA calls are successful
  * \note This implementation executes requests one by one, which is not efficient.
  */
-template <PageStorage page_storage, QKVLayout kv_layout, uint32_t num_frags_x, uint32_t GROUP_SIZE, uint32_t HEAD_DIM,
-          RotaryMode ROTARY_MODE, bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL, typename DTypeIn,
-          typename DTypeOut, typename IdType>
+template <PageStorage page_storage, QKVLayout kv_layout, uint32_t num_frags_x, uint32_t GROUP_SIZE,
+          uint32_t HEAD_DIM, RotaryMode ROTARY_MODE, bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL,
+          typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheFallbackDispatched(
     DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr,
-    paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, DTypeOut* o, float* tmp, float* lse,
-    uint32_t num_qo_tiles, float rope_scale = 1.f, float rope_theta = 1e4,
+    paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, DTypeOut* o, float* tmp,
+    float* lse, uint32_t num_qo_tiles, float rope_scale = 1.f, float rope_theta = 1e4,
     cudaStream_t stream = nullptr) {
   constexpr QKVLayout KV_LAYOUT = QKVLayout::kNHD;
   const uint32_t num_kv_heads = paged_kv.num_heads;
@@ -1786,13 +1786,14 @@ cudaError_t BatchPrefillWithPagedKVCacheFallbackDispatched(
   return cudaSuccess;
 }
 
-template <PageStorage page_storage, QKVLayout kv_layout, uint32_t num_frags_x, uint32_t PAGE_SIZE, uint32_t GROUP_SIZE,
-          uint32_t HEAD_DIM, RotaryMode ROTARY_MODE, bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL,
-          typename DTypeIn, typename DTypeOut, typename IdType>
+template <PageStorage page_storage, QKVLayout kv_layout, uint32_t num_frags_x, uint32_t PAGE_SIZE,
+          uint32_t GROUP_SIZE, uint32_t HEAD_DIM, RotaryMode ROTARY_MODE,
+          bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL, typename DTypeIn, typename DTypeOut,
+          typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr,
-    paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, DTypeOut* o, float* tmp, float* lse,
-    uint32_t num_qo_tiles, float rope_scale, float rope_theta, cudaStream_t stream) {
+    paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, DTypeOut* o, float* tmp,
+    float* lse, uint32_t num_qo_tiles, float rope_scale, float rope_theta, cudaStream_t stream) {
   const float sm_scale = 1.f / std::sqrt(float(paged_kv.head_dim));
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
@@ -1828,7 +1829,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     auto kernel =
         BatchPrefillWithPagedKVCacheKernel<GROUP_SIZE, PAGE_SIZE, CAUSAL, ROTARY_MODE, num_frags_x,
                                            num_frags_y, num_frags_z, num_warps, page_storage,
-                                           DTypeIn, DTypeQKAccum, DTypeOut, IdType>;
+                                           kv_layout, DTypeIn, DTypeQKAccum, DTypeOut, IdType>;
     uint32_t smem_size =
         (num_frags_x * num_warps + num_frags_z * 2) * 16 * HEAD_DIM * sizeof(DTypeIn);
     FLASHINFER_CUDA_CALL(
@@ -1849,10 +1850,11 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
   return cudaSuccess;
 }
 
-template <PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeOut, typename IdType>
+template <PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeOut,
+          typename IdType>
 cudaError_t BatchPrefillWithPagedKVCache(
-    DTypeIn* q, IdType* qo_indptr, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, DTypeOut* o,
-    float* tmp, float* lse, uint32_t num_qo_heads, bool causal = true,
+    DTypeIn* q, IdType* qo_indptr, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
+    DTypeOut* o, float* tmp, float* lse, uint32_t num_qo_heads, bool causal = true,
     RotaryMode rotary_mode = RotaryMode::kNone, bool allow_fp16_qk_reduction = false,
     float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   const uint32_t num_kv_heads = paged_kv.num_heads;
@@ -1896,15 +1898,16 @@ cudaError_t BatchPrefillWithPagedKVCache(
                               {
                                 if constexpr (PAGE_SIZE == 0) {
                                   return BatchPrefillWithPagedKVCacheFallbackDispatched<
-                                      page_storage, NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM, ROTARY_MODE,
-                                      ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
+                                      page_storage, kv_layout, NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM,
+                                      ROTARY_MODE, ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn,
+                                      DTypeOut, IdType>(
                                       q, request_indices_d, tile_indices_d, qo_indptr, paged_kv, o,
                                       tmp, lse, num_qo_tiles, rope_scale, rope_theta, stream);
                                 } else {
                                   return BatchPrefillWithPagedKVCacheDispatched<
-                                      page_storage, NUM_FRAGS_X, PAGE_SIZE, GROUP_SIZE, HEAD_DIM,
-                                      ROTARY_MODE, ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn,
-                                      DTypeOut, IdType>(
+                                      page_storage, kv_layout, NUM_FRAGS_X, PAGE_SIZE, GROUP_SIZE,
+                                      HEAD_DIM, ROTARY_MODE, ALLOW_FP16_QK_REDUCTION, CAUSAL,
+                                      DTypeIn, DTypeOut, IdType>(
                                       q, request_indices_d, tile_indices_d, qo_indptr, paged_kv, o,
                                       tmp, lse, num_qo_tiles, rope_scale, rope_theta, stream);
                                 }

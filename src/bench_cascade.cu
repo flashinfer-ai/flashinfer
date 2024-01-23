@@ -25,6 +25,8 @@
 
 using namespace flashinfer;
 
+constexpr QKVLayout kv_layout = QKVLayout::kNHD;
+
 template <typename T>
 void bench_merge_states(nvbench::state& state) {
   const auto num_index_sets = state.get_int64("num_index_sets");
@@ -101,13 +103,13 @@ void bench_two_level_single_prefix_cascade_decode(nvbench::state& state) {
     thrust::device_vector<int32_t> kv_indptr_unique_d(kv_indptr_unique_h),
         kv_indices_unique_d(kv_indices_unique_h),
         kv_last_page_len_unique_d(kv_last_page_len_unique_h);
-    paged_kv_t<page_storage, T, int32_t> paged_kv_casacde_d(
+    paged_kv_t<page_storage, kv_layout, T, int32_t> paged_kv_casacde_d(
         num_kv_heads, page_size, head_dim, batch_size, thrust::raw_pointer_cast(kv_data_d.data()),
         thrust::raw_pointer_cast(kv_indices_unique_d.data()),
         thrust::raw_pointer_cast(kv_indptr_unique_d.data()),
         thrust::raw_pointer_cast(kv_last_page_len_unique_d.data()));
     BatchDecodeHandler cascade_handler;
-    cascade_handler.BeginForward<page_storage, T, T, int32_t>(
+    cascade_handler.BeginForward<page_storage, kv_layout, T, T, int32_t>(
         kv_indptr_unique_h.data(), kv_last_page_len_unique_h.data(), batch_size, num_qo_heads,
         num_kv_heads, head_dim, page_size, RotaryMode::kNone);
 
@@ -119,7 +121,7 @@ void bench_two_level_single_prefix_cascade_decode(nvbench::state& state) {
           thrust::raw_pointer_cast(o_cascade_0_d.data()), thrust::raw_pointer_cast(tmp_0_d.data()),
           thrust::raw_pointer_cast(lse_cascade_0_d.data()), num_qo_heads, num_kv_heads,
           /*qo_len=*/batch_size, /*kv_len=*/shared_prefix_length, head_dim,
-          /*causal=*/false, /*layout=*/QKVLayout::kNHD,
+          /*causal=*/false, /*kv_layout=*/QKVLayout::kNHD,
           /*rotary_mode=*/RotaryMode::kNone, /*allow_fp16_qk_reduction=*/false);
 
       if (status != cudaSuccess) {
@@ -127,7 +129,7 @@ void bench_two_level_single_prefix_cascade_decode(nvbench::state& state) {
                    std::string(cudaGetErrorString(status)));
       }
 
-      status = BatchDecodeWithPagedKVCacheWrapper<page_storage, T, T, int32_t>(
+      status = BatchDecodeWithPagedKVCacheWrapper<page_storage, kv_layout, T, T, int32_t>(
           &cascade_handler, thrust::raw_pointer_cast(q_d.data()), paged_kv_casacde_d,
           thrust::raw_pointer_cast(o_cascade_1_d.data()),
           /*lse=*/thrust::raw_pointer_cast(lse_cascade_1_d.data()), num_qo_heads,
@@ -155,22 +157,23 @@ void bench_two_level_single_prefix_cascade_decode(nvbench::state& state) {
     thrust::device_vector<int32_t> kv_indptr_combined_d(kv_indptr_combined_h),
         kv_indices_combined_d(kv_indices_combined_h),
         kv_last_page_len_combined_d(kv_last_page_len_combined_h);
-    paged_kv_t<page_storage, T, int32_t> paged_kv_baseline_d(
+    paged_kv_t<page_storage, kv_layout, T, int32_t> paged_kv_baseline_d(
         num_kv_heads, page_size, head_dim, batch_size, thrust::raw_pointer_cast(kv_data_d.data()),
         thrust::raw_pointer_cast(kv_indices_combined_d.data()),
         thrust::raw_pointer_cast(kv_indptr_combined_d.data()),
         thrust::raw_pointer_cast(kv_last_page_len_combined_d.data()));
     BatchDecodeHandler baseline_handler;
-    baseline_handler.BeginForward<page_storage, T, T, int32_t>(
+    baseline_handler.BeginForward<page_storage, kv_layout, T, T, int32_t>(
         kv_indptr_combined_h.data(), kv_last_page_len_combined_h.data(), batch_size, num_qo_heads,
         num_kv_heads, head_dim, page_size, RotaryMode::kNone);
 
     state.exec(nvbench::exec_tag::timer, [&](nvbench::launch& launch, auto& timer) {
       timer.start();
-      cudaError_t status = BatchDecodeWithPagedKVCacheWrapper<page_storage, T, T, int32_t>(
-          &baseline_handler, thrust::raw_pointer_cast(q_d.data()), paged_kv_baseline_d,
-          thrust::raw_pointer_cast(o_baseline_d.data()),
-          /*lse=*/nullptr, num_qo_heads, RotaryMode::kNone);
+      cudaError_t status =
+          BatchDecodeWithPagedKVCacheWrapper<page_storage, kv_layout, T, T, int32_t>(
+              &baseline_handler, thrust::raw_pointer_cast(q_d.data()), paged_kv_baseline_d,
+              thrust::raw_pointer_cast(o_baseline_d.data()),
+              /*lse=*/nullptr, num_qo_heads, RotaryMode::kNone);
       if (status != cudaSuccess) {
         state.skip("Cascade implementation decode failed with error: " +
                    std::string(cudaGetErrorString(status)));
@@ -229,7 +232,7 @@ void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
     thrust::device_vector<int32_t> kv_indptr_unique_d(kv_indptr_unique_h),
         kv_indices_unique_d(kv_indices_unique_h),
         kv_last_page_len_unique_d(kv_last_page_len_unique_h);
-    paged_kv_t<page_storage, T, int32_t> paged_kv_casacde_d(
+    paged_kv_t<page_storage, kv_layout, T, int32_t> paged_kv_casacde_d(
         num_kv_heads, page_size, head_dim, batch_size, thrust::raw_pointer_cast(kv_data_d.data()),
         thrust::raw_pointer_cast(kv_indices_unique_d.data()),
         thrust::raw_pointer_cast(kv_indptr_unique_d.data()),
@@ -245,7 +248,7 @@ void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
           thrust::raw_pointer_cast(lse_cascade_0_d.data()), num_qo_heads, num_kv_heads,
           /*qo_len=*/batch_size * qo_append_length,
           /*kv_len=*/shared_prefix_length, head_dim,
-          /*causal=*/false, /*layout=*/QKVLayout::kNHD,
+          /*causal=*/false, /*kv_layout=*/QKVLayout::kNHD,
           /*rotary_mode=*/RotaryMode::kNone, /*allow_fp16_qk_reduction=*/false);
 
       if (status != cudaSuccess) {
@@ -253,7 +256,7 @@ void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
                    std::string(cudaGetErrorString(status)));
       }
 
-      status = BatchPrefillWithPagedKVCacheWrapper<page_storage, T, T, int32_t>(
+      status = BatchPrefillWithPagedKVCacheWrapper<page_storage, kv_layout, T, T, int32_t>(
           &cascade_handler, thrust::raw_pointer_cast(q_d.data()),
           thrust::raw_pointer_cast(qo_indptr_d.data()), paged_kv_casacde_d,
           thrust::raw_pointer_cast(o_cascade_1_d.data()),
@@ -281,7 +284,7 @@ void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
     thrust::device_vector<int32_t> kv_indptr_combined_d(kv_indptr_combined_h),
         kv_indices_combined_d(kv_indices_combined_h),
         kv_last_page_len_combined_d(kv_last_page_len_combined_h);
-    paged_kv_t<page_storage, T, int32_t> paged_kv_baseline_d(
+    paged_kv_t<page_storage, kv_layout, T, int32_t> paged_kv_baseline_d(
         num_kv_heads, page_size, head_dim, batch_size, thrust::raw_pointer_cast(kv_data_d.data()),
         thrust::raw_pointer_cast(kv_indices_combined_d.data()),
         thrust::raw_pointer_cast(kv_indptr_combined_d.data()),
@@ -290,12 +293,13 @@ void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
     baseline_handler.BeginForward(qo_indptr_h.data(), batch_size, num_qo_heads, num_kv_heads);
     state.exec(nvbench::exec_tag::timer, [&](nvbench::launch& launch, auto& timer) {
       timer.start();
-      cudaError_t status = BatchPrefillWithPagedKVCacheWrapper<page_storage, T, T, int32_t>(
-          &baseline_handler, thrust::raw_pointer_cast(q_d.data()),
-          thrust::raw_pointer_cast(qo_indptr_d.data()), paged_kv_baseline_d,
-          thrust::raw_pointer_cast(o_baseline_d.data()),
-          /*lse=*/nullptr, num_qo_heads, /*causal=*/true, RotaryMode::kNone,
-          /*allow_fp16_qk_reduction=*/false);
+      cudaError_t status =
+          BatchPrefillWithPagedKVCacheWrapper<page_storage, kv_layout, T, T, int32_t>(
+              &baseline_handler, thrust::raw_pointer_cast(q_d.data()),
+              thrust::raw_pointer_cast(qo_indptr_d.data()), paged_kv_baseline_d,
+              thrust::raw_pointer_cast(o_baseline_d.data()),
+              /*lse=*/nullptr, num_qo_heads, /*causal=*/true, RotaryMode::kNone,
+              /*allow_fp16_qk_reduction=*/false);
 
       if (status != cudaSuccess) {
         state.skip("Baseline implementation failed with error: " +

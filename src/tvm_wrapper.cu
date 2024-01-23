@@ -181,10 +181,11 @@ thread_local BatchPrefillHandler batch_prefill_ragged_kv_handler;
  * \brief The BatchPrefillWithKVCacheWrapper function with some parameters fixed at compile time
  *    to accelerate the dispatching.
  */
-template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
+template <PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeOut,
+          typename IdType>
 cudaError_t _BatchPrefillWithPagedKVCacheWrapper(
     BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr,
-    paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, DTypeOut* o, float* lse,
+    paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, DTypeOut* o, float* lse,
     uint32_t num_qo_heads, bool causal = true, RotaryMode rotary_mode = RotaryMode::kNone,
     bool allow_fp16_qk_reduction = false, float rope_scale = 1.f, float rope_theta = 1e4,
     cudaStream_t stream = nullptr) {
@@ -199,7 +200,7 @@ cudaError_t _BatchPrefillWithPagedKVCacheWrapper(
       group_size, GROUP_SIZE,
       {SWITCH_CAUSAL(causal, CAUSAL, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
                        return BatchPrefillWithPagedKVCacheWrapperDispatched<
-                           page_storage, GROUP_SIZE, /*head_dim=*/128, ROTARY_MODE,
+                           page_storage, kv_layout, GROUP_SIZE, /*head_dim=*/128, ROTARY_MODE,
                            /*allow_fp16_qk_reduction=*/false, CAUSAL, DTypeIn, DTypeOut, IdType>(
                            handler, q, qo_indptr, paged_kv, o, lse, num_qo_heads, rope_scale,
                            rope_theta, stream);
@@ -275,18 +276,20 @@ void _FlashInferAttentionPrefillWithPagedKVCache(int64_t handler_id, DLTensor* q
   CHECK_EQ(output->shape[2], nfeat);
 
   constexpr PageStorage page_storage = PageStorage::kIndices;
+  constexpr QKVLayout kv_layout = QKVLayout::kHND;
 
   SWITCH_TVM_CUDA_DTYPE(
       pages->dtype, dtype_in,
       {SWITCH_TVM_CUDA_DTYPE(
           output->dtype, dtype_out, {SWITCH_TVM_CUDA_IDTYPE(page_table_values->dtype, dtype_idx, {
-            paged_kv_t<page_storage, dtype_in, dtype_idx> cache(
+            paged_kv_t<page_storage, kv_layout, dtype_in, dtype_idx> cache(
                 nhead_kv, page_size, nfeat, num_total_seqs, static_cast<dtype_in*>(pages->data),
                 static_cast<dtype_idx*>(page_table_values->data),
                 static_cast<dtype_idx*>(page_table_indptr->data),
                 static_cast<dtype_idx*>(last_page_len->data));
             cudaError_t status =
-                _BatchPrefillWithPagedKVCacheWrapper<page_storage, dtype_in, dtype_out, dtype_idx>(
+                _BatchPrefillWithPagedKVCacheWrapper<page_storage, kv_layout, dtype_in, dtype_out,
+                                                     dtype_idx>(
                     &batch_prefill_paged_kv_handlers[handler_id],
                     static_cast<dtype_in*>(q_data->data), static_cast<dtype_idx*>(qo_indptr->data),
                     cache, static_cast<dtype_out*>(output->data),
@@ -382,12 +385,13 @@ void _FlashInferAttentionDecodeWithPagedKVCache(int64_t handler_id, DLTensor* q_
   CHECK_EQ(output->shape[2], nfeat);
 
   constexpr PageStorage page_storage = PageStorage::kIndices;
+  constexpr QKVLayout kv_layout = QKVLayout::kHND;
 
   SWITCH_TVM_CUDA_DTYPE(
       pages->dtype, dtype_in,
       {SWITCH_TVM_CUDA_DTYPE(
           output->dtype, dtype_out, {SWITCH_TVM_CUDA_IDTYPE(page_table_values->dtype, dtype_idx, {
-            paged_kv_t<page_storage, dtype_in, dtype_idx> cache(
+            paged_kv_t<page_storage, kv_layout, dtype_in, dtype_idx> cache(
                 nhead_kv, page_size, nfeat, num_total_seqs, static_cast<dtype_in*>(pages->data),
                 static_cast<dtype_idx*>(page_table_values->data),
                 static_cast<dtype_idx*>(page_table_indptr->data),
