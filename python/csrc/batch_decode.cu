@@ -49,11 +49,13 @@ torch::Tensor batch_decode_with_padded_kv_cache(torch::Tensor q, torch::Tensor k
   auto o = torch::empty_like(q, q.options());
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
+    c_type* tmp = nullptr;
+    float* lse = nullptr;
     cudaError_t status = BatchDecodeWithPaddedKVCache<c_type, c_type>(
         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k_padded.data_ptr()),
         static_cast<c_type*>(v_padded.data_ptr()), static_cast<c_type*>(o.data_ptr()),
-        /*tmp=*/nullptr,
-        /*lse=*/nullptr, batch_size, padded_kv_len, num_qo_heads, num_kv_heads, head_dim, kv_layout,
+        /*tmp=*/tmp,
+        /*lse=*/lse, batch_size, padded_kv_len, num_qo_heads, num_kv_heads, head_dim, kv_layout,
         RotaryMode(rotary_mode), rope_scale, rope_theta);
     TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPaddedKVCache failed with error code ",
                 status);

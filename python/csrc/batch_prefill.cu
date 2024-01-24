@@ -57,9 +57,7 @@ torch::Tensor batch_prefill_with_paged_kv_cache(
   }
   unsigned int batch_size = q_indptr.size(0) - 1;
   unsigned int head_dim = q.size(2);
-
   unsigned int num_qo_heads = q.size(1);
-  num_kv_heads = kv_data.size(2);
 
   auto o = torch::empty_like(q, q.options());
 
