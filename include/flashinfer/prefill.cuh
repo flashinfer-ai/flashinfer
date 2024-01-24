@@ -104,7 +104,7 @@ __device__ __forceinline__ void frag_apply_llama_rope(T* x_first_half, T* x_seco
  * \tparam num_frags_y The number of fragments in y dimension.
  * \tparam num_frags_z The number of fragments in z dimension.
  * \tparam num_warps The number of warps in the threadblock.
- * \tparam layout The layout of the input tensor.
+ * \tparam kv_layout The layout of the input tensor.
  * \tparam group_size The number of qo heads that maps to a kv head (used in GQA).
  * \tparam T The data type of the input tensor.
  * \param smem The shared memory to store kv fragments.
@@ -139,12 +139,12 @@ __device__ __forceinline__ void produce_kv(smem_t smem, uint32_t* smem_offset, T
 }
 
 template <bool produce_v, uint32_t page_size, uint32_t num_warps, uint32_t num_frags_y,
-          uint32_t num_frags_z, PageStorage page_storage, typename DType, typename IdType>
-__device__ __forceinline__ void page_produce_kv(smem_t smem, uint32_t* smem_offset,
-                                                paged_kv_t<page_storage, DType, IdType>& paged_kv,
-                                                const uint32_t kv_idx_base,
-                                                const uint32_t page_iter_base,
-                                                const uint32_t kv_len, const IdType last_indptr) {
+          uint32_t num_frags_z, PageStorage page_storage, QKVLayout kv_layout, typename DType,
+          typename IdType>
+__device__ __forceinline__ void page_produce_kv(
+    smem_t smem, uint32_t* smem_offset,
+    paged_kv_t<page_storage, kv_layout, DType, IdType>& paged_kv, const uint32_t kv_idx_base,
+    const uint32_t page_iter_base, const uint32_t kv_len, const IdType last_indptr) {
   constexpr SharedMemFillMode fill_mode =
       produce_v ? SharedMemFillMode::kFillZero : SharedMemFillMode::kNoFill;
   constexpr uint32_t head_dim = num_frags_y * 16;
@@ -734,7 +734,7 @@ __device__ __forceinline__ void write_o_reg_gmem(float (*o_frag)[num_frags_y][8]
  * \tparam partition_kv Whether to split kv_len into chunks.
  * \tparam group_size The number of qo heads that maps to a kv head (used in GQA).
  * \tparam causal Whether to use causal attention.
- * \tparam layout The layout of the input tensor.
+ * \tparam kv_layout The layout of the input tensor.
  * \tparam rotary_mode The rotary mode.
  * \tparam num_frags_x The number of fragments in x dimension.
  * \tparam num_frags_y The number of fragments in y dimension.
@@ -755,13 +755,13 @@ __device__ __forceinline__ void write_o_reg_gmem(float (*o_frag)[num_frags_y][8]
  * \param log2_rope_rcp_theta log2(1/(rope_theta)), where rope_theta is the theta
  *   used in RoPE.
  */
-template <bool partition_kv, uint32_t group_size, bool causal, QKVLayout layout,
+template <bool partition_kv, uint32_t group_size, bool causal, QKVLayout kv_layout,
           RotaryMode rotary_mode, uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z,
           uint32_t num_warps, typename DTypeIn, typename DTypeQKAccum, typename DTypeOut>
 __global__ void SinglePrefillWithKVCacheKernel(
     DTypeIn* __restrict__ q, DTypeIn* __restrict__ k, DTypeIn* __restrict__ v,
     DTypeOut* __restrict__ o, void* __restrict__ tmp, float* __restrict__ lse,
-    const tensor_info_t<layout, group_size, num_frags_y * 16> qkv_info, float sm_scale,
+    const tensor_info_t<kv_layout, group_size, num_frags_y * 16> qkv_info, float sm_scale,
     const float log2_rope_rcp_scale, const float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
@@ -940,7 +940,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
   }
 }
 
-template <uint32_t group_size, bool causal, QKVLayout layout, RotaryMode rotary_mode,
+template <uint32_t group_size, bool causal, QKVLayout kv_layout, RotaryMode rotary_mode,
           uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps,
           typename DTypeIn, typename DTypeQKAccum, typename DTypeOut, typename IdType>
 __global__ void BatchPrefillWithRaggedKVCacheKernel(
@@ -961,7 +961,8 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
   constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
   const uint32_t qo_len = qo_indptr[request_idx + 1] - qo_indptr[request_idx],
                  kv_len = kv_indptr[request_idx + 1] - kv_indptr[request_idx];
-  const tensor_info_t<layout, group_size, num_frags_y * 16> qkv_info(qo_len, kv_len, num_kv_heads);
+  const tensor_info_t<kv_layout, group_size, num_frags_y * 16> qkv_info(qo_len, kv_len,
+                                                                        num_kv_heads);
   const uint32_t qo_upper_bound = min(qo_len, (tile_idx + 1) * (num_rows_per_cta / group_size));
 
   constexpr bool partition_kv = false;
@@ -1120,11 +1121,11 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
 
 template <uint32_t group_size, uint32_t page_size, bool causal, RotaryMode rotary_mode,
           uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps,
-          PageStorage page_storage, typename DTypeIn, typename DTypeQKAccum, typename DTypeOut,
-          typename IdType>
+          PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeQKAccum,
+          typename DTypeOut, typename IdType>
 __global__ void BatchPrefillWithPagedKVCacheKernel(
     IdType* __restrict__ request_indices, IdType* __restrict__ tile_indices,
-    DTypeIn* __restrict__ q, paged_kv_t<page_storage, DTypeIn, IdType> paged_kv,
+    DTypeIn* __restrict__ q, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
     IdType* __restrict__ qo_indptr, DTypeOut* __restrict__ o, float* __restrict__ tmp,
     float* __restrict__ lse, float sm_scale, const float log2_rope_rcp_scale,
     const float log2_rope_rcp_theta) {
@@ -1165,8 +1166,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
   init_states<num_frags_x, num_frags_y>(o_frag, m, d);
 
   const uint32_t qo_idx_base = ((tile_idx * num_warps + ty) * num_frags_x * 16) / group_size;
-  const uint32_t kv_n_stride = get_n_stride_impl<QKVLayout::kNHD, head_dim>(num_kv_heads),
-                 qo_n_stride = get_n_stride_impl<QKVLayout::kNHD, head_dim>(num_qo_heads),
+  const uint32_t qo_n_stride = get_n_stride_impl<QKVLayout::kNHD, head_dim>(num_qo_heads),
                  qo_h_stride = get_h_stride_impl<QKVLayout::kNHD, head_dim>(qo_len);
   smem_t qo_smem(smem);
   DTypeIn* q_ptr_base = q + get_elem_offset_impl<QKVLayout::kNHD, head_dim>(
@@ -1307,7 +1307,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
  * \param kv_len The length of key and value.
  * \param head_dim The dimension of each head.
  * \param causal Whether to use causal attention.
- * \param layout The layout of input and output.
+ * \param kv_layout The layout of KV Cache.
  * \param rotary_mode The rotary mode.
  * \param allow_fp16_qk_reduction Whether to allow accumulating q*k^T with fp16.
  * \param stream The cuda stream to execute the kernel on.
@@ -1317,7 +1317,7 @@ template <typename DTypeIn, typename DTypeOut>
 cudaError_t SinglePrefillWithKVCacheWorkEstimation(
     uint32_t& tmp_size, uint32_t& max_grid_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
     uint32_t qo_len, uint32_t kv_len, uint32_t head_dim, bool causal = true,
-    QKVLayout layout = QKVLayout::kNHD, RotaryMode rotary_mode = RotaryMode::kNone,
+    QKVLayout kv_layout = QKVLayout::kNHD, RotaryMode rotary_mode = RotaryMode::kNone,
     bool allow_fp16_qk_reduction = false, cudaStream_t stream = nullptr) {
   if (kv_len < qo_len && causal) {
     std::ostringstream err_msg;
@@ -1337,7 +1337,7 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
                   causal, CAUSAL, {SWITCH_HEAD_DIM_PREFILL(head_dim, HEAD_DIM, {
                     constexpr uint32_t num_frags_y = HEAD_DIM / 16;
                     SWITCH_ROTARY_MODE(
-                        rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(layout, LAYOUT, {
+                        rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(kv_layout, KV_LAYOUT, {
                           using DTypeQKAccum =
                               typename std::conditional<ALLOW_FP16_QK_REDUCTION &&
                                                             std::is_same<DTypeIn, half>::value,
@@ -1369,11 +1369,11 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
                                 constexpr uint32_t num_threads = num_warps * warp_size;
                                 constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
                                 auto partition_kv_kernel = SinglePrefillWithKVCacheKernel<
-                                    /*partition_kv=*/true, GROUP_SIZE, CAUSAL, LAYOUT, ROTARY_MODE,
-                                    num_frags_x, num_frags_y, num_frags_z, num_warps, DTypeIn,
-                                    DTypeQKAccum, DTypeOut>;
-                                tensor_info_t<LAYOUT, GROUP_SIZE, HEAD_DIM> qkv_info(qo_len, kv_len,
-                                                                                     num_kv_heads);
+                                    /*partition_kv=*/true, GROUP_SIZE, CAUSAL, KV_LAYOUT,
+                                    ROTARY_MODE, num_frags_x, num_frags_y, num_frags_z, num_warps,
+                                    DTypeIn, DTypeQKAccum, DTypeOut>;
+                                tensor_info_t<KV_LAYOUT, GROUP_SIZE, HEAD_DIM> qkv_info(
+                                    qo_len, kv_len, num_kv_heads);
                                 uint32_t smem_size = (num_frags_x * num_warps + num_frags_z * 2) *
                                                      16 * head_dim * sizeof(DTypeIn);
                                 FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
@@ -1411,7 +1411,7 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
   return cudaSuccess;
 }
 
-template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout LAYOUT, RotaryMode ROTARY_MODE,
+template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT, RotaryMode ROTARY_MODE,
           bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL, typename DTypeIn, typename DTypeOut>
 cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o,
                                                float* tmp, float* lse, uint32_t num_kv_heads,
@@ -1457,10 +1457,10 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
       constexpr uint32_t num_threads = num_warps * warp_size;
       constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
       auto partition_kv_kernel =
-          SinglePrefillWithKVCacheKernel</*partition_kv=*/true, GROUP_SIZE, CAUSAL, LAYOUT,
+          SinglePrefillWithKVCacheKernel</*partition_kv=*/true, GROUP_SIZE, CAUSAL, KV_LAYOUT,
                                          ROTARY_MODE, num_frags_x, num_frags_y, num_frags_z,
                                          num_warps, DTypeIn, DTypeQKAccum, DTypeOut>;
-      tensor_info_t<LAYOUT, GROUP_SIZE, HEAD_DIM> qkv_info(qo_len, kv_len, num_kv_heads);
+      tensor_info_t<KV_LAYOUT, GROUP_SIZE, HEAD_DIM> qkv_info(qo_len, kv_len, num_kv_heads);
       uint32_t smem_size =
           (num_frags_x * num_warps + num_frags_z * 2) * 16 * HEAD_DIM * sizeof(DTypeIn);
       FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
@@ -1478,7 +1478,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
       if (num_chunks <= 1 || tmp == nullptr) {
         // Enough parallelism, do not split-kv
         auto kernel =
-            SinglePrefillWithKVCacheKernel</*partition_kv=*/false, GROUP_SIZE, CAUSAL, LAYOUT,
+            SinglePrefillWithKVCacheKernel</*partition_kv=*/false, GROUP_SIZE, CAUSAL, KV_LAYOUT,
                                            ROTARY_MODE, num_frags_x, num_frags_y, num_frags_z,
                                            num_warps, DTypeIn, DTypeQKAccum, DTypeOut>;
         void* args[] = {(void*)&q,
@@ -1540,7 +1540,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
  * \param kv_len The length of key and value.
  * \param head_dim The dimension of each head.
  * \param causal Whether to use causal attention.
- * \param layout The layout of input and output.
+ * \param kv_layout The layout of input and output.
  * \param rotary_mode The rotary mode.
  * \param allow_fp16_qk_reduction Whether to allow accumulating q*k^T with fp16.
  * \param rope_scale The scaling factor used in RoPE interpolation.
@@ -1552,7 +1552,7 @@ template <typename DTypeIn, typename DTypeOut>
 cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o, float* tmp,
                                      float* lse, uint32_t num_qo_heads, uint32_t num_kv_heads,
                                      uint32_t qo_len, uint32_t kv_len, uint32_t head_dim,
-                                     bool causal = true, QKVLayout layout = QKVLayout::kNHD,
+                                     bool causal = true, QKVLayout kv_layout = QKVLayout::kNHD,
                                      RotaryMode rotary_mode = RotaryMode::kNone,
                                      bool allow_fp16_qk_reduction = false, float rope_scale = 1.f,
                                      float rope_theta = 1e4, cudaStream_t stream = nullptr) {
@@ -1561,17 +1561,17 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOu
       allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
       {SWITCH_GQA_GROUP_SIZE(
           group_size, GROUP_SIZE,
-          {SWITCH_CAUSAL(
-              causal, CAUSAL,
-              {SWITCH_HEAD_DIM_PREFILL(
-                  head_dim, HEAD_DIM,
-                  {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(layout, LAYOUT, {
-                                        SinglePrefillWithKVCacheDispatched<
-                                            GROUP_SIZE, HEAD_DIM, LAYOUT, ROTARY_MODE,
-                                            ALLOW_FP16_QK_REDUCTION, CAUSAL>(
-                                            q, k, v, o, tmp, lse, num_kv_heads, qo_len, kv_len,
-                                            rope_scale, rope_theta, stream);
-                                      })})})})})});
+          {SWITCH_CAUSAL(causal, CAUSAL,
+                         {SWITCH_HEAD_DIM_PREFILL(
+                             head_dim, HEAD_DIM,
+                             {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE,
+                                                 {SWITCH_LAYOUT(kv_layout, KV_LAYOUT, {
+                                                   SinglePrefillWithKVCacheDispatched<
+                                                       GROUP_SIZE, HEAD_DIM, KV_LAYOUT, ROTARY_MODE,
+                                                       ALLOW_FP16_QK_REDUCTION, CAUSAL>(
+                                                       q, k, v, o, tmp, lse, num_kv_heads, qo_len,
+                                                       kv_len, rope_scale, rope_theta, stream);
+                                                 })})})})})});
   return cudaSuccess;
 }
 
@@ -1606,7 +1606,7 @@ std::tuple<IdType, IdType, std::vector<IdType>, std::vector<IdType>> split_qo_in
   return {num_frags_x, num_qo_tiles, std::move(request_indices), std::move(tile_indices)};
 }
 
-template <uint32_t num_frags_x, uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout LAYOUT,
+template <uint32_t num_frags_x, uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
           RotaryMode ROTARY_MODE, bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL, typename DTypeIn,
           typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
@@ -1644,7 +1644,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
 
   SWITCH_NUM_FRAGS_Z(min(max_num_frags_z_smem, max_num_frags_z_reg), num_frags_z, {
     auto kernel =
-        BatchPrefillWithRaggedKVCacheKernel<GROUP_SIZE, CAUSAL, LAYOUT, ROTARY_MODE, num_frags_x,
+        BatchPrefillWithRaggedKVCacheKernel<GROUP_SIZE, CAUSAL, KV_LAYOUT, ROTARY_MODE, num_frags_x,
                                             num_frags_y, num_frags_z, num_warps, DTypeIn,
                                             DTypeQKAccum, DTypeOut, IdType>;
     uint32_t smem_size =
@@ -1698,7 +1698,7 @@ cudaError_t BatchPrefillWithRaggedKVCache(
                                        sizeof(IdType) * tile_indices_h.size(),
                                        cudaMemcpyHostToDevice, stream));
 
-  constexpr QKVLayout LAYOUT = QKVLayout::kNHD;
+  constexpr QKVLayout KV_LAYOUT = QKVLayout::kNHD;
   SWITCH_NUM_FRAGS_X(
       num_frags_x, NUM_FRAGS_X,
       {SWITCH_ALLOW_FP16_QK_REDUCTION(
@@ -1709,7 +1709,7 @@ cudaError_t BatchPrefillWithRaggedKVCache(
                              {SWITCH_HEAD_DIM_PREFILL(
                                  head_dim, HEAD_DIM, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
                                    return BatchPrefillWithRaggedKVCacheDispatched<
-                                       NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM, LAYOUT, ROTARY_MODE,
+                                       NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM, KV_LAYOUT, ROTARY_MODE,
                                        ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
                                        q, request_indices_d, tile_indices_d, qo_indptr, k, v,
                                        kv_indptr, o, tmp, lse, batch_size, num_qo_tiles,
@@ -1743,15 +1743,15 @@ cudaError_t BatchPrefillWithRaggedKVCache(
  * \return status Indicates whether CUDA calls are successful
  * \note This implementation executes requests one by one, which is not efficient.
  */
-template <PageStorage page_storage, uint32_t num_frags_x, uint32_t GROUP_SIZE, uint32_t HEAD_DIM,
-          RotaryMode ROTARY_MODE, bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL, typename DTypeIn,
-          typename DTypeOut, typename IdType>
+template <PageStorage page_storage, QKVLayout kv_layout, uint32_t num_frags_x, uint32_t GROUP_SIZE,
+          uint32_t HEAD_DIM, RotaryMode ROTARY_MODE, bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL,
+          typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheFallbackDispatched(
     DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr,
-    paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, DTypeOut* o, float* tmp, float* lse,
-    uint32_t num_qo_tiles, float rope_scale = 1.f, float rope_theta = 1e4,
+    paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, DTypeOut* o, float* tmp,
+    float* lse, uint32_t num_qo_tiles, float rope_scale = 1.f, float rope_theta = 1e4,
     cudaStream_t stream = nullptr) {
-  constexpr QKVLayout LAYOUT = QKVLayout::kNHD;
+  constexpr QKVLayout KV_LAYOUT = QKVLayout::kNHD;
   const uint32_t num_kv_heads = paged_kv.num_heads;
   const uint32_t head_dim = paged_kv.head_dim;
   const uint32_t batch_size = paged_kv.batch_size;
@@ -1773,7 +1773,7 @@ cudaError_t BatchPrefillWithPagedKVCacheFallbackDispatched(
                                        cudaMemcpyHostToDevice, stream));
   FLASHINFER_CUDA_CALL(PagedKVCacheToRaggedTensor(paged_kv, keys, values, kv_indptr, stream));
 
-  BatchPrefillWithRaggedKVCacheDispatched<num_frags_x, GROUP_SIZE, HEAD_DIM, LAYOUT, ROTARY_MODE,
+  BatchPrefillWithRaggedKVCacheDispatched<num_frags_x, GROUP_SIZE, HEAD_DIM, KV_LAYOUT, ROTARY_MODE,
                                           ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut,
                                           IdType>(
       q, request_indices, tile_indices, qo_indptr, keys, values, kv_indptr, o, tmp, lse, batch_size,
@@ -1786,13 +1786,14 @@ cudaError_t BatchPrefillWithPagedKVCacheFallbackDispatched(
   return cudaSuccess;
 }
 
-template <PageStorage page_storage, uint32_t num_frags_x, uint32_t PAGE_SIZE, uint32_t GROUP_SIZE,
-          uint32_t HEAD_DIM, RotaryMode ROTARY_MODE, bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL,
-          typename DTypeIn, typename DTypeOut, typename IdType>
+template <PageStorage page_storage, QKVLayout kv_layout, uint32_t num_frags_x, uint32_t PAGE_SIZE,
+          uint32_t GROUP_SIZE, uint32_t HEAD_DIM, RotaryMode ROTARY_MODE,
+          bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL, typename DTypeIn, typename DTypeOut,
+          typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr,
-    paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, DTypeOut* o, float* tmp, float* lse,
-    uint32_t num_qo_tiles, float rope_scale, float rope_theta, cudaStream_t stream) {
+    paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, DTypeOut* o, float* tmp,
+    float* lse, uint32_t num_qo_tiles, float rope_scale, float rope_theta, cudaStream_t stream) {
   const float sm_scale = 1.f / std::sqrt(float(paged_kv.head_dim));
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
@@ -1828,7 +1829,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     auto kernel =
         BatchPrefillWithPagedKVCacheKernel<GROUP_SIZE, PAGE_SIZE, CAUSAL, ROTARY_MODE, num_frags_x,
                                            num_frags_y, num_frags_z, num_warps, page_storage,
-                                           DTypeIn, DTypeQKAccum, DTypeOut, IdType>;
+                                           kv_layout, DTypeIn, DTypeQKAccum, DTypeOut, IdType>;
     uint32_t smem_size =
         (num_frags_x * num_warps + num_frags_z * 2) * 16 * HEAD_DIM * sizeof(DTypeIn);
     FLASHINFER_CUDA_CALL(
@@ -1849,10 +1850,11 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
   return cudaSuccess;
 }
 
-template <PageStorage page_storage, typename DTypeIn, typename DTypeOut, typename IdType>
+template <PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeOut,
+          typename IdType>
 cudaError_t BatchPrefillWithPagedKVCache(
-    DTypeIn* q, IdType* qo_indptr, paged_kv_t<page_storage, DTypeIn, IdType> paged_kv, DTypeOut* o,
-    float* tmp, float* lse, uint32_t num_qo_heads, bool causal = true,
+    DTypeIn* q, IdType* qo_indptr, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
+    DTypeOut* o, float* tmp, float* lse, uint32_t num_qo_heads, bool causal = true,
     RotaryMode rotary_mode = RotaryMode::kNone, bool allow_fp16_qk_reduction = false,
     float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   const uint32_t num_kv_heads = paged_kv.num_heads;
@@ -1896,15 +1898,16 @@ cudaError_t BatchPrefillWithPagedKVCache(
                               {
                                 if constexpr (PAGE_SIZE == 0) {
                                   return BatchPrefillWithPagedKVCacheFallbackDispatched<
-                                      page_storage, NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM, ROTARY_MODE,
-                                      ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
+                                      page_storage, kv_layout, NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM,
+                                      ROTARY_MODE, ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn,
+                                      DTypeOut, IdType>(
                                       q, request_indices_d, tile_indices_d, qo_indptr, paged_kv, o,
                                       tmp, lse, num_qo_tiles, rope_scale, rope_theta, stream);
                                 } else {
                                   return BatchPrefillWithPagedKVCacheDispatched<
-                                      page_storage, NUM_FRAGS_X, PAGE_SIZE, GROUP_SIZE, HEAD_DIM,
-                                      ROTARY_MODE, ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn,
-                                      DTypeOut, IdType>(
+                                      page_storage, kv_layout, NUM_FRAGS_X, PAGE_SIZE, GROUP_SIZE,
+                                      HEAD_DIM, ROTARY_MODE, ALLOW_FP16_QK_REDUCTION, CAUSAL,
+                                      DTypeIn, DTypeOut, IdType>(
                                       q, request_indices_d, tile_indices_d, qo_indptr, paged_kv, o,
                                       tmp, lse, num_qo_tiles, rope_scale, rope_theta, stream);
                                 }

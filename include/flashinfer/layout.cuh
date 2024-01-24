@@ -51,7 +51,7 @@ __host__ __device__ __forceinline__ uint32_t get_h_stride_impl(uint32_t seq_len)
   return layout == QKVLayout::kNHD ? head_dim : seq_len * head_dim;
 }
 
-template <QKVLayout layout, uint32_t group_size, uint32_t head_dim>
+template <QKVLayout kv_layout, uint32_t group_size, uint32_t head_dim>
 struct tensor_info_t {
   uint32_t qo_len;
   uint32_t kv_len;
@@ -69,40 +69,40 @@ struct tensor_info_t {
   __host__ __device__ __forceinline__ size_t get_qo_elem_offset(uint32_t qo_idx,
                                                                 uint32_t qo_head_idx,
                                                                 uint32_t feat_idx) const {
-    return get_elem_offset_impl<layout, head_dim>(qo_idx, qo_head_idx, feat_idx, qo_len,
-                                                  get_num_qo_heads());
+    return get_elem_offset_impl<QKVLayout::kNHD, head_dim>(qo_idx, qo_head_idx, feat_idx, qo_len,
+                                                           get_num_qo_heads());
   }
 
   __host__ __device__ __forceinline__ size_t get_kv_elem_offset(uint32_t kv_idx,
                                                                 uint32_t kv_head_idx,
                                                                 uint32_t feat_idx) const {
-    return get_elem_offset_impl<layout, head_dim>(kv_idx, kv_head_idx, feat_idx, kv_len,
-                                                  num_kv_heads);
+    return get_elem_offset_impl<kv_layout, head_dim>(kv_idx, kv_head_idx, feat_idx, kv_len,
+                                                     num_kv_heads);
   }
 
   __host__ __device__ __forceinline__ uint32_t get_qo_n_stride() const {
-    return get_n_stride_impl<layout, head_dim>(get_num_qo_heads());
+    return get_n_stride_impl<QKVLayout::kNHD, head_dim>(get_num_qo_heads());
   }
 
   __host__ __device__ __forceinline__ uint32_t get_kv_n_stride() const {
-    return get_n_stride_impl<layout, head_dim>(num_kv_heads);
+    return get_n_stride_impl<kv_layout, head_dim>(num_kv_heads);
   }
 
   __host__ __device__ __forceinline__ uint32_t get_qo_h_stride() const {
-    return get_h_stride_impl<layout, head_dim>(qo_len);
+    return get_h_stride_impl<QKVLayout::kNHD, head_dim>(qo_len);
   }
 
   __host__ __device__ __forceinline__ uint32_t get_kv_h_stride() const {
-    return get_h_stride_impl<layout, head_dim>(kv_len);
+    return get_h_stride_impl<kv_layout, head_dim>(kv_len);
   }
 };
 
 /*!
  * \brief Convert QKVLayout to string
- * \param qkv_layout The QKVLayout to convert
+ * \param layout The QKVLayout to convert
  */
-inline std::string QKVLayoutToString(const QKVLayout& qkv_layout) {
-  switch (qkv_layout) {
+inline std::string QKVLayoutToString(const QKVLayout& layout) {
+  switch (layout) {
     case QKVLayout::kNHD:
       return "NHD";
     case QKVLayout::kHND:
