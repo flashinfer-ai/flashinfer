@@ -109,21 +109,26 @@ std::vector<torch::Tensor> batch_decode_with_padded_kv_cache_return_lse(
 }
 
 void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
-    torch::Tensor indptr, torch::Tensor last_page_len, unsigned int batch_size,
-    unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int head_dim,
-    unsigned int page_size, unsigned int rotary_mode, torch::Tensor empty_data) {
+    torch::Tensor workspace_buffer, torch::Tensor indptr, torch::Tensor last_page_len,
+    unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads,
+    unsigned int head_dim, unsigned int page_size, unsigned int rotary_mode,
+    torch::Tensor empty_data) {
   // NOTE(zihao): not necessary to be CUDA tensor
   CHECK_CONTIGUOUS(indptr);
   CHECK_CONTIGUOUS(last_page_len);
+  CHECK_CONTIGUOUS(workspace_buffer);
+  CHECK_DIM(1, workspace_buffer);
   CHECK_DIM(1, indptr);
   CHECK_DIM(1, last_page_len);
   CHECK_EQ(indptr.scalar_type(), torch::kInt32);
   CHECK_EQ(indptr.scalar_type(), torch::kInt32);
+  size_t workspace_size_in_bytes = workspace_buffer.size(0) * workspace_buffer.element_size();
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(empty_data.scalar_type(), c_type, [&] {
     SWITCH_LAYOUT(kv_layout_, KV_LAYOUT, {
       cudaError_t status =
           handler_.BeginForward<PageStorage::kIndices, KV_LAYOUT, c_type, c_type, int32_t>(
+              static_cast<void*>(workspace_buffer.data_ptr()), workspace_size_in_bytes,
               static_cast<int32_t*>(indptr.data_ptr()),
               static_cast<int32_t*>(last_page_len.data_ptr()), batch_size, num_qo_heads,
               num_kv_heads, head_dim, page_size, RotaryMode(rotary_mode));
