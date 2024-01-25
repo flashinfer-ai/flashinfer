@@ -34,9 +34,9 @@ struct AlignedAlloactor {
   AlignedAlloactor(void* buf, size_t space) : ptr(buf), space(space) {}
   template <typename T>
   T* aligned_alloc(size_t size, size_t alignment) {
-    if (std::align(alignmemt, size, ptr, space)) {
+    if (std::align(alignment, size, ptr, space)) {
       T* result = reinterpret_cast<T*>(ptr);
-      p = (char*)p + size;
+      ptr = (char*)ptr + size;
       space -= size;
       return result;
     } else {
@@ -105,7 +105,7 @@ class BatchDecodeHandler {
           allocator.aligned_alloc<void*>(batch_size_after_partition_ * sizeof(IdType), 16);
       chunk_start_pos_ =
           allocator.aligned_alloc<void*>(batch_size_after_partition_ * sizeof(IdType), 16);
-      seq_lengths_after_partition_ =
+      seq_lengths_before_partition_ =
           allocator.aligned_alloc<void*>(batch_size_after_partition_ * sizeof(IdType), 16);
       FLASHINFER_CUDA_CALL(PartitionPagedKVCacheComputeAuxiliaryInfo(
           max_num_pages_per_batch, batch_size, page_size, indptr, last_page_len,
@@ -122,13 +122,6 @@ class BatchDecodeHandler {
     batch_size_before_partition_ = 0;
     batch_size_after_partition_ = 0;
     return cudaSuccess;
-    void* float_buffer_;
-    void* new_indptr_;
-    void* new_last_page_len_;
-    void* chunk_indptr_;
-    void* batch_idx_map_;
-    void* chunk_start_pos_;
-    void* seq_lengths_before_partition_;
   }
 
   bool IsForwardStarted() const { return forward_started_; }
@@ -144,7 +137,12 @@ class BatchDecodeHandler {
   BatchDecodeHandler()
       : batch_size_after_partition_(0U),
         float_buffer_(nullptr),
-        int_buffer_(nullptr),
+        new_indptr_(nullptr),
+        new_last_page_len_(nullptr),
+        chunk_indptr_(nullptr),
+        batch_idx_map_(nullptr),
+        chunk_start_pos_(nullptr),
+        seq_lengths_before_partition_(nullptr),
         forward_started_(false),
         stream_(nullptr) {}
   ~BatchDecodeHandler() { EndForward(); }
@@ -153,7 +151,12 @@ class BatchDecodeHandler {
   uint32_t batch_size_before_partition_;
   uint32_t batch_size_after_partition_;
   void* float_buffer_;
-  void* int_buffer_;
+  void* new_indptr_;
+  void* new_last_page_len_;
+  void* chunk_indptr_;
+  void* batch_idx_map_;
+  void* chunk_start_pos_;
+  void* seq_lengths_before_partition_;
   bool forward_started_;
   cudaStream_t stream_;
 };
