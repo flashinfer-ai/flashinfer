@@ -117,9 +117,9 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
   CHECK_CONTIGUOUS(indptr);
   CHECK_CONTIGUOUS(last_page_len);
   CHECK_CONTIGUOUS(workspace_buffer);
-  CHECK_DIM(1, workspace_buffer);
   CHECK_DIM(1, indptr);
   CHECK_DIM(1, last_page_len);
+  CHECK_DIM(1, workspace_buffer);
   CHECK_EQ(indptr.scalar_type(), torch::kInt32);
   CHECK_EQ(indptr.scalar_type(), torch::kInt32);
   size_t workspace_size_in_bytes = workspace_buffer.size(0) * workspace_buffer.element_size();

@@ -534,6 +534,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             getattr(TensorLayout, kv_layout)
         )
 
+    def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
+        self.workspace_buffer = workspace_buffer
+
     def begin_forward(
         self,
         indptr: torch.Tensor,
@@ -639,6 +642,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._wrapper = _kernels.BatchPrefillWithPagedKVCachePyTorchWrapper(
             getattr(TensorLayout, kv_layout)
         )
+
+    def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
+        self.workspace_buffer = workspace_buffer
 
     def begin_forward(
         self,
