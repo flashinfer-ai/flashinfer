@@ -129,13 +129,6 @@ class BatchDecodeHandler {
     chunk_start_pos_ = nullptr;
     seq_lengths_before_partition_ = nullptr;
     return cudaSuccess;
-    void* float_buffer_;
-    void* new_indptr_;
-    void* new_last_page_len_;
-    void* chunk_indptr_;
-    void* batch_idx_map_;
-    void* chunk_start_pos_;
-    void* seq_lengths_before_partition_;
   }
 
   bool IsForwardStarted() const { return forward_started_; }
