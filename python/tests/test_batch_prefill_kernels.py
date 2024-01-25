@@ -58,7 +58,10 @@ def test_batch_prefill_with_paged_kv_cache(
     ).to(0)
 
     if use_wrapper:
-        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(kv_layout)
+        workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace_buffer, kv_layout
+        )
         wrapper.begin_forward(q_indptr, batch_size, num_qo_heads, num_kv_heads)
         o = wrapper.forward(
             q, q_indptr, kv_data, kv_indptr, kv_indices, kv_last_page_len

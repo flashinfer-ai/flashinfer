@@ -54,7 +54,8 @@ def test_batch_decode_with_paged_kv_cache(
         (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
     ).to(0)
 
-    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(kv_layout)
+    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, kv_layout)
     wrapper.begin_forward(
         kv_indptr,
         kv_last_page_len,
