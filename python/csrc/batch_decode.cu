@@ -117,6 +117,10 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
   CHECK_CONTIGUOUS(indptr);
   CHECK_CONTIGUOUS(last_page_len);
   CHECK_CONTIGUOUS(workspace_buffer);
+<<<<<<< HEAD
+=======
+  CHECK_DIM(1, workspace_buffer);
+>>>>>>> b8228d1 (fix pytorch c++ bindings)
   CHECK_DIM(1, indptr);
   CHECK_DIM(1, last_page_len);
   CHECK_DIM(1, workspace_buffer);
