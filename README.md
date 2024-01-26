@@ -35,6 +35,35 @@ cd flashinfer/python
 pip install -e .
 ```
 
+### Trying it out
+
+Below is a minimal example of using FlashInfer's single-request decode/append/prefill attention kernels:
+
+```python
+import torch
+import flashinfer
+
+k = torch.randn(2048, 32, 128).half().to(0) 
+v = torch.randn(2048, 32, 128).half().to(0) 
+
+# decode attention
+q = torch.randn(32, 128).half().to(0)
+
+o = flashinfer.single_decode_with_kv_cache(q, k, v) # decode attention without RoPE on-the-fly
+o_rope_on_the_fly = flashinfer.single_decode_with_kv_cache(q, k, v, rotary_mode="LLAMA") # decode with LLaMA style RoPE on-the-fly
+
+# append attention
+q = torch.randn(128, 32, 128).half().to(0) # append attention, the last 128 tokens in the KV-Cache are the new tokens
+o = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=True) # append attention without RoPE on-the-fly
+o_rope_on_the_fly = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=True, rotary_mode="LLAMA") # append attention with LLaMA style RoPE on-the-fly
+
+# prefill attention
+q = torch.randn(2048, 32, 128).half().to(0) # prefill attention
+o = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=False) # prefill attention without RoPE on-the-fly
+```
+
+Check out [documentation](https://docs.flashinfer.ai/) for usage of batch decode/append/prefill kernels and shared-prefix cascading kernels.
+
 ## Run Benchmarks
 
 We profile FlashInfer kernel performance with [nvbench](https://github.com/NVIDIA/nvbench) and you can compile and run the benchmarks with the following commands:
