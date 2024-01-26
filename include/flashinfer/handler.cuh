@@ -121,6 +121,13 @@ class BatchDecodeHandler {
     forward_started_ = false;
     batch_size_before_partition_ = 0;
     batch_size_after_partition_ = 0;
+    float_buffer_ = nullptr;
+    new_indptr_ = nullptr;
+    new_last_page_len_ = nullptr;
+    chunk_indptr_ = nullptr;
+    batch_idx_map_ = nullptr;
+    chunk_start_pos_ = nullptr;
+    seq_lengths_before_partition_ = nullptr;
     return cudaSuccess;
   }
 
@@ -209,14 +216,8 @@ class BatchPrefillHandler {
     forward_started_ = false;
     num_frags_x_ = 0U;
     num_qo_tiles_ = 0U;
-    if (request_indices_ != nullptr) {
-      FLASHINFER_CUDA_CALL(cudaFreeAsync(request_indices_, stream_));
-      request_indices_ = nullptr;
-    }
-    if (tile_indices_ != nullptr) {
-      FLASHINFER_CUDA_CALL(cudaFreeAsync(tile_indices_, stream_));
-      tile_indices_ = nullptr;
-    }
+    request_indices_ = nullptr;
+    tile_indices_ = nullptr;
     return cudaSuccess;
   }
 
