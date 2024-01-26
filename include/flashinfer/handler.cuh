@@ -28,6 +28,24 @@
 
 namespace flashinfer {
 
+struct AlignedAlloactor {
+  void* ptr;
+  size_t space;
+  AlignedAlloactor(void* buf, size_t space) : ptr(buf), space(space) {}
+  template <typename T>
+  T* aligned_alloc(size_t size, size_t alignment) {
+    if (std::align(alignment, size, ptr, space)) {
+      T* result = reinterpret_cast<T*>(ptr);
+      ptr = (char*)ptr + size;
+      space -= size;
+      return result;
+    } else {
+      throw std::runtime_error("RuntimeError: Out of workspace memory in AlignedAlloactor");
+    }
+    return nullptr;
+  }
+};
+
 class BatchDecodeHandler {
  public:
   template <typename DType>
@@ -36,57 +54,35 @@ class BatchDecodeHandler {
   }
   template <typename IdType>
   IdType* GetNewIndPtr() const {
-    return (IdType*)int_buffer_;
+    return (IdType*)new_indptr_;
   }
   template <typename IdType>
   IdType* GetNewLastPageLen() const {
-    if (int_buffer_ != nullptr) {
-      return ((IdType*)int_buffer_) + batch_size_after_partition_ + 1;
-    } else {
-      return nullptr;
-    }
+    return (IdType*)new_last_page_len_;
   }
   template <typename IdType>
   IdType* GetChunkIndPtr() const {
-    if (int_buffer_ != nullptr) {
-      return ((IdType*)int_buffer_) + 2 * batch_size_after_partition_ + 1;
-    } else {
-      return nullptr;
-    }
+    return (IdType*)chunk_indptr_;
   }
   template <typename IdType>
   IdType* GetBatchIdxMap() const {
-    if (int_buffer_ != nullptr) {
-      return ((IdType*)int_buffer_) + 2 * batch_size_after_partition_ +
-             batch_size_before_partition_ + 2;
-    } else {
-      return nullptr;
-    }
+    return (IdType*)batch_idx_map_;
   }
   template <typename IdType>
   IdType* GetChunkStartPos() const {
-    if (int_buffer_ != nullptr) {
-      return ((IdType*)int_buffer_) + 3 * batch_size_after_partition_ +
-             batch_size_before_partition_ + 2;
-    } else {
-      return nullptr;
-    }
+    return (IdType*)chunk_start_pos_;
   }
   template <typename IdType>
   IdType* GetSeqLengthsBeforePartition() const {
-    if (int_buffer_ != nullptr) {
-      return ((IdType*)int_buffer_) + 4 * batch_size_after_partition_ +
-             batch_size_before_partition_ + 2;
-    } else {
-      return nullptr;
-    }
+    return (IdType*)seq_lengths_before_partition_;
   }
 
   template <PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeOut,
             typename IdType>
-  cudaError_t BeginForward(IdType* indptr, IdType* last_page_len, uint32_t batch_size,
-                           uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
-                           uint32_t page_size, RotaryMode rotary_mode) {
+  cudaError_t BeginForward(void* buffer, size_t workspace_size_in_bytes, IdType* indptr,
+                           IdType* last_page_len, uint32_t batch_size, uint32_t num_qo_heads,
+                           uint32_t num_kv_heads, uint32_t head_dim, uint32_t page_size,
+                           RotaryMode rotary_mode) {
     batch_size_before_partition_ = batch_size;
     uint32_t tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size;
     auto work_estimation_func =
@@ -97,10 +93,20 @@ class BatchDecodeHandler {
         num_qo_heads, num_kv_heads, head_dim, page_size, rotary_mode, stream_));
     batch_size_after_partition_ = new_batch_size;
     if (tmp_size > 0) {
-      FLASHINFER_CUDA_CALL(cudaMallocAsync(&float_buffer_, tmp_size, stream_));
-      FLASHINFER_CUDA_CALL(cudaMallocAsync(
-          &int_buffer_, sizeof(IdType) * (5 * new_batch_size + batch_size_before_partition_ + 2),
-          stream_));
+      AlignedAlloactor allocator(buffer, workspace_size_in_bytes);
+      float_buffer_ = allocator.aligned_alloc<void*>(tmp_size, 16);
+      new_indptr_ =
+          allocator.aligned_alloc<void*>((batch_size_after_partition_ + 1) * sizeof(IdType), 16);
+      new_last_page_len_ =
+          allocator.aligned_alloc<void*>(batch_size_after_partition_ * sizeof(IdType), 16);
+      chunk_indptr_ =
+          allocator.aligned_alloc<void*>((batch_size_before_partition_ + 1) * sizeof(IdType), 16);
+      batch_idx_map_ =
+          allocator.aligned_alloc<void*>(batch_size_after_partition_ * sizeof(IdType), 16);
+      chunk_start_pos_ =
+          allocator.aligned_alloc<void*>(batch_size_after_partition_ * sizeof(IdType), 16);
+      seq_lengths_before_partition_ =
+          allocator.aligned_alloc<void*>(batch_size_after_partition_ * sizeof(IdType), 16);
       FLASHINFER_CUDA_CALL(PartitionPagedKVCacheComputeAuxiliaryInfo(
           max_num_pages_per_batch, batch_size, page_size, indptr, last_page_len,
           GetNewIndPtr<IdType>(), GetNewLastPageLen<IdType>(), GetChunkIndPtr<IdType>(),
@@ -115,14 +121,13 @@ class BatchDecodeHandler {
     forward_started_ = false;
     batch_size_before_partition_ = 0;
     batch_size_after_partition_ = 0;
-    if (float_buffer_ != nullptr) {
-      FLASHINFER_CUDA_CALL(cudaFreeAsync(float_buffer_, stream_));
-      float_buffer_ = nullptr;
-    }
-    if (int_buffer_ != nullptr) {
-      FLASHINFER_CUDA_CALL(cudaFreeAsync(int_buffer_, stream_));
-      int_buffer_ = nullptr;
-    }
+    float_buffer_ = nullptr;
+    new_indptr_ = nullptr;
+    new_last_page_len_ = nullptr;
+    chunk_indptr_ = nullptr;
+    batch_idx_map_ = nullptr;
+    chunk_start_pos_ = nullptr;
+    seq_lengths_before_partition_ = nullptr;
     return cudaSuccess;
   }
 
@@ -139,7 +144,12 @@ class BatchDecodeHandler {
   BatchDecodeHandler()
       : batch_size_after_partition_(0U),
         float_buffer_(nullptr),
-        int_buffer_(nullptr),
+        new_indptr_(nullptr),
+        new_last_page_len_(nullptr),
+        chunk_indptr_(nullptr),
+        batch_idx_map_(nullptr),
+        chunk_start_pos_(nullptr),
+        seq_lengths_before_partition_(nullptr),
         forward_started_(false),
         stream_(nullptr) {}
   ~BatchDecodeHandler() { EndForward(); }
@@ -148,7 +158,12 @@ class BatchDecodeHandler {
   uint32_t batch_size_before_partition_;
   uint32_t batch_size_after_partition_;
   void* float_buffer_;
-  void* int_buffer_;
+  void* new_indptr_;
+  void* new_last_page_len_;
+  void* chunk_indptr_;
+  void* batch_idx_map_;
+  void* chunk_start_pos_;
+  void* seq_lengths_before_partition_;
   bool forward_started_;
   cudaStream_t stream_;
 };
@@ -172,8 +187,8 @@ class BatchPrefillHandler {
   bool IsForwardStarted() const { return request_indices_ != nullptr; }
 
   template <typename IdType>
-  cudaError_t BeginForward(IdType* qo_indptr, uint32_t batch_size, uint32_t num_qo_heads,
-                           uint32_t num_kv_heads) {
+  cudaError_t BeginForward(void* buffer, size_t workspace_size_in_bytes, IdType* qo_indptr,
+                           uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads) {
     if (num_qo_heads % num_kv_heads != 0) {
       std::ostringstream err_msg;
       err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -184,8 +199,10 @@ class BatchPrefillHandler {
     std::vector<IdType> request_indices_h, tile_indices_h;
     std::tie(num_frags_x_, num_qo_tiles_, request_indices_h, tile_indices_h) =
         split_qo_indptr(qo_indptr, batch_size, gqa_group_size, stream_);
-    FLASHINFER_CUDA_CALL(cudaMalloc(&request_indices_, sizeof(IdType) * request_indices_h.size()));
-    FLASHINFER_CUDA_CALL(cudaMalloc(&tile_indices_, sizeof(IdType) * tile_indices_h.size()));
+    AlignedAlloactor allocator(buffer, workspace_size_in_bytes);
+    request_indices_ =
+        allocator.aligned_alloc<void*>(sizeof(IdType) * request_indices_h.size(), 16);
+    tile_indices_ = allocator.aligned_alloc<void*>(sizeof(IdType) * tile_indices_h.size(), 16);
     FLASHINFER_CUDA_CALL(cudaMemcpyAsync(request_indices_, request_indices_h.data(),
                                          sizeof(IdType) * request_indices_h.size(),
                                          cudaMemcpyHostToDevice, stream_));
@@ -199,14 +216,8 @@ class BatchPrefillHandler {
     forward_started_ = false;
     num_frags_x_ = 0U;
     num_qo_tiles_ = 0U;
-    if (request_indices_ != nullptr) {
-      FLASHINFER_CUDA_CALL(cudaFreeAsync(request_indices_, stream_));
-      request_indices_ = nullptr;
-    }
-    if (tile_indices_ != nullptr) {
-      FLASHINFER_CUDA_CALL(cudaFreeAsync(tile_indices_, stream_));
-      tile_indices_ = nullptr;
-    }
+    request_indices_ = nullptr;
+    tile_indices_ = nullptr;
     return cudaSuccess;
   }
 

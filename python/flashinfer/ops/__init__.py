@@ -526,12 +526,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
     the lifecycle of these data structures.
     """
 
-    def __init__(self, kv_layout: str = "NHD"):
+    def __init__(self, workspace_buffer: torch.Tensor, kv_layout: str = "NHD"):
         _check_kv_layout(kv_layout)
         self.kv_layout = kv_layout
+        self.workspace_buffer = workspace_buffer
         self._wrapper = _kernels.BatchDecodeWithPagedKVCachePyTorchWrapper(
             getattr(TensorLayout, kv_layout)
         )
+
+    def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
+        self.workspace_buffer = workspace_buffer
 
     def begin_forward(
         self,
@@ -553,6 +557,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         # NOTE(Zihao): the following tensor acts as placeholder to pass dtype info
         empty_data = torch.empty(0, dtype=getattr(torch, data_type))
         self._wrapper.begin_forward(
+            self.workspace_buffer,
             indptr,
             last_page_len,
             batch_size,
@@ -630,12 +635,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
 class BatchPrefillWithPagedKVCacheWrapper:
     r"""Wrapper class of batch_prefill_with_paged_kv_cache kernel."""
 
-    def __init__(self, kv_layout: str = "NHD"):
+    def __init__(self, workspace_buffer: torch.Tensor, kv_layout: str = "NHD"):
         _check_kv_layout(kv_layout)
         self.kv_layout = kv_layout
+        self.workspace_buffer = workspace_buffer
         self._wrapper = _kernels.BatchPrefillWithPagedKVCachePyTorchWrapper(
             getattr(TensorLayout, kv_layout)
         )
+
+    def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
+        self.workspace_buffer = workspace_buffer
 
     def begin_forward(
         self,
@@ -644,7 +653,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         num_qo_heads: int,
         num_kv_heads: int,
     ):
-        self._wrapper.begin_forward(qo_indptr, batch_size, num_qo_heads, num_kv_heads)
+        self._wrapper.begin_forward(
+            self.workspace_buffer, qo_indptr, batch_size, num_qo_heads, num_kv_heads
+        )
 
     def end_forward(self):
         self._wrapper.end_forward()

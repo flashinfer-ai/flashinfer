@@ -281,11 +281,17 @@ void _TestTwoLevelSinglePrefixCascadeDecodeCorrectness(size_t batch_size,
 
   BatchDecodeHandler baseline_handler, cascade_handler;
 
+  size_t workspace_size_in_bytes = 32 * 1024 * 1024;
+  thrust::device_vector<char> buffer_baseline(workspace_size_in_bytes),
+      buffer_cascade(workspace_size_in_bytes);
+
   baseline_handler.BeginForward<page_storage, kv_layout, T, T, int32_t>(
+      (void*)thrust::raw_pointer_cast(buffer_baseline.data()), workspace_size_in_bytes,
       kv_indptr_combined_h.data(), kv_last_page_len_combined_h.data(), batch_size, num_qo_heads,
       num_kv_heads, head_dim, page_size, RotaryMode::kNone);
 
   cascade_handler.BeginForward<page_storage, kv_layout, T, T, int32_t>(
+      (void*)thrust::raw_pointer_cast(buffer_cascade.data()), workspace_size_in_bytes,
       kv_indptr_unique_h.data(), kv_last_page_len_unique_h.data(), batch_size, num_qo_heads,
       num_kv_heads, head_dim, page_size, RotaryMode::kNone);
 
@@ -398,8 +404,16 @@ void _TestTwoLevelSinglePrefixCascadeAppendCorrectness(size_t batch_size,
       thrust::raw_pointer_cast(kv_last_page_len_unique_d.data()));
 
   BatchPrefillHandler baseline_handler, cascade_handler;
-  baseline_handler.BeginForward(qo_indptr_h.data(), batch_size, num_qo_heads, num_kv_heads);
-  cascade_handler.BeginForward(qo_indptr_h.data(), batch_size, num_qo_heads, num_kv_heads);
+  size_t workspace_size_in_bytes = 32 * 1024 * 1024;
+  thrust::device_vector<char> buffer_baseline(workspace_size_in_bytes),
+      buffer_cascade(workspace_size_in_bytes);
+
+  baseline_handler.BeginForward((void*)thrust::raw_pointer_cast(buffer_baseline.data()),
+                                workspace_size_in_bytes, qo_indptr_h.data(), batch_size,
+                                num_qo_heads, num_kv_heads);
+  cascade_handler.BeginForward((void*)thrust::raw_pointer_cast(buffer_cascade.data()),
+                               workspace_size_in_bytes, qo_indptr_h.data(), batch_size,
+                               num_qo_heads, num_kv_heads);
 
   cudaError_t status = BatchPrefillWithPagedKVCacheWrapper<page_storage, kv_layout, T, T, int32_t>(
       &baseline_handler, thrust::raw_pointer_cast(q_d.data()),

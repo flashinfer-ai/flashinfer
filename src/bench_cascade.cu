@@ -109,7 +109,10 @@ void bench_two_level_single_prefix_cascade_decode(nvbench::state& state) {
         thrust::raw_pointer_cast(kv_indptr_unique_d.data()),
         thrust::raw_pointer_cast(kv_last_page_len_unique_d.data()));
     BatchDecodeHandler cascade_handler;
+    size_t workspace_size_in_bytes = 32 * 1024 * 1024;
+    thrust::device_vector<char> buffer(workspace_size_in_bytes);
     cascade_handler.BeginForward<page_storage, kv_layout, T, T, int32_t>(
+        (void*)thrust::raw_pointer_cast(buffer.data()), workspace_size_in_bytes,
         kv_indptr_unique_h.data(), kv_last_page_len_unique_h.data(), batch_size, num_qo_heads,
         num_kv_heads, head_dim, page_size, RotaryMode::kNone);
 
@@ -163,7 +166,10 @@ void bench_two_level_single_prefix_cascade_decode(nvbench::state& state) {
         thrust::raw_pointer_cast(kv_indptr_combined_d.data()),
         thrust::raw_pointer_cast(kv_last_page_len_combined_d.data()));
     BatchDecodeHandler baseline_handler;
+    size_t workspace_size_in_bytes = 32 * 1024 * 1024;
+    thrust::device_vector<char> buffer(workspace_size_in_bytes);
     baseline_handler.BeginForward<page_storage, kv_layout, T, T, int32_t>(
+        (void*)thrust::raw_pointer_cast(buffer.data()), workspace_size_in_bytes,
         kv_indptr_combined_h.data(), kv_last_page_len_combined_h.data(), batch_size, num_qo_heads,
         num_kv_heads, head_dim, page_size, RotaryMode::kNone);
 
@@ -238,7 +244,11 @@ void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
         thrust::raw_pointer_cast(kv_indptr_unique_d.data()),
         thrust::raw_pointer_cast(kv_last_page_len_unique_d.data()));
     BatchPrefillHandler cascade_handler;
-    cascade_handler.BeginForward(qo_indptr_h.data(), batch_size, num_qo_heads, num_kv_heads);
+    size_t workspace_size_in_bytes = 32 * 1024 * 1024;
+    thrust::device_vector<char> buffer(workspace_size_in_bytes);
+    cascade_handler.BeginForward((void*)thrust::raw_pointer_cast(buffer.data()),
+                                 workspace_size_in_bytes, qo_indptr_h.data(), batch_size,
+                                 num_qo_heads, num_kv_heads);
     state.exec(nvbench::exec_tag::timer, [&](nvbench::launch& launch, auto& timer) {
       timer.start();
       cudaError_t status = SinglePrefillWithKVCache(
@@ -290,7 +300,11 @@ void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
         thrust::raw_pointer_cast(kv_indptr_combined_d.data()),
         thrust::raw_pointer_cast(kv_last_page_len_combined_d.data()));
     BatchPrefillHandler baseline_handler;
-    baseline_handler.BeginForward(qo_indptr_h.data(), batch_size, num_qo_heads, num_kv_heads);
+    size_t workspace_size_in_bytes = 32 * 1024 * 1024;
+    thrust::device_vector<char> buffer(workspace_size_in_bytes);
+    baseline_handler.BeginForward((void*)thrust::raw_pointer_cast(buffer.data()),
+                                  workspace_size_in_bytes, qo_indptr_h.data(), batch_size,
+                                  num_qo_heads, num_kv_heads);
     state.exec(nvbench::exec_tag::timer, [&](nvbench::launch& launch, auto& timer) {
       timer.start();
       cudaError_t status =

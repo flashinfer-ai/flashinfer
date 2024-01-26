@@ -57,9 +57,10 @@ class BatchDecodeWithPagedKVCachePyTorchWrapper {
   static BatchDecodeWithPagedKVCachePyTorchWrapper Create(unsigned int layout) {
     return BatchDecodeWithPagedKVCachePyTorchWrapper(layout);
   }
-  void BeginForward(torch::Tensor indptr, torch::Tensor last_page_len, unsigned int batch_size,
-                    unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int head_dim,
-                    unsigned int page_size, unsigned int rotary_mode, torch::Tensor empty_data);
+  void BeginForward(torch::Tensor workspace_buffer, torch::Tensor indptr,
+                    torch::Tensor last_page_len, unsigned int batch_size, unsigned int num_qo_heads,
+                    unsigned int num_kv_heads, unsigned int head_dim, unsigned int page_size,
+                    unsigned int rotary_mode, torch::Tensor empty_data);
   void EndForward();
   std::vector<torch::Tensor> Forward(torch::Tensor q, torch::Tensor paged_kv_data,
                                      torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
@@ -78,8 +79,8 @@ class BatchPrefillWithPagedKVCachePyTorchWrapper {
   static BatchPrefillWithPagedKVCachePyTorchWrapper Create(unsigned int layout) {
     return BatchPrefillWithPagedKVCachePyTorchWrapper(layout);
   }
-  void BeginForward(torch::Tensor qo_indptr, unsigned int batch_size, unsigned int num_qo_heads,
-                    unsigned int num_kv_heads);
+  void BeginForward(torch::Tensor workspace_buffer, torch::Tensor qo_indptr,
+                    unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads);
   void EndForward();
   std::vector<torch::Tensor> Forward(torch::Tensor q, torch::Tensor qo_indptr,
                                      torch::Tensor paged_kv_data, torch::Tensor paged_kv_indptr,
