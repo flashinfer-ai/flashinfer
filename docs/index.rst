@@ -6,15 +6,20 @@
 Welcome to FlashInfer's documentation!
 ======================================
 
+`Discussion Forum <https://github.com/orgs/flashinfer-ai/discussions>`_ | `GitHub <https://github.com/flashinfer-ai/flashinfer/>`_
+
 .. toctree::
    :maxdepth: 2
    :caption: Contents:
 
 
+    deploy/tvm
 
-Indices and tables
-==================
+.. toctree::
+   :maxdepth: 2
+   :caption: API Reference
 
-* :ref:`genindex`
-* :ref:`modindex`
-* :ref:`search`
+    api/python/decode
+    api/python/prefill
+    api/python/cascade
+   
