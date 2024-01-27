@@ -10,16 +10,23 @@ Welcome to FlashInfer's documentation!
 
 .. toctree::
    :maxdepth: 2
-   :caption: Contents:
+   :caption: Page Layout
 
-
-    deploy/tvm
+   tutorials/recursive_softmax
+   tutorials/page_layout
 
 .. toctree::
    :maxdepth: 2
-   :caption: API Reference
+   :caption: TVM Bindings
+   :hidden:
 
-    api/python/decode
-    api/python/prefill
-    api/python/cascade
+   deploy/tvm
+
+.. toctree::
+   :maxdepth: 2
+   :caption: PyTorch API Reference
+
+   api/python/decode
+   api/python/prefill
+   api/python/cascade
    
