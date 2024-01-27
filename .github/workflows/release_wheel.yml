@@ -1,0 +1,105 @@
+name: Release
+on:
+  workflow_call:
+    inputs:
+      tag_name:
+        required: true
+        type: string
+    secrets:
+      WHL_TOKEN:
+        required: true
+      # PYPI_TEST_TOKEN:
+      #   required: true
+
+env:
+  TORCH_CUDA_ARCH_LIST: "8.0 8.6 8.9 9.0+PTX"
+  FLASHINFER_CI_TORCH_VERSION: "2.1.0"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11"]
+        cuda: ["11.8", "12.1"]
+    runs-on: [self-hosted]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Build wheel
+        run: |
+          chown -R $CI_UID:$CI_GID "$GITHUB_WORKSPACE"
+          version="$(cat version.txt)"
+          docker run --rm -t \
+              -v "$CI_RUNNER_CACHE_DIR":/ci-cache \
+              -v "$GITHUB_WORKSPACE":/app \
+              -e FLASHINFER_CI_PYTHON_VERSION=${{ matrix.python }} \
+              -e FLASHINFER_CI_CUDA_VERSION=${{ matrix.cuda }} \
+              -e FLASHINFER_CI_TORCH_VERSION=$FLASHINFER_CI_TORCH_VERSION \
+              -e FLASHINFER_BUILD_VERSION=$version \
+              -e TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" \
+              --user $CI_UID:$CI_GID \
+              pytorch/manylinux-builder:cuda${{ matrix.cuda }} \
+              bash /app/ci/run-ci-build-wheel.bash
+
+      - run: du -h dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-cuda${{ matrix.cuda }}-python${{ matrix.python }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+          pattern: wheel-*
+
+      - run: ls -lah dist/
+
+      - uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          files: |
+            dist/flashinfer-*.whl
+            dist/flashinfer-*.tar.gz
+
+      - name: Clone wheel index
+        run: git clone https://oauth2:${WHL_TOKEN}@github.com/flashinfer-ai/whl.git flashinfer-whl
+        env:
+          WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
+
+      - name: Update wheel index
+        shell: python
+        run: |
+          import pathlib
+          import hashlib
+          import re
+          for path in sorted(pathlib.Path("dist").glob("*.whl")):
+            with open(path, "rb") as f:
+              sha256 = hashlib.sha256(f.read()).hexdigest()
+            ver, cu = re.findall(r"flashinfer-([0-9.]+)\+cu(\d+)-", path.name)[0]
+            with open(f"flashinfer-whl/cu{cu}/flashinfer/index.html", "a") as f:
+              f.write(f'<a href="https://github.com/flashinfer-ai/flashinfer/releases/download/v{ver}/{path.name}#sha256={sha256}">{path.name}</a><br>\n')
+
+      - name: Push wheel index
+        run: |
+          cd flashinfer-whl
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "update whl"
+          git push
+
+      # - name: Upload sdist to pypi
+      #   run: |
+      #     pip install twine
+      #     python -m twine upload --repository testpypi --username=__token__ dist/*.tar.gz
+      #   env:
+      #     TWINE_PASSWORD: ${{ secrets.PYPI_TEST_TOKEN }}

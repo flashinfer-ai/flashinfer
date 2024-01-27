@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 import pathlib
+import datetime
+import subprocess
 
 import setuptools
 import torch.utils.cpp_extension as torch_cpp_ext
@@ -21,12 +23,24 @@ import torch.utils.cpp_extension as torch_cpp_ext
 root = pathlib.Path(__name__).parent
 
 
-def get_version(path):
-    with open(path) as f:
-        for line in f:
-            if line.startswith("__version__"):
-                return line.split("=", maxsplit=1)[1].replace('"', "").strip()
-    raise ValueError("Version not found")
+def get_local_version_suffix() -> str:
+    if not (root / ".git").is_dir():
+        return ""
+    now = datetime.datetime.now()
+    git_hash = subprocess.check_output(
+        ["git", "rev-parse", "--short", "HEAD"], cwd=root, text=True
+    ).strip()
+    commit_number = subprocess.check_output(
+        ["git", "rev-list", "HEAD", "--count"], cwd=root, text=True
+    ).strip()
+    dirty = ".dirty" if subprocess.run(["git", "diff", "--quiet"]).returncode else ""
+    return f"+c{commit_number}.d{now:%Y%m%d}.{git_hash}{dirty}"
+
+def get_version():
+    with open(root / "version.txt") as f:
+        version = f.read().strip()
+    version += get_local_version_suffix()
+    return version
 
 
 def remove_unwanted_pytorch_nvcc_flags():
@@ -68,7 +82,7 @@ ext_modules.append(
 
 setuptools.setup(
     name="flashinfer",
-    version=get_version(root / "flashinfer/__init__.py"),
+    version=get_version(),
     packages=setuptools.find_packages(),
     author="FlashInfer team",
     license="Apache License 2.0",

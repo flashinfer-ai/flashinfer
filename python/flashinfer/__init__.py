@@ -29,4 +29,3 @@ from .ops import (
     BatchPrefillWithPagedKVCacheWrapper,
 )
 
-__version__ = "0.0.1"
