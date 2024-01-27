@@ -36,6 +36,7 @@ def get_local_version_suffix() -> str:
     dirty = ".dirty" if subprocess.run(["git", "diff", "--quiet"]).returncode else ""
     return f"+c{commit_number}.d{now:%Y%m%d}.{git_hash}{dirty}"
 
+
 def get_version():
     with open(root / "version.txt") as f:
         version = f.read().strip()

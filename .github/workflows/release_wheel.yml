@@ -1,3 +1,4 @@
+# Adapted from https://github.com/punica-ai/punica/blob/591b59899f0a20760821785d06b331c8a2e5cb86/.github/workflows/release_wheel.yml
 name: Release
 on:
   workflow_call:
@@ -42,7 +43,7 @@ jobs:
               -e TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" \
               --user $CI_UID:$CI_GID \
               pytorch/manylinux-builder:cuda${{ matrix.cuda }} \
-              bash /app/ci/run-ci-build-wheel.bash
+              bash /app/scripts/run-ci-build-wheel.sh
 
       - run: du -h dist/*
 
