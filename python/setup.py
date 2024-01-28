@@ -84,38 +84,40 @@ def remove_unwanted_pytorch_nvcc_flags():
             pass
 
 
-remove_unwanted_pytorch_nvcc_flags()
-ext_modules = []
-ext_modules.append(
-    torch_cpp_ext.CUDAExtension(
-        name="flashinfer.ops._kernels",
-        sources=[
-            "csrc/single_decode.cu",
-            "csrc/single_prefill.cu",
-            "csrc/cascade.cu",
-            "csrc/batch_decode.cu",
-            "csrc/flashinfer_ops.cu",
-            "csrc/batch_prefill.cu",
-        ],
-        include_dirs=[
-            str(root / "include"),
-        ],
-        extra_compile_args={
-            "cxx": ["-O3"],
-            "nvcc": ["-O3", "--threads", "8"],
-        },
+if __name__ == "__main__":
+    remove_unwanted_pytorch_nvcc_flags()
+    generate_build_meta()
+    ext_modules = []
+    ext_modules.append(
+        torch_cpp_ext.CUDAExtension(
+            name="flashinfer.ops._kernels",
+            sources=[
+                "csrc/single_decode.cu",
+                "csrc/single_prefill.cu",
+                "csrc/cascade.cu",
+                "csrc/batch_decode.cu",
+                "csrc/flashinfer_ops.cu",
+                "csrc/batch_prefill.cu",
+            ],
+            include_dirs=[
+                str(root / "include"),
+            ],
+            extra_compile_args={
+                "cxx": ["-O3"],
+                "nvcc": ["-O3", "--threads", "8"],
+            },
+        )
     )
-)
 
-setuptools.setup(
-    name="flashinfer",
-    version=get_version(),
-    packages=setuptools.find_packages(),
-    author="FlashInfer team",
-    license="Apache License 2.0",
-    description="FlashInfer: Kernel Library for LLM Serving",
-    url="https://github.com/flashinfer-ai/flashinfer",
-    python_requires=">=3.9",
-    ext_modules=ext_modules,
-    cmdclass={"build_ext": torch_cpp_ext.BuildExtension},
-)
+    setuptools.setup(
+        name="flashinfer",
+        version=get_version(),
+        packages=setuptools.find_packages(),
+        author="FlashInfer team",
+        license="Apache License 2.0",
+        description="FlashInfer: Kernel Library for LLM Serving",
+        url="https://github.com/flashinfer-ai/flashinfer",
+        python_requires=">=3.9",
+        ext_modules=ext_modules,
+        cmdclass={"build_ext": torch_cpp_ext.BuildExtension},
+    )
