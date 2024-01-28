@@ -1,6 +1,6 @@
 # sdist & wheel
-include ../version.txt
-recursive-include ../include *
+include version.txt
+recursive-include include *
 
 # wheel-only
 exclude flashinfer/_build_meta.py
