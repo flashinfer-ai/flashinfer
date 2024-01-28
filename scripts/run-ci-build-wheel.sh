@@ -39,7 +39,7 @@ echo "::endgroup::"
 
 
 echo "::group::Build wheel for FlashInfer"
-cd "$PROJECT_ROOT"
+cd "$PROJECT_ROOT/python"
 FLASHINFER_BUILD_VERSION="${FLASHINFER_BUILD_VERSION}+cu${CUDA_MAJOR}${CUDA_MINOR}" python -m build --no-isolation
 rm -f dist/*.tar.gz
 python -m build --no-isolation --sdist
