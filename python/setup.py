@@ -27,22 +27,9 @@ import torch.utils.cpp_extension as torch_cpp_ext
 root = pathlib.Path(__name__).parent
 
 
-def get_local_version_suffix() -> str:
-    now = datetime.datetime.now()
-    git_hash = subprocess.check_output(
-        ["git", "rev-parse", "--short", "HEAD"], cwd=root, text=True
-    ).strip()
-    commit_number = subprocess.check_output(
-        ["git", "rev-list", "HEAD", "--count"], cwd=root, text=True
-    ).strip()
-    dirty = ".dirty" if subprocess.run(["git", "diff", "--quiet"]).returncode else ""
-    return f"+c{commit_number}.d{now:%Y%m%d}.{git_hash}{dirty}"
-
-
 def get_version():
     with open(root / "version.txt") as f:
         version = f.read().strip()
-    version += get_local_version_suffix()
     return version
 
 
