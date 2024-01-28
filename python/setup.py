@@ -20,7 +20,7 @@ import subprocess
 import setuptools
 import torch.utils.cpp_extension as torch_cpp_ext
 
-root = pathlib.Path(__name__).parent
+root = pathlib.Path(__name__).parent.resolve().parent
 
 
 def get_local_version_suffix() -> str:
@@ -73,7 +73,7 @@ ext_modules.append(
             "csrc/batch_prefill.cu",
         ],
         include_dirs=[
-            str(root.resolve().parent / "include"),
+            str(root / "include"),
         ],
         extra_compile_args={
             "cxx": ["-O3"],
