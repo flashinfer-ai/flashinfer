@@ -1,14 +1,20 @@
 # Adapted from https://github.com/punica-ai/punica/blob/591b59899f0a20760821785d06b331c8a2e5cb86/.github/workflows/release_wheel.yml
 name: Release
 on:
-  workflow_call:
-    inputs:
-      tag_name:
-        required: true
-        type: string
+  push:
+    branches:
+      - 'ci'
     secrets:
       WHL_TOKEN:
         required: true
+  # workflow_call:
+  #   inputs:
+  #     tag_name:
+  #       required: true
+  #       type: string
+  #   secrets:
+  #     WHL_TOKEN:
+  #       required: true
       # PYPI_TEST_TOKEN:
       #   required: true
 
