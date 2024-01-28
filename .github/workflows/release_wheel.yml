@@ -4,9 +4,6 @@ on:
   push:
     branches:
       - 'ci'
-    secrets:
-      WHL_TOKEN:
-        required: true
   # workflow_call:
   #   inputs:
   #     tag_name:
