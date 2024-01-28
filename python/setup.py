@@ -38,7 +38,7 @@ def get_local_version_suffix() -> str:
 
 
 def get_version():
-    with open(root.parent / "version.txt") as f:
+    with open(root.resolve().parent / "version.txt") as f:
         version = f.read().strip()
     version += get_local_version_suffix()
     return version
