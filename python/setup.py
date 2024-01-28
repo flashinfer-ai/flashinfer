@@ -14,10 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 import pathlib
+import os
+import re
 import datetime
 import subprocess
+import platform
 
 import setuptools
+import torch
 import torch.utils.cpp_extension as torch_cpp_ext
 
 root = pathlib.Path(__name__).parent.resolve().parent
@@ -42,6 +46,28 @@ def get_version():
         version = f.read().strip()
     version += get_local_version_suffix()
     return version
+
+
+def get_cuda_version() -> tuple[int, int]:
+    if torch_cpp_ext.CUDA_HOME is None:
+        nvcc = "nvcc"
+    else:
+        nvcc = os.path.join(torch_cpp_ext.CUDA_HOME, "bin/nvcc")
+    txt = subprocess.check_output([nvcc, "--version"], text=True)
+    major, minor = map(int, re.findall(r"release (\d+)\.(\d+),", txt)[0])
+    return major, minor
+
+
+def generate_build_meta() -> None:
+    d = {}
+    version = get_version()
+    d["cuda_major"], d["cuda_minor"] = get_cuda_version()
+    d["torch"] = torch.__version__
+    d["python"] = platform.python_version()
+    d["TORCH_CUDA_ARCH_LIST"] = os.environ.get("TORCH_CUDA_ARCH_LIST", None)
+    with open(root / "python/flashinfer/_build_meta.py", "w") as f:
+        f.write(f"__version__ = {version!r}\n")
+        f.write(f"build_meta = {d!r}")
 
 
 def remove_unwanted_pytorch_nvcc_flags():
