@@ -120,4 +120,6 @@ if __name__ == "__main__":
         python_requires=">=3.9",
         ext_modules=ext_modules,
         cmdclass={"build_ext": torch_cpp_ext.BuildExtension},
+        package_data={'': ["../version.txt"]},
+        include_package_data=True
     )
