@@ -85,7 +85,7 @@ if __name__ == "__main__":
                 "csrc/batch_prefill.cu",
             ],
             include_dirs=[
-                str("include"),
+                str(root / "include"),
             ],
             extra_compile_args={
                 "cxx": ["-O3"],
