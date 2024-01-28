@@ -24,12 +24,10 @@ import setuptools
 import torch
 import torch.utils.cpp_extension as torch_cpp_ext
 
-root = pathlib.Path(__name__).parent.resolve().parent
+root = pathlib.Path(__name__).parent
 
 
 def get_local_version_suffix() -> str:
-    if not (root / ".git").is_dir():
-        return ""
     now = datetime.datetime.now()
     git_hash = subprocess.check_output(
         ["git", "rev-parse", "--short", "HEAD"], cwd=root, text=True
@@ -65,7 +63,7 @@ def generate_build_meta() -> None:
     d["torch"] = torch.__version__
     d["python"] = platform.python_version()
     d["TORCH_CUDA_ARCH_LIST"] = os.environ.get("TORCH_CUDA_ARCH_LIST", None)
-    with open(root / "python/flashinfer/_build_meta.py", "w") as f:
+    with open(root / "flashinfer/_build_meta.py", "w") as f:
         f.write(f"__version__ = {version!r}\n")
         f.write(f"build_meta = {d!r}")
 
@@ -100,7 +98,7 @@ if __name__ == "__main__":
                 "csrc/batch_prefill.cu",
             ],
             include_dirs=[
-                str(root / "include"),
+                str("include"),
             ],
             extra_compile_args={
                 "cxx": ["-O3"],
