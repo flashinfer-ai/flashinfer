@@ -48,12 +48,12 @@ jobs:
               pytorch/manylinux-builder:cuda${{ matrix.cuda }} \
               bash /app/scripts/run-ci-build-wheel.sh
         timeout-minutes: 90
-      - run: du -h dist/*
+      - run: du -h python/dist/*
 
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-cuda${{ matrix.cuda }}-python${{ matrix.python }}
-          path: dist/*
+          path: python/dist/*
 
   release:
     needs: build
@@ -61,18 +61,18 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          path: dist/
+          path: ptyhon/dist/
           merge-multiple: true
           pattern: wheel-*
 
-      - run: ls -lah dist/
+      - run: ls -lah python/dist/
 
       - uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ inputs.tag_name }}
           files: |
-            dist/flashinfer-*.whl
-            dist/flashinfer-*.tar.gz
+            python/dist/flashinfer-*.whl
+            python/dist/flashinfer-*.tar.gz
 
       - name: Clone wheel index
         run: git clone https://oauth2:${WHL_TOKEN}@github.com/flashinfer-ai/whl.git flashinfer-whl
@@ -85,7 +85,7 @@ jobs:
           import pathlib
           import hashlib
           import re
-          for path in sorted(pathlib.Path("dist").glob("*.whl")):
+          for path in sorted(pathlib.Path("python/dist").glob("*.whl")):
             with open(path, "rb") as f:
               sha256 = hashlib.sha256(f.read()).hexdigest()
             ver, cu = re.findall(r"flashinfer-([0-9.]+)\+cu(\d+)-", path.name)[0]
