@@ -80,6 +80,7 @@ if __name__ == "__main__":
                 "csrc/single_decode.cu",
                 "csrc/single_prefill.cu",
                 "csrc/cascade.cu",
+                "csrc/page.cu",
                 "csrc/batch_decode.cu",
                 "csrc/flashinfer_ops.cu",
                 "csrc/batch_prefill.cu",

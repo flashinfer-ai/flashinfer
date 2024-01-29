@@ -13,18 +13,29 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
-import torch
-
-from .ops import (
+from .decode import (
+    single_decode_with_kv_cache,
     batch_decode_with_padded_kv_cache,
     batch_decode_with_padded_kv_cache_return_lse,
-    batch_decode_with_shared_prefix_padded_kv_cache,
-    batch_prefill_with_paged_kv_cache,
-    merge_state,
-    merge_states,
-    single_decode_with_kv_cache,
+    BatchDecodeWithPagedKVCacheWrapper,
+)
+from .prefill import (
     single_prefill_with_kv_cache,
     single_prefill_with_kv_cache_return_lse,
-    BatchDecodeWithPagedKVCacheWrapper,
+    batch_prefill_with_paged_kv_cache,
     BatchPrefillWithPagedKVCacheWrapper,
 )
+<<<<<<< HEAD
+=======
+from .cascade import (
+    merge_state,
+    merge_state_in_place,
+    merge_states,
+    batch_decode_with_shared_prefix_padded_kv_cache,
+    BatchDecodeWithSharedPrefixPagedKVCacheWrapper,
+    BatchPrefillWithSharedPrefixPagedKVCacheWrapper,
+)
+from .page import append_paged_kv_cache
+
+__version__ = "0.0.1"
+>>>>>>> 93b1c55 (add-missing-pytorch-apis)

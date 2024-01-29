@@ -33,8 +33,16 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache_return_lse(
     unsigned int layout, unsigned int rotary_mode, bool allow_fp16_qk_reduction, float rope_scale,
     float rope_theta);
 
+void append_paged_kv_cache(torch::Tensor append_key, torch::Tensor append_value,
+                           torch::Tensor append_indptr, torch::Tensor kv_data,
+                           torch::Tensor kv_indices, torch::Tensor kv_indptr,
+                           torch::Tensor kv_last_page_len, unsigned int layout);
+
 std::vector<torch::Tensor> merge_state(torch::Tensor v_a, torch::Tensor s_a, torch::Tensor v_b,
                                        torch::Tensor s_b);
+
+void merge_state_in_place(torch::Tensor v, torch::Tensor s, torch::Tensor v_other,
+                          torch::Tensor s_other);
 
 std::vector<torch::Tensor> merge_states(torch::Tensor v, torch::Tensor s);
 

@@ -57,6 +57,39 @@ std::vector<torch::Tensor> merge_state(torch::Tensor v_a, torch::Tensor s_a, tor
   return {v_merged, s_merged};
 }
 
+void merge_state_in_place(torch::Tensor v, torch::Tensor s, torch::Tensor v_other,
+                          torch::Tensor s_other) {
+  CHECK_INPUT(v);
+  CHECK_INPUT(s);
+  CHECK_INPUT(v_other);
+  CHECK_INPUT(s_other);
+  CHECK_DIM(3, v);
+  CHECK_DIM(2, s);
+  CHECK_DIM(3, v_other);
+  CHECK_DIM(2, s_other);
+  CHECK_SHAPE(v, v_other);
+  CHECK_SHAPE(s, s_other);
+  CHECK_EQ(v.size(0), s.size(0));
+  CHECK_EQ(v.size(1), s.size(1));
+  CHECK_EQ(s.scalar_type(), torch::kFloat32);
+  CHECK_EQ(s_other.scalar_type(), torch::kFloat32);
+  unsigned int seq_len = v.size(0);
+  unsigned int num_heads = v.size(1);
+  unsigned int head_dim = v.size(2);
+
+  bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(v.scalar_type(), c_type, [&] {
+    cudaError_t status =
+        MergeStateInPlace(static_cast<c_type*>(v.data_ptr()), static_cast<float*>(s.data_ptr()),
+                          static_cast<c_type*>(v_other.data_ptr()),
+                          static_cast<float*>(s_other.data_ptr()), seq_len, num_heads, head_dim);
+    TORCH_CHECK(status == cudaSuccess,
+                "MergeStateInPlace kernel launch failed: ", cudaGetErrorString(status));
+    return true;
+  });
+
+  TORCH_CHECK(success, "MergeStateInPlace kernel launch failed: unsupported data type");
+}
+
 std::vector<torch::Tensor> merge_states(torch::Tensor v, torch::Tensor s) {
   CHECK_INPUT(v);
   CHECK_INPUT(s);

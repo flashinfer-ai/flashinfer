@@ -62,10 +62,15 @@ def test_batch_prefill_with_paged_kv_cache(
         wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer, kv_layout
         )
-        wrapper.begin_forward(q_indptr, batch_size, num_qo_heads, num_kv_heads)
-        o = wrapper.forward(
-            q, q_indptr, kv_data, kv_indptr, kv_indices, kv_last_page_len
+        wrapper.begin_forward(
+            q_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            num_qo_heads,
+            num_kv_heads,
         )
+        o = wrapper.forward(q, kv_data)
     else:
         o = flashinfer.batch_prefill_with_paged_kv_cache(
             q,
@@ -111,7 +116,7 @@ def test_batch_prefill_with_paged_kv_cache(
             ],
             dim=0,
         )
-        o_ref_i = flashinfer.ops.single_prefill_with_kv_cache(qi, ki, vi, True)
+        o_ref_i = flashinfer.single_prefill_with_kv_cache(qi, ki, vi, True)
         o_i_np = o[q_indptr[i] : q_indptr[i + 1]].cpu().numpy()
         o_ref_i_np = o_ref_i.cpu().numpy()
         numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
