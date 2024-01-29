@@ -47,7 +47,7 @@ jobs:
               --user $CI_UID:$CI_GID \
               pytorch/manylinux-builder:cuda${{ matrix.cuda }} \
               bash /app/scripts/run-ci-build-wheel.sh
-
+        timeout-minutes: 90
       - run: du -h dist/*
 
       - uses: actions/upload-artifact@v4
