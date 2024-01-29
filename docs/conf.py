@@ -10,6 +10,9 @@ import tlcpack_sphinx_addon
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
+
+sys.path.insert(0, os.path.abspath("../python"))
+
 project = 'FlashInfer'
 author = "FlashInfer Contributors"
 footer_copyright = '2023-2024, {}'.format(author)
@@ -66,6 +69,8 @@ header_links = [
     ("Discussions", "https://github.com/orgs/flashinfer-ai/discussions"),
 ]
 
+html_logo = "_static/FlashInfer-right-background.png"
+
 html_context = {
     "footer_copyright": footer_copyright,
     "footer_note": footer_note,
@@ -75,7 +80,7 @@ html_context = {
     "github_repo": "flashinfer",
     "github_version": "main/docs/",
     "theme_vcs_pageview_mode": "edit",
-    # "header_logo": "/path/to/logo",
+    # "header_logo": "",
     # "header_logo_link": "",
     # "version_selecter": "",
 }
