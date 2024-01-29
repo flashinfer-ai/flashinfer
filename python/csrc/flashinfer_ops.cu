@@ -20,10 +20,10 @@
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("single_decode_with_kv_cache", &single_decode_with_kv_cache,
         "Single-request decode with KV-Cache operator");
-//   m.def("single_prefill_with_kv_cache", &single_prefill_with_kv_cache,
-//         "Single-request prefill with KV-Cache operator");
-//   m.def("single_prefill_with_kv_cache_return_lse", &single_prefill_with_kv_cache_return_lse,
-//         "Single-request prefill with KV-Cache operator, return logsumexp");
+  m.def("single_prefill_with_kv_cache", &single_prefill_with_kv_cache,
+        "Single-request prefill with KV-Cache operator");
+  m.def("single_prefill_with_kv_cache_return_lse", &single_prefill_with_kv_cache_return_lse,
+        "Single-request prefill with KV-Cache operator, return logsumexp");
   m.def("merge_state", &merge_state, "Merge two self-attention states");
   m.def("merge_states", &merge_states, "Merge multiple self-attention states");
   m.def("batch_decode_with_padded_kv_cache", &batch_decode_with_padded_kv_cache,
@@ -31,18 +31,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("batch_decode_with_padded_kv_cache_return_lse",
         &batch_decode_with_padded_kv_cache_return_lse,
         "Multi-request batch decode with padded KV-Cache operator, return logsumexp");
-//   m.def("batch_prefill_with_paged_kv_cache", &batch_prefill_with_paged_kv_cache,
-//         "Multi-request batch prefill with paged KV-Cache operator");
+  m.def("batch_prefill_with_paged_kv_cache", &batch_prefill_with_paged_kv_cache,
+        "Multi-request batch prefill with paged KV-Cache operator");
   py::class_<BatchDecodeWithPagedKVCachePyTorchWrapper>(m,
                                                         "BatchDecodeWithPagedKVCachePyTorchWrapper")
       .def(py::init(&BatchDecodeWithPagedKVCachePyTorchWrapper::Create))
       .def("begin_forward", &BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward)
       .def("end_forward", &BatchDecodeWithPagedKVCachePyTorchWrapper::EndForward)
       .def("forward", &BatchDecodeWithPagedKVCachePyTorchWrapper::Forward);
-//   py::class_<BatchPrefillWithPagedKVCachePyTorchWrapper>(
-//       m, "BatchPrefillWithPagedKVCachePyTorchWrapper")
-//       .def(py::init(&BatchPrefillWithPagedKVCachePyTorchWrapper::Create))
-//       .def("begin_forward", &BatchPrefillWithPagedKVCachePyTorchWrapper::BeginForward)
-//       .def("end_forward", &BatchPrefillWithPagedKVCachePyTorchWrapper::EndForward)
-//       .def("forward", &BatchPrefillWithPagedKVCachePyTorchWrapper::Forward);
+  py::class_<BatchPrefillWithPagedKVCachePyTorchWrapper>(
+      m, "BatchPrefillWithPagedKVCachePyTorchWrapper")
+      .def(py::init(&BatchPrefillWithPagedKVCachePyTorchWrapper::Create))
+      .def("begin_forward", &BatchPrefillWithPagedKVCachePyTorchWrapper::BeginForward)
+      .def("end_forward", &BatchPrefillWithPagedKVCachePyTorchWrapper::EndForward)
+      .def("forward", &BatchPrefillWithPagedKVCachePyTorchWrapper::Forward);
 }

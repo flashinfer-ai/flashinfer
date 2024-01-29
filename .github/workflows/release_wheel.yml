@@ -1,17 +1,14 @@
 # Adapted from https://github.com/punica-ai/punica/blob/591b59899f0a20760821785d06b331c8a2e5cb86/.github/workflows/release_wheel.yml
 name: Release
 on:
-  push:
-    branches:
-      - 'ci'
-  # workflow_call:
-  #   inputs:
-  #     tag_name:
-  #       required: true
-  #       type: string
-  #   secrets:
-  #     WHL_TOKEN:
-  #       required: true
+  workflow_call:
+    inputs:
+      tag_name:
+        required: true
+        type: string
+    secrets:
+      WHL_TOKEN:
+        required: true
       # PYPI_TEST_TOKEN:
       #   required: true
 
@@ -47,7 +44,7 @@ jobs:
               --user $CI_UID:$CI_GID \
               pytorch/manylinux-builder:cuda${{ matrix.cuda }} \
               bash /app/scripts/run-ci-build-wheel.sh
-        timeout-minutes: 90
+        timeout-minutes: 120
       - run: du -h python/dist/*
 
       - uses: actions/upload-artifact@v4
