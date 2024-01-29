@@ -25,8 +25,6 @@ from .prefill import (
     batch_prefill_with_paged_kv_cache,
     BatchPrefillWithPagedKVCacheWrapper,
 )
-<<<<<<< HEAD
-=======
 from .cascade import (
     merge_state,
     merge_state_in_place,
@@ -36,6 +34,3 @@ from .cascade import (
     BatchPrefillWithSharedPrefixPagedKVCacheWrapper,
 )
 from .page import append_paged_kv_cache
-
-__version__ = "0.0.1"
->>>>>>> 93b1c55 (add-missing-pytorch-apis)
