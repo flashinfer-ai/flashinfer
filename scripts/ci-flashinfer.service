@@ -1,0 +1,27 @@
+# https://github.com/myoung34/docker-github-actions-runner/wiki/Usage
+# Install with:
+#   install -m 644 ci-flashinfer.service $HOME/.config/systemd/user/
+#   systemctl --user daemon-reload
+# Run with:
+#   systemctl --user start ci-flashinfer
+# Stop with:
+#   systemctl --user stop ci-flashinfer
+# See live logs with:
+#   journalctl -f -u ci-flashinfer.service --no-hostname --no-tail
+[Unit]
+Description=Ephemeral GitHub Actions Runner Container for flashinfer-ai/flashinfer
+[Service]
+TimeoutStartSec=0
+Restart=always
+ExecStartPre=-/usr/bin/docker stop %N
+ExecStartPre=-/usr/bin/docker rm %N
+ExecStartPre=-/usr/bin/docker pull myoung34/github-runner:latest
+ExecStart=/usr/bin/docker run --rm \
+                              --env-file %h/.config/ci-flashinfer.env \
+                              -e RUNNER_NAME=%H \
+                              -e CI_UID=%U \
+                              -e CI_GID=%G \
+                              -v /var/run/docker.sock:/var/run/docker.sock \
+                              -v /tmp/ci-flashinfer:/tmp/ci-flashinfer \
+                              --name %N \
+                              myoung34/github-runner:latest

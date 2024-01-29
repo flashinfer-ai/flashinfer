@@ -1,0 +1,12 @@
+# sdist & wheel
+include version.txt
+recursive-include include *
+recursive-include csrc *
+
+# wheel-only
+exclude flashinfer/_build_meta.py
+exclude tests/
+
+# Unneeded files
+prune */__pycache__
+global-exclude *.so
