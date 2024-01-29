@@ -78,11 +78,11 @@ if __name__ == "__main__":
             name="flashinfer.ops._kernels",
             sources=[
                 "csrc/single_decode.cu",
-                "csrc/single_prefill.cu",
-                "csrc/cascade.cu",
+                # "csrc/single_prefill.cu",
+                # "csrc/cascade.cu",
                 "csrc/batch_decode.cu",
                 "csrc/flashinfer_ops.cu",
-                "csrc/batch_prefill.cu",
+                # "csrc/batch_prefill.cu",
             ],
             include_dirs=[
                 str(root.resolve() / "include"),
