@@ -24,7 +24,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Single-request prefill with KV-Cache operator");
   m.def("single_prefill_with_kv_cache_return_lse", &single_prefill_with_kv_cache_return_lse,
         "Single-request prefill with KV-Cache operator, return logsumexp");
+  m.def("append_paged_kv_cache", &append_paged_kv_cache, "Append paged KV-Cache operator");
   m.def("merge_state", &merge_state, "Merge two self-attention states");
+  m.def("merge_state_in_place", &merge_state_in_place,
+        "Merge another self-attention state in-place.");
   m.def("merge_states", &merge_states, "Merge multiple self-attention states");
   m.def("batch_decode_with_padded_kv_cache", &batch_decode_with_padded_kv_cache,
         "Multi-request batch decode with padded KV-Cache operator");

@@ -106,12 +106,11 @@ void _TestAppendPagedKVKernelCorrectness(size_t page_size, size_t batch_size, si
     if (round % 2 == 0) {
       // call prefill kernel
       cudaError_t status =
-          AppendPagedKVCachePrefill(paged_kv_gpu, thrust::raw_pointer_cast(keys_gpu.data()),
-                                    thrust::raw_pointer_cast(values_gpu.data()),
-                                    thrust::raw_pointer_cast(append_indptr_gpu.data()));
-      EXPECT_EQ(status, cudaSuccess)
-          << "AppendPagedKVCachePrefill kernel launch failed, error message: "
-          << cudaGetErrorString(status);
+          AppendPagedKVCache(paged_kv_gpu, thrust::raw_pointer_cast(keys_gpu.data()),
+                             thrust::raw_pointer_cast(values_gpu.data()),
+                             thrust::raw_pointer_cast(append_indptr_gpu.data()));
+      EXPECT_EQ(status, cudaSuccess) << "AppendPagedKVCache kernel launch failed, error message: "
+                                     << cudaGetErrorString(status);
     } else {
       // call decode kernel
       cudaError_t status =
