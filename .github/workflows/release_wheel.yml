@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.11", "3.12"]
+        python: ["3.10", "3.11"]
         cuda: ["11.8", "12.1"]
     runs-on: [self-hosted]
     steps:
