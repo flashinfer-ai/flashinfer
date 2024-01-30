@@ -59,7 +59,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          path: ptyhon/dist/
+          path: python/dist/
           merge-multiple: true
           pattern: wheel-*
 
