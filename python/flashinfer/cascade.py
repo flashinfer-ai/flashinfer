@@ -18,7 +18,11 @@ from typing import Optional
 
 import torch
 
-from . import _kernels
+try:
+    from . import _kernels
+except ImportError:
+    _kernels = None
+
 from .decode import (
     batch_decode_with_padded_kv_cache_return_lse,
     BatchDecodeWithPagedKVCacheWrapper,

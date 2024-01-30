@@ -15,7 +15,10 @@ limitations under the License.
 """
 import torch
 
-from . import _kernels
+try:
+    from . import _kernels
+except ImportError:
+    _kernels = None
 from .utils import TensorLayout, check_kv_layout
 
 

@@ -4,7 +4,6 @@ flashinfer.cascade
 ==================
 
 .. currentmodule:: flashinfer.cascade
-.. automodule:: flashinfer.cascade
 
 
 Merge Attention States
@@ -23,4 +22,14 @@ Cascade Attention
 .. autosummary::
     :toctree: ../../generated
 
-    
+    batch_decode_with_shared_prefix_padded_kv_cache
+
+
+Cascade Attention Wrapper Classes
+---------------------------------
+
+.. autoclass:: BatchDecodeWithSharedPrefixPagedKVCacheWrapper
+    :members:
+
+.. autoclass:: BatchPrefillWithSharedPrefixPagedKVCacheWrapper
+    :members:

@@ -18,7 +18,11 @@ from typing import Optional
 
 import torch
 
-from . import _kernels
+try:
+    from . import _kernels
+except ImportError:
+    _kernels = None
+
 from .utils import (
     RotaryMode,
     TensorLayout,

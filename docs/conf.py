@@ -10,8 +10,9 @@ import tlcpack_sphinx_addon
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
-
 sys.path.insert(0, os.path.abspath("../python"))
+
+import flashinfer
 
 project = 'FlashInfer'
 author = "FlashInfer Contributors"
