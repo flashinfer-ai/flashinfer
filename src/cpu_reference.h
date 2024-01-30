@@ -58,10 +58,10 @@ std::vector<dtype_out> single_mha(const std::vector<dtype_in>& q, const std::vec
   std::vector<float> att(kv_len);
   std::vector<float> q_rotary_local(head_dim);
   std::vector<float> k_rotary_local(head_dim);
-  SWITCH_GQA_GROUP_SIZE(
+  DISPATCH_GQA_GROUP_SIZE(
       num_q_heads / num_kv_heads, GROUP_SIZE,
-      {SWITCH_LAYOUT(
-          kv_layout, KV_LAYOUT, {SWITCH_HEAD_DIM(head_dim, HEAD_DIM, {
+      {DISPATCH_LAYOUT(
+          kv_layout, KV_LAYOUT, {DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
             tensor_info_t<KV_LAYOUT, GROUP_SIZE, HEAD_DIM> info(qo_len, kv_len, num_kv_heads);
             for (size_t qo_head_idx = 0; qo_head_idx < info.get_num_qo_heads(); ++qo_head_idx) {
               const size_t kv_head_idx = qo_head_idx / GROUP_SIZE;

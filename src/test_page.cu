@@ -286,7 +286,7 @@ void TestAppendPagedKVKernelCorrectness() {
       for (size_t num_heads : {32}) {
         for (QKVLayout kv_layout : {QKVLayout::kNHD, QKVLayout::kHND}) {
           for (size_t head_dim : {64, 128, 256}) {
-            SWITCH_LAYOUT(kv_layout, KV_LAYOUT, {
+            DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
               _TestAppendPagedKVKernelCorrectness<KV_LAYOUT, T>(page_size, batch_size, num_heads,
                                                                 head_dim);
             });
@@ -304,7 +304,7 @@ void TestPagedKVCacheToRaggedTensorCorrectness() {
       for (size_t num_heads : {32}) {
         for (QKVLayout kv_layout : {QKVLayout::kNHD, QKVLayout::kHND}) {
           for (size_t head_dim : {64, 128, 256}) {
-            SWITCH_LAYOUT(kv_layout, KV_LAYOUT, {
+            DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
               _TestPagedKVCacheToRaggedTensorCorrectness<KV_LAYOUT, T>(page_size, batch_size,
                                                                        num_heads, head_dim);
             });

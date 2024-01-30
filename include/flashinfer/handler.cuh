@@ -322,8 +322,8 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
     throw std::runtime_error(err_msg.str());
   }
 
-  SWITCH_NUM_FRAGS_X(
-      num_frags_x, NUM_FRAGS_X, {SWITCH_PAGE_SIZE(paged_kv.page_size, PAGE_SIZE, {
+  DISPATCH_NUM_FRAGS_X(
+      num_frags_x, NUM_FRAGS_X, {DISPATCH_PAGE_SIZE(paged_kv.page_size, PAGE_SIZE, {
         if constexpr (PAGE_SIZE == 0) {
           return BatchPrefillWithPagedKVCacheFallbackDispatched<
               page_storage, kv_layout, NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM, ROTARY_MODE,
@@ -351,21 +351,22 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
     cudaStream_t stream = nullptr) {
   const uint32_t num_kv_heads = paged_kv.num_heads;
   const uint32_t head_dim = paged_kv.head_dim;
-  SWITCH_GQA_GROUP_SIZE(
+  DISPATCH_GQA_GROUP_SIZE(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
-      {SWITCH_HEAD_DIM(
+      {DISPATCH_HEAD_DIM(
           head_dim, HEAD_DIM,
-          {SWITCH_CAUSAL(causal, CAUSAL,
-                         {SWITCH_ROTARY_MODE(
-                             rotary_mode, ROTARY_MODE,
-                             {SWITCH_ALLOW_FP16_QK_REDUCTION(
-                                 allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
-                                   return BatchPrefillWithPagedKVCacheWrapperDispatched<
-                                       page_storage, kv_layout, GROUP_SIZE, HEAD_DIM, ROTARY_MODE,
-                                       ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
-                                       handler, q, qo_indptr, paged_kv, o, lse, num_qo_heads,
-                                       rope_scale, rope_theta, stream);
-                                 })})})})});
+          {DISPATCH_CAUSAL(
+              causal, CAUSAL,
+              {DISPATCH_ROTARY_MODE(
+                  rotary_mode, ROTARY_MODE,
+                  {DISPATCH_ALLOW_FP16_QK_REDUCTION(
+                      allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
+                        return BatchPrefillWithPagedKVCacheWrapperDispatched<
+                            page_storage, kv_layout, GROUP_SIZE, HEAD_DIM, ROTARY_MODE,
+                            ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
+                            handler, q, qo_indptr, paged_kv, o, lse, num_qo_heads, rope_scale,
+                            rope_theta, stream);
+                      })})})})});
   return cudaSuccess;
 }
 
@@ -394,7 +395,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
     throw std::runtime_error(err_msg.str());
   }
 
-  SWITCH_NUM_FRAGS_X(num_frags_x, NUM_FRAGS_X, {
+  DISPATCH_NUM_FRAGS_X(num_frags_x, NUM_FRAGS_X, {
     return BatchPrefillWithRaggedKVCacheDispatched<NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
                                                    ROTARY_MODE, ALLOW_FP16_QK_REDUCTION, CAUSAL,
                                                    DTypeIn, DTypeOut, IdType>(
@@ -413,21 +414,22 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
     bool allow_fp16_qk_reduction = false, const float rope_scale = 1.f,
     const float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   constexpr QKVLayout KV_LAYOUT = QKVLayout::kNHD;
-  SWITCH_GQA_GROUP_SIZE(
+  DISPATCH_GQA_GROUP_SIZE(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
-      {SWITCH_HEAD_DIM(
+      {DISPATCH_HEAD_DIM(
           head_dim, HEAD_DIM,
-          {SWITCH_CAUSAL(causal, CAUSAL,
-                         {SWITCH_ROTARY_MODE(
-                             rotary_mode, ROTARY_MODE,
-                             {SWITCH_ALLOW_FP16_QK_REDUCTION(
-                                 allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
-                                   return BatchPrefillWithRaggedKVCacheWrapperDispatched<
-                                       GROUP_SIZE, HEAD_DIM, KV_LAYOUT, ROTARY_MODE,
-                                       ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
-                                       handler, q, qo_indptr, k, v, kv_indptr, o, lse, batch_size,
-                                       num_kv_heads, rope_scale, rope_theta, stream);
-                                 })})})})});
+          {DISPATCH_CAUSAL(
+              causal, CAUSAL,
+              {DISPATCH_ROTARY_MODE(
+                  rotary_mode, ROTARY_MODE,
+                  {DISPATCH_ALLOW_FP16_QK_REDUCTION(
+                      allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
+                        return BatchPrefillWithRaggedKVCacheWrapperDispatched<
+                            GROUP_SIZE, HEAD_DIM, KV_LAYOUT, ROTARY_MODE, ALLOW_FP16_QK_REDUCTION,
+                            CAUSAL, DTypeIn, DTypeOut, IdType>(
+                            handler, q, qo_indptr, k, v, kv_indptr, o, lse, batch_size,
+                            num_kv_heads, rope_scale, rope_theta, stream);
+                      })})})})});
   return cudaSuccess;
 }
 

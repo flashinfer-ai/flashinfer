@@ -62,7 +62,7 @@ torch::Tensor batch_prefill_with_paged_kv_cache(
   auto o = torch::empty_like(q, q.options());
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
-    SWITCH_LAYOUT(kv_layout, KV_LAYOUT, {
+    DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
       paged_kv_t<PageStorage::kIndices, KV_LAYOUT, c_type, int32_t> paged_kv(
           num_kv_heads, page_size, head_dim, batch_size, static_cast<c_type*>(kv_data.data_ptr()),
           static_cast<int32_t*>(kv_indices.data_ptr()), static_cast<int32_t*>(kv_indptr.data_ptr()),
@@ -162,7 +162,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
   }
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
-    SWITCH_LAYOUT(kv_layout_, KV_LAYOUT, {
+    DISPATCH_LAYOUT(kv_layout_, KV_LAYOUT, {
       paged_kv_t<PageStorage::kIndices, KV_LAYOUT, c_type, int32_t> paged_kv(
           num_kv_heads, page_size, head_dim, batch_size,
           static_cast<c_type*>(paged_kv_data.data_ptr()),

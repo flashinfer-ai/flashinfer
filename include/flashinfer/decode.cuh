@@ -735,12 +735,12 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& 
   if (seq_len <= 256U) {
     tmp_size = 0;
   } else {
-    SWITCH_GQA_GROUP_SIZE(
+    DISPATCH_GQA_GROUP_SIZE(
         num_qo_heads / num_kv_heads, GROUP_SIZE,
-        {SWITCH_HEAD_DIM(
+        {DISPATCH_HEAD_DIM(
             head_dim, HEAD_DIM,
-            {SWITCH_ROTARY_MODE(
-                rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(kv_layout, KV_LAYOUT, {
+            {DISPATCH_ROTARY_MODE(
+                rotary_mode, ROTARY_MODE, {DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
                   constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
                   constexpr uint32_t num_stages_smem = 2U;
                   constexpr uint32_t bdx = HEAD_DIM / vec_size;
@@ -817,12 +817,12 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
     throw std::invalid_argument(err_msg.str());
   }
 
-  SWITCH_GQA_GROUP_SIZE(
+  DISPATCH_GQA_GROUP_SIZE(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
-      {SWITCH_HEAD_DIM(
+      {DISPATCH_HEAD_DIM(
           head_dim, HEAD_DIM,
-          {SWITCH_ROTARY_MODE(
-              rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(kv_layout, KV_LAYOUT, {
+          {DISPATCH_ROTARY_MODE(
+              rotary_mode, ROTARY_MODE, {DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
                 constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
                 constexpr uint32_t num_stages_smem = 2U;
                 constexpr uint32_t bdx = HEAD_DIM / vec_size;
@@ -1055,10 +1055,10 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
     uint32_t& new_batch_size, uint32_t batch_size, IdType* kv_indptr, const uint32_t num_qo_heads,
     const uint32_t num_kv_heads, const uint32_t head_dim, const uint32_t page_size,
     const RotaryMode rotary_mode = RotaryMode::kNone, cudaStream_t stream = nullptr) {
-  SWITCH_GQA_GROUP_SIZE(
+  DISPATCH_GQA_GROUP_SIZE(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
-      {SWITCH_HEAD_DIM(
-          head_dim, HEAD_DIM, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
+      {DISPATCH_HEAD_DIM(
+          head_dim, HEAD_DIM, {DISPATCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
             constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
             constexpr uint32_t num_stages_smem = 2U;
             constexpr uint32_t bdx = HEAD_DIM / vec_size;
@@ -1226,10 +1226,10 @@ cudaError_t BatchDecodeWithPagedKVCache(
     throw std::invalid_argument(err_msg.str());
   }
 
-  SWITCH_GQA_GROUP_SIZE(
+  DISPATCH_GQA_GROUP_SIZE(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
-      {SWITCH_HEAD_DIM(
-          head_dim, HEAD_DIM, {SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
+      {DISPATCH_HEAD_DIM(
+          head_dim, HEAD_DIM, {DISPATCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
             return BatchDecodeWithPagedKVCacheDispatched<GROUP_SIZE, HEAD_DIM, page_storage,
                                                          kv_layout, ROTARY_MODE, DTypeIn, DTypeOut,
                                                          IdType>(
@@ -1295,12 +1295,12 @@ cudaError_t BatchDecodeWithPaddedKVCache(
     throw std::invalid_argument(err_msg.str());
   }
 
-  SWITCH_GQA_GROUP_SIZE(
+  DISPATCH_GQA_GROUP_SIZE(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
-      {SWITCH_HEAD_DIM(
+      {DISPATCH_HEAD_DIM(
           head_dim, HEAD_DIM,
-          {SWITCH_ROTARY_MODE(
-              rotary_mode, ROTARY_MODE, {SWITCH_LAYOUT(kv_layout, KV_LAYOUT, {
+          {DISPATCH_ROTARY_MODE(
+              rotary_mode, ROTARY_MODE, {DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
                 return BatchDecodeWithPaddedKVCacheDispatched<GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
                                                               ROTARY_MODE, DTypeIn, DTypeOut>(
                     q, k, v, o, tmp, lse, batch_size, padded_kv_len, num_qo_heads, rope_scale,
