@@ -1,7 +1,7 @@
 import os
 import sys
 
-import tlcpack_sphinx_addon
+# import tlcpack_sphinx_addon
 # Configuration file for the Sphinx documentation builder.
 #
 # For the full list of built-in configuration values, see the documentation:
@@ -25,12 +25,11 @@ release = "0.0.1"
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
 
 extensions = [
-    # "sphinx_tabs.tabs",
+    "sphinx_tabs.tabs",
     "sphinx.ext.autodoc",
     "sphinx.ext.napoleon",
     "sphinx.ext.autosummary",
-    # "sphinx.ext.mathjax",
-    # "sphinxcontrib.jquery",
+    "sphinx.ext.mathjax",
 ]
 
 source_suffix = [".rst"]
@@ -49,10 +48,10 @@ todo_include_todos = False
 # -- Options for HTML output ----------------------------------------------
 
 # The theme is set by the make target
-import sphinx_rtd_theme
+# import sphinx_rtd_theme
 
-html_theme = "sphinx_rtd_theme"
-html_theme_path = [sphinx_rtd_theme.get_html_theme_path()]
+html_theme = "furo" #"sphinx_rtd_theme"
+# html_theme_path = [sphinx_rtd_theme.get_html_theme_path()]
 
 templates_path = []
 
@@ -70,7 +69,11 @@ header_links = [
     ("Discussions", "https://github.com/orgs/flashinfer-ai/discussions"),
 ]
 
-# html_logo = "FlashInfer-white-background.png"
+html_static_path = ["_static"]
+html_theme_options = {
+    "light_logo": "FlashInfer-white-background.png",
+    "dark_logo": "FlashInfer-black-background.png",
+}
 
 html_context = {
     "footer_copyright": footer_copyright,
@@ -87,6 +90,5 @@ html_context = {
 }
 
 # add additional overrides
-templates_path += [tlcpack_sphinx_addon.get_templates_path()]
-html_static_path += [tlcpack_sphinx_addon.get_static_path()]
-
+# templates_path += [tlcpack_sphinx_addon.get_templates_path()]
+# html_static_path += [tlcpack_sphinx_addon.get_static_path()]

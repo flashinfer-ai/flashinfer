@@ -5,7 +5,7 @@ flashinfer.cascade
 
 .. currentmodule:: flashinfer.cascade
 
-
+.. _api-merge-states:
 
 Merge Attention States
 ----------------------
@@ -16,6 +16,8 @@ Merge Attention States
    merge_state
    merge_state_in_place
    merge_states
+
+.. _api-cascade-attention:
 
 Cascade Attention
 -----------------

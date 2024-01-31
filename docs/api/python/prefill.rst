@@ -21,4 +21,7 @@ Batch Prefill/Append Attention
 
 .. autoclass:: BatchPrefillWithPagedKVCacheWrapper
     :members:
+
+.. autoclass:: BatchPrefillWithRaggedKVCacheWrapper
+    :members:
     

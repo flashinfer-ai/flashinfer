@@ -8,12 +8,20 @@ Welcome to FlashInfer's documentation!
 
 `Discussion Forum <https://github.com/orgs/flashinfer-ai/discussions>`_ | `GitHub <https://github.com/flashinfer-ai/flashinfer/>`_
 
+FlashInfer is fast kernel library that implements operators in LLM serving.
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Get Started
+
+   installation
+
 .. toctree::
    :maxdepth: 2
    :caption: Tutorials
 
    tutorials/recursive_attention
-   tutorials/page_layout
+   tutorials/kv_layout
 
 .. toctree::
    :maxdepth: 2
@@ -24,10 +32,3 @@ Welcome to FlashInfer's documentation!
    api/python/cascade
    api/python/page
    
-.. toctree::
-   :maxdepth: 2
-   :caption: Language Bindings
-   :hidden:
-
-   deploy/tvm
-   deploy/cpp
