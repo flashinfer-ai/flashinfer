@@ -12,7 +12,7 @@ import tlcpack_sphinx_addon
 
 sys.path.insert(0, os.path.abspath("../python"))
 os.environ["BUILD_DOC"] = "1"
-
+autodoc_mock_imports = ["torch"]
 import flashinfer
 
 project = 'FlashInfer'
@@ -36,8 +36,6 @@ extensions = [
     "sphinx.ext.mathjax",
     # "sphinx_reredirects",
 ]
-
-autodoc_mock_imports = ["torch"]
 
 source_suffix = [".rst"]
 
