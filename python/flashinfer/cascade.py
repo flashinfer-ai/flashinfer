@@ -289,7 +289,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
 
         The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads``
         is not equal to ``num_kv_heads``, the function will use
-        `grouped query attention<https://arxiv.org/abs/2305.13245>`_.
+        `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
         """
         self._batch_decode_wrapper.begin_forward(
             unique_kv_indptr,

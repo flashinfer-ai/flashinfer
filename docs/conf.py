@@ -94,6 +94,6 @@ html_context = {
 }
 
 # add additional overrides
-# templates_path += [tlcpack_sphinx_addon.get_templates_path()]
-# html_static_path += [tlcpack_sphinx_addon.get_static_path()]
+templates_path += [tlcpack_sphinx_addon.get_templates_path()]
+html_static_path += [tlcpack_sphinx_addon.get_static_path()]
 

@@ -157,12 +157,12 @@ def batch_decode_with_padded_kv_cache(
         The padded key tensor, shape:
         ``[batch_size, padded_seq_len, num_kv_heads, head_dim]`` if :attr:`kv_layout`
         is ``NHD`` or ``[batch_size, num_kv_heads, padded_seq_len, head_dim]`` if
-        :attr:`kv_layout` is ``HND`.
+        :attr:`kv_layout` is ``HND``.
     v_padded : torch.Tensor
         The padded value tensor, shape:
         ``[batch_size, padded_seq_len, num_kv_heads, head_dim]`` if :attr:`kv_layout`
         is ``NHD`` or ``[batch_size, num_kv_heads, padded_seq_len, head_dim]`` if
-        :attr:`kv_layout` is ``HND`.
+        :attr:`kv_layout` is ``HND``.
     kv_layout : str
         The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
     rotary_mode : str
@@ -228,12 +228,12 @@ def batch_decode_with_padded_kv_cache_return_lse(
         The padded key tensor, shape:
         ``[batch_size, padded_seq_len, num_kv_heads, head_dim]`` if :attr:`kv_layout`
         is ``NHD`` or ``[batch_size, num_kv_heads, padded_seq_len, head_dim]`` if
-        :attr:`kv_layout` is ``HND`.
+        :attr:`kv_layout` is ``HND``.
     v_padded : torch.Tensor
         The padded value tensor, shape:
         ``[batch_size, padded_seq_len, num_kv_heads, head_dim]`` if :attr:`kv_layout`
         is ``NHD`` or ``[batch_size, num_kv_heads, padded_seq_len, head_dim]`` if
-        :attr:`kv_layout` is ``HND`.
+        :attr:`kv_layout` is ``HND``.
     kv_layout : str
         The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
     rotary_mode : str
