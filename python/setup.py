@@ -137,8 +137,10 @@ def get_instantiation_cu() -> list[str]:
 
 
 def get_version():
-    with open(root / "version.txt") as f:
-        version = f.read().strip()
+    version = os.getenv("FLASHINFER_BUILD_VERSION")
+    if version is None:
+        with open(root / "version.txt") as f:
+            version = f.read().strip()
     return version
 
 
