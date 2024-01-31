@@ -27,8 +27,8 @@ import flashinfer
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
 @pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
-@pytest.mark.parametrize("use_wrapper", [True, False])
 def test_batch_prefill_with_paged_kv_cache(
     batch_size,
     kv_len,
@@ -37,7 +37,7 @@ def test_batch_prefill_with_paged_kv_cache(
     num_kv_heads,
     num_qo_heads,
     head_dim,
-    use_wrapper,
+    causal,
     kv_layout,
 ):
     q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
@@ -57,30 +57,19 @@ def test_batch_prefill_with_paged_kv_cache(
         (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
     ).to(0)
 
-    if use_wrapper:
-        workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
-        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            workspace_buffer, kv_layout
-        )
-        wrapper.begin_forward(
-            q_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_len,
-            num_qo_heads,
-            num_kv_heads,
-        )
-        o = wrapper.forward(q, kv_data)
-    else:
-        o = flashinfer.batch_prefill_with_paged_kv_cache(
-            q,
-            q_indptr,
-            kv_data,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_len,
-            kv_layout=kv_layout,
-        )
+    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout
+    )
+    wrapper.begin_forward(
+        q_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+    )
+    o = wrapper.forward(q, kv_data, causal=causal)
 
     for i in range(batch_size):
         perm_dims = [0, 2, 1, 3] if kv_layout == "HND" else [0, 1, 2, 3]
@@ -116,12 +105,55 @@ def test_batch_prefill_with_paged_kv_cache(
             ],
             dim=0,
         )
-        o_ref_i = flashinfer.single_prefill_with_kv_cache(qi, ki, vi, True)
+        o_ref_i = flashinfer.single_prefill_with_kv_cache(qi, ki, vi, causal=causal)
+        o_i_np = o[q_indptr[i] : q_indptr[i + 1]].cpu().numpy()
+        o_ref_i_np = o_ref_i.cpu().numpy()
+        numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("batch_size", [12, 17])
+@pytest.mark.parametrize("kv_len", [54, 97])
+@pytest.mark.parametrize("qo_len", [37, 17])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("causal", [False, True])
+def test_batch_prefill_with_ragged_kv_cache(
+    batch_size, kv_len, qo_len, num_kv_heads, num_qo_heads, head_dim, causal
+):
+    kv_layout = "NHD"
+    q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
+    q_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
+
+    k = torch.randn(batch_size * kv_len, num_kv_heads, head_dim).to(0).half()
+    v = torch.randn(batch_size * kv_len, num_kv_heads, head_dim).to(0).half()
+    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len
+
+    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace_buffer, kv_layout
+    )
+    wrapper.begin_forward(
+        q_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+    )
+    o = wrapper.forward(q, k, v, causal=causal)
+
+    for i in range(batch_size):
+        o_ref_i = flashinfer.single_prefill_with_kv_cache(
+            q[q_indptr[i] : q_indptr[i + 1]],
+            k[kv_indptr[i] : kv_indptr[i + 1]],
+            v[kv_indptr[i] : kv_indptr[i + 1]],
+            causal=causal,
+        )
         o_i_np = o[q_indptr[i] : q_indptr[i + 1]].cpu().numpy()
         o_ref_i_np = o_ref_i.cpu().numpy()
         numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":
-    test_batch_prefill_with_paged_kv_cache(12, 54, 37, 8, 8, 8, 128, False, "HND")
-    test_batch_prefill_with_paged_kv_cache(12, 54, 37, 1, 8, 8, 128, False, "HND")
+    test_batch_prefill_with_paged_kv_cache(12, 54, 37, 8, 8, 8, 128, True, "HND")
+    test_batch_prefill_with_paged_kv_cache(12, 54, 37, 1, 8, 8, 128, True, "HND")
+    test_batch_prefill_with_ragged_kv_cache(12, 54, 37, 8, 8, 8, 128, True)

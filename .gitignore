@@ -1,3 +1,7 @@
+# Generated cu files
+python/csrc/generated/
+python/flashinfer/_build_meta.py
+
 microbenchmark/
 .vscode/
 

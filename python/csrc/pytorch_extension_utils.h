@@ -16,6 +16,8 @@
 #pragma once
 #include <torch/extension.h>
 
+#include "generated/dispatch.inc"
+
 #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...) \
   [&]() -> bool {                                                   \
     switch (pytorch_dtype) {                                        \
@@ -31,6 +33,28 @@
         return false;                                               \
     }                                                               \
   }()
+
+#define _DISPATCH_SWITCH(cond, ...) \
+  [&]() -> bool {                   \
+    switch (cond) {                 \
+      __VA_ARGS__                   \
+      default:                      \
+        return false;               \
+    }                               \
+  }()
+
+#define _DISPATCH_CASE(case_expr, var, ...) \
+  case case_expr: {                         \
+    constexpr auto var = case_expr;         \
+    return __VA_ARGS__();                   \
+  }
+
+#define DISPATCH_group_size(expr, ...) \
+  _DISPATCH_SWITCH(expr, _DISPATCH_CASES_group_size(__VA_ARGS__))
+
+#define DISPATCH_page_size(expr, ...) _DISPATCH_SWITCH(expr, _DISPATCH_CASES_page_size(__VA_ARGS__))
+
+#define DISPATCH_head_dim(expr, ...) _DISPATCH_SWITCH(expr, _DISPATCH_CASES_head_dim(__VA_ARGS__))
 
 inline void check_shape(const torch::Tensor& a, const torch::Tensor& b, const char* a_name,
                         const char* b_name) {

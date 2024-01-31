@@ -22,7 +22,7 @@ from .decode import (
 from .prefill import (
     single_prefill_with_kv_cache,
     single_prefill_with_kv_cache_return_lse,
-    batch_prefill_with_paged_kv_cache,
+    BatchPrefillWithRaggedKVCacheWrapper,
     BatchPrefillWithPagedKVCacheWrapper,
 )
 from .cascade import (

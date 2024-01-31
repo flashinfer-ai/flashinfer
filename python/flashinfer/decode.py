@@ -140,7 +140,8 @@ def batch_decode_with_padded_kv_cache(
         sm_scale,
         rope_scale,
         rope_theta,
-    )
+        False,
+    )[0]
 
 
 def batch_decode_with_padded_kv_cache_return_lse(
@@ -191,7 +192,7 @@ def batch_decode_with_padded_kv_cache_return_lse(
         rope_scale = 1.0
     if rope_theta is None:
         rope_theta = 1e4
-    return _kernels.batch_decode_with_padded_kv_cache_return_lse(
+    return _kernels.batch_decode_with_padded_kv_cache(
         q,
         k_padded,
         v_padded,
@@ -200,6 +201,7 @@ def batch_decode_with_padded_kv_cache_return_lse(
         sm_scale,
         rope_scale,
         rope_theta,
+        True,
     )
 
 

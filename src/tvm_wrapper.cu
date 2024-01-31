@@ -202,8 +202,8 @@ cudaError_t _BatchPrefillWithPagedKVCacheWrapper(
                          return BatchPrefillWithPagedKVCacheWrapperDispatched<
                              page_storage, kv_layout, GROUP_SIZE, /*head_dim=*/128, ROTARY_MODE,
                              /*allow_fp16_qk_reduction=*/false, CAUSAL, DTypeIn, DTypeOut, IdType>(
-                             handler, q, qo_indptr, paged_kv, o, lse, num_qo_heads, rope_scale,
-                             rope_theta, stream);
+                             handler, q, qo_indptr, paged_kv, o, lse, rope_scale, rope_theta,
+                             stream);
                        })})});
   return cudaSuccess;
 }

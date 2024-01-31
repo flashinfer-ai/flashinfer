@@ -106,7 +106,8 @@ def single_prefill_with_kv_cache(
         allow_fp16_qk_reduction,
         rope_scale,
         rope_theta,
-    )
+        False,
+    )[0]
 
 
 def single_prefill_with_kv_cache_return_lse(
@@ -167,7 +168,7 @@ def single_prefill_with_kv_cache_return_lse(
         rope_scale = 1.0
     if rope_theta is None:
         rope_theta = 1e4
-    return _kernels.single_prefill_with_kv_cache_return_lse(
+    return _kernels.single_prefill_with_kv_cache(
         q,
         k,
         v,
@@ -178,43 +179,7 @@ def single_prefill_with_kv_cache_return_lse(
         allow_fp16_qk_reduction,
         rope_scale,
         rope_theta,
-    )
-
-
-def batch_prefill_with_paged_kv_cache(
-    q: torch.Tensor,
-    q_indptr: torch.Tensor,
-    kv_data: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    kv_indices: torch.Tensor,
-    kv_last_page_len: torch.Tensor,
-    casual: bool = True,
-    kv_layout: str = "NHD",
-    rotary_mode: str = "NONE",
-    allow_fp16_qk_reduction: bool = False,
-    rope_scale: Optional[float] = None,
-    rope_theta: Optional[float] = None,
-):
-    check_rotary_mode(rotary_mode)
-    check_kv_layout(kv_layout)
-    if rope_scale is None:
-        rope_scale = 1.0
-    if rope_theta is None:
-        rope_theta = 1e4
-    kv_data = expand_5d(kv_data, kv_layout)
-    return _kernels.batch_prefill_with_paged_kv_cache(
-        q,
-        q_indptr,
-        kv_data,
-        kv_indptr,
-        kv_indices,
-        kv_last_page_len,
-        casual,
-        getattr(TensorLayout, kv_layout),
-        getattr(RotaryMode, rotary_mode),
-        allow_fp16_qk_reduction,
-        rope_scale,
-        rope_theta,
+        True,
     )
 
 
@@ -315,6 +280,102 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._paged_kv_indptr,
             self._paged_kv_indices,
             self._paged_kv_last_page_len,
+            causal,
+            getattr(RotaryMode, rotary_mode),
+            allow_fp16_qk_reduction,
+            rope_scale,
+            rope_theta,
+            True,
+        )
+
+
+class BatchPrefillWithRaggedKVCacheWrapper:
+    r"""Wrapper class of batch_prefill_with_ragged_kv_cache kernel."""
+
+    def __init__(self, workspace_buffer: torch.Tensor, kv_layout: str = "NHD"):
+        check_kv_layout(kv_layout)
+        self._kv_layout = kv_layout
+        self._workspace_buffer = workspace_buffer
+        self._wrapper = _kernels.BatchPrefillWithRaggedKVCachePyTorchWrapper(
+            getattr(TensorLayout, kv_layout)
+        )
+        self._qo_indptr = None
+        self._kv_indptr = None
+
+    def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
+        self._workspace_buffer = new_workspace_buffer
+
+    def begin_forward(
+        self,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        num_qo_heads: int,
+        num_kv_heads: int,
+    ):
+        batch_size = len(qo_indptr) - 1
+        self._qo_indptr = qo_indptr
+        self._kv_indptr = kv_indptr
+        self._wrapper.begin_forward(
+            self._workspace_buffer, qo_indptr, batch_size, num_qo_heads, num_kv_heads
+        )
+
+    def end_forward(self):
+        self._qo_indptr = None
+        self._kv_indptr = None
+        self._wrapper.end_forward()
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        causal: bool = True,
+        rotary_mode: str = "NONE",
+        allow_fp16_qk_reduction: bool = False,
+        rope_scale: Optional[float] = None,
+        rope_theta: Optional[float] = None,
+    ):
+        check_rotary_mode(rotary_mode)
+        if rope_scale is None:
+            rope_scale = 1.0
+        if rope_theta is None:
+            rope_theta = 1e4
+        return self._wrapper.forward(
+            q,
+            self._qo_indptr,
+            k,
+            v,
+            self._kv_indptr,
+            causal,
+            getattr(RotaryMode, rotary_mode),
+            allow_fp16_qk_reduction,
+            rope_scale,
+            rope_theta,
+            False,
+        )[0]
+
+    def forward_return_lse(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        causal: bool = True,
+        rotary_mode: str = "NONE",
+        allow_fp16_qk_reduction: bool = False,
+        rope_scale: Optional[float] = None,
+        rope_theta: Optional[float] = None,
+    ):
+        check_rotary_mode(rotary_mode)
+        if rope_scale is None:
+            rope_scale = 1.0
+        if rope_theta is None:
+            rope_theta = 1e4
+        return self._wrapper.forward(
+            q,
+            self._qo_indptr,
+            k,
+            v,
+            self._kv_indptr,
             causal,
             getattr(RotaryMode, rotary_mode),
             allow_fp16_qk_reduction,
