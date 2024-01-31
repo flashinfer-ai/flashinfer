@@ -72,7 +72,7 @@ header_links = [
 ]
 
 # html_logo = "https://raw.githubusercontent.com/flashinfer-ai/web-data/main/logo/FlashInfer-white-background.png"
-html_logo = "FlashInfer-white-background.png"
+# html_logo = "FlashInfer-white-background.png"
 
 html_context = {
     "footer_copyright": footer_copyright,
