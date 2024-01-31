@@ -37,7 +37,7 @@ The **attention state** on the entire sequence can be defined as:
 
   \begin{bmatrix}\mathbf{v}(\{1,2,\dots, n\})\\s(\{1,2,\dots, n\})\end{bmatrix} = \bigoplus_{i=1}^{n} \begin{bmatrix}\mathbf{v}_i\\s_i\end{bmatrix}
 
-Then $\mathbf{v}(\{1,2,\dots, n\})$ is the final attention output.
+Then :math:`\mathbf{v}(\{1,2,\dots, n\})` is the final attention output.
 
 .. note::
 
