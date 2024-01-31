@@ -15,10 +15,21 @@ limitations under the License.
 """
 import math
 from typing import Optional, Union
-
 import torch
 
-from . import _kernels
+try:
+    from . import _kernels
+except ImportError as e:
+    import os
+    import logging
+
+    if os.environ.get("BUILD_DOC", "0") == "1":
+        _kernels = None
+        logging.warning("Kernels are not loaded in documentation build mode.")
+    else:
+        raise e
+
+
 from .utils import (
     RotaryMode,
     TensorLayout,
@@ -43,35 +54,64 @@ def single_decode_with_kv_cache(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    rotary_mode: str = "NONE",
     kv_layout: str = "NHD",
+    rotary_mode: str = "NONE",
     sm_scale: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
 ):
-    r"""Single request decode with KV cache.
+    r"""Decode attention with KV Cache for single request, return attention output.
 
     Parameters
     ----------
     q : torch.Tensor
-        Shape: [num_qo_heads, head_dim]
+        The query tensor, shape: ``[num_qo_heads, head_dim]``.
     k : torch.Tensor
-        Shape: [kv_len, num_kv_heads, head_dim] if NHD
-               [num_kv_heads, kv_len, head_dim] if HND
+        The key tensor, shape: ``[kv_len, num_kv_heads, head_dim]`` if :attr:`kv_layout`
+        is ``NHD``, or ``[num_kv_heads, kv_len, head_dim]`` if :attr:`kv_layout` is
+        ``HND``.
     v : torch.Tensor
-        Shape: [kv_len, num_kv_heads, head_dim] if NHD
-               [num_kv_heads, kv_len, head_dim] if HND
-    rotary_mode : str
-        Whether to apply rotary embeddings inside attention kernels, could be
-        "NONE" or "LLAMA".
+        The value tensor, shape: ``[kv_len, num_kv_heads, head_dim]`` if
+        :attr:`kv_layout` is ``NHD``, or ``[num_kv_heads, kv_len, head_dim]`` if
+        :attr:`kv_layout` is ``HND``.
     kv_layout : str
-        The layout of the input k/v tensors, could be either "NHD" or "HND".
+        The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
+    rotary_mode : str
+        Whether to apply RoPE on-the-fly inside attention kernels, could be
+        ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
     sm_scale : Optional[float]
-        The scale of softmax, if not provided, will be set to 1 / sqrt(head_dim)
+        The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
     rope_scale : Optional[float]
-        The scale used in RoPE interpolation, if not provided, will be set to 1.0.
+        The scale used in RoPE interpolation, if not provided, will be set to ``1.0``.
     rope_theta : Optional[float]
-        The theta used in RoPE, if not provided, will be set to 1e4.
+        The theta used in RoPE, if not provided, will be set to ``1e4``.
+
+    Returns
+    -------
+    torch.Tensor
+        The attention output, shape: ``[num_qo_heads, head_dim]``
+
+    Examples
+    --------
+
+    >>> import torch
+    >>> import flashinfer
+    >>> kv_len = 4096
+    >>> num_qo_heads = 32
+    >>> num_kv_heads = 32
+    >>> head_dim = 128
+    >>> q = torch.randn(num_qo_heads, head_dim).half().to("cuda:0")
+    >>> k = torch.randn(kv_len, num_kv_heads, head_dim).half().to("cuda:0")
+    >>> v = torch.randn(kv_len, num_kv_heads, head_dim).half().to("cuda:0")
+    >>> o = flashinfer.single_decode_with_kv_cache(q, k, v)
+    >>> o.shape
+    torch.Size([32, 128])
+
+    Notes
+    -----
+    The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads`` is
+    not equal to ``num_kv_heads``, the function will use
+    `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
     """
     check_rotary_mode(rotary_mode)
     check_kv_layout(kv_layout)
@@ -106,23 +146,45 @@ def batch_decode_with_padded_kv_cache(
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
 ):
-    r"""Batch decode with padded KV cache.
+    r"""Decode attention with padded KV cache for batch of requests, return attention
+    output.
 
     Parameters
     ----------
     q : torch.Tensor
-        Shape: [batch_size, num_qo_heads, head_dim]
+        The query tensor, shape: ``[batch_size, num_qo_heads, head_dim]``.
     k_padded : torch.Tensor
-        Shape: [batch_size, padded_seq_len, num_kv_heads, head_dim] if NHD
-               [batch_size, num_kv_heads, padded_seq_len, head_dim] if HND
+        The padded key tensor, shape:
+        ``[batch_size, padded_seq_len, num_kv_heads, head_dim]`` if :attr:`kv_layout`
+        is ``NHD`` or ``[batch_size, num_kv_heads, padded_seq_len, head_dim]`` if
+        :attr:`kv_layout` is ``HND``.
     v_padded : torch.Tensor
-        Shape: [batch_size, padded_seq_len, num_kv_heads, head_dim] if NHD
-               [batch_size, num_kv_heads, padded_seq_len, head_dim] if HND
+        The padded value tensor, shape:
+        ``[batch_size, padded_seq_len, num_kv_heads, head_dim]`` if :attr:`kv_layout`
+        is ``NHD`` or ``[batch_size, num_kv_heads, padded_seq_len, head_dim]`` if
+        :attr:`kv_layout` is ``HND``.
+    kv_layout : str
+        The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
+    rotary_mode : str
+        Whether to apply RoPE on-the-fly inside attention kernels, could be
+        ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
+    sm_scale : Optional[float]
+        The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
+    rope_scale : Optional[float]
+        The scale used in RoPE interpolation, if not provided, will be set to ``1.0``.
+    rope_theta : Optional[float]
+        The theta used in RoPE, if not provided, will be set to ``1e4``.
 
     Returns
     -------
-    V : torch.Tensor
-        Shape: [batch_size, num_heads, head_dim]
+    torch.Tensor
+        The attention output, shape: ``[batch_size, num_qo_heads, head_dim]``.
+
+    Notes
+    -----
+    The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads`` is
+    not equal to ``num_kv_heads``, the function will use
+    `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
     """
     if sm_scale is None:
         head_dim = q.shape[-1]
@@ -154,36 +216,48 @@ def batch_decode_with_padded_kv_cache_return_lse(
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
 ):
-    r"""
+    r"""Decode attention with padded KV cache for batch of requests, return attention
+    output and logsumexp of attention scores, return attention output and logsumexp of
+    attention scores.
+
     Parameters
     ----------
     q : torch.Tensor
-        Shape: [batch_size, num_qo_heads, head_dim]
+        The query tensor, shape: ``[batch_size, num_qo_heads, head_dim]``.
     k_padded : torch.Tensor
-        Shape: [batch_size, padded_seq_len, num_kv_heads, head_dim] if NHD
-               [batch_size, num_kv_heads, padded_seq_len, head_dim] if HND
+        The padded key tensor, shape:
+        ``[batch_size, padded_seq_len, num_kv_heads, head_dim]`` if :attr:`kv_layout`
+        is ``NHD`` or ``[batch_size, num_kv_heads, padded_seq_len, head_dim]`` if
+        :attr:`kv_layout` is ``HND``.
     v_padded : torch.Tensor
-        Shape: [batch_size, padded_seq_len, num_kv_heads, head_dim] if NHD
-               [batch_size, num_kv_heads, padded_seq_len, head_dim] if HND
-    kv_layout: str
-        The layout of the input k_padded/v_padded tensors, could be either
-        "NHD" or "HND"
-    rotary_mode: str
-        Whether to apply rotary embeddings inside attention kernels, could be
-        "NONE" or "LLAMA".
-    sm_scale: Optional[float]
-        The scale of softmax, if not provided, will be set to 1 / sqrt(head_dim)
-    rope_scale: Optional[float]
-        The scale used in RoPE interpolation, if not provided, will be set to 1.0.
-    rope_theta: Optional[float]
-        The theta used in RoPE, if not provided, will be set to 1e4.
+        The padded value tensor, shape:
+        ``[batch_size, padded_seq_len, num_kv_heads, head_dim]`` if :attr:`kv_layout`
+        is ``NHD`` or ``[batch_size, num_kv_heads, padded_seq_len, head_dim]`` if
+        :attr:`kv_layout` is ``HND``.
+    kv_layout : str
+        The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
+    rotary_mode : str
+        Whether to apply RoPE on-the-fly inside attention kernels, could be
+        ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
+    sm_scale : Optional[float]
+        The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
+    rope_scale : Optional[float]
+        The scale used in RoPE interpolation, if not provided, will be set to ``1.0``.
+    rope_theta : Optional[float]
+        The theta used in RoPE, if not provided, will be set to ``1e4``.
 
     Returns
     -------
     V : torch.Tensor
-        Shape: [batch_size, num_heads, head_dim]
+        The attention output, shape: [batch_size, num_qo_heads, head_dim]
     S : torch.Tensor
-        Shape: [batch_size, num_heads]
+        The logsumexp of attention scores, Shape: [batch_size, num_qo_heads]
+
+    Notes
+    -----
+    The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads`` is
+    not equal to ``num_kv_heads``, the function will use
+    `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
     """
     if sm_scale is None:
         head_dim = q.shape[-1]
@@ -206,15 +280,31 @@ def batch_decode_with_padded_kv_cache_return_lse(
 
 
 class BatchDecodeWithPagedKVCacheWrapper:
-    r"""Wrapper class for batch_decode_with_paged_kv_cache kernel.
+    r"""Wrapper class for decode attention with paged kv-cache (first proposed in
+    `vLLM <https://arxiv.org/abs/2309.06180>`_) for batch of requests.
 
-    To accelerate computation, FlashInfer's batch decode operators creates some
+    Check :ref:`our tutorial<page-layout>` for page table layout.
+
+    Note
+    ----
+    To accelerate computation, FlashInfer's batch decode attention creates some
     auxiliary data structures, these data structures can be reused across multiple
-    batch decode calls (e.g. different Transformer layers). This wrapper class manages
-    the lifecycle of these data structures.
+    batch decode attention calls (e.g. different Transformer layers). This wrapper class
+    manages the lifecycle of these data structures.
     """
 
     def __init__(self, workspace_buffer: torch.Tensor, kv_layout: str = "NHD"):
+        r"""Constructor of :class:`BatchDecodeWithPagedKVCacheWrapper`.
+
+        Parameters
+        ----------
+        workspace_buffer : torch.Tensor
+            The user reserved workspace buffer used to store auxiliary data structures,
+            recommended size is 16MB, the device of the workspace buffer should be the
+            same as the device of the input tensors.
+        kv_layout : str
+            The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
+        """
         check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
         self._workspace_buffer = workspace_buffer
@@ -226,6 +316,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._paged_kv_last_page_len = None
 
     def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
+        r"""Reset the workspace buffer.
+
+        Parameters
+        ----------
+        new_workspace_buffer : torch.Tensor
+            The new workspace buffer, the device of the new workspace buffer should
+            be the same as the device of the input tensors.
+        """
         self._workspace_buffer = new_workspace_buffer
 
     def begin_forward(
@@ -240,9 +338,41 @@ class BatchDecodeWithPagedKVCacheWrapper:
         rotary_mode: str = "NONE",
         data_type: Union[str, torch.dtype] = "float16",
     ):
-        r"""The begin_forward method should be called before any batch decode calls,
-        auxiliary data structures will be created during this call and cached for
-        multiple forward calls.
+        r"""Create auxiliary data structures for batch decode for multiple forward calls
+        within the same decode step.
+
+        Parameters
+        ----------
+        indptr : torch.Tensor
+            The indptr of the paged kv cache, shape: ``[batch_size + 1]``
+        indices : torch.Tensor
+            The page indices of the paged kv cache, shape: ``[qo_indptr[-1]]``
+        last_page_len : torch.Tensor
+            The number of entries in the last page of each request in the paged kv
+            cache, shape: ``[batch_size]``
+        num_qo_heads : int
+            The number of query/output heads
+        num_kv_heads : int
+            The number of key/value heads
+        head_dim : int
+            The dimension of the heads
+        page_size : int
+            The page size of the paged kv cache
+        rotary_mode : str
+            Whether to apply RoPE on-the-fly inside attention kernels, could be
+            ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
+        data_type : Union[str, torch.dtype]
+            The data type of the paged kv cache
+
+        Note
+        ----
+        The :meth:`begin_forward` method should be called before any :meth:`forward` or
+        :meth:`forward_return_lse` calls, auxiliary data structures will be created
+        during this call and cached for multiple forward calls.
+
+        The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads``
+        is not equal to ``num_kv_heads``, the function will use
+        `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
         """
         self._paged_kv_indptr = indptr
         self._paged_kv_indices = indices
@@ -270,7 +400,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         )
 
     def end_forward(self):
-        r"""The end_forward method can clear the cached data structures."""
+        r"""Clear auxiliary data structures created by :meth:`begin_forward`."""
         self._paged_kv_indptr = None
         self._paged_kv_indices = None
         self._paged_kv_last_page_len = None
@@ -284,6 +414,32 @@ class BatchDecodeWithPagedKVCacheWrapper:
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
     ):
+        r"""Compute batch decode attention between query and paged kv cache.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            The query tensor, shape: ``[batch_size, num_qo_heads, head_dim]``
+        paged_kv_data : torch.Tensor
+            A 5-D tensor of the reserved paged kv-cache data, shape:
+            ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
+            :attr:`kv_layout` is ``NHD``, or
+            ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
+            :attr:`kv_layout` is ``HND``.
+        rotary_mode : str
+            Whether to apply RoPE on-the-fly inside attention kernels, could be
+            ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
+        rope_scale : Optional[float]
+            The scale used in RoPE interpolation, if not provided, will be set to
+            ``1.0``.
+        rope_theta : Optional[float]
+            The theta used in RoPE, if not provided, will be set to ``1e4``.
+
+        Returns
+        -------
+        torch.Tensor
+            The attention output, shape: ``[batch_size, num_qo_heads, head_dim]``.
+        """
         check_rotary_mode(rotary_mode)
         if rope_scale is None:
             rope_scale = 1.0
@@ -310,6 +466,35 @@ class BatchDecodeWithPagedKVCacheWrapper:
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
     ):
+        r"""Compute batch decode attention with paged kv cache, return attention output
+        and logsumexp of attention scores.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            The query tensor, shape: ``[batch_size, num_qo_heads, head_dim]``
+        paged_kv_data : torch.Tensor
+            A 5-D tensor of the reserved paged kv-cache data, shape:
+            ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
+            :attr:`kv_layout` is ``NHD``, or
+            ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
+            :attr:`kv_layout` is ``HND``.
+        rotary_mode : str
+            Whether to apply RoPE on-the-fly inside attention kernels, could be
+            ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
+        rope_scale : Optional[float]
+            The scale used in RoPE interpolation, if not provided, will be set to
+            ``1.0``.
+        rope_theta : Optional[float]
+            The theta used in RoPE, if not provided, will be set to ``1e4``.
+
+        Returns
+        -------
+        V : torch.Tensor
+            The attention output, shape: ``[batch_size, num_qo_heads, head_dim]``.
+        S : torch.Tensor
+            The logsumexp of attention scores, Shape: ``[batch_size, num_qo_heads]``.
+        """
         check_rotary_mode(rotary_mode)
         if rope_scale is None:
             rope_scale = 1.0
