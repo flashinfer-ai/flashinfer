@@ -12,8 +12,6 @@ import tlcpack_sphinx_addon
 
 sys.path.insert(0, os.path.abspath("../python"))
 
-import flashinfer
-
 project = 'FlashInfer'
 author = "FlashInfer Contributors"
 footer_copyright = '2023-2024, {}'.format(author)
@@ -26,10 +24,13 @@ release = "0.0.1"
 
 extensions = [
     "sphinx_tabs.tabs",
+    "sphinx.ext.autodoc",
     "sphinx_toolbox.collapse",
     "sphinxcontrib.httpdomain",
     "sphinx.ext.autodoc",
+    "sphinx.ext.mathjax",
     "sphinx.ext.napoleon",
+    "sphinx.ext.autosummary",
     "sphinx_reredirects",
 ]
 
@@ -40,7 +41,7 @@ language = "en"
 exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 
 # The name of the Pygments (syntax highlighting) style to use.
-pygments_style = "sphinx"
+pygments_style = "colorful"
 
 # A list of ignored prefixes for module index sorting.
 # If true, `todo` and `todoList` produce output, else they produce nothing.
@@ -70,7 +71,7 @@ header_links = [
     ("Discussions", "https://github.com/orgs/flashinfer-ai/discussions"),
 ]
 
-html_logo = "_static/FlashInfer-right-background.png"
+# html_logo = "_static/FlashInfer-white-background.png"
 
 html_context = {
     "footer_copyright": footer_copyright,

@@ -157,8 +157,7 @@ def single_prefill_with_kv_cache_return_lse(
     -------
     V : torch.Tensor
         The attention output.
-        Shape: [qo_len, num_qo_heads, head_dim] if NHD
-               [num_qo_heads, qo_len, head_dim] if HND
+        Shape: [qo_len, num_qo_heads, head_dim] if NHD, [num_qo_heads, qo_len, head_dim] if HND
     S : torch.Tensor
         The logsumexp value.
         Shape: [qo_len, num_qo_heads]

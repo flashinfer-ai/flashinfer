@@ -10,7 +10,7 @@ Welcome to FlashInfer's documentation!
 
 .. toctree::
    :maxdepth: 2
-   :caption: Page Layout
+   :caption: Tutorials
 
    tutorials/recursive_softmax
    tutorials/page_layout
@@ -29,4 +29,5 @@ Welcome to FlashInfer's documentation!
    api/python/decode
    api/python/prefill
    api/python/cascade
+   api/python/page
    

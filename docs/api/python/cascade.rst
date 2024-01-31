@@ -1,4 +1,4 @@
-.. _apidata:
+.. _apicascade:
 
 flashinfer.cascade
 ==================
@@ -6,23 +6,24 @@ flashinfer.cascade
 .. currentmodule:: flashinfer.cascade
 
 
+
 Merge Attention States
 ----------------------
 
 .. autosummary::
-    :toctree: ../../generated
+   :toctree: ../../generated
 
-    merge_state
-    merge_state_in_place
-    merge_states
+   merge_state
+   merge_state_in_place
+   merge_states
 
 Cascade Attention
 -----------------
 
 .. autosummary::
-    :toctree: ../../generated
+   :toctree: ../../generated
 
-    batch_decode_with_shared_prefix_padded_kv_cache
+   batch_decode_with_shared_prefix_padded_kv_cache
 
 
 Cascade Attention Wrapper Classes

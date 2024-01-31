@@ -76,6 +76,11 @@ def single_decode_with_kv_cache(
         The scale used in RoPE interpolation, if not provided, will be set to 1.0.
     rope_theta : Optional[float]
         The theta used in RoPE, if not provided, will be set to 1e4.
+    
+    Returns
+    -------
+    V : torch.Tensor
+        The attention output, shape: [num_qo_heads, head_dim]
     """
     check_rotary_mode(rotary_mode)
     check_kv_layout(kv_layout)
@@ -158,7 +163,8 @@ def batch_decode_with_padded_kv_cache_return_lse(
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
 ):
-    r"""
+    r"""Batch decode with padded KV cache, return attention output and logsumexp of attention scores.
+
     Parameters
     ----------
     q : torch.Tensor
@@ -185,9 +191,9 @@ def batch_decode_with_padded_kv_cache_return_lse(
     Returns
     -------
     V : torch.Tensor
-        Shape: [batch_size, num_heads, head_dim]
+        The attention output, shape: [batch_size, num_heads, head_dim]
     S : torch.Tensor
-        Shape: [batch_size, num_heads]
+        The logsumexp of attention scores, Shape: [batch_size, num_heads]
     """
     if sm_scale is None:
         head_dim = q.shape[-1]
@@ -210,8 +216,10 @@ def batch_decode_with_padded_kv_cache_return_lse(
 
 
 class BatchDecodeWithPagedKVCacheWrapper:
-    r"""Wrapper class for batch_decode_with_paged_kv_cache kernel.
+    r"""Wrapper class for batch decoding operator where the k/v history are stored in paged kv cache.
 
+    Note
+    -----
     To accelerate computation, FlashInfer's batch decode operators creates some
     auxiliary data structures, these data structures can be reused across multiple
     batch decode calls (e.g. different Transformer layers). This wrapper class manages
@@ -219,6 +227,17 @@ class BatchDecodeWithPagedKVCacheWrapper:
     """
 
     def __init__(self, workspace_buffer: torch.Tensor, kv_layout: str = "NHD"):
+        r"""Constructor of BatchDecodeWithPagedKVCacheWrapper.
+
+        Parameters
+        ----------
+        workspace_buffer : torch.Tensor
+            The user reserved workspace buffer used to store auxiliary data structures,
+            recommended size is 16MB, the device of the workspace buffer should be the
+            same as the device of the input tensors.
+        kv_layout : str
+            The layout of the input k/v tensors, could be either "NHD" or "HND".
+        """
         check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
         self._workspace_buffer = workspace_buffer
@@ -230,6 +249,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._paged_kv_last_page_len = None
 
     def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
+        r"""Reset the workspace buffer.
+
+        Parameters
+        ----------
+        new_workspace_buffer : torch.Tensor
+            The new workspace buffer, the device of the new workspace buffer should
+            be the same as the device of the input tensors.
+        """
         self._workspace_buffer = new_workspace_buffer
 
     def begin_forward(
@@ -244,7 +271,34 @@ class BatchDecodeWithPagedKVCacheWrapper:
         rotary_mode: str = "NONE",
         data_type: Union[str, torch.dtype] = "float16",
     ):
-        r"""The begin_forward method should be called before any batch decode calls,
+        r"""Create auxiliary data structures for batch decode for multiple forward calls
+        within the same decode step.
+
+        Parameters
+        ----------
+        indptr : torch.Tensor
+            The indptr of the paged kv cache, shape: [batch_size + 1]
+        indices : torch.Tensor
+            The page indices of the paged kv cache, shape: [num_kv_entries]
+        last_page_len : torch.Tensor
+            The number of entries in the last page length of the paged kv cache, shape: [batch_size]
+        num_qo_heads : int
+            The number of query/output heads
+        num_kv_heads : int
+            The number of key/value heads
+        head_dim : int
+            The dimension of the heads
+        page_size : int
+            The page size of the paged kv cache
+        rotary_mode : str
+            Whether to apply rotary embeddings on-the-fly inside attention kernels, could be
+            "NONE" or "LLAMA"
+        data_type : Union[str, torch.dtype]
+            The data type of the paged kv cache
+        
+        Note
+        ----
+        The begin_forward method should be called before any batch decode calls,
         auxiliary data structures will be created during this call and cached for
         multiple forward calls.
         """
@@ -274,7 +328,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         )
 
     def end_forward(self):
-        r"""The end_forward method can clear the cached data structures."""
+        r"""Clear auxiliary data structures after all forward calls within the same
+        decoding step are done.
+        """
         self._paged_kv_indptr = None
         self._paged_kv_indices = None
         self._paged_kv_last_page_len = None
@@ -288,6 +344,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
     ):
+        r"""Compute batch decode attention with paged kv cache.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            The query tensor, shape: [batch_size, num_qo_heads, head_dim]
+        #TODO(Zihao)
+        """
         check_rotary_mode(rotary_mode)
         if rope_scale is None:
             rope_scale = 1.0
