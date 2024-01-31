@@ -25,15 +25,12 @@ release = "0.0.1"
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
 
 extensions = [
-    "sphinx_tabs.tabs",
-    "sphinx.ext.autodoc",
-    # "sphinx_toolbox.collapse",
-    # "sphinxcontrib.httpdomain",
+    # "sphinx_tabs.tabs",
     "sphinx.ext.autodoc",
     "sphinx.ext.napoleon",
     "sphinx.ext.autosummary",
-    "sphinx.ext.mathjax",
-    # "sphinx_reredirects",
+    # "sphinx.ext.mathjax",
+    # "sphinxcontrib.jquery",
 ]
 
 source_suffix = [".rst"]
@@ -73,7 +70,6 @@ header_links = [
     ("Discussions", "https://github.com/orgs/flashinfer-ai/discussions"),
 ]
 
-# html_logo = "https://raw.githubusercontent.com/flashinfer-ai/web-data/main/logo/FlashInfer-white-background.png"
 # html_logo = "FlashInfer-white-background.png"
 
 html_context = {

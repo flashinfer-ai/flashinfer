@@ -6,7 +6,6 @@
 Welcome to FlashInfer's documentation!
 ======================================
 
-Why does the link doesn't work?
 `Discussion Forum <https://github.com/orgs/flashinfer-ai/discussions>`_ | `GitHub <https://github.com/flashinfer-ai/flashinfer/>`_
 
 .. toctree::
