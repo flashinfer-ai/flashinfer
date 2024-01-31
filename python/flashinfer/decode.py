@@ -16,12 +16,20 @@ limitations under the License.
 import math
 from typing import Optional, Union
 
-import torch
-
 try:
+    import torch
     from . import _kernels
-except ImportError:
-    _kernels = None
+except ImportError as e:
+    import os
+    import logging
+    if os.environ.get("BUILD_DOC", "0") == "1":
+        _kernels = None
+        logging.warning(
+            "Kernels are not loaded in documentation build mode."
+        )
+    else:
+        raise e
+
 
 from .utils import (
     RotaryMode,

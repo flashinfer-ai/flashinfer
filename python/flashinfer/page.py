@@ -16,11 +16,18 @@ limitations under the License.
 import torch
 
 try:
+    import torch
     from . import _kernels
-except ImportError:
-    _kernels = None
-from .utils import TensorLayout, check_kv_layout
-
+except ImportError as e:
+    import os
+    import logging
+    if os.environ.get("BUILD_DOC", "0") == "1":
+        _kernels = None
+        logging.warning(
+            "Kernels are not loaded in documentation build mode."
+        )
+    else:
+        raise e
 
 def append_paged_kv_cache(
     append_key: torch.Tensor,
