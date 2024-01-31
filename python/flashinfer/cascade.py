@@ -43,31 +43,33 @@ from .utils import (
 def merge_state(
     v_a: torch.Tensor, s_a: torch.Tensor, v_b: torch.Tensor, s_b: torch.Tensor
 ):
-    r"""Merge the attention output (V) and the logsumexp value (S) from the two KV-segments.
+    r"""Merge the attention output ``V`` and the logsumexp value ``S`` from the two
+    KV-segments.
+    Check :ref:`our tutorial <recursive-attention>` on the mathematical details.
 
     Parameters
     ----------
     v_a : torch.Tensor
-        The attention output from the KV segment A.
-        Shape: [seq_len, num_heads, head_dim]
+        The attention output from the KV segment ``A``, shape:
+        ``[seq_len, num_heads, head_dim]``.
     s_a : torch.Tensor
-        The logsumexp value from the KV segment A. Expected to be a float32 tensor.
-        Shape: [seq_len, num_heads]
+        The logsumexp value from the KV segment ``A``. expected to be a float32 tensor,
+        shape: ``[seq_len, num_heads]``.
     v_b : torch.Tensor
-        The attention output from the KV segment B.
-        Shape: [seq_len, num_heads, head_dim]
+        The attention output from the KV segment ``B``,
+        shape: ``[seq_len, num_heads, head_dim]``.
     s_b : torch.Tensor
-        The logsumexp value from the KV segment B. Expected to be a float32 tensor.
-        Shape: [seq_len, num_heads]
+        The logsumexp value from the KV segment ``B``, expected to be a float32 tensor,
+        shape: ``[seq_len, num_heads]``
 
     Returns
     -------
     V : torch.Tensor
-        The merged attention output (equivalent to attention with merged KV-segment [A: B]).
-        Shape: [batch_size, num_heads, head_dim]
+        The merged attention output (equivalent to attention with merged KV-segment
+        ``[A: B]``), shape: ``[batch_size, num_heads, head_dim]``.
     S : torch.Tensor
-        The logsumexp value from the merged KV-segment [A: B].
-        Shape: [batch_size, num_heads]
+        The logsumexp value from the merged KV-segment ``[A: B]``, shape:
+        ``[batch_size, num_heads]``.
     """
     return _kernels.merge_state(v_a, s_a, v_b, s_b)
 
@@ -75,46 +77,48 @@ def merge_state(
 def merge_state_in_place(
     v: torch.Tensor, s: torch.Tensor, v_other: torch.Tensor, s_other: torch.Tensor
 ):
-    r"""Merge the self-attention state (v, s) with another state (v_other, s_other) in-place.
+    r"""Merge the self-attention state ``(v, s)`` with another state
+    ``(v_other, s_other)`` in-place.
 
     Parameters
     ----------
     v : torch.Tensor
-        The partial v to be updated in-place.
-        Shape: (seq_len, num_heads, head_dim)
+        The partial attention output to be updated in-place, shape:
+        ``(seq_len, num_heads, head_dim)``.
     s : torch.Tensor
-        The partial logsumexpr value to be updated in-place, expected to be a float32 tensor.
-        Shape: (seq_len, num_heads)
+        The partial logsumexpr value to be updated in-place, expected to be a float32
+        tensor, shape: ``(seq_len, num_heads)``.
     v_other : torch.Tensor
-        The other v to be merged.
-        Shape: (seq_len, num_heads, head_dim)
+        The other attention output to be merged, shape:
+        ``(seq_len, num_heads, head_dim)``.
     s_other : torch.Tensor
-        The other logsumexp value to be merged, expected to be a float32 tensor.
-        Shape: (seq_len, num_heads)
+        The other logsumexp value to be merged, expected to be a float32 tensor,
+        shape: ``(seq_len, num_heads)``.
     """
     _kernels.merge_state_in_place(v, s, v_other, s_other)
 
 
 def merge_states(v: torch.Tensor, s: torch.Tensor):
-    r"""Merge the attention output (V) and the logsumexp value (S) from multiple KV-segments.
+    r"""Merge the attention output ``V`` and the logsumexp value ``S`` from multiple
+    KV-segments.
 
     Parameters
     ----------
     v : torch.Tensor
-        The attention output from the KV segments.
-        Shape: [seq_len, num_kv_segments, num_heads, head_dim]
+        The attention output from the KV segments, shape:
+        ``[seq_len, num_kv_segments, num_heads, head_dim]``.
     s : torch.Tensor
-        The logsumexp value from the KV segments.
-        Shape: [seq_len, num_kv_segments, num_heads]
+        The logsumexp value from the KV segments, shape:
+        ``[seq_len, num_kv_segments, num_heads]``, expected
+        to be a float32 tensor.
 
     Returns
     -------
     V : torch.Tensor
-        The merged attention output.
-        Shape: [seq_len, num_heads, head_dim]
+        The merged attention output, shape: ``[seq_len, num_heads, head_dim]``.
     S : torch.Tensor
-        The logsumexp value from the merged KV-segments.
-        Shape: [seq_len, num_heads]
+        The logsumexp value from the merged KV-segments, shape:
+        ``[seq_len, num_heads]``.
     """
     return _kernels.merge_states(v, s)
 
@@ -131,40 +135,49 @@ def batch_decode_with_shared_prefix_padded_kv_cache(
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
 ):
-    r"""Batch decode with shared prefix padded KV cache.
+    r"""Decode attention between queries and shared prefix kv-cache for batch of
+    requests.
 
     Parameters
     ----------
     q : torch.Tensor
-        Shape: [batch_size, num_qo_heads, head_dim]
+        The query tensor, shape: ``[batch_size, num_qo_heads, head_dim]``.
     k_shared : torch.Tensor
-        Shape: [shared_prefix_len, num_kv_heads, head_dim] if NHD
-               [num_kv_heads, shared_prefix_len, head_dim] if HND
+        The shared prefix key tensor, shape:
+        ``[shared_prefix_len, num_kv_heads, head_dim]`` if :attr:`kv_layout` is ``NHD``,
+        or ``[num_kv_heads, shared_prefix_len, head_dim]`` if :attr:`kv_layout` is
+        ``HND``.
     v_shared : torch.Tensor
-        Shape: [shared_prefix_len, num_kv_heads, head_dim] if NHD
-               [num_kv_heads, shared_prefix_len, head_dim] if HND
+        The shared prefix value tensor, shape:
+        ``[shared_prefix_len, num_kv_heads, head_dim]`` if :attr:`kv_layout` is ``NHD``,
+        or ``[num_kv_heads, shared_prefix_len, head_dim]`` if :attr:`kv_layout` is
+        ``HND``.
     k_unique : torch.Tensor
-        Shape: [batch_size, unique_len, num_kv_heads, head_dim] if NHD
-               [batch_size, num_kv_heads, unique_len, head_dim] if HND
+        The request-independent suffix key tensor, shape:
+        ``[batch_size, unique_len, num_kv_heads, head_dim]`` if :attr:`kv_layout` is
+        ``NHD``, or ``[batch_size, num_kv_heads, unique_len, head_dim]`` if
+        :attr:`kv_layout` is ``HND``.
     v_unique : torch.Tensor
-        Shape: [batch_size, unique_len, num_kv_heads, head_dim] if NHD
-               [batch_size, num_kv_heads, unique_len, head_dim] if HND
+        The request-independent suffix value tensor, shape:
+        ``[batch_size, unique_len, num_kv_heads, head_dim]`` if :attr:`kv_layout` is
+        ``NHD``, or ``[batch_size, num_kv_heads, unique_len, head_dim]`` if
+        :attr:`kv_layout` is ``HND``.
     kv_layout : str
-        The layout of the input k/v tensors, could be either "NHD" or "HND".
+        The layout of the kv-cache, could be either "NHD" or "HND".
     allow_fp16_qk_reduction : bool
-        Whether to use f16 for qk reduction (could be significantly faster for GeForce cards, at
-        the cost of slight precision loss).
+        Whether to use f16 for qk reduction (faster at the cost of slight precision
+        loss).
     sm_scale : Optional[float]
-        The scale of softmax, if not provided, will be set to 1 / sqrt(head_dim)
+        The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``
     rope_scale : Optional[float]
-        The scale used in RoPE interpolation, if not provided, will be set to 1.0.
+        The scale used in RoPE interpolation, if not provided, will be set to ``1.0``.
     rope_theta : Optional[float]
-        The theta used in RoPE, if not provided, will be set to 1e4.
+        The theta used in RoPE, if not provided, will be set to ``1e4``.
 
     Returns
     -------
     V : torch.Tensor
-        Shape: [batch_size, num_heads, head_dim]
+        The attention output, shape: ``[batch_size, num_heads, head_dim]``
     """
     check_kv_layout(kv_layout)
     V_shared, S_shared = single_prefill_with_kv_cache_return_lse(
@@ -194,6 +207,19 @@ def batch_decode_with_shared_prefix_padded_kv_cache(
 
 
 class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
+    r"""Wrapper class for decode attention with shared-prefix paged kv-cache for batch
+    of requests.
+
+    Check :ref:`our tutorial<page-layout>` for page table layout.
+
+    Note
+    ----
+    To accelerate computation, FlashInfer's shared prefix batch decode attention creates
+    some auxiliary data structures, these data structures can be reused across multiple
+    batch decode attention calls (e.g. different Transformer layers). This wrapper class
+     manages the lifecycle of these data structures.
+    """
+
     def __init__(self, workspace_buffer: torch.Tensor, kv_layout: str = "NHD"):
         self._batch_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
             workspace_buffer, kv_layout
@@ -201,6 +227,14 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
         self._kv_layout = kv_layout
 
     def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
+        r"""Reset the workspace buffer.
+
+        Parameters
+        ----------
+        new_workspace_buffer : torch.Tensor
+            The new workspace buffer, the device of the new workspace buffer should
+            be the same as the device of the input tensors.
+        """
         self._batch_decode_wrapper.reset_workspace_buffer(new_workspace_buffer)
 
     def begin_forward(
@@ -214,6 +248,43 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
         page_size: int,
         data_type: str = "float16",
     ):
+        r"""Create auxiliary data structures for shared-prefix batch decode for multiple
+        forward calls within the same decode step.
+
+        Parameters
+        ----------
+        indptr : torch.Tensor
+            The indptr of the paged kv cache, shape: ``[batch_size + 1]``
+        indices : torch.Tensor
+            The page indices of the paged kv cache, shape: ``[qo_indptr[-1]]``
+        last_page_len : torch.Tensor
+            The number of entries in the last page of each request in the paged kv
+            cache, shape: ``[batch_size]``
+        num_qo_heads : int
+            The number of query/output heads
+        num_kv_heads : int
+            The number of key/value heads
+        head_dim : int
+            The dimension of the heads
+        page_size : int
+            The page size of the paged kv cache
+        rotary_mode : str
+            Whether to apply RoPE on-the-fly inside attention kernels, could be
+            ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
+        data_type : Union[str, torch.dtype]
+            The data type of the paged kv cache
+
+        Note
+        ----
+        The :meth:`begin_forward` method should be called before any :meth:`forward` or
+        :meth:`forward_return_lse` calls,
+        auxiliary data structures will be created during this call and cached for
+        multiple forward calls.
+
+        The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads``
+        is not equal to ``num_kv_heads``, the function will use
+        `grouped query attention<https://arxiv.org/abs/2305.13245>`_.
+        """
         self._batch_decode_wrapper.begin_forward(
             unique_kv_indptr,
             unique_kv_indices,
@@ -227,6 +298,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
         )
 
     def end_forward(self):
+        r"""Clear auxiliary data structures created by :meth:`begin_forward`."""
         self._batch_decode_wrapper.end_forward()
 
     def forward(
@@ -239,6 +311,44 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
     ):
+        r"""Compute batch decode attention between queries and shared-prefix paged
+        kv-cache.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            The query tensor, shape: ``[batch_size, num_qo_heads, head_dim]``.
+        k_shared : torch.Tensor
+            The shared prefix key tensor, shape:
+            ``[shared_prefix_len, num_kv_heads, head_dim]`` if :attr:`kv_layout` is
+            ``NHD``, or ``[num_kv_heads, shared_prefix_len, head_dim]`` if
+            :attr:`kv_layout` is ``HND``.
+        v_shared : torch.Tensor
+            The shared prefix value tensor, shape:
+            ``[shared_prefix_len, num_kv_heads, head_dim]`` if :attr:`kv_layout` is
+            ``NHD``, or ``[num_kv_heads, shared_prefix_len, head_dim]`` if
+            :attr:`kv_layout` is ``HND``.
+        unique_kv_data : torch.Tensor
+            A 5-D tensor of paged kv-cache data storing the request-independent suffix
+            key and value tensors, shape:
+            ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
+            :attr:`kv_layout` is ``NHD``, or
+            ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
+            :attr:`kv_layout` is ``HND``.
+        allow_fp16_qk_reduction : bool
+            Whether to use f16 for qk reduction (faster at the cost of slight precision
+            loss).
+        rope_scale : Optional[float]
+            The scale used in RoPE interpolation, if not provided, will be set to
+            ``1.0``.
+        rope_theta : Optional[float]
+            The theta used in RoPE, if not provided, will be set to ``1e4``.
+
+        Returns
+        -------
+        V : torch.Tensor
+            The attention output, shape: ``[batch_size, num_heads, head_dim]``
+        """
         V_shared, S_shared = single_prefill_with_kv_cache_return_lse(
             q,
             k_shared,
@@ -262,13 +372,45 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
 
 
 class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
+    r"""Wrapper class for prefill/append attention with shared-prefix paged kv-cache for
+    batch of requests.
+
+    Check :ref:`our tutorial<page-layout>` for paged kv-cache layout.
+
+    Note
+    ----
+    To accelerate computation, FlashInfer's shared-prefix batch prefill/append attention
+    operators creates some auxiliary data structures, these data structures can be
+    reused across multiple prefill/append attention calls (e.g. different Transformer
+    layers). This wrapper class manages the lifecycle of these data structures.
+    """
+
     def __init__(self, workspace_buffer: torch.Tensor, kv_layout: str = "NHD"):
+        r"""Constructor of :class:`BatchDecodeWithSharedPrefixPagedKVCacheWrapper`.
+
+        Parameters
+        ----------
+        workspace_buffer : torch.Tensor
+            The user reserved workspace buffer used to store auxiliary data structures,
+            recommended size is 16MB, the device of the workspace buffer should be the
+            same as the device of the input tensors.
+        kv_layout : str
+            The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
+        """
         self._batch_prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer, kv_layout
         )
         self._kv_layout = kv_layout
 
     def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
+        r"""Reset the workspace buffer.
+
+        Parameters
+        ----------
+        new_workspace_buffer : torch.Tensor
+            The new workspace buffer, the device of the new workspace buffer should
+            be the same as the device of the input tensors.
+        """
         self._batch_prefill_wrapper.reset_workspace_buffer(new_workspace_buffer)
 
     def begin_forward(
@@ -280,6 +422,36 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
         num_qo_heads: int,
         num_kv_heads: int,
     ):
+        r"""Create auxiliary data structures for shared-prefix batch prefill/append
+        attention for multiple forward calls within the same prefill/append step.
+
+        Parameters
+        ----------
+        qo_indptr : torch.Tensor
+            The indptr of the query/output tensor, shape: ``[batch_size + 1]``.
+        paged_kv_indptr : torch.Tensor
+            The indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
+        paged_kv_indices : torch.Tensor
+            The page indices of the paged kv-cache, shape: ``[qo_indptr[-1]]``.
+        paged_kv_last_page_len : torch.Tensor
+            The number of entries in the last page of each request in the paged
+            kv-cache, shape: ``[batch_size]``.
+        num_qo_heads : int
+            The number of query/output heads.
+        num_kv_heads : int
+            The number of key/value heads.
+
+        Notes
+        -----
+        The :meth:`begin_forward` method should be called before any :meth:`forward`
+        or :meth:`forward_return_lse` calls, auxiliary data structures will be created
+        during this call and cached for multiple forward calls.
+
+        The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads``
+        is not equal to ``num_kv_heads``, the function will use
+        `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
+        """
+
         self._batch_prefill_wrapper.begin_forward(
             qo_indptr,
             paged_kv_indptr,
@@ -290,6 +462,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
         )
 
     def end_forward(self):
+        r"""Clear the auxiliary data structures created by :meth:`begin_forward`."""
         self._batch_prefill_wrapper.end_forward()
 
     def forward(
@@ -303,6 +476,46 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
     ):
+        r"""Compute batch prefill/append attention between query and shared-prefix paged
+        kv-cache.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            The query tensor, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
+        k_shared : torch.Tensor
+            The shared prefix key tensor, shape:
+            ``[shared_prefix_len, num_kv_heads, head_dim]`` if :attr:`kv_layout` is
+            ``NHD``, or ``[num_kv_heads, shared_prefix_len, head_dim]`` if
+            :attr:`kv_layout` is ``HND``.
+        v_shared ; torch.Tensor
+            The shared prefix value tensor, shape:
+            ``[shared_prefix_len, num_kv_heads, head_dim]`` if :attr:`kv_layout` is
+            ``NHD``, or ``[num_kv_heads, shared_prefix_len, head_dim]`` if
+            :attr:`kv_layout` is ``HND``.
+        unique_kv_data : torch.Tensor
+            A 5-D tensor of paged kv-cache data storing the request-independent suffix
+            key and value tensors, shape:
+            ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
+            :attr:`kv_layout` is ``NHD``, or
+            ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
+            :attr:`kv_layout` is ``HND``.
+        causal : bool
+            Whether to apply causal mask on the attention matrix.
+        allow_fp16_qk_reduction : bool
+            Whether to use f16 for qk reduction (faster at the cost of slight precision
+            loss).
+        rope_scale : Optional[float]
+            The scale used in RoPE interpolation, if not provided, will be set to
+            ``1.0``.
+        rope_theta : Optional[float]
+            The theta used in RoPE, if not provided, will be set to ``1e4``.
+
+        Returns
+        -------
+        V : torch.Tensor
+            The attention output, shape: ``[qo_indptr[-1], num_heads, head_dim]``.
+        """
         V_shared, S_shared = single_prefill_with_kv_cache_return_lse(
             q,
             k_shared,

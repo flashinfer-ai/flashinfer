@@ -6,21 +6,15 @@
 Welcome to FlashInfer's documentation!
 ======================================
 
+Why does the link doesn't work?
 `Discussion Forum <https://github.com/orgs/flashinfer-ai/discussions>`_ | `GitHub <https://github.com/flashinfer-ai/flashinfer/>`_
 
 .. toctree::
    :maxdepth: 2
    :caption: Tutorials
 
-   tutorials/recursive_softmax
+   tutorials/recursive_attention
    tutorials/page_layout
-
-.. toctree::
-   :maxdepth: 2
-   :caption: TVM Bindings
-   :hidden:
-
-   deploy/tvm
 
 .. toctree::
    :maxdepth: 2
@@ -31,3 +25,10 @@ Welcome to FlashInfer's documentation!
    api/python/cascade
    api/python/page
    
+.. toctree::
+   :maxdepth: 2
+   :caption: Language Bindings
+   :hidden:
+
+   deploy/tvm
+   deploy/cpp

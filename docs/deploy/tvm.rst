@@ -1,4 +1,4 @@
-.. _tvm-bindings
+.. _tvm-bindings:
 
 TVM Bindings
 ============
@@ -7,7 +7,7 @@ TVM Bindings
     :local:
     :depth: 2
 
-FlashInfer also provides TVM bindings where the kernels are wrapped as `PackedFunc in TVM<https://tvm.apache.org/docs/arch/runtime.html#packedfunc>`_.
+FlashInfer also provides TVM bindings where the kernels are wrapped as `PackedFunc <https://tvm.apache.org/docs/arch/runtime.html#packedfunc>`_  in TVM.
 Registered functions can be used in different languages (Python/Rust/Javascript/etc) with `TVM Runtime System <https://tvm.apache.org/docs/arch/runtime.html>`_, the wrapped 
 function definitions can be found at `tvm_wrapper.cu <https://github.com/flashinfer-ai/flashinfer/blob/main/src/tvm_wrapper.cu>`_.
 

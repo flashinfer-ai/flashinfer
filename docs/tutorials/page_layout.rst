@@ -1,3 +1,5 @@
+.. _page-layout:
+
 Paged KV-Cache Layout in FlashInfer
 ===================================
 

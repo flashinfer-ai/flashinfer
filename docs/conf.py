@@ -25,13 +25,13 @@ release = "0.0.1"
 extensions = [
     "sphinx_tabs.tabs",
     "sphinx.ext.autodoc",
-    "sphinx_toolbox.collapse",
-    "sphinxcontrib.httpdomain",
+    # "sphinx_toolbox.collapse",
+    # "sphinxcontrib.httpdomain",
     "sphinx.ext.autodoc",
-    "sphinx.ext.mathjax",
     "sphinx.ext.napoleon",
     "sphinx.ext.autosummary",
-    "sphinx_reredirects",
+    "sphinx.ext.mathjax",
+    # "sphinx_reredirects",
 ]
 
 source_suffix = [".rst"]
@@ -41,7 +41,7 @@ language = "en"
 exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 
 # The name of the Pygments (syntax highlighting) style to use.
-pygments_style = "colorful"
+pygments_style = "sphinx"
 
 # A list of ignored prefixes for module index sorting.
 # If true, `todo` and `todoList` produce output, else they produce nothing.
@@ -71,7 +71,8 @@ header_links = [
     ("Discussions", "https://github.com/orgs/flashinfer-ai/discussions"),
 ]
 
-# html_logo = "_static/FlashInfer-white-background.png"
+# html_logo = "https://raw.githubusercontent.com/flashinfer-ai/web-data/main/logo/FlashInfer-white-background.png"
+html_logo = "FlashInfer-white-background.png"
 
 html_context = {
     "footer_copyright": footer_copyright,
@@ -83,7 +84,7 @@ html_context = {
     "github_version": "main/docs/",
     "theme_vcs_pageview_mode": "edit",
     # "header_logo": "",
-    # "header_logo_link": "",
+    # "header_logo_link": "https://raw.githubusercontent.com/flashinfer-ai/web-data/main/logo/FlashInfer-black-background.png",
     # "version_selecter": "",
 }
 

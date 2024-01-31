@@ -58,39 +58,70 @@ def single_prefill_with_kv_cache(
     k: torch.Tensor,
     v: torch.Tensor,
     causal: bool = False,
-    rotary_mode: str = "NONE",
     kv_layout: str = "NHD",
+    rotary_mode: str = "NONE",
     allow_fp16_qk_reduction: bool = False,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
 ):
-    r"""Single request prefill with KV cache kernel.
+    r"""Prefill/Append attention with KV cache for single request, return the attention
+    output.
 
     Parameters
     ----------
     q : torch.Tensor
-        Shape: [qo_len, num_qo_heads, head_dim] if NHD
-               [num_qo_heads, qo_len, head_dim] if HND
+        The query tensor, shape: ``[qo_len, num_qo_heads, head_dim]``.
     k : torch.Tensor
-        Shape: [kv_len, num_kv_heads, head_dim] if NHD
-               [num_kv_heads, kv_len, head_dim] if HND
+        The key tensor, shape: ``[kv_len, num_kv_heads, head_dim]`` if :attr:`kv_layout`
+        is ``NHD``, or ``[num_kv_heads, kv_len, head_dim]`` if :attr:`kv_layout` is
+        ``HND``.
     v : torch.Tensor
-        Shape: [kv_len, num_kv_heads, head_dim] if NHD
-               [num_kv_heads, kv_len, head_dim] if HND
+        The key tensor, shape: ``[kv_len, num_kv_heads, head_dim]`` if :attr:`kv_layout`
+        is ``NHD``, ``[num_kv_heads, kv_len, head_dim]`` if :attr:`kv_layout` is
+        ``HND``.
     causal : bool
         Whether to apply causal mask to the attention matrix.
-    rotary_mode : str
-        Whether to apply rotary embeddings inside attention kernels, could be
-        "NONE" or "LLAMA".
     kv_layout : str
-        The layout of the input k/v tensors, could be either "NHD" or "HND".
+        The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
+    rotary_mode : str
+        Whether to apply RoPE on-the-fly inside attention kernels, could be
+        ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
     allow_fp16_qk_reduction : bool
-        Whether to use f16 for qk reduction (could be significantly faster for GeForce cards, at
-        the cost of precision loss).
+        Whether to use f16 for qk reduction (faster at the cost of slight precision
+        loss).
     rope_scale : Optional[float]
         The scale used in RoPE interpolation, if not provided, will be set to 1.0.
     rope_theta : Optional[float]
         The theta used in RoPE, if not provided, will be set to 1e4.
+
+    Returns
+    -------
+    torch.Tensor
+        The attention output, shape: ``[qo_len, num_qo_heads, head_dim]``.
+
+    Examples
+    --------
+
+    >>> import torch
+    >>> import flashinfer
+    >>> qo_len = 128
+    >>> kv_len = 4096
+    >>> num_qo_heads = 32
+    >>> num_kv_heads = 4
+    >>> head_dim = 128
+    >>> q = torch.randn(qo_len, num_qo_heads, head_dim).half().to("cuda:0")
+    >>> k = torch.randn(kv_len, num_kv_heads, head_dim).half().to("cuda:0")
+    >>> v = torch.randn(kv_len, num_kv_heads, head_dim).half().to("cuda:0")
+    >>> o = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=True,
+            allow_fp16_qk_reduction=True)
+    >>> o.shape
+    torch.Size([128, 32, 128])
+
+    Notes
+    -----
+    The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads`` is
+    not equal to ``num_kv_heads``, the function will use
+    `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
     """
     check_rotary_mode(rotary_mode)
     check_kv_layout(kv_layout)
@@ -119,48 +150,73 @@ def single_prefill_with_kv_cache_return_lse(
     k: torch.Tensor,
     v: torch.Tensor,
     causal: bool = False,
-    rotary_mode: str = "NONE",
     kv_layout: str = "NHD",
+    rotary_mode: str = "NONE",
     allow_fp16_qk_reduction: bool = False,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
 ):
-    r"""Single request prefill with KV cache kernel, return logsumexp value.
+    r"""Prefill/Append attention with KV cache for single request, return attention
+    output and logsumexp of attention scores.
 
     Parameters
     ----------
     q : torch.Tensor
-        Shape: [qo_len, num_qo_heads, head_dim] if NHD
-               [num_qo_heads, qo_len, head_dim] if HND
+        The query tensor, shape: ``[qo_len, num_qo_heads, head_dim]``.
     k : torch.Tensor
-        Shape: [kv_len, num_kv_heads, head_dim] if NHD
-               [num_kv_heads, kv_len, head_dim] if HND
+        The key tensor, shape: ``[kv_len, num_kv_heads, head_dim]`` if :attr:`kv_layout`
+        is ``NHD``, or ``[num_kv_heads, kv_len, head_dim]`` if :attr:`kv_layout` is
+        ``HND``.
     v : torch.Tensor
-        Shape: [kv_len, num_kv_heads, head_dim] if NHD
-               [num_kv_heads, kv_len, head_dim] if HND
+        The key tensor, shape: ``[kv_len, num_kv_heads, head_dim]`` if :attr:`kv_layout`
+        is ``NHD``, or ``[num_kv_heads, kv_len, head_dim]`` if :attr:`kv_layout` is
+        ``HND``.
     causal : bool
         Whether to apply causal mask to the attention matrix.
-    rotary_mode : str
-        Whether to apply rotary embeddings inside attention kernels, could be
-        "NONE" or "LLAMA".
     kv_layout : str
-        The layout of the input k/v tensors, could be either "NHD" or "HND".
+        The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
+    rotary_mode : str
+        Whether to apply RoPE on-the-fly inside attention kernels, could be
+        ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
     allow_fp16_qk_reduction : bool
-        Whether to use f16 for qk reduction (could be significantly faster for GeForce cards, at
-        the cost of precision loss).
+        Whether to use f16 for qk reduction (faster at the cost of slight precision
+        loss).
     rope_scale : Optional[float]
-        The scale used in RoPE interpolation, if not provided, will be set to 1.0.
+        The scale used in RoPE interpolation, if not provided, will be set to ``1.0``.
     rope_theta : Optional[float]
-        The theta used in RoPE, if not provided, will be set to 1e4.
+        The theta used in RoPE, if not provided, will be set to ``1e4``.
 
     Returns
     -------
     V : torch.Tensor
-        The attention output.
-        Shape: [qo_len, num_qo_heads, head_dim] if NHD, [num_qo_heads, qo_len, head_dim] if HND
+        The attention output, shape: ``[qo_len, num_qo_heads, head_dim]``.
     S : torch.Tensor
-        The logsumexp value.
-        Shape: [qo_len, num_qo_heads]
+        The logsumexp value, shape: ``[qo_len, num_qo_heads]``
+
+    Examples
+    --------
+
+    >>> import torch
+    >>> import flashinfer
+    >>> qo_len = 128
+    >>> kv_len = 4096
+    >>> num_qo_heads = 32
+    >>> num_kv_heads = 4
+    >>> head_dim = 128
+    >>> q = torch.randn(qo_len, num_qo_heads, head_dim).half().to("cuda:0")
+    >>> k = torch.randn(kv_len, num_kv_heads, head_dim).half().to("cuda:0")
+    >>> v = torch.randn(kv_len, num_kv_heads, head_dim).half().to("cuda:0")
+    >>> V, S = flashinfer.single_prefill_with_kv_cache_return_lse(q, k, v, causal=True)
+    >>> V.shape
+    torch.Size([128, 32, 128])
+    >>> S.shape
+    torch.Size([128, 32])
+
+    Notes
+    -----
+    The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads`` is
+    not equal to ``num_kv_heads``, the function will use
+    `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
     """
     check_rotary_mode(rotary_mode)
     check_kv_layout(kv_layout)
@@ -187,9 +243,31 @@ def single_prefill_with_kv_cache_return_lse(
 
 
 class BatchPrefillWithPagedKVCacheWrapper:
-    r"""Wrapper class of batch_prefill_with_paged_kv_cache kernel."""
+    r"""Wrapper class for prefill/append attention with paged kv-cache for batch of
+    requests.
+
+    Check :ref:`our tutorial<page-layout>` for page table layout.
+
+    Note
+    ----
+    To accelerate computation, FlashInfer's batch prefill/append attention operators
+    creates some auxiliary data structures, these data structures can be reused across
+    multiple prefill/append attention calls (e.g. different Transformer layers). This
+    wrapper class manages the lifecycle of these data structures.
+    """
 
     def __init__(self, workspace_buffer: torch.Tensor, kv_layout: str = "NHD"):
+        r"""Constructor of :class:`BatchDecodeWithPagedKVCacheWrapper`.
+
+        Parameters
+        ----------
+        workspace_buffer : torch.Tensor
+            The user reserved workspace buffer used to store auxiliary data structures,
+            recommended size is 16MB, the device of the workspace buffer should be the
+            same as the device of the input tensors.
+        kv_layout : str
+            The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
+        """
         check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
         self._workspace_buffer = workspace_buffer
@@ -202,6 +280,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._paged_kv_last_page_len = None
 
     def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
+        r"""Reset the workspace buffer.
+
+        Parameters
+        ----------
+        new_workspace_buffer : torch.Tensor
+            The new workspace buffer, the device of the new workspace buffer should
+            be the same as the device of the input tensors.
+        """
         self._workspace_buffer = new_workspace_buffer
 
     def begin_forward(
@@ -213,6 +299,35 @@ class BatchPrefillWithPagedKVCacheWrapper:
         num_qo_heads: int,
         num_kv_heads: int,
     ):
+        r"""Create auxiliary data structures for batch prefill/append attention for
+        multiple forward calls within the same prefill/append step.
+
+        Parameters
+        ----------
+        qo_indptr : torch.Tensor
+            The indptr of the query/output tensor, shape: ``[batch_size + 1]``.
+        paged_kv_indptr : torch.Tensor
+            The indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
+        paged_kv_indices : torch.Tensor
+            The page indices of the paged kv-cache, shape: ``[qo_indptr[-1]]``.
+        paged_kv_last_page_len : torch.Tensor
+            The number of entries in the last page of each request in the paged
+            kv-cache, shape: ``[batch_size]``.
+        num_qo_heads : int
+            The number of query/output heads.
+        num_kv_heads : int
+            The number of key/value heads.
+
+        Notes
+        -----
+        The :meth:`begin_forward` method should be called before any :meth:`forward` or
+        :meth:`forward_return_lse` calls, auxiliary data structures will be created
+        during this call and cached for multiple forward calls.
+
+        The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads``
+        is not equal to ``num_kv_heads``, the function will use
+        `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
+        """
         batch_size = len(qo_indptr) - 1
         self._qo_indptr = qo_indptr
         self._paged_kv_indptr = paged_kv_indptr
@@ -223,6 +338,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         )
 
     def end_forward(self):
+        r"""Clear the auxiliary data structures created by :meth:`begin_forward`."""
         self._qo_indptr = None
         self._paged_kv_indptr = None
         self._paged_kv_indices = None
@@ -239,6 +355,37 @@ class BatchPrefillWithPagedKVCacheWrapper:
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
     ):
+        r"""Compute batch prefill/append attention between query and paged kv-cache.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            The query tensor, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``
+        paged_kv_data : torch.Tensor
+            A 5-D tensor of the reserved paged kv-cache data, shape:
+            ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]``
+            if :attr:`kv_layout` is ``NHD``, or
+            ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]``
+            if :attr:`kv_layout` is ``HND``.
+        causal : bool
+            Whether to apply causal mask to the attention matrix.
+        rotary_mode : str
+            Whether to apply RoPE on-the-fly inside attention kernels, could be
+            ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
+        allow_fp16_qk_reduction : bool
+            Whether to use f16 for qk reduction (faster at the cost of slight precision
+            loss).
+        rope_scale : Optional[float]
+            The scale used in RoPE interpolation, if not provided, will be set to
+            ``1.0``.
+        rope_theta : Optional[float]
+            The theta used in RoPE, if not provided, will be set to ``1e4``.
+
+        Returns
+        -------
+        torch.Tensor
+            The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
+        """
         check_rotary_mode(rotary_mode)
         if rope_scale is None:
             rope_scale = 1.0
@@ -270,6 +417,40 @@ class BatchPrefillWithPagedKVCacheWrapper:
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
     ):
+        r"""Compute batch prefill/append attention paged kv-cache.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            The query tensor, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``
+        paged_kv_data : torch.Tensor
+            A 5-D tensor of the reserved paged kv-cache data, shape:
+            ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]``
+            if :attr:`kv_layout` is ``NHD``, or
+            ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
+            :attr:`kv_layout` is ``HND``.
+        causal : bool
+            Whether to apply causal mask to the attention matrix.
+        rotary_mode : str
+            Whether to apply RoPE on-the-fly inside attention kernels, could be
+            ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
+        allow_fp16_qk_reduction : bool
+            Whether to use f16 for qk reduction (faster at the cost of slight precision
+            loss).
+        rope_scale : Optional[float]
+            The scale used in RoPE interpolation, if not provided, will be set to
+            ``1.0``.
+        rope_theta : Optional[float]
+            The theta used in RoPE, if not provided, will be set to ``1e4``.
+
+        Returns
+        -------
+        V : torch.Tensor
+            The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
+        S : torch.Tensor
+            The logsumexp of attention output, shape:
+            ``[qo_indptr[-1], num_qo_heads, head_dim]``.
+        """
         check_rotary_mode(rotary_mode)
         if rope_scale is None:
             rope_scale = 1.0
@@ -293,9 +474,31 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
 
 class BatchPrefillWithRaggedKVCacheWrapper:
-    r"""Wrapper class of batch_prefill_with_ragged_kv_cache kernel."""
+    r"""Wrapper class for prefill/append attention with ragged (tensor) kv-cache for
+    batch of requests.
+
+    Check :ref:`our tutorial<ragged-layout>` for ragged kv-cache layout.
+
+    Note
+    ----
+    To accelerate computation, FlashInfer's batch prefill/append attention operators
+    creates some auxiliary data structures, these data structures can be reused across
+    multiple prefill/append attention calls (e.g. different Transformer layers). This
+    wrapper class manages the lifecycle of these data structures.
+    """
 
     def __init__(self, workspace_buffer: torch.Tensor, kv_layout: str = "NHD"):
+        r"""Constructor of :class:`BatchDecodeWithRaggedKVCacheWrapper`.
+
+        Parameters
+        ----------
+        workspace_buffer : torch.Tensor
+            The user reserved workspace buffer used to store auxiliary data structures,
+            recommended size is 16MB, the device of the workspace buffer should be the
+            same as the device of the input tensors.
+        kv_layout : str
+            The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
+        """
         check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
         self._workspace_buffer = workspace_buffer
@@ -306,6 +509,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._kv_indptr = None
 
     def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
+        r"""Reset the workspace buffer.
+
+        Parameters
+        ----------
+        new_workspace_buffer : torch.Tensor
+            The new workspace buffer, the device of the new workspace buffer should
+            be the same as the device of the input tensors.
+        """
         self._workspace_buffer = new_workspace_buffer
 
     def begin_forward(
@@ -315,6 +526,30 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         num_qo_heads: int,
         num_kv_heads: int,
     ):
+        r"""Create auxiliary data structures for batch prefill/append attention for
+        multiple forward calls within the same prefill/append step.
+
+        Parameters
+        ----------
+        qo_indptr : torch.Tensor
+            The indptr of the query/output tensor, shape: ``[batch_size + 1]``.
+        kv_indptr : torch.Tensor
+            The indptr of the key/value tensor, shape: ``[batch_size + 1]``.
+        num_qo_heads : int
+            The number of query/output heads.
+        num_kv_heads : int
+            The number of key/value heads.
+
+        Notes
+        -----
+        The :meth:`begin_forward` method should be called before any :meth:`forward` or
+        :meth:`forward_return_lse` calls, auxiliary data structures will be created
+        during this call and cached for multiple forward calls.
+
+        The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads``
+        is not equal to ``num_kv_heads``, the function will use
+        `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
+        """
         batch_size = len(qo_indptr) - 1
         self._qo_indptr = qo_indptr
         self._kv_indptr = kv_indptr
@@ -323,6 +558,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         )
 
     def end_forward(self):
+        r"""Clear the auxiliary data structures created by :meth:`begin_forward`."""
         self._qo_indptr = None
         self._kv_indptr = None
         self._wrapper.end_forward()
@@ -338,6 +574,36 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
     ):
+        r"""Compute batch prefill/append attention between query and kv-cache stored in
+        ragged tensor.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            The query tensor, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``
+        k : torch.Tensor
+            The key tensor, shape: ``[kv_indptr[-1], num_kv_heads, head_dim]``
+        v : torch.Tensor
+            The value tensor, shape: ``[kv_indptr[-1], num_kv_heads, head_dim]``
+        causal : bool
+            Whether to apply causal mask to the attention matrix.
+        rotary_mode : str
+            Whether to apply RoPE on-the-fly inside attention kernels, could be
+            ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
+        allow_fp16_qk_reduction : bool
+            Whether to use f16 for qk reduction (faster at the cost of slight precision
+            loss).
+        rope_scale : Optional[float]
+            The scale used in RoPE interpolation, if not provided, will be set to
+            ``1.0``.
+        rope_theta : Optional[float]
+            The theta used in RoPE, if not provided, will be set to ``1e4``.
+
+        Returns
+        -------
+        torch.Tensor
+            The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
+        """
         check_rotary_mode(rotary_mode)
         if rope_scale is None:
             rope_scale = 1.0
@@ -368,6 +634,38 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
     ):
+        r"""Compute batch prefill/append attention between query and kv-cache stored in
+        ragged tensor. Return attention output and logsumexp of attention scores.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            The query tensor, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``
+        k : torch.Tensor
+            The key tensor, shape: ``[kv_indptr[-1], num_kv_heads, head_dim]``
+        v : torch.Tensor
+            The value tensor, shape: ``[kv_indptr[-1], num_kv_heads, head_dim]``
+        causal : bool
+            Whether to apply causal mask to the attention matrix.
+        rotary_mode : str
+            Whether to apply RoPE on-the-fly inside attention kernels, could be
+            ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
+        allow_fp16_qk_reduction : bool
+            Whether to use f16 for qk reduction (faster at the cost of slight precision
+            loss).
+        rope_scale : Optional[float]
+            The scale used in RoPE interpolation, if not provided, will be set to ``1.0``.
+        rope_theta : Optional[float]
+            The theta used in RoPE, if not provided, will be set to ``1e4``.
+
+        Returns
+        -------
+        V : torch.Tensor
+            The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
+        S : torch.Tensor
+            The logsumexp of attention output, shape:
+            ``[qo_indptr[-1], num_qo_heads, head_dim]``.
+        """
         check_rotary_mode(rotary_mode)
         if rope_scale is None:
             rope_scale = 1.0
