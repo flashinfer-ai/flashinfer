@@ -13,7 +13,18 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
-import torch
+try:
+    import torch
+except ImportError as e:
+    import os
+    import logging
+    if os.environ.get("BUILD_DOC", "0") == "1":
+        _kernels = None
+        logging.warning(
+            "torch is not loaded in documentation build mode."
+        )
+    else:
+        raise e
 
 
 class RotaryMode:
