@@ -40,7 +40,7 @@ jobs:
         python -m pip install -r docs/requirements.txt
 
     - name: Bulid Documentation
-      if: github.ref == 'refs/heads/main'
+      # if: github.ref == 'refs/heads/main'
       run: |
         cd docs
         make html
