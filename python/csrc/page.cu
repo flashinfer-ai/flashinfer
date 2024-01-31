@@ -66,7 +66,7 @@ void append_paged_kv_cache(torch::Tensor append_key, torch::Tensor append_value,
   CHECK_EQ(append_key.size(2), head_dim);
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(kv_data.scalar_type(), c_type, [&] {
-    SWITCH_LAYOUT(kv_layout, KV_LAYOUT, {
+    DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
       paged_kv_t<page_storage, KV_LAYOUT, c_type, int32_t> paged_kv(
           num_heads, page_size, head_dim, batch_size, static_cast<c_type*>(kv_data.data_ptr()),
           static_cast<int32_t*>(kv_indices.data_ptr()), static_cast<int32_t*>(kv_indptr.data_ptr()),

@@ -415,7 +415,7 @@ cudaError_t AppendPagedKVCacheDecode(paged_kv_t<page_storage, layout, DType, IdT
   uint32_t head_dim = paged_kv.head_dim;
   uint32_t batch_size = paged_kv.batch_size;
   uint32_t num_heads = paged_kv.num_heads;
-  SWITCH_HEAD_DIM(head_dim, HEAD_DIM, {
+  DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
     uint32_t bdx = HEAD_DIM / vec_size;
     uint32_t bdy = num_heads;
@@ -449,7 +449,7 @@ cudaError_t AppendPagedKVCache(paged_kv_t<page_storage, layout, DType, IdType> p
   uint32_t head_dim = paged_kv.head_dim;
   uint32_t batch_size = paged_kv.batch_size;
   uint32_t num_heads = paged_kv.num_heads;
-  SWITCH_HEAD_DIM(head_dim, HEAD_DIM, {
+  DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
     uint32_t bdx = HEAD_DIM / vec_size;
     uint32_t bdy = num_heads;
@@ -530,7 +530,7 @@ cudaError_t PagedKVCacheToRaggedTensor(paged_kv_t<page_storage, layout, DType, I
   const uint32_t num_heads = paged_kv.num_heads;
   const uint32_t page_size = paged_kv.page_size;
 
-  SWITCH_HEAD_DIM(head_dim, HEAD_DIM, {
+  DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16U / sizeof(DType), HEAD_DIM / 32U);
     uint32_t bdx = HEAD_DIM / vec_size;
     uint32_t bdy = num_heads;

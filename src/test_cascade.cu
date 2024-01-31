@@ -16,9 +16,7 @@
 #include <gtest/gtest.h>
 
 #include <flashinfer/cascade.cuh>
-#include <flashinfer/decode.cuh>
-#include <flashinfer/handler.cuh>
-#include <flashinfer/prefill.cuh>
+#include <flashinfer/wrapper.cuh>
 
 #include "utils.h"
 

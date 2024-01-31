@@ -145,7 +145,7 @@ cudaError_t BatchQKApplyRotaryInPlace(DType* __restrict__ q, DType* __restrict__
   float rope_rcp_scale = 1.0f / rope_scale;
   float rope_rcp_theta = 1.0f / rope_theta;
 
-  SWITCH_HEAD_DIM(head_dim, HEAD_DIM, {
+  DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
     constexpr uint32_t bdx = HEAD_DIM / vec_size;
     uint32_t num_threads = std::max(128U, bdx);

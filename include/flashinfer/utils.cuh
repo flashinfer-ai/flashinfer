@@ -20,6 +20,7 @@
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
 
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
@@ -44,43 +45,43 @@
   }
 #endif
 
-#define SWITCH_SPLIT_QO_INDPTR(split_qo_indptr, SPLIT_QO_INDPTR, ...) \
-  if (split_qo_indptr) {                                              \
-    constexpr bool SPLIT_QO_INDPTR = true;                            \
-    __VA_ARGS__                                                       \
-  } else {                                                            \
-    constexpr bool SPLIT_QO_INDPTR = false;                           \
-    __VA_ARGS__                                                       \
+#define DISPATCH_SPLIT_QO_INDPTR(split_qo_indptr, SPLIT_QO_INDPTR, ...) \
+  if (split_qo_indptr) {                                                \
+    constexpr bool SPLIT_QO_INDPTR = true;                              \
+    __VA_ARGS__                                                         \
+  } else {                                                              \
+    constexpr bool SPLIT_QO_INDPTR = false;                             \
+    __VA_ARGS__                                                         \
   }
 
-#define SWITCH_ALLOW_FP16_QK_REDUCTION(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, ...) \
-  if (allow_fp16_qk_reduction) {                                                              \
-    constexpr bool ALLOW_FP16_QK_REDUCTION = true;                                            \
-    __VA_ARGS__                                                                               \
-  } else {                                                                                    \
-    constexpr bool ALLOW_FP16_QK_REDUCTION = false;                                           \
-    __VA_ARGS__                                                                               \
+#define DISPATCH_ALLOW_FP16_QK_REDUCTION(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, ...) \
+  if (allow_fp16_qk_reduction) {                                                                \
+    constexpr bool ALLOW_FP16_QK_REDUCTION = true;                                              \
+    __VA_ARGS__                                                                                 \
+  } else {                                                                                      \
+    constexpr bool ALLOW_FP16_QK_REDUCTION = false;                                             \
+    __VA_ARGS__                                                                                 \
   }
 
-#define SWITCH_PAGE_SIZE(page_size, PAGE_SIZE, ...) \
-  if (page_size == 1) {                             \
-    constexpr size_t PAGE_SIZE = 1;                 \
-    __VA_ARGS__                                     \
-  } else if (page_size == 8) {                      \
-    constexpr size_t PAGE_SIZE = 8;                 \
-    __VA_ARGS__                                     \
-  } else if (page_size == 16) {                     \
-    constexpr size_t PAGE_SIZE = 16;                \
-    __VA_ARGS__                                     \
-  } else if (page_size == 32) {                     \
-    constexpr size_t PAGE_SIZE = 32;                \
-    __VA_ARGS__                                     \
-  } else {                                          \
-    constexpr size_t PAGE_SIZE = 0;                 \
-    __VA_ARGS__                                     \
+#define DISPATCH_PAGE_SIZE(page_size, PAGE_SIZE, ...) \
+  if (page_size == 1) {                               \
+    constexpr size_t PAGE_SIZE = 1;                   \
+    __VA_ARGS__                                       \
+  } else if (page_size == 8) {                        \
+    constexpr size_t PAGE_SIZE = 8;                   \
+    __VA_ARGS__                                       \
+  } else if (page_size == 16) {                       \
+    constexpr size_t PAGE_SIZE = 16;                  \
+    __VA_ARGS__                                       \
+  } else if (page_size == 32) {                       \
+    constexpr size_t PAGE_SIZE = 32;                  \
+    __VA_ARGS__                                       \
+  } else {                                            \
+    constexpr size_t PAGE_SIZE = 0;                   \
+    __VA_ARGS__                                       \
   }
 
-#define SWITCH_NUM_FRAGS_X(num_frags_x, NUM_FRAGS_X, ...)                 \
+#define DISPATCH_NUM_FRAGS_X(num_frags_x, NUM_FRAGS_X, ...)               \
   if (num_frags_x == 1) {                                                 \
     constexpr size_t NUM_FRAGS_X = 1;                                     \
     __VA_ARGS__                                                           \
@@ -91,7 +92,7 @@
     std::cerr << "Unsupported num_frags_x: " << num_frags_x << std::endl; \
   }
 
-#define SWITCH_NUM_FRAGS_Z(max_frags_z, NUM_FRAGS_Z, ...)                 \
+#define DISPATCH_NUM_FRAGS_Z(max_frags_z, NUM_FRAGS_Z, ...)               \
   if (max_frags_z == 4) {                                                 \
     constexpr size_t NUM_FRAGS_Z = 4;                                     \
     __VA_ARGS__                                                           \
@@ -102,7 +103,7 @@
     std::cerr << "Unsupported max_frags_z: " << max_frags_z << std::endl; \
   }
 
-#define SWITCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, ...)              \
+#define DISPATCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, ...)            \
   if (group_size == 1) {                                                \
     constexpr size_t GROUP_SIZE = 1;                                    \
     __VA_ARGS__                                                         \
@@ -116,16 +117,16 @@
     std::cerr << "Unsupported group_size: " << group_size << std::endl; \
   }
 
-#define SWITCH_CAUSAL(causal, CAUSAL, ...) \
-  if (causal) {                            \
-    constexpr bool CAUSAL = true;          \
-    __VA_ARGS__                            \
-  } else {                                 \
-    constexpr bool CAUSAL = false;         \
-    __VA_ARGS__                            \
+#define DISPATCH_CAUSAL(causal, CAUSAL, ...) \
+  if (causal) {                              \
+    constexpr bool CAUSAL = true;            \
+    __VA_ARGS__                              \
+  } else {                                   \
+    constexpr bool CAUSAL = false;           \
+    __VA_ARGS__                              \
   }
 
-#define SWITCH_LAYOUT(layout, LAYOUT, ...)              \
+#define DISPATCH_LAYOUT(layout, LAYOUT, ...)            \
   switch (layout) {                                     \
     case QKVLayout::kNHD: {                             \
       constexpr QKVLayout LAYOUT = QKVLayout::kNHD;     \
@@ -144,7 +145,7 @@
     }                                                   \
   }
 
-#define SWITCH_HEAD_DIM(head_dim, HEAD_DIM, ...)       \
+#define DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, ...)     \
   switch (head_dim) {                                  \
     case 64: {                                         \
       constexpr size_t HEAD_DIM = 64;                  \
@@ -168,26 +169,26 @@
     }                                                  \
   }
 
-#define SWITCH_HEAD_DIM_PREFILL(head_dim, HEAD_DIM, ...) \
-  switch (head_dim) {                                    \
-    case 64: {                                           \
-      constexpr size_t HEAD_DIM = 64;                    \
-      __VA_ARGS__                                        \
-      break;                                             \
-    }                                                    \
-    case 128: {                                          \
-      constexpr size_t HEAD_DIM = 128;                   \
-      __VA_ARGS__                                        \
-      break;                                             \
-    }                                                    \
-    default: {                                           \
-      std::ostringstream err_msg;                        \
-      err_msg << "Unsupported head_dim: " << head_dim;   \
-      throw std::invalid_argument(err_msg.str());        \
-    }                                                    \
+#define DISPATCH_HEAD_DIM_PREFILL(head_dim, HEAD_DIM, ...) \
+  switch (head_dim) {                                      \
+    case 64: {                                             \
+      constexpr size_t HEAD_DIM = 64;                      \
+      __VA_ARGS__                                          \
+      break;                                               \
+    }                                                      \
+    case 128: {                                            \
+      constexpr size_t HEAD_DIM = 128;                     \
+      __VA_ARGS__                                          \
+      break;                                               \
+    }                                                      \
+    default: {                                             \
+      std::ostringstream err_msg;                          \
+      err_msg << "Unsupported head_dim: " << head_dim;     \
+      throw std::invalid_argument(err_msg.str());          \
+    }                                                      \
   }
 
-#define SWITCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, ...)         \
+#define DISPATCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, ...)       \
   switch (rotary_mode) {                                          \
     case RotaryMode::kNone: {                                     \
       constexpr RotaryMode ROTARY_MODE = RotaryMode::kNone;       \
@@ -217,6 +218,37 @@ inline bool is_device_ptr(const void* ptr) {
 template <typename T1, typename T2>
 __forceinline__ __device__ __host__ T1 ceil_div(const T1 x, const T2 y) {
   return (x + y - 1) / y;
+}
+
+template <typename IdType>
+std::tuple<IdType, IdType, std::vector<IdType>, std::vector<IdType>> split_qo_indptr(
+    IdType* qo_indptr, uint32_t batch_size, uint32_t gqa_group_size,
+    cudaStream_t stream = nullptr) {
+  constexpr uint32_t num_warps = 4;
+  std::vector<IdType> qo_indptr_h(batch_size + 1), request_indices, tile_indices;
+  if (is_device_ptr((void*)qo_indptr)) {
+    cudaMemcpyAsync(qo_indptr_h.data(), qo_indptr, sizeof(IdType) * (batch_size + 1),
+                    cudaMemcpyDeviceToHost, stream);
+  } else {
+    qo_indptr_h.assign(qo_indptr, qo_indptr + batch_size + 1);
+  }
+
+  const uint32_t total_q_len = qo_indptr_h[batch_size];
+  const bool avg_len_greater_than_64 = total_q_len * gqa_group_size > 64 * batch_size;
+  const uint32_t num_frags_x = avg_len_greater_than_64 ? 2 : 1;
+  const uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
+  uint32_t num_qo_tiles = 0;
+
+  for (uint32_t i = 0; i < batch_size; ++i) {
+    for (uint32_t j = qo_indptr_h[i] * gqa_group_size; j < qo_indptr_h[i + 1] * gqa_group_size;
+         j += num_rows_per_cta) {
+      request_indices.push_back(i);
+      tile_indices.push_back((j - qo_indptr_h[i] * gqa_group_size) / num_rows_per_cta);
+      ++num_qo_tiles;
+    }
+  }
+
+  return {num_frags_x, num_qo_tiles, std::move(request_indices), std::move(tile_indices)};
 }
 
 }  // namespace flashinfer

@@ -16,9 +16,7 @@
 #include <thrust/device_vector.h>
 
 #include <cstdint>
-#include <flashinfer/decode.cuh>
-#include <flashinfer/handler.cuh>
-#include <flashinfer/prefill.cuh>
+#include <flashinfer/wrapper.cuh>
 #include <nvbench/nvbench.cuh>
 #include <vector>
 
