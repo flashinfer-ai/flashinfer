@@ -12,6 +12,8 @@ import tlcpack_sphinx_addon
 
 sys.path.insert(0, os.path.abspath("../python"))
 
+import flashinfer
+
 project = 'FlashInfer'
 author = "FlashInfer Contributors"
 footer_copyright = '2023-2024, {}'.format(author)
