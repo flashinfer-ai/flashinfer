@@ -1,4 +1,12 @@
-# FlashInfer: Kernel Library for LLM Serving
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/flashinfer-ai/web-data/blob/main/logo/FlashInfer-black-background.png?raw=true">
+    <img alt="FlashInfer" src="https://github.com/flashinfer-ai/web-data/blob/main/logo/FlashInfer-white-background.png?raw=true" width=55%>
+  </picture>
+</p>
+<h3 align="center">
+Kernel Library for LLM Serving
+</h3>
 
 [Blog](https://flashinfer.ai) | [Documentation](https://docs.flashinfer.ai/) | [Discussion Forum](https://github.com/orgs/flashinfer-ai/discussions)
 
