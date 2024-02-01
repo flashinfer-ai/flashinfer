@@ -27,6 +27,8 @@ except ImportError as e:
     else:
         raise e
 
+from .utils import check_kv_layout, TensorLayout
+
 
 def append_paged_kv_cache(
     append_key: torch.Tensor,
