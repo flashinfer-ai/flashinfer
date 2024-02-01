@@ -117,7 +117,7 @@ def merge_state_in_place(
     s_other : torch.Tensor
         The other logsumexp value to be merged, expected to be a float32 tensor,
         shape: ``(seq_len, num_heads)``.
-    
+
     Example
     -------
     >>> import torch
@@ -135,7 +135,7 @@ def merge_state_in_place(
 
 
 def merge_states(v: torch.Tensor, s: torch.Tensor):
-    r"""Merge multiple attention states (v, s). 
+    r"""Merge multiple attention states (v, s).
 
     Parameters
     ----------
@@ -154,7 +154,7 @@ def merge_states(v: torch.Tensor, s: torch.Tensor):
     S : torch.Tensor
         The logsumexp value from the merged KV-segments, shape:
         ``[seq_len, num_heads]``.
-    
+
     Example
     -------
     >>> import torch
@@ -229,7 +229,7 @@ def batch_decode_with_shared_prefix_padded_kv_cache(
     -------
     V : torch.Tensor
         The attention output, shape: ``[batch_size, num_heads, head_dim]``
-    
+
     Example
     -------
     >>> import torch
@@ -312,7 +312,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
     ... )
     >>> batch_size = 7
     >>> shared_prefix_len = 8192
-    >>> unique_kv_page_indices = torch.arange(max_num_pages).int().to("cuda:0") 
+    >>> unique_kv_page_indices = torch.arange(max_num_pages).int().to("cuda:0")
     >>> unique_kv_page_indptr = torch.tensor(
     ...     [0, 17, 29, 44, 48, 66, 100, 128], dtype=torch.int32, device="cuda:0"
     ... )
@@ -355,7 +355,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
     ...     # compute batch decode attention, reuse auxiliary data structures for all layers
     ...     o = wrapper.forward(q, k_shared, v_shared, unique_kv_data)
     ...     outputs.append(o)
-    ... 
+    ...
     >>> # clear auxiliary data structures
     >>> wrapper.end_forward()
     >>> outputs[0].shape
@@ -547,7 +547,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
     >>> qo_indptr = torch.tensor(
     ...     [0, 33, 44, 55, 66, 77, 88, nnz_qo], dtype=torch.int32, device="cuda:0"
     ... )
-    >>> paged_kv_indices = torch.arange(max_num_pages).int().to("cuda:0") 
+    >>> paged_kv_indices = torch.arange(max_num_pages).int().to("cuda:0")
     >>> paged_kv_indptr = torch.tensor(
     ...     [0, 17, 29, 44, 48, 66, 100, 128], dtype=torch.int32, device="cuda:0"
     ... )
@@ -590,7 +590,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
     ...         q, k_shared, v_shared, kv_data, causal=True
     ...     )
     ...     outputs.append(o)
-    ... 
+    ...
     s[0].shape>>> # clear auxiliary data structures
     >>> prefill_wrapper.end_forward()
     >>> outputs[0].shape

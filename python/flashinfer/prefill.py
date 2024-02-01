@@ -277,7 +277,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
     >>> qo_indptr = torch.tensor(
     ...     [0, 33, 44, 55, 66, 77, 88, nnz_qo], dtype=torch.int32, device="cuda:0"
     ... )
-    >>> paged_kv_indices = torch.arange(max_num_pages).int().to("cuda:0") 
+    >>> paged_kv_indices = torch.arange(max_num_pages).int().to("cuda:0")
     >>> paged_kv_indptr = torch.tensor(
     ...     [0, 17, 29, 44, 48, 66, 100, 128], dtype=torch.int32, device="cuda:0"
     ... )
@@ -308,7 +308,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
     ...         q, kv_data, causal=True
     ...     )
     ...     outputs.append(o)
-    ... 
+    ...
     >>> # clear auxiliary data structures
     >>> prefill_wrapper.end_forward()
     >>> outputs[0].shape
@@ -582,7 +582,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
     ...         q, k, v, causal=True
     ...     )
     ...     outputs.append(o)
-    ... 
+    ...
     >>> # clear auxiliary data structures
     >>> prefill_wrapper.end_forward()
     >>> outputs[0].shape
