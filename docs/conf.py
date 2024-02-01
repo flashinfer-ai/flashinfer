@@ -32,6 +32,9 @@ extensions = [
     "sphinx.ext.mathjax",
 ]
 
+autodoc_default_flags = ['members']
+autosummary_generate = True
+
 source_suffix = [".rst"]
 
 language = "en"

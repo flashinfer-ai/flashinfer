@@ -179,6 +179,24 @@ def batch_decode_with_padded_kv_cache(
     -------
     torch.Tensor
         The attention output, shape: ``[batch_size, num_qo_heads, head_dim]``.
+    
+    Examples
+    --------
+    >>> import torch
+    >>> import flashinfer
+    >>> padded_kv_len = 4096
+    >>> num_qo_heads = 32
+    >>> num_kv_heads = 32
+    >>> batch_size = 7
+    >>> head_dim = 128
+    >>> q = torch.randn(batch_size, num_qo_heads, head_dim).half().to("cuda:0")
+    >>> k_padded = torch.randn(batch_size, padded_kv_len, num_kv_heads, head_dim).half().to("cuda:0")
+    >>> v_padded = torch.randn(batch_size, padded_kv_len, num_kv_heads, head_dim).half().to("cuda:0")
+    >>> o = flashinfer.batch_decode_with_padded_kv_cache(
+    ...     q, k_padded, v_padded, "NHD", "LLAMA"
+    ... )
+    >>> o.shape
+    torch.Size([7, 32, 128])
 
     Notes
     -----
@@ -252,9 +270,32 @@ def batch_decode_with_padded_kv_cache_return_lse(
         The attention output, shape: [batch_size, num_qo_heads, head_dim]
     S : torch.Tensor
         The logsumexp of attention scores, Shape: [batch_size, num_qo_heads]
+    
+    Examples
+    --------
+    >>> import torch
+    >>> import flashinfer
+    >>> padded_kv_len = 4096
+    >>> num_qo_heads = 32
+    >>> num_kv_heads = 32
+    >>> batch_size = 7
+    >>> head_dim = 128
+    >>> q = torch.randn(batch_size, num_qo_heads, head_dim).half().to("cuda:0")
+    >>> k_padded = torch.randn(batch_size, padded_kv_len, num_kv_heads, head_dim).half().to("cuda:0")
+    >>> v_padded = torch.randn(batch_size, padded_kv_len, num_kv_heads, head_dim).half().to("cuda:0")
+    >>> v, s = flashinfer.batch_decode_with_padded_kv_cache_return_lse(
+    ...     q, k_padded, v_padded, "NHD"
+    ... )
+    >>> v.shape
+    torch.Size([7, 32, 128])
+    >>> s.shape
+    torch.Size([7, 32])
 
     Notes
     -----
+    Please refer to the :ref:`tutorial <recursive-attention>` for a detailed
+    explanation of the log-sum-exp function and attention states.
+
     The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads`` is
     not equal to ``num_kv_heads``, the function will use
     `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
@@ -284,6 +325,60 @@ class BatchDecodeWithPagedKVCacheWrapper:
     `vLLM <https://arxiv.org/abs/2309.06180>`_) for batch of requests.
 
     Check :ref:`our tutorial<page-layout>` for page table layout.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import flashinfer
+    >>> num_layers = 32
+    >>> num_qo_heads = 64
+    >>> num_kv_heads = 8
+    >>> head_dim = 128
+    >>> max_num_pages = 128
+    >>> page_size = 16
+    >>> # allocate 16MB workspace buffer
+    >>> workspace_buffer = torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+    >>> decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+    ...     workspace_buffer, "NHD"
+    ... )
+    >>> batch_size = 7
+    >>> kv_page_indices = torch.arange(max_num_pages).int().to("cuda:0") 
+    >>> kv_page_indptr = torch.tensor(
+    ...     [0, 17, 29, 44, 48, 66, 100, 128], dtype=torch.int32, device="cuda:0"
+    ... )
+    >>> # 1 <= kv_last_page_len <= page_size
+    >>> kv_last_page_len = torch.tensor(
+    ...     [1, 7, 14, 4, 3, 1, 16], dtype=torch.int32, device="cuda:0"
+    ... )
+    >>> kv_data_at_layer = [
+    ...     torch.randn(
+    ...         max_num_pages, 2, page_size, num_kv_heads, head_dim, dtype=torch.float16, device="cuda:0"
+    ...     ) for _ in range(num_layers)
+    ... ]
+    >>> # create auxiliary data structures for batch decode attention
+    >>> decode_wrapper.begin_forward(
+    ...     kv_page_indptr,
+    ...     kv_page_indices,
+    ...     kv_last_page_len,
+    ...     num_qo_heads,
+    ...     num_kv_heads,
+    ...     head_dim,
+    ...     page_size,
+    ...     rotary_mode="NONE",
+    ...     data_type=torch.float16
+    ... )
+    >>> outputs = []
+    >>> for i in range(num_layers):
+    ...     q = torch.randn(batch_size, num_qo_heads, head_dim).half().to("cuda:0")
+    ...     kv_data = kv_data_at_layer[i]
+    ...     # compute batch decode attention, reuse auxiliary data structures for all layers
+    ...     o = decode_wrapper.forward(q, kv_data)
+    ...     outputs.append(o)
+    ... 
+    >>> # clear auxiliary data structures
+    >>> decode_wrapper.end_forward()
+    >>> outputs[0].shape
+    torch.Size([7, 64, 128])
 
     Note
     ----
@@ -494,6 +589,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The attention output, shape: ``[batch_size, num_qo_heads, head_dim]``.
         S : torch.Tensor
             The logsumexp of attention scores, Shape: ``[batch_size, num_qo_heads]``.
+        
+        Notes
+        -----
+        Please refer to the :ref:`tutorial <recursive-attention>` for a detailed
+        explanation of the log-sum-exp function and attention states.
         """
         check_rotary_mode(rotary_mode)
         if rope_scale is None:
