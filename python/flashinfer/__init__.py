@@ -34,3 +34,9 @@ from .cascade import (
     BatchPrefillWithSharedPrefixPagedKVCacheWrapper,
 )
 from .page import append_paged_kv_cache
+
+try:
+    from ._build_meta import __version__ as __version__
+except ImportError:
+    with open("version.txt") as f:
+        __version__ = f.read().strip()

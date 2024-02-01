@@ -179,7 +179,7 @@ def batch_decode_with_padded_kv_cache(
     -------
     torch.Tensor
         The attention output, shape: ``[batch_size, num_qo_heads, head_dim]``.
-    
+
     Examples
     --------
     >>> import torch
@@ -270,7 +270,7 @@ def batch_decode_with_padded_kv_cache_return_lse(
         The attention output, shape: [batch_size, num_qo_heads, head_dim]
     S : torch.Tensor
         The logsumexp of attention scores, Shape: [batch_size, num_qo_heads]
-    
+
     Examples
     --------
     >>> import torch
@@ -342,7 +342,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
     ...     workspace_buffer, "NHD"
     ... )
     >>> batch_size = 7
-    >>> kv_page_indices = torch.arange(max_num_pages).int().to("cuda:0") 
+    >>> kv_page_indices = torch.arange(max_num_pages).int().to("cuda:0")
     >>> kv_page_indptr = torch.tensor(
     ...     [0, 17, 29, 44, 48, 66, 100, 128], dtype=torch.int32, device="cuda:0"
     ... )
@@ -374,7 +374,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
     ...     # compute batch decode attention, reuse auxiliary data structures for all layers
     ...     o = decode_wrapper.forward(q, kv_data)
     ...     outputs.append(o)
-    ... 
+    ...
     >>> # clear auxiliary data structures
     >>> decode_wrapper.end_forward()
     >>> outputs[0].shape
@@ -589,7 +589,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The attention output, shape: ``[batch_size, num_qo_heads, head_dim]``.
         S : torch.Tensor
             The logsumexp of attention scores, Shape: ``[batch_size, num_qo_heads]``.
-        
+
         Notes
         -----
         Please refer to the :ref:`tutorial <recursive-attention>` for a detailed

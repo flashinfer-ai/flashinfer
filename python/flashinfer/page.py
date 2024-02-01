@@ -67,7 +67,7 @@ def append_paged_kv_cache(
         shape: ``[batch_size]``.
     kv_layout : str
         The layout of the paged kv-cache, either ``NHD`` or ``HND``.
-    
+
     Example
     -------
     >>> import torch
@@ -96,7 +96,7 @@ def append_paged_kv_cache(
     >>> # 25 = (2 - 1) * 16 + 9
     >>> # 22 = (2 - 1) * 16 + 6
     >>> kv_last_page_len = torch.tensor([13, 8, 9, 6], dtype=torch.int32, device="cuda:0")
-    >>> 
+    >>>
     >>> flashinfer.append_paged_kv_cache(
     ...     k_append,
     ...     v_append,
@@ -111,7 +111,7 @@ def append_paged_kv_cache(
     -----
     Please refer to the :ref:`tutorial <recursive-attention>` for a detailed
     explanation of the log-sum-exp function and attention states.
-    
+
     The function assumes that the space for appended k/v have already been allocated,
     which means :attr:`kv_indices`, :attr:`kv_indptr`, :attr:`kv_last_page_len` has
     incorporated appended k/v.
