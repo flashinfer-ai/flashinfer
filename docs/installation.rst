@@ -12,9 +12,13 @@ Prerequisites
 ^^^^^^^^^^^^^
 
 - OS: Linux only
+
 - Python: 3.10, 3.11
+
 - PyTorch CUDA 11.8/12.1
+
   - Use ``python -c "import torch; print(torch.version.cuda)"`` to check your PyTorch CUDA version.
+
 - Supported GPU architectures: sm_80, sm_86, sm_89, sm_90 (sm_75 support is working in progress).
 
 Quick Start

@@ -65,11 +65,17 @@ to index the pages in KV-Cache.
   :align: center
   :alt: Data structure of Paged KV-Cache.
 
-For each request, we keep an record of its ``page_indices``, ``last_page_length``. 
+For each request, we keep an record of its ``page_indices``, ``last_page_len`` which
+tracks the pages used by this request and the number of entries in the last page. The KV
+sequence length of request ``i`` is ``page_size * (len(page_indices[i]) - 1) + last_page_length[i]``.
+
+.. note::
+  The ``last_page_len`` of each request must be greater than zero, and less than or equal to ``page_size``.
+
 The overall ``kv_indptr`` array (with length ``num_requests+1``) can be computed as:
 ``[0, len(page_indices[0]), len(page_indices[0])+len(page_indices[1]), ...]``.
 The overall ``kv_page_indices`` array (with length ``kv_indptr[-1]``) is the concatenation of all requests' ``page_indices``.
-The overall ``last_page_lens`` array (with length ``num_requests``) is the concatenation of all requests' ``last_page_length``.
+The overall ``kv_last_page_lens`` array (with length ``num_requests``) is the concatenation of all requests' ``last_page_length``.
 
 The ``kv_data`` tensor is a 5-D tensor with shape (in ``NHD`` layout):
 

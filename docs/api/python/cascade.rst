@@ -34,5 +34,7 @@ Cascade Attention Wrapper Classes
 .. autoclass:: BatchDecodeWithSharedPrefixPagedKVCacheWrapper
     :members:
 
+
 .. autoclass:: BatchPrefillWithSharedPrefixPagedKVCacheWrapper
     :members:
+
