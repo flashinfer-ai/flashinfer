@@ -79,8 +79,8 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
         head_dim, page_size, rotary_mode);
     state.exec([&](nvbench::launch&) {
       cudaError_t status =
-          BatchDecodeWithPagedKVCacheWrapper<PageStorage::kIndices, kv_layout, T, T>(
-              &handler, thrust::raw_pointer_cast(q.data()), paged_kv,
+          BatchDecodeWithPagedKVCacheWrapper<PageStorage::kIndices, kv_layout, T, T, int32_t>(
+              &handler, thrust::raw_pointer_cast(q.data()), /*q_rope_position=*/nullptr, paged_kv,
               thrust::raw_pointer_cast(o.data()), /*lse=*/nullptr, num_qo_heads, rotary_mode);
       if (status != cudaSuccess) {
         state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
@@ -88,10 +88,11 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
     });
   } else {
     state.exec([&](nvbench::launch&) {
-      cudaError_t status = BatchDecodeWithPagedKVCache<PageStorage::kIndices, kv_layout, T, T>(
-          thrust::raw_pointer_cast(q.data()), paged_kv, kv_partition_info_t<int32_t>(),
-          thrust::raw_pointer_cast(o.data()), nullptr,
-          /*lse=*/nullptr, num_qo_heads, rotary_mode);
+      cudaError_t status =
+          BatchDecodeWithPagedKVCache<PageStorage::kIndices, kv_layout, T, T, int32_t>(
+              thrust::raw_pointer_cast(q.data()), /*q_rope_position=*/nullptr, paged_kv,
+              kv_partition_info_t<int32_t>(), thrust::raw_pointer_cast(o.data()), nullptr,
+              /*lse=*/nullptr, num_qo_heads, rotary_mode);
       if (status != cudaSuccess) {
         state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
       }
@@ -152,9 +153,9 @@ void bench_flashinfer_batch_decode_with_prefill(nvbench::state& state) {
                        qo_indptr_h.data(), batch_size, num_qo_heads, num_kv_heads);
 
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
-    cudaError_t status = BatchPrefillWithPagedKVCacheWrapper(
+    cudaError_t status = BatchPrefillWithPagedKVCacheWrapper<PageStorage::kIndices, T, T, int32_t>(
         &handler, thrust::raw_pointer_cast(q.data()), thrust::raw_pointer_cast(qo_indptr_d.data()),
-        paged_kv, thrust::raw_pointer_cast(o.data()),
+        /*q_rope_position=*/nullptr, paged_kv, thrust::raw_pointer_cast(o.data()),
         /*lse=*/nullptr, num_qo_heads,
         /*causal=*/false, rotary_mode);
   });
