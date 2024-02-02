@@ -38,7 +38,10 @@ Using our PyTorch API is the easiest way to get started:
 We provide prebuilt wheels for Linux and you can try out FlashInfer with the following command:
 
 ```bash
-pip install flashinfer -i https://flashinfer.ai/whl/cu121/ # for CUDA 12.1, use cu118 for CUDA 11.8
+# For CUDA 12.1
+pip install flashinfer -i https://flashinfer.ai/whl/cu121/
+# For CUDA 11.8
+# pip install flashinfer -i https://flashinfer.ai/whl/cu118/
 ```
 
 or you can build from source:
