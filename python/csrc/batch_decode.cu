@@ -45,6 +45,7 @@ std::vector<torch::Tensor> batch_decode_with_padded_kv_cache(
     num_kv_heads = k_padded.size(1);
   }
 
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
   auto o = torch::empty_like(q, q.options());
   torch::Tensor lse = torch::empty({0});
   if (return_lse) {
@@ -59,7 +60,7 @@ std::vector<torch::Tensor> batch_decode_with_padded_kv_cache(
         /*tmp=*/tmp,
         /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr, batch_size,
         padded_kv_len, num_qo_heads, num_kv_heads, head_dim, kv_layout, RotaryMode(rotary_mode),
-        rope_scale, rope_theta);
+        rope_scale, rope_theta, torch_current_stream);
     TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPaddedKVCache failed with error code ",
                 status);
     return true;
@@ -88,6 +89,8 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
   CHECK_EQ(indptr.scalar_type(), torch::kInt32);
   CHECK_EQ(indptr.scalar_type(), torch::kInt32);
   size_t workspace_size_in_bytes = workspace_buffer.size(0) * workspace_buffer.element_size();
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
+  handler_.SetCUDAStream(torch_current_stream);
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(empty_data.scalar_type(), c_type, [&] {
     DISPATCH_LAYOUT(kv_layout_, KV_LAYOUT, {
@@ -145,6 +148,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
   CHECK_EQ(paged_kv_indices.scalar_type(), torch::kInt32);
   CHECK_EQ(paged_kv_last_page_len.scalar_type(), torch::kInt32);
 
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
   torch::Tensor o = torch::empty_like(q, q.options());
   torch::Tensor lse;
   if (return_lse) {
@@ -163,7 +167,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
           &handler_, static_cast<c_type*>(q.data_ptr()), /*q_rope_position=*/nullptr, paged_kv,
           static_cast<c_type*>(o.data_ptr()),
           /*lse=*/(return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr), num_qo_heads,
-          RotaryMode(rotary_mode), rope_scale, rope_theta, /*stream=*/nullptr);
+          RotaryMode(rotary_mode), rope_scale, rope_theta, /*stream=*/torch_current_stream);
       TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
                   cudaGetErrorString(status));
     });
