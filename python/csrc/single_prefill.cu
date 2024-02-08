@@ -46,6 +46,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
     num_qo_heads = q.size(0);
   }
   CHECK(num_qo_heads % num_kv_heads == 0);
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
   auto o = torch::empty_like(q, q.options());
   torch::Tensor lse = torch::empty({0});
   if (return_lse) {
@@ -66,7 +67,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
                         static_cast<c_type*>(v.data_ptr()), static_cast<c_type*>(o.data_ptr()),
                         static_cast<float*>(tmp.data_ptr()),
                         /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                        num_kv_heads, qo_len, kv_len, rope_scale, rope_theta, nullptr);
+                        num_kv_heads, qo_len, kv_len, rope_scale, rope_theta, torch_current_stream);
                 TORCH_CHECK(status == cudaSuccess,
                             "SinglePrefillWithKVCache kernel launch failed, error: " +
                                 std::string(cudaGetErrorString(status)));
