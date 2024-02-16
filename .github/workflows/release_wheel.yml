@@ -27,7 +27,7 @@ jobs:
       matrix:
         python: ["3.9", "3.10", "3.11"]
         cuda: ["11.8", "12.1"]
-        torch: ["2.1.0", "2.2.0"]
+        torch: ["2.1", "2.2"]
     runs-on: [self-hosted]
     steps:
       - uses: actions/checkout@v4
