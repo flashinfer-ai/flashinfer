@@ -44,11 +44,11 @@ std::vector<torch::Tensor> merge_state(torch::Tensor v_a, torch::Tensor s_a, tor
   auto s_merged = torch::empty({seq_len, num_heads}, s_a.options());
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(v_a.scalar_type(), c_type, [&] {
-    cudaError_t status =
-        MergeState(static_cast<c_type*>(v_a.data_ptr()), static_cast<float*>(s_a.data_ptr()),
-                   static_cast<c_type*>(v_b.data_ptr()), static_cast<float*>(s_b.data_ptr()),
-                   static_cast<c_type*>(v_merged.data_ptr()),
-                   static_cast<float*>(s_merged.data_ptr()), seq_len, num_heads, head_dim, torch_current_stream);
+    cudaError_t status = MergeState(
+        static_cast<c_type*>(v_a.data_ptr()), static_cast<float*>(s_a.data_ptr()),
+        static_cast<c_type*>(v_b.data_ptr()), static_cast<float*>(s_b.data_ptr()),
+        static_cast<c_type*>(v_merged.data_ptr()), static_cast<float*>(s_merged.data_ptr()),
+        seq_len, num_heads, head_dim, torch_current_stream);
     TORCH_CHECK(status == cudaSuccess,
                 "MergeState kernel launch failed: ", cudaGetErrorString(status));
     return true;
@@ -80,10 +80,10 @@ void merge_state_in_place(torch::Tensor v, torch::Tensor s, torch::Tensor v_othe
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(v.scalar_type(), c_type, [&] {
-    cudaError_t status =
-        MergeStateInPlace(static_cast<c_type*>(v.data_ptr()), static_cast<float*>(s.data_ptr()),
-                          static_cast<c_type*>(v_other.data_ptr()),
-                          static_cast<float*>(s_other.data_ptr()), seq_len, num_heads, head_dim, torch_current_stream);
+    cudaError_t status = MergeStateInPlace(
+        static_cast<c_type*>(v.data_ptr()), static_cast<float*>(s.data_ptr()),
+        static_cast<c_type*>(v_other.data_ptr()), static_cast<float*>(s_other.data_ptr()), seq_len,
+        num_heads, head_dim, torch_current_stream);
     TORCH_CHECK(status == cudaSuccess,
                 "MergeStateInPlace kernel launch failed: ", cudaGetErrorString(status));
     return true;
