@@ -207,8 +207,9 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
                             return BatchPrefillWithRaggedKVCacheWrapperDispatched<
                                 GROUP_SIZE, HEAD_DIM, KV_LAYOUT, ROTARY_MODE,
                                 ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
-                                handler, q, qo_indptr, k, v, kv_indptr, o, lse, batch_size,
-                                num_kv_heads, rope_scale, rope_theta, stream);
+                                handler, q, qo_indptr, k, v, kv_indptr, /*q_rope_position=*/nullptr,
+                                /*k_rope_pos_offset=*/nullptr, o, lse, batch_size, num_kv_heads,
+                                rope_scale, rope_theta, stream);
                           })})})})})});
   return cudaSuccess;
 }

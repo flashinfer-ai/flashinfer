@@ -29,14 +29,14 @@
                              float* lse, float rope_scale, float rope_theta, cudaStream_t stream); \
   }
 
-#define INST_BatchPrefillRaggedWrapper(T, GROUP_SIZE, HEAD_DIM, CAUSAL, ALLOW_FP16_QK_REDUCTION,  \
-                                       LAYOUT, ROTARY_MODE)                                       \
-  namespace flashinfer {                                                                          \
-  template cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched<                            \
-      GROUP_SIZE, HEAD_DIM, LAYOUT, ROTARY_MODE, ALLOW_FP16_QK_REDUCTION, CAUSAL, T, T, int32_t>( \
-      BatchPrefillHandler * handler, T* q, int32_t* qo_indptr, T* k, T* v, int32_t* kv_indptr,    \
-      T* o, float* lse, uint32_t batch_size, uint32_t num_kv_heads, float rope_scale,             \
-      float rope_theta, cudaStream_t stream);                                                     \
+#define INST_BatchPrefillRaggedWrapper(T, GROUP_SIZE, HEAD_DIM, CAUSAL, ALLOW_FP16_QK_REDUCTION,   \
+                                       LAYOUT, ROTARY_MODE)                                        \
+  namespace flashinfer {                                                                           \
+  template cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched<                             \
+      GROUP_SIZE, HEAD_DIM, LAYOUT, ROTARY_MODE, ALLOW_FP16_QK_REDUCTION, CAUSAL, T, T, int32_t>(  \
+      BatchPrefillHandler * handler, T* q, int32_t* qo_indptr, T* k, T* v, int32_t* kv_indptr,     \
+      int32_t* q_rope_position, int32_t* k_rope_pos_offset, T* o, float* lse, uint32_t batch_size, \
+      uint32_t num_kv_heads, float rope_scale, float rope_theta, cudaStream_t stream);             \
   }
 
 #define INST_SinglePrefill(T, GROUP_SIZE, HEAD_DIM, CAUSAL, ALLOW_FP16_QK_REDUCTION, LAYOUT,   \
@@ -57,9 +57,9 @@ template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT, RotaryMod
           typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
     BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, DTypeIn* k, DTypeIn* v,
-    IdType* kv_indptr, DTypeOut* o, float* lse, const uint32_t batch_size,
-    const uint32_t num_kv_heads, const float rope_scale, const float rope_theta,
-    cudaStream_t stream);
+    IdType* kv_indptr, IdType* q_rope_position, IdType* k_rope_pos_offset, DTypeOut* o, float* lse,
+    const uint32_t batch_size, const uint32_t num_kv_heads, const float rope_scale,
+    const float rope_theta, cudaStream_t stream);
 
 template <PageStorage page_storage, QKVLayout kv_layout, uint32_t GROUP_SIZE, uint32_t HEAD_DIM,
           RotaryMode ROTARY_MODE, bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL, typename DTypeIn,
