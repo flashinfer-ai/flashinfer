@@ -73,9 +73,10 @@ void append_paged_kv_cache(torch::Tensor append_key, torch::Tensor append_value,
           num_heads, page_size, head_dim, batch_size, static_cast<c_type*>(kv_data.data_ptr()),
           static_cast<int32_t*>(kv_indices.data_ptr()), static_cast<int32_t*>(kv_indptr.data_ptr()),
           static_cast<int32_t*>(kv_last_page_len.data_ptr()));
-      cudaError_t status = AppendPagedKVCache(paged_kv, static_cast<c_type*>(append_key.data_ptr()),
-                                              static_cast<c_type*>(append_value.data_ptr()),
-                                              static_cast<int32_t*>(append_indptr.data_ptr()), torch_current_stream);
+      cudaError_t status =
+          AppendPagedKVCache(paged_kv, static_cast<c_type*>(append_key.data_ptr()),
+                             static_cast<c_type*>(append_value.data_ptr()),
+                             static_cast<int32_t*>(append_indptr.data_ptr()), torch_current_stream);
       TORCH_CHECK(status == cudaSuccess,
                   "AppendPagedKVCache failed with error: ", cudaGetErrorString(status));
       return true;

@@ -24,6 +24,7 @@
   template cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched<                              \
       PageStorage::kIndices, LAYOUT, GROUP_SIZE, HEAD_DIM, ROTARY_MODE, ALLOW_FP16_QK_REDUCTION,   \
       CAUSAL, T, T, int32_t>(BatchPrefillHandler * handler, T* q, int32_t* qo_indptr,              \
+                             IdType* q_rope_position,                                              \
                              paged_kv_t<PageStorage::kIndices, LAYOUT, T, int32_t> paged_kv, T* o, \
                              float* lse, float rope_scale, float rope_theta, cudaStream_t stream); \
   }
@@ -64,7 +65,7 @@ template <PageStorage page_storage, QKVLayout kv_layout, uint32_t GROUP_SIZE, ui
           RotaryMode ROTARY_MODE, bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL, typename DTypeIn,
           typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
-    BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr,
+    BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, IdType* q_rope_position,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, DTypeOut* o, float* lse,
     float rope_scale, float rope_theta, cudaStream_t stream);
 
