@@ -6,18 +6,11 @@ on:
       tag_name:
         required: true
         type: string
-      skip_build_wheel:
-        required: true
-        type: boolean
   workflow_call:
     inputs:
       tag_name:
         required: true
         type: string
-      skip_build_wheel:
-        required: false
-        default: false
-        type: boolean
     secrets:
       WHL_TOKEN:
         required: true
@@ -29,7 +22,6 @@ env:
 
 jobs:
   build:
-    if : ${{ !github.event.inputs.skip_build_wheel }}
     strategy:
       fail-fast: false
       matrix:
@@ -66,7 +58,7 @@ jobs:
           path: python/dist/*
 
   release:
-    if: ${{ success() || github.event.inputs.skip_build_wheel }}
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
