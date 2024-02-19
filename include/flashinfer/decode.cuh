@@ -698,7 +698,11 @@ constexpr uint32_t get_heuristic_num_threads(uint32_t group_size, uint32_t sizeo
       return 512U;
     }
   } else {
+#ifdef FLASHINFER_ENABLE_BF16
     return 128U;
+#else
+    return 64U;
+#endif
   }
 }
 
