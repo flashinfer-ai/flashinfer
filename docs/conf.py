@@ -16,10 +16,10 @@ autodoc_mock_imports = ["torch"]
 
 project = 'FlashInfer'
 author = "FlashInfer Contributors"
-footer_copyright = '2023-2024, {}'.format(author)
+copyright = '2023-2024, {}'.format(author)
 
-version = "0.0.1"
-release = "0.0.1"
+version = "0.0.2"
+release = "0.0.2"
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
@@ -55,8 +55,6 @@ html_theme = "furo" #"sphinx_rtd_theme"
 templates_path = []
 
 html_static_path = []
-
-footer_note = " "
 
 html_theme_options = {
     "logo_only": True,
