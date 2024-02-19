@@ -19,14 +19,17 @@ Prerequisites
 
   - Use ``python -c "import torch; print(torch.version.cuda)"`` to check your PyTorch CUDA version.
 
-- Supported GPU architectures: `sm80`, `sm86`, `sm89`, `sm90` (`sm75` / `sm70` support is working in progress).
+- Supported GPU architectures: ``sm80``, ``sm86``, ``sm89``, ``sm90`` (``sm75`` / ``sm70`` support is working in progress).
 
 Quick Start
 ^^^^^^^^^^^
 
 .. tabs::
+
     .. tab:: PyTorch 2.2
+
         .. tabs::
+
             .. tab:: CUDA 12.1
 
                 .. code-block:: bash
@@ -39,8 +42,10 @@ Quick Start
 
                     pip install flashinfer -i https://flashinfer.ai/whl/cu118/torch2.2/
 
-     .. tab:: PyTorch 2.1
+    .. tab:: PyTorch 2.1
+
         .. tabs::
+
             .. tab:: CUDA 12.1
 
                 .. code-block:: bash
