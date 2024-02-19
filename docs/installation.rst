@@ -19,23 +19,44 @@ Prerequisites
 
   - Use ``python -c "import torch; print(torch.version.cuda)"`` to check your PyTorch CUDA version.
 
-- Supported GPU architectures: sm_80, sm_86, sm_89, sm_90 (sm_75 support is working in progress).
+- Supported GPU architectures: ``sm80``, ``sm86``, ``sm89``, ``sm90`` (``sm75`` / ``sm70`` support is working in progress).
 
 Quick Start
 ^^^^^^^^^^^
 
 .. tabs::
-    .. tab:: PyTorch CUDA 11.8
 
-        .. code-block:: bash
+    .. tab:: PyTorch 2.2
 
-            pip install flashinfer -i https://flashinfer.ai/whl/cu118/
+        .. tabs::
 
-    .. tab:: PyTorch CUDA 12.1
+            .. tab:: CUDA 12.1
 
-        .. code-block:: bash
+                .. code-block:: bash
 
-            pip install flashinfer -i https://flashinfer.ai/whl/cu121/
+                    pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.2/
+
+            .. tab:: CUDA 11.8
+
+                .. code-block:: bash
+
+                    pip install flashinfer -i https://flashinfer.ai/whl/cu118/torch2.2/
+
+    .. tab:: PyTorch 2.1
+
+        .. tabs::
+
+            .. tab:: CUDA 12.1
+
+                .. code-block:: bash
+
+                    pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.1/
+
+            .. tab:: CUDA 11.8
+
+                .. code-block:: bash
+
+                    pip install flashinfer -i https://flashinfer.ai/whl/cu118/torch2.1/
 
 
 C++ API
