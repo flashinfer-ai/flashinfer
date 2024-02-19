@@ -31,8 +31,8 @@ namespace mma {
 #define FLASHINFER_STMATRIX_M8N8X4_ENABLED
 #endif
 #if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 800))
-// #define FLASHINFER_MMA_F16F16F32_M16N8K16_ENABLED
-// #define FLASHINFER_MMA_F16F16F16_M16N8K16_ENABLED
+#define FLASHINFER_MMA_F16F16F32_M16N8K16_ENABLED
+#define FLASHINFER_MMA_F16F16F16_M16N8K16_ENABLED
 #endif
 #if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 750))
 #define FLASHINFER_MMA_F16F16F32_M16N8K8_ENABLED
@@ -210,7 +210,6 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
     }
   }
 #elif defined(FLASHINFER_MMA_F16F16F32_M16N8K8_ENABLED)
-  static_assert(std::is_same<T, half>::value, "bf16 mma instruction is not supported on sm_75");
   if constexpr (mma_mode == MMAMode::kInit) {
     asm volatile(
         "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "

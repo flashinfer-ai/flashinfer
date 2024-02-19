@@ -16,7 +16,9 @@
 #ifndef VEC_DTYPES_CUH_
 #define VEC_DTYPES_CUH_
 
+#ifdef FLASHINFER_ENABLE_BF16
 #include <cuda_bf16.h>
+#endif
 #include <cuda_fp16.h>
 #ifdef FLASHINFER_ENABLE_FP8
 #include <cuda_fp8.h>
@@ -738,6 +740,7 @@ struct vec_t<half, vec_size> {
   }
 };
 
+#ifdef FLASHINFER_ENABLE_BF16
 /******************* vec_t<nv_bfloat16> *******************/
 
 // nv_bfloat16 x 1
@@ -919,6 +922,8 @@ struct vec_t<nv_bfloat16, vec_size> {
   }
 };
 
+#endif
+
 /******************* vec_t<float> *******************/
 
 // float x 1
@@ -1065,6 +1070,7 @@ FLASHINFER_INLINE void vec_cast<half, float>(half* dst, const float* src) {
   }
 }
 
+#ifdef FLASHINFER_ENABLE_BF16
 template <size_t vec_size>
 FLASHINFER_INLINE void vec_cast<float, nv_bfloat16>(float* dst, const nv_bfloat16* src) {
 #pragma unroll
@@ -1080,6 +1086,7 @@ FLASHINFER_INLINE void vec_cast<nv_bfloat16, float>(nv_bfloat16* dst, const floa
     ((nv_bfloat162*)dst)[i] = __float22bfloat162_rn(((float2*)src)[i]);
   }
 }
+#endif
 
 template <size_t vec_size>
 FLASHINFER_INLINE void cast_from_impl(vec_t<float, vec_size>& dst,
@@ -1107,6 +1114,7 @@ FLASHINFER_INLINE void cast_from_impl(vec_t<half, vec_size>& dst,
   }
 }
 
+#ifdef FLASHINFER_ENABLE_BF16
 template <size_t vec_size>
 FLASHINFER_INLINE void cast_from_impl(vec_t<float, vec_size>& dst,
                                       const vec_t<nv_bfloat16, vec_size>& src) {
@@ -1132,6 +1140,7 @@ FLASHINFER_INLINE void cast_from_impl(vec_t<nv_bfloat16, vec_size>& dst,
     }
   }
 }
+#endif
 
 #ifdef FLASHINFER_ENABLE_FP8
 

@@ -27,11 +27,24 @@ import torch.utils.cpp_extension as torch_cpp_ext
 
 root = pathlib.Path(__name__).parent
 
+enable_bf16 = True
+for cuda_arch_flags in torch_cpp_ext._get_cuda_arch_flags():
+    arch = int(re.search("compute_\d+", cuda_arch_flags).group()[-2:])
+    if arch < 75:
+        raise RuntimeError("FlashInfer requires sm75+")
+    elif arch == 75:
+        # disable bf16 for sm75
+        enable_bf16 = False
 
+if enable_bf16:
+    torch_cpp_ext.COMMON_NVCC_FLAGS.append("-DFLASHINFER_ENABLE_BF16")
+    
 def get_instantiation_cu() -> list[str]:
     prefix = "csrc/generated"
     (root / prefix).mkdir(parents=True, exist_ok=True)
-    dtypes = {"fp16": "nv_half", "bf16": "nv_bfloat16"}
+    dtypes = {"fp16": "nv_half"}
+    if enable_bf16:
+        dtypes["bf16"] = "nv_bfloat16"
     group_sizes = os.environ.get("FLASHINFER_GROUP_SIZES", "1,4,8").split(",")
     head_dims = os.environ.get("FLASHINFER_HEAD_DIMS", "64, 128").split(",")
     group_sizes = [int(x) for x in group_sizes]
@@ -140,7 +153,7 @@ def get_instantiation_cu() -> list[str]:
 def get_version():
     version = os.getenv("FLASHINFER_BUILD_VERSION")
     if version is None:
-        with open(root / "version.txt") as f:
+        with open(root / "../version.txt") as f:
             version = f.read().strip()
     return version
 
@@ -182,18 +195,6 @@ def remove_unwanted_pytorch_nvcc_flags():
 
 
 if __name__ == "__main__":
-    enable_bf16 = True
-    for cuda_arch_flags in torch_cpp_ext._get_cuda_arch_flags():
-        arch = int(re.search("compute_\d+", cuda_arch_flags).group()[-2:])
-        if arch < 75:
-            raise RuntimeError("FlashInfer requires sm75+")
-        elif arch == 75:
-            # disable bf16 for sm75
-            enable_bf16 = False
-
-    if enable_bf16:
-        torch_cpp_ext.COMMON_NVCC_FLAGS.append("-DFLASHINFER_ENABLE_BF16")
-
     remove_unwanted_pytorch_nvcc_flags()
     generate_build_meta()
     ext_modules = []
@@ -211,7 +212,7 @@ if __name__ == "__main__":
             ]
             + get_instantiation_cu(),
             include_dirs=[
-                str(root.resolve() / "include"),
+                str(root.resolve() / "../include"),
             ],
             extra_compile_args={
                 "cxx": ["-O3"],
