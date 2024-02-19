@@ -34,6 +34,8 @@ void BatchPrefillWithPagedKVCachePyTorchWrapper::BeginForward(torch::Tensor work
   // TODO(Zihao): support dispatching to different index data types.
   CHECK_EQ(qo_indptr.scalar_type(), torch::kInt32);
   size_t workspace_size_in_bytes = workspace_buffer.size(0) * workspace_buffer.element_size();
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
+  handler_.SetCUDAStream(torch_current_stream);
 
   cudaError_t status = handler_.BeginForward(
       static_cast<void*>(workspace_buffer.data_ptr()), workspace_size_in_bytes,
@@ -87,6 +89,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
   CHECK_EQ(paged_kv_indices.scalar_type(), torch::kInt32);
   CHECK_EQ(paged_kv_last_page_len.scalar_type(), torch::kInt32);
 
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
   torch::Tensor o = torch::empty_like(q, q.options());
   torch::Tensor lse = torch::empty({0});
   if (return_lse) {
@@ -114,7 +117,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
                     /*q_rope_position=*/nullptr, paged_kv, static_cast<c_type*>(o.data_ptr()),
                     /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr, rope_scale,
                     rope_theta,
-                    /*stream=*/nullptr);
+                    /*stream=*/torch_current_stream);
                 TORCH_CHECK(status == cudaSuccess,
                             "BatchPrefillWithPagedKVCache failed with error code ",
                             cudaGetErrorString(status));
@@ -152,6 +155,8 @@ void BatchPrefillWithRaggedKVCachePyTorchWrapper::BeginForward(torch::Tensor wor
   // TODO(Zihao): support dispatching to different index data types.
   CHECK_EQ(qo_indptr.scalar_type(), torch::kInt32);
   size_t workspace_size_in_bytes = workspace_buffer.size(0) * workspace_buffer.element_size();
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
+  handler_.SetCUDAStream(torch_current_stream);
 
   cudaError_t status = handler_.BeginForward(
       static_cast<void*>(workspace_buffer.data_ptr()), workspace_size_in_bytes,
@@ -191,6 +196,7 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
   CHECK_EQ(qo_indptr.scalar_type(), torch::kInt32);
   CHECK_EQ(kv_indptr.scalar_type(), torch::kInt32);
 
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
   torch::Tensor o = torch::empty_like(q, q.options());
   torch::Tensor lse = torch::empty({0});
   if (return_lse) {
@@ -210,10 +216,11 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
                     &handler_, static_cast<c_type*>(q.data_ptr()),
                     static_cast<int32_t*>(qo_indptr.data_ptr()), static_cast<c_type*>(k.data_ptr()),
                     static_cast<c_type*>(v.data_ptr()), static_cast<int32_t*>(kv_indptr.data_ptr()),
+                    /*q_rope_position=*/nullptr, /*k_rope_pos_offset=*/nullptr,
                     static_cast<c_type*>(o.data_ptr()),
                     /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr, batch_size,
                     num_kv_heads, rope_scale, rope_theta,
-                    /*stream=*/nullptr);
+                    /*stream=*/torch_current_stream);
                 TORCH_CHECK(status == cudaSuccess,
                             "BatchPrefillWithRaggedKVCache failed with error ",
                             cudaGetErrorString(status));

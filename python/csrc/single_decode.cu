@@ -43,6 +43,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
     num_kv_heads = k.size(0);
     kv_len = k.size(1);
   }
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
   auto o = torch::empty_like(q, q.options());
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
@@ -50,7 +51,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
         static_cast<c_type*>(v.data_ptr()), static_cast<c_type*>(o.data_ptr()),
         static_cast<c_type*>(tmp.data_ptr()), num_qo_heads, num_kv_heads, kv_len, head_dim,
-        kv_layout, RotaryMode(rotary_mode), rope_scale, rope_theta, nullptr);
+        kv_layout, RotaryMode(rotary_mode), rope_scale, rope_theta, torch_current_stream);
     TORCH_CHECK(status == cudaSuccess, "SingleDecodeWithKVCache kernel launch failed, error: " +
                                            std::string(cudaGetErrorString(status)));
     return true;

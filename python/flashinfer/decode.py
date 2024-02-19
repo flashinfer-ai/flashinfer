@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+
 import math
 from typing import Optional, Union
 import torch
@@ -477,9 +478,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         # NOTE(Zihao): the following tensor acts as placeholder to pass dtype info
         empty_data = torch.empty(
             0,
-            dtype=getattr(torch, data_type)
-            if isinstance(data_type, str)
-            else data_type,
+            dtype=(
+                getattr(torch, data_type) if isinstance(data_type, str) else data_type
+            ),
         )
         self._wrapper.begin_forward(
             self._workspace_buffer,

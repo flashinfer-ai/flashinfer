@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #pragma once
+#include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
 
 #include "generated/dispatch.inc"

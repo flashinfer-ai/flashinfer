@@ -65,15 +65,18 @@ void append_paged_kv_cache(torch::Tensor append_key, torch::Tensor append_value,
   CHECK_EQ(append_value.size(1), num_heads);
   CHECK_EQ(append_key.size(2), head_dim);
 
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
+
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(kv_data.scalar_type(), c_type, [&] {
     DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
       paged_kv_t<page_storage, KV_LAYOUT, c_type, int32_t> paged_kv(
           num_heads, page_size, head_dim, batch_size, static_cast<c_type*>(kv_data.data_ptr()),
           static_cast<int32_t*>(kv_indices.data_ptr()), static_cast<int32_t*>(kv_indptr.data_ptr()),
           static_cast<int32_t*>(kv_last_page_len.data_ptr()));
-      cudaError_t status = AppendPagedKVCache(paged_kv, static_cast<c_type*>(append_key.data_ptr()),
-                                              static_cast<c_type*>(append_value.data_ptr()),
-                                              static_cast<int32_t*>(append_indptr.data_ptr()));
+      cudaError_t status =
+          AppendPagedKVCache(paged_kv, static_cast<c_type*>(append_key.data_ptr()),
+                             static_cast<c_type*>(append_value.data_ptr()),
+                             static_cast<int32_t*>(append_indptr.data_ptr()), torch_current_stream);
       TORCH_CHECK(status == cudaSuccess,
                   "AppendPagedKVCache failed with error: ", cudaGetErrorString(status));
       return true;

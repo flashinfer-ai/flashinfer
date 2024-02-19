@@ -24,6 +24,8 @@ mkdir -p $HOME
 export PATH="$HOME/.local/bin:$PATH"
 CUDA_MAJOR="${FLASHINFER_CI_CUDA_VERSION%.*}"
 CUDA_MINOR="${FLASHINFER_CI_CUDA_VERSION#*.}"
+TORCH_MAJOR="${FLASHINFER_CI_TORCH_VERSION%.*}"
+TORCH_MINOR="${FLASHINFER_CI_TORCH_VERSION#*.}"
 PYVER="${FLASHINFER_CI_PYTHON_VERSION//./}"
 export PATH="/opt/python/cp${PYVER}-cp${PYVER}/bin:$PATH"
 
@@ -40,7 +42,7 @@ echo "::endgroup::"
 
 echo "::group::Build wheel for FlashInfer"
 cd "$PROJECT_ROOT/python"
-MAX_JOBS=32 FLASHINFER_BUILD_VERSION="${FLASHINFER_BUILD_VERSION}+cu${CUDA_MAJOR}${CUDA_MINOR}" python -m build --no-isolation
+MAX_JOBS=32 FLASHINFER_BUILD_VERSION="${FLASHINFER_BUILD_VERSION}+cu${CUDA_MAJOR}${CUDA_MINOR}torch${FLASHINFER_CI_TORCH_VERSION}" python -m build --no-isolation
 rm -f dist/*.tar.gz
 python -m build --no-isolation --sdist
 echo "::endgroup::"
