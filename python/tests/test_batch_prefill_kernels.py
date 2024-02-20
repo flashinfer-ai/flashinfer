@@ -157,4 +157,4 @@ def test_batch_prefill_with_ragged_kv_cache(
 if __name__ == "__main__":
     test_batch_prefill_with_paged_kv_cache(12, 54, 37, 8, 8, 8, 128, True, "HND")
     test_batch_prefill_with_paged_kv_cache(12, 54, 37, 1, 8, 8, 128, True, "HND")
-    test_batch_prefill_with_ragged_kv_cache(12, 54, 37, 8, 8, 8, 128, True)
+    test_batch_prefill_with_ragged_kv_cache(12, 54, 37, 8, 8, 128, True)
