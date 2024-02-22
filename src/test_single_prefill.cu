@@ -34,7 +34,7 @@ void _TestSinglePrefillKernelCorrectness(size_t qo_len, size_t kv_len, size_t nu
   std::vector<DTypeOut> o(qo_len * num_qo_heads * head_dim);
 
   utils::vec_normal_(q);
-  utils::vec_fill_<DTypeIn>(k, 1.f);
+  utils::vec_normal_(k);
   utils::vec_normal_(v);
   utils::vec_zero_(o);
 
