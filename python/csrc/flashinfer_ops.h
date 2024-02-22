@@ -79,7 +79,8 @@ class BatchPrefillWithPagedKVCachePyTorchWrapper {
     return BatchPrefillWithPagedKVCachePyTorchWrapper(layout);
   }
   void BeginForward(torch::Tensor workspace_buffer, torch::Tensor qo_indptr,
-                    unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads);
+                    unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads,
+                    unsigned int head_dim);
   void EndForward();
   std::vector<torch::Tensor> Forward(torch::Tensor q, torch::Tensor qo_indptr,
                                      torch::Tensor paged_kv_data, torch::Tensor paged_kv_indptr,
@@ -101,7 +102,8 @@ class BatchPrefillWithRaggedKVCachePyTorchWrapper {
     return BatchPrefillWithRaggedKVCachePyTorchWrapper(layout);
   }
   void BeginForward(torch::Tensor workspace_buffer, torch::Tensor qo_indptr,
-                    unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads);
+                    unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads,
+                    unsigned int head_dim);
   void EndForward();
   std::vector<torch::Tensor> Forward(torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor k,
                                      torch::Tensor v, torch::Tensor kv_indptr, bool causal,

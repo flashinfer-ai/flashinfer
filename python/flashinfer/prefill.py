@@ -298,7 +298,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
     ...     paged_kv_indices,
     ...     paged_kv_last_page_len,
     ...     num_qo_heads,
-    ...     num_kv_heads
+    ...     num_kv_heads,
+    ...     head_dim
     ... )
     >>> outputs = []
     >>> for i in range(num_layers):
@@ -365,6 +366,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         paged_kv_last_page_len: torch.Tensor,
         num_qo_heads: int,
         num_kv_heads: int,
+        head_dim: int,
     ):
         r"""Create auxiliary data structures for batch prefill/append attention for
         multiple forward calls within the same prefill/append step.
@@ -384,6 +386,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The number of query/output heads.
         num_kv_heads : int
             The number of key/value heads.
+        head_dim : int
+            The dimension of the heads.
 
         Notes
         -----
@@ -401,7 +405,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._paged_kv_indices = paged_kv_indices
         self._paged_kv_last_page_len = paged_kv_last_page_len
         self._wrapper.begin_forward(
-            self._workspace_buffer, qo_indptr, batch_size, num_qo_heads, num_kv_heads
+            self._workspace_buffer,
+            qo_indptr,
+            batch_size,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
         )
 
     def end_forward(self):
@@ -571,7 +580,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
     ...     qo_indptr,
     ...     kv_indptr,
     ...     num_qo_heads,
-    ...     num_kv_heads
+    ...     num_kv_heads,
+    ...     head_dim
     ... )
     >>> outputs = []
     >>> for i in range(num_layers):
@@ -635,6 +645,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         kv_indptr: torch.Tensor,
         num_qo_heads: int,
         num_kv_heads: int,
+        head_dim: int,
     ):
         r"""Create auxiliary data structures for batch prefill/append attention for
         multiple forward calls within the same prefill/append step.
@@ -649,6 +660,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The number of query/output heads.
         num_kv_heads : int
             The number of key/value heads.
+        head_dim : int
+            The dimension of the heads.
 
         Notes
         -----
@@ -664,7 +677,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._qo_indptr = qo_indptr
         self._kv_indptr = kv_indptr
         self._wrapper.begin_forward(
-            self._workspace_buffer, qo_indptr, batch_size, num_qo_heads, num_kv_heads
+            self._workspace_buffer,
+            qo_indptr,
+            batch_size,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
         )
 
     def end_forward(self):
