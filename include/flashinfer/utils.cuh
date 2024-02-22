@@ -169,25 +169,6 @@
     }                                                  \
   }
 
-#define DISPATCH_HEAD_DIM_PREFILL(head_dim, HEAD_DIM, ...) \
-  switch (head_dim) {                                      \
-    case 64: {                                             \
-      constexpr size_t HEAD_DIM = 64;                      \
-      __VA_ARGS__                                          \
-      break;                                               \
-    }                                                      \
-    case 128: {                                            \
-      constexpr size_t HEAD_DIM = 128;                     \
-      __VA_ARGS__                                          \
-      break;                                               \
-    }                                                      \
-    default: {                                             \
-      std::ostringstream err_msg;                          \
-      err_msg << "Unsupported head_dim: " << head_dim;     \
-      throw std::invalid_argument(err_msg.str());          \
-    }                                                      \
-  }
-
 #define DISPATCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, ...)       \
   switch (rotary_mode) {                                          \
     case RotaryMode::kNone: {                                     \
@@ -222,7 +203,7 @@ __forceinline__ __device__ __host__ T1 ceil_div(const T1 x, const T2 y) {
 
 template <typename IdType>
 std::tuple<IdType, IdType, std::vector<IdType>, std::vector<IdType>> split_qo_indptr(
-    IdType* qo_indptr, uint32_t batch_size, uint32_t gqa_group_size,
+    IdType* qo_indptr, uint32_t batch_size, uint32_t gqa_group_size, uint32_t head_dim,
     cudaStream_t stream = nullptr) {
   constexpr uint32_t num_warps = 4;
   std::vector<IdType> qo_indptr_h(batch_size + 1), request_indices, tile_indices;
@@ -235,7 +216,7 @@ std::tuple<IdType, IdType, std::vector<IdType>, std::vector<IdType>> split_qo_in
 
   const uint32_t total_q_len = qo_indptr_h[batch_size];
   const bool avg_len_greater_than_64 = total_q_len * gqa_group_size > 64 * batch_size;
-  const uint32_t num_frags_x = avg_len_greater_than_64 ? 2 : 1;
+  const uint32_t num_frags_x = (head_dim < 256 && avg_len_greater_than_64) ? 2 : 1;
   const uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
   uint32_t num_qo_tiles = 0;
 

@@ -514,8 +514,8 @@ cudaError_t _BatchPrefillWithRaggedKVCacheWrapper(
 void _FlashInferAttentionPrefillWithRaggedKVCache(
     DLTensor* q_data, DLTensor* qo_indptr, DLTensor* k_data, DLTensor* v_data, DLTensor* kv_indptr,
     DLTensor* q_rope_position_map, DLTensor* k_rope_pos_offset, DLTensor* output, DLTensor* lse,
-    int64_t causal = 1, int64_t rotary_mode = 0, double rope_scale = 1.0f,
-    double rope_theta = 1e4, double attn_score_scaling_factor = 1.0f) {
+    int64_t causal = 1, int64_t rotary_mode = 0, double rope_scale = 1.0f, double rope_theta = 1e4,
+    double attn_score_scaling_factor = 1.0f) {
   CHECK_EQ(q_data->device.device_type, kDLCUDA) << "The device of q_data must be CUDA.";
   CHECK_EQ(qo_indptr->device.device_type, kDLCUDA) << "The device of qo_indptr must be CUDA.";
   CHECK_EQ(k_data->device.device_type, kDLCUDA) << "The device of k_data must be CUDA.";

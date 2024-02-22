@@ -187,7 +187,8 @@ class BatchPrefillHandler {
 
   template <typename IdType>
   cudaError_t BeginForward(void* buffer, size_t workspace_size_in_bytes, IdType* qo_indptr,
-                           uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads) {
+                           uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
+                           uint32_t head_dim) {
     if (num_qo_heads % num_kv_heads != 0) {
       std::ostringstream err_msg;
       err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -197,7 +198,7 @@ class BatchPrefillHandler {
     uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
     std::vector<IdType> request_indices_h, tile_indices_h;
     std::tie(num_frags_x_, num_qo_tiles_, request_indices_h, tile_indices_h) =
-        split_qo_indptr(qo_indptr, batch_size, gqa_group_size, stream_);
+        split_qo_indptr(qo_indptr, batch_size, gqa_group_size, head_dim, stream_);
     AlignedAlloactor allocator(buffer, workspace_size_in_bytes);
     request_indices_ =
         allocator.aligned_alloc<void*>(sizeof(IdType) * request_indices_h.size(), 16);

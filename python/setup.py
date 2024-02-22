@@ -33,7 +33,7 @@ def get_instantiation_cu() -> list[str]:
     (root / prefix).mkdir(parents=True, exist_ok=True)
     dtypes = {"fp16": "nv_half", "bf16": "nv_bfloat16"}
     group_sizes = os.environ.get("FLASHINFER_GROUP_SIZES", "1,4,8").split(",")
-    head_dims = os.environ.get("FLASHINFER_HEAD_DIMS", "64, 128").split(",")
+    head_dims = os.environ.get("FLASHINFER_HEAD_DIMS", "64,128,256").split(",")
     group_sizes = [int(x) for x in group_sizes]
     head_dims = [int(x) for x in head_dims]
     causal_options = [False, True]

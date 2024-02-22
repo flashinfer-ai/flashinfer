@@ -1414,11 +1414,11 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
   DISPATCH_ALLOW_FP16_QK_REDUCTION(
       allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
       {DISPATCH_NUM_FRAGS_X(
-          (qo_len * group_size > 64 ? 2 : 1), num_frags_x,
+          (qo_len * group_size > 64 && head_dim < 256 ? 2 : 1), num_frags_x,
           {DISPATCH_GQA_GROUP_SIZE(
               group_size, GROUP_SIZE,
               {DISPATCH_CAUSAL(
-                  causal, CAUSAL, {DISPATCH_HEAD_DIM_PREFILL(head_dim, HEAD_DIM, {
+                  causal, CAUSAL, {DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
                     constexpr uint32_t num_frags_y = HEAD_DIM / 16;
                     DISPATCH_ROTARY_MODE(
                         rotary_mode, ROTARY_MODE, {DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
@@ -1646,7 +1646,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOu
           group_size, GROUP_SIZE,
           {DISPATCH_CAUSAL(
               causal, CAUSAL,
-              {DISPATCH_HEAD_DIM_PREFILL(
+              {DISPATCH_HEAD_DIM(
                   head_dim, HEAD_DIM,
                   {DISPATCH_ROTARY_MODE(
                       rotary_mode, ROTARY_MODE, {DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
@@ -1739,7 +1739,7 @@ cudaError_t BatchPrefillWithRaggedKVCache(
   uint32_t num_frags_x, num_qo_tiles;
   std::vector<IdType> request_indices_h, tile_indices_h;
   std::tie(num_frags_x, num_qo_tiles, request_indices_h, tile_indices_h) =
-      split_qo_indptr(qo_indptr, batch_size, group_size, stream);
+      split_qo_indptr(qo_indptr, batch_size, group_size, head_dim, stream);
 
   IdType* request_indices_d;
   IdType* tile_indices_d;
@@ -1765,7 +1765,7 @@ cudaError_t BatchPrefillWithRaggedKVCache(
                   num_qo_heads / num_kv_heads, GROUP_SIZE,
                   {DISPATCH_CAUSAL(
                       causal, CAUSAL,
-                      {DISPATCH_HEAD_DIM_PREFILL(
+                      {DISPATCH_HEAD_DIM(
                           head_dim, HEAD_DIM, {DISPATCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
                             return BatchPrefillWithRaggedKVCacheDispatched<
                                 NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM, KV_LAYOUT, ROTARY_MODE,
@@ -1928,7 +1928,7 @@ cudaError_t BatchPrefillWithPagedKVCache(
   uint32_t num_frags_x, num_qo_tiles;
   std::vector<IdType> request_indices_h, tile_indices_h;
   std::tie(num_frags_x, num_qo_tiles, request_indices_h, tile_indices_h) =
-      split_qo_indptr(qo_indptr, batch_size, group_size, stream);
+      split_qo_indptr(qo_indptr, batch_size, group_size, head_dim, stream);
 
   IdType* request_indices_d;
   IdType* tile_indices_d;
@@ -1952,7 +1952,7 @@ cudaError_t BatchPrefillWithPagedKVCache(
               group_size, GROUP_SIZE,
               {DISPATCH_CAUSAL(
                   causal, CAUSAL,
-                  {DISPATCH_HEAD_DIM_PREFILL(
+                  {DISPATCH_HEAD_DIM(
                       head_dim, HEAD_DIM,
                       {DISPATCH_ROTARY_MODE(
                           rotary_mode, ROTARY_MODE,
