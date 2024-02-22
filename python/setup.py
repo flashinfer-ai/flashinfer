@@ -38,7 +38,8 @@ for cuda_arch_flags in torch_cpp_ext._get_cuda_arch_flags():
 
 if enable_bf16:
     torch_cpp_ext.COMMON_NVCC_FLAGS.append("-DFLASHINFER_ENABLE_BF16")
-    
+
+
 def get_instantiation_cu() -> list[str]:
     prefix = "csrc/generated"
     (root / prefix).mkdir(parents=True, exist_ok=True)
@@ -153,7 +154,7 @@ def get_instantiation_cu() -> list[str]:
 def get_version():
     version = os.getenv("FLASHINFER_BUILD_VERSION")
     if version is None:
-        with open(root / "../version.txt") as f:
+        with open((root / "version.txt").resolve()) as f:
             version = f.read().strip()
     return version
 
@@ -212,7 +213,7 @@ if __name__ == "__main__":
             ]
             + get_instantiation_cu(),
             include_dirs=[
-                str(root.resolve() / "../include"),
+                str((root / "../include")).resolve(),
             ],
             extra_compile_args={
                 "cxx": ["-O3"],
