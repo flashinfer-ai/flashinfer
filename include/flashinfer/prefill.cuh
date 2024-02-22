@@ -1512,7 +1512,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
   }
 
   constexpr uint32_t num_frags_y = HEAD_DIM / 16;
-  DISPATCH_NUM_FRAGS_X((qo_len * GROUP_SIZE > 64 ? 2 : 1), num_frags_x, {
+  DISPATCH_NUM_FRAGS_X((qo_len * GROUP_SIZE > 64 && HEAD_DIM < 256 ? 2 : 1), num_frags_x, {
     using DTypeQKAccum =
         typename std::conditional<ALLOW_FP16_QK_REDUCTION && std::is_same<DTypeIn, half>::value,
                                   half, float>::type;
