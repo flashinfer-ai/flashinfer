@@ -402,32 +402,70 @@ __device__ __forceinline__ void k_smem_inplace_apply_rotary(const uint32_t kv_id
   constexpr uint32_t channel_size_128b_in = head_dim / num_elems_per_128b<DTypeIn>();
   uint32_t k_frag_local[2][4];
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
-  uint32_t kv_idx = kv_idx_base + (ty / 2) * 16 + tx / 4;
-  *k_smem_offset_r = (*k_smem_offset_r ^ (0x2 * (ty % 2))) + (ty / 2) * 16 * channel_size_128b_in;
-#pragma unroll
-  for (uint32_t i = 0; i < num_frags_z / 2; ++i) {
-    // uint32_t fz = ty / 2 + i * 2;
-    uint32_t k_smem_offset_r_first_half = *k_smem_offset_r;
-#pragma unroll
-    for (uint32_t j = 0; j < num_frags_y / 4; ++j) {
-      uint32_t fyi = (ty % 2) + j * 2;
-      k_smem->ldmatrix_m8n8x4(k_smem_offset_r_first_half, k_frag_local[0]);
-      uint32_t k_smem_offset_r_last_half =
-          k_smem->advance_offset_by_column<num_frags_y>(k_smem_offset_r_first_half, 0);
-      k_smem->ldmatrix_m8n8x4(k_smem_offset_r_last_half, k_frag_local[1]);
-      frag_apply_llama_rope<FragLayout::kColMajor, 1, DTypeIn>(
-          (DTypeIn*)k_frag_local[0], (DTypeIn*)k_frag_local[1], rope_freq[fyi], kv_idx);
-      k_smem->stmatrix_m8n8x4(k_smem_offset_r_last_half, k_frag_local[1]);
-      k_smem->stmatrix_m8n8x4(k_smem_offset_r_first_half, k_frag_local[0]);
-      k_smem_offset_r_first_half =
-          k_smem->advance_offset_by_column<4>(k_smem_offset_r_first_half, 0);
-      ;
+  if constexpr (num_frags_y == 4) {
+    // horizontal-axis: y
+    // vertical-axis: z
+    //         | 1-16       | 16-32      | 32-48      | 48-64      |
+    // | 1-16  | warp_idx=0 | warp_idx=1 | warp_idx=0 | warp_idx=1 |
+    // | 16-32 | warp_idx=2 | warp_idx=3 | warp_idx=2 | warp_idx=3 |
+    // static_assert(num_frags_z % 2 == 0, "when num_frags_y == 4, num_frags_z must be a multiple of 2");
+    uint32_t kv_idx = kv_idx_base + (ty / 2) * 16 + tx / 4;
+    *k_smem_offset_r = (*k_smem_offset_r ^ (0x2 * (ty % 2))) + (ty / 2) * 16 * channel_size_128b_in;
+  #pragma unroll
+    for (uint32_t i = 0; i < num_frags_z / 2; ++i) {
+      // uint32_t fz = ty / 2 + i * 2;
+      uint32_t k_smem_offset_r_first_half = *k_smem_offset_r;
+  #pragma unroll
+      for (uint32_t j = 0; j < 1; ++j) {
+        uint32_t fyi = (ty % 2);
+        k_smem->ldmatrix_m8n8x4(k_smem_offset_r_first_half, k_frag_local[0]);
+        uint32_t k_smem_offset_r_last_half =
+            k_smem->advance_offset_by_column<4>(k_smem_offset_r_first_half, 0);
+        k_smem->ldmatrix_m8n8x4(k_smem_offset_r_last_half, k_frag_local[1]);
+        frag_apply_llama_rope<FragLayout::kColMajor, 1, DTypeIn>(
+            (DTypeIn*)k_frag_local[0], (DTypeIn*)k_frag_local[1], rope_freq[fyi], kv_idx);
+        k_smem->stmatrix_m8n8x4(k_smem_offset_r_last_half, k_frag_local[1]);
+        k_smem->stmatrix_m8n8x4(k_smem_offset_r_first_half, k_frag_local[0]);
+        k_smem_offset_r_first_half =
+            k_smem->advance_offset_by_column<4>(k_smem_offset_r_first_half, 0);
+      }
+      *k_smem_offset_r += 32 * channel_size_128b_in;
+      kv_idx += 32;
     }
-    *k_smem_offset_r += 32 * channel_size_128b_in;
-    kv_idx += 32;
+    *k_smem_offset_r =
+        (*k_smem_offset_r ^ (0x2 * (ty % 2))) - ((ty / 2) + num_frags_z) * 16 * channel_size_128b_in;
+  } else {
+    // static_assert(num_frags_y % 8 == 0);
+    // horizontal axis: y
+    // vertical axis: z
+    //         | 1-16       | 16-32      | 32-48      | 48-64      | ...
+    // | 1-16  | warp_idx=0 | warp_idx=1 | warp_idx=2 | warp_idx=3 | ...
+    // | 16-32 | warp_idx=0 | warp_idx=1 | warp_idx=2 | warp_idx=3 | ...
+    // ...
+    uint32_t kv_idx = kv_idx_base + tx / 4;
+    *k_smem_offset_r = *k_smem_offset_r ^ (0x2 * ty);
+#pragma unroll
+    for (uint32_t i = 0; i < num_frags_z; ++i) {
+      uint32_t k_smem_offset_r_first_half = *k_smem_offset_r;
+#pragma unroll
+      for (uint32_t j = 0; j < num_frags_y / 8; ++j) {
+        uint32_t fyi = ty + j * 4;
+        k_smem->ldmatrix_m8n8x4(k_smem_offset_r_first_half, k_frag_local[0]);
+        uint32_t k_smem_offset_r_last_half =
+            k_smem->advance_offset_by_column<num_frags_y>(k_smem_offset_r_first_half, 0);
+        k_smem->ldmatrix_m8n8x4(k_smem_offset_r_last_half, k_frag_local[1]);
+        frag_apply_llama_rope<FragLayout::kColMajor, 1, DTypeIn>(
+            (DTypeIn*)k_frag_local[0], (DTypeIn*)k_frag_local[1], rope_freq[fyi], kv_idx);
+        k_smem->stmatrix_m8n8x4(k_smem_offset_r_last_half, k_frag_local[1]);
+        k_smem->stmatrix_m8n8x4(k_smem_offset_r_first_half, k_frag_local[0]);
+        k_smem_offset_r_first_half =
+            k_smem->advance_offset_by_column<8>(k_smem_offset_r_first_half, 0);
+      }
+      *k_smem_offset_r += 16 * channel_size_128b_in;
+      kv_idx += 16;
+    }
+    *k_smem_offset_r = (*k_smem_offset_r ^ (0x2 * ty)) - num_frags_z * 16 * channel_size_128b_in;
   }
-  *k_smem_offset_r =
-      (*k_smem_offset_r ^ (0x2 * (ty % 2))) - ((ty / 2) + num_frags_z) * 16 * channel_size_128b_in;
 }
 
 template <uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z, typename DTypeIn,
