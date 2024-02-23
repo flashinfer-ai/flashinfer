@@ -152,20 +152,12 @@ TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelLongContextCorrectnessFP1
   TestSinglePrefillKernelLongContextCorrectness<half, half>(true);
 }
 
-TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelLongContextCorrectnessBF16) {
-  TestSinglePrefillKernelLongContextCorrectness<nv_bfloat16, nv_bfloat16>(false);
-}
-
 TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelShortContextCorrectnessFP16) {
   TestSinglePrefillKernelShortContextCorrectness<half, half>(false);
 }
 
 TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelShortContextCorrectnessFP16QKHalfAccum) {
   TestSinglePrefillKernelShortContextCorrectness<half, half>(true);
-}
-
-TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelShortContextCorrectnessBF16) {
-  TestSinglePrefillKernelShortContextCorrectness<nv_bfloat16, nv_bfloat16>(false);
 }
 
 TEST(FlashInferCorrectnessTest, SinglePrefillKernelCorrectnessTestFP16) {
@@ -176,6 +168,14 @@ TEST(FlashInferCorrectnessTest, SinglePrefillKernelCorrectnessTestFP16QKHalfAccu
   TestSinglePrefillKernelCorrectness<half, half>(true);
 }
 
+#ifdef FLASHINFER_ENABLE_BF16
+TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelLongContextCorrectnessBF16) {
+  TestSinglePrefillKernelLongContextCorrectness<nv_bfloat16, nv_bfloat16>(false);
+}
+TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelShortContextCorrectnessBF16) {
+  TestSinglePrefillKernelShortContextCorrectness<nv_bfloat16, nv_bfloat16>(false);
+}
 TEST(FlashInferCorrectnessTest, SinglePrefillKernelCorrectnessTestBF16) {
   TestSinglePrefillKernelCorrectness<nv_bfloat16, nv_bfloat16>(false);
 }
+#endif

@@ -183,14 +183,17 @@ TEST(FlashInferCorrectnessTest, BatchDecodeKernelCorrectnessTestFP16) {
   TestBatchDecodeKernelCorrectness<half>();
 }
 
+#ifdef FLASHINFER_ENABLE_BF16
 TEST(FlashInferCorrectnessTest, TestBatchDecodeKernelCorrectnessBF16) {
   TestBatchDecodeKernelCorrectness<__nv_bfloat16>();
 }
+#endif
 
 TEST(FlashInferCorrectnessTest, TestBatchDecodeKernelCorrectnessFP32) {
   TestBatchDecodeKernelCorrectness<float>();
 }
 
+#ifdef FLASHINFER_ENABLE_FP8
 TEST(FlashInferCorrectnessTest, TestBatchDecodeKernelCorrectnessE4M3) {
   TestBatchDecodeKernelCorrectness<__nv_fp8_e4m3>();
 }
@@ -198,6 +201,7 @@ TEST(FlashInferCorrectnessTest, TestBatchDecodeKernelCorrectnessE4M3) {
 TEST(FlashInferCorrectnessTest, TestBatchDecodeKernelCorrectnessE5M2) {
   TestBatchDecodeKernelCorrectness<__nv_fp8_e5m2>();
 }
+#endif
 
 TEST(FlashInferCorrectnessTest, TestCooperativeBatchDecodeKernelCorrectnessTestFP16) {
   TestCooperativeBatchDecodeKernelCorrectness<half>();

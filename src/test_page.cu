@@ -319,32 +319,34 @@ TEST(FlashInferCorrectnessTest, AppendPagedKVKernelCorrectnessTestFP16) {
   TestAppendPagedKVKernelCorrectness<half>();
 }
 
-TEST(FlashInferCorrectnessTest, AppendPagedKVKernelCorrectnessTestBF16) {
-  TestAppendPagedKVKernelCorrectness<__nv_bfloat16>();
+TEST(FlashInferCorrectnessTest, PagedKVCacheToRaggedTensorCorrectnessTestFP16) {
+  TestPagedKVCacheToRaggedTensorCorrectness<half>();
 }
 
 TEST(FlashInferCorrectnessTest, AppendPagedKVKernelCorrectnessTestFP32) {
   TestAppendPagedKVKernelCorrectness<float>();
 }
 
+TEST(FlashInferCorrectnessTest, PagedKVCacheToRaggedTensorCorrectnessTestFP32) {
+  TestPagedKVCacheToRaggedTensorCorrectness<float>();
+}
+
+#ifdef FLASHINFER_ENABLE_BF16
+TEST(FlashInferCorrectnessTest, AppendPagedKVKernelCorrectnessTestBF16) {
+  TestAppendPagedKVKernelCorrectness<__nv_bfloat16>();
+}
+TEST(FlashInferCorrectnessTest, PagedKVCacheToRaggedTensorCorrectnessTestBF16) {
+  TestPagedKVCacheToRaggedTensorCorrectness<__nv_bfloat16>();
+}
+#endif
+
+#ifdef FLASHINFER_ENABLE_FP8
 TEST(FlashInferCorrectnessTest, AppendPagedKVKernelCorrectnessTestE4M3) {
   TestAppendPagedKVKernelCorrectness<__nv_fp8_e4m3>();
 }
 
 TEST(FlashInferCorrectnessTest, AppendPagedKVKernelCorrectnessTestE5M2) {
   TestAppendPagedKVKernelCorrectness<__nv_fp8_e5m2>();
-}
-
-TEST(FlashInferCorrectnessTest, PagedKVCacheToRaggedTensorCorrectnessTestFP16) {
-  TestPagedKVCacheToRaggedTensorCorrectness<half>();
-}
-
-TEST(FlashInferCorrectnessTest, PagedKVCacheToRaggedTensorCorrectnessTestBF16) {
-  TestPagedKVCacheToRaggedTensorCorrectness<__nv_bfloat16>();
-}
-
-TEST(FlashInferCorrectnessTest, PagedKVCacheToRaggedTensorCorrectnessTestFP32) {
-  TestPagedKVCacheToRaggedTensorCorrectness<float>();
 }
 
 TEST(FlashInferCorrectnessTest, PagedKVCacheToRaggedTensorCorrectnessTestE4M3) {
@@ -354,3 +356,4 @@ TEST(FlashInferCorrectnessTest, PagedKVCacheToRaggedTensorCorrectnessTestE4M3) {
 TEST(FlashInferCorrectnessTest, PagedKVCacheToRaggedTensorCorrectnessTestE5M2) {
   TestPagedKVCacheToRaggedTensorCorrectness<__nv_fp8_e5m2>();
 }
+#endif

@@ -19,6 +19,7 @@
 
 #include "generated/dispatch.inc"
 
+#ifdef FLASHINFER_ENABLE_BF16
 #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...) \
   [&]() -> bool {                                                   \
     switch (pytorch_dtype) {                                        \
@@ -34,6 +35,19 @@
         return false;                                               \
     }                                                               \
   }()
+#else
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...) \
+  [&]() -> bool {                                                   \
+    switch (pytorch_dtype) {                                        \
+      case at::ScalarType::Half: {                                  \
+        using c_type = nv_half;                                     \
+        return __VA_ARGS__();                                       \
+      }                                                             \
+      default:                                                      \
+        return false;                                               \
+    }                                                               \
+  }()
+#endif
 
 #define _DISPATCH_SWITCH(cond, ...) \
   [&]() -> bool {                   \
