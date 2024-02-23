@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from typing import List, Tuple
+
 import pathlib
 import os
 import re
@@ -40,7 +42,7 @@ if enable_bf16:
     torch_cpp_ext.COMMON_NVCC_FLAGS.append("-DFLASHINFER_ENABLE_BF16")
 
 
-def get_instantiation_cu() -> list[str]:
+def get_instantiation_cu() -> List[str]:
     prefix = "csrc/generated"
     (root / prefix).mkdir(parents=True, exist_ok=True)
     dtypes = {"fp16": "nv_half"}
@@ -154,12 +156,12 @@ def get_instantiation_cu() -> list[str]:
 def get_version():
     version = os.getenv("FLASHINFER_BUILD_VERSION")
     if version is None:
-        with open((root / "version.txt").resolve()) as f:
+        with open(root / "version.txt") as f:
             version = f.read().strip()
     return version
 
 
-def get_cuda_version() -> tuple[int, int]:
+def get_cuda_version() -> Tuple[int, int]:
     if torch_cpp_ext.CUDA_HOME is None:
         nvcc = "nvcc"
     else:
@@ -213,7 +215,7 @@ if __name__ == "__main__":
             ]
             + get_instantiation_cu(),
             include_dirs=[
-                str((root / "../include")).resolve(),
+                str(root.resolve() / "include"),
             ],
             extra_compile_args={
                 "cxx": ["-O3"],
@@ -230,7 +232,7 @@ if __name__ == "__main__":
         license="Apache License 2.0",
         description="FlashInfer: Kernel Library for LLM Serving",
         url="https://github.com/flashinfer-ai/flashinfer",
-        python_requires=">=3.9",
+        python_requires=">=3.8",
         ext_modules=ext_modules,
         cmdclass={"build_ext": torch_cpp_ext.BuildExtension},
     )
