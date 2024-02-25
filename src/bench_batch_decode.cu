@@ -150,14 +150,16 @@ void bench_flashinfer_batch_decode_with_prefill(nvbench::state& state) {
   thrust::device_vector<char> buffer(workspace_size_in_bytes);
 
   handler.BeginForward((void*)thrust::raw_pointer_cast(buffer.data()), workspace_size_in_bytes,
-                       qo_indptr_h.data(), batch_size, num_qo_heads, num_kv_heads);
+                       qo_indptr_h.data(), batch_size, num_qo_heads, num_kv_heads, head_dim);
 
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
-    cudaError_t status = BatchPrefillWithPagedKVCacheWrapper<PageStorage::kIndices, T, T, int32_t>(
-        &handler, thrust::raw_pointer_cast(q.data()), thrust::raw_pointer_cast(qo_indptr_d.data()),
-        /*q_rope_position=*/nullptr, paged_kv, thrust::raw_pointer_cast(o.data()),
-        /*lse=*/nullptr, num_qo_heads,
-        /*causal=*/false, rotary_mode);
+    cudaError_t status =
+        BatchPrefillWithPagedKVCacheWrapper<PageStorage::kIndices, kv_layout, T, T, int32_t>(
+            &handler, thrust::raw_pointer_cast(q.data()),
+            thrust::raw_pointer_cast(qo_indptr_d.data()),
+            /*q_rope_position=*/nullptr, paged_kv, thrust::raw_pointer_cast(o.data()),
+            /*lse=*/nullptr, num_qo_heads,
+            /*causal=*/false, rotary_mode);
   });
 }
 

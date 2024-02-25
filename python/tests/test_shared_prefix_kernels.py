@@ -29,7 +29,7 @@ def ceil_div(a, b):
 @pytest.mark.parametrize("unique_kv_len", [37, 17])
 @pytest.mark.parametrize("shared_kv_len", [54, 97, 1979])
 @pytest.mark.parametrize("num_heads", [8, 16])
-@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("head_dim", [128, 256])
 def test_batch_decode_with_shared_prefix_padded_kv_cache(
     batch_size, unique_kv_len, shared_kv_len, num_heads, head_dim
 ):
@@ -57,7 +57,7 @@ def test_batch_decode_with_shared_prefix_padded_kv_cache(
 @pytest.mark.parametrize("unique_kv_len", [37, 17])
 @pytest.mark.parametrize("shared_kv_len", [54, 97, 1979])
 @pytest.mark.parametrize("num_heads", [8, 16])
-@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("page_size", [1, 4, 16])
 def test_batch_decode_with_shared_prefix_paged_kv_cache(
     batch_size, unique_kv_len, shared_kv_len, num_heads, head_dim, page_size
@@ -130,7 +130,7 @@ def test_batch_decode_with_shared_prefix_paged_kv_cache(
 @pytest.mark.parametrize("shared_kv_len", [128, 512, 2048])
 @pytest.mark.parametrize("num_heads", [8, 16])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("page_size", [1, 4, 16])
 def test_batch_prefill_with_shared_prefix_paged_kv_cache(
     batch_size, unique_kv_len, shared_kv_len, num_heads, causal, head_dim, page_size
@@ -226,6 +226,7 @@ def test_batch_prefill_with_shared_prefix_paged_kv_cache(
         baseline_kv_last_page_len,
         num_heads,
         num_heads,
+        head_dim,
     )
 
     o_baseline = baseline_wrapper.forward(q, kv_data, causal=causal)
@@ -240,6 +241,7 @@ def test_batch_prefill_with_shared_prefix_paged_kv_cache(
         cascade_kv_last_page_len,
         num_heads,
         num_heads,
+        head_dim,
     )
 
     o_cascade = cascade_wrapper.forward(q, k_shared, v_shared, kv_data, causal=causal)

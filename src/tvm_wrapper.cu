@@ -324,14 +324,14 @@ void _FlashInferAttentionPrefillWithPagedKVCache(int64_t handler_id, DLTensor* q
 
 void _FlashInferAttentionPrefillWithPagedKVCacheBeginForward(
     int64_t handler_idx, DLTensor* workspace_buffer, DLTensor* qo_indptr, int64_t batch_size,
-    int64_t num_qo_heads, int64_t num_kv_heads) {
+    int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim) {
   CHECK_EQ(workspace_buffer->ndim, 1) << "The workspace buffer must be a 1-D tensor";
   size_t workspace_size_in_bytes = workspace_buffer->shape[0] * workspace_buffer->dtype.bits / 8;
   CHECK(handler_idx < max_num_handlers) << "The handler id must be less than " << max_num_handlers;
   DISPATCH_TVM_CUDA_IDTYPE(qo_indptr->dtype, dtype_idx, {
     cudaError_t status = batch_prefill_paged_kv_handlers[handler_idx].BeginForward(
         static_cast<void*>(workspace_buffer->data), workspace_size_in_bytes,
-        static_cast<dtype_idx*>(qo_indptr->data), batch_size, num_qo_heads, num_kv_heads);
+        static_cast<dtype_idx*>(qo_indptr->data), batch_size, num_qo_heads, num_kv_heads, head_dim);
     if (status != cudaSuccess) {
       LOG(FATAL) << "FlashInfer prefill BeginForward error " << cudaGetErrorString(status);
     }
@@ -514,8 +514,8 @@ cudaError_t _BatchPrefillWithRaggedKVCacheWrapper(
 void _FlashInferAttentionPrefillWithRaggedKVCache(
     DLTensor* q_data, DLTensor* qo_indptr, DLTensor* k_data, DLTensor* v_data, DLTensor* kv_indptr,
     DLTensor* q_rope_position_map, DLTensor* k_rope_pos_offset, DLTensor* output, DLTensor* lse,
-    int64_t causal = 1, int64_t rotary_mode = 0, double rope_scale = 1.0f,
-    double rope_theta = 1e4, double attn_score_scaling_factor = 1.0f) {
+    int64_t causal = 1, int64_t rotary_mode = 0, double rope_scale = 1.0f, double rope_theta = 1e4,
+    double attn_score_scaling_factor = 1.0f) {
   CHECK_EQ(q_data->device.device_type, kDLCUDA) << "The device of q_data must be CUDA.";
   CHECK_EQ(qo_indptr->device.device_type, kDLCUDA) << "The device of qo_indptr must be CUDA.";
   CHECK_EQ(k_data->device.device_type, kDLCUDA) << "The device of k_data must be CUDA.";
@@ -598,18 +598,16 @@ void _FlashInferAttentionPrefillWithRaggedKVCache(
           })})})
 }
 
-void _FlashInferAttentionPrefillWithRaggedKVCacheBeginForward(DLTensor* workspace_buffer,
-                                                              DLTensor* qo_indptr,
-                                                              int64_t batch_size,
-                                                              int64_t num_qo_heads,
-                                                              int64_t num_kv_heads) {
+void _FlashInferAttentionPrefillWithRaggedKVCacheBeginForward(
+    DLTensor* workspace_buffer, DLTensor* qo_indptr, int64_t batch_size, int64_t num_qo_heads,
+    int64_t num_kv_heads, int64_t head_dim) {
   CHECK_EQ(workspace_buffer->ndim, 1) << "The workspace buffer must be a 1-D tensor";
   size_t workspace_size_in_bytes = workspace_buffer->shape[0] * workspace_buffer->dtype.bits / 8;
 
   DISPATCH_TVM_CUDA_IDTYPE(qo_indptr->dtype, dtype_idx, {
     cudaError_t status = batch_prefill_ragged_kv_handler.BeginForward(
         static_cast<void*>(workspace_buffer->data), workspace_size_in_bytes,
-        static_cast<dtype_idx*>(qo_indptr->data), batch_size, num_qo_heads, num_kv_heads);
+        static_cast<dtype_idx*>(qo_indptr->data), batch_size, num_qo_heads, num_kv_heads, head_dim);
     if (status != cudaSuccess) {
       LOG(FATAL) << "FlashInfer PrefillWithRaggedKVCache BeginForward error "
                  << cudaGetErrorString(status);

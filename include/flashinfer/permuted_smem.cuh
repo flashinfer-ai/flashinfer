@@ -63,27 +63,25 @@ struct smem_t {
   template <uint32_t step_size>
   static __device__ __forceinline__ uint32_t advance_offset_by_column(uint32_t offset,
                                                                       uint32_t step_idx) {
+    static_assert(step_size == 2 || step_size == 4 || step_size % 8 == 0, "Unsupported step size");
     if constexpr (step_size == 2) {
       return (offset ^ (0x2 + (0x4 * (step_idx % 2 == 1)))) + (step_idx % 4 == 3) * 8;
     } else if constexpr (step_size == 4) {
       return (offset ^ 0x4) + (step_idx % 2 == 1) * 8;
-    } else if constexpr (step_size % 8 == 0) {
-      return offset + step_size;
     } else {
-      // Note(Zihao): not implemented yet.
-      return 0;
+      // step_size % 8 == 0
+      return offset + step_size;
     }
   }
 
   template <uint32_t step_size, uint32_t row_stride>
   static __device__ __forceinline__ uint32_t advance_offset_by_row(uint32_t offset) {
+    static_assert(step_size == 4 || step_size % 8 == 0, "Unsupported step size");
     if constexpr (step_size == 4) {
       return (offset ^ 0x4) + step_size * row_stride;
-    } else if constexpr (step_size % 8 == 0) {
-      return offset + step_size * row_stride;
     } else {
-      // NOTE(Zihao): not implemented yet.
-      return 0;
+      // step_size % 8 == 0
+      return offset + step_size * row_stride;
     }
   }
 

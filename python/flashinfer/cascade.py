@@ -578,7 +578,8 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
     ...     paged_kv_indices,
     ...     paged_kv_last_page_len,
     ...     num_qo_heads,
-    ...     num_kv_heads
+    ...     num_kv_heads,
+    ...     head_dim,
     ... )
     >>> outputs = []
     >>> for i in range(num_layers):
@@ -641,6 +642,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
         paged_kv_last_page_len: torch.Tensor,
         num_qo_heads: int,
         num_kv_heads: int,
+        head_dim: int,
     ):
         r"""Create auxiliary data structures for shared-prefix batch prefill/append
         attention for multiple forward calls within the same prefill/append step.
@@ -660,6 +662,8 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
             The number of query/output heads.
         num_kv_heads : int
             The number of key/value heads.
+        head_dim : int
+            The dimension of the heads.
 
         Notes
         -----
@@ -679,6 +683,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
             paged_kv_last_page_len,
             num_qo_heads,
             num_kv_heads,
+            head_dim,
         )
 
     def end_forward(self):

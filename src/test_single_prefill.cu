@@ -83,7 +83,7 @@ void TestSinglePrefillKernelLongContextCorrectness(bool allow_fp16_qk_reduction)
   for (size_t qo_len : {1, 31, 63, 127}) {
     for (size_t kv_len : {31717}) {
       for (size_t num_heads : {1}) {
-        for (size_t head_dim : {64, 128}) {
+        for (size_t head_dim : {64, 128, 256}) {
           for (bool causal : {false, true}) {
             for (size_t rotary_mode : {0, 1}) {
               for (size_t kv_layout : {0, 1}) {
@@ -106,7 +106,7 @@ void TestSinglePrefillKernelShortContextCorrectness(bool allow_fp16_qk_reduction
   for (size_t qkv_len : {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37}) {
     for (size_t num_qo_heads : {32}) {
       for (size_t num_kv_heads : {4, 8, 32}) {
-        for (size_t head_dim : {64, 128}) {
+        for (size_t head_dim : {64, 128, 256}) {
           for (bool causal : {false, true}) {
             for (size_t rotary_mode : {0, 1}) {
               for (size_t kv_layout : {0, 1}) {
@@ -128,7 +128,7 @@ void TestSinglePrefillKernelCorrectness(bool allow_fp16_qk_reduction) {
   for (size_t qo_len : {399, 400, 401}) {
     for (size_t kv_len : {533, 534, 535}) {
       for (size_t num_heads : {12}) {
-        for (size_t head_dim : {64, 128}) {
+        for (size_t head_dim : {64, 128, 256}) {
           for (bool causal : {false, true}) {
             for (size_t rotary_mode : {0, 1}) {
               for (size_t kv_layout : {0, 1}) {
