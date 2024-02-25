@@ -1530,9 +1530,14 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
                                       (num_blocks_per_sm * num_sm) /
                                       (num_kv_heads *
                                        ceil_div(qo_len * group_size, num_rows_per_cta));
-                                  uint32_t chunk_size =
-                                      max(ceil_div(kv_len, max_num_kv_chunks), 256);
-                                  uint32_t num_chunks = ceil_div(kv_len, chunk_size);
+                                  uint32_t num_chunks;
+                                  if (max_num_kv_chunks > 0) {
+                                    uint32_t chunk_size =
+                                        max(ceil_div(kv_len, max_num_kv_chunks), 256);
+                                    num_chunks = ceil_div(kv_len, chunk_size);
+                                  } else {
+                                    num_chunks = 0;
+                                  }
 
                                   max_grid_size = num_blocks_per_sm * num_sm;
                                   if (num_chunks > 1) {
@@ -1626,8 +1631,13 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
         uint32_t max_num_kv_chunks =
             (num_blocks_per_sm * num_sm) /
             (num_kv_heads * ceil_div(qo_len * GROUP_SIZE, num_rows_per_cta));
-        uint32_t chunk_size = max(ceil_div(kv_len, max_num_kv_chunks), 256);
-        uint32_t num_chunks = ceil_div(kv_len, chunk_size);
+        uint32_t num_chunks;
+        if (max_num_kv_chunks > 0) {
+          uint32_t chunk_size = max(ceil_div(kv_len, max_num_kv_chunks), 256);
+          num_chunks = ceil_div(kv_len, chunk_size);
+        } else {
+          num_chunks = 0;
+        }
 
         if (num_chunks <= 1 || tmp == nullptr) {
           // Enough parallelism, do not split-kv
