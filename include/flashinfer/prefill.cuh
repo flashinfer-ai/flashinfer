@@ -1526,12 +1526,12 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
                                       cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                                           &num_blocks_per_sm, partition_kv_kernel, num_threads,
                                           smem_size));
-                                  uint32_t num_chunks =
-                                      min((num_blocks_per_sm * num_sm) /
-                                              (num_kv_heads *
-                                               ceil_div(qo_len * group_size, num_rows_per_cta)),
-                                          kv_len / 128);
-                                  uint32_t chunk_size = ceil_div(kv_len, num_chunks);
+                                  uint32_t max_num_kv_chunks =
+                                      (num_blocks_per_sm * num_sm) /
+                                      (num_kv_heads *
+                                       ceil_div(qo_len * group_size, num_rows_per_cta));
+                                  uint32_t chunk_size =
+                                      max(ceil_div(kv_len, max_num_kv_chunks), 256);
                                   num_chunks = ceil_div(kv_len, chunk_size);
 
                                   max_grid_size = num_blocks_per_sm * num_sm;
@@ -1623,11 +1623,10 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
             cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
         FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &num_blocks_per_sm, partition_kv_kernel, num_threads, smem_size));
-        uint32_t num_chunks =
-            min((num_blocks_per_sm * num_sm) /
-                    (num_kv_heads * ceil_div(qo_len * GROUP_SIZE, num_rows_per_cta)),
-                kv_len / 128);
-        uint32_t chunk_size = ceil_div(kv_len, num_chunks);
+        uint32_t max_num_kv_chunks =
+            (num_blocks_per_sm * num_sm) /
+            (num_kv_heads * ceil_div(qo_len * GROUP_SIZE, num_rows_per_cta));
+        uint32_t chunk_size = max(ceil_div(kv_len, max_num_kv_chunks), 256);
         num_chunks = ceil_div(kv_len, chunk_size);
 
         if (num_chunks <= 1 || tmp == nullptr) {
