@@ -1490,8 +1490,8 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
                           // control num_frags_z for maximum warp occupancy
                           DISPATCH_NUM_FRAGS_Z(
                               min(max_num_frags_z_smem, max_num_frags_z_reg), num_frags_z, {
-                                if constexpr (is_invalid_configuration(num_frags_x, num_frags_y, num_frags_z,
-                                                             num_warps)) {
+                                if constexpr (is_invalid_configuration(num_frags_x, num_frags_y,
+                                                                       num_frags_z, num_warps)) {
                                   // Invalid configuration, skip
                                   std::ostringstream err_msg;
                                   err_msg << "FlashInfer Internal Error: Invalid configuration : "
@@ -1531,6 +1531,8 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
                                               (num_kv_heads *
                                                ceil_div(qo_len * group_size, num_rows_per_cta)),
                                           kv_len / 128);
+                                  uint32_t chunk_size = ceil_div(kv_len, num_chunks);
+                                  num_chunks = ceil_div(kv_len, chunk_size);
 
                                   max_grid_size = num_blocks_per_sm * num_sm;
                                   if (num_chunks > 1) {
@@ -1625,6 +1627,8 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
             min((num_blocks_per_sm * num_sm) /
                     (num_kv_heads * ceil_div(qo_len * GROUP_SIZE, num_rows_per_cta)),
                 kv_len / 128);
+        uint32_t chunk_size = ceil_div(kv_len, num_chunks);
+        num_chunks = ceil_div(kv_len, chunk_size);
 
         if (num_chunks <= 1 || tmp == nullptr) {
           // Enough parallelism, do not split-kv
