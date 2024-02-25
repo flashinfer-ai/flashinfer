@@ -27,7 +27,7 @@ import flashinfer
 @pytest.mark.parametrize("page_size", [1, 8, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 def test_batch_prefill_with_paged_kv_cache(
@@ -107,10 +107,10 @@ def test_batch_prefill_with_paged_kv_cache(
             ],
             dim=0,
         )
-        # o_ref_i = flashinfer.single_prefill_with_kv_cache(qi, ki, vi, causal=causal)
+        o_ref_i = flashinfer.single_prefill_with_kv_cache(qi, ki, vi, causal=causal)
         o_i_np = o[q_indptr[i] : q_indptr[i + 1]].cpu().numpy()
-        # o_ref_i_np = o_ref_i.cpu().numpy()
-        # numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
+        o_ref_i_np = o_ref_i.cpu().numpy()
+        numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -118,7 +118,7 @@ def test_batch_prefill_with_paged_kv_cache(
 @pytest.mark.parametrize("qo_len", [37, 17])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("causal", [False, True])
 def test_batch_prefill_with_ragged_kv_cache(
     batch_size, kv_len, qo_len, num_kv_heads, num_qo_heads, head_dim, causal
@@ -144,16 +144,16 @@ def test_batch_prefill_with_ragged_kv_cache(
     )
     o = wrapper.forward(q, k, v, causal=causal)
 
-    # for i in range(batch_size):
-    #     o_ref_i = flashinfer.single_prefill_with_kv_cache(
-    #         q[q_indptr[i] : q_indptr[i + 1]],
-    #         k[kv_indptr[i] : kv_indptr[i + 1]],
-    #         v[kv_indptr[i] : kv_indptr[i + 1]],
-    #         causal=causal,
-    #     )
-    #     o_i_np = o[q_indptr[i] : q_indptr[i + 1]].cpu().numpy()
-    #     o_ref_i_np = o_ref_i.cpu().numpy()
-    #     numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
+    for i in range(batch_size):
+        o_ref_i = flashinfer.single_prefill_with_kv_cache(
+            q[q_indptr[i] : q_indptr[i + 1]],
+            k[kv_indptr[i] : kv_indptr[i + 1]],
+            v[kv_indptr[i] : kv_indptr[i + 1]],
+            causal=causal,
+        )
+        o_i_np = o[q_indptr[i] : q_indptr[i + 1]].cpu().numpy()
+        o_ref_i_np = o_ref_i.cpu().numpy()
+        numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":
