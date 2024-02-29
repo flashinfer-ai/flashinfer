@@ -25,16 +25,16 @@
 
 #include <tuple>
 
+#include "../cp_async.cuh"
+#include "../layout.cuh"
+#include "../math.cuh"
+#include "../mma.cuh"
+#include "../page.cuh"
+#include "../permuted_smem.cuh"
+#include "../rope.cuh"
+#include "../utils.cuh"
 #include "cascade.cuh"
-#include "cp_async.cuh"
-#include "layout.cuh"
-#include "math.cuh"
-#include "mma.cuh"
-#include "page.cuh"
-#include "permuted_smem.cuh"
-#include "rope.cuh"
 #include "state.cuh"
-#include "utils.cuh"
 
 namespace flashinfer {
 

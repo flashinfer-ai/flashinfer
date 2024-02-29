@@ -18,10 +18,10 @@
 
 #include <cooperative_groups.h>
 
-#include "cp_async.cuh"
-#include "math.cuh"
+#include "../cp_async.cuh"
+#include "../math.cuh"
+#include "../utils.cuh"
 #include "state.cuh"
-#include "utils.cuh"
 
 namespace flashinfer {
 

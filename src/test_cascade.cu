@@ -15,8 +15,8 @@
  */
 #include <gtest/gtest.h>
 
-#include <flashinfer/cascade.cuh>
-#include <flashinfer/wrapper.cuh>
+#include <flashinfer/attention/cascade.cuh>
+#include <flashinfer/attention/wrapper.cuh>
 
 #include "utils.h"
 
