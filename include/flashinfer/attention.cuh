@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 by FlashInfer team.
+ * Copyright (c) 2024 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,12 +13,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_CUH_
-#define FLASHINFER_CUH_
+#ifndef FLASHINFER_ATTENTION_CUH_
+#define FLASHINFER_ATTENTION_CUH_
 
-#include "flashinfer/attention.cuh"
-#include "flashinfer/layout.cuh"
-#include "flashinfer/page.cuh"
-#include "flashinfer/rope.cuh"
+#include "attention/cascade.cuh"
+#include "attention/decode.cuh"
+#include "attention/handler.cuh"
+#include "attention/prefill.cuh"
+#include "attention/wrapper.cuh"
 
-#endif  // FLASHINFER_CUH_
+#endif  // FLASHINFER_ATTENTION_CUH_

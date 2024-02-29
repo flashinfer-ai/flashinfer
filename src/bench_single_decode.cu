@@ -15,8 +15,8 @@
  */
 #include <thrust/device_vector.h>
 
-#include <flashinfer/decode.cuh>
-#include <flashinfer/prefill.cuh>
+#include <flashinfer/attention/decode.cuh>
+#include <flashinfer/attention/prefill.cuh>
 #include <nvbench/nvbench.cuh>
 
 using flashinfer::QKVLayout;

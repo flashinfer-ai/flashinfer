@@ -16,8 +16,8 @@
 #ifndef FLASHINFER_STATE_CUH_
 #define FLASHINFER_STATE_CUH_
 
-#include "math.cuh"
-#include "vec_dtypes.cuh"
+#include "../math.cuh"
+#include "../vec_dtypes.cuh"
 
 namespace flashinfer {
 

@@ -16,7 +16,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
-#include <flashinfer/prefill.cuh>
+#include <flashinfer/attention/prefill.cuh>
 
 #include "cpu_reference.h"
 #include "utils.h"

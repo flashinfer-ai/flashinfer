@@ -27,15 +27,15 @@
 #include <iostream>
 #include <random>
 
+#include "../cp_async.cuh"
+#include "../layout.cuh"
+#include "../math.cuh"
+#include "../page.cuh"
+#include "../rope.cuh"
+#include "../utils.cuh"
+#include "../vec_dtypes.cuh"
 #include "cascade.cuh"
-#include "cp_async.cuh"
-#include "layout.cuh"
-#include "math.cuh"
-#include "page.cuh"
-#include "rope.cuh"
 #include "state.cuh"
-#include "utils.cuh"
-#include "vec_dtypes.cuh"
 
 namespace flashinfer {
 

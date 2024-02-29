@@ -21,9 +21,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include "../rope.cuh"
+#include "../utils.cuh"
 #include "decode.cuh"
-#include "rope.cuh"
-#include "utils.cuh"
 
 namespace flashinfer {
 

@@ -15,8 +15,8 @@
  */
 #include <thrust/device_vector.h>
 
-#include <flashinfer/cascade.cuh>
-#include <flashinfer/wrapper.cuh>
+#include <flashinfer/attention/cascade.cuh>
+#include <flashinfer/attention/wrapper.cuh>
 #include <nvbench/nvbench.cuh>
 
 #include "utils.h"
