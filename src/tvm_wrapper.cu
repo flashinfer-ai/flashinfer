@@ -58,6 +58,7 @@ cudaError_t _SinglePrefillWithKVCacheNoLSE(
   CHECK(head_dim == 128) << "The head dimension must be 128";
   CHECK(kv_layout == QKVLayout::kNHD) << "The KV layout must be NHD";
   const uint32_t group_size = num_qo_heads / num_kv_heads;
+  const float sm_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
   DISPATCH_ALLOW_FP16_QK_REDUCTION(
       allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
@@ -68,7 +69,7 @@ cudaError_t _SinglePrefillWithKVCacheNoLSE(
                                  GROUP_SIZE, /*head_dim=*/128, /*layout=*/QKVLayout::kNHD,
                                  ROTARY_MODE, ALLOW_FP16_QK_REDUCTION, CAUSAL>(
                                  q, k, v, o, tmp, /*lse=*/nullptr, num_kv_heads, qo_len, kv_len,
-                                 rope_scale, rope_theta, stream);
+                                 sm_scale, rope_scale, rope_theta, stream);
                            })})})});
   return cudaSuccess;
 }
@@ -186,9 +187,8 @@ template <PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typen
 cudaError_t _BatchPrefillWithPagedKVCacheWrapper(
     BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, IdType* q_rope_position,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, DTypeOut* o, float* lse,
-    uint32_t num_qo_heads, bool causal = true, RotaryMode rotary_mode = RotaryMode::kNone,
-    bool allow_fp16_qk_reduction = false, float rope_scale = 1.f, float rope_theta = 1e4,
-    cudaStream_t stream = nullptr) {
+    uint32_t num_qo_heads, bool causal, RotaryMode rotary_mode, bool allow_fp16_qk_reduction,
+    float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream) {
   CHECK(lse != nullptr) << "The lse buffer must be provided";
   CHECK(allow_fp16_qk_reduction == false) << "The fp16 qk reduction is not supported";
   CHECK(paged_kv.head_dim == 128) << "The head dimension must be 128";
@@ -202,8 +202,8 @@ cudaError_t _BatchPrefillWithPagedKVCacheWrapper(
                          return BatchPrefillWithPagedKVCacheWrapperDispatched<
                              page_storage, kv_layout, GROUP_SIZE, /*head_dim=*/128, ROTARY_MODE,
                              /*allow_fp16_qk_reduction=*/false, CAUSAL, DTypeIn, DTypeOut, IdType>(
-                             handler, q, qo_indptr, q_rope_position, paged_kv, o, lse, rope_scale,
-                             rope_theta, stream);
+                             handler, q, qo_indptr, q_rope_position, paged_kv, o, lse, sm_scale,
+                             rope_scale, rope_theta, stream);
                        })})});
   return cudaSuccess;
 }
@@ -218,10 +218,10 @@ void _FlashInferAttentionPrefillWithPagedKVCache(int64_t handler_id, DLTensor* q
                                                  DLTensor* q_rope_position,    //
                                                  DLTensor* output,             //
                                                  DLTensor* lse,                //
-                                                 int64_t causal = 1,           //
-                                                 int64_t rotary_mode = 0,      //
-                                                 double rope_scale = 1.0f,     //
-                                                 double rope_theta = 1e4,
+                                                 int64_t causal,               //
+                                                 int64_t rotary_mode,          //
+                                                 double rope_scale,            //
+                                                 double rope_theta,
                                                  double attn_score_scaling_factor = 1.0f) {
   CHECK(handler_id < max_num_handlers) << "The handler id must be less than " << max_num_handlers;
   CHECK_EQ(q_data->device.device_type, kDLCUDA) << "The device of q_data must be CUDA.";
@@ -239,7 +239,6 @@ void _FlashInferAttentionPrefillWithPagedKVCache(int64_t handler_id, DLTensor* q
   CHECK_EQ(qo_indptr->device.device_type, kDLCUDA)
       << "The device of qo_indptr matrix must be CUDA.";
   CHECK_EQ(output->device.device_type, kDLCUDA) << "The device of output must be CUDA.";
-  CHECK_EQ(attn_score_scaling_factor, 1.0f) << "The attention score scaling factor must be 1.0.";
 
   int32_t dev_id = q_data->device.device_id;
   CHECK_EQ(pages->device.device_id, dev_id);
@@ -295,6 +294,7 @@ void _FlashInferAttentionPrefillWithPagedKVCache(int64_t handler_id, DLTensor* q
 
   constexpr PageStorage page_storage = PageStorage::kIndices;
   constexpr QKVLayout kv_layout = QKVLayout::kHND;
+  const float sm_scale = attn_score_scaling_factor / std::sqrt(static_cast<float>(nfeat));
 
   DISPATCH_TVM_CUDA_DTYPE(
       pages->dtype, dtype_in,
@@ -315,7 +315,8 @@ void _FlashInferAttentionPrefillWithPagedKVCache(int64_t handler_id, DLTensor* q
                     static_cast<dtype_out*>(output->data),
                     /*lse=*/static_cast<float*>(lse->data), nhead_qo,
                     /*causal=*/causal, RotaryMode(rotary_mode), /*allow_fp16_qk_reduction=*/false,
-                    rope_scale, rope_theta, 0);
+                    sm_scale, rope_scale, rope_theta,
+                    /*stream=*/0);
             if (status != cudaSuccess) {
               LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
             }
@@ -373,7 +374,6 @@ void _FlashInferAttentionDecodeWithPagedKVCache(int64_t handler_id, DLTensor* q_
   CHECK_EQ(k_rope_pos_offset->device.device_type, kDLCUDA)
       << "The device of k_rope_pos_offset matrix must be CUDA.";
   CHECK_EQ(output->device.device_type, kDLCUDA) << "The device of output must be CUDA.";
-  CHECK_EQ(attn_score_scaling_factor, 1.0f) << "The attention score scaling factor must be 1.0.";
 
   int32_t dev_id = q_data->device.device_id;
   CHECK_EQ(pages->device.device_id, dev_id);
@@ -425,6 +425,7 @@ void _FlashInferAttentionDecodeWithPagedKVCache(int64_t handler_id, DLTensor* q_
 
   constexpr PageStorage page_storage = PageStorage::kIndices;
   constexpr QKVLayout kv_layout = QKVLayout::kHND;
+  const float sm_scale = attn_score_scaling_factor / std::sqrt(static_cast<float>(nfeat));
 
   DISPATCH_TVM_CUDA_DTYPE(
       pages->dtype, dtype_in,
@@ -441,8 +442,9 @@ void _FlashInferAttentionDecodeWithPagedKVCache(int64_t handler_id, DLTensor* q_
                 &batch_decode_handlers[handler_id], static_cast<dtype_in*>(q_data->data),
                 static_cast<dtype_idx*>(q_rope_position->data), cache,
                 static_cast<dtype_out*>(output->data),
-                /*lse=*/static_cast<float*>(lse->data), nhead_qo, RotaryMode(rotary_mode),
-                rope_scale, rope_theta, 0);
+                /*lse=*/static_cast<float*>(lse->data), nhead_qo, RotaryMode(rotary_mode), sm_scale,
+                rope_scale, rope_theta,
+                /*stream=*/0);
             if (status != cudaSuccess) {
               LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
             }
@@ -491,13 +493,14 @@ cudaError_t _BatchPrefillWithRaggedKVCacheWrapper(
     BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, DTypeIn* k, DTypeIn* v,
     IdType* kv_indptr, IdType* q_rope_position_map, IdType* k_rope_pos_offset, DTypeOut* o,
     float* lse, const uint32_t batch_size, const uint32_t num_qo_heads, const uint32_t num_kv_heads,
-    const uint32_t head_dim, bool causal = true, QKVLayout kv_layout = QKVLayout::kNHD,
-    RotaryMode rotary_mode = RotaryMode::kNone, bool allow_fp16_qk_reduction = false,
-    const float rope_scale = 1.f, const float rope_theta = 1e4, cudaStream_t stream = nullptr) {
+    const uint32_t head_dim, bool causal, QKVLayout kv_layout, RotaryMode rotary_mode,
+    bool allow_fp16_qk_reduction, const float sm_scale, const float rope_scale,
+    const float rope_theta, cudaStream_t stream) {
   CHECK(lse != nullptr) << "The lse buffer must be provided";
   CHECK(head_dim == 128) << "The head dimension must be 128";
   CHECK(kv_layout == QKVLayout::kNHD) << "The layout must be NHD";
   CHECK(allow_fp16_qk_reduction == false) << "The fp16 qk reduction is not supported";
+
   DISPATCH_GQA_GROUP_SIZE(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
       {DISPATCH_CAUSAL(causal, CAUSAL, {DISPATCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
@@ -505,8 +508,8 @@ cudaError_t _BatchPrefillWithRaggedKVCacheWrapper(
                              GROUP_SIZE, /*head_dim=*/128, /*layout=*/QKVLayout::kNHD, ROTARY_MODE,
                              /*allow_fp16_qk_reduction=*/false, CAUSAL, DTypeIn, DTypeOut, IdType>(
                              handler, q, qo_indptr, k, v, kv_indptr, q_rope_position_map,
-                             k_rope_pos_offset, o, lse, batch_size, num_kv_heads, rope_scale,
-                             rope_theta, stream);
+                             k_rope_pos_offset, o, lse, batch_size, num_kv_heads, sm_scale,
+                             rope_scale, rope_theta, stream);
                        })})});
   return cudaSuccess;
 }
@@ -527,7 +530,6 @@ void _FlashInferAttentionPrefillWithRaggedKVCache(
       << "The device of q_rope_position_map must be CUDA.";
   CHECK_EQ(k_rope_pos_offset->device.device_type, kDLCUDA)
       << "The device of k_rope_pos_offset must be CUDA.";
-  CHECK_EQ(attn_score_scaling_factor, 1.0f) << "The attention score scaling factor must be 1.0.";
 
   int dev_id = q_data->device.device_id;
   CHECK_EQ(qo_indptr->device.device_id, dev_id);
@@ -580,6 +582,8 @@ void _FlashInferAttentionPrefillWithRaggedKVCache(
   CHECK_EQ(k_rope_pos_offset->ndim, 1);
   CHECK_EQ(k_rope_pos_offset->shape[0], batch_size);
 
+  const float sm_scale = attn_score_scaling_factor / std::sqrt(static_cast<float>(nfeat));
+
   DISPATCH_TVM_CUDA_DTYPE(
       q_data->dtype, dtype_in,
       {DISPATCH_TVM_CUDA_DTYPE(
@@ -594,7 +598,8 @@ void _FlashInferAttentionPrefillWithRaggedKVCache(
                     static_cast<dtype_out*>(output->data),
                     /*lse=*/static_cast<float*>(lse->data), batch_size, nhead_qo, nhead_kv, nfeat,
                     /*causal=*/bool(causal), QKVLayout::kNHD, RotaryMode(rotary_mode),
-                    /*allow_fp16_qk_reduction=*/false, rope_scale, rope_theta, 0);
+                    /*allow_fp16_qk_reduction=*/false, sm_scale, rope_scale, rope_theta,
+                    /*sm_scale=*/0);
           })})})
 }
 

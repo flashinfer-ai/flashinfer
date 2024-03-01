@@ -68,6 +68,7 @@ def single_prefill_with_kv_cache(
     kv_layout: str = "NHD",
     rotary_mode: str = "NONE",
     allow_fp16_qk_reduction: bool = False,
+    sm_scale: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
 ):
@@ -96,6 +97,8 @@ def single_prefill_with_kv_cache(
     allow_fp16_qk_reduction : bool
         Whether to use f16 for qk reduction (faster at the cost of slight precision
         loss).
+    sm_scale : Optional[float]
+        The scale used in softmax, if not provided, will be set to ``1.0 / sqrt(head_dim)``.
     rope_scale : Optional[float]
         The scale used in RoPE interpolation, if not provided, will be set to 1.0.
     rope_theta : Optional[float]
@@ -133,6 +136,8 @@ def single_prefill_with_kv_cache(
     check_rotary_mode(rotary_mode)
     check_kv_layout(kv_layout)
     tmp = _get_cache_buf("single_prefill_with_kv_cache_tmp", 8 * 1024 * 1024, q.device)
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(q.size(-1))
     if rope_scale is None:
         rope_scale = 1.0
     if rope_theta is None:
@@ -146,6 +151,7 @@ def single_prefill_with_kv_cache(
         getattr(TensorLayout, kv_layout),
         getattr(RotaryMode, rotary_mode),
         allow_fp16_qk_reduction,
+        sm_scale,
         rope_scale,
         rope_theta,
         False,
@@ -160,6 +166,7 @@ def single_prefill_with_kv_cache_return_lse(
     kv_layout: str = "NHD",
     rotary_mode: str = "NONE",
     allow_fp16_qk_reduction: bool = False,
+    sm_scale: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
 ):
@@ -188,6 +195,8 @@ def single_prefill_with_kv_cache_return_lse(
     allow_fp16_qk_reduction : bool
         Whether to use f16 for qk reduction (faster at the cost of slight precision
         loss).
+    sm_scale : Optional[float]
+        The scale used in softmax, if not provided, will be set to ``1.0 / sqrt(head_dim)``.
     rope_scale : Optional[float]
         The scale used in RoPE interpolation, if not provided, will be set to ``1.0``.
     rope_theta : Optional[float]
@@ -233,6 +242,8 @@ def single_prefill_with_kv_cache_return_lse(
     tmp = _get_cache_buf(
         "single_prefill_with_kv_cache_return_lse_tmp", 8 * 1024 * 1024, q.device
     )
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(q.size(-1))
     if rope_scale is None:
         rope_scale = 1.0
     if rope_theta is None:
@@ -246,6 +257,7 @@ def single_prefill_with_kv_cache_return_lse(
         getattr(TensorLayout, kv_layout),
         getattr(RotaryMode, rotary_mode),
         allow_fp16_qk_reduction,
+        sm_scale,
         rope_scale,
         rope_theta,
         True,
@@ -428,6 +440,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         causal: bool = True,
         rotary_mode: str = "NONE",
         allow_fp16_qk_reduction: bool = False,
+        sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
     ):
@@ -451,6 +464,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         allow_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
             loss).
+        sm_scale : Optional[float]
+            The scale used in softmax, if not provided, will be set to
+            ``1.0 / sqrt(head_dim)``.
         rope_scale : Optional[float]
             The scale used in RoPE interpolation, if not provided, will be set to
             ``1.0``.
@@ -463,6 +479,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
         """
         check_rotary_mode(rotary_mode)
+        if sm_scale is None:
+            sm_scale = 1.0 / math.sqrt(q.size(-1))
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
@@ -478,6 +496,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             causal,
             getattr(RotaryMode, rotary_mode),
             allow_fp16_qk_reduction,
+            sm_scale,
             rope_scale,
             rope_theta,
             False,
@@ -490,6 +509,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         causal: bool = True,
         rotary_mode: str = "NONE",
         allow_fp16_qk_reduction: bool = False,
+        sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
     ):
@@ -513,6 +533,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         allow_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
             loss).
+        sm_scale : Optional[float]
+            The scale used in softmax, if not provided, will be set to
+            ``1.0 / sqrt(head_dim)``.
         rope_scale : Optional[float]
             The scale used in RoPE interpolation, if not provided, will be set to
             ``1.0``.
@@ -528,6 +551,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             ``[qo_indptr[-1], num_qo_heads, head_dim]``.
         """
         check_rotary_mode(rotary_mode)
+        if sm_scale is None:
+            sm_scale = 1.0 / math.sqrt(q.size(-1))
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
@@ -543,6 +568,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             causal,
             getattr(RotaryMode, rotary_mode),
             allow_fp16_qk_reduction,
+            sm_scale,
             rope_scale,
             rope_theta,
             True,
@@ -699,6 +725,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         causal: bool = True,
         rotary_mode: str = "NONE",
         allow_fp16_qk_reduction: bool = False,
+        sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
     ):
@@ -721,6 +748,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         allow_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
             loss).
+        sm_scale : Optional[float]
+            The scale used in softmax, if not provided, will be set to
+            ``1.0 / sqrt(head_dim)``.
         rope_scale : Optional[float]
             The scale used in RoPE interpolation, if not provided, will be set to
             ``1.0``.
@@ -733,6 +763,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
         """
         check_rotary_mode(rotary_mode)
+        if sm_scale is None:
+            sm_scale = 1.0 / math.sqrt(q.size(-1))
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
@@ -746,6 +778,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             causal,
             getattr(RotaryMode, rotary_mode),
             allow_fp16_qk_reduction,
+            sm_scale,
             rope_scale,
             rope_theta,
             False,
@@ -759,6 +792,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         causal: bool = True,
         rotary_mode: str = "NONE",
         allow_fp16_qk_reduction: bool = False,
+        sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
     ):
@@ -781,6 +815,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         allow_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
             loss).
+        sm_scale : Optional[float]
+            The scale used in softmax, if not provided, will be set to
+            ``1.0 / sqrt(head_dim)``.
         rope_scale : Optional[float]
             The scale used in RoPE interpolation, if not provided, will be set to ``1.0``.
         rope_theta : Optional[float]
@@ -795,6 +832,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             ``[qo_indptr[-1], num_qo_heads, head_dim]``.
         """
         check_rotary_mode(rotary_mode)
+        if sm_scale is None:
+            sm_scale = 1.0 / math.sqrt(q.size(-1))
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
@@ -808,6 +847,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             causal,
             getattr(RotaryMode, rotary_mode),
             allow_fp16_qk_reduction,
+            sm_scale,
             rope_scale,
             rope_theta,
             True,

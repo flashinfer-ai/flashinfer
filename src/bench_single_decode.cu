@@ -49,8 +49,10 @@ void bench_flashinfer_single_decode(nvbench::state& state) {
         thrust::raw_pointer_cast(Q.data()), thrust::raw_pointer_cast(K.data()),
         thrust::raw_pointer_cast(V.data()), thrust::raw_pointer_cast(O.data()),
         cooperative ? thrust::raw_pointer_cast(tmp.data()) : nullptr, num_qo_heads, num_kv_heads,
-        seq_len, head_dim, QKVLayout(kv_layout), RotaryMode(rotary_mode), 1.f, 1e4,
-        launch.get_stream());
+        seq_len, head_dim, QKVLayout(kv_layout), RotaryMode(rotary_mode),
+        /*maybe_sm_scale=*/std::nullopt,
+        /*rope_scale=*/1.f,
+        /*rope_theta=*/1e4, launch.get_stream());
     if (status != cudaSuccess) {
       state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
     }
@@ -91,7 +93,10 @@ void bench_flashinfer_single_decode_with_prefill(nvbench::state& state) {
         /*qo_len=*/1,
         /*kv_len=*/seq_len, head_dim,
         /*causal=*/false, QKVLayout(kv_layout), RotaryMode(rotary_mode),
-        /*allow_fp16_qk_reduction=*/false, 1.f, 1e4, launch.get_stream());
+        /*allow_fp16_qk_reduction=*/false,
+        /*maybe_sm_scale=*/std::nullopt,
+        /*rope_scale=*/1.f,
+        /*rope_theta=*/1e4, launch.get_stream());
     if (status != cudaSuccess) {
       state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
     }

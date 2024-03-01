@@ -272,6 +272,7 @@ def batch_decode_with_shared_prefix_padded_kv_cache(
         rotary_mode="NONE",
         kv_layout=kv_layout,
         allow_fp16_qk_reduction=allow_fp16_qk_reduction,
+        sm_scale=sm_scale,
         rope_scale=rope_scale,
         rope_theta=rope_theta,
     )
@@ -458,6 +459,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
         v_shared: torch.Tensor,
         unique_kv_data: torch.Tensor,
         allow_fp16_qk_reduction=False,
+        sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
     ):
@@ -488,6 +490,8 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
         allow_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
             loss).
+        sm_scale : Optional[float]
+            The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
         rope_scale : Optional[float]
             The scale used in RoPE interpolation, if not provided, will be set to
             ``1.0``.
@@ -507,6 +511,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
             rotary_mode="NONE",
             kv_layout=self._kv_layout,
             allow_fp16_qk_reduction=allow_fp16_qk_reduction,
+            sm_scale=sm_scale,
             rope_scale=rope_scale,
             rope_theta=rope_theta,
         )
@@ -514,6 +519,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
             q,
             unique_kv_data,
             rotary_mode="NONE",
+            sm_scale=sm_scale,
             rope_scale=rope_scale,
             rope_theta=rope_theta,
         )
@@ -698,6 +704,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
         unique_kv_data: torch.Tensor,
         causal: bool = True,
         allow_fp16_qk_reduction: bool = False,
+        sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
     ):
@@ -730,6 +737,8 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
         allow_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
             loss).
+        sm_scale : Optional[float]
+            The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
         rope_scale : Optional[float]
             The scale used in RoPE interpolation, if not provided, will be set to
             ``1.0``.
@@ -749,6 +758,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
             rotary_mode="NONE",
             kv_layout=self._kv_layout,
             allow_fp16_qk_reduction=allow_fp16_qk_reduction,
+            sm_scale=sm_scale,
             rope_scale=rope_scale,
             rope_theta=rope_theta,
         )
@@ -758,6 +768,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
             causal=causal,
             rotary_mode="NONE",
             allow_fp16_qk_reduction=allow_fp16_qk_reduction,
+            sm_scale=sm_scale,
             rope_scale=rope_scale,
             rope_theta=rope_theta,
         )
