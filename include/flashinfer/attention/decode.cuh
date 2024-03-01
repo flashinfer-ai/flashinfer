@@ -816,8 +816,12 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                                     uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t seq_len,
                                     uint32_t head_dim, QKVLayout kv_layout = QKVLayout::kNHD,
                                     RotaryMode rotary_mode = RotaryMode::kNone,
+                                    std::optional<float> sm_scale = std::nullopt,
                                     float rope_scale = 1.f, float rope_theta = 1e4,
                                     cudaStream_t stream = nullptr) {
+  if (!sm_scale.has_value()) {
+    sm_scale = 1.f / std::sqrt(float(head_dim));
+  }
   const float sm_scale = 1.f / std::sqrt(float(head_dim));
   const float rope_rcp_scale = 1.f / rope_scale;
   const float rope_rcp_theta = 1.f / rope_theta;
@@ -865,7 +869,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                                   (void*)&o,
                                   (void*)&tmp,
                                   (void*)&info,
-                                  (void*)&sm_scale,
+                                  (void*)&(sm_scale.value()),
                                   (void*)&rope_rcp_scale,
                                   (void*)&rope_rcp_theta,
                                   (void*)&seq_len};
@@ -1134,8 +1138,8 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     DTypeIn* q, IdType* q_rope_position,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, DTypeOut* tmp, float* lse,
+    float sm_scale,
     float rope_scale, float rope_theta, cudaStream_t stream) {
-  const float sm_scale = 1.f / std::sqrt(float(HEAD_DIM));
   const float rope_rcp_scale = 1.f / rope_scale;
   const float rope_rcp_theta = 1.f / rope_theta;
   const uint32_t num_kv_heads = paged_kv.num_heads;
@@ -1229,11 +1233,16 @@ cudaError_t BatchDecodeWithPagedKVCache(
     DTypeIn* q, IdType* q_rope_position,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, DTypeOut* tmp, float* lse,
-    uint32_t num_qo_heads, RotaryMode rotary_mode = RotaryMode::kNone, float rope_scale = 1.f,
+    uint32_t num_qo_heads, RotaryMode rotary_mode = RotaryMode::kNone,
+    std::optional<float> sm_scale = std::nullopt,
+    float rope_scale = 1.f,
     float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   const uint32_t num_kv_heads = paged_kv.num_heads;
   const uint32_t head_dim = paged_kv.head_dim;
   const uint32_t batch_size = paged_kv.batch_size;
+  if (!sm_scale.has_value()) {
+    sm_scale = 1.f / std::sqrt(float(head_dim));
+  }
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " is not a multiple of num_kv_heads "
@@ -1247,7 +1256,7 @@ cudaError_t BatchDecodeWithPagedKVCache(
                            return BatchDecodeWithPagedKVCacheDispatched<
                                GROUP_SIZE, HEAD_DIM, page_storage, kv_layout, ROTARY_MODE, DTypeIn,
                                DTypeOut, IdType>(q, q_rope_position, paged_kv, kv_partition_info, o,
-                                                 tmp, lse, rope_scale, rope_theta, stream);
+                                                 tmp, lse, sm_scale, rope_scale, rope_theta, stream);
                          })})});
 
   return cudaSuccess;
@@ -1258,9 +1267,9 @@ template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT, RotaryMod
 cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeIn* o,
                                                    DTypeOut* tmp, float* lse, uint32_t batch_size,
                                                    uint32_t padded_kv_len, uint32_t num_qo_heads,
+                                                   float sm_scale,
                                                    float rope_scale, float rope_theta,
                                                    cudaStream_t stream) {
-  const float sm_scale = 1.f / std::sqrt(float(HEAD_DIM));
   const float rope_rcp_scale = 1.f / rope_scale;
   const float rope_rcp_theta = 1.f / rope_theta;
   const uint32_t num_kv_heads = num_qo_heads / GROUP_SIZE;
@@ -1301,7 +1310,11 @@ cudaError_t BatchDecodeWithPaddedKVCache(
     DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeIn* o, DTypeOut* tmp, float* lse, uint32_t batch_size,
     uint32_t padded_kv_len, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
     QKVLayout kv_layout = QKVLayout::kNHD, RotaryMode rotary_mode = RotaryMode::kNone,
+    std::optional<float> sm_scale = std::nullopt,
     float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {
+  if (!sm_scale.has_value()) {
+    sm_scale = 1.f / std::sqrt(float(head_dim));
+  }
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " is not a multiple of num_kv_heads "
@@ -1317,7 +1330,9 @@ cudaError_t BatchDecodeWithPaddedKVCache(
               rotary_mode, ROTARY_MODE, {DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
                 return BatchDecodeWithPaddedKVCacheDispatched<GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
                                                               ROTARY_MODE, DTypeIn, DTypeOut>(
-                    q, k, v, o, tmp, lse, batch_size, padded_kv_len, num_qo_heads, rope_scale,
+                    q, k, v, o, tmp, lse, batch_size, padded_kv_len, num_qo_heads,
+                    sm_scale,
+                    rope_scale,
                     rope_theta, stream);
               })})})});
   return cudaSuccess;

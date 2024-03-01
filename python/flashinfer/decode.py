@@ -507,6 +507,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q: torch.Tensor,
         paged_kv_data: torch.Tensor,
         rotary_mode: str = "NONE",
+        sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
     ):
@@ -525,6 +526,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         rotary_mode : str
             Whether to apply RoPE on-the-fly inside attention kernels, could be
             ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
+        sm_scale : Optional[float]
+            The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
         rope_scale : Optional[float]
             The scale used in RoPE interpolation, if not provided, will be set to
             ``1.0``.
@@ -537,10 +540,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The attention output, shape: ``[batch_size, num_qo_heads, head_dim]``.
         """
         check_rotary_mode(rotary_mode)
+        if sm_scale is None:
+            head_dim = q.shape[-1]
+            sm_scale = 1.0 / math.sqrt(head_dim)
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
+
         paged_kv_data = expand_5d(paged_kv_data, self._kv_layout)
         return self._wrapper.forward(
             q,
@@ -549,6 +556,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._paged_kv_indices,
             self._paged_kv_last_page_len,
             getattr(RotaryMode, rotary_mode),
+            sm_scale,
             rope_scale,
             rope_theta,
             False,
@@ -559,6 +567,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q: torch.Tensor,
         paged_kv_data: torch.Tensor,
         rotary_mode: str = "NONE",
+        sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
     ):
@@ -578,6 +587,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         rotary_mode : str
             Whether to apply RoPE on-the-fly inside attention kernels, could be
             ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
+        sm_scale : Optional[float]
+            The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
         rope_scale : Optional[float]
             The scale used in RoPE interpolation, if not provided, will be set to
             ``1.0``.
@@ -597,6 +608,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         explanation of the log-sum-exp function and attention states.
         """
         check_rotary_mode(rotary_mode)
+        if sm_scale is None:
+            head_dim = q.shape[-1]
+            sm_scale = 1.0 / math.sqrt(head_dim)
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
@@ -609,6 +623,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._paged_kv_indices,
             self._paged_kv_last_page_len,
             getattr(RotaryMode, rotary_mode),
+            sm_scale,
             rope_scale,
             rope_theta,
             True,

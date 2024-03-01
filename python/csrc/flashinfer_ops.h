@@ -31,7 +31,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
 
 std::vector<torch::Tensor> single_prefill_with_kv_cache(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor tmp, bool causal,
-    unsigned int layout, unsigned int rotary_mode, bool allow_fp16_qk_reduction, float rope_scale,
+    unsigned int layout, unsigned int rotary_mode, bool allow_fp16_qk_reduction, float sm_scale, float rope_scale,
     float rope_theta, bool return_lse);
 
 void append_paged_kv_cache(torch::Tensor append_key, torch::Tensor append_value,
@@ -64,6 +64,7 @@ class BatchDecodeWithPagedKVCachePyTorchWrapper {
   std::vector<torch::Tensor> Forward(torch::Tensor q, torch::Tensor paged_kv_data,
                                      torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
                                      torch::Tensor paged_kv_last_page_len, unsigned int rotary_mode,
+                                     float sm_scale,
                                      float rope_scale, float rope_theta, bool return_lse);
 
  private:
@@ -87,6 +88,7 @@ class BatchPrefillWithPagedKVCachePyTorchWrapper {
                                      torch::Tensor paged_kv_indices,
                                      torch::Tensor paged_kv_last_page_len, bool causal,
                                      unsigned int rotary_mode, bool allow_fp16_qk_reduction,
+                                     float sm_scale,
                                      float rope_scale, float rope_theta, bool return_lse);
 
  private:
@@ -108,6 +110,7 @@ class BatchPrefillWithRaggedKVCachePyTorchWrapper {
   std::vector<torch::Tensor> Forward(torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor k,
                                      torch::Tensor v, torch::Tensor kv_indptr, bool causal,
                                      unsigned int rotary_mode, bool allow_fp16_qk_reduction,
+                                     float sm_scale,
                                      float rope_scale, float rope_theta, bool return_lse);
 
  private:
