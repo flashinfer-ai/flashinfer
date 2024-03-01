@@ -58,8 +58,10 @@ void bench_flashinfer_single_prefill(nvbench::state& state) {
         thrust::raw_pointer_cast(V.data()), thrust::raw_pointer_cast(O.data()),
         /*tmp=*/cooperative ? thrust::raw_pointer_cast(tmp.data()) : nullptr,
         /*lse=*/nullptr, num_qo_heads, num_kv_heads, qo_len, kv_len, head_dim, causal,
-        QKVLayout(kv_layout), RotaryMode(rotary_mode), allow_fp16_qk_reduction, 1.f, 1e4,
-        launch.get_stream());
+        QKVLayout(kv_layout), RotaryMode(rotary_mode), allow_fp16_qk_reduction,
+        /*maybe_sm_scale=*/std::nullopt,
+        /*rope_scale=*/1.f,
+        /*rope_theta=*/1e4, launch.get_stream());
     if (status != cudaSuccess) {
       state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
     }
