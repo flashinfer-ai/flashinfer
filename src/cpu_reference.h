@@ -16,7 +16,7 @@
 #pragma once
 
 #include <flashinfer/page.cuh>
-#include <flashinfer/rope.cuh>
+#include <flashinfer/pos_enc.cuh>
 #include <stdexcept>
 
 #include "utils.h"
@@ -49,7 +49,7 @@ std::vector<dtype_out> single_mha(const std::vector<dtype_in>& q, const std::vec
                                   const std::vector<dtype_in>& v, size_t qo_len, size_t kv_len,
                                   size_t num_q_heads, size_t num_kv_heads, size_t head_dim,
                                   bool causal = true, QKVLayout kv_layout = QKVLayout::kHND,
-                                  RotaryMode rotary_mode = RotaryMode::kNone,
+                                  PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
                                   float rope_scale = 1.f, float rope_theta = 1e4) {
   assert(qo_len <= kv_len);
   assert(num_q_heads % num_kv_heads == 0);
@@ -67,15 +67,15 @@ std::vector<dtype_out> single_mha(const std::vector<dtype_in>& q, const std::vec
               const size_t kv_head_idx = qo_head_idx / GROUP_SIZE;
               for (size_t q_idx = 0; q_idx < qo_len; ++q_idx) {
                 float max_val = -5e4;
-                if (rotary_mode == RotaryMode::kLlama) {
+                if (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
                   q_rotary_local = std::move(cpu_reference::apply_llama_rope(
                       q.data() + info.get_qo_elem_offset(q_idx, qo_head_idx, 0), head_dim,
                       q_idx + kv_len - qo_len, rope_scale, rope_theta));
                 }
                 for (size_t kv_idx = 0; kv_idx < kv_len; ++kv_idx) {
                   att[kv_idx] = 0.;
-                  switch (rotary_mode) {
-                    case RotaryMode::kNone: {
+                  switch (pos_encoding_mode) {
+                    case PosEncodingMode::kNone: {
                       for (size_t feat_idx = 0; feat_idx < head_dim; ++feat_idx) {
                         att[kv_idx] +=
                             float(q[info.get_qo_elem_offset(q_idx, qo_head_idx, feat_idx)]) *
@@ -84,7 +84,7 @@ std::vector<dtype_out> single_mha(const std::vector<dtype_in>& q, const std::vec
                       }
                       break;
                     }
-                    case RotaryMode::kLlama: {
+                    case PosEncodingMode::kRoPELlama: {
                       k_rotary_local = std::move(cpu_reference::apply_llama_rope(
                           k.data() + info.get_kv_elem_offset(kv_idx, kv_head_idx, 0), head_dim,
                           kv_idx, rope_scale, rope_theta));

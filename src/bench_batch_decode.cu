@@ -30,7 +30,7 @@ constexpr QKVLayout kv_layout = QKVLayout::kNHD;
 template <typename T>
 void bench_flashinfer_batch_decode(nvbench::state& state) {
   constexpr size_t head_dim = 128;
-  constexpr auto rotary_mode = RotaryMode::kNone;
+  constexpr auto pos_encoding_mode = PosEncodingMode::kNone;
   size_t seqlen = state.get_int64("seqlen");
   size_t batch_size = state.get_int64("batch_size");
   size_t page_size = state.get_int64("page_size");
@@ -76,12 +76,12 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
     handler.BeginForward<PageStorage::kIndices, kv_layout, T, T, int32_t>(
         (void*)thrust::raw_pointer_cast(buffer.data()), workspace_size_in_bytes,
         kv_indptr_host.data(), kv_last_page_len_host.data(), batch_size, num_qo_heads, num_kv_heads,
-        head_dim, page_size, rotary_mode);
+        head_dim, page_size, pos_encoding_mode);
     state.exec([&](nvbench::launch&) {
       cudaError_t status =
           BatchDecodeWithPagedKVCacheWrapper<PageStorage::kIndices, kv_layout, T, T, int32_t>(
               &handler, thrust::raw_pointer_cast(q.data()), /*q_rope_position=*/nullptr, paged_kv,
-              thrust::raw_pointer_cast(o.data()), /*lse=*/nullptr, num_qo_heads, rotary_mode);
+              thrust::raw_pointer_cast(o.data()), /*lse=*/nullptr, num_qo_heads, pos_encoding_mode);
       if (status != cudaSuccess) {
         state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
       }
@@ -92,7 +92,7 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
           BatchDecodeWithPagedKVCache<PageStorage::kIndices, kv_layout, T, T, int32_t>(
               thrust::raw_pointer_cast(q.data()), /*q_rope_position=*/nullptr, paged_kv,
               kv_partition_info_t<int32_t>(), thrust::raw_pointer_cast(o.data()), nullptr,
-              /*lse=*/nullptr, num_qo_heads, rotary_mode);
+              /*lse=*/nullptr, num_qo_heads, pos_encoding_mode);
       if (status != cudaSuccess) {
         state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
       }
@@ -103,7 +103,7 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
 template <typename T>
 void bench_flashinfer_batch_decode_with_prefill(nvbench::state& state) {
   constexpr size_t head_dim = 128;
-  constexpr auto rotary_mode = RotaryMode::kNone;
+  constexpr auto pos_encoding_mode = PosEncodingMode::kNone;
   size_t seqlen = state.get_int64("seqlen");
   size_t batch_size = state.get_int64("batch_size");
   size_t page_size = state.get_int64("page_size");
@@ -159,7 +159,7 @@ void bench_flashinfer_batch_decode_with_prefill(nvbench::state& state) {
             thrust::raw_pointer_cast(qo_indptr_d.data()),
             /*q_rope_position=*/nullptr, paged_kv, thrust::raw_pointer_cast(o.data()),
             /*lse=*/nullptr, num_qo_heads,
-            /*causal=*/false, rotary_mode);
+            /*causal=*/false, pos_encoding_mode);
   });
 }
 

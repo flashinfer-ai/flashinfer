@@ -32,7 +32,7 @@
 #include "../layout.cuh"
 #include "../math.cuh"
 #include "../page.cuh"
-#include "../rope.cuh"
+#include "../pos_enc.cuh"
 #include "../utils.cuh"
 #include "../vec_dtypes.cuh"
 #include "cascade.cuh"
@@ -48,7 +48,7 @@ namespace {
 
 /*!
  * \brief Load k tile from smem and compute qk
- * \tparam rotary_mode The rotary mode used in the kernel
+ * \tparam pos_encoding_mode The positional encoding mode used in the kernel
  * \tparam head_dim A template integer indicates the head dimension
  * \tparam vec_size A template integer indicates the vector size
  * \tparam bdx A template integer indicates the block size in x dimension
@@ -65,7 +65,8 @@ namespace {
  * \param s A float indicates the thread-local result of qk
  * \param st The self-attention state to be updated
  */
-template <RotaryMode rotary_mode, uint32_t vec_size, uint32_t bdx, uint32_t tile_size, typename T>
+template <PosEncodingMode pos_encoding_mode, uint32_t vec_size, uint32_t bdx, uint32_t tile_size,
+          typename T>
 __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage_idx,
                                            const vec_t<float, vec_size>& q_vec,
                                            const vec_t<float, vec_size>& freq, uint32_t kv_idx_base,
@@ -76,7 +77,7 @@ __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage
 #pragma unroll
   for (uint32_t j = 0; j < tile_size; ++j) {
     vec_t<float, vec_size> k_vec;
-    if constexpr (rotary_mode == RotaryMode::kLlama) {
+    if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
       // apply rotary embedding for all rows in k matrix of kv-cache
       k_vec = vec_apply_llama_rope<vec_size, bdx>(smem + j * bdx * vec_size, freq,
                                                   kv_idx_base + tz * tile_size + j);
@@ -84,7 +85,11 @@ __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage
       // do not apply rotary embedding
       k_vec.cast_load(smem + (j * bdx + tx) * vec_size);
     }
-    s[j] = 0.f;
+    if constexpr (pos_encoding_mode == PosEncoding::ALiBi) {
+      // TODO(Zihao)
+    } else {
+      s[j] = 0.f;
+    }
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
       s[j] += q_vec[i] * k_vec[i];
@@ -175,7 +180,7 @@ __device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, f
  * \brief FlashAttention decoding cuda kernel with kv-cache for a single request
  * \tparam kv_layout The layout of k/v matrices (NHD or HND)
  * \tparam partition_kv Whether to partition kv-cache on sequence length dimension or not
- * \tparam rotary_mode The rotary mode
+ * \tparam pos_encoding_mode The positional encoding mode
  * \tparam vec_size A template integer indicates the vector size
  * \tparam bdx A template integer indicates the block size in x dimension
  * \tparam bdy A template integer indicates the block size in y dimension
@@ -196,9 +201,9 @@ __device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, f
  *   of "theta" used in RoPE (Rotary Positional Embeddings)
  * \param kv_chunk_size A integer indicates the kv-chunk size
  */
-template <QKVLayout kv_layout, bool partition_kv, RotaryMode rotary_mode, uint32_t num_stages_smem,
-          uint32_t tile_size_per_bdx, uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz,
-          typename DTypeIn, typename DTypeOut>
+template <QKVLayout kv_layout, bool partition_kv, PosEncodingMode pos_encoding_mode,
+          uint32_t num_stages_smem, uint32_t tile_size_per_bdx, uint32_t vec_size, uint32_t bdx,
+          uint32_t bdy, uint32_t bdz, typename DTypeIn, typename DTypeOut>
 __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* __restrict__ k,
                                               DTypeIn* __restrict__ v, DTypeOut* __restrict__ o,
                                               DTypeOut* __restrict__ tmp,
@@ -227,7 +232,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
   uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
   vec_t<float, vec_size> q_vec;
   vec_t<float, vec_size> freq;
-  if constexpr (rotary_mode == RotaryMode::kLlama) {
+  if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
       freq[i] = rope_rcp_scale *
@@ -290,7 +295,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
     // compute qk
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    compute_qk<rotary_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
+    compute_qk<pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
         k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, stage_idx, q_vec,
         freq, consumer_kv_idx_base, iter * bdy * tile_size_per_bdx * bdz, kv_chunk_size, s,
         st_local);
@@ -349,8 +354,9 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
   }
 }
 
-template <QKVLayout kv_layout, RotaryMode rotary_mode, uint32_t num_stages_smem, uint32_t vec_size,
-          uint32_t bdx, uint32_t bdy, uint32_t bdz, typename DTypeIn, typename DTypeOut>
+template <QKVLayout kv_layout, PosEncodingMode pos_encoding_mode, uint32_t num_stages_smem,
+          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename DTypeIn,
+          typename DTypeOut>
 __global__ void BatchDecodeWithPaddedKVCacheKernel(
     DTypeIn* __restrict__ q, DTypeIn* __restrict__ k, DTypeIn* __restrict__ v,
     DTypeOut* __restrict__ o, float* __restrict__ lse,
@@ -375,7 +381,7 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(
   uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
   vec_t<float, vec_size> q_vec;
   vec_t<float, vec_size> freq;
-  if constexpr (rotary_mode == RotaryMode::kLlama) {
+  if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
       freq[i] = rope_rcp_scale *
@@ -429,9 +435,9 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(
     // compute qk
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    compute_qk<rotary_mode, vec_size, bdx, bdy>(k_smem + (stage_idx * bdz + tz) * bdy * head_dim,
-                                                stage_idx, q_vec, freq, consumer_kv_idx_base,
-                                                iter * bdy * bdz, seq_len, s, st_local);
+    compute_qk<pos_encoding_mode, vec_size, bdx, bdy>(
+        k_smem + (stage_idx * bdz + tz) * bdy * head_dim, stage_idx, q_vec, freq,
+        consumer_kv_idx_base, iter * bdy * bdz, seq_len, s, st_local);
     block.sync();
     // load k
     cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
@@ -481,7 +487,7 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(
 /*!
  * \brief FlashAttention decoding cuda kernel with paged kv-cache for multiple requests
  * \tparam partition_kv Whether to partition kv-cache on sequence length dimension or not
- * \tparam rotary_mode The rotary mode
+ * \tparam pos_encoding_mode The positional encoding mode
  * \tparam vec_size A template integer indicates the vector size
  * \tparam bdx A template integer indicates the block size in x dimension
  * \tparam bdy A template integer indicates the block size in y dimension
@@ -502,7 +508,7 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(
  * \param rope_rcp_theta A floating number indicate the reciprocal
  *   of "theta" used in RoPE (Rotary Positional Embeddings)
  */
-template <bool partition_kv, RotaryMode rotary_mode, uint32_t num_stages_smem,
+template <bool partition_kv, PosEncodingMode pos_encoding_mode, uint32_t num_stages_smem,
           uint32_t tile_size_per_bdx, uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz,
           PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeOut,
           typename IdType>
@@ -546,7 +552,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
   const uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
   vec_t<float, vec_size> q_vec;
   vec_t<float, vec_size> freq;
-  if constexpr (rotary_mode == RotaryMode::kLlama) {
+  if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
       freq[i] = rope_rcp_scale *
@@ -631,7 +637,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
     // compute qk
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    compute_qk<rotary_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
+    compute_qk<pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
         k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, stage_idx, q_vec,
         freq,
         (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[mapped_batch_idx]) +
@@ -732,17 +738,15 @@ constexpr uint32_t get_heuristic_num_threads(uint32_t group_size, uint32_t sizeo
  * \param seq_len A integer indicates the sequence length
  * \param head_dim A integer indicates the head dimension
  * \param kv_layout The layout of k/v matrices
- * \param rotary_mode The rotary mode
+ * \param pos_encoding_mode The positional encoding mode
  * \param stream The cuda stream to launch the kernel
  * \return status Indicates whether CUDA calls are successful
  */
 template <typename DTypeIn, typename DTypeOut>
-cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& max_grid_size,
-                                                  uint32_t num_qo_heads, uint32_t num_kv_heads,
-                                                  uint32_t seq_len, uint32_t head_dim,
-                                                  QKVLayout kv_layout = QKVLayout::kNHD,
-                                                  RotaryMode rotary_mode = RotaryMode::kNone,
-                                                  cudaStream_t stream = nullptr) {
+cudaError_t SingleDecodeWithKVCacheWorkEstimation(
+    uint32_t& tmp_size, uint32_t& max_grid_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
+    uint32_t seq_len, uint32_t head_dim, QKVLayout kv_layout = QKVLayout::kNHD,
+    PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone, cudaStream_t stream = nullptr) {
   const uint32_t GROUP_SIZE = num_qo_heads / num_kv_heads;
   if (seq_len <= 256U) {
     tmp_size = 0;
@@ -751,8 +755,8 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& 
         num_qo_heads / num_kv_heads, GROUP_SIZE,
         {DISPATCH_HEAD_DIM(
             head_dim, HEAD_DIM,
-            {DISPATCH_ROTARY_MODE(
-                rotary_mode, ROTARY_MODE, {DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
+            {DISPATCH_pos_encoding_mode(
+                pos_encoding_mode, pos_encoding_mode, {DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
                   constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
                   constexpr uint32_t num_stages_smem = 2U;
                   constexpr uint32_t bdx = HEAD_DIM / vec_size;
@@ -767,10 +771,9 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& 
                                                  head_dim * sizeof(DTypeIn) +
                                              2U * bdy * bdz * sizeof(float);
 
-                  auto kernel =
-                      SingleDecodeWithKVCacheKernel<KV_LAYOUT, /*partition_kv=*/true, ROTARY_MODE,
-                                                    num_stages_smem, tile_size_per_bdx, vec_size,
-                                                    bdx, bdy, bdz, DTypeIn, DTypeOut>;
+                  auto kernel = SingleDecodeWithKVCacheKernel<
+                      KV_LAYOUT, /*partition_kv=*/true, pos_encoding_mode, num_stages_smem,
+                      tile_size_per_bdx, vec_size, bdx, bdy, bdz, DTypeIn, DTypeOut>;
                   int num_blocks_per_sm = 0;
                   int num_sm = 0;
                   int dev_id = 0;
@@ -806,7 +809,7 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(uint32_t& tmp_size, uint32_t& 
  * \param seq_len A integer indicates the sequence length
  * \param head_dim A integer indicates the head dimension
  * \param kv_layout The layout of q/k/v matrices
- * \param rotary_mode The rotary mode
+ * \param pos_encoding_mode The positional encoding mode
  * \param rope_scale The scaling factor used in RoPE Interpolation
  * \param rope_theta The theta used in RoPE
  * \param stream The cuda stream to launch the kernel
@@ -816,7 +819,7 @@ template <typename DTypeIn, typename DTypeOut>
 cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o, DTypeOut* tmp,
                                     uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t seq_len,
                                     uint32_t head_dim, QKVLayout kv_layout = QKVLayout::kNHD,
-                                    RotaryMode rotary_mode = RotaryMode::kNone,
+                                    PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
                                     std::optional<float> maybe_sm_scale = std::nullopt,
                                     float rope_scale = 1.f, float rope_theta = 1e4,
                                     cudaStream_t stream = nullptr) {
@@ -834,8 +837,8 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
       num_qo_heads / num_kv_heads, GROUP_SIZE,
       {DISPATCH_HEAD_DIM(
           head_dim, HEAD_DIM,
-          {DISPATCH_ROTARY_MODE(
-              rotary_mode, ROTARY_MODE, {DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
+          {DISPATCH_pos_encoding_mode(
+              pos_encoding_mode, pos_encoding_mode, {DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
                 constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
                 constexpr uint32_t num_stages_smem = 2U;
                 constexpr uint32_t bdx = HEAD_DIM / vec_size;
@@ -852,10 +855,9 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                                            2U * bdy * bdz * sizeof(float);
                 if (seq_len <= 256 || tmp == nullptr) {
                   // no need to use partition-kv kernel
-                  auto kernel =
-                      SingleDecodeWithKVCacheKernel<KV_LAYOUT, /*partition_kv=*/false, ROTARY_MODE,
-                                                    num_stages_smem, tile_size_per_bdx, vec_size,
-                                                    bdx, bdy, bdz, DTypeIn, DTypeOut>;
+                  auto kernel = SingleDecodeWithKVCacheKernel<
+                      KV_LAYOUT, /*partition_kv=*/false, pos_encoding_mode, num_stages_smem,
+                      tile_size_per_bdx, vec_size, bdx, bdy, bdz, DTypeIn, DTypeOut>;
                   FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
                       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -875,10 +877,9 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
                       cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
                 } else {
                   // use partition-kv kernel
-                  auto kernel =
-                      SingleDecodeWithKVCacheKernel<KV_LAYOUT, /*partition_kv=*/true, ROTARY_MODE,
-                                                    num_stages_smem, tile_size_per_bdx, vec_size,
-                                                    bdx, bdy, bdz, DTypeIn, DTypeOut>;
+                  auto kernel = SingleDecodeWithKVCacheKernel<
+                      KV_LAYOUT, /*partition_kv=*/true, pos_encoding_mode, num_stages_smem,
+                      tile_size_per_bdx, vec_size, bdx, bdy, bdz, DTypeIn, DTypeOut>;
                   FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
                       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -1057,7 +1058,7 @@ std::pair<uint32_t, uint32_t> PartitionPagedKVCacheBinarySearchMinNumPagePerBatc
  * \param new_batch_size The new batch size after the partition
  * \param paged_kv The paged kv cache data structure
  * \param num_qo_heads A integer indicates the number of heads of query and output
- * \param rotary_mode The rotary mode
+ * \param pos_encoding_mode The positional encoding mode
  * \param stream The cuda stream to launch the kernel
  * \return status Indicates whether CUDA calls are successful
  */
@@ -1067,11 +1068,12 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
     uint32_t& tmp_size, uint32_t& max_grid_size, uint32_t& max_num_pages_per_batch,
     uint32_t& new_batch_size, uint32_t batch_size, IdType* kv_indptr, const uint32_t num_qo_heads,
     const uint32_t num_kv_heads, const uint32_t head_dim, const uint32_t page_size,
-    const RotaryMode rotary_mode = RotaryMode::kNone, cudaStream_t stream = nullptr) {
+    const PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
+    cudaStream_t stream = nullptr) {
   DISPATCH_GQA_GROUP_SIZE(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
       {DISPATCH_HEAD_DIM(
-          head_dim, HEAD_DIM, {DISPATCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
+          head_dim, HEAD_DIM, {DISPATCH_pos_encoding_mode(pos_encoding_mode, pos_encoding_mode, {
             constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
             constexpr uint32_t num_stages_smem = 2U;
             constexpr uint32_t bdx = HEAD_DIM / vec_size;
@@ -1087,8 +1089,8 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
                          2 * bdy * bdz * sizeof(float));
 
             auto partition_kv_kernel = BatchDecodeWithPagedKVCacheKernel<
-                /*partition_kv=*/true, ROTARY_MODE, num_stages_smem, tile_size_per_bdx, vec_size,
-                bdx, bdy, bdz, page_storage, kv_layout, DTypeIn, DTypeOut, IdType>;
+                /*partition_kv=*/true, pos_encoding_mode, num_stages_smem, tile_size_per_bdx,
+                vec_size, bdx, bdy, bdz, page_storage, kv_layout, DTypeIn, DTypeOut, IdType>;
             int num_blocks_per_sm = 0;
             int num_sm = 0;
             int dev_id = 0;
@@ -1131,7 +1133,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
 }
 
 template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, QKVLayout kv_layout,
-          RotaryMode ROTARY_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
+          PosEncodingMode pos_encoding_mode, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     DTypeIn* q, IdType* q_rope_position,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
@@ -1160,9 +1162,9 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     dim3 nblks(batch_size, num_kv_heads);
     dim3 nthrs(bdx, bdy, bdz);
     auto kernel =
-        BatchDecodeWithPagedKVCacheKernel</*partition_kv=*/false, ROTARY_MODE, num_stages_smem,
-                                          tile_size_per_bdx, vec_size, bdx, bdy, bdz, page_storage,
-                                          kv_layout, DTypeIn, DTypeOut, IdType>;
+        BatchDecodeWithPagedKVCacheKernel</*partition_kv=*/false, pos_encoding_mode,
+                                          num_stages_smem, tile_size_per_bdx, vec_size, bdx, bdy,
+                                          bdz, page_storage, kv_layout, DTypeIn, DTypeOut, IdType>;
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     void* args[] = {(void*)&q,
@@ -1179,7 +1181,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
   } else {
     // use partition-kv kernel
     auto partition_kv_kernel =
-        BatchDecodeWithPagedKVCacheKernel</*partition_kv=*/true, ROTARY_MODE, num_stages_smem,
+        BatchDecodeWithPagedKVCacheKernel</*partition_kv=*/true, pos_encoding_mode, num_stages_smem,
                                           tile_size_per_bdx, vec_size, bdx, bdy, bdz, page_storage,
                                           kv_layout, DTypeIn, DTypeOut, IdType>;
     FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
@@ -1218,7 +1220,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
  * \param tmp Used-allocated temporary buffer
  * \param lse The logsumexp values.
  * \param num_qo_heads A integer indicates the number of heads of query and output
- * \param rotary_mode The rotary mode
+ * \param pos_encoding_mode The positional encoding mode
  * \param rope_scale The scaling ratio used in RoPE Interpolation.
  * \param rope_theta A floating point number indicate the "theta" used in RoPE
  * \param stream The cuda stream to launch the kernel
@@ -1230,7 +1232,7 @@ cudaError_t BatchDecodeWithPagedKVCache(
     DTypeIn* q, IdType* q_rope_position,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, DTypeOut* tmp, float* lse,
-    uint32_t num_qo_heads, RotaryMode rotary_mode = RotaryMode::kNone,
+    uint32_t num_qo_heads, PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
     std::optional<float> maybe_sm_scale = std::nullopt, float rope_scale = 1.f,
     float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   const uint32_t num_kv_heads = paged_kv.num_heads;
@@ -1247,10 +1249,10 @@ cudaError_t BatchDecodeWithPagedKVCache(
   DISPATCH_GQA_GROUP_SIZE(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
       {DISPATCH_HEAD_DIM(
-          head_dim, HEAD_DIM, {DISPATCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
+          head_dim, HEAD_DIM, {DISPATCH_pos_encoding_mode(pos_encoding_mode, pos_encoding_mode, {
             return BatchDecodeWithPagedKVCacheDispatched<GROUP_SIZE, HEAD_DIM, page_storage,
-                                                         kv_layout, ROTARY_MODE, DTypeIn, DTypeOut,
-                                                         IdType>(
+                                                         kv_layout, pos_encoding_mode, DTypeIn,
+                                                         DTypeOut, IdType>(
                 q, q_rope_position, paged_kv, kv_partition_info, o, tmp, lse, sm_scale, rope_scale,
                 rope_theta, stream);
           })})});
@@ -1258,8 +1260,8 @@ cudaError_t BatchDecodeWithPagedKVCache(
   return cudaSuccess;
 }
 
-template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT, RotaryMode ROTARY_MODE,
-          typename DTypeIn, typename DTypeOut>
+template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
+          PosEncodingMode pos_encoding_mode, typename DTypeIn, typename DTypeOut>
 cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeIn* o,
                                                    DTypeOut* tmp, float* lse, uint32_t batch_size,
                                                    uint32_t padded_kv_len, uint32_t num_qo_heads,
@@ -1282,7 +1284,7 @@ cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DType
 
   dim3 nblks(batch_size, num_kv_heads);
   dim3 nthrs(bdx, bdy, bdz);
-  auto kernel = BatchDecodeWithPaddedKVCacheKernel<KV_LAYOUT, ROTARY_MODE, num_stages_smem,
+  auto kernel = BatchDecodeWithPaddedKVCacheKernel<KV_LAYOUT, pos_encoding_mode, num_stages_smem,
                                                    vec_size, bdx, bdy, bdz, DTypeIn, DTypeOut>;
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -1301,12 +1303,15 @@ cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DType
 }
 
 template <typename DTypeIn, typename DTypeOut>
-cudaError_t BatchDecodeWithPaddedKVCache(
-    DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeIn* o, DTypeOut* tmp, float* lse, uint32_t batch_size,
-    uint32_t padded_kv_len, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
-    QKVLayout kv_layout = QKVLayout::kNHD, RotaryMode rotary_mode = RotaryMode::kNone,
-    std::optional<float> sm_scale = std::nullopt, float rope_scale = 1.f, float rope_theta = 1e4,
-    cudaStream_t stream = nullptr) {
+cudaError_t BatchDecodeWithPaddedKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeIn* o,
+                                         DTypeOut* tmp, float* lse, uint32_t batch_size,
+                                         uint32_t padded_kv_len, uint32_t num_qo_heads,
+                                         uint32_t num_kv_heads, uint32_t head_dim,
+                                         QKVLayout kv_layout = QKVLayout::kNHD,
+                                         PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
+                                         std::optional<float> sm_scale = std::nullopt,
+                                         float rope_scale = 1.f, float rope_theta = 1e4,
+                                         cudaStream_t stream = nullptr) {
   if (!sm_scale.has_value()) {
     sm_scale = 1.f / std::sqrt(float(head_dim));
   }
@@ -1321,10 +1326,10 @@ cudaError_t BatchDecodeWithPaddedKVCache(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
       {DISPATCH_HEAD_DIM(
           head_dim, HEAD_DIM,
-          {DISPATCH_ROTARY_MODE(
-              rotary_mode, ROTARY_MODE, {DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
+          {DISPATCH_pos_encoding_mode(
+              pos_encoding_mode, pos_encoding_mode, {DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
                 return BatchDecodeWithPaddedKVCacheDispatched<GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
-                                                              ROTARY_MODE, DTypeIn, DTypeOut>(
+                                                              pos_encoding_mode, DTypeIn, DTypeOut>(
                     q, k, v, o, tmp, lse, batch_size, padded_kv_len, num_qo_heads, sm_scale,
                     rope_scale, rope_theta, stream);
               })})})});

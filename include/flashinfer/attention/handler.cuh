@@ -21,7 +21,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "../rope.cuh"
+#include "../pos_enc.cuh"
 #include "../utils.cuh"
 #include "decode.cuh"
 
@@ -81,7 +81,7 @@ class BatchDecodeHandler {
   cudaError_t BeginForward(void* buffer, size_t workspace_size_in_bytes, IdType* indptr,
                            IdType* last_page_len, uint32_t batch_size, uint32_t num_qo_heads,
                            uint32_t num_kv_heads, uint32_t head_dim, uint32_t page_size,
-                           RotaryMode rotary_mode) {
+                           PosEncodingMode pos_encoding_mode) {
     batch_size_before_partition_ = batch_size;
     uint32_t tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size;
     auto work_estimation_func =
@@ -89,7 +89,7 @@ class BatchDecodeHandler {
                                                   IdType>;
     FLASHINFER_CUDA_CALL(work_estimation_func(
         tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size, batch_size, indptr,
-        num_qo_heads, num_kv_heads, head_dim, page_size, rotary_mode, stream_));
+        num_qo_heads, num_kv_heads, head_dim, page_size, pos_encoding_mode, stream_));
     batch_size_after_partition_ = new_batch_size;
     if (tmp_size > 0) {
       AlignedAlloactor allocator(buffer, workspace_size_in_bytes);

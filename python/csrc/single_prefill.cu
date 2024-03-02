@@ -21,8 +21,8 @@ using namespace flashinfer;
 
 std::vector<torch::Tensor> single_prefill_with_kv_cache(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor tmp, bool causal,
-    unsigned int layout, unsigned int rotary_mode, bool allow_fp16_qk_reduction, float rope_scale,
-    float rope_theta, bool return_lse) {
+    unsigned int layout, unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction,
+    float rope_scale, float rope_theta, bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(k);
   CHECK_INPUT(v);
@@ -59,10 +59,11 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
         DISPATCH_CAUSAL(causal, CAUSAL, {
           DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
             DISPATCH_ALLOW_FP16_QK_REDUCTION(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
-              DISPATCH_ROTARY_MODE(RotaryMode(rotary_mode), ROTARY_MODE, {
+              DISPATCH_pos_encoding_mode(PosEncodingMode(pos_encoding_mode), pos_encoding_mode, {
                 cudaError_t status =
-                    SinglePrefillWithKVCacheDispatched<GROUP_SIZE, HEAD_DIM, KV_LAYOUT, ROTARY_MODE,
-                                                       ALLOW_FP16_QK_REDUCTION, CAUSAL>(
+                    SinglePrefillWithKVCacheDispatched<GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
+                                                       pos_encoding_mode, ALLOW_FP16_QK_REDUCTION,
+                                                       CAUSAL>(
                         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
                         static_cast<c_type*>(v.data_ptr()), static_cast<c_type*>(o.data_ptr()),
                         static_cast<float*>(tmp.data_ptr()),

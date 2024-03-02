@@ -40,9 +40,9 @@ from .prefill import (
 )
 from .utils import (
     expand_5d,
-    check_rotary_mode,
+    check_pos_encoding_mode,
     check_kv_layout,
-    RotaryMode,
+    PosEncodingMode,
     TensorLayout,
 )
 
@@ -269,7 +269,7 @@ def batch_decode_with_shared_prefix_padded_kv_cache(
         k_shared,
         v_shared,
         causal=False,
-        rotary_mode="NONE",
+        pos_encoding_mode="NONE",
         kv_layout=kv_layout,
         allow_fp16_qk_reduction=allow_fp16_qk_reduction,
         sm_scale=sm_scale,
@@ -281,7 +281,7 @@ def batch_decode_with_shared_prefix_padded_kv_cache(
         k_unique,
         v_unique,
         kv_layout=kv_layout,
-        rotary_mode="NONE",
+        pos_encoding_mode="NONE",
         sm_scale=sm_scale,
         rope_scale=rope_scale,
         rope_theta=rope_theta,
@@ -419,7 +419,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
             The dimension of the heads
         page_size : int
             The page size of the paged kv cache
-        rotary_mode : str
+        pos_encoding_mode : str
             Whether to apply RoPE on-the-fly inside attention kernels, could be
             ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
         data_type : Union[str, torch.dtype]
@@ -444,7 +444,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
             num_kv_heads,
             head_dim,
             page_size,
-            rotary_mode="NONE",
+            pos_encoding_mode="NONE",
             data_type=data_type,
         )
 
@@ -508,7 +508,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
             k_shared,
             v_shared,
             causal=False,
-            rotary_mode="NONE",
+            pos_encoding_mode="NONE",
             kv_layout=self._kv_layout,
             allow_fp16_qk_reduction=allow_fp16_qk_reduction,
             sm_scale=sm_scale,
@@ -518,7 +518,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
         V_unique, S_unique = self._batch_decode_wrapper.forward_return_lse(
             q,
             unique_kv_data,
-            rotary_mode="NONE",
+            pos_encoding_mode="NONE",
             sm_scale=sm_scale,
             rope_scale=rope_scale,
             rope_theta=rope_theta,
@@ -755,7 +755,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
             k_shared,
             v_shared,
             causal=False,
-            rotary_mode="NONE",
+            pos_encoding_mode="NONE",
             kv_layout=self._kv_layout,
             allow_fp16_qk_reduction=allow_fp16_qk_reduction,
             sm_scale=sm_scale,
@@ -766,7 +766,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
             q,
             unique_kv_data,
             causal=causal,
-            rotary_mode="NONE",
+            pos_encoding_mode="NONE",
             allow_fp16_qk_reduction=allow_fp16_qk_reduction,
             sm_scale=sm_scale,
             rope_scale=rope_scale,

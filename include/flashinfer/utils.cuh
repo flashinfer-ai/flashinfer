@@ -178,23 +178,23 @@
     }                                                  \
   }
 
-#define DISPATCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, ...)       \
-  switch (rotary_mode) {                                          \
-    case RotaryMode::kNone: {                                     \
-      constexpr RotaryMode ROTARY_MODE = RotaryMode::kNone;       \
-      __VA_ARGS__                                                 \
-      break;                                                      \
-    }                                                             \
-    case RotaryMode::kLlama: {                                    \
-      constexpr RotaryMode ROTARY_MODE = RotaryMode::kLlama;      \
-      __VA_ARGS__                                                 \
-      break;                                                      \
-    }                                                             \
-    default: {                                                    \
-      std::ostringstream err_msg;                                 \
-      err_msg << "Unsupported rotary_mode: " << int(rotary_mode); \
-      throw std::invalid_argument(err_msg.str());                 \
-    }                                                             \
+#define DISPATCH_pos_encoding_mode(pos_encoding_mode, pos_encoding_mode, ...)    \
+  switch (pos_encoding_mode) {                                                   \
+    case PosEncodingMode::kNone: {                                               \
+      constexpr PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone;      \
+      __VA_ARGS__                                                                \
+      break;                                                                     \
+    }                                                                            \
+    case PosEncodingMode::kRoPELlama: {                                          \
+      constexpr PosEncodingMode pos_encoding_mode = PosEncodingMode::kRoPELlama; \
+      __VA_ARGS__                                                                \
+      break;                                                                     \
+    }                                                                            \
+    default: {                                                                   \
+      std::ostringstream err_msg;                                                \
+      err_msg << "Unsupported pos_encoding_mode: " << int(pos_encoding_mode);    \
+      throw std::invalid_argument(err_msg.str());                                \
+    }                                                                            \
   }
 
 namespace flashinfer {

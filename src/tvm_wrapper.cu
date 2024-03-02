@@ -52,7 +52,8 @@ template <typename DTypeIn, typename DTypeOut>
 cudaError_t _SinglePrefillWithKVCacheNoLSE(
     DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o, float* tmp, uint32_t num_qo_heads,
     uint32_t num_kv_heads, uint32_t qo_len, uint32_t kv_len, uint32_t head_dim, bool causal = true,
-    QKVLayout kv_layout = QKVLayout::kNHD, RotaryMode rotary_mode = RotaryMode::kNone,
+    QKVLayout kv_layout = QKVLayout::kNHD,
+    PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
     bool allow_fp16_qk_reduction = false, float rope_scale = 1.f, float rope_theta = 1e4,
     cudaStream_t stream = nullptr) {
   CHECK(head_dim == 128) << "The head dimension must be 128";
@@ -64,18 +65,19 @@ cudaError_t _SinglePrefillWithKVCacheNoLSE(
       allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
       {DISPATCH_GQA_GROUP_SIZE(
           group_size, GROUP_SIZE,
-          {DISPATCH_CAUSAL(causal, CAUSAL, {DISPATCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
-                             SinglePrefillWithKVCacheDispatched<
-                                 GROUP_SIZE, /*head_dim=*/128, /*layout=*/QKVLayout::kNHD,
-                                 ROTARY_MODE, ALLOW_FP16_QK_REDUCTION, CAUSAL>(
-                                 q, k, v, o, tmp, /*lse=*/nullptr, num_kv_heads, qo_len, kv_len,
-                                 sm_scale, rope_scale, rope_theta, stream);
-                           })})})});
+          {DISPATCH_CAUSAL(
+              causal, CAUSAL, {DISPATCH_pos_encoding_mode(pos_encoding_mode, pos_encoding_mode, {
+                SinglePrefillWithKVCacheDispatched<GROUP_SIZE, /*head_dim=*/128,
+                                                   /*layout=*/QKVLayout::kNHD, pos_encoding_mode,
+                                                   ALLOW_FP16_QK_REDUCTION, CAUSAL>(
+                    q, k, v, o, tmp, /*lse=*/nullptr, num_kv_heads, qo_len, kv_len, sm_scale,
+                    rope_scale, rope_theta, stream);
+              })})})});
   return cudaSuccess;
 }
 
 int _FlashInferSinglePrefillWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, DLTensor* tmp,
-                                        bool causal, int64_t kv_layout, int64_t rotary_mode,
+                                        bool causal, int64_t kv_layout, int64_t pos_encoding_mode,
                                         bool allow_fp16_qk_reduction, double rope_scale,
                                         double rope_theta, DLTensor* o) {
   // `tmp` is user-provided scratch space of at least 16MB, e.g. 4 * 1024 * 1024 float32.
@@ -117,8 +119,8 @@ int _FlashInferSinglePrefillWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, D
         cudaError_t status = _SinglePrefillWithKVCacheNoLSE(
             (dtype_in*)q->data, (dtype_in*)k->data, (dtype_in*)v->data, (dtype_out*)o->data,
             (float*)tmp->data, num_qo_heads, num_kv_heads, qo_len, kv_len, head_dim, causal,
-            QKVLayout(kv_layout), RotaryMode(rotary_mode), allow_fp16_qk_reduction, rope_scale,
-            rope_theta, 0);
+            QKVLayout(kv_layout), PosEncodingMode(pos_encoding_mode), allow_fp16_qk_reduction,
+            rope_scale, rope_theta, 0);
         if (status != cudaSuccess) {
           LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
         }
@@ -127,8 +129,8 @@ int _FlashInferSinglePrefillWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, D
 }
 
 int _FlashInferSingleDecodeWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, DLTensor* tmp,
-                                       int64_t kv_layout, int64_t rotary_mode, double rope_scale,
-                                       double rope_theta, DLTensor* o) {
+                                       int64_t kv_layout, int64_t pos_encoding_mode,
+                                       double rope_scale, double rope_theta, DLTensor* o) {
   // `tmp` is user-provided scratch space of at least 16MB, e.g. 4 * 1024 * 1024 float32.
   CHECK_EQ(q->device.device_type, kDLCUDA) << "The device of q matrix must be CUDA.";
   CHECK_EQ(k->device.device_type, kDLCUDA) << "The device of k matrix must be CUDA.";
@@ -166,7 +168,7 @@ int _FlashInferSingleDecodeWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, DL
         cudaError_t status = SingleDecodeWithKVCache(
             (dtype_in*)q->data, (dtype_in*)k->data, (dtype_in*)v->data, (dtype_out*)o->data,
             (dtype_out*)tmp->data, num_qo_heads, num_kv_heads, seq_len, head_dim,
-            QKVLayout(kv_layout), RotaryMode(rotary_mode), rope_scale, rope_theta, 0);
+            QKVLayout(kv_layout), PosEncodingMode(pos_encoding_mode), rope_scale, rope_theta, 0);
         if (status != cudaSuccess) {
           LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
         }
@@ -187,8 +189,9 @@ template <PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typen
 cudaError_t _BatchPrefillWithPagedKVCacheWrapper(
     BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, IdType* q_rope_position,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, DTypeOut* o, float* lse,
-    uint32_t num_qo_heads, bool causal, RotaryMode rotary_mode, bool allow_fp16_qk_reduction,
-    float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream) {
+    uint32_t num_qo_heads, bool causal, PosEncodingMode pos_encoding_mode,
+    bool allow_fp16_qk_reduction, float sm_scale, float rope_scale, float rope_theta,
+    cudaStream_t stream) {
   CHECK(lse != nullptr) << "The lse buffer must be provided";
   CHECK(allow_fp16_qk_reduction == false) << "The fp16 qk reduction is not supported";
   CHECK(paged_kv.head_dim == 128) << "The head dimension must be 128";
@@ -198,13 +201,14 @@ cudaError_t _BatchPrefillWithPagedKVCacheWrapper(
   const uint32_t group_size = num_qo_heads / num_kv_heads;
   DISPATCH_GQA_GROUP_SIZE(
       group_size, GROUP_SIZE,
-      {DISPATCH_CAUSAL(causal, CAUSAL, {DISPATCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
-                         return BatchPrefillWithPagedKVCacheWrapperDispatched<
-                             page_storage, kv_layout, GROUP_SIZE, /*head_dim=*/128, ROTARY_MODE,
-                             /*allow_fp16_qk_reduction=*/false, CAUSAL, DTypeIn, DTypeOut, IdType>(
-                             handler, q, qo_indptr, q_rope_position, paged_kv, o, lse, sm_scale,
-                             rope_scale, rope_theta, stream);
-                       })})});
+      {DISPATCH_CAUSAL(
+          causal, CAUSAL, {DISPATCH_pos_encoding_mode(pos_encoding_mode, pos_encoding_mode, {
+            return BatchPrefillWithPagedKVCacheWrapperDispatched<
+                page_storage, kv_layout, GROUP_SIZE, /*head_dim=*/128, pos_encoding_mode,
+                /*allow_fp16_qk_reduction=*/false, CAUSAL, DTypeIn, DTypeOut, IdType>(
+                handler, q, qo_indptr, q_rope_position, paged_kv, o, lse, sm_scale, rope_scale,
+                rope_theta, stream);
+          })})});
   return cudaSuccess;
 }
 
@@ -219,7 +223,7 @@ void _FlashInferAttentionPrefillWithPagedKVCache(int64_t handler_id, DLTensor* q
                                                  DLTensor* output,             //
                                                  DLTensor* lse,                //
                                                  int64_t causal,               //
-                                                 int64_t rotary_mode,          //
+                                                 int64_t pos_encoding_mode,    //
                                                  double rope_scale,            //
                                                  double rope_theta,
                                                  double attn_score_scaling_factor = 1.0f) {
@@ -314,8 +318,8 @@ void _FlashInferAttentionPrefillWithPagedKVCache(int64_t handler_id, DLTensor* q
                     static_cast<dtype_idx*>(q_rope_position->data), cache,
                     static_cast<dtype_out*>(output->data),
                     /*lse=*/static_cast<float*>(lse->data), nhead_qo,
-                    /*causal=*/causal, RotaryMode(rotary_mode), /*allow_fp16_qk_reduction=*/false,
-                    sm_scale, rope_scale, rope_theta,
+                    /*causal=*/causal, PosEncodingMode(pos_encoding_mode),
+                    /*allow_fp16_qk_reduction=*/false, sm_scale, rope_scale, rope_theta,
                     /*stream=*/0);
             if (status != cudaSuccess) {
               LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
@@ -349,15 +353,15 @@ thread_local BatchDecodeHandler batch_decode_handlers[max_num_handlers];
 
 void _FlashInferAttentionDecodeWithPagedKVCache(int64_t handler_id, DLTensor* q_data,
                                                 DLTensor* pages,
-                                                DLTensor* page_table_indptr,  //
-                                                DLTensor* page_table_values,  //
-                                                DLTensor* last_page_len,      //
-                                                DLTensor* k_rope_pos_offset,  //
-                                                DLTensor* q_rope_position,    //
-                                                DLTensor* output,             //
-                                                DLTensor* lse,                //
-                                                int64_t rotary_mode = 0,      //
-                                                double rope_scale = 1.0f,     //
+                                                DLTensor* page_table_indptr,    //
+                                                DLTensor* page_table_values,    //
+                                                DLTensor* last_page_len,        //
+                                                DLTensor* k_rope_pos_offset,    //
+                                                DLTensor* q_rope_position,      //
+                                                DLTensor* output,               //
+                                                DLTensor* lse,                  //
+                                                int64_t pos_encoding_mode = 0,  //
+                                                double rope_scale = 1.0f,       //
                                                 double rope_theta = 1e4,
                                                 double attn_score_scaling_factor = 1.0f) {
   CHECK_LT(handler_id, max_num_handlers) << "The handler id must be less than " << max_num_handlers;
@@ -442,8 +446,8 @@ void _FlashInferAttentionDecodeWithPagedKVCache(int64_t handler_id, DLTensor* q_
                 &batch_decode_handlers[handler_id], static_cast<dtype_in*>(q_data->data),
                 static_cast<dtype_idx*>(q_rope_position->data), cache,
                 static_cast<dtype_out*>(output->data),
-                /*lse=*/static_cast<float*>(lse->data), nhead_qo, RotaryMode(rotary_mode), sm_scale,
-                rope_scale, rope_theta,
+                /*lse=*/static_cast<float*>(lse->data), nhead_qo,
+                PosEncodingMode(pos_encoding_mode), sm_scale, rope_scale, rope_theta,
                 /*stream=*/0);
             if (status != cudaSuccess) {
               LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
@@ -454,7 +458,7 @@ void _FlashInferAttentionDecodeWithPagedKVCache(int64_t handler_id, DLTensor* q_
 void _FlashInferAttentionDecodeWithPagedKVCacheBeginForward(
     int64_t handler_idx, DLTensor* workspace_buffer, DLTensor* page_table_indptr,
     DLTensor* last_page_len, int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim,
-    int64_t page_size, int64_t rotary_mode) {
+    int64_t page_size, int64_t pos_encoding_mode) {
   CHECK_EQ(workspace_buffer->ndim, 1) << "The workspace buffer must be a 1-D tensor";
   size_t workspace_size_in_bytes = workspace_buffer->shape[0] * workspace_buffer->dtype.bits / 8;
   CHECK_LT(handler_idx, max_num_handlers)
@@ -472,7 +476,7 @@ void _FlashInferAttentionDecodeWithPagedKVCacheBeginForward(
                 static_cast<void*>(workspace_buffer->data), workspace_size_in_bytes,
                 static_cast<dtype_idx*>(page_table_indptr->data),
                 static_cast<dtype_idx*>(last_page_len->data), batch_size, num_qo_heads,
-                num_kv_heads, head_dim, page_size, RotaryMode(rotary_mode));
+                num_kv_heads, head_dim, page_size, PosEncodingMode(pos_encoding_mode));
     if (status != cudaSuccess) {
       LOG(FATAL) << "FlashInfer decode BeginForward error " << cudaGetErrorString(status);
     }
@@ -493,7 +497,7 @@ cudaError_t _BatchPrefillWithRaggedKVCacheWrapper(
     BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, DTypeIn* k, DTypeIn* v,
     IdType* kv_indptr, IdType* q_rope_position_map, IdType* k_rope_pos_offset, DTypeOut* o,
     float* lse, const uint32_t batch_size, const uint32_t num_qo_heads, const uint32_t num_kv_heads,
-    const uint32_t head_dim, bool causal, QKVLayout kv_layout, RotaryMode rotary_mode,
+    const uint32_t head_dim, bool causal, QKVLayout kv_layout, PosEncodingMode pos_encoding_mode,
     bool allow_fp16_qk_reduction, const float sm_scale, const float rope_scale,
     const float rope_theta, cudaStream_t stream) {
   CHECK(lse != nullptr) << "The lse buffer must be provided";
@@ -503,22 +507,22 @@ cudaError_t _BatchPrefillWithRaggedKVCacheWrapper(
 
   DISPATCH_GQA_GROUP_SIZE(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
-      {DISPATCH_CAUSAL(causal, CAUSAL, {DISPATCH_ROTARY_MODE(rotary_mode, ROTARY_MODE, {
-                         return BatchPrefillWithRaggedKVCacheWrapperDispatched<
-                             GROUP_SIZE, /*head_dim=*/128, /*layout=*/QKVLayout::kNHD, ROTARY_MODE,
-                             /*allow_fp16_qk_reduction=*/false, CAUSAL, DTypeIn, DTypeOut, IdType>(
-                             handler, q, qo_indptr, k, v, kv_indptr, q_rope_position_map,
-                             k_rope_pos_offset, o, lse, batch_size, num_kv_heads, sm_scale,
-                             rope_scale, rope_theta, stream);
-                       })})});
+      {DISPATCH_CAUSAL(
+          causal, CAUSAL, {DISPATCH_pos_encoding_mode(pos_encoding_mode, pos_encoding_mode, {
+            return BatchPrefillWithRaggedKVCacheWrapperDispatched<
+                GROUP_SIZE, /*head_dim=*/128, /*layout=*/QKVLayout::kNHD, pos_encoding_mode,
+                /*allow_fp16_qk_reduction=*/false, CAUSAL, DTypeIn, DTypeOut, IdType>(
+                handler, q, qo_indptr, k, v, kv_indptr, q_rope_position_map, k_rope_pos_offset, o,
+                lse, batch_size, num_kv_heads, sm_scale, rope_scale, rope_theta, stream);
+          })})});
   return cudaSuccess;
 }
 
 void _FlashInferAttentionPrefillWithRaggedKVCache(
     DLTensor* q_data, DLTensor* qo_indptr, DLTensor* k_data, DLTensor* v_data, DLTensor* kv_indptr,
     DLTensor* q_rope_position_map, DLTensor* k_rope_pos_offset, DLTensor* output, DLTensor* lse,
-    int64_t causal = 1, int64_t rotary_mode = 0, double rope_scale = 1.0f, double rope_theta = 1e4,
-    double attn_score_scaling_factor = 1.0f) {
+    int64_t causal = 1, int64_t pos_encoding_mode = 0, double rope_scale = 1.0f,
+    double rope_theta = 1e4, double attn_score_scaling_factor = 1.0f) {
   CHECK_EQ(q_data->device.device_type, kDLCUDA) << "The device of q_data must be CUDA.";
   CHECK_EQ(qo_indptr->device.device_type, kDLCUDA) << "The device of qo_indptr must be CUDA.";
   CHECK_EQ(k_data->device.device_type, kDLCUDA) << "The device of k_data must be CUDA.";
@@ -597,7 +601,7 @@ void _FlashInferAttentionPrefillWithRaggedKVCache(
                     static_cast<dtype_idx*>(k_rope_pos_offset->data),
                     static_cast<dtype_out*>(output->data),
                     /*lse=*/static_cast<float*>(lse->data), batch_size, nhead_qo, nhead_kv, nfeat,
-                    /*causal=*/bool(causal), QKVLayout::kNHD, RotaryMode(rotary_mode),
+                    /*causal=*/bool(causal), QKVLayout::kNHD, PosEncodingMode(pos_encoding_mode),
                     /*allow_fp16_qk_reduction=*/false, sm_scale, rope_scale, rope_theta,
                     /*sm_scale=*/0);
           })})})

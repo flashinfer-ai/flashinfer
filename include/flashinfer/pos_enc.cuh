@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_ROPE_CUH_
-#define FLASHINFER_ROPE_CUH_
+#ifndef FLASHINFER_POS_ENC_CUH_
+#define FLASHINFER_POS_ENC_CUH_
 
 #include <string>
 
@@ -33,6 +33,8 @@ enum class PosEncodingMode {
   kNone = 0U,
   // Apply Llama-style rope.
   kRoPELlama = 1U,
+  // Apply ALiBi bias
+  kALiBi = 2U
 };
 
 /*!
@@ -45,6 +47,8 @@ inline std::string PosEncodingModeToString(const PosEncodingMode& pos_encoding_m
       return "None";
     case PosEncodingMode::kRoPELlama:
       return "Llama";
+    case PosEncodingMode::kALiBi:
+      return "ALiBi";
     default:
       return "Unknown";
   }
@@ -170,4 +174,4 @@ cudaError_t BatchQKApplyRotaryInPlace(DType* __restrict__ q, DType* __restrict__
 
 }  // namespace flashinfer
 
-#endif  // FLASHINFER_ROPE_CUH_
+#endif  // FLASHINFER_POS_ENC_CUH_
