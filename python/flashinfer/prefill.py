@@ -93,7 +93,7 @@ def single_prefill_with_kv_cache(
         The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
     pos_encoding_mode : str
         Whether to apply RoPE on-the-fly inside attention kernels, could be
-        ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
+        ``NONE``/``ROPE_LLAMA``(LLAMA style rotary embedding)/``ALIBI``.
     allow_fp16_qk_reduction : bool
         Whether to use f16 for qk reduction (faster at the cost of slight precision
         loss).
@@ -191,7 +191,7 @@ def single_prefill_with_kv_cache_return_lse(
         The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
     pos_encoding_mode : str
         Whether to apply RoPE on-the-fly inside attention kernels, could be
-        ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
+        ``NONE``/``ROPE_LLAMA``(LLAMA style rotary embedding)/``ALIBI``.
     allow_fp16_qk_reduction : bool
         Whether to use f16 for qk reduction (faster at the cost of slight precision
         loss).
@@ -460,7 +460,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Whether to apply causal mask to the attention matrix.
         pos_encoding_mode : str
             Whether to apply RoPE on-the-fly inside attention kernels, could be
-            ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
+            ``NONE``/``ROPE_LLAMA``(LLAMA style rotary embedding)/``ALIBI``.
         allow_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
             loss).
@@ -529,7 +529,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Whether to apply causal mask to the attention matrix.
         pos_encoding_mode : str
             Whether to apply RoPE on-the-fly inside attention kernels, could be
-            ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
+            ``NONE``/``ROPE_LLAMA``(LLAMA style rotary embedding)/``ALIBI``.
         allow_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
             loss).
@@ -744,7 +744,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             Whether to apply causal mask to the attention matrix.
         pos_encoding_mode : str
             Whether to apply RoPE on-the-fly inside attention kernels, could be
-            ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
+            ``NONE``/``ROPE_LLAMA``(LLAMA style rotary embedding)/``ALIBI``.
         allow_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
             loss).
@@ -811,7 +811,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             Whether to apply causal mask to the attention matrix.
         pos_encoding_mode : str
             Whether to apply RoPE on-the-fly inside attention kernels, could be
-            ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
+            ``NONE``/``ROPE_LLAMA``(LLAMA style rotary embedding)/``ALIBI``.
         allow_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
             loss).
