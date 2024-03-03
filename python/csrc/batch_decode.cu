@@ -61,7 +61,7 @@ std::vector<torch::Tensor> batch_decode_with_padded_kv_cache(
         /*tmp=*/tmp,
         /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr, batch_size,
         padded_kv_len, num_qo_heads, num_kv_heads, head_dim, kv_layout,
-        PosEncodingMode(pos_encoding_mode), rope_scale, rope_theta, torch_current_stream);
+        PosEncodingMode(pos_encoding_mode), sm_scale, rope_scale, rope_theta, torch_current_stream);
     TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPaddedKVCache failed with error code ",
                 status);
     return true;
