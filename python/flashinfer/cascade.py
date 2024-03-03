@@ -419,9 +419,6 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
             The dimension of the heads
         page_size : int
             The page size of the paged kv cache
-        pos_encoding_mode : str
-            Whether to apply RoPE on-the-fly inside attention kernels, could be
-            ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
         data_type : Union[str, torch.dtype]
             The data type of the paged kv cache
 
