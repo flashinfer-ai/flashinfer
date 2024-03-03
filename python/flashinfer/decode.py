@@ -79,7 +79,7 @@ def single_decode_with_kv_cache(
         The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
     pos_encoding_mode : str
         Whether to apply RoPE on-the-fly inside attention kernels, could be
-        ``NONE``/``ROPE_LLAMA``(LLAMA style rotary embedding)/``ALIBI``.
+        ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
     sm_scale : Optional[float]
         The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
     rope_scale : Optional[float]
@@ -168,7 +168,7 @@ def batch_decode_with_padded_kv_cache(
         The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
     pos_encoding_mode : str
         Whether to apply RoPE on-the-fly inside attention kernels, could be
-        ``NONE``/``ROPE_LLAMA``(LLAMA style rotary embedding)/``ALIBI``.
+        ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
     sm_scale : Optional[float]
         The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
     rope_scale : Optional[float]
@@ -257,7 +257,7 @@ def batch_decode_with_padded_kv_cache_return_lse(
         The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
     pos_encoding_mode : str
         Whether to apply RoPE on-the-fly inside attention kernels, could be
-        ``NONE``/``ROPE_LLAMA``(LLAMA style rotary embedding)/``ALIBI``.
+        ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
     sm_scale : Optional[float]
         The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
     rope_scale : Optional[float]
@@ -456,7 +456,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The page size of the paged kv cache
         pos_encoding_mode : str
             Whether to apply RoPE on-the-fly inside attention kernels, could be
-            ``NONE``/``ROPE_LLAMA``(LLAMA style rotary embedding)/``ALIBI``.
+            ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
         data_type : Union[str, torch.dtype]
             The data type of the paged kv cache
 
@@ -525,7 +525,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             :attr:`kv_layout` is ``HND``.
         pos_encoding_mode : str
             Whether to apply RoPE on-the-fly inside attention kernels, could be
-            ``NONE``/``ROPE_LLAMA``(LLAMA style rotary embedding)/``ALIBI``.
+            ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
         sm_scale : Optional[float]
             The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
         rope_scale : Optional[float]
@@ -586,7 +586,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             :attr:`kv_layout` is ``HND``.
         pos_encoding_mode : str
             Whether to apply RoPE on-the-fly inside attention kernels, could be
-            ``NONE``/``ROPE_LLAMA``(LLAMA style rotary embedding)/``ALIBI``.
+            ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
         sm_scale : Optional[float]
             The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
         rope_scale : Optional[float]
