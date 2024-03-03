@@ -66,9 +66,9 @@ cudaError_t _SinglePrefillWithKVCacheNoLSE(
       {DISPATCH_GQA_GROUP_SIZE(
           group_size, GROUP_SIZE,
           {DISPATCH_CAUSAL(
-              causal, CAUSAL, {DISPATCH_pos_encoding_mode(pos_encoding_mode, pos_encoding_mode, {
+              causal, CAUSAL, {DISPATCH_POS_ENCODING_MODE(pos_encoding_mode, POS_ENCODING_MODE, {
                 SinglePrefillWithKVCacheDispatched<GROUP_SIZE, /*head_dim=*/128,
-                                                   /*layout=*/QKVLayout::kNHD, pos_encoding_mode,
+                                                   /*layout=*/QKVLayout::kNHD, POS_ENCODING_MODE,
                                                    ALLOW_FP16_QK_REDUCTION, CAUSAL>(
                     q, k, v, o, tmp, /*lse=*/nullptr, num_kv_heads, qo_len, kv_len, sm_scale,
                     rope_scale, rope_theta, stream);
@@ -202,9 +202,9 @@ cudaError_t _BatchPrefillWithPagedKVCacheWrapper(
   DISPATCH_GQA_GROUP_SIZE(
       group_size, GROUP_SIZE,
       {DISPATCH_CAUSAL(
-          causal, CAUSAL, {DISPATCH_pos_encoding_mode(pos_encoding_mode, pos_encoding_mode, {
+          causal, CAUSAL, {DISPATCH_POS_ENCODING_MODE(pos_encoding_mode, POS_ENCODING_MODE, {
             return BatchPrefillWithPagedKVCacheWrapperDispatched<
-                page_storage, kv_layout, GROUP_SIZE, /*head_dim=*/128, pos_encoding_mode,
+                page_storage, kv_layout, GROUP_SIZE, /*head_dim=*/128, POS_ENCODING_MODE,
                 /*allow_fp16_qk_reduction=*/false, CAUSAL, DTypeIn, DTypeOut, IdType>(
                 handler, q, qo_indptr, q_offset, paged_kv, o, lse, sm_scale, rope_scale, rope_theta,
                 stream);
@@ -506,9 +506,9 @@ cudaError_t _BatchPrefillWithRaggedKVCacheWrapper(
   DISPATCH_GQA_GROUP_SIZE(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
       {DISPATCH_CAUSAL(
-          causal, CAUSAL, {DISPATCH_pos_encoding_mode(pos_encoding_mode, pos_encoding_mode, {
+          causal, CAUSAL, {DISPATCH_POS_ENCODING_MODE(pos_encoding_mode, POS_ENCODING_MODE, {
             return BatchPrefillWithRaggedKVCacheWrapperDispatched<
-                GROUP_SIZE, /*head_dim=*/128, /*layout=*/QKVLayout::kNHD, pos_encoding_mode,
+                GROUP_SIZE, /*head_dim=*/128, /*layout=*/QKVLayout::kNHD, POS_ENCODING_MODE,
                 /*allow_fp16_qk_reduction=*/false, CAUSAL, DTypeIn, DTypeOut, IdType>(
                 handler, q, qo_indptr, k, v, kv_indptr, q_offset_map, k_rope_pos_offset, o, lse,
                 batch_size, num_kv_heads, sm_scale, rope_scale, rope_theta, stream);

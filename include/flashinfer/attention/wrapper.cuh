@@ -138,7 +138,7 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
           head_dim, HEAD_DIM,
           {DISPATCH_CAUSAL(
               causal, CAUSAL,
-              {DISPATCH_pos_encoding_mode(
+              {DISPATCH_POS_ENCODING_MODE(
                   pos_encoding_mode, pos_encoding_mode,
                   {DISPATCH_ALLOW_FP16_QK_REDUCTION(
                       allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
@@ -205,7 +205,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
               head_dim, HEAD_DIM,
               {DISPATCH_CAUSAL(
                   causal, CAUSAL,
-                  {DISPATCH_pos_encoding_mode(
+                  {DISPATCH_POS_ENCODING_MODE(
                       pos_encoding_mode, pos_encoding_mode,
                       {DISPATCH_ALLOW_FP16_QK_REDUCTION(
                           allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {

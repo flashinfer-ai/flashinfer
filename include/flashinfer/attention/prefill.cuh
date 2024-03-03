@@ -527,7 +527,7 @@ template <PosEncodingMode pos_encoding_mode, bool partition_kv, bool causal, uin
           typename DTypeQKAccum>
 __device__ __forceinline__ void mask_s(const uint32_t qo_idx_base, const uint32_t kv_idx_base,
                                        const int32_t q_offset, const uint32_t chunk_end,
-                                       float* alibi_slopes,
+                                       float (*alibi_slopes)[2],
                                        DTypeQKAccum (*s_frag)[num_frags_z][8]) {
   const uint32_t tx = threadIdx.x;
 #pragma unroll
@@ -542,12 +542,12 @@ __device__ __forceinline__ void mask_s(const uint32_t qo_idx_base, const uint32_
         const bool out_of_boundary =
             (causal ? (kv_idx > q_offset + q_idx || (partition_kv && kv_idx >= chunk_end))
                     : kv_idx >= chunk_end);
-        if constexpr (pos_encoding_mode == PosEncoding::ALiBi) {
+        if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
           s_frag[fx][fz][reg_id] =
               out_of_boundary
                   ? DTypeQKAccum(-5e4)
-                  : (s_frag[fx][fz][reg_id] +
-                     alibi_slopes[(reg_id % 4) / 2] * DTypeQKAccum(kv_idx - q_offset - q_idx));
+                  : (s_frag[fx][fz][reg_id] + DTypeQKAccum(alibi_slopes[fx][(reg_id % 4) / 2]) *
+                                                  DTypeQKAccum(kv_idx - q_offset - q_idx));
         } else {
           s_frag[fx][fz][reg_id] = out_of_boundary ? DTypeQKAccum(-5e4) : s_frag[fx][fz][reg_id];
         }
@@ -885,14 +885,17 @@ __global__ void SinglePrefillWithKVCacheKernel(
   const uint32_t kv_len = qkv_info.kv_len;
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
   const uint32_t bx = blockIdx.x, chunk_idx = blockIdx.y, kv_head_idx = blockIdx.z;
-  float alibi_slopes[2];
-  if constexpr (pos_encoding_mode == PosEncodingMode::ALiBi) {
+  float alibi_slopes[num_frags_x][2];
+  if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
 #pragma unroll
-    for (uint32_t j = 0; j < 2; ++j) {
-      const uint32_t qo_head_idx =
-          kv_head_idx * group_size + (tx / 4 + j * 8 + fx * 16) % group_size;
-      const uint32_t num_qo_heads = qkv_info.get_num_qo_heads();
-      alibi_slopes[j] = get_alibi_slope(qo_head_idx, num_qo_heads);
+    for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+      for (uint32_t j = 0; j < 2; ++j) {
+        const uint32_t qo_head_idx =
+            kv_head_idx * group_size + (tx / 4 + j * 8 + fx * 16) % group_size;
+        const uint32_t num_qo_heads = qkv_info.get_num_qo_heads();
+        alibi_slopes[fx][j] = get_alibi_slope(qo_head_idx, num_qo_heads);
+      }
     }
   }
 
@@ -1091,14 +1094,17 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
                  kv_len = kv_indptr[request_idx + 1] - kv_indptr[request_idx];
   const tensor_info_t<kv_layout, group_size, num_frags_y * 16> qkv_info(qo_len, kv_len,
                                                                         num_kv_heads);
-  float alibi_slopes[2];
-  if constexpr (pos_encoding_mode == PosEncodingMode::ALiBi) {
+  float alibi_slopes[num_frags_x][2];
+  if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
 #pragma unroll
-    for (uint32_t j = 0; j < 2; ++j) {
-      const uint32_t qo_head_idx =
-          kv_head_idx * group_size + (tx / 4 + j * 8 + fx * 16) % group_size;
-      const uint32_t num_qo_heads = qkv_info.get_num_qo_heads();
-      alibi_slopes[j] = get_alibi_slope(qo_head_idx, num_qo_heads);
+    for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+      for (uint32_t j = 0; j < 2; ++j) {
+        const uint32_t qo_head_idx =
+            kv_head_idx * group_size + (tx / 4 + j * 8 + fx * 16) % group_size;
+        const uint32_t num_qo_heads = qkv_info.get_num_qo_heads();
+        alibi_slopes[fx][j] = get_alibi_slope(qo_head_idx, num_qo_heads);
+      }
     }
   }
   const uint32_t qo_upper_bound = min(qo_len, (tile_idx + 1) * (num_rows_per_cta / group_size));
@@ -1284,13 +1290,16 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
 
   const uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y, kv_head_idx = blockIdx.z;
   const uint32_t num_kv_heads = gridDim.z, num_qo_heads = num_kv_heads * group_size;
-  float alibi_slopes[2];
-  if constexpr (pos_encoding_mode == PosEncodingMode::ALiBi) {
+  float alibi_slopes[num_frags_x][2];
+  if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
 #pragma unroll
-    for (uint32_t j = 0; j < 2; ++j) {
-      const uint32_t qo_head_idx =
-          kv_head_idx * group_size + (tx / 4 + j * 8 + fx * 16) % group_size;
-      alibi_slopes[j] = get_alibi_slope(qo_head_idx, num_qo_heads);
+    for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+      for (uint32_t j = 0; j < 2; ++j) {
+        const uint32_t qo_head_idx =
+            kv_head_idx * group_size + (tx / 4 + j * 8 + fx * 16) % group_size;
+        alibi_slopes[fx][j] = get_alibi_slope(qo_head_idx, num_qo_heads);
+      }
     }
   }
   const uint32_t request_idx = request_indices[bx], tile_idx = tile_indices[bx];
@@ -1504,7 +1513,7 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
               {DISPATCH_CAUSAL(
                   causal, CAUSAL, {DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
                     constexpr uint32_t num_frags_y = HEAD_DIM / 16;
-                    DISPATCH_pos_encoding_mode(
+                    DISPATCH_POS_ENCODING_MODE(
                         pos_encoding_mode, pos_encoding_mode,
                         {DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
                           using DTypeQKAccum =
@@ -1779,7 +1788,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOu
               causal, CAUSAL,
               {DISPATCH_HEAD_DIM(
                   head_dim, HEAD_DIM,
-                  {DISPATCH_pos_encoding_mode(
+                  {DISPATCH_POS_ENCODING_MODE(
                       pos_encoding_mode, pos_encoding_mode, {DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
                         SinglePrefillWithKVCacheDispatched<GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
                                                            pos_encoding_mode,
@@ -1910,7 +1919,7 @@ cudaError_t BatchPrefillWithRaggedKVCache(
                       causal, CAUSAL,
                       {DISPATCH_HEAD_DIM(
                           head_dim, HEAD_DIM,
-                          {DISPATCH_pos_encoding_mode(pos_encoding_mode, pos_encoding_mode, {
+                          {DISPATCH_POS_ENCODING_MODE(pos_encoding_mode, pos_encoding_mode, {
                             return BatchPrefillWithRaggedKVCacheDispatched<
                                 NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM, KV_LAYOUT, pos_encoding_mode,
                                 ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
@@ -2110,7 +2119,7 @@ cudaError_t BatchPrefillWithPagedKVCache(
                   causal, CAUSAL,
                   {DISPATCH_HEAD_DIM(
                       head_dim, HEAD_DIM,
-                      {DISPATCH_pos_encoding_mode(
+                      {DISPATCH_POS_ENCODING_MODE(
                           pos_encoding_mode, pos_encoding_mode,
                           {DISPATCH_PAGE_SIZE(
                               paged_kv.page_size, PAGE_SIZE,
