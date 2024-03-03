@@ -86,11 +86,7 @@ __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage
       // do not apply rotary embedding
       k_vec.cast_load(smem + (j * bdx + tx) * vec_size);
     }
-    if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
-      s[j] = alibi_slope * float(int(kv_idx_base + tz * tile_size + j) - q_offset);
-    } else {
-      s[j] = 0.f;
-    }
+    s[j] = 0.f;
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
       s[j] += q_vec[i] * k_vec[i];
@@ -100,6 +96,9 @@ __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage
       s[j] += math::shfl_xor_sync(s[j], offset);
     }
     s[j] = (iter_base + tz * tile_size + j < iter_bound) ? s[j] : -5e4;
+    if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
+      s[j] += alibi_slope * float(int(kv_idx_base + tz * tile_size + j) - q_offset);
+    }
     st.m = max(st.m, s[j]);
   }
 
@@ -221,7 +220,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
   uint32_t kv_chunk_idx = blockIdx.x;
   uint32_t num_kv_chunks = gridDim.x;
   uint32_t num_qo_heads = info.get_num_qo_heads();
-  const float alibi_slope = get_alibi_slope(qo_head_idx, num_qo_heads);
+  const float alibi_slope = get_alibi_slope(qo_head_idx, num_qo_heads) * math::log2e;
   uint32_t seq_len = info.kv_len;
 
   extern __shared__ uint8_t smem[];
@@ -373,7 +372,7 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(
   uint32_t batch_idx = blockIdx.x;
   uint32_t num_qo_heads = info.get_num_qo_heads();
   uint32_t num_kv_heads = info.get_num_kv_heads();
-  const float alibi_slope = get_alibi_slope(qo_head_idx, num_qo_heads);
+  const float alibi_slope = get_alibi_slope(qo_head_idx, num_qo_heads) * math::log2e;
   uint32_t seq_len = info.kv_len;
 
   extern __shared__ uint8_t smem[];
@@ -529,7 +528,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
   const uint32_t kv_head_idx = blockIdx.y;
   const uint32_t qo_head_idx = kv_head_idx * bdy + threadIdx.y;
   const uint32_t num_qo_heads = gridDim.y * bdy;
-  const float alibi_slope = get_alibi_slope(qo_head_idx, num_qo_heads);
+  const float alibi_slope = get_alibi_slope(qo_head_idx, num_qo_heads) * math::log2e;
   const uint32_t cur_chunk_start = partition_kv ? kv_partition_info.chunk_start_pos[batch_idx] : 0U;
   const uint32_t cur_page_indptr_begin = paged_kv.indptr[batch_idx],
                  cur_page_indptr_end = paged_kv.indptr[batch_idx + 1];
@@ -1311,12 +1310,10 @@ cudaError_t BatchDecodeWithPaddedKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTy
                                          uint32_t num_kv_heads, uint32_t head_dim,
                                          QKVLayout kv_layout = QKVLayout::kNHD,
                                          PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
-                                         std::optional<float> sm_scale = std::nullopt,
+                                         std::optional<float> maybe_sm_scale = std::nullopt,
                                          float rope_scale = 1.f, float rope_theta = 1e4,
                                          cudaStream_t stream = nullptr) {
-  if (!sm_scale.has_value()) {
-    sm_scale = 1.f / std::sqrt(float(head_dim));
-  }
+  const float sm_scale = maybe_sm_scale.value_or(1.f / std::sqrt(float(head_dim)));
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " is not a multiple of num_kv_heads "

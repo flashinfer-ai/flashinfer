@@ -894,7 +894,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
         const uint32_t qo_head_idx =
             kv_head_idx * group_size + (tx / 4 + j * 8 + fx * 16) % group_size;
         const uint32_t num_qo_heads = qkv_info.get_num_qo_heads();
-        alibi_slopes[fx][j] = get_alibi_slope(qo_head_idx, num_qo_heads);
+        alibi_slopes[fx][j] = get_alibi_slope(qo_head_idx, num_qo_heads) * math::log2e;
       }
     }
   }
@@ -1103,7 +1103,7 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
         const uint32_t qo_head_idx =
             kv_head_idx * group_size + (tx / 4 + j * 8 + fx * 16) % group_size;
         const uint32_t num_qo_heads = qkv_info.get_num_qo_heads();
-        alibi_slopes[fx][j] = get_alibi_slope(qo_head_idx, num_qo_heads);
+        alibi_slopes[fx][j] = get_alibi_slope(qo_head_idx, num_qo_heads) * math::log2e;
       }
     }
   }
@@ -1298,7 +1298,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
       for (uint32_t j = 0; j < 2; ++j) {
         const uint32_t qo_head_idx =
             kv_head_idx * group_size + (tx / 4 + j * 8 + fx * 16) % group_size;
-        alibi_slopes[fx][j] = get_alibi_slope(qo_head_idx, num_qo_heads);
+        alibi_slopes[fx][j] = get_alibi_slope(qo_head_idx, num_qo_heads) * math::log2e;
       }
     }
   }

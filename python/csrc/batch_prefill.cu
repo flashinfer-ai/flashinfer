@@ -49,7 +49,8 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
     torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor paged_kv_data,
     torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
     torch::Tensor paged_kv_last_page_len, bool causal, unsigned int pos_encoding_mode,
-    bool allow_fp16_qk_reduction, float rope_scale, float rope_theta, bool return_lse) {
+    bool allow_fp16_qk_reduction, float sm_scale, float rope_scale, float rope_theta,
+    bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(qo_indptr);
   CHECK_INPUT(paged_kv_data);
@@ -114,8 +115,8 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
                     &handler_, static_cast<c_type*>(q.data_ptr()),
                     static_cast<int32_t*>(qo_indptr.data_ptr()),
                     /*q_offset=*/nullptr, paged_kv, static_cast<c_type*>(o.data_ptr()),
-                    /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr, rope_scale,
-                    rope_theta,
+                    /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr, sm_scale,
+                    rope_scale, rope_theta,
                     /*stream=*/torch_current_stream);
                 TORCH_CHECK(status == cudaSuccess,
                             "BatchPrefillWithPagedKVCache failed with error code ",
@@ -168,7 +169,8 @@ void BatchPrefillWithRaggedKVCachePyTorchWrapper::EndForward() { handler_.EndFor
 std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
     torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor k, torch::Tensor v,
     torch::Tensor kv_indptr, bool causal, unsigned int pos_encoding_mode,
-    bool allow_fp16_qk_reduction, float rope_scale, float rope_theta, bool return_lse) {
+    bool allow_fp16_qk_reduction, float sm_scale, float rope_scale, float rope_theta,
+    bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(qo_indptr);
   CHECK_INPUT(k);
@@ -217,7 +219,7 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
                     /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr,
                     static_cast<c_type*>(o.data_ptr()),
                     /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr, batch_size,
-                    num_kv_heads, rope_scale, rope_theta,
+                    num_kv_heads, sm_scale, rope_scale, rope_theta,
                     /*stream=*/torch_current_stream);
                 TORCH_CHECK(status == cudaSuccess,
                             "BatchPrefillWithRaggedKVCache failed with error ",
