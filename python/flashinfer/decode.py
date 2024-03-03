@@ -32,10 +32,10 @@ except ImportError as e:
 
 
 from .utils import (
-    RotaryMode,
+    PosEncodingMode,
     TensorLayout,
     expand_5d,
-    check_rotary_mode,
+    check_pos_encoding_mode,
     check_kv_layout,
 )
 
@@ -56,7 +56,7 @@ def single_decode_with_kv_cache(
     k: torch.Tensor,
     v: torch.Tensor,
     kv_layout: str = "NHD",
-    rotary_mode: str = "NONE",
+    pos_encoding_mode: str = "NONE",
     sm_scale: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
@@ -77,7 +77,7 @@ def single_decode_with_kv_cache(
         :attr:`kv_layout` is ``HND``.
     kv_layout : str
         The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
-    rotary_mode : str
+    pos_encoding_mode : str
         Whether to apply RoPE on-the-fly inside attention kernels, could be
         ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
     sm_scale : Optional[float]
@@ -114,7 +114,7 @@ def single_decode_with_kv_cache(
     not equal to ``num_kv_heads``, the function will use
     `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
     """
-    check_rotary_mode(rotary_mode)
+    check_pos_encoding_mode(pos_encoding_mode)
     check_kv_layout(kv_layout)
     tmp = _get_cache_buf("single_decode_with_kv_cache_tmp", 8 * 1024 * 1024, q.device)
     if sm_scale is None:
@@ -129,8 +129,8 @@ def single_decode_with_kv_cache(
         k,
         v,
         tmp,
-        getattr(RotaryMode, rotary_mode),
-        getattr(TensorLayout, kv_layout),
+        PosEncodingMode[pos_encoding_mode].value,
+        TensorLayout[kv_layout].value,
         sm_scale,
         rope_scale,
         rope_theta,
@@ -142,7 +142,7 @@ def batch_decode_with_padded_kv_cache(
     k_padded: torch.Tensor,
     v_padded: torch.Tensor,
     kv_layout: str = "NHD",
-    rotary_mode: str = "NONE",
+    pos_encoding_mode: str = "NONE",
     sm_scale: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
@@ -166,7 +166,7 @@ def batch_decode_with_padded_kv_cache(
         :attr:`kv_layout` is ``HND``.
     kv_layout : str
         The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
-    rotary_mode : str
+    pos_encoding_mode : str
         Whether to apply RoPE on-the-fly inside attention kernels, could be
         ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
     sm_scale : Optional[float]
@@ -216,8 +216,8 @@ def batch_decode_with_padded_kv_cache(
         q,
         k_padded,
         v_padded,
-        getattr(TensorLayout, kv_layout),
-        getattr(RotaryMode, rotary_mode),
+        TensorLayout[kv_layout].value,
+        PosEncodingMode[pos_encoding_mode].value,
         sm_scale,
         rope_scale,
         rope_theta,
@@ -230,7 +230,7 @@ def batch_decode_with_padded_kv_cache_return_lse(
     k_padded: torch.Tensor,
     v_padded: torch.Tensor,
     kv_layout: str = "NHD",
-    rotary_mode: str = "NONE",
+    pos_encoding_mode: str = "NONE",
     sm_scale: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
@@ -255,7 +255,7 @@ def batch_decode_with_padded_kv_cache_return_lse(
         :attr:`kv_layout` is ``HND``.
     kv_layout : str
         The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
-    rotary_mode : str
+    pos_encoding_mode : str
         Whether to apply RoPE on-the-fly inside attention kernels, could be
         ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
     sm_scale : Optional[float]
@@ -312,8 +312,8 @@ def batch_decode_with_padded_kv_cache_return_lse(
         q,
         k_padded,
         v_padded,
-        getattr(TensorLayout, kv_layout),
-        getattr(RotaryMode, rotary_mode),
+        TensorLayout[kv_layout].value,
+        PosEncodingMode[pos_encoding_mode].value,
         sm_scale,
         rope_scale,
         rope_theta,
@@ -365,7 +365,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
     ...     num_kv_heads,
     ...     head_dim,
     ...     page_size,
-    ...     rotary_mode="NONE",
+    ...     pos_encoding_mode="NONE",
     ...     data_type=torch.float16
     ... )
     >>> outputs = []
@@ -405,7 +405,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._kv_layout = kv_layout
         self._workspace_buffer = workspace_buffer
         self._wrapper = _kernels.BatchDecodeWithPagedKVCachePyTorchWrapper(
-            getattr(TensorLayout, kv_layout)
+            TensorLayout[kv_layout].value
         )
         self._paged_kv_indptr = None
         self._paged_kv_indices = None
@@ -431,7 +431,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         num_kv_heads: int,
         head_dim: int,
         page_size: int,
-        rotary_mode: str = "NONE",
+        pos_encoding_mode: str = "NONE",
         data_type: Union[str, torch.dtype] = "float16",
     ):
         r"""Create auxiliary data structures for batch decode for multiple forward calls
@@ -454,7 +454,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The dimension of the heads
         page_size : int
             The page size of the paged kv cache
-        rotary_mode : str
+        pos_encoding_mode : str
             Whether to apply RoPE on-the-fly inside attention kernels, could be
             ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
         data_type : Union[str, torch.dtype]
@@ -491,7 +491,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             num_kv_heads,
             head_dim,
             page_size,
-            getattr(RotaryMode, rotary_mode),
+            PosEncodingMode[pos_encoding_mode].value,
             empty_data,
         )
 
@@ -506,7 +506,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self,
         q: torch.Tensor,
         paged_kv_data: torch.Tensor,
-        rotary_mode: str = "NONE",
+        pos_encoding_mode: str = "NONE",
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
@@ -523,7 +523,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             :attr:`kv_layout` is ``NHD``, or
             ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
             :attr:`kv_layout` is ``HND``.
-        rotary_mode : str
+        pos_encoding_mode : str
             Whether to apply RoPE on-the-fly inside attention kernels, could be
             ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
         sm_scale : Optional[float]
@@ -539,7 +539,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         torch.Tensor
             The attention output, shape: ``[batch_size, num_qo_heads, head_dim]``.
         """
-        check_rotary_mode(rotary_mode)
+        check_pos_encoding_mode(pos_encoding_mode)
         if sm_scale is None:
             head_dim = q.shape[-1]
             sm_scale = 1.0 / math.sqrt(head_dim)
@@ -555,7 +555,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._paged_kv_indptr,
             self._paged_kv_indices,
             self._paged_kv_last_page_len,
-            getattr(RotaryMode, rotary_mode),
+            PosEncodingMode[pos_encoding_mode].value,
             sm_scale,
             rope_scale,
             rope_theta,
@@ -566,7 +566,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self,
         q: torch.Tensor,
         paged_kv_data: torch.Tensor,
-        rotary_mode: str = "NONE",
+        pos_encoding_mode: str = "NONE",
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
@@ -584,7 +584,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             :attr:`kv_layout` is ``NHD``, or
             ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
             :attr:`kv_layout` is ``HND``.
-        rotary_mode : str
+        pos_encoding_mode : str
             Whether to apply RoPE on-the-fly inside attention kernels, could be
             ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
         sm_scale : Optional[float]
@@ -607,7 +607,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         Please refer to the :ref:`tutorial <recursive-attention>` for a detailed
         explanation of the log-sum-exp function and attention states.
         """
-        check_rotary_mode(rotary_mode)
+        check_pos_encoding_mode(pos_encoding_mode)
         if sm_scale is None:
             head_dim = q.shape[-1]
             sm_scale = 1.0 / math.sqrt(head_dim)
@@ -622,7 +622,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._paged_kv_indptr,
             self._paged_kv_indices,
             self._paged_kv_last_page_len,
-            getattr(RotaryMode, rotary_mode),
+            PosEncodingMode[pos_encoding_mode].value,
             sm_scale,
             rope_scale,
             rope_theta,

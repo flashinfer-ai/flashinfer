@@ -22,7 +22,8 @@ using namespace flashinfer;
 
 std::vector<torch::Tensor> batch_decode_with_padded_kv_cache(
     torch::Tensor q, torch::Tensor k_padded, torch::Tensor v_padded, unsigned int layout,
-    unsigned int rotary_mode, float sm_scale, float rope_scale, float rope_theta, bool return_lse) {
+    unsigned int pos_encoding_mode, float sm_scale, float rope_scale, float rope_theta,
+    bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(k_padded);
   CHECK_INPUT(v_padded);
@@ -59,8 +60,8 @@ std::vector<torch::Tensor> batch_decode_with_padded_kv_cache(
         static_cast<c_type*>(v_padded.data_ptr()), static_cast<c_type*>(o.data_ptr()),
         /*tmp=*/tmp,
         /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr, batch_size,
-        padded_kv_len, num_qo_heads, num_kv_heads, head_dim, kv_layout, RotaryMode(rotary_mode),
-        rope_scale, rope_theta, torch_current_stream);
+        padded_kv_len, num_qo_heads, num_kv_heads, head_dim, kv_layout,
+        PosEncodingMode(pos_encoding_mode), sm_scale, rope_scale, rope_theta, torch_current_stream);
     TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPaddedKVCache failed with error code ",
                 status);
     return true;
@@ -77,7 +78,7 @@ std::vector<torch::Tensor> batch_decode_with_padded_kv_cache(
 void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
     torch::Tensor workspace_buffer, torch::Tensor indptr, torch::Tensor last_page_len,
     unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads,
-    unsigned int head_dim, unsigned int page_size, unsigned int rotary_mode,
+    unsigned int head_dim, unsigned int page_size, unsigned int pos_encoding_mode,
     torch::Tensor empty_data) {
   // NOTE(zihao): not necessary to be CUDA tensor
   CHECK_CONTIGUOUS(indptr);
@@ -99,7 +100,7 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
               static_cast<void*>(workspace_buffer.data_ptr()), workspace_size_in_bytes,
               static_cast<int32_t*>(indptr.data_ptr()),
               static_cast<int32_t*>(last_page_len.data_ptr()), batch_size, num_qo_heads,
-              num_kv_heads, head_dim, page_size, RotaryMode(rotary_mode));
+              num_kv_heads, head_dim, page_size, PosEncodingMode(pos_encoding_mode));
       TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
                   cudaGetErrorString(status));
       return true;
@@ -114,8 +115,9 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::EndForward() { handler_.EndForwa
 
 std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
     torch::Tensor q, torch::Tensor paged_kv_data, torch::Tensor paged_kv_indptr,
-    torch::Tensor paged_kv_indices, torch::Tensor paged_kv_last_page_len, unsigned int rotary_mode,
-    float rope_scale, float rope_theta, bool return_lse) {
+    torch::Tensor paged_kv_indices, torch::Tensor paged_kv_last_page_len,
+    unsigned int pos_encoding_mode, float sm_scale, float rope_scale, float rope_theta,
+    bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(paged_kv_data);
   CHECK_INPUT(paged_kv_indptr);
@@ -164,10 +166,11 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
           static_cast<int32_t*>(paged_kv_last_page_len.data_ptr()));
       cudaError_t status = BatchDecodeWithPagedKVCacheWrapper<PageStorage::kIndices, KV_LAYOUT,
                                                               c_type, c_type, int32_t>(
-          &handler_, static_cast<c_type*>(q.data_ptr()), /*q_rope_position=*/nullptr, paged_kv,
+          &handler_, static_cast<c_type*>(q.data_ptr()), /*q_offset=*/nullptr, paged_kv,
           static_cast<c_type*>(o.data_ptr()),
           /*lse=*/(return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr), num_qo_heads,
-          RotaryMode(rotary_mode), rope_scale, rope_theta, /*stream=*/torch_current_stream);
+          PosEncodingMode(pos_encoding_mode), sm_scale, rope_scale, rope_theta,
+          /*stream=*/torch_current_stream);
       TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
                   cudaGetErrorString(status));
     });

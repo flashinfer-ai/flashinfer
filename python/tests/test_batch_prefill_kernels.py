@@ -30,6 +30,7 @@ import flashinfer
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
 def test_batch_prefill_with_paged_kv_cache(
     batch_size,
     kv_len,
@@ -40,6 +41,7 @@ def test_batch_prefill_with_paged_kv_cache(
     head_dim,
     causal,
     kv_layout,
+    pos_encoding_mode,
 ):
     q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
     q_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
@@ -71,7 +73,7 @@ def test_batch_prefill_with_paged_kv_cache(
         num_kv_heads,
         head_dim,
     )
-    o = wrapper.forward(q, kv_data, causal=causal)
+    o = wrapper.forward(q, kv_data, causal=causal, pos_encoding_mode=pos_encoding_mode)
 
     for i in range(batch_size):
         perm_dims = [0, 2, 1, 3] if kv_layout == "HND" else [0, 1, 2, 3]
@@ -107,7 +109,9 @@ def test_batch_prefill_with_paged_kv_cache(
             ],
             dim=0,
         )
-        o_ref_i = flashinfer.single_prefill_with_kv_cache(qi, ki, vi, causal=causal)
+        o_ref_i = flashinfer.single_prefill_with_kv_cache(
+            qi, ki, vi, causal=causal, pos_encoding_mode=pos_encoding_mode
+        )
         o_i_np = o[q_indptr[i] : q_indptr[i + 1]].cpu().numpy()
         o_ref_i_np = o_ref_i.cpu().numpy()
         numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
@@ -120,8 +124,16 @@ def test_batch_prefill_with_paged_kv_cache(
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
 def test_batch_prefill_with_ragged_kv_cache(
-    batch_size, kv_len, qo_len, num_kv_heads, num_qo_heads, head_dim, causal
+    batch_size,
+    kv_len,
+    qo_len,
+    num_kv_heads,
+    num_qo_heads,
+    head_dim,
+    causal,
+    pos_encoding_mode,
 ):
     kv_layout = "NHD"
     q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
@@ -142,7 +154,7 @@ def test_batch_prefill_with_ragged_kv_cache(
         num_kv_heads,
         head_dim,
     )
-    o = wrapper.forward(q, k, v, causal=causal)
+    o = wrapper.forward(q, k, v, causal=causal, pos_encoding_mode=pos_encoding_mode)
 
     for i in range(batch_size):
         o_ref_i = flashinfer.single_prefill_with_kv_cache(
@@ -150,6 +162,7 @@ def test_batch_prefill_with_ragged_kv_cache(
             k[kv_indptr[i] : kv_indptr[i + 1]],
             v[kv_indptr[i] : kv_indptr[i + 1]],
             causal=causal,
+            pos_encoding_mode=pos_encoding_mode,
         )
         o_i_np = o[q_indptr[i] : q_indptr[i + 1]].cpu().numpy()
         o_ref_i_np = o_ref_i.cpu().numpy()
@@ -157,6 +170,10 @@ def test_batch_prefill_with_ragged_kv_cache(
 
 
 if __name__ == "__main__":
-    test_batch_prefill_with_paged_kv_cache(12, 54, 37, 8, 8, 8, 128, True, "HND")
-    test_batch_prefill_with_paged_kv_cache(12, 54, 37, 1, 8, 8, 128, True, "HND")
-    test_batch_prefill_with_ragged_kv_cache(12, 54, 37, 8, 8, 128, True)
+    test_batch_prefill_with_paged_kv_cache(
+        12, 54, 37, 8, 8, 8, 128, True, "HND", "NONE"
+    )
+    test_batch_prefill_with_paged_kv_cache(
+        12, 54, 37, 1, 8, 8, 128, True, "HND", "NONE"
+    )
+    test_batch_prefill_with_ragged_kv_cache(12, 54, 37, 8, 8, 128, True, "NONE")

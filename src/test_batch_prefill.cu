@@ -27,7 +27,7 @@ constexpr QKVLayout kv_layout = QKVLayout::kNHD;
 template <typename T>
 void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t num_qo_heads,
                                               size_t page_size, size_t head_dim, bool causal,
-                                              RotaryMode rotary_mode,
+                                              PosEncodingMode pos_encoding_mode,
                                               bool allow_fp16_qk_reduction) {
   uint32_t batch_size = 9;
   std::vector<int32_t> q_lens(batch_size), kv_lens(batch_size);
@@ -92,7 +92,7 @@ void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t num_qo
 
     std::vector<T> o_ref = cpu_reference::single_mha<T, T>(
         q, key[request_idx], value[request_idx], q_len, kv_len, num_qo_heads, num_kv_heads,
-        head_dim, causal, QKVLayout::kNHD, rotary_mode);
+        head_dim, causal, QKVLayout::kNHD, pos_encoding_mode);
 
     thrust::device_vector<int32_t> q_indptr_device(q_indptr);
     thrust::device_vector<T> q_device(q);
@@ -101,9 +101,9 @@ void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t num_qo
     for (uint32_t num_runs = 0; num_runs < 10; ++num_runs) {
       auto status = BatchPrefillWithPagedKVCache<PageStorage::kIndices, kv_layout, T, T, int32_t>(
           thrust::raw_pointer_cast(q_device.data()),
-          thrust::raw_pointer_cast(q_indptr_device.data()), /*q_rope_position=*/nullptr, paged_kv,
+          thrust::raw_pointer_cast(q_indptr_device.data()), /*q_offset=*/nullptr, paged_kv,
           thrust::raw_pointer_cast(o_device.data()), /*tmp=*/nullptr,
-          /*lse=*/nullptr, num_qo_heads, causal, rotary_mode, allow_fp16_qk_reduction);
+          /*lse=*/nullptr, num_qo_heads, causal, pos_encoding_mode, allow_fp16_qk_reduction);
       EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
     }
 
@@ -122,7 +122,8 @@ void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t num_qo
     std::cout << "request_idx=" << request_idx << ", page_size=" << page_size
               << ", num_qo_heads=" << num_qo_heads << ", num_kv_heads=" << num_kv_heads
               << ", q_len=" << q_len << ", kv_len=" << kv_len << ", head_dim=" << head_dim
-              << ", causal=" << causal << ", rotary_mode=" << RotaryModeToString(rotary_mode)
+              << ", causal=" << causal
+              << ", pos_encoding_mode=" << PosEncodingModeToString(pos_encoding_mode)
               << ", result_accuracy=" << result_accuracy << std::endl;
     EXPECT_GT(result_accuracy, 0.99) << "Result correctness test failed.";
     EXPECT_EQ(nan_detected, false) << "NaN detected in output.";
@@ -132,7 +133,7 @@ void _TestBatchPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t num_qo
 template <typename T>
 void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads, size_t num_qo_heads,
                                                     size_t page_size, size_t head_dim, bool causal,
-                                                    RotaryMode rotary_mode,
+                                                    PosEncodingMode pos_encoding_mode,
                                                     bool allow_fp16_qk_reduction) {
   uint32_t batch_size = 7;
   std::vector<int32_t> q_lens(batch_size);
@@ -200,7 +201,7 @@ void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads, size_t 
     int32_t q_len = q_lens[request_idx], kv_len = kv_lens[request_idx];
     std::vector<T> o_ref_i = cpu_reference::single_mha<T, T>(
         q[request_idx], key[request_idx], value[request_idx], q_len, kv_len, num_qo_heads,
-        num_kv_heads, head_dim, causal, QKVLayout::kNHD, rotary_mode);
+        num_kv_heads, head_dim, causal, QKVLayout::kNHD, pos_encoding_mode);
     o_ref.push_back(o_ref_i);
   }
 
@@ -216,9 +217,9 @@ void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads, size_t 
 
   auto status = BatchPrefillWithPagedKVCache<PageStorage::kIndices, kv_layout, T, T, int32_t>(
       thrust::raw_pointer_cast(q_device.data()), thrust::raw_pointer_cast(q_indptr_device.data()),
-      /*q_rope_position=*/nullptr, paged_kv, thrust::raw_pointer_cast(o_device.data()),
+      /*q_offset=*/nullptr, paged_kv, thrust::raw_pointer_cast(o_device.data()),
       /*tmp=*/nullptr,
-      /*lse=*/nullptr, num_qo_heads, causal, rotary_mode, allow_fp16_qk_reduction);
+      /*lse=*/nullptr, num_qo_heads, causal, pos_encoding_mode, allow_fp16_qk_reduction);
   EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
 
   thrust::host_vector<T> o_host(o_device);
@@ -235,7 +236,8 @@ void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads, size_t 
       1. - float(num_result_errors_atol_1e_3_rtol_1e_3) / max(float(o_concat_ref.size()), 1.f);
   std::cout << "page_size=" << page_size << ", num_qo_heads=" << num_qo_heads
             << ", num_kv_heads=" << num_kv_heads << ", head_dim=" << head_dim
-            << ", causal=" << causal << ", rotary_mode=" << RotaryModeToString(rotary_mode)
+            << ", causal=" << causal
+            << ", pos_encoding_mode=" << PosEncodingModeToString(pos_encoding_mode)
             << ", result_accuracy=" << result_accuracy << std::endl;
   EXPECT_GT(result_accuracy, 0.99) << "Result correctness test failed.";
   EXPECT_EQ(nan_detected, false) << "NaN detected in output.";
@@ -244,7 +246,7 @@ void _TestBatchPrefillKernelShortContextCorrectness(size_t num_kv_heads, size_t 
 template <typename T>
 void _TestBatchPrefillKernelLongContextCorrectness(size_t num_kv_heads, size_t num_qo_heads,
                                                    size_t page_size, size_t head_dim, bool causal,
-                                                   RotaryMode rotary_mode,
+                                                   PosEncodingMode pos_encoding_mode,
                                                    bool allow_fp16_qk_reduction) {
   std::vector<std::vector<std::vector<T>>> keys, values;
   std::vector<int32_t> q_lens{63}, kv_lens{2047};
@@ -293,7 +295,7 @@ void _TestBatchPrefillKernelLongContextCorrectness(size_t num_kv_heads, size_t n
 
   std::vector<T> o_ref =
       cpu_reference::single_mha<T, T>(q, k, v, q_lens[0], kv_lens[0], num_qo_heads, num_kv_heads,
-                                      head_dim, causal, QKVLayout::kNHD, rotary_mode);
+                                      head_dim, causal, QKVLayout::kNHD, pos_encoding_mode);
 
   thrust::device_vector<int32_t> q_indptr_device(q_indptr);
   thrust::device_vector<T> q_device(q);
@@ -301,8 +303,9 @@ void _TestBatchPrefillKernelLongContextCorrectness(size_t num_kv_heads, size_t n
 
   auto status = BatchPrefillWithPagedKVCache<PageStorage::kIndices, kv_layout, T, T, int32_t>(
       thrust::raw_pointer_cast(q_device.data()), thrust::raw_pointer_cast(q_indptr_device.data()),
-      /*q_rope_position=*/nullptr, paged_kv, thrust::raw_pointer_cast(o_device.data()),
-      /*tmp=*/nullptr, /*lse=*/nullptr, num_qo_heads, causal, rotary_mode, allow_fp16_qk_reduction);
+      /*q_offset=*/nullptr, paged_kv, thrust::raw_pointer_cast(o_device.data()),
+      /*tmp=*/nullptr, /*lse=*/nullptr, num_qo_heads, causal, pos_encoding_mode,
+      allow_fp16_qk_reduction);
   EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
 
   thrust::host_vector<T> o_host(o_device);
@@ -320,7 +323,7 @@ void _TestBatchPrefillKernelLongContextCorrectness(size_t num_kv_heads, size_t n
   std::cout << ", page_size=" << page_size << ", num_qo_heads=" << num_qo_heads
             << ", num_kv_heads=" << num_kv_heads << ", q_len=" << q_lens[0]
             << ", kv_len=" << kv_lens[0] << ", head_dim=" << head_dim << ", causal=" << causal
-            << ", rotary_mode=" << RotaryModeToString(rotary_mode)
+            << ", pos_encoding_mode=" << PosEncodingModeToString(pos_encoding_mode)
             << ", result_accuracy=" << result_accuracy << std::endl;
   EXPECT_GT(result_accuracy, 0.99) << "Result correctness test failed.";
   EXPECT_EQ(nan_detected, false) << "NaN detected in output.";
@@ -333,10 +336,10 @@ void TestBatchPrefillKernelOneHotCorrectness(bool allow_fp16_qk_reduction) {
       for (size_t page_size : {1, 7, 16}) {
         for (size_t head_dim : {64, 128, 256}) {
           for (size_t causal : {false, true}) {
-            for (size_t rotary_mode : {0, 1}) {
-              _TestBatchPrefillKernelOneHotCorrectness<T>(num_kv_heads, num_qo_heads, page_size,
-                                                          head_dim, causal, RotaryMode(rotary_mode),
-                                                          allow_fp16_qk_reduction);
+            for (size_t pos_encoding_mode : {0, 1}) {
+              _TestBatchPrefillKernelOneHotCorrectness<T>(
+                  num_kv_heads, num_qo_heads, page_size, head_dim, causal,
+                  PosEncodingMode(pos_encoding_mode), allow_fp16_qk_reduction);
             }
           }
         }
@@ -352,10 +355,10 @@ void TestBatchPrefillKernelShortContextCorrectness(bool allow_fp16_qk_reduction)
       for (size_t page_size : {1, 7, 16}) {
         for (size_t head_dim : {64, 128, 256}) {
           for (size_t causal : {false, true}) {
-            for (size_t rotary_mode : {0, 1}) {
+            for (size_t pos_encoding_mode : {0, 1}) {
               _TestBatchPrefillKernelShortContextCorrectness<T>(
-                  num_kv_heads, num_qo_heads, page_size, head_dim, causal, RotaryMode(rotary_mode),
-                  allow_fp16_qk_reduction);
+                  num_kv_heads, num_qo_heads, page_size, head_dim, causal,
+                  PosEncodingMode(pos_encoding_mode), allow_fp16_qk_reduction);
             }
           }
         }
@@ -371,10 +374,10 @@ void TestBatchPrefillKernelLongContextCorrectness(bool allow_fp16_qk_reduction) 
       for (size_t page_size : {1, 7, 16}) {
         for (size_t head_dim : {64, 128, 256}) {
           for (size_t causal : {false, true}) {
-            for (size_t rotary_mode : {0, 1}) {
+            for (size_t pos_encoding_mode : {0, 1}) {
               _TestBatchPrefillKernelLongContextCorrectness<T>(
-                  num_kv_heads, num_qo_heads, page_size, head_dim, causal, RotaryMode(rotary_mode),
-                  allow_fp16_qk_reduction);
+                  num_kv_heads, num_qo_heads, page_size, head_dim, causal,
+                  PosEncodingMode(pos_encoding_mode), allow_fp16_qk_reduction);
             }
           }
         }

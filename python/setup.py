@@ -55,7 +55,7 @@ def get_instantiation_cu() -> List[str]:
     causal_options = [False, True]
     allow_fp16_qk_reduction_options = [False, True]
     layout_options = ["HND", "NHD"]
-    rotary_mode_options = ["None", "Llama"]
+    pos_encoding_mode_options = ["None", "RoPELlama", "ALiBi"]
 
     # dispatch.inc
     path = root / prefix / "dispatch.inc"
@@ -80,7 +80,7 @@ def get_instantiation_cu() -> List[str]:
         causal,
         allow_fp16_qk_reduction,
         layout,
-        rotary_mode,
+        pos_encoding_mode,
     ) in itertools.product(
         group_sizes,
         head_dims,
@@ -88,10 +88,10 @@ def get_instantiation_cu() -> List[str]:
         causal_options,
         allow_fp16_qk_reduction_options,
         layout_options,
-        rotary_mode_options,
+        pos_encoding_mode_options,
     ):
         # paged batch prefill
-        fname = f"paged_batch_prefill_group{group_size}_head{head_dim}_causal{causal}_fp16qk{allow_fp16_qk_reduction}_layout{layout}_rotary{rotary_mode}_{dtype}.cu"
+        fname = f"paged_batch_prefill_group{group_size}_head{head_dim}_causal{causal}_fp16qk{allow_fp16_qk_reduction}_layout{layout}_pe{pos_encoding_mode}_{dtype}.cu"
         files.append(prefix + "/" + fname)
         if not (root / prefix / fname).exists():
             with open(root / prefix / fname, "w") as f:
@@ -106,12 +106,12 @@ def get_instantiation_cu() -> List[str]:
                         str(causal).lower(),
                         str(allow_fp16_qk_reduction).lower(),
                         "QKVLayout::k" + layout,
-                        "RotaryMode::k" + rotary_mode,
+                        "PosEncodingMode::k" + pos_encoding_mode,
                     )
                 )
 
         # ragged batch prefill
-        fname = f"ragged_batch_prefill_group{group_size}_head{head_dim}_causal{causal}_fp16qk{allow_fp16_qk_reduction}_layout{layout}_rotary{rotary_mode}_{dtype}.cu"
+        fname = f"ragged_batch_prefill_group{group_size}_head{head_dim}_causal{causal}_fp16qk{allow_fp16_qk_reduction}_layout{layout}_pe{pos_encoding_mode}_{dtype}.cu"
         files.append(prefix + "/" + fname)
         if not (root / prefix / fname).exists():
             with open(root / prefix / fname, "w") as f:
@@ -126,12 +126,12 @@ def get_instantiation_cu() -> List[str]:
                         str(causal).lower(),
                         str(allow_fp16_qk_reduction).lower(),
                         "QKVLayout::k" + layout,
-                        "RotaryMode::k" + rotary_mode,
+                        "PosEncodingMode::k" + pos_encoding_mode,
                     )
                 )
 
         # single prefill
-        fname = f"single_prefill_group{group_size}_head{head_dim}_causal{causal}_fp16qk{allow_fp16_qk_reduction}_layout{layout}_rotary{rotary_mode}_{dtype}.cu"
+        fname = f"single_prefill_group{group_size}_head{head_dim}_causal{causal}_fp16qk{allow_fp16_qk_reduction}_layout{layout}_pe{pos_encoding_mode}_{dtype}.cu"
         files.append(prefix + "/" + fname)
         if not (root / prefix / fname).exists():
             with open(root / prefix / fname, "w") as f:
@@ -146,7 +146,7 @@ def get_instantiation_cu() -> List[str]:
                         str(causal).lower(),
                         str(allow_fp16_qk_reduction).lower(),
                         "QKVLayout::k" + layout,
-                        "RotaryMode::k" + rotary_mode,
+                        "PosEncodingMode::k" + pos_encoding_mode,
                     )
                 )
 

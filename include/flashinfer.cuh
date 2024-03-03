@@ -19,6 +19,6 @@
 #include "flashinfer/attention.cuh"
 #include "flashinfer/layout.cuh"
 #include "flashinfer/page.cuh"
-#include "flashinfer/rope.cuh"
+#include "flashinfer/pos_enc.cuh"
 
 #endif  // FLASHINFER_CUH_

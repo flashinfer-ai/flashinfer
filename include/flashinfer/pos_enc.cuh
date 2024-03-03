@@ -13,12 +13,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_ROPE_CUH_
-#define FLASHINFER_ROPE_CUH_
+#ifndef FLASHINFER_POS_ENC_CUH_
+#define FLASHINFER_POS_ENC_CUH_
 
 #include <string>
 
 #include "layout.cuh"
+#include "math.cuh"
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
 
@@ -28,26 +29,35 @@ namespace flashinfer {
  * \brief An enumeration class that defines different modes for applying RoPE
  *   (Rotary Positional Embeddings).
  */
-enum class RotaryMode {
+enum class PosEncodingMode {
   // No rotary positional embeddings
   kNone = 0U,
   // Apply Llama-style rope.
-  kLlama = 1U,
+  kRoPELlama = 1U,
+  // Apply ALiBi bias
+  kALiBi = 2U
 };
 
 /*!
- * \brief Convert RotaryMode to string
- * \param rotary_mode A RotaryMode value
+ * \brief Convert PosEncodingMode to string
+ * \param pos_encoding_mode A PosEncodingMode value
  */
-inline std::string RotaryModeToString(const RotaryMode& rotary_mode) {
-  switch (rotary_mode) {
-    case RotaryMode::kNone:
+inline std::string PosEncodingModeToString(const PosEncodingMode& pos_encoding_mode) {
+  switch (pos_encoding_mode) {
+    case PosEncodingMode::kNone:
       return "None";
-    case RotaryMode::kLlama:
+    case PosEncodingMode::kRoPELlama:
       return "Llama";
+    case PosEncodingMode::kALiBi:
+      return "ALiBi";
     default:
       return "Unknown";
   }
+}
+
+__device__ __forceinline__ float get_alibi_slope(uint32_t head_idx, uint32_t num_heads) {
+  // NOTE(Zihao): here we assume that num_heads is a power of 2
+  return math::ptx_exp2(-8. * float(head_idx + 1) / float(num_heads));
 }
 
 /*!
@@ -63,7 +73,7 @@ inline std::string RotaryModeToString(const RotaryMode& rotary_mode) {
  */
 template <uint32_t vec_size, uint32_t bdx, typename T>
 __device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope(
-    const T* x, const vec_t<float, vec_size>& freq, uint32_t offset) {
+    const T* x, const vec_t<float, vec_size>& freq, int32_t offset) {
   constexpr uint32_t head_dim = vec_size * bdx;
   vec_t<float, vec_size> permuted_vec, vec;
   vec.cast_load(x + threadIdx.x * vec_size);
@@ -170,4 +180,4 @@ cudaError_t BatchQKApplyRotaryInPlace(DType* __restrict__ q, DType* __restrict__
 
 }  // namespace flashinfer
 
-#endif  // FLASHINFER_ROPE_CUH_
+#endif  // FLASHINFER_POS_ENC_CUH_

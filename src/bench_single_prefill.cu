@@ -18,8 +18,8 @@
 #include <flashinfer/attention/prefill.cuh>
 #include <nvbench/nvbench.cuh>
 
+using flashinfer::PosEncodingMode;
 using flashinfer::QKVLayout;
-using flashinfer::RotaryMode;
 
 template <typename dtype_in, typename dtype_out, bool append>
 void bench_flashinfer_single_prefill(nvbench::state& state) {
@@ -34,7 +34,7 @@ void bench_flashinfer_single_prefill(nvbench::state& state) {
   size_t num_qo_heads = state.get_int64("num_qo_heads");
   size_t num_kv_heads = state.get_int64("num_kv_heads");
   size_t head_dim = state.get_int64("head_dim");
-  size_t rotary_mode = state.get_int64("rotary_mode");
+  size_t pos_encoding_mode = state.get_int64("pos_encoding_mode");
   size_t kv_layout = state.get_int64("kv_layout");
   bool causal = state.get_int64("causal");
   bool cooperative = state.get_int64("cooperative");
@@ -58,7 +58,7 @@ void bench_flashinfer_single_prefill(nvbench::state& state) {
         thrust::raw_pointer_cast(V.data()), thrust::raw_pointer_cast(O.data()),
         /*tmp=*/cooperative ? thrust::raw_pointer_cast(tmp.data()) : nullptr,
         /*lse=*/nullptr, num_qo_heads, num_kv_heads, qo_len, kv_len, head_dim, causal,
-        QKVLayout(kv_layout), RotaryMode(rotary_mode), allow_fp16_qk_reduction,
+        QKVLayout(kv_layout), PosEncodingMode(pos_encoding_mode), allow_fp16_qk_reduction,
         /*maybe_sm_scale=*/std::nullopt,
         /*rope_scale=*/1.f,
         /*rope_theta=*/1e4, launch.get_stream());
@@ -96,7 +96,7 @@ void bench_flashinfer_single_prefill(nvbench::state& state) {
       .add_int64_axis("head_dim", {128})                                                    \
       .add_int64_axis("causal", {0, 1})                                                     \
       .add_int64_axis("kv_layout", {0, 1})                                                  \
-      .add_int64_axis("rotary_mode", {0, 1})                                                \
+      .add_int64_axis("pos_encoding_mode", {0, 1})                                          \
       .add_int64_axis("allow_fp16_qk_reduction", {0, 1})                                    \
       .add_int64_axis("cooperative", {1})
 
@@ -112,7 +112,7 @@ void bench_flashinfer_single_prefill(nvbench::state& state) {
       .add_int64_axis("head_dim", {128})                                                      \
       .add_int64_axis("causal", {0, 1})                                                       \
       .add_int64_axis("kv_layout", {0, 1})                                                    \
-      .add_int64_axis("rotary_mode", {0, 1})                                                  \
+      .add_int64_axis("pos_encoding_mode", {0, 1})                                            \
       .add_int64_axis("allow_fp16_qk_reduction", {0, 1})                                      \
       .add_int64_axis("cooperative", {0, 1})
 

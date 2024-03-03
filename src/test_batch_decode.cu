@@ -28,7 +28,8 @@ constexpr QKVLayout kv_layout = QKVLayout::kNHD;
 template <typename T>
 void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, size_t num_qo_heads,
                                          size_t num_kv_heads, size_t head_dim,
-                                         flashinfer::RotaryMode rotary_mode, bool cooperative) {
+                                         flashinfer::PosEncodingMode pos_encoding_mode,
+                                         bool cooperative) {
   std::vector<int32_t> seq_lens(batch_size);
   utils::vec_randint_(seq_lens, 1, 1024);
   std::vector<int32_t> append_indptr{0};
@@ -57,7 +58,7 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
     // compute reference output
     std::vector<T> o_ref_i =
         cpu_reference::single_mha<T, T>(qi, ki, vi, 1, seq_len, num_qo_heads, num_kv_heads,
-                                        head_dim, false, QKVLayout::kNHD, rotary_mode);
+                                        head_dim, false, QKVLayout::kNHD, pos_encoding_mode);
     keys.push_back(ki);
     values.push_back(vi);
     // append new q and o_ref
@@ -102,21 +103,22 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
   handler.BeginForward<PageStorage::kIndices, kv_layout, T, T, int32_t>(
       (void*)thrust::raw_pointer_cast(buffer.data()), workspace_size_in_bytes, kv_indptr.data(),
       kv_last_page_len.data(), batch_size, num_qo_heads, num_kv_heads, head_dim, page_size,
-      rotary_mode);
+      pos_encoding_mode);
 
   if (!cooperative) {
     // use non-cooperative kernel
     cudaError_t status =
         flashinfer::BatchDecodeWithPagedKVCache<PageStorage::kIndices, kv_layout, T, T, int32_t>(
-            thrust::raw_pointer_cast(q_device.data()), /*q_rope_position=*/nullptr, paged_kv,
+            thrust::raw_pointer_cast(q_device.data()), /*q_offset=*/nullptr, paged_kv,
             kv_partition_info_t<int32_t>(), thrust::raw_pointer_cast(o_device.data()),
-            /*tmp=*/nullptr, /*lse=*/nullptr, num_qo_heads, rotary_mode);
+            /*tmp=*/nullptr, /*lse=*/nullptr, num_qo_heads, pos_encoding_mode);
     EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
   } else {
     cudaError_t status = flashinfer::BatchDecodeWithPagedKVCacheWrapper<PageStorage::kIndices,
                                                                         kv_layout, T, T, int32_t>(
-        &handler, thrust::raw_pointer_cast(q_device.data()), /*q_rope_position=*/nullptr, paged_kv,
-        thrust::raw_pointer_cast(o_device.data()), /*lse=*/nullptr, num_qo_heads, rotary_mode);
+        &handler, thrust::raw_pointer_cast(q_device.data()), /*q_offset=*/nullptr, paged_kv,
+        thrust::raw_pointer_cast(o_device.data()), /*lse=*/nullptr, num_qo_heads,
+        pos_encoding_mode);
     EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
   }
   // compare result
@@ -135,7 +137,7 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
   std::cout << "page_size=" << page_size << ", num_qo_heads=" << num_qo_heads
             << ", num_kv_heads=" << num_kv_heads << ", batch_size=" << batch_size
             << ", head_dim=" << head_dim
-            << ", rotary_mode=" << flashinfer::RotaryModeToString(rotary_mode)
+            << ", pos_encoding_mode=" << flashinfer::PosEncodingModeToString(pos_encoding_mode)
             << ", result accuracy (atol=1e-3, rtol=1e-3): " << result_accuracy << std::endl;
   EXPECT_GT(result_accuracy, 0.90) << "Result correctness test failed.";
   EXPECT_EQ(nan_detected, false) << "NaN detected.";
@@ -148,10 +150,10 @@ void TestBatchDecodeKernelCorrectness() {
       for (size_t num_qo_heads : {32}) {
         for (size_t num_kv_heads : {32, 8, 4}) {
           for (size_t head_dim : {64, 128, 256}) {
-            for (size_t rotary_mode : {0U, 1U}) {
-              _TestBatchDecodingKernelCorrectness<T>(page_size, batch_size, num_qo_heads,
-                                                     num_kv_heads, head_dim,
-                                                     flashinfer::RotaryMode(rotary_mode), false);
+            for (size_t pos_encoding_mode : {0U, 1U}) {
+              _TestBatchDecodingKernelCorrectness<T>(
+                  page_size, batch_size, num_qo_heads, num_kv_heads, head_dim,
+                  flashinfer::PosEncodingMode(pos_encoding_mode), false);
             }
           }
         }
@@ -167,10 +169,10 @@ void TestCooperativeBatchDecodeKernelCorrectness() {
       for (size_t num_qo_heads : {32}) {
         for (size_t num_kv_heads : {32, 8, 4}) {
           for (size_t head_dim : {64, 128, 256}) {
-            for (size_t rotary_mode : {0U, 1U}) {
-              _TestBatchDecodingKernelCorrectness<T>(page_size, batch_size, num_qo_heads,
-                                                     num_kv_heads, head_dim,
-                                                     flashinfer::RotaryMode(rotary_mode), true);
+            for (size_t pos_encoding_mode : {0U, 1U}) {
+              _TestBatchDecodingKernelCorrectness<T>(
+                  page_size, batch_size, num_qo_heads, num_kv_heads, head_dim,
+                  flashinfer::PosEncodingMode(pos_encoding_mode), true);
             }
           }
         }

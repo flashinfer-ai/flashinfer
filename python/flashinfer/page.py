@@ -126,5 +126,5 @@ def append_paged_kv_cache(
         kv_indices,
         kv_indptr,
         kv_last_page_len,
-        getattr(TensorLayout, kv_layout),
+        TensorLayout[kv_layout].value,
     )

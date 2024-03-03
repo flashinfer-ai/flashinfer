@@ -25,7 +25,8 @@ using namespace flashinfer;
 
 template <typename T>
 void _TestDecodingKernelCorrectness(size_t num_qo_heads, size_t num_kv_heads, size_t seq_len,
-                                    size_t head_dim, QKVLayout kv_layout, RotaryMode rotary_mode) {
+                                    size_t head_dim, QKVLayout kv_layout,
+                                    PosEncodingMode pos_encoding_mode) {
   std::vector<T> Q_host(num_qo_heads * head_dim);
   std::vector<T> K_host(seq_len * num_kv_heads * head_dim);
   std::vector<T> V_host(seq_len * num_kv_heads * head_dim);
@@ -45,13 +46,13 @@ void _TestDecodingKernelCorrectness(size_t num_qo_heads, size_t num_kv_heads, si
 
   o_ref_host =
       cpu_reference::single_mha<T, T>(Q_host, K_host, V_host, 1, seq_len, num_qo_heads,
-                                      num_kv_heads, head_dim, false, kv_layout, rotary_mode);
+                                      num_kv_heads, head_dim, false, kv_layout, pos_encoding_mode);
 
   cudaError_t status = SingleDecodeWithKVCache(
       thrust::raw_pointer_cast(Q.data()), thrust::raw_pointer_cast(K.data()),
       thrust::raw_pointer_cast(V.data()), thrust::raw_pointer_cast(O.data()),
       thrust::raw_pointer_cast(tmp.data()), num_qo_heads, num_kv_heads, seq_len, head_dim,
-      kv_layout, rotary_mode);
+      kv_layout, pos_encoding_mode);
   EXPECT_EQ(status, cudaSuccess) << "SingleDecodeWithKVCache kernel launch failed, error message: "
                                  << cudaGetErrorString(status);
 
@@ -72,7 +73,7 @@ void _TestDecodingKernelCorrectness(size_t num_qo_heads, size_t num_kv_heads, si
   std::cout << "num_qo_heads=" << num_qo_heads << ", num_kv_heads=" << num_kv_heads
             << ", seq_len=" << seq_len << ", head_dim=" << head_dim
             << ", kv_layout=" << QKVLayoutToString(kv_layout)
-            << ", rotary_mode=" << RotaryModeToString(rotary_mode)
+            << ", pos_encoding_mode=" << PosEncodingModeToString(pos_encoding_mode)
             << ", result accuracy (atol=1e-3, rtol=1e-3): " << result_accuracy << std::endl;
   EXPECT_GT(result_accuracy, 0.90) << "Result correctness test failed.";
   EXPECT_FALSE(nan_detected) << "NaN detected.";
@@ -86,9 +87,10 @@ void TestSingleDecodeKernelCorrectness() {
            {1, 3, 9, 27, 81, 129, 257, 512, 1024, 2048, 4096, 8192, 16384, 32768}) {
         for (size_t head_dim : {64, 128, 256}) {
           for (unsigned int kv_layout : {0U, 1U}) {
-            for (unsigned int rotary_mode : {0U, 1U}) {
+            for (unsigned int pos_encoding_mode : {0U, 1U}) {
               _TestDecodingKernelCorrectness<T>(num_qo_heads, num_kv_heads, seq_len, head_dim,
-                                                QKVLayout(kv_layout), RotaryMode(rotary_mode));
+                                                QKVLayout(kv_layout),
+                                                PosEncodingMode(pos_encoding_mode));
             }
           }
         }

@@ -31,10 +31,10 @@ except ImportError as e:
         raise e
 
 from .utils import (
-    RotaryMode,
+    PosEncodingMode,
     TensorLayout,
     expand_5d,
-    check_rotary_mode,
+    check_pos_encoding_mode,
     check_kv_layout,
 )
 
@@ -66,7 +66,7 @@ def single_prefill_with_kv_cache(
     v: torch.Tensor,
     causal: bool = False,
     kv_layout: str = "NHD",
-    rotary_mode: str = "NONE",
+    pos_encoding_mode: str = "NONE",
     allow_fp16_qk_reduction: bool = False,
     sm_scale: Optional[float] = None,
     rope_scale: Optional[float] = None,
@@ -91,7 +91,7 @@ def single_prefill_with_kv_cache(
         Whether to apply causal mask to the attention matrix.
     kv_layout : str
         The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
-    rotary_mode : str
+    pos_encoding_mode : str
         Whether to apply RoPE on-the-fly inside attention kernels, could be
         ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
     allow_fp16_qk_reduction : bool
@@ -133,7 +133,7 @@ def single_prefill_with_kv_cache(
     not equal to ``num_kv_heads``, the function will use
     `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
     """
-    check_rotary_mode(rotary_mode)
+    check_pos_encoding_mode(pos_encoding_mode)
     check_kv_layout(kv_layout)
     tmp = _get_cache_buf("single_prefill_with_kv_cache_tmp", 8 * 1024 * 1024, q.device)
     if sm_scale is None:
@@ -148,8 +148,8 @@ def single_prefill_with_kv_cache(
         v,
         tmp,
         causal,
-        getattr(TensorLayout, kv_layout),
-        getattr(RotaryMode, rotary_mode),
+        TensorLayout[kv_layout].value,
+        PosEncodingMode[pos_encoding_mode].value,
         allow_fp16_qk_reduction,
         sm_scale,
         rope_scale,
@@ -164,7 +164,7 @@ def single_prefill_with_kv_cache_return_lse(
     v: torch.Tensor,
     causal: bool = False,
     kv_layout: str = "NHD",
-    rotary_mode: str = "NONE",
+    pos_encoding_mode: str = "NONE",
     allow_fp16_qk_reduction: bool = False,
     sm_scale: Optional[float] = None,
     rope_scale: Optional[float] = None,
@@ -189,7 +189,7 @@ def single_prefill_with_kv_cache_return_lse(
         Whether to apply causal mask to the attention matrix.
     kv_layout : str
         The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
-    rotary_mode : str
+    pos_encoding_mode : str
         Whether to apply RoPE on-the-fly inside attention kernels, could be
         ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
     allow_fp16_qk_reduction : bool
@@ -237,7 +237,7 @@ def single_prefill_with_kv_cache_return_lse(
     not equal to ``num_kv_heads``, the function will use
     `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
     """
-    check_rotary_mode(rotary_mode)
+    check_pos_encoding_mode(pos_encoding_mode)
     check_kv_layout(kv_layout)
     tmp = _get_cache_buf(
         "single_prefill_with_kv_cache_return_lse_tmp", 8 * 1024 * 1024, q.device
@@ -254,8 +254,8 @@ def single_prefill_with_kv_cache_return_lse(
         v,
         tmp,
         causal,
-        getattr(TensorLayout, kv_layout),
-        getattr(RotaryMode, rotary_mode),
+        TensorLayout[kv_layout].value,
+        PosEncodingMode[pos_encoding_mode].value,
         allow_fp16_qk_reduction,
         sm_scale,
         rope_scale,
@@ -352,7 +352,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._kv_layout = kv_layout
         self._workspace_buffer = workspace_buffer
         self._wrapper = _kernels.BatchPrefillWithPagedKVCachePyTorchWrapper(
-            getattr(TensorLayout, kv_layout)
+            TensorLayout[kv_layout].value
         )
         self._qo_indptr = None
         self._paged_kv_indptr = None
@@ -438,7 +438,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         q: torch.Tensor,
         paged_kv_data: torch.Tensor,
         causal: bool = True,
-        rotary_mode: str = "NONE",
+        pos_encoding_mode: str = "NONE",
         allow_fp16_qk_reduction: bool = False,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
@@ -458,7 +458,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if :attr:`kv_layout` is ``HND``.
         causal : bool
             Whether to apply causal mask to the attention matrix.
-        rotary_mode : str
+        pos_encoding_mode : str
             Whether to apply RoPE on-the-fly inside attention kernels, could be
             ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
         allow_fp16_qk_reduction : bool
@@ -478,7 +478,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         torch.Tensor
             The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
         """
-        check_rotary_mode(rotary_mode)
+        check_pos_encoding_mode(pos_encoding_mode)
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
         if rope_scale is None:
@@ -494,7 +494,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._paged_kv_indices,
             self._paged_kv_last_page_len,
             causal,
-            getattr(RotaryMode, rotary_mode),
+            PosEncodingMode[pos_encoding_mode].value,
             allow_fp16_qk_reduction,
             sm_scale,
             rope_scale,
@@ -507,7 +507,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         q: torch.Tensor,
         paged_kv_data: torch.Tensor,
         causal: bool = True,
-        rotary_mode: str = "NONE",
+        pos_encoding_mode: str = "NONE",
         allow_fp16_qk_reduction: bool = False,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
@@ -527,7 +527,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             :attr:`kv_layout` is ``HND``.
         causal : bool
             Whether to apply causal mask to the attention matrix.
-        rotary_mode : str
+        pos_encoding_mode : str
             Whether to apply RoPE on-the-fly inside attention kernels, could be
             ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
         allow_fp16_qk_reduction : bool
@@ -550,7 +550,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The logsumexp of attention output, shape:
             ``[qo_indptr[-1], num_qo_heads, head_dim]``.
         """
-        check_rotary_mode(rotary_mode)
+        check_pos_encoding_mode(pos_encoding_mode)
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
         if rope_scale is None:
@@ -566,7 +566,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._paged_kv_indices,
             self._paged_kv_last_page_len,
             causal,
-            getattr(RotaryMode, rotary_mode),
+            PosEncodingMode[pos_encoding_mode].value,
             allow_fp16_qk_reduction,
             sm_scale,
             rope_scale,
@@ -649,7 +649,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._kv_layout = kv_layout
         self._workspace_buffer = workspace_buffer
         self._wrapper = _kernels.BatchPrefillWithRaggedKVCachePyTorchWrapper(
-            getattr(TensorLayout, kv_layout)
+            TensorLayout[kv_layout].value
         )
         self._qo_indptr = None
         self._kv_indptr = None
@@ -723,7 +723,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         k: torch.Tensor,
         v: torch.Tensor,
         causal: bool = True,
-        rotary_mode: str = "NONE",
+        pos_encoding_mode: str = "NONE",
         allow_fp16_qk_reduction: bool = False,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
@@ -742,7 +742,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The value tensor, shape: ``[kv_indptr[-1], num_kv_heads, head_dim]``
         causal : bool
             Whether to apply causal mask to the attention matrix.
-        rotary_mode : str
+        pos_encoding_mode : str
             Whether to apply RoPE on-the-fly inside attention kernels, could be
             ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
         allow_fp16_qk_reduction : bool
@@ -762,7 +762,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         torch.Tensor
             The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
         """
-        check_rotary_mode(rotary_mode)
+        check_pos_encoding_mode(pos_encoding_mode)
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
         if rope_scale is None:
@@ -776,7 +776,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             v,
             self._kv_indptr,
             causal,
-            getattr(RotaryMode, rotary_mode),
+            PosEncodingMode[pos_encoding_mode].value,
             allow_fp16_qk_reduction,
             sm_scale,
             rope_scale,
@@ -790,7 +790,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         k: torch.Tensor,
         v: torch.Tensor,
         causal: bool = True,
-        rotary_mode: str = "NONE",
+        pos_encoding_mode: str = "NONE",
         allow_fp16_qk_reduction: bool = False,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
@@ -809,7 +809,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The value tensor, shape: ``[kv_indptr[-1], num_kv_heads, head_dim]``
         causal : bool
             Whether to apply causal mask to the attention matrix.
-        rotary_mode : str
+        pos_encoding_mode : str
             Whether to apply RoPE on-the-fly inside attention kernels, could be
             ``NONE`` or ``LLAMA`` (LLAMA style rotary embedding).
         allow_fp16_qk_reduction : bool
@@ -831,7 +831,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The logsumexp of attention output, shape:
             ``[qo_indptr[-1], num_qo_heads, head_dim]``.
         """
-        check_rotary_mode(rotary_mode)
+        check_pos_encoding_mode(pos_encoding_mode)
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
         if rope_scale is None:
@@ -845,7 +845,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             v,
             self._kv_indptr,
             causal,
-            getattr(RotaryMode, rotary_mode),
+            PosEncodingMode[pos_encoding_mode].value,
             allow_fp16_qk_reduction,
             sm_scale,
             rope_scale,

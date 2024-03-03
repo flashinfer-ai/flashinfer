@@ -21,8 +21,8 @@ using namespace flashinfer;
 
 std::vector<torch::Tensor> single_prefill_with_kv_cache(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor tmp, bool causal,
-    unsigned int layout, unsigned int rotary_mode, bool allow_fp16_qk_reduction, float rope_scale,
-    float rope_theta, bool return_lse) {
+    unsigned int layout, unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction,
+    float sm_scale, float rope_scale, float rope_theta, bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(k);
   CHECK_INPUT(v);
@@ -59,15 +59,17 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
         DISPATCH_CAUSAL(causal, CAUSAL, {
           DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
             DISPATCH_ALLOW_FP16_QK_REDUCTION(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
-              DISPATCH_ROTARY_MODE(RotaryMode(rotary_mode), ROTARY_MODE, {
+              DISPATCH_POS_ENCODING_MODE(PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, {
                 cudaError_t status =
-                    SinglePrefillWithKVCacheDispatched<GROUP_SIZE, HEAD_DIM, KV_LAYOUT, ROTARY_MODE,
-                                                       ALLOW_FP16_QK_REDUCTION, CAUSAL>(
+                    SinglePrefillWithKVCacheDispatched<GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
+                                                       POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION,
+                                                       CAUSAL>(
                         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
                         static_cast<c_type*>(v.data_ptr()), static_cast<c_type*>(o.data_ptr()),
                         static_cast<float*>(tmp.data_ptr()),
                         /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                        num_kv_heads, qo_len, kv_len, rope_scale, rope_theta, torch_current_stream);
+                        num_kv_heads, qo_len, kv_len, sm_scale, rope_scale, rope_theta,
+                        torch_current_stream);
                 TORCH_CHECK(status == cudaSuccess,
                             "SinglePrefillWithKVCache kernel launch failed, error: " +
                                 std::string(cudaGetErrorString(status)));

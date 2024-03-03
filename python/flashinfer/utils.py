@@ -15,20 +15,18 @@ limitations under the License.
 """
 
 import torch
+from enum import Enum
 
 
-class RotaryMode:
+class PosEncodingMode(Enum):
     NONE = 0
-    LLAMA = 1
+    ROPE_LLAMA = 1
+    ALIBI = 2
 
-    FORMAT2STR = {0: "NONE", 1: "LLAMA"}
 
-
-class TensorLayout:
+class TensorLayout(Enum):
     NHD = 0
     HND = 1
-
-    FORMAT2STR = {0: "NHD", 1: "HND"}
 
 
 def expand_5d(x: torch.Tensor, kv_layout: str):
@@ -47,9 +45,9 @@ def expand_5d(x: torch.Tensor, kv_layout: str):
     return x
 
 
-def check_rotary_mode(rotary_mode: str):
-    if not hasattr(RotaryMode, rotary_mode):
-        raise KeyError("Invalid rotary_mode {}".format(rotary_mode))
+def check_pos_encoding_mode(pos_encoding_mode: str):
+    if not hasattr(PosEncodingMode, pos_encoding_mode):
+        raise KeyError("Invalid pos_encoding_mode {}".format(pos_encoding_mode))
 
 
 def check_kv_layout(kv_layout: str):
