@@ -113,7 +113,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
                     ALLOW_FP16_QK_REDUCTION, CAUSAL, c_type, c_type, int32_t>(
                     &handler_, static_cast<c_type*>(q.data_ptr()),
                     static_cast<int32_t*>(qo_indptr.data_ptr()),
-                    /*q_rope_position=*/nullptr, paged_kv, static_cast<c_type*>(o.data_ptr()),
+                    /*q_offset=*/nullptr, paged_kv, static_cast<c_type*>(o.data_ptr()),
                     /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr, rope_scale,
                     rope_theta,
                     /*stream=*/torch_current_stream);
@@ -214,7 +214,7 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
                     &handler_, static_cast<c_type*>(q.data_ptr()),
                     static_cast<int32_t*>(qo_indptr.data_ptr()), static_cast<c_type*>(k.data_ptr()),
                     static_cast<c_type*>(v.data_ptr()), static_cast<int32_t*>(kv_indptr.data_ptr()),
-                    /*q_rope_position=*/nullptr, /*k_rope_pos_offset=*/nullptr,
+                    /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr,
                     static_cast<c_type*>(o.data_ptr()),
                     /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr, batch_size,
                     num_kv_heads, rope_scale, rope_theta,

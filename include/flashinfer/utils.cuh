@@ -178,15 +178,20 @@
     }                                                  \
   }
 
-#define DISPATCH_pos_encoding_mode(pos_encoding_mode, pos_encoding_mode, ...)    \
+#define DISPATCH_POS_ENCODING_MODE(pos_encoding_mode, POS_ENCODING_MODE, ...)    \
   switch (pos_encoding_mode) {                                                   \
     case PosEncodingMode::kNone: {                                               \
-      constexpr PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone;      \
+      constexpr PosEncodingMode POS_ENCODING_MODE = PosEncodingMode::kNone;      \
       __VA_ARGS__                                                                \
       break;                                                                     \
     }                                                                            \
     case PosEncodingMode::kRoPELlama: {                                          \
-      constexpr PosEncodingMode pos_encoding_mode = PosEncodingMode::kRoPELlama; \
+      constexpr PosEncodingMode POS_ENCODING_MODE = PosEncodingMode::kRoPELlama; \
+      __VA_ARGS__                                                                \
+      break;                                                                     \
+    }                                                                            \
+    case PosEncodingMode::kALiBi: {                                              \
+      constexpr PosEncodingMode POS_ENCODING_MODE = PosEncodingMode::kALiBi;     \
       __VA_ARGS__                                                                \
       break;                                                                     \
     }                                                                            \

@@ -46,7 +46,7 @@ namespace flashinfer {
 template <PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeOut,
           typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheWrapper(
-    BatchDecodeHandler* handler, DTypeIn* q, IdType* q_rope_position,
+    BatchDecodeHandler* handler, DTypeIn* q, IdType* q_offset,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, DTypeOut* o, float* lse,
     uint32_t num_qo_heads, PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
     std::optional<float> maybe_sm_scale = std::nullopt, float rope_scale = 1.f,
@@ -73,15 +73,15 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapper(
     throw std::runtime_error(err_msg.str());
   }
   return BatchDecodeWithPagedKVCache<page_storage, kv_layout, DTypeIn, DTypeOut, IdType>(
-      q, q_rope_position, new_paged_kv, kv_partition_info, o, tmp, lse, num_qo_heads,
-      pos_encoding_mode, maybe_sm_scale, rope_scale, rope_theta, stream);
+      q, q_offset, new_paged_kv, kv_partition_info, o, tmp, lse, num_qo_heads, pos_encoding_mode,
+      maybe_sm_scale, rope_scale, rope_theta, stream);
 }
 
 template <PageStorage page_storage, QKVLayout kv_layout, uint32_t GROUP_SIZE, uint32_t HEAD_DIM,
           PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL,
           typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
-    BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, IdType* q_rope_position,
+    BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, IdType* q_offset,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, DTypeOut* o, float* lse,
     float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream) {
   float* tmp = nullptr;
@@ -107,13 +107,13 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
           return BatchPrefillWithPagedKVCacheFallbackDispatched<
               page_storage, kv_layout, NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM, pos_encoding_mode,
               ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
-              q, request_indices, tile_indices, qo_indptr, q_rope_position, paged_kv, o, tmp, lse,
+              q, request_indices, tile_indices, qo_indptr, q_offset, paged_kv, o, tmp, lse,
               num_qo_tiles, sm_scale, rope_scale, rope_theta, stream);
         } else {
           return BatchPrefillWithPagedKVCacheDispatched<
               page_storage, kv_layout, NUM_FRAGS_X, PAGE_SIZE, GROUP_SIZE, HEAD_DIM,
               pos_encoding_mode, ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
-              q, request_indices, tile_indices, qo_indptr, q_rope_position, paged_kv, o, tmp, lse,
+              q, request_indices, tile_indices, qo_indptr, q_offset, paged_kv, o, tmp, lse,
               num_qo_tiles, sm_scale, rope_scale, rope_theta, stream);
         }
       })});
@@ -123,7 +123,7 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
 template <PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeOut,
           typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheWrapper(
-    BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, IdType* q_rope_position,
+    BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, IdType* q_offset,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, DTypeOut* o, float* lse,
     uint32_t num_qo_heads, bool causal = true,
     PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
@@ -145,8 +145,8 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
                         return BatchPrefillWithPagedKVCacheWrapperDispatched<
                             page_storage, kv_layout, GROUP_SIZE, HEAD_DIM, pos_encoding_mode,
                             ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
-                            handler, q, qo_indptr, q_rope_position, paged_kv, o, lse, sm_scale,
-                            rope_scale, rope_theta, stream);
+                            handler, q, qo_indptr, q_offset, paged_kv, o, lse, sm_scale, rope_scale,
+                            rope_theta, stream);
                       })})})})});
   return cudaSuccess;
 }
@@ -156,7 +156,7 @@ template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
           typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
     BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, DTypeIn* k, DTypeIn* v,
-    IdType* kv_indptr, IdType* q_rope_position, IdType* k_rope_pos_offset, DTypeOut* o, float* lse,
+    IdType* kv_indptr, IdType* q_offset, IdType* k_rope_pos_offset, DTypeOut* o, float* lse,
     const uint32_t batch_size, const uint32_t num_kv_heads, const float sm_scale,
     const float rope_scale, const float rope_theta, cudaStream_t stream) {
   float* tmp = nullptr;
@@ -180,9 +180,9 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
     return BatchPrefillWithRaggedKVCacheDispatched<NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
                                                    pos_encoding_mode, ALLOW_FP16_QK_REDUCTION,
                                                    CAUSAL, DTypeIn, DTypeOut, IdType>(
-        q, request_indices, tile_indices, qo_indptr, k, v, kv_indptr, q_rope_position,
-        k_rope_pos_offset, o, tmp, lse, batch_size, num_qo_tiles, num_kv_heads, sm_scale,
-        rope_scale, rope_theta, stream);
+        q, request_indices, tile_indices, qo_indptr, k, v, kv_indptr, q_offset, k_rope_pos_offset,
+        o, tmp, lse, batch_size, num_qo_tiles, num_kv_heads, sm_scale, rope_scale, rope_theta,
+        stream);
   });
   return cudaSuccess;
 }
@@ -212,7 +212,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
                             return BatchPrefillWithRaggedKVCacheWrapperDispatched<
                                 GROUP_SIZE, HEAD_DIM, KV_LAYOUT, pos_encoding_mode,
                                 ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
-                                handler, q, qo_indptr, k, v, kv_indptr, /*q_rope_position=*/nullptr,
+                                handler, q, qo_indptr, k, v, kv_indptr, /*q_offset=*/nullptr,
                                 /*k_rope_pos_offset=*/nullptr, o, lse, batch_size, num_kv_heads,
                                 sm_scale, rope_scale, rope_theta, stream);
                           })})})})})});

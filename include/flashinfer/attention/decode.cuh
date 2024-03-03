@@ -70,7 +70,8 @@ template <PosEncodingMode pos_encoding_mode, uint32_t vec_size, uint32_t bdx, ui
 __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage_idx,
                                            const vec_t<float, vec_size>& q_vec,
                                            const vec_t<float, vec_size>& freq, uint32_t kv_idx_base,
-                                           uint32_t iter_base, uint32_t iter_bound, float* s,
+                                           uint32_t iter_base, uint32_t iter_bound,
+                                           const int32_t q_offset, float alibi_slope, float* s,
                                            state_t<vec_size>& st) {
   uint32_t tx = threadIdx.x, tz = threadIdx.z;
   float m_prev = st.m;
@@ -86,7 +87,7 @@ __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage
       k_vec.cast_load(smem + (j * bdx + tx) * vec_size);
     }
     if constexpr (pos_encoding_mode == PosEncoding::ALiBi) {
-      // TODO(Zihao)
+      s[j] = alibi_slope * float(int(kv_idx_base + tz * tile_size + j) - q_offset);
     } else {
       s[j] = 0.f;
     }
@@ -220,6 +221,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
   uint32_t kv_chunk_idx = blockIdx.x;
   uint32_t num_kv_chunks = gridDim.x;
   uint32_t num_qo_heads = info.get_num_qo_heads();
+  const float alibi_slope = get_alibi_slope(qo_head_idx, num_qo_heads);
   uint32_t seq_len = info.kv_len;
 
   extern __shared__ uint8_t smem[];
@@ -297,8 +299,8 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
     block.sync();
     compute_qk<pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
         k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, stage_idx, q_vec,
-        freq, consumer_kv_idx_base, iter * bdy * tile_size_per_bdx * bdz, kv_chunk_size, s,
-        st_local);
+        freq, consumer_kv_idx_base, iter * bdy * tile_size_per_bdx * bdz, kv_chunk_size,
+        seq_len - 1, alibi_slope, s, st_local);
     block.sync();
     // load k
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
@@ -371,6 +373,7 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(
   uint32_t batch_idx = blockIdx.x;
   uint32_t num_qo_heads = info.get_num_qo_heads();
   uint32_t num_kv_heads = info.get_num_kv_heads();
+  const float alibi_slope = get_alibi_slope(qo_head_idx, num_qo_heads);
   uint32_t seq_len = info.kv_len;
 
   extern __shared__ uint8_t smem[];
@@ -437,7 +440,7 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(
     block.sync();
     compute_qk<pos_encoding_mode, vec_size, bdx, bdy>(
         k_smem + (stage_idx * bdz + tz) * bdy * head_dim, stage_idx, q_vec, freq,
-        consumer_kv_idx_base, iter * bdy * bdz, seq_len, s, st_local);
+        consumer_kv_idx_base, iter * bdy * bdz, seq_len, seq_len - 1, alibi_slope, s, st_local);
     block.sync();
     // load k
     cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
@@ -513,7 +516,7 @@ template <bool partition_kv, PosEncodingMode pos_encoding_mode, uint32_t num_sta
           PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeOut,
           typename IdType>
 __global__ void BatchDecodeWithPagedKVCacheKernel(
-    DTypeIn* __restrict__ q, IdType* __restrict__ q_rope_position,
+    DTypeIn* __restrict__ q, IdType* __restrict__ q_offset,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* __restrict__ o,
     DTypeOut* __restrict__ tmp, float* __restrict__ lse, float sm_scale, float rope_rcp_scale,
@@ -526,6 +529,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
   const uint32_t kv_head_idx = blockIdx.y;
   const uint32_t qo_head_idx = kv_head_idx * bdy + threadIdx.y;
   const uint32_t num_qo_heads = gridDim.y * bdy;
+  const float alibi_slope = get_alibi_slope(qo_head_idx, num_qo_heads);
   const uint32_t cur_chunk_start = partition_kv ? kv_partition_info.chunk_start_pos[batch_idx] : 0U;
   const uint32_t cur_page_indptr_begin = paged_kv.indptr[batch_idx],
                  cur_page_indptr_end = paged_kv.indptr[batch_idx + 1];
@@ -552,6 +556,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
   const uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
   vec_t<float, vec_size> q_vec;
   vec_t<float, vec_size> freq;
+  int32_t q_offset_val = q_offset == nullptr ? (seq_len - 1) : q_offset[mapped_batch_idx];
   if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
@@ -561,8 +566,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
     }
     // apply rotary embedding to q matrix
     q_vec = vec_apply_llama_rope<vec_size, bdx>(
-        q + (mapped_batch_idx * num_qo_heads + qo_head_idx) * head_dim, freq,
-        q_rope_position == nullptr ? (seq_len - 1) : q_rope_position[mapped_batch_idx]);
+        q + (mapped_batch_idx * num_qo_heads + qo_head_idx) * head_dim, freq, q_offset_val);
   } else {
     // do not apply rotary embedding to q matrix
     q_vec.cast_load(q + (mapped_batch_idx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
@@ -642,7 +646,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
         freq,
         (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[mapped_batch_idx]) +
             cur_chunk_start + iter * tile_size_per_bdx * bdy * bdz,
-        iter * tile_size_per_bdx * bdy * bdz, kv_chunk_len, s, st);
+        iter * tile_size_per_bdx * bdy * bdz, kv_chunk_len, q_offset_val, alibi_slope, s, st);
     block.sync();
 
 #pragma unroll
@@ -1135,8 +1139,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
 template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, QKVLayout kv_layout,
           PosEncodingMode pos_encoding_mode, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(
-    DTypeIn* q, IdType* q_rope_position,
-    paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
+    DTypeIn* q, IdType* q_offset, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, DTypeOut* tmp, float* lse,
     float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream) {
   const float rope_rcp_scale = 1.f / rope_scale;
@@ -1168,7 +1171,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     void* args[] = {(void*)&q,
-                    (void*)&q_rope_position,
+                    (void*)&q_offset,
                     (void*)&paged_kv,
                     (void*)&kv_partition_info,
                     (void*)&o,
@@ -1187,7 +1190,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
         partition_kv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     void* args[] = {(void*)&q,
-                    (void*)&q_rope_position,
+                    (void*)&q_offset,
                     (void*)&paged_kv,
                     (void*)&kv_partition_info,
                     (void*)&o,
@@ -1229,8 +1232,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
 template <PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeOut,
           typename IdType>
 cudaError_t BatchDecodeWithPagedKVCache(
-    DTypeIn* q, IdType* q_rope_position,
-    paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
+    DTypeIn* q, IdType* q_offset, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, DTypeOut* tmp, float* lse,
     uint32_t num_qo_heads, PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
     std::optional<float> maybe_sm_scale = std::nullopt, float rope_scale = 1.f,
@@ -1253,7 +1255,7 @@ cudaError_t BatchDecodeWithPagedKVCache(
             return BatchDecodeWithPagedKVCacheDispatched<GROUP_SIZE, HEAD_DIM, page_storage,
                                                          kv_layout, pos_encoding_mode, DTypeIn,
                                                          DTypeOut, IdType>(
-                q, q_rope_position, paged_kv, kv_partition_info, o, tmp, lse, sm_scale, rope_scale,
+                q, q_offset, paged_kv, kv_partition_info, o, tmp, lse, sm_scale, rope_scale,
                 rope_theta, stream);
           })})});
 

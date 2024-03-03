@@ -19,6 +19,7 @@
 #include <string>
 
 #include "layout.cuh"
+#include "math.cuh"
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
 
@@ -54,6 +55,11 @@ inline std::string PosEncodingModeToString(const PosEncodingMode& pos_encoding_m
   }
 }
 
+__device__ __forceinline__ float get_alibi_slope(uint32_t head_idx, uint32_t num_heads) {
+  // NOTE(Zihao): here we assume that num_heads is a power of 2
+  return math::ptx_exp2(-8. * float(head_idx) / float(num_heads));
+}
+
 /*!
  * \brief Apply RoPE (Rotary Positional Embeddings) to x[0: head_dim],
  *   return thread-local vector
@@ -67,7 +73,7 @@ inline std::string PosEncodingModeToString(const PosEncodingMode& pos_encoding_m
  */
 template <uint32_t vec_size, uint32_t bdx, typename T>
 __device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope(
-    const T* x, const vec_t<float, vec_size>& freq, uint32_t offset) {
+    const T* x, const vec_t<float, vec_size>& freq, int32_t offset) {
   constexpr uint32_t head_dim = vec_size * bdx;
   vec_t<float, vec_size> permuted_vec, vec;
   vec.cast_load(x + threadIdx.x * vec_size);
