@@ -107,9 +107,9 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
         return DISPATCH_head_dim(head_dim, [&] {
           DISPATCH_CAUSAL(causal, CAUSAL, {
             DISPATCH_ALLOW_FP16_QK_REDUCTION(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
-              DISPATCH_pos_encoding_mode(PosEncodingMode(pos_encoding_mode), pos_encoding_mode, {
+              DISPATCH_POS_ENCODING_MODE(PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, {
                 cudaError_t status = BatchPrefillWithPagedKVCacheWrapperDispatched<
-                    PageStorage::kIndices, KV_LAYOUT, GROUP_SIZE, HEAD_DIM, pos_encoding_mode,
+                    PageStorage::kIndices, KV_LAYOUT, GROUP_SIZE, HEAD_DIM, POS_ENCODING_MODE,
                     ALLOW_FP16_QK_REDUCTION, CAUSAL, c_type, c_type, int32_t>(
                     &handler_, static_cast<c_type*>(q.data_ptr()),
                     static_cast<int32_t*>(qo_indptr.data_ptr()),
@@ -206,10 +206,10 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
       return DISPATCH_head_dim(head_dim, [&] {
         DISPATCH_CAUSAL(causal, CAUSAL, {
           DISPATCH_ALLOW_FP16_QK_REDUCTION(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
-            DISPATCH_pos_encoding_mode(PosEncodingMode(pos_encoding_mode), pos_encoding_mode, {
+            DISPATCH_POS_ENCODING_MODE(PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, {
               DISPATCH_LAYOUT(kv_layout_, KV_LAYOUT, {
                 cudaError_t status = BatchPrefillWithRaggedKVCacheWrapperDispatched<
-                    GROUP_SIZE, HEAD_DIM, KV_LAYOUT, pos_encoding_mode, ALLOW_FP16_QK_REDUCTION,
+                    GROUP_SIZE, HEAD_DIM, KV_LAYOUT, POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION,
                     CAUSAL, c_type, c_type, int32_t>(
                     &handler_, static_cast<c_type*>(q.data_ptr()),
                     static_cast<int32_t*>(qo_indptr.data_ptr()), static_cast<c_type*>(k.data_ptr()),

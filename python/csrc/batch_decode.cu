@@ -116,7 +116,8 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::EndForward() { handler_.EndForwa
 std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
     torch::Tensor q, torch::Tensor paged_kv_data, torch::Tensor paged_kv_indptr,
     torch::Tensor paged_kv_indices, torch::Tensor paged_kv_last_page_len,
-    unsigned int pos_encoding_mode, float rope_scale, float rope_theta, bool return_lse) {
+    unsigned int pos_encoding_mode, float sm_scale, float rope_scale, float rope_theta,
+    bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(paged_kv_data);
   CHECK_INPUT(paged_kv_indptr);
@@ -168,7 +169,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
           &handler_, static_cast<c_type*>(q.data_ptr()), /*q_offset=*/nullptr, paged_kv,
           static_cast<c_type*>(o.data_ptr()),
           /*lse=*/(return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr), num_qo_heads,
-          PosEncodingMode(pos_encoding_mode), rope_scale, rope_theta,
+          PosEncodingMode(pos_encoding_mode), sm_scale, rope_scale, rope_theta,
           /*stream=*/torch_current_stream);
       TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
                   cudaGetErrorString(status));

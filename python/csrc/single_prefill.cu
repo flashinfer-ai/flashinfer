@@ -59,10 +59,10 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
         DISPATCH_CAUSAL(causal, CAUSAL, {
           DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
             DISPATCH_ALLOW_FP16_QK_REDUCTION(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
-              DISPATCH_pos_encoding_mode(PosEncodingMode(pos_encoding_mode), pos_encoding_mode, {
+              DISPATCH_POS_ENCODING_MODE(PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, {
                 cudaError_t status =
                     SinglePrefillWithKVCacheDispatched<GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
-                                                       pos_encoding_mode, ALLOW_FP16_QK_REDUCTION,
+                                                       POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION,
                                                        CAUSAL>(
                         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
                         static_cast<c_type*>(v.data_ptr()), static_cast<c_type*>(o.data_ptr()),
