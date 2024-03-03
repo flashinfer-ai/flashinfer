@@ -522,14 +522,12 @@ __device__ __forceinline__ void compute_qk(smem_t* q_smem, uint32_t* q_smem_offs
   *k_smem_offset_r -= num_frags_y * 2;
 }
 
-template <PosEncodingMode pos_encoding_mode, bool partition_kv, bool causal, uint32_t group_size,
-          uint32_t num_warps, uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z,
-          typename DTypeQKAccum>
-__device__ __forceinline__ void mask_s(const uint32_t qo_idx_base, const uint32_t kv_idx_base,
-                                       const int32_t q_offset, const uint32_t chunk_end,
-                                       float (*alibi_slopes)[2],
-                                       DTypeQKAccum (*s_frag)[num_frags_z][8]) {
-  const uint32_t tx = threadIdx.x;
+template <uint32_t group_size, uint32_t num_frags_x, uint32_t num_frags_z, typename T>
+__device__ __forceinline__ void apply_alibi_bias(const uint32_t qo_idx_base,
+                                                 const uint32_t kv_idx_base, const int32_t q_offset,
+                                                 float (*alibi_slope)[2],
+                                                 T (*s_frag)[num_frags_z][8]) {
+  const int32_t tx = threadIdx.x;
 #pragma unroll
   for (int32_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
@@ -539,18 +537,34 @@ __device__ __forceinline__ void mask_s(const uint32_t qo_idx_base, const uint32_
         const int32_t q_idx =
                           qo_idx_base + (fx * 16 + tx / 4 + 8 * ((reg_id % 4) / 2)) / group_size,
                       kv_idx = kv_idx_base + fz * 16 + 2 * (tx % 4) + 8 * (reg_id / 4) + reg_id % 2;
+        s_frag[fx][fz][reg_id] +=
+            T(alibi_slope[fx][(reg_id % 4) / 2]) * T(kv_idx - q_idx - q_offset);
+      }
+    }
+  }
+}
+
+template <bool partition_kv, bool causal, uint32_t group_size, uint32_t num_warps,
+          uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z, typename DTypeQKAccum>
+__device__ __forceinline__ void mask_s(const uint32_t qo_idx_base, const uint32_t kv_idx_base,
+                                       const uint32_t qo_len, const uint32_t kv_len,
+                                       const uint32_t chunk_end,
+                                       DTypeQKAccum (*s_frag)[num_frags_z][8]) {
+  const uint32_t tx = threadIdx.x;
+#pragma unroll
+  for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+    for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
+#pragma unroll
+      for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+        const uint32_t q_idx =
+                           qo_idx_base + (fx * 16 + tx / 4 + 8 * ((reg_id % 4) / 2)) / group_size,
+                       kv_idx =
+                           kv_idx_base + fz * 16 + 2 * (tx % 4) + 8 * (reg_id / 4) + reg_id % 2;
         const bool out_of_boundary =
-            (causal ? (kv_idx > q_offset + q_idx || (partition_kv && kv_idx >= chunk_end))
+            (causal ? (kv_idx > kv_len + q_idx - qo_len || (partition_kv && kv_idx >= chunk_end))
                     : kv_idx >= chunk_end);
-        if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
-          s_frag[fx][fz][reg_id] =
-              out_of_boundary
-                  ? DTypeQKAccum(-5e4)
-                  : (s_frag[fx][fz][reg_id] + DTypeQKAccum(alibi_slopes[fx][(reg_id % 4) / 2]) *
-                                                  DTypeQKAccum(kv_idx - q_offset - q_idx));
-        } else {
-          s_frag[fx][fz][reg_id] = out_of_boundary ? DTypeQKAccum(-5e4) : s_frag[fx][fz][reg_id];
-        }
+        s_frag[fx][fz][reg_id] = out_of_boundary ? DTypeQKAccum(-5e4) : s_frag[fx][fz][reg_id];
       }
     }
   }
@@ -1006,11 +1020,15 @@ __global__ void SinglePrefillWithKVCacheKernel(
     compute_qk<num_frags_x, num_frags_y, num_frags_z, DTypeIn>(&qo_smem, &q_smem_offset_r, &k_smem,
                                                                &k_smem_offset_r, s_frag);
 
+    if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
+      apply_alibi_bias<group_size, num_frags_x, num_frags_z>(
+          qo_idx_base, chunk_start + iter * 16 * num_frags_z, int(kv_len) - int(qo_len),
+          alibi_slopes, s_frag);
+    }
     // apply mask
     if (iter >= mask_iteration) {
-      mask_s<pos_encoding_mode, partition_kv, causal, group_size, num_warps, num_frags_x,
-             num_frags_y, num_frags_z>(qo_idx_base, chunk_start + iter * 16 * num_frags_z,
-                                       int(kv_len) - int(qo_len), chunk_end, alibi_slopes, s_frag);
+      mask_s<partition_kv, causal, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
+          qo_idx_base, chunk_start + iter * 16 * num_frags_z, qo_len, kv_len, chunk_end, s_frag);
     }
 
     // compute m,d states in online softmax
@@ -1218,11 +1236,15 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
     compute_qk<num_frags_x, num_frags_y, num_frags_z, DTypeIn>(&qo_smem, &q_smem_offset_r, &k_smem,
                                                                &k_smem_offset_r, s_frag);
 
+    if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
+      // TODO(Zihao): handle the case that q_offset is specified
+      apply_alibi_bias<group_size, num_frags_x, num_frags_z>(
+          qo_idx_base, iter * 16 * num_frags_z, int(kv_len) - int(qo_len), alibi_slopes, s_frag);
+    }
     // apply mask
     if (iter >= mask_iteration) {
-      mask_s<pos_encoding_mode, partition_kv, causal, group_size, num_warps, num_frags_x,
-             num_frags_y, num_frags_z>(qo_idx_base, iter * 16 * num_frags_z,
-                                       int(kv_len) - int(qo_len), kv_len, alibi_slopes, s_frag);
+      mask_s<partition_kv, causal, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
+          qo_idx_base, iter * 16 * num_frags_z, qo_len, kv_len, kv_len, s_frag);
     }
 
     // compute m,d states in online softmax
@@ -1413,11 +1435,15 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
     compute_qk<num_frags_x, num_frags_y, num_frags_z, DTypeIn>(&qo_smem, &q_smem_offset_r, &k_smem,
                                                                &k_smem_offset_r, s_frag);
 
+    if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
+      // TODO(Zihao): handle the case that q_offset is specified
+      apply_alibi_bias<group_size, num_frags_x, num_frags_z>(
+          qo_idx_base, iter * 16 * num_frags_z, int(kv_len) - int(qo_len), alibi_slopes, s_frag);
+    }
     // apply mask
     if (iter >= mask_iteration) {
-      mask_s<pos_encoding_mode, partition_kv, causal, group_size, num_warps, num_frags_x,
-             num_frags_y, num_frags_z>(qo_idx_base, iter * 16 * num_frags_z,
-                                       int(kv_len) - int(qo_len), kv_len, alibi_slopes, s_frag);
+      mask_s<partition_kv, causal, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
+          qo_idx_base, iter * 16 * num_frags_z, qo_len, kv_len, kv_len, s_frag);
     }
 
     // compute m,d states in online softmax

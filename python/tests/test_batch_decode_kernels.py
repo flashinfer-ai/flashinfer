@@ -29,6 +29,7 @@ import flashinfer
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
 def test_batch_decode_with_paged_kv_cache(
     batch_size,
     kv_len,
@@ -38,6 +39,7 @@ def test_batch_decode_with_paged_kv_cache(
     num_qo_heads,
     head_dim,
     kv_layout,
+    pos_encoding_mode,
 ):
     q = torch.randn(batch_size, num_qo_heads, head_dim).to(0).half()
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
@@ -68,7 +70,7 @@ def test_batch_decode_with_paged_kv_cache(
         "NONE",
         "float16",
     )
-    o = wrapper.forward(q, kv_data)
+    o = wrapper.forward(q, kv_data, pos_encoding_mode=pos_encoding_mode)
 
     for i in range(batch_size):
         perm_dims = [0, 2, 1, 3] if kv_layout == "HND" else [0, 1, 2, 3]
@@ -104,12 +106,14 @@ def test_batch_decode_with_paged_kv_cache(
             ],
             dim=0,
         )
-        o_ref_i = flashinfer.single_decode_with_kv_cache(qi, ki, vi)
+        o_ref_i = flashinfer.single_decode_with_kv_cache(
+            qi, ki, vi, pos_encoding_mode=pos_encoding_mode
+        )
         o_i_np = o[i].cpu().numpy()
         o_ref_i_np = o_ref_i.cpu().numpy()
         numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":
-    test_batch_decode_with_paged_kv_cache(12, 54, 37, 8, 8, 8, 128, "HND")
-    test_batch_decode_with_paged_kv_cache(12, 54, 37, 1, 8, 8, 128, "HND")
+    test_batch_decode_with_paged_kv_cache(12, 54, 37, 8, 8, 8, 128, "HND", "NONE")
+    test_batch_decode_with_paged_kv_cache(12, 54, 37, 1, 8, 8, 128, "HND", "NONE")

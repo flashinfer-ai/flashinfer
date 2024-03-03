@@ -55,7 +55,7 @@ def get_instantiation_cu() -> List[str]:
     causal_options = [False, True]
     allow_fp16_qk_reduction_options = [False, True]
     layout_options = ["HND", "NHD"]
-    pos_encoding_mode_options = ["None", "Llama"]
+    pos_encoding_mode_options = ["None", "RoPELlama", "ALiBi"]
 
     # dispatch.inc
     path = root / prefix / "dispatch.inc"
@@ -91,7 +91,7 @@ def get_instantiation_cu() -> List[str]:
         pos_encoding_mode_options,
     ):
         # paged batch prefill
-        fname = f"paged_batch_prefill_group{group_size}_head{head_dim}_causal{causal}_fp16qk{allow_fp16_qk_reduction}_layout{layout}_rotary{pos_encoding_mode}_{dtype}.cu"
+        fname = f"paged_batch_prefill_group{group_size}_head{head_dim}_causal{causal}_fp16qk{allow_fp16_qk_reduction}_layout{layout}_pe{pos_encoding_mode}_{dtype}.cu"
         files.append(prefix + "/" + fname)
         if not (root / prefix / fname).exists():
             with open(root / prefix / fname, "w") as f:
@@ -111,7 +111,7 @@ def get_instantiation_cu() -> List[str]:
                 )
 
         # ragged batch prefill
-        fname = f"ragged_batch_prefill_group{group_size}_head{head_dim}_causal{causal}_fp16qk{allow_fp16_qk_reduction}_layout{layout}_rotary{pos_encoding_mode}_{dtype}.cu"
+        fname = f"ragged_batch_prefill_group{group_size}_head{head_dim}_causal{causal}_fp16qk{allow_fp16_qk_reduction}_layout{layout}_pe{pos_encoding_mode}_{dtype}.cu"
         files.append(prefix + "/" + fname)
         if not (root / prefix / fname).exists():
             with open(root / prefix / fname, "w") as f:
@@ -131,7 +131,7 @@ def get_instantiation_cu() -> List[str]:
                 )
 
         # single prefill
-        fname = f"single_prefill_group{group_size}_head{head_dim}_causal{causal}_fp16qk{allow_fp16_qk_reduction}_layout{layout}_rotary{pos_encoding_mode}_{dtype}.cu"
+        fname = f"single_prefill_group{group_size}_head{head_dim}_causal{causal}_fp16qk{allow_fp16_qk_reduction}_layout{layout}_pe{pos_encoding_mode}_{dtype}.cu"
         files.append(prefix + "/" + fname)
         if not (root / prefix / fname).exists():
             with open(root / prefix / fname, "w") as f:
