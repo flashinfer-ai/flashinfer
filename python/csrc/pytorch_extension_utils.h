@@ -15,9 +15,16 @@
  */
 #pragma once
 #include <c10/cuda/CUDAStream.h>
+#include <cuda_fp16.h>
 #include <torch/extension.h>
 
 #include "generated/dispatch.inc"
+#ifdef FLASHINFER_ENABLE_BF16
+#include <cuda_bf16.h>
+#endif
+#ifdef FLASHINFER_ENABLE_FP8
+#include <cuda_fp8.h>
+#endif
 
 #ifdef FLASHINFER_ENABLE_BF16
 #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...) \
@@ -48,6 +55,22 @@
     }                                                               \
   }()
 #endif
+
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(pytorch_dtype, c_type, ...) \
+  [&]() -> bool {                                                       \
+    switch (pytorch_dtype) {                                            \
+      case at::ScalarType::Float8_e4m3fn: {                             \
+        using c_type = __nv_fp8_e4m3;                                   \
+        return __VA_ARGS__();                                           \
+      }                                                                 \
+      case at::ScalarType::Float8_e5m2: {                               \
+        using c_type = __nv_fp8_e5m2;                                   \
+        return __VA_ARGS__();                                           \
+      }                                                                 \
+      default:                                                          \
+        return false;                                                   \
+    }                                                                   \
+  }()
 
 #define _DISPATCH_SWITCH(cond, ...) \
   [&]() -> bool {                   \
@@ -99,3 +122,8 @@ inline constexpr uint32_t pack_u16(uint16_t a, uint16_t b) {
 #define CHECK_EQ(a, b) TORCH_CHECK((a) == (b), "CHECK_EQ(" #a ", " #b ") failed. ", a, " vs ", b)
 
 #define CHECK_GE(a, b) TORCH_CHECK((a) >= (b), "CHECK_GE(" #a ", " #b ") failed. ", a, " vs ", b)
+
+inline bool is_float8_tensor(const torch::Tensor& tensor) {
+  return tensor.scalar_type() == at::ScalarType::Float8_e4m3fn ||
+         tensor.scalar_type() == at::ScalarType::Float8_e5m2;
+}

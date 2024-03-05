@@ -53,3 +53,7 @@ def check_pos_encoding_mode(pos_encoding_mode: str):
 def check_kv_layout(kv_layout: str):
     if not hasattr(TensorLayout, kv_layout):
         raise KeyError("Invalide kv_layout {}".format(kv_layout))
+
+
+def is_float8(x: torch.Tensor):
+    return x.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]

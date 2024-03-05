@@ -30,6 +30,9 @@ import flashinfer
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.float8_e4m3fn, torch.float8_e5m2]
+)
 def test_batch_decode_with_paged_kv_cache(
     batch_size,
     kv_len,
@@ -40,16 +43,15 @@ def test_batch_decode_with_paged_kv_cache(
     head_dim,
     kv_layout,
     pos_encoding_mode,
+    dtype,
 ):
-    q = torch.randn(batch_size, num_qo_heads, head_dim).to(0).half()
+    q = torch.randn(batch_size, num_qo_heads, head_dim).to(0).to(dtype)
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size
     kv_data = (
-        torch.randn(total_num_pages, 2, num_kv_heads, page_size, head_dim).to(0).half()
+        torch.randn(total_num_pages, 2, num_kv_heads, page_size, head_dim).to(0)
         if kv_layout == "HND"
-        else torch.randn(total_num_pages, 2, page_size, num_kv_heads, head_dim)
-        .to(0)
-        .half()
+        else torch.randn(total_num_pages, 2, page_size, num_kv_heads, head_dim).to(0)
     )
     kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * num_pages_per_seq
     kv_indices = torch.arange(0, total_num_pages).to(0).int()
@@ -68,9 +70,9 @@ def test_batch_decode_with_paged_kv_cache(
         head_dim,
         page_size,
         "NONE",
-        "float16",
+        dtype,
     )
-    o = wrapper.forward(q, kv_data, pos_encoding_mode=pos_encoding_mode)
+    o = wrapper.forward(q, kv_data.to(dtype), pos_encoding_mode=pos_encoding_mode)
 
     for i in range(batch_size):
         perm_dims = [0, 2, 1, 3] if kv_layout == "HND" else [0, 1, 2, 3]
@@ -90,7 +92,7 @@ def test_batch_decode_with_paged_kv_cache(
                 .reshape(-1, num_kv_heads, head_dim),
             ],
             dim=0,
-        )
+        ).to(dtype)
         vi = torch.cat(
             [
                 kv_data[kv_indptr[i] : kv_indptr[i + 1] - 1, 1]
@@ -105,7 +107,7 @@ def test_batch_decode_with_paged_kv_cache(
                 .reshape(-1, num_kv_heads, head_dim),
             ],
             dim=0,
-        )
+        ).to(dtype)
         o_ref_i = flashinfer.single_decode_with_kv_cache(
             qi, ki, vi, pos_encoding_mode=pos_encoding_mode
         )
@@ -115,5 +117,9 @@ def test_batch_decode_with_paged_kv_cache(
 
 
 if __name__ == "__main__":
-    test_batch_decode_with_paged_kv_cache(12, 54, 37, 8, 8, 8, 128, "HND", "NONE")
-    test_batch_decode_with_paged_kv_cache(12, 54, 37, 1, 8, 8, 128, "HND", "NONE")
+    test_batch_decode_with_paged_kv_cache(
+        12, 54, 37, 8, 8, 8, 128, "HND", "NONE", torch.float16
+    )
+    test_batch_decode_with_paged_kv_cache(
+        12, 54, 37, 1, 8, 8, 128, "HND", "NONE", torch.float8_e5m2
+    )

@@ -30,6 +30,9 @@ import torch.utils.cpp_extension as torch_cpp_ext
 root = pathlib.Path(__name__).parent
 
 enable_bf16 = True
+# NOTE(Zihao): we haven't utilized fp8 tensor cores yet, so there is no
+# cuda arch check for fp8 at the moment.
+enable_fp8 = True
 for cuda_arch_flags in torch_cpp_ext._get_cuda_arch_flags():
     arch = int(re.search("compute_\d+", cuda_arch_flags).group()[-2:])
     if arch < 75:
@@ -40,6 +43,8 @@ for cuda_arch_flags in torch_cpp_ext._get_cuda_arch_flags():
 
 if enable_bf16:
     torch_cpp_ext.COMMON_NVCC_FLAGS.append("-DFLASHINFER_ENABLE_BF16")
+if enable_fp8:
+    torch_cpp_ext.COMMON_NVCC_FLAGS.append("-DFLASHINFER_ENABLE_FP8")
 
 
 def get_instantiation_cu() -> List[str]:
