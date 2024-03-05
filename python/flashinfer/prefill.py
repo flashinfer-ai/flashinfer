@@ -17,6 +17,7 @@ limitations under the License.
 import math
 from typing import Optional
 import torch
+import logging
 
 try:
     from . import _kernels
@@ -36,6 +37,7 @@ from .utils import (
     expand_5d,
     check_pos_encoding_mode,
     check_kv_layout,
+    is_float8,
 )
 
 
@@ -248,6 +250,14 @@ def single_prefill_with_kv_cache_return_lse(
         rope_scale = 1.0
     if rope_theta is None:
         rope_theta = 1e4
+    if is_float8(q):
+        logging.warning(
+            "Our current prefill kernel implementation needs f16 input, the f8 inputs "
+            " are casted to f16, which could result in performance degradation."
+        )
+        q = q.to(torch.float16)
+        k = k.to(torch.float16)
+        v = v.to(torch.float16)
     return _kernels.single_prefill_with_kv_cache(
         q,
         k,
@@ -485,6 +495,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
+        if is_float8(q):
+            logging.warning(
+                "Our current prefill kernel implementation needs f16 input, the f8 inputs "
+                " are casted to f16, which could result in performance degradation."
+            )
+            q = q.to(torch.float16)
+            paged_kv_data = paged_kv_data.to(torch.float16)
+
         paged_kv_data = expand_5d(paged_kv_data, self._kv_layout)
         return self._wrapper.forward(
             q,
@@ -557,6 +575,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
+        if is_float8(q):
+            logging.warning(
+                "Our current prefill kernel implementation needs f16 input, the f8 inputs "
+                " are casted to f16, which could result in performance degradation."
+            )
+            q = q.to(torch.float16)
+            paged_kv_data = paged_kv_data.to(torch.float16)
+
         paged_kv_data = expand_5d(paged_kv_data, self._kv_layout)
         return self._wrapper.forward(
             q,
@@ -769,6 +795,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
+        if is_float8(q):
+            logging.warning(
+                "Our current prefill kernel implementation needs f16 input, the f8 inputs "
+                " are casted to f16, which could result in performance degradation."
+            )
+            q = q.to(torch.float16)
+            k = k.to(torch.float16)
+            v = v.to(torch.float16)
         return self._wrapper.forward(
             q,
             self._qo_indptr,
@@ -838,6 +872,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
+        if is_float8(q):
+            logging.warning(
+                "Our current prefill kernel implementation needs f16 input, the f8 inputs "
+                " are casted to f16, which could result in performance degradation."
+            )
+            q = q.to(torch.float16)
+            k = k.to(torch.float16)
+            v = v.to(torch.float16)
         return self._wrapper.forward(
             q,
             self._qo_indptr,

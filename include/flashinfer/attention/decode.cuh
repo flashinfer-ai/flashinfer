@@ -1263,7 +1263,7 @@ cudaError_t BatchDecodeWithPagedKVCache(
 
 template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
           PosEncodingMode POS_ENCODING_MODE, typename DTypeIn, typename DTypeOut>
-cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeIn* o,
+cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o,
                                                    DTypeOut* tmp, float* lse, uint32_t batch_size,
                                                    uint32_t padded_kv_len, uint32_t num_qo_heads,
                                                    float sm_scale, float rope_scale,
@@ -1304,7 +1304,7 @@ cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DType
 }
 
 template <typename DTypeIn, typename DTypeOut>
-cudaError_t BatchDecodeWithPaddedKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeIn* o,
+cudaError_t BatchDecodeWithPaddedKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o,
                                          DTypeOut* tmp, float* lse, uint32_t batch_size,
                                          uint32_t padded_kv_len, uint32_t num_qo_heads,
                                          uint32_t num_kv_heads, uint32_t head_dim,
