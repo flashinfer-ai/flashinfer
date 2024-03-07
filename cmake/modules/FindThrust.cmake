@@ -51,13 +51,32 @@ if( THRUST_INCLUDE_DIR )
     version
     "${version}"
     )
+
+  file( STRINGS ${THRUST_INCLUDE_DIR}/thrust/version.h
+    major_version
+    REGEX "#define THRUST_MAJOR_VERSION[ \t]+([0-9x]+)"
+    )
+  string( REGEX REPLACE
+    "#define THRUST_MAJOR_VERSION[ \t]+"
+    ""
+    major_version
+    "${major_version}"
+    )
+
+  file( STRINGS ${THRUST_INCLUDE_DIR}/thrust/version.h
+    major_version
+    REGEX "#define THRUST_MINOR_VERSION[ \t]+([0-9x]+)"
+    )
+  string( REGEX REPLACE
+    "#define THRUST_MINOR_VERSION[ \t]+"
+    ""
+    minor_version
+    "${minor_version}"
+    )
   
-  math(EXPR major "${version} / 100000")
-  math(EXPR minor "(${version} / 100) % 1000")
-  math(EXPR version "${version} % 100")
-  set( THRUST_VERSION "${major}.${minor}.${version}")
-  set( THRUST_MAJOR_VERSION "${major}")
-  set( THRUST_MINOR_VERSION "${minor}")
+  set( THRUST_VERSION "${version}")
+  set( THRUST_MAJOR_VERSION "${major_version}")
+  set( THRUST_MINOR_VERSION "${minor_version}")
 endif( THRUST_INCLUDE_DIR )
 
 # Check for required components
