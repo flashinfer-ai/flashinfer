@@ -1111,9 +1111,9 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
               // compute max_num_pages_per_batch and new_batch_size
               std::vector<IdType> page_indptr_h(batch_size + 1), num_pages(batch_size);
               if (is_device_ptr(kv_indptr)) {
-                FLASHINFER_CUDA_CALL(cudaMemcpy(page_indptr_h.data(), kv_indptr,
-                                                sizeof(IdType) * (batch_size + 1),
-                                                cudaMemcpyDeviceToHost));
+                FLASHINFER_CUDA_CALL(cudaMemcpyAsync(page_indptr_h.data(), kv_indptr,
+                                                     sizeof(IdType) * (batch_size + 1),
+                                                     cudaMemcpyDeviceToHost, stream));
               } else {
                 page_indptr_h.assign(kv_indptr, kv_indptr + batch_size + 1);
               }
