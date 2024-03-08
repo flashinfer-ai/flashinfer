@@ -232,7 +232,7 @@ struct paged_kv_t {
     if constexpr (page_storage == PageStorage::kIndices) {
       return data + get_k_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
     } else {
-      return __ldg(ptrs + page_iter) + get_k_elem_offset_in_page(head_idx, entry_idx, feat_idx);
+      return ptrs[page_iter] + get_k_elem_offset_in_page(head_idx, entry_idx, feat_idx);
     }
   }
 
@@ -247,9 +247,9 @@ struct paged_kv_t {
       }
     } else {
       if (page_iter < last_indptr) {
-        return __ldg(ptrs + page_iter) + get_k_elem_offset_in_page(head_idx, entry_idx, feat_idx);
+        return ptrs[page_iter] + get_k_elem_offset_in_page(head_idx, entry_idx, feat_idx);
       } else {
-        return __ldg(ptrs);
+        return *ptrs;
       }
     }
   }
@@ -259,7 +259,7 @@ struct paged_kv_t {
     if constexpr (page_storage == PageStorage::kIndices) {
       return data + get_v_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
     } else {
-      return __ldg(ptrs + page_iter) + get_v_elem_offset_in_page(head_idx, entry_idx, feat_idx);
+      return ptrs[page_iter] + get_v_elem_offset_in_page(head_idx, entry_idx, feat_idx);
     }
   }
 
@@ -274,9 +274,9 @@ struct paged_kv_t {
       }
     } else {
       if (page_iter < last_indptr) {
-        return __ldg(ptrs + page_iter) + get_v_elem_offset_in_page(head_idx, entry_idx, feat_idx);
+        return ptrs[page_iter] + get_v_elem_offset_in_page(head_idx, entry_idx, feat_idx);
       } else {
-        return __ldg(ptrs);
+        return *ptrs;
       }
     }
   }
