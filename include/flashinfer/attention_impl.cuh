@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_ATTENTION_CUH_
-#define FLASHINFER_ATTENTION_CUH_
+#ifndef FLASHINFER_ATTENTION_IMPL_CUH_
+#define FLASHINFER_ATTENTION_IMPL_CUH_
 
 #include "attention/cascade.cuh"
 #include "attention/decode.cuh"
@@ -22,4 +22,4 @@
 #include "attention/prefill.cuh"
 #include "attention/wrapper.cuh"
 
-#endif  // FLASHINFER_ATTENTION_CUH_
+#endif  // FLASHINFER_ATTENTION_IMPL_CUH_
