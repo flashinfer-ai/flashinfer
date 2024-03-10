@@ -333,7 +333,7 @@ template <typename T>
 void TestBatchPrefillKernelOneHotCorrectness(bool allow_fp16_qk_reduction) {
   for (size_t num_kv_heads : {4, 8, 32}) {
     for (size_t num_qo_heads : {32}) {
-      for (size_t page_size : {1, 7, 16}) {
+      for (size_t page_size : {1, 8, 16}) {
         for (size_t head_dim : {64, 128, 256}) {
           for (size_t causal : {false, true}) {
             for (size_t pos_encoding_mode : {0, 1}) {
@@ -352,7 +352,7 @@ template <typename T>
 void TestBatchPrefillKernelShortContextCorrectness(bool allow_fp16_qk_reduction) {
   for (size_t num_kv_heads : {4, 8, 32}) {
     for (size_t num_qo_heads : {32}) {
-      for (size_t page_size : {1, 7, 16}) {
+      for (size_t page_size : {1, 8, 16}) {
         for (size_t head_dim : {64, 128, 256}) {
           for (size_t causal : {false, true}) {
             for (size_t pos_encoding_mode : {0, 1}) {
@@ -371,7 +371,7 @@ template <typename T>
 void TestBatchPrefillKernelLongContextCorrectness(bool allow_fp16_qk_reduction) {
   for (size_t num_kv_heads : {1, 2, 8}) {
     for (size_t num_qo_heads : {8}) {
-      for (size_t page_size : {1, 7, 16}) {
+      for (size_t page_size : {1, 8, 16}) {
         for (size_t head_dim : {64, 128, 256}) {
           for (size_t causal : {false, true}) {
             for (size_t pos_encoding_mode : {0, 1}) {

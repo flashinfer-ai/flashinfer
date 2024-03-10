@@ -35,11 +35,11 @@ cudaError_t SingleDecodeWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v
                                               uint32_t seq_len, float sm_scale, float rope_scale,
                                               float rope_theta, cudaStream_t stream);
 
-template <PageStorage page_storage, QKVLayout kv_layout, uint32_t GROUP_SIZE, uint32_t HEAD_DIM,
-          PosEncodingMode pos_encoding_mode, typename DTypeIn, typename DTypeOut, typename IdType>
-cudaError_t BatchDecodeWithPagedKVCacheWrapperDispatched(
-    BatchDecodeHandler* handler, DTypeIn* q, IdType* q_offset,
-    paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, DTypeOut* o, float* lse,
+template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, QKVLayout kv_layout,
+          PosEncodingMode POS_ENCODING_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
+cudaError_t BatchDecodeWithPagedKVCacheDispatched(
+    DTypeIn* q, IdType* q_offset, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
+    kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, DTypeOut* tmp, float* lse,
     float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream);
 
 template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
@@ -131,17 +131,74 @@ cudaError_t BatchDecodeWithPagedKVCache(
     throw std::invalid_argument(err_msg.str());
   }
 
-  // DISPATCH_GQA_GROUP_SIZE(
-  //     num_qo_heads / num_kv_heads, GROUP_SIZE,
-  //     {DISPATCH_HEAD_DIM(
-  //         head_dim, HEAD_DIM, {DISPATCH_POS_ENCODING_MODE(pos_encoding_mode, POS_ENCODING_MODE, {
-  //           return BatchDecodeWithPagedKVCacheDispatched<GROUP_SIZE, HEAD_DIM, page_storage,
-  //                                                        kv_layout, POS_ENCODING_MODE, DTypeIn,
-  //                                                        DTypeOut, IdType>(
-  //               q, q_offset, paged_kv, kv_partition_info, o, tmp, lse, sm_scale, rope_scale,
-  //               rope_theta, stream);
-  //         })})});
+  DISPATCH_GQA_GROUP_SIZE(
+      num_qo_heads / num_kv_heads, GROUP_SIZE,
+      {DISPATCH_HEAD_DIM(
+          head_dim, HEAD_DIM, {DISPATCH_POS_ENCODING_MODE(pos_encoding_mode, POS_ENCODING_MODE, {
+            return BatchDecodeWithPagedKVCacheDispatched<GROUP_SIZE, HEAD_DIM, page_storage,
+                                                         kv_layout, POS_ENCODING_MODE, DTypeIn,
+                                                         DTypeOut, IdType>(
+                q, q_offset, paged_kv, kv_partition_info, o, tmp, lse, sm_scale, rope_scale,
+                rope_theta, stream);
+          })})});
 
+  return cudaSuccess;
+}
+
+/*!
+ * \brief Wrapper of BatchDecodeWithPagedKVCache function, and caches the temporary buffer
+ *   for cooperative kernels.
+ * \tparam page_storage Whether to store indices or pointers of each active page
+ * \tparam kv_layout The layout of last 3 dimensions in KV-Cache
+ * \tparam DTypeIn The data type of input tensor.
+ * \tparam DTypeOut The data type of output tensor.
+ * \tparam IdType The data type of index tensor.
+ * \param handler The handler for the batch decode forward request.
+ * \param q The input tensor.
+ * \param paged_kv The paged key-value tensor.
+ * \param o The output tensor.
+ * \param lse The logsumexp values.
+ * \param num_qo_heads The number of heads.
+ * \param pos_encoding_mode The positional encoding mode.
+ * \param rope_scale The scale of rope.
+ * \param rope_theta The theta of rope.
+ * \param stream The CUDA stream.
+ * \note This wrapper function should be only called after we call BeginForward function in the
+ *   BatchDecodeHandler.
+ */
+template <PageStorage page_storage, QKVLayout kv_layout, uint32_t GROUP_SIZE, uint32_t HEAD_DIM,
+          PosEncodingMode pos_encoding_mode, typename DTypeIn, typename DTypeOut, typename IdType>
+cudaError_t BatchDecodeWithPagedKVCacheWrapperDispatched(
+    BatchDecodeHandler* handler, DTypeIn* q, IdType* q_offset,
+    paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, DTypeOut* o, float* lse,
+    float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream) {
+  paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> new_paged_kv = paged_kv;
+  kv_partition_info_t<IdType> kv_partition_info;
+  DTypeOut* tmp = handler->GetTempFloatBuffer<DTypeOut>();
+
+  if (handler->IsForwardStarted()) {
+    if (tmp != nullptr) {
+      // create auxiliary information for cooperative kernels
+      new_paged_kv.batch_size = handler->GetBatchSizeAfterPartition();
+      new_paged_kv.indptr = handler->GetNewIndPtr<IdType>();
+      new_paged_kv.last_page_len = handler->GetNewLastPageLen<IdType>();
+      kv_partition_info.batch_size_before_partition = handler->GetBatchSizeBeforePartition();
+      kv_partition_info.chunk_indptr = handler->GetChunkIndPtr<IdType>();
+      kv_partition_info.batch_idx_map = handler->GetBatchIdxMap<IdType>();
+      kv_partition_info.chunk_start_pos = handler->GetChunkStartPos<IdType>();
+      kv_partition_info.seq_lens_before_partition = handler->GetSeqLengthsBeforePartition<IdType>();
+    }
+  } else {
+    std::ostringstream err_msg;
+    err_msg << "Please call BatchDecodeHandler's BeginForward() before calling "
+               "BatchDecodeWithPagedKVCacheWrapper()";
+    throw std::runtime_error(err_msg.str());
+  }
+
+  return BatchDecodeWithPagedKVCacheDispatched<GROUP_SIZE, HEAD_DIM, page_storage, kv_layout,
+                                               pos_encoding_mode, DTypeIn, DTypeOut, IdType>(
+      q, q_offset, new_paged_kv, kv_partition_info, o, tmp, lse, sm_scale, rope_scale, rope_theta,
+      stream);
   return cudaSuccess;
 }
 
@@ -172,7 +229,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapper(
   //                   page_storage, KV_LAYOUT, GROUP_SIZE, HEAD_DIM, POS_ENCODING_MODE, DTypeIn,
   //                   DTypeOut, IdType>(handler, q, q_offset, paged_kv, o, lse, sm_scale,
   //                   rope_scale,
-  //                                     rope_theta, stream);
+  //                   rope_theta, stream);
   //             })})})});
   return cudaSuccess;
 }

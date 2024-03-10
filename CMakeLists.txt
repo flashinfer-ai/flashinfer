@@ -77,12 +77,11 @@ foreach(group_size IN LISTS GROUP_SIZES)
     foreach(kv_layout IN LISTS KV_LAYOUTS)
       foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
         foreach(dtype IN LISTS DECODE_DTYPES)
-          set(generated_kernel_fname single_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_${dtype}.cu)
-          set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/${generated_kernel_fname})
+          set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_${dtype}.cu)
           add_custom_command(
             OUTPUT ${generated_kernel_src}
-            COMMAND python ${PROJECT_SOURCE_DIR}/scripts/generate_single_decode_inst_file.py ${generated_kernel_fname}
-            DEPENDS ${PROJECT_SOURCE_DIR}/scripts/generate_single_decode_inst_file.py
+            COMMAND python ${PROJECT_SOURCE_DIR}/python/generate_single_decode_inst.py ${generated_kernel_src}
+            DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_single_decode_inst.py
             COMMENT "Generating additional source file ${generated_kernel_src}"
             VERBATIM
           )
@@ -91,12 +90,11 @@ foreach(group_size IN LISTS GROUP_SIZES)
 
         # fp8 in, fp16 out
         foreach(dtype IN LISTS DECODE_F8_DTYPES)
-          set(generated_kernel_fname single_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_f16.cu)
-          set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/${generated_kernel_fname})
+          set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_f16.cu)
           add_custom_command(
             OUTPUT ${generated_kernel_src}
-            COMMAND python ${PROJECT_SOURCE_DIR}/scripts/generate_single_decode_inst_file.py ${generated_kernel_fname}
-            DEPENDS ${PROJECT_SOURCE_DIR}/scripts/generate_single_decode_inst_file.py
+            COMMAND python ${PROJECT_SOURCE_DIR}/python/generate_single_decode_inst.py ${generated_kernel_src}
+            DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_single_decode_inst.py
             COMMENT "Generating additional source file ${generated_kernel_src}"
             VERBATIM
           )
@@ -114,12 +112,11 @@ foreach(group_size IN LISTS GROUP_SIZES)
       foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
         foreach(idtype IN LISTS IDTYPES)
           foreach(dtype IN LISTS DECODE_DTYPES)
-            set(generated_kernel_fname batch_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
-            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/${generated_kernel_fname})
+            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
             add_custom_command(
               OUTPUT ${generated_kernel_src}
-              COMMAND python ${PROJECT_SOURCE_DIR}/scripts/generate_batch_decode_inst_file.py ${generated_kernel_fname}
-              DEPENDS ${PROJECT_SOURCE_DIR}/scripts/generate_batch_decode_inst_file.py
+              COMMAND python ${PROJECT_SOURCE_DIR}/python/generate_batch_decode_inst.py ${generated_kernel_src}
+              DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_decode_inst.py
               COMMENT "Generating additional source file ${generated_kernel_src}"
               VERBATIM
             )
@@ -128,12 +125,11 @@ foreach(group_size IN LISTS GROUP_SIZES)
           
           # fp8 in, fp16 out
           foreach(dtype IN LISTS DECODE_FP8_DTYPES)
-            set(generated_kernel_fname batch_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_f16_idtype_${idtype}.cu)
-            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/${generated_kernel_fname})
+            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_f16_idtype_${idtype}.cu)
             add_custom_command(
               OUTPUT ${generated_kernel_src}
-              COMMAND python ${PROJECT_SOURCE_DIR}/scripts/generate_batch_decode_inst_file.py ${generated_kernel_fname}
-              DEPENDS ${PROJECT_SOURCE_DIR}/scripts/generate_batch_decode_inst_file.py
+              COMMAND python ${PROJECT_SOURCE_DIR}/python/generate_batch_decode_inst.py ${generated_kernel_src}
+              DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_decode_inst.py
               COMMENT "Generating additional source file ${generated_kernel_src}"
               VERBATIM
             )
@@ -156,12 +152,11 @@ foreach(group_size IN LISTS GROUP_SIZES)
         foreach(allow_fp16_qk_reduction IN LISTS ALLOW_FP16_QK_REDUCTIONS)
           foreach(causal IN LISTS CAUSALS)
             foreach(dtype IN LISTS PREFILL_DTYPES)
-              set(generated_kernel_fname single_prefill_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_causal_${causal}_dtypein_${dtype}_dtypeout_${dtype}.cu)
-              set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/${generated_kernel_fname})
+              set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_prefill_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_causal_${causal}_dtypein_${dtype}_dtypeout_${dtype}.cu)
               add_custom_command(
                 OUTPUT ${generated_kernel_src}
-                COMMAND python ${PROJECT_SOURCE_DIR}/scripts/generate_single_prefill_inst_file.py ${generated_kernel_fname}
-                DEPENDS ${PROJECT_SOURCE_DIR}/scripts/generate_single_prefill_inst_file.py
+                COMMAND python ${PROJECT_SOURCE_DIR}/python/generate_single_prefill_inst.py ${generated_kernel_src}
+                DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_single_prefill_inst.py
                 COMMENT "Generating additional source file ${generated_kernel_src}"
                 VERBATIM
               )
@@ -183,12 +178,11 @@ foreach(group_size IN LISTS GROUP_SIZES)
           foreach(causal IN LISTS CAUSALS)
             foreach(dtype IN LISTS PREFILL_DTYPES)
               foreach(idtype IN LISTS IDTYPES)
-                set(generated_kernel_fname batch_paged_prefill_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_causal_${causal}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
-                set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/${generated_kernel_fname})
+                set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_prefill_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_causal_${causal}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
                 add_custom_command(
                   OUTPUT ${generated_kernel_src}
-                  COMMAND python ${PROJECT_SOURCE_DIR}/scripts/generate_batch_paged_prefill_inst_file.py ${generated_kernel_fname}
-                  DEPENDS ${PROJECT_SOURCE_DIR}/scripts/generate_batch_paged_prefill_inst_file.py
+                  COMMAND python ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py ${generated_kernel_src}
+                  DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py
                   COMMENT "Generating additional source file ${generated_kernel_src}"
                   VERBATIM
                 )
@@ -211,12 +205,11 @@ foreach(group_size IN LISTS GROUP_SIZES)
           foreach(causal IN LISTS CAUSALS)
             foreach(dtype IN LISTS PREFILL_DTYPES)
               foreach(idtype IN LISTS IDTYPES)
-                set(generated_kernel_fname batch_ragged_prefill_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_causal_${causal}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
-                set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/${generated_kernel_fname})
+                set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_ragged_prefill_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_causal_${causal}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
                 add_custom_command(
                   OUTPUT ${generated_kernel_src}
-                  COMMAND python ${PROJECT_SOURCE_DIR}/scripts/generate_batch_ragged_prefill_inst_file.py ${generated_kernel_fname}
-                  DEPENDS ${PROJECT_SOURCE_DIR}/scripts/generate_batch_ragged_prefill_inst_file.py
+                  COMMAND python ${PROJECT_SOURCE_DIR}/python/generate_batch_ragged_prefill_inst.py ${generated_kernel_src}
+                  DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_ragged_prefill_inst.py
                   COMMENT "Generating additional source file ${generated_kernel_src}"
                   VERBATIM
                 )
@@ -311,23 +304,24 @@ if (FLASHINFER_CASCADE)
   target_link_libraries(test_cascade PRIVATE gtest gtest_main decode_kernels prefill_kernels)
 endif(FLASHINFER_CASCADE)
 
-# if(FLASHINFER_TVM_BINDING)
-#   message(STATUS "Compile tvm binding.")
-#   if(NOT FLASHINFER_TVM_HOME STREQUAL "")
-#     set(TVM_HOME_SET ${FLASHINFER_TVM_HOME})
-#   elseif(DEFINED ENV{TVM_HOME})
-#     set(TVM_HOME_SET $ENV{TVM_HOME})
-#   else()
-#     message(FATAL_ERROR "Error: Cannot find TVM. Please set the path to TVM by 1) adding `-DFLASHINFER_TVM_HOME=path/to/tvm` in the cmake command, or 2) setting the environment variable `TVM_HOME` to the tvm path.")
-#   endif()
-#   message(STATUS "FlashInfer uses TVM home ${TVM_HOME_SET}.")
+if(FLASHINFER_TVM_BINDING)
+  message(STATUS "Compile tvm binding.")
+  if(NOT FLASHINFER_TVM_HOME STREQUAL "")
+    set(TVM_HOME_SET ${FLASHINFER_TVM_HOME})
+  elseif(DEFINED ENV{TVM_HOME})
+    set(TVM_HOME_SET $ENV{TVM_HOME})
+  else()
+    message(FATAL_ERROR "Error: Cannot find TVM. Please set the path to TVM by 1) adding `-DFLASHINFER_TVM_HOME=path/to/tvm` in the cmake command, or 2) setting the environment variable `TVM_HOME` to the tvm path.")
+  endif()
+  message(STATUS "FlashInfer uses TVM home ${TVM_HOME_SET}.")
 
-#   file(GLOB_RECURSE TVM_BINDING_SRCS ${PROJECT_SOURCE_DIR}/src/tvm_wrapper.cu)
-#   add_library(flashinfer_tvm OBJECT ${TVM_BINDING_SRCS})
-#   target_compile_definitions(flashinfer_tvm PRIVATE -DDMLC_USE_LOGGING_LIBRARY=\<tvm/runtime/logging.h\>)
-#   target_include_directories(flashinfer_tvm PRIVATE ${FLASHINFER_INCLUDE_DIR})
-#   target_include_directories(flashinfer_tvm PRIVATE ${TVM_HOME_SET}/include)
-#   target_include_directories(flashinfer_tvm PRIVATE ${TVM_HOME_SET}/3rdparty/dlpack/include)
-#   target_include_directories(flashinfer_tvm PRIVATE ${TVM_HOME_SET}/3rdparty/dmlc-core/include)
-#   target_compile_options(flashinfer_tvm PRIVATE -Xcompiler=-fPIC -diag-suppress "1305")
-# endif(FLASHINFER_TVM_BINDING)
+  file(GLOB_RECURSE TVM_BINDING_SRCS ${PROJECT_SOURCE_DIR}/src/tvm_wrapper.cu)
+  add_library(flashinfer_tvm STATIC ${TVM_BINDING_SRCS})
+  target_compile_definitions(flashinfer_tvm PRIVATE -DDMLC_USE_LOGGING_LIBRARY=\<tvm/runtime/logging.h\>)
+  target_link_libraries(flashinfer_tvm PRIVATE decode_kernels prefill_kernels)
+  target_include_directories(flashinfer_tvm PRIVATE ${FLASHINFER_INCLUDE_DIR})
+  target_include_directories(flashinfer_tvm PRIVATE ${TVM_HOME_SET}/include)
+  target_include_directories(flashinfer_tvm PRIVATE ${TVM_HOME_SET}/3rdparty/dlpack/include)
+  target_include_directories(flashinfer_tvm PRIVATE ${TVM_HOME_SET}/3rdparty/dmlc-core/include)
+  target_compile_options(flashinfer_tvm PRIVATE -Xcompiler=-fPIC -diag-suppress "1305")
+endif(FLASHINFER_TVM_BINDING)

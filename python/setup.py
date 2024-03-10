@@ -100,7 +100,6 @@ def get_instantiation_cu() -> List[str]:
         files.append(prefix + "/" + fname)
         if not (root / prefix / fname).exists():
             with open(root / prefix / fname, "w") as f:
-                f.write('#include "../flashinfer_decl.h"\n\n')
                 f.write(f"#include <flashinfer.cuh>\n\n")
                 f.write(f"using namespace flashinfer;\n\n")
                 f.write(
@@ -120,7 +119,6 @@ def get_instantiation_cu() -> List[str]:
         files.append(prefix + "/" + fname)
         if not (root / prefix / fname).exists():
             with open(root / prefix / fname, "w") as f:
-                f.write('#include "../flashinfer_decl.h"\n\n')
                 f.write(f"#include <flashinfer.cuh>\n\n")
                 f.write(f"using namespace flashinfer;\n\n")
                 f.write(
@@ -140,7 +138,6 @@ def get_instantiation_cu() -> List[str]:
         files.append(prefix + "/" + fname)
         if not (root / prefix / fname).exists():
             with open(root / prefix / fname, "w") as f:
-                f.write('#include "../flashinfer_decl.h"\n\n')
                 f.write(f"#include <flashinfer.cuh>\n\n")
                 f.write(f"using namespace flashinfer;\n\n")
                 f.write(

@@ -18,8 +18,6 @@
 
 #include "attention/cascade.cuh"
 #include "attention/decode.cuh"
-#include "attention/handler.cuh"
 #include "attention/prefill.cuh"
-#include "attention/wrapper.cuh"
 
 #endif  // FLASHINFER_ATTENTION_IMPL_CUH_
