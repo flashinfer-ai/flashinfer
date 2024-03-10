@@ -63,22 +63,23 @@
     __VA_ARGS__                                                                                 \
   }
 
-#define DISPATCH_PAGE_SIZE(page_size, PAGE_SIZE, ...) \
-  if (page_size == 1) {                               \
-    constexpr size_t PAGE_SIZE = 1;                   \
-    __VA_ARGS__                                       \
-  } else if (page_size == 8) {                        \
-    constexpr size_t PAGE_SIZE = 8;                   \
-    __VA_ARGS__                                       \
-  } else if (page_size == 16) {                       \
-    constexpr size_t PAGE_SIZE = 16;                  \
-    __VA_ARGS__                                       \
-  } else if (page_size == 32) {                       \
-    constexpr size_t PAGE_SIZE = 32;                  \
-    __VA_ARGS__                                       \
-  } else {                                            \
-    constexpr size_t PAGE_SIZE = 0;                   \
-    __VA_ARGS__                                       \
+#define DISPATCH_PAGE_SIZE(page_size, PAGE_SIZE, ...)  \
+  if (page_size == 1) {                                \
+    constexpr size_t PAGE_SIZE = 1;                    \
+    __VA_ARGS__                                        \
+  } else if (page_size == 8) {                         \
+    constexpr size_t PAGE_SIZE = 8;                    \
+    __VA_ARGS__                                        \
+  } else if (page_size == 16) {                        \
+    constexpr size_t PAGE_SIZE = 16;                   \
+    __VA_ARGS__                                        \
+  } else if (page_size == 32) {                        \
+    constexpr size_t PAGE_SIZE = 32;                   \
+    __VA_ARGS__                                        \
+  } else {                                             \
+    std::ostringstream err_msg;                        \
+    err_msg << "Unsupported page_size: " << page_size; \
+    throw std::invalid_argument(err_msg.str());        \
   }
 
 #define DISPATCH_NUM_FRAGS_X(num_frags_x, NUM_FRAGS_X, ...) \

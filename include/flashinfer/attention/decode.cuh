@@ -796,143 +796,6 @@ cudaError_t SingleDecodeWithKVCacheWorkEstimation(
   return cudaSuccess;
 }
 
-template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
-          PosEncodingMode pos_encoding_mode, typename DTypeIn, typename DTypeOut>
-cudaError_t SingleDecodeWithKVCacheDispatched(DTypeIn* q, DTypeOIn* k, DTypeIn* v, DTypeOut* o,
-                                              DTypeOut* tmp, uint32_t num_kv_heads,
-                                              uint32_t seq_len, float sm_scale, float rope_scale,
-                                              float rope_theta, cudaStream_t stream) {
-  const float rope_rcp_scale = 1.f / rope_scale;
-  const float rope_rcp_theta = 1.f / rope_theta;
-  constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
-  constexpr uint32_t num_stages_smem = 2U;
-  constexpr uint32_t bdx = HEAD_DIM / vec_size;
-  static_assert(bdx <= 32U);
-  constexpr uint32_t bdy = GROUP_SIZE;
-  constexpr uint32_t num_threads =
-      std::max(get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeIn)), bdx * bdy);
-  constexpr uint32_t bdz = num_threads / (bdx * bdy);
-  tensor_info_t<KV_LAYOUT, GROUP_SIZE, HEAD_DIM> info(1, seq_len, num_kv_heads);
-  constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeIn) == 1 ? 2U : 8U) : 1U;
-  const uint32_t smem_size =
-      2U * num_stages_smem * bdy * tile_size_per_bdx * bdz * head_dim * sizeof(DTypeIn) +
-      2U * bdy * bdz * sizeof(float);
-  if (seq_len <= 256 || tmp == nullptr) {
-    // no need to use partition-kv kernel
-    auto kernel =
-        SingleDecodeWithKVCacheKernel<KV_LAYOUT, /*partition_kv=*/false, POS_ENCODING_MODE,
-                                      num_stages_smem, tile_size_per_bdx, vec_size, bdx, bdy, bdz,
-                                      DTypeIn, DTypeOut>;
-    FLASHINFER_CUDA_CALL(
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-
-    dim3 nblks = dim3(1, num_kv_heads);
-    dim3 nthrs = dim3(bdx, bdy, bdz);
-    void* args[] = {(void*)&q,
-                    (void*)&k,
-                    (void*)&v,
-                    (void*)&o,
-                    (void*)&tmp,
-                    (void*)&info,
-                    (void*)&sm_scale,
-                    (void*)&rope_rcp_scale,
-                    (void*)&rope_rcp_theta,
-                    (void*)&seq_len};
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-  } else {
-    // use partition-kv kernel
-    auto kernel = SingleDecodeWithKVCacheKernel<KV_LAYOUT, /*partition_kv=*/true, POS_ENCODING_MODE,
-                                                num_stages_smem, tile_size_per_bdx, vec_size, bdx,
-                                                bdy, bdz, DTypeIn, DTypeOut>;
-    FLASHINFER_CUDA_CALL(
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-
-    int num_blocks_per_sm = 0;
-    int num_sm = 0;
-    int dev_id = 0;
-    FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
-    FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
-    FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
-                                                                       num_threads, smem_size));
-    uint32_t max_grid_size = uint32_t(num_blocks_per_sm) * uint32_t(num_sm);
-    uint32_t max_num_kv_chunks = max_grid_size / num_kv_heads;
-    uint32_t kv_chunk_size = max(ceil_div(seq_len, max_num_kv_chunks), 256);
-    uint32_t num_chunks = ceil_div(seq_len, kv_chunk_size);
-    dim3 nblks = dim3(num_chunks, num_kv_heads);
-    if (nblks.x == 0 || nblks.y == 0) {
-      std::ostringstream err_msg;
-      err_msg << "Invalid kernel configuration: nblks=(" << nblks.x << "," << nblks.y << ")";
-      throw std::runtime_error(err_msg.str());
-    }
-    dim3 nthrs = dim3(bdx, bdy, bdz);
-    void* args[] = {(void*)&q,
-                    (void*)&k,
-                    (void*)&v,
-                    (void*)&o,
-                    (void*)&tmp,
-                    (void*)&info,
-                    (void*)&sm_scale,
-                    (void*)&rope_rcp_scale,
-                    (void*)&rope_rcp_theta,
-                    (void*)&kv_chunk_size};
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-    FLASHINFER_CUDA_CALL(MergeStates(tmp, (float*)(tmp + num_chunks * num_qo_heads * HEAD_DIM), o,
-                                     nullptr, num_chunks, 1, num_qo_heads, HEAD_DIM, stream));
-  }
-  return cudaSuccess;
-}
-
-/*!
- * \brief FlashAttention decoding with kv-cache for a single request
- * \tparam DTypeIn A template type indicates the input data type
- * \tparam DTypeOut A template type indicates the output data type
- * \param q The query matrix, shape: [num_qo_heads, head_dim]
- * \param k The key matrix in kv-cache, shape: [seq_len, num_kv_heads, head_dim]
- *   for NHD layout, [num_kv_heads, seq_len, head_dim] for HND layout
- * \param v The value matrix in kv-cache, shape: [seq_len, num_kv_heads,
- *   head_dim] for NHD layout, [num_kv_heads, seq_len, head_dim] for HND layout
- * \param o The output matrix, shape: [num_qo_heads, head_dim]
- * \param tmp Used-allocated temporary buffer
- * \param num_qo_heads A integer indicates the number of heads of query and output
- * \param num_kv_heads A integer indicates the number of heads of key and value
- * \param seq_len A integer indicates the sequence length
- * \param head_dim A integer indicates the head dimension
- * \param kv_layout The layout of q/k/v matrices
- * \param pos_encoding_mode The positional encoding mode
- * \param rope_scale The scaling factor used in RoPE Interpolation
- * \param rope_theta The theta used in RoPE
- * \param stream The cuda stream to launch the kernel
- * \return status Indicates whether CUDA calls are successful
- */
-template <typename DTypeIn, typename DTypeOut>
-cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o, DTypeOut* tmp,
-                                    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t seq_len,
-                                    uint32_t head_dim, QKVLayout kv_layout = QKVLayout::kNHD,
-                                    PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
-                                    std::optional<float> maybe_sm_scale = std::nullopt,
-                                    float rope_scale = 1.f, float rope_theta = 1e4,
-                                    cudaStream_t stream = nullptr) {
-  float sm_scale = maybe_sm_scale.value_or(1.f / std::sqrt(float(head_dim)));
-  if (num_qo_heads % num_kv_heads != 0) {
-    std::ostringstream err_msg;
-    err_msg << "num_qo_heads " << num_qo_heads << " is not a multiple of num_kv_heads "
-            << num_kv_heads;
-    throw std::invalid_argument(err_msg.str());
-  }
-
-  DISPATCH_GQA_GROUP_SIZE(
-      num_qo_heads / num_kv_heads, GROUP_SIZE,
-      {DISPATCH_HEAD_DIM(
-          head_dim, HEAD_DIM,
-          {DISPATCH_POS_ENCODING_MODE(
-              pos_encoding_mode, POS_ENCODING_MODE, {DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
-                SingleDecodeWithKVCacheDispatched<GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
-                                                  POS_ENCODING_MODE>(
-                    q, k, v, o, tmp, num_kv_heads, seq_len, sm_scale, rope_scale, rope_theta);
-              })})})});
-  return cudaSuccess;
-}
-
 /*!
  * \brief Partition Paged KV-Cache into multiple chunks on KV sequence length
  * \tparam IdType A template type indicates the index data type
@@ -1142,6 +1005,115 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
   return cudaSuccess;
 }
 
+/*!
+ * \brief FlashAttention decoding with kv-cache for a single request
+ * \tparam DTypeIn A template type indicates the input data type
+ * \tparam DTypeOut A template type indicates the output data type
+ * \param q The query matrix, shape: [num_qo_heads, head_dim]
+ * \param k The key matrix in kv-cache, shape: [seq_len, num_kv_heads, head_dim]
+ *   for NHD layout, [num_kv_heads, seq_len, head_dim] for HND layout
+ * \param v The value matrix in kv-cache, shape: [seq_len, num_kv_heads,
+ *   head_dim] for NHD layout, [num_kv_heads, seq_len, head_dim] for HND layout
+ * \param o The output matrix, shape: [num_qo_heads, head_dim]
+ * \param tmp Used-allocated temporary buffer
+ * \param num_qo_heads A integer indicates the number of heads of query and output
+ * \param num_kv_heads A integer indicates the number of heads of key and value
+ * \param seq_len A integer indicates the sequence length
+ * \param head_dim A integer indicates the head dimension
+ * \param kv_layout The layout of q/k/v matrices
+ * \param pos_encoding_mode The positional encoding mode
+ * \param rope_scale The scaling factor used in RoPE Interpolation
+ * \param rope_theta The theta used in RoPE
+ * \param stream The cuda stream to launch the kernel
+ * \return status Indicates whether CUDA calls are successful
+ */
+template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
+          PosEncodingMode POS_ENCODING_MODE, typename DTypeIn, typename DTypeOut>
+cudaError_t SingleDecodeWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o,
+                                              DTypeOut* tmp, uint32_t num_kv_heads,
+                                              uint32_t seq_len, float sm_scale, float rope_scale,
+                                              float rope_theta, cudaStream_t stream) {
+  const float rope_rcp_scale = 1.f / rope_scale;
+  const float rope_rcp_theta = 1.f / rope_theta;
+  const uint32_t num_qo_heads = num_kv_heads * GROUP_SIZE;
+  constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
+  constexpr uint32_t num_stages_smem = 2U;
+  constexpr uint32_t bdx = HEAD_DIM / vec_size;
+  static_assert(bdx <= 32U);
+  constexpr uint32_t bdy = GROUP_SIZE;
+  constexpr uint32_t num_threads =
+      std::max(get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeIn)), bdx * bdy);
+  constexpr uint32_t bdz = num_threads / (bdx * bdy);
+  tensor_info_t<KV_LAYOUT, GROUP_SIZE, HEAD_DIM> info(1, seq_len, num_kv_heads);
+  constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeIn) == 1 ? 2U : 8U) : 1U;
+  const uint32_t smem_size =
+      2U * num_stages_smem * bdy * tile_size_per_bdx * bdz * HEAD_DIM * sizeof(DTypeIn) +
+      2U * bdy * bdz * sizeof(float);
+  if (seq_len <= 256 || tmp == nullptr) {
+    // no need to use partition-kv kernel
+    auto kernel =
+        SingleDecodeWithKVCacheKernel<KV_LAYOUT, /*partition_kv=*/false, POS_ENCODING_MODE,
+                                      num_stages_smem, tile_size_per_bdx, vec_size, bdx, bdy, bdz,
+                                      DTypeIn, DTypeOut>;
+    FLASHINFER_CUDA_CALL(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+    dim3 nblks = dim3(1, num_kv_heads);
+    dim3 nthrs = dim3(bdx, bdy, bdz);
+    void* args[] = {(void*)&q,
+                    (void*)&k,
+                    (void*)&v,
+                    (void*)&o,
+                    (void*)&tmp,
+                    (void*)&info,
+                    (void*)&sm_scale,
+                    (void*)&rope_rcp_scale,
+                    (void*)&rope_rcp_theta,
+                    (void*)&seq_len};
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  } else {
+    // use partition-kv kernel
+    auto kernel = SingleDecodeWithKVCacheKernel<KV_LAYOUT, /*partition_kv=*/true, POS_ENCODING_MODE,
+                                                num_stages_smem, tile_size_per_bdx, vec_size, bdx,
+                                                bdy, bdz, DTypeIn, DTypeOut>;
+    FLASHINFER_CUDA_CALL(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+    int num_blocks_per_sm = 0;
+    int num_sm = 0;
+    int dev_id = 0;
+    FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+    FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
+    FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
+                                                                       num_threads, smem_size));
+    uint32_t max_grid_size = uint32_t(num_blocks_per_sm) * uint32_t(num_sm);
+    uint32_t max_num_kv_chunks = max_grid_size / num_kv_heads;
+    uint32_t kv_chunk_size = max(ceil_div(seq_len, max_num_kv_chunks), 256);
+    uint32_t num_chunks = ceil_div(seq_len, kv_chunk_size);
+    dim3 nblks = dim3(num_chunks, num_kv_heads);
+    if (nblks.x == 0 || nblks.y == 0) {
+      std::ostringstream err_msg;
+      err_msg << "Invalid kernel configuration: nblks=(" << nblks.x << "," << nblks.y << ")";
+      throw std::runtime_error(err_msg.str());
+    }
+    dim3 nthrs = dim3(bdx, bdy, bdz);
+    void* args[] = {(void*)&q,
+                    (void*)&k,
+                    (void*)&v,
+                    (void*)&o,
+                    (void*)&tmp,
+                    (void*)&info,
+                    (void*)&sm_scale,
+                    (void*)&rope_rcp_scale,
+                    (void*)&rope_rcp_theta,
+                    (void*)&kv_chunk_size};
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+    FLASHINFER_CUDA_CALL(MergeStates(tmp, (float*)(tmp + num_chunks * num_qo_heads * HEAD_DIM), o,
+                                     nullptr, num_chunks, 1, num_qo_heads, HEAD_DIM, stream));
+  }
+  return cudaSuccess;
+}
+
 template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, QKVLayout kv_layout,
           PosEncodingMode POS_ENCODING_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(
@@ -1235,39 +1207,6 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
  * \param stream The cuda stream to launch the kernel
  * \return status Indicates whether CUDA calls are successful
  */
-template <PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeOut,
-          typename IdType>
-cudaError_t BatchDecodeWithPagedKVCache(
-    DTypeIn* q, IdType* q_offset, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
-    kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, DTypeOut* tmp, float* lse,
-    uint32_t num_qo_heads, PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
-    std::optional<float> maybe_sm_scale = std::nullopt, float rope_scale = 1.f,
-    float rope_theta = 1e4, cudaStream_t stream = nullptr) {
-  const uint32_t num_kv_heads = paged_kv.num_heads;
-  const uint32_t head_dim = paged_kv.head_dim;
-  const uint32_t batch_size = paged_kv.batch_size;
-  const float sm_scale = maybe_sm_scale.value_or(1.f / std::sqrt(float(head_dim)));
-  if (num_qo_heads % num_kv_heads != 0) {
-    std::ostringstream err_msg;
-    err_msg << "num_qo_heads " << num_qo_heads << " is not a multiple of num_kv_heads "
-            << num_kv_heads;
-    throw std::invalid_argument(err_msg.str());
-  }
-
-  DISPATCH_GQA_GROUP_SIZE(
-      num_qo_heads / num_kv_heads, GROUP_SIZE,
-      {DISPATCH_HEAD_DIM(
-          head_dim, HEAD_DIM, {DISPATCH_POS_ENCODING_MODE(pos_encoding_mode, POS_ENCODING_MODE, {
-            return BatchDecodeWithPagedKVCacheDispatched<GROUP_SIZE, HEAD_DIM, page_storage,
-                                                         kv_layout, POS_ENCODING_MODE, DTypeIn,
-                                                         DTypeOut, IdType>(
-                q, q_offset, paged_kv, kv_partition_info, o, tmp, lse, sm_scale, rope_scale,
-                rope_theta, stream);
-          })})});
-
-  return cudaSuccess;
-}
-
 template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
           PosEncodingMode POS_ENCODING_MODE, typename DTypeIn, typename DTypeOut>
 cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o,
@@ -1307,38 +1246,6 @@ cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DType
                   (void*)&rope_rcp_scale,
                   (void*)&rope_rcp_theta};
   FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-  return cudaSuccess;
-}
-
-template <typename DTypeIn, typename DTypeOut>
-cudaError_t BatchDecodeWithPaddedKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o,
-                                         DTypeOut* tmp, float* lse, uint32_t batch_size,
-                                         uint32_t padded_kv_len, uint32_t num_qo_heads,
-                                         uint32_t num_kv_heads, uint32_t head_dim,
-                                         QKVLayout kv_layout = QKVLayout::kNHD,
-                                         PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
-                                         std::optional<float> maybe_sm_scale = std::nullopt,
-                                         float rope_scale = 1.f, float rope_theta = 1e4,
-                                         cudaStream_t stream = nullptr) {
-  const float sm_scale = maybe_sm_scale.value_or(1.f / std::sqrt(float(head_dim)));
-  if (num_qo_heads % num_kv_heads != 0) {
-    std::ostringstream err_msg;
-    err_msg << "num_qo_heads " << num_qo_heads << " is not a multiple of num_kv_heads "
-            << num_kv_heads;
-    throw std::invalid_argument(err_msg.str());
-  }
-
-  DISPATCH_GQA_GROUP_SIZE(
-      num_qo_heads / num_kv_heads, GROUP_SIZE,
-      {DISPATCH_HEAD_DIM(
-          head_dim, HEAD_DIM,
-          {DISPATCH_POS_ENCODING_MODE(
-              pos_encoding_mode, POS_ENCODING_MODE, {DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
-                return BatchDecodeWithPaddedKVCacheDispatched<GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
-                                                              POS_ENCODING_MODE, DTypeIn, DTypeOut>(
-                    q, k, v, o, tmp, lse, batch_size, padded_kv_len, num_qo_heads, sm_scale,
-                    rope_scale, rope_theta, stream);
-              })})})});
   return cudaSuccess;
 }
 

@@ -15,7 +15,7 @@
  */
 #include <gtest/gtest.h>
 
-#include <flashinfer/attention/wrapper.cuh>
+#include <flashinfer/decode_attention_decl.cuh>
 #include <type_traits>
 
 #include "cpu_reference.h"
@@ -190,10 +190,6 @@ TEST(FlashInferCorrectnessTest, TestBatchDecodeKernelCorrectnessBF16) {
   TestBatchDecodeKernelCorrectness<__nv_bfloat16>();
 }
 #endif
-
-TEST(FlashInferCorrectnessTest, TestBatchDecodeKernelCorrectnessFP32) {
-  TestBatchDecodeKernelCorrectness<float>();
-}
 
 #ifdef FLASHINFER_ENABLE_FP8
 TEST(FlashInferCorrectnessTest, TestBatchDecodeKernelCorrectnessE4M3) {

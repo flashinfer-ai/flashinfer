@@ -15,7 +15,7 @@
  */
 #include <gtest/gtest.h>
 
-#include <flashinfer/attention/decode.cuh>
+#include <flashinfer/decode_attention_decl.cuh>
 #include <type_traits>
 
 #include "cpu_reference.h"
@@ -101,10 +101,6 @@ void TestSingleDecodeKernelCorrectness() {
 
 TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestFP16) {
   TestSingleDecodeKernelCorrectness<half>();
-}
-
-TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestFP32) {
-  TestSingleDecodeKernelCorrectness<float>();
 }
 
 #ifdef FLASHINFER_ENABLE_BF16

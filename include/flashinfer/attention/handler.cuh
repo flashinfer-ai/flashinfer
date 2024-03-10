@@ -17,15 +17,28 @@
 #define FLASHINFER_HANDLER_CUH_
 
 #include <memory>
-#include <mutex>
 #include <unordered_map>
 #include <vector>
 
 #include "../pos_enc.cuh"
 #include "../utils.cuh"
-#include "decode.cuh"
 
 namespace flashinfer {
+
+template <PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeOut,
+          typename IdType>
+cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
+    uint32_t& tmp_size, uint32_t& max_grid_size, uint32_t& max_num_pages_per_batch,
+    uint32_t& new_batch_size, uint32_t batch_size, IdType* kv_indptr, const uint32_t num_qo_heads,
+    const uint32_t num_kv_heads, const uint32_t head_dim, const uint32_t page_size,
+    const PosEncodingMode pos_encoding_mode, cudaStream_t stream);
+
+template <typename IdType>
+cudaError_t PartitionPagedKVCacheComputeAuxiliaryInfo(
+    const uint32_t max_num_pages_per_batch, const uint32_t old_batch_size, const uint32_t page_size,
+    IdType* old_indptr, IdType* old_last_page_len, IdType* new_indptr_d,
+    IdType* new_last_page_len_d, IdType* chunk_indptr_d, IdType* batch_idx_map_d,
+    IdType* chunk_start_d, IdType* seq_lens_before_partition_d, cudaStream_t stream);
 
 struct AlignedAlloactor {
   void* ptr;

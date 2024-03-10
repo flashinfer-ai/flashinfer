@@ -1098,8 +1098,8 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
     IdType* __restrict__ tile_indices, IdType* __restrict__ qo_indptr, DTypeIn* __restrict__ k,
     DTypeIn* __restrict__ v, IdType* __restrict__ kv_indptr, IdType* __restrict__ q_offset,
     IdType* __restrict__ k_rope_pos_offset, DTypeOut* __restrict__ o, float* __restrict__ tmp,
-    float* __restrict__ lse, const uint32_t batch_size, float sm_scale,
-    const float log2_rope_rcp_scale, const float log2_rope_rcp_theta) {
+    float* __restrict__ lse, uint32_t batch_size, float sm_scale, float log2_rope_rcp_scale,
+    float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
   sm_scale *= math::log2e;
@@ -1305,8 +1305,8 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
     IdType* __restrict__ request_indices, IdType* __restrict__ tile_indices,
     DTypeIn* __restrict__ q, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
     IdType* __restrict__ qo_indptr, IdType* __restrict__ q_offset, DTypeOut* __restrict__ o,
-    float* __restrict__ tmp, float* __restrict__ lse, float sm_scale,
-    const float log2_rope_rcp_scale, const float log2_rope_rcp_theta) {
+    float* __restrict__ tmp, float* __restrict__ lse, float sm_scale, float log2_rope_rcp_scale,
+    float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
   sm_scale *= math::log2e;
@@ -1907,130 +1907,6 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
   return cudaSuccess;
 }
 
-template <typename DTypeIn, typename DTypeOut, typename IdType>
-cudaError_t BatchPrefillWithRaggedKVCache(
-    DTypeIn* q, IdType* qo_indptr, DTypeIn* k, DTypeIn* v, IdType* kv_indptr, IdType* q_offset,
-    IdType* k_rope_pos_offset, DTypeOut* o, float* tmp, float* lse, const uint32_t batch_size,
-    const uint32_t num_qo_heads, const uint32_t num_kv_heads, const uint32_t head_dim,
-    bool causal = true, QKVLayout kv_layout = QKVLayout::kNHD,
-    PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
-    bool allow_fp16_qk_reduction = false, std::optional<float> maybe_sm_scale = std::nullopt,
-    const float rope_scale = 1.f, const float rope_theta = 1e4, cudaStream_t stream = nullptr) {
-  const uint32_t group_size = num_qo_heads / num_kv_heads;
-  const float sm_scale = maybe_sm_scale.value_or(1.f / std::sqrt(float(head_dim)));
-
-  uint32_t num_frags_x, num_qo_tiles;
-  std::vector<IdType> request_indices_h, tile_indices_h;
-  std::tie(num_frags_x, num_qo_tiles, request_indices_h, tile_indices_h) =
-      split_qo_indptr(qo_indptr, batch_size, group_size, head_dim, stream);
-
-  IdType* request_indices_d;
-  IdType* tile_indices_d;
-
-  FLASHINFER_CUDA_CALL(
-      cudaMallocAsync(&request_indices_d, sizeof(IdType) * request_indices_h.size(), stream));
-  FLASHINFER_CUDA_CALL(
-      cudaMallocAsync(&tile_indices_d, sizeof(IdType) * tile_indices_h.size(), stream));
-  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(request_indices_d, request_indices_h.data(),
-                                       sizeof(IdType) * request_indices_h.size(),
-                                       cudaMemcpyHostToDevice, stream));
-  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(tile_indices_d, tile_indices_h.data(),
-                                       sizeof(IdType) * tile_indices_h.size(),
-                                       cudaMemcpyHostToDevice, stream));
-
-  DISPATCH_LAYOUT(
-      kv_layout, KV_LAYOUT,
-      {DISPATCH_NUM_FRAGS_X(
-          num_frags_x, NUM_FRAGS_X,
-          {DISPATCH_ALLOW_FP16_QK_REDUCTION(
-              allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
-              {DISPATCH_GQA_GROUP_SIZE(
-                  num_qo_heads / num_kv_heads, GROUP_SIZE,
-                  {DISPATCH_CAUSAL(
-                      causal, CAUSAL,
-                      {DISPATCH_HEAD_DIM(
-                          head_dim, HEAD_DIM,
-                          {DISPATCH_POS_ENCODING_MODE(pos_encoding_mode, pos_encoding_mode, {
-                            return BatchPrefillWithRaggedKVCacheDispatched<
-                                NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM, KV_LAYOUT, pos_encoding_mode,
-                                ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
-                                q, request_indices_d, tile_indices_d, qo_indptr, k, v, kv_indptr,
-                                q_offset, k_rope_pos_offset, o, tmp, lse, batch_size, num_qo_tiles,
-                                num_kv_heads, sm_scale, rope_scale, rope_theta, stream);
-                          })})})})})})});
-
-  FLASHINFER_CUDA_CALL(cudaFreeAsync(request_indices_d, stream));
-  FLASHINFER_CUDA_CALL(cudaFreeAsync(tile_indices_d, stream));
-  return cudaSuccess;
-}
-
-/*!
- * \brief Fallback implementation of FlashAttention prefill CUDA function for multiple requests,
- * \tparam page_storage Whether to store indices or pointers of each active page
- * \tparam DTypeIn The data type of input
- * \tparam DTypeOut The data type of output
- * \tparam IdType The data type of index
- * \param q The query tensor.
- * \param paged_kv The paged kv-cache data structure.
- * \param qo_indptr The index pointer of queries.
- * \param o The output tensor.
- * \param tmp The temporary storage (only used for cooperative kernel).
- * \param lse The logsumexp value.
- * \param num_qo_heads The number of query and output heads.
- * \param causal Whether to use causal attention.
- * \param pos_encoding_mode The positional encoding mode.
- * \param allow_fp16_qk_reduction Whether to allow accumulating q*k^T with fp16.
- * \param rope_scale The scaling factor used in RoPE interpolation.
- * \param rope_theta The theta used in RoPE.
- * \param stream The cuda stream to execute the kernel on.
- * \return status Indicates whether CUDA calls are successful
- * \note This implementation executes requests one by one, which is not efficient.
- */
-template <PageStorage page_storage, QKVLayout kv_layout, uint32_t num_frags_x, uint32_t GROUP_SIZE,
-          uint32_t HEAD_DIM, PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION,
-          bool CAUSAL, typename DTypeIn, typename DTypeOut, typename IdType>
-cudaError_t BatchPrefillWithPagedKVCacheFallbackDispatched(
-    DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, IdType* q_offset,
-    paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, DTypeOut* o, float* tmp,
-    float* lse, uint32_t num_qo_tiles, std::optional<float> maybe_sm_scale = std::nullopt,
-    float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {
-  constexpr QKVLayout KV_LAYOUT = QKVLayout::kNHD;
-  const uint32_t num_kv_heads = paged_kv.num_heads;
-  const uint32_t head_dim = paged_kv.head_dim;
-  const uint32_t batch_size = paged_kv.batch_size;
-  const float sm_scale = maybe_sm_scale.value_or(1.f / std::sqrt(float(head_dim)));
-
-  std::vector<IdType> kv_indptr_h(paged_kv.batch_size + 1);
-
-  FLASHINFER_CUDA_CALL(PagedKVCacheToRaggedTensorComputeIndptr(paged_kv, kv_indptr_h, stream));
-  uint32_t nnz = kv_indptr_h.back();
-
-  DTypeIn *keys = nullptr, *values = nullptr;
-  IdType* kv_indptr = nullptr;
-  FLASHINFER_CUDA_CALL(
-      cudaMallocAsync(&keys, nnz * num_kv_heads * head_dim * sizeof(DTypeIn), stream));
-  FLASHINFER_CUDA_CALL(
-      cudaMallocAsync(&values, nnz * num_kv_heads * head_dim * sizeof(DTypeIn), stream));
-  FLASHINFER_CUDA_CALL(cudaMallocAsync(&kv_indptr, (batch_size + 1) * sizeof(IdType), stream));
-  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(kv_indptr, kv_indptr_h.data(),
-                                       sizeof(IdType) * (paged_kv.batch_size + 1),
-                                       cudaMemcpyHostToDevice, stream));
-  FLASHINFER_CUDA_CALL(PagedKVCacheToRaggedTensor(paged_kv, keys, values, kv_indptr, stream));
-
-  BatchPrefillWithRaggedKVCacheDispatched<num_frags_x, GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
-                                          pos_encoding_mode, ALLOW_FP16_QK_REDUCTION, CAUSAL,
-                                          DTypeIn, DTypeOut, IdType>(
-      q, request_indices, tile_indices, qo_indptr, keys, values, kv_indptr, q_offset,
-      paged_kv.rope_pos_offset, o, tmp, lse, batch_size, num_qo_tiles, num_kv_heads, sm_scale,
-      rope_scale, rope_theta, stream);
-
-  FLASHINFER_CUDA_CALL(cudaFreeAsync(keys, stream));
-  FLASHINFER_CUDA_CALL(cudaFreeAsync(values, stream));
-  FLASHINFER_CUDA_CALL(cudaFreeAsync(kv_indptr, stream));
-
-  return cudaSuccess;
-}
-
 template <PageStorage page_storage, QKVLayout kv_layout, uint32_t num_frags_x, uint32_t PAGE_SIZE,
           uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PosEncodingMode pos_encoding_mode,
           bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL, typename DTypeIn, typename DTypeOut,
@@ -2104,81 +1980,6 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
       FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
     }
   });
-  return cudaSuccess;
-}
-
-template <PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeOut,
-          typename IdType>
-cudaError_t BatchPrefillWithPagedKVCache(
-    DTypeIn* q, IdType* qo_indptr, IdType* q_offset,
-    paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, DTypeOut* o, float* tmp,
-    float* lse, uint32_t num_qo_heads, bool causal = true,
-    PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
-    bool allow_fp16_qk_reduction = false, std::optional<float> maybe_sm_scale = std::nullopt,
-    float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {
-  const uint32_t num_kv_heads = paged_kv.num_heads;
-  const uint32_t head_dim = paged_kv.head_dim;
-  const uint32_t batch_size = paged_kv.batch_size;
-  const uint32_t group_size = num_qo_heads / num_kv_heads;
-  const float sm_scale = maybe_sm_scale.value_or(1.f / std::sqrt(float(head_dim)));
-
-  uint32_t num_frags_x, num_qo_tiles;
-  std::vector<IdType> request_indices_h, tile_indices_h;
-  std::tie(num_frags_x, num_qo_tiles, request_indices_h, tile_indices_h) =
-      split_qo_indptr(qo_indptr, batch_size, group_size, head_dim, stream);
-
-  IdType* request_indices_d;
-  IdType* tile_indices_d;
-
-  FLASHINFER_CUDA_CALL(
-      cudaMallocAsync(&request_indices_d, sizeof(IdType) * request_indices_h.size(), stream));
-  FLASHINFER_CUDA_CALL(
-      cudaMallocAsync(&tile_indices_d, sizeof(IdType) * tile_indices_h.size(), stream));
-  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(request_indices_d, request_indices_h.data(),
-                                       sizeof(IdType) * request_indices_h.size(),
-                                       cudaMemcpyHostToDevice, stream));
-  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(tile_indices_d, tile_indices_h.data(),
-                                       sizeof(IdType) * tile_indices_h.size(),
-                                       cudaMemcpyHostToDevice, stream));
-
-  DISPATCH_NUM_FRAGS_X(
-      num_frags_x, NUM_FRAGS_X,
-      {DISPATCH_ALLOW_FP16_QK_REDUCTION(
-          allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
-          {DISPATCH_GQA_GROUP_SIZE(
-              group_size, GROUP_SIZE,
-              {DISPATCH_CAUSAL(
-                  causal, CAUSAL,
-                  {DISPATCH_HEAD_DIM(
-                      head_dim, HEAD_DIM,
-                      {DISPATCH_POS_ENCODING_MODE(
-                          pos_encoding_mode, pos_encoding_mode,
-                          {DISPATCH_PAGE_SIZE(
-                              paged_kv.page_size, PAGE_SIZE,
-                              {
-                                if constexpr (PAGE_SIZE == 0) {
-                                  return BatchPrefillWithPagedKVCacheFallbackDispatched<
-                                      page_storage, kv_layout, NUM_FRAGS_X, GROUP_SIZE, HEAD_DIM,
-                                      pos_encoding_mode, ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn,
-                                      DTypeOut, IdType>(q, request_indices_d, tile_indices_d,
-                                                        qo_indptr, q_offset, paged_kv, o, tmp, lse,
-                                                        num_qo_tiles, sm_scale, rope_scale,
-                                                        rope_theta, stream);
-                                } else {
-                                  return BatchPrefillWithPagedKVCacheDispatched<
-                                      page_storage, kv_layout, NUM_FRAGS_X, PAGE_SIZE, GROUP_SIZE,
-                                      HEAD_DIM, pos_encoding_mode, ALLOW_FP16_QK_REDUCTION, CAUSAL,
-                                      DTypeIn, DTypeOut, IdType>(
-                                      q, request_indices_d, tile_indices_d, qo_indptr, q_offset,
-                                      paged_kv, o, tmp, lse, num_qo_tiles, sm_scale, rope_scale,
-                                      rope_theta, stream);
-                                }
-                              })
-
-                          })})})})})});
-
-  FLASHINFER_CUDA_CALL(cudaFreeAsync(request_indices_d, stream));
-  FLASHINFER_CUDA_CALL(cudaFreeAsync(tile_indices_d, stream));
   return cudaSuccess;
 }
 

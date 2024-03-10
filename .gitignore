@@ -1,4 +1,5 @@
 # Generated cu files
+src/generated/
 python/csrc/generated/
 python/flashinfer/_build_meta.py
 
