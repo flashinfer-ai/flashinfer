@@ -73,7 +73,30 @@ jobs:
         with:
           tag_name: ${{ inputs.tag_name }}
           files: |
-            python/dist/flashinfer-*.whl
+            python/dist/flashinfer.*cp38.*.whl
+
+      - uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          files: |
+            python/dist/flashinfer.*cp39.*.whl
+
+      - uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          files: |
+            python/dist/flashinfer.*cp310.*.whl
+
+      - uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          files: |
+            python/dist/flashinfer.*cp311.*.whl
+
+      - uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          files: |
             python/dist/flashinfer-*.tar.gz
 
       - name: Clone wheel index

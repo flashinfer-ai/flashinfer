@@ -349,6 +349,7 @@ def remove_unwanted_pytorch_nvcc_flags():
         except ValueError:
             pass
 
+
 class NinjaBuildExtension(torch_cpp_ext.BuildExtension):
     def __init__(self, *args, **kwargs) -> None:
         # do not override env MAX_JOBS if already exists
@@ -357,6 +358,7 @@ class NinjaBuildExtension(torch_cpp_ext.BuildExtension):
             os.environ["MAX_JOBS"] = str(max_num_jobs_cores)
 
         super().__init__(*args, **kwargs)
+
 
 if __name__ == "__main__":
     remove_unwanted_pytorch_nvcc_flags()
@@ -380,7 +382,14 @@ if __name__ == "__main__":
             ],
             extra_compile_args={
                 "cxx": ["-O3"],
-                "nvcc": ["-O3", "-std=c++17", "--threads", "8", "-Xfatbin", "-compress-all"],
+                "nvcc": [
+                    "-O3",
+                    "-std=c++17",
+                    "--threads",
+                    "8",
+                    "-Xfatbin",
+                    "-compress-all",
+                ],
             },
         )
     )
