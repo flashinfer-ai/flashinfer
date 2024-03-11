@@ -265,6 +265,7 @@ def get_instantiation_cu() -> List[str]:
                 dtype,
                 dtype,
                 idtype,
+                page_size_choices=[1, 16, 32],
             )
             write_if_different(root / prefix / fname, content)
 
@@ -378,9 +379,8 @@ if __name__ == "__main__":
                 str(root.resolve() / "include"),
             ],
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"],
-                "nvcc": ["-O3", "-std=c++17", "--threads", "8", "-gencode", "arch=compute_80,code=sm_80",
-                         "-gencode", "arch=compute_89,code=sm_89", "-gencode", "arch=compute_90,code=sm_90"],
+                "cxx": ["-O3"],
+                "nvcc": ["-O3", "-std=c++17", "--threads", "8", "-Xfatbin", "-compress-all"],
             },
         )
     )

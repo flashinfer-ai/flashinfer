@@ -36,9 +36,9 @@ def get_cu_file_str(
     dtype_in,
     dtype_out,
     idtype,
+    page_size_choices=[1, 8, 16, 32],
 ):
     num_frags_x_choices = [1, 2]
-    page_size_choices = [1, 8, 16, 32]
     insts = "\n".join(
         [
             """template cudaError_t BatchPrefillWithPagedKVCacheDispatched<page_storage, {kv_layout}, {num_frags_x}, {page_size}, {group_size}, {head_dim}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {causal}, {dtype_in}, {dtype_out}, {idtype}>(
