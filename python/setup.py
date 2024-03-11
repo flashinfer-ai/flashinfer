@@ -49,6 +49,15 @@ if enable_fp8:
     torch_cpp_ext.COMMON_NVCC_FLAGS.append("-DFLASHINFER_ENABLE_FP8")
 
 
+def write_if_different(path: pathlib.Path, content: str) -> None:
+    if path.exists():
+        with open(path, "r") as f:
+            if f.read() == content:
+                return
+    with open(path, "w") as f:
+        f.write(content)
+
+
 def get_instantiation_cu() -> List[str]:
     prefix = "csrc/generated"
     (root / prefix).mkdir(parents=True, exist_ok=True)
@@ -101,33 +110,29 @@ def get_instantiation_cu() -> List[str]:
         for dtype in decode_dtypes:
             fname = f"single_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypein_{dtype}_dtypeout_{dtype}.cu"
             files.append(prefix + "/" + fname)
-            with open(root / prefix / fname, "w") as f:
-                f.write(
-                    generate_single_decode_inst.get_cu_file_str(
-                        group_size,
-                        head_dim,
-                        kv_layout,
-                        pos_encoding_mode,
-                        dtype,
-                        dtype,
-                    )
-                )
+            content = generate_single_decode_inst.get_cu_file_str(
+                group_size,
+                head_dim,
+                kv_layout,
+                pos_encoding_mode,
+                dtype,
+                dtype,
+            )
+            write_if_different(root / prefix / fname, content)
 
         for dtype_in in fp8_dtypes:
             dtype_out = "f16"
             fname = f"single_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypein_{dtype_in}_dtypeout_{dtype_out}.cu"
             files.append(prefix + "/" + fname)
-            with open(root / prefix / fname, "w") as f:
-                f.write(
-                    generate_single_decode_inst.get_cu_file_str(
-                        group_size,
-                        head_dim,
-                        kv_layout,
-                        pos_encoding_mode,
-                        dtype_in,
-                        dtype_out,
-                    )
-                )
+            content = generate_single_decode_inst.get_cu_file_str(
+                group_size,
+                head_dim,
+                kv_layout,
+                pos_encoding_mode,
+                dtype_in,
+                dtype_out,
+            )
+            write_if_different(root / prefix / fname, content)
 
     # batch decode files
     for (
@@ -145,64 +150,58 @@ def get_instantiation_cu() -> List[str]:
             for dtype in decode_dtypes:
                 fname = f"batch_paged_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypein_{dtype}_dtypeout_{dtype}_idtype_{idtype}.cu"
                 files.append(prefix + "/" + fname)
-                with open(root / prefix / fname, "w") as f:
-                    f.write(
-                        generate_batch_paged_decode_inst.get_cu_file_str(
-                            group_size,
-                            head_dim,
-                            kv_layout,
-                            pos_encoding_mode,
-                            dtype,
-                            dtype,
-                            idtype,
-                        )
-                    )
-
-            for dtype_in in fp8_dtypes:
-                dtype_out = "f16"
-                fname = f"batch_paged_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypein_{dtype_in}_dtypeout_{dtype_out}_idtype_{idtype}.cu"
-                files.append(prefix + "/" + fname)
-                with open(root / prefix / fname, "w") as f:
-                    f.write(
-                        generate_batch_paged_decode_inst.get_cu_file_str(
-                            group_size,
-                            head_dim,
-                            kv_layout,
-                            pos_encoding_mode,
-                            dtype_in,
-                            dtype_out,
-                            idtype,
-                        )
-                    )
-
-        fname = f"batch_padded_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypein_{dtype}_dtypeout_{dtype}.cu"
-        files.append(prefix + "/" + fname)
-        with open(root / prefix / fname, "w") as f:
-            f.write(
-                generate_batch_padded_decode_inst.get_cu_file_str(
+                content = generate_batch_paged_decode_inst.get_cu_file_str(
                     group_size,
                     head_dim,
                     kv_layout,
                     pos_encoding_mode,
                     dtype,
                     dtype,
+                    idtype,
                 )
+                write_if_different(root / prefix / fname, content)
+
+            for dtype_in in fp8_dtypes:
+                dtype_out = "f16"
+                fname = f"batch_paged_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypein_{dtype_in}_dtypeout_{dtype_out}_idtype_{idtype}.cu"
+                files.append(prefix + "/" + fname)
+                content = generate_batch_paged_decode_inst.get_cu_file_str(
+                    group_size,
+                    head_dim,
+                    kv_layout,
+                    pos_encoding_mode,
+                    dtype_in,
+                    dtype_out,
+                    idtype,
+                )
+                write_if_different(root / prefix / fname, content)
+
+        for dtype in decode_dtypes:
+            fname = f"batch_padded_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypein_{dtype}_dtypeout_{dtype}.cu"
+            files.append(prefix + "/" + fname)
+            content = generate_batch_padded_decode_inst.get_cu_file_str(
+                group_size,
+                head_dim,
+                kv_layout,
+                pos_encoding_mode,
+                dtype,
+                dtype,
             )
+            write_if_different(root / prefix / fname, content)
+
         for dtype_in in fp8_dtypes:
             dtype_out = "f16"
             fname = f"batch_padded_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypein_{dtype_in}_dtypeout_{dtype_out}.cu"
             files.append(prefix + "/" + fname)
-            with open(root / prefix / fname, "w") as f:
-                f.write(
-                    generate_batch_padded_decode_inst.get_cu_file_str(
-                        group_size,
-                        head_dim,
-                        kv_layout,
-                        pos_encoding_mode,
-                        dtype_in,
-                        dtype_out,
-                    )
-                )
+            content = generate_batch_padded_decode_inst.get_cu_file_str(
+                group_size,
+                head_dim,
+                kv_layout,
+                pos_encoding_mode,
+                dtype_in,
+                dtype_out,
+            )
+            write_if_different(root / prefix / fname, content)
 
     # single prefill files
     for (
@@ -223,19 +222,17 @@ def get_instantiation_cu() -> List[str]:
         for dtype in prefill_dtypes:
             fname = f"single_prefill_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_causal_{causal}_dtypein_{dtype}_dtypeout_{dtype}.cu"
             files.append(prefix + "/" + fname)
-            with open(root / prefix / fname, "w") as f:
-                f.write(
-                    generate_single_prefill_inst.get_cu_file_str(
-                        group_size,
-                        head_dim,
-                        kv_layout,
-                        pos_encoding_mode,
-                        allow_fp16_qk_reduction,
-                        causal,
-                        dtype,
-                        dtype,
-                    )
-                )
+            content = generate_single_prefill_inst.get_cu_file_str(
+                group_size,
+                head_dim,
+                kv_layout,
+                pos_encoding_mode,
+                allow_fp16_qk_reduction,
+                causal,
+                dtype,
+                dtype,
+            )
+            write_if_different(root / prefix / fname, content)
 
     # batch paged prefill files
     for (
@@ -258,20 +255,18 @@ def get_instantiation_cu() -> List[str]:
         for dtype in prefill_dtypes:
             fname = f"batch_paged_prefill_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_causal_{causal}_dtypein_{dtype}_dtypeout_{dtype}_idtype_{idtype}.cu"
             files.append(prefix + "/" + fname)
-            with open(root / prefix / fname, "w") as f:
-                f.write(
-                    generate_batch_paged_prefill_inst.get_cu_file_str(
-                        group_size,
-                        head_dim,
-                        kv_layout,
-                        pos_encoding_mode,
-                        allow_fp16_qk_reduction,
-                        causal,
-                        dtype,
-                        dtype,
-                        idtype,
-                    )
-                )
+            content = generate_batch_paged_prefill_inst.get_cu_file_str(
+                group_size,
+                head_dim,
+                kv_layout,
+                pos_encoding_mode,
+                allow_fp16_qk_reduction,
+                causal,
+                dtype,
+                dtype,
+                idtype,
+            )
+            write_if_different(root / prefix / fname, content)
 
     # batch ragged prefill files
     for (
@@ -294,20 +289,18 @@ def get_instantiation_cu() -> List[str]:
         for dtype in prefill_dtypes:
             fname = f"batch_ragged_prefill_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_causal_{causal}_dtypein_{dtype}_dtypeout_{dtype}_idtype_{idtype}.cu"
             files.append(prefix + "/" + fname)
-            with open(root / prefix / fname, "w") as f:
-                f.write(
-                    generate_batch_ragged_prefill_inst.get_cu_file_str(
-                        group_size,
-                        head_dim,
-                        kv_layout,
-                        pos_encoding_mode,
-                        allow_fp16_qk_reduction,
-                        causal,
-                        dtype,
-                        dtype,
-                        idtype,
-                    )
-                )
+            content = generate_batch_ragged_prefill_inst.get_cu_file_str(
+                group_size,
+                head_dim,
+                kv_layout,
+                pos_encoding_mode,
+                allow_fp16_qk_reduction,
+                causal,
+                dtype,
+                dtype,
+                idtype,
+            )
+            write_if_different(root / prefix / fname, content)
 
     return files
 
