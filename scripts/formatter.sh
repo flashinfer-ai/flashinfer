@@ -5,3 +5,4 @@ find src/ -regex '.*\.\(h\|cuh\|cu\|cc\)' | xargs clang-format -i
 find python/ -regex '.*\.\(h\|cuh\|cu\|cc\)' | xargs clang-format -i
 echo "Formatting Python files"
 find python/ -regex '.*\.\(py\)' | xargs black
+

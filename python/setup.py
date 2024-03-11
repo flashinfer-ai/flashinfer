@@ -27,6 +27,8 @@ import setuptools
 import torch
 import torch.utils.cpp_extension as torch_cpp_ext
 
+import generate_single_decode_inst, generate_single_prefill_inst, generate_batch_paged_decode_inst, generate_batch_padded_decode_inst, generate_batch_paged_prefill_inst, generate_batch_ragged_prefill_inst
+
 root = pathlib.Path(__name__).parent
 
 enable_bf16 = True
@@ -47,21 +49,29 @@ if enable_fp8:
     torch_cpp_ext.COMMON_NVCC_FLAGS.append("-DFLASHINFER_ENABLE_FP8")
 
 
+def write_if_different(path: pathlib.Path, content: str) -> None:
+    if path.exists():
+        with open(path, "r") as f:
+            if f.read() == content:
+                return
+    with open(path, "w") as f:
+        f.write(content)
+
+
 def get_instantiation_cu() -> List[str]:
     prefix = "csrc/generated"
     (root / prefix).mkdir(parents=True, exist_ok=True)
-    dtypes = {"fp16": "nv_half"}
-    if enable_bf16:
-        dtypes["bf16"] = "nv_bfloat16"
+
     group_sizes = os.environ.get("FLASHINFER_GROUP_SIZES", "1,4,8").split(",")
     head_dims = os.environ.get("FLASHINFER_HEAD_DIMS", "64,128,256").split(",")
-    group_sizes = [int(x) for x in group_sizes]
-    head_dims = [int(x) for x in head_dims]
-    causal_options = [False, True]
-    allow_fp16_qk_reduction_options = [False, True]
-    layout_options = ["HND", "NHD"]
-    pos_encoding_mode_options = ["None", "RoPELlama", "ALiBi"]
-
+    kv_layouts = os.environ.get("FLASHINFER_KV_LAYOUTS", "0,1").split(",")
+    pos_encoding_modes = os.environ.get("FLASHINFER_POS_ENCODING_MODES", "0,1,2").split(
+        ","
+    )
+    allow_fp16_qk_reduction_options = os.environ.get(
+        "FLASHINFER_ALLOW_FP16_QK_REDUCTION_OPTIONS", "0,1"
+    ).split(",")
+    causal_options = os.environ.get("FLASHINFER_CAUSAL_OPTIONS", "0,1").split(",")
     # dispatch.inc
     path = root / prefix / "dispatch.inc"
     if not path.exists():
@@ -77,83 +87,220 @@ def get_instantiation_cu() -> List[str]:
             f.write("// EOL\n")
             f.write("\n")
 
+    idtypes = ["i32"]
+    prefill_dtypes = ["f16"]
+    if enable_bf16:
+        prefill_dtypes.append("bf16")
+    decode_dtypes = ["f16", "bf16"]
+    fp8_dtypes = ["e4m3", "e5m2"]
+
     files = []
+    # single decode files
     for (
         group_size,
         head_dim,
-        dtype,
-        causal,
-        allow_fp16_qk_reduction,
-        layout,
+        kv_layout,
         pos_encoding_mode,
     ) in itertools.product(
         group_sizes,
         head_dims,
-        dtypes,
-        causal_options,
-        allow_fp16_qk_reduction_options,
-        layout_options,
-        pos_encoding_mode_options,
+        kv_layouts,
+        pos_encoding_modes,
     ):
-        # paged batch prefill
-        fname = f"paged_batch_prefill_group{group_size}_head{head_dim}_causal{causal}_fp16qk{allow_fp16_qk_reduction}_layout{layout}_pe{pos_encoding_mode}_{dtype}.cu"
-        files.append(prefix + "/" + fname)
-        if not (root / prefix / fname).exists():
-            with open(root / prefix / fname, "w") as f:
-                f.write('#include "../flashinfer_decl.h"\n\n')
-                f.write(f"#include <flashinfer.cuh>\n\n")
-                f.write(f"using namespace flashinfer;\n\n")
-                f.write(
-                    "INST_BatchPrefillPagedWrapper({}, {}, {}, {}, {}, {}, {})\n".format(
-                        dtypes[dtype],
-                        group_size,
-                        head_dim,
-                        str(causal).lower(),
-                        str(allow_fp16_qk_reduction).lower(),
-                        "QKVLayout::k" + layout,
-                        "PosEncodingMode::k" + pos_encoding_mode,
-                    )
-                )
+        for dtype in decode_dtypes:
+            fname = f"single_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypein_{dtype}_dtypeout_{dtype}.cu"
+            files.append(prefix + "/" + fname)
+            content = generate_single_decode_inst.get_cu_file_str(
+                group_size,
+                head_dim,
+                kv_layout,
+                pos_encoding_mode,
+                dtype,
+                dtype,
+            )
+            write_if_different(root / prefix / fname, content)
 
-        # ragged batch prefill
-        fname = f"ragged_batch_prefill_group{group_size}_head{head_dim}_causal{causal}_fp16qk{allow_fp16_qk_reduction}_layout{layout}_pe{pos_encoding_mode}_{dtype}.cu"
-        files.append(prefix + "/" + fname)
-        if not (root / prefix / fname).exists():
-            with open(root / prefix / fname, "w") as f:
-                f.write('#include "../flashinfer_decl.h"\n\n')
-                f.write(f"#include <flashinfer.cuh>\n\n")
-                f.write(f"using namespace flashinfer;\n\n")
-                f.write(
-                    "INST_BatchPrefillRaggedWrapper({}, {}, {}, {}, {}, {}, {})\n".format(
-                        dtypes[dtype],
-                        group_size,
-                        head_dim,
-                        str(causal).lower(),
-                        str(allow_fp16_qk_reduction).lower(),
-                        "QKVLayout::k" + layout,
-                        "PosEncodingMode::k" + pos_encoding_mode,
-                    )
-                )
+        for dtype_in in fp8_dtypes:
+            dtype_out = "f16"
+            fname = f"single_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypein_{dtype_in}_dtypeout_{dtype_out}.cu"
+            files.append(prefix + "/" + fname)
+            content = generate_single_decode_inst.get_cu_file_str(
+                group_size,
+                head_dim,
+                kv_layout,
+                pos_encoding_mode,
+                dtype_in,
+                dtype_out,
+            )
+            write_if_different(root / prefix / fname, content)
 
-        # single prefill
-        fname = f"single_prefill_group{group_size}_head{head_dim}_causal{causal}_fp16qk{allow_fp16_qk_reduction}_layout{layout}_pe{pos_encoding_mode}_{dtype}.cu"
-        files.append(prefix + "/" + fname)
-        if not (root / prefix / fname).exists():
-            with open(root / prefix / fname, "w") as f:
-                f.write('#include "../flashinfer_decl.h"\n\n')
-                f.write(f"#include <flashinfer.cuh>\n\n")
-                f.write(f"using namespace flashinfer;\n\n")
-                f.write(
-                    "INST_SinglePrefill({}, {}, {}, {}, {}, {}, {})\n".format(
-                        dtypes[dtype],
-                        group_size,
-                        head_dim,
-                        str(causal).lower(),
-                        str(allow_fp16_qk_reduction).lower(),
-                        "QKVLayout::k" + layout,
-                        "PosEncodingMode::k" + pos_encoding_mode,
-                    )
+    # batch decode files
+    for (
+        group_size,
+        head_dim,
+        kv_layout,
+        pos_encoding_mode,
+    ) in itertools.product(
+        group_sizes,
+        head_dims,
+        kv_layouts,
+        pos_encoding_modes,
+    ):
+        for idtype in idtypes:
+            for dtype in decode_dtypes:
+                fname = f"batch_paged_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypein_{dtype}_dtypeout_{dtype}_idtype_{idtype}.cu"
+                files.append(prefix + "/" + fname)
+                content = generate_batch_paged_decode_inst.get_cu_file_str(
+                    group_size,
+                    head_dim,
+                    kv_layout,
+                    pos_encoding_mode,
+                    dtype,
+                    dtype,
+                    idtype,
                 )
+                write_if_different(root / prefix / fname, content)
+
+            for dtype_in in fp8_dtypes:
+                dtype_out = "f16"
+                fname = f"batch_paged_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypein_{dtype_in}_dtypeout_{dtype_out}_idtype_{idtype}.cu"
+                files.append(prefix + "/" + fname)
+                content = generate_batch_paged_decode_inst.get_cu_file_str(
+                    group_size,
+                    head_dim,
+                    kv_layout,
+                    pos_encoding_mode,
+                    dtype_in,
+                    dtype_out,
+                    idtype,
+                )
+                write_if_different(root / prefix / fname, content)
+
+        for dtype in decode_dtypes:
+            fname = f"batch_padded_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypein_{dtype}_dtypeout_{dtype}.cu"
+            files.append(prefix + "/" + fname)
+            content = generate_batch_padded_decode_inst.get_cu_file_str(
+                group_size,
+                head_dim,
+                kv_layout,
+                pos_encoding_mode,
+                dtype,
+                dtype,
+            )
+            write_if_different(root / prefix / fname, content)
+
+        for dtype_in in fp8_dtypes:
+            dtype_out = "f16"
+            fname = f"batch_padded_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypein_{dtype_in}_dtypeout_{dtype_out}.cu"
+            files.append(prefix + "/" + fname)
+            content = generate_batch_padded_decode_inst.get_cu_file_str(
+                group_size,
+                head_dim,
+                kv_layout,
+                pos_encoding_mode,
+                dtype_in,
+                dtype_out,
+            )
+            write_if_different(root / prefix / fname, content)
+
+    # single prefill files
+    for (
+        group_size,
+        head_dim,
+        kv_layout,
+        pos_encoding_mode,
+        allow_fp16_qk_reduction,
+        causal,
+    ) in itertools.product(
+        group_sizes,
+        head_dims,
+        kv_layouts,
+        pos_encoding_modes,
+        allow_fp16_qk_reduction_options,
+        causal_options,
+    ):
+        for dtype in prefill_dtypes:
+            fname = f"single_prefill_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_causal_{causal}_dtypein_{dtype}_dtypeout_{dtype}.cu"
+            files.append(prefix + "/" + fname)
+            content = generate_single_prefill_inst.get_cu_file_str(
+                group_size,
+                head_dim,
+                kv_layout,
+                pos_encoding_mode,
+                allow_fp16_qk_reduction,
+                causal,
+                dtype,
+                dtype,
+            )
+            write_if_different(root / prefix / fname, content)
+
+    # batch paged prefill files
+    for (
+        group_size,
+        head_dim,
+        kv_layout,
+        pos_encoding_mode,
+        allow_fp16_qk_reduction,
+        causal,
+        idtype,
+    ) in itertools.product(
+        group_sizes,
+        head_dims,
+        kv_layouts,
+        pos_encoding_modes,
+        allow_fp16_qk_reduction_options,
+        causal_options,
+        idtypes,
+    ):
+        for dtype in prefill_dtypes:
+            fname = f"batch_paged_prefill_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_causal_{causal}_dtypein_{dtype}_dtypeout_{dtype}_idtype_{idtype}.cu"
+            files.append(prefix + "/" + fname)
+            content = generate_batch_paged_prefill_inst.get_cu_file_str(
+                group_size,
+                head_dim,
+                kv_layout,
+                pos_encoding_mode,
+                allow_fp16_qk_reduction,
+                causal,
+                dtype,
+                dtype,
+                idtype,
+            )
+            write_if_different(root / prefix / fname, content)
+
+    # batch ragged prefill files
+    for (
+        group_size,
+        head_dim,
+        kv_layout,
+        pos_encoding_mode,
+        allow_fp16_qk_reduction,
+        causal,
+        idtype,
+    ) in itertools.product(
+        group_sizes,
+        head_dims,
+        kv_layouts,
+        pos_encoding_modes,
+        allow_fp16_qk_reduction_options,
+        causal_options,
+        idtypes,
+    ):
+        for dtype in prefill_dtypes:
+            fname = f"batch_ragged_prefill_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_causal_{causal}_dtypein_{dtype}_dtypeout_{dtype}_idtype_{idtype}.cu"
+            files.append(prefix + "/" + fname)
+            content = generate_batch_ragged_prefill_inst.get_cu_file_str(
+                group_size,
+                head_dim,
+                kv_layout,
+                pos_encoding_mode,
+                allow_fp16_qk_reduction,
+                causal,
+                dtype,
+                dtype,
+                idtype,
+            )
+            write_if_different(root / prefix / fname, content)
 
     return files
 
