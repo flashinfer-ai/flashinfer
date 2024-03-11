@@ -18,7 +18,7 @@ on:
       #   required: true
 
 env:
-  TORCH_CUDA_ARCH_LIST: "8.0 8.6 8.9 9.0+PTX"
+  TORCH_CUDA_ARCH_LIST: "8.0 8.9 9.0+PTX"
 
 jobs:
   build:
