@@ -348,6 +348,14 @@ def remove_unwanted_pytorch_nvcc_flags():
         except ValueError:
             pass
 
+class NinjaBuildExtension(torch_cpp_ext.BuildExtension):
+    def __init__(self, *args, **kwargs) -> None:
+        # do not override env MAX_JOBS if already exists
+        if not os.environ.get("MAX_JOBS"):
+            max_num_jobs_cores = max(1, os.cpu_count() // 2)
+            os.environ["MAX_JOBS"] = str(max_num_jobs_cores)
+
+        super().__init__(*args, **kwargs)
 
 if __name__ == "__main__":
     remove_unwanted_pytorch_nvcc_flags()
@@ -370,8 +378,9 @@ if __name__ == "__main__":
                 str(root.resolve() / "include"),
             ],
             extra_compile_args={
-                "cxx": ["-O3"],
-                "nvcc": ["-O3"],
+                "cxx": ["-O3", "-std=c++17"],
+                "nvcc": ["-O3", "-std=c++17", "--threads", "8", "-gencode", "arch=compute_80,code=sm_80",
+                         "-gencode", "arch=compute_89,code=sm_89", "-gencode", "arch=compute_90,code=sm_90"],
             },
         )
     )
@@ -386,5 +395,5 @@ if __name__ == "__main__":
         url="https://github.com/flashinfer-ai/flashinfer",
         python_requires=">=3.8",
         ext_modules=ext_modules,
-        cmdclass={"build_ext": torch_cpp_ext.BuildExtension},
+        cmdclass={"build_ext": NinjaBuildExtension},
     )
