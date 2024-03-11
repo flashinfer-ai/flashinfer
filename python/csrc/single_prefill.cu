@@ -13,7 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "flashinfer_decl.h"
+#include <flashinfer/prefill_attention_decl.cuh>
+
 #include "flashinfer_ops.h"
 #include "pytorch_extension_utils.h"
 

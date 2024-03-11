@@ -20,29 +20,30 @@ from literal_map import (
     kv_layout_literal,
     pos_encoding_mode_literal,
     dtype_literal,
-    idtype_literal,
 )
 from pathlib import Path
 
 
 def get_cu_file_str(
-    group_size, head_dim, kv_layout, pos_encoding_mode, dtype_in, dtype_out, idtype
+    group_size,
+    head_dim,
+    kv_layout,
+    pos_encoding_mode,
+    dtype_in,
+    dtype_out,
 ):
     content = """#include <flashinfer/attention_impl.cuh>
 
-    namespace flashinfer {{
+namespace flashinfer {{
 
-    constexpr PageStorage page_storage = PageStorage::kIndices;
-
-    template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{group_size}, {head_dim}, page_storage, {kv_layout}, {pos_encoding_mode}, {dtype_in}, {dtype_out}, {idtype}>(
-    {dtype_in}* q, {idtype}* q_offset,
-    paged_kv_t<page_storage, {kv_layout}, {dtype_in}, {idtype}> paged_kv,
-    kv_partition_info_t<{idtype}> kv_partition_info,
+template cudaError_t BatchDecodeWithPaddedKVCacheDispatched<{group_size}, {head_dim}, {kv_layout}, {pos_encoding_mode}, {dtype_in}, {dtype_out}>(
+    {dtype_in}* q, {dtype_in}* k, {dtype_in}* v,
     {dtype_out}* o, {dtype_out}* tmp, float* lse,
+    uint32_t batch_size, uint32_t padded_kv_len, uint32_t num_qo_heads,
     float sm_scale, float rope_scale,
     float rope_theta, cudaStream_t stream);
 
-    }}
+}}
     """.format(
         kv_layout=kv_layout_literal[int(kv_layout)],
         group_size=group_size,
@@ -50,15 +51,14 @@ def get_cu_file_str(
         pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
         dtype_in=dtype_literal[dtype_in],
         dtype_out=dtype_literal[dtype_out],
-        idtype=idtype_literal[idtype],
     )
     return content
 
 
 if __name__ == "__main__":
     pattern = (
-        r"batch_decode_group_([0-9]+)_head_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
-        r"dtypein_([a-z0-9]+)_dtypeout_([a-z0-9]+)_idtype_([a-z0-9]+)\.cu"
+        r"batch_padded_decode_group_([0-9]+)_head_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
+        r"dtypein_([a-z0-9]+)_dtypeout_([a-z0-9]+)\.cu"
     )
 
     compiled_pattern = re.compile(pattern)

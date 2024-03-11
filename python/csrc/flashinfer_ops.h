@@ -19,10 +19,10 @@
 #include <flashinfer/attention/handler.cuh>
 #include <flashinfer/layout.cuh>
 
-namespace flashinfer {
-class BatchPrefillHandler;
-class BatchDecodeHandler;
-}  // namespace flashinfer
+// namespace flashinfer {
+// class BatchPrefillHandler;
+// class BatchDecodeHandler;
+// }  // namespace flashinfer
 
 torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                                           torch::Tensor tmp, unsigned int pos_encoding_mode,

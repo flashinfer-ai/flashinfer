@@ -110,13 +110,14 @@ foreach(group_size IN LISTS GROUP_SIZES)
   foreach(head_dim IN LISTS HEAD_DIMS)
     foreach(kv_layout IN LISTS KV_LAYOUTS)
       foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
+        # paged kv-cache
         foreach(idtype IN LISTS IDTYPES)
           foreach(dtype IN LISTS DECODE_DTYPES)
-            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
+            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
             add_custom_command(
               OUTPUT ${generated_kernel_src}
-              COMMAND python ${PROJECT_SOURCE_DIR}/python/generate_batch_decode_inst.py ${generated_kernel_src}
-              DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_decode_inst.py
+              COMMAND python ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_decode_inst.py ${generated_kernel_src}
+              DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_decode_inst.py
               COMMENT "Generating additional source file ${generated_kernel_src}"
               VERBATIM
             )
@@ -125,17 +126,43 @@ foreach(group_size IN LISTS GROUP_SIZES)
           
           # fp8 in, fp16 out
           foreach(dtype IN LISTS DECODE_FP8_DTYPES)
-            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_f16_idtype_${idtype}.cu)
+            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_f16_idtype_${idtype}.cu)
             add_custom_command(
               OUTPUT ${generated_kernel_src}
-              COMMAND python ${PROJECT_SOURCE_DIR}/python/generate_batch_decode_inst.py ${generated_kernel_src}
-              DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_decode_inst.py
+              COMMAND python ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_decode_inst.py ${generated_kernel_src}
+              DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_decode_inst.py
               COMMENT "Generating additional source file ${generated_kernel_src}"
               VERBATIM
             )
             list(APPEND batch_decode_kernels_src ${generated_kernel_src})
           endforeach()
         endforeach(idtype)
+
+        # padded kv-cache
+        foreach(dtype IN LISTS DECODE_DTYPES)
+          set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_padded_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_${dtype}.cu)
+          add_custom_command(
+            OUTPUT ${generated_kernel_src}
+            COMMAND python ${PROJECT_SOURCE_DIR}/python/generate_batch_padded_decode_inst.py ${generated_kernel_src}
+            DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_padded_decode_inst.py
+            COMMENT "Generating additional source file ${generated_kernel_src}"
+            VERBATIM
+          )
+          list(APPEND batch_decode_kernels_src ${generated_kernel_src})
+        endforeach(dtype)
+        
+        # padded kv-cache, fp8 in, fp16 out
+        foreach(dtype IN LISTS DECODE_FP8_DTYPES)
+          set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_padded_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_f16.cu)
+          add_custom_command(
+            OUTPUT ${generated_kernel_src}
+            COMMAND python ${PROJECT_SOURCE_DIR}/python/generate_batch_padded_decode_inst.py ${generated_kernel_src}
+            DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_padded_decode_inst.py
+            COMMENT "Generating additional source file ${generated_kernel_src}"
+            VERBATIM
+          )
+          list(APPEND batch_decode_kernels_src ${generated_kernel_src})
+        endforeach()
       endforeach(pos_encoding_mode)
     endforeach(kv_layout)
   endforeach(head_dim)

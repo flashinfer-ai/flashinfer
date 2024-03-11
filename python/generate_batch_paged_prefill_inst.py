@@ -24,7 +24,6 @@ from literal_map import (
     idtype_literal,
 )
 from pathlib import Path
-from typing import Optional
 
 
 def get_cu_file_str(
@@ -72,13 +71,13 @@ def get_cu_file_str(
 
     content = f"""#include <flashinfer/attention_impl.cuh>
 
-    namespace flashinfer {{
+namespace flashinfer {{
 
-    constexpr PageStorage page_storage = PageStorage::kIndices;
+constexpr PageStorage page_storage = PageStorage::kIndices;
 
-    {insts}
+{insts}
 
-    }}"""
+}}"""
     return content
 
 

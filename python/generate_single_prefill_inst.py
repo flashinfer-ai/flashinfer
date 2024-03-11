@@ -33,15 +33,15 @@ def get_cu_file_str(
 
     content = """#include <flashinfer/attention_impl.cuh>
 
-    namespace flashinfer {{
+namespace flashinfer {{
 
-    template cudaError_t SinglePrefillWithKVCacheDispatched<{group_size}, {head_dim}, {kv_layout}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {causal}, {dtype_in}, {dtype_out}>(
-        {dtype_in}* q, {dtype_in}* k, {dtype_in}* v, {dtype_out}* o,
-        float* tmp, float* lse, uint32_t num_kv_heads, uint32_t qo_len, uint32_t kv_len,
-        float sm_scale, float rope_scale,
-        float rope_theta, cudaStream_t stream);
+template cudaError_t SinglePrefillWithKVCacheDispatched<{group_size}, {head_dim}, {kv_layout}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {causal}, {dtype_in}, {dtype_out}>(
+    {dtype_in}* q, {dtype_in}* k, {dtype_in}* v, {dtype_out}* o,
+    float* tmp, float* lse, uint32_t num_kv_heads, uint32_t qo_len, uint32_t kv_len,
+    float sm_scale, float rope_scale,
+    float rope_theta, cudaStream_t stream);
 
-    }}
+}}
     """.format(
         kv_layout=kv_layout_literal[int(kv_layout)],
         group_size=group_size,
