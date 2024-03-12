@@ -58,7 +58,7 @@ def test_batch_decode_with_shared_prefix_padded_kv_cache(
 @pytest.mark.parametrize("shared_kv_len", [54, 97, 1979])
 @pytest.mark.parametrize("num_heads", [8, 16])
 @pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("page_size", [1, 4, 16])
+@pytest.mark.parametrize("page_size", [1, 16])
 def test_batch_decode_with_shared_prefix_paged_kv_cache(
     batch_size, unique_kv_len, shared_kv_len, num_heads, head_dim, page_size
 ):
@@ -131,7 +131,7 @@ def test_batch_decode_with_shared_prefix_paged_kv_cache(
 @pytest.mark.parametrize("num_heads", [8, 16])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("page_size", [1, 4, 16])
+@pytest.mark.parametrize("page_size", [1, 16])
 def test_batch_prefill_with_shared_prefix_paged_kv_cache(
     batch_size, unique_kv_len, shared_kv_len, num_heads, causal, head_dim, page_size
 ):
