@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_SAMPLING_TOP_P_CUH_
-#define FLASHINFER_SAMPLING_TOP_P_CUH_
+#ifndef FLASHINFER_SAMPLING_CUH_
+#define FLASHINFER_SAMPLING_CUH_
 
 #include "../vec_dtypes.cuh"
 
@@ -23,7 +23,26 @@ namespace flashinfer {
 namespace sampling {
 
 /*!
- * \brief Top-P sampling kernel.
+ * \brief Top-P sampling kernel, pin probs in shared memory
+ * \param x The input tensor of shape (N, D)
+ * \param indices The output indices tensor of shape (N,)
+ * \param p The probability threshold
+ * \param d The 
+ */
+template <typename DType, typename IdType>
+__global__ void TopPSamplingSMEMKernel(
+  DType* __restrict__ x,
+  IdType* __restrict__ indices,
+  const float p,
+  const uint32_t d
+) {
+  const uint32_t i = blockIdx.x;
+  constexpr uint32_t vec_size = 16 / sizeof(DType);
+
+}
+
+/*!
+ * \brief Top-P sampling kernel
  * \param x The input tensor of shape (N, D)
  * \param indices The output indices tensor of shape (N,)
  * \param p The probability threshold
@@ -41,8 +60,9 @@ __global__ void TopPSamplingKernel(
 
 }
 
+
 } // namespace sampling
 
 } // namespace flashinfer
 
-#endif  // FLASHINFER_SAMPLING_TOP_P_CUH_
+#endif  // FLASHINFER_SAMPLING_CUH_

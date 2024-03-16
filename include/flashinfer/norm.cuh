@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_NORM_RMSNORM_CUH_
-#define FLASHINFER_NORM_RMSNORM_CUH_
+#ifndef FLASHINFER_NORM_CUH_
+#define FLASHINFER_NORM_CUH_
 
 #include "../vec_dtypes.cuh"
 
@@ -23,24 +23,35 @@ namespace flashinfer {
 namespace norm {
 
 /*!
- * \brief Fused RMSNorm CUDA Kernel
+ * \brief Fused RMSNorm CUDA Kernel, pin input tensors to shared memory
  * \param x The input tensor of shape (N, D)
  * \param y The output tensor of shape (N, D)
  * \param d The dimension of the input tensor
  */
 template <typename T>
-__global__ void RMSNormKernel(
+__global__ void RMSNormSMEMKernel(
   T* __restrict__ x,
   T* __restrict__ y,
-  const uint32_t d
+  const uint32_t d,
+  float epsilon
 ) {
   const uint32_t i = blockIdx.x;
   constexpr uint32_t vec_size = 16 / sizeof(T);
 
 }
 
+template <typename T>
+__global__ void RMSNormKernel(
+  T* __restrict__ x,
+  T* __restrict__ y,
+  const uint32_t d,
+  float epsilon
+) {
+  // TODO(Zihao)
+}
+
 }  // namespace norm
 
 }
 
-#endif  // FLASHINFER_NORM_RMSNORM_CUH_
+#endif  // FLASHINFER_NORM_CUH_
