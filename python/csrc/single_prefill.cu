@@ -55,8 +55,8 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
   }
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
-    return DISPATCH_group_size(num_qo_heads / num_kv_heads, [&] {
-      return DISPATCH_head_dim(head_dim, [&] {
+    bool success = DISPATCH_group_size(num_qo_heads / num_kv_heads, [&] {
+      bool success = DISPATCH_head_dim(head_dim, [&] {
         DISPATCH_CAUSAL(causal, CAUSAL, {
           DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
             DISPATCH_ALLOW_FP16_QK_REDUCTION(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
@@ -80,7 +80,15 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
         });
         return true;
       });
+      TORCH_CHECK(success,
+                  "SinglePrefillWithKVCache kernel launch failed, error: unknown head_dim ",
+                  head_dim);
+      return success;
     });
+    TORCH_CHECK(success,
+                "SinglePrefillWithKVCache kernel launch failed, error: unknown group_size ",
+                num_qo_heads / num_kv_heads);
+    return success;
   });
 
   TORCH_CHECK(success, "SinglePrefillWithKVCache kernel launch failed, error: unknown dtype");

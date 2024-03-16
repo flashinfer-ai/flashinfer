@@ -105,8 +105,8 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
           static_cast<int32_t*>(paged_kv_indices.data_ptr()),
           static_cast<int32_t*>(paged_kv_indptr.data_ptr()),
           static_cast<int32_t*>(paged_kv_last_page_len.data_ptr()));
-      return DISPATCH_group_size(num_qo_heads / num_kv_heads, [&] {
-        return DISPATCH_head_dim(head_dim, [&] {
+      bool success = DISPATCH_group_size(num_qo_heads / num_kv_heads, [&] {
+        bool success = DISPATCH_head_dim(head_dim, [&] {
           DISPATCH_CAUSAL(causal, CAUSAL, {
             DISPATCH_ALLOW_FP16_QK_REDUCTION(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
               DISPATCH_POS_ENCODING_MODE(PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, {
@@ -127,7 +127,11 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
           });
           return true;
         });
+        TORCH_CHECK(success, "BatchPrefillWithPagedKVCache failed to dispatch head_dim ", head_dim);
+        return success;
       });
+      TORCH_CHECK(success, "BatchPrefillWithPagedKVCache failed to dispatch group_size ",
+                  num_qo_heads / num_kv_heads);
     });
     return true;
   });
