@@ -86,9 +86,12 @@ using namespace flashinfer;
     }                                                                                        \
   }()
 #else
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(pytorch_dtype, c_type, ...) \
-  [&]() -> bool {                                                       \
-    return false;                                                       \
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(pytorch_dtype, c_type, ...)                  \
+  [&]() -> bool {                                                                        \
+    std::ostringstream oss;                                                              \
+    oss << __PRETTY_FUNCTION__ << " failed to dispatch fp8 data type " << pytorch_dtype; \
+    TORCH_CHECK(false, oss.str());                                                       \
+    return false;                                                                        \
   }()
 #endif
 
@@ -122,9 +125,9 @@ using namespace flashinfer;
 #define DISPATCH_kv_layout(expr, const_expr, ...) \
   _DISPATCH_SWITCH("kv layout", expr, _DISPATCH_CASES_kv_layout(const_expr, __VA_ARGS__))
 
-#define DISPATCH_pos_encoding_mode(expr, const_expr, ...) \
-  _DISPATCH_SWITCH("positional encoding mode", expr,      \
-                   _DISPATCH_CASES_pos_encoding_mode(const_expr, __VA_ARGS__))
+#define DISPATCH_pos_enc_mode(expr, const_expr, ...) \
+  _DISPATCH_SWITCH("positional encoding mode", expr, \
+                   _DISPATCH_CASES_pos_enc_mode(const_expr, __VA_ARGS__))
 
 #define DISPATCH_allow_fp16_qk_reduction(expr, const_expr, ...) \
   _DISPATCH_SWITCH("allow_fp16_qk_reduction", expr,             \
@@ -145,10 +148,6 @@ inline void check_shape(const torch::Tensor& a, const torch::Tensor& b, const ch
 inline constexpr uint32_t pack_u16(uint16_t a, uint16_t b) {
   return (uint32_t(a) << 16) | uint32_t(b);
 }
-
-#define CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads)                   \
-  TORCH_CHECK(num_qo_heads % num_kv_heads == 0, "num_qo_heads(", num_qo_heads, \
-              ") must be divisible by num_kv_heads(", num_kv_heads, ")")
 
 #define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
 
