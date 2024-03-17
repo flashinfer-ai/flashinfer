@@ -48,9 +48,9 @@ namespace mma {
 #endif
 
 #if defined(__CUDA_ARCH__)
-#  define FLASHINFER_RUNTIME_ASSERT(x) __brkpt()
+#define FLASHINFER_RUNTIME_ASSERT(x) __brkpt()
 #else
-#  define FLASHINFER_RUNTIME_ASSERT(x) assert(0 && x)
+#define FLASHINFER_RUNTIME_ASSERT(x) assert(0 && x)
 #endif
 
 enum class MMAMode {
@@ -223,7 +223,8 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f32(float* C, uin
     }
   }
 #else
-  FLASHINFER_RUNTIME_ASSERT("fp8 mma instruction is only available for sm89, PTX 8.4+ and CUDA 12.4+");
+  FLASHINFER_RUNTIME_ASSERT(
+      "fp8 mma instruction is only available for sm89, PTX 8.4+ and CUDA 12.4+");
 #endif
 }
 
@@ -430,7 +431,8 @@ __device__ __forceinline__ void rowsum_f8f8f32(float* d, DType* s) {
           "r"(1010580540), "f"(d[0]), "f"(d[1]));
   }
 #else
-  FLASHINFER_RUNTIME_ASSERT("fp8 mma instruction is only available for sm89, PTX 8.4+ and CUDA 12.4+");
+  FLASHINFER_RUNTIME_ASSERT(
+      "fp8 mma instruction is only available for sm89, PTX 8.4+ and CUDA 12.4+");
 #endif
 }
 

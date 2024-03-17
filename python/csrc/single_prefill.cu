@@ -46,7 +46,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
     num_kv_heads = k.size(0);
     num_qo_heads = q.size(0);
   }
-  CHECK(num_qo_heads % num_kv_heads == 0);
+  CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
   auto o = torch::empty_like(q, q.options());
   torch::Tensor lse = torch::empty({0});
@@ -55,43 +55,35 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
   }
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
-    bool success = DISPATCH_group_size(num_qo_heads / num_kv_heads, [&] {
-      bool success = DISPATCH_head_dim(head_dim, [&] {
-        DISPATCH_CAUSAL(causal, CAUSAL, {
-          DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
-            DISPATCH_ALLOW_FP16_QK_REDUCTION(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
-              DISPATCH_POS_ENCODING_MODE(PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, {
-                cudaError_t status =
-                    SinglePrefillWithKVCacheDispatched<GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
-                                                       POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION,
-                                                       CAUSAL>(
-                        static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
-                        static_cast<c_type*>(v.data_ptr()), static_cast<c_type*>(o.data_ptr()),
-                        static_cast<float*>(tmp.data_ptr()),
-                        /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                        num_kv_heads, qo_len, kv_len, sm_scale, rope_scale, rope_theta,
-                        torch_current_stream);
-                TORCH_CHECK(status == cudaSuccess,
-                            "SinglePrefillWithKVCache kernel launch failed, error: " +
-                                std::string(cudaGetErrorString(status)));
-              });
-            });
+    return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
+      return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
+        return DISPATCH_causal(causal, CAUSAL, [&] {
+          return DISPATCH_kv_layout(kv_layout, KV_LAYOUT, [&] {
+            return DISPATCH_allow_fp16_qk_reduction(
+                allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
+                  return DISPATCH_pos_encoding_mode(
+                      PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
+                        cudaError_t status = SinglePrefillWithKVCacheDispatched<
+                            GROUP_SIZE, HEAD_DIM, KV_LAYOUT, POS_ENCODING_MODE,
+                            ALLOW_FP16_QK_REDUCTION, CAUSAL>(
+                            static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
+                            static_cast<c_type*>(v.data_ptr()), static_cast<c_type*>(o.data_ptr()),
+                            static_cast<float*>(tmp.data_ptr()),
+                            /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
+                            num_kv_heads, qo_len, kv_len, sm_scale, rope_scale, rope_theta,
+                            torch_current_stream);
+                        TORCH_CHECK(status == cudaSuccess,
+                                    "SinglePrefillWithKVCache kernel launch failed, error: " +
+                                        std::string(cudaGetErrorString(status)));
+                        return true;
+                      });
+                });
           });
         });
-        return true;
       });
-      TORCH_CHECK(success,
-                  "SinglePrefillWithKVCache kernel launch failed, error: unknown head_dim ",
-                  head_dim);
-      return success;
     });
-    TORCH_CHECK(success,
-                "SinglePrefillWithKVCache kernel launch failed, error: unknown group_size ",
-                num_qo_heads / num_kv_heads);
-    return success;
   });
 
-  TORCH_CHECK(success, "SinglePrefillWithKVCache kernel launch failed, error: unknown dtype");
   if (return_lse) {
     return {o, lse};
   } else {

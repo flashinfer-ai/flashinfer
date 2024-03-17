@@ -24,10 +24,11 @@ import subprocess
 import platform
 
 import setuptools
+import argparse
 import torch
 import torch.utils.cpp_extension as torch_cpp_ext
 
-import generate_single_decode_inst, generate_single_prefill_inst, generate_batch_paged_decode_inst, generate_batch_padded_decode_inst, generate_batch_paged_prefill_inst, generate_batch_ragged_prefill_inst
+import generate_single_decode_inst, generate_single_prefill_inst, generate_batch_paged_decode_inst, generate_batch_padded_decode_inst, generate_batch_paged_prefill_inst, generate_batch_ragged_prefill_inst, generate_dispatch_inc
 
 root = pathlib.Path(__name__).parent
 
@@ -74,18 +75,19 @@ def get_instantiation_cu() -> List[str]:
     causal_options = os.environ.get("FLASHINFER_CAUSAL_OPTIONS", "0,1").split(",")
     # dispatch.inc
     path = root / prefix / "dispatch.inc"
-    if not path.exists():
-        with open(root / prefix / "dispatch.inc", "w") as f:
-            f.write("#define _DISPATCH_CASES_group_size(...)      \\\n")
-            for x in group_sizes:
-                f.write(f"  _DISPATCH_CASE({x}, GROUP_SIZE, __VA_ARGS__) \\\n")
-            f.write("// EOL\n")
-
-            f.write("#define _DISPATCH_CASES_head_dim(...)        \\\n")
-            for x in head_dims:
-                f.write(f"  _DISPATCH_CASE({x}, HEAD_DIM, __VA_ARGS__) \\\n")
-            f.write("// EOL\n")
-            f.write("\n")
+    write_if_different(
+        path,
+        generate_dispatch_inc.get_dispatch_inc_str(
+            argparse.Namespace(
+                group_sizes=map(int, group_sizes),
+                head_dims=map(int, head_dims),
+                kv_layouts=map(int, kv_layouts),
+                pos_encoding_modes=map(int, pos_encoding_modes),
+                allow_fp16_qk_reductions=map(int, allow_fp16_qk_reduction_options),
+                causals=map(int, causal_options),
+            )
+        ),
+    )
 
     idtypes = ["i32"]
     prefill_dtypes = ["f16"]

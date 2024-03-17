@@ -26,7 +26,7 @@ void BatchPrefillWithPagedKVCachePyTorchWrapper::BeginForward(
   // NOTE(Zihao): not necessary to be a CUDA tensor
   CHECK_CONTIGUOUS(qo_indptr);
   CHECK_CONTIGUOUS(workspace_buffer);
-  CHECK_EQ(num_qo_heads % num_kv_heads, 0);
+  CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
   CHECK_DIM(1, qo_indptr);
   CHECK_DIM(1, workspace_buffer);
 
@@ -78,7 +78,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
     page_size = paged_kv_data.size(2);
     num_kv_heads = paged_kv_data.size(3);
   }
-  CHECK_EQ(num_qo_heads % num_kv_heads, 0);
+  CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
   CHECK_EQ(qo_indptr.size(0), batch_size + 1);
   CHECK_EQ(paged_kv_indptr.size(0), batch_size + 1);
   CHECK_EQ(paged_kv_last_page_len.size(0), batch_size);
@@ -97,46 +97,42 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
     lse = torch::empty({nnz_qo, num_qo_heads}, q.options()).to(torch::kFloat32);
   }
 
-  bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
-    DISPATCH_LAYOUT(kv_layout_, KV_LAYOUT, {
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
+    return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
       paged_kv_t<PageStorage::kIndices, KV_LAYOUT, c_type, int32_t> paged_kv(
           num_kv_heads, page_size, head_dim, batch_size,
           static_cast<c_type*>(paged_kv_data.data_ptr()),
           static_cast<int32_t*>(paged_kv_indices.data_ptr()),
           static_cast<int32_t*>(paged_kv_indptr.data_ptr()),
           static_cast<int32_t*>(paged_kv_last_page_len.data_ptr()));
-      bool success = DISPATCH_group_size(num_qo_heads / num_kv_heads, [&] {
-        bool success = DISPATCH_head_dim(head_dim, [&] {
-          DISPATCH_CAUSAL(causal, CAUSAL, {
-            DISPATCH_ALLOW_FP16_QK_REDUCTION(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
-              DISPATCH_POS_ENCODING_MODE(PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, {
-                cudaError_t status = BatchPrefillWithPagedKVCacheWrapperDispatched<
-                    PageStorage::kIndices, KV_LAYOUT, GROUP_SIZE, HEAD_DIM, POS_ENCODING_MODE,
-                    ALLOW_FP16_QK_REDUCTION, CAUSAL, c_type, c_type, int32_t>(
-                    &handler_, static_cast<c_type*>(q.data_ptr()),
-                    static_cast<int32_t*>(qo_indptr.data_ptr()),
-                    /*q_offset=*/nullptr, paged_kv, static_cast<c_type*>(o.data_ptr()),
-                    /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr, sm_scale,
-                    rope_scale, rope_theta,
-                    /*stream=*/torch_current_stream);
-                TORCH_CHECK(status == cudaSuccess,
-                            "BatchPrefillWithPagedKVCache failed with error code ",
-                            cudaGetErrorString(status));
-              });
-            });
+      return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
+        return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
+          return DISPATCH_causal(causal, CAUSAL, [&] {
+            return DISPATCH_allow_fp16_qk_reduction(
+                allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
+                  return DISPATCH_pos_encoding_mode(
+                      PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
+                        cudaError_t status = BatchPrefillWithPagedKVCacheWrapperDispatched<
+                            PageStorage::kIndices, KV_LAYOUT, GROUP_SIZE, HEAD_DIM,
+                            POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION, CAUSAL, c_type, c_type,
+                            int32_t>(
+                            &handler_, static_cast<c_type*>(q.data_ptr()),
+                            static_cast<int32_t*>(qo_indptr.data_ptr()),
+                            /*q_offset=*/nullptr, paged_kv, static_cast<c_type*>(o.data_ptr()),
+                            /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
+                            sm_scale, rope_scale, rope_theta,
+                            /*stream=*/torch_current_stream);
+                        TORCH_CHECK(status == cudaSuccess,
+                                    "BatchPrefillWithPagedKVCache failed with error code ",
+                                    cudaGetErrorString(status));
+                        return true;
+                      });
+                });
           });
-          return true;
         });
-        TORCH_CHECK(success, "BatchPrefillWithPagedKVCache failed to dispatch head_dim ", head_dim);
-        return success;
       });
-      TORCH_CHECK(success, "BatchPrefillWithPagedKVCache failed to dispatch group_size ",
-                  num_qo_heads / num_kv_heads);
     });
-    return true;
   });
-  TORCH_CHECK(success, "BatchPrefillWithPagedKVCache failed to dispatch with dtype ",
-              q.scalar_type());
 
   if (return_lse) {
     return {o, lse};
@@ -151,7 +147,7 @@ void BatchPrefillWithRaggedKVCachePyTorchWrapper::BeginForward(
   // NOTE(Zihao): not necessary to be a CUDA tensor
   CHECK_CONTIGUOUS(qo_indptr);
   CHECK_CONTIGUOUS(workspace_buffer);
-  CHECK_EQ(num_qo_heads % num_kv_heads, 0);
+  CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
   CHECK_DIM(1, qo_indptr);
   CHECK_DIM(1, workspace_buffer);
 
@@ -196,7 +192,7 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
   CHECK_EQ(k.size(1), v.size(1));
   CHECK_EQ(k.size(2), v.size(2));
   CHECK_EQ(k.size(2), head_dim);
-  CHECK_EQ(num_qo_heads % num_kv_heads, 0);
+  CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
   // TODO(Zihao): support dispatching to different index data types.
   CHECK_EQ(qo_indptr.scalar_type(), torch::kInt32);
   CHECK_EQ(kv_indptr.scalar_type(), torch::kInt32);
@@ -208,32 +204,35 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
     lse = torch::empty({nnz_qo, num_qo_heads}, q.options()).to(torch::kFloat32);
   }
 
-  bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
-    return DISPATCH_group_size(num_qo_heads / num_kv_heads, [&] {
-      return DISPATCH_head_dim(head_dim, [&] {
-        DISPATCH_CAUSAL(causal, CAUSAL, {
-          DISPATCH_ALLOW_FP16_QK_REDUCTION(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
-            DISPATCH_POS_ENCODING_MODE(PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, {
-              DISPATCH_LAYOUT(kv_layout_, KV_LAYOUT, {
-                cudaError_t status = BatchPrefillWithRaggedKVCacheWrapperDispatched<
-                    GROUP_SIZE, HEAD_DIM, KV_LAYOUT, POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION,
-                    CAUSAL, c_type, c_type, int32_t>(
-                    &handler_, static_cast<c_type*>(q.data_ptr()),
-                    static_cast<int32_t*>(qo_indptr.data_ptr()), static_cast<c_type*>(k.data_ptr()),
-                    static_cast<c_type*>(v.data_ptr()), static_cast<int32_t*>(kv_indptr.data_ptr()),
-                    /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr,
-                    static_cast<c_type*>(o.data_ptr()),
-                    /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr, batch_size,
-                    num_kv_heads, sm_scale, rope_scale, rope_theta,
-                    /*stream=*/torch_current_stream);
-                TORCH_CHECK(status == cudaSuccess,
-                            "BatchPrefillWithRaggedKVCache failed with error ",
-                            cudaGetErrorString(status));
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
+    return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
+      return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
+        return DISPATCH_causal(causal, CAUSAL, [&] {
+          return DISPATCH_allow_fp16_qk_reduction(
+              allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
+                return DISPATCH_pos_encoding_mode(
+                    PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
+                      return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
+                        cudaError_t status = BatchPrefillWithRaggedKVCacheWrapperDispatched<
+                            GROUP_SIZE, HEAD_DIM, KV_LAYOUT, POS_ENCODING_MODE,
+                            ALLOW_FP16_QK_REDUCTION, CAUSAL, c_type, c_type, int32_t>(
+                            &handler_, static_cast<c_type*>(q.data_ptr()),
+                            static_cast<int32_t*>(qo_indptr.data_ptr()),
+                            static_cast<c_type*>(k.data_ptr()), static_cast<c_type*>(v.data_ptr()),
+                            static_cast<int32_t*>(kv_indptr.data_ptr()),
+                            /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr,
+                            static_cast<c_type*>(o.data_ptr()),
+                            /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
+                            batch_size, num_kv_heads, sm_scale, rope_scale, rope_theta,
+                            /*stream=*/torch_current_stream);
+                        TORCH_CHECK(status == cudaSuccess,
+                                    "BatchPrefillWithRaggedKVCache failed with error ",
+                                    cudaGetErrorString(status));
+                        return true;
+                      });
+                    });
               });
-            });
-          });
         });
-        return true;
       });
     });
   });
