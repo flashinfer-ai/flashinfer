@@ -55,12 +55,12 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
   }
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
-    bool success = DISPATCH_group_size(num_qo_heads / num_kv_heads, [&] {
-      bool success = DISPATCH_head_dim(head_dim, [&] {
-        DISPATCH_CAUSAL(causal, CAUSAL, {
-          DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {
-            DISPATCH_ALLOW_FP16_QK_REDUCTION(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
-              DISPATCH_POS_ENCODING_MODE(PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, {
+    bool success = DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
+      bool success = DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
+        bool success DISPATCH_causal(causal, CAUSAL, [&] {
+          bool success = DISPATCH_kv_layout(kv_layout, KV_LAYOUT, [&] {
+            bool success = DISPATCH_allow_fp16_qk_reduction(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
+              bool success = DISPATCH_pos_enc_mode(pos_encoding_mode, POS_ENCODING_MODE, [&] {
                 cudaError_t status =
                     SinglePrefillWithKVCacheDispatched<GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
                                                        POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION,
@@ -74,19 +74,31 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
                 TORCH_CHECK(status == cudaSuccess,
                             "SinglePrefillWithKVCache kernel launch failed, error: " +
                                 std::string(cudaGetErrorString(status)));
+                return success;
               });
+              TORCH_CHECK(success, "SinglePrefillWithKVCache kernel failed to dispatch pos_encoding_mode ",
+                          pos_encoding_mode);
+              return success;
             });
+            TORCH_CHECK(success, "SinglePrefillWithKVCache kernel failed to dispatch allow_fp16_qk_reduction ",
+                        allow_fp16_qk_reduction);
+            return success;
           });
+          TORCH_CHECK(success, "SinglePrefillWithKVCache kernel failed to dispatch kv_layout ",
+                      kv_layout);
+          return success;
         });
-        return true;
+        TORCH_CHECK(success, "SinglePrefillWithKVCache kernel failed to dispatch causal ",
+                    causal);
+        return success;
       });
       TORCH_CHECK(success,
-                  "SinglePrefillWithKVCache kernel launch failed, error: unknown head_dim ",
+                  "SinglePrefillWithKVCache kernel failed to dispatch head_dim ",
                   head_dim);
       return success;
     });
     TORCH_CHECK(success,
-                "SinglePrefillWithKVCache kernel launch failed, error: unknown group_size ",
+                "SinglePrefillWithKVCache kernel failed to dispatch group_size ",
                 num_qo_heads / num_kv_heads);
     return success;
   });

@@ -198,7 +198,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
   bool success;
   if (is_float8_tensor(q)) {
     success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(q.scalar_type(), c_type, [&] {
-      DISPATCH_LAYOUT(kv_layout_, KV_LAYOUT, {
+      bool success = DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
         paged_kv_t<PageStorage::kIndices, KV_LAYOUT, c_type, int32_t> paged_kv(
             num_kv_heads, page_size, head_dim, batch_size,
             static_cast<c_type*>(paged_kv_data.data_ptr()),
@@ -215,11 +215,13 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
         TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
                     cudaGetErrorString(status));
       });
+      TORCH_CHECK(success, "BatchDecodeWithPagedKVCache failed to dispatch with layout ",
+                  kv_layout_);
       return true;
     });
   } else {
     success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
-      DISPATCH_LAYOUT(kv_layout_, KV_LAYOUT, {
+      bool success = DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
         paged_kv_t<PageStorage::kIndices, KV_LAYOUT, c_type, int32_t> paged_kv(
             num_kv_heads, page_size, head_dim, batch_size,
             static_cast<c_type*>(paged_kv_data.data_ptr()),
@@ -236,6 +238,8 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
         TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
                     cudaGetErrorString(status));
       });
+      TORCH_CHECK(success, "BatchDecodeWithPagedKVCache failed to dispatch with layout ",
+                  kv_layout_);
       return true;
     });
   }

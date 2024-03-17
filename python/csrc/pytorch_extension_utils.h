@@ -52,7 +52,7 @@
       }                                                             \
       default:                                                      \
         return false;                                               \
-    }                                                               \
+    }                            
   }()
 #endif
 
@@ -94,12 +94,23 @@
     return __VA_ARGS__();                   \
   }
 
-#define DISPATCH_group_size(expr, ...) \
-  _DISPATCH_SWITCH(expr, _DISPATCH_CASES_group_size(__VA_ARGS__))
+#define DISPATCH_group_size(expr, const_expr, ...) \
+  _DISPATCH_SWITCH(expr, _DISPATCH_CASES_group_size(const_expr, __VA_ARGS__))
 
-#define DISPATCH_page_size(expr, ...) _DISPATCH_SWITCH(expr, _DISPATCH_CASES_page_size(__VA_ARGS__))
+#define DISPATCH_page_size(expr, const_expr, ...) _DISPATCH_SWITCH(expr, _DISPATCH_CASES_page_size(const_expr, __VA_ARGS__))
 
-#define DISPATCH_head_dim(expr, ...) _DISPATCH_SWITCH(expr, _DISPATCH_CASES_head_dim(__VA_ARGS__))
+#define DISPATCH_head_dim(expr, const_expr, ...) _DISPATCH_SWITCH(expr, _DISPATCH_CASES_head_dim(const_expr, __VA_ARGS__))
+
+#define DISPATCH_kv_layout(expr, const_expr, ...) \
+  _DISPATCH_SWITCH(expr, _DISPATCH_CASES_kv_layout(const_expr, __VA_ARGS__))
+
+#define DISPATCH_pos_enc_mode(expr, const_expr, ...) \
+  _DISPATCH_SWITCH(expr, _DISPATCH_CASES_pos_enc_mode(const_expr, __VA_ARGS__))
+
+#define DISPATCH_allow_fp16_qk_reduction(expr, const_expr, ...) \
+  _DISPATCH_SWITCH(expr, _DISPATCH_CASES_allow_fp16_qk_reduction(const_expr, __VA_ARGS__))
+
+#define DISPATCH_causal(expr, const_expr, ...) _DISPATCH_SWITCH(expr, _DISPATCH_CASES_causal(const_expr, __VA_ARGS__))
 
 inline void check_shape(const torch::Tensor& a, const torch::Tensor& b, const char* a_name,
                         const char* b_name) {

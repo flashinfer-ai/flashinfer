@@ -98,18 +98,18 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
   }
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
-    DISPATCH_LAYOUT(kv_layout_, KV_LAYOUT, {
+    bool success = DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
       paged_kv_t<PageStorage::kIndices, KV_LAYOUT, c_type, int32_t> paged_kv(
           num_kv_heads, page_size, head_dim, batch_size,
           static_cast<c_type*>(paged_kv_data.data_ptr()),
           static_cast<int32_t*>(paged_kv_indices.data_ptr()),
           static_cast<int32_t*>(paged_kv_indptr.data_ptr()),
           static_cast<int32_t*>(paged_kv_last_page_len.data_ptr()));
-      bool success = DISPATCH_group_size(num_qo_heads / num_kv_heads, [&] {
-        bool success = DISPATCH_head_dim(head_dim, [&] {
-          DISPATCH_CAUSAL(causal, CAUSAL, {
-            DISPATCH_ALLOW_FP16_QK_REDUCTION(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
-              DISPATCH_POS_ENCODING_MODE(PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, {
+      bool success = DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
+        bool success = DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
+          bool success = DISPATCH_causal(causal, CAUSAL, [&] {
+            bool success = DISPATCH_allow_fp16_qk_reduction(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
+              bool success = DISPATCH_pos_enc_mode(PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
                 cudaError_t status = BatchPrefillWithPagedKVCacheWrapperDispatched<
                     PageStorage::kIndices, KV_LAYOUT, GROUP_SIZE, HEAD_DIM, POS_ENCODING_MODE,
                     ALLOW_FP16_QK_REDUCTION, CAUSAL, c_type, c_type, int32_t>(
@@ -123,17 +123,28 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
                             "BatchPrefillWithPagedKVCache failed with error code ",
                             cudaGetErrorString(status));
               });
+              TORCH_CHECK(success, "BatchPrefillWithPagedKVCache failed to dispatch pos_enc_mode ",
+                          pos_encoding_mode);
+              return success;
             });
+            TORCH_CHECK(success, "BatchPrefillWithPagedKVCache failed to dispatch allow_fp16_qk_reduction ",
+                        allow_fp16_qk_reduction);
+            return success;
           });
-          return true;
+          TORCH_CHECK(success, "BatchPrefillWithPagedKVCache failed to dispatch causal ",
+                      causal);
+          return success;
         });
         TORCH_CHECK(success, "BatchPrefillWithPagedKVCache failed to dispatch head_dim ", head_dim);
         return success;
       });
       TORCH_CHECK(success, "BatchPrefillWithPagedKVCache failed to dispatch group_size ",
                   num_qo_heads / num_kv_heads);
+      return success;
     });
-    return true;
+    TORCH_CHECK(success, "BatchPrefillWithPagedKVCache failed to dispatch with kv_layout ",
+                kv_layout_);
+    return success;
   });
   TORCH_CHECK(success, "BatchPrefillWithPagedKVCache failed to dispatch with dtype ",
               q.scalar_type());
@@ -209,12 +220,12 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
   }
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
-    return DISPATCH_group_size(num_qo_heads / num_kv_heads, [&] {
-      return DISPATCH_head_dim(head_dim, [&] {
-        DISPATCH_CAUSAL(causal, CAUSAL, {
-          DISPATCH_ALLOW_FP16_QK_REDUCTION(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
-            DISPATCH_POS_ENCODING_MODE(PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, {
-              DISPATCH_LAYOUT(kv_layout_, KV_LAYOUT, {
+    bool success = DISPATCH_group_size(num_qo_heads / num_kv_heads, [&] {
+      bool success = DISPATCH_head_dim(head_dim, [&] {
+        bool success = DISPATCH_causal(causal, CAUSAL, [&] {
+          bool success = DISPATCH_allow_fp16_qk_reduction(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
+            bool success = DISPATCH_pos_enc_mode(PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
+              bool success = DISPATCH_layout(kv_layout_, KV_LAYOUT, [&] {
                 cudaError_t status = BatchPrefillWithRaggedKVCacheWrapperDispatched<
                     GROUP_SIZE, HEAD_DIM, KV_LAYOUT, POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION,
                     CAUSAL, c_type, c_type, int32_t>(
@@ -229,14 +240,33 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
                 TORCH_CHECK(status == cudaSuccess,
                             "BatchPrefillWithRaggedKVCache failed with error ",
                             cudaGetErrorString(status));
+                return true;
               });
+              TORCH_CHECK(success, "BatchPrefillWithRaggedKVCache failed to dispatch layout ",
+                          kv_layout_);
+              return true;
             });
+            TORCH_CHECK(success, "BatchPrefillWithRaggedKVCache failed to dispatch pos_enc_mode ",
+                        pos_encoding_mode);
+            return true;
           });
+          TORCH_CHECK(success, "BatchPrefillWithRaggedKVCache failed to dispatch allow_fp16_qk_reduction ",
+                      allow_fp16_qk_reduction);
+          return true;
         });
+        TORCH_CHECK(success, "BatchPrefillWithRaggedKVCache failed to dispatch causal ", causal);
         return true;
       });
+      TORCH_CHECK(success, "BatchPrefillWithRaggedKVCache failed to dispatch head_dim ", head_dim);
+      return true;
     });
+    TORCH_CHECK(success, "BatchPrefillWithRaggedKVCache failed to dispatch group_size ",
+                num_qo_heads / num_kv_heads);
+    return true;
   });
+
+  TORCH_CHECK(success, "BatchPrefillWithRaggedKVCache failed to dispatch with dtype ",
+              q.scalar_type());
 
   if (return_lse) {
     return {o, lse};
