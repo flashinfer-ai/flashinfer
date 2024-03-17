@@ -61,22 +61,22 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
           return DISPATCH_kv_layout(kv_layout, KV_LAYOUT, [&] {
             return DISPATCH_allow_fp16_qk_reduction(
                 allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
-                  return DISPATCH_pos_enc_mode(pos_encoding_mode, POS_ENC_MODE, [&] {
-                    cudaError_t status =
-                        SinglePrefillWithKVCacheDispatched<GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
-                                                           POS_ENC_MODE, ALLOW_FP16_QK_REDUCTION,
-                                                           CAUSAL>(
+                  return DISPATCH_pos_enc_mode(
+                      PosEncodingMode(pos_encoding_mode), POS_ENC_MODE, [&] {
+                        cudaError_t status = SinglePrefillWithKVCacheDispatched<
+                            GROUP_SIZE, HEAD_DIM, KV_LAYOUT, POS_ENC_MODE, ALLOW_FP16_QK_REDUCTION,
+                            CAUSAL>(
                             static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
                             static_cast<c_type*>(v.data_ptr()), static_cast<c_type*>(o.data_ptr()),
                             static_cast<float*>(tmp.data_ptr()),
                             /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
                             num_kv_heads, qo_len, kv_len, sm_scale, rope_scale, rope_theta,
                             torch_current_stream);
-                    TORCH_CHECK(status == cudaSuccess,
-                                "SinglePrefillWithKVCache kernel launch failed, error: " +
-                                    std::string(cudaGetErrorString(status)));
-                    return true;
-                  });
+                        TORCH_CHECK(status == cudaSuccess,
+                                    "SinglePrefillWithKVCache kernel launch failed, error: " +
+                                        std::string(cudaGetErrorString(status)));
+                        return true;
+                      });
                 });
           });
         });
