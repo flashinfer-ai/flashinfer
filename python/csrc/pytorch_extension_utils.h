@@ -56,6 +56,7 @@
   }()
 #endif
 
+#ifdef FLASHINFER_ENABLE_FP8
 #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(pytorch_dtype, c_type, ...) \
   [&]() -> bool {                                                       \
     switch (pytorch_dtype) {                                            \
@@ -71,6 +72,12 @@
         return false;                                                   \
     }                                                                   \
   }()
+#else
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(pytorch_dtype, c_type, ...) \
+  [&]() -> bool {                                                       \
+    return false;                                                       \
+  }()
+#endif
 
 #define _DISPATCH_SWITCH(cond, ...) \
   [&]() -> bool {                   \
