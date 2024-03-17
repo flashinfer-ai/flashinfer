@@ -26,7 +26,7 @@ void BatchPrefillWithPagedKVCachePyTorchWrapper::BeginForward(
   // NOTE(Zihao): not necessary to be a CUDA tensor
   CHECK_CONTIGUOUS(qo_indptr);
   CHECK_CONTIGUOUS(workspace_buffer);
-  CHECK_EQ(num_qo_heads % num_kv_heads, 0);
+  CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
   CHECK_DIM(1, qo_indptr);
   CHECK_DIM(1, workspace_buffer);
 
@@ -78,7 +78,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
     page_size = paged_kv_data.size(2);
     num_kv_heads = paged_kv_data.size(3);
   }
-  CHECK_EQ(num_qo_heads % num_kv_heads, 0);
+  CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
   CHECK_EQ(qo_indptr.size(0), batch_size + 1);
   CHECK_EQ(paged_kv_indptr.size(0), batch_size + 1);
   CHECK_EQ(paged_kv_last_page_len.size(0), batch_size);
@@ -110,11 +110,12 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
           return DISPATCH_causal(causal, CAUSAL, [&] {
             return DISPATCH_allow_fp16_qk_reduction(
                 allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
-                  return DISPATCH_pos_enc_mode(
-                      PosEncodingMode(pos_encoding_mode), POS_ENC_MODE, [&] {
+                  return DISPATCH_pos_encoding_mode(
+                      PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
                         cudaError_t status = BatchPrefillWithPagedKVCacheWrapperDispatched<
-                            PageStorage::kIndices, KV_LAYOUT, GROUP_SIZE, HEAD_DIM, POS_ENC_MODE,
-                            ALLOW_FP16_QK_REDUCTION, CAUSAL, c_type, c_type, int32_t>(
+                            PageStorage::kIndices, KV_LAYOUT, GROUP_SIZE, HEAD_DIM,
+                            POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION, CAUSAL, c_type, c_type,
+                            int32_t>(
                             &handler_, static_cast<c_type*>(q.data_ptr()),
                             static_cast<int32_t*>(qo_indptr.data_ptr()),
                             /*q_offset=*/nullptr, paged_kv, static_cast<c_type*>(o.data_ptr()),
@@ -146,7 +147,7 @@ void BatchPrefillWithRaggedKVCachePyTorchWrapper::BeginForward(
   // NOTE(Zihao): not necessary to be a CUDA tensor
   CHECK_CONTIGUOUS(qo_indptr);
   CHECK_CONTIGUOUS(workspace_buffer);
-  CHECK_EQ(num_qo_heads % num_kv_heads, 0);
+  CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
   CHECK_DIM(1, qo_indptr);
   CHECK_DIM(1, workspace_buffer);
 
@@ -191,7 +192,7 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
   CHECK_EQ(k.size(1), v.size(1));
   CHECK_EQ(k.size(2), v.size(2));
   CHECK_EQ(k.size(2), head_dim);
-  CHECK_EQ(num_qo_heads % num_kv_heads, 0);
+  CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
   // TODO(Zihao): support dispatching to different index data types.
   CHECK_EQ(qo_indptr.scalar_type(), torch::kInt32);
   CHECK_EQ(kv_indptr.scalar_type(), torch::kInt32);
@@ -209,26 +210,27 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
         return DISPATCH_causal(causal, CAUSAL, [&] {
           return DISPATCH_allow_fp16_qk_reduction(
               allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
-                return DISPATCH_pos_enc_mode(PosEncodingMode(pos_encoding_mode), POS_ENC_MODE, [&] {
-                  return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
-                    cudaError_t status = BatchPrefillWithRaggedKVCacheWrapperDispatched<
-                        GROUP_SIZE, HEAD_DIM, KV_LAYOUT, POS_ENC_MODE, ALLOW_FP16_QK_REDUCTION,
-                        CAUSAL, c_type, c_type, int32_t>(
-                        &handler_, static_cast<c_type*>(q.data_ptr()),
-                        static_cast<int32_t*>(qo_indptr.data_ptr()),
-                        static_cast<c_type*>(k.data_ptr()), static_cast<c_type*>(v.data_ptr()),
-                        static_cast<int32_t*>(kv_indptr.data_ptr()),
-                        /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr,
-                        static_cast<c_type*>(o.data_ptr()),
-                        /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                        batch_size, num_kv_heads, sm_scale, rope_scale, rope_theta,
-                        /*stream=*/torch_current_stream);
-                    TORCH_CHECK(status == cudaSuccess,
-                                "BatchPrefillWithRaggedKVCache failed with error ",
-                                cudaGetErrorString(status));
-                    return true;
-                  });
-                });
+                return DISPATCH_pos_encoding_mode(
+                    PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
+                      return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
+                        cudaError_t status = BatchPrefillWithRaggedKVCacheWrapperDispatched<
+                            GROUP_SIZE, HEAD_DIM, KV_LAYOUT, POS_ENCODING_MODE,
+                            ALLOW_FP16_QK_REDUCTION, CAUSAL, c_type, c_type, int32_t>(
+                            &handler_, static_cast<c_type*>(q.data_ptr()),
+                            static_cast<int32_t*>(qo_indptr.data_ptr()),
+                            static_cast<c_type*>(k.data_ptr()), static_cast<c_type*>(v.data_ptr()),
+                            static_cast<int32_t*>(kv_indptr.data_ptr()),
+                            /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr,
+                            static_cast<c_type*>(o.data_ptr()),
+                            /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
+                            batch_size, num_kv_heads, sm_scale, rope_scale, rope_theta,
+                            /*stream=*/torch_current_stream);
+                        TORCH_CHECK(status == cudaSuccess,
+                                    "BatchPrefillWithRaggedKVCache failed with error ",
+                                    cudaGetErrorString(status));
+                        return true;
+                      });
+                    });
               });
         });
       });

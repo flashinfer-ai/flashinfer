@@ -95,72 +95,63 @@ std::pair<uint32_t, uint32_t> PartitionPagedKVCacheBinarySearchMinNumPagePerBatc
  * \param stream The cuda stream to launch the kernel
  * \return status Indicates whether CUDA calls are successful
  */
-template <PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeOut,
-          typename IdType>
-cudaError_t BatchDecodeWithPagedKVCacheWorkEstimation(
+template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, QKVLayout kv_layout,
+          PosEncodingMode POS_ENCODING_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
+cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     uint32_t& tmp_size, uint32_t& max_grid_size, uint32_t& max_num_pages_per_batch,
     uint32_t& new_batch_size, uint32_t batch_size, IdType* kv_indptr, const uint32_t num_qo_heads,
-    const uint32_t num_kv_heads, const uint32_t head_dim, const uint32_t page_size,
-    const PosEncodingMode pos_encoding_mode, cudaStream_t stream) {
-  DISPATCH_GQA_GROUP_SIZE(
-      num_qo_heads / num_kv_heads, GROUP_SIZE,
-      {DISPATCH_HEAD_DIM(
-          head_dim, HEAD_DIM, {DISPATCH_POS_ENCODING_MODE(pos_encoding_mode, POS_ENCODING_MODE, {
-            constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
-            constexpr uint32_t num_stages_smem = 2U;
-            constexpr uint32_t bdx = HEAD_DIM / vec_size;
-            static_assert(bdx <= 32);
-            constexpr uint32_t bdy = GROUP_SIZE;
-            constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
-            constexpr uint32_t bdz = num_threads / (bdx * bdy);
-            constexpr uint32_t tile_size_per_bdx =
-                GROUP_SIZE == 1 ? (sizeof(DTypeIn) == 1 ? 2U : 4U) : 1U;
-            const uint32_t smem_size =
-                2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim * sizeof(DTypeIn) +
-                std::max(tile_size_per_bdx * num_threads * sizeof(DTypeIn*),
-                         2 * bdy * bdz * sizeof(float));
+    const uint32_t page_size, cudaStream_t stream) {
+  constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
+  constexpr uint32_t num_stages_smem = 2U;
+  constexpr uint32_t bdx = HEAD_DIM / vec_size;
+  static_assert(bdx <= 32);
+  constexpr uint32_t bdy = GROUP_SIZE;
+  constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
+  constexpr uint32_t bdz = num_threads / (bdx * bdy);
+  constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeIn) == 1 ? 2U : 4U) : 1U;
+  const uint32_t num_kv_heads = num_qo_heads / GROUP_SIZE;
+  const uint32_t smem_size =
+      2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * HEAD_DIM * sizeof(DTypeIn) +
+      std::max(tile_size_per_bdx * num_threads * sizeof(DTypeIn*), 2 * bdy * bdz * sizeof(float));
 
-            auto partition_kv_kernel = BatchDecodeWithPagedKVCacheKernel<
-                /*partition_kv=*/true, POS_ENCODING_MODE, num_stages_smem, tile_size_per_bdx,
-                vec_size, bdx, bdy, bdz, page_storage, kv_layout, DTypeIn, DTypeOut, IdType>;
-            int num_blocks_per_sm = 0;
-            int num_sm = 0;
-            int dev_id = 0;
-            FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
-            FLASHINFER_CUDA_CALL(
-                cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
-            FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &num_blocks_per_sm, partition_kv_kernel, num_threads, smem_size));
-            max_grid_size = num_blocks_per_sm * num_sm;
-            if (batch_size * num_kv_heads >= max_grid_size) {
-              // do not use partition-kv kernel
-              tmp_size = 0;
-              new_batch_size = batch_size;
-            } else {
-              // compute max_num_pages_per_batch and new_batch_size
-              std::vector<IdType> page_indptr_h(batch_size + 1), num_pages(batch_size);
-              if (is_device_ptr(kv_indptr)) {
-                FLASHINFER_CUDA_CALL(cudaMemcpyAsync(page_indptr_h.data(), kv_indptr,
-                                                     sizeof(IdType) * (batch_size + 1),
-                                                     cudaMemcpyDeviceToHost, stream));
-              } else {
-                page_indptr_h.assign(kv_indptr, kv_indptr + batch_size + 1);
-              }
-              for (uint32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-                num_pages[batch_idx] = page_indptr_h[batch_idx + 1] - page_indptr_h[batch_idx];
-              }
-              std::tie(max_num_pages_per_batch, new_batch_size) =
-                  PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(max_grid_size, num_kv_heads,
-                                                                      num_pages, 128 / page_size);
-              if (new_batch_size == batch_size) {
-                // do not use partition-kv kernel for short sequence
-                tmp_size = 0;
-              } else {
-                tmp_size = num_qo_heads * new_batch_size *
-                           (head_dim * sizeof(DTypeOut) + 2 * sizeof(float));
-              }
-            }
-          })})});
+  auto partition_kv_kernel = BatchDecodeWithPagedKVCacheKernel<
+      /*partition_kv=*/true, POS_ENCODING_MODE, num_stages_smem, tile_size_per_bdx, vec_size, bdx,
+      bdy, bdz, page_storage, kv_layout, DTypeIn, DTypeOut, IdType>;
+  int num_blocks_per_sm = 0;
+  int num_sm = 0;
+  int dev_id = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
+  FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &num_blocks_per_sm, partition_kv_kernel, num_threads, smem_size));
+  max_grid_size = num_blocks_per_sm * num_sm;
+  if (batch_size * num_kv_heads >= max_grid_size) {
+    // do not use partition-kv kernel
+    tmp_size = 0;
+    new_batch_size = batch_size;
+  } else {
+    // compute max_num_pages_per_batch and new_batch_size
+    std::vector<IdType> page_indptr_h(batch_size + 1), num_pages(batch_size);
+    if (is_device_ptr(kv_indptr)) {
+      FLASHINFER_CUDA_CALL(cudaMemcpyAsync(page_indptr_h.data(), kv_indptr,
+                                           sizeof(IdType) * (batch_size + 1),
+                                           cudaMemcpyDeviceToHost, stream));
+    } else {
+      page_indptr_h.assign(kv_indptr, kv_indptr + batch_size + 1);
+    }
+    for (uint32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+      num_pages[batch_idx] = page_indptr_h[batch_idx + 1] - page_indptr_h[batch_idx];
+    }
+    std::tie(max_num_pages_per_batch, new_batch_size) =
+        PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(max_grid_size, num_kv_heads, num_pages,
+                                                            128 / page_size);
+    if (new_batch_size == batch_size) {
+      // do not use partition-kv kernel for short sequence
+      tmp_size = 0;
+    } else {
+      tmp_size = num_qo_heads * new_batch_size * (HEAD_DIM * sizeof(DTypeOut) + 2 * sizeof(float));
+    }
+  }
   return cudaSuccess;
 }
 
@@ -294,20 +285,20 @@ class BatchDecodeHandler {
     return (IdType*)seq_lengths_before_partition_;
   }
 
-  template <PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeOut,
-            typename IdType>
-  cudaError_t BeginForward(void* buffer, size_t workspace_size_in_bytes, IdType* indptr,
-                           IdType* last_page_len, uint32_t batch_size, uint32_t num_qo_heads,
-                           uint32_t num_kv_heads, uint32_t head_dim, uint32_t page_size,
-                           PosEncodingMode pos_encoding_mode) {
+  template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, QKVLayout kv_layout,
+            PosEncodingMode POS_ENCODING_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
+  cudaError_t BeginForwardDispatched(void* buffer, size_t workspace_size_in_bytes, IdType* indptr,
+                                     IdType* last_page_len, uint32_t batch_size,
+                                     uint32_t num_qo_heads, uint32_t page_size) {
     batch_size_before_partition_ = batch_size;
     uint32_t tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size;
     auto work_estimation_func =
-        BatchDecodeWithPagedKVCacheWorkEstimation<page_storage, kv_layout, DTypeIn, DTypeOut,
-                                                  IdType>;
-    FLASHINFER_CUDA_CALL(work_estimation_func(
-        tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size, batch_size, indptr,
-        num_qo_heads, num_kv_heads, head_dim, page_size, pos_encoding_mode, stream_));
+        BatchDecodeWithPagedKVCacheWorkEstimationDispatched<GROUP_SIZE, HEAD_DIM, page_storage,
+                                                            kv_layout, POS_ENCODING_MODE, DTypeIn,
+                                                            DTypeOut, IdType>;
+    FLASHINFER_CUDA_CALL(work_estimation_func(tmp_size, max_grid_size, max_num_pages_per_batch,
+                                              new_batch_size, batch_size, indptr, num_qo_heads,
+                                              page_size, stream_));
     batch_size_after_partition_ = new_batch_size;
     if (tmp_size > 0) {
       AlignedAlloactor allocator(buffer, workspace_size_in_bytes);
@@ -332,6 +323,30 @@ class BatchDecodeHandler {
     }
     forward_started_ = true;
     return cudaSuccess;
+  }
+
+  template <PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeOut,
+            typename IdType>
+  cudaError_t BeginForward(void* buffer, size_t workspace_size_in_bytes, IdType* indptr,
+                           IdType* last_page_len, uint32_t batch_size, uint32_t num_qo_heads,
+                           uint32_t num_kv_heads, uint32_t head_dim, uint32_t page_size,
+                           PosEncodingMode pos_encoding_mode) {
+    if (num_qo_heads % num_kv_heads != 0) {
+      std::ostringstream err_msg;
+      err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
+              << num_kv_heads;
+      throw std::invalid_argument(err_msg.str());
+    }
+    DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
+      DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+        DISPATCH_POS_ENCODING_MODE(pos_encoding_mode, POS_ENCODING_MODE, {
+          return BeginForwardDispatched<GROUP_SIZE, HEAD_DIM, page_storage, kv_layout,
+                                        POS_ENCODING_MODE, DTypeIn, DTypeOut, IdType>(
+              buffer, workspace_size_in_bytes, indptr, last_page_len, batch_size, num_qo_heads,
+              page_size);
+        });
+      });
+    });
   }
 
   cudaError_t EndForward() {

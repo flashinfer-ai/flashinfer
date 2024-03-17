@@ -1,3 +1,6 @@
+# Generated inst files
+include/flashinfer/dispatch.inc
+
 # Generated cu files
 src/generated/
 python/csrc/generated/

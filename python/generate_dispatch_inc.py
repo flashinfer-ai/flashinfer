@@ -58,13 +58,13 @@ def get_dispatch_inc_str(args: argparse.Namespace) -> str:
     # positional encoding modes
     dispatch_pos_encoding_modes_entries = "\n".join(
         [
-            "  _DISPATCH_CASE({}, POS_ENC_MODE, __VA_ARGS__) \\".format(
+            "  _DISPATCH_CASE({}, POS_ENCODING_MODE, __VA_ARGS__) \\".format(
                 pos_encoding_mode_literal[_]
             )
-            for _ in args.pos_enc_modes
+            for _ in args.pos_encoding_modes
         ]
     )
-    dispatch_pos_encoding_modes_str = f"""#define _DISPATCH_CASES_pos_enc_mode(...)         \\
+    dispatch_pos_encoding_modes_str = f"""#define _DISPATCH_CASES_pos_encoding_mode(...)         \\
 {dispatch_pos_encoding_modes_entries}
 // EOL
 """
@@ -120,7 +120,7 @@ if __name__ == "__main__":
         "--kv_layouts", type=int, required=True, nargs="+", help="KV layouts"
     )
     parser.add_argument(
-        "--pos_enc_modes",
+        "--pos_encoding_modes",
         type=int,
         required=True,
         nargs="+",

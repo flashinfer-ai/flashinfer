@@ -46,7 +46,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
     num_kv_heads = k.size(0);
     num_qo_heads = q.size(0);
   }
-  CHECK(num_qo_heads % num_kv_heads == 0);
+  CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
   auto o = torch::empty_like(q, q.options());
   torch::Tensor lse = torch::empty({0});
@@ -61,11 +61,11 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
           return DISPATCH_kv_layout(kv_layout, KV_LAYOUT, [&] {
             return DISPATCH_allow_fp16_qk_reduction(
                 allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
-                  return DISPATCH_pos_enc_mode(
-                      PosEncodingMode(pos_encoding_mode), POS_ENC_MODE, [&] {
+                  return DISPATCH_pos_encoding_mode(
+                      PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
                         cudaError_t status = SinglePrefillWithKVCacheDispatched<
-                            GROUP_SIZE, HEAD_DIM, KV_LAYOUT, POS_ENC_MODE, ALLOW_FP16_QK_REDUCTION,
-                            CAUSAL>(
+                            GROUP_SIZE, HEAD_DIM, KV_LAYOUT, POS_ENCODING_MODE,
+                            ALLOW_FP16_QK_REDUCTION, CAUSAL>(
                             static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
                             static_cast<c_type*>(v.data_ptr()), static_cast<c_type*>(o.data_ptr()),
                             static_cast<float*>(tmp.data_ptr()),
