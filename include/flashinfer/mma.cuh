@@ -47,6 +47,12 @@ namespace mma {
 #endif
 #endif
 
+#if defined(__CUDA_ARCH__)
+#  define FLASHINFER_RUNTIME_ASSERT(x) __brkpt()
+#else
+#  define FLASHINFER_RUNTIME_ASSERT(x) assert(0 && x)
+#endif
+
 enum class MMAMode {
   kInit = 0U,
   kInplaceUpdate = 1U,
@@ -67,7 +73,7 @@ __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
                : "=r"(R[0]), "=r"(R[1]), "=r"(R[2]), "=r"(R[3])
                : "r"(smem_int_ptr));
 #else
-#error "Unsupported CUDA architecture for ldmatrix instruction"
+  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
 #endif
 }
 
@@ -86,7 +92,7 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t* R, T* smem_ptr) 
                : "=r"(R[0]), "=r"(R[1]), "=r"(R[2]), "=r"(R[3])
                : "r"(smem_int_ptr));
 #else
-#error "Unsupported CUDA architecture for ldmatrix instruction"
+  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
 #endif
 }
 
@@ -217,7 +223,7 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f32(float* C, uin
     }
   }
 #else
-#error "fp8 mma instruction is only available for sm89, PTX 8.4+ and CUDA 12.4+"
+  FLASHINFER_RUNTIME_ASSERT("fp8 mma instruction is only available for sm89, PTX 8.4+ and CUDA 12.4+");
 #endif
 }
 
@@ -384,7 +390,7 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
         : "r"(A[2]), "r"(A[3]), "r"(B[3]), "f"(C[4]), "f"(C[5]), "f"(C[6]), "f"(C[7]));
   }
 #else
-#error "Unsupported CUDA architecture for mma instruction"
+  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
 #endif
 }
 
@@ -424,7 +430,7 @@ __device__ __forceinline__ void rowsum_f8f8f32(float* d, DType* s) {
           "r"(1010580540), "f"(d[0]), "f"(d[1]));
   }
 #else
-#error "fp8 mma instruction is only available for sm89, PTX 8.4+ and CUDA 12.4+"
+  FLASHINFER_RUNTIME_ASSERT("fp8 mma instruction is only available for sm89, PTX 8.4+ and CUDA 12.4+");
 #endif
 }
 
@@ -488,7 +494,7 @@ __device__ __forceinline__ void rowsum_f16f16f32(float* d, DType* s) {
       : "=f"(d[0]), "=f"(d[1])
       : "r"(s_u32[2]), "r"(s_u32[3]), "r"(1006648320), "f"(d[0]), "f"(d[1]));
 #else
-#error "Unsupported CUDA architecture for mma instruction"
+  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
 #endif
 }
 
@@ -608,7 +614,7 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f16(uint32_t* C
         : "r"(A[2]), "r"(A[3]), "r"(B[3]), "r"(C[2]), "r"(C[3]));
   }
 #else
-#error "Unsupported CUDA architecture for mma instruction"
+  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
 #endif
 }
 
