@@ -55,55 +55,35 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
   }
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
-    bool success = DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
-      bool success = DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-        bool success DISPATCH_causal(causal, CAUSAL, [&] {
-          bool success = DISPATCH_kv_layout(kv_layout, KV_LAYOUT, [&] {
-            bool success = DISPATCH_allow_fp16_qk_reduction(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
-              bool success = DISPATCH_pos_enc_mode(pos_encoding_mode, POS_ENCODING_MODE, [&] {
-                cudaError_t status =
-                    SinglePrefillWithKVCacheDispatched<GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
-                                                       POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION,
-                                                       CAUSAL>(
-                        static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
-                        static_cast<c_type*>(v.data_ptr()), static_cast<c_type*>(o.data_ptr()),
-                        static_cast<float*>(tmp.data_ptr()),
-                        /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                        num_kv_heads, qo_len, kv_len, sm_scale, rope_scale, rope_theta,
-                        torch_current_stream);
-                TORCH_CHECK(status == cudaSuccess,
-                            "SinglePrefillWithKVCache kernel launch failed, error: " +
-                                std::string(cudaGetErrorString(status)));
-                return success;
-              });
-              TORCH_CHECK(success, "SinglePrefillWithKVCache kernel failed to dispatch pos_encoding_mode ",
-                          pos_encoding_mode);
-              return success;
-            });
-            TORCH_CHECK(success, "SinglePrefillWithKVCache kernel failed to dispatch allow_fp16_qk_reduction ",
-                        allow_fp16_qk_reduction);
-            return success;
+    return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
+      return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
+        return DISPATCH_causal(causal, CAUSAL, [&] {
+          return DISPATCH_kv_layout(kv_layout, KV_LAYOUT, [&] {
+            return DISPATCH_allow_fp16_qk_reduction(
+                allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
+                  return DISPATCH_pos_enc_mode(pos_encoding_mode, POS_ENC_MODE, [&] {
+                    cudaError_t status =
+                        SinglePrefillWithKVCacheDispatched<GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
+                                                           POS_ENC_MODE, ALLOW_FP16_QK_REDUCTION,
+                                                           CAUSAL>(
+                            static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
+                            static_cast<c_type*>(v.data_ptr()), static_cast<c_type*>(o.data_ptr()),
+                            static_cast<float*>(tmp.data_ptr()),
+                            /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
+                            num_kv_heads, qo_len, kv_len, sm_scale, rope_scale, rope_theta,
+                            torch_current_stream);
+                    TORCH_CHECK(status == cudaSuccess,
+                                "SinglePrefillWithKVCache kernel launch failed, error: " +
+                                    std::string(cudaGetErrorString(status)));
+                    return true;
+                  });
+                });
           });
-          TORCH_CHECK(success, "SinglePrefillWithKVCache kernel failed to dispatch kv_layout ",
-                      kv_layout);
-          return success;
         });
-        TORCH_CHECK(success, "SinglePrefillWithKVCache kernel failed to dispatch causal ",
-                    causal);
-        return success;
       });
-      TORCH_CHECK(success,
-                  "SinglePrefillWithKVCache kernel failed to dispatch head_dim ",
-                  head_dim);
-      return success;
     });
-    TORCH_CHECK(success,
-                "SinglePrefillWithKVCache kernel failed to dispatch group_size ",
-                num_qo_heads / num_kv_heads);
-    return success;
   });
 
-  TORCH_CHECK(success, "SinglePrefillWithKVCache kernel launch failed, error: unknown dtype");
   if (return_lse) {
     return {o, lse};
   } else {

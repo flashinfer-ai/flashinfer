@@ -47,9 +47,8 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
   auto o = torch::empty_like(
       q, q.options().dtype(is_float8_tensor(q) ? torch::kFloat16 : q.scalar_type()));
 
-  bool success;
   if (is_float8_tensor(q)) {
-    success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(q.scalar_type(), c_type, [&] {
+    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(q.scalar_type(), c_type, [&] {
       cudaError_t status = SingleDecodeWithKVCache(
           static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
           static_cast<c_type*>(v.data_ptr()), static_cast<nv_half*>(o.data_ptr()),
@@ -61,7 +60,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
       return true;
     });
   } else {
-    success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
+    DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
       cudaError_t status = SingleDecodeWithKVCache(
           static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
           static_cast<c_type*>(v.data_ptr()), static_cast<c_type*>(o.data_ptr()),
@@ -74,6 +73,5 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
     });
   }
 
-  TORCH_CHECK(success, "SingleDecodeWithKVCache kernel launch failed, error: unsupported dtype");
   return o;
 }

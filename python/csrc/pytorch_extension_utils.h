@@ -18,6 +18,9 @@
 #include <cuda_fp16.h>
 #include <torch/extension.h>
 
+#include <flashinfer/layout.cuh>
+#include <flashinfer/pos_enc.cuh>
+
 #include "generated/dispatch.inc"
 #ifdef FLASHINFER_ENABLE_BF16
 #include <cuda_bf16.h>
@@ -26,51 +29,61 @@
 #include <cuda_fp8.h>
 #endif
 
+using namespace flashinfer;
+
 #ifdef FLASHINFER_ENABLE_BF16
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...) \
-  [&]() -> bool {                                                   \
-    switch (pytorch_dtype) {                                        \
-      case at::ScalarType::Half: {                                  \
-        using c_type = nv_half;                                     \
-        return __VA_ARGS__();                                       \
-      }                                                             \
-      case at::ScalarType::BFloat16: {                              \
-        using c_type = nv_bfloat16;                                 \
-        return __VA_ARGS__();                                       \
-      }                                                             \
-      default:                                                      \
-        return false;                                               \
-    }                                                               \
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...)                      \
+  [&]() -> bool {                                                                        \
+    switch (pytorch_dtype) {                                                             \
+      case at::ScalarType::Half: {                                                       \
+        using c_type = nv_half;                                                          \
+        return __VA_ARGS__();                                                            \
+      }                                                                                  \
+      case at::ScalarType::BFloat16: {                                                   \
+        using c_type = nv_bfloat16;                                                      \
+        return __VA_ARGS__();                                                            \
+      }                                                                                  \
+      default:                                                                           \
+        std::ostringstream oss;                                                          \
+        oss << __PRETTY_FUNCTION__ << " failed to dispatch data type " << pytorch_dtype; \
+        TORCH_CHECK(false, oss.str());                                                   \
+        return false;                                                                    \
+    }                                                                                    \
   }()
 #else
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...) \
-  [&]() -> bool {                                                   \
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...) [&]() -> bool {                                                   \
     switch (pytorch_dtype) {                                        \
       case at::ScalarType::Half: {                                  \
         using c_type = nv_half;                                     \
         return __VA_ARGS__();                                       \
       }                                                             \
       default:                                                      \
+        std::ostringstream oss;                                     \
+        oss << __PRETTY_FUNCTION__ << " failed to dispatch data type " << pytorch_dtype; \
+        TORCH_CHECK(false, oss.str()); \
         return false;                                               \
-    }                            
-  }()
+    }
+}
+()
 #endif
 
-#ifdef FLASHINFER_ENABLE_FP8
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(pytorch_dtype, c_type, ...) \
-  [&]() -> bool {                                                       \
-    switch (pytorch_dtype) {                                            \
-      case at::ScalarType::Float8_e4m3fn: {                             \
-        using c_type = __nv_fp8_e4m3;                                   \
-        return __VA_ARGS__();                                           \
-      }                                                                 \
-      case at::ScalarType::Float8_e5m2: {                               \
-        using c_type = __nv_fp8_e5m2;                                   \
-        return __VA_ARGS__();                                           \
-      }                                                                 \
-      default:                                                          \
-        return false;                                                   \
-    }                                                                   \
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(pytorch_dtype, c_type, ...)                      \
+  [&]() -> bool {                                                                            \
+    switch (pytorch_dtype) {                                                                 \
+      case at::ScalarType::Float8_e4m3fn: {                                                  \
+        using c_type = __nv_fp8_e4m3;                                                        \
+        return __VA_ARGS__();                                                                \
+      }                                                                                      \
+      case at::ScalarType::Float8_e5m2: {                                                    \
+        using c_type = __nv_fp8_e5m2;                                                        \
+        return __VA_ARGS__();                                                                \
+      }                                                                                      \
+      default:                                                                               \
+        std::ostringstream oss;                                                              \
+        oss << __PRETTY_FUNCTION__ << " failed to dispatch fp8 data type " << pytorch_dtype; \
+        TORCH_CHECK(false, oss.str());                                                       \
+        return false;                                                                        \
+    }                                                                                        \
   }()
 #else
 #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(pytorch_dtype, c_type, ...) \
@@ -79,13 +92,16 @@
   }()
 #endif
 
-#define _DISPATCH_SWITCH(cond, ...) \
-  [&]() -> bool {                   \
-    switch (cond) {                 \
-      __VA_ARGS__                   \
-      default:                      \
-        return false;               \
-    }                               \
+#define _DISPATCH_SWITCH(var_name, cond, ...)                                           \
+  [&]() -> bool {                                                                       \
+    switch (cond) {                                                                     \
+      __VA_ARGS__                                                                       \
+      default:                                                                          \
+        std::ostringstream oss;                                                         \
+        oss << __PRETTY_FUNCTION__ << " failed to dispatch " var_name " " << int(cond); \
+        TORCH_CHECK(false, oss.str());                                                  \
+        return false;                                                                   \
+    }                                                                                   \
   }()
 
 #define _DISPATCH_CASE(case_expr, var, ...) \
@@ -95,22 +111,27 @@
   }
 
 #define DISPATCH_group_size(expr, const_expr, ...) \
-  _DISPATCH_SWITCH(expr, _DISPATCH_CASES_group_size(const_expr, __VA_ARGS__))
+  _DISPATCH_SWITCH("group_size", expr, _DISPATCH_CASES_group_size(const_expr, __VA_ARGS__))
 
-#define DISPATCH_page_size(expr, const_expr, ...) _DISPATCH_SWITCH(expr, _DISPATCH_CASES_page_size(const_expr, __VA_ARGS__))
+#define DISPATCH_page_size(expr, const_expr, ...) \
+  _DISPATCH_SWITCH("page size", expr, _DISPATCH_CASES_page_size(const_expr, __VA_ARGS__))
 
-#define DISPATCH_head_dim(expr, const_expr, ...) _DISPATCH_SWITCH(expr, _DISPATCH_CASES_head_dim(const_expr, __VA_ARGS__))
+#define DISPATCH_head_dim(expr, const_expr, ...) \
+  _DISPATCH_SWITCH("head_dim", expr, _DISPATCH_CASES_head_dim(const_expr, __VA_ARGS__))
 
 #define DISPATCH_kv_layout(expr, const_expr, ...) \
-  _DISPATCH_SWITCH(expr, _DISPATCH_CASES_kv_layout(const_expr, __VA_ARGS__))
+  _DISPATCH_SWITCH("kv layout", expr, _DISPATCH_CASES_kv_layout(const_expr, __VA_ARGS__))
 
 #define DISPATCH_pos_enc_mode(expr, const_expr, ...) \
-  _DISPATCH_SWITCH(expr, _DISPATCH_CASES_pos_enc_mode(const_expr, __VA_ARGS__))
+  _DISPATCH_SWITCH("positional encoding mode", expr, \
+                   _DISPATCH_CASES_pos_enc_mode(const_expr, __VA_ARGS__))
 
 #define DISPATCH_allow_fp16_qk_reduction(expr, const_expr, ...) \
-  _DISPATCH_SWITCH(expr, _DISPATCH_CASES_allow_fp16_qk_reduction(const_expr, __VA_ARGS__))
+  _DISPATCH_SWITCH("allow_fp16_qk_reduction", expr,             \
+                   _DISPATCH_CASES_allow_fp16_qk_reduction(const_expr, __VA_ARGS__))
 
-#define DISPATCH_causal(expr, const_expr, ...) _DISPATCH_SWITCH(expr, _DISPATCH_CASES_causal(const_expr, __VA_ARGS__))
+#define DISPATCH_causal(expr, const_expr, ...) \
+  _DISPATCH_SWITCH("causal", expr, _DISPATCH_CASES_causal(const_expr, __VA_ARGS__))
 
 inline void check_shape(const torch::Tensor& a, const torch::Tensor& b, const char* a_name,
                         const char* b_name) {

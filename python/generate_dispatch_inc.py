@@ -16,13 +16,16 @@ limitations under the License.
 
 import argparse
 from pathlib import Path
-from literal_map import kv_layout_literal, pos_encoding_mode_literal
+from literal_map import kv_layout_literal, pos_encoding_mode_literal, bool_literal
 
 
 def get_dispatch_inc_str(args: argparse.Namespace) -> str:
     # head dims
     dispatch_head_dims_entries = "\n".join(
-        ["  _DISPATCH_CASE({}, HEAD_DIM, __VA_ARGS__) \\".format(_) for _ in args.head_dims]
+        [
+            "  _DISPATCH_CASE({}, HEAD_DIM, __VA_ARGS__) \\".format(_)
+            for _ in args.head_dims
+        ]
     )
     dispatch_head_dims_str = f"""#define _DISPATCH_CASES_head_dim(...)         \\
 {dispatch_head_dims_entries}
@@ -30,7 +33,10 @@ def get_dispatch_inc_str(args: argparse.Namespace) -> str:
 """
     # group sizes
     dispatch_group_sizes_entries = "\n".join(
-        ["  _DISPATCH_CASE({}, GROUP_SIZE, __VA_ARGS__) \\".format(_) for _ in args.group_sizes]
+        [
+            "  _DISPATCH_CASE({}, GROUP_SIZE, __VA_ARGS__) \\".format(_)
+            for _ in args.group_sizes
+        ]
     )
     dispatch_group_sizes_str = f"""#define _DISPATCH_CASES_group_size(...)         \\
 {dispatch_group_sizes_entries}
@@ -38,7 +44,12 @@ def get_dispatch_inc_str(args: argparse.Namespace) -> str:
 """
     # kv layouts
     dispatch_kv_layouts_entries = "\n".join(
-        ["  _DISPATCH_CASE({}, KV_LAYOUT, __VA_ARGS__) \\".format(kv_layout_literal[_]) for _ in args.kv_layouts]
+        [
+            "  _DISPATCH_CASE({}, KV_LAYOUT, __VA_ARGS__) \\".format(
+                kv_layout_literal[_]
+            )
+            for _ in args.kv_layouts
+        ]
     )
     dispatch_kv_layouts_str = f"""#define _DISPATCH_CASES_kv_layout(...)         \\
 {dispatch_kv_layouts_entries}
@@ -46,7 +57,12 @@ def get_dispatch_inc_str(args: argparse.Namespace) -> str:
 """
     # positional encoding modes
     dispatch_pos_encoding_modes_entries = "\n".join(
-        ["  _DISPATCH_CASE({}, POS_ENC_MODE, __VA_ARGS__) \\".format(pos_encoding_mode_literal[_]) for _ in args.pos_enc_modes]
+        [
+            "  _DISPATCH_CASE({}, POS_ENC_MODE, __VA_ARGS__) \\".format(
+                pos_encoding_mode_literal[_]
+            )
+            for _ in args.pos_enc_modes
+        ]
     )
     dispatch_pos_encoding_modes_str = f"""#define _DISPATCH_CASES_pos_enc_mode(...)         \\
 {dispatch_pos_encoding_modes_entries}
@@ -54,39 +70,69 @@ def get_dispatch_inc_str(args: argparse.Namespace) -> str:
 """
     # allow fp16 qk reductions
     dispatch_allow_fp16_qk_reduction_entries = "\n".join(
-        ["  _DISPATCH_CASE({}, ALLOW_FP16_QK_REDUCTIONS, __VA_ARGS__) \\".format(_) for _ in args.allow_fp16_qk_reductions]
+        [
+            "  _DISPATCH_CASE({}, ALLOW_FP16_QK_REDUCTION, __VA_ARGS__) \\".format(
+                bool_literal[_]
+            )
+            for _ in args.allow_fp16_qk_reductions
+        ]
     )
-    dispatch_allow_fp16_qk_reductions_str = f"""#define _DISPATCH_CASES_allow_fp16_qk_reductions(...)         \\
+    dispatch_allow_fp16_qk_reductions_str = f"""#define _DISPATCH_CASES_allow_fp16_qk_reduction(...)         \\
 {dispatch_allow_fp16_qk_reduction_entries}
 // EOL
 """
     # causal
     dispatch_causal_entries = "\n".join(
-        ["  _DISPATCH_CASE({}, CAUSAL, __VA_ARGS__) \\".format(_) for _ in args.causals]
+        [
+            "  _DISPATCH_CASE({}, CAUSAL, __VA_ARGS__) \\".format(bool_literal[_])
+            for _ in args.causals
+        ]
     )
     dispatch_causal_str = f"""#define _DISPATCH_CASES_causal(...)         \\
 {dispatch_causal_entries}
 // EOL
 """
 
-    return "\n".join([
-        dispatch_head_dims_str,
-        dispatch_group_sizes_str,
-        dispatch_kv_layouts_str,
-        dispatch_pos_encoding_modes_str,
-        dispatch_allow_fp16_qk_reductions_str,
-        dispatch_causal_str
-    ])
+    return "\n".join(
+        [
+            dispatch_head_dims_str,
+            dispatch_group_sizes_str,
+            dispatch_kv_layouts_str,
+            dispatch_pos_encoding_modes_str,
+            dispatch_allow_fp16_qk_reductions_str,
+            dispatch_causal_str,
+        ]
+    )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Generate dispatch inc file")
-    parser.add_argument("--path", type=str, required=True, help="Path to the dispatch inc file")
-    parser.add_argument("--head_dims", type=int, required=True, nargs="+", help="Head dimensions")
-    parser.add_argument("--group_sizes", type=int, required=True, nargs="+", help="Group sizes")
-    parser.add_argument("--kv_layouts", type=int, required=True, nargs="+", help="KV layouts")
-    parser.add_argument("--pos_enc_modes", type=int, required=True, nargs="+", help="Position encoding modes")
-    parser.add_argument("--allow_fp16_qk_reductions", type=int, required=True, nargs="+", help="Allow fp16 qk reductions")
+    parser.add_argument(
+        "--path", type=str, required=True, help="Path to the dispatch inc file"
+    )
+    parser.add_argument(
+        "--head_dims", type=int, required=True, nargs="+", help="Head dimensions"
+    )
+    parser.add_argument(
+        "--group_sizes", type=int, required=True, nargs="+", help="Group sizes"
+    )
+    parser.add_argument(
+        "--kv_layouts", type=int, required=True, nargs="+", help="KV layouts"
+    )
+    parser.add_argument(
+        "--pos_enc_modes",
+        type=int,
+        required=True,
+        nargs="+",
+        help="Position encoding modes",
+    )
+    parser.add_argument(
+        "--allow_fp16_qk_reductions",
+        type=int,
+        required=True,
+        nargs="+",
+        help="Allow fp16 qk reductions",
+    )
     parser.add_argument("--causals", type=int, required=True, nargs="+", help="Causals")
     args = parser.parse_args()
     with open(Path(args.path), "w") as f:

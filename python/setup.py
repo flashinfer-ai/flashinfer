@@ -64,7 +64,9 @@ def get_instantiation_cu() -> List[str]:
     (root / prefix).mkdir(parents=True, exist_ok=True)
 
     group_sizes = os.environ.get("FLASHINFER_GROUP_SIZES", "1,4,8").split(",")
-    prefill_page_sizes = os.environ.get("FLASHINFER_PREFILL_PAGE_SIZES", "1,16,32").split(",")
+    prefill_page_sizes = os.environ.get(
+        "FLASHINFER_PREFILL_PAGE_SIZES", "1,16,32"
+    ).split(",")
     head_dims = os.environ.get("FLASHINFER_HEAD_DIMS", "64,128,256").split(",")
     kv_layouts = os.environ.get("FLASHINFER_KV_LAYOUTS", "0,1").split(",")
     pos_encoding_modes = os.environ.get("FLASHINFER_POS_ENCODING_MODES", "0,1,2").split(
@@ -76,16 +78,19 @@ def get_instantiation_cu() -> List[str]:
     causal_options = os.environ.get("FLASHINFER_CAUSAL_OPTIONS", "0,1").split(",")
     # dispatch.inc
     path = root / prefix / "dispatch.inc"
-    write_if_different(path, generate_dispatch_inc.get_dispatch_inc_str(
-        argparse.Namespace(
-            group_sizes=map(int, group_sizes),
-            head_dims=map(int, head_dims),
-            kv_layouts=map(int, kv_layouts),
-            pos_enc_modes=map(int, pos_encoding_modes),
-            allow_fp16_qk_reductions=map(int, allow_fp16_qk_reduction_options),
-            causals=map(int, causal_options)
-        )
-    ))
+    write_if_different(
+        path,
+        generate_dispatch_inc.get_dispatch_inc_str(
+            argparse.Namespace(
+                group_sizes=map(int, group_sizes),
+                head_dims=map(int, head_dims),
+                kv_layouts=map(int, kv_layouts),
+                pos_enc_modes=map(int, pos_encoding_modes),
+                allow_fp16_qk_reductions=map(int, allow_fp16_qk_reduction_options),
+                causals=map(int, causal_options),
+            )
+        ),
+    )
 
     idtypes = ["i32"]
     prefill_dtypes = ["f16"]

@@ -38,3 +38,8 @@ idtype_literal = {
     "i64": "int64_t",
     "u64": "uint64_t",
 }
+
+bool_literal = {
+    0: "false",
+    1: "true",
+}
