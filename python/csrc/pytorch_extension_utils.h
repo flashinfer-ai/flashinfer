@@ -149,6 +149,10 @@ inline constexpr uint32_t pack_u16(uint16_t a, uint16_t b) {
   return (uint32_t(a) << 16) | uint32_t(b);
 }
 
+#define CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads)                   \
+  TORCH_CHECK(num_qo_heads % num_kv_heads == 0, "num_qo_heads(", num_qo_heads, \
+              ") must be divisible by num_kv_heads(", num_kv_heads, ")")
+
 #define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
 
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
