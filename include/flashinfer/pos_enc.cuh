@@ -34,8 +34,10 @@ enum class PosEncodingMode {
   kNone = 0U,
   // Apply Llama-style rope.
   kRoPELlama = 1U,
+  // Apply interleaved (e.g. GPT-J) rope.
+  kRoPEInterleave = 2U,
   // Apply ALiBi bias
-  kALiBi = 2U
+  kALiBi = 3U
 };
 
 /*!
@@ -47,7 +49,9 @@ inline std::string PosEncodingModeToString(const PosEncodingMode& pos_encoding_m
     case PosEncodingMode::kNone:
       return "None";
     case PosEncodingMode::kRoPELlama:
-      return "Llama";
+      return "RoPELlama";
+    case PosEncodingMode::kRoPEInterleave:
+      return "RoPEInterleave";
     case PosEncodingMode::kALiBi:
       return "ALiBi";
     default:
@@ -88,6 +92,28 @@ __device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope(
     __sincosf(embed, &sin, &cos);
     vec[i] = vec[i] * cos +
              ((threadIdx.x * vec_size < head_dim / 2) ? -permuted_vec[i] : permuted_vec[i]) * sin;
+  }
+  return vec;
+}
+
+template <uint32_t vec_size, uint32_t bdx, typename T>
+__device__ __forceinline__ vec_t<float, vec_size> vec_apply_interleave_rope(
+    const T* x, const vec_t<float, vec_size>& freq, int32_t offset
+) {
+  constexpr uint32_t head_dim = vec_size * bdx;
+  vec_t<float, vec_size> vec, permuted_vec;
+  vec.cast_load(x + threadIdx.x * vec_size);
+#pragma unroll
+  for (uint32_t i = 0; i < vec_size; ++i) {
+    permuted_vec[i] = (i & 1) ? vec[i ^ 1]: -vec[i ^ 1];
+  }
+
+#pragma unroll
+  for (uint32_t i = 0; i < vec_size; ++i) {
+    float embed = float(offset) * freq[i];
+    float cos, sin;
+    __sincosf(embed, &sin, &cos);
+    vec[i] = vec[i] * cos + permuted_vec[i] * sin;
   }
   return vec;
 }
