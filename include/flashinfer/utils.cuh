@@ -258,7 +258,8 @@ template <typename IdType>
 std::tuple<IdType, IdType, std::vector<IdType>, std::vector<IdType>> split_qo_indptr(
     IdType* qo_indptr, uint32_t batch_size, uint32_t gqa_group_size, uint32_t head_dim,
     cudaStream_t stream = nullptr) {
-  constexpr uint32_t num_warps = 4;
+  // TODO(Zihao): make it a template parameter
+  constexpr uint32_t num_warps_x = 1;
   std::vector<IdType> qo_indptr_h(batch_size + 1), request_indices, tile_indices;
   if (is_device_ptr((void*)qo_indptr)) {
     cudaMemcpyAsync(qo_indptr_h.data(), qo_indptr, sizeof(IdType) * (batch_size + 1),
@@ -268,9 +269,9 @@ std::tuple<IdType, IdType, std::vector<IdType>, std::vector<IdType>> split_qo_in
   }
 
   const uint32_t total_q_len = qo_indptr_h[batch_size];
-  const bool avg_len_greater_than_64 = total_q_len * gqa_group_size > 64 * batch_size;
-  const uint32_t num_frags_x = (head_dim < 256 && avg_len_greater_than_64) ? 2 : 1;
-  const uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
+  const bool avg_len_greater_than_num_warps_x_16 = total_q_len * gqa_group_size > (num_warps_x * 16) * batch_size;
+  const uint32_t num_frags_x = (head_dim < 256 && avg_len_greater_than_num_warps_x_16) ? 2 : 1;
+  const uint32_t num_rows_per_cta = num_frags_x * num_warps_x * 16;
   uint32_t num_qo_tiles = 0;
 
   for (uint32_t i = 0; i < batch_size; ++i) {

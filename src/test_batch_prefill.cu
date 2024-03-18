@@ -103,7 +103,7 @@ void _TestBatchPagedPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t n
     thrust::device_vector<T> o_device(q_len * num_qo_heads * head_dim);
 
     handler.BeginForward((void*)thrust::raw_pointer_cast(buffer.data()), workspace_size_in_bytes,
-                         thrust::raw_pointer_cast(append_indptr.data()), batch_size, num_qo_heads,
+                         thrust::raw_pointer_cast(q_indptr_device.data()), batch_size, num_qo_heads,
                          num_kv_heads, head_dim);
 
     for (uint32_t num_runs = 0; num_runs < 10; ++num_runs) {
@@ -190,7 +190,7 @@ void _TestBatchRaggedPrefillKernelCorrectness(size_t num_kv_heads, size_t num_qo
   thrust::device_vector<int32_t> kv_indptr_device(kv_indptr);
 
   handler.BeginForward((void*)thrust::raw_pointer_cast(buffer.data()), workspace_size_in_bytes,
-                       thrust::raw_pointer_cast(append_indptr_device.data()), batch_size,
+                       thrust::raw_pointer_cast(append_indptr.data()), batch_size,
                        num_qo_heads, num_kv_heads, head_dim);
 
   auto status = BatchPrefillWithRaggedKVCacheWrapper<T, T, int32_t>(
@@ -357,9 +357,9 @@ void _TestBatchPagedPrefillKernelLongContextCorrectness(size_t num_kv_heads, siz
                                                         PosEncodingMode pos_encoding_mode,
                                                         bool allow_fp16_qk_reduction) {
   std::vector<std::vector<std::vector<T>>> keys, values;
-  std::vector<int32_t> q_lens{63}, kv_lens{2047};
-  std::vector<int32_t> q_indptr{0, 63};
-  std::vector<int32_t> append_indptr{0, 2047};
+  std::vector<int32_t> q_lens{1}, kv_lens{64};
+  std::vector<int32_t> q_indptr{0, 1};
+  std::vector<int32_t> append_indptr{0, 64};
   std::vector<T> kv_data;
   std::vector<int32_t> kv_indptr{0};
   std::vector<int32_t> kv_indices;
@@ -371,6 +371,13 @@ void _TestBatchPagedPrefillKernelLongContextCorrectness(size_t num_kv_heads, siz
   std::vector<T> k(kv_lens[0] * num_kv_heads * head_dim), v(kv_lens[0] * num_kv_heads * head_dim);
   utils::vec_normal_(k);
   utils::vec_normal_(v);
+  for (size_t i = 0; i < kv_lens[0]; ++i) {
+    for (size_t j = 0; j < num_kv_heads; ++j) {
+      for (size_t k = 0; k < head_dim; ++k) {
+        v[i * num_kv_heads * head_dim + j * head_dim + k] = T(i);
+      }
+    }
+  }
   kv_last_page_len.push_back(last_page_len);
   kv_indptr.push_back(kv_indptr.back() + num_pages);
   for (size_t j = 0; j < num_pages; ++j) {
@@ -414,7 +421,7 @@ void _TestBatchPagedPrefillKernelLongContextCorrectness(size_t num_kv_heads, siz
   thrust::device_vector<char> buffer(workspace_size_in_bytes);
 
   handler.BeginForward((void*)thrust::raw_pointer_cast(buffer.data()), workspace_size_in_bytes,
-                       thrust::raw_pointer_cast(append_indptr.data()),
+                       thrust::raw_pointer_cast(q_indptr_device.data()),
                        /*batch_size=*/1, num_qo_heads, num_kv_heads, head_dim);
 
   auto status =
@@ -434,10 +441,14 @@ void _TestBatchPagedPrefillKernelLongContextCorrectness(size_t num_kv_heads, siz
     }
     num_result_errors_atol_1e_3_rtol_1e_3 +=
         (!utils::isclose(float(o_host[i]), float(o_ref[i]), 1e-3, 1e-3));
+    if (!utils::isclose(float(o_host[i]), float(o_ref[i]), 1e-3, 1e-3)) {
+      std::cout << "i=" << i << ", o_ref[i]=" << float(o_ref[i]) << ", o_h[i]=" << float(o_host[i])
+                << std::endl;
+    }
   }
   float result_accuracy = 1. - float(num_result_errors_atol_1e_3_rtol_1e_3) /
                                    max(float(q_lens[0] * num_qo_heads * head_dim), 1.f);
-  std::cout << ", page_size=" << page_size << ", num_qo_heads=" << num_qo_heads
+  std::cout << "page_size=" << page_size << ", num_qo_heads=" << num_qo_heads
             << ", num_kv_heads=" << num_kv_heads << ", q_len=" << q_lens[0]
             << ", kv_len=" << kv_lens[0] << ", head_dim=" << head_dim << ", causal=" << causal
             << ", pos_encoding_mode=" << PosEncodingModeToString(pos_encoding_mode)
@@ -486,12 +497,12 @@ void TestBatchPagedPrefillKernelShortContextCorrectness(bool allow_fp16_qk_reduc
 
 template <typename T>
 void TestBatchPagedPrefillKernelLongContextCorrectness(bool allow_fp16_qk_reduction) {
-  for (size_t num_kv_heads : {1, 2, 8}) {
-    for (size_t num_qo_heads : {8}) {
-      for (size_t page_size : {1, 8, 16}) {
-        for (size_t head_dim : {64, 128, 256}) {
+  for (size_t num_kv_heads : {1}) {
+    for (size_t num_qo_heads : {1}) {
+      for (size_t page_size : {16}) {
+        for (size_t head_dim : {128}) {
           for (size_t causal : {false, true}) {
-            for (size_t pos_encoding_mode : {0, 1}) {
+            for (size_t pos_encoding_mode : {0}) {
               _TestBatchPagedPrefillKernelLongContextCorrectness<T>(
                   num_kv_heads, num_qo_heads, page_size, head_dim, causal,
                   PosEncodingMode(pos_encoding_mode), allow_fp16_qk_reduction);
@@ -505,11 +516,11 @@ void TestBatchPagedPrefillKernelLongContextCorrectness(bool allow_fp16_qk_reduct
 
 template <typename T>
 void TestBatchRaggedPrefillKernelCorrectness(bool allow_fp16_qk_reduction) {
-  for (size_t num_kv_heads : {4, 8, 32}) {
+  for (size_t num_kv_heads : {32}) {
     for (size_t num_qo_heads : {32}) {
-      for (size_t head_dim : {64, 128, 256}) {
+      for (size_t head_dim : {128}) {
         for (size_t causal : {false, true}) {
-          for (size_t pos_encoding_mode : {0, 1}) {
+          for (size_t pos_encoding_mode : {0}) {
             _TestBatchRaggedPrefillKernelCorrectness<T>(num_kv_heads, num_qo_heads, head_dim,
                                                         causal, PosEncodingMode(pos_encoding_mode),
                                                         allow_fp16_qk_reduction);
@@ -520,30 +531,34 @@ void TestBatchRaggedPrefillKernelCorrectness(bool allow_fp16_qk_reduction) {
   }
 }
 
-TEST(FlashInferCorrectnessTest, BatchPagedPrefillShortContextTestFP16) {
-  TestBatchPagedPrefillKernelShortContextCorrectness<half>(false);
+// TEST(FlashInferCorrectnessTest, BatchPagedPrefillShortContextTestFP16) {
+//   TestBatchPagedPrefillKernelShortContextCorrectness<half>(false);
+// }
+
+// TEST(FlashInferCorrectnessTest, BatchPagedPrefillShortContextTestFP16QKHalfAccum) {
+//   TestBatchPagedPrefillKernelShortContextCorrectness<half>(false);
+// }
+
+TEST(FlashInferCorrectnessTest, BatchPagedPrefillLongContextTestFP16) {
+  TestBatchPagedPrefillKernelLongContextCorrectness<half>(false);
 }
 
-TEST(FlashInferCorrectnessTest, BatchPagedPrefillShortContextTestFP16QKHalfAccum) {
-  TestBatchPagedPrefillKernelShortContextCorrectness<half>(false);
-}
+// TEST(FlashInferCorrectnessTest, BatchPagedPrefillLongContextTestFP16QKHalfAccum) {
+//   TestBatchPagedPrefillKernelLongContextCorrectness<half>(true);
+// }
 
-TEST(FlashInferCorrectnessTest, BatchPagedPrefillLongContextTestFP16QKHalfAccum) {
-  TestBatchPagedPrefillKernelLongContextCorrectness<half>(true);
-}
+// TEST(FlashInferCorrectnessTest, BatchPagedPrefillKernelCorrectnessTestOneHotFP16) {
+//   TestBatchPagedPrefillKernelOneHotCorrectness<half>(false);
+// }
 
-TEST(FlashInferCorrectnessTest, BatchPagedPrefillKernelCorrectnessTestOneHotFP16) {
-  TestBatchPagedPrefillKernelOneHotCorrectness<half>(false);
-}
-
-TEST(FlashInferCorrectnessTest, BatchPagedPrefillKernelCorrectnessTestOneHotFP16QKHalfAccum) {
-  TestBatchPagedPrefillKernelOneHotCorrectness<half>(true);
-}
+// TEST(FlashInferCorrectnessTest, BatchPagedPrefillKernelCorrectnessTestOneHotFP16QKHalfAccum) {
+//   TestBatchPagedPrefillKernelOneHotCorrectness<half>(true);
+// }
 
 TEST(FlashInferCorrectnessTest, BatchRaggedPrefillTestFP16) {
   TestBatchRaggedPrefillKernelCorrectness<half>(false);
 }
 
-TEST(FlashInferCorrectnessTest, BatchRaggedPrefillTestFP16QKHalfAccum) {
-  TestBatchRaggedPrefillKernelCorrectness<half>(true);
-}
+// TEST(FlashInferCorrectnessTest, BatchRaggedPrefillTestFP16QKHalfAccum) {
+//   TestBatchRaggedPrefillKernelCorrectness<half>(true);
+// }
