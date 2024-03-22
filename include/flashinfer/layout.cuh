@@ -30,6 +30,17 @@ enum class QKVLayout {
   kHND = 1U,
 };
 
+template <QKVLayout layout>
+__host__ __device__ __forceinline__ size_t get_elem_offset_impl(size_t elem_idx, size_t head_idx,
+                                                                size_t feat_idx, size_t seq_len,
+                                                                size_t num_heads, size_t head_dim) {
+  if constexpr (layout == QKVLayout::kHND) {
+    return (head_idx * seq_len + elem_idx) * head_dim + feat_idx;
+  } else {
+    return (elem_idx * num_heads + head_idx) * head_dim + feat_idx;
+  }
+}
+
 template <QKVLayout layout, size_t head_dim>
 __host__ __device__ __forceinline__ size_t get_elem_offset_impl(size_t elem_idx, size_t head_idx,
                                                                 size_t feat_idx, size_t seq_len,
