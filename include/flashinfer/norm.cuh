@@ -47,7 +47,9 @@ __global__ void RMSNormKernel(
   const uint32_t d,
   float epsilon
 ) {
-  // TODO(Zihao)
+  const uint32_t i = blockIdx.x;
+  constexpr uint32_t vec_size = 16 / sizeof(T);
+
 }
 
 }  // namespace norm
