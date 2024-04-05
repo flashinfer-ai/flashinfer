@@ -91,10 +91,13 @@ def get_instantiation_cu() -> List[str]:
 
     idtypes = ["i32"]
     prefill_dtypes = ["f16"]
+    decode_dtypes = ["f16"]
     if enable_bf16:
         prefill_dtypes.append("bf16")
-    decode_dtypes = ["f16", "bf16"]
-    fp8_dtypes = ["e4m3", "e5m2"]
+        decode_dtypes.append("bf16")
+    fp8_dtypes = []
+    if enable_fp8:
+        fp8_dtypes = ["e4m3", "e5m2"]
 
     files = []
     # single decode files
