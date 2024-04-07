@@ -180,6 +180,7 @@ endforeach(group_size)
 
 add_library(decode_kernels STATIC ${single_decode_kernels_src} ${batch_decode_kernels_src})
 target_include_directories(decode_kernels PRIVATE ${FLASHINFER_INCLUDE_DIR})
+target_compile_options(decode_kernels PRIVATE -Xcompiler=-fPIC --fatbin-options -compress-all)
 
 # single prefill kernel inst generation
 foreach(group_size IN LISTS GROUP_SIZES)
@@ -262,6 +263,7 @@ endforeach(group_size)
 
 add_library(prefill_kernels STATIC ${single_prefill_kernels_src} ${batch_paged_prefill_kernels_src} ${batch_ragged_prefill_kernels_src})
 target_include_directories(prefill_kernels PRIVATE ${FLASHINFER_INCLUDE_DIR})
+target_compile_options(prefill_kernels PRIVATE -Xcompiler=-fPIC --fatbin-options -compress-all)
 
 if (FLASHINFER_DECODE)
   message(STATUS "Compile single decode kernel benchmarks.")
