@@ -53,15 +53,6 @@ def _get_cache_buf(name: str, bytes: int, device: torch.device):
     return buf
 
 
-def _get_cache_buf(name: str, bytes: int, device: torch.device):
-    key = (name, device)
-    buf = _cache_buf.get(key)
-    if buf is None:
-        buf = torch.empty(bytes, dtype=torch.uint8, device=device)
-        _cache_buf[key] = buf
-    return buf
-
-
 def single_prefill_with_kv_cache(
     q: torch.Tensor,
     k: torch.Tensor,
