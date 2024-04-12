@@ -16,44 +16,73 @@
 #ifndef FLASHINFER_NORM_CUH_
 #define FLASHINFER_NORM_CUH_
 
-#include "../vec_dtypes.cuh"
+#include "math.cuh"
+#include "vec_dtypes.cuh"
 
 namespace flashinfer {
 
 namespace norm {
 
-/*!
- * \brief Fused RMSNorm CUDA Kernel, pin input tensors to shared memory
- * \param x The input tensor of shape (N, D)
- * \param y The output tensor of shape (N, D)
- * \param d The dimension of the input tensor
- */
 template <typename T>
-__global__ void RMSNormSMEMKernel(
-  T* __restrict__ x,
-  T* __restrict__ y,
-  const uint32_t d,
-  float epsilon
-) {
-  const uint32_t i = blockIdx.x;
+__global__ void RMSNormKernel(T* __restrict__ x, T* __restrict__ w, T* __restrict__ y,
+                              const uint32_t d, float eps) {
+  const uint32_t bx = blockIdx.x;
+  const uint32_t tx = threadIdx.x, ty = threadIdx.y;
+  constexpr uint32_t warp_size = 32;
+  const uint32_t num_warps = blockDim.y;
+  // NOTE(Zihao): it's guaranteed that num_warps should be smaller than 32
+  const uint32_t thread_id = tx + ty * warp_size;
+  const uint32_t num_threads = num_warps * warp_size;
   constexpr uint32_t vec_size = 16 / sizeof(T);
+  const uint32_t rounds = d / vec_size;
+  extern __shared__ float smem[];
 
-}
+  float sum_sq = 0.f;
 
-template <typename T>
-__global__ void RMSNormKernel(
-  T* __restrict__ x,
-  T* __restrict__ y,
-  const uint32_t d,
-  float epsilon
-) {
-  const uint32_t i = blockIdx.x;
-  constexpr uint32_t vec_size = 16 / sizeof(T);
+  for (uint32_t i = 0; i < rounds; i++) {
+    vec_t<T, vec_size> x_vec;
+    x_vec.load(x + bx * d + i * num_threads * vec_size + thread_id * vec_size);
+#pragma unroll
+    for (uint32_t j = 0; j < vec_size; j++) {
+      sum_sq += float(x_vec[j]) * float(x_vec[j]);
+    }
+  }
 
+  // first, warp reduce sum
+#pragma unroll
+  for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2) {
+    sum_sq += math::shfl_xor_sync(sum_sq, offset);
+  }
+  smem[ty] = sum_sq;
+  __syncthreads();
+  // then, cross warp reduce sum using only the first warp
+  if (ty == 0) {
+    sum_sq = (tx < num_warps) ? smem[tx] : 0.f;
+    for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2) {
+      sum_sq += math::shfl_xor_sync(sum_sq, offset);
+    }
+    smem[0] = sum_sq;
+  }
+  __syncthreads();
+
+  float norm_factor = math::rsqrt(smem[0] / float(d) + eps);
+
+  for (uint32_t i = 0; i < rounds; i++) {
+    vec_t<T, vec_size> x_vec;
+    vec_t<T, vec_size> w_vec;
+    vec_t<T, vec_size> y_vec;
+    x_vec.load(x + bx * d + i * num_threads * vec_size + thread_id * vec_size);
+    w_vec.load(w + i * num_threads * vec_size + thread_id * vec_size);
+#pragma unroll
+    for (uint32_t j = 0; j < vec_size; j++) {
+      y_vec[j] = float(x_vec[j]) * norm_factor + float(w_vec[j]);
+    }
+    y_vec.store(y + bx * d + i * num_threads * vec_size + thread_id * vec_size);
+  }
 }
 
 }  // namespace norm
 
-}
+}  // namespace flashinfer
 
 #endif  // FLASHINFER_NORM_CUH_

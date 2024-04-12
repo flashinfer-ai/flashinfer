@@ -104,6 +104,16 @@ __forceinline__ __device__ half2 shfl_xor_sync(half2 x, int lane_mask) {
   return __shfl_xor_sync(0xffffffff, x, lane_mask);
 }
 
+/*!
+ * \brief Wrapper of PTX rsqrt approximation instruction, which computes 1/sqrt(x)
+ * \param x input
+ */
+__forceinline__ __device__ float rsqrt(float x) {
+  float y;
+  asm volatile("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+
 }  // namespace math
 }  // namespace flashinfer
 #endif  // FLASHINFER_MATH_CUH_

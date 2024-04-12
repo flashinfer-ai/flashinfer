@@ -27,18 +27,13 @@ namespace sampling {
  * \param x The input tensor of shape (N, D)
  * \param indices The output indices tensor of shape (N,)
  * \param p The probability threshold
- * \param d The 
+ * \param d The
  */
 template <typename DType, typename IdType>
-__global__ void TopPSamplingSMEMKernel(
-  DType* __restrict__ x,
-  IdType* __restrict__ indices,
-  const float p,
-  const uint32_t d
-) {
+__global__ void TopPSamplingSMEMKernel(DType* __restrict__ x, IdType* __restrict__ indices,
+                                       const float p, const uint32_t d) {
   const uint32_t i = blockIdx.x;
   constexpr uint32_t vec_size = 16 / sizeof(DType);
-
 }
 
 /*!
@@ -46,23 +41,17 @@ __global__ void TopPSamplingSMEMKernel(
  * \param x The input tensor of shape (N, D)
  * \param indices The output indices tensor of shape (N,)
  * \param p The probability threshold
- * \param d The 
+ * \param d The
  */
 template <typename DType, typename IdType>
-__global__ void TopPSamplingKernel(
-  DType* __restrict__ x,
-  IdType* __restrict__ indices,
-  const float p,
-  const uint32_t d
-) {
+__global__ void TopPSamplingKernel(DType* __restrict__ x, IdType* __restrict__ indices,
+                                   const float p, const uint32_t d) {
   const uint32_t i = blockIdx.x;
   constexpr uint32_t vec_size = 16 / sizeof(DType);
-
 }
 
+}  // namespace sampling
 
-} // namespace sampling
-
-} // namespace flashinfer
+}  // namespace flashinfer
 
 #endif  // FLASHINFER_SAMPLING_CUH_
