@@ -51,20 +51,20 @@ using namespace flashinfer;
     }                                                                                    \
   }()
 #else
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...) [&]() -> bool {                                                   \
-    switch (pytorch_dtype) {                                        \
-      case at::ScalarType::Half: {                                  \
-        using c_type = nv_half;                                     \
-        return __VA_ARGS__();                                       \
-      }                                                             \
-      default:                                                      \
-        std::ostringstream oss;                                     \
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...) \
+  [&]() -> bool {                                                                        \
+    switch (pytorch_dtype) {                                                             \
+      case at::ScalarType::Half: {                                                       \
+        using c_type = nv_half;                                                          \
+        return __VA_ARGS__();                                                            \
+      }                                                                                  \
+      default:                                                                           \
+        std::ostringstream oss;                                                          \
         oss << __PRETTY_FUNCTION__ << " failed to dispatch data type " << pytorch_dtype; \
-        TORCH_CHECK(false, oss.str()); \
-        return false;                                               \
-    }
-}
-()
+        TORCH_CHECK(false, oss.str());                                                   \
+        return false;                                                                    \
+    }                                                                                    \
+  } ()
 #endif
 
 #ifdef FLASHINFER_ENABLE_FP8
