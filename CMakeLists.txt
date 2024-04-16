@@ -90,7 +90,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
           set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_${dtype}.cu)
           add_custom_command(
             OUTPUT ${generated_kernel_src}
-            COMMAND python ${PROJECT_SOURCE_DIR}/python/generate_single_decode_inst.py ${generated_kernel_src}
+            COMMAND python3 ${PROJECT_SOURCE_DIR}/python/generate_single_decode_inst.py ${generated_kernel_src}
             DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_single_decode_inst.py
             COMMENT "Generating additional source file ${generated_kernel_src}"
             VERBATIM
@@ -103,7 +103,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
           set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_f16.cu)
           add_custom_command(
             OUTPUT ${generated_kernel_src}
-            COMMAND python ${PROJECT_SOURCE_DIR}/python/generate_single_decode_inst.py ${generated_kernel_src}
+            COMMAND python3 ${PROJECT_SOURCE_DIR}/python/generate_single_decode_inst.py ${generated_kernel_src}
             DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_single_decode_inst.py
             COMMENT "Generating additional source file ${generated_kernel_src}"
             VERBATIM
@@ -126,7 +126,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
             set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
             add_custom_command(
               OUTPUT ${generated_kernel_src}
-              COMMAND python ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_decode_inst.py ${generated_kernel_src}
+              COMMAND python3 ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_decode_inst.py ${generated_kernel_src}
               DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_decode_inst.py
               COMMENT "Generating additional source file ${generated_kernel_src}"
               VERBATIM
@@ -139,7 +139,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
             set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_f16_idtype_${idtype}.cu)
             add_custom_command(
               OUTPUT ${generated_kernel_src}
-              COMMAND python ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_decode_inst.py ${generated_kernel_src}
+              COMMAND python3 ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_decode_inst.py ${generated_kernel_src}
               DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_decode_inst.py
               COMMENT "Generating additional source file ${generated_kernel_src}"
               VERBATIM
@@ -153,7 +153,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
           set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_padded_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_${dtype}.cu)
           add_custom_command(
             OUTPUT ${generated_kernel_src}
-            COMMAND python ${PROJECT_SOURCE_DIR}/python/generate_batch_padded_decode_inst.py ${generated_kernel_src}
+            COMMAND python3 ${PROJECT_SOURCE_DIR}/python/generate_batch_padded_decode_inst.py ${generated_kernel_src}
             DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_padded_decode_inst.py
             COMMENT "Generating additional source file ${generated_kernel_src}"
             VERBATIM
@@ -166,7 +166,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
           set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_padded_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_f16.cu)
           add_custom_command(
             OUTPUT ${generated_kernel_src}
-            COMMAND python ${PROJECT_SOURCE_DIR}/python/generate_batch_padded_decode_inst.py ${generated_kernel_src}
+            COMMAND python3 ${PROJECT_SOURCE_DIR}/python/generate_batch_padded_decode_inst.py ${generated_kernel_src}
             DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_padded_decode_inst.py
             COMMENT "Generating additional source file ${generated_kernel_src}"
             VERBATIM
@@ -193,7 +193,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
               set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_prefill_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_causal_${causal}_dtypein_${dtype}_dtypeout_${dtype}.cu)
               add_custom_command(
                 OUTPUT ${generated_kernel_src}
-                COMMAND python ${PROJECT_SOURCE_DIR}/python/generate_single_prefill_inst.py ${generated_kernel_src}
+                COMMAND python3 ${PROJECT_SOURCE_DIR}/python/generate_single_prefill_inst.py ${generated_kernel_src}
                 DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_single_prefill_inst.py
                 COMMENT "Generating additional source file ${generated_kernel_src}"
                 VERBATIM
@@ -219,7 +219,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
                 set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_prefill_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_causal_${causal}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
                 add_custom_command(
                   OUTPUT ${generated_kernel_src}
-                  COMMAND python ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py ${generated_kernel_src}
+                  COMMAND python3 ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py ${generated_kernel_src}
                   DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py
                   COMMENT "Generating additional source file ${generated_kernel_src}"
                   VERBATIM
@@ -246,7 +246,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
                 set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_ragged_prefill_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_causal_${causal}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
                 add_custom_command(
                   OUTPUT ${generated_kernel_src}
-                  COMMAND python ${PROJECT_SOURCE_DIR}/python/generate_batch_ragged_prefill_inst.py ${generated_kernel_src}
+                  COMMAND python3 ${PROJECT_SOURCE_DIR}/python/generate_batch_ragged_prefill_inst.py ${generated_kernel_src}
                   DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_ragged_prefill_inst.py
                   COMMENT "Generating additional source file ${generated_kernel_src}"
                   VERBATIM
