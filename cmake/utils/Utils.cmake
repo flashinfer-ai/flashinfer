@@ -4,6 +4,10 @@ macro(__flashinfer_option variable description value)
   endif()
 endmacro()
 
+macro(flashinfer_list_option variable description value)
+  __flashinfer_option(${variable} "${description}" "${value}")
+endmacro()
+
 set(FLASHINFER_ALL_OPTIONS)
 
 #######################################################
@@ -15,7 +19,7 @@ macro(flashinfer_option variable description value)
   set(__value ${value})
   set(__condition "")
   set(__varname "__value")
-  list(APPEND TVM_ALL_OPTIONS ${variable})
+  list(APPEND FLASHINFER_ALL_OPTIONS ${variable})
   foreach(arg ${ARGN})
     if(arg STREQUAL "IF" OR arg STREQUAL "if")
       set(__varname "__condition")
@@ -30,11 +34,8 @@ macro(flashinfer_option variable description value)
 
   if(${__condition})
     if("${__value}" MATCHES ";")
-      if(${__value})
-        __flashinfer_option(${variable} "${description}" ON)
-      else()
-        __flashinfer_option(${variable} "${description}" OFF)
-      endif()
+      # list values directly pass through
+      __flashinfer_option(${variable} "${description}" "${__value}")
     elseif(DEFINED ${__value})
       if(${__value})
         __flashinfer_option(${variable} "${description}" ON)

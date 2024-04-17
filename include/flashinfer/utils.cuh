@@ -25,6 +25,11 @@
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
 
+// macro to turn off fp16 qk reduction to reduce binary
+#ifndef FLASHINFER_ALWAYS_DISALLOW_FP16_QK_REDUCTION
+#define FLASHINFER_ALWAYS_DISALLOW_FP16_QK_REDUCTION 0
+#endif
+
 #ifndef NDEBUG
 #define FLASHINFER_CUDA_CALL(func, ...)                                                     \
   {                                                                                         \
@@ -54,6 +59,18 @@
     __VA_ARGS__                                                         \
   }
 
+#if FLASHINFER_ALWAYS_DISALLOW_FP16_QK_REDUCTION
+
+#define DISPATCH_ALLOW_FP16_QK_REDUCTION(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, ...) \
+  if (allow_fp16_qk_reduction) {                                                                \
+    throw std::runtime_error("FP16_QK_REDUCTION disabled at compile time");                     \
+  } else {                                                                                      \
+    constexpr bool ALLOW_FP16_QK_REDUCTION = false;                                             \
+    __VA_ARGS__                                                                                 \
+  }
+
+#else
+
 #define DISPATCH_ALLOW_FP16_QK_REDUCTION(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, ...) \
   if (allow_fp16_qk_reduction) {                                                                \
     constexpr bool ALLOW_FP16_QK_REDUCTION = true;                                              \
@@ -62,6 +79,9 @@
     constexpr bool ALLOW_FP16_QK_REDUCTION = false;                                             \
     __VA_ARGS__                                                                                 \
   }
+
+#endif
+
 
 #define DISPATCH_PAGE_SIZE(page_size, PAGE_SIZE, ...)  \
   if (page_size == 1) {                                \

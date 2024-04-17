@@ -27,6 +27,15 @@ flashinfer_option(FLASHINFER_CASCADE "Whether to compile cascade kernel tests/be
 flashinfer_option(FLASHINFER_TVM_BINDING "Whether to compile tvm binding or not." OFF)
 flashinfer_option(FLASHINFER_TVM_HOME "The path to tvm for building tvm binding." "")
 
+# The following configurations can impact the binary
+# size of the generated library
+flashinfer_option(FLASHINFER_GEN_GROUP_SIZES "Group sizes to enable" 1 4 6 8)
+flashinfer_option(FLASHINFER_GEN_HEAD_DIMS "Head dims to enable" 64 128 256)
+flashinfer_option(FLASHINFER_GEN_KV_LAYOUTS "KV layouts to enable" 0 1)
+flashinfer_option(FLASHINFER_GEN_POS_ENCODING_MODES "Pos encodings to enable" 0 1 2)
+flashinfer_option(FLASHINFER_GEN_ALLOW_FP16_QK_REDUCTIONS "QK reductions to enable" "false" "true")
+flashinfer_option(FLASHINFER_GEN_CASUALS "Casual modes to enable" "false" "true")
+
 if(DEFINED FLASHINFER_CUDA_ARCHITECTURES)
   message(STATUS "CMAKE_CUDA_ARCHITECTURES set to ${FLASHINFER_CUDA_ARCHITECTURES}.")
   set(CMAKE_CUDA_ARCHITECTURES ${FLASHINFER_CUDA_ARCHITECTURES})
@@ -58,12 +67,12 @@ if(FLASHINFER_ENABLE_BF16)
 endif(FLASHINFER_ENABLE_BF16)
 
 # generate kernel inst
-set (GROUP_SIZES 1 4 6 8)
-set (HEAD_DIMS 64 128 256)
-set (KV_LAYOUTS 0 1)
-set (POS_ENCODING_MODES 0 1 2)
-set (ALLOW_FP16_QK_REDUCTIONS "false" "true")
-set (CAUSALS "false" "true")
+set (GROUP_SIZES ${FLASHINFER_GEN_GROUP_SIZES})
+set (HEAD_DIMS ${FLASHINFER_GEN_HEAD_DIMS})
+set (KV_LAYOUTS ${FLASHINFER_GEN_KV_LAYOUTS})
+set (POS_ENCODING_MODES ${FLASHINFER_GEN_POS_ENCODING_MODES})
+set (ALLOW_FP16_QK_REDUCTIONS ${FLASHINFER_GEN_ALLOW_FP16_QK_REDUCTIONS})
+set (CAUSALS ${FLASHINFER_GEN_CASUALS})
 set (DECODE_DTYPES "f16")
 set (PREFILL_DTYPES "f16")
 set (DECODE_F8_DTYPES)
@@ -79,7 +88,20 @@ if(FLASHINFER_ENABLE_BF16)
   list(APPEND PREFILL_DTYPES "bf16")
 endif(FLASHINFER_ENABLE_BF16)
 
+# log options
+message(STATUS "FLASHINFER_GROUP_SIZES=${GROUP_SIZES}")
+message(STATUS "FLASHINFER_HEAD_DIMS=${HEAD_DIMS}")
+message(STATUS "FLASHINFER_KV_LAYOUTS=${KV_LAYOUTS}")
+message(STATUS "FLASHINFER_POS_ENCODING_MODES=${POS_ENCODING_MODES}")
+message(STATUS "FLASHINFER_ALLOW_FP16_QK_REDUCTIONS=${ALLOW_FP16_QK_REDUCTIONS}")
+message(STATUS "FLASHINFER_CAUSALS=${CAUSALS}")
+
 file(MAKE_DIRECTORY ${PROJECT_SOURCE_DIR}/src/generated)
+
+if(ALLOW_FP16_QK_REDUCTIONS STREQUAL "false")
+  add_definitions(-DFLASHINFER_ALWAYS_DISALLOW_FP16_QK_REDUCTIONS=1)
+  message(STATUS "Set FLASHINFER_ALWAYS_DISALLOW_FP16_QK_REDUCTIONS=1 at compile time")
+endif()
 
 # single decode kernel inst generation
 foreach(group_size IN LISTS GROUP_SIZES)
@@ -108,7 +130,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
             COMMENT "Generating additional source file ${generated_kernel_src}"
             VERBATIM
           )
-          list(APPEND single_decode_kernels_src ${generated_kernel_src})         
+          list(APPEND single_decode_kernels_src ${generated_kernel_src})
         endforeach(dtype)
       endforeach(pos_encoding_mode)
     endforeach(kv_layout)
@@ -133,7 +155,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
             )
             list(APPEND batch_decode_kernels_src ${generated_kernel_src})
           endforeach(dtype)
-          
+
           # fp8 in, fp16 out
           foreach(dtype IN LISTS DECODE_FP8_DTYPES)
             set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_f16_idtype_${idtype}.cu)
@@ -160,7 +182,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
           )
           list(APPEND batch_decode_kernels_src ${generated_kernel_src})
         endforeach(dtype)
-        
+
         # padded kv-cache, fp8 in, fp16 out
         foreach(dtype IN LISTS DECODE_FP8_DTYPES)
           set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_padded_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_f16.cu)
@@ -224,7 +246,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
                   COMMENT "Generating additional source file ${generated_kernel_src}"
                   VERBATIM
                 )
-                list(APPEND batch_paged_prefill_kernels_src ${generated_kernel_src})    
+                list(APPEND batch_paged_prefill_kernels_src ${generated_kernel_src})
               endforeach(idtype)
             endforeach(dtype)
           endforeach(causal)
@@ -251,7 +273,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
                   COMMENT "Generating additional source file ${generated_kernel_src}"
                   VERBATIM
                 )
-                list(APPEND batch_ragged_prefill_kernels_src ${generated_kernel_src})    
+                list(APPEND batch_ragged_prefill_kernels_src ${generated_kernel_src})
               endforeach(idtype)
             endforeach(dtype)
           endforeach(causal)
