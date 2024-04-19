@@ -26,6 +26,17 @@ namespace cpu_reference {
 using namespace flashinfer;
 
 template <typename T>
+inline std::vector<T> exclusive_prefix_sum(const T* input, size_t batch_size, size_t d) {
+  std::vector<T> output(batch_size * d);
+  for (size_t i = 0; i < batch_size; ++i) {
+    for (size_t j = 0; j < d; ++j) {
+      output[i * d + j] = (j == 0) ? 0 : output[i * d + j - 1] + input[i * d + j - 1];
+    }
+  }
+  return std::move(output);
+}
+
+template <typename T>
 inline std::vector<float> apply_llama_rope(const T* input, size_t D, size_t offset,
                                            float rope_scale, float rope_theta) {
   std::vector<float> rst(D);
