@@ -26,6 +26,34 @@ namespace cpu_reference {
 using namespace flashinfer;
 
 template <typename T>
+inline std::vector<T> rms_norm(const T* input, const T* weight, size_t batch_size, size_t d,
+                               float eps = 1e-5) {
+  std::vector<T> output(batch_size * d);
+  for (size_t i = 0; i < batch_size; ++i) {
+    float sum = 0;
+    for (size_t j = 0; j < d; ++j) {
+      sum += float(input[i * d + j]) * float(input[i * d + j]);
+    }
+    float rms_rcp = 1.f / (std::sqrt(sum / float(d)) + eps);
+    for (size_t j = 0; j < d; ++j) {
+      output[i * d + j] = (float(input[i * d + j]) * rms_rcp) * float(weight[j]);
+    }
+  }
+  return std::move(output);
+}
+
+template <typename T>
+inline std::vector<T> exclusive_prefix_sum(const T* input, size_t batch_size, size_t d) {
+  std::vector<T> output(batch_size * d);
+  for (size_t i = 0; i < batch_size; ++i) {
+    for (size_t j = 0; j < d; ++j) {
+      output[i * d + j] = (j == 0) ? 0 : output[i * d + j - 1] + input[i * d + j - 1];
+    }
+  }
+  return std::move(output);
+}
+
+template <typename T>
 inline std::vector<float> apply_llama_rope(const T* input, size_t D, size_t offset,
                                            float rope_scale, float rope_theta) {
   std::vector<float> rst(D);
