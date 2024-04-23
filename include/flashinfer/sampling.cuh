@@ -21,7 +21,6 @@
 #include <cub/block/block_reduce.cuh>
 #include <cub/block/block_scan.cuh>
 
-#include "gtest/gtest.h"
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
 

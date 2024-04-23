@@ -18,6 +18,7 @@
 
 #include "flashinfer/utils.cuh"
 #include "math.cuh"
+#include "utils.cuh"
 #include "vec_dtypes.cuh"
 
 namespace flashinfer {
@@ -35,7 +36,7 @@ __global__ void RMSNormKernel(T* __restrict__ x, T* __restrict__ w, T* __restric
   const uint32_t thread_id = tx + ty * warp_size;
   const uint32_t num_threads = num_warps * warp_size;
   constexpr uint32_t vec_size = 16 / sizeof(T);
-  const uint32_t rounds = d / vec_size;
+  const uint32_t rounds = ceil_div(d, vec_size * num_threads);
   extern __shared__ float smem[];
 
   float sum_sq = 0.f;

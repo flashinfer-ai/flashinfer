@@ -51,7 +51,7 @@ using namespace flashinfer;
     }                                                                                    \
   }()
 #else
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...) \
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...)                      \
   [&]() -> bool {                                                                        \
     switch (pytorch_dtype) {                                                             \
       case at::ScalarType::Half: {                                                       \
@@ -64,7 +64,7 @@ using namespace flashinfer;
         TORCH_CHECK(false, oss.str());                                                   \
         return false;                                                                    \
     }                                                                                    \
-  } ()
+  }()
 #endif
 
 #ifdef FLASHINFER_ENABLE_FP8
