@@ -16,6 +16,8 @@
 #ifndef FLASHINFER_NORM_CUH_
 #define FLASHINFER_NORM_CUH_
 
+#include <numeric>
+
 #include "flashinfer/utils.cuh"
 #include "math.cuh"
 #include "utils.cuh"
@@ -25,7 +27,7 @@ namespace flashinfer {
 
 namespace norm {
 
-template <typename T>
+template <uint32_t VEC_SIZE, typename T>
 __global__ void RMSNormKernel(T* __restrict__ x, T* __restrict__ w, T* __restrict__ y,
                               const uint32_t d, float eps) {
   const uint32_t bx = blockIdx.x;
@@ -35,20 +37,19 @@ __global__ void RMSNormKernel(T* __restrict__ x, T* __restrict__ w, T* __restric
   // NOTE(Zihao): it's guaranteed that num_warps should be smaller than 32
   const uint32_t thread_id = tx + ty * warp_size;
   const uint32_t num_threads = num_warps * warp_size;
-  constexpr uint32_t vec_size = 16 / sizeof(T);
-  const uint32_t rounds = ceil_div(d, vec_size * num_threads);
+  const uint32_t rounds = ceil_div(d, VEC_SIZE * num_threads);
   extern __shared__ float smem[];
 
   float sum_sq = 0.f;
 
   for (uint32_t i = 0; i < rounds; i++) {
-    vec_t<T, vec_size> x_vec;
+    vec_t<T, VEC_SIZE> x_vec;
     x_vec.fill(0);
-    if ((i * num_threads + thread_id) * vec_size < d) {
-      x_vec.load(x + bx * d + i * num_threads * vec_size + thread_id * vec_size);
+    if ((i * num_threads + thread_id) * VEC_SIZE < d) {
+      x_vec.load(x + bx * d + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
     }
 #pragma unroll
-    for (uint32_t j = 0; j < vec_size; j++) {
+    for (uint32_t j = 0; j < VEC_SIZE; j++) {
       sum_sq += float(x_vec[j]) * float(x_vec[j]);
     }
   }
@@ -75,21 +76,21 @@ __global__ void RMSNormKernel(T* __restrict__ x, T* __restrict__ w, T* __restric
   float rms_rcp = math::rsqrt(smem[0] / float(d) + eps);
 
   for (uint32_t i = 0; i < rounds; i++) {
-    vec_t<T, vec_size> x_vec;
-    vec_t<T, vec_size> w_vec;
-    vec_t<T, vec_size> y_vec;
+    vec_t<T, VEC_SIZE> x_vec;
+    vec_t<T, VEC_SIZE> w_vec;
+    vec_t<T, VEC_SIZE> y_vec;
     x_vec.fill(0);
     w_vec.fill(0);
-    if ((i * num_threads + thread_id) * vec_size < d) {
-      x_vec.load(x + bx * d + i * num_threads * vec_size + thread_id * vec_size);
-      w_vec.load(w + i * num_threads * vec_size + thread_id * vec_size);
+    if ((i * num_threads + thread_id) * VEC_SIZE < d) {
+      x_vec.load(x + bx * d + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+      w_vec.load(w + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
     }
 #pragma unroll
-    for (uint32_t j = 0; j < vec_size; j++) {
+    for (uint32_t j = 0; j < VEC_SIZE; j++) {
       y_vec[j] = float(x_vec[j]) * rms_rcp * float(w_vec[j]);
     }
-    if ((i * num_threads + thread_id) * vec_size < d) {
-      y_vec.store(y + bx * d + i * num_threads * vec_size + thread_id * vec_size);
+    if ((i * num_threads + thread_id) * VEC_SIZE < d) {
+      y_vec.store(y + bx * d + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
     }
   }
 }
@@ -97,18 +98,19 @@ __global__ void RMSNormKernel(T* __restrict__ x, T* __restrict__ w, T* __restric
 template <typename T>
 cudaError_t RMSNorm(T* x, T* w, T* y, uint32_t batch_size, uint32_t d, float eps = 1e-5,
                     cudaStream_t stream = 0) {
-  constexpr uint32_t vec_size = 16 / sizeof(T);
-  if (d % vec_size != 0) {
-    return cudaErrorInvalidValue;
-  }
+  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+
   const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
   const uint32_t num_warps = ceil_div(block_size, 32);
   dim3 nblks(batch_size);
   dim3 nthrs(32, num_warps);
   const uint32_t smem_size = num_warps * sizeof(float);
-  auto kernel = RMSNormKernel<T>;
   void* args[] = {&x, &w, &y, &d, &eps};
-  FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+
+  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+    auto kernel = RMSNormKernel<VEC_SIZE, T>;
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  });
   return cudaSuccess;
 }
 

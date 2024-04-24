@@ -188,84 +188,10 @@ void _TestSamplingFromProb(size_t batch_size, size_t vocab_size) {
             << ", accuracy test passed." << std::endl;
 }
 
-template <typename T>
-void _TestInclusiveExclusiveParallelScan(size_t batch_size, size_t d, bool pin_smem) {
-  std::vector<T> probs_h(batch_size * d);
-  utils::vec_uniform_<T>(probs_h, 0, 1);
-
-  // normalize the probs_h
-  for (size_t i = 0; i < batch_size; ++i) {
-    T sum = 0;
-    for (size_t j = 0; j < d; ++j) {
-      sum += probs_h[i * d + j];
-    }
-    for (size_t j = 0; j < d; ++j) {
-      probs_h[i * d + j] /= sum;
-    }
-  }
-
-  thrust::device_vector<T> probs_d(probs_h);
-  thrust::device_vector<T> exclusive_cdf_d(batch_size * d);
-
-  if (pin_smem) {
-    auto status = sampling::DebugThreadBlockSMEMPrefixSum<T>(
-        thrust::raw_pointer_cast(probs_d.data()), thrust::raw_pointer_cast(exclusive_cdf_d.data()),
-        batch_size, d);
-    EXPECT_EQ(status, cudaSuccess)
-        << "DebugThreadBlockSMEMPrefixSum kernel launch failed, error message: "
-        << cudaGetErrorString(status);
-  } else {
-    auto status = sampling::DebugThreadBlockPrefixSum<T>(
-        thrust::raw_pointer_cast(probs_d.data()), thrust::raw_pointer_cast(exclusive_cdf_d.data()),
-        batch_size, d);
-    EXPECT_EQ(status, cudaSuccess)
-        << "DebugThreadBlockPrefixSum kernel launch failed, error message: "
-        << cudaGetErrorString(status);
-  }
-
-  thrust::host_vector<T> exclusive_cdf_h(exclusive_cdf_d);
-  std::vector<T> exclusive_cdf_ref_h =
-      cpu_reference::exclusive_prefix_sum(probs_h.data(), batch_size, d);
-  size_t num_result_errors_atol_1e_3_rtol_1e_3 = 0;
-  bool nan_detected = false;
-  for (uint32_t i = 0; i < batch_size; ++i) {
-    for (uint32_t j = 0; j < d; ++j) {
-      if (isnan(float(exclusive_cdf_h[i * d + j]))) {
-        nan_detected = true;
-      }
-      if (!utils::isclose(exclusive_cdf_h[i * d + j], exclusive_cdf_ref_h[i * d + j], 1e-3, 1e-3)) {
-        std::cout << "i: " << i << ", j: " << j
-                  << ", exclusive_cdf_h: " << exclusive_cdf_h[i * d + j]
-                  << ", exclusive_cdf_ref_h: " << exclusive_cdf_ref_h[i * d + j] << std::endl;
-      }
-      num_result_errors_atol_1e_3_rtol_1e_3 +=
-          !utils::isclose(exclusive_cdf_h[i * d + j], exclusive_cdf_ref_h[i * d + j], 1e-3, 1e-3);
-    }
-  }
-  float result_accuracy =
-      1.0f - float(num_result_errors_atol_1e_3_rtol_1e_3) / float(batch_size * d);
-  std::cout << "batch_size: " << batch_size << ", d: " << d << ", pin_smem: " << pin_smem
-            << ", result_accuracy: " << result_accuracy << ", nan_detected: " << nan_detected
-            << std::endl;
-  EXPECT_GT(result_accuracy, 0.99) << "Result accuracy test failed.";
-  EXPECT_FALSE(nan_detected) << "NaN detected in the output.";
-}
-
-template <typename T>
-void TestInclusiveExclusiveParallelScan() {
-  for (size_t batch_size : {1, 17, 333}) {
-    for (size_t d : {24, 4096, 32000}) {
-      for (bool pin_smem : {true, false}) {
-        _TestInclusiveExclusiveParallelScan<T>(batch_size, d, pin_smem);
-      }
-    }
-  }
-}
-
 template <typename T, typename IdType>
 void TestSamplingFromProb() {
   for (size_t batch_size : {1, 7, 333}) {
-    for (size_t d : {24, 4096, 32000, 128000}) {
+    for (size_t d : {24, 97, 1002, 4096, 32000, 128000}) {
       _TestSamplingFromProb<T, IdType>(batch_size, d);
     }
   }
@@ -275,7 +201,7 @@ template <typename T, typename IdType>
 void TestTopKSamplingFromProb() {
   for (size_t batch_size : {1, 7, 333}) {
     for (size_t k : {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}) {
-      for (size_t d : {24, 4096, 32000, 128000}) {
+      for (size_t d : {24, 97, 1002, 4096, 32000, 128000}) {
         _TestTopKSamplingFromProb<T, IdType>(batch_size, k, d);
       }
     }
@@ -286,7 +212,7 @@ template <typename T, typename IdType>
 void TestTopPSamplingFromProb() {
   for (size_t batch_size : {1, 7, 333}) {
     for (size_t k : {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}) {
-      for (size_t d : {24, 4096, 32000, 128000}) {
+      for (size_t d : {24, 4096, 1002, 32000, 128000}) {
         _TestTopPSamplingFromProb<T, IdType>(batch_size, k, d);
       }
     }
@@ -303,8 +229,4 @@ TEST(FlashInferCorrectnessTests, TestTopPSamplingFromProbFP32) {
 
 TEST(FlashInferCorrectnessTests, TestSamplingFromProbFP32) {
   TestSamplingFromProb<float, int32_t>();
-}
-
-TEST(FlashInferCorrectnessTests, TestInclusiveExclusiveParallelScanFP32) {
-  TestInclusiveExclusiveParallelScan<float>();
 }

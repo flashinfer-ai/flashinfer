@@ -67,7 +67,7 @@ void _TestRMSNormCorrectness(uint32_t batch_size, uint32_t d) {
 template <typename T>
 void TestRMSNormCorrectness() {
   for (size_t batch_size : {1, 3, 7, 19, 733}) {
-    for (size_t d : {128, 512, 3072, 4096, 8192, 16384}) {
+    for (size_t d : {37, 128, 512, 1002, 3072, 4096, 8192, 16384}) {
       _TestRMSNormCorrectness<T>(batch_size, d);
     }
   }
