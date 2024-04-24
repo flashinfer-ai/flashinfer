@@ -87,9 +87,9 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     float* lse, uint32_t num_qo_tiles, float sm_scale, float rope_scale, float rope_theta,
     cudaStream_t stream);
 
-template <PageStorage page_storage, QKVLayout kv_layout, uint32_t GROUP_SIZE, uint32_t HEAD_DIM,
-          PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL,
-          typename DTypeIn, typename DTypeOut, typename IdType>
+template <PageStorage page_storage, QKVLayout kv_layout, uint32_t PAGE_SIZE, uint32_t GROUP_SIZE,
+          uint32_t HEAD_DIM, PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION,
+          bool CAUSAL, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
     BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, IdType* q_offset,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, DTypeOut* o, float* lse,
@@ -111,14 +111,13 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
     throw std::runtime_error(err_msg.str());
   }
 
-  DISPATCH_NUM_FRAGS_X(
-      num_frags_x, NUM_FRAGS_X, {DISPATCH_PAGE_SIZE(paged_kv.page_size, PAGE_SIZE, {
-        return BatchPrefillWithPagedKVCacheDispatched<
-            page_storage, kv_layout, NUM_FRAGS_X, PAGE_SIZE, GROUP_SIZE, HEAD_DIM,
-            pos_encoding_mode, ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
-            q, request_indices, tile_indices, qo_indptr, q_offset, paged_kv, o, tmp, lse,
-            num_qo_tiles, sm_scale, rope_scale, rope_theta, stream);
-      })});
+  DISPATCH_NUM_FRAGS_X(num_frags_x, NUM_FRAGS_X, {
+    return BatchPrefillWithPagedKVCacheDispatched<
+        page_storage, kv_layout, NUM_FRAGS_X, PAGE_SIZE, GROUP_SIZE, HEAD_DIM, pos_encoding_mode,
+        ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
+        q, request_indices, tile_indices, qo_indptr, q_offset, paged_kv, o, tmp, lse, num_qo_tiles,
+        sm_scale, rope_scale, rope_theta, stream);
+  });
   return cudaSuccess;
 }
 
@@ -138,18 +137,19 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
       num_qo_heads / num_kv_heads, GROUP_SIZE,
       {DISPATCH_HEAD_DIM(
           head_dim, HEAD_DIM,
-          {DISPATCH_CAUSAL(
-              causal, CAUSAL,
-              {DISPATCH_POS_ENCODING_MODE(
-                  pos_encoding_mode, pos_encoding_mode,
-                  {DISPATCH_ALLOW_FP16_QK_REDUCTION(
-                      allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
-                        return BatchPrefillWithPagedKVCacheWrapperDispatched<
-                            page_storage, kv_layout, GROUP_SIZE, HEAD_DIM, pos_encoding_mode,
-                            ALLOW_FP16_QK_REDUCTION, CAUSAL, DTypeIn, DTypeOut, IdType>(
-                            handler, q, qo_indptr, q_offset, paged_kv, o, lse, sm_scale, rope_scale,
-                            rope_theta, stream);
-                      })})})})});
+          {DISPATCH_CAUSAL(causal, CAUSAL,
+                           {DISPATCH_POS_ENCODING_MODE(
+                               pos_encoding_mode, pos_encoding_mode,
+                               {DISPATCH_ALLOW_FP16_QK_REDUCTION(
+                                   allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
+                                   {DISPATCH_PAGE_SIZE(paged_kv.page_size, PAGE_SIZE, {
+                                     return BatchPrefillWithPagedKVCacheWrapperDispatched<
+                                         page_storage, kv_layout, PAGE_SIZE, GROUP_SIZE, HEAD_DIM,
+                                         pos_encoding_mode, ALLOW_FP16_QK_REDUCTION, CAUSAL,
+                                         DTypeIn, DTypeOut, IdType>(handler, q, qo_indptr, q_offset,
+                                                                    paged_kv, o, lse, sm_scale,
+                                                                    rope_scale, rope_theta, stream);
+                                   })})})})})});
   return cudaSuccess;
 }
 
