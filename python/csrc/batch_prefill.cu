@@ -112,20 +112,22 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
                 allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
                   return DISPATCH_pos_encoding_mode(
                       PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
-                        cudaError_t status = BatchPrefillWithPagedKVCacheWrapperDispatched<
-                            PageStorage::kIndices, KV_LAYOUT, GROUP_SIZE, HEAD_DIM,
-                            POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION, CAUSAL, c_type, c_type,
-                            int32_t>(
-                            &handler_, static_cast<c_type*>(q.data_ptr()),
-                            static_cast<int32_t*>(qo_indptr.data_ptr()),
-                            /*q_offset=*/nullptr, paged_kv, static_cast<c_type*>(o.data_ptr()),
-                            /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                            sm_scale, rope_scale, rope_theta,
-                            /*stream=*/torch_current_stream);
-                        TORCH_CHECK(status == cudaSuccess,
-                                    "BatchPrefillWithPagedKVCache failed with error code ",
-                                    cudaGetErrorString(status));
-                        return true;
+                        return DISPATCH_page_size(page_size, PAGE_SIZE, [&] {
+                          cudaError_t status = BatchPrefillWithPagedKVCacheWrapperDispatched<
+                              PageStorage::kIndices, KV_LAYOUT, PAGE_SIZE, GROUP_SIZE, HEAD_DIM,
+                              POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION, CAUSAL, c_type, c_type,
+                              int32_t>(
+                              &handler_, static_cast<c_type*>(q.data_ptr()),
+                              static_cast<int32_t*>(qo_indptr.data_ptr()),
+                              /*q_offset=*/nullptr, paged_kv, static_cast<c_type*>(o.data_ptr()),
+                              /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
+                              sm_scale, rope_scale, rope_theta,
+                              /*stream=*/torch_current_stream);
+                          TORCH_CHECK(status == cudaSuccess,
+                                      "BatchPrefillWithPagedKVCache failed with error code ",
+                                      cudaGetErrorString(status));
+                          return true;
+                        });
                       });
                 });
           });
