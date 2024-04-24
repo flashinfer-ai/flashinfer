@@ -157,18 +157,18 @@ auto bench_sampling_with_probability_f32 = bench_sampling_with_probability<float
 NVBENCH_BENCH(bench_sampling_with_probability_f32)
     .set_name("bench_sampling_with_probability_f32")
     .add_int64_axis("batch_size", {16, 32, 128, 512, 2048})
-    .add_int64_axis("vocab_size", {32000, 128000, 256000});
+    .add_int64_axis("vocab_size", {32000, 32001, 32002, 128000, 256000});
 
 auto bench_top_p_sampling_with_probability_f32 = bench_top_p_sampling_with_probability<float>;
 NVBENCH_BENCH(bench_top_p_sampling_with_probability_f32)
     .set_name("bench_top_p_sampling_with_probability_f32")
     .add_int64_axis("batch_size", {16, 32, 128, 512, 2048})
-    .add_int64_axis("vocab_size", {32000, 128000, 256000})
+    .add_int64_axis("vocab_size", {32000, 32001, 32002, 128000, 256000})
     .add_float64_axis("p", {0.1, 0.5, 0.9, 1.0});
 
 auto bench_top_k_sampling_with_probability_f32 = bench_top_k_sampling_with_probability<float>;
 NVBENCH_BENCH(bench_top_k_sampling_with_probability_f32)
     .set_name("bench_top_k_sampling_with_probability_f32")
     .add_int64_axis("batch_size", {16, 32, 128, 512, 2048})
-    .add_int64_axis("vocab_size", {32000, 128000, 256000})
+    .add_int64_axis("vocab_size", {32000, 32001, 32002, 128000, 256000})
     .add_int64_axis("k", {16, 32, 128, 1024});
