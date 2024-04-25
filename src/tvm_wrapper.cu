@@ -23,6 +23,7 @@
 #include <flashinfer/attention/cascade.cuh>
 #include <flashinfer/decode_attention_decl.cuh>
 #include <flashinfer/prefill_attention_decl.cuh>
+#include <flashinfer/sampling.cuh>
 #include <optional>
 
 using tvm::runtime::Array;
@@ -45,6 +46,26 @@ using namespace flashinfer;
     __VA_ARGS__                                              \
   } else {                                                   \
     LOG(FATAL) << "Unsupported data type " << dl_dtype.code; \
+  }
+
+#define DISPATCH_REJECTIVE_SAMPLING_NUM_ROUNDS(num_rounds, NUM_ROUNDS, ...)         \
+  if (num_rounds == 1) {                                                            \
+    constexpr bool NUM_ROUNDS = 1;                                                  \
+    __VA_ARGS__                                                                     \
+  } else if (num_rounds == 2) {                                                     \
+    constexpr bool NUM_ROUNDS = 2;                                                  \
+    __VA_ARGS__                                                                     \
+  } else if (num_rounds == 4) {                                                     \
+    constexpr bool NUM_ROUNDS = 4;                                                  \
+    __VA_ARGS__                                                                     \
+  } else if (num_rounds == 8) {                                                     \
+    constexpr bool NUM_ROUNDS = 8;                                                  \
+    __VA_ARGS__                                                                     \
+  } else if (num_rounds == 16) {                                                    \
+    constexpr bool NUM_ROUNDS = 16;                                                 \
+    __VA_ARGS__                                                                     \
+  } else {                                                                          \
+    LOG(FATAL) << "Unsupported number of rejective sampling rounds " << num_rounds; \
   }
 
 int _FlashInferSinglePrefillWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, DLTensor* tmp,
@@ -534,6 +555,10 @@ void _FlashInferAttentionPrefillWithRaggedKVCache(
                     /*causal=*/bool(causal), QKVLayout::kNHD, PosEncodingMode(pos_encoding_mode),
                     /*allow_fp16_qk_reduction=*/false, sm_scale, rope_scale, rope_theta,
                     /*sm_scale=*/0);
+            if (status != cudaSuccess) {
+              LOG(FATAL) << "FlashInfer AttentionPrefillWithRaggedKVCache error "
+                         << cudaGetErrorString(status);
+            }
           })})})
 }
 
@@ -609,7 +634,7 @@ void _FlashInferMergeState(DLTensor* v_a, DLTensor* s_a, DLTensor* v_b, DLTensor
                        static_cast<dtype_out*>(v_merged->data), static_cast<float*>(s_merged->data),
                        batch_size, num_heads, head_dim);
         if (status != cudaSuccess) {
-          LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
+          LOG(FATAL) << "FlashInfer CUDA MergeState error " << cudaGetErrorString(status);
         }
       })});
 }
@@ -651,7 +676,7 @@ void _FlashInferMergeStateInPlace(DLTensor* v, DLTensor* s, DLTensor* v_other, D
                           static_cast<dtype*>(v_other->data), static_cast<float*>(s_other->data),
                           batch_size, num_heads, head_dim);
     if (status != cudaSuccess) {
-      LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
+      LOG(FATAL) << "FlashInfer CUDA MergeStateInPlace error " << cudaGetErrorString(status);
     }
   });
 }
@@ -670,6 +695,97 @@ void _FlashInferBatchQKApplyRotaryInPlace(DLTensor* q, DLTensor* k, DLTensor* in
           LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
         }
       })});
+}
+
+void _FlashInferParallelSamplingFromProb(DLTensor* probs, DLTensor* uniform_samples,
+                                         DLTensor* row_indices, DLTensor* sampled_token_ids) {
+  CHECK_EQ(probs->device.device_type, kDLCUDA) << "The device of probs must be CUDA.";
+  CHECK_EQ(uniform_samples->device.device_type, kDLCUDA)
+      << "The device of uniform_samples must be CUDA.";
+  CHECK_EQ(row_indices->device.device_type, kDLCUDA) << "The device of row_indices must be CUDA.";
+  CHECK_EQ(sampled_token_ids->device.device_type, kDLCUDA)
+      << "The device of sampled_token_ids must be CUDA.";
+
+  int dev_id = probs->device.device_id;
+  CHECK_EQ(uniform_samples->device.device_id, dev_id);
+  CHECK_EQ(row_indices->device.device_id, dev_id);
+  CHECK_EQ(sampled_token_ids->device.device_id, dev_id);
+
+  CHECK(probs->dtype.lanes == 1 && uniform_samples->dtype.lanes == 1 &&
+        row_indices->dtype.lanes == 1 && sampled_token_ids->dtype.lanes == 1);
+  CHECK(probs->dtype.code == kDLFloat && probs->dtype.bits == 32);
+  CHECK(uniform_samples->dtype.code == kDLFloat && uniform_samples->dtype.bits == 32);
+  CHECK(row_indices->dtype.code == kDLInt && row_indices->dtype.bits == 32);
+  CHECK(sampled_token_ids->dtype.code == kDLInt && sampled_token_ids->dtype.bits == 32);
+
+  CHECK_EQ(probs->ndim, 2);              // num_probs, vocab_size
+  CHECK_EQ(uniform_samples->ndim, 1);    // batch_size,
+  CHECK_EQ(row_indices->ndim, 1);        // batch_size,
+  CHECK_EQ(sampled_token_ids->ndim, 1);  // batch_size,
+  int64_t num_probs = probs->shape[0];
+  int64_t vocab_size = probs->shape[1];
+  int64_t batch_size = row_indices->shape[0];
+  CHECK_EQ(uniform_samples->shape[0], batch_size);
+  CHECK_EQ(sampled_token_ids->shape[0], batch_size);
+
+  cudaError_t status = sampling::ParallelSamplingFromProb<float, int32_t>(
+      static_cast<float*>(probs->data), static_cast<float*>(uniform_samples->data),
+      static_cast<int32_t*>(sampled_token_ids->data), static_cast<int32_t*>(row_indices->data),
+      batch_size, vocab_size);
+  if (status != cudaSuccess) {
+    LOG(FATAL) << "FlashInfer ParallelTopPSamplingFromProb error " << cudaGetErrorString(status);
+  }
+}
+
+void _FlashInferParallelTopPSamplingFromProb(DLTensor* probs, DLTensor* uniform_samples,
+                                             DLTensor* row_indices, DLTensor* top_p,
+                                             DLTensor* sampled_token_ids, int num_rounds) {
+  CHECK_EQ(probs->device.device_type, kDLCUDA) << "The device of probs must be CUDA.";
+  CHECK_EQ(uniform_samples->device.device_type, kDLCUDA)
+      << "The device of uniform_samples must be CUDA.";
+  CHECK_EQ(row_indices->device.device_type, kDLCUDA) << "The device of row_indices must be CUDA.";
+  CHECK_EQ(top_p->device.device_type, kDLCUDA) << "The device of top_p must be CUDA.";
+  CHECK_EQ(sampled_token_ids->device.device_type, kDLCUDA)
+      << "The device of sampled_token_ids must be CUDA.";
+
+  int dev_id = probs->device.device_id;
+  CHECK_EQ(uniform_samples->device.device_id, dev_id);
+  CHECK_EQ(row_indices->device.device_id, dev_id);
+  CHECK_EQ(top_p->device.device_id, dev_id);
+  CHECK_EQ(sampled_token_ids->device.device_id, dev_id);
+
+  CHECK(probs->dtype.lanes == 1 && uniform_samples->dtype.lanes == 1 &&
+        row_indices->dtype.lanes == 1 && top_p->dtype.lanes == 1 &&
+        sampled_token_ids->dtype.lanes == 1);
+  CHECK(probs->dtype.code == kDLFloat && probs->dtype.bits == 32);
+  CHECK(uniform_samples->dtype.code == kDLFloat && uniform_samples->dtype.bits == 32);
+  CHECK(top_p->dtype.code == kDLFloat && top_p->dtype.bits == 32);
+  CHECK(row_indices->dtype.code == kDLInt && row_indices->dtype.bits == 32);
+  CHECK(sampled_token_ids->dtype.code == kDLInt && sampled_token_ids->dtype.bits == 32);
+
+  CHECK_EQ(probs->ndim, 2);              // num_probs, vocab_size
+  CHECK_EQ(uniform_samples->ndim, 1);    // batch_size * num_rounds,
+  CHECK_EQ(row_indices->ndim, 1);        // batch_size,
+  CHECK_EQ(top_p->ndim, 1);              // num_probs,
+  CHECK_EQ(sampled_token_ids->ndim, 1);  // batch_size,
+  int64_t num_probs = probs->shape[0];
+  int64_t vocab_size = probs->shape[1];
+  int64_t batch_size = row_indices->shape[0];
+  CHECK_EQ(uniform_samples->shape[0], batch_size * num_rounds);
+  CHECK_EQ(top_p->shape[0], num_probs);
+  CHECK_EQ(sampled_token_ids->shape[0], batch_size);
+
+  DISPATCH_REJECTIVE_SAMPLING_NUM_ROUNDS(num_rounds, rej_samping_num_rounds, {
+    cudaError_t status =
+        sampling::ParallelTopPSamplingFromProb<rej_samping_num_rounds, float, int32_t>(
+            static_cast<float*>(probs->data), static_cast<float*>(uniform_samples->data),
+            static_cast<int32_t*>(sampled_token_ids->data), /*success=*/nullptr,
+            static_cast<int32_t*>(row_indices->data), static_cast<float*>(top_p->data), batch_size,
+            vocab_size);
+    if (status != cudaSuccess) {
+      LOG(FATAL) << "FlashInfer ParallelTopPSamplingFromProb error " << cudaGetErrorString(status);
+    }
+  });
 }
 
 TVM_REGISTER_GLOBAL("flashinfer.attention_kernel_prefill_with_paged_kv_cache")
@@ -708,4 +824,11 @@ TVM_REGISTER_GLOBAL("flashinfer.batch_qk_apply_rotary_in_place")
 
 TVM_REGISTER_GLOBAL("flashinfer.single_prefill")
     .set_body_typed(_FlashInferSinglePrefillWithKVCache);
+
 TVM_REGISTER_GLOBAL("flashinfer.single_decode").set_body_typed(_FlashInferSingleDecodeWithKVCache);
+
+TVM_REGISTER_GLOBAL("flashinfer.sampling.parallel_sampling_from_prob")
+    .set_body_typed(_FlashInferParallelSamplingFromProb);
+
+TVM_REGISTER_GLOBAL("flashinfer.sampling.parallel_top_p_sampling_from_prob")
+    .set_body_typed(_FlashInferParallelTopPSamplingFromProb);

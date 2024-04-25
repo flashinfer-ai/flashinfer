@@ -216,10 +216,14 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, DType* uniform_samples,
   if (tx == 0) {
     if (temp_storage.data.block_aggregate.pair.count + k <= d) {
       // failed to sample within MAX_TOP_P_ROUNDS
-      success[bx] = false;
+      if (success != nullptr) {
+        success[bx] = false;
+      }
     } else {
       output[bx] = sampled_id;
-      success[bx] = true;
+      if (success != nullptr) {
+        success[bx] = true;
+      }
     }
   }
 }
@@ -300,10 +304,14 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
   if (tx == 0) {
     if (q + top_p <= 1 + eps) {
       // failed to sample within MAX_TOP_P_ROUNDS
-      success[bx] = false;
+      if (success != nullptr) {
+        success[bx] = false;
+      }
     } else {
       output[bx] = sampled_id;
-      success[bx] = true;
+      if (success != nullptr) {
+        success[bx] = true;
+      }
     }
   }
 }
@@ -415,9 +423,8 @@ cudaError_t ParallelTopPSamplingFromProb(T* probs, T* uniform_samples, IdType* o
   dim3 nblks(batch_size);
   dim3 nthrs(BLOCK_THREADS);
   T top_p_placeholder = 0;
-  void* args[] = {&probs,   &uniform_samples,         &output,
-                  &success, &row_indices & top_p_arr, &top_p_placeholder,
-                  &d};
+  void* args[] = {&probs,     &uniform_samples,   &output, &success, &row_indices,
+                  &top_p_arr, &top_p_placeholder, &d};
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
     auto kernel = TopPSamplingFromProbKernel<MAX_TOP_P_ROUNDS, BLOCK_THREADS,
