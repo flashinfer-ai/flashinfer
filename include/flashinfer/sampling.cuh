@@ -16,8 +16,6 @@
 #ifndef FLASHINFER_SAMPLING_CUH_
 #define FLASHINFER_SAMPLING_CUH_
 
-#include <cstddef>
-#include <cstdint>
 #include <cub/block/block_adjacent_difference.cuh>
 #include <cub/block/block_reduce.cuh>
 #include <cub/block/block_scan.cuh>
@@ -384,7 +382,7 @@ cudaError_t TopPSamplingFromProb(T* probs, T* uniform_samples, IdType* output, b
 }
 
 template <uint32_t MAX_TOP_P_ROUNDS, typename T, typename IdType>
-cudaError_t TopPSamplingFromMultipleProb(T* probs, T* uniform_samples, IdType* output,
+cudaError_t ParallelTopPSamplingFromProb(T* probs, T* uniform_samples, IdType* output,
                                          bool* success, IdType* row_indices, T* top_p_arr,
                                          uint32_t batch_size, uint32_t d, cudaStream_t stream = 0) {
   constexpr uint32_t BLOCK_THREADS = 1024;
