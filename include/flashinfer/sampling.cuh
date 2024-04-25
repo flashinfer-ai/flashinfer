@@ -118,8 +118,9 @@ __device__ void DeviceSamplingFromProb(
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm ALGORITHM, uint32_t VEC_SIZE, typename DType,
           typename IdType>
 __global__ void SamplingFromProbKernel(DType* probs, DType* uniform_samples, IdType* output,
-                                       uint32_t d) {
+                                       IdType* row_indices, uint32_t d) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
+  const uint32_t row_idx = row_indices == nullptr ? bx : row_indices[bx];
 
   extern __shared__ __align__(alignof(SamplingTempStorage<DType, BLOCK_THREADS, ALGORITHM>))
       uint8_t smem[];
@@ -133,7 +134,7 @@ __global__ void SamplingFromProbKernel(DType* probs, DType* uniform_samples, IdT
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     probs_vec.fill(DType(0));
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-      probs_vec.load(probs + bx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+      probs_vec.load(probs + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
     }
 
     DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, ALGORITHM, DType>(i, DType(0), u, probs_vec,
@@ -314,7 +315,28 @@ cudaError_t SamplingFromProb(T* probs, T* uniform_samples, IdType* output, uint3
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
   dim3 nblks(batch_size);
   dim3 nthrs(BLOCK_THREADS);
-  void* args[] = {&probs, &uniform_samples, &output, &d};
+  IdType* row_indices_placeholder = nullptr;
+  void* args[] = {&probs, &uniform_samples, &output, &row_indices_placeholder, &d};
+  const uint32_t smem_size =
+      sizeof(SamplingTempStorage<T, BLOCK_THREADS, BLOCK_SCAN_RAKING_MEMOIZE>);
+
+  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+    auto kernel =
+        SamplingFromProbKernel<BLOCK_THREADS, BLOCK_SCAN_RAKING_MEMOIZE, VEC_SIZE, T, IdType>;
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  });
+  return cudaSuccess;
+}
+
+template <typename T, typename IdType>
+cudaError_t ParallelSamplingFromProb(T* probs, T* uniform_samples, IdType* output,
+                                     IdType* row_indices, uint32_t batch_size, uint32_t d,
+                                     cudaStream_t stream = 0) {
+  constexpr uint32_t BLOCK_THREADS = 1024;
+  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+  dim3 nblks(batch_size);
+  dim3 nthrs(BLOCK_THREADS);
+  void* args[] = {&probs, &uniform_samples, &output, &row_indices, &d};
   const uint32_t smem_size =
       sizeof(SamplingTempStorage<T, BLOCK_THREADS, BLOCK_SCAN_RAKING_MEMOIZE>);
 
