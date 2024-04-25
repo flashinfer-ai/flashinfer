@@ -60,8 +60,10 @@ union SamplingTempStorage {
   typename BlockAdjacentDifference<bool, BLOCK_THREADS>::TempStorage adj_diff;
   struct {
     int32_t sampled_id;
-    T block_aggregate;
-    Pair<T> block_aggregate_pair;
+    union {
+      T value;
+      Pair<T> pair;
+    } block_aggregate;
   } data;
 };
 
@@ -80,10 +82,10 @@ __device__ void DeviceSamplingFromProb(
   aggregate_local = BlockReduce<T, BLOCK_THREADS>(temp_storage->reduce)
                         .Sum<VEC_SIZE>(prob_greater_than_threshold);
   if (threadIdx.x == 0) {
-    temp_storage->data.block_aggregate = aggregate_local;
+    temp_storage->data.block_aggregate.value = aggregate_local;
   }
   __syncthreads();
-  aggregate_local = temp_storage->data.block_aggregate;
+  aggregate_local = temp_storage->data.block_aggregate.value;
 
   if (aggregate + aggregate_local > u) {
     BlockScan<T, BLOCK_THREADS, ALGORITHM>(temp_storage->scan)
@@ -198,21 +200,21 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, DType* uniform_samples,
       aggregate_leq_pivot += BlockReduce<Pair<DType>, BLOCK_THREADS>(temp_storage.reduce_pair)
                                  .Sum<VEC_SIZE>(probs_leq_pivot);
       if (tx == 0) {
-        temp_storage.data.block_aggregate_pair = aggregate_leq_pivot;
+        temp_storage.data.block_aggregate.pair = aggregate_leq_pivot;
       }
       __syncthreads();
-      if (temp_storage.data.block_aggregate_pair.count + k > d) {
+      if (temp_storage.data.block_aggregate.pair.count + k > d) {
         break;
       }
     }
-    q = temp_storage.data.block_aggregate_pair.value;
-    if (temp_storage.data.block_aggregate_pair.count + k > d) {
+    q = temp_storage.data.block_aggregate.pair.value;
+    if (temp_storage.data.block_aggregate.pair.count + k > d) {
       break;
     }
   }
   __syncthreads();
   if (tx == 0) {
-    if (temp_storage.data.block_aggregate_pair.count + k <= d) {
+    if (temp_storage.data.block_aggregate.pair.count + k <= d) {
       // failed to sample within MAX_TOP_P_ROUNDS
       success[bx] = false;
     } else {
@@ -276,14 +278,14 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
       aggregate_leq_pivot +=
           BlockReduce<DType, BLOCK_THREADS>(temp_storage.reduce).Sum<VEC_SIZE>(probs_leq_pivot);
       if (tx == 0) {
-        temp_storage.data.block_aggregate = aggregate_leq_pivot;
+        temp_storage.data.block_aggregate.value = aggregate_leq_pivot;
       }
       __syncthreads();
-      if (temp_storage.data.block_aggregate + p > 1 + eps) {
+      if (temp_storage.data.block_aggregate.value + p > 1 + eps) {
         break;
       }
     }
-    q = temp_storage.data.block_aggregate;
+    q = temp_storage.data.block_aggregate.value;
     if (q + p > 1 + eps) {
       break;
     }
