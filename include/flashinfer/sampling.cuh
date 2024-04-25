@@ -57,7 +57,6 @@ union SamplingTempStorage {
   typename BlockReduce<T, BLOCK_THREADS>::TempStorage reduce;
   typename BlockReduce<Pair<T>, BLOCK_THREADS>::TempStorage reduce_pair;
   typename BlockAdjacentDifference<bool, BLOCK_THREADS>::TempStorage adj_diff;
-  T reduce_result;
   struct {
     int32_t sampled_id;
     union {
