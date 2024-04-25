@@ -55,8 +55,10 @@ struct Pair {
 template <typename T, typename ReduceT, uint32_t BLOCK_THREADS, BlockScanAlgorithm ALGORITHM>
 union SamplingTempStorage {
   typename BlockScan<T, BLOCK_THREADS, ALGORITHM>::TempStorage scan;
+  typename BlockReduce<T, BLOCK_THREADS>::TempStorage reduce_;
   typename BlockReduce<ReduceT, BLOCK_THREADS>::TempStorage reduce;
   typename BlockAdjacentDifference<bool, BLOCK_THREADS>::TempStorage adj_diff;
+  T reduce_result;
   struct {
     int32_t sampled_id;
     ReduceT block_aggregate;
@@ -76,30 +78,41 @@ __device__ void DeviceSamplingFromProb(
   for (uint32_t j = 0; j < VEC_SIZE; ++j) {
     prob_greater_than_threshold[j] = (prob_vec[j] > threshold) ? prob_vec[j] : T(0);
   }
-  BlockScan<T, BLOCK_THREADS, ALGORITHM>(temp_storage->scan)
-      .InclusiveSum<VEC_SIZE>(prob_greater_than_threshold, inclusive_cdf, aggregate_local);
-  __syncthreads();
-
-#pragma unroll
-  for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-    inclusive_cdf[j] = inclusive_cdf[j] + aggregate;
-    greater_than_u[j] = inclusive_cdf[j] > u;
+  aggregate_local = BlockReduce<T, BLOCK_THREADS>(temp_storage->reduce_)
+      .Sum<VEC_SIZE>(prob_greater_than_threshold);
+  if (threadIdx.x == 0) {
+    temp_storage->reduce_result = aggregate_local;
   }
-  aggregate += aggregate_local;
-
-  BlockAdjacentDifference<bool, BLOCK_THREADS>(temp_storage->adj_diff)
-      .SubtractLeft<VEC_SIZE>(greater_than_u, greater_than_u, BoolDiffOp());
   __syncthreads();
+  aggregate_local = temp_storage->reduce_result;
 
-  const uint32_t tx = threadIdx.x;
+  if (aggregate > u) {
+    BlockScan<T, BLOCK_THREADS, ALGORITHM>(temp_storage->scan)
+        .InclusiveSum<VEC_SIZE>(prob_greater_than_threshold, inclusive_cdf);
+    __syncthreads();
 
-#pragma unroll
-  for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-    if (greater_than_u[j]) {
-      temp_storage->data.sampled_id = (i * BLOCK_THREADS + tx) * VEC_SIZE + j;
+  #pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      inclusive_cdf[j] = inclusive_cdf[j] + aggregate;
+      greater_than_u[j] = inclusive_cdf[j] > u;
     }
+
+    BlockAdjacentDifference<bool, BLOCK_THREADS>(temp_storage->adj_diff)
+        .SubtractLeft<VEC_SIZE>(greater_than_u, greater_than_u, BoolDiffOp());
+    __syncthreads();
+
+    const uint32_t tx = threadIdx.x;
+
+  #pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      if (greater_than_u[j]) {
+        temp_storage->data.sampled_id = (i * BLOCK_THREADS + tx) * VEC_SIZE + j;
+      }
+    }
+    __syncthreads();
+  } else {
+    aggregate += aggregate_local;
   }
-  __syncthreads();
 }
 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm ALGORITHM, uint32_t VEC_SIZE, typename DType,
