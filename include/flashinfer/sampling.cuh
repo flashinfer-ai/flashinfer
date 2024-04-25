@@ -16,7 +16,6 @@
 #ifndef FLASHINFER_SAMPLING_CUH_
 #define FLASHINFER_SAMPLING_CUH_
 
-#include <cstdint>
 #include <cub/block/block_adjacent_difference.cuh>
 #include <cub/block/block_reduce.cuh>
 #include <cub/block/block_scan.cuh>
@@ -229,9 +228,15 @@ constexpr float eps = 1e-5;
 template <uint32_t MAX_TOP_P_ROUNDS, uint32_t BLOCK_THREADS, BlockScanAlgorithm ALGORITHM,
           uint32_t VEC_SIZE, typename DType, typename IdType>
 __global__ void TopPSamplingFromProbKernel(DType* probs, DType* uniform_samples, IdType* output,
-                                           bool* success, float p, uint32_t d) {
+                                           bool* success, IdType* row_indices, float* top_p_arr,
+                                           float top_p, uint32_t d) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
+
+  if (top_p_arr != nullptr) {
+    top_p = top_p_arr[bx];
+  }
+  const uint32_t row_idx = row_indices == nullptr ? bx : row_indices[bx];
 
   extern __shared__ __align__(alignof(SamplingTempStorage<DType, BLOCK_THREADS, ALGORITHM>))
       uint8_t smem[];
@@ -249,7 +254,7 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
       probs_vec.fill(DType(0));
       if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-        probs_vec.load(probs + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+        probs_vec.load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
       }
 
       DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, ALGORITHM, DType>(i, pivot, u, probs_vec,
@@ -260,13 +265,13 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
     }
     __syncthreads();
     sampled_id = (aggregate > u) ? temp_storage.data.sampled_id : d - 1;
-    pivot = probs[bx * d + sampled_id];
+    pivot = probs[row_idx * d + sampled_id];
 
     DType aggregate_leq_pivot = DType(0);
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
       probs_vec.fill(DType(0));
       if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-        probs_vec.load(probs + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+        probs_vec.load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
       }
 
       DType probs_leq_pivot[VEC_SIZE];
@@ -281,18 +286,18 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
         temp_storage.data.block_aggregate.value = aggregate_leq_pivot;
       }
       __syncthreads();
-      if (temp_storage.data.block_aggregate.value + p > 1 + eps) {
+      if (temp_storage.data.block_aggregate.value + top_p > 1 + eps) {
         break;
       }
     }
     q = temp_storage.data.block_aggregate.value;
-    if (q + p > 1 + eps) {
+    if (q + top_p > 1 + eps) {
       break;
     }
   }
   __syncthreads();
   if (tx == 0) {
-    if (q + p <= 1 + eps) {
+    if (q + top_p <= 1 + eps) {
       // failed to sample within MAX_TOP_P_ROUNDS
       success[bx] = false;
     } else {
@@ -323,7 +328,7 @@ cudaError_t SamplingFromProb(T* probs, T* uniform_samples, IdType* output, uint3
 
 template <uint32_t MAX_TOP_K_ROUNDS, typename T, typename IdType>
 cudaError_t TopKSamplingFromProb(T* probs, T* uniform_samples, IdType* output, bool* success,
-                                 IdType k, uint32_t batch_size, uint32_t d,
+                                 IdType top_k, uint32_t batch_size, uint32_t d,
                                  cudaStream_t stream = 0) {
   constexpr uint32_t BLOCK_THREADS = 1024;
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
@@ -332,7 +337,7 @@ cudaError_t TopKSamplingFromProb(T* probs, T* uniform_samples, IdType* output, b
       sizeof(SamplingTempStorage<T, BLOCK_THREADS, BLOCK_SCAN_RAKING_MEMOIZE>);
   dim3 nblks(batch_size);
   dim3 nthrs(BLOCK_THREADS);
-  void* args[] = {&probs, &uniform_samples, &output, &success, &k, &d};
+  void* args[] = {&probs, &uniform_samples, &output, &success, &top_k, &d};
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
     auto kernel = TopKSamplingFromProbKernel<MAX_TOP_K_ROUNDS, BLOCK_THREADS,
@@ -345,8 +350,9 @@ cudaError_t TopKSamplingFromProb(T* probs, T* uniform_samples, IdType* output, b
 }
 
 template <uint32_t MAX_TOP_P_ROUNDS, typename T, typename IdType>
-cudaError_t TopPSamplingFromProb(T* probs, T* uniform_samples, IdType* output, bool* success, T p,
-                                 uint32_t batch_size, uint32_t d, cudaStream_t stream = 0) {
+cudaError_t TopPSamplingFromProb(T* probs, T* uniform_samples, IdType* output, bool* success,
+                                 T top_p, uint32_t batch_size, uint32_t d,
+                                 cudaStream_t stream = 0) {
   constexpr uint32_t BLOCK_THREADS = 1024;
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
@@ -354,7 +360,42 @@ cudaError_t TopPSamplingFromProb(T* probs, T* uniform_samples, IdType* output, b
       sizeof(SamplingTempStorage<T, BLOCK_THREADS, BLOCK_SCAN_RAKING_MEMOIZE>);
   dim3 nblks(batch_size);
   dim3 nthrs(BLOCK_THREADS);
-  void* args[] = {&probs, &uniform_samples, &output, &success, &p, &d};
+  IdType* row_indices_placeholder = nullptr;
+  T* top_p_arr_placeholder = nullptr;
+  void* args[] = {&probs,
+                  &uniform_samples,
+                  &output,
+                  &success,
+                  &row_indices_placeholder,
+                  &top_p_arr_placeholder,
+                  &top_p,
+                  &d};
+
+  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+    auto kernel = TopPSamplingFromProbKernel<MAX_TOP_P_ROUNDS, BLOCK_THREADS,
+                                             BLOCK_SCAN_RAKING_MEMOIZE, VEC_SIZE, T, IdType>;
+    FLASHINFER_CUDA_CALL(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  });
+  return cudaSuccess;
+}
+
+template <uint32_t MAX_TOP_P_ROUNDS, typename T, typename IdType>
+cudaError_t ParallelTopPSamplingFromProb(T* probs, T* uniform_samples, IdType* output,
+                                         bool* success, IdType* row_indices, T* top_p_arr,
+                                         uint32_t batch_size, uint32_t d, cudaStream_t stream = 0) {
+  constexpr uint32_t BLOCK_THREADS = 1024;
+  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+
+  const uint32_t smem_size =
+      sizeof(SamplingTempStorage<T, BLOCK_THREADS, BLOCK_SCAN_RAKING_MEMOIZE>);
+  dim3 nblks(batch_size);
+  dim3 nthrs(BLOCK_THREADS);
+  T top_p_placeholder = 0;
+  void* args[] = {&probs,   &uniform_samples,         &output,
+                  &success, &row_indices & top_p_arr, &top_p_placeholder,
+                  &d};
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
     auto kernel = TopPSamplingFromProbKernel<MAX_TOP_P_ROUNDS, BLOCK_THREADS,
