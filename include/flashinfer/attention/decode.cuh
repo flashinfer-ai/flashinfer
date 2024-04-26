@@ -72,8 +72,8 @@ __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage
                                            const vec_t<float, vec_size>& q_vec,
                                            const vec_t<float, vec_size>& freq, uint32_t kv_idx_base,
                                            uint32_t iter_base, uint32_t iter_bound,
-                                           const int32_t q_offset, float alibi_slope, float* s,
-                                           state_t<vec_size>& st) {
+                                           const int32_t q_offset, float alibi_slope,
+                                           float sm_scale, float* s, state_t<vec_size>& st) {
   uint32_t tx = threadIdx.x, tz = threadIdx.z;
   float m_prev = st.m;
 #pragma unroll
@@ -100,6 +100,7 @@ __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
       s[j] += alibi_slope * float(int(kv_idx_base + tz * tile_size + j) - q_offset);
     }
+    s[j] *= sm_scale;
     st.m = max(st.m, s[j]);
   }
 
@@ -248,11 +249,6 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
     // do not apply rotary embedding to q matrix
     q_vec.cast_load(q + info.get_qo_elem_offset(0, qo_head_idx, tx * vec_size));
   }
-  // multiple q_vec by sm_scale
-#pragma unroll
-  for (uint32_t i = 0; i < vec_size; ++i) {
-    q_vec[i] *= sm_scale;
-  }
   block.sync();
 
   uint32_t chunk_start = kv_chunk_idx * kv_chunk_size;
@@ -300,7 +296,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
     compute_qk<pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
         k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, stage_idx, q_vec,
         freq, consumer_kv_idx_base, iter * bdy * tile_size_per_bdx * bdz, kv_chunk_size,
-        seq_len - 1, alibi_slope, s, st_local);
+        seq_len - 1, alibi_slope, sm_scale, s, st_local);
     block.sync();
     // load k
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
@@ -400,10 +396,6 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(
     q_vec.cast_load(q + batch_idx * num_qo_heads * head_dim +
                     info.get_qo_elem_offset(0, qo_head_idx, tx * vec_size));
   }
-#pragma unroll
-  for (uint32_t i = 0; i < vec_size; ++i) {
-    q_vec[i] *= sm_scale;
-  }
   block.sync();
 
   // preload k tiles and v tiles
@@ -440,7 +432,8 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(
     block.sync();
     compute_qk<pos_encoding_mode, vec_size, bdx, bdy>(
         k_smem + (stage_idx * bdz + tz) * bdy * head_dim, stage_idx, q_vec, freq,
-        consumer_kv_idx_base, iter * bdy * bdz, seq_len, seq_len - 1, alibi_slope, s, st_local);
+        consumer_kv_idx_base, iter * bdy * bdz, seq_len, seq_len - 1, alibi_slope, sm_scale, s,
+        st_local);
     block.sync();
     // load k
     cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
@@ -571,10 +564,6 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
     // do not apply rotary embedding to q matrix
     q_vec.cast_load(q + (mapped_batch_idx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
   }
-#pragma unroll
-  for (uint32_t i = 0; i < vec_size; ++i) {
-    q_vec[i] *= sm_scale;
-  }
   block.sync();
 
   // preload k/v tiles
@@ -646,7 +635,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
         freq,
         (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[mapped_batch_idx]) +
             cur_chunk_start + iter * tile_size_per_bdx * bdy * bdz,
-        iter * tile_size_per_bdx * bdy * bdz, kv_chunk_len, q_offset_val, alibi_slope, s, st);
+        iter * tile_size_per_bdx * bdy * bdz, kv_chunk_len, q_offset_val, alibi_slope, sm_scale, s,
+        st);
     block.sync();
 
 #pragma unroll
