@@ -48,26 +48,6 @@ using namespace flashinfer;
     LOG(FATAL) << "Unsupported data type " << dl_dtype.code; \
   }
 
-#define DISPATCH_REJECTIVE_SAMPLING_NUM_ROUNDS(num_rounds, NUM_ROUNDS, ...)         \
-  if (num_rounds == 1) {                                                            \
-    constexpr bool NUM_ROUNDS = 1;                                                  \
-    __VA_ARGS__                                                                     \
-  } else if (num_rounds == 2) {                                                     \
-    constexpr bool NUM_ROUNDS = 2;                                                  \
-    __VA_ARGS__                                                                     \
-  } else if (num_rounds == 4) {                                                     \
-    constexpr bool NUM_ROUNDS = 4;                                                  \
-    __VA_ARGS__                                                                     \
-  } else if (num_rounds == 8) {                                                     \
-    constexpr bool NUM_ROUNDS = 8;                                                  \
-    __VA_ARGS__                                                                     \
-  } else if (num_rounds == 16) {                                                    \
-    constexpr bool NUM_ROUNDS = 16;                                                 \
-    __VA_ARGS__                                                                     \
-  } else {                                                                          \
-    LOG(FATAL) << "Unsupported number of rejective sampling rounds " << num_rounds; \
-  }
-
 int _FlashInferSinglePrefillWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, DLTensor* tmp,
                                         bool causal, int64_t kv_layout, int64_t pos_encoding_mode,
                                         bool allow_fp16_qk_reduction, double rope_scale,
@@ -775,17 +755,14 @@ void _FlashInferParallelTopPSamplingFromProb(DLTensor* probs, DLTensor* uniform_
   CHECK_EQ(top_p->shape[0], num_probs);
   CHECK_EQ(sampled_token_ids->shape[0], batch_size);
 
-  DISPATCH_REJECTIVE_SAMPLING_NUM_ROUNDS(num_rounds, rej_samping_num_rounds, {
-    cudaError_t status =
-        sampling::ParallelTopPSamplingFromProb<rej_samping_num_rounds, float, int32_t>(
-            static_cast<float*>(probs->data), static_cast<float*>(uniform_samples->data),
-            static_cast<int32_t*>(sampled_token_ids->data), /*success=*/nullptr,
-            static_cast<int32_t*>(row_indices->data), static_cast<float*>(top_p->data), batch_size,
-            vocab_size);
-    if (status != cudaSuccess) {
-      LOG(FATAL) << "FlashInfer ParallelTopPSamplingFromProb error " << cudaGetErrorString(status);
-    }
-  });
+  cudaError_t status = sampling::ParallelTopPSamplingFromProb<float, int32_t>(
+      static_cast<float*>(probs->data), static_cast<float*>(uniform_samples->data),
+      static_cast<int32_t*>(sampled_token_ids->data), /*success=*/nullptr,
+      static_cast<int32_t*>(row_indices->data), static_cast<float*>(top_p->data), batch_size,
+      vocab_size, num_rounds);
+  if (status != cudaSuccess) {
+    LOG(FATAL) << "FlashInfer ParallelTopPSamplingFromProb error " << cudaGetErrorString(status);
+  }
 }
 
 TVM_REGISTER_GLOBAL("flashinfer.attention_kernel_prefill_with_paged_kv_cache")
