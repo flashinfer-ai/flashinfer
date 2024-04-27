@@ -719,7 +719,7 @@ void _FlashInferParallelSamplingFromProb(DLTensor* probs, DLTensor* uniform_samp
 
 void _FlashInferParallelTopPSamplingFromProb(DLTensor* probs, DLTensor* uniform_samples,
                                              DLTensor* row_indices, DLTensor* top_p,
-                                             DLTensor* sampled_token_ids, int num_rounds) {
+                                             DLTensor* sampled_token_ids) {
   CHECK_EQ(probs->device.device_type, kDLCUDA) << "The device of probs must be CUDA.";
   CHECK_EQ(uniform_samples->device.device_type, kDLCUDA)
       << "The device of uniform_samples must be CUDA.";
@@ -744,14 +744,15 @@ void _FlashInferParallelTopPSamplingFromProb(DLTensor* probs, DLTensor* uniform_
   CHECK(sampled_token_ids->dtype.code == kDLInt && sampled_token_ids->dtype.bits == 32);
 
   CHECK_EQ(probs->ndim, 2);              // num_probs, vocab_size
-  CHECK_EQ(uniform_samples->ndim, 1);    // batch_size * num_rounds,
+  CHECK_EQ(uniform_samples->ndim, 2);    // num_rounds, batch_size
   CHECK_EQ(row_indices->ndim, 1);        // batch_size,
   CHECK_EQ(top_p->ndim, 1);              // num_probs,
   CHECK_EQ(sampled_token_ids->ndim, 1);  // batch_size,
   int64_t num_probs = probs->shape[0];
   int64_t vocab_size = probs->shape[1];
   int64_t batch_size = row_indices->shape[0];
-  CHECK_EQ(uniform_samples->shape[0], batch_size * num_rounds);
+  int64_t num_rounds = uniform_samples->shape[0];
+  CHECK_EQ(uniform_samples->shape[1], batch_size);
   CHECK_EQ(top_p->shape[0], num_probs);
   CHECK_EQ(sampled_token_ids->shape[0], batch_size);
 
