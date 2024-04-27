@@ -28,6 +28,7 @@ from pathlib import Path
 
 def get_cu_file_str(
     group_size,
+    page_size,
     head_dim,
     kv_layout,
     pos_encoding_mode,
@@ -36,7 +37,6 @@ def get_cu_file_str(
     dtype_in,
     dtype_out,
     idtype,
-    page_size_choices=[1, 8, 16, 32],
 ):
     num_frags_x_choices = [1, 2]
     insts = "\n".join(
@@ -62,10 +62,7 @@ def get_cu_file_str(
                 dtype_out=dtype_literal[dtype_out],
                 idtype=idtype_literal[idtype],
             )
-            for num_frags_x, page_size in itertools.product(
-                num_frags_x_choices,
-                page_size_choices,
-            )
+            for num_frags_x in num_frags_x_choices
         ]
     )
 

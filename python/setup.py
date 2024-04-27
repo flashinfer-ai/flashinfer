@@ -64,6 +64,7 @@ def get_instantiation_cu() -> List[str]:
     (root / prefix).mkdir(parents=True, exist_ok=True)
 
     group_sizes = os.environ.get("FLASHINFER_GROUP_SIZES", "1,4,6,8").split(",")
+    page_sizes = os.environ.get("FLASHINFER_PAGE_SIZES", "1,8,16,32").split(",")
     head_dims = os.environ.get("FLASHINFER_HEAD_DIMS", "64,128,256").split(",")
     kv_layouts = os.environ.get("FLASHINFER_KV_LAYOUTS", "0,1").split(",")
     pos_encoding_modes = os.environ.get("FLASHINFER_POS_ENCODING_MODES", "0,1,2").split(
@@ -80,6 +81,7 @@ def get_instantiation_cu() -> List[str]:
         generate_dispatch_inc.get_dispatch_inc_str(
             argparse.Namespace(
                 group_sizes=map(int, group_sizes),
+                page_sizes=map(int, page_sizes),
                 head_dims=map(int, head_dims),
                 kv_layouts=map(int, kv_layouts),
                 pos_encoding_modes=map(int, pos_encoding_modes),
@@ -242,6 +244,7 @@ def get_instantiation_cu() -> List[str]:
     # batch paged prefill files
     for (
         group_size,
+        page_size,
         head_dim,
         kv_layout,
         pos_encoding_mode,
@@ -250,6 +253,7 @@ def get_instantiation_cu() -> List[str]:
         idtype,
     ) in itertools.product(
         group_sizes,
+        page_sizes,
         head_dims,
         kv_layouts,
         pos_encoding_modes,
@@ -258,10 +262,11 @@ def get_instantiation_cu() -> List[str]:
         idtypes,
     ):
         for dtype in prefill_dtypes:
-            fname = f"batch_paged_prefill_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_causal_{causal}_dtypein_{dtype}_dtypeout_{dtype}_idtype_{idtype}.cu"
+            fname = f"batch_paged_prefill_group_{group_size}_page_{page_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_causal_{causal}_dtypein_{dtype}_dtypeout_{dtype}_idtype_{idtype}.cu"
             files.append(prefix + "/" + fname)
             content = generate_batch_paged_prefill_inst.get_cu_file_str(
                 group_size,
+                page_size,
                 head_dim,
                 kv_layout,
                 pos_encoding_mode,
@@ -270,7 +275,6 @@ def get_instantiation_cu() -> List[str]:
                 dtype,
                 dtype,
                 idtype,
-                page_size_choices=[1, 16, 32],
             )
             write_if_different(root / prefix / fname, content)
 
