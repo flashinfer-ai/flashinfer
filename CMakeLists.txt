@@ -37,6 +37,7 @@ flashinfer_option(FLASHINFER_TVM_HOME "The path to tvm for building tvm binding.
 # The following configurations can impact the binary
 # size of the generated library
 flashinfer_option(FLASHINFER_GEN_GROUP_SIZES "Group sizes to enable" 1 4 6 8)
+flashinfer_option(FLASHINFER_GEN_PAGE_SIZES "Prefill page sizes to enable" 1 16 32)
 flashinfer_option(FLASHINFER_GEN_HEAD_DIMS "Head dims to enable" 64 128 256)
 flashinfer_option(FLASHINFER_GEN_KV_LAYOUTS "KV layouts to enable" 0 1)
 flashinfer_option(FLASHINFER_GEN_POS_ENCODING_MODES "Pos encodings to enable" 0 1 2)
@@ -75,6 +76,7 @@ endif(FLASHINFER_ENABLE_BF16)
 
 # generate kernel inst
 set (GROUP_SIZES ${FLASHINFER_GEN_GROUP_SIZES})
+set (PAGE_SIZES ${FLASHINFER_GEN_PAGE_SIZES})
 set (HEAD_DIMS ${FLASHINFER_GEN_HEAD_DIMS})
 set (KV_LAYOUTS ${FLASHINFER_GEN_KV_LAYOUTS})
 set (POS_ENCODING_MODES ${FLASHINFER_GEN_POS_ENCODING_MODES})
@@ -239,29 +241,31 @@ endforeach(group_size)
 
 # batch paged prefill kernel inst generation
 foreach(group_size IN LISTS GROUP_SIZES)
-  foreach(head_dim IN LISTS HEAD_DIMS)
-    foreach(kv_layout IN LISTS KV_LAYOUTS)
-      foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
-        foreach(allow_fp16_qk_reduction IN LISTS ALLOW_FP16_QK_REDUCTIONS)
-          foreach(causal IN LISTS CAUSALS)
-            foreach(dtype IN LISTS PREFILL_DTYPES)
-              foreach(idtype IN LISTS IDTYPES)
-                set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_prefill_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_causal_${causal}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
-                add_custom_command(
-                  OUTPUT ${generated_kernel_src}
-                  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py ${generated_kernel_src}
-                  DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py
-                  COMMENT "Generating additional source file ${generated_kernel_src}"
-                  VERBATIM
-                )
-                list(APPEND batch_paged_prefill_kernels_src ${generated_kernel_src})
-              endforeach(idtype)
-            endforeach(dtype)
-          endforeach(causal)
-        endforeach(allow_fp16_qk_reduction)
-      endforeach(pos_encoding_mode)
-    endforeach(kv_layout)
-  endforeach(head_dim)
+  foreach(page_size IN LISTS PAGE_SIZES)
+    foreach(head_dim IN LISTS HEAD_DIMS)
+      foreach(kv_layout IN LISTS KV_LAYOUTS)
+        foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
+          foreach(allow_fp16_qk_reduction IN LISTS ALLOW_FP16_QK_REDUCTIONS)
+            foreach(causal IN LISTS CAUSALS)
+              foreach(dtype IN LISTS PREFILL_DTYPES)
+                foreach(idtype IN LISTS IDTYPES)
+                  set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_prefill_group_${group_size}_page_${page_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_causal_${causal}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
+                  add_custom_command(
+                    OUTPUT ${generated_kernel_src}
+                    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py ${generated_kernel_src}
+                    DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py
+                    COMMENT "Generating additional source file ${generated_kernel_src}"
+                    VERBATIM
+                  )
+                  list(APPEND batch_paged_prefill_kernels_src ${generated_kernel_src})
+                endforeach(idtype)
+              endforeach(dtype)
+            endforeach(causal)
+          endforeach(allow_fp16_qk_reduction)
+        endforeach(pos_encoding_mode)
+      endforeach(kv_layout)
+    endforeach(head_dim)
+  endforeach(page_size)
 endforeach(group_size)
 
 # batch ragged prefill kernel inst generation
