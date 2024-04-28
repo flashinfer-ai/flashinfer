@@ -139,11 +139,11 @@ __global__ void SamplingFromProbKernel(DType* probs, DType* uniform_samples, IdT
 
     DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, ALGORITHM, DType>(i, DType(0), u, probs_vec,
                                                                       aggregate, &temp_storage);
-    if (aggregate > u) {
+    if (float(aggregate) > u) {
       break;
     }
   }
-  output[bx] = (aggregate > u) ? temp_storage.data.sampled_id : d - 1;
+  output[bx] = (float(aggregate) > u) ? temp_storage.data.sampled_id : d - 1;
 }
 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm ALGORITHM, uint32_t VEC_SIZE, typename DType,
@@ -292,18 +292,18 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
         temp_storage.data.block_aggregate.value = aggregate_leq_pivot;
       }
       __syncthreads();
-      if (temp_storage.data.block_aggregate.value + top_p > 1 + eps) {
+      if (float(temp_storage.data.block_aggregate.value) + top_p > 1 + eps) {
         break;
       }
     }
     q = temp_storage.data.block_aggregate.value;
-    if (q + top_p > 1 + eps) {
+    if (float(q) + top_p > 1 + eps) {
       break;
     }
   }
   __syncthreads();
   if (tx == 0) {
-    if (q + top_p <= 1 + eps) {
+    if (float(q) + top_p <= 1 + eps) {
       // failed to sample within MAX_TOP_P_ROUNDS
       if (success != nullptr) {
         success[bx] = false;
