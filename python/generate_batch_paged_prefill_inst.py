@@ -80,7 +80,7 @@ constexpr PageStorage page_storage = PageStorage::kIndices;
 
 if __name__ == "__main__":
     pattern = (
-        r"batch_paged_prefill_group_([0-9]+)_head_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
+        r"batch_paged_prefill_group_([0-9]+)_page_([0-9]+)_head_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
         r"fp16qkred_([a-z]+)_causal_([a-z]+)_dtypein_([a-z0-9]+)_dtypeout_([a-z0-9]+)_idtype_([a-z0-9]+)\.cu"
     )
     compiled_pattern = re.compile(pattern)
