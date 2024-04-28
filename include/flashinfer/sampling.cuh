@@ -255,7 +255,7 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
   DType pivot = DType(0);
   IdType sampled_id;
   for (uint32_t round = 0; round < max_top_p_rounds; ++round) {
-    DType u = uniform_samples[round * batch_size + bx] * (1 - q);
+    DType u = uniform_samples[round * batch_size + bx] * (DType(1) - q);
     aggregate = DType(0);
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
       probs_vec.fill(DType(0));
