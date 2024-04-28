@@ -288,26 +288,29 @@ __device__ __forceinline__ void load_q_global_smem(uint32_t q_idx_base,
                                                    const uint32_t qo_upper_bound,
                                                    DTypeIn* q_ptr_base, const uint32_t qo_n_stride,
                                                    const uint32_t qo_h_stride, smem_t* q_smem) {
+  constexpr uint32_t rows_per_warp = 16 / (2 * group_size) * 2;
+  constexpr uint32_t aligned_group_size = 16 / rows_per_warp;
   constexpr uint32_t head_dim = num_frags_y * 16;
   constexpr uint32_t channel_size_128b_in = head_dim / num_elems_per_128b<DTypeIn>();
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t q_smem_offset_w =
       smem_t::get_permuted_offset<channel_size_128b_in>(ty * num_frags_x * 16 + tx / 8, tx % 8);
 
-  q_idx_base += (tx / 8) / group_size;
-  q_ptr_base += ((tx / 8) / group_size) * qo_n_stride + ((tx / 8) % group_size) * qo_h_stride;
+  q_idx_base += (tx / 8) / aligned_group_size;
+  q_ptr_base += ((tx / 8) / aligned_group_size) * qo_n_stride;
 #pragma unroll
   for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
     for (uint32_t j = 0; j < 4; ++j) {
-      const uint32_t q_idx = q_idx_base + (fx * 16 + j * 4) / group_size;
-      DTypeIn* q_ptr = q_ptr_base + ((fx * 16 + j * 4) / group_size) * qo_n_stride +
-                       ((fx * 16 + j * 4) % group_size) * qo_h_stride;
+      const uint32_t q_idx = q_idx_base + (fx * 16 + j * 4) / aligned_group_size;
+      const uint32_t group_id = (fx * 16 + j * 4 + tx / 8) % aligned_group_size;
+      DTypeIn* q_ptr = q_ptr_base + ((fx * 16 + j * 4) / aligned_group_size) * qo_n_stride +
+                       group_id * qo_h_stride;
 #pragma unroll
       for (uint32_t fyo = 0; fyo < num_frags_y / 4; ++fyo) {
         // load q fragment from gmem to smem
-        q_smem->load_128b_async<SharedMemFillMode::kNoFill>(q_smem_offset_w, q_ptr,
-                                                            q_idx < qo_upper_bound);
+        q_smem->load_128b_async<SharedMemFillMode::kFillZero>(q_smem_offset_w, q_ptr,
+                                                            q_idx < qo_upper_bound && group_id < group_size);
         q_smem_offset_w = q_smem->advance_offset_by_column<8>(q_smem_offset_w, fyo);
         q_ptr += 8 * num_elems_per_128b<DTypeIn>();
       }
@@ -811,6 +814,8 @@ __device__ __forceinline__ void write_o_reg_gmem(float (*o_frag)[num_frags_y][8]
                                                  const uint32_t qo_upper_bound,
                                                  const uint32_t qo_n_stride,
                                                  const uint32_t qo_h_stride) {
+  constexpr uint32_t rows_per_warp = 16 / (2 * group_size) * 2;
+  constexpr uint32_t aligned_group_size = 16 / rows_per_warp;
   constexpr uint32_t head_dim = num_frags_y * 16;
   constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeOut>();
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
@@ -835,18 +840,19 @@ __device__ __forceinline__ void write_o_reg_gmem(float (*o_frag)[num_frags_y][8]
   uint32_t o_smem_offset_w =
       smem_t::get_permuted_offset<channel_size_128b_out>(ty * num_frags_x * 16 + tx / 8, tx % 8);
 
-  o_idx_base += (tx / 8) / group_size;
-  o_ptr_base += ((tx / 8) / group_size) * qo_n_stride + ((tx / 8) % group_size) * qo_h_stride;
+  o_idx_base += (tx / 8) / aligned_group_size;
+  o_ptr_base += ((tx / 8) / group_size) * qo_n_stride;
 #pragma unroll
   for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
     for (uint32_t j = 0; j < 4; ++j) {
-      const uint32_t o_idx = o_idx_base + (fx * 16 + j * 4) / group_size;
-      DTypeOut* o_ptr = o_ptr_base + ((fx * 16 + j * 4) / group_size) * qo_n_stride +
-                        ((fx * 16 + j * 4) % group_size) * qo_h_stride;
+      const uint32_t o_idx = o_idx_base + (fx * 16 + j * 4) / aligned_group_size;
+      const uint32_t group_id = (fx * 16 + j * 4 + tx / 8) % aligned_group_size;
+      DTypeOut* o_ptr = o_ptr_base + ((fx * 16 + j * 4) / aligned_group_size) * qo_n_stride +
+                        group_id * qo_h_stride;
 #pragma unroll
       for (uint32_t fyo = 0; fyo < num_frags_y / 4; ++fyo) {
-        if (o_idx < qo_upper_bound) {
+        if (o_idx < qo_upper_bound && group_id < group_size) {
           o_smem->store_128b(o_smem_offset_w, o_ptr);
         }
         o_ptr += 8 * num_elems_per_128b<DTypeOut>();
@@ -927,7 +933,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
   constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeOut>();
 
   static_assert(num_frags_z * num_frags_y % num_warps == 0);
-  static_assert(group_size == 1 || group_size % 4 == 0 || group_size == 6);
+  static_assert(group_size == 1 || group_size >= 4 && group_size <=8); 
 
   extern __shared__ uint8_t smem[];
 
@@ -1308,6 +1314,8 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
     IdType* __restrict__ qo_indptr, IdType* __restrict__ q_offset, DTypeOut* __restrict__ o,
     float* __restrict__ tmp, float* __restrict__ lse, float sm_scale, float log2_rope_rcp_scale,
     float log2_rope_rcp_theta) {
+  constexpr uint32_t rows_per_warp = 16 / (2 * group_size) * 2;
+  constexpr uint32_t aligned_group_size = 16 / rows_per_warp;
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
   sm_scale *= math::log2e;
@@ -1322,7 +1330,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
 #pragma unroll
       for (uint32_t j = 0; j < 2; ++j) {
         const uint32_t qo_head_idx =
-            kv_head_idx * group_size + (tx / 4 + j * 8 + fx * 16) % group_size;
+            kv_head_idx * group_size + (tx / 4 + j * 8 + fx * 16) % aligned_group_size;
         alibi_slopes[fx][j] = get_alibi_slope(qo_head_idx, num_qo_heads) * math::log2e;
       }
     }
@@ -1333,7 +1341,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
                  kv_len = (paged_kv.indptr[request_idx + 1] - paged_kv.indptr[request_idx] - 1) *
                               paged_kv.page_size +
                           paged_kv.last_page_len[request_idx];
-  const uint32_t qo_upper_bound = min(qo_len, (tile_idx + 1) * (num_rows_per_cta / group_size));
+  const uint32_t qo_upper_bound = min(qo_len, (tile_idx + 1) * (num_rows_per_cta / aligned_group_size));
 
   constexpr bool partition_kv = false;
   constexpr uint32_t head_dim = num_frags_y * 16;
@@ -1341,7 +1349,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
   constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeOut>();
 
   static_assert(num_frags_z * num_frags_y % num_warps == 0);
-  static_assert(group_size == 1 || group_size % 4 == 0 || group_size == 6);
+  static_assert(group_size == 1 || group_size >= 4 && group_size <= 8);
 
   extern __shared__ uint8_t smem[];
 
@@ -1356,7 +1364,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
   }
   init_states<num_frags_x, num_frags_y>(o_frag, m, d);
 
-  const uint32_t qo_idx_base = ((tile_idx * num_warps + ty) * num_frags_x * 16) / group_size;
+  const uint32_t qo_idx_base = ((tile_idx * num_warps + ty) * num_frags_x * 16) / aligned_group_size;
   const uint32_t qo_n_stride = get_n_stride_impl<QKVLayout::kNHD, head_dim>(num_qo_heads),
                  qo_h_stride = get_h_stride_impl<QKVLayout::kNHD, head_dim>(qo_len);
   smem_t qo_smem(smem);
@@ -1378,11 +1386,11 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
 
   if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
     if (q_offset == nullptr) {
-      q_smem_inplace_apply_rotary_multiply_sm_scale<group_size, num_warps, num_frags_x, num_frags_y,
+      q_smem_inplace_apply_rotary_multiply_sm_scale<aligned_group_size, num_warps, num_frags_x, num_frags_y,
                                                     DTypeIn>(qo_idx_base, qo_len, kv_len, &qo_smem,
                                                              &q_smem_offset_r, rope_freq, sm_scale);
     } else {
-      q_smem_inplace_apply_rotary_with_pos_multiply_sm_scale<group_size, num_warps, num_frags_x,
+      q_smem_inplace_apply_rotary_with_pos_multiply_sm_scale<aligned_group_size, num_warps, num_frags_x,
                                                              num_frags_y, DTypeIn>(
           qo_indptr[request_idx] + qo_idx_base, q_offset, &qo_smem, &q_smem_offset_r, rope_freq,
           sm_scale);
@@ -1411,13 +1419,13 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
 
   const uint32_t num_iterations = ceil_div(
       (causal ? min(kv_len,
-                    kv_len - qo_len + ((tile_idx + 1) * num_frags_x * num_warps * 16) / group_size)
+                    kv_len - qo_len + ((tile_idx + 1) * num_frags_x * num_warps * 16) / aligned_group_size)
               : kv_len),
       16 * num_frags_z);
 
   const uint32_t mask_iteration =
       (causal
-           ? min(kv_len + (tile_idx * num_warps * num_frags_x * 16) / group_size - qo_len, kv_len)
+           ? min(kv_len + (tile_idx * num_warps * num_frags_x * 16) / aligned_group_size - qo_len, kv_len)
            : kv_len) /
       (16 * num_frags_z);
 
@@ -1440,12 +1448,12 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
 
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
       // TODO(Zihao): handle the case that q_offset is specified
-      apply_alibi_bias<group_size, num_frags_x, num_frags_z>(
+      apply_alibi_bias<aligned_group_size, num_frags_x, num_frags_z>(
           qo_idx_base, iter * 16 * num_frags_z, int(kv_len) - int(qo_len), alibi_slopes, s_frag);
     }
     // apply mask
     if (iter >= mask_iteration) {
-      mask_s<partition_kv, causal, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
+      mask_s<partition_kv, causal, aligned_group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
           qo_idx_base, iter * 16 * num_frags_z, qo_len, kv_len, kv_len, s_frag);
     }
 
@@ -1487,10 +1495,10 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
     for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
       for (uint32_t j = 0; j < 2; ++j) {
-        const uint32_t qo_head_idx =
-            kv_head_idx * group_size + (tx / 4 + j * 8 + fx * 16) % group_size;
-        const uint32_t qo_idx = qo_idx_base + (tx / 4 + j * 8 + fx * 16) / group_size;
-        if (qo_idx < qo_upper_bound) {
+        const uint32_t group_id = (tx / 4 + j * 8 + fx * 16) % aligned_group_size;
+        const uint32_t qo_head_idx = kv_head_idx * group_size + group_id;
+        const uint32_t qo_idx = qo_idx_base + (tx / 4 + j * 8 + fx * 16) / aligned_group_size;
+        if (qo_idx < qo_upper_bound && group_id < group_size) {
           lse[(qo_indptr[request_idx] + qo_idx) * num_qo_heads + qo_head_idx] =
               math::ptx_log2(d[fx][j]) + float(m[fx][j]);
         }

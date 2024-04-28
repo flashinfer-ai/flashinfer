@@ -36,7 +36,7 @@ flashinfer_option(FLASHINFER_TVM_HOME "The path to tvm for building tvm binding.
 
 # The following configurations can impact the binary
 # size of the generated library
-flashinfer_option(FLASHINFER_GEN_GROUP_SIZES "Group sizes to enable" 1 4 6 8)
+flashinfer_option(FLASHINFER_GEN_GROUP_SIZES "Group sizes to enable" 1 4 5 6 7 8)
 flashinfer_option(FLASHINFER_GEN_PAGE_SIZES "Prefill page sizes to enable" 1 16 32)
 flashinfer_option(FLASHINFER_GEN_HEAD_DIMS "Head dims to enable" 64 128 256)
 flashinfer_option(FLASHINFER_GEN_KV_LAYOUTS "KV layouts to enable" 0 1)

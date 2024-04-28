@@ -134,8 +134,14 @@
   } else if (group_size == 4) {                              \
     constexpr size_t GROUP_SIZE = 4;                         \
     __VA_ARGS__                                              \
+  } else if (group_size == 5) {                              \
+    constexpr size_t GROUP_SIZE = 5;                         \
+    __VA_ARGS__                                              \
   } else if (group_size == 6) {                              \
     constexpr size_t GROUP_SIZE = 6;                         \
+    __VA_ARGS__                                              \
+  } else if (group_size == 7) {                              \
+    constexpr size_t GROUP_SIZE = 7;                         \
     __VA_ARGS__                                              \
   } else if (group_size == 8) {                              \
     constexpr size_t GROUP_SIZE = 8;                         \
@@ -282,17 +288,19 @@ std::tuple<IdType, IdType, std::vector<IdType>, std::vector<IdType>> split_qo_in
     qo_indptr_h.assign(qo_indptr, qo_indptr + batch_size + 1);
   }
 
+  const uint32_t rows_per_warp = 16 / (2 * gqa_group_size) * 2;
+  const uint32_t aligned_gqa_group_size = 16 / rows_per_warp;
   const uint32_t total_q_len = qo_indptr_h[batch_size];
-  const bool avg_len_greater_than_64 = total_q_len * gqa_group_size > 64 * batch_size;
+  const bool avg_len_greater_than_64 = total_q_len * aligned_gqa_group_size > 64 * batch_size;
   const uint32_t num_frags_x = (head_dim < 256 && avg_len_greater_than_64) ? 2 : 1;
   const uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
   uint32_t num_qo_tiles = 0;
 
   for (uint32_t i = 0; i < batch_size; ++i) {
-    for (uint32_t j = qo_indptr_h[i] * gqa_group_size; j < qo_indptr_h[i + 1] * gqa_group_size;
+    for (uint32_t j = qo_indptr_h[i] * aligned_gqa_group_size; j < qo_indptr_h[i + 1] * aligned_gqa_group_size;
          j += num_rows_per_cta) {
       request_indices.push_back(i);
-      tile_indices.push_back((j - qo_indptr_h[i] * gqa_group_size) / num_rows_per_cta);
+      tile_indices.push_back((j - qo_indptr_h[i] * aligned_gqa_group_size) / num_rows_per_cta);
       ++num_qo_tiles;
     }
   }
