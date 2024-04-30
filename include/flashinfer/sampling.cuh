@@ -30,6 +30,19 @@ namespace sampling {
 
 using namespace cub;
 
+/*!
+ * \note (Zihao): We choose the BLOCK_SCAN_WARP_SCANS algorithm because we found
+ * this is the only algorithm that guarantee the monotonicity of the inclusive
+ * sum. This is important for the sampling algorithm to work correctly.
+ *
+ * In sampling, there might be lots of small probabilities, for the other two
+ * algorithms, the sum(prob[0:i]) might be smaller than the sum(prob[0:i-1]) due to
+ * the different order of floating point addition. This will cause the sampling
+ * algorithm to fail.
+ */
+constexpr BlockScanAlgorithm SCAN_ALGO = BLOCK_SCAN_WARP_SCANS;
+constexpr BlockReduceAlgorithm REDUCE_ALGO = BLOCK_REDUCE_WARP_REDUCTIONS;
+
 struct BoolDiffOp {
   __device__ __forceinline__ bool operator()(const bool& lhs, const bool& rhs) const {
     return lhs != rhs;
@@ -51,11 +64,12 @@ struct Pair {
   }
 };
 
-template <typename T, uint32_t BLOCK_THREADS, BlockScanAlgorithm ALGORITHM>
+template <typename T, uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
+          BlockReduceAlgorithm REDUCE_ALGORITHM>
 union SamplingTempStorage {
-  typename BlockScan<T, BLOCK_THREADS, ALGORITHM>::TempStorage scan;
-  typename BlockReduce<T, BLOCK_THREADS>::TempStorage reduce;
-  typename BlockReduce<Pair<T>, BLOCK_THREADS>::TempStorage reduce_pair;
+  typename BlockScan<T, BLOCK_THREADS, SCAN_ALGORITHM>::TempStorage scan;
+  typename BlockReduce<T, BLOCK_THREADS, REDUCE_ALGORITHM>::TempStorage reduce;
+  typename BlockReduce<Pair<T>, BLOCK_THREADS, REDUCE_ALGORITHM>::TempStorage reduce_pair;
   typename BlockAdjacentDifference<bool, BLOCK_THREADS>::TempStorage adj_diff;
   struct {
     int32_t sampled_id;
@@ -66,10 +80,11 @@ union SamplingTempStorage {
   } data;
 };
 
-template <uint32_t VEC_SIZE, uint32_t BLOCK_THREADS, BlockScanAlgorithm ALGORITHM, typename T>
-__device__ void DeviceSamplingFromProb(
+template <uint32_t VEC_SIZE, uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
+          BlockReduceAlgorithm REDUCE_ALGORITHM, typename T>
+__device__ __forceinline__ void DeviceSamplingFromProb(
     uint32_t i, T threshold, T u, vec_t<T, VEC_SIZE> prob_vec, T& aggregate,
-    SamplingTempStorage<T, BLOCK_THREADS, ALGORITHM>* temp_storage) {
+    SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>* temp_storage) {
   T inclusive_cdf[VEC_SIZE];
   bool greater_than_u[VEC_SIZE];
   T aggregate_local = T(0);
@@ -78,7 +93,7 @@ __device__ void DeviceSamplingFromProb(
   for (uint32_t j = 0; j < VEC_SIZE; ++j) {
     prob_greater_than_threshold[j] = (prob_vec[j] > threshold) ? prob_vec[j] : T(0);
   }
-  aggregate_local = BlockReduce<T, BLOCK_THREADS>(temp_storage->reduce)
+  aggregate_local = BlockReduce<T, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->reduce)
                         .Sum<VEC_SIZE>(prob_greater_than_threshold);
   if (threadIdx.x == 0) {
     temp_storage->data.block_aggregate.value = aggregate_local;
@@ -87,7 +102,7 @@ __device__ void DeviceSamplingFromProb(
   aggregate_local = temp_storage->data.block_aggregate.value;
 
   if (aggregate + aggregate_local > u) {
-    BlockScan<T, BLOCK_THREADS, ALGORITHM>(temp_storage->scan)
+    BlockScan<T, BLOCK_THREADS, SCAN_ALGORITHM>(temp_storage->scan)
         .InclusiveSum<VEC_SIZE>(prob_greater_than_threshold, inclusive_cdf);
     __syncthreads();
 
@@ -109,23 +124,22 @@ __device__ void DeviceSamplingFromProb(
         temp_storage->data.sampled_id = (i * BLOCK_THREADS + tx) * VEC_SIZE + j;
       }
     }
-
     __syncthreads();
   }
   aggregate += aggregate_local;
 }
 
-template <uint32_t BLOCK_THREADS, BlockScanAlgorithm ALGORITHM, uint32_t VEC_SIZE, typename DType,
-          typename IdType>
+template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
+          BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, typename DType, typename IdType>
 __global__ void SamplingFromProbKernel(DType* probs, DType* uniform_samples, IdType* output,
                                        IdType* row_indices, uint32_t d) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   const uint32_t row_idx = row_indices == nullptr ? bx : row_indices[bx];
 
-  extern __shared__ __align__(alignof(SamplingTempStorage<DType, BLOCK_THREADS, ALGORITHM>))
-      uint8_t smem[];
-  auto& temp_storage =
-      reinterpret_cast<SamplingTempStorage<DType, BLOCK_THREADS, ALGORITHM>&>(smem);
+  extern __shared__ __align__(alignof(
+      SamplingTempStorage<DType, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>)) uint8_t smem[];
+  auto& temp_storage = reinterpret_cast<
+      SamplingTempStorage<DType, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>&>(smem);
 
   vec_t<DType, VEC_SIZE> probs_vec;
   DType aggregate(0);
@@ -137,8 +151,8 @@ __global__ void SamplingFromProbKernel(DType* probs, DType* uniform_samples, IdT
       probs_vec.load(probs + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
     }
 
-    DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, ALGORITHM, DType>(i, DType(0), u, probs_vec,
-                                                                      aggregate, &temp_storage);
+    DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, DType>(
+        i, DType(0), u, probs_vec, aggregate, &temp_storage);
     if (float(aggregate) > u) {
       break;
     }
@@ -146,18 +160,18 @@ __global__ void SamplingFromProbKernel(DType* probs, DType* uniform_samples, IdT
   output[bx] = (float(aggregate) > u) ? temp_storage.data.sampled_id : d - 1;
 }
 
-template <uint32_t BLOCK_THREADS, BlockScanAlgorithm ALGORITHM, uint32_t VEC_SIZE, typename DType,
-          typename IdType>
+template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
+          BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, typename DType, typename IdType>
 __global__ void TopKSamplingFromProbKernel(DType* probs, DType* uniform_samples, IdType* output,
                                            bool* success, uint32_t k, uint32_t d,
                                            uint32_t max_top_k_rounds) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
-  extern __shared__ __align__(alignof(SamplingTempStorage<DType, BLOCK_THREADS, ALGORITHM>))
-      uint8_t smem[];
-  auto& temp_storage =
-      reinterpret_cast<SamplingTempStorage<DType, BLOCK_THREADS, ALGORITHM>&>(smem);
+  extern __shared__ __align__(alignof(
+      SamplingTempStorage<DType, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>)) uint8_t smem[];
+  auto& temp_storage = reinterpret_cast<
+      SamplingTempStorage<DType, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>&>(smem);
 
   vec_t<DType, VEC_SIZE> probs_vec;
   DType aggregate;
@@ -173,8 +187,8 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, DType* uniform_samples,
         probs_vec.load(probs + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
       }
 
-      DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, ALGORITHM, DType>(i, pivot, u, probs_vec,
-                                                                        aggregate, &temp_storage);
+      DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, DType>(
+          i, pivot, u, probs_vec, aggregate, &temp_storage);
       if (aggregate > u) {
         break;
       }
@@ -231,8 +245,8 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, DType* uniform_samples,
 
 constexpr float eps = 1e-5;
 
-template <uint32_t BLOCK_THREADS, BlockScanAlgorithm ALGORITHM, uint32_t VEC_SIZE, typename DType,
-          typename IdType>
+template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
+          BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, typename DType, typename IdType>
 __global__ void TopPSamplingFromProbKernel(DType* probs, DType* uniform_samples, IdType* output,
                                            bool* success, IdType* row_indices, float* top_p_arr,
                                            float top_p, uint32_t d, uint32_t max_top_p_rounds) {
@@ -244,10 +258,10 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
   }
   const uint32_t row_idx = row_indices == nullptr ? bx : row_indices[bx];
 
-  extern __shared__ __align__(alignof(SamplingTempStorage<DType, BLOCK_THREADS, ALGORITHM>))
-      uint8_t smem[];
-  auto& temp_storage =
-      reinterpret_cast<SamplingTempStorage<DType, BLOCK_THREADS, ALGORITHM>&>(smem);
+  extern __shared__ __align__(alignof(
+      SamplingTempStorage<DType, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>)) uint8_t smem[];
+  auto& temp_storage = reinterpret_cast<
+      SamplingTempStorage<DType, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>&>(smem);
 
   vec_t<DType, VEC_SIZE> probs_vec;
   DType aggregate;
@@ -263,8 +277,8 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
         probs_vec.load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
       }
 
-      DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, ALGORITHM, DType>(i, pivot, u, probs_vec,
-                                                                        aggregate, &temp_storage);
+      DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, DType>(
+          i, pivot, u, probs_vec, aggregate, &temp_storage);
       if (aggregate > u) {
         break;
       }
@@ -326,12 +340,11 @@ cudaError_t SamplingFromProb(T* probs, T* uniform_samples, IdType* output, uint3
   dim3 nthrs(BLOCK_THREADS);
   IdType* row_indices_placeholder = nullptr;
   void* args[] = {&probs, &uniform_samples, &output, &row_indices_placeholder, &d};
-  const uint32_t smem_size =
-      sizeof(SamplingTempStorage<T, BLOCK_THREADS, BLOCK_SCAN_RAKING_MEMOIZE>);
+  const uint32_t smem_size = sizeof(SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
     auto kernel =
-        SamplingFromProbKernel<BLOCK_THREADS, BLOCK_SCAN_RAKING_MEMOIZE, VEC_SIZE, T, IdType>;
+        SamplingFromProbKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, VEC_SIZE, T, IdType>;
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
   });
   return cudaSuccess;
@@ -346,12 +359,11 @@ cudaError_t ParallelSamplingFromProb(T* probs, T* uniform_samples, IdType* outpu
   dim3 nblks(batch_size);
   dim3 nthrs(BLOCK_THREADS);
   void* args[] = {&probs, &uniform_samples, &output, &row_indices, &d};
-  const uint32_t smem_size =
-      sizeof(SamplingTempStorage<T, BLOCK_THREADS, BLOCK_SCAN_RAKING_MEMOIZE>);
+  const uint32_t smem_size = sizeof(SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
     auto kernel =
-        SamplingFromProbKernel<BLOCK_THREADS, BLOCK_SCAN_RAKING_MEMOIZE, VEC_SIZE, T, IdType>;
+        SamplingFromProbKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, VEC_SIZE, T, IdType>;
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
   });
   return cudaSuccess;
@@ -364,15 +376,14 @@ cudaError_t TopKSamplingFromProb(T* probs, T* uniform_samples, IdType* output, b
   constexpr uint32_t BLOCK_THREADS = 1024;
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
-  const uint32_t smem_size =
-      sizeof(SamplingTempStorage<T, BLOCK_THREADS, BLOCK_SCAN_RAKING_MEMOIZE>);
+  const uint32_t smem_size = sizeof(SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
   dim3 nblks(batch_size);
   dim3 nthrs(BLOCK_THREADS);
   void* args[] = {&probs, &uniform_samples, &output, &success, &top_k, &d, &max_top_k_rounds};
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
     auto kernel =
-        TopKSamplingFromProbKernel<BLOCK_THREADS, BLOCK_SCAN_RAKING_MEMOIZE, VEC_SIZE, T, IdType>;
+        TopKSamplingFromProbKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, VEC_SIZE, T, IdType>;
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
@@ -387,8 +398,7 @@ cudaError_t TopPSamplingFromProb(T* probs, T* uniform_samples, IdType* output, b
   constexpr uint32_t BLOCK_THREADS = 1024;
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
-  const uint32_t smem_size =
-      sizeof(SamplingTempStorage<T, BLOCK_THREADS, BLOCK_SCAN_RAKING_MEMOIZE>);
+  const uint32_t smem_size = sizeof(SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
   dim3 nblks(batch_size);
   dim3 nthrs(BLOCK_THREADS);
   IdType* row_indices_placeholder = nullptr;
@@ -405,7 +415,7 @@ cudaError_t TopPSamplingFromProb(T* probs, T* uniform_samples, IdType* output, b
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
     auto kernel =
-        TopPSamplingFromProbKernel<BLOCK_THREADS, BLOCK_SCAN_RAKING_MEMOIZE, VEC_SIZE, T, IdType>;
+        TopPSamplingFromProbKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, VEC_SIZE, T, IdType>;
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
@@ -421,8 +431,7 @@ cudaError_t ParallelTopPSamplingFromProb(T* probs, T* uniform_samples, IdType* o
   constexpr uint32_t BLOCK_THREADS = 1024;
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
-  const uint32_t smem_size =
-      sizeof(SamplingTempStorage<T, BLOCK_THREADS, BLOCK_SCAN_RAKING_MEMOIZE>);
+  const uint32_t smem_size = sizeof(SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
   dim3 nblks(batch_size);
   dim3 nthrs(BLOCK_THREADS);
   T top_p_placeholder = 0;
@@ -431,7 +440,7 @@ cudaError_t ParallelTopPSamplingFromProb(T* probs, T* uniform_samples, IdType* o
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
     auto kernel =
-        TopPSamplingFromProbKernel<BLOCK_THREADS, BLOCK_SCAN_RAKING_MEMOIZE, VEC_SIZE, T, IdType>;
+        TopPSamplingFromProbKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, VEC_SIZE, T, IdType>;
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
