@@ -30,24 +30,8 @@ namespace sampling {
 
 using namespace cub;
 
-/*!
- * \note (Zihao): We choose the BLOCK_SCAN_WARP_SCANS algorithm because we found
- * this is the only algorithm that guarantee the monotonicity of the inclusive
- * sum. This is important for the sampling algorithm to work correctly.
- *
- * In sampling, there might be lots of small probabilities, for the other two
- * algorithms, the sum(prob[0:i]) might be smaller than the sum(prob[0:i-1]) due to
- * the different order of floating point addition. This will cause the sampling
- * algorithm to fail.
- */
 constexpr BlockScanAlgorithm SCAN_ALGO = BLOCK_SCAN_WARP_SCANS;
 constexpr BlockReduceAlgorithm REDUCE_ALGO = BLOCK_REDUCE_WARP_REDUCTIONS;
-
-struct BoolDiffOp {
-  __device__ __forceinline__ bool operator()(const bool& lhs, const bool& rhs) const {
-    return lhs != rhs;
-  }
-};
 
 template <typename T>
 struct Pair {
@@ -64,13 +48,21 @@ struct Pair {
   }
 };
 
+struct BoolDiffOp {
+  __device__ __forceinline__ bool operator()(const bool& lhs, const bool& rhs) const {
+    return lhs != rhs;
+  }
+};
+
 template <typename T, uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM>
-union SamplingTempStorage {
-  typename BlockScan<T, BLOCK_THREADS, SCAN_ALGORITHM>::TempStorage scan;
-  typename BlockReduce<T, BLOCK_THREADS, REDUCE_ALGORITHM>::TempStorage reduce;
-  typename BlockReduce<Pair<T>, BLOCK_THREADS, REDUCE_ALGORITHM>::TempStorage reduce_pair;
-  typename BlockAdjacentDifference<bool, BLOCK_THREADS>::TempStorage adj_diff;
+struct SamplingTempStorage {
+  union {
+    typename BlockScan<T, BLOCK_THREADS, SCAN_ALGORITHM>::TempStorage scan;
+    typename BlockReduce<T, BLOCK_THREADS, REDUCE_ALGORITHM>::TempStorage reduce;
+    typename BlockReduce<Pair<T>, BLOCK_THREADS, REDUCE_ALGORITHM>::TempStorage reduce_pair;
+    typename BlockAdjacentDifference<bool, BLOCK_THREADS>::TempStorage adj_diff;
+  } block_prim;
   struct {
     int32_t sampled_id;
     union {
@@ -83,45 +75,44 @@ union SamplingTempStorage {
 template <uint32_t VEC_SIZE, uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, typename T>
 __device__ __forceinline__ void DeviceSamplingFromProb(
-    uint32_t i, T threshold, T u, vec_t<T, VEC_SIZE> prob_vec, T& aggregate,
+    uint32_t i, uint32_t d, T threshold, T u, vec_t<T, VEC_SIZE> prob_vec, T& aggregate,
     SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>* temp_storage) {
-  T inclusive_cdf[VEC_SIZE];
-  bool greater_than_u[VEC_SIZE];
-  T aggregate_local = T(0);
+  const uint32_t tx = threadIdx.x;
   T prob_greater_than_threshold[VEC_SIZE];
+  T inclusive_cdf[VEC_SIZE];
+  bool greater_than_u[VEC_SIZE], valid[VEC_SIZE];
 #pragma unroll
   for (uint32_t j = 0; j < VEC_SIZE; ++j) {
     prob_greater_than_threshold[j] = (prob_vec[j] > threshold) ? prob_vec[j] : T(0);
+    valid[j] = prob_vec[j] > threshold && (i * BLOCK_THREADS + tx) * VEC_SIZE < d;
   }
-  aggregate_local = BlockReduce<T, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->reduce)
-                        .Sum<VEC_SIZE>(prob_greater_than_threshold);
-  if (threadIdx.x == 0) {
+  T aggregate_local =
+      BlockReduce<T, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce)
+          .Sum<VEC_SIZE>(prob_greater_than_threshold);
+  if (tx == 0) {
     temp_storage->data.block_aggregate.value = aggregate_local;
   }
   __syncthreads();
   aggregate_local = temp_storage->data.block_aggregate.value;
 
   if (aggregate + aggregate_local > u) {
-    BlockScan<T, BLOCK_THREADS, SCAN_ALGORITHM>(temp_storage->scan)
+    BlockScan<T, BLOCK_THREADS, SCAN_ALGORITHM>(temp_storage->block_prim.scan)
         .InclusiveSum<VEC_SIZE>(prob_greater_than_threshold, inclusive_cdf);
     __syncthreads();
 
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      inclusive_cdf[j] = inclusive_cdf[j] + aggregate;
-      greater_than_u[j] = inclusive_cdf[j] > u;
+      greater_than_u[j] = inclusive_cdf[j] + aggregate > u;
     }
 
-    BlockAdjacentDifference<bool, BLOCK_THREADS>(temp_storage->adj_diff)
+    BlockAdjacentDifference<bool, BLOCK_THREADS>(temp_storage->block_prim.adj_diff)
         .SubtractLeft<VEC_SIZE>(greater_than_u, greater_than_u, BoolDiffOp());
     __syncthreads();
 
-    const uint32_t tx = threadIdx.x;
-
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      if (greater_than_u[j]) {
-        temp_storage->data.sampled_id = (i * BLOCK_THREADS + tx) * VEC_SIZE + j;
+      if (greater_than_u[j] && valid[j]) {
+        atomicMin(&(temp_storage->data.sampled_id), (i * BLOCK_THREADS + tx) * VEC_SIZE + j);
       }
     }
     __syncthreads();
@@ -140,6 +131,8 @@ __global__ void SamplingFromProbKernel(DType* probs, DType* uniform_samples, IdT
       SamplingTempStorage<DType, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>)) uint8_t smem[];
   auto& temp_storage = reinterpret_cast<
       SamplingTempStorage<DType, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>&>(smem);
+  temp_storage.data.sampled_id = d - 1;
+  __syncthreads();
 
   vec_t<DType, VEC_SIZE> probs_vec;
   DType aggregate(0);
@@ -152,12 +145,12 @@ __global__ void SamplingFromProbKernel(DType* probs, DType* uniform_samples, IdT
     }
 
     DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, DType>(
-        i, DType(0), u, probs_vec, aggregate, &temp_storage);
+        i, d, DType(0), u, probs_vec, aggregate, &temp_storage);
     if (float(aggregate) > u) {
       break;
     }
   }
-  output[bx] = (float(aggregate) > u) ? temp_storage.data.sampled_id : d - 1;
+  output[bx] = temp_storage.data.sampled_id;
 }
 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
@@ -179,6 +172,8 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, DType* uniform_samples,
   DType pivot = DType(0);
   IdType sampled_id;
   for (uint32_t round = 0; round < max_top_k_rounds; ++round) {
+    temp_storage.data.sampled_id = d - 1;
+    __syncthreads();
     DType u = uniform_samples[round * batch_size + bx] * (DType(1) - q);
     aggregate = DType(0);
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
@@ -188,13 +183,13 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, DType* uniform_samples,
       }
 
       DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, DType>(
-          i, pivot, u, probs_vec, aggregate, &temp_storage);
+          i, d, pivot, u, probs_vec, aggregate, &temp_storage);
       if (aggregate > u) {
         break;
       }
     }
     __syncthreads();
-    sampled_id = (aggregate > u) ? temp_storage.data.sampled_id : d - 1;
+    sampled_id = temp_storage.data.sampled_id;
     pivot = probs[bx * d + sampled_id];
 
     Pair<DType> aggregate_leq_pivot{DType(0), 0};
@@ -212,8 +207,9 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, DType* uniform_samples,
             (probs_vec[j] <= pivot && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
       }
 
-      aggregate_leq_pivot += BlockReduce<Pair<DType>, BLOCK_THREADS>(temp_storage.reduce_pair)
-                                 .Sum<VEC_SIZE>(probs_leq_pivot);
+      aggregate_leq_pivot +=
+          BlockReduce<Pair<DType>, BLOCK_THREADS>(temp_storage.block_prim.reduce_pair)
+              .Sum<VEC_SIZE>(probs_leq_pivot);
       if (tx == 0) {
         temp_storage.data.block_aggregate.pair = aggregate_leq_pivot;
       }
@@ -269,6 +265,8 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
   DType pivot = DType(0);
   IdType sampled_id;
   for (uint32_t round = 0; round < max_top_p_rounds; ++round) {
+    temp_storage.data.sampled_id = d - 1;
+    __syncthreads();
     DType u = uniform_samples[round * batch_size + bx] * (DType(1) - q);
     aggregate = DType(0);
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
@@ -278,13 +276,13 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
       }
 
       DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, DType>(
-          i, pivot, u, probs_vec, aggregate, &temp_storage);
+          i, d, pivot, u, probs_vec, aggregate, &temp_storage);
       if (aggregate > u) {
         break;
       }
     }
     __syncthreads();
-    sampled_id = (aggregate > u) ? temp_storage.data.sampled_id : d - 1;
+    sampled_id = temp_storage.data.sampled_id;
     pivot = probs[row_idx * d + sampled_id];
 
     DType aggregate_leq_pivot = DType(0);
@@ -300,8 +298,8 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
         probs_leq_pivot[j] = (probs_vec[j] <= pivot) ? probs_vec[j] : DType(0);
       }
 
-      aggregate_leq_pivot +=
-          BlockReduce<DType, BLOCK_THREADS>(temp_storage.reduce).Sum<VEC_SIZE>(probs_leq_pivot);
+      aggregate_leq_pivot += BlockReduce<DType, BLOCK_THREADS>(temp_storage.block_prim.reduce)
+                                 .Sum<VEC_SIZE>(probs_leq_pivot);
       if (tx == 0) {
         temp_storage.data.block_aggregate.value = aggregate_leq_pivot;
       }
