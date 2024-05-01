@@ -30,16 +30,6 @@ namespace sampling {
 
 using namespace cub;
 
-/*!
- * \note (Zihao): We choose the BLOCK_SCAN_WARP_SCANS algorithm because we found
- * this is the only algorithm that guarantee the monotonicity of the inclusive
- * sum. This is important for the sampling algorithm to work correctly.
- *
- * In sampling, there might be lots of small probabilities, for the other two
- * algorithms, the sum(prob[0:i]) might be smaller than the sum(prob[0:i-1]) due to
- * the different order of floating point addition. This will cause the sampling
- * algorithm to fail.
- */
 constexpr BlockScanAlgorithm SCAN_ALGO = BLOCK_SCAN_WARP_SCANS;
 constexpr BlockReduceAlgorithm REDUCE_ALGO = BLOCK_REDUCE_WARP_REDUCTIONS;
 
