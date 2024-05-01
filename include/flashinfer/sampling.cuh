@@ -58,10 +58,9 @@ struct Pair {
   }
 };
 
-struct BoolPairDiffOp {
-  __device__ __forceinline__ Pair<bool> operator()(const Pair<bool>& lhs,
-                                                   const Pair<bool>& rhs) const {
-    return {lhs.value != rhs.value, lhs.count != rhs.count};
+struct BoolDiffOp {
+  __device__ __forceinline__ bool operator()(const bool& lhs, const bool& rhs) const {
+    return lhs != rhs;
   }
 };
 
@@ -69,10 +68,10 @@ template <typename T, uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM>
 struct SamplingTempStorage {
   union {
-    typename BlockScan<Pair<T>, BLOCK_THREADS, SCAN_ALGORITHM>::TempStorage scan;
+    typename BlockScan<T, BLOCK_THREADS, SCAN_ALGORITHM>::TempStorage scan;
     typename BlockReduce<T, BLOCK_THREADS, REDUCE_ALGORITHM>::TempStorage reduce;
     typename BlockReduce<Pair<T>, BLOCK_THREADS, REDUCE_ALGORITHM>::TempStorage reduce_pair;
-    typename BlockAdjacentDifference<Pair<bool>, BLOCK_THREADS>::TempStorage adj_diff;
+    typename BlockAdjacentDifference<bool, BLOCK_THREADS>::TempStorage adj_diff;
   } block_prim;
   struct {
     int32_t sampled_id;
@@ -90,9 +89,12 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
     SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>* temp_storage) {
   const uint32_t tx = threadIdx.x;
   T prob_greater_than_threshold[VEC_SIZE];
+  T inclusive_cdf[VEC_SIZE];
+  bool greater_than_u[VEC_SIZE], valid[VEC_SIZE];
 #pragma unroll
   for (uint32_t j = 0; j < VEC_SIZE; ++j) {
     prob_greater_than_threshold[j] = (prob_vec[j] > threshold) ? prob_vec[j] : T(0);
+    valid[j] = prob_vec[j] > threshold && (i * BLOCK_THREADS + tx) * VEC_SIZE < d;
   }
   T aggregate_local =
       BlockReduce<T, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce)
@@ -104,31 +106,22 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
   aggregate_local = temp_storage->data.block_aggregate.value;
 
   if (aggregate + aggregate_local > u) {
-    Pair<T> prob_pair[VEC_SIZE];
-    Pair<T> inclusive_cdf[VEC_SIZE];
-    Pair<bool> greater_than_u[VEC_SIZE];
-#pragma unroll
-    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      prob_pair[j] = {prob_greater_than_threshold[j],
-                      prob_vec[j] > threshold && (i * BLOCK_THREADS + tx) * VEC_SIZE < d};
-    }
-    BlockScan<Pair<T>, BLOCK_THREADS, SCAN_ALGORITHM>(temp_storage->block_prim.scan)
-        .InclusiveSum<VEC_SIZE>(prob_pair, inclusive_cdf);
+    BlockScan<T, BLOCK_THREADS, SCAN_ALGORITHM>(temp_storage->block_prim.scan)
+        .InclusiveSum<VEC_SIZE>(prob_greater_than_threshold, inclusive_cdf);
     __syncthreads();
 
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      greater_than_u[j] = {inclusive_cdf[j].value + aggregate > u, inclusive_cdf[j].count};
+      greater_than_u[j] = inclusive_cdf[j] + aggregate > u;
     }
 
-    BlockAdjacentDifference<Pair<bool>, BLOCK_THREADS>(temp_storage->block_prim.adj_diff)
-        .SubtractLeft<VEC_SIZE>(greater_than_u, greater_than_u, BoolPairDiffOp(),
-                                Pair<bool>{false, 0});
+    BlockAdjacentDifference<bool, BLOCK_THREADS>(temp_storage->block_prim.adj_diff)
+        .SubtractLeft<VEC_SIZE>(greater_than_u, greater_than_u, BoolDiffOp());
     __syncthreads();
 
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      if (greater_than_u[j].value && greater_than_u[j].count) {
+      if (greater_than_u[j] && valid[j]) {
         atomicMin(&(temp_storage->data.sampled_id), (i * BLOCK_THREADS + tx) * VEC_SIZE + j);
       }
     }
