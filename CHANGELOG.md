@@ -1,14 +1,16 @@
 # Changelog
 
-## [0.1.0](https://github.com/flashinfer-ai/flashinfer/compare/v0.0.3...v0.1.0) (2024-05-01)
+## [0.0.4](https://github.com/flashinfer-ai/flashinfer/compare/v0.0.3...v0.1.0) (2024-05-01)
 
 
 ### Features
 
+* pytorch 2.3 support
+* gpu sampling kernels (top-p, top-k)
+* more gqa group sizes
 * add mma instructions for fp8 ([#179](https://github.com/flashinfer-ai/flashinfer/issues/179)) ([d305798](https://github.com/flashinfer-ai/flashinfer/commit/d3057983e6d47e857ec3956de94eb11f62d9d83e))
 * mma rowsum for fp8 ([#180](https://github.com/flashinfer-ai/flashinfer/issues/180)) ([5af935c](https://github.com/flashinfer-ai/flashinfer/commit/5af935ca783d3487034110902c6406089c31acbc))
 * support any num_heads for get_alibi_slope ([#200](https://github.com/flashinfer-ai/flashinfer/issues/200)) ([b217a6f](https://github.com/flashinfer-ai/flashinfer/commit/b217a6fefb7bd091469467d32b8aedde4a25cad7))
-
 
 ### Bug Fixes
 
