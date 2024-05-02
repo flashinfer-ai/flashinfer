@@ -4,6 +4,7 @@ include generate_batch_padded_decode_inst.py
 include generate_batch_paged_decode_inst.py
 include generate_batch_paged_prefill_inst.py
 include generate_batch_ragged_prefill_inst.py
+include generate_dispatch_inc.py
 include generate_single_decode_inst.py
 include generate_single_prefill_inst.py
 include literal_map.py
