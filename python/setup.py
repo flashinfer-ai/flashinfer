@@ -394,8 +394,6 @@ if __name__ == "__main__":
                 "nvcc": [
                     "-O3",
                     "-std=c++17",
-                    "--threads",
-                    "8",
                     "-Xfatbin",
                     "-compress-all",
                 ],
