@@ -108,10 +108,10 @@ using namespace flashinfer;
     }                                                                                   \
   }()
 
-#define _DISPATCH_CASE(case_expr, var, ...) \
-  case case_expr: {                         \
-    constexpr auto var = case_expr;         \
-    return __VA_ARGS__();                   \
+#define _DISPATCH_CASE(case_expr, case_var, ...) \
+  case case_expr: {                              \
+    constexpr auto case_var = case_expr;         \
+    return __VA_ARGS__();                        \
   }
 
 #define DISPATCH_group_size(expr, const_expr, ...) \
