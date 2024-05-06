@@ -1,5 +1,8 @@
+# Compile commands json file
+compile_commands.json
+
 # Generated inst files
-include/flashinfer/dispatch.inc
+src/dispatch.inc
 
 # Generated cu files
 src/generated/

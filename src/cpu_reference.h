@@ -20,6 +20,7 @@
 #include <stdexcept>
 
 #include "utils.h"
+#include "dispatch.inc"
 
 namespace cpu_reference {
 
