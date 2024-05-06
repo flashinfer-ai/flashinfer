@@ -14,12 +14,12 @@ sys.path.insert(0, os.path.abspath("../python"))
 os.environ["BUILD_DOC"] = "1"
 autodoc_mock_imports = ["torch"]
 
-project = 'FlashInfer'
+project = "FlashInfer"
 author = "FlashInfer Contributors"
-copyright = '2023-2024, {}'.format(author)
+copyright = "2023-2024, {}".format(author)
 
-version = "0.0.3"
-release = "0.0.3"
+version = "0.0.4"
+release = "0.0.4"
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
@@ -32,7 +32,7 @@ extensions = [
     "sphinx.ext.mathjax",
 ]
 
-autodoc_default_flags = ['members']
+autodoc_default_flags = ["members"]
 autosummary_generate = True
 
 source_suffix = [".rst"]
@@ -50,7 +50,7 @@ todo_include_todos = False
 
 # -- Options for HTML output ----------------------------------------------
 
-html_theme = "furo" #"sphinx_rtd_theme"
+html_theme = "furo"  # "sphinx_rtd_theme"
 
 templates_path = []
 
