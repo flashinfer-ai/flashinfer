@@ -29,22 +29,17 @@ except ImportError as e:
         raise e
 
 
-def sampling_from_probs(
-    probs: torch.Tensor,
-    uniform_samples: torch.Tensor
-):
+def sampling_from_probs(probs: torch.Tensor, uniform_samples: torch.Tensor):
     return _kernels.sampling_from_probs(probs, uniform_samples)
 
+
 def top_p_sampling_from_probs(
-    probs: torch.Tensor,
-    uniform_samples: torch.Tensor,
-    p: float
+    probs: torch.Tensor, uniform_samples: torch.Tensor, p: float
 ):
     return _kernels.top_p_sampling_from_probs(probs, uniform_samples, p)
 
+
 def top_k_sampling_from_probs(
-    probs: torch.Tensor,
-    uniform_samples: torch.Tensor,
-    k: int
+    probs: torch.Tensor, uniform_samples: torch.Tensor, k: int
 ):
     return _kernels.top_k_sampling_from_probs(probs, uniform_samples, k)

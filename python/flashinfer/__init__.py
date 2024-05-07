@@ -35,7 +35,11 @@ from .cascade import (
     BatchPrefillWithSharedPrefixPagedKVCacheWrapper,
 )
 from .page import append_paged_kv_cache
-from .sampling import sampling_from_probs, top_p_sampling_from_probs, top_k_sampling_from_probs
+from .sampling import (
+    sampling_from_probs,
+    top_p_sampling_from_probs,
+    top_k_sampling_from_probs,
+)
 from .norm import rmsnorm
 
 try:

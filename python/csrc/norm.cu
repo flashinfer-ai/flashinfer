@@ -20,15 +20,11 @@
 
 using namespace flashinfer;
 
-torch::Tensor rmsnorm(
-  torch::Tensor x,
-  torch::Tensor w,
-  double eps   
-) {
+torch::Tensor rmsnorm(torch::Tensor x, torch::Tensor w, double eps) {
   CHECK_INPUT(x);
   CHECK_INPUT(w);
-  CHECK_DIM(2, x); // x: (batch_size, hidden_size)
-  CHECK_DIM(1, w); // w: (hidden_size)
+  CHECK_DIM(2, x);  // x: (batch_size, hidden_size)
+  CHECK_DIM(1, w);  // w: (hidden_size)
   CHECK_EQ(x.size(1), w.size(0));
   unsigned int batch_size = x.size(0);
   unsigned int hidden_size = x.size(1);
@@ -36,16 +32,11 @@ torch::Tensor rmsnorm(
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
   auto y = torch::empty_like(x);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(x.scalar_type(), c_type, [&] {
-    cudaError_t status = RMSNorm(
-      x.data_ptr<c_type>(),
-      w.data_ptr<c_type>(),
-      y.data_ptr<c_type>(),
-      batch_size,
-      hidden_size,
-      eps,
-      torch_current_stream
-    );
-    TORCH_CHECK(status == cudaSuccess, "RMSNorm failed with error code " + std::string(cudaGetErrorString(status));) 
+    cudaError_t status = norm::RMSNorm(
+        static_cast<c_type*>(x.data_ptr()), static_cast<c_type*>(w.data_ptr()),
+        static_cast<c_type*>(y.data_ptr()), batch_size, hidden_size, eps, torch_current_stream);
+    TORCH_CHECK(status == cudaSuccess,
+                "RMSNorm failed with error code " + std::string(cudaGetErrorString(status)));
     return true;
   });
   return y;

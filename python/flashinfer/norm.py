@@ -28,9 +28,6 @@ except ImportError as e:
     else:
         raise e
 
-def rmsnorm(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    eps: float
-):
+
+def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6):
     return _kernels.rmsnorm(x, w, eps)
