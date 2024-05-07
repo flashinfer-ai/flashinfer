@@ -52,6 +52,17 @@ std::vector<torch::Tensor> batch_decode_with_padded_kv_cache(
     unsigned int pos_encoding_mode, float sm_scale, float rope_scale, float rope_theta,
     bool return_lse);
 
+torch::Tensor sampling_from_probs(torch::Tensor probs, torch::Tensor uniform_samples);
+
+std::vector<torch::Tensor> top_p_sampling_from_probs(torch::Tensor probs,
+                                                     torch::Tensor uniform_samples, double top_p);
+
+std::vector<torch::Tensor> top_k_sampling_from_probs(torch::Tensor probs,
+                                                     torch::Tensor uniform_samples,
+                                                     unsigned int top_k);
+
+torch::Tensor rmsnorm(torch::Tensor x, torch::Tensor w, double eps);
+
 class BatchDecodeWithPagedKVCachePyTorchWrapper {
  public:
   static BatchDecodeWithPagedKVCachePyTorchWrapper Create(unsigned int layout) {
