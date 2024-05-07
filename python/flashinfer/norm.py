@@ -30,4 +30,20 @@ except ImportError as e:
 
 
 def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6):
+    r"""Root mean square normalization.
+
+    Parameters
+    ----------
+    x: torch.Tensor
+        Input tensor, shape (batch_size, hidden_size).
+    w: torch.Tensor
+        Weight tensor, shape (hidden_size,).
+    eps: float
+        Epsilon for numerical stability.
+
+    Returns
+    -------
+    y: torch.Tensor
+        Normalized tensor, shape (batch_size, hidden_size).
+    """
     return _kernels.rmsnorm(x, w, eps)
