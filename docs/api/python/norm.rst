@@ -1,4 +1,4 @@
-.. _apipage:
+.. _apinorm:
 
 flashinfer.norm
 ===============

@@ -1,4 +1,4 @@
-.. _apipage:
+.. _apisampling:
 
 flashinfer.sampling
 ===================

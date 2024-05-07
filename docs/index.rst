@@ -31,4 +31,5 @@ FlashInfer is a library for Language Languages Models that provides high-perform
    api/python/prefill
    api/python/cascade
    api/python/page
-   
+   api/python/sampling
+   api/python/norm
