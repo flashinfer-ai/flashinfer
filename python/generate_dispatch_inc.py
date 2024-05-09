@@ -124,7 +124,11 @@ if __name__ == "__main__":
         "--head_dims", type=int, required=True, nargs="+", help="Head dimensions"
     )
     parser.add_argument(
-        "--page_sizes", type=int, required=True, nargs="+", help="Prefill attention page sizes"
+        "--page_sizes",
+        type=int,
+        required=True,
+        nargs="+",
+        help="Prefill attention page sizes",
     )
     parser.add_argument(
         "--group_sizes", type=int, required=True, nargs="+", help="Group sizes"
@@ -146,7 +150,13 @@ if __name__ == "__main__":
         nargs="+",
         help="Allow fp16 qk reductions",
     )
-    parser.add_argument("--causals", type=lambda x: x if isinstance(x, int) else x.lower() == "true", required=True, nargs="+", help="Causals")
+    parser.add_argument(
+        "--causals",
+        type=lambda x: x if isinstance(x, int) else x.lower() == "true",
+        required=True,
+        nargs="+",
+        help="Causals",
+    )
     args = parser.parse_args()
     print(args)
     with open(Path(args.path), "w") as f:

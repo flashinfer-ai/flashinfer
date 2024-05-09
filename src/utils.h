@@ -28,6 +28,49 @@
 
 #include <random>
 
+#include "dispatch.inc"
+
+#define _DISPATCH_SWITCH(var_name, cond, ...)                                           \
+  [&]() -> bool {                                                                       \
+    switch (cond) {                                                                     \
+      __VA_ARGS__                                                                       \
+      default:                                                                          \
+        std::ostringstream oss;                                                         \
+        oss << __PRETTY_FUNCTION__ << " failed to dispatch " var_name " " << int(cond); \
+        throw std::invalid_argument(oss.str());                                         \
+        return false;                                                                   \
+    }                                                                                   \
+  }()
+
+#define _DISPATCH_CASE(case_expr, case_var, ...) \
+  case case_expr: {                              \
+    constexpr auto case_var = case_expr;         \
+    return __VA_ARGS__();                        \
+  }
+
+#define DISPATCH_group_size(expr, const_expr, ...) \
+  _DISPATCH_SWITCH("group_size", expr, _DISPATCH_CASES_group_size(const_expr, __VA_ARGS__))
+
+#define DISPATCH_page_size(expr, const_expr, ...) \
+  _DISPATCH_SWITCH("page size", expr, _DISPATCH_CASES_page_size(const_expr, __VA_ARGS__))
+
+#define DISPATCH_head_dim(expr, const_expr, ...) \
+  _DISPATCH_SWITCH("head_dim", expr, _DISPATCH_CASES_head_dim(const_expr, __VA_ARGS__))
+
+#define DISPATCH_kv_layout(expr, const_expr, ...) \
+  _DISPATCH_SWITCH("kv layout", expr, _DISPATCH_CASES_kv_layout(const_expr, __VA_ARGS__))
+
+#define DISPATCH_pos_encoding_mode(expr, const_expr, ...) \
+  _DISPATCH_SWITCH("positional encoding mode", expr,      \
+                   _DISPATCH_CASES_pos_encoding_mode(const_expr, __VA_ARGS__))
+
+#define DISPATCH_allow_fp16_qk_reduction(expr, const_expr, ...) \
+  _DISPATCH_SWITCH("allow_fp16_qk_reduction", expr,             \
+                   _DISPATCH_CASES_allow_fp16_qk_reduction(const_expr, __VA_ARGS__))
+
+#define DISPATCH_causal(expr, const_expr, ...) \
+  _DISPATCH_SWITCH("causal", expr, _DISPATCH_CASES_causal(const_expr, __VA_ARGS__))
+
 namespace utils {
 
 template <typename T>
