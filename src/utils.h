@@ -45,6 +45,7 @@
   case case_expr: {                              \
     constexpr auto case_var = case_expr;         \
     __VA_ARGS__                                  \
+    break;                                       \
   }
 
 #define DISPATCH_group_size(expr, const_expr, ...) \
