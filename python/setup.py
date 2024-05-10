@@ -400,6 +400,7 @@ if __name__ == "__main__":
                     "8",
                     "-Xfatbin",
                     "-compress-all",
+                    "-Wno-switch-bool"
                 ],
             },
         )
