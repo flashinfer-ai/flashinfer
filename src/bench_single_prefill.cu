@@ -15,8 +15,9 @@
  */
 #include <thrust/device_vector.h>
 
-#include <flashinfer/prefill_attention_decl.cuh>
 #include <nvbench/nvbench.cuh>
+
+#include "flashinfer_ops.cuh"
 
 using flashinfer::PosEncodingMode;
 using flashinfer::QKVLayout;

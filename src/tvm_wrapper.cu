@@ -21,10 +21,10 @@
 #include <tvm/runtime/registry.h>
 
 #include <flashinfer/attention/cascade.cuh>
-#include <flashinfer/decode_attention_decl.cuh>
-#include <flashinfer/prefill_attention_decl.cuh>
 #include <flashinfer/sampling.cuh>
 #include <optional>
+
+#include "flashinfer_ops.cuh"
 
 using tvm::runtime::Array;
 using tvm::runtime::DataType;
@@ -424,15 +424,15 @@ void _FlashInferAttentionDecodeWithPagedKVCacheBeginForward(
   batch_decode_handlers[handler_idx].SetCUDAStream(static_cast<cudaStream_t>(copy_stream));
   DISPATCH_TVM_CUDA_IDTYPE(page_table_indptr->dtype, dtype_idx, {
     cudaError_t status =
-        batch_decode_handlers[handler_idx]
-            .BeginForward<page_storage, kv_layout, dtype_in, dtype_in, dtype_idx>(
-                static_cast<void*>(workspace_buffer->data), workspace_size_in_bytes,
-                static_cast<dtype_idx*>(page_table_indptr->data) +
-                    page_table_indptr->byte_offset / sizeof(dtype_idx),
-                static_cast<dtype_idx*>(last_page_len->data) +
-                    last_page_len->byte_offset / sizeof(dtype_idx),
-                batch_size, num_qo_heads, num_kv_heads, head_dim, page_size,
-                PosEncodingMode(pos_encoding_mode));
+        BatchDecodeHandlerBeginForward<page_storage, kv_layout, dtype_in, dtype_in, dtype_idx>(
+            batch_decode_handlers + handler_idx, static_cast<void*>(workspace_buffer->data),
+            workspace_size_in_bytes,
+            static_cast<dtype_idx*>(page_table_indptr->data) +
+                page_table_indptr->byte_offset / sizeof(dtype_idx),
+            static_cast<dtype_idx*>(last_page_len->data) +
+                last_page_len->byte_offset / sizeof(dtype_idx),
+            batch_size, num_qo_heads, num_kv_heads, head_dim, page_size,
+            PosEncodingMode(pos_encoding_mode));
     if (status != cudaSuccess) {
       LOG(FATAL) << "FlashInfer decode BeginForward error " << cudaGetErrorString(status);
     }

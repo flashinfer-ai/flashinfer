@@ -15,10 +15,10 @@
  */
 #include <gtest/gtest.h>
 
-#include <flashinfer/decode_attention_decl.cuh>
 #include <type_traits>
 
 #include "cpu_reference.h"
+#include "flashinfer_ops.cuh"
 #include "utils.h"
 
 using namespace flashinfer;

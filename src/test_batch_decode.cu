@@ -15,10 +15,10 @@
  */
 #include <gtest/gtest.h>
 
-#include <flashinfer/decode_attention_decl.cuh>
 #include <type_traits>
 
 #include "cpu_reference.h"
+#include "flashinfer_ops.cuh"
 #include "utils.h"
 
 using namespace flashinfer;
@@ -100,10 +100,10 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
   flashinfer::BatchDecodeHandler handler;
   size_t workspace_size_in_bytes = 32 * 1024 * 1024;
   thrust::device_vector<char> buffer(workspace_size_in_bytes);
-  handler.BeginForward<PageStorage::kIndices, kv_layout, T, T, int32_t>(
-      (void*)thrust::raw_pointer_cast(buffer.data()), workspace_size_in_bytes, kv_indptr.data(),
-      kv_last_page_len.data(), batch_size, num_qo_heads, num_kv_heads, head_dim, page_size,
-      pos_encoding_mode);
+  BatchDecodeHandlerBeginForward<PageStorage::kIndices, kv_layout, T, T, int32_t>(
+      &handler, (void*)thrust::raw_pointer_cast(buffer.data()), workspace_size_in_bytes,
+      kv_indptr.data(), kv_last_page_len.data(), batch_size, num_qo_heads, num_kv_heads, head_dim,
+      page_size, pos_encoding_mode);
 
   if (!cooperative) {
     // use non-cooperative kernel
