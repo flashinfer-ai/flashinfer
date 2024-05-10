@@ -16,11 +16,10 @@
 #include <thrust/device_vector.h>
 
 #include <cstdint>
-#include <flashinfer/decode_attention_decl.cuh>
-#include <flashinfer/prefill_attention_decl.cuh>
 #include <nvbench/nvbench.cuh>
 #include <vector>
 
+#include "flashinfer_ops.cuh"
 #include "utils.h"
 
 using utils::vec_bytes;
@@ -74,8 +73,8 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
     size_t workspace_size_in_bytes = 32 * 1024 * 1024;
     thrust::device_vector<char> buffer(workspace_size_in_bytes);
     // begin forward
-    handler.BeginForward<PageStorage::kIndices, kv_layout, T, T, int32_t>(
-        (void*)thrust::raw_pointer_cast(buffer.data()), workspace_size_in_bytes,
+    BatchDecodeHandlerBeginForward<PageStorage::kIndices, kv_layout, T, T, int32_t>(
+        &handler, (void*)thrust::raw_pointer_cast(buffer.data()), workspace_size_in_bytes,
         kv_indptr_host.data(), kv_last_page_len_host.data(), batch_size, num_qo_heads, num_kv_heads,
         head_dim, page_size, pos_encoding_mode);
     state.exec([&](nvbench::launch&) {

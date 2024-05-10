@@ -325,30 +325,6 @@ class BatchDecodeHandler {
     return cudaSuccess;
   }
 
-  template <PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeOut,
-            typename IdType>
-  cudaError_t BeginForward(void* buffer, size_t workspace_size_in_bytes, IdType* indptr,
-                           IdType* last_page_len, uint32_t batch_size, uint32_t num_qo_heads,
-                           uint32_t num_kv_heads, uint32_t head_dim, uint32_t page_size,
-                           PosEncodingMode pos_encoding_mode) {
-    if (num_qo_heads % num_kv_heads != 0) {
-      std::ostringstream err_msg;
-      err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
-              << num_kv_heads;
-      throw std::invalid_argument(err_msg.str());
-    }
-    DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
-      DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-        DISPATCH_POS_ENCODING_MODE(pos_encoding_mode, POS_ENCODING_MODE, {
-          return BeginForwardDispatched<GROUP_SIZE, HEAD_DIM, page_storage, kv_layout,
-                                        POS_ENCODING_MODE, DTypeIn, DTypeOut, IdType>(
-              buffer, workspace_size_in_bytes, indptr, last_page_len, batch_size, num_qo_heads,
-              page_size);
-        });
-      });
-    });
-  }
-
   cudaError_t EndForward() {
     forward_started_ = false;
     batch_size_before_partition_ = 0;

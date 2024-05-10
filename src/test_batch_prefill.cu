@@ -16,9 +16,9 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
-#include <flashinfer/prefill_attention_decl.cuh>
 
 #include "cpu_reference.h"
+#include "flashinfer_ops.cuh"
 #include "utils.h"
 
 using namespace flashinfer;
@@ -107,12 +107,12 @@ void _TestBatchPagedPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t n
                          num_kv_heads, head_dim);
 
     for (uint32_t num_runs = 0; num_runs < 10; ++num_runs) {
-      auto status =
-          BatchPrefillWithPagedKVCacheWrapper<PageStorage::kIndices, kv_layout, T, T, int32_t>(
-              &handler, thrust::raw_pointer_cast(q_device.data()),
-              thrust::raw_pointer_cast(q_indptr_device.data()), /*q_offset=*/nullptr, paged_kv,
-              thrust::raw_pointer_cast(o_device.data()),
-              /*lse=*/nullptr, num_qo_heads, causal, pos_encoding_mode, allow_fp16_qk_reduction);
+      auto status = flashinfer::BatchPrefillWithPagedKVCacheWrapper<PageStorage::kIndices,
+                                                                    kv_layout, T, T, int32_t>(
+          &handler, thrust::raw_pointer_cast(q_device.data()),
+          thrust::raw_pointer_cast(q_indptr_device.data()), /*q_offset=*/nullptr, paged_kv,
+          thrust::raw_pointer_cast(o_device.data()),
+          /*lse=*/nullptr, num_qo_heads, causal, pos_encoding_mode, allow_fp16_qk_reduction);
       EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
     }
 

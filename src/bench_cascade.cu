@@ -16,10 +16,9 @@
 #include <thrust/device_vector.h>
 
 #include <flashinfer/attention/cascade.cuh>
-#include <flashinfer/decode_attention_decl.cuh>
-#include <flashinfer/prefill_attention_decl.cuh>
 #include <nvbench/nvbench.cuh>
 
+#include "flashinfer_ops.cuh"
 #include "utils.h"
 
 using namespace flashinfer;
@@ -110,8 +109,8 @@ void bench_two_level_single_prefix_cascade_decode(nvbench::state& state) {
     BatchDecodeHandler cascade_handler;
     size_t workspace_size_in_bytes = 32 * 1024 * 1024;
     thrust::device_vector<char> buffer(workspace_size_in_bytes);
-    cascade_handler.BeginForward<page_storage, kv_layout, T, T, int32_t>(
-        (void*)thrust::raw_pointer_cast(buffer.data()), workspace_size_in_bytes,
+    BatchDecodeHandlerBeginForward<page_storage, kv_layout, T, T, int32_t>(
+        &cascade_handler, (void*)thrust::raw_pointer_cast(buffer.data()), workspace_size_in_bytes,
         kv_indptr_unique_h.data(), kv_last_page_len_unique_h.data(), batch_size, num_qo_heads,
         num_kv_heads, head_dim, page_size, PosEncodingMode::kNone);
 
@@ -167,8 +166,8 @@ void bench_two_level_single_prefix_cascade_decode(nvbench::state& state) {
     BatchDecodeHandler baseline_handler;
     size_t workspace_size_in_bytes = 32 * 1024 * 1024;
     thrust::device_vector<char> buffer(workspace_size_in_bytes);
-    baseline_handler.BeginForward<page_storage, kv_layout, T, T, int32_t>(
-        (void*)thrust::raw_pointer_cast(buffer.data()), workspace_size_in_bytes,
+    BatchDecodeHandlerBeginForward<page_storage, kv_layout, T, T, int32_t>(
+        &baseline_handler, (void*)thrust::raw_pointer_cast(buffer.data()), workspace_size_in_bytes,
         kv_indptr_combined_h.data(), kv_last_page_len_combined_h.data(), batch_size, num_qo_heads,
         num_kv_heads, head_dim, page_size, PosEncodingMode::kNone);
 

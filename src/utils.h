@@ -27,25 +27,24 @@
 #include <thrust/transform.h>
 
 #include <random>
+#include <sstream>
+#include <stdexcept>
 
 #include "dispatch.inc"
 
-#define _DISPATCH_SWITCH(var_name, cond, ...)                                           \
-  [&]() -> bool {                                                                       \
-    switch (cond) {                                                                     \
-      __VA_ARGS__                                                                       \
-      default:                                                                          \
-        std::ostringstream oss;                                                         \
-        oss << __PRETTY_FUNCTION__ << " failed to dispatch " var_name " " << int(cond); \
-        throw std::invalid_argument(oss.str());                                         \
-        return false;                                                                   \
-    }                                                                                   \
-  }()
+#define _DISPATCH_SWITCH(var_name, cond, ...)                                         \
+  switch (cond) {                                                                     \
+    __VA_ARGS__                                                                       \
+    default:                                                                          \
+      std::ostringstream oss;                                                         \
+      oss << __PRETTY_FUNCTION__ << " failed to dispatch " var_name " " << int(cond); \
+      throw std::invalid_argument(oss.str());                                         \
+  }
 
 #define _DISPATCH_CASE(case_expr, case_var, ...) \
   case case_expr: {                              \
     constexpr auto case_var = case_expr;         \
-    return __VA_ARGS__();                        \
+    __VA_ARGS__                                  \
   }
 
 #define DISPATCH_group_size(expr, const_expr, ...) \

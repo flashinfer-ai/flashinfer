@@ -15,9 +15,8 @@
  */
 #include <gtest/gtest.h>
 
-#include <flashinfer/prefill_attention_decl.cuh>
-
 #include "cpu_reference.h"
+#include "flashinfer_ops.cuh"
 #include "utils.h"
 
 using namespace flashinfer;
