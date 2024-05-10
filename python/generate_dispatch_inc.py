@@ -23,11 +23,11 @@ def get_dispatch_inc_str(args: argparse.Namespace) -> str:
     # head dims
     dispatch_head_dims_entries = "\n".join(
         [
-            "  _DISPATCH_CASE({}, HEAD_DIM, __VA_ARGS__) \\".format(_)
+            "  _DISPATCH_CASE({}, case_var, __VA_ARGS__) \\".format(_)
             for _ in args.head_dims
         ]
     )
-    dispatch_head_dims_str = f"""#define _DISPATCH_CASES_head_dim(const_var, ...)         \\
+    dispatch_head_dims_str = f"""#define _DISPATCH_CASES_head_dim(case_var, ...)         \\
 {dispatch_head_dims_entries}
 // EOL
 """
