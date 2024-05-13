@@ -392,7 +392,10 @@ if __name__ == "__main__":
                 str(root.resolve() / "include"),
             ],
             extra_compile_args={
-                "cxx": ["-O3"],
+                "cxx": [
+                    "-O3",
+                    "-Wno-switch-bool",
+                ],
                 "nvcc": [
                     "-O3",
                     "-std=c++17",
@@ -400,7 +403,6 @@ if __name__ == "__main__":
                     "8",
                     "-Xfatbin",
                     "-compress-all",
-                    "-Wno-switch-bool"
                 ],
             },
         )
