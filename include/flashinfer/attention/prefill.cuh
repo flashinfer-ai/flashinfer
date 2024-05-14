@@ -927,7 +927,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
   constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeOut>();
 
   static_assert(num_frags_z * num_frags_y % num_warps == 0);
-  static_assert(group_size == 1 || group_size % 4 == 0 || group_size == 6);
+  static_assert(group_size == 1 || group_size % 4 == 0 || group_size == 6 || group_size == 7);
 
   extern __shared__ uint8_t smem[];
 
@@ -1135,7 +1135,7 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
   constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeOut>();
 
   static_assert(num_frags_z * num_frags_y % num_warps == 0);
-  static_assert(group_size == 1 || group_size % 4 == 0 || group_size == 6);
+  static_assert(group_size == 1 || group_size % 4 == 0 || group_size == 6 || group_size == 7);
 
   extern __shared__ uint8_t smem[];
 
@@ -1341,7 +1341,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
   constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeOut>();
 
   static_assert(num_frags_z * num_frags_y % num_warps == 0);
-  static_assert(group_size == 1 || group_size % 4 == 0 || group_size == 6);
+  static_assert(group_size == 1 || group_size % 4 == 0 || group_size == 6 || group_size == 7);
 
   extern __shared__ uint8_t smem[];
 
