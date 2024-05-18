@@ -2021,8 +2021,8 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
     const float rope_theta, cudaStream_t stream = nullptr) {
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
-  constexpr uint32_t num_warps_x = 1;
-  constexpr uint32_t num_warps_z = 2;
+  constexpr uint32_t num_warps_x = 4;
+  constexpr uint32_t num_warps_z = 1;
 
   dim3 nblks(num_qo_tiles, 1, num_kv_heads);
   dim3 nthrs(32, num_warps_x, num_warps_z);
@@ -2101,8 +2101,8 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     cudaStream_t stream) {
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
-  constexpr uint32_t num_warps_x = 1;
-  constexpr uint32_t num_warps_z = 2;
+  constexpr uint32_t num_warps_x = 4;
+  constexpr uint32_t num_warps_z = 1;
   const uint32_t num_kv_heads = paged_kv.num_heads;
   const uint32_t batch_size = paged_kv.batch_size;
 
