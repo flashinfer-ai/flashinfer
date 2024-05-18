@@ -60,21 +60,17 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOu
   const MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
   DISPATCH_allow_fp16_qk_reduction(
       allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
-      {DISPATCH_group_size(
-          group_size, GROUP_SIZE,
-          {DISPATCH_mask_mode(
-              mask_mode, MASK_MODE,
-              {DISPATCH_head_dim(head_dim, HEAD_DIM,
-                                 {DISPATCH_pos_encoding_mode(
-                                     pos_encoding_mode, POS_ENCODING_MODE,
-                                     {DISPATCH_kv_layout(kv_layout, KV_LAYOUT, {
-                                       return SinglePrefillWithKVCacheDispatched<
-                                           GROUP_SIZE, HEAD_DIM, KV_LAYOUT, POS_ENCODING_MODE,
-                                           ALLOW_FP16_QK_REDUCTION, MASK_MODE>(
-                                           q, k, v, /*custom_mask=*/nullptr, o, tmp, lse,
-                                           num_kv_heads, qo_len, kv_len, sm_scale, rope_scale,
-                                           rope_theta, stream);
-                                     })})})})})});
+      {DISPATCH_mask_mode(
+          mask_mode, MASK_MODE,
+          {DISPATCH_head_dim(
+              head_dim, HEAD_DIM,
+              {DISPATCH_pos_encoding_mode(
+                  pos_encoding_mode, POS_ENCODING_MODE, {DISPATCH_kv_layout(kv_layout, KV_LAYOUT, {
+                    return SinglePrefillWithKVCacheDispatched<
+                        HEAD_DIM, KV_LAYOUT, POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION, MASK_MODE>(
+                        q, k, v, /*custom_mask=*/nullptr, o, tmp, lse, num_qo_heads, num_kv_heads,
+                        qo_len, kv_len, sm_scale, rope_scale, rope_theta, stream);
+                  })})})})});
   return cudaSuccess;
 }
 
@@ -91,23 +87,21 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
   const MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
   DISPATCH_kv_layout(
       kv_layout, KV_LAYOUT,
-      {DISPATCH_group_size(
-          num_qo_heads / num_kv_heads, GROUP_SIZE,
-          {DISPATCH_head_dim(
-              head_dim, HEAD_DIM,
-              {DISPATCH_mask_mode(
-                  mask_mode, MASK_MODE,
-                  {DISPATCH_pos_encoding_mode(
-                      pos_encoding_mode, pos_encoding_mode,
-                      {DISPATCH_allow_fp16_qk_reduction(
-                          allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
-                            return BatchPrefillWithRaggedKVCacheWrapperDispatched<
-                                GROUP_SIZE, HEAD_DIM, KV_LAYOUT, pos_encoding_mode,
-                                ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeOut, IdType>(
-                                handler, q, qo_indptr, k, v, kv_indptr, /*custom_mask=*/nullptr,
-                                /*qk_indptr=*/nullptr, q_offset, k_rope_pos_offset, o, lse,
-                                batch_size, num_kv_heads, sm_scale, rope_scale, rope_theta, stream);
-                          })})})})})});
+      {DISPATCH_head_dim(
+          head_dim, HEAD_DIM,
+          {DISPATCH_mask_mode(
+              mask_mode, MASK_MODE,
+              {DISPATCH_pos_encoding_mode(
+                  pos_encoding_mode, pos_encoding_mode,
+                  {DISPATCH_allow_fp16_qk_reduction(
+                      allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
+                        return BatchPrefillWithRaggedKVCacheWrapperDispatched<
+                            HEAD_DIM, KV_LAYOUT, pos_encoding_mode, ALLOW_FP16_QK_REDUCTION,
+                            MASK_MODE, DTypeIn, DTypeOut, IdType>(
+                            handler, q, qo_indptr, k, v, kv_indptr, /*custom_mask=*/nullptr,
+                            /*qk_indptr=*/nullptr, q_offset, k_rope_pos_offset, o, lse, batch_size,
+                            num_qo_heads, num_kv_heads, sm_scale, rope_scale, rope_theta, stream);
+                      })})})})});
   return cudaSuccess;
 }
 
@@ -124,24 +118,22 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
   const uint32_t num_kv_heads = paged_kv.num_heads;
   const uint32_t head_dim = paged_kv.head_dim;
   const MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
-  DISPATCH_group_size(
-      num_qo_heads / num_kv_heads, GROUP_SIZE,
-      {DISPATCH_head_dim(
-          head_dim, HEAD_DIM,
-          {DISPATCH_mask_mode(mask_mode, MASK_MODE,
-                              {DISPATCH_pos_encoding_mode(
-                                  pos_encoding_mode, pos_encoding_mode,
-                                  {DISPATCH_allow_fp16_qk_reduction(
-                                      allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
-                                      {DISPATCH_page_size(paged_kv.page_size, PAGE_SIZE, {
-                                        return BatchPrefillWithPagedKVCacheWrapperDispatched<
-                                            page_storage, kv_layout, PAGE_SIZE, GROUP_SIZE,
-                                            HEAD_DIM, pos_encoding_mode, ALLOW_FP16_QK_REDUCTION,
-                                            MASK_MODE, DTypeIn, DTypeOut, IdType>(
-                                            handler, q, qo_indptr, q_offset, paged_kv,
-                                            /*custom_mask=*/nullptr, /*qk_indptr=*/nullptr, o, lse,
-                                            sm_scale, rope_scale, rope_theta, stream);
-                                      })})})})})});
+  DISPATCH_head_dim(
+      head_dim, HEAD_DIM,
+      {DISPATCH_mask_mode(
+          mask_mode, MASK_MODE,
+          {DISPATCH_pos_encoding_mode(
+              pos_encoding_mode, pos_encoding_mode,
+              {DISPATCH_allow_fp16_qk_reduction(
+                  allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
+                  {DISPATCH_page_size(paged_kv.page_size, PAGE_SIZE, {
+                    return BatchPrefillWithPagedKVCacheWrapperDispatched<
+                        page_storage, kv_layout, PAGE_SIZE, HEAD_DIM, pos_encoding_mode,
+                        ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeOut, IdType>(
+                        handler, q, qo_indptr, q_offset, paged_kv,
+                        /*custom_mask=*/nullptr, /*qk_indptr=*/nullptr, o, lse, num_qo_heads,
+                        sm_scale, rope_scale, rope_theta, stream);
+                  })})})})});
   return cudaSuccess;
 }
 
@@ -161,17 +153,14 @@ cudaError_t SingleDecodeWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut
     throw std::invalid_argument(err_msg.str());
   }
 
-  DISPATCH_group_size(
-      num_qo_heads / num_kv_heads, GROUP_SIZE,
-      {DISPATCH_head_dim(
-          head_dim, HEAD_DIM,
-          {DISPATCH_pos_encoding_mode(
-              pos_encoding_mode, POS_ENCODING_MODE, {DISPATCH_kv_layout(kv_layout, KV_LAYOUT, {
-                SingleDecodeWithKVCacheDispatched<GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
-                                                  POS_ENCODING_MODE>(q, k, v, o, tmp, num_kv_heads,
-                                                                     seq_len, sm_scale, rope_scale,
-                                                                     rope_theta, stream);
-              })})})});
+  DISPATCH_head_dim(
+      head_dim, HEAD_DIM,
+      {DISPATCH_pos_encoding_mode(
+          pos_encoding_mode, POS_ENCODING_MODE, {DISPATCH_kv_layout(kv_layout, KV_LAYOUT, {
+            SingleDecodeWithKVCacheDispatched<HEAD_DIM, KV_LAYOUT, POS_ENCODING_MODE>(
+                q, k, v, o, tmp, num_qo_heads, num_kv_heads, seq_len, sm_scale, rope_scale,
+                rope_theta, stream);
+          })})});
   return cudaSuccess;
 }
 
@@ -193,17 +182,15 @@ cudaError_t BatchDecodeWithPaddedKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTy
     throw std::invalid_argument(err_msg.str());
   }
 
-  DISPATCH_group_size(
-      num_qo_heads / num_kv_heads, GROUP_SIZE,
-      {DISPATCH_head_dim(
-          head_dim, HEAD_DIM,
-          {DISPATCH_pos_encoding_mode(
-              pos_encoding_mode, POS_ENCODING_MODE, {DISPATCH_kv_layout(kv_layout, KV_LAYOUT, {
-                return BatchDecodeWithPaddedKVCacheDispatched<GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
-                                                              POS_ENCODING_MODE, DTypeIn, DTypeOut>(
-                    q, k, v, o, tmp, lse, batch_size, padded_kv_len, num_qo_heads, sm_scale,
-                    rope_scale, rope_theta, stream);
-              })})})});
+  DISPATCH_head_dim(
+      head_dim, HEAD_DIM,
+      {DISPATCH_pos_encoding_mode(
+          pos_encoding_mode, POS_ENCODING_MODE, {DISPATCH_kv_layout(kv_layout, KV_LAYOUT, {
+            return BatchDecodeWithPaddedKVCacheDispatched<HEAD_DIM, KV_LAYOUT, POS_ENCODING_MODE,
+                                                          DTypeIn, DTypeOut>(
+                q, k, v, o, tmp, lse, batch_size, padded_kv_len, num_qo_heads, num_kv_heads,
+                sm_scale, rope_scale, rope_theta, stream);
+          })})});
   return cudaSuccess;
 }
 
@@ -226,18 +213,14 @@ cudaError_t BatchDecodeWithPagedKVCacheNoSplitKV(
     throw std::invalid_argument(err_msg.str());
   }
 
-  DISPATCH_group_size(
-      num_qo_heads / num_kv_heads, GROUP_SIZE,
-      {DISPATCH_head_dim(
-          head_dim, HEAD_DIM, {DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
-            return BatchDecodeWithPagedKVCacheDispatched<GROUP_SIZE, HEAD_DIM, page_storage,
-                                                         kv_layout, POS_ENCODING_MODE, DTypeIn,
-                                                         DTypeOut, IdType>(
-                q, q_offset, paged_kv, kv_partition_info, o, /*tmp_v=*/nullptr, /*tmp_s=*/nullptr,
-                lse,
-                /*block_valid_mask=*/nullptr, /*padded_batch_size=*/paged_kv.batch_size, sm_scale,
-                rope_scale, rope_theta, stream);
-          })})});
+  DISPATCH_head_dim(
+      head_dim, HEAD_DIM, {DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
+        return BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, page_storage, kv_layout,
+                                                     POS_ENCODING_MODE, DTypeIn, DTypeOut, IdType>(
+            q, q_offset, paged_kv, kv_partition_info, o, /*tmp_v=*/nullptr, /*tmp_s=*/nullptr, lse,
+            /*block_valid_mask=*/nullptr, /*padded_batch_size=*/paged_kv.batch_size, num_qo_heads,
+            sm_scale, rope_scale, rope_theta, stream);
+      })});
 
   return cudaSuccess;
 }
@@ -280,16 +263,14 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapper(
     throw std::invalid_argument(err_msg.str());
   }
 
-  DISPATCH_group_size(
-      num_qo_heads / num_kv_heads, GROUP_SIZE,
-      {DISPATCH_head_dim(
-          paged_kv.head_dim, HEAD_DIM,
-          {DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
-            return BatchDecodeWithPagedKVCacheWrapperDispatched<page_storage, KV_LAYOUT, GROUP_SIZE,
-                                                                HEAD_DIM, POS_ENCODING_MODE,
-                                                                DTypeIn, DTypeOut, IdType>(
-                handler, q, q_offset, paged_kv, o, lse, sm_scale, rope_scale, rope_theta, stream);
-          })})});
+  DISPATCH_head_dim(
+      paged_kv.head_dim, HEAD_DIM,
+      {DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
+        return BatchDecodeWithPagedKVCacheWrapperDispatched<
+            page_storage, KV_LAYOUT, HEAD_DIM, POS_ENCODING_MODE, DTypeIn, DTypeOut, IdType>(
+            handler, q, q_offset, paged_kv, o, lse, num_qo_heads, sm_scale, rope_scale, rope_theta,
+            stream);
+      })});
   return cudaSuccess;
 }
 
@@ -307,14 +288,12 @@ cudaError_t BatchDecodeHandlerBeginForward(BatchDecodeHandler* handler, void* bu
             << num_kv_heads;
     throw std::invalid_argument(err_msg.str());
   }
-  DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, {
-    DISPATCH_head_dim(head_dim, HEAD_DIM, {
-      DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
-        return handler->BeginForwardDispatched<GROUP_SIZE, HEAD_DIM, page_storage, kv_layout,
-                                               POS_ENCODING_MODE, DTypeIn, DTypeOut, IdType>(
-            buffer, workspace_size_in_bytes, indptr, last_page_len, batch_size, num_qo_heads,
-            page_size);
-      });
+  DISPATCH_head_dim(head_dim, HEAD_DIM, {
+    DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
+      return handler->BeginForwardDispatched<HEAD_DIM, page_storage, kv_layout, POS_ENCODING_MODE,
+                                             DTypeIn, DTypeOut, IdType>(
+          buffer, workspace_size_in_bytes, indptr, last_page_len, batch_size, num_qo_heads,
+          num_kv_heads, page_size);
     });
   });
 }

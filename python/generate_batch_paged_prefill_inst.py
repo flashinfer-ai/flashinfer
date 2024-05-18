@@ -28,7 +28,6 @@ from pathlib import Path
 
 
 def get_cu_file_str(
-    group_size,
     page_size,
     head_dim,
     kv_layout,
@@ -42,12 +41,13 @@ def get_cu_file_str(
     num_frags_x_choices = [1, 2]
     insts = "\n".join(
         [
-            """template cudaError_t BatchPrefillWithPagedKVCacheDispatched<page_storage, {kv_layout}, {num_frags_x}, {page_size}, {group_size}, {head_dim}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {dtype_in}, {dtype_out}, {idtype}>(
+            """template cudaError_t BatchPrefillWithPagedKVCacheDispatched<page_storage, {kv_layout}, {num_frags_x}, {page_size}, {head_dim}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {dtype_in}, {dtype_out}, {idtype}>(
     {dtype_in}* q, {idtype}* request_indices, {idtype}* tile_indices,
     {idtype}* qo_indptr, {idtype}* q_offset,
     paged_kv_t<page_storage, {kv_layout}, {dtype_in}, {idtype}> paged_kv,
     float* custom_mask, {idtype}* qk_indptr,
     {dtype_out}* o, float* tmp, float* lse,
+    uint32_t num_qo_heads,
     uint32_t num_qo_tiles,
     float sm_scale, float rope_scale,
     float rope_theta, cudaStream_t stream);
@@ -55,7 +55,6 @@ def get_cu_file_str(
                 kv_layout=kv_layout_literal[int(kv_layout)],
                 num_frags_x=num_frags_x,
                 page_size=page_size,
-                group_size=group_size,
                 head_dim=head_dim,
                 pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
                 allow_fp16_qk_reduction=allow_fp16_qk_reduction,
@@ -82,7 +81,7 @@ constexpr PageStorage page_storage = PageStorage::kIndices;
 
 if __name__ == "__main__":
     pattern = (
-        r"batch_paged_prefill_group_([0-9]+)_page_([0-9]+)_head_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
+        r"batch_paged_prefill_page_([0-9]+)_head_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
         r"fp16qkred_([a-z]+)_mask_([0-9]+)_dtypein_([a-z0-9]+)_dtypeout_([a-z0-9]+)_idtype_([a-z0-9]+)\.cu"
     )
     compiled_pattern = re.compile(pattern)

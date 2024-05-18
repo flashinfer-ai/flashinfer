@@ -99,19 +99,21 @@ std::pair<uint32_t, uint32_t> PartitionPagedKVCacheBinarySearchMinNumPagePerBatc
  * \param stream The cuda stream to launch the kernel
  * \return status Indicates whether CUDA calls are successful
  */
-template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, QKVLayout kv_layout,
+template <uint32_t HEAD_DIM, PageStorage page_storage, QKVLayout kv_layout,
           PosEncodingMode POS_ENCODING_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     uint32_t& tmp_size, uint32_t& max_grid_size, uint32_t& max_num_pages_per_batch,
     uint32_t& new_batch_size, uint32_t batch_size, IdType* kv_indptr, const uint32_t num_qo_heads,
-    const uint32_t page_size, bool enable_cuda_graph, cudaStream_t stream) {
+    const uint32_t num_kv_heads, const uint32_t page_size, bool enable_cuda_graph,
+    cudaStream_t stream) {
   constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
   constexpr uint32_t num_stages_smem = 2U;
   constexpr uint32_t bdx = HEAD_DIM / vec_size;
   static_assert(bdx <= 32);
-  constexpr uint32_t bdy = GROUP_SIZE;
+  constexpr uint32_t bdy = num_qo_heads / num_kv_heads;
   constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
   constexpr uint32_t bdz = num_threads / (bdx * bdy);
+  // TODO(ZIHAO): fix this
   constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeIn) == 1 ? 2U : 4U) : 1U;
   const uint32_t num_kv_heads = num_qo_heads / GROUP_SIZE;
   const uint32_t smem_size =
@@ -293,21 +295,19 @@ class BatchDecodeHandler {
 
   bool* GetBlockValidMask() const { return block_valid_mask_; }
 
-  template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, QKVLayout kv_layout,
+  template <uint32_t HEAD_DIM, PageStorage page_storage, QKVLayout kv_layout,
             PosEncodingMode POS_ENCODING_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
   cudaError_t BeginForwardDispatched(void* buffer, size_t workspace_size_in_bytes, IdType* indptr,
                                      IdType* last_page_len, uint32_t batch_size,
-                                     uint32_t num_qo_heads, uint32_t page_size) {
+                                     uint32_t num_qo_heads, uint32_t num_kv_heads,
+                                     uint32_t page_size) {
     batch_size_before_partition_ = batch_size;
-    uint32_t num_kv_heads = num_qo_heads / GROUP_SIZE;
     uint32_t tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size;
-    auto work_estimation_func =
-        BatchDecodeWithPagedKVCacheWorkEstimationDispatched<GROUP_SIZE, HEAD_DIM, page_storage,
-                                                            kv_layout, POS_ENCODING_MODE, DTypeIn,
-                                                            DTypeOut, IdType>;
+    auto work_estimation_func = BatchDecodeWithPagedKVCacheWorkEstimationDispatched<
+        HEAD_DIM, page_storage, kv_layout, POS_ENCODING_MODE, DTypeIn, DTypeOut, IdType>;
     FLASHINFER_CUDA_CALL(work_estimation_func(tmp_size, max_grid_size, max_num_pages_per_batch,
                                               new_batch_size, batch_size, indptr, num_qo_heads,
-                                              page_size,
+                                              num_kv_heads, page_size,
                                               /*enable_cuda_graph=*/IsCUDAGraphEnabled(), stream_));
     batch_size_after_partition_ = new_batch_size;
     if (IsCUDAGraphEnabled()) {

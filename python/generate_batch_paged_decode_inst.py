@@ -26,7 +26,7 @@ from pathlib import Path
 
 
 def get_cu_file_str(
-    group_size, head_dim, kv_layout, pos_encoding_mode, dtype_in, dtype_out, idtype
+    head_dim, kv_layout, pos_encoding_mode, dtype_in, dtype_out, idtype
 ):
     content = """#include <flashinfer/attention_impl.cuh>
 
@@ -34,19 +34,18 @@ namespace flashinfer {{
 
 constexpr PageStorage page_storage = PageStorage::kIndices;
 
-template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{group_size}, {head_dim}, page_storage, {kv_layout}, {pos_encoding_mode}, {dtype_in}, {dtype_out}, {idtype}>(
+template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{head_dim}, page_storage, {kv_layout}, {pos_encoding_mode}, {dtype_in}, {dtype_out}, {idtype}>(
     {dtype_in}* q, {idtype}* q_offset,
     paged_kv_t<page_storage, {kv_layout}, {dtype_in}, {idtype}> paged_kv,
     kv_partition_info_t<{idtype}> kv_partition_info,
     {dtype_out}* o, {dtype_out}* tmp_v, float* tmp_s, float* lse,
     bool* block_valid_mask, uint32_t padded_batch_size,
-    float sm_scale, float rope_scale,
+    uint32_t num_qo_heads, float sm_scale, float rope_scale,
     float rope_theta, cudaStream_t stream);
 
 }}
     """.format(
         kv_layout=kv_layout_literal[int(kv_layout)],
-        group_size=group_size,
         head_dim=head_dim,
         pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
         dtype_in=dtype_literal[dtype_in],
@@ -58,7 +57,7 @@ template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{group_size}, {head_d
 
 if __name__ == "__main__":
     pattern = (
-        r"batch_paged_decode_group_([0-9]+)_head_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
+        r"batch_paged_decode_head_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
         r"dtypein_([a-z0-9]+)_dtypeout_([a-z0-9]+)_idtype_([a-z0-9]+)\.cu"
     )
 

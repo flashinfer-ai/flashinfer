@@ -37,7 +37,6 @@ flashinfer_option(FLASHINFER_TVM_SOURCE_DIR "The path to tvm for building tvm bi
 
 # The following configurations can impact the binary
 # size of the generated library
-flashinfer_option(FLASHINFER_GEN_GROUP_SIZES "Group sizes to enable" 1 4 5 6 7 8)
 flashinfer_option(FLASHINFER_GEN_PAGE_SIZES "Prefill page sizes to enable" 1 16 32)
 flashinfer_option(FLASHINFER_GEN_HEAD_DIMS "Head dims to enable" 64 128 256)
 flashinfer_option(FLASHINFER_GEN_KV_LAYOUTS "KV layouts to enable" 0 1)
@@ -80,7 +79,6 @@ if(FLASHINFER_ENABLE_BF16)
 endif(FLASHINFER_ENABLE_BF16)
 
 # generate kernel inst
-set (GROUP_SIZES ${FLASHINFER_GEN_GROUP_SIZES})
 set (PAGE_SIZES ${FLASHINFER_GEN_PAGE_SIZES})
 set (HEAD_DIMS ${FLASHINFER_GEN_HEAD_DIMS})
 set (KV_LAYOUTS ${FLASHINFER_GEN_KV_LAYOUTS})
@@ -103,7 +101,6 @@ if(FLASHINFER_ENABLE_BF16)
 endif(FLASHINFER_ENABLE_BF16)
 
 # log options
-message(STATUS "FLASHINFER_GROUP_SIZES=${GROUP_SIZES}")
 message(STATUS "FLASHINFER_PAGE_SIZES=${PAGE_SIZES}")
 message(STATUS "FLASHINFER_HEAD_DIMS=${HEAD_DIMS}")
 message(STATUS "FLASHINFER_KV_LAYOUTS=${KV_LAYOUTS}")
@@ -116,7 +113,7 @@ file(MAKE_DIRECTORY ${PROJECT_SOURCE_DIR}/src/generated)
 set(dispatch_inc_file ${PROJECT_SOURCE_DIR}/src/dispatch.inc)
 add_custom_command(
   OUTPUT ${dispatch_inc_file}
-  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_dispatch_inc.py --path ${PROJECT_SOURCE_DIR}/src/dispatch.inc --head_dims ${HEAD_DIMS} --page_sizes ${FLASHINFER_GEN_PAGE_SIZES} --group_sizes ${GROUP_SIZES} --kv_layouts ${KV_LAYOUTS} --pos_encoding_modes ${POS_ENCODING_MODES} --allow_fp16_qk_reductions ${ALLOW_FP16_QK_REDUCTIONS} --mask_modes ${MASK_MODES}
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_dispatch_inc.py --path ${PROJECT_SOURCE_DIR}/src/dispatch.inc --head_dims ${HEAD_DIMS} --page_sizes ${FLASHINFER_GEN_PAGE_SIZES} --kv_layouts ${KV_LAYOUTS} --pos_encoding_modes ${POS_ENCODING_MODES} --allow_fp16_qk_reductions ${ALLOW_FP16_QK_REDUCTIONS} --mask_modes ${MASK_MODES}
   DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_dispatch_inc.py
   COMMENT "Generating additional source file ${generated_dispatch_inc}"
   VERBATIM
@@ -124,162 +121,127 @@ add_custom_command(
 add_custom_target(dispatch_inc DEPENDS ${dispatch_inc_file})
 
 # single decode kernel inst generation
-foreach(group_size IN LISTS GROUP_SIZES)
-  foreach(head_dim IN LISTS HEAD_DIMS)
-    foreach(kv_layout IN LISTS KV_LAYOUTS)
-      foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
-        foreach(dtype IN LISTS DECODE_DTYPES)
-          set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_${dtype}.cu)
-          add_custom_command(
-            OUTPUT ${generated_kernel_src}
-            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_single_decode_inst.py ${generated_kernel_src}
-            DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_single_decode_inst.py
-            COMMENT "Generating additional source file ${generated_kernel_src}"
-            VERBATIM
-          )
-          list(APPEND single_decode_kernels_src ${generated_kernel_src})
-        endforeach(dtype)
+foreach(head_dim IN LISTS HEAD_DIMS)
+  foreach(kv_layout IN LISTS KV_LAYOUTS)
+    foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
+      foreach(dtype IN LISTS DECODE_DTYPES)
+        set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_decode_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_${dtype}.cu)
+        add_custom_command(
+          OUTPUT ${generated_kernel_src}
+          COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_single_decode_inst.py ${generated_kernel_src}
+          DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_single_decode_inst.py
+          COMMENT "Generating additional source file ${generated_kernel_src}"
+          VERBATIM
+        )
+        list(APPEND single_decode_kernels_src ${generated_kernel_src})
+      endforeach(dtype)
 
-        # fp8 in, fp16 out
-        foreach(dtype IN LISTS DECODE_FP8_DTYPES)
-          set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_f16.cu)
-          add_custom_command(
-            OUTPUT ${generated_kernel_src}
-            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_single_decode_inst.py ${generated_kernel_src}
-            DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_single_decode_inst.py
-            COMMENT "Generating additional source file ${generated_kernel_src}"
-            VERBATIM
-          )
-          list(APPEND single_decode_kernels_src ${generated_kernel_src})
-        endforeach(dtype)
-      endforeach(pos_encoding_mode)
-    endforeach(kv_layout)
-  endforeach(head_dim)
-endforeach(group_size)
+      # fp8 in, fp16 out
+      foreach(dtype IN LISTS DECODE_F8_DTYPES)
+        set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_decode_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_f16.cu)
+        add_custom_command(
+          OUTPUT ${generated_kernel_src}
+          COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_single_decode_inst.py ${generated_kernel_src}
+          DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_single_decode_inst.py
+          COMMENT "Generating additional source file ${generated_kernel_src}"
+          VERBATIM
+        )
+        list(APPEND single_decode_kernels_src ${generated_kernel_src})
+      endforeach(dtype)
+    endforeach(pos_encoding_mode)
+  endforeach(kv_layout)
+endforeach(head_dim)
 
 # batch decode kernel inst generation
-foreach(group_size IN LISTS GROUP_SIZES)
-  foreach(head_dim IN LISTS HEAD_DIMS)
-    foreach(kv_layout IN LISTS KV_LAYOUTS)
-      foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
-        # paged kv-cache
-        foreach(idtype IN LISTS IDTYPES)
-          foreach(dtype IN LISTS DECODE_DTYPES)
-            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
-            add_custom_command(
-              OUTPUT ${generated_kernel_src}
-              COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_decode_inst.py ${generated_kernel_src}
-              DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_decode_inst.py
-              COMMENT "Generating additional source file ${generated_kernel_src}"
-              VERBATIM
-            )
-            list(APPEND batch_decode_kernels_src ${generated_kernel_src})
-          endforeach(dtype)
-
-          # fp8 in, fp16 out
-          foreach(dtype IN LISTS DECODE_FP8_DTYPES)
-            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_f16_idtype_${idtype}.cu)
-            add_custom_command(
-              OUTPUT ${generated_kernel_src}
-              COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_decode_inst.py ${generated_kernel_src}
-              DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_decode_inst.py
-              COMMENT "Generating additional source file ${generated_kernel_src}"
-              VERBATIM
-            )
-            list(APPEND batch_decode_kernels_src ${generated_kernel_src})
-          endforeach()
-        endforeach(idtype)
-
-        # padded kv-cache
+foreach(head_dim IN LISTS HEAD_DIMS)
+  foreach(kv_layout IN LISTS KV_LAYOUTS)
+    foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
+      # paged kv-cache
+      foreach(idtype IN LISTS IDTYPES)
         foreach(dtype IN LISTS DECODE_DTYPES)
-          set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_padded_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_${dtype}.cu)
+          set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_decode_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
           add_custom_command(
             OUTPUT ${generated_kernel_src}
-            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_padded_decode_inst.py ${generated_kernel_src}
-            DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_padded_decode_inst.py
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_decode_inst.py ${generated_kernel_src}
+            DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_decode_inst.py
             COMMENT "Generating additional source file ${generated_kernel_src}"
             VERBATIM
           )
           list(APPEND batch_decode_kernels_src ${generated_kernel_src})
         endforeach(dtype)
 
-        # padded kv-cache, fp8 in, fp16 out
+        # fp8 in, fp16 out
         foreach(dtype IN LISTS DECODE_FP8_DTYPES)
-          set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_padded_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_f16.cu)
+          set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_decode_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_f16_idtype_${idtype}.cu)
           add_custom_command(
             OUTPUT ${generated_kernel_src}
-            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_padded_decode_inst.py ${generated_kernel_src}
-            DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_padded_decode_inst.py
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_decode_inst.py ${generated_kernel_src}
+            DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_decode_inst.py
             COMMENT "Generating additional source file ${generated_kernel_src}"
             VERBATIM
           )
           list(APPEND batch_decode_kernels_src ${generated_kernel_src})
         endforeach()
-      endforeach(pos_encoding_mode)
-    endforeach(kv_layout)
-  endforeach(head_dim)
-endforeach(group_size)
+      endforeach(idtype)
+
+      # padded kv-cache
+      foreach(dtype IN LISTS DECODE_DTYPES)
+        set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_padded_decode_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_${dtype}.cu)
+        add_custom_command(
+          OUTPUT ${generated_kernel_src}
+          COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_padded_decode_inst.py ${generated_kernel_src}
+          DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_padded_decode_inst.py
+          COMMENT "Generating additional source file ${generated_kernel_src}"
+          VERBATIM
+        )
+        list(APPEND batch_decode_kernels_src ${generated_kernel_src})
+      endforeach(dtype)
+
+      # padded kv-cache, fp8 in, fp16 out
+      foreach(dtype IN LISTS DECODE_FP8_DTYPES)
+        set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_padded_decode_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_f16.cu)
+        add_custom_command(
+          OUTPUT ${generated_kernel_src}
+          COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_padded_decode_inst.py ${generated_kernel_src}
+          DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_padded_decode_inst.py
+          COMMENT "Generating additional source file ${generated_kernel_src}"
+          VERBATIM
+        )
+        list(APPEND batch_decode_kernels_src ${generated_kernel_src})
+      endforeach()
+    endforeach(pos_encoding_mode)
+  endforeach(kv_layout)
+endforeach(head_dim)
 
 add_library(decode_kernels STATIC ${single_decode_kernels_src} ${batch_decode_kernels_src})
 target_include_directories(decode_kernels PRIVATE ${FLASHINFER_INCLUDE_DIR})
 target_compile_options(decode_kernels PRIVATE -Xcompiler=-fPIC --fatbin-options -compress-all)
 
 # single prefill kernel inst generation
-foreach(group_size IN LISTS GROUP_SIZES)
-  foreach(head_dim IN LISTS HEAD_DIMS)
-    foreach(kv_layout IN LISTS KV_LAYOUTS)
-      foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
-        foreach(allow_fp16_qk_reduction IN LISTS ALLOW_FP16_QK_REDUCTIONS)
-          foreach(mask_mode IN LISTS MASK_MODES)
-            foreach(dtype IN LISTS PREFILL_DTYPES)
-              set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_prefill_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypein_${dtype}_dtypeout_${dtype}.cu)
-              add_custom_command(
-                OUTPUT ${generated_kernel_src}
-                COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_single_prefill_inst.py ${generated_kernel_src}
-                DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_single_prefill_inst.py
-                COMMENT "Generating additional source file ${generated_kernel_src}"
-                VERBATIM
-              )
-              list(APPEND single_prefill_kernels_src ${generated_kernel_src})
-            endforeach(dtype)
-          endforeach(mask_mode)
-        endforeach(allow_fp16_qk_reduction)
-      endforeach(pos_encoding_mode)
-    endforeach(kv_layout)
-  endforeach(head_dim)
-endforeach(group_size)
+foreach(head_dim IN LISTS HEAD_DIMS)
+  foreach(kv_layout IN LISTS KV_LAYOUTS)
+    foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
+      foreach(allow_fp16_qk_reduction IN LISTS ALLOW_FP16_QK_REDUCTIONS)
+        foreach(mask_mode IN LISTS MASK_MODES)
+          foreach(dtype IN LISTS PREFILL_DTYPES)
+            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_prefill_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypein_${dtype}_dtypeout_${dtype}.cu)
+            add_custom_command(
+              OUTPUT ${generated_kernel_src}
+              COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_single_prefill_inst.py ${generated_kernel_src}
+              DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_single_prefill_inst.py
+              COMMENT "Generating additional source file ${generated_kernel_src}"
+              VERBATIM
+            )
+            list(APPEND single_prefill_kernels_src ${generated_kernel_src})
+          endforeach(dtype)
+        endforeach(mask_mode)
+      endforeach(allow_fp16_qk_reduction)
+    endforeach(pos_encoding_mode)
+  endforeach(kv_layout)
+endforeach(head_dim)
 
 # batch paged prefill kernel inst generation
-foreach(group_size IN LISTS GROUP_SIZES)
-  foreach(page_size IN LISTS PAGE_SIZES)
-    foreach(head_dim IN LISTS HEAD_DIMS)
-      foreach(kv_layout IN LISTS KV_LAYOUTS)
-        foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
-          foreach(allow_fp16_qk_reduction IN LISTS ALLOW_FP16_QK_REDUCTIONS)
-            foreach(mask_mode IN LISTS MASK_MODES)
-              foreach(dtype IN LISTS PREFILL_DTYPES)
-                foreach(idtype IN LISTS IDTYPES)
-                  set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_prefill_group_${group_size}_page_${page_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
-                  add_custom_command(
-                    OUTPUT ${generated_kernel_src}
-                    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py ${generated_kernel_src}
-                    DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py
-                    COMMENT "Generating additional source file ${generated_kernel_src}"
-                    VERBATIM
-                  )
-                  list(APPEND batch_paged_prefill_kernels_src ${generated_kernel_src})
-                endforeach(idtype)
-              endforeach(dtype)
-            endforeach(mask_mode)
-          endforeach(allow_fp16_qk_reduction)
-        endforeach(pos_encoding_mode)
-      endforeach(kv_layout)
-    endforeach(head_dim)
-  endforeach(page_size)
-endforeach(group_size)
-
-# batch ragged prefill kernel inst generation
-foreach(group_size IN LISTS GROUP_SIZES)
+foreach(page_size IN LISTS PAGE_SIZES)
   foreach(head_dim IN LISTS HEAD_DIMS)
     foreach(kv_layout IN LISTS KV_LAYOUTS)
       foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
@@ -287,15 +249,15 @@ foreach(group_size IN LISTS GROUP_SIZES)
           foreach(mask_mode IN LISTS MASK_MODES)
             foreach(dtype IN LISTS PREFILL_DTYPES)
               foreach(idtype IN LISTS IDTYPES)
-                set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_ragged_prefill_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
+                set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_prefill_page_${page_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
                 add_custom_command(
                   OUTPUT ${generated_kernel_src}
-                  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_ragged_prefill_inst.py ${generated_kernel_src}
-                  DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_ragged_prefill_inst.py
+                  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py ${generated_kernel_src}
+                  DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py
                   COMMENT "Generating additional source file ${generated_kernel_src}"
                   VERBATIM
                 )
-                list(APPEND batch_ragged_prefill_kernels_src ${generated_kernel_src})
+                list(APPEND batch_paged_prefill_kernels_src ${generated_kernel_src})
               endforeach(idtype)
             endforeach(dtype)
           endforeach(mask_mode)
@@ -303,7 +265,32 @@ foreach(group_size IN LISTS GROUP_SIZES)
       endforeach(pos_encoding_mode)
     endforeach(kv_layout)
   endforeach(head_dim)
-endforeach(group_size)
+endforeach(page_size)
+
+# batch ragged prefill kernel inst generation
+foreach(head_dim IN LISTS HEAD_DIMS)
+  foreach(kv_layout IN LISTS KV_LAYOUTS)
+    foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
+      foreach(allow_fp16_qk_reduction IN LISTS ALLOW_FP16_QK_REDUCTIONS)
+        foreach(mask_mode IN LISTS MASK_MODES)
+          foreach(dtype IN LISTS PREFILL_DTYPES)
+            foreach(idtype IN LISTS IDTYPES)
+              set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_ragged_prefill_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
+              add_custom_command(
+                OUTPUT ${generated_kernel_src}
+                COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_ragged_prefill_inst.py ${generated_kernel_src}
+                DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_ragged_prefill_inst.py
+                COMMENT "Generating additional source file ${generated_kernel_src}"
+                VERBATIM
+              )
+              list(APPEND batch_ragged_prefill_kernels_src ${generated_kernel_src})
+            endforeach(idtype)
+          endforeach(dtype)
+        endforeach(mask_mode)
+      endforeach(allow_fp16_qk_reduction)
+    endforeach(pos_encoding_mode)
+  endforeach(kv_layout)
+endforeach(head_dim)
 
 add_library(prefill_kernels STATIC ${single_prefill_kernels_src} ${batch_paged_prefill_kernels_src} ${batch_ragged_prefill_kernels_src})
 target_include_directories(prefill_kernels PRIVATE ${FLASHINFER_INCLUDE_DIR})

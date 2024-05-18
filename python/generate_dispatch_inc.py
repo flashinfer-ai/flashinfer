@@ -36,17 +36,6 @@ def get_dispatch_inc_str(args: argparse.Namespace) -> str:
 {dispatch_head_dims_entries}
 // EOL
 """
-    # group sizes
-    dispatch_group_sizes_entries = "\n".join(
-        [
-            "  _DISPATCH_CASE({}, case_var, __VA_ARGS__) \\".format(_)
-            for _ in args.group_sizes
-        ]
-    )
-    dispatch_group_sizes_str = f"""#define _DISPATCH_CASES_group_size(case_var, ...)         \\
-{dispatch_group_sizes_entries}
-// EOL
-"""
     # page sizes
     dispatch_page_sizes_entries = "\n".join(
         [
@@ -112,7 +101,6 @@ def get_dispatch_inc_str(args: argparse.Namespace) -> str:
     return "\n".join(
         [
             dispatch_head_dims_str,
-            dispatch_group_sizes_str,
             dispatch_page_sizes_str,
             dispatch_kv_layouts_str,
             dispatch_pos_encoding_modes_str,
@@ -136,9 +124,6 @@ if __name__ == "__main__":
         required=True,
         nargs="+",
         help="Prefill attention page sizes",
-    )
-    parser.add_argument(
-        "--group_sizes", type=int, required=True, nargs="+", help="Group sizes"
     )
     parser.add_argument(
         "--kv_layouts", type=int, required=True, nargs="+", help="KV layouts"

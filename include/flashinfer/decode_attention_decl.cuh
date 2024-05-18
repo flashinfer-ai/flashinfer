@@ -28,14 +28,15 @@
 
 namespace flashinfer {
 
-template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
-          PosEncodingMode pos_encoding_mode, typename DTypeIn, typename DTypeOut>
+template <uint32_t HEAD_DIM, QKVLayout KV_LAYOUT, PosEncodingMode pos_encoding_mode,
+          typename DTypeIn, typename DTypeOut>
 cudaError_t SingleDecodeWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o,
-                                              DTypeOut* tmp, uint32_t num_kv_heads,
-                                              uint32_t seq_len, float sm_scale, float rope_scale,
-                                              float rope_theta, cudaStream_t stream);
+                                              DTypeOut* tmp, uint32_t num_qo_heads,
+                                              uint32_t num_kv_heads, uint32_t seq_len,
+                                              float sm_scale, float rope_scale, float rope_theta,
+                                              cudaStream_t stream);
 
-template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, QKVLayout kv_layout,
+template <uint32_t HEAD_DIM, PageStorage page_storage, QKVLayout kv_layout,
           PosEncodingMode POS_ENCODING_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     DTypeIn* q, IdType* q_offset, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
@@ -43,20 +44,22 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     float* lse, bool* block_valid_mask, uint32_t padded_batch_size, float sm_scale,
     float rope_scale, float rope_theta, cudaStream_t stream);
 
-template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
-          PosEncodingMode POS_ENCODING_MODE, typename DTypeIn, typename DTypeOut>
+template <uint32_t HEAD_DIM, QKVLayout KV_LAYOUT, PosEncodingMode POS_ENCODING_MODE,
+          typename DTypeIn, typename DTypeOut>
 cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o,
                                                    DTypeOut* tmp, float* lse, uint32_t batch_size,
                                                    uint32_t padded_kv_len, uint32_t num_qo_heads,
-                                                   float sm_scale, float rope_scale,
-                                                   float rope_theta, cudaStream_t stream);
+                                                   uint32_t num_kv_heads, float sm_scale,
+                                                   float rope_scale, float rope_theta,
+                                                   cudaStream_t stream);
 
-template <PageStorage page_storage, QKVLayout KV_LAYOUT, uint32_t GROUP_SIZE, uint32_t HEAD_DIM,
+template <PageStorage page_storage, QKVLayout KV_LAYOUT, uint32_t HEAD_DIM,
           PosEncodingMode POS_ENCODING_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheWrapperDispatched(
     BatchDecodeHandler* handler, DTypeIn* q, IdType* q_offset,
     paged_kv_t<page_storage, KV_LAYOUT, DTypeIn, IdType> paged_kv, DTypeOut* o, float* lse,
-    float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream) {
+    uint32_t num_qo_heads, float sm_scale, float rope_scale, float rope_theta,
+    cudaStream_t stream) {
   paged_kv_t<page_storage, KV_LAYOUT, DTypeIn, IdType> new_paged_kv = paged_kv;
   kv_partition_info_t<IdType> kv_partition_info;
   DTypeOut* tmp_v = handler->GetTempV<DTypeOut>();
@@ -81,9 +84,9 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapperDispatched(
     throw std::runtime_error(err_msg.str());
   }
 
-  return BatchDecodeWithPagedKVCacheDispatched<GROUP_SIZE, HEAD_DIM, page_storage, KV_LAYOUT,
-                                               POS_ENCODING_MODE, DTypeIn, DTypeOut, IdType>(
-      q, q_offset, new_paged_kv, kv_partition_info, o, tmp_v, tmp_s, lse,
+  return BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, page_storage, KV_LAYOUT, POS_ENCODING_MODE,
+                                               DTypeIn, DTypeOut, IdType>(
+      q, q_offset, new_paged_kv, kv_partition_info, o, tmp_v, tmp_s, lse, num_qo_heads,
       handler->GetBlockValidMask(), handler->GetPaddedBatchSize(), sm_scale, rope_scale, rope_theta,
       stream);
 }
