@@ -448,6 +448,8 @@ if(FLASHINFER_TVM_BINDING)
     set(TVM_SOURCE_DIR_SET ${FLASHINFER_TVM_SOURCE_DIR})
   elseif(DEFINED ENV{TVM_SOURCE_DIR})
     set(TVM_SOURCE_DIR_SET $ENV{TVM_SOURCE_DIR})
+  elseif(DEFINED ENV{TVM_HOME}) # for backward compatibility
+    set(TVM_SOURCE_DIR_SET $ENV{TVM_HOME})
   else()
     message(FATAL_ERROR "Error: Cannot find TVM. Please set the path to TVM by 1) adding `-DFLASHINFER_TVM_SOURCE_DIR=path/to/tvm` in the cmake command, or 2) setting the environment variable `TVM_SOURCE_DIR` to the tvm path.")
   endif()
