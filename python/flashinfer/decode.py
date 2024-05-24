@@ -643,9 +643,9 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper:
     def __init__(
         self,
         workspace_buffer: torch.Tensor,
-        indptr_buffer,
-        indices_buffer,
-        last_page_len_buffer,
+        indptr_buffer: torch.Tensor,
+        indices_buffer: torch.Tensor,
+        last_page_len_buffer: torch.Tensor,
         kv_layout: str = "NHD",
     ):
         r"""Constructor of :class:`BatchDecodeWithPagedKVCacheWrapper`.
@@ -662,15 +662,14 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper:
         check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
         self._workspace_buffer = workspace_buffer
-        self._wrapper = _kernels.BatchDecodeWithPagedKVCachePyTorchWrapper(
+        max_batch_size = len(last_page_len_buffer)
+        self._wrapper = _kernels.CUDAGraphBatchDecodeWithPagedKVCachePyTorchWrapper(
             TensorLayout[kv_layout].value,
-            workspace_buffer.numel() * workspace_buffer.element_size(),
+            max_batch_size,
         )
         self._paged_kv_indptr_buf = indptr_buffer
         self._paged_kv_indices_buf = indices_buffer
         self._paged_kv_last_page_len_buf = last_page_len_buffer
-        self._batch_size = 0
-        self._nnz_pages = 0
 
     def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
         r"""Reset the workspace buffer.
@@ -731,12 +730,10 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper:
         is not equal to ``num_kv_heads``, the function will use
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
         """
-        self._paged_kv_indptr_buf[len(indptr_host)] = indptr_host
-        self._paged_kv_indices_buf[len(indices_host)] = indices_host
-        self._paged_kv_last_page_len_buf[len(last_page_len_host)] = last_page_len_host
 
-        self._batch_size = len(indptr_host) - 1
-        self._nnz_pages = len(indices_host)
+        self._paged_kv_indptr_buf[: len(indptr_host)] = indptr_host
+        self._paged_kv_indices_buf[: len(indices_host)] = indices_host
+        self._paged_kv_last_page_len_buf[: len(last_page_len_host)] = last_page_len_host
 
         batch_size = len(indptr_host) - 1
         # NOTE(Zihao): the following tensor acts as placeholder to pass dtype info
@@ -816,8 +813,6 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper:
             self._paged_kv_indptr_buf,
             self._paged_kv_indices_buf,
             self._paged_kv_last_page_len_buf,
-            self._batch_size,
-            self._nnz_pages,
             PosEncodingMode[pos_encoding_mode].value,
             sm_scale,
             rope_scale,

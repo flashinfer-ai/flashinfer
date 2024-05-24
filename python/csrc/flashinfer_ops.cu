@@ -43,6 +43,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("update_page_locked_buffer_size",
            &BatchDecodeWithPagedKVCachePyTorchWrapper::UpdatePageLockedBufferSize)
       .def("forward", &BatchDecodeWithPagedKVCachePyTorchWrapper::Forward);
+  py::class_<CUDAGraphBatchDecodeWithPagedKVCachePyTorchWrapper>(
+      m, "CUDAGraphBatchDecodeWithPagedKVCachePyTorchWrapper")
+      .def(py::init<unsigned int, unsigned int>())
+      .def("begin_forward", &CUDAGraphBatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward)
+      .def("end_forward", &CUDAGraphBatchDecodeWithPagedKVCachePyTorchWrapper::EndForward)
+      .def("update_page_locked_buffer_size",
+           &CUDAGraphBatchDecodeWithPagedKVCachePyTorchWrapper::UpdatePageLockedBufferSize)
+      .def("forward", &CUDAGraphBatchDecodeWithPagedKVCachePyTorchWrapper::Forward);
   py::class_<BatchPrefillWithPagedKVCachePyTorchWrapper>(
       m, "BatchPrefillWithPagedKVCachePyTorchWrapper")
       .def(py::init<unsigned int, unsigned int>())
