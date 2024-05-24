@@ -37,7 +37,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rmsnorm", &rmsnorm, "Root mean square normalization");
   py::class_<BatchDecodeWithPagedKVCachePyTorchWrapper>(m,
                                                         "BatchDecodeWithPagedKVCachePyTorchWrapper")
-      .def(py::init<unsigned int>())
+      .def(py::init<unsigned int, unsigned int>())
       .def("begin_forward", &BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward)
       .def("end_forward", &BatchDecodeWithPagedKVCachePyTorchWrapper::EndForward)
       .def("update_page_locked_buffer_size",
@@ -45,7 +45,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("forward", &BatchDecodeWithPagedKVCachePyTorchWrapper::Forward);
   py::class_<BatchPrefillWithPagedKVCachePyTorchWrapper>(
       m, "BatchPrefillWithPagedKVCachePyTorchWrapper")
-      .def(py::init<unsigned int>())
+      .def(py::init<unsigned int, unsigned int>())
       .def("begin_forward", &BatchPrefillWithPagedKVCachePyTorchWrapper::BeginForward)
       .def("end_forward", &BatchPrefillWithPagedKVCachePyTorchWrapper::EndForward)
       .def("update_page_locked_buffer_size",
@@ -53,7 +53,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("forward", &BatchPrefillWithPagedKVCachePyTorchWrapper::Forward);
   py::class_<BatchPrefillWithRaggedKVCachePyTorchWrapper>(
       m, "BatchPrefillWithRaggedKVCachePyTorchWrapper")
-      .def(py::init<unsigned int>())
+      .def(py::init<unsigned int, unsigned int>())
       .def("begin_forward", &BatchPrefillWithRaggedKVCachePyTorchWrapper::BeginForward)
       .def("end_forward", &BatchPrefillWithRaggedKVCachePyTorchWrapper::EndForward)
       .def("update_page_locked_buffer_size",

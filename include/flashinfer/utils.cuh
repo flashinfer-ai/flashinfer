@@ -282,8 +282,8 @@ std::tuple<IdType, IdType, std::vector<IdType>, std::vector<IdType>> split_qo_in
   uint32_t num_qo_tiles = 0;
 
   for (uint32_t i = 0; i < batch_size; ++i) {
-    for (uint32_t j = qo_indptr_h[i] * aligned_gqa_group_size; j < qo_indptr_h[i + 1] * aligned_gqa_group_size;
-         j += num_rows_per_cta) {
+    for (uint32_t j = qo_indptr_h[i] * aligned_gqa_group_size;
+         j < qo_indptr_h[i + 1] * aligned_gqa_group_size; j += num_rows_per_cta) {
       request_indices.push_back(i);
       tile_indices.push_back((j - qo_indptr_h[i] * aligned_gqa_group_size) / num_rows_per_cta);
       ++num_qo_tiles;

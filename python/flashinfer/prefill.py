@@ -353,7 +353,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._kv_layout = kv_layout
         self._workspace_buffer = workspace_buffer
         self._wrapper = _kernels.BatchPrefillWithPagedKVCachePyTorchWrapper(
-            TensorLayout[kv_layout].value, workspace_buffer.numel() * workspace_buffer.element_size()
+            TensorLayout[kv_layout].value,
+            workspace_buffer.numel() * workspace_buffer.element_size(),
         )
         self._qo_indptr = None
         self._paged_kv_indptr = None
@@ -666,7 +667,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._kv_layout = kv_layout
         self._workspace_buffer = workspace_buffer
         self._wrapper = _kernels.BatchPrefillWithRaggedKVCachePyTorchWrapper(
-            TensorLayout[kv_layout].value, workspace_buffer.numel() * workspace_buffer.element_size()
+            TensorLayout[kv_layout].value,
+            workspace_buffer.numel() * workspace_buffer.element_size(),
         )
         self._qo_indptr = None
         self._kv_indptr = None

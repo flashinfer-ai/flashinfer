@@ -188,7 +188,7 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
 void BatchDecodeWithPagedKVCachePyTorchWrapper::EndForward() { handler_.EndForward(); }
 
 void BatchDecodeWithPagedKVCachePyTorchWrapper::UpdatePageLockedBufferSize(
-  unsigned int max_workspace_size_in_bytes) {
+    unsigned int max_workspace_size_in_bytes) {
   handler_.UpdatePageLockedBufferSize(max_workspace_size_in_bytes);
 }
 

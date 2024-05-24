@@ -76,8 +76,10 @@ class BatchDecodeWithPagedKVCachePyTorchWrapper {
                                      torch::Tensor paged_kv_last_page_len,
                                      unsigned int pos_encoding_mode, float sm_scale,
                                      float rope_scale, float rope_theta, bool return_lse);
-  BatchDecodeWithPagedKVCachePyTorchWrapper(unsigned int layout)
-      : kv_layout_(flashinfer::QKVLayout(layout)) {}
+  BatchDecodeWithPagedKVCachePyTorchWrapper(unsigned int layout,
+                                            unsigned int max_workspace_buffer_size_in_bytes)
+      : kv_layout_(flashinfer::QKVLayout(layout)),
+        handler_(flashinfer::BatchDecodeHandler(max_workspace_buffer_size_in_bytes)) {}
 
  private:
   flashinfer::BatchDecodeHandler handler_;
@@ -123,8 +125,10 @@ class BatchPrefillWithPagedKVCachePyTorchWrapper {
                                      unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction,
                                      float sm_scale, float rope_scale, float rope_theta,
                                      bool return_lse);
-  BatchPrefillWithPagedKVCachePyTorchWrapper(unsigned int layout)
-      : kv_layout_(flashinfer::QKVLayout(layout)) {}
+  BatchPrefillWithPagedKVCachePyTorchWrapper(unsigned int layout,
+                                             unsigned int max_workspace_buffer_size_in_bytes)
+      : kv_layout_(flashinfer::QKVLayout(layout)),
+        handler_(flashinfer::BatchPrefillHandler(max_workspace_buffer_size_in_bytes)) {}
 
  private:
   flashinfer::BatchPrefillHandler handler_;
@@ -143,8 +147,10 @@ class BatchPrefillWithRaggedKVCachePyTorchWrapper {
                                      unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction,
                                      float sm_scale, float rope_scale, float rope_theta,
                                      bool return_lse);
-  BatchPrefillWithRaggedKVCachePyTorchWrapper(unsigned int layout)
-      : kv_layout_(flashinfer::QKVLayout(layout)) {}
+  BatchPrefillWithRaggedKVCachePyTorchWrapper(unsigned int layout,
+                                              unsigned int max_workspace_buffer_size_in_bytes)
+      : kv_layout_(flashinfer::QKVLayout(layout)),
+        handler_(flashinfer::BatchPrefillHandler(max_workspace_buffer_size_in_bytes)) {}
 
  private:
   flashinfer::BatchPrefillHandler handler_;

@@ -47,7 +47,7 @@ void BatchPrefillWithPagedKVCachePyTorchWrapper::BeginForward(
 void BatchPrefillWithPagedKVCachePyTorchWrapper::EndForward() { handler_.EndForward(); }
 
 void BatchPrefillWithPagedKVCachePyTorchWrapper::UpdatePageLockedBufferSize(
-  unsigned int max_workspace_size_in_bytes) {
+    unsigned int max_workspace_size_in_bytes) {
   handler_.UpdatePageLockedBufferSize(max_workspace_size_in_bytes);
 }
 
@@ -175,7 +175,7 @@ void BatchPrefillWithRaggedKVCachePyTorchWrapper::BeginForward(
 void BatchPrefillWithRaggedKVCachePyTorchWrapper::EndForward() { handler_.EndForward(); }
 
 void BatchPrefillWithRaggedKVCachePyTorchWrapper::UpdatePageLockedBufferSize(
-  unsigned int max_workspace_size_in_bytes) {
+    unsigned int max_workspace_size_in_bytes) {
   handler_.UpdatePageLockedBufferSize(max_workspace_size_in_bytes);
 }
 

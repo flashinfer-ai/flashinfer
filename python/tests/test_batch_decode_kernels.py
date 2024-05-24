@@ -72,10 +72,7 @@ def test_batch_decode_with_paged_kv_cache(
         "NONE",
         dtype,
     )
-    print("wow")
     o = wrapper.forward(q, kv_data.to(dtype), pos_encoding_mode=pos_encoding_mode)
-    print("hmmm")
-    print(o)
 
     for i in range(batch_size):
         perm_dims = [0, 2, 1, 3] if kv_layout == "HND" else [0, 1, 2, 3]
@@ -111,11 +108,9 @@ def test_batch_decode_with_paged_kv_cache(
             ],
             dim=0,
         ).to(dtype)
-        print('ahhhh')
         o_ref_i = flashinfer.single_decode_with_kv_cache(
             qi, ki, vi, pos_encoding_mode=pos_encoding_mode
         )
-        print('okkk')
         o_i_np = o[i].cpu().numpy()
         o_ref_i_np = o_ref_i.cpu().numpy()
         numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)

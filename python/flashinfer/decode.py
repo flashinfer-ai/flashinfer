@@ -405,7 +405,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._kv_layout = kv_layout
         self._workspace_buffer = workspace_buffer
         self._wrapper = _kernels.BatchDecodeWithPagedKVCachePyTorchWrapper(
-            TensorLayout[kv_layout].value, workspace_buffer.numel() * workspace_buffer.element_size()
+            TensorLayout[kv_layout].value,
+            workspace_buffer.numel() * workspace_buffer.element_size(),
         )
         self._paged_kv_indptr = None
         self._paged_kv_indices = None
@@ -639,12 +640,14 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper:
     # TODO(Zihao): update documentation
     """
 
-    def __init__(self,
+    def __init__(
+        self,
         workspace_buffer: torch.Tensor,
         indptr_buffer,
         indices_buffer,
         last_page_len_buffer,
-        kv_layout: str = "NHD"):
+        kv_layout: str = "NHD",
+    ):
         r"""Constructor of :class:`BatchDecodeWithPagedKVCacheWrapper`.
 
         Parameters
@@ -660,7 +663,8 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper:
         self._kv_layout = kv_layout
         self._workspace_buffer = workspace_buffer
         self._wrapper = _kernels.BatchDecodeWithPagedKVCachePyTorchWrapper(
-            TensorLayout[kv_layout].value, workspace_buffer.numel() * workspace_buffer.element_size()
+            TensorLayout[kv_layout].value,
+            workspace_buffer.numel() * workspace_buffer.element_size(),
         )
         self._paged_kv_indptr_buf = indptr_buffer
         self._paged_kv_indices_buf = indices_buffer
@@ -889,4 +893,3 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper:
             rope_theta,
             True,
         )
-
