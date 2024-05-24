@@ -70,6 +70,7 @@ class BatchDecodeWithPagedKVCachePyTorchWrapper {
                     unsigned int num_kv_heads, unsigned int head_dim, unsigned int page_size,
                     unsigned int pos_encoding_mode, torch::Tensor empty_data);
   void EndForward();
+  void UpdatePageLockedBufferSize(uint32_t max_workspace_size_in_bytes);
   std::vector<torch::Tensor> Forward(torch::Tensor q, torch::Tensor paged_kv_data,
                                      torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
                                      torch::Tensor paged_kv_last_page_len,
@@ -83,12 +84,38 @@ class BatchDecodeWithPagedKVCachePyTorchWrapper {
   flashinfer::QKVLayout kv_layout_;
 };
 
+// class CUDAGraphBatchDecodeWithPagedKVCachePyTorchWrapper {
+//  public:
+//   static CUDAGraphBatchDecodeWithPagedKVCachePyTorchWrapper Create(unsigned int layout) {
+//     return CUDAGraphBatchDecodeWithPagedKVCachePyTorchWrapper(layout);
+//   }
+//   void BeginForward(torch::Tensor workspace_buffer, torch::Tensor indptr_host,
+//                     torch::Tensor last_page_len_host, unsigned int batch_size, unsigned int
+//                     num_qo_heads, unsigned int num_kv_heads, unsigned int head_dim, unsigned int
+//                     page_size, unsigned int pos_encoding_mode, torch::Tensor empty_data);
+//   void EndForward();
+//   std::vector<torch::Tensor> Forward(torch::Tensor q, torch::Tensor paged_kv_data,
+//                                      torch::Tensor paged_kv_indptr_buf, torch::Tensor
+//                                      paged_kv_indices_buf, torch::Tensor
+//                                      paged_kv_last_page_len_buf, unsigned int batch_size,
+//                                      unsigned int nnz_pages,
+//                                      unsigned int pos_encoding_mode, float sm_scale,
+//                                      float rope_scale, float rope_theta, bool return_lse);
+
+//  private:
+//   CUDAGraphBatchDecodeWithPagedKVCachePyTorchWrapper(unsigned int layout)
+//       : kv_layout_(flashinfer::QKVLayout(layout)) {}
+//   flashinfer::CUDAGraphBatchDecodeHandler handler_;
+//   flashinfer::QKVLayout kv_layout_;
+// };
+
 class BatchPrefillWithPagedKVCachePyTorchWrapper {
  public:
   void BeginForward(torch::Tensor workspace_buffer, torch::Tensor qo_indptr,
                     unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads,
                     unsigned int head_dim);
   void EndForward();
+  void UpdatePageLockedBufferSize(uint32_t max_workspace_size_in_bytes);
   std::vector<torch::Tensor> Forward(torch::Tensor q, torch::Tensor qo_indptr,
                                      torch::Tensor paged_kv_data, torch::Tensor paged_kv_indptr,
                                      torch::Tensor paged_kv_indices,
@@ -110,6 +137,7 @@ class BatchPrefillWithRaggedKVCachePyTorchWrapper {
                     unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads,
                     unsigned int head_dim);
   void EndForward();
+  void UpdatePageLockedBufferSize(uint32_t max_workspace_size_in_bytes);
   std::vector<torch::Tensor> Forward(torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor k,
                                      torch::Tensor v, torch::Tensor kv_indptr, bool causal,
                                      unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction,

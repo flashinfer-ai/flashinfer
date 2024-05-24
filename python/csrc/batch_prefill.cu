@@ -46,6 +46,11 @@ void BatchPrefillWithPagedKVCachePyTorchWrapper::BeginForward(
 
 void BatchPrefillWithPagedKVCachePyTorchWrapper::EndForward() { handler_.EndForward(); }
 
+void BatchPrefillWithPagedKVCachePyTorchWrapper::UpdatePageLockedBufferSize(
+  unsigned int max_workspace_size_in_bytes) {
+  handler_.UpdatePageLockedBufferSize(max_workspace_size_in_bytes);
+}
+
 std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
     torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor paged_kv_data,
     torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
@@ -168,6 +173,11 @@ void BatchPrefillWithRaggedKVCachePyTorchWrapper::BeginForward(
 }
 
 void BatchPrefillWithRaggedKVCachePyTorchWrapper::EndForward() { handler_.EndForward(); }
+
+void BatchPrefillWithRaggedKVCachePyTorchWrapper::UpdatePageLockedBufferSize(
+  unsigned int max_workspace_size_in_bytes) {
+  handler_.UpdatePageLockedBufferSize(max_workspace_size_in_bytes);
+}
 
 std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
     torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor k, torch::Tensor v,

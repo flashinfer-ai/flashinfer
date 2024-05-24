@@ -306,32 +306,34 @@ class BatchDecodeHandler {
       float_buffer_ = allocator.aligned_alloc<void*>(tmp_size, 16);
       new_indptr_ =
           allocator.aligned_alloc<void*>((batch_size_after_partition_ + 1) * sizeof(IdType), 16);
-      void* new_indptr_h_ = host_buffer_;
+      void* new_indptr_h_ = page_locked_buffer_;
       new_last_page_len_ =
           allocator.aligned_alloc<void*>(batch_size_after_partition_ * sizeof(IdType), 16);
       void* new_last_page_len_h_ =
-          (char*)host_buffer_ + ((char*)new_last_page_len_ - (char*)new_indptr_);
+          (char*)page_locked_buffer_ + ((char*)new_last_page_len_ - (char*)new_indptr_);
       chunk_indptr_ =
           allocator.aligned_alloc<void*>((batch_size_before_partition_ + 1) * sizeof(IdType), 16);
-      void* chunk_indptr_h_ = (char*)host_buffer_ + ((char*)chunk_indptr_ - (char*)new_indptr_);
+      void* chunk_indptr_h_ =
+          (char*)page_locked_buffer_ + ((char*)chunk_indptr_ - (char*)new_indptr_);
       batch_idx_map_ =
           allocator.aligned_alloc<void*>(batch_size_after_partition_ * sizeof(IdType), 16);
-      void* batch_idx_map_h_ = (char*)host_buffer_ + ((char*)batch_idx_map_ - (char*)new_indptr_);
+      void* batch_idx_map_h_ =
+          (char*)page_locked_buffer_ + ((char*)batch_idx_map_ - (char*)new_indptr_);
       chunk_start_pos_ =
           allocator.aligned_alloc<void*>(batch_size_after_partition_ * sizeof(IdType), 16);
       void* chunk_start_pos_h_ =
-          (char*)host_buffer_ + ((char*)chunk_start_pos_ - (char*)new_indptr_);
+          (char*)page_locked_buffer_ + ((char*)chunk_start_pos_ - (char*)new_indptr_);
       seq_lengths_before_partition_ =
           allocator.aligned_alloc<void*>(batch_size_after_partition_ * sizeof(IdType), 16);
       void* seq_lengths_before_partition_h_ =
-          (char*)host_buffer_ + ((char*)seq_lengths_before_partition_ - (char*)new_indptr_);
+          (char*)page_locked_buffer_ + ((char*)seq_lengths_before_partition_ - (char*)new_indptr_);
       size_t num_bytes_to_copy = (char*)allocator.ptr - (char*)new_indptr_;
       FLASHINFER_CUDA_CALL(PartitionPagedKVCacheComputeAuxiliaryInfo(
           max_num_pages_per_batch, batch_size, page_size, indptr, last_page_len,
           (IdType*)new_indptr_h_, (IdType*)new_last_page_len_h_, (IdType*)chunk_indptr_h_,
           (IdType*)batch_idx_map_h_, (IdType*)chunk_start_pos_h_,
-          (IdType*)seq_lengths_before_partition_h_, new_indptr_, host_buffer_, num_bytes_to_copy,
-          stream_));
+          (IdType*)seq_lengths_before_partition_h_, new_indptr_, page_locked_buffer_,
+          num_bytes_to_copy, stream_));
     }
     forward_started_ = true;
     return cudaSuccess;
@@ -353,6 +355,11 @@ class BatchDecodeHandler {
 
   bool IsForwardStarted() const { return forward_started_; }
 
+  void UpdatePageLockedBufferSize(size_t max_workspace_size_in_bytes) {
+    cudaFreeHost(page_locked_buffer_);
+    cudaMallocHost(&page_locked_buffer_, max_workspace_size_in_bytes);
+  }
+
   uint32_t GetBatchSizeBeforePartition() const { return batch_size_before_partition_; }
 
   uint32_t GetBatchSizeAfterPartition() const { return batch_size_after_partition_; }
@@ -372,17 +379,17 @@ class BatchDecodeHandler {
         seq_lengths_before_partition_(nullptr),
         forward_started_(false),
         stream_(nullptr) {
-    cudaMallocHost(&host_buffer_, max_workspace_size_in_bytes);
+    cudaMallocHost(&page_locked_buffer_, max_workspace_size_in_bytes);
   }
   ~BatchDecodeHandler() {
     EndForward();
-    cudaFreeHost(host_buffer_);
+    cudaFreeHost(page_locked_buffer_);
   }
 
  private:
   uint32_t batch_size_before_partition_;
   uint32_t batch_size_after_partition_;
-  void* host_buffer_;
+  void* page_locked_buffer_;
   void* float_buffer_;
   void* new_indptr_;
   void* new_last_page_len_;
@@ -393,6 +400,13 @@ class BatchDecodeHandler {
   bool forward_started_;
   cudaStream_t stream_;
 };
+
+// class CUDAGraphBatchDecodeHandler: public BatchDecodeHandler {
+//  public:
+//   BatchDecodeHandler(size_t max_workspace_size_in_bytes = 64 * 1024 * 1024) {
+
+//   }
+// }
 
 class BatchPrefillHandler {
  public:
@@ -412,6 +426,11 @@ class BatchPrefillHandler {
 
   bool IsForwardStarted() const { return request_indices_ != nullptr; }
 
+  void UpdatePageLockedBufferSize(size_t max_workspace_size_in_bytes) {
+    cudaFreeHost(page_locked_buffer_);
+    cudaMallocHost(&page_locked_buffer_, max_workspace_size_in_bytes);
+  }
+
   template <typename IdType>
   cudaError_t BeginForward(void* buffer, size_t workspace_size_in_bytes, IdType* qo_indptr,
                            uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
@@ -429,14 +448,15 @@ class BatchPrefillHandler {
     AlignedAlloactor allocator(buffer, workspace_size_in_bytes);
     request_indices_ =
         allocator.aligned_alloc<void*>(sizeof(IdType) * request_indices_vec.size(), 16);
-    void* request_indices_h_ = host_buffer_;
+    void* request_indices_h_ = page_locked_buffer_;
     tile_indices_ = allocator.aligned_alloc<void*>(sizeof(IdType) * tile_indices_vec.size(), 16);
-    void* tile_indices_h_ = (char*)host_buffer_ + ((char*)tile_indices_ - (char*)request_indices_);
+    void* tile_indices_h_ =
+        (char*)page_locked_buffer_ + ((char*)tile_indices_ - (char*)request_indices_);
     std::copy(request_indices_vec.begin(), request_indices_vec.end(), (IdType*)request_indices_h_);
     std::copy(tile_indices_vec.begin(), tile_indices_vec.end(), (IdType*)tile_indices_h_);
     size_t num_bytes_to_copy = (char*)allocator.ptr - (char*)request_indices_;
 
-    FLASHINFER_CUDA_CALL(cudaMemcpyAsync(request_indices_, host_buffer_, num_bytes_to_copy,
+    FLASHINFER_CUDA_CALL(cudaMemcpyAsync(request_indices_, page_locked_buffer_, num_bytes_to_copy,
                                          cudaMemcpyHostToDevice, stream_));
 
     return cudaSuccess;
@@ -462,15 +482,15 @@ class BatchPrefillHandler {
         num_qo_tiles_(0U),
         forward_started_(false),
         stream_(nullptr) {
-    cudaMallocHost(&host_buffer_, max_workspace_size_in_bytes);
+    cudaMallocHost(&page_locked_buffer_, max_workspace_size_in_bytes);
   }
   ~BatchPrefillHandler() {
     EndForward();
-    cudaFreeHost(host_buffer_);
+    cudaFreeHost(page_locked_buffer_);
   }
 
  private:
-  void* host_buffer_;
+  void* page_locked_buffer_;
   void* request_indices_;
   void* tile_indices_;
   uint32_t num_frags_x_;

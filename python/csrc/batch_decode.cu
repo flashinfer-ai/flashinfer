@@ -187,6 +187,11 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
 
 void BatchDecodeWithPagedKVCachePyTorchWrapper::EndForward() { handler_.EndForward(); }
 
+void BatchDecodeWithPagedKVCachePyTorchWrapper::UpdatePageLockedBufferSize(
+  unsigned int max_workspace_size_in_bytes) {
+  handler_.UpdatePageLockedBufferSize(max_workspace_size_in_bytes);
+}
+
 std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
     torch::Tensor q, torch::Tensor paged_kv_data, torch::Tensor paged_kv_indptr,
     torch::Tensor paged_kv_indices, torch::Tensor paged_kv_last_page_len,
