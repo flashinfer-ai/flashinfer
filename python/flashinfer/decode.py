@@ -405,7 +405,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._kv_layout = kv_layout
         self._workspace_buffer = workspace_buffer
         self._wrapper = _kernels.BatchDecodeWithPagedKVCachePyTorchWrapper(
-            TensorLayout[kv_layout].value
+            TensorLayout[kv_layout].value,
+            workspace_buffer.numel() * workspace_buffer.element_size(),
         )
         self._paged_kv_indptr = None
         self._paged_kv_indices = None
@@ -622,6 +623,288 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._paged_kv_indptr,
             self._paged_kv_indices,
             self._paged_kv_last_page_len,
+            PosEncodingMode[pos_encoding_mode].value,
+            sm_scale,
+            rope_scale,
+            rope_theta,
+            True,
+        )
+
+
+class CUDAGraphBatchDecodeWithPagedKVCacheWrapper:
+    r"""CUDAGraph-compatible Wrapper class for decode attention with paged kv-cache (first 
+    proposed in `vLLM <https://arxiv.org/abs/2309.06180>`_) for batch of requests. 
+    
+    Note that this wrapper may not be as efficient as :class:`BatchDecodeWithPagedKVCacheWrapper`
+    because we won't dispatch to different kernels for different batch sizes/sequence lengths/etc
+    to accomodate the CUDAGraph requirement.
+
+    Check :ref:`our tutorial<page-layout>` for page table layout.
+    # TODO(Zihao): update documentation
+
+    Note
+    ----
+    The :meth:`begin_forward` method could not be captured by CUDAGraph.
+
+    See Also
+    --------
+    :class:`BatchDecodeWithPagedKVCacheWrapper`
+    """
+
+    def __init__(
+        self,
+        workspace_buffer: torch.Tensor,
+        indptr_buffer: torch.Tensor,
+        indices_buffer: torch.Tensor,
+        last_page_len_buffer: torch.Tensor,
+        kv_layout: str = "NHD",
+    ):
+        r"""Constructor of :class:`BatchDecodeWithPagedKVCacheWrapper`.
+
+        Parameters
+        ----------
+        workspace_buffer : torch.Tensor
+            The user reserved workspace buffer on GPU used to store auxiliary data structures,
+            recommended size is 128MB, the device of the workspace buffer should be the
+            same as the device of the input tensors.
+        indptr_buffer : torch.Tensor
+            The user reserved buffer on GPU to store the indptr of the paged kv cache, should
+            be large enough to store the indptr of maximum batch size (``[max_batch_size + 1]``)
+            during the lifecycle of this wrapper.
+        indices_buffer : torch.Tensor
+            The user reserved buffer on GPU to store the page indices of the paged kv cache,
+            should be large enough to store the maximum number of page indices 
+            (``max_num_pages``) during the lifecycle of this wrapper.
+        last_page_len_buffer : torch.Tensor
+            The user reserved buffer on GPU to store the number of entries in the last page,
+            should be large enough to store the maximum batch size (``[max_batch_size]``)
+            during the lifecycle of this wrapper.
+        kv_layout : str
+            The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
+        """
+        check_kv_layout(kv_layout)
+        self._kv_layout = kv_layout
+        self._workspace_buffer = workspace_buffer
+        max_batch_size = len(last_page_len_buffer)
+        self._wrapper = _kernels.CUDAGraphBatchDecodeWithPagedKVCachePyTorchWrapper(
+            TensorLayout[kv_layout].value,
+            max_batch_size,
+        )
+        self._paged_kv_indptr_buf = indptr_buffer
+        self._paged_kv_indices_buf = indices_buffer
+        self._paged_kv_last_page_len_buf = last_page_len_buffer
+
+    def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
+        r"""Reset the workspace buffer.
+
+        Parameters
+        ----------
+        new_workspace_buffer : torch.Tensor
+            The new workspace buffer, the device of the new workspace buffer should
+            be the same as the device of the input tensors.
+        """
+        self._workspace_buffer = new_workspace_buffer
+
+    def begin_forward(
+        self,
+        indptr: torch.Tensor,
+        indices: torch.Tensor,
+        last_page_len: torch.Tensor,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        page_size: int,
+        pos_encoding_mode: str = "NONE",
+        data_type: Union[str, torch.dtype] = "float16",
+    ):
+        r"""Create auxiliary data structures for batch decode for multiple forward calls
+        within the same decode step.
+
+        Parameters
+        ----------
+        indptr : torch.Tensor
+            The indptr of the paged kv cache, shape: ``[batch_size + 1]``
+        indices_host : torch.Tensor
+            The page indices of the paged kv cache, shape: ``[qo_indptr[-1]]``
+        last_page_len : torch.Tensor
+            The number of entries in the last page of each request in the paged kv
+            cache, shape: ``[batch_size]``
+        num_qo_heads : int
+            The number of query/output heads
+        num_kv_heads : int
+            The number of key/value heads
+        head_dim : int
+            The dimension of the heads
+        page_size : int
+            The page size of the paged kv cache
+        pos_encoding_mode : str
+            Whether to apply RoPE on-the-fly inside attention kernels, could be
+            ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
+        data_type : Union[str, torch.dtype]
+            The data type of the paged kv cache
+
+        Note
+        ----
+        The :meth:`begin_forward` method should be called before any :meth:`forward` or
+        :meth:`forward_return_lse` calls, auxiliary data structures will be created
+        during this call and cached for multiple forward calls.
+
+        The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads``
+        is not equal to ``num_kv_heads``, the function will use
+        `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
+        """
+
+        self._paged_kv_indptr_buf[: len(indptr)] = indptr
+        self._paged_kv_indices_buf[: len(indices)] = indices
+        self._paged_kv_last_page_len_buf[: len(last_page_len)] = last_page_len
+
+        batch_size = len(indptr) - 1
+        # NOTE(Zihao): the following tensor acts as placeholder to pass dtype info
+        empty_data = torch.empty(
+            0,
+            dtype=(
+                getattr(torch, data_type) if isinstance(data_type, str) else data_type
+            ),
+        )
+        self._wrapper.begin_forward(
+            self._workspace_buffer,
+            indptr,
+            last_page_len,
+            batch_size,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            PosEncodingMode[pos_encoding_mode].value,
+            empty_data,
+        )
+
+    def end_forward(self):
+        r"""Clear auxiliary data structures created by :meth:`begin_forward`."""
+        self._wrapper.end_forward()
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        paged_kv_data: torch.Tensor,
+        pos_encoding_mode: str = "NONE",
+        sm_scale: Optional[float] = None,
+        rope_scale: Optional[float] = None,
+        rope_theta: Optional[float] = None,
+    ):
+        r"""Compute batch decode attention between query and paged kv cache.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            The query tensor, shape: ``[batch_size, num_qo_heads, head_dim]``
+        paged_kv_data : torch.Tensor
+            A 5-D tensor of the reserved paged kv-cache data, shape:
+            ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
+            :attr:`kv_layout` is ``NHD``, or
+            ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
+            :attr:`kv_layout` is ``HND``.
+        pos_encoding_mode : str
+            Whether to apply RoPE on-the-fly inside attention kernels, could be
+            ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
+        sm_scale : Optional[float]
+            The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
+        rope_scale : Optional[float]
+            The scale used in RoPE interpolation, if not provided, will be set to
+            ``1.0``.
+        rope_theta : Optional[float]
+            The theta used in RoPE, if not provided, will be set to ``1e4``.
+
+        Returns
+        -------
+        torch.Tensor
+            The attention output, shape: ``[batch_size, num_qo_heads, head_dim]``.
+        """
+        check_pos_encoding_mode(pos_encoding_mode)
+        if sm_scale is None:
+            head_dim = q.shape[-1]
+            sm_scale = 1.0 / math.sqrt(head_dim)
+        if rope_scale is None:
+            rope_scale = 1.0
+        if rope_theta is None:
+            rope_theta = 1e4
+
+        paged_kv_data = expand_5d(paged_kv_data, self._kv_layout)
+        return self._wrapper.forward(
+            q,
+            paged_kv_data,
+            self._paged_kv_indptr_buf,
+            self._paged_kv_indices_buf,
+            self._paged_kv_last_page_len_buf,
+            PosEncodingMode[pos_encoding_mode].value,
+            sm_scale,
+            rope_scale,
+            rope_theta,
+            False,
+        )[0]
+
+    def forward_return_lse(
+        self,
+        q: torch.Tensor,
+        paged_kv_data: torch.Tensor,
+        pos_encoding_mode: str = "NONE",
+        sm_scale: Optional[float] = None,
+        rope_scale: Optional[float] = None,
+        rope_theta: Optional[float] = None,
+    ):
+        r"""Compute batch decode attention with paged kv cache, return attention output
+        and logsumexp of attention scores.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            The query tensor, shape: ``[batch_size, num_qo_heads, head_dim]``
+        paged_kv_data : torch.Tensor
+            A 5-D tensor of the reserved paged kv-cache data, shape:
+            ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
+            :attr:`kv_layout` is ``NHD``, or
+            ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
+            :attr:`kv_layout` is ``HND``.
+        pos_encoding_mode : str
+            Whether to apply RoPE on-the-fly inside attention kernels, could be
+            ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
+        sm_scale : Optional[float]
+            The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
+        rope_scale : Optional[float]
+            The scale used in RoPE interpolation, if not provided, will be set to
+            ``1.0``.
+        rope_theta : Optional[float]
+            The theta used in RoPE, if not provided, will be set to ``1e4``.
+
+        Returns
+        -------
+        V : torch.Tensor
+            The attention output, shape: ``[batch_size, num_qo_heads, head_dim]``.
+        S : torch.Tensor
+            The logsumexp of attention scores, Shape: ``[batch_size, num_qo_heads]``.
+
+        Notes
+        -----
+        Please refer to the :ref:`tutorial <recursive-attention>` for a detailed
+        explanation of the log-sum-exp function and attention states.
+        """
+        check_pos_encoding_mode(pos_encoding_mode)
+        if sm_scale is None:
+            head_dim = q.shape[-1]
+            sm_scale = 1.0 / math.sqrt(head_dim)
+        if rope_scale is None:
+            rope_scale = 1.0
+        if rope_theta is None:
+            rope_theta = 1e4
+        paged_kv_data = expand_5d(paged_kv_data, self._kv_layout)
+        return self._wrapper.forward(
+            q,
+            paged_kv_data,
+            self._paged_kv_indptr_buf,
+            self._paged_kv_indices_buf,
+            self._paged_kv_last_page_len_buf,
+            self._batch_size,
+            self._nnz_pages,
             PosEncodingMode[pos_encoding_mode].value,
             sm_scale,
             rope_scale,
