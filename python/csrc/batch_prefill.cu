@@ -34,21 +34,21 @@ void BatchPrefillWithPagedKVCachePyTorchWrapper::BeginForward(
   CHECK_EQ(qo_indptr.scalar_type(), torch::kInt32);
   size_t workspace_size_in_bytes = workspace_buffer.size(0) * workspace_buffer.element_size();
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
-  handler_.SetCUDAStream(torch_current_stream);
+  handler_->SetCUDAStream(torch_current_stream);
 
   cudaError_t status =
-      handler_.BeginForward(static_cast<void*>(workspace_buffer.data_ptr()),
+      handler_->BeginForward(static_cast<void*>(workspace_buffer.data_ptr()),
                             workspace_size_in_bytes, static_cast<int32_t*>(qo_indptr.data_ptr()),
                             batch_size, num_qo_heads, num_kv_heads, head_dim);
   TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithPagedKVCache failed with error ",
               cudaGetErrorString(status));
 }
 
-void BatchPrefillWithPagedKVCachePyTorchWrapper::EndForward() { handler_.EndForward(); }
+void BatchPrefillWithPagedKVCachePyTorchWrapper::EndForward() { handler_->EndForward(); }
 
 void BatchPrefillWithPagedKVCachePyTorchWrapper::UpdatePageLockedBufferSize(
     unsigned int max_workspace_size_in_bytes) {
-  handler_.UpdatePageLockedBufferSize(max_workspace_size_in_bytes);
+  handler_->UpdatePageLockedBufferSize(max_workspace_size_in_bytes);
 }
 
 std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
@@ -122,7 +122,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
                               PageStorage::kIndices, KV_LAYOUT, PAGE_SIZE, GROUP_SIZE, HEAD_DIM,
                               POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION, CAUSAL, c_type, c_type,
                               int32_t>(
-                              &handler_, static_cast<c_type*>(q.data_ptr()),
+                              handler_.get(), static_cast<c_type*>(q.data_ptr()),
                               static_cast<int32_t*>(qo_indptr.data_ptr()),
                               /*q_offset=*/nullptr, paged_kv, static_cast<c_type*>(o.data_ptr()),
                               /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
@@ -162,21 +162,21 @@ void BatchPrefillWithRaggedKVCachePyTorchWrapper::BeginForward(
   CHECK_EQ(qo_indptr.scalar_type(), torch::kInt32);
   size_t workspace_size_in_bytes = workspace_buffer.size(0) * workspace_buffer.element_size();
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
-  handler_.SetCUDAStream(torch_current_stream);
+  handler_->SetCUDAStream(torch_current_stream);
 
   cudaError_t status =
-      handler_.BeginForward(static_cast<void*>(workspace_buffer.data_ptr()),
+      handler_->BeginForward(static_cast<void*>(workspace_buffer.data_ptr()),
                             workspace_size_in_bytes, static_cast<int32_t*>(qo_indptr.data_ptr()),
                             batch_size, num_qo_heads, num_kv_heads, head_dim);
   TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithPagedKVCache failed with error ",
               cudaGetErrorString(status));
 }
 
-void BatchPrefillWithRaggedKVCachePyTorchWrapper::EndForward() { handler_.EndForward(); }
+void BatchPrefillWithRaggedKVCachePyTorchWrapper::EndForward() { handler_->EndForward(); }
 
 void BatchPrefillWithRaggedKVCachePyTorchWrapper::UpdatePageLockedBufferSize(
     unsigned int max_workspace_size_in_bytes) {
-  handler_.UpdatePageLockedBufferSize(max_workspace_size_in_bytes);
+  handler_->UpdatePageLockedBufferSize(max_workspace_size_in_bytes);
 }
 
 std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
@@ -228,7 +228,7 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
                         cudaError_t status = BatchPrefillWithRaggedKVCacheWrapperDispatched<
                             GROUP_SIZE, HEAD_DIM, KV_LAYOUT, POS_ENCODING_MODE,
                             ALLOW_FP16_QK_REDUCTION, CAUSAL, c_type, c_type, int32_t>(
-                            &handler_, static_cast<c_type*>(q.data_ptr()),
+                            handler_.get(), static_cast<c_type*>(q.data_ptr()),
                             static_cast<int32_t*>(qo_indptr.data_ptr()),
                             static_cast<c_type*>(k.data_ptr()), static_cast<c_type*>(v.data_ptr()),
                             static_cast<int32_t*>(kv_indptr.data_ptr()),

@@ -79,15 +79,15 @@ class BatchDecodeWithPagedKVCachePyTorchWrapper {
                                      float rope_scale, float rope_theta, bool return_lse);
   BatchDecodeWithPagedKVCachePyTorchWrapper(
       std::shared_ptr<flashinfer::BatchDecodeHandler> handler_ptr, flashinfer::QKVLayout kv_layout)
-      : handler_ptr_(handler_ptr), kv_layout_(kv_layout) {}
+      : handler_(handler_ptr), kv_layout_(kv_layout) {}
   BatchDecodeWithPagedKVCachePyTorchWrapper(unsigned int layout,
                                             unsigned int max_workspace_size_in_bytes)
       : kv_layout_(flashinfer::QKVLayout(layout)),
-        handler_ptr_(
+        handler_(
             std::make_shared<flashinfer::BatchDecodeHandler>(max_workspace_size_in_bytes)) {}
 
  protected:
-  std::shared_ptr<flashinfer::BatchDecodeHandler> handler_ptr_;
+  std::shared_ptr<flashinfer::BatchDecodeHandler> handler_;
   flashinfer::QKVLayout kv_layout_;
 };
 
@@ -118,10 +118,10 @@ class BatchPrefillWithPagedKVCachePyTorchWrapper {
   BatchPrefillWithPagedKVCachePyTorchWrapper(unsigned int layout,
                                              unsigned int max_workspace_size_in_bytes)
       : kv_layout_(flashinfer::QKVLayout(layout)),
-        handler_(flashinfer::BatchPrefillHandler(max_workspace_size_in_bytes)) {}
+        handler_(std::make_shared<flashinfer::BatchPrefillHandler>(max_workspace_size_in_bytes)) {}
 
  private:
-  flashinfer::BatchPrefillHandler handler_;
+  std::shared_ptr<flashinfer::BatchPrefillHandler> handler_;
   flashinfer::QKVLayout kv_layout_;
 };
 
@@ -140,9 +140,9 @@ class BatchPrefillWithRaggedKVCachePyTorchWrapper {
   BatchPrefillWithRaggedKVCachePyTorchWrapper(unsigned int layout,
                                               unsigned int max_workspace_size_in_bytes)
       : kv_layout_(flashinfer::QKVLayout(layout)),
-        handler_(flashinfer::BatchPrefillHandler(max_workspace_size_in_bytes)) {}
+        handler_(std::make_shared<flashinfer::BatchPrefillHandler>(max_workspace_size_in_bytes)) {}
 
  private:
-  flashinfer::BatchPrefillHandler handler_;
+  std::shared_ptr<flashinfer::BatchPrefillHandler> handler_;
   flashinfer::QKVLayout kv_layout_;
 };

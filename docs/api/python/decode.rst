@@ -24,3 +24,6 @@ Batch Decoding
 
 .. autoclass:: BatchDecodeWithPagedKVCacheWrapper
     :members:
+
+.. autoclass:: CUDAGraphDecodeWithPagedKVCacheWrapper
+    :members:
