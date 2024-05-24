@@ -476,13 +476,10 @@ class CUDAGraphBatchDecodeHandler : public BatchDecodeHandler {
                            dev_id);
     max_batch_size_after_partition_ =
         std::max<size_t>(max_thread_blocks_per_sm * num_sm, max_batch_size);
+    std::cout << max_thread_blocks_per_sm * num_sm << " " << max_batch_size << std::endl;
     size_t max_workspace_size_in_bytes =
         6 * (sizeof(uint64_t) * (max_batch_size_after_partition_ + 1) + 16);
     cudaMallocHost(&page_locked_buffer_, max_workspace_size_in_bytes);
-  }
-  ~CUDAGraphBatchDecodeHandler() {
-    EndForward();
-    cudaFreeHost(page_locked_buffer_);
   }
   bool IsCUDAGraphMode() const override { return true; }
 

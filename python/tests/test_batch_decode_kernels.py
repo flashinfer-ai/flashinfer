@@ -160,7 +160,7 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
     kv_indices_device_buffer = torch.empty(total_num_pages).int().to(0)
     kv_last_page_device_buffer = torch.empty(batch_size).int().to(0)
 
-    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
     wrapper = flashinfer.CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
         workspace_buffer,
         kv_indptr_device_buffer,
