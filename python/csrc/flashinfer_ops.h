@@ -65,9 +65,6 @@ torch::Tensor rmsnorm(torch::Tensor x, torch::Tensor w, double eps);
 
 class BatchDecodeWithPagedKVCachePyTorchWrapper {
  public:
-  static BatchDecodeWithPagedKVCachePyTorchWrapper Create(unsigned int layout) {
-    return BatchDecodeWithPagedKVCachePyTorchWrapper(layout);
-  }
   void BeginForward(torch::Tensor workspace_buffer, torch::Tensor indptr,
                     torch::Tensor last_page_len, unsigned int batch_size, unsigned int num_qo_heads,
                     unsigned int num_kv_heads, unsigned int head_dim, unsigned int page_size,
@@ -78,19 +75,16 @@ class BatchDecodeWithPagedKVCachePyTorchWrapper {
                                      torch::Tensor paged_kv_last_page_len,
                                      unsigned int pos_encoding_mode, float sm_scale,
                                      float rope_scale, float rope_theta, bool return_lse);
-
- private:
   BatchDecodeWithPagedKVCachePyTorchWrapper(unsigned int layout)
       : kv_layout_(flashinfer::QKVLayout(layout)) {}
+
+ private:
   flashinfer::BatchDecodeHandler handler_;
   flashinfer::QKVLayout kv_layout_;
 };
 
 class BatchPrefillWithPagedKVCachePyTorchWrapper {
  public:
-  static BatchPrefillWithPagedKVCachePyTorchWrapper Create(unsigned int layout) {
-    return BatchPrefillWithPagedKVCachePyTorchWrapper(layout);
-  }
   void BeginForward(torch::Tensor workspace_buffer, torch::Tensor qo_indptr,
                     unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads,
                     unsigned int head_dim);
@@ -102,19 +96,16 @@ class BatchPrefillWithPagedKVCachePyTorchWrapper {
                                      unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction,
                                      float sm_scale, float rope_scale, float rope_theta,
                                      bool return_lse);
-
- private:
   BatchPrefillWithPagedKVCachePyTorchWrapper(unsigned int layout)
       : kv_layout_(flashinfer::QKVLayout(layout)) {}
+
+ private:
   flashinfer::BatchPrefillHandler handler_;
   flashinfer::QKVLayout kv_layout_;
 };
 
 class BatchPrefillWithRaggedKVCachePyTorchWrapper {
  public:
-  static BatchPrefillWithRaggedKVCachePyTorchWrapper Create(unsigned int layout) {
-    return BatchPrefillWithRaggedKVCachePyTorchWrapper(layout);
-  }
   void BeginForward(torch::Tensor workspace_buffer, torch::Tensor qo_indptr,
                     unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads,
                     unsigned int head_dim);
@@ -124,10 +115,10 @@ class BatchPrefillWithRaggedKVCachePyTorchWrapper {
                                      unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction,
                                      float sm_scale, float rope_scale, float rope_theta,
                                      bool return_lse);
-
- private:
   BatchPrefillWithRaggedKVCachePyTorchWrapper(unsigned int layout)
       : kv_layout_(flashinfer::QKVLayout(layout)) {}
+
+ private:
   flashinfer::BatchPrefillHandler handler_;
   flashinfer::QKVLayout kv_layout_;
 };
