@@ -21,6 +21,7 @@
 #include <cub/block/block_scan.cuh>
 #include <numeric>
 
+#include "math.cuh"
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
 
@@ -207,9 +208,9 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, DType* uniform_samples,
             (probs_vec[j] <= pivot && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
       }
 
-      aggregate_leq_pivot +=
-          BlockReduce<Pair<DType>, BLOCK_THREADS>(temp_storage.block_prim.reduce_pair)
-              .Sum<VEC_SIZE>(probs_leq_pivot);
+      aggregate_leq_pivot += BlockReduce<Pair<DType>, BLOCK_THREADS, REDUCE_ALGORITHM>(
+                                 temp_storage.block_prim.reduce_pair)
+                                 .Sum<VEC_SIZE>(probs_leq_pivot);
       if (tx == 0) {
         temp_storage.data.block_aggregate.pair = aggregate_leq_pivot;
       }
@@ -414,6 +415,234 @@ cudaError_t TopPSamplingFromProb(T* probs, T* uniform_samples, IdType* output, b
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
     auto kernel =
         TopPSamplingFromProbKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, VEC_SIZE, T, IdType>;
+    FLASHINFER_CUDA_CALL(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  });
+  return cudaSuccess;
+}
+
+template <typename T, uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM>
+struct RenormTempStorage {
+  union {
+    typename BlockReduce<T, BLOCK_THREADS, REDUCE_ALGORITHM>::TempStorage reduce;
+    typename BlockReduce<Pair<T>, BLOCK_THREADS, REDUCE_ALGORITHM>::TempStorage reduce_pair;
+  } block_prim;
+  struct {
+    T max_val;
+    union {
+      T value;
+      Pair<T> pair;
+    } block_aggregate;
+  } data;
+};
+
+template <uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE,
+          typename T, typename IdType>
+__global__ void TopPRenormProbKernel(T* probs, IdType* renormed_prob, float p, float eps,
+                                     uint32_t d) {
+  const uint32_t bx = blockIdx.x, tx = threadIdx.x;
+  const uint32_t row_idx = bx;
+
+  extern __shared__ __align__(alignof(RenormTempStorage<T, BLOCK_THREADS, REDUCE_ALGO>))
+      uint8_t smem[];
+  auto& temp_storage = reinterpret_cast<RenormTempStorage<T, BLOCK_THREADS, REDUCE_ALGO>&>(smem);
+  temp_storage.data.max_val = T(0);
+  vec_t<T, VEC_SIZE> probs_vec;
+  T probs_greater_than_pivot[VEC_SIZE];  // pivot initialized to 0
+
+  T threadlocal_max_val = T(0);
+  for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+    probs_vec.fill(DType(0));
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+      probs_vec.load(probs + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+    }
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      probs_greater_than_pivot[j] = probs_vec[j];
+    }
+    threadlocal_max_val =
+        max(threadlocal_max_val,
+            BlockReduce<T, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
+                .Max<VEC_SIZE>(probs_greater_than_pivot));
+    __syncthreads();
+  }
+  if (tx == 0) {
+    temp_storage.data.max_val = threadlocal_max_val;
+  }
+  __syncthreads();
+  threadlocal_max_val = temp_storage.data.max_val;
+
+  float low = 0, high = threadlocal_max_val;
+  T sum_high(1);
+  // f(x) = probs[probs > x], f(x) is non-increasing
+  // loop invariant: f(low) > p, f(high) <= p
+  while (high - low > eps) {
+    T threadlocal_sum(0);
+    float mid = (low + high) / 2;
+    for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+      probs_vec.fill(DType(0));
+      if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+        probs_vec.load(probs + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+      }
+#pragma unroll
+      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+        probs_greater_than_pivot[j] = (probs_vec[j] > mid) ? probs_vec[j] : T(0);
+      }
+      threadlocal_sum +=
+          BlockReduce<T, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
+              .Sum<VEC_SIZE>(probs_greater_than_pivot);
+      __syncthreads();
+    }
+    if (tx == 0) {
+      temp_storage.data.block_aggregate.value = threadlocal_sum;
+    }
+    __syncthreads();
+    threadlocal_sum = temp_storage.data.block_aggregate.value;
+    if (threadlocal_sum > p) {
+      low = mid;
+    } else {
+      high = mid;
+      sum_high = float(threadlocal_sum);
+    }
+  }
+
+  T noramlizer = math::ptx_rcp(max(sum_high, eps));
+
+  // normalize
+  for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+    probs_vec.fill(DType(0));
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+      probs_vec.load(probs + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+    }
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      probs_vec[j] = (probs_vec[j] > low) ? probs_vec[j] * normalizer : T(0);
+    }
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+      probs_vec.store(probs + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+    }
+  }
+}
+
+template <uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE,
+          typename T, typename IdType>
+__global__ void TopKRenormProbKernel(T* probs, IdType* renormed_prob, uint32_t k, float eps,
+                                     uint32_t d) {
+  extern __shared__ __align__(alignof(RenormTempStorage<T, BLOCK_THREADS, REDUCE_ALGO>))
+      uint8_t smem[];
+  auto& temp_storage = reinterpret_cast<RenormTempStorage<T, BLOCK_THREADS, REDUCE_ALGO>&>(smem);
+  temp_storage.data.max_val = T(0);
+  vec_t<T, VEC_SIZE> probs_vec;
+  T probs_greater_than_pivot[VEC_SIZE];  // pivot initialized to 0
+
+  T threadlocal_max_val = T(0);
+  for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+    probs_vec.fill(DType(0));
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+      probs_vec.load(probs + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+    }
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      probs_greater_than_pivot[j] = probs_vec[j];
+    }
+    threadlocal_max_val =
+        max(threadlocal_max_val,
+            BlockReduce<T, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
+                .Max<VEC_SIZE>(probs_greater_than_pivot));
+    __syncthreads();
+  }
+  if (tx == 0) {
+    temp_storage.data.max_val = threadlocal_max_val;
+  }
+  __syncthreads();
+  threadlocal_max_val = temp_storage.data.max_val;
+
+  float low = 0, high = threadlocal_max_val;
+  T sum_high(1);
+  // f(x) = len(nonzero(probs > x)), f(x) is non-increasing
+  // loop invariant: f(low) > k, f(high) <= k
+  while (high - low > eps) {
+    Pair<T> threadlocal_sum{T(0), 0};
+    float mid = (low + high) / 2;
+    for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+      probs_vec.fill(DType(0));
+      if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+        probs_vec.load(probs + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+      }
+#pragma unroll
+      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+        probs_greater_than_pivot[j] = {
+            (probs_vec[j] > mid) ? probs_vec[j] : T(0),
+            (probs_vec[j] > mid && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
+      }
+      threadlocal_sum +=
+          BlockReduce<Pair<T>, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
+              .Sum<VEC_SIZE>(probs_greater_than_pivot);
+      __syncthreads();
+    }
+    if (tx == 0) {
+      temp_storage.data.block_aggregate.pair = threadlocal_sum;
+    }
+    __syncthreads();
+    threadlocal_sum = temp_storage.data.block_aggregate.pair;
+    if (threadlocal_sum.count > k) {
+      low = mid;
+    } else {
+      high = mid;
+      sum_high = float(threadlocal_sum.value);
+    }
+  }
+
+  float normalizer = math::ptx_rcp(max(sum_high, eps));
+
+  // normalize
+  for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+    probs_vec.fill(DType(0));
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+      probs_vec.load(probs + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+    }
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      probs_vec[j] = (probs_vec[j] > low) ? probs_vec[j] * normalizer : T(0);
+    }
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+      probs_vec.store(probs + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
+    }
+  }
+}
+
+template <typename T, typename IdType>
+cudaError_t TopPRenormProb(T* probs, IdType* renormed_prob, float p, float eps, uint32_t batch_size,
+                           uint32_t d, cudaStream_t stream = 0) {
+  const uint32_t BLOCK_THREADS = 1024;
+  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+
+  const uint32_t smem_size = sizeof(RenormTempStorage<T, BLOCK_THREADS, REDUCE_ALGO>);
+  dim3 nblks(batch_size);
+  dim3 nthrs(BLOCK_THREADS);
+  void* args[] = {&probs, &renormed_prob, &p, &eps, &d};
+  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+    auto kernel = TopPRenormProbKernel<BLOCK_THREADS, REDUCE_ALGO, VEC_SIZE, T, IdType>;
+    FLASHINFER_CUDA_CALL(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  });
+  return cudaSuccess;
+}
+
+template <typename T, typename IdType>
+cudaError_t TopKRenormProb(T* probs, IdType* renormed_prob, uint32_t k, float eps,
+                           uint32_t batch_size, uint32_t d, cudaStream_t stream = 0) {
+  const uint32_t BLOCK_THREADS = 1024;
+  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+
+  const uint32_t smem_size = sizeof(RenormTempStorage<T, BLOCK_THREADS, REDUCE_ALGO>);
+  dim3 nblks(batch_size);
+  dim3 nthrs(BLOCK_THREADS);
+  void* args[] = {&probs, &renormed_prob, &k, &eps, &d};
+  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+    auto kernel = TopKRenormProbKernel<BLOCK_THREADS, REDUCE_ALGO, VEC_SIZE, T, IdType>;
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));

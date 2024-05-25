@@ -30,7 +30,7 @@ except ImportError as e:
 
 
 def sampling_from_probs(probs: torch.Tensor, uniform_samples: torch.Tensor):
-    r"""Category sampling from probabilities.
+    r"""Fused GPU kernel for category sampling from probabilities.
 
     Parameters
     ----------
@@ -75,8 +75,11 @@ def sampling_from_probs(probs: torch.Tensor, uniform_samples: torch.Tensor):
 def top_p_sampling_from_probs(
     probs: torch.Tensor, uniform_samples: torch.Tensor, top_p: float
 ):
-    r"""Top-p sampling (nucleus sampling) from probabilities, this operator implements
-    GPU-based rejection sampling without explicit sorting.
+    r"""Fused GPU kernel for top-p sampling (nucleus sampling) from probabilities,
+    this operator implements GPU-based rejection sampling without explicit sorting.
+
+    The multiple rounds of rejection sampling are implemented in a single CUDA kernel,
+    which is more efficient than the naive implementation that launches a series of kernels.
 
     Parameters
     ----------
@@ -134,8 +137,11 @@ def top_p_sampling_from_probs(
 def top_k_sampling_from_probs(
     probs: torch.Tensor, uniform_samples: torch.Tensor, top_k: int
 ):
-    r"""Top-k sampling from probabilities, this operator implements GPU-based rejection sampling
-    without explicit sorting.
+    r"""Fused GPU kernel for top-k sampling from probabilities,
+    this operator implements GPU-based rejection sampling without explicit sorting.
+
+    The multiple rounds of rejection sampling are implemented in a single CUDA kernel,
+    which is more efficient than the naive implementation that launches a series of kernels.
 
     Parameters
     ----------
