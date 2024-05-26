@@ -632,9 +632,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
 
 class CUDAGraphBatchDecodeWithPagedKVCacheWrapper:
-    r"""CUDAGraph-compatible Wrapper class for decode attention with paged kv-cache (first 
-    proposed in `vLLM <https://arxiv.org/abs/2309.06180>`_) for batch of requests. 
-    
+    r"""CUDAGraph-compatible Wrapper class for decode attention with paged kv-cache (first
+    proposed in `vLLM <https://arxiv.org/abs/2309.06180>`_) for batch of requests.
+
     Note that this wrapper may not be as efficient as :class:`BatchDecodeWithPagedKVCacheWrapper`
     because we won't dispatch to different kernels for different batch sizes/sequence lengths/etc
     to accomodate the CUDAGraph requirement.
@@ -673,7 +673,7 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper:
             during the lifecycle of this wrapper.
         indices_buffer : torch.Tensor
             The user reserved buffer on GPU to store the page indices of the paged kv cache,
-            should be large enough to store the maximum number of page indices 
+            should be large enough to store the maximum number of page indices
             (``max_num_pages``) during the lifecycle of this wrapper.
         last_page_len_buffer : torch.Tensor
             The user reserved buffer on GPU to store the number of entries in the last page,

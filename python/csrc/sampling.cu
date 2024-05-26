@@ -96,3 +96,42 @@ std::vector<torch::Tensor> top_k_sampling_from_probs(torch::Tensor probs,
 
   return {samples, success};
 }
+
+torch::Tensor top_p_renorm_prob(torch::Tensor probs, double top_p, double eps) {
+  CHECK_INPUT(probs);
+  CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
+  unsigned int batch_size = probs.size(0);
+  unsigned int vocab_size = probs.size(1);
+  probs = probs.to(torch::kFloat32);
+
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
+  auto renorm_probs =
+      torch::empty({batch_size, vocab_size}, torch::dtype(torch::kFloat32).device(probs.device()));
+
+  cudaError_t status = sampling::TopPRenormProb<float>(
+      static_cast<float*>(probs.data_ptr()), static_cast<float*>(renorm_probs.data_ptr()), top_p,
+      eps, batch_size, vocab_size, torch_current_stream);
+  TORCH_CHECK(status == cudaSuccess,
+              "TopPRenormProb failed with error code " + std::string(cudaGetErrorString(status)));
+  return renorm_probs;
+}
+
+torch::Tensor top_k_renorm_prob(torch::Tensor probs, unsigned int top_k, double eps) {
+  CHECK_INPUT(probs);
+  CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
+  unsigned int batch_size = probs.size(0);
+  unsigned int vocab_size = probs.size(1);
+  probs = probs.to(torch::kFloat32);
+
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
+  auto renorm_probs =
+      torch::empty({batch_size, vocab_size}, torch::dtype(torch::kFloat32).device(probs.device()));
+
+  cudaError_t status = sampling::TopKRenormProb<float>(
+      static_cast<float*>(probs.data_ptr()), static_cast<float*>(renorm_probs.data_ptr()), top_k,
+      eps, batch_size, vocab_size, torch_current_stream);
+
+  TORCH_CHECK(status == cudaSuccess,
+              "TopKRenormProb failed with error code " + std::string(cudaGetErrorString(status)));
+  return renorm_probs;
+}

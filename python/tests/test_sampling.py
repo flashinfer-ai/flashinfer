@@ -95,7 +95,62 @@ def test_top_k_sampling(batch_size, vocab_size, k):
         ]
 
 
+@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
+def test_top_p_renorm_prob(batch_size, vocab_size, p):
+    eps = 1e-6
+    pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    sorted_prob, indices = torch.sort(normalized_prob, descending=False)
+    cdf = torch.cumsum(sorted_prob, dim=-1)
+    mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32).to(0)
+    mask.scatter_add_(1, indices, (cdf >= (1 - p)).int())
+    renorm_prob_ground_truth = normalized_prob
+    renorm_prob_ground_truth[mask == 0] = 0
+    renorm_prob_ground_truth = renorm_prob_ground_truth / renorm_prob_ground_truth.sum(
+        dim=-1, keepdim=True
+    )
+
+    renorm_prob = flashinfer.sampling.top_p_renorm_prob(normalized_prob, p, eps=eps)
+    numpy.testing.assert_allclose(
+        renorm_prob_ground_truth.cpu().numpy(),
+        renorm_prob.cpu().numpy(),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize("k", [10, 100, 500])
+def test_top_k_renorm_prob(batch_size, vocab_size, k):
+    if k > vocab_size:
+        pytest.skip("k should be less than vocab_size")
+    torch.manual_seed(42)
+    pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    sorted_prob, _ = torch.sort(normalized_prob, descending=True)
+    pivot = sorted_prob[:, k - 1]
+    mask = (normalized_prob >= pivot.unsqueeze(-1)).int()
+    renorm_prob_ground_truth = normalized_prob
+    renorm_prob_ground_truth[mask == 0] = 0
+    renorm_prob_ground_truth = renorm_prob_ground_truth / renorm_prob_ground_truth.sum(
+        dim=-1, keepdim=True
+    )
+
+    renorm_prob = flashinfer.sampling.top_k_renorm_prob(normalized_prob, k)
+    numpy.testing.assert_allclose(
+        renorm_prob_ground_truth.cpu().numpy(),
+        renorm_prob.cpu().numpy(),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
 if __name__ == "__main__":
     test_sampling(1, 111)
     test_top_p_sampling(3, 111, 0.9)
     test_top_k_sampling(3, 111, 10)
+    test_top_p_renorm_prob(3, 111, 0.9)
+    test_top_k_renorm_prob(3, 111, 10)

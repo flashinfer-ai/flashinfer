@@ -194,3 +194,11 @@ def top_k_sampling_from_probs(
     implementation usually use much fewer rounds for rejection sampling because of early stopping.
     """
     return _kernels.top_k_sampling_from_probs(probs, uniform_samples, top_k)
+
+
+def top_p_renorm_prob(probs: torch.Tensor, top_p: float, eps: float = 1e-5):
+    return _kernels.top_p_renorm_prob(probs, top_p, eps)
+
+
+def top_k_renorm_prob(probs: torch.Tensor, top_k: int, eps: float = 1e-5):
+    return _kernels.top_k_renorm_prob(probs, top_k, eps)
