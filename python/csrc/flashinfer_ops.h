@@ -66,6 +66,9 @@ torch::Tensor top_p_renorm_prob(torch::Tensor probs, double top_p, double eps);
 
 torch::Tensor top_k_renorm_prob(torch::Tensor probs, unsigned int top_k, double eps);
 
+torch::Tensor chain_speculative_sampling(torch::Tensor draft_probs, torch::Tensor draft_token_ids,
+                                         torch::Tensor uniform_samples, torch::Tensor target_probs);
+
 torch::Tensor rmsnorm(torch::Tensor x, torch::Tensor w, double eps);
 
 class BatchDecodeWithPagedKVCachePyTorchWrapper {

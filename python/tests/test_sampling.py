@@ -148,9 +148,54 @@ def test_top_k_renorm_prob(batch_size, vocab_size, k):
     )
 
 
+@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize("num_speculate_tokens", [1, 3, 5, 7])
+def test_chain_speculative_sampling(
+    batch_size,
+    vocab_size,
+    num_speculate_tokens,
+):
+    pre_norm_draft_prob = torch.rand(batch_size, num_speculate_tokens, vocab_size).to(0)
+    normalized_draft_prob = pre_norm_draft_prob / pre_norm_draft_prob.sum(
+        dim=-1, keepdim=True
+    )
+    draft_token_ids = torch.randint(vocab_size, (batch_size, num_speculate_tokens)).to(
+        0
+    )
+    uniform_samples = torch.empty(batch_size, num_speculate_tokens + 1).to(0)
+    pre_norm_target_prob = torch.rand(
+        batch_size, num_speculate_tokens + 1, vocab_size
+    ).to(0)
+    normalized_target_prob = pre_norm_target_prob / pre_norm_target_prob.sum(
+        dim=-1, keepdim=True
+    )
+
+    # NOTE(Zihao): this is a very simple test that only checks whether output is valid or not.
+    for trials in range(10):
+        uniform_samples.uniform_()
+        output_token_ids = flashinfer.sampling.chain_speculative_sampling(
+            normalized_draft_prob,
+            draft_token_ids,
+            uniform_samples,
+            normalized_target_prob,
+        )
+        assert torch.all(output_token_ids[output_token_ids >= 0] < vocab_size)
+        assert output_token_ids.shape == (batch_size, num_speculate_tokens + 1)
+        matches = output_token_ids[..., :-1] != draft_token_ids
+        for row in range(batch_size):
+            mismatch_idx = torch.nonzero(matches[row], as_tuple=True)[0]
+            if len(mismatch_idx) > 0:
+                # mismatch_idx should be contiguous
+                assert torch.all(mismatch_idx[1:] == mismatch_idx[:-1] + 1)
+                # from the second mismatched token on, the output tokens should be -1
+                assert torch.all(output_token_ids[row, mismatch_idx[0] + 1 :] == -1)
+
+
 if __name__ == "__main__":
     test_sampling(1, 111)
     test_top_p_sampling(3, 111, 0.9)
     test_top_k_sampling(3, 111, 10)
     test_top_p_renorm_prob(3, 111, 0.9)
     test_top_k_renorm_prob(3, 111, 10)
+    test_chain_speculative_sampling(3, 111, 3)
