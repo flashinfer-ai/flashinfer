@@ -34,9 +34,9 @@ using namespace cub;
 constexpr BlockScanAlgorithm SCAN_ALGO = BLOCK_SCAN_WARP_SCANS;
 constexpr BlockReduceAlgorithm REDUCE_ALGO = BLOCK_REDUCE_WARP_REDUCTIONS;
 
-// #if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120100)
-// #define FLASHINFER_CUB_SUBTRACTLEFT_DEFINED
-// #endif
+#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120100)
+#define FLASHINFER_CUB_SUBTRACTLEFT_DEFINED
+#endif
 
 template <typename T>
 struct Pair {
