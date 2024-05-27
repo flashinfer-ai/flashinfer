@@ -62,6 +62,13 @@ std::vector<torch::Tensor> top_k_sampling_from_probs(torch::Tensor probs,
                                                      torch::Tensor uniform_samples,
                                                      unsigned int top_k);
 
+torch::Tensor top_p_renorm_prob(torch::Tensor probs, double top_p, double eps);
+
+torch::Tensor top_k_renorm_prob(torch::Tensor probs, unsigned int top_k, double eps);
+
+torch::Tensor chain_speculative_sampling(torch::Tensor draft_probs, torch::Tensor draft_token_ids,
+                                         torch::Tensor uniform_samples, torch::Tensor target_probs);
+
 torch::Tensor rmsnorm(torch::Tensor x, torch::Tensor w, double eps);
 
 class BatchDecodeWithPagedKVCachePyTorchWrapper {
@@ -83,8 +90,7 @@ class BatchDecodeWithPagedKVCachePyTorchWrapper {
   BatchDecodeWithPagedKVCachePyTorchWrapper(unsigned int layout,
                                             unsigned int max_workspace_size_in_bytes)
       : kv_layout_(flashinfer::QKVLayout(layout)),
-        handler_(
-            std::make_shared<flashinfer::BatchDecodeHandler>(max_workspace_size_in_bytes)) {}
+        handler_(std::make_shared<flashinfer::BatchDecodeHandler>(max_workspace_size_in_bytes)) {}
 
  protected:
   std::shared_ptr<flashinfer::BatchDecodeHandler> handler_;

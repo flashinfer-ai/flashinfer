@@ -38,8 +38,8 @@ void BatchPrefillWithPagedKVCachePyTorchWrapper::BeginForward(
 
   cudaError_t status =
       handler_->BeginForward(static_cast<void*>(workspace_buffer.data_ptr()),
-                            workspace_size_in_bytes, static_cast<int32_t*>(qo_indptr.data_ptr()),
-                            batch_size, num_qo_heads, num_kv_heads, head_dim);
+                             workspace_size_in_bytes, static_cast<int32_t*>(qo_indptr.data_ptr()),
+                             batch_size, num_qo_heads, num_kv_heads, head_dim);
   TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithPagedKVCache failed with error ",
               cudaGetErrorString(status));
 }
@@ -166,8 +166,8 @@ void BatchPrefillWithRaggedKVCachePyTorchWrapper::BeginForward(
 
   cudaError_t status =
       handler_->BeginForward(static_cast<void*>(workspace_buffer.data_ptr()),
-                            workspace_size_in_bytes, static_cast<int32_t*>(qo_indptr.data_ptr()),
-                            batch_size, num_qo_heads, num_kv_heads, head_dim);
+                             workspace_size_in_bytes, static_cast<int32_t*>(qo_indptr.data_ptr()),
+                             batch_size, num_qo_heads, num_kv_heads, head_dim);
   TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithPagedKVCache failed with error ",
               cudaGetErrorString(status));
 }
