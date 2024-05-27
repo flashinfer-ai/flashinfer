@@ -143,6 +143,12 @@ class BatchPrefillWithRaggedKVCachePyTorchWrapper {
                                      unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction,
                                      float sm_scale, float rope_scale, float rope_theta,
                                      bool return_lse);
+  std::vector<torch::Tensor> ForwardWithMask(torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor k,
+                                     torch::Tensor v, torch::Tensor kv_indptr, torch::Tensor mask,
+                                     torch::Tensor qk_indptr, bool causal,
+                                     unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction,
+                                     float sm_scale, float rope_scale, float rope_theta,
+                                     bool return_lse);
   BatchPrefillWithRaggedKVCachePyTorchWrapper(unsigned int layout,
                                               unsigned int max_workspace_size_in_bytes)
       : kv_layout_(flashinfer::QKVLayout(layout)),

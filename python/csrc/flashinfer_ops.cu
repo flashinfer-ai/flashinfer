@@ -71,4 +71,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("update_page_locked_buffer_size",
            &BatchPrefillWithRaggedKVCachePyTorchWrapper::UpdatePageLockedBufferSize)
       .def("forward", &BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward);
+      .def("forward_with_mask", &BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardWithMask);
 }

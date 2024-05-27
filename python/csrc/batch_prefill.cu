@@ -258,3 +258,81 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
     return {o};
   }
 }
+
+std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardWithMask(
+    torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor k, torch::Tensor v,
+    torch::Tensor kv_indptr, torch::Tensor mask, torch::Tensor qk_indptr,
+    bool causal, unsigned int pos_encoding_mode,
+    bool allow_fp16_qk_reduction, float sm_scale, float rope_scale, float rope_theta,
+    bool return_lse) {
+  CHECK_INPUT(q);
+  CHECK_INPUT(qo_indptr);
+  CHECK_INPUT(k);
+  CHECK_INPUT(v);
+  CHECK_INPUT(kv_indptr);
+  CHECK_DIM(3, q);          // (nnz_qo, H_qo, D)
+  CHECK_DIM(1, qo_indptr);  // (B + 1,)
+  CHECK_DIM(3, k);          // (nnz_kv, H_kv, D) if NHD else (H_kv, nnz_kv, D)
+  CHECK_DIM(3, v);          // (nnz_kv, H_kv, D) if NHD else (H_kv, nnz_kv, D)
+  CHECK_DIM(1, kv_indptr);  // (B + 1,)
+  int64_t batch_size = qo_indptr.size(0) - 1;
+  int64_t nnz_qo = q.size(0);
+  int64_t num_qo_heads = q.size(1);
+  int64_t head_dim = q.size(2);
+  CHECK_EQ(kv_indptr.size(0), batch_size + 1);
+  int64_t num_kv_heads = (kv_layout_ == QKVLayout::kNHD) ? k.size(1) : k.size(0);
+  CHECK_EQ(k.size(0), v.size(0));
+  CHECK_EQ(k.size(1), v.size(1));
+  CHECK_EQ(k.size(2), v.size(2));
+  CHECK_EQ(k.size(2), head_dim);
+  CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
+  // TODO(Zihao): support dispatching to different index data types.
+  CHECK_EQ(qo_indptr.scalar_type(), torch::kInt32);
+  CHECK_EQ(kv_indptr.scalar_type(), torch::kInt32);
+
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
+  torch::Tensor o = torch::empty_like(q, q.options());
+  torch::Tensor lse = torch::empty({0});
+  if (return_lse) {
+    lse = torch::empty({nnz_qo, num_qo_heads}, q.options()).to(torch::kFloat32);
+  }
+
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
+    return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
+      return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
+        return DISPATCH_causal(causal, CAUSAL, [&] {
+          return DISPATCH_allow_fp16_qk_reduction(
+              allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
+                return DISPATCH_pos_encoding_mode(
+                    PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
+                      return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
+                        cudaError_t status = BatchPrefillWithRaggedKVCacheWrapperDispatched<
+                            GROUP_SIZE, HEAD_DIM, KV_LAYOUT, POS_ENCODING_MODE,
+                            ALLOW_FP16_QK_REDUCTION, CAUSAL, c_type, c_type, int32_t>(
+                            handler_.get(), static_cast<c_type*>(q.data_ptr()),
+                            static_cast<int32_t*>(qo_indptr.data_ptr()),
+                            static_cast<c_type*>(k.data_ptr()), static_cast<c_type*>(v.data_ptr()),
+                            static_cast<int32_t*>(kv_indptr.data_ptr()),
+                            /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr,
+                            static_cast<c_type*>(o.data_ptr()),
+                            /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
+                            batch_size, num_kv_heads, sm_scale, rope_scale, rope_theta,
+                            /*stream=*/torch_current_stream);
+                        TORCH_CHECK(status == cudaSuccess,
+                                    "BatchPrefillWithRaggedKVCache failed with error ",
+                                    cudaGetErrorString(status));
+                        return true;
+                      });
+                    });
+              });
+        });
+      });
+    });
+  });
+
+  if (return_lse) {
+    return {o, lse};
+  } else {
+    return {o};
+  }
+}

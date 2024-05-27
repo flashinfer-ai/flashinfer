@@ -593,6 +593,20 @@ class BatchPrefillWithPagedKVCacheWrapper:
         )
 
 
+def _compute_qk_indptr(
+    qo_indptr: torch.Tensor, kv_indptr: torch.Tensor
+):
+    if len(qo_indptr) != len(kv_indptr):
+        raise ValueError("The length of qo_indptr and kv_indptr should be the same.")
+    qk_indptr = torch.empty_like(qo_indptr)
+    qk_indptr[0] = 0
+    qk_indptr[1:] = torch.cumsum(
+        (qo_indptr[1:] - qo_indptr[:-1]) * (kv_indptr[1:] - kv_indptr[:-1]),
+        0,
+    )
+    return qk_indptr
+
+
 class BatchPrefillWithRaggedKVCacheWrapper:
     r"""Wrapper class for prefill/append attention with ragged (tensor) kv-cache for
     batch of requests.
@@ -672,6 +686,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         )
         self._qo_indptr = None
         self._kv_indptr = None
+        self._mask = None
+        self._qk_indptr = None
 
     def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
         r"""Reset the workspace buffer.
@@ -691,6 +707,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
+        mask: Optional[torch.Tensor] = None,
     ):
         r"""Create auxiliary data structures for batch prefill/append attention for
         multiple forward calls within the same prefill/append step.
@@ -707,6 +724,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The number of key/value heads.
         head_dim : int
             The dimension of the heads.
+        mask : Optional[torch.Tensor]
+            The flattened mask tensor, shape: ``(sum(q_len[i] * k_len[i] for i in range(batch_size))``
+            The mask tensor will be added to the attention matrix before softmax.
 
         Notes
         -----
@@ -721,6 +741,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         batch_size = len(qo_indptr) - 1
         self._qo_indptr = qo_indptr
         self._kv_indptr = kv_indptr
+        if mask is not None:
+            self._qk_indptr = _compute_qk_indptr(qo_indptr, kv_indptr)
+            self._mask = mask
         self._wrapper.begin_forward(
             self._workspace_buffer,
             qo_indptr,
@@ -734,6 +757,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         r"""Clear the auxiliary data structures created by :meth:`begin_forward`."""
         self._qo_indptr = None
         self._kv_indptr = None
+        self._mask = None
+        self._qk_indptr = None
         self._wrapper.end_forward()
 
     def forward(
@@ -796,20 +821,40 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             q = q.to(torch.float16)
             k = k.to(torch.float16)
             v = v.to(torch.float16)
-        return self._wrapper.forward(
-            q,
-            self._qo_indptr,
-            k,
-            v,
-            self._kv_indptr,
-            causal,
-            PosEncodingMode[pos_encoding_mode].value,
-            allow_fp16_qk_reduction,
-            sm_scale,
-            rope_scale,
-            rope_theta,
-            False,
-        )[0]
+        if self._mask is None:
+            return self._wrapper.forward(
+                q,
+                self._qo_indptr,
+                k,
+                v,
+                self._kv_indptr,
+                self._mask,
+                self._qk_indptr,
+                causal,
+                PosEncodingMode[pos_encoding_mode].value,
+                allow_fp16_qk_reduction,
+                sm_scale,
+                rope_scale,
+                rope_theta,
+                False,
+            )[0]
+        else:
+            return self._wrapper.forward_with_mask(
+                q,
+                self._qo_indptr,
+                k,
+                v,
+                self._kv_indptr,
+                self._mask,
+                self._qk_indptr,
+                causal,
+                PosEncodingMode[pos_encoding_mode].value,
+                allow_fp16_qk_reduction,
+                sm_scale,
+                rope_scale,
+                rope_theta,
+                False,
+            )[0]
 
     def forward_return_lse(
         self,
@@ -873,17 +918,35 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             q = q.to(torch.float16)
             k = k.to(torch.float16)
             v = v.to(torch.float16)
-        return self._wrapper.forward(
-            q,
-            self._qo_indptr,
-            k,
-            v,
-            self._kv_indptr,
-            causal,
-            PosEncodingMode[pos_encoding_mode].value,
-            allow_fp16_qk_reduction,
-            sm_scale,
-            rope_scale,
-            rope_theta,
-            True,
-        )
+        if self._mask is None:
+            return self._wrapper.forward(
+                q,
+                self._qo_indptr,
+                k,
+                v,
+                self._kv_indptr,
+                causal,
+                PosEncodingMode[pos_encoding_mode].value,
+                allow_fp16_qk_reduction,
+                sm_scale,
+                rope_scale,
+                rope_theta,
+                True,
+            )
+        else:
+            return self._wrapper.forward_with_mask(
+                q,
+                self._qo_indptr,
+                k,
+                v,
+                self._kv_indptr,
+                self._mask,
+                self._qk_indptr,
+                causal,
+                PosEncodingMode[pos_encoding_mode].value,
+                allow_fp16_qk_reduction,
+                sm_scale,
+                rope_scale,
+                rope_theta,
+                True,
+            )
