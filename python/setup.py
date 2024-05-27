@@ -73,7 +73,7 @@ def get_instantiation_cu() -> List[str]:
     allow_fp16_qk_reduction_options = os.environ.get(
         "FLASHINFER_ALLOW_FP16_QK_REDUCTION_OPTIONS", "0"
     ).split(",")
-    causal_options = os.environ.get("FLASHINFER_CAUSAL_OPTIONS", "0,1").split(",")
+    mask_modes = os.environ.get("FLASHINFER_MASK_MODES", "0,1,2").split(",")
     # dispatch.inc
     path = root / prefix / "dispatch.inc"
     write_if_different(
@@ -86,7 +86,7 @@ def get_instantiation_cu() -> List[str]:
                 kv_layouts=map(int, kv_layouts),
                 pos_encoding_modes=map(int, pos_encoding_modes),
                 allow_fp16_qk_reductions=map(int, allow_fp16_qk_reduction_options),
-                causals=map(int, causal_options),
+                mask_modes=map(int, mask_modes),
             )
         ),
     )
@@ -217,17 +217,17 @@ def get_instantiation_cu() -> List[str]:
         kv_layout,
         pos_encoding_mode,
         allow_fp16_qk_reduction,
-        causal,
+        mask_mode,
     ) in itertools.product(
         group_sizes,
         head_dims,
         kv_layouts,
         pos_encoding_modes,
         allow_fp16_qk_reduction_options,
-        causal_options,
+        mask_modes,
     ):
         for dtype in prefill_dtypes:
-            fname = f"single_prefill_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_causal_{causal}_dtypein_{dtype}_dtypeout_{dtype}.cu"
+            fname = f"single_prefill_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_mask_{mask_modes}_dtypein_{dtype}_dtypeout_{dtype}.cu"
             files.append(prefix + "/" + fname)
             content = generate_single_prefill_inst.get_cu_file_str(
                 group_size,
@@ -235,7 +235,7 @@ def get_instantiation_cu() -> List[str]:
                 kv_layout,
                 pos_encoding_mode,
                 allow_fp16_qk_reduction,
-                causal,
+                mask_mode,
                 dtype,
                 dtype,
             )
@@ -249,7 +249,7 @@ def get_instantiation_cu() -> List[str]:
         kv_layout,
         pos_encoding_mode,
         allow_fp16_qk_reduction,
-        causal,
+        mask_mode,
         idtype,
     ) in itertools.product(
         group_sizes,
@@ -258,11 +258,11 @@ def get_instantiation_cu() -> List[str]:
         kv_layouts,
         pos_encoding_modes,
         allow_fp16_qk_reduction_options,
-        causal_options,
+        mask_modes,
         idtypes,
     ):
         for dtype in prefill_dtypes:
-            fname = f"batch_paged_prefill_group_{group_size}_page_{page_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_causal_{causal}_dtypein_{dtype}_dtypeout_{dtype}_idtype_{idtype}.cu"
+            fname = f"batch_paged_prefill_group_{group_size}_page_{page_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_mask_{mask_mode}_dtypein_{dtype}_dtypeout_{dtype}_idtype_{idtype}.cu"
             files.append(prefix + "/" + fname)
             content = generate_batch_paged_prefill_inst.get_cu_file_str(
                 group_size,
@@ -271,7 +271,7 @@ def get_instantiation_cu() -> List[str]:
                 kv_layout,
                 pos_encoding_mode,
                 allow_fp16_qk_reduction,
-                causal,
+                mask_mode,
                 dtype,
                 dtype,
                 idtype,
@@ -285,7 +285,7 @@ def get_instantiation_cu() -> List[str]:
         kv_layout,
         pos_encoding_mode,
         allow_fp16_qk_reduction,
-        causal,
+        mask_mode,
         idtype,
     ) in itertools.product(
         group_sizes,
@@ -293,11 +293,11 @@ def get_instantiation_cu() -> List[str]:
         kv_layouts,
         pos_encoding_modes,
         allow_fp16_qk_reduction_options,
-        causal_options,
+        mask_modes,
         idtypes,
     ):
         for dtype in prefill_dtypes:
-            fname = f"batch_ragged_prefill_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_causal_{causal}_dtypein_{dtype}_dtypeout_{dtype}_idtype_{idtype}.cu"
+            fname = f"batch_ragged_prefill_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_mask_{mask_mode}_dtypein_{dtype}_dtypeout_{dtype}_idtype_{idtype}.cu"
             files.append(prefix + "/" + fname)
             content = generate_batch_ragged_prefill_inst.get_cu_file_str(
                 group_size,
@@ -305,7 +305,7 @@ def get_instantiation_cu() -> List[str]:
                 kv_layout,
                 pos_encoding_mode,
                 allow_fp16_qk_reduction,
-                causal,
+                mask_mode,
                 dtype,
                 dtype,
                 idtype,

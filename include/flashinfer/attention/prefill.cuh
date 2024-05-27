@@ -44,6 +44,12 @@ namespace cg = cooperative_groups;
 using cp_async::SharedMemFillMode;
 using mma::MMAMode;
 
+enum class MaskMode {
+  kNone = 0U,    // No mask
+  kCausal = 1U,  // Causal mask
+  kCustom = 2U,  // Custom mask
+};
+
 constexpr uint32_t warp_size = 32;
 
 namespace {
@@ -550,11 +556,12 @@ __device__ __forceinline__ void apply_alibi_bias(const uint32_t qo_idx_base,
   }
 }
 
-template <bool partition_kv, bool causal, uint32_t group_size, uint32_t num_warps,
+template <bool partition_kv, MaskMode mask_mode, uint32_t group_size, uint32_t num_warps,
           uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z, typename DTypeQKAccum>
 __device__ __forceinline__ void mask_s(const uint32_t qo_idx_base, const uint32_t kv_idx_base,
                                        const uint32_t qo_len, const uint32_t kv_len,
                                        const uint32_t chunk_end,
+                                       float *custom_mask,
                                        DTypeQKAccum (*s_frag)[num_frags_z][8]) {
   const uint32_t tx = threadIdx.x;
 #pragma unroll
@@ -568,9 +575,10 @@ __device__ __forceinline__ void mask_s(const uint32_t qo_idx_base, const uint32_
                        kv_idx =
                            kv_idx_base + fz * 16 + 2 * (tx % 4) + 8 * (reg_id / 4) + reg_id % 2;
         const bool out_of_boundary =
-            (causal ? (kv_idx > kv_len + q_idx - qo_len || (partition_kv && kv_idx >= chunk_end))
+            (mask_mode == MaskMode::kCausal ? (kv_idx > kv_len + q_idx - qo_len || (partition_kv && kv_idx >= chunk_end))
                     : kv_idx >= chunk_end);
-        s_frag[fx][fz][reg_id] = out_of_boundary ? DTypeQKAccum(-5e4) : s_frag[fx][fz][reg_id];
+        s_frag[fx][fz][reg_id] = out_of_boundary ? DTypeQKAccum(-5e4) : s_frag[fx][fz][reg_id] + 
+          DTypeQKAccum(mask_mode == MaskMode::kCustom ? custom_mask[q_idx * kv_len + kv_idx]: 0.f);
       }
     }
   }
@@ -870,7 +878,7 @@ __device__ __forceinline__ void write_o_reg_gmem(float (*o_frag)[num_frags_y][8]
  * \brief FlashAttention prefill CUDA kernel for a single request.
  * \tparam partition_kv Whether to split kv_len into chunks.
  * \tparam group_size The number of qo heads that maps to a kv head (used in GQA).
- * \tparam causal Whether to use causal attention.
+ * \tparam mask_mode The mask mode used in the attention operation.
  * \tparam kv_layout The layout of the input tensor.
  * \tparam pos_encoding_mode The positional encoding mode.
  * \tparam num_frags_x The number of fragments in x dimension.
@@ -892,7 +900,7 @@ __device__ __forceinline__ void write_o_reg_gmem(float (*o_frag)[num_frags_y][8]
  * \param log2_rope_rcp_theta log2(1/(rope_theta)), where rope_theta is the theta
  *   used in RoPE.
  */
-template <bool partition_kv, uint32_t group_size, bool causal, QKVLayout kv_layout,
+template <bool partition_kv, uint32_t group_size, MaskMode mask_mode, QKVLayout kv_layout,
           PosEncodingMode pos_encoding_mode, uint32_t num_frags_x, uint32_t num_frags_y,
           uint32_t num_frags_z, uint32_t num_warps, typename DTypeIn, typename DTypeQKAccum,
           typename DTypeOut>
@@ -983,7 +991,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
       v_smem(smem + (num_warps * num_frags_x + num_frags_z) * 16 * head_dim * sizeof(DTypeIn));
 
   const uint32_t num_iterations = ceil_div(
-      causal ? min(chunk_end - chunk_start,
+      mask_mode == MaskMode::kCausal ? min(chunk_end - chunk_start,
                    sub_if_greater_or_zero(
                        kv_len - qo_len + ((bx + 1) * num_frags_x * num_warps * 16) / group_size,
                        chunk_start))
@@ -991,7 +999,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
       16 * num_frags_z);
 
   const uint32_t mask_iteration =
-      (causal ? min(chunk_end - chunk_start,
+      (mask_mode == MaskMode::kCausal ? min(chunk_end - chunk_start,
                     sub_if_greater_or_zero(
                         kv_len + (bx * num_warps * num_frags_x * 16) / group_size - qo_len,
                         chunk_start))
@@ -1036,8 +1044,8 @@ __global__ void SinglePrefillWithKVCacheKernel(
     }
     // apply mask
     if (iter >= mask_iteration) {
-      mask_s<partition_kv, causal, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
-          qo_idx_base, chunk_start + iter * 16 * num_frags_z, qo_len, kv_len, chunk_end, s_frag);
+      mask_s<partition_kv, mask_mode, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
+          qo_idx_base, chunk_start + iter * 16 * num_frags_z, qo_len, kv_len, chunk_end, nullptr, s_frag);
     }
 
     // compute m,d states in online softmax
@@ -1097,13 +1105,15 @@ __global__ void SinglePrefillWithKVCacheKernel(
   }
 }
 
-template <uint32_t group_size, bool causal, QKVLayout kv_layout, PosEncodingMode pos_encoding_mode,
+template <uint32_t group_size, MaskMode mask_mode, QKVLayout kv_layout, PosEncodingMode pos_encoding_mode,
           uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps,
           typename DTypeIn, typename DTypeQKAccum, typename DTypeOut, typename IdType>
 __global__ void BatchPrefillWithRaggedKVCacheKernel(
     DTypeIn* __restrict__ q, IdType* __restrict__ request_indices,
     IdType* __restrict__ tile_indices, IdType* __restrict__ qo_indptr, DTypeIn* __restrict__ k,
-    DTypeIn* __restrict__ v, IdType* __restrict__ kv_indptr, IdType* __restrict__ q_offset,
+    DTypeIn* __restrict__ v, IdType* __restrict__ kv_indptr,
+    float* custom_mask, IdType* qk_indptr,
+    IdType* __restrict__ q_offset,
     IdType* __restrict__ k_rope_pos_offset, DTypeOut* __restrict__ o, float* __restrict__ tmp,
     float* __restrict__ lse, uint32_t batch_size, float sm_scale, float log2_rope_rcp_scale,
     float log2_rope_rcp_theta) {
@@ -1194,13 +1204,13 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
   }
 
   const uint32_t num_iterations = ceil_div(
-      (causal ? min(kv_len,
+      (mask_mode == MaskMode::kCausal ? min(kv_len,
                     kv_len - qo_len + ((tile_idx + 1) * num_frags_x * num_warps * 16) / group_size)
               : kv_len),
       16 * num_frags_z);
 
   const uint32_t mask_iteration =
-      (causal
+      (mask_mode == MaskMode::kCausal
            ? min(kv_len + (tile_idx * num_warps * num_frags_x * 16) / group_size - qo_len, kv_len)
            : kv_len) /
       (16 * num_frags_z);
@@ -1251,9 +1261,14 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
           qo_idx_base, iter * 16 * num_frags_z, int(kv_len) - int(qo_len), alibi_slopes, s_frag);
     }
     // apply mask
-    if (iter >= mask_iteration) {
-      mask_s<partition_kv, causal, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
-          qo_idx_base, iter * 16 * num_frags_z, qo_len, kv_len, kv_len, s_frag);
+    if constexpr (mask_mode == MaskMode::kCustom) {
+      mask_s<partition_kv, mask_mode, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
+          qo_idx_base, iter * 16 * num_frags_z, qo_len, kv_len, kv_len, custom_mask + qk_indptr[request_idx], s_frag);
+    } else {
+      if (iter >= mask_iteration) {
+        mask_s<partition_kv, mask_mode, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
+            qo_idx_base, iter * 16 * num_frags_z, qo_len, kv_len, kv_len, nullptr, s_frag);
+      }
     }
 
     // compute m,d states in online softmax
@@ -1304,7 +1319,7 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
   }
 }
 
-template <uint32_t group_size, uint32_t page_size, bool causal, PosEncodingMode pos_encoding_mode,
+template <uint32_t group_size, uint32_t page_size, MaskMode mask_mode, PosEncodingMode pos_encoding_mode,
           uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps,
           PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeQKAccum,
           typename DTypeOut, typename IdType>
@@ -1420,14 +1435,14 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
   cp_async::commit_group();
 
   const uint32_t num_iterations = ceil_div(
-      (causal
+      (mask_mode == MaskMode::kCausal
            ? min(kv_len, kv_len - qo_len +
                              ((tile_idx + 1) * num_frags_x * num_warps * 16) / aligned_group_size)
            : kv_len),
       16 * num_frags_z);
 
   const uint32_t mask_iteration =
-      (causal
+      (mask_mode == MaskMode::kCausal
            ? min(kv_len + (tile_idx * num_warps * num_frags_x * 16) / aligned_group_size - qo_len,
                  kv_len)
            : kv_len) /
@@ -1457,8 +1472,8 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
     }
     // apply mask
     if (iter >= mask_iteration) {
-      mask_s<partition_kv, causal, aligned_group_size, num_warps, num_frags_x, num_frags_y,
-             num_frags_z>(qo_idx_base, iter * 16 * num_frags_z, qo_len, kv_len, kv_len, s_frag);
+      mask_s<partition_kv, mask_mode, aligned_group_size, num_warps, num_frags_x, num_frags_y,
+             num_frags_z>(qo_idx_base, iter * 16 * num_frags_z, qo_len, kv_len, kv_len, nullptr, s_frag);
     }
 
     // compute m,d states in online softmax
@@ -1523,7 +1538,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
  * \param qo_len The length of query and output.
  * \param kv_len The length of key and value.
  * \param head_dim The dimension of each head.
- * \param causal Whether to use causal attention.
+ * \param mask_mode The mask mode applied in the attention score.
  * \param kv_layout The layout of KV Cache.
  * \param pos_encoding_mode The positional encoding mode.
  * \param allow_fp16_qk_reduction Whether to allow accumulating q*k^T with fp16.
@@ -1533,13 +1548,13 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
 template <typename DTypeIn, typename DTypeOut>
 cudaError_t SinglePrefillWithKVCacheWorkEstimation(
     uint32_t& tmp_size, uint32_t& max_grid_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
-    uint32_t qo_len, uint32_t kv_len, uint32_t head_dim, bool causal = true,
+    uint32_t qo_len, uint32_t kv_len, uint32_t head_dim, MaskMode mask_mode,
     QKVLayout kv_layout = QKVLayout::kNHD,
     PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
     bool allow_fp16_qk_reduction = false, cudaStream_t stream = nullptr) {
-  if (kv_len < qo_len && causal) {
+  if (kv_len < qo_len && mask_mode == MaskMode::kCausal) {
     std::ostringstream err_msg;
-    err_msg << "When causal is true, kv_len must be greater than or equal to qo_len, "
+    err_msg << "When setting mask_mode to kCausal, kv_len must be greater than or equal to qo_len, "
             << "got kv_len " << kv_len << " and qo_len " << qo_len;
     throw std::invalid_argument(err_msg.str());
   }
@@ -1551,8 +1566,8 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
           (qo_len * group_size > 64 && head_dim < 256 ? 2 : 1), num_frags_x,
           {DISPATCH_GQA_GROUP_SIZE(
               group_size, GROUP_SIZE,
-              {DISPATCH_CAUSAL(
-                  causal, CAUSAL, {DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+              {DISPATCH_MASK_MODE(
+                  mask_mode, MASK_MODE, {DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
                     constexpr uint32_t num_frags_y = HEAD_DIM / 16;
                     DISPATCH_POS_ENCODING_MODE(
                         pos_encoding_mode, pos_encoding_mode,
@@ -1605,7 +1620,7 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
                                   constexpr uint32_t num_rows_per_cta =
                                       num_frags_x * num_warps * 16;
                                   auto partition_kv_kernel = SinglePrefillWithKVCacheKernel<
-                                      /*partition_kv=*/true, GROUP_SIZE, CAUSAL, KV_LAYOUT,
+                                      /*partition_kv=*/true, GROUP_SIZE, MASK_MODE, KV_LAYOUT,
                                       pos_encoding_mode, num_frags_x, num_frags_y, num_frags_z,
                                       num_warps, DTypeIn, DTypeQKAccum, DTypeOut>;
                                   tensor_info_t<KV_LAYOUT, GROUP_SIZE, HEAD_DIM> qkv_info(
@@ -1657,7 +1672,7 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
 }
 
 template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
-          PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL,
+          PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename DTypeIn, typename DTypeOut>
 cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o,
                                                float* tmp, float* lse, uint32_t num_kv_heads,
@@ -1666,9 +1681,9 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
                                                cudaStream_t stream) {
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
-  if (kv_len < qo_len && CAUSAL) {
+  if (kv_len < qo_len && MASK_MODE == MaskMode::kCausal) {
     std::ostringstream err_msg;
-    err_msg << "When causal is true, kv_len must be greater than or equal to qo_len, got kv_len"
+    err_msg << "When mask_mode is set to MaskMode::kCausal, kv_len must be greater than or equal to qo_len, got kv_len"
             << kv_len << " and qo_len " << qo_len;
     throw std::invalid_argument(err_msg.str());
   }
@@ -1713,7 +1728,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
         constexpr uint32_t num_threads = num_warps * warp_size;
         constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
         auto partition_kv_kernel =
-            SinglePrefillWithKVCacheKernel</*partition_kv=*/true, GROUP_SIZE, CAUSAL, KV_LAYOUT,
+            SinglePrefillWithKVCacheKernel</*partition_kv=*/true, GROUP_SIZE, MASK_MODE, KV_LAYOUT,
                                            pos_encoding_mode, num_frags_x, num_frags_y, num_frags_z,
                                            num_warps, DTypeIn, DTypeQKAccum, DTypeOut>;
         tensor_info_t<KV_LAYOUT, GROUP_SIZE, HEAD_DIM> qkv_info(qo_len, kv_len, num_kv_heads);
@@ -1741,7 +1756,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
         if (num_chunks <= 1 || tmp == nullptr) {
           // Enough parallelism, do not split-kv
           auto kernel = SinglePrefillWithKVCacheKernel<
-              /*partition_kv=*/false, GROUP_SIZE, CAUSAL, KV_LAYOUT, pos_encoding_mode, num_frags_x,
+              /*partition_kv=*/false, GROUP_SIZE, MASK_MODE, KV_LAYOUT, pos_encoding_mode, num_frags_x,
               num_frags_y, num_frags_z, num_warps, DTypeIn, DTypeQKAccum, DTypeOut>;
           void* args[] = {(void*)&q,
                           (void*)&k,
@@ -1788,11 +1803,13 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
 }
 
 template <uint32_t num_frags_x, uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
-          PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL,
+          PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION, MaskMode mask_mode,
           typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, DTypeIn* k,
-    DTypeIn* v, IdType* kv_indptr, IdType* q_offset, IdType* k_rope_pos_offset, DTypeOut* o,
+    DTypeIn* v, IdType* kv_indptr,
+    float* mask, IdType* qk_indptr, 
+    IdType* q_offset, IdType* k_rope_pos_offset, DTypeOut* o,
     float* tmp, float* lse, const uint32_t batch_size, const uint32_t num_qo_tiles,
     const uint32_t num_kv_heads, const float sm_scale, const float rope_scale,
     const float rope_theta, cudaStream_t stream = nullptr) {
@@ -1836,7 +1853,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
       throw std::invalid_argument(err_msg.str());
     } else {
       auto kernel =
-          BatchPrefillWithRaggedKVCacheKernel<GROUP_SIZE, CAUSAL, KV_LAYOUT, pos_encoding_mode,
+          BatchPrefillWithRaggedKVCacheKernel<GROUP_SIZE, MASK_MODE, KV_LAYOUT, pos_encoding_mode,
                                               num_frags_x, num_frags_y, num_frags_z, num_warps,
                                               DTypeIn, DTypeQKAccum, DTypeOut, IdType>;
       uint32_t smem_size =
@@ -1867,7 +1884,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
 
 template <PageStorage page_storage, QKVLayout kv_layout, uint32_t num_frags_x, uint32_t PAGE_SIZE,
           uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PosEncodingMode pos_encoding_mode,
-          bool ALLOW_FP16_QK_REDUCTION, bool CAUSAL, typename DTypeIn, typename DTypeOut,
+          bool ALLOW_FP16_QK_REDUCTION, MaskMode mask_mode, typename DTypeIn, typename DTypeOut,
           typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, IdType* q_offset,
@@ -1917,7 +1934,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
       throw std::invalid_argument(err_msg.str());
     } else {
       auto kernel = BatchPrefillWithPagedKVCacheKernel<
-          GROUP_SIZE, PAGE_SIZE, CAUSAL, pos_encoding_mode, num_frags_x, num_frags_y, num_frags_z,
+          GROUP_SIZE, PAGE_SIZE, MASK_MODE, pos_encoding_mode, num_frags_x, num_frags_y, num_frags_z,
           num_warps, page_storage, kv_layout, DTypeIn, DTypeQKAccum, DTypeOut, IdType>;
       uint32_t smem_size =
           (num_frags_x * num_warps + num_frags_z * 2) * 16 * HEAD_DIM * sizeof(DTypeIn);

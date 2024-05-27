@@ -54,7 +54,7 @@ void BatchPrefillWithPagedKVCachePyTorchWrapper::UpdatePageLockedBufferSize(
 std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
     torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor paged_kv_data,
     torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
-    torch::Tensor paged_kv_last_page_len, bool causal, unsigned int pos_encoding_mode,
+    torch::Tensor paged_kv_last_page_len, unsigned int mask_mode_value, unsigned int pos_encoding_mode,
     bool allow_fp16_qk_reduction, float sm_scale, float rope_scale, float rope_theta,
     bool return_lse) {
   CHECK_INPUT(q);
@@ -101,6 +101,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
   if (return_lse) {
     lse = torch::empty({nnz_qo, num_qo_heads}, q.options()).to(torch::kFloat32);
   }
+  MaskMode mask_mode = MaskMode(mask_mode_value);
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
     return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
@@ -112,7 +113,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
           static_cast<int32_t*>(paged_kv_last_page_len.data_ptr()));
       return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
         return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-          return DISPATCH_causal(causal, CAUSAL, [&] {
+          return DISPATCH_mask_mode(mask_mode, MASK_MODE, [&] {
             return DISPATCH_allow_fp16_qk_reduction(
                 allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
                   return DISPATCH_pos_encoding_mode(
@@ -120,7 +121,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
                         return DISPATCH_page_size(page_size, PAGE_SIZE, [&] {
                           cudaError_t status = BatchPrefillWithPagedKVCacheWrapperDispatched<
                               PageStorage::kIndices, KV_LAYOUT, PAGE_SIZE, GROUP_SIZE, HEAD_DIM,
-                              POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION, CAUSAL, c_type, c_type,
+                              POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION, MASK_MODE, c_type, c_type,
                               int32_t>(
                               handler_.get(), static_cast<c_type*>(q.data_ptr()),
                               static_cast<int32_t*>(qo_indptr.data_ptr()),
@@ -181,7 +182,7 @@ void BatchPrefillWithRaggedKVCachePyTorchWrapper::UpdatePageLockedBufferSize(
 
 std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
     torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor k, torch::Tensor v,
-    torch::Tensor kv_indptr, bool causal, unsigned int pos_encoding_mode,
+    torch::Tensor kv_indptr, unsigned int mask_mode_value, unsigned int pos_encoding_mode,
     bool allow_fp16_qk_reduction, float sm_scale, float rope_scale, float rope_theta,
     bool return_lse) {
   CHECK_INPUT(q);
@@ -216,10 +217,12 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
     lse = torch::empty({nnz_qo, num_qo_heads}, q.options()).to(torch::kFloat32);
   }
 
+  MaskMode mask_mode = MaskMode(mask_mode_value);
+
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
     return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
       return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-        return DISPATCH_causal(causal, CAUSAL, [&] {
+        return DISPATCH_mask_mode(mask_mode, MASK_MODE, [&] {
           return DISPATCH_allow_fp16_qk_reduction(
               allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
                 return DISPATCH_pos_encoding_mode(
@@ -227,7 +230,7 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
                       return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
                         cudaError_t status = BatchPrefillWithRaggedKVCacheWrapperDispatched<
                             GROUP_SIZE, HEAD_DIM, KV_LAYOUT, POS_ENCODING_MODE,
-                            ALLOW_FP16_QK_REDUCTION, CAUSAL, c_type, c_type, int32_t>(
+                            ALLOW_FP16_QK_REDUCTION, MASK_MODE, c_type, c_type, int32_t>(
                             handler_.get(), static_cast<c_type*>(q.data_ptr()),
                             static_cast<int32_t*>(qo_indptr.data_ptr()),
                             static_cast<c_type*>(k.data_ptr()), static_cast<c_type*>(v.data_ptr()),

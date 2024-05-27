@@ -17,6 +17,11 @@ limitations under the License.
 import torch
 from enum import Enum
 
+class MaskMode(Enum):
+    NONE = 0
+    CAUSAL = 1
+    CUSTOM = 2
+
 
 class PosEncodingMode(Enum):
     NONE = 0

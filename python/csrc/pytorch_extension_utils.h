@@ -134,8 +134,8 @@ using namespace flashinfer;
   _DISPATCH_SWITCH("allow_fp16_qk_reduction", expr,             \
                    _DISPATCH_CASES_allow_fp16_qk_reduction(const_expr, __VA_ARGS__))
 
-#define DISPATCH_causal(expr, const_expr, ...) \
-  _DISPATCH_SWITCH("causal", expr, _DISPATCH_CASES_causal(const_expr, __VA_ARGS__))
+#define DISPATCH_mask_mode(expr, const_expr, ...) \
+  _DISPATCH_SWITCH("mask_mode", expr, _DISPATCH_CASES_mask_mode(const_expr, __VA_ARGS__))
 
 inline void check_shape(const torch::Tensor& a, const torch::Tensor& b, const char* a_name,
                         const char* b_name) {

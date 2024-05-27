@@ -21,7 +21,7 @@
 using namespace flashinfer;
 
 std::vector<torch::Tensor> single_prefill_with_kv_cache(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor tmp, bool causal,
+    torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor tmp, unsigned int mask_mode,
     unsigned int layout, unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction,
     float sm_scale, float rope_scale, float rope_theta, bool return_lse) {
   CHECK_INPUT(q);
@@ -54,10 +54,12 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
     lse = torch::empty({qo_len, num_qo_heads}, q.options().dtype(torch::kFloat32));
   }
 
+  MaskMode mask_mode = MaskMode(mask_mode_value);
+
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
     return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
       return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-        return DISPATCH_causal(causal, CAUSAL, [&] {
+        return DISPATCH_mask_mode(mask_mode, MASK_MODE, [&] {
           return DISPATCH_kv_layout(kv_layout, KV_LAYOUT, [&] {
             return DISPATCH_allow_fp16_qk_reduction(
                 allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
@@ -65,7 +67,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
                       PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
                         cudaError_t status = SinglePrefillWithKVCacheDispatched<
                             GROUP_SIZE, HEAD_DIM, KV_LAYOUT, POS_ENCODING_MODE,
-                            ALLOW_FP16_QK_REDUCTION, CAUSAL>(
+                            ALLOW_FP16_QK_REDUCTION, MASK_MODE>(
                             static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
                             static_cast<c_type*>(v.data_ptr()), static_cast<c_type*>(o.data_ptr()),
                             static_cast<float*>(tmp.data_ptr()),

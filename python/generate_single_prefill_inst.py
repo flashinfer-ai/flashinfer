@@ -16,7 +16,7 @@ limitations under the License.
 
 import sys
 import re
-from literal_map import kv_layout_literal, pos_encoding_mode_literal, dtype_literal
+from literal_map import kv_layout_literal, pos_encoding_mode_literal, dtype_literal, mask_mode_literal
 from pathlib import Path
 
 
@@ -26,7 +26,7 @@ def get_cu_file_str(
     kv_layout,
     pos_encoding_mode,
     allow_fp16_qk_reduction,
-    causal,
+    mask_mode,
     dtype_in,
     dtype_out,
 ):
@@ -35,7 +35,7 @@ def get_cu_file_str(
 
 namespace flashinfer {{
 
-template cudaError_t SinglePrefillWithKVCacheDispatched<{group_size}, {head_dim}, {kv_layout}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {causal}, {dtype_in}, {dtype_out}>(
+template cudaError_t SinglePrefillWithKVCacheDispatched<{group_size}, {head_dim}, {kv_layout}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {dtype_in}, {dtype_out}>(
     {dtype_in}* q, {dtype_in}* k, {dtype_in}* v, {dtype_out}* o,
     float* tmp, float* lse, uint32_t num_kv_heads, uint32_t qo_len, uint32_t kv_len,
     float sm_scale, float rope_scale,
@@ -48,7 +48,7 @@ template cudaError_t SinglePrefillWithKVCacheDispatched<{group_size}, {head_dim}
         head_dim=head_dim,
         pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
         allow_fp16_qk_reduction=allow_fp16_qk_reduction,
-        causal=causal,
+        mask_mode=mask_mode_literal[int(mask_mode)],
         dtype_in=dtype_literal[dtype_in],
         dtype_out=dtype_literal[dtype_out],
     )
@@ -58,7 +58,7 @@ template cudaError_t SinglePrefillWithKVCacheDispatched<{group_size}, {head_dim}
 if __name__ == "__main__":
     pattern = (
         r"single_prefill_group_([0-9]+)_head_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
-        r"fp16qkred_([a-z]+)_causal_([a-z]+)_dtypein_([a-z0-9]+)_dtypeout_([a-z0-9]+)\.cu"
+        r"fp16qkred_([a-z]+)_mask_([0-9]+)_dtypein_([a-z0-9]+)_dtypeout_([a-z0-9]+)\.cu"
     )
 
     compiled_pattern = re.compile(pattern)
