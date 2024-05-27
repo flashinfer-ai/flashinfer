@@ -34,6 +34,10 @@ using namespace cub;
 constexpr BlockScanAlgorithm SCAN_ALGO = BLOCK_SCAN_WARP_SCANS;
 constexpr BlockReduceAlgorithm REDUCE_ALGO = BLOCK_REDUCE_WARP_REDUCTIONS;
 
+#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120100)
+#define FLASHINFER_CUB_SUBTRACTLEFT_DEFINED
+#endif
+
 template <typename T>
 struct Pair {
   T value;
@@ -106,8 +110,13 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
       greater_than_u[j] = inclusive_cdf[j] + aggregate > u;
     }
 
+#ifdef FLASHINFER_CUB_SUBTRACTLEFT_DEFINED
     BlockAdjacentDifference<bool, BLOCK_THREADS>(temp_storage->block_prim.adj_diff)
         .SubtractLeft<VEC_SIZE>(greater_than_u, greater_than_u, BoolDiffOp());
+#else
+    BlockAdjacentDifference<bool, BLOCK_THREADS>(temp_storage->block_prim.adj_diff)
+        .FlagHeads<VEC_SIZE>(greater_than_u, greater_than_u, BoolDiffOp());
+#endif
     __syncthreads();
 
 #pragma unroll
