@@ -9,7 +9,7 @@ Layout: NHD/HND
 FlashInfer provides two layouts for last 3 dimensions in KV-Cache: ``NHD`` and ``HND``:
 
 - ``NHD``: the last 3 dimensions are organized as ``(seq_len, num_heads, head_dim)``.
-- ``HND``: the last 3 dimensions are organized as ``(num_heads, head_dim, seq_len)``.
+- ``HND``: the last 3 dimensions are organized as ``(num_heads, seq_len, head_dim)``.
 
 The ``NHD`` layout is more natural because it's consistent with the output of
 :math:`xW_k` and :math:`xW_v` without transpose. The ``HND`` layout is more friendly
