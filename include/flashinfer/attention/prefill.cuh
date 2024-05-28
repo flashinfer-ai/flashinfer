@@ -910,7 +910,9 @@ template <bool partition_kv, uint32_t group_size, MaskMode mask_mode, QKVLayout 
           typename DTypeOut>
 __global__ void SinglePrefillWithKVCacheKernel(
     DTypeIn* __restrict__ q, DTypeIn* __restrict__ k, DTypeIn* __restrict__ v,
-    DTypeOut* __restrict__ o, void* __restrict__ tmp, float* __restrict__ lse,
+    DTypeOut* __restrict__ o,
+    float* __restrict__ custom_mask,
+    void* __restrict__ tmp, float* __restrict__ lse,
     const tensor_info_t<kv_layout, group_size, num_frags_y * 16> qkv_info, float sm_scale,
     const float log2_rope_rcp_scale, const float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
@@ -1049,10 +1051,16 @@ __global__ void SinglePrefillWithKVCacheKernel(
           alibi_slopes, s_frag);
     }
     // apply mask
-    if (iter >= mask_iteration) {
+    if constexpr (mask_mode == MaskMode::kCustom) {
       mask_s<partition_kv, mask_mode, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
-          qo_idx_base, chunk_start + iter * 16 * num_frags_z, qo_len, kv_len, chunk_end, nullptr,
+          qo_idx_base, chunk_start + iter * 16 * num_frags_z, qo_len, kv_len, chunk_end, custom_mask,
           s_frag);
+    } else {
+      if (iter >= mask_iteration) {
+        mask_s<partition_kv, mask_mode, group_size, num_warps, num_frags_x, num_frags_y, num_frags_z>(
+            qo_idx_base, chunk_start + iter * 16 * num_frags_z, qo_len, kv_len, chunk_end, nullptr,
+            s_frag);
+      }
     }
 
     // compute m,d states in online softmax
@@ -1336,7 +1344,10 @@ template <uint32_t group_size, uint32_t page_size, MaskMode mask_mode,
 __global__ void BatchPrefillWithPagedKVCacheKernel(
     IdType* __restrict__ request_indices, IdType* __restrict__ tile_indices,
     DTypeIn* __restrict__ q, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
-    IdType* __restrict__ qo_indptr, IdType* __restrict__ q_offset, DTypeOut* __restrict__ o,
+    IdType* __restrict__ qo_indptr,
+    float* __restrict__ custom_mask,
+    IdType* __restrict__ qk_indptr, 
+    IdType* __restrict__ q_offset, DTypeOut* __restrict__ o,
     float* __restrict__ tmp, float* __restrict__ lse, float sm_scale, float log2_rope_rcp_scale,
     float log2_rope_rcp_theta) {
   constexpr uint32_t rows_per_warp = 16 / (2 * group_size) * 2;
@@ -1481,10 +1492,16 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
           qo_idx_base, iter * 16 * num_frags_z, int(kv_len) - int(qo_len), alibi_slopes, s_frag);
     }
     // apply mask
-    if (iter >= mask_iteration) {
+    if constexpr (mask_mode == MaskMode::kCustom) {
       mask_s<partition_kv, mask_mode, aligned_group_size, num_warps, num_frags_x, num_frags_y,
-             num_frags_z>(qo_idx_base, iter * 16 * num_frags_z, qo_len, kv_len, kv_len, nullptr,
+            num_frags_z>(qo_idx_base, iter * 16 * num_frags_z, qo_len, kv_len, kv_len, custom_mask + qk_indptr[request_idx],
                           s_frag);
+    } else {
+      if (iter >= mask_iteration) {
+        mask_s<partition_kv, mask_mode, aligned_group_size, num_warps, num_frags_x, num_frags_y,
+              num_frags_z>(qo_idx_base, iter * 16 * num_frags_z, qo_len, kv_len, kv_len, nullptr,
+                            s_frag);
+      }
     }
 
     // compute m,d states in online softmax
@@ -1685,7 +1702,7 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
 template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
           PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename DTypeIn, typename DTypeOut>
-cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o,
+cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v, float* custom_mask, DTypeOut* o,
                                                float* tmp, float* lse, uint32_t num_kv_heads,
                                                uint32_t qo_len, uint32_t kv_len, float sm_scale,
                                                float rope_scale, float rope_theta,
@@ -1773,6 +1790,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
           void* args[] = {(void*)&q,
                           (void*)&k,
                           (void*)&v,
+                          (void*)&custom_mask,
                           (void*)&o,
                           (void*)&tmp,
                           (void*)&lse,
@@ -1791,6 +1809,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
           void* args[] = {(void*)&q,
                           (void*)&k,
                           (void*)&v,
+                          (void*)&custom_mask,
                           (void*)&o,
                           (void*)&tmp,
                           (void*)&lse,
@@ -1819,7 +1838,7 @@ template <uint32_t num_frags_x, uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayou
           typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, DTypeIn* k,
-    DTypeIn* v, IdType* kv_indptr, float* mask, IdType* qk_indptr, IdType* q_offset,
+    DTypeIn* v, IdType* kv_indptr, float* custom_mask, IdType* qk_indptr, IdType* q_offset,
     IdType* k_rope_pos_offset, DTypeOut* o, float* tmp, float* lse, const uint32_t batch_size,
     const uint32_t num_qo_tiles, const uint32_t num_kv_heads, const float sm_scale,
     const float rope_scale, const float rope_theta, cudaStream_t stream = nullptr) {
@@ -1877,7 +1896,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
                       (void*)&k,
                       (void*)&v,
                       (void*)&kv_indptr,
-                      (void*)&mask,
+                      (void*)&custom_mask,
                       (void*)&qk_indptr,
                       (void*)&q_offset,
                       (void*)&k_rope_pos_offset,
@@ -1899,7 +1918,9 @@ template <PageStorage page_storage, QKVLayout kv_layout, uint32_t num_frags_x, u
           bool ALLOW_FP16_QK_REDUCTION, MaskMode mask_mode, typename DTypeIn, typename DTypeOut,
           typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(
-    DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, IdType* q_offset,
+    DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr,
+    float* custom_mask, IdType* qk_indptr,
+    IdType* q_offset,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, DTypeOut* o, float* tmp,
     float* lse, uint32_t num_qo_tiles, float sm_scale, float rope_scale, float rope_theta,
     cudaStream_t stream) {
@@ -1957,6 +1978,8 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
                       (void*)&q,
                       (void*)&paged_kv,
                       (void*)&qo_indptr,
+                      (void*)&custom_mask,
+                      (void*)&qk_indptr,
                       (void*)&q_offset,
                       (void*)&o,
                       (void*)&tmp,

@@ -69,7 +69,9 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
                             GROUP_SIZE, HEAD_DIM, KV_LAYOUT, POS_ENCODING_MODE,
                             ALLOW_FP16_QK_REDUCTION, MASK_MODE>(
                             static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
-                            static_cast<c_type*>(v.data_ptr()), static_cast<c_type*>(o.data_ptr()),
+                            static_cast<c_type*>(v.data_ptr()),
+                            /*custom_mask=*/nullptr,
+                            static_cast<c_type*>(o.data_ptr()),
                             static_cast<float*>(tmp.data_ptr()),
                             /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
                             num_kv_heads, qo_len, kv_len, sm_scale, rope_scale, rope_theta,
