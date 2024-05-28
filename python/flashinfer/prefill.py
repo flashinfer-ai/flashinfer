@@ -375,7 +375,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
     ...     paged_kv_last_page_len,
     ...     num_qo_heads,
     ...     num_kv_heads,
-    ...     head_dim
+    ...     head_dim,
+    ...     page_size,
     ... )
     >>> outputs = []
     >>> for i in range(num_layers):
@@ -469,6 +470,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The number of key/value heads.
         head_dim : int
             The dimension of the heads.
+        page_size : int
+            The size of each page in the paged kv-cache.
         custom_mask : Optional[torch.Tensor]
             The flattened mask tensor, shape: ``(sum(q_len[i] * k_len[i] for i in range(batch_size))``.
             The mask tensor will be applied to the attention matrix before softmax if provided.
@@ -540,6 +543,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if :attr:`kv_layout` is ``HND``.
         causal : bool
             Whether to apply causal mask to the attention matrix.
+            This is only effective when :attr:`custom_mask` is not provided in
+            :meth:`begin_forward`.
         pos_encoding_mode : str
             Whether to apply RoPE on-the-fly inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
