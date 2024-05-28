@@ -65,8 +65,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("end_forward", &BatchPrefillWithPagedKVCachePyTorchWrapper::EndForward)
       .def("update_page_locked_buffer_size",
            &BatchPrefillWithPagedKVCachePyTorchWrapper::UpdatePageLockedBufferSize)
-      .def("forward", &BatchPrefillWithPagedKVCachePyTorchWrapper::Forward);
-  .def("forward_custom_mask", &BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCustomMask);
+      .def("forward", &BatchPrefillWithPagedKVCachePyTorchWrapper::Forward)
+      .def("forward_custom_mask", &BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCustomMask);
   py::class_<BatchPrefillWithRaggedKVCachePyTorchWrapper>(
       m, "BatchPrefillWithRaggedKVCachePyTorchWrapper")
       .def(py::init<unsigned int, unsigned int>())
@@ -74,6 +74,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("end_forward", &BatchPrefillWithRaggedKVCachePyTorchWrapper::EndForward)
       .def("update_page_locked_buffer_size",
            &BatchPrefillWithRaggedKVCachePyTorchWrapper::UpdatePageLockedBufferSize)
-      .def("forward", &BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward);
-  .def("forward_custom_mask", &BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardCustomMask);
+      .def("forward", &BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward)
+      .def("forward_custom_mask", &BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardCustomMask);
 }
