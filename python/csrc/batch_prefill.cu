@@ -30,8 +30,7 @@ void BatchPrefillWithPagedKVCachePyTorchWrapper::BeginForward(
   CHECK_DIM(1, qo_indptr);
   CHECK_DIM(1, workspace_buffer);
 
-  // TODO(Zihao): support dispatching to different index data types.
-  CHECK_EQ(qo_indptr.scalar_type(), torch::kInt32);
+  qo_indptr = qo_indptr.to(torch::kInt32);
   size_t workspace_size_in_bytes = workspace_buffer.size(0) * workspace_buffer.element_size();
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
   handler_->SetCUDAStream(torch_current_stream);
@@ -89,11 +88,10 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
   CHECK_EQ(paged_kv_last_page_len.size(0), batch_size);
   CHECK_EQ(paged_kv_data.size(1), 2);
   CHECK_EQ(paged_kv_data.size(4), head_dim);
-  // TODO(Zihao): support dispatching to different index data types.
-  CHECK_EQ(qo_indptr.scalar_type(), torch::kInt32);
-  CHECK_EQ(paged_kv_indptr.scalar_type(), torch::kInt32);
-  CHECK_EQ(paged_kv_indices.scalar_type(), torch::kInt32);
-  CHECK_EQ(paged_kv_last_page_len.scalar_type(), torch::kInt32);
+  qo_indptr = qo_indptr.to(torch::kInt32);
+  paged_kv_indptr = paged_kv_indptr.to(torch::kInt32);
+  paged_kv_indices = paged_kv_indices.to(torch::kInt32);
+  paged_kv_last_page_len = paged_kv_last_page_len.to(torch::kInt32);
 
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
   torch::Tensor o = torch::empty_like(q, q.options());
@@ -125,9 +123,9 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
                               int32_t>(
                               handler_.get(), static_cast<c_type*>(q.data_ptr()),
                               static_cast<int32_t*>(qo_indptr.data_ptr()),
+                              /*q_offset=*/nullptr, paged_kv,
                               /*custom_mask=*/nullptr,
-                              /*qk_indptr=*/nullptr,
-                              /*q_offset=*/nullptr, paged_kv, static_cast<c_type*>(o.data_ptr()),
+                              /*qk_indptr=*/nullptr, static_cast<c_type*>(o.data_ptr()),
                               /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
                               sm_scale, rope_scale, rope_theta,
                               /*stream=*/torch_current_stream);
@@ -154,15 +152,17 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
 std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCustomMask(
     torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor paged_kv_data,
     torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
-    torch::Tensor paged_kv_last_page_len, bool causal, unsigned int pos_encoding_mode,
-    bool allow_fp16_qk_reduction, float sm_scale, float rope_scale, float rope_theta,
-    bool return_lse) {
+    torch::Tensor paged_kv_last_page_len, torch::Tensor custom_mask, torch::Tensor qk_indptr,
+    unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction, float sm_scale, float rope_scale,
+    float rope_theta, bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(qo_indptr);
   CHECK_INPUT(paged_kv_data);
   CHECK_INPUT(paged_kv_indptr);
   CHECK_INPUT(paged_kv_indices);
   CHECK_INPUT(paged_kv_last_page_len);
+  CHECK_INPUT(custom_mask);
+  CHECK_INPUT(qk_indptr);
   CHECK_DIM(3, q);          // (nnz_qo, H_qo, D)
   CHECK_DIM(1, qo_indptr);  // (B + 1,)
   // [max_num_pages, 2, num_kv_heads, page_size, head_dim] for HND
@@ -171,6 +171,8 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCu
   CHECK_DIM(1, paged_kv_indptr);         // (B + 1,)
   CHECK_DIM(1, paged_kv_indices);        // (nnz_kv,)
   CHECK_DIM(1, paged_kv_last_page_len);  // (B,)
+  CHECK_DIM(1, custom_mask);             // (nnz_qk,)
+  CHECK_DIM(1, qk_indptr);               // (B + 1,)
   int64_t batch_size = qo_indptr.size(0) - 1;
   int64_t nnz_qo = q.size(0);
   int64_t num_qo_heads = q.size(1);
@@ -189,11 +191,13 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCu
   CHECK_EQ(paged_kv_last_page_len.size(0), batch_size);
   CHECK_EQ(paged_kv_data.size(1), 2);
   CHECK_EQ(paged_kv_data.size(4), head_dim);
-  // TODO(Zihao): support dispatching to different index data types.
-  CHECK_EQ(qo_indptr.scalar_type(), torch::kInt32);
-  CHECK_EQ(paged_kv_indptr.scalar_type(), torch::kInt32);
-  CHECK_EQ(paged_kv_indices.scalar_type(), torch::kInt32);
-  CHECK_EQ(paged_kv_last_page_len.scalar_type(), torch::kInt32);
+  CHECK_EQ(qk_indptr.size(0), batch_size + 1);
+  qo_indptr = qo_indptr.to(torch::kInt32);
+  paged_kv_indptr = paged_kv_indptr.to(torch::kInt32);
+  paged_kv_indices = paged_kv_indices.to(torch::kInt32);
+  paged_kv_last_page_len = paged_kv_last_page_len.to(torch::kInt32);
+  custom_mask = custom_mask.to(torch::kFloat32);
+  qk_indptr = qk_indptr.to(torch::kInt32);
 
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
   torch::Tensor o = torch::empty_like(q, q.options());
@@ -225,9 +229,10 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCu
                               int32_t>(
                               handler_.get(), static_cast<c_type*>(q.data_ptr()),
                               static_cast<int32_t*>(qo_indptr.data_ptr()),
-                              /*custom_mask=*/nullptr,
-                              /*qk_indptr=*/nullptr,
-                              /*q_offset=*/nullptr, paged_kv, static_cast<c_type*>(o.data_ptr()),
+                              /*q_offset=*/nullptr, paged_kv,
+                              static_cast<float*>(custom_mask.data_ptr()),
+                              static_cast<int32_t*>(qk_indptr.data_ptr()),
+                              static_cast<c_type*>(o.data_ptr()),
                               /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
                               sm_scale, rope_scale, rope_theta,
                               /*stream=*/torch_current_stream);
@@ -261,8 +266,7 @@ void BatchPrefillWithRaggedKVCachePyTorchWrapper::BeginForward(
   CHECK_DIM(1, qo_indptr);
   CHECK_DIM(1, workspace_buffer);
 
-  // TODO(Zihao): support dispatching to different index data types.
-  CHECK_EQ(qo_indptr.scalar_type(), torch::kInt32);
+  qo_indptr = qo_indptr.to(torch::kInt32);
   size_t workspace_size_in_bytes = workspace_buffer.size(0) * workspace_buffer.element_size();
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
   handler_->SetCUDAStream(torch_current_stream);
@@ -308,9 +312,8 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
   CHECK_EQ(k.size(2), v.size(2));
   CHECK_EQ(k.size(2), head_dim);
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
-  // TODO(Zihao): support dispatching to different index data types.
-  CHECK_EQ(qo_indptr.scalar_type(), torch::kInt32);
-  CHECK_EQ(kv_indptr.scalar_type(), torch::kInt32);
+  qo_indptr = qo_indptr.to(torch::kInt32);
+  kv_indptr = kv_indptr.to(torch::kInt32);
 
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
   torch::Tensor o = torch::empty_like(q, q.options());
@@ -393,7 +396,6 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardW
   CHECK_EQ(k.size(2), v.size(2));
   CHECK_EQ(k.size(2), head_dim);
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
-  // TODO(Zihao): support dispatching to different index data types.
   qo_indptr = qo_indptr.to(torch::kInt32);
   kv_indptr = kv_indptr.to(torch::kInt32);
   qk_indptr = qk_indptr.to(torch::kInt32);
