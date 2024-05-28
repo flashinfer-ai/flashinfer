@@ -21,7 +21,7 @@
 using namespace flashinfer;
 
 std::vector<torch::Tensor> single_prefill_with_kv_cache(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor tmp, unsigned int mask_mode,
+    torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor tmp, bool causal,
     unsigned int layout, unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction,
     float sm_scale, float rope_scale, float rope_theta, bool return_lse) {
   CHECK_INPUT(q);
@@ -54,7 +54,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
     lse = torch::empty({qo_len, num_qo_heads}, q.options().dtype(torch::kFloat32));
   }
 
-  MaskMode mask_mode = MaskMode(mask_mode_value);
+  const MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
     return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
