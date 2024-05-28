@@ -573,11 +573,11 @@ __device__ __forceinline__ void mask_s(const uint32_t qo_idx_base, const uint32_
                  ? (kv_idx > kv_len + q_idx - qo_len || (partition_kv && kv_idx >= chunk_end))
                  : kv_idx >= chunk_end);
         s_frag[fx][fz][reg_id] =
-            out_of_boundary
-                ? DTypeQKAccum(-5e4)
-                : s_frag[fx][fz][reg_id] + DTypeQKAccum(mask_mode == MaskMode::kCustom
-                                                            ? custom_mask[q_idx * kv_len + kv_idx]
-                                                            : 0.f);
+            out_of_boundary ? DTypeQKAccum(-5e4)
+                            : s_frag[fx][fz][reg_id] +
+                                  DTypeQKAccum((mask_mode == MaskMode::kCustom && q_idx < qo_len)
+                                                   ? custom_mask[q_idx * kv_len + kv_idx]
+                                                   : 0.f);
       }
     }
   }
