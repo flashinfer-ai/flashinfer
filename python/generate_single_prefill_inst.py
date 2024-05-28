@@ -41,7 +41,7 @@ def get_cu_file_str(
 namespace flashinfer {{
 
 template cudaError_t SinglePrefillWithKVCacheDispatched<{group_size}, {head_dim}, {kv_layout}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {dtype_in}, {dtype_out}>(
-    {dtype_in}* q, {dtype_in}* k, {dtype_in}* v, {dtype_out}* o,
+    {dtype_in}* q, {dtype_in}* k, {dtype_in}* v, float* custom_mask, {dtype_out}* o,
     float* tmp, float* lse, uint32_t num_kv_heads, uint32_t qo_len, uint32_t kv_len,
     float sm_scale, float rope_scale,
     float rope_theta, cudaStream_t stream);
