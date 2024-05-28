@@ -140,7 +140,7 @@ def single_prefill_with_kv_cache(
     if rope_theta is None:
         rope_theta = 1e4
     if custom_mask is not None:
-        return _kernels.single_prefill_with_kv_cache_custom_custom_mask(
+        return _kernels.single_prefill_with_kv_cache_custom_mask(
             q,
             k,
             v,
@@ -274,7 +274,7 @@ def single_prefill_with_kv_cache_return_lse(
         k = k.to(torch.float16)
         v = v.to(torch.float16)
     if custom_mask is not None:
-        return _kernels.single_prefill_with_kv_cache_custom_custom_mask(
+        return _kernels.single_prefill_with_kv_cache_custom_mask(
             q,
             k,
             v,
@@ -320,7 +320,7 @@ def _compute_page_qk_indptr(
     qk_indptr[1:] = torch.cumsum(
         (qo_indptr[1:] - qo_indptr[:-1])
         * (
-            (paged_kv_indptr[1:] - paged_kv_indptr[:-1]) * page_size
+            (paged_kv_indptr[1:] - paged_kv_indptr[:-1] - 1) * page_size
             + paged_kv_last_page_len
         ),
         0,
@@ -423,6 +423,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._paged_kv_indptr = None
         self._paged_kv_indices = None
         self._paged_kv_last_page_len = None
+        self._custom_mask = None
+        self._qk_indptr = None
 
     def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
         r"""Reset the workspace buffer.
@@ -487,6 +489,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._paged_kv_indices = paged_kv_indices
         self._paged_kv_last_page_len = paged_kv_last_page_len
         if custom_mask is not None:
+            self._custom_mask = custom_mask
             self._qk_indptr = _compute_page_qk_indptr(
                 qo_indptr,
                 paged_kv_indptr,
@@ -508,6 +511,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._paged_kv_indptr = None
         self._paged_kv_indices = None
         self._paged_kv_last_page_len = None
+        self._custom_mask = None
+        self._qk_indptr = None
         self._wrapper.end_forward()
 
     def forward(
@@ -571,21 +576,39 @@ class BatchPrefillWithPagedKVCacheWrapper:
             paged_kv_data = paged_kv_data.to(torch.float16)
 
         paged_kv_data = expand_5d(paged_kv_data, self._kv_layout)
-        return self._wrapper.forward(
-            q,
-            self._qo_indptr,
-            paged_kv_data,
-            self._paged_kv_indptr,
-            self._paged_kv_indices,
-            self._paged_kv_last_page_len,
-            causal,
-            PosEncodingMode[pos_encoding_mode].value,
-            allow_fp16_qk_reduction,
-            sm_scale,
-            rope_scale,
-            rope_theta,
-            False,
-        )[0]
+        if self._custom_mask is None:
+            return self._wrapper.forward(
+                q,
+                self._qo_indptr,
+                paged_kv_data,
+                self._paged_kv_indptr,
+                self._paged_kv_indices,
+                self._paged_kv_last_page_len,
+                causal,
+                PosEncodingMode[pos_encoding_mode].value,
+                allow_fp16_qk_reduction,
+                sm_scale,
+                rope_scale,
+                rope_theta,
+                False,
+            )[0]
+        else:
+            return self._wrapper.forward_custom_mask(
+                q,
+                self._qo_indptr,
+                paged_kv_data,
+                self._paged_kv_indptr,
+                self._paged_kv_indices,
+                self._paged_kv_last_page_len,
+                self._custom_mask,
+                self._qk_indptr,
+                PosEncodingMode[pos_encoding_mode].value,
+                allow_fp16_qk_reduction,
+                sm_scale,
+                rope_scale,
+                rope_theta,
+                False,
+            )[0]
 
     def forward_return_lse(
         self,
@@ -651,21 +674,39 @@ class BatchPrefillWithPagedKVCacheWrapper:
             paged_kv_data = paged_kv_data.to(torch.float16)
 
         paged_kv_data = expand_5d(paged_kv_data, self._kv_layout)
-        return self._wrapper.forward(
-            q,
-            self._qo_indptr,
-            paged_kv_data,
-            self._paged_kv_indptr,
-            self._paged_kv_indices,
-            self._paged_kv_last_page_len,
-            causal,
-            PosEncodingMode[pos_encoding_mode].value,
-            allow_fp16_qk_reduction,
-            sm_scale,
-            rope_scale,
-            rope_theta,
-            True,
-        )
+        if self._custom_mask is None:
+            return self._wrapper.forward(
+                q,
+                self._qo_indptr,
+                paged_kv_data,
+                self._paged_kv_indptr,
+                self._paged_kv_indices,
+                self._paged_kv_last_page_len,
+                causal,
+                PosEncodingMode[pos_encoding_mode].value,
+                allow_fp16_qk_reduction,
+                sm_scale,
+                rope_scale,
+                rope_theta,
+                True,
+            )
+        else:
+            return self._wrapper.forward(
+                q,
+                self._qo_indptr,
+                paged_kv_data,
+                self._paged_kv_indptr,
+                self._paged_kv_indices,
+                self._paged_kv_last_page_len,
+                self._custom_mask,
+                self._qk_indptr,
+                PosEncodingMode[pos_encoding_mode].value,
+                allow_fp16_qk_reduction,
+                sm_scale,
+                rope_scale,
+                rope_theta,
+                True,
+            )
 
 
 def _compute_qk_indptr(qo_indptr: torch.Tensor, kv_indptr: torch.Tensor):
@@ -815,8 +856,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._qo_indptr = qo_indptr
         self._kv_indptr = kv_indptr
         if custom_mask is not None:
-            self._qk_indptr = _compute_qk_indptr(qo_indptr, kv_indptr)
             self._custom_mask = custom_mask
+            self._qk_indptr = _compute_qk_indptr(qo_indptr, kv_indptr)
         self._wrapper.begin_forward(
             self._workspace_buffer,
             qo_indptr,
@@ -911,7 +952,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 False,
             )[0]
         else:
-            return self._wrapper.forward_custom_custom_mask(
+            return self._wrapper.forward_custom_mask(
                 q,
                 self._qo_indptr,
                 k,
@@ -1006,7 +1047,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 True,
             )
         else:
-            return self._wrapper.forward_custom_custom_mask(
+            return self._wrapper.forward_custom_mask(
                 q,
                 self._qo_indptr,
                 k,

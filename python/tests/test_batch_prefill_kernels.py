@@ -72,6 +72,7 @@ def test_batch_prefill_with_paged_kv_cache(
         num_qo_heads,
         num_kv_heads,
         head_dim,
+        page_size,
     )
     o = wrapper.forward(q, kv_data, causal=causal, pos_encoding_mode=pos_encoding_mode)
 
@@ -115,6 +116,90 @@ def test_batch_prefill_with_paged_kv_cache(
         o_i_np = o[q_indptr[i] : q_indptr[i + 1]].cpu().numpy()
         o_ref_i_np = o_ref_i.cpu().numpy()
         numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("batch_size", [12, 17])
+@pytest.mark.parametrize("kv_len", [54, 97])
+@pytest.mark.parametrize("qo_len", [37, 17])
+@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
+def test_batch_prefill_with_paged_kv_cache_custom_mask(
+    batch_size,
+    kv_len,
+    qo_len,
+    page_size,
+    num_kv_heads,
+    num_qo_heads,
+    head_dim,
+    kv_layout,
+    pos_encoding_mode,
+):
+    q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
+    q_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    kv_data = (
+        torch.randn(total_num_pages, 2, num_kv_heads, page_size, head_dim).to(0).half()
+        if kv_layout == "HND"
+        else torch.randn(total_num_pages, 2, page_size, num_kv_heads, head_dim)
+        .to(0)
+        .half()
+    )
+    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * num_pages_per_seq
+    kv_indices = torch.arange(0, total_num_pages).to(0).int()
+    kv_last_page_len = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
+    ).to(0)
+
+    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout
+    )
+    custom_mask = (
+        torch.triu(
+            torch.full((batch_size, qo_len, kv_len), -5e4, dtype=torch.float32),
+            diagonal=(kv_len - qo_len + 1),
+        )
+        .reshape(-1)
+        .to(0)
+    )
+
+    # use custom mask
+    wrapper.begin_forward(
+        q_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        custom_mask,
+    )
+    o_custom = wrapper.forward(q, kv_data, pos_encoding_mode=pos_encoding_mode)
+    wrapper.end_forward()
+
+    # use causal
+    wrapper.begin_forward(
+        q_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        page_size,
+        head_dim,
+    )
+    o_causal = wrapper.forward(
+        q, kv_data, causal=True, pos_encoding_mode=pos_encoding_mode
+    )
+    numpy.testing.assert_allclose(
+        o_custom.cpu().numpy(), o_causal.cpu().numpy(), rtol=1e-3, atol=1e-3
+    )
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -169,6 +254,61 @@ def test_batch_prefill_with_ragged_kv_cache(
         numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("batch_size", [12, 17])
+@pytest.mark.parametrize("kv_len", [54, 97])
+@pytest.mark.parametrize("qo_len", [37, 17])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
+def test_batch_prefill_with_ragged_kv_cache_custom_mask(
+    batch_size,
+    kv_len,
+    qo_len,
+    num_kv_heads,
+    num_qo_heads,
+    head_dim,
+    pos_encoding_mode,
+):
+    kv_layout = "NHD"
+    q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
+    q_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
+
+    k = torch.randn(batch_size * kv_len, num_kv_heads, head_dim).to(0).half()
+    v = torch.randn(batch_size * kv_len, num_kv_heads, head_dim).to(0).half()
+    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len
+
+    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace_buffer, kv_layout
+    )
+
+    custom_mask = (
+        torch.triu(
+            torch.full((batch_size, qo_len, kv_len), -5e4, dtype=torch.float32),
+            diagonal=(kv_len - qo_len + 1),
+        )
+        .reshape(-1)
+        .to(0)
+    )
+
+    # use custom mask
+    wrapper.begin_forward(
+        q_indptr, kv_indptr, num_qo_heads, num_kv_heads, head_dim, custom_mask
+    )
+    o_custom = wrapper.forward(q, k, v, pos_encoding_mode=pos_encoding_mode)
+    wrapper.end_forward()
+
+    # use causal
+    wrapper.begin_forward(q_indptr, kv_indptr, num_qo_heads, num_kv_heads, head_dim)
+    o_causal = wrapper.forward(
+        q, k, v, causal=True, pos_encoding_mode=pos_encoding_mode
+    )
+    numpy.testing.assert_allclose(
+        o_custom.cpu().numpy(), o_causal.cpu().numpy(), rtol=1e-3, atol=1e-3
+    )
+
+
 if __name__ == "__main__":
     test_batch_prefill_with_paged_kv_cache(
         12, 54, 37, 8, 8, 8, 128, True, "HND", "NONE"
@@ -176,4 +316,8 @@ if __name__ == "__main__":
     test_batch_prefill_with_paged_kv_cache(
         12, 54, 37, 1, 8, 8, 128, True, "HND", "NONE"
     )
+    test_batch_prefill_with_paged_kv_cache_custom_mask(
+        12, 137, 137, 1, 8, 8, 128, "HND", "NONE"
+    )
     test_batch_prefill_with_ragged_kv_cache(12, 54, 37, 8, 8, 128, True, "NONE")
+    test_batch_prefill_with_ragged_kv_cache_custom_mask(12, 137, 137, 8, 8, 128, "NONE")

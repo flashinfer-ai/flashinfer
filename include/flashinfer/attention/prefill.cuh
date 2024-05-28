@@ -905,7 +905,7 @@ template <bool partition_kv, uint32_t group_size, MaskMode mask_mode, QKVLayout 
           typename DTypeOut>
 __global__ void SinglePrefillWithKVCacheKernel(
     DTypeIn* __restrict__ q, DTypeIn* __restrict__ k, DTypeIn* __restrict__ v,
-    DTypeOut* __restrict__ o, float* __restrict__ custom_mask, void* __restrict__ tmp,
+    float* __restrict__ custom_mask, DTypeOut* __restrict__ o, void* __restrict__ tmp,
     float* __restrict__ lse, const tensor_info_t<kv_layout, group_size, num_frags_y * 16> qkv_info,
     float sm_scale, const float log2_rope_rcp_scale, const float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);

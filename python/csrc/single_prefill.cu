@@ -98,9 +98,8 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
 
 std::vector<torch::Tensor> single_prefill_with_kv_cache_custom_mask(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor custom_mask, torch::Tensor tmp,
-    unsigned int mask_mode, unsigned int layout, unsigned int pos_encoding_mode,
-    bool allow_fp16_qk_reduction, float sm_scale, float rope_scale, float rope_theta,
-    bool return_lse) {
+    unsigned int layout, unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction,
+    float sm_scale, float rope_scale, float rope_theta, bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(k);
   CHECK_INPUT(v);

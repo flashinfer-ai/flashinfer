@@ -36,7 +36,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
     float sm_scale, float rope_scale, float rope_theta, bool return_lse);
 
 std::vector<torch::Tensor> single_prefill_with_kv_cache_custom_mask(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor tmp, torch::Tensor custom_mask,
+    torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor custom_mask, torch::Tensor tmp,
     unsigned int layout, unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction,
     float sm_scale, float rope_scale, float rope_theta, bool return_lse);
 
