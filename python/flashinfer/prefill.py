@@ -83,6 +83,8 @@ def single_prefill_with_kv_cache(
         ``HND``.
     custom_mask : Optional[torch.Tensor]
         The custom mask tensor, shape: ``[qo_len, kv_len]``.
+        If provided, the custom mask will be added to the attention matrix before
+        softmax and after scaling, and the :attr:`causal` parameter will be ignored.
     causal : bool
         Whether to apply causal mask to the attention matrix.
         This is only effective when :attr:`custom_mask` is not provided.
@@ -201,6 +203,8 @@ def single_prefill_with_kv_cache_return_lse(
         ``HND``.
     custom_mask : Optional[torch.Tensor]
         The custom_mask tensor, shape: ``[qo_len, kv_len]``.
+        If provided, the custom mask will be added to the attention matrix before
+        softmax and after scaling, and the :attr:`causal` parameter will be ignored.
     causal : bool
         Whether to apply causal mask to the attention matrix.
         This is only effective when :attr:`custom_mask` is not provided.
@@ -474,7 +478,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The size of each page in the paged kv-cache.
         custom_mask : Optional[torch.Tensor]
             The flattened mask tensor, shape: ``(sum(q_len[i] * k_len[i] for i in range(batch_size))``.
-            The mask tensor will be applied to the attention matrix before softmax if provided.
+            If provided, the custom mask will be added to the attention matrix before softmax
+            and after scaling. The mask tensor should be in the same device as the input tensors.
+
+            Please refer to the :ref:`mask layout <mask-layout>` for more details about flattened
+            layout of mask tensor.
 
         Notes
         -----
@@ -845,7 +853,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The dimension of the heads.
         custom_mask : Optional[torch.Tensor]
             The flattened mask tensor, shape: ``(sum(q_len[i] * k_len[i] for i in range(batch_size))``.
-            The mask tensor will be added to the attention matrix before softmax.
+            If provided, the custom mask will be added to the attention matrix before softmax
+            and after scaling. The mask tensor should be in the same device as the input tensors.
+
+            Please refer to the :ref:`mask layout <mask-layout>` for more details about flattened
+            layout of mask tensor.
 
         Notes
         -----
