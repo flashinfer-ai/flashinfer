@@ -16,7 +16,12 @@ limitations under the License.
 
 import argparse
 from pathlib import Path
-from literal_map import kv_layout_literal, pos_encoding_mode_literal, bool_literal
+from literal_map import (
+    kv_layout_literal,
+    pos_encoding_mode_literal,
+    bool_literal,
+    mask_mode_literal,
+)
 
 
 def get_dispatch_inc_str(args: argparse.Namespace) -> str:
@@ -90,15 +95,17 @@ def get_dispatch_inc_str(args: argparse.Namespace) -> str:
 {dispatch_allow_fp16_qk_reduction_entries}
 // EOL
 """
-    # causal
-    dispatch_causal_entries = "\n".join(
+    # mask_mode
+    dispatch_mask_mode_entries = "\n".join(
         [
-            "  _DISPATCH_CASE({}, case_var, __VA_ARGS__) \\".format(bool_literal[_])
-            for _ in args.causals
+            "  _DISPATCH_CASE({}, case_var, __VA_ARGS__) \\".format(
+                mask_mode_literal[_]
+            )
+            for _ in args.mask_modes
         ]
     )
-    dispatch_causal_str = f"""#define _DISPATCH_CASES_causal(case_var, ...)         \\
-{dispatch_causal_entries}
+    dispatch_mask_mode_str = f"""#define _DISPATCH_CASES_mask_mode(case_var, ...)         \\
+{dispatch_mask_mode_entries}
 // EOL
 """
 
@@ -110,7 +117,7 @@ def get_dispatch_inc_str(args: argparse.Namespace) -> str:
             dispatch_kv_layouts_str,
             dispatch_pos_encoding_modes_str,
             dispatch_allow_fp16_qk_reductions_str,
-            dispatch_causal_str,
+            dispatch_mask_mode_str,
         ]
     )
 
@@ -151,11 +158,11 @@ if __name__ == "__main__":
         help="Allow fp16 qk reductions",
     )
     parser.add_argument(
-        "--causals",
-        type=lambda x: x if isinstance(x, int) else x.lower() == "true",
+        "--mask_modes",
+        type=int,
         required=True,
         nargs="+",
-        help="Causals",
+        help="Mask modes",
     )
     args = parser.parse_args()
     print(args)

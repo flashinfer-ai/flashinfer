@@ -14,6 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+mask_mode_literal = {
+    0: "MaskMode::kNone",
+    1: "MaskMode::kCausal",
+    2: "MaskMode::kCustom",
+}
+
 kv_layout_literal = {
     0: "QKVLayout::kNHD",
     1: "QKVLayout::kHND",

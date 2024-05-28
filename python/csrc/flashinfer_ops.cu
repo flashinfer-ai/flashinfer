@@ -22,6 +22,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Single-request decode with KV-Cache operator");
   m.def("single_prefill_with_kv_cache", &single_prefill_with_kv_cache,
         "Single-request prefill with KV-Cache operator, return logsumexp");
+  m.def(
+      "single_prefill_with_kv_cache_custom_mask", &single_prefill_with_kv_cache_custom_mask,
+      "Single-request prefill with KV-Cache operator, user defined custom mask, return logsumexp");
   m.def("append_paged_kv_cache", &append_paged_kv_cache, "Append paged KV-Cache operator");
   m.def("merge_state", &merge_state, "Merge two self-attention states");
   m.def("merge_state_in_place", &merge_state_in_place,
@@ -62,7 +65,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("end_forward", &BatchPrefillWithPagedKVCachePyTorchWrapper::EndForward)
       .def("update_page_locked_buffer_size",
            &BatchPrefillWithPagedKVCachePyTorchWrapper::UpdatePageLockedBufferSize)
-      .def("forward", &BatchPrefillWithPagedKVCachePyTorchWrapper::Forward);
+      .def("forward", &BatchPrefillWithPagedKVCachePyTorchWrapper::Forward)
+      .def("forward_custom_mask", &BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCustomMask);
   py::class_<BatchPrefillWithRaggedKVCachePyTorchWrapper>(
       m, "BatchPrefillWithRaggedKVCachePyTorchWrapper")
       .def(py::init<unsigned int, unsigned int>())
@@ -70,5 +74,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("end_forward", &BatchPrefillWithRaggedKVCachePyTorchWrapper::EndForward)
       .def("update_page_locked_buffer_size",
            &BatchPrefillWithRaggedKVCachePyTorchWrapper::UpdatePageLockedBufferSize)
-      .def("forward", &BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward);
+      .def("forward", &BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward)
+      .def("forward_custom_mask", &BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardCustomMask);
 }

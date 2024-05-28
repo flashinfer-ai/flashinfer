@@ -24,7 +24,7 @@ set(FLASHINFER_GEN_HEAD_DIMS 64 128 256)
 set(FLASHINFER_GEN_KV_LAYOUTS 0 1)
 set(FLASHINFER_GEN_POS_ENCODING_MODES 0 1 2)
 set(FLASHINFER_GEN_ALLOW_FP16_QK_REDUCTIONS "false" "true")
-set(FLASHINFER_GEN_CASUALS "false" "true")
+set(FLASHINFER_GEN_MASK_MODES 0 1)
 
 # Set target cuda architectures for tests/benchmarks, defaults to native.
 # "native" is a special value for CMAKE_CUDA_ARCHITECTURES which means use the architectures of the host's GPU.

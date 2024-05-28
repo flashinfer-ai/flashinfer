@@ -81,7 +81,7 @@ set (HEAD_DIMS ${FLASHINFER_GEN_HEAD_DIMS})
 set (KV_LAYOUTS ${FLASHINFER_GEN_KV_LAYOUTS})
 set (POS_ENCODING_MODES ${FLASHINFER_GEN_POS_ENCODING_MODES})
 set (ALLOW_FP16_QK_REDUCTIONS ${FLASHINFER_GEN_ALLOW_FP16_QK_REDUCTIONS})
-set (CAUSALS ${FLASHINFER_GEN_CASUALS})
+set (MASK_MODES ${FLASHINFER_GEN_MASK_MODES})
 set (DECODE_DTYPES "f16")
 set (PREFILL_DTYPES "f16")
 set (DECODE_F8_DTYPES)
@@ -104,14 +104,14 @@ message(STATUS "FLASHINFER_HEAD_DIMS=${HEAD_DIMS}")
 message(STATUS "FLASHINFER_KV_LAYOUTS=${KV_LAYOUTS}")
 message(STATUS "FLASHINFER_POS_ENCODING_MODES=${POS_ENCODING_MODES}")
 message(STATUS "FLASHINFER_ALLOW_FP16_QK_REDUCTIONS=${ALLOW_FP16_QK_REDUCTIONS}")
-message(STATUS "FLASHINFER_CAUSALS=${CAUSALS}")
+message(STATUS "FLASHINFER_MASK_MODES=${MASK_MODES}")
 
 file(MAKE_DIRECTORY ${PROJECT_SOURCE_DIR}/src/generated)
 
 set(dispatch_inc_file ${PROJECT_SOURCE_DIR}/src/dispatch.inc)
 add_custom_command(
   OUTPUT ${dispatch_inc_file}
-  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_dispatch_inc.py --path ${PROJECT_SOURCE_DIR}/src/dispatch.inc --head_dims ${HEAD_DIMS} --page_sizes ${FLASHINFER_GEN_PAGE_SIZES} --group_sizes ${GROUP_SIZES} --kv_layouts ${KV_LAYOUTS} --pos_encoding_modes ${POS_ENCODING_MODES} --allow_fp16_qk_reductions ${ALLOW_FP16_QK_REDUCTIONS} --causals ${CAUSALS}
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_dispatch_inc.py --path ${PROJECT_SOURCE_DIR}/src/dispatch.inc --head_dims ${HEAD_DIMS} --page_sizes ${FLASHINFER_GEN_PAGE_SIZES} --group_sizes ${GROUP_SIZES} --kv_layouts ${KV_LAYOUTS} --pos_encoding_modes ${POS_ENCODING_MODES} --allow_fp16_qk_reductions ${ALLOW_FP16_QK_REDUCTIONS} --mask_modes ${MASK_MODES}
   DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_dispatch_inc.py
   COMMENT "Generating additional source file ${generated_dispatch_inc}"
   VERBATIM
@@ -225,9 +225,9 @@ foreach(group_size IN LISTS GROUP_SIZES)
     foreach(kv_layout IN LISTS KV_LAYOUTS)
       foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
         foreach(allow_fp16_qk_reduction IN LISTS ALLOW_FP16_QK_REDUCTIONS)
-          foreach(causal IN LISTS CAUSALS)
+          foreach(mask_mode IN LISTS MASK_MODES)
             foreach(dtype IN LISTS PREFILL_DTYPES)
-              set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_prefill_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_causal_${causal}_dtypein_${dtype}_dtypeout_${dtype}.cu)
+              set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_prefill_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypein_${dtype}_dtypeout_${dtype}.cu)
               add_custom_command(
                 OUTPUT ${generated_kernel_src}
                 COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_single_prefill_inst.py ${generated_kernel_src}
@@ -237,7 +237,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
               )
               list(APPEND single_prefill_kernels_src ${generated_kernel_src})
             endforeach(dtype)
-          endforeach(causal)
+          endforeach(mask_mode)
         endforeach(allow_fp16_qk_reduction)
       endforeach(pos_encoding_mode)
     endforeach(kv_layout)
@@ -251,10 +251,10 @@ foreach(group_size IN LISTS GROUP_SIZES)
       foreach(kv_layout IN LISTS KV_LAYOUTS)
         foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
           foreach(allow_fp16_qk_reduction IN LISTS ALLOW_FP16_QK_REDUCTIONS)
-            foreach(causal IN LISTS CAUSALS)
+            foreach(mask_mode IN LISTS MASK_MODES)
               foreach(dtype IN LISTS PREFILL_DTYPES)
                 foreach(idtype IN LISTS IDTYPES)
-                  set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_prefill_group_${group_size}_page_${page_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_causal_${causal}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
+                  set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_prefill_group_${group_size}_page_${page_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
                   add_custom_command(
                     OUTPUT ${generated_kernel_src}
                     COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py ${generated_kernel_src}
@@ -265,7 +265,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
                   list(APPEND batch_paged_prefill_kernels_src ${generated_kernel_src})
                 endforeach(idtype)
               endforeach(dtype)
-            endforeach(causal)
+            endforeach(mask_mode)
           endforeach(allow_fp16_qk_reduction)
         endforeach(pos_encoding_mode)
       endforeach(kv_layout)
@@ -279,10 +279,10 @@ foreach(group_size IN LISTS GROUP_SIZES)
     foreach(kv_layout IN LISTS KV_LAYOUTS)
       foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
         foreach(allow_fp16_qk_reduction IN LISTS ALLOW_FP16_QK_REDUCTIONS)
-          foreach(causal IN LISTS CAUSALS)
+          foreach(mask_mode IN LISTS MASK_MODES)
             foreach(dtype IN LISTS PREFILL_DTYPES)
               foreach(idtype IN LISTS IDTYPES)
-                set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_ragged_prefill_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_causal_${causal}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
+                set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_ragged_prefill_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
                 add_custom_command(
                   OUTPUT ${generated_kernel_src}
                   COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_ragged_prefill_inst.py ${generated_kernel_src}
@@ -293,7 +293,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
                 list(APPEND batch_ragged_prefill_kernels_src ${generated_kernel_src})
               endforeach(idtype)
             endforeach(dtype)
-          endforeach(causal)
+          endforeach(mask_mode)
         endforeach(allow_fp16_qk_reduction)
       endforeach(pos_encoding_mode)
     endforeach(kv_layout)

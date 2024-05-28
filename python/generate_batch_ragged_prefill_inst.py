@@ -17,6 +17,7 @@ limitations under the License.
 import sys
 import re
 from literal_map import (
+    mask_mode_literal,
     kv_layout_literal,
     pos_encoding_mode_literal,
     dtype_literal,
@@ -31,7 +32,7 @@ def get_cu_file_str(
     kv_layout,
     pos_encoding_mode,
     allow_fp16_qk_reduction,
-    causal,
+    mask_mode,
     dtype_in,
     dtype_out,
     idtype,
@@ -39,9 +40,11 @@ def get_cu_file_str(
     num_frags_x_choices = [1, 2]
     insts = "\n".join(
         [
-            """template cudaError_t BatchPrefillWithRaggedKVCacheDispatched<{num_frags_x}, {group_size}, {head_dim}, {kv_layout}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {causal}, {dtype_in}, {dtype_out}, {idtype}>(
+            """template cudaError_t BatchPrefillWithRaggedKVCacheDispatched<{num_frags_x}, {group_size}, {head_dim}, {kv_layout}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {dtype_in}, {dtype_out}, {idtype}>(
     {dtype_in}* q, {idtype}* request_indices, {idtype}* tile_indices, {idtype}* qo_indptr,
-    {dtype_in}* k, {dtype_in}* v, {idtype}* kv_indptr, {idtype}* q_offset, {idtype}* k_rope_pos_offset,
+    {dtype_in}* k, {dtype_in}* v, {idtype}* kv_indptr,
+    float* custom_mask, {idtype}* qk_indptr,
+    {idtype}* q_offset, {idtype}* k_rope_pos_offset,
     {dtype_out}* o, float* tmp, float* lse,
     uint32_t batch_size, uint32_t num_qo_tiles, uint32_t num_kv_heads,
     float sm_scale, float rope_scale,
@@ -53,7 +56,7 @@ def get_cu_file_str(
                 head_dim=head_dim,
                 pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
                 allow_fp16_qk_reduction=allow_fp16_qk_reduction,
-                causal=causal,
+                mask_mode=mask_mode_literal[int(mask_mode)],
                 dtype_in=dtype_literal[dtype_in],
                 dtype_out=dtype_literal[dtype_out],
                 idtype=idtype_literal[idtype],
@@ -76,7 +79,7 @@ namespace flashinfer {{
 if __name__ == "__main__":
     pattern = (
         r"batch_ragged_prefill_group_([0-9]+)_head_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
-        r"fp16qkred_([a-z]+)_causal_([a-z]+)_dtypein_([a-z0-9]+)_dtypeout_([a-z0-9]+)_idtype_([a-z0-9]+)\.cu"
+        r"fp16qkred_([a-z]+)_mask_([0-9]+)_dtypein_([a-z0-9]+)_dtypeout_([a-z0-9]+)_idtype_([a-z0-9]+)\.cu"
     )
     compiled_pattern = re.compile(pattern)
     path = Path(sys.argv[1])

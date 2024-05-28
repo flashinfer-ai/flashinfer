@@ -583,6 +583,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
     ...     num_qo_heads,
     ...     num_kv_heads,
     ...     head_dim,
+    ...     page_size,
     ... )
     >>> outputs = []
     >>> for i in range(num_layers):
@@ -646,6 +647,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
+        page_size: int,
     ):
         r"""Create auxiliary data structures for shared-prefix batch prefill/append
         attention for multiple forward calls within the same prefill/append step.
@@ -667,6 +669,8 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
             The number of key/value heads.
         head_dim : int
             The dimension of the heads.
+        page_size : int
+            The page size of the paged kv-cache.
 
         Notes
         -----
@@ -687,6 +691,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
             num_qo_heads,
             num_kv_heads,
             head_dim,
+            page_size,
         )
 
     def end_forward(self):
