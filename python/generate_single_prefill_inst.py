@@ -16,7 +16,12 @@ limitations under the License.
 
 import sys
 import re
-from literal_map import kv_layout_literal, pos_encoding_mode_literal, dtype_literal, mask_mode_literal
+from literal_map import (
+    kv_layout_literal,
+    pos_encoding_mode_literal,
+    dtype_literal,
+    mask_mode_literal,
+)
 from pathlib import Path
 
 

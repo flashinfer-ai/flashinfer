@@ -16,7 +16,12 @@ limitations under the License.
 
 import argparse
 from pathlib import Path
-from literal_map import kv_layout_literal, pos_encoding_mode_literal, bool_literal, mask_mode_literal
+from literal_map import (
+    kv_layout_literal,
+    pos_encoding_mode_literal,
+    bool_literal,
+    mask_mode_literal,
+)
 
 
 def get_dispatch_inc_str(args: argparse.Namespace) -> str:
@@ -93,7 +98,9 @@ def get_dispatch_inc_str(args: argparse.Namespace) -> str:
     # mask_mode
     dispatch_mask_mode_entries = "\n".join(
         [
-            "  _DISPATCH_CASE({}, case_var, __VA_ARGS__) \\".format(mask_mode_literal[_])
+            "  _DISPATCH_CASE({}, case_var, __VA_ARGS__) \\".format(
+                mask_mode_literal[_]
+            )
             for _ in args.mask_modes
         ]
     )

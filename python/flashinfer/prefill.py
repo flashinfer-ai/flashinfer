@@ -57,6 +57,7 @@ def single_prefill_with_kv_cache(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    custom_mask: Optional[torch.Tensor] = None,
     causal: bool = False,
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
@@ -80,8 +81,11 @@ def single_prefill_with_kv_cache(
         The key tensor, shape: ``[kv_len, num_kv_heads, head_dim]`` if :attr:`kv_layout`
         is ``NHD``, ``[num_kv_heads, kv_len, head_dim]`` if :attr:`kv_layout` is
         ``HND``.
+    custom_mask : Optional[torch.Tensor]
+        The custom mask tensor, shape: ``[qo_len, kv_len]``.
     causal : bool
         Whether to apply causal mask to the attention matrix.
+        This is only effective when :attr:`custom_mask` is not provided.
     kv_layout : str
         The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
     pos_encoding_mode : str
@@ -135,26 +139,43 @@ def single_prefill_with_kv_cache(
         rope_scale = 1.0
     if rope_theta is None:
         rope_theta = 1e4
-    return _kernels.single_prefill_with_kv_cache(
-        q,
-        k,
-        v,
-        tmp,
-        causal,
-        TensorLayout[kv_layout].value,
-        PosEncodingMode[pos_encoding_mode].value,
-        allow_fp16_qk_reduction,
-        sm_scale,
-        rope_scale,
-        rope_theta,
-        False,
-    )[0]
+    if custom_mask is not None:
+        return _kernels.single_prefill_with_kv_cache_custom_custom_mask(
+            q,
+            k,
+            v,
+            tmp,
+            custom_mask,
+            TensorLayout[kv_layout].value,
+            PosEncodingMode[pos_encoding_mode].value,
+            allow_fp16_qk_reduction,
+            sm_scale,
+            rope_scale,
+            rope_theta,
+            False,
+        )[0]
+    else:
+        return _kernels.single_prefill_with_kv_cache(
+            q,
+            k,
+            v,
+            tmp,
+            causal,
+            TensorLayout[kv_layout].value,
+            PosEncodingMode[pos_encoding_mode].value,
+            allow_fp16_qk_reduction,
+            sm_scale,
+            rope_scale,
+            rope_theta,
+            False,
+        )[0]
 
 
 def single_prefill_with_kv_cache_return_lse(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    custom_mask: Optional[torch.Tensor] = None,
     causal: bool = False,
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
@@ -178,8 +199,11 @@ def single_prefill_with_kv_cache_return_lse(
         The key tensor, shape: ``[kv_len, num_kv_heads, head_dim]`` if :attr:`kv_layout`
         is ``NHD``, or ``[num_kv_heads, kv_len, head_dim]`` if :attr:`kv_layout` is
         ``HND``.
+    custom_mask : Optional[torch.Tensor]
+        The custom_mask tensor, shape: ``[qo_len, kv_len]``.
     causal : bool
         Whether to apply causal mask to the attention matrix.
+        This is only effective when :attr:`custom_mask` is not provided.
     kv_layout : str
         The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
     pos_encoding_mode : str
@@ -249,20 +273,59 @@ def single_prefill_with_kv_cache_return_lse(
         q = q.to(torch.float16)
         k = k.to(torch.float16)
         v = v.to(torch.float16)
-    return _kernels.single_prefill_with_kv_cache(
-        q,
-        k,
-        v,
-        tmp,
-        causal,
-        TensorLayout[kv_layout].value,
-        PosEncodingMode[pos_encoding_mode].value,
-        allow_fp16_qk_reduction,
-        sm_scale,
-        rope_scale,
-        rope_theta,
-        True,
+    if custom_mask is not None:
+        return _kernels.single_prefill_with_kv_cache_custom_custom_mask(
+            q,
+            k,
+            v,
+            tmp,
+            custom_mask,
+            TensorLayout[kv_layout].value,
+            PosEncodingMode[pos_encoding_mode].value,
+            allow_fp16_qk_reduction,
+            sm_scale,
+            rope_scale,
+            rope_theta,
+            True,
+        )
+    else:
+        return _kernels.single_prefill_with_kv_cache(
+            q,
+            k,
+            v,
+            tmp,
+            causal,
+            TensorLayout[kv_layout].value,
+            PosEncodingMode[pos_encoding_mode].value,
+            allow_fp16_qk_reduction,
+            sm_scale,
+            rope_scale,
+            rope_theta,
+            True,
+        )
+
+
+def _compute_page_qk_indptr(
+    qo_indptr: torch.Tensor,
+    paged_kv_indptr: torch.Tensor,
+    paged_kv_last_page_len: torch.Tensor,
+    page_size: int,
+):
+    if len(qo_indptr) != len(paged_kv_indptr):
+        raise ValueError(
+            "The length of qo_indptr and paged_kv_indptr should be the same."
+        )
+    qk_indptr = torch.empty_like(qo_indptr)
+    qk_indptr[0] = 0
+    qk_indptr[1:] = torch.cumsum(
+        (qo_indptr[1:] - qo_indptr[:-1])
+        * (
+            (paged_kv_indptr[1:] - paged_kv_indptr[:-1]) * page_size
+            + paged_kv_last_page_len
+        ),
+        0,
     )
+    return qk_indptr
 
 
 class BatchPrefillWithPagedKVCacheWrapper:
@@ -381,6 +444,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
+        page_size: int,
+        custom_mask: Optional[torch.Tensor] = None,
     ):
         r"""Create auxiliary data structures for batch prefill/append attention for
         multiple forward calls within the same prefill/append step.
@@ -402,6 +467,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The number of key/value heads.
         head_dim : int
             The dimension of the heads.
+        custom_mask : Optional[torch.Tensor]
+            The flattened mask tensor, shape: ``(sum(q_len[i] * k_len[i] for i in range(batch_size))``.
+            The mask tensor will be applied to the attention matrix before softmax if provided.
 
         Notes
         -----
@@ -418,6 +486,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._paged_kv_indptr = paged_kv_indptr
         self._paged_kv_indices = paged_kv_indices
         self._paged_kv_last_page_len = paged_kv_last_page_len
+        if custom_mask is not None:
+            self._qk_indptr = _compute_page_qk_indptr(
+                qo_indptr,
+                paged_kv_indptr,
+                paged_kv_last_page_len,
+                page_size,
+            )
         self._wrapper.begin_forward(
             self._workspace_buffer,
             qo_indptr,
@@ -593,9 +668,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         )
 
 
-def _compute_qk_indptr(
-    qo_indptr: torch.Tensor, kv_indptr: torch.Tensor
-):
+def _compute_qk_indptr(qo_indptr: torch.Tensor, kv_indptr: torch.Tensor):
     if len(qo_indptr) != len(kv_indptr):
         raise ValueError("The length of qo_indptr and kv_indptr should be the same.")
     qk_indptr = torch.empty_like(qo_indptr)
@@ -686,7 +759,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         )
         self._qo_indptr = None
         self._kv_indptr = None
-        self._mask = None
+        self._custom_mask = None
         self._qk_indptr = None
 
     def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
@@ -707,7 +780,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
-        mask: Optional[torch.Tensor] = None,
+        custom_mask: Optional[torch.Tensor] = None,
     ):
         r"""Create auxiliary data structures for batch prefill/append attention for
         multiple forward calls within the same prefill/append step.
@@ -724,8 +797,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The number of key/value heads.
         head_dim : int
             The dimension of the heads.
-        mask : Optional[torch.Tensor]
-            The flattened mask tensor, shape: ``(sum(q_len[i] * k_len[i] for i in range(batch_size))``
+        custom_mask : Optional[torch.Tensor]
+            The flattened mask tensor, shape: ``(sum(q_len[i] * k_len[i] for i in range(batch_size))``.
             The mask tensor will be added to the attention matrix before softmax.
 
         Notes
@@ -741,9 +814,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         batch_size = len(qo_indptr) - 1
         self._qo_indptr = qo_indptr
         self._kv_indptr = kv_indptr
-        if mask is not None:
+        if custom_mask is not None:
             self._qk_indptr = _compute_qk_indptr(qo_indptr, kv_indptr)
-            self._mask = mask
+            self._custom_mask = custom_mask
         self._wrapper.begin_forward(
             self._workspace_buffer,
             qo_indptr,
@@ -757,7 +830,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         r"""Clear the auxiliary data structures created by :meth:`begin_forward`."""
         self._qo_indptr = None
         self._kv_indptr = None
-        self._mask = None
+        self._custom_mask = None
         self._qk_indptr = None
         self._wrapper.end_forward()
 
@@ -786,6 +859,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The value tensor, shape: ``[kv_indptr[-1], num_kv_heads, head_dim]``
         causal : bool
             Whether to apply causal mask to the attention matrix.
+            This argument is ignored if ``mask`` is provided in :meth:`begin_forward`.
         pos_encoding_mode : str
             Whether to apply RoPE on-the-fly inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
@@ -821,15 +895,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             q = q.to(torch.float16)
             k = k.to(torch.float16)
             v = v.to(torch.float16)
-        if self._mask is None:
+        if self._custom_mask is None:
             return self._wrapper.forward(
                 q,
                 self._qo_indptr,
                 k,
                 v,
                 self._kv_indptr,
-                self._mask,
-                self._qk_indptr,
                 causal,
                 PosEncodingMode[pos_encoding_mode].value,
                 allow_fp16_qk_reduction,
@@ -839,15 +911,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 False,
             )[0]
         else:
-            return self._wrapper.forward_with_mask(
+            return self._wrapper.forward_custom_custom_mask(
                 q,
                 self._qo_indptr,
                 k,
                 v,
                 self._kv_indptr,
-                self._mask,
+                self._custom_mask,
                 self._qk_indptr,
-                causal,
                 PosEncodingMode[pos_encoding_mode].value,
                 allow_fp16_qk_reduction,
                 sm_scale,
@@ -881,6 +952,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The value tensor, shape: ``[kv_indptr[-1], num_kv_heads, head_dim]``
         causal : bool
             Whether to apply causal mask to the attention matrix.
+            This argument is ignored if ``mask`` is provided in :meth:`begin_forward`.
         pos_encoding_mode : str
             Whether to apply RoPE on-the-fly inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
@@ -918,7 +990,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             q = q.to(torch.float16)
             k = k.to(torch.float16)
             v = v.to(torch.float16)
-        if self._mask is None:
+        if self._custom_mask is None:
             return self._wrapper.forward(
                 q,
                 self._qo_indptr,
@@ -934,15 +1006,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 True,
             )
         else:
-            return self._wrapper.forward_with_mask(
+            return self._wrapper.forward_custom_custom_mask(
                 q,
                 self._qo_indptr,
                 k,
                 v,
                 self._kv_indptr,
-                self._mask,
+                self._custom_mask,
                 self._qk_indptr,
-                causal,
                 PosEncodingMode[pos_encoding_mode].value,
                 allow_fp16_qk_reduction,
                 sm_scale,
