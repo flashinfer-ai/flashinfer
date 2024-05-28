@@ -131,9 +131,9 @@ class BatchPrefillWithPagedKVCachePyTorchWrapper {
       torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
       torch::Tensor paged_kv_last_page_len, torch::Tensor custom_mask, torch::Tensor qk_indptr,
       unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction, float sm_scale,
-      float rope_scale, float rope_theta, bool return_lse)
-      BatchPrefillWithPagedKVCachePyTorchWrapper(unsigned int layout,
-                                                 unsigned int max_workspace_size_in_bytes)
+      float rope_scale, float rope_theta, bool return_lse);
+  BatchPrefillWithPagedKVCachePyTorchWrapper(unsigned int layout,
+                                             unsigned int max_workspace_size_in_bytes)
       : kv_layout_(flashinfer::QKVLayout(layout)),
         handler_(std::make_shared<flashinfer::BatchPrefillHandler>(max_workspace_size_in_bytes)) {}
 
