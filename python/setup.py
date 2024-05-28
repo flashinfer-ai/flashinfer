@@ -227,7 +227,7 @@ def get_instantiation_cu() -> List[str]:
         mask_modes,
     ):
         for dtype in prefill_dtypes:
-            fname = f"single_prefill_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_mask_{mask_modes}_dtypein_{dtype}_dtypeout_{dtype}.cu"
+            fname = f"single_prefill_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_mask_{mask_mode}_dtypein_{dtype}_dtypeout_{dtype}.cu"
             files.append(prefix + "/" + fname)
             content = generate_single_prefill_inst.get_cu_file_str(
                 group_size,
