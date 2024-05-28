@@ -21,6 +21,7 @@
 #include <optional>
 
 #include "attention/handler.cuh"
+#include "attention/mask.cuh"
 #include "layout.cuh"
 #include "page.cuh"
 #include "pos_enc.cuh"
@@ -29,7 +30,7 @@
 namespace flashinfer {
 
 template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
-          PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION, MaskMode mask_mode,
+          PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename DTypeIn, typename DTypeOut>
 cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v,
                                                float* custom_mask, DTypeOut* o, float* tmp,
@@ -38,7 +39,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
                                                float rope_theta, cudaStream_t stream);
 
 template <uint32_t num_frags_x, uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
-          PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION, MaskMode mask_mode,
+          PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, DTypeIn* k,
@@ -49,7 +50,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
 
 template <PageStorage page_storage, QKVLayout kv_layout, uint32_t num_frags_x, uint32_t PAGE_SIZE,
           uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PosEncodingMode pos_encoding_mode,
-          bool ALLOW_FP16_QK_REDUCTION, MaskMode mask_mode, typename DTypeIn, typename DTypeOut,
+          bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut,
           typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, IdType* q_offset,
@@ -59,7 +60,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
 
 template <PageStorage page_storage, QKVLayout kv_layout, uint32_t PAGE_SIZE, uint32_t GROUP_SIZE,
           uint32_t HEAD_DIM, PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION,
-          MaskMode mask_mode, typename DTypeIn, typename DTypeOut, typename IdType>
+          MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
     BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, IdType* q_offset,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, float* custom_mask,
@@ -93,7 +94,7 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
 }
 
 template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
-          PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION, MaskMode mask_mode,
+          PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
     BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, DTypeIn* k, DTypeIn* v,

@@ -159,7 +159,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--mask_modes",
-        type=lambda x: x if isinstance(x, int) else x.lower() == "true",
+        type=int,
         required=True,
         nargs="+",
         help="Mask modes",

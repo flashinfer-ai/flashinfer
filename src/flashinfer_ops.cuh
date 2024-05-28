@@ -137,8 +137,8 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
                                             page_storage, kv_layout, PAGE_SIZE, GROUP_SIZE,
                                             HEAD_DIM, pos_encoding_mode, ALLOW_FP16_QK_REDUCTION,
                                             MASK_MODE, DTypeIn, DTypeOut, IdType>(
-                                            handler, q, qo_indptr, /*custom_mask=*/nullptr,
-                                            /*qk_indptr=*/nullptr, q_offset, paged_kv, o, lse,
+                                            handler, q, qo_indptr, q_offset, paged_kv,
+                                            /*custom_mask=*/nullptr, /*qk_indptr=*/nullptr, o, lse,
                                             sm_scale, rope_scale, rope_theta, stream);
                                       })})})})})});
   return cudaSuccess;

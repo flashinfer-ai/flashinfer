@@ -36,6 +36,7 @@
 #include "../utils.cuh"
 #include "cascade.cuh"
 #include "handler.cuh"
+#include "mask.cuh"
 #include "state.cuh"
 
 namespace flashinfer {
@@ -43,12 +44,6 @@ namespace flashinfer {
 namespace cg = cooperative_groups;
 using cp_async::SharedMemFillMode;
 using mma::MMAMode;
-
-enum class MaskMode {
-  kNone = 0U,    // No mask
-  kCausal = 1U,  // Causal mask
-  kCustom = 2U,  // Custom mask
-};
 
 constexpr uint32_t warp_size = 32;
 
@@ -1829,12 +1824,12 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
 }
 
 template <uint32_t num_frags_x, uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
-          PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION, MaskMode mask_mode,
+          PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, DTypeIn* k,
-    DTypeIn* v, IdType* kv_indptr, IdType* q_offset, IdType* k_rope_pos_offset, float* custom_mask,
-    IdType* qk_indptr, DTypeOut* o, float* tmp, float* lse, const uint32_t batch_size,
+    DTypeIn* v, IdType* kv_indptr, float* custom_mask, IdType* qk_indptr, IdType* q_offset,
+    IdType* k_rope_pos_offset, DTypeOut* o, float* tmp, float* lse, const uint32_t batch_size,
     const uint32_t num_qo_tiles, const uint32_t num_kv_heads, const float sm_scale,
     const float rope_scale, const float rope_theta, cudaStream_t stream = nullptr) {
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
@@ -1910,7 +1905,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
 
 template <PageStorage page_storage, QKVLayout kv_layout, uint32_t num_frags_x, uint32_t PAGE_SIZE,
           uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PosEncodingMode pos_encoding_mode,
-          bool ALLOW_FP16_QK_REDUCTION, MaskMode mask_mode, typename DTypeIn, typename DTypeOut,
+          bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut,
           typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, IdType* q_offset,
