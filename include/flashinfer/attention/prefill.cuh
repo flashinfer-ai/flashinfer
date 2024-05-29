@@ -1430,7 +1430,8 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
       // TODO(Zihao): handle the case that q_offset is specified
       apply_alibi_bias<group_size, num_frags_x, num_frags_z>(
-          qo_idx_base + get_warp_idx_x<num_warps_x, num_warps_z>() * num_frags_x * 16,
+          qo_idx_base +
+              (get_warp_idx_x<num_warps_x, num_warps_z>() * num_frags_x * 16) / group_size,
           iter * 16 * num_warps_z * num_frags_z +
               get_warp_idx_z<num_warps_x, num_warps_z>() * num_frags_z * 16,
           int(kv_len) - int(qo_len), alibi_slopes, s_frag);
@@ -1659,7 +1660,8 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
       // TODO(Zihao): handle the case that q_offset is specified
       apply_alibi_bias<group_size, num_frags_x, num_frags_z>(
-          qo_idx_base + get_warp_idx_x<num_warps_x, num_warps_z>() * num_frags_x * 16,
+          qo_idx_base +
+              (get_warp_idx_x<num_warps_x, num_warps_z>() * num_frags_x * 16) / group_size,
           iter * 16 * num_warps_z * num_frags_z +
               get_warp_idx_z<num_warps_x, num_warps_z>() * num_frags_z * 16,
           int(kv_len) - int(qo_len), alibi_slopes, s_frag);

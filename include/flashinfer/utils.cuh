@@ -259,7 +259,7 @@ std::tuple<IdType, IdType, std::vector<IdType>, std::vector<IdType>> split_qo_in
     IdType* qo_indptr, uint32_t batch_size, uint32_t gqa_group_size, uint32_t head_dim,
     cudaStream_t stream = nullptr) {
   // TODO(Zihao): make it a template parameter
-  constexpr uint32_t num_warps_x = 4;
+  constexpr uint32_t num_warps_x = 1;
   std::vector<IdType> qo_indptr_h(batch_size + 1), request_indices, tile_indices;
   if (is_device_ptr((void*)qo_indptr)) {
     cudaMemcpyAsync(qo_indptr_h.data(), qo_indptr, sizeof(IdType) * (batch_size + 1),
