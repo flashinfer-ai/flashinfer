@@ -1438,7 +1438,8 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
     // apply mask
     if (iter >= mask_iteration) {
       mask_s<partition_kv, causal, group_size, num_frags_x, num_frags_y, num_frags_z>(
-          qo_idx_base + get_warp_idx_x<num_warps_x, num_warps_z>() * num_frags_x * 16,
+          qo_idx_base +
+              (get_warp_idx_x<num_warps_x, num_warps_z>() * num_frags_x * 16) / group_size,
           iter * 16 * num_warps_z * num_frags_z +
               get_warp_idx_z<num_warps_x, num_warps_z>() * num_frags_z * 16,
           qo_len, kv_len, kv_len, s_frag);
@@ -1666,7 +1667,8 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
     // apply mask
     if (iter >= mask_iteration) {
       mask_s<partition_kv, causal, group_size, num_frags_x, num_frags_y, num_frags_z>(
-          qo_idx_base + get_warp_idx_x<num_warps_x, num_warps_z>() * num_frags_x * 16,
+          qo_idx_base +
+              (get_warp_idx_x<num_warps_x, num_warps_z>() * num_frags_x * 16) / group_size,
           iter * 16 * num_warps_z * num_frags_z +
               get_warp_idx_z<num_warps_x, num_warps_z>() * num_frags_z * 16,
           qo_len, kv_len, kv_len, s_frag);
