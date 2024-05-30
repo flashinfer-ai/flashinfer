@@ -829,8 +829,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
     ... )
     >>> kv_indptr = qo_indptr.clone()
     >>> q_at_layer = torch.randn(num_layers, nnz_qo, num_qo_heads, head_dim).half().to("cuda:0")
-    >>> k_data_at_layer = torch.randn(num_layers, nnz_kv, num_kv_heads, head_dim).half().to("cuda:0")
-    >>> v_data_at_layer = torch.randn(num_layers, nnz_kv, num_kv_heads, head_dim).half().to("cuda:0")
+    >>> k_at_layer = torch.randn(num_layers, nnz_kv, num_kv_heads, head_dim).half().to("cuda:0")
+    >>> v_at_layer = torch.randn(num_layers, nnz_kv, num_kv_heads, head_dim).half().to("cuda:0")
     >>> # create auxiliary data structures for batch prefill attention
     >>> prefill_wrapper.begin_forward(
     ...     qo_indptr,
@@ -864,7 +864,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
     ...         torch.full((qo_len[i], kv_len[i]), -float("inf"), dtype=torch.float32, device="cuda:0"),
     ...         diagonal=(kv_len[i] - qo_len[i] + 1),
     ...     )
-    ...     mask_arr.append(mask_i)
+    ...     mask_arr.append(mask_i.flatten())
     ...
     >>> mask = torch.cat(mask_arr, dim=0)
     >>> prefill_wrapper.begin_forward(
