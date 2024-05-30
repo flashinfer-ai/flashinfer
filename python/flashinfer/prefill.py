@@ -125,6 +125,21 @@ def single_prefill_with_kv_cache(
             allow_fp16_qk_reduction=True)
     >>> o.shape
     torch.Size([128, 32, 128])
+    >>> mask = torch.triu(
+    >>>     torch.full((qo_len, kv_len), -float("inf"), dtype=torch.float32, device="cuda:0"),
+    >>>     diagonal=(kv_len - qo_len + 1),
+    >>> )
+    >>> mask
+    tensor([[0., 0., 0.,  ..., -inf, -inf, -inf],
+        [0., 0., 0.,  ..., -inf, -inf, -inf],
+        [0., 0., 0.,  ..., -inf, -inf, -inf],
+        ...,
+        [0., 0., 0.,  ..., 0., -inf, -inf],
+        [0., 0., 0.,  ..., 0., 0., -inf],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0')
+    >>> o_custom = flashinfer.single_prefill_with_kv_cache(q, k, v, custom_mask=mask)
+    >>> torch.allclose(o, o_custom, rtol=1e-3, atol=1e-3)
+    True
 
     Notes
     -----
@@ -146,8 +161,8 @@ def single_prefill_with_kv_cache(
             q,
             k,
             v,
-            tmp,
             custom_mask,
+            tmp,
             TensorLayout[kv_layout].value,
             PosEncodingMode[pos_encoding_mode].value,
             allow_fp16_qk_reduction,
@@ -248,6 +263,23 @@ def single_prefill_with_kv_cache_return_lse(
     torch.Size([128, 32, 128])
     >>> S.shape
     torch.Size([128, 32])
+    >>> mask = torch.triu(
+    >>>     torch.full((qo_len, kv_len), -float("inf"), dtype=torch.float32, device="cuda:0"),
+    >>>     diagonal=(kv_len - qo_len + 1),
+    >>> )
+    >>> mask
+    tensor([[0., 0., 0.,  ..., -inf, -inf, -inf],
+        [0., 0., 0.,  ..., -inf, -inf, -inf],
+        [0., 0., 0.,  ..., -inf, -inf, -inf],
+        ...,
+        [0., 0., 0.,  ..., 0., -inf, -inf],
+        [0., 0., 0.,  ..., 0., 0., -inf],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0')
+    >>> V_custom, S_custom = flashinfer.single_prefill_with_kv_cache_return_lse(q, k, v, custom_mask=mask)
+    >>> torch.allclose(V, V_custom, rtol=1e-3, atol=1e-3)
+    True
+    >>> torch.allclose(S, S_custom, rtol=1e-3, atol=1e-3)
+    True
 
     Notes
     -----
@@ -282,8 +314,8 @@ def single_prefill_with_kv_cache_return_lse(
             q,
             k,
             v,
-            tmp,
             custom_mask,
+            tmp,
             TensorLayout[kv_layout].value,
             PosEncodingMode[pos_encoding_mode].value,
             allow_fp16_qk_reduction,
@@ -363,14 +395,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
     ...     [0, 17, 29, 44, 48, 66, 100, 128], dtype=torch.int32, device="cuda:0"
     ... )
     >>> # 1 <= paged_kv_last_page_len <= page_size
-    >>> paged_kv_last_page_len= torch.tensor(
+    >>> paged_kv_last_page_len = torch.tensor(
     ...     [1, 7, 14, 4, 3, 1, 16], dtype=torch.int32, device="cuda:0"
     ... )
-    >>> kv_data_at_layer = [
-    ...     torch.randn(
-    ...         max_num_pages, 2, page_size, num_kv_heads, head_dim, dtype=torch.float16, device="cuda:0"
-    ...     ) for _ in range(num_layers)
-    ... ]
+    >>> q_at_layer = torch.randn(num_layers, nnz_qo, num_qo_heads, head_dim).half().to("cuda:0")
+    >>> kv_data_at_layer = torch.randn(
+    ...     num_layers, max_num_pages, 2, page_size, num_kv_heads, head_dim, dtype=torch.float16, device="cuda:0"
+    ... )
     >>> # create auxiliary data structures for batch prefill attention
     >>> prefill_wrapper.begin_forward(
     ...     qo_indptr,
@@ -384,7 +415,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
     ... )
     >>> outputs = []
     >>> for i in range(num_layers):
-    ...     q = torch.randn(nnz_qo, num_qo_heads, head_dim).half().to("cuda:0")
+    ...     q = q_at_layer[i]
     ...     kv_data = kv_data_at_layer[i]
     ...     # compute batch prefill attention, reuse auxiliary data structures
     ...     o = prefill_wrapper.forward(
@@ -396,6 +427,43 @@ class BatchPrefillWithPagedKVCacheWrapper:
     >>> prefill_wrapper.end_forward()
     >>> outputs[0].shape
     torch.Size([100, 64, 128])
+    >>>
+    >>> # below is another example of creating custom mask for batch prefill attention
+    >>> mask_arr = []
+    >>> qo_len = (qo_indptr[1:] - qo_indptr[:-1]).cpu().tolist()
+    >>> kv_len = (page_size * (paged_kv_indptr[1:] - paged_kv_indptr[:-1] - 1) + paged_kv_last_page_len).cpu().tolist()
+    >>> for i in range(batch_size):
+    ...     mask_i = torch.triu(
+    ...         torch.full((qo_len[i], kv_len[i]), -float("inf"), dtype=torch.float32, device="cuda:0"),
+    ...         diagonal=(kv_len[i] - qo_len[i] + 1),
+    ...     )
+    ...     mask_arr.append(mask_i)
+    ...
+    >>> mask = torch.cat(mask_arr, dim=0)
+    >>> prefill_wrapper.begin_forward(
+    ...     qo_indptr,
+    ...     paged_kv_indptr,
+    ...     paged_kv_indices,
+    ...     paged_kv_last_page_len,
+    ...     num_qo_heads,
+    ...     num_kv_heads,
+    ...     head_dim,
+    ...     page_size,
+    ...     mask
+    ... )
+    >>> outputs_custom_mask = []
+    >>> for i in range(num_layers):
+    ...     q = q_at_layer[i]
+    ...     kv_data = kv_data_at_layer[i]
+    ...     # compute batch prefill attention, reuse auxiliary data structures
+    ...     o_custom = prefill_wrapper.forward(
+    ...         q, kv_data
+    ...     )
+    ...     assert torch.allclose(o_custom, outputs[i], rtol=1e-3, atol=1e-3)
+    ...
+    >>> # clear auxiliary data structures
+    >>> prefill_wrapper.end_forward()
+
 
     Note
     ----
@@ -760,6 +828,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
     ...     [0, 33, 44, 55, 66, 77, 88, nnz_qo], dtype=torch.int32, device="cuda:0"
     ... )
     >>> kv_indptr = qo_indptr.clone()
+    >>> q_at_layer = torch.randn(num_layers, nnz_qo, num_qo_heads, head_dim).half().to("cuda:0")
+    >>> k_data_at_layer = torch.randn(num_layers, nnz_kv, num_kv_heads, head_dim).half().to("cuda:0")
+    >>> v_data_at_layer = torch.randn(num_layers, nnz_kv, num_kv_heads, head_dim).half().to("cuda:0")
     >>> # create auxiliary data structures for batch prefill attention
     >>> prefill_wrapper.begin_forward(
     ...     qo_indptr,
@@ -770,9 +841,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
     ... )
     >>> outputs = []
     >>> for i in range(num_layers):
-    ...     q = torch.randn(nnz_qo, num_qo_heads, head_dim).half().to("cuda:0")
-    ...     k = torch.randn(nnz_kv, num_kv_heads, head_dim).half().to("cuda:0")
-    ...     v = torch.randn(nnz_kv, num_kv_heads, head_dim).half().to("cuda:0")
+    ...     q = q_at_layer[i] 
+    ...     k = k_at_layer[i]
+    ...     v = v_at_layer[i]
     ...     # compute batch prefill attention, reuse auxiliary data structures
     ...     o = prefill_wrapper.forward(
     ...         q, k, v, causal=True
@@ -783,6 +854,39 @@ class BatchPrefillWithRaggedKVCacheWrapper:
     >>> prefill_wrapper.end_forward()
     >>> outputs[0].shape
     torch.Size([100, 64, 128])
+    >>>
+    >>> # below is another example of creating custom mask for batch prefill attention
+    >>> mask_arr = []
+    >>> qo_len = (qo_indptr[1:] - qo_indptr[:-1]).cpu().tolist()
+    >>> kv_len = (kv_indptr[1:] - kv_indptr[:-1]).cpu().tolist()
+    >>> for i in range(batch_size):
+    ...     mask_i = torch.triu(
+    ...         torch.full((qo_len[i], kv_len[i]), -float("inf"), dtype=torch.float32, device="cuda:0"),
+    ...         diagonal=(kv_len[i] - qo_len[i] + 1),
+    ...     )
+    ...     mask_arr.append(mask_i)
+    ...
+    >>> mask = torch.cat(mask_arr, dim=0)
+    >>> prefill_wrapper.begin_forward(
+    ...     qo_indptr,
+    ...     kv_indptr,
+    ...     num_qo_heads,
+    ...     num_kv_heads,
+    ...     head_dim,
+    ...     mask
+    ... )
+    >>> outputs_custom_mask = []
+    >>> for i in range(num_layers):
+    ...     q = q_at_layer[i]
+    ...     k = k_at_layer[i]
+    ...     v = v_at_layer[i]
+    ...     # compute batch prefill attention, reuse auxiliary data structures
+    ...     o_custom = prefill_wrapper.forward(q, k, v)
+    ...     assert torch.allclose(o_custom, outputs[i], rtol=1e-3, atol=1e-3)
+    ...
+    >>> # clear auxiliary data structures
+    >>> prefill_wrapper.end_forward()
+    
 
     Note
     ----
