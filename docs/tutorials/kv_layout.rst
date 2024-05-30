@@ -41,6 +41,13 @@ shape ``(indptr[-1], num_heads, head_dim)`` when the layout is ``NHD``.
 
 We can use ``data[indptr[i]:indptr[i+1]]`` to slice the keys (or values) of request ``i``.
 
+FlashInfer APIs
+~~~~~~~~~~~~~~~
+
+FlashInfer provides :class:`flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper` to compute
+the prefill attention between queries stored in ragged tensor and keys/values stored in ragged
+KV-Cache.
+
 .. _mask-layout:
 
 Mask Layout (2D Ragged Tensor)
@@ -68,18 +75,14 @@ to store the start offset of each request's mask in the flattened mask array: ``
 ``mask_data`` has shape ``(qk_indptr[-1],)``, we can use ``mask_data[qk_indptr[i]:qk_indptr[i+1]]`` to slice the flattened
 mask of request ``i``.
 
+FlashInfer APIs
+~~~~~~~~~~~~~~~
+
 :class:`flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper` and :class:`flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper`
 allow user to specify ``qo_indptr``, ``kv_indptr`` and custom attention mask ``custom_mask`` in ``begin_forward`` functions,
 the mask data will be added to the attention score before softmax (and after softmax scaling) in the attention kernel.
 
 .. _page-layout:
-
-FlashInfer APIs
-~~~~~~~~~~~~~~~
-
-FlashInfer provides :class:`flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper` to compute
-the prefill attention between queries stored in ragged tensor and keys/values stored in ragged
-KV-Cache.
 
 Page Table
 ----------
