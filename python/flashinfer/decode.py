@@ -57,6 +57,9 @@ def single_decode_with_kv_cache(
     v: torch.Tensor,
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
     sm_scale: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
@@ -80,6 +83,12 @@ def single_decode_with_kv_cache(
     pos_encoding_mode : str
         Whether to apply RoPE on-the-fly inside attention kernels, could be
         ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
+    q_scale : Optional[float]
+        The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
+    k_scale : Optional[float]
+        The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
+    v_scale : Optional[float]
+        The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
     sm_scale : Optional[float]
         The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
     rope_scale : Optional[float]
@@ -120,11 +129,15 @@ def single_decode_with_kv_cache(
     if sm_scale is None:
         head_dim = q.shape[-1]
         sm_scale = 1.0 / math.sqrt(head_dim)
+    if q_scale is not None:
+        sm_scale *= q_scale
+    if k_scale is not None:
+        sm_scale *= k_scale
     if rope_scale is None:
         rope_scale = 1.0
     if rope_theta is None:
         rope_theta = 1e4
-    return _kernels.single_decode_with_kv_cache(
+    out = _kernels.single_decode_with_kv_cache(
         q,
         k,
         v,
@@ -135,6 +148,9 @@ def single_decode_with_kv_cache(
         rope_scale,
         rope_theta,
     )
+    if v_scale is not None:
+        out *= v_scale
+    return out
 
 
 def batch_decode_with_padded_kv_cache(
@@ -143,6 +159,9 @@ def batch_decode_with_padded_kv_cache(
     v_padded: torch.Tensor,
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
     sm_scale: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
@@ -169,6 +188,12 @@ def batch_decode_with_padded_kv_cache(
     pos_encoding_mode : str
         Whether to apply RoPE on-the-fly inside attention kernels, could be
         ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
+    q_scale : Optional[float]
+        The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
+    k_scale : Optional[float]
+        The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
+    v_scale : Optional[float]
+        The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
     sm_scale : Optional[float]
         The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
     rope_scale : Optional[float]
@@ -208,11 +233,15 @@ def batch_decode_with_padded_kv_cache(
     if sm_scale is None:
         head_dim = q.shape[-1]
         sm_scale = 1.0 / math.sqrt(head_dim)
+    if q_scale is not None:
+        sm_scale *= q_scale
+    if k_scale is not None:
+        sm_scale *= k_scale
     if rope_scale is None:
         rope_scale = 1.0
     if rope_theta is None:
         rope_theta = 1e4
-    return _kernels.batch_decode_with_padded_kv_cache(
+    out = _kernels.batch_decode_with_padded_kv_cache(
         q,
         k_padded,
         v_padded,
@@ -223,6 +252,9 @@ def batch_decode_with_padded_kv_cache(
         rope_theta,
         False,
     )[0]
+    if v_scale is not None:
+        out *= v_scale
+    return out
 
 
 def batch_decode_with_padded_kv_cache_return_lse(
@@ -231,6 +263,9 @@ def batch_decode_with_padded_kv_cache_return_lse(
     v_padded: torch.Tensor,
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
+    q_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
     sm_scale: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
@@ -258,6 +293,12 @@ def batch_decode_with_padded_kv_cache_return_lse(
     pos_encoding_mode : str
         Whether to apply RoPE on-the-fly inside attention kernels, could be
         ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
+    q_scale : Optional[float]
+        The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
+    k_scale : Optional[float]
+        The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
+    v_scale : Optional[float]
+        The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
     sm_scale : Optional[float]
         The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
     rope_scale : Optional[float]
@@ -304,11 +345,15 @@ def batch_decode_with_padded_kv_cache_return_lse(
     if sm_scale is None:
         head_dim = q.shape[-1]
         sm_scale = 1.0 / math.sqrt(head_dim)
+    if q_scale is not None:
+        sm_scale *= q_scale
+    if k_scale is not None:
+        sm_scale *= k_scale
     if rope_scale is None:
         rope_scale = 1.0
     if rope_theta is None:
         rope_theta = 1e4
-    return _kernels.batch_decode_with_padded_kv_cache(
+    V, s = _kernels.batch_decode_with_padded_kv_cache(
         q,
         k_padded,
         v_padded,
@@ -319,6 +364,9 @@ def batch_decode_with_padded_kv_cache_return_lse(
         rope_theta,
         True,
     )
+    if v_scale is not None:
+        V *= v_scale
+    return V, s
 
 
 class BatchDecodeWithPagedKVCacheWrapper:
@@ -508,6 +556,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q: torch.Tensor,
         paged_kv_data: torch.Tensor,
         pos_encoding_mode: str = "NONE",
+        q_scale: Optional[float] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
@@ -527,6 +578,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
         pos_encoding_mode : str
             Whether to apply RoPE on-the-fly inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
+        q_scale : Optional[float]
+            The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
+        k_scale : Optional[float]
+            The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
+        v_scale : Optional[float]
+            The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
         sm_scale : Optional[float]
             The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
         rope_scale : Optional[float]
@@ -544,13 +601,17 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if sm_scale is None:
             head_dim = q.shape[-1]
             sm_scale = 1.0 / math.sqrt(head_dim)
+        if q_scale is not None:
+            sm_scale *= q_scale
+        if k_scale is not None:
+            sm_scale *= k_scale
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
 
         paged_kv_data = expand_5d(paged_kv_data, self._kv_layout)
-        return self._wrapper.forward(
+        out = self._wrapper.forward(
             q,
             paged_kv_data,
             self._paged_kv_indptr,
@@ -562,12 +623,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
             rope_theta,
             False,
         )[0]
+        if v_scale is not None:
+            out *= v_scale
+        return out
 
     def forward_return_lse(
         self,
         q: torch.Tensor,
         paged_kv_data: torch.Tensor,
         pos_encoding_mode: str = "NONE",
+        q_scale: Optional[float] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
@@ -588,6 +655,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
         pos_encoding_mode : str
             Whether to apply RoPE on-the-fly inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
+        q_scale : Optional[float]
+            The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
+        k_scale : Optional[float]
+            The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
+        v_scale : Optional[float]
+            The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
         sm_scale : Optional[float]
             The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
         rope_scale : Optional[float]
@@ -612,12 +685,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if sm_scale is None:
             head_dim = q.shape[-1]
             sm_scale = 1.0 / math.sqrt(head_dim)
+        if q_scale is not None:
+            sm_scale *= q_scale
+        if k_scale is not None:
+            sm_scale *= k_scale
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
         paged_kv_data = expand_5d(paged_kv_data, self._kv_layout)
-        return self._wrapper.forward(
+        V, s = self._wrapper.forward(
             q,
             paged_kv_data,
             self._paged_kv_indptr,
@@ -629,6 +706,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             rope_theta,
             True,
         )
+        if v_scale is not None:
+            V *= v_scale
+        return V, s
 
 
 class CUDAGraphBatchDecodeWithPagedKVCacheWrapper:
@@ -788,6 +868,9 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper:
         q: torch.Tensor,
         paged_kv_data: torch.Tensor,
         pos_encoding_mode: str = "NONE",
+        q_scale: Optional[float] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
@@ -807,6 +890,12 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper:
         pos_encoding_mode : str
             Whether to apply RoPE on-the-fly inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
+        q_scale : Optional[float]
+            The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
+        k_scale : Optional[float]
+            The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
+        v_scale : Optional[float]
+            The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
         sm_scale : Optional[float]
             The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
         rope_scale : Optional[float]
@@ -824,13 +913,17 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper:
         if sm_scale is None:
             head_dim = q.shape[-1]
             sm_scale = 1.0 / math.sqrt(head_dim)
+        if q_scale is not None:
+            sm_scale *= q_scale
+        if k_scale is not None:
+            sm_scale *= k_scale
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
 
         paged_kv_data = expand_5d(paged_kv_data, self._kv_layout)
-        return self._wrapper.forward(
+        out = self._wrapper.forward(
             q,
             paged_kv_data,
             self._paged_kv_indptr_buf,
@@ -842,12 +935,18 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper:
             rope_theta,
             False,
         )[0]
+        if v_scale is not None:
+            out *= v_scale
+        return out
 
     def forward_return_lse(
         self,
         q: torch.Tensor,
         paged_kv_data: torch.Tensor,
         pos_encoding_mode: str = "NONE",
+        q_scale: Optional[float] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
@@ -868,6 +967,12 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper:
         pos_encoding_mode : str
             Whether to apply RoPE on-the-fly inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
+        q_scale : Optional[float]
+            The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
+        k_scale : Optional[float]
+            The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
+        v_scale : Optional[float]
+            The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
         sm_scale : Optional[float]
             The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
         rope_scale : Optional[float]
@@ -892,12 +997,16 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper:
         if sm_scale is None:
             head_dim = q.shape[-1]
             sm_scale = 1.0 / math.sqrt(head_dim)
+        if q_scale is not None:
+            sm_scale *= q_scale
+        if k_scale is not None:
+            sm_scale *= k_scale
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
         paged_kv_data = expand_5d(paged_kv_data, self._kv_layout)
-        return self._wrapper.forward(
+        V, s = self._wrapper.forward(
             q,
             paged_kv_data,
             self._paged_kv_indptr_buf,
@@ -911,3 +1020,6 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper:
             rope_theta,
             True,
         )
+        if v_scale is not None:
+            V *= v_scale
+        return V, s
