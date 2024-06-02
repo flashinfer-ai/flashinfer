@@ -84,7 +84,7 @@ class BatchDecodeWithPagedKVCachePyTorchWrapper {
                     unsigned int pos_encoding_mode, torch::Tensor empty_data);
   void EndForward();
   void UpdatePageLockedBufferSize(uint32_t max_workspace_size_in_bytes);
-  bool IsGraphGraphEnabled() const { return handler_->IsGraphGraphEnabled(); }
+  bool IsCUDAGraphEnabled() const { return handler_->IsCUDAGraphEnabled(); }
   std::vector<torch::Tensor> Forward(torch::Tensor q, torch::Tensor paged_kv_data,
                                      torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
                                      torch::Tensor paged_kv_last_page_len,
@@ -110,7 +110,7 @@ class BatchPrefillWithPagedKVCachePyTorchWrapper {
                     unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads,
                     unsigned int head_dim);
   void EndForward();
-  bool IsGraphGraphEnabled() const { return handler_->IsGraphGraphEnabled(); }
+  bool IsCUDAGraphEnabled() const { return handler_->IsCUDAGraphEnabled(); }
   void UpdatePageLockedBufferSize(uint32_t max_workspace_size_in_bytes);
   std::vector<torch::Tensor> Forward(torch::Tensor q, torch::Tensor qo_indptr,
                                      torch::Tensor paged_kv_data, torch::Tensor paged_kv_indptr,
@@ -143,7 +143,7 @@ class BatchPrefillWithRaggedKVCachePyTorchWrapper {
                     unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads,
                     unsigned int head_dim);
   void EndForward();
-  bool IsGraphGraphEnabled() const { return handler_->IsGraphGraphEnabled(); }
+  bool IsCUDAGraphEnabled() const { return handler_->IsCUDAGraphEnabled(); }
   void UpdatePageLockedBufferSize(uint32_t max_workspace_size_in_bytes);
   std::vector<torch::Tensor> Forward(torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor k,
                                      torch::Tensor v, torch::Tensor kv_indptr, bool causal,
