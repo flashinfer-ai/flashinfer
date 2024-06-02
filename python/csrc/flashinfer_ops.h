@@ -84,7 +84,6 @@ class BatchDecodeWithPagedKVCachePyTorchWrapper {
                     unsigned int pos_encoding_mode, torch::Tensor empty_data);
   void EndForward();
   void UpdatePageLockedBufferSize(uint32_t max_workspace_size_in_bytes);
-  bool IsCUDAGraphEnabled() const { return handler_->IsCUDAGraphEnabled(); }
   std::vector<torch::Tensor> Forward(torch::Tensor q, torch::Tensor paged_kv_data,
                                      torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
                                      torch::Tensor paged_kv_last_page_len,
@@ -93,15 +92,24 @@ class BatchDecodeWithPagedKVCachePyTorchWrapper {
   BatchDecodeWithPagedKVCachePyTorchWrapper(
       std::shared_ptr<flashinfer::BatchDecodeHandler> handler_ptr, flashinfer::QKVLayout kv_layout)
       : handler_(handler_ptr), kv_layout_(kv_layout) {}
-  BatchDecodeWithPagedKVCachePyTorchWrapper(unsigned int layout, unsigned int max_batch_size,
-                                            bool enable_cuda_graph)
+  BatchDecodeWithPagedKVCachePyTorchWrapper(unsigned int layout,
+                                            unsigned int max_workspace_size_in_bytes)
       : kv_layout_(flashinfer::QKVLayout(layout)),
-        handler_(
-            std::make_shared<flashinfer::BatchDecodeHandler>(max_batch_size, enable_cuda_graph)) {}
+        handler_(std::make_shared<flashinfer::BatchDecodeHandler>(max_workspace_size_in_bytes)) {}
 
  protected:
   std::shared_ptr<flashinfer::BatchDecodeHandler> handler_;
   flashinfer::QKVLayout kv_layout_;
+};
+
+class CUDAGraphBatchDecodeWithPagedKVCachePyTorchWrapper
+    : public BatchDecodeWithPagedKVCachePyTorchWrapper {
+ public:
+  CUDAGraphBatchDecodeWithPagedKVCachePyTorchWrapper(unsigned int layout,
+                                                     unsigned int max_batch_size)
+      : BatchDecodeWithPagedKVCachePyTorchWrapper(
+            std::make_shared<flashinfer::CUDAGraphBatchDecodeHandler>(max_batch_size),
+            flashinfer::QKVLayout(layout)) {}
 };
 
 class BatchPrefillWithPagedKVCachePyTorchWrapper {
@@ -110,7 +118,6 @@ class BatchPrefillWithPagedKVCachePyTorchWrapper {
                     unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads,
                     unsigned int head_dim);
   void EndForward();
-  bool IsCUDAGraphEnabled() const { return handler_->IsCUDAGraphEnabled(); }
   void UpdatePageLockedBufferSize(uint32_t max_workspace_size_in_bytes);
   std::vector<torch::Tensor> Forward(torch::Tensor q, torch::Tensor qo_indptr,
                                      torch::Tensor paged_kv_data, torch::Tensor paged_kv_indptr,
@@ -126,11 +133,9 @@ class BatchPrefillWithPagedKVCachePyTorchWrapper {
       unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction, float sm_scale,
       float rope_scale, float rope_theta, bool return_lse);
   BatchPrefillWithPagedKVCachePyTorchWrapper(unsigned int layout,
-                                             unsigned int max_workspace_size_in_bytes,
-                                             bool enable_cuda_graph)
+                                             unsigned int max_workspace_size_in_bytes)
       : kv_layout_(flashinfer::QKVLayout(layout)),
-        handler_(std::make_shared<flashinfer::BatchPrefillHandler>(max_workspace_size_in_bytes,
-                                                                   enable_cuda_graph)) {}
+        handler_(std::make_shared<flashinfer::BatchPrefillHandler>(max_workspace_size_in_bytes)) {}
 
  private:
   std::shared_ptr<flashinfer::BatchPrefillHandler> handler_;
@@ -143,7 +148,6 @@ class BatchPrefillWithRaggedKVCachePyTorchWrapper {
                     unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads,
                     unsigned int head_dim);
   void EndForward();
-  bool IsCUDAGraphEnabled() const { return handler_->IsCUDAGraphEnabled(); }
   void UpdatePageLockedBufferSize(uint32_t max_workspace_size_in_bytes);
   std::vector<torch::Tensor> Forward(torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor k,
                                      torch::Tensor v, torch::Tensor kv_indptr, bool causal,
@@ -158,11 +162,9 @@ class BatchPrefillWithRaggedKVCachePyTorchWrapper {
                                                bool allow_fp16_qk_reduction, float sm_scale,
                                                float rope_scale, float rope_theta, bool return_lse);
   BatchPrefillWithRaggedKVCachePyTorchWrapper(unsigned int layout,
-                                              unsigned int max_workspace_size_in_bytes,
-                                              bool enable_cuda_graph)
+                                              unsigned int max_workspace_size_in_bytes)
       : kv_layout_(flashinfer::QKVLayout(layout)),
-        handler_(std::make_shared<flashinfer::BatchPrefillHandler>(max_workspace_size_in_bytes,
-                                                                   enable_cuda_graph)) {}
+        handler_(std::make_shared<flashinfer::BatchPrefillHandler>(max_workspace_size_in_bytes)) {}
 
  private:
   std::shared_ptr<flashinfer::BatchPrefillHandler> handler_;

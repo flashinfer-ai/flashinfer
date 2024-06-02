@@ -141,17 +141,32 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
           return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
             return DISPATCH_pos_encoding_mode(
                 PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
-                  cudaError_t status =
-                      handler_->BeginForwardDispatched<GROUP_SIZE, HEAD_DIM, PageStorage::kIndices,
-                                                       KV_LAYOUT, POS_ENCODING_MODE, c_type,
-                                                       nv_half, int32_t>(
-                          static_cast<void*>(workspace_buffer.data_ptr()), workspace_size_in_bytes,
-                          static_cast<int32_t*>(indptr.data_ptr()),
-                          static_cast<int32_t*>(last_page_len.data_ptr()), batch_size, num_qo_heads,
-                          page_size);
-                  TORCH_CHECK(status == cudaSuccess,
-                              "BatchDecodeWithPagedKVCache failed with error ",
-                              cudaGetErrorString(status));
+                  if (handler_->IsCUDAGraphMode()) {
+                    // NOTE(Zihao): use runtime dispatch because template function is not virtual
+                    auto cuda_graph_handler_ =
+                        dynamic_cast<CUDAGraphBatchDecodeHandler*>(handler_.get());
+                    cudaError_t status = cuda_graph_handler_->CUDAGraphBeginForwardDispatched<
+                        GROUP_SIZE, HEAD_DIM, PageStorage::kIndices, KV_LAYOUT, POS_ENCODING_MODE,
+                        c_type, nv_half, int32_t>(static_cast<void*>(workspace_buffer.data_ptr()),
+                                                  workspace_size_in_bytes,
+                                                  static_cast<int32_t*>(indptr.data_ptr()),
+                                                  static_cast<int32_t*>(last_page_len.data_ptr()),
+                                                  batch_size, num_qo_heads, page_size);
+                    TORCH_CHECK(status == cudaSuccess,
+                                "BatchDecodeWithPagedKVCache (CUDAGraph Mode) failed with error ",
+                                cudaGetErrorString(status));
+                  } else {
+                    cudaError_t status = handler_->BeginForwardDispatched<
+                        GROUP_SIZE, HEAD_DIM, PageStorage::kIndices, KV_LAYOUT, POS_ENCODING_MODE,
+                        c_type, nv_half, int32_t>(static_cast<void*>(workspace_buffer.data_ptr()),
+                                                  workspace_size_in_bytes,
+                                                  static_cast<int32_t*>(indptr.data_ptr()),
+                                                  static_cast<int32_t*>(last_page_len.data_ptr()),
+                                                  batch_size, num_qo_heads, page_size);
+                    TORCH_CHECK(status == cudaSuccess,
+                                "BatchDecodeWithPagedKVCache failed with error ",
+                                cudaGetErrorString(status));
+                  }
                   return true;
                 });
           });
@@ -165,17 +180,32 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
           return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
             return DISPATCH_pos_encoding_mode(
                 PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
-                  cudaError_t status =
-                      handler_->BeginForwardDispatched<GROUP_SIZE, HEAD_DIM, PageStorage::kIndices,
-                                                       KV_LAYOUT, POS_ENCODING_MODE, c_type, c_type,
-                                                       int32_t>(
-                          static_cast<void*>(workspace_buffer.data_ptr()), workspace_size_in_bytes,
-                          static_cast<int32_t*>(indptr.data_ptr()),
-                          static_cast<int32_t*>(last_page_len.data_ptr()), batch_size, num_qo_heads,
-                          page_size);
-                  TORCH_CHECK(status == cudaSuccess,
-                              "BatchDecodeWithPagedKVCache failed with error ",
-                              cudaGetErrorString(status));
+                  if (handler_->IsCUDAGraphMode()) {
+                    // NOTE(Zihao): use runtime dispatch because template function is not virtual
+                    auto cuda_graph_handler_ =
+                        dynamic_cast<CUDAGraphBatchDecodeHandler*>(handler_.get());
+                    auto status = cuda_graph_handler_->CUDAGraphBeginForwardDispatched<
+                        GROUP_SIZE, HEAD_DIM, PageStorage::kIndices, KV_LAYOUT, POS_ENCODING_MODE,
+                        c_type, c_type, int32_t>(static_cast<void*>(workspace_buffer.data_ptr()),
+                                                 workspace_size_in_bytes,
+                                                 static_cast<int32_t*>(indptr.data_ptr()),
+                                                 static_cast<int32_t*>(last_page_len.data_ptr()),
+                                                 batch_size, num_qo_heads, page_size);
+                    TORCH_CHECK(status == cudaSuccess,
+                                "BatchDecodeWithPagedKVCache (CUDAGraph Mode) failed with error ",
+                                cudaGetErrorString(status));
+                  } else {
+                    cudaError_t status = handler_->BeginForwardDispatched<
+                        GROUP_SIZE, HEAD_DIM, PageStorage::kIndices, KV_LAYOUT, POS_ENCODING_MODE,
+                        c_type, c_type, int32_t>(static_cast<void*>(workspace_buffer.data_ptr()),
+                                                 workspace_size_in_bytes,
+                                                 static_cast<int32_t*>(indptr.data_ptr()),
+                                                 static_cast<int32_t*>(last_page_len.data_ptr()),
+                                                 batch_size, num_qo_heads, page_size);
+                    TORCH_CHECK(status == cudaSuccess,
+                                "BatchDecodeWithPagedKVCache failed with error ",
+                                cudaGetErrorString(status));
+                  }
                   return true;
                 });
           });
