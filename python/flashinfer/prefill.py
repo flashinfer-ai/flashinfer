@@ -841,7 +841,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
     ... )
     >>> outputs = []
     >>> for i in range(num_layers):
-    ...     q = q_at_layer[i] 
+    ...     q = q_at_layer[i]
     ...     k = k_at_layer[i]
     ...     v = v_at_layer[i]
     ...     # compute batch prefill attention, reuse auxiliary data structures
@@ -886,7 +886,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
     ...
     >>> # clear auxiliary data structures
     >>> prefill_wrapper.end_forward()
-    
+
 
     Note
     ----
@@ -896,7 +896,16 @@ class BatchPrefillWithRaggedKVCacheWrapper:
     wrapper class manages the lifecycle of these data structures.
     """
 
-    def __init__(self, workspace_buffer: torch.Tensor, kv_layout: str = "NHD"):
+    def __init__(
+        self,
+        workspace_buffer: torch.Tensor,
+        kv_layout: str = "NHD",
+        enable_cuda_graph: bool = False,
+        qo_indptr_buf: Optional[torch.Tensor] = None,
+        kv_indptr_buf: Optional[torch.Tensor] = None,
+        custom_mask_buf: Optional[torch.Tensor] = None,
+        qk_indptr_buf: Optional[torch.Tensor] = None,
+    ):
         r"""Constructor of :class:`BatchDecodeWithRaggedKVCacheWrapper`.
 
         Parameters
@@ -905,8 +914,38 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The user reserved workspace buffer used to store auxiliary data structures,
             recommended size is 16MB, the device of the workspace buffer should be the
             same as the device of the input tensors.
+
         kv_layout : str
             The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
+
+        enable_cuda_graph : bool
+            Whether to enable CUDA graph capture for the prefill kernels, if enabled, the
+            auxiliary data structures will be stored in the provided buffers.
+
+        qo_indptr_buf : Optional[torch.Tensor]
+            The user reserved GPU buffer to store the ``qo_indptr`` array, should be large
+            enough to store the maximum possible size of the ``qo_indptr`` array during the
+            lifetime of the wrapper. This argument is only effective when ``enable_cuda_graph``
+            is ``True``.
+
+        kv_indptr_buf : Optional[torch.Tensor]
+            The user reserved GPU buffer to store the ``kv_indptr`` array, should be large
+            enough to store the maximum possible size of the ``kv_indptr`` array during the
+            lifetime of the wrapper. This argument is only effective when ``enable_cuda_graph``
+            is ``True``.
+
+        custom_mask_buf : Optional[torch.Tensor]
+            The user reserved GPU buffer to store the custom mask tensor, should be large
+            enough to store the maximum possible size of the custom mask tensor during the
+            lifetime of the wrapper. This argument is only effective when ``enable_cuda_graph``
+            is ``True`` and custom mask will be used.
+
+        qk_indptr_buf : Optional[torch.Tensor]
+            The user reserved GPU buffer to store the ``qk_indptr`` array, should be large
+            enough to store the maximum possible size of the ``qk_indptr`` array during the
+            lifetime of the wrapper. This argument is only effective when ``enable_cuda_graph``
+            is ``True``.
+
         """
         check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
@@ -914,11 +953,28 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._wrapper = _kernels.BatchPrefillWithRaggedKVCachePyTorchWrapper(
             TensorLayout[kv_layout].value,
             workspace_buffer.numel() * workspace_buffer.element_size(),
+            enable_cuda_graph,
         )
-        self._qo_indptr = None
-        self._kv_indptr = None
-        self._custom_mask = None
-        self._qk_indptr = None
+        if enable_cuda_graph:
+            if not torch.is_tensor(qo_indptr_buf):
+                raise ValueError("qo_indptr_buf should be a torch.Tensor")
+            if not torch.is_tensor(kv_indptr_buf):
+                raise ValueError("kv_indptr_buf should be a torch.Tensor")
+            # NOTE(Zihao): do not check custom_mask_buf and qk_indptr_buf here,
+            # as they may not be used.
+            self._qo_indptr_buf = qo_indptr_buf
+            self._kv_indptr_buf = kv_indptr_buf
+            self._custom_mask_buf = custom_mask_buf
+            self._qk_indptr_buf = qk_indptr_buf
+        else:
+            self._qo_indptr_buf = None
+            self._kv_indptr_buf = None
+            self._custom_mask_buf = None
+            self._qk_indptr_buf = None
+
+    @property
+    def is_cuda_graph_enabled(self):
+        return self._wrapper.is_cuda_graph_enabled
 
     def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
         r"""Reset the workspace buffer.
@@ -974,11 +1030,28 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
         """
         batch_size = len(qo_indptr) - 1
-        self._qo_indptr = qo_indptr
-        self._kv_indptr = kv_indptr
-        if custom_mask is not None:
-            self._custom_mask = custom_mask
-            self._qk_indptr = _compute_qk_indptr(qo_indptr, kv_indptr)
+        if self.is_cuda_graph_enabled:
+            self._qo_indptr_buf[: len(qo_indptr)] = qo_indptr
+            self._kv_indptr_buf[: len(kv_indptr)] = kv_indptr
+            if custom_mask is not None:
+                if not torch.is_tensor(self._custom_mask_buf):
+                    raise ValueError(
+                        "custom_mask_buf must be initialized with a torch.Tensor in cuda graph mode if we use custom mask in attention."
+                    )
+                if not torch.is_tensor(self._qk_indptr_buf):
+                    raise ValueError(
+                        "qk_indptr_buf must be initialized with a torch.Tensor in cuda graph mode if we use custom mask in the attention."
+                    )
+                self._custom_mask_buf[: len(custom_mask)] = custom_mask
+                self._qk_indptr_buf[: len(qo_indptr)] = _compute_qk_indptr(
+                    qo_indptr, kv_indptr
+                )
+        else:
+            self._qo_indptr_buf = qo_indptr
+            self._kv_indptr_buf = kv_indptr
+            if custom_mask is not None:
+                self._custom_mask_buf = custom_mask
+                self._qk_indptr_buf = _compute_qk_indptr(qo_indptr, kv_indptr)
         self._wrapper.begin_forward(
             self._workspace_buffer,
             qo_indptr,
@@ -990,10 +1063,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
     def end_forward(self):
         r"""Clear the auxiliary data structures created by :meth:`begin_forward`."""
-        self._qo_indptr = None
-        self._kv_indptr = None
-        self._custom_mask = None
-        self._qk_indptr = None
+        if not self.is_cuda_graph_enabled:
+            self._qo_indptr = None
+            self._kv_indptr = None
+            self._custom_mask = None
+            self._qk_indptr = None
         self._wrapper.end_forward()
 
     def forward(
@@ -1060,10 +1134,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         if self._custom_mask is None:
             return self._wrapper.forward(
                 q,
-                self._qo_indptr,
+                self._qo_indptr_buf,
                 k,
                 v,
-                self._kv_indptr,
+                self._kv_indptr_buf,
                 causal,
                 PosEncodingMode[pos_encoding_mode].value,
                 allow_fp16_qk_reduction,
@@ -1075,11 +1149,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         else:
             return self._wrapper.forward_custom_mask(
                 q,
-                self._qo_indptr,
+                self._qo_indptr_buf,
                 k,
                 v,
-                self._kv_indptr,
-                self._custom_mask,
+                self._kv_indptr_buf,
+                self._custom_mask_buf,
                 self._qk_indptr,
                 PosEncodingMode[pos_encoding_mode].value,
                 allow_fp16_qk_reduction,
@@ -1155,10 +1229,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         if self._custom_mask is None:
             return self._wrapper.forward(
                 q,
-                self._qo_indptr,
+                self._qo_indptr_buf,
                 k,
                 v,
-                self._kv_indptr,
+                self._kv_indptr_buf,
                 causal,
                 PosEncodingMode[pos_encoding_mode].value,
                 allow_fp16_qk_reduction,
@@ -1170,10 +1244,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         else:
             return self._wrapper.forward_custom_mask(
                 q,
-                self._qo_indptr,
+                self._qo_indptr_buf,
                 k,
                 v,
-                self._kv_indptr,
+                self._kv_indptr_buf,
                 self._custom_mask,
                 self._qk_indptr,
                 PosEncodingMode[pos_encoding_mode].value,

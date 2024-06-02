@@ -437,17 +437,48 @@ class BatchDecodeWithPagedKVCacheWrapper:
     manages the lifecycle of these data structures.
     """
 
-    def __init__(self, workspace_buffer: torch.Tensor, kv_layout: str = "NHD"):
+    def __init__(
+        self,
+        workspace_buffer: torch.Tensor,
+        kv_layout: str = "NHD",
+        enable_cuda_graph: bool = False,
+        paged_kv_indptr_buffer: Optional[torch.Tensor] = None,
+        paged_kv_indices_buffer: Optional[torch.Tensor] = None,
+        paged_kv_last_page_len_buffer: Optional[torch.Tensor] = None,
+    ):
         r"""Constructor of :class:`BatchDecodeWithPagedKVCacheWrapper`.
 
         Parameters
         ----------
         workspace_buffer : torch.Tensor
             The user reserved workspace buffer used to store auxiliary data structures,
-            recommended size is 16MB, the device of the workspace buffer should be the
-            same as the device of the input tensors.
+            recommended size is 16MB (128MB if cudagraph enabled), the device of the workspace
+            buffer should be the same as the device of the input tensors.
+
         kv_layout : str
             The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
+
+        enable_cuda_graph : bool
+            Whether to enable CUDAGraph for batch decode attention, if enabled, the
+            auxiliary data structures will be stored in the provided buffers.
+
+        indptr_buffer : Optional[torch.Tensor]
+            The user reserved buffer on GPU to store the indptr of the paged kv cache, should
+            be large enough to store the indptr of maximum batch size (``[max_batch_size + 1]``)
+            during the lifecycle of this wrapper.
+            Only needed when ``enable_cuda_graph`` is ``True``.
+
+        indices_buffer : Optional[torch.Tensor]
+            The user reserved buffer on GPU to store the page indices of the paged kv cache,
+            should be large enough to store the maximum number of page indices
+            (``max_num_pages``) during the lifecycle of this wrapper.
+            Only needed when ``enable_cuda_graph`` is ``True``.
+
+        last_page_len_buffer : Optional[torch.Tensor]
+            The user reserved buffer on GPU to store the number of entries in the last page,
+            should be large enough to store the maximum batch size (``[max_batch_size]``)
+            during the lifecycle of this wrapper.
+            Only needed when ``enable_cuda_graph`` is ``True``.
         """
         check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
@@ -455,10 +486,32 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._wrapper = _kernels.BatchDecodeWithPagedKVCachePyTorchWrapper(
             TensorLayout[kv_layout].value,
             workspace_buffer.numel() * workspace_buffer.element_size(),
+            enable_cuda_graph,
         )
-        self._paged_kv_indptr = None
-        self._paged_kv_indices = None
-        self._paged_kv_last_page_len = None
+        if enable_cuda_graph:
+            if not torch.is_tensor(paged_kv_indptr_buffer):
+                raise ValueError(
+                    "paged_kv_indptr_buffer should be a torch.Tensor in cudagraph mode"
+                )
+            if not torch.is_tensor(paged_kv_indices_buffer):
+                raise ValueError(
+                    "paged_kv_indices_buffer should be a torch.Tensor in cudagraph mode"
+                )
+            if not torch.is_tensor(paged_kv_last_page_len_buffer):
+                raise ValueError(
+                    "paged_kv_last_page_len_buffer should be a torch.Tensor in cudagraph mode"
+                )
+            self._paged_kv_indptr_buf = paged_kv_indptr_buffer
+            self._paged_kv_indices_buf = paged_kv_indices_buffer
+            self._paged_kv_last_page_len_buf = paged_kv_last_page_len_buffer
+        else:
+            self._paged_kv_indptr_buf = None
+            self._paged_kv_indices_buf = None
+            self._paged_kv_last_page_len_buf = None
+
+    @property
+    def is_cuda_graph_enabled(self):
+        return self._wrapper.is_cuda_graph_enabled()
 
     def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
         r"""Reset the workspace buffer.
@@ -519,9 +572,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
         is not equal to ``num_kv_heads``, the function will use
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
         """
-        self._paged_kv_indptr = indptr
-        self._paged_kv_indices = indices
-        self._paged_kv_last_page_len = last_page_len
+        if self.is_cuda_graph_enabled:
+            self._paged_kv_indptr_buf[: len(indptr)] = indptr
+            self._paged_kv_indices_buf[: len(indices)] = indices
+            self._paged_kv_last_page_len_buf[: len(last_page_len)] = last_page_len
+        else:
+            self._paged_kv_indptr_buf = indptr
+            self._paged_kv_indices_buf = indices
+            self._paged_kv_last_page_len_buf = last_page_len
 
         batch_size = len(indptr) - 1
         # NOTE(Zihao): the following tensor acts as placeholder to pass dtype info
@@ -546,9 +604,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
     def end_forward(self):
         r"""Clear auxiliary data structures created by :meth:`begin_forward`."""
-        self._paged_kv_indptr = None
-        self._paged_kv_indices = None
-        self._paged_kv_last_page_len = None
+        if not self.is_cuda_graph_enabled:
+            self._paged_kv_indptr_buf = None
+            self._paged_kv_indices_buf = None
+            self._paged_kv_last_page_len_buf = None
         self._wrapper.end_forward()
 
     def forward(
@@ -614,9 +673,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         out = self._wrapper.forward(
             q,
             paged_kv_data,
-            self._paged_kv_indptr,
-            self._paged_kv_indices,
-            self._paged_kv_last_page_len,
+            self._paged_kv_indptr_buf,
+            self._paged_kv_indices_buf,
+            self._paged_kv_last_page_len_buf,
             PosEncodingMode[pos_encoding_mode].value,
             sm_scale,
             rope_scale,
@@ -697,9 +756,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         V, s = self._wrapper.forward(
             q,
             paged_kv_data,
-            self._paged_kv_indptr,
-            self._paged_kv_indices,
-            self._paged_kv_last_page_len,
+            self._paged_kv_indptr_buf,
+            self._paged_kv_indices_buf,
+            self._paged_kv_last_page_len_buf,
             PosEncodingMode[pos_encoding_mode].value,
             sm_scale,
             rope_scale,
@@ -711,7 +770,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         return V, s
 
 
-class CUDAGraphBatchDecodeWithPagedKVCacheWrapper:
+class CUDAGraphBatchDecodeWithPagedKVCacheWrapper(BatchDecodeWithPagedKVCacheWrapper):
     r"""CUDAGraph-compatible Wrapper class for decode attention with paged kv-cache (first
     proposed in `vLLM <https://arxiv.org/abs/2309.06180>`_) for batch of requests.
 
@@ -720,7 +779,6 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper:
     to accomodate the CUDAGraph requirement.
 
     Check :ref:`our tutorial<page-layout>` for page table layout.
-    # TODO(Zihao): update documentation
 
     Note
     ----
@@ -747,20 +805,24 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper:
             The user reserved workspace buffer on GPU used to store auxiliary data structures,
             recommended size is 128MB, the device of the workspace buffer should be the
             same as the device of the input tensors.
+
+        kv_layout : str
+            The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
+
         indptr_buffer : torch.Tensor
             The user reserved buffer on GPU to store the indptr of the paged kv cache, should
             be large enough to store the indptr of maximum batch size (``[max_batch_size + 1]``)
             during the lifecycle of this wrapper.
+
         indices_buffer : torch.Tensor
             The user reserved buffer on GPU to store the page indices of the paged kv cache,
             should be large enough to store the maximum number of page indices
             (``max_num_pages``) during the lifecycle of this wrapper.
+
         last_page_len_buffer : torch.Tensor
             The user reserved buffer on GPU to store the number of entries in the last page,
             should be large enough to store the maximum batch size (``[max_batch_size]``)
             during the lifecycle of this wrapper.
-        kv_layout : str
-            The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
         """
         check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
@@ -1019,6 +1081,9 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper:
             rope_scale,
             rope_theta,
             True,
+            indptr_buffer,
+            indices_buffer,
+            last_page_len_buffer,
         )
         if v_scale is not None:
             V *= v_scale
