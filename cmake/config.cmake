@@ -16,6 +16,8 @@ set(FLASHINFER_CASCADE ON)
 set(FLASHINFER_SAMPLING ON)
 # Whether to compile normalization kernel tests/benchmarks or not.
 set(FLASHINFER_NORMALIZATION ON)
+# Whether to compile fastdiv tests
+set(FLASHINFER_FASTDIV_TEST OFF)
 # The following configurations can impact the binary
 # size of the generated library
 set(FLASHINFER_GEN_GROUP_SIZES 1 4 6 8)
