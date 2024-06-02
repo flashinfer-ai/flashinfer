@@ -35,9 +35,7 @@
 #include "../pos_enc.cuh"
 #include "../utils.cuh"
 #include "cascade.cuh"
-#include "handler.cuh"
 #include "mask.cuh"
-#include "state.cuh"
 
 namespace flashinfer {
 

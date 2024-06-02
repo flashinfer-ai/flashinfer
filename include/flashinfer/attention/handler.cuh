@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <memory>
+#include <sstream>
 #include <unordered_map>
 #include <vector>
 
@@ -240,10 +241,10 @@ cudaError_t PartitionPagedKVCacheComputeAuxiliaryInfo(
   return cudaSuccess;
 }
 
-struct AlignedAlloactor {
+struct AlignedAllocator {
   void* ptr;
   size_t space;
-  AlignedAlloactor(void* buf, size_t space) : ptr(buf), space(space) {}
+  AlignedAllocator(void* buf, size_t space) : ptr(buf), space(space) {}
   template <typename T>
   T* aligned_alloc(size_t size, size_t alignment) {
     if (std::align(alignment, size, ptr, space)) {
@@ -311,7 +312,7 @@ class BatchDecodeHandler {
       // So it should be compatible with CUDAGraph which requires fixed pointer.
       size_t max_tmp_size = num_qo_heads * max_batch_size_after_partition_ *
                             (HEAD_DIM * sizeof(DTypeOut) + 2 * sizeof(float));
-      AlignedAlloactor allocator(buffer, workspace_size_in_bytes);
+      AlignedAllocator allocator(buffer, workspace_size_in_bytes);
       float_buffer_ = allocator.aligned_alloc<void*>(max_tmp_size, 16);
       new_indptr_ = allocator.aligned_alloc<void*>(
           (max_batch_size_after_partition_ + 1) * sizeof(IdType), 16);
@@ -347,7 +348,7 @@ class BatchDecodeHandler {
           num_bytes_to_copy, stream_));
     } else {
       if (tmp_size > 0) {
-        AlignedAlloactor allocator(buffer, workspace_size_in_bytes);
+        AlignedAllocator allocator(buffer, workspace_size_in_bytes);
         float_buffer_ = allocator.aligned_alloc<void*>(tmp_size, 16);
         new_indptr_ =
             allocator.aligned_alloc<void*>((batch_size_after_partition_ + 1) * sizeof(IdType), 16);
@@ -415,7 +416,12 @@ class BatchDecodeHandler {
 
   void SetCUDAStream(cudaStream_t stream) { stream_ = stream; }
 
-  BatchDecodeHandler(size_t max_batch_size = 16384, bool enable_cuda_graph = false)
+  /*!
+   * \note (Zihao): when enable_cuda_graph is true, max_workspace_size_in_bytes will be ignored,
+   *                when enable_cuda_graph is false, max_batch_size will be ignored.
+   */
+  BatchDecodeHandler(size_t max_workspace_size_in_bytes = 128 * 64 * 64,
+                     size_t max_batch_size = 16384, bool enable_cuda_graph = false)
       : batch_size_after_partition_(0U),
         float_buffer_(nullptr),
         new_indptr_(nullptr),
@@ -427,15 +433,25 @@ class BatchDecodeHandler {
         forward_started_(false),
         cuda_graph_enabled_(enable_cuda_graph),
         stream_(nullptr) {
-    int dev_id = 0, num_sm = 0, max_thread_blocks_per_sm = 0;
-    cudaGetDevice(&dev_id);
-    cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id);
-    cudaDeviceGetAttribute(&max_thread_blocks_per_sm, cudaDevAttrMaxBlocksPerMultiprocessor,
-                           dev_id);
-    max_batch_size_after_partition_ =
-        std::max<size_t>(max_thread_blocks_per_sm * num_sm, max_batch_size);
-    size_t max_workspace_size_in_bytes =
-        6 * (sizeof(uint64_t) * (max_batch_size_after_partition_ + 1) + 16);
+    if (enable_cuda_graph) {
+      int dev_id = 0, num_sm = 0, max_thread_blocks_per_sm = 0;
+      cudaGetDevice(&dev_id);
+      cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id);
+      cudaDeviceGetAttribute(&max_thread_blocks_per_sm, cudaDevAttrMaxBlocksPerMultiprocessor,
+                             dev_id);
+      max_batch_size_after_partition_ =
+          std::max<size_t>(max_thread_blocks_per_sm * num_sm, max_batch_size);
+      size_t required_max_workspace_size_in_bytes =
+          6 * (sizeof(uint64_t) * (max_batch_size_after_partition_ + 1) + 16);
+      if (required_max_workspace_size_in_bytes > max_workspace_size_in_bytes) {
+        std::ostringstream err_msg;
+        err_msg << "RuntimeError: reserved workspace size is not enough, required size: "
+                << required_max_workspace_size_in_bytes
+                << " bytes, actual size: " << max_workspace_size_in_bytes
+                << " bytes, please increase workspace buffer size.";
+        throw std::runtime_error(err_msg.str());
+      }
+    }
     cudaMallocHost(&page_locked_buffer_, max_workspace_size_in_bytes);
   }
   ~BatchDecodeHandler() {
@@ -499,7 +515,7 @@ class BatchPrefillHandler {
     std::vector<IdType> request_indices_vec, tile_indices_vec;
     std::tie(num_frags_x_, num_qo_tiles_, request_indices_vec, tile_indices_vec) =
         split_qo_indptr(qo_indptr, batch_size, gqa_group_size, head_dim, stream_);
-    AlignedAlloactor allocator(buffer, workspace_size_in_bytes);
+    AlignedAllocator allocator(buffer, workspace_size_in_bytes);
     if (IsCUDAGraphEnabled()) {
       request_indices_ = allocator.aligned_alloc<void*>(sizeof(IdType) * max_num_qo_tiles_, 16);
     } else {
