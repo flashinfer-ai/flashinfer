@@ -17,25 +17,48 @@
 
 #include <flashinfer/fastdiv.cuh>
 
+#include "gtest/gtest.h"
 #include "utils.h"
 
 using namespace flashinfer;
 
-__global__ void test_fastdiv_kernel(uint_fastdiv fd, uint32_t* out) {
+__global__ void test_fastdiv_kernel_0(uint_fastdiv fd, uint32_t* q, uint32_t* r) {
   uint32_t global_rank = blockIdx.x * blockDim.x + threadIdx.x;
-  out[global_rank] = global_rank / fd;
+  q[global_rank] = global_rank / fd;
+  r[global_rank] = global_rank % fd;
+}
+
+__global__ void test_fastdiv_kernel_1(uint_fastdiv fd, uint32_t* q, uint32_t* r) {
+  uint32_t global_rank = blockIdx.x * blockDim.x + threadIdx.x;
+  fd.divmod(global_rank, q[global_rank], r[global_rank]);
 }
 
 void _TestFastDivU32Correctness(uint32_t d) {
   uint_fastdiv fd(d);
-  thrust::device_vector<uint32_t> out(1024 * 1024);
+  thrust::device_vector<uint32_t> q(1024 * 1024), r(1024 * 1024);
 
-  test_fastdiv_kernel<<<1024, 1024>>>(fd, thrust::raw_pointer_cast(out.data()));
+  {
+    test_fastdiv_kernel_0<<<1024, 1024>>>(fd, thrust::raw_pointer_cast(q.data()),
+                                          thrust::raw_pointer_cast(r.data()));
 
-  thrust::host_vector<uint32_t> out_h(out);
+    thrust::host_vector<uint32_t> q_h(q), r_h(r);
 
-  for (size_t i = 0; i < out_h.size(); ++i) {
-    EXPECT_EQ(out_h[i], i / d);
+    for (size_t i = 0; i < q_h.size(); ++i) {
+      EXPECT_EQ(q_h[i], i / d);
+      EXPECT_EQ(r_h[i], i % d);
+    }
+  }
+
+  {
+    test_fastdiv_kernel_1<<<1024, 1024>>>(fd, thrust::raw_pointer_cast(q.data()),
+                                          thrust::raw_pointer_cast(r.data()));
+
+    thrust::host_vector<uint32_t> q_h(q), r_h(r);
+
+    for (size_t i = 0; i < q_h.size(); ++i) {
+      EXPECT_EQ(q_h[i], i / d);
+      EXPECT_EQ(r_h[i], i % d);
+    }
   }
 
   std::cout << "FastDivU32 correctness test passed for d = " << d << std::endl;

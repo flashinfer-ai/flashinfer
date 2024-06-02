@@ -29,10 +29,9 @@ struct uint_fastdiv {
   uint32_t a;
 
   uint_fastdiv(uint32_t d) : d(d) {
-    int p;
-    unsigned int nc, delta, q1, r1, q2, r2;
+    unsigned int p, nc, delta, q1, r1, q2, r2;
     a = 0;
-    nc = -1 - (-d) % d;
+    nc = unsigned(-1) - unsigned(-d) % d;
     p = 31;
     q1 = 0x80000000 / nc;
     r1 = 0x80000000 - q1 * nc;
