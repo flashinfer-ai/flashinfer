@@ -679,7 +679,6 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
   auto& temp_storage = reinterpret_cast<
       SamplingTempStorage<DType, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>&>(smem);
 
-  bool rejected = false;
   uint32_t pos = 0;
   for (pos = 0; pos < num_speculative_tokens; ++pos) {
     IdType draft_id = draft_token_ids[row_idx * num_speculative_tokens + pos];
