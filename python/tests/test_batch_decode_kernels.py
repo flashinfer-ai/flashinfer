@@ -192,7 +192,8 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         o = wrapper.forward(q, kv_data.to(dtype), pos_encoding_mode=pos_encoding_mode)
-
+    wrapper.end_forward()
+    # replay
     wrapper.begin_forward(
         kv_indptr_host,
         kv_indices_host,

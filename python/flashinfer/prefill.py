@@ -546,19 +546,19 @@ class BatchPrefillWithPagedKVCacheWrapper:
             enable_cuda_graph,
         )
         if enable_cuda_graph:
-            if not torch.is_tensor(self._qo_indptr):
+            if not torch.is_tensor(qo_indptr_buf):
                 raise ValueError(
                     "qo_indptr_buf should be a torch.Tensor in CUDA graph mode"
                 )
-            if not torch.is_tensor(self._paged_kv_indptr):
+            if not torch.is_tensor(paged_kv_indptr_buf):
                 raise ValueError(
                     "paged_kv_indptr_buf should be a torch.Tensor in CUDA graph mode"
                 )
-            if not torch.is_tensor(self._paged_kv_indices):
+            if not torch.is_tensor(paged_kv_indices_buf):
                 raise ValueError(
                     "paged_kv_indices_buf should be a torch.Tensor in CUDA graph mode"
                 )
-            if not torch.is_tensor(self._paged_kv_last_page_len):
+            if not torch.is_tensor(paged_kv_last_page_len_buf):
                 raise ValueError(
                     "paged_kv_last_page_len_buf should be a torch.Tensor in CUDA graph mode"
                 )
@@ -573,7 +573,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
     @property
     def is_cuda_graph_enabled(self):
-        return self._wrapper.is_cuda_graph_enabled
+        return self._wrapper.is_cuda_graph_enabled()
 
     def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
         r"""Reset the workspace buffer.
@@ -760,7 +760,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             paged_kv_data = paged_kv_data.to(torch.float16)
 
         paged_kv_data = expand_5d(paged_kv_data, self._kv_layout)
-        if self._custom_mask is None:
+        if self._custom_mask_buf is None:
             return self._wrapper.forward(
                 q,
                 self._qo_indptr_buf,
@@ -1077,7 +1077,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
     @property
     def is_cuda_graph_enabled(self):
-        return self._wrapper.is_cuda_graph_enabled
+        return self._wrapper.is_cuda_graph_enabled()
 
     def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
         r"""Reset the workspace buffer.
@@ -1234,7 +1234,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             q = q.to(torch.float16)
             k = k.to(torch.float16)
             v = v.to(torch.float16)
-        if self._custom_mask is None:
+        if self._custom_mask_buf is None:
             return self._wrapper.forward(
                 q,
                 self._qo_indptr_buf,
@@ -1257,7 +1257,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 v,
                 self._kv_indptr_buf,
                 self._custom_mask_buf,
-                self._qk_indptr,
+                self._qk_indptr_buf,
                 PosEncodingMode[pos_encoding_mode].value,
                 allow_fp16_qk_reduction,
                 sm_scale,

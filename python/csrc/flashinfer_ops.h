@@ -20,11 +20,6 @@
 #include <flashinfer/layout.cuh>
 #include <memory>
 
-// namespace flashinfer {
-// class BatchPrefillHandler;
-// class BatchDecodeHandler;
-// }  // namespace flashinfer
-
 torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                                           torch::Tensor tmp, unsigned int pos_encoding_mode,
                                           unsigned int layout, float sm_scale, float rope_scale,
@@ -93,11 +88,12 @@ class BatchDecodeWithPagedKVCachePyTorchWrapper {
   BatchDecodeWithPagedKVCachePyTorchWrapper(
       std::shared_ptr<flashinfer::BatchDecodeHandler> handler_ptr, flashinfer::QKVLayout kv_layout)
       : handler_(handler_ptr), kv_layout_(kv_layout) {}
-  BatchDecodeWithPagedKVCachePyTorchWrapper(unsigned int layout, unsigned int max_batch_size,
-                                            bool enable_cuda_graph)
+  BatchDecodeWithPagedKVCachePyTorchWrapper(unsigned int layout,
+                                            unsigned int max_workspace_size_in_bytes,
+                                            unsigned int max_batch_size, bool enable_cuda_graph)
       : kv_layout_(flashinfer::QKVLayout(layout)),
-        handler_(
-            std::make_shared<flashinfer::BatchDecodeHandler>(max_batch_size, enable_cuda_graph)) {}
+        handler_(std::make_shared<flashinfer::BatchDecodeHandler>(
+            max_workspace_size_in_bytes, max_batch_size, enable_cuda_graph)) {}
 
  protected:
   std::shared_ptr<flashinfer::BatchDecodeHandler> handler_;

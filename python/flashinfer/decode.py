@@ -483,9 +483,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
         check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
         self._workspace_buffer = workspace_buffer
+        # NOTE(Zihao): max_batch_size will only be used in cudagraph mode
+        max_batch_size = len(paged_kv_last_page_len_buffer) if enable_cuda_graph else 0
         self._wrapper = _kernels.BatchDecodeWithPagedKVCachePyTorchWrapper(
             TensorLayout[kv_layout].value,
             workspace_buffer.numel() * workspace_buffer.element_size(),
+            max_batch_size,
             enable_cuda_graph,
         )
         if enable_cuda_graph:

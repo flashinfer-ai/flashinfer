@@ -44,7 +44,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rmsnorm", &rmsnorm, "Root mean square normalization");
   py::class_<BatchDecodeWithPagedKVCachePyTorchWrapper>(m,
                                                         "BatchDecodeWithPagedKVCachePyTorchWrapper")
-      .def(py::init<unsigned int, unsigned int, bool>())
+      .def(py::init<unsigned int, unsigned int, unsigned int, bool>())
       .def("begin_forward", &BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward)
       .def("end_forward", &BatchDecodeWithPagedKVCachePyTorchWrapper::EndForward)
       .def("is_cuda_graph_enabled", &BatchDecodeWithPagedKVCachePyTorchWrapper::IsCUDAGraphEnabled)
