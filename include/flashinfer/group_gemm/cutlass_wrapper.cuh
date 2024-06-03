@@ -14,8 +14,31 @@
  * limitations under the License.
  */
 
+#include <cstdint>
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm_grouped.h"
 #include "cutlass/gemm/kernel/default_gemm_grouped.h"
 #include "cutlass/layout/matrix.h"
 #include "cutlass/numeric_types.h"
+
+namespace flashinfer {
+
+template <typename DType>
+__global__ void group_gemm_args_kernel(
+  cutlass::gemm::GemmCoord *all_problems,
+  DType **ptr_y,
+  DType **ptr_x,
+  DType **ptr_w,
+  int64_t *ld_y,
+  int64_t *ld_x,
+  int64_t *ld_w,
+  DType *y,
+  DType *x,
+  DType **w,
+  int64_t d_in,
+  int64_t d_out
+) {
+  // TODO(Zihao)
+}
+
+}
