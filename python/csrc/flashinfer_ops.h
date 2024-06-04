@@ -17,7 +17,7 @@
 #include <torch/extension.h>
 
 #include <flashinfer/attention/handler.cuh>
-#include <flashinfer/group_gemm/wrapper.cuh>
+#include <flashinfer/group_gemm/handler.cuh>
 #include <flashinfer/layout.cuh>
 #include <memory>
 
@@ -175,8 +175,8 @@ class CutlassSegmentGEMMPyTorchWrapper {
   torch::Tensor Forward(torch::Tensor x, torch::Tensor w);
 
   CutlassSegmentGEMMPyTorchWrapper()
-      : handler_(std::make_shared<flashinfer::group_gemm::CutlassSegmentGEMMWrapper>()) {}
+      : handler_(std::make_shared<flashinfer::group_gemm::CutlassSegmentGEMMHandler>()) {}
 
  private:
-  std::shared_ptr<flashinfer::group_gemm::CutlassSegmentGEMMWrapper> handler_;
-}
+  std::shared_ptr<flashinfer::group_gemm::CutlassSegmentGEMMHandler> handler_;
+};

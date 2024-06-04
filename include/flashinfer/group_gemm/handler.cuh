@@ -72,7 +72,7 @@ class CutlassSegmentGEMMHandler {
     w_column_major_ = weight_column_major;
 
     AlignedAllocator allocator(buffer_, workspace_size_in_bytes);
-    problem_size_ = allocator.aligned_alloc<cutlass::gemm::GemmCoord>(batch_size, 16);
+    problem_sizes_ = allocator.aligned_alloc<cutlass::gemm::GemmCoord>(batch_size, 16);
     x_data_ = allocator.aligned_alloc<DType*>(batch_size, 16);
     w_data_ = allocator.aligned_alloc<DType*>(batch_size, 16);
     y_data_ = allocator.aligned_alloc<DType*>(batch_size, 16);
@@ -82,13 +82,13 @@ class CutlassSegmentGEMMHandler {
 
     auto compute_args_kernel = compute_cutlass_group_gemm_args<DType>;
 
-    void* args[] = {(void*)&problem_size_, (void*)&x_data_,     (void*)&w_data_,
-                    (void*)&y_data_,       (void*)&ld_x_,       (void*)&ld_w_,
-                    (void*)&ld_y_,         (void*)&xy_indptr_d, (void*)&w_indices_d,
-                    (void*)&d_in,          (void*)&d_out,       (void*)&w_column_major_};
+    void* args[] = {(void*)&problem_sizes_, (void*)&x_data_,     (void*)&w_data_,
+                    (void*)&y_data_,        (void*)&ld_x_,       (void*)&ld_w_,
+                    (void*)&ld_y_,          (void*)&xy_indptr_d, (void*)&w_indices_d,
+                    (void*)&d_in,           (void*)&d_out,       (void*)&w_column_major_};
 
     FLASHINFER_CUDA_CALL(
-        cudaLaunchKernel((void*)compute_args_kernel, batch_size, 1, args, 0, stream_););
+        cudaLaunchKernel((void*)compute_args_kernel, batch_size, 1, args, 0, stream_));
 
     return cudaSuccess;
   }
