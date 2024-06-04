@@ -420,7 +420,7 @@ class BatchDecodeHandler {
    * \note (Zihao): when enable_cuda_graph is true, max_workspace_size_in_bytes will be ignored,
    *                when enable_cuda_graph is false, max_batch_size will be ignored.
    */
-  BatchDecodeHandler(size_t max_workspace_size_in_bytes = 128 * 64 * 64,
+  BatchDecodeHandler(size_t max_workspace_size_in_bytes = 128 * 1024 * 1024,
                      size_t max_batch_size = 16384, bool enable_cuda_graph = false)
       : batch_size_after_partition_(0U),
         float_buffer_(nullptr),

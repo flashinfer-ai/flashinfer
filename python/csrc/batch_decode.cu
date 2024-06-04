@@ -222,8 +222,8 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
   }
   CHECK_EQ(paged_kv_data.size(1), 2);
   CHECK_EQ(paged_kv_data.size(4), head_dim);
-  CHECK_EQ(paged_kv_indptr.size(0), batch_size + 1);
-  CHECK_EQ(paged_kv_last_page_len.size(0), batch_size);
+  CHECK_GE(paged_kv_indptr.size(0), batch_size + 1);
+  CHECK_GE(paged_kv_last_page_len.size(0), batch_size);
   // TODO(Zihao): support dispatching to different data types
   CHECK_EQ(paged_kv_indptr.scalar_type(), torch::kInt32);
   CHECK_EQ(paged_kv_indices.scalar_type(), torch::kInt32);
