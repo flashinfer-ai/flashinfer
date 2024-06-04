@@ -32,6 +32,8 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
   CHECK_DIM(3, v);
   CHECK_SHAPE(k, v);
   CHECK_EQ(q.size(1), k.size(2));
+  CHECK_EQ(q.scalar_type(), k.scalar_type());
+  CHECK_EQ(q.scalar_type(), v.scalar_type());
   unsigned int num_qo_heads = q.size(0);
   unsigned int head_dim = q.size(1);
   unsigned int kv_len, num_kv_heads;

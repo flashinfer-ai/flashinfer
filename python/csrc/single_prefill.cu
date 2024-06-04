@@ -32,6 +32,8 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
   CHECK_DIM(3, v);
   CHECK_SHAPE(k, v);
   CHECK_EQ(q.size(2), k.size(2));
+  CHECK_EQ(q.scalar_type(), k.scalar_type());
+  CHECK_EQ(q.scalar_type(), v.scalar_type());
   unsigned int head_dim = q.size(2);
   unsigned int kv_len, qo_len, num_kv_heads, num_qo_heads;
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
