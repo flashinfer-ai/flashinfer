@@ -37,17 +37,17 @@ class CutlassSegmentGEMMHandler {
   cutlass::gemm::GemmCoord* GetProblemSizes() const { return problem_sizes_; }
 
   template <typename DType>
-  DType** GetXPtr() const {
+  DType** GetXPtr() {
     return static_cast<DType**>(x_data_);
   }
 
   template <typename DType>
-  DType** GetWPtr() const {
+  DType** GetWPtr() {
     return static_cast<DType**>(w_data_);
   }
 
   template <typename DType>
-  DType** GetYPtr() const {
+  DType** GetYPtr() {
     return static_cast<DType**>(y_data_);
   }
 
@@ -71,9 +71,9 @@ class CutlassSegmentGEMMHandler {
 
     AlignedAllocator allocator(buffer_, workspace_size_in_bytes);
     problem_sizes_ = allocator.aligned_alloc<cutlass::gemm::GemmCoord>(batch_size, 16);
-    x_data_ = allocator.aligned_alloc<DType*>(batch_size, 16);
-    w_data_ = allocator.aligned_alloc<DType*>(batch_size, 16);
-    y_data_ = allocator.aligned_alloc<DType*>(batch_size, 16);
+    x_data_ = allocator.aligned_alloc<DType**>(batch_size, 16);
+    w_data_ = allocator.aligned_alloc<DType**>(batch_size, 16);
+    y_data_ = allocator.aligned_alloc<DType**>(batch_size, 16);
     ld_x_ = allocator.aligned_alloc<int64_t>(batch_size, 16);
     ld_w_ = allocator.aligned_alloc<int64_t>(batch_size, 16);
     ld_y_ = allocator.aligned_alloc<int64_t>(batch_size, 16);
@@ -108,9 +108,9 @@ class CutlassSegmentGEMMHandler {
   bool w_column_major_;
   size_t batch_size_;
   cutlass::gemm::GemmCoord* problem_sizes_;
-  void** x_data_;
-  void** w_data_;
-  void** y_data_;
+  void* x_data_;
+  void* w_data_;
+  void* y_data_;
   void* ld_x_;
   void* ld_w_;
   void* ld_y_;

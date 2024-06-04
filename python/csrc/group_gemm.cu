@@ -25,7 +25,7 @@ void CutlassSegmentGEMMPyTorchWrapper::RegisterProblem(torch::Tensor workspace_b
                                                        unsigned int d_out, bool weight_column_major,
                                                        torch::Tensor seg_indptr,
                                                        torch::Tensor weight_indices,
-                                                       torch::Tensor empty_data, ) {
+                                                       torch::Tensor empty_data) {
   CHECK_CUDA(workspace_buffer);
   // TODO(Zihao): add more checks here
   size_t workspace_size_in_bytes = workspace_buffer.size(0) * workspace_buffer.element_size();
@@ -37,12 +37,14 @@ void CutlassSegmentGEMMPyTorchWrapper::RegisterProblem(torch::Tensor workspace_b
   }
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(empty_data.scalar_type(), c_type, [&] {
+    using cutlass_t = typename cutlass_dtype<c_type>::type;
     cudaError_t status = handler_->RegisterProblem<c_type>(
         static_cast<void*>(workspace_buffer.data_ptr()), workspace_size_in_bytes,
         static_cast<int64_t*>(seg_indptr.data_ptr()),
         weight_indices_defined ? static_cast<int64_t*>(weight_indices.data_ptr()) : nullptr,
         batch_size, d_in, d_out, weight_column_major);
     TORCH_CHECK(status == cudaSuccess, "Failed to register problem: ", cudaGetErrorString(status));
+    return true;
   });
 }
 
@@ -52,18 +54,21 @@ torch::Tensor CutlassSegmentGEMMPyTorchWrapper::Forward(torch::Tensor x, torch::
   CHECK_CUDA(weight);
   CHECK_DIM(2, x);       // x: [sum(m_i), d_in]
   CHECK_DIM(2, weight);  // weight: [d_out, d_in] if weight_column_major, [d_in, d_out] otherwise
-  size_t cumulative_batch_size = x.size(0);
-  size_t d_out = handler_->IsWeightColumnMajor() ? weight.size(0) : weight.size(1);
-  size_t d_in = handler_->IsWeightColumnMajor() ? weight.size(1) : weight.size(0);
+  int64_t cumulative_batch_size = x.size(0);
+  int64_t d_out = handler_->IsWeightColumnMajor() ? weight.size(0) : weight.size(1);
+  int64_t d_in = handler_->IsWeightColumnMajor() ? weight.size(1) : weight.size(0);
   CHECK_EQ(x.size(1), d_in);
   auto y = torch::empty({cumulative_batch_size, d_out}, x.options());
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(x.scalar_type(), c_type, [&] {
     cudaError_t status = CutlassSegmentGEMMWrapper<c_type>(
-        handler_, static_cast<c_type*>(x.data_ptr()), static_cast<c_type*>(weight.data_ptr()),
+        handler_.get(), static_cast<c_type*>(x.data_ptr()), static_cast<c_type*>(weight.data_ptr()),
         static_cast<c_type*>(y.data_ptr()), torch_current_stream);
     TORCH_CHECK(status == cudaSuccess,
                 "Failed to run CutlassSegmentGEMM: ", cudaGetErrorString(status));
+    return true;
   });
+
+  return y;
 }
