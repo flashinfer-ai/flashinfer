@@ -70,6 +70,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
   CHECK_DIM(1, paged_kv_indptr);         // (B + 1,)
   CHECK_DIM(1, paged_kv_indices);        // (nnz_kv,)
   CHECK_DIM(1, paged_kv_last_page_len);  // (B,)
+  CHECK_EQ(q.scalar_type(), paged_kv_data.scalar_type());
   int64_t batch_size = qo_indptr.size(0) - 1;
   int64_t nnz_qo = q.size(0);
   int64_t num_qo_heads = q.size(1);
@@ -173,6 +174,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCu
   CHECK_DIM(1, paged_kv_last_page_len);  // (B,)
   CHECK_DIM(1, custom_mask);             // (nnz_qk,)
   CHECK_DIM(1, qk_indptr);               // (B + 1,)
+  CHECK_EQ(q.scalar_type(), paged_kv_data.scalar_type());
   int64_t batch_size = qo_indptr.size(0) - 1;
   int64_t nnz_qo = q.size(0);
   int64_t num_qo_heads = q.size(1);
@@ -299,6 +301,8 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
   CHECK_DIM(3, k);          // (nnz_kv, H_kv, D) if NHD else (H_kv, nnz_kv, D)
   CHECK_DIM(3, v);          // (nnz_kv, H_kv, D) if NHD else (H_kv, nnz_kv, D)
   CHECK_DIM(1, kv_indptr);  // (B + 1,)
+  CHECK_EQ(q.scalar_type(), k.scalar_type());
+  CHECK_EQ(q.scalar_type(), v.scalar_type());
   int64_t batch_size = qo_indptr.size(0) - 1;
   int64_t nnz_qo = q.size(0);
   int64_t num_qo_heads = q.size(1);
@@ -382,6 +386,8 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardC
   CHECK_DIM(1, kv_indptr);    // (B + 1,)
   CHECK_DIM(1, custom_mask);  // (nnz_qk,)
   CHECK_DIM(1, qk_indptr);    // (B + 1,)
+  CHECK_EQ(q.scalar_type(), k.scalar_type());
+  CHECK_EQ(q.scalar_type(), v.scalar_type());
   int64_t batch_size = qo_indptr.size(0) - 1;
   int64_t nnz_qo = q.size(0);
   int64_t num_qo_heads = q.size(1);

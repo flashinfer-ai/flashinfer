@@ -33,6 +33,8 @@ std::vector<torch::Tensor> batch_decode_with_padded_kv_cache(
   CHECK_SHAPE(k_padded, v_padded);
   CHECK_EQ(q.size(0), k_padded.size(0));
   CHECK_EQ(q.size(2), k_padded.size(3));
+  CHECK_EQ(q.scalar_type(), k_padded.scalar_type());
+  CHECK_EQ(q.scalar_type(), v_padded.scalar_type());
   unsigned int batch_size = q.size(0);
   unsigned int num_qo_heads = q.size(1);
   unsigned int head_dim = q.size(2);
@@ -206,6 +208,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
   CHECK_DIM(1, paged_kv_last_page_len);  // (B,)
   CHECK_DIM(1, paged_kv_indptr);         // (B+1,)
   CHECK_DIM(1, paged_kv_indices);        // (nnz,)
+  CHECK_EQ(q.scalar_type(), paged_kv_data.scalar_type());
   // (num_max_pages, 2, H_kv, page_size, head_dim) for HND
   // (num_max_pages, 2, page_size, H_kv, head_dim) for NHD
   CHECK_DIM(5, paged_kv_data);
