@@ -16,8 +16,6 @@
 #ifndef FLASHINFER_GROUP_GEMM_HANDLER_CUH_
 #define FLASHINFER_GROUP_GEMM_HANDLER_CUH_
 
-#include <stdatomic.h>
-
 #include "../allocator.h"
 #include "../utils.cuh"
 #include "group_gemm_cutlass.cuh"
@@ -110,9 +108,9 @@ class CutlassSegmentGEMMHandler {
   bool w_column_major_;
   size_t batch_size_;
   cutlass::gemm::GemmCoord* problem_sizes_;
-  void* x_data_;
-  void* w_data_;
-  void* y_data_;
+  void** x_data_;
+  void** w_data_;
+  void** y_data_;
   void* ld_x_;
   void* ld_w_;
   void* ld_y_;
