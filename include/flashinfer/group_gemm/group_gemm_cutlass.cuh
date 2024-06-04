@@ -50,7 +50,7 @@ __global__ void compute_cutlass_group_gemm_args(cutlass::gemm::GemmCoord* all_pr
   int i = blockIdx.x;
   int m = xy_indptr[i + 1] - xy_indptr[i], k = d_in, n = d_out;
   all_problems[i] = cutlass::gemm::GemmCoord(m, n, k);
-  ptr_w[i] = w + w_indices[i] * d_in * d_out;
+  ptr_w[i] = w + (w_indices == nullptr ? i : w_indices[i]) * d_in * d_out;
   ptr_x[i] = x + xy_indptr[i] * d_in;
   ptr_y[i] = y + xy_indptr[i] * d_out;
   ld_x[i] = k;                       // m * k

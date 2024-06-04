@@ -17,6 +17,7 @@
 #include <torch/extension.h>
 
 #include <flashinfer/attention/handler.cuh>
+#include <flashinfer/group_gemm/wrapper.cuh>
 #include <flashinfer/layout.cuh>
 #include <memory>
 
@@ -164,3 +165,18 @@ class BatchPrefillWithRaggedKVCachePyTorchWrapper {
   std::shared_ptr<flashinfer::BatchPrefillHandler> handler_;
   flashinfer::QKVLayout kv_layout_;
 };
+
+class CutlassSegmentGEMMPyTorchWrapper {
+ public:
+  void RegisterProblem(torch::Tensor workspace_buffer, unsigned int batch_size, unsigned int d_in,
+                       unsigned int d_out, bool weight_column_major, torch::Tensor seg_indptr,
+                       torch::Tensor weight_indices, torch::Tensor empty_data);
+
+  torch::Tensor Forward(torch::Tensor x, torch::Tensor w);
+
+  CutlassSegmentGEMMPyTorchWrapper()
+      : handler_(std::make_shared<flashinfer::group_gemm::CutlassSegmentGEMMWrapper>()) {}
+
+ private:
+  std::shared_ptr<flashinfer::group_gemm::CutlassSegmentGEMMWrapper> handler_;
+}

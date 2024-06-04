@@ -57,6 +57,7 @@ class SegmentGEMMWrapper:
         seg_lens: Optional[torch.Tensor] = None,
         seg_indptr: Optional[torch.Tensor] = None,
         weight_indices: Optional[torch.Tensor] = None,
+        dtype: torch.dtype = torch.float16,
     ):
         if seg_lens is None and seg_indptr is None:
             raise ValueError("Either seg_lens or seg_indptr should be provided.")
@@ -68,6 +69,14 @@ class SegmentGEMMWrapper:
                 ],
                 dim=0,
             )
+        if weight_indices is None:
+            # create an empty CPU tensor as placeholder
+            weight_indices = torch.empty(0, dtype=torch.int64)
+        # NOTE(Zihao): the following tensor acts as placeholder to pass dtype info
+        empty_data = torch.empty(
+            0,
+            dtype=(getattr(torch, dtype) if isinstance(dtype, str) else dtype),
+        )
         self._wrapper.register_problem(
             self._workspace_buffer,
             batch_size,
@@ -76,6 +85,7 @@ class SegmentGEMMWrapper:
             weight_column_major,
             seg_indptr,
             weight_indices,
+            empty_data,
         )
 
     def forward(self, x: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
