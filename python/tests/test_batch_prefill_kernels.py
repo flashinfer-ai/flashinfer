@@ -43,7 +43,7 @@ def test_batch_prefill_with_paged_kv_cache(
     causal,
     kv_layout,
     pos_encoding_mode,
-    enable_cuda_graph
+    enable_cuda_graph,
 ):
     q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
     q_indptr_cpu = torch.arange(0, batch_size + 1).int() * qo_len
@@ -81,23 +81,29 @@ def test_batch_prefill_with_paged_kv_cache(
             head_dim,
             page_size,
         )
-        o = wrapper.forward(q, kv_data, causal=causal, pos_encoding_mode=pos_encoding_mode)
+        o = wrapper.forward(
+            q, kv_data, causal=causal, pos_encoding_mode=pos_encoding_mode
+        )
     else:
         q_indptr_buffer = torch.empty(batch_size + 1).int().to(0)
         kv_indptr_buffer = torch.empty(batch_size + 1).int().to(0)
         kv_indices_buffer = torch.empty(total_num_pages).int().to(0)
         kv_last_page_len_buffer = torch.empty(batch_size).int().to(0)
         wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            workspace_buffer, kv_layout, enable_cuda_graph=True,
+            workspace_buffer,
+            kv_layout,
+            enable_cuda_graph=True,
             qo_indptr_buf=q_indptr_buffer,
             paged_kv_indptr_buf=kv_indptr_buffer,
             paged_kv_indices_buf=kv_indices_buffer,
-            paged_kv_last_page_len_buf=kv_last_page_len_buffer
+            paged_kv_last_page_len_buf=kv_last_page_len_buffer,
         )
         q_indptr_warmup = torch.arange(0, batch_size + 1).int() * qo_len
         kv_indptr_warmup = torch.arange(0, batch_size + 1).int()
         kv_indices_warmup = torch.arange(0, batch_size).int()
-        kv_last_page_len_warmup = torch.full((batch_size,), page_size, dtype=torch.int32)
+        kv_last_page_len_warmup = torch.full(
+            (batch_size,), page_size, dtype=torch.int32
+        )
         wrapper.begin_forward(
             q_indptr_warmup,
             kv_indptr_warmup,
@@ -113,9 +119,7 @@ def test_batch_prefill_with_paged_kv_cache(
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             for _ in range(3):
-                o = wrapper.forward(
-                    q, kv_data, pos_encoding_mode=pos_encoding_mode
-                )
+                o = wrapper.forward(q, kv_data, pos_encoding_mode=pos_encoding_mode)
         torch.cuda.current_stream().wait_stream(s)
         # capture
         g = torch.cuda.CUDAGraph()
@@ -148,7 +152,9 @@ def test_batch_prefill_with_paged_kv_cache(
                 (
                     kv_data[kv_indptr_cpu[i + 1] - 1, 0, :, : kv_last_page_len_cpu[i]]
                     if kv_layout == "HND"
-                    else kv_data[kv_indptr_cpu[i + 1] - 1, 0, : kv_last_page_len_cpu[i], :]
+                    else kv_data[
+                        kv_indptr_cpu[i + 1] - 1, 0, : kv_last_page_len_cpu[i], :
+                    ]
                 )
                 .permute(*perm_dims_last)
                 .reshape(-1, num_kv_heads, head_dim),
@@ -163,7 +169,9 @@ def test_batch_prefill_with_paged_kv_cache(
                 (
                     kv_data[kv_indptr_cpu[i + 1] - 1, 1, :, : kv_last_page_len_cpu[i]]
                     if kv_layout == "HND"
-                    else kv_data[kv_indptr_cpu[i + 1] - 1, 1, : kv_last_page_len_cpu[i], :]
+                    else kv_data[
+                        kv_indptr_cpu[i + 1] - 1, 1, : kv_last_page_len_cpu[i], :
+                    ]
                 )
                 .permute(*perm_dims_last)
                 .reshape(-1, num_kv_heads, head_dim),
@@ -381,4 +389,3 @@ if __name__ == "__main__":
     )
     test_batch_prefill_with_ragged_kv_cache(12, 54, 37, 8, 8, 128, True, "NONE")
     test_batch_prefill_with_ragged_kv_cache_custom_mask(12, 137, 137, 8, 8, 128, "NONE")
-

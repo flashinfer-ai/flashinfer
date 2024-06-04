@@ -16,8 +16,8 @@
 #ifndef FLASHINFER_ALLOCATOR_H_
 #define FLASHINFER_ALLOCATOR_H_
 
-#include <stdexcept>
 #include <memory>
+#include <stdexcept>
 
 namespace flashinfer {
 

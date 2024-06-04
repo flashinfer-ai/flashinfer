@@ -13,3 +13,17 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#ifndef FLASHINFER_GROUP_GEMM_LORA_CUH_
+#define FLASHINFER_GROUP_GEMM_LORA_CUH_
+
+namespace flashinfer {
+
+namespace group_gemm {
+
+// TODO(Zihao): port punica's sgmv kernel
+
+}  // namespace group_gemm
+
+}  // namespace flashinfer
+
+#endif  // FLASHINFER_GROUP_GEMM_LORA_CUH_

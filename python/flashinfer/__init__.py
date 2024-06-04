@@ -45,6 +45,7 @@ from .sampling import (
     chain_speculative_sampling,
 )
 from .norm import rmsnorm
+from .group_gemm import SegmentGEMMWrapper
 
 try:
     from ._build_meta import __version__ as __version__

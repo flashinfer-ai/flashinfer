@@ -386,6 +386,7 @@ if __name__ == "__main__":
                 "csrc/batch_prefill.cu",
                 "csrc/sampling.cu",
                 "csrc/norm.cu",
+                "csrc/group_gemm.cu",
             ]
             + get_instantiation_cu(),
             include_dirs=[
