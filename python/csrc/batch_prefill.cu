@@ -83,9 +83,9 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
     num_kv_heads = paged_kv_data.size(3);
   }
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
-  CHECK_EQ(qo_indptr.size(0), batch_size + 1);
-  CHECK_EQ(paged_kv_indptr.size(0), batch_size + 1);
-  CHECK_EQ(paged_kv_last_page_len.size(0), batch_size);
+  CHECK_GE(qo_indptr.size(0), batch_size + 1);
+  CHECK_GE(paged_kv_indptr.size(0), batch_size + 1);
+  CHECK_GE(paged_kv_last_page_len.size(0), batch_size);
   CHECK_EQ(paged_kv_data.size(1), 2);
   CHECK_EQ(paged_kv_data.size(4), head_dim);
   qo_indptr = qo_indptr.to(torch::kInt32);
@@ -186,12 +186,12 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCu
     num_kv_heads = paged_kv_data.size(3);
   }
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
-  CHECK_EQ(qo_indptr.size(0), batch_size + 1);
-  CHECK_EQ(paged_kv_indptr.size(0), batch_size + 1);
-  CHECK_EQ(paged_kv_last_page_len.size(0), batch_size);
+  CHECK_GE(qo_indptr.size(0), batch_size + 1);
+  CHECK_GE(paged_kv_indptr.size(0), batch_size + 1);
+  CHECK_GE(paged_kv_last_page_len.size(0), batch_size);
   CHECK_EQ(paged_kv_data.size(1), 2);
   CHECK_EQ(paged_kv_data.size(4), head_dim);
-  CHECK_EQ(qk_indptr.size(0), batch_size + 1);
+  CHECK_GE(qk_indptr.size(0), batch_size + 1);
   qo_indptr = qo_indptr.to(torch::kInt32);
   paged_kv_indptr = paged_kv_indptr.to(torch::kInt32);
   paged_kv_indices = paged_kv_indices.to(torch::kInt32);
@@ -303,7 +303,7 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
   int64_t nnz_qo = q.size(0);
   int64_t num_qo_heads = q.size(1);
   int64_t head_dim = q.size(2);
-  CHECK_EQ(kv_indptr.size(0), batch_size + 1);
+  CHECK_GE(kv_indptr.size(0), batch_size + 1);
   int64_t num_kv_heads = (kv_layout_ == QKVLayout::kNHD) ? k.size(1) : k.size(0);
   CHECK_EQ(k.size(0), v.size(0));
   CHECK_EQ(k.size(1), v.size(1));
@@ -366,8 +366,8 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
 std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardCustomMask(
     torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor k, torch::Tensor v,
     torch::Tensor kv_indptr, torch::Tensor custom_mask, torch::Tensor qk_indptr,
-    unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction, float sm_scale, float rope_scale,
-    float rope_theta, bool return_lse) {
+    unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction,
+    float sm_scale, float rope_scale, float rope_theta, bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(qo_indptr);
   CHECK_INPUT(k);
@@ -386,8 +386,8 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardC
   int64_t nnz_qo = q.size(0);
   int64_t num_qo_heads = q.size(1);
   int64_t head_dim = q.size(2);
-  CHECK_EQ(kv_indptr.size(0), batch_size + 1);
-  CHECK_EQ(qk_indptr.size(0), batch_size + 1);
+  CHECK_GE(kv_indptr.size(0), batch_size + 1);
+  CHECK_GE(qk_indptr.size(0), batch_size + 1);
   int64_t num_kv_heads = (kv_layout_ == QKVLayout::kNHD) ? k.size(1) : k.size(0);
   CHECK_EQ(k.size(0), v.size(0));
   CHECK_EQ(k.size(1), v.size(1));
