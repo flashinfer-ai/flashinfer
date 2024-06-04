@@ -35,7 +35,7 @@ class SegmentGEMMWrapper:
 
     def __init__(self, workspace_buffer: torch.Tensor):
         self._workspace_buffer = workspace_buffer
-        self._wrapper = _kernels.SegmentGEMMWrapper()
+        self._wrapper = _kernels.CutlassSegmentGEMMPyTorchWrapper()
 
     def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
         r"""Reset the workspace buffer.
