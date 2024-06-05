@@ -34,7 +34,7 @@ namespace flashinfer {{
 
 constexpr PageStorage page_storage = PageStorage::kIndices;
 
-template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{group_size}, {head_dim}, page_storage, {kv_layout}, {pos_encoding_mode}, {dtype_q}, {dtype_kv} {dtype_out}, {idtype}>(
+template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{group_size}, {head_dim}, page_storage, {kv_layout}, {pos_encoding_mode}, {dtype_q}, {dtype_kv}, {dtype_out}, {idtype}>(
     {dtype_q}* q, {idtype}* q_offset,
     paged_kv_t<page_storage, {kv_layout}, {dtype_kv}, {idtype}> paged_kv,
     kv_partition_info_t<{idtype}> kv_partition_info,
