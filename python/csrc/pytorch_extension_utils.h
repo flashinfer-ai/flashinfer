@@ -16,7 +16,6 @@
 #pragma once
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_fp16.h>
-#include <thrust/execution_policy.h>
 #include <torch/extension.h>
 
 #include <flashinfer/layout.cuh>
