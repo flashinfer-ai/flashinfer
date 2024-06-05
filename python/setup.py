@@ -391,7 +391,9 @@ if __name__ == "__main__":
             + get_instantiation_cu(),
             include_dirs=[
                 str(root.resolve() / "include"),
-                str(root.resolve() / "3rdparty" / "cutlass" / "include") # for group gemm
+                str(
+                    root.resolve() / "3rdparty" / "cutlass" / "include"
+                ),  # for group gemm
             ],
             extra_compile_args={
                 "cxx": [

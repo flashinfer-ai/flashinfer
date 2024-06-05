@@ -16,6 +16,7 @@ limitations under the License.
 
 import torch
 from typing import Optional
+from .utils import get_indptr
 
 try:
     from . import _kernels
@@ -34,8 +35,18 @@ class SegmentGEMMWrapper:
     r"""Wrapper for segment GEMM kernels."""
 
     def __init__(self, workspace_buffer: torch.Tensor):
+        r"""Initialize the wrapper.
+
+        Parameters
+        ----------
+        workspace_buffer : torch.Tensor
+            The workspace buffer for the kernels, we use it to store the metadata for the segment GEMM whose
+            size is proportional to the number of segments (batch size), 1MB workspace is enough for most cases.
+        """
         self._workspace_buffer = workspace_buffer
-        self._wrapper = _kernels.CutlassSegmentGEMMPyTorchWrapper()
+        self._wrapper = _kernels.CutlassSegmentGEMMPyTorchWrapper(
+            self._workspace_buffer
+        )
 
     def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
         r"""Reset the workspace buffer.
@@ -47,47 +58,88 @@ class SegmentGEMMWrapper:
             be the same as the device of the input tensors.
         """
         self._workspace_buffer = new_workspace_buffer
+        self._wrapper.register_workspace_buffer(new_workspace_buffer)
 
-    def register_problem(
+    def forward(
         self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
         batch_size: int,
-        d_in: int,
-        d_out: int,
         weight_column_major: bool,
         seg_lens: Optional[torch.Tensor] = None,
         seg_indptr: Optional[torch.Tensor] = None,
         weight_indices: Optional[torch.Tensor] = None,
-        dtype: torch.dtype = torch.float16,
-    ):
+    ) -> torch.Tensor:
+        r"""Forward pass of segment GEMM.
+
+        Compute the matrix multiplication between a batch of input tensor (with variable number of rows, but fixed
+        number of columns) and a batch of weight tensor with fixed number of rows and columns:
+
+        .. math::
+
+            y[i] = x[i] \times W[i]
+
+        if :attr:`weight_indices` is provided, we will select the weight tensor based on the indices in the
+        :attr:`weight_indices` tensor:
+
+        .. math::
+
+            y[i] = x[i] \times W[weight_indices[i]]
+
+        We use Ragged Tensor to represent the input tensor :attr:`x` and the output tensor :attr:`y`, and each x[i]
+        is a segment of the concatenated tensor. Please see :ref:`Ragged Tensor tutorial <ragged-layout>` for more details.
+        We use a ``seg_len`` or ``seg_indptr`` tensor (either would work) to indicate the start and end of each segment,
+        where the ``seg_indptr`` is the cumulative sum of the ``seg_lens`` tensor (with an additional 0 at the beginning):
+
+        .. math::
+
+            \text{seg_indptr}[i] = \sum_{j=0}^{i-1} \text{seg_lens}[j], \quad \text{seg_indptr}[0] = 0
+
+        - If ``seg_lens`` is provided, then :attr:`x` has shape ``(sum(seg_lens), d_in)`` and :attr:`y` has shape
+            ``(sum(seg_lens), d_out)``, where ``d_in`` is the number of columns of the input tensor and ``d_out`` is the
+            number of columns of the output tensor.
+        - If ``seg_indptr`` is provided, then :attr:`x` has shape ``(seg_indptr[-1], d_in)`` and :attr:`y` has shape
+            ``(seg_indptr[-1], d_out)``.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            The input tensor with shape ``(sum(seg_lens), d_in)``.
+        weights : torch.Tensor
+            The 3D weight tensor with shape ``(num_weights, d_in, d_out)`` if :attr:`weight_column_major` is ``False``,
+            or ``(num_weights, d_out, d_in)`` if :attr:`weight_column_major` is ``True``.
+        batch_size : int
+            The number of segments.
+        weight_column_major : bool
+            Whether the weight tensor is column major.
+        seg_lens : Optional[torch.Tensor]
+            The length of each segment, with shape ``(batch_size,)``, expects a 1D tensor of dtype ``torch.int64``.
+        seg_indptr : Optional[torch.Tensor]
+            The indptr of the segments, with shape ``(batch_size + 1,)``, expects a 1D tensor of dtype ``torch.int64``.
+            If this is provided, then :attr:`seg_lens` will be ignored, otherwise ``seg_indptr`` will be computed
+            internally from :attr:`seg_lens`.
+        weight_indices : Optional[torch.Tensor]
+            The indices of the weight tensor to be selected for each segment, with shape ``(batch_size,)``.
+            Expects a 1D tensor of dtype ``torch.int64``.
+            If this is provided, then the weight tensor will be selected based on the indices in this tensor.
+
+        Returns
+        -------
+        torch.Tensor
+            The output tensor with shape ``(sum(seg_lens), d_out)``.
+        """
         if seg_lens is None and seg_indptr is None:
             raise ValueError("Either seg_lens or seg_indptr should be provided.")
         if seg_indptr is None:
-            seg_indptr = torch.cat(
-                [
-                    torch.tensor([0], device=seg_lens.device, dtype=seg_lens.dtype),
-                    seg_lens.cumsum(0),
-                ],
-                dim=0,
-            )
+            seg_indptr = get_indptr(seg_lens.to(x))
         if weight_indices is None:
             # create an empty CPU tensor as placeholder
             weight_indices = torch.empty(0, dtype=torch.int64)
-        # NOTE(Zihao): the following tensor acts as placeholder to pass dtype info
-        empty_data = torch.empty(
-            0,
-            dtype=(getattr(torch, dtype) if isinstance(dtype, str) else dtype),
-        )
-        self._wrapper.register_problem(
-            self._workspace_buffer,
-            batch_size,
-            d_in,
-            d_out,
-            weight_column_major,
+        return self._wrapper.forward(
             seg_indptr,
             weight_indices,
-            empty_data,
+            x,
+            weights,
+            batch_size,
+            weight_column_major,
         )
-
-    def forward(self, x: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-        r"""Forward pass of segment GEMM."""
-        return self._wrapper.forward(x, weights)

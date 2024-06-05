@@ -168,14 +168,15 @@ class BatchPrefillWithRaggedKVCachePyTorchWrapper {
 
 class CutlassSegmentGEMMPyTorchWrapper {
  public:
-  void RegisterProblem(torch::Tensor workspace_buffer, unsigned int batch_size, unsigned int d_in,
-                       unsigned int d_out, bool weight_column_major, torch::Tensor seg_indptr,
-                       torch::Tensor weight_indices, torch::Tensor empty_data);
+  void RegisterWorkspaceBuffer(torch::Tensor workspace_buffer);
 
-  torch::Tensor Forward(torch::Tensor x, torch::Tensor w);
+  torch::Tensor Forward(torch::Tensor seg_indptr, torch::Tensor weight_indices, torch::Tensor x,
+                        torch::Tensor weight, unsigned int batch_size, bool weight_column_major);
 
-  CutlassSegmentGEMMPyTorchWrapper()
-      : handler_(std::make_shared<flashinfer::group_gemm::CutlassSegmentGEMMHandler>()) {}
+  CutlassSegmentGEMMPyTorchWrapper(torch::Tensor workspace_buffer)
+      : handler_(std::make_shared<flashinfer::group_gemm::CutlassSegmentGEMMHandler>()) {
+    RegisterWorkspaceBuffer(workspace_buffer);
+  }
 
  private:
   std::shared_ptr<flashinfer::group_gemm::CutlassSegmentGEMMHandler> handler_;

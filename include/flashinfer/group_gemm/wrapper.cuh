@@ -16,80 +16,99 @@
 #ifndef FLASHINFER_GROUP_GEMM_WRAPPER_CUH_
 #define FLASHINFER_GROUP_GEMM_WRAPPER_CUH_
 
+#include <sstream>
+
+#include "../allocator.h"
 #include "handler.cuh"
 
 namespace flashinfer {
 
 namespace group_gemm {
 
+#define DISPATCH_WEIGHT_LAYOUT(is_column_major, WEIGHT_LAYOUT, ...) \
+  if (is_column_major) {                                            \
+    using WEIGHT_LAYOUT = cutlass::layout::ColumnMajor;             \
+    __VA_ARGS__                                                     \
+  } else {                                                          \
+    using WEIGHT_LAYOUT = cutlass::layout::RowMajor;                \
+    __VA_ARGS__                                                     \
+  }
+
 template <typename DType>
 cudaError_t CutlassSegmentGEMMWrapper(CutlassSegmentGEMMHandler* handler, DType* x, DType* w,
-                                      DType* y, cudaStream_t stream) {
-  using cutlass_t = typename cutlass_dtype<DType>::type;
-  if (handler->IsProblemRegistered()) {
-    using cutlass::epilogue::thread::LinearCombination;
-    using cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle;
-    if (!handler->IsWeightColumnMajor()) {
-      // TODO(Zihao): investigate the difference between GroupScheduleMode::kDeviceOnly and
-      // GroupScheduleMode::kHostPrecompute
-      using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
-          cutlass_t,                              // Element A
-          cutlass::layout::RowMajor,              // Layout A
-          cutlass::ComplexTransform::kNone,       //
-          8,                                      // Granularity A
-          cutlass_t,                              // Element B
-          cutlass::layout::RowMajor,              // Layout B
-          cutlass::ComplexTransform::kNone,       //
-          8,                                      // Granularity B
-          cutlass_t,                              // Element C&D
-          cutlass::layout::RowMajor,              // Layout C&D
-          float,                                  // Element Accumulator
-          cutlass::arch::OpClassTensorOp,         // Operator Class Tag
-          cutlass::arch::Sm80,                    // Architecture
-          cutlass::gemm::GemmShape<32, 128, 16>,  // Thread Block Shape
-          cutlass::gemm::GemmShape<32, 64, 16>,   // Warp Shape
-          cutlass::gemm::GemmShape<16, 8, 8>,     // Instruction Shape
-          cutlass::epilogue::thread::LinearCombination<cutlass_t, 8, float, float>,  // Epilogue
-          GemmIdentityThreadblockSwizzle<1>,                     // Swizzling Operator
-          2,                                                     // Stages
-          cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly  // Group Schedule Mode
-          >::GemmKernel;
+                                      DType* y, int64_t* xy_indptr_d, int64_t* w_indices_d,
+                                      unsigned int batch_size, unsigned int d_in,
+                                      unsigned int d_out, bool weight_column_major,
+                                      cudaStream_t stream) {
+  AlignedAllocator allocator(handler->GetWorkspace(), handler->GetWorkspaceSizeInBytes());
+  cutlass::gemm::GemmCoord* problem_sizes_device =
+      allocator.aligned_alloc<cutlass::gemm::GemmCoord>(
+          batch_size * sizeof(cutlass::gemm::GemmCoord), 16);
+  DType** x_data = allocator.aligned_alloc<DType*>(batch_size * sizeof(DType*), 16);
+  DType** w_data = allocator.aligned_alloc<DType*>(batch_size * sizeof(DType*), 16);
+  DType** y_data = allocator.aligned_alloc<DType*>(batch_size * sizeof(DType*), 16);
+  int64_t* ld_x = allocator.aligned_alloc<int64_t>(batch_size * sizeof(int64_t), 16);
+  int64_t* ld_w = allocator.aligned_alloc<int64_t>(batch_size * sizeof(int64_t), 16);
+  int64_t* ld_y = allocator.aligned_alloc<int64_t>(batch_size * sizeof(int64_t), 16);
 
-      using EpilogueOutputOp = typename GemmKernel::Epilogue::OutputOp;
-      typename EpilogueOutputOp::Params epilogue_op(1.0, 1.0);
+  // NOTE(Zihao): I didn't successfully launch the kernel with cudaLaunchKernel API,
+  // so I just use the kernel function directly, need to investigate more.
+  auto compute_args_kernel = compute_cutlass_group_gemm_args<DType>;
+  compute_args_kernel<<<batch_size, 1, 0, stream>>>(
+      problem_sizes_device, x_data, w_data, y_data, ld_x, ld_w, ld_y, (DType*)x, (DType*)w,
+      (DType*)y, xy_indptr_d, w_indices_d, d_in, d_out, weight_column_major);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    std::cerr << "Failed to launch kernel: " << cudaGetErrorString(err) << std::endl;
+    return err;
+  }
 
-      using GemmGrouped = cutlass::gemm::device::GemmGrouped<GemmKernel>;
-      typename GemmGrouped::Arguments args(
-          handler->GetProblemSizes(), handler->GetBatchSize(), 512, epilogue_op,
-          handler->GetXPtr<cutlass_t>(), handler->GetWPtr<cutlass_t>(),
-          handler->GetYPtr<cutlass_t>(), handler->GetYPtr<cutlass_t>(), handler->GetLdX(),
-          handler->GetLdW(), handler->GetLdY(), handler->GetLdY());
+  using cutlass::epilogue::thread::LinearCombination;
+  using cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle;
+  DISPATCH_WEIGHT_LAYOUT(weight_column_major, WEIGHT_LAYOUT, {
+    using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
+        DType,                                   // Element A
+        cutlass::layout::RowMajor,               // Layout A
+        cutlass::ComplexTransform::kNone,        //
+        8,                                       // Granularity A
+        DType,                                   // Element B
+        WEIGHT_LAYOUT,                           // Layout B
+        cutlass::ComplexTransform::kNone,        //
+        8,                                       // Granularity B
+        DType,                                   // Element C&D
+        cutlass::layout::RowMajor,               // Layout C&D
+        float,                                   // Element Accumulator
+        cutlass::arch::OpClassTensorOp,          // Operator Class Tag
+        cutlass::arch::Sm80,                     // Architecture
+        cutlass::gemm::GemmShape<128, 128, 32>,  // Thread Block Shape
+        cutlass::gemm::GemmShape<64, 64, 32>,    // Warp Shape
+        cutlass::gemm::GemmShape<16, 8, 16>,     // Instruction Shape
+        cutlass::epilogue::thread::LinearCombination<DType, 8, float, float>,  // Epilogue
+        cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,     // Swizzling Operator
+        8                                                                      // Stages
+        >::GemmKernel;
 
-      GemmGrouped gemm;
-      auto status = gemm.initialize(args, nullptr, stream);
-      if (status != cutlass::Status::kSuccess) {
-        std::ostringstream err_msg;
-        err_msg << "sgmv_cutlass gemm.initialize failed: " << cutlassGetStatusString(status);
-        throw std::runtime_error(err_msg.str());
-      }
-      status = gemm.run(stream);
-      if (status != cutlass::Status::kSuccess) {
-        std::ostringstream err_msg;
-        err_msg << "sgmv_cutlass gemm.run failed: " << cutlassGetStatusString(status);
-        throw std::runtime_error(err_msg.str());
-      }
-    } else {
+    using EpilogueOutputOp = typename GemmKernel::Epilogue::OutputOp;
+    typename EpilogueOutputOp::Params epilogue_op(1.0, 1.0);
+    using GemmGrouped = cutlass::gemm::device::GemmGrouped<GemmKernel>;
+    typename GemmGrouped::Arguments args(problem_sizes_device, batch_size, 4, epilogue_op, x_data,
+                                         w_data, y_data, y_data, ld_x, ld_w, ld_y, ld_y);
+
+    GemmGrouped gemm;
+    auto status = gemm.initialize(args, nullptr, stream);
+    if (status != cutlass::Status::kSuccess) {
       std::ostringstream err_msg;
-      // TODO: support column-major weight matrix
-      err_msg << "CutlassSegmentGEMMWrapper only supports row-major weight matrix";
+      err_msg << "cutlass group_gemm.initialize failed: " << cutlassGetStatusString(status);
       throw std::runtime_error(err_msg.str());
     }
-  } else {
-    std::ostringstream err_msg;
-    err_msg << "Please call CutlassSegmentGEMMHandler's RegisterProblem() before calling "
-               "BatchDecodeWithPagedKVCacheWrapper()";
-    throw std::runtime_error(err_msg.str());
-  }
+    status = gemm.run(stream);
+    if (status != cutlass::Status::kSuccess) {
+      std::ostringstream err_msg;
+      err_msg << "cutlass group_gemm.run failed: " << cutlassGetStatusString(status);
+      throw std::runtime_error(err_msg.str());
+    }
+  });
+
   return cudaSuccess;
 }
 

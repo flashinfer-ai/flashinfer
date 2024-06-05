@@ -57,3 +57,10 @@ def check_kv_layout(kv_layout: str):
 
 def is_float8(x: torch.Tensor):
     return x.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
+
+
+def get_indptr(x: torch.Tensor):
+    x = x.to(torch.int64)
+    ret = torch.zeros(x.shape[0] + 1, dtype=x.dtype, device=x.device)
+    ret[1:] = x.cumsum(0)
+    return ret
