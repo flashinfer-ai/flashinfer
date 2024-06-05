@@ -51,7 +51,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
       q, q.options().dtype(is_float8_tensor(q) ? torch::kFloat16 : q.scalar_type()));
 
   if (is_float8_tensor(q)) {
-    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(q.scalar_type(), c_type, [&] {
+    DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
       return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
         return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
           return DISPATCH_kv_layout(kv_layout, KV_LAYOUT, [&] {

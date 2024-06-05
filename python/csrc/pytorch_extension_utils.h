@@ -31,7 +31,34 @@
 
 using namespace flashinfer;
 
-#ifdef FLASHINFER_ENABLE_BF16
+#if defined (FLASHINFER_ENABLE_BF16) && defined (FLASHINFER_ENABLE_FP8)
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...)                      \
+  [&]() -> bool {                                                                        \
+    switch (pytorch_dtype) {                                                             \
+      case at::ScalarType::Half: {                                                       \
+        using c_type = nv_half;                                                          \
+        return __VA_ARGS__();                                                            \
+      }                                                                                  \
+      case at::ScalarType::BFloat16: {                                                   \
+        using c_type = nv_bfloat16;                                                      \
+        return __VA_ARGS__();                                                            \
+      }                                                                                  \
+      case at::ScalarType::Float8_e4m3fn: {                                              \
+        using c_type = __nv_fp8_e4m3;                                                    \
+        return __VA_ARGS__();                                                            \
+      }                                                                                  \
+      case at::ScalarType::Float8_e5m2: {                                                \
+        using c_type = __nv_fp8_e5m2;                                                    \
+        return __VA_ARGS__();                                                            \
+      }                                                                                  \
+      default:                                                                           \
+        std::ostringstream oss;                                                          \
+        oss << __PRETTY_FUNCTION__ << " failed to dispatch data type " << pytorch_dtype; \
+        TORCH_CHECK(false, oss.str());                                                   \
+        return false;                                                                    \
+    }                                                                                    \
+  }()
+#elif defined (FLASHINFER_ENABLE_BF16)
 #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...)                      \
   [&]() -> bool {                                                                        \
     switch (pytorch_dtype) {                                                             \
@@ -50,25 +77,8 @@ using namespace flashinfer;
         return false;                                                                    \
     }                                                                                    \
   }()
-#else
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...)                      \
-  [&]() -> bool {                                                                        \
-    switch (pytorch_dtype) {                                                             \
-      case at::ScalarType::Half: {                                                       \
-        using c_type = nv_half;                                                          \
-        return __VA_ARGS__();                                                            \
-      }                                                                                  \
-      default:                                                                           \
-        std::ostringstream oss;                                                          \
-        oss << __PRETTY_FUNCTION__ << " failed to dispatch data type " << pytorch_dtype; \
-        TORCH_CHECK(false, oss.str());                                                   \
-        return false;                                                                    \
-    }                                                                                    \
-  }()
-#endif
-
-#ifdef FLASHINFER_ENABLE_FP8
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(pytorch_dtype, c_type, ...)                      \
+#elif defined (FLASHINFER_ENABLE_FP8)
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...)                          \
   [&]() -> bool {                                                                            \
     switch (pytorch_dtype) {                                                                 \
       case at::ScalarType::Float8_e4m3fn: {                                                  \
@@ -87,12 +97,19 @@ using namespace flashinfer;
     }                                                                                        \
   }()
 #else
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(pytorch_dtype, c_type, ...)                  \
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...)                      \
   [&]() -> bool {                                                                        \
-    std::ostringstream oss;                                                              \
-    oss << __PRETTY_FUNCTION__ << " failed to dispatch fp8 data type " << pytorch_dtype; \
-    TORCH_CHECK(false, oss.str());                                                       \
-    return false;                                                                        \
+    switch (pytorch_dtype) {                                                             \
+      case at::ScalarType::Half: {                                                       \
+        using c_type = nv_half;                                                          \
+        return __VA_ARGS__();                                                            \
+      }                                                                                  \
+      default:                                                                           \
+        std::ostringstream oss;                                                          \
+        oss << __PRETTY_FUNCTION__ << " failed to dispatch data type " << pytorch_dtype; \
+        TORCH_CHECK(false, oss.str());                                                   \
+        return false;                                                                    \
+    }                                                                                    \
   }()
 #endif
 
