@@ -22,6 +22,9 @@ Batch Prefill/Append Attention
 .. autoclass:: BatchPrefillWithPagedKVCacheWrapper
     :members:
 
+    .. automethod:: __init__
+
 .. autoclass:: BatchPrefillWithRaggedKVCacheWrapper
     :members:
     
+    .. automethod:: __init__

@@ -13,16 +13,15 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_HANDLER_CUH_
-#define FLASHINFER_HANDLER_CUH_
+#ifndef FLASHINFER_ATTENTION_HANDLER_CUH_
+#define FLASHINFER_ATTENTION_HANDLER_CUH_
 
 #include <algorithm>
 #include <cstddef>
-#include <memory>
 #include <sstream>
-#include <unordered_map>
 #include <vector>
 
+#include "../allocator.h"
 #include "../page.cuh"
 #include "../pos_enc.cuh"
 #include "../utils.cuh"
@@ -240,24 +239,6 @@ cudaError_t PartitionPagedKVCacheComputeAuxiliaryInfo(
                                        cudaMemcpyHostToDevice, stream));
   return cudaSuccess;
 }
-
-struct AlignedAllocator {
-  void* ptr;
-  size_t space;
-  AlignedAllocator(void* buf, size_t space) : ptr(buf), space(space) {}
-  template <typename T>
-  T* aligned_alloc(size_t size, size_t alignment) {
-    if (std::align(alignment, size, ptr, space)) {
-      T* result = reinterpret_cast<T*>(ptr);
-      ptr = (char*)ptr + size;
-      space -= size;
-      return result;
-    } else {
-      throw std::runtime_error("RuntimeError: Out of workspace memory in AlignedAlloactor");
-    }
-    return nullptr;
-  }
-};
 
 class BatchDecodeHandler {
  public:
@@ -584,4 +565,4 @@ class BatchPrefillHandler {
 };
 
 }  // namespace flashinfer
-#endif  // FLASHINFER_HANDLER_CUH_
+#endif  // FLASHINFER_ATTENTION_HANDLER_CUH_

@@ -25,5 +25,9 @@ Batch Decoding
 .. autoclass:: BatchDecodeWithPagedKVCacheWrapper
     :members:
 
+    .. automethod:: __init__
+
 .. autoclass:: CUDAGraphBatchDecodeWithPagedKVCacheWrapper
     :members:
+
+    .. automethod:: __init__

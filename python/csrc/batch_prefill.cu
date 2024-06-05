@@ -370,8 +370,8 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
 std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardCustomMask(
     torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor k, torch::Tensor v,
     torch::Tensor kv_indptr, torch::Tensor custom_mask, torch::Tensor qk_indptr,
-    unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction,
-    float sm_scale, float rope_scale, float rope_theta, bool return_lse) {
+    unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction, float sm_scale, float rope_scale,
+    float rope_theta, bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(qo_indptr);
   CHECK_INPUT(k);

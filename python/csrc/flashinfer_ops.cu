@@ -72,4 +72,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            &BatchPrefillWithRaggedKVCachePyTorchWrapper::UpdatePageLockedBufferSize)
       .def("forward", &BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward)
       .def("forward_custom_mask", &BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardCustomMask);
+  py::class_<CutlassSegmentGEMMPyTorchWrapper>(m, "CutlassSegmentGEMMPyTorchWrapper")
+      .def(py::init<torch::Tensor>())
+      .def("register_workspace", &CutlassSegmentGEMMPyTorchWrapper::RegisterWorkspaceBuffer)
+      .def("forward", &CutlassSegmentGEMMPyTorchWrapper::Forward);
 }

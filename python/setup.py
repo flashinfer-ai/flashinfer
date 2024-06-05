@@ -386,10 +386,14 @@ if __name__ == "__main__":
                 "csrc/batch_prefill.cu",
                 "csrc/sampling.cu",
                 "csrc/norm.cu",
+                "csrc/group_gemm.cu",
             ]
             + get_instantiation_cu(),
             include_dirs=[
                 str(root.resolve() / "include"),
+                str(
+                    root.resolve() / "3rdparty" / "cutlass" / "include"
+                ),  # for group gemm
             ],
             extra_compile_args={
                 "cxx": [

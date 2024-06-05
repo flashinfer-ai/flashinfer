@@ -308,6 +308,17 @@ std::tuple<IdType, IdType, std::vector<IdType>, std::vector<IdType>> split_qo_in
   return {num_frags_x, num_qo_tiles, std::move(request_indices), std::move(tile_indices)};
 }
 
+template <typename T>
+inline void DebugPrintCUDAArray(T* device_ptr, size_t size, std::string prefix = "") {
+  std::vector<T> host_array(size);
+  std::cout << prefix;
+  cudaMemcpy(host_array.data(), device_ptr, size * sizeof(T), cudaMemcpyDeviceToHost);
+  for (size_t i = 0; i < size; ++i) {
+    std::cout << host_array[i] << " ";
+  }
+  std::cout << std::endl;
+}
+
 }  // namespace flashinfer
 
 #endif  // FLASHINFER_UTILS_CUH_
