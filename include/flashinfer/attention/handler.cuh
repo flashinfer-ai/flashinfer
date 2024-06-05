@@ -294,29 +294,29 @@ class BatchDecodeHandler {
       size_t max_tmp_size = num_qo_heads * max_batch_size_after_partition_ *
                             (HEAD_DIM * sizeof(DTypeOut) + 2 * sizeof(float));
       AlignedAllocator allocator(buffer, workspace_size_in_bytes);
-      float_buffer_ = allocator.aligned_alloc<void*>(max_tmp_size, 16);
-      new_indptr_ = allocator.aligned_alloc<void*>(
-          (max_batch_size_after_partition_ + 1) * sizeof(IdType), 16);
+      float_buffer_ = allocator.aligned_alloc<void>(max_tmp_size, 16);
+      new_indptr_ =
+          allocator.aligned_alloc<void>((max_batch_size_after_partition_ + 1) * sizeof(IdType), 16);
 
       void* new_indptr_h_ = page_locked_buffer_;
       new_last_page_len_ =
-          allocator.aligned_alloc<void*>(max_batch_size_after_partition_ * sizeof(IdType), 16);
+          allocator.aligned_alloc<void>(max_batch_size_after_partition_ * sizeof(IdType), 16);
       void* new_last_page_len_h_ =
           (char*)page_locked_buffer_ + ((char*)new_last_page_len_ - (char*)new_indptr_);
-      chunk_indptr_ = allocator.aligned_alloc<void*>(
-          (max_batch_size_after_partition_ + 1) * sizeof(IdType), 16);
+      chunk_indptr_ =
+          allocator.aligned_alloc<void>((max_batch_size_after_partition_ + 1) * sizeof(IdType), 16);
       void* chunk_indptr_h_ =
           (char*)page_locked_buffer_ + ((char*)chunk_indptr_ - (char*)new_indptr_);
       batch_idx_map_ =
-          allocator.aligned_alloc<void*>(max_batch_size_after_partition_ * sizeof(IdType), 16);
+          allocator.aligned_alloc<void>(max_batch_size_after_partition_ * sizeof(IdType), 16);
       void* batch_idx_map_h_ =
           (char*)page_locked_buffer_ + ((char*)batch_idx_map_ - (char*)new_indptr_);
       chunk_start_pos_ =
-          allocator.aligned_alloc<void*>(max_batch_size_after_partition_ * sizeof(IdType), 16);
+          allocator.aligned_alloc<void>(max_batch_size_after_partition_ * sizeof(IdType), 16);
       void* chunk_start_pos_h_ =
           (char*)page_locked_buffer_ + ((char*)chunk_start_pos_ - (char*)new_indptr_);
       seq_lengths_before_partition_ =
-          allocator.aligned_alloc<void*>(max_batch_size_after_partition_ * sizeof(IdType), 16);
+          allocator.aligned_alloc<void>(max_batch_size_after_partition_ * sizeof(IdType), 16);
       void* seq_lengths_before_partition_h_ =
           (char*)page_locked_buffer_ + ((char*)seq_lengths_before_partition_ - (char*)new_indptr_);
 
@@ -330,28 +330,28 @@ class BatchDecodeHandler {
     } else {
       if (tmp_size > 0) {
         AlignedAllocator allocator(buffer, workspace_size_in_bytes);
-        float_buffer_ = allocator.aligned_alloc<void*>(tmp_size, 16);
+        float_buffer_ = allocator.aligned_alloc<void>(tmp_size, 16);
         new_indptr_ =
-            allocator.aligned_alloc<void*>((batch_size_after_partition_ + 1) * sizeof(IdType), 16);
+            allocator.aligned_alloc<void>((batch_size_after_partition_ + 1) * sizeof(IdType), 16);
         void* new_indptr_h_ = page_locked_buffer_;
         new_last_page_len_ =
-            allocator.aligned_alloc<void*>(batch_size_after_partition_ * sizeof(IdType), 16);
+            allocator.aligned_alloc<void>(batch_size_after_partition_ * sizeof(IdType), 16);
         void* new_last_page_len_h_ =
             (char*)page_locked_buffer_ + ((char*)new_last_page_len_ - (char*)new_indptr_);
         chunk_indptr_ =
-            allocator.aligned_alloc<void*>((batch_size_before_partition_ + 1) * sizeof(IdType), 16);
+            allocator.aligned_alloc<void>((batch_size_before_partition_ + 1) * sizeof(IdType), 16);
         void* chunk_indptr_h_ =
             (char*)page_locked_buffer_ + ((char*)chunk_indptr_ - (char*)new_indptr_);
         batch_idx_map_ =
-            allocator.aligned_alloc<void*>(batch_size_after_partition_ * sizeof(IdType), 16);
+            allocator.aligned_alloc<void>(batch_size_after_partition_ * sizeof(IdType), 16);
         void* batch_idx_map_h_ =
             (char*)page_locked_buffer_ + ((char*)batch_idx_map_ - (char*)new_indptr_);
         chunk_start_pos_ =
-            allocator.aligned_alloc<void*>(batch_size_after_partition_ * sizeof(IdType), 16);
+            allocator.aligned_alloc<void>(batch_size_after_partition_ * sizeof(IdType), 16);
         void* chunk_start_pos_h_ =
             (char*)page_locked_buffer_ + ((char*)chunk_start_pos_ - (char*)new_indptr_);
         seq_lengths_before_partition_ =
-            allocator.aligned_alloc<void*>(batch_size_after_partition_ * sizeof(IdType), 16);
+            allocator.aligned_alloc<void>(batch_size_after_partition_ * sizeof(IdType), 16);
         void* seq_lengths_before_partition_h_ =
             (char*)page_locked_buffer_ +
             ((char*)seq_lengths_before_partition_ - (char*)new_indptr_);
@@ -498,16 +498,16 @@ class BatchPrefillHandler {
         split_qo_indptr(qo_indptr, batch_size, gqa_group_size, head_dim, stream_);
     AlignedAllocator allocator(buffer, workspace_size_in_bytes);
     if (IsCUDAGraphEnabled()) {
-      request_indices_ = allocator.aligned_alloc<void*>(sizeof(IdType) * max_num_qo_tiles_, 16);
+      request_indices_ = allocator.aligned_alloc<void>(sizeof(IdType) * max_num_qo_tiles_, 16);
     } else {
       request_indices_ =
-          allocator.aligned_alloc<void*>(sizeof(IdType) * request_indices_vec.size(), 16);
+          allocator.aligned_alloc<void>(sizeof(IdType) * request_indices_vec.size(), 16);
     }
     void* request_indices_h_ = page_locked_buffer_;
     if (IsCUDAGraphEnabled()) {
-      tile_indices_ = allocator.aligned_alloc<void*>(sizeof(IdType) * max_num_qo_tiles_, 16);
+      tile_indices_ = allocator.aligned_alloc<void>(sizeof(IdType) * max_num_qo_tiles_, 16);
     } else {
-      tile_indices_ = allocator.aligned_alloc<void*>(sizeof(IdType) * tile_indices_vec.size(), 16);
+      tile_indices_ = allocator.aligned_alloc<void>(sizeof(IdType) * tile_indices_vec.size(), 16);
     }
     void* tile_indices_h_ =
         (char*)page_locked_buffer_ + ((char*)tile_indices_ - (char*)request_indices_);
