@@ -57,8 +57,8 @@ std::vector<torch::Tensor> batch_decode_with_padded_kv_cache(
   }
 
   if (is_float8_tensor(q)) {
-    DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), q_type, [&] {
-      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE(k_padded.scalar_type(), kv_type, [&] {
+    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_COMBINED_FP8(q.scalar_type(), q_type, [&] {
+      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_COMBINED_FP8(k_padded.scalar_type(), kv_type, [&] {
         return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
           return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
             return DISPATCH_pos_encoding_mode(
@@ -86,8 +86,8 @@ std::vector<torch::Tensor> batch_decode_with_padded_kv_cache(
       });
     });
   } else {
-    DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), q_type, [&] {
-      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE(k_padded.scalar_type(), kv_type, [&] {
+    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_COMBINED_FP8(q.scalar_type(), q_type, [&] {
+      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_COMBINED_FP8(k_padded.scalar_type(), kv_type, [&] {
         q_type* tmp = nullptr;
         return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
           return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
@@ -140,7 +140,7 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
   handler_->SetCUDAStream(torch_current_stream);
 
   if (is_float8_tensor(empty_data)) {
-    DISPATCH_PYTORCH_DTYPE_TO_CTYPE(empty_data.scalar_type(), c_type, [&] {
+    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_COMBINED_FP8(empty_data.scalar_type(), c_type, [&] {
       return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
         return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
           return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
@@ -164,7 +164,7 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
       });
     });
   } else {
-    DISPATCH_PYTORCH_DTYPE_TO_CTYPE(empty_data.scalar_type(), c_type, [&] {
+    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_COMBINED_FP8(empty_data.scalar_type(), c_type, [&] {
       return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
         return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
           return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
@@ -244,8 +244,8 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
   }
 
   if (is_float8_tensor(q)) {
-    DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), q_type, [&] {
-      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE(paged_kv_data.scalar_type(), kv_type, [&] {
+    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_COMBINED_FP8(q.scalar_type(), q_type, [&] {
+      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_COMBINED_FP8(paged_kv_data.scalar_type(), kv_type, [&] {
         return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
           return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
             return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
@@ -276,8 +276,8 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
       });
     });
   } else {
-    DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), q_type, [&] {
-      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE(paged_kv_data.scalar_type(), kv_type, [&] {
+    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_COMBINED_FP8(q.scalar_type(), q_type, [&] {
+      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_COMBINED_FP8(paged_kv_data.scalar_type(), kv_type, [&] {
         return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
           return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
             return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {

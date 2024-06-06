@@ -32,8 +32,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
   CHECK_DIM(3, v);
   CHECK_SHAPE(k, v);
   CHECK_EQ(q.size(1), k.size(2));
-  CHECK_EQ(q.scalar_type(), k.scalar_type());
-  CHECK_EQ(q.scalar_type(), v.scalar_type());
+  CHECK_EQ(v.scalar_type(), k.scalar_type());
   unsigned int num_qo_heads = q.size(0);
   unsigned int head_dim = q.size(1);
   unsigned int kv_len, num_kv_heads;
@@ -51,47 +50,51 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
       q, q.options().dtype(is_float8_tensor(q) ? torch::kFloat16 : q.scalar_type()));
 
   if (is_float8_tensor(q)) {
-    DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
-      return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
-        return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-          return DISPATCH_kv_layout(kv_layout, KV_LAYOUT, [&] {
-            return DISPATCH_pos_encoding_mode(
-                PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
-                  cudaError_t status =
-                      SingleDecodeWithKVCacheDispatched<GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
-                                                        POS_ENCODING_MODE>(
-                          static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
-                          static_cast<c_type*>(v.data_ptr()), static_cast<nv_half*>(o.data_ptr()),
-                          static_cast<nv_half*>(tmp.data_ptr()), num_kv_heads, kv_len, sm_scale,
-                          rope_scale, rope_theta, torch_current_stream);
-                  TORCH_CHECK(status == cudaSuccess,
-                              "SingleDecodeWithKVCache kernel launch failed, error: " +
-                                  std::string(cudaGetErrorString(status)));
-                  return true;
-                });
+    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_COMBINED_FP8(q.scalar_type(), q_type, [&] {
+      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_COMBINED_FP8(k.scalar_type(), kv_type, [&] {
+        return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
+          return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
+            return DISPATCH_kv_layout(kv_layout, KV_LAYOUT, [&] {
+              return DISPATCH_pos_encoding_mode(
+                  PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
+                    cudaError_t status =
+                        SingleDecodeWithKVCacheDispatched<GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
+                                                          POS_ENCODING_MODE>(
+                            static_cast<q_type*>(q.data_ptr()), static_cast<kv_type*>(k.data_ptr()),
+                            static_cast<kv_type*>(v.data_ptr()), static_cast<nv_half*>(o.data_ptr()),
+                            static_cast<nv_half*>(tmp.data_ptr()), num_kv_heads, kv_len, sm_scale,
+                            rope_scale, rope_theta, torch_current_stream);
+                    TORCH_CHECK(status == cudaSuccess,
+                                "SingleDecodeWithKVCache kernel launch failed, error: " +
+                                    std::string(cudaGetErrorString(status)));
+                    return true;
+                  });
+            });
           });
         });
       });
     });
   } else {
-    DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
-      return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
-        return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-          return DISPATCH_kv_layout(kv_layout, KV_LAYOUT, [&] {
-            return DISPATCH_pos_encoding_mode(
-                PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
-                  cudaError_t status =
-                      SingleDecodeWithKVCacheDispatched<GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
-                                                        POS_ENCODING_MODE>(
-                          static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
-                          static_cast<c_type*>(v.data_ptr()), static_cast<c_type*>(o.data_ptr()),
-                          static_cast<c_type*>(tmp.data_ptr()), num_kv_heads, kv_len, sm_scale,
-                          rope_scale, rope_theta, torch_current_stream);
-                  TORCH_CHECK(status == cudaSuccess,
-                              "SingleDecodeWithKVCache kernel launch failed, error: " +
-                                  std::string(cudaGetErrorString(status)));
-                  return true;
-                });
+    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_COMBINED_FP8(q.scalar_type(), q_type, [&] {
+      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_COMBINED_FP8(k.scalar_type(), kv_type, [&] {
+        return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
+          return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
+            return DISPATCH_kv_layout(kv_layout, KV_LAYOUT, [&] {
+              return DISPATCH_pos_encoding_mode(
+                  PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
+                    cudaError_t status =
+                        SingleDecodeWithKVCacheDispatched<GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
+                                                          POS_ENCODING_MODE>(
+                            static_cast<q_type*>(q.data_ptr()), static_cast<kv_type*>(k.data_ptr()),
+                            static_cast<kv_type*>(v.data_ptr()), static_cast<q_type*>(o.data_ptr()),
+                            static_cast<q_type*>(tmp.data_ptr()), num_kv_heads, kv_len, sm_scale,
+                            rope_scale, rope_theta, torch_current_stream);
+                    TORCH_CHECK(status == cudaSuccess,
+                                "SingleDecodeWithKVCache kernel launch failed, error: " +
+                                    std::string(cudaGetErrorString(status)));
+                    return true;
+                  });
+            });
           });
         });
       });
