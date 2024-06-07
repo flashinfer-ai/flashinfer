@@ -102,7 +102,7 @@ template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, QKVL
 cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     uint32_t& tmp_size, uint32_t& max_grid_size, uint32_t& max_num_pages_per_batch,
     uint32_t& new_batch_size, uint32_t batch_size, IdType* kv_indptr, const uint32_t num_qo_heads,
-    const uint32_t page_size, bool enable_cuda_graph, cudaStream_t stream) {
+    const uint32_t page_size, cudaStream_t stream) {
   constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
   constexpr uint32_t num_stages_smem = 2U;
   constexpr uint32_t bdx = HEAD_DIM / vec_size;
@@ -127,10 +127,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
   FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
       &num_blocks_per_sm, partition_kv_kernel, num_threads, smem_size));
   max_grid_size = num_blocks_per_sm * num_sm;
-  if (batch_size * num_kv_heads >= max_grid_size && !enable_cuda_graph) {
-    // do not use partition-kv kernel
-    // TODO(Zihao): if enable_cuda_graph, we should always use partition-kv kernel
-    // so that only one kernel will be captured in the graph.
+  if (batch_size * num_kv_heads >= max_grid_size) {
     tmp_size = 0;
     new_batch_size = batch_size;
   } else {
@@ -284,8 +281,7 @@ class BatchDecodeHandler {
                                                             DTypeOut, IdType>;
     FLASHINFER_CUDA_CALL(work_estimation_func(tmp_size, max_grid_size, max_num_pages_per_batch,
                                               new_batch_size, batch_size, indptr, num_qo_heads,
-                                              page_size,
-                                              /*enable_cuda_graph=*/IsCUDAGraphEnabled(), stream_));
+                                              page_size, stream_));
     batch_size_after_partition_ = new_batch_size;
     if (IsCUDAGraphEnabled()) {
       // NOTE(Zihao): max_batch_size_after_partition_ is determined in handler initialization.

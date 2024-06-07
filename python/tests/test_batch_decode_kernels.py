@@ -180,9 +180,7 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         for _ in range(3):
-            o = wrapper.forward(
-                q, kv_data_dtype, pos_encoding_mode=pos_encoding_mode
-            )
+            o = wrapper.forward(q, kv_data_dtype, pos_encoding_mode=pos_encoding_mode)
     torch.cuda.current_stream().wait_stream(s)
 
     # capture
@@ -195,9 +193,7 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
     for i in range(1, min(4, num_pages_per_seq)):
         kv_indptr_host = torch.arange(0, batch_size + 1).int() * i
         kv_indices_host = torch.arange(0, i * batch_size).int()
-        kv_last_page_len_host = torch.full(
-            (batch_size,), page_size, dtype=torch.int32
-        )
+        kv_last_page_len_host = torch.full((batch_size,), page_size, dtype=torch.int32)
 
         wrapper.begin_forward(
             kv_indptr_host,

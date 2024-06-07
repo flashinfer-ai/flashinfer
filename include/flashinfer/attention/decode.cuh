@@ -18,6 +18,10 @@
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_runtime_api.h>
+#include <vector_types.h>
+
+#include <cstddef>
 #ifdef FLASHINFER_ENABLE_FP8
 #include <cuda_fp8.h>
 #endif
@@ -838,12 +842,57 @@ cudaError_t SingleDecodeWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v
   return cudaSuccess;
 }
 
+/*!
+ * \brief Dynamic parallelism kernel to dispatch batch decoding operators, used in CUDA-Graph mode.
+ */
+template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
+          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, PageStorage page_storage,
+          QKVLayout kv_layout, typename DTypeIn, typename DTypeOut, typename IdType>
+__global__ void BatchDecodeWithPagedKVCacheKernelLauncher(
+    const uint32_t batch_size, const uint32_t num_qo_heads, const uint32_t num_kv_heads,
+    const uint32_t smem_size, cudaStream_t stream, DTypeIn* __restrict__ q,
+    IdType* __restrict__ q_offset, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
+    kv_partition_info_t<IdType> kv_partition_info, DTypeOut* __restrict__ o,
+    DTypeOut* __restrict__ tmp, float* __restrict__ lse, float sm_scale, float rope_rcp_scale,
+    float rope_rcp_theta) {
+  dim3 nblks(batch_size, num_kv_heads);
+  dim3 nthrs(bdx, bdy, bdz);
+  if (tmp == nullptr) {
+    BatchDecodeWithPagedKVCacheKernel</*partition_kv=*/false, POS_ENCODING_MODE, num_stages_smem,
+                                      tile_size_per_bdx, vec_size, bdx, bdy, bdz, page_storage,
+                                      kv_layout, DTypeIn, DTypeOut, IdType>
+        <<<nblks, nthrs, smem_size, stream>>>(q, q_offset, paged_kv, kv_partition_info, o, tmp, lse,
+                                              sm_scale, rope_rcp_scale, rope_rcp_theta);
+  } else {
+    BatchDecodeWithPagedKVCacheKernel</*partition_kv=*/true, POS_ENCODING_MODE, num_stages_smem,
+                                      tile_size_per_bdx, vec_size, bdx, bdy, bdz, page_storage,
+                                      kv_layout, DTypeIn, DTypeOut, IdType>
+        <<<nblks, nthrs, smem_size, stream>>>(q, q_offset, paged_kv, kv_partition_info, o, tmp, lse,
+                                              sm_scale, rope_rcp_scale, rope_rcp_theta);
+
+    // call merge kernel
+    constexpr uint32_t HEAD_DIM = bdx * vec_size;
+    dim3 nblks_merge(kv_partition_info.batch_size_before_partition, num_qo_heads);
+    constexpr uint32_t num_threads = 128;
+    constexpr uint32_t bdy_merge = num_threads / bdx;
+    dim3 nthrs_merge(bdx, bdy_merge);
+    constexpr uint32_t num_smem_stages_merge = 4;
+    const uint32_t smem_size_merge =
+        num_smem_stages_merge * nthrs_merge.y * HEAD_DIM * sizeof(DTypeIn) + 128 * sizeof(float);
+    VariableLengthMergeStatesKernel<vec_size, bdx, bdy_merge, num_smem_stages_merge, DTypeIn,
+                                    DTypeOut, IdType>
+        <<<nblks_merge, nthrs_merge, smem_size_merge, stream>>>(
+            tmp, (float*)(tmp + batch_size * num_qo_heads * HEAD_DIM),
+            kv_partition_info.chunk_indptr, o, lse, num_qo_heads);
+  }
+}
+
 template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, QKVLayout kv_layout,
           PosEncodingMode POS_ENCODING_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     DTypeIn* q, IdType* q_offset, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, DTypeOut* tmp, float* lse,
-    float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream) {
+    float sm_scale, float rope_scale, float rope_theta, bool use_cuda_graph, cudaStream_t stream) {
   const float rope_rcp_scale = 1.f / rope_scale;
   const float rope_rcp_theta = 1.f / rope_theta;
   const uint32_t num_kv_heads = paged_kv.num_heads;
@@ -862,52 +911,65 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
       2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * HEAD_DIM * sizeof(DTypeIn) +
       std::max(tile_size_per_bdx * num_threads * sizeof(DTypeIn*), 2 * bdy * bdz * sizeof(float));
 
-  if (tmp == nullptr) {
-    // do not use partition-kv kernel
-    dim3 nblks(batch_size, num_kv_heads);
-    dim3 nthrs(bdx, bdy, bdz);
-    auto kernel =
-        BatchDecodeWithPagedKVCacheKernel</*partition_kv=*/false, POS_ENCODING_MODE,
-                                          num_stages_smem, tile_size_per_bdx, vec_size, bdx, bdy,
-                                          bdz, page_storage, kv_layout, DTypeIn, DTypeOut, IdType>;
-    FLASHINFER_CUDA_CALL(
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    void* args[] = {(void*)&q,
-                    (void*)&q_offset,
-                    (void*)&paged_kv,
-                    (void*)&kv_partition_info,
-                    (void*)&o,
-                    (void*)&tmp,
-                    (void*)&lse,
-                    (void*)&sm_scale,
-                    (void*)&rope_rcp_scale,
-                    (void*)&rope_rcp_theta};
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  if (use_cuda_graph) {
+    auto kernel_no_split_kv = BatchDecodeWithPagedKVCacheKernel<
+        /*partition_kv=*/false, POS_ENCODING_MODE, num_stages_smem, tile_size_per_bdx, vec_size,
+        bdx, bdy, bdz, page_storage, kv_layout, DTypeIn, DTypeOut, IdType>;
+    auto kernel_split_kv = BatchDecodeWithPagedKVCacheKernel<
+        /*partition_kv=*/true, POS_ENCODING_MODE, num_stages_smem, tile_size_per_bdx, vec_size, bdx,
+        bdy, bdz, page_storage, kv_layout, DTypeIn, DTypeOut, IdType>;
+    // auto kernel_merge =
+    // launch dynamic parallelism kernel
+    BatchDecodeWithPagedKVCacheKernelLauncher<POS_ENCODING_MODE, num_stages_smem, tile_size_per_bdx,
+                                              vec_size, bdx, bdy, bdz><<<1, 1, 0, stream>>>(
+        batch_size, num_qo_heads, num_kv_heads, smem_size, stream, q, q_offset, paged_kv,
+        kv_partition_info, o, tmp, lse, sm_scale, rope_rcp_scale, rope_rcp_theta);
   } else {
-    // use partition-kv kernel
-    auto partition_kv_kernel =
-        BatchDecodeWithPagedKVCacheKernel</*partition_kv=*/true, POS_ENCODING_MODE, num_stages_smem,
-                                          tile_size_per_bdx, vec_size, bdx, bdy, bdz, page_storage,
-                                          kv_layout, DTypeIn, DTypeOut, IdType>;
-    FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
-        partition_kv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    void* args[] = {(void*)&q,
-                    (void*)&q_offset,
-                    (void*)&paged_kv,
-                    (void*)&kv_partition_info,
-                    (void*)&o,
-                    (void*)&tmp,
-                    (void*)&lse,
-                    (void*)&sm_scale,
-                    (void*)&rope_rcp_scale,
-                    (void*)&rope_rcp_theta};
-    dim3 nblks(batch_size, num_kv_heads);
-    dim3 nthrs(bdx, bdy, bdz);
-    FLASHINFER_CUDA_CALL(
-        cudaLaunchKernel((void*)partition_kv_kernel, nblks, nthrs, args, smem_size, stream));
-    FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
-        tmp, (float*)(tmp + batch_size * num_qo_heads * HEAD_DIM), kv_partition_info.chunk_indptr,
-        o, lse, kv_partition_info.batch_size_before_partition, num_qo_heads, HEAD_DIM, stream));
+    if (tmp == nullptr) {
+      // do not use partition-kv kernel
+      dim3 nblks(batch_size, num_kv_heads);
+      dim3 nthrs(bdx, bdy, bdz);
+      auto kernel = BatchDecodeWithPagedKVCacheKernel<
+          /*partition_kv=*/false, POS_ENCODING_MODE, num_stages_smem, tile_size_per_bdx, vec_size,
+          bdx, bdy, bdz, page_storage, kv_layout, DTypeIn, DTypeOut, IdType>;
+      FLASHINFER_CUDA_CALL(
+          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      void* args[] = {(void*)&q,
+                      (void*)&q_offset,
+                      (void*)&paged_kv,
+                      (void*)&kv_partition_info,
+                      (void*)&o,
+                      (void*)&tmp,
+                      (void*)&lse,
+                      (void*)&sm_scale,
+                      (void*)&rope_rcp_scale,
+                      (void*)&rope_rcp_theta};
+      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+    } else {
+      // use partition-kv kernel
+      auto partition_kv_kernel = BatchDecodeWithPagedKVCacheKernel<
+          /*partition_kv=*/true, POS_ENCODING_MODE, num_stages_smem, tile_size_per_bdx, vec_size,
+          bdx, bdy, bdz, page_storage, kv_layout, DTypeIn, DTypeOut, IdType>;
+      FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
+          partition_kv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      void* args[] = {(void*)&q,
+                      (void*)&q_offset,
+                      (void*)&paged_kv,
+                      (void*)&kv_partition_info,
+                      (void*)&o,
+                      (void*)&tmp,
+                      (void*)&lse,
+                      (void*)&sm_scale,
+                      (void*)&rope_rcp_scale,
+                      (void*)&rope_rcp_theta};
+      dim3 nblks(batch_size, num_kv_heads);
+      dim3 nthrs(bdx, bdy, bdz);
+      FLASHINFER_CUDA_CALL(
+          cudaLaunchKernel((void*)partition_kv_kernel, nblks, nthrs, args, smem_size, stream));
+      FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
+          tmp, (float*)(tmp + batch_size * num_qo_heads * HEAD_DIM), kv_partition_info.chunk_indptr,
+          o, lse, kv_partition_info.batch_size_before_partition, num_qo_heads, HEAD_DIM, stream));
+    }
   }
 
   return cudaSuccess;

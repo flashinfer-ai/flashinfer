@@ -233,7 +233,7 @@ cudaError_t BatchDecodeWithPagedKVCache(
                                                          kv_layout, POS_ENCODING_MODE, DTypeIn,
                                                          DTypeOut, IdType>(
                 q, q_offset, paged_kv, kv_partition_info, o, tmp, lse, sm_scale, rope_scale,
-                rope_theta, stream);
+                rope_theta, /*use_cuda_graph=*/false, stream);
           })})});
 
   return cudaSuccess;

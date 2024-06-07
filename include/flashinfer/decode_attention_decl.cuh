@@ -40,7 +40,7 @@ template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, QKVL
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     DTypeIn* q, IdType* q_offset, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, DTypeOut* tmp, float* lse,
-    float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream);
+    float sm_scale, float rope_scale, float rope_theta, bool use_cuda_graph, cudaStream_t stream);
 
 template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
           PosEncodingMode POS_ENCODING_MODE, typename DTypeIn, typename DTypeOut>
@@ -82,7 +82,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapperDispatched(
   return BatchDecodeWithPagedKVCacheDispatched<GROUP_SIZE, HEAD_DIM, page_storage, KV_LAYOUT,
                                                POS_ENCODING_MODE, DTypeIn, DTypeOut, IdType>(
       q, q_offset, new_paged_kv, kv_partition_info, o, tmp, lse, sm_scale, rope_scale, rope_theta,
-      stream);
+      handler->IsCUDAGraphEnabled(), stream);
 }
 
 }  // namespace flashinfer
