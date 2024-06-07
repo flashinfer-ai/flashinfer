@@ -84,12 +84,12 @@ set (ALLOW_FP16_QK_REDUCTIONS ${FLASHINFER_GEN_ALLOW_FP16_QK_REDUCTIONS})
 set (MASK_MODES ${FLASHINFER_GEN_MASK_MODES})
 set (DECODE_DTYPES "f16")
 set (PREFILL_DTYPES "f16")
-set (DECODE_F8_DTYPES)
+set (DECODE_FP8_DTYPES)
 set (IDTYPES "i32")
 
 if(FLASHINFER_ENABLE_FP8)
   list(APPEND DECODE_DTYPES "e4m3" "e5m2")
-  list(APPEND DECODE_F8_DTYPES "e4m3" "e5m2")
+  list(APPEND DECODE_FP8_DTYPES "e4m3" "e5m2")
 endif(FLASHINFER_ENABLE_FP8)
 
 if(FLASHINFER_ENABLE_BF16)
@@ -136,7 +136,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
         endforeach(dtype)
 
         # fp8 in, fp16 out
-        foreach(dtype IN LISTS DECODE_F8_DTYPES)
+        foreach(dtype IN LISTS DECODE_FP8_DTYPES)
           set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_decode_group_${group_size}_head_${head_dim}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypein_${dtype}_dtypeout_f16.cu)
           add_custom_command(
             OUTPUT ${generated_kernel_src}
