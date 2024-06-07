@@ -115,7 +115,7 @@ def test_batch_decode_with_paged_kv_cache(
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
-@pytest.mark.parametrize("kv_len", [54, 97])
+@pytest.mark.parametrize("kv_len", [54, 2048])
 @pytest.mark.parametrize("page_size", [1, 8, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
@@ -144,16 +144,11 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
         if kv_layout == "HND"
         else torch.randn(total_num_pages, 2, page_size, num_kv_heads, head_dim).to(0)
     )
+    kv_data_dtype = kv_data.to(dtype)
     kv_indptr_host_warmup = torch.arange(0, batch_size + 1).int()
     kv_indices_host_warmup = torch.arange(0, batch_size).int()
     kv_last_page_len_host_warmup = torch.full(
         (batch_size,), page_size, dtype=torch.int32
-    )
-
-    kv_indptr_host = torch.arange(0, batch_size + 1).int() * num_pages_per_seq
-    kv_indices_host = torch.arange(0, total_num_pages).int()
-    kv_last_page_len_host = torch.full(
-        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
     )
 
     # NOTE(Zihao): allocate more space than needed for testing
@@ -186,15 +181,44 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
     with torch.cuda.stream(s):
         for _ in range(3):
             o = wrapper.forward(
-                q, kv_data.to(dtype), pos_encoding_mode=pos_encoding_mode
+                q, kv_data_dtype, pos_encoding_mode=pos_encoding_mode
             )
     torch.cuda.current_stream().wait_stream(s)
+
     # capture
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        o = wrapper.forward(q, kv_data.to(dtype), pos_encoding_mode=pos_encoding_mode)
+        o = wrapper.forward(q, kv_data_dtype, pos_encoding_mode=pos_encoding_mode)
     wrapper.end_forward()
-    # replay
+
+    # replay multiple times
+    for i in range(1, min(4, num_pages_per_seq)):
+        kv_indptr_host = torch.arange(0, batch_size + 1).int() * i
+        kv_indices_host = torch.arange(0, i * batch_size).int()
+        kv_last_page_len_host = torch.full(
+            (batch_size,), page_size, dtype=torch.int32
+        )
+
+        wrapper.begin_forward(
+            kv_indptr_host,
+            kv_indices_host,
+            kv_last_page_len_host,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            "NONE",
+            dtype,
+        )
+        g.replay()
+
+    # replay again
+    kv_indptr_host = torch.arange(0, batch_size + 1).int() * num_pages_per_seq
+    kv_indices_host = torch.arange(0, total_num_pages).int()
+    kv_last_page_len_host = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
+    )
+
     wrapper.begin_forward(
         kv_indptr_host,
         kv_indices_host,
@@ -255,12 +279,12 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
 
 
 if __name__ == "__main__":
-    test_batch_decode_with_paged_kv_cache(
-        12, 54, 8, 8, 8, 128, "HND", "NONE", torch.float16
-    )
-    test_batch_decode_with_paged_kv_cache(
-        12, 54, 1, 8, 8, 128, "HND", "NONE", torch.float8_e5m2
-    )
+    # test_batch_decode_with_paged_kv_cache(
+    #     12, 54, 8, 8, 8, 128, "HND", "NONE", torch.float16
+    # )
+    # test_batch_decode_with_paged_kv_cache(
+    #     12, 54, 1, 8, 8, 128, "HND", "NONE", torch.float8_e5m2
+    # )
     test_cuda_graph_batch_decode_with_paged_kv_cache(
-        12, 54, 8, 8, 8, 128, "HND", "NONE", torch.float16
+        12, 2048, 8, 8, 8, 128, "NHD", "NONE", torch.float16
     )
