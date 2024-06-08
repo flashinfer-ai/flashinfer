@@ -71,7 +71,7 @@ int main(int argc, char* argv[]) {
 
   // call attention all reduce kernel
   dim3 nthrs(1024);
-  dim3 nblks((buf_size_in_bytes + nthrs.x - 1) / nthrs.x);
+  dim3 nblks(128);
   distributed::SumAllReduceInplaceKernel<T, ReduceT><<<nblks, nthrs>>>(
       thrust::raw_pointer_cast(sm_channel_handlers_d.data()),
       thrust::raw_pointer_cast(device_buf.data()), rank, nranks, device_buf.size());

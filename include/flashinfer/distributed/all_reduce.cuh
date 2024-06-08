@@ -72,10 +72,11 @@ void SetupChannels(mscclpp::Communicator* comm, std::vector<mscclpp::SmChannel>&
 }
 
 constexpr uint32_t MAX_RANKS = 8;
+__device__ mscclpp::DeviceSyncer device_syncer;
 
 template <typename DType>
 __global__ void AttentionAllReduceInplaceKernel(mscclpp::SmChannelDeviceHandle* sm_channels,
-                                                void* buf, const uint32_t rank,
+                                                uint8_t* buf, const uint32_t rank,
                                                 const uint32_t num_ranks, const uint32_t batch_size,
                                                 const uint32_t num_heads, const uint32_t head_dim) {
   const uint32_t vec_size = 16 / sizeof(DType);
@@ -85,7 +86,7 @@ __global__ void AttentionAllReduceInplaceKernel(mscclpp::SmChannelDeviceHandle* 
   const uint32_t tid = threadIdx.x + blockDim.x * (threadIdx.y + blockIdx.x * blockDim.y);
   const uint32_t tx = threadIdx.x;
   const uint32_t head_id = threadIdx.y;
-  const uint32_t batch_id = blockDim.x;
+  const uint32_t batch_id = blockIdx.x;
   DType* v_buf = (DType*)buf;
   float* s_buf = (float*)(buf + batch_size * num_heads * head_dim * sizeof(DType));
 
@@ -93,21 +94,23 @@ __global__ void AttentionAllReduceInplaceKernel(mscclpp::SmChannelDeviceHandle* 
     sm_channels[tid].signal();
     sm_channels[tid].wait();
   }
+  device_syncer.sync(gridDim.x);
 
-  float other_s[MAX_RANKS - 1];
+  float other_lse[MAX_RANKS - 1], self_lse = s_buf[batch_id * num_heads + head_id];
   for (uint32_t round_idx = 0; round_idx < num_peers; ++round_idx) {
     int peer_idx = (round_idx + rank);
     if (peer_idx >= num_peers) peer_idx -= num_peers;
-    other_s[round_idx] = ((float*)(sm_channels[peer_idx].dst_ +
-                                batch_size * num_heads * head_dim *
-                                    sizeof(DType)))[batch_id * num_heads + head_id];
+    other_lse[round_idx] =
+        ((float*)(sm_channels[peer_idx].dst_ + batch_size * num_heads * head_dim *
+                                                   sizeof(DType)))[batch_id * num_heads + head_id];
   }
 
   state_t<vec_size> tmp;
   for (uint32_t elem_idx = tx; elem_idx < chunk_size / vec_size; elem_idx += blockDim.x) {
+    tmp.init();
     tmp.o.cast_load(v_buf + (batch_id * num_heads + head_id) * head_dim + rank * chunk_size +
                     elem_idx * vec_size);
-    tmp.m = s_buf[batch_id * num_heads + head_id];
+    tmp.m = self_lse;
     for (uint32_t round_idx = 0; round_idx < num_peers; ++round_idx) {
       int peer_idx = (round_idx + rank);
       if (peer_idx >= num_peers) peer_idx -= num_peers;
@@ -115,7 +118,7 @@ __global__ void AttentionAllReduceInplaceKernel(mscclpp::SmChannelDeviceHandle* 
       other_v.cast_load(((DType*)sm_channels[peer_idx].dst_) +
                         (batch_id * num_heads + head_id) * head_dim + rank * chunk_size +
                         elem_idx * vec_size);
-      tmp.merge(other_v, other_s[round_idx], 1);
+      tmp.merge(other_v, other_lse[round_idx], 1);
     }
     tmp.normalize();
     for (uint32_t round_idx = 0; round_idx < num_peers; ++round_idx) {
@@ -128,24 +131,26 @@ __global__ void AttentionAllReduceInplaceKernel(mscclpp::SmChannelDeviceHandle* 
     tmp.o.cast_store(v_buf + (batch_id * num_heads + head_id) * head_dim + rank * chunk_size +
                      elem_idx * vec_size);
   }
-
   float lse = tmp.get_lse();
-  for (uint32_t round_idx = 0; round_idx < num_peers; ++round_idx) {
-    int peer_idx = (round_idx + rank);
-    if (peer_idx >= num_peers) peer_idx -= num_peers;
-    ((float*)(sm_channels[peer_idx].dst_ +
-                                    batch_size * num_heads * head_dim *
-                                        sizeof(DType)))[batch_id * num_heads + head_id] = lse;
-  }
-  s_buf[batch_id * num_heads + head_id] = lse;
+  device_syncer.sync(gridDim.x);
 
+  if (tx == 0) {
+    for (uint32_t round_idx = 0; round_idx < num_peers; ++round_idx) {
+      int peer_idx = (round_idx + rank);
+      if (peer_idx >= num_peers) peer_idx -= num_peers;
+      ((float*)(sm_channels[peer_idx].dst_ + batch_size * num_heads * head_dim *
+                                                 sizeof(DType)))[batch_id * num_heads + head_id] =
+          lse;
+    }
+    s_buf[batch_id * num_heads + head_id] = lse;
+  }
+
+  device_syncer.sync(gridDim.x);
   if (tid < num_peers) {
     sm_channels[tid].signal();
     sm_channels[tid].wait();
   }
 }
-
-__device__ mscclpp::DeviceSyncer device_syncer;
 
 template <typename DType, typename ReduceDType>
 __global__ void SumAllReduceInplaceKernel(mscclpp::SmChannelDeviceHandle* sm_channels, DType* buf,
@@ -161,6 +166,7 @@ __global__ void SumAllReduceInplaceKernel(mscclpp::SmChannelDeviceHandle* sm_cha
     sm_channels[tid].signal();
     sm_channels[tid].wait();
   }
+  device_syncer.sync(gridDim.x);
 
   size_t num_vec_per_chunk = chunk_size / vec_size;
   // use int4 as much as possible
@@ -185,6 +191,7 @@ __global__ void SumAllReduceInplaceKernel(mscclpp::SmChannelDeviceHandle* sm_cha
     tmp.cast_store(buf + rank * chunk_size + i * vec_size);
   }
 
+  device_syncer.sync(gridDim.x);
   if (tid < num_peers) {
     sm_channels[tid].signal();
     sm_channels[tid].wait();
