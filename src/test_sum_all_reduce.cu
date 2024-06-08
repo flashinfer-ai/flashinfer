@@ -39,11 +39,11 @@ int main(int argc, char* argv[]) {
   using T = float;
   using ReduceT = float;
   const size_t num_elems = 2 * 1024 * 1024;
-  std::vector<T> host_buff(num_elems);
+  std::vector<T> host_buf(num_elems);
   for (uint32_t i = 0; i < num_elems; ++i) {
-    host_buff[i] = T(i + rank);
+    host_buf[i] = T(i + rank);
   }
-  thrust::device_vector<T> device_buff(host_buff);
+  thrust::device_vector<T> device_buf(host_buf);
   const size_t buf_size_in_bytes = num_elems * sizeof(T);
 
   // Initialize communicator
@@ -58,7 +58,7 @@ int main(int argc, char* argv[]) {
   // setup sm channels
   std::vector<mscclpp::SmChannel> sm_channels;
   distributed::SetupChannels(&comm, sm_channels, rank, nranks,
-                             thrust::raw_pointer_cast(device_buff.data()), buf_size_in_bytes);
+                             thrust::raw_pointer_cast(device_buf.data()), buf_size_in_bytes);
   std::vector<mscclpp::DeviceHandle<mscclpp::SmChannel>> sm_channel_handlers(sm_channels.size());
   std::transform(
       sm_channels.begin(), sm_channels.end(), sm_channel_handlers.begin(),
@@ -74,7 +74,7 @@ int main(int argc, char* argv[]) {
   dim3 nblks((buf_size_in_bytes + nthrs.x - 1) / nthrs.x);
   distributed::SumAllReduceInplaceKernel<T, ReduceT><<<nblks, nthrs>>>(
       thrust::raw_pointer_cast(sm_channel_handlers_d.data()),
-      thrust::raw_pointer_cast(device_buff.data()), rank, nranks, device_buff.size());
+      thrust::raw_pointer_cast(device_buf.data()), rank, nranks, device_buf.size());
 
   cudaError_t status = cudaGetLastError();
   if (status != cudaSuccess) {
@@ -82,23 +82,23 @@ int main(int argc, char* argv[]) {
   }
 
   // check result correctness
-  thrust::host_vector<T> host_buff_result = device_buff;
+  thrust::host_vector<T> host_buf_result = device_buf;
   size_t num_results_error_atol_1e_3_rtol_1e_3 = 0;
   bool nan_detected = false;
 
   for (uint32_t i = 0; i < num_elems; ++i) {
     T expected = T(i * nranks + (nranks - 1) * nranks / 2);
-    if (std::isnan(float(host_buff_result[i]))) {
+    if (std::isnan(float(host_buf_result[i]))) {
       nan_detected = true;
     }
-    if (!utils::isclose(float(host_buff_result[i]), float(expected), 1e-3, 1e-3)) {
+    if (!utils::isclose(float(host_buf_result[i]), float(expected), 1e-3, 1e-3)) {
       num_results_error_atol_1e_3_rtol_1e_3++;
     }
   }
   float result_accuracy = 1. - float(num_results_error_atol_1e_3_rtol_1e_3) / float(num_elems);
 
   spdlog::info("rank: {}, nan_detected: {} accuracy: {}", rank, nan_detected, result_accuracy);
-  if (result_accuracy < 0.99) {
+  if (result_accuracy < 0.99 || nan_detected) {
     spdlog::error("rank: {}, accuracy test failed.", rank);
   }
 

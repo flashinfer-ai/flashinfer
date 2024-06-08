@@ -71,6 +71,8 @@ void SetupChannels(mscclpp::Communicator* comm, std::vector<mscclpp::SmChannel>&
   }
 }
 
+constexpr uint32_t MAX_RANKS = 8;
+
 template <typename DType>
 __global__ void AttentionAllReduceInplaceKernel(mscclpp::SmChannelDeviceHandle* sm_channels,
                                                 void* buf, const uint32_t rank,
@@ -92,8 +94,17 @@ __global__ void AttentionAllReduceInplaceKernel(mscclpp::SmChannelDeviceHandle* 
     sm_channels[tid].wait();
   }
 
+  float other_s[MAX_RANKS - 1];
+  for (uint32_t round_idx = 0; round_idx < num_peers; ++round_idx) {
+    int peer_idx = (round_idx + rank);
+    if (peer_idx >= num_peers) peer_idx -= num_peers;
+    other_s[round_idx] = ((float*)(sm_channels[peer_idx].dst_ +
+                                batch_size * num_heads * head_dim *
+                                    sizeof(DType)))[batch_id * num_heads + head_id];
+  }
+
+  state_t<vec_size> tmp;
   for (uint32_t elem_idx = tx; elem_idx < chunk_size / vec_size; elem_idx += blockDim.x) {
-    state_t<vec_size> tmp;
     tmp.o.cast_load(v_buf + (batch_id * num_heads + head_id) * head_dim + rank * chunk_size +
                     elem_idx * vec_size);
     tmp.m = s_buf[batch_id * num_heads + head_id];
@@ -104,25 +115,29 @@ __global__ void AttentionAllReduceInplaceKernel(mscclpp::SmChannelDeviceHandle* 
       other_v.cast_load(((DType*)sm_channels[peer_idx].dst_) +
                         (batch_id * num_heads + head_id) * head_dim + rank * chunk_size +
                         elem_idx * vec_size);
-      float other_s =
-          *(float*)(sm_channels[peer_idx].dst_ + batch_size * num_heads * head_dim * sizeof(DType));
-      tmp.merge(other_v, other_s, 1);
+      tmp.merge(other_v, other_s[round_idx], 1);
     }
     tmp.normalize();
-    float lse = tmp.get_lse();
     for (uint32_t round_idx = 0; round_idx < num_peers; ++round_idx) {
       int peer_idx = (round_idx + rank);
       if (peer_idx >= num_peers) peer_idx -= num_peers;
       tmp.o.cast_store(((DType*)sm_channels[peer_idx].dst_) +
                        (batch_id * num_heads + head_id) * head_dim + rank * chunk_size +
                        elem_idx * vec_size);
-      *(float*)(sm_channels[peer_idx].dst_ + batch_size * num_heads * head_dim * sizeof(DType)) =
-          lse;
     }
     tmp.o.cast_store(v_buf + (batch_id * num_heads + head_id) * head_dim + rank * chunk_size +
                      elem_idx * vec_size);
-    s_buf[batch_id * num_heads + head_id] = lse;
   }
+
+  float lse = tmp.get_lse();
+  for (uint32_t round_idx = 0; round_idx < num_peers; ++round_idx) {
+    int peer_idx = (round_idx + rank);
+    if (peer_idx >= num_peers) peer_idx -= num_peers;
+    ((float*)(sm_channels[peer_idx].dst_ +
+                                    batch_size * num_heads * head_dim *
+                                        sizeof(DType)))[batch_id * num_heads + head_id] = lse;
+  }
+  s_buf[batch_id * num_heads + head_id] = lse;
 
   if (tid < num_peers) {
     sm_channels[tid].signal();
