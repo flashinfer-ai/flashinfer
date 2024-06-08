@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_DISTRIBUTED_ATTENTION_ALL_REDUCE_CUH_
-#define FLASHINFER_DISTRIBUTED_ATTENTION_ALL_REDUCE_CUH_
+#ifndef FLASHINFER_DISTRIBUTED_ALL_REDUCE_CUH_
+#define FLASHINFER_DISTRIBUTED_ALL_REDUCE_CUH_
 
 #include <mscclpp/concurrency_device.hpp>
 #include <mscclpp/core.hpp>
@@ -180,4 +180,4 @@ __global__ void SumAllReduceInplaceKernel(mscclpp::SmChannelDeviceHandle* sm_cha
 
 }  // namespace flashinfer
 
-#endif  // FLASHINFER_DISTRIBUTED_ATTENTION_ALL_REDUCE_CUH_
+#endif  // FLASHINFER_DISTRIBUTED_ALL_REDUCE_CUH_
