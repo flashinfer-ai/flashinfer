@@ -408,8 +408,8 @@ cudaError_t MergeStateInPlace(DType* v, float* s, DType* v_other, float* s_other
  * \brief Merge self-attention states of a list of index sets.
  * \tparam DTypeIn The data type of v.
  * \tparam DTypeOut The data type of v_merged.
- * \param v The partial v of index sets. (num_index_sets, n, h, d)
- * \param s The logsumexp value of index sets. (num_index_sets, n, h)
+ * \param v The partial v of index sets. (n, num_index_sets, h, d)
+ * \param s The logsumexp value of index sets. (n, num_index_sets, h)
  * \param v_merged The merged v of index sets union. (n, h, d)
  * \param s_merged The merged logsumexp value of index sets union. (n, h)
  * \param num_index_sets The number of index sets.
