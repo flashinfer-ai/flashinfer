@@ -105,6 +105,13 @@ __global__ void AttentionAllReduceInplaceKernel(mscclpp::SmChannelDeviceHandle* 
                                                    sizeof(DType)))[batch_id * num_heads + head_id];
   }
 
+  device_syncer.sync(gridDim.x);
+  if (tid < num_peers) {
+    sm_channels[tid].signal();
+    sm_channels[tid].wait();
+  }
+  device_syncer.sync(gridDim.x);
+
   state_t<vec_size> tmp;
   for (uint32_t elem_idx = tx; elem_idx < chunk_size / vec_size; elem_idx += blockDim.x) {
     tmp.init();
@@ -121,6 +128,14 @@ __global__ void AttentionAllReduceInplaceKernel(mscclpp::SmChannelDeviceHandle* 
       tmp.merge(other_v, other_lse[round_idx], 1);
     }
     tmp.normalize();
+
+    device_syncer.sync(gridDim.x);
+    if (tid < num_peers) {
+      sm_channels[tid].signal();
+      sm_channels[tid].wait();
+    }
+    device_syncer.sync(gridDim.x);
+
     for (uint32_t round_idx = 0; round_idx < num_peers; ++round_idx) {
       int peer_idx = (round_idx + rank);
       if (peer_idx >= num_peers) peer_idx -= num_peers;
@@ -130,8 +145,20 @@ __global__ void AttentionAllReduceInplaceKernel(mscclpp::SmChannelDeviceHandle* 
     }
     tmp.o.cast_store(v_buf + (batch_id * num_heads + head_id) * head_dim + rank * chunk_size +
                      elem_idx * vec_size);
+
+    device_syncer.sync(gridDim.x);
+    if (tid < num_peers) {
+      sm_channels[tid].signal();
+      sm_channels[tid].wait();
+    }
+    device_syncer.sync(gridDim.x);
   }
   float lse = tmp.get_lse();
+  device_syncer.sync(gridDim.x);
+  if (tid < num_peers) {
+    sm_channels[tid].signal();
+    sm_channels[tid].wait();
+  }
   device_syncer.sync(gridDim.x);
 
   if (tx == 0) {
@@ -183,12 +210,27 @@ __global__ void SumAllReduceInplaceKernel(mscclpp::SmChannelDeviceHandle* sm_cha
         tmp[j] += val[j];
       }
     }
+
+    device_syncer.sync(gridDim.x);
+    if (tid < num_peers) {
+      sm_channels[tid].signal();
+      sm_channels[tid].wait();
+    }
+    device_syncer.sync(gridDim.x);
+
     for (uint32_t round_idx = 0; round_idx < num_peers; ++round_idx) {
       int peer_idx = (round_idx + rank);
       if (peer_idx >= num_peers) peer_idx -= num_peers;
       tmp.cast_store(((DType*)sm_channels[peer_idx].dst_) + rank * chunk_size + i * vec_size);
     }
     tmp.cast_store(buf + rank * chunk_size + i * vec_size);
+
+    device_syncer.sync(gridDim.x);
+    if (tid < num_peers) {
+      sm_channels[tid].signal();
+      sm_channels[tid].wait();
+    }
+    device_syncer.sync(gridDim.x);
   }
 
   device_syncer.sync(gridDim.x);
