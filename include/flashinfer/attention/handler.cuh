@@ -271,7 +271,7 @@ class BatchDecodeHandler {
     return (IdType*)seq_lengths_before_partition_;
   }
 
-  const uint32_t GetFixedGridSize() const { return fixed_grid_size_; }
+  uint32_t GetFixedGridSize() const { return fixed_grid_size_; }
 
   template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, QKVLayout kv_layout,
             PosEncodingMode POS_ENCODING_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
