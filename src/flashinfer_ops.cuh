@@ -15,6 +15,7 @@
  */
 #include <flashinfer/decode_attention_decl.cuh>
 #include <flashinfer/prefill_attention_decl.cuh>
+#include <optional>
 
 #include "utils.h"
 
@@ -232,8 +233,8 @@ cudaError_t BatchDecodeWithPagedKVCache(
             return BatchDecodeWithPagedKVCacheDispatched<GROUP_SIZE, HEAD_DIM, page_storage,
                                                          kv_layout, POS_ENCODING_MODE, DTypeIn,
                                                          DTypeOut, IdType>(
-                q, q_offset, paged_kv, kv_partition_info, o, tmp, lse, sm_scale, rope_scale,
-                rope_theta, stream);
+                q, q_offset, paged_kv, kv_partition_info, o, tmp, lse, std::nullopt, sm_scale,
+                rope_scale, rope_theta, stream);
           })})});
 
   return cudaSuccess;

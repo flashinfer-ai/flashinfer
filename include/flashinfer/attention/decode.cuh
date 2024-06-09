@@ -525,6 +525,9 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
 
   constexpr uint32_t head_dim = bdx * vec_size;
   const uint32_t batch_idx = blockIdx.x;
+  // NOTE(Zihao): blockIdx.x might be larger than paged_kv.batch_size
+  // when CUDAGraph is used, so we need to check if batch_idx is valid.
+  if (batch_idx >= paged_kv.batch_size) return;
   const uint32_t kv_head_idx = blockIdx.y;
   const uint32_t qo_head_idx = kv_head_idx * bdy + threadIdx.y;
   const uint32_t num_qo_heads = gridDim.y * bdy;
@@ -843,11 +846,13 @@ template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, QKVL
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     DTypeIn* q, IdType* q_offset, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, DTypeOut* tmp, float* lse,
-    float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream) {
+    std::optional<uint32_t> fixed_grid_size, float sm_scale, float rope_scale, float rope_theta,
+    cudaStream_t stream) {
   const float rope_rcp_scale = 1.f / rope_scale;
   const float rope_rcp_theta = 1.f / rope_theta;
   const uint32_t num_kv_heads = paged_kv.num_heads;
   const uint32_t batch_size = paged_kv.batch_size;
+  const uint32_t grid_size = fixed_grid_size.value_or(batch_size * num_kv_heads);
   const uint32_t num_qo_heads = num_kv_heads * GROUP_SIZE;
 
   constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
@@ -864,7 +869,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
 
   if (tmp == nullptr) {
     // do not use partition-kv kernel
-    dim3 nblks(batch_size, num_kv_heads);
+    dim3 nblks(grid_size / num_kv_heads, num_kv_heads);
     dim3 nthrs(bdx, bdy, bdz);
     auto kernel =
         BatchDecodeWithPagedKVCacheKernel</*partition_kv=*/false, POS_ENCODING_MODE,
@@ -901,7 +906,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
                     (void*)&sm_scale,
                     (void*)&rope_rcp_scale,
                     (void*)&rope_rcp_theta};
-    dim3 nblks(batch_size, num_kv_heads);
+    dim3 nblks(grid_size / num_kv_heads, num_kv_heads);
     dim3 nthrs(bdx, bdy, bdz);
     FLASHINFER_CUDA_CALL(
         cudaLaunchKernel((void*)partition_kv_kernel, nblks, nthrs, args, smem_size, stream));

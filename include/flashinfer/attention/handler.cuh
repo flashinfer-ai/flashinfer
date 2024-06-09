@@ -149,7 +149,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     std::tie(max_num_pages_per_batch, new_batch_size) =
         PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(max_grid_size, num_kv_heads, num_pages,
                                                             128 / page_size);
-    if (new_batch_size == batch_size) {
+    if (new_batch_size == batch_size && !enable_cuda_graph) {
       // do not use partition-kv kernel for short sequence
       tmp_size = 0;
     } else {
@@ -271,6 +271,8 @@ class BatchDecodeHandler {
     return (IdType*)seq_lengths_before_partition_;
   }
 
+  const uint32_t GetFixedGridSize() const { return fixed_grid_size_; }
+
   template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, QKVLayout kv_layout,
             PosEncodingMode POS_ENCODING_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
   cudaError_t BeginForwardDispatched(void* buffer, size_t workspace_size_in_bytes, IdType* indptr,
@@ -291,6 +293,7 @@ class BatchDecodeHandler {
       // NOTE(Zihao): max_batch_size_after_partition_ is determined in handler initialization.
       // the value should not be changed during the lifetime of the handler.
       // So it should be compatible with CUDAGraph which requires fixed pointer.
+      fixed_grid_size_ = max_grid_size;
       size_t max_tmp_size = num_qo_heads * max_batch_size_after_partition_ *
                             (HEAD_DIM * sizeof(DTypeOut) + 2 * sizeof(float));
       AlignedAllocator allocator(buffer, workspace_size_in_bytes);
@@ -370,6 +373,8 @@ class BatchDecodeHandler {
 
   cudaError_t EndForward() {
     forward_started_ = false;
+    max_batch_size_after_partition_ = 0;
+    fixed_grid_size_ = 0;
     batch_size_before_partition_ = 0;
     batch_size_after_partition_ = 0;
     float_buffer_ = nullptr;
@@ -456,6 +461,7 @@ class BatchDecodeHandler {
   bool forward_started_;
   bool cuda_graph_enabled_;
   uint32_t max_batch_size_after_partition_;
+  uint32_t fixed_grid_size_;
   cudaStream_t stream_;
 };
 
