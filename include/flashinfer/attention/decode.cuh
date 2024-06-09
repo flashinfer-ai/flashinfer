@@ -525,9 +525,11 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
 
   constexpr uint32_t head_dim = bdx * vec_size;
   const uint32_t batch_idx = blockIdx.x;
-  // NOTE(Zihao): blockIdx.x might be larger than paged_kv.batch_size
-  // when CUDAGraph is used, so we need to check if batch_idx is valid.
-  if (batch_idx >= paged_kv.batch_size) return;
+  if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0
+      && blockIdx.x == 0 && blockIdx.y == 0) {
+    printf("%d %d\n", gridDim.x, paged_kv.batch_size);
+  }
+
   const uint32_t kv_head_idx = blockIdx.y;
   const uint32_t qo_head_idx = kv_head_idx * bdy + threadIdx.y;
   const uint32_t num_qo_heads = gridDim.y * bdy;
@@ -535,6 +537,9 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
   const uint32_t cur_chunk_start = partition_kv ? kv_partition_info.chunk_start_pos[batch_idx] : 0U;
   const uint32_t cur_page_indptr_begin = paged_kv.indptr[batch_idx],
                  cur_page_indptr_end = paged_kv.indptr[batch_idx + 1];
+  // NOTE(Zihao): when CUDAGraph is enabled, we will launch more blocks than
+  // the actual batch size, so we need to check if the current batch is valid
+  if (cur_page_indptr_begin == cur_page_indptr_end) return;
   const uint32_t cur_last_page_len = paged_kv.last_page_len[batch_idx];
   const uint32_t kv_chunk_len =
       cur_page_indptr_begin != cur_page_indptr_end
@@ -845,7 +850,7 @@ template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, QKVL
           PosEncodingMode POS_ENCODING_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     DTypeIn* q, IdType* q_offset, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
-    kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, DTypeOut* tmp, float* lse,
+    kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, DTypeOut* tmp_v, float* tmp_s, float* lse,
     std::optional<uint32_t> fixed_grid_size, float sm_scale, float rope_scale, float rope_theta,
     cudaStream_t stream) {
   const float rope_rcp_scale = 1.f / rope_scale;
@@ -867,7 +872,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
       2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * HEAD_DIM * sizeof(DTypeIn) +
       std::max(tile_size_per_bdx * num_threads * sizeof(DTypeIn*), 2 * bdy * bdz * sizeof(float));
 
-  if (tmp == nullptr) {
+  if (tmp_v == nullptr) {
     // do not use partition-kv kernel
     dim3 nblks(grid_size / num_kv_heads, num_kv_heads);
     dim3 nthrs(bdx, bdy, bdz);
@@ -882,7 +887,8 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
                     (void*)&paged_kv,
                     (void*)&kv_partition_info,
                     (void*)&o,
-                    (void*)&tmp,
+                    (void*)&tmp_v,
+                    (void*)&tmp_s,
                     (void*)&lse,
                     (void*)&sm_scale,
                     (void*)&rope_rcp_scale,
@@ -901,7 +907,8 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
                     (void*)&paged_kv,
                     (void*)&kv_partition_info,
                     (void*)&o,
-                    (void*)&tmp,
+                    (void*)&tmp_v,
+                    (void*)&tmp_s,
                     (void*)&lse,
                     (void*)&sm_scale,
                     (void*)&rope_rcp_scale,
@@ -911,7 +918,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     FLASHINFER_CUDA_CALL(
         cudaLaunchKernel((void*)partition_kv_kernel, nblks, nthrs, args, smem_size, stream));
     FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
-        tmp, (float*)(tmp + batch_size * num_qo_heads * HEAD_DIM), kv_partition_info.chunk_indptr,
+        tmp_v, tmp_s, kv_partition_info.chunk_indptr,
         o, lse, kv_partition_info.batch_size_before_partition, num_qo_heads, HEAD_DIM, stream));
   }
 

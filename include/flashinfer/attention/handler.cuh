@@ -235,6 +235,13 @@ cudaError_t PartitionPagedKVCacheComputeAuxiliaryInfo(
       }
     }
   }
+
+  // NOTE(Zihao): When CUDAGraph is activated, we need to fill the remaining entries in the indptr
+  // arrays with the last value, and this will notify the kernel to skip the computation for
+  // out of range entries.
+  std::fill(new_page_indptr_h + new_page_indptr_vec.size, new_last_page_len_h,
+            new_page_indptr_vec.back());
+
   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(device_buffer, host_buffer, num_bytes_to_copy,
                                        cudaMemcpyHostToDevice, stream));
   return cudaSuccess;
@@ -243,8 +250,12 @@ cudaError_t PartitionPagedKVCacheComputeAuxiliaryInfo(
 class BatchDecodeHandler {
  public:
   template <typename DType>
-  DType* GetTempFloatBuffer() const {
-    return (DType*)float_buffer_;
+  DType* GetTempFloatVBuffer() const {
+    return (DType*)float_v_buffer_;
+  }
+  template <typename DType>
+  DType* GetTempFloatSBuffer() const {
+    return (DType*)float_s_buffer_;
   }
   template <typename IdType>
   IdType* GetNewIndPtr() const {
@@ -294,10 +305,11 @@ class BatchDecodeHandler {
       // the value should not be changed during the lifetime of the handler.
       // So it should be compatible with CUDAGraph which requires fixed pointer.
       fixed_grid_size_ = max_grid_size;
-      size_t max_tmp_size = num_qo_heads * max_batch_size_after_partition_ *
-                            (HEAD_DIM * sizeof(DTypeOut) + 2 * sizeof(float));
       AlignedAllocator allocator(buffer, workspace_size_in_bytes);
-      float_buffer_ = allocator.aligned_alloc<void>(max_tmp_size, 16);
+      float_v_buffer_ = allocator.aligned_alloc<void>(
+          num_qo_heads * max_batch_size_after_partition_ * HEAD_DIM * sizeof(DTypeOut), 16);
+      float_s_buffer_ = allocator.aligned_alloc<void>(
+          num_qo_heads * max_batch_size_after_partition_ * 2 * sizeof(float), 16);
       new_indptr_ =
           allocator.aligned_alloc<void>((max_batch_size_after_partition_ + 1) * sizeof(IdType), 16);
 
@@ -333,7 +345,9 @@ class BatchDecodeHandler {
     } else {
       if (tmp_size > 0) {
         AlignedAllocator allocator(buffer, workspace_size_in_bytes);
-        float_buffer_ = allocator.aligned_alloc<void>(tmp_size, 16);
+        float_v_buffer_ = allocator.aligned_alloc<void>(tmp_size, 16);
+        float_s_buffer_ = (char*)float_v_buffer_ +
+                          num_qo_heads * batch_size_after_partition_ * HEAD_DIM * sizeof(DTypeOut);
         new_indptr_ =
             allocator.aligned_alloc<void>((batch_size_after_partition_ + 1) * sizeof(IdType), 16);
         void* new_indptr_h_ = page_locked_buffer_;
@@ -373,11 +387,11 @@ class BatchDecodeHandler {
 
   cudaError_t EndForward() {
     forward_started_ = false;
-    max_batch_size_after_partition_ = 0;
     fixed_grid_size_ = 0;
     batch_size_before_partition_ = 0;
     batch_size_after_partition_ = 0;
-    float_buffer_ = nullptr;
+    float_v_buffer_ = nullptr;
+    float_s_buffer_ = nullptr;
     new_indptr_ = nullptr;
     new_last_page_len_ = nullptr;
     chunk_indptr_ = nullptr;
@@ -409,7 +423,8 @@ class BatchDecodeHandler {
   BatchDecodeHandler(size_t max_workspace_size_in_bytes = 128 * 1024 * 1024,
                      size_t max_batch_size = 16384, bool enable_cuda_graph = false)
       : batch_size_after_partition_(0U),
-        float_buffer_(nullptr),
+        float_v_buffer_(nullptr),
+        float_s_buffer_(nullptr),
         new_indptr_(nullptr),
         new_last_page_len_(nullptr),
         chunk_indptr_(nullptr),
@@ -451,7 +466,8 @@ class BatchDecodeHandler {
   uint32_t batch_size_before_partition_;
   uint32_t batch_size_after_partition_;
   void* page_locked_buffer_;
-  void* float_buffer_;
+  void* float_v_buffer_;
+  void* float_s_buffer_;
   void* new_indptr_;
   void* new_last_page_len_;
   void* chunk_indptr_;
