@@ -40,7 +40,7 @@ template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{group_size}, {head_d
     kv_partition_info_t<{idtype}> kv_partition_info,
     {dtype_out}* o, {dtype_out}* tmp, float* lse,
     float sm_scale, float rope_scale,
-    float rope_theta, cudaStream_t stream);
+    float rope_theta, bool use_cuda_graph, cudaStream_t stream);
 
 }}
     """.format(
