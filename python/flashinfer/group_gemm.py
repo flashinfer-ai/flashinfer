@@ -84,7 +84,7 @@ class SegmentGEMMWrapper:
 
         .. math::
 
-            y[i] = x[i] \times W[weight_indices[i]]
+            y[i] = x[i] \times W[\text{weight_indices}[i]]
 
         We use Ragged Tensor to represent the input tensor :attr:`x` and the output tensor :attr:`y`, and each x[i]
         is a segment of the concatenated tensor. Please see :ref:`Ragged Tensor tutorial <ragged-layout>` for more details.
