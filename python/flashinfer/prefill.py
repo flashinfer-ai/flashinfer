@@ -499,31 +499,29 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         enable_cuda_graph : bool
             Whether to enable CUDA graph capture for the prefill kernels, if enabled, the
-            auxiliary data structures will be stored in provided buffers.
+            auxiliary data structures will be stored in provided buffers. The ``batch_size``
+            cannot change during the lifecycle of this wrapper when CUDAGraph is enabled.
 
         qo_indptr_buf : Optional[torch.Tensor]
-            The user reserved buffer to store the ``qo_indptr`` array, should be large
-            enough to store the maximum possible size of the ``qo_indptr`` array during the
-            lifetime of the wrapper. This argument is only effective when ``enable_cuda_graph``
-            is set to ``True``.
+            The user reserved buffer to store the ``qo_indptr`` array, the size of the buffer
+            should be ``[batch_size + 1]``.
+            This argument is only effective when ``enable_cuda_graph`` is ``True``.
 
         paged_kv_indptr_buf : Optional[torch.Tensor]
-            The user reserved buffer to store the ``paged_kv_indptr`` array, should be large
-            enough to store the maximum possible size of the ``paged_kv_indptr`` array during
-            the lifetime of the wrapper. This argument is only effective when ``enable_cuda_graph``
-            is set to ``True``.
+            The user reserved buffer to store the ``paged_kv_indptr`` array, the size of this
+            buffer should be ``[batch_size + 1]``.
+            This argument is only effective when ``enable_cuda_graph`` is ``True``.
 
         paged_kv_indices_buf : Optional[torch.Tensor]
             The user reserved buffer to store the ``paged_kv_indices`` array, should be large
             enough to store the maximum possible size of the ``paged_kv_indices`` array during
             the lifetime of the wrapper. This argument is only effective when ``enable_cuda_graph``
-            is set to ``True``.
+            is ``True``.
 
         paged_kv_last_page_len_buf : Optional[torch.Tensor]
-            The user reserved buffer to store the ``paged_kv_last_page_len`` array, should be
-            large enough to store the maximum possible size of the ``paged_kv_last_page_len`` array
-            during the lifetime of the wrapper. This argument is only effective when ``enable_cuda_graph``
-            is set to ``True``.
+            The user reserved buffer to store the ``paged_kv_last_page_len`` array, the size of
+            the buffer should be ``[batch_size]``.
+            This argument is only effective when ``enable_cuda_graph`` is ``True``.
 
         custom_mask_buf : Optional[torch.Tensor]
             The user reserved buffer to store the custom mask tensor, should be large enough to
@@ -532,10 +530,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             and the custom mask will be used in attention computation.
 
         qk_indptr_buf : Optional[torch.Tensor]
-            The user reserved buffer to store the ``qk_indptr`` array, should be large enough to
-            store the maximum possible size of the ``qk_indptr`` array during the lifetime of the
-            wrapper. This argument is only effective when ``enable_cuda_graph`` is set to ``True``
-            and the custom mask will be used in attention computation.
+            The user reserved buffer to store the ``qk_indptr`` array, the size of the buffer
+            should be ``[batch_size + 1]``.
+            This argument is only effective when ``enable_cuda_graph`` is ``True`` and the custom
+            mask will be used in attention computation.
         """
         check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
@@ -561,7 +559,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 raise ValueError(
                     "paged_kv_last_page_len_buf should be a torch.Tensor in CUDA graph mode"
                 )
+            self._fixed_batch_size = len(qo_indptr_buf) - 1
+            if len(paged_kv_indptr_buf) != self._fixed_batch_size + 1:
+                raise ValueError(
+                    "The length of paged_kv_indptr_buf should be batch_size + 1."
+                )
+            if len(paged_kv_last_page_len_buf) != self._fixed_batch_size:
+                raise ValueError(
+                    "The length of paged_kv_last_page_len_buf should be batch_size."
+                )
             # NOTE(Zihao): do not check custom_mask_buf and qk_indptr_buf here, as they are optional
+        else:
+            self._fixed_batch_size = 0
 
         self._qo_indptr_buf = qo_indptr_buf
         self._paged_kv_indptr_buf = paged_kv_indptr_buf
@@ -638,13 +647,25 @@ class BatchPrefillWithPagedKVCacheWrapper:
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
         """
         batch_size = len(qo_indptr) - 1
+
         if self.is_cuda_graph_enabled:
-            self._qo_indptr_buf[: len(qo_indptr)] = qo_indptr
-            self._paged_kv_indptr_buf[: len(paged_kv_indptr)] = paged_kv_indptr
+            if batch_size != self._fixed_batch_size:
+                raise ValueError(
+                    "The batch size should be fixed during the lifecycle of the wrapper in "
+                    "cuda graph mode, the runtime batch size {} mismatches the batch size {} "
+                    " set during initialization.".format(
+                        batch_size, self._fixed_batch_size
+                    )
+                )
+            if len(paged_kv_indices) > len(self._paged_kv_indices_buf):
+                raise ValueError(
+                    "The length of paged_kv_indices exceeds the allocated buffer size."
+                )
+
+            self._qo_indptr_buf.copy_(qo_indptr)
+            self._paged_kv_indptr_buf.copy_(paged_kv_indptr)
             self._paged_kv_indices_buf[: len(paged_kv_indices)] = paged_kv_indices
-            self._paged_kv_last_page_len_buf[: len(paged_kv_last_page_len)] = (
-                paged_kv_last_page_len
-            )
+            self._paged_kv_last_page_len_buf.copy_(paged_kv_last_page_len)
 
             if custom_mask is not None:
                 if not torch.is_tensor(self._custom_mask_buf):
@@ -657,11 +678,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     )
                 self._custom_mask_buf[: len(custom_mask)] = custom_mask
                 # NOTE(Zihao): qk_indptr has the same length as qo_indptr
-                self._qk_indptr_buf[: len(qo_indptr)] = _compute_page_qk_indptr(
-                    qo_indptr,
-                    paged_kv_indptr,
-                    paged_kv_last_page_len,
-                    page_size,
+                self._qk_indptr_buf.copy_(
+                    _compute_page_qk_indptr(
+                        qo_indptr,
+                        paged_kv_indptr,
+                        paged_kv_last_page_len,
+                        page_size,
+                    )
                 )
         else:
             self._qo_indptr_buf = qo_indptr
@@ -1025,16 +1048,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             auxiliary data structures will be stored in the provided buffers.
 
         qo_indptr_buf : Optional[torch.Tensor]
-            The user reserved GPU buffer to store the ``qo_indptr`` array, should be large
-            enough to store the maximum possible size of the ``qo_indptr`` array during the
-            lifetime of the wrapper. This argument is only effective when ``enable_cuda_graph``
-            is ``True``.
+            The user reserved GPU buffer to store the ``qo_indptr`` array, the size of the buffer
+            should be ``[batch_size + 1]``.
+            This argument is only effective when ``enable_cuda_graph`` is ``True``.
 
         kv_indptr_buf : Optional[torch.Tensor]
-            The user reserved GPU buffer to store the ``kv_indptr`` array, should be large
-            enough to store the maximum possible size of the ``kv_indptr`` array during the
-            lifetime of the wrapper. This argument is only effective when ``enable_cuda_graph``
-            is ``True``.
+            The user reserved GPU buffer to store the ``kv_indptr`` array, the size of the buffer
+            should be ``[batch_size + 1]``.
+            This argument is only effective when ``enable_cuda_graph`` is ``True``.
 
         custom_mask_buf : Optional[torch.Tensor]
             The user reserved GPU buffer to store the custom mask tensor, should be large
@@ -1043,11 +1064,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             is ``True`` and custom mask will be used in attention computation.
 
         qk_indptr_buf : Optional[torch.Tensor]
-            The user reserved GPU buffer to store the ``qk_indptr`` array, should be large
-            enough to store the maximum possible size of the ``qk_indptr`` array during the
-            lifetime of the wrapper. This argument is only effective when ``enable_cuda_graph``
-            is ``True`` and custom mask will be used in attention computation.
-
+            The user reserved GPU buffer to store the ``qk_indptr`` array, the size of the buffer
+            should be ``[batch_size]``.
+            This argument is only effective when ``enable_cuda_graph`` is ``True`` and custom mask
+            will be used in attention computation.
         """
         check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
@@ -1064,6 +1084,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             if not torch.is_tensor(kv_indptr_buf):
                 raise ValueError(
                     "kv_indptr_buf should be a torch.Tensor in cuda graph mode"
+                )
+            self._fixed_batch_size = len(qo_indptr_buf)
+            if len(kv_indptr_buf) != self._fixed_batch_size:
+                raise ValueError(
+                    "The length of kv_indptr_buf ({}) should be the same as qo_indptr_buf ({}).".format(
+                        len(kv_indptr_buf), self._fixed_batch_size
+                    )
                 )
             # NOTE(Zihao): do not check custom_mask_buf and qk_indptr_buf here,
             # as they may not be used.
@@ -1131,9 +1158,21 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
         """
         batch_size = len(qo_indptr) - 1
+        if len(kv_indptr) != batch_size + 1:
+            raise ValueError(
+                "The kv_indptr length should be equal to qk_indptr length."
+            )
+
         if self.is_cuda_graph_enabled:
-            self._qo_indptr_buf[: len(qo_indptr)] = qo_indptr
-            self._kv_indptr_buf[: len(kv_indptr)] = kv_indptr
+            if batch_size != self._fixed_batch_size:
+                raise ValueError(
+                    "The batch size should be fixed in cudagraph mode, the runtime batch size {} "
+                    " mismatches the batch size set during initialization {}.".format(
+                        batch_size, self._fixed_batch_size
+                    )
+                )
+            self._qo_indptr_buf.copy_(qo_indptr)
+            self._kv_indptr_buf.copy_(kv_indptr)
             if custom_mask is not None:
                 if not torch.is_tensor(self._custom_mask_buf):
                     raise ValueError(
@@ -1144,9 +1183,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                         "qk_indptr_buf must be initialized with a torch.Tensor in cuda graph mode if we use custom mask in the attention computation."
                     )
                 self._custom_mask_buf[: len(custom_mask)] = custom_mask
-                self._qk_indptr_buf[: len(qo_indptr)] = _compute_qk_indptr(
-                    qo_indptr, kv_indptr
-                )
+                self._qk_indptr_buf.copy_(_compute_qk_indptr(qo_indptr, kv_indptr))
         else:
             self._qo_indptr_buf = qo_indptr
             self._kv_indptr_buf = kv_indptr

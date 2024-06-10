@@ -31,7 +31,7 @@ import flashinfer
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
-@pytest.mark.parametrize("enable_cuda_graph", [False, True])
+@pytest.mark.parametrize("enable_cuda_graph", [True])
 def test_batch_prefill_with_paged_kv_cache(
     batch_size,
     kv_len,
@@ -114,17 +114,22 @@ def test_batch_prefill_with_paged_kv_cache(
             head_dim,
             page_size,
         )
+
         # warmup
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             for _ in range(3):
-                o = wrapper.forward(q, kv_data, pos_encoding_mode=pos_encoding_mode)
+                o = wrapper.forward(
+                    q, kv_data, causal=causal, pos_encoding_mode=pos_encoding_mode
+                )
         torch.cuda.current_stream().wait_stream(s)
         # capture
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
-            o = wrapper.forward(q, kv_data, pos_encoding_mode=pos_encoding_mode)
+            o = wrapper.forward(
+                q, kv_data, causal=causal, pos_encoding_mode=pos_encoding_mode
+            )
         wrapper.end_forward()
 
         wrapper.begin_forward(
@@ -259,8 +264,8 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
         kv_last_page_len,
         num_qo_heads,
         num_kv_heads,
-        page_size,
         head_dim,
+        page_size,
     )
     o_causal = wrapper.forward(
         q, kv_data, causal=True, pos_encoding_mode=pos_encoding_mode

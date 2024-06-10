@@ -53,7 +53,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("forward", &BatchDecodeWithPagedKVCachePyTorchWrapper::Forward);
   py::class_<BatchPrefillWithPagedKVCachePyTorchWrapper>(
       m, "BatchPrefillWithPagedKVCachePyTorchWrapper")
-      .def(py::init<bool, unsigned int>())
+      .def(py::init<unsigned int, bool>())
       .def("begin_forward", &BatchPrefillWithPagedKVCachePyTorchWrapper::BeginForward)
       .def("end_forward", &BatchPrefillWithPagedKVCachePyTorchWrapper::EndForward)
       .def("is_cuda_graph_enabled", &BatchPrefillWithPagedKVCachePyTorchWrapper::IsCUDAGraphEnabled)
@@ -63,7 +63,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("forward_custom_mask", &BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCustomMask);
   py::class_<BatchPrefillWithRaggedKVCachePyTorchWrapper>(
       m, "BatchPrefillWithRaggedKVCachePyTorchWrapper")
-      .def(py::init<bool, unsigned int>())
+      .def(py::init<unsigned int, bool>())
       .def("begin_forward", &BatchPrefillWithRaggedKVCachePyTorchWrapper::BeginForward)
       .def("end_forward", &BatchPrefillWithRaggedKVCachePyTorchWrapper::EndForward)
       .def("is_cuda_graph_enabled",

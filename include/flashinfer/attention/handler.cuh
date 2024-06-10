@@ -468,7 +468,7 @@ class BatchDecodeHandler {
         cuda_graph_enabled_(enable_cuda_graph),
         fixed_batch_size_(batch_size),
         stream_(nullptr) {
-    cudaMallocHost(&page_locked_buffer_, 16 * 1024 * 1024);
+    cudaMallocHost(&page_locked_buffer_, 8 * 1024 * 1024);
   }
   ~BatchDecodeHandler() {
     EndForward();
@@ -535,18 +535,10 @@ class BatchPrefillHandler {
     std::tie(num_frags_x_, num_qo_tiles_, request_indices_vec, tile_indices_vec) =
         split_qo_indptr(qo_indptr, batch_size, gqa_group_size, head_dim, stream_);
     AlignedAllocator allocator(buffer, workspace_size_in_bytes);
-    if (IsCUDAGraphEnabled()) {
-      request_indices_ = allocator.aligned_alloc<void>(sizeof(IdType) * max_num_qo_tiles_, 16);
-    } else {
-      request_indices_ =
-          allocator.aligned_alloc<void>(sizeof(IdType) * request_indices_vec.size(), 16);
-    }
+    request_indices_ =
+        allocator.aligned_alloc<void>(sizeof(IdType) * request_indices_vec.size(), 16);
     void* request_indices_h_ = page_locked_buffer_;
-    if (IsCUDAGraphEnabled()) {
-      tile_indices_ = allocator.aligned_alloc<void>(sizeof(IdType) * max_num_qo_tiles_, 16);
-    } else {
-      tile_indices_ = allocator.aligned_alloc<void>(sizeof(IdType) * tile_indices_vec.size(), 16);
-    }
+    tile_indices_ = allocator.aligned_alloc<void>(sizeof(IdType) * tile_indices_vec.size(), 16);
     void* tile_indices_h_ =
         (char*)page_locked_buffer_ + ((char*)tile_indices_ - (char*)request_indices_);
     std::copy(request_indices_vec.begin(), request_indices_vec.end(), (IdType*)request_indices_h_);
@@ -582,7 +574,7 @@ class BatchPrefillHandler {
         forward_started_(false),
         enable_cuda_graph_(enable_cuda_graph),
         stream_(nullptr) {
-    cudaMallocHost(&page_locked_buffer_, 16 * 1024 * 1024);
+    cudaMallocHost(&page_locked_buffer_, 8 * 1024 * 1024);
   }
   ~BatchPrefillHandler() {
     EndForward();

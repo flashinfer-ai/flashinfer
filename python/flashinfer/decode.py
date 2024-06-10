@@ -460,7 +460,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         enable_cuda_graph : bool
             Whether to enable CUDAGraph for batch decode attention, if enabled, the
-            auxiliary data structures will be stored in the provided buffers.
+            auxiliary data structures will be stored in the provided buffers. The ``batch_size``
+            cannot change during the lifecycle of this wrapper when CUDAGraph is enabled.
 
         indptr_buffer : Optional[torch.Tensor]
             The user reserved buffer on GPU to store the indptr of the paged kv cache, the size
@@ -481,21 +482,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
         self._workspace_buffer = workspace_buffer
-        # NOTE(Zihao): fixed_batch_size will only be used in cudagraph mode
-        if enable_cuda_graph:
-            self._fixed_batch_size = len(paged_kv_last_page_len_buffer)
-            if len(paged_kv_indptr_buffer) != self._fixed_batch_size + 1:
-                raise ValueError(
-                    "The size of paged_kv_indptr_buffer should be batch_size + 1"
-                )
-        else:
-            self._fixed_batch_size = 0
 
-        self._wrapper = _kernels.BatchDecodeWithPagedKVCachePyTorchWrapper(
-            TensorLayout[kv_layout].value,
-            enable_cuda_graph,
-            self._fixed_batch_size,
-        )
         if enable_cuda_graph:
             if not torch.is_tensor(paged_kv_indptr_buffer):
                 raise ValueError(
@@ -509,13 +496,23 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 raise ValueError(
                     "paged_kv_last_page_len_buffer should be a torch.Tensor in cudagraph mode"
                 )
-            self._paged_kv_indptr_buf = paged_kv_indptr_buffer
-            self._paged_kv_indices_buf = paged_kv_indices_buffer
-            self._paged_kv_last_page_len_buf = paged_kv_last_page_len_buffer
+            self._fixed_batch_size = len(paged_kv_last_page_len_buffer)
+            if len(paged_kv_indptr_buffer) != self._fixed_batch_size + 1:
+                raise ValueError(
+                    "The size of paged_kv_indptr_buffer should be batch_size + 1"
+                )
         else:
-            self._paged_kv_indptr_buf = None
-            self._paged_kv_indices_buf = None
-            self._paged_kv_last_page_len_buf = None
+            self._fixed_batch_size = 0
+
+        self._paged_kv_indptr_buf = paged_kv_indptr_buffer
+        self._paged_kv_indices_buf = paged_kv_indices_buffer
+        self._paged_kv_last_page_len_buf = paged_kv_last_page_len_buffer
+
+        self._wrapper = _kernels.BatchDecodeWithPagedKVCachePyTorchWrapper(
+            TensorLayout[kv_layout].value,
+            enable_cuda_graph,
+            self._fixed_batch_size,
+        )
 
     @property
     def is_cuda_graph_enabled(self):
@@ -581,12 +578,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
         """
         batch_size = len(last_page_len)
-        if len(indptr) != batch_size + 1:
-            raise ValueError(
-                "The size of indptr ({}) should be size of last_page_len ({}) + 1".format(
-                    len(indptr), batch_size
-                )
-            )
 
         if self.is_cuda_graph_enabled:
             if batch_size != self._fixed_batch_size:
@@ -600,9 +591,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 raise ValueError(
                     "The size of indices should be less than or equal to the allocated buffer"
                 )
-            self._paged_kv_indptr_buf[: self._fixed_batch_size + 1] = indptr
+            self._paged_kv_indptr_buf.copy_(indptr)
             self._paged_kv_indices_buf[: len(indices)] = indices
-            self._paged_kv_last_page_len_buf[: self._fixed_batch_size] = last_page_len
+            self._paged_kv_last_page_len_buf.copy_(last_page_len)
         else:
             self._paged_kv_indptr_buf = indptr
             self._paged_kv_indices_buf = indices
