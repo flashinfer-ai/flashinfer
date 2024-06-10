@@ -289,7 +289,7 @@ class BatchDecodeHandler {
     return (IdType*)seq_lengths_before_partition_;
   }
 
-  uint32_t GetFixedGridSize() const { return fixed_grid_size_; }
+  uint32_t GetPaddedBatchSize() const { return padded_batch_size_; }
 
   bool* GetBlockValidMask() const { return block_valid_mask_; }
 
@@ -320,7 +320,7 @@ class BatchDecodeHandler {
       }
       size_t padded_batch_size_after_partition = max_grid_size / num_kv_heads;
       if (tmp_size > 0) {
-        fixed_grid_size_ = padded_batch_size_after_partition * num_kv_heads;
+        padded_batch_size_ = padded_batch_size_after_partition;
         AlignedAllocator allocator(buffer, workspace_size_in_bytes);
         tmp_v_ = allocator.aligned_alloc<void>(
             num_qo_heads * padded_batch_size_after_partition * HEAD_DIM * sizeof(DTypeOut), 16);
@@ -367,11 +367,13 @@ class BatchDecodeHandler {
             /*host_buffer=*/page_locked_buffer_, num_bytes_to_copy, stream_));
       } else {
         block_valid_mask_ = nullptr;
-        fixed_grid_size_ = num_kv_heads * batch_size;
+        padded_batch_size_ = num_kv_heads * batch_size;
       }
     } else {
       // NOTE(Zihao): we don't use block_valid_mask when CUDAGraph is disabled.
       block_valid_mask_ = nullptr;
+      // do not pad the batch size when not using CUDAGraph
+      padded_batch_size_ = batch_size_after_partition_;
       if (tmp_size > 0) {
         AlignedAllocator allocator(buffer, workspace_size_in_bytes);
         tmp_v_ = allocator.aligned_alloc<void>(tmp_size, 16);
@@ -418,7 +420,7 @@ class BatchDecodeHandler {
 
   cudaError_t EndForward() {
     forward_started_ = false;
-    fixed_grid_size_ = 0;
+    padded_batch_size_ = 0;
     batch_size_before_partition_ = 0;
     batch_size_after_partition_ = 0;
     block_valid_mask_ = nullptr;
@@ -492,7 +494,7 @@ class BatchDecodeHandler {
   void* seq_lengths_before_partition_;
   bool forward_started_;
   bool cuda_graph_enabled_;
-  uint32_t fixed_grid_size_;
+  uint32_t padded_batch_size_;
   uint32_t fixed_batch_size_;
   cudaStream_t stream_;
 };
