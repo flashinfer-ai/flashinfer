@@ -234,8 +234,7 @@ cudaError_t BatchDecodeWithPagedKVCache(
                                                          kv_layout, POS_ENCODING_MODE, DTypeIn,
                                                          DTypeOut, IdType>(
                 q, q_offset, paged_kv, kv_partition_info, o, tmp,
-                (float*)tmp + batch_size * num_qo_heads * head_dim,
-                lse, std::nullopt, sm_scale,
+                (float*)tmp + batch_size * num_qo_heads * head_dim, lse, std::nullopt, sm_scale,
                 rope_scale, rope_theta, stream);
           })})});
 

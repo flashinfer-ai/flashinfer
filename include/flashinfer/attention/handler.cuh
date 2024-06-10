@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <sstream>
+#include <stdexcept>
 #include <vector>
 
 #include "../allocator.h"
@@ -36,7 +37,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
     DTypeIn* __restrict__ q, IdType* __restrict__ q_offset,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* __restrict__ o,
-    DTypeOut* __restrict__ tmp, float* __restrict__ lse, float sm_scale, float rope_rcp_scale,
+    DTypeOut* __restrict__ tmp_v, float* __restrict__ tmp_s, float* __restrict__ lse,
+    bool* __restrict__ block_valid_mask, float sm_scale, float rope_rcp_scale,
     float rope_rcp_theta);
 
 /*!
@@ -127,10 +129,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
   FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
       &num_blocks_per_sm, partition_kv_kernel, num_threads, smem_size));
   max_grid_size = num_blocks_per_sm * num_sm;
-  if (batch_size * num_kv_heads >= max_grid_size && !enable_cuda_graph) {
-    // do not use partition-kv kernel
-    // TODO(Zihao): if enable_cuda_graph, we should always use partition-kv kernel
-    // so that only one kernel will be captured in the graph.
+  if (batch_size * num_kv_heads >= num_sm) {
     tmp_size = 0;
     new_batch_size = batch_size;
   } else {
@@ -150,7 +149,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
         PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(max_grid_size, num_kv_heads, num_pages,
                                                             128 / page_size);
     if (new_batch_size == batch_size && !enable_cuda_graph) {
-      // do not use partition-kv kernel for short sequence
+      // do not use partition-kv kernel for short sequence, when not using CUDAGraph
       tmp_size = 0;
     } else {
       tmp_size = num_qo_heads * new_batch_size * (HEAD_DIM * sizeof(DTypeOut) + 2 * sizeof(float));
@@ -158,6 +157,20 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
   }
   return cudaSuccess;
 }
+
+/*!
+ * \brief A lightweight wrapper to create a vector from pointer to pre-allocated memory
+ */
+template <typename T>
+struct vec_from_ptr {
+  T* data;
+  size_t size;
+  vec_from_ptr(T* data) : data(data), size(0) {}
+  T operator[](size_t idx) const { return data[idx]; }
+  T& operator[](size_t idx) { return data[idx]; }
+  T back() const { return data[size - 1]; }
+  void push_back(T val) { data[size++] = val; }
+};
 
 /*!
  * \brief Partition Paged KV-Cache into multiple chunks on KV sequence length
@@ -172,25 +185,17 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
  */
 template <typename IdType>
 cudaError_t PartitionPagedKVCacheComputeAuxiliaryInfo(
-    const uint32_t max_num_pages_per_batch, const uint32_t old_batch_size, const uint32_t page_size,
-    IdType* old_indptr, IdType* old_last_page_len, IdType* new_page_indptr_h,
-    IdType* new_last_page_len_h, IdType* chunk_indptr_h, IdType* batch_idx_map_h,
-    IdType* chunk_start_pos_h, IdType* seq_lens_before_partition_h, void* device_buffer,
+    const uint32_t max_num_pages_per_batch, const uint32_t old_batch_size,
+    const uint32_t padded_batch_size, const uint32_t page_size, IdType* old_indptr,
+    IdType* old_last_page_len, IdType* new_page_indptr_h, IdType* new_last_page_len_h,
+    IdType* chunk_indptr_h, IdType* batch_idx_map_h, IdType* chunk_start_pos_h,
+    IdType* seq_lens_before_partition_h, bool* block_valid_mask_h, void* device_buffer,
     void* host_buffer, size_t num_bytes_to_copy, cudaStream_t stream = nullptr) {
-  struct idtype_vector {
-    IdType* data;
-    size_t size;
-    idtype_vector(IdType* data) : data(data), size(0) {}
-    IdType operator[](size_t idx) const { return data[idx]; }
-    IdType& operator[](size_t idx) { return data[idx]; }
-    IdType back() const { return data[size - 1]; }
-    void push_back(IdType val) { data[size++] = val; }
-  };
-
-  idtype_vector new_page_indptr_vec(new_page_indptr_h), new_last_page_len_vec(new_last_page_len_h),
-      chunk_indptr_vec(chunk_indptr_h), batch_idx_map_vec(batch_idx_map_h),
-      chunk_start_pos_vec(chunk_start_pos_h),
+  vec_from_ptr<IdType> new_page_indptr_vec(new_page_indptr_h),
+      new_last_page_len_vec(new_last_page_len_h), chunk_indptr_vec(chunk_indptr_h),
+      batch_idx_map_vec(batch_idx_map_h), chunk_start_pos_vec(chunk_start_pos_h),
       seq_lens_before_partition_vec(seq_lens_before_partition_h);
+  vec_from_ptr<bool> block_valid_mask_vec(block_valid_mask_h);
 
   new_page_indptr_vec.push_back(0);
   chunk_indptr_vec.push_back(0);
@@ -216,6 +221,9 @@ cudaError_t PartitionPagedKVCacheComputeAuxiliaryInfo(
     if (num_chunks == 0) {
       new_page_indptr_vec.push_back(old_indptr_h[batch_idx]);
       new_last_page_len_vec.push_back(0);
+      if (block_valid_mask_h != nullptr) {
+        block_valid_mask_vec.push_back(true);
+      }
       batch_idx_map_vec.push_back(batch_idx);
       chunk_start_pos_vec.push_back(0);
       seq_lens_before_partition_vec.push_back(0);
@@ -229,17 +237,16 @@ cudaError_t PartitionPagedKVCacheComputeAuxiliaryInfo(
             min(old_indptr_h[batch_idx] + (j + 1) * max_num_pages_per_batch,
                 old_indptr_h[batch_idx + 1]));
         new_last_page_len_vec.push_back(is_last ? old_last_page_len_h[batch_idx] : page_size);
+        if (block_valid_mask_h != nullptr) {
+          block_valid_mask_vec.push_back(true);
+        }
         batch_idx_map_vec.push_back(batch_idx);
         chunk_start_pos_vec.push_back(j * max_num_pages_per_batch * page_size);
         seq_lens_before_partition_vec.push_back(seq_len_before_partition);
       }
     }
   }
-
-  // NOTE(Zihao): When CUDAGraph is activated, we need to fill the remaining entries in the indptr
-  // arrays with the last value, and this will notify the kernel to skip the computation for
-  // out of range entries.
-  std::fill(new_page_indptr_h + new_page_indptr_vec.size, new_last_page_len_h,
+  std::fill(new_page_indptr_h + new_page_indptr_vec.size, new_page_indptr_h + padded_batch_size + 1,
             new_page_indptr_vec.back());
 
   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(device_buffer, host_buffer, num_bytes_to_copy,
@@ -250,12 +257,12 @@ cudaError_t PartitionPagedKVCacheComputeAuxiliaryInfo(
 class BatchDecodeHandler {
  public:
   template <typename DType>
-  DType* GetTempFloatVBuffer() const {
-    return (DType*)float_v_buffer_;
+  DType* GetTempV() const {
+    return (DType*)tmp_v_;
   }
   template <typename DType>
-  DType* GetTempFloatSBuffer() const {
-    return (DType*)float_s_buffer_;
+  DType* GetTempS() const {
+    return (DType*)tmp_s_;
   }
   template <typename IdType>
   IdType* GetNewIndPtr() const {
@@ -284,12 +291,15 @@ class BatchDecodeHandler {
 
   uint32_t GetFixedGridSize() const { return fixed_grid_size_; }
 
+  bool* GetBlockValidMask() const { return block_valid_mask_; }
+
   template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, QKVLayout kv_layout,
             PosEncodingMode POS_ENCODING_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
   cudaError_t BeginForwardDispatched(void* buffer, size_t workspace_size_in_bytes, IdType* indptr,
                                      IdType* last_page_len, uint32_t batch_size,
                                      uint32_t num_qo_heads, uint32_t page_size) {
     batch_size_before_partition_ = batch_size;
+    uint32_t num_kv_heads = num_qo_heads / GROUP_SIZE;
     uint32_t tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size;
     auto work_estimation_func =
         BatchDecodeWithPagedKVCacheWorkEstimationDispatched<GROUP_SIZE, HEAD_DIM, page_storage,
@@ -301,53 +311,72 @@ class BatchDecodeHandler {
                                               /*enable_cuda_graph=*/IsCUDAGraphEnabled(), stream_));
     batch_size_after_partition_ = new_batch_size;
     if (IsCUDAGraphEnabled()) {
-      // NOTE(Zihao): max_batch_size_after_partition_ is determined in handler initialization.
-      // the value should not be changed during the lifetime of the handler.
-      // So it should be compatible with CUDAGraph which requires fixed pointer.
-      fixed_grid_size_ = max_grid_size;
-      AlignedAllocator allocator(buffer, workspace_size_in_bytes);
-      float_v_buffer_ = allocator.aligned_alloc<void>(
-          num_qo_heads * max_batch_size_after_partition_ * HEAD_DIM * sizeof(DTypeOut), 16);
-      float_s_buffer_ = allocator.aligned_alloc<void>(
-          num_qo_heads * max_batch_size_after_partition_ * 2 * sizeof(float), 16);
-      new_indptr_ =
-          allocator.aligned_alloc<void>((max_batch_size_after_partition_ + 1) * sizeof(IdType), 16);
+      if (batch_size != fixed_batch_size_) {
+        std::ostringstream err_msg;
+        err_msg << "The running batch size " << batch_size
+                << " is not compatible with the fixed batch size " << fixed_batch_size_
+                << " initialized for CUDAGraph";
+        throw std::runtime_error(err_msg.str());
+      }
+      size_t padded_batch_size_after_partition = max_grid_size / num_kv_heads;
+      if (tmp_size > 0) {
+        fixed_grid_size_ = padded_batch_size_after_partition * num_kv_heads;
+        AlignedAllocator allocator(buffer, workspace_size_in_bytes);
+        tmp_v_ = allocator.aligned_alloc<void>(
+            num_qo_heads * padded_batch_size_after_partition * HEAD_DIM * sizeof(DTypeOut), 16);
+        tmp_s_ = allocator.aligned_alloc<void>(
+            num_qo_heads * padded_batch_size_after_partition * 2 * sizeof(float), 16);
+        new_indptr_ = allocator.aligned_alloc<void>(
+            (padded_batch_size_after_partition + 1) * sizeof(IdType), 16);
 
-      void* new_indptr_h_ = page_locked_buffer_;
-      new_last_page_len_ =
-          allocator.aligned_alloc<void>(max_batch_size_after_partition_ * sizeof(IdType), 16);
-      void* new_last_page_len_h_ =
-          (char*)page_locked_buffer_ + ((char*)new_last_page_len_ - (char*)new_indptr_);
-      chunk_indptr_ =
-          allocator.aligned_alloc<void>((max_batch_size_after_partition_ + 1) * sizeof(IdType), 16);
-      void* chunk_indptr_h_ =
-          (char*)page_locked_buffer_ + ((char*)chunk_indptr_ - (char*)new_indptr_);
-      batch_idx_map_ =
-          allocator.aligned_alloc<void>(max_batch_size_after_partition_ * sizeof(IdType), 16);
-      void* batch_idx_map_h_ =
-          (char*)page_locked_buffer_ + ((char*)batch_idx_map_ - (char*)new_indptr_);
-      chunk_start_pos_ =
-          allocator.aligned_alloc<void>(max_batch_size_after_partition_ * sizeof(IdType), 16);
-      void* chunk_start_pos_h_ =
-          (char*)page_locked_buffer_ + ((char*)chunk_start_pos_ - (char*)new_indptr_);
-      seq_lengths_before_partition_ =
-          allocator.aligned_alloc<void>(max_batch_size_after_partition_ * sizeof(IdType), 16);
-      void* seq_lengths_before_partition_h_ =
-          (char*)page_locked_buffer_ + ((char*)seq_lengths_before_partition_ - (char*)new_indptr_);
+        void* new_indptr_h_ = page_locked_buffer_;
+        new_last_page_len_ =
+            allocator.aligned_alloc<void>(padded_batch_size_after_partition * sizeof(IdType), 16);
+        void* new_last_page_len_h_ =
+            (char*)page_locked_buffer_ + ((char*)new_last_page_len_ - (char*)new_indptr_);
+        chunk_indptr_ = allocator.aligned_alloc<void>(
+            (padded_batch_size_after_partition + 1) * sizeof(IdType), 16);
+        void* chunk_indptr_h_ =
+            (char*)page_locked_buffer_ + ((char*)chunk_indptr_ - (char*)new_indptr_);
+        batch_idx_map_ =
+            allocator.aligned_alloc<void>(padded_batch_size_after_partition * sizeof(IdType), 16);
+        void* batch_idx_map_h_ =
+            (char*)page_locked_buffer_ + ((char*)batch_idx_map_ - (char*)new_indptr_);
+        chunk_start_pos_ =
+            allocator.aligned_alloc<void>(padded_batch_size_after_partition * sizeof(IdType), 16);
+        void* chunk_start_pos_h_ =
+            (char*)page_locked_buffer_ + ((char*)chunk_start_pos_ - (char*)new_indptr_);
+        seq_lengths_before_partition_ =
+            allocator.aligned_alloc<void>(padded_batch_size_after_partition * sizeof(IdType), 16);
+        void* seq_lengths_before_partition_h_ =
+            (char*)page_locked_buffer_ +
+            ((char*)seq_lengths_before_partition_ - (char*)new_indptr_);
+        block_valid_mask_ =
+            allocator.aligned_alloc<bool>(padded_batch_size_after_partition * sizeof(bool), 16);
+        bool* block_valid_mask_h_ =
+            (bool*)page_locked_buffer_ + ((bool*)block_valid_mask_ - (bool*)new_indptr_);
+        std::fill(block_valid_mask_h_, block_valid_mask_h_ + padded_batch_size_after_partition, 0);
 
-      size_t num_bytes_to_copy = (char*)allocator.ptr - (char*)new_indptr_;
-      FLASHINFER_CUDA_CALL(PartitionPagedKVCacheComputeAuxiliaryInfo(
-          max_num_pages_per_batch, batch_size, page_size, indptr, last_page_len,
-          (IdType*)new_indptr_h_, (IdType*)new_last_page_len_h_, (IdType*)chunk_indptr_h_,
-          (IdType*)batch_idx_map_h_, (IdType*)chunk_start_pos_h_,
-          (IdType*)seq_lengths_before_partition_h_, new_indptr_, page_locked_buffer_,
-          num_bytes_to_copy, stream_));
+        size_t num_bytes_to_copy = (char*)allocator.ptr - (char*)new_indptr_;
+        FLASHINFER_CUDA_CALL(PartitionPagedKVCacheComputeAuxiliaryInfo(
+            max_num_pages_per_batch, batch_size, padded_batch_size_after_partition, page_size,
+            indptr, last_page_len, (IdType*)new_indptr_h_, (IdType*)new_last_page_len_h_,
+            (IdType*)chunk_indptr_h_, (IdType*)batch_idx_map_h_, (IdType*)chunk_start_pos_h_,
+            (IdType*)seq_lengths_before_partition_h_, block_valid_mask_h_,
+            /*device_buffer=*/new_indptr_,
+            /*host_buffer=*/page_locked_buffer_, num_bytes_to_copy, stream_));
+      } else {
+        block_valid_mask_ = nullptr;
+        fixed_grid_size_ = num_kv_heads * batch_size;
+      }
     } else {
+      // NOTE(Zihao): we don't use block_valid_mask when CUDAGraph is disabled.
+      block_valid_mask_ = nullptr;
       if (tmp_size > 0) {
         AlignedAllocator allocator(buffer, workspace_size_in_bytes);
-        float_v_buffer_ = allocator.aligned_alloc<void>(tmp_size, 16);
-        float_s_buffer_ = (char*)float_v_buffer_ +
-                          num_qo_heads * batch_size_after_partition_ * HEAD_DIM * sizeof(DTypeOut);
+        tmp_v_ = allocator.aligned_alloc<void>(tmp_size, 16);
+        tmp_s_ = (char*)tmp_v_ +
+                 num_qo_heads * batch_size_after_partition_ * HEAD_DIM * sizeof(DTypeOut);
         new_indptr_ =
             allocator.aligned_alloc<void>((batch_size_after_partition_ + 1) * sizeof(IdType), 16);
         void* new_indptr_h_ = page_locked_buffer_;
@@ -374,11 +403,13 @@ class BatchDecodeHandler {
             ((char*)seq_lengths_before_partition_ - (char*)new_indptr_);
         size_t num_bytes_to_copy = (char*)allocator.ptr - (char*)new_indptr_;
         FLASHINFER_CUDA_CALL(PartitionPagedKVCacheComputeAuxiliaryInfo(
-            max_num_pages_per_batch, batch_size, page_size, indptr, last_page_len,
-            (IdType*)new_indptr_h_, (IdType*)new_last_page_len_h_, (IdType*)chunk_indptr_h_,
-            (IdType*)batch_idx_map_h_, (IdType*)chunk_start_pos_h_,
-            (IdType*)seq_lengths_before_partition_h_, new_indptr_, page_locked_buffer_,
-            num_bytes_to_copy, stream_));
+            max_num_pages_per_batch, batch_size, batch_size_after_partition_, page_size, indptr,
+            last_page_len, (IdType*)new_indptr_h_, (IdType*)new_last_page_len_h_,
+            (IdType*)chunk_indptr_h_, (IdType*)batch_idx_map_h_, (IdType*)chunk_start_pos_h_,
+            (IdType*)seq_lengths_before_partition_h_,
+            /*block_valid_mask_h=*/nullptr,
+            /*device_buffer=*/new_indptr_,
+            /*host_buffer=*/page_locked_buffer_, num_bytes_to_copy, stream_));
       }
     }
     forward_started_ = true;
@@ -390,8 +421,9 @@ class BatchDecodeHandler {
     fixed_grid_size_ = 0;
     batch_size_before_partition_ = 0;
     batch_size_after_partition_ = 0;
-    float_v_buffer_ = nullptr;
-    float_s_buffer_ = nullptr;
+    block_valid_mask_ = nullptr;
+    tmp_v_ = nullptr;
+    tmp_s_ = nullptr;
     new_indptr_ = nullptr;
     new_last_page_len_ = nullptr;
     chunk_indptr_ = nullptr;
@@ -417,14 +449,15 @@ class BatchDecodeHandler {
   void SetCUDAStream(cudaStream_t stream) { stream_ = stream; }
 
   /*!
-   * \note (Zihao): when enable_cuda_graph is true, max_workspace_size_in_bytes will be ignored,
-   *                when enable_cuda_graph is false, max_batch_size will be ignored.
+   * \brief Constructor of BatchDecodeHandler
+   * \param enable_cuda_graph A boolean indicates whether to enable CUDA graph
+   * \param batch_size If enable_cuda_graph is true, we must specify a fixed batch_size
    */
-  BatchDecodeHandler(size_t max_workspace_size_in_bytes = 128 * 1024 * 1024,
-                     size_t max_batch_size = 16384, bool enable_cuda_graph = false)
+  BatchDecodeHandler(bool enable_cuda_graph = false, uint32_t batch_size = 0)
       : batch_size_after_partition_(0U),
-        float_v_buffer_(nullptr),
-        float_s_buffer_(nullptr),
+        tmp_v_(nullptr),
+        tmp_s_(nullptr),
+        block_valid_mask_(nullptr),
         new_indptr_(nullptr),
         new_last_page_len_(nullptr),
         chunk_indptr_(nullptr),
@@ -433,27 +466,9 @@ class BatchDecodeHandler {
         seq_lengths_before_partition_(nullptr),
         forward_started_(false),
         cuda_graph_enabled_(enable_cuda_graph),
+        fixed_batch_size_(batch_size),
         stream_(nullptr) {
-    if (enable_cuda_graph) {
-      int dev_id = 0, num_sm = 0, max_thread_blocks_per_sm = 0;
-      cudaGetDevice(&dev_id);
-      cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id);
-      cudaDeviceGetAttribute(&max_thread_blocks_per_sm, cudaDevAttrMaxBlocksPerMultiprocessor,
-                             dev_id);
-      max_batch_size_after_partition_ =
-          std::max<size_t>(max_thread_blocks_per_sm * num_sm, max_batch_size);
-      size_t required_max_workspace_size_in_bytes =
-          6 * (sizeof(uint64_t) * (max_batch_size_after_partition_ + 1) + 16);
-      if (required_max_workspace_size_in_bytes > max_workspace_size_in_bytes) {
-        std::ostringstream err_msg;
-        err_msg << "RuntimeError: reserved workspace size is not enough, required size: "
-                << required_max_workspace_size_in_bytes
-                << " bytes, actual size: " << max_workspace_size_in_bytes
-                << " bytes, please increase workspace buffer size.";
-        throw std::runtime_error(err_msg.str());
-      }
-    }
-    cudaMallocHost(&page_locked_buffer_, max_workspace_size_in_bytes);
+    cudaMallocHost(&page_locked_buffer_, 16 * 1024 * 1024);
   }
   ~BatchDecodeHandler() {
     EndForward();
@@ -466,8 +481,9 @@ class BatchDecodeHandler {
   uint32_t batch_size_before_partition_;
   uint32_t batch_size_after_partition_;
   void* page_locked_buffer_;
-  void* float_v_buffer_;
-  void* float_s_buffer_;
+  void* tmp_v_;
+  void* tmp_s_;
+  bool* block_valid_mask_;
   void* new_indptr_;
   void* new_last_page_len_;
   void* chunk_indptr_;
@@ -476,8 +492,8 @@ class BatchDecodeHandler {
   void* seq_lengths_before_partition_;
   bool forward_started_;
   bool cuda_graph_enabled_;
-  uint32_t max_batch_size_after_partition_;
   uint32_t fixed_grid_size_;
+  uint32_t fixed_batch_size_;
   cudaStream_t stream_;
 };
 
@@ -558,8 +574,7 @@ class BatchPrefillHandler {
 
   bool IsCUDAGraphEnabled() const { return enable_cuda_graph_; }
 
-  BatchPrefillHandler(size_t max_workspace_size_in_bytes = 64 * 1024 * 1024,
-                      bool enable_cuda_graph = false)
+  BatchPrefillHandler(bool enable_cuda_graph = false)
       : request_indices_(nullptr),
         tile_indices_(nullptr),
         num_frags_x_(0U),
@@ -567,7 +582,7 @@ class BatchPrefillHandler {
         forward_started_(false),
         enable_cuda_graph_(enable_cuda_graph),
         stream_(nullptr) {
-    cudaMallocHost(&page_locked_buffer_, max_workspace_size_in_bytes);
+    cudaMallocHost(&page_locked_buffer_, 16 * 1024 * 1024);
   }
   ~BatchPrefillHandler() {
     EndForward();

@@ -542,7 +542,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._workspace_buffer = workspace_buffer
         self._wrapper = _kernels.BatchPrefillWithPagedKVCachePyTorchWrapper(
             TensorLayout[kv_layout].value,
-            workspace_buffer.numel() * workspace_buffer.element_size(),
             enable_cuda_graph,
         )
         if enable_cuda_graph:
@@ -1055,7 +1054,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._workspace_buffer = workspace_buffer
         self._wrapper = _kernels.BatchPrefillWithRaggedKVCachePyTorchWrapper(
             TensorLayout[kv_layout].value,
-            workspace_buffer.numel() * workspace_buffer.element_size(),
             enable_cuda_graph,
         )
         if enable_cuda_graph:
