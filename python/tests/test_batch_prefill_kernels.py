@@ -31,7 +31,7 @@ import flashinfer
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
-@pytest.mark.parametrize("enable_cuda_graph", [True])
+@pytest.mark.parametrize("enable_cuda_graph", [False, True])
 def test_batch_prefill_with_paged_kv_cache(
     batch_size,
     kv_len,
