@@ -89,12 +89,11 @@ class BatchDecodeWithPagedKVCachePyTorchWrapper {
   BatchDecodeWithPagedKVCachePyTorchWrapper(
       std::shared_ptr<flashinfer::BatchDecodeHandler> handler_ptr, flashinfer::QKVLayout kv_layout)
       : handler_(handler_ptr), kv_layout_(kv_layout) {}
-  BatchDecodeWithPagedKVCachePyTorchWrapper(unsigned int layout,
-                                            unsigned int max_workspace_size_in_bytes,
-                                            unsigned int max_batch_size, bool enable_cuda_graph)
+  BatchDecodeWithPagedKVCachePyTorchWrapper(unsigned int layout, bool enable_cuda_graph,
+                                            unsigned int fixed_batch_size)
       : kv_layout_(flashinfer::QKVLayout(layout)),
-        handler_(std::make_shared<flashinfer::BatchDecodeHandler>(
-            max_workspace_size_in_bytes, max_batch_size, enable_cuda_graph)) {}
+        handler_(std::make_shared<flashinfer::BatchDecodeHandler>(enable_cuda_graph,
+                                                                  fixed_batch_size)) {}
 
  protected:
   std::shared_ptr<flashinfer::BatchDecodeHandler> handler_;
@@ -122,12 +121,9 @@ class BatchPrefillWithPagedKVCachePyTorchWrapper {
       torch::Tensor paged_kv_last_page_len, torch::Tensor custom_mask, torch::Tensor qk_indptr,
       unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction, float sm_scale,
       float rope_scale, float rope_theta, bool return_lse);
-  BatchPrefillWithPagedKVCachePyTorchWrapper(unsigned int layout,
-                                             unsigned int max_workspace_size_in_bytes,
-                                             bool enable_cuda_graph)
+  BatchPrefillWithPagedKVCachePyTorchWrapper(unsigned int layout, bool enable_cuda_graph)
       : kv_layout_(flashinfer::QKVLayout(layout)),
-        handler_(std::make_shared<flashinfer::BatchPrefillHandler>(max_workspace_size_in_bytes,
-                                                                   enable_cuda_graph)) {}
+        handler_(std::make_shared<flashinfer::BatchPrefillHandler>(enable_cuda_graph)) {}
 
  private:
   std::shared_ptr<flashinfer::BatchPrefillHandler> handler_;
@@ -154,12 +150,9 @@ class BatchPrefillWithRaggedKVCachePyTorchWrapper {
                                                unsigned int pos_encoding_mode,
                                                bool allow_fp16_qk_reduction, float sm_scale,
                                                float rope_scale, float rope_theta, bool return_lse);
-  BatchPrefillWithRaggedKVCachePyTorchWrapper(unsigned int layout,
-                                              unsigned int max_workspace_size_in_bytes,
-                                              bool enable_cuda_graph)
+  BatchPrefillWithRaggedKVCachePyTorchWrapper(unsigned int layout, bool enable_cuda_graph)
       : kv_layout_(flashinfer::QKVLayout(layout)),
-        handler_(std::make_shared<flashinfer::BatchPrefillHandler>(max_workspace_size_in_bytes,
-                                                                   enable_cuda_graph)) {}
+        handler_(std::make_shared<flashinfer::BatchPrefillHandler>(enable_cuda_graph)) {}
 
  private:
   std::shared_ptr<flashinfer::BatchPrefillHandler> handler_;

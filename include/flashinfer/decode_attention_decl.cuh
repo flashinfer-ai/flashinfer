@@ -39,8 +39,9 @@ template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, QKVL
           PosEncodingMode POS_ENCODING_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     DTypeIn* q, IdType* q_offset, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
-    kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, DTypeOut* tmp, float* lse,
-    float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream);
+    kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, DTypeOut* tmp_v, float* tmp_s,
+    float* lse, bool* block_valid_mask, std::optional<uint32_t> fixed_grid_size, float sm_scale,
+    float rope_scale, float rope_theta, cudaStream_t stream);
 
 template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
           PosEncodingMode POS_ENCODING_MODE, typename DTypeIn, typename DTypeOut>
@@ -58,10 +59,11 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapperDispatched(
     float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream) {
   paged_kv_t<page_storage, KV_LAYOUT, DTypeIn, IdType> new_paged_kv = paged_kv;
   kv_partition_info_t<IdType> kv_partition_info;
-  DTypeOut* tmp = handler->GetTempFloatBuffer<DTypeOut>();
+  DTypeOut* tmp_v = handler->GetTempV<DTypeOut>();
+  float* tmp_s = handler->GetTempS<float>();
 
   if (handler->IsForwardStarted()) {
-    if (tmp != nullptr) {
+    if (tmp_v != nullptr) {
       // create auxiliary information for cooperative kernels
       new_paged_kv.batch_size = handler->GetBatchSizeAfterPartition();
       new_paged_kv.indptr = handler->GetNewIndPtr<IdType>();
@@ -81,8 +83,11 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapperDispatched(
 
   return BatchDecodeWithPagedKVCacheDispatched<GROUP_SIZE, HEAD_DIM, page_storage, KV_LAYOUT,
                                                POS_ENCODING_MODE, DTypeIn, DTypeOut, IdType>(
-      q, q_offset, new_paged_kv, kv_partition_info, o, tmp, lse, sm_scale, rope_scale, rope_theta,
-      stream);
+      q, q_offset, new_paged_kv, kv_partition_info, o, tmp_v, tmp_s, lse,
+      handler->GetBlockValidMask(),
+      (handler->IsCUDAGraphEnabled() ? std::optional<uint32_t>(handler->GetFixedGridSize())
+                                     : std::nullopt),
+      sm_scale, rope_scale, rope_theta, stream);
 }
 
 }  // namespace flashinfer
