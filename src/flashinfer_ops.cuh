@@ -15,6 +15,7 @@
  */
 #include <flashinfer/decode_attention_decl.cuh>
 #include <flashinfer/prefill_attention_decl.cuh>
+#include <optional>
 
 #include "utils.h"
 
@@ -208,10 +209,10 @@ cudaError_t BatchDecodeWithPaddedKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTyp
 
 template <PageStorage page_storage, QKVLayout kv_layout, typename DTypeQ, typename DTypeKV,
           typename DTypeOut, typename IdType>
-cudaError_t BatchDecodeWithPagedKVCache(
+cudaError_t BatchDecodeWithPagedKVCacheNoSplitKV(
     DTypeQ* q, IdType* q_offset, paged_kv_t<page_storage, kv_layout, DTypeKV, IdType> paged_kv,
-    kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, DTypeOut* tmp, float* lse,
-    uint32_t num_qo_heads, PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
+    kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, float* lse, uint32_t num_qo_heads,
+    PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
     std::optional<float> maybe_sm_scale = std::nullopt, float rope_scale = 1.f,
     float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   static_assert(!std::is_same_v<DTypeOut, int>);
@@ -233,8 +234,10 @@ cudaError_t BatchDecodeWithPagedKVCache(
             return BatchDecodeWithPagedKVCacheDispatched<GROUP_SIZE, HEAD_DIM, page_storage,
                                                          kv_layout, POS_ENCODING_MODE, DTypeQ,
                                                          DTypeKV, DTypeOut, IdType>(
-                q, q_offset, paged_kv, kv_partition_info, o, tmp, lse, sm_scale, rope_scale,
-                rope_theta, stream);
+                q, q_offset, paged_kv, kv_partition_info, o, /*tmp_v=*/nullptr, /*tmp_s=*/nullptr,
+                lse,
+                /*block_valid_mask=*/nullptr, /*padded_batch_size=*/paged_kv.batch_size, sm_scale,
+                rope_scale, rope_theta, stream);
           })})});
 
   return cudaSuccess;

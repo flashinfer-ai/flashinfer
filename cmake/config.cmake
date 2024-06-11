@@ -17,7 +17,9 @@ set(FLASHINFER_SAMPLING ON)
 # Whether to compile normalization kernel tests/benchmarks or not.
 set(FLASHINFER_NORMALIZATION ON)
 # Whether to compile fastdiv tests
-set(FLASHINFER_FASTDIV_TEST OFF)
+set(FLASHINFER_FASTDIV_TEST ON)
+# Whether to compile distributed tests
+set(FLASHINFER_DISTRIBUTED ON)
 # The following configurations can impact the binary
 # size of the generated library
 set(FLASHINFER_GEN_GROUP_SIZES 1 4 6 8)
@@ -32,6 +34,9 @@ set(FLASHINFER_GEN_MASK_MODES 0 1)
 # "native" is a special value for CMAKE_CUDA_ARCHITECTURES which means use the architectures of the host's GPU.
 # it's new in CMake 3.24, if you are using an older of CMake or you want to use a different value, you can
 # set its value here. Supported CUDA architctures include 80;86;89;90
+# NOTE(Zihao): using "native" might be slow because whenever compile a cuda file with `-arch=native`, nvcc will spawn
+# a `__nvcc_device_query` process to get the architecture of the host's GPU, which could stall the compilation process.
+# So it's recommended to set it to a specific value if you know the architecture of the target GPU.
 # Example:
 # set(FLASHINFER_CUDA_ARCHITECTURES 80)
 set(FLASHINFER_CUDA_ARCHITECTURES native)

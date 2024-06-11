@@ -460,12 +460,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         enable_cuda_graph : bool
             Whether to enable CUDAGraph for batch decode attention, if enabled, the
-            auxiliary data structures will be stored in the provided buffers.
+            auxiliary data structures will be stored in the provided buffers. The ``batch_size``
+            cannot change during the lifecycle of this wrapper when CUDAGraph is enabled.
 
         indptr_buffer : Optional[torch.Tensor]
-            The user reserved buffer on GPU to store the indptr of the paged kv cache, should
-            be large enough to store the indptr of maximum batch size (``[max_batch_size + 1]``)
-            during the lifecycle of this wrapper.
+            The user reserved buffer on GPU to store the indptr of the paged kv cache, the size
+            of the buffer should be ``[batch_size + 1]``.
             Only needed when ``enable_cuda_graph`` is ``True``.
 
         indices_buffer : Optional[torch.Tensor]
@@ -475,22 +475,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
             Only needed when ``enable_cuda_graph`` is ``True``.
 
         last_page_len_buffer : Optional[torch.Tensor]
-            The user reserved buffer on GPU to store the number of entries in the last page,
-            should be large enough to store the maximum batch size (``[max_batch_size]``)
-            during the lifecycle of this wrapper.
+            The user reserved buffer on GPU to store the number of entries in the last page, the
+            size of the buffer should be ``[batch_size]``.
             Only needed when ``enable_cuda_graph`` is ``True``.
         """
         check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
         self._workspace_buffer = workspace_buffer
-        # NOTE(Zihao): max_batch_size will only be used in cudagraph mode
-        max_batch_size = len(paged_kv_last_page_len_buffer) if enable_cuda_graph else 0
-        self._wrapper = _kernels.BatchDecodeWithPagedKVCachePyTorchWrapper(
-            TensorLayout[kv_layout].value,
-            workspace_buffer.numel() * workspace_buffer.element_size(),
-            max_batch_size,
-            enable_cuda_graph,
-        )
+
         if enable_cuda_graph:
             if not torch.is_tensor(paged_kv_indptr_buffer):
                 raise ValueError(
@@ -504,13 +496,23 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 raise ValueError(
                     "paged_kv_last_page_len_buffer should be a torch.Tensor in cudagraph mode"
                 )
-            self._paged_kv_indptr_buf = paged_kv_indptr_buffer
-            self._paged_kv_indices_buf = paged_kv_indices_buffer
-            self._paged_kv_last_page_len_buf = paged_kv_last_page_len_buffer
+            self._fixed_batch_size = len(paged_kv_last_page_len_buffer)
+            if len(paged_kv_indptr_buffer) != self._fixed_batch_size + 1:
+                raise ValueError(
+                    "The size of paged_kv_indptr_buffer should be batch_size + 1"
+                )
         else:
-            self._paged_kv_indptr_buf = None
-            self._paged_kv_indices_buf = None
-            self._paged_kv_last_page_len_buf = None
+            self._fixed_batch_size = 0
+
+        self._paged_kv_indptr_buf = paged_kv_indptr_buffer
+        self._paged_kv_indices_buf = paged_kv_indices_buffer
+        self._paged_kv_last_page_len_buf = paged_kv_last_page_len_buffer
+
+        self._wrapper = _kernels.BatchDecodeWithPagedKVCachePyTorchWrapper(
+            TensorLayout[kv_layout].value,
+            enable_cuda_graph,
+            self._fixed_batch_size,
+        )
 
     @property
     def is_cuda_graph_enabled(self):
@@ -575,16 +577,28 @@ class BatchDecodeWithPagedKVCacheWrapper:
         is not equal to ``num_kv_heads``, the function will use
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
         """
+        batch_size = len(last_page_len)
+
         if self.is_cuda_graph_enabled:
-            self._paged_kv_indptr_buf[: len(indptr)] = indptr
+            if batch_size != self._fixed_batch_size:
+                raise ValueError(
+                    "The batch size should be fixed in cudagraph mode, the runtime batch size {} "
+                    " mismatches the batch size set during initialization {}".format(
+                        batch_size, self._fixed_batch_size
+                    )
+                )
+            if len(indices) > len(self._paged_kv_indices_buf):
+                raise ValueError(
+                    "The size of indices should be less than or equal to the allocated buffer"
+                )
+            self._paged_kv_indptr_buf.copy_(indptr)
             self._paged_kv_indices_buf[: len(indices)] = indices
-            self._paged_kv_last_page_len_buf[: len(last_page_len)] = last_page_len
+            self._paged_kv_last_page_len_buf.copy_(last_page_len)
         else:
             self._paged_kv_indptr_buf = indptr
             self._paged_kv_indices_buf = indices
             self._paged_kv_last_page_len_buf = last_page_len
 
-        batch_size = len(indptr) - 1
         # NOTE(Zihao): the following tensor acts as placeholder to pass dtype info
         empty_data = torch.empty(
             0,
