@@ -105,7 +105,6 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     uint32_t& tmp_size, uint32_t& max_grid_size, uint32_t& max_num_pages_per_batch,
     uint32_t& new_batch_size, uint32_t batch_size, IdType* kv_indptr, const uint32_t num_qo_heads,
     const uint32_t page_size, bool enable_cuda_graph, cudaStream_t stream) {
-  static_assert(!std::is_same_v<DTypeOut, int>);
   constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL);
   constexpr uint32_t num_stages_smem = 2U;
   constexpr uint32_t bdx = HEAD_DIM / vec_size;

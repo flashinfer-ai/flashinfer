@@ -523,7 +523,6 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
     DTypeOut* __restrict__ tmp_v, float* __restrict__ tmp_s, float* __restrict__ lse,
     bool* __restrict__ block_valid_mask, float sm_scale, float rope_rcp_scale,
     float rope_rcp_theta) {
-  static_assert(!std::is_same_v<DTypeOut, int>);
   auto block = cg::this_thread_block();
   sm_scale *= math::log2e;
 

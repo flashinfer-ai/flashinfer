@@ -215,7 +215,6 @@ cudaError_t BatchDecodeWithPagedKVCacheNoSplitKV(
     PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
     std::optional<float> maybe_sm_scale = std::nullopt, float rope_scale = 1.f,
     float rope_theta = 1e4, cudaStream_t stream = nullptr) {
-  static_assert(!std::is_same_v<DTypeOut, int>);
   const uint32_t num_kv_heads = paged_kv.num_heads;
   const uint32_t head_dim = paged_kv.head_dim;
   const uint32_t batch_size = paged_kv.batch_size;
