@@ -77,6 +77,21 @@ struct SamplingTempStorage {
   } data;
 };
 
+template <typename T, uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM>
+struct RenormTempStorage {
+  union {
+    typename BlockReduce<T, BLOCK_THREADS, REDUCE_ALGORITHM>::TempStorage reduce;
+    typename BlockReduce<Pair<T>, BLOCK_THREADS, REDUCE_ALGORITHM>::TempStorage reduce_pair;
+  } block_prim;
+  struct {
+    T max_val;
+    union {
+      T value;
+      Pair<T> pair;
+    } block_aggregate;
+  } data;
+};
+
 template <uint32_t VEC_SIZE, uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, typename T>
 __device__ __forceinline__ void DeviceSamplingFromProb(
@@ -129,6 +144,8 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
   }
   aggregate += aggregate_local;
 }
+
+namespace SamplingKernel {
 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, typename DType, typename IdType>
@@ -342,112 +359,9 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
   }
 }
 
-template <typename T, typename IdType>
-cudaError_t SamplingFromProb(T* probs, T* uniform_samples, IdType* output, uint32_t batch_size,
-                             uint32_t d, cudaStream_t stream = 0) {
-  constexpr uint32_t BLOCK_THREADS = 1024;
-  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
-  dim3 nblks(batch_size);
-  dim3 nthrs(BLOCK_THREADS);
-  IdType* row_indices_placeholder = nullptr;
-  void* args[] = {&probs, &uniform_samples, &output, &row_indices_placeholder, &d};
-  const uint32_t smem_size = sizeof(SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
+}  // namespace SamplingKernel
 
-  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    auto kernel =
-        SamplingFromProbKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, VEC_SIZE, T, IdType>;
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-  });
-  return cudaSuccess;
-}
-
-template <typename T, typename IdType>
-cudaError_t ParallelSamplingFromProb(T* probs, T* uniform_samples, IdType* output,
-                                     IdType* row_indices, uint32_t batch_size, uint32_t d,
-                                     cudaStream_t stream = 0) {
-  constexpr uint32_t BLOCK_THREADS = 1024;
-  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
-  dim3 nblks(batch_size);
-  dim3 nthrs(BLOCK_THREADS);
-  void* args[] = {&probs, &uniform_samples, &output, &row_indices, &d};
-  const uint32_t smem_size = sizeof(SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
-
-  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    auto kernel =
-        SamplingFromProbKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, VEC_SIZE, T, IdType>;
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-  });
-  return cudaSuccess;
-}
-
-template <typename T, typename IdType>
-cudaError_t TopKSamplingFromProb(T* probs, T* uniform_samples, IdType* output, bool* success,
-                                 IdType top_k, uint32_t batch_size, uint32_t d,
-                                 uint32_t max_top_k_rounds, cudaStream_t stream = 0) {
-  constexpr uint32_t BLOCK_THREADS = 1024;
-  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
-
-  const uint32_t smem_size = sizeof(SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
-  dim3 nblks(batch_size);
-  dim3 nthrs(BLOCK_THREADS);
-  void* args[] = {&probs, &uniform_samples, &output, &success, &top_k, &d, &max_top_k_rounds};
-
-  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    auto kernel =
-        TopKSamplingFromProbKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, VEC_SIZE, T, IdType>;
-    FLASHINFER_CUDA_CALL(
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-  });
-  return cudaSuccess;
-}
-
-template <typename T, typename IdType>
-cudaError_t TopPSamplingFromProb(T* probs, T* uniform_samples, IdType* output, bool* success,
-                                 T top_p, uint32_t batch_size, uint32_t d,
-                                 uint32_t max_top_p_rounds, cudaStream_t stream = 0) {
-  constexpr uint32_t BLOCK_THREADS = 1024;
-  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
-
-  const uint32_t smem_size = sizeof(SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
-  dim3 nblks(batch_size);
-  dim3 nthrs(BLOCK_THREADS);
-  IdType* row_indices_placeholder = nullptr;
-  T* top_p_arr_placeholder = nullptr;
-  void* args[] = {&probs,
-                  &uniform_samples,
-                  &output,
-                  &success,
-                  &row_indices_placeholder,
-                  &top_p_arr_placeholder,
-                  &top_p,
-                  &d,
-                  &max_top_p_rounds};
-
-  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    auto kernel =
-        TopPSamplingFromProbKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, VEC_SIZE, T, IdType>;
-    FLASHINFER_CUDA_CALL(
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-  });
-  return cudaSuccess;
-}
-
-template <typename T, uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM>
-struct RenormTempStorage {
-  union {
-    typename BlockReduce<T, BLOCK_THREADS, REDUCE_ALGORITHM>::TempStorage reduce;
-    typename BlockReduce<Pair<T>, BLOCK_THREADS, REDUCE_ALGORITHM>::TempStorage reduce_pair;
-  } block_prim;
-  struct {
-    T max_val;
-    union {
-      T value;
-      Pair<T> pair;
-    } block_aggregate;
-  } data;
-};
+namespace RenormKernel {
 
 template <uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE,
           typename DType, typename IdType>
@@ -630,43 +544,9 @@ __global__ void TopKRenormProbKernel(DType* probs, IdType* renormed_prob, uint32
   }
 }
 
-template <typename DType, typename IdType>
-cudaError_t TopPRenormProb(DType* probs, IdType* renormed_prob, float p, float eps,
-                           uint32_t batch_size, uint32_t d, cudaStream_t stream = 0) {
-  const uint32_t BLOCK_THREADS = 1024;
-  const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
+}  // namespace RenormKernel
 
-  const uint32_t smem_size = sizeof(RenormTempStorage<DType, BLOCK_THREADS, REDUCE_ALGO>);
-  dim3 nblks(batch_size);
-  dim3 nthrs(BLOCK_THREADS);
-  void* args[] = {&probs, &renormed_prob, &p, &eps, &d};
-  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    auto kernel = TopPRenormProbKernel<BLOCK_THREADS, REDUCE_ALGO, VEC_SIZE, DType, IdType>;
-    FLASHINFER_CUDA_CALL(
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-  });
-  return cudaSuccess;
-}
-
-template <typename DType, typename IdType>
-cudaError_t TopKRenormProb(DType* probs, IdType* renormed_prob, uint32_t k, float eps,
-                           uint32_t batch_size, uint32_t d, cudaStream_t stream = 0) {
-  const uint32_t BLOCK_THREADS = 1024;
-  const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
-
-  const uint32_t smem_size = sizeof(RenormTempStorage<DType, BLOCK_THREADS, REDUCE_ALGO>);
-  dim3 nblks(batch_size);
-  dim3 nthrs(BLOCK_THREADS);
-  void* args[] = {&probs, &renormed_prob, &k, &eps, &d};
-  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    auto kernel = TopKRenormProbKernel<BLOCK_THREADS, REDUCE_ALGO, VEC_SIZE, DType, IdType>;
-    FLASHINFER_CUDA_CALL(
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-  });
-  return cudaSuccess;
-}
+namespace SpecDecodingKernel {
 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, typename DType, typename IdType>
@@ -768,6 +648,140 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
   }
 }
 
+}  // namespace SpecDecodingKernel
+
+template <typename T, typename IdType>
+cudaError_t SamplingFromProb(T* probs, T* uniform_samples, IdType* output, uint32_t batch_size,
+                             uint32_t d, cudaStream_t stream = 0) {
+  constexpr uint32_t BLOCK_THREADS = 1024;
+  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+  dim3 nblks(batch_size);
+  dim3 nthrs(BLOCK_THREADS);
+  IdType* row_indices_placeholder = nullptr;
+  void* args[] = {&probs, &uniform_samples, &output, &row_indices_placeholder, &d};
+  const uint32_t smem_size = sizeof(SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
+
+  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+    auto kernel = SamplingKernel::SamplingFromProbKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO,
+                                                         VEC_SIZE, T, IdType>;
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  });
+  return cudaSuccess;
+}
+
+template <typename T, typename IdType>
+cudaError_t ParallelSamplingFromProb(T* probs, T* uniform_samples, IdType* output,
+                                     IdType* row_indices, uint32_t batch_size, uint32_t d,
+                                     cudaStream_t stream = 0) {
+  constexpr uint32_t BLOCK_THREADS = 1024;
+  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+  dim3 nblks(batch_size);
+  dim3 nthrs(BLOCK_THREADS);
+  void* args[] = {&probs, &uniform_samples, &output, &row_indices, &d};
+  const uint32_t smem_size = sizeof(SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
+
+  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+    auto kernel = SamplingKernel::SamplingFromProbKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO,
+                                                         VEC_SIZE, T, IdType>;
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  });
+  return cudaSuccess;
+}
+
+template <typename T, typename IdType>
+cudaError_t TopKSamplingFromProb(T* probs, T* uniform_samples, IdType* output, bool* success,
+                                 IdType top_k, uint32_t batch_size, uint32_t d,
+                                 uint32_t max_top_k_rounds, cudaStream_t stream = 0) {
+  constexpr uint32_t BLOCK_THREADS = 1024;
+  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+
+  const uint32_t smem_size = sizeof(SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
+  dim3 nblks(batch_size);
+  dim3 nthrs(BLOCK_THREADS);
+  void* args[] = {&probs, &uniform_samples, &output, &success, &top_k, &d, &max_top_k_rounds};
+
+  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+    auto kernel = SamplingKernel::TopKSamplingFromProbKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO,
+                                                             VEC_SIZE, T, IdType>;
+    FLASHINFER_CUDA_CALL(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  });
+  return cudaSuccess;
+}
+
+template <typename T, typename IdType>
+cudaError_t TopPSamplingFromProb(T* probs, T* uniform_samples, IdType* output, bool* success,
+                                 T top_p, uint32_t batch_size, uint32_t d,
+                                 uint32_t max_top_p_rounds, cudaStream_t stream = 0) {
+  constexpr uint32_t BLOCK_THREADS = 1024;
+  const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+
+  const uint32_t smem_size = sizeof(SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
+  dim3 nblks(batch_size);
+  dim3 nthrs(BLOCK_THREADS);
+  IdType* row_indices_placeholder = nullptr;
+  T* top_p_arr_placeholder = nullptr;
+  void* args[] = {&probs,
+                  &uniform_samples,
+                  &output,
+                  &success,
+                  &row_indices_placeholder,
+                  &top_p_arr_placeholder,
+                  &top_p,
+                  &d,
+                  &max_top_p_rounds};
+
+  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+    auto kernel = SamplingKernel::TopPSamplingFromProbKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO,
+                                                             VEC_SIZE, T, IdType>;
+    FLASHINFER_CUDA_CALL(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  });
+  return cudaSuccess;
+}
+
+template <typename DType, typename IdType>
+cudaError_t TopPRenormProb(DType* probs, IdType* renormed_prob, float p, float eps,
+                           uint32_t batch_size, uint32_t d, cudaStream_t stream = 0) {
+  const uint32_t BLOCK_THREADS = 1024;
+  const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
+
+  const uint32_t smem_size = sizeof(RenormTempStorage<DType, BLOCK_THREADS, REDUCE_ALGO>);
+  dim3 nblks(batch_size);
+  dim3 nthrs(BLOCK_THREADS);
+  void* args[] = {&probs, &renormed_prob, &p, &eps, &d};
+  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+    auto kernel =
+        RenormKernel::TopPRenormProbKernel<BLOCK_THREADS, REDUCE_ALGO, VEC_SIZE, DType, IdType>;
+    FLASHINFER_CUDA_CALL(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  });
+  return cudaSuccess;
+}
+
+template <typename DType, typename IdType>
+cudaError_t TopKRenormProb(DType* probs, IdType* renormed_prob, uint32_t k, float eps,
+                           uint32_t batch_size, uint32_t d, cudaStream_t stream = 0) {
+  const uint32_t BLOCK_THREADS = 1024;
+  const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
+
+  const uint32_t smem_size = sizeof(RenormTempStorage<DType, BLOCK_THREADS, REDUCE_ALGO>);
+  dim3 nblks(batch_size);
+  dim3 nthrs(BLOCK_THREADS);
+  void* args[] = {&probs, &renormed_prob, &k, &eps, &d};
+  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+    auto kernel =
+        RenormKernel::TopKRenormProbKernel<BLOCK_THREADS, REDUCE_ALGO, VEC_SIZE, DType, IdType>;
+    FLASHINFER_CUDA_CALL(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  });
+  return cudaSuccess;
+}
+
 template <typename T, typename IdType>
 cudaError_t ParallelTopPSamplingFromProb(T* probs, T* uniform_samples, IdType* output,
                                          bool* success, IdType* row_indices, T* top_p_arr,
@@ -784,8 +798,8 @@ cudaError_t ParallelTopPSamplingFromProb(T* probs, T* uniform_samples, IdType* o
                   &top_p_arr, &top_p_placeholder, &d,      &max_top_p_rounds};
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    auto kernel =
-        TopPSamplingFromProbKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, VEC_SIZE, T, IdType>;
+    auto kernel = SamplingKernel::TopPSamplingFromProbKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO,
+                                                             VEC_SIZE, T, IdType>;
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
@@ -815,7 +829,8 @@ cudaError_t ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token_ids
                   &d};
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
     auto kernel =
-        ChainSpeculativeSampling<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, VEC_SIZE, DType, IdType>;
+        SpecDecodingKernel::ChainSpeculativeSampling<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO,
+                                                     VEC_SIZE, DType, IdType>;
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
