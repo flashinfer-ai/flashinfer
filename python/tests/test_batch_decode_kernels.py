@@ -30,7 +30,10 @@ import flashinfer
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
 @pytest.mark.parametrize(
-    "dtype", [torch.float16, torch.float8_e4m3fn, torch.float8_e5m2]
+    "q_dtype", [torch.float16, torch.float8_e4m3fn, torch.float8_e5m2]
+)
+@pytest.mark.parametrize(
+    "kv_dtype", [torch.float16, torch.float8_e4m3fn, torch.float8_e5m2]
 )
 def test_batch_decode_with_paged_kv_cache(
     batch_size,
@@ -41,9 +44,10 @@ def test_batch_decode_with_paged_kv_cache(
     head_dim,
     kv_layout,
     pos_encoding_mode,
-    dtype,
+    q_dtype,
+    kv_dtype,
 ):
-    q = torch.randn(batch_size, num_qo_heads, head_dim).to(0).to(dtype)
+    q = torch.randn(batch_size, num_qo_heads, head_dim).to(0).to(q_dtype)
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size
     kv_data = (
@@ -68,9 +72,9 @@ def test_batch_decode_with_paged_kv_cache(
         head_dim,
         page_size,
         "NONE",
-        dtype,
+        kv_dtype,
     )
-    o = wrapper.forward(q, kv_data.to(dtype), pos_encoding_mode=pos_encoding_mode)
+    o = wrapper.forward(q, kv_data.to(kv_dtype), pos_encoding_mode=pos_encoding_mode)
 
     for i in range(batch_size):
         perm_dims = [0, 2, 1, 3] if kv_layout == "HND" else [0, 1, 2, 3]
@@ -90,7 +94,7 @@ def test_batch_decode_with_paged_kv_cache(
                 .reshape(-1, num_kv_heads, head_dim),
             ],
             dim=0,
-        ).to(dtype)
+        ).to(kv_dtype)
         vi = torch.cat(
             [
                 kv_data[kv_indptr[i] : kv_indptr[i + 1] - 1, 1]
@@ -105,7 +109,7 @@ def test_batch_decode_with_paged_kv_cache(
                 .reshape(-1, num_kv_heads, head_dim),
             ],
             dim=0,
-        ).to(dtype)
+        ).to(kv_dtype)
         o_ref_i = flashinfer.single_decode_with_kv_cache(
             qi, ki, vi, pos_encoding_mode=pos_encoding_mode
         )
@@ -123,7 +127,10 @@ def test_batch_decode_with_paged_kv_cache(
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
 @pytest.mark.parametrize(
-    "dtype", [torch.float16, torch.float8_e4m3fn, torch.float8_e5m2]
+    "q_dtype", [torch.float16, torch.float8_e4m3fn, torch.float8_e5m2]
+)
+@pytest.mark.parametrize(
+    "kv_dtype", [torch.float16, torch.float8_e4m3fn, torch.float8_e5m2]
 )
 def test_cuda_graph_batch_decode_with_paged_kv_cache(
     batch_size,
@@ -134,9 +141,10 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
     head_dim,
     kv_layout,
     pos_encoding_mode,
-    dtype,
+    q_dtype,
+    kv_dtype,
 ):
-    q = torch.randn(batch_size, num_qo_heads, head_dim).to(0).to(dtype)
+    q = torch.randn(batch_size, num_qo_heads, head_dim).to(0).to(q_dtype)
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size
     kv_data = (
@@ -178,7 +186,7 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
         head_dim,
         page_size,
         "NONE",
-        dtype,
+        kv_dtype,
     )
     # warmup
     s = torch.cuda.Stream()
@@ -186,13 +194,13 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
     with torch.cuda.stream(s):
         for _ in range(3):
             o = wrapper.forward(
-                q, kv_data.to(dtype), pos_encoding_mode=pos_encoding_mode
+                q, kv_data.to(kv_dtype), pos_encoding_mode=pos_encoding_mode
             )
     torch.cuda.current_stream().wait_stream(s)
     # capture
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        o = wrapper.forward(q, kv_data.to(dtype), pos_encoding_mode=pos_encoding_mode)
+        o = wrapper.forward(q, kv_data.to(kv_dtype), pos_encoding_mode=pos_encoding_mode)
     wrapper.end_forward()
     # replay
     wrapper.begin_forward(
@@ -204,7 +212,7 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
         head_dim,
         page_size,
         "NONE",
-        dtype,
+        kv_dtype,
     )
     g.replay()
 
@@ -230,7 +238,7 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
                 .reshape(-1, num_kv_heads, head_dim),
             ],
             dim=0,
-        ).to(dtype)
+        ).to(kv_dtype)
         vi = torch.cat(
             [
                 kv_data[kv_indptr[i] : kv_indptr[i + 1] - 1, 1]
@@ -245,7 +253,7 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
                 .reshape(-1, num_kv_heads, head_dim),
             ],
             dim=0,
-        ).to(dtype)
+        ).to(kv_dtype)
         o_ref_i = flashinfer.single_decode_with_kv_cache(
             qi, ki, vi, pos_encoding_mode=pos_encoding_mode
         )
@@ -256,11 +264,21 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
 
 if __name__ == "__main__":
     test_batch_decode_with_paged_kv_cache(
-        12, 54, 8, 8, 8, 128, "HND", "NONE", torch.float16
+        12, 54, 8, 8, 8, 128, "HND", "NONE", torch.float16, torch.float16
     )
     test_batch_decode_with_paged_kv_cache(
-        12, 54, 1, 8, 8, 128, "HND", "NONE", torch.float8_e5m2
+        12, 54, 1, 8, 8, 128, "HND", "NONE", torch.float8_e5m2, torch.float8_e5m2
     )
     test_cuda_graph_batch_decode_with_paged_kv_cache(
-        12, 54, 8, 8, 8, 128, "HND", "NONE", torch.float16
+        12, 54, 8, 8, 8, 128, "HND", "NONE", torch.float16, torch.float16
+    )
+
+    test_batch_decode_with_paged_kv_cache(
+        12, 54, 8, 8, 8, 128, "HND", "NONE", torch.float8_e5m2, torch.float16
+    )
+    test_batch_decode_with_paged_kv_cache(
+        12, 54, 1, 8, 8, 128, "HND", "NONE", torch.float8_e5m2, torch.float16
+    )
+    test_cuda_graph_batch_decode_with_paged_kv_cache(
+        12, 54, 8, 8, 8, 128, "HND", "NONE", torch.float8_e5m2, torch.float16
     )
