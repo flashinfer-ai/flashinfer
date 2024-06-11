@@ -118,6 +118,8 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
       2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * HEAD_DIM * sizeof(DTypeKV) +
       std::max(tile_size_per_bdx * num_threads * sizeof(DTypeKV*), 2 * bdy * bdz * sizeof(float));
 
+  // Note that the dtype of Q should not impact the cudaOccupancyMaxActiveBlocksPerMultiprocessor
+  // return, which is why we just use DTypeKV as it simplifies the API.
   auto partition_kv_kernel = BatchDecodeWithPagedKVCacheKernel<
       /*partition_kv=*/true, POS_ENCODING_MODE, num_stages_smem, tile_size_per_bdx, vec_size, bdx,
       bdy, bdz, page_storage, kv_layout, DTypeKV, DTypeKV, DTypeOut, IdType>;
