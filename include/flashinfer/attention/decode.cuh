@@ -522,6 +522,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* __restrict__ o,
     DTypeOut* __restrict__ tmp, float* __restrict__ lse, float sm_scale, float rope_rcp_scale,
     float rope_rcp_theta) {
+  static_assert(!std::is_same_v<DTypeOut, int>);
   auto block = cg::this_thread_block();
   sm_scale *= math::log2e;
 
@@ -848,6 +849,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     DTypeQ* q, IdType* q_offset, paged_kv_t<page_storage, kv_layout, DTypeKV, IdType> paged_kv,
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, DTypeOut* tmp, float* lse,
     float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream) {
+  static_assert(!std::is_same_v<DTypeOut, int>);
   const float rope_rcp_scale = 1.f / rope_scale;
   const float rope_rcp_theta = 1.f / rope_theta;
   const uint32_t num_kv_heads = paged_kv.num_heads;

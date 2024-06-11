@@ -214,6 +214,7 @@ cudaError_t BatchDecodeWithPagedKVCache(
     uint32_t num_qo_heads, PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
     std::optional<float> maybe_sm_scale = std::nullopt, float rope_scale = 1.f,
     float rope_theta = 1e4, cudaStream_t stream = nullptr) {
+  static_assert(!std::is_same_v<DTypeOut, int>);
   const uint32_t num_kv_heads = paged_kv.num_heads;
   const uint32_t head_dim = paged_kv.head_dim;
   const uint32_t batch_size = paged_kv.batch_size;
@@ -291,7 +292,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapper(
   return cudaSuccess;
 }
 
-template <PageStorage page_storage, QKVLayout kv_layout, typename DTypeQ, typename DTypeKV,
+template <PageStorage page_storage, QKVLayout kv_layout, typename DTypeKV,
           typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeHandlerBeginForward(BatchDecodeHandler* handler, void* buffer,
                                            size_t workspace_size_in_bytes, IdType* indptr,
@@ -309,7 +310,7 @@ cudaError_t BatchDecodeHandlerBeginForward(BatchDecodeHandler* handler, void* bu
     DISPATCH_head_dim(head_dim, HEAD_DIM, {
       DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
         return handler->BeginForwardDispatched<GROUP_SIZE, HEAD_DIM, page_storage, kv_layout,
-                                               POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeOut, IdType>(
+                                               POS_ENCODING_MODE, DTypeKV, DTypeOut, IdType>(
             buffer, workspace_size_in_bytes, indptr, last_page_len, batch_size, num_qo_heads,
             page_size);
       });

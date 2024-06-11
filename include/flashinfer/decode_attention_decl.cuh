@@ -56,6 +56,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapperDispatched(
     BatchDecodeHandler* handler, DTypeQ* q, IdType* q_offset,
     paged_kv_t<page_storage, KV_LAYOUT, DTypeKV, IdType> paged_kv, DTypeOut* o, float* lse,
     float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream) {
+  static_assert(!std::is_same_v<DTypeOut, int>);
   paged_kv_t<page_storage, KV_LAYOUT, DTypeKV, IdType> new_paged_kv = paged_kv;
   kv_partition_info_t<IdType> kv_partition_info;
   DTypeOut* tmp = handler->GetTempFloatBuffer<DTypeOut>();

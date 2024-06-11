@@ -50,7 +50,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
       q, q.options().dtype(is_float8_tensor(q) ? torch::kFloat16 : q.scalar_type()));
 
   if (is_float8_tensor(q)) {
-    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_COMBINED_FP8(q.scalar_type(), q_type, [&] {
+    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(q.scalar_type(), q_type, [&] {
       return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_COMBINED_FP8(k.scalar_type(), kv_type, [&] {
         return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
           return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
@@ -75,7 +75,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
       });
     });
   } else {
-    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_COMBINED_FP8(q.scalar_type(), q_type, [&] {
+    DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), q_type, [&] {
       return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_COMBINED_FP8(k.scalar_type(), kv_type, [&] {
         return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
           return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
