@@ -248,7 +248,7 @@ cudaError_t PartitionPagedKVCacheComputeAuxiliaryInfo(
   }
   std::fill(new_page_indptr_h + new_page_indptr_vec.size, new_page_indptr_h + padded_batch_size + 1,
             new_page_indptr_vec.back());
-  
+
   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(device_buffer, host_buffer, num_bytes_to_copy,
                                        cudaMemcpyHostToDevice, stream));
   return cudaSuccess;
