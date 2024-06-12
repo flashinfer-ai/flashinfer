@@ -206,6 +206,10 @@ using namespace flashinfer;
 #define DISPATCH_head_dim(expr, const_expr, ...) \
   _DISPATCH_SWITCH("head_dim", expr, _DISPATCH_CASES_head_dim(const_expr, __VA_ARGS__))
 
+#define DISPATCH_logits_post_hook(expr, const_expr, ...) \
+  _DISPATCH_SWITCH("logits post hook", expr,             \
+                   _DISPATCH_CASES_logits_post_hook(const_expr, __VA_ARGS__))
+
 #define DISPATCH_kv_layout(expr, const_expr, ...) \
   _DISPATCH_SWITCH("kv layout", expr, _DISPATCH_CASES_kv_layout(const_expr, __VA_ARGS__))
 

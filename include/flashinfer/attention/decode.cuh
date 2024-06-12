@@ -36,8 +36,8 @@
 #include "../utils.cuh"
 #include "../vec_dtypes.cuh"
 #include "cascade.cuh"
-#include "state.cuh"
 #include "logits_post_hook.cuh"
+#include "state.cuh"
 
 namespace flashinfer {
 
@@ -67,8 +67,8 @@ namespace {
  * \param s A float indicates the thread-local result of qk
  * \param st The self-attention state to be updated
  */
-template <LogitsPostHook logits_post_hook, PosEncodingMode pos_encoding_mode, uint32_t vec_size, uint32_t bdx, uint32_t tile_size,
-          typename T>
+template <LogitsPostHook logits_post_hook, PosEncodingMode pos_encoding_mode, uint32_t vec_size,
+          uint32_t bdx, uint32_t tile_size, typename T>
 __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage_idx,
                                            const vec_t<float, vec_size>& q_vec,
                                            const vec_t<float, vec_size>& freq, uint32_t kv_idx_base,
@@ -206,11 +206,12 @@ __device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, f
  *   of "theta" used in RoPE (Rotary Positional Embeddings)
  * \param kv_chunk_size A integer indicates the kv-chunk size
  */
-template <LogitsPostHook logits_post_hook, QKVLayout kv_layout, bool partition_kv, PosEncodingMode pos_encoding_mode,
-          uint32_t num_stages_smem, uint32_t tile_size_per_bdx, uint32_t vec_size, uint32_t bdx,
-          uint32_t bdy, uint32_t bdz, typename DTypeQ, typename DTypeKV, typename DTypeOut>
-__global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* __restrict__ k,
-                                              DTypeKV* __restrict__ v, DTypeOut* __restrict__ o,
+template <LogitsPostHook logits_post_hook, QKVLayout kv_layout, bool partition_kv,
+          PosEncodingMode pos_encoding_mode, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
+          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename DTypeQ, typename DTypeKV,
+          typename DTypeOut>
+__global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* __restrict__ k,
+                                              DTypeIn* __restrict__ v, DTypeOut* __restrict__ o,
                                               DTypeOut* __restrict__ tmp,
                                               tensor_info_t<kv_layout, bdy, bdx * vec_size> info,
                                               float sm_scale, float rope_rcp_scale,
@@ -360,9 +361,9 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
   }
 }
 
-template <LogitsPostHook logits_post_hook, QKVLayout kv_layout, PosEncodingMode pos_encoding_mode, uint32_t num_stages_smem,
-          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename DTypeQ, typename DTypeKV,
-          typename DTypeOut>
+template <LogitsPostHook logits_post_hook, QKVLayout kv_layout, PosEncodingMode pos_encoding_mode,
+          uint32_t num_stages_smem, uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz,
+          typename DTypeQ, typename DTypeKV, typename DTypeOut>
 __global__ void BatchDecodeWithPaddedKVCacheKernel(
     DTypeQ* __restrict__ q, DTypeKV* __restrict__ k, DTypeKV* __restrict__ v,
     DTypeOut* __restrict__ o, float* __restrict__ lse,
@@ -517,10 +518,10 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(
  * \param rope_rcp_theta A floating number indicate the reciprocal
  *   of "theta" used in RoPE (Rotary Positional Embeddings)
  */
-template <LogitsPostHook logits_post_hook, bool partition_kv, PosEncodingMode pos_encoding_mode, uint32_t num_stages_smem,
-          uint32_t tile_size_per_bdx, uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz,
-          PageStorage page_storage, QKVLayout kv_layout, typename DTypeQ, typename DTypeKV,
-          typename DTypeOut, typename IdType>
+template <LogitsPostHook logits_post_hook, bool partition_kv, PosEncodingMode pos_encoding_mode,
+          uint32_t num_stages_smem, uint32_t tile_size_per_bdx, uint32_t vec_size, uint32_t bdx,
+          uint32_t bdy, uint32_t bdz, PageStorage page_storage, QKVLayout kv_layout,
+          typename DTypeQ, typename DTypeKV, typename DTypeOut, typename IdType>
 __global__ void BatchDecodeWithPagedKVCacheKernel(
     DTypeQ* __restrict__ q, IdType* __restrict__ q_offset,
     paged_kv_t<page_storage, kv_layout, DTypeKV, IdType> paged_kv,
@@ -765,10 +766,10 @@ constexpr uint32_t get_heuristic_num_threads(uint32_t group_size, uint32_t sizeo
  * \param stream The cuda stream to launch the kernel
  * \return status Indicates whether CUDA calls are successful
  */
-template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
-          PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV,
+template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK,
+          QKVLayout KV_LAYOUT, PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV,
           typename DTypeOut>
-cudaError_t SingleDecodeWithKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut* o,
+cudaError_t SingleDecodeWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o,
                                               DTypeOut* tmp, uint32_t num_kv_heads,
                                               uint32_t seq_len, float sm_scale, float rope_scale,
                                               float rope_theta, cudaStream_t stream) {
@@ -791,9 +792,9 @@ cudaError_t SingleDecodeWithKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v,
   if (seq_len <= 256 || tmp == nullptr) {
     // no need to use partition-kv kernel
     auto kernel =
-        SingleDecodeWithKVCacheKernel<KV_LAYOUT, /*partition_kv=*/false, POS_ENCODING_MODE,
-                                      num_stages_smem, tile_size_per_bdx, vec_size, bdx, bdy, bdz,
-                                      DTypeQ, DTypeKV, DTypeOut>;
+        SingleDecodeWithKVCacheKernel<LOGITS_POST_HOOK, KV_LAYOUT, /*partition_kv=*/false,
+                                      POS_ENCODING_MODE, num_stages_smem, tile_size_per_bdx,
+                                      vec_size, bdx, bdy, bdz, DTypeQ, DTypeKV, DTypeOut>;
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -812,9 +813,10 @@ cudaError_t SingleDecodeWithKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v,
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
   } else {
     // use partition-kv kernel
-    auto kernel = SingleDecodeWithKVCacheKernel<KV_LAYOUT, /*partition_kv=*/true, POS_ENCODING_MODE,
-                                                num_stages_smem, tile_size_per_bdx, vec_size, bdx,
-                                                bdy, bdz, DTypeQ, DTypeKV, DTypeOut>;
+    auto kernel =
+        SingleDecodeWithKVCacheKernel<LOGITS_POST_HOOK, KV_LAYOUT, /*partition_kv=*/true,
+                                      POS_ENCODING_MODE, num_stages_smem, tile_size_per_bdx,
+                                      vec_size, bdx, bdy, bdz, DTypeQ, DTypeKV, DTypeOut>;
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -853,13 +855,13 @@ cudaError_t SingleDecodeWithKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v,
   return cudaSuccess;
 }
 
-template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, QKVLayout kv_layout,
-          PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV, typename DTypeOut, typename IdType>
+template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage,
+          LogitsPostHook LOGITS_POST_HOOK, QKVLayout kv_layout, PosEncodingMode POS_ENCODING_MODE,
+          typename DTypeQ, typename DTypeKV, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     DTypeQ* q, IdType* q_offset, paged_kv_t<page_storage, kv_layout, DTypeKV, IdType> paged_kv,
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, DTypeOut* tmp_v, float* tmp_s,
-    float* lse, bool* block_valid_mask, uint32_t padded_batch_size,
-    float sm_scale,
+    float* lse, bool* block_valid_mask, uint32_t padded_batch_size, float sm_scale,
     float rope_scale, float rope_theta, cudaStream_t stream) {
   const float rope_rcp_scale = 1.f / rope_scale;
   const float rope_rcp_theta = 1.f / rope_theta;
@@ -883,9 +885,10 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     dim3 nblks(padded_batch_size, num_kv_heads);
     dim3 nthrs(bdx, bdy, bdz);
     auto kernel =
-        BatchDecodeWithPagedKVCacheKernel</*partition_kv=*/false, POS_ENCODING_MODE,
-                                          num_stages_smem, tile_size_per_bdx, vec_size, bdx, bdy,
-                                          bdz, page_storage, kv_layout, DTypeQ, DTypeKV, DTypeOut, IdType>;
+        BatchDecodeWithPagedKVCacheKernel<LOGITS_POST_HOOK, /*partition_kv=*/false,
+                                          POS_ENCODING_MODE, num_stages_smem, tile_size_per_bdx,
+                                          vec_size, bdx, bdy, bdz, page_storage, kv_layout, DTypeQ, DTypeKV,
+                                          DTypeOut, IdType>;
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     void* args[] = {(void*)&q,
@@ -904,9 +907,10 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
   } else {
     // use partition-kv kernel
     auto partition_kv_kernel =
-        BatchDecodeWithPagedKVCacheKernel</*partition_kv=*/true, POS_ENCODING_MODE, num_stages_smem,
-                                          tile_size_per_bdx, vec_size, bdx, bdy, bdz, page_storage,
-                                          kv_layout, DTypeQ, DTypeKV, DTypeOut, IdType>;
+        BatchDecodeWithPagedKVCacheKernel<LOGITS_POST_HOOK, /*partition_kv=*/true,
+                                          POS_ENCODING_MODE, num_stages_smem, tile_size_per_bdx,
+                                          vec_size, bdx, bdy, bdz, page_storage, kv_layout, DTypeQ, DTypeKV,
+                                          DTypeOut, IdType>;
     FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
         partition_kv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     void* args[] = {(void*)&q,
@@ -952,9 +956,10 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
  * \param stream The cuda stream to launch the kernel
  * \return status Indicates whether CUDA calls are successful
  */
-template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
-          PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV, typename DTypeOut>
-cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut* o,
+template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK,
+          QKVLayout KV_LAYOUT, PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV,
+          typename DTypeOut>
+cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o,
                                                    DTypeOut* tmp, float* lse, uint32_t batch_size,
                                                    uint32_t padded_kv_len, uint32_t num_qo_heads,
                                                    float sm_scale, float rope_scale,
@@ -976,8 +981,9 @@ cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeK
 
   dim3 nblks(batch_size, num_kv_heads);
   dim3 nthrs(bdx, bdy, bdz);
-  auto kernel = BatchDecodeWithPaddedKVCacheKernel<KV_LAYOUT, POS_ENCODING_MODE, num_stages_smem,
-                                                   vec_size, bdx, bdy, bdz, DTypeQ, DTypeKV, DTypeOut>;
+  auto kernel = BatchDecodeWithPaddedKVCacheKernel<LOGITS_POST_HOOK, KV_LAYOUT, POS_ENCODING_MODE,
+                                                   num_stages_smem, vec_size, bdx, bdy, bdz,
+                                                   DTypeQ, DTypeKV, DTypeOut>;
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
   tensor_info_t<KV_LAYOUT, GROUP_SIZE, HEAD_DIM> info(1, padded_kv_len, num_kv_heads);

@@ -20,6 +20,7 @@ from literal_map import (
     kv_layout_literal,
     pos_encoding_mode_literal,
     dtype_literal,
+    logit_hook_literal,
 )
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from pathlib import Path
 def get_cu_file_str(
     group_size,
     head_dim,
+    logit_hook,
     kv_layout,
     pos_encoding_mode,
     dtype_q,
@@ -37,7 +39,7 @@ def get_cu_file_str(
 
 namespace flashinfer {{
 
-template cudaError_t BatchDecodeWithPaddedKVCacheDispatched<{group_size}, {head_dim}, {kv_layout}, {pos_encoding_mode}, {dtype_q}, {dtype_kv}, {dtype_out}>(
+template cudaError_t BatchDecodeWithPaddedKVCacheDispatched<{group_size}, {head_dim}, {logit_hook}, {kv_layout}, {pos_encoding_mode}, {dtype_q}, {dtype_kv}, {dtype_out}>(
     {dtype_q}* q, {dtype_kv}* k, {dtype_kv}* v,
     {dtype_out}* o, {dtype_out}* tmp, float* lse,
     uint32_t batch_size, uint32_t padded_kv_len, uint32_t num_qo_heads,
@@ -46,6 +48,7 @@ template cudaError_t BatchDecodeWithPaddedKVCacheDispatched<{group_size}, {head_
 
 }}
     """.format(
+        logit_hook=logit_hook_literal[int(logit_hook)],
         kv_layout=kv_layout_literal[int(kv_layout)],
         group_size=group_size,
         head_dim=head_dim,
@@ -59,7 +62,7 @@ template cudaError_t BatchDecodeWithPaddedKVCacheDispatched<{group_size}, {head_
 
 if __name__ == "__main__":
     pattern = (
-        r"batch_padded_decode_group_([0-9]+)_head_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
+        r"batch_padded_decode_group_([0-9]+)_head_([0-9]+)_logithook_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
         r"dtypeq_([a-z0-9]+)_dtypekv_([a-z0-9]+)_dtypeout_([a-z0-9]+)\.cu"
     )
 

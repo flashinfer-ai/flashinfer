@@ -131,7 +131,7 @@ __forceinline__ __device__ float tanh(float x) {
 __forceinline__ __device__ half2 tanh(half2 x) {
   uint32_t y_u32;
   uint32_t x_u32 = half2_as_uint32(x);
-  asm volatile("tanh.approx.f16x2 %0, %1;" : "=r"(y_u32) : "h"(x_u32));
+  asm volatile("tanh.approx.f16x2 %0, %1;" : "=r"(y_u32) : "r"(x_u32));
   return uint32_as_half2(y_u32);
 }
 
@@ -140,9 +140,9 @@ __forceinline__ __device__ half2 tanh(half2 x) {
  * \param x input
  */
 __forceinline__ __device__ half tanh(half x) {
-  half y;
-  asm volatile("tanh.approx.f16 %0, %1;" : "=h"(y) : "h"(x));
-  return y;
+  ushort y_u16;
+  asm volatile("tanh.approx.f16 %0, %1;" : "=h"(y_u16) : "h"(__half_as_ushort(x)));
+  return __ushort_as_half(y_u16);
 }
 
 }  // namespace math

@@ -1717,9 +1717,9 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
   return cudaSuccess;
 }
 
-template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
-          PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE,
-          typename DTypeIn, typename DTypeOut>
+template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK,
+          QKVLayout KV_LAYOUT, PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION,
+          MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut>
 cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v,
                                                float* custom_mask, DTypeOut* o, float* tmp,
                                                float* lse, uint32_t num_kv_heads, uint32_t qo_len,
@@ -1775,9 +1775,10 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
         constexpr uint32_t num_threads = num_warps * warp_size;
         constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
         auto partition_kv_kernel =
-            SinglePrefillWithKVCacheKernel</*partition_kv=*/true, GROUP_SIZE, MASK_MODE, KV_LAYOUT,
-                                           pos_encoding_mode, num_frags_x, num_frags_y, num_frags_z,
-                                           num_warps, DTypeIn, DTypeQKAccum, DTypeOut>;
+            SinglePrefillWithKVCacheKernel<LOGITS_POST_HOOK, /*partition_kv=*/true, GROUP_SIZE,
+                                           MASK_MODE, KV_LAYOUT, pos_encoding_mode, num_frags_x,
+                                           num_frags_y, num_frags_z, num_warps, DTypeIn,
+                                           DTypeQKAccum, DTypeOut>;
         tensor_info_t<KV_LAYOUT, GROUP_SIZE, HEAD_DIM> qkv_info(qo_len, kv_len, num_kv_heads);
         uint32_t smem_size =
             (num_frags_x * num_warps + num_frags_z * 2) * 16 * HEAD_DIM * sizeof(DTypeIn);
@@ -1802,9 +1803,11 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
 
         if (num_chunks <= 1 || tmp == nullptr) {
           // Enough parallelism, do not split-kv
-          auto kernel = SinglePrefillWithKVCacheKernel<
-              /*partition_kv=*/false, GROUP_SIZE, MASK_MODE, KV_LAYOUT, pos_encoding_mode,
-              num_frags_x, num_frags_y, num_frags_z, num_warps, DTypeIn, DTypeQKAccum, DTypeOut>;
+          auto kernel =
+              SinglePrefillWithKVCacheKernel<LOGITS_POST_HOOK, /*partition_kv=*/false, GROUP_SIZE,
+                                             MASK_MODE, KV_LAYOUT, pos_encoding_mode, num_frags_x,
+                                             num_frags_y, num_frags_z, num_warps, DTypeIn,
+                                             DTypeQKAccum, DTypeOut>;
           void* args[] = {(void*)&q,
                           (void*)&k,
                           (void*)&v,
@@ -1851,9 +1854,10 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
   return cudaSuccess;
 }
 
-template <uint32_t num_frags_x, uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
-          PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE,
-          typename DTypeIn, typename DTypeOut, typename IdType>
+template <uint32_t num_frags_x, uint32_t GROUP_SIZE, uint32_t HEAD_DIM,
+          LogitsPostHook LOGITS_POST_HOOK, QKVLayout KV_LAYOUT, PosEncodingMode pos_encoding_mode,
+          bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut,
+          typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, DTypeIn* k,
     DTypeIn* v, IdType* kv_indptr, float* custom_mask, IdType* qk_indptr, IdType* q_offset,
@@ -1899,10 +1903,9 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
                  " and report the issue to the developers.";
       throw std::invalid_argument(err_msg.str());
     } else {
-      auto kernel =
-          BatchPrefillWithRaggedKVCacheKernel<GROUP_SIZE, MASK_MODE, KV_LAYOUT, pos_encoding_mode,
-                                              num_frags_x, num_frags_y, num_frags_z, num_warps,
-                                              DTypeIn, DTypeQKAccum, DTypeOut, IdType>;
+      auto kernel = BatchPrefillWithRaggedKVCacheKernel<
+          LOGITS_POST_HOOK, GROUP_SIZE, MASK_MODE, KV_LAYOUT, pos_encoding_mode, num_frags_x,
+          num_frags_y, num_frags_z, num_warps, DTypeIn, DTypeQKAccum, DTypeOut, IdType>;
       uint32_t smem_size =
           (num_frags_x * num_warps + num_frags_z * 2) * 16 * HEAD_DIM * sizeof(DTypeIn);
       FLASHINFER_CUDA_CALL(
@@ -1931,10 +1934,10 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
   return cudaSuccess;
 }
 
-template <PageStorage page_storage, QKVLayout kv_layout, uint32_t num_frags_x, uint32_t PAGE_SIZE,
-          uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PosEncodingMode pos_encoding_mode,
-          bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut,
-          typename IdType>
+template <PageStorage page_storage, uint32_t num_frags_x, uint32_t PAGE_SIZE, uint32_t GROUP_SIZE,
+          uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK, QKVLayout kv_layout,
+          PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE,
+          typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, IdType* q_offset,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, float* custom_mask,
@@ -1982,9 +1985,11 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
                  " and report the issue to the developers.";
       throw std::invalid_argument(err_msg.str());
     } else {
-      auto kernel = BatchPrefillWithPagedKVCacheKernel<
-          GROUP_SIZE, PAGE_SIZE, MASK_MODE, pos_encoding_mode, num_frags_x, num_frags_y,
-          num_frags_z, num_warps, page_storage, kv_layout, DTypeIn, DTypeQKAccum, DTypeOut, IdType>;
+      auto kernel =
+          BatchPrefillWithPagedKVCacheKernel<LOGITS_POST_HOOK, GROUP_SIZE, PAGE_SIZE, MASK_MODE,
+                                             pos_encoding_mode, num_frags_x, num_frags_y,
+                                             num_frags_z, num_warps, page_storage, kv_layout,
+                                             DTypeIn, DTypeQKAccum, DTypeOut, IdType>;
       uint32_t smem_size =
           (num_frags_x * num_warps + num_frags_z * 2) * 16 * HEAD_DIM * sizeof(DTypeIn);
       FLASHINFER_CUDA_CALL(
