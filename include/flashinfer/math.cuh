@@ -114,6 +114,37 @@ __forceinline__ __device__ float rsqrt(float x) {
   return y;
 }
 
+/*!
+ * \brief Wrapper of PTX tanh.approx.f32 instruction, which computes tanh(x)
+ * \param x input
+ */
+__forceinline__ __device__ float tanh(float x) {
+  float y;
+  asm volatile("tanh.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+
+/*!
+ * \brief Wrapper of PTX tanh.approx.f16x2 instruction, which computes tanh(x)
+ * \param x input
+ */
+__forceinline__ __device__ half2 tanh(half2 x) {
+  uint32_t y_u32;
+  uint32_t x_u32 = half2_as_uint32(x);
+  asm volatile("tanh.approx.f16x2 %0, %1;" : "=r"(y_u32) : "h"(x_u32));
+  return uint32_as_half2(y_u32);
+}
+
+/*!
+ * \brief Wrapper of PTX tanh.approx.f16 instruction, which computes tanh(x)
+ * \param x input
+ */
+__forceinline__ __device__ half tanh(half x) {
+  half y;
+  asm volatile("tanh.approx.f16 %0, %1;" : "=h"(y) : "h"(x));
+  return y;
+}
+
 }  // namespace math
 }  // namespace flashinfer
 #endif  // FLASHINFER_MATH_CUH_

@@ -18,6 +18,8 @@
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+
+#include <type_traits>
 #ifdef FLASHINFER_ENABLE_FP8
 #include <cuda_fp8.h>
 #endif
@@ -35,6 +37,7 @@
 #include "../pos_enc.cuh"
 #include "../utils.cuh"
 #include "cascade.cuh"
+#include "logits_post_hook.cuh"
 #include "mask.cuh"
 
 namespace flashinfer {
@@ -476,8 +479,8 @@ __device__ __forceinline__ void k_smem_inplace_apply_rotary(const uint32_t kv_id
   }
 }
 
-template <uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z, typename DTypeIn,
-          typename DTypeQKAccum>
+template <LogitsPostHook logits_post_hook, uint32_t num_frags_x, uint32_t num_frags_y,
+          uint32_t num_frags_z, typename DTypeIn, typename DTypeQKAccum>
 __device__ __forceinline__ void compute_qk(smem_t* q_smem, uint32_t* q_smem_offset_r,
                                            smem_t* k_smem, uint32_t* k_smem_offset_r,
                                            DTypeQKAccum (*s_frag)[num_frags_z][8]) {
@@ -525,6 +528,32 @@ __device__ __forceinline__ void compute_qk(smem_t* q_smem, uint32_t* q_smem_offs
   }
   *q_smem_offset_r -= num_frags_y * 2;
   *k_smem_offset_r -= num_frags_y * 2;
+
+  if constexpr (std::is_same<DTypeQKAccum, float>::value) {
+#pragma unroll
+    for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+      for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
+#pragma unroll
+        for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+          s_frag[fx][fz][reg_id] = apply_logits_post_hook<logits_post_hook>(s_frag[fx][fz][reg_id]);
+        }
+      }
+    }
+  } else {
+    static_assert(std::is_same<DTypeQKAccum, half>::value);
+#pragma unroll
+    for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+      for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
+#pragma unroll
+        for (uint32_t reg_id = 0; reg_id < 4; ++reg_id) {
+          *(half2*)(&s_frag[fx][fz][reg_id * 2]) =
+              apply_logits_post_hook<logits_post_hook>(*(half2*)(&s_frag[fx][fz][reg_id * 2]));
+        }
+      }
+    }
+  }
 }
 
 template <uint32_t group_size, uint32_t num_frags_x, uint32_t num_frags_z, typename T>
@@ -897,10 +926,10 @@ __device__ __forceinline__ void write_o_reg_gmem(float (*o_frag)[num_frags_y][8]
  * \param log2_rope_rcp_theta log2(1/(rope_theta)), where rope_theta is the theta
  *   used in RoPE.
  */
-template <bool partition_kv, uint32_t group_size, MaskMode mask_mode, QKVLayout kv_layout,
-          PosEncodingMode pos_encoding_mode, uint32_t num_frags_x, uint32_t num_frags_y,
-          uint32_t num_frags_z, uint32_t num_warps, typename DTypeIn, typename DTypeQKAccum,
-          typename DTypeOut>
+template <LogitsPostHook logits_post_hook, bool partition_kv, uint32_t group_size,
+          MaskMode mask_mode, QKVLayout kv_layout, PosEncodingMode pos_encoding_mode,
+          uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps,
+          typename DTypeIn, typename DTypeQKAccum, typename DTypeOut>
 __global__ void SinglePrefillWithKVCacheKernel(
     DTypeIn* __restrict__ q, DTypeIn* __restrict__ k, DTypeIn* __restrict__ v,
     float* __restrict__ custom_mask, DTypeOut* __restrict__ o, void* __restrict__ tmp,
@@ -1033,8 +1062,8 @@ __global__ void SinglePrefillWithKVCacheKernel(
     }
 
     // compute attention score
-    compute_qk<num_frags_x, num_frags_y, num_frags_z, DTypeIn>(&qo_smem, &q_smem_offset_r, &k_smem,
-                                                               &k_smem_offset_r, s_frag);
+    compute_qk<logits_post_hook, num_frags_x, num_frags_y, num_frags_z, DTypeIn>(
+        &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
 
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
       apply_alibi_bias<group_size, num_frags_x, num_frags_z>(
@@ -1111,10 +1140,10 @@ __global__ void SinglePrefillWithKVCacheKernel(
   }
 }
 
-template <uint32_t group_size, MaskMode mask_mode, QKVLayout kv_layout,
-          PosEncodingMode pos_encoding_mode, uint32_t num_frags_x, uint32_t num_frags_y,
-          uint32_t num_frags_z, uint32_t num_warps, typename DTypeIn, typename DTypeQKAccum,
-          typename DTypeOut, typename IdType>
+template <LogitsPostHook logits_post_hook, uint32_t group_size, MaskMode mask_mode,
+          QKVLayout kv_layout, PosEncodingMode pos_encoding_mode, uint32_t num_frags_x,
+          uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps, typename DTypeIn,
+          typename DTypeQKAccum, typename DTypeOut, typename IdType>
 __global__ void BatchPrefillWithRaggedKVCacheKernel(
     DTypeIn* __restrict__ q, IdType* __restrict__ request_indices,
     IdType* __restrict__ tile_indices, IdType* __restrict__ qo_indptr, DTypeIn* __restrict__ k,
@@ -1259,8 +1288,8 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
     }
 
     // compute attention score
-    compute_qk<num_frags_x, num_frags_y, num_frags_z, DTypeIn>(&qo_smem, &q_smem_offset_r, &k_smem,
-                                                               &k_smem_offset_r, s_frag);
+    compute_qk<logits_post_hook, num_frags_x, num_frags_y, num_frags_z, DTypeIn>(
+        &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
 
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
       // TODO(Zihao): handle the case that q_offset is specified
@@ -1328,10 +1357,11 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
   }
 }
 
-template <uint32_t group_size, uint32_t page_size, MaskMode mask_mode,
-          PosEncodingMode pos_encoding_mode, uint32_t num_frags_x, uint32_t num_frags_y,
-          uint32_t num_frags_z, uint32_t num_warps, PageStorage page_storage, QKVLayout kv_layout,
-          typename DTypeIn, typename DTypeQKAccum, typename DTypeOut, typename IdType>
+template <LogitsPostHook logits_post_hook, uint32_t group_size, uint32_t page_size,
+          MaskMode mask_mode, PosEncodingMode pos_encoding_mode, uint32_t num_frags_x,
+          uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps, PageStorage page_storage,
+          QKVLayout kv_layout, typename DTypeIn, typename DTypeQKAccum, typename DTypeOut,
+          typename IdType>
 __global__ void BatchPrefillWithPagedKVCacheKernel(
     IdType* __restrict__ request_indices, IdType* __restrict__ tile_indices,
     DTypeIn* __restrict__ q, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
@@ -1471,8 +1501,8 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
     }
 
     // compute attention score
-    compute_qk<num_frags_x, num_frags_y, num_frags_z, DTypeIn>(&qo_smem, &q_smem_offset_r, &k_smem,
-                                                               &k_smem_offset_r, s_frag);
+    compute_qk<logits_post_hook, num_frags_x, num_frags_y, num_frags_z, DTypeIn>(
+        &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
 
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
       // TODO(Zihao): handle the case that q_offset is specified

@@ -326,26 +326,21 @@ class BatchDecodeHandler {
         AlignedAllocator allocator(buffer, workspace_size_in_bytes);
         tmp_v_ = allocator.aligned_alloc<void>(
             num_qo_heads * padded_batch_size * HEAD_DIM * sizeof(DTypeOut), 16);
-        tmp_s_ = allocator.aligned_alloc<void>(
-            num_qo_heads * padded_batch_size * 2 * sizeof(float), 16);
-        new_indptr_ = allocator.aligned_alloc<void>(
-            (padded_batch_size + 1) * sizeof(IdType), 16);
+        tmp_s_ =
+            allocator.aligned_alloc<void>(num_qo_heads * padded_batch_size * 2 * sizeof(float), 16);
+        new_indptr_ = allocator.aligned_alloc<void>((padded_batch_size + 1) * sizeof(IdType), 16);
 
         void* new_indptr_h_ = page_locked_buffer_;
-        new_last_page_len_ =
-            allocator.aligned_alloc<void>(padded_batch_size * sizeof(IdType), 16);
+        new_last_page_len_ = allocator.aligned_alloc<void>(padded_batch_size * sizeof(IdType), 16);
         void* new_last_page_len_h_ =
             (char*)page_locked_buffer_ + ((char*)new_last_page_len_ - (char*)new_indptr_);
-        chunk_indptr_ = allocator.aligned_alloc<void>(
-            (padded_batch_size + 1) * sizeof(IdType), 16);
+        chunk_indptr_ = allocator.aligned_alloc<void>((padded_batch_size + 1) * sizeof(IdType), 16);
         void* chunk_indptr_h_ =
             (char*)page_locked_buffer_ + ((char*)chunk_indptr_ - (char*)new_indptr_);
-        batch_idx_map_ =
-            allocator.aligned_alloc<void>(padded_batch_size * sizeof(IdType), 16);
+        batch_idx_map_ = allocator.aligned_alloc<void>(padded_batch_size * sizeof(IdType), 16);
         void* batch_idx_map_h_ =
             (char*)page_locked_buffer_ + ((char*)batch_idx_map_ - (char*)new_indptr_);
-        chunk_start_pos_ =
-            allocator.aligned_alloc<void>(padded_batch_size * sizeof(IdType), 16);
+        chunk_start_pos_ = allocator.aligned_alloc<void>(padded_batch_size * sizeof(IdType), 16);
         void* chunk_start_pos_h_ =
             (char*)page_locked_buffer_ + ((char*)chunk_start_pos_ - (char*)new_indptr_);
         seq_lengths_before_partition_ =
@@ -353,16 +348,15 @@ class BatchDecodeHandler {
         void* seq_lengths_before_partition_h_ =
             (char*)page_locked_buffer_ +
             ((char*)seq_lengths_before_partition_ - (char*)new_indptr_);
-        block_valid_mask_ =
-            allocator.aligned_alloc<bool>(padded_batch_size * sizeof(bool), 16);
+        block_valid_mask_ = allocator.aligned_alloc<bool>(padded_batch_size * sizeof(bool), 16);
         bool* block_valid_mask_h_ =
             (bool*)page_locked_buffer_ + ((bool*)block_valid_mask_ - (bool*)new_indptr_);
         std::fill(block_valid_mask_h_, block_valid_mask_h_ + padded_batch_size, 0);
 
         size_t num_bytes_to_copy = (char*)allocator.ptr - (char*)new_indptr_;
         FLASHINFER_CUDA_CALL(PartitionPagedKVCacheComputeAuxiliaryInfo(
-            max_num_pages_per_batch, batch_size, padded_batch_size, page_size,
-            indptr, last_page_len, (IdType*)new_indptr_h_, (IdType*)new_last_page_len_h_,
+            max_num_pages_per_batch, batch_size, padded_batch_size, page_size, indptr,
+            last_page_len, (IdType*)new_indptr_h_, (IdType*)new_last_page_len_h_,
             (IdType*)chunk_indptr_h_, (IdType*)batch_idx_map_h_, (IdType*)chunk_start_pos_h_,
             (IdType*)seq_lengths_before_partition_h_, block_valid_mask_h_,
             /*device_buffer=*/new_indptr_,

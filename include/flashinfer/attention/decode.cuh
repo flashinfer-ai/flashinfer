@@ -37,6 +37,7 @@
 #include "../vec_dtypes.cuh"
 #include "cascade.cuh"
 #include "state.cuh"
+#include "logits_post_hook.cuh"
 
 namespace flashinfer {
 
@@ -48,6 +49,7 @@ namespace {
 
 /*!
  * \brief Load k tile from smem and compute qk
+ * \tparam logits_post_hook The logits post hook used in the kernel
  * \tparam pos_encoding_mode The positional encoding mode used in the kernel
  * \tparam head_dim A template integer indicates the head dimension
  * \tparam vec_size A template integer indicates the vector size
@@ -65,7 +67,7 @@ namespace {
  * \param s A float indicates the thread-local result of qk
  * \param st The self-attention state to be updated
  */
-template <PosEncodingMode pos_encoding_mode, uint32_t vec_size, uint32_t bdx, uint32_t tile_size,
+template <LogitsPostHook logits_post_hook, PosEncodingMode pos_encoding_mode, uint32_t vec_size, uint32_t bdx, uint32_t tile_size,
           typename T>
 __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage_idx,
                                            const vec_t<float, vec_size>& q_vec,
@@ -96,6 +98,7 @@ __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage
       s[j] += math::shfl_xor_sync(s[j], offset);
     }
     s[j] = (iter_base + tz * tile_size + j < iter_bound) ? s[j] : -5e4;
+    s[j] = apply_logits_post_hook<logits_post_hook>(s[j]);
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
       s[j] += alibi_slope * float(int(kv_idx_base + tz * tile_size + j) - q_offset);
     }
@@ -178,6 +181,7 @@ __device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, f
 
 /*!
  * \brief FlashAttention decoding cuda kernel with kv-cache for a single request
+ * \tparam logits_post_hook The logits post hook used in the kernel
  * \tparam kv_layout The layout of k/v matrices (NHD or HND)
  * \tparam partition_kv Whether to partition kv-cache on sequence length dimension or not
  * \tparam pos_encoding_mode The positional encoding mode
@@ -202,7 +206,7 @@ __device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, f
  *   of "theta" used in RoPE (Rotary Positional Embeddings)
  * \param kv_chunk_size A integer indicates the kv-chunk size
  */
-template <QKVLayout kv_layout, bool partition_kv, PosEncodingMode pos_encoding_mode,
+template <LogitsPostHook logits_post_hook, QKVLayout kv_layout, bool partition_kv, PosEncodingMode pos_encoding_mode,
           uint32_t num_stages_smem, uint32_t tile_size_per_bdx, uint32_t vec_size, uint32_t bdx,
           uint32_t bdy, uint32_t bdz, typename DTypeQ, typename DTypeKV, typename DTypeOut>
 __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* __restrict__ k,
@@ -297,7 +301,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
     // compute qk
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    compute_qk<pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
+    compute_qk<logits_post_hook, pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
         k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, stage_idx, q_vec,
         freq, consumer_kv_idx_base, iter * bdy * tile_size_per_bdx * bdz, kv_chunk_size,
         seq_len - 1, alibi_slope, s, st_local);
@@ -356,9 +360,9 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
   }
 }
 
-template <QKVLayout kv_layout, PosEncodingMode pos_encoding_mode, uint32_t num_stages_smem,
-          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename DTypeQ,
-          typename DTypeKV, typename DTypeOut>
+template <LogitsPostHook logits_post_hook, QKVLayout kv_layout, PosEncodingMode pos_encoding_mode, uint32_t num_stages_smem,
+          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename DTypeQ, typename DTypeKV,
+          typename DTypeOut>
 __global__ void BatchDecodeWithPaddedKVCacheKernel(
     DTypeQ* __restrict__ q, DTypeKV* __restrict__ k, DTypeKV* __restrict__ v,
     DTypeOut* __restrict__ o, float* __restrict__ lse,
@@ -438,7 +442,7 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(
     // compute qk
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    compute_qk<pos_encoding_mode, vec_size, bdx, bdy>(
+    compute_qk<logits_post_hook, pos_encoding_mode, vec_size, bdx, bdy>(
         k_smem + (stage_idx * bdz + tz) * bdy * head_dim, stage_idx, q_vec, freq,
         consumer_kv_idx_base, iter * bdy * bdz, seq_len, seq_len - 1, alibi_slope, s, st_local);
     block.sync();
@@ -489,6 +493,7 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(
 
 /*!
  * \brief FlashAttention decoding cuda kernel with paged kv-cache for multiple requests
+ * \tparam logits_post_hook The logits post hook used in the kernel
  * \tparam partition_kv Whether to partition kv-cache on sequence length dimension or not
  * \tparam pos_encoding_mode The positional encoding mode
  * \tparam vec_size A template integer indicates the vector size
@@ -512,7 +517,7 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(
  * \param rope_rcp_theta A floating number indicate the reciprocal
  *   of "theta" used in RoPE (Rotary Positional Embeddings)
  */
-template <bool partition_kv, PosEncodingMode pos_encoding_mode, uint32_t num_stages_smem,
+template <LogitsPostHook logits_post_hook, bool partition_kv, PosEncodingMode pos_encoding_mode, uint32_t num_stages_smem,
           uint32_t tile_size_per_bdx, uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz,
           PageStorage page_storage, QKVLayout kv_layout, typename DTypeQ, typename DTypeKV,
           typename DTypeOut, typename IdType>
@@ -649,7 +654,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
     // compute qk
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    compute_qk<pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
+    compute_qk<logits_post_hook, pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
         k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, stage_idx, q_vec,
         freq,
         (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[mapped_batch_idx]) +
@@ -853,7 +858,8 @@ template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, QKVL
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     DTypeQ* q, IdType* q_offset, paged_kv_t<page_storage, kv_layout, DTypeKV, IdType> paged_kv,
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, DTypeOut* tmp_v, float* tmp_s,
-    float* lse, bool* block_valid_mask, uint32_t padded_batch_size, float sm_scale,
+    float* lse, bool* block_valid_mask, uint32_t padded_batch_size,
+    float sm_scale,
     float rope_scale, float rope_theta, cudaStream_t stream) {
   const float rope_rcp_scale = 1.f / rope_scale;
   const float rope_rcp_theta = 1.f / rope_theta;
