@@ -283,12 +283,12 @@ void _TestTwoLevelSinglePrefixCascadeDecodeCorrectness(size_t batch_size,
   thrust::device_vector<char> buffer_baseline(workspace_size_in_bytes),
       buffer_cascade(workspace_size_in_bytes);
 
-  BatchDecodeHandlerBeginForward<page_storage, kv_layout, T, T, int32_t>(
+  BatchDecodeHandlerBeginForward<page_storage, kv_layout, T, T, T, int32_t>(
       &baseline_handler, (void*)thrust::raw_pointer_cast(buffer_baseline.data()),
       workspace_size_in_bytes, kv_indptr_combined_h.data(), kv_last_page_len_combined_h.data(),
       batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, PosEncodingMode::kNone);
 
-  BatchDecodeHandlerBeginForward<page_storage, kv_layout, T, T, int32_t>(
+  BatchDecodeHandlerBeginForward<page_storage, kv_layout, T, T, T, int32_t>(
       &cascade_handler, (void*)thrust::raw_pointer_cast(buffer_cascade.data()),
       workspace_size_in_bytes, kv_indptr_unique_h.data(), kv_last_page_len_unique_h.data(),
       batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, PosEncodingMode::kNone);

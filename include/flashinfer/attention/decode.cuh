@@ -184,7 +184,8 @@ __device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, f
  * \tparam vec_size A template integer indicates the vector size
  * \tparam bdx A template integer indicates the block size in x dimension
  * \tparam bdy A template integer indicates the block size in y dimension
- * \tparam DTypeIn A template type indicates the input data type
+ * \tparam DTypeQ A template type indicates the query data type
+ * \tparam DTypeKV A template type indicates the key-value data type
  * \tparam DTypeOut A template type indicates the output data type
  * \param q [num_qo_heads, head_dim] The query matrix
  * \param k [seq_len, num_kv_heads, head_dim] The key matrix in kv-cache
@@ -203,9 +204,9 @@ __device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, f
  */
 template <QKVLayout kv_layout, bool partition_kv, PosEncodingMode pos_encoding_mode,
           uint32_t num_stages_smem, uint32_t tile_size_per_bdx, uint32_t vec_size, uint32_t bdx,
-          uint32_t bdy, uint32_t bdz, typename DTypeIn, typename DTypeOut>
-__global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* __restrict__ k,
-                                              DTypeIn* __restrict__ v, DTypeOut* __restrict__ o,
+          uint32_t bdy, uint32_t bdz, typename DTypeQ, typename DTypeKV, typename DTypeOut>
+__global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* __restrict__ k,
+                                              DTypeKV* __restrict__ v, DTypeOut* __restrict__ o,
                                               DTypeOut* __restrict__ tmp,
                                               tensor_info_t<kv_layout, bdy, bdx * vec_size> info,
                                               float sm_scale, float rope_rcp_scale,
@@ -224,11 +225,11 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
   uint32_t seq_len = info.kv_len;
 
   extern __shared__ uint8_t smem[];
-  DTypeIn* k_smem = (DTypeIn*)smem;
-  DTypeIn* v_smem = (DTypeIn*)(smem + num_stages_smem * bdy * tile_size_per_bdx * bdz * head_dim *
-                                          sizeof(DTypeIn));
+  DTypeKV* k_smem = (DTypeKV*)smem;
+  DTypeKV* v_smem = (DTypeKV*)(smem + num_stages_smem * bdy * tile_size_per_bdx * bdz * head_dim *
+                                          sizeof(DTypeKV));
   float* smem_md = (float*)(smem + 2 * num_stages_smem * bdy * tile_size_per_bdx * bdz * head_dim *
-                                       sizeof(DTypeIn));
+                                       sizeof(DTypeKV));
 
   uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
   vec_t<float, vec_size> q_vec;
@@ -260,7 +261,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
 
   // preload k tiles and v tiles
   uint32_t producer_kv_idx_base = chunk_start;
-  constexpr uint32_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
+  constexpr uint32_t vec_bits = sizeof(DTypeKV) * vec_size * 8;
 #pragma unroll
   for (uint32_t iter = 0; iter < num_stages_smem; ++iter) {
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
@@ -356,10 +357,10 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* 
 }
 
 template <QKVLayout kv_layout, PosEncodingMode pos_encoding_mode, uint32_t num_stages_smem,
-          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename DTypeIn,
-          typename DTypeOut>
+          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename DTypeQ,
+          typename DTypeKV, typename DTypeOut>
 __global__ void BatchDecodeWithPaddedKVCacheKernel(
-    DTypeIn* __restrict__ q, DTypeIn* __restrict__ k, DTypeIn* __restrict__ v,
+    DTypeQ* __restrict__ q, DTypeKV* __restrict__ k, DTypeKV* __restrict__ v,
     DTypeOut* __restrict__ o, float* __restrict__ lse,
     tensor_info_t<kv_layout, bdy, bdx * vec_size> info, float sm_scale, float rope_rcp_scale,
     float rope_rcp_theta) {
@@ -376,9 +377,9 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(
   uint32_t seq_len = info.kv_len;
 
   extern __shared__ uint8_t smem[];
-  DTypeIn* k_smem = (DTypeIn*)smem;
-  DTypeIn* v_smem = (DTypeIn*)(smem + num_stages_smem * bdy * bdz * head_dim * sizeof(DTypeIn));
-  float* smem_md = (float*)(smem + 2 * num_stages_smem * bdy * bdz * head_dim * sizeof(DTypeIn));
+  DTypeKV* k_smem = (DTypeKV*)smem;
+  DTypeKV* v_smem = (DTypeKV*)(smem + num_stages_smem * bdy * bdz * head_dim * sizeof(DTypeKV));
+  float* smem_md = (float*)(smem + 2 * num_stages_smem * bdy * bdz * head_dim * sizeof(DTypeKV));
 
   uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
   vec_t<float, vec_size> q_vec;
@@ -407,7 +408,7 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(
 
   // preload k tiles and v tiles
   uint32_t producer_kv_idx_base = 0;
-  constexpr uint32_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
+  constexpr uint32_t vec_bits = sizeof(DTypeKV) * vec_size * 8;
 #pragma unroll
   for (uint32_t iter = 0; iter < num_stages_smem; ++iter) {
     cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
@@ -495,7 +496,8 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(
  * \tparam bdy A template integer indicates the block size in y dimension
  * \tparam bdz A template integer indicates the block size in z dimension
  * \tparam page_storage Whether to store indices or pointers of each active page
- * \tparam DTypeIn A template type indicates the input data type
+ * \tparam DTypeQ A template type indicates the query data type
+ * \tparam DTypeKV A template type indicates the key-value data type
  * \tparam DTypeOut A template type indicates the output data type
  * \tparam IdType A template type indicates the index data type
  * \param q [batch_size, num_qo_heads, head_dim] The query matrix
@@ -512,11 +514,11 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(
  */
 template <bool partition_kv, PosEncodingMode pos_encoding_mode, uint32_t num_stages_smem,
           uint32_t tile_size_per_bdx, uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz,
-          PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeOut,
-          typename IdType>
+          PageStorage page_storage, QKVLayout kv_layout, typename DTypeQ, typename DTypeKV,
+          typename DTypeOut, typename IdType>
 __global__ void BatchDecodeWithPagedKVCacheKernel(
-    DTypeIn* __restrict__ q, IdType* __restrict__ q_offset,
-    paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
+    DTypeQ* __restrict__ q, IdType* __restrict__ q_offset,
+    paged_kv_t<page_storage, kv_layout, DTypeKV, IdType> paged_kv,
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* __restrict__ o,
     DTypeOut* __restrict__ tmp_v, float* __restrict__ tmp_s, float* __restrict__ lse,
     bool* __restrict__ block_valid_mask, float sm_scale, float rope_rcp_scale,
@@ -548,13 +550,13 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
       partition_kv ? kv_partition_info.batch_idx_map[batch_idx] : batch_idx;
 
   extern __shared__ uint8_t smem[];
-  DTypeIn* k_smem = (DTypeIn*)smem;
-  DTypeIn* v_smem = (DTypeIn*)(smem + num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
-                                          sizeof(DTypeIn));
-  DTypeIn** k_ptrs_smem = (DTypeIn**)(smem + 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz *
-                                                 head_dim * sizeof(DTypeIn));
+  DTypeKV* k_smem = (DTypeKV*)smem;
+  DTypeKV* v_smem = (DTypeKV*)(smem + num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
+                                          sizeof(DTypeKV));
+  DTypeKV** k_ptrs_smem = (DTypeKV**)(smem + 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz *
+                                                 head_dim * sizeof(DTypeKV));
   float* smem_md = (float*)(smem + 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
-                                       sizeof(DTypeIn));
+                                       sizeof(DTypeKV));
 
   const uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
   vec_t<float, vec_size> q_vec;
@@ -582,7 +584,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
 
   // preload k/v tiles
   uint32_t stage_idx = 0;
-  constexpr uint32_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
+  constexpr uint32_t vec_bits = sizeof(DTypeKV) * vec_size * 8;
   // NOTE(Zihao): when CUDAGraph is disabled, gridDim.x = batch_size, otherwise,
   // we guarantee that indptr array length is greater than or equal to batch_size + 1,
   // so we can safely access paged_kv.indptr[batch_idx + 1]
@@ -597,7 +599,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
   }
   block.sync();
 
-  DTypeIn* k_ptrs[tile_size_per_bdx];
+  DTypeKV* k_ptrs[tile_size_per_bdx];
 #pragma unroll
   for (uint32_t iter = 0; iter < num_stages_smem; ++iter) {
 #pragma unroll
@@ -615,7 +617,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
     cp_async::commit_group();
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
-      DTypeIn* v_ptr = k_ptrs[j] + paged_kv.kv_offset_delta();
+      DTypeKV* v_ptr = k_ptrs[j] + paged_kv.kv_offset_delta();
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
           v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
@@ -684,7 +686,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
     // load v tiles
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
-      DTypeIn* v_ptr = k_ptrs[j] + paged_kv.kv_offset_delta();
+      DTypeKV* v_ptr = k_ptrs[j] + paged_kv.kv_offset_delta();
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
           v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
@@ -737,7 +739,8 @@ constexpr uint32_t get_heuristic_num_threads(uint32_t group_size, uint32_t sizeo
 
 /*!
  * \brief FlashAttention decoding with kv-cache for a single request
- * \tparam DTypeIn A template type indicates the input data type
+ * \tparam DTypeQ A template type indicates the query data type
+ * \tparam DTypeKV A template type indicates the key-value data type
  * \tparam DTypeOut A template type indicates the output data type
  * \param q The query matrix, shape: [num_qo_heads, head_dim]
  * \param k The key matrix in kv-cache, shape: [seq_len, num_kv_heads, head_dim]
@@ -758,33 +761,34 @@ constexpr uint32_t get_heuristic_num_threads(uint32_t group_size, uint32_t sizeo
  * \return status Indicates whether CUDA calls are successful
  */
 template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
-          PosEncodingMode POS_ENCODING_MODE, typename DTypeIn, typename DTypeOut>
-cudaError_t SingleDecodeWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o,
+          PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV,
+          typename DTypeOut>
+cudaError_t SingleDecodeWithKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut* o,
                                               DTypeOut* tmp, uint32_t num_kv_heads,
                                               uint32_t seq_len, float sm_scale, float rope_scale,
                                               float rope_theta, cudaStream_t stream) {
   const float rope_rcp_scale = 1.f / rope_scale;
   const float rope_rcp_theta = 1.f / rope_theta;
   const uint32_t num_qo_heads = num_kv_heads * GROUP_SIZE;
-  constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
+  constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL);
   constexpr uint32_t num_stages_smem = 2U;
   constexpr uint32_t bdx = HEAD_DIM / vec_size;
   static_assert(bdx <= 32U);
   constexpr uint32_t bdy = GROUP_SIZE;
   constexpr uint32_t num_threads =
-      std::max(get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeIn)), bdx * bdy);
+      std::max(get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeKV)), bdx * bdy);
   constexpr uint32_t bdz = num_threads / (bdx * bdy);
   tensor_info_t<KV_LAYOUT, GROUP_SIZE, HEAD_DIM> info(1, seq_len, num_kv_heads);
-  constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeIn) == 1 ? 2U : 8U) : 1U;
+  constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 8U) : 1U;
   const uint32_t smem_size =
-      2U * num_stages_smem * bdy * tile_size_per_bdx * bdz * HEAD_DIM * sizeof(DTypeIn) +
+      2U * num_stages_smem * bdy * tile_size_per_bdx * bdz * HEAD_DIM * sizeof(DTypeKV) +
       2U * bdy * bdz * sizeof(float);
   if (seq_len <= 256 || tmp == nullptr) {
     // no need to use partition-kv kernel
     auto kernel =
         SingleDecodeWithKVCacheKernel<KV_LAYOUT, /*partition_kv=*/false, POS_ENCODING_MODE,
                                       num_stages_smem, tile_size_per_bdx, vec_size, bdx, bdy, bdz,
-                                      DTypeIn, DTypeOut>;
+                                      DTypeQ, DTypeKV, DTypeOut>;
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -805,7 +809,7 @@ cudaError_t SingleDecodeWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v
     // use partition-kv kernel
     auto kernel = SingleDecodeWithKVCacheKernel<KV_LAYOUT, /*partition_kv=*/true, POS_ENCODING_MODE,
                                                 num_stages_smem, tile_size_per_bdx, vec_size, bdx,
-                                                bdy, bdz, DTypeIn, DTypeOut>;
+                                                bdy, bdz, DTypeQ, DTypeKV, DTypeOut>;
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -845,9 +849,9 @@ cudaError_t SingleDecodeWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v
 }
 
 template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, QKVLayout kv_layout,
-          PosEncodingMode POS_ENCODING_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
+          PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(
-    DTypeIn* q, IdType* q_offset, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
+    DTypeQ* q, IdType* q_offset, paged_kv_t<page_storage, kv_layout, DTypeKV, IdType> paged_kv,
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, DTypeOut* tmp_v, float* tmp_s,
     float* lse, bool* block_valid_mask, uint32_t padded_batch_size, float sm_scale,
     float rope_scale, float rope_theta, cudaStream_t stream) {
@@ -856,17 +860,17 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
   const uint32_t num_kv_heads = paged_kv.num_heads;
   const uint32_t num_qo_heads = num_kv_heads * GROUP_SIZE;
 
-  constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
+  constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL);
   constexpr uint32_t num_stages_smem = 2U;
   constexpr uint32_t bdx = HEAD_DIM / vec_size;
   static_assert(bdx <= 32);
   constexpr uint32_t bdy = GROUP_SIZE;
   constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
   constexpr uint32_t bdz = num_threads / (bdx * bdy);
-  constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeIn) == 1 ? 2U : 4U) : 1U;
+  constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 4U) : 1U;
   const uint32_t smem_size =
-      2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * HEAD_DIM * sizeof(DTypeIn) +
-      std::max(tile_size_per_bdx * num_threads * sizeof(DTypeIn*), 2 * bdy * bdz * sizeof(float));
+      2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * HEAD_DIM * sizeof(DTypeKV) +
+      std::max(tile_size_per_bdx * num_threads * sizeof(DTypeKV*), 2 * bdy * bdz * sizeof(float));
 
   if (tmp_v == nullptr) {
     // do not use partition-kv kernel
@@ -875,7 +879,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     auto kernel =
         BatchDecodeWithPagedKVCacheKernel</*partition_kv=*/false, POS_ENCODING_MODE,
                                           num_stages_smem, tile_size_per_bdx, vec_size, bdx, bdy,
-                                          bdz, page_storage, kv_layout, DTypeIn, DTypeOut, IdType>;
+                                          bdz, page_storage, kv_layout, DTypeQ, DTypeKV, DTypeOut, IdType>;
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     void* args[] = {(void*)&q,
@@ -896,7 +900,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     auto partition_kv_kernel =
         BatchDecodeWithPagedKVCacheKernel</*partition_kv=*/true, POS_ENCODING_MODE, num_stages_smem,
                                           tile_size_per_bdx, vec_size, bdx, bdy, bdz, page_storage,
-                                          kv_layout, DTypeIn, DTypeOut, IdType>;
+                                          kv_layout, DTypeQ, DTypeKV, DTypeOut, IdType>;
     FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
         partition_kv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     void* args[] = {(void*)&q,
@@ -926,7 +930,8 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
 /*!
  * \brief FlashAttention decoding cuda kernel with paged kv-cache for batched requests
  * \tparam page_storage Whether to store indices or pointers of each active page
- * \tparam DTypeIn A template type indicates the input data type
+ * \tparam DTypeQ A template type indicates the query data type
+ * \tparam DTypeKV A template type indicates the key-value data type
  * \tparam DTypeOut A template type indicates the output data type
  * \tparam IdType A template type indicates the index data type used in paged kv-cache
  * \param q [batch_size, num_qo_heads, head_dim] The query matrix
@@ -942,8 +947,8 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
  * \return status Indicates whether CUDA calls are successful
  */
 template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
-          PosEncodingMode POS_ENCODING_MODE, typename DTypeIn, typename DTypeOut>
-cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o,
+          PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV, typename DTypeOut>
+cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut* o,
                                                    DTypeOut* tmp, float* lse, uint32_t batch_size,
                                                    uint32_t padded_kv_len, uint32_t num_qo_heads,
                                                    float sm_scale, float rope_scale,
@@ -952,7 +957,7 @@ cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DType
   const float rope_rcp_theta = 1.f / rope_theta;
   const uint32_t num_kv_heads = num_qo_heads / GROUP_SIZE;
 
-  constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeIn), HEAD_DIM / 32UL);
+  constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL);
   constexpr uint32_t num_stages_smem = 2U;
   constexpr uint32_t bdx = HEAD_DIM / vec_size;
   static_assert(bdx <= 32);
@@ -961,12 +966,12 @@ cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DType
   constexpr uint32_t bdz = num_threads / (bdx * bdy);
 
   const uint32_t smem_size =
-      2 * num_stages_smem * bdy * bdz * HEAD_DIM * sizeof(DTypeIn) + 2 * bdy * bdz * sizeof(float);
+      2 * num_stages_smem * bdy * bdz * HEAD_DIM * sizeof(DTypeKV) + 2 * bdy * bdz * sizeof(float);
 
   dim3 nblks(batch_size, num_kv_heads);
   dim3 nthrs(bdx, bdy, bdz);
   auto kernel = BatchDecodeWithPaddedKVCacheKernel<KV_LAYOUT, POS_ENCODING_MODE, num_stages_smem,
-                                                   vec_size, bdx, bdy, bdz, DTypeIn, DTypeOut>;
+                                                   vec_size, bdx, bdy, bdz, DTypeQ, DTypeKV, DTypeOut>;
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
   tensor_info_t<KV_LAYOUT, GROUP_SIZE, HEAD_DIM> info(1, padded_kv_len, num_kv_heads);

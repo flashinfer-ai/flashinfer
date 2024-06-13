@@ -73,7 +73,7 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
     size_t workspace_size_in_bytes = 32 * 1024 * 1024;
     thrust::device_vector<char> buffer(workspace_size_in_bytes);
     // begin forward
-    BatchDecodeHandlerBeginForward<PageStorage::kIndices, kv_layout, T, T, int32_t>(
+    BatchDecodeHandlerBeginForward<PageStorage::kIndices, kv_layout, T, T, T, int32_t>(
         &handler, (void*)thrust::raw_pointer_cast(buffer.data()), workspace_size_in_bytes,
         kv_indptr_host.data(), kv_last_page_len_host.data(), batch_size, num_qo_heads, num_kv_heads,
         head_dim, page_size, pos_encoding_mode);

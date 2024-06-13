@@ -94,12 +94,12 @@ def get_instantiation_cu() -> List[str]:
     idtypes = ["i32"]
     prefill_dtypes = ["f16"]
     decode_dtypes = ["f16"]
+    fp8_dtypes = ["e4m3", "e5m2"]
     if enable_bf16:
         prefill_dtypes.append("bf16")
         decode_dtypes.append("bf16")
-    fp8_dtypes = []
     if enable_fp8:
-        fp8_dtypes = ["e4m3", "e5m2"]
+        decode_dtypes.extend(fp8_dtypes)
 
     files = []
     # single decode files
@@ -114,29 +114,17 @@ def get_instantiation_cu() -> List[str]:
         kv_layouts,
         pos_encoding_modes,
     ):
-        for dtype in decode_dtypes:
-            fname = f"single_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypein_{dtype}_dtypeout_{dtype}.cu"
+        for dtype_q, dtype_kv in itertools.product(decode_dtypes, decode_dtypes):
+            dtype_out = dtype_q if dtype_q not in fp8_dtypes else "f16"
+            fname = f"single_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_out}.cu"
             files.append(prefix + "/" + fname)
             content = generate_single_decode_inst.get_cu_file_str(
                 group_size,
                 head_dim,
                 kv_layout,
                 pos_encoding_mode,
-                dtype,
-                dtype,
-            )
-            write_if_different(root / prefix / fname, content)
-
-        for dtype_in in fp8_dtypes:
-            dtype_out = "f16"
-            fname = f"single_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypein_{dtype_in}_dtypeout_{dtype_out}.cu"
-            files.append(prefix + "/" + fname)
-            content = generate_single_decode_inst.get_cu_file_str(
-                group_size,
-                head_dim,
-                kv_layout,
-                pos_encoding_mode,
-                dtype_in,
+                dtype_q,
+                dtype_kv,
                 dtype_out,
             )
             write_if_different(root / prefix / fname, content)
@@ -154,58 +142,33 @@ def get_instantiation_cu() -> List[str]:
         pos_encoding_modes,
     ):
         for idtype in idtypes:
-            for dtype in decode_dtypes:
-                fname = f"batch_paged_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypein_{dtype}_dtypeout_{dtype}_idtype_{idtype}.cu"
+            for dtype_q, dtype_kv in itertools.product(decode_dtypes, decode_dtypes):
+                dtype_out = dtype_q if dtype_q not in fp8_dtypes else "f16"
+                fname = f"batch_paged_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_out}_idtype_{idtype}.cu"
                 files.append(prefix + "/" + fname)
                 content = generate_batch_paged_decode_inst.get_cu_file_str(
                     group_size,
                     head_dim,
                     kv_layout,
                     pos_encoding_mode,
-                    dtype,
-                    dtype,
-                    idtype,
-                )
-                write_if_different(root / prefix / fname, content)
-
-            for dtype_in in fp8_dtypes:
-                dtype_out = "f16"
-                fname = f"batch_paged_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypein_{dtype_in}_dtypeout_{dtype_out}_idtype_{idtype}.cu"
-                files.append(prefix + "/" + fname)
-                content = generate_batch_paged_decode_inst.get_cu_file_str(
-                    group_size,
-                    head_dim,
-                    kv_layout,
-                    pos_encoding_mode,
-                    dtype_in,
+                    dtype_q,
+                    dtype_kv,
                     dtype_out,
                     idtype,
                 )
                 write_if_different(root / prefix / fname, content)
 
-        for dtype in decode_dtypes:
-            fname = f"batch_padded_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypein_{dtype}_dtypeout_{dtype}.cu"
+        for dtype_q, dtype_kv in itertools.product(decode_dtypes, decode_dtypes):
+            dtype_out = dtype_q if dtype_q not in fp8_dtypes else "f16"
+            fname = f"batch_padded_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_out}.cu"
             files.append(prefix + "/" + fname)
             content = generate_batch_padded_decode_inst.get_cu_file_str(
                 group_size,
                 head_dim,
                 kv_layout,
                 pos_encoding_mode,
-                dtype,
-                dtype,
-            )
-            write_if_different(root / prefix / fname, content)
-
-        for dtype_in in fp8_dtypes:
-            dtype_out = "f16"
-            fname = f"batch_padded_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypein_{dtype_in}_dtypeout_{dtype_out}.cu"
-            files.append(prefix + "/" + fname)
-            content = generate_batch_padded_decode_inst.get_cu_file_str(
-                group_size,
-                head_dim,
-                kv_layout,
-                pos_encoding_mode,
-                dtype_in,
+                dtype_q,
+                dtype_kv,
                 dtype_out,
             )
             write_if_different(root / prefix / fname, content)

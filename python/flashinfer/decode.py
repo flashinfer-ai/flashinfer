@@ -540,6 +540,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         page_size: int,
         pos_encoding_mode: str = "NONE",
         data_type: Union[str, torch.dtype] = "float16",
+        q_data_type: Optional[Union[str, torch.dtype]] = None,
     ):
         r"""Create auxiliary data structures for batch decode for multiple forward calls
         within the same decode step.
@@ -566,6 +567,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
         data_type : Union[str, torch.dtype]
             The data type of the paged kv cache
+        q_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the query tensor. If None, will be set to
+            ``data_type``.
 
         Note
         ----
@@ -599,8 +603,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._paged_kv_indices_buf = indices
             self._paged_kv_last_page_len_buf = last_page_len
 
-        # NOTE(Zihao): the following tensor acts as placeholder to pass dtype info
-        empty_data = torch.empty(
+        # NOTE(Zihao): the following tensors acts as placeholder to pass dtype info
+        if not q_data_type:
+            q_data_type = data_type
+        empty_q_data = torch.empty(
+            0,
+            dtype=(
+                getattr(torch, q_data_type) if isinstance(q_data_type, str) else q_data_type
+            ),
+        )
+        empty_kv_data = torch.empty(
             0,
             dtype=(
                 getattr(torch, data_type) if isinstance(data_type, str) else data_type
@@ -616,7 +628,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             head_dim,
             page_size,
             PosEncodingMode[pos_encoding_mode].value,
-            empty_data,
+            empty_q_data,
+            empty_kv_data,
         )
 
     def end_forward(self):

@@ -29,15 +29,16 @@ def get_cu_file_str(
     head_dim,
     kv_layout,
     pos_encoding_mode,
-    dtype_in,
+    dtype_q,
+    dtype_kv,
     dtype_out,
 ):
     content = """#include <flashinfer/attention_impl.cuh>
 
 namespace flashinfer {{
 
-template cudaError_t BatchDecodeWithPaddedKVCacheDispatched<{group_size}, {head_dim}, {kv_layout}, {pos_encoding_mode}, {dtype_in}, {dtype_out}>(
-    {dtype_in}* q, {dtype_in}* k, {dtype_in}* v,
+template cudaError_t BatchDecodeWithPaddedKVCacheDispatched<{group_size}, {head_dim}, {kv_layout}, {pos_encoding_mode}, {dtype_q}, {dtype_kv}, {dtype_out}>(
+    {dtype_q}* q, {dtype_kv}* k, {dtype_kv}* v,
     {dtype_out}* o, {dtype_out}* tmp, float* lse,
     uint32_t batch_size, uint32_t padded_kv_len, uint32_t num_qo_heads,
     float sm_scale, float rope_scale,
@@ -49,7 +50,8 @@ template cudaError_t BatchDecodeWithPaddedKVCacheDispatched<{group_size}, {head_
         group_size=group_size,
         head_dim=head_dim,
         pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
-        dtype_in=dtype_literal[dtype_in],
+        dtype_q=dtype_literal[dtype_q],
+        dtype_kv=dtype_literal[dtype_kv],
         dtype_out=dtype_literal[dtype_out],
     )
     return content
@@ -58,7 +60,7 @@ template cudaError_t BatchDecodeWithPaddedKVCacheDispatched<{group_size}, {head_
 if __name__ == "__main__":
     pattern = (
         r"batch_padded_decode_group_([0-9]+)_head_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
-        r"dtypein_([a-z0-9]+)_dtypeout_([a-z0-9]+)\.cu"
+        r"dtypeq_([a-z0-9]+)_dtypekv_([a-z0-9]+)_dtypeout_([a-z0-9]+)\.cu"
     )
 
     compiled_pattern = re.compile(pattern)

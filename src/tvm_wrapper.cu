@@ -424,7 +424,7 @@ void _FlashInferAttentionDecodeWithPagedKVCacheBeginForward(
   batch_decode_handlers[handler_idx].SetCUDAStream(static_cast<cudaStream_t>(copy_stream));
   DISPATCH_TVM_CUDA_IDTYPE(page_table_indptr->dtype, dtype_idx, {
     cudaError_t status =
-        BatchDecodeHandlerBeginForward<page_storage, kv_layout, dtype_in, dtype_in, dtype_idx>(
+        BatchDecodeHandlerBeginForward<page_storage, kv_layout, dtype_in, dtype_in, dtype_in, dtype_idx>(
             batch_decode_handlers + handler_idx, static_cast<void*>(workspace_buffer->data),
             workspace_size_in_bytes,
             static_cast<dtype_idx*>(page_table_indptr->data) +
