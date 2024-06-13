@@ -100,7 +100,7 @@ std::pair<uint32_t, uint32_t> PartitionPagedKVCacheBinarySearchMinNumPagePerBatc
  * \return status Indicates whether CUDA calls are successful
  */
 template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, QKVLayout kv_layout,
-          PosEncodingMode POS_ENCODING_MODE, typename DTypeKV, typename DTypeOut, typename IdType>
+          PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     uint32_t& tmp_size, uint32_t& max_grid_size, uint32_t& max_num_pages_per_batch,
     uint32_t& new_batch_size, uint32_t batch_size, IdType* kv_indptr, const uint32_t num_qo_heads,
@@ -122,7 +122,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
   // return, which is why we just use DTypeKV as it simplifies the API.
   auto partition_kv_kernel = BatchDecodeWithPagedKVCacheKernel<
       /*partition_kv=*/true, POS_ENCODING_MODE, num_stages_smem, tile_size_per_bdx, vec_size, bdx,
-      bdy, bdz, page_storage, kv_layout, DTypeKV, DTypeKV, DTypeOut, IdType>;
+      bdy, bdz, page_storage, kv_layout, DTypeQ, DTypeKV, DTypeOut, IdType>;
   int num_blocks_per_sm = 0;
   int num_sm = 0;
   int dev_id = 0;
@@ -296,7 +296,7 @@ class BatchDecodeHandler {
   bool* GetBlockValidMask() const { return block_valid_mask_; }
 
   template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage, QKVLayout kv_layout,
-            PosEncodingMode POS_ENCODING_MODE, typename DTypeKV, typename DTypeOut, typename IdType>
+            PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV, typename DTypeOut, typename IdType>
   cudaError_t BeginForwardDispatched(void* buffer, size_t workspace_size_in_bytes, IdType* indptr,
                                      IdType* last_page_len, uint32_t batch_size,
                                      uint32_t num_qo_heads, uint32_t page_size) {
@@ -306,7 +306,7 @@ class BatchDecodeHandler {
     auto work_estimation_func =
         BatchDecodeWithPagedKVCacheWorkEstimationDispatched<GROUP_SIZE, HEAD_DIM, page_storage,
                                                             kv_layout, POS_ENCODING_MODE,
-                                                            DTypeKV, DTypeOut, IdType>;
+                                                            DTypeQ, DTypeKV, DTypeOut, IdType>;
     FLASHINFER_CUDA_CALL(work_estimation_func(tmp_size, max_grid_size, max_num_pages_per_batch,
                                               new_batch_size, batch_size, indptr, num_qo_heads,
                                               page_size,

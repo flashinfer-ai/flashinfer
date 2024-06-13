@@ -73,6 +73,7 @@ def test_batch_decode_with_paged_kv_cache(
         page_size,
         "NONE",
         kv_dtype,
+        q_dtype,
     )
     o = wrapper.forward(q, kv_data.to(kv_dtype), pos_encoding_mode=pos_encoding_mode)
 
@@ -182,6 +183,7 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
         page_size,
         "NONE",
         kv_dtype,
+        q_dtype,
     )
     # warmup
     s = torch.cuda.Stream()
@@ -213,6 +215,7 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
             page_size,
             "NONE",
             kv_dtype,
+            q_dtype,
         )
         g.replay()
 
@@ -233,6 +236,7 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
         page_size,
         "NONE",
         kv_dtype,
+        q_dtype,
     )
     g.replay()
 

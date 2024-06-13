@@ -294,8 +294,8 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapper(
   return cudaSuccess;
 }
 
-template <PageStorage page_storage, QKVLayout kv_layout, typename DTypeKV,
-          typename DTypeOut, typename IdType>
+template <PageStorage page_storage, QKVLayout kv_layout, typename DTypeQ,
+          typename DTypeKV, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeHandlerBeginForward(BatchDecodeHandler* handler, void* buffer,
                                            size_t workspace_size_in_bytes, IdType* indptr,
                                            IdType* last_page_len, uint32_t batch_size,
@@ -312,7 +312,7 @@ cudaError_t BatchDecodeHandlerBeginForward(BatchDecodeHandler* handler, void* bu
     DISPATCH_head_dim(head_dim, HEAD_DIM, {
       DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
         return handler->BeginForwardDispatched<GROUP_SIZE, HEAD_DIM, page_storage, kv_layout,
-                                               POS_ENCODING_MODE, DTypeKV, DTypeOut, IdType>(
+                                               POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeOut, IdType>(
             buffer, workspace_size_in_bytes, indptr, last_page_len, batch_size, num_qo_heads,
             page_size);
       });
