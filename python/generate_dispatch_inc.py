@@ -140,7 +140,11 @@ if __name__ == "__main__":
         help="Prefill attention page sizes",
     )
     parser.add_argument(
-        "--logits_post_hooks", type=int, required=True, nargs="+", help="Logit post hooks"
+        "--logits_post_hooks",
+        type=int,
+        required=True,
+        nargs="+",
+        help="Logit post hooks",
     )
     parser.add_argument(
         "--kv_layouts", type=int, required=True, nargs="+", help="KV layouts"
