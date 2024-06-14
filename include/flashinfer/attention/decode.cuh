@@ -218,7 +218,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
                                               float rope_rcp_theta, uint32_t kv_chunk_size) {
   auto block = cg::this_thread_block();
   auto grid = cg::this_grid();
-  sm_scale *= math::log2e;
+  sm_scale *= (logits_post_hook == LogitsPostHook::kNone ? math::log2e : 1.f / 30.f);
 
   constexpr uint32_t head_dim = bdx * vec_size;
   uint32_t kv_head_idx = blockIdx.y;
@@ -370,7 +370,7 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(
     tensor_info_t<kv_layout, bdy, bdx * vec_size> info, float sm_scale, float rope_rcp_scale,
     float rope_rcp_theta) {
   auto block = cg::this_thread_block();
-  sm_scale *= math::log2e;
+  sm_scale *= (logits_post_hook == LogitsPostHook::kNone ? math::log2e : 1.f / 30.f);
 
   constexpr uint32_t head_dim = bdx * vec_size;
   uint32_t kv_head_idx = blockIdx.y;
@@ -530,7 +530,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
     bool* __restrict__ block_valid_mask, float sm_scale, float rope_rcp_scale,
     float rope_rcp_theta) {
   auto block = cg::this_thread_block();
-  sm_scale *= math::log2e;
+  sm_scale *= (logits_post_hook == LogitsPostHook::kNone ? math::log2e : 1.f / 30.f);
 
   constexpr uint32_t head_dim = bdx * vec_size;
   const uint32_t batch_idx = blockIdx.x;

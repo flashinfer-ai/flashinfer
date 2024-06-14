@@ -22,8 +22,9 @@ using namespace flashinfer;
 
 std::vector<torch::Tensor> single_prefill_with_kv_cache(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor tmp, bool causal,
-    unsigned int layout, unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction,
-    float sm_scale, float rope_scale, float rope_theta, bool return_lse) {
+    unsigned int layout, unsigned int pos_encoding_mode, bool logit_cap,
+    bool allow_fp16_qk_reduction, float sm_scale, float rope_scale, float rope_theta,
+    bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(k);
   CHECK_INPUT(v);
@@ -57,34 +58,37 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
   }
 
   const MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
+  const LogitsPostHook logits_post_hook =
+      logit_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
     return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
       return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
         return DISPATCH_mask_mode(mask_mode, MASK_MODE, [&] {
-          return DISPATCH_kv_layout(kv_layout, KV_LAYOUT, [&] {
-            return DISPATCH_allow_fp16_qk_reduction(
-                allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
-                  return DISPATCH_pos_encoding_mode(
-                      PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
-                        cudaError_t status =
-                            SinglePrefillWithKVCacheDispatched<GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
-                                                               POS_ENCODING_MODE,
-                                                               ALLOW_FP16_QK_REDUCTION, MASK_MODE>(
-                                static_cast<c_type*>(q.data_ptr()),
-                                static_cast<c_type*>(k.data_ptr()),
-                                static_cast<c_type*>(v.data_ptr()),
-                                /*custom_mask=*/nullptr, static_cast<c_type*>(o.data_ptr()),
-                                static_cast<float*>(tmp.data_ptr()),
-                                /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                                num_kv_heads, qo_len, kv_len, sm_scale, rope_scale, rope_theta,
-                                torch_current_stream);
-                        TORCH_CHECK(status == cudaSuccess,
-                                    "SinglePrefillWithKVCache kernel launch failed, error: " +
-                                        std::string(cudaGetErrorString(status)));
-                        return true;
-                      });
-                });
+          return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
+            return DISPATCH_kv_layout(kv_layout, KV_LAYOUT, [&] {
+              return DISPATCH_allow_fp16_qk_reduction(
+                  allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
+                    return DISPATCH_pos_encoding_mode(
+                        PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
+                          cudaError_t status = SinglePrefillWithKVCacheDispatched<
+                              GROUP_SIZE, HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT, POS_ENCODING_MODE,
+                              ALLOW_FP16_QK_REDUCTION, MASK_MODE>(
+                              static_cast<c_type*>(q.data_ptr()),
+                              static_cast<c_type*>(k.data_ptr()),
+                              static_cast<c_type*>(v.data_ptr()),
+                              /*custom_mask=*/nullptr, static_cast<c_type*>(o.data_ptr()),
+                              static_cast<float*>(tmp.data_ptr()),
+                              /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
+                              num_kv_heads, qo_len, kv_len, sm_scale, rope_scale, rope_theta,
+                              torch_current_stream);
+                          TORCH_CHECK(status == cudaSuccess,
+                                      "SinglePrefillWithKVCache kernel launch failed, error: " +
+                                          std::string(cudaGetErrorString(status)));
+                          return true;
+                        });
+                  });
+            });
           });
         });
       });
@@ -100,8 +104,9 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
 
 std::vector<torch::Tensor> single_prefill_with_kv_cache_custom_mask(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor custom_mask, torch::Tensor tmp,
-    unsigned int layout, unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction,
-    float sm_scale, float rope_scale, float rope_theta, bool return_lse) {
+    unsigned int layout, unsigned int pos_encoding_mode, bool logit_cap,
+    bool allow_fp16_qk_reduction, float sm_scale, float rope_scale, float rope_theta,
+    bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(k);
   CHECK_INPUT(v);
@@ -137,31 +142,35 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache_custom_mask(
   }
 
   constexpr MaskMode MASK_MODE = MaskMode::kCustom;
+  const LogitsPostHook logits_post_hook =
+      logit_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
     return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
       return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-        return DISPATCH_kv_layout(kv_layout, KV_LAYOUT, [&] {
-          return DISPATCH_allow_fp16_qk_reduction(
-              allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
-                return DISPATCH_pos_encoding_mode(
-                    PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
-                      cudaError_t status = SinglePrefillWithKVCacheDispatched<
-                          GROUP_SIZE, HEAD_DIM, KV_LAYOUT, POS_ENCODING_MODE,
-                          ALLOW_FP16_QK_REDUCTION, MASK_MODE>(
-                          static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
-                          static_cast<c_type*>(v.data_ptr()),
-                          static_cast<float*>(custom_mask.data_ptr()),
-                          static_cast<c_type*>(o.data_ptr()), static_cast<float*>(tmp.data_ptr()),
-                          /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                          num_kv_heads, qo_len, kv_len, sm_scale, rope_scale, rope_theta,
-                          torch_current_stream);
-                      TORCH_CHECK(status == cudaSuccess,
-                                  "SinglePrefillWithKVCache kernel launch failed, error: " +
-                                      std::string(cudaGetErrorString(status)));
-                      return true;
-                    });
-              });
+        return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
+          return DISPATCH_kv_layout(kv_layout, KV_LAYOUT, [&] {
+            return DISPATCH_allow_fp16_qk_reduction(
+                allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
+                  return DISPATCH_pos_encoding_mode(
+                      PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
+                        cudaError_t status = SinglePrefillWithKVCacheDispatched<
+                            GROUP_SIZE, HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT, POS_ENCODING_MODE,
+                            ALLOW_FP16_QK_REDUCTION, MASK_MODE>(
+                            static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
+                            static_cast<c_type*>(v.data_ptr()),
+                            static_cast<float*>(custom_mask.data_ptr()),
+                            static_cast<c_type*>(o.data_ptr()), static_cast<float*>(tmp.data_ptr()),
+                            /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
+                            num_kv_heads, qo_len, kv_len, sm_scale, rope_scale, rope_theta,
+                            torch_current_stream);
+                        TORCH_CHECK(status == cudaSuccess,
+                                    "SinglePrefillWithKVCache kernel launch failed, error: " +
+                                        std::string(cudaGetErrorString(status)));
+                        return true;
+                      });
+                });
+          });
         });
       });
     });

@@ -64,6 +64,7 @@ def get_instantiation_cu() -> List[str]:
     (root / prefix).mkdir(parents=True, exist_ok=True)
 
     group_sizes = os.environ.get("FLASHINFER_GROUP_SIZES", "1,4,6,8").split(",")
+    logits_hooks = os.environ.get("FLASHINFER_LOGITS_POST_HOOKS", "0,1").split(",")
     page_sizes = os.environ.get("FLASHINFER_PAGE_SIZES", "1,16,32").split(",")
     head_dims = os.environ.get("FLASHINFER_HEAD_DIMS", "64,128,256").split(",")
     kv_layouts = os.environ.get("FLASHINFER_KV_LAYOUTS", "0,1").split(",")
@@ -83,6 +84,7 @@ def get_instantiation_cu() -> List[str]:
                 group_sizes=map(int, group_sizes),
                 page_sizes=map(int, page_sizes),
                 head_dims=map(int, head_dims),
+                logits_post_hooks=map(int, logits_hooks),
                 kv_layouts=map(int, kv_layouts),
                 pos_encoding_modes=map(int, pos_encoding_modes),
                 allow_fp16_qk_reductions=map(int, allow_fp16_qk_reduction_options),
@@ -106,21 +108,24 @@ def get_instantiation_cu() -> List[str]:
     for (
         group_size,
         head_dim,
+        logits_hook,
         kv_layout,
         pos_encoding_mode,
     ) in itertools.product(
         group_sizes,
         head_dims,
+        logits_hooks,
         kv_layouts,
         pos_encoding_modes,
     ):
         for dtype_q, dtype_kv in itertools.product(decode_dtypes, decode_dtypes):
             dtype_out = dtype_q if dtype_q not in fp8_dtypes else "f16"
-            fname = f"single_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_out}.cu"
+            fname = f"single_decode_group_{group_size}_head_{head_dim}_logithook_{logits_hook}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_out}.cu"
             files.append(prefix + "/" + fname)
             content = generate_single_decode_inst.get_cu_file_str(
                 group_size,
                 head_dim,
+                logits_hook,
                 kv_layout,
                 pos_encoding_mode,
                 dtype_q,
@@ -133,22 +138,25 @@ def get_instantiation_cu() -> List[str]:
     for (
         group_size,
         head_dim,
+        logits_hook,
         kv_layout,
         pos_encoding_mode,
     ) in itertools.product(
         group_sizes,
         head_dims,
+        logits_hooks,
         kv_layouts,
         pos_encoding_modes,
     ):
         for idtype in idtypes:
             for dtype_q, dtype_kv in itertools.product(decode_dtypes, decode_dtypes):
                 dtype_out = dtype_q if dtype_q not in fp8_dtypes else "f16"
-                fname = f"batch_paged_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_out}_idtype_{idtype}.cu"
+                fname = f"batch_paged_decode_group_{group_size}_head_{head_dim}_logithook_{logits_hook}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_out}_idtype_{idtype}.cu"
                 files.append(prefix + "/" + fname)
                 content = generate_batch_paged_decode_inst.get_cu_file_str(
                     group_size,
                     head_dim,
+                    logits_hook,
                     kv_layout,
                     pos_encoding_mode,
                     dtype_q,
@@ -160,11 +168,12 @@ def get_instantiation_cu() -> List[str]:
 
         for dtype_q, dtype_kv in itertools.product(decode_dtypes, decode_dtypes):
             dtype_out = dtype_q if dtype_q not in fp8_dtypes else "f16"
-            fname = f"batch_padded_decode_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_out}.cu"
+            fname = f"batch_padded_decode_group_{group_size}_head_{head_dim}_logithook_{logits_hook}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_out}.cu"
             files.append(prefix + "/" + fname)
             content = generate_batch_padded_decode_inst.get_cu_file_str(
                 group_size,
                 head_dim,
+                logits_hook,
                 kv_layout,
                 pos_encoding_mode,
                 dtype_q,
@@ -177,6 +186,7 @@ def get_instantiation_cu() -> List[str]:
     for (
         group_size,
         head_dim,
+        logits_hook,
         kv_layout,
         pos_encoding_mode,
         allow_fp16_qk_reduction,
@@ -184,17 +194,19 @@ def get_instantiation_cu() -> List[str]:
     ) in itertools.product(
         group_sizes,
         head_dims,
+        logits_hooks,
         kv_layouts,
         pos_encoding_modes,
         allow_fp16_qk_reduction_options,
         mask_modes,
     ):
         for dtype in prefill_dtypes:
-            fname = f"single_prefill_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_mask_{mask_mode}_dtypein_{dtype}_dtypeout_{dtype}.cu"
+            fname = f"single_prefill_group_{group_size}_head_{head_dim}_logithook_{logits_hook}_layout_{kv_layout}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_mask_{mask_mode}_dtypein_{dtype}_dtypeout_{dtype}.cu"
             files.append(prefix + "/" + fname)
             content = generate_single_prefill_inst.get_cu_file_str(
                 group_size,
                 head_dim,
+                logits_hook,
                 kv_layout,
                 pos_encoding_mode,
                 allow_fp16_qk_reduction,
@@ -209,6 +221,7 @@ def get_instantiation_cu() -> List[str]:
         group_size,
         page_size,
         head_dim,
+        logits_hook,
         kv_layout,
         pos_encoding_mode,
         allow_fp16_qk_reduction,
@@ -218,6 +231,7 @@ def get_instantiation_cu() -> List[str]:
         group_sizes,
         page_sizes,
         head_dims,
+        logits_hooks,
         kv_layouts,
         pos_encoding_modes,
         allow_fp16_qk_reduction_options,
@@ -225,12 +239,13 @@ def get_instantiation_cu() -> List[str]:
         idtypes,
     ):
         for dtype in prefill_dtypes:
-            fname = f"batch_paged_prefill_group_{group_size}_page_{page_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_mask_{mask_mode}_dtypein_{dtype}_dtypeout_{dtype}_idtype_{idtype}.cu"
+            fname = f"batch_paged_prefill_group_{group_size}_page_{page_size}_head_{head_dim}_logithook_{logits_hook}_layout_{kv_layout}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_mask_{mask_mode}_dtypein_{dtype}_dtypeout_{dtype}_idtype_{idtype}.cu"
             files.append(prefix + "/" + fname)
             content = generate_batch_paged_prefill_inst.get_cu_file_str(
                 group_size,
                 page_size,
                 head_dim,
+                logits_hook,
                 kv_layout,
                 pos_encoding_mode,
                 allow_fp16_qk_reduction,
@@ -245,6 +260,7 @@ def get_instantiation_cu() -> List[str]:
     for (
         group_size,
         head_dim,
+        logits_hook,
         kv_layout,
         pos_encoding_mode,
         allow_fp16_qk_reduction,
@@ -253,6 +269,7 @@ def get_instantiation_cu() -> List[str]:
     ) in itertools.product(
         group_sizes,
         head_dims,
+        logits_hooks,
         kv_layouts,
         pos_encoding_modes,
         allow_fp16_qk_reduction_options,
@@ -260,11 +277,12 @@ def get_instantiation_cu() -> List[str]:
         idtypes,
     ):
         for dtype in prefill_dtypes:
-            fname = f"batch_ragged_prefill_group_{group_size}_head_{head_dim}_layout_{kv_layout}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_mask_{mask_mode}_dtypein_{dtype}_dtypeout_{dtype}_idtype_{idtype}.cu"
+            fname = f"batch_ragged_prefill_group_{group_size}_head_{head_dim}_logithook_{logits_hook}_layout_{kv_layout}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_mask_{mask_mode}_dtypein_{dtype}_dtypeout_{dtype}_idtype_{idtype}.cu"
             files.append(prefix + "/" + fname)
             content = generate_batch_ragged_prefill_inst.get_cu_file_str(
                 group_size,
                 head_dim,
+                logits_hook,
                 kv_layout,
                 pos_encoding_mode,
                 allow_fp16_qk_reduction,

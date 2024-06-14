@@ -937,7 +937,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
     float sm_scale, const float log2_rope_rcp_scale, const float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
-  sm_scale *= math::log2e;
+  sm_scale *= (logits_post_hook == LogitsPostHook::kNone ? math::log2e : 1.f / 30.f);
   const uint32_t qo_len = qkv_info.qo_len;
   const uint32_t kv_len = qkv_info.kv_len;
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
@@ -1154,7 +1154,7 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
     float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
-  sm_scale *= math::log2e;
+  sm_scale *= (logits_post_hook == LogitsPostHook::kNone ? math::log2e : 1.f / 30.f);
   constexpr uint32_t head_dim = num_frags_y * 16;
 
   auto block = cg::this_thread_block();
@@ -1372,7 +1372,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
   constexpr uint32_t aligned_group_size = 16 / rows_per_warp;
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
-  sm_scale *= math::log2e;
+  sm_scale *= (logits_post_hook == LogitsPostHook::kNone ? math::log2e : 1.f / 30.f);
   auto block = cg::this_thread_block();
 
   const uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y, kv_head_idx = blockIdx.z;

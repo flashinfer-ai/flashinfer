@@ -54,8 +54,8 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
     torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor paged_kv_data,
     torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
     torch::Tensor paged_kv_last_page_len, bool causal, unsigned int pos_encoding_mode,
-    bool allow_fp16_qk_reduction, float sm_scale, float rope_scale, float rope_theta,
-    bool return_lse) {
+    bool logit_cap, bool allow_fp16_qk_reduction, float sm_scale, float rope_scale,
+    float rope_theta, bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(qo_indptr);
   CHECK_INPUT(paged_kv_data);
@@ -101,42 +101,46 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
     lse = torch::empty({nnz_qo, num_qo_heads}, q.options()).to(torch::kFloat32);
   }
   MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
+  const LogitsPostHook logits_post_hook =
+      logit_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
-    return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
-      paged_kv_t<PageStorage::kIndices, KV_LAYOUT, c_type, int32_t> paged_kv(
-          num_kv_heads, page_size, head_dim, batch_size,
-          static_cast<c_type*>(paged_kv_data.data_ptr()),
-          static_cast<int32_t*>(paged_kv_indices.data_ptr()),
-          static_cast<int32_t*>(paged_kv_indptr.data_ptr()),
-          static_cast<int32_t*>(paged_kv_last_page_len.data_ptr()));
-      return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
-        return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-          return DISPATCH_mask_mode(mask_mode, MASK_MODE, [&] {
-            return DISPATCH_allow_fp16_qk_reduction(
-                allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
-                  return DISPATCH_pos_encoding_mode(
-                      PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
-                        return DISPATCH_page_size(page_size, PAGE_SIZE, [&] {
-                          cudaError_t status = BatchPrefillWithPagedKVCacheWrapperDispatched<
-                              PageStorage::kIndices, KV_LAYOUT, PAGE_SIZE, GROUP_SIZE, HEAD_DIM,
-                              POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION, MASK_MODE, c_type, c_type,
-                              int32_t>(
-                              handler_.get(), static_cast<c_type*>(q.data_ptr()),
-                              static_cast<int32_t*>(qo_indptr.data_ptr()),
-                              /*q_offset=*/nullptr, paged_kv,
-                              /*custom_mask=*/nullptr,
-                              /*qk_indptr=*/nullptr, static_cast<c_type*>(o.data_ptr()),
-                              /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                              sm_scale, rope_scale, rope_theta,
-                              /*stream=*/torch_current_stream);
-                          TORCH_CHECK(status == cudaSuccess,
-                                      "BatchPrefillWithPagedKVCache failed with error code ",
-                                      cudaGetErrorString(status));
-                          return true;
+    return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
+      return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
+        paged_kv_t<PageStorage::kIndices, KV_LAYOUT, c_type, int32_t> paged_kv(
+            num_kv_heads, page_size, head_dim, batch_size,
+            static_cast<c_type*>(paged_kv_data.data_ptr()),
+            static_cast<int32_t*>(paged_kv_indices.data_ptr()),
+            static_cast<int32_t*>(paged_kv_indptr.data_ptr()),
+            static_cast<int32_t*>(paged_kv_last_page_len.data_ptr()));
+        return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
+          return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
+            return DISPATCH_mask_mode(mask_mode, MASK_MODE, [&] {
+              return DISPATCH_allow_fp16_qk_reduction(
+                  allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
+                    return DISPATCH_pos_encoding_mode(
+                        PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
+                          return DISPATCH_page_size(page_size, PAGE_SIZE, [&] {
+                            cudaError_t status = BatchPrefillWithPagedKVCacheWrapperDispatched<
+                                PageStorage::kIndices, PAGE_SIZE, GROUP_SIZE, HEAD_DIM,
+                                LOGITS_POST_HOOK, KV_LAYOUT, POS_ENCODING_MODE,
+                                ALLOW_FP16_QK_REDUCTION, MASK_MODE, c_type, c_type, int32_t>(
+                                handler_.get(), static_cast<c_type*>(q.data_ptr()),
+                                static_cast<int32_t*>(qo_indptr.data_ptr()),
+                                /*q_offset=*/nullptr, paged_kv,
+                                /*custom_mask=*/nullptr,
+                                /*qk_indptr=*/nullptr, static_cast<c_type*>(o.data_ptr()),
+                                /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
+                                sm_scale, rope_scale, rope_theta,
+                                /*stream=*/torch_current_stream);
+                            TORCH_CHECK(status == cudaSuccess,
+                                        "BatchPrefillWithPagedKVCache failed with error code ",
+                                        cudaGetErrorString(status));
+                            return true;
+                          });
                         });
-                      });
-                });
+                  });
+            });
           });
         });
       });
@@ -154,8 +158,8 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCu
     torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor paged_kv_data,
     torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
     torch::Tensor paged_kv_last_page_len, torch::Tensor custom_mask, torch::Tensor qk_indptr,
-    unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction, float sm_scale, float rope_scale,
-    float rope_theta, bool return_lse) {
+    unsigned int pos_encoding_mode, bool logit_cap, bool allow_fp16_qk_reduction, float sm_scale,
+    float rope_scale, float rope_theta, bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(qo_indptr);
   CHECK_INPUT(paged_kv_data);
@@ -208,42 +212,46 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCu
     lse = torch::empty({nnz_qo, num_qo_heads}, q.options()).to(torch::kFloat32);
   }
   constexpr MaskMode MASK_MODE = MaskMode::kCustom;
+  const LogitsPostHook logits_post_hook =
+      logit_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
-    return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
-      paged_kv_t<PageStorage::kIndices, KV_LAYOUT, c_type, int32_t> paged_kv(
-          num_kv_heads, page_size, head_dim, batch_size,
-          static_cast<c_type*>(paged_kv_data.data_ptr()),
-          static_cast<int32_t*>(paged_kv_indices.data_ptr()),
-          static_cast<int32_t*>(paged_kv_indptr.data_ptr()),
-          static_cast<int32_t*>(paged_kv_last_page_len.data_ptr()));
-      return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
-        return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-          return DISPATCH_allow_fp16_qk_reduction(
-              allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
-                return DISPATCH_pos_encoding_mode(
-                    PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
-                      return DISPATCH_page_size(page_size, PAGE_SIZE, [&] {
-                        cudaError_t status = BatchPrefillWithPagedKVCacheWrapperDispatched<
-                            PageStorage::kIndices, KV_LAYOUT, PAGE_SIZE, GROUP_SIZE, HEAD_DIM,
-                            POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION, MASK_MODE, c_type, c_type,
-                            int32_t>(
-                            handler_.get(), static_cast<c_type*>(q.data_ptr()),
-                            static_cast<int32_t*>(qo_indptr.data_ptr()),
-                            /*q_offset=*/nullptr, paged_kv,
-                            static_cast<float*>(custom_mask.data_ptr()),
-                            static_cast<int32_t*>(qk_indptr.data_ptr()),
-                            static_cast<c_type*>(o.data_ptr()),
-                            /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                            sm_scale, rope_scale, rope_theta,
-                            /*stream=*/torch_current_stream);
-                        TORCH_CHECK(status == cudaSuccess,
-                                    "BatchPrefillWithPagedKVCache failed with error code ",
-                                    cudaGetErrorString(status));
-                        return true;
+    return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
+      return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
+        paged_kv_t<PageStorage::kIndices, KV_LAYOUT, c_type, int32_t> paged_kv(
+            num_kv_heads, page_size, head_dim, batch_size,
+            static_cast<c_type*>(paged_kv_data.data_ptr()),
+            static_cast<int32_t*>(paged_kv_indices.data_ptr()),
+            static_cast<int32_t*>(paged_kv_indptr.data_ptr()),
+            static_cast<int32_t*>(paged_kv_last_page_len.data_ptr()));
+        return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
+          return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
+            return DISPATCH_allow_fp16_qk_reduction(
+                allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
+                  return DISPATCH_pos_encoding_mode(
+                      PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
+                        return DISPATCH_page_size(page_size, PAGE_SIZE, [&] {
+                          cudaError_t status = BatchPrefillWithPagedKVCacheWrapperDispatched<
+                              PageStorage::kIndices, PAGE_SIZE, GROUP_SIZE, HEAD_DIM,
+                              LOGITS_POST_HOOK, KV_LAYOUT, POS_ENCODING_MODE,
+                              ALLOW_FP16_QK_REDUCTION, MASK_MODE, c_type, c_type, int32_t>(
+                              handler_.get(), static_cast<c_type*>(q.data_ptr()),
+                              static_cast<int32_t*>(qo_indptr.data_ptr()),
+                              /*q_offset=*/nullptr, paged_kv,
+                              static_cast<float*>(custom_mask.data_ptr()),
+                              static_cast<int32_t*>(qk_indptr.data_ptr()),
+                              static_cast<c_type*>(o.data_ptr()),
+                              /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
+                              sm_scale, rope_scale, rope_theta,
+                              /*stream=*/torch_current_stream);
+                          TORCH_CHECK(status == cudaSuccess,
+                                      "BatchPrefillWithPagedKVCache failed with error code ",
+                                      cudaGetErrorString(status));
+                          return true;
+                        });
                       });
-                    });
-              });
+                });
+          });
         });
       });
     });
@@ -288,7 +296,7 @@ void BatchPrefillWithRaggedKVCachePyTorchWrapper::UpdatePageLockedBufferSize(
 
 std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
     torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor k, torch::Tensor v,
-    torch::Tensor kv_indptr, bool causal, unsigned int pos_encoding_mode,
+    torch::Tensor kv_indptr, bool causal, unsigned int pos_encoding_mode, bool logit_cap,
     bool allow_fp16_qk_reduction, float sm_scale, float rope_scale, float rope_theta,
     bool return_lse) {
   CHECK_INPUT(q);
@@ -325,6 +333,8 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
   }
 
   MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
+  const LogitsPostHook logits_post_hook =
+      logit_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
     return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
@@ -334,24 +344,27 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
               allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
                 return DISPATCH_pos_encoding_mode(
                     PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
-                      return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
-                        cudaError_t status = BatchPrefillWithRaggedKVCacheWrapperDispatched<
-                            GROUP_SIZE, HEAD_DIM, KV_LAYOUT, POS_ENCODING_MODE,
-                            ALLOW_FP16_QK_REDUCTION, MASK_MODE, c_type, c_type, int32_t>(
-                            handler_.get(), static_cast<c_type*>(q.data_ptr()),
-                            static_cast<int32_t*>(qo_indptr.data_ptr()),
-                            static_cast<c_type*>(k.data_ptr()), static_cast<c_type*>(v.data_ptr()),
-                            static_cast<int32_t*>(kv_indptr.data_ptr()),
-                            /*custom_mask=*/nullptr, /*qk_indptr=*/nullptr,
-                            /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr,
-                            static_cast<c_type*>(o.data_ptr()),
-                            /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                            batch_size, num_kv_heads, sm_scale, rope_scale, rope_theta,
-                            /*stream=*/torch_current_stream);
-                        TORCH_CHECK(status == cudaSuccess,
-                                    "BatchPrefillWithRaggedKVCache failed with error ",
-                                    cudaGetErrorString(status));
-                        return true;
+                      return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
+                        return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
+                          cudaError_t status = BatchPrefillWithRaggedKVCacheWrapperDispatched<
+                              GROUP_SIZE, HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT, POS_ENCODING_MODE,
+                              ALLOW_FP16_QK_REDUCTION, MASK_MODE, c_type, c_type, int32_t>(
+                              handler_.get(), static_cast<c_type*>(q.data_ptr()),
+                              static_cast<int32_t*>(qo_indptr.data_ptr()),
+                              static_cast<c_type*>(k.data_ptr()),
+                              static_cast<c_type*>(v.data_ptr()),
+                              static_cast<int32_t*>(kv_indptr.data_ptr()),
+                              /*custom_mask=*/nullptr, /*qk_indptr=*/nullptr,
+                              /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr,
+                              static_cast<c_type*>(o.data_ptr()),
+                              /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
+                              batch_size, num_kv_heads, sm_scale, rope_scale, rope_theta,
+                              /*stream=*/torch_current_stream);
+                          TORCH_CHECK(status == cudaSuccess,
+                                      "BatchPrefillWithRaggedKVCache failed with error ",
+                                      cudaGetErrorString(status));
+                          return true;
+                        });
                       });
                     });
               });
@@ -370,8 +383,8 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
 std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardCustomMask(
     torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor k, torch::Tensor v,
     torch::Tensor kv_indptr, torch::Tensor custom_mask, torch::Tensor qk_indptr,
-    unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction, float sm_scale, float rope_scale,
-    float rope_theta, bool return_lse) {
+    unsigned int pos_encoding_mode, bool logit_cap, bool allow_fp16_qk_reduction, float sm_scale,
+    float rope_scale, float rope_theta, bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(qo_indptr);
   CHECK_INPUT(k);
@@ -413,6 +426,9 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardC
   }
 
   constexpr MaskMode MASK_MODE = MaskMode::kCustom;
+  const LogitsPostHook logits_post_hook =
+      logit_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
+
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
     return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
       return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
@@ -420,25 +436,27 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardC
             allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
               return DISPATCH_pos_encoding_mode(
                   PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
-                    return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
-                      cudaError_t status = BatchPrefillWithRaggedKVCacheWrapperDispatched<
-                          GROUP_SIZE, HEAD_DIM, KV_LAYOUT, POS_ENCODING_MODE,
-                          ALLOW_FP16_QK_REDUCTION, MASK_MODE, c_type, c_type, int32_t>(
-                          handler_.get(), static_cast<c_type*>(q.data_ptr()),
-                          static_cast<int32_t*>(qo_indptr.data_ptr()),
-                          static_cast<c_type*>(k.data_ptr()), static_cast<c_type*>(v.data_ptr()),
-                          static_cast<int32_t*>(kv_indptr.data_ptr()),
-                          static_cast<float*>(custom_mask.data_ptr()),
-                          static_cast<int32_t*>(qk_indptr.data_ptr()),
-                          /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr,
-                          static_cast<c_type*>(o.data_ptr()),
-                          /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                          batch_size, num_kv_heads, sm_scale, rope_scale, rope_theta,
-                          /*stream=*/torch_current_stream);
-                      TORCH_CHECK(status == cudaSuccess,
-                                  "BatchPrefillWithRaggedKVCache failed with error ",
-                                  cudaGetErrorString(status));
-                      return true;
+                    return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
+                      return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
+                        cudaError_t status = BatchPrefillWithRaggedKVCacheWrapperDispatched<
+                            GROUP_SIZE, HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT, POS_ENCODING_MODE,
+                            ALLOW_FP16_QK_REDUCTION, MASK_MODE, c_type, c_type, int32_t>(
+                            handler_.get(), static_cast<c_type*>(q.data_ptr()),
+                            static_cast<int32_t*>(qo_indptr.data_ptr()),
+                            static_cast<c_type*>(k.data_ptr()), static_cast<c_type*>(v.data_ptr()),
+                            static_cast<int32_t*>(kv_indptr.data_ptr()),
+                            static_cast<float*>(custom_mask.data_ptr()),
+                            static_cast<int32_t*>(qk_indptr.data_ptr()),
+                            /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr,
+                            static_cast<c_type*>(o.data_ptr()),
+                            /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
+                            batch_size, num_kv_heads, sm_scale, rope_scale, rope_theta,
+                            /*stream=*/torch_current_stream);
+                        TORCH_CHECK(status == cudaSuccess,
+                                    "BatchPrefillWithRaggedKVCache failed with error ",
+                                    cudaGetErrorString(status));
+                        return true;
+                      });
                     });
                   });
             });

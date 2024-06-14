@@ -30,18 +30,34 @@ enum class LogitsPostHook {
  * \ref
  * https://github.com/xai-org/grok-1/blob/7050ed204b8206bb8645c7b7bbef7252f79561b0/model.py#L864-L865
  */
-__forceinline__ __device__ float logits_cap_30(float x) { return 30.f * math::tanh(x / 30.f); }
+__forceinline__ __device__ float logits_cap_30(float x) {
+  return (30 * math::log2e) * math::tanh(x);
+}
 
-template <LogitsPostHook mode>
-__forceinline__ __device__ float apply_logits_post_hook(float x);
+__forceinline__ __device__ half2 logits_cap_30(half2 x) {
+  return __hmul2(__float2half2_rn(30 * math::log2e), math::tanh(x));
+}
+
+template <LogitsPostHook mode, typename T>
+__forceinline__ __device__ T apply_logits_post_hook(T x);
 
 template <>
-__forceinline__ __device__ float apply_logits_post_hook<LogitsPostHook::kNone>(float x) {
+__forceinline__ __device__ float apply_logits_post_hook<LogitsPostHook::kNone, float>(float x) {
   return x;
 }
 
 template <>
-__forceinline__ __device__ float apply_logits_post_hook<LogitsPostHook::kCap30>(float x) {
+__forceinline__ __device__ float apply_logits_post_hook<LogitsPostHook::kCap30, float>(float x) {
+  return logits_cap_30(x);
+}
+
+template <>
+__forceinline__ __device__ half2 apply_logits_post_hook<LogitsPostHook::kNone, half2>(half2 x) {
+  return x;
+}
+
+template <>
+__forceinline__ __device__ half2 apply_logits_post_hook<LogitsPostHook::kCap30, half2>(half2 x) {
   return logits_cap_30(x);
 }
 
