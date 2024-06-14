@@ -294,10 +294,11 @@ void _TestTwoLevelSinglePrefixCascadeDecodeCorrectness(size_t batch_size,
       batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, PosEncodingMode::kNone);
 
   // Compute result using baseline implementation
-  cudaError_t status = BatchDecodeWithPagedKVCacheWrapper<page_storage, kv_layout, T, T, int32_t>(
-      &baseline_handler, thrust::raw_pointer_cast(q_d.data()),
-      /*q_offset=*/nullptr, paged_kv_baseline_d, thrust::raw_pointer_cast(o_baseline_d.data()),
-      /*lse=*/nullptr, num_qo_heads, PosEncodingMode::kNone);
+  cudaError_t status =
+      BatchDecodeWithPagedKVCacheWrapper<page_storage, kv_layout, T, T, T, int32_t>(
+          &baseline_handler, thrust::raw_pointer_cast(q_d.data()),
+          /*q_offset=*/nullptr, paged_kv_baseline_d, thrust::raw_pointer_cast(o_baseline_d.data()),
+          /*lse=*/nullptr, num_qo_heads, PosEncodingMode::kNone);
 
   EXPECT_EQ(status, cudaSuccess) << "Baseline implementation failed with error: "
                                  << cudaGetErrorString(status);
@@ -314,7 +315,7 @@ void _TestTwoLevelSinglePrefixCascadeDecodeCorrectness(size_t batch_size,
   EXPECT_EQ(status, cudaSuccess) << "Cascade implementation prefill failed with error: "
                                  << cudaGetErrorString(status);
 
-  status = BatchDecodeWithPagedKVCacheWrapper<page_storage, kv_layout, T, T, int32_t>(
+  status = BatchDecodeWithPagedKVCacheWrapper<page_storage, kv_layout, T, T, T, int32_t>(
       &cascade_handler, thrust::raw_pointer_cast(q_d.data()),
       /*q_offset=*/nullptr, paged_kv_casacde_d, thrust::raw_pointer_cast(o_cascade_1_d.data()),
       /*lse=*/thrust::raw_pointer_cast(lse_cascade_1_d.data()), num_qo_heads,

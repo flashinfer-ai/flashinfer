@@ -20,6 +20,11 @@ mask_mode_literal = {
     2: "MaskMode::kCustom",
 }
 
+logits_hook_literal = {
+    0: "LogitsPostHook::kNone",
+    1: "LogitsPostHook::kCap30",
+}
+
 kv_layout_literal = {
     0: "QKVLayout::kNHD",
     1: "QKVLayout::kHND",

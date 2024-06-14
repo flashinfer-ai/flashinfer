@@ -21,6 +21,7 @@ from literal_map import (
     pos_encoding_mode_literal,
     bool_literal,
     mask_mode_literal,
+    logits_hook_literal,
 )
 
 
@@ -56,6 +57,19 @@ def get_dispatch_inc_str(args: argparse.Namespace) -> str:
     )
     dispatch_page_sizes_str = f"""#define _DISPATCH_CASES_page_size(case_var, ...)         \\
 {dispatch_page_sizes_entries}
+// EOL
+"""
+    # logits post hooks
+    dispatch_logits_post_hooks_entries = "\n".join(
+        [
+            "  _DISPATCH_CASE({}, case_var, __VA_ARGS__) \\".format(
+                logits_hook_literal[_]
+            )
+            for _ in args.logits_post_hooks
+        ]
+    )
+    dispatch_logits_post_hooks_str = f"""#define _DISPATCH_CASES_logits_post_hook(case_var, ...)         \\
+{dispatch_logits_post_hooks_entries}
 // EOL
 """
     # kv layouts
@@ -114,6 +128,7 @@ def get_dispatch_inc_str(args: argparse.Namespace) -> str:
             dispatch_head_dims_str,
             dispatch_group_sizes_str,
             dispatch_page_sizes_str,
+            dispatch_logits_post_hooks_str,
             dispatch_kv_layouts_str,
             dispatch_pos_encoding_modes_str,
             dispatch_allow_fp16_qk_reductions_str,
@@ -139,6 +154,13 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--group_sizes", type=int, required=True, nargs="+", help="Group sizes"
+    )
+    parser.add_argument(
+        "--logits_post_hooks",
+        type=int,
+        required=True,
+        nargs="+",
+        help="Logit post hooks",
     )
     parser.add_argument(
         "--kv_layouts", type=int, required=True, nargs="+", help="KV layouts"

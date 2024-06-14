@@ -22,6 +22,7 @@ from literal_map import (
     pos_encoding_mode_literal,
     dtype_literal,
     idtype_literal,
+    logits_hook_literal,
 )
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from pathlib import Path
 def get_cu_file_str(
     group_size,
     head_dim,
+    logits_hook,
     kv_layout,
     pos_encoding_mode,
     allow_fp16_qk_reduction,
@@ -40,7 +42,7 @@ def get_cu_file_str(
     num_frags_x_choices = [1, 2]
     insts = "\n".join(
         [
-            """template cudaError_t BatchPrefillWithRaggedKVCacheDispatched<{num_frags_x}, {group_size}, {head_dim}, {kv_layout}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {dtype_in}, {dtype_out}, {idtype}>(
+            """template cudaError_t BatchPrefillWithRaggedKVCacheDispatched<{num_frags_x}, {group_size}, {head_dim}, {logits_hook}, {kv_layout}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {dtype_in}, {dtype_out}, {idtype}>(
     {dtype_in}* q, {idtype}* request_indices, {idtype}* tile_indices, {idtype}* qo_indptr,
     {dtype_in}* k, {dtype_in}* v, {idtype}* kv_indptr,
     float* custom_mask, {idtype}* qk_indptr,
@@ -51,6 +53,7 @@ def get_cu_file_str(
     float rope_theta, cudaStream_t stream);
         """.format(
                 num_frags_x=num_frags_x,
+                logits_hook=logits_hook_literal[int(logits_hook)],
                 kv_layout=kv_layout_literal[int(kv_layout)],
                 group_size=group_size,
                 head_dim=head_dim,
@@ -78,7 +81,7 @@ namespace flashinfer {{
 
 if __name__ == "__main__":
     pattern = (
-        r"batch_ragged_prefill_group_([0-9]+)_head_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
+        r"batch_ragged_prefill_group_([0-9]+)_head_([0-9]+)_logitshook_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
         r"fp16qkred_([a-z]+)_mask_([0-9]+)_dtypein_([a-z0-9]+)_dtypeout_([a-z0-9]+)_idtype_([a-z0-9]+)\.cu"
     )
     compiled_pattern = re.compile(pattern)

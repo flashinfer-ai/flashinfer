@@ -18,6 +18,8 @@
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+
+#include <type_traits>
 #ifdef FLASHINFER_ENABLE_FP8
 #include <cuda_fp8.h>
 #endif
@@ -35,6 +37,7 @@
 #include "../pos_enc.cuh"
 #include "../utils.cuh"
 #include "cascade.cuh"
+#include "logits_post_hook.cuh"
 #include "mask.cuh"
 
 namespace flashinfer {
@@ -476,8 +479,8 @@ __device__ __forceinline__ void k_smem_inplace_apply_rotary(const uint32_t kv_id
   }
 }
 
-template <uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z, typename DTypeIn,
-          typename DTypeQKAccum>
+template <LogitsPostHook logits_post_hook, uint32_t num_frags_x, uint32_t num_frags_y,
+          uint32_t num_frags_z, typename DTypeIn, typename DTypeQKAccum>
 __device__ __forceinline__ void compute_qk(smem_t* q_smem, uint32_t* q_smem_offset_r,
                                            smem_t* k_smem, uint32_t* k_smem_offset_r,
                                            DTypeQKAccum (*s_frag)[num_frags_z][8]) {
@@ -525,6 +528,32 @@ __device__ __forceinline__ void compute_qk(smem_t* q_smem, uint32_t* q_smem_offs
   }
   *q_smem_offset_r -= num_frags_y * 2;
   *k_smem_offset_r -= num_frags_y * 2;
+
+  if constexpr (std::is_same<DTypeQKAccum, float>::value) {
+#pragma unroll
+    for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+      for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
+#pragma unroll
+        for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+          s_frag[fx][fz][reg_id] = apply_logits_post_hook<logits_post_hook>(s_frag[fx][fz][reg_id]);
+        }
+      }
+    }
+  } else {
+    static_assert(std::is_same<DTypeQKAccum, half>::value);
+#pragma unroll
+    for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+      for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
+#pragma unroll
+        for (uint32_t reg_id = 0; reg_id < 4; ++reg_id) {
+          *(half2*)(&s_frag[fx][fz][reg_id * 2]) =
+              apply_logits_post_hook<logits_post_hook>(*(half2*)(&s_frag[fx][fz][reg_id * 2]));
+        }
+      }
+    }
+  }
 }
 
 template <uint32_t group_size, uint32_t num_frags_x, uint32_t num_frags_z, typename T>
@@ -897,10 +926,10 @@ __device__ __forceinline__ void write_o_reg_gmem(float (*o_frag)[num_frags_y][8]
  * \param log2_rope_rcp_theta log2(1/(rope_theta)), where rope_theta is the theta
  *   used in RoPE.
  */
-template <bool partition_kv, uint32_t group_size, MaskMode mask_mode, QKVLayout kv_layout,
-          PosEncodingMode pos_encoding_mode, uint32_t num_frags_x, uint32_t num_frags_y,
-          uint32_t num_frags_z, uint32_t num_warps, typename DTypeIn, typename DTypeQKAccum,
-          typename DTypeOut>
+template <LogitsPostHook logits_post_hook, bool partition_kv, uint32_t group_size,
+          MaskMode mask_mode, QKVLayout kv_layout, PosEncodingMode pos_encoding_mode,
+          uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps,
+          typename DTypeIn, typename DTypeQKAccum, typename DTypeOut>
 __global__ void SinglePrefillWithKVCacheKernel(
     DTypeIn* __restrict__ q, DTypeIn* __restrict__ k, DTypeIn* __restrict__ v,
     float* __restrict__ custom_mask, DTypeOut* __restrict__ o, void* __restrict__ tmp,
@@ -908,7 +937,7 @@ __global__ void SinglePrefillWithKVCacheKernel(
     float sm_scale, const float log2_rope_rcp_scale, const float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
-  sm_scale *= math::log2e;
+  sm_scale *= (logits_post_hook == LogitsPostHook::kNone ? math::log2e : 1.f / 30.f);
   const uint32_t qo_len = qkv_info.qo_len;
   const uint32_t kv_len = qkv_info.kv_len;
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
@@ -1033,8 +1062,8 @@ __global__ void SinglePrefillWithKVCacheKernel(
     }
 
     // compute attention score
-    compute_qk<num_frags_x, num_frags_y, num_frags_z, DTypeIn>(&qo_smem, &q_smem_offset_r, &k_smem,
-                                                               &k_smem_offset_r, s_frag);
+    compute_qk<logits_post_hook, num_frags_x, num_frags_y, num_frags_z, DTypeIn>(
+        &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
 
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
       apply_alibi_bias<group_size, num_frags_x, num_frags_z>(
@@ -1111,10 +1140,10 @@ __global__ void SinglePrefillWithKVCacheKernel(
   }
 }
 
-template <uint32_t group_size, MaskMode mask_mode, QKVLayout kv_layout,
-          PosEncodingMode pos_encoding_mode, uint32_t num_frags_x, uint32_t num_frags_y,
-          uint32_t num_frags_z, uint32_t num_warps, typename DTypeIn, typename DTypeQKAccum,
-          typename DTypeOut, typename IdType>
+template <LogitsPostHook logits_post_hook, uint32_t group_size, MaskMode mask_mode,
+          QKVLayout kv_layout, PosEncodingMode pos_encoding_mode, uint32_t num_frags_x,
+          uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps, typename DTypeIn,
+          typename DTypeQKAccum, typename DTypeOut, typename IdType>
 __global__ void BatchPrefillWithRaggedKVCacheKernel(
     DTypeIn* __restrict__ q, IdType* __restrict__ request_indices,
     IdType* __restrict__ tile_indices, IdType* __restrict__ qo_indptr, DTypeIn* __restrict__ k,
@@ -1125,7 +1154,7 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
     float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
-  sm_scale *= math::log2e;
+  sm_scale *= (logits_post_hook == LogitsPostHook::kNone ? math::log2e : 1.f / 30.f);
   constexpr uint32_t head_dim = num_frags_y * 16;
 
   auto block = cg::this_thread_block();
@@ -1259,8 +1288,8 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
     }
 
     // compute attention score
-    compute_qk<num_frags_x, num_frags_y, num_frags_z, DTypeIn>(&qo_smem, &q_smem_offset_r, &k_smem,
-                                                               &k_smem_offset_r, s_frag);
+    compute_qk<logits_post_hook, num_frags_x, num_frags_y, num_frags_z, DTypeIn>(
+        &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
 
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
       // TODO(Zihao): handle the case that q_offset is specified
@@ -1328,10 +1357,11 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
   }
 }
 
-template <uint32_t group_size, uint32_t page_size, MaskMode mask_mode,
-          PosEncodingMode pos_encoding_mode, uint32_t num_frags_x, uint32_t num_frags_y,
-          uint32_t num_frags_z, uint32_t num_warps, PageStorage page_storage, QKVLayout kv_layout,
-          typename DTypeIn, typename DTypeQKAccum, typename DTypeOut, typename IdType>
+template <LogitsPostHook logits_post_hook, uint32_t group_size, uint32_t page_size,
+          MaskMode mask_mode, PosEncodingMode pos_encoding_mode, uint32_t num_frags_x,
+          uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps, PageStorage page_storage,
+          QKVLayout kv_layout, typename DTypeIn, typename DTypeQKAccum, typename DTypeOut,
+          typename IdType>
 __global__ void BatchPrefillWithPagedKVCacheKernel(
     IdType* __restrict__ request_indices, IdType* __restrict__ tile_indices,
     DTypeIn* __restrict__ q, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
@@ -1342,7 +1372,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
   constexpr uint32_t aligned_group_size = 16 / rows_per_warp;
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
-  sm_scale *= math::log2e;
+  sm_scale *= (logits_post_hook == LogitsPostHook::kNone ? math::log2e : 1.f / 30.f);
   auto block = cg::this_thread_block();
 
   const uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y, kv_head_idx = blockIdx.z;
@@ -1471,8 +1501,8 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
     }
 
     // compute attention score
-    compute_qk<num_frags_x, num_frags_y, num_frags_z, DTypeIn>(&qo_smem, &q_smem_offset_r, &k_smem,
-                                                               &k_smem_offset_r, s_frag);
+    compute_qk<logits_post_hook, num_frags_x, num_frags_y, num_frags_z, DTypeIn>(
+        &qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
 
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
       // TODO(Zihao): handle the case that q_offset is specified
@@ -1687,9 +1717,9 @@ cudaError_t SinglePrefillWithKVCacheWorkEstimation(
   return cudaSuccess;
 }
 
-template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
-          PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE,
-          typename DTypeIn, typename DTypeOut>
+template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK,
+          QKVLayout KV_LAYOUT, PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION,
+          MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut>
 cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v,
                                                float* custom_mask, DTypeOut* o, float* tmp,
                                                float* lse, uint32_t num_kv_heads, uint32_t qo_len,
@@ -1745,9 +1775,10 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
         constexpr uint32_t num_threads = num_warps * warp_size;
         constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
         auto partition_kv_kernel =
-            SinglePrefillWithKVCacheKernel</*partition_kv=*/true, GROUP_SIZE, MASK_MODE, KV_LAYOUT,
-                                           pos_encoding_mode, num_frags_x, num_frags_y, num_frags_z,
-                                           num_warps, DTypeIn, DTypeQKAccum, DTypeOut>;
+            SinglePrefillWithKVCacheKernel<LOGITS_POST_HOOK, /*partition_kv=*/true, GROUP_SIZE,
+                                           MASK_MODE, KV_LAYOUT, pos_encoding_mode, num_frags_x,
+                                           num_frags_y, num_frags_z, num_warps, DTypeIn,
+                                           DTypeQKAccum, DTypeOut>;
         tensor_info_t<KV_LAYOUT, GROUP_SIZE, HEAD_DIM> qkv_info(qo_len, kv_len, num_kv_heads);
         uint32_t smem_size =
             (num_frags_x * num_warps + num_frags_z * 2) * 16 * HEAD_DIM * sizeof(DTypeIn);
@@ -1772,9 +1803,11 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
 
         if (num_chunks <= 1 || tmp == nullptr) {
           // Enough parallelism, do not split-kv
-          auto kernel = SinglePrefillWithKVCacheKernel<
-              /*partition_kv=*/false, GROUP_SIZE, MASK_MODE, KV_LAYOUT, pos_encoding_mode,
-              num_frags_x, num_frags_y, num_frags_z, num_warps, DTypeIn, DTypeQKAccum, DTypeOut>;
+          auto kernel =
+              SinglePrefillWithKVCacheKernel<LOGITS_POST_HOOK, /*partition_kv=*/false, GROUP_SIZE,
+                                             MASK_MODE, KV_LAYOUT, pos_encoding_mode, num_frags_x,
+                                             num_frags_y, num_frags_z, num_warps, DTypeIn,
+                                             DTypeQKAccum, DTypeOut>;
           void* args[] = {(void*)&q,
                           (void*)&k,
                           (void*)&v,
@@ -1821,9 +1854,10 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
   return cudaSuccess;
 }
 
-template <uint32_t num_frags_x, uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
-          PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE,
-          typename DTypeIn, typename DTypeOut, typename IdType>
+template <uint32_t num_frags_x, uint32_t GROUP_SIZE, uint32_t HEAD_DIM,
+          LogitsPostHook LOGITS_POST_HOOK, QKVLayout KV_LAYOUT, PosEncodingMode pos_encoding_mode,
+          bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut,
+          typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, DTypeIn* k,
     DTypeIn* v, IdType* kv_indptr, float* custom_mask, IdType* qk_indptr, IdType* q_offset,
@@ -1869,10 +1903,9 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
                  " and report the issue to the developers.";
       throw std::invalid_argument(err_msg.str());
     } else {
-      auto kernel =
-          BatchPrefillWithRaggedKVCacheKernel<GROUP_SIZE, MASK_MODE, KV_LAYOUT, pos_encoding_mode,
-                                              num_frags_x, num_frags_y, num_frags_z, num_warps,
-                                              DTypeIn, DTypeQKAccum, DTypeOut, IdType>;
+      auto kernel = BatchPrefillWithRaggedKVCacheKernel<
+          LOGITS_POST_HOOK, GROUP_SIZE, MASK_MODE, KV_LAYOUT, pos_encoding_mode, num_frags_x,
+          num_frags_y, num_frags_z, num_warps, DTypeIn, DTypeQKAccum, DTypeOut, IdType>;
       uint32_t smem_size =
           (num_frags_x * num_warps + num_frags_z * 2) * 16 * HEAD_DIM * sizeof(DTypeIn);
       FLASHINFER_CUDA_CALL(
@@ -1901,10 +1934,10 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
   return cudaSuccess;
 }
 
-template <PageStorage page_storage, QKVLayout kv_layout, uint32_t num_frags_x, uint32_t PAGE_SIZE,
-          uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PosEncodingMode pos_encoding_mode,
-          bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut,
-          typename IdType>
+template <PageStorage page_storage, uint32_t num_frags_x, uint32_t PAGE_SIZE, uint32_t GROUP_SIZE,
+          uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK, QKVLayout kv_layout,
+          PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE,
+          typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, IdType* q_offset,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, float* custom_mask,
@@ -1952,9 +1985,11 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
                  " and report the issue to the developers.";
       throw std::invalid_argument(err_msg.str());
     } else {
-      auto kernel = BatchPrefillWithPagedKVCacheKernel<
-          GROUP_SIZE, PAGE_SIZE, MASK_MODE, pos_encoding_mode, num_frags_x, num_frags_y,
-          num_frags_z, num_warps, page_storage, kv_layout, DTypeIn, DTypeQKAccum, DTypeOut, IdType>;
+      auto kernel =
+          BatchPrefillWithPagedKVCacheKernel<LOGITS_POST_HOOK, GROUP_SIZE, PAGE_SIZE, MASK_MODE,
+                                             pos_encoding_mode, num_frags_x, num_frags_y,
+                                             num_frags_z, num_warps, page_storage, kv_layout,
+                                             DTypeIn, DTypeQKAccum, DTypeOut, IdType>;
       uint32_t smem_size =
           (num_frags_x * num_warps + num_frags_z * 2) * 16 * HEAD_DIM * sizeof(DTypeIn);
       FLASHINFER_CUDA_CALL(

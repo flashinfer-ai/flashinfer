@@ -16,18 +16,30 @@ limitations under the License.
 
 import sys
 import re
-from literal_map import kv_layout_literal, pos_encoding_mode_literal, dtype_literal
+from literal_map import (
+    kv_layout_literal,
+    pos_encoding_mode_literal,
+    dtype_literal,
+    logits_hook_literal,
+)
 from pathlib import Path
 
 
 def get_cu_file_str(
-    group_size, head_dim, kv_layout, pos_encoding_mode, dtype_q, dtype_kv, dtype_out
+    group_size,
+    head_dim,
+    logits_hook,
+    kv_layout,
+    pos_encoding_mode,
+    dtype_q,
+    dtype_kv,
+    dtype_out,
 ):
     content = """#include <flashinfer/attention_impl.cuh>
 
 namespace flashinfer {{
 
-template cudaError_t SingleDecodeWithKVCacheDispatched<{group_size}, {head_dim}, {kv_layout}, {pos_encoding_mode}, {dtype_q}, {dtype_kv}, {dtype_out}>(
+template cudaError_t SingleDecodeWithKVCacheDispatched<{group_size}, {head_dim}, {logits_hook}, {kv_layout}, {pos_encoding_mode}, {dtype_q}, {dtype_kv}, {dtype_out}>(
     {dtype_q}* q, {dtype_kv}* k, {dtype_kv}* v, {dtype_out}* o,
     {dtype_out}* tmp, uint32_t num_kv_heads, uint32_t seq_len,
     float sm_scale, float rope_scale,
@@ -35,6 +47,7 @@ template cudaError_t SingleDecodeWithKVCacheDispatched<{group_size}, {head_dim},
 
 }}
     """.format(
+        logits_hook=logits_hook_literal[int(logits_hook)],
         kv_layout=kv_layout_literal[int(kv_layout)],
         group_size=group_size,
         head_dim=head_dim,
@@ -48,7 +61,7 @@ template cudaError_t SingleDecodeWithKVCacheDispatched<{group_size}, {head_dim},
 
 if __name__ == "__main__":
     pattern = (
-        r"single_decode_group_([0-9]+)_head_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
+        r"single_decode_group_([0-9]+)_head_([0-9]+)_logitshook_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
         r"dtypeq_([a-z0-9]+)_dtypekv_([a-z0-9]+)_dtypeout_([a-z0-9]+)\.cu"
     )
 
