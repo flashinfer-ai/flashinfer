@@ -77,7 +77,8 @@ class BatchDecodeWithPagedKVCachePyTorchWrapper {
   void BeginForward(torch::Tensor workspace_buffer, torch::Tensor indptr,
                     torch::Tensor last_page_len, unsigned int batch_size, unsigned int num_qo_heads,
                     unsigned int num_kv_heads, unsigned int head_dim, unsigned int page_size,
-                    unsigned int pos_encoding_mode, torch::Tensor empty_q_data, torch::Tensor empty_kv_data);
+                    unsigned int pos_encoding_mode, torch::Tensor empty_q_data,
+                    torch::Tensor empty_kv_data);
   void EndForward();
   void UpdatePageLockedBufferSize(uint32_t max_workspace_size_in_bytes);
   bool IsCUDAGraphEnabled() const { return handler_->IsCUDAGraphEnabled(); }

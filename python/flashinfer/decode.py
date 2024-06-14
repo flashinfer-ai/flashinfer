@@ -609,7 +609,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         empty_q_data = torch.empty(
             0,
             dtype=(
-                getattr(torch, q_data_type) if isinstance(q_data_type, str) else q_data_type
+                getattr(torch, q_data_type)
+                if isinstance(q_data_type, str)
+                else q_data_type
             ),
         )
         empty_kv_data = torch.empty(

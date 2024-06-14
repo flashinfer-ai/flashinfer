@@ -26,7 +26,14 @@ from pathlib import Path
 
 
 def get_cu_file_str(
-    group_size, head_dim, logit_hook, kv_layout, pos_encoding_mode, dtype_q, dtype_kv, dtype_out
+    group_size,
+    head_dim,
+    logit_hook,
+    kv_layout,
+    pos_encoding_mode,
+    dtype_q,
+    dtype_kv,
+    dtype_out,
 ):
     content = """#include <flashinfer/attention_impl.cuh>
 

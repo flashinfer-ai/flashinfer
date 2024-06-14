@@ -84,8 +84,8 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapperDispatched(
   }
 
   return BatchDecodeWithPagedKVCacheDispatched<GROUP_SIZE, HEAD_DIM, PAGE_STORAGE, LOGITS_POST_HOOK,
-                                               KV_LAYOUT, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeOut,
-                                               IdType>(
+                                               KV_LAYOUT, POS_ENCODING_MODE, DTypeQ, DTypeKV,
+                                               DTypeOut, IdType>(
       q, q_offset, new_paged_kv, kv_partition_info, o, tmp_v, tmp_s, lse,
       handler->GetBlockValidMask(), handler->GetPaddedBatchSize(), sm_scale, rope_scale, rope_theta,
       stream);

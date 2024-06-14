@@ -33,7 +33,7 @@ namespace flashinfer {
 template <LogitsPostHook logits_post_hook, bool partition_kv, PosEncodingMode pos_encoding_mode,
           uint32_t num_stages_smem, uint32_t tile_size_per_bdx, uint32_t vec_size, uint32_t bdx,
           uint32_t bdy, uint32_t bdz, PageStorage page_storage, QKVLayout kv_layout,
-          typename DTypeQ, typename DTypeKV,, typename DTypeOut, typename IdType>
+          typename DTypeQ, typename DTypeKV, , typename DTypeOut, typename IdType>
 __global__ void BatchDecodeWithPagedKVCacheKernel(
     DTypeQ* __restrict__ q, IdType* __restrict__ q_offset,
     paged_kv_t<page_storage, kv_layout, DTypeKV, IdType> paged_kv,
@@ -307,8 +307,8 @@ class BatchDecodeHandler {
     uint32_t num_kv_heads = num_qo_heads / GROUP_SIZE;
     uint32_t tmp_size, max_grid_size, max_num_pages_per_batch, new_batch_size;
     auto work_estimation_func = BatchDecodeWithPagedKVCacheWorkEstimationDispatched<
-        GROUP_SIZE, HEAD_DIM, page_storage, LOGITS_POST_HOOK, kv_layout, POS_ENCODING_MODE, DTypeQ, DTypeKV,
-        DTypeOut, IdType>;
+        GROUP_SIZE, HEAD_DIM, page_storage, LOGITS_POST_HOOK, kv_layout, POS_ENCODING_MODE, DTypeQ,
+        DTypeKV, DTypeOut, IdType>;
     FLASHINFER_CUDA_CALL(work_estimation_func(tmp_size, max_grid_size, max_num_pages_per_batch,
                                               new_batch_size, batch_size, indptr, num_qo_heads,
                                               page_size,

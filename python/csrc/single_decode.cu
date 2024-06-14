@@ -61,7 +61,8 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
                         SingleDecodeWithKVCacheDispatched<GROUP_SIZE, HEAD_DIM, KV_LAYOUT,
                                                           POS_ENCODING_MODE>(
                             static_cast<q_type*>(q.data_ptr()), static_cast<kv_type*>(k.data_ptr()),
-                            static_cast<kv_type*>(v.data_ptr()), static_cast<nv_half*>(o.data_ptr()),
+                            static_cast<kv_type*>(v.data_ptr()),
+                            static_cast<nv_half*>(o.data_ptr()),
                             static_cast<nv_half*>(tmp.data_ptr()), num_kv_heads, kv_len, sm_scale,
                             rope_scale, rope_theta, torch_current_stream);
                     TORCH_CHECK(status == cudaSuccess,
