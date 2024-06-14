@@ -786,7 +786,7 @@ cudaError_t SingleDecodeWithKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v,
     constexpr uint32_t num_threads =
         std::max(get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeKV)), bdx * bdy);
     constexpr uint32_t bdz = num_threads / (bdx * bdy);
-    tensor_info_t<KV_LAYOUT, HEAD_DIM> info(1, seq_len, num_kv_heads);
+    tensor_info_t<KV_LAYOUT, HEAD_DIM> info(1, seq_len, num_qo_heads, num_kv_heads);
     constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 8U) : 1U;
     const uint32_t smem_size =
         2U * num_stages_smem * bdy * tile_size_per_bdx * bdz * HEAD_DIM * sizeof(DTypeKV) +
@@ -989,7 +989,7 @@ cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeK
                                                      DTypeQ, DTypeKV, DTypeOut>;
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    tensor_info_t<KV_LAYOUT, HEAD_DIM> info(1, padded_kv_len, num_kv_heads);
+    tensor_info_t<KV_LAYOUT, HEAD_DIM> info(1, padded_kv_len, num_qo_heads, num_kv_heads);
     void* args[] = {(void*)&q,
                     (void*)&k,
                     (void*)&v,
