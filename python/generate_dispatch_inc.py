@@ -21,7 +21,7 @@ from literal_map import (
     pos_encoding_mode_literal,
     bool_literal,
     mask_mode_literal,
-    logits_hook_literal,
+    logit_hook_literal,
 )
 
 
@@ -35,17 +35,6 @@ def get_dispatch_inc_str(args: argparse.Namespace) -> str:
     )
     dispatch_head_dims_str = f"""#define _DISPATCH_CASES_head_dim(case_var, ...)         \\
 {dispatch_head_dims_entries}
-// EOL
-"""
-    # group sizes
-    dispatch_group_sizes_entries = "\n".join(
-        [
-            "  _DISPATCH_CASE({}, case_var, __VA_ARGS__) \\".format(_)
-            for _ in args.group_sizes
-        ]
-    )
-    dispatch_group_sizes_str = f"""#define _DISPATCH_CASES_group_size(case_var, ...)         \\
-{dispatch_group_sizes_entries}
 // EOL
 """
     # page sizes
@@ -63,7 +52,7 @@ def get_dispatch_inc_str(args: argparse.Namespace) -> str:
     dispatch_logits_post_hooks_entries = "\n".join(
         [
             "  _DISPATCH_CASE({}, case_var, __VA_ARGS__) \\".format(
-                logits_hook_literal[_]
+                logit_hook_literal[_]
             )
             for _ in args.logits_post_hooks
         ]
@@ -126,9 +115,7 @@ def get_dispatch_inc_str(args: argparse.Namespace) -> str:
     return "\n".join(
         [
             dispatch_head_dims_str,
-            dispatch_group_sizes_str,
             dispatch_page_sizes_str,
-            dispatch_logits_post_hooks_str,
             dispatch_kv_layouts_str,
             dispatch_pos_encoding_modes_str,
             dispatch_allow_fp16_qk_reductions_str,
@@ -153,14 +140,7 @@ if __name__ == "__main__":
         help="Prefill attention page sizes",
     )
     parser.add_argument(
-        "--group_sizes", type=int, required=True, nargs="+", help="Group sizes"
-    )
-    parser.add_argument(
-        "--logits_post_hooks",
-        type=int,
-        required=True,
-        nargs="+",
-        help="Logit post hooks",
+        "--logits_post_hooks", type=int, required=True, nargs="+", help="Logit post hooks"
     )
     parser.add_argument(
         "--kv_layouts", type=int, required=True, nargs="+", help="KV layouts"
