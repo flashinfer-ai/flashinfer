@@ -75,21 +75,21 @@ inline std::vector<float> apply_llama_rope(const T* input, size_t D, size_t offs
 template <typename dtype_in, typename dtype_out>
 std::vector<dtype_out> single_mha(const std::vector<dtype_in>& q, const std::vector<dtype_in>& k,
                                   const std::vector<dtype_in>& v, size_t qo_len, size_t kv_len,
-                                  size_t num_q_heads, size_t num_kv_heads, size_t head_dim,
+                                  size_t num_qo_heads, size_t num_kv_heads, size_t head_dim,
                                   bool causal = true, QKVLayout kv_layout = QKVLayout::kHND,
                                   PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
                                   float rope_scale = 1.f, float rope_theta = 1e4) {
   assert(qo_len <= kv_len);
   assert(num_q_heads % num_kv_heads == 0);
   float sm_scale = 1.f / std::sqrt(float(head_dim));
-  std::vector<dtype_out> o(qo_len * num_q_heads * head_dim);
+  std::vector<dtype_out> o(qo_len * num_qo_heads * head_dim);
   std::vector<float> att(kv_len);
   std::vector<float> q_rotary_local(head_dim);
   std::vector<float> k_rotary_local(head_dim);
   DISPATCH_kv_layout(kv_layout, KV_LAYOUT, {
     DISPATCH_head_dim(head_dim, HEAD_DIM, {
       tensor_info_t<KV_LAYOUT, HEAD_DIM> info(qo_len, kv_len, num_qo_heads, num_kv_heads);
-      for (size_t qo_head_idx = 0; qo_head_idx < info.get_num_qo_heads(); ++qo_head_idx) {
+      for (size_t qo_head_idx = 0; qo_head_idx < num_qo_heads; ++qo_head_idx) {
         const size_t kv_head_idx = qo_head_idx / info.get_group_size();
         for (size_t q_idx = 0; q_idx < qo_len; ++q_idx) {
           float max_val = -5e4;
