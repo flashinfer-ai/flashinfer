@@ -86,8 +86,8 @@ def single_decode_with_kv_cache(
         ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
         Defaults to ``NONE``.
     logits_cap : bool
-        Whether to apply logits cap to attention scores.
-        If ``True``, the attention scores will be capped according to formula (proposed in
+        Whether to apply logits cap to pre-attention logits.
+        If ``True``, the logits will be capped according to formula (proposed in
         Grok-1): :math:`30 \times \mathrm{tanh}(x / 30)`, where :math:`x` is the input logits.
         Defaults to ``False``.
     q_scale : Optional[float]
@@ -199,8 +199,8 @@ def batch_decode_with_padded_kv_cache(
         ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
         Defaults to ``NONE``.
     logits_cap : bool
-        Whether to apply logits cap to attention scores.
-        If ``True``, the attention scores will be capped according to formula (proposed in
+        Whether to apply logits cap to pre-attention logits.
+        If ``True``, the logits will be capped according to formula (proposed in
         Grok-1): :math:`30 \times \mathrm{tanh}(x / 30)`, where :math:`x` is the input logits.
         Defaults to ``False``.
     q_scale : Optional[float]
@@ -312,8 +312,8 @@ def batch_decode_with_padded_kv_cache_return_lse(
         ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
         Defaults to ``NONE``.
     logits_cap : bool
-        Whether to apply logits cap to attention scores.
-        If ``True``, the attention scores will be capped according to formula (proposed in
+        Whether to apply logits cap to pre-attention logits.
+        If ``True``, the logits will be capped according to formula (proposed in
         Grok-1): :math:`30 \times \mathrm{tanh}(x / 30)`, where :math:`x` is the input logits.
         Defaults to ``False``.
     q_scale : Optional[float]
@@ -592,8 +592,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
             Defaults to ``NONE``.
         logits_cap: bool
-            Whether to apply logits cap to attention scores.
-            If ``True``, the attention scores will be capped according to formula (proposed in
+            Whether to apply logits cap to pre-attention logits.
+            If ``True``, the logits will be capped according to formula (proposed in
             Grok-1): :math:`30 \times \mathrm{tanh}(x / 30)`, where :math:`x` is the input logits.
             Defaults to ``False``.
         data_type : Union[str, torch.dtype]
@@ -704,8 +704,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
             Defaults to ``NONE``.
         logits_cap: bool
-            Whether to apply logits cap to attention scores.
-            If ``True``, the attention scores will be capped according to formula (proposed in
+            Whether to apply logits cap to pre-attention logits.
+            If ``True``, the logits will be capped according to formula (proposed in
             Grok-1): :math:`30 \times \mathrm{tanh}(x / 30)`, where :math:`x` is the input logits.
             Defaults to ``False``.
         q_scale : Optional[float]
@@ -789,8 +789,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
             Defaults to ``NONE``.
         logits_cap: bool
-            Whether to apply logits cap to attention scores.
-            If ``True``, the attention scores will be capped according to formula (proposed in
+            Whether to apply logits cap to pre-attention logits.
+            If ``True``, the logits will be capped according to formula (proposed in
             Grok-1): :math:`30 \times \mathrm{tanh}(x / 30)`, where :math:`x` is the input logits.
             Defaults to ``False``.
         q_scale : Optional[float]
