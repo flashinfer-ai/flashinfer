@@ -23,7 +23,7 @@ from literal_map import (
     pos_encoding_mode_literal,
     dtype_literal,
     idtype_literal,
-    logit_hook_literal,
+    logits_hook_literal,
 )
 from pathlib import Path
 
@@ -32,7 +32,7 @@ def get_cu_file_str(
     group_size,
     page_size,
     head_dim,
-    logit_hook,
+    logits_hook,
     kv_layout,
     pos_encoding_mode,
     allow_fp16_qk_reduction,
@@ -44,7 +44,7 @@ def get_cu_file_str(
     num_frags_x_choices = [1, 2]
     insts = "\n".join(
         [
-            """template cudaError_t BatchPrefillWithPagedKVCacheDispatched<page_storage, {num_frags_x}, {page_size}, {group_size}, {head_dim}, {logit_hook}, {kv_layout}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {dtype_in}, {dtype_out}, {idtype}>(
+            """template cudaError_t BatchPrefillWithPagedKVCacheDispatched<page_storage, {num_frags_x}, {page_size}, {group_size}, {head_dim}, {logits_hook}, {kv_layout}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {dtype_in}, {dtype_out}, {idtype}>(
     {dtype_in}* q, {idtype}* request_indices, {idtype}* tile_indices,
     {idtype}* qo_indptr, {idtype}* q_offset,
     paged_kv_t<page_storage, {kv_layout}, {dtype_in}, {idtype}> paged_kv,
@@ -54,7 +54,7 @@ def get_cu_file_str(
     float sm_scale, float rope_scale,
     float rope_theta, cudaStream_t stream);
     """.format(
-                logit_hook=logit_hook_literal[int(logit_hook)],
+                logits_hook=logits_hook_literal[int(logits_hook)],
                 kv_layout=kv_layout_literal[int(kv_layout)],
                 num_frags_x=num_frags_x,
                 page_size=page_size,
@@ -85,7 +85,7 @@ constexpr PageStorage page_storage = PageStorage::kIndices;
 
 if __name__ == "__main__":
     pattern = (
-        r"batch_paged_prefill_group_([0-9]+)_page_([0-9]+)_head_([0-9]+)_logithook_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
+        r"batch_paged_prefill_group_([0-9]+)_page_([0-9]+)_head_([0-9]+)_logitshook_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
         r"fp16qkred_([a-z]+)_mask_([0-9]+)_dtypein_([a-z0-9]+)_dtypeout_([a-z0-9]+)_idtype_([a-z0-9]+)\.cu"
     )
     compiled_pattern = re.compile(pattern)

@@ -54,7 +54,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
     torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor paged_kv_data,
     torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
     torch::Tensor paged_kv_last_page_len, bool causal, unsigned int pos_encoding_mode,
-    bool logit_cap, bool allow_fp16_qk_reduction, float sm_scale, float rope_scale,
+    bool logits_cap, bool allow_fp16_qk_reduction, float sm_scale, float rope_scale,
     float rope_theta, bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(qo_indptr);
@@ -102,7 +102,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
   }
   MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
   const LogitsPostHook logits_post_hook =
-      logit_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
+      logits_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
     return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
@@ -158,7 +158,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCu
     torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor paged_kv_data,
     torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
     torch::Tensor paged_kv_last_page_len, torch::Tensor custom_mask, torch::Tensor qk_indptr,
-    unsigned int pos_encoding_mode, bool logit_cap, bool allow_fp16_qk_reduction, float sm_scale,
+    unsigned int pos_encoding_mode, bool logits_cap, bool allow_fp16_qk_reduction, float sm_scale,
     float rope_scale, float rope_theta, bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(qo_indptr);
@@ -213,7 +213,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCu
   }
   constexpr MaskMode MASK_MODE = MaskMode::kCustom;
   const LogitsPostHook logits_post_hook =
-      logit_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
+      logits_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
     return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
@@ -296,7 +296,7 @@ void BatchPrefillWithRaggedKVCachePyTorchWrapper::UpdatePageLockedBufferSize(
 
 std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
     torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor k, torch::Tensor v,
-    torch::Tensor kv_indptr, bool causal, unsigned int pos_encoding_mode, bool logit_cap,
+    torch::Tensor kv_indptr, bool causal, unsigned int pos_encoding_mode, bool logits_cap,
     bool allow_fp16_qk_reduction, float sm_scale, float rope_scale, float rope_theta,
     bool return_lse) {
   CHECK_INPUT(q);
@@ -334,7 +334,7 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
 
   MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
   const LogitsPostHook logits_post_hook =
-      logit_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
+      logits_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
     return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {
@@ -383,7 +383,7 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
 std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardCustomMask(
     torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor k, torch::Tensor v,
     torch::Tensor kv_indptr, torch::Tensor custom_mask, torch::Tensor qk_indptr,
-    unsigned int pos_encoding_mode, bool logit_cap, bool allow_fp16_qk_reduction, float sm_scale,
+    unsigned int pos_encoding_mode, bool logits_cap, bool allow_fp16_qk_reduction, float sm_scale,
     float rope_scale, float rope_theta, bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(qo_indptr);
@@ -427,7 +427,7 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardC
 
   constexpr MaskMode MASK_MODE = MaskMode::kCustom;
   const LogitsPostHook logits_post_hook =
-      logit_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
+      logits_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
     return DISPATCH_group_size(num_qo_heads / num_kv_heads, GROUP_SIZE, [&] {

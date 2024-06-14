@@ -43,7 +43,7 @@ def test_single_decode_logits_cap(
     k = torch.randn(seq_len, num_heads, head_dim).to(0).half()
     v = torch.randn(seq_len, num_heads, head_dim).to(0).half()
 
-    o = flashinfer.single_decode_with_kv_cache(q, k, v, logit_cap=True)
+    o = flashinfer.single_decode_with_kv_cache(q, k, v, logits_cap=True)
     o_ref = attention_logits_cap_torch(q.unsqueeze(0), k, v).squeeze(0)
     numpy.testing.assert_allclose(
         o.cpu().numpy(), o_ref.cpu().numpy(), rtol=1e-3, atol=1e-3
@@ -64,7 +64,7 @@ def test_single_prefill_logits_cap(
     k = torch.randn(kv_len, num_heads, head_dim).to(0).half()
     v = torch.randn(kv_len, num_heads, head_dim).to(0).half()
 
-    o = flashinfer.single_prefill_with_kv_cache(q, k, v, logit_cap=True)
+    o = flashinfer.single_prefill_with_kv_cache(q, k, v, logits_cap=True)
     o_ref = attention_logits_cap_torch(q, k, v)
     numpy.testing.assert_allclose(
         o.cpu().numpy(), o_ref.cpu().numpy(), rtol=1e-2, atol=1e-2

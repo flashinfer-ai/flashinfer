@@ -22,7 +22,7 @@ using namespace flashinfer;
 
 torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                                           torch::Tensor tmp, unsigned int pos_encoding_mode,
-                                          bool logit_cap, unsigned int layout, float sm_scale,
+                                          bool logits_cap, unsigned int layout, float sm_scale,
                                           float rope_scale, float rope_theta) {
   CHECK_INPUT(q);
   CHECK_INPUT(k);
@@ -50,7 +50,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
       q, q.options().dtype(is_float8_tensor(q) ? torch::kFloat16 : q.scalar_type()));
 
   const LogitsPostHook logits_post_hook =
-      logit_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
+      logits_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
 
   if (is_float8_tensor(q)) {
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(q.scalar_type(), q_type, [&] {

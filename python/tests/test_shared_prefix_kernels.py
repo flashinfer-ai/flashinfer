@@ -227,6 +227,7 @@ def test_batch_prefill_with_shared_prefix_paged_kv_cache(
         num_heads,
         num_heads,
         head_dim,
+        page_size,
     )
 
     o_baseline = baseline_wrapper.forward(q, kv_data, causal=causal)
@@ -242,6 +243,7 @@ def test_batch_prefill_with_shared_prefix_paged_kv_cache(
         num_heads,
         num_heads,
         head_dim,
+        page_size,
     )
 
     o_cascade = cascade_wrapper.forward(q, k_shared, v_shared, kv_data, causal=causal)

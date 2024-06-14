@@ -20,7 +20,7 @@ mask_mode_literal = {
     2: "MaskMode::kCustom",
 }
 
-logit_hook_literal = {
+logits_hook_literal = {
     0: "LogitsPostHook::kNone",
     1: "LogitsPostHook::kCap30",
 }

@@ -57,7 +57,7 @@ def single_decode_with_kv_cache(
     v: torch.Tensor,
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
-    logit_cap: bool = False,
+    logits_cap: bool = False,
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
@@ -85,7 +85,7 @@ def single_decode_with_kv_cache(
         The position encoding applied inside attention kernels, could be
         ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
         Defaults to ``NONE``.
-    logit_cap : bool
+    logits_cap : bool
         Whether to apply logits cap to attention scores.
         If ``True``, the attention scores will be capped according to formula (proposed in
         Grok-1): :math:`30 \times \mathrm{tanh}(x / 30)`, where :math:`x` is the input logits.
@@ -150,7 +150,7 @@ def single_decode_with_kv_cache(
         v,
         tmp,
         PosEncodingMode[pos_encoding_mode].value,
-        logit_cap,
+        logits_cap,
         TensorLayout[kv_layout].value,
         sm_scale,
         rope_scale,
@@ -167,7 +167,7 @@ def batch_decode_with_padded_kv_cache(
     v_padded: torch.Tensor,
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
-    logit_cap: bool = False,
+    logits_cap: bool = False,
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
@@ -198,7 +198,7 @@ def batch_decode_with_padded_kv_cache(
         The position encoding applied inside attention kernels, could be
         ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
         Defaults to ``NONE``.
-    logit_cap : bool
+    logits_cap : bool
         Whether to apply logits cap to attention scores.
         If ``True``, the attention scores will be capped according to formula (proposed in
         Grok-1): :math:`30 \times \mathrm{tanh}(x / 30)`, where :math:`x` is the input logits.
@@ -262,7 +262,7 @@ def batch_decode_with_padded_kv_cache(
         v_padded,
         TensorLayout[kv_layout].value,
         PosEncodingMode[pos_encoding_mode].value,
-        logit_cap,
+        logits_cap,
         sm_scale,
         rope_scale,
         rope_theta,
@@ -279,7 +279,7 @@ def batch_decode_with_padded_kv_cache_return_lse(
     v_padded: torch.Tensor,
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
-    logit_cap: bool = False,
+    logits_cap: bool = False,
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
@@ -311,7 +311,7 @@ def batch_decode_with_padded_kv_cache_return_lse(
         The position encoding applied inside attention kernels, could be
         ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
         Defaults to ``NONE``.
-    logit_cap : bool
+    logits_cap : bool
         Whether to apply logits cap to attention scores.
         If ``True``, the attention scores will be capped according to formula (proposed in
         Grok-1): :math:`30 \times \mathrm{tanh}(x / 30)`, where :math:`x` is the input logits.
@@ -382,7 +382,7 @@ def batch_decode_with_padded_kv_cache_return_lse(
         v_padded,
         TensorLayout[kv_layout].value,
         PosEncodingMode[pos_encoding_mode].value,
-        logit_cap,
+        logits_cap,
         sm_scale,
         rope_scale,
         rope_theta,
@@ -563,7 +563,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         head_dim: int,
         page_size: int,
         pos_encoding_mode: str = "NONE",
-        logit_cap: bool = False,
+        logits_cap: bool = False,
         data_type: Union[str, torch.dtype] = "float16",
         q_data_type: Optional[Union[str, torch.dtype]] = None,
     ):
@@ -591,7 +591,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
             Defaults to ``NONE``.
-        logit_cap: bool
+        logits_cap: bool
             Whether to apply logits cap to attention scores.
             If ``True``, the attention scores will be capped according to formula (proposed in
             Grok-1): :math:`30 \times \mathrm{tanh}(x / 30)`, where :math:`x` is the input logits.
@@ -661,7 +661,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             head_dim,
             page_size,
             PosEncodingMode[pos_encoding_mode].value,
-            logit_cap,
+            logits_cap,
             empty_q_data,
             empty_kv_data,
         )
@@ -679,7 +679,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q: torch.Tensor,
         paged_kv_data: torch.Tensor,
         pos_encoding_mode: str = "NONE",
-        logit_cap: bool = False,
+        logits_cap: bool = False,
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
@@ -703,7 +703,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
             Defaults to ``NONE``.
-        logit_cap: bool
+        logits_cap: bool
             Whether to apply logits cap to attention scores.
             If ``True``, the attention scores will be capped according to formula (proposed in
             Grok-1): :math:`30 \times \mathrm{tanh}(x / 30)`, where :math:`x` is the input logits.
@@ -748,7 +748,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._paged_kv_indices_buf,
             self._paged_kv_last_page_len_buf,
             PosEncodingMode[pos_encoding_mode].value,
-            logit_cap,
+            logits_cap,
             sm_scale,
             rope_scale,
             rope_theta,
@@ -763,7 +763,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q: torch.Tensor,
         paged_kv_data: torch.Tensor,
         pos_encoding_mode: str = "NONE",
-        logit_cap: bool = False,
+        logits_cap: bool = False,
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
@@ -788,7 +788,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
             Defaults to ``NONE``.
-        logit_cap: bool
+        logits_cap: bool
             Whether to apply logits cap to attention scores.
             If ``True``, the attention scores will be capped according to formula (proposed in
             Grok-1): :math:`30 \times \mathrm{tanh}(x / 30)`, where :math:`x` is the input logits.
@@ -839,7 +839,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._paged_kv_indices_buf,
             self._paged_kv_last_page_len_buf,
             PosEncodingMode[pos_encoding_mode].value,
-            logit_cap,
+            logits_cap,
             sm_scale,
             rope_scale,
             rope_theta,

@@ -21,7 +21,7 @@ from literal_map import (
     pos_encoding_mode_literal,
     dtype_literal,
     idtype_literal,
-    logit_hook_literal,
+    logits_hook_literal,
 )
 from pathlib import Path
 
@@ -29,7 +29,7 @@ from pathlib import Path
 def get_cu_file_str(
     group_size,
     head_dim,
-    logit_hook,
+    logits_hook,
     kv_layout,
     pos_encoding_mode,
     dtype_q,
@@ -43,7 +43,7 @@ namespace flashinfer {{
 
 constexpr PageStorage page_storage = PageStorage::kIndices;
 
-template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{group_size}, {head_dim}, page_storage, {logit_hook}, {kv_layout}, {pos_encoding_mode}, {dtype_q}, {dtype_kv}, {dtype_out}, {idtype}>(
+template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{group_size}, {head_dim}, page_storage, {logits_hook}, {kv_layout}, {pos_encoding_mode}, {dtype_q}, {dtype_kv}, {dtype_out}, {idtype}>(
     {dtype_q}* q, {idtype}* q_offset,
     paged_kv_t<page_storage, {kv_layout}, {dtype_kv}, {idtype}> paged_kv,
     kv_partition_info_t<{idtype}> kv_partition_info,
@@ -54,7 +54,7 @@ template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{group_size}, {head_d
 
 }}
     """.format(
-        logit_hook=logit_hook_literal[int(logit_hook)],
+        logits_hook=logits_hook_literal[int(logits_hook)],
         kv_layout=kv_layout_literal[int(kv_layout)],
         group_size=group_size,
         head_dim=head_dim,
@@ -69,7 +69,7 @@ template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{group_size}, {head_d
 
 if __name__ == "__main__":
     pattern = (
-        r"batch_paged_decode_group_([0-9]+)_head_([0-9]+)_logithook_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
+        r"batch_paged_decode_group_([0-9]+)_head_([0-9]+)_logitshook_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
         r"dtypeq_([a-z0-9]+)_dtypekv_([a-z0-9]+)_dtypeout_([a-z0-9]+)_idtype_([a-z0-9]+)\.cu"
     )
 

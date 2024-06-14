@@ -62,7 +62,7 @@ def test_single_prefill_alibi(
     v = torch.randn(kv_len, num_heads, head_dim).to(0).half()
 
     o = flashinfer.single_prefill_with_kv_cache(
-        q, k, v, causal, pos_encoding_mode="ALIBI"
+        q, k, v, causal=causal, pos_encoding_mode="ALIBI"
     )
     mask = torch.ones(q_len, kv_len, dtype=torch.bool).to(0)
     if causal:

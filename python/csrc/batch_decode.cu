@@ -22,7 +22,7 @@ using namespace flashinfer;
 
 std::vector<torch::Tensor> batch_decode_with_padded_kv_cache(
     torch::Tensor q, torch::Tensor k_padded, torch::Tensor v_padded, unsigned int layout,
-    unsigned int pos_encoding_mode, bool logit_cap, float sm_scale, float rope_scale,
+    unsigned int pos_encoding_mode, bool logits_cap, float sm_scale, float rope_scale,
     float rope_theta, bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(k_padded);
@@ -57,7 +57,7 @@ std::vector<torch::Tensor> batch_decode_with_padded_kv_cache(
   }
 
   const LogitsPostHook logits_post_hook =
-      logit_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
+      logits_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
 
   if (is_float8_tensor(q)) {
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(q.scalar_type(), q_type, [&] {
@@ -133,7 +133,7 @@ std::vector<torch::Tensor> batch_decode_with_padded_kv_cache(
 void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
     torch::Tensor workspace_buffer, torch::Tensor indptr, torch::Tensor last_page_len,
     unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads,
-    unsigned int head_dim, unsigned int page_size, unsigned int pos_encoding_mode, bool logit_cap,
+    unsigned int head_dim, unsigned int page_size, unsigned int pos_encoding_mode, bool logits_cap,
     torch::Tensor empty_q_data, torch::Tensor empty_kv_data) {
   // NOTE(zihao): not necessary to be CUDA tensor
   CHECK_CONTIGUOUS(indptr);
@@ -150,7 +150,7 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
   handler_->SetCUDAStream(torch_current_stream);
 
   const LogitsPostHook logits_post_hook =
-      logit_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
+      logits_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
 
   if (is_float8_tensor(empty_q_data)) {
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(empty_q_data.scalar_type(), q_type, [&] {
@@ -221,7 +221,7 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::UpdatePageLockedBufferSize(
 std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
     torch::Tensor q, torch::Tensor paged_kv_data, torch::Tensor paged_kv_indptr,
     torch::Tensor paged_kv_indices, torch::Tensor paged_kv_last_page_len,
-    unsigned int pos_encoding_mode, bool logit_cap, float sm_scale, float rope_scale,
+    unsigned int pos_encoding_mode, bool logits_cap, float sm_scale, float rope_scale,
     float rope_theta, bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(paged_kv_data);
@@ -265,7 +265,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
   }
 
   const LogitsPostHook logits_post_hook =
-      logit_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
+      logits_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
 
   if (is_float8_tensor(q)) {
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(q.scalar_type(), q_type, [&] {

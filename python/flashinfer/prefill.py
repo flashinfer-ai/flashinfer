@@ -61,7 +61,7 @@ def single_prefill_with_kv_cache(
     causal: bool = False,
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
-    logit_cap: bool = False,
+    logits_cap: bool = False,
     allow_fp16_qk_reduction: bool = False,
     sm_scale: Optional[float] = None,
     rope_scale: Optional[float] = None,
@@ -95,7 +95,7 @@ def single_prefill_with_kv_cache(
         The position encoding applied inside attention kernels, could be
         ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
         Default is ``NONE``.
-    logit_cap : bool
+    logits_cap : bool
         Whether to apply logits cap to attention scores.
         If ``True``, the attention scores will be capped according to formula (proposed in
         Grok-1): :math:`30 \times \mathrm{tanh}(x / 30)`, where :math:`x` is the input logits.
@@ -172,7 +172,7 @@ def single_prefill_with_kv_cache(
             tmp,
             TensorLayout[kv_layout].value,
             PosEncodingMode[pos_encoding_mode].value,
-            logit_cap,
+            logits_cap,
             allow_fp16_qk_reduction,
             sm_scale,
             rope_scale,
@@ -188,7 +188,7 @@ def single_prefill_with_kv_cache(
             causal,
             TensorLayout[kv_layout].value,
             PosEncodingMode[pos_encoding_mode].value,
-            logit_cap,
+            logits_cap,
             allow_fp16_qk_reduction,
             sm_scale,
             rope_scale,
@@ -205,7 +205,7 @@ def single_prefill_with_kv_cache_return_lse(
     causal: bool = False,
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
-    logit_cap: bool = False,
+    logits_cap: bool = False,
     allow_fp16_qk_reduction: bool = False,
     sm_scale: Optional[float] = None,
     rope_scale: Optional[float] = None,
@@ -239,7 +239,7 @@ def single_prefill_with_kv_cache_return_lse(
         The position encoding applied inside attention kernels, could be
         ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
         Default is ``NONE``.
-    logit_cap : bool
+    logits_cap : bool
         Whether to apply logits cap to attention scores.
         If ``True``, the attention scores will be capped according to formula (proposed in
         Grok-1): :math:`30 \times \mathrm{tanh}(x / 30)`, where :math:`x` is the input logits.
@@ -334,7 +334,7 @@ def single_prefill_with_kv_cache_return_lse(
             tmp,
             TensorLayout[kv_layout].value,
             PosEncodingMode[pos_encoding_mode].value,
-            logit_cap,
+            logits_cap,
             allow_fp16_qk_reduction,
             sm_scale,
             rope_scale,
@@ -350,7 +350,7 @@ def single_prefill_with_kv_cache_return_lse(
             causal,
             TensorLayout[kv_layout].value,
             PosEncodingMode[pos_encoding_mode].value,
-            logit_cap,
+            logits_cap,
             allow_fp16_qk_reduction,
             sm_scale,
             rope_scale,
@@ -743,7 +743,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         paged_kv_data: torch.Tensor,
         causal: bool = True,
         pos_encoding_mode: str = "NONE",
-        logit_cap: bool = False,
+        logits_cap: bool = False,
         allow_fp16_qk_reduction: bool = False,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
@@ -769,7 +769,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
             Default is ``NONE``.
-        logit_cap : bool
+        logits_cap : bool
             Whether to apply logits cap to attention scores.
             If ``True``, the attention scores will be capped according to formula (proposed in
             Grok-1): :math:`30 \times \mathrm{tanh}(x / 30)`, where :math:`x` is the input logits.
@@ -817,7 +817,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._paged_kv_last_page_len_buf,
                 causal,
                 PosEncodingMode[pos_encoding_mode].value,
-                logit_cap,
+                logits_cap,
                 allow_fp16_qk_reduction,
                 sm_scale,
                 rope_scale,
@@ -835,7 +835,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._custom_mask_buf,
                 self._qk_indptr_buf,
                 PosEncodingMode[pos_encoding_mode].value,
-                logit_cap,
+                logits_cap,
                 allow_fp16_qk_reduction,
                 sm_scale,
                 rope_scale,
@@ -849,7 +849,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         paged_kv_data: torch.Tensor,
         causal: bool = True,
         pos_encoding_mode: str = "NONE",
-        logit_cap: bool = False,
+        logits_cap: bool = False,
         allow_fp16_qk_reduction: bool = False,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
@@ -873,7 +873,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
             Default is ``NONE``.
-        logit_cap : bool
+        logits_cap : bool
             Whether to apply logits cap to attention scores.
             If ``True``, the attention scores will be capped according to formula (proposed in
             Grok-1): :math:`30 \times \mathrm{tanh}(x / 30)`, where :math:`x` is the input logits.
@@ -914,7 +914,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             paged_kv_data = paged_kv_data.to(torch.float16)
 
         paged_kv_data = expand_5d(paged_kv_data, self._kv_layout)
-        if self._custom_mask is None:
+        if self._custom_mask_buf is None:
             return self._wrapper.forward(
                 q,
                 self._qo_indptr_buf,
@@ -924,7 +924,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._paged_kv_last_page_len_buf,
                 causal,
                 PosEncodingMode[pos_encoding_mode].value,
-                logit_cap,
+                logits_cap,
                 allow_fp16_qk_reduction,
                 sm_scale,
                 rope_scale,
@@ -942,7 +942,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._custom_mask_buf,
                 self._qk_indptr_buf,
                 PosEncodingMode[pos_encoding_mode].value,
-                logit_cap,
+                logits_cap,
                 allow_fp16_qk_reduction,
                 sm_scale,
                 rope_scale,
@@ -1251,7 +1251,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         v: torch.Tensor,
         causal: bool = True,
         pos_encoding_mode: str = "NONE",
-        logit_cap: bool = False,
+        logits_cap: bool = False,
         allow_fp16_qk_reduction: bool = False,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
@@ -1275,7 +1275,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
             Default is ``NONE``.
-        logit_cap : bool
+        logits_cap : bool
             Whether to apply logits cap to attention scores.
             If ``True``, the attention scores will be capped according to formula (proposed in
             Grok-1): :math:`30 \times \mathrm{tanh}(x / 30)`, where :math:`x` is the input logits.
@@ -1321,7 +1321,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._kv_indptr_buf,
                 causal,
                 PosEncodingMode[pos_encoding_mode].value,
-                logit_cap,
+                logits_cap,
                 allow_fp16_qk_reduction,
                 sm_scale,
                 rope_scale,
@@ -1338,7 +1338,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._custom_mask_buf,
                 self._qk_indptr_buf,
                 PosEncodingMode[pos_encoding_mode].value,
-                logit_cap,
+                logits_cap,
                 allow_fp16_qk_reduction,
                 sm_scale,
                 rope_scale,
@@ -1353,7 +1353,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         v: torch.Tensor,
         causal: bool = True,
         pos_encoding_mode: str = "NONE",
-        logit_cap: bool = False,
+        logits_cap: bool = False,
         allow_fp16_qk_reduction: bool = False,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
@@ -1377,7 +1377,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
             Default is ``NONE``.
-        logit_cap : bool
+        logits_cap : bool
             Whether to apply logits cap to attention scores.
             If ``True``, the attention scores will be capped according to formula (proposed in
             Grok-1): :math:`30 \times \mathrm{tanh}(x / 30)`, where :math:`x` is the input logits.
@@ -1425,7 +1425,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._kv_indptr_buf,
                 causal,
                 PosEncodingMode[pos_encoding_mode].value,
-                logit_cap,
+                logits_cap,
                 allow_fp16_qk_reduction,
                 sm_scale,
                 rope_scale,
@@ -1442,7 +1442,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._custom_mask_buf,
                 self._qk_indptr_buf,
                 PosEncodingMode[pos_encoding_mode].value,
-                logit_cap,
+                logits_cap,
                 allow_fp16_qk_reduction,
                 sm_scale,
                 rope_scale,

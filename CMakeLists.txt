@@ -132,7 +132,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
       foreach(kv_layout IN LISTS KV_LAYOUTS)
         foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
           foreach(dtype IN LISTS DECODE_DTYPES)
-            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_decode_group_${group_size}_head_${head_dim}_logithook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_${dtype}.cu)
+            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_decode_group_${group_size}_head_${head_dim}_logitshook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_${dtype}.cu)
             add_custom_command(
               OUTPUT ${generated_kernel_src}
               COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_single_decode_inst.py ${generated_kernel_src}
@@ -145,7 +145,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
 
           # fp8 in, fp16 out
           foreach(dtype IN LISTS DECODE_FP8_DTYPES)
-            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_decode_group_${group_size}_head_${head_dim}_logithook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_f16.cu)
+            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_decode_group_${group_size}_head_${head_dim}_logitshook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_f16.cu)
             add_custom_command(
               OUTPUT ${generated_kernel_src}
               COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_single_decode_inst.py ${generated_kernel_src}
@@ -170,7 +170,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
           # paged kv-cache
           foreach(idtype IN LISTS IDTYPES)
             foreach(dtype IN LISTS DECODE_DTYPES)
-              set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_decode_group_${group_size}_head_${head_dim}_logithook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
+              set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_decode_group_${group_size}_head_${head_dim}_logitshook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
               add_custom_command(
                 OUTPUT ${generated_kernel_src}
                 COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_decode_inst.py ${generated_kernel_src}
@@ -183,7 +183,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
 
             # fp8 in, fp16 out
             foreach(dtype IN LISTS DECODE_FP8_DTYPES)
-              set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_decode_group_${group_size}_head_${head_dim}_logithook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_f16_idtype_${idtype}.cu)
+              set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_decode_group_${group_size}_head_${head_dim}_logitshook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_f16_idtype_${idtype}.cu)
               add_custom_command(
                 OUTPUT ${generated_kernel_src}
                 COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_decode_inst.py ${generated_kernel_src}
@@ -197,7 +197,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
 
           # padded kv-cache
           foreach(dtype IN LISTS DECODE_DTYPES)
-            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_padded_decode_group_${group_size}_head_${head_dim}_logithook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_${dtype}.cu)
+            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_padded_decode_group_${group_size}_head_${head_dim}_logitshook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_${dtype}.cu)
             add_custom_command(
               OUTPUT ${generated_kernel_src}
               COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_padded_decode_inst.py ${generated_kernel_src}
@@ -210,7 +210,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
 
           # padded kv-cache, fp8 in, fp16 out
           foreach(dtype IN LISTS DECODE_FP8_DTYPES)
-            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_padded_decode_group_${group_size}_head_${head_dim}_logithook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_f16.cu)
+            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_padded_decode_group_${group_size}_head_${head_dim}_logitshook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_f16.cu)
             add_custom_command(
               OUTPUT ${generated_kernel_src}
               COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_padded_decode_inst.py ${generated_kernel_src}
@@ -239,7 +239,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
           foreach(allow_fp16_qk_reduction IN LISTS ALLOW_FP16_QK_REDUCTIONS)
             foreach(mask_mode IN LISTS MASK_MODES)
               foreach(dtype IN LISTS PREFILL_DTYPES)
-                set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_prefill_group_${group_size}_head_${head_dim}_logithook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypein_${dtype}_dtypeout_${dtype}.cu)
+                set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_prefill_group_${group_size}_head_${head_dim}_logitshook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypein_${dtype}_dtypeout_${dtype}.cu)
                 add_custom_command(
                   OUTPUT ${generated_kernel_src}
                   COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_single_prefill_inst.py ${generated_kernel_src}
@@ -268,7 +268,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
               foreach(mask_mode IN LISTS MASK_MODES)
                 foreach(dtype IN LISTS PREFILL_DTYPES)
                   foreach(idtype IN LISTS IDTYPES)
-                    set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_prefill_group_${group_size}_page_${page_size}_head_${head_dim}_logithook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
+                    set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_prefill_group_${group_size}_page_${page_size}_head_${head_dim}_logitshook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
                     add_custom_command(
                       OUTPUT ${generated_kernel_src}
                       COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py ${generated_kernel_src}
@@ -298,7 +298,7 @@ foreach(group_size IN LISTS GROUP_SIZES)
             foreach(mask_mode IN LISTS MASK_MODES)
               foreach(dtype IN LISTS PREFILL_DTYPES)
                 foreach(idtype IN LISTS IDTYPES)
-                  set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_ragged_prefill_group_${group_size}_head_${head_dim}_logithook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
+                  set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_ragged_prefill_group_${group_size}_head_${head_dim}_logitshook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
                   add_custom_command(
                     OUTPUT ${generated_kernel_src}
                     COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_ragged_prefill_inst.py ${generated_kernel_src}

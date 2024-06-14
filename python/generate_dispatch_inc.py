@@ -21,7 +21,7 @@ from literal_map import (
     pos_encoding_mode_literal,
     bool_literal,
     mask_mode_literal,
-    logit_hook_literal,
+    logits_hook_literal,
 )
 
 
@@ -63,7 +63,7 @@ def get_dispatch_inc_str(args: argparse.Namespace) -> str:
     dispatch_logits_post_hooks_entries = "\n".join(
         [
             "  _DISPATCH_CASE({}, case_var, __VA_ARGS__) \\".format(
-                logit_hook_literal[_]
+                logits_hook_literal[_]
             )
             for _ in args.logits_post_hooks
         ]
