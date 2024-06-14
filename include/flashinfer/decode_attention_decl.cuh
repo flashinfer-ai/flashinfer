@@ -27,8 +27,9 @@
 
 namespace flashinfer {
 
-template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, QKVLayout KV_LAYOUT,
-          PosEncodingMode pos_encoding_mode, typename DTypeQ, typename DTypeKV, typename DTypeOut>
+template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK,
+          QKVLayout KV_LAYOUT, PosEncodingMode pos_encoding_mode, typename DTypeQ, typename DTypeKV,
+          typename DTypeOut>
 cudaError_t SingleDecodeWithKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut* o,
                                               DTypeOut* tmp, uint32_t num_kv_heads,
                                               uint32_t seq_len, float sm_scale, float rope_scale,

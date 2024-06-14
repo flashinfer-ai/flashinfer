@@ -392,8 +392,8 @@ void _FlashInferAttentionDecodeWithPagedKVCache(int64_t handler_id, DLTensor* q_
                     last_page_len->byte_offset / sizeof(dtype_idx),
                 static_cast<dtype_idx*>(k_rope_pos_offset->data) +
                     k_rope_pos_offset->byte_offset / sizeof(dtype_idx));
-            cudaError_t status = BatchDecodeWithPagedKVCacheWrapper<page_storage, kv_layout,
-                                                                    dtype_in, dtype_out, dtype_idx>(
+            cudaError_t status = BatchDecodeWithPagedKVCacheWrapper<
+                page_storage, kv_layout, dtype_in, dtype_in, dtype_out, dtype_idx>(
                 &batch_decode_handlers[handler_id], static_cast<dtype_in*>(q_data->data),
                 static_cast<dtype_idx*>(q_offset->data) + q_offset->byte_offset / sizeof(dtype_idx),
                 cache, static_cast<dtype_out*>(output->data),

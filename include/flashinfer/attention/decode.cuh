@@ -210,8 +210,8 @@ template <LogitsPostHook logits_post_hook, QKVLayout kv_layout, bool partition_k
           PosEncodingMode pos_encoding_mode, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
           uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename DTypeQ,
           typename DTypeKV, typename DTypeOut>
-__global__ void SingleDecodeWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* __restrict__ k,
-                                              DTypeIn* __restrict__ v, DTypeOut* __restrict__ o,
+__global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* __restrict__ k,
+                                              DTypeKV* __restrict__ v, DTypeOut* __restrict__ o,
                                               DTypeOut* __restrict__ tmp,
                                               tensor_info_t<kv_layout, bdy, bdx * vec_size> info,
                                               float sm_scale, float rope_rcp_scale,
@@ -769,7 +769,7 @@ constexpr uint32_t get_heuristic_num_threads(uint32_t group_size, uint32_t sizeo
 template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK,
           QKVLayout KV_LAYOUT, PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV,
           typename DTypeOut>
-cudaError_t SingleDecodeWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o,
+cudaError_t SingleDecodeWithKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut* o,
                                               DTypeOut* tmp, uint32_t num_kv_heads,
                                               uint32_t seq_len, float sm_scale, float rope_scale,
                                               float rope_theta, cudaStream_t stream) {
@@ -959,7 +959,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
 template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK,
           QKVLayout KV_LAYOUT, PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV,
           typename DTypeOut>
-cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o,
+cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut* o,
                                                    DTypeOut* tmp, float* lse, uint32_t batch_size,
                                                    uint32_t padded_kv_len, uint32_t num_qo_heads,
                                                    float sm_scale, float rope_scale,

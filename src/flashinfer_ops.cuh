@@ -204,7 +204,7 @@ cudaError_t BatchDecodeWithPaddedKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTyp
               pos_encoding_mode, POS_ENCODING_MODE, {DISPATCH_kv_layout(kv_layout, KV_LAYOUT, {
                 return BatchDecodeWithPaddedKVCacheDispatched<
                     GROUP_SIZE, HEAD_DIM, LogitsPostHook::kNone, KV_LAYOUT, POS_ENCODING_MODE,
-                    DTypeQ, DtypeKV, DTypeOut>(q, k, v, o, tmp, lse, batch_size, padded_kv_len,
+                    DTypeQ, DTypeKV, DTypeOut>(q, k, v, o, tmp, lse, batch_size, padded_kv_len,
                                                num_qo_heads, sm_scale, rope_scale, rope_theta,
                                                stream);
               })})})});

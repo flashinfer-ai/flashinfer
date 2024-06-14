@@ -33,7 +33,7 @@ namespace flashinfer {
 template <LogitsPostHook logits_post_hook, bool partition_kv, PosEncodingMode pos_encoding_mode,
           uint32_t num_stages_smem, uint32_t tile_size_per_bdx, uint32_t vec_size, uint32_t bdx,
           uint32_t bdy, uint32_t bdz, PageStorage page_storage, QKVLayout kv_layout,
-          typename DTypeQ, typename DTypeKV, , typename DTypeOut, typename IdType>
+          typename DTypeQ, typename DTypeKV, typename DTypeOut, typename IdType>
 __global__ void BatchDecodeWithPagedKVCacheKernel(
     DTypeQ* __restrict__ q, IdType* __restrict__ q_offset,
     paged_kv_t<page_storage, kv_layout, DTypeKV, IdType> paged_kv,
