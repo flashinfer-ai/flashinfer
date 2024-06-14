@@ -22,7 +22,6 @@ set(FLASHINFER_FASTDIV_TEST ON)
 set(FLASHINFER_DISTRIBUTED ON)
 # The following configurations can impact the binary
 # size of the generated library
-set(FLASHINFER_GEN_GROUP_SIZES 1 4 6 8)
 set(FLASHINFER_GEN_LOGITS_POST_HOOKS 0)
 set(FLASHINFER_GEN_PAGE_SIZES 1 16 32)
 set(FLASHINFER_GEN_HEAD_DIMS 64 128 256)
