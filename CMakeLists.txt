@@ -37,7 +37,6 @@ flashinfer_option(FLASHINFER_TVM_SOURCE_DIR "The path to tvm for building tvm bi
 
 # The following configurations can impact the binary
 # size of the generated library
-flashinfer_option(FLASHINFER_GEN_PAGE_SIZES "Prefill page sizes to enable" 1 16 32)
 flashinfer_option(FLASHINFER_GEN_HEAD_DIMS "Head dims to enable" 64 128 256)
 flashinfer_option(FLASHINFER_GEN_KV_LAYOUTS "KV layouts to enable" 0 1)
 flashinfer_option(FLASHINFER_GEN_LOGITS_POST_HOOKS "Logits post hooks" 0 1)
@@ -80,7 +79,6 @@ if(FLASHINFER_ENABLE_BF16)
 endif(FLASHINFER_ENABLE_BF16)
 
 # generate kernel inst
-set (PAGE_SIZES ${FLASHINFER_GEN_PAGE_SIZES})
 set (HEAD_DIMS ${FLASHINFER_GEN_HEAD_DIMS})
 set (LOGITS_POST_HOOKS ${FLASHINFER_GEN_LOGITS_POST_HOOKS})
 set (KV_LAYOUTS ${FLASHINFER_GEN_KV_LAYOUTS})
@@ -103,7 +101,6 @@ if(FLASHINFER_ENABLE_BF16)
 endif(FLASHINFER_ENABLE_BF16)
 
 # log options
-message(STATUS "FLASHINFER_PAGE_SIZES=${PAGE_SIZES}")
 message(STATUS "FLASHINFER_HEAD_DIMS=${HEAD_DIMS}")
 message(STATUS "FLASHINFER_KV_LAYOUTS=${KV_LAYOUTS}")
 message(STATUS "FLASHINFER_POS_ENCODING_MODES=${POS_ENCODING_MODES}")
@@ -115,7 +112,7 @@ file(MAKE_DIRECTORY ${PROJECT_SOURCE_DIR}/src/generated)
 set(dispatch_inc_file ${PROJECT_SOURCE_DIR}/src/dispatch.inc)
 add_custom_command(
   OUTPUT ${dispatch_inc_file}
-  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_dispatch_inc.py --path ${PROJECT_SOURCE_DIR}/src/dispatch.inc --head_dims ${HEAD_DIMS} --page_sizes ${FLASHINFER_GEN_PAGE_SIZES} --logits_post_hooks ${LOGITS_POST_HOOKS} --kv_layouts ${KV_LAYOUTS} --pos_encoding_modes ${POS_ENCODING_MODES} --allow_fp16_qk_reductions ${ALLOW_FP16_QK_REDUCTIONS} --mask_modes ${MASK_MODES}
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_dispatch_inc.py --path ${PROJECT_SOURCE_DIR}/src/dispatch.inc --head_dims ${HEAD_DIMS} --logits_post_hooks ${LOGITS_POST_HOOKS} --kv_layouts ${KV_LAYOUTS} --pos_encoding_modes ${POS_ENCODING_MODES} --allow_fp16_qk_reductions ${ALLOW_FP16_QK_REDUCTIONS} --mask_modes ${MASK_MODES}
   DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_dispatch_inc.py
   COMMENT "Generating additional source file ${generated_dispatch_inc}"
   VERBATIM
@@ -249,33 +246,31 @@ foreach(head_dim IN LISTS HEAD_DIMS)
 endforeach(head_dim)
 
 # batch paged prefill kernel inst generation
-foreach(page_size IN LISTS PAGE_SIZES)
-  foreach(head_dim IN LISTS HEAD_DIMS)
-    foreach(logits_post_hook IN LISTS LOGITS_POST_HOOKS)
-      foreach(kv_layout IN LISTS KV_LAYOUTS)
-        foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
-          foreach(allow_fp16_qk_reduction IN LISTS ALLOW_FP16_QK_REDUCTIONS)
-            foreach(mask_mode IN LISTS MASK_MODES)
-              foreach(dtype IN LISTS PREFILL_DTYPES)
-                foreach(idtype IN LISTS IDTYPES)
-                  set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_prefill_page_${page_size}_head_${head_dim}_logitshook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
-                  add_custom_command(
-                    OUTPUT ${generated_kernel_src}
-                    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py ${generated_kernel_src}
-                    DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py
-                    COMMENT "Generating additional source file ${generated_kernel_src}"
-                    VERBATIM
-                  )
-                  list(APPEND batch_paged_prefill_kernels_src ${generated_kernel_src})
-                endforeach(idtype)
-              endforeach(dtype)
-            endforeach(mask_mode)
-          endforeach(allow_fp16_qk_reduction)
-        endforeach(pos_encoding_mode)
-      endforeach(kv_layout)
-    endforeach(logits_post_hook)
-  endforeach(head_dim)
-endforeach(page_size)
+foreach(head_dim IN LISTS HEAD_DIMS)
+  foreach(logits_post_hook IN LISTS LOGITS_POST_HOOKS)
+    foreach(kv_layout IN LISTS KV_LAYOUTS)
+      foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
+        foreach(allow_fp16_qk_reduction IN LISTS ALLOW_FP16_QK_REDUCTIONS)
+          foreach(mask_mode IN LISTS MASK_MODES)
+            foreach(dtype IN LISTS PREFILL_DTYPES)
+              foreach(idtype IN LISTS IDTYPES)
+                set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_prefill_head_${head_dim}_logitshook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
+                add_custom_command(
+                  OUTPUT ${generated_kernel_src}
+                  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py ${generated_kernel_src}
+                  DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py
+                  COMMENT "Generating additional source file ${generated_kernel_src}"
+                  VERBATIM
+                )
+                list(APPEND batch_paged_prefill_kernels_src ${generated_kernel_src})
+              endforeach(idtype)
+            endforeach(dtype)
+          endforeach(mask_mode)
+        endforeach(allow_fp16_qk_reduction)
+      endforeach(pos_encoding_mode)
+    endforeach(kv_layout)
+  endforeach(logits_post_hook)
+endforeach(head_dim)
 
 # batch ragged prefill kernel inst generation
 foreach(head_dim IN LISTS HEAD_DIMS)

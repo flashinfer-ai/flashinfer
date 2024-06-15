@@ -127,7 +127,7 @@ def test_batch_decode_with_paged_kv_cache_fp8_calibration_scale(
         page_size,
         "NONE",
         data_type=torch.float16,
-        q_data_type=torch.float16
+        q_data_type=torch.float16,
     )
     o_fp16 = wrapper.forward(q, kv_data, pos_encoding_mode=pos_encoding_mode)
     wrapper.end_forward()

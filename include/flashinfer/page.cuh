@@ -18,6 +18,7 @@
 
 #include <vector>
 
+#include "fastdiv.cuh"
 #include "layout.cuh"
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
@@ -69,8 +70,8 @@ struct kv_partition_info_t {
  */
 template <PageStorage page_storage, QKVLayout layout, typename DType, typename IdType>
 struct paged_kv_t {
+  uint_fastdiv page_size;
   uint32_t num_heads;
-  uint32_t page_size;
   uint32_t head_dim;
   uint32_t batch_size;
 
@@ -119,11 +120,10 @@ struct paged_kv_t {
    * \param rope_pos_offset The start position of each request in the batch.
    * \note This constructor should only be used when page_storage == kIndices
    */
-  __host__ __device__ __forceinline__ paged_kv_t(uint32_t num_heads, uint32_t page_size,
-                                                 uint32_t head_dim, uint32_t batch_size,
-                                                 DType* data, IdType* indices, IdType* indptr,
-                                                 IdType* last_page_len,
-                                                 IdType* rope_pos_offset = nullptr)
+  __host__ __forceinline__ paged_kv_t(uint32_t num_heads, uint32_t page_size, uint32_t head_dim,
+                                      uint32_t batch_size, DType* data, IdType* indices,
+                                      IdType* indptr, IdType* last_page_len,
+                                      IdType* rope_pos_offset = nullptr)
       : num_heads(num_heads),
         page_size(page_size),
         head_dim(head_dim),
@@ -146,11 +146,9 @@ struct paged_kv_t {
    * \param rope_pos_offset The start position of each request in the batch.
    * \note This constructor should only be used when page_storage == kIndices
    */
-  __host__ __device__ __forceinline__ paged_kv_t(uint32_t num_heads, uint32_t page_size,
-                                                 uint32_t head_dim, uint32_t batch_size,
-                                                 DType** ptrs, IdType* indptr,
-                                                 IdType* last_page_len,
-                                                 IdType* rope_pos_offset = nullptr)
+  __host__ __forceinline__ paged_kv_t(uint32_t num_heads, uint32_t page_size, uint32_t head_dim,
+                                      uint32_t batch_size, DType** ptrs, IdType* indptr,
+                                      IdType* last_page_len, IdType* rope_pos_offset = nullptr)
       : num_heads(num_heads),
         page_size(page_size),
         head_dim(head_dim),

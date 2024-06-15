@@ -29,7 +29,6 @@ from pathlib import Path
 
 
 def get_cu_file_str(
-    page_size,
     head_dim,
     logits_hook,
     kv_layout,
@@ -43,7 +42,7 @@ def get_cu_file_str(
     num_frags_x_choices = [1, 2]
     insts = "\n".join(
         [
-            """template cudaError_t BatchPrefillWithPagedKVCacheDispatched<page_storage, {num_frags_x}, {page_size}, {head_dim}, {logits_hook}, {kv_layout}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {dtype_in}, {dtype_out}, {idtype}>(
+            """template cudaError_t BatchPrefillWithPagedKVCacheDispatched<page_storage, {num_frags_x}, {head_dim}, {logits_hook}, {kv_layout}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {dtype_in}, {dtype_out}, {idtype}>(
     {dtype_in}* q, {idtype}* request_indices, {idtype}* tile_indices,
     {idtype}* qo_indptr, {idtype}* q_offset,
     paged_kv_t<page_storage, {kv_layout}, {dtype_in}, {idtype}> paged_kv,
@@ -56,7 +55,6 @@ def get_cu_file_str(
                 logits_hook=logits_hook_literal[int(logits_hook)],
                 kv_layout=kv_layout_literal[int(kv_layout)],
                 num_frags_x=num_frags_x,
-                page_size=page_size,
                 head_dim=head_dim,
                 pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
                 allow_fp16_qk_reduction=allow_fp16_qk_reduction,
@@ -83,7 +81,7 @@ constexpr PageStorage page_storage = PageStorage::kIndices;
 
 if __name__ == "__main__":
     pattern = (
-        r"batch_paged_prefill_page_([0-9]+)_head_([0-9]+)_logitshook_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
+        r"batch_paged_prefill_head_([0-9]+)_logitshook_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
         r"fp16qkred_([a-z]+)_mask_([0-9]+)_dtypein_([a-z0-9]+)_dtypeout_([a-z0-9]+)_idtype_([a-z0-9]+)\.cu"
     )
     compiled_pattern = re.compile(pattern)

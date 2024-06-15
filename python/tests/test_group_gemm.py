@@ -56,13 +56,9 @@ def test_segment_gemm(
             )
     else:
         if column_major:
-            weight = (
-                (torch.randn(batch_size, d_out, d_in) / 10).to(0).to(torch.float16)
-            )
+            weight = (torch.randn(batch_size, d_out, d_in) / 10).to(0).to(torch.float16)
         else:
-            weight = (
-                (torch.randn(batch_size, d_in, d_out) / 10).to(0).to(torch.float16)
-            )
+            weight = (torch.randn(batch_size, d_in, d_out) / 10).to(0).to(torch.float16)
     y = segment_gemm.forward(
         x,
         weight,

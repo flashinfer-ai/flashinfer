@@ -121,21 +121,19 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
   const MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
   DISPATCH_head_dim(
       head_dim, HEAD_DIM,
-      {DISPATCH_mask_mode(mask_mode, MASK_MODE,
-                          {DISPATCH_pos_encoding_mode(
-                              pos_encoding_mode, POS_ENCODING_MODE,
-                              {DISPATCH_allow_fp16_qk_reduction(
-                                  allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
-                                  {DISPATCH_page_size(paged_kv.page_size, PAGE_SIZE, {
-                                    return BatchPrefillWithPagedKVCacheWrapperDispatched<
-                                        PAGE_STORAGE, PAGE_SIZE, HEAD_DIM, LogitsPostHook::kNone,
-                                        KV_LAYOUT, POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION,
-                                        MASK_MODE, DTypeIn, DTypeOut, IdType>(
-                                        handler, q, qo_indptr, q_offset, paged_kv,
-                                        /*custom_mask=*/nullptr,
-                                        /*qk_indptr=*/nullptr, o, lse, num_qo_heads, sm_scale,
-                                        rope_scale, rope_theta, stream);
-                                  })})})})});
+      {DISPATCH_mask_mode(
+          mask_mode, MASK_MODE,
+          {DISPATCH_pos_encoding_mode(
+              pos_encoding_mode, POS_ENCODING_MODE,
+              {DISPATCH_allow_fp16_qk_reduction(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
+                return BatchPrefillWithPagedKVCacheWrapperDispatched<
+                    PAGE_STORAGE, HEAD_DIM, LogitsPostHook::kNone, KV_LAYOUT, POS_ENCODING_MODE,
+                    ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeOut, IdType>(
+                    handler, q, qo_indptr, q_offset, paged_kv,
+                    /*custom_mask=*/nullptr,
+                    /*qk_indptr=*/nullptr, o, lse, num_qo_heads, sm_scale, rope_scale, rope_theta,
+                    stream);
+              })})})});
   return cudaSuccess;
 }
 
