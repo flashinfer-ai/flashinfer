@@ -196,9 +196,6 @@ using namespace flashinfer;
     return __VA_ARGS__();                        \
   }
 
-#define DISPATCH_page_size(expr, const_expr, ...) \
-  _DISPATCH_SWITCH("page size", expr, _DISPATCH_CASES_page_size(const_expr, __VA_ARGS__))
-
 #define DISPATCH_head_dim(expr, const_expr, ...) \
   _DISPATCH_SWITCH("head_dim", expr, _DISPATCH_CASES_head_dim(const_expr, __VA_ARGS__))
 

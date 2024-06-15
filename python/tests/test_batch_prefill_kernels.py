@@ -24,7 +24,7 @@ import flashinfer
 @pytest.mark.parametrize("batch_size", [12, 17])
 @pytest.mark.parametrize("kv_len", [54, 97])
 @pytest.mark.parametrize("qo_len", [37, 17])
-@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("page_size", [1, 5, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
 @pytest.mark.parametrize("head_dim", [128, 256])

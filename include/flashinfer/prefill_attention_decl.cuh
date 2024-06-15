@@ -48,7 +48,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
     uint32_t num_qo_tiles, uint32_t num_qo_heads, uint32_t num_kv_heads, float sm_scale,
     float rope_scale, float rope_theta, cudaStream_t stream = nullptr);
 
-template <PageStorage PAGE_STORAGE, uint32_t NUM_FRAGS_X, uint32_t PAGE_SIZE, uint32_t HEAD_DIM,
+template <PageStorage PAGE_STORAGE, uint32_t NUM_FRAGS_X, uint32_t HEAD_DIM,
           LogitsPostHook LOGITS_POST_HOOK, QKVLayout KV_LAYOUT, PosEncodingMode POS_ENCODING_MODE,
           bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut,
           typename IdType>
@@ -58,10 +58,9 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     IdType* qk_indptr, DTypeOut* o, float* tmp, float* lse, uint32_t num_qo_tiles,
     uint32_t num_qo_heads, float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream);
 
-template <PageStorage PAGE_STORAGE, uint32_t PAGE_SIZE, uint32_t HEAD_DIM,
-          LogitsPostHook LOGITS_POST_HOOK, QKVLayout KV_LAYOUT, PosEncodingMode POS_ENCODING_MODE,
-          bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut,
-          typename IdType>
+template <PageStorage PAGE_STORAGE, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK,
+          QKVLayout KV_LAYOUT, PosEncodingMode POS_ENCODING_MODE, bool ALLOW_FP16_QK_REDUCTION,
+          MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
     BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, IdType* q_offset,
     paged_kv_t<PAGE_STORAGE, KV_LAYOUT, DTypeIn, IdType> paged_kv, float* custom_mask,
@@ -86,8 +85,8 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
 
   DISPATCH_NUM_FRAGS_X(num_frags_x, NUM_FRAGS_X, {
     return BatchPrefillWithPagedKVCacheDispatched<
-        PAGE_STORAGE, NUM_FRAGS_X, PAGE_SIZE, HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT,
-        POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeOut, IdType>(
+        PAGE_STORAGE, NUM_FRAGS_X, HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT, POS_ENCODING_MODE,
+        ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeOut, IdType>(
         q, request_indices, tile_indices, qo_indptr, q_offset, paged_kv, custom_mask, qk_indptr, o,
         tmp, lse, num_qo_heads, num_qo_tiles, sm_scale, rope_scale, rope_theta, stream);
   });

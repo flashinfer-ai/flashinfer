@@ -19,6 +19,7 @@
  */
 #ifndef FLASHINFER_FASTDIV_CUH_
 #define FLASHINFER_FASTDIV_CUH_
+#include <cstdint>
 
 namespace flashinfer {
 

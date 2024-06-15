@@ -601,9 +601,10 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
   static_assert(num_stages_smem <= bdx);
 #pragma unroll
   for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
-    k_ptrs_smem[((j * bdz + tz) * bdy + ty) * bdx + tx] = paged_kv.protective_get_k_ptr(
-        cur_page_indptr_begin + (((j * bdz + tz) * bdy + ty) * bdx + tx) / paged_kv.page_size,
-        kv_head_idx, (((j * bdz + tz) * bdy + ty) * bdx + tx) % paged_kv.page_size, 0, last_indptr);
+    uint32_t q, r;
+    paged_kv.page_size.divmod(((j * bdz + tz) * bdy + ty) * bdx + tx, q, r);
+    k_ptrs_smem[((j * bdz + tz) * bdy + ty) * bdx + tx] =
+        paged_kv.protective_get_k_ptr(cur_page_indptr_begin + q, kv_head_idx, r, 0, last_indptr);
   }
   block.sync();
 
@@ -643,15 +644,12 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
     if ((iter + num_stages_smem) % bdx == 0) {
 #pragma unroll
       for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
+        uint32_t q, r;
+        paged_kv.page_size.divmod(((iter + num_stages_smem) * tile_size_per_bdx * bdy * bdz +
+                                   ((j * bdz + tz) * bdy + ty) * bdx + tx),
+                                  q, r);
         k_ptrs_smem[((j * bdz + tz) * bdy + ty) * bdx + tx] = paged_kv.protective_get_k_ptr(
-            cur_page_indptr_begin + ((iter + num_stages_smem) * tile_size_per_bdx * bdy * bdz +
-                                     ((j * bdz + tz) * bdy + ty) * bdx + tx) /
-                                        paged_kv.page_size,
-            kv_head_idx,
-            ((iter + num_stages_smem) * tile_size_per_bdx * bdy * bdz +
-             ((j * bdz + tz) * bdy + ty) * bdx + tx) %
-                paged_kv.page_size,
-            0, last_indptr);
+            cur_page_indptr_begin + q, kv_head_idx, r, 0, last_indptr);
       }
     }
     // compute qk
