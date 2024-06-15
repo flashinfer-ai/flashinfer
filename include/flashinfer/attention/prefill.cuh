@@ -965,6 +965,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
   const uint32_t bx = blockIdx.x, chunk_idx = blockIdx.y, kv_head_idx = blockIdx.z;
   const uint32_t num_kv_heads = gridDim.z, num_qo_heads = num_kv_heads * group_size;
+  constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
   const tensor_info_t<kv_layout, num_frags_y * 16> qkv_info(qo_len, kv_len, num_kv_heads,
                                                             num_qo_heads);
   float alibi_slopes[num_frags_x][2];
@@ -1041,18 +1042,16 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
   const uint32_t num_iterations = ceil_div(
       mask_mode == MaskMode::kCausal
           ? min(chunk_end - chunk_start,
-                sub_if_greater_or_zero(
-                    kv_len - qo_len + ((bx + 1) * num_frags_x * num_warps * 16) / group_size,
-                    chunk_start))
+                sub_if_greater_or_zero(kv_len - qo_len + ((bx + 1) * num_rows_per_cta) / group_size,
+                                       chunk_start))
           : chunk_end - chunk_start,
       16 * num_frags_z);
 
   const uint32_t mask_iteration =
       (mask_mode == MaskMode::kCausal
            ? min(chunk_end - chunk_start,
-                 sub_if_greater_or_zero(
-                     kv_len + (bx * num_warps * num_frags_x * 16) / group_size - qo_len,
-                     chunk_start))
+                 sub_if_greater_or_zero(kv_len + (bx * num_rows_per_cta) / group_size - qo_len,
+                                        chunk_start))
            : (chunk_end - chunk_start)) /
       (16 * num_frags_z);
 
@@ -1259,16 +1258,15 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
     }
   }
 
-  const uint32_t num_iterations =
-      ceil_div((mask_mode == MaskMode::kCausal
-                    ? min(kv_len, kv_len - qo_len +
-                                      ((tile_idx + 1) * num_frags_x * num_warps * 16) / group_size)
-                    : kv_len),
-               16 * num_frags_z);
+  const uint32_t num_iterations = ceil_div(
+      (mask_mode == MaskMode::kCausal
+           ? min(kv_len, kv_len - qo_len + ((tile_idx + 1) * num_rows_per_cta) / group_size)
+           : kv_len),
+      16 * num_frags_z);
 
   const uint32_t mask_iteration =
       (mask_mode == MaskMode::kCausal
-           ? min(kv_len + (tile_idx * num_warps * num_frags_x * 16) / group_size - qo_len, kv_len)
+           ? min(kv_len + (tile_idx * num_rows_per_cta) / group_size - qo_len, kv_len)
            : kv_len) /
       (16 * num_frags_z);
 
@@ -1491,16 +1489,15 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
       v_smem, &kv_smem_offset_w, paged_kv, 0, page_iter_base, kv_len, last_indptr);
   cp_async::commit_group();
 
-  const uint32_t num_iterations =
-      ceil_div((mask_mode == MaskMode::kCausal
-                    ? min(kv_len, kv_len - qo_len +
-                                      ((tile_idx + 1) * num_frags_x * num_warps * 16) / group_size)
-                    : kv_len),
-               16 * num_frags_z);
+  const uint32_t num_iterations = ceil_div(
+      (mask_mode == MaskMode::kCausal
+           ? min(kv_len, kv_len - qo_len + ((tile_idx + 1) * num_rows_per_cta) / group_size)
+           : kv_len),
+      16 * num_frags_z);
 
   const uint32_t mask_iteration =
       (mask_mode == MaskMode::kCausal
-           ? min(kv_len + (tile_idx * num_warps * num_frags_x * 16) / group_size - qo_len, kv_len)
+           ? min(kv_len + (tile_idx * num_rows_per_cta) / group_size - qo_len, kv_len)
            : kv_len) /
       (16 * num_frags_z);
 
