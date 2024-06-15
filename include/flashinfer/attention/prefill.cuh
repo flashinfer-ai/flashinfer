@@ -23,9 +23,6 @@
 #endif
 #include <cuda_runtime.h>
 
-#include <optional>
-#include <tuple>
-
 #include "../cp_async.cuh"
 #include "../fastdiv.cuh"
 #include "../layout.cuh"
