@@ -326,7 +326,7 @@ class NinjaBuildExtension(torch_cpp_ext.BuildExtension):
     def __init__(self, *args, **kwargs) -> None:
         # do not override env MAX_JOBS if already exists
         if not os.environ.get("MAX_JOBS"):
-            max_num_jobs_cores = max(1, os.cpu_count() // 2)
+            max_num_jobs_cores = max(1, os.cpu_count())
             os.environ["MAX_JOBS"] = str(max_num_jobs_cores)
 
         super().__init__(*args, **kwargs)
@@ -367,7 +367,7 @@ if __name__ == "__main__":
                     "-O3",
                     "-std=c++17",
                     "--threads",
-                    "8",
+                    "1",
                     "-Xfatbin",
                     "-compress-all",
                 ],
