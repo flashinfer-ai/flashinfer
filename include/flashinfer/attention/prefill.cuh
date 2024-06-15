@@ -1153,7 +1153,8 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
   const tensor_info_t<kv_layout, num_frags_y * 16> qkv_info(qo_len, kv_len, num_qo_heads,
                                                             num_kv_heads);
   float alibi_slopes[num_frags_x][2];
-  const uint32_t qo_upper_bound = min(qo_len, ((tile_idx + 1) * num_rows_per_cta) / group_size);
+  const uint32_t qo_upper_bound =
+      min(qo_len, ceil_div((tile_idx + 1) * num_rows_per_cta, group_size));
 
   constexpr bool partition_kv = false;
   constexpr uint32_t channel_size_128b_in = head_dim / num_elems_per_128b<DTypeIn>();
@@ -1367,7 +1368,8 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
                  kv_len = (paged_kv.indptr[request_idx + 1] - paged_kv.indptr[request_idx] - 1) *
                               paged_kv.page_size +
                           paged_kv.last_page_len[request_idx];
-  const uint32_t qo_upper_bound = min(qo_len, ((tile_idx + 1) * num_rows_per_cta) / group_size);
+  const uint32_t qo_upper_bound =
+      min(qo_len, ceil_div((tile_idx + 1) * num_rows_per_cta, group_size));
 
   constexpr bool partition_kv = false;
   constexpr uint32_t head_dim = num_frags_y * 16;
