@@ -64,11 +64,6 @@ __device__ __forceinline__ uint32_t sub_if_greater_or_zero(uint32_t x, uint32_t 
   return (x > y) ? x - y : 0U;
 }
 
-enum class FragLayout {
-  kRowMajor,
-  kColMajor,
-};
-
 /*!
  * \brief Apply Llama style rotary embedding to two 16x16 fragments.
  * \tparam FragLayout The layout of the input fragments.
@@ -81,7 +76,7 @@ enum class FragLayout {
  * \note The sin/cos computation is slow, especially for A100 GPUs which has low
  *   non tensor-ops flops, will optimize in the future.
  */
-template <FragLayout frag_layout, typename T>
+template <typename T>
 __device__ __forceinline__ void k_frag_apply_llama_rope(T* x_first_half, T* x_second_half,
                                                         const float* rope_freq,
                                                         const uint32_t kv_offset,
@@ -89,20 +84,10 @@ __device__ __forceinline__ void k_frag_apply_llama_rope(T* x_first_half, T* x_se
 #pragma unroll
   for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
     float cos, sin, tmp;
-    uint32_t i, j;
-    if constexpr (frag_layout == FragLayout::kRowMajor) {
-      // 0 1 | 4 5
-      // ---------
-      // 2 3 | 6 7
-      i = ((reg_id % 4) / 2);
-      j = (reg_id / 4);
-    } else {
-      // 0 1 | 2 3
-      // ---------
-      // 4 5 | 6 7
-      i = reg_id / 4;
-      j = (reg_id % 4) / 2;
-    }
+    // 0 1 | 2 3
+    // ---------
+    // 4 5 | 6 7
+    uint32_t i = reg_id / 4, j = (reg_id % 4) / 2;
     __sincosf(float(kv_offset + 8 * i) * rope_freq[2 * j + reg_id % 2], &sin, &cos);
     tmp = x_first_half[reg_id];
     x_first_half[reg_id] = (tmp * cos - (float)x_second_half[reg_id] * sin) * scale;
@@ -110,7 +95,7 @@ __device__ __forceinline__ void k_frag_apply_llama_rope(T* x_first_half, T* x_se
   }
 }
 
-template <FragLayout frag_layout, typename T>
+template <typename T>
 __device__ __forceinline__ void q_frag_apply_llama_rope(T* x_first_half, T* x_second_half,
                                                         const float* rope_freq,
                                                         const uint32_t qo_packed_offset,
@@ -119,20 +104,10 @@ __device__ __forceinline__ void q_frag_apply_llama_rope(T* x_first_half, T* x_se
 #pragma unroll
   for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
     float cos, sin, tmp;
-    uint32_t i, j;
-    if constexpr (frag_layout == FragLayout::kRowMajor) {
-      // 0 1 | 4 5
-      // ---------
-      // 2 3 | 6 7
-      i = ((reg_id % 4) / 2);
-      j = (reg_id / 4);
-    } else {
-      // 0 1 | 2 3
-      // ---------
-      // 4 5 | 6 7
-      i = reg_id / 4;
-      j = (reg_id % 4) / 2;
-    }
+    // 0 1 | 4 5
+    // ---------
+    // 2 3 | 6 7
+    uint32_t i = ((reg_id % 4) / 2), j = (reg_id / 4);
     __sincosf(float((qo_packed_offset + 8 * i) / group_size) * rope_freq[2 * j + reg_id % 2], &sin,
               &cos);
     tmp = x_first_half[reg_id];
@@ -141,7 +116,7 @@ __device__ __forceinline__ void q_frag_apply_llama_rope(T* x_first_half, T* x_se
   }
 }
 
-template <FragLayout frag_layout, typename T, typename IdType>
+template <typename T, typename IdType>
 __device__ __forceinline__ void q_frag_apply_llama_rope_with_pos(
     T* x_first_half, T* x_second_half, const float* rope_freq, const uint32_t qo_packed_offset,
     const uint_fastdiv group_size, const IdType* q_offset, float scale = 1.f) {
@@ -150,20 +125,10 @@ __device__ __forceinline__ void q_frag_apply_llama_rope_with_pos(
 #pragma unroll
   for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
     float cos, sin, tmp;
-    uint32_t i, j;
-    if constexpr (frag_layout == FragLayout::kRowMajor) {
-      // 0 1 | 4 5
-      // ---------
-      // 2 3 | 6 7
-      i = ((reg_id % 4) / 2);
-      j = (reg_id / 4);
-    } else {
-      // 0 1 | 2 3
-      // ---------
-      // 4 5 | 6 7
-      i = reg_id / 4;
-      j = (reg_id % 4) / 2;
-    }
+    // 0 1 | 4 5
+    // ---------
+    // 2 3 | 6 7
+    uint32_t i = ((reg_id % 4) / 2), j = (reg_id / 4);
     __sincosf(pos[i] * rope_freq[2 * j + reg_id % 2], &sin, &cos);
     tmp = x_first_half[reg_id];
     x_first_half[reg_id] = (tmp * cos - (float)x_second_half[reg_id] * sin) * scale;
@@ -366,7 +331,7 @@ __device__ __forceinline__ void q_smem_inplace_apply_rotary_multiply_sm_scale(
       uint32_t q_smem_offset_r_last_half =
           q_smem->advance_offset_by_column<num_frags_y>(q_smem_offset_r_first_half, 0);
       q_smem->ldmatrix_m8n8x4(q_smem_offset_r_last_half, q_frag_local[1]);
-      q_frag_apply_llama_rope<FragLayout::kRowMajor, DTypeIn>(
+      q_frag_apply_llama_rope<DTypeIn>(
           (DTypeIn*)q_frag_local[0], (DTypeIn*)q_frag_local[1], rope_freq[fyi],
           q_packed_idx + kv_len * group_size - qo_len * group_size + tx % 8 + fx * 16 + tx / 4,
           group_size, sm_scale);
@@ -400,7 +365,7 @@ __device__ __forceinline__ void q_smem_inplace_apply_rotary_with_pos_multiply_sm
       uint32_t q_smem_offset_r_last_half =
           q_smem->advance_offset_by_column<num_frags_y>(q_smem_offset_r_first_half, 0);
       q_smem->ldmatrix_m8n8x4(q_smem_offset_r_last_half, q_frag_local[1]);
-      q_frag_apply_llama_rope_with_pos<FragLayout::kRowMajor, DTypeIn>(
+      q_frag_apply_llama_rope_with_pos<DTypeIn>(
           (DTypeIn*)q_frag_local[0], (DTypeIn*)q_frag_local[1], rope_freq[fyi],
           q_packed_idx_base + tx % 8 + fx * 16 + tx / 4, group_size, q_offset, sm_scale);
       q_smem->stmatrix_m8n8x4(q_smem_offset_r_last_half, q_frag_local[1]);
@@ -461,8 +426,8 @@ __device__ __forceinline__ void k_smem_inplace_apply_rotary(const uint32_t kv_id
       uint32_t k_smem_offset_r_last_half =
           k_smem->advance_offset_by_column<4>(k_smem_offset_r_first_half, 0);
       k_smem->ldmatrix_m8n8x4(k_smem_offset_r_last_half, k_frag_local[1]);
-      k_frag_apply_llama_rope<FragLayout::kColMajor, DTypeIn>(
-          (DTypeIn*)k_frag_local[0], (DTypeIn*)k_frag_local[1], rope_freq[fyi], kv_idx);
+      k_frag_apply_llama_rope<DTypeIn>((DTypeIn*)k_frag_local[0], (DTypeIn*)k_frag_local[1],
+                                       rope_freq[fyi], kv_idx);
       k_smem->stmatrix_m8n8x4(k_smem_offset_r_last_half, k_frag_local[1]);
       k_smem->stmatrix_m8n8x4(k_smem_offset_r_first_half, k_frag_local[0]);
       *k_smem_offset_r += 32 * channel_size_128b_in;
@@ -490,8 +455,8 @@ __device__ __forceinline__ void k_smem_inplace_apply_rotary(const uint32_t kv_id
         uint32_t k_smem_offset_r_last_half =
             k_smem->advance_offset_by_column<num_frags_y>(k_smem_offset_r_first_half, 0);
         k_smem->ldmatrix_m8n8x4(k_smem_offset_r_last_half, k_frag_local[1]);
-        k_frag_apply_llama_rope<FragLayout::kColMajor, DTypeIn>(
-            (DTypeIn*)k_frag_local[0], (DTypeIn*)k_frag_local[1], rope_freq[fyi], kv_idx);
+        k_frag_apply_llama_rope<DTypeIn>((DTypeIn*)k_frag_local[0], (DTypeIn*)k_frag_local[1],
+                                         rope_freq[fyi], kv_idx);
         k_smem->stmatrix_m8n8x4(k_smem_offset_r_last_half, k_frag_local[1]);
         k_smem->stmatrix_m8n8x4(k_smem_offset_r_first_half, k_frag_local[0]);
         k_smem_offset_r_first_half =
