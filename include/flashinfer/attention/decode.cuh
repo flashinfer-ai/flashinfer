@@ -225,7 +225,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
   uint32_t qo_head_idx = kv_head_idx * bdy + threadIdx.y;
   uint32_t kv_chunk_idx = blockIdx.x;
   uint32_t num_kv_chunks = gridDim.x;
-  uint32_t num_qo_heads = info.get_num_qo_heads();
+  uint32_t num_qo_heads = info.num_qo_heads;
   const float alibi_slope = get_alibi_slope(qo_head_idx, num_qo_heads) * math::log2e;
   uint32_t seq_len = info.kv_len;
 
@@ -378,8 +378,8 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(DTypeQ* __restrict__ q, DType
   uint32_t kv_head_idx = blockIdx.y;
   uint32_t qo_head_idx = kv_head_idx * bdy + threadIdx.y;
   uint32_t batch_idx = blockIdx.x;
-  uint32_t num_qo_heads = info.get_num_qo_heads();
-  uint32_t num_kv_heads = info.get_num_kv_heads();
+  uint32_t num_qo_heads = info.num_qo_heads;
+  uint32_t num_kv_heads = info.num_kv_heads;
   const float alibi_slope = get_alibi_slope(qo_head_idx, num_qo_heads) * math::log2e;
   uint32_t seq_len = info.kv_len;
 
