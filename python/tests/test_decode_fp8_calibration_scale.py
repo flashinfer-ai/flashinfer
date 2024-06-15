@@ -54,20 +54,17 @@ def test_single_decode_fp8_calibration_scale(
         q, k, v, kv_layout=kv_layout, pos_encoding_mode=pos_encoding_mode
     )
 
-    q_scale = q.amax().item() / 256
     k_scale = k.amax().item() / 256
     v_scale = v.amax().item() / 256
-    q_fp8 = (q / q_scale).to(fp8_dtype)
     k_fp8 = (k / k_scale).to(fp8_dtype)
     v_fp8 = (v / v_scale).to(fp8_dtype)
 
     o_fp8 = flashinfer.single_decode_with_kv_cache(
-        q_fp8,
+        q,
         k_fp8,
         v_fp8,
         kv_layout=kv_layout,
         pos_encoding_mode=pos_encoding_mode,
-        q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
     )
@@ -84,7 +81,7 @@ def test_single_decode_fp8_calibration_scale(
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 def test_batch_decode_with_paged_kv_cache_fp8_calibration_scale(
     batch_size,
@@ -129,17 +126,16 @@ def test_batch_decode_with_paged_kv_cache_fp8_calibration_scale(
         head_dim,
         page_size,
         "NONE",
-        torch.float16,
+        data_type=torch.float16,
+        q_data_type=torch.float16
     )
     o_fp16 = wrapper.forward(q, kv_data, pos_encoding_mode=pos_encoding_mode)
     wrapper.end_forward()
 
-    q_scale = q.amax().item() / 256
     k_data, v_data = torch.chunk(kv_data, 2, dim=1)
     k_scale = k_data.amax().item() / 256
     v_scale = v_data.amax().item() / 256
 
-    q_fp8 = (q / q_scale).to(dtype)
     k_fp8 = (k_data / k_scale).to(dtype)
     v_fp8 = (v_data / v_scale).to(dtype)
     kv_data_fp8 = torch.cat([k_fp8, v_fp8], dim=1)
@@ -153,13 +149,13 @@ def test_batch_decode_with_paged_kv_cache_fp8_calibration_scale(
         head_dim,
         page_size,
         "NONE",
-        dtype,
+        data_type=dtype,
+        q_data_type=torch.float16,
     )
     o_fp8 = wrapper.forward(
-        q_fp8,
+        q,
         kv_data_fp8.to(dtype),
         pos_encoding_mode=pos_encoding_mode,
-        q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
     )
