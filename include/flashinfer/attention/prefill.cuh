@@ -368,7 +368,7 @@ __device__ __forceinline__ void q_smem_inplace_apply_rotary_multiply_sm_scale(
       q_smem->ldmatrix_m8n8x4(q_smem_offset_r_last_half, q_frag_local[1]);
       q_frag_apply_llama_rope<FragLayout::kRowMajor, DTypeIn>(
           (DTypeIn*)q_frag_local[0], (DTypeIn*)q_frag_local[1], rope_freq[fyi],
-          q_packed_idx + kv_len * group_size - qo_len * group_size, tx % 8 + fx * 16 + tx / 4,
+          q_packed_idx + kv_len * group_size - qo_len * group_size + tx % 8 + fx * 16 + tx / 4,
           group_size, sm_scale);
       q_smem->stmatrix_m8n8x4(q_smem_offset_r_last_half, q_frag_local[1]);
       q_smem->stmatrix_m8n8x4(q_smem_offset_r_first_half, q_frag_local[0]);
@@ -461,7 +461,7 @@ __device__ __forceinline__ void k_smem_inplace_apply_rotary(const uint32_t kv_id
       uint32_t k_smem_offset_r_last_half =
           k_smem->advance_offset_by_column<4>(k_smem_offset_r_first_half, 0);
       k_smem->ldmatrix_m8n8x4(k_smem_offset_r_last_half, k_frag_local[1]);
-      k_frag_apply_llama_rope<FragLayout::kColMajor, 1, DTypeIn>(
+      k_frag_apply_llama_rope<FragLayout::kColMajor, DTypeIn>(
           (DTypeIn*)k_frag_local[0], (DTypeIn*)k_frag_local[1], rope_freq[fyi], kv_idx);
       k_smem->stmatrix_m8n8x4(k_smem_offset_r_last_half, k_frag_local[1]);
       k_smem->stmatrix_m8n8x4(k_smem_offset_r_first_half, k_frag_local[0]);
@@ -1019,7 +1019,8 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
 
   if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
     q_smem_inplace_apply_rotary_multiply_sm_scale<num_warps, num_frags_x, num_frags_y, DTypeIn>(
-        qo_packed_idx_base, qo_len, kv_len, &qo_smem, &q_smem_offset_r, rope_freq, sm_scale);
+        qo_packed_idx_base, qo_len, kv_len, group_size, &qo_smem, &q_smem_offset_r, rope_freq,
+        sm_scale);
   } else {
     q_smem_inplace_multiply_sm_scale<num_frags_x, num_frags_y, DTypeIn>(&qo_smem, sm_scale);
   }
@@ -1252,7 +1253,6 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
       for (uint32_t j = 0; j < 2; ++j) {
         const uint32_t qo_head_idx =
             kv_head_idx * group_size + (qo_packed_idx_base + tx / 4 + j * 8 + fx * 16) % group_size;
-        const uint32_t num_qo_heads = qkv_info.get_num_qo_heads();
         alibi_slopes[fx][j] = get_alibi_slope(qo_head_idx, num_qo_heads) * math::log2e;
       }
     }
