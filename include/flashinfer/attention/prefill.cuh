@@ -37,6 +37,7 @@
 #include "cascade.cuh"
 #include "logits_post_hook.cuh"
 #include "mask.cuh"
+#include "../fastdiv.cuh"
 
 namespace flashinfer {
 
@@ -317,7 +318,7 @@ __device__ __forceinline__ void load_q_global_smem(uint32_t packed_offset,
                                                    const uint32_t qo_upper_bound,
                                                    DTypeIn* q_ptr_base, const uint32_t qo_n_stride,
                                                    const uint32_t qo_h_stride,
-                                                   const uint32_t group_size, smem_t* q_smem) {
+                                                   const uint_fastdiv group_size, smem_t* q_smem) {
   constexpr uint32_t head_dim = num_frags_y * 16;
   constexpr uint32_t channel_size_128b_in = head_dim / num_elems_per_128b<DTypeIn>();
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
@@ -328,10 +329,12 @@ __device__ __forceinline__ void load_q_global_smem(uint32_t packed_offset,
   for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
     for (uint32_t j = 0; j < 4; ++j) {
-      const uint32_t q_idx = (packed_offset + tx / 8 + fx * 16 + j * 4) / group_size;
+      uint32_t q, r;
+      group_size.divmod(packed_offset + tx / 8 + fx * 16 + j * 4, q, r);
+      const uint32_t q_idx = q;
       DTypeIn* q_ptr = q_ptr_base +
-                       ((packed_offset + tx / 8 + fx * 16 + j * 4) / group_size) * qo_n_stride +
-                       ((packed_offset + tx / 8 + fx * 16 + j * 4) % group_size) * qo_h_stride;
+                       (q) * qo_n_stride +
+                       (r) * qo_h_stride;
 #pragma unroll
       for (uint32_t fyo = 0; fyo < num_frags_y / 4; ++fyo) {
         // load q fragment from gmem to smem
@@ -606,7 +609,7 @@ template <bool partition_kv, MaskMode mask_mode, uint32_t num_warps, uint32_t nu
 __device__ __forceinline__ void mask_s(const uint32_t qo_packed_idx_base,
                                        const uint32_t kv_idx_base, const uint32_t qo_len,
                                        const uint32_t kv_len, const uint32_t chunk_end,
-                                       const uint32_t group_size, float* custom_mask,
+                                       const uint_fastdiv group_size, float* custom_mask,
                                        DTypeQKAccum (*s_frag)[num_frags_z][8]) {
   const uint32_t tx = threadIdx.x;
 #pragma unroll
@@ -872,7 +875,7 @@ __device__ __forceinline__ void write_o_reg_gmem(float (*o_frag)[num_frags_y][8]
                                                  const uint32_t qo_upper_bound,
                                                  const uint32_t qo_n_stride,
                                                  const uint32_t qo_h_stride,
-                                                 const uint32_t group_size) {
+                                                 const uint_fastdiv group_size) {
   constexpr uint32_t head_dim = num_frags_y * 16;
   constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeOut>();
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
@@ -901,10 +904,12 @@ __device__ __forceinline__ void write_o_reg_gmem(float (*o_frag)[num_frags_y][8]
   for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
     for (uint32_t j = 0; j < 4; ++j) {
-      const uint32_t o_idx = (o_packed_idx_base + tx / 8 + fx * 16 + j * 4) / group_size;
+      uint32_t q, r;
+      group_size.divmod(o_packed_idx_base + tx / 8 + fx * 16 + j * 4, q, r);
+      const uint32_t o_idx = q;
       DTypeOut* o_ptr =
-          o_ptr_base + ((o_packed_idx_base + tx / 8 + fx * 16 + j * 4) / group_size) * qo_n_stride +
-          ((o_packed_idx_base + tx / 8 + fx * 16 + j * 4) % group_size) * qo_h_stride;
+          o_ptr_base + (q) * qo_n_stride +
+          (r) * qo_h_stride;
 #pragma unroll
       for (uint32_t fyo = 0; fyo < num_frags_y / 4; ++fyo) {
         if (o_idx < qo_upper_bound) {
@@ -955,7 +960,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
                                                float* __restrict__ custom_mask,
                                                DTypeOut* __restrict__ o, void* __restrict__ tmp,
                                                float* __restrict__ lse, const uint32_t qo_len,
-                                               const uint32_t kv_len, const uint32_t group_size,
+                                               const uint32_t kv_len, const uint_fastdiv group_size,
                                                float sm_scale, const float log2_rope_rcp_scale,
                                                const float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
@@ -1001,10 +1006,10 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
                                                         (tx % 8) * num_elems_per_128b<DTypeIn>());
   DTypeOut* o_ptr_base =
       partition_kv ? ((DTypeOut*)tmp) + chunk_idx * num_qo_heads * head_dim +
-                         qkv_info.get_qo_elem_offset((qo_packed_idx_base / group_size) * num_chunks,
+                         qkv_info.get_qo_elem_offset(0,
                                                      kv_head_idx * group_size,
                                                      (tx % 8) * num_elems_per_128b<DTypeOut>())
-                   : o + qkv_info.get_qo_elem_offset((qo_packed_idx_base / group_size),
+                   : o + qkv_info.get_qo_elem_offset(0,
                                                      kv_head_idx * group_size,
                                                      (tx % 8) * num_elems_per_128b<DTypeOut>());
   uint32_t q_smem_offset_r =
@@ -1612,6 +1617,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
   }
 
   const uint32_t group_size = num_qo_heads / num_kv_heads;
+  const uint_fastdiv group_size_fastdiv(group_size);
   constexpr uint32_t num_frags_y = HEAD_DIM / 16;
   DISPATCH_NUM_FRAGS_X((qo_len * group_size > 64 && HEAD_DIM < 256 ? 2 : 1), num_frags_x, {
     using DTypeQKAccum =
@@ -1688,9 +1694,9 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
                           (void*)&o,
                           (void*)&tmp,
                           (void*)&lse,
-                          (void*)&num_qo_heads,
-                          (void*)&num_kv_heads,
-                          (void*)&group_size,
+                          (void*)&qo_len,
+                          (void*)&kv_len,
+                          (void*)&group_size_fastdiv,
                           (void*)&sm_scale,
                           (void*)&log2_rope_rcp_scale,
                           (void*)&log2_rope_rcp_theta};
@@ -1709,9 +1715,9 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
                           (void*)&o,
                           (void*)&tmp,
                           (void*)&lse,
-                          (void*)&num_qo_heads,
-                          (void*)&num_kv_heads,
-                          (void*)&group_size,
+                          (void*)&qo_len,
+                          (void*)&kv_len,
+                          (void*)&group_size_fastdiv,
                           (void*)&sm_scale,
                           (void*)&log2_rope_rcp_scale,
                           (void*)&log2_rope_rcp_theta};
