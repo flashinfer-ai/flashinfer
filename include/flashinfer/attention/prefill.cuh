@@ -333,8 +333,8 @@ __device__ __forceinline__ void q_smem_inplace_apply_rotary_multiply_sm_scale(
       q_smem->ldmatrix_m8n8x4(q_smem_offset_r_last_half, q_frag_local[1]);
       q_frag_apply_llama_rope<DTypeIn>(
           (DTypeIn*)q_frag_local[0], (DTypeIn*)q_frag_local[1], rope_freq[fyi],
-          q_packed_idx + kv_len * group_size - qo_len * group_size + tx % 8 + fx * 16 + tx / 4,
-          group_size, sm_scale);
+          q_packed_idx + kv_len * group_size - qo_len * group_size + fx * 16 + tx / 4, group_size,
+          sm_scale);
       q_smem->stmatrix_m8n8x4(q_smem_offset_r_last_half, q_frag_local[1]);
       q_smem->stmatrix_m8n8x4(q_smem_offset_r_first_half, q_frag_local[0]);
       q_smem_offset_r_first_half =
@@ -367,7 +367,7 @@ __device__ __forceinline__ void q_smem_inplace_apply_rotary_with_pos_multiply_sm
       q_smem->ldmatrix_m8n8x4(q_smem_offset_r_last_half, q_frag_local[1]);
       q_frag_apply_llama_rope_with_pos<DTypeIn>(
           (DTypeIn*)q_frag_local[0], (DTypeIn*)q_frag_local[1], rope_freq[fyi],
-          q_packed_idx_base + tx % 8 + fx * 16 + tx / 4, group_size, q_offset, sm_scale);
+          q_packed_idx_base + fx * 16 + tx / 4, group_size, q_offset, sm_scale);
       q_smem->stmatrix_m8n8x4(q_smem_offset_r_last_half, q_frag_local[1]);
       q_smem->stmatrix_m8n8x4(q_smem_offset_r_first_half, q_frag_local[0]);
       q_smem_offset_r_first_half =
