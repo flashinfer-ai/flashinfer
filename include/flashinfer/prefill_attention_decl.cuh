@@ -89,7 +89,7 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
         PAGE_STORAGE, NUM_FRAGS_X, PAGE_SIZE, HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT,
         POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeOut, IdType>(
         q, request_indices, tile_indices, qo_indptr, q_offset, paged_kv, custom_mask, qk_indptr, o,
-        tmp, lse, num_qo_tiles, num_qo_heads, sm_scale, rope_scale, rope_theta, stream);
+        tmp, lse, num_qo_heads, num_qo_tiles, sm_scale, rope_scale, rope_theta, stream);
   });
   return cudaSuccess;
 }
@@ -125,7 +125,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
         NUM_FRAGS_X, HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT, POS_ENCODING_MODE,
         ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeOut, IdType>(
         q, request_indices, tile_indices, qo_indptr, k, v, kv_indptr, custom_mask, qk_indptr,
-        q_offset, k_rope_pos_offset, o, tmp, lse, batch_size, num_qo_tiles, num_qo_heads,
+        q_offset, k_rope_pos_offset, o, tmp, lse, batch_size, num_qo_heads, num_qo_tiles,
         num_kv_heads, sm_scale, rope_scale, rope_theta, stream);
   });
   return cudaSuccess;

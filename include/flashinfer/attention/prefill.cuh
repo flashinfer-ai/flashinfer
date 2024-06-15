@@ -297,7 +297,7 @@ __device__ __forceinline__ void load_q_global_smem(uint32_t packed_offset,
       uint32_t q, r;
       group_size.divmod(packed_offset + tx / 8 + fx * 16 + j * 4, q, r);
       const uint32_t q_idx = q;
-      DTypeIn* q_ptr = q_ptr_base + (q)*qo_n_stride + (r)*qo_h_stride;
+      DTypeIn* q_ptr = q_ptr_base + q * qo_n_stride + r * qo_h_stride;
 #pragma unroll
       for (uint32_t fyo = 0; fyo < num_frags_y / 4; ++fyo) {
         // load q fragment from gmem to smem
@@ -870,7 +870,7 @@ __device__ __forceinline__ void write_o_reg_gmem(
       uint32_t q, r;
       group_size.divmod(o_packed_idx_base + tx / 8 + fx * 16 + j * 4, q, r);
       const uint32_t o_idx = q;
-      DTypeOut* o_ptr = o_ptr_base + (q)*qo_n_stride + (r)*qo_h_stride;
+      DTypeOut* o_ptr = o_ptr_base + q * qo_n_stride + r * qo_h_stride;
 #pragma unroll
       for (uint32_t fyo = 0; fyo < num_frags_y / 4; ++fyo) {
         if (o_idx < qo_upper_bound) {
@@ -931,8 +931,8 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
   const uint32_t bx = blockIdx.x, chunk_idx = blockIdx.y, kv_head_idx = blockIdx.z;
   const uint32_t num_kv_heads = gridDim.z, num_qo_heads = num_kv_heads * group_size;
   constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
-  const tensor_info_t<kv_layout, num_frags_y * 16> qkv_info(qo_len, kv_len, num_kv_heads,
-                                                            num_qo_heads);
+  const tensor_info_t<kv_layout, num_frags_y * 16> qkv_info(qo_len, kv_len, num_qo_heads,
+                                                            num_kv_heads);
   float alibi_slopes[num_frags_x][2];
 
   const uint32_t num_chunks = gridDim.y;
