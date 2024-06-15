@@ -18,6 +18,8 @@
 #include <cuda_runtime.h>
 
 #include <iostream>
+#include <sstream>
+#include <stdexcept>
 #include <vector>
 
 #define STR_HELPER(x) #x
