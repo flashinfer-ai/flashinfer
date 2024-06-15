@@ -34,6 +34,8 @@ def test_segment_gemm(
     use_weight_indices,
     column_major,
 ):
+    if batch_size * num_rows_per_batch > 8192:
+        pytest.skip("batch_size * num_rows_per_batch too large for test.")
     torch.manual_seed(42)
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
     segment_gemm = flashinfer.group_gemm.SegmentGEMMWrapper(workspace_buffer)
@@ -53,7 +55,14 @@ def test_segment_gemm(
                 (torch.randn(num_weights, d_in, d_out) / 10).to(0).to(torch.float16)
             )
     else:
-        weight = (torch.randn(batch_size, d_in, d_out) / 10).to(0).to(torch.float16)
+        if column_major:
+            weight = (
+                (torch.randn(batch_size, d_out, d_in) / 10).to(0).to(torch.float16)
+            )
+        else:
+            weight = (
+                (torch.randn(batch_size, d_in, d_out) / 10).to(0).to(torch.float16)
+            )
     y = segment_gemm.forward(
         x,
         weight,
@@ -101,7 +110,7 @@ def test_segment_gemm(
 
 
 if __name__ == "__main__":
-    test_segment_gemm(199, 99, 128, 128, False, False)
-    test_segment_gemm(199, 99, 128, 128, False, True)
-    test_segment_gemm(199, 99, 128, 128, True, False)
-    test_segment_gemm(199, 99, 128, 128, True, True)
+    test_segment_gemm(199, 99, 128, 1024, False, False)
+    test_segment_gemm(199, 99, 128, 1024, False, True)
+    test_segment_gemm(199, 99, 128, 1024, True, False)
+    test_segment_gemm(199, 99, 128, 1024, True, True)
