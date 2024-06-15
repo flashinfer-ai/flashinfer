@@ -1081,9 +1081,10 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
     for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
       for (uint32_t j = 0; j < 2; ++j) {
-        const uint32_t qo_head_idx =
-            kv_head_idx * group_size + (qo_packed_idx_base + tx / 4 + j * 8 + fx * 16) % group_size;
-        const uint32_t qo_idx = (qo_packed_idx_base + tx / 4 + j * 8 + fx * 16) / group_size;
+        uint32_t q, r;
+        group_size.divmod(qo_packed_idx_base + tx / 4 + j * 8 + fx * 16, q, r);
+        const uint32_t qo_head_idx = kv_head_idx * group_size + r;
+        const uint32_t qo_idx = q;
         if (qo_idx < qo_len) {
           if constexpr (partition_kv) {
             float* tmp_lse =
@@ -1303,9 +1304,10 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
     for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
       for (uint32_t j = 0; j < 2; ++j) {
-        const uint32_t qo_head_idx =
-            kv_head_idx * group_size + (qo_packed_idx_base + tx / 4 + j * 8 + fx * 16) % group_size;
-        const uint32_t qo_idx = (qo_packed_idx_base + tx / 4 + j * 8 + fx * 16) / group_size;
+        uint32_t q, r;
+        group_size.divmod(qo_packed_idx_base + tx / 4 + j * 8 + fx * 16, q, r);
+        const uint32_t qo_head_idx = kv_head_idx * group_size + r;
+        const uint32_t qo_idx = q;
         if (qo_idx < qo_len) {
           lse[(qo_indptr[request_idx] + qo_idx) * num_qo_heads + qo_head_idx] =
               math::ptx_log2(d[fx][j]) + float(m[fx][j]);
@@ -1515,9 +1517,10 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
     for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
       for (uint32_t j = 0; j < 2; ++j) {
-        const uint32_t qo_head_idx =
-            kv_head_idx * group_size + (qo_packed_idx_base + tx / 4 + j * 8 + fx * 16) % group_size;
-        const uint32_t qo_idx = (qo_packed_idx_base + tx / 4 + j * 8 + fx * 16) / group_size;
+        uint32_t q, r;
+        group_size.divmod(qo_packed_idx_base + tx / 4 + j * 8 + fx * 16, q, r);
+        const uint32_t qo_head_idx = kv_head_idx * group_size + r;
+        const uint32_t qo_idx = q;
         if (qo_idx < qo_upper_bound) {
           lse[(qo_indptr[request_idx] + qo_idx) * num_qo_heads + qo_head_idx] =
               math::ptx_log2(d[fx][j]) + float(m[fx][j]);
