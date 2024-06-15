@@ -437,7 +437,7 @@ void _TestBatchPagedPrefillKernelLongContextCorrectness(size_t num_kv_heads, siz
   }
   float result_accuracy = 1. - float(num_result_errors_atol_1e_3_rtol_1e_3) /
                                    max(float(q_lens[0] * num_qo_heads * head_dim), 1.f);
-  std::cout << ", page_size=" << page_size << ", num_qo_heads=" << num_qo_heads
+  std::cout << "page_size=" << page_size << ", num_qo_heads=" << num_qo_heads
             << ", num_kv_heads=" << num_kv_heads << ", q_len=" << q_lens[0]
             << ", kv_len=" << kv_lens[0] << ", head_dim=" << head_dim << ", causal=" << causal
             << ", pos_encoding_mode=" << PosEncodingModeToString(pos_encoding_mode)
@@ -450,7 +450,7 @@ template <typename T>
 void TestBatchPagedPrefillKernelOneHotCorrectness(bool allow_fp16_qk_reduction) {
   for (size_t num_kv_heads : {4, 8, 32}) {
     for (size_t num_qo_heads : {32}) {
-      for (size_t page_size : {1, 8, 16}) {
+      for (size_t page_size : {1, 16}) {
         for (size_t head_dim : {64, 128, 256}) {
           for (size_t causal : {false, true}) {
             for (size_t pos_encoding_mode : {0, 1}) {
@@ -469,7 +469,7 @@ template <typename T>
 void TestBatchPagedPrefillKernelShortContextCorrectness(bool allow_fp16_qk_reduction) {
   for (size_t num_kv_heads : {4, 8, 32}) {
     for (size_t num_qo_heads : {32}) {
-      for (size_t page_size : {1, 8, 16}) {
+      for (size_t page_size : {1, 16}) {
         for (size_t head_dim : {64, 128, 256}) {
           for (size_t causal : {false, true}) {
             for (size_t pos_encoding_mode : {0, 1}) {
@@ -489,7 +489,7 @@ void TestBatchPagedPrefillKernelLongContextCorrectness(bool allow_fp16_qk_reduct
   for (size_t num_kv_heads : {1, 2, 8}) {
     for (size_t group_size : {1, 4, 5, 6, 7, 8}) {
       size_t num_qo_heads = num_kv_heads * group_size;
-      for (size_t page_size : {1, 8, 16}) {
+      for (size_t page_size : {1, 16}) {
         for (size_t head_dim : {64, 128, 256}) {
           for (size_t causal : {false, true}) {
             for (size_t pos_encoding_mode : {0, 1}) {

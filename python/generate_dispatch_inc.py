@@ -116,6 +116,7 @@ def get_dispatch_inc_str(args: argparse.Namespace) -> str:
         [
             dispatch_head_dims_str,
             dispatch_page_sizes_str,
+            dispatch_logits_post_hooks_str,
             dispatch_kv_layouts_str,
             dispatch_pos_encoding_modes_str,
             dispatch_allow_fp16_qk_reductions_str,

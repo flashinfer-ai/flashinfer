@@ -80,7 +80,7 @@ std::vector<dtype_out> single_mha(const std::vector<dtype_in>& q, const std::vec
                                   PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
                                   float rope_scale = 1.f, float rope_theta = 1e4) {
   assert(qo_len <= kv_len);
-  assert(num_q_heads % num_kv_heads == 0);
+  assert(num_qo_heads % num_kv_heads == 0);
   float sm_scale = 1.f / std::sqrt(float(head_dim));
   std::vector<dtype_out> o(qo_len * num_qo_heads * head_dim);
   std::vector<float> att(kv_len);
