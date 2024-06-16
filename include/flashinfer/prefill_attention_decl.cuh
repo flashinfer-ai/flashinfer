@@ -32,7 +32,7 @@ template <uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK, QKVLayout KV_LAYOU
           PosEncodingMode POS_ENCODING_MODE, bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename DTypeIn, typename DTypeOut>
 cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v,
-                                               float* custom_mask, DTypeOut* o, float* tmp,
+                                               uint8_t* custom_mask, DTypeOut* o, float* tmp,
                                                float* lse, uint32_t num_qo_heads,
                                                uint32_t num_kv_heads, uint32_t qo_len,
                                                uint32_t kv_len, float sm_scale, float rope_scale,
@@ -43,7 +43,7 @@ template <uint32_t NUM_FRAGS_X, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HO
           MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, DTypeIn* k,
-    DTypeIn* v, IdType* kv_indptr, float* custom_mask, IdType* qk_indptr, IdType* q_offset,
+    DTypeIn* v, IdType* kv_indptr, uint8_t* custom_mask, IdType* qk_indptr, IdType* q_offset,
     IdType* k_rope_pos_offset, DTypeOut* o, float* tmp, float* lse, uint32_t batch_size,
     uint32_t num_qo_tiles, uint32_t num_qo_heads, uint32_t num_kv_heads, float sm_scale,
     float rope_scale, float rope_theta, cudaStream_t stream = nullptr);
@@ -54,7 +54,7 @@ template <PageStorage PAGE_STORAGE, uint32_t NUM_FRAGS_X, uint32_t HEAD_DIM,
           typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, IdType* q_offset,
-    paged_kv_t<PAGE_STORAGE, KV_LAYOUT, DTypeIn, IdType> paged_kv, float* custom_mask,
+    paged_kv_t<PAGE_STORAGE, KV_LAYOUT, DTypeIn, IdType> paged_kv, uint8_t* custom_mask,
     IdType* qk_indptr, DTypeOut* o, float* tmp, float* lse, uint32_t num_qo_tiles,
     uint32_t num_qo_heads, float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream);
 
@@ -63,7 +63,7 @@ template <PageStorage PAGE_STORAGE, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POS
           MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
     BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, IdType* q_offset,
-    paged_kv_t<PAGE_STORAGE, KV_LAYOUT, DTypeIn, IdType> paged_kv, float* custom_mask,
+    paged_kv_t<PAGE_STORAGE, KV_LAYOUT, DTypeIn, IdType> paged_kv, uint8_t* custom_mask,
     IdType* qk_indptr, DTypeOut* o, float* lse, uint32_t num_qo_heads, float sm_scale,
     float rope_scale, float rope_theta, cudaStream_t stream) {
   float* tmp = nullptr;
@@ -98,7 +98,7 @@ template <uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK, QKVLayout KV_LAYOU
           typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
     BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, DTypeIn* k, DTypeIn* v,
-    IdType* kv_indptr, float* custom_mask, IdType* qk_indptr, IdType* q_offset,
+    IdType* kv_indptr, uint8_t* custom_mask, IdType* qk_indptr, IdType* q_offset,
     IdType* k_rope_pos_offset, DTypeOut* o, float* lse, uint32_t batch_size, uint32_t num_qo_heads,
     uint32_t num_kv_heads, float sm_scale, float rope_scale, float rope_theta,
     cudaStream_t stream) {

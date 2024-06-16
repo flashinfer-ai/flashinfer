@@ -102,20 +102,23 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
 }
 
 std::vector<torch::Tensor> single_prefill_with_kv_cache_custom_mask(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor custom_mask, torch::Tensor tmp,
-    unsigned int layout, unsigned int pos_encoding_mode, bool logits_cap,
+    torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor packed_custom_mask,
+    torch::Tensor tmp, unsigned int layout, unsigned int pos_encoding_mode, bool logits_cap,
     bool allow_fp16_qk_reduction, float sm_scale, float rope_scale, float rope_theta,
     bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(k);
   CHECK_INPUT(v);
-  CHECK_INPUT(custom_mask);
+  CHECK_INPUT(packed_custom_mask);
   CHECK_DIM(3, q);
   CHECK_DIM(3, k);
   CHECK_DIM(3, v);
-  CHECK_DIM(2, custom_mask);
+  CHECK_DIM(1, packed_custom_mask);
   CHECK_SHAPE(k, v);
   CHECK_EQ(q.size(2), k.size(2));
+  // packed_custom_mask must be uint8
+  TORCH_CHECK(packed_custom_mask.scalar_type() == torch::kUInt8,
+              "packed_custom_mask must be uint8");
   unsigned int head_dim = q.size(2);
   unsigned int kv_len, qo_len, num_kv_heads, num_qo_heads;
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
@@ -130,8 +133,6 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache_custom_mask(
     num_kv_heads = k.size(0);
     num_qo_heads = q.size(0);
   }
-  CHECK_EQ(custom_mask.size(0), qo_len);
-  CHECK_EQ(custom_mask.size(1), kv_len);
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
   auto o = torch::empty_like(q, q.options());
@@ -157,7 +158,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache_custom_mask(
                           ALLOW_FP16_QK_REDUCTION, MASK_MODE>(
                           static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
                           static_cast<c_type*>(v.data_ptr()),
-                          static_cast<float*>(custom_mask.data_ptr()),
+                          static_cast<uint8_t*>(packed_custom_mask.data_ptr()),
                           static_cast<c_type*>(o.data_ptr()), static_cast<float*>(tmp.data_ptr()),
                           /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
                           num_qo_heads, num_kv_heads, qo_len, kv_len, sm_scale, rope_scale,

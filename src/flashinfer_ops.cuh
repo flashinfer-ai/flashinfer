@@ -18,9 +18,34 @@
 #include <optional>
 
 #include "flashinfer/attention/logits_post_hook.cuh"
+#include "flashinfer/attention/mask.cuh"
 #include "utils.h"
 
 namespace flashinfer {
+
+template <typename DTypeIn, typename DTypeOut>
+cudaError_t SinglePrefillWithKVCacheCustomMask(
+    DTypeIn* q, DTypeIn* k, DTypeIn* v, uint8_t* custom_mask, DTypeOut* o, float* tmp, float* lse,
+    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t qo_len, uint32_t kv_len,
+    uint32_t head_dim, QKVLayout kv_layout = QKVLayout::kNHD,
+    PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
+    bool allow_fp16_qk_reduction = false, std::optional<float> maybe_sm_scale = std::nullopt,
+    float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {
+  const float sm_scale = maybe_sm_scale.value_or(1.f / std::sqrt(float(head_dim)));
+  DISPATCH_allow_fp16_qk_reduction(
+      allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
+      {DISPATCH_head_dim(
+          head_dim, HEAD_DIM,
+          {DISPATCH_pos_encoding_mode(
+              pos_encoding_mode, POS_ENCODING_MODE, {DISPATCH_kv_layout(kv_layout, KV_LAYOUT, {
+                return SinglePrefillWithKVCacheDispatched<
+                    HEAD_DIM, LogitsPostHook::kNone, KV_LAYOUT, POS_ENCODING_MODE,
+                    ALLOW_FP16_QK_REDUCTION, MaskMode::kCustom>(
+                    q, k, v, custom_mask, o, tmp, lse, num_qo_heads, num_kv_heads, qo_len, kv_len,
+                    sm_scale, rope_scale, rope_theta, stream);
+              })})})});
+  return cudaSuccess;
+}
 
 /*!
  * \brief FlashAttention prefill CUDA function for a single request.

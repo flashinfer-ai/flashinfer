@@ -233,9 +233,9 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
         workspace_buffer, kv_layout
     )
     custom_mask = (
-        torch.triu(
-            torch.full((batch_size, qo_len, kv_len), -5e4, dtype=torch.float32),
-            diagonal=(kv_len - qo_len + 1),
+        torch.tril(
+            torch.full((batch_size, qo_len, kv_len), True),
+            diagonal=(kv_len - qo_len),
         )
         .reshape(-1)
         .to(0)
@@ -357,9 +357,9 @@ def test_batch_prefill_with_ragged_kv_cache_custom_mask(
     )
 
     custom_mask = (
-        torch.triu(
-            torch.full((batch_size, qo_len, kv_len), -5e4, dtype=torch.float32),
-            diagonal=(kv_len - qo_len + 1),
+        torch.tril(
+            torch.full((batch_size, qo_len, kv_len), True),
+            diagonal=(kv_len - qo_len),
         )
         .reshape(-1)
         .to(0)

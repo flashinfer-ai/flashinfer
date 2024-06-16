@@ -33,8 +33,8 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
     bool return_lse);
 
 std::vector<torch::Tensor> single_prefill_with_kv_cache_custom_mask(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor custom_mask, torch::Tensor tmp,
-    unsigned int layout, unsigned int pos_encoding_mode, bool logits_cap,
+    torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor packed_custom_mask,
+    torch::Tensor tmp, unsigned int layout, unsigned int pos_encoding_mode, bool logits_cap,
     bool allow_fp16_qk_reduction, float sm_scale, float rope_scale, float rope_theta,
     bool return_lse);
 
@@ -73,6 +73,11 @@ torch::Tensor chain_speculative_sampling(torch::Tensor draft_probs, torch::Tenso
                                          torch::Tensor uniform_samples, torch::Tensor target_probs);
 
 torch::Tensor rmsnorm(torch::Tensor x, torch::Tensor w, double eps);
+
+torch::Tensor packbits(torch::Tensor x, const std::string& bitorder);
+
+torch::Tensor segment_packbits(torch::Tensor x, torch::Tensor input_indptr,
+                               torch::Tensor output_indptr, const std::string& bitorder);
 
 class BatchDecodeWithPagedKVCachePyTorchWrapper {
  public:
@@ -122,9 +127,10 @@ class BatchPrefillWithPagedKVCachePyTorchWrapper {
   std::vector<torch::Tensor> ForwardCustomMask(
       torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor paged_kv_data,
       torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
-      torch::Tensor paged_kv_last_page_len, torch::Tensor custom_mask, torch::Tensor qk_indptr,
-      unsigned int pos_encoding_mode, bool logits_cap, bool allow_fp16_qk_reduction, float sm_scale,
-      float rope_scale, float rope_theta, bool return_lse);
+      torch::Tensor paged_kv_last_page_len, torch::Tensor packed_custom_mask,
+      torch::Tensor qk_indptr, unsigned int pos_encoding_mode, bool logits_cap,
+      bool allow_fp16_qk_reduction, float sm_scale, float rope_scale, float rope_theta,
+      bool return_lse);
   BatchPrefillWithPagedKVCachePyTorchWrapper(unsigned int layout, bool enable_cuda_graph)
       : kv_layout_(flashinfer::QKVLayout(layout)),
         handler_(std::make_shared<flashinfer::BatchPrefillHandler>(enable_cuda_graph)) {}
@@ -147,13 +153,11 @@ class BatchPrefillWithRaggedKVCachePyTorchWrapper {
                                      unsigned int pos_encoding_mode, bool logits_cap,
                                      bool allow_fp16_qk_reduction, float sm_scale, float rope_scale,
                                      float rope_theta, bool return_lse);
-  std::vector<torch::Tensor> ForwardCustomMask(torch::Tensor q, torch::Tensor qo_indptr,
-                                               torch::Tensor k, torch::Tensor v,
-                                               torch::Tensor kv_indptr, torch::Tensor custom_mask,
-                                               torch::Tensor qk_indptr,
-                                               unsigned int pos_encoding_mode, bool logits_cap,
-                                               bool allow_fp16_qk_reduction, float sm_scale,
-                                               float rope_scale, float rope_theta, bool return_lse);
+  std::vector<torch::Tensor> ForwardCustomMask(
+      torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor k, torch::Tensor v,
+      torch::Tensor kv_indptr, torch::Tensor packed_custom_mask, torch::Tensor qk_indptr,
+      unsigned int pos_encoding_mode, bool logits_cap, bool allow_fp16_qk_reduction, float sm_scale,
+      float rope_scale, float rope_theta, bool return_lse);
   BatchPrefillWithRaggedKVCachePyTorchWrapper(unsigned int layout, bool enable_cuda_graph)
       : kv_layout_(flashinfer::QKVLayout(layout)),
         handler_(std::make_shared<flashinfer::BatchPrefillHandler>(enable_cuda_graph)) {}

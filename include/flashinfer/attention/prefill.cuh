@@ -547,7 +547,7 @@ template <bool partition_kv, MaskMode mask_mode, uint32_t num_warps, uint32_t nu
 __device__ __forceinline__ void mask_s(const uint32_t qo_packed_idx_base,
                                        const uint32_t kv_idx_base, const uint32_t qo_len,
                                        const uint32_t kv_len, const uint32_t chunk_end,
-                                       const uint_fastdiv group_size, float* custom_mask,
+                                       const uint_fastdiv group_size, uint8_t* custom_mask,
                                        DTypeQKAccum (*s_frag)[num_frags_z][8]) {
   const uint32_t tx = threadIdx.x;
 #pragma unroll
@@ -565,11 +565,11 @@ __device__ __forceinline__ void mask_s(const uint32_t qo_packed_idx_base,
                  ? (kv_idx > kv_len + q_idx - qo_len || (partition_kv && kv_idx >= chunk_end))
                  : kv_idx >= chunk_end);
         s_frag[fx][fz][reg_id] =
-            out_of_boundary ? DTypeQKAccum(-5e4)
-                            : s_frag[fx][fz][reg_id] +
-                                  DTypeQKAccum((mask_mode == MaskMode::kCustom && q_idx < qo_len)
-                                                   ? custom_mask[q_idx * kv_len + kv_idx]
-                                                   : 0.f);
+            (out_of_boundary ||
+             ((mask_mode == MaskMode::kCustom && q_idx < qo_len &&
+               !(custom_mask[(q_idx * kv_len + kv_idx) / 8] >> ((q_idx * kv_len + kv_idx) % 8)))))
+                ? DTypeQKAccum(-5e4)
+                : s_frag[fx][fz][reg_id];
       }
     }
   }
@@ -891,7 +891,7 @@ template <LogitsPostHook logits_post_hook, bool partition_kv, MaskMode mask_mode
           typename DTypeQKAccum, typename DTypeOut>
 __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* __restrict__ k,
                                                DTypeIn* __restrict__ v,
-                                               float* __restrict__ custom_mask,
+                                               uint8_t* __restrict__ custom_mask,
                                                DTypeOut* __restrict__ o, void* __restrict__ tmp,
                                                float* __restrict__ lse, const uint32_t qo_len,
                                                const uint32_t kv_len, const uint_fastdiv group_size,
@@ -1107,7 +1107,7 @@ template <LogitsPostHook logits_post_hook, MaskMode mask_mode, QKVLayout kv_layo
 __global__ void BatchPrefillWithRaggedKVCacheKernel(
     DTypeIn* __restrict__ q, IdType* __restrict__ request_indices,
     IdType* __restrict__ tile_indices, IdType* __restrict__ qo_indptr, DTypeIn* __restrict__ k,
-    DTypeIn* __restrict__ v, IdType* __restrict__ kv_indptr, float* __restrict__ custom_mask,
+    DTypeIn* __restrict__ v, IdType* __restrict__ kv_indptr, uint8_t* __restrict__ custom_mask,
     IdType* __restrict__ qk_indptr, IdType* __restrict__ q_offset,
     IdType* __restrict__ k_rope_pos_offset, DTypeOut* __restrict__ o, float* __restrict__ tmp,
     float* __restrict__ lse, uint32_t batch_size, const uint_fastdiv group_size, float sm_scale,
@@ -1324,9 +1324,9 @@ template <LogitsPostHook logits_post_hook, MaskMode mask_mode, PosEncodingMode p
 __global__ void BatchPrefillWithPagedKVCacheKernel(
     IdType* __restrict__ request_indices, IdType* __restrict__ tile_indices,
     DTypeIn* __restrict__ q, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
-    IdType* __restrict__ qo_indptr, float* __restrict__ custom_mask, IdType* __restrict__ qk_indptr,
-    IdType* __restrict__ q_offset, DTypeOut* __restrict__ o, float* __restrict__ tmp,
-    float* __restrict__ lse, const uint_fastdiv group_size, float sm_scale,
+    IdType* __restrict__ qo_indptr, uint8_t* __restrict__ custom_mask,
+    IdType* __restrict__ qk_indptr, IdType* __restrict__ q_offset, DTypeOut* __restrict__ o,
+    float* __restrict__ tmp, float* __restrict__ lse, const uint_fastdiv group_size, float sm_scale,
     float log2_rope_rcp_scale, float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
@@ -1534,7 +1534,7 @@ template <uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK, QKVLayout KV_LAYOU
           PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename DTypeIn, typename DTypeOut>
 cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v,
-                                               float* custom_mask, DTypeOut* o, float* tmp,
+                                               uint8_t* custom_mask, DTypeOut* o, float* tmp,
                                                float* lse, uint32_t num_qo_heads,
                                                uint32_t num_kv_heads, uint32_t qo_len,
                                                uint32_t kv_len, float sm_scale, float rope_scale,
@@ -1674,7 +1674,7 @@ template <uint32_t num_frags_x, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HO
           MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, DTypeIn* k,
-    DTypeIn* v, IdType* kv_indptr, float* custom_mask, IdType* qk_indptr, IdType* q_offset,
+    DTypeIn* v, IdType* kv_indptr, uint8_t* custom_mask, IdType* qk_indptr, IdType* q_offset,
     IdType* k_rope_pos_offset, DTypeOut* o, float* tmp, float* lse, const uint32_t batch_size,
     const uint32_t num_qo_heads, const uint32_t num_qo_tiles, const uint32_t num_kv_heads,
     const float sm_scale, const float rope_scale, const float rope_theta,
@@ -1758,7 +1758,7 @@ template <PageStorage page_storage, uint32_t num_frags_x, uint32_t HEAD_DIM,
           typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, IdType* q_offset,
-    paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, float* custom_mask,
+    paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, uint8_t* custom_mask,
     IdType* qk_indptr, DTypeOut* o, float* tmp, float* lse, uint32_t num_qo_heads,
     uint32_t num_qo_tiles, float sm_scale, float rope_scale, float rope_theta,
     cudaStream_t stream) {
