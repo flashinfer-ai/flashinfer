@@ -32,7 +32,7 @@ except ImportError as e:
 def packbits(x: torch.Tensor, bitorder: str = "big"):
     r"""Pack the elements of a binary-valued array into bits in a uint8 array.
 
-    See `numpy.packbits <https://numpy.org/doc/stable/reference/generated/numpy.packbits.html>`_ for more details.
+    The semantics of this function is the same as `numpy.packbits <https://numpy.org/doc/stable/reference/generated/numpy.packbits.html>`_.
 
     Parameters
     ----------
@@ -45,19 +45,25 @@ def packbits(x: torch.Tensor, bitorder: str = "big"):
     -------
     y: torch.Tensor
         An uint8 packed array, shape ``((x.size(0) + 7) / 8),)``.
+
+    See Also
+    --------
+    segment_packbits
     """
     return _kernels.packbits(x, bitorder)
 
 
 def segment_packbits(x: torch.Tensor, indptr: torch.Tensor, bitorder: str = "big"):
-    r"""Pack a batch elements of a binary-valued array into bits in a uint8 array.
+    r"""Pack a batch of binary-valued segments into bits in a uint8 array.
+
+    For each segment, the semantics of this function is the same as `numpy.packbits <https://numpy.org/doc/stable/reference/generated/numpy.packbits.html>`_.
 
     Parameters
     ----------
     x: torch.Tensor
-        The 1D binary-valued array to pack.
+        The 1D binary-valued array to pack, shape ``(indptr[-1],)``.
     indptr: torch.Tensor
-        The index pointer of the first element of each segment in :attr:`x`.
+        The index pointer of each segment in :attr:`x`, shape ``(batch_size + 1,)``.
         The i-th segment in :attr:`x` is ``x[indptr[i]:indptr[i+1]]``.
     bitorder: str
         The bit-order ("bit"/"little") of the output. Default is "big".
@@ -68,8 +74,12 @@ def segment_packbits(x: torch.Tensor, indptr: torch.Tensor, bitorder: str = "big
         An uint8 packed array, shape: ``(new_indptr[-1],)``.
         The ``y[new_indptr[i]:new_indptr[i+1]]`` contains the packed bits ``x[indptr[i]:indptr[i+1]]``.
     new_indptr: torch.Tensor
-        The new index pointer of the first element of each packed segment in :attr:`y`.
+        The new index pointer of each packed segment in :attr:`y`, shape ``(batch_size + 1,)``.
         It's guaranteed that ``new_indptr[i+1] - new_indptr[i] == (indptr[i+1] - indptr[i] + 7) // 8``.
+
+    See Also
+    --------
+    packbits
     """
     seglen = indptr[1:] - indptr[:-1]
     packed_len = (seglen + 7) // 8

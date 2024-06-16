@@ -46,7 +46,7 @@ def get_cu_file_str(
     {dtype_in}* q, {idtype}* request_indices, {idtype}* tile_indices,
     {idtype}* qo_indptr, {idtype}* q_offset,
     paged_kv_t<page_storage, {kv_layout}, {dtype_in}, {idtype}> paged_kv,
-    float* custom_mask, {idtype}* qk_indptr,
+    uint8_t* custom_mask, {idtype}* qk_indptr,
     {dtype_out}* o, float* tmp, float* lse,
     uint32_t num_qo_tiles, uint32_t num_qo_heads,
     float sm_scale, float rope_scale,

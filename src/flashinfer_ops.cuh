@@ -25,7 +25,7 @@ namespace flashinfer {
 
 template <typename DTypeIn, typename DTypeOut>
 cudaError_t SinglePrefillWithKVCacheCustomMask(
-    DTypeIn* q, DTypeIn* k, DTypeIn* v, float* custom_mask, DTypeOut* o, float* tmp, float* lse,
+    DTypeIn* q, DTypeIn* k, DTypeIn* v, uint8_t* custom_mask, DTypeOut* o, float* tmp, float* lse,
     uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t qo_len, uint32_t kv_len,
     uint32_t head_dim, QKVLayout kv_layout = QKVLayout::kNHD,
     PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,

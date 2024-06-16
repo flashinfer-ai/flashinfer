@@ -23,6 +23,8 @@
 using flashinfer::PosEncodingMode;
 using flashinfer::QKVLayout;
 
+inline uint32_t ceil_div(uint32_t a, uint32_t b) { return (a + b - 1) / b; }
+
 template <typename dtype_in, typename dtype_out, bool append>
 void bench_flashinfer_single_prefill(nvbench::state& state) {
   size_t kv_len = state.get_int64("kv_len");
@@ -46,7 +48,7 @@ void bench_flashinfer_single_prefill(nvbench::state& state) {
   thrust::device_vector<dtype_in> Q(qo_len * num_qo_heads * head_dim);
   thrust::device_vector<dtype_in> K(kv_len * num_kv_heads * head_dim);
   thrust::device_vector<dtype_in> V(kv_len * num_kv_heads * head_dim);
-  thrust::device_vector<float> mask(qo_len * kv_len);
+  thrust::device_vector<uint8_t> mask(ceil_div(qo_len * kv_len, 8));
   thrust::device_vector<dtype_out> O(qo_len * num_qo_heads * head_dim);
   thrust::device_vector<float> tmp(8 * 1024 * 1024);
 

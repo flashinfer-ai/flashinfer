@@ -44,7 +44,7 @@ def get_cu_file_str(
             """template cudaError_t BatchPrefillWithRaggedKVCacheDispatched<{num_frags_x}, {head_dim}, {logits_hook}, {kv_layout}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {dtype_in}, {dtype_out}, {idtype}>(
     {dtype_in}* q, {idtype}* request_indices, {idtype}* tile_indices, {idtype}* qo_indptr,
     {dtype_in}* k, {dtype_in}* v, {idtype}* kv_indptr,
-    float* custom_mask, {idtype}* qk_indptr,
+    uint8_t* custom_mask, {idtype}* qk_indptr,
     {idtype}* q_offset, {idtype}* k_rope_pos_offset,
     {dtype_out}* o, float* tmp, float* lse,
     uint32_t batch_size, uint32_t num_qo_tiles,

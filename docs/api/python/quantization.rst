@@ -11,3 +11,4 @@ Quantization related kernels.
     :toctree: _generate
     
     packbits
+    segment_packbits
