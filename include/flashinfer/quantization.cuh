@@ -18,6 +18,8 @@
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 
+#include <cub/cub.cuh>
+
 #include "utils.cuh"
 
 namespace flashinfer {
@@ -36,20 +38,13 @@ enum class BitOrder { kBig = 0U, kLittle = 1U };
 
 template <BitOrder BITORDER>
 __global__ void PackBitsKernel(bool* input, uint8_t* output, int64_t num_elements) {
-  int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t start_offset = blockIdx.x * blockDim.x * 8, tx = threadIdx.x;
   uint8_t ret = 0;
-  uint8_t input_vec[8];
-  for (uint32_t i = 0; i < 8; ++i) {
-    input_vec[i] = 0;
-  }
-  if ((idx + 1) * 8 <= num_elements) {
-    *(uint2*)input_vec = *(uint2*)(input + idx * 8);
-  } else {
-#pragma unroll
-    for (uint32_t i = 0; i < 8; ++i) {
-      input_vec[i] = (idx * 8 + i < num_elements) ? input[idx * 8 + i] : false;
-    }
-  }
+  bool input_vec[8];
+  typedef cub::BlockLoad<bool, 256, 8, cub::BLOCK_LOAD_VECTORIZE> BlockLoad;
+  __shared__ typename BlockLoad::TempStorage temp_storage;
+  BlockLoad(temp_storage)
+      .Load(input + start_offset, input_vec, num_elements - start_offset, /*default=*/0);
 
   if constexpr (BITORDER == BitOrder::kBig) {
     ret = (input_vec[0] << 7) | (input_vec[1] << 6) | (input_vec[2] << 5) | (input_vec[3] << 4) |
@@ -58,23 +53,22 @@ __global__ void PackBitsKernel(bool* input, uint8_t* output, int64_t num_element
     ret = (input_vec[7] << 7) | (input_vec[6] << 6) | (input_vec[5] << 5) | (input_vec[4] << 4) |
           (input_vec[3] << 3) | (input_vec[2] << 2) | (input_vec[1] << 1) | input_vec[0];
   }
-  output[idx] = ret;
+  if (start_offset + tx * 8 < num_elements) output[start_offset / 8 + tx] = ret;
 }
 
-// NOTE(Zihao): this implementation is not efficient, but this kernel is not a bottleneck
-// at the moment. We can optimize it later if needed.
 template <BitOrder BITORDER, typename IdType>
 __global__ void SegmentPackBitsKernel(bool* input, uint8_t* output, IdType* input_indptr,
                                       IdType* output_indptr) {
   int64_t bx = blockIdx.x, tx = threadIdx.x;
-  for (uint32_t j = tx; j < output_indptr[bx + 1] - output_indptr[bx]; j += blockDim.x) {
-    int64_t num_elements = input_indptr[bx + 1] - input_indptr[bx];
+  bool input_vec[8];
+  typedef cub::BlockLoad<bool, 256, 8, cub::BLOCK_LOAD_VECTORIZE> BlockLoad;
+  __shared__ typename BlockLoad::TempStorage temp_storage;
+  int64_t num_elements = input_indptr[bx + 1] - input_indptr[bx];
+  for (uint32_t start_offset = 0; start_offset < num_elements; start_offset += 8 * blockDim.x) {
     uint8_t ret = 0;
-    uint8_t input_vec[8];
-#pragma unroll
-    for (uint32_t i = 0; i < 8; ++i) {
-      input_vec[i] = (j * 8 + i < num_elements) ? input[input_indptr[bx] + j * 8 + i] : false;
-    }
+    BlockLoad(temp_storage)
+        .Load(input + input_indptr[bx] + start_offset, input_vec, num_elements - start_offset,
+              /*default=*/0);
 
     if constexpr (BITORDER == BitOrder::kBig) {
       ret = (input_vec[0] << 7) | (input_vec[1] << 6) | (input_vec[2] << 5) | (input_vec[3] << 4) |
@@ -83,7 +77,8 @@ __global__ void SegmentPackBitsKernel(bool* input, uint8_t* output, IdType* inpu
       ret = (input_vec[7] << 7) | (input_vec[6] << 6) | (input_vec[5] << 5) | (input_vec[4] << 4) |
             (input_vec[3] << 3) | (input_vec[2] << 2) | (input_vec[1] << 1) | input_vec[0];
     }
-    output[output_indptr[bx] + j] = ret;
+    if (start_offset + tx * 8 < num_elements)
+      output[output_indptr[bx] + start_offset / 8 + tx] = ret;
   }
 }
 

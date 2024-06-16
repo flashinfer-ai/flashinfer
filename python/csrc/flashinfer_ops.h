@@ -76,8 +76,8 @@ torch::Tensor rmsnorm(torch::Tensor x, torch::Tensor w, double eps);
 
 torch::Tensor packbits(torch::Tensor x, const std::string& bitorder);
 
-torch::Tensor segment_packbits(torch::Tensor x, torch::Tensor input_indptr, torch::Tensor output_indptr,
-                               const std::string& bitorder);
+torch::Tensor segment_packbits(torch::Tensor x, torch::Tensor input_indptr,
+                               torch::Tensor output_indptr, const std::string& bitorder);
 
 class BatchDecodeWithPagedKVCachePyTorchWrapper {
  public:

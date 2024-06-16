@@ -28,9 +28,10 @@ except ImportError as e:
     else:
         raise e
 
+
 def packbits(x: torch.Tensor, bitorder: str = "big"):
     r"""Pack the elements of a binary-valued array into bits in a uint8 array.
- 
+
     See `numpy.packbits <https://numpy.org/doc/stable/reference/generated/numpy.packbits.html>`_ for more details.
 
     Parameters
@@ -47,7 +48,8 @@ def packbits(x: torch.Tensor, bitorder: str = "big"):
     """
     return _kernels.packbits(x, bitorder)
 
-def segment_packbits(x: torch.Tensor, indptr: torch.Tensor, bitorder: str="big"):
+
+def segment_packbits(x: torch.Tensor, indptr: torch.Tensor, bitorder: str = "big"):
     r"""Pack a batch elements of a binary-valued array into bits in a uint8 array.
 
     Parameters
@@ -59,7 +61,7 @@ def segment_packbits(x: torch.Tensor, indptr: torch.Tensor, bitorder: str="big")
         The i-th segment in :attr:`x` is ``x[indptr[i]:indptr[i+1]]``.
     bitorder: str
         The bit-order ("bit"/"little") of the output. Default is "big".
-    
+
     Returns
     -------
     y: torch.Tensor
@@ -71,5 +73,6 @@ def segment_packbits(x: torch.Tensor, indptr: torch.Tensor, bitorder: str="big")
     """
     seglen = indptr[1:] - indptr[:-1]
     packed_len = (seglen + 7) // 8
-    indptr_new = torch.empty(len(indptr) + 1, dtype=indptr.dtype, device=indptr.device)
+    indptr_new = torch.zeros(len(indptr), dtype=indptr.dtype, device=indptr.device)
     indptr_new[1:] = torch.cumsum(packed_len, 0)
+    return _kernels.segment_packbits(x, indptr, indptr_new, bitorder), indptr_new
