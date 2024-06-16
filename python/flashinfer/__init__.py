@@ -46,6 +46,7 @@ from .sampling import (
 )
 from .norm import rmsnorm
 from .group_gemm import SegmentGEMMWrapper
+from .quantization import packbits, segment_packbits
 
 try:
     from ._build_meta import __version__ as __version__

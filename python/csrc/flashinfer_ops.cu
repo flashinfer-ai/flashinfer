@@ -42,6 +42,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("chain_speculative_sampling", &chain_speculative_sampling,
         "Speculative sampling from sequence of probabilities");
   m.def("rmsnorm", &rmsnorm, "Root mean square normalization");
+  m.def("packbits", &packbits, "GPU packbits operator");
+  m.def("segment_packbits", &segment_packbits, "GPU segment packbits operator");
   py::class_<BatchDecodeWithPagedKVCachePyTorchWrapper>(m,
                                                         "BatchDecodeWithPagedKVCachePyTorchWrapper")
       .def(py::init<unsigned int, bool, unsigned int>())

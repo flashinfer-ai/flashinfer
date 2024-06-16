@@ -345,6 +345,7 @@ if __name__ == "__main__":
                 "csrc/sampling.cu",
                 "csrc/norm.cu",
                 "csrc/group_gemm.cu",
+                "csrc/quantization.cu",
             ]
             + get_instantiation_cu(),
             include_dirs=[
