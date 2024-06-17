@@ -1668,7 +1668,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, DTypeIn* k,
     DTypeIn* v, IdType* kv_indptr, uint8_t* custom_mask, IdType* qk_indptr, IdType* q_offset,
     IdType* k_rope_pos_offset, DTypeOut* o, float* tmp, float* lse, const uint32_t batch_size,
-    const uint32_t num_qo_heads, const uint32_t num_qo_tiles, const uint32_t num_kv_heads,
+    const uint32_t num_qo_heads, const uint32_t num_tiles, const uint32_t num_kv_heads,
     const float sm_scale, const float rope_scale, const float rope_theta,
     cudaStream_t stream = nullptr) {
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
@@ -1677,7 +1677,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
   const uint32_t group_size = num_qo_heads / num_kv_heads;
   const uint_fastdiv group_size_fastdiv(group_size);
 
-  dim3 nblks(num_qo_tiles, 1, num_kv_heads);
+  dim3 nblks(num_tiles, 1, num_kv_heads);
   dim3 nthrs(32, num_warps);
   constexpr uint32_t num_frags_y = HEAD_DIM / 16;
   using DTypeQKAccum =
@@ -1752,7 +1752,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, IdType* q_offset,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, uint8_t* custom_mask,
     IdType* qk_indptr, DTypeOut* o, float* tmp, float* lse, uint32_t num_qo_heads,
-    uint32_t num_qo_tiles, float sm_scale, float rope_scale, float rope_theta,
+    uint32_t num_tiles, float sm_scale, float rope_scale, float rope_theta,
     cudaStream_t stream) {
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
@@ -1762,7 +1762,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
   const uint32_t group_size = num_qo_heads / num_kv_heads;
   const uint_fastdiv group_size_fastdiv(group_size);
 
-  dim3 nblks(num_qo_tiles, 1, num_kv_heads);
+  dim3 nblks(num_tiles, 1, num_kv_heads);
   dim3 nthrs(32, num_warps);
 
   constexpr uint32_t num_frags_y = HEAD_DIM / 16;

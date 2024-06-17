@@ -45,7 +45,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, DTypeIn* k,
     DTypeIn* v, IdType* kv_indptr, uint8_t* custom_mask, IdType* qk_indptr, IdType* q_offset,
     IdType* k_rope_pos_offset, DTypeOut* o, float* tmp, float* lse, uint32_t batch_size,
-    uint32_t num_qo_tiles, uint32_t num_qo_heads, uint32_t num_kv_heads, float sm_scale,
+    uint32_t num_tiles, uint32_t num_qo_heads, uint32_t num_kv_heads, float sm_scale,
     float rope_scale, float rope_theta, cudaStream_t stream = nullptr);
 
 template <PageStorage PAGE_STORAGE, uint32_t NUM_FRAGS_X, uint32_t HEAD_DIM,
@@ -55,7 +55,7 @@ template <PageStorage PAGE_STORAGE, uint32_t NUM_FRAGS_X, uint32_t HEAD_DIM,
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, IdType* q_offset,
     paged_kv_t<PAGE_STORAGE, KV_LAYOUT, DTypeIn, IdType> paged_kv, uint8_t* custom_mask,
-    IdType* qk_indptr, DTypeOut* o, float* tmp, float* lse, uint32_t num_qo_tiles,
+    IdType* qk_indptr, DTypeOut* o, float* tmp, float* lse, uint32_t num_tiles,
     uint32_t num_qo_heads, float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream);
 
 template <PageStorage PAGE_STORAGE, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK,
@@ -70,12 +70,12 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
   IdType* request_indices = nullptr;
   IdType* tile_indices = nullptr;
   uint32_t num_frags_x = 0U;
-  uint32_t num_qo_tiles = 0U;
+  uint32_t num_tiles = 0U;
   if (handler->IsForwardStarted()) {
     request_indices = handler->GetRequestIndices<IdType>();
-    tile_indices = handler->GetTileIndices<IdType>();
+    tile_indices = handler->GetQOTileIndices<IdType>();
     num_frags_x = handler->GetNumFragsX();
-    num_qo_tiles = handler->GetNumQOTiles();
+    num_tiles = handler->GetNumTiles();
   } else {
     std::ostringstream err_msg;
     err_msg << "Please call BatchPrefillHandler's BeginForward() before calling "
@@ -88,7 +88,7 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
         PAGE_STORAGE, NUM_FRAGS_X, HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT, POS_ENCODING_MODE,
         ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeOut, IdType>(
         q, request_indices, tile_indices, qo_indptr, q_offset, paged_kv, custom_mask, qk_indptr, o,
-        tmp, lse, num_qo_heads, num_qo_tiles, sm_scale, rope_scale, rope_theta, stream);
+        tmp, lse, num_qo_heads, num_tiles, sm_scale, rope_scale, rope_theta, stream);
   });
   return cudaSuccess;
 }
@@ -106,12 +106,12 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
   IdType* request_indices = nullptr;
   IdType* tile_indices = nullptr;
   uint32_t num_frags_x = 0U;
-  uint32_t num_qo_tiles = 0U;
+  uint32_t num_tiles = 0U;
   if (handler->IsForwardStarted()) {
     request_indices = handler->GetRequestIndices<IdType>();
-    tile_indices = handler->GetTileIndices<IdType>();
+    tile_indices = handler->GetQOTileIndices<IdType>();
     num_frags_x = handler->GetNumFragsX();
-    num_qo_tiles = handler->GetNumQOTiles();
+    num_tiles = handler->GetNumTiles();
   } else {
     std::ostringstream err_msg;
     err_msg << "Please call BatchPrefillHandler's BeginForward() before calling "
@@ -124,7 +124,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
         NUM_FRAGS_X, HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT, POS_ENCODING_MODE,
         ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeOut, IdType>(
         q, request_indices, tile_indices, qo_indptr, k, v, kv_indptr, custom_mask, qk_indptr,
-        q_offset, k_rope_pos_offset, o, tmp, lse, batch_size, num_qo_heads, num_qo_tiles,
+        q_offset, k_rope_pos_offset, o, tmp, lse, batch_size, num_qo_heads, num_tiles,
         num_kv_heads, sm_scale, rope_scale, rope_theta, stream);
   });
   return cudaSuccess;

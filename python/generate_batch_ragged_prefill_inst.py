@@ -47,7 +47,7 @@ def get_cu_file_str(
     uint8_t* custom_mask, {idtype}* qk_indptr,
     {idtype}* q_offset, {idtype}* k_rope_pos_offset,
     {dtype_out}* o, float* tmp, float* lse,
-    uint32_t batch_size, uint32_t num_qo_tiles,
+    uint32_t batch_size, uint32_t num_tiles,
     uint32_t num_qo_heads, uint32_t num_kv_heads,
     float sm_scale, float rope_scale,
     float rope_theta, cudaStream_t stream);

@@ -82,6 +82,36 @@ std::pair<uint32_t, uint32_t> PartitionPagedKVCacheBinarySearchMinNumPagePerBatc
   return {low, new_batch_size};
 }
 
+std::pair<uint32_t, uint32_t> PrefillBinarySearchKVChunkSize(
+    const uint32_t max_grid_size, const uint32_t num_kv_heads,
+    const std::vector<int64_t>& packed_qo_len_arr, const std::vector<int64_t>& kv_len_arr,
+    const uint32_t qo_chunk_size, const uint32_t min_kv_chunk_size = 1) {
+  int64_t low = min_kv_chunk_size, high = 0;
+  int64_t batch_size = packed_qo_len_arr.size();
+  for (const int64_t& kv_len : kv_len_arr) {
+    high = max(high, elem);
+  }
+  int64_t new_batch_size;
+  while (low < high) {
+    int64_t mid = (low + high) / 2;
+    new_batch_size = 0;
+    for (uint32_t i = 0; i < batch_size; ++i) {
+      new_batch_size +=
+          ceil_div(packed_qo_len_arr[i], qo_chunk_size) * ceil_div(kv_len_arr[i], mid);
+    }
+    if (new_batch_size * num_kv_heads > max_grid_size) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  new_batch_size = 0;
+  for (uint32_t i = 0; i < batch_size; ++i) {
+    new_batch_size += ceil_div(packed_qo_len_arr[i], qo_chunk_size) * ceil_div(kv_len_arr[i], mid);
+  }
+  return {low, new_batch_size};
+}
+
 /*!
  * \brief Estimate the temporary buffer size and the maximum grid size for the
  *   partition-kv BatchDecodeWithPagedKVCache kernel
@@ -500,6 +530,112 @@ class BatchDecodeHandler {
   cudaStream_t stream_;
 };
 
+template <typename IdType>
+std::tuple<IdType, IdType, std::vector<IdType>, std::vector<IdType>> split_qo_indptr(
+    IdType* qo_indptr, uint32_t batch_size, uint32_t gqa_group_size, uint32_t head_dim,
+    cudaStream_t stream = nullptr) {
+  constexpr uint32_t num_warps = 4;
+  std::vector<IdType> qo_indptr_h(batch_size + 1), request_indices, tile_indices;
+  if (is_device_ptr((void*)qo_indptr)) {
+    cudaMemcpyAsync(qo_indptr_h.data(), qo_indptr, sizeof(IdType) * (batch_size + 1),
+                    cudaMemcpyDeviceToHost, stream);
+  } else {
+    qo_indptr_h.assign(qo_indptr, qo_indptr + batch_size + 1);
+  }
+
+  const uint32_t total_q_len = qo_indptr_h[batch_size];
+  const bool avg_len_greater_than_64 = total_q_len * gqa_group_size > 64 * batch_size;
+  const uint32_t num_frags_x = (head_dim < 256 && avg_len_greater_than_64) ? 2 : 1;
+  const uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
+  uint32_t num_tiles = 0;
+
+  for (uint32_t i = 0; i < batch_size; ++i) {
+    for (uint32_t j = qo_indptr_h[i] * gqa_group_size; j < qo_indptr_h[i + 1] * gqa_group_size;
+         j += num_rows_per_cta) {
+      request_indices.push_back(i);
+      tile_indices.push_back((j - qo_indptr_h[i] * gqa_group_size) / num_rows_per_cta);
+      ++num_tiles;
+    }
+  }
+
+  return {num_frags_x, num_tiles, std::move(request_indices), std::move(tile_indices)};
+}
+
+template <typename IdType>
+void split_qo_kv_indptr(IdType* qo_indptr, IdType* kv_indptr, uint32_t batch_size,
+                        uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
+                        uint32_t page_size, cudaStream_t stream = nullptr) {
+  const uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
+  constexpr uint32_t num_warps = 4;
+  std::vector<IdType> qo_indptr_h(batch_size + 1), kv_indptr_h(batch_size + 1),
+      kv_last_page_len_h(batch_size);
+  if (is_device_ptr((void*)qo_indptr)) {
+    cudaMemcpyAsync(qo_indptr_h.data(), qo_indptr, sizeof(IdType) * (batch_size + 1),
+                    cudaMemcpyDeviceToHost, stream);
+  } else {
+    qo_indptr_h.assign(qo_indptr, qo_indptr + batch_size + 1);
+  }
+
+  if (is_device_ptr((void*)kv_indptr)) {
+    cudaMemcpyAsync(kv_indptr_h.data(), kv_indptr, sizeof(IdType) * (batch_size + 1),
+                    cudaMemcpyDeviceToHost, stream);
+  } else {
+    kv_indptr_h.assign(kv_indptr, kv_indptr + batch_size + 1);
+  }
+
+  // step 0: get the number of SMs
+  int num_sm = 0;
+  int dev_id = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
+  int num_blocks_per_sm =
+      1;  // NOTE(Zihao): this should be determined by cudaOccupancyMaxActiveBlocksPerMultiprocessor
+  int max_grid_size = num_blocks_per_sm * num_sm;
+
+  // step 1: compute qo_chunk_size
+  std::vector<int64_t> packed_qo_len_arr(batch_size), kv_len_arr(batch_size);
+  int64_t volume = 0;
+  for (uint32_t i = 0; i < batch_size; ++i) {
+    packed_qo_len_arr[i] = int64_t(qo_indptr_h[i + 1] - qo_indptr_h[i]) * int64_t(gqa_group_size);
+    kv_len_arr[i] = int64_t(kv_indptr_h[i + 1] - kv_indptr_h[i]);
+    volume += packed_qo_len[i] * kv_len_arr[i];
+  }
+  int64_t avg_packed_qo_len = volume / int64_t(batch_size);
+  const bool avg_qo_len_greater_than_64 = avg_qo_len > 64;
+  const uint32_t num_frags_x = (head_dim < 256 && avg_qo_len_greater_than_64) ? 2 : 1;
+  const uint32_t qo_chunk_size = num_frags_x * (num_warps * 16);
+
+  // step 2: determine kv_chunk_size
+  uint32_t kv_chunk_size, new_batch_size;
+  std::tie(kv_chunk_size, new_batch_size) =
+      PrefillBinarySearchKVChunkSize(max_grid_size, num_kv_heads, packed_qo_len_arr, kv_len_arr,
+                                     qo_chunk_size, /*min_kv_chunk_size=*/128 / page_size);
+
+  std::vector<IdType> request_indices, qo_tile_indices, kv_tile_indices, merge_indptr{0}, o_indptr{0};
+  // step 3: split qo_indptr and kv_indptr
+  for (uint32_t request_idx = 0; request_idx < batch_size; ++i) {
+    int64_t packed_qo_len = packed_qo_len_arr[request_idx],
+            kv_len = kv_len_arr[request_idx];
+    int64_t num_tiles_q = ceil_div(packed_qo_len, qo_chunk_size),
+            num_tiles_kv = ceil_div(kv_len, kv_chunk_size);
+    for (uint32_t q_tile_idx = 0; q_tile_idx < num_tiles_q; ++q_tile_idx) {
+      for (uint32_t kv_tile_idx = 0; kv_tile_idx < num_tiles_kv; ++kv_tile_idx) {
+        request_indices.push_back(request_idx);
+        qo_tile_indices.push_back(q_tile_idx);
+        kv_tile_indices.push_back(kv_tile_idx);
+      }
+    }
+
+    int64_t qo_len = packed_qo_len / gqa_group_size;
+    for (uint32_t row = 0; row < qo_len; ++row) {
+      merge_indptr.push_back(merge_indptr.back() + num_tiles_kv);
+    }
+    o_indptr.push_back(o_indptr.back() + qo_len * num_tile);
+  }
+
+  // TODO(Zihao)
+}
+
 class BatchPrefillHandler {
  public:
   template <typename IdType>
@@ -508,13 +644,30 @@ class BatchPrefillHandler {
   }
 
   template <typename IdType>
-  IdType* GetTileIndices() const {
-    return (IdType*)tile_indices_;
+  IdType* GetQOTileIndices() const {
+    return (IdType*)qo_tile_indices_;
   }
+
+  template <typename IdType>
+  IdType* GetKVTileIndices() const {
+    return (IdType*)kv_tile_indices_;
+  }
+
+  template <typename IdType>
+  IdType* GetMergeIndptr() const {
+    return (IdType*)merge_indptr_;
+  }
+
+  template <typename IdType>
+  IdType* GetOIndptr() const {
+    retrn(IdType*) o_indptr_;
+  }
+
+  uint32_t GetKVChunkSize() const { return kv_chunk_size_; }
 
   uint32_t GetNumFragsX() const { return num_frags_x_; }
 
-  uint32_t GetNumQOTiles() const { return num_qo_tiles_; }
+  uint32_t GetNumTiles() const { return num_tiles_; }
 
   bool IsForwardStarted() const { return request_indices_ != nullptr; }
 
@@ -525,8 +678,8 @@ class BatchPrefillHandler {
 
   template <typename IdType>
   cudaError_t BeginForward(void* buffer, size_t workspace_size_in_bytes, IdType* qo_indptr,
-                           uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
-                           uint32_t head_dim) {
+                           IdType* kv_indptr, uint32_t batch_size, uint32_t num_qo_heads,
+                           uint32_t num_kv_heads, uint32_t head_dim) {
     if (num_qo_heads % num_kv_heads != 0) {
       std::ostringstream err_msg;
       err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -535,15 +688,15 @@ class BatchPrefillHandler {
     }
     uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
     std::vector<IdType> request_indices_vec, tile_indices_vec;
-    std::tie(num_frags_x_, num_qo_tiles_, request_indices_vec, tile_indices_vec) =
+    std::tie(num_frags_x_, num_tiles_, request_indices_vec, tile_indices_vec) =
         split_qo_indptr(qo_indptr, batch_size, gqa_group_size, head_dim, stream_);
     AlignedAllocator allocator(buffer, workspace_size_in_bytes);
     request_indices_ =
         allocator.aligned_alloc<void>(sizeof(IdType) * request_indices_vec.size(), 16);
     void* request_indices_h_ = page_locked_buffer_;
-    tile_indices_ = allocator.aligned_alloc<void>(sizeof(IdType) * tile_indices_vec.size(), 16);
+    qo_tile_indices_ = allocator.aligned_alloc<void>(sizeof(IdType) * tile_indices_vec.size(), 16);
     void* tile_indices_h_ =
-        (char*)page_locked_buffer_ + ((char*)tile_indices_ - (char*)request_indices_);
+        (char*)page_locked_buffer_ + ((char*)qo_tile_indices_ - (char*)request_indices_);
     std::copy(request_indices_vec.begin(), request_indices_vec.end(), (IdType*)request_indices_h_);
     std::copy(tile_indices_vec.begin(), tile_indices_vec.end(), (IdType*)tile_indices_h_);
     size_t num_bytes_to_copy = (char*)allocator.ptr - (char*)request_indices_;
@@ -556,10 +709,14 @@ class BatchPrefillHandler {
 
   cudaError_t EndForward() {
     forward_started_ = false;
-    num_frags_x_ = 0U;
-    num_qo_tiles_ = 0U;
     request_indices_ = nullptr;
-    tile_indices_ = nullptr;
+    qo_tile_indices_ = nullptr;
+    kv_tile_indices_ = nullptr;
+    merge_indptr_ = nullptr;
+    o_indptr_ = nullptr;
+    num_frags_x_ = 0U;
+    num_tiles_ = 0U;
+    kv_chunk_size_ = 0U;
     return cudaSuccess;
   }
 
@@ -571,9 +728,10 @@ class BatchPrefillHandler {
 
   BatchPrefillHandler(bool enable_cuda_graph = false)
       : request_indices_(nullptr),
-        tile_indices_(nullptr),
+        qo_tile_indices_(nullptr),
         num_frags_x_(0U),
-        num_qo_tiles_(0U),
+        num_tiles_(0U),
+        kv_chunk_size_(0U),
         forward_started_(false),
         enable_cuda_graph_(enable_cuda_graph),
         stream_(nullptr) {
@@ -587,13 +745,17 @@ class BatchPrefillHandler {
  protected:
   void* page_locked_buffer_;
   void* request_indices_;
-  void* tile_indices_;
+  void* qo_tile_indices_;
+  void* kv_tile_indices_;
+  void* merge_indptr_;
+  void* o_indptr_;
   uint32_t num_frags_x_;
-  uint32_t num_qo_tiles_;
+  uint32_t num_tiles_;
+  uint32_t kv_chunk_size_;
   bool forward_started_;
   cudaStream_t stream_;
   bool enable_cuda_graph_;
-  static constexpr uint32_t max_num_qo_tiles_ = 1024 * 1024;
+  static constexpr uint32_t max_num_tiles_ = 1024 * 1024;
 };
 
 }  // namespace flashinfer

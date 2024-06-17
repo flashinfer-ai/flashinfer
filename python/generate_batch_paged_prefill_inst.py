@@ -48,7 +48,7 @@ def get_cu_file_str(
     paged_kv_t<page_storage, {kv_layout}, {dtype_in}, {idtype}> paged_kv,
     uint8_t* custom_mask, {idtype}* qk_indptr,
     {dtype_out}* o, float* tmp, float* lse,
-    uint32_t num_qo_tiles, uint32_t num_qo_heads,
+    uint32_t num_tiles, uint32_t num_qo_heads,
     float sm_scale, float rope_scale,
     float rope_theta, cudaStream_t stream);
     """.format(
