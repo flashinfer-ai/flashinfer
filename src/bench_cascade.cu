@@ -96,8 +96,9 @@ void bench_two_level_single_prefix_cascade_decode(nvbench::state& state) {
   if (use_cascade) {
     thrust::device_vector<T> shared_k_d(shared_k_h), shared_v_d(shared_v_h),
         o_cascade_0_d(q_h.size()), o_cascade_1_d(q_h.size());
-    thrust::device_vector<float> tmp_0_d(8 * 1024 * 1024),
-        lse_cascade_0_d(batch_size * num_qo_heads), lse_cascade_1_d(batch_size * num_qo_heads);
+    thrust::device_vector<T> tmp_0_d(16 * 1024 * 1024);
+    thrust::device_vector<float> lse_cascade_0_d(batch_size * num_qo_heads),
+        lse_cascade_1_d(batch_size * num_qo_heads);
     thrust::device_vector<int32_t> kv_indptr_unique_d(kv_indptr_unique_h),
         kv_indices_unique_d(kv_indices_unique_h),
         kv_last_page_len_unique_d(kv_last_page_len_unique_h);
@@ -231,8 +232,8 @@ void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
   if (use_cascade) {
     thrust::device_vector<T> shared_k_d(shared_k_h), shared_v_d(shared_v_h),
         o_cascade_0_d(q_h.size()), o_cascade_1_d(q_h.size());
-    thrust::device_vector<float> tmp_0_d(8 * 1024 * 1024),
-        lse_cascade_0_d((batch_size * qo_append_length) * num_qo_heads),
+    thrust::device_vector<T> tmp_0_d(8 * 1024 * 1024);
+    thrust::device_vector<float> lse_cascade_0_d((batch_size * qo_append_length) * num_qo_heads),
         lse_cascade_1_d((batch_size * qo_append_length) * num_qo_heads);
     thrust::device_vector<int32_t> kv_indptr_unique_d(kv_indptr_unique_h),
         kv_indices_unique_d(kv_indices_unique_h),
