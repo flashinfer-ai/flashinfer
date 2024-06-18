@@ -50,15 +50,6 @@
   }
 #endif
 
-#define DISPATCH_SPLIT_QO_INDPTR(split_qo_indptr, SPLIT_QO_INDPTR, ...) \
-  if (split_qo_indptr) {                                                \
-    constexpr bool SPLIT_QO_INDPTR = true;                              \
-    __VA_ARGS__                                                         \
-  } else {                                                              \
-    constexpr bool SPLIT_QO_INDPTR = false;                             \
-    __VA_ARGS__                                                         \
-  }
-
 #define DISPATCH_ALLOW_FP16_QK_REDUCTION(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, ...) \
   if (allow_fp16_qk_reduction) {                                                                \
     throw std::runtime_error("FP16_QK_REDUCTION disabled at compile time");                     \
