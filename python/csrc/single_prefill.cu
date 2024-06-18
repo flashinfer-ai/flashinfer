@@ -78,7 +78,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
                                 static_cast<c_type*>(k.data_ptr()),
                                 static_cast<c_type*>(v.data_ptr()),
                                 /*custom_mask=*/nullptr, static_cast<c_type*>(o.data_ptr()),
-                                static_cast<float*>(tmp.data_ptr()),
+                                static_cast<c_type*>(tmp.data_ptr()),
                                 /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
                                 num_qo_heads, num_kv_heads, qo_len, kv_len, sm_scale, rope_scale,
                                 rope_theta, torch_current_stream);
@@ -159,7 +159,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache_custom_mask(
                           static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
                           static_cast<c_type*>(v.data_ptr()),
                           static_cast<uint8_t*>(packed_custom_mask.data_ptr()),
-                          static_cast<c_type*>(o.data_ptr()), static_cast<float*>(tmp.data_ptr()),
+                          static_cast<c_type*>(o.data_ptr()), static_cast<c_type*>(tmp.data_ptr()),
                           /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
                           num_qo_heads, num_kv_heads, qo_len, kv_len, sm_scale, rope_scale,
                           rope_theta, torch_current_stream);

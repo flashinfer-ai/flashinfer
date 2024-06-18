@@ -889,14 +889,11 @@ template <LogitsPostHook logits_post_hook, bool partition_kv, MaskMode mask_mode
           QKVLayout kv_layout, PosEncodingMode pos_encoding_mode, uint32_t num_frags_x,
           uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps, typename DTypeIn,
           typename DTypeQKAccum, typename DTypeOut>
-__global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn* __restrict__ k,
-                                               DTypeIn* __restrict__ v,
-                                               uint8_t* __restrict__ custom_mask,
-                                               DTypeOut* __restrict__ o, void* __restrict__ tmp,
-                                               float* __restrict__ lse, const uint32_t qo_len,
-                                               const uint32_t kv_len, const uint_fastdiv group_size,
-                                               float sm_scale, const float log2_rope_rcp_scale,
-                                               const float log2_rope_rcp_theta) {
+__global__ void SinglePrefillWithKVCacheKernel(
+    DTypeIn* __restrict__ q, DTypeIn* __restrict__ k, DTypeIn* __restrict__ v,
+    uint8_t* __restrict__ custom_mask, DTypeOut* __restrict__ o, float* __restrict__ lse,
+    const uint32_t qo_len, const uint32_t kv_len, const uint_fastdiv group_size, float sm_scale,
+    const float log2_rope_rcp_scale, const float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
   sm_scale *= (logits_post_hook == LogitsPostHook::kNone ? math::log2e : 1.f / 30.f);
@@ -940,7 +937,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
   DTypeIn* q_ptr_base = q + qkv_info.get_qo_elem_offset(0, kv_head_idx * group_size,
                                                         (tx % 8) * num_elems_per_128b<DTypeIn>());
   DTypeOut* o_ptr_base =
-      partition_kv ? ((DTypeOut*)tmp) + chunk_idx * num_qo_heads * head_dim +
+      partition_kv ? o + chunk_idx * num_qo_heads * head_dim +
                          qkv_info.get_qo_elem_offset(0, kv_head_idx * group_size,
                                                      (tx % 8) * num_elems_per_128b<DTypeOut>())
                    : o + qkv_info.get_qo_elem_offset(0, kv_head_idx * group_size,
@@ -1087,9 +1084,7 @@ __global__ void SinglePrefillWithKVCacheKernel(DTypeIn* __restrict__ q, DTypeIn*
         const uint32_t qo_idx = q;
         if (qo_idx < qo_len) {
           if constexpr (partition_kv) {
-            float* tmp_lse =
-                (float*)(((DTypeOut*)tmp) + qo_len * num_chunks * num_qo_heads * head_dim);
-            tmp_lse[(qo_idx * num_chunks + chunk_idx) * num_qo_heads + qo_head_idx] =
+            lse[(qo_idx * num_chunks + chunk_idx) * num_qo_heads + qo_head_idx] =
                 math::ptx_log2(d[fx][j]) + float(m[fx][j]);
           } else {
             lse[qo_idx * num_qo_heads + qo_head_idx] = math::ptx_log2(d[fx][j]) + float(m[fx][j]);
@@ -1534,7 +1529,7 @@ template <uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK, QKVLayout KV_LAYOU
           PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename DTypeIn, typename DTypeOut>
 cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* v,
-                                               uint8_t* custom_mask, DTypeOut* o, float* tmp,
+                                               uint8_t* custom_mask, DTypeOut* o, DTypeOut* tmp,
                                                float* lse, uint32_t num_qo_heads,
                                                uint32_t num_kv_heads, uint32_t qo_len,
                                                uint32_t kv_len, float sm_scale, float rope_scale,
@@ -1625,7 +1620,6 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
                           (void*)&v,
                           (void*)&custom_mask,
                           (void*)&o,
-                          (void*)&tmp,
                           (void*)&lse,
                           (void*)&qo_len,
                           (void*)&kv_len,
@@ -1641,13 +1635,13 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
               cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         } else {
           // Use cooperative groups to increase occupancy
+          float* tmp_lse = (float*)(tmp + num_chunks * qo_len * num_qo_heads * HEAD_DIM);
           void* args[] = {(void*)&q,
                           (void*)&k,
                           (void*)&v,
                           (void*)&custom_mask,
-                          (void*)&o,
                           (void*)&tmp,
-                          (void*)&lse,
+                          (void*)&tmp_lse,
                           (void*)&qo_len,
                           (void*)&kv_len,
                           (void*)&group_size_fastdiv,
@@ -1658,10 +1652,8 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
           dim3 nthrs(32, num_warps);
           FLASHINFER_CUDA_CALL(
               cudaLaunchKernel((void*)partition_kv_kernel, nblks, nthrs, args, smem_size, stream));
-          FLASHINFER_CUDA_CALL(MergeStates(
-              (DTypeOut*)tmp,
-              (float*)(((DTypeOut*)tmp) + num_chunks * qo_len * num_qo_heads * HEAD_DIM), o, lse,
-              num_chunks, qo_len, num_qo_heads, HEAD_DIM, stream));
+          FLASHINFER_CUDA_CALL(MergeStates(tmp, tmp_lse, o, lse, num_chunks, qo_len, num_qo_heads,
+                                           HEAD_DIM, stream));
         }
       }
     })
