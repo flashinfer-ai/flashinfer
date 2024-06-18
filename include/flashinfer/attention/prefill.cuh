@@ -1102,15 +1102,12 @@ template <bool partition_kv, LogitsPostHook logits_post_hook, MaskMode mask_mode
 __global__ void BatchPrefillWithRaggedKVCacheKernel(
     DTypeIn* __restrict__ q, IdType* __restrict__ request_indices,
     IdType* __restrict__ q_tile_indices, IdType* __restrict__ kv_tile_indices,
-    IdType* __restrict__ q_indptr, DTypeIn* __restrict__ k,
-    DTypeIn* __restrict__ v, IdType* __restrict__ kv_indptr, uint8_t* __restrict__ custom_mask,
+    IdType* __restrict__ q_indptr, DTypeIn* __restrict__ k, DTypeIn* __restrict__ v,
+    IdType* __restrict__ kv_indptr, uint8_t* __restrict__ custom_mask,
     IdType* __restrict__ qk_indptr, IdType* __restrict__ q_offset,
-    IdType* __restrict__ k_rope_pos_offset,
-    IdType* __restrict__ o_indptr, 
-    DTypeOut* __restrict__ o, DTypeOut* __restrict__ tmp_v,
-    float* __restrict__ tmp_s, float* __restrict__ lse, uint32_t batch_size,
-    const uint_fastdiv group_size, const uint32_t kv_chunk_size, float sm_scale,
-    float log2_rope_rcp_scale, float log2_rope_rcp_theta) {
+    IdType* __restrict__ k_rope_pos_offset, IdType* __restrict__ o_indptr, DTypeOut* __restrict__ o,
+    float* __restrict__ lse, const uint_fastdiv group_size, const uint32_t kv_chunk_size,
+    float sm_scale, float log2_rope_rcp_scale, float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
   sm_scale *= (logits_post_hook == LogitsPostHook::kNone ? math::log2e : 1.f / 30.f);
@@ -1323,13 +1320,10 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
     IdType* __restrict__ request_indices, IdType* __restrict__ q_tile_indices,
     IdType* __restrict__ kv_tile_indices, DTypeIn* __restrict__ q,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, IdType* __restrict__ q_indptr,
-    uint8_t* __restrict__ custom_mask,
-    IdType* __restrict__ qk_indptr, IdType* __restrict__ q_offset,
-    IdType* __restrict__ o_indptr, 
-    DTypeOut* __restrict__ o,
-    DTypeOut* __restrict__ tmp_v, float* __restrict__ tmp_s, float* __restrict__ lse,
-    const uint_fastdiv group_size, const uint32_t kv_chunk_size, float sm_scale,
-    float log2_rope_rcp_scale, float log2_rope_rcp_theta) {
+    uint8_t* __restrict__ custom_mask, IdType* __restrict__ qk_indptr,
+    IdType* __restrict__ q_offset, IdType* __restrict__ o_indptr, DTypeOut* __restrict__ o,
+    float* __restrict__ lse, const uint_fastdiv group_size, const uint32_t kv_chunk_size,
+    float sm_scale, float log2_rope_rcp_scale, float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
   sm_scale *= (logits_post_hook == LogitsPostHook::kNone ? math::log2e : 1.f / 30.f);
@@ -1730,8 +1724,9 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
             cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         void* args[] = {(void*)&q,
                         (void*)&request_indices,
-                        (void*)&tile_indices,
-                        (void*)&qo_indptr,
+                        (void*)&q_tile_indices,
+                        (void*)&kv_tile_indices,
+                        (void*)&q_indptr,
                         (void*)&k,
                         (void*)&v,
                         (void*)&kv_indptr,
@@ -1739,12 +1734,11 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
                         (void*)&qk_indptr,
                         (void*)&q_offset,
                         (void*)&k_rope_pos_offset,
+                        (void*)&o_indptr,
                         (void*)&o,
-                        (void*)&tmp_v,
-                        (void*)&tmp_s,
                         (void*)&lse,
-                        (void*)&batch_size,
                         (void*)&group_size_fastdiv,
+                        (void*)&kv_chunk_size,
                         (void*)&sm_scale,
                         (void*)&log2_rope_rcp_scale,
                         (void*)&log2_rope_rcp_theta};
@@ -1758,7 +1752,30 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
             IdType>;
         FLASHINFER_CUDA_CALL(
             cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-        // TODO(Zihao)
+        void* args[] = {(void*)&q,
+                        (void*)&request_indices,
+                        (void*)&q_tile_indices,
+                        (void*)&kv_tile_indices,
+                        (void*)&q_indptr,
+                        (void*)&k,
+                        (void*)&v,
+                        (void*)&kv_indptr,
+                        (void*)&custom_mask,
+                        (void*)&qk_indptr,
+                        (void*)&q_offset,
+                        (void*)&k_rope_pos_offset,
+                        (void*)&o_indptr,
+                        (void*)&tmp_v,
+                        (void*)&tmp_s,
+                        (void*)&group_size_fastdiv,
+                        (void*)&kv_chunk_size,
+                        (void*)&sm_scale,
+                        (void*)&log2_rope_rcp_scale,
+                        (void*)&log2_rope_rcp_theta};
+        FLASHINFER_CUDA_CALL(
+            cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+        FLASHINFER_CUDA_CALL(VariableLengthMergeStates(tmp_v, tmp_s, merge_indptr, o, lse,
+                                                       batch_size, num_qo_heads, HEAD_DIM, stream));
       }
     }
   });
@@ -1840,11 +1857,11 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
                         (void*)&custom_mask,
                         (void*)&qk_indptr,
                         (void*)&q_offset,
+                        (void*)&o_indptr,
                         (void*)&o,
-                        (void*)&tmp_v,
-                        (void*)&tmp_s,
                         (void*)&lse,
                         (void*)&group_size_fastdiv,
+                        (void*)&kv_chunk_size,
                         (void*)&sm_scale,
                         (void*)&log2_rope_rcp_scale,
                         (void*)&log2_rope_rcp_theta};
@@ -1858,6 +1875,27 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
 
         FLASHINFER_CUDA_CALL(
             cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        void* args[] = {(void*)&request_indices,
+                        (void*)&q_tile_indices,
+                        (void*)&kv_tile_indices,
+                        (void*)&q,
+                        (void*)&paged_kv,
+                        (void*)&q_indptr,
+                        (void*)&custom_mask,
+                        (void*)&qk_indptr,
+                        (void*)&q_offset,
+                        (void*)&o_indptr,
+                        (void*)&tmp_v,
+                        (void*)&tmp_s,
+                        (void*)&group_size_fastdiv,
+                        (void*)&kv_chunk_size,
+                        (void*)&sm_scale,
+                        (void*)&log2_rope_rcp_scale,
+                        (void*)&log2_rope_rcp_theta};
+        FLASHINFER_CUDA_CALL(
+            cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+        FLASHINFER_CUDA_CALL(VariableLengthMergeStates(tmp_v, tmp_s, merge_indptr, o, lse,
+                                                       batch_size, num_qo_heads, HEAD_DIM, stream));
       }
     }
   });

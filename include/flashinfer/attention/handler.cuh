@@ -657,13 +657,15 @@ class BatchPrefillHandler {
 
   template <typename IdType>
   IdType* GetOIndptr() const {
-    retrn(IdType*) o_indptr_;
+    return (IdType*)o_indptr_;
   }
 
   template <typename DType>
   DType* GetTempV() const {
     return (DType*)tmp_v_;
   }
+
+  float* GetTempS() const { return tmp_s_; }
 
   uint32_t GetKVChunkSize() const { return kv_chunk_size_; }
 
@@ -678,7 +680,7 @@ class BatchPrefillHandler {
     cudaMallocHost(&page_locked_buffer_, max_workspace_size_in_bytes);
   }
 
-  template <typename IdType>
+  template <typename DTypeOut, typename IdType>
   cudaError_t BeginForward(void* buffer, size_t workspace_size_in_bytes, IdType* qo_indptr,
                            IdType* kv_indptr, IdType* kv_last_page_len, uint32_t batch_size,
                            uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim) {
@@ -797,7 +799,6 @@ class BatchPrefillHandler {
   bool forward_started_;
   cudaStream_t stream_;
   bool enable_cuda_graph_;
-  static constexpr uint32_t max_num_tiles_ = 1024 * 1024;
 };
 
 }  // namespace flashinfer
