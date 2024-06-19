@@ -107,7 +107,7 @@ std::tuple<bool, uint32_t, uint32_t> PrefillBinarySearchKVChunkSize(
   }
   new_batch_size = 0;
   for (uint32_t i = 0; i < batch_size; ++i) {
-    new_batch_size += ceil_div(packed_qo_len_arr[i], qo_chunk_size) * ceil_div(kv_len_arr[i], mid);
+    new_batch_size += ceil_div(packed_qo_len_arr[i], qo_chunk_size) * ceil_div(kv_len_arr[i], low);
   }
   return {low < high, low, new_batch_size};
 }
@@ -669,9 +669,7 @@ class BatchPrefillHandler {
     return (DType*)tmp_v_;
   }
 
-  bool* GetBlockValidMask() const {
-    return block_valid_mask_;
-  }
+  bool* GetBlockValidMask() const { return block_valid_mask_; }
 
   float* GetTempS() const { return tmp_s_; }
 
