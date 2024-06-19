@@ -1102,12 +1102,13 @@ template <bool partition_kv, LogitsPostHook logits_post_hook, MaskMode mask_mode
 __global__ void BatchPrefillWithRaggedKVCacheKernel(
     DTypeIn* __restrict__ q, IdType* __restrict__ request_indices,
     IdType* __restrict__ q_tile_indices, IdType* __restrict__ kv_tile_indices,
-    IdType* __restrict__ q_indptr, DTypeIn* __restrict__ k, DTypeIn* __restrict__ v,
-    IdType* __restrict__ kv_indptr, uint8_t* __restrict__ custom_mask,
+    IdType* __restrict__ kv_lens, IdType* __restrict__ q_indptr, DTypeIn* __restrict__ k,
+    DTypeIn* __restrict__ v, IdType* __restrict__ kv_indptr, uint8_t* __restrict__ custom_mask,
     IdType* __restrict__ qk_indptr, IdType* __restrict__ q_offset,
     IdType* __restrict__ k_rope_pos_offset, IdType* __restrict__ o_indptr, DTypeOut* __restrict__ o,
-    float* __restrict__ lse, const uint_fastdiv group_size, const uint32_t kv_chunk_size,
-    float sm_scale, float log2_rope_rcp_scale, float log2_rope_rcp_theta) {
+    float* __restrict__ lse, bool* __restrict__ block_valid_mask, const uint_fastdiv group_size,
+    const uint32_t kv_chunk_size, float sm_scale, float log2_rope_rcp_scale,
+    float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
   sm_scale *= (logits_post_hook == LogitsPostHook::kNone ? math::log2e : 1.f / 30.f);
@@ -1115,12 +1116,15 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
 
   auto block = cg::this_thread_block();
   const uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y, kv_head_idx = blockIdx.z;
+  if (block_valid_mask && !block_valid_mask[bx]) {
+    return;
+  }
   const uint32_t num_kv_heads = gridDim.z, num_qo_heads = group_size * num_kv_heads;
   const uint32_t request_idx = request_indices[bx], qo_tile_idx = qo_tile_indices[bx],
                  kv_tile_idx = kv_tile_indices[bx];
   constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
   const uint32_t qo_len = q_indptr[request_idx + 1] - q_indptr[request_idx],
-                 kv_len = kv_indptr[request_idx + 1] - kv_indptr[request_idx];
+                 kv_len = kv_lens[request_idx];
   const uint32_t chunk_size = partition_kv ? kv_chunk_size : kv_len;
   const uint32_t chunk_start = partition_kv ? kv_tile_idx * chunk_size : 0;
   const uint32_t chunk_end = partition_kv ? min((kv_tile_idx + 1) * chunk_size, kv_len) : kv_len;
@@ -1340,18 +1344,22 @@ template <bool partition_kv, LogitsPostHook logits_post_hook, MaskMode mask_mode
           typename DTypeIn, typename DTypeQKAccum, typename DTypeOut, typename IdType>
 __global__ void BatchPrefillWithPagedKVCacheKernel(
     IdType* __restrict__ request_indices, IdType* __restrict__ q_tile_indices,
-    IdType* __restrict__ kv_tile_indices, DTypeIn* __restrict__ q,
+    IdType* __restrict__ kv_tile_indices, IdType* __restrict__ kv_lens, DTypeIn* __restrict__ q,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, IdType* __restrict__ q_indptr,
     uint8_t* __restrict__ custom_mask, IdType* __restrict__ qk_indptr,
     IdType* __restrict__ q_offset, IdType* __restrict__ o_indptr, DTypeOut* __restrict__ o,
-    float* __restrict__ lse, const uint_fastdiv group_size, const uint32_t kv_chunk_size,
-    float sm_scale, float log2_rope_rcp_scale, float log2_rope_rcp_theta) {
+    float* __restrict__ lse, bool* __restrict__ block_valid_mask, const uint_fastdiv group_size,
+    const uint32_t kv_chunk_size, float sm_scale, float log2_rope_rcp_scale,
+    float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
   sm_scale *= (logits_post_hook == LogitsPostHook::kNone ? math::log2e : 1.f / 30.f);
   auto block = cg::this_thread_block();
 
   const uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y, kv_head_idx = blockIdx.z;
+  if (block_valid_mask && !block_valid_mask[bx]) {
+    return;
+  }
   const uint32_t num_kv_heads = gridDim.z, num_qo_heads = num_kv_heads * group_size;
   float alibi_slopes[num_frags_x][2];
 
@@ -1359,9 +1367,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
                  kv_tile_idx = kv_tile_indices[bx];
   constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
   const uint32_t qo_len = q_indptr[request_idx + 1] - q_indptr[request_idx],
-                 kv_len = (paged_kv.indptr[request_idx + 1] - paged_kv.indptr[request_idx] - 1) *
-                              paged_kv.page_size +
-                          paged_kv.last_page_len[request_idx];
+                 kv_len = kv_lens[request_idx];
   const uint32_t chunk_size = partition_kv ? kv_chunk_size : kv_len;
   const uint32_t chunk_start = partition_kv ? kv_tile_idx * chunk_size : 0;
   const uint32_t chunk_end = partition_kv ? min((kv_tile_idx + 1) * chunk_size, kv_len) : kv_len;
@@ -1502,12 +1508,12 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
     // apply mask
     if constexpr (mask_mode == MaskMode::kCustom) {
       mask_s<partition_kv, mask_mode, num_warps, num_frags_x, num_frags_y, num_frags_z>(
-          qo_packed_idx_base, chunk_start + iter * 16 * num_frags_z, qo_len, kv_len, kv_len,
+          qo_packed_idx_base, chunk_start + iter * 16 * num_frags_z, qo_len, kv_len, chunk_end,
           group_size, custom_mask + qk_indptr[request_idx], s_frag);
     } else {
       if (iter >= mask_iteration) {
         mask_s<partition_kv, mask_mode, num_warps, num_frags_x, num_frags_y, num_frags_z>(
-            qo_packed_idx_base, chunk_start + iter * 16 * num_frags_z, qo_len, kv_len, kv_len,
+            qo_packed_idx_base, chunk_start + iter * 16 * num_frags_z, qo_len, kv_len, chunk_end,
             group_size, nullptr, s_frag);
       }
     }
@@ -1519,7 +1525,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
     packed_page_iter_base += 16 * num_frags_z;
     page_produce_kv<false, num_warps, num_frags_y, num_frags_z>(
         k_smem, &kv_smem_offset_w, paged_kv, chunk_start + (iter + 1) * 16 * num_frags_z,
-        packed_page_iter_base, kv_len, last_indptr);
+        packed_page_iter_base, chunk_end, last_indptr);
     cp_async::commit_group();
     cp_async::wait_group<1>();
     block.sync();
@@ -1531,7 +1537,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
     block.sync();
     page_produce_kv<true, num_warps, num_frags_y, num_frags_z>(
         v_smem, &kv_smem_offset_w, paged_kv, chunk_start + (iter + 1) * 16 * num_frags_z,
-        packed_page_iter_base, kv_len, last_indptr);
+        packed_page_iter_base, chunk_end, last_indptr);
     cp_async::commit_group();
   }
   cp_async::wait_group<0>();
@@ -1711,19 +1717,20 @@ template <uint32_t num_frags_x, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HO
           MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* q_tile_indices, IdType* kv_tile_indices,
-    IdType* q_indptr, DTypeIn* k, DTypeIn* v, IdType* kv_indptr, uint8_t* custom_mask,
-    IdType* qk_indptr, IdType* q_offset, IdType* k_rope_pos_offset, IdType* o_indptr, DTypeOut* o,
-    DTypeOut* tmp_v, float* tmp_s, float* lse, const uint32_t batch_size,
-    const uint32_t num_qo_heads, const uint32_t kv_chunk_size, const uint32_t num_tiles,
-    const uint32_t num_kv_heads, const float sm_scale, const float rope_scale,
-    const float rope_theta, cudaStream_t stream = nullptr) {
+    IdType* kv_lens, IdType* q_indptr, DTypeIn* k, DTypeIn* v, IdType* kv_indptr,
+    uint8_t* custom_mask, IdType* qk_indptr, IdType* q_offset, IdType* k_rope_pos_offset,
+    IdType* o_indptr, DTypeOut* o, DTypeOut* tmp_v, float* tmp_s, float* lse, IdType* merge_indptr,
+    bool* block_valid_mask, const uint32_t batch_size, const uint32_t num_qo_heads,
+    const uint32_t kv_chunk_size, const uint32_t padded_batch_size, const uint32_t num_kv_heads,
+    const float sm_scale, const float rope_scale, const float rope_theta,
+    cudaStream_t stream = nullptr) {
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
   constexpr uint32_t num_warps = 4;
   const uint32_t group_size = num_qo_heads / num_kv_heads;
   const uint_fastdiv group_size_fastdiv(group_size);
 
-  dim3 nblks(num_tiles, 1, num_kv_heads);
+  dim3 nblks(padded_batch_size, 1, num_kv_heads);
   dim3 nthrs(32, num_warps);
   constexpr uint32_t num_frags_y = HEAD_DIM / 16;
   using DTypeQKAccum =
@@ -1772,6 +1779,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
                         (void*)&request_indices,
                         (void*)&q_tile_indices,
                         (void*)&kv_tile_indices,
+                        (void*)&kv_lens,
                         (void*)&q_indptr,
                         (void*)&k,
                         (void*)&v,
@@ -1783,6 +1791,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
                         (void*)&o_indptr,
                         (void*)&o,
                         (void*)&lse,
+                        (void*)&block_valid_mask,
                         (void*)&group_size_fastdiv,
                         (void*)&kv_chunk_size,
                         (void*)&sm_scale,
@@ -1802,6 +1811,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
                         (void*)&request_indices,
                         (void*)&q_tile_indices,
                         (void*)&kv_tile_indices,
+                        (void*)&kv_lens,
                         (void*)&q_indptr,
                         (void*)&k,
                         (void*)&v,
@@ -1813,6 +1823,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
                         (void*)&o_indptr,
                         (void*)&tmp_v,
                         (void*)&tmp_s,
+                        (void*)&block_valid_mask,
                         (void*)&group_size_fastdiv,
                         (void*)&kv_chunk_size,
                         (void*)&sm_scale,
@@ -1834,11 +1845,12 @@ template <PageStorage page_storage, uint32_t num_frags_x, uint32_t HEAD_DIM,
           typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* q_tile_indices, IdType* kv_tile_indices,
-    IdType* q_indptr, IdType* q_offset,
+    IdType* kv_lens, IdType* q_indptr, IdType* q_offset,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, uint8_t* custom_mask,
     IdType* qk_indptr, IdType* o_indptr, DTypeOut* o, DTypeOut* tmp_v, float* tmp_s, float* lse,
-    uint32_t num_qo_heads, uint32_t kv_chunk_size, uint32_t num_tiles, float sm_scale,
-    float rope_scale, float rope_theta, cudaStream_t stream) {
+    IdType* merge_indptr, bool* block_valid_mask, uint32_t num_qo_heads, uint32_t kv_chunk_size,
+    uint32_t padded_batch_size, float sm_scale, float rope_scale, float rope_theta,
+    cudaStream_t stream) {
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
   constexpr uint32_t num_warps = 4;
@@ -1847,7 +1859,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
   const uint32_t group_size = num_qo_heads / num_kv_heads;
   const uint_fastdiv group_size_fastdiv(group_size);
 
-  dim3 nblks(num_tiles, 1, num_kv_heads);
+  dim3 nblks(padded_batch_size, 1, num_kv_heads);
   dim3 nthrs(32, num_warps);
 
   constexpr uint32_t num_frags_y = HEAD_DIM / 16;
@@ -1898,6 +1910,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
         void* args[] = {(void*)&request_indices,
                         (void*)&q_tile_indices,
                         (void*)&kv_tile_indices,
+                        (void*)&kv_lens,
                         (void*)&q,
                         (void*)&paged_kv,
                         (void*)&q_indptr,
@@ -1907,6 +1920,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
                         (void*)&o_indptr,
                         (void*)&o,
                         (void*)&lse,
+                        (void*)&block_valid_mask,
                         (void*)&group_size_fastdiv,
                         (void*)&kv_chunk_size,
                         (void*)&sm_scale,
@@ -1925,6 +1939,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
         void* args[] = {(void*)&request_indices,
                         (void*)&q_tile_indices,
                         (void*)&kv_tile_indices,
+                        (void*)&kv_lens,
                         (void*)&q,
                         (void*)&paged_kv,
                         (void*)&q_indptr,
@@ -1934,6 +1949,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
                         (void*)&o_indptr,
                         (void*)&tmp_v,
                         (void*)&tmp_s,
+                        (void*)&block_valid_mask,
                         (void*)&group_size_fastdiv,
                         (void*)&kv_chunk_size,
                         (void*)&sm_scale,
