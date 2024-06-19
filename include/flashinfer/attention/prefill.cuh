@@ -1120,7 +1120,7 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
     return;
   }
   const uint32_t num_kv_heads = gridDim.z, num_qo_heads = group_size * num_kv_heads;
-  const uint32_t request_idx = request_indices[bx], qo_tile_idx = qo_tile_indices[bx],
+  const uint32_t request_idx = request_indices[bx], qo_tile_idx = q_tile_indices[bx],
                  kv_tile_idx = kv_tile_indices[bx];
   constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
   const uint32_t qo_len = q_indptr[request_idx + 1] - q_indptr[request_idx],
