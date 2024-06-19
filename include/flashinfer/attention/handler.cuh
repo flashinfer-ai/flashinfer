@@ -84,7 +84,7 @@ std::pair<uint32_t, uint32_t> PartitionPagedKVCacheBinarySearchMinNumPagePerBatc
   return {low, new_batch_size};
 }
 
-std::tuple<bool, uint32_t, uint32_t> PrefillBinarySearchKVChunkSize(
+inline std::tuple<bool, uint32_t, uint32_t> PrefillBinarySearchKVChunkSize(
     const uint32_t max_grid_size, const uint32_t num_kv_heads,
     const std::vector<int64_t>& packed_qo_len_arr, const std::vector<int64_t>& kv_len_arr,
     const uint32_t qo_chunk_size, const uint32_t min_kv_chunk_size = 1) {
@@ -771,8 +771,8 @@ class BatchPrefillHandler {
       if (split_kv) {
         tmp_v_ = allocator.aligned_alloc<void>(
             num_qo_heads * padded_batch_size_ * qo_tile_size * head_dim * sizeof(DTypeOut), 16);
-        tmp_s_ =
-            allocator.aligned_alloc<float>(num_qo_heads * padded_batch_size_ * qo_tile_size * sizeof(float), 16);
+        tmp_s_ = allocator.aligned_alloc<float>(
+            num_qo_heads * padded_batch_size_ * qo_tile_size * sizeof(float), 16);
       } else {
         tmp_v_ = nullptr;
         tmp_s_ = nullptr;
@@ -818,7 +818,8 @@ class BatchPrefillHandler {
       if (split_kv) {
         tmp_v_ = allocator.aligned_alloc<void>(
             num_qo_heads * new_batch_size * qo_tile_size * head_dim * sizeof(DTypeOut), 16);
-        tmp_s_ = allocator.aligned_alloc<float>(num_qo_heads * new_batch_size * qo_tile_size * sizeof(float), 16);
+        tmp_s_ = allocator.aligned_alloc<float>(
+            num_qo_heads * new_batch_size * qo_tile_size * sizeof(float), 16);
       } else {
         tmp_v_ = nullptr;
         tmp_s_ = nullptr;

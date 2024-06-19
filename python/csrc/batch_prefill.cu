@@ -48,6 +48,7 @@ void BatchPrefillWithPagedKVCachePyTorchWrapper::BeginForward(
         num_kv_heads, head_dim, page_size);
     TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithPagedKVCache failed with error ",
                 cudaGetErrorString(status));
+    return true;
   });
 }
 
@@ -289,6 +290,7 @@ void BatchPrefillWithRaggedKVCachePyTorchWrapper::BeginForward(
         /*page_size=*/1);
     TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithPagedKVCache failed with error ",
                 cudaGetErrorString(status));
+    return true;
   });
 }
 
@@ -361,8 +363,7 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
                             /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr,
                             static_cast<c_type*>(o.data_ptr()),
                             /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                            batch_size, num_qo_heads, num_kv_heads, sm_scale, rope_scale,
-                            rope_theta,
+                            num_qo_heads, num_kv_heads, sm_scale, rope_scale, rope_theta,
                             /*stream=*/torch_current_stream);
                         TORCH_CHECK(status == cudaSuccess,
                                     "BatchPrefillWithRaggedKVCache failed with error ",
@@ -452,7 +453,7 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardC
                           /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr,
                           static_cast<c_type*>(o.data_ptr()),
                           /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                          batch_size, num_qo_heads, num_kv_heads, sm_scale, rope_scale, rope_theta,
+                          num_qo_heads, num_kv_heads, sm_scale, rope_scale, rope_theta,
                           /*stream=*/torch_current_stream);
                       TORCH_CHECK(status == cudaSuccess,
                                   "BatchPrefillWithRaggedKVCache failed with error ",
