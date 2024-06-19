@@ -538,7 +538,7 @@ class BatchDecodeHandler {
 template <typename IdType>
 cudaError_t PrefillSplitQOKVIndptr(
     bool& split_kv, uint32_t& padded_batch_size, uint32_t& new_batch_size, uint32_t& num_frags_x,
-    uint32_t& kv_chunk_size, std::vector<IdType>& packed_kv_len_arr,
+    uint32_t& kv_chunk_size, uint32_t& total_num_rows, std::vector<IdType>& packed_kv_len_arr,
     std::vector<IdType>& request_indices, std::vector<IdType>& qo_tile_indices,
     std::vector<IdType>& kv_tile_indices, std::vector<IdType>& merge_indptr,
     std::vector<IdType>& o_indptr, IdType* qo_indptr, IdType* kv_indptr, IdType* kv_last_page_len,
@@ -563,6 +563,7 @@ cudaError_t PrefillSplitQOKVIndptr(
   } else {
     qo_indptr_h.assign(qo_indptr, qo_indptr + batch_size + 1);
   }
+  total_num_rows = qo_indptr_h.back();
 
   if (is_device_ptr((void*)kv_indptr)) {
     cudaMemcpyAsync(kv_indptr_h.data(), kv_indptr, sizeof(IdType) * (batch_size + 1),
@@ -591,16 +592,16 @@ cudaError_t PrefillSplitQOKVIndptr(
 
   // step 1: compute qo_chunk_size
   std::vector<int64_t> packed_qo_len_arr(batch_size), kv_len_arr(batch_size);
-  int64_t volume = 0;
+  int64_t sum_packed_qo_len = 0;
   for (uint32_t i = 0; i < batch_size; ++i) {
     packed_qo_len_arr[i] = int64_t(qo_indptr_h[i + 1] - qo_indptr_h[i]) * int64_t(gqa_group_size);
     kv_len_arr[i] = int64_t(kv_indptr_h[i + 1] - kv_indptr_h[i]);
     packed_kv_len_arr[i] = has_kv_last_page_len
                                ? (kv_len_arr[i] - 1) * page_size + kv_last_page_len_h[i]
                                : kv_len_arr[i];
-    volume += packed_qo_len_arr[i] * kv_len_arr[i];
+    sum_packed_qo_len += packed_qo_len_arr[i];
   }
-  int64_t avg_packed_qo_len = volume / int64_t(kv_indptr_h.back());
+  int64_t avg_packed_qo_len = sum_packed_qo_len / batch_size;
   const bool avg_qo_len_greater_than_64 = avg_packed_qo_len > 64;
   num_frags_x = (head_dim < 256 && avg_qo_len_greater_than_64) ? 2 : 1;
   const uint32_t qo_chunk_size = num_frags_x * (num_warps * 16);
@@ -611,10 +612,12 @@ cudaError_t PrefillSplitQOKVIndptr(
                                      qo_chunk_size, /*min_kv_chunk_size=*/(128 / page_size));
 
   // step 3: split qo_indptr and kv_indptr
+  uint32_t sum_num_tiles_q = 0;
   for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
     int64_t packed_qo_len = packed_qo_len_arr[request_idx], kv_len = kv_len_arr[request_idx];
     int64_t num_tiles_q = ceil_div(packed_qo_len, qo_chunk_size),
             num_tiles_kv = ceil_div(kv_len, kv_chunk_size);
+    sum_num_tiles_q += num_tiles_q;
     for (uint32_t q_tile_idx = 0; q_tile_idx < num_tiles_q; ++q_tile_idx) {
       for (uint32_t kv_tile_idx = 0; kv_tile_idx < num_tiles_kv; ++kv_tile_idx) {
         request_indices.push_back(request_idx);
@@ -629,6 +632,7 @@ cudaError_t PrefillSplitQOKVIndptr(
     }
     o_indptr.push_back(o_indptr.back() + qo_len * num_tiles_kv);
   }
+  padded_batch_size = std::max(max_grid_size / num_kv_heads, sum_num_tiles_q);
 
   // step 4: multiply kv_chunk_size by page_size
   kv_chunk_size *= page_size;
@@ -701,56 +705,117 @@ class BatchPrefillHandler {
       throw std::invalid_argument(err_msg.str());
     }
     bool split_kv;
-    uint32_t new_batch_size;
+    uint32_t new_batch_size, total_num_rows;
     std::vector<IdType> request_indices_vec, qo_tile_indices_vec, kv_tile_indices_vec, kv_len_vec,
         merge_indptr_vec, o_indptr_vec;
     FLASHINFER_CUDA_CALL(PrefillSplitQOKVIndptr(
-        split_kv, padded_batch_size_, new_batch_size, num_frags_x_, kv_chunk_size_, kv_len_vec,
-        request_indices_vec, qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec,
+        split_kv, padded_batch_size_, new_batch_size, num_frags_x_, kv_chunk_size_, total_num_rows,
+        kv_len_vec, request_indices_vec, qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec,
         o_indptr_vec, qo_indptr, kv_indptr, kv_last_page_len, batch_size, num_qo_heads,
         num_kv_heads, head_dim, page_size, stream_));
-    padded_batch_size_ = new_batch_size;
 
-    AlignedAllocator allocator(buffer, workspace_size_in_bytes);
-    request_indices_ =
-        allocator.aligned_alloc<void>(sizeof(IdType) * request_indices_vec.size(), 16);
-    void* request_indices_h_ = page_locked_buffer_;
-    qo_tile_indices_ =
-        allocator.aligned_alloc<void>(sizeof(IdType) * qo_tile_indices_vec.size(), 16);
-    void* qo_tile_indices_h_ =
-        (char*)page_locked_buffer_ + ((char*)qo_tile_indices_ - (char*)request_indices_);
-    kv_tile_indices_ =
-        allocator.aligned_alloc<void>(sizeof(IdType) * kv_tile_indices_vec.size(), 16);
-    void* kv_tile_indices_h_ =
-        (char*)page_locked_buffer_ + ((char*)kv_tile_indices_ - (char*)request_indices_);
-    kv_len_ = allocator.aligned_alloc<void>(sizeof(IdType) * kv_len_vec.size(), 16);
-    void* kv_len_h_ = (char*)page_locked_buffer_ + ((char*)kv_len_ - (char*)request_indices_);
-    merge_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * merge_indptr_vec.size(), 16);
-    void* merge_indptr_h_ =
-        (char*)page_locked_buffer_ + ((char*)merge_indptr_ - (char*)request_indices_);
-    o_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * o_indptr_vec.size(), 16);
-    void* o_indptr_h_ = (char*)page_locked_buffer_ + ((char*)o_indptr_ - (char*)request_indices_);
-    std::copy(request_indices_vec.begin(), request_indices_vec.end(), (IdType*)request_indices_h_);
-    std::copy(qo_tile_indices_vec.begin(), qo_tile_indices_vec.end(), (IdType*)qo_tile_indices_h_);
-    std::copy(kv_tile_indices_vec.begin(), kv_tile_indices_vec.end(), (IdType*)kv_tile_indices_h_);
-    std::copy(kv_len_vec.begin(), kv_len_vec.end(), (IdType*)kv_len_h_);
-    std::copy(merge_indptr_vec.begin(), merge_indptr_vec.end(), (IdType*)merge_indptr_h_);
-    std::copy(o_indptr_vec.begin(), o_indptr_vec.end(), (IdType*)o_indptr_h_);
-    size_t num_bytes_to_copy = (char*)allocator.ptr - (char*)request_indices_;
+    if (IsCUDAGraphEnabled()) {
+      AlignedAllocator allocator(buffer, workspace_size_in_bytes);
+      request_indices_ = allocator.aligned_alloc<void>(sizeof(IdType) * padded_batch_size_, 16);
+      void* request_indices_h_ = page_locked_buffer_;
+      qo_tile_indices_ = allocator.aligned_alloc<void>(sizeof(IdType) * padded_batch_size_, 16);
+      void* qo_tile_indices_h_ =
+          (char*)page_locked_buffer_ + ((char*)qo_tile_indices_ - (char*)request_indices_);
+      kv_tile_indices_ = allocator.aligned_alloc<void>(sizeof(IdType) * padded_batch_size_, 16);
+      void* kv_tile_indices_h_ =
+          (char*)page_locked_buffer_ + ((char*)kv_tile_indices_ - (char*)request_indices_);
+      kv_len_ = allocator.aligned_alloc<void>(sizeof(IdType) * batch_size, 16);
+      void* kv_len_h_ = (char*)page_locked_buffer_ + ((char*)kv_len_ - (char*)request_indices_);
+      merge_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * (total_num_rows + 1), 16);
+      void* merge_indptr_h_ =
+          (char*)page_locked_buffer_ + ((char*)merge_indptr_ - (char*)request_indices_);
+      o_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * (batch_size + 1), 16);
+      void* o_indptr_h_ = (char*)page_locked_buffer_ + ((char*)o_indptr_ - (char*)request_indices_);
+      if (split_kv) {
+        block_valid_mask_ = allocator.aligned_alloc<bool>(sizeof(bool) * padded_batch_size_, 16);
+        bool* block_valid_mask_h_ =
+            (bool*)page_locked_buffer_ + ((bool*)block_valid_mask_ - (bool*)request_indices_);
+        for (uint32_t i = 0; i < padded_batch_size_; ++i) {
+          block_valid_mask_h_[i] = i < new_batch_size;
+        }
+      } else {
+        block_valid_mask_ = nullptr;
+        if (padded_batch_size_ != new_batch_size) {
+          std::ostringstream err_msg;
+          err_msg << "InternalError: padded_batch_size " << padded_batch_size_
+                  << " should be equal to new_batch_size " << new_batch_size;
+          throw std::invalid_argument(err_msg.str());
+        }
+      }
+      std::copy(request_indices_vec.begin(), request_indices_vec.end(),
+                (IdType*)request_indices_h_);
+      std::copy(qo_tile_indices_vec.begin(), qo_tile_indices_vec.end(),
+                (IdType*)qo_tile_indices_h_);
+      std::copy(kv_tile_indices_vec.begin(), kv_tile_indices_vec.end(),
+                (IdType*)kv_tile_indices_h_);
+      std::copy(kv_len_vec.begin(), kv_len_vec.end(), (IdType*)kv_len_h_);
+      std::copy(merge_indptr_vec.begin(), merge_indptr_vec.end(), (IdType*)merge_indptr_h_);
+      std::copy(o_indptr_vec.begin(), o_indptr_vec.end(), (IdType*)o_indptr_h_);
 
-    FLASHINFER_CUDA_CALL(cudaMemcpyAsync(request_indices_, page_locked_buffer_, num_bytes_to_copy,
-                                         cudaMemcpyHostToDevice, stream_))
+      size_t num_bytes_to_copy = (char*)allocator.ptr - (char*)request_indices_;
+      FLASHINFER_CUDA_CALL(cudaMemcpyAsync(request_indices_, page_locked_buffer_, num_bytes_to_copy,
+                                           cudaMemcpyHostToDevice, stream_))
 
-    if (split_kv) {
-      tmp_v_ = allocator.aligned_alloc<void>(
-          num_qo_heads * new_batch_size * head_dim * sizeof(DTypeOut), 16);
-      tmp_s_ = allocator.aligned_alloc<float>(num_qo_heads * new_batch_size * sizeof(float), 16);
+      if (split_kv) {
+        tmp_v_ = allocator.aligned_alloc<void>(
+            num_qo_heads * padded_batch_size_ * head_dim * sizeof(DTypeOut), 16);
+        tmp_s_ =
+            allocator.aligned_alloc<float>(num_qo_heads * padded_batch_size_ * sizeof(float), 16);
+      } else {
+        tmp_v_ = nullptr;
+        tmp_s_ = nullptr;
+      }
     } else {
-      tmp_v_ = nullptr;
-      tmp_s_ = nullptr;
-    }
+      padded_batch_size_ = new_batch_size;
+      AlignedAllocator allocator(buffer, workspace_size_in_bytes);
+      request_indices_ =
+          allocator.aligned_alloc<void>(sizeof(IdType) * request_indices_vec.size(), 16);
+      void* request_indices_h_ = page_locked_buffer_;
+      qo_tile_indices_ =
+          allocator.aligned_alloc<void>(sizeof(IdType) * qo_tile_indices_vec.size(), 16);
+      void* qo_tile_indices_h_ =
+          (char*)page_locked_buffer_ + ((char*)qo_tile_indices_ - (char*)request_indices_);
+      kv_tile_indices_ =
+          allocator.aligned_alloc<void>(sizeof(IdType) * kv_tile_indices_vec.size(), 16);
+      void* kv_tile_indices_h_ =
+          (char*)page_locked_buffer_ + ((char*)kv_tile_indices_ - (char*)request_indices_);
+      kv_len_ = allocator.aligned_alloc<void>(sizeof(IdType) * kv_len_vec.size(), 16);
+      void* kv_len_h_ = (char*)page_locked_buffer_ + ((char*)kv_len_ - (char*)request_indices_);
+      merge_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * merge_indptr_vec.size(), 16);
+      void* merge_indptr_h_ =
+          (char*)page_locked_buffer_ + ((char*)merge_indptr_ - (char*)request_indices_);
+      o_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * o_indptr_vec.size(), 16);
+      void* o_indptr_h_ = (char*)page_locked_buffer_ + ((char*)o_indptr_ - (char*)request_indices_);
+      std::copy(request_indices_vec.begin(), request_indices_vec.end(),
+                (IdType*)request_indices_h_);
+      std::copy(qo_tile_indices_vec.begin(), qo_tile_indices_vec.end(),
+                (IdType*)qo_tile_indices_h_);
+      std::copy(kv_tile_indices_vec.begin(), kv_tile_indices_vec.end(),
+                (IdType*)kv_tile_indices_h_);
+      std::copy(kv_len_vec.begin(), kv_len_vec.end(), (IdType*)kv_len_h_);
+      std::copy(merge_indptr_vec.begin(), merge_indptr_vec.end(), (IdType*)merge_indptr_h_);
+      std::copy(o_indptr_vec.begin(), o_indptr_vec.end(), (IdType*)o_indptr_h_);
+      size_t num_bytes_to_copy = (char*)allocator.ptr - (char*)request_indices_;
 
-    block_valid_mask_ = nullptr;
+      FLASHINFER_CUDA_CALL(cudaMemcpyAsync(request_indices_, page_locked_buffer_, num_bytes_to_copy,
+                                           cudaMemcpyHostToDevice, stream_))
+
+      if (split_kv) {
+        tmp_v_ = allocator.aligned_alloc<void>(
+            num_qo_heads * new_batch_size * head_dim * sizeof(DTypeOut), 16);
+        tmp_s_ = allocator.aligned_alloc<float>(num_qo_heads * new_batch_size * sizeof(float), 16);
+      } else {
+        tmp_v_ = nullptr;
+        tmp_s_ = nullptr;
+      }
+
+      block_valid_mask_ = nullptr;
+    }
     return cudaSuccess;
   }
 
