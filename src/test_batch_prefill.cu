@@ -360,9 +360,9 @@ void _TestBatchPagedPrefillKernelLongContextCorrectness(size_t num_kv_heads, siz
                                                         PosEncodingMode pos_encoding_mode,
                                                         bool allow_fp16_qk_reduction) {
   std::vector<std::vector<std::vector<T>>> keys, values;
-  std::vector<int32_t> q_lens{63}, kv_lens{2047};
-  std::vector<int32_t> q_indptr{0, 63};
-  std::vector<int32_t> append_indptr{0, 2047};
+  std::vector<int32_t> q_lens{33}, kv_lens{32768};
+  std::vector<int32_t> q_indptr{0, 33};
+  std::vector<int32_t> append_indptr{0, 32768};
   std::vector<T> kv_data;
   std::vector<int32_t> kv_indptr{0};
   std::vector<int32_t> kv_indices;
@@ -531,6 +531,10 @@ TEST(FlashInferCorrectnessTest, BatchPagedPrefillShortContextTestFP16) {
 
 TEST(FlashInferCorrectnessTest, BatchPagedPrefillShortContextTestFP16QKHalfAccum) {
   TestBatchPagedPrefillKernelShortContextCorrectness<half>(false);
+}
+
+TEST(FlashInferCorrectnessTest, BatchPagedPrefillLongContextTestFP16) {
+  TestBatchPagedPrefillKernelLongContextCorrectness<half>(false);
 }
 
 TEST(FlashInferCorrectnessTest, BatchPagedPrefillLongContextTestFP16QKHalfAccum) {
