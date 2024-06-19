@@ -70,12 +70,12 @@ template <PageStorage PAGE_STORAGE, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POS
 cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
     BatchPrefillHandler* handler, DTypeIn* q, IdType* q_indptr, IdType* q_offset,
     paged_kv_t<PAGE_STORAGE, KV_LAYOUT, DTypeIn, IdType> paged_kv, uint8_t* custom_mask,
-    IdType* qk_indptr, IdType* o_indptr, DTypeOut* o, float* lse, uint32_t num_qo_heads,
-    float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream) {
+    IdType* qk_indptr, DTypeOut* o, float* lse, uint32_t num_qo_heads, float sm_scale,
+    float rope_scale, float rope_theta, cudaStream_t stream) {
   DTypeOut* tmp_v = nullptr;
   float* tmp_s = nullptr;
   IdType *kv_lens = nullptr, request_indices = nullptr, qo_tile_indices = nullptr,
-         *kv_tile_indices = nullptr, *o_merge_indptr, *merge_indptr = nullptr;
+         *kv_tile_indices = nullptr, *o_indptr = nullptr, *merge_indptr = nullptr;
   bool* block_valid_mask = nullptr;
   uint32_t num_frags_x = 0U;
   uint32_t padded_batch_size = 0U;
@@ -117,13 +117,13 @@ template <uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK, QKVLayout KV_LAYOU
 cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
     BatchPrefillHandler* handler, DTypeIn* q, IdType* q_indptr, DTypeIn* k, DTypeIn* v,
     IdType* kv_indptr, uint8_t* custom_mask, IdType* qk_indptr, IdType* q_offset,
-    IdType* k_rope_pos_offset, IdType* o_indptr, DTypeOut* o, float* lse, uint32_t batch_size,
-    uint32_t num_qo_heads, uint32_t num_kv_heads, float sm_scale, float rope_scale,
-    float rope_theta, cudaStream_t stream) {
+    IdType* k_rope_pos_offset, DTypeOut* o, float* lse, uint32_t batch_size, uint32_t num_qo_heads,
+    uint32_t num_kv_heads, float sm_scale, float rope_scale, float rope_theta,
+    cudaStream_t stream) {
   DTypeOut* tmp_v = nullptr;
   float* tmp_s = nullptr;
   IdType *kv_lens = nullptr, request_indices = nullptr, qo_tile_indices = nullptr,
-         *kv_tile_indices = nullptr, *o_merge_indptr, *merge_indptr = nullptr;
+         *kv_tile_indices = nullptr, *o_indptr = nullptr, *merge_indptr = nullptr;
   bool* block_valid_mask = nullptr;
   uint32_t num_frags_x = 0U;
   uint32_t padded_batch_size = 0U;
