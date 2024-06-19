@@ -582,6 +582,22 @@ cudaError_t PrefillSplitQOKVIndptr(
     }
   }
 
+  std::cout << "qo_indptr_h: ";
+  for (auto val : qo_indptr_h) {
+    std::cout << val << " ";
+  }
+  std::cout << std::endl;
+  std::cout << "kv_indptr_h: ";
+  for (auto val : kv_indptr_h) {
+    std::cout << val << " ";
+  }
+  std::cout << std::endl;
+  std::cout << "kv_last_page_len_h: ";
+  for (auto val : kv_last_page_len_h) {
+    std::cout << val << " ";
+  }
+  std::cout << std::endl;
+
   // step 0: get the number of SMs
   int num_sm = 0;
   int dev_id = 0;
@@ -636,6 +652,46 @@ cudaError_t PrefillSplitQOKVIndptr(
 
   // step 4: multiply kv_chunk_size by page_size
   kv_chunk_size *= page_size;
+
+  std::cout << "split_kv: " << split_kv << ", padded_batch_size: " << padded_batch_size
+            << ", new_batch_size: " << new_batch_size << ", num_frags_x: " << num_frags_x
+            << ", kv_chunk_size: " << kv_chunk_size << ", total_num_rows: " << total_num_rows
+            << ", qo_chunk_size: " << qo_chunk_size << ", max_grid_size: " << max_grid_size
+            << ", avg_packed_qo_len: " << avg_packed_qo_len
+            << ", sum_packed_qo_len: " << sum_packed_qo_len
+            << ", avg_qo_len_greater_than_64: " << avg_qo_len_greater_than_64
+            << ", num_kv_heads: " << num_kv_heads << ", num_qo_heads: " << num_qo_heads
+            << ", head_dim: " << head_dim << ", page_size: " << page_size << std::endl;
+  std::cout << "request_indices: ";
+  for (auto idx : request_indices) {
+    std::cout << idx << " ";
+  }
+  std::cout << std::endl;
+  std::cout << "qo_tile_indices: ";
+  for (auto idx : qo_tile_indices) {
+    std::cout << idx << " ";
+  }
+  std::cout << std::endl;
+  std::cout << "kv_tile_indices: ";
+  for (auto idx : kv_tile_indices) {
+    std::cout << idx << " ";
+  }
+  std::cout << std::endl;
+  std::cout << "kv_len: ";
+  for (auto len : packed_kv_len_arr) {
+    std::cout << len << " ";
+  }
+  std::cout << std::endl;
+  std::cout << "merge_indptr: ";
+  for (auto idx : merge_indptr) {
+    std::cout << idx << " ";
+  }
+  std::cout << std::endl;
+  std::cout << "o_indptr: ";
+  for (auto idx : o_indptr) {
+    std::cout << idx << " ";
+  }
+  std::cout << std::endl;
   return cudaSuccess;
 }
 
@@ -686,6 +742,8 @@ class BatchPrefillHandler {
 
   uint32_t GetNumFragsX() const { return num_frags_x_; }
 
+  uint32_t GetTotalNumRows() const { return total_num_rows_; }
+
   bool IsForwardStarted() const { return request_indices_ != nullptr; }
 
   void UpdatePageLockedBufferSize(size_t max_workspace_size_in_bytes) {
@@ -705,11 +763,11 @@ class BatchPrefillHandler {
       throw std::invalid_argument(err_msg.str());
     }
     bool split_kv;
-    uint32_t new_batch_size, total_num_rows;
+    uint32_t new_batch_size;
     std::vector<IdType> request_indices_vec, qo_tile_indices_vec, kv_tile_indices_vec, kv_len_vec,
         merge_indptr_vec, o_indptr_vec;
     FLASHINFER_CUDA_CALL(PrefillSplitQOKVIndptr(
-        split_kv, padded_batch_size_, new_batch_size, num_frags_x_, kv_chunk_size_, total_num_rows,
+        split_kv, padded_batch_size_, new_batch_size, num_frags_x_, kv_chunk_size_, total_num_rows_,
         kv_len_vec, request_indices_vec, qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec,
         o_indptr_vec, qo_indptr, kv_indptr, kv_last_page_len, batch_size, num_qo_heads,
         num_kv_heads, head_dim, page_size, stream_));
@@ -726,12 +784,15 @@ class BatchPrefillHandler {
           (char*)page_locked_buffer_ + ((char*)kv_tile_indices_ - (char*)request_indices_);
       kv_len_ = allocator.aligned_alloc<void>(sizeof(IdType) * batch_size, 16);
       void* kv_len_h_ = (char*)page_locked_buffer_ + ((char*)kv_len_ - (char*)request_indices_);
-      merge_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * (total_num_rows + 1), 16);
-      void* merge_indptr_h_ =
-          (char*)page_locked_buffer_ + ((char*)merge_indptr_ - (char*)request_indices_);
       o_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * (batch_size + 1), 16);
       void* o_indptr_h_ = (char*)page_locked_buffer_ + ((char*)o_indptr_ - (char*)request_indices_);
       if (split_kv) {
+        // need merge_indptr when split_kv is true
+        merge_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * (total_num_rows_ + 1), 16);
+        void* merge_indptr_h_ =
+            (char*)page_locked_buffer_ + ((char*)merge_indptr_ - (char*)request_indices_);
+        std::copy(merge_indptr_vec.begin(), merge_indptr_vec.end(), (IdType*)merge_indptr_h_);
+        // need block_valid_mask when split_kv is true and CUDAGraph is enabled
         block_valid_mask_ = allocator.aligned_alloc<bool>(sizeof(bool) * padded_batch_size_, 16);
         bool* block_valid_mask_h_ =
             (bool*)page_locked_buffer_ + ((bool*)block_valid_mask_ - (bool*)request_indices_);
@@ -739,6 +800,7 @@ class BatchPrefillHandler {
           block_valid_mask_h_[i] = i < new_batch_size;
         }
       } else {
+        merge_indptr_ = nullptr;
         block_valid_mask_ = nullptr;
         if (padded_batch_size_ != new_batch_size) {
           std::ostringstream err_msg;
@@ -754,7 +816,6 @@ class BatchPrefillHandler {
       std::copy(kv_tile_indices_vec.begin(), kv_tile_indices_vec.end(),
                 (IdType*)kv_tile_indices_h_);
       std::copy(kv_len_vec.begin(), kv_len_vec.end(), (IdType*)kv_len_h_);
-      std::copy(merge_indptr_vec.begin(), merge_indptr_vec.end(), (IdType*)merge_indptr_h_);
       std::copy(o_indptr_vec.begin(), o_indptr_vec.end(), (IdType*)o_indptr_h_);
 
       size_t num_bytes_to_copy = (char*)allocator.ptr - (char*)request_indices_;
@@ -786,9 +847,13 @@ class BatchPrefillHandler {
           (char*)page_locked_buffer_ + ((char*)kv_tile_indices_ - (char*)request_indices_);
       kv_len_ = allocator.aligned_alloc<void>(sizeof(IdType) * kv_len_vec.size(), 16);
       void* kv_len_h_ = (char*)page_locked_buffer_ + ((char*)kv_len_ - (char*)request_indices_);
-      merge_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * merge_indptr_vec.size(), 16);
-      void* merge_indptr_h_ =
-          (char*)page_locked_buffer_ + ((char*)merge_indptr_ - (char*)request_indices_);
+      if (split_kv) {
+        // need merge_indptr when split_kv is true
+        merge_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * merge_indptr_vec.size(), 16);
+        void* merge_indptr_h_ =
+            (char*)page_locked_buffer_ + ((char*)merge_indptr_ - (char*)request_indices_);
+        std::copy(merge_indptr_vec.begin(), merge_indptr_vec.end(), (IdType*)merge_indptr_h_);
+      }
       o_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * o_indptr_vec.size(), 16);
       void* o_indptr_h_ = (char*)page_locked_buffer_ + ((char*)o_indptr_ - (char*)request_indices_);
       std::copy(request_indices_vec.begin(), request_indices_vec.end(),
@@ -798,7 +863,6 @@ class BatchPrefillHandler {
       std::copy(kv_tile_indices_vec.begin(), kv_tile_indices_vec.end(),
                 (IdType*)kv_tile_indices_h_);
       std::copy(kv_len_vec.begin(), kv_len_vec.end(), (IdType*)kv_len_h_);
-      std::copy(merge_indptr_vec.begin(), merge_indptr_vec.end(), (IdType*)merge_indptr_h_);
       std::copy(o_indptr_vec.begin(), o_indptr_vec.end(), (IdType*)o_indptr_h_);
       size_t num_bytes_to_copy = (char*)allocator.ptr - (char*)request_indices_;
 
@@ -830,6 +894,7 @@ class BatchPrefillHandler {
     tmp_v_ = nullptr;
     tmp_s_ = nullptr;
     block_valid_mask_ = nullptr;
+    total_num_rows_ = 0U;
     padded_batch_size_ = 0U;
     num_frags_x_ = 0U;
     kv_chunk_size_ = 0U;
@@ -852,6 +917,7 @@ class BatchPrefillHandler {
         tmp_v_(nullptr),
         tmp_s_(nullptr),
         block_valid_mask_(nullptr),
+        total_num_rows_(0U),
         padded_batch_size_(0U),
         num_frags_x_(0U),
         kv_chunk_size_(0U),
@@ -876,6 +942,7 @@ class BatchPrefillHandler {
   void* tmp_v_;
   float* tmp_s_;
   bool* block_valid_mask_;
+  uint32_t total_num_rows_;
   uint32_t padded_batch_size_;
   uint32_t num_frags_x_;
   uint32_t kv_chunk_size_;

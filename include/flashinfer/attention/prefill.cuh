@@ -1721,7 +1721,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
     IdType* kv_lens, IdType* q_indptr, DTypeIn* k, DTypeIn* v, IdType* kv_indptr,
     uint8_t* custom_mask, IdType* qk_indptr, IdType* q_offset, IdType* k_rope_pos_offset,
     IdType* o_indptr, DTypeOut* o, DTypeOut* tmp_v, float* tmp_s, float* lse, IdType* merge_indptr,
-    bool* block_valid_mask, const uint32_t batch_size, const uint32_t num_qo_heads,
+    bool* block_valid_mask, const uint32_t total_num_rows, const uint32_t num_qo_heads,
     const uint32_t kv_chunk_size, const uint32_t padded_batch_size, const uint32_t num_kv_heads,
     const float sm_scale, const float rope_scale, const float rope_theta,
     cudaStream_t stream = nullptr) {
@@ -1832,8 +1832,8 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
                         (void*)&log2_rope_rcp_theta};
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-        FLASHINFER_CUDA_CALL(VariableLengthMergeStates(tmp_v, tmp_s, merge_indptr, o, lse,
-                                                       batch_size, num_qo_heads, HEAD_DIM, stream));
+        FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
+            tmp_v, tmp_s, merge_indptr, o, lse, total_num_rows, num_qo_heads, HEAD_DIM, stream));
       }
     }
   });
@@ -1849,14 +1849,13 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     IdType* kv_lens, IdType* q_indptr, IdType* q_offset,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, uint8_t* custom_mask,
     IdType* qk_indptr, IdType* o_indptr, DTypeOut* o, DTypeOut* tmp_v, float* tmp_s, float* lse,
-    IdType* merge_indptr, bool* block_valid_mask, uint32_t num_qo_heads, uint32_t kv_chunk_size,
-    uint32_t padded_batch_size, float sm_scale, float rope_scale, float rope_theta,
-    cudaStream_t stream) {
+    IdType* merge_indptr, bool* block_valid_mask, uint32_t total_num_rows, uint32_t num_qo_heads,
+    uint32_t kv_chunk_size, uint32_t padded_batch_size, float sm_scale, float rope_scale,
+    float rope_theta, cudaStream_t stream) {
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
   constexpr uint32_t num_warps = 4;
   const uint32_t num_kv_heads = paged_kv.num_heads;
-  const uint32_t batch_size = paged_kv.batch_size;
   const uint32_t group_size = num_qo_heads / num_kv_heads;
   const uint_fastdiv group_size_fastdiv(group_size);
 
@@ -1958,8 +1957,8 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
                         (void*)&log2_rope_rcp_theta};
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-        FLASHINFER_CUDA_CALL(VariableLengthMergeStates(tmp_v, tmp_s, merge_indptr, o, lse,
-                                                       batch_size, num_qo_heads, HEAD_DIM, stream));
+        FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
+            tmp_v, tmp_s, merge_indptr, o, lse, total_num_rows, num_qo_heads, HEAD_DIM, stream));
       }
     }
   });
