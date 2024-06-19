@@ -17,6 +17,7 @@
 #define FLASHINFER_ATTENTION_HANDLER_CUH_
 
 #include <driver_types.h>
+
 #include <algorithm>
 #include <cstddef>
 #include <sstream>
