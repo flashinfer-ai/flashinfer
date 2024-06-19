@@ -1547,6 +1547,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
   normalize_d<num_frags_x, num_frags_y>(o_frag, d);
 
   const uint32_t num_kv_chunks = ceil_div(kv_len, kv_chunk_size);
+
   // write_back
   write_o_reg_gmem<num_frags_x, num_frags_y>(
       o_frag, &qo_smem, o_ptr_base, qo_packed_idx_base, qo_len,

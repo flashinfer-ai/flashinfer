@@ -89,9 +89,11 @@ std::tuple<bool, uint32_t, uint32_t> PrefillBinarySearchKVChunkSize(
     const uint32_t qo_chunk_size, const uint32_t min_kv_chunk_size = 1) {
   int64_t low = min_kv_chunk_size, high = 0;
   int64_t batch_size = packed_qo_len_arr.size();
+  int64_t max_kv_len;
   for (const int64_t& kv_len : kv_len_arr) {
-    high = std::max(high, kv_len);
+    max_kv_len = std::max(high, kv_len);
   }
+  high = max_kv_len;
   int64_t new_batch_size;
   while (low < high) {
     int64_t mid = (low + high) / 2;
@@ -106,11 +108,12 @@ std::tuple<bool, uint32_t, uint32_t> PrefillBinarySearchKVChunkSize(
       high = mid;
     }
   }
+
   new_batch_size = 0;
   for (uint32_t i = 0; i < batch_size; ++i) {
     new_batch_size += ceil_div(packed_qo_len_arr[i], qo_chunk_size) * ceil_div(kv_len_arr[i], low);
   }
-  return {low < high, low, new_batch_size};
+  return {low < max_kv_len, low, new_batch_size};
 }
 
 /*!
@@ -540,8 +543,7 @@ cudaError_t PrefillSplitQOKVIndptr(
     std::vector<IdType>& o_indptr, IdType* qo_indptr, IdType* kv_indptr, IdType* kv_last_page_len,
     uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
     uint32_t page_size, cudaStream_t stream = nullptr) {
-  packed_kv_len_arr.clear();
-  packed_kv_len_arr.reserve(batch_size);
+  packed_kv_len_arr.resize(batch_size);
   request_indices.clear();
   qo_tile_indices.clear();
   kv_tile_indices.clear();
@@ -597,7 +599,7 @@ cudaError_t PrefillSplitQOKVIndptr(
                                : kv_len_arr[i];
     volume += packed_qo_len_arr[i] * kv_len_arr[i];
   }
-  int64_t avg_packed_qo_len = volume / int64_t(batch_size);
+  int64_t avg_packed_qo_len = volume / int64_t(kv_indptr_h.back());
   const bool avg_qo_len_greater_than_64 = avg_packed_qo_len > 64;
   num_frags_x = (head_dim < 256 && avg_qo_len_greater_than_64) ? 2 : 1;
   const uint32_t qo_chunk_size = num_frags_x * (num_warps * 16);
@@ -606,7 +608,6 @@ cudaError_t PrefillSplitQOKVIndptr(
   std::tie(split_kv, kv_chunk_size, new_batch_size) =
       PrefillBinarySearchKVChunkSize(max_grid_size, num_kv_heads, packed_qo_len_arr, kv_len_arr,
                                      qo_chunk_size, /*min_kv_chunk_size=*/(128 / page_size));
-  kv_chunk_size *= page_size;
 
   // step 3: split qo_indptr and kv_indptr
   for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
@@ -628,6 +629,8 @@ cudaError_t PrefillSplitQOKVIndptr(
     o_indptr.push_back(o_indptr.back() + qo_len * num_tiles_kv);
   }
 
+  // step 4: multiply kv_chunk_size by page_size
+  kv_chunk_size *= page_size;
   return cudaSuccess;
 }
 
@@ -705,6 +708,7 @@ class BatchPrefillHandler {
         request_indices_vec, qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec,
         o_indptr_vec, qo_indptr, kv_indptr, kv_last_page_len, batch_size, num_qo_heads,
         num_kv_heads, head_dim, page_size, stream_));
+    padded_batch_size_ = new_batch_size;
 
     AlignedAllocator allocator(buffer, workspace_size_in_bytes);
     request_indices_ =
