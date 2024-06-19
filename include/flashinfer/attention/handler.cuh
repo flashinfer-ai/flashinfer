@@ -623,7 +623,7 @@ split_qo_kv_indptr(IdType* qo_indptr, IdType* kv_indptr, IdType* kv_last_page_le
           padded_batch_size,
           new_batch_size,
           num_frags_x,
-          kv_chunk_size,
+          kv_chunk_size * page_size,
           std::move(packed_kv_len_arr),
           std::move(request_indices),
           std::move(qo_tile_indices),

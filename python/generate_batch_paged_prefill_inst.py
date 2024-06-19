@@ -43,13 +43,14 @@ def get_cu_file_str(
     insts = "\n".join(
         [
             """template cudaError_t BatchPrefillWithPagedKVCacheDispatched<page_storage, {num_frags_x}, {head_dim}, {logits_hook}, {kv_layout}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {dtype_in}, {dtype_out}, {idtype}>(
-    {dtype_in}* q, {idtype}* request_indices, {idtype}* tile_indices,
-    {idtype}* qo_indptr, {idtype}* q_offset,
+    {dtype_in}* q, {idtype}* request_indices, {idtype}* q_tile_indices, {idtype}* kv_tile_indices,
+    {idtype}* kv_lens, {idtype}* q_indptr, {idtype}* q_offset,
     paged_kv_t<page_storage, {kv_layout}, {dtype_in}, {idtype}> paged_kv,
-    uint8_t* custom_mask, {idtype}* qk_indptr,
-    {dtype_out}* o, float* tmp, float* lse,
-    uint32_t num_tiles, uint32_t num_qo_heads,
-    float sm_scale, float rope_scale,
+    uint8_t* custom_mask, {idtype}* qk_indptr, {idtype}* o_indptr,
+    {dtype_out}* o, {dtype_out}* tmp_v, float* tmp_s, float* lse,
+    {idtype}* merge_indptr, bool* block_valid_mask,
+    uint32_t num_qo_heads, uint32_t kv_chunk_size,
+    uiint32_t padded_batch_size, float sm_scale, float rope_scale,
     float rope_theta, cudaStream_t stream);
     """.format(
                 logits_hook=logits_hook_literal[int(logits_hook)],

@@ -42,15 +42,14 @@ def get_cu_file_str(
     insts = "\n".join(
         [
             """template cudaError_t BatchPrefillWithRaggedKVCacheDispatched<{num_frags_x}, {head_dim}, {logits_hook}, {kv_layout}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {dtype_in}, {dtype_out}, {idtype}>(
-    {dtype_in}* q, {idtype}* request_indices, {idtype}* tile_indices, {idtype}* qo_indptr,
-    {dtype_in}* k, {dtype_in}* v, {idtype}* kv_indptr,
-    uint8_t* custom_mask, {idtype}* qk_indptr,
-    {idtype}* q_offset, {idtype}* k_rope_pos_offset,
-    {dtype_out}* o, float* tmp, float* lse,
-    uint32_t batch_size, uint32_t num_tiles,
-    uint32_t num_qo_heads, uint32_t num_kv_heads,
-    float sm_scale, float rope_scale,
-    float rope_theta, cudaStream_t stream);
+    {dtype_in}* q, {idtype}* request_indices, {idtype}* q_tile_indices, {idtype}* kv_tile_indices,
+    {idtype}* kv_lens, {idtype}* q_indptr, {dtype_in}* k, {dtype_in}* v, {idtype}* kv_indptr,
+    uint8_t* custom_mask, {idtype}* qk_indptr, {idtype}* q_offset, {idtype}* k_rope_pos_offset,
+    {idtype}* o_indptr, {dtype_out}* o, {dtype_out}* tmp_v, float* tmp_s, float* lse, {idtype}* merge_indptr,
+    bool* block_valid_mask, const uint32_t batch_size, const uint32_t num_qo_heads,
+    const uint32_t kv_chunk_size, const uint32_t padded_batch_size, const uint32_t num_kv_heads,
+    const float sm_scale, const float rope_scale, const float rope_theta,
+    cudaStream_t stream);
         """.format(
                 num_frags_x=num_frags_x,
                 logits_hook=logits_hook_literal[int(logits_hook)],
