@@ -669,6 +669,10 @@ class BatchPrefillHandler {
     return (DType*)tmp_v_;
   }
 
+  bool* GetBlockValidMask() const {
+    return block_valid_mask_;
+  }
+
   float* GetTempS() const { return tmp_s_; }
 
   uint32_t GetPaddedBatchSize() const { return padded_batch_size_; }
@@ -744,6 +748,8 @@ class BatchPrefillHandler {
       tmp_v_ = nullptr;
       tmp_s_ = nullptr;
     }
+
+    block_valid_mask_ = nullptr;
     return cudaSuccess;
   }
 
@@ -757,6 +763,7 @@ class BatchPrefillHandler {
     o_indptr_ = nullptr;
     tmp_v_ = nullptr;
     tmp_s_ = nullptr;
+    block_valid_mask_ = nullptr;
     padded_batch_size_ = 0U;
     num_frags_x_ = 0U;
     kv_chunk_size_ = 0U;
@@ -778,6 +785,7 @@ class BatchPrefillHandler {
         o_indptr_(nullptr),
         tmp_v_(nullptr),
         tmp_s_(nullptr),
+        block_valid_mask_(nullptr),
         padded_batch_size_(0U),
         num_frags_x_(0U),
         kv_chunk_size_(0U),
@@ -801,6 +809,7 @@ class BatchPrefillHandler {
   void* o_indptr_;
   void* tmp_v_;
   float* tmp_s_;
+  bool* block_valid_mask_;
   uint32_t padded_batch_size_;
   uint32_t num_frags_x_;
   uint32_t kv_chunk_size_;
