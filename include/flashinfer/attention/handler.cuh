@@ -697,10 +697,10 @@ class BatchPrefillHandler {
     }
     uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
     bool split_kv;
-    IdType padded_batch_size, num_frags_x, kv_chunk_size;
+    IdType padded_batch_size, new_batch_size, num_frags_x, kv_chunk_size;
     std::vector<IdType> request_indices_vec, qo_tile_indices_vec, kv_tile_indices_vec, kv_len_vec,
         merge_indptr_vec, o_indptr_vec;
-    std::tie(split_kv, padded_batch_size, num_frags_x, kv_chunk_size, kv_len_vec,
+    std::tie(split_kv, padded_batch_size, new_batch_size, num_frags_x, kv_chunk_size, kv_len_vec,
              request_indices_vec, qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec,
              o_indptr_vec) =
         split_qo_kv_indptr(qo_indptr, kv_indptr, kv_last_page_len, batch_size, num_qo_heads,
@@ -738,8 +738,11 @@ class BatchPrefillHandler {
 
     if (split_kv) {
       tmp_v_ = allocator.aligned_alloc<void>(
-          num_qo_heads * batch_size * head_dim * sizeof(DTypeOut), 16);
-      tmp_s_ = allocator.aligned_alloc<float>(num_qo_heads * batch_size * sizeof(float), 16);
+          num_qo_heads * new_batch_size * head_dim * sizeof(DTypeOut), 16);
+      tmp_s_ = allocator.aligned_alloc<float>(num_qo_heads * new_batch_size * sizeof(float), 16);
+    } else {
+      tmp_v_ = nullptr;
+      tmp_s_ = nullptr;
     }
     return cudaSuccess;
   }
