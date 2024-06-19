@@ -579,10 +579,10 @@ split_qo_kv_indptr(IdType* qo_indptr, IdType* kv_indptr, IdType* kv_last_page_le
   for (uint32_t i = 0; i < batch_size; ++i) {
     packed_qo_len_arr[i] = int64_t(qo_indptr_h[i + 1] - qo_indptr_h[i]) * int64_t(gqa_group_size);
     kv_len_arr[i] = int64_t(kv_indptr_h[i + 1] - kv_indptr_h[i]);
-    volume += packed_qo_len[i] * kv_len_arr[i];
+    volume += packed_qo_len_arr[i] * kv_len_arr[i];
   }
   int64_t avg_packed_qo_len = volume / int64_t(batch_size);
-  const bool avg_qo_len_greater_than_64 = avg_qo_len > 64;
+  const bool avg_qo_len_greater_than_64 = avg_packed_qo_len > 64;
   const uint32_t num_frags_x = (head_dim < 256 && avg_qo_len_greater_than_64) ? 2 : 1;
   const uint32_t qo_chunk_size = num_frags_x * (num_warps * 16);
 
@@ -594,6 +594,7 @@ split_qo_kv_indptr(IdType* qo_indptr, IdType* kv_indptr, IdType* kv_last_page_le
 
   std::vector<IdType> request_indices, qo_tile_indices, kv_tile_indices, new_last_page_len,
       merge_indptr{0}, o_indptr{0};
+  int64_t num_tiles = 0;
   // step 3: split qo_indptr and kv_indptr
   for (uint32_t request_idx = 0; request_idx < batch_size; ++i) {
     int64_t packed_qo_len = packed_qo_len_arr[request_idx], kv_len = kv_len_arr[request_idx];
@@ -601,10 +602,11 @@ split_qo_kv_indptr(IdType* qo_indptr, IdType* kv_indptr, IdType* kv_last_page_le
             num_tiles_kv = ceil_div(kv_len, kv_chunk_size);
     for (uint32_t q_tile_idx = 0; q_tile_idx < num_tiles_q; ++q_tile_idx) {
       for (uint32_t kv_tile_idx = 0; kv_tile_idx < num_tiles_kv; ++kv_tile_idx) {
+        num_tiles++;
         request_indices.push_back(request_idx);
         qo_tile_indices.push_back(q_tile_idx);
         kv_tile_indices.push_back(kv_tile_idx);
-        if (has_last_page_len) {
+        if (has_kv_last_page_len) {
           bool is_last_kv_tile = kv_tile_idx + 1 == num_tiles_kv;
           new_last_page_len.push_back(is_last_kv_tile ? kv_last_page_len_h[request_idx]
                                                       : page_size);
@@ -616,10 +618,11 @@ split_qo_kv_indptr(IdType* qo_indptr, IdType* kv_indptr, IdType* kv_last_page_le
     for (uint32_t row = 0; row < qo_len; ++row) {
       merge_indptr.push_back(merge_indptr.back() + num_tiles_kv);
     }
-    o_indptr.push_back(o_indptr.back() + qo_len * num_tile);
+    o_indptr.push_back(o_indptr.back() + qo_len * num_tiles_kv);
   }
 
-  return {num_frags_x,
+  return {num_tiles,
+          num_frags_x,
           kv_chunk_size,
           std::move(request_indices),
           std::move(qo_tile_indices),
@@ -694,7 +697,7 @@ class BatchPrefillHandler {
     IdType num_frags_x, kv_chunk_size;
     std::vector<IdType> request_indices_vec, qo_tile_indices_vec, kv_tile_indices_vec,
         new_last_page_len_vec, merge_indptr_vec, o_indptr_vec;
-    std::tie(num_frags_x, kv_chunk_size, request_indices_vec, qo_tile_indices_vec,
+    std::tie(num_tiles_, num_frags_x, kv_chunk_size, request_indices_vec, qo_tile_indices_vec,
              kv_tile_indices_vec, new_last_page_len_vec, merge_indptr_vec, o_indptr_vec) =
         split_qo_kv_indptr(qo_indptr, kv_indptr, batch_size, num_qo_heads, num_kv_heads, head_dim,
                            stream_);

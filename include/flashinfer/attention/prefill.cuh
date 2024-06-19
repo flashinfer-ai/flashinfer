@@ -1710,10 +1710,11 @@ template <uint32_t num_frags_x, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HO
           QKVLayout KV_LAYOUT, PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION,
           MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
-    DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, DTypeIn* k,
-    DTypeIn* v, IdType* kv_indptr, uint8_t* custom_mask, IdType* qk_indptr, IdType* q_offset,
-    IdType* k_rope_pos_offset, DTypeOut* o, DTypeOut* tmp_v, float* tmp_s, float* lse,
-    const uint32_t batch_size, const uint32_t num_qo_heads, const uint32_t num_tiles,
+    DTypeIn* q, IdType* request_indices, IdType* q_tile_indices, IdType* kv_tile_indices,
+    IdType* q_indptr, DTypeIn* k, DTypeIn* v, IdType* kv_indptr, uint8_t* custom_mask,
+    IdType* qk_indptr, IdType* q_offset, IdType* k_rope_pos_offset, IdType* o_indptr, DTypeOut* o,
+    DTypeOut* tmp_v, float* tmp_s, float* lse, const uint32_t batch_size,
+    const uint32_t num_qo_heads, const uint32_t kv_chunk_size, const uint32_t num_tiles,
     const uint32_t num_kv_heads, const float sm_scale, const float rope_scale,
     const float rope_theta, cudaStream_t stream = nullptr) {
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
@@ -1832,11 +1833,12 @@ template <PageStorage page_storage, uint32_t num_frags_x, uint32_t HEAD_DIM,
           bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut,
           typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(
-    DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, IdType* q_offset,
+    DTypeIn* q, IdType* request_indices, IdType* q_tile_indices, IdType* kv_tile_indices,
+    IdType* q_indptr, IdType* q_offset,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, uint8_t* custom_mask,
-    IdType* qk_indptr, DTypeOut* o, DTypeOut* tmp_v, float* tmp_s, float* lse,
-    uint32_t num_qo_heads, uint32_t num_tiles, float sm_scale, float rope_scale, float rope_theta,
-    cudaStream_t stream) {
+    IdType* qk_indptr, IdType* o_indptr, DTypeOut* o, DTypeOut* tmp_v, float* tmp_s, float* lse,
+    uint32_t num_qo_heads, uint32_t kv_chunk_size, uint32_t num_tiles, float sm_scale,
+    float rope_scale, float rope_theta, cudaStream_t stream) {
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
   constexpr uint32_t num_warps = 4;
