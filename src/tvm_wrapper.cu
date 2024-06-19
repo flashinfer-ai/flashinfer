@@ -271,19 +271,28 @@ void _FlashInferAttentionPrefillWithPagedKVCache(int64_t handler_id, DLTensor* q
 }
 
 void _FlashInferAttentionPrefillWithPagedKVCacheBeginForward(
-    int64_t handler_idx, DLTensor* workspace_buffer, DLTensor* qo_indptr, int64_t batch_size,
-    int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim, TVMStreamHandle copy_stream) {
+    int64_t handler_idx, DLTensor* workspace_buffer, DLTensor* qo_indptr, DLTensor* kv_indptr,
+    DLTensor* kv_last_page_len, int64_t batch_size, int64_t num_qo_heads, int64_t num_kv_heads,
+    int64_t head_dim, int64_t page_size, TVMStreamHandle copy_stream) {
   CHECK_EQ(workspace_buffer->ndim, 1) << "The workspace buffer must be a 1-D tensor";
   size_t workspace_size_in_bytes = workspace_buffer->shape[0] * workspace_buffer->dtype.bits / 8;
   CHECK(handler_idx < max_num_handlers) << "The handler id must be less than " << max_num_handlers;
+
+  // NOTE(Zihao): here we presume the input data type is half, in the future we should
+  //   leave a parameter for the input data type.
+  using dtype_in = half;
   cudaStream_t original_stream = batch_prefill_paged_kv_handlers[handler_idx].GetCUDAStream();
   batch_prefill_paged_kv_handlers[handler_idx].SetCUDAStream(
       static_cast<cudaStream_t>(copy_stream));
   DISPATCH_TVM_CUDA_IDTYPE(qo_indptr->dtype, dtype_idx, {
-    cudaError_t status = batch_prefill_paged_kv_handlers[handler_idx].BeginForward(
-        static_cast<void*>(workspace_buffer->data), workspace_size_in_bytes,
-        static_cast<dtype_idx*>(qo_indptr->data) + qo_indptr->byte_offset / sizeof(dtype_idx),
-        batch_size, num_qo_heads, num_kv_heads, head_dim);
+    cudaError_t status =
+        batch_prefill_paged_kv_handlers[handler_idx].BeginForward<dtype_in, dtype_idx>(
+            static_cast<void*>(workspace_buffer->data), workspace_size_in_bytes,
+            static_cast<dtype_idx*>(qo_indptr->data) + qo_indptr->byte_offset / sizeof(dtype_idx),
+            static_cast<dtype_idx*>(kv_indptr->data) + kv_indptr->byte_offset / sizeof(dtype_idx),
+            static_cast<dtype_idx*>(kv_last_page_len->data) +
+                kv_last_page_len->byte_offset / sizeof(dtype_idx),
+            batch_size, num_qo_heads, num_kv_heads, head_dim, page_size);
     if (status != cudaSuccess) {
       LOG(FATAL) << "FlashInfer prefill BeginForward error " << cudaGetErrorString(status);
     }
@@ -543,18 +552,24 @@ void _FlashInferAttentionPrefillWithRaggedKVCache(
 }
 
 void _FlashInferAttentionPrefillWithRaggedKVCacheBeginForward(
-    DLTensor* workspace_buffer, DLTensor* qo_indptr, int64_t batch_size, int64_t num_qo_heads,
-    int64_t num_kv_heads, int64_t head_dim, TVMStreamHandle copy_stream) {
+    DLTensor* workspace_buffer, DLTensor* qo_indptr, DLTensor* kv_indptr, int64_t batch_size,
+    int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim, TVMStreamHandle copy_stream) {
   CHECK_EQ(workspace_buffer->ndim, 1) << "The workspace buffer must be a 1-D tensor";
   size_t workspace_size_in_bytes = workspace_buffer->shape[0] * workspace_buffer->dtype.bits / 8;
   cudaStream_t original_stream = batch_prefill_ragged_kv_handler.GetCUDAStream();
   batch_prefill_ragged_kv_handler.SetCUDAStream(static_cast<cudaStream_t>(copy_stream));
 
+  // NOTE(Zihao): here we presume the input data type is half, in the future we should
+  //  leave a parameter for the input data type.
+  using dtype_in = half;
+
   DISPATCH_TVM_CUDA_IDTYPE(qo_indptr->dtype, dtype_idx, {
-    cudaError_t status = batch_prefill_ragged_kv_handler.BeginForward(
+    cudaError_t status = batch_prefill_ragged_kv_handler.BeginForward<dtype_in, dtype_idx>(
         static_cast<void*>(workspace_buffer->data), workspace_size_in_bytes,
         static_cast<dtype_idx*>(qo_indptr->data) + qo_indptr->byte_offset / sizeof(dtype_idx),
-        batch_size, num_qo_heads, num_kv_heads, head_dim);
+        static_cast<dtype_idx*>(kv_indptr->data) + kv_indptr->byte_offset / sizeof(dtype_idx),
+        /*kv_last_page_len=*/nullptr, batch_size, num_qo_heads, num_kv_heads, head_dim,
+        /*page_size=*/1);
     if (status != cudaSuccess) {
       LOG(FATAL) << "FlashInfer PrefillWithRaggedKVCache BeginForward error "
                  << cudaGetErrorString(status);
