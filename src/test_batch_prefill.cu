@@ -103,9 +103,9 @@ void _TestBatchPagedPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t n
     thrust::device_vector<T> o_device(q_len * num_qo_heads * head_dim);
 
     handler.BeginForward<T, int32_t>((void*)thrust::raw_pointer_cast(buffer.data()),
-                                     workspace_size_in_bytes, append_indptr.data(),
-                                     kv_indptr.data(), kv_last_page_len.data(), batch_size,
-                                     num_qo_heads, num_kv_heads, head_dim, page_size);
+                                     workspace_size_in_bytes, q_indptr.data(), kv_indptr.data(),
+                                     kv_last_page_len.data(), batch_size, num_qo_heads,
+                                     num_kv_heads, head_dim, page_size);
 
     for (uint32_t num_runs = 0; num_runs < 10; ++num_runs) {
       auto status = flashinfer::BatchPrefillWithPagedKVCacheWrapper<PageStorage::kIndices,
