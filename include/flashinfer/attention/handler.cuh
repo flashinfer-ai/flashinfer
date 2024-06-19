@@ -541,6 +541,7 @@ cudaError_t PrefillSplitQOKVIndptr(
     uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
     uint32_t page_size, cudaStream_t stream = nullptr) {
   packed_kv_len_arr.clear();
+  packed_kv_len_arr.reserve(batch_size);
   request_indices.clear();
   qo_tile_indices.clear();
   kv_tile_indices.clear();
@@ -696,11 +697,11 @@ class BatchPrefillHandler {
       throw std::invalid_argument(err_msg.str());
     }
     bool split_kv;
-    uint32_t padded_batch_size, new_batch_size, num_frags_x, kv_chunk_size;
+    uint32_t new_batch_size;
     std::vector<IdType> request_indices_vec, qo_tile_indices_vec, kv_tile_indices_vec, kv_len_vec,
         merge_indptr_vec, o_indptr_vec;
     FLASHINFER_CUDA_CALL(PrefillSplitQOKVIndptr(
-        split_kv, padded_batch_size, new_batch_size, num_frags_x, kv_chunk_size, kv_len_vec,
+        split_kv, padded_batch_size_, new_batch_size, num_frags_x_, kv_chunk_size_, kv_len_vec,
         request_indices_vec, qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec,
         o_indptr_vec, qo_indptr, kv_indptr, kv_last_page_len, batch_size, num_qo_heads,
         num_kv_heads, head_dim, page_size, stream_));
