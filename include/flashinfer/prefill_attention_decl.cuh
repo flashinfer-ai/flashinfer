@@ -74,7 +74,7 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
     float rope_scale, float rope_theta, cudaStream_t stream) {
   DTypeOut* tmp_v = nullptr;
   float* tmp_s = nullptr;
-  IdType *kv_lens = nullptr, request_indices = nullptr, qo_tile_indices = nullptr,
+  IdType *kv_lens = nullptr, *request_indices = nullptr, *qo_tile_indices = nullptr,
          *kv_tile_indices = nullptr, *o_indptr = nullptr, *merge_indptr = nullptr;
   bool* block_valid_mask = nullptr;
   uint32_t num_frags_x = 0U;
@@ -122,7 +122,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
     cudaStream_t stream) {
   DTypeOut* tmp_v = nullptr;
   float* tmp_s = nullptr;
-  IdType *kv_lens = nullptr, request_indices = nullptr, qo_tile_indices = nullptr,
+  IdType *kv_lens = nullptr, *request_indices = nullptr, *qo_tile_indices = nullptr,
          *kv_tile_indices = nullptr, *o_indptr = nullptr, *merge_indptr = nullptr;
   bool* block_valid_mask = nullptr;
   uint32_t num_frags_x = 0U;
