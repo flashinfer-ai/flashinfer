@@ -146,7 +146,7 @@ void bench_flashinfer_batch_decode_with_prefill(nvbench::state& state) {
       "Read");
   state.add_global_memory_writes<uint8_t>(vec_bytes(o), "Write");
   BatchPrefillHandler handler;
-  size_t workspace_size_in_bytes = 32 * 1024 * 1024;
+  size_t workspace_size_in_bytes = 128 * 1024 * 1024;
   thrust::device_vector<char> buffer(workspace_size_in_bytes);
 
   handler.BeginForward<T, int32_t>((void*)thrust::raw_pointer_cast(buffer.data()),
