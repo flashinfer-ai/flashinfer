@@ -81,7 +81,7 @@ void _TestBatchPagedPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t n
   paged_kv.last_page_len = thrust::raw_pointer_cast(kv_last_page_len_device.data());
 
   BatchPrefillHandler handler;
-  size_t workspace_size_in_bytes = 32 * 1024 * 1024;
+  size_t workspace_size_in_bytes = 128 * 1024 * 1024;
   thrust::device_vector<char> buffer(workspace_size_in_bytes);
 
   for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
@@ -147,8 +147,8 @@ void _TestBatchRaggedPrefillKernelCorrectness(size_t num_kv_heads, size_t num_qo
                                               bool allow_fp16_qk_reduction) {
   uint32_t batch_size = 9;
   std::vector<int32_t> q_lens(batch_size), kv_lens(batch_size);
-  utils::vec_randint_(q_lens, 1, 15);
-  utils::vec_randint_(kv_lens, 15, 257);
+  utils::vec_randint_(q_lens, 10, 15);
+  utils::vec_randint_(kv_lens, 128, 2048);
   std::vector<int32_t> append_indptr{0}, kv_indptr{0};
 
   for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
@@ -162,7 +162,7 @@ void _TestBatchRaggedPrefillKernelCorrectness(size_t num_kv_heads, size_t num_qo
   std::vector<T> output_refs;
 
   BatchPrefillHandler handler;
-  size_t workspace_size_in_bytes = 32 * 1024 * 1024;
+  size_t workspace_size_in_bytes = 128 * 1024 * 1024;
   thrust::device_vector<char> buffer(workspace_size_in_bytes);
 
   for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
