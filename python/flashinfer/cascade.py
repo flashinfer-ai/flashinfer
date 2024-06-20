@@ -307,8 +307,8 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
     >>> head_dim = 128
     >>> max_num_pages = 128
     >>> page_size = 16
-    >>> # allocate 16MB workspace buffer
-    >>> workspace_buffer = torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+    >>> # allocate 128MB workspace buffer
+    >>> workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
     >>> wrapper = flashinfer.BatchDecodeWithSharedPrefixPagedKVCacheWrapper(
     ...     workspace_buffer, "NHD"
     ... )
@@ -540,8 +540,8 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
     >>> head_dim = 128
     >>> max_num_pages = 128
     >>> page_size = 16
-    >>> # allocate 16MB workspace buffer
-    >>> workspace_buffer = torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+    >>> # allocate 128MB workspace buffer
+    >>> workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
     >>> prefill_wrapper = flashinfer.BatchPrefillWithSharedPrefixPagedKVCacheWrapper(
     ...     workspace_buffer, "NHD"
     ... )
@@ -617,7 +617,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
         ----------
         workspace_buffer : torch.Tensor
             The user reserved workspace buffer used to store auxiliary data structures,
-            recommended size is 16MB, the device of the workspace buffer should be the
+            recommended size is 128MB, the device of the workspace buffer should be the
             same as the device of the input tensors.
         kv_layout : str
             The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
