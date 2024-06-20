@@ -38,16 +38,14 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
   unsigned int head_dim = q.size(2);
   unsigned int kv_len, qo_len, num_kv_heads, num_qo_heads;
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
+  qo_len = q.size(0);
+  num_qo_heads = q.size(1);
   if (kv_layout == QKVLayout::kNHD) {
     kv_len = k.size(0);
-    qo_len = q.size(0);
     num_kv_heads = k.size(1);
-    num_qo_heads = q.size(1);
   } else {
     kv_len = k.size(1);
-    qo_len = q.size(1);
     num_kv_heads = k.size(0);
-    num_qo_heads = q.size(0);
   }
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
@@ -122,16 +120,14 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache_custom_mask(
   unsigned int head_dim = q.size(2);
   unsigned int kv_len, qo_len, num_kv_heads, num_qo_heads;
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
+  qo_len = q.size(0);
+  num_qo_heads = q.size(1);
   if (kv_layout == QKVLayout::kNHD) {
     kv_len = k.size(0);
-    qo_len = q.size(0);
     num_kv_heads = k.size(1);
-    num_qo_heads = q.size(1);
   } else {
     kv_len = k.size(1);
-    qo_len = q.size(1);
     num_kv_heads = k.size(0);
-    num_qo_heads = q.size(0);
   }
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();

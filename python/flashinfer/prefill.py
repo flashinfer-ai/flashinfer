@@ -166,7 +166,7 @@ def single_prefill_with_kv_cache(
     """
     check_pos_encoding_mode(pos_encoding_mode)
     check_kv_layout(kv_layout)
-    tmp = _get_cache_buf("single_prefill_with_kv_cache_tmp", 8 * 1024 * 1024, q.device)
+    tmp = _get_cache_buf("single_prefill_with_kv_cache_tmp", 32 * 1024 * 1024, q.device)
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(q.size(-1))
     if rope_scale is None:
@@ -192,7 +192,7 @@ def single_prefill_with_kv_cache(
             sm_scale,
             rope_scale,
             rope_theta,
-            False,
+            False,  # return lse
         )[0]
     else:
         return _kernels.single_prefill_with_kv_cache(
@@ -208,7 +208,7 @@ def single_prefill_with_kv_cache(
             sm_scale,
             rope_scale,
             rope_theta,
-            False,
+            False,  # return lse
         )[0]
 
 
@@ -368,7 +368,7 @@ def single_prefill_with_kv_cache_return_lse(
             sm_scale,
             rope_scale,
             rope_theta,
-            True,
+            True,  # return lse
         )
     else:
         return _kernels.single_prefill_with_kv_cache(
@@ -384,7 +384,7 @@ def single_prefill_with_kv_cache_return_lse(
             sm_scale,
             rope_scale,
             rope_theta,
-            True,
+            True,  # return lse
         )
 
 
@@ -427,8 +427,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
     >>> head_dim = 128
     >>> max_num_pages = 128
     >>> page_size = 16
-    >>> # allocate 16MB workspace buffer
-    >>> workspace_buffer = torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+    >>> # allocate 128MB workspace buffer
+    >>> workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
     >>> prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
     ...     workspace_buffer, "NHD"
     ... )
@@ -524,7 +524,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self,
         workspace_buffer: torch.Tensor,
         kv_layout: str = "NHD",
-        enable_cuda_graph: bool = False,
+        use_cuda_graph: bool = False,
         qo_indptr_buf: Optional[torch.Tensor] = None,
         paged_kv_indptr_buf: Optional[torch.Tensor] = None,
         paged_kv_indices_buf: Optional[torch.Tensor] = None,
@@ -538,13 +538,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
         ----------
         workspace_buffer : torch.Tensor
             The user reserved workspace buffer used to store auxiliary data structures,
-            recommended size is 16MB, the device of the workspace buffer should be the
+            recommended size is 128MB, the device of the workspace buffer should be the
             same as the device of the input tensors.
 
         kv_layout : str
             The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
 
-        enable_cuda_graph : bool
+        use_cuda_graph : bool
             Whether to enable CUDA graph capture for the prefill kernels, if enabled, the
             auxiliary data structures will be stored in provided buffers. The ``batch_size``
             cannot change during the lifecycle of this wrapper when CUDAGraph is enabled.
@@ -552,34 +552,34 @@ class BatchPrefillWithPagedKVCacheWrapper:
         qo_indptr_buf : Optional[torch.Tensor]
             The user reserved buffer to store the ``qo_indptr`` array, the size of the buffer
             should be ``[batch_size + 1]``.
-            This argument is only effective when ``enable_cuda_graph`` is ``True``.
+            This argument is only effective when ``use_cuda_graph`` is ``True``.
 
         paged_kv_indptr_buf : Optional[torch.Tensor]
             The user reserved buffer to store the ``paged_kv_indptr`` array, the size of this
             buffer should be ``[batch_size + 1]``.
-            This argument is only effective when ``enable_cuda_graph`` is ``True``.
+            This argument is only effective when ``use_cuda_graph`` is ``True``.
 
         paged_kv_indices_buf : Optional[torch.Tensor]
             The user reserved buffer to store the ``paged_kv_indices`` array, should be large
             enough to store the maximum possible size of the ``paged_kv_indices`` array during
-            the lifetime of the wrapper. This argument is only effective when ``enable_cuda_graph``
+            the lifetime of the wrapper. This argument is only effective when ``use_cuda_graph``
             is ``True``.
 
         paged_kv_last_page_len_buf : Optional[torch.Tensor]
             The user reserved buffer to store the ``paged_kv_last_page_len`` array, the size of
             the buffer should be ``[batch_size]``.
-            This argument is only effective when ``enable_cuda_graph`` is ``True``.
+            This argument is only effective when ``use_cuda_graph`` is ``True``.
 
         custom_mask_buf : Optional[torch.Tensor]
             The user reserved buffer to store the custom mask tensor, should be large enough to
             store the maximum possible size of the packed custom mask tensor during the lifetime of
-            the wrapper. This argument is only effective when ``enable_cuda_graph`` is set to ``True``
+            the wrapper. This argument is only effective when ``use_cuda_graph`` is set to ``True``
             and the custom mask will be used in attention computation.
 
         qk_indptr_buf : Optional[torch.Tensor]
             The user reserved buffer to store the ``qk_indptr`` array, the size of the buffer
             should be ``[batch_size + 1]``.
-            This argument is only effective when ``enable_cuda_graph`` is ``True`` and the custom
+            This argument is only effective when ``use_cuda_graph`` is ``True`` and the custom
             mask will be used in attention computation.
         """
         check_kv_layout(kv_layout)
@@ -587,9 +587,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._workspace_buffer = workspace_buffer
         self._wrapper = _kernels.BatchPrefillWithPagedKVCachePyTorchWrapper(
             TensorLayout[kv_layout].value,
-            enable_cuda_graph,
+            use_cuda_graph,
         )
-        if enable_cuda_graph:
+        if use_cuda_graph:
             if not torch.is_tensor(qo_indptr_buf):
                 raise ValueError(
                     "qo_indptr_buf should be a torch.Tensor in CUDA graph mode"
@@ -878,7 +878,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 sm_scale,
                 rope_scale,
                 rope_theta,
-                False,
+                False,  # return LSE
             )[0]
         else:
             return self._wrapper.forward_custom_mask(
@@ -896,7 +896,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 sm_scale,
                 rope_scale,
                 rope_theta,
-                False,
+                False,  # return LSE
             )[0]
 
     def forward_return_lse(
@@ -985,7 +985,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 sm_scale,
                 rope_scale,
                 rope_theta,
-                True,
+                True,  # return LSE
             )
         else:
             return self._wrapper.forward(
@@ -1003,7 +1003,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 sm_scale,
                 rope_scale,
                 rope_theta,
-                True,
+                True,  # return LSE
             )
 
 
@@ -1033,8 +1033,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
     >>> num_qo_heads = 64
     >>> num_kv_heads = 16
     >>> head_dim = 128
-    >>> # allocate 16MB workspace buffer
-    >>> workspace_buffer = torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+    >>> # allocate 128MB workspace buffer
+    >>> workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
     >>> prefill_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
     ...     workspace_buffer, "NHD"
     ... )
@@ -1117,7 +1117,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self,
         workspace_buffer: torch.Tensor,
         kv_layout: str = "NHD",
-        enable_cuda_graph: bool = False,
+        use_cuda_graph: bool = False,
         qo_indptr_buf: Optional[torch.Tensor] = None,
         kv_indptr_buf: Optional[torch.Tensor] = None,
         custom_mask_buf: Optional[torch.Tensor] = None,
@@ -1129,36 +1129,36 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         ----------
         workspace_buffer : torch.Tensor
             The user reserved workspace buffer used to store auxiliary data structures,
-            recommended size is 16MB, the device of the workspace buffer should be the
+            recommended size is 128MB, the device of the workspace buffer should be the
             same as the device of the input tensors.
 
         kv_layout : str
             The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
 
-        enable_cuda_graph : bool
+        use_cuda_graph : bool
             Whether to enable CUDA graph capture for the prefill kernels, if enabled, the
             auxiliary data structures will be stored in the provided buffers.
 
         qo_indptr_buf : Optional[torch.Tensor]
             The user reserved GPU buffer to store the ``qo_indptr`` array, the size of the buffer
             should be ``[batch_size + 1]``.
-            This argument is only effective when ``enable_cuda_graph`` is ``True``.
+            This argument is only effective when ``use_cuda_graph`` is ``True``.
 
         kv_indptr_buf : Optional[torch.Tensor]
             The user reserved GPU buffer to store the ``kv_indptr`` array, the size of the buffer
             should be ``[batch_size + 1]``.
-            This argument is only effective when ``enable_cuda_graph`` is ``True``.
+            This argument is only effective when ``use_cuda_graph`` is ``True``.
 
         custom_mask_buf : Optional[torch.Tensor]
             The user reserved GPU buffer to store the custom mask tensor, should be large
             enough to store the maximum possible size of the packed custom mask tensor during the
-            lifetime of the wrapper. This argument is only effective when ``enable_cuda_graph``
+            lifetime of the wrapper. This argument is only effective when ``use_cuda_graph``
             is ``True`` and custom mask will be used in attention computation.
 
         qk_indptr_buf : Optional[torch.Tensor]
             The user reserved GPU buffer to store the ``qk_indptr`` array, the size of the buffer
             should be ``[batch_size]``.
-            This argument is only effective when ``enable_cuda_graph`` is ``True`` and custom mask
+            This argument is only effective when ``use_cuda_graph`` is ``True`` and custom mask
             will be used in attention computation.
         """
         check_kv_layout(kv_layout)
@@ -1166,9 +1166,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._workspace_buffer = workspace_buffer
         self._wrapper = _kernels.BatchPrefillWithRaggedKVCachePyTorchWrapper(
             TensorLayout[kv_layout].value,
-            enable_cuda_graph,
+            use_cuda_graph,
         )
-        if enable_cuda_graph:
+        if use_cuda_graph:
             if not torch.is_tensor(qo_indptr_buf):
                 raise ValueError(
                     "qo_indptr_buf should be a torch.Tensor in cuda graph mode"

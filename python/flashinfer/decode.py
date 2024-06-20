@@ -51,6 +51,10 @@ def _get_cache_buf(name: str, bytes: int, device: torch.device):
     return buf
 
 
+def _grouped_size_compiled_for_decode_kernels(num_qo_heads: int, num_kv_heads: int):
+    return (num_qo_heads // num_kv_heads) in [1, 4, 8]
+
+
 def single_decode_with_kv_cache(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -58,6 +62,7 @@ def single_decode_with_kv_cache(
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
     logits_cap: bool = False,
+    use_tensor_cores: bool = False,
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
@@ -90,6 +95,9 @@ def single_decode_with_kv_cache(
         If ``True``, the logits will be capped according to formula (proposed in
         Grok-1): :math:`30 \times \mathrm{tanh}(x / 30)`, where :math:`x` is the input logits.
         Defaults to ``False``.
+    use_tensor_cores: bool
+        Whether to use tensor cores for the computation. Will be faster for large group
+        size in grouped query attention. Defaults to ``False``.
     q_scale : Optional[float]
         The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
     k_scale : Optional[float]
@@ -132,7 +140,7 @@ def single_decode_with_kv_cache(
     """
     check_pos_encoding_mode(pos_encoding_mode)
     check_kv_layout(kv_layout)
-    tmp = _get_cache_buf("single_decode_with_kv_cache_tmp", 8 * 1024 * 1024, q.device)
+    tmp = _get_cache_buf("single_decode_with_kv_cache_tmp", 32 * 1024 * 1024, q.device)
     if sm_scale is None:
         head_dim = q.shape[-1]
         sm_scale = 1.0 / math.sqrt(head_dim)
@@ -144,18 +152,45 @@ def single_decode_with_kv_cache(
         rope_scale = 1.0
     if rope_theta is None:
         rope_theta = 1e4
-    out = _kernels.single_decode_with_kv_cache(
-        q,
-        k,
-        v,
-        tmp,
-        PosEncodingMode[pos_encoding_mode].value,
-        logits_cap,
-        TensorLayout[kv_layout].value,
-        sm_scale,
-        rope_scale,
-        rope_theta,
-    )
+    num_qo_heads = q.shape[0]
+    num_kv_heads = k.shape[1]
+    if not _grouped_size_compiled_for_decode_kernels(num_qo_heads, num_kv_heads):
+        raise RuntimeError(
+            "Please set `use_tensor_cores=True` in single_decode_with_kv_cache for group size {}.".format(
+                num_qo_heads // num_kv_heads
+            )
+        )
+
+    if use_tensor_cores:
+        print(q.shape, k.shape)
+        out = _kernels.single_prefill_with_kv_cache(
+            q.unsqueeze(0),
+            k,
+            v,
+            tmp,
+            False,  # causal
+            TensorLayout[kv_layout].value,
+            PosEncodingMode[pos_encoding_mode].value,
+            logits_cap,
+            False,  # allow_fp16_qk_reduction
+            sm_scale,
+            rope_scale,
+            rope_theta,
+            False,  # return_lse
+        )[0].squeeze(0)
+    else:
+        out = _kernels.single_decode_with_kv_cache(
+            q,
+            k,
+            v,
+            tmp,
+            PosEncodingMode[pos_encoding_mode].value,
+            logits_cap,
+            TensorLayout[kv_layout].value,
+            sm_scale,
+            rope_scale,
+            rope_theta,
+        )
     if v_scale is not None:
         out *= v_scale
     return out
@@ -266,7 +301,7 @@ def batch_decode_with_padded_kv_cache(
         sm_scale,
         rope_scale,
         rope_theta,
-        False,
+        False,  # return_lse
     )[0]
     if v_scale is not None:
         out *= v_scale
@@ -386,7 +421,7 @@ def batch_decode_with_padded_kv_cache_return_lse(
         sm_scale,
         rope_scale,
         rope_theta,
-        True,
+        True,  # return_lse
     )
     if v_scale is not None:
         V *= v_scale
@@ -409,8 +444,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
     >>> head_dim = 128
     >>> max_num_pages = 128
     >>> page_size = 16
-    >>> # allocate 16MB workspace buffer
-    >>> workspace_buffer = torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+    >>> # allocate 128MB workspace buffer
+    >>> workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
     >>> decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
     ...     workspace_buffer, "NHD"
     ... )
@@ -465,7 +500,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self,
         workspace_buffer: torch.Tensor,
         kv_layout: str = "NHD",
-        enable_cuda_graph: bool = False,
+        use_cuda_graph: bool = False,
+        use_tensor_cores: bool = False,
         paged_kv_indptr_buffer: Optional[torch.Tensor] = None,
         paged_kv_indices_buffer: Optional[torch.Tensor] = None,
         paged_kv_last_page_len_buffer: Optional[torch.Tensor] = None,
@@ -476,38 +512,42 @@ class BatchDecodeWithPagedKVCacheWrapper:
         ----------
         workspace_buffer : torch.Tensor
             The user reserved workspace buffer used to store auxiliary data structures,
-            recommended size is 16MB (128MB if cudagraph enabled), the device of the workspace
+            recommended size is 128MB, the device of the workspace
             buffer should be the same as the device of the input tensors.
 
         kv_layout : str
             The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
 
-        enable_cuda_graph : bool
+        use_cuda_graph : bool
             Whether to enable CUDAGraph for batch decode attention, if enabled, the
             auxiliary data structures will be stored in the provided buffers. The ``batch_size``
             cannot change during the lifecycle of this wrapper when CUDAGraph is enabled.
 
+        use_tensor_cores : bool
+            Whether to use tensor cores for the computation. Will be faster for large group
+            size in grouped query attention. Defaults to ``False``.
+
         indptr_buffer : Optional[torch.Tensor]
             The user reserved buffer on GPU to store the indptr of the paged kv cache, the size
             of the buffer should be ``[batch_size + 1]``.
-            Only needed when ``enable_cuda_graph`` is ``True``.
+            Only needed when ``use_cuda_graph`` is ``True``.
 
         indices_buffer : Optional[torch.Tensor]
             The user reserved buffer on GPU to store the page indices of the paged kv cache,
             should be large enough to store the maximum number of page indices
             (``max_num_pages``) during the lifecycle of this wrapper.
-            Only needed when ``enable_cuda_graph`` is ``True``.
+            Only needed when ``use_cuda_graph`` is ``True``.
 
         last_page_len_buffer : Optional[torch.Tensor]
             The user reserved buffer on GPU to store the number of entries in the last page, the
             size of the buffer should be ``[batch_size]``.
-            Only needed when ``enable_cuda_graph`` is ``True``.
+            Only needed when ``use_cuda_graph`` is ``True``.
         """
         check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
         self._workspace_buffer = workspace_buffer
 
-        if enable_cuda_graph:
+        if use_cuda_graph:
             if not torch.is_tensor(paged_kv_indptr_buffer):
                 raise ValueError(
                     "paged_kv_indptr_buffer should be a torch.Tensor in cudagraph mode"
@@ -532,11 +572,29 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._paged_kv_indices_buf = paged_kv_indices_buffer
         self._paged_kv_last_page_len_buf = paged_kv_last_page_len_buffer
 
-        self._wrapper = _kernels.BatchDecodeWithPagedKVCachePyTorchWrapper(
-            TensorLayout[kv_layout].value,
-            enable_cuda_graph,
-            self._fixed_batch_size,
-        )
+        if use_tensor_cores:
+            self._use_tensor_cores = True
+            self._wrapper = _kernels.BatchPrefillWithPagedKVCachePyTorchWrapper(
+                TensorLayout[kv_layout].value,
+                use_cuda_graph,
+            )
+            if use_cuda_graph:
+                self._qo_indptr_buf = torch.arange(
+                    self._fixed_batch_size + 1,
+                    dtype=torch.int32,
+                    device=workspace_buffer.device,
+                )
+        else:
+            self._use_tensor_cores = False
+            self._wrapper = _kernels.BatchDecodeWithPagedKVCachePyTorchWrapper(
+                TensorLayout[kv_layout].value,
+                use_cuda_graph,
+                self._fixed_batch_size,
+            )
+
+    @property
+    def use_tensor_cores(self):
+        return self._use_tensor_cores
 
     @property
     def is_cuda_graph_enabled(self):
@@ -651,20 +709,50 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 getattr(torch, data_type) if isinstance(data_type, str) else data_type
             ),
         )
-        self._wrapper.begin_forward(
-            self._workspace_buffer,
-            indptr,
-            last_page_len,
-            batch_size,
-            num_qo_heads,
-            num_kv_heads,
-            head_dim,
-            page_size,
-            PosEncodingMode[pos_encoding_mode].value,
-            logits_cap,
-            empty_q_data,
-            empty_kv_data,
-        )
+
+        if not _grouped_size_compiled_for_decode_kernels(num_qo_heads, num_kv_heads):
+            if not self.use_tensor_cores:
+                # NOTE(Zihao): group size not compiled for decode (cuda cores) kernels, user should use prefill (tensor cores) kernels instead
+                raise RuntimeError(
+                    "Please set `use_tensor_cores=True` in BatchDecodeWithPagedKVCacheWrapper for group size {}.".format(
+                        num_qo_heads // num_kv_heads
+                    )
+                )
+
+        if self.use_tensor_cores:
+            if not self.is_cuda_graph_enabled:
+                # when not using cudagraph, we need to create the indptr buffer, otherwise
+                # the buffer is already created during initialization
+                self._qo_indptr_buf = torch.arange(
+                    batch_size + 1, dtype=torch.int32, device=indptr.device
+                )
+            self._wrapper.begin_forward(
+                self._workspace_buffer,
+                self._qo_indptr_buf,
+                indptr,
+                last_page_len,
+                batch_size,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                page_size,
+                empty_q_data,
+            )
+        else:
+            self._wrapper.begin_forward(
+                self._workspace_buffer,
+                indptr,
+                last_page_len,
+                batch_size,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                page_size,
+                PosEncodingMode[pos_encoding_mode].value,
+                logits_cap,
+                empty_q_data,
+                empty_kv_data,
+            )
 
     def end_forward(self):
         r"""Clear auxiliary data structures created by :meth:`begin_forward`."""
@@ -672,6 +760,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._paged_kv_indptr_buf = None
             self._paged_kv_indices_buf = None
             self._paged_kv_last_page_len_buf = None
+            self._qo_indptr_buf = None
         self._wrapper.end_forward()
 
     def forward(
@@ -741,19 +830,38 @@ class BatchDecodeWithPagedKVCacheWrapper:
             rope_theta = 1e4
 
         paged_kv_data = expand_5d(paged_kv_data, self._kv_layout)
-        out = self._wrapper.forward(
-            q,
-            paged_kv_data,
-            self._paged_kv_indptr_buf,
-            self._paged_kv_indices_buf,
-            self._paged_kv_last_page_len_buf,
-            PosEncodingMode[pos_encoding_mode].value,
-            logits_cap,
-            sm_scale,
-            rope_scale,
-            rope_theta,
-            False,
-        )[0]
+
+        if self.use_tensor_cores:
+            out = self._wrapper.forward(
+                q,
+                self._qo_indptr_buf,
+                paged_kv_data,
+                self._paged_kv_indptr_buf,
+                self._paged_kv_indices_buf,
+                self._paged_kv_last_page_len_buf,
+                False,  # causal
+                PosEncodingMode[pos_encoding_mode].value,
+                logits_cap,
+                False,  # allow_fp16_qk_reduction
+                sm_scale,
+                rope_scale,
+                rope_theta,
+                False,  # return_lse
+            )[0]
+        else:
+            out = self._wrapper.forward(
+                q,
+                paged_kv_data,
+                self._paged_kv_indptr_buf,
+                self._paged_kv_indices_buf,
+                self._paged_kv_last_page_len_buf,
+                PosEncodingMode[pos_encoding_mode].value,
+                logits_cap,
+                sm_scale,
+                rope_scale,
+                rope_theta,
+                False,  # return_lse
+            )[0]
         if v_scale is not None:
             out *= v_scale
         return out
@@ -832,19 +940,37 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if rope_theta is None:
             rope_theta = 1e4
         paged_kv_data = expand_5d(paged_kv_data, self._kv_layout)
-        V, s = self._wrapper.forward(
-            q,
-            paged_kv_data,
-            self._paged_kv_indptr_buf,
-            self._paged_kv_indices_buf,
-            self._paged_kv_last_page_len_buf,
-            PosEncodingMode[pos_encoding_mode].value,
-            logits_cap,
-            sm_scale,
-            rope_scale,
-            rope_theta,
-            True,
-        )
+        if self.use_tensor_cores:
+            V, s = self._wrapper.forward(
+                q,
+                self._qo_indptr_buf,
+                paged_kv_data,
+                self._paged_kv_indptr_buf,
+                self._paged_kv_indices_buf,
+                self._paged_kv_last_page_len_buf,
+                False,  # causal
+                PosEncodingMode[pos_encoding_mode].value,
+                logits_cap,
+                False,  # allow_fp16_qk_reduction
+                sm_scale,
+                rope_scale,
+                rope_theta,
+                True,  # return_lse
+            )
+        else:
+            V, s = self._wrapper.forward(
+                q,
+                paged_kv_data,
+                self._paged_kv_indptr_buf,
+                self._paged_kv_indices_buf,
+                self._paged_kv_last_page_len_buf,
+                PosEncodingMode[pos_encoding_mode].value,
+                logits_cap,
+                sm_scale,
+                rope_scale,
+                rope_theta,
+                True,  # return_lse
+            )
         if v_scale is not None:
             V *= v_scale
         return V, s
@@ -876,6 +1002,7 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper(BatchDecodeWithPagedKVCacheWra
         indices_buffer: torch.Tensor,
         last_page_len_buffer: torch.Tensor,
         kv_layout: str = "NHD",
+        use_tensor_cores: bool = False,
     ):
         r"""Constructor of :class:`BatchDecodeWithPagedKVCacheWrapper`.
 
@@ -885,9 +1012,6 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper(BatchDecodeWithPagedKVCacheWra
             The user reserved workspace buffer on GPU used to store auxiliary data structures,
             recommended size is 128MB, the device of the workspace buffer should be the
             same as the device of the input tensors.
-
-        kv_layout : str
-            The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
 
         indptr_buffer : torch.Tensor
             The user reserved buffer on GPU to store the indptr of the paged kv cache, should
@@ -903,12 +1027,20 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper(BatchDecodeWithPagedKVCacheWra
             The user reserved buffer on GPU to store the number of entries in the last page,
             should be large enough to store the maximum batch size (``[max_batch_size]``)
             during the lifecycle of this wrapper.
+
+        use_tensor_cores : bool
+            Whether to use tensor cores for the computation. Will be faster for large group
+            size in grouped query attention. Defaults to ``False``.
+
+        kv_layout : str
+            The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
         """
         super().__init__(
             workspace_buffer,
             kv_layout,
-            True,
-            indptr_buffer,
-            indices_buffer,
-            last_page_len_buffer,
+            use_cuda_graph=True,
+            use_tensor_cores=use_tensor_cores,
+            paged_kv_indptr_buffer=indptr_buffer,
+            paged_kv_indices_buffer=indices_buffer,
+            paged_kv_last_page_len_buffer=last_page_len_buffer,
         )
