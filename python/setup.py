@@ -70,7 +70,7 @@ def get_instantiation_cu() -> List[str]:
         ","
     )
     allow_fp16_qk_reduction_options = os.environ.get(
-        "FLASHINFER_ALLOW_FP16_QK_REDUCTION_OPTIONS", "0"
+        "FLASHINFER_ALLOW_FP16_QK_REDUCTION_OPTIONS", "0,1"
     ).split(",")
     mask_modes = os.environ.get("FLASHINFER_MASK_MODES", "0,1,2").split(",")
     # dispatch.inc
