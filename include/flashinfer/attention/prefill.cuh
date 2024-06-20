@@ -1102,8 +1102,8 @@ template <bool partition_kv, LogitsPostHook logits_post_hook, MaskMode mask_mode
 __global__ void BatchPrefillWithRaggedKVCacheKernel(
     DTypeIn* __restrict__ q, IdType* __restrict__ request_indices,
     IdType* __restrict__ q_tile_indices, IdType* __restrict__ kv_tile_indices,
-    IdType* __restrict__ kv_lens, IdType* __restrict__ q_indptr, DTypeIn* __restrict__ k,
-    DTypeIn* __restrict__ v, IdType* __restrict__ kv_indptr, uint8_t* __restrict__ custom_mask,
+    IdType* __restrict__ q_indptr, DTypeIn* __restrict__ k, DTypeIn* __restrict__ v,
+    IdType* __restrict__ kv_indptr, uint8_t* __restrict__ custom_mask,
     IdType* __restrict__ qk_indptr, IdType* __restrict__ q_offset,
     IdType* __restrict__ k_rope_pos_offset, IdType* __restrict__ o_indptr, DTypeOut* __restrict__ o,
     float* __restrict__ lse, bool* __restrict__ block_valid_mask, const uint_fastdiv group_size,
@@ -1124,7 +1124,7 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
                  kv_tile_idx = kv_tile_indices[bx];
   constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
   const uint32_t qo_len = q_indptr[request_idx + 1] - q_indptr[request_idx],
-                 kv_len = kv_lens[request_idx];
+                 kv_len = kv_indptr[request_idx + 1] - kv_indptr[request_idx];
   const uint32_t chunk_size = partition_kv ? kv_chunk_size : kv_len;
   const uint32_t chunk_start = partition_kv ? kv_tile_idx * chunk_size : 0;
   const uint32_t chunk_end = partition_kv ? min((kv_tile_idx + 1) * chunk_size, kv_len) : kv_len;
@@ -1271,12 +1271,12 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
     // apply mask
     if constexpr (mask_mode == MaskMode::kCustom) {
       mask_s<partition_kv, mask_mode, num_warps, num_frags_x, num_frags_y, num_frags_z>(
-          qo_packed_idx_base, chunk_start + iter * 16 * num_frags_z, qo_len, kv_len, kv_len,
+          qo_packed_idx_base, chunk_start + iter * 16 * num_frags_z, qo_len, kv_len, chunk_end,
           group_size, custom_mask + qk_indptr[request_idx], s_frag);
     } else {
       if (iter >= mask_iteration) {
         mask_s<partition_kv, mask_mode, num_warps, num_frags_x, num_frags_y, num_frags_z>(
-            qo_packed_idx_base, chunk_start + iter * 16 * num_frags_z, qo_len, kv_len, kv_len,
+            qo_packed_idx_base, chunk_start + iter * 16 * num_frags_z, qo_len, kv_len, chunk_end,
             group_size, nullptr, s_frag);
       }
     }
@@ -1309,6 +1309,7 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
   normalize_d<num_frags_x, num_frags_y>(o_frag, d);
 
   const uint32_t num_kv_chunks = ceil_div(kv_len, kv_chunk_size);
+
   // write back
   write_o_reg_gmem<num_frags_x, num_frags_y>(
       o_frag, &qo_smem, o_ptr_base, qo_packed_idx_base, qo_len,
@@ -1344,7 +1345,7 @@ template <bool partition_kv, LogitsPostHook logits_post_hook, MaskMode mask_mode
           typename DTypeIn, typename DTypeQKAccum, typename DTypeOut, typename IdType>
 __global__ void BatchPrefillWithPagedKVCacheKernel(
     IdType* __restrict__ request_indices, IdType* __restrict__ q_tile_indices,
-    IdType* __restrict__ kv_tile_indices, IdType* __restrict__ kv_lens, DTypeIn* __restrict__ q,
+    IdType* __restrict__ kv_tile_indices, DTypeIn* __restrict__ q,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, IdType* __restrict__ q_indptr,
     uint8_t* __restrict__ custom_mask, IdType* __restrict__ qk_indptr,
     IdType* __restrict__ q_offset, IdType* __restrict__ o_indptr, DTypeOut* __restrict__ o,
@@ -1367,7 +1368,9 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
                  kv_tile_idx = kv_tile_indices[bx];
   constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
   const uint32_t qo_len = q_indptr[request_idx + 1] - q_indptr[request_idx],
-                 kv_len = kv_lens[request_idx];
+                 kv_len = (paged_kv.indptr[request_idx + 1] - paged_kv.indptr[request_idx] - 1) *
+                              paged_kv.page_size +
+                          paged_kv.last_page_len[request_idx];
   const uint32_t chunk_size = partition_kv ? kv_chunk_size : kv_len;
   const uint32_t chunk_start = partition_kv ? kv_tile_idx * chunk_size : 0;
   const uint32_t chunk_end = partition_kv ? min((kv_tile_idx + 1) * chunk_size, kv_len) : kv_len;
@@ -1718,7 +1721,7 @@ template <uint32_t num_frags_x, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HO
           MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* q_tile_indices, IdType* kv_tile_indices,
-    IdType* kv_lens, IdType* q_indptr, DTypeIn* k, DTypeIn* v, IdType* kv_indptr,
+    IdType* q_indptr, DTypeIn* k, DTypeIn* v, IdType* kv_indptr,
     uint8_t* custom_mask, IdType* qk_indptr, IdType* q_offset, IdType* k_rope_pos_offset,
     IdType* o_indptr, DTypeOut* o, DTypeOut* tmp_v, float* tmp_s, float* lse, IdType* merge_indptr,
     bool* block_valid_mask, const uint32_t total_num_rows, const uint32_t num_qo_heads,
@@ -1780,7 +1783,6 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
                         (void*)&request_indices,
                         (void*)&q_tile_indices,
                         (void*)&kv_tile_indices,
-                        (void*)&kv_lens,
                         (void*)&q_indptr,
                         (void*)&k,
                         (void*)&v,
@@ -1812,7 +1814,6 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
                         (void*)&request_indices,
                         (void*)&q_tile_indices,
                         (void*)&kv_tile_indices,
-                        (void*)&kv_lens,
                         (void*)&q_indptr,
                         (void*)&k,
                         (void*)&v,
@@ -1846,7 +1847,7 @@ template <PageStorage page_storage, uint32_t num_frags_x, uint32_t HEAD_DIM,
           typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* q_tile_indices, IdType* kv_tile_indices,
-    IdType* kv_lens, IdType* q_indptr, IdType* q_offset,
+    IdType* q_indptr, IdType* q_offset,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, uint8_t* custom_mask,
     IdType* qk_indptr, IdType* o_indptr, DTypeOut* o, DTypeOut* tmp_v, float* tmp_s, float* lse,
     IdType* merge_indptr, bool* block_valid_mask, uint32_t total_num_rows, uint32_t num_qo_heads,
@@ -1910,7 +1911,6 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
         void* args[] = {(void*)&request_indices,
                         (void*)&q_tile_indices,
                         (void*)&kv_tile_indices,
-                        (void*)&kv_lens,
                         (void*)&q,
                         (void*)&paged_kv,
                         (void*)&q_indptr,
@@ -1939,7 +1939,6 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
         void* args[] = {(void*)&request_indices,
                         (void*)&q_tile_indices,
                         (void*)&kv_tile_indices,
-                        (void*)&kv_lens,
                         (void*)&q,
                         (void*)&paged_kv,
                         (void*)&q_indptr,

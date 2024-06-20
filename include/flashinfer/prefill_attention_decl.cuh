@@ -43,7 +43,7 @@ template <uint32_t num_frags_x, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HO
           MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* q_tile_indices, IdType* kv_tile_indices,
-    IdType* kv_lens, IdType* q_indptr, DTypeIn* k, DTypeIn* v, IdType* kv_indptr,
+    IdType* q_indptr, DTypeIn* k, DTypeIn* v, IdType* kv_indptr,
     uint8_t* custom_mask, IdType* qk_indptr, IdType* q_offset, IdType* k_rope_pos_offset,
     IdType* o_indptr, DTypeOut* o, DTypeOut* tmp_v, float* tmp_s, float* lse, IdType* merge_indptr,
     bool* block_valid_mask, const uint32_t total_num_rows, const uint32_t num_qo_heads,
@@ -57,7 +57,7 @@ template <PageStorage page_storage, uint32_t num_frags_x, uint32_t HEAD_DIM,
           typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* q_tile_indices, IdType* kv_tile_indices,
-    IdType* kv_lens, IdType* q_indptr, IdType* q_offset,
+    IdType* q_indptr, IdType* q_offset,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, uint8_t* custom_mask,
     IdType* qk_indptr, IdType* o_indptr, DTypeOut* o, DTypeOut* tmp_v, float* tmp_s, float* lse,
     IdType* merge_indptr, bool* block_valid_mask, uint32_t total_num_rows, uint32_t num_qo_heads,
@@ -74,7 +74,7 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
     float rope_scale, float rope_theta, cudaStream_t stream) {
   DTypeOut* tmp_v = nullptr;
   float* tmp_s = nullptr;
-  IdType *kv_lens = nullptr, *request_indices = nullptr, *qo_tile_indices = nullptr,
+  IdType *request_indices = nullptr, *qo_tile_indices = nullptr,
          *kv_tile_indices = nullptr, *o_indptr = nullptr, *merge_indptr = nullptr;
   bool* block_valid_mask = nullptr;
   uint32_t num_frags_x = 0U;
@@ -84,7 +84,6 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
   if (handler->IsForwardStarted()) {
     tmp_v = handler->GetTempV<DTypeOut>();
     tmp_s = handler->GetTempS();
-    kv_lens = handler->GetKVLen<IdType>();
     request_indices = handler->GetRequestIndices<IdType>();
     qo_tile_indices = handler->GetQOTileIndices<IdType>();
     kv_tile_indices = handler->GetKVTileIndices<IdType>();
@@ -106,7 +105,7 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
     return BatchPrefillWithPagedKVCacheDispatched<
         PAGE_STORAGE, NUM_FRAGS_X, HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT, POS_ENCODING_MODE,
         ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeOut, IdType>(
-        q, request_indices, qo_tile_indices, kv_tile_indices, kv_lens, q_indptr, q_offset, paged_kv,
+        q, request_indices, qo_tile_indices, kv_tile_indices, q_indptr, q_offset, paged_kv,
         custom_mask, qk_indptr, o_indptr, o, tmp_v, tmp_s, lse, merge_indptr, block_valid_mask,
         total_num_rows, num_qo_heads, kv_chunk_size, padded_batch_size, sm_scale, rope_scale,
         rope_theta, stream);
@@ -125,7 +124,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
     cudaStream_t stream) {
   DTypeOut* tmp_v = nullptr;
   float* tmp_s = nullptr;
-  IdType *kv_lens = nullptr, *request_indices = nullptr, *qo_tile_indices = nullptr,
+  IdType *request_indices = nullptr, *qo_tile_indices = nullptr,
          *kv_tile_indices = nullptr, *o_indptr = nullptr, *merge_indptr = nullptr;
   bool* block_valid_mask = nullptr;
   uint32_t num_frags_x = 0U;
@@ -135,7 +134,6 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
   if (handler->IsForwardStarted()) {
     tmp_v = handler->GetTempV<DTypeOut>();
     tmp_s = handler->GetTempS();
-    kv_lens = handler->GetKVLen<IdType>();
     request_indices = handler->GetRequestIndices<IdType>();
     qo_tile_indices = handler->GetQOTileIndices<IdType>();
     kv_tile_indices = handler->GetKVTileIndices<IdType>();
@@ -157,7 +155,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
     return BatchPrefillWithRaggedKVCacheDispatched<
         NUM_FRAGS_X, HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT, POS_ENCODING_MODE,
         ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeOut, IdType>(
-        q, request_indices, qo_tile_indices, kv_tile_indices, kv_lens, q_indptr, k, v, kv_indptr,
+        q, request_indices, qo_tile_indices, kv_tile_indices, q_indptr, k, v, kv_indptr,
         custom_mask, qk_indptr, q_offset, k_rope_pos_offset, o_indptr, o, tmp_v, tmp_s, lse,
         merge_indptr, block_valid_mask, total_num_rows, num_qo_heads, kv_chunk_size,
         padded_batch_size, num_kv_heads, sm_scale, rope_scale, rope_theta, stream);
