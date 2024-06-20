@@ -36,7 +36,7 @@ echo "::endgroup::"
 
 echo "::group::Install build system"
 pip install ninja numpy
-pip install --upgrade setuptools wheel build
+pip install --upgrade setuptools==69.5.1 wheel build
 echo "::endgroup::"
 
 
