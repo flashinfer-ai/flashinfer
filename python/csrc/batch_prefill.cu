@@ -207,7 +207,6 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCu
   paged_kv_indptr = paged_kv_indptr.to(torch::kInt32);
   paged_kv_indices = paged_kv_indices.to(torch::kInt32);
   paged_kv_last_page_len = paged_kv_last_page_len.to(torch::kInt32);
-  custom_mask = custom_mask.to(torch::kFloat32);
   qk_indptr = qk_indptr.to(torch::kInt32);
 
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
@@ -420,7 +419,6 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardC
   qo_indptr = qo_indptr.to(torch::kInt32);
   kv_indptr = kv_indptr.to(torch::kInt32);
   qk_indptr = qk_indptr.to(torch::kInt32);
-  custom_mask = custom_mask.to(torch::kFloat32);
 
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
   torch::Tensor o = torch::empty_like(q, q.options());
