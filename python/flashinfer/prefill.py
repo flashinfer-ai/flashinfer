@@ -785,12 +785,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
     def end_forward(self):
         r"""Clear the auxiliary data structures created by :meth:`begin_forward`."""
         if not self.is_cuda_graph_enabled:
-            self._qo_indptr = None
-            self._paged_kv_indptr = None
-            self._paged_kv_indices = None
-            self._paged_kv_last_page_len = None
-            self._custom_mask = None
-            self._qk_indptr = None
+            self._qo_indptr_buf = None
+            self._paged_kv_indptr_buf = None
+            self._paged_kv_indices_buf = None
+            self._paged_kv_last_page_len_buf = None
+            self._custom_mask_buf = None
+            self._qk_indptr_buf = None
         self._wrapper.end_forward()
 
     def forward(
@@ -1328,10 +1328,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
     def end_forward(self):
         r"""Clear the auxiliary data structures created by :meth:`begin_forward`."""
         if not self.is_cuda_graph_enabled:
-            self._qo_indptr = None
-            self._kv_indptr = None
-            self._custom_mask = None
-            self._qk_indptr = None
+            self._qo_indptr_buf = None
+            self._kv_indptr_buf = None
+            self._custom_mask_buf = None
+            self._qk_indptr_buf = None
         self._wrapper.end_forward()
 
     def forward(

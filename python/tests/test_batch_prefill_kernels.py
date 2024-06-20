@@ -62,7 +62,7 @@ def test_batch_prefill_with_paged_kv_cache(
         (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
     )
 
-    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
     if not enable_cuda_graph:
         q_indptr_gpu = q_indptr_cpu.to(0)
         kv_indptr_gpu = kv_indptr_cpu.to(0)
@@ -228,7 +228,7 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
         (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
     ).to(0)
 
-    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout
     )
@@ -301,7 +301,7 @@ def test_batch_prefill_with_ragged_kv_cache(
     v = torch.randn(batch_size * kv_len, num_kv_heads, head_dim).to(0).half()
     kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len
 
-    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
     wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
         workspace_buffer, kv_layout
     )
@@ -351,7 +351,7 @@ def test_batch_prefill_with_ragged_kv_cache_custom_mask(
     v = torch.randn(batch_size * kv_len, num_kv_heads, head_dim).to(0).half()
     kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len
 
-    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
     wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
         workspace_buffer, kv_layout
     )
@@ -367,7 +367,7 @@ def test_batch_prefill_with_ragged_kv_cache_custom_mask(
 
     # use custom mask
     wrapper.begin_forward(
-        q_indptr, kv_indptr, num_qo_heads, num_kv_heads, head_dim, custom_mask
+        q_indptr, kv_indptr, num_qo_heads, num_kv_heads, head_dim, custom_mask=custom_mask
     )
     o_custom = wrapper.forward(q, k, v, pos_encoding_mode=pos_encoding_mode)
     wrapper.end_forward()
