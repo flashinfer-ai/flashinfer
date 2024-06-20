@@ -555,9 +555,11 @@ cudaError_t PrefillSplitQOKVIndptr(
   const uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
   std::vector<IdType> qo_indptr_h(batch_size + 1), kv_indptr_h(batch_size + 1),
       kv_last_page_len_h(batch_size);
+  bool need_stream_sync = false;
   if (is_device_ptr((void*)qo_indptr)) {
     cudaMemcpyAsync(qo_indptr_h.data(), qo_indptr, sizeof(IdType) * (batch_size + 1),
                     cudaMemcpyDeviceToHost, stream);
+    need_stream_sync = true;
   } else {
     qo_indptr_h.assign(qo_indptr, qo_indptr + batch_size + 1);
   }
@@ -566,6 +568,7 @@ cudaError_t PrefillSplitQOKVIndptr(
   if (is_device_ptr((void*)kv_indptr)) {
     cudaMemcpyAsync(kv_indptr_h.data(), kv_indptr, sizeof(IdType) * (batch_size + 1),
                     cudaMemcpyDeviceToHost, stream);
+    need_stream_sync = true;
   } else {
     kv_indptr_h.assign(kv_indptr, kv_indptr + batch_size + 1);
   }
@@ -575,9 +578,13 @@ cudaError_t PrefillSplitQOKVIndptr(
     if (is_device_ptr((void*)kv_last_page_len)) {
       cudaMemcpyAsync(kv_last_page_len_h.data(), kv_last_page_len, sizeof(IdType) * batch_size,
                       cudaMemcpyDeviceToHost, stream);
+      need_stream_sync = true;
     } else {
       kv_last_page_len_h.assign(kv_last_page_len, kv_last_page_len + batch_size);
     }
+  }
+  if (need_stream_sync) {
+    cudaStreamSynchronize(stream);
   }
 
   // step 0: get the number of SMs
