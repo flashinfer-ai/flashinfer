@@ -1106,13 +1106,14 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
     IdType* __restrict__ kv_indptr, uint8_t* __restrict__ custom_mask,
     IdType* __restrict__ qk_indptr, IdType* __restrict__ q_offset,
     IdType* __restrict__ k_rope_pos_offset, IdType* __restrict__ o_indptr, DTypeOut* __restrict__ o,
-    float* __restrict__ lse, bool* __restrict__ block_valid_mask, const uint_fastdiv group_size,
-    const uint32_t kv_chunk_size, float sm_scale, float log2_rope_rcp_scale,
-    float log2_rope_rcp_theta) {
+    float* __restrict__ lse, bool* __restrict__ block_valid_mask,
+    IdType* __restrict__ kv_chunk_size_ptr, const uint_fastdiv group_size, float sm_scale,
+    float log2_rope_rcp_scale, float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
   sm_scale *= (logits_post_hook == LogitsPostHook::kNone ? math::log2e : 1.f / 30.f);
   constexpr uint32_t head_dim = num_frags_y * 16;
+  const uint32_t kv_chunk_size = *kv_chunk_size_ptr;
 
   auto block = cg::this_thread_block();
   const uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y, kv_head_idx = blockIdx.z;
@@ -1160,6 +1161,7 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
   DTypeIn* q_ptr_base =
       q + qkv_info.get_qo_elem_offset(q_indptr[request_idx], kv_head_idx * group_size,
                                       (tx % 8) * num_elems_per_128b<DTypeIn>());
+
   DTypeIn* o_ptr_base =
       partition_kv
           ? o + kv_tile_idx * num_qo_heads * head_dim +
@@ -1349,13 +1351,14 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, IdType* __restrict__ q_indptr,
     uint8_t* __restrict__ custom_mask, IdType* __restrict__ qk_indptr,
     IdType* __restrict__ q_offset, IdType* __restrict__ o_indptr, DTypeOut* __restrict__ o,
-    float* __restrict__ lse, bool* __restrict__ block_valid_mask, const uint_fastdiv group_size,
-    const uint32_t kv_chunk_size, float sm_scale, float log2_rope_rcp_scale,
-    float log2_rope_rcp_theta) {
+    float* __restrict__ lse, bool* __restrict__ block_valid_mask,
+    IdType* __restrict__ kv_chunk_size_ptr, const uint_fastdiv group_size, float sm_scale,
+    float log2_rope_rcp_scale, float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
   sm_scale *= (logits_post_hook == LogitsPostHook::kNone ? math::log2e : 1.f / 30.f);
   auto block = cg::this_thread_block();
+  const uint32_t kv_chunk_size = *kv_chunk_size_ptr;
 
   const uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y, kv_head_idx = blockIdx.z;
   if (block_valid_mask && !block_valid_mask[bx]) {
@@ -1721,13 +1724,12 @@ template <uint32_t num_frags_x, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HO
           MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
     DTypeIn* q, IdType* request_indices, IdType* q_tile_indices, IdType* kv_tile_indices,
-    IdType* q_indptr, DTypeIn* k, DTypeIn* v, IdType* kv_indptr,
-    uint8_t* custom_mask, IdType* qk_indptr, IdType* q_offset, IdType* k_rope_pos_offset,
-    IdType* o_indptr, DTypeOut* o, DTypeOut* tmp_v, float* tmp_s, float* lse, IdType* merge_indptr,
-    bool* block_valid_mask, const uint32_t total_num_rows, const uint32_t num_qo_heads,
-    const uint32_t kv_chunk_size, const uint32_t padded_batch_size, const uint32_t num_kv_heads,
-    const float sm_scale, const float rope_scale, const float rope_theta,
-    cudaStream_t stream = nullptr) {
+    IdType* q_indptr, DTypeIn* k, DTypeIn* v, IdType* kv_indptr, uint8_t* custom_mask,
+    IdType* qk_indptr, IdType* q_offset, IdType* k_rope_pos_offset, IdType* o_indptr, DTypeOut* o,
+    DTypeOut* tmp_v, float* tmp_s, float* lse, IdType* merge_indptr, bool* block_valid_mask,
+    IdType* kv_chunk_size_ptr, const uint32_t total_num_rows, const uint32_t num_qo_heads,
+    const uint32_t padded_batch_size, const uint32_t num_kv_heads, const float sm_scale,
+    const float rope_scale, const float rope_theta, cudaStream_t stream = nullptr) {
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
   constexpr uint32_t num_warps = 4;
@@ -1795,8 +1797,8 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
                         (void*)&o,
                         (void*)&lse,
                         (void*)&block_valid_mask,
+                        (void*)&kv_chunk_size_ptr,
                         (void*)&group_size_fastdiv,
-                        (void*)&kv_chunk_size,
                         (void*)&sm_scale,
                         (void*)&log2_rope_rcp_scale,
                         (void*)&log2_rope_rcp_theta};
@@ -1826,8 +1828,8 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
                         (void*)&tmp_v,
                         (void*)&tmp_s,
                         (void*)&block_valid_mask,
+                        (void*)&kv_chunk_size_ptr,
                         (void*)&group_size_fastdiv,
-                        (void*)&kv_chunk_size,
                         (void*)&sm_scale,
                         (void*)&log2_rope_rcp_scale,
                         (void*)&log2_rope_rcp_theta};
@@ -1850,9 +1852,9 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     IdType* q_indptr, IdType* q_offset,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, uint8_t* custom_mask,
     IdType* qk_indptr, IdType* o_indptr, DTypeOut* o, DTypeOut* tmp_v, float* tmp_s, float* lse,
-    IdType* merge_indptr, bool* block_valid_mask, uint32_t total_num_rows, uint32_t num_qo_heads,
-    uint32_t kv_chunk_size, uint32_t padded_batch_size, float sm_scale, float rope_scale,
-    float rope_theta, cudaStream_t stream) {
+    IdType* merge_indptr, bool* block_valid_mask, IdType* kv_chunk_size_ptr,
+    uint32_t total_num_rows, uint32_t num_qo_heads, uint32_t padded_batch_size, float sm_scale,
+    float rope_scale, float rope_theta, cudaStream_t stream) {
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
   constexpr uint32_t num_warps = 4;
@@ -1921,8 +1923,8 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
                         (void*)&o,
                         (void*)&lse,
                         (void*)&block_valid_mask,
+                        (void*)&kv_chunk_size_ptr,
                         (void*)&group_size_fastdiv,
-                        (void*)&kv_chunk_size,
                         (void*)&sm_scale,
                         (void*)&log2_rope_rcp_scale,
                         (void*)&log2_rope_rcp_theta};
@@ -1949,8 +1951,8 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
                         (void*)&tmp_v,
                         (void*)&tmp_s,
                         (void*)&block_valid_mask,
+                        (void*)&kv_chunk_size_ptr,
                         (void*)&group_size_fastdiv,
-                        (void*)&kv_chunk_size,
                         (void*)&sm_scale,
                         (void*)&log2_rope_rcp_scale,
                         (void*)&log2_rope_rcp_theta};

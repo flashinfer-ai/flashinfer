@@ -47,8 +47,8 @@ def get_cu_file_str(
     {idtype}* q_indptr, {idtype}* q_offset,
     paged_kv_t<page_storage, {kv_layout}, {dtype_in}, {idtype}> paged_kv, uint8_t* custom_mask,
     {idtype}* qk_indptr, {idtype}* o_indptr, {dtype_out}* o, {dtype_out}* tmp_v, float* tmp_s, float* lse,
-    {idtype}* merge_indptr, bool* block_valid_mask, uint32_t max_num_rows, uint32_t num_qo_heads, uint32_t kv_chunk_size,
-    uint32_t padded_batch_size, float sm_scale, float rope_scale, float rope_theta,
+    {idtype}* merge_indptr, bool* block_valid_mask, {idtype}* kv_chunk_size_ptr, uint32_t max_num_rows,
+    uint32_t num_qo_heads, uint32_t padded_batch_size, float sm_scale, float rope_scale, float rope_theta,
     cudaStream_t stream);
     """.format(
                 logits_hook=logits_hook_literal[int(logits_hook)],

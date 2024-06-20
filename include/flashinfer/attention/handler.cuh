@@ -537,13 +537,13 @@ class BatchDecodeHandler {
 
 template <uint32_t num_warps, typename IdType>
 cudaError_t PrefillSplitQOKVIndptr(
-    bool& split_kv, uint32_t& padded_batch_size, uint32_t& new_batch_size, uint32_t& num_frags_x,
-    uint32_t& kv_chunk_size, uint32_t& total_num_rows,
-    std::vector<IdType>& request_indices, std::vector<IdType>& qo_tile_indices,
-    std::vector<IdType>& kv_tile_indices, std::vector<IdType>& merge_indptr,
-    std::vector<IdType>& o_indptr, IdType* qo_indptr, IdType* kv_indptr, IdType* kv_last_page_len,
-    uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
-    uint32_t page_size, cudaStream_t stream = nullptr) {
+    bool& split_kv, uint32_t& split_max_batch_size, uint32_t& total_num_tiles_q,
+    uint32_t& new_batch_size, uint32_t& num_frags_x, uint32_t& kv_chunk_size,
+    uint32_t& total_num_rows, std::vector<IdType>& request_indices,
+    std::vector<IdType>& qo_tile_indices, std::vector<IdType>& kv_tile_indices,
+    std::vector<IdType>& merge_indptr, std::vector<IdType>& o_indptr, IdType* qo_indptr,
+    IdType* kv_indptr, IdType* kv_last_page_len, uint32_t batch_size, uint32_t num_qo_heads,
+    uint32_t num_kv_heads, uint32_t head_dim, uint32_t page_size, cudaStream_t stream = nullptr) {
   request_indices.clear();
   qo_tile_indices.clear();
   kv_tile_indices.clear();
@@ -587,6 +587,7 @@ cudaError_t PrefillSplitQOKVIndptr(
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
   int num_blocks_per_sm = 2;
   int max_grid_size = num_blocks_per_sm * num_sm;
+  split_max_batch_size = max_grid_size / num_kv_heads;
 
   // step 1: compute qo_chunk_size
   std::vector<int64_t> packed_qo_len_arr(batch_size), kv_len_arr(batch_size);
@@ -607,12 +608,12 @@ cudaError_t PrefillSplitQOKVIndptr(
                                      qo_chunk_size, /*min_kv_chunk_size=*/(128 / page_size));
 
   // step 3: split qo_indptr and kv_indptr
-  uint32_t sum_num_tiles_q = 0;
+  total_num_tiles_q = 0;
   for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
     int64_t packed_qo_len = packed_qo_len_arr[request_idx], kv_len = kv_len_arr[request_idx];
     int64_t num_tiles_q = ceil_div(packed_qo_len, qo_chunk_size),
             num_tiles_kv = ceil_div(kv_len, kv_chunk_size);
-    sum_num_tiles_q += num_tiles_q;
+    total_num_tiles_q += num_tiles_q;
     for (uint32_t q_tile_idx = 0; q_tile_idx < num_tiles_q; ++q_tile_idx) {
       for (uint32_t kv_tile_idx = 0; kv_tile_idx < num_tiles_kv; ++kv_tile_idx) {
         request_indices.push_back(request_idx);
@@ -627,7 +628,6 @@ cudaError_t PrefillSplitQOKVIndptr(
     }
     o_indptr.push_back(o_indptr.back() + qo_len * num_tiles_kv);
   }
-  padded_batch_size = std::max(max_grid_size / num_kv_heads, sum_num_tiles_q);
 
   // step 4: multiply kv_chunk_size by page_size
   kv_chunk_size *= page_size;
@@ -662,6 +662,11 @@ class BatchPrefillHandler {
     return (IdType*)o_indptr_;
   }
 
+  template <typename IdType>
+  IdType* GetKVChunkSizePtr() const {
+    return (IdType*)kv_chunk_size_ptr_;
+  }
+
   template <typename DType>
   DType* GetTempV() const {
     return (DType*)tmp_v_;
@@ -672,8 +677,6 @@ class BatchPrefillHandler {
   float* GetTempS() const { return tmp_s_; }
 
   uint32_t GetPaddedBatchSize() const { return padded_batch_size_; }
-
-  uint32_t GetKVChunkSize() const { return kv_chunk_size_; }
 
   uint32_t GetNumFragsX() const { return num_frags_x_; }
 
@@ -698,18 +701,19 @@ class BatchPrefillHandler {
       throw std::invalid_argument(err_msg.str());
     }
     bool split_kv;
-    uint32_t new_batch_size;
+    uint32_t split_max_batch_size, new_batch_size, total_num_tiles_q, kv_chunk_size;
     std::vector<IdType> request_indices_vec, qo_tile_indices_vec, kv_tile_indices_vec,
         merge_indptr_vec, o_indptr_vec;
     constexpr uint32_t num_warps = 4;
     FLASHINFER_CUDA_CALL(PrefillSplitQOKVIndptr<num_warps>(
-        split_kv, padded_batch_size_, new_batch_size, num_frags_x_, kv_chunk_size_, total_num_rows_,
-        request_indices_vec, qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec,
-        o_indptr_vec, qo_indptr, kv_indptr, kv_last_page_len, batch_size, num_qo_heads,
-        num_kv_heads, head_dim, page_size, stream_));
+        split_kv, split_max_batch_size, total_num_tiles_q, new_batch_size, num_frags_x_,
+        kv_chunk_size, total_num_rows_, request_indices_vec, qo_tile_indices_vec,
+        kv_tile_indices_vec, merge_indptr_vec, o_indptr_vec, qo_indptr, kv_indptr, kv_last_page_len,
+        batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, stream_));
     const uint32_t qo_tile_size = num_frags_x_ * (16 * num_warps);
 
     if (IsCUDAGraphEnabled()) {
+      padded_batch_size_ = std::max(split_max_batch_size, total_num_tiles_q);
       AlignedAllocator allocator(buffer, workspace_size_in_bytes);
       request_indices_ = allocator.aligned_alloc<void>(sizeof(IdType) * padded_batch_size_, 16);
       void* request_indices_h_ = page_locked_buffer_;
@@ -721,13 +725,16 @@ class BatchPrefillHandler {
           (char*)page_locked_buffer_ + ((char*)kv_tile_indices_ - (char*)request_indices_);
       o_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * (batch_size + 1), 16);
       void* o_indptr_h_ = (char*)page_locked_buffer_ + ((char*)o_indptr_ - (char*)request_indices_);
-      if (split_kv) {
-        // need merge_indptr when split_kv is true
+      kv_chunk_size_ptr_ = allocator.aligned_alloc<void>(sizeof(IdType), 1);
+      void* kv_chunk_size_ptr_h_ =
+          (char*)page_locked_buffer_ + ((char*)kv_chunk_size_ptr_ - (char*)request_indices_);
+      *(IdType*)kv_chunk_size_ptr_h_ = kv_chunk_size;
+      if (total_num_tiles_q < split_max_batch_size) {
+        // need merge_indptr
         merge_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * (total_num_rows_ + 1), 16);
         void* merge_indptr_h_ =
             (char*)page_locked_buffer_ + ((char*)merge_indptr_ - (char*)request_indices_);
         std::copy(merge_indptr_vec.begin(), merge_indptr_vec.end(), (IdType*)merge_indptr_h_);
-        // need block_valid_mask when split_kv is true and CUDAGraph is enabled
         block_valid_mask_ = allocator.aligned_alloc<bool>(sizeof(bool) * padded_batch_size_, 16);
         bool* block_valid_mask_h_ =
             (bool*)page_locked_buffer_ + ((bool*)block_valid_mask_ - (bool*)request_indices_);
@@ -735,14 +742,10 @@ class BatchPrefillHandler {
           block_valid_mask_h_[i] = i < new_batch_size;
         }
       } else {
+        // total_num_tiles_q >= split_max_batch_size, we don't need to perform the second round at
+        // all.
         merge_indptr_ = nullptr;
         block_valid_mask_ = nullptr;
-        if (padded_batch_size_ != new_batch_size) {
-          std::ostringstream err_msg;
-          err_msg << "InternalError: padded_batch_size " << padded_batch_size_
-                  << " should be equal to new_batch_size " << new_batch_size;
-          throw std::invalid_argument(err_msg.str());
-        }
       }
       std::copy(request_indices_vec.begin(), request_indices_vec.end(),
                 (IdType*)request_indices_h_);
@@ -756,11 +759,11 @@ class BatchPrefillHandler {
       FLASHINFER_CUDA_CALL(cudaMemcpyAsync(request_indices_, page_locked_buffer_, num_bytes_to_copy,
                                            cudaMemcpyHostToDevice, stream_))
 
-      if (split_kv) {
+      if (total_num_tiles_q < split_max_batch_size) {
         tmp_v_ = allocator.aligned_alloc<void>(
-            num_qo_heads * padded_batch_size_ * qo_tile_size * head_dim * sizeof(DTypeOut), 16);
-        tmp_s_ =
-            allocator.aligned_alloc<float>(num_qo_heads * padded_batch_size_ * qo_tile_size * sizeof(float), 16);
+            num_qo_heads * split_max_batch_size * qo_tile_size * head_dim * sizeof(DTypeOut), 16);
+        tmp_s_ = allocator.aligned_alloc<float>(
+            num_qo_heads * split_max_batch_size * qo_tile_size * sizeof(float), 16);
       } else {
         tmp_v_ = nullptr;
         tmp_s_ = nullptr;
@@ -788,6 +791,10 @@ class BatchPrefillHandler {
       }
       o_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * o_indptr_vec.size(), 16);
       void* o_indptr_h_ = (char*)page_locked_buffer_ + ((char*)o_indptr_ - (char*)request_indices_);
+      kv_chunk_size_ptr_ = allocator.aligned_alloc<void>(sizeof(IdType), 1);
+      void* kv_chunk_size_ptr_h_ =
+          (char*)page_locked_buffer_ + ((char*)kv_chunk_size_ptr_ - (char*)request_indices_);
+      *(IdType*)kv_chunk_size_ptr_h_ = kv_chunk_size;
       std::copy(request_indices_vec.begin(), request_indices_vec.end(),
                 (IdType*)request_indices_h_);
       std::copy(qo_tile_indices_vec.begin(), qo_tile_indices_vec.end(),
@@ -803,7 +810,8 @@ class BatchPrefillHandler {
       if (split_kv) {
         tmp_v_ = allocator.aligned_alloc<void>(
             num_qo_heads * new_batch_size * qo_tile_size * head_dim * sizeof(DTypeOut), 16);
-        tmp_s_ = allocator.aligned_alloc<float>(num_qo_heads * new_batch_size * qo_tile_size * sizeof(float), 16);
+        tmp_s_ = allocator.aligned_alloc<float>(
+            num_qo_heads * new_batch_size * qo_tile_size * sizeof(float), 16);
       } else {
         tmp_v_ = nullptr;
         tmp_s_ = nullptr;
@@ -821,13 +829,13 @@ class BatchPrefillHandler {
     kv_tile_indices_ = nullptr;
     merge_indptr_ = nullptr;
     o_indptr_ = nullptr;
+    kv_chunk_size_ptr_ = nullptr;
     tmp_v_ = nullptr;
     tmp_s_ = nullptr;
     block_valid_mask_ = nullptr;
     total_num_rows_ = 0U;
     padded_batch_size_ = 0U;
     num_frags_x_ = 0U;
-    kv_chunk_size_ = 0U;
     return cudaSuccess;
   }
 
@@ -843,13 +851,13 @@ class BatchPrefillHandler {
         kv_tile_indices_(nullptr),
         merge_indptr_(nullptr),
         o_indptr_(nullptr),
+        kv_chunk_size_ptr_(nullptr),
         tmp_v_(nullptr),
         tmp_s_(nullptr),
         block_valid_mask_(nullptr),
         total_num_rows_(0U),
         padded_batch_size_(0U),
         num_frags_x_(0U),
-        kv_chunk_size_(0U),
         forward_started_(false),
         enable_cuda_graph_(enable_cuda_graph),
         stream_(nullptr) {
@@ -867,16 +875,16 @@ class BatchPrefillHandler {
   void* kv_tile_indices_;
   void* merge_indptr_;
   void* o_indptr_;
+  void* kv_chunk_size_ptr_;
   void* tmp_v_;
   float* tmp_s_;
   bool* block_valid_mask_;
   uint32_t total_num_rows_;
   uint32_t padded_batch_size_;
   uint32_t num_frags_x_;
-  uint32_t kv_chunk_size_;
   bool forward_started_;
-  cudaStream_t stream_;
   bool enable_cuda_graph_;
+  cudaStream_t stream_;
 };
 
 }  // namespace flashinfer
