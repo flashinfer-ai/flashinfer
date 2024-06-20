@@ -21,7 +21,7 @@
 #include "utils.h"
 
 using namespace flashinfer;
-constexpr QKVLayout kv_layout = QKVLayout::kNHD;
+constexpr QKVLayout kv_layout = QKVLayout::kHND;
 
 bool is_prime(int x) {
   for (int i = 2; i < int(std::sqrt(x)); ++i) {
@@ -312,7 +312,7 @@ void _TestTwoLevelSinglePrefixCascadeDecodeCorrectness(size_t batch_size,
       num_qo_heads, num_kv_heads, /*qo_len=*/batch_size, /*kv_len=*/shared_prefix_length, head_dim,
       /*causal=*/false, /*kv_layout=*/QKVLayout::kNHD,
       /*pos_encoding_mode=*/PosEncodingMode::kNone, /*allow_fp16_qk_reduction=*/false);
-
+  
   EXPECT_EQ(status, cudaSuccess) << "Cascade implementation prefill failed with error: "
                                  << cudaGetErrorString(status);
 
