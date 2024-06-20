@@ -125,7 +125,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
                             HEAD_DIM, LogitsPostHook::kNone, KV_LAYOUT, pos_encoding_mode,
                             ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeOut, IdType>(
                             handler, q, qo_indptr, k, v, kv_indptr, /*custom_mask=*/nullptr,
-                            /*qk_indptr=*/nullptr, q_offset, k_rope_pos_offset, o, lse, batch_size,
+                            /*qk_indptr=*/nullptr, q_offset, k_rope_pos_offset, o, lse,
                             num_qo_heads, num_kv_heads, sm_scale, rope_scale, rope_theta, stream);
                       })})})})});
   return cudaSuccess;

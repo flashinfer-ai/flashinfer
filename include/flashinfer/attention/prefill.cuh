@@ -566,8 +566,8 @@ __device__ __forceinline__ void mask_s(const uint32_t qo_packed_idx_base,
                  : kv_idx >= chunk_end);
         s_frag[fx][fz][reg_id] =
             (out_of_boundary ||
-             ((mask_mode == MaskMode::kCustom && q_idx < qo_len &&
-               !(custom_mask[(q_idx * kv_len + kv_idx) / 8] >> ((q_idx * kv_len + kv_idx) % 8)))))
+             (mask_mode == MaskMode::kCustom && q_idx < qo_len &&
+               !((custom_mask[(q_idx * kv_len + kv_idx) / 8] >> ((q_idx * kv_len + kv_idx) % 8)) & 1)))
                 ? DTypeQKAccum(-5e4)
                 : s_frag[fx][fz][reg_id];
       }
@@ -1095,37 +1095,46 @@ __global__ void SinglePrefillWithKVCacheKernel(
   }
 }
 
-template <LogitsPostHook logits_post_hook, MaskMode mask_mode, QKVLayout kv_layout,
-          PosEncodingMode pos_encoding_mode, uint32_t num_frags_x, uint32_t num_frags_y,
-          uint32_t num_frags_z, uint32_t num_warps, typename DTypeIn, typename DTypeQKAccum,
-          typename DTypeOut, typename IdType>
+template <bool partition_kv, LogitsPostHook logits_post_hook, MaskMode mask_mode,
+          QKVLayout kv_layout, PosEncodingMode pos_encoding_mode, uint32_t num_frags_x,
+          uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps, typename DTypeIn,
+          typename DTypeQKAccum, typename DTypeOut, typename IdType>
 __global__ void BatchPrefillWithRaggedKVCacheKernel(
     DTypeIn* __restrict__ q, IdType* __restrict__ request_indices,
-    IdType* __restrict__ tile_indices, IdType* __restrict__ qo_indptr, DTypeIn* __restrict__ k,
-    DTypeIn* __restrict__ v, IdType* __restrict__ kv_indptr, uint8_t* __restrict__ custom_mask,
+    IdType* __restrict__ q_tile_indices, IdType* __restrict__ kv_tile_indices,
+    IdType* __restrict__ q_indptr, DTypeIn* __restrict__ k, DTypeIn* __restrict__ v,
+    IdType* __restrict__ kv_indptr, uint8_t* __restrict__ custom_mask,
     IdType* __restrict__ qk_indptr, IdType* __restrict__ q_offset,
-    IdType* __restrict__ k_rope_pos_offset, DTypeOut* __restrict__ o, float* __restrict__ tmp,
-    float* __restrict__ lse, uint32_t batch_size, const uint_fastdiv group_size, float sm_scale,
+    IdType* __restrict__ k_rope_pos_offset, IdType* __restrict__ o_indptr, DTypeOut* __restrict__ o,
+    float* __restrict__ lse, bool* __restrict__ block_valid_mask,
+    IdType* __restrict__ kv_chunk_size_ptr, const uint_fastdiv group_size, float sm_scale,
     float log2_rope_rcp_scale, float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
   sm_scale *= (logits_post_hook == LogitsPostHook::kNone ? math::log2e : 1.f / 30.f);
   constexpr uint32_t head_dim = num_frags_y * 16;
+  const uint32_t kv_chunk_size = *kv_chunk_size_ptr;
 
   auto block = cg::this_thread_block();
   const uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y, kv_head_idx = blockIdx.z;
+  if (block_valid_mask && !block_valid_mask[bx]) {
+    return;
+  }
   const uint32_t num_kv_heads = gridDim.z, num_qo_heads = group_size * num_kv_heads;
-  const uint32_t request_idx = request_indices[bx], tile_idx = tile_indices[bx];
+  const uint32_t request_idx = request_indices[bx], qo_tile_idx = q_tile_indices[bx],
+                 kv_tile_idx = kv_tile_indices[bx];
   constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
-  const uint32_t qo_len = qo_indptr[request_idx + 1] - qo_indptr[request_idx],
+  const uint32_t qo_len = q_indptr[request_idx + 1] - q_indptr[request_idx],
                  kv_len = kv_indptr[request_idx + 1] - kv_indptr[request_idx];
+  const uint32_t chunk_size = partition_kv ? kv_chunk_size : kv_len;
+  const uint32_t chunk_start = partition_kv ? kv_tile_idx * chunk_size : 0;
+  const uint32_t chunk_end = partition_kv ? min((kv_tile_idx + 1) * chunk_size, kv_len) : kv_len;
   const tensor_info_t<kv_layout, num_frags_y * 16> qkv_info(qo_len, kv_len, num_qo_heads,
                                                             num_kv_heads);
   float alibi_slopes[num_frags_x][2];
   const uint32_t qo_upper_bound =
-      min(qo_len, ceil_div((tile_idx + 1) * num_rows_per_cta, group_size));
+      min(qo_len, ceil_div((qo_tile_idx + 1) * num_rows_per_cta, group_size));
 
-  constexpr bool partition_kv = false;
   constexpr uint32_t channel_size_128b_in = head_dim / num_elems_per_128b<DTypeIn>();
   constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeOut>();
 
@@ -1144,17 +1153,22 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
   }
   init_states<num_frags_x, num_frags_y>(o_frag, m, d);
 
-  const uint32_t qo_packed_idx_base = (tile_idx * num_warps + ty) * num_frags_x * 16;
+  const uint32_t qo_packed_idx_base = (qo_tile_idx * num_warps + ty) * num_frags_x * 16;
   const uint32_t kv_n_stride = qkv_info.get_kv_n_stride(), qo_n_stride = qkv_info.get_qo_n_stride(),
                  qo_h_stride = qkv_info.get_qo_h_stride();
   smem_t qo_smem(smem);
 
   DTypeIn* q_ptr_base =
-      q + qkv_info.get_qo_elem_offset(qo_indptr[request_idx], kv_head_idx * group_size,
+      q + qkv_info.get_qo_elem_offset(q_indptr[request_idx], kv_head_idx * group_size,
                                       (tx % 8) * num_elems_per_128b<DTypeIn>());
+
   DTypeIn* o_ptr_base =
-      o + qkv_info.get_qo_elem_offset(qo_indptr[request_idx], kv_head_idx * group_size,
-                                      (tx % 8) * num_elems_per_128b<DTypeOut>());
+      partition_kv
+          ? o + kv_tile_idx * num_qo_heads * head_dim +
+                qkv_info.get_qo_elem_offset(o_indptr[request_idx], kv_head_idx * group_size,
+                                            (tx % 8) * num_elems_per_128b<DTypeOut>())
+          : o + qkv_info.get_qo_elem_offset(o_indptr[request_idx], kv_head_idx * group_size,
+                                            (tx % 8) * num_elems_per_128b<DTypeOut>());
 
   uint32_t q_smem_offset_r =
       smem_t::get_permuted_offset<channel_size_128b_in>(ty * num_frags_x * 16 + tx % 16, tx / 16);
@@ -1174,7 +1188,7 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
     } else {
       q_smem_inplace_apply_rotary_with_pos_multiply_sm_scale<num_warps, num_frags_x, num_frags_y,
                                                              DTypeIn>(
-          qo_packed_idx_base, q_offset + qo_indptr[request_idx], &qo_smem, group_size,
+          qo_packed_idx_base, q_offset + q_indptr[request_idx], &qo_smem, group_size,
           &q_smem_offset_r, rope_freq, sm_scale);
     }
   } else {
@@ -1193,16 +1207,21 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
     }
   }
 
-  const uint32_t num_iterations = ceil_div(
-      (mask_mode == MaskMode::kCausal
-           ? min(kv_len, kv_len - qo_len + ((tile_idx + 1) * num_rows_per_cta) / group_size)
-           : kv_len),
-      16 * num_frags_z);
+  const uint32_t num_iterations =
+      ceil_div((mask_mode == MaskMode::kCausal
+                    ? min(chunk_end - chunk_start,
+                          sub_if_greater_or_zero(
+                              kv_len - qo_len + ((qo_tile_idx + 1) * num_rows_per_cta) / group_size,
+                              chunk_start))
+                    : chunk_end - chunk_start),
+               16 * num_frags_z);
 
   const uint32_t mask_iteration =
       (mask_mode == MaskMode::kCausal
-           ? min(kv_len + (tile_idx * num_rows_per_cta) / group_size - qo_len, kv_len)
-           : kv_len) /
+           ? min(chunk_end - chunk_start,
+                 sub_if_greater_or_zero(
+                     kv_len + (qo_tile_idx * num_rows_per_cta) / group_size - qo_len, chunk_start))
+           : chunk_end - chunk_start) /
       (16 * num_frags_z);
 
   smem_t k_smem(smem + (num_warps * num_frags_x) * 16 * head_dim * sizeof(DTypeIn)),
@@ -1215,17 +1234,17 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
                smem_t::get_permuted_offset<channel_size_128b_in>(ty * 4 + tx / 8, tx % 8);
 
   DTypeIn* k_ptr =
-      k + qkv_info.get_kv_elem_offset(kv_indptr[request_idx] + ty * 4 + tx / 8, kv_head_idx,
-                                      (tx % 8) * num_elems_per_128b<DTypeIn>());
+      k + qkv_info.get_kv_elem_offset(kv_indptr[request_idx] + chunk_start + ty * 4 + tx / 8,
+                                      kv_head_idx, (tx % 8) * num_elems_per_128b<DTypeIn>());
   DTypeIn* v_ptr =
-      v + qkv_info.get_kv_elem_offset(kv_indptr[request_idx] + ty * 4 + tx / 8, kv_head_idx,
-                                      (tx % 8) * num_elems_per_128b<DTypeIn>());
+      v + qkv_info.get_kv_elem_offset(kv_indptr[request_idx] + chunk_start + ty * 4 + tx / 8,
+                                      kv_head_idx, (tx % 8) * num_elems_per_128b<DTypeIn>());
 
   produce_kv<SharedMemFillMode::kNoFill, num_warps, num_frags_y, num_frags_z>(
-      k_smem, &kv_smem_offset_w, &k_ptr, kv_n_stride, 0, kv_len);
+      k_smem, &kv_smem_offset_w, &k_ptr, kv_n_stride, chunk_start, chunk_end);
   cp_async::commit_group();
   produce_kv<SharedMemFillMode::kFillZero, num_warps, num_frags_y, num_frags_z>(
-      v_smem, &kv_smem_offset_w, &v_ptr, kv_n_stride, 0, kv_len);
+      v_smem, &kv_smem_offset_w, &v_ptr, kv_n_stride, chunk_start, chunk_end);
   cp_async::commit_group();
 
 #pragma unroll 1
@@ -1235,7 +1254,7 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
 
     if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
       k_smem_inplace_apply_rotary<num_frags_y, num_frags_z, DTypeIn>(
-          (k_rope_pos_offset == nullptr ? 0 : k_rope_pos_offset[request_idx]) +
+          (k_rope_pos_offset == nullptr ? 0 : k_rope_pos_offset[request_idx]) + chunk_start +
               iter * 16 * num_frags_z,
           &k_smem, &k_smem_offset_r, rope_freq);
       block.sync();
@@ -1247,20 +1266,20 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
 
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
       // TODO(Zihao): handle the case that q_offset is specified
-      apply_alibi_bias<num_frags_x, num_frags_z>(qo_packed_idx_base, iter * 16 * num_frags_z,
-                                                 int(kv_len) - int(qo_len), group_size,
-                                                 alibi_slopes, s_frag);
+      apply_alibi_bias<num_frags_x, num_frags_z>(
+          qo_packed_idx_base, chunk_start + iter * 16 * num_frags_z, int(kv_len) - int(qo_len),
+          group_size, alibi_slopes, s_frag);
     }
     // apply mask
     if constexpr (mask_mode == MaskMode::kCustom) {
       mask_s<partition_kv, mask_mode, num_warps, num_frags_x, num_frags_y, num_frags_z>(
-          qo_packed_idx_base, iter * 16 * num_frags_z, qo_len, kv_len, kv_len, group_size,
-          custom_mask + qk_indptr[request_idx], s_frag);
+          qo_packed_idx_base, chunk_start + iter * 16 * num_frags_z, qo_len, kv_len, chunk_end,
+          group_size, custom_mask + qk_indptr[request_idx], s_frag);
     } else {
       if (iter >= mask_iteration) {
         mask_s<partition_kv, mask_mode, num_warps, num_frags_x, num_frags_y, num_frags_z>(
-            qo_packed_idx_base, iter * 16 * num_frags_z, qo_len, kv_len, kv_len, group_size,
-            nullptr, s_frag);
+            qo_packed_idx_base, chunk_start + iter * 16 * num_frags_z, qo_len, kv_len, chunk_end,
+            group_size, nullptr, s_frag);
       }
     }
 
@@ -1269,7 +1288,8 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
 
     block.sync();
     produce_kv<SharedMemFillMode::kNoFill, num_warps, num_frags_y, num_frags_z>(
-        k_smem, &kv_smem_offset_w, &k_ptr, kv_n_stride, (iter + 1) * 16 * num_frags_z, kv_len);
+        k_smem, &kv_smem_offset_w, &k_ptr, kv_n_stride, chunk_start + (iter + 1) * 16 * num_frags_z,
+        kv_len);
     cp_async::commit_group();
     cp_async::wait_group<1>();
     block.sync();
@@ -1280,7 +1300,8 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
 
     block.sync();
     produce_kv<SharedMemFillMode::kFillZero, num_warps, num_frags_y, num_frags_z>(
-        v_smem, &kv_smem_offset_w, &v_ptr, kv_n_stride, (iter + 1) * 16 * num_frags_z, kv_len);
+        v_smem, &kv_smem_offset_w, &v_ptr, kv_n_stride, chunk_start + (iter + 1) * 16 * num_frags_z,
+        kv_len);
     cp_async::commit_group();
   }
   cp_async::wait_group<0>();
@@ -1289,9 +1310,12 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
   // normalize d
   normalize_d<num_frags_x, num_frags_y>(o_frag, d);
 
+  const uint32_t num_kv_chunks = ceil_div(kv_len, kv_chunk_size);
+
   // write back
-  write_o_reg_gmem<num_frags_x, num_frags_y>(o_frag, &qo_smem, o_ptr_base, qo_packed_idx_base,
-                                             qo_len, qo_n_stride, qo_h_stride, group_size);
+  write_o_reg_gmem<num_frags_x, num_frags_y>(
+      o_frag, &qo_smem, o_ptr_base, qo_packed_idx_base, qo_len,
+      partition_kv ? qo_n_stride * num_kv_chunks : qo_n_stride, qo_h_stride, group_size);
 
   // write lse
   if (lse != nullptr) {
@@ -1304,44 +1328,58 @@ __global__ void BatchPrefillWithRaggedKVCacheKernel(
         const uint32_t qo_head_idx = kv_head_idx * group_size + r;
         const uint32_t qo_idx = q;
         if (qo_idx < qo_len) {
-          lse[(qo_indptr[request_idx] + qo_idx) * num_qo_heads + qo_head_idx] =
-              math::ptx_log2(d[fx][j]) + float(m[fx][j]);
+          if constexpr (partition_kv) {
+            lse[(o_indptr[request_idx] + qo_idx * num_kv_chunks + kv_tile_idx) * num_qo_heads +
+                qo_head_idx] = math::ptx_log2(d[fx][j]) + float(m[fx][j]);
+          } else {
+            lse[(o_indptr[request_idx] + qo_idx) * num_qo_heads + qo_head_idx] =
+                math::ptx_log2(d[fx][j]) + float(m[fx][j]);
+          }
         }
       }
     }
   }
 }
 
-template <LogitsPostHook logits_post_hook, MaskMode mask_mode, PosEncodingMode pos_encoding_mode,
-          uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps,
-          PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeQKAccum,
-          typename DTypeOut, typename IdType>
+template <bool partition_kv, LogitsPostHook logits_post_hook, MaskMode mask_mode,
+          PosEncodingMode pos_encoding_mode, uint32_t num_frags_x, uint32_t num_frags_y,
+          uint32_t num_frags_z, uint32_t num_warps, PageStorage page_storage, QKVLayout kv_layout,
+          typename DTypeIn, typename DTypeQKAccum, typename DTypeOut, typename IdType>
 __global__ void BatchPrefillWithPagedKVCacheKernel(
-    IdType* __restrict__ request_indices, IdType* __restrict__ tile_indices,
-    DTypeIn* __restrict__ q, paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv,
-    IdType* __restrict__ qo_indptr, uint8_t* __restrict__ custom_mask,
-    IdType* __restrict__ qk_indptr, IdType* __restrict__ q_offset, DTypeOut* __restrict__ o,
-    float* __restrict__ tmp, float* __restrict__ lse, const uint_fastdiv group_size, float sm_scale,
+    IdType* __restrict__ request_indices, IdType* __restrict__ q_tile_indices,
+    IdType* __restrict__ kv_tile_indices, DTypeIn* __restrict__ q,
+    paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, IdType* __restrict__ q_indptr,
+    uint8_t* __restrict__ custom_mask, IdType* __restrict__ qk_indptr,
+    IdType* __restrict__ q_offset, IdType* __restrict__ o_indptr, DTypeOut* __restrict__ o,
+    float* __restrict__ lse, bool* __restrict__ block_valid_mask,
+    IdType* __restrict__ kv_chunk_size_ptr, const uint_fastdiv group_size, float sm_scale,
     float log2_rope_rcp_scale, float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
   sm_scale *= (logits_post_hook == LogitsPostHook::kNone ? math::log2e : 1.f / 30.f);
   auto block = cg::this_thread_block();
+  const uint32_t kv_chunk_size = *kv_chunk_size_ptr;
 
   const uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y, kv_head_idx = blockIdx.z;
+  if (block_valid_mask && !block_valid_mask[bx]) {
+    return;
+  }
   const uint32_t num_kv_heads = gridDim.z, num_qo_heads = num_kv_heads * group_size;
   float alibi_slopes[num_frags_x][2];
 
-  const uint32_t request_idx = request_indices[bx], tile_idx = tile_indices[bx];
+  const uint32_t request_idx = request_indices[bx], qo_tile_idx = q_tile_indices[bx],
+                 kv_tile_idx = kv_tile_indices[bx];
   constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
-  const uint32_t qo_len = qo_indptr[request_idx + 1] - qo_indptr[request_idx],
+  const uint32_t qo_len = q_indptr[request_idx + 1] - q_indptr[request_idx],
                  kv_len = (paged_kv.indptr[request_idx + 1] - paged_kv.indptr[request_idx] - 1) *
                               paged_kv.page_size +
                           paged_kv.last_page_len[request_idx];
+  const uint32_t chunk_size = partition_kv ? kv_chunk_size : kv_len;
+  const uint32_t chunk_start = partition_kv ? kv_tile_idx * chunk_size : 0;
+  const uint32_t chunk_end = partition_kv ? min((kv_tile_idx + 1) * chunk_size, kv_len) : kv_len;
   const uint32_t qo_upper_bound =
-      min(qo_len, ceil_div((tile_idx + 1) * num_rows_per_cta, group_size));
+      min(qo_len, ceil_div((qo_tile_idx + 1) * num_rows_per_cta, group_size));
 
-  constexpr bool partition_kv = false;
   constexpr uint32_t head_dim = num_frags_y * 16;
   constexpr uint32_t channel_size_128b_in = head_dim / num_elems_per_128b<DTypeIn>();
   constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeOut>();
@@ -1361,16 +1399,21 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
   }
   init_states<num_frags_x, num_frags_y>(o_frag, m, d);
 
-  const uint32_t qo_packed_idx_base = (tile_idx * num_warps + ty) * num_frags_x * 16;
+  const uint32_t qo_packed_idx_base = (qo_tile_idx * num_warps + ty) * num_frags_x * 16;
   const uint32_t qo_n_stride = get_n_stride_impl<QKVLayout::kNHD, head_dim>(num_qo_heads),
                  qo_h_stride = get_h_stride_impl<QKVLayout::kNHD, head_dim>(qo_len);
   smem_t qo_smem(smem);
   DTypeIn* q_ptr_base = q + get_elem_offset_impl<QKVLayout::kNHD, head_dim>(
-                                qo_indptr[request_idx], kv_head_idx * group_size,
+                                q_indptr[request_idx], kv_head_idx * group_size,
                                 (tx % 8) * num_elems_per_128b<DTypeIn>(), qo_len, num_qo_heads);
-  DTypeIn* o_ptr_base = o + get_elem_offset_impl<QKVLayout::kNHD, head_dim>(
-                                qo_indptr[request_idx], kv_head_idx * group_size,
-                                (tx % 8) * num_elems_per_128b<DTypeOut>(), qo_len, num_qo_heads);
+  DTypeIn* o_ptr_base =
+      partition_kv ? o + kv_tile_idx * num_qo_heads * head_dim +
+                         get_elem_offset_impl<QKVLayout::kNHD, head_dim>(
+                             o_indptr[request_idx], kv_head_idx * group_size,
+                             (tx % 8) * num_elems_per_128b<DTypeOut>(), qo_len, num_qo_heads)
+                   : o + get_elem_offset_impl<QKVLayout::kNHD, head_dim>(
+                             o_indptr[request_idx], kv_head_idx * group_size,
+                             (tx % 8) * num_elems_per_128b<DTypeOut>(), qo_len, num_qo_heads);
   uint32_t q_smem_offset_r =
       smem_t::get_permuted_offset<channel_size_128b_in>(ty * num_frags_x * 16 + tx % 16, tx / 16);
 
@@ -1389,7 +1432,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
     } else {
       q_smem_inplace_apply_rotary_with_pos_multiply_sm_scale<num_warps, num_frags_x, num_frags_y,
                                                              DTypeIn>(
-          qo_packed_idx_base, q_offset + qo_indptr[request_idx], &qo_smem, group_size,
+          qo_packed_idx_base, q_offset + q_indptr[request_idx], &qo_smem, group_size,
           &q_smem_offset_r, rope_freq, sm_scale);
     }
   } else {
@@ -1418,24 +1461,31 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
                smem_t::get_permuted_offset<channel_size_128b_in>(ty * 4 + tx / 8, tx % 8);
   const IdType last_indptr = paged_kv.indptr[paged_kv.batch_size];
 
-  uint32_t packed_page_iter_base = paged_kv.indptr[request_idx] * paged_kv.page_size;
-  page_produce_kv<false, num_warps, num_frags_y, num_frags_z>(
-      k_smem, &kv_smem_offset_w, paged_kv, 0, packed_page_iter_base, kv_len, last_indptr);
+  uint32_t packed_page_iter_base = paged_kv.indptr[request_idx] * paged_kv.page_size + chunk_start;
+  page_produce_kv<false, num_warps, num_frags_y, num_frags_z>(k_smem, &kv_smem_offset_w, paged_kv,
+                                                              chunk_start, packed_page_iter_base,
+                                                              chunk_end, last_indptr);
   cp_async::commit_group();
-  page_produce_kv<true, num_warps, num_frags_y, num_frags_z>(
-      v_smem, &kv_smem_offset_w, paged_kv, 0, packed_page_iter_base, kv_len, last_indptr);
+  page_produce_kv<true, num_warps, num_frags_y, num_frags_z>(v_smem, &kv_smem_offset_w, paged_kv,
+                                                             chunk_start, packed_page_iter_base,
+                                                             chunk_end, last_indptr);
   cp_async::commit_group();
 
-  const uint32_t num_iterations = ceil_div(
-      (mask_mode == MaskMode::kCausal
-           ? min(kv_len, kv_len - qo_len + ((tile_idx + 1) * num_rows_per_cta) / group_size)
-           : kv_len),
-      16 * num_frags_z);
+  const uint32_t num_iterations =
+      ceil_div((mask_mode == MaskMode::kCausal
+                    ? min(chunk_end - chunk_start,
+                          sub_if_greater_or_zero(
+                              kv_len - qo_len + ((qo_tile_idx + 1) * num_rows_per_cta) / group_size,
+                              chunk_start))
+                    : chunk_end - chunk_start),
+               16 * num_frags_z);
 
   const uint32_t mask_iteration =
       (mask_mode == MaskMode::kCausal
-           ? min(kv_len + (tile_idx * num_rows_per_cta) / group_size - qo_len, kv_len)
-           : kv_len) /
+           ? min(chunk_end - chunk_start,
+                 sub_if_greater_or_zero(
+                     kv_len + (qo_tile_idx * num_rows_per_cta) / group_size - qo_len, chunk_start))
+           : chunk_end - chunk_start) /
       (16 * num_frags_z);
 
 #pragma unroll
@@ -1446,7 +1496,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
     if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
       k_smem_inplace_apply_rotary<num_frags_y, num_frags_z, DTypeIn>(
           (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[request_idx]) +
-              iter * 16 * num_frags_z,
+              chunk_start + iter * 16 * num_frags_z,
           &k_smem, &k_smem_offset_r, rope_freq);
       block.sync();
     }
@@ -1457,20 +1507,20 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
 
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
       // TODO(Zihao): handle the case that q_offset is specified
-      apply_alibi_bias<num_frags_x, num_frags_z>(qo_packed_idx_base, iter * 16 * num_frags_z,
-                                                 int(kv_len) - int(qo_len), group_size,
-                                                 alibi_slopes, s_frag);
+      apply_alibi_bias<num_frags_x, num_frags_z>(
+          qo_packed_idx_base, chunk_start + iter * 16 * num_frags_z, int(kv_len) - int(qo_len),
+          group_size, alibi_slopes, s_frag);
     }
     // apply mask
     if constexpr (mask_mode == MaskMode::kCustom) {
       mask_s<partition_kv, mask_mode, num_warps, num_frags_x, num_frags_y, num_frags_z>(
-          qo_packed_idx_base, iter * 16 * num_frags_z, qo_len, kv_len, kv_len, group_size,
-          custom_mask + qk_indptr[request_idx], s_frag);
+          qo_packed_idx_base, chunk_start + iter * 16 * num_frags_z, qo_len, kv_len, chunk_end,
+          group_size, custom_mask + qk_indptr[request_idx], s_frag);
     } else {
       if (iter >= mask_iteration) {
         mask_s<partition_kv, mask_mode, num_warps, num_frags_x, num_frags_y, num_frags_z>(
-            qo_packed_idx_base, iter * 16 * num_frags_z, qo_len, kv_len, kv_len, group_size,
-            nullptr, s_frag);
+            qo_packed_idx_base, chunk_start + iter * 16 * num_frags_z, qo_len, kv_len, chunk_end,
+            group_size, nullptr, s_frag);
       }
     }
 
@@ -1480,8 +1530,8 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
     block.sync();
     packed_page_iter_base += 16 * num_frags_z;
     page_produce_kv<false, num_warps, num_frags_y, num_frags_z>(
-        k_smem, &kv_smem_offset_w, paged_kv, (iter + 1) * 16 * num_frags_z, packed_page_iter_base,
-        kv_len, last_indptr);
+        k_smem, &kv_smem_offset_w, paged_kv, chunk_start + (iter + 1) * 16 * num_frags_z,
+        packed_page_iter_base, chunk_end, last_indptr);
     cp_async::commit_group();
     cp_async::wait_group<1>();
     block.sync();
@@ -1492,8 +1542,8 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
 
     block.sync();
     page_produce_kv<true, num_warps, num_frags_y, num_frags_z>(
-        v_smem, &kv_smem_offset_w, paged_kv, (iter + 1) * 16 * num_frags_z, packed_page_iter_base,
-        kv_len, last_indptr);
+        v_smem, &kv_smem_offset_w, paged_kv, chunk_start + (iter + 1) * 16 * num_frags_z,
+        packed_page_iter_base, chunk_end, last_indptr);
     cp_async::commit_group();
   }
   cp_async::wait_group<0>();
@@ -1502,9 +1552,12 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
   // normalize d
   normalize_d<num_frags_x, num_frags_y>(o_frag, d);
 
+  const uint32_t num_kv_chunks = ceil_div(kv_len, kv_chunk_size);
+
   // write_back
-  write_o_reg_gmem<num_frags_x, num_frags_y>(o_frag, &qo_smem, o_ptr_base, qo_packed_idx_base,
-                                             qo_len, qo_n_stride, qo_h_stride, group_size);
+  write_o_reg_gmem<num_frags_x, num_frags_y>(
+      o_frag, &qo_smem, o_ptr_base, qo_packed_idx_base, qo_len,
+      partition_kv ? qo_n_stride * num_kv_chunks : qo_n_stride, qo_h_stride, group_size);
 
   // write lse
   if (lse != nullptr) {
@@ -1517,8 +1570,13 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
         const uint32_t qo_head_idx = kv_head_idx * group_size + r;
         const uint32_t qo_idx = q;
         if (qo_idx < qo_upper_bound) {
-          lse[(qo_indptr[request_idx] + qo_idx) * num_qo_heads + qo_head_idx] =
-              math::ptx_log2(d[fx][j]) + float(m[fx][j]);
+          if constexpr (partition_kv) {
+            lse[(o_indptr[request_idx] + qo_idx * num_kv_chunks + kv_tile_idx) * num_qo_heads +
+                qo_head_idx] = math::ptx_log2(d[fx][j]) + float(m[fx][j]);
+          } else {
+            lse[(o_indptr[request_idx] + qo_idx) * num_qo_heads + qo_head_idx] =
+                math::ptx_log2(d[fx][j]) + float(m[fx][j]);
+          }
         }
       }
     }
@@ -1665,19 +1723,20 @@ template <uint32_t num_frags_x, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HO
           QKVLayout KV_LAYOUT, PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION,
           MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
-    DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, DTypeIn* k,
-    DTypeIn* v, IdType* kv_indptr, uint8_t* custom_mask, IdType* qk_indptr, IdType* q_offset,
-    IdType* k_rope_pos_offset, DTypeOut* o, float* tmp, float* lse, const uint32_t batch_size,
-    const uint32_t num_qo_heads, const uint32_t num_qo_tiles, const uint32_t num_kv_heads,
-    const float sm_scale, const float rope_scale, const float rope_theta,
-    cudaStream_t stream = nullptr) {
+    DTypeIn* q, IdType* request_indices, IdType* q_tile_indices, IdType* kv_tile_indices,
+    IdType* q_indptr, DTypeIn* k, DTypeIn* v, IdType* kv_indptr, uint8_t* custom_mask,
+    IdType* qk_indptr, IdType* q_offset, IdType* k_rope_pos_offset, IdType* o_indptr, DTypeOut* o,
+    DTypeOut* tmp_v, float* tmp_s, float* lse, IdType* merge_indptr, bool* block_valid_mask,
+    IdType* kv_chunk_size_ptr, const uint32_t total_num_rows, const uint32_t num_qo_heads,
+    const uint32_t padded_batch_size, const uint32_t num_kv_heads, const float sm_scale,
+    const float rope_scale, const float rope_theta, cudaStream_t stream = nullptr) {
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
   constexpr uint32_t num_warps = 4;
   const uint32_t group_size = num_qo_heads / num_kv_heads;
   const uint_fastdiv group_size_fastdiv(group_size);
 
-  dim3 nblks(num_qo_tiles, 1, num_kv_heads);
+  dim3 nblks(padded_batch_size, 1, num_kv_heads);
   dim3 nthrs(32, num_warps);
   constexpr uint32_t num_frags_y = HEAD_DIM / 16;
   using DTypeQKAccum =
@@ -1712,33 +1771,73 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
                  " and report the issue to the developers.";
       throw std::invalid_argument(err_msg.str());
     } else {
-      auto kernel = BatchPrefillWithRaggedKVCacheKernel<
-          LOGITS_POST_HOOK, MASK_MODE, KV_LAYOUT, pos_encoding_mode, num_frags_x, num_frags_y,
-          num_frags_z, num_warps, DTypeIn, DTypeQKAccum, DTypeOut, IdType>;
       uint32_t smem_size =
           (num_frags_x * num_warps + num_frags_z * 2) * 16 * HEAD_DIM * sizeof(DTypeIn);
-      FLASHINFER_CUDA_CALL(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-      void* args[] = {(void*)&q,
-                      (void*)&request_indices,
-                      (void*)&tile_indices,
-                      (void*)&qo_indptr,
-                      (void*)&k,
-                      (void*)&v,
-                      (void*)&kv_indptr,
-                      (void*)&custom_mask,
-                      (void*)&qk_indptr,
-                      (void*)&q_offset,
-                      (void*)&k_rope_pos_offset,
-                      (void*)&o,
-                      (void*)&tmp,
-                      (void*)&lse,
-                      (void*)&batch_size,
-                      (void*)&group_size_fastdiv,
-                      (void*)&sm_scale,
-                      (void*)&log2_rope_rcp_scale,
-                      (void*)&log2_rope_rcp_theta};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+      if (tmp_v == nullptr) {
+        // do not partition kv
+        auto kernel = BatchPrefillWithRaggedKVCacheKernel<
+            /*partition_kv=*/false, LOGITS_POST_HOOK, MASK_MODE, KV_LAYOUT, pos_encoding_mode,
+            num_frags_x, num_frags_y, num_frags_z, num_warps, DTypeIn, DTypeQKAccum, DTypeOut,
+            IdType>;
+        FLASHINFER_CUDA_CALL(
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        void* args[] = {(void*)&q,
+                        (void*)&request_indices,
+                        (void*)&q_tile_indices,
+                        (void*)&kv_tile_indices,
+                        (void*)&q_indptr,
+                        (void*)&k,
+                        (void*)&v,
+                        (void*)&kv_indptr,
+                        (void*)&custom_mask,
+                        (void*)&qk_indptr,
+                        (void*)&q_offset,
+                        (void*)&k_rope_pos_offset,
+                        (void*)&o_indptr,
+                        (void*)&o,
+                        (void*)&lse,
+                        (void*)&block_valid_mask,
+                        (void*)&kv_chunk_size_ptr,
+                        (void*)&group_size_fastdiv,
+                        (void*)&sm_scale,
+                        (void*)&log2_rope_rcp_scale,
+                        (void*)&log2_rope_rcp_theta};
+        FLASHINFER_CUDA_CALL(
+            cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+      } else {
+        // partition kv
+        auto kernel = BatchPrefillWithRaggedKVCacheKernel<
+            /*partition_kv=*/true, LOGITS_POST_HOOK, MASK_MODE, KV_LAYOUT, pos_encoding_mode,
+            num_frags_x, num_frags_y, num_frags_z, num_warps, DTypeIn, DTypeQKAccum, DTypeOut,
+            IdType>;
+        FLASHINFER_CUDA_CALL(
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        void* args[] = {(void*)&q,
+                        (void*)&request_indices,
+                        (void*)&q_tile_indices,
+                        (void*)&kv_tile_indices,
+                        (void*)&q_indptr,
+                        (void*)&k,
+                        (void*)&v,
+                        (void*)&kv_indptr,
+                        (void*)&custom_mask,
+                        (void*)&qk_indptr,
+                        (void*)&q_offset,
+                        (void*)&k_rope_pos_offset,
+                        (void*)&o_indptr,
+                        (void*)&tmp_v,
+                        (void*)&tmp_s,
+                        (void*)&block_valid_mask,
+                        (void*)&kv_chunk_size_ptr,
+                        (void*)&group_size_fastdiv,
+                        (void*)&sm_scale,
+                        (void*)&log2_rope_rcp_scale,
+                        (void*)&log2_rope_rcp_theta};
+        FLASHINFER_CUDA_CALL(
+            cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+        FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
+            tmp_v, tmp_s, merge_indptr, o, lse, total_num_rows, num_qo_heads, HEAD_DIM, stream));
+      }
     }
   });
   return cudaSuccess;
@@ -1749,20 +1848,21 @@ template <PageStorage page_storage, uint32_t num_frags_x, uint32_t HEAD_DIM,
           bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut,
           typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(
-    DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, IdType* q_offset,
+    DTypeIn* q, IdType* request_indices, IdType* q_tile_indices, IdType* kv_tile_indices,
+    IdType* q_indptr, IdType* q_offset,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, uint8_t* custom_mask,
-    IdType* qk_indptr, DTypeOut* o, float* tmp, float* lse, uint32_t num_qo_heads,
-    uint32_t num_qo_tiles, float sm_scale, float rope_scale, float rope_theta,
-    cudaStream_t stream) {
+    IdType* qk_indptr, IdType* o_indptr, DTypeOut* o, DTypeOut* tmp_v, float* tmp_s, float* lse,
+    IdType* merge_indptr, bool* block_valid_mask, IdType* kv_chunk_size_ptr,
+    uint32_t total_num_rows, uint32_t num_qo_heads, uint32_t padded_batch_size, float sm_scale,
+    float rope_scale, float rope_theta, cudaStream_t stream) {
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
   constexpr uint32_t num_warps = 4;
   const uint32_t num_kv_heads = paged_kv.num_heads;
-  const uint32_t batch_size = paged_kv.batch_size;
   const uint32_t group_size = num_qo_heads / num_kv_heads;
   const uint_fastdiv group_size_fastdiv(group_size);
 
-  dim3 nblks(num_qo_tiles, 1, num_kv_heads);
+  dim3 nblks(padded_batch_size, 1, num_kv_heads);
   dim3 nthrs(32, num_warps);
 
   constexpr uint32_t num_frags_y = HEAD_DIM / 16;
@@ -1798,29 +1898,69 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
                  " and report the issue to the developers.";
       throw std::invalid_argument(err_msg.str());
     } else {
-      auto kernel = BatchPrefillWithPagedKVCacheKernel<
-          LOGITS_POST_HOOK, MASK_MODE, pos_encoding_mode, num_frags_x, num_frags_y, num_frags_z,
-          num_warps, page_storage, kv_layout, DTypeIn, DTypeQKAccum, DTypeOut, IdType>;
       uint32_t smem_size =
           (num_frags_x * num_warps + num_frags_z * 2) * 16 * HEAD_DIM * sizeof(DTypeIn);
-      FLASHINFER_CUDA_CALL(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-      void* args[] = {(void*)&request_indices,
-                      (void*)&tile_indices,
-                      (void*)&q,
-                      (void*)&paged_kv,
-                      (void*)&qo_indptr,
-                      (void*)&custom_mask,
-                      (void*)&qk_indptr,
-                      (void*)&q_offset,
-                      (void*)&o,
-                      (void*)&tmp,
-                      (void*)&lse,
-                      (void*)&group_size_fastdiv,
-                      (void*)&sm_scale,
-                      (void*)&log2_rope_rcp_scale,
-                      (void*)&log2_rope_rcp_theta};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+
+      if (tmp_v == nullptr) {
+        // do not partition kv
+        auto kernel = BatchPrefillWithPagedKVCacheKernel<
+            /*partition_kv=*/false, LOGITS_POST_HOOK, MASK_MODE, pos_encoding_mode, num_frags_x,
+            num_frags_y, num_frags_z, num_warps, page_storage, kv_layout, DTypeIn, DTypeQKAccum,
+            DTypeOut, IdType>;
+
+        FLASHINFER_CUDA_CALL(
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        void* args[] = {(void*)&request_indices,
+                        (void*)&q_tile_indices,
+                        (void*)&kv_tile_indices,
+                        (void*)&q,
+                        (void*)&paged_kv,
+                        (void*)&q_indptr,
+                        (void*)&custom_mask,
+                        (void*)&qk_indptr,
+                        (void*)&q_offset,
+                        (void*)&o_indptr,
+                        (void*)&o,
+                        (void*)&lse,
+                        (void*)&block_valid_mask,
+                        (void*)&kv_chunk_size_ptr,
+                        (void*)&group_size_fastdiv,
+                        (void*)&sm_scale,
+                        (void*)&log2_rope_rcp_scale,
+                        (void*)&log2_rope_rcp_theta};
+        FLASHINFER_CUDA_CALL(
+            cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+      } else {
+        auto kernel = BatchPrefillWithPagedKVCacheKernel<
+            /*partition_kv=*/true, LOGITS_POST_HOOK, MASK_MODE, pos_encoding_mode, num_frags_x,
+            num_frags_y, num_frags_z, num_warps, page_storage, kv_layout, DTypeIn, DTypeQKAccum,
+            DTypeOut, IdType>;
+
+        FLASHINFER_CUDA_CALL(
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        void* args[] = {(void*)&request_indices,
+                        (void*)&q_tile_indices,
+                        (void*)&kv_tile_indices,
+                        (void*)&q,
+                        (void*)&paged_kv,
+                        (void*)&q_indptr,
+                        (void*)&custom_mask,
+                        (void*)&qk_indptr,
+                        (void*)&q_offset,
+                        (void*)&o_indptr,
+                        (void*)&tmp_v,
+                        (void*)&tmp_s,
+                        (void*)&block_valid_mask,
+                        (void*)&kv_chunk_size_ptr,
+                        (void*)&group_size_fastdiv,
+                        (void*)&sm_scale,
+                        (void*)&log2_rope_rcp_scale,
+                        (void*)&log2_rope_rcp_theta};
+        FLASHINFER_CUDA_CALL(
+            cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+        FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
+            tmp_v, tmp_s, merge_indptr, o, lse, total_num_rows, num_qo_heads, HEAD_DIM, stream));
+      }
     }
   });
   return cudaSuccess;

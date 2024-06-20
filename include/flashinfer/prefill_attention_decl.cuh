@@ -38,44 +38,60 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
                                                uint32_t kv_len, float sm_scale, float rope_scale,
                                                float rope_theta, cudaStream_t stream);
 
-template <uint32_t NUM_FRAGS_X, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK,
-          QKVLayout KV_LAYOUT, PosEncodingMode POS_ENCODING_MODE, bool ALLOW_FP16_QK_REDUCTION,
+template <uint32_t num_frags_x, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK,
+          QKVLayout KV_LAYOUT, PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION,
           MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
-    DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, DTypeIn* k,
-    DTypeIn* v, IdType* kv_indptr, uint8_t* custom_mask, IdType* qk_indptr, IdType* q_offset,
-    IdType* k_rope_pos_offset, DTypeOut* o, float* tmp, float* lse, uint32_t batch_size,
-    uint32_t num_qo_tiles, uint32_t num_qo_heads, uint32_t num_kv_heads, float sm_scale,
-    float rope_scale, float rope_theta, cudaStream_t stream = nullptr);
+    DTypeIn* q, IdType* request_indices, IdType* q_tile_indices, IdType* kv_tile_indices,
+    IdType* q_indptr, DTypeIn* k, DTypeIn* v, IdType* kv_indptr, uint8_t* custom_mask,
+    IdType* qk_indptr, IdType* q_offset, IdType* k_rope_pos_offset, IdType* o_indptr, DTypeOut* o,
+    DTypeOut* tmp_v, float* tmp_s, float* lse, IdType* merge_indptr, bool* block_valid_mask,
+    IdType* kv_chunk_size_ptr, const uint32_t total_num_rows, const uint32_t num_qo_heads,
+    const uint32_t padded_batch_size, const uint32_t num_kv_heads, const float sm_scale,
+    const float rope_scale, const float rope_theta, cudaStream_t stream = nullptr);
 
-template <PageStorage PAGE_STORAGE, uint32_t NUM_FRAGS_X, uint32_t HEAD_DIM,
-          LogitsPostHook LOGITS_POST_HOOK, QKVLayout KV_LAYOUT, PosEncodingMode POS_ENCODING_MODE,
+template <PageStorage page_storage, uint32_t num_frags_x, uint32_t HEAD_DIM,
+          LogitsPostHook LOGITS_POST_HOOK, QKVLayout kv_layout, PosEncodingMode pos_encoding_mode,
           bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut,
           typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(
-    DTypeIn* q, IdType* request_indices, IdType* tile_indices, IdType* qo_indptr, IdType* q_offset,
-    paged_kv_t<PAGE_STORAGE, KV_LAYOUT, DTypeIn, IdType> paged_kv, uint8_t* custom_mask,
-    IdType* qk_indptr, DTypeOut* o, float* tmp, float* lse, uint32_t num_qo_tiles,
-    uint32_t num_qo_heads, float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream);
+    DTypeIn* q, IdType* request_indices, IdType* q_tile_indices, IdType* kv_tile_indices,
+    IdType* q_indptr, IdType* q_offset,
+    paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, uint8_t* custom_mask,
+    IdType* qk_indptr, IdType* o_indptr, DTypeOut* o, DTypeOut* tmp_v, float* tmp_s, float* lse,
+    IdType* merge_indptr, bool* block_valid_mask, IdType* kv_chunk_size_ptr,
+    uint32_t total_num_rows, uint32_t num_qo_heads, uint32_t padded_batch_size, float sm_scale,
+    float rope_scale, float rope_theta, cudaStream_t stream);
 
 template <PageStorage PAGE_STORAGE, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK,
           QKVLayout KV_LAYOUT, PosEncodingMode POS_ENCODING_MODE, bool ALLOW_FP16_QK_REDUCTION,
           MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
-    BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, IdType* q_offset,
+    BatchPrefillHandler* handler, DTypeIn* q, IdType* q_indptr, IdType* q_offset,
     paged_kv_t<PAGE_STORAGE, KV_LAYOUT, DTypeIn, IdType> paged_kv, uint8_t* custom_mask,
     IdType* qk_indptr, DTypeOut* o, float* lse, uint32_t num_qo_heads, float sm_scale,
     float rope_scale, float rope_theta, cudaStream_t stream) {
-  float* tmp = nullptr;
-  IdType* request_indices = nullptr;
-  IdType* tile_indices = nullptr;
+  DTypeOut* tmp_v = nullptr;
+  float* tmp_s = nullptr;
+  IdType *request_indices = nullptr, *qo_tile_indices = nullptr, *kv_tile_indices = nullptr,
+         *o_indptr = nullptr, *merge_indptr = nullptr, *kv_chunk_size_ptr = nullptr;
+  bool* block_valid_mask = nullptr;
   uint32_t num_frags_x = 0U;
-  uint32_t num_qo_tiles = 0U;
+  uint32_t padded_batch_size = 0U;
+  uint32_t total_num_rows = 0U;
   if (handler->IsForwardStarted()) {
+    tmp_v = handler->GetTempV<DTypeOut>();
+    tmp_s = handler->GetTempS();
     request_indices = handler->GetRequestIndices<IdType>();
-    tile_indices = handler->GetTileIndices<IdType>();
+    qo_tile_indices = handler->GetQOTileIndices<IdType>();
+    kv_tile_indices = handler->GetKVTileIndices<IdType>();
+    block_valid_mask = handler->GetBlockValidMask();
+    o_indptr = handler->GetOIndptr<IdType>();
+    merge_indptr = handler->GetMergeIndptr<IdType>();
+    kv_chunk_size_ptr = handler->GetKVChunkSizePtr<IdType>();
     num_frags_x = handler->GetNumFragsX();
-    num_qo_tiles = handler->GetNumQOTiles();
+    padded_batch_size = handler->GetPaddedBatchSize();
+    total_num_rows = handler->GetTotalNumRows();
   } else {
     std::ostringstream err_msg;
     err_msg << "Please call BatchPrefillHandler's BeginForward() before calling "
@@ -87,8 +103,10 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
     return BatchPrefillWithPagedKVCacheDispatched<
         PAGE_STORAGE, NUM_FRAGS_X, HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT, POS_ENCODING_MODE,
         ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeOut, IdType>(
-        q, request_indices, tile_indices, qo_indptr, q_offset, paged_kv, custom_mask, qk_indptr, o,
-        tmp, lse, num_qo_heads, num_qo_tiles, sm_scale, rope_scale, rope_theta, stream);
+        q, request_indices, qo_tile_indices, kv_tile_indices, q_indptr, q_offset, paged_kv,
+        custom_mask, qk_indptr, o_indptr, o, tmp_v, tmp_s, lse, merge_indptr, block_valid_mask,
+        kv_chunk_size_ptr, total_num_rows, num_qo_heads, padded_batch_size, sm_scale, rope_scale,
+        rope_theta, stream);
   });
   return cudaSuccess;
 }
@@ -97,21 +115,32 @@ template <uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK, QKVLayout KV_LAYOU
           PosEncodingMode POS_ENCODING_MODE, bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
-    BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, DTypeIn* k, DTypeIn* v,
+    BatchPrefillHandler* handler, DTypeIn* q, IdType* q_indptr, DTypeIn* k, DTypeIn* v,
     IdType* kv_indptr, uint8_t* custom_mask, IdType* qk_indptr, IdType* q_offset,
-    IdType* k_rope_pos_offset, DTypeOut* o, float* lse, uint32_t batch_size, uint32_t num_qo_heads,
+    IdType* k_rope_pos_offset, DTypeOut* o, float* lse, uint32_t num_qo_heads,
     uint32_t num_kv_heads, float sm_scale, float rope_scale, float rope_theta,
     cudaStream_t stream) {
-  float* tmp = nullptr;
-  IdType* request_indices = nullptr;
-  IdType* tile_indices = nullptr;
+  DTypeOut* tmp_v = nullptr;
+  float* tmp_s = nullptr;
+  IdType *request_indices = nullptr, *qo_tile_indices = nullptr, *kv_tile_indices = nullptr,
+         *o_indptr = nullptr, *merge_indptr = nullptr, *kv_chunk_size_ptr = nullptr;
+  bool* block_valid_mask = nullptr;
   uint32_t num_frags_x = 0U;
-  uint32_t num_qo_tiles = 0U;
+  uint32_t padded_batch_size = 0U;
+  uint32_t total_num_rows = 0U;
   if (handler->IsForwardStarted()) {
+    tmp_v = handler->GetTempV<DTypeOut>();
+    tmp_s = handler->GetTempS();
     request_indices = handler->GetRequestIndices<IdType>();
-    tile_indices = handler->GetTileIndices<IdType>();
+    qo_tile_indices = handler->GetQOTileIndices<IdType>();
+    kv_tile_indices = handler->GetKVTileIndices<IdType>();
+    block_valid_mask = handler->GetBlockValidMask();
+    o_indptr = handler->GetOIndptr<IdType>();
+    merge_indptr = handler->GetMergeIndptr<IdType>();
+    kv_chunk_size_ptr = handler->GetKVChunkSizePtr<IdType>();
     num_frags_x = handler->GetNumFragsX();
-    num_qo_tiles = handler->GetNumQOTiles();
+    padded_batch_size = handler->GetPaddedBatchSize();
+    total_num_rows = handler->GetTotalNumRows();
   } else {
     std::ostringstream err_msg;
     err_msg << "Please call BatchPrefillHandler's BeginForward() before calling "
@@ -123,9 +152,10 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
     return BatchPrefillWithRaggedKVCacheDispatched<
         NUM_FRAGS_X, HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT, POS_ENCODING_MODE,
         ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeOut, IdType>(
-        q, request_indices, tile_indices, qo_indptr, k, v, kv_indptr, custom_mask, qk_indptr,
-        q_offset, k_rope_pos_offset, o, tmp, lse, batch_size, num_qo_heads, num_qo_tiles,
-        num_kv_heads, sm_scale, rope_scale, rope_theta, stream);
+        q, request_indices, qo_tile_indices, kv_tile_indices, q_indptr, k, v, kv_indptr,
+        custom_mask, qk_indptr, q_offset, k_rope_pos_offset, o_indptr, o, tmp_v, tmp_s, lse,
+        merge_indptr, block_valid_mask, kv_chunk_size_ptr, total_num_rows, num_qo_heads,
+        padded_batch_size, num_kv_heads, sm_scale, rope_scale, rope_theta, stream);
   });
   return cudaSuccess;
 }

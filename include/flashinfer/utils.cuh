@@ -50,15 +50,6 @@
   }
 #endif
 
-#define DISPATCH_SPLIT_QO_INDPTR(split_qo_indptr, SPLIT_QO_INDPTR, ...) \
-  if (split_qo_indptr) {                                                \
-    constexpr bool SPLIT_QO_INDPTR = true;                              \
-    __VA_ARGS__                                                         \
-  } else {                                                              \
-    constexpr bool SPLIT_QO_INDPTR = false;                             \
-    __VA_ARGS__                                                         \
-  }
-
 #define DISPATCH_ALLOW_FP16_QK_REDUCTION(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, ...) \
   if (allow_fp16_qk_reduction) {                                                                \
     throw std::runtime_error("FP16_QK_REDUCTION disabled at compile time");                     \
@@ -263,37 +254,6 @@ inline bool is_device_ptr(const void* ptr) {
 template <typename T1, typename T2>
 __forceinline__ __device__ __host__ T1 ceil_div(const T1 x, const T2 y) {
   return (x + y - 1) / y;
-}
-
-template <typename IdType>
-std::tuple<IdType, IdType, std::vector<IdType>, std::vector<IdType>> split_qo_indptr(
-    IdType* qo_indptr, uint32_t batch_size, uint32_t gqa_group_size, uint32_t head_dim,
-    cudaStream_t stream = nullptr) {
-  constexpr uint32_t num_warps = 4;
-  std::vector<IdType> qo_indptr_h(batch_size + 1), request_indices, tile_indices;
-  if (is_device_ptr((void*)qo_indptr)) {
-    cudaMemcpyAsync(qo_indptr_h.data(), qo_indptr, sizeof(IdType) * (batch_size + 1),
-                    cudaMemcpyDeviceToHost, stream);
-  } else {
-    qo_indptr_h.assign(qo_indptr, qo_indptr + batch_size + 1);
-  }
-
-  const uint32_t total_q_len = qo_indptr_h[batch_size];
-  const bool avg_len_greater_than_64 = total_q_len * gqa_group_size > 64 * batch_size;
-  const uint32_t num_frags_x = (head_dim < 256 && avg_len_greater_than_64) ? 2 : 1;
-  const uint32_t num_rows_per_cta = num_frags_x * num_warps * 16;
-  uint32_t num_qo_tiles = 0;
-
-  for (uint32_t i = 0; i < batch_size; ++i) {
-    for (uint32_t j = qo_indptr_h[i] * gqa_group_size; j < qo_indptr_h[i + 1] * gqa_group_size;
-         j += num_rows_per_cta) {
-      request_indices.push_back(i);
-      tile_indices.push_back((j - qo_indptr_h[i] * gqa_group_size) / num_rows_per_cta);
-      ++num_qo_tiles;
-    }
-  }
-
-  return {num_frags_x, num_qo_tiles, std::move(request_indices), std::move(tile_indices)};
 }
 
 template <typename T>

@@ -64,7 +64,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapperDispatched(
   paged_kv_t<PAGE_STORAGE, KV_LAYOUT, DTypeKV, IdType> new_paged_kv = paged_kv;
   kv_partition_info_t<IdType> kv_partition_info;
   DTypeOut* tmp_v = handler->GetTempV<DTypeOut>();
-  float* tmp_s = handler->GetTempS<float>();
+  float* tmp_s = handler->GetTempS();
 
   if (handler->IsForwardStarted()) {
     if (tmp_v != nullptr) {
