@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.0.4](https://github.com/flashinfer-ai/flashinfer/compare/v0.0.4...v0.0.5) (2024-06-20)
+## [0.0.5](https://github.com/flashinfer-ai/flashinfer/compare/v0.0.4...v0.0.5) (2024-06-20)
 
 ### Highlights
 
