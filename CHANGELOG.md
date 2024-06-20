@@ -1,15 +1,15 @@
 # Changelog
 
-## [0.0.0](https://github.com/flashinfer-ai/flashinfer/compare/v0.0.4...v0.0.5) (2024-06-20)
+## [0.0.4](https://github.com/flashinfer-ai/flashinfer/compare/v0.0.4...v0.0.5) (2024-06-20)
 
 ### Highlights
 
-* Any GQA group size support.
-* Any page size support for prefill kernels.
-* Add CUDA-Graph support for prefill/decode APIs.
+* Support any GQA group size support for tensor-cores kernels.
+* Support any page size support for tensor-cores kernels.
+* Support CUDA-Graph for prefill/decode APIs.
 * Add an option to accelerate decode kernels with Tensor Cores.
-* Supports custom attention mask. (https://docs.flashinfer.ai/tutorials/kv_layout.html#mask-layout-2d-ragged-tensor)
-* Supports logits cap in Grok-1 models.
+* Support custom attention mask. (https://docs.flashinfer.ai/tutorials/kv_layout.html#mask-layout-2d-ragged-tensor)
+* Support logits cap in Grok-1 models.
 * Fused GPU-sampling kernels: top-p, top-k, speculative verification. (https://docs.flashinfer.ai/api/python/sampling.html)
 * PyTorch wrapper of group-gemm cutlass kernels. (https://docs.flashinfer.ai/api/python/sampling.html)
 
