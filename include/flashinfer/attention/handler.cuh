@@ -92,7 +92,7 @@ inline std::tuple<bool, uint32_t, uint32_t> PrefillBinarySearchKVChunkSize(
   int64_t batch_size = packed_qo_len_arr.size();
   int64_t max_kv_len;
   for (const int64_t& kv_len : kv_len_arr) {
-    max_kv_len = std::max(high, kv_len);
+    max_kv_len = std::max(max_kv_len, kv_len);
   }
   high = max_kv_len;
   int64_t new_batch_size;
