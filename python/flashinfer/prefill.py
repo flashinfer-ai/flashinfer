@@ -217,6 +217,7 @@ def single_prefill_with_kv_cache_return_lse(
     k: torch.Tensor,
     v: torch.Tensor,
     custom_mask: Optional[torch.Tensor] = None,
+    packed_custom_mask: Optional[torch.Tensor] = None,
     causal: bool = False,
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
