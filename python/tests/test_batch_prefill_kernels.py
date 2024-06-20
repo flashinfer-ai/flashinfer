@@ -367,7 +367,12 @@ def test_batch_prefill_with_ragged_kv_cache_custom_mask(
 
     # use custom mask
     wrapper.begin_forward(
-        q_indptr, kv_indptr, num_qo_heads, num_kv_heads, head_dim, custom_mask=custom_mask
+        q_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        custom_mask=custom_mask,
     )
     o_custom = wrapper.forward(q, k, v, pos_encoding_mode=pos_encoding_mode)
     wrapper.end_forward()

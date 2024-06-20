@@ -567,7 +567,8 @@ __device__ __forceinline__ void mask_s(const uint32_t qo_packed_idx_base,
         s_frag[fx][fz][reg_id] =
             (out_of_boundary ||
              (mask_mode == MaskMode::kCustom && q_idx < qo_len &&
-               !((custom_mask[(q_idx * kv_len + kv_idx) / 8] >> ((q_idx * kv_len + kv_idx) % 8)) & 1)))
+              !((custom_mask[(q_idx * kv_len + kv_idx) / 8] >> ((q_idx * kv_len + kv_idx) % 8)) &
+                1)))
                 ? DTypeQKAccum(-5e4)
                 : s_frag[fx][fz][reg_id];
       }

@@ -21,7 +21,7 @@
 #include "utils.h"
 
 using namespace flashinfer;
-constexpr QKVLayout kv_layout = QKVLayout::kNHD;
+constexpr QKVLayout kv_layout = QKVLayout::kHND;
 
 bool is_prime(int x) {
   for (int i = 2; i < int(std::sqrt(x)); ++i) {
