@@ -105,7 +105,7 @@ jobs:
           WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
 
       - name: Update wheel index
-        shell: python
+        shell: python3
         run: |
           import hashlib
           import pathlib
