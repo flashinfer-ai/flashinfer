@@ -557,8 +557,8 @@ cudaError_t PrefillSplitQOKVIndptr(
       kv_last_page_len_h(batch_size);
   bool need_stream_sync = false;
   if (is_device_ptr((void*)qo_indptr)) {
-    cudaMemcpyAsync(qo_indptr_h.data(), qo_indptr, sizeof(IdType) * (batch_size + 1),
-                    cudaMemcpyDeviceToHost, stream);
+    FLASHINFER_CUDA_CALL(cudaMemcpyAsync(qo_indptr_h.data(), qo_indptr, sizeof(IdType) * (batch_size + 1),
+                    cudaMemcpyDeviceToHost, stream));
     need_stream_sync = true;
   } else {
     qo_indptr_h.assign(qo_indptr, qo_indptr + batch_size + 1);
@@ -566,8 +566,8 @@ cudaError_t PrefillSplitQOKVIndptr(
   total_num_rows = qo_indptr_h.back();
 
   if (is_device_ptr((void*)kv_indptr)) {
-    cudaMemcpyAsync(kv_indptr_h.data(), kv_indptr, sizeof(IdType) * (batch_size + 1),
-                    cudaMemcpyDeviceToHost, stream);
+    FLASHINFER_CUDA_CALL(cudaMemcpyAsync(kv_indptr_h.data(), kv_indptr, sizeof(IdType) * (batch_size + 1),
+                    cudaMemcpyDeviceToHost, stream));
     need_stream_sync = true;
   } else {
     kv_indptr_h.assign(kv_indptr, kv_indptr + batch_size + 1);
@@ -576,15 +576,15 @@ cudaError_t PrefillSplitQOKVIndptr(
   bool has_kv_last_page_len = kv_last_page_len != nullptr;
   if (has_kv_last_page_len) {
     if (is_device_ptr((void*)kv_last_page_len)) {
-      cudaMemcpyAsync(kv_last_page_len_h.data(), kv_last_page_len, sizeof(IdType) * batch_size,
-                      cudaMemcpyDeviceToHost, stream);
+      FLASHINFER_CUDA_CALL(cudaMemcpyAsync(kv_last_page_len_h.data(), kv_last_page_len, sizeof(IdType) * batch_size,
+                      cudaMemcpyDeviceToHost, stream));
       need_stream_sync = true;
     } else {
       kv_last_page_len_h.assign(kv_last_page_len, kv_last_page_len + batch_size);
     }
   }
   if (need_stream_sync) {
-    cudaStreamSynchronize(stream);
+    FLASHINFER_CUDA_CALL(cudaStreamSynchronize(stream));
   }
 
   // step 0: get the number of SMs
