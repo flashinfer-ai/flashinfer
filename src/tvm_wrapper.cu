@@ -272,8 +272,8 @@ void _FlashInferAttentionPrefillWithPagedKVCache(int64_t handler_id, DLTensor* q
 
 void _FlashInferAttentionPrefillWithPagedKVCacheBeginForward(
     int64_t handler_idx, DLTensor* workspace_buffer, DLTensor* qo_indptr, DLTensor* kv_indptr,
-    DLTensor* kv_last_page_len, int64_t batch_size, int64_t num_qo_heads, int64_t num_kv_heads,
-    int64_t head_dim, int64_t page_size, TVMStreamHandle copy_stream) {
+    int64_t batch_size, int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim,
+    int64_t page_size, TVMStreamHandle copy_stream) {
   CHECK_EQ(workspace_buffer->ndim, 1) << "The workspace buffer must be a 1-D tensor";
   size_t workspace_size_in_bytes = workspace_buffer->shape[0] * workspace_buffer->dtype.bits / 8;
   CHECK(handler_idx < max_num_handlers) << "The handler id must be less than " << max_num_handlers;
@@ -290,8 +290,6 @@ void _FlashInferAttentionPrefillWithPagedKVCacheBeginForward(
             static_cast<void*>(workspace_buffer->data), workspace_size_in_bytes,
             static_cast<dtype_idx*>(qo_indptr->data) + qo_indptr->byte_offset / sizeof(dtype_idx),
             static_cast<dtype_idx*>(kv_indptr->data) + kv_indptr->byte_offset / sizeof(dtype_idx),
-            static_cast<dtype_idx*>(kv_last_page_len->data) +
-                kv_last_page_len->byte_offset / sizeof(dtype_idx),
             batch_size, num_qo_heads, num_kv_heads, head_dim, page_size);
     if (status != cudaSuccess) {
       LOG(FATAL) << "FlashInfer prefill BeginForward error " << cudaGetErrorString(status);
@@ -568,7 +566,7 @@ void _FlashInferAttentionPrefillWithRaggedKVCacheBeginForward(
         static_cast<void*>(workspace_buffer->data), workspace_size_in_bytes,
         static_cast<dtype_idx*>(qo_indptr->data) + qo_indptr->byte_offset / sizeof(dtype_idx),
         static_cast<dtype_idx*>(kv_indptr->data) + kv_indptr->byte_offset / sizeof(dtype_idx),
-        /*kv_last_page_len=*/nullptr, batch_size, num_qo_heads, num_kv_heads, head_dim,
+        batch_size, num_qo_heads, num_kv_heads, head_dim,
         /*page_size=*/1);
     if (status != cudaSuccess) {
       LOG(FATAL) << "FlashInfer PrefillWithRaggedKVCache BeginForward error "
