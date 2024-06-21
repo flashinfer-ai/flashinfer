@@ -2,6 +2,9 @@
 
 ## [0.0.6](https://github.com/flashinfer-ai/flashinfer/compare/v0.0.5...v0.0.6) (2024-06-21)
 
+### Bugfix
+
+Fix some bug in v0.0.5 that might lead to crashes and instable performance.
 
 ### Performance Improvements
 
