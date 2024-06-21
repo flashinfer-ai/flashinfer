@@ -476,7 +476,7 @@ __device__ __forceinline__ void k_smem_inplace_apply_rotary(const uint32_t kv_id
         uint32_t fyi = warp_idx_x + j * num_warps_x;
         k_smem->ldmatrix_m8n8x4(k_smem_offset_r_first_half, k_frag_local[0]);
         uint32_t k_smem_offset_r_last_half =
-            k_smem->advance_offset_by_column<num_frags_y>(k_smem_offset_r_first_half, fyi);
+            k_smem->advance_offset_by_column<num_frags_y>(k_smem_offset_r_first_half, 0);
         k_smem->ldmatrix_m8n8x4(k_smem_offset_r_last_half, k_frag_local[1]);
         k_frag_apply_llama_rope<DTypeIn>((DTypeIn*)k_frag_local[0], (DTypeIn*)k_frag_local[1],
                                          rope_freq[fyi], kv_idx);
