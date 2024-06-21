@@ -35,6 +35,7 @@
 #include "cascade.cuh"
 #include "logits_post_hook.cuh"
 #include "mask.cuh"
+#include "warp_layout.cuh"
 
 namespace flashinfer {
 
@@ -1750,7 +1751,19 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
   const uint32_t group_size = num_qo_heads / num_kv_heads;
   const uint_fastdiv group_size_fastdiv(group_size);
   constexpr uint32_t num_frags_y = HEAD_DIM / 16;
-  DISPATCH_NUM_FRAGS_X((qo_len * group_size > 64 && HEAD_DIM < 256 ? 2 : 1), num_frags_x, {
+  WarpLayout warp_layout;
+  if (qo_len * group_size > 64 && HEAD_DIM < 256) {
+    warp_layout = WarpLayout::k4x1x2;
+  } else {
+    if (qo_len * group_size > 16) {
+      warp_layout = WarpLayout::k4x1x1;
+    } else {
+      warp_layout = WarpLayout::k1x4x1;
+    }
+  }
+
+  DISPATCH_WARP_LAYOUT(warp_layout, WARP_LAYOUT, {
+    constexpr uint32_t num_frags_x = get_num_frags_x<WARP_LAYOUT>();
     using DTypeQKAccum =
         typename std::conditional<ALLOW_FP16_QK_REDUCTION && std::is_same<DTypeIn, half>::value,
                                   half, float>::type;
@@ -1763,8 +1776,8 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
     // we expect each sm execute two threadblocks
     const int max_smem_per_threadblock = max_smem_per_sm / 2;
 
-    constexpr uint32_t num_warps_x = 1;
-    constexpr uint32_t num_warps_z = 4;
+    constexpr uint32_t num_warps_x = get_num_warps_x<WARP_LAYOUT>();
+    constexpr uint32_t num_warps_z = get_num_warps_z<WARP_LAYOUT>();
     const uint32_t max_num_frags_z_reg =
         (HEAD_DIM == 128 && num_frags_x == 2 && pos_encoding_mode == PosEncodingMode::kRoPELlama &&
          !ALLOW_FP16_QK_REDUCTION)
@@ -1868,7 +1881,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
   return cudaSuccess;
 }
 
-template <uint32_t num_frags_x, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK,
+template <WarpLayout WARP_LAYOUT, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK,
           QKVLayout KV_LAYOUT, PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION,
           MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
@@ -1881,8 +1894,9 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
     const float rope_scale, const float rope_theta, cudaStream_t stream = nullptr) {
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
-  constexpr uint32_t num_warps_x = 1;
-  constexpr uint32_t num_warps_z = 4;
+  constexpr uint32_t num_frags_x = get_num_frags_x<WARP_LAYOUT>();
+  constexpr uint32_t num_warps_x = get_num_warps_x<WARP_LAYOUT>();
+  constexpr uint32_t num_warps_z = get_num_warps_z<WARP_LAYOUT>();
   const uint32_t group_size = num_qo_heads / num_kv_heads;
   const uint_fastdiv group_size_fastdiv(group_size);
 
@@ -1994,7 +2008,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
   return cudaSuccess;
 }
 
-template <PageStorage page_storage, uint32_t num_frags_x, uint32_t HEAD_DIM,
+template <PageStorage page_storage, WarpLayout WARP_LAYOUT, uint32_t HEAD_DIM,
           LogitsPostHook LOGITS_POST_HOOK, QKVLayout kv_layout, PosEncodingMode pos_encoding_mode,
           bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut,
           typename IdType>
@@ -2008,8 +2022,9 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     float rope_scale, float rope_theta, cudaStream_t stream) {
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
-  constexpr uint32_t num_warps_x = 1;
-  constexpr uint32_t num_warps_z = 4;
+  constexpr uint32_t num_frags_x = get_num_frags_x<WARP_LAYOUT>();
+  constexpr uint32_t num_warps_x = get_num_warps_x<WARP_LAYOUT>();
+  constexpr uint32_t num_warps_z = get_num_warps_z<WARP_LAYOUT>();
   const uint32_t num_kv_heads = paged_kv.num_heads;
   const uint32_t group_size = num_qo_heads / num_kv_heads;
   const uint_fastdiv group_size_fastdiv(group_size);

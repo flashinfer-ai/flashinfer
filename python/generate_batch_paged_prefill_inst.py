@@ -21,6 +21,7 @@ from literal_map import (
     mask_mode_literal,
     kv_layout_literal,
     pos_encoding_mode_literal,
+    warp_layout_literal,
     dtype_literal,
     idtype_literal,
     logits_hook_literal,
@@ -39,10 +40,10 @@ def get_cu_file_str(
     dtype_out,
     idtype,
 ):
-    num_frags_x_choices = [1, 2]
+    warp_layout_choice = [0, 1, 2]
     insts = "\n".join(
         [
-            """template cudaError_t BatchPrefillWithPagedKVCacheDispatched<page_storage, {num_frags_x}, {head_dim}, {logits_hook}, {kv_layout}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {dtype_in}, {dtype_out}, {idtype}>(
+            """template cudaError_t BatchPrefillWithPagedKVCacheDispatched<page_storage, {warp_layout}, {head_dim}, {logits_hook}, {kv_layout}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {dtype_in}, {dtype_out}, {idtype}>(
     {dtype_in}* q, {idtype}* request_indices, {idtype}* q_tile_indices, {idtype}* kv_tile_indices,
     {idtype}* q_indptr, {idtype}* q_offset,
     paged_kv_t<page_storage, {kv_layout}, {dtype_in}, {idtype}> paged_kv, uint8_t* custom_mask,
@@ -53,7 +54,7 @@ def get_cu_file_str(
     """.format(
                 logits_hook=logits_hook_literal[int(logits_hook)],
                 kv_layout=kv_layout_literal[int(kv_layout)],
-                num_frags_x=num_frags_x,
+                warp_layout=warp_layout_literal[warp_layout],
                 head_dim=head_dim,
                 pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
                 allow_fp16_qk_reduction=allow_fp16_qk_reduction,
@@ -62,7 +63,7 @@ def get_cu_file_str(
                 dtype_out=dtype_literal[dtype_out],
                 idtype=idtype_literal[idtype],
             )
-            for num_frags_x in num_frags_x_choices
+            for warp_layout in warp_layout_choice
         ]
     )
 

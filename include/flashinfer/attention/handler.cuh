@@ -29,6 +29,7 @@
 #include "../pos_enc.cuh"
 #include "../utils.cuh"
 #include "logits_post_hook.cuh"
+#include "warp_layout.cuh"
 
 namespace flashinfer {
 
@@ -535,10 +536,10 @@ class BatchDecodeHandler {
   cudaStream_t stream_;
 };
 
-template <uint32_t num_warps, typename IdType>
+template <typename IdType>
 cudaError_t PrefillSplitQOKVIndptr(
     bool& split_kv, uint32_t& split_max_batch_size, uint32_t& total_num_tiles_q,
-    uint32_t& new_batch_size, uint32_t& num_frags_x, uint32_t& kv_chunk_size,
+    uint32_t& new_batch_size, WarpLayout& warp_layout, uint32_t& kv_chunk_size,
     uint32_t& total_num_rows, std::vector<IdType>& request_indices,
     std::vector<IdType>& qo_tile_indices, std::vector<IdType>& kv_tile_indices,
     std::vector<IdType>& merge_indptr, std::vector<IdType>& o_indptr, IdType* qo_indptr,
@@ -608,9 +609,16 @@ cudaError_t PrefillSplitQOKVIndptr(
     sum_packed_qo_len += packed_qo_len_arr[i];
   }
   int64_t avg_packed_qo_len = sum_packed_qo_len / batch_size;
-  const bool avg_qo_len_greater_than_64 = avg_packed_qo_len > 64;
-  num_frags_x = (head_dim < 256 && avg_qo_len_greater_than_64) ? 2 : 1;
-  const uint32_t qo_chunk_size = num_frags_x * (num_warps * 16);
+  if (avg_packed_qo_len > 64 && head_dim < 256) {
+    warp_layout = WarpLayout::k4x1x2;  // (num_warps_x = 4, num_warps_z = 1, num_frags_x = 2)
+  } else {
+    if (avg_packed_qo_len > 16) {
+      warp_layout = WarpLayout::k4x1x1;  // (num_warps_x = 4, num_warps_z = 1, num_frags_x = 1)
+    } else {
+      warp_layout = WarpLayout::k1x4x1;  // (num_warps_x = 1, num_warps_z = 4, num_frags_x = 1)
+    }
+  }
+  const uint32_t qo_chunk_size = get_num_rows_per_cta(warp_layout);
 
   // step 2: determine kv_chunk_size
   std::tie(split_kv, kv_chunk_size, new_batch_size) =
@@ -688,7 +696,7 @@ class BatchPrefillHandler {
 
   uint32_t GetPaddedBatchSize() const { return padded_batch_size_; }
 
-  uint32_t GetNumFragsX() const { return num_frags_x_; }
+  WarpLayout GetWarpLayout() const { return warp_layout_; }
 
   uint32_t GetTotalNumRows() const { return total_num_rows_; }
 
@@ -714,13 +722,12 @@ class BatchPrefillHandler {
     uint32_t split_max_batch_size, new_batch_size, total_num_tiles_q, kv_chunk_size;
     std::vector<IdType> request_indices_vec, qo_tile_indices_vec, kv_tile_indices_vec,
         merge_indptr_vec, o_indptr_vec;
-    constexpr uint32_t num_warps = 1;
-    FLASHINFER_CUDA_CALL(PrefillSplitQOKVIndptr<num_warps>(
-        split_kv, split_max_batch_size, total_num_tiles_q, new_batch_size, num_frags_x_,
+    FLASHINFER_CUDA_CALL(PrefillSplitQOKVIndptr(
+        split_kv, split_max_batch_size, total_num_tiles_q, new_batch_size, warp_layout_,
         kv_chunk_size, total_num_rows_, request_indices_vec, qo_tile_indices_vec,
         kv_tile_indices_vec, merge_indptr_vec, o_indptr_vec, qo_indptr, kv_indptr, kv_last_page_len,
         batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, stream_));
-    const uint32_t qo_tile_size = num_frags_x_ * (16 * num_warps);
+    const uint32_t qo_tile_size = get_num_rows_per_cta(warp_layout_);
 
     if (IsCUDAGraphEnabled()) {
       padded_batch_size_ = std::max(split_max_batch_size, total_num_tiles_q);
@@ -845,7 +852,7 @@ class BatchPrefillHandler {
     block_valid_mask_ = nullptr;
     total_num_rows_ = 0U;
     padded_batch_size_ = 0U;
-    num_frags_x_ = 0U;
+    warp_layout_ = WarpLayout::k4x1x2;
     return cudaSuccess;
   }
 
@@ -867,7 +874,7 @@ class BatchPrefillHandler {
         block_valid_mask_(nullptr),
         total_num_rows_(0U),
         padded_batch_size_(0U),
-        num_frags_x_(0U),
+        warp_layout_(WarpLayout::k4x1x2),
         forward_started_(false),
         enable_cuda_graph_(enable_cuda_graph),
         stream_(nullptr) {
@@ -891,7 +898,7 @@ class BatchPrefillHandler {
   bool* block_valid_mask_;
   uint32_t total_num_rows_;
   uint32_t padded_batch_size_;
-  uint32_t num_frags_x_;
+  WarpLayout warp_layout_;
   bool forward_started_;
   bool enable_cuda_graph_;
   cudaStream_t stream_;
