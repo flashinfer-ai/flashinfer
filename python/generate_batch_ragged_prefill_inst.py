@@ -39,7 +39,7 @@ def get_cu_file_str(
     dtype_out,
     idtype,
 ):
-    warp_layout_choice = [0, 1, 2]
+    warp_layout_choice = [0, 1]
     insts = "\n".join(
         [
             """template cudaError_t BatchPrefillWithRaggedKVCacheDispatched<{warp_layout}, {head_dim}, {logits_hook}, {kv_layout}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {dtype_in}, {dtype_out}, {idtype}>(
