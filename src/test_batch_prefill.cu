@@ -104,7 +104,7 @@ void _TestBatchPagedPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t n
 
     handler.BeginForward<T, int32_t>((void*)thrust::raw_pointer_cast(buffer.data()),
                                      workspace_size_in_bytes, q_indptr.data(), kv_indptr.data(),
-                                     kv_last_page_len.data(), batch_size, num_qo_heads,
+                                     batch_size, num_qo_heads,
                                      num_kv_heads, head_dim, page_size);
 
     for (uint32_t num_runs = 0; num_runs < 10; ++num_runs) {
@@ -192,7 +192,7 @@ void _TestBatchRaggedPrefillKernelCorrectness(size_t num_kv_heads, size_t num_qo
 
   handler.BeginForward<T, int32_t>((void*)thrust::raw_pointer_cast(buffer.data()),
                                    workspace_size_in_bytes, append_indptr.data(), kv_indptr.data(),
-                                   /*kv_last_page_len=*/nullptr, batch_size, num_qo_heads,
+                                   batch_size, num_qo_heads,
                                    num_kv_heads, head_dim, /*page_size=*/1);
 
   auto status = BatchPrefillWithRaggedKVCacheWrapper<T, T, int32_t>(
@@ -321,7 +321,7 @@ void _TestBatchPagedPrefillKernelShortContextCorrectness(size_t num_kv_heads, si
 
   handler.BeginForward<T, int32_t>((void*)thrust::raw_pointer_cast(buffer.data()),
                                    workspace_size_in_bytes, append_indptr.data(), kv_indptr.data(),
-                                   kv_last_page_len.data(), batch_size, num_qo_heads, num_kv_heads,
+                                   batch_size, num_qo_heads, num_kv_heads,
                                    head_dim, page_size);
 
   auto status =
@@ -418,7 +418,7 @@ void _TestBatchPagedPrefillKernelLongContextCorrectness(size_t num_kv_heads, siz
 
   handler.BeginForward<T, int32_t>(
       (void*)thrust::raw_pointer_cast(buffer.data()), workspace_size_in_bytes, append_indptr.data(),
-      kv_indptr.data(), kv_last_page_len.data(),
+      kv_indptr.data(),
       /*batch_size=*/1, num_qo_heads, num_kv_heads, head_dim, page_size);
 
   auto status =

@@ -248,7 +248,7 @@ void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
     thrust::device_vector<char> buffer(workspace_size_in_bytes);
     cascade_handler.BeginForward<T, int32_t>(
         (void*)thrust::raw_pointer_cast(buffer.data()), workspace_size_in_bytes, qo_indptr_h.data(),
-        kv_indptr_unique_h.data(), kv_last_page_len_unique_h.data(), batch_size, num_qo_heads,
+        kv_indptr_unique_h.data(), batch_size, num_qo_heads,
         num_kv_heads, head_dim, page_size);
     state.exec(nvbench::exec_tag::timer, [&](nvbench::launch& launch, auto& timer) {
       timer.start();
@@ -305,7 +305,7 @@ void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
     thrust::device_vector<char> buffer(workspace_size_in_bytes);
     baseline_handler.BeginForward<T, int32_t>(
         (void*)thrust::raw_pointer_cast(buffer.data()), workspace_size_in_bytes, qo_indptr_h.data(),
-        kv_indptr_combined_h.data(), kv_last_page_len_combined_h.data(), batch_size, num_qo_heads,
+        kv_indptr_combined_h.data(), batch_size, num_qo_heads,
         num_kv_heads, head_dim, page_size);
     state.exec(nvbench::exec_tag::timer, [&](nvbench::launch& launch, auto& timer) {
       timer.start();

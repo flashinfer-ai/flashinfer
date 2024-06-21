@@ -92,7 +92,7 @@ inline std::tuple<bool, uint32_t, uint32_t> PrefillBinarySearchKVChunkSize(
     const uint32_t qo_chunk_size, const uint32_t min_kv_chunk_size = 1) {
   int64_t low = min_kv_chunk_size, high = 0;
   int64_t batch_size = packed_qo_len_arr.size();
-  int64_t max_kv_len;
+  int64_t max_kv_len = 0;
   for (const int64_t& kv_len : kv_len_arr) {
     max_kv_len = std::max(max_kv_len, kv_len);
   }
@@ -174,9 +174,9 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     new_batch_size = batch_size;
   } else {
     // compute max_num_pages_per_batch and new_batch_size
-    std::vector<IdType> page_indptr_h(batch_size + 1), num_pages(batch_size);
+    std::vector<IdType> num_pages(batch_size);
     for (uint32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-      num_pages[batch_idx] = page_indptr_h[batch_idx + 1] - page_indptr_h[batch_idx];
+      num_pages[batch_idx] = kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx];
     }
     std::tie(max_num_pages_per_batch, new_batch_size) =
         PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(max_grid_size, num_kv_heads, num_pages,
@@ -523,8 +523,8 @@ cudaError_t PrefillSplitQOKVIndptr(
     uint32_t& total_num_rows, std::vector<IdType>& request_indices,
     std::vector<IdType>& qo_tile_indices, std::vector<IdType>& kv_tile_indices,
     std::vector<IdType>& merge_indptr, std::vector<IdType>& o_indptr, IdType* qo_indptr_h,
-    IdType* kv_indptr_h, IdType* kv_last_page_len_h, uint32_t batch_size, uint32_t num_qo_heads,
-    uint32_t num_kv_heads, uint32_t head_dim, uint32_t page_size, cudaStream_t stream = nullptr) {
+    IdType* kv_indptr_h, uint32_t batch_size, uint32_t num_qo_heads,
+    uint32_t num_kv_heads, uint32_t head_dim, uint32_t page_size) {
   request_indices.clear();
   qo_tile_indices.clear();
   kv_tile_indices.clear();
@@ -535,8 +535,6 @@ cudaError_t PrefillSplitQOKVIndptr(
 
   const uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
   total_num_rows = qo_indptr_h[batch_size];
-
-  bool has_kv_last_page_len = kv_last_page_len_h != nullptr;
 
   // step 0: get the number of SMs
   int num_sm = 0;
@@ -656,7 +654,7 @@ class BatchPrefillHandler {
 
   template <typename DTypeOut, typename IdType>
   cudaError_t BeginForward(void* buffer, size_t workspace_size_in_bytes, IdType* qo_indptr_h,
-                           IdType* kv_indptr_h, IdType* kv_last_page_len_h, uint32_t batch_size,
+                           IdType* kv_indptr_h, uint32_t batch_size,
                            uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
                            uint32_t page_size) {
     if (num_qo_heads % num_kv_heads != 0) {
@@ -673,7 +671,7 @@ class BatchPrefillHandler {
         split_kv, split_max_batch_size, total_num_tiles_q, new_batch_size, warp_layout_,
         kv_chunk_size, total_num_rows_, request_indices_vec, qo_tile_indices_vec,
         kv_tile_indices_vec, merge_indptr_vec, o_indptr_vec, qo_indptr_h, kv_indptr_h,
-        kv_last_page_len_h, batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, stream_));
+        batch_size, num_qo_heads, num_kv_heads, head_dim, page_size));
     const uint32_t qo_tile_size = get_num_rows_per_cta(warp_layout_);
 
     if (IsCUDAGraphEnabled()) {

@@ -151,7 +151,7 @@ void bench_flashinfer_batch_decode_with_prefill(nvbench::state& state) {
 
   handler.BeginForward<T, int32_t>((void*)thrust::raw_pointer_cast(buffer.data()),
                                    workspace_size_in_bytes, qo_indptr_h.data(),
-                                   kv_indptr_host.data(), kv_last_page_len_host.data(), batch_size,
+                                   kv_indptr_host.data(), batch_size,
                                    num_qo_heads, num_kv_heads, head_dim, page_size);
 
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
