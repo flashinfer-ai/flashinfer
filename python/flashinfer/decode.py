@@ -730,7 +730,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._workspace_buffer,
                 self._qo_indptr_buf,
                 indptr,
-                last_page_len,
                 batch_size,
                 num_qo_heads,
                 num_kv_heads,
