@@ -146,6 +146,8 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
   size_t workspace_size_in_bytes = workspace_buffer.size(0) * workspace_buffer.element_size();
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
   handler_->SetCUDAStream(torch_current_stream);
+  indptr = indptr.to(torch::kCPU);
+  last_page_len = last_page_len.to(torch::kCPU);
 
   const LogitsPostHook logits_post_hook =
       logits_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
