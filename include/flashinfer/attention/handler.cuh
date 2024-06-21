@@ -714,7 +714,7 @@ class BatchPrefillHandler {
     uint32_t split_max_batch_size, new_batch_size, total_num_tiles_q, kv_chunk_size;
     std::vector<IdType> request_indices_vec, qo_tile_indices_vec, kv_tile_indices_vec,
         merge_indptr_vec, o_indptr_vec;
-    constexpr uint32_t num_warps = 4;
+    constexpr uint32_t num_warps = 1;
     FLASHINFER_CUDA_CALL(PrefillSplitQOKVIndptr<num_warps>(
         split_kv, split_max_batch_size, total_num_tiles_q, new_batch_size, num_frags_x_,
         kv_chunk_size, total_num_rows_, request_indices_vec, qo_tile_indices_vec,
