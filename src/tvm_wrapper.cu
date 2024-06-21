@@ -272,8 +272,8 @@ void _FlashInferAttentionPrefillWithPagedKVCache(int64_t handler_id, DLTensor* q
 
 void _FlashInferAttentionPrefillWithPagedKVCacheBeginForward(
     int64_t handler_idx, DLTensor* workspace_buffer, DLTensor* qo_indptr, DLTensor* kv_indptr,
-    int64_t batch_size, int64_t num_qo_heads, int64_t num_kv_heads,
-    int64_t head_dim, int64_t page_size, TVMStreamHandle copy_stream) {
+    int64_t batch_size, int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim,
+    int64_t page_size, TVMStreamHandle copy_stream) {
   CHECK_EQ(workspace_buffer->ndim, 1) << "The workspace buffer must be a 1-D tensor";
   size_t workspace_size_in_bytes = workspace_buffer->shape[0] * workspace_buffer->dtype.bits / 8;
   CHECK(handler_idx < max_num_handlers) << "The handler id must be less than " << max_num_handlers;

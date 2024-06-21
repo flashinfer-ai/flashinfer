@@ -517,14 +517,16 @@ class BatchDecodeHandler {
 };
 
 template <typename IdType>
-cudaError_t PrefillSplitQOKVIndptr(
-    bool& split_kv, uint32_t& split_max_batch_size, uint32_t& total_num_tiles_q,
-    uint32_t& new_batch_size, WarpLayout& warp_layout, uint32_t& kv_chunk_size,
-    uint32_t& total_num_rows, std::vector<IdType>& request_indices,
-    std::vector<IdType>& qo_tile_indices, std::vector<IdType>& kv_tile_indices,
-    std::vector<IdType>& merge_indptr, std::vector<IdType>& o_indptr, IdType* qo_indptr_h,
-    IdType* kv_indptr_h, uint32_t batch_size, uint32_t num_qo_heads,
-    uint32_t num_kv_heads, uint32_t head_dim, uint32_t page_size) {
+cudaError_t PrefillSplitQOKVIndptr(bool& split_kv, uint32_t& split_max_batch_size,
+                                   uint32_t& total_num_tiles_q, uint32_t& new_batch_size,
+                                   WarpLayout& warp_layout, uint32_t& kv_chunk_size,
+                                   uint32_t& total_num_rows, std::vector<IdType>& request_indices,
+                                   std::vector<IdType>& qo_tile_indices,
+                                   std::vector<IdType>& kv_tile_indices,
+                                   std::vector<IdType>& merge_indptr, std::vector<IdType>& o_indptr,
+                                   IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t batch_size,
+                                   uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
+                                   uint32_t page_size) {
   request_indices.clear();
   qo_tile_indices.clear();
   kv_tile_indices.clear();
@@ -654,9 +656,8 @@ class BatchPrefillHandler {
 
   template <typename DTypeOut, typename IdType>
   cudaError_t BeginForward(void* buffer, size_t workspace_size_in_bytes, IdType* qo_indptr_h,
-                           IdType* kv_indptr_h, uint32_t batch_size,
-                           uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
-                           uint32_t page_size) {
+                           IdType* kv_indptr_h, uint32_t batch_size, uint32_t num_qo_heads,
+                           uint32_t num_kv_heads, uint32_t head_dim, uint32_t page_size) {
     if (num_qo_heads % num_kv_heads != 0) {
       std::ostringstream err_msg;
       err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -670,8 +671,8 @@ class BatchPrefillHandler {
     FLASHINFER_CUDA_CALL(PrefillSplitQOKVIndptr(
         split_kv, split_max_batch_size, total_num_tiles_q, new_batch_size, warp_layout_,
         kv_chunk_size, total_num_rows_, request_indices_vec, qo_tile_indices_vec,
-        kv_tile_indices_vec, merge_indptr_vec, o_indptr_vec, qo_indptr_h, kv_indptr_h,
-        batch_size, num_qo_heads, num_kv_heads, head_dim, page_size));
+        kv_tile_indices_vec, merge_indptr_vec, o_indptr_vec, qo_indptr_h, kv_indptr_h, batch_size,
+        num_qo_heads, num_kv_heads, head_dim, page_size));
     const uint32_t qo_tile_size = get_num_rows_per_cta(warp_layout_);
 
     if (IsCUDAGraphEnabled()) {
