@@ -153,7 +153,7 @@ def single_decode_with_kv_cache(
     if rope_theta is None:
         rope_theta = 1e4
     num_qo_heads = q.shape[0]
-    num_kv_heads = k.shape[1]
+    num_kv_heads = k.shape[1] if kv_layout == "NHD" else k.shape[0]
     if not _grouped_size_compiled_for_decode_kernels(num_qo_heads, num_kv_heads):
         raise RuntimeError(
             "Please set `use_tensor_cores=True` in single_decode_with_kv_cache for group size {}.".format(

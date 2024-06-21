@@ -174,7 +174,7 @@ def test_batch_decode_tensor_cores_cuda_graph(
     wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
         workspace_buffer,
         kv_layout,
-        enable_cuda_graph=True,
+        use_cuda_graph=True,
         paged_kv_indptr_buffer=kv_indptr,
         paged_kv_indices_buffer=kv_indices,
         paged_kv_last_page_len_buffer=kv_last_page_len,
@@ -212,7 +212,7 @@ def test_batch_decode_tensor_cores_cuda_graph(
     wrapper_tensor_cores = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
         workspace_buffer,
         kv_layout,
-        enable_cuda_graph=True,
+        use_cuda_graph=True,
         use_tensor_cores=True,
         paged_kv_indptr_buffer=kv_indptr,
         paged_kv_indices_buffer=kv_indices,
