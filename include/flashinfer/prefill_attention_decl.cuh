@@ -21,6 +21,7 @@
 #include "attention/handler.cuh"
 #include "attention/logits_post_hook.cuh"
 #include "attention/mask.cuh"
+#include "flashinfer/attention/warp_layout.cuh"
 #include "layout.cuh"
 #include "page.cuh"
 #include "pos_enc.cuh"
@@ -38,7 +39,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(DTypeIn* q, DTypeIn* k, DTypeIn* 
                                                uint32_t kv_len, float sm_scale, float rope_scale,
                                                float rope_theta, cudaStream_t stream);
 
-template <uint32_t num_frags_x, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK,
+template <WarpLayout WARP_LAYOUT, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK,
           QKVLayout KV_LAYOUT, PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION,
           MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
@@ -50,7 +51,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
     const uint32_t padded_batch_size, const uint32_t num_kv_heads, const float sm_scale,
     const float rope_scale, const float rope_theta, cudaStream_t stream = nullptr);
 
-template <PageStorage page_storage, uint32_t num_frags_x, uint32_t HEAD_DIM,
+template <PageStorage page_storage, WarpLayout WARP_LAYOUT, uint32_t HEAD_DIM,
           LogitsPostHook LOGITS_POST_HOOK, QKVLayout kv_layout, PosEncodingMode pos_encoding_mode,
           bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut,
           typename IdType>
@@ -76,7 +77,7 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
   IdType *request_indices = nullptr, *qo_tile_indices = nullptr, *kv_tile_indices = nullptr,
          *o_indptr = nullptr, *merge_indptr = nullptr, *kv_chunk_size_ptr = nullptr;
   bool* block_valid_mask = nullptr;
-  uint32_t num_frags_x = 0U;
+  WarpLayout warp_layout;
   uint32_t padded_batch_size = 0U;
   uint32_t total_num_rows = 0U;
   if (handler->IsForwardStarted()) {
@@ -89,7 +90,7 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
     o_indptr = handler->GetOIndptr<IdType>();
     merge_indptr = handler->GetMergeIndptr<IdType>();
     kv_chunk_size_ptr = handler->GetKVChunkSizePtr<IdType>();
-    num_frags_x = handler->GetNumFragsX();
+    warp_layout = handler->GetWarpLayout();
     padded_batch_size = handler->GetPaddedBatchSize();
     total_num_rows = handler->GetTotalNumRows();
   } else {
@@ -99,9 +100,9 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
     throw std::runtime_error(err_msg.str());
   }
 
-  DISPATCH_NUM_FRAGS_X(num_frags_x, NUM_FRAGS_X, {
+  DISPATCH_WARP_LAYOUT(warp_layout, WARP_LAYOUT, {
     return BatchPrefillWithPagedKVCacheDispatched<
-        PAGE_STORAGE, NUM_FRAGS_X, HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT, POS_ENCODING_MODE,
+        PAGE_STORAGE, WARP_LAYOUT, HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT, POS_ENCODING_MODE,
         ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeOut, IdType>(
         q, request_indices, qo_tile_indices, kv_tile_indices, q_indptr, q_offset, paged_kv,
         custom_mask, qk_indptr, o_indptr, o, tmp_v, tmp_s, lse, merge_indptr, block_valid_mask,
@@ -125,7 +126,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
   IdType *request_indices = nullptr, *qo_tile_indices = nullptr, *kv_tile_indices = nullptr,
          *o_indptr = nullptr, *merge_indptr = nullptr, *kv_chunk_size_ptr = nullptr;
   bool* block_valid_mask = nullptr;
-  uint32_t num_frags_x = 0U;
+  WarpLayout warp_layout;
   uint32_t padded_batch_size = 0U;
   uint32_t total_num_rows = 0U;
   if (handler->IsForwardStarted()) {
@@ -138,7 +139,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
     o_indptr = handler->GetOIndptr<IdType>();
     merge_indptr = handler->GetMergeIndptr<IdType>();
     kv_chunk_size_ptr = handler->GetKVChunkSizePtr<IdType>();
-    num_frags_x = handler->GetNumFragsX();
+    warp_layout = handler->GetWarpLayout();
     padded_batch_size = handler->GetPaddedBatchSize();
     total_num_rows = handler->GetTotalNumRows();
   } else {
@@ -148,9 +149,9 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
     throw std::runtime_error(err_msg.str());
   }
 
-  DISPATCH_NUM_FRAGS_X(num_frags_x, NUM_FRAGS_X, {
+  DISPATCH_WARP_LAYOUT(warp_layout, WARP_LAYOUT, {
     return BatchPrefillWithRaggedKVCacheDispatched<
-        NUM_FRAGS_X, HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT, POS_ENCODING_MODE,
+        WARP_LAYOUT, HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT, POS_ENCODING_MODE,
         ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeOut, IdType>(
         q, request_indices, qo_tile_indices, kv_tile_indices, q_indptr, k, v, kv_indptr,
         custom_mask, qk_indptr, q_offset, k_rope_pos_offset, o_indptr, o, tmp_v, tmp_s, lse,

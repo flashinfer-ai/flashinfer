@@ -31,10 +31,10 @@ void BatchPrefillWithPagedKVCachePyTorchWrapper::BeginForward(
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
   CHECK_DIM(1, qo_indptr);
   CHECK_DIM(1, workspace_buffer);
+  qo_indptr = qo_indptr.to(torch::kCPU).to(torch::kInt32);
+  paged_kv_indptr = paged_kv_indptr.to(torch::kCPU).to(torch::kInt32);
+  paged_kv_last_page_len = paged_kv_last_page_len.to(torch::kCPU).to(torch::kInt32);
 
-  qo_indptr = qo_indptr.to(torch::kInt32);
-  paged_kv_indptr = paged_kv_indptr.to(torch::kInt32);
-  paged_kv_last_page_len = paged_kv_last_page_len.to(torch::kInt32);
   size_t workspace_size_in_bytes = workspace_buffer.size(0) * workspace_buffer.element_size();
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
   handler_->SetCUDAStream(torch_current_stream);
@@ -275,8 +275,8 @@ void BatchPrefillWithRaggedKVCachePyTorchWrapper::BeginForward(
   CHECK_DIM(1, qo_indptr);
   CHECK_DIM(1, workspace_buffer);
 
-  qo_indptr = qo_indptr.to(torch::kInt32);
-  kv_indptr = kv_indptr.to(torch::kInt32);
+  qo_indptr = qo_indptr.to(torch::kCPU).to(torch::kInt32);
+  kv_indptr = kv_indptr.to(torch::kCPU).to(torch::kInt32);
   size_t workspace_size_in_bytes = workspace_buffer.size(0) * workspace_buffer.element_size();
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
   handler_->SetCUDAStream(torch_current_stream);

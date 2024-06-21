@@ -31,7 +31,7 @@ import flashinfer
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
-@pytest.mark.parametrize("enable_cuda_graph", [False, True])
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
 def test_batch_prefill_with_paged_kv_cache(
     batch_size,
     kv_len,
@@ -43,7 +43,7 @@ def test_batch_prefill_with_paged_kv_cache(
     causal,
     kv_layout,
     pos_encoding_mode,
-    enable_cuda_graph,
+    use_cuda_graph,
 ):
     q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
     q_indptr_cpu = torch.arange(0, batch_size + 1).int() * qo_len
@@ -63,7 +63,7 @@ def test_batch_prefill_with_paged_kv_cache(
     )
 
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
-    if not enable_cuda_graph:
+    if not use_cuda_graph:
         q_indptr_gpu = q_indptr_cpu.to(0)
         kv_indptr_gpu = kv_indptr_cpu.to(0)
         kv_indices_gpu = kv_indices_cpu.to(0)
@@ -92,7 +92,7 @@ def test_batch_prefill_with_paged_kv_cache(
         wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer,
             kv_layout,
-            enable_cuda_graph=True,
+            use_cuda_graph=True,
             qo_indptr_buf=q_indptr_buffer,
             paged_kv_indptr_buf=kv_indptr_buffer,
             paged_kv_indices_buf=kv_indices_buffer,

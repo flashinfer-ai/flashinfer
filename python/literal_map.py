@@ -25,6 +25,12 @@ logits_hook_literal = {
     1: "LogitsPostHook::kCap30",
 }
 
+warp_layout_literal = {
+    0: "WarpLayout::k4x1x2",
+    1: "WarpLayout::k4x1x1",
+    2: "WarpLayout::k1x4x1",
+}
+
 kv_layout_literal = {
     0: "QKVLayout::kNHD",
     1: "QKVLayout::kHND",
