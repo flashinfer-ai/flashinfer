@@ -1129,7 +1129,8 @@ __global__ void SinglePrefillWithKVCacheKernel(
       if (iter >= mask_iteration) {
         mask_s<partition_kv, mask_mode, num_frags_x, num_frags_y, num_frags_z>(
             qo_packed_idx_base,
-            (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) * num_frags_z * 16,
+            chunk_start + (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) *
+                              num_frags_z * 16,
             qo_len, kv_len, chunk_end, group_size, nullptr, s_frag);
       }
     }
