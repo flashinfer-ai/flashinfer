@@ -566,7 +566,7 @@ cudaError_t PrefillSplitQOKVIndptr(bool& split_kv, uint32_t& split_max_batch_siz
   // step 2: determine kv_chunk_size
   std::tie(split_kv, kv_chunk_size, new_batch_size) =
       PrefillBinarySearchKVChunkSize(max_grid_size, num_kv_heads, packed_qo_len_arr, kv_len_arr,
-                                     qo_chunk_size, /*min_kv_chunk_size=*/(512 / page_size));
+                                     qo_chunk_size, /*min_kv_chunk_size=*/(128 / page_size));
 
   // step 3: split qo_indptr and kv_indptr
   total_num_tiles_q = 0;
