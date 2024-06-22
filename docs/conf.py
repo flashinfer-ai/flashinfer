@@ -18,8 +18,8 @@ project = "FlashInfer"
 author = "FlashInfer Contributors"
 copyright = "2023-2024, {}".format(author)
 
-version = "0.0.5"
-release = "0.0.5"
+version = "0.0.6"
+release = "0.0.6"
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
