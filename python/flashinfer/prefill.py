@@ -484,7 +484,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
     ...         torch.full((qo_len[i], kv_len[i]), True, device="cuda:0"),
     ...         diagonal=(kv_len[i] - qo_len[i]),
     ...     )
-    ...     mask_arr.append(mask_i)
+    ...     mask_arr.append(mask_i.flatten())
     ...
     >>> mask = torch.cat(mask_arr, dim=0)
     >>> prefill_wrapper.begin_forward(
