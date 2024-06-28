@@ -1505,7 +1505,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             q = q.to(torch.float16)
             k = k.to(torch.float16)
             v = v.to(torch.float16)
-        if self._custom_mask is None:
+        if self._custom_mask_buf is None:
             return self._wrapper.forward(
                 q,
                 self._qo_indptr_buf,
