@@ -76,7 +76,7 @@ __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage
                                            const vec_t<float, vec_size>& freq, uint32_t kv_idx_base,
                                            uint32_t iter_base, uint32_t iter_bound,
                                            const int32_t q_offset, float alibi_slope, float* s,
-                                           state_t<vec_size>& st) {
+                                           state_t<vec_size>& st, const float logits_soft_cap) {
   uint32_t tx = threadIdx.x, tz = threadIdx.z;
   float m_prev = st.m;
 #pragma unroll
@@ -100,7 +100,7 @@ __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage
       s[j] += math::shfl_xor_sync(s[j], offset);
     }
     s[j] = (iter_base + tz * tile_size + j < iter_bound) ? s[j] : -5e4;
-    s[j] = apply_logits_post_hook<logits_post_hook>(s[j]);
+    s[j] = apply_logits_post_hook<logits_post_hook>(s[j], logits_soft_cap);
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
       s[j] += alibi_slope * float(int(kv_idx_base + tz * tile_size + j) - q_offset);
     }
@@ -215,11 +215,13 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
                                               DTypeKV* __restrict__ v, DTypeOut* __restrict__ o,
                                               float* __restrict__ lse,
                                               tensor_info_t<kv_layout, bdx * vec_size> info,
-                                              float sm_scale, float rope_rcp_scale,
-                                              float rope_rcp_theta, uint32_t kv_chunk_size) {
+                                              float logits_soft_cap, float sm_scale,
+                                              float rope_rcp_scale, float rope_rcp_theta,
+                                              uint32_t kv_chunk_size) {
   auto block = cg::this_thread_block();
   auto grid = cg::this_grid();
-  sm_scale *= (logits_post_hook == LogitsPostHook::kNone ? math::log2e : 1.f / 30.f);
+  sm_scale *=
+      (logits_post_hook == LogitsPostHook::kNone ? math::log2e : math::ptx_rcp(logits_soft_cap));
 
   constexpr uint32_t head_dim = bdx * vec_size;
   uint32_t kv_head_idx = blockIdx.y;
@@ -305,7 +307,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
     compute_qk<logits_post_hook, pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
         k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, stage_idx, q_vec,
         freq, consumer_kv_idx_base, iter * bdy * tile_size_per_bdx * bdz, kv_chunk_size,
-        seq_len - 1, alibi_slope, s, st_local);
+        seq_len - 1, alibi_slope, s, st_local, logits_soft_cap);
     block.sync();
     // load k
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
@@ -364,10 +366,11 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(DTypeQ* __restrict__ q, DType
                                                    DTypeOut* __restrict__ o,
                                                    float* __restrict__ lse,
                                                    tensor_info_t<kv_layout, bdx * vec_size> info,
-                                                   float sm_scale, float rope_rcp_scale,
-                                                   float rope_rcp_theta) {
+                                                   float logits_soft_cap, float sm_scale,
+                                                   float rope_rcp_scale, float rope_rcp_theta) {
   auto block = cg::this_thread_block();
-  sm_scale *= (logits_post_hook == LogitsPostHook::kNone ? math::log2e : 1.f / 30.f);
+  sm_scale *=
+      (logits_post_hook == LogitsPostHook::kNone ? math::log2e : math::ptx_rcp(logits_soft_cap));
 
   constexpr uint32_t head_dim = bdx * vec_size;
   uint32_t kv_head_idx = blockIdx.y;
@@ -442,7 +445,8 @@ __global__ void BatchDecodeWithPaddedKVCacheKernel(DTypeQ* __restrict__ q, DType
     block.sync();
     compute_qk<logits_post_hook, pos_encoding_mode, vec_size, bdx, bdy>(
         k_smem + (stage_idx * bdz + tz) * bdy * head_dim, stage_idx, q_vec, freq,
-        consumer_kv_idx_base, iter * bdy * bdz, seq_len, seq_len - 1, alibi_slope, s, st_local);
+        consumer_kv_idx_base, iter * bdy * bdz, seq_len, seq_len - 1, alibi_slope, s, st_local,
+        logits_soft_cap);
     block.sync();
     // load k
     cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
@@ -523,10 +527,11 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
     DTypeQ* __restrict__ q, IdType* __restrict__ q_offset,
     paged_kv_t<page_storage, kv_layout, DTypeKV, IdType> paged_kv,
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* __restrict__ o,
-    float* __restrict__ lse, bool* __restrict__ block_valid_mask, float sm_scale,
-    float rope_rcp_scale, float rope_rcp_theta) {
+    float* __restrict__ lse, bool* __restrict__ block_valid_mask, float logits_soft_cap,
+    float sm_scale, float rope_rcp_scale, float rope_rcp_theta) {
   auto block = cg::this_thread_block();
-  sm_scale *= (logits_post_hook == LogitsPostHook::kNone ? math::log2e : 1.f / 30.f);
+  sm_scale *=
+      (logits_post_hook == LogitsPostHook::kNone ? math::log2e : math::ptx_rcp(logits_soft_cap));
 
   constexpr uint32_t head_dim = bdx * vec_size;
   const uint32_t batch_idx = blockIdx.x;
@@ -654,7 +659,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
         freq,
         (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[mapped_batch_idx]) +
             cur_chunk_start + iter * tile_size_per_bdx * bdy * bdz,
-        iter * tile_size_per_bdx * bdy * bdz, kv_chunk_len, q_offset_val, alibi_slope, s, st);
+        iter * tile_size_per_bdx * bdy * bdz, kv_chunk_len, q_offset_val, alibi_slope, s, st,
+        logits_soft_cap);
     block.sync();
 
 #pragma unroll
@@ -760,7 +766,8 @@ template <uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK, QKVLayout KV_LAYOU
 cudaError_t SingleDecodeWithKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut* o,
                                               DTypeOut* tmp, uint32_t num_qo_heads,
                                               uint32_t num_kv_heads, uint32_t seq_len,
-                                              float sm_scale, float rope_scale, float rope_theta,
+                                              float logits_soft_cap, float sm_scale,
+                                              float rope_scale, float rope_theta,
                                               cudaStream_t stream) {
   const float rope_rcp_scale = 1.f / rope_scale;
   const float rope_rcp_theta = 1.f / rope_theta;
@@ -796,6 +803,7 @@ cudaError_t SingleDecodeWithKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v,
                       (void*)&o,
                       (void*)&lse,
                       (void*)&info,
+                      (void*)&logits_soft_cap,
                       (void*)&sm_scale,
                       (void*)&rope_rcp_scale,
                       (void*)&rope_rcp_theta,
@@ -835,6 +843,7 @@ cudaError_t SingleDecodeWithKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v,
                       (void*)&tmp,
                       (void*)&tmp_lse,
                       (void*)&info,
+                      (void*)&logits_soft_cap,
                       (void*)&sm_scale,
                       (void*)&rope_rcp_scale,
                       (void*)&rope_rcp_theta,
@@ -854,7 +863,8 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     DTypeQ* q, IdType* q_offset, paged_kv_t<page_storage, kv_layout, DTypeKV, IdType> paged_kv,
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, DTypeOut* tmp_v, float* tmp_s,
     float* lse, bool* block_valid_mask, uint32_t padded_batch_size, uint32_t num_qo_heads,
-    float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream) {
+    float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta,
+    cudaStream_t stream) {
   const float rope_rcp_scale = 1.f / rope_scale;
   const float rope_rcp_theta = 1.f / rope_theta;
   const uint32_t num_kv_heads = paged_kv.num_heads;
@@ -890,6 +900,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
                       (void*)&o,
                       (void*)&lse,
                       (void*)&block_valid_mask,
+                      (void*)&logits_soft_cap,
                       (void*)&sm_scale,
                       (void*)&rope_rcp_scale,
                       (void*)&rope_rcp_theta};
@@ -910,6 +921,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
                       (void*)&tmp_v,
                       (void*)&tmp_s,
                       (void*)&block_valid_mask,
+                      (void*)&logits_soft_cap,
                       (void*)&sm_scale,
                       (void*)&rope_rcp_scale,
                       (void*)&rope_rcp_theta};
@@ -949,9 +961,9 @@ template <uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK, QKVLayout KV_LAYOU
 cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut* o,
                                                    DTypeOut* tmp, float* lse, uint32_t batch_size,
                                                    uint32_t padded_kv_len, uint32_t num_qo_heads,
-                                                   uint32_t num_kv_heads, float sm_scale,
-                                                   float rope_scale, float rope_theta,
-                                                   cudaStream_t stream) {
+                                                   uint32_t num_kv_heads, float logits_soft_cap,
+                                                   float sm_scale, float rope_scale,
+                                                   float rope_theta, cudaStream_t stream) {
   const float rope_rcp_scale = 1.f / rope_scale;
   const float rope_rcp_theta = 1.f / rope_theta;
 
@@ -981,6 +993,7 @@ cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeK
                     (void*)&o,
                     (void*)&lse,
                     (void*)&info,
+                    (void*)&logits_soft_cap,
                     (void*)&sm_scale,
                     (void*)&rope_rcp_scale,
                     (void*)&rope_rcp_theta};

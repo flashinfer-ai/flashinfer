@@ -42,8 +42,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
     DTypeQ* __restrict__ q, IdType* __restrict__ q_offset,
     paged_kv_t<page_storage, kv_layout, DTypeKV, IdType> paged_kv,
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* __restrict__ o,
-    float* __restrict__ lse, bool* __restrict__ block_valid_mask, float sm_scale,
-    float rope_rcp_scale, float rope_rcp_theta);
+    float* __restrict__ lse, bool* __restrict__ block_valid_mask, float logits_soft_cap,
+    float sm_scale, float rope_rcp_scale, float rope_rcp_theta);
 
 /*!
  * \brief Compute the maximum number of pages per batch and the new batch size

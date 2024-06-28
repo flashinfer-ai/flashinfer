@@ -22,7 +22,7 @@ mask_mode_literal = {
 
 logits_hook_literal = {
     0: "LogitsPostHook::kNone",
-    1: "LogitsPostHook::kCap30",
+    1: "LogitsPostHook::kSoftCap",
 }
 
 warp_layout_literal = {

@@ -22,7 +22,7 @@ namespace flashinfer {
 
 enum class LogitsPostHook {
   kNone = 0U,
-  kCap30 = 1U,
+  kSoftCap = 1U,
 };
 
 /*!
@@ -30,35 +30,39 @@ enum class LogitsPostHook {
  * \ref
  * https://github.com/xai-org/grok-1/blob/7050ed204b8206bb8645c7b7bbef7252f79561b0/model.py#L864-L865
  */
-__forceinline__ __device__ float logits_cap_30(float x) {
-  return (30 * math::log2e) * math::tanh(x);
+__forceinline__ __device__ float logits_soft_cap_impl(float x, const float soft_cap) {
+  return (soft_cap * math::log2e) * math::tanh(x);
 }
 
-__forceinline__ __device__ half2 logits_cap_30(half2 x) {
-  return __hmul2(__float2half2_rn(30 * math::log2e), math::tanh(x));
+__forceinline__ __device__ half2 logits_soft_cap_impl(half2 x, const float soft_cap) {
+  return __hmul2(__float2half2_rn(soft_cap * math::log2e), math::tanh(x));
 }
 
 template <LogitsPostHook mode, typename T>
-__forceinline__ __device__ T apply_logits_post_hook(T x);
+__forceinline__ __device__ T apply_logits_post_hook(T x, const float soft_cap);
 
 template <>
-__forceinline__ __device__ float apply_logits_post_hook<LogitsPostHook::kNone, float>(float x) {
+__forceinline__ __device__ float apply_logits_post_hook<LogitsPostHook::kNone, float>(
+    float x, const float soft_cap) {
   return x;
 }
 
 template <>
-__forceinline__ __device__ float apply_logits_post_hook<LogitsPostHook::kCap30, float>(float x) {
-  return logits_cap_30(x);
+__forceinline__ __device__ float apply_logits_post_hook<LogitsPostHook::kSoftCap, float>(
+    float x, const float soft_cap) {
+  return logits_soft_cap_impl(x, soft_cap);
 }
 
 template <>
-__forceinline__ __device__ half2 apply_logits_post_hook<LogitsPostHook::kNone, half2>(half2 x) {
+__forceinline__ __device__ half2
+apply_logits_post_hook<LogitsPostHook::kNone, half2>(half2 x, const float soft_cap) {
   return x;
 }
 
 template <>
-__forceinline__ __device__ half2 apply_logits_post_hook<LogitsPostHook::kCap30, half2>(half2 x) {
-  return logits_cap_30(x);
+__forceinline__ __device__ half2
+apply_logits_post_hook<LogitsPostHook::kSoftCap, half2>(half2 x, const float soft_cap) {
+  return logits_soft_cap_impl(x, soft_cap);
 }
 
 }  // namespace flashinfer
