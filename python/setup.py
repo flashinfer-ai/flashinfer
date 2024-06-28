@@ -366,6 +366,10 @@ if __name__ == "__main__":
                     "1",
                     "-Xfatbin",
                     "-compress-all",
+                    "-Xcompiler",
+                    "-mcmodel=medium",
+                    "-Xcompiler",
+                    "\"-Wl,--no-relax\""
                 ],
             },
         )
