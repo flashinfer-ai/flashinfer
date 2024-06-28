@@ -13,7 +13,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <driver_types.h>
 #include <thrust/device_vector.h>
 
 #include <nvbench/nvbench.cuh>
@@ -54,7 +53,7 @@ void bench_flashinfer_single_prefill(nvbench::state& state) {
 
   // Provide throughput information:
   state.add_global_memory_reads<dtype_in>(
-      (2 * qo_len * num_qo_heads + 2 * kv_len * num_kv_heads) * head_dim, "Read");
+      (qo_len * num_qo_heads + 2 * kv_len * num_kv_heads) * head_dim, "Read");
   state.add_global_memory_writes<dtype_out>(qo_len * num_qo_heads * head_dim, "Write");
 
   state.exec(nvbench::exec_tag::timer, [&](nvbench::launch& launch, auto& timer) {
