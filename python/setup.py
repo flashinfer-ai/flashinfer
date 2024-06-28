@@ -358,6 +358,8 @@ if __name__ == "__main__":
                 "cxx": [
                     "-O3",
                     "-Wno-switch-bool",
+                    "-Xcompiler -mcmodel=medium",
+                    "-Xcompiler -Wl,--no-relax"
                 ],
                 "nvcc": [
                     "-O3",
