@@ -142,6 +142,8 @@ def single_decode_with_kv_cache(
     check_pos_encoding_mode(pos_encoding_mode)
     check_kv_layout(kv_layout)
     tmp = _get_cache_buf("single_decode_with_kv_cache_tmp", 32 * 1024 * 1024, q.device)
+    if logits_soft_cap is None:
+        logits_soft_cap = 0.0
     if sm_scale is None:
         head_dim = q.shape[-1]
         sm_scale = 1.0 / math.sqrt(head_dim)
@@ -282,6 +284,8 @@ def batch_decode_with_padded_kv_cache(
     not equal to ``num_kv_heads``, the function will use
     `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
     """
+    if logits_soft_cap is None:
+        logits_soft_cap = 0.0
     if sm_scale is None:
         head_dim = q.shape[-1]
         sm_scale = 1.0 / math.sqrt(head_dim)
@@ -403,6 +407,8 @@ def batch_decode_with_padded_kv_cache_return_lse(
     not equal to ``num_kv_heads``, the function will use
     `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
     """
+    if logits_soft_cap is None:
+        logits_soft_cap = 0.0
     if sm_scale is None:
         head_dim = q.shape[-1]
         sm_scale = 1.0 / math.sqrt(head_dim)
@@ -675,6 +681,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
         """
         batch_size = len(last_page_len)
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
 
         if self.is_cuda_graph_enabled:
             if batch_size != self._fixed_batch_size:
@@ -821,6 +829,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The attention output, shape: ``[batch_size, num_qo_heads, head_dim]``.
         """
         check_pos_encoding_mode(pos_encoding_mode)
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
         if sm_scale is None:
             head_dim = q.shape[-1]
             sm_scale = 1.0 / math.sqrt(head_dim)
@@ -933,6 +943,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         explanation of the log-sum-exp function and attention states.
         """
         check_pos_encoding_mode(pos_encoding_mode)
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
         if sm_scale is None:
             head_dim = q.shape[-1]
             sm_scale = 1.0 / math.sqrt(head_dim)

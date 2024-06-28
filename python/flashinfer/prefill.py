@@ -168,6 +168,8 @@ def single_prefill_with_kv_cache(
     check_pos_encoding_mode(pos_encoding_mode)
     check_kv_layout(kv_layout)
     tmp = _get_cache_buf("single_prefill_with_kv_cache_tmp", 32 * 1024 * 1024, q.device)
+    if logits_soft_cap is None:
+        logits_soft_cap = 0.0
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(q.size(-1))
     if rope_scale is None:
@@ -337,6 +339,8 @@ def single_prefill_with_kv_cache_return_lse(
     tmp = _get_cache_buf(
         "single_prefill_with_kv_cache_return_lse_tmp", 8 * 1024 * 1024, q.device
     )
+    if logits_soft_cap is None:
+        logits_soft_cap = 0.0
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(q.size(-1))
     if rope_scale is None:
@@ -850,6 +854,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
         """
         check_pos_encoding_mode(pos_encoding_mode)
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
         if rope_scale is None:
@@ -958,6 +964,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             ``[qo_indptr[-1], num_qo_heads, head_dim]``.
         """
         check_pos_encoding_mode(pos_encoding_mode)
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
         if rope_scale is None:
@@ -1392,6 +1400,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
         """
         check_pos_encoding_mode(pos_encoding_mode)
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
         if rope_scale is None:
@@ -1497,6 +1507,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             ``[qo_indptr[-1], num_qo_heads, head_dim]``.
         """
         check_pos_encoding_mode(pos_encoding_mode)
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
         if rope_scale is None:
