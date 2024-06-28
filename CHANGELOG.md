@@ -1,7 +1,12 @@
 # Changelog
 
-## [0.1.0](https://github.com/flashinfer-ai/flashinfer/compare/v0.0.6...v0.1.0) (2024-06-28)
+## [0.0.7](https://github.com/flashinfer-ai/flashinfer/compare/v0.0.6...v0.0.7) (2024-06-28)
 
+
+### Bugfix
+
+* fix the `forward_return_lse` function in `BatchPrefillWithRaggedKVCache` class ([#337](https://github.com/flashinfer-ai/flashinfer/pull/337))
+* fix the scheduler behavior of large page size ([#333](https://github.com/flashinfer-ai/flashinfer/pull/333))
 
 ### Features
 
