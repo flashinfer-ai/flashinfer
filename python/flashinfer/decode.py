@@ -870,8 +870,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,
                 PosEncodingMode[pos_encoding_mode].value,
-                sm_scale,
                 logits_soft_cap,
+                sm_scale,
                 rope_scale,
                 rope_theta,
                 False,  # return_lse
