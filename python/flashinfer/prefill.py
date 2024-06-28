@@ -63,9 +63,9 @@ def single_prefill_with_kv_cache(
     causal: bool = False,
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
-    logits_cap: bool = False,
     allow_fp16_qk_reduction: bool = False,
     sm_scale: Optional[float] = None,
+    logits_soft_cap: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
 ):
@@ -105,14 +105,15 @@ def single_prefill_with_kv_cache(
         The position encoding applied inside attention kernels, could be
         ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
         Default is ``NONE``.
-    logits_cap : bool
-        Whether to apply logits cap to pre-softmax logits.
-        If ``True``, the logits will be capped according to formula (proposed in
-        Grok-1): :math:`30 \times \mathrm{tanh}(x / 30)`, where :math:`x` is the input logits.
-        Defaults to ``False``.
     allow_fp16_qk_reduction : bool
         Whether to use f16 for qk reduction (faster at the cost of slight precision
         loss).
+    logits_soft_cap : Optional[float]
+        The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
+        provided, will be set to ``0``. If greater than 0, the logits will be capped according to
+        formula:
+        :math:`\texttt{logits_soft_cap} \times \mathrm{tanh}(x / \texttt{logits_soft_cap})`,
+        where :math:`x` is the input logits.
     sm_scale : Optional[float]
         The scale used in softmax, if not provided, will be set to ``1.0 / sqrt(head_dim)``.
     rope_scale : Optional[float]
@@ -167,6 +168,8 @@ def single_prefill_with_kv_cache(
     check_pos_encoding_mode(pos_encoding_mode)
     check_kv_layout(kv_layout)
     tmp = _get_cache_buf("single_prefill_with_kv_cache_tmp", 32 * 1024 * 1024, q.device)
+    if logits_soft_cap is None:
+        logits_soft_cap = 0.0
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(q.size(-1))
     if rope_scale is None:
@@ -187,8 +190,8 @@ def single_prefill_with_kv_cache(
             tmp,
             TensorLayout[kv_layout].value,
             PosEncodingMode[pos_encoding_mode].value,
-            logits_cap,
             allow_fp16_qk_reduction,
+            logits_soft_cap,
             sm_scale,
             rope_scale,
             rope_theta,
@@ -203,8 +206,8 @@ def single_prefill_with_kv_cache(
             causal,
             TensorLayout[kv_layout].value,
             PosEncodingMode[pos_encoding_mode].value,
-            logits_cap,
             allow_fp16_qk_reduction,
+            logits_soft_cap,
             sm_scale,
             rope_scale,
             rope_theta,
@@ -221,8 +224,8 @@ def single_prefill_with_kv_cache_return_lse(
     causal: bool = False,
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
-    logits_cap: bool = False,
     allow_fp16_qk_reduction: bool = False,
+    logits_soft_cap: Optional[float] = None,
     sm_scale: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
@@ -263,14 +266,15 @@ def single_prefill_with_kv_cache_return_lse(
         The position encoding applied inside attention kernels, could be
         ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
         Default is ``NONE``.
-    logits_cap : bool
-        Whether to apply logits cap to pre-softmax logits.
-        If ``True``, the logits will be capped according to formula (proposed in
-        Grok-1): :math:`30 \times \mathrm{tanh}(x / 30)`, where :math:`x` is the input logits.
-        Defaults to ``False``.
     allow_fp16_qk_reduction : bool
         Whether to use f16 for qk reduction (faster at the cost of slight precision
         loss).
+    logits_soft_cap : Optional[float]
+        The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
+        provided, will be set to ``0``. If greater than 0, the logits will be capped according to
+        formula:
+        :math:`\texttt{logits_soft_cap} \times \mathrm{tanh}(x / \texttt{logits_soft_cap})`,
+        where :math:`x` is the input logits.
     sm_scale : Optional[float]
         The scale used in softmax, if not provided, will be set to ``1.0 / sqrt(head_dim)``.
     rope_scale : Optional[float]
@@ -335,6 +339,8 @@ def single_prefill_with_kv_cache_return_lse(
     tmp = _get_cache_buf(
         "single_prefill_with_kv_cache_return_lse_tmp", 8 * 1024 * 1024, q.device
     )
+    if logits_soft_cap is None:
+        logits_soft_cap = 0.0
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(q.size(-1))
     if rope_scale is None:
@@ -363,8 +369,8 @@ def single_prefill_with_kv_cache_return_lse(
             tmp,
             TensorLayout[kv_layout].value,
             PosEncodingMode[pos_encoding_mode].value,
-            logits_cap,
             allow_fp16_qk_reduction,
+            logits_soft_cap,
             sm_scale,
             rope_scale,
             rope_theta,
@@ -379,8 +385,8 @@ def single_prefill_with_kv_cache_return_lse(
             causal,
             TensorLayout[kv_layout].value,
             PosEncodingMode[pos_encoding_mode].value,
-            logits_cap,
             allow_fp16_qk_reduction,
+            logits_soft_cap,
             sm_scale,
             rope_scale,
             rope_theta,
@@ -798,8 +804,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         paged_kv_data: torch.Tensor,
         causal: bool = True,
         pos_encoding_mode: str = "NONE",
-        logits_cap: bool = False,
         allow_fp16_qk_reduction: bool = False,
+        logits_soft_cap: Optional[float] = None,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
@@ -824,14 +830,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
             Default is ``NONE``.
-        logits_cap : bool
-            Whether to apply logits cap to pre-softmax logits,
-            If ``True``, the logits will be capped according to formula (proposed in
-            Grok-1): :math:`30 \times \mathrm{tanh}(x / 30)`, where :math:`x` is the input logits.
-            Defaults to ``False``.
         allow_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
             loss).
+        logits_soft_cap : Optional[float]
+            The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
+            provided, will be set to ``0``. If greater than 0, the logits will be capped according to
+            formula:
+            :math:`\texttt{logits_soft_cap} \times \mathrm{tanh}(x / \texttt{logits_soft_cap})`,
+            where :math:`x` is the input logits.
         sm_scale : Optional[float]
             The scale used in softmax, if not provided, will be set to
             ``1.0 / sqrt(head_dim)``.
@@ -847,6 +854,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
         """
         check_pos_encoding_mode(pos_encoding_mode)
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
         if rope_scale is None:
@@ -872,8 +881,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._paged_kv_last_page_len_buf,
                 causal,
                 PosEncodingMode[pos_encoding_mode].value,
-                logits_cap,
                 allow_fp16_qk_reduction,
+                logits_soft_cap,
                 sm_scale,
                 rope_scale,
                 rope_theta,
@@ -890,8 +899,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._custom_mask_buf,
                 self._qk_indptr_buf,
                 PosEncodingMode[pos_encoding_mode].value,
-                logits_cap,
                 allow_fp16_qk_reduction,
+                logits_soft_cap,
                 sm_scale,
                 rope_scale,
                 rope_theta,
@@ -904,8 +913,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         paged_kv_data: torch.Tensor,
         causal: bool = True,
         pos_encoding_mode: str = "NONE",
-        logits_cap: bool = False,
         allow_fp16_qk_reduction: bool = False,
+        logits_soft_cap: Optional[float] = None,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
@@ -928,14 +937,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
             Default is ``NONE``.
-        logits_cap : bool
-            Whether to apply logits cap to pre-softmax logits.
-            If ``True``, the logits will be capped according to formula (proposed in
-            Grok-1): :math:`30 \times \mathrm{tanh}(x / 30)`, where :math:`x` is the input logits.
-            Defaults to ``False``.
         allow_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
             loss).
+        logits_soft_cap : Optional[float]
+            The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
+            provided, will be set to ``0``. If greater than 0, the logits will be capped according to
+            formula:
+            :math:`\texttt{logits_soft_cap} \times \mathrm{tanh}(x / \texttt{logits_soft_cap})`,
+            where :math:`x` is the input logits.
         sm_scale : Optional[float]
             The scale used in softmax, if not provided, will be set to
             ``1.0 / sqrt(head_dim)``.
@@ -954,6 +964,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             ``[qo_indptr[-1], num_qo_heads, head_dim]``.
         """
         check_pos_encoding_mode(pos_encoding_mode)
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
         if rope_scale is None:
@@ -979,8 +991,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._paged_kv_last_page_len_buf,
                 causal,
                 PosEncodingMode[pos_encoding_mode].value,
-                logits_cap,
                 allow_fp16_qk_reduction,
+                logits_soft_cap,
                 sm_scale,
                 rope_scale,
                 rope_theta,
@@ -997,8 +1009,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._custom_mask_buf,
                 self._qk_indptr_buf,
                 PosEncodingMode[pos_encoding_mode].value,
-                logits_cap,
                 allow_fp16_qk_reduction,
+                logits_soft_cap,
                 sm_scale,
                 rope_scale,
                 rope_theta,
@@ -1340,8 +1352,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         v: torch.Tensor,
         causal: bool = True,
         pos_encoding_mode: str = "NONE",
-        logits_cap: bool = False,
         allow_fp16_qk_reduction: bool = False,
+        logits_soft_cap: Optional[float] = None,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
@@ -1364,14 +1376,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
             Default is ``NONE``.
-        logits_cap : bool
-            Whether to apply logits cap to pre-softmax logits.
-            If ``True``, the logits will be capped according to formula (proposed in
-            Grok-1): :math:`30 \times \mathrm{tanh}(x / 30)`, where :math:`x` is the input logits.
-            Defaults to ``False``.
         allow_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
             loss).
+        logits_soft_cap : Optional[float]
+            The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
+            provided, will be set to ``0``. If greater than 0, the logits will be capped according to
+            formula:
+            :math:`\texttt{logits_soft_cap} \times \mathrm{tanh}(x / \texttt{logits_soft_cap})`,
+            where :math:`x` is the input logits.
         sm_scale : Optional[float]
             The scale used in softmax, if not provided, will be set to
             ``1.0 / sqrt(head_dim)``.
@@ -1387,6 +1400,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
         """
         check_pos_encoding_mode(pos_encoding_mode)
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
         if rope_scale is None:
@@ -1410,8 +1425,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._kv_indptr_buf,
                 causal,
                 PosEncodingMode[pos_encoding_mode].value,
-                logits_cap,
                 allow_fp16_qk_reduction,
+                logits_soft_cap,
                 sm_scale,
                 rope_scale,
                 rope_theta,
@@ -1427,8 +1442,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._custom_mask_buf,
                 self._qk_indptr_buf,
                 PosEncodingMode[pos_encoding_mode].value,
-                logits_cap,
                 allow_fp16_qk_reduction,
+                logits_soft_cap,
                 sm_scale,
                 rope_scale,
                 rope_theta,
@@ -1442,8 +1457,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         v: torch.Tensor,
         causal: bool = True,
         pos_encoding_mode: str = "NONE",
-        logits_cap: bool = False,
         allow_fp16_qk_reduction: bool = False,
+        logits_soft_cap: Optional[float] = None,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
@@ -1466,14 +1481,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
             Default is ``NONE``.
-        logits_cap : bool
-            Whether to apply logits cap to pre-softmax logits.
-            If ``True``, the logits will be capped according to formula (proposed in
-            Grok-1): :math:`30 \times \mathrm{tanh}(x / 30)`, where :math:`x` is the input logits.
-            Defaults to ``False``.
         allow_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
             loss).
+        logits_soft_cap : Optional[float]
+            The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
+            provided, will be set to ``0``. If greater than 0, the logits will be capped according to
+            formula:
+            :math:`\texttt{logits_soft_cap} \times \mathrm{tanh}(x / \texttt{logits_soft_cap})`,
+            where :math:`x` is the input logits.
         sm_scale : Optional[float]
             The scale used in softmax, if not provided, will be set to
             ``1.0 / sqrt(head_dim)``.
@@ -1491,6 +1507,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             ``[qo_indptr[-1], num_qo_heads, head_dim]``.
         """
         check_pos_encoding_mode(pos_encoding_mode)
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
         if rope_scale is None:
@@ -1514,8 +1532,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._kv_indptr_buf,
                 causal,
                 PosEncodingMode[pos_encoding_mode].value,
-                logits_cap,
                 allow_fp16_qk_reduction,
+                logits_soft_cap,
                 sm_scale,
                 rope_scale,
                 rope_theta,
@@ -1531,8 +1549,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._custom_mask_buf,
                 self._qk_indptr_buf,
                 PosEncodingMode[pos_encoding_mode].value,
-                logits_cap,
                 allow_fp16_qk_reduction,
+                logits_soft_cap,
                 sm_scale,
                 rope_scale,
                 rope_theta,

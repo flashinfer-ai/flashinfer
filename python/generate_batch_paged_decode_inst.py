@@ -48,7 +48,7 @@ template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{head_dim}, page_stor
     kv_partition_info_t<{idtype}> kv_partition_info,
     {dtype_out}* o, {dtype_out}* tmp_v, float* tmp_s, float* lse,
     bool* block_valid_mask, uint32_t padded_batch_size, uint32_t num_qo_heads,
-    float sm_scale, float rope_scale,
+    float logits_soft_cap, float sm_scale, float rope_scale,
     float rope_theta, cudaStream_t stream);
 
 }}

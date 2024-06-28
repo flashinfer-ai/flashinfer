@@ -47,9 +47,9 @@ def get_cu_file_str(
     {idtype}* q_indptr, {dtype_in}* k, {dtype_in}* v, {idtype}* kv_indptr,
     uint8_t* custom_mask, {idtype}* qk_indptr, {idtype}* q_offset, {idtype}* k_rope_pos_offset,
     {idtype}* o_indptr, {dtype_out}* o, {dtype_out}* tmp_v, float* tmp_s, float* lse, {idtype}* merge_indptr,
-    bool* block_valid_mask, {idtype}* kv_chunk_size_ptr, const uint32_t total_num_rows, const uint32_t num_qo_heads,
-    const uint32_t padded_batch_size, const uint32_t num_kv_heads,
-    const float sm_scale, const float rope_scale, const float rope_theta,
+    bool* block_valid_mask, {idtype}* kv_chunk_size_ptr, uint32_t total_num_rows, uint32_t num_qo_heads,
+    uint32_t padded_batch_size, uint32_t num_kv_heads,
+    float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta,
     cudaStream_t stream);
         """.format(
                 warp_layout=warp_layout_literal[warp_layout],

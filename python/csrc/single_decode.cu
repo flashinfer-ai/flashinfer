@@ -22,8 +22,8 @@ using namespace flashinfer;
 
 torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                                           torch::Tensor tmp, unsigned int pos_encoding_mode,
-                                          bool logits_cap, unsigned int layout, float sm_scale,
-                                          float rope_scale, float rope_theta) {
+                                          unsigned int layout, float logits_soft_cap,
+                                          float sm_scale, float rope_scale, float rope_theta) {
   CHECK_INPUT(q);
   CHECK_INPUT(k);
   CHECK_INPUT(v);
@@ -49,8 +49,9 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
   auto o = torch::empty_like(
       q, q.options().dtype(is_float8_tensor(q) ? torch::kFloat16 : q.scalar_type()));
 
+  TORCH_CHECK(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
   const LogitsPostHook logits_post_hook =
-      logits_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
+      logits_soft_cap > 0.f ? LogitsPostHook::kSoftCap : LogitsPostHook::kNone;
 
   if (is_float8_tensor(q)) {
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(q.scalar_type(), q_type, [&] {
@@ -60,14 +61,12 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
             return DISPATCH_kv_layout(kv_layout, KV_LAYOUT, [&] {
               return DISPATCH_pos_encoding_mode(
                   PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
-                    cudaError_t status =
-                        SingleDecodeWithKVCacheDispatched<HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT,
-                                                          POS_ENCODING_MODE>(
-                            static_cast<q_type*>(q.data_ptr()), static_cast<kv_type*>(k.data_ptr()),
-                            static_cast<kv_type*>(v.data_ptr()),
-                            static_cast<nv_half*>(o.data_ptr()),
-                            static_cast<nv_half*>(tmp.data_ptr()), num_qo_heads, num_kv_heads,
-                            kv_len, sm_scale, rope_scale, rope_theta, torch_current_stream);
+                    cudaError_t status = SingleDecodeWithKVCacheDispatched<
+                        HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT, POS_ENCODING_MODE>(
+                        static_cast<q_type*>(q.data_ptr()), static_cast<kv_type*>(k.data_ptr()),
+                        static_cast<kv_type*>(v.data_ptr()), static_cast<nv_half*>(o.data_ptr()),
+                        static_cast<nv_half*>(tmp.data_ptr()), num_qo_heads, num_kv_heads, kv_len,
+                        logits_soft_cap, sm_scale, rope_scale, rope_theta, torch_current_stream);
                     TORCH_CHECK(status == cudaSuccess,
                                 "SingleDecodeWithKVCache kernel launch failed, error: " +
                                     std::string(cudaGetErrorString(status)));
@@ -92,7 +91,8 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
                             static_cast<q_type*>(q.data_ptr()), static_cast<kv_type*>(k.data_ptr()),
                             static_cast<kv_type*>(v.data_ptr()), static_cast<q_type*>(o.data_ptr()),
                             static_cast<q_type*>(tmp.data_ptr()), num_qo_heads, num_kv_heads,
-                            kv_len, sm_scale, rope_scale, rope_theta, torch_current_stream);
+                            kv_len, logits_soft_cap, sm_scale, rope_scale, rope_theta,
+                            torch_current_stream);
                     TORCH_CHECK(status == cudaSuccess,
                                 "SingleDecodeWithKVCache kernel launch failed, error: " +
                                     std::string(cudaGetErrorString(status)));

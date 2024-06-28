@@ -22,7 +22,7 @@ using namespace flashinfer;
 
 std::vector<torch::Tensor> batch_decode_with_padded_kv_cache(
     torch::Tensor q, torch::Tensor k_padded, torch::Tensor v_padded, unsigned int layout,
-    unsigned int pos_encoding_mode, bool logits_cap, float sm_scale, float rope_scale,
+    unsigned int pos_encoding_mode, float logits_soft_cap, float sm_scale, float rope_scale,
     float rope_theta, bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(k_padded);
@@ -56,8 +56,9 @@ std::vector<torch::Tensor> batch_decode_with_padded_kv_cache(
     lse = torch::empty({batch_size, num_qo_heads}, q.options()).to(torch::kFloat32);
   }
 
+  TORCH_CHECK(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
   const LogitsPostHook logits_post_hook =
-      logits_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
+      logits_soft_cap > 0.f ? LogitsPostHook::kSoftCap : LogitsPostHook::kNone;
 
   if (is_float8_tensor(q)) {
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(q.scalar_type(), q_type, [&] {
@@ -78,8 +79,8 @@ std::vector<torch::Tensor> batch_decode_with_padded_kv_cache(
                             static_cast<nv_half*>(o.data_ptr()),
                             /*tmp=*/tmp,
                             /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                            batch_size, padded_kv_len, num_qo_heads, num_kv_heads, sm_scale,
-                            rope_scale, rope_theta, torch_current_stream);
+                            batch_size, padded_kv_len, num_qo_heads, num_kv_heads, logits_soft_cap,
+                            sm_scale, rope_scale, rope_theta, torch_current_stream);
                     TORCH_CHECK(status == cudaSuccess,
                                 "BatchDecodeWithPaddedKVCache failed with error code ", status);
                     return true;
@@ -108,8 +109,8 @@ std::vector<torch::Tensor> batch_decode_with_padded_kv_cache(
                             static_cast<q_type*>(o.data_ptr()),
                             /*tmp=*/tmp,
                             /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                            batch_size, padded_kv_len, num_qo_heads, num_kv_heads, sm_scale,
-                            rope_scale, rope_theta, torch_current_stream);
+                            batch_size, padded_kv_len, num_qo_heads, num_kv_heads, logits_soft_cap,
+                            sm_scale, rope_scale, rope_theta, torch_current_stream);
                     TORCH_CHECK(status == cudaSuccess,
                                 "BatchDecodeWithPaddedKVCache failed with error code ", status);
                     return true;
@@ -131,8 +132,8 @@ std::vector<torch::Tensor> batch_decode_with_padded_kv_cache(
 void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
     torch::Tensor workspace_buffer, torch::Tensor indptr, torch::Tensor last_page_len,
     unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads,
-    unsigned int head_dim, unsigned int page_size, unsigned int pos_encoding_mode, bool logits_cap,
-    torch::Tensor empty_q_data, torch::Tensor empty_kv_data) {
+    unsigned int head_dim, unsigned int page_size, unsigned int pos_encoding_mode,
+    float logits_soft_cap, torch::Tensor empty_q_data, torch::Tensor empty_kv_data) {
   // NOTE(zihao): not necessary to be CUDA tensor
   CHECK_CONTIGUOUS(indptr);
   CHECK_CONTIGUOUS(last_page_len);
@@ -149,8 +150,9 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
   indptr = indptr.to(torch::kCPU);
   last_page_len = last_page_len.to(torch::kCPU);
 
+  TORCH_CHECK(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
   const LogitsPostHook logits_post_hook =
-      logits_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
+      logits_soft_cap > 0.f ? LogitsPostHook::kSoftCap : LogitsPostHook::kNone;
 
   if (is_float8_tensor(empty_q_data)) {
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(empty_q_data.scalar_type(), q_type, [&] {
@@ -217,7 +219,7 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::UpdatePageLockedBufferSize(
 std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
     torch::Tensor q, torch::Tensor paged_kv_data, torch::Tensor paged_kv_indptr,
     torch::Tensor paged_kv_indices, torch::Tensor paged_kv_last_page_len,
-    unsigned int pos_encoding_mode, bool logits_cap, float sm_scale, float rope_scale,
+    unsigned int pos_encoding_mode, float logits_soft_cap, float sm_scale, float rope_scale,
     float rope_theta, bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(paged_kv_data);
@@ -260,8 +262,9 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
     lse = torch::empty({batch_size, num_qo_heads}, q.options()).to(torch::kFloat32);
   }
 
+  TORCH_CHECK(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
   const LogitsPostHook logits_post_hook =
-      logits_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
+      logits_soft_cap > 0.f ? LogitsPostHook::kSoftCap : LogitsPostHook::kNone;
 
   if (is_float8_tensor(q)) {
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(q.scalar_type(), q_type, [&] {
@@ -284,7 +287,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
                             handler_.get(), static_cast<q_type*>(q.data_ptr()),
                             /*q_offset=*/nullptr, paged_kv, static_cast<nv_half*>(o.data_ptr()),
                             /*lse=*/(return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr),
-                            num_qo_heads, sm_scale, rope_scale, rope_theta,
+                            num_qo_heads, logits_soft_cap, sm_scale, rope_scale, rope_theta,
                             /*stream=*/torch_current_stream);
                         TORCH_CHECK(status == cudaSuccess,
                                     "BatchDecodeWithPagedKVCache failed with error ",
@@ -317,7 +320,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
                             handler_.get(), static_cast<q_type*>(q.data_ptr()),
                             /*q_offset=*/nullptr, paged_kv, static_cast<q_type*>(o.data_ptr()),
                             /*lse=*/(return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr),
-                            num_qo_heads, sm_scale, rope_scale, rope_theta,
+                            num_qo_heads, logits_soft_cap, sm_scale, rope_scale, rope_theta,
                             /*stream=*/torch_current_stream);
                         TORCH_CHECK(status == cudaSuccess,
                                     "BatchDecodeWithPagedKVCache failed with error ",

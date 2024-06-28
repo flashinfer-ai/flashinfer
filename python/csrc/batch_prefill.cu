@@ -60,7 +60,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
     torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor paged_kv_data,
     torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
     torch::Tensor paged_kv_last_page_len, bool causal, unsigned int pos_encoding_mode,
-    bool logits_cap, bool allow_fp16_qk_reduction, float sm_scale, float rope_scale,
+    bool allow_fp16_qk_reduction, float logits_soft_cap, float sm_scale, float rope_scale,
     float rope_theta, bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(qo_indptr);
@@ -107,8 +107,9 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
     lse = torch::empty({nnz_qo, num_qo_heads}, q.options()).to(torch::kFloat32);
   }
   MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
+  TORCH_CHECK(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
   const LogitsPostHook logits_post_hook =
-      logits_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
+      logits_soft_cap > 0.f ? LogitsPostHook::kSoftCap : LogitsPostHook::kNone;
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
     return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
@@ -135,7 +136,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
                             /*custom_mask=*/nullptr,
                             /*qk_indptr=*/nullptr, static_cast<c_type*>(o.data_ptr()),
                             /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                            num_qo_heads, sm_scale, rope_scale, rope_theta,
+                            num_qo_heads, logits_soft_cap, sm_scale, rope_scale, rope_theta,
                             /*stream=*/torch_current_stream);
                         TORCH_CHECK(status == cudaSuccess,
                                     "BatchPrefillWithPagedKVCache failed with error code ",
@@ -160,8 +161,8 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCu
     torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor paged_kv_data,
     torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
     torch::Tensor paged_kv_last_page_len, torch::Tensor custom_mask, torch::Tensor qk_indptr,
-    unsigned int pos_encoding_mode, bool logits_cap, bool allow_fp16_qk_reduction, float sm_scale,
-    float rope_scale, float rope_theta, bool return_lse) {
+    unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction, float logits_soft_cap,
+    float sm_scale, float rope_scale, float rope_theta, bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(qo_indptr);
   CHECK_INPUT(paged_kv_data);
@@ -213,8 +214,9 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCu
     lse = torch::empty({nnz_qo, num_qo_heads}, q.options()).to(torch::kFloat32);
   }
   constexpr MaskMode MASK_MODE = MaskMode::kCustom;
+  TORCH_CHECK(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
   const LogitsPostHook logits_post_hook =
-      logits_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
+      logits_soft_cap > 0.f ? LogitsPostHook::kSoftCap : LogitsPostHook::kNone;
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
     return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
@@ -241,7 +243,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCu
                           static_cast<int32_t*>(qk_indptr.data_ptr()),
                           static_cast<c_type*>(o.data_ptr()),
                           /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                          num_qo_heads, sm_scale, rope_scale, rope_theta,
+                          num_qo_heads, logits_soft_cap, sm_scale, rope_scale, rope_theta,
                           /*stream=*/torch_current_stream);
                       TORCH_CHECK(status == cudaSuccess,
                                   "BatchPrefillWithPagedKVCache failed with error code ",
@@ -299,9 +301,9 @@ void BatchPrefillWithRaggedKVCachePyTorchWrapper::UpdatePageLockedBufferSize(
 
 std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
     torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor k, torch::Tensor v,
-    torch::Tensor kv_indptr, bool causal, unsigned int pos_encoding_mode, bool logits_cap,
-    bool allow_fp16_qk_reduction, float sm_scale, float rope_scale, float rope_theta,
-    bool return_lse) {
+    torch::Tensor kv_indptr, bool causal, unsigned int pos_encoding_mode,
+    bool allow_fp16_qk_reduction, float logits_soft_cap, float sm_scale, float rope_scale,
+    float rope_theta, bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(qo_indptr);
   CHECK_INPUT(k);
@@ -336,8 +338,9 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
   }
 
   MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
+  TORCH_CHECK(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
   const LogitsPostHook logits_post_hook =
-      logits_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
+      logits_soft_cap > 0.f ? LogitsPostHook::kSoftCap : LogitsPostHook::kNone;
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
     return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
@@ -359,7 +362,8 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
                             /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr,
                             static_cast<c_type*>(o.data_ptr()),
                             /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                            num_qo_heads, num_kv_heads, sm_scale, rope_scale, rope_theta,
+                            num_qo_heads, num_kv_heads, logits_soft_cap, sm_scale, rope_scale,
+                            rope_theta,
                             /*stream=*/torch_current_stream);
                         TORCH_CHECK(status == cudaSuccess,
                                     "BatchPrefillWithRaggedKVCache failed with error ",
@@ -383,8 +387,8 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
 std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardCustomMask(
     torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor k, torch::Tensor v,
     torch::Tensor kv_indptr, torch::Tensor custom_mask, torch::Tensor qk_indptr,
-    unsigned int pos_encoding_mode, bool logits_cap, bool allow_fp16_qk_reduction, float sm_scale,
-    float rope_scale, float rope_theta, bool return_lse) {
+    unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction, float logits_soft_cap,
+    float sm_scale, float rope_scale, float rope_theta, bool return_lse) {
   CHECK_INPUT(q);
   CHECK_INPUT(qo_indptr);
   CHECK_INPUT(k);
@@ -425,8 +429,9 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardC
   }
 
   constexpr MaskMode MASK_MODE = MaskMode::kCustom;
+  TORCH_CHECK(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
   const LogitsPostHook logits_post_hook =
-      logits_cap ? LogitsPostHook::kCap30 : LogitsPostHook::kNone;
+      logits_soft_cap > 0.f ? LogitsPostHook::kSoftCap : LogitsPostHook::kNone;
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
     return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
@@ -448,7 +453,8 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardC
                           /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr,
                           static_cast<c_type*>(o.data_ptr()),
                           /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                          num_qo_heads, num_kv_heads, sm_scale, rope_scale, rope_theta,
+                          num_qo_heads, num_kv_heads, logits_soft_cap, sm_scale, rope_scale,
+                          rope_theta,
                           /*stream=*/torch_current_stream);
                       TORCH_CHECK(status == cudaSuccess,
                                   "BatchPrefillWithRaggedKVCache failed with error ",

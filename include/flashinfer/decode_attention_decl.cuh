@@ -32,7 +32,8 @@ template <uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK, QKVLayout KV_LAYOU
 cudaError_t SingleDecodeWithKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut* o,
                                               DTypeOut* tmp, uint32_t num_qo_heads,
                                               uint32_t num_kv_heads, uint32_t seq_len,
-                                              float sm_scale, float rope_scale, float rope_theta,
+                                              float logits_soft_cap, float sm_scale,
+                                              float rope_scale, float rope_theta,
                                               cudaStream_t stream);
 
 template <uint32_t HEAD_DIM, PageStorage page_storage, LogitsPostHook LOGITS_POST_HOOK,
@@ -42,16 +43,16 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     DTypeQ* q, IdType* q_offset, paged_kv_t<page_storage, KV_LAYOUT, DTypeKV, IdType> paged_kv,
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, DTypeOut* tmp_v, float* tmp_s,
     float* lse, bool* block_valid_mask, uint32_t padded_batch_size, uint32_t num_qo_heads,
-    float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream);
+    float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream);
 
 template <uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK, QKVLayout KV_LAYOUT,
           PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV, typename DTypeOut>
 cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut* o,
                                                    DTypeOut* tmp, float* lse, uint32_t batch_size,
                                                    uint32_t padded_kv_len, uint32_t num_qo_heads,
-                                                   uint32_t num_kv_heads, float sm_scale,
-                                                   float rope_scale, float rope_theta,
-                                                   cudaStream_t stream);
+                                                   uint32_t num_kv_heads, float logits_soft_cap,
+                                                   float sm_scale, float rope_scale,
+                                                   float rope_theta, cudaStream_t stream);
 
 template <PageStorage PAGE_STORAGE, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK,
           QKVLayout KV_LAYOUT, PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV,
@@ -59,8 +60,8 @@ template <PageStorage PAGE_STORAGE, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POS
 cudaError_t BatchDecodeWithPagedKVCacheWrapperDispatched(
     BatchDecodeHandler* handler, DTypeQ* q, IdType* q_offset,
     paged_kv_t<PAGE_STORAGE, KV_LAYOUT, DTypeKV, IdType> paged_kv, DTypeOut* o, float* lse,
-    uint32_t num_qo_heads, float sm_scale, float rope_scale, float rope_theta,
-    cudaStream_t stream) {
+    uint32_t num_qo_heads, float logits_soft_cap, float sm_scale, float rope_scale,
+    float rope_theta, cudaStream_t stream) {
   paged_kv_t<PAGE_STORAGE, KV_LAYOUT, DTypeKV, IdType> new_paged_kv = paged_kv;
   kv_partition_info_t<IdType> kv_partition_info;
   DTypeOut* tmp_v = handler->GetTempV<DTypeOut>();
@@ -89,8 +90,8 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapperDispatched(
                                                POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeOut,
                                                IdType>(
       q, q_offset, new_paged_kv, kv_partition_info, o, tmp_v, tmp_s, lse,
-      handler->GetBlockValidMask(), handler->GetPaddedBatchSize(), num_qo_heads, sm_scale,
-      rope_scale, rope_theta, stream);
+      handler->GetBlockValidMask(), handler->GetPaddedBatchSize(), num_qo_heads, logits_soft_cap,
+      sm_scale, rope_scale, rope_theta, stream);
 }
 
 }  // namespace flashinfer

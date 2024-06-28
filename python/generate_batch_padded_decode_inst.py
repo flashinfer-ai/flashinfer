@@ -42,7 +42,7 @@ template cudaError_t BatchDecodeWithPaddedKVCacheDispatched<{head_dim}, {logits_
     {dtype_q}* q, {dtype_kv}* k, {dtype_kv}* v,
     {dtype_out}* o, {dtype_out}* tmp, float* lse,
     uint32_t batch_size, uint32_t padded_kv_len, uint32_t num_qo_heads, uint32_t num_kv_heads,
-    float sm_scale, float rope_scale,
+    float logits_soft_cap, float sm_scale, float rope_scale,
     float rope_theta, cudaStream_t stream);
 
 }}
