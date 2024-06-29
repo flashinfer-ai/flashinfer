@@ -15,4 +15,5 @@
 	url = https://github.com/ROCm/composable_kernel.git
 [submodule "3rdparty/spdlog"]
 	path = 3rdparty/spdlog
-	url = git@github.com:gabime/spdlog.git
+	url = https://github.com/gabime/spdlog.git
+
