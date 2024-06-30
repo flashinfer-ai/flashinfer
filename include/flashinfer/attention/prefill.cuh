@@ -53,7 +53,7 @@ constexpr bool is_invalid_configuration(uint32_t num_frags_x, uint32_t num_frags
                                         uint32_t num_warps_z) {
   return ((num_frags_y < 4) || (num_frags_y == 4 && num_frags_z % 2 == 1) ||
           (num_frags_y > 4 && num_frags_y % (2 * num_warps_x) != 0) ||
-          (num_frags_x * (8 * num_frags_y + 2 * sizeof(DTypeQKAccum) * num_frags_z) >= 256));
+          (num_frags_x * (8 * num_frags_y + 2 * sizeof(DTypeQKAccum) * num_frags_z) >= 200));
 }
 
 /*!
