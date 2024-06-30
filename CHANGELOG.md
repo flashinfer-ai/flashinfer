@@ -2,6 +2,8 @@
 
 ## [0.0.7](https://github.com/flashinfer-ai/flashinfer/compare/v0.0.6...v0.0.7) (2024-06-28)
 
+### Breaking Changes
+* `batch_decode_with_padded_kv_cache` was removed, we encourage user to use `BatchDecodeWithPagedKVCacheWrapper` instead. ([#343](https://github.com/flashinfer-ai/flashinfer/pull/343))
 
 ### Bugfix
 
