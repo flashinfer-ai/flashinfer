@@ -72,9 +72,9 @@ inline std::vector<float> apply_llama_rope(const T* input, size_t D, size_t offs
   return std::move(rst);
 }
 
-template <typename dtype_in, typename dtype_out>
-std::vector<dtype_out> single_mha(const std::vector<dtype_in>& q, const std::vector<dtype_in>& k,
-                                  const std::vector<dtype_in>& v, size_t qo_len, size_t kv_len,
+template <typename dtype_q, typename dtype_kv, typename dtype_out>
+std::vector<dtype_out> single_mha(const std::vector<dtype_q>& q, const std::vector<dtype_kv>& k,
+                                  const std::vector<dtype_kv>& v, size_t qo_len, size_t kv_len,
                                   size_t num_qo_heads, size_t num_kv_heads, size_t head_dim,
                                   bool causal = true, QKVLayout kv_layout = QKVLayout::kHND,
                                   PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,

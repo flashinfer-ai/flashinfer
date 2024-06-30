@@ -28,7 +28,7 @@ import argparse
 import torch
 import torch.utils.cpp_extension as torch_cpp_ext
 
-import generate_single_decode_inst, generate_single_prefill_inst, generate_batch_paged_decode_inst, generate_batch_padded_decode_inst, generate_batch_paged_prefill_inst, generate_batch_ragged_prefill_inst, generate_dispatch_inc
+import generate_single_decode_inst, generate_single_prefill_inst, generate_batch_paged_decode_inst, generate_batch_paged_prefill_inst, generate_batch_ragged_prefill_inst, generate_dispatch_inc
 
 root = pathlib.Path(__name__).parent
 
@@ -92,10 +92,12 @@ def get_instantiation_cu() -> List[str]:
     idtypes = ["i32"]
     prefill_dtypes = ["f16"]
     decode_dtypes = ["f16"]
+    fp16_dtypes = ["f16"]
     fp8_dtypes = ["e4m3", "e5m2"]
     if enable_bf16:
         prefill_dtypes.append("bf16")
         decode_dtypes.append("bf16")
+        fp16_dtypes.append("bf16")
     if enable_fp8:
         decode_dtypes.extend(fp8_dtypes)
 
@@ -112,8 +114,10 @@ def get_instantiation_cu() -> List[str]:
         kv_layouts,
         pos_encoding_modes,
     ):
-        for dtype_q, dtype_kv in itertools.product(decode_dtypes, decode_dtypes):
-            dtype_out = dtype_q if dtype_q not in fp8_dtypes else "f16"
+        for dtype_q, dtype_kv in list(zip(decode_dtypes, decode_dtypes)) + list(
+            itertools.product(fp16_dtypes, fp8_dtypes)
+        ):
+            dtype_out = dtype_q
             fname = f"single_decode_head_{head_dim}_logitshook_{logits_hook}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_out}.cu"
             files.append(prefix + "/" + fname)
             content = generate_single_decode_inst.get_cu_file_str(
@@ -140,8 +144,10 @@ def get_instantiation_cu() -> List[str]:
         pos_encoding_modes,
     ):
         for idtype in idtypes:
-            for dtype_q, dtype_kv in itertools.product(decode_dtypes, decode_dtypes):
-                dtype_out = dtype_q if dtype_q not in fp8_dtypes else "f16"
+            for dtype_q, dtype_kv in list(zip(decode_dtypes, decode_dtypes)) + list(
+                itertools.product(fp16_dtypes, fp8_dtypes)
+            ):
+                dtype_out = dtype_q
                 fname = f"batch_paged_decode_head_{head_dim}_logitshook_{logits_hook}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_out}_idtype_{idtype}.cu"
                 files.append(prefix + "/" + fname)
                 content = generate_batch_paged_decode_inst.get_cu_file_str(
@@ -155,21 +161,6 @@ def get_instantiation_cu() -> List[str]:
                     idtype,
                 )
                 write_if_different(root / prefix / fname, content)
-
-        for dtype_q, dtype_kv in itertools.product(decode_dtypes, decode_dtypes):
-            dtype_out = dtype_q if dtype_q not in fp8_dtypes else "f16"
-            fname = f"batch_padded_decode_head_{head_dim}_logitshook_{logits_hook}_layout_{kv_layout}_posenc_{pos_encoding_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_out}.cu"
-            files.append(prefix + "/" + fname)
-            content = generate_batch_padded_decode_inst.get_cu_file_str(
-                head_dim,
-                logits_hook,
-                kv_layout,
-                pos_encoding_mode,
-                dtype_q,
-                dtype_kv,
-                dtype_out,
-            )
-            write_if_different(root / prefix / fname, content)
 
     # single prefill files
     for (
@@ -369,7 +360,7 @@ if __name__ == "__main__":
                     "-Xcompiler",
                     "-mcmodel=medium",
                     "-Xcompiler",
-                    "\"-Wl,--no-relax\""
+                    '"-Wl,--no-relax"',
                 ],
             },
         )

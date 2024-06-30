@@ -52,7 +52,7 @@ def _get_cache_buf(name: str, bytes: int, device: torch.device):
 
 
 def _grouped_size_compiled_for_decode_kernels(num_qo_heads: int, num_kv_heads: int):
-    return (num_qo_heads // num_kv_heads) in [1, 4, 8]
+    return (num_qo_heads // num_kv_heads) in [1, 2, 4, 8]
 
 
 def single_decode_with_kv_cache(
@@ -165,7 +165,6 @@ def single_decode_with_kv_cache(
         )
 
     if use_tensor_cores:
-        print(q.shape, k.shape)
         out = _kernels.single_prefill_with_kv_cache(
             q.unsqueeze(0),
             k,
@@ -197,244 +196,6 @@ def single_decode_with_kv_cache(
     if v_scale is not None:
         out *= v_scale
     return out
-
-
-def batch_decode_with_padded_kv_cache(
-    q: torch.Tensor,
-    k_padded: torch.Tensor,
-    v_padded: torch.Tensor,
-    kv_layout: str = "NHD",
-    pos_encoding_mode: str = "NONE",
-    q_scale: Optional[float] = None,
-    k_scale: Optional[float] = None,
-    v_scale: Optional[float] = None,
-    logits_soft_cap: Optional[float] = None,
-    sm_scale: Optional[float] = None,
-    rope_scale: Optional[float] = None,
-    rope_theta: Optional[float] = None,
-):
-    r"""Decode attention with padded KV cache for batch of requests, return attention
-    output.
-
-    Parameters
-    ----------
-    q : torch.Tensor
-        The query tensor, shape: ``[batch_size, num_qo_heads, head_dim]``.
-    k_padded : torch.Tensor
-        The padded key tensor, shape:
-        ``[batch_size, padded_seq_len, num_kv_heads, head_dim]`` if :attr:`kv_layout`
-        is ``NHD`` or ``[batch_size, num_kv_heads, padded_seq_len, head_dim]`` if
-        :attr:`kv_layout` is ``HND``.
-    v_padded : torch.Tensor
-        The padded value tensor, shape:
-        ``[batch_size, padded_seq_len, num_kv_heads, head_dim]`` if :attr:`kv_layout`
-        is ``NHD`` or ``[batch_size, num_kv_heads, padded_seq_len, head_dim]`` if
-        :attr:`kv_layout` is ``HND``.
-    kv_layout : str
-        The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
-    pos_encoding_mode : str
-        The position encoding applied inside attention kernels, could be
-        ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
-        Defaults to ``NONE``.
-    q_scale : Optional[float]
-        The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
-    k_scale : Optional[float]
-        The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
-    v_scale : Optional[float]
-        The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
-    logits_soft_cap : Optional[float]
-        The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
-        provided, will be set to ``0``. If greater than 0, the logits will be capped according to
-        formula:
-        :math:`\texttt{logits_soft_cap} \times \mathrm{tanh}(x / \texttt{logits_soft_cap})`,
-        where :math:`x` is the input logits.
-    sm_scale : Optional[float]
-        The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
-    rope_scale : Optional[float]
-        The scale used in RoPE interpolation, if not provided, will be set to ``1.0``.
-    rope_theta : Optional[float]
-        The theta used in RoPE, if not provided, will be set to ``1e4``.
-
-    Returns
-    -------
-    torch.Tensor
-        The attention output, shape: ``[batch_size, num_qo_heads, head_dim]``.
-
-    Examples
-    --------
-    >>> import torch
-    >>> import flashinfer
-    >>> padded_kv_len = 4096
-    >>> num_qo_heads = 32
-    >>> num_kv_heads = 32
-    >>> batch_size = 7
-    >>> head_dim = 128
-    >>> q = torch.randn(batch_size, num_qo_heads, head_dim).half().to("cuda:0")
-    >>> k_padded = torch.randn(batch_size, padded_kv_len, num_kv_heads, head_dim).half().to("cuda:0")
-    >>> v_padded = torch.randn(batch_size, padded_kv_len, num_kv_heads, head_dim).half().to("cuda:0")
-    >>> o = flashinfer.batch_decode_with_padded_kv_cache(
-    ...     q, k_padded, v_padded, "NHD", "LLAMA"
-    ... )
-    >>> o.shape
-    torch.Size([7, 32, 128])
-
-    Notes
-    -----
-    The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads`` is
-    not equal to ``num_kv_heads``, the function will use
-    `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
-    """
-    if logits_soft_cap is None:
-        logits_soft_cap = 0.0
-    if sm_scale is None:
-        head_dim = q.shape[-1]
-        sm_scale = 1.0 / math.sqrt(head_dim)
-    if q_scale is not None:
-        sm_scale *= q_scale
-    if k_scale is not None:
-        sm_scale *= k_scale
-    if rope_scale is None:
-        rope_scale = 1.0
-    if rope_theta is None:
-        rope_theta = 1e4
-    out = _kernels.batch_decode_with_padded_kv_cache(
-        q,
-        k_padded,
-        v_padded,
-        TensorLayout[kv_layout].value,
-        PosEncodingMode[pos_encoding_mode].value,
-        logits_soft_cap,
-        sm_scale,
-        rope_scale,
-        rope_theta,
-        False,  # return_lse
-    )[0]
-    if v_scale is not None:
-        out *= v_scale
-    return out
-
-
-def batch_decode_with_padded_kv_cache_return_lse(
-    q: torch.Tensor,
-    k_padded: torch.Tensor,
-    v_padded: torch.Tensor,
-    kv_layout: str = "NHD",
-    pos_encoding_mode: str = "NONE",
-    q_scale: Optional[float] = None,
-    k_scale: Optional[float] = None,
-    v_scale: Optional[float] = None,
-    logits_soft_cap: Optional[float] = None,
-    sm_scale: Optional[float] = None,
-    rope_scale: Optional[float] = None,
-    rope_theta: Optional[float] = None,
-):
-    r"""Decode attention with padded KV cache for batch of requests, return attention
-    output and logsumexp of attention scores, return attention output and logsumexp of
-    attention scores.
-
-    Parameters
-    ----------
-    q : torch.Tensor
-        The query tensor, shape: ``[batch_size, num_qo_heads, head_dim]``.
-    k_padded : torch.Tensor
-        The padded key tensor, shape:
-        ``[batch_size, padded_seq_len, num_kv_heads, head_dim]`` if :attr:`kv_layout`
-        is ``NHD`` or ``[batch_size, num_kv_heads, padded_seq_len, head_dim]`` if
-        :attr:`kv_layout` is ``HND``.
-    v_padded : torch.Tensor
-        The padded value tensor, shape:
-        ``[batch_size, padded_seq_len, num_kv_heads, head_dim]`` if :attr:`kv_layout`
-        is ``NHD`` or ``[batch_size, num_kv_heads, padded_seq_len, head_dim]`` if
-        :attr:`kv_layout` is ``HND``.
-    kv_layout : str
-        The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
-    pos_encoding_mode : str
-        The position encoding applied inside attention kernels, could be
-        ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
-        Defaults to ``NONE``.
-    logits_soft_cap : Optional[float]
-        The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
-        provided, will be set to ``0``. If greater than 0, the logits will be capped according to
-        formula:
-        :math:`\texttt{logits_soft_cap} \times \mathrm{tanh}(x / \texttt{logits_soft_cap})`,
-        where :math:`x` is the input logits.
-    q_scale : Optional[float]
-        The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
-    k_scale : Optional[float]
-        The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
-    v_scale : Optional[float]
-        The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
-    sm_scale : Optional[float]
-        The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
-    rope_scale : Optional[float]
-        The scale used in RoPE interpolation, if not provided, will be set to ``1.0``.
-    rope_theta : Optional[float]
-        The theta used in RoPE, if not provided, will be set to ``1e4``.
-
-    Returns
-    -------
-    V : torch.Tensor
-        The attention output, shape: [batch_size, num_qo_heads, head_dim]
-    S : torch.Tensor
-        The logsumexp of attention scores, Shape: [batch_size, num_qo_heads]
-
-    Examples
-    --------
-    >>> import torch
-    >>> import flashinfer
-    >>> padded_kv_len = 4096
-    >>> num_qo_heads = 32
-    >>> num_kv_heads = 32
-    >>> batch_size = 7
-    >>> head_dim = 128
-    >>> q = torch.randn(batch_size, num_qo_heads, head_dim).half().to("cuda:0")
-    >>> k_padded = torch.randn(batch_size, padded_kv_len, num_kv_heads, head_dim).half().to("cuda:0")
-    >>> v_padded = torch.randn(batch_size, padded_kv_len, num_kv_heads, head_dim).half().to("cuda:0")
-    >>> v, s = flashinfer.batch_decode_with_padded_kv_cache_return_lse(
-    ...     q, k_padded, v_padded, "NHD"
-    ... )
-    >>> v.shape
-    torch.Size([7, 32, 128])
-    >>> s.shape
-    torch.Size([7, 32])
-
-    Notes
-    -----
-    Please refer to the :ref:`tutorial <recursive-attention>` for a detailed
-    explanation of the log-sum-exp function and attention states.
-
-    The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads`` is
-    not equal to ``num_kv_heads``, the function will use
-    `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
-    """
-    if logits_soft_cap is None:
-        logits_soft_cap = 0.0
-    if sm_scale is None:
-        head_dim = q.shape[-1]
-        sm_scale = 1.0 / math.sqrt(head_dim)
-    if q_scale is not None:
-        sm_scale *= q_scale
-    if k_scale is not None:
-        sm_scale *= k_scale
-    if rope_scale is None:
-        rope_scale = 1.0
-    if rope_theta is None:
-        rope_theta = 1e4
-    V, s = _kernels.batch_decode_with_padded_kv_cache(
-        q,
-        k_padded,
-        v_padded,
-        TensorLayout[kv_layout].value,
-        PosEncodingMode[pos_encoding_mode].value,
-        logits_soft_cap,
-        sm_scale,
-        rope_scale,
-        rope_theta,
-        True,  # return_lse
-    )
-    if v_scale is not None:
-        V *= v_scale
-    return V, s
 
 
 class BatchDecodeWithPagedKVCacheWrapper:
@@ -982,8 +743,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,
                 PosEncodingMode[pos_encoding_mode].value,
-                sm_scale,
                 logits_soft_cap,
+                sm_scale,
                 rope_scale,
                 rope_theta,
                 True,  # return_lse

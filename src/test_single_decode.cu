@@ -23,32 +23,32 @@
 
 using namespace flashinfer;
 
-template <typename T>
+template <typename DTypeQO, typename DTypeKV>
 void _TestDecodingKernelCorrectness(size_t num_qo_heads, size_t num_kv_heads, size_t seq_len,
                                     size_t head_dim, QKVLayout kv_layout,
                                     PosEncodingMode pos_encoding_mode) {
-  std::vector<T> Q_host(num_qo_heads * head_dim);
-  std::vector<T> K_host(seq_len * num_kv_heads * head_dim);
-  std::vector<T> V_host(seq_len * num_kv_heads * head_dim);
-  std::vector<T> O_host(num_qo_heads * head_dim);
+  std::vector<DTypeQO> Q_host(num_qo_heads * head_dim);
+  std::vector<DTypeKV> K_host(seq_len * num_kv_heads * head_dim);
+  std::vector<DTypeKV> V_host(seq_len * num_kv_heads * head_dim);
+  std::vector<DTypeQO> O_host(num_qo_heads * head_dim);
 
   utils::vec_normal_(Q_host);
   utils::vec_normal_(K_host);
   utils::vec_normal_(V_host);
   utils::vec_zero_(O_host);
 
-  thrust::device_vector<T> Q(Q_host);
-  thrust::device_vector<T> K(K_host);
-  thrust::device_vector<T> V(V_host);
-  thrust::device_vector<T> O(O_host);
-  thrust::device_vector<T> tmp(16 * 1024 * 1024);
-  std::vector<T> o_ref_host;
+  thrust::device_vector<DTypeQO> Q(Q_host);
+  thrust::device_vector<DTypeKV> K(K_host);
+  thrust::device_vector<DTypeKV> V(V_host);
+  thrust::device_vector<DTypeQO> O(O_host);
+  thrust::device_vector<DTypeQO> tmp(32 * 1024 * 1024);
+  std::vector<DTypeQO> o_ref_host;
 
-  o_ref_host =
-      cpu_reference::single_mha<T, T>(Q_host, K_host, V_host, 1, seq_len, num_qo_heads,
-                                      num_kv_heads, head_dim, false, kv_layout, pos_encoding_mode);
+  o_ref_host = cpu_reference::single_mha<DTypeQO, DTypeKV, DTypeQO>(
+      Q_host, K_host, V_host, 1, seq_len, num_qo_heads, num_kv_heads, head_dim, false, kv_layout,
+      pos_encoding_mode);
 
-  cudaError_t status = SingleDecodeWithKVCache(
+  cudaError_t status = SingleDecodeWithKVCache<DTypeQO, DTypeKV, DTypeQO>(
       thrust::raw_pointer_cast(Q.data()), thrust::raw_pointer_cast(K.data()),
       thrust::raw_pointer_cast(V.data()), thrust::raw_pointer_cast(O.data()),
       thrust::raw_pointer_cast(tmp.data()), num_qo_heads, num_kv_heads, seq_len, head_dim,
@@ -56,8 +56,7 @@ void _TestDecodingKernelCorrectness(size_t num_qo_heads, size_t num_kv_heads, si
   EXPECT_EQ(status, cudaSuccess) << "SingleDecodeWithKVCache kernel launch failed, error message: "
                                  << cudaGetErrorString(status);
 
-  thrust::host_vector<T> o_host = O;
-  thrust::host_vector<T> tmp_host = tmp;
+  thrust::host_vector<DTypeQO> o_host = O;
 
   size_t num_result_errors_atol_1e_3_rtol_1e_3 = 0;
   bool nan_detected = false;
@@ -79,7 +78,7 @@ void _TestDecodingKernelCorrectness(size_t num_qo_heads, size_t num_kv_heads, si
   EXPECT_FALSE(nan_detected) << "NaN detected.";
 }
 
-template <typename T>
+template <typename DTypeQO, typename DTypeKV>
 void TestSingleDecodeKernelCorrectness() {
   for (size_t num_qo_heads : {32}) {
     for (size_t num_kv_heads : {4, 8, 32}) {
@@ -88,9 +87,9 @@ void TestSingleDecodeKernelCorrectness() {
         for (size_t head_dim : {64, 128, 256}) {
           for (unsigned int kv_layout : {0U, 1U}) {
             for (unsigned int pos_encoding_mode : {0U, 1U}) {
-              _TestDecodingKernelCorrectness<T>(num_qo_heads, num_kv_heads, seq_len, head_dim,
-                                                QKVLayout(kv_layout),
-                                                PosEncodingMode(pos_encoding_mode));
+              _TestDecodingKernelCorrectness<DTypeQO, DTypeKV>(num_qo_heads, num_kv_heads, seq_len,
+                                                               head_dim, QKVLayout(kv_layout),
+                                                               PosEncodingMode(pos_encoding_mode));
             }
           }
         }
@@ -100,20 +99,20 @@ void TestSingleDecodeKernelCorrectness() {
 }
 
 TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestFP16) {
-  TestSingleDecodeKernelCorrectness<half>();
+  TestSingleDecodeKernelCorrectness<half, half>();
 }
 
 #ifdef FLASHINFER_ENABLE_BF16
 TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestBF16) {
-  TestSingleDecodeKernelCorrectness<nv_bfloat16>();
+  TestSingleDecodeKernelCorrectness<nv_bfloat16, nv_bfloat16>();
 }
 #endif
 
 #ifdef FLASHINFER_ENABLE_FP8
 TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestE4M3) {
-  TestSingleDecodeKernelCorrectness<__nv_fp8_e4m3>();
+  TestSingleDecodeKernelCorrectness<half, __nv_fp8_e4m3>();
 }
 TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestE5M2) {
-  TestSingleDecodeKernelCorrectness<__nv_fp8_e5m2>();
+  TestSingleDecodeKernelCorrectness<half, __nv_fp8_e5m2>();
 }
 #endif

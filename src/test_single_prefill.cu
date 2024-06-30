@@ -54,7 +54,7 @@ void _TestSinglePrefillKernelCorrectness(size_t qo_len, size_t kv_len, size_t nu
                                  << cudaGetErrorString(status);
 
   thrust::host_vector<DTypeOut> o_h(o_d);
-  std::vector<DTypeOut> o_ref = cpu_reference::single_mha<DTypeIn, DTypeOut>(
+  std::vector<DTypeOut> o_ref = cpu_reference::single_mha<DTypeIn, DTypeIn, DTypeOut>(
       q, k, v, qo_len, kv_len, num_qo_heads, num_kv_heads, head_dim, causal, kv_layout,
       pos_encoding_mode);
   size_t num_results_error_atol = 0;

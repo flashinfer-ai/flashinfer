@@ -45,15 +45,6 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     float* lse, bool* block_valid_mask, uint32_t padded_batch_size, uint32_t num_qo_heads,
     float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream);
 
-template <uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK, QKVLayout KV_LAYOUT,
-          PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV, typename DTypeOut>
-cudaError_t BatchDecodeWithPaddedKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut* o,
-                                                   DTypeOut* tmp, float* lse, uint32_t batch_size,
-                                                   uint32_t padded_kv_len, uint32_t num_qo_heads,
-                                                   uint32_t num_kv_heads, float logits_soft_cap,
-                                                   float sm_scale, float rope_scale,
-                                                   float rope_theta, cudaStream_t stream);
-
 template <PageStorage PAGE_STORAGE, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK,
           QKVLayout KV_LAYOUT, PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV,
           typename DTypeOut, typename IdType>

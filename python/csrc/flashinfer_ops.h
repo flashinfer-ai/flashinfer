@@ -50,11 +50,6 @@ void merge_state_in_place(torch::Tensor v, torch::Tensor s, torch::Tensor v_othe
 
 std::vector<torch::Tensor> merge_states(torch::Tensor v, torch::Tensor s);
 
-std::vector<torch::Tensor> batch_decode_with_padded_kv_cache(
-    torch::Tensor q, torch::Tensor k_padded, torch::Tensor v_padded, unsigned int layout,
-    unsigned int pos_encoding_mode, float logits_soft_cap, float sm_scale, float rope_scale,
-    float rope_theta, bool return_lse);
-
 torch::Tensor sampling_from_probs(torch::Tensor probs, torch::Tensor uniform_samples);
 
 std::vector<torch::Tensor> top_p_sampling_from_probs(torch::Tensor probs,

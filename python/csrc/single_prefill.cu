@@ -59,7 +59,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
   const LogitsPostHook logits_post_hook =
       logits_soft_cap > 0.f ? LogitsPostHook::kSoftCap : LogitsPostHook::kNone;
 
-  bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
+  bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
       return DISPATCH_mask_mode(mask_mode, MASK_MODE, [&] {
         return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
@@ -142,7 +142,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache_custom_mask(
   const LogitsPostHook logits_post_hook =
       logits_soft_cap > 0.f ? LogitsPostHook::kSoftCap : LogitsPostHook::kNone;
 
-  bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
+  bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
       return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
         return DISPATCH_kv_layout(kv_layout, KV_LAYOUT, [&] {

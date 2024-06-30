@@ -30,8 +30,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("merge_state_in_place", &merge_state_in_place,
         "Merge another self-attention state in-place.");
   m.def("merge_states", &merge_states, "Merge multiple self-attention states");
-  m.def("batch_decode_with_padded_kv_cache", &batch_decode_with_padded_kv_cache,
-        "Multi-request batch decode with padded KV-Cache operator");
   m.def("sampling_from_probs", &sampling_from_probs, "Sample from probabilities");
   m.def("top_k_sampling_from_probs", &top_k_sampling_from_probs,
         "Top-k sampling from probabilities");
