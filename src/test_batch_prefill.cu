@@ -94,7 +94,7 @@ void _TestBatchPagedPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t n
     std::vector<T> q(q_len * num_qo_heads * head_dim);
     utils::vec_normal_(q);
 
-    std::vector<T> o_ref = cpu_reference::single_mha<T, T>(
+    std::vector<T> o_ref = cpu_reference::single_mha<T, T, T>(
         q, key[request_idx], value[request_idx], q_len, kv_len, num_qo_heads, num_kv_heads,
         head_dim, causal, QKVLayout::kNHD, pos_encoding_mode);
 
@@ -173,8 +173,8 @@ void _TestBatchRaggedPrefillKernelCorrectness(size_t num_kv_heads, size_t num_qo
     utils::vec_normal_(k);
     utils::vec_normal_(v);
     std::vector<T> o_ref =
-        cpu_reference::single_mha<T, T>(q, k, v, q_len, kv_len, num_qo_heads, num_kv_heads,
-                                        head_dim, causal, QKVLayout::kNHD, pos_encoding_mode);
+        cpu_reference::single_mha<T, T, T>(q, k, v, q_len, kv_len, num_qo_heads, num_kv_heads,
+                                           head_dim, causal, QKVLayout::kNHD, pos_encoding_mode);
     // NOTE(Zihao): The following code is only compatible with kv_layout = QKVLayout::kNHD
     std::copy(q.begin(), q.end(), std::back_inserter(queries));
     std::copy(k.begin(), k.end(), std::back_inserter(keys));
@@ -297,7 +297,7 @@ void _TestBatchPagedPrefillKernelShortContextCorrectness(size_t num_kv_heads, si
   for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
     // create one-hot queries
     int32_t q_len = q_lens[request_idx], kv_len = kv_lens[request_idx];
-    std::vector<T> o_ref_i = cpu_reference::single_mha<T, T>(
+    std::vector<T> o_ref_i = cpu_reference::single_mha<T, T, T>(
         q[request_idx], key[request_idx], value[request_idx], q_len, kv_len, num_qo_heads,
         num_kv_heads, head_dim, causal, QKVLayout::kNHD, pos_encoding_mode);
     o_ref.push_back(o_ref_i);
@@ -402,8 +402,8 @@ void _TestBatchPagedPrefillKernelLongContextCorrectness(size_t num_kv_heads, siz
   utils::vec_normal_(q);
 
   std::vector<T> o_ref =
-      cpu_reference::single_mha<T, T>(q, k, v, q_lens[0], kv_lens[0], num_qo_heads, num_kv_heads,
-                                      head_dim, causal, QKVLayout::kNHD, pos_encoding_mode);
+      cpu_reference::single_mha<T, T, T>(q, k, v, q_lens[0], kv_lens[0], num_qo_heads, num_kv_heads,
+                                         head_dim, causal, QKVLayout::kNHD, pos_encoding_mode);
 
   thrust::device_vector<int32_t> q_indptr_device(q_indptr);
   thrust::device_vector<T> q_device(q);

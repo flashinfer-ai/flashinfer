@@ -31,7 +31,6 @@ except ImportError as e:
         raise e
 
 from .decode import (
-    batch_decode_with_padded_kv_cache_return_lse,
     BatchDecodeWithPagedKVCacheWrapper,
 )
 from .prefill import (
@@ -173,122 +172,6 @@ def merge_states(v: torch.Tensor, s: torch.Tensor):
     torch.Size([2048, 32])
     """
     return _kernels.merge_states(v, s)
-
-
-def batch_decode_with_shared_prefix_padded_kv_cache(
-    q: torch.Tensor,
-    k_shared: torch.Tensor,
-    v_shared: torch.Tensor,
-    k_unique: torch.Tensor,
-    v_unique: torch.Tensor,
-    kv_layout: str = "NHD",
-    allow_fp16_qk_reduction=False,
-    sm_scale: Optional[float] = None,
-    rope_scale: Optional[float] = None,
-    rope_theta: Optional[float] = None,
-):
-    r"""Decode attention between queries and shared prefix kv-cache for batch of
-    requests.
-
-    Parameters
-    ----------
-    q : torch.Tensor
-        The query tensor, shape: ``[batch_size, num_qo_heads, head_dim]``.
-    k_shared : torch.Tensor
-        The shared prefix key tensor, shape:
-        ``[shared_prefix_len, num_kv_heads, head_dim]`` if :attr:`kv_layout` is ``NHD``,
-        or ``[num_kv_heads, shared_prefix_len, head_dim]`` if :attr:`kv_layout` is
-        ``HND``.
-    v_shared : torch.Tensor
-        The shared prefix value tensor, shape:
-        ``[shared_prefix_len, num_kv_heads, head_dim]`` if :attr:`kv_layout` is ``NHD``,
-        or ``[num_kv_heads, shared_prefix_len, head_dim]`` if :attr:`kv_layout` is
-        ``HND``.
-    k_unique : torch.Tensor
-        The request-independent suffix key tensor, shape:
-        ``[batch_size, unique_len, num_kv_heads, head_dim]`` if :attr:`kv_layout` is
-        ``NHD``, or ``[batch_size, num_kv_heads, unique_len, head_dim]`` if
-        :attr:`kv_layout` is ``HND``.
-    v_unique : torch.Tensor
-        The request-independent suffix value tensor, shape:
-        ``[batch_size, unique_len, num_kv_heads, head_dim]`` if :attr:`kv_layout` is
-        ``NHD``, or ``[batch_size, num_kv_heads, unique_len, head_dim]`` if
-        :attr:`kv_layout` is ``HND``.
-    kv_layout : str
-        The layout of the kv-cache, could be either "NHD" or "HND".
-    allow_fp16_qk_reduction : bool
-        Whether to use f16 for qk reduction (faster at the cost of slight precision
-        loss).
-    sm_scale : Optional[float]
-        The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``
-    rope_scale : Optional[float]
-        The scale used in RoPE interpolation, if not provided, will be set to ``1.0``.
-    rope_theta : Optional[float]
-        The theta used in RoPE, if not provided, will be set to ``1e4``.
-
-    Returns
-    -------
-    V : torch.Tensor
-        The attention output, shape: ``[batch_size, num_heads, head_dim]``
-
-    Example
-    -------
-    >>> import torch
-    >>> import flashinfer
-    >>> shared_prefix_len = 16384
-    >>> padded_unique_suffix_len = 2048
-    >>> batch_size = 53
-    >>> num_qo_heads = 32
-    >>> num_kv_heads = 32
-    >>> head_dim = 128
-    >>> q = torch.randn(batch_size, num_qo_heads, head_dim).half().to("cuda:0")
-    >>> k_shared = torch.randn(shared_prefix_len, num_kv_heads, head_dim).half().to("cuda:0")
-    >>> v_shared = torch.randn(shared_prefix_len, num_kv_heads, head_dim).half().to("cuda:0")
-    >>> k_unique = torch.randn(
-    ...     batch_size,
-    ...     padded_unique_suffix_len,
-    ...     num_kv_heads,
-    ...     head_dim
-    ... ).half().to("cuda:0")
-    >>> v_unique = torch.randn(
-    ...     batch_size,
-    ...     padded_unique_suffix_len,
-    ...     num_kv_heads,
-    ...     head_dim
-    ... ).half().to("cuda:0")
-    >>> o = flashinfer.batch_decode_with_shared_prefix_padded_kv_cache(
-    ...     q, k_shared, v_shared, k_unique, v_unique, kv_layout="NHD",
-    ...     allow_fp16_qk_reduction=True
-    ... )
-    >>> o.shape
-    torch.Size([53, 32, 128])
-    """
-    check_kv_layout(kv_layout)
-    V_shared, S_shared = single_prefill_with_kv_cache_return_lse(
-        q,
-        k_shared,
-        v_shared,
-        causal=False,
-        pos_encoding_mode="NONE",
-        kv_layout=kv_layout,
-        allow_fp16_qk_reduction=allow_fp16_qk_reduction,
-        sm_scale=sm_scale,
-        rope_scale=rope_scale,
-        rope_theta=rope_theta,
-    )
-    V_unique, S_unique = batch_decode_with_padded_kv_cache_return_lse(
-        q,
-        k_unique,
-        v_unique,
-        kv_layout=kv_layout,
-        pos_encoding_mode="NONE",
-        sm_scale=sm_scale,
-        rope_scale=rope_scale,
-        rope_theta=rope_theta,
-    )
-
-    merge_state_in_place(V_shared, S_shared, V_unique, S_unique)
-    return V_shared
 
 
 class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:

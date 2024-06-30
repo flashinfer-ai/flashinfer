@@ -16,8 +16,6 @@ limitations under the License.
 
 from .decode import (
     single_decode_with_kv_cache,
-    batch_decode_with_padded_kv_cache,
-    batch_decode_with_padded_kv_cache_return_lse,
     BatchDecodeWithPagedKVCacheWrapper,
     CUDAGraphBatchDecodeWithPagedKVCacheWrapper,
 )
@@ -31,7 +29,6 @@ from .cascade import (
     merge_state,
     merge_state_in_place,
     merge_states,
-    batch_decode_with_shared_prefix_padded_kv_cache,
     BatchDecodeWithSharedPrefixPagedKVCacheWrapper,
     BatchPrefillWithSharedPrefixPagedKVCacheWrapper,
 )

@@ -136,9 +136,9 @@ foreach(head_dim IN LISTS HEAD_DIMS)
           list(APPEND single_decode_kernels_src ${generated_kernel_src})
         endforeach(dtype)
 
-        # fp8 in, fp16 out
-        foreach(dtype IN LISTS DECODE_FP8_DTYPES)
-          set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_decode_head_${head_dim}_logitshook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_f16.cu)
+        # fp8 kv-cache
+        foreach(dtype_kv IN LISTS DECODE_FP8_DTYPES)
+          set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_decode_head_${head_dim}_logitshook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypeq_f16_dtypekv_${dtype_kv}_dtypeout_f16.cu)
           add_custom_command(
             OUTPUT ${generated_kernel_src}
             COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_single_decode_inst.py ${generated_kernel_src}
@@ -147,7 +147,7 @@ foreach(head_dim IN LISTS HEAD_DIMS)
             VERBATIM
           )
           list(APPEND single_decode_kernels_src ${generated_kernel_src})
-        endforeach(dtype)
+        endforeach(dtype_kv)
       endforeach(pos_encoding_mode)
     endforeach(kv_layout)
   endforeach(logits_post_hook)
@@ -172,9 +172,9 @@ foreach(head_dim IN LISTS HEAD_DIMS)
             list(APPEND batch_decode_kernels_src ${generated_kernel_src})
           endforeach(dtype)
 
-          # fp8 in, fp16 out
-          foreach(dtype IN LISTS DECODE_FP8_DTYPES)
-            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_decode_head_${head_dim}_logitshook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_f16_idtype_${idtype}.cu)
+          # fp8 kv-cache
+          foreach(dtype_kv IN LISTS DECODE_FP8_DTYPES)
+            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_decode_head_${head_dim}_logitshook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypeq_f16_dtypekv_${dtype_kv}_dtypeout_f16_idtype_${idtype}.cu)
             add_custom_command(
               OUTPUT ${generated_kernel_src}
               COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_decode_inst.py ${generated_kernel_src}
@@ -183,34 +183,8 @@ foreach(head_dim IN LISTS HEAD_DIMS)
               VERBATIM
             )
             list(APPEND batch_decode_kernels_src ${generated_kernel_src})
-          endforeach()
+          endforeach(dtype_kv)
         endforeach(idtype)
-
-        # padded kv-cache
-        foreach(dtype IN LISTS DECODE_DTYPES)
-          set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_padded_decode_head_${head_dim}_logitshook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_${dtype}.cu)
-          add_custom_command(
-            OUTPUT ${generated_kernel_src}
-            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_padded_decode_inst.py ${generated_kernel_src}
-            DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_padded_decode_inst.py
-            COMMENT "Generating additional source file ${generated_kernel_src}"
-            VERBATIM
-          )
-          list(APPEND batch_decode_kernels_src ${generated_kernel_src})
-        endforeach(dtype)
-
-        # padded kv-cache, fp8 in, fp16 out
-        foreach(dtype IN LISTS DECODE_FP8_DTYPES)
-          set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_padded_decode_head_${head_dim}_logitshook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_f16.cu)
-          add_custom_command(
-            OUTPUT ${generated_kernel_src}
-            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_padded_decode_inst.py ${generated_kernel_src}
-            DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_padded_decode_inst.py
-            COMMENT "Generating additional source file ${generated_kernel_src}"
-            VERBATIM
-          )
-          list(APPEND batch_decode_kernels_src ${generated_kernel_src})
-        endforeach()
       endforeach(pos_encoding_mode)
     endforeach(kv_layout)
   endforeach(logits_post_hook)

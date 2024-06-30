@@ -32,7 +32,7 @@
 using namespace flashinfer;
 
 #ifdef FLASHINFER_ENABLE_BF16
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...)                      \
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(pytorch_dtype, c_type, ...)                 \
   [&]() -> bool {                                                                        \
     switch (pytorch_dtype) {                                                             \
       case at::ScalarType::Half: {                                                       \
@@ -51,7 +51,7 @@ using namespace flashinfer;
     }                                                                                    \
   }()
 #else
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...)                      \
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(pytorch_dtype, c_type, ...)                 \
   [&]() -> bool {                                                                        \
     switch (pytorch_dtype) {                                                             \
       case at::ScalarType::Half: {                                                       \
@@ -97,7 +97,7 @@ using namespace flashinfer;
 #endif
 
 #if defined(FLASHINFER_ENABLE_BF16) && defined(FLASHINFER_ENABLE_FP8)
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_COMBINED_FP8(pytorch_dtype, c_type, ...)         \
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...)                      \
   [&]() -> bool {                                                                        \
     switch (pytorch_dtype) {                                                             \
       case at::ScalarType::Half: {                                                       \
@@ -124,7 +124,7 @@ using namespace flashinfer;
     }                                                                                    \
   }()
 #elif defined(FLASHINFER_ENABLE_BF16)
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_COMBINED_FP8(pytorch_dtype, c_type, ...)         \
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...)                      \
   [&]() -> bool {                                                                        \
     switch (pytorch_dtype) {                                                             \
       case at::ScalarType::Half: {                                                       \
@@ -143,7 +143,7 @@ using namespace flashinfer;
     }                                                                                    \
   }()
 #elif defined(FLASHINFER_ENABLE_FP8)
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_COMBINED_FP8(pytorch_dtype, c_type, ...)             \
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...)                          \
   [&]() -> bool {                                                                            \
     switch (pytorch_dtype) {                                                                 \
       case at::ScalarType::Float8_e4m3fn: {                                                  \
@@ -162,7 +162,7 @@ using namespace flashinfer;
     }                                                                                        \
   }()
 #else
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_COMBINED_FP8(pytorch_dtype, c_type, ...)         \
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...)                      \
   [&]() -> bool {                                                                        \
     switch (pytorch_dtype) {                                                             \
       case at::ScalarType::Half: {                                                       \

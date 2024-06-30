@@ -37,7 +37,7 @@ void BatchPrefillWithPagedKVCachePyTorchWrapper::BeginForward(
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
   handler_->SetCUDAStream(torch_current_stream);
 
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE(empty_q_data.scalar_type(), q_type, [&] {
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(empty_q_data.scalar_type(), q_type, [&] {
     cudaError_t status = handler_->BeginForward<q_type, int32_t>(
         static_cast<void*>(workspace_buffer.data_ptr()), workspace_size_in_bytes,
         static_cast<int32_t*>(qo_indptr.data_ptr()),
@@ -111,7 +111,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
   const LogitsPostHook logits_post_hook =
       logits_soft_cap > 0.f ? LogitsPostHook::kSoftCap : LogitsPostHook::kNone;
 
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
       return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
         paged_kv_t<PageStorage::kIndices, KV_LAYOUT, c_type, int32_t> paged_kv(
@@ -218,7 +218,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCu
   const LogitsPostHook logits_post_hook =
       logits_soft_cap > 0.f ? LogitsPostHook::kSoftCap : LogitsPostHook::kNone;
 
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
       return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
         paged_kv_t<PageStorage::kIndices, KV_LAYOUT, c_type, int32_t> paged_kv(
@@ -280,7 +280,7 @@ void BatchPrefillWithRaggedKVCachePyTorchWrapper::BeginForward(
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
   handler_->SetCUDAStream(torch_current_stream);
 
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE(empty_q_data.scalar_type(), q_type, [&] {
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(empty_q_data.scalar_type(), q_type, [&] {
     cudaError_t status = handler_->BeginForward<q_type, int32_t>(
         static_cast<void*>(workspace_buffer.data_ptr()), workspace_size_in_bytes,
         static_cast<int32_t*>(qo_indptr.data_ptr()), static_cast<int32_t*>(kv_indptr.data_ptr()),
@@ -342,7 +342,7 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
   const LogitsPostHook logits_post_hook =
       logits_soft_cap > 0.f ? LogitsPostHook::kSoftCap : LogitsPostHook::kNone;
 
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
       return DISPATCH_mask_mode(mask_mode, MASK_MODE, [&] {
         return DISPATCH_allow_fp16_qk_reduction(
@@ -433,7 +433,7 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardC
   const LogitsPostHook logits_post_hook =
       logits_soft_cap > 0.f ? LogitsPostHook::kSoftCap : LogitsPostHook::kNone;
 
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
       return DISPATCH_allow_fp16_qk_reduction(
           allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {

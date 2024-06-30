@@ -31,7 +31,7 @@ torch::Tensor rmsnorm(torch::Tensor x, torch::Tensor w, double eps) {
 
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
   auto y = torch::empty_like(x);
-  DISPATCH_PYTORCH_DTYPE_TO_CTYPE(x.scalar_type(), c_type, [&] {
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(x.scalar_type(), c_type, [&] {
     cudaError_t status = norm::RMSNorm(
         static_cast<c_type*>(x.data_ptr()), static_cast<c_type*>(w.data_ptr()),
         static_cast<c_type*>(y.data_ptr()), batch_size, hidden_size, eps, torch_current_stream);

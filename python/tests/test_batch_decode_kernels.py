@@ -29,9 +29,8 @@ import flashinfer
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
-@pytest.mark.parametrize(
-    "q_dtype", [torch.float16, torch.float8_e4m3fn, torch.float8_e5m2]
-)
+@pytest.mark.parametrize("return_lse", [True, False])
+@pytest.mark.parametrize("q_dtype", [torch.float16])
 @pytest.mark.parametrize(
     "kv_dtype", [torch.float16, torch.float8_e4m3fn, torch.float8_e5m2]
 )
@@ -44,6 +43,7 @@ def test_batch_decode_with_paged_kv_cache(
     head_dim,
     kv_layout,
     pos_encoding_mode,
+    return_lse,
     q_dtype,
     kv_dtype,
 ):
@@ -75,7 +75,14 @@ def test_batch_decode_with_paged_kv_cache(
         data_type=kv_dtype,
         q_data_type=q_dtype,
     )
-    o = wrapper.forward(q, kv_data.to(kv_dtype), pos_encoding_mode=pos_encoding_mode)
+    if return_lse:
+        o, _ = wrapper.forward_return_lse(
+            q, kv_data.to(kv_dtype), pos_encoding_mode=pos_encoding_mode
+        )
+    else:
+        o = wrapper.forward(
+            q, kv_data.to(kv_dtype), pos_encoding_mode=pos_encoding_mode
+        )
 
     for i in range(batch_size):
         perm_dims = [0, 2, 1, 3] if kv_layout == "HND" else [0, 1, 2, 3]
@@ -127,9 +134,7 @@ def test_batch_decode_with_paged_kv_cache(
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
-@pytest.mark.parametrize(
-    "q_dtype", [torch.float16, torch.float8_e4m3fn, torch.float8_e5m2]
-)
+@pytest.mark.parametrize("q_dtype", [torch.float16])
 @pytest.mark.parametrize(
     "kv_dtype", [torch.float16, torch.float8_e4m3fn, torch.float8_e5m2]
 )
@@ -288,13 +293,13 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
 
 if __name__ == "__main__":
     test_batch_decode_with_paged_kv_cache(
-        256, 54, 8, 8, 8, 128, "NHD", "NONE", torch.float16, torch.float16
+        256, 54, 8, 8, 8, 128, "NHD", "NONE", False, torch.float16, torch.float16
     )
     test_batch_decode_with_paged_kv_cache(
-        12, 2048, 8, 8, 8, 128, "NHD", "NONE", torch.float16, torch.float16
+        12, 2048, 8, 8, 8, 128, "NHD", "NONE", False, torch.float16, torch.float16
     )
     test_batch_decode_with_paged_kv_cache(
-        12, 54, 1, 8, 8, 128, "HND", "NONE", torch.float8_e5m2, torch.float8_e5m2
+        12, 54, 1, 8, 8, 128, "HND", "NONE", True, torch.float16, torch.float8_e5m2
     )
     test_cuda_graph_batch_decode_with_paged_kv_cache(
         12, 2048, 8, 8, 8, 128, "NHD", "NONE", torch.float16, torch.float16
@@ -303,8 +308,8 @@ if __name__ == "__main__":
         128, 54, 8, 8, 8, 128, "NHD", "NONE", torch.float16, torch.float16
     )
     test_batch_decode_with_paged_kv_cache(
-        12, 54, 1, 8, 8, 128, "HND", "NONE", torch.float8_e5m2, torch.float16
+        12, 54, 1, 8, 8, 128, "HND", "NONE", True, torch.float16, torch.float8_e5m2
     )
     test_cuda_graph_batch_decode_with_paged_kv_cache(
-        12, 54, 8, 8, 8, 128, "HND", "NONE", torch.float8_e5m2, torch.float16
+        12, 54, 8, 8, 8, 128, "HND", "NONE", torch.float16, torch.float8_e5m2
     )
