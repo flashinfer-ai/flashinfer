@@ -112,6 +112,7 @@ Currently FlashInfer is adopted by the following projects:
 - [MLC-LLM](https://github.com/mlc-ai/mlc-llm)
 - [Punica](https://github.com/punica-ai/punica)
 - [sglang](https://github.com/sgl-project/sglang)
+- [ScaleLLM](https://github.com/vectorch-ai/ScaleLLM)
 
 ## Acknowledgement
 
