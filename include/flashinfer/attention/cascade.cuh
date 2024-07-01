@@ -152,23 +152,40 @@ __global__ void MergeStatesKernel(DTypeIn* __restrict__ V, float* __restrict__ S
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t pos = blockIdx.x;
   uint32_t head_idx = ty;
-  state_t<vec_size> st;
 
-  vec_t<float, vec_size> v_merged_vec;
-  v_merged_vec.fill(0.f);
+  if (num_index_sets > 1) {
+    vec_t<float, vec_size> v_merged_vec;
+    state_t<vec_size> st;
+    v_merged_vec.fill(0.f);
 #pragma unroll 2
-  for (uint32_t iter = 0; iter < num_index_sets; ++iter) {
-    float s = S[(pos * num_index_sets + iter) * num_heads + head_idx];
-    vec_t<float, vec_size> v;
-    v.cast_load(V + ((pos * num_index_sets + iter) * num_heads + head_idx) * head_dim +
-                tx * vec_size);
-    st.merge(v, s, 1);
-  }
+    for (uint32_t iter = 0; iter < num_index_sets; ++iter) {
+      float s = S[(pos * num_index_sets + iter) * num_heads + head_idx];
+      vec_t<float, vec_size> v;
+      v.cast_load(V + ((pos * num_index_sets + iter) * num_heads + head_idx) * head_dim +
+                  tx * vec_size);
+      st.merge(v, s, 1);
+    }
 
-  st.normalize();
-  st.o.cast_store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
-  if (s_merged != nullptr) {
-    s_merged[pos * num_heads + head_idx] = st.get_lse();
+    st.normalize();
+    st.o.cast_store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+    if (s_merged != nullptr) {
+      s_merged[pos * num_heads + head_idx] = st.get_lse();
+    }
+  } else if (num_index_sets == 1) {
+    vec_t<DTypeOut, vec_size> v;
+    v.cast_load(V + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+    v.store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+    if (s_merged != nullptr) {
+      s_merged[pos * num_heads + head_idx] = S[pos * num_heads + head_idx];
+    }
+  } else {
+    // num_index_sets == 0
+    vec_t<DTypeOut, vec_size> v;
+    v.fill(DTypeOut(0));
+    v.store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+    if (s_merged != nullptr) {
+      s_merged[pos * num_heads + head_idx] = -5e4;
+    }
   }
 }
 
@@ -291,51 +308,68 @@ __global__ void VariableLengthMergeStatesKernel(DTypeIn* __restrict__ V, float* 
   float* s_smem = (float*)(smem + num_smem_stages * bdy * head_dim * sizeof(DTypeIn));
   const uint32_t num_index_sets = indptr[pos + 1] - indptr[pos];
 
+  if (num_index_sets > 1) {
 #pragma unroll
-  for (uint32_t iter = 0; iter < num_smem_stages; ++iter) {
-    cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
-        v_smem + (iter * bdy + ty) * head_dim + tx * vec_size,
-        V + ((indptr[pos] + (iter * bdy + ty)) * num_heads + head_idx) * head_dim + tx * vec_size,
-        (iter * bdy + ty) < num_index_sets);
-    cp_async::commit_group();
-  }
+    for (uint32_t iter = 0; iter < num_smem_stages; ++iter) {
+      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+          v_smem + (iter * bdy + ty) * head_dim + tx * vec_size,
+          V + ((indptr[pos] + (iter * bdy + ty)) * num_heads + head_idx) * head_dim + tx * vec_size,
+          (iter * bdy + ty) < num_index_sets);
+      cp_async::commit_group();
+    }
 #pragma unroll 4
-  for (uint32_t iter = 0; iter < ceil_div(num_index_sets, bdy); ++iter) {
-    if (iter % bdx == 0) {
-      s_smem[ty * bdx + tx] =
-          iter * bdy + (ty * bdx + tx) < num_index_sets
-              ? S[(indptr[pos] + (iter * bdy + ty * bdx + tx)) * num_heads + head_idx]
-              : 0.f;
+    for (uint32_t iter = 0; iter < ceil_div(num_index_sets, bdy); ++iter) {
+      if (iter % bdx == 0) {
+        s_smem[ty * bdx + tx] =
+            iter * bdy + (ty * bdx + tx) < num_index_sets
+                ? S[(indptr[pos] + (iter * bdy + ty * bdx + tx)) * num_heads + head_idx]
+                : 0.f;
+        __syncthreads();
+      }
+      cp_async::wait_group<num_smem_stages - 1>();
       __syncthreads();
+      vec_t<float, vec_size> v;
+      v.cast_load(v_smem + ((iter % num_smem_stages) * bdy + ty) * head_dim + tx * vec_size);
+      if (iter * bdy + ty < num_index_sets) {
+        float s = s_smem[(iter % bdx) * bdy + ty];
+        st.merge(v, s, 1);
+      }
+      __syncthreads();
+      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+          v_smem + ((iter % num_smem_stages) * bdy + ty) * head_dim + tx * vec_size,
+          V +
+              ((indptr[pos] + ((iter + num_smem_stages) * bdy + ty)) * num_heads + head_idx) *
+                  head_dim +
+              tx * vec_size,
+          (iter + num_smem_stages) * bdy + ty < num_index_sets);
+      cp_async::commit_group();
     }
-    cp_async::wait_group<num_smem_stages - 1>();
+    cp_async::wait_group<0>();
     __syncthreads();
-    vec_t<float, vec_size> v;
-    v.cast_load(v_smem + ((iter % num_smem_stages) * bdy + ty) * head_dim + tx * vec_size);
-    if (iter * bdy + ty < num_index_sets) {
-      float s = s_smem[(iter % bdx) * bdy + ty];
-      st.merge(v, s, 1);
+
+    st.normalize();
+    threadblock_sync_state<bdx, bdy, vec_size>(st, v_smem, s_smem);
+    st.normalize();
+
+    st.o.cast_store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+    if (s_merged != nullptr) {
+      s_merged[pos * num_heads + head_idx] = st.get_lse();
     }
-    __syncthreads();
-    cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
-        v_smem + ((iter % num_smem_stages) * bdy + ty) * head_dim + tx * vec_size,
-        V +
-            ((indptr[pos] + ((iter + num_smem_stages) * bdy + ty)) * num_heads + head_idx) *
-                head_dim +
-            tx * vec_size,
-        (iter + num_smem_stages) * bdy + ty < num_index_sets);
-    cp_async::commit_group();
-  }
-  cp_async::wait_group<0>();
-  __syncthreads();
-
-  st.normalize();
-  threadblock_sync_state<bdx, bdy, vec_size>(st, v_smem, s_smem);
-  st.normalize();
-
-  st.o.cast_store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
-  if (s_merged != nullptr) {
-    s_merged[pos * num_heads + head_idx] = st.get_lse();
+  } else if (num_index_sets == 1) {
+    vec_t<DTypeOut, vec_size> v;
+    v.cast_load(V + (indptr[pos] * num_heads + head_idx) * head_dim + tx * vec_size);
+    v.store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+    if (s_merged != nullptr) {
+      s_merged[pos * num_heads + head_idx] = S[indptr[pos] * num_heads + head_idx];
+    }
+  } else {
+    // num_index_sets == 0
+    vec_t<DTypeOut, vec_size> v;
+    v.fill(DTypeOut(0));
+    v.store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+    if (s_merged != nullptr) {
+      s_merged[pos * num_heads + head_idx] = -5e4;
+    }
   }
 }
 
