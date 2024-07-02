@@ -125,7 +125,7 @@ std::vector<dtype_out> single_mha(const std::vector<dtype_q>& q, const std::vect
               }
             }
             // apply mask
-            if (causal && kv_idx > kv_len + q_idx - qo_len) {
+            if (causal && kv_idx >= kv_len + q_idx - qo_len) {
               att[kv_idx] = -5e4;
             }
             max_val = std::max(max_val, att[kv_idx]);

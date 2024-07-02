@@ -619,7 +619,7 @@ __device__ __forceinline__ void mask_s(const uint32_t qo_packed_idx_base,
                                 reg_id % 2;
         const bool out_of_boundary =
             (mask_mode == MaskMode::kCausal
-                 ? (kv_idx > kv_len + q_idx - qo_len || (partition_kv && kv_idx >= chunk_end))
+                 ? (kv_idx >= kv_len + q_idx - qo_len || (partition_kv && kv_idx >= chunk_end))
                  : kv_idx >= chunk_end);
         s_frag[fx][fz][reg_id] =
             (out_of_boundary ||
