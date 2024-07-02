@@ -412,9 +412,8 @@ __device__ __forceinline__ void rowsum_f8f8f32(float* d, DType* s) {
   if constexpr (std::is_same<DType, __nv_fp8_e4m3>::value) {
     asm volatile(
         "{\n"
-        ".reg .f32 ph;\n"
         "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-        "{%0,  ph,  %1,  ph},"
+        "{%0,  _,  %1,  _},"
         "{%2,  %3,  %4,  %5},"
         "{%6,  %7},"
         "{%8,  0.,  %9,  0.};\n"
@@ -425,9 +424,8 @@ __device__ __forceinline__ void rowsum_f8f8f32(float* d, DType* s) {
   } else {  // e5m2
     asm volatile(
         "{\n"
-        ".reg .f32 ph;\n"
         "mma.sync.aligned.m16n8k16.row.col.f32.e5m2.e5m2.f32 "
-        "{%0,  ph,  %1,  ph},"
+        "{%0,  _,  %1,  _},"
         "{%2,  %3,  %4,  %5},"
         "{%6,  %7},"
         "{%8,  0.,  %9,  0.};\n"
@@ -454,9 +452,8 @@ __device__ __forceinline__ void rowsum_f16f16f32(float* d, DType* s) {
   if constexpr (std::is_same<DType, half>::value) {
     asm volatile(
         "{\n"
-        ".reg .f32 ph;\n"
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-        "{%0,  ph,  %1,  ph},"
+        "{%0,  _,  %1,  _},"
         "{%2,  %3,  %4,  %5},"
         "{%6,  %7},"
         "{%8,  0.,  %9,  0.};\n"
@@ -467,9 +464,8 @@ __device__ __forceinline__ void rowsum_f16f16f32(float* d, DType* s) {
   } else {
     asm volatile(
         "{\n"
-        ".reg .f32 ph;\n"
         "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{%0,  ph,  %1,  ph},"
+        "{%0,  _,  %1,  _},"
         "{%2,  %3,  %4,  %5},"
         "{%6,  %7},"
         "{%8,  0.,  %9,  0.};\n"
@@ -482,9 +478,8 @@ __device__ __forceinline__ void rowsum_f16f16f32(float* d, DType* s) {
   static_assert(std::is_same<DType, half>::value, "bf16 mma instruction is not supported on sm_75");
   asm volatile(
       "{\n"
-      ".reg .f32 ph;\n"
       "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-      "{%0,  ph,  %1,  ph},"
+      "{%0,  _,  %1,  _},"
       "{%2,  %3},"
       "{%4},"
       "{%5,  0.,  %6,  0.};\n"
@@ -493,9 +488,8 @@ __device__ __forceinline__ void rowsum_f16f16f32(float* d, DType* s) {
       : "r"(s_u32[0]), "r"(s_u32[1]), "r"(1006648320), "f"(d[0]), "f"(d[1]));
   asm volatile(
       "{\n"
-      ".reg .f32 ph;\n"
       "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-      "{%0,  ph,  %1,  ph},"
+      "{%0,  _,  %1,  _},"
       "{%2,  %3},"
       "{%4},"
       "{%5,  0.,  %6,  0.};\n"
