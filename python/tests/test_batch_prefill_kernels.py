@@ -85,9 +85,22 @@ def test_batch_prefill_with_paged_kv_cache(
             head_dim,
             page_size,
         )
-        o = wrapper.forward(
-            q, kv_data, causal=causal, pos_encoding_mode=pos_encoding_mode
-        )
+        if return_lse:
+            o, _ = wrapper.forward_return_lse(
+                q,
+                kv_data,
+                causal=causal,
+                pos_encoding_mode=pos_encoding_mode,
+                logits_soft_cap=logits_soft_cap,
+            )
+        else:
+            o = wrapper.forward(
+                q,
+                kv_data,
+                causal=causal,
+                pos_encoding_mode=pos_encoding_mode,
+                logits_soft_cap=logits_soft_cap,
+            )
     else:
         q_indptr_buffer = torch.empty(batch_size + 1).int().to(0)
         kv_indptr_buffer = torch.empty(batch_size + 1).int().to(0)
