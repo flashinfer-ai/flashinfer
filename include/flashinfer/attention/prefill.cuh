@@ -619,7 +619,7 @@ __device__ __forceinline__ void mask_s(const uint32_t qo_packed_idx_base,
                                 reg_id % 2;
         const bool out_of_boundary =
             (mask_mode == MaskMode::kCausal
-                 ? (kv_idx > kv_len + q_idx - qo_len || (partition_kv && kv_idx >= chunk_end))
+                 ? (kv_idx + qo_len > kv_len + q_idx || (partition_kv && kv_idx >= chunk_end))
                  : kv_idx >= chunk_end);
         s_frag[fx][fz][reg_id] =
             (out_of_boundary ||
@@ -1503,9 +1503,11 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
                  kv_tile_idx = kv_tile_indices[bx];
   constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps_x * 16;
   const uint32_t qo_len = q_indptr[request_idx + 1] - q_indptr[request_idx],
-                 kv_len = (paged_kv.indptr[request_idx + 1] - paged_kv.indptr[request_idx] - 1) *
-                              paged_kv.page_size +
-                          paged_kv.last_page_len[request_idx];
+                 kv_len = (paged_kv.indptr[request_idx + 1] != paged_kv.indptr[request_idx])
+                              ? (paged_kv.indptr[request_idx + 1] - paged_kv.indptr[request_idx] -
+                                 1) * paged_kv.page_size +
+                                    paged_kv.last_page_len[request_idx]
+                              : 0;
   const uint32_t chunk_size = partition_kv ? kv_chunk_size : kv_len;
   const uint32_t chunk_start = partition_kv ? kv_tile_idx * chunk_size : 0;
   const uint32_t chunk_end = partition_kv ? min((kv_tile_idx + 1) * chunk_size, kv_len) : kv_len;
@@ -1908,6 +1910,12 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
   const uint32_t group_size = num_qo_heads / num_kv_heads;
   const uint_fastdiv group_size_fastdiv(group_size);
 
+  if (padded_batch_size == 0) {
+    // No request, skip
+    // this won't happen in CUDAGraph mode because we fixed the padded_batch_size
+    return cudaSuccess;
+  }
+
   dim3 nblks(padded_batch_size, 1, num_kv_heads);
   dim3 nthrs(32, num_warps_x, num_warps_z);
   constexpr uint32_t num_frags_y = HEAD_DIM / 16;
@@ -2039,6 +2047,12 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
   const uint32_t num_kv_heads = paged_kv.num_heads;
   const uint32_t group_size = num_qo_heads / num_kv_heads;
   const uint_fastdiv group_size_fastdiv(group_size);
+
+  if (padded_batch_size == 0) {
+    // No request, skip
+    // this won't happen in CUDAGraph mode because we fixed the padded_batch_size
+    return cudaSuccess;
+  }
 
   dim3 nblks(padded_batch_size, 1, num_kv_heads);
   dim3 nthrs(32, num_warps_x, num_warps_z);
