@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.0.8](https://github.com/flashinfer-ai/flashinfer/compare/v0.0.7...v0.0.8) (2024-07-03)
+
+### Bugfix
+
+* fix prefill/append kernel behavior for empty kv-cache ([#353](https://github.com/flashinfer-ai/flashinfer/pull/353)) ([7adc8c](https://github.com/flashinfer-ai/flashinfer/commit/7adc8cf01a029645307c321a7754d0b0a4f0f4de))
+* fix decode attention kernel with logits cap ([#350](https://github.com/flashinfer-ai/flashinfer/pull/350)) ([f5f7a2](https://github.com/flashinfer-ai/flashinfer/commit/f5f7a2a23249fd0be5b30fd8fb3957ac3bb527ca))
+
+
 ## [0.0.7](https://github.com/flashinfer-ai/flashinfer/compare/v0.0.6...v0.0.7) (2024-06-28)
 
 ### Breaking Changes
