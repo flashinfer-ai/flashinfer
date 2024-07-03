@@ -114,7 +114,8 @@ inline std::tuple<bool, uint32_t, uint32_t> PrefillBinarySearchKVChunkSize(
 
   new_batch_size = 0;
   for (uint32_t i = 0; i < batch_size; ++i) {
-    new_batch_size += ceil_div(packed_qo_len_arr[i], qo_chunk_size) * ceil_div(kv_len_arr[i], low);
+    new_batch_size += ceil_div(packed_qo_len_arr[i], qo_chunk_size) *
+                      ceil_div(std::max(int(kv_len_arr[i]), 1), low);
   }
   return {low < max_kv_len, low, new_batch_size};
 }
@@ -571,7 +572,8 @@ cudaError_t PrefillSplitQOKVIndptr(bool& split_kv, uint32_t& split_max_batch_siz
   // step 3: split qo_indptr and kv_indptr
   total_num_tiles_q = 0;
   for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
-    int64_t packed_qo_len = packed_qo_len_arr[request_idx], kv_len = kv_len_arr[request_idx];
+    int64_t packed_qo_len = packed_qo_len_arr[request_idx],
+            kv_len = std::max(int(kv_len_arr[request_idx]), 1);
     int64_t num_tiles_q = ceil_div(packed_qo_len, qo_chunk_size),
             num_tiles_kv = ceil_div(kv_len, kv_chunk_size);
     total_num_tiles_q += num_tiles_q;
