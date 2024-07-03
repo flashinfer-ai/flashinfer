@@ -34,7 +34,7 @@ def attention_logits_soft_cap_torch(q, k, v, soft_cap):
 @pytest.mark.parametrize("seq_len", [1, 9, 81, 729, 33001])
 @pytest.mark.parametrize("num_heads", [4, 8, 32])
 @pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("soft_cap", [30.0, 50.0])
+@pytest.mark.parametrize("soft_cap", [1.0, 30.0, 50.0])
 def test_single_decode_logits_soft_cap(
     seq_len,
     num_heads,
@@ -56,7 +56,7 @@ def test_single_decode_logits_soft_cap(
 @pytest.mark.parametrize("kv_len", [1, 17, 81, 987, 31111])
 @pytest.mark.parametrize("num_heads", [4, 8, 32])
 @pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("soft_cap", [30.0, 50.0])
+@pytest.mark.parametrize("soft_cap", [1.0, 30.0, 50.0])
 def test_single_prefill_logits_soft_cap(
     q_len,
     kv_len,
