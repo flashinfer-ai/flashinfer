@@ -538,7 +538,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         custom_mask_buf: Optional[torch.Tensor] = None,
         qk_indptr_buf: Optional[torch.Tensor] = None,
     ):
-        r"""Constructor of :class:`BatchDecodeWithPagedKVCacheWrapper`.
+        r"""Constructor of :class:`BatchPrefillWithPagedKVCacheWrapper`.
 
         Parameters
         ----------
@@ -1134,7 +1134,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         custom_mask_buf: Optional[torch.Tensor] = None,
         qk_indptr_buf: Optional[torch.Tensor] = None,
     ):
-        r"""Constructor of :class:`BatchDecodeWithRaggedKVCacheWrapper`.
+        r"""Constructor of :class:`BatchPrefillWithRaggedKVCacheWrapper`.
 
         Parameters
         ----------
