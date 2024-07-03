@@ -32,6 +32,7 @@ import flashinfer
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
 @pytest.mark.parametrize("return_lse", [True, False])
 def test_batch_prefill_with_paged_kv_cache(
     batch_size,
@@ -45,6 +46,7 @@ def test_batch_prefill_with_paged_kv_cache(
     kv_layout,
     pos_encoding_mode,
     use_cuda_graph,
+    logits_soft_cap,
     return_lse,
 ):
     q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
@@ -124,11 +126,19 @@ def test_batch_prefill_with_paged_kv_cache(
             for _ in range(3):
                 if return_lse:
                     o, _ = wrapper.forward_return_lse(
-                        q, kv_data, causal=causal, pos_encoding_mode=pos_encoding_mode
+                        q,
+                        kv_data,
+                        causal=causal,
+                        pos_encoding_mode=pos_encoding_mode,
+                        logits_soft_cap=logits_soft_cap,
                     )
                 else:
                     o = wrapper.forward(
-                        q, kv_data, causal=causal, pos_encoding_mode=pos_encoding_mode
+                        q,
+                        kv_data,
+                        causal=causal,
+                        pos_encoding_mode=pos_encoding_mode,
+                        logits_soft_cap=logits_soft_cap,
                     )
         torch.cuda.current_stream().wait_stream(s)
         # capture
@@ -136,11 +146,19 @@ def test_batch_prefill_with_paged_kv_cache(
         with torch.cuda.graph(g):
             if return_lse:
                 o, _ = wrapper.forward_return_lse(
-                    q, kv_data, causal=causal, pos_encoding_mode=pos_encoding_mode
+                    q,
+                    kv_data,
+                    causal=causal,
+                    pos_encoding_mode=pos_encoding_mode,
+                    logits_soft_cap=logits_soft_cap,
                 )
             else:
                 o = wrapper.forward(
-                    q, kv_data, causal=causal, pos_encoding_mode=pos_encoding_mode
+                    q,
+                    kv_data,
+                    causal=causal,
+                    pos_encoding_mode=pos_encoding_mode,
+                    logits_soft_cap=logits_soft_cap,
                 )
         wrapper.end_forward()
 
@@ -196,7 +214,12 @@ def test_batch_prefill_with_paged_kv_cache(
             dim=0,
         )
         o_ref_i = flashinfer.single_prefill_with_kv_cache(
-            qi, ki, vi, causal=causal, pos_encoding_mode=pos_encoding_mode
+            qi,
+            ki,
+            vi,
+            causal=causal,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=logits_soft_cap,
         )
         o_i_np = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]].cpu().numpy()
         o_ref_i_np = o_ref_i.cpu().numpy()
@@ -212,6 +235,7 @@ def test_batch_prefill_with_paged_kv_cache(
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
 @pytest.mark.parametrize("return_lse", [True, False])
 def test_batch_prefill_with_paged_kv_cache_custom_mask(
     batch_size,
@@ -223,6 +247,7 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
     head_dim,
     kv_layout,
     pos_encoding_mode,
+    logits_soft_cap,
     return_lse,
 ):
     q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
@@ -269,10 +294,18 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
     )
     if return_lse:
         o_custom, _ = wrapper.forward_return_lse(
-            q, kv_data, pos_encoding_mode=pos_encoding_mode
+            q,
+            kv_data,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=logits_soft_cap,
         )
     else:
-        o_custom = wrapper.forward(q, kv_data, pos_encoding_mode=pos_encoding_mode)
+        o_custom = wrapper.forward(
+            q,
+            kv_data,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=logits_soft_cap,
+        )
     wrapper.end_forward()
 
     # use causal
@@ -288,11 +321,19 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
     )
     if return_lse:
         o_causal, _ = wrapper.forward_return_lse(
-            q, kv_data, causal=True, pos_encoding_mode=pos_encoding_mode
+            q,
+            kv_data,
+            causal=True,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=logits_soft_cap,
         )
     else:
         o_causal = wrapper.forward(
-            q, kv_data, causal=True, pos_encoding_mode=pos_encoding_mode
+            q,
+            kv_data,
+            causal=True,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=logits_soft_cap,
         )
     numpy.testing.assert_allclose(
         o_custom.cpu().numpy(), o_causal.cpu().numpy(), rtol=1e-3, atol=1e-3
@@ -307,6 +348,7 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
 @pytest.mark.parametrize("return_lse", [True, False])
 def test_batch_prefill_with_ragged_kv_cache(
     batch_size,
@@ -317,6 +359,7 @@ def test_batch_prefill_with_ragged_kv_cache(
     head_dim,
     causal,
     pos_encoding_mode,
+    logits_soft_cap,
     return_lse,
 ):
     kv_layout = "NHD"
@@ -340,10 +383,22 @@ def test_batch_prefill_with_ragged_kv_cache(
     )
     if return_lse:
         o, _ = wrapper.forward_return_lse(
-            q, k, v, causal=causal, pos_encoding_mode=pos_encoding_mode
+            q,
+            k,
+            v,
+            causal=causal,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=logits_soft_cap,
         )
     else:
-        o = wrapper.forward(q, k, v, causal=causal, pos_encoding_mode=pos_encoding_mode)
+        o = wrapper.forward(
+            q,
+            k,
+            v,
+            causal=causal,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=logits_soft_cap,
+        )
 
     for i in range(batch_size):
         o_ref_i = flashinfer.single_prefill_with_kv_cache(
@@ -352,6 +407,7 @@ def test_batch_prefill_with_ragged_kv_cache(
             v[kv_indptr[i] : kv_indptr[i + 1]],
             causal=causal,
             pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=logits_soft_cap,
         )
         o_i_np = o[q_indptr[i] : q_indptr[i + 1]].cpu().numpy()
         o_ref_i_np = o_ref_i.cpu().numpy()
@@ -365,6 +421,7 @@ def test_batch_prefill_with_ragged_kv_cache(
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
 @pytest.mark.parametrize("return_lse", [True, False])
 def test_batch_prefill_with_ragged_kv_cache_custom_mask(
     batch_size,
@@ -374,6 +431,7 @@ def test_batch_prefill_with_ragged_kv_cache_custom_mask(
     num_qo_heads,
     head_dim,
     pos_encoding_mode,
+    logits_soft_cap,
     return_lse,
 ):
     kv_layout = "NHD"
@@ -409,21 +467,41 @@ def test_batch_prefill_with_ragged_kv_cache_custom_mask(
     )
     if return_lse:
         o_custom, _ = wrapper.forward_return_lse(
-            q, k, v, pos_encoding_mode=pos_encoding_mode
+            q,
+            k,
+            v,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=logits_soft_cap,
         )
     else:
-        o_custom = wrapper.forward(q, k, v, pos_encoding_mode=pos_encoding_mode)
+        o_custom = wrapper.forward(
+            q,
+            k,
+            v,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=logits_soft_cap,
+        )
     wrapper.end_forward()
 
     # use causal
     wrapper.begin_forward(q_indptr, kv_indptr, num_qo_heads, num_kv_heads, head_dim)
     if return_lse:
         o_causal, _ = wrapper.forward_return_lse(
-            q, k, v, causal=True, pos_encoding_mode=pos_encoding_mode
+            q,
+            k,
+            v,
+            causal=True,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=logits_soft_cap,
         )
     else:
         o_causal = wrapper.forward(
-            q, k, v, causal=True, pos_encoding_mode=pos_encoding_mode
+            q,
+            k,
+            v,
+            causal=True,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=logits_soft_cap,
         )
     numpy.testing.assert_allclose(
         o_custom.cpu().numpy(), o_causal.cpu().numpy(), rtol=1e-3, atol=1e-3
@@ -432,15 +510,17 @@ def test_batch_prefill_with_ragged_kv_cache_custom_mask(
 
 if __name__ == "__main__":
     test_batch_prefill_with_paged_kv_cache(
-        12, 54, 37, 16, 8, 8, 128, True, "HND", "NONE", True, False
+        12, 54, 37, 16, 8, 8, 128, True, "HND", "NONE", True, 0.0, False
     )
     test_batch_prefill_with_paged_kv_cache(
-        12, 54, 37, 1, 8, 8, 128, True, "HND", "NONE", False, False
+        12, 54, 37, 1, 8, 8, 128, True, "HND", "NONE", False, 0.0, False
     )
     test_batch_prefill_with_paged_kv_cache_custom_mask(
-        12, 137, 137, 1, 8, 8, 128, "HND", "NONE", False
+        12, 137, 137, 1, 8, 8, 128, "HND", "NONE", 0.0, False
     )
-    test_batch_prefill_with_ragged_kv_cache(12, 54, 37, 8, 8, 128, True, "NONE", False)
+    test_batch_prefill_with_ragged_kv_cache(
+        12, 54, 37, 8, 8, 128, True, "NONE", 0.0, False
+    )
     test_batch_prefill_with_ragged_kv_cache_custom_mask(
-        12, 137, 137, 8, 8, 128, "NONE", False
+        12, 137, 137, 8, 8, 128, "NONE", 0.0, False
     )
