@@ -560,7 +560,12 @@ cudaError_t PrefillSplitQOKVIndptr(bool& split_kv, uint32_t& split_max_batch_siz
   if (avg_packed_qo_len > 64 && head_dim < 256) {
     warp_layout = WarpLayout::k4x1x2;  // (num_warps_x = 4, num_warps_z = 1, num_frags_x = 2)
   } else {
-    warp_layout = WarpLayout::k4x1x1;  // (num_warps_x = 4, num_warps_z = 1, num_frags_x = 1)
+    if (avg_packed_qo_len > 16) {
+      warp_layout = WarpLayout::k4x1x1;  // (num_warps_x = 4, num_warps_z = 1, num_frags_x = 1)
+    } else {
+      // avg_packed_qo_len <= 16
+      warp_layout = WarpLayout::k1x4x1;  // (num_warps_x = 1, num_warps_z = 4, num_frags_x = 1)
+    }
   }
   const uint32_t qo_chunk_size = get_num_rows_per_cta(warp_layout);
 

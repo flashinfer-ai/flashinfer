@@ -26,7 +26,7 @@ namespace flashinfer {
 enum class WarpLayout {
   k4x1x2 = 0U,
   k4x1x1 = 1U,
-  // k1x4x1 = 2U,
+  k1x4x1 = 2U,
 };
 
 template <WarpLayout warp_layout>
@@ -44,10 +44,10 @@ constexpr uint32_t get_num_warps_x<WarpLayout::k4x1x1>() {
   return 4;
 }
 
-// template <>
-// constexpr uint32_t get_num_warps_x<WarpLayout::k1x4x1>() {
-//   return 1;
-// }
+template <>
+constexpr uint32_t get_num_warps_x<WarpLayout::k1x4x1>() {
+  return 1;
+}
 
 template <WarpLayout warp_layout>
 constexpr uint32_t get_num_warps_z() {
@@ -64,10 +64,10 @@ constexpr uint32_t get_num_warps_z<WarpLayout::k4x1x1>() {
   return 1;
 }
 
-// template <>
-// constexpr uint32_t get_num_warps_z<WarpLayout::k1x4x1>() {
-//   return 4;
-// }
+template <>
+constexpr uint32_t get_num_warps_z<WarpLayout::k1x4x1>() {
+  return 4;
+}
 
 template <WarpLayout warp_layout>
 constexpr uint32_t get_num_frags_x() {
@@ -84,10 +84,10 @@ constexpr uint32_t get_num_frags_x<WarpLayout::k4x1x1>() {
   return 1;
 }
 
-// template <>
-// constexpr uint32_t get_num_frags_x<WarpLayout::k1x4x1>() {
-//   return 1;
-// }
+template <>
+constexpr uint32_t get_num_frags_x<WarpLayout::k1x4x1>() {
+  return 1;
+}
 
 #define DISPATCH_WARP_LAYOUT(warp_layout, WARP_LAYOUT, ...)     \
   if (warp_layout == WarpLayout::k4x1x2) {                      \
@@ -95,6 +95,9 @@ constexpr uint32_t get_num_frags_x<WarpLayout::k4x1x1>() {
     __VA_ARGS__                                                 \
   } else if (warp_layout == WarpLayout::k4x1x1) {               \
     constexpr WarpLayout WARP_LAYOUT = WarpLayout::k4x1x1;      \
+    __VA_ARGS__                                                 \
+  } else if (warp_layout == WarpLayout::k1x4x1) {               \
+    constexpr WarpLayout WARP_LAYOUT = WarpLayout::k1x4x1;      \
     __VA_ARGS__                                                 \
   } else {                                                      \
     std::ostringstream err_msg;                                 \
