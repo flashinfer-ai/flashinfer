@@ -53,7 +53,7 @@ constexpr bool is_invalid_configuration(uint32_t num_frags_x, uint32_t num_frags
                                         uint32_t num_warps_z) {
   return ((num_frags_y < 4) || (num_frags_y == 4 && num_frags_z % 2 == 1) ||
           (num_frags_y > 4 && num_frags_y % (2 * num_warps_x) != 0) ||
-          (num_frags_x * (8 * num_frags_y + 2 * sizeof(DTypeQKAccum) * num_frags_z) >= 200));
+          (num_frags_x * (8 * num_frags_y + 2 * sizeof(DTypeQKAccum) * num_frags_z) >= 256));
 }
 
 /*!
@@ -207,14 +207,13 @@ template <bool produce_v, uint32_t num_warps_x, uint32_t num_warps_z, uint32_t n
 __device__ __forceinline__ void page_produce_kv(
     smem_t smem, uint32_t* smem_offset,
     paged_kv_t<page_storage, kv_layout, DType, IdType>& paged_kv, const uint32_t kv_idx_base,
-    const size_t* kv_offset, const uint32_t kv_len, const IdType last_indptr) {
+    const size_t* kv_offset, const uint32_t kv_len) {
   constexpr SharedMemFillMode fill_mode =
       produce_v ? SharedMemFillMode::kFillZero : SharedMemFillMode::kNoFill;
   constexpr uint32_t head_dim = num_frags_y * 16;
   constexpr uint32_t num_warps = num_warps_x * num_warps_z;
   constexpr uint32_t channel_size_128b_in = head_dim / num_elems_per_128b<DType>();
   const uint32_t warp_idx = get_warp_idx<num_warps_x, num_warps_z>(), lane_idx = threadIdx.x;
-  const uint32_t kv_head_idx = blockIdx.z;
   uint32_t kv_idx = kv_idx_base + warp_idx * 4 + lane_idx / 8;
   // NOTE(Zihao): num_frags_z * 4 / num_warps_x = num_warps_z * num_frags_z * 4 / num_warps
   static_assert(num_frags_z * 4 % num_warps_x == 0);
@@ -1619,10 +1618,10 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
             : 0;
   }
   page_produce_kv<false, num_warps_x, num_warps_z, num_frags_y, num_frags_z>(
-      k_smem, &kv_smem_offset_w, paged_kv, chunk_start, kv_offset, chunk_end, last_indptr);
+      k_smem, &kv_smem_offset_w, paged_kv, chunk_start, kv_offset, chunk_end);
   cp_async::commit_group();
   page_produce_kv<true, num_warps_x, num_warps_z, num_frags_y, num_frags_z>(
-      v_smem, &kv_smem_offset_w, paged_kv, chunk_start, kv_offset, chunk_end, last_indptr);
+      v_smem, &kv_smem_offset_w, paged_kv, chunk_start, kv_offset, chunk_end);
   cp_async::commit_group();
 
   const uint32_t num_iterations =
@@ -1702,8 +1701,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
     block.sync();
     page_produce_kv<false, num_warps_x, num_warps_z, num_frags_y, num_frags_z>(
         k_smem, &kv_smem_offset_w, paged_kv,
-        chunk_start + (iter + 1) * 16 * num_warps_z * num_frags_z, kv_offset, chunk_end,
-        last_indptr);
+        chunk_start + (iter + 1) * 16 * num_warps_z * num_frags_z, kv_offset, chunk_end);
     cp_async::commit_group();
     cp_async::wait_group<1>();
     block.sync();
@@ -1715,8 +1713,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
     block.sync();
     page_produce_kv<true, num_warps_x, num_warps_z, num_frags_y, num_frags_z>(
         v_smem, &kv_smem_offset_w, paged_kv,
-        chunk_start + (iter + 1) * 16 * num_warps_z * num_frags_z, kv_offset, chunk_end,
-        last_indptr);
+        chunk_start + (iter + 1) * 16 * num_warps_z * num_frags_z, kv_offset, chunk_end);
     cp_async::commit_group();
   }
   cp_async::wait_group<0>();
