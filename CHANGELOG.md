@@ -49,7 +49,7 @@ Fix some bug in v0.0.5 that might lead to crashes and instable performance.
 * Support custom attention mask. (https://docs.flashinfer.ai/tutorials/kv_layout.html#mask-layout-2d-ragged-tensor)
 * Support logits cap in Grok-1 models.
 * Fused GPU-sampling kernels: top-p, top-k, speculative verification. (https://docs.flashinfer.ai/api/python/sampling.html)
-* PyTorch wrapper of group-gemm cutlass kernels. (https://docs.flashinfer.ai/api/python/sampling.html)
+* PyTorch wrapper of group-gemm cutlass kernels. (https://docs.flashinfer.ai/api/python/group_gemm.html)
 
 ### Acknowledgement
 
