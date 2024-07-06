@@ -25,10 +25,10 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
     unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads,
     unsigned int head_dim, unsigned int page_size, unsigned int pos_encoding_mode,
     float logits_soft_cap, torch::Tensor empty_q_data, torch::Tensor empty_kv_data) {
+  CHECK_INPUT(workspace_buffer);
   // NOTE(zihao): not necessary to be CUDA tensor
   CHECK_CONTIGUOUS(indptr);
   CHECK_CONTIGUOUS(last_page_len);
-  CHECK_CONTIGUOUS(workspace_buffer);
   CHECK_DIM(1, indptr);
   CHECK_DIM(1, last_page_len);
   CHECK_DIM(1, workspace_buffer);
@@ -36,7 +36,8 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
   CHECK_EQ(indptr.scalar_type(), torch::kInt32);
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
   size_t workspace_size_in_bytes = workspace_buffer.size(0) * workspace_buffer.element_size();
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
+  auto device = workspace_buffer.device();
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
   handler_->SetCUDAStream(torch_current_stream);
   indptr = indptr.to(torch::kCPU);
   last_page_len = last_page_len.to(torch::kCPU);
@@ -116,6 +117,11 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
   CHECK_INPUT(paged_kv_indptr);
   CHECK_INPUT(paged_kv_indices);
   CHECK_INPUT(paged_kv_last_page_len);
+  auto device = q.device();
+  CHECK_EQ(paged_kv_data.device(), device);
+  CHECK_EQ(paged_kv_indices.device(), device);
+  CHECK_EQ(paged_kv_indptr.device(), device);
+  CHECK_EQ(paged_kv_last_page_len.device(), device);
   CHECK_DIM(3, q);                       // (B, H_qo, D)
   CHECK_DIM(1, paged_kv_last_page_len);  // (B,)
   CHECK_DIM(1, paged_kv_indptr);         // (B+1,)
@@ -144,7 +150,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
   CHECK_EQ(paged_kv_last_page_len.scalar_type(), torch::kInt32);
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
 
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
   torch::Tensor o = torch::empty_like(q);
   torch::Tensor lse;
   if (return_lse) {

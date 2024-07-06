@@ -27,6 +27,11 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
   CHECK_INPUT(q);
   CHECK_INPUT(k);
   CHECK_INPUT(v);
+  CHECK_INPUT(tmp);
+  auto device = q.device();
+  CHECK_EQ(k.device(), device);
+  CHECK_EQ(v.device(), device);
+  CHECK_EQ(tmp.device(), device);
   CHECK_DIM(3, q);
   CHECK_DIM(3, k);
   CHECK_DIM(3, v);
@@ -47,7 +52,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
     num_kv_heads = k.size(0);
   }
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
   auto o = torch::empty_like(q, q.options());
   torch::Tensor lse = torch::empty({0});
   if (return_lse) {
@@ -108,6 +113,10 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache_custom_mask(
   CHECK_INPUT(k);
   CHECK_INPUT(v);
   CHECK_INPUT(packed_custom_mask);
+  auto device = q.device();
+  CHECK_EQ(k.device(), device);
+  CHECK_EQ(v.device(), device);
+  CHECK_EQ(packed_custom_mask.device(), device);
   CHECK_DIM(3, q);
   CHECK_DIM(3, k);
   CHECK_DIM(3, v);
@@ -130,7 +139,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache_custom_mask(
     num_kv_heads = k.size(0);
   }
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
   auto o = torch::empty_like(q, q.options());
   torch::Tensor lse = torch::empty({0});
   if (return_lse) {

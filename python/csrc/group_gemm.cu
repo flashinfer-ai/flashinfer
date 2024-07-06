@@ -34,6 +34,9 @@ torch::Tensor CutlassSegmentGEMMPyTorchWrapper::Forward(torch::Tensor seg_indptr
   CHECK_CUDA(seg_indptr);
   CHECK_CUDA(x);
   CHECK_CUDA(weight);
+  auto device = x.device();
+  CHECK_EQ(seg_indptr.device(), device);
+  CHECK_EQ(weight_indices.device(), device);
   CHECK_DIM(2, x);       // x: [sum(m_i), d_in]
   CHECK_DIM(3, weight);  // weight: [num_weights, d_out, d_in] if weight_column_major, [num_weights,
                          // d_in, d_out] otherwise
@@ -42,12 +45,13 @@ torch::Tensor CutlassSegmentGEMMPyTorchWrapper::Forward(torch::Tensor seg_indptr
   int64_t d_in = weight_column_major ? weight.size(2) : weight.size(1);
   CHECK_EQ(x.size(1), d_in);
   auto y = torch::zeros({cumulative_batch_size, d_out}, x.options());
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
   seg_indptr = seg_indptr.to(torch::kInt64);
 
   bool weight_indices_defined = weight_indices.numel() > 0;
   if (weight_indices_defined) {
     CHECK_CUDA(weight_indices);
+    CHECK_EQ(weight_indices.device(), device);
     weight_indices = weight_indices.to(torch::kInt64);
   }
 

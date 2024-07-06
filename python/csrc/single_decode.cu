@@ -27,6 +27,11 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
   CHECK_INPUT(q);
   CHECK_INPUT(k);
   CHECK_INPUT(v);
+  CHECK_INPUT(tmp);
+  auto device = q.device();
+  CHECK_EQ(k.device(), device);
+  CHECK_EQ(v.device(), device);
+  CHECK_EQ(tmp.device(), device);
   CHECK_DIM(2, q);
   CHECK_DIM(3, k);
   CHECK_DIM(3, v);
@@ -45,7 +50,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
     kv_len = k.size(1);
   }
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
   auto o = torch::empty_like(q);
 
   TORCH_CHECK(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
