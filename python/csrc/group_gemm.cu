@@ -31,12 +31,12 @@ torch::Tensor CutlassSegmentGEMMPyTorchWrapper::Forward(torch::Tensor seg_indptr
                                                         unsigned int batch_size,
                                                         bool weight_column_major) {
   // TODO(Zihao): Add more checks here
-  CHECK_CUDA(seg_indptr);
-  CHECK_CUDA(x);
-  CHECK_CUDA(weight);
+  CHECK_INPUT(seg_indptr);
+  CHECK_INPUT(x);
+  CHECK_INPUT(weight);
   auto device = x.device();
   CHECK_EQ(seg_indptr.device(), device);
-  CHECK_EQ(weight_indices.device(), device);
+  CHECK_EQ(weight.device(), device);
   CHECK_DIM(2, x);       // x: [sum(m_i), d_in]
   CHECK_DIM(3, weight);  // weight: [num_weights, d_out, d_in] if weight_column_major, [num_weights,
                          // d_in, d_out] otherwise
@@ -50,7 +50,7 @@ torch::Tensor CutlassSegmentGEMMPyTorchWrapper::Forward(torch::Tensor seg_indptr
 
   bool weight_indices_defined = weight_indices.numel() > 0;
   if (weight_indices_defined) {
-    CHECK_CUDA(weight_indices);
+    CHECK_INPUT(weight_indices);
     CHECK_EQ(weight_indices.device(), device);
     weight_indices = weight_indices.to(torch::kInt64);
   }
