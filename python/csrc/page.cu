@@ -72,7 +72,7 @@ void append_paged_kv_cache(torch::Tensor append_key, torch::Tensor append_value,
   CHECK_EQ(append_value.size(1), num_heads);
   CHECK_EQ(append_key.size(2), head_dim);
 
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(kv_data.scalar_type(), c_type, [&] {
     DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {

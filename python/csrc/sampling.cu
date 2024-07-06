@@ -33,7 +33,7 @@ torch::Tensor sampling_from_probs(torch::Tensor probs, torch::Tensor uniform_sam
   probs = probs.to(torch::kFloat32);
   uniform_samples = uniform_samples.to(torch::kFloat32);
 
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto samples = torch::empty({batch_size}, torch::dtype(torch::kInt32).device(device));
 
   cudaError_t status = sampling::SamplingFromProb(
@@ -59,7 +59,7 @@ std::vector<torch::Tensor> top_p_sampling_from_probs(torch::Tensor probs,
   probs = probs.to(torch::kFloat32);
   uniform_samples = uniform_samples.to(torch::kFloat32);
 
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto samples = torch::empty({batch_size}, torch::dtype(torch::kInt32).device(device));
   auto success = torch::empty({batch_size}, torch::dtype(torch::kBool).device(device));
 
@@ -89,7 +89,7 @@ std::vector<torch::Tensor> top_k_sampling_from_probs(torch::Tensor probs,
   probs = probs.to(torch::kFloat32);
   uniform_samples = uniform_samples.to(torch::kFloat32);
 
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto samples = torch::empty({batch_size}, torch::dtype(torch::kInt32).device(device));
   auto success = torch::empty({batch_size}, torch::dtype(torch::kBool).device(device));
 
@@ -111,7 +111,7 @@ torch::Tensor top_p_renorm_prob(torch::Tensor probs, double top_p, double eps) {
   unsigned int vocab_size = probs.size(1);
   probs = probs.to(torch::kFloat32);
 
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto renorm_probs =
       torch::empty({batch_size, vocab_size}, torch::dtype(torch::kFloat32).device(device));
 
@@ -131,7 +131,7 @@ torch::Tensor top_k_renorm_prob(torch::Tensor probs, unsigned int top_k, double 
   unsigned int vocab_size = probs.size(1);
   probs = probs.to(torch::kFloat32);
 
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto renorm_probs =
       torch::empty({batch_size, vocab_size}, torch::dtype(torch::kFloat32).device(device));
 
@@ -174,7 +174,7 @@ torch::Tensor chain_speculative_sampling(torch::Tensor draft_probs, torch::Tenso
   uniform_samples = uniform_samples.to(torch::kFloat32);
   target_probs = target_probs.to(torch::kFloat32);
 
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto output_token_ids = torch::empty({batch_size, num_speculate_tokens + 1},
                                        torch::dtype(torch::kInt32).device(device));
 

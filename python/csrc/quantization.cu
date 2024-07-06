@@ -25,7 +25,7 @@ torch::Tensor packbits(torch::Tensor x, const std::string& bitorder) {
   auto device = x.device();
   TORCH_CHECK(bitorder == "big" || bitorder == "little", "bitorder must be 'big' or 'little'");
   x = x.to(torch::kBool);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
 
   int64_t num_elements = x.numel();
   int64_t num_output_elements = (num_elements + 7) / 8;
@@ -63,6 +63,6 @@ torch::Tensor segment_packbits(torch::Tensor x, torch::Tensor input_indptr,
       static_cast<int32_t*>(input_indptr.data_ptr()),
       static_cast<int32_t*>(output_indptr.data_ptr()), batch_size,
       bitorder == "big" ? quantization::BitOrder::kBig : quantization::BitOrder::kLittle,
-      c10::cuda::getCurrentCUDAStream(device));
+      c10::cuda::getCurrentCUDAStream(device.index()));
   return y;
 }

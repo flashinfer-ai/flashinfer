@@ -35,7 +35,7 @@ void BatchPrefillWithPagedKVCachePyTorchWrapper::BeginForward(
   paged_kv_indptr = paged_kv_indptr.to(torch::kCPU).to(torch::kInt32);
   auto device = workspace_buffer.device();
   size_t workspace_size_in_bytes = workspace_buffer.size(0) * workspace_buffer.element_size();
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   handler_->SetCUDAStream(torch_current_stream);
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(empty_q_data.scalar_type(), q_type, [&] {
@@ -107,7 +107,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
   paged_kv_indices = paged_kv_indices.to(torch::kInt32);
   paged_kv_last_page_len = paged_kv_last_page_len.to(torch::kInt32);
 
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   torch::Tensor o = torch::empty_like(q, q.options());
   torch::Tensor lse = torch::empty({0});
   if (return_lse) {
@@ -222,7 +222,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCu
   paged_kv_last_page_len = paged_kv_last_page_len.to(torch::kInt32);
   qk_indptr = qk_indptr.to(torch::kInt32);
 
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   torch::Tensor o = torch::empty_like(q, q.options());
   torch::Tensor lse = torch::empty({0});
   if (return_lse) {
@@ -292,7 +292,7 @@ void BatchPrefillWithRaggedKVCachePyTorchWrapper::BeginForward(
   kv_indptr = kv_indptr.to(torch::kCPU).to(torch::kInt32);
   size_t workspace_size_in_bytes = workspace_buffer.size(0) * workspace_buffer.element_size();
   auto device = workspace_buffer.device();
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   handler_->SetCUDAStream(torch_current_stream);
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(empty_q_data.scalar_type(), q_type, [&] {
@@ -350,7 +350,7 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
   qo_indptr = qo_indptr.to(torch::kInt32);
   kv_indptr = kv_indptr.to(torch::kInt32);
 
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   torch::Tensor o = torch::empty_like(q, q.options());
   torch::Tensor lse = torch::empty({0});
   if (return_lse) {
@@ -448,7 +448,7 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardC
   kv_indptr = kv_indptr.to(torch::kInt32);
   qk_indptr = qk_indptr.to(torch::kInt32);
 
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   torch::Tensor o = torch::empty_like(q, q.options());
   torch::Tensor lse = torch::empty({0});
   if (return_lse) {

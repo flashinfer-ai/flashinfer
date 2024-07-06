@@ -31,7 +31,7 @@ torch::Tensor rmsnorm(torch::Tensor x, torch::Tensor w, double eps) {
   unsigned int batch_size = x.size(0);
   unsigned int hidden_size = x.size(1);
 
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto y = torch::empty_like(x);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(x.scalar_type(), c_type, [&] {
     cudaError_t status = norm::RMSNorm(

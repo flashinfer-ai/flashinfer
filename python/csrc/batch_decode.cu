@@ -37,7 +37,7 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
   size_t workspace_size_in_bytes = workspace_buffer.size(0) * workspace_buffer.element_size();
   auto device = workspace_buffer.device();
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   handler_->SetCUDAStream(torch_current_stream);
   indptr = indptr.to(torch::kCPU);
   last_page_len = last_page_len.to(torch::kCPU);
@@ -150,7 +150,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
   CHECK_EQ(paged_kv_last_page_len.scalar_type(), torch::kInt32);
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
 
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   torch::Tensor o = torch::empty_like(q);
   torch::Tensor lse;
   if (return_lse) {

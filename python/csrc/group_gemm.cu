@@ -45,7 +45,7 @@ torch::Tensor CutlassSegmentGEMMPyTorchWrapper::Forward(torch::Tensor seg_indptr
   int64_t d_in = weight_column_major ? weight.size(2) : weight.size(1);
   CHECK_EQ(x.size(1), d_in);
   auto y = torch::zeros({cumulative_batch_size, d_out}, x.options());
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   seg_indptr = seg_indptr.to(torch::kInt64);
 
   bool weight_indices_defined = weight_indices.numel() > 0;

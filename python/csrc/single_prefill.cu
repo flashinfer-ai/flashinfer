@@ -52,7 +52,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
     num_kv_heads = k.size(0);
   }
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto o = torch::empty_like(q, q.options());
   torch::Tensor lse = torch::empty({0});
   if (return_lse) {
@@ -139,7 +139,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache_custom_mask(
     num_kv_heads = k.size(0);
   }
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto o = torch::empty_like(q, q.options());
   torch::Tensor lse = torch::empty({0});
   if (return_lse) {
