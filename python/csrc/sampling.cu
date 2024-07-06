@@ -23,6 +23,8 @@ using namespace flashinfer;
 torch::Tensor sampling_from_probs(torch::Tensor probs, torch::Tensor uniform_samples) {
   CHECK_INPUT(probs);
   CHECK_INPUT(uniform_samples);
+  auto device = probs.device();
+  CHECK_EQ(uniform_samples.device(), device);
   CHECK_DIM(2, probs);            // probs: (batch_size, vocab_size)
   CHECK_DIM(1, uniform_samples);  // uniform_samples: (batch_size)
   CHECK_EQ(probs.size(0), uniform_samples.size(0));
@@ -31,8 +33,8 @@ torch::Tensor sampling_from_probs(torch::Tensor probs, torch::Tensor uniform_sam
   probs = probs.to(torch::kFloat32);
   uniform_samples = uniform_samples.to(torch::kFloat32);
 
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
-  auto samples = torch::empty({batch_size}, torch::dtype(torch::kInt32).device(probs.device()));
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
+  auto samples = torch::empty({batch_size}, torch::dtype(torch::kInt32).device(device));
 
   cudaError_t status = sampling::SamplingFromProb(
       static_cast<float*>(probs.data_ptr()), static_cast<float*>(uniform_samples.data_ptr()),
@@ -46,6 +48,8 @@ std::vector<torch::Tensor> top_p_sampling_from_probs(torch::Tensor probs,
                                                      torch::Tensor uniform_samples, double top_p) {
   CHECK_INPUT(probs);
   CHECK_INPUT(uniform_samples);
+  auto device = probs.device();
+  CHECK_EQ(uniform_samples.device(), device);
   CHECK_DIM(2, probs);            // probs: (batch_size, vocab_size)
   CHECK_DIM(2, uniform_samples);  // uniform_samples: (max_top_p_rounds, batch_size)
   CHECK_EQ(probs.size(0), uniform_samples.size(1));
@@ -55,9 +59,9 @@ std::vector<torch::Tensor> top_p_sampling_from_probs(torch::Tensor probs,
   probs = probs.to(torch::kFloat32);
   uniform_samples = uniform_samples.to(torch::kFloat32);
 
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
-  auto samples = torch::empty({batch_size}, torch::dtype(torch::kInt32).device(probs.device()));
-  auto success = torch::empty({batch_size}, torch::dtype(torch::kBool).device(probs.device()));
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
+  auto samples = torch::empty({batch_size}, torch::dtype(torch::kInt32).device(device));
+  auto success = torch::empty({batch_size}, torch::dtype(torch::kBool).device(device));
 
   cudaError_t status = sampling::TopPSamplingFromProb<float, int>(
       static_cast<float*>(probs.data_ptr()), static_cast<float*>(uniform_samples.data_ptr()),
@@ -74,6 +78,8 @@ std::vector<torch::Tensor> top_k_sampling_from_probs(torch::Tensor probs,
                                                      unsigned int top_k) {
   CHECK_INPUT(probs);
   CHECK_INPUT(uniform_samples);
+  auto device = probs.device();
+  CHECK_EQ(uniform_samples.device(), device);
   CHECK_DIM(2, probs);            // probs: (batch_size, vocab_size)
   CHECK_DIM(2, uniform_samples);  // uniform_samples: (max_top_k_rounds, batch_size)
   CHECK_EQ(probs.size(0), uniform_samples.size(1));
@@ -83,9 +89,9 @@ std::vector<torch::Tensor> top_k_sampling_from_probs(torch::Tensor probs,
   probs = probs.to(torch::kFloat32);
   uniform_samples = uniform_samples.to(torch::kFloat32);
 
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
-  auto samples = torch::empty({batch_size}, torch::dtype(torch::kInt32).device(probs.device()));
-  auto success = torch::empty({batch_size}, torch::dtype(torch::kBool).device(probs.device()));
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
+  auto samples = torch::empty({batch_size}, torch::dtype(torch::kInt32).device(device));
+  auto success = torch::empty({batch_size}, torch::dtype(torch::kBool).device(device));
 
   cudaError_t status = sampling::TopKSamplingFromProb<float, int>(
       static_cast<float*>(probs.data_ptr()), static_cast<float*>(uniform_samples.data_ptr()),
@@ -99,14 +105,15 @@ std::vector<torch::Tensor> top_k_sampling_from_probs(torch::Tensor probs,
 
 torch::Tensor top_p_renorm_prob(torch::Tensor probs, double top_p, double eps) {
   CHECK_INPUT(probs);
+  auto device = probs.device();
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
   unsigned int batch_size = probs.size(0);
   unsigned int vocab_size = probs.size(1);
   probs = probs.to(torch::kFloat32);
 
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto renorm_probs =
-      torch::empty({batch_size, vocab_size}, torch::dtype(torch::kFloat32).device(probs.device()));
+      torch::empty({batch_size, vocab_size}, torch::dtype(torch::kFloat32).device(device));
 
   cudaError_t status = sampling::TopPRenormProb<float>(
       static_cast<float*>(probs.data_ptr()), static_cast<float*>(renorm_probs.data_ptr()), top_p,
@@ -118,14 +125,15 @@ torch::Tensor top_p_renorm_prob(torch::Tensor probs, double top_p, double eps) {
 
 torch::Tensor top_k_renorm_prob(torch::Tensor probs, unsigned int top_k, double eps) {
   CHECK_INPUT(probs);
+  auto device = probs.device();
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
   unsigned int batch_size = probs.size(0);
   unsigned int vocab_size = probs.size(1);
   probs = probs.to(torch::kFloat32);
 
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto renorm_probs =
-      torch::empty({batch_size, vocab_size}, torch::dtype(torch::kFloat32).device(probs.device()));
+      torch::empty({batch_size, vocab_size}, torch::dtype(torch::kFloat32).device(device));
 
   cudaError_t status = sampling::TopKRenormProb<float>(
       static_cast<float*>(probs.data_ptr()), static_cast<float*>(renorm_probs.data_ptr()), top_k,
@@ -143,6 +151,10 @@ torch::Tensor chain_speculative_sampling(torch::Tensor draft_probs, torch::Tenso
   CHECK_INPUT(draft_token_ids);
   CHECK_INPUT(uniform_samples);
   CHECK_INPUT(target_probs);
+  auto device = draft_probs.device();
+  CHECK_EQ(draft_token_ids.device(), device);
+  CHECK_EQ(uniform_samples.device(), device);
+  CHECK_EQ(target_probs.device(), device);
   CHECK_DIM(3, draft_probs);      // draft_probs: (batch_size, num_speculate_tokens, vocab_size)
   CHECK_DIM(2, draft_token_ids);  // draft_token_ids: (batch_size, num_speculate_tokens)
   CHECK_DIM(2, uniform_samples);  // uniform_samples: (batch_size, num_speculate_tokens + 1)
@@ -162,10 +174,9 @@ torch::Tensor chain_speculative_sampling(torch::Tensor draft_probs, torch::Tenso
   uniform_samples = uniform_samples.to(torch::kFloat32);
   target_probs = target_probs.to(torch::kFloat32);
 
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
-  auto output_token_ids =
-      torch::empty({batch_size, num_speculate_tokens + 1},
-                   torch::dtype(torch::kInt32).device(draft_token_ids.device()));
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
+  auto output_token_ids = torch::empty({batch_size, num_speculate_tokens + 1},
+                                       torch::dtype(torch::kInt32).device(device));
 
   cudaError_t status = sampling::ChainSpeculativeSampling<float, int>(
       static_cast<float*>(draft_probs.data_ptr()), static_cast<int*>(draft_token_ids.data_ptr()),

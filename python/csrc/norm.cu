@@ -23,13 +23,15 @@ using namespace flashinfer;
 torch::Tensor rmsnorm(torch::Tensor x, torch::Tensor w, double eps) {
   CHECK_INPUT(x);
   CHECK_INPUT(w);
+  auto device = x.device();
+  CHECK_EQ(w.device(), device);
   CHECK_DIM(2, x);  // x: (batch_size, hidden_size)
   CHECK_DIM(1, w);  // w: (hidden_size)
   CHECK_EQ(x.size(1), w.size(0));
   unsigned int batch_size = x.size(0);
   unsigned int hidden_size = x.size(1);
 
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto y = torch::empty_like(x);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(x.scalar_type(), c_type, [&] {
     cudaError_t status = norm::RMSNorm(

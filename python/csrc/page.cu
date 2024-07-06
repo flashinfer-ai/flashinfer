@@ -45,6 +45,13 @@ void append_paged_kv_cache(torch::Tensor append_key, torch::Tensor append_value,
   CHECK_EQ(kv_indptr.scalar_type(), torch::kInt32);
   CHECK_EQ(kv_indices.scalar_type(), torch::kInt32);
   CHECK_EQ(kv_last_page_len.scalar_type(), torch::kInt32);
+  auto device = append_indptr.device();
+  CHECK_EQ(append_key.device(), device);
+  CHECK_EQ(append_value.device(), device);
+  CHECK_EQ(kv_data.device(), device);
+  CHECK_EQ(kv_indices.device(), device);
+  CHECK_EQ(kv_indptr.device(), device);
+  CHECK_EQ(kv_last_page_len.device(), device);
 
   constexpr PageStorage page_storage = PageStorage::kIndices;
   QKVLayout kv_layout = QKVLayout(layout);
@@ -65,7 +72,7 @@ void append_paged_kv_cache(torch::Tensor append_key, torch::Tensor append_value,
   CHECK_EQ(append_value.size(1), num_heads);
   CHECK_EQ(append_key.size(2), head_dim);
 
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(kv_data.scalar_type(), c_type, [&] {
     DISPATCH_LAYOUT(kv_layout, KV_LAYOUT, {

@@ -26,6 +26,10 @@ std::vector<torch::Tensor> merge_state(torch::Tensor v_a, torch::Tensor s_a, tor
   CHECK_INPUT(s_a);
   CHECK_INPUT(v_b);
   CHECK_INPUT(s_b);
+  auto device = v_a.device();
+  CHECK_EQ(s_a.device(), device);
+  CHECK_EQ(v_b.device(), device);
+  CHECK_EQ(s_b.device(), device);
   CHECK_DIM(3, v_a);
   CHECK_DIM(2, s_a);
   CHECK_DIM(3, v_b);
@@ -39,7 +43,7 @@ std::vector<torch::Tensor> merge_state(torch::Tensor v_a, torch::Tensor s_a, tor
   unsigned int seq_len = v_a.size(0);
   unsigned int num_heads = v_a.size(1);
   unsigned int head_dim = v_a.size(2);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto v_merged = torch::empty_like(v_a, v_a.options());
   auto s_merged = torch::empty({seq_len, num_heads}, s_a.options());
 
@@ -64,6 +68,10 @@ void merge_state_in_place(torch::Tensor v, torch::Tensor s, torch::Tensor v_othe
   CHECK_INPUT(s);
   CHECK_INPUT(v_other);
   CHECK_INPUT(s_other);
+  auto device = v.device();
+  CHECK_EQ(s.device(), device);
+  CHECK_EQ(v_other.device(), device);
+  CHECK_EQ(s_other.device(), device);
   CHECK_DIM(3, v);
   CHECK_DIM(2, s);
   CHECK_DIM(3, v_other);
@@ -77,7 +85,7 @@ void merge_state_in_place(torch::Tensor v, torch::Tensor s, torch::Tensor v_othe
   unsigned int seq_len = v.size(0);
   unsigned int num_heads = v.size(1);
   unsigned int head_dim = v.size(2);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(v.scalar_type(), c_type, [&] {
     cudaError_t status = MergeStateInPlace(
@@ -95,6 +103,8 @@ void merge_state_in_place(torch::Tensor v, torch::Tensor s, torch::Tensor v_othe
 std::vector<torch::Tensor> merge_states(torch::Tensor v, torch::Tensor s) {
   CHECK_INPUT(v);
   CHECK_INPUT(s);
+  auto device = v.device();
+  CHECK_EQ(s.device(), device);
   CHECK_DIM(4, v);
   CHECK_DIM(3, s);
   CHECK_EQ(v.size(0), s.size(0));
@@ -105,7 +115,7 @@ std::vector<torch::Tensor> merge_states(torch::Tensor v, torch::Tensor s) {
   unsigned int num_heads = v.size(2);
   unsigned int head_dim = v.size(3);
   s = s.to(torch::kFloat32);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto v_merged = torch::empty({seq_len, num_heads, head_dim}, v.options());
   auto s_merged = torch::empty({seq_len, num_heads}, s.options());
 

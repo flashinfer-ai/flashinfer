@@ -22,9 +22,10 @@ using namespace flashinfer;
 
 torch::Tensor packbits(torch::Tensor x, const std::string& bitorder) {
   CHECK_INPUT(x);
+  auto device = x.device();
   TORCH_CHECK(bitorder == "big" || bitorder == "little", "bitorder must be 'big' or 'little'");
   x = x.to(torch::kBool);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream();
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
 
   int64_t num_elements = x.numel();
   int64_t num_output_elements = (num_elements + 7) / 8;
@@ -46,6 +47,9 @@ torch::Tensor segment_packbits(torch::Tensor x, torch::Tensor input_indptr,
   CHECK_INPUT(x);
   CHECK_INPUT(input_indptr);
   CHECK_INPUT(output_indptr);
+  auto device = x.device();
+  CHECK_EQ(input_indptr.device(), device);
+  CHECK_EQ(output_indptr.device(), device);
   TORCH_CHECK(bitorder == "big" || bitorder == "little", "bitorder must be 'big' or 'little'");
   unsigned int batch_size = input_indptr.size(0) - 1;
   CHECK_EQ(output_indptr.size(0), batch_size + 1);
@@ -59,6 +63,6 @@ torch::Tensor segment_packbits(torch::Tensor x, torch::Tensor input_indptr,
       static_cast<int32_t*>(input_indptr.data_ptr()),
       static_cast<int32_t*>(output_indptr.data_ptr()), batch_size,
       bitorder == "big" ? quantization::BitOrder::kBig : quantization::BitOrder::kLittle,
-      c10::cuda::getCurrentCUDAStream());
+      c10::cuda::getCurrentCUDAStream(device.index()));
   return y;
 }
