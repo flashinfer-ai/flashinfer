@@ -85,7 +85,7 @@ void merge_state_in_place(torch::Tensor v, torch::Tensor s, torch::Tensor v_othe
   unsigned int seq_len = v.size(0);
   unsigned int num_heads = v.size(1);
   unsigned int head_dim = v.size(2);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(v);
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device);
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(v.scalar_type(), c_type, [&] {
     cudaError_t status = MergeStateInPlace(
