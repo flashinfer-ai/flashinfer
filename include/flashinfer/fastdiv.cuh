@@ -65,13 +65,17 @@ struct uint_fastdiv {
   __host__ __device__ __forceinline__ operator unsigned int() const { return d; }
 
   __host__ __device__ __forceinline__ void divmod(uint32_t n, uint32_t& q, uint32_t& r) const {
+    if (d == 1) {
+      q = n;
+    } else {
 #ifdef __CUDA_ARCH__
-    asm("mul.hi.u32 %0, %1, %2;" : "=r"(q) : "r"(m), "r"(n));
+      q = __umulhi(m, n);
 #else
-    q = (((unsigned long long)((long long)m * (long long)n)) >> 32);
+      q = (((unsigned long long)((long long)m * (long long)n)) >> 32);
 #endif
-    q += a * n;
-    q >>= s;
+      q += a * n;
+      q >>= s;
+    }
     r = n - q * d;
   }
 };
@@ -79,13 +83,17 @@ struct uint_fastdiv {
 __host__ __device__ __forceinline__ uint32_t operator/(const uint32_t n,
                                                        const uint_fastdiv& divisor) {
   uint32_t q;
+  if (divisor.d == 1) {
+    q = n;
+  } else {
 #ifdef __CUDA_ARCH__
-  asm("mul.hi.u32 %0, %1, %2;" : "=r"(q) : "r"(divisor.m), "r"(n));
+    q = __umulhi(divisor.m, n);
 #else
-  q = (((unsigned long long)((long long)divisor.m * (long long)n)) >> 32);
+    q = (((unsigned long long)((long long)divisor.m * (long long)n)) >> 32);
 #endif
-  q += divisor.a * n;
-  q >>= divisor.s;
+    q += divisor.a * n;
+    q >>= divisor.s;
+  }
   return q;
 }
 
