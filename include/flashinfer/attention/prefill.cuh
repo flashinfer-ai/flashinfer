@@ -564,9 +564,8 @@ __device__ __forceinline__ void compute_qk(smem_t* q_smem, uint32_t* q_smem_offs
 }
 
 template <uint32_t num_frags_x, uint32_t num_frags_z, typename T>
-__device__ __forceinline__ void apply_alibi_bias(const uint32_t qo_packed_idx_base,
-                                                 const uint32_t kv_idx_base, const int32_t q_offset,
-                                                 const uint_fastdiv group_size,
+__device__ __forceinline__ void apply_alibi_bias(const uint32_t kv_idx_base, const int32_t q_offset,
+                                                 uint32_t (*precomputed_q_idx)[2],
                                                  float (*alibi_slope)[2],
                                                  T (*s_frag)[num_frags_z][8]) {
   const int32_t lane_idx = threadIdx.x;
@@ -576,9 +575,7 @@ __device__ __forceinline__ void apply_alibi_bias(const uint32_t qo_packed_idx_ba
     for (int32_t fz = 0; fz < num_frags_z; ++fz) {
 #pragma unroll
       for (int32_t reg_id = 0; reg_id < 8; ++reg_id) {
-        const int32_t q_idx =
-                          (qo_packed_idx_base + fx * 16 + lane_idx / 4 + 8 * ((reg_id % 4) / 2)) /
-                          group_size,
+        const int32_t q_idx = precomputed_q_idx[fx][(reg_id % 4) / 2],
                       kv_idx = kv_idx_base + fz * 16 + 2 * (lane_idx % 4) + 8 * (reg_id / 4) +
                                reg_id % 2;
         s_frag[fx][fz][reg_id] +=
@@ -590,10 +587,9 @@ __device__ __forceinline__ void apply_alibi_bias(const uint32_t qo_packed_idx_ba
 
 template <bool partition_kv, MaskMode mask_mode, uint32_t num_frags_x, uint32_t num_frags_y,
           uint32_t num_frags_z, typename DTypeQKAccum>
-__device__ __forceinline__ void mask_s(const uint32_t qo_packed_idx_base,
-                                       const uint32_t kv_idx_base, const uint32_t qo_len,
+__device__ __forceinline__ void mask_s(const uint32_t kv_idx_base, const uint32_t qo_len,
                                        const uint32_t kv_len, const uint32_t chunk_end,
-                                       const uint_fastdiv group_size, uint8_t* custom_mask,
+                                       uint32_t (*precomputed_q_idx)[2], uint8_t* custom_mask,
                                        DTypeQKAccum (*s_frag)[num_frags_z][8]) {
   const uint32_t lane_idx = threadIdx.x;
 #pragma unroll
@@ -602,9 +598,7 @@ __device__ __forceinline__ void mask_s(const uint32_t qo_packed_idx_base,
     for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
 #pragma unroll
       for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
-        const uint32_t q_idx =
-                           (qo_packed_idx_base + fx * 16 + lane_idx / 4 + 8 * ((reg_id % 4) / 2)) /
-                           group_size,
+        const uint32_t q_idx = precomputed_q_idx[fx][(reg_id % 4) / 2],
                        kv_idx = kv_idx_base + fz * 16 + 2 * (lane_idx % 4) + 8 * (reg_id / 4) +
                                 reg_id % 2;
         const bool out_of_boundary =
@@ -1008,6 +1002,14 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
   // cooperative fetch q fragment from gmem to reg
   const uint32_t qo_packed_idx_base =
       (bx * num_warps_x + get_warp_idx_x<num_warps_x, num_warps_z>()) * num_frags_x * 16;
+  uint32_t precomputed_q_idx[num_frags_x][2];
+#pragma unroll
+  for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+    for (uint32_t j = 0; j < 2; ++j) {
+      precomputed_q_idx[fx][j] = (qo_packed_idx_base + fx * 16 + lane_idx / 4 + 8 * j) / group_size;
+    }
+  }
   const uint32_t kv_n_stride = qkv_info.get_kv_n_stride(), qo_n_stride = qkv_info.get_qo_n_stride(),
                  qo_h_stride = qkv_info.get_qo_h_stride();
   smem_t qo_smem(smem);
@@ -1114,25 +1116,22 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
 
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
       apply_alibi_bias<num_frags_x, num_frags_z>(
-          qo_packed_idx_base,
           chunk_start +
               (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) * num_frags_z * 16,
-          int(kv_len) - int(qo_len), group_size, alibi_slopes, s_frag);
+          int(kv_len) - int(qo_len), precomputed_q_idx, alibi_slopes, s_frag);
     }
     // apply mask
     if constexpr (mask_mode == MaskMode::kCustom) {
       mask_s<partition_kv, mask_mode, num_frags_x, num_frags_y, num_frags_z>(
-          qo_packed_idx_base,
           chunk_start +
               (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) * num_frags_z * 16,
-          qo_len, kv_len, chunk_end, group_size, custom_mask, s_frag);
+          qo_len, kv_len, chunk_end, precomputed_q_idx, custom_mask, s_frag);
     } else {
       if (iter >= mask_iteration) {
         mask_s<partition_kv, mask_mode, num_frags_x, num_frags_y, num_frags_z>(
-            qo_packed_idx_base,
             chunk_start + (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) *
                               num_frags_z * 16,
-            qo_len, kv_len, chunk_end, group_size, nullptr, s_frag);
+            qo_len, kv_len, chunk_end, precomputed_q_idx, /*custom_mask=*/nullptr, s_frag);
       }
     }
 
@@ -1259,6 +1258,14 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
 
   const uint32_t qo_packed_idx_base =
       (qo_tile_idx * num_warps_x + get_warp_idx_x<num_warps_x, num_warps_z>()) * num_frags_x * 16;
+  uint32_t precomputed_q_idx[num_frags_x][2];
+#pragma unroll
+  for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+    for (uint32_t j = 0; j < 2; ++j) {
+      precomputed_q_idx[fx][j] = (qo_packed_idx_base + fx * 16 + lane_idx / 4 + 8 * j) / group_size;
+    }
+  }
   const uint32_t kv_n_stride = qkv_info.get_kv_n_stride(), qo_n_stride = qkv_info.get_qo_n_stride(),
                  qo_h_stride = qkv_info.get_qo_h_stride();
   smem_t qo_smem(smem);
@@ -1381,25 +1388,23 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
       // TODO(Zihao): handle the case that q_offset is specified
       apply_alibi_bias<num_frags_x, num_frags_z>(
-          qo_packed_idx_base,
           chunk_start +
               (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) * num_frags_z * 16,
-          int(kv_len) - int(qo_len), group_size, alibi_slopes, s_frag);
+          int(kv_len) - int(qo_len), precomputed_q_idx, alibi_slopes, s_frag);
     }
     // apply mask
     if constexpr (mask_mode == MaskMode::kCustom) {
       mask_s<partition_kv, mask_mode, num_frags_x, num_frags_y, num_frags_z>(
-          qo_packed_idx_base,
           chunk_start +
               (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) * num_frags_z * 16,
-          qo_len, kv_len, chunk_end, group_size, custom_mask + qk_indptr[request_idx], s_frag);
+          qo_len, kv_len, chunk_end, precomputed_q_idx, custom_mask + qk_indptr[request_idx],
+          s_frag);
     } else {
       if (iter >= mask_iteration) {
         mask_s<partition_kv, mask_mode, num_frags_x, num_frags_y, num_frags_z>(
-            qo_packed_idx_base,
             chunk_start + (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) *
                               num_frags_z * 16,
-            qo_len, kv_len, chunk_end, group_size, nullptr, s_frag);
+            qo_len, kv_len, chunk_end, precomputed_q_idx, /*custom_mask=*/nullptr, s_frag);
       }
     }
 
@@ -1532,6 +1537,14 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
 
   const uint32_t qo_packed_idx_base =
       (qo_tile_idx * num_warps_x + get_warp_idx_x<num_warps_x, num_warps_z>()) * num_frags_x * 16;
+  uint32_t precomputed_q_idx[num_frags_x][2];
+#pragma unroll
+  for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+    for (uint32_t j = 0; j < 2; ++j) {
+      precomputed_q_idx[fx][j] = (qo_packed_idx_base + fx * 16 + lane_idx / 4 + 8 * j) / group_size;
+    }
+  }
   const uint32_t qo_n_stride = get_n_stride_impl<QKVLayout::kNHD, head_dim>(num_qo_heads),
                  qo_h_stride = get_h_stride_impl<QKVLayout::kNHD, head_dim>(qo_len);
   smem_t qo_smem(smem);
@@ -1674,25 +1687,23 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
       // TODO(Zihao): handle the case that q_offset is specified
       apply_alibi_bias<num_frags_x, num_frags_z>(
-          qo_packed_idx_base,
           chunk_start +
               (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) * num_frags_z * 16,
-          int(kv_len) - int(qo_len), group_size, alibi_slopes, s_frag);
+          int(kv_len) - int(qo_len), precomputed_q_idx, alibi_slopes, s_frag);
     }
     // apply mask
     if constexpr (mask_mode == MaskMode::kCustom) {
       mask_s<partition_kv, mask_mode, num_frags_x, num_frags_y, num_frags_z>(
-          qo_packed_idx_base,
           chunk_start +
               (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) * num_frags_z * 16,
-          qo_len, kv_len, chunk_end, group_size, custom_mask + qk_indptr[request_idx], s_frag);
+          qo_len, kv_len, chunk_end, precomputed_q_idx, custom_mask + qk_indptr[request_idx],
+          s_frag);
     } else {
       if (iter >= mask_iteration) {
         mask_s<partition_kv, mask_mode, num_frags_x, num_frags_y, num_frags_z>(
-            qo_packed_idx_base,
             chunk_start + (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) *
                               num_frags_z * 16,
-            qo_len, kv_len, chunk_end, group_size, nullptr, s_frag);
+            qo_len, kv_len, chunk_end, precomputed_q_idx, /*custom_mask=*/nullptr, s_frag);
       }
     }
 
