@@ -69,7 +69,7 @@ struct uint_fastdiv {
       q = n;
     } else {
 #ifdef __CUDA_ARCH__
-      asm volatile("mul.hi.u32 %0, %1, %2;" : "=r"(q) : "r"(m), "r"(n));
+      q = __umulhi(m, n);
 #else
       q = (((unsigned long long)((long long)m * (long long)n)) >> 32);
 #endif
@@ -87,7 +87,7 @@ __host__ __device__ __forceinline__ uint32_t operator/(const uint32_t n,
     q = n;
   } else {
 #ifdef __CUDA_ARCH__
-    asm volatile("mul.hi.u32 %0, %1, %2;" : "=r"(q) : "r"(divisor.m), "r"(n));
+    q = __umulhi(divisor.m, n);
 #else
     q = (((unsigned long long)((long long)divisor.m * (long long)n)) >> 32);
 #endif
