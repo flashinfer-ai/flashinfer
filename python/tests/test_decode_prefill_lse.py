@@ -64,13 +64,16 @@ def test_mlc_failed_case():
         data_type=torch.float16,
         q_data_type=torch.float16,
     )
-    o_1_tc, lse_1_tc = wrapper_tensor_cores.forward_return_lse(q, kv_data)
+    o_1_tc, lse_1_tc = wrapper_tensor_cores.forward_return_lse(
+        q, kv_data
+    )
 
     np.testing.assert_allclose(
         lse_1.cpu().numpy(), lse_1_tc.cpu().numpy(), rtol=1e-3, atol=1e-3
     )
-    print(lse_1[1], lse_1_tc[1])
-
+    np.testing.assert_allclose(
+        o_1.cpu().numpy(), o_1_tc.cpu().numpy(), rtol=1e-3, atol=1e-3
+    )
 
 if __name__ == "__main__":
     test_mlc_failed_case()

@@ -238,7 +238,7 @@ cudaError_t PartitionPagedKVCacheComputeAuxiliaryInfo(
   for (uint32_t batch_idx = 0; batch_idx < old_batch_size; batch_idx++) {
     uint32_t num_chunks =
         ceil_div(old_indptr_h[batch_idx + 1] - old_indptr_h[batch_idx], max_num_pages_per_batch);
-    chunk_indptr_vec.push_back(chunk_indptr_vec.back() + num_chunks);
+    chunk_indptr_vec.push_back(chunk_indptr_vec.back() + std::max(num_chunks, 1U));
     if (num_chunks == 0) {
       new_page_indptr_vec.push_back(old_indptr_h[batch_idx]);
       new_last_page_len_vec.push_back(0);
