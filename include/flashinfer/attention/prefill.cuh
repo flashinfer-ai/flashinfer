@@ -814,11 +814,11 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(float (*o_frag)[num_
       }
     }
 
-    float o_scale[num_frags_x][2][num_warps_z];
     // synchronize m,d first
     __syncthreads();
 #pragma unroll
     for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+      float o_scale[2][num_warps_z];
 #pragma unroll
       for (uint32_t j = 0; j < 2; ++j) {
         float m_new = -5e4, d_new = 1.f;
@@ -846,16 +846,12 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(float (*o_frag)[num_
                                   warp_size +
                               lane_idx];
           float mi = md.x;
-          o_scale[fx][j][i] = math::ptx_exp2(float(mi - m_new));
+          o_scale[j][i] = math::ptx_exp2(float(mi - m_new));
         }
         m[fx][j] = DTypeQKAccum(m_new);
         d[fx][j] = d_new;
       }
-    }
 
-    // the following code saves shared memory usage.
-#pragma unroll
-    for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
       for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
         vec_t<float, 8> o_new;
@@ -873,7 +869,7 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(float (*o_frag)[num_
                       8);
 #pragma unroll
           for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
-            o_new[reg_id] += oi[reg_id] * o_scale[fx][(reg_id % 4) / 2][i];
+            o_new[reg_id] += oi[reg_id] * o_scale[(reg_id % 4) / 2][i];
           }
         }
         o_new.store(o_frag[fx][fy]);
@@ -968,7 +964,8 @@ template <LogitsPostHook logits_post_hook, bool partition_kv, MaskMode mask_mode
           QKVLayout kv_layout, PosEncodingMode pos_encoding_mode, uint32_t num_frags_x,
           uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps_x, uint32_t num_warps_z,
           typename DTypeIn, typename DTypeQKAccum, typename DTypeOut>
-__global__ void SinglePrefillWithKVCacheKernel(
+__global__
+__launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVCacheKernel(
     DTypeIn* __restrict__ q, DTypeIn* __restrict__ k, DTypeIn* __restrict__ v,
     uint8_t* __restrict__ custom_mask, DTypeOut* __restrict__ o, float* __restrict__ lse,
     const uint32_t qo_len, const uint32_t kv_len, const uint_fastdiv group_size,
@@ -1204,7 +1201,8 @@ template <bool partition_kv, LogitsPostHook logits_post_hook, MaskMode mask_mode
           QKVLayout kv_layout, PosEncodingMode pos_encoding_mode, uint32_t num_frags_x,
           uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps_x, uint32_t num_warps_z,
           typename DTypeIn, typename DTypeQKAccum, typename DTypeOut, typename IdType>
-__global__ void BatchPrefillWithRaggedKVCacheKernel(
+__global__
+__launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRaggedKVCacheKernel(
     DTypeIn* __restrict__ q, IdType* __restrict__ request_indices,
     IdType* __restrict__ q_tile_indices, IdType* __restrict__ kv_tile_indices,
     IdType* __restrict__ q_indptr, DTypeIn* __restrict__ k, DTypeIn* __restrict__ v,
@@ -1474,7 +1472,8 @@ template <bool partition_kv, LogitsPostHook logits_post_hook, MaskMode mask_mode
           uint32_t num_frags_z, uint32_t num_warps_x, uint32_t num_warps_z,
           PageStorage page_storage, QKVLayout kv_layout, typename DTypeIn, typename DTypeQKAccum,
           typename DTypeOut, typename IdType>
-__global__ void BatchPrefillWithPagedKVCacheKernel(
+__global__
+__launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPagedKVCacheKernel(
     IdType* __restrict__ request_indices, IdType* __restrict__ q_tile_indices,
     IdType* __restrict__ kv_tile_indices, DTypeIn* __restrict__ q,
     paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, IdType* __restrict__ q_indptr,
@@ -1606,6 +1605,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
   const IdType last_indptr = paged_kv.indptr[paged_kv.batch_size];
 
   uint32_t packed_page_iter_base = paged_kv.indptr[request_idx] * paged_kv.page_size + chunk_start;
+#pragma unroll
   for (uint32_t i = 0; i < num_frags_z * 4 / num_warps_x; ++i) {
     uint32_t page_iter, entry_idx;
     paged_kv.page_size.divmod(
@@ -1644,6 +1644,7 @@ __global__ void BatchPrefillWithPagedKVCacheKernel(
 #pragma unroll 1
   for (uint32_t iter = 0; iter < num_iterations; ++iter) {
     packed_page_iter_base += 16 * num_warps_z * num_frags_z;
+#pragma unroll
     for (uint32_t i = 0; i < num_frags_z * 4 / num_warps_x; ++i) {
       uint32_t page_iter, entry_idx;
       paged_kv.page_size.divmod(
