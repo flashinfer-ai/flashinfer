@@ -154,7 +154,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
   torch::Tensor o = torch::empty_like(q);
   torch::Tensor lse;
   if (return_lse) {
-    lse = torch::empty({batch_size, num_qo_heads}, q.options()).to(torch::kFloat32);
+    lse = torch::empty({batch_size, num_qo_heads}, q.options().dtype((torch::kFloat32)));
   }
 
   TORCH_CHECK(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
