@@ -25,6 +25,7 @@ from .prefill import (
     BatchPrefillWithRaggedKVCacheWrapper,
     BatchPrefillWithPagedKVCacheWrapper,
 )
+from .sparse import BlockSparseFlashAttentionWrapper
 from .cascade import (
     merge_state,
     merge_state_in_place,
