@@ -64,21 +64,20 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q_scalar_type, qkv_type, [&] {
       return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
         return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
-          return DISPATCH_kv_layout(kv_layout, KV_LAYOUT, [&] {
-            return DISPATCH_pos_encoding_mode(
-                PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
-                  cudaError_t status = SingleDecodeWithKVCacheDispatched<
-                      HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT, POS_ENCODING_MODE>(
-                      static_cast<qkv_type*>(q.data_ptr()), static_cast<qkv_type*>(k.data_ptr()),
-                      static_cast<qkv_type*>(v.data_ptr()), static_cast<qkv_type*>(o.data_ptr()),
-                      static_cast<qkv_type*>(tmp.data_ptr()), num_qo_heads, num_kv_heads, kv_len,
-                      logits_soft_cap, sm_scale, rope_scale, rope_theta, torch_current_stream);
-                  TORCH_CHECK(status == cudaSuccess,
-                              "SingleDecodeWithKVCache kernel launch failed, error: " +
-                                  std::string(cudaGetErrorString(status)));
-                  return true;
-                });
-          });
+          return DISPATCH_pos_encoding_mode(
+              PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
+                cudaError_t status = SingleDecodeWithKVCacheDispatched<HEAD_DIM, LOGITS_POST_HOOK,
+                                                                       POS_ENCODING_MODE>(
+                    static_cast<qkv_type*>(q.data_ptr()), static_cast<qkv_type*>(k.data_ptr()),
+                    static_cast<qkv_type*>(v.data_ptr()), static_cast<qkv_type*>(o.data_ptr()),
+                    static_cast<qkv_type*>(tmp.data_ptr()), num_qo_heads, num_kv_heads, kv_len,
+                    kv_layout, logits_soft_cap, sm_scale, rope_scale, rope_theta,
+                    torch_current_stream);
+                TORCH_CHECK(status == cudaSuccess,
+                            "SingleDecodeWithKVCache kernel launch failed, error: " +
+                                std::string(cudaGetErrorString(status)));
+                return true;
+              });
         });
       });
     });
@@ -87,23 +86,20 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
       return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(kv_scalar_type, kv_type, [&] {
         return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
           return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
-            return DISPATCH_kv_layout(kv_layout, KV_LAYOUT, [&] {
-              return DISPATCH_pos_encoding_mode(
-                  PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
-                    cudaError_t status =
-                        SingleDecodeWithKVCacheDispatched<HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT,
-                                                          POS_ENCODING_MODE>(
-                            static_cast<q_type*>(q.data_ptr()), static_cast<kv_type*>(k.data_ptr()),
-                            static_cast<kv_type*>(v.data_ptr()), static_cast<q_type*>(o.data_ptr()),
-                            static_cast<q_type*>(tmp.data_ptr()), num_qo_heads, num_kv_heads,
-                            kv_len, logits_soft_cap, sm_scale, rope_scale, rope_theta,
-                            torch_current_stream);
-                    TORCH_CHECK(status == cudaSuccess,
-                                "SingleDecodeWithKVCache kernel launch failed, error: " +
-                                    std::string(cudaGetErrorString(status)));
-                    return true;
-                  });
-            });
+            return DISPATCH_pos_encoding_mode(
+                PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
+                  cudaError_t status = SingleDecodeWithKVCacheDispatched<HEAD_DIM, LOGITS_POST_HOOK,
+                                                                         POS_ENCODING_MODE>(
+                      static_cast<q_type*>(q.data_ptr()), static_cast<kv_type*>(k.data_ptr()),
+                      static_cast<kv_type*>(v.data_ptr()), static_cast<q_type*>(o.data_ptr()),
+                      static_cast<q_type*>(tmp.data_ptr()), num_qo_heads, num_kv_heads, kv_len,
+                      kv_layout, logits_soft_cap, sm_scale, rope_scale, rope_theta,
+                      torch_current_stream);
+                  TORCH_CHECK(status == cudaSuccess,
+                              "SingleDecodeWithKVCache kernel launch failed, error: " +
+                                  std::string(cudaGetErrorString(status)));
+                  return true;
+                });
           });
         });
       });

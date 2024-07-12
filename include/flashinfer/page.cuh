@@ -68,12 +68,14 @@ struct kv_partition_info_t {
  * \tparam DType The data type of the key-value cache
  * \tparam IdType The index data type of the kv-cache
  */
-template <PageStorage page_storage, QKVLayout layout, typename DType, typename IdType>
+template <PageStorage page_storage, typename DType, typename IdType>
 struct paged_kv_t {
   uint_fastdiv page_size;
   uint32_t num_heads;
   uint32_t head_dim;
   uint32_t batch_size;
+  uint32_t stride_n;
+  uint32_t stride_h;
 
   // The flattened key-value cache, used when page_storage == kIndices
   // Internal layout:
@@ -100,6 +102,8 @@ struct paged_kv_t {
         page_size(0),
         head_dim(0),
         batch_size(0),
+        stride_n(0),
+        stride_h(0),
         data(nullptr),
         indices(nullptr),
         ptrs(nullptr),
@@ -113,6 +117,7 @@ struct paged_kv_t {
    * \param page_size The size of each page
    * \param head_dim The dimension of each head
    * \param batch_size The batch size
+   * \param layout The layout of last 3 dimensions in KV-Cache.
    * \param data The flattened key-value cache
    * \param indices The page indices array
    * \param indptr The page indptr array
@@ -121,8 +126,8 @@ struct paged_kv_t {
    * \note This constructor should only be used when page_storage == kIndices
    */
   __host__ __forceinline__ paged_kv_t(uint32_t num_heads, uint32_t page_size, uint32_t head_dim,
-                                      uint32_t batch_size, DType* data, IdType* indices,
-                                      IdType* indptr, IdType* last_page_len,
+                                      uint32_t batch_size, QKVLayout layout, DType* data,
+                                      IdType* indices, IdType* indptr, IdType* last_page_len,
                                       IdType* rope_pos_offset = nullptr)
       : num_heads(num_heads),
         page_size(page_size),
@@ -132,7 +137,10 @@ struct paged_kv_t {
         indices(indices),
         indptr(indptr),
         last_page_len(last_page_len),
-        rope_pos_offset(rope_pos_offset) {}
+        rope_pos_offset(rope_pos_offset) {
+    stride_n = layout == QKVLayout::kHND ? head_dim : num_heads * head_dim;
+    stride_h = layout == QKVLayout::kHND ? page_size * head_dim : head_dim;
+  }
 
   /*!
    * \brief Construct a paged key-value cache
@@ -140,6 +148,7 @@ struct paged_kv_t {
    * \param page_size The size of each page
    * \param head_dim The dimension of each head
    * \param batch_size The batch size
+   * \param layout The layout of last 3 dimensions in KV-Cache.
    * \param ptrs The array of pointers to each active page
    * \param indptr The page indptr array
    * \param last_page_len The offset of the last page for each request in the batch
@@ -147,8 +156,9 @@ struct paged_kv_t {
    * \note This constructor should only be used when page_storage == kIndices
    */
   __host__ __forceinline__ paged_kv_t(uint32_t num_heads, uint32_t page_size, uint32_t head_dim,
-                                      uint32_t batch_size, DType** ptrs, IdType* indptr,
-                                      IdType* last_page_len, IdType* rope_pos_offset = nullptr)
+                                      uint32_t batch_size, QKVLayout layout, DType** ptrs,
+                                      IdType* indptr, IdType* last_page_len,
+                                      IdType* rope_pos_offset = nullptr)
       : num_heads(num_heads),
         page_size(page_size),
         head_dim(head_dim),
@@ -156,7 +166,10 @@ struct paged_kv_t {
         ptrs(ptrs),
         indptr(indptr),
         last_page_len(last_page_len),
-        rope_pos_offset(rope_pos_offset) {}
+        rope_pos_offset(rope_pos_offset) {
+    stride_n = layout == QKVLayout::kHND ? head_dim : num_heads * head_dim;
+    stride_h = layout == QKVLayout::kHND ? page_size * head_dim : head_dim;
+  }
 
   /*!
    * \brief Compute the offset of k element in the allocated buffer.
@@ -169,11 +182,8 @@ struct paged_kv_t {
   __host__ __device__ __forceinline__ size_t get_k_elem_offset(size_t page_idx, size_t head_idx,
                                                                size_t entry_idx,
                                                                size_t feat_idx) const {
-    return layout == QKVLayout::kHND
-               ? ((page_idx * 2 * num_heads + head_idx) * page_size + entry_idx) * head_dim +
-                     feat_idx
-               : ((page_idx * 2 * page_size + entry_idx) * num_heads + head_idx) * head_dim +
-                     feat_idx;
+    return page_idx * 2 * page_size * num_heads * head_dim + head_idx * stride_h +
+           entry_idx * stride_n + feat_idx;
   }
 
   /*!
@@ -185,8 +195,7 @@ struct paged_kv_t {
   __host__ __device__ __forceinline__ size_t get_k_elem_offset_in_page(size_t head_idx,
                                                                        size_t entry_idx,
                                                                        size_t feat_idx) const {
-    return layout == QKVLayout::kHND ? (head_idx * page_size + entry_idx) * head_dim + feat_idx
-                                     : (entry_idx * num_heads + head_idx) * head_dim + feat_idx;
+    return head_idx * stride_h + entry_idx * stride_n + feat_idx;
   }
 
   /*!
@@ -200,11 +209,8 @@ struct paged_kv_t {
   __host__ __device__ __forceinline__ size_t get_v_elem_offset(size_t page_idx, size_t head_idx,
                                                                size_t entry_idx,
                                                                size_t feat_idx) const {
-    return layout == QKVLayout::kHND
-               ? (((page_idx * 2 + 1) * num_heads + head_idx) * page_size + entry_idx) * head_dim +
-                     feat_idx
-               : (((page_idx * 2 + 1) * page_size + entry_idx) * num_heads + head_idx) * head_dim +
-                     feat_idx;
+    return (page_idx * 2 + 1) * page_size * num_heads * head_dim + head_idx * stride_h +
+           entry_idx * stride_n + feat_idx;
   }
 
   /*!
@@ -216,9 +222,7 @@ struct paged_kv_t {
   __host__ __device__ __forceinline__ size_t get_v_elem_offset_in_page(size_t head_idx,
                                                                        size_t entry_idx,
                                                                        size_t feat_idx) const {
-    return layout == QKVLayout::kHND
-               ? ((num_heads + head_idx) * page_size + entry_idx) * head_dim + feat_idx
-               : ((page_size + entry_idx) * num_heads + head_idx) * head_dim + feat_idx;
+    return head_idx * stride_h + entry_idx * stride_n + feat_idx;
   }
 
   __host__ __device__ __forceinline__ uint32_t kv_offset_delta() const {
@@ -285,18 +289,16 @@ struct paged_kv_t {
  * \tparam head_dim The dimension of each head
  * \tparam vec_size The vector size used in the kernel
  * \tparam page_storage Whether to store indices or pointers of each active page
- * \tparam layout The layout of last 3 dimension in KV-Cache
  * \tparam DType The data type of the key-value cache
  * \tparam IdType The index data type of the kv-cache
  * \param paged_kv The paged key-value cache
  * \param key The key to be appended
  * \param value The value to be appended
  */
-template <uint32_t head_dim, uint32_t vec_size, PageStorage page_storage, QKVLayout layout,
-          typename DType, typename IdType>
-__global__ void AppendPagedKVCacheDecodeKernel(
-    paged_kv_t<page_storage, layout, DType, IdType> paged_kv, DType* __restrict__ key,
-    DType* __restrict__ value) {
+template <uint32_t head_dim, uint32_t vec_size, PageStorage page_storage, typename DType,
+          typename IdType>
+__global__ void AppendPagedKVCacheDecodeKernel(paged_kv_t<page_storage, DType, IdType> paged_kv,
+                                               DType* __restrict__ key, DType* __restrict__ value) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t num_heads = paged_kv.num_heads;
   uint32_t batch_idx = blockIdx.x;
@@ -323,7 +325,6 @@ __global__ void AppendPagedKVCacheDecodeKernel(
  * \tparam head_dim The dimension of each head
  * \tparam vec_size The vector size used in the kernel
  * \tparam page_storage Whether to store indices or pointers of each active page
- * \tparam layout The layout of last 3 dimension in KV-Cache
  * \tparam DType The data type of the key-value cache
  * \tparam IdType The index data type of the kv-cache
  * \param paged_kv The paged key-value cache
@@ -331,11 +332,11 @@ __global__ void AppendPagedKVCacheDecodeKernel(
  * \param value The value to be appended
  * \param append_indptr The indptr array of the appended ragged tensor
  */
-template <uint32_t head_dim, uint32_t vec_size, PageStorage page_storage, QKVLayout layout,
-          typename DType, typename IdType>
-__global__ void AppendPagedKVCachePrefillKernel(
-    paged_kv_t<page_storage, layout, DType, IdType> paged_kv, DType* __restrict__ key,
-    DType* __restrict__ value, IdType* __restrict__ append_indptr) {
+template <uint32_t head_dim, uint32_t vec_size, PageStorage page_storage, typename DType,
+          typename IdType>
+__global__ void AppendPagedKVCachePrefillKernel(paged_kv_t<page_storage, DType, IdType> paged_kv,
+                                                DType* __restrict__ key, DType* __restrict__ value,
+                                                IdType* __restrict__ append_indptr) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t num_heads = paged_kv.num_heads;
   uint32_t batch_idx = blockIdx.x;
@@ -368,7 +369,6 @@ __global__ void AppendPagedKVCachePrefillKernel(
 /*!
  * \brief Append new keys/values to the paged key-value cache in the decode phase
  * \tparam page_storage Whether to store indices or pointers of each active page
- * \tparam layout The layout of last 3 dimension in KV-Cache
  * \tparam DType The data type of the key-value cache
  * \tparam IdType The index data type of the kv-cache
  * \param paged_kv The paged key-value cache
@@ -377,9 +377,9 @@ __global__ void AppendPagedKVCachePrefillKernel(
  * \param stream The CUDA stream to execute kernels.
  * \return status Indicates whether CUDA calls are successful
  */
-template <PageStorage page_storage, QKVLayout layout, typename DType, typename IdType>
-cudaError_t AppendPagedKVCacheDecode(paged_kv_t<page_storage, layout, DType, IdType> paged_kv,
-                                     DType* key, DType* value, cudaStream_t stream = nullptr) {
+template <PageStorage page_storage, typename DType, typename IdType>
+cudaError_t AppendPagedKVCacheDecode(paged_kv_t<page_storage, DType, IdType> paged_kv, DType* key,
+                                     DType* value, cudaStream_t stream = nullptr) {
   uint32_t head_dim = paged_kv.head_dim;
   uint32_t batch_size = paged_kv.batch_size;
   uint32_t num_heads = paged_kv.num_heads;
@@ -390,8 +390,7 @@ cudaError_t AppendPagedKVCacheDecode(paged_kv_t<page_storage, layout, DType, IdT
     // NOTE(Zihao): could be slow for small batch size, will optimize later
     dim3 nblks(batch_size);
     dim3 nthrs(bdx, bdy);
-    auto kernel =
-        AppendPagedKVCacheDecodeKernel<HEAD_DIM, vec_size, page_storage, layout, DType, IdType>;
+    auto kernel = AppendPagedKVCacheDecodeKernel<HEAD_DIM, vec_size, page_storage, DType, IdType>;
     void* args[] = {(void*)&paged_kv, (void*)&key, (void*)&value};
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
   });
@@ -411,8 +410,8 @@ cudaError_t AppendPagedKVCacheDecode(paged_kv_t<page_storage, layout, DType, IdT
  * \param stream The CUDA stream to execute kernels.
  * \return status Indicates whether CUDA calls are successful
  */
-template <PageStorage page_storage, QKVLayout layout, typename DType, typename IdType>
-cudaError_t AppendPagedKVCache(paged_kv_t<page_storage, layout, DType, IdType> paged_kv, DType* key,
+template <PageStorage page_storage, typename DType, typename IdType>
+cudaError_t AppendPagedKVCache(paged_kv_t<page_storage, DType, IdType> paged_kv, DType* key,
                                DType* value, IdType* append_indptr, cudaStream_t stream = nullptr) {
   uint32_t head_dim = paged_kv.head_dim;
   uint32_t batch_size = paged_kv.batch_size;
@@ -424,8 +423,7 @@ cudaError_t AppendPagedKVCache(paged_kv_t<page_storage, layout, DType, IdType> p
     // NOTE(Zihao): could be slow for small batch size, will optimize later
     dim3 nblks(batch_size);
     dim3 nthrs(bdx, bdy);
-    auto kernel =
-        AppendPagedKVCachePrefillKernel<HEAD_DIM, vec_size, page_storage, layout, DType, IdType>;
+    auto kernel = AppendPagedKVCachePrefillKernel<HEAD_DIM, vec_size, page_storage, DType, IdType>;
     void* args[] = {(void*)&paged_kv, (void*)&key, (void*)&value, (void*)&append_indptr};
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
   });

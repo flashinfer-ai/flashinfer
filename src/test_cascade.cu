@@ -266,14 +266,16 @@ void _TestTwoLevelSinglePrefixCascadeDecodeCorrectness(size_t batch_size,
 
   constexpr PageStorage page_storage = PageStorage::kIndices;
 
-  paged_kv_t<page_storage, kv_layout, T, int32_t> paged_kv_baseline_d(
-      num_kv_heads, page_size, head_dim, batch_size, thrust::raw_pointer_cast(kv_data_d.data()),
+  paged_kv_t<page_storage, T, int32_t> paged_kv_baseline_d(
+      num_kv_heads, page_size, head_dim, batch_size, kv_layout,
+      thrust::raw_pointer_cast(kv_data_d.data()),
       thrust::raw_pointer_cast(kv_indices_combined_d.data()),
       thrust::raw_pointer_cast(kv_indptr_combined_d.data()),
       thrust::raw_pointer_cast(kv_last_page_len_combined_d.data()));
 
-  paged_kv_t<page_storage, kv_layout, T, int32_t> paged_kv_casacde_d(
-      num_kv_heads, page_size, head_dim, batch_size, thrust::raw_pointer_cast(kv_data_d.data()),
+  paged_kv_t<page_storage, T, int32_t> paged_kv_casacde_d(
+      num_kv_heads, page_size, head_dim, batch_size, kv_layout,
+      thrust::raw_pointer_cast(kv_data_d.data()),
       thrust::raw_pointer_cast(kv_indices_unique_d.data()),
       thrust::raw_pointer_cast(kv_indptr_unique_d.data()),
       thrust::raw_pointer_cast(kv_last_page_len_unique_d.data()));
@@ -284,22 +286,21 @@ void _TestTwoLevelSinglePrefixCascadeDecodeCorrectness(size_t batch_size,
   thrust::device_vector<char> buffer_baseline(workspace_size_in_bytes),
       buffer_cascade(workspace_size_in_bytes);
 
-  BatchDecodeHandlerBeginForward<page_storage, kv_layout, T, T, T, int32_t>(
+  BatchDecodeHandlerBeginForward<page_storage, T, T, T, int32_t>(
       &baseline_handler, (void*)thrust::raw_pointer_cast(buffer_baseline.data()),
       workspace_size_in_bytes, kv_indptr_combined_h.data(), kv_last_page_len_combined_h.data(),
       batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, PosEncodingMode::kNone);
 
-  BatchDecodeHandlerBeginForward<page_storage, kv_layout, T, T, T, int32_t>(
+  BatchDecodeHandlerBeginForward<page_storage, T, T, T, int32_t>(
       &cascade_handler, (void*)thrust::raw_pointer_cast(buffer_cascade.data()),
       workspace_size_in_bytes, kv_indptr_unique_h.data(), kv_last_page_len_unique_h.data(),
       batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, PosEncodingMode::kNone);
 
   // Compute result using baseline implementation
-  cudaError_t status =
-      BatchDecodeWithPagedKVCacheWrapper<page_storage, kv_layout, T, T, T, int32_t>(
-          &baseline_handler, thrust::raw_pointer_cast(q_d.data()),
-          /*q_offset=*/nullptr, paged_kv_baseline_d, thrust::raw_pointer_cast(o_baseline_d.data()),
-          /*lse=*/nullptr, num_qo_heads, PosEncodingMode::kNone);
+  cudaError_t status = BatchDecodeWithPagedKVCacheWrapper<page_storage, T, T, T, int32_t>(
+      &baseline_handler, thrust::raw_pointer_cast(q_d.data()),
+      /*q_offset=*/nullptr, paged_kv_baseline_d, thrust::raw_pointer_cast(o_baseline_d.data()),
+      /*lse=*/nullptr, num_qo_heads, PosEncodingMode::kNone);
 
   EXPECT_EQ(status, cudaSuccess) << "Baseline implementation failed with error: "
                                  << cudaGetErrorString(status);
@@ -316,7 +317,7 @@ void _TestTwoLevelSinglePrefixCascadeDecodeCorrectness(size_t batch_size,
   EXPECT_EQ(status, cudaSuccess) << "Cascade implementation prefill failed with error: "
                                  << cudaGetErrorString(status);
 
-  status = BatchDecodeWithPagedKVCacheWrapper<page_storage, kv_layout, T, T, T, int32_t>(
+  status = BatchDecodeWithPagedKVCacheWrapper<page_storage, T, T, T, int32_t>(
       &cascade_handler, thrust::raw_pointer_cast(q_d.data()),
       /*q_offset=*/nullptr, paged_kv_casacde_d, thrust::raw_pointer_cast(o_cascade_1_d.data()),
       /*lse=*/thrust::raw_pointer_cast(lse_cascade_1_d.data()), num_qo_heads,
@@ -392,14 +393,16 @@ void _TestTwoLevelSinglePrefixCascadeAppendCorrectness(size_t batch_size,
 
   constexpr PageStorage page_storage = PageStorage::kIndices;
 
-  paged_kv_t<page_storage, kv_layout, T, int32_t> paged_kv_baseline_d(
-      num_kv_heads, page_size, head_dim, batch_size, thrust::raw_pointer_cast(kv_data_d.data()),
+  paged_kv_t<page_storage, T, int32_t> paged_kv_baseline_d(
+      num_kv_heads, page_size, head_dim, batch_size, kv_layout,
+      thrust::raw_pointer_cast(kv_data_d.data()),
       thrust::raw_pointer_cast(kv_indices_combined_d.data()),
       thrust::raw_pointer_cast(kv_indptr_combined_d.data()),
       thrust::raw_pointer_cast(kv_last_page_len_combined_d.data()));
 
-  paged_kv_t<page_storage, kv_layout, T, int32_t> paged_kv_casacde_d(
-      num_kv_heads, page_size, head_dim, batch_size, thrust::raw_pointer_cast(kv_data_d.data()),
+  paged_kv_t<page_storage, T, int32_t> paged_kv_casacde_d(
+      num_kv_heads, page_size, head_dim, batch_size, kv_layout,
+      thrust::raw_pointer_cast(kv_data_d.data()),
       thrust::raw_pointer_cast(kv_indices_unique_d.data()),
       thrust::raw_pointer_cast(kv_indptr_unique_d.data()),
       thrust::raw_pointer_cast(kv_last_page_len_unique_d.data()));
@@ -418,7 +421,7 @@ void _TestTwoLevelSinglePrefixCascadeAppendCorrectness(size_t batch_size,
                                            kv_indptr_unique_h.data(), batch_size, num_qo_heads,
                                            num_kv_heads, head_dim, page_size);
 
-  cudaError_t status = BatchPrefillWithPagedKVCacheWrapper<page_storage, kv_layout, T, T, int32_t>(
+  cudaError_t status = BatchPrefillWithPagedKVCacheWrapper<page_storage, T, T, int32_t>(
       &baseline_handler, thrust::raw_pointer_cast(q_d.data()),
       thrust::raw_pointer_cast(qo_indptr_d.data()),
       /*q_offset=*/nullptr, paged_kv_baseline_d, thrust::raw_pointer_cast(o_baseline_d.data()),
@@ -441,7 +444,7 @@ void _TestTwoLevelSinglePrefixCascadeAppendCorrectness(size_t batch_size,
       << "Cascade implementation shared prefix prefill failed with error: "
       << cudaGetErrorString(status);
 
-  status = BatchPrefillWithPagedKVCacheWrapper<page_storage, kv_layout, T, T, int32_t>(
+  status = BatchPrefillWithPagedKVCacheWrapper<page_storage, T, T, int32_t>(
       &cascade_handler, thrust::raw_pointer_cast(q_d.data()),
       thrust::raw_pointer_cast(qo_indptr_d.data()),
       /*r_rope_position=*/nullptr, paged_kv_casacde_d,

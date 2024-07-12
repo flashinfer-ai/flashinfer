@@ -77,11 +77,10 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
   assert(q.size() == batch_size * num_qo_heads * head_dim);
   assert(o_ref.size() == batch_size * num_qo_heads * head_dim);
 
-  flashinfer::paged_kv_t<PageStorage::kIndices, kv_layout, DTypeKV, int32_t> paged_kv_cpu(
-      num_kv_heads, page_size, head_dim, batch_size, kv_data.data(), kv_indices.data(),
+  flashinfer::paged_kv_t<PageStorage::kIndices, DTypeKV, int32_t> paged_kv_cpu(
+      num_kv_heads, page_size, head_dim, batch_size, kv_layout, kv_data.data(), kv_indices.data(),
       kv_indptr.data(), kv_last_page_len.data());
-  cpu_reference::append_paged_kv_cache<kv_layout, DTypeKV, int32_t>(paged_kv_cpu, keys, values,
-                                                                    append_indptr);
+  cpu_reference::append_paged_kv_cache<DTypeKV, int32_t>(paged_kv_cpu, keys, values, append_indptr);
 
   // copy data to device
   thrust::device_vector<DTypeKV> kv_data_device(kv_data);
@@ -92,8 +91,8 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
   thrust::device_vector<DTypeQO> o_device(o_ref.size());
 
   // create paged_kv object
-  flashinfer::paged_kv_t<PageStorage::kIndices, kv_layout, DTypeKV, int32_t> paged_kv(
-      num_kv_heads, page_size, head_dim, batch_size,
+  flashinfer::paged_kv_t<PageStorage::kIndices, DTypeKV, int32_t> paged_kv(
+      num_kv_heads, page_size, head_dim, batch_size, kv_layout,
       thrust::raw_pointer_cast(kv_data_device.data()),
       thrust::raw_pointer_cast(kv_indices_device.data()),
       thrust::raw_pointer_cast(kv_indptr_device.data()),
@@ -101,25 +100,24 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
   flashinfer::BatchDecodeHandler handler;
   size_t workspace_size_in_bytes = 32 * 1024 * 1024;
   thrust::device_vector<char> buffer(workspace_size_in_bytes);
-  BatchDecodeHandlerBeginForward<PageStorage::kIndices, kv_layout, DTypeQO, DTypeKV, DTypeQO,
-                                 int32_t>(&handler, (void*)thrust::raw_pointer_cast(buffer.data()),
-                                          workspace_size_in_bytes, kv_indptr.data(),
-                                          kv_last_page_len.data(), batch_size, num_qo_heads,
-                                          num_kv_heads, head_dim, page_size, pos_encoding_mode);
+  BatchDecodeHandlerBeginForward<PageStorage::kIndices, DTypeQO, DTypeKV, DTypeQO, int32_t>(
+      &handler, (void*)thrust::raw_pointer_cast(buffer.data()), workspace_size_in_bytes,
+      kv_indptr.data(), kv_last_page_len.data(), batch_size, num_qo_heads, num_kv_heads, head_dim,
+      page_size, pos_encoding_mode);
 
   if (!cooperative) {
     // use non-cooperative kernel
     cudaError_t status =
-        flashinfer::BatchDecodeWithPagedKVCacheNoSplitKV<PageStorage::kIndices, kv_layout, DTypeQO,
-                                                         DTypeKV, DTypeQO, int32_t>(
+        flashinfer::BatchDecodeWithPagedKVCacheNoSplitKV<PageStorage::kIndices, DTypeQO, DTypeKV,
+                                                         DTypeQO, int32_t>(
             thrust::raw_pointer_cast(q_device.data()), /*q_offset=*/nullptr, paged_kv,
             kv_partition_info_t<int32_t>(), thrust::raw_pointer_cast(o_device.data()),
             /*lse=*/nullptr, num_qo_heads, pos_encoding_mode);
     EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
   } else {
     cudaError_t status =
-        flashinfer::BatchDecodeWithPagedKVCacheWrapper<PageStorage::kIndices, kv_layout, DTypeQO,
-                                                       DTypeKV, DTypeQO, int32_t>(
+        flashinfer::BatchDecodeWithPagedKVCacheWrapper<PageStorage::kIndices, DTypeQO, DTypeKV,
+                                                       DTypeQO, int32_t>(
             &handler, thrust::raw_pointer_cast(q_device.data()), /*q_offset=*/nullptr, paged_kv,
             thrust::raw_pointer_cast(o_device.data()), /*lse=*/nullptr, num_qo_heads,
             pos_encoding_mode);

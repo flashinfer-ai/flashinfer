@@ -31,11 +31,6 @@ warp_layout_literal = {
     2: "WarpLayout::k1x4x1",
 }
 
-kv_layout_literal = {
-    0: "QKVLayout::kNHD",
-    1: "QKVLayout::kHND",
-}
-
 pos_encoding_mode_literal = {
     0: "PosEncodingMode::kNone",
     1: "PosEncodingMode::kRoPELlama",

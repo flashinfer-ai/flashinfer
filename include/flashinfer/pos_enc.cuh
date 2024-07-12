@@ -119,9 +119,8 @@ __global__ void BatchQKApplyRotaryInPlaceKernel(DType* __restrict__ q, DType* __
     for (uint32_t i = 0; i < (seq_len + bdy - 1) / bdy; ++i) {
       vec_t<float, vec_size> q_vec;
       if (i * bdy + ty < seq_len) {
-        DType* q_ptr =
-            q + get_elem_offset_impl<QKVLayout::kNHD, head_dim>(
-                    indptr[batch_idx] + i * bdy + ty, qo_head_idx, 0, seq_len, num_qo_heads);
+        DType* q_ptr = q + get_elem_offset_impl(indptr[batch_idx] + i * bdy + ty, qo_head_idx, 0,
+                                                num_qo_heads * head_dim, head_dim);
         q_vec = vec_apply_llama_rope<vec_size, bdx>(q_ptr, freq, offset + i * bdy + ty);
         q_vec.cast_store(q_ptr + tx * vec_size);
       }
@@ -136,9 +135,8 @@ __global__ void BatchQKApplyRotaryInPlaceKernel(DType* __restrict__ q, DType* __
     for (uint32_t i = 0; i < (seq_len + bdy - 1) / bdy; ++i) {
       vec_t<float, vec_size> k_vec;
       if (i * bdy + ty < seq_len) {
-        DType* k_ptr =
-            k + get_elem_offset_impl<QKVLayout::kNHD, head_dim>(
-                    indptr[batch_idx] + i * bdy + ty, kv_head_idx, 0, seq_len, num_kv_heads);
+        DType* k_ptr = k + get_elem_offset_impl(indptr[batch_idx] + i * bdy + ty, kv_head_idx, 0,
+                                                num_kv_heads * head_dim, head_dim);
         k_vec = vec_apply_llama_rope<vec_size, bdx>(k_ptr, freq, offset + i * bdy + ty);
         k_vec.cast_store(k_ptr + tx * vec_size);
       }

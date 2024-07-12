@@ -53,22 +53,20 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q_scalar_type, qkv_type, [&] {
       return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
         return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
-          return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
-            return DISPATCH_pos_encoding_mode(
-                PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
-                  cudaError_t status = handler_->BeginForwardDispatched<
-                      HEAD_DIM, PageStorage::kIndices, LOGITS_POST_HOOK, KV_LAYOUT,
-                      POS_ENCODING_MODE, qkv_type, qkv_type, qkv_type, int32_t>(
-                      static_cast<void*>(workspace_buffer.data_ptr()), workspace_size_in_bytes,
-                      static_cast<int32_t*>(indptr.data_ptr()),
-                      static_cast<int32_t*>(last_page_len.data_ptr()), batch_size, num_qo_heads,
-                      num_kv_heads, page_size);
-                  TORCH_CHECK(status == cudaSuccess,
-                              "BatchDecodeWithPagedKVCache failed with error ",
-                              cudaGetErrorString(status));
-                  return true;
-                });
-          });
+          return DISPATCH_pos_encoding_mode(
+              PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
+                cudaError_t status =
+                    handler_->BeginForwardDispatched<HEAD_DIM, PageStorage::kIndices,
+                                                     LOGITS_POST_HOOK, POS_ENCODING_MODE, qkv_type,
+                                                     qkv_type, qkv_type, int32_t>(
+                        static_cast<void*>(workspace_buffer.data_ptr()), workspace_size_in_bytes,
+                        static_cast<int32_t*>(indptr.data_ptr()),
+                        static_cast<int32_t*>(last_page_len.data_ptr()), batch_size, num_qo_heads,
+                        num_kv_heads, page_size);
+                TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
+                            cudaGetErrorString(status));
+                return true;
+              });
         });
       });
     });
@@ -77,22 +75,21 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
       return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(kv_scalar_type, kv_type, [&] {
         return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
           return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
-            return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
-              return DISPATCH_pos_encoding_mode(
-                  PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
-                    cudaError_t status = handler_->BeginForwardDispatched<
-                        HEAD_DIM, PageStorage::kIndices, LOGITS_POST_HOOK, KV_LAYOUT,
-                        POS_ENCODING_MODE, q_type, kv_type, q_type, int32_t>(
-                        static_cast<void*>(workspace_buffer.data_ptr()), workspace_size_in_bytes,
-                        static_cast<int32_t*>(indptr.data_ptr()),
-                        static_cast<int32_t*>(last_page_len.data_ptr()), batch_size, num_qo_heads,
-                        num_kv_heads, page_size);
-                    TORCH_CHECK(status == cudaSuccess,
-                                "BatchDecodeWithPagedKVCache failed with error ",
-                                cudaGetErrorString(status));
-                    return true;
-                  });
-            });
+            return DISPATCH_pos_encoding_mode(
+                PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
+                  cudaError_t status =
+                      handler_->BeginForwardDispatched<HEAD_DIM, PageStorage::kIndices,
+                                                       LOGITS_POST_HOOK, POS_ENCODING_MODE, q_type,
+                                                       kv_type, q_type, int32_t>(
+                          static_cast<void*>(workspace_buffer.data_ptr()), workspace_size_in_bytes,
+                          static_cast<int32_t*>(indptr.data_ptr()),
+                          static_cast<int32_t*>(last_page_len.data_ptr()), batch_size, num_qo_heads,
+                          num_kv_heads, page_size);
+                  TORCH_CHECK(status == cudaSuccess,
+                              "BatchDecodeWithPagedKVCache failed with error ",
+                              cudaGetErrorString(status));
+                  return true;
+                });
           });
         });
       });
@@ -167,21 +164,48 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
   if (q_scalar_type == kv_scalar_type) {
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q_scalar_type, qkv_type, [&] {
       return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
-        return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
+        return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
+          return DISPATCH_pos_encoding_mode(
+              PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
+                paged_kv_t<PageStorage::kIndices, qkv_type, int32_t> paged_kv(
+                    num_kv_heads, page_size, head_dim, batch_size, kv_layout_,
+                    static_cast<qkv_type*>(paged_kv_data.data_ptr()),
+                    static_cast<int32_t*>(paged_kv_indices.data_ptr()),
+                    static_cast<int32_t*>(paged_kv_indptr.data_ptr()),
+                    static_cast<int32_t*>(paged_kv_last_page_len.data_ptr()));
+                cudaError_t status = BatchDecodeWithPagedKVCacheWrapperDispatched<
+                    PageStorage::kIndices, HEAD_DIM, LOGITS_POST_HOOK, POS_ENCODING_MODE, qkv_type,
+                    qkv_type, qkv_type, int32_t>(
+                    handler_.get(), static_cast<qkv_type*>(q.data_ptr()),
+                    /*q_offset=*/nullptr, paged_kv, static_cast<qkv_type*>(o.data_ptr()),
+                    /*lse=*/(return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr),
+                    num_qo_heads, logits_soft_cap, sm_scale, rope_scale, rope_theta,
+                    /*stream=*/torch_current_stream);
+                TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
+                            cudaGetErrorString(status));
+                return true;
+              });
+        });
+      });
+    });
+  } else {
+    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q_scalar_type, q_type, [&] {
+      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(kv_scalar_type, kv_type, [&] {
+        return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
           return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
             return DISPATCH_pos_encoding_mode(
                 PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
-                  paged_kv_t<PageStorage::kIndices, KV_LAYOUT, qkv_type, int32_t> paged_kv(
-                      num_kv_heads, page_size, head_dim, batch_size,
-                      static_cast<qkv_type*>(paged_kv_data.data_ptr()),
+                  paged_kv_t<PageStorage::kIndices, kv_type, int32_t> paged_kv(
+                      num_kv_heads, page_size, head_dim, batch_size, kv_layout_,
+                      static_cast<kv_type*>(paged_kv_data.data_ptr()),
                       static_cast<int32_t*>(paged_kv_indices.data_ptr()),
                       static_cast<int32_t*>(paged_kv_indptr.data_ptr()),
                       static_cast<int32_t*>(paged_kv_last_page_len.data_ptr()));
                   cudaError_t status = BatchDecodeWithPagedKVCacheWrapperDispatched<
-                      PageStorage::kIndices, HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT,
-                      POS_ENCODING_MODE, qkv_type, qkv_type, qkv_type, int32_t>(
-                      handler_.get(), static_cast<qkv_type*>(q.data_ptr()),
-                      /*q_offset=*/nullptr, paged_kv, static_cast<qkv_type*>(o.data_ptr()),
+                      PageStorage::kIndices, HEAD_DIM, LOGITS_POST_HOOK, POS_ENCODING_MODE, q_type,
+                      kv_type, q_type, int32_t>(
+                      handler_.get(), static_cast<q_type*>(q.data_ptr()),
+                      /*q_offset=*/nullptr, paged_kv, static_cast<q_type*>(o.data_ptr()),
                       /*lse=*/(return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr),
                       num_qo_heads, logits_soft_cap, sm_scale, rope_scale, rope_theta,
                       /*stream=*/torch_current_stream);
@@ -190,38 +214,6 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
                               cudaGetErrorString(status));
                   return true;
                 });
-          });
-        });
-      });
-    });
-  } else {
-    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q_scalar_type, q_type, [&] {
-      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(kv_scalar_type, kv_type, [&] {
-        return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
-          return DISPATCH_kv_layout(kv_layout_, KV_LAYOUT, [&] {
-            return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-              return DISPATCH_pos_encoding_mode(
-                  PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
-                    paged_kv_t<PageStorage::kIndices, KV_LAYOUT, kv_type, int32_t> paged_kv(
-                        num_kv_heads, page_size, head_dim, batch_size,
-                        static_cast<kv_type*>(paged_kv_data.data_ptr()),
-                        static_cast<int32_t*>(paged_kv_indices.data_ptr()),
-                        static_cast<int32_t*>(paged_kv_indptr.data_ptr()),
-                        static_cast<int32_t*>(paged_kv_last_page_len.data_ptr()));
-                    cudaError_t status = BatchDecodeWithPagedKVCacheWrapperDispatched<
-                        PageStorage::kIndices, HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT,
-                        POS_ENCODING_MODE, q_type, kv_type, q_type, int32_t>(
-                        handler_.get(), static_cast<q_type*>(q.data_ptr()),
-                        /*q_offset=*/nullptr, paged_kv, static_cast<q_type*>(o.data_ptr()),
-                        /*lse=*/(return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr),
-                        num_qo_heads, logits_soft_cap, sm_scale, rope_scale, rope_theta,
-                        /*stream=*/torch_current_stream);
-                    TORCH_CHECK(status == cudaSuccess,
-                                "BatchDecodeWithPagedKVCache failed with error ",
-                                cudaGetErrorString(status));
-                    return true;
-                  });
-            });
           });
         });
       });
