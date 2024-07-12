@@ -88,7 +88,7 @@ std::vector<dtype_out> single_mha(const std::vector<dtype_q>& q, const std::vect
   std::vector<float> k_rotary_local(head_dim);
   DISPATCH_kv_layout(kv_layout, KV_LAYOUT, {
     DISPATCH_head_dim(head_dim, HEAD_DIM, {
-      tensor_info_t<KV_LAYOUT, HEAD_DIM> info(qo_len, kv_len, num_qo_heads, num_kv_heads);
+      tensor_info_t info(qo_len, kv_len, num_qo_heads, num_kv_heads, KV_LAYOUT, HEAD_DIM);
       for (size_t qo_head_idx = 0; qo_head_idx < num_qo_heads; ++qo_head_idx) {
         const size_t kv_head_idx = qo_head_idx / info.get_group_size();
         for (size_t q_idx = 0; q_idx < qo_len; ++q_idx) {

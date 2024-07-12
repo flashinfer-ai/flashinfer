@@ -37,13 +37,14 @@ cudaError_t SinglePrefillWithKVCacheCustomMask(
       {DISPATCH_head_dim(
           head_dim, HEAD_DIM,
           {DISPATCH_pos_encoding_mode(
-              pos_encoding_mode, POS_ENCODING_MODE, {DISPATCH_kv_layout(kv_layout, KV_LAYOUT, {
+              pos_encoding_mode, POS_ENCODING_MODE, {
                 return SinglePrefillWithKVCacheDispatched<
-                    HEAD_DIM, LogitsPostHook::kNone, KV_LAYOUT, POS_ENCODING_MODE,
+                    HEAD_DIM, LogitsPostHook::kNone, POS_ENCODING_MODE,
                     ALLOW_FP16_QK_REDUCTION, MaskMode::kCustom>(
                     q, k, v, custom_mask, o, tmp, lse, num_qo_heads, num_kv_heads, qo_len, kv_len,
+                    kv_layout,
                     /*logits_soft_cap*/ 0.f, sm_scale, rope_scale, rope_theta, stream);
-              })})})});
+              })})});
   return cudaSuccess;
 }
 
@@ -90,14 +91,14 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOu
           {DISPATCH_head_dim(
               head_dim, HEAD_DIM,
               {DISPATCH_pos_encoding_mode(
-                  pos_encoding_mode, POS_ENCODING_MODE, {DISPATCH_kv_layout(kv_layout, KV_LAYOUT, {
+                  pos_encoding_mode, POS_ENCODING_MODE, {
                     return SinglePrefillWithKVCacheDispatched<HEAD_DIM, LogitsPostHook::kNone,
-                                                              KV_LAYOUT, POS_ENCODING_MODE,
+                                                              POS_ENCODING_MODE,
                                                               ALLOW_FP16_QK_REDUCTION, MASK_MODE>(
                         q, k, v, /*custom_mask=*/nullptr, o, tmp, lse, num_qo_heads, num_kv_heads,
-                        qo_len, kv_len, /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta,
+                        qo_len, kv_len, kv_layout, /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta,
                         stream);
-                  })})})})});
+                  })})})});
   return cudaSuccess;
 }
 

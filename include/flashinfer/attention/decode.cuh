@@ -214,7 +214,7 @@ template <LogitsPostHook logits_post_hook, QKVLayout kv_layout, bool partition_k
 __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* __restrict__ k,
                                               DTypeKV* __restrict__ v, DTypeOut* __restrict__ o,
                                               float* __restrict__ lse,
-                                              tensor_info_t<kv_layout, bdx * vec_size> info,
+                                              tensor_info_t info,
                                               float logits_soft_cap, float sm_scale,
                                               float rope_rcp_scale, float rope_rcp_theta,
                                               uint32_t kv_chunk_size) {
@@ -645,7 +645,7 @@ cudaError_t SingleDecodeWithKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v,
     constexpr uint32_t num_threads =
         std::max(get_heuristic_num_threads(GROUP_SIZE, sizeof(DTypeKV)), bdx * bdy);
     constexpr uint32_t bdz = num_threads / (bdx * bdy);
-    tensor_info_t<KV_LAYOUT, HEAD_DIM> info(1, seq_len, num_qo_heads, num_kv_heads);
+    tensor_info_t info(1, seq_len, num_qo_heads, num_kv_heads, KV_LAYOUT, HEAD_DIM);
     constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 8U) : 1U;
     const uint32_t smem_size =
         2U * num_stages_smem * bdy * tile_size_per_bdx * bdz * HEAD_DIM * sizeof(DTypeKV) +
