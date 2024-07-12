@@ -1803,10 +1803,10 @@ cudaError_t SinglePrefillWithKVCacheDispatched(
     constexpr uint32_t num_warps_x = get_num_warps_x<WARP_LAYOUT>();
     constexpr uint32_t num_warps_z = get_num_warps_z<WARP_LAYOUT>();
     const uint32_t max_num_frags_z_reg =
-        (HEAD_DIM == 128 && num_frags_x == 2 && pos_encoding_mode == PosEncodingMode::kRoPELlama &&
+        (HEAD_DIM >= 128 && num_frags_x == 2 && pos_encoding_mode == PosEncodingMode::kRoPELlama &&
          !ALLOW_FP16_QK_REDUCTION)
             ? 2
-            : 4;
+            : (8 / num_frags_x);
     const uint32_t max_num_frags_z_smem =
         (max_smem_per_threadblock / (16 * HEAD_DIM * sizeof(DTypeIn)) - num_frags_x * num_warps_x) /
         (2 * num_warps_z);
@@ -1946,10 +1946,10 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
   const int max_smem_per_threadblock = max_smem_per_sm / 2;
 
   const uint32_t max_num_frags_z_reg =
-      (HEAD_DIM == 128 && num_frags_x == 2 && pos_encoding_mode == PosEncodingMode::kRoPELlama &&
+      (HEAD_DIM >= 128 && num_frags_x == 2 && pos_encoding_mode == PosEncodingMode::kRoPELlama &&
        !ALLOW_FP16_QK_REDUCTION)
           ? 2
-          : 4;
+          : (8 / num_frags_x);
   const uint32_t max_num_frags_z_smem =
       (max_smem_per_threadblock / (16 * HEAD_DIM * sizeof(DTypeIn)) - num_frags_x * num_warps_x) /
       (2 * num_warps_z);
@@ -2086,10 +2086,10 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
   const int max_smem_per_threadblock = max_smem_per_sm / 2;
 
   const uint32_t max_num_frags_z_reg =
-      (HEAD_DIM == 128 && num_frags_x == 2 && pos_encoding_mode == PosEncodingMode::kRoPELlama &&
+      (HEAD_DIM >= 128 && num_frags_x == 2 && pos_encoding_mode == PosEncodingMode::kRoPELlama &&
        !ALLOW_FP16_QK_REDUCTION)
           ? 2
-          : 4;
+          : (8 / num_frags_x);
   const uint32_t max_num_frags_z_smem =
       (max_smem_per_threadblock / (16 * HEAD_DIM * sizeof(DTypeIn)) - num_frags_x * num_warps_x) /
       (2 * num_warps_z);
