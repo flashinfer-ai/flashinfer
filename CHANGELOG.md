@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.0.9](https://github.com/flashinfer-ai/flashinfer/compare/v0.0.8...v0.0.9) (2024-07-12)
+
+### Bugfix
+
+* fix the decode kernel segfault in cudagraph mode ([#368](https://github.com/flashinfer-ai/flashinfer/pull/368))([c69cfa](https://github.com/flashinfer-ai/flashinfer/commit/c69cfabc540e4a7edd991713df10d575ff3b0c21))
+- fix decode kernels output for empty kv cache ([#363](https://github.com/flashinfer-ai/flashinfer/pull/363))([ac72b1](https://github.com/flashinfer-ai/flashinfer/commit/ac72b1cc14a6474d601f371c8d69e2600ac28d2f))
+- check gpu id in PyTorch APIs and use input tensor's gpu default stream ([#361](https://github.com/flashinfer-ai/flashinfer/pull/361))([1b84fa](https://github.com/flashinfer-ai/flashinfer/commit/1b84fab3e4f53fb4fa26952fdb46fa8018634057))
+
+### Performance Improvements
+
+* accelerate alibi ([#365](https://github.com/flashinfer-ai/flashinfer/issues/365)) ([4f0a9f9](https://github.com/flashinfer-ai/flashinfer/commit/4f0a9f987ad2036f3c466257459de823be85fcc6))
+* accelerate gqa performance ([#356](https://github.com/flashinfer-ai/flashinfer/issues/356)) ([e56ddad](https://github.com/flashinfer-ai/flashinfer/commit/e56ddadf4bdbb164c3f1a03f9f69cb8a25621ef5))
+* Optimize tensor conversions in C++ code to avoid unnecessary copies ([#366](https://github.com/flashinfer-ai/flashinfer/issues/366)) ([1116237](https://github.com/flashinfer-ai/flashinfer/commit/1116237ac1e5690cf404841327b58b1d268d9951))
+
+### Acknowledgement
+
+We thank [@Yard1](https://github.com/Yard1), [@Ying1123](https://github.com/Ying1123) and [@zhyncs](https://github.com/zhyncs) for their contributions.
+
 ## [0.0.8](https://github.com/flashinfer-ai/flashinfer/compare/v0.0.7...v0.0.8) (2024-07-03)
 
 ### Bugfix
