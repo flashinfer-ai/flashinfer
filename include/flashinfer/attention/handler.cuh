@@ -36,11 +36,11 @@ namespace flashinfer {
 
 template <LogitsPostHook logits_post_hook, bool partition_kv, PosEncodingMode pos_encoding_mode,
           uint32_t num_stages_smem, uint32_t tile_size_per_bdx, uint32_t vec_size, uint32_t bdx,
-          uint32_t bdy, uint32_t bdz, PageStorage page_storage, QKVLayout kv_layout,
-          typename DTypeQ, typename DTypeKV, typename DTypeOut, typename IdType>
+          uint32_t bdy, uint32_t bdz, PageStorage page_storage, typename DTypeQ, typename DTypeKV,
+          typename DTypeOut, typename IdType>
 __global__ void BatchDecodeWithPagedKVCacheKernel(
     DTypeQ* __restrict__ q, IdType* __restrict__ q_offset,
-    paged_kv_t<page_storage, kv_layout, DTypeKV, IdType> paged_kv,
+    paged_kv_t<page_storage, DTypeKV, IdType> paged_kv,
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* __restrict__ o,
     float* __restrict__ lse, bool* __restrict__ block_valid_mask, float logits_soft_cap,
     float sm_scale, float rope_rcp_scale, float rope_rcp_theta);
@@ -138,8 +138,8 @@ inline std::tuple<bool, uint32_t, uint32_t> PrefillBinarySearchKVChunkSize(
  * \return status Indicates whether CUDA calls are successful
  */
 template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PageStorage page_storage,
-          LogitsPostHook LOGITS_POST_HOOK, QKVLayout kv_layout, PosEncodingMode POS_ENCODING_MODE,
-          typename DTypeQ, typename DTypeKV, typename DTypeOut, typename IdType>
+          LogitsPostHook LOGITS_POST_HOOK, PosEncodingMode POS_ENCODING_MODE, typename DTypeQ,
+          typename DTypeKV, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     bool& split_kv, uint32_t& max_grid_size, uint32_t& max_num_pages_per_batch,
     uint32_t& new_batch_size, uint32_t batch_size, IdType* kv_indptr_h, const uint32_t num_qo_heads,
@@ -161,7 +161,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
       BatchDecodeWithPagedKVCacheKernel<LOGITS_POST_HOOK,
                                         /*partition_kv=*/true, POS_ENCODING_MODE, num_stages_smem,
                                         tile_size_per_bdx, vec_size, bdx, bdy, bdz, page_storage,
-                                        kv_layout, DTypeQ, DTypeKV, DTypeOut, IdType>;
+                                        DTypeQ, DTypeKV, DTypeOut, IdType>;
   int num_blocks_per_sm = 0;
   int num_sm = 0;
   int dev_id = 0;
@@ -308,8 +308,8 @@ class BatchDecodeHandler {
   bool* GetBlockValidMask() const { return block_valid_mask_; }
 
   template <uint32_t HEAD_DIM, PageStorage page_storage, LogitsPostHook LOGITS_POST_HOOK,
-            QKVLayout kv_layout, PosEncodingMode POS_ENCODING_MODE, typename DTypeQ,
-            typename DTypeKV, typename DTypeOut, typename IdType>
+            PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV, typename DTypeOut,
+            typename IdType>
   cudaError_t BeginForwardDispatched(void* buffer, size_t workspace_size_in_bytes, IdType* indptr_h,
                                      IdType* last_page_len_h, uint32_t batch_size,
                                      uint32_t num_qo_heads, uint32_t num_kv_heads,
@@ -318,9 +318,10 @@ class BatchDecodeHandler {
     bool split_kv;
     uint32_t max_grid_size, max_num_pages_per_batch, new_batch_size;
     DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
-      auto work_estimation_func = BatchDecodeWithPagedKVCacheWorkEstimationDispatched<
-          GROUP_SIZE, HEAD_DIM, page_storage, LOGITS_POST_HOOK, kv_layout, POS_ENCODING_MODE,
-          DTypeQ, DTypeKV, DTypeOut, IdType>;
+      auto work_estimation_func =
+          BatchDecodeWithPagedKVCacheWorkEstimationDispatched<GROUP_SIZE, HEAD_DIM, page_storage,
+                                                              LOGITS_POST_HOOK, POS_ENCODING_MODE,
+                                                              DTypeQ, DTypeKV, DTypeOut, IdType>;
       FLASHINFER_CUDA_CALL(
           work_estimation_func(split_kv, max_grid_size, max_num_pages_per_batch, new_batch_size,
                                batch_size, indptr_h, num_qo_heads, page_size,

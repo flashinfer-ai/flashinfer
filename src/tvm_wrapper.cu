@@ -243,8 +243,9 @@ void _FlashInferAttentionPrefillWithPagedKVCache(int64_t handler_id, DLTensor* q
       pages->dtype, dtype_in,
       {DISPATCH_TVM_CUDA_DTYPE(
           output->dtype, dtype_out, {DISPATCH_TVM_CUDA_IDTYPE(page_table_values->dtype, dtype_idx, {
-            paged_kv_t<page_storage, kv_layout, dtype_in, dtype_idx> cache(
-                nhead_kv, page_size, nfeat, num_total_seqs, static_cast<dtype_in*>(pages->data),
+            paged_kv_t<page_storage, dtype_in, dtype_idx> cache(
+                nhead_kv, page_size, nfeat, num_total_seqs, kv_layout,
+                static_cast<dtype_in*>(pages->data),
                 static_cast<dtype_idx*>(page_table_values->data) +
                     page_table_values->byte_offset / sizeof(dtype_idx),
                 static_cast<dtype_idx*>(page_table_indptr->data) +
@@ -253,17 +254,19 @@ void _FlashInferAttentionPrefillWithPagedKVCache(int64_t handler_id, DLTensor* q
                     last_page_len->byte_offset / sizeof(dtype_idx),
                 static_cast<dtype_idx*>(k_rope_pos_offset->data) +
                     k_rope_pos_offset->byte_offset / sizeof(dtype_idx));
-            cudaError_t status = BatchPrefillWithPagedKVCacheWrapper<
-                page_storage, kv_layout, dtype_in, dtype_out, dtype_idx>(
-                &batch_prefill_paged_kv_handlers[handler_id], static_cast<dtype_in*>(q_data->data),
-                static_cast<dtype_idx*>(qo_indptr->data) +
-                    qo_indptr->byte_offset / sizeof(dtype_idx),
-                static_cast<dtype_idx*>(q_offset->data) + q_offset->byte_offset / sizeof(dtype_idx),
-                cache, static_cast<dtype_out*>(output->data),
-                /*lse=*/static_cast<float*>(lse->data), nhead_qo,
-                /*causal=*/causal, PosEncodingMode(pos_encoding_mode),
-                /*allow_fp16_qk_reduction=*/false, sm_scale, rope_scale, rope_theta,
-                /*stream=*/0);
+            cudaError_t status =
+                BatchPrefillWithPagedKVCacheWrapper<page_storage, dtype_in, dtype_out, dtype_idx>(
+                    &batch_prefill_paged_kv_handlers[handler_id],
+                    static_cast<dtype_in*>(q_data->data),
+                    static_cast<dtype_idx*>(qo_indptr->data) +
+                        qo_indptr->byte_offset / sizeof(dtype_idx),
+                    static_cast<dtype_idx*>(q_offset->data) +
+                        q_offset->byte_offset / sizeof(dtype_idx),
+                    cache, static_cast<dtype_out*>(output->data),
+                    /*lse=*/static_cast<float*>(lse->data), nhead_qo,
+                    /*causal=*/causal, PosEncodingMode(pos_encoding_mode),
+                    /*allow_fp16_qk_reduction=*/false, sm_scale, rope_scale, rope_theta,
+                    /*stream=*/0);
             if (status != cudaSuccess) {
               LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
             }
@@ -389,8 +392,9 @@ void _FlashInferAttentionDecodeWithPagedKVCache(int64_t handler_id, DLTensor* q_
       pages->dtype, dtype_in,
       {DISPATCH_TVM_CUDA_DTYPE(
           output->dtype, dtype_out, {DISPATCH_TVM_CUDA_IDTYPE(page_table_values->dtype, dtype_idx, {
-            paged_kv_t<page_storage, kv_layout, dtype_in, dtype_idx> cache(
-                nhead_kv, page_size, nfeat, num_total_seqs, static_cast<dtype_in*>(pages->data),
+            paged_kv_t<page_storage, dtype_in, dtype_idx> cache(
+                nhead_kv, page_size, nfeat, num_total_seqs, kv_layout,
+                static_cast<dtype_in*>(pages->data),
                 static_cast<dtype_idx*>(page_table_values->data) +
                     page_table_values->byte_offset / sizeof(dtype_idx),
                 static_cast<dtype_idx*>(page_table_indptr->data) +
@@ -399,8 +403,8 @@ void _FlashInferAttentionDecodeWithPagedKVCache(int64_t handler_id, DLTensor* q_
                     last_page_len->byte_offset / sizeof(dtype_idx),
                 static_cast<dtype_idx*>(k_rope_pos_offset->data) +
                     k_rope_pos_offset->byte_offset / sizeof(dtype_idx));
-            cudaError_t status = BatchDecodeWithPagedKVCacheWrapper<
-                page_storage, kv_layout, dtype_in, dtype_in, dtype_out, dtype_idx>(
+            cudaError_t status = BatchDecodeWithPagedKVCacheWrapper<page_storage, dtype_in,
+                                                                    dtype_in, dtype_out, dtype_idx>(
                 &batch_decode_handlers[handler_id], static_cast<dtype_in*>(q_data->data),
                 static_cast<dtype_idx*>(q_offset->data) + q_offset->byte_offset / sizeof(dtype_idx),
                 cache, static_cast<dtype_out*>(output->data),
@@ -422,7 +426,6 @@ void _FlashInferAttentionDecodeWithPagedKVCacheBeginForward(
   CHECK_LT(handler_idx, max_num_handlers)
       << "The handler id must be less than " << max_num_handlers;
   constexpr PageStorage page_storage = PageStorage::kIndices;
-  constexpr QKVLayout kv_layout = QKVLayout::kHND;
   // NOTE(Zihao): here we presume the input data type is half, in the future we should
   //   leave a parameter for the input data type.
   using dtype_in = half;
@@ -430,16 +433,16 @@ void _FlashInferAttentionDecodeWithPagedKVCacheBeginForward(
   cudaStream_t original_stream = batch_decode_handlers[handler_idx].GetCUDAStream();
   batch_decode_handlers[handler_idx].SetCUDAStream(static_cast<cudaStream_t>(copy_stream));
   DISPATCH_TVM_CUDA_IDTYPE(page_table_indptr->dtype, dtype_idx, {
-    cudaError_t status = BatchDecodeHandlerBeginForward<page_storage, kv_layout, dtype_in, dtype_in,
-                                                        dtype_in, dtype_idx>(
-        batch_decode_handlers + handler_idx, static_cast<void*>(workspace_buffer->data),
-        workspace_size_in_bytes,
-        static_cast<dtype_idx*>(page_table_indptr->data) +
-            page_table_indptr->byte_offset / sizeof(dtype_idx),
-        static_cast<dtype_idx*>(last_page_len->data) +
-            last_page_len->byte_offset / sizeof(dtype_idx),
-        batch_size, num_qo_heads, num_kv_heads, head_dim, page_size,
-        PosEncodingMode(pos_encoding_mode));
+    cudaError_t status =
+        BatchDecodeHandlerBeginForward<page_storage, dtype_in, dtype_in, dtype_in, dtype_idx>(
+            batch_decode_handlers + handler_idx, static_cast<void*>(workspace_buffer->data),
+            workspace_size_in_bytes,
+            static_cast<dtype_idx*>(page_table_indptr->data) +
+                page_table_indptr->byte_offset / sizeof(dtype_idx),
+            static_cast<dtype_idx*>(last_page_len->data) +
+                last_page_len->byte_offset / sizeof(dtype_idx),
+            batch_size, num_qo_heads, num_kv_heads, head_dim, page_size,
+            PosEncodingMode(pos_encoding_mode));
     if (status != cudaSuccess) {
       LOG(FATAL) << "FlashInfer decode BeginForward error " << cudaGetErrorString(status);
     }

@@ -18,7 +18,6 @@ import sys
 import re
 from literal_map import (
     mask_mode_literal,
-    kv_layout_literal,
     pos_encoding_mode_literal,
     warp_layout_literal,
     dtype_literal,
@@ -31,7 +30,6 @@ from pathlib import Path
 def get_cu_file_str(
     head_dim,
     logits_hook,
-    kv_layout,
     pos_encoding_mode,
     allow_fp16_qk_reduction,
     mask_mode,
@@ -42,19 +40,18 @@ def get_cu_file_str(
     warp_layout_choice = [0, 1, 2]
     insts = "\n".join(
         [
-            """template cudaError_t BatchPrefillWithRaggedKVCacheDispatched<{warp_layout}, {head_dim}, {logits_hook}, {kv_layout}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {dtype_in}, {dtype_out}, {idtype}>(
+            """template cudaError_t BatchPrefillWithRaggedKVCacheDispatched<{warp_layout}, {head_dim}, {logits_hook}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {dtype_in}, {dtype_out}, {idtype}>(
     {dtype_in}* q, {idtype}* request_indices, {idtype}* q_tile_indices, {idtype}* kv_tile_indices,
     {idtype}* q_indptr, {dtype_in}* k, {dtype_in}* v, {idtype}* kv_indptr,
     uint8_t* custom_mask, {idtype}* qk_indptr, {idtype}* q_offset, {idtype}* k_rope_pos_offset,
     {idtype}* o_indptr, {dtype_out}* o, {dtype_out}* tmp_v, float* tmp_s, float* lse, {idtype}* merge_indptr,
     bool* block_valid_mask, {idtype}* kv_chunk_size_ptr, uint32_t total_num_rows, uint32_t num_qo_heads,
-    uint32_t padded_batch_size, uint32_t num_kv_heads,
+    uint32_t padded_batch_size, uint32_t num_kv_heads, QKVLayout kv_layout,
     float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta,
     cudaStream_t stream);
         """.format(
                 warp_layout=warp_layout_literal[warp_layout],
                 logits_hook=logits_hook_literal[int(logits_hook)],
-                kv_layout=kv_layout_literal[int(kv_layout)],
                 head_dim=head_dim,
                 pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
                 allow_fp16_qk_reduction=allow_fp16_qk_reduction,
@@ -80,7 +77,7 @@ namespace flashinfer {{
 
 if __name__ == "__main__":
     pattern = (
-        r"batch_ragged_prefill_head_([0-9]+)_logitshook_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
+        r"batch_ragged_prefill_head_([0-9]+)_logitshook_([0-9]+)_posenc_([0-9]+)_"
         r"fp16qkred_([a-z]+)_mask_([0-9]+)_dtypein_([a-z0-9]+)_dtypeout_([a-z0-9]+)_idtype_([a-z0-9]+)\.cu"
     )
     compiled_pattern = re.compile(pattern)

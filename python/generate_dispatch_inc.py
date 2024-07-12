@@ -17,7 +17,6 @@ limitations under the License.
 import argparse
 from pathlib import Path
 from literal_map import (
-    kv_layout_literal,
     pos_encoding_mode_literal,
     bool_literal,
     mask_mode_literal,
@@ -48,19 +47,6 @@ def get_dispatch_inc_str(args: argparse.Namespace) -> str:
     )
     dispatch_logits_post_hooks_str = f"""#define _DISPATCH_CASES_logits_post_hook(case_var, ...)         \\
 {dispatch_logits_post_hooks_entries}
-// EOL
-"""
-    # kv layouts
-    dispatch_kv_layouts_entries = "\n".join(
-        [
-            "  _DISPATCH_CASE({}, case_var, __VA_ARGS__) \\".format(
-                kv_layout_literal[_]
-            )
-            for _ in args.kv_layouts
-        ]
-    )
-    dispatch_kv_layouts_str = f"""#define _DISPATCH_CASES_kv_layout(case_var, ...)         \\
-{dispatch_kv_layouts_entries}
 // EOL
 """
     # positional encoding modes
@@ -105,7 +91,6 @@ def get_dispatch_inc_str(args: argparse.Namespace) -> str:
         [
             dispatch_head_dims_str,
             dispatch_logits_post_hooks_str,
-            dispatch_kv_layouts_str,
             dispatch_pos_encoding_modes_str,
             dispatch_allow_fp16_qk_reductions_str,
             dispatch_mask_mode_str,
@@ -127,9 +112,6 @@ if __name__ == "__main__":
         required=True,
         nargs="+",
         help="Logit post hooks",
-    )
-    parser.add_argument(
-        "--kv_layouts", type=int, required=True, nargs="+", help="KV layouts"
     )
     parser.add_argument(
         "--pos_encoding_modes",

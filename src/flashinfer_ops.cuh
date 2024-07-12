@@ -35,16 +35,14 @@ cudaError_t SinglePrefillWithKVCacheCustomMask(
   DISPATCH_allow_fp16_qk_reduction(
       allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
       {DISPATCH_head_dim(
-          head_dim, HEAD_DIM,
-          {DISPATCH_pos_encoding_mode(
-              pos_encoding_mode, POS_ENCODING_MODE, {
-                return SinglePrefillWithKVCacheDispatched<
-                    HEAD_DIM, LogitsPostHook::kNone, POS_ENCODING_MODE,
-                    ALLOW_FP16_QK_REDUCTION, MaskMode::kCustom>(
-                    q, k, v, custom_mask, o, tmp, lse, num_qo_heads, num_kv_heads, qo_len, kv_len,
-                    kv_layout,
-                    /*logits_soft_cap*/ 0.f, sm_scale, rope_scale, rope_theta, stream);
-              })})});
+          head_dim, HEAD_DIM, {DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
+            return SinglePrefillWithKVCacheDispatched<HEAD_DIM, LogitsPostHook::kNone,
+                                                      POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION,
+                                                      MaskMode::kCustom>(
+                q, k, v, custom_mask, o, tmp, lse, num_qo_heads, num_kv_heads, qo_len, kv_len,
+                kv_layout,
+                /*logits_soft_cap*/ 0.f, sm_scale, rope_scale, rope_theta, stream);
+          })})});
   return cudaSuccess;
 }
 
@@ -88,17 +86,15 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOu
       allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
       {DISPATCH_mask_mode(
           mask_mode, MASK_MODE,
-          {DISPATCH_head_dim(
-              head_dim, HEAD_DIM,
-              {DISPATCH_pos_encoding_mode(
-                  pos_encoding_mode, POS_ENCODING_MODE, {
-                    return SinglePrefillWithKVCacheDispatched<HEAD_DIM, LogitsPostHook::kNone,
-                                                              POS_ENCODING_MODE,
-                                                              ALLOW_FP16_QK_REDUCTION, MASK_MODE>(
-                        q, k, v, /*custom_mask=*/nullptr, o, tmp, lse, num_qo_heads, num_kv_heads,
-                        qo_len, kv_len, kv_layout, /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta,
-                        stream);
-                  })})})});
+          {DISPATCH_head_dim(head_dim, HEAD_DIM,
+                             {DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
+                               return SinglePrefillWithKVCacheDispatched<
+                                   HEAD_DIM, LogitsPostHook::kNone, POS_ENCODING_MODE,
+                                   ALLOW_FP16_QK_REDUCTION, MASK_MODE>(
+                                   q, k, v, /*custom_mask=*/nullptr, o, tmp, lse, num_qo_heads,
+                                   num_kv_heads, qo_len, kv_len, kv_layout, /*logits_soft_cap=*/0.f,
+                                   sm_scale, rope_scale, rope_theta, stream);
+                             })})})});
   return cudaSuccess;
 }
 
@@ -113,32 +109,28 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
     const float rope_scale = 1.f, const float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   const float sm_scale = maybe_sm_scale.value_or(1.f / std::sqrt(float(head_dim)));
   const MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
-  DISPATCH_kv_layout(
-      kv_layout, KV_LAYOUT,
-      {DISPATCH_head_dim(
-          head_dim, HEAD_DIM,
-          {DISPATCH_mask_mode(
-              mask_mode, MASK_MODE,
-              {DISPATCH_pos_encoding_mode(
-                  pos_encoding_mode, pos_encoding_mode,
-                  {DISPATCH_allow_fp16_qk_reduction(
-                      allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
-                        return BatchPrefillWithRaggedKVCacheWrapperDispatched<
-                            HEAD_DIM, LogitsPostHook::kNone, KV_LAYOUT, pos_encoding_mode,
-                            ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeOut, IdType>(
-                            handler, q, qo_indptr, k, v, kv_indptr, /*custom_mask=*/nullptr,
-                            /*qk_indptr=*/nullptr, q_offset, k_rope_pos_offset, o, lse,
-                            num_qo_heads, num_kv_heads, /*logits_soft_cap=*/0.f, sm_scale,
-                            rope_scale, rope_theta, stream);
-                      })})})})});
+  DISPATCH_head_dim(
+      head_dim, HEAD_DIM,
+      {DISPATCH_mask_mode(
+          mask_mode, MASK_MODE,
+          {DISPATCH_pos_encoding_mode(
+              pos_encoding_mode, pos_encoding_mode,
+              {DISPATCH_allow_fp16_qk_reduction(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
+                return BatchPrefillWithRaggedKVCacheWrapperDispatched<
+                    HEAD_DIM, LogitsPostHook::kNone, pos_encoding_mode, ALLOW_FP16_QK_REDUCTION,
+                    MASK_MODE, DTypeIn, DTypeOut, IdType>(
+                    handler, q, qo_indptr, k, v, kv_indptr, /*custom_mask=*/nullptr,
+                    /*qk_indptr=*/nullptr, q_offset, k_rope_pos_offset, o, lse, num_qo_heads,
+                    num_kv_heads, kv_layout, /*logits_soft_cap=*/0.f, sm_scale, rope_scale,
+                    rope_theta, stream);
+              })})})});
   return cudaSuccess;
 }
 
-template <PageStorage PAGE_STORAGE, QKVLayout KV_LAYOUT, typename DTypeIn, typename DTypeOut,
-          typename IdType>
+template <PageStorage PAGE_STORAGE, typename DTypeIn, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheWrapper(
     BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, IdType* q_offset,
-    paged_kv_t<PAGE_STORAGE, KV_LAYOUT, DTypeIn, IdType> paged_kv, DTypeOut* o, float* lse,
+    paged_kv_t<PAGE_STORAGE, DTypeIn, IdType> paged_kv, DTypeOut* o, float* lse,
     uint32_t num_qo_heads, bool causal = true,
     PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
     bool allow_fp16_qk_reduction = false, std::optional<float> maybe_sm_scale = std::nullopt,
@@ -155,7 +147,7 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
               pos_encoding_mode, POS_ENCODING_MODE,
               {DISPATCH_allow_fp16_qk_reduction(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
                 return BatchPrefillWithPagedKVCacheWrapperDispatched<
-                    PAGE_STORAGE, HEAD_DIM, LogitsPostHook::kNone, KV_LAYOUT, POS_ENCODING_MODE,
+                    PAGE_STORAGE, HEAD_DIM, LogitsPostHook::kNone, POS_ENCODING_MODE,
                     ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeOut, IdType>(
                     handler, q, qo_indptr, q_offset, paged_kv,
                     /*custom_mask=*/nullptr,
@@ -182,21 +174,18 @@ cudaError_t SingleDecodeWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut*
   }
 
   DISPATCH_head_dim(
-      head_dim, HEAD_DIM,
-      {DISPATCH_pos_encoding_mode(
-          pos_encoding_mode, POS_ENCODING_MODE, {DISPATCH_kv_layout(kv_layout, KV_LAYOUT, {
-            SingleDecodeWithKVCacheDispatched<HEAD_DIM, LogitsPostHook::kNone, KV_LAYOUT,
-                                              POS_ENCODING_MODE>(
-                q, k, v, o, tmp, num_qo_heads, num_kv_heads, seq_len, /*logits_soft_cap=*/0.f,
-                sm_scale, rope_scale, rope_theta, stream);
-          })})});
+      head_dim, HEAD_DIM, {DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
+        SingleDecodeWithKVCacheDispatched<HEAD_DIM, LogitsPostHook::kNone, POS_ENCODING_MODE>(
+            q, k, v, o, tmp, num_qo_heads, num_kv_heads, seq_len, kv_layout,
+            /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta, stream);
+      })});
   return cudaSuccess;
 }
 
-template <PageStorage PAGE_STORAGE, QKVLayout KV_LAYOUT, typename DTypeQ, typename DTypeKV,
-          typename DTypeOut, typename IdType>
+template <PageStorage PAGE_STORAGE, typename DTypeQ, typename DTypeKV, typename DTypeOut,
+          typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheNoSplitKV(
-    DTypeQ* q, IdType* q_offset, paged_kv_t<PAGE_STORAGE, KV_LAYOUT, DTypeKV, IdType> paged_kv,
+    DTypeQ* q, IdType* q_offset, paged_kv_t<PAGE_STORAGE, DTypeKV, IdType> paged_kv,
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, float* lse, uint32_t num_qo_heads,
     PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
     std::optional<float> maybe_sm_scale = std::nullopt, float rope_scale = 1.f,
@@ -215,8 +204,8 @@ cudaError_t BatchDecodeWithPagedKVCacheNoSplitKV(
   DISPATCH_head_dim(
       head_dim, HEAD_DIM, {DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
         return BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, PAGE_STORAGE, LogitsPostHook::kNone,
-                                                     KV_LAYOUT, POS_ENCODING_MODE, DTypeQ, DTypeKV,
-                                                     DTypeOut, IdType>(
+                                                     POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeOut,
+                                                     IdType>(
             q, q_offset, paged_kv, kv_partition_info, o, /*tmp_v=*/nullptr, /*tmp_s=*/nullptr, lse,
             /*block_valid_mask=*/nullptr, /*padded_batch_size=*/paged_kv.batch_size, num_qo_heads,
             /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta, stream);
@@ -229,7 +218,6 @@ cudaError_t BatchDecodeWithPagedKVCacheNoSplitKV(
  * \brief Wrapper of BatchDecodeWithPagedKVCache function, and caches the temporary buffer
  *   for cooperative kernels.
  * \tparam page_storage Whether to store indices or pointers of each active page
- * \tparam kv_layout The layout of last 3 dimensions in KV-Cache
  * \tparam DTypeQ The data type of query tensor.
  * \tparam DTypeKV The data type of key-value tensor.
  * \tparam DTypeOut The data type of output tensor.
@@ -247,11 +235,11 @@ cudaError_t BatchDecodeWithPagedKVCacheNoSplitKV(
  * \note This wrapper function should be only called after we call BeginForward function in the
  *   BatchDecodeHandler.
  */
-template <PageStorage PAGE_STORAGE, QKVLayout KV_LAYOUT, typename DTypeQ, typename DTypeKV,
-          typename DTypeOut, typename IdType>
+template <PageStorage PAGE_STORAGE, typename DTypeQ, typename DTypeKV, typename DTypeOut,
+          typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheWrapper(
     BatchDecodeHandler* handler, DTypeQ* q, IdType* q_offset,
-    paged_kv_t<PAGE_STORAGE, KV_LAYOUT, DTypeKV, IdType> paged_kv, DTypeOut* o, float* lse,
+    paged_kv_t<PAGE_STORAGE, DTypeKV, IdType> paged_kv, DTypeOut* o, float* lse,
     uint32_t num_qo_heads, PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
     std::optional<float> maybe_sm_scale = std::nullopt, float rope_scale = 1.f,
     float rope_theta = 1e4, cudaStream_t stream = nullptr) {
@@ -267,16 +255,16 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapper(
   DISPATCH_head_dim(paged_kv.head_dim, HEAD_DIM,
                     {DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
                       return BatchDecodeWithPagedKVCacheWrapperDispatched<
-                          PAGE_STORAGE, HEAD_DIM, LogitsPostHook::kNone, KV_LAYOUT,
-                          POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeOut, IdType>(
+                          PAGE_STORAGE, HEAD_DIM, LogitsPostHook::kNone, POS_ENCODING_MODE, DTypeQ,
+                          DTypeKV, DTypeOut, IdType>(
                           handler, q, q_offset, paged_kv, o, lse, num_qo_heads,
                           /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta, stream);
                     })});
   return cudaSuccess;
 }
 
-template <PageStorage PAGE_STORAGE, QKVLayout KV_LAYOUT, typename DTypeQ, typename DTypeKV,
-          typename DTypeOut, typename IdType>
+template <PageStorage PAGE_STORAGE, typename DTypeQ, typename DTypeKV, typename DTypeOut,
+          typename IdType>
 cudaError_t BatchDecodeHandlerBeginForward(BatchDecodeHandler* handler, void* buffer,
                                            size_t workspace_size_in_bytes, IdType* indptr_h,
                                            IdType* last_page_len_h, uint32_t batch_size,
@@ -291,11 +279,10 @@ cudaError_t BatchDecodeHandlerBeginForward(BatchDecodeHandler* handler, void* bu
   }
   DISPATCH_head_dim(head_dim, HEAD_DIM, {
     DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
-      return handler
-          ->BeginForwardDispatched<HEAD_DIM, PAGE_STORAGE, LogitsPostHook::kNone, KV_LAYOUT,
-                                   POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeOut, IdType>(
-              buffer, workspace_size_in_bytes, indptr_h, last_page_len_h, batch_size, num_qo_heads,
-              num_kv_heads, page_size);
+      return handler->BeginForwardDispatched<HEAD_DIM, PAGE_STORAGE, LogitsPostHook::kNone,
+                                             POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeOut, IdType>(
+          buffer, workspace_size_in_bytes, indptr_h, last_page_len_h, batch_size, num_qo_heads,
+          num_kv_heads, page_size);
     });
   });
 }

@@ -23,9 +23,9 @@
 
 using namespace flashinfer;
 
-template <QKVLayout kv_layout, typename T>
+template <typename T>
 void _TestAppendPagedKVKernelCorrectness(size_t page_size, size_t batch_size, size_t num_heads,
-                                         size_t head_dim) {
+                                         size_t head_dim, QKVLayout kv_layout) {
   // number of conversation rounds
   size_t num_conv_rounds = 3;
   size_t max_decode_len = 1;
@@ -79,17 +79,18 @@ void _TestAppendPagedKVKernelCorrectness(size_t page_size, size_t batch_size, si
       }
       indptr_cpu.push_back(indptr_cpu.back() + page_indices[i].size());
     }
-    paged_kv_t<PageStorage::kIndices, kv_layout, T, int32_t> paged_kv_cpu(
-        num_heads, page_size, head_dim, batch_size, kv_data_cpu.data(), indices_cpu.data(),
-        indptr_cpu.data(), last_page_len.data());
-    cpu_reference::append_paged_kv_cache<kv_layout>(paged_kv_cpu, keys, values, append_indptr);
+    paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv_cpu(
+        num_heads, page_size, head_dim, batch_size, kv_layout, kv_data_cpu.data(),
+        indices_cpu.data(), indptr_cpu.data(), last_page_len.data());
+    cpu_reference::append_paged_kv_cache(paged_kv_cpu, keys, values, append_indptr);
 
     thrust::device_vector<int32_t> indptr_gpu(indptr_cpu);
     thrust::device_vector<int32_t> indices_gpu(indices_cpu);
     thrust::device_vector<int32_t> last_page_len_gpu(last_page_len);
-    paged_kv_t<PageStorage::kIndices, kv_layout, T, int32_t> paged_kv_gpu(
-        num_heads, page_size, head_dim, batch_size, thrust::raw_pointer_cast(kv_data_gpu.data()),
-        thrust::raw_pointer_cast(indices_gpu.data()), thrust::raw_pointer_cast(indptr_gpu.data()),
+    paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv_gpu(
+        num_heads, page_size, head_dim, batch_size, kv_layout,
+        thrust::raw_pointer_cast(kv_data_gpu.data()), thrust::raw_pointer_cast(indices_gpu.data()),
+        thrust::raw_pointer_cast(indptr_gpu.data()),
         thrust::raw_pointer_cast(last_page_len_gpu.data()));
 
     thrust::device_vector<int32_t> append_indptr_gpu(append_indptr);
@@ -148,10 +149,8 @@ void TestAppendPagedKVKernelCorrectness() {
       for (size_t num_heads : {32}) {
         for (QKVLayout kv_layout : {QKVLayout::kNHD, QKVLayout::kHND}) {
           for (size_t head_dim : {64, 128, 256}) {
-            DISPATCH_kv_layout(kv_layout, KV_LAYOUT, {
-              _TestAppendPagedKVKernelCorrectness<KV_LAYOUT, T>(page_size, batch_size, num_heads,
-                                                                head_dim);
-            });
+            _TestAppendPagedKVKernelCorrectness<T>(page_size, batch_size, num_heads, head_dim,
+                                                   kv_layout);
           }
         }
       }

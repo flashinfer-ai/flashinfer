@@ -54,9 +54,6 @@
 #define DISPATCH_head_dim(expr, const_expr, ...) \
   _DISPATCH_SWITCH("head_dim", expr, _DISPATCH_CASES_head_dim(const_expr, __VA_ARGS__))
 
-#define DISPATCH_kv_layout(expr, const_expr, ...) \
-  _DISPATCH_SWITCH("kv layout", expr, _DISPATCH_CASES_kv_layout(const_expr, __VA_ARGS__))
-
 #define DISPATCH_pos_encoding_mode(expr, const_expr, ...) \
   _DISPATCH_SWITCH("positional encoding mode", expr,      \
                    _DISPATCH_CASES_pos_encoding_mode(const_expr, __VA_ARGS__))
