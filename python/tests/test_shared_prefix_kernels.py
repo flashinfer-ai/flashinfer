@@ -199,6 +199,63 @@ def test_batch_attention_with_shared_prefix_paged_kv_cache(
         o_baseline.cpu().numpy(), o_cascade.cpu().numpy(), rtol=1e-3, atol=1e-3
     )
 
+@pytest.mark.parametrize("seed", [0])
+@pytest.mark.parametrize("num_tries", [50])
+def test_merge_state_in_place_with_mask(seed, num_tries):
+    seq_len = 512
+    num_heads = 32
+    head_dim = 128
+    va = torch.randn(seq_len, num_heads, head_dim).half().to("cuda:0")
+    sa = torch.randn(seq_len, num_heads, dtype=torch.float32).to("cuda:0")
+    vb = torch.randn(seq_len, num_heads, head_dim).half().to("cuda:0")
+    sb = torch.randn(seq_len, num_heads, dtype=torch.float32).to("cuda:0")
+    va_orginal = va.clone()
+    sa_original = sa.clone()
+
+    # No mask.
+    flashinfer.merge_state_in_place(va, sa, vb, sb)
+    va_merged_ref = va.clone()
+    sa_merged_ref = sa.clone()
+    assert not torch.allclose(va_merged_ref, va_orginal)
+    assert not torch.allclose(sa_merged_ref, sa_original)
+
+    # Mask with all 1s. Should be identical to no mask.
+    mask = torch.ones(seq_len, dtype=torch.bool).to("cuda:0")
+    va = va_orginal.clone()
+    sa = sa_original.clone()
+    flashinfer.merge_state_in_place(va, sa, vb, sb, mask=mask)
+    va_merged = va
+    sa_merged = sa
+    numpy.testing.assert_allclose(va_merged.cpu().numpy(), va_merged_ref.cpu().numpy(), rtol=1e-3, atol=1e-3)
+    numpy.testing.assert_allclose(sa_merged.cpu().numpy(), sa_merged_ref.cpu().numpy(), rtol=1e-3, atol=1e-3)
+
+    # Mask with all zeros. Input and output should be identical.
+    mask = torch.zeros(seq_len, dtype=torch.bool).to("cuda:0")
+    va = va_orginal.clone()
+    sa = sa_original.clone()
+    flashinfer.merge_state_in_place(va, sa, vb, sb, mask=mask)
+    va_merged = va
+    sa_merged = sa
+    numpy.testing.assert_allclose(va_merged.cpu().numpy(), va_orginal.cpu().numpy(), rtol=1e-3, atol=1e-3)
+    numpy.testing.assert_allclose(sa_merged.cpu().numpy(), sa_original.cpu().numpy(), rtol=1e-3, atol=1e-3)
+
+    # Test some random masks.
+    randgen = torch.Generator(device="cuda:0")
+    randgen.manual_seed(seed)
+    for _ in range(num_tries):
+        rand_mask = (torch.rand(seq_len, generator=randgen, dtype=torch.float32, device="cuda:0") > 0.5).to(dtype=torch.bool)
+        true_indices = rand_mask.nonzero()
+        false_indices = (rand_mask==0).nonzero()
+        va = va_orginal.clone()
+        sa = sa_original.clone()
+        flashinfer.merge_state_in_place(va, sa, vb, sb, mask=rand_mask)
+        va_merged = va
+        sa_merged = sa
+
+        numpy.testing.assert_allclose(va_merged[false_indices].cpu().numpy(), va_orginal[false_indices].cpu().numpy(), rtol=1e-3, atol=1e-3)
+        numpy.testing.assert_allclose(sa_merged[false_indices].cpu().numpy(), sa_original[false_indices].cpu().numpy(), rtol=1e-3, atol=1e-3)
+        numpy.testing.assert_allclose(va_merged[true_indices].cpu().numpy(), va_merged_ref[true_indices].cpu().numpy(), rtol=1e-3, atol=1e-3)
+        numpy.testing.assert_allclose(sa_merged[true_indices].cpu().numpy(), sa_merged_ref[true_indices].cpu().numpy(), rtol=1e-3, atol=1e-3)
 
 if __name__ == "__main__":
     test_batch_attention_with_shared_prefix_paged_kv_cache(
