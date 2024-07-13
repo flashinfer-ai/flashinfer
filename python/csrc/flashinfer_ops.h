@@ -61,9 +61,10 @@ std::vector<torch::Tensor> top_k_sampling_from_probs(torch::Tensor probs,
 
 std::vector<torch::Tensor> top_k_top_p_sampling_from_probs(torch::Tensor probs,
                                                            torch::Tensor uniform_samples,
-                                                           torch::Tensor top_k, torch::Tensor top_p);
+                                                           torch::Tensor top_k,
+                                                           torch::Tensor top_p);
 
-    torch::Tensor top_p_renorm_prob(torch::Tensor probs, double top_p, double eps);
+torch::Tensor top_p_renorm_prob(torch::Tensor probs, double top_p, double eps);
 
 torch::Tensor top_k_renorm_prob(torch::Tensor probs, unsigned int top_k, double eps);
 
