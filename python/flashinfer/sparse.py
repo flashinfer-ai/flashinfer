@@ -97,9 +97,14 @@ class BlockSparseFlashAttentionWrapper:
 
         self._paged_kv_indptr_buf = indptr
         self._paged_kv_indices_buf = indices
-        is_last_column = indices == (N - 1)
+        if indices.max().item() * C > N:
+            raise ValueError("indices out of bound")
         
-        self._paged_kv_last_page_len = torch.full(num_rows, C, dtype=torch.int32, device=indptr.device)
+        row_empty = indptr[1:] == indptr[:1]
+        last_block_pos = indices[torch.clamp(indptr[1:], min=1) - 1]
+        last_block_pos.masked_fill_(row_empty, 0)
+
+        self._paged_kv_last_page_len = torch.clamp(N - last_block_pos * C, max=C)
         if packed_mask is not None:
             self._packed_mask_buf = packed_mask
             self._qk_indptr_buf = qk_indptr
