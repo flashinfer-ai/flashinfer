@@ -89,12 +89,11 @@ __global__ void MergeStateKernel(DTypeIn* __restrict__ v_a, float* __restrict__ 
 template <uint32_t vec_size, typename DType>
 __global__ void MergeStateInPlaceKernel(DType* __restrict__ v, float* __restrict__ s,
                                         DType* __restrict__ v_other, float* __restrict__ s_other,
-                                        uint8_t* __restrict__ mask,
-                                        uint32_t num_heads, uint32_t head_dim) {
+                                        uint8_t* __restrict__ mask, uint32_t num_heads,
+                                        uint32_t head_dim) {
   uint32_t pos = blockIdx.x;
 
-  if (mask != nullptr && mask[pos] == 0)
-    return;
+  if (mask != nullptr && mask[pos] == 0) return;
 
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t head_idx = ty;
@@ -396,8 +395,7 @@ cudaError_t MergeState(DTypeIn* v_a, float* s_a, DTypeIn* v_b, float* s_b, DType
  */
 template <typename DType>
 cudaError_t MergeStateInPlace(DType* v, float* s, DType* v_other, float* s_other, uint32_t seq_len,
-                              uint32_t num_heads, uint32_t head_dim,
-                              uint8_t* mask = nullptr,
+                              uint32_t num_heads, uint32_t head_dim, uint8_t* mask = nullptr,
                               cudaStream_t stream = nullptr) {
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16U / sizeof(DType), HEAD_DIM / 32U);
