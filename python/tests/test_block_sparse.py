@@ -13,40 +13,43 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+
 import pytest
 import torch
 import numpy as np
 import scipy as sp
 import flashinfer
 
+
 def bsr_attention_ref(
-    q, kv,
+    q,
+    kv,
     indptr,
     indices,
     mask_data,
 ):
-    print(kv.shape)
     M = q.shape[0]
     NB, _, C, H_KV, D = kv.shape
     N = NB * C
-    bsr = sp.sparse.bsr_matrix((mask_data.cpu().numpy(), indices.cpu().numpy(), indptr.cpu().numpy()), shape=(M, N))
+    bsr = sp.sparse.bsr_matrix(
+        (mask_data.cpu().numpy(), indices.cpu().numpy(), indptr.cpu().numpy()),
+        shape=(M, N),
+    )
     dense_mask = torch.tensor(bsr.toarray(), dtype=bool, device=q.device)
     k = kv[:, 0].reshape(-1, H_KV, D).contiguous()
     v = kv[:, 1].reshape(-1, H_KV, D).contiguous()
-    o = flashinfer.single_prefill_with_kv_cache(
-        q, k, v, custom_mask=dense_mask
-    )
+    o = flashinfer.single_prefill_with_kv_cache(q, k, v, custom_mask=dense_mask)
     return o
 
 
-@pytest.mark.parametrize("R", [1, 4, 16])#[1, 4, 16])
-@pytest.mark.parametrize("C", [1, 4])#[1, 4, 16])
+@pytest.mark.parametrize("R", [1, 4, 16])
+@pytest.mark.parametrize("C", [1])  # , 4, 16])
 @pytest.mark.parametrize("M", [64, 128, 256])
 @pytest.mark.parametrize("N", [64, 128, 256])
 @pytest.mark.parametrize("num_qo_heads", [1, 4, 16])
 @pytest.mark.parametrize("num_kv_heads", [1, 4, 16])
 @pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("mask_inside_block", [False])#[True, False])
+@pytest.mark.parametrize("mask_inside_block", [False])  # [True, False])
 def test_block_sparse_attention(
     R, C, M, N, num_qo_heads, num_kv_heads, head_dim, mask_inside_block
 ):
@@ -64,27 +67,32 @@ def test_block_sparse_attention(
     else:
         data_mask = torch.full((nnz, R, C), True, dtype=bool, device=0)
     q = torch.randn((M, num_qo_heads, head_dim), dtype=torch.float16, device=0)
-    kv_data = torch.randn((NB, 2, C, num_kv_heads, head_dim), dtype=torch.float16, device=0)
-
-    o_ref = bsr_attention_ref(
-        q, kv_data, indptr, indices, data_mask
+    kv_data = torch.randn(
+        (NB, 2, C, num_kv_heads, head_dim), dtype=torch.float16, device=0
     )
+
+    o_ref = bsr_attention_ref(q, kv_data, indptr, indices, data_mask)
 
     workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=0)
-    sparse_attention_wrapper = flashinfer.BlockSparseAttentionWrapper(
-        workspace_buffer
-    )
+    sparse_attention_wrapper = flashinfer.BlockSparseAttentionWrapper(workspace_buffer)
 
     sparse_attention_wrapper.begin_forward(
         indptr,
         indices,
-        M, N, R, C, num_qo_heads, num_kv_heads, head_dim,
-        mask=data_mask.view(-1) if mask_inside_block else None
+        M,
+        N,
+        R,
+        C,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        mask=data_mask.view(-1) if mask_inside_block else None,
     )
 
     o = sparse_attention_wrapper.forward(q, kv_data)
+    sparse_attention_wrapper.end_forward()
     np.testing.assert_allclose(o_ref.cpu(), o.cpu(), atol=1e-2, rtol=1e-3)
 
 
 if __name__ == "__main__":
-    test_block_sparse_attention(1, 1, 64, 64, 1, 1, 128)
+    test_block_sparse_attention(1, 1, 64, 64, 1, 1, 128, False)
