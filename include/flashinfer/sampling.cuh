@@ -536,7 +536,7 @@ cudaError_t TopKTopPSamplingFromProb(T* probs, T* uniform_samples, IdType* top_k
   const uint32_t smem_size = sizeof(SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
   dim3 nblks(batch_size);
   dim3 nthrs(BLOCK_THREADS);
-  void* args = {&probs, &uniform_samples, &top_k, &top_p, &output, &success, &d, &max_rounds};
+  void* args[] = {&probs, &uniform_samples, &top_k, &top_p, &output, &success, &d, &max_rounds};
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
     auto kernel =
