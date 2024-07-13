@@ -18,7 +18,7 @@ import math
 from typing import Optional
 import torch
 import logging
-from .prefill import _compute_qk_indptr
+from .prefill import _compute_page_qk_indptr
 from .quantization import segment_packbits
 from .utils import check_pos_encoding_mode, check_kv_layout, is_float8, expand_5d, PosEncodingMode, TensorLayout
 
@@ -35,13 +35,13 @@ except ImportError as e:
         raise e
 
 
-class BlockSparseFlashAttentionWrapper:
+class BlockSparseAttentionWrapper:
     def __init__(
         self,
         workspace_buffer: torch.Tensor,
         kv_layout: str = "NHD",
     ):
-        r"""Constructs of :class:`BlockSparseFlashAttentionWrapper`. 
+        r"""Constructs of :class:`BlockSparseAttentionWrapper`. 
 
         Parameters
         ----------
@@ -80,11 +80,18 @@ class BlockSparseFlashAttentionWrapper:
         qo_indptr_host = R * torch.arange(num_rows + 1, dtype=torch.int32)
         qo_indptr_host[-1] = M
         self._qo_indptr = qo_indptr_host.to(indptr.device)
+        row_empty = indptr[1:] == indptr[:1]
+        if indices.max().item() * C > N:
+            raise ValueError("indices out of bound") 
+        last_block_pos = indices[torch.clamp(indptr[1:], min=1) - 1]
+        last_block_pos.masked_fill_(row_empty, 0)
+        last_block_len = torch.clamp(N - last_block_pos * C, max=C)
+
         if mask is not None or packed_mask is not None:
-            qk_indptr = _compute_qk_indptr(
+            qk_indptr = _compute_page_qk_indptr(
                 self._qo_indptr,
                 indptr, # paged_kv_indptr
-                indices, # paged_kv_last_page_len
+                last_block_len, # paged_kv_last_page_len
                 C # page_size
             )
         if packed_mask is None and mask is not None:
@@ -97,17 +104,12 @@ class BlockSparseFlashAttentionWrapper:
 
         self._paged_kv_indptr_buf = indptr
         self._paged_kv_indices_buf = indices
-        if indices.max().item() * C > N:
-            raise ValueError("indices out of bound")
-        
-        row_empty = indptr[1:] == indptr[:1]
-        last_block_pos = indices[torch.clamp(indptr[1:], min=1) - 1]
-        last_block_pos.masked_fill_(row_empty, 0)
-
-        self._paged_kv_last_page_len = torch.clamp(N - last_block_pos * C, max=C)
+        self._paged_kv_last_page_len = last_block_len
         if packed_mask is not None:
             self._packed_mask_buf = packed_mask
             self._qk_indptr_buf = qk_indptr
+        else:
+            self._packed_mask_buf = None
         
         empty_q_data = torch.empty(
             0,
@@ -202,4 +204,4 @@ class BlockSparseFlashAttentionWrapper:
                 rope_scale,
                 rope_theta,
                 False,  # return LSE
-            )
+            )[0]

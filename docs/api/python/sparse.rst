@@ -7,7 +7,7 @@ Kernels for block sparse flashattention.
 
 .. currentmodule:: flashinfer.sparse
 
-.. autoclass:: BatchPrefillWithPagedKVCacheWrapper
+.. autoclass:: BlockSparseAttentionWrapper
     :members:
 
     .. automethod:: __init__

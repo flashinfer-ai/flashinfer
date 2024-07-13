@@ -16,31 +16,75 @@ limitations under the License.
 import pytest
 import torch
 import numpy as np
-from scipy.sparse import bsr_matrix
+import scipy as sp
 import flashinfer
 
 def bsr_attention_ref(
     q, kv,
     indptr,
     indices,
-    R, C,
+    mask_data,
 ):
+    print(kv.shape)
     M = q.shape[0]
-    N, _, _, H, D = kv.shape[0]
-    nnz = indices.shape[0]
-    data = np.zeros((nnz, R, C), dtype=np.float32)
-    bsr_matrix = bsr_matrix((data, indices, indptr), shape=(M, N * C))
-    dense_mask = torch.tensor(bsr_matrix.toarray(), dtype=bool, device=q.device)
-
-    k = kv[:, 0].view(-1, H, D)
-    v = kv[:, 1].view(-1, H, D)
-
+    NB, _, C, H_KV, D = kv.shape
+    N = NB * C
+    bsr = sp.sparse.bsr_matrix((mask_data.cpu().numpy(), indices.cpu().numpy(), indptr.cpu().numpy()), shape=(M, N))
+    dense_mask = torch.tensor(bsr.toarray(), dtype=bool, device=q.device)
+    k = kv[:, 0].reshape(-1, H_KV, D).contiguous()
+    v = kv[:, 1].reshape(-1, H_KV, D).contiguous()
     o = flashinfer.single_prefill_with_kv_cache(
         q, k, v, custom_mask=dense_mask
     )
     return o
 
 
+@pytest.mark.parametrize("R", [1, 4, 16])#[1, 4, 16])
+@pytest.mark.parametrize("C", [1, 4])#[1, 4, 16])
+@pytest.mark.parametrize("M", [64, 128, 256])
+@pytest.mark.parametrize("N", [64, 128, 256])
+@pytest.mark.parametrize("num_qo_heads", [1, 4, 16])
+@pytest.mark.parametrize("num_kv_heads", [1, 4, 16])
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("mask_inside_block", [False])#[True, False])
 def test_block_sparse_attention(
-
+    R, C, M, N, num_qo_heads, num_kv_heads, head_dim, mask_inside_block
 ):
+    if num_qo_heads % num_kv_heads != 0:
+        pytest.skip("num_qo_heads must be divisible by num_kv_heads")
+    rng = np.random.default_rng()
+    MB = M // R
+    NB = N // C
+    S = sp.sparse.random(MB, NB, density=0.25, random_state=rng).tocsr()
+    indptr = torch.from_numpy(S.indptr).to(0)
+    indices = torch.from_numpy(S.indices).to(0)
+    nnz = S.nnz
+    if mask_inside_block:
+        data_mask = (torch.rand((nnz, R, C)) > 0.5).to(0)
+    else:
+        data_mask = torch.full((nnz, R, C), True, dtype=bool, device=0)
+    q = torch.randn((M, num_qo_heads, head_dim), dtype=torch.float16, device=0)
+    kv_data = torch.randn((NB, 2, C, num_kv_heads, head_dim), dtype=torch.float16, device=0)
+
+    o_ref = bsr_attention_ref(
+        q, kv_data, indptr, indices, data_mask
+    )
+
+    workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=0)
+    sparse_attention_wrapper = flashinfer.BlockSparseAttentionWrapper(
+        workspace_buffer
+    )
+
+    sparse_attention_wrapper.begin_forward(
+        indptr,
+        indices,
+        M, N, R, C, num_qo_heads, num_kv_heads, head_dim,
+        mask=data_mask.view(-1) if mask_inside_block else None
+    )
+
+    o = sparse_attention_wrapper.forward(q, kv_data)
+    np.testing.assert_allclose(o_ref.cpu(), o.cpu(), atol=1e-2, rtol=1e-3)
+
+
+if __name__ == "__main__":
+    test_block_sparse_attention(1, 1, 64, 64, 1, 1, 128)
