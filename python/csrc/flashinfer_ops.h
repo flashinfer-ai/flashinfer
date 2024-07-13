@@ -46,7 +46,7 @@ std::vector<torch::Tensor> merge_state(torch::Tensor v_a, torch::Tensor s_a, tor
                                        torch::Tensor s_b);
 
 void merge_state_in_place(torch::Tensor v, torch::Tensor s, torch::Tensor v_other,
-                          torch::Tensor s_other);
+                          torch::Tensor s_other, std::optional<torch::Tensor> mask = std::nullopt);
 
 std::vector<torch::Tensor> merge_states(torch::Tensor v, torch::Tensor s);
 

@@ -98,7 +98,11 @@ def merge_state(
 
 
 def merge_state_in_place(
-    v: torch.Tensor, s: torch.Tensor, v_other: torch.Tensor, s_other: torch.Tensor
+    v: torch.Tensor,
+    s: torch.Tensor,
+    v_other: torch.Tensor,
+    s_other: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
 ):
     r"""Merge the self-attention state ``(v, s)`` with another state
     ``(v_other, s_other)`` in-place.
@@ -117,6 +121,11 @@ def merge_state_in_place(
     s_other : torch.Tensor
         The other logsumexp value to be merged, expected to be a float32 tensor,
         shape: ``(seq_len, num_heads)``.
+    mask : Optional[torch.Tensor]
+        The boolean mask tensor for whether to merge the state for a corresponding sequence
+        or not. Useful for CUDA graphs. If not specified (default), will merge states for
+        all sequences.
+        shape: ``[seq_len]``
 
     Example
     -------
@@ -131,7 +140,7 @@ def merge_state_in_place(
     >>> s_other = torch.randn(seq_len, num_heads, dtype=torch.float32).to("cuda:0")
     >>> flashinfer.merge_state_in_place(v, s, v_other, s_other)
     """
-    _kernels.merge_state_in_place(v, s, v_other, s_other)
+    _kernels.merge_state_in_place(v, s, v_other, s_other, mask)
 
 
 def merge_states(v: torch.Tensor, s: torch.Tensor):

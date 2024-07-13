@@ -63,7 +63,7 @@ std::vector<torch::Tensor> merge_state(torch::Tensor v_a, torch::Tensor s_a, tor
 }
 
 void merge_state_in_place(torch::Tensor v, torch::Tensor s, torch::Tensor v_other,
-                          torch::Tensor s_other) {
+                          torch::Tensor s_other, std::optional<torch::Tensor> mask) {
   CHECK_INPUT(v);
   CHECK_INPUT(s);
   CHECK_INPUT(v_other);
@@ -82,6 +82,13 @@ void merge_state_in_place(torch::Tensor v, torch::Tensor s, torch::Tensor v_othe
   CHECK_EQ(v.size(1), s.size(1));
   CHECK_EQ(s.scalar_type(), torch::kFloat32);
   CHECK_EQ(s_other.scalar_type(), torch::kFloat32);
+  uint8_t* mask_ptr = nullptr;
+  if (mask.has_value()) {
+    CHECK_DIM(1, mask.value());
+    CHECK_EQ(v.size(0), mask.value().size(0));
+    CHECK_EQ(mask.value().device(), device);
+    mask_ptr = static_cast<uint8_t*>(mask.value().data_ptr());
+  }
   unsigned int seq_len = v.size(0);
   unsigned int num_heads = v.size(1);
   unsigned int head_dim = v.size(2);
@@ -91,7 +98,7 @@ void merge_state_in_place(torch::Tensor v, torch::Tensor s, torch::Tensor v_othe
     cudaError_t status = MergeStateInPlace(
         static_cast<c_type*>(v.data_ptr()), static_cast<float*>(s.data_ptr()),
         static_cast<c_type*>(v_other.data_ptr()), static_cast<float*>(s_other.data_ptr()), seq_len,
-        num_heads, head_dim, torch_current_stream);
+        num_heads, head_dim, mask_ptr, torch_current_stream);
     TORCH_CHECK(status == cudaSuccess,
                 "MergeStateInPlace kernel launch failed: ", cudaGetErrorString(status));
     return true;
