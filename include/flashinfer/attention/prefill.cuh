@@ -751,15 +751,16 @@ __device__ __forceinline__ void compute_sfm_v(smem_t* v_smem, uint32_t* v_smem_o
   *v_smem_offset_r -= 16 * num_frags_z * channel_size_128b_in;
 }
 
-template <uint32_t num_frags_x, uint32_t num_frags_y>
-__device__ __forceinline__ void normalize_d(float (*o_frag)[num_frags_y][8], float (*d)[2]) {
+template <uint32_t num_frags_x, uint32_t num_frags_y, typename DTypeQKAccum>
+__device__ __forceinline__ void normalize_d(float (*o_frag)[num_frags_y][8], DTypeQKAccum (*m)[2],
+                                            float (*d)[2]) {
   float d_rcp[num_frags_x][2];
   // compute reciprocal of d
 #pragma unroll
   for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
     for (uint32_t j = 0; j < 2; ++j) {
-      d_rcp[fx][j] = math::ptx_rcp(d[fx][j]);
+      d_rcp[fx][j] = (m[fx][j] != DTypeQKAccum(-5e4)) ? math::ptx_rcp(d[fx][j]) : 0.f;
     }
   }
 
@@ -1161,7 +1162,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
       o_frag, (float*)smem, m, d, warp_idx, lane_idx);
 
   // normalize d
-  normalize_d<num_frags_x, num_frags_y>(o_frag, d);
+  normalize_d<num_frags_x, num_frags_y>(o_frag, m, d);
 
   // write back
   write_o_reg_gmem<num_warps_x, num_warps_z, num_frags_x, num_frags_y>(
@@ -1428,7 +1429,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
       o_frag, (float*)smem, m, d, warp_idx, lane_idx);
 
   // normalize d
-  normalize_d<num_frags_x, num_frags_y>(o_frag, d);
+  normalize_d<num_frags_x, num_frags_y>(o_frag, m, d);
 
   const uint32_t num_kv_chunks = ceil_div(kv_len, kv_chunk_size);
 
@@ -1719,7 +1720,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
       o_frag, (float*)smem, m, d, warp_idx, lane_idx);
 
   // normalize d
-  normalize_d<num_frags_x, num_frags_y>(o_frag, d);
+  normalize_d<num_frags_x, num_frags_y>(o_frag, m, d);
 
   const uint32_t num_kv_chunks = ceil_div(kv_len, kv_chunk_size);
 

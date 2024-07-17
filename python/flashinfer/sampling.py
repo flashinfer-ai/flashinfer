@@ -254,7 +254,7 @@ def top_k_top_p_sampling_from_probs(
     >>> samples
     tensor([3, 3, 0, 1], device='cuda:0', dtype=torch.int32)
     >>> success
-    tensor([True, True, True, True], device='cuda:0')            
+    tensor([True, True, True, True], device='cuda:0')
 
     Notes
     -----
