@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.0](https://github.com/flashinfer-ai/flashinfer/compare/v0.0.9...v0.1.0) (2024-07-17)
+
+
+### Features
+
+* Add mask to `merge_state_in_place` ([#372](https://github.com/flashinfer-ai/flashinfer/issues/372)) ([e14fa81](https://github.com/flashinfer-ai/flashinfer/commit/e14fa8194cfc09c271e6f2c102060698f18297a9))
+* expose pytorch api for block sparse attention ([#375](https://github.com/flashinfer-ai/flashinfer/issues/375)) ([4bba6fa](https://github.com/flashinfer-ai/flashinfer/commit/4bba6fa3aa848d2e43248bca8d959fd58a27cfa4))
+* Fused GPU sampling kernel for joint top-k & top-p sampling ([#374](https://github.com/flashinfer-ai/flashinfer/issues/374)) ([6e028eb](https://github.com/flashinfer-ai/flashinfer/commit/6e028eb997173658832a66c7480cc9224d637a15))
+
 ## [0.0.9](https://github.com/flashinfer-ai/flashinfer/compare/v0.0.8...v0.0.9) (2024-07-12)
 
 ### Bugfix
