@@ -43,13 +43,13 @@ def bsr_attention_ref(
 
 
 @pytest.mark.parametrize("R", [1, 4, 16])
-@pytest.mark.parametrize("C", [1])  # , 4, 16])
+@pytest.mark.parametrize("C", [1, 4, 16])
 @pytest.mark.parametrize("M", [64, 128, 256])
 @pytest.mark.parametrize("N", [64, 128, 256])
 @pytest.mark.parametrize("num_qo_heads", [1, 4, 16])
 @pytest.mark.parametrize("num_kv_heads", [1, 4, 16])
 @pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("mask_inside_block", [False])  # [True, False])
+@pytest.mark.parametrize("mask_inside_block", [True, False])
 def test_block_sparse_attention(
     R, C, M, N, num_qo_heads, num_kv_heads, head_dim, mask_inside_block
 ):
@@ -72,9 +72,15 @@ def test_block_sparse_attention(
     )
 
     o_ref = bsr_attention_ref(q, kv_data, indptr, indices, data_mask)
-
     workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=0)
     sparse_attention_wrapper = flashinfer.BlockSparseAttentionWrapper(workspace_buffer)
+
+    if mask_inside_block:
+        mask_flashinfer_layout = torch.full((nnz * R * C,), False, dtype=bool, device=0)
+        for i in range(MB):
+            mask_flashinfer_layout[indptr[i] * R * C : indptr[i + 1] * R * C] = (
+                data_mask[indptr[i] : indptr[i + 1]].transpose(0, 1).reshape(-1)
+            )
 
     sparse_attention_wrapper.begin_forward(
         indptr,
@@ -86,13 +92,14 @@ def test_block_sparse_attention(
         num_qo_heads,
         num_kv_heads,
         head_dim,
-        mask=data_mask.view(-1) if mask_inside_block else None,
+        mask=mask_flashinfer_layout if mask_inside_block else None,
     )
 
     o = sparse_attention_wrapper.forward(q, kv_data)
     sparse_attention_wrapper.end_forward()
+    print(o_ref, o)
     np.testing.assert_allclose(o_ref.cpu(), o.cpu(), atol=1e-2, rtol=1e-3)
 
 
 if __name__ == "__main__":
-    test_block_sparse_attention(1, 1, 64, 64, 1, 1, 128, False)
+    test_block_sparse_attention(1, 1, 64, 64, 1, 1, 128, True)
