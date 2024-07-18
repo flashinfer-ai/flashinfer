@@ -213,8 +213,9 @@ struct paged_kv_t {
   }
 
   __host__ __device__ __forceinline__ int64_t kv_ptr_delta() const {
-    return page_storage == PageStorage::kPointer ? num_heads * page_size * head_dim
-                                                 : int64_t(v_data) - int64_t(k_data);
+    return page_storage == PageStorage::kPointer
+               ? num_heads * page_size * head_dim
+               : (int64_t(v_data) - int64_t(k_data)) / sizeof(DType);
   }
 
   /*!

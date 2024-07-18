@@ -76,7 +76,7 @@ void _TestBatchPagedPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t n
   // create paged_kv object
   flashinfer::paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv = paged_kv_cpu;
   paged_kv.k_data = thrust::raw_pointer_cast(kv_data_device.data());
-  paged_kv.v_data = paged_kv.k_data + paged_kv.kv_ptr_delta();
+  paged_kv.v_data = paged_kv.k_data + paged_kv_cpu.kv_ptr_delta();
   paged_kv.indices = thrust::raw_pointer_cast(kv_indices_device.data());
   paged_kv.indptr = thrust::raw_pointer_cast(kv_indptr_device.data());
   paged_kv.last_page_len = thrust::raw_pointer_cast(kv_last_page_len_device.data());
@@ -284,7 +284,7 @@ void _TestBatchPagedPrefillKernelShortContextCorrectness(size_t num_kv_heads, si
   // create paged_kv object
   flashinfer::paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv = paged_kv_cpu;
   paged_kv.k_data = thrust::raw_pointer_cast(kv_data_device.data());
-  paged_kv.v_data = paged_kv.k_data + paged_kv.kv_ptr_delta();
+  paged_kv.v_data = paged_kv.k_data + paged_kv_cpu.kv_ptr_delta();
   paged_kv.indices = thrust::raw_pointer_cast(kv_indices_device.data());
   paged_kv.indptr = thrust::raw_pointer_cast(kv_indptr_device.data());
   paged_kv.last_page_len = thrust::raw_pointer_cast(kv_last_page_len_device.data());
@@ -405,7 +405,7 @@ void _TestBatchPagedPrefillKernelQMinMaxKVMinMaxCorrectness(
   // create paged_kv object
   flashinfer::paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv = paged_kv_cpu;
   paged_kv.k_data = thrust::raw_pointer_cast(kv_data_device.data());
-  paged_kv.v_data = paged_kv.k_data + paged_kv.kv_ptr_delta();
+  paged_kv.v_data = paged_kv.k_data + paged_kv_cpu.kv_ptr_delta();
   paged_kv.indices = thrust::raw_pointer_cast(kv_indices_device.data());
   paged_kv.indptr = thrust::raw_pointer_cast(kv_indptr_device.data());
   paged_kv.last_page_len = thrust::raw_pointer_cast(kv_last_page_len_device.data());
@@ -513,7 +513,7 @@ void _TestBatchPagedPrefillKernelLongContextCorrectness(size_t num_kv_heads, siz
   // create paged_kv object
   flashinfer::paged_kv_t<PageStorage::kIndices, T, int32_t> paged_kv = paged_kv_cpu;
   paged_kv.k_data = thrust::raw_pointer_cast(kv_data_device.data());
-  paged_kv.v_data = paged_kv.k_data + paged_kv.kv_ptr_delta();
+  paged_kv.v_data = paged_kv.k_data + paged_kv_cpu.kv_ptr_delta();
   paged_kv.indices = thrust::raw_pointer_cast(kv_indices_device.data());
   paged_kv.indptr = thrust::raw_pointer_cast(kv_indptr_device.data());
   paged_kv.last_page_len = thrust::raw_pointer_cast(kv_last_page_len_device.data());
