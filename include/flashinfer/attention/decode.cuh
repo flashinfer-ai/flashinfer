@@ -487,7 +487,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
     cp_async::commit_group();
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
-      DTypeKV* v_ptr = k_ptrs[j] + paged_kv.kv_offset_delta();
+      DTypeKV* v_ptr = k_ptrs[j] + paged_kv.kv_ptr_delta();
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
           v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
@@ -554,7 +554,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
     // load v tiles
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
-      DTypeKV* v_ptr = k_ptrs[j] + paged_kv.kv_offset_delta();
+      DTypeKV* v_ptr = k_ptrs[j] + paged_kv.kv_ptr_delta();
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
           v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,

@@ -216,8 +216,7 @@ __device__ __forceinline__ void page_produce_kv(smem_t smem, uint32_t* smem_offs
   static_assert(num_frags_z * 4 % num_warps_x == 0);
 #pragma unroll
   for (uint32_t i = 0; i < num_frags_z * 4 / num_warps_x; ++i) {
-    DType* gptr = produce_v ? paged_kv.data + paged_kv.kv_offset_delta() + kv_offset[i]
-                            : paged_kv.data + kv_offset[i];
+    DType* gptr = produce_v ? paged_kv.v_data + kv_offset[i] : paged_kv.k_data + kv_offset[i];
 #pragma unroll
     for (uint32_t j = 0; j < num_frags_y / 4; ++j) {
       smem.load_128b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
@@ -1608,8 +1607,8 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
         page_iter, entry_idx);
     kv_offset[i] =
         page_iter < last_indptr
-            ? paged_kv.get_k_elem_offset(__ldg(paged_kv.indices + page_iter), kv_head_idx,
-                                         entry_idx, (lane_idx % 8) * num_elems_per_128b<DTypeIn>())
+            ? paged_kv.get_elem_offset(__ldg(paged_kv.indices + page_iter), kv_head_idx, entry_idx,
+                                       (lane_idx % 8) * num_elems_per_128b<DTypeIn>())
             : 0;
   }
   page_produce_kv<false, num_warps_x, num_warps_z, num_frags_y, num_frags_z>(
@@ -1645,11 +1644,11 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
       paged_kv.page_size.divmod(
           packed_page_iter_base + warp_idx * 4 + lane_idx / 8 + 4 * num_warps_x * num_warps_z * i,
           page_iter, entry_idx);
-      kv_offset[i] = page_iter < last_indptr
-                         ? paged_kv.get_k_elem_offset(
-                               __ldg(paged_kv.indices + page_iter), kv_head_idx, entry_idx,
-                               (lane_idx % 8) * num_elems_per_128b<DTypeIn>())
-                         : 0;
+      kv_offset[i] =
+          page_iter < last_indptr
+              ? paged_kv.get_elem_offset(__ldg(paged_kv.indices + page_iter), kv_head_idx,
+                                         entry_idx, (lane_idx % 8) * num_elems_per_128b<DTypeIn>())
+              : 0;
     }
     cp_async::wait_group<1>();
     block.sync();
