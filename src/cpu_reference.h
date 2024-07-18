@@ -180,10 +180,10 @@ void append_paged_kv_cache(paged_kv_t<PageStorage::kIndices, T, IdxType> page_cp
       for (size_t h = 0; h < num_heads; ++h) {
         std::copy(ki.begin() + (j * num_heads + h) * head_dim,
                   ki.begin() + (j * num_heads + h + 1) * head_dim,
-                  page_cpu.data + page_cpu.get_k_elem_offset(page_idx, h, entry_idx, 0));
+                  page_cpu.k_data + page_cpu.get_elem_offset(page_idx, h, entry_idx, 0));
         std::copy(vi.begin() + (j * num_heads + h) * head_dim,
                   vi.begin() + (j * num_heads + h + 1) * head_dim,
-                  page_cpu.data + page_cpu.get_v_elem_offset(page_idx, h, entry_idx, 0));
+                  page_cpu.v_data + page_cpu.get_elem_offset(page_idx, h, entry_idx, 0));
       }
     }
   }
