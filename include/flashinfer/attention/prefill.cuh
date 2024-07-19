@@ -894,13 +894,8 @@ __device__ __forceinline__ void write_o_reg_gmem(
         uint32_t o_frag_f16[4];
         vec_cast<DTypeOut, float, 8>((DTypeOut*)o_frag_f16, o_frag[fx][fy]);
         uint32_t o_smem_offset_w = smem_t::get_permuted_offset<channel_size_128b_out>(
-            (warp_idx_x * num_frags_x + fx) * 16 + lane_idx / 4, fy * 2);
-        ((uint32_t*)(o_smem->base + o_smem_offset_w))[lane_idx % 4] = o_frag_f16[0];
-        ((uint32_t*)(o_smem->base + o_smem_offset_w + 8 * channel_size_128b_out))[lane_idx % 4] =
-            o_frag_f16[1];
-        ((uint32_t*)(o_smem->base + (o_smem_offset_w ^ 0x1)))[lane_idx % 4] = o_frag_f16[2];
-        ((uint32_t*)(o_smem->base + (o_smem_offset_w ^ 0x1) +
-                     8 * channel_size_128b_out))[lane_idx % 4] = o_frag_f16[3];
+            (warp_idx_x * num_frags_x + fx) * 16 + lane_idx % 16, fy * 2 + lane_idx / 16);
+        o_smem->stmatrix_m8n8x4(o_smem_offset_w, o_frag_f16);
       }
     }
 
