@@ -31,10 +31,10 @@ void append_paged_kv_cache(torch::Tensor append_key, torch::Tensor append_value,
   CHECK_INPUT(append_value);
   CHECK_INPUT(append_indptr);
   if (paged_kv_defined) {
-    CHECK_INPUT(*paged_kv_cache);
+    CHECK_INPUT(paged_kv_cache.value());
   } else {
-    CHECK_INPUT(*paged_k_cache);
-    CHECK_INPUT(*paged_v_cache);
+    CHECK_INPUT(paged_k_cache.value());
+    CHECK_INPUT(paged_v_cache.value());
   }
   CHECK_INPUT(kv_indices);
   CHECK_INPUT(kv_indptr);
@@ -43,10 +43,10 @@ void append_paged_kv_cache(torch::Tensor append_key, torch::Tensor append_value,
   CHECK_DIM(3, append_value);
   CHECK_DIM(1, append_indptr);
   if (paged_kv_defined) {
-    CHECK_DIM(5, *paged_kv_cache);
+    CHECK_DIM(5, paged_kv_cache.value());
   } else {
-    CHECK_DIM(4, *paged_k_cache);
-    CHECK_DIM(4, *paged_v_cache);
+    CHECK_DIM(4, paged_k_cache.value());
+    CHECK_DIM(4, paged_v_cache.value());
   }
   CHECK_DIM(1, kv_indices);
   CHECK_DIM(1, kv_indptr);
@@ -87,11 +87,11 @@ void append_paged_kv_cache(torch::Tensor append_key, torch::Tensor append_value,
   } else {
     head_dim = paged_k_cache->size(3);
     if (kv_layout == QKVLayout::kHND) {
-      num_heads = paged_k_cache.size(1);
-      page_size = paged_k_cache.size(2);
+      num_heads = paged_k_cache->size(1);
+      page_size = paged_k_cache->size(2);
     } else {
-      page_size = paged_k_cache.size(1);
-      num_heads = paged_k_cache.size(2);
+      page_size = paged_k_cache->size(1);
+      num_heads = paged_k_cache->size(2);
     }
   }
 
@@ -123,5 +123,5 @@ void append_paged_kv_cache(torch::Tensor append_key, torch::Tensor append_value,
   });
 
   TORCH_CHECK(success, "AppendPagedKVCache failed to dispatch with dtype ",
-              paged_kv_cache.scalar_type());
+              kv_scalar_dtype);
 }

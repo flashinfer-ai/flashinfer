@@ -37,13 +37,6 @@ from .prefill import (
     single_prefill_with_kv_cache_return_lse,
     BatchPrefillWithPagedKVCacheWrapper,
 )
-from .utils import (
-    expand_5d,
-    check_pos_encoding_mode,
-    check_kv_layout,
-    PosEncodingMode,
-    TensorLayout,
-)
 
 
 def merge_state(

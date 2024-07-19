@@ -21,10 +21,10 @@ import logging
 from .prefill import _compute_page_qk_indptr
 from .quantization import segment_packbits
 from .utils import (
-    check_pos_encoding_mode,
-    check_kv_layout,
+    _check_pos_encoding_mode,
+    _check_kv_layout,
+    _unpack_paged_kv_cache,
     is_float8,
-    expand_5d,
     PosEncodingMode,
     TensorLayout,
 )
@@ -62,7 +62,7 @@ class BlockSparseAttentionWrapper:
         kv_layout : str
             The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
         """
-        check_kv_layout(kv_layout)
+        _check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
         self._workspace_buffer = workspace_buffer
         self._wrapper = _kernels.BatchPrefillWithPagedKVCachePyTorchWrapper(
@@ -190,7 +190,7 @@ class BlockSparseAttentionWrapper:
     def forward(
         self,
         q: torch.Tensor,
-        kv_data: torch.Tensor,
+        paged_kv_cache: torch.Tensor,
         pos_encoding_mode: str = "NONE",
         allow_fp16_qk_reduction: bool = False,
         logits_soft_cap: Optional[float] = None,
@@ -200,14 +200,14 @@ class BlockSparseAttentionWrapper:
     ):
         r"""Compute block-sparse attention between Q/K/V tensors.
 
-        Warning(Zihao): in the next release, kv_data will be decoupled into standalone k/v tensors, each
+        Warning(Zihao): in the next release, paged_kv_cache will be decoupled into standalone k/v tensors, each
         with shape (N, num_kv_heads, head_dim).
 
         Parameters
         ----------
         q : torch.Tensor
             The query tensor, shape (M, num_qo_heads, head_dim).
-        kv_data : torch.Tensor
+        paged_kv_cache : torch.Tensor
             The key/value tensor, shape (N // C, 2, C, num_kv_heads, head_dim).
         pos_encoding_mode : str, optional
             The position encoding applied inside attention kernels, could be
@@ -236,7 +236,7 @@ class BlockSparseAttentionWrapper:
         torch.Tensor
             The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
         """
-        check_pos_encoding_mode(pos_encoding_mode)
+        _check_pos_encoding_mode(pos_encoding_mode)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         if sm_scale is None:
@@ -245,21 +245,12 @@ class BlockSparseAttentionWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
-        if is_float8(q):
-            logging.warning(
-                "Our current prefill kernel implementation needs f16 input, the f8 inputs "
-                " are casted to f16, which could result in performance degradation."
-            )
-            q = q.to(torch.float16)
-            kv_data = kv_data.to(torch.float16)
-
-        kv_data = expand_5d(kv_data, self._kv_layout)
 
         if self._packed_mask_buf is None:
             return self._wrapper.forward(
                 q,
                 self._qo_indptr,
-                kv_data,
+                *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
                 self._paged_kv_indptr_buf,
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len,
@@ -276,7 +267,7 @@ class BlockSparseAttentionWrapper:
             return self._wrapper.forward_custom_mask(
                 q,
                 self._qo_indptr,
-                kv_data,
+                *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
                 self._paged_kv_indptr_buf,
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len,

@@ -28,14 +28,14 @@ except ImportError as e:
     else:
         raise e
 
-from .utils import check_kv_layout, TensorLayout
+from .utils import _check_kv_layout, TensorLayout, _unpack_paged_kv_cache
 
 
 def append_paged_kv_cache(
     append_key: torch.Tensor,
     append_value: torch.Tensor,
     append_indptr: torch.Tensor,
-    kv_data: torch.Tensor,
+    paged_kv_cache: torch.Tensor,
     kv_indices: torch.Tensor,
     kv_indptr: torch.Tensor,
     kv_last_page_len: torch.Tensor,
@@ -53,7 +53,7 @@ def append_paged_kv_cache(
         ``[append_indptr[-1], num_kv_heads, head_dim]``.
     append_indptr : torch.Tensor
         The indptr tensor of the key-value pairs to append, shape: ``[batch_size + 1]``.
-    kv_data : torch.Tensor
+    paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         The 5-D tensor of the paged key-value cache, shape:
         ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
         :attr:`kv_layout` is ``NHD``, or
@@ -85,7 +85,7 @@ def append_paged_kv_cache(
     ... ).int()
     >>> max_num_pages = 1000
     >>> page_size = 16
-    >>> kv_data = torch.randn(max_num_pages, 2, page_size, num_kv_heads, head_dim).half().to(0)
+    >>> paged_kv_cache = torch.randn(max_num_pages, 2, page_size, num_kv_heads, head_dim).half().to(0)
     >>> num_pages_per_req = torch.tensor([3, 1, 2, 2], dtype=torch.int32, device="cuda:0")
     >>> kv_page_indptr = torch.cat(
     ...     [torch.zeros(1).int().to(0), torch.cumsum(num_pages_per_req, dim=0)]
@@ -102,7 +102,7 @@ def append_paged_kv_cache(
     ...     k_append,
     ...     v_append,
     ...     kv_append_indptr,
-    ...     kv_data,
+    ...     paged_kv_cache,
     ...     kv_page_indices,
     ...     kv_page_indptr,
     ...     kv_last_page_len
@@ -117,12 +117,12 @@ def append_paged_kv_cache(
     which means :attr:`kv_indices`, :attr:`kv_indptr`, :attr:`kv_last_page_len` has
     incorporated appended k/v.
     """
-    check_kv_layout(kv_layout)
+    _check_kv_layout(kv_layout)
     _kernels.append_paged_kv_cache(
         append_key,
         append_value,
         append_indptr,
-        kv_data,
+        *_unpack_paged_kv_cache(paged_kv_cache, kv_layout),
         kv_indices,
         kv_indptr,
         kv_last_page_len,

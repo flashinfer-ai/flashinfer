@@ -34,9 +34,9 @@ except ImportError as e:
 from .utils import (
     PosEncodingMode,
     TensorLayout,
-    expand_5d,
-    check_pos_encoding_mode,
-    check_kv_layout,
+    _check_pos_encoding_mode,
+    _check_kv_layout,
+    _unpack_paged_kv_cache,
     is_float8,
 )
 from .quantization import packbits, segment_packbits
@@ -165,8 +165,8 @@ def single_prefill_with_kv_cache(
     not equal to ``num_kv_heads``, the function will use
     `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
     """
-    check_pos_encoding_mode(pos_encoding_mode)
-    check_kv_layout(kv_layout)
+    _check_pos_encoding_mode(pos_encoding_mode)
+    _check_kv_layout(kv_layout)
     tmp = _get_cache_buf("single_prefill_with_kv_cache_tmp", 32 * 1024 * 1024, q.device)
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
@@ -334,8 +334,8 @@ def single_prefill_with_kv_cache_return_lse(
     not equal to ``num_kv_heads``, the function will use
     `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
     """
-    check_pos_encoding_mode(pos_encoding_mode)
-    check_kv_layout(kv_layout)
+    _check_pos_encoding_mode(pos_encoding_mode)
+    _check_kv_layout(kv_layout)
     tmp = _get_cache_buf(
         "single_prefill_with_kv_cache_return_lse_tmp", 8 * 1024 * 1024, q.device
     )
@@ -452,7 +452,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
     ...     [1, 7, 14, 4, 3, 1, 16], dtype=torch.int32, device="cuda:0"
     ... )
     >>> q_at_layer = torch.randn(num_layers, nnz_qo, num_qo_heads, head_dim).half().to("cuda:0")
-    >>> kv_data_at_layer = torch.randn(
+    >>> kv_cache_at_layer = torch.randn(
     ...     num_layers, max_num_pages, 2, page_size, num_kv_heads, head_dim, dtype=torch.float16, device="cuda:0"
     ... )
     >>> # create auxiliary data structures for batch prefill attention
@@ -469,10 +469,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
     >>> outputs = []
     >>> for i in range(num_layers):
     ...     q = q_at_layer[i]
-    ...     kv_data = kv_data_at_layer[i]
+    ...     kv_cache = kv_cache_at_layer[i]
     ...     # compute batch prefill attention, reuse auxiliary data structures
     ...     o = prefill_wrapper.forward(
-    ...         q, kv_data, causal=True
+    ...         q, kv_cache, causal=True
     ...     )
     ...     outputs.append(o)
     ...
@@ -507,10 +507,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
     >>> outputs_custom_mask = []
     >>> for i in range(num_layers):
     ...     q = q_at_layer[i]
-    ...     kv_data = kv_data_at_layer[i]
+    ...     kv_cache = kv_cache_at_layer[i]
     ...     # compute batch prefill attention, reuse auxiliary data structures
     ...     o_custom = prefill_wrapper.forward(
-    ...         q, kv_data
+    ...         q, kv_cache
     ...     )
     ...     assert torch.allclose(o_custom, outputs[i], rtol=1e-3, atol=1e-3)
     ...
@@ -588,7 +588,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             This argument is only effective when ``use_cuda_graph`` is ``True`` and the custom
             mask will be used in attention computation.
         """
-        check_kv_layout(kv_layout)
+        _check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
         self._workspace_buffer = workspace_buffer
         self._wrapper = _kernels.BatchPrefillWithPagedKVCachePyTorchWrapper(
@@ -801,7 +801,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
     def forward(
         self,
         q: torch.Tensor,
-        paged_kv_data: torch.Tensor,
+        paged_kv_cache: torch.Tensor,
         causal: bool = True,
         pos_encoding_mode: str = "NONE",
         allow_fp16_qk_reduction: bool = False,
@@ -816,7 +816,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         ----------
         q : torch.Tensor
             The query tensor, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``
-        paged_kv_data : torch.Tensor
+        paged_kv_cache : torch.Tensor
             A 5-D tensor of the reserved paged kv-cache data, shape:
             ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]``
             if :attr:`kv_layout` is ``NHD``, or
@@ -853,7 +853,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         torch.Tensor
             The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
         """
-        check_pos_encoding_mode(pos_encoding_mode)
+        _check_pos_encoding_mode(pos_encoding_mode)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         if sm_scale is None:
@@ -862,20 +862,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
-        if is_float8(q):
-            logging.warning(
-                "Our current prefill kernel implementation needs f16 input, the f8 inputs "
-                " are casted to f16, which could result in performance degradation."
-            )
-            q = q.to(torch.float16)
-            paged_kv_data = paged_kv_data.to(torch.float16)
 
-        paged_kv_data = expand_5d(paged_kv_data, self._kv_layout)
         if self._custom_mask_buf is None:
             return self._wrapper.forward(
                 q,
                 self._qo_indptr_buf,
-                paged_kv_data,
+                *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
                 self._paged_kv_indptr_buf,
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,
@@ -892,7 +884,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             return self._wrapper.forward_custom_mask(
                 q,
                 self._qo_indptr_buf,
-                paged_kv_data,
+                *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
                 self._paged_kv_indptr_buf,
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,
@@ -910,7 +902,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
     def forward_return_lse(
         self,
         q: torch.Tensor,
-        paged_kv_data: torch.Tensor,
+        paged_kv_cache: torch.Tensor,
         causal: bool = True,
         pos_encoding_mode: str = "NONE",
         allow_fp16_qk_reduction: bool = False,
@@ -925,7 +917,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         ----------
         q : torch.Tensor
             The query tensor, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``
-        paged_kv_data : torch.Tensor
+        paged_kv_cache : torch.Tensor
             A 5-D tensor of the reserved paged kv-cache data, shape:
             ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]``
             if :attr:`kv_layout` is ``NHD``, or
@@ -963,7 +955,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The logsumexp of attention output, shape:
             ``[qo_indptr[-1], num_qo_heads, head_dim]``.
         """
-        check_pos_encoding_mode(pos_encoding_mode)
+        _check_pos_encoding_mode(pos_encoding_mode)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         if sm_scale is None:
@@ -972,20 +964,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
-        if is_float8(q):
-            logging.warning(
-                "Our current prefill kernel implementation needs f16 input, the f8 inputs "
-                " are casted to f16, which could result in performance degradation."
-            )
-            q = q.to(torch.float16)
-            paged_kv_data = paged_kv_data.to(torch.float16)
 
-        paged_kv_data = expand_5d(paged_kv_data, self._kv_layout)
         if self._custom_mask_buf is None:
             return self._wrapper.forward(
                 q,
                 self._qo_indptr_buf,
-                paged_kv_data,
+                *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
                 self._paged_kv_indptr_buf,
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,
@@ -1002,7 +986,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             return self._wrapper.forward(
                 q,
                 self._qo_indptr_buf,
-                paged_kv_data,
+                *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
                 self._paged_kv_indptr_buf,
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,
@@ -1172,7 +1156,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             This argument is only effective when ``use_cuda_graph`` is ``True`` and custom mask
             will be used in attention computation.
         """
-        check_kv_layout(kv_layout)
+        _check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
         self._workspace_buffer = workspace_buffer
         self._wrapper = _kernels.BatchPrefillWithRaggedKVCachePyTorchWrapper(
@@ -1399,7 +1383,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         torch.Tensor
             The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
         """
-        check_pos_encoding_mode(pos_encoding_mode)
+        _check_pos_encoding_mode(pos_encoding_mode)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         if sm_scale is None:
@@ -1506,7 +1490,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The logsumexp of attention output, shape:
             ``[qo_indptr[-1], num_qo_heads, head_dim]``.
         """
-        check_pos_encoding_mode(pos_encoding_mode)
+        _check_pos_encoding_mode(pos_encoding_mode)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         if sm_scale is None:

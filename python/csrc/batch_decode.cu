@@ -113,10 +113,10 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
   CHECK_INPUT(q);
   bool paged_kv_defined = paged_kv_cache.has_value();
   if (paged_kv_defined) {
-    CHECK_INPUT(*paged_kv_cache);
+    CHECK_INPUT(paged_kv_cache.value());
   } else {
-    CHECK_INPUT(*paged_k_cache);
-    CHECK_INPUT(*paged_v_cache);
+    CHECK_INPUT(paged_k_cache.value());
+    CHECK_INPUT(paged_v_cache.value());
   }
   CHECK_INPUT(paged_kv_indptr);
   CHECK_INPUT(paged_kv_indices);
@@ -138,12 +138,12 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
   if (paged_kv_defined) {
     // (num_max_pages, 2, H_kv, page_size, head_dim) for HND
     // (num_max_pages, 2, page_size, H_kv, head_dim) for NHD
-    CHECK_DIM(5, *paged_kv_cache);
+    CHECK_DIM(5, paged_kv_cache.value());
   } else {
     // (num_max_pages, H_kv, page_size, head_dim) for HND
     // (num_max_pages, page_size, H_kv, head_dim) for NHD
-    CHECK_DIM(4, *paged_k_cache);
-    CHECK_DIM(4, *paged_v_cache);
+    CHECK_DIM(4, paged_k_cache.value());
+    CHECK_DIM(4, paged_v_cache.value());
   }
   int64_t batch_size = q.size(0);
   int64_t num_qo_heads = q.size(1);
@@ -191,8 +191,8 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
 
   auto q_scalar_type = q.scalar_type();
   auto kv_scalar_type =
-      paged_kv_defined ? paged_kv_cache.scalar_type() : paged_k_cache.scalar_type();
-
+      paged_kv_defined ? paged_kv_cache->scalar_type() : paged_k_cache->scalar_type();
+  
   if (q_scalar_type == kv_scalar_type) {
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q_scalar_type, qkv_type, [&] {
       return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
