@@ -122,6 +122,48 @@ struct paged_kv_t {
    * \param head_dim The dimension of each head
    * \param batch_size The batch size
    * \param layout The layout of last 3 dimensions in KV-Cache.
+   * \param kv_data The flattened key-value cache
+   * \param k_data The flattened key cache
+   * \param v_data The flattened value cache
+   * \param indices The page indices array
+   * \param indptr The page indptr array
+   * \param last_page_len The offset of the last page for each request in the batch
+   * \param rope_pos_offset The start position of each request in the batch.
+   * \note This constructor should only be used when page_storage == kIndices
+   */
+  __host__ __forceinline__ paged_kv_t(uint32_t num_heads, uint32_t page_size, uint32_t head_dim,
+                                      uint32_t batch_size, QKVLayout layout, DType* kv_data, DType* k_data,
+                                      DType* v_data, IdType* indices, IdType* indptr,
+                                      IdType* last_page_len, IdType* rope_pos_offset = nullptr)
+      : num_heads(num_heads),
+        page_size(page_size),
+        head_dim(head_dim),
+        batch_size(batch_size),
+        indices(indices),
+        indptr(indptr),
+        last_page_len(last_page_len),
+        rope_pos_offset(rope_pos_offset) {
+    bool kv_defined = kv_data != nullptr;
+    if (kv_defined) {
+      stride_page = 2 * num_heads * page_size * head_dim;
+      k_data = kv_data;
+      v_data = kv_data + num_heads * page_size * head_dim;
+    } else {
+      stride_page = num_heads * page_size * head_dim;
+      k_data = k_data;
+      v_data = v_data;
+    }
+    stride_n = layout == QKVLayout::kHND ? head_dim : num_heads * head_dim;
+    stride_h = layout == QKVLayout::kHND ? page_size * head_dim : head_dim;
+  }
+
+  /*!
+   * \brief Construct a paged key-value cache
+   * \param num_heads The number of heads
+   * \param page_size The size of each page
+   * \param head_dim The dimension of each head
+   * \param batch_size The batch size
+   * \param layout The layout of last 3 dimensions in KV-Cache.
    * \param k_data The flattened key cache
    * \param v_data The flattened value cache
    * \param indices The page indices array

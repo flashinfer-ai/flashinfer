@@ -105,17 +105,29 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::UpdatePageLockedBufferSize(
 }
 
 std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
-    torch::Tensor q, torch::Tensor paged_kv_data, torch::Tensor paged_kv_indptr,
-    torch::Tensor paged_kv_indices, torch::Tensor paged_kv_last_page_len,
-    unsigned int pos_encoding_mode, float logits_soft_cap, float sm_scale, float rope_scale,
-    float rope_theta, bool return_lse) {
+    torch::Tensor q, std::optional<torch::Tensor> paged_kv_cache,
+    std::optional<torch::Tensor> paged_k_cache, std::optional<torch::Tensor> paged_v_cache,
+    torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
+    torch::Tensor paged_kv_last_page_len, unsigned int pos_encoding_mode, float logits_soft_cap,
+    float sm_scale, float rope_scale, float rope_theta, bool return_lse) {
   CHECK_INPUT(q);
-  CHECK_INPUT(paged_kv_data);
+  bool paged_kv_defined = paged_kv_cache.has_value();
+  if (paged_kv_defined) {
+    CHECK_INPUT(*paged_kv_cache);
+  } else {
+    CHECK_INPUT(*paged_k_cache);
+    CHECK_INPUT(*paged_v_cache);
+  }
   CHECK_INPUT(paged_kv_indptr);
   CHECK_INPUT(paged_kv_indices);
   CHECK_INPUT(paged_kv_last_page_len);
   auto device = q.device();
-  CHECK_EQ(paged_kv_data.device(), device);
+  if (paged_kv_defined) {
+    CHECK_EQ(paged_kv_cache->device(), device);
+  } else {
+    CHECK_EQ(paged_k_cache->device(), device);
+    CHECK_EQ(paged_v_cache->device(), device);
+  }
   CHECK_EQ(paged_kv_indices.device(), device);
   CHECK_EQ(paged_kv_indptr.device(), device);
   CHECK_EQ(paged_kv_last_page_len.device(), device);
@@ -123,22 +135,41 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
   CHECK_DIM(1, paged_kv_last_page_len);  // (B,)
   CHECK_DIM(1, paged_kv_indptr);         // (B+1,)
   CHECK_DIM(1, paged_kv_indices);        // (nnz,)
-  // (num_max_pages, 2, H_kv, page_size, head_dim) for HND
-  // (num_max_pages, 2, page_size, H_kv, head_dim) for NHD
-  CHECK_DIM(5, paged_kv_data);
+  if (paged_kv_defined) {
+    // (num_max_pages, 2, H_kv, page_size, head_dim) for HND
+    // (num_max_pages, 2, page_size, H_kv, head_dim) for NHD
+    CHECK_DIM(5, *paged_kv_cache);
+  } else {
+    // (num_max_pages, H_kv, page_size, head_dim) for HND
+    // (num_max_pages, page_size, H_kv, head_dim) for NHD
+    CHECK_DIM(4, *paged_k_cache);
+    CHECK_DIM(4, *paged_v_cache);
+  }
   int64_t batch_size = q.size(0);
   int64_t num_qo_heads = q.size(1);
   int64_t head_dim = q.size(2);
   int64_t num_kv_heads, page_size;
-  if (kv_layout_ == QKVLayout::kHND) {
-    num_kv_heads = paged_kv_data.size(2);
-    page_size = paged_kv_data.size(3);
+  if (paged_kv_defined) {
+    CHECK_EQ(paged_kv_cache->size(1), 2);
+    CHECK_EQ(paged_kv_cache->size(4), head_dim);
+    if (kv_layout_ == QKVLayout::kHND) {
+      num_kv_heads = paged_kv_cache->size(2);
+      page_size = paged_kv_cache->size(3);
+    } else {
+      page_size = paged_kv_cache->size(2);
+      num_kv_heads = paged_kv_cache->size(3);
+    }
   } else {
-    page_size = paged_kv_data.size(2);
-    num_kv_heads = paged_kv_data.size(3);
+    CHECK_EQ(paged_k_cache->size(3), head_dim);
+    CHECK_EQ(paged_v_cache->size(3), head_dim);
+    if (kv_layout_ == QKVLayout::kHND) {
+      num_kv_heads = paged_k_cache->size(1);
+      page_size = paged_k_cache->size(2);
+    } else {
+      page_size = paged_k_cache->size(1);
+      num_kv_heads = paged_k_cache->size(2);
+    }
   }
-  CHECK_EQ(paged_kv_data.size(1), 2);
-  CHECK_EQ(paged_kv_data.size(4), head_dim);
   CHECK_GE(paged_kv_indptr.size(0), batch_size + 1);
   CHECK_GE(paged_kv_last_page_len.size(0), batch_size);
   // TODO(Zihao): support dispatching to different data types
@@ -159,7 +190,8 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
       logits_soft_cap > 0.f ? LogitsPostHook::kSoftCap : LogitsPostHook::kNone;
 
   auto q_scalar_type = q.scalar_type();
-  auto kv_scalar_type = paged_kv_data.scalar_type();
+  auto kv_scalar_type =
+      paged_kv_defined ? paged_kv_cache.scalar_type() : paged_k_cache.scalar_type();
 
   if (q_scalar_type == kv_scalar_type) {
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q_scalar_type, qkv_type, [&] {
@@ -169,7 +201,12 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
               PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
                 paged_kv_t<PageStorage::kIndices, qkv_type, int32_t> paged_kv(
                     num_kv_heads, page_size, head_dim, batch_size, kv_layout_,
-                    static_cast<qkv_type*>(paged_kv_data.data_ptr()),
+                    static_cast<qkv_type*>(paged_kv_cache.has_value() ? paged_kv_cache->data_ptr()
+                                                                      : nullptr),
+                    static_cast<qkv_type*>(paged_k_cache.has_value() ? paged_k_cache->data_ptr()
+                                                                     : nullptr),
+                    static_cast<qkv_type*>(paged_v_cache.has_value() ? paged_v_cache->data_ptr()
+                                                                     : nullptr),
                     static_cast<int32_t*>(paged_kv_indices.data_ptr()),
                     static_cast<int32_t*>(paged_kv_indptr.data_ptr()),
                     static_cast<int32_t*>(paged_kv_last_page_len.data_ptr()));
@@ -197,7 +234,12 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
                 PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
                   paged_kv_t<PageStorage::kIndices, kv_type, int32_t> paged_kv(
                       num_kv_heads, page_size, head_dim, batch_size, kv_layout_,
-                      static_cast<kv_type*>(paged_kv_data.data_ptr()),
+                      static_cast<kv_type*>(paged_kv_cache.has_value() ? paged_kv_cache->data_ptr()
+                                                                       : nullptr),
+                      static_cast<kv_type*>(paged_k_cache.has_value() ? paged_k_cache->data_ptr()
+                                                                      : nullptr),
+                      static_cast<kv_type*>(paged_v_cache.has_value() ? paged_v_cache->data_ptr()
+                                                                      : nullptr),
                       static_cast<int32_t*>(paged_kv_indices.data_ptr()),
                       static_cast<int32_t*>(paged_kv_indptr.data_ptr()),
                       static_cast<int32_t*>(paged_kv_last_page_len.data_ptr()));
