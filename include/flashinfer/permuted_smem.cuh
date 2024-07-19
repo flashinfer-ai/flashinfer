@@ -63,8 +63,10 @@ struct smem_t {
   template <uint32_t step_size>
   static __device__ __forceinline__ uint32_t advance_offset_by_column(uint32_t offset,
                                                                       uint32_t step_idx) {
-    static_assert(step_size == 2 || step_size == 4 || step_size % 8 == 0, "Unsupported step size");
-    if constexpr (step_size == 2) {
+    static_assert(step_size == 1 || step_size == 2 || step_size == 4 || step_size % 8 == 0, "Unsupported step size");
+    if constexpr (step_size == 1) {
+      return (offset ^ (0x1 + 0x2 * (step_idx % 2 == 1) + 0x4 * (step_idx % 4 == 3))) + (step_idx % 8 == 7) * 8;
+    } else if constexpr (step_size == 2) {
       return (offset ^ (0x2 + (0x4 * (step_idx % 2 == 1)))) + (step_idx % 4 == 3) * 8;
     } else if constexpr (step_size == 4) {
       return (offset ^ 0x4) + (step_idx % 2 == 1) * 8;
@@ -85,9 +87,38 @@ struct smem_t {
     }
   }
 
+  template<typename dtype = half>
   __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t offset, uint32_t* R) {
     b128_t* smem_ptr = base + offset;
     mma::ldmatrix_m8n8x4(R, smem_ptr);
+
+    if constexpr (std::is_same<dtype, __nv_fp8_e4m3>::value ||
+        std::is_same<dtype, __nv_fp8_e5m2>::value) {
+      // Convert fp8 fragments to fp16
+      constexpr __nv_fp8_interpretation_t interp = std::is_same<dtype, __nv_fp8_e4m3>::value ?
+          __nv_fp8_interpretation_t::__NV_E4M3 : __nv_fp8_interpretation_t::__NV_E5M2;
+      constexpr uint32_t FULL_MASK = 0xffffffff;
+
+      uint32_t lane_id = threadIdx.x;
+      uint32_t t_idx_0 = (lane_id & ~0x3) + ((lane_id & 0x2) >> 1);
+      uint32_t t_idx_1 = t_idx_0 + 2;
+      uint32_t shift = (lane_id & 0x1) * 16;
+
+      auto cnv = [](__half2_raw v) -> uint32_t {
+        uint32_t res = v.x;
+        return res | v.y << 16;
+      };
+
+      uint32_t val_0 = __shfl_sync(FULL_MASK, R[0], t_idx_0);
+      uint32_t val_1 = __shfl_sync(FULL_MASK, R[0], t_idx_1);
+      R[0] = cnv(__nv_cvt_fp8x2_to_halfraw2(val_0 >> shift, interp));
+      R[1] = cnv(__nv_cvt_fp8x2_to_halfraw2(val_1 >> shift, interp));
+
+      val_0 = __shfl_sync(FULL_MASK, R[2], t_idx_0);
+      val_1 = __shfl_sync(FULL_MASK, R[2], t_idx_1);
+      R[2] = cnv(__nv_cvt_fp8x2_to_halfraw2(val_0 >> shift, interp));
+      R[3] = cnv(__nv_cvt_fp8x2_to_halfraw2(val_1 >> shift, interp));
+    }
   }
 
   __device__ __forceinline__ void stmatrix_m8n8x4(uint32_t offset, uint32_t* R) {
@@ -95,9 +126,43 @@ struct smem_t {
     mma::stmatrix_m8n8x4(R, smem_ptr);
   }
 
+  template<typename dtype = half>
   __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t offset, uint32_t* R) {
     b128_t* smem_ptr = base + offset;
     mma::ldmatrix_m8n8x4_trans(R, smem_ptr);
+
+    if constexpr (std::is_same<dtype, __nv_fp8_e4m3>::value ||
+            std::is_same<dtype, __nv_fp8_e5m2>::value) {
+      // Convert fp8 fragments to fp16
+      constexpr __nv_fp8_interpretation_t interp = std::is_same<dtype, __nv_fp8_e4m3>::value ?
+          __nv_fp8_interpretation_t::__NV_E4M3 : __nv_fp8_interpretation_t::__NV_E5M2;
+
+      constexpr uint32_t FULL_MASK = 0xffffffff;
+
+      uint32_t lane_id = threadIdx.x;
+      uint32_t t_idx_0 = (lane_id & 0x3) + ((lane_id & ~0x7) >> 1);
+      uint32_t t_idx_1 = t_idx_0 + 16;
+      uint32_t shift = (lane_id & 0x4) * 4;
+
+      auto cnv = [](__half2_raw v) -> uint32_t {
+        uint32_t res = v.x;
+        return res | v.y << 16;
+      };
+
+      auto shffle_acbd = [](uint32_t v) -> uint32_t {
+        return (v & 0xff0000ff) + ((v >> 8) & 0x0000ff00) + ((v << 8) & 0x00ff0000);
+      };
+
+      uint32_t val_0 = shffle_acbd(__shfl_sync(FULL_MASK, R[0], t_idx_0));
+      uint32_t val_1 = shffle_acbd(__shfl_sync(FULL_MASK, R[0], t_idx_1));
+      R[0] = cnv(__nv_cvt_fp8x2_to_halfraw2(val_0 >> shift, interp));
+      R[2] = cnv(__nv_cvt_fp8x2_to_halfraw2(val_1 >> shift, interp));
+
+      val_0 = shffle_acbd(__shfl_sync(FULL_MASK, R[1], t_idx_0));
+      val_1 = shffle_acbd(__shfl_sync(FULL_MASK, R[1], t_idx_1));
+      R[1] = cnv(__nv_cvt_fp8x2_to_halfraw2(val_0 >> shift, interp));
+      R[3] = cnv(__nv_cvt_fp8x2_to_halfraw2(val_1 >> shift, interp));
+    }
   }
 
   template <cp_async::SharedMemFillMode fill_mode, typename T>

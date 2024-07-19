@@ -51,12 +51,12 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
 
 template <PageStorage page_storage, WarpLayout WARP_LAYOUT, uint32_t HEAD_DIM,
           LogitsPostHook LOGITS_POST_HOOK, QKVLayout kv_layout, PosEncodingMode pos_encoding_mode,
-          bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut,
-          typename IdType>
+          bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename DTypeQ, typename DTypeKV,
+          typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(
-    DTypeIn* q, IdType* request_indices, IdType* q_tile_indices, IdType* kv_tile_indices,
+    DTypeQ* q, IdType* request_indices, IdType* q_tile_indices, IdType* kv_tile_indices,
     IdType* q_indptr, IdType* q_offset,
-    paged_kv_t<page_storage, kv_layout, DTypeIn, IdType> paged_kv, uint8_t* custom_mask,
+    paged_kv_t<page_storage, kv_layout, DTypeKV, IdType> paged_kv, uint8_t* custom_mask,
     IdType* qk_indptr, IdType* o_indptr, DTypeOut* o, DTypeOut* tmp_v, float* tmp_s, float* lse,
     IdType* merge_indptr, bool* block_valid_mask, IdType* kv_chunk_size_ptr,
     uint32_t total_num_rows, uint32_t num_qo_heads, uint32_t padded_batch_size,
@@ -64,10 +64,10 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
 
 template <PageStorage PAGE_STORAGE, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK,
           QKVLayout KV_LAYOUT, PosEncodingMode POS_ENCODING_MODE, bool ALLOW_FP16_QK_REDUCTION,
-          MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
+          MaskMode MASK_MODE, typename DTypeQ, typename DTypeKV, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
-    BatchPrefillHandler* handler, DTypeIn* q, IdType* q_indptr, IdType* q_offset,
-    paged_kv_t<PAGE_STORAGE, KV_LAYOUT, DTypeIn, IdType> paged_kv, uint8_t* custom_mask,
+    BatchPrefillHandler* handler, DTypeQ* q, IdType* q_indptr, IdType* q_offset,
+    paged_kv_t<PAGE_STORAGE, KV_LAYOUT, DTypeKV, IdType> paged_kv, uint8_t* custom_mask,
     IdType* qk_indptr, DTypeOut* o, float* lse, uint32_t num_qo_heads, float logits_soft_cap,
     float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream) {
   DTypeOut* tmp_v = nullptr;
@@ -101,7 +101,7 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
   DISPATCH_WARP_LAYOUT(warp_layout, WARP_LAYOUT, {
     return BatchPrefillWithPagedKVCacheDispatched<
         PAGE_STORAGE, WARP_LAYOUT, HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT, POS_ENCODING_MODE,
-        ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeOut, IdType>(
+        ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeQ, DTypeKV, DTypeOut, IdType>(
         q, request_indices, qo_tile_indices, kv_tile_indices, q_indptr, q_offset, paged_kv,
         custom_mask, qk_indptr, o_indptr, o, tmp_v, tmp_s, lse, merge_indptr, block_valid_mask,
         kv_chunk_size_ptr, total_num_rows, num_qo_heads, padded_batch_size, logits_soft_cap,

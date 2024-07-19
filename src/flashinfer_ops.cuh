@@ -133,11 +133,11 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
   return cudaSuccess;
 }
 
-template <PageStorage PAGE_STORAGE, QKVLayout KV_LAYOUT, typename DTypeIn, typename DTypeOut,
-          typename IdType>
+template <PageStorage PAGE_STORAGE, QKVLayout KV_LAYOUT, typename DTypeQ, typename DTypeKV,
+          typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheWrapper(
-    BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, IdType* q_offset,
-    paged_kv_t<PAGE_STORAGE, KV_LAYOUT, DTypeIn, IdType> paged_kv, DTypeOut* o, float* lse,
+    BatchPrefillHandler* handler, DTypeQ* q, IdType* qo_indptr, IdType* q_offset,
+    paged_kv_t<PAGE_STORAGE, KV_LAYOUT, DTypeKV, IdType> paged_kv, DTypeOut* o, float* lse,
     uint32_t num_qo_heads, bool causal = true,
     PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
     bool allow_fp16_qk_reduction = false, std::optional<float> maybe_sm_scale = std::nullopt,
@@ -155,7 +155,7 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
               {DISPATCH_allow_fp16_qk_reduction(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
                 return BatchPrefillWithPagedKVCacheWrapperDispatched<
                     PAGE_STORAGE, HEAD_DIM, LogitsPostHook::kNone, KV_LAYOUT, POS_ENCODING_MODE,
-                    ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeOut, IdType>(
+                    ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeQ, DTypeKV, DTypeOut, IdType>(
                     handler, q, qo_indptr, q_offset, paged_kv,
                     /*custom_mask=*/nullptr,
                     /*qk_indptr=*/nullptr, o, lse, num_qo_heads, /*logits_soft_cap=*/0.f, sm_scale,
