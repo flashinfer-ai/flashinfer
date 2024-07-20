@@ -132,8 +132,8 @@ struct paged_kv_t {
    * \note This constructor should only be used when page_storage == kIndices
    */
   __host__ __forceinline__ paged_kv_t(uint32_t num_heads, uint32_t page_size, uint32_t head_dim,
-                                      uint32_t batch_size, QKVLayout layout, DType* kv_data, DType* k_data,
-                                      DType* v_data, IdType* indices, IdType* indptr,
+                                      uint32_t batch_size, QKVLayout layout, DType* kv_data,
+                                      DType* k_data, DType* v_data, IdType* indices, IdType* indptr,
                                       IdType* last_page_len, IdType* rope_pos_offset = nullptr)
       : num_heads(num_heads),
         page_size(page_size),
@@ -146,12 +146,12 @@ struct paged_kv_t {
     bool kv_defined = kv_data != nullptr;
     if (kv_defined) {
       stride_page = 2 * num_heads * page_size * head_dim;
-      k_data = kv_data;
-      v_data = kv_data + num_heads * page_size * head_dim;
+      this->k_data = kv_data;
+      this->v_data = kv_data + num_heads * page_size * head_dim;
     } else {
       stride_page = num_heads * page_size * head_dim;
-      k_data = k_data;
-      v_data = v_data;
+      this->k_data = k_data;
+      this->v_data = v_data;
     }
     stride_n = layout == QKVLayout::kHND ? head_dim : num_heads * head_dim;
     stride_h = layout == QKVLayout::kHND ? page_size * head_dim : head_dim;

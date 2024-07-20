@@ -552,7 +552,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         use_cuda_graph : bool
             Whether to enable CUDA graph capture for the prefill kernels, if enabled, the
-            auxiliary data structures will be stored in provided buffers. The ``batch_size``
+            auxiliary data structures will be stored as provided buffers. The ``batch_size``
             cannot change during the lifecycle of this wrapper when CUDAGraph is enabled.
 
         qo_indptr_buf : Optional[torch.Tensor]
@@ -816,12 +816,20 @@ class BatchPrefillWithPagedKVCacheWrapper:
         ----------
         q : torch.Tensor
             The query tensor, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``
-        paged_kv_cache : torch.Tensor
-            A 5-D tensor of the reserved paged kv-cache data, shape:
-            ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]``
-            if :attr:`kv_layout` is ``NHD``, or
-            ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]``
-            if :attr:`kv_layout` is ``HND``.
+        paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+            The paged KV-Cache stored as a tuple of tensors or a single tensor:
+
+            * a tuple ``(k_cache, v_cache)`` of 4-D tensors, each with shape:
+              ``[max_num_pages, page_size, num_kv_heads, head_dim]`` if :attr:`kv_layout` is ``NHD``,
+              and ``[max_num_pages, num_kv_heads, page_size, head_dim]`` if :attr:`kv_layout` is ``HND``.
+
+            * a single 5-D tensor with shape:
+              ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
+              :attr:`kv_layout` is ``NHD``, and
+              ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
+              :attr:`kv_layout` is ``NHD``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
+              ``paged_kv_cache[:, 1]`` is the value-cache.
+
         causal : bool
             Whether to apply causal mask to the attention matrix.
             This is only effective when :attr:`custom_mask` is not provided in
@@ -917,12 +925,20 @@ class BatchPrefillWithPagedKVCacheWrapper:
         ----------
         q : torch.Tensor
             The query tensor, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``
-        paged_kv_cache : torch.Tensor
-            A 5-D tensor of the reserved paged kv-cache data, shape:
-            ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]``
-            if :attr:`kv_layout` is ``NHD``, or
-            ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
-            :attr:`kv_layout` is ``HND``.
+        paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+            The paged KV-Cache stored as a tuple of tensors or a single tensor:
+
+            * a tuple ``(k_cache, v_cache)`` of 4-D tensors, each with shape:
+              ``[max_num_pages, page_size, num_kv_heads, head_dim]`` if :attr:`kv_layout` is ``NHD``,
+              and ``[max_num_pages, num_kv_heads, page_size, head_dim]`` if :attr:`kv_layout` is ``HND``.
+
+            * a single 5-D tensor with shape:
+              ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
+              :attr:`kv_layout` is ``NHD``, and
+              ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
+              :attr:`kv_layout` is ``NHD``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
+              ``paged_kv_cache[:, 1]`` is the value-cache.
+
         causal : bool
             Whether to apply causal mask to the attention matrix.
         pos_encoding_mode : str
@@ -1132,7 +1148,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         use_cuda_graph : bool
             Whether to enable CUDA graph capture for the prefill kernels, if enabled, the
-            auxiliary data structures will be stored in the provided buffers.
+            auxiliary data structures will be stored as the provided buffers.
 
         qo_indptr_buf : Optional[torch.Tensor]
             The user reserved GPU buffer to store the ``qo_indptr`` array, the size of the buffer
@@ -1342,7 +1358,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
     ):
-        r"""Compute batch prefill/append attention between query and kv-cache stored in
+        r"""Compute batch prefill/append attention between query and kv-cache stored as
         ragged tensor.
 
         Parameters
@@ -1447,7 +1463,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
     ):
-        r"""Compute batch prefill/append attention between query and kv-cache stored in
+        r"""Compute batch prefill/append attention between query and kv-cache stored as
         ragged tensor. Return attention output and logsumexp of attention scores.
 
         Parameters

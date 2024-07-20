@@ -192,7 +192,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
   auto q_scalar_type = q.scalar_type();
   auto kv_scalar_type =
       paged_kv_defined ? paged_kv_cache->scalar_type() : paged_k_cache->scalar_type();
-  
+
   if (q_scalar_type == kv_scalar_type) {
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q_scalar_type, qkv_type, [&] {
       return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {

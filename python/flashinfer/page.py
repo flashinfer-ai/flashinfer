@@ -54,11 +54,19 @@ def append_paged_kv_cache(
     append_indptr : torch.Tensor
         The indptr tensor of the key-value pairs to append, shape: ``[batch_size + 1]``.
     paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-        The 5-D tensor of the paged key-value cache, shape:
-        ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
-        :attr:`kv_layout` is ``NHD``, or
-        ``[max_num_pages, 2, num_kv_heads, page_size, num_kv_heads]`` if
-        :attr:`kv_layout` is ``NHD``.
+        The paged KV-Cache stored as a tuple of tensors or a single tensor:
+
+        * a tuple ``(k_cache, v_cache)`` of 4-D tensors, each with shape:
+          ``[max_num_pages, page_size, num_kv_heads, head_dim]`` if :attr:`kv_layout` is ``NHD``,
+          and ``[max_num_pages, num_kv_heads, page_size, head_dim]`` if :attr:`kv_layout` is ``HND``.
+
+        * a single 5-D tensor with shape:
+          ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
+          :attr:`kv_layout` is ``NHD``, and
+          ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
+          :attr:`kv_layout` is ``NHD``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
+          ``paged_kv_cache[:, 1]`` is the value-cache.
+
     kv_indices : torch.Tensor
         The page indices of the paged kv-cache, shape: ``[kv_indptr[-1]]``.
     kv_indptr : torch.Tensor

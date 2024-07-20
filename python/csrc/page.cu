@@ -122,6 +122,5 @@ void append_paged_kv_cache(torch::Tensor append_key, torch::Tensor append_value,
     return true;
   });
 
-  TORCH_CHECK(success, "AppendPagedKVCache failed to dispatch with dtype ",
-              kv_scalar_dtype);
+  TORCH_CHECK(success, "AppendPagedKVCache failed to dispatch with dtype ", kv_scalar_dtype);
 }

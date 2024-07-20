@@ -119,14 +119,23 @@ The overall ``kv_indptr`` array (with length ``num_requests+1``) can be computed
 The overall ``kv_page_indices`` array (with length ``kv_indptr[-1]``) is the concatenation of all requests' ``page_indices``.
 The overall ``kv_last_page_lens`` array (with length ``num_requests``) is the concatenation of all requests' ``last_page_length``.
 
-The ``kv_data`` tensor is a 5-D tensor with shape (in ``NHD`` layout):
+The ``kv_data`` tensor could either be a single 5-D tensor or a tuple of 4-D tensors,
+when stored in a single tensor, ``kv_data`` has shape:
 
-.. code::
+.. code:: python
 
-  (max_num_pages, 2, page_size, num_heads, head_dim)
+  (max_num_pages, 2, page_size, num_heads, head_dim) # NHD layout
+  (max_num_pages, 2, num_heads, page_size, head_dim) # HND layout
+
+when stored in a tuple of tensors, ``kv_data = (k_data, v_data)``, and each one of them has shape:
+
+.. code:: python
+
+  (max_num_pages, page_size, num_heads, head_dim) # NHD layout
+  (max_num_pages, num_heads, page_size, head_dim) # HND layout
 
 where ``max_num_pages`` is the maximum number of pages used by all requests, ``page_size`` is the number of tokens
-we fit into each page. ``2`` is the number of slots in each page (first one for keys, the second one for values).
+we fit into each page. ``2`` in single tensor storage means K/V (first one for keys, the second one for values).
 
 FlashInfer APIs
 ~~~~~~~~~~~~~~~

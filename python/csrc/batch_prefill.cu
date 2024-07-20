@@ -124,13 +124,14 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
       num_kv_heads = paged_kv_cache->size(3);
     }
   } else {
-    CHECK_EQ(paged_kv_cache->size(3), head_dim);
+    CHECK_EQ(paged_k_cache->size(3), head_dim);
+    CHECK_EQ(paged_v_cache->size(3), head_dim);
     if (kv_layout_ == QKVLayout::kHND) {
-      num_kv_heads = paged_kv_cache->size(1);
-      page_size = paged_kv_cache->size(2);
+      num_kv_heads = paged_k_cache->size(1);
+      page_size = paged_k_cache->size(2);
     } else {
-      page_size = paged_kv_cache->size(1);
-      num_kv_heads = paged_kv_cache->size(2);
+      page_size = paged_k_cache->size(1);
+      num_kv_heads = paged_k_cache->size(2);
     }
   }
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);

@@ -22,7 +22,6 @@ from .prefill import _compute_page_qk_indptr
 from .quantization import segment_packbits
 from .utils import (
     _check_pos_encoding_mode,
-    _check_kv_layout,
     _unpack_paged_kv_cache,
     is_float8,
     PosEncodingMode,
@@ -42,15 +41,81 @@ except ImportError as e:
         raise e
 
 
+def convert_bsr_mask_layout(mask: torch.Tensor, indptr: torch.Tensor):
+    r"""Convert mask from BSR data layout to flashinfer's flattened mask layout.
+
+    Parameters
+    ----------
+    mask : torch.Tensor
+        A boolean mask tensor with shape ``(nnz, R, C)``.
+    indptr : torch.Tensor
+        The indptr tensor in BSR format.
+
+    Returns
+    -------
+    flattened_mask : torch.Tensor
+        A flattenedd mask tensor with shape ``(nnz * R * C,)``.
+    """
+    nnz, R, C = mask.shape
+    MB = len(indptr) - 1
+    mask_flashinfer = torch.empty((nnz * R * C,), dtype=mask.dtype, device=mask.device)
+    for i in range(MB):
+        mask_flashinfer[indptr[i] * R * C : indptr[i + 1] * R * C] = (
+            mask[indptr[i] : indptr[i + 1]].transpose(0, 1).reshape(-1)
+        )
+    return mask_flashinfer
+
+
 class BlockSparseAttentionWrapper:
+    r"""Wrapper class for attention computation with a block-sparse matrix as attention mask.
+    The definition of block sparse matrix can be found at
+    `bsr_matrix <https://docs.scipy.org/doc/scipy/reference/generated/scipy.sparse.bsr_matrix.html>`_
+    in SciPy.
+
+    This API supports any block size ``(R, C)``.
+
+    Example
+    -------
+    >>> import torch
+    >>> import flashinfer
+    >>> num_qo_heads = 32
+    >>> num_kv_heads = 8
+    >>> head_dim = 128
+    >>> # allocate 128MB workspace buffer
+    >>> workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+    >>> bsr_wrapper = flashinfer.BlockSparseAttentionWrapper(workspace_buffer)
+    >>> # sparse mask: [[0, 0, 1], [1, 0, 1], [0, 1, 1]]
+    >>> M = 3
+    >>> N = 3
+    >>> indptr = torch.tensor([0, 1, 3, 5], dtype=torch.int32, device="cuda:0")
+    >>> indices = torch.tensor([2, 0, 2, 1, 2], dtype=torch.int32, device="cuda:0")
+    >>> bsr_wrapper.begin_forward(
+    ...     indptr,
+    ...     indices,
+    ...     M,
+    ...     N,
+    ...     1, # R(block_rows)=1
+    ...     1, # C(block_columns)=1
+    ...     num_qo_heads,
+    ...     num_kv_heads,
+    ...     head_dim,
+    ... )
+    >>> q = torch.randn((M, num_qo_heads, head_dim), dtype=torch.float16, device="cuda:0")
+    >>> k = torch.randn((N, num_kv_heads, head_dim), dtype=torch.float16, device="cuda:0")
+    >>> v = torch.randn((N, num_kv_heads, head_dim), dtype=torch.float16, device="cuda:0")
+    >>> o = bsr_wrapper.forward(q, k, v)
+    >>> # use dense implementation with attention mask for comparison
+    >>> mask = torch.tensor([[0, 0, 1], [1, 0, 1], [0, 1, 1]], dtype=torch.bool, device="cuda:0")
+    >>> o_ref = flashinfer.single_prefill_with_kv_cache(q, k, v, custom_mask=mask)
+    >>> torch.allclose(o, o_ref)
+    True
+    """
+
     def __init__(
         self,
         workspace_buffer: torch.Tensor,
-        kv_layout: str = "NHD",
     ):
         r"""Constructs of :class:`BlockSparseAttentionWrapper`.
-
-        Warning(Zihao): this is an experimental API and subject to change.
 
         Parameters
         ----------
@@ -58,17 +123,16 @@ class BlockSparseAttentionWrapper:
             The user reserved workspace buffer used to store auxiliary data structures,
             recommended size is 128MB, the device of the workspace buffer should be the
             same as the device of the input tensors.
-
-        kv_layout : str
-            The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
         """
-        _check_kv_layout(kv_layout)
-        self._kv_layout = kv_layout
         self._workspace_buffer = workspace_buffer
         self._wrapper = _kernels.BatchPrefillWithPagedKVCachePyTorchWrapper(
-            TensorLayout[kv_layout].value,
+            TensorLayout["NHD"].value,
             False,  # use_cuda_graph
         )
+        self.R = None
+        self.C = None
+        self.M = None
+        self.N = None
 
     def begin_forward(
         self,
@@ -90,13 +154,16 @@ class BlockSparseAttentionWrapper:
         Parameters
         ----------
         indptr : torch.Tensor
-            The indptr of the block-sparse matrix, shape (MB + 1,), where MB is the number of blocks in the row dimension.
+            The block index pointer of the block-sparse matrix on row dimension, shape ``(MB + 1,)``,
+            where ``MB`` is the number of blocks in the row dimension.
         indices: torch.Tensor
-            The indices of the block-sparse matrix, shape (nnz,), where nnz is the number of non-zero blocks.
+            The block indices of the block-sparse matrix on column dimension, shape ``(nnz,)``, where
+            ``nnz`` is the number of non-zero blocks. The elements in ``indices`` array should be less then ``NB``:
+            the number of blocks in the column dimension.
         M : int
-            The number of rows of the block-sparse matrix, MB = ceil_div(M, R).
+            The number of rows of the block-sparse matrix, ``MB = ceil_div(M, R)``.
         N : int
-            The number of columns of the block-sparse matrix, NB = ceil_div(N, C).
+            The number of columns of the block-sparse matrix, ``NB = N // C``, ``N`` should be divisible by ``C``.
         R : int
             The number of rows in each block.
         C : int
@@ -108,7 +175,7 @@ class BlockSparseAttentionWrapper:
         head_dim : int
             The dimension of each head.
         mask : torch.Tensor, optional
-            The flattened mask tensor, shape (nnz * R * C,), where nnz is the number of non-zero blocks.
+            The mask tensor with shape ``(nnz, R, C,)``, where nnz is the number of non-zero blocks.
             If every block is full, then we don't need to provide the mask tensor.
         packed_mask : torch.Tensor, optional
             The 1D packed mask tensor, if provided, the :attr:`custom_mask` will be ignored.
@@ -124,16 +191,16 @@ class BlockSparseAttentionWrapper:
         is not equal to ``num_kv_heads``, the function will use
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
         """
-        num_rows = len(indptr) - 1
-        qo_indptr_host = R * torch.arange(num_rows + 1, dtype=torch.int32)
+        num_blocks_row = len(indptr) - 1
+        qo_indptr_host = R * torch.arange(num_blocks_row + 1, dtype=torch.int32)
         qo_indptr_host[-1] = M
         self._qo_indptr = qo_indptr_host.to(indptr.device)
         row_empty = indptr[1:] == indptr[:1]
         if indices.max().item() * C > N:
             raise ValueError("indices out of bound")
-        last_block_pos = indices[torch.clamp(indptr[1:], min=1) - 1]
-        last_block_pos.masked_fill_(row_empty, 0)
-        last_block_len = torch.clamp(N - last_block_pos * C, max=C)
+        last_block_len = torch.full(
+            (num_blocks_row,), C, dtype=torch.int32, device=indptr.device
+        )
 
         if mask is not None or packed_mask is not None:
             qk_indptr = _compute_page_qk_indptr(
@@ -143,6 +210,8 @@ class BlockSparseAttentionWrapper:
                 C,  # page_size
             )
         if packed_mask is None and mask is not None:
+            # first convert BSR mask to flashinfer layout
+            mask = convert_bsr_mask_layout(mask, indptr)
             # create packed mask from mask
             packed_mask, qk_indptr = segment_packbits(
                 mask.contiguous().view(-1), qk_indptr, bitorder="little"
@@ -166,11 +235,16 @@ class BlockSparseAttentionWrapper:
             ),
         )
 
+        self.M = M
+        self.N = N
+        self.R = R
+        self.C = C
+
         self._wrapper.begin_forward(
             self._workspace_buffer,
             self._qo_indptr,
             self._paged_kv_indptr_buf,
-            num_rows,
+            num_blocks_row,
             num_qo_heads,
             num_kv_heads,
             head_dim,
@@ -186,11 +260,16 @@ class BlockSparseAttentionWrapper:
         self._paged_kv_last_page_len = None
         self._packed_mask_buf = None
         self._qk_indptr_buf = None
+        self.M = None
+        self.N = None
+        self.R = None
+        self.C = None
 
     def forward(
         self,
         q: torch.Tensor,
-        paged_kv_cache: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
         pos_encoding_mode: str = "NONE",
         allow_fp16_qk_reduction: bool = False,
         logits_soft_cap: Optional[float] = None,
@@ -200,15 +279,14 @@ class BlockSparseAttentionWrapper:
     ):
         r"""Compute block-sparse attention between Q/K/V tensors.
 
-        Warning(Zihao): in the next release, paged_kv_cache will be decoupled into standalone k/v tensors, each
-        with shape (N, num_kv_heads, head_dim).
-
         Parameters
         ----------
         q : torch.Tensor
-            The query tensor, shape (M, num_qo_heads, head_dim).
-        paged_kv_cache : torch.Tensor
-            The key/value tensor, shape (N // C, 2, C, num_kv_heads, head_dim).
+            The query tensor with shape ``(M, num_qo_heads, head_dim)``.
+        k : torch.Tensor
+            The key tensor with shape ``(N, num_kv_heads, head_dim)``.
+        v : torch.Tensor
+            The value tensor with shape ``(N, num_kv_heads, head_dim)``.
         pos_encoding_mode : str, optional
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
@@ -246,11 +324,15 @@ class BlockSparseAttentionWrapper:
         if rope_theta is None:
             rope_theta = 1e4
 
+        k = k.reshape(-1, self.C, *k.shape[-2:]).contiguous()
+        v = v.reshape(-1, self.C, *v.shape[-2:]).contiguous()
         if self._packed_mask_buf is None:
             return self._wrapper.forward(
                 q,
                 self._qo_indptr,
-                *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
+                None,
+                k,
+                v,
                 self._paged_kv_indptr_buf,
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len,
@@ -267,7 +349,9 @@ class BlockSparseAttentionWrapper:
             return self._wrapper.forward_custom_mask(
                 q,
                 self._qo_indptr,
-                *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
+                None,
+                k,
+                v,
                 self._paged_kv_indptr_buf,
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len,

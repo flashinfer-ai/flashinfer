@@ -23,21 +23,19 @@ import flashinfer
 
 def bsr_attention_ref(
     q,
-    kv,
+    k,
+    v,
     indptr,
     indices,
     mask_data,
 ):
     M = q.shape[0]
-    NB, _, C, H_KV, D = kv.shape
-    N = NB * C
+    N = k.shape[0]
     bsr = sp.sparse.bsr_matrix(
         (mask_data.cpu().numpy(), indices.cpu().numpy(), indptr.cpu().numpy()),
         shape=(M, N),
     )
     dense_mask = torch.tensor(bsr.toarray(), dtype=bool, device=q.device)
-    k = kv[:, 0].reshape(-1, H_KV, D).contiguous()
-    v = kv[:, 1].reshape(-1, H_KV, D).contiguous()
     o = flashinfer.single_prefill_with_kv_cache(q, k, v, custom_mask=dense_mask)
     return o
 
@@ -67,20 +65,12 @@ def test_block_sparse_attention(
     else:
         data_mask = torch.full((nnz, R, C), True, dtype=bool, device=0)
     q = torch.randn((M, num_qo_heads, head_dim), dtype=torch.float16, device=0)
-    kv_data = torch.randn(
-        (NB, 2, C, num_kv_heads, head_dim), dtype=torch.float16, device=0
-    )
+    k = torch.randn((N, num_kv_heads, head_dim), dtype=torch.float16, device=0)
+    v = torch.randn((N, num_kv_heads, head_dim), dtype=torch.float16, device=0)
 
-    o_ref = bsr_attention_ref(q, kv_data, indptr, indices, data_mask)
+    o_ref = bsr_attention_ref(q, k, v, indptr, indices, data_mask)
     workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=0)
     sparse_attention_wrapper = flashinfer.BlockSparseAttentionWrapper(workspace_buffer)
-
-    if mask_inside_block:
-        mask_flashinfer_layout = torch.full((nnz * R * C,), False, dtype=bool, device=0)
-        for i in range(MB):
-            mask_flashinfer_layout[indptr[i] * R * C : indptr[i + 1] * R * C] = (
-                data_mask[indptr[i] : indptr[i + 1]].transpose(0, 1).reshape(-1)
-            )
 
     sparse_attention_wrapper.begin_forward(
         indptr,
@@ -92,12 +82,11 @@ def test_block_sparse_attention(
         num_qo_heads,
         num_kv_heads,
         head_dim,
-        mask=mask_flashinfer_layout if mask_inside_block else None,
+        mask=data_mask if mask_inside_block else None,
     )
 
-    o = sparse_attention_wrapper.forward(q, kv_data)
+    o = sparse_attention_wrapper.forward(q, k, v)
     sparse_attention_wrapper.end_forward()
-    print(o_ref, o)
     np.testing.assert_allclose(o_ref.cpu(), o.cpu(), atol=1e-2, rtol=1e-3)
 
 
