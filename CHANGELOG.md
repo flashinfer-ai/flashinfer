@@ -1,7 +1,10 @@
 # Changelog
 
-## [0.2.0](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.0...v0.2.0) (2024-07-20)
+## [0.1.1](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.0...v0.1.1) (2024-07-20)
 
+### Bugfix
+
+* fix the invalid kernel configuration for architectures with small shared memory size ([#385](https://github.com/flashinfer-ai/flashinfer/pull/385)) ([cdac57](https://github.com/flashinfer-ai/flashinfer/commit/cdac577011e8ab50aa26dfef0cecf77d92d2f804))
 
 ### Features
 
