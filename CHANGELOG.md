@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.1](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.0...v0.1.1) (2024-07-20)
+
+### Bugfix
+
+* fix the invalid kernel configuration for architectures with small shared memory size ([#385](https://github.com/flashinfer-ai/flashinfer/pull/385)) ([cdac57](https://github.com/flashinfer-ai/flashinfer/commit/cdac577011e8ab50aa26dfef0cecf77d92d2f804))
+
+### Features
+
+* expose decoupled kv-cache to pytorch api ([#383](https://github.com/flashinfer-ai/flashinfer/issues/383)) ([457a0ae](https://github.com/flashinfer-ai/flashinfer/commit/457a0ae0c8a43bd95a803167e28be19555a2ebf8))
+
+
+### Performance Improvements
+
+* use stmatrix in epilogue for sm90+ ([#380](https://github.com/flashinfer-ai/flashinfer/issues/380)) ([c6f20d1](https://github.com/flashinfer-ai/flashinfer/commit/c6f20d1406a3a8c4f134c4a764d16e157a184338))
+
 ## [0.1.0](https://github.com/flashinfer-ai/flashinfer/compare/v0.0.9...v0.1.0) (2024-07-17)
 
 
