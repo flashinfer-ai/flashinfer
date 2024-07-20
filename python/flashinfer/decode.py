@@ -34,9 +34,9 @@ except ImportError as e:
 from .utils import (
     PosEncodingMode,
     TensorLayout,
-    expand_5d,
-    check_pos_encoding_mode,
-    check_kv_layout,
+    _check_pos_encoding_mode,
+    _check_kv_layout,
+    _unpack_paged_kv_cache,
 )
 
 _cache_buf = {}
@@ -139,8 +139,8 @@ def single_decode_with_kv_cache(
     not equal to ``num_kv_heads``, the function will use
     `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
     """
-    check_pos_encoding_mode(pos_encoding_mode)
-    check_kv_layout(kv_layout)
+    _check_pos_encoding_mode(pos_encoding_mode)
+    _check_kv_layout(kv_layout)
     tmp = _get_cache_buf("single_decode_with_kv_cache_tmp", 32 * 1024 * 1024, q.device)
     if logits_soft_cap is None:
         logits_soft_cap = 0.0
@@ -228,7 +228,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
     >>> kv_last_page_len = torch.tensor(
     ...     [1, 7, 14, 4, 3, 1, 16], dtype=torch.int32, device="cuda:0"
     ... )
-    >>> kv_data_at_layer = [
+    >>> kv_cache_at_layer = [
     ...     torch.randn(
     ...         max_num_pages, 2, page_size, num_kv_heads, head_dim, dtype=torch.float16, device="cuda:0"
     ...     ) for _ in range(num_layers)
@@ -248,9 +248,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
     >>> outputs = []
     >>> for i in range(num_layers):
     ...     q = torch.randn(batch_size, num_qo_heads, head_dim).half().to("cuda:0")
-    ...     kv_data = kv_data_at_layer[i]
+    ...     kv_cache = kv_cache_at_layer[i]
     ...     # compute batch decode attention, reuse auxiliary data structures for all layers
-    ...     o = decode_wrapper.forward(q, kv_data)
+    ...     o = decode_wrapper.forward(q, kv_cache)
     ...     outputs.append(o)
     ...
     >>> # clear auxiliary data structures
@@ -290,7 +290,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         use_cuda_graph : bool
             Whether to enable CUDAGraph for batch decode attention, if enabled, the
-            auxiliary data structures will be stored in the provided buffers. The ``batch_size``
+            auxiliary data structures will be stored as the provided buffers. The ``batch_size``
             cannot change during the lifecycle of this wrapper when CUDAGraph is enabled.
 
         use_tensor_cores : bool
@@ -313,7 +313,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             size of the buffer should be ``[batch_size]``.
             Only needed when ``use_cuda_graph`` is ``True``.
         """
-        check_kv_layout(kv_layout)
+        _check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
         self._workspace_buffer = workspace_buffer
 
@@ -476,7 +476,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 else q_data_type
             ),
         )
-        empty_kv_data = torch.empty(
+        empty_kv_cache = torch.empty(
             0,
             dtype=(
                 getattr(torch, data_type) if isinstance(data_type, str) else data_type
@@ -523,7 +523,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 PosEncodingMode[pos_encoding_mode].value,
                 logits_soft_cap,
                 empty_q_data,
-                empty_kv_data,
+                empty_kv_cache,
             )
 
     def end_forward(self):
@@ -538,7 +538,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
     def forward(
         self,
         q: torch.Tensor,
-        paged_kv_data: torch.Tensor,
+        paged_kv_cache: torch.Tensor,
         pos_encoding_mode: str = "NONE",
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
@@ -554,12 +554,20 @@ class BatchDecodeWithPagedKVCacheWrapper:
         ----------
         q : torch.Tensor
             The query tensor, shape: ``[batch_size, num_qo_heads, head_dim]``
-        paged_kv_data : torch.Tensor
-            A 5-D tensor of the reserved paged kv-cache data, shape:
-            ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
-            :attr:`kv_layout` is ``NHD``, or
-            ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
-            :attr:`kv_layout` is ``HND``.
+        paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+            The paged KV-Cache stored as a tuple of tensors or a single tensor:
+
+            * a tuple ``(k_cache, v_cache)`` of 4-D tensors, each with shape:
+              ``[max_num_pages, page_size, num_kv_heads, head_dim]`` if :attr:`kv_layout` is ``NHD``,
+              and ``[max_num_pages, num_kv_heads, page_size, head_dim]`` if :attr:`kv_layout` is ``HND``.
+
+            * a single 5-D tensor with shape:
+              ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
+              :attr:`kv_layout` is ``NHD``, and
+              ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
+              :attr:`kv_layout` is ``NHD``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
+              ``paged_kv_cache[:, 1]`` is the value-cache.
+
         pos_encoding_mode : str
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
@@ -589,7 +597,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         torch.Tensor
             The attention output, shape: ``[batch_size, num_qo_heads, head_dim]``.
         """
-        check_pos_encoding_mode(pos_encoding_mode)
+        _check_pos_encoding_mode(pos_encoding_mode)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         if sm_scale is None:
@@ -604,13 +612,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if rope_theta is None:
             rope_theta = 1e4
 
-        paged_kv_data = expand_5d(paged_kv_data, self._kv_layout)
-
         if self.use_tensor_cores:
             out = self._wrapper.forward(
                 q,
                 self._qo_indptr_buf,
-                paged_kv_data,
+                *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
                 self._paged_kv_indptr_buf,
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,
@@ -626,7 +632,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         else:
             out = self._wrapper.forward(
                 q,
-                paged_kv_data,
+                *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
                 self._paged_kv_indptr_buf,
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,
@@ -644,7 +650,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
     def forward_return_lse(
         self,
         q: torch.Tensor,
-        paged_kv_data: torch.Tensor,
+        paged_kv_cache: torch.Tensor,
         pos_encoding_mode: str = "NONE",
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
@@ -661,12 +667,20 @@ class BatchDecodeWithPagedKVCacheWrapper:
         ----------
         q : torch.Tensor
             The query tensor, shape: ``[batch_size, num_qo_heads, head_dim]``
-        paged_kv_data : torch.Tensor
-            A 5-D tensor of the reserved paged kv-cache data, shape:
-            ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
-            :attr:`kv_layout` is ``NHD``, or
-            ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
-            :attr:`kv_layout` is ``HND``.
+        paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+            The paged KV-Cache stored as a tuple of tensors or a single tensor:
+
+            * a tuple ``(k_cache, v_cache)`` of 4-D tensors, each with shape:
+              ``[max_num_pages, page_size, num_kv_heads, head_dim]`` if :attr:`kv_layout` is ``NHD``,
+              and ``[max_num_pages, num_kv_heads, page_size, head_dim]`` if :attr:`kv_layout` is ``HND``.
+
+            * a single 5-D tensor with shape:
+              ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
+              :attr:`kv_layout` is ``NHD``, and
+              ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
+              :attr:`kv_layout` is ``NHD``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
+              ``paged_kv_cache[:, 1]`` is the value-cache.
+
         pos_encoding_mode : str
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
@@ -703,7 +717,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         Please refer to the :ref:`tutorial <recursive-attention>` for a detailed
         explanation of the log-sum-exp function and attention states.
         """
-        check_pos_encoding_mode(pos_encoding_mode)
+        _check_pos_encoding_mode(pos_encoding_mode)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         if sm_scale is None:
@@ -717,12 +731,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
-        paged_kv_data = expand_5d(paged_kv_data, self._kv_layout)
         if self.use_tensor_cores:
             V, s = self._wrapper.forward(
                 q,
                 self._qo_indptr_buf,
-                paged_kv_data,
+                *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
                 self._paged_kv_indptr_buf,
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,
@@ -738,7 +751,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         else:
             V, s = self._wrapper.forward(
                 q,
-                paged_kv_data,
+                *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
                 self._paged_kv_indptr_buf,
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,

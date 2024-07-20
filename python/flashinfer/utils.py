@@ -16,6 +16,7 @@ limitations under the License.
 
 import torch
 from enum import Enum
+from typing import Optional, Tuple, Union
 
 
 class PosEncodingMode(Enum):
@@ -29,15 +30,17 @@ class TensorLayout(Enum):
     HND = 1
 
 
-def expand_5d(x: torch.Tensor, kv_layout: str):
+def _expand_5d(x: torch.Tensor, kv_layout: str):
     if not x.ndim in [4, 5]:
         raise ValueError("x must be 4D or 5D")
     if x.ndim == 4:
         # page_size == 1
         if kv_layout == "NHD":
+            # (num_pages, 2, num_heads, head_dim) -> (num_pages, 2, page_size=1, num_heads, head_dim)
             # expand to 5D on the 3nd last dimension
             return x.unsqueeze(-3)
         elif kv_layout == "HND":
+            # (num_pages, 2, num_heads, head_dim) -> (num_pages, 2, num_heads, page_size=1, head_dim)
             # expand to 5D on the 2nd last dimension
             return x.unsqueeze(-2)
         else:
@@ -45,12 +48,30 @@ def expand_5d(x: torch.Tensor, kv_layout: str):
     return x
 
 
-def check_pos_encoding_mode(pos_encoding_mode: str):
+def _expand_4d(x: torch.Tensor, kv_layout: str):
+    if not x.ndim in [3, 4]:
+        raise ValueError("x must be 3D or 4D")
+    if x.ndim == 3:
+        # page_size == 1
+        if kv_layout == "NHD":
+            # (num_pages, num_heads, head_dim) -> (num_pages, page_size=1, num_heads, head_dim)
+            # expand to 4D on the 3nd last dimension
+            return x.unsqueeze(-3)
+        elif kv_layout == "HND":
+            # (num_pages, num_heads, head_dim) -> (num_pages, num_heads, page_size=1, head_dim)
+            # expand to 5D on the 2nd last dimension
+            return x.unsqueeze(-2)
+        else:
+            raise KeyError("Invalid kv_layout {}".format(kv_layout))
+    return x
+
+
+def _check_pos_encoding_mode(pos_encoding_mode: str):
     if not hasattr(PosEncodingMode, pos_encoding_mode):
         raise KeyError("Invalid pos_encoding_mode {}".format(pos_encoding_mode))
 
 
-def check_kv_layout(kv_layout: str):
+def _check_kv_layout(kv_layout: str):
     if not hasattr(TensorLayout, kv_layout):
         raise KeyError("Invalide kv_layout {}".format(kv_layout))
 
@@ -64,3 +85,24 @@ def get_indptr(x: torch.Tensor):
     ret = torch.zeros(x.shape[0] + 1, dtype=x.dtype, device=x.device)
     ret[1:] = x.cumsum(0)
     return ret
+
+
+def _unpack_paged_kv_cache(
+    paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    kv_layout: str,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    if isinstance(paged_kv_cache, tuple):
+        paged_k_cache, paged_v_cache = paged_kv_cache
+        return (
+            None,
+            _expand_4d(paged_k_cache, kv_layout),
+            _expand_4d(paged_v_cache, kv_layout),
+        )
+    elif torch.is_tensor(paged_kv_cache):
+        return (_expand_5d(paged_kv_cache, kv_layout), None, None)
+    else:
+        raise KeyError(
+            "Unrecongized paged_kv_cache type {}, expect a single tensor or a tuple of tensor.".format(
+                type(paged_kv_cache)
+            )
+        )

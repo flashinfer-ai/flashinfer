@@ -22,12 +22,6 @@ Merge Attention States
 Cascade Attention
 -----------------
 
-.. autosummary::
-   :toctree: ../../generated
-
-   batch_decode_with_shared_prefix_padded_kv_cache
-
-
 Cascade Attention Wrapper Classes
 ---------------------------------
 
