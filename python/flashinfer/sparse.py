@@ -16,14 +16,12 @@ limitations under the License.
 
 import math
 from typing import Optional
-import torch
 import logging
+import torch
 from .prefill import _compute_page_qk_indptr
 from .quantization import segment_packbits
 from .utils import (
     _check_pos_encoding_mode,
-    _unpack_paged_kv_cache,
-    is_float8,
     PosEncodingMode,
     TensorLayout,
 )
@@ -33,7 +31,6 @@ try:
     from . import _kernels
 except ImportError as e:
     import os
-    import logging
 
     if os.environ.get("BUILD_DOC", "0") == "1":
         _kernels = None
@@ -130,6 +127,12 @@ class BlockSparseAttentionWrapper:
             TensorLayout["NHD"].value,
             False,  # use_cuda_graph
         )
+        self._qo_indptr: Optional[torch.Tensor] = None
+        self._paged_kv_indptr_buf: Optional[torch.Tensor] = None
+        self._paged_kv_indices_buf: Optional[torch.Tensor] = None
+        self._paged_kv_last_page_len: Optional[torch.Tensor] = None
+        self._packed_mask_buf: Optional[torch.Tensor] = None
+        self._qk_indptr_buf: Optional[torch.Tensor] = None
         self.R: Optional[int] = None
         self.C: Optional[int] = None
         self.M: Optional[int] = None
