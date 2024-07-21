@@ -30,7 +30,7 @@ class TensorLayout(Enum):
     HND = 1
 
 
-def _expand_5d(x: torch.Tensor, kv_layout: str):
+def _expand_5d(x: torch.Tensor, kv_layout: str) -> torch.Tensor:
     if not x.ndim in [4, 5]:
         raise ValueError("x must be 4D or 5D")
     if x.ndim == 4:
@@ -48,7 +48,7 @@ def _expand_5d(x: torch.Tensor, kv_layout: str):
     return x
 
 
-def _expand_4d(x: torch.Tensor, kv_layout: str):
+def _expand_4d(x: torch.Tensor, kv_layout: str) -> torch.Tensor:
     if not x.ndim in [3, 4]:
         raise ValueError("x must be 3D or 4D")
     if x.ndim == 3:
@@ -66,21 +66,21 @@ def _expand_4d(x: torch.Tensor, kv_layout: str):
     return x
 
 
-def _check_pos_encoding_mode(pos_encoding_mode: str):
+def _check_pos_encoding_mode(pos_encoding_mode: str) -> None:
     if not hasattr(PosEncodingMode, pos_encoding_mode):
         raise KeyError("Invalid pos_encoding_mode {}".format(pos_encoding_mode))
 
 
-def _check_kv_layout(kv_layout: str):
+def _check_kv_layout(kv_layout: str) -> None:
     if not hasattr(TensorLayout, kv_layout):
         raise KeyError("Invalide kv_layout {}".format(kv_layout))
 
 
-def is_float8(x: torch.Tensor):
+def is_float8(x: torch.Tensor) -> bool:
     return x.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]
 
 
-def get_indptr(x: torch.Tensor):
+def get_indptr(x: torch.Tensor) -> torch.Tensor:
     x = x.to(torch.int64)
     ret = torch.zeros(x.shape[0] + 1, dtype=x.dtype, device=x.device)
     ret[1:] = x.cumsum(0)

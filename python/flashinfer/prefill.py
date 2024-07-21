@@ -15,10 +15,11 @@ limitations under the License.
 """
 
 import math
-from typing import Optional
+from typing import Optional, Dict, Tuple
 import torch
 import logging
 
+# mypy: disable-error-code="attr-defined"
 try:
     from . import _kernels
 except ImportError as e:
@@ -42,10 +43,10 @@ from .utils import (
 from .quantization import packbits, segment_packbits
 
 
-_cache_buf = {}
+_cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}
 
 
-def _get_cache_buf(name: str, bytes: int, device: torch.device):
+def _get_cache_buf(name: str, bytes: int, device: torch.device) -> torch.Tensor:
     key = (name, device)
     buf = _cache_buf.get(key)
     if buf is None:
@@ -68,7 +69,7 @@ def single_prefill_with_kv_cache(
     logits_soft_cap: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
-):
+) -> torch.Tensor:
     r"""Prefill/Append attention with KV cache for single request, return the attention
     output.
 
@@ -229,7 +230,7 @@ def single_prefill_with_kv_cache_return_lse(
     sm_scale: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
-):
+) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Prefill/Append attention with KV cache for single request, return attention
     output and logsumexp of attention scores.
 
@@ -399,7 +400,7 @@ def _compute_page_qk_indptr(
     paged_kv_indptr: torch.Tensor,
     paged_kv_last_page_len: torch.Tensor,
     page_size: int,
-):
+) -> torch.Tensor:
     if len(qo_indptr) != len(paged_kv_indptr):
         raise ValueError(
             "The length of qo_indptr and paged_kv_indptr should be the same."
@@ -537,7 +538,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         paged_kv_last_page_len_buf: Optional[torch.Tensor] = None,
         custom_mask_buf: Optional[torch.Tensor] = None,
         qk_indptr_buf: Optional[torch.Tensor] = None,
-    ):
+    ) -> None:
         r"""Constructor of :class:`BatchPrefillWithPagedKVCacheWrapper`.
 
         Parameters
@@ -633,10 +634,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._qk_indptr_buf = qk_indptr_buf
 
     @property
-    def is_cuda_graph_enabled(self):
+    def is_cuda_graph_enabled(self) -> bool:
         return self._wrapper.is_cuda_graph_enabled()
 
-    def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
+    def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor) -> None:
         r"""Reset the workspace buffer.
 
         Parameters
@@ -660,7 +661,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         custom_mask: Optional[torch.Tensor] = None,
         packed_custom_mask: Optional[torch.Tensor] = None,
         q_data_type: str = "float16",
-    ):
+    ) -> None:
         r"""Create auxiliary data structures for batch prefill/append attention for
         multiple forward calls within the same prefill/append step.
 
@@ -787,7 +788,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             empty_q_data,
         )
 
-    def end_forward(self):
+    def end_forward(self) -> None:
         r"""Clear the auxiliary data structures created by :meth:`begin_forward`."""
         if not self.is_cuda_graph_enabled:
             self._qo_indptr_buf = None
@@ -809,7 +810,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
-    ):
+    ) -> torch.Tensor:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
 
         Parameters
@@ -918,7 +919,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
-    ):
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Compute batch prefill/append attention paged kv-cache.
 
         Parameters
@@ -1018,7 +1019,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             )
 
 
-def _compute_qk_indptr(qo_indptr: torch.Tensor, kv_indptr: torch.Tensor):
+def _compute_qk_indptr(
+    qo_indptr: torch.Tensor, kv_indptr: torch.Tensor
+) -> torch.Tensor:
     if len(qo_indptr) != len(kv_indptr):
         raise ValueError("The length of qo_indptr and kv_indptr should be the same.")
     qk_indptr = torch.empty_like(qo_indptr)
@@ -1133,7 +1136,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         kv_indptr_buf: Optional[torch.Tensor] = None,
         custom_mask_buf: Optional[torch.Tensor] = None,
         qk_indptr_buf: Optional[torch.Tensor] = None,
-    ):
+    ) -> None:
         r"""Constructor of :class:`BatchPrefillWithRaggedKVCacheWrapper`.
 
         Parameters
@@ -1204,10 +1207,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._qk_indptr_buf = qk_indptr_buf
 
     @property
-    def is_cuda_graph_enabled(self):
+    def is_cuda_graph_enabled(self) -> bool:
         return self._wrapper.is_cuda_graph_enabled()
 
-    def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
+    def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor) -> None:
         r"""Reset the workspace buffer.
 
         Parameters
@@ -1228,7 +1231,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         custom_mask: Optional[torch.Tensor] = None,
         packed_custom_mask: Optional[torch.Tensor] = None,
         q_data_type: str = "float16",
-    ):
+    ) -> None:
         r"""Create auxiliary data structures for batch prefill/append attention for
         multiple forward calls within the same prefill/append step.
 
@@ -1336,7 +1339,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             empty_q_data,
         )
 
-    def end_forward(self):
+    def end_forward(self) -> None:
         r"""Clear the auxiliary data structures created by :meth:`begin_forward`."""
         if not self.is_cuda_graph_enabled:
             self._qo_indptr_buf = None
@@ -1357,7 +1360,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
-    ):
+    ) -> torch.Tensor:
         r"""Compute batch prefill/append attention between query and kv-cache stored as
         ragged tensor.
 
@@ -1462,7 +1465,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
-    ):
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Compute batch prefill/append attention between query and kv-cache stored as
         ragged tensor. Return attention output and logsumexp of attention scores.
 

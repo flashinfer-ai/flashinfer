@@ -15,7 +15,9 @@ limitations under the License.
 """
 
 import torch
+from typing import Tuple
 
+# mypy: disable-error-code="attr-defined"
 try:
     from . import _kernels
 except ImportError as e:
@@ -29,7 +31,7 @@ except ImportError as e:
         raise e
 
 
-def packbits(x: torch.Tensor, bitorder: str = "big"):
+def packbits(x: torch.Tensor, bitorder: str = "big") -> torch.Tensor:
     r"""Pack the elements of a binary-valued array into bits in a uint8 array.
 
     The semantics of this function is the same as `numpy.packbits <https://numpy.org/doc/stable/reference/generated/numpy.packbits.html>`_.
@@ -53,7 +55,9 @@ def packbits(x: torch.Tensor, bitorder: str = "big"):
     return _kernels.packbits(x, bitorder)
 
 
-def segment_packbits(x: torch.Tensor, indptr: torch.Tensor, bitorder: str = "big"):
+def segment_packbits(
+    x: torch.Tensor, indptr: torch.Tensor, bitorder: str = "big"
+) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Pack a batch of binary-valued segments into bits in a uint8 array.
 
     For each segment, the semantics of this function is the same as `numpy.packbits <https://numpy.org/doc/stable/reference/generated/numpy.packbits.html>`_.

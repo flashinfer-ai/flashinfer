@@ -15,9 +15,10 @@ limitations under the License.
 """
 
 import math
-from typing import Optional
+from typing import Optional, Tuple
 import torch
 
+# mypy: disable-error-code="attr-defined"
 try:
     from . import _kernels
 except ImportError as e:
@@ -41,7 +42,7 @@ from .prefill import (
 
 def merge_state(
     v_a: torch.Tensor, s_a: torch.Tensor, v_b: torch.Tensor, s_b: torch.Tensor
-):
+) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Merge the attention output ``V`` and the logsumexp value ``S`` from the two
     KV-segments.
     Check :ref:`our tutorial <recursive-attention>` on the mathematical details.
@@ -96,7 +97,7 @@ def merge_state_in_place(
     v_other: torch.Tensor,
     s_other: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
-):
+) -> None:
     r"""Merge the self-attention state ``(v, s)`` with another state
     ``(v_other, s_other)`` in-place.
 
@@ -136,7 +137,7 @@ def merge_state_in_place(
     _kernels.merge_state_in_place(v, s, v_other, s_other, mask)
 
 
-def merge_states(v: torch.Tensor, s: torch.Tensor):
+def merge_states(v: torch.Tensor, s: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Merge multiple attention states (v, s).
 
     Parameters
@@ -256,13 +257,13 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
     manages the lifecycle of these data structures.
     """
 
-    def __init__(self, workspace_buffer: torch.Tensor, kv_layout: str = "NHD"):
+    def __init__(self, workspace_buffer: torch.Tensor, kv_layout: str = "NHD") -> None:
         self._batch_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
             workspace_buffer, kv_layout
         )
         self._kv_layout = kv_layout
 
-    def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
+    def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor) -> None:
         r"""Reset the workspace buffer.
 
         Parameters
@@ -283,7 +284,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
         head_dim: int,
         page_size: int,
         data_type: str = "float16",
-    ):
+    ) -> None:
         r"""Create auxiliary data structures for shared-prefix batch decode for multiple
         forward calls within the same decode step.
 
@@ -330,7 +331,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
             data_type=data_type,
         )
 
-    def end_forward(self):
+    def end_forward(self) -> None:
         r"""Clear auxiliary data structures created by :meth:`begin_forward`."""
         self._batch_decode_wrapper.end_forward()
 
@@ -344,7 +345,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
-    ):
+    ) -> torch.Tensor:
         r"""Compute batch decode attention between queries and shared-prefix paged
         kv-cache.
 
@@ -502,7 +503,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
     layers). This wrapper class manages the lifecycle of these data structures.
     """
 
-    def __init__(self, workspace_buffer: torch.Tensor, kv_layout: str = "NHD"):
+    def __init__(self, workspace_buffer: torch.Tensor, kv_layout: str = "NHD") -> None:
         r"""Constructor of :class:`BatchDecodeWithSharedPrefixPagedKVCacheWrapper`.
 
         Parameters
@@ -519,7 +520,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
         )
         self._kv_layout = kv_layout
 
-    def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
+    def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor) -> None:
         r"""Reset the workspace buffer.
 
         Parameters
@@ -540,7 +541,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
         num_kv_heads: int,
         head_dim: int,
         page_size: int,
-    ):
+    ) -> None:
         r"""Create auxiliary data structures for shared-prefix batch prefill/append
         attention for multiple forward calls within the same prefill/append step.
 
@@ -586,7 +587,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
             page_size,
         )
 
-    def end_forward(self):
+    def end_forward(self) -> None:
         r"""Clear the auxiliary data structures created by :meth:`begin_forward`."""
         self._batch_prefill_wrapper.end_forward()
 
@@ -601,7 +602,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
-    ):
+    ) -> torch.Tensor:
         r"""Compute batch prefill/append attention between query and shared-prefix paged
         kv-cache.
 

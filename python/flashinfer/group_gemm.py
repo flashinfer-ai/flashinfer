@@ -18,6 +18,7 @@ import torch
 from typing import Optional
 from .utils import get_indptr
 
+# mypy: disable-error-code="attr-defined"
 try:
     from . import _kernels
 except ImportError as e:
@@ -34,7 +35,7 @@ except ImportError as e:
 class SegmentGEMMWrapper:
     r"""Wrapper for segment GEMM kernels."""
 
-    def __init__(self, workspace_buffer: torch.Tensor):
+    def __init__(self, workspace_buffer: torch.Tensor) -> None:
         r"""Initialize the wrapper.
 
         Parameters
@@ -48,7 +49,7 @@ class SegmentGEMMWrapper:
             self._workspace_buffer
         )
 
-    def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
+    def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor) -> None:
         r"""Reset the workspace buffer.
 
         Parameters

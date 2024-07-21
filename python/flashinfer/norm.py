@@ -16,6 +16,7 @@ limitations under the License.
 
 import torch
 
+# mypy: disable-error-code="attr-defined"
 try:
     from . import _kernels
 except ImportError as e:
@@ -29,7 +30,7 @@ except ImportError as e:
         raise e
 
 
-def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6):
+def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     r"""Root mean square normalization.
 
     Parameters

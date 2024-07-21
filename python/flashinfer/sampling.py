@@ -15,7 +15,9 @@ limitations under the License.
 """
 
 import torch
+from typing import Tuple
 
+# mypy: disable-error-code="attr-defined"
 try:
     from . import _kernels
 except ImportError as e:
@@ -29,7 +31,9 @@ except ImportError as e:
         raise e
 
 
-def sampling_from_probs(probs: torch.Tensor, uniform_samples: torch.Tensor):
+def sampling_from_probs(
+    probs: torch.Tensor, uniform_samples: torch.Tensor
+) -> torch.Tensor:
     r"""Fused GPU kernel for category sampling from probabilities.
 
     Parameters
@@ -74,7 +78,7 @@ def sampling_from_probs(probs: torch.Tensor, uniform_samples: torch.Tensor):
 
 def top_p_sampling_from_probs(
     probs: torch.Tensor, uniform_samples: torch.Tensor, top_p: float
-):
+) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Fused GPU kernel for top-p sampling (nucleus sampling) from probabilities,
     this operator implements GPU-based rejection sampling without explicit sorting.
 
@@ -94,12 +98,11 @@ def top_p_sampling_from_probs(
 
     Returns
     -------
-    (samples, success): Tuple[torch.Tensor, torch.Tensor]
-        samples: torch.Tensor
-            Sampled categories, shape ``(batch_size,)``.
-        success: torch.Tensor
-            Whether the sampling is successful within ``max_top_p_rounds`` rounds,
-            shape ``(batch_size,)``.
+    samples: torch.Tensor
+        Sampled categories, shape ``(batch_size,)``.
+    success: torch.Tensor
+        Whether the sampling is successful within ``max_top_p_rounds`` rounds,
+        shape ``(batch_size,)``.
 
     Examples
     --------
@@ -136,7 +139,7 @@ def top_p_sampling_from_probs(
 
 def top_k_sampling_from_probs(
     probs: torch.Tensor, uniform_samples: torch.Tensor, top_k: int
-):
+) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Fused GPU kernel for top-k sampling from probabilities,
     this operator implements GPU-based rejection sampling without explicit sorting.
 
@@ -156,12 +159,11 @@ def top_k_sampling_from_probs(
 
     Returns
     -------
-    (samples, success): Tuple[torch.Tensor, torch.Tensor]
-        samples: torch.Tensor
-            Sampled categories, shape ``(batch_size,)``.
-        success: torch.Tensor
-            Whether the sampling is successful within ``max_top_k_rounds`` rounds,
-            shape ``(batch_size,)``.
+    samples: torch.Tensor
+        Sampled categories, shape ``(batch_size,)``.
+    success: torch.Tensor
+        Whether the sampling is successful within ``max_top_k_rounds`` rounds,
+        shape ``(batch_size,)``.
 
     Examples
     --------
@@ -201,7 +203,7 @@ def top_k_top_p_sampling_from_probs(
     uniform_samples: torch.Tensor,
     top_k: torch.Tensor,
     top_p: torch.Tensor,
-):
+) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Fused GPU kernel for joint top-k and top-p sampling from probabilities,
 
     this operator implements GPU-based rejection sampling without explicit sorting.
@@ -224,12 +226,11 @@ def top_k_top_p_sampling_from_probs(
 
     Returns
     -------
-    (samples, success): Tuple[torch.Tensor, torch.Tensor]
-        samples: torch.Tensor
-            Sampled categories, shape ``(batch_size,)``.
-        success: torch.Tensor
-            Whether the sampling is successful within ``max_top_k_rounds`` rounds,
-            shape ``(batch_size,)``.
+    samples: torch.Tensor
+        Sampled categories, shape ``(batch_size,)``.
+    success: torch.Tensor
+        Whether the sampling is successful within ``max_top_k_rounds`` rounds,
+        shape ``(batch_size,)``.
 
     Examples
     --------
@@ -267,7 +268,9 @@ def top_k_top_p_sampling_from_probs(
     )
 
 
-def top_p_renorm_prob(probs: torch.Tensor, top_p: float, eps: float = 1e-5):
+def top_p_renorm_prob(
+    probs: torch.Tensor, top_p: float, eps: float = 1e-5
+) -> torch.Tensor:
     r"""Fused GPU kernel for renormalizing probabilities by top-p thresholding.
 
     Parameters
@@ -292,7 +295,9 @@ def top_p_renorm_prob(probs: torch.Tensor, top_p: float, eps: float = 1e-5):
     return _kernels.top_p_renorm_prob(probs, top_p, eps)
 
 
-def top_k_renorm_prob(probs: torch.Tensor, top_k: int, eps: float = 1e-5):
+def top_k_renorm_prob(
+    probs: torch.Tensor, top_k: int, eps: float = 1e-5
+) -> torch.Tensor:
     r"""Fused GPU kernel for renormalizing probabilities by top-k thresholding.
 
     Parameters
@@ -323,7 +328,7 @@ def chain_speculative_sampling(
     draft_token_ids,
     uniform_samples,
     target_probs,
-):
+) -> torch.Tensor:
     r"""Fused-GPU kernel for speculative sampling for sequence generation (proposed in
     paper `Accelerating Large Language Model Decoding with Speculative Sampling <https://arxiv.org/pdf/2302.01318>`_),
     where the draft model generates a sequence(chain) of tokens for each request.

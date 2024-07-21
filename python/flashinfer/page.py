@@ -16,6 +16,7 @@ limitations under the License.
 
 import torch
 
+# mypy: disable-error-code="attr-defined"
 try:
     from . import _kernels
 except ImportError as e:
@@ -40,7 +41,7 @@ def append_paged_kv_cache(
     kv_indptr: torch.Tensor,
     kv_last_page_len: torch.Tensor,
     kv_layout: str = "NHD",
-):
+) -> None:
     r"""Append a batch of key-value pairs to a paged key-value cache.
 
     Parameters
