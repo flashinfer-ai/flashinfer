@@ -48,7 +48,7 @@ from .group_gemm import SegmentGEMMWrapper
 from .quantization import packbits, segment_packbits
 
 try:
-    from ._build_meta import __version__ as __version__
+    from ._build_meta import __version__
 except ImportError:
     with open("version.txt") as f:
         __version__ = f.read().strip()

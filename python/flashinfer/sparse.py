@@ -16,23 +16,21 @@ limitations under the License.
 
 import math
 from typing import Optional
-import torch
 import logging
+import torch
 from .prefill import _compute_page_qk_indptr
 from .quantization import segment_packbits
 from .utils import (
     _check_pos_encoding_mode,
-    _unpack_paged_kv_cache,
-    is_float8,
     PosEncodingMode,
     TensorLayout,
 )
 
+# mypy: disable-error-code="attr-defined"
 try:
     from . import _kernels
 except ImportError as e:
     import os
-    import logging
 
     if os.environ.get("BUILD_DOC", "0") == "1":
         _kernels = None
@@ -41,7 +39,7 @@ except ImportError as e:
         raise e
 
 
-def convert_bsr_mask_layout(mask: torch.Tensor, indptr: torch.Tensor):
+def convert_bsr_mask_layout(mask: torch.Tensor, indptr: torch.Tensor) -> torch.Tensor:
     r"""Convert mask from BSR data layout to flashinfer's flattened mask layout.
 
     Parameters
@@ -114,7 +112,7 @@ class BlockSparseAttentionWrapper:
     def __init__(
         self,
         workspace_buffer: torch.Tensor,
-    ):
+    ) -> None:
         r"""Constructs of :class:`BlockSparseAttentionWrapper`.
 
         Parameters
@@ -129,10 +127,16 @@ class BlockSparseAttentionWrapper:
             TensorLayout["NHD"].value,
             False,  # use_cuda_graph
         )
-        self.R = None
-        self.C = None
-        self.M = None
-        self.N = None
+        self._qo_indptr: Optional[torch.Tensor] = None
+        self._paged_kv_indptr_buf: Optional[torch.Tensor] = None
+        self._paged_kv_indices_buf: Optional[torch.Tensor] = None
+        self._paged_kv_last_page_len: Optional[torch.Tensor] = None
+        self._packed_mask_buf: Optional[torch.Tensor] = None
+        self._qk_indptr_buf: Optional[torch.Tensor] = None
+        self.R: Optional[int] = None
+        self.C: Optional[int] = None
+        self.M: Optional[int] = None
+        self.N: Optional[int] = None
 
     def begin_forward(
         self,
@@ -148,7 +152,7 @@ class BlockSparseAttentionWrapper:
         mask: Optional[torch.Tensor] = None,
         packed_mask: Optional[torch.Tensor] = None,
         q_data_type: str = "float16",
-    ):
+    ) -> None:
         r"""Create auxiliary data structures for block sparse attention.
 
         Parameters
@@ -195,7 +199,6 @@ class BlockSparseAttentionWrapper:
         qo_indptr_host = R * torch.arange(num_blocks_row + 1, dtype=torch.int32)
         qo_indptr_host[-1] = M
         self._qo_indptr = qo_indptr_host.to(indptr.device)
-        row_empty = indptr[1:] == indptr[:1]
         if indices.max().item() * C > N:
             raise ValueError("indices out of bound")
         last_block_len = torch.full(
@@ -252,7 +255,7 @@ class BlockSparseAttentionWrapper:
             empty_q_data,
         )
 
-    def end_forward(self):
+    def end_forward(self) -> None:
         r"""Clear the auxiliary data structures created by :meth:`begin_forward`."""
         self._qo_indptr = None
         self._paged_kv_indptr_buf = None
@@ -276,7 +279,7 @@ class BlockSparseAttentionWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
-    ):
+    ) -> torch.Tensor:
         r"""Compute block-sparse attention between Q/K/V tensors.
 
         Parameters

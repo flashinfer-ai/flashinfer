@@ -15,9 +15,10 @@ limitations under the License.
 """
 
 import math
-from typing import Optional, Union
+from typing import Optional, Union, Dict, Tuple
 import torch
 
+# mypy: disable-error-code="attr-defined"
 try:
     from . import _kernels
 except ImportError as e:
@@ -39,10 +40,10 @@ from .utils import (
     _unpack_paged_kv_cache,
 )
 
-_cache_buf = {}
+_cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}
 
 
-def _get_cache_buf(name: str, bytes: int, device: torch.device):
+def _get_cache_buf(name: str, bytes: int, device: torch.device) -> torch.Tensor:
     key = (name, device)
     buf = _cache_buf.get(key)
     if buf is None:
@@ -51,7 +52,9 @@ def _get_cache_buf(name: str, bytes: int, device: torch.device):
     return buf
 
 
-def _grouped_size_compiled_for_decode_kernels(num_qo_heads: int, num_kv_heads: int):
+def _grouped_size_compiled_for_decode_kernels(
+    num_qo_heads: int, num_kv_heads: int
+) -> bool:
     return (num_qo_heads // num_kv_heads) in [1, 2, 4, 8]
 
 
@@ -69,7 +72,7 @@ def single_decode_with_kv_cache(
     sm_scale: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
-):
+) -> torch.Tensor:
     r"""Decode attention with KV Cache for single request, return attention output.
 
     Parameters
@@ -275,7 +278,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         paged_kv_indptr_buffer: Optional[torch.Tensor] = None,
         paged_kv_indices_buffer: Optional[torch.Tensor] = None,
         paged_kv_last_page_len_buffer: Optional[torch.Tensor] = None,
-    ):
+    ) -> None:
         r"""Constructor of :class:`BatchDecodeWithPagedKVCacheWrapper`.
 
         Parameters
@@ -363,14 +366,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
 
     @property
-    def use_tensor_cores(self):
+    def use_tensor_cores(self) -> bool:
         return self._use_tensor_cores
 
     @property
-    def is_cuda_graph_enabled(self):
+    def is_cuda_graph_enabled(self) -> bool:
         return self._wrapper.is_cuda_graph_enabled()
 
-    def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor):
+    def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor) -> None:
         r"""Reset the workspace buffer.
 
         Parameters
@@ -394,7 +397,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         logits_soft_cap: Optional[float] = None,
         data_type: Union[str, torch.dtype] = "float16",
         q_data_type: Optional[Union[str, torch.dtype]] = None,
-    ):
+    ) -> None:
         r"""Create auxiliary data structures for batch decode for multiple forward calls
         within the same decode step.
 
@@ -526,7 +529,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 empty_kv_cache,
             )
 
-    def end_forward(self):
+    def end_forward(self) -> None:
         r"""Clear auxiliary data structures created by :meth:`begin_forward`."""
         if not self.is_cuda_graph_enabled:
             self._paged_kv_indptr_buf = None
@@ -547,7 +550,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
-    ):
+    ) -> torch.Tensor:
         r"""Compute batch decode attention between query and paged kv cache.
 
         Parameters
@@ -659,7 +662,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
-    ):
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Compute batch decode attention with paged kv cache, return attention output
         and logsumexp of attention scores.
 
@@ -794,7 +797,7 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper(BatchDecodeWithPagedKVCacheWra
         last_page_len_buffer: torch.Tensor,
         kv_layout: str = "NHD",
         use_tensor_cores: bool = False,
-    ):
+    ) -> None:
         r"""Constructor of :class:`BatchDecodeWithPagedKVCacheWrapper`.
 
         Parameters
