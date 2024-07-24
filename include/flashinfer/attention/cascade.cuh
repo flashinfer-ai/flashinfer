@@ -157,9 +157,29 @@ __global__ void MergeStatesKernel(DTypeIn* __restrict__ V, float* __restrict__ S
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t pos = blockIdx.x;
   uint32_t head_idx = ty;
-  state_t<vec_size> st;
+
+  if (num_index_sets == 0) {
+    vec_t<DTypeOut, vec_size> v;
+    v.fill(DTypeOut(0));
+    v.store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+    if (s_merged != nullptr) {
+      s_merged[pos * num_heads + head_idx] = -5e4;
+    }
+    return;
+  }
+
+  if (num_index_sets == 1) {
+    vec_t<DTypeOut, vec_size> v;
+    v.cast_load(V + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+    v.store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+    if (s_merged != nullptr) {
+      s_merged[pos * num_heads + head_idx] = S[pos * num_heads + head_idx];
+    }
+    return;
+  }
 
   vec_t<float, vec_size> v_merged_vec;
+  state_t<vec_size> st;
   v_merged_vec.fill(0.f);
 #pragma unroll 2
   for (uint32_t iter = 0; iter < num_index_sets; ++iter) {
@@ -295,6 +315,25 @@ __global__ void VariableLengthMergeStatesKernel(DTypeIn* __restrict__ V, float* 
   DTypeIn* v_smem = (DTypeIn*)smem;
   float* s_smem = (float*)(smem + num_smem_stages * bdy * head_dim * sizeof(DTypeIn));
   const uint32_t num_index_sets = indptr[pos + 1] - indptr[pos];
+
+  if (num_index_sets == 0) {
+    vec_t<DTypeOut, vec_size> v;
+    v.fill(DTypeOut(0));
+    v.store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+    if (s_merged != nullptr) {
+      s_merged[pos * num_heads + head_idx] = -5e4;
+    }
+    return;
+  }
+
+  if (num_index_sets == 1) {
+    vec_t<DTypeOut, vec_size> v;
+    v.cast_load(V + (indptr[pos] * num_heads + head_idx) * head_dim + tx * vec_size);
+    v.store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+    if (s_merged != nullptr) {
+      s_merged[pos * num_heads + head_idx] = S[indptr[pos] * num_heads + head_idx];
+    }
+  }
 
 #pragma unroll
   for (uint32_t iter = 0; iter < num_smem_stages; ++iter) {
