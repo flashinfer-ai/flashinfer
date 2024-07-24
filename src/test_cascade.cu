@@ -234,9 +234,7 @@ void _TestTwoLevelSinglePrefixCascadeDecodeCorrectness(size_t batch_size,
                                                        size_t unique_kv_length, size_t num_qo_heads,
                                                        size_t num_kv_heads, size_t head_dim) {
   constexpr uint32_t page_size = 16;
-  std::vector<std::vector<T>> testcase_float_data;
-  std::vector<std::vector<int32_t>> testcase_int_data;
-  std::tie(testcase_float_data, testcase_int_data) = utils::create_shared_prefix_testcase_data<T>(
+  auto [testcase_float_data, testcase_int_data] = utils::create_shared_prefix_testcase_data<T>(
       batch_size, shared_prefix_length, unique_kv_length,
       /*qo_append_length=*/1, num_qo_heads, num_kv_heads, head_dim, page_size);
 
@@ -360,9 +358,7 @@ void _TestTwoLevelSinglePrefixCascadeAppendCorrectness(size_t batch_size,
                                                        size_t num_kv_heads, size_t head_dim) {
   constexpr uint32_t page_size = 16;
 
-  std::vector<std::vector<T>> testcase_float_data;
-  std::vector<std::vector<int32_t>> testcase_int_data;
-  std::tie(testcase_float_data, testcase_int_data) = utils::create_shared_prefix_testcase_data<T>(
+  auto [testcase_float_data, testcase_int_data] = utils::create_shared_prefix_testcase_data<T>(
       batch_size, shared_prefix_length, unique_kv_length, qo_append_length, num_qo_heads,
       num_kv_heads, head_dim, page_size);
 
