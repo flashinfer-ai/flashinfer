@@ -68,9 +68,7 @@ void bench_two_level_single_prefix_cascade_decode(nvbench::state& state) {
 
   constexpr uint32_t page_size = 16;
 
-  std::vector<std::vector<T>> testcase_float_data;
-  std::vector<std::vector<int32_t>> testcase_int_data;
-  std::tie(testcase_float_data, testcase_int_data) = utils::create_shared_prefix_testcase_data<T>(
+  auto [testcase_float_data, testcase_int_data] = utils::create_shared_prefix_testcase_data<T>(
       batch_size, shared_prefix_length, unique_kv_length,
       /*qo_append_length=*/1, num_qo_heads, num_kv_heads, head_dim, page_size);
 
@@ -202,9 +200,7 @@ void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
 
   constexpr uint32_t page_size = 16;
 
-  std::vector<std::vector<T>> testcase_float_data;
-  std::vector<std::vector<int32_t>> testcase_int_data;
-  std::tie(testcase_float_data, testcase_int_data) = utils::create_shared_prefix_testcase_data<T>(
+  auto [testcase_float_data, testcase_int_data] = utils::create_shared_prefix_testcase_data<T>(
       batch_size, shared_prefix_length, unique_kv_length, qo_append_length, num_qo_heads,
       num_kv_heads, head_dim, page_size);
 
