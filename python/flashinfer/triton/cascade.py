@@ -8,7 +8,7 @@ from .kernels.cascade import (
     merge_states_kernel,
     variable_length_merge_states_kernel,
 )
-from .utils import check_dim, check_input, check_shape
+from .utils import check_device, check_dim, check_input, check_shape
 
 
 def merge_state(
@@ -18,10 +18,7 @@ def merge_state(
     check_input(s_a)
     check_input(v_b)
     check_input(s_b)
-    device = v_a.device
-    assert s_a.device == device
-    assert v_b.device == device
-    assert s_b.device == device
+    check_device([v_a, s_a, v_b, s_b])
     check_dim(3, v_a)
     check_dim(2, s_a)
     check_dim(3, v_b)
@@ -58,10 +55,7 @@ def merge_state_in_place(
     check_input(s)
     check_input(v_other)
     check_input(s_other)
-    device = v.device
-    assert s.device == device
-    assert v_other.device == device
-    assert s_other.device == device
+    check_device([v, s, v_other, s_other])
     check_dim(3, v)
     check_dim(2, s)
     check_dim(3, v_other)
@@ -90,8 +84,7 @@ def merge_state_in_place(
 def merge_states(v: torch.Tensor, s: torch.Tensor):
     check_input(v)
     check_input(s)
-    device = v.device
-    assert s.device == device
+    check_device([v, s])
     check_dim(4, v)
     check_dim(3, s)
     assert v.size(0) == s.size(0)
@@ -128,8 +121,7 @@ def variable_length_merge_states(
 ):
     check_input(v)
     check_input(s)
-    device = v.device
-    assert s.device == device
+    check_device([v, s])
     check_dim(3, v)
     check_dim(2, s)
     assert v.size(0) == s.size(0)

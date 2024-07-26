@@ -1,13 +1,14 @@
+import pytest
 import torch
 
 import flashinfer
 import flashinfer.triton
 
 
-def test_merge_state():
-    seq_len = 2048
-    num_heads = 32
-    head_dim = 128
+@pytest.mark.parametrize("seq_len", [2048])
+@pytest.mark.parametrize("num_heads", [32])
+@pytest.mark.parametrize("head_dim", [128])
+def test_merge_state(seq_len, num_heads, head_dim):
     va = torch.randn(seq_len, num_heads, head_dim).half().to("cuda:0")
     sa = torch.randn(seq_len, num_heads, dtype=torch.float32).to("cuda:0")
     vb = torch.randn(seq_len, num_heads, head_dim).half().to("cuda:0")
@@ -19,10 +20,10 @@ def test_merge_state():
     assert torch.allclose(s_merged, s_merged_std, atol=1e-2)
 
 
-def test_merge_state_in_place():
-    seq_len = 2048
-    num_heads = 32
-    head_dim = 128
+@pytest.mark.parametrize("seq_len", [2048])
+@pytest.mark.parametrize("num_heads", [32])
+@pytest.mark.parametrize("head_dim", [128])
+def test_merge_state_in_place(seq_len, num_heads, head_dim):
     v = torch.randn(seq_len, num_heads, head_dim).half()
     v_std = v.clone()
     v, v_std = v.to("cuda:0"), v_std.to("cuda:0")
@@ -38,11 +39,11 @@ def test_merge_state_in_place():
     assert torch.allclose(s, s_std, atol=1e-2)
 
 
-def test_merge_states():
-    seq_len = 2048
-    num_heads = 32
-    head_dim = 128
-    num_states = 100
+@pytest.mark.parametrize("seq_len", [2048])
+@pytest.mark.parametrize("num_heads", [32])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("num_states", [100])
+def test_merge_states(seq_len, num_states, num_heads, head_dim):
     v = torch.randn(seq_len, num_states, num_heads, head_dim).half().to("cuda:0")
     s = torch.randn(seq_len, num_states, num_heads, dtype=torch.float32).to("cuda:0")
     v_merged_std, s_merged_std = flashinfer.merge_states(v, s)
@@ -52,11 +53,10 @@ def test_merge_states():
     assert torch.allclose(s_merged, s_merged_std, atol=1e-2)
 
 
-def test_variable_length_merge_states():
-    seq_len = 512
-    num_heads = 32
-    head_dim = 128
-
+@pytest.mark.parametrize("seq_len", [2048])
+@pytest.mark.parametrize("num_heads", [32])
+@pytest.mark.parametrize("head_dim", [128])
+def test_variable_length_merge_states(seq_len, num_heads, head_dim):
     max_index_sets = 512
     lengths = torch.randint(low=1, high=max_index_sets, size=(seq_len,))
     indptr = [0]
@@ -79,10 +79,3 @@ def test_variable_length_merge_states():
         assert v_merged[i].shape == v_merged_std.shape
         assert torch.allclose(v_merged[i], v_merged_std, atol=1e-2)
         assert torch.allclose(s_merged[i], s_merged_std, atol=1e-2)
-
-
-if __name__ == "__main__":
-    test_merge_state()
-    test_merge_state_in_place()
-    test_merge_states()
-    test_variable_length_merge_states()

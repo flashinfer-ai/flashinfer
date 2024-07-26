@@ -1,3 +1,5 @@
+from typing import List
+
 import torch
 
 
@@ -11,6 +13,16 @@ def check_dim(d, x: torch.Tensor):
 
 
 def check_shape(a: torch.Tensor, b: torch.Tensor):
-    assert a.dim() == b.dim()
+    assert a.dim() == b.dim(), f"tensors should have same dim"
     for i in range(a.dim()):
-        assert a.size(i) == b.size(i)
+        assert a.size(i) == b.size(
+            i
+        ), f"tensors shape mismatch, {a.size()} and {b.size()}"
+
+
+def check_device(tensors: List[torch.Tensor]):
+    device = tensors[0].device
+    for t in tensors:
+        assert (
+            t.device == device
+        ), f"All tensors should be on the same device, but got {device} and {t.device}"
