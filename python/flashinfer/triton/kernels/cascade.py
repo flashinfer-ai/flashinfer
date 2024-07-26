@@ -129,3 +129,31 @@ def merge_states_kernel(
                 tl.store(
                     s_merged_ptr + pos * num_heads + head_idx, state_get_lse(o, m, d)
                 )
+
+
+@triton.jit
+def variable_length_merge_states_kernel(
+    v_ptr,
+    s_ptr,
+    indptr,
+    v_merged_ptr,
+    s_merged_ptr,
+    num_heads,
+    head_dim,
+    bdx: tl.constexpr,
+    bdy: tl.constexpr,
+):
+    pos = tl.program_id(axis=0)
+    for tx in tl.range(bdx):
+        for head_idx in tl.range(bdy):
+            o, m, d = 0.0, -5e4, 1.0
+            for iter in tl.range(tl.load(indptr + pos), tl.load(indptr + pos + 1)):
+                s = tl.load(s_ptr + iter * num_heads + head_idx)
+                v = tl.load(v_ptr + (iter * num_heads + head_idx) * head_dim + tx)
+                o, m, d = state_merge(o, m, d, v, s, 1)
+            o, m, d = state_normalize(o, m, d)
+            tl.store(v_merged_ptr + (pos * num_heads + head_idx) * head_dim + tx, o)
+            if s_merged_ptr:
+                tl.store(
+                    s_merged_ptr + pos * num_heads + head_idx, state_get_lse(o, m, d)
+                )

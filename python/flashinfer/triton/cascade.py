@@ -6,6 +6,7 @@ from .kernels.cascade import (
     merge_state_in_place_kernel,
     merge_state_kernel,
     merge_states_kernel,
+    variable_length_merge_states_kernel,
 )
 from .utils import check_dim, check_input, check_shape
 
@@ -114,6 +115,43 @@ def merge_states(v: torch.Tensor, s: torch.Tensor):
         v_merged,
         s_merged,
         num_index_sets,
+        num_heads,
+        head_dim,
+        bdx=bdx,
+        bdy=bdy,
+    )
+    return v_merged, s_merged
+
+
+def variable_length_merge_states(
+    v: torch.Tensor, s: torch.Tensor, indptr: torch.Tensor
+):
+    check_input(v)
+    check_input(s)
+    device = v.device
+    assert s.device == device
+    check_dim(3, v)
+    check_dim(2, s)
+    assert v.size(0) == s.size(0)
+    assert v.size(1) == s.size(1)
+    seq_len = indptr.size(0) - 1
+    num_heads = v.size(1)
+    head_dim = v.size(2)
+    s = s.to(torch.float32)
+    indptr = indptr.to(torch.int32)
+    v_merged = torch.empty(
+        (seq_len, num_heads, head_dim), dtype=v.dtype, device=v.device
+    )
+    s_merged = torch.empty((seq_len, num_heads), dtype=s.dtype, device=s.device)
+
+    bdx = head_dim
+    bdy = num_heads
+    variable_length_merge_states_kernel[(seq_len,)](
+        v,
+        s,
+        indptr,
+        v_merged,
+        s_merged,
         num_heads,
         head_dim,
         bdx=bdx,
