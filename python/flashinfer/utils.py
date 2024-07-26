@@ -22,7 +22,8 @@ from typing import Optional, Tuple, Union
 class PosEncodingMode(Enum):
     NONE = 0
     ROPE_LLAMA = 1
-    ALIBI = 2
+    ROPE_INTERLEAVE = 2
+    ALIBI = 3
 
 
 class TensorLayout(Enum):
