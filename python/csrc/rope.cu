@@ -56,6 +56,7 @@ void apply_rope_inplace(torch::Tensor q, torch::Tensor k, torch::Tensor indptr,
         k_stride_h, rope_scale, rope_theta, torch_current_stream);
     TORCH_CHECK(status == cudaSuccess, "BatchQKApplyRotaryInPlace failed with error code " +
                                            std::string(cudaGetErrorString(status)));
+    return true;
   });
 }
 
@@ -98,5 +99,6 @@ void apply_llama31_rope_inplace(torch::Tensor q, torch::Tensor k, torch::Tensor 
         torch_current_stream);
     TORCH_CHECK(status == cudaSuccess, "BatchQKApplyLlama31RotaryInPlace failed with error code " +
                                            std::string(cudaGetErrorString(status)));
+    return true;
   });
 }

@@ -91,9 +91,11 @@ def apply_llama31_rope_inplace(
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where ``nnz`` is the last
+        element of ``indptr``.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
+        element of ``indptr``.
     indptr : torch.Tensor
         Indptr tensor, shape: ``(batch_size + 1)``.
     offsets : torch.Tensor
