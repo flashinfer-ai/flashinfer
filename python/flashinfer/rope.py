@@ -35,7 +35,7 @@ def apply_rope_inplace(
     k: torch.Tensor,
     indptr: torch.Tensor,
     offsets: torch.Tensor,
-    interleave: bool = True,
+    interleave: bool = False,
     rope_scale: float = 1,
     rope_theta: float = 1e4,
 ) -> None:
@@ -61,7 +61,15 @@ def apply_rope_inplace(
     offsets : torch.Tensor
         The relative position offsets of each query in the batch, shape: ``(batch_size)``.
     interleave : bool
-        Whether to use interleave layout in the last dimension, default: ``True``.
+        Whether to use interleaved layout in the last dimension, default: ``False``.
+
+        * If ``True``, the last dimension of the query/key tensor is interleaved, i.e.,
+          we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
+
+        * If ``False``, the last dimension of the query/key tensor is not interleaved, i.e.,
+          we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          dimensions ``([..., head_dim//2:])``.
+
     rope_scale : float
         The scaling factor used in the rope embedding, default: ``1``.
     rope_theta : float
@@ -107,7 +115,15 @@ def apply_llama31_rope_inplace(
     offsets : torch.Tensor
         The relative position offsets of each query in the batch, shape: ``(batch_size)``.
     interleave : bool
-        Whether to use interleave layout in the last dimension, default: ``True``.
+        Whether to use interleaved layout in the last dimension, default: ``False``.
+
+        * If ``True``, the last dimension of the query/key tensor is interleaved, i.e.,
+          we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
+
+        * If ``False``, the last dimension of the query/key tensor is not interleaved, i.e.,
+          we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          dimensions ``([..., head_dim//2:])``.
+
     rope_scale : float
         The scaling factor used in the rope embedding, default: ``8``.
     rope_theta : float
@@ -117,7 +133,7 @@ def apply_llama31_rope_inplace(
     high_freq_factor : float
         The high frequency factor used in Llama 3.1 RoPE, default: ``4``.
     old_context_len : int
-        The old context length used in Llama 3.1 RoPE, default.
+        The old context length used in Llama 3.1 RoPE, default: ``8192``.
     """
     return _kernels.apply_llama31_rope_inplace(
         q,

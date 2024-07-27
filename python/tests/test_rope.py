@@ -64,7 +64,9 @@ def test_llama_rope(
     k_rope = k_rope.reshape(nnz, num_kv_heads, head_dim)
 
     # flashinfer implementation
-    flashinfer.apply_rope_inplace(q, k, indptr, offsets, rope_theta=1e4)
+    flashinfer.apply_rope_inplace(
+        q, k, indptr, offsets, interleave=True, rope_theta=1e4
+    )
 
     # compare
     np.testing.assert_allclose(
@@ -118,7 +120,9 @@ def test_llama31_rope(
     k_rope = k_rope.reshape(nnz, num_kv_heads, head_dim)
 
     # flashinfer implementation
-    flashinfer.apply_llama31_rope_inplace(q, k, indptr, offsets, rope_theta=5e5)
+    flashinfer.apply_llama31_rope_inplace(
+        q, k, indptr, offsets, interleave=True, rope_theta=5e5
+    )
 
     # compare
     np.testing.assert_allclose(

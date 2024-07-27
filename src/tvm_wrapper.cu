@@ -691,7 +691,7 @@ void _FlashInferBatchQKApplyRotaryInPlace(DLTensor* q, DLTensor* k, DLTensor* in
             static_cast<dtype*>(q->data), static_cast<dtype*>(k->data),
             static_cast<idtype*>(indptr->data), static_cast<idtype*>(offsets->data), batch_size,
             num_qo_heads, num_kv_heads, head_dim, q_stride_n, q_stride_h, k_stride_n, k_stride_h,
-            rope_scale, rope_theta);
+            /*interleave=*/false, rope_scale, rope_theta);
         if (status != cudaSuccess) {
           LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
         }
