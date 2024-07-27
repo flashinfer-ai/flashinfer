@@ -73,7 +73,7 @@ def apply_llama31_rope_inplace(
     indptr: torch.Tensor,
     offsets: torch.Tensor,
     rope_scale: float = 8,
-    rope_theta: float = 1e4,
+    rope_theta: float = 5e5,
     low_freq_factor: float = 1,
     high_freq_factor: float = 4,
     old_context_len: int = 8192,
@@ -103,7 +103,7 @@ def apply_llama31_rope_inplace(
     rope_scale : float
         The scaling factor used in the rope embedding, default: ``8``.
     rope_theta : float
-        The theta value used in the rope embedding, default: ``1e4``.
+        The theta value used in the rope embedding, default: ``5e5``.
     low_freq_factor : float
         The low frequency factor used in Llama 3.1 RoPE, default: ``1``.
     high_freq_factor : float

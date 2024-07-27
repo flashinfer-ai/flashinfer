@@ -44,6 +44,7 @@ from .sampling import (
     chain_speculative_sampling,
 )
 from .norm import rmsnorm
+from .rope import apply_rope_inplace, apply_llama31_rope_inplace
 from .group_gemm import SegmentGEMMWrapper
 from .quantization import packbits, segment_packbits
 
