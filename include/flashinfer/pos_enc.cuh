@@ -157,8 +157,6 @@ cudaError_t BatchQKApplyRotaryInPlace(DType* __restrict__ q, DType* __restrict__
                                       cudaStream_t stream = nullptr) {
   float rope_rcp_scale = 1.0f / rope_scale;
   float rope_rcp_theta = 1.0f / rope_theta;
-  float low_freq_wavelen = old_context_length / low_freq_factor;
-  float high_freq_wavelen = old_context_length / high_freq_factor;
   float smooth_a = 0.f;
   float smooth_b = 1.f;
 
