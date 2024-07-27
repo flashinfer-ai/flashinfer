@@ -200,10 +200,8 @@ cudaError_t Llama31BatchQKApplyRotaryInPlace(
     float old_context_length, cudaStream_t stream = nullptr) {
   float rope_rcp_scale = 1.0f / rope_scale;
   float rope_rcp_theta = 1.0f / rope_theta;
-  float low_freq_wavelen = old_context_length / low_freq_factor;
-  float high_freq_wavelen = old_context_length / high_freq_factor;
-  float smooth_a = 1.0f / (2 * M_PI / high_freq_wavelen - 2 * M_PI / low_freq_wavelen);
-  float smooth_b = -1.0f / (low_freq_wavelen / high_freq_wavelen - 1.0f);
+  float smooth_a = old_context_length / (2 * M_PI * high_freq_factor - 2 * M_PI * low_freq_factor);
+  float smooth_b = -1.0f / (high_freq_factor / low_freq_factor - 1.0f);
 
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
