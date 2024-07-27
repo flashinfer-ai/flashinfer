@@ -35,6 +35,7 @@ def apply_rope_inplace(
     k: torch.Tensor,
     indptr: torch.Tensor,
     offsets: torch.Tensor,
+    interleave: bool = True,
     rope_scale: float = 1,
     rope_theta: float = 1e4,
 ) -> None:
@@ -59,12 +60,16 @@ def apply_rope_inplace(
         Indptr tensor, shape: ``(batch_size + 1)``.
     offsets : torch.Tensor
         The relative position offsets of each query in the batch, shape: ``(batch_size)``.
+    interleave : bool
+        Whether to use interleave layout in the last dimension, default: ``True``.
     rope_scale : float
         The scaling factor used in the rope embedding, default: ``1``.
     rope_theta : float
         The theta value used in the rope embedding, default: ``1e4``.
     """
-    return _kernels.apply_rope_inplace(q, k, indptr, offsets, rope_scale, rope_theta)
+    return _kernels.apply_rope_inplace(
+        q, k, indptr, offsets, interleave, rope_scale, rope_theta
+    )
 
 
 def apply_llama31_rope_inplace(
@@ -72,6 +77,7 @@ def apply_llama31_rope_inplace(
     k: torch.Tensor,
     indptr: torch.Tensor,
     offsets: torch.Tensor,
+    interleave: bool = True,
     rope_scale: float = 8,
     rope_theta: float = 5e5,
     low_freq_factor: float = 1,
@@ -100,6 +106,8 @@ def apply_llama31_rope_inplace(
         Indptr tensor, shape: ``(batch_size + 1)``.
     offsets : torch.Tensor
         The relative position offsets of each query in the batch, shape: ``(batch_size)``.
+    interleave : bool
+        Whether to use interleave layout in the last dimension, default: ``True``.
     rope_scale : float
         The scaling factor used in the rope embedding, default: ``8``.
     rope_theta : float
@@ -116,6 +124,7 @@ def apply_llama31_rope_inplace(
         k,
         indptr,
         offsets,
+        interleave,
         rope_scale,
         rope_theta,
         low_freq_factor,

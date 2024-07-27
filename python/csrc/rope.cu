@@ -21,7 +21,8 @@
 using namespace flashinfer;
 
 void apply_rope_inplace(torch::Tensor q, torch::Tensor k, torch::Tensor indptr,
-                        torch::Tensor offsets, float rope_scale, float rope_theta) {
+                        torch::Tensor offsets, bool interleave, float rope_scale,
+                        float rope_theta) {
   CHECK_CUDA(q);  // not necessarily contiguous
   CHECK_CUDA(k);  // not necessarily contiguous
   CHECK_INPUT(indptr);
@@ -53,7 +54,7 @@ void apply_rope_inplace(torch::Tensor q, torch::Tensor k, torch::Tensor indptr,
         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
         static_cast<int32_t*>(indptr.data_ptr()), static_cast<int32_t*>(offsets.data_ptr()),
         batch_size, num_qo_heads, num_kv_heads, head_dim, q_stride_n, q_stride_h, k_stride_n,
-        k_stride_h, rope_scale, rope_theta, torch_current_stream);
+        k_stride_h, interleave, rope_scale, rope_theta, torch_current_stream);
     TORCH_CHECK(status == cudaSuccess, "BatchQKApplyRotaryInPlace failed with error code " +
                                            std::string(cudaGetErrorString(status)));
     return true;
@@ -61,8 +62,8 @@ void apply_rope_inplace(torch::Tensor q, torch::Tensor k, torch::Tensor indptr,
 }
 
 void apply_llama31_rope_inplace(torch::Tensor q, torch::Tensor k, torch::Tensor indptr,
-                                torch::Tensor offsets, float rope_scale, float rope_theta,
-                                float low_freq_factor, float high_freq_factor,
+                                torch::Tensor offsets, bool interleave, float rope_scale,
+                                float rope_theta, float low_freq_factor, float high_freq_factor,
                                 float old_context_length) {
   CHECK_CUDA(q);  // not necessarily contiguous
   CHECK_CUDA(k);  // not necessarily contiguous
@@ -95,8 +96,8 @@ void apply_llama31_rope_inplace(torch::Tensor q, torch::Tensor k, torch::Tensor 
         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
         static_cast<int32_t*>(indptr.data_ptr()), static_cast<int32_t*>(offsets.data_ptr()),
         batch_size, num_qo_heads, num_kv_heads, head_dim, q_stride_h, q_stride_h, k_stride_n,
-        k_stride_h, rope_scale, rope_theta, low_freq_factor, high_freq_factor, old_context_length,
-        torch_current_stream);
+        k_stride_h, interleave, rope_scale, rope_theta, low_freq_factor, high_freq_factor,
+        old_context_length, torch_current_stream);
     TORCH_CHECK(status == cudaSuccess, "BatchQKApplyLlama31RotaryInPlace failed with error code " +
                                            std::string(cudaGetErrorString(status)));
     return true;
