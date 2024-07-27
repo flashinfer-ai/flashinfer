@@ -681,12 +681,17 @@ void _FlashInferBatchQKApplyRotaryInPlace(DLTensor* q, DLTensor* k, DLTensor* in
                                           DLTensor* offsets, int64_t batch_size,
                                           int64_t num_qo_heads, int64_t num_kv_heads,
                                           int64_t head_dim, double rope_scale, double rope_theta) {
+  size_t q_stride_n = q->strides[0];
+  size_t q_stride_h = q->strides[1];
+  size_t k_stride_n = k->strides[0];
+  size_t k_stride_h = k->strides[1];
   DISPATCH_TVM_CUDA_DTYPE(
       q->dtype, dtype, {DISPATCH_TVM_CUDA_IDTYPE(indptr->dtype, idtype, {
         cudaError_t status = BatchQKApplyRotaryInPlace(
             static_cast<dtype*>(q->data), static_cast<dtype*>(k->data),
             static_cast<idtype*>(indptr->data), static_cast<idtype*>(offsets->data), batch_size,
-            num_qo_heads, num_kv_heads, head_dim, rope_scale, rope_theta);
+            num_qo_heads, num_kv_heads, head_dim, q_stride_n, q_stride_h, k_stride_n, k_stride_h,
+            rope_scale, rope_theta);
         if (status != cudaSuccess) {
           LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
         }

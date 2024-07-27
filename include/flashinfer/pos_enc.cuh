@@ -190,7 +190,7 @@ cudaError_t BatchQKApplyRotaryInPlace(DType* __restrict__ q, DType* __restrict__
 }
 
 template <typename DType, typename IdType>
-cudaError_t Llama31BatchQKApplyRotaryInPlace(
+cudaError_t BatchQKApplyLlama31RotaryInPlace(
     DType* __restrict__ q, DType* __restrict__ k, IdType* __restrict__ indptr,
     IdType* __restrict__ offsets, uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
     uint32_t head_dim, size_t q_stride_n, size_t q_stride_h, size_t k_stride_n, size_t k_stride_h,
