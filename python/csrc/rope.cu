@@ -95,7 +95,7 @@ void apply_llama31_rope_inplace(torch::Tensor q, torch::Tensor k, torch::Tensor 
     cudaError_t status = BatchQKApplyLlama31RotaryInPlace(
         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
         static_cast<int32_t*>(indptr.data_ptr()), static_cast<int32_t*>(offsets.data_ptr()),
-        batch_size, num_qo_heads, num_kv_heads, head_dim, q_stride_h, q_stride_h, k_stride_n,
+        batch_size, num_qo_heads, num_kv_heads, head_dim, q_stride_n, q_stride_h, k_stride_n,
         k_stride_h, interleave, rope_scale, rope_theta, low_freq_factor, high_freq_factor,
         old_context_length, torch_current_stream);
     TORCH_CHECK(status == cudaSuccess, "BatchQKApplyLlama31RotaryInPlace failed with error code " +
