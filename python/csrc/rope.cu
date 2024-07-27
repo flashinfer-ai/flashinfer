@@ -52,7 +52,7 @@ void apply_rope_inplace(torch::Tensor q, torch::Tensor k, torch::Tensor indptr,
     cudaError_t status = BatchQKApplyRotaryInPlace(
         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
         static_cast<int32_t*>(indptr.data_ptr()), static_cast<int32_t*>(offsets.data_ptr()),
-        batch_size, num_qo_heads, num_kv_heads, head_dim, q_stride_h, q_stride_h, k_stride_n,
+        batch_size, num_qo_heads, num_kv_heads, head_dim, q_stride_n, q_stride_h, k_stride_n,
         k_stride_h, rope_scale, rope_theta, torch_current_stream);
     TORCH_CHECK(status == cudaSuccess, "BatchQKApplyRotaryInPlace failed with error code " +
                                            std::string(cudaGetErrorString(status)));
