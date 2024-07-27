@@ -40,12 +40,21 @@ def apply_rope_inplace(
 ) -> None:
     r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor) inplace.
 
+    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
+    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
+    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
+    0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
+    Please see :ref:`Ragged Tensor tutorial <ragged-layout>` for more details about the
+    ragged tensor.
+
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)`.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)`, where ``nnz`` is the last
+        element of ``indptr``.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
+        element of ``indptr``.
     indptr : torch.Tensor
         Indptr tensor, shape: ``(batch_size + 1)``.
     offsets : torch.Tensor
@@ -69,7 +78,15 @@ def apply_llama31_rope_inplace(
     high_freq_factor: float = 4,
     old_context_len: int = 8192,
 ) -> None:
-    r"""Apply Llama 3.1 style rotary embedding to a batch of queries/keys (stored as RaggedTensor) inplace.
+    r"""Apply Llama 3.1 style rotary embedding to a batch of queries/keys (stored as
+    RaggedTensor) inplace.
+
+    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
+    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
+    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
+    0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
+    Please see :ref:`Ragged Tensor tutorial <ragged-layout>` for more details about the
+    ragged tensor.
 
     Parameters
     ----------
