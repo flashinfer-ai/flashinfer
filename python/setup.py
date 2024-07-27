@@ -318,6 +318,7 @@ if __name__ == "__main__":
                 "csrc/batch_prefill.cu",
                 "csrc/sampling.cu",
                 "csrc/norm.cu",
+                "csrc/rope.cu",
                 "csrc/group_gemm.cu",
                 "csrc/quantization.cu",
             ]

@@ -35,4 +35,5 @@ FlashInfer is a library for Large Language Models that provides high-performance
    api/python/sampling
    api/python/group_gemm
    api/python/norm
+   api/python/rope
    api/python/quantization

@@ -75,6 +75,14 @@ torch::Tensor chain_speculative_sampling(torch::Tensor draft_probs, torch::Tenso
 
 torch::Tensor rmsnorm(torch::Tensor x, torch::Tensor w, double eps);
 
+void apply_rope_inplace(torch::Tensor q, torch::Tensor k, torch::Tensor indptr,
+                        torch::Tensor offsets, bool interleave, float rope_scale, float rope_theta);
+
+void apply_llama31_rope_inplace(torch::Tensor q, torch::Tensor k, torch::Tensor indptr,
+                                torch::Tensor offsets, bool interleave, float rope_scale,
+                                float rope_theta, float low_freq_factor, float high_freq_factor,
+                                float old_context_length);
+
 torch::Tensor packbits(torch::Tensor x, const std::string& bitorder);
 
 torch::Tensor segment_packbits(torch::Tensor x, torch::Tensor input_indptr,
