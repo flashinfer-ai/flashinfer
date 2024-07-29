@@ -1171,7 +1171,8 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
   // write back
   write_o_reg_gmem<num_warps_x, num_warps_z, num_frags_x, num_frags_y>(
       o_frag, &qo_smem, o_ptr_base, qo_packed_idx_base, qo_len,
-      partition_kv ? q_stride_n * num_chunks : q_stride_n, q_stride_h, group_size);
+      /*o_stride_n=*/partition_kv ? num_qo_heads * head_dim * num_chunks : num_qo_heads * head_dim,
+      /*o_stride_h=*/head_dim, group_size);
 
   // write lse
   if (lse != nullptr || partition_kv) {
@@ -1438,7 +1439,9 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
   // write back
   write_o_reg_gmem<num_warps_x, num_warps_z, num_frags_x, num_frags_y>(
       o_frag, &qo_smem, o_ptr_base, qo_packed_idx_base, qo_len,
-      partition_kv ? q_stride_n * num_kv_chunks : q_stride_n, q_stride_h, group_size);
+      /*o_stride_n=*/
+          partition_kv ? num_qo_heads * head_dim * num_kv_chunks : num_qo_heads * head_dim,
+      /*o_stride_h=*/head_dim, group_size);
 
   // write lse
   if (lse != nullptr) {
@@ -1728,7 +1731,9 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
   // write_back
   write_o_reg_gmem<num_warps_x, num_warps_z, num_frags_x, num_frags_y>(
       o_frag, &qo_smem, o_ptr_base, qo_packed_idx_base, qo_len,
-      partition_kv ? q_stride_n * num_kv_chunks : q_stride_n, q_stride_h, group_size);
+      /*o_stride_n=*/
+          partition_kv ? num_qo_heads * head_dim * num_kv_chunks : num_qo_heads * head_dim,
+      /*o_stride_h=*/head_dim, group_size);
 
   // write lse
   if (lse != nullptr) {
