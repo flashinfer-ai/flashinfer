@@ -83,8 +83,6 @@ struct tensor_info_t {
     q_stride_h = head_dim;
     kv_stride_n = (kv_layout == QKVLayout::kNHD) ? num_kv_heads * head_dim : head_dim;
     kv_stride_h = (kv_layout == QKVLayout::kNHD) ? head_dim : kv_len * head_dim;
-    // std::tie(q_stride_n, q_stride_h, kv_stride_n, kv_stride_h) =
-    //     get_qkv_strides(kv_layout, kv_len, num_qo_heads, num_kv_heads, head_dim);
   }
 
   __host__ __device__ __forceinline__ size_t get_q_elem_offset(uint32_t qo_idx,
