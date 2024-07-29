@@ -600,8 +600,8 @@ __device__ __forceinline__ void mask_s(const uint32_t qo_packed_idx_base,
         const bool out_of_boundary =
             (mask_mode == MaskMode::kCausal
                  ? (kv_idx + qo_len > kv_len + q_idx || (partition_kv && kv_idx >= chunk_end) ||
-                    kv_idx + window_left < q_idx)
-                 : kv_idx >= chunk_end || kv_idx + window_left < q_idx);
+                    kv_idx + qo_len + window_left < kv_len + q_idx)
+                 : kv_idx >= chunk_end || kv_idx + qo_len + window_left < kv_len + q_idx);
         s_frag[fx][fz][reg_id] =
             (out_of_boundary ||
              (mask_mode == MaskMode::kCustom && q_idx < qo_len &&
@@ -1064,8 +1064,9 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
       16 * num_warps_z * num_frags_z);
 
   const uint32_t window_iteration =
-      sub_if_greater_or_zero(kv_len, window_left + (bx + 1) * num_rows_per_cta - 1 + chunk_start) /
-      (16 * num_warps_z * num_frags_z);
+      ceil_div(sub_if_greater_or_zero(kv_len + (bx + 1) * num_rows_per_cta,
+                                      qo_len + window_left + chunk_start),
+               (16 * num_warps_z * num_frags_z));
 
   const uint32_t mask_iteration =
       (mask_mode == MaskMode::kCausal
@@ -1327,8 +1328,9 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
                16 * num_warps_z * num_frags_z);
 
   const uint32_t window_iteration =
-      sub_if_greater_or_zero(kv_len, window_left + (bx + 1) * num_rows_per_cta - 1 + chunk_start) /
-      (16 * num_warps_z * num_frags_z);
+      ceil_div(sub_if_greater_or_zero(kv_len + (bx + 1) * num_rows_per_cta,
+                                      qo_len + window_left + chunk_start),
+               (16 * num_warps_z * num_frags_z));
 
   const uint32_t mask_iteration =
       (mask_mode == MaskMode::kCausal
@@ -1640,8 +1642,9 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
                16 * num_warps_z * num_frags_z);
 
   const uint32_t window_iteration =
-      sub_if_greater_or_zero(kv_len, window_left + (bx + 1) * num_rows_per_cta - 1 + chunk_start) /
-      (16 * num_warps_z * num_frags_z);
+      ceil_div(sub_if_greater_or_zero(kv_len + (bx + 1) * num_rows_per_cta,
+                                      qo_len + window_left + chunk_start),
+               (16 * num_warps_z * num_frags_z));
 
   const uint32_t mask_iteration =
       (mask_mode == MaskMode::kCausal

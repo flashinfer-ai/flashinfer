@@ -102,7 +102,8 @@ __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage
     }
     s[j] = apply_logits_post_hook<logits_post_hook>(s[j], logits_soft_cap);
     uint32_t pos = iter_base + tz * tile_size + j;
-    s[j] = (pos < right_open_bound && pos >= left_close_bound) ? s[j] : -5e4;
+    s[j] = (pos < right_open_bound && kv_idx_base + tz * tile_size + j >= left_close_bound) ? s[j]
+                                                                                            : -5e4;
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
       s[j] += alibi_slope * float(int(kv_idx_base + tz * tile_size + j) - q_offset);
     }
