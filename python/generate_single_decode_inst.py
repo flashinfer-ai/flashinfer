@@ -39,7 +39,7 @@ namespace flashinfer {{
 template cudaError_t SingleDecodeWithKVCacheDispatched<{head_dim}, {logits_hook}, {pos_encoding_mode}, {dtype_q}, {dtype_kv}, {dtype_out}>(
     {dtype_q}* q, {dtype_kv}* k, {dtype_kv}* v, {dtype_out}* o,
     {dtype_out}* tmp, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t seq_len,
-    QKVLayout kv_layout, float logits_soft_cap, float sm_scale, float rope_scale,
+    QKVLayout kv_layout, int32_t window_left, float logits_soft_cap, float sm_scale, float rope_scale,
     float rope_theta, cudaStream_t stream);
 
 }}

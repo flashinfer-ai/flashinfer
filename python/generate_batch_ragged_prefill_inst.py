@@ -47,7 +47,8 @@ def get_cu_file_str(
     {idtype}* o_indptr, {dtype_out}* o, {dtype_out}* tmp_v, float* tmp_s, float* lse, {idtype}* merge_indptr,
     bool* block_valid_mask, {idtype}* kv_chunk_size_ptr, uint32_t total_num_rows, uint32_t num_qo_heads,
     uint32_t padded_batch_size, uint32_t num_kv_heads, uint32_t q_stride_n, uint32_t q_stride_h,
-    uint32_t kv_stride_n, uint32_t kv_stride_h, float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta,
+    uint32_t kv_stride_n, uint32_t kv_stride_h, int32_t window_left,
+    float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta,
     cudaStream_t stream);
         """.format(
                 warp_layout=warp_layout_literal[warp_layout],

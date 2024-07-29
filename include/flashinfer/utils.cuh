@@ -246,6 +246,13 @@ inline void DebugPrintCUDAArray(T* device_ptr, size_t size, std::string prefix =
   std::cout << std::endl;
 }
 
+/*!
+ * \brief Return x - y if x > y, otherwise return 0.
+ */
+__device__ __forceinline__ uint32_t sub_if_greater_or_zero(uint32_t x, uint32_t y) {
+  return (x > y) ? x - y : 0U;
+}
+
 }  // namespace flashinfer
 
 #endif  // FLASHINFER_UTILS_CUH_

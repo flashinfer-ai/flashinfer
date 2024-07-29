@@ -43,6 +43,7 @@ cudaError_t SinglePrefillWithKVCacheCustomMask(
                                                       MaskMode::kCustom>(
                 q, k, v, custom_mask, o, tmp, lse, num_qo_heads, num_kv_heads, qo_len, kv_len,
                 qo_stride_n, qo_stride_h, kv_stride_n, kv_stride_h,
+                /*window_left=*/-1,
                 /*logits_soft_cap*/ 0.f, sm_scale, rope_scale, rope_theta, stream);
           })})});
   return cudaSuccess;
@@ -98,6 +99,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOu
                                                           ALLOW_FP16_QK_REDUCTION, MASK_MODE>(
                     q, k, v, /*custom_mask=*/nullptr, o, tmp, lse, num_qo_heads, num_kv_heads,
                     qo_len, kv_len, qo_stride_n, qo_stride_h, kv_stride_n, kv_stride_h,
+                    /*window_left=*/-1,
                     /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta, stream);
               })})})});
   return cudaSuccess;
@@ -129,6 +131,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
                     handler, q, qo_indptr, k, v, kv_indptr, /*custom_mask=*/nullptr,
                     /*qk_indptr=*/nullptr, q_offset, k_rope_pos_offset, o, lse, num_qo_heads,
                     num_kv_heads, qo_stride_n, qo_stride_h, kv_stride_n, kv_stride_h,
+                    /*window_left=*/-1,
                     /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta, stream);
               })})})});
   return cudaSuccess;
@@ -158,8 +161,8 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
                     ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeOut, IdType>(
                     handler, q, qo_indptr, q_offset, paged_kv,
                     /*custom_mask=*/nullptr,
-                    /*qk_indptr=*/nullptr, o, lse, num_qo_heads, /*logits_soft_cap=*/0.f, sm_scale,
-                    rope_scale, rope_theta, stream);
+                    /*qk_indptr=*/nullptr, o, lse, num_qo_heads, /*window_left=*/-1,
+                    /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta, stream);
               })})})});
   return cudaSuccess;
 }
@@ -184,6 +187,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut*
       head_dim, HEAD_DIM, {DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
         SingleDecodeWithKVCacheDispatched<HEAD_DIM, LogitsPostHook::kNone, POS_ENCODING_MODE>(
             q, k, v, o, tmp, num_qo_heads, num_kv_heads, seq_len, kv_layout,
+            /*window_left=*/-1,
             /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta, stream);
       })});
   return cudaSuccess;
@@ -215,6 +219,7 @@ cudaError_t BatchDecodeWithPagedKVCacheNoSplitKV(
                                                      IdType>(
             q, q_offset, paged_kv, kv_partition_info, o, /*tmp_v=*/nullptr, /*tmp_s=*/nullptr, lse,
             /*block_valid_mask=*/nullptr, /*padded_batch_size=*/paged_kv.batch_size, num_qo_heads,
+            /*window_left=*/-1,
             /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta, stream);
       })});
 
@@ -265,6 +270,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapper(
                           PAGE_STORAGE, HEAD_DIM, LogitsPostHook::kNone, POS_ENCODING_MODE, DTypeQ,
                           DTypeKV, DTypeOut, IdType>(
                           handler, q, q_offset, paged_kv, o, lse, num_qo_heads,
+                          /*window_left=*/-1,
                           /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta, stream);
                     })});
   return cudaSuccess;
