@@ -75,7 +75,7 @@ __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage
                                            const vec_t<float, vec_size>& q_vec,
                                            const vec_t<float, vec_size>& freq, uint32_t kv_idx_base,
                                            uint32_t iter_base, uint32_t left_close_bound,
-                                           uint32_t kv_chunk_size, const int32_t q_offset,
+                                           uint32_t iter_bound, const int32_t q_offset,
                                            float alibi_slope, float* s, state_t<vec_size>& st,
                                            const float logits_soft_cap) {
   uint32_t tx = threadIdx.x, tz = threadIdx.z;
@@ -102,8 +102,7 @@ __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage
     }
     s[j] = apply_logits_post_hook<logits_post_hook>(s[j], logits_soft_cap);
     const uint32_t pos = kv_idx_base + tz * tile_size + j;
-    s[j] =
-        (iter_base + tz * tile_size + j < kv_chunk_size && pos >= left_close_bound) ? s[j] : -5e4;
+    s[j] = (iter_base + tz * tile_size + j < iter_bound && pos >= left_close_bound) ? s[j] : -5e4;
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
       s[j] += alibi_slope * float(int(pos) - q_offset);
     }
