@@ -12,3 +12,5 @@ Kernels for applying rotary embeddings.
     
     apply_rope_inplace
     apply_llama31_rope_inplace
+    apply_rope
+    apply_llama31_rope

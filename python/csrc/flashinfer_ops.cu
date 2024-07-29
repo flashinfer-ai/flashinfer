@@ -45,6 +45,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("apply_rope_inplace", &apply_rope_inplace, "Apply RoPE in-place");
   m.def("apply_llama31_rope_inplace", &apply_llama31_rope_inplace,
         "Apply Llama 3.1 style RoPE in-place");
+  m.def("apply_rope", &apply_rope, "Apply RoPE");
+  m.def("apply_llama31_rope", &apply_llama31_rope, "Apply Llama 3.1 style RoPE");
   m.def("packbits", &packbits, "GPU packbits operator");
   m.def("segment_packbits", &segment_packbits, "GPU segment packbits operator");
   py::class_<BatchDecodeWithPagedKVCachePyTorchWrapper>(m,
