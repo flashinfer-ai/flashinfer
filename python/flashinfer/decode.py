@@ -68,6 +68,7 @@ def single_decode_with_kv_cache(
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    window_left: int = -1,
     logits_soft_cap: Optional[float] = None,
     sm_scale: Optional[float] = None,
     rope_scale: Optional[float] = None,
@@ -102,6 +103,9 @@ def single_decode_with_kv_cache(
         The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
     v_scale : Optional[float]
         The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
+    window_left : int
+        The left (inclusive) window size for the attention window, when set to ``-1``, the window
+        size will be set to the full length of the sequence. Defaults to ``-1``.
     logits_soft_cap : Optional[float]
         The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
         provided, will be set to ``0``. If greater than 0, the logits will be capped according to
@@ -177,6 +181,7 @@ def single_decode_with_kv_cache(
             TensorLayout[kv_layout].value,
             PosEncodingMode[pos_encoding_mode].value,
             False,  # allow_fp16_qk_reduction
+            window_left,
             logits_soft_cap,
             sm_scale,
             rope_scale,
@@ -191,6 +196,7 @@ def single_decode_with_kv_cache(
             tmp,
             PosEncodingMode[pos_encoding_mode].value,
             TensorLayout[kv_layout].value,
+            window_left,
             logits_soft_cap,
             sm_scale,
             rope_scale,
@@ -546,6 +552,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
+        window_left: int = -1,
         logits_soft_cap: Optional[float] = None,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
@@ -581,6 +588,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
         v_scale : Optional[float]
             The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
+        window_left : int
+            The left (inclusive) window size for the attention window, when set to ``-1``, the window
+            size will be set to the full length of the sequence. Defaults to ``-1``.
         logits_soft_cap : Optional[float]
             The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
             provided, will be set to ``0``. If greater than 0, the logits will be capped according to
@@ -626,6 +636,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 False,  # causal
                 PosEncodingMode[pos_encoding_mode].value,
                 False,  # allow_fp16_qk_reduction
+                window_left,
                 logits_soft_cap,
                 sm_scale,
                 rope_scale,
@@ -640,6 +651,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,
                 PosEncodingMode[pos_encoding_mode].value,
+                window_left,
                 logits_soft_cap,
                 sm_scale,
                 rope_scale,
@@ -658,6 +670,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
+        window_left: int = -1,
         logits_soft_cap: Optional[float] = None,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
@@ -694,6 +707,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
         v_scale : Optional[float]
             The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
+        window_left : int
+            The left (inclusive) window size for the attention window, when set to ``-1``, the window
+            size will be set to the full length of the sequence. Defaults to ``-1``.
         logits_soft_cap : Optional[float]
             The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
             provided, will be set to ``0``. If greater than 0, the logits will be capped according to
@@ -745,6 +761,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 False,  # causal
                 PosEncodingMode[pos_encoding_mode].value,
                 False,  # allow_fp16_qk_reduction
+                window_left,
                 logits_soft_cap,
                 sm_scale,
                 rope_scale,
@@ -759,6 +776,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,
                 PosEncodingMode[pos_encoding_mode].value,
+                window_left,
                 logits_soft_cap,
                 sm_scale,
                 rope_scale,

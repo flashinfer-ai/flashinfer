@@ -66,6 +66,7 @@ def single_prefill_with_kv_cache(
     pos_encoding_mode: str = "NONE",
     allow_fp16_qk_reduction: bool = False,
     sm_scale: Optional[float] = None,
+    window_left: int = 0,
     logits_soft_cap: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
@@ -109,6 +110,9 @@ def single_prefill_with_kv_cache(
     allow_fp16_qk_reduction : bool
         Whether to use f16 for qk reduction (faster at the cost of slight precision
         loss).
+    window_left : int
+        The left (inclusive) window size for the attention window, when set to ``-1``, the window
+        size will be set to the full length of the sequence. Defaults to ``-1``.
     logits_soft_cap : Optional[float]
         The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
         provided, will be set to ``0``. If greater than 0, the logits will be capped according to
@@ -192,6 +196,7 @@ def single_prefill_with_kv_cache(
             TensorLayout[kv_layout].value,
             PosEncodingMode[pos_encoding_mode].value,
             allow_fp16_qk_reduction,
+            window_left,
             logits_soft_cap,
             sm_scale,
             rope_scale,
@@ -208,6 +213,7 @@ def single_prefill_with_kv_cache(
             TensorLayout[kv_layout].value,
             PosEncodingMode[pos_encoding_mode].value,
             allow_fp16_qk_reduction,
+            window_left,
             logits_soft_cap,
             sm_scale,
             rope_scale,
@@ -226,6 +232,7 @@ def single_prefill_with_kv_cache_return_lse(
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
     allow_fp16_qk_reduction: bool = False,
+    window_left: int = 0,
     logits_soft_cap: Optional[float] = None,
     sm_scale: Optional[float] = None,
     rope_scale: Optional[float] = None,
@@ -270,6 +277,9 @@ def single_prefill_with_kv_cache_return_lse(
     allow_fp16_qk_reduction : bool
         Whether to use f16 for qk reduction (faster at the cost of slight precision
         loss).
+    window_left : int
+        The left (inclusive) window size for the attention window, when set to ``-1``, the window
+        size will be set to the full length of the sequence. Defaults to ``-1``.
     logits_soft_cap : Optional[float]
         The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
         provided, will be set to ``0``. If greater than 0, the logits will be capped according to
@@ -371,6 +381,7 @@ def single_prefill_with_kv_cache_return_lse(
             TensorLayout[kv_layout].value,
             PosEncodingMode[pos_encoding_mode].value,
             allow_fp16_qk_reduction,
+            window_left,
             logits_soft_cap,
             sm_scale,
             rope_scale,
@@ -387,6 +398,7 @@ def single_prefill_with_kv_cache_return_lse(
             TensorLayout[kv_layout].value,
             PosEncodingMode[pos_encoding_mode].value,
             allow_fp16_qk_reduction,
+            window_left,
             logits_soft_cap,
             sm_scale,
             rope_scale,
@@ -806,6 +818,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         causal: bool = True,
         pos_encoding_mode: str = "NONE",
         allow_fp16_qk_reduction: bool = False,
+        window_left: int = -1,
         logits_soft_cap: Optional[float] = None,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
@@ -842,6 +855,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         allow_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
             loss).
+        window_left : int
+            The left (inclusive) window size for the attention window, when set to ``-1``, the window
+            size will be set to the full length of the sequence. Defaults to ``-1``.
         logits_soft_cap : Optional[float]
             The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
             provided, will be set to ``0``. If greater than 0, the logits will be capped according to
@@ -883,6 +899,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 causal,
                 PosEncodingMode[pos_encoding_mode].value,
                 allow_fp16_qk_reduction,
+                window_left,
                 logits_soft_cap,
                 sm_scale,
                 rope_scale,
@@ -901,6 +918,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._qk_indptr_buf,
                 PosEncodingMode[pos_encoding_mode].value,
                 allow_fp16_qk_reduction,
+                window_left,
                 logits_soft_cap,
                 sm_scale,
                 rope_scale,
@@ -915,6 +933,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         causal: bool = True,
         pos_encoding_mode: str = "NONE",
         allow_fp16_qk_reduction: bool = False,
+        window_left: int = -1,
         logits_soft_cap: Optional[float] = None,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
@@ -949,6 +968,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         allow_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
             loss).
+        window_left : int
+            The left (inclusive) window size for the attention window, when set to ``-1``, the window
+            size will be set to the full length of the sequence. Defaults to ``-1``.
         logits_soft_cap : Optional[float]
             The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
             provided, will be set to ``0``. If greater than 0, the logits will be capped according to
@@ -993,6 +1015,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 causal,
                 PosEncodingMode[pos_encoding_mode].value,
                 allow_fp16_qk_reduction,
+                window_left,
                 logits_soft_cap,
                 sm_scale,
                 rope_scale,
@@ -1011,6 +1034,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._qk_indptr_buf,
                 PosEncodingMode[pos_encoding_mode].value,
                 allow_fp16_qk_reduction,
+                window_left,
                 logits_soft_cap,
                 sm_scale,
                 rope_scale,
@@ -1356,6 +1380,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         causal: bool = True,
         pos_encoding_mode: str = "NONE",
         allow_fp16_qk_reduction: bool = False,
+        window_left: int = -1,
         logits_soft_cap: Optional[float] = None,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
@@ -1382,6 +1407,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         allow_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
             loss).
+        window_left : int
+            The left (inclusive) window size for the attention window, when set to ``-1``, the window
+            size will be set to the full length of the sequence. Defaults to ``-1``.
         logits_soft_cap : Optional[float]
             The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
             provided, will be set to ``0``. If greater than 0, the logits will be capped according to
@@ -1429,6 +1457,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 causal,
                 PosEncodingMode[pos_encoding_mode].value,
                 allow_fp16_qk_reduction,
+                window_left,
                 logits_soft_cap,
                 sm_scale,
                 rope_scale,
@@ -1446,6 +1475,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._qk_indptr_buf,
                 PosEncodingMode[pos_encoding_mode].value,
                 allow_fp16_qk_reduction,
+                window_left,
                 logits_soft_cap,
                 sm_scale,
                 rope_scale,
@@ -1461,6 +1491,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         causal: bool = True,
         pos_encoding_mode: str = "NONE",
         allow_fp16_qk_reduction: bool = False,
+        window_left: int = -1,
         logits_soft_cap: Optional[float] = None,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
@@ -1487,6 +1518,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         allow_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
             loss).
+        window_left : int
+            The left (inclusive) window size for the attention window, when set to ``-1``, the window
+            size will be set to the full length of the sequence. Defaults to ``-1``.
         logits_soft_cap : Optional[float]
             The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
             provided, will be set to ``0``. If greater than 0, the logits will be capped according to
@@ -1536,6 +1570,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 causal,
                 PosEncodingMode[pos_encoding_mode].value,
                 allow_fp16_qk_reduction,
+                window_left,
                 logits_soft_cap,
                 sm_scale,
                 rope_scale,
@@ -1553,6 +1588,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._qk_indptr_buf,
                 PosEncodingMode[pos_encoding_mode].value,
                 allow_fp16_qk_reduction,
+                window_left,
                 logits_soft_cap,
                 sm_scale,
                 rope_scale,
