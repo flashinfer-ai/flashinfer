@@ -391,7 +391,7 @@ void BatchPrefillWithRaggedKVCachePyTorchWrapper::UpdatePageLockedBufferSize(
 std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
     torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor k, torch::Tensor v,
     torch::Tensor kv_indptr, bool causal, unsigned int pos_encoding_mode,
-    bool allow_fp16_qk_reduction, float logits_soft_cap, int window_left, float sm_scale,
+    bool allow_fp16_qk_reduction, int window_left, float logits_soft_cap, float sm_scale,
     float rope_scale, float rope_theta, bool return_lse) {
   CHECK_INPUT(qo_indptr);
   CHECK_CUDA(q);

@@ -229,7 +229,8 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
   uint32_t num_qo_heads = info.num_qo_heads;
   const float alibi_slope = get_alibi_slope(qo_head_idx, num_qo_heads) * math::log2e;
   uint32_t seq_len = info.kv_len;
-  uint32_t left_close_bound = (window_left >= 0) ? sub_if_greater_or_zero(seq_len, window_left) : 0;
+  uint32_t left_close_bound =
+      (window_left >= 0) ? sub_if_greater_or_zero(seq_len, window_left + 1) : 0;
 
   extern __shared__ uint8_t smem[];
   DTypeKV* k_smem = (DTypeKV*)smem;
@@ -419,7 +420,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
   const uint32_t seq_len =
       partition_kv ? kv_partition_info.seq_lens_before_partition[batch_idx] : kv_chunk_len;
   const uint32_t left_close_bound =
-      (window_left >= 0) ? sub_if_greater_or_zero(seq_len, window_left) : 0;
+      (window_left >= 0) ? sub_if_greater_or_zero(seq_len, window_left + 1) : 0;
   const uint32_t mapped_batch_idx =
       partition_kv ? kv_partition_info.batch_idx_map[batch_idx] : batch_idx;
 
