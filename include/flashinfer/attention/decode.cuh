@@ -75,7 +75,7 @@ __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage
                                            const vec_t<float, vec_size>& q_vec,
                                            const vec_t<float, vec_size>& freq, uint32_t kv_idx_base,
                                            uint32_t iter_base, uint32_t left_close_bound,
-                                           uint32_t right_open_bound, const int32_t q_offset,
+                                           uint32_t kv_chunk_size, const int32_t q_offset,
                                            float alibi_slope, float* s, state_t<vec_size>& st,
                                            const float logits_soft_cap) {
   uint32_t tx = threadIdx.x, tz = threadIdx.z;
@@ -101,11 +101,11 @@ __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage
       s[j] += math::shfl_xor_sync(s[j], offset);
     }
     s[j] = apply_logits_post_hook<logits_post_hook>(s[j], logits_soft_cap);
-    uint32_t pos = iter_base + tz * tile_size + j;
-    s[j] = (pos < right_open_bound && kv_idx_base + tz * tile_size + j >= left_close_bound) ? s[j]
-                                                                                            : -5e4;
+    const uint32_t pos = kv_idx_base + tz * tile_size + j;
+    s[j] =
+        (iter_base + tz * tile_size + j < kv_chunk_size && pos >= left_close_bound) ? s[j] : -5e4;
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
-      s[j] += alibi_slope * float(int(kv_idx_base + tz * tile_size + j) - q_offset);
+      s[j] += alibi_slope * float(int(pos) - q_offset);
     }
     st.m = max(st.m, s[j]);
   }
@@ -309,7 +309,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
     compute_qk<logits_post_hook, pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
         k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, stage_idx, q_vec,
         freq, consumer_kv_idx_base, iter * bdy * tile_size_per_bdx * bdz, left_close_bound,
-        /*right_open_bound=*/kv_chunk_size, seq_len - 1, alibi_slope, s, st_local, logits_soft_cap);
+        kv_chunk_size, seq_len - 1, alibi_slope, s, st_local, logits_soft_cap);
     block.sync();
     // load k
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
@@ -528,8 +528,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
         freq,
         (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[mapped_batch_idx]) +
             cur_chunk_start + iter * tile_size_per_bdx * bdy * bdz,
-        iter * tile_size_per_bdx * bdy * bdz, left_close_bound, /*right_open_bound=*/kv_chunk_len,
-        q_offset_val, alibi_slope, s, st, logits_soft_cap);
+        iter * tile_size_per_bdx * bdy * bdz, left_close_bound, kv_chunk_len, q_offset_val,
+        alibi_slope, s, st, logits_soft_cap);
     block.sync();
 
 #pragma unroll
