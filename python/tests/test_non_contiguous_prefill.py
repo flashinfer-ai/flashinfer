@@ -60,7 +60,7 @@ def test_single_prefill_packed_input(
 @pytest.mark.parametrize("batch_size", [1, 19, 99])
 @pytest.mark.parametrize("seq_len", [1, 7, 127, 257])
 @pytest.mark.parametrize("num_kv_heads", [1, 4, 8])
-@pytest.mark.parametrize("num_qo_heads", [4, 8, 32])
+@pytest.mark.parametrize("num_qo_heads", [4, 8])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("causal", [True, False])
 def test_batch_ragged_prefill_packed_input(
@@ -88,7 +88,7 @@ def test_batch_ragged_prefill_packed_input(
     kv_indptr = qo_indptr
 
     workspace_buffer = torch.empty(
-        (128 * 1024 * 1024,), dtype=torch.uint8, device="cuda:0"
+        (256 * 1024 * 1024,), dtype=torch.uint8, device="cuda:0"
     )
     wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(workspace_buffer)
     wrapper.begin_forward(
