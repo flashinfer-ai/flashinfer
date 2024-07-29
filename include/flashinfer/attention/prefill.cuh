@@ -56,13 +56,6 @@ constexpr bool is_invalid_configuration(uint32_t num_frags_x, uint32_t num_frags
           (num_frags_x * (8 * num_frags_y + 2 * sizeof(DTypeQKAccum) * num_frags_z) >= 256));
 }
 
-/*!
- * \brief Return x - y if x > y, otherwise return 0.
- */
-__device__ __forceinline__ uint32_t sub_if_greater_or_zero(uint32_t x, uint32_t y) {
-  return (x > y) ? x - y : 0U;
-}
-
 template <uint32_t num_warps_x, uint32_t num_warps_z>
 __device__ __forceinline__ uint32_t get_warp_idx_x() {
   if constexpr (num_warps_x == 1) {
@@ -588,8 +581,9 @@ template <bool partition_kv, MaskMode mask_mode, uint32_t num_frags_x, uint32_t 
           uint32_t num_frags_z, typename DTypeQKAccum>
 __device__ __forceinline__ void mask_s(const uint32_t qo_packed_idx_base,
                                        const uint32_t kv_idx_base, const uint32_t qo_len,
-                                       const uint32_t kv_len, const uint32_t chunk_end,
-                                       const uint_fastdiv group_size, uint8_t* custom_mask,
+                                       const uint32_t kv_len, const uint32_t window_left,
+                                       const uint32_t chunk_end, const uint_fastdiv group_size,
+                                       uint8_t* custom_mask,
                                        DTypeQKAccum (*s_frag)[num_frags_z][8]) {
   const uint32_t lane_idx = threadIdx.x;
 #pragma unroll
@@ -605,8 +599,9 @@ __device__ __forceinline__ void mask_s(const uint32_t qo_packed_idx_base,
                                 reg_id % 2;
         const bool out_of_boundary =
             (mask_mode == MaskMode::kCausal
-                 ? (kv_idx + qo_len > kv_len + q_idx || (partition_kv && kv_idx >= chunk_end))
-                 : kv_idx >= chunk_end);
+                 ? (kv_idx + qo_len > kv_len + q_idx || (partition_kv && kv_idx >= chunk_end) ||
+                    kv_idx + window_left < q_idx)
+                 : kv_idx >= chunk_end || kv_idx + window_left < q_idx);
         s_frag[fx][fz][reg_id] =
             (out_of_boundary ||
              (mask_mode == MaskMode::kCustom && q_idx < qo_len &&
@@ -972,8 +967,8 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
     uint8_t* __restrict__ custom_mask, DTypeOut* __restrict__ o, float* __restrict__ lse,
     const uint32_t qo_len, const uint32_t kv_len, const uint_fastdiv group_size,
     const uint32_t q_stride_n, const uint32_t q_stride_h, const uint32_t kv_stride_n,
-    const uint32_t kv_stride_h, const float logits_soft_cap, float sm_scale,
-    const float log2_rope_rcp_scale, const float log2_rope_rcp_theta) {
+    const uint32_t kv_stride_h, const int32_t window_left, const float logits_soft_cap,
+    float sm_scale, const float log2_rope_rcp_scale, const float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
   sm_scale *=
@@ -991,6 +986,9 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
   const uint32_t chunk_start = partition_kv ? chunk_idx * chunk_size : 0;
   const uint32_t chunk_end = partition_kv ? min((chunk_idx + 1) * chunk_size, kv_len) : kv_len;
   auto block = cg::this_thread_block();
+  if (window_left < 0) {
+    window_left = kv_len;
+  }
 
   constexpr uint32_t head_dim = num_frags_y * 16;
   constexpr uint32_t channel_size_128b_in = head_dim / num_elems_per_128b<DTypeIn>();
@@ -1067,6 +1065,10 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
           : chunk_end - chunk_start,
       16 * num_warps_z * num_frags_z);
 
+  const uint32_t window_iteration =
+      sub_if_greater_or_zero(kv_len, window_left + (bx + 1) * num_rows_per_cta - 1 + chunk_start) /
+      (16 * num_warps_z * num_frags_z);
+
   const uint32_t mask_iteration =
       (mask_mode == MaskMode::kCausal
            ? min(chunk_end - chunk_start,
@@ -1126,14 +1128,14 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
           qo_packed_idx_base,
           chunk_start +
               (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) * num_frags_z * 16,
-          qo_len, kv_len, chunk_end, group_size, custom_mask, s_frag);
+          qo_len, kv_len, window_left, chunk_end, group_size, custom_mask, s_frag);
     } else {
-      if (iter >= mask_iteration) {
+      if (iter >= mask_iteration || iter < window_iteration) {
         mask_s<partition_kv, mask_mode, num_frags_x, num_frags_y, num_frags_z>(
             qo_packed_idx_base,
             chunk_start + (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) *
                               num_frags_z * 16,
-            qo_len, kv_len, chunk_end, group_size, nullptr, s_frag);
+            qo_len, kv_len, window_left, chunk_end, group_size, nullptr, s_frag);
       }
     }
 
@@ -1214,8 +1216,8 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
     float* __restrict__ lse, bool* __restrict__ block_valid_mask,
     IdType* __restrict__ kv_chunk_size_ptr, const uint_fastdiv group_size,
     const uint32_t q_stride_n, const uint32_t q_stride_h, const uint32_t kv_stride_n,
-    const uint32_t kv_stride_h, const float logits_soft_cap, float sm_scale,
-    const float log2_rope_rcp_scale, const float log2_rope_rcp_theta) {
+    const uint32_t kv_stride_h, const int32_t window_left, const float logits_soft_cap,
+    float sm_scale, const float log2_rope_rcp_scale, const float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
   sm_scale *=
@@ -1235,6 +1237,9 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
   constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps_x * 16;
   const uint32_t qo_len = q_indptr[request_idx + 1] - q_indptr[request_idx],
                  kv_len = kv_indptr[request_idx + 1] - kv_indptr[request_idx];
+  if (window_left < 0) {
+    window_left = kv_len;
+  }
   const uint32_t chunk_size = partition_kv ? kv_chunk_size : kv_len;
   const uint32_t chunk_start = partition_kv ? kv_tile_idx * chunk_size : 0;
   const uint32_t chunk_end = partition_kv ? min((kv_tile_idx + 1) * chunk_size, kv_len) : kv_len;
@@ -1325,6 +1330,10 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
                     : chunk_end - chunk_start),
                16 * num_warps_z * num_frags_z);
 
+  const uint32_t window_iteration =
+      sub_if_greater_or_zero(kv_len, window_left + (bx + 1) * num_rows_per_cta - 1 + chunk_start) /
+      (16 * num_warps_z * num_frags_z);
+
   const uint32_t mask_iteration =
       (mask_mode == MaskMode::kCausal
            ? min(chunk_end - chunk_start,
@@ -1392,14 +1401,15 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
           qo_packed_idx_base,
           chunk_start +
               (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) * num_frags_z * 16,
-          qo_len, kv_len, chunk_end, group_size, custom_mask + qk_indptr[request_idx], s_frag);
+          qo_len, kv_len, window_left, chunk_end, group_size, custom_mask + qk_indptr[request_idx],
+          s_frag);
     } else {
-      if (iter >= mask_iteration) {
+      if (iter >= mask_iteration || iter < window_iteration) {
         mask_s<partition_kv, mask_mode, num_frags_x, num_frags_y, num_frags_z>(
             qo_packed_idx_base,
             chunk_start + (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) *
                               num_frags_z * 16,
-            qo_len, kv_len, chunk_end, group_size, nullptr, s_frag);
+            qo_len, kv_len, window_left, chunk_end, group_size, nullptr, s_frag);
       }
     }
 
@@ -1483,8 +1493,8 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
     IdType* __restrict__ q_offset, IdType* __restrict__ o_indptr, DTypeOut* __restrict__ o,
     float* __restrict__ lse, bool* __restrict__ block_valid_mask,
     IdType* __restrict__ kv_chunk_size_ptr, const uint_fastdiv group_size,
-    const float logits_soft_cap, float sm_scale, const float log2_rope_rcp_scale,
-    const float log2_rope_rcp_theta) {
+    const int32_t window_left, const float logits_soft_cap, float sm_scale,
+    const float log2_rope_rcp_scale, const float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
   sm_scale *=
@@ -1509,6 +1519,9 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
                                  1) * paged_kv.page_size +
                                     paged_kv.last_page_len[request_idx]
                               : 0;
+  if (window_left < 0) {
+    window_left = kv_len;
+  }
   const uint32_t chunk_size = partition_kv ? kv_chunk_size : kv_len;
   const uint32_t chunk_start = partition_kv ? kv_tile_idx * chunk_size : 0;
   const uint32_t chunk_end = partition_kv ? min((kv_tile_idx + 1) * chunk_size, kv_len) : kv_len;
@@ -1632,6 +1645,10 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
                     : chunk_end - chunk_start),
                16 * num_warps_z * num_frags_z);
 
+  const uint32_t window_iteration =
+      sub_if_greater_or_zero(kv_len, window_left + (bx + 1) * num_rows_per_cta - 1 + chunk_start) /
+      (16 * num_warps_z * num_frags_z);
+
   const uint32_t mask_iteration =
       (mask_mode == MaskMode::kCausal
            ? min(chunk_end - chunk_start,
@@ -1684,14 +1701,15 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
           qo_packed_idx_base,
           chunk_start +
               (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) * num_frags_z * 16,
-          qo_len, kv_len, chunk_end, group_size, custom_mask + qk_indptr[request_idx], s_frag);
+          qo_len, kv_len, window_left, chunk_end, group_size, custom_mask + qk_indptr[request_idx],
+          s_frag);
     } else {
-      if (iter >= mask_iteration) {
+      if (iter >= mask_iteration || iter < window_iteration) {
         mask_s<partition_kv, mask_mode, num_frags_x, num_frags_y, num_frags_z>(
             qo_packed_idx_base,
             chunk_start + (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) *
                               num_frags_z * 16,
-            qo_len, kv_len, chunk_end, group_size, nullptr, s_frag);
+            qo_len, kv_len, window_left, chunk_end, group_size, nullptr, s_frag);
       }
     }
 
@@ -1767,7 +1785,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(
     DTypeIn* q, DTypeIn* k, DTypeIn* v, uint8_t* custom_mask, DTypeOut* o, DTypeOut* tmp,
     float* lse, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t qo_len, uint32_t kv_len,
     uint32_t q_stride_n, uint32_t q_stride_h, uint32_t kv_stride_n, uint32_t kv_stride_h,
-    float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta,
+    int32_t window_left, float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta,
     cudaStream_t stream) {
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
@@ -1877,6 +1895,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(
                           (void*)&q_stride_h,
                           (void*)&kv_stride_n,
                           (void*)&kv_stride_h,
+                          (void*)&window_left,
                           (void*)&logits_soft_cap,
                           (void*)&sm_scale,
                           (void*)&log2_rope_rcp_scale,
@@ -1903,6 +1922,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(
                           (void*)&q_stride_h,
                           (void*)&kv_stride_n,
                           (void*)&kv_stride_h,
+                          (void*)&window_left,
                           (void*)&logits_soft_cap,
                           (void*)&sm_scale,
                           (void*)&log2_rope_rcp_scale,
@@ -1930,8 +1950,8 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
     DTypeOut* tmp_v, float* tmp_s, float* lse, IdType* merge_indptr, bool* block_valid_mask,
     IdType* kv_chunk_size_ptr, uint32_t total_num_rows, uint32_t num_qo_heads,
     uint32_t padded_batch_size, uint32_t num_kv_heads, uint32_t q_stride_n, uint32_t q_stride_h,
-    uint32_t kv_stride_n, uint32_t kv_stride_h, float logits_soft_cap, float sm_scale,
-    float rope_scale, float rope_theta, cudaStream_t stream = nullptr) {
+    uint32_t kv_stride_n, uint32_t kv_stride_h, int32_t window_left, float logits_soft_cap,
+    float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream = nullptr) {
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
   constexpr uint32_t num_frags_x = get_num_frags_x<WARP_LAYOUT>();
@@ -2015,6 +2035,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
                         (void*)&q_stride_h,
                         (void*)&kv_stride_n,
                         (void*)&kv_stride_h,
+                        (void*)&window_left,
                         (void*)&logits_soft_cap,
                         (void*)&sm_scale,
                         (void*)&log2_rope_rcp_scale,
@@ -2051,6 +2072,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
                         (void*)&q_stride_h,
                         (void*)&kv_stride_n,
                         (void*)&kv_stride_h,
+                        (void*)&window_left,
                         (void*)&logits_soft_cap,
                         (void*)&sm_scale,
                         (void*)&log2_rope_rcp_scale,
@@ -2075,8 +2097,8 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     uint8_t* custom_mask, IdType* qk_indptr, IdType* o_indptr, DTypeOut* o, DTypeOut* tmp_v,
     float* tmp_s, float* lse, IdType* merge_indptr, bool* block_valid_mask,
     IdType* kv_chunk_size_ptr, uint32_t total_num_rows, uint32_t num_qo_heads,
-    uint32_t padded_batch_size, float logits_soft_cap, float sm_scale, float rope_scale,
-    float rope_theta, cudaStream_t stream) {
+    uint32_t padded_batch_size, int32_t window_left, float logits_soft_cap, float sm_scale,
+    float rope_scale, float rope_theta, cudaStream_t stream) {
   const float log2_rope_rcp_scale = -std::log2f(rope_scale);
   const float log2_rope_rcp_theta = -std::log2f(rope_theta);
   constexpr uint32_t num_frags_x = get_num_frags_x<WARP_LAYOUT>();
@@ -2157,6 +2179,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
                         (void*)&block_valid_mask,
                         (void*)&kv_chunk_size_ptr,
                         (void*)&group_size_fastdiv,
+                        (void*)&window_left,
                         (void*)&logits_soft_cap,
                         (void*)&sm_scale,
                         (void*)&log2_rope_rcp_scale,
@@ -2186,6 +2209,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
                         (void*)&block_valid_mask,
                         (void*)&kv_chunk_size_ptr,
                         (void*)&group_size_fastdiv,
+                        (void*)&window_left,
                         (void*)&logits_soft_cap,
                         (void*)&sm_scale,
                         (void*)&log2_rope_rcp_scale,

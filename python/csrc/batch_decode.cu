@@ -108,8 +108,8 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
     torch::Tensor q, std::optional<torch::Tensor> paged_kv_cache,
     std::optional<torch::Tensor> paged_k_cache, std::optional<torch::Tensor> paged_v_cache,
     torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
-    torch::Tensor paged_kv_last_page_len, unsigned int pos_encoding_mode, float logits_soft_cap,
-    float sm_scale, float rope_scale, float rope_theta, bool return_lse) {
+    torch::Tensor paged_kv_last_page_len, unsigned int pos_encoding_mode, int window_left,
+    float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta, bool return_lse) {
   CHECK_INPUT(q);
   bool paged_kv_defined = paged_kv_cache.has_value();
   if (paged_kv_defined) {
@@ -216,7 +216,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
                     handler_.get(), static_cast<qkv_type*>(q.data_ptr()),
                     /*q_offset=*/nullptr, paged_kv, static_cast<qkv_type*>(o.data_ptr()),
                     /*lse=*/(return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr),
-                    num_qo_heads, logits_soft_cap, sm_scale, rope_scale, rope_theta,
+                    num_qo_heads, window_left, logits_soft_cap, sm_scale, rope_scale, rope_theta,
                     /*stream=*/torch_current_stream);
                 TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
                             cudaGetErrorString(status));
@@ -249,7 +249,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
                       handler_.get(), static_cast<q_type*>(q.data_ptr()),
                       /*q_offset=*/nullptr, paged_kv, static_cast<q_type*>(o.data_ptr()),
                       /*lse=*/(return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr),
-                      num_qo_heads, logits_soft_cap, sm_scale, rope_scale, rope_theta,
+                      num_qo_heads, window_left, logits_soft_cap, sm_scale, rope_scale, rope_theta,
                       /*stream=*/torch_current_stream);
                   TORCH_CHECK(status == cudaSuccess,
                               "BatchDecodeWithPagedKVCache failed with error ",

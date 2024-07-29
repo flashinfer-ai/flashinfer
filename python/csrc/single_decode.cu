@@ -22,8 +22,9 @@ using namespace flashinfer;
 
 torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                                           torch::Tensor tmp, unsigned int pos_encoding_mode,
-                                          unsigned int layout, float logits_soft_cap,
-                                          float sm_scale, float rope_scale, float rope_theta) {
+                                          unsigned int layout, int window_left,
+                                          float logits_soft_cap, float sm_scale, float rope_scale,
+                                          float rope_theta) {
   CHECK_INPUT(q);
   CHECK_INPUT(k);
   CHECK_INPUT(v);
@@ -71,7 +72,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
                     static_cast<qkv_type*>(q.data_ptr()), static_cast<qkv_type*>(k.data_ptr()),
                     static_cast<qkv_type*>(v.data_ptr()), static_cast<qkv_type*>(o.data_ptr()),
                     static_cast<qkv_type*>(tmp.data_ptr()), num_qo_heads, num_kv_heads, kv_len,
-                    kv_layout, logits_soft_cap, sm_scale, rope_scale, rope_theta,
+                    kv_layout, window_left, logits_soft_cap, sm_scale, rope_scale, rope_theta,
                     torch_current_stream);
                 TORCH_CHECK(status == cudaSuccess,
                             "SingleDecodeWithKVCache kernel launch failed, error: " +
@@ -93,7 +94,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
                       static_cast<q_type*>(q.data_ptr()), static_cast<kv_type*>(k.data_ptr()),
                       static_cast<kv_type*>(v.data_ptr()), static_cast<q_type*>(o.data_ptr()),
                       static_cast<q_type*>(tmp.data_ptr()), num_qo_heads, num_kv_heads, kv_len,
-                      kv_layout, logits_soft_cap, sm_scale, rope_scale, rope_theta,
+                      kv_layout, window_left, logits_soft_cap, sm_scale, rope_scale, rope_theta,
                       torch_current_stream);
                   TORCH_CHECK(status == cudaSuccess,
                               "SingleDecodeWithKVCache kernel launch failed, error: " +
