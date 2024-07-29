@@ -1,7 +1,9 @@
 # Changelog
 
-## [0.2.0](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.1...v0.2.0) (2024-07-29)
+## [0.1.2](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.1...v0.1.2) (2024-07-29)
 
+### Bugfix
+* Fix the sampling kernel bug for cu118 ([#386](https://github.com/flashinfer-ai/flashinfer/pull/386), [#387](https://github.com/flashinfer-ai/flashinfer/pull/387)) ([0cd499](https://github.com/flashinfer-ai/flashinfer/commit/0cd49949e6c05a0c8f63d050ff96c8f6168cf914), [dc3f18](https://github.com/flashinfer-ai/flashinfer/commit/dc3f184eda83b9feb5c901606b3d8aede23a4a5f))
 
 ### Features
 
