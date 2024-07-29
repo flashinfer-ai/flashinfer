@@ -422,7 +422,7 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
   CHECK_EQ(k.size(2), v.size(2));
   CHECK_EQ(k.size(2), head_dim);
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
-  const uint32_t q_stride_n = q.stride(0), q_stride_h = q.stride(1), kv_stride_n, kv_stride_h;
+  uint32_t q_stride_n = q.stride(0), q_stride_h = q.stride(1), kv_stride_n, kv_stride_h;
   if (kv_layout_ == QKVLayout::kNHD) {
     kv_stride_n = k.stride(0);
     kv_stride_h = k.stride(1);
@@ -528,7 +528,7 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardC
   CHECK_EQ(k.size(2), v.size(2));
   CHECK_EQ(k.size(2), head_dim);
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
-  const uint32_t q_stride_n = q.stride(0), q_stride_h = q.stride(1), kv_stride_n, kv_stride_h;
+  uint32_t q_stride_n = q.stride(0), q_stride_h = q.stride(1), kv_stride_n, kv_stride_h;
   if (kv_layout_ == QKVLayout::kNHD) {
     kv_stride_n = k.stride(0);
     kv_stride_h = k.stride(1);

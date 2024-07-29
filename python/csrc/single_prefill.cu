@@ -47,7 +47,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
   qo_len = q.size(0);
   num_qo_heads = q.size(1);
-  const uint32_t q_stride_n = q.stride(0), q_stride_h = q.stride(1), kv_stride_n, kv_stride_h;
+  uint32_t q_stride_n = q.stride(0), q_stride_h = q.stride(1), kv_stride_n, kv_stride_h;
   if (kv_layout == QKVLayout::kNHD) {
     kv_len = k.size(0);
     num_kv_heads = k.size(1);
@@ -141,7 +141,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache_custom_mask(
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
   qo_len = q.size(0);
   num_qo_heads = q.size(1);
-  const uint32_t q_stride_n = q.stride(0), q_stride_h = q.stride(1), kv_stride_n, kv_stride_h;
+  uint32_t q_stride_n = q.stride(0), q_stride_h = q.stride(1), kv_stride_n, kv_stride_h;
   if (kv_layout == QKVLayout::kNHD) {
     kv_len = k.size(0);
     num_kv_heads = k.size(1);
