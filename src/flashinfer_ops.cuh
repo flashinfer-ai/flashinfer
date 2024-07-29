@@ -32,6 +32,8 @@ cudaError_t SinglePrefillWithKVCacheCustomMask(
     bool allow_fp16_qk_reduction = false, std::optional<float> maybe_sm_scale = std::nullopt,
     float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   const float sm_scale = maybe_sm_scale.value_or(1.f / std::sqrt(float(head_dim)));
+  auto [qo_stride_n, qo_stride_h, kv_stride_n, kv_stride_h] =
+      get_qkv_strides(kv_layout, kv_len, num_qo_heads, num_kv_heads, head_dim);
   DISPATCH_allow_fp16_qk_reduction(
       allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
       {DISPATCH_head_dim(
@@ -40,7 +42,7 @@ cudaError_t SinglePrefillWithKVCacheCustomMask(
                                                       POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION,
                                                       MaskMode::kCustom>(
                 q, k, v, custom_mask, o, tmp, lse, num_qo_heads, num_kv_heads, qo_len, kv_len,
-                kv_layout,
+                qo_stride_n, qo_stride_h, kv_stride_n, kv_stride_h,
                 /*logits_soft_cap*/ 0.f, sm_scale, rope_scale, rope_theta, stream);
           })})});
   return cudaSuccess;
@@ -82,19 +84,22 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOu
                                      cudaStream_t stream = nullptr) {
   const float sm_scale = maybe_sm_scale.value_or(1.f / std::sqrt(float(head_dim)));
   const MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
+  auto [qo_stride_n, qo_stride_h, kv_stride_n, kv_stride_h] =
+      get_qkv_strides(kv_layout, kv_len, num_qo_heads, num_kv_heads, head_dim);
   DISPATCH_allow_fp16_qk_reduction(
       allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
       {DISPATCH_mask_mode(
           mask_mode, MASK_MODE,
-          {DISPATCH_head_dim(head_dim, HEAD_DIM,
-                             {DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
-                               return SinglePrefillWithKVCacheDispatched<
-                                   HEAD_DIM, LogitsPostHook::kNone, POS_ENCODING_MODE,
-                                   ALLOW_FP16_QK_REDUCTION, MASK_MODE>(
-                                   q, k, v, /*custom_mask=*/nullptr, o, tmp, lse, num_qo_heads,
-                                   num_kv_heads, qo_len, kv_len, kv_layout, /*logits_soft_cap=*/0.f,
-                                   sm_scale, rope_scale, rope_theta, stream);
-                             })})})});
+          {DISPATCH_head_dim(
+              head_dim, HEAD_DIM,
+              {DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
+                return SinglePrefillWithKVCacheDispatched<HEAD_DIM, LogitsPostHook::kNone,
+                                                          POS_ENCODING_MODE,
+                                                          ALLOW_FP16_QK_REDUCTION, MASK_MODE>(
+                    q, k, v, /*custom_mask=*/nullptr, o, tmp, lse, num_qo_heads, num_kv_heads,
+                    qo_len, kv_len, qo_stride_n, qo_stride_h, kv_stride_n, kv_stride_h,
+                    /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta, stream);
+              })})})});
   return cudaSuccess;
 }
 
@@ -109,6 +114,8 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
     const float rope_scale = 1.f, const float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   const float sm_scale = maybe_sm_scale.value_or(1.f / std::sqrt(float(head_dim)));
   const MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
+  auto [qo_stride_n, qo_stride_h, kv_stride_n, kv_stride_h] =
+      get_qkv_strides(kv_layout, 0, num_qo_heads, num_kv_heads, head_dim);
   DISPATCH_head_dim(
       head_dim, HEAD_DIM,
       {DISPATCH_mask_mode(
@@ -121,8 +128,8 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
                     MASK_MODE, DTypeIn, DTypeOut, IdType>(
                     handler, q, qo_indptr, k, v, kv_indptr, /*custom_mask=*/nullptr,
                     /*qk_indptr=*/nullptr, q_offset, k_rope_pos_offset, o, lse, num_qo_heads,
-                    num_kv_heads, kv_layout, /*logits_soft_cap=*/0.f, sm_scale, rope_scale,
-                    rope_theta, stream);
+                    num_kv_heads, qo_stride_n, qo_stride_h, kv_stride_n, kv_stride_h,
+                    /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta, stream);
               })})})});
   return cudaSuccess;
 }

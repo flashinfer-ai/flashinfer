@@ -94,7 +94,7 @@ std::vector<dtype_out> single_mha(const std::vector<dtype_q>& q, const std::vect
         float max_val = -5e4;
         if (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
           q_rotary_local = std::move(cpu_reference::apply_llama_rope(
-              q.data() + info.get_qo_elem_offset(q_idx, qo_head_idx, 0), head_dim,
+              q.data() + info.get_q_elem_offset(q_idx, qo_head_idx, 0), head_dim,
               q_idx + kv_len - qo_len, rope_scale, rope_theta));
         }
         for (size_t kv_idx = 0; kv_idx < kv_len; ++kv_idx) {
@@ -102,7 +102,7 @@ std::vector<dtype_out> single_mha(const std::vector<dtype_q>& q, const std::vect
           switch (pos_encoding_mode) {
             case PosEncodingMode::kNone: {
               for (size_t feat_idx = 0; feat_idx < head_dim; ++feat_idx) {
-                att[kv_idx] += float(q[info.get_qo_elem_offset(q_idx, qo_head_idx, feat_idx)]) *
+                att[kv_idx] += float(q[info.get_q_elem_offset(q_idx, qo_head_idx, feat_idx)]) *
                                float(k[info.get_kv_elem_offset(kv_idx, kv_head_idx, feat_idx)]) *
                                sm_scale;
               }
@@ -147,7 +147,7 @@ std::vector<dtype_out> single_mha(const std::vector<dtype_q>& q, const std::vect
             o_float +=
                 att[kv_idx] * float(v[info.get_kv_elem_offset(kv_idx, kv_head_idx, feat_idx)]);
           }
-          o[info.get_qo_elem_offset(q_idx, qo_head_idx, feat_idx)] = dtype_out(o_float);
+          o[info.get_o_elem_offset(q_idx, qo_head_idx, feat_idx)] = dtype_out(o_float);
         }
       }
     }

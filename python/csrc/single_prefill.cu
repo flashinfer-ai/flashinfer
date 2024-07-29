@@ -24,9 +24,9 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor tmp, bool causal,
     unsigned int layout, unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction,
     float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta, bool return_lse) {
-  CHECK_INPUT(q);
-  CHECK_INPUT(k);
-  CHECK_INPUT(v);
+  CHECK_CUDA(q);
+  CHECK_CUDA(k);
+  CHECK_CUDA(v);
   CHECK_INPUT(tmp);
   auto device = q.device();
   CHECK_EQ(k.device(), device);
@@ -36,6 +36,9 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
   CHECK_DIM(3, k);
   CHECK_DIM(3, v);
   CHECK_SHAPE(k, v);
+  CHECK_EQ(q.stride(2), 1);
+  CHECK_EQ(k.stride(2), 1);
+  CHECK_EQ(v.stride(2), 1);
   CHECK_EQ(q.size(2), k.size(2));
   CHECK_EQ(q.scalar_type(), k.scalar_type());
   CHECK_EQ(q.scalar_type(), v.scalar_type());
@@ -44,12 +47,17 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
   qo_len = q.size(0);
   num_qo_heads = q.size(1);
+  uint32_t q_stride_n = q.stride(0), q_stride_h = q.stride(1), kv_stride_n, kv_stride_h;
   if (kv_layout == QKVLayout::kNHD) {
     kv_len = k.size(0);
     num_kv_heads = k.size(1);
-  } else {
+    kv_stride_n = k.stride(0);
+    kv_stride_h = k.stride(1);
+  } else {  // QKVLayout::kHND
     kv_len = k.size(1);
     num_kv_heads = k.size(0);
+    kv_stride_h = k.stride(0);
+    kv_stride_n = k.stride(1);
   }
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
@@ -63,7 +71,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
   TORCH_CHECK(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
   const LogitsPostHook logits_post_hook =
       logits_soft_cap > 0.f ? LogitsPostHook::kSoftCap : LogitsPostHook::kNone;
-
+  
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
       return DISPATCH_mask_mode(mask_mode, MASK_MODE, [&] {
@@ -72,16 +80,19 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
               allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
                 return DISPATCH_pos_encoding_mode(
                     PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
-                      cudaError_t status = SinglePrefillWithKVCacheDispatched<
-                          HEAD_DIM, LOGITS_POST_HOOK, POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION,
-                          MASK_MODE>(
-                          static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
-                          static_cast<c_type*>(v.data_ptr()),
-                          /*custom_mask=*/nullptr, static_cast<c_type*>(o.data_ptr()),
-                          static_cast<c_type*>(tmp.data_ptr()),
-                          /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                          num_qo_heads, num_kv_heads, qo_len, kv_len, kv_layout, logits_soft_cap,
-                          sm_scale, rope_scale, rope_theta, torch_current_stream);
+                      cudaError_t status =
+                          SinglePrefillWithKVCacheDispatched<HEAD_DIM, LOGITS_POST_HOOK,
+                                                             POS_ENCODING_MODE,
+                                                             ALLOW_FP16_QK_REDUCTION, MASK_MODE>(
+                              static_cast<c_type*>(q.data_ptr()),
+                              static_cast<c_type*>(k.data_ptr()),
+                              static_cast<c_type*>(v.data_ptr()),
+                              /*custom_mask=*/nullptr, static_cast<c_type*>(o.data_ptr()),
+                              static_cast<c_type*>(tmp.data_ptr()),
+                              /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
+                              num_qo_heads, num_kv_heads, qo_len, kv_len, q_stride_n, q_stride_h,
+                              kv_stride_n, kv_stride_h, logits_soft_cap, sm_scale, rope_scale,
+                              rope_theta, torch_current_stream);
                       TORCH_CHECK(status == cudaSuccess,
                                   "SinglePrefillWithKVCache kernel launch failed, error: " +
                                       std::string(cudaGetErrorString(status)));
@@ -105,9 +116,9 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache_custom_mask(
     torch::Tensor tmp, unsigned int layout, unsigned int pos_encoding_mode,
     bool allow_fp16_qk_reduction, float logits_soft_cap, float sm_scale, float rope_scale,
     float rope_theta, bool return_lse) {
-  CHECK_INPUT(q);
-  CHECK_INPUT(k);
-  CHECK_INPUT(v);
+  CHECK_CUDA(q);
+  CHECK_CUDA(k);
+  CHECK_CUDA(v);
   CHECK_INPUT(packed_custom_mask);
   auto device = q.device();
   CHECK_EQ(k.device(), device);
@@ -118,6 +129,9 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache_custom_mask(
   CHECK_DIM(3, v);
   CHECK_DIM(1, packed_custom_mask);
   CHECK_SHAPE(k, v);
+  CHECK_EQ(q.stride(2), 1);
+  CHECK_EQ(k.stride(2), 1);
+  CHECK_EQ(v.stride(2), 1);
   CHECK_EQ(q.size(2), k.size(2));
   // packed_custom_mask must be uint8
   TORCH_CHECK(packed_custom_mask.scalar_type() == torch::kUInt8,
@@ -127,12 +141,17 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache_custom_mask(
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
   qo_len = q.size(0);
   num_qo_heads = q.size(1);
+  uint32_t q_stride_n = q.stride(0), q_stride_h = q.stride(1), kv_stride_n, kv_stride_h;
   if (kv_layout == QKVLayout::kNHD) {
     kv_len = k.size(0);
     num_kv_heads = k.size(1);
+    kv_stride_n = k.stride(0);
+    kv_stride_h = k.stride(1);
   } else {
     kv_len = k.size(1);
     num_kv_heads = k.size(0);
+    kv_stride_h = k.stride(0);
+    kv_stride_n = k.stride(1);
   }
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
@@ -164,8 +183,9 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache_custom_mask(
                             static_cast<c_type*>(o.data_ptr()),
                             static_cast<c_type*>(tmp.data_ptr()),
                             /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                            num_qo_heads, num_kv_heads, qo_len, kv_len, kv_layout, logits_soft_cap,
-                            sm_scale, rope_scale, rope_theta, torch_current_stream);
+                            num_qo_heads, num_kv_heads, qo_len, kv_len, q_stride_n, q_stride_h,
+                            kv_stride_n, kv_stride_h, logits_soft_cap, sm_scale, rope_scale,
+                            rope_theta, torch_current_stream);
                     TORCH_CHECK(status == cudaSuccess,
                                 "SinglePrefillWithKVCache kernel launch failed, error: " +
                                     std::string(cudaGetErrorString(status)));
