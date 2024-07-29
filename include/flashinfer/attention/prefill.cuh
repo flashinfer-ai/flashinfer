@@ -967,7 +967,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
     uint8_t* __restrict__ custom_mask, DTypeOut* __restrict__ o, float* __restrict__ lse,
     const uint32_t qo_len, const uint32_t kv_len, const uint_fastdiv group_size,
     const uint32_t q_stride_n, const uint32_t q_stride_h, const uint32_t kv_stride_n,
-    const uint32_t kv_stride_h, const int32_t window_left, const float logits_soft_cap,
+    const uint32_t kv_stride_h, const int32_t maybe_window_left, const float logits_soft_cap,
     float sm_scale, const float log2_rope_rcp_scale, const float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
@@ -986,9 +986,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
   const uint32_t chunk_start = partition_kv ? chunk_idx * chunk_size : 0;
   const uint32_t chunk_end = partition_kv ? min((chunk_idx + 1) * chunk_size, kv_len) : kv_len;
   auto block = cg::this_thread_block();
-  if (window_left < 0) {
-    window_left = kv_len;
-  }
+  const uint32_t window_left = (maybe_window_left >= 0) ? maybe_window_left : kv_len;
 
   constexpr uint32_t head_dim = num_frags_y * 16;
   constexpr uint32_t channel_size_128b_in = head_dim / num_elems_per_128b<DTypeIn>();
@@ -1216,7 +1214,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
     float* __restrict__ lse, bool* __restrict__ block_valid_mask,
     IdType* __restrict__ kv_chunk_size_ptr, const uint_fastdiv group_size,
     const uint32_t q_stride_n, const uint32_t q_stride_h, const uint32_t kv_stride_n,
-    const uint32_t kv_stride_h, const int32_t window_left, const float logits_soft_cap,
+    const uint32_t kv_stride_h, const int32_t maybe_window_left, const float logits_soft_cap,
     float sm_scale, const float log2_rope_rcp_scale, const float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
@@ -1237,9 +1235,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
   constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps_x * 16;
   const uint32_t qo_len = q_indptr[request_idx + 1] - q_indptr[request_idx],
                  kv_len = kv_indptr[request_idx + 1] - kv_indptr[request_idx];
-  if (window_left < 0) {
-    window_left = kv_len;
-  }
+  const uint32_t window_left = (maybe_window_left >= 0) ? maybe_window_left : kv_len;
   const uint32_t chunk_size = partition_kv ? kv_chunk_size : kv_len;
   const uint32_t chunk_start = partition_kv ? kv_tile_idx * chunk_size : 0;
   const uint32_t chunk_end = partition_kv ? min((kv_tile_idx + 1) * chunk_size, kv_len) : kv_len;
@@ -1493,7 +1489,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
     IdType* __restrict__ q_offset, IdType* __restrict__ o_indptr, DTypeOut* __restrict__ o,
     float* __restrict__ lse, bool* __restrict__ block_valid_mask,
     IdType* __restrict__ kv_chunk_size_ptr, const uint_fastdiv group_size,
-    const int32_t window_left, const float logits_soft_cap, float sm_scale,
+    int32_t maybe_window_left, const float logits_soft_cap, float sm_scale,
     const float log2_rope_rcp_scale, const float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeIn) == 2);
   static_assert(sizeof(DTypeOut) == 2);
@@ -1519,9 +1515,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
                                  1) * paged_kv.page_size +
                                     paged_kv.last_page_len[request_idx]
                               : 0;
-  if (window_left < 0) {
-    window_left = kv_len;
-  }
+  const uint32_t window_left = (maybe_window_left >= 0) ? maybe_window_left : kv_len;
   const uint32_t chunk_size = partition_kv ? kv_chunk_size : kv_len;
   const uint32_t chunk_start = partition_kv ? kv_tile_idx * chunk_size : 0;
   const uint32_t chunk_end = partition_kv ? min((kv_tile_idx + 1) * chunk_size, kv_len) : kv_len;
