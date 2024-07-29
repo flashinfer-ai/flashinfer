@@ -246,11 +246,11 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
                        float(2 * ((tx * vec_size + i) % (head_dim / 2))) / float(head_dim));
     }
     // apply rotary embedding to q matrix
-    q_vec = vec_apply_llama_rope<vec_size, bdx>(q + info.get_qo_elem_offset(0, qo_head_idx, 0),
-                                                freq, seq_len - 1);
+    q_vec = vec_apply_llama_rope<vec_size, bdx>(q + info.get_q_elem_offset(0, qo_head_idx, 0), freq,
+                                                seq_len - 1);
   } else {
     // do not apply rotary embedding to q matrix
-    q_vec.cast_load(q + info.get_qo_elem_offset(0, qo_head_idx, tx * vec_size));
+    q_vec.cast_load(q + info.get_q_elem_offset(0, qo_head_idx, tx * vec_size));
   }
   // multiple q_vec by sm_scale
 #pragma unroll

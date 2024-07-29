@@ -391,10 +391,10 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
     torch::Tensor kv_indptr, bool causal, unsigned int pos_encoding_mode,
     bool allow_fp16_qk_reduction, float logits_soft_cap, float sm_scale, float rope_scale,
     float rope_theta, bool return_lse) {
-  CHECK_INPUT(q);
   CHECK_INPUT(qo_indptr);
-  CHECK_INPUT(k);
-  CHECK_INPUT(v);
+  CHECK_CUDA(q);
+  CHECK_CUDA(k);
+  CHECK_CUDA(v);
   CHECK_INPUT(kv_indptr);
   auto device = q.device();
   CHECK_EQ(device, qo_indptr.device());
@@ -414,11 +414,22 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
   int64_t head_dim = q.size(2);
   CHECK_GE(kv_indptr.size(0), batch_size + 1);
   int64_t num_kv_heads = (kv_layout_ == QKVLayout::kNHD) ? k.size(1) : k.size(0);
+  CHECK_EQ(q.stride(2), 1);
+  CHECK_EQ(k.stride(2), 1);
+  CHECK_EQ(v.stride(2), 1);
   CHECK_EQ(k.size(0), v.size(0));
   CHECK_EQ(k.size(1), v.size(1));
   CHECK_EQ(k.size(2), v.size(2));
   CHECK_EQ(k.size(2), head_dim);
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
+  const uint32_t q_stride_n = q.stride(0), q_stride_h = q.stride(1), kv_stride_n, kv_stride_h;
+  if (kv_layout_ == QKVLayout::kNHD) {
+    kv_stride_n = k.stride(0);
+    kv_stride_h = k.stride(1);
+  } else {
+    kv_stride_h = k.stride(0);
+    kv_stride_n = k.stride(1);
+  }
   qo_indptr = qo_indptr.to(torch::kInt32);
   kv_indptr = kv_indptr.to(torch::kInt32);
 
@@ -453,8 +464,8 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
                           /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr,
                           static_cast<c_type*>(o.data_ptr()),
                           /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                          num_qo_heads, num_kv_heads, kv_layout_, logits_soft_cap, sm_scale,
-                          rope_scale, rope_theta,
+                          num_qo_heads, num_kv_heads, q_stride_n, q_stride_h, kv_stride_n,
+                          kv_stride_h, logits_soft_cap, sm_scale, rope_scale, rope_theta,
                           /*stream=*/torch_current_stream);
                       TORCH_CHECK(status == cudaSuccess,
                                   "BatchPrefillWithRaggedKVCache failed with error ",
@@ -479,10 +490,10 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardC
     torch::Tensor kv_indptr, torch::Tensor custom_mask, torch::Tensor qk_indptr,
     unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction, float logits_soft_cap,
     float sm_scale, float rope_scale, float rope_theta, bool return_lse) {
-  CHECK_INPUT(q);
   CHECK_INPUT(qo_indptr);
-  CHECK_INPUT(k);
-  CHECK_INPUT(v);
+  CHECK_CUDA(q);
+  CHECK_CUDA(k);
+  CHECK_CUDA(v);
   CHECK_INPUT(kv_indptr);
   CHECK_INPUT(custom_mask);
   CHECK_INPUT(qk_indptr);
@@ -509,11 +520,22 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardC
   CHECK_GE(kv_indptr.size(0), batch_size + 1);
   CHECK_GE(qk_indptr.size(0), batch_size + 1);
   int64_t num_kv_heads = (kv_layout_ == QKVLayout::kNHD) ? k.size(1) : k.size(0);
+  CHECK_EQ(q.stride(2), 1);
+  CHECK_EQ(k.stride(2), 1);
+  CHECK_EQ(v.stride(2), 1);
   CHECK_EQ(k.size(0), v.size(0));
   CHECK_EQ(k.size(1), v.size(1));
   CHECK_EQ(k.size(2), v.size(2));
   CHECK_EQ(k.size(2), head_dim);
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
+  const uint32_t q_stride_n = q.stride(0), q_stride_h = q.stride(1), kv_stride_n, kv_stride_h;
+  if (kv_layout_ == QKVLayout::kNHD) {
+    kv_stride_n = k.stride(0);
+    kv_stride_h = k.stride(1);
+  } else {
+    kv_stride_h = k.stride(0);
+    kv_stride_n = k.stride(1);
+  }
   qo_indptr = qo_indptr.to(torch::kInt32);
   kv_indptr = kv_indptr.to(torch::kInt32);
   qk_indptr = qk_indptr.to(torch::kInt32);
@@ -549,8 +571,8 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardC
                         /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr,
                         static_cast<c_type*>(o.data_ptr()),
                         /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                        num_qo_heads, num_kv_heads, kv_layout_, logits_soft_cap, sm_scale,
-                        rope_scale, rope_theta,
+                        num_qo_heads, num_kv_heads, q_stride_n, q_stride_h, kv_stride_n,
+                        kv_stride_h, logits_soft_cap, sm_scale, rope_scale, rope_theta,
                         /*stream=*/torch_current_stream);
                     TORCH_CHECK(status == cudaSuccess,
                                 "BatchPrefillWithRaggedKVCache failed with error ",
