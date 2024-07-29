@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.1.2](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.1...v0.1.2) (2024-07-29)
+
+### Bugfix
+* Fix the sampling kernel bug for cu118 ([#386](https://github.com/flashinfer-ai/flashinfer/pull/386), [#387](https://github.com/flashinfer-ai/flashinfer/pull/387)) ([0cd499](https://github.com/flashinfer-ai/flashinfer/commit/0cd49949e6c05a0c8f63d050ff96c8f6168cf914), [dc3f18](https://github.com/flashinfer-ai/flashinfer/commit/dc3f184eda83b9feb5c901606b3d8aede23a4a5f))
+
+### Features
+
+* add llama 3.1 style rope ([#401](https://github.com/flashinfer-ai/flashinfer/issues/401)) ([4c89dec](https://github.com/flashinfer-ai/flashinfer/commit/4c89decadc8ae9f261cae97c350064156e66bc09))
+* non-inplace rope operators ([#405](https://github.com/flashinfer-ai/flashinfer/issues/405)) ([74ffba1](https://github.com/flashinfer-ai/flashinfer/commit/74ffba1d1b946fcd3536b7637a4e1a999e5a5d3e))
+* sliding window attention ([#406](https://github.com/flashinfer-ai/flashinfer/issues/406)) ([28cffd3](https://github.com/flashinfer-ai/flashinfer/commit/28cffd366888649a1e9d871efec32e67b88070cb))
+* support non-contiguous (packed) input for prefill kernels ([#404](https://github.com/flashinfer-ai/flashinfer/issues/404)) ([68c3719](https://github.com/flashinfer-ai/flashinfer/commit/68c3719113f90bed5bf1a5d4990f8e2c0b0f5fd3))
+
+
+### Performance Improvements
+
+* slight optimization on merge states ([#313](https://github.com/flashinfer-ai/flashinfer/issues/313)) ([701c813](https://github.com/flashinfer-ai/flashinfer/commit/701c813cb1266f8dd2b93d17978d35fd6fb975dd))
+
 ## [0.1.1](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.0...v0.1.1) (2024-07-20)
 
 ### Bugfix
