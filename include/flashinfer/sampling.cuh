@@ -118,7 +118,7 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
         .SubtractLeft<VEC_SIZE>(greater_than_u, greater_than_u_diff, BoolDiffOp());
 #else
     BlockAdjacentDifference<bool, BLOCK_THREADS>(temp_storage->block_prim.adj_diff)
-        .FlagHeads<VEC_SIZE>(greater_than_u_diff, greater_than_u, BoolDiffOp());
+        .FlagHeads<VEC_SIZE>(greater_than_u_diff, greater_than_u, BoolDiffOp(), 0);
 #endif
     __syncthreads();
 
