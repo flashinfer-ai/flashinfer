@@ -14,8 +14,6 @@ on:
     secrets:
       WHL_TOKEN:
         required: true
-      # PYPI_TEST_TOKEN:
-      #   required: true
 
 env:
   TORCH_CUDA_ARCH_LIST: "8.0 8.9 9.0+PTX"
@@ -26,13 +24,8 @@ jobs:
       fail-fast: false
       matrix:
         python: ["3.8", "3.9", "3.10", "3.11"]
-        cuda: ["11.8", "12.1", "12.4"]
+        cuda: ["12.1"]
         torch: ["2.2", "2.3", "2.4"]
-        exclude: # for cuda 12.4, we only support torch 2.4+
-          - cuda: "12.4"
-            torch: "2.2"
-          - cuda: "12.4"
-            torch: "2.3"
 
     runs-on: [self-hosted]
     steps:
@@ -121,10 +114,3 @@ jobs:
           git add -A
           git commit -m "update whl"
           git push
-
-      # - name: Upload sdist to pypi
-      #   run: |
-      #     pip install twine
-      #     python -m twine upload --repository testpypi --username=__token__ dist/*.tar.gz
-      #   env:
-      #     TWINE_PASSWORD: ${{ secrets.PYPI_TEST_TOKEN }}

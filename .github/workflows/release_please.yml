@@ -18,10 +18,26 @@ jobs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
 
-  wheel:
+  wheel-cu118:
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created }}
-    uses: ./.github/workflows/release_wheel.yml
+    uses: ./.github/workflows/release_wheel_cu118.yml
+    with:
+      tag_name: ${{ needs.release-please.outputs.tag_name }}
+    secrets: inherit
+
+  wheel-cu121:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created }}
+    uses: ./.github/workflows/release_wheel_cu121.yml
+    with:
+      tag_name: ${{ needs.release-please.outputs.tag_name }}
+    secrets: inherit
+
+  wheel-cu124:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created }}
+    uses: ./.github/workflows/release_wheel_cu124.yml
     with:
       tag_name: ${{ needs.release-please.outputs.tag_name }}
     secrets: inherit

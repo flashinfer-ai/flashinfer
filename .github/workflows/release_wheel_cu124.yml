@@ -1,0 +1,121 @@
+# Adapted from https://github.com/punica-ai/punica/blob/591b59899f0a20760821785d06b331c8a2e5cb86/.github/workflows/release_wheel.yml
+name: Release
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag_name:
+        required: true
+        type: string
+    secrets:
+      WHL_TOKEN:
+        required: true
+
+env:
+  TORCH_CUDA_ARCH_LIST: "8.0 8.9 9.0+PTX"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.8", "3.9", "3.10", "3.11"]
+        cuda: ["12.4"]
+        torch: ["2.2", "2.3", "2.4"]
+        exclude: # for cuda 12.4, we only support torch 2.4+
+          - cuda: "12.4"
+            torch: "2.2"
+          - cuda: "12.4"
+            torch: "2.3"
+
+    runs-on: [self-hosted]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Build wheel
+        run: |
+          chown -R $CI_UID:$CI_GID "$GITHUB_WORKSPACE"
+          version="$(cat version.txt)"
+          docker run --rm -t \
+              -v "$CI_RUNNER_CACHE_DIR":/ci-cache \
+              -v "$GITHUB_WORKSPACE":/app \
+              -e FLASHINFER_CI_PYTHON_VERSION=${{ matrix.python }} \
+              -e FLASHINFER_CI_CUDA_VERSION=${{ matrix.cuda }} \
+              -e FLASHINFER_CI_TORCH_VERSION=${{ matrix.torch }} \
+              -e FLASHINFER_BUILD_VERSION=$version \
+              -e TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" \
+              --user $CI_UID:$CI_GID \
+              pytorch/manylinux-builder:cuda${{ matrix.cuda }} \
+              bash /app/scripts/run-ci-build-wheel.sh
+        timeout-minutes: 120
+      - run: du -h python/dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-cuda${{ matrix.cuda }}-torch${{ matrix.torch }}-python${{ matrix.python }}
+          path: python/dist/*
+
+  release:
+    needs: build
+    runs-on: [self-hosted]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: python/dist/
+          merge-multiple: true
+          pattern: wheel-*
+
+      - run: ls -lah python/dist/
+
+      - uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          files: |
+            python/dist/flashinfer*cp38*.whl
+
+      - uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          files: |
+            python/dist/flashinfer*cp39*.whl
+
+      - uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          files: |
+            python/dist/flashinfer*cp310*.whl
+
+      - uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          files: |
+            python/dist/flashinfer*cp311*.whl
+
+      - uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          files: |
+            python/dist/flashinfer-*.tar.gz
+
+      - name: Clone wheel index
+        run: git clone https://oauth2:${WHL_TOKEN}@github.com/flashinfer-ai/whl.git flashinfer-whl
+        env:
+          WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
+
+      - name: Update wheel index
+        run: python3 scripts/update_whl_index.py
+
+      - name: Push wheel index
+        run: |
+          cd flashinfer-whl
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "update whl"
+          git push
