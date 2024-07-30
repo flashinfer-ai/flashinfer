@@ -1215,8 +1215,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 raise ValueError(
                     "kv_indptr_buf should be a torch.Tensor in cuda graph mode"
                 )
-            self._fixed_batch_size = len(qo_indptr_buf)
-            if len(kv_indptr_buf) != self._fixed_batch_size:
+            self._fixed_batch_size = len(qo_indptr_buf) - 1
+            if len(kv_indptr_buf) != self._fixed_batch_size + 1:
                 raise ValueError(
                     "The length of kv_indptr_buf ({}) should be the same as qo_indptr_buf ({}).".format(
                         len(kv_indptr_buf), self._fixed_batch_size
