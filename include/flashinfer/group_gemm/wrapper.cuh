@@ -43,7 +43,7 @@ cudaError_t CutlassSegmentGEMMWrapper(CutlassSegmentGEMMHandler* handler, DType*
   AlignedAllocator allocator(handler->GetWorkspace(), handler->GetWorkspaceSizeInBytes());
   cutlass::gemm::GemmCoord* problem_sizes_device =
       allocator.aligned_alloc<cutlass::gemm::GemmCoord>(
-          batch_size * sizeof(cutlass::gemm::GemmCoord), 16);
+          batch_size * sizeof(cutlass::gemm::GemmCoord), 16, "problem_sizes_device");
   DType** x_data = allocator.aligned_alloc<DType*>(batch_size * sizeof(DType*), 16, "x_data");
   DType** w_data = allocator.aligned_alloc<DType*>(batch_size * sizeof(DType*), 16, "w_data");
   DType** y_data = allocator.aligned_alloc<DType*>(batch_size * sizeof(DType*), 16, "y_data");
