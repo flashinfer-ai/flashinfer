@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.3](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.2...v0.1.3) (2024-07-31)
+
+### Bugfix
+
+* bugfix: Fix cudagraph mode of BatchPrefillWithRaggedKVCacheWrapper ([#412](https://github.com/flashinfer-ai/flashinfer/pull/412)) ([9907bc](https://github.com/flashinfer-ai/flashinfer/commit/9907bc163eec7677870014b6ed5bb1789cc584f0))
+* fix cu118 cub usage for sampling kernels ([#410](https://github.com/flashinfer-ai/flashinfer/pull/410)) ([58d359](https://github.com/flashinfer-ai/flashinfer/commit/58d35930740083f27e65c9818ab857f9f4880aff))
+
+### Misc
+
+* enhance allocator error info and add shape check for prefill begin forward functions ([#413](https://github.com/flashinfer-ai/flashinfer/pull/413)) ([5e36c5](https://github.com/flashinfer-ai/flashinfer/commit/5e36c527bb10c9331a17d4ecd609120406280979))
+
 ## [0.1.2](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.1...v0.1.2) (2024-07-29)
 
 ### Bugfix
