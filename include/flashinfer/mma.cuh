@@ -100,6 +100,44 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t* R, T* smem_ptr) 
 }
 
 /*!
+ * \brief Wrapper of PTX ldmatrix m8n8.x2 instruction, loads data from shared memory
+ *   to fragment
+ * \tparam T data type of the fragment
+ * \param R pointer to the fragment
+ * \param smem_ptr pointer to the shared memory
+ */
+template <typename T>
+__device__ __forceinline__ void ldmatrix_m8n8x2(uint32_t* R, T* smem_ptr) {
+#ifdef FLASHINFER_LDMATRIX_M8N8X4_ENABLED
+  uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+               : "=r"(R[0]), "=r"(R[1])
+               : "r"(smem_int_ptr));
+#else
+  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
+#endif
+}
+
+/*!
+ * \brief Wrapper of PTX ldmatrix m8n8.x2 transposed instruction, loads data from
+ *   shared memory to fragment and transposes the fragment
+ * \tparam T data type of the fragment
+ * \param R pointer to the fragment
+ * \param smem_ptr pointer to the shared memory
+ */
+template <typename T>
+__device__ __forceinline__ void ldmatrix_m8n8x2_trans(uint32_t* R, T* smem_ptr) {
+#ifdef FLASHINFER_LDMATRIX_M8N8X4_ENABLED
+  uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile("ldmatrix.sync.aligned.trans.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+               : "=r"(R[0]), "=r"(R[1])
+               : "r"(smem_int_ptr));
+#else
+  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
+#endif
+}
+
+/*!
  * \brief Wrapper of PTX stmatrix m8n8.x4 instruction, stores data from fragment
  *   to shared memory
  * \tparam T data type of the fragment
