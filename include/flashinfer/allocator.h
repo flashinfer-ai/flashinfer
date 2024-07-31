@@ -17,6 +17,7 @@
 #define FLASHINFER_ALLOCATOR_H_
 
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 
 namespace flashinfer {
@@ -26,14 +27,17 @@ struct AlignedAllocator {
   size_t space;
   AlignedAllocator(void* buf, size_t space) : ptr(buf), space(space) {}
   template <typename T>
-  T* aligned_alloc(size_t size, size_t alignment) {
+  T* aligned_alloc(size_t size, size_t alignment, std::string name) {
     if (std::align(alignment, size, ptr, space)) {
       T* result = reinterpret_cast<T*>(ptr);
       ptr = (char*)ptr + size;
       space -= size;
       return result;
     } else {
-      throw std::runtime_error("RuntimeError: Out of workspace memory in AlignedAlloactor");
+      std::ostringstream oss;
+      oss << "Failed to allocate memory for " << name << " with size " << size << " and alignment "
+          << alignment << " in AlignedAllocator";
+      throw std::runtime_error(oss.str());
     }
     return nullptr;
   }
