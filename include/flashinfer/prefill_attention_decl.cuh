@@ -31,18 +31,18 @@ namespace flashinfer {
 
 template <uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK, QKVLayout KV_LAYOUT,
           PosEncodingMode POS_ENCODING_MODE, bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE,
-          typename DTypeIn, typename DTypeOut>
+          typename DTypeQ, typename DTypeKV, typename DTypeOut>
 cudaError_t SinglePrefillWithKVCacheDispatched(
-    DTypeIn* q, DTypeIn* k, DTypeIn* v, uint8_t* custom_mask, DTypeOut* o, DTypeOut* tmp,
+    DTypeQ* q, DTypeKV* k, DTypeKV* v, uint8_t* custom_mask, DTypeOut* o, DTypeOut* tmp,
     float* lse, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t qo_len, uint32_t kv_len,
     float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream);
 
 template <WarpLayout WARP_LAYOUT, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK,
           QKVLayout KV_LAYOUT, PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION,
-          MaskMode MASK_MODE, typename DTypeIn, typename DTypeOut, typename IdType>
+          MaskMode MASK_MODE, typename DTypeQ, typename DTypeKV, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
-    DTypeIn* q, IdType* request_indices, IdType* q_tile_indices, IdType* kv_tile_indices,
-    IdType* q_indptr, DTypeIn* k, DTypeIn* v, IdType* kv_indptr, uint8_t* custom_mask,
+    DTypeQ* q, IdType* request_indices, IdType* q_tile_indices, IdType* kv_tile_indices,
+    IdType* q_indptr, DTypeKV* k, DTypeKV* v, IdType* kv_indptr, uint8_t* custom_mask,
     IdType* qk_indptr, IdType* q_offset, IdType* k_rope_pos_offset, IdType* o_indptr, DTypeOut* o,
     DTypeOut* tmp_v, float* tmp_s, float* lse, IdType* merge_indptr, bool* block_valid_mask,
     IdType* kv_chunk_size_ptr, uint32_t total_num_rows, uint32_t num_qo_heads,
@@ -112,9 +112,9 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
 
 template <uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK, QKVLayout KV_LAYOUT,
           PosEncodingMode POS_ENCODING_MODE, bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE,
-          typename DTypeIn, typename DTypeOut, typename IdType>
+          typename DTypeQ, typename DTypeKV, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
-    BatchPrefillHandler* handler, DTypeIn* q, IdType* q_indptr, DTypeIn* k, DTypeIn* v,
+    BatchPrefillHandler* handler, DTypeQ* q, IdType* q_indptr, DTypeKV* k, DTypeKV* v,
     IdType* kv_indptr, uint8_t* custom_mask, IdType* qk_indptr, IdType* q_offset,
     IdType* k_rope_pos_offset, DTypeOut* o, float* lse, uint32_t num_qo_heads,
     uint32_t num_kv_heads, float logits_soft_cap, float sm_scale, float rope_scale,
@@ -150,7 +150,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
   DISPATCH_WARP_LAYOUT(warp_layout, WARP_LAYOUT, {
     return BatchPrefillWithRaggedKVCacheDispatched<
         WARP_LAYOUT, HEAD_DIM, LOGITS_POST_HOOK, KV_LAYOUT, POS_ENCODING_MODE,
-        ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeOut, IdType>(
+        ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeQ, DTypeKV, DTypeOut, IdType>(
         q, request_indices, qo_tile_indices, kv_tile_indices, q_indptr, k, v, kv_indptr,
         custom_mask, qk_indptr, q_offset, k_rope_pos_offset, o_indptr, o, tmp_v, tmp_s, lse,
         merge_indptr, block_valid_mask, kv_chunk_size_ptr, total_num_rows, num_qo_heads,

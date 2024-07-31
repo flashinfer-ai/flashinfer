@@ -49,7 +49,8 @@ cudaError_t SinglePrefillWithKVCacheCustomMask(
 
 /*!
  * \brief FlashAttention prefill CUDA function for a single request.
- * \tparam DTypeIn The data type of input
+ * \tparam DTypeQ The data type of query
+ * \tparam DTypeKV The data type of key and value
  * \tparam DTypeOut The data type of output
  * \param q The query tensor.
  * \param k The key tensor.
@@ -71,8 +72,8 @@ cudaError_t SinglePrefillWithKVCacheCustomMask(
  * \param stream The cuda stream to execute the kernel on.
  * \return status Indicates whether CUDA calls are successful
  */
-template <typename DTypeIn, typename DTypeOut>
-cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o, DTypeOut* tmp,
+template <typename DTypeQ, typename DTypeKV, typename DTypeOut>
+cudaError_t SinglePrefillWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut* o, DTypeOut* tmp,
                                      float* lse, uint32_t num_qo_heads, uint32_t num_kv_heads,
                                      uint32_t qo_len, uint32_t kv_len, uint32_t head_dim,
                                      bool causal = true, QKVLayout kv_layout = QKVLayout::kNHD,
@@ -101,9 +102,9 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOu
   return cudaSuccess;
 }
 
-template <typename DTypeIn, typename DTypeOut, typename IdType>
+template <typename DTypeQ, typename DTypeKV, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
-    BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, DTypeIn* k, DTypeIn* v,
+    BatchPrefillHandler* handler, DTypeQ* q, IdType* qo_indptr, DTypeKV* k, DTypeKV* v,
     IdType* kv_indptr, IdType* q_offset, IdType* k_rope_pos_offset, DTypeOut* o, float* lse,
     const uint32_t batch_size, const uint32_t num_qo_heads, const uint32_t num_kv_heads,
     const uint32_t head_dim, bool causal = true, QKVLayout kv_layout = QKVLayout::kNHD,
@@ -124,7 +125,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
                       allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
                         return BatchPrefillWithRaggedKVCacheWrapperDispatched<
                             HEAD_DIM, LogitsPostHook::kNone, KV_LAYOUT, pos_encoding_mode,
-                            ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeOut, IdType>(
+                            ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeQ, DTypeKV, DTypeOut, IdType>(
                             handler, q, qo_indptr, k, v, kv_indptr, /*custom_mask=*/nullptr,
                             /*qk_indptr=*/nullptr, q_offset, k_rope_pos_offset, o, lse,
                             num_qo_heads, num_kv_heads, /*logits_soft_cap=*/0.f, sm_scale,

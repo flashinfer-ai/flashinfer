@@ -33,7 +33,8 @@ def get_cu_file_str(
     pos_encoding_mode,
     allow_fp16_qk_reduction,
     mask_mode,
-    dtype_in,
+    dtype_q,
+    dtype_kv,
     dtype_out,
 ):
 
@@ -41,8 +42,8 @@ def get_cu_file_str(
 
 namespace flashinfer {{
 
-template cudaError_t SinglePrefillWithKVCacheDispatched<{head_dim}, {logits_hook}, {kv_layout}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {dtype_in}, {dtype_out}>(
-    {dtype_in}* q, {dtype_in}* k, {dtype_in}* v, uint8_t* custom_mask, {dtype_out}* o,
+template cudaError_t SinglePrefillWithKVCacheDispatched<{head_dim}, {logits_hook}, {kv_layout}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {dtype_q}, {dtype_kv}, {dtype_out}>(
+    {dtype_q}* q, {dtype_kv}* k, {dtype_kv}* v, uint8_t* custom_mask, {dtype_out}* o,
     {dtype_out}* tmp, float* lse, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t qo_len, uint32_t kv_len,
     float logits_soft_cap, float sm_scale, float rope_scale,
     float rope_theta, cudaStream_t stream);
@@ -55,7 +56,8 @@ template cudaError_t SinglePrefillWithKVCacheDispatched<{head_dim}, {logits_hook
         pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
         allow_fp16_qk_reduction=allow_fp16_qk_reduction,
         mask_mode=mask_mode_literal[int(mask_mode)],
-        dtype_in=dtype_literal[dtype_in],
+        dtype_q=dtype_literal[dtype_q],
+        dtype_kv=dtype_literal[dtype_kv],
         dtype_out=dtype_literal[dtype_out],
     )
     return content
@@ -64,7 +66,7 @@ template cudaError_t SinglePrefillWithKVCacheDispatched<{head_dim}, {logits_hook
 if __name__ == "__main__":
     pattern = (
         r"single_prefill_head_([0-9]+)_logitshook_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
-        r"fp16qkred_([a-z]+)_mask_([0-9]+)_dtypein_([a-z0-9]+)_dtypeout_([a-z0-9]+)\.cu"
+        r"fp16qkred_([a-z]+)_mask_([0-9]+)_dtypeq_([a-z0-9]+)_dtypekv_([a-z0-9]+)_dtypeout_([a-z0-9]+)\.cu"
     )
 
     compiled_pattern = re.compile(pattern)

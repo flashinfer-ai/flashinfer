@@ -88,11 +88,13 @@ set (MASK_MODES ${FLASHINFER_GEN_MASK_MODES})
 set (DECODE_DTYPES "f16")
 set (PREFILL_DTYPES "f16")
 set (DECODE_FP8_DTYPES)
+set (PREFILL_FP8_DTYPES)
 set (IDTYPES "i32")
 
 if(FLASHINFER_ENABLE_FP8)
   list(APPEND DECODE_DTYPES "e4m3" "e5m2")
   list(APPEND DECODE_FP8_DTYPES "e4m3" "e5m2")
+  list(APPEND PREFILL_FP8_DTYPES "e4m3" "e5m2")
 endif(FLASHINFER_ENABLE_FP8)
 
 if(FLASHINFER_ENABLE_BF16)
@@ -202,7 +204,7 @@ foreach(head_dim IN LISTS HEAD_DIMS)
         foreach(allow_fp16_qk_reduction IN LISTS ALLOW_FP16_QK_REDUCTIONS)
           foreach(mask_mode IN LISTS MASK_MODES)
             foreach(dtype IN LISTS PREFILL_DTYPES)
-              set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_prefill_head_${head_dim}_logitshook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypein_${dtype}_dtypeout_${dtype}.cu)
+              set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_prefill_head_${head_dim}_logitshook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_${dtype}.cu)
               add_custom_command(
                 OUTPUT ${generated_kernel_src}
                 COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_single_prefill_inst.py ${generated_kernel_src}
@@ -226,9 +228,9 @@ foreach(head_dim IN LISTS HEAD_DIMS)
       foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
         foreach(allow_fp16_qk_reduction IN LISTS ALLOW_FP16_QK_REDUCTIONS)
           foreach(mask_mode IN LISTS MASK_MODES)
-            foreach(dtype IN LISTS PREFILL_DTYPES)
-              foreach(idtype IN LISTS IDTYPES)
-                set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_prefill_head_${head_dim}_logitshook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
+            foreach(idtype IN LISTS IDTYPES)
+              foreach(dtype IN LISTS PREFILL_DTYPES)
+                set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_prefill_head_${head_dim}_logitshook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
                 add_custom_command(
                   OUTPUT ${generated_kernel_src}
                   COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py ${generated_kernel_src}
@@ -237,8 +239,21 @@ foreach(head_dim IN LISTS HEAD_DIMS)
                   VERBATIM
                 )
                 list(APPEND batch_paged_prefill_kernels_src ${generated_kernel_src})
-              endforeach(idtype)
-            endforeach(dtype)
+              endforeach(dtype)
+
+              # fp8 kv-cache
+              foreach(dtype_kv IN LISTS PREFILL_FP8_DTYPES)
+                set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_prefill_head_${head_dim}_logitshook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypeq_f16_dtypekv_${dtype_kv}_dtypeout_f16_idtype_${idtype}.cu)
+                add_custom_command(
+                  OUTPUT ${generated_kernel_src}
+                  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py ${generated_kernel_src}
+                  DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py
+                  COMMENT "Generating additional source file ${generated_kernel_src}"
+                  VERBATIM
+                )
+                list(APPEND batch_paged_prefill_kernels_src ${generated_kernel_src})
+              endforeach(dtype_kv)
+            endforeach(idtype)
           endforeach(mask_mode)
         endforeach(allow_fp16_qk_reduction)
       endforeach(pos_encoding_mode)
@@ -255,7 +270,7 @@ foreach(head_dim IN LISTS HEAD_DIMS)
           foreach(mask_mode IN LISTS MASK_MODES)
             foreach(dtype IN LISTS PREFILL_DTYPES)
               foreach(idtype IN LISTS IDTYPES)
-                set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_ragged_prefill_head_${head_dim}_logitshook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypein_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
+                set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_ragged_prefill_head_${head_dim}_logitshook_${logits_post_hook}_layout_${kv_layout}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
                 add_custom_command(
                   OUTPUT ${generated_kernel_src}
                   COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_ragged_prefill_inst.py ${generated_kernel_src}

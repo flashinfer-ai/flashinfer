@@ -35,16 +35,17 @@ def get_cu_file_str(
     pos_encoding_mode,
     allow_fp16_qk_reduction,
     mask_mode,
-    dtype_in,
+    dtype_q,
+    dtype_kv,
     dtype_out,
     idtype,
 ):
     warp_layout_choice = [0, 1]
     insts = "\n".join(
         [
-            """template cudaError_t BatchPrefillWithRaggedKVCacheDispatched<{warp_layout}, {head_dim}, {logits_hook}, {kv_layout}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {dtype_in}, {dtype_out}, {idtype}>(
-    {dtype_in}* q, {idtype}* request_indices, {idtype}* q_tile_indices, {idtype}* kv_tile_indices,
-    {idtype}* q_indptr, {dtype_in}* k, {dtype_in}* v, {idtype}* kv_indptr,
+            """template cudaError_t BatchPrefillWithRaggedKVCacheDispatched<{warp_layout}, {head_dim}, {logits_hook}, {kv_layout}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {dtype_q}, {dtype_kv}, {dtype_out}, {idtype}>(
+    {dtype_q}* q, {idtype}* request_indices, {idtype}* q_tile_indices, {idtype}* kv_tile_indices,
+    {idtype}* q_indptr, {dtype_kv}* k, {dtype_kv}* v, {idtype}* kv_indptr,
     uint8_t* custom_mask, {idtype}* qk_indptr, {idtype}* q_offset, {idtype}* k_rope_pos_offset,
     {idtype}* o_indptr, {dtype_out}* o, {dtype_out}* tmp_v, float* tmp_s, float* lse, {idtype}* merge_indptr,
     bool* block_valid_mask, {idtype}* kv_chunk_size_ptr, uint32_t total_num_rows, uint32_t num_qo_heads,
@@ -59,7 +60,8 @@ def get_cu_file_str(
                 pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
                 allow_fp16_qk_reduction=allow_fp16_qk_reduction,
                 mask_mode=mask_mode_literal[int(mask_mode)],
-                dtype_in=dtype_literal[dtype_in],
+                dtype_q=dtype_literal[dtype_q],
+                dtype_kv=dtype_literal[dtype_kv],
                 dtype_out=dtype_literal[dtype_out],
                 idtype=idtype_literal[idtype],
             )
@@ -81,7 +83,7 @@ namespace flashinfer {{
 if __name__ == "__main__":
     pattern = (
         r"batch_ragged_prefill_head_([0-9]+)_logitshook_([0-9]+)_layout_([0-9]+)_posenc_([0-9]+)_"
-        r"fp16qkred_([a-z]+)_mask_([0-9]+)_dtypein_([a-z0-9]+)_dtypeout_([a-z0-9]+)_idtype_([a-z0-9]+)\.cu"
+        r"fp16qkred_([a-z]+)_mask_([0-9]+)_dtypeq_([a-z0-9]+)_dtypekv_([a-z0-9]+)_dtypeout_([a-z0-9]+)_idtype_([a-z0-9]+)\.cu"
     )
     compiled_pattern = re.compile(pattern)
     path = Path(sys.argv[1])
