@@ -79,7 +79,6 @@ std::pair<uint32_t, uint32_t> PartitionPagedKVCacheBinarySearchMinNumPagePerBatc
       high = mid;
     }
   }
-  low = 16;
   new_batch_size = 0;
   for (const IdType& elem : num_pages) {
     new_batch_size += ceil_div(std::max(elem, 1), low);
@@ -112,7 +111,6 @@ inline std::tuple<bool, uint32_t, uint32_t> PrefillBinarySearchKVChunkSize(
       high = mid;
     }
   }
-  low = 16;
   new_batch_size = 0;
   for (uint32_t i = 0; i < batch_size; ++i) {
     new_batch_size += ceil_div(packed_qo_len_arr[i], qo_chunk_size) *
