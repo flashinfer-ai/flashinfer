@@ -169,7 +169,6 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
   FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
       &num_blocks_per_sm, partition_kv_kernel, num_threads, smem_size));
   max_grid_size = num_blocks_per_sm * num_sm;
-  std::cout << batch_size << " " << num_kv_heads << " " << max_grid_size << std::endl;
   if (batch_size * num_kv_heads >= max_grid_size) {
     split_kv = false;
     new_batch_size = batch_size;
