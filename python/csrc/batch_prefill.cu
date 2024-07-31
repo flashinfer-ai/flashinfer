@@ -30,7 +30,10 @@ void BatchPrefillWithPagedKVCachePyTorchWrapper::BeginForward(
   CHECK_CONTIGUOUS(paged_kv_indptr);
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
   CHECK_DIM(1, qo_indptr);
+  CHECK_DIM(1, paged_kv_indptr);
   CHECK_DIM(1, workspace_buffer);
+  CHECK_EQ(qo_indptr.size(0), batch_size + 1);
+  CHECK_EQ(paged_kv_indptr.size(0), batch_size + 1);
   qo_indptr = qo_indptr.to(torch::dtype(torch::kInt32).device(torch::kCPU));
   paged_kv_indptr = paged_kv_indptr.to(torch::dtype(torch::kInt32).device(torch::kCPU));
   auto device = workspace_buffer.device();
@@ -361,7 +364,10 @@ void BatchPrefillWithRaggedKVCachePyTorchWrapper::BeginForward(
   CHECK_CONTIGUOUS(qo_indptr);
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
   CHECK_DIM(1, qo_indptr);
+  CHECK_DIM(1, kv_indptr);
   CHECK_DIM(1, workspace_buffer);
+  CHECK_EQ(qo_indptr.size(0), batch_size + 1);
+  CHECK_EQ(kv_indptr.size(0), batch_size + 1);
   qo_indptr = qo_indptr.to(torch::dtype(torch::kInt32).device(torch::kCPU));
   kv_indptr = kv_indptr.to(torch::dtype(torch::kInt32).device(torch::kCPU));
   size_t workspace_size_in_bytes = workspace_buffer.size(0) * workspace_buffer.element_size();

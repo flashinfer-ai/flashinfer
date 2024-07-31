@@ -111,7 +111,6 @@ inline std::tuple<bool, uint32_t, uint32_t> PrefillBinarySearchKVChunkSize(
       high = mid;
     }
   }
-
   new_batch_size = 0;
   for (uint32_t i = 0; i < batch_size; ++i) {
     new_batch_size += ceil_div(packed_qo_len_arr[i], qo_chunk_size) *
@@ -340,32 +339,37 @@ class BatchDecodeHandler {
           padded_batch_size_ = padded_batch_size;
           AlignedAllocator allocator(buffer, workspace_size_in_bytes);
           tmp_v_ = allocator.aligned_alloc<void>(
-              num_qo_heads * padded_batch_size * HEAD_DIM * sizeof(DTypeOut), 16);
-          tmp_s_ =
-              allocator.aligned_alloc<float>(num_qo_heads * padded_batch_size * sizeof(float), 16);
-          new_indptr_ = allocator.aligned_alloc<void>((padded_batch_size + 1) * sizeof(IdType), 16);
+              num_qo_heads * padded_batch_size * HEAD_DIM * sizeof(DTypeOut), 16,
+              "batch_decode_tmp_v");
+          tmp_s_ = allocator.aligned_alloc<float>(num_qo_heads * padded_batch_size * sizeof(float),
+                                                  16, "batch_decode_tmp_s");
+          new_indptr_ = allocator.aligned_alloc<void>((padded_batch_size + 1) * sizeof(IdType), 16,
+                                                      "batch_decode_new_indptr");
 
           void* new_indptr_h_ = page_locked_buffer_;
-          new_last_page_len_ =
-              allocator.aligned_alloc<void>(padded_batch_size * sizeof(IdType), 16);
+          new_last_page_len_ = allocator.aligned_alloc<void>(padded_batch_size * sizeof(IdType), 16,
+                                                             "batch_decode_new_last_page_len");
           void* new_last_page_len_h_ =
               (char*)page_locked_buffer_ + ((char*)new_last_page_len_ - (char*)new_indptr_);
-          chunk_indptr_ =
-              allocator.aligned_alloc<void>((padded_batch_size + 1) * sizeof(IdType), 16);
+          chunk_indptr_ = allocator.aligned_alloc<void>((padded_batch_size + 1) * sizeof(IdType),
+                                                        16, "batch_decode_chunk_indptr");
           void* chunk_indptr_h_ =
               (char*)page_locked_buffer_ + ((char*)chunk_indptr_ - (char*)new_indptr_);
-          batch_idx_map_ = allocator.aligned_alloc<void>(padded_batch_size * sizeof(IdType), 16);
+          batch_idx_map_ = allocator.aligned_alloc<void>(padded_batch_size * sizeof(IdType), 16,
+                                                         "batch_decode_batch_idx_map");
           void* batch_idx_map_h_ =
               (char*)page_locked_buffer_ + ((char*)batch_idx_map_ - (char*)new_indptr_);
-          chunk_start_pos_ = allocator.aligned_alloc<void>(padded_batch_size * sizeof(IdType), 16);
+          chunk_start_pos_ = allocator.aligned_alloc<void>(padded_batch_size * sizeof(IdType), 16,
+                                                           "batch_decode_chunk_start_pos");
           void* chunk_start_pos_h_ =
               (char*)page_locked_buffer_ + ((char*)chunk_start_pos_ - (char*)new_indptr_);
-          seq_lengths_before_partition_ =
-              allocator.aligned_alloc<void>(padded_batch_size * sizeof(IdType), 16);
+          seq_lengths_before_partition_ = allocator.aligned_alloc<void>(
+              padded_batch_size * sizeof(IdType), 16, "batch_decode_seq_lengths_before_partition");
           void* seq_lengths_before_partition_h_ =
               (char*)page_locked_buffer_ +
               ((char*)seq_lengths_before_partition_ - (char*)new_indptr_);
-          block_valid_mask_ = allocator.aligned_alloc<bool>(padded_batch_size * sizeof(bool), 16);
+          block_valid_mask_ = allocator.aligned_alloc<bool>(padded_batch_size * sizeof(bool), 16,
+                                                            "batch_decode_block_valid_mask");
           bool* block_valid_mask_h_ =
               (bool*)page_locked_buffer_ + ((bool*)block_valid_mask_ - (bool*)new_indptr_);
           std::fill(block_valid_mask_h_, block_valid_mask_h_ + padded_batch_size, 0);
@@ -390,30 +394,32 @@ class BatchDecodeHandler {
         if (split_kv) {
           AlignedAllocator allocator(buffer, workspace_size_in_bytes);
           tmp_v_ = allocator.aligned_alloc<void>(
-              num_qo_heads * new_batch_size * HEAD_DIM * sizeof(DTypeOut), 16);
-          tmp_s_ =
-              allocator.aligned_alloc<float>(num_qo_heads * new_batch_size * sizeof(float), 16);
-          new_indptr_ =
-              allocator.aligned_alloc<void>((batch_size_after_partition_ + 1) * sizeof(IdType), 16);
+              num_qo_heads * new_batch_size * HEAD_DIM * sizeof(DTypeOut), 16,
+              "batch_decode_tmp_v");
+          tmp_s_ = allocator.aligned_alloc<float>(num_qo_heads * new_batch_size * sizeof(float), 16,
+                                                  "batch_decode_tmp_s");
+          new_indptr_ = allocator.aligned_alloc<void>(
+              (batch_size_after_partition_ + 1) * sizeof(IdType), 16, "batch_decode_new_indptr");
           void* new_indptr_h_ = page_locked_buffer_;
-          new_last_page_len_ =
-              allocator.aligned_alloc<void>(batch_size_after_partition_ * sizeof(IdType), 16);
+          new_last_page_len_ = allocator.aligned_alloc<void>(
+              batch_size_after_partition_ * sizeof(IdType), 16, "batch_decode_new_last_page_len");
           void* new_last_page_len_h_ =
               (char*)page_locked_buffer_ + ((char*)new_last_page_len_ - (char*)new_indptr_);
           chunk_indptr_ = allocator.aligned_alloc<void>(
-              (batch_size_before_partition_ + 1) * sizeof(IdType), 16);
+              (batch_size_before_partition_ + 1) * sizeof(IdType), 16, "batch_decode_chunk_indptr");
           void* chunk_indptr_h_ =
               (char*)page_locked_buffer_ + ((char*)chunk_indptr_ - (char*)new_indptr_);
-          batch_idx_map_ =
-              allocator.aligned_alloc<void>(batch_size_after_partition_ * sizeof(IdType), 16);
+          batch_idx_map_ = allocator.aligned_alloc<void>(
+              batch_size_after_partition_ * sizeof(IdType), 16, "batch_decode_batch_idx_map");
           void* batch_idx_map_h_ =
               (char*)page_locked_buffer_ + ((char*)batch_idx_map_ - (char*)new_indptr_);
-          chunk_start_pos_ =
-              allocator.aligned_alloc<void>(batch_size_after_partition_ * sizeof(IdType), 16);
+          chunk_start_pos_ = allocator.aligned_alloc<void>(
+              batch_size_after_partition_ * sizeof(IdType), 16, "batch_decode_chunk_start_pos");
           void* chunk_start_pos_h_ =
               (char*)page_locked_buffer_ + ((char*)chunk_start_pos_ - (char*)new_indptr_);
           seq_lengths_before_partition_ =
-              allocator.aligned_alloc<void>(batch_size_after_partition_ * sizeof(IdType), 16);
+              allocator.aligned_alloc<void>(batch_size_after_partition_ * sizeof(IdType), 16,
+                                            "batch_decode_seq_lengths_before_partition");
           void* seq_lengths_before_partition_h_ =
               (char*)page_locked_buffer_ +
               ((char*)seq_lengths_before_partition_ - (char*)new_indptr_);
@@ -678,27 +684,34 @@ class BatchPrefillHandler {
     if (IsCUDAGraphEnabled()) {
       padded_batch_size_ = std::max(split_max_batch_size, total_num_tiles_q);
       AlignedAllocator allocator(buffer, workspace_size_in_bytes);
-      request_indices_ = allocator.aligned_alloc<void>(sizeof(IdType) * padded_batch_size_, 16);
+      request_indices_ = allocator.aligned_alloc<void>(sizeof(IdType) * padded_batch_size_, 16,
+                                                       "batch_prefill_request_indices");
       void* request_indices_h_ = page_locked_buffer_;
-      qo_tile_indices_ = allocator.aligned_alloc<void>(sizeof(IdType) * padded_batch_size_, 16);
+      qo_tile_indices_ = allocator.aligned_alloc<void>(sizeof(IdType) * padded_batch_size_, 16,
+                                                       "batch_prefill_qo_tile_indices");
       void* qo_tile_indices_h_ =
           (char*)page_locked_buffer_ + ((char*)qo_tile_indices_ - (char*)request_indices_);
-      kv_tile_indices_ = allocator.aligned_alloc<void>(sizeof(IdType) * padded_batch_size_, 16);
+      kv_tile_indices_ = allocator.aligned_alloc<void>(sizeof(IdType) * padded_batch_size_, 16,
+                                                       "batch_prefill_kv_tile_indices");
       void* kv_tile_indices_h_ =
           (char*)page_locked_buffer_ + ((char*)kv_tile_indices_ - (char*)request_indices_);
-      o_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * (batch_size + 1), 16);
+      o_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * (batch_size + 1), 16,
+                                                "batch_prefill_o_indptr");
       void* o_indptr_h_ = (char*)page_locked_buffer_ + ((char*)o_indptr_ - (char*)request_indices_);
-      kv_chunk_size_ptr_ = allocator.aligned_alloc<void>(sizeof(IdType), 1);
+      kv_chunk_size_ptr_ =
+          allocator.aligned_alloc<void>(sizeof(IdType), 1, "batch_prefill_kv_chunk_size_ptr");
       void* kv_chunk_size_ptr_h_ =
           (char*)page_locked_buffer_ + ((char*)kv_chunk_size_ptr_ - (char*)request_indices_);
       *(IdType*)kv_chunk_size_ptr_h_ = kv_chunk_size;
       if (total_num_tiles_q < split_max_batch_size) {
         // need merge_indptr
-        merge_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * (total_num_rows_ + 1), 16);
+        merge_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * (total_num_rows_ + 1), 16,
+                                                      "batch_prefill_merge_indptr");
         void* merge_indptr_h_ =
             (char*)page_locked_buffer_ + ((char*)merge_indptr_ - (char*)request_indices_);
         std::copy(merge_indptr_vec.begin(), merge_indptr_vec.end(), (IdType*)merge_indptr_h_);
-        block_valid_mask_ = allocator.aligned_alloc<bool>(sizeof(bool) * padded_batch_size_, 16);
+        block_valid_mask_ = allocator.aligned_alloc<bool>(sizeof(bool) * padded_batch_size_, 16,
+                                                          "batch_prefill_block_valid_mask");
         bool* block_valid_mask_h_ =
             (bool*)page_locked_buffer_ + ((bool*)block_valid_mask_ - (bool*)request_indices_);
         for (uint32_t i = 0; i < padded_batch_size_; ++i) {
@@ -724,9 +737,11 @@ class BatchPrefillHandler {
 
       if (total_num_tiles_q < split_max_batch_size) {
         tmp_v_ = allocator.aligned_alloc<void>(
-            num_qo_heads * split_max_batch_size * qo_tile_size * head_dim * sizeof(DTypeOut), 16);
+            num_qo_heads * split_max_batch_size * qo_tile_size * head_dim * sizeof(DTypeOut), 16,
+            "batch_prefill_tmp_v");
         tmp_s_ = allocator.aligned_alloc<float>(
-            num_qo_heads * split_max_batch_size * qo_tile_size * sizeof(float), 16);
+            num_qo_heads * split_max_batch_size * qo_tile_size * sizeof(float), 16,
+            "batch_prefill_tmp_s");
       } else {
         tmp_v_ = nullptr;
         tmp_s_ = nullptr;
@@ -734,27 +749,30 @@ class BatchPrefillHandler {
     } else {
       padded_batch_size_ = new_batch_size;
       AlignedAllocator allocator(buffer, workspace_size_in_bytes);
-      request_indices_ =
-          allocator.aligned_alloc<void>(sizeof(IdType) * request_indices_vec.size(), 16);
+      request_indices_ = allocator.aligned_alloc<void>(sizeof(IdType) * request_indices_vec.size(),
+                                                       16, "batch_prefill_request_indices");
       void* request_indices_h_ = page_locked_buffer_;
-      qo_tile_indices_ =
-          allocator.aligned_alloc<void>(sizeof(IdType) * qo_tile_indices_vec.size(), 16);
+      qo_tile_indices_ = allocator.aligned_alloc<void>(sizeof(IdType) * qo_tile_indices_vec.size(),
+                                                       16, "batch_prefill_qo_tile_indices");
       void* qo_tile_indices_h_ =
           (char*)page_locked_buffer_ + ((char*)qo_tile_indices_ - (char*)request_indices_);
-      kv_tile_indices_ =
-          allocator.aligned_alloc<void>(sizeof(IdType) * kv_tile_indices_vec.size(), 16);
+      kv_tile_indices_ = allocator.aligned_alloc<void>(sizeof(IdType) * kv_tile_indices_vec.size(),
+                                                       16, "batch_prefill_kv_tile_indices");
       void* kv_tile_indices_h_ =
           (char*)page_locked_buffer_ + ((char*)kv_tile_indices_ - (char*)request_indices_);
       if (split_kv) {
         // need merge_indptr when split_kv is true
-        merge_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * merge_indptr_vec.size(), 16);
+        merge_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * merge_indptr_vec.size(), 16,
+                                                      "batch_prefill_merge_indptr");
         void* merge_indptr_h_ =
             (char*)page_locked_buffer_ + ((char*)merge_indptr_ - (char*)request_indices_);
         std::copy(merge_indptr_vec.begin(), merge_indptr_vec.end(), (IdType*)merge_indptr_h_);
       }
-      o_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * o_indptr_vec.size(), 16);
+      o_indptr_ = allocator.aligned_alloc<void>(sizeof(IdType) * o_indptr_vec.size(), 16,
+                                                "batch_prefill_o_indptr");
       void* o_indptr_h_ = (char*)page_locked_buffer_ + ((char*)o_indptr_ - (char*)request_indices_);
-      kv_chunk_size_ptr_ = allocator.aligned_alloc<void>(sizeof(IdType), 1);
+      kv_chunk_size_ptr_ =
+          allocator.aligned_alloc<void>(sizeof(IdType), 1, "batch_prefill_kv_chunk_size_ptr");
       void* kv_chunk_size_ptr_h_ =
           (char*)page_locked_buffer_ + ((char*)kv_chunk_size_ptr_ - (char*)request_indices_);
       *(IdType*)kv_chunk_size_ptr_h_ = kv_chunk_size;
@@ -772,9 +790,11 @@ class BatchPrefillHandler {
 
       if (split_kv) {
         tmp_v_ = allocator.aligned_alloc<void>(
-            num_qo_heads * new_batch_size * qo_tile_size * head_dim * sizeof(DTypeOut), 16);
+            num_qo_heads * new_batch_size * qo_tile_size * head_dim * sizeof(DTypeOut), 16,
+            "batch_prefill_tmp_v");
         tmp_s_ = allocator.aligned_alloc<float>(
-            num_qo_heads * new_batch_size * qo_tile_size * sizeof(float), 16);
+            num_qo_heads * new_batch_size * qo_tile_size * sizeof(float), 16,
+            "batch_prefill_tmp_s");
       } else {
         tmp_v_ = nullptr;
         tmp_s_ = nullptr;
