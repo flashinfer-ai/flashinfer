@@ -2109,6 +2109,11 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
               << " please create an issue (https://github.com/flashinfer-ai/flashinfer/issues)"
                  " and report the issue to the developers.";
       throw std::invalid_argument(err_msg.str());
+    } else if constexpr ((HEAD_DIM * sizeof(DTypeKV)) % 128 != 0) {
+      std::ostringstream err_msg;
+      err_msg << "Incompatible HEAD_DIM with DTypeKV. Should be multiples of 128 byte chunk."
+                 "HEAD_DIM=" << HEAD_DIM << ", sizeof(DTypeKV)=" << sizeof(DTypeKV);
+      throw std::invalid_argument(err_msg.str());
     } else {
       uint32_t smem_size = num_frags_x * num_warps_x * 16 * HEAD_DIM * sizeof(DTypeQ) + 
                            num_frags_z * num_warps_z * 2 * 16 * HEAD_DIM * sizeof(DTypeKV);
