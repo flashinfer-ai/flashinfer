@@ -44,12 +44,12 @@ cudaError_t CutlassSegmentGEMMWrapper(CutlassSegmentGEMMHandler* handler, DType*
   cutlass::gemm::GemmCoord* problem_sizes_device =
       allocator.aligned_alloc<cutlass::gemm::GemmCoord>(
           batch_size * sizeof(cutlass::gemm::GemmCoord), 16);
-  DType** x_data = allocator.aligned_alloc<DType*>(batch_size * sizeof(DType*), 16);
-  DType** w_data = allocator.aligned_alloc<DType*>(batch_size * sizeof(DType*), 16);
-  DType** y_data = allocator.aligned_alloc<DType*>(batch_size * sizeof(DType*), 16);
-  int64_t* ld_x = allocator.aligned_alloc<int64_t>(batch_size * sizeof(int64_t), 16);
-  int64_t* ld_w = allocator.aligned_alloc<int64_t>(batch_size * sizeof(int64_t), 16);
-  int64_t* ld_y = allocator.aligned_alloc<int64_t>(batch_size * sizeof(int64_t), 16);
+  DType** x_data = allocator.aligned_alloc<DType*>(batch_size * sizeof(DType*), 16, "x_data");
+  DType** w_data = allocator.aligned_alloc<DType*>(batch_size * sizeof(DType*), 16, "w_data");
+  DType** y_data = allocator.aligned_alloc<DType*>(batch_size * sizeof(DType*), 16, "y_data");
+  int64_t* ld_x = allocator.aligned_alloc<int64_t>(batch_size * sizeof(int64_t), 16, "ld_x");
+  int64_t* ld_w = allocator.aligned_alloc<int64_t>(batch_size * sizeof(int64_t), 16, "ld_w");
+  int64_t* ld_y = allocator.aligned_alloc<int64_t>(batch_size * sizeof(int64_t), 16, "ld_y");
 
   // NOTE(Zihao): I didn't successfully launch the kernel with cudaLaunchKernel API,
   // so I just use the kernel function directly, need to investigate more.
