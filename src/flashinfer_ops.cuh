@@ -127,7 +127,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
               {DISPATCH_allow_fp16_qk_reduction(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
                 return BatchPrefillWithRaggedKVCacheWrapperDispatched<
                     HEAD_DIM, LogitsPostHook::kNone, pos_encoding_mode, ALLOW_FP16_QK_REDUCTION,
-                    MASK_MODE, DTypeIn, DTypeOut, IdType>(
+                    MASK_MODE, DTypeIn, DTypeIn, DTypeOut, IdType>(
                     handler, q, qo_indptr, k, v, kv_indptr, /*custom_mask=*/nullptr,
                     /*qk_indptr=*/nullptr, q_offset, k_rope_pos_offset, o, lse, num_qo_heads,
                     num_kv_heads, qo_stride_n, qo_stride_h, kv_stride_n, kv_stride_h,
@@ -158,7 +158,7 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
               {DISPATCH_allow_fp16_qk_reduction(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
                 return BatchPrefillWithPagedKVCacheWrapperDispatched<
                     PAGE_STORAGE, HEAD_DIM, LogitsPostHook::kNone, POS_ENCODING_MODE,
-                    ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeOut, IdType>(
+                    ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeIn, DTypeOut, IdType>(
                     handler, q, qo_indptr, q_offset, paged_kv,
                     /*custom_mask=*/nullptr,
                     /*qk_indptr=*/nullptr, o, lse, num_qo_heads, /*window_left=*/-1,

@@ -32,8 +32,8 @@
 #include "../permuted_smem.cuh"
 #include "../pos_enc.cuh"
 #include "../utils.cuh"
+#include "../frag_layout_swizzle.cuh"
 #include "cascade.cuh"
-#include "frag_layout_swizzle.cuh"
 #include "logits_post_hook.cuh"
 #include "mask.cuh"
 #include "warp_layout.cuh"
@@ -980,7 +980,7 @@ __device__ __forceinline__ void write_o_reg_gmem(
 template <LogitsPostHook logits_post_hook, bool partition_kv, MaskMode mask_mode,
           PosEncodingMode pos_encoding_mode, uint32_t num_frags_x, uint32_t num_frags_y,
           uint32_t num_frags_z, uint32_t num_warps_x, uint32_t num_warps_z, typename DTypeQ,
-          typename DTypeQKAccum, typename DTypeOut>
+          typename DTypeKV, typename DTypeQKAccum, typename DTypeOut>
 __global__
 __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVCacheKernel(
     DTypeQ* __restrict__ q, DTypeKV* __restrict__ k, DTypeKV* __restrict__ v,
@@ -1010,7 +1010,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
 
   constexpr uint32_t head_dim = num_frags_y * 16;
   constexpr uint32_t channel_size_128b_q = head_dim / num_elems_per_128b<DTypeQ>();
-  // constexpr uint32_t channel_size_128b_kv = head_dim / num_elems_per_128b<DTypeKV>();
+  constexpr uint32_t channel_size_128b_kv = head_dim / num_elems_per_128b<DTypeKV>();
   constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeOut>();
 
   extern __shared__ uint8_t smem[];
