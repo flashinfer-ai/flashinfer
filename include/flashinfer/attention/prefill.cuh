@@ -170,6 +170,7 @@ template <SharedMemFillMode fill_mode, uint32_t num_warps_x, uint32_t num_warps_
 __device__ __forceinline__ void produce_kv(smem_t smem, uint32_t* smem_offset, T** gptr,
                                            const uint32_t kv_stride_n, const uint32_t kv_idx_base,
                                            const uint32_t kv_len) {
+  // NOTE(Zihao): for fp8, this function doesn't work for head_dim = 64 at the moment
   constexpr uint32_t head_dim = num_frags_y * 16;
   constexpr uint32_t num_warps = num_warps_x * num_warps_z;
   constexpr uint32_t channel_size_128b_kv = head_dim / num_elems_per_128b<T>();
@@ -199,6 +200,7 @@ __device__ __forceinline__ void page_produce_kv(smem_t smem, uint32_t* smem_offs
                                                 paged_kv_t<page_storage, DType, IdType>& paged_kv,
                                                 const uint32_t kv_idx_base, const size_t* kv_offset,
                                                 const uint32_t kv_len) {
+  // NOTE(Zihao): for fp8, this function doesn't work for head_dim = 64 at the moment
   constexpr SharedMemFillMode fill_mode =
       produce_v ? SharedMemFillMode::kFillZero : SharedMemFillMode::kNoFill;
   constexpr uint32_t head_dim = num_frags_y * 16;
@@ -503,7 +505,7 @@ __device__ __forceinline__ void compute_qk(smem_t* q_smem, uint32_t* q_smem_offs
         k_smem->ldmatrix_m8n8x2(*k_smem_offset_r, b_frag_f8);
         b_frag_f8[0] = frag_layout_transform_16b_to_8b(b_frag_f8[0]);
         b_frag_f8[1] = frag_layout_transform_16b_to_8b(b_frag_f8[1]);
-        vec_cast<8>((DTypeKV*)b_frag_f8, (DTypeQ*)b_frag);
+        vec_cast<DTypeQ, DTypeKV, 8>((DTypeQ*)b_frag, (DTypeKV*)b_frag_f8);
       } else {
         k_smem->ldmatrix_m8n8x4(*k_smem_offset_r, b_frag);
       }
@@ -742,7 +744,7 @@ __device__ __forceinline__ void compute_sfm_v(smem_t* v_smem, uint32_t* v_smem_o
         v_smem->ldmatrix_m8n8x2_trans(*v_smem_offset_r, b_frag_f8);
         b_frag_f8[0] = frag_layout_transform_16b_to_8b_trans(b_frag_f8[0]);
         b_frag_f8[1] = frag_layout_transform_16b_to_8b_trans(b_frag_f8[1]);
-        vec_cast<8>((DTypeKV*)b_frag_f8, (DTypeQ*)b_frag);
+        vec_cast<DTypeQ, DTypeKV, 8>((DTypeQ*)b_frag, (DTypeKV*)b_frag_f8);
       } else {
         v_smem->ldmatrix_m8n8x4_trans(*v_smem_offset_r, b_frag);
       }
