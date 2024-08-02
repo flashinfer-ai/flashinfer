@@ -757,9 +757,9 @@ __device__ __forceinline__ void compute_sfm_v(smem_t* v_smem, uint32_t* v_smem_o
           v_smem->ldmatrix_m8n8x4_trans(*v_smem_offset_r, b_frag_f8);
         }
         b_frag_f8[0 + 2 * (fy % 2)] =
-            frag_layout_transform_16b_to_8b_trans(b_frag_f8[2 * (fy % 2)]);
+            frag_layout_transform_16b_to_8b_trans(b_frag_f8[0 + 2 * (fy % 2)]);
         b_frag_f8[1 + 2 * (fy % 2)] =
-            frag_layout_transform_16b_to_8b_trans(b_frag_f8[2 * (fy % 2)]);
+            frag_layout_transform_16b_to_8b_trans(b_frag_f8[1 + 2 * (fy % 2)]);
         vec_cast<DTypeQ, DTypeKV, 8>((DTypeQ*)b_frag, (DTypeKV*)(b_frag_f8 + 2 * (fy % 2)));
       } else {
         v_smem->ldmatrix_m8n8x4_trans(*v_smem_offset_r, b_frag);

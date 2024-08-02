@@ -1070,6 +1070,64 @@ FLASHINFER_INLINE void vec_cast<half, float>(half* dst, const float* src) {
   }
 }
 
+#if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 890))
+template <size_t vec_size>
+FLASHINFER_INLINE void vec_cast<__nv_fp8_e4m3, half>(__nv_fp8_e4m3* dst, const half* src) {
+  if constexpr (vec_size == 1) {
+    dst[0] = __nv_fp8_e4m3(src[0]);
+  } else {
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 2; ++i) {
+      asm volatile("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;"
+                   : "=h"(*(__nv_fp8x2_e4m3*)&dst[i * 2])
+                   : "r"(*(half2*)&src[i * 2]));
+    }
+  }
+}
+
+template <size_t vec_size>
+FLASHINFER_INLINE void vec_cast<__nv_fp8_e5m2, half>(__nv_fp8_e5m2* dst, const half* src) {
+  if constexpr (vec_size == 1) {
+    dst[0] = __nv_fp8_e5m2(src[0]);
+  } else {
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 2; ++i) {
+      asm volatile("cvt.rn.satfinite.e5m2x2.f16x2 %0, %1;"
+                   : "=h"(*(__nv_fp8x2_e5m2*)&dst[i * 2])
+                   : "r"(*(half2*)&src[i * 2]));
+    }
+  }
+}
+
+template <size_t vec_size>
+FLASHINFER_INLINE void vec_cast<half, __nv_fp8_e4m3>(half* dst, const __nv_fp8_e4m3* src) {
+  if constexpr (vec_size == 1) {
+    dst[0] = half(src[0]);
+  } else {
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 2; ++i) {
+      asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;"
+                   : "=h"(*(half2*)&dst[i * 2])
+                   : "r"(*(__nv_fp8x2_e4m3*)&src[i * 2]));
+    }
+  }
+}
+
+template <size_t vec_size>
+FLASHINFER_INLINE void vec_cast<half, __nv_fp8_e5m2>(half* dst, const __nv_fp8_e5m2* src) {
+  if constexpr (vec_size == 1) {
+    dst[0] = half(src[0]);
+  } else {
+#pragma unroll
+    for (size_t i = 0; i < vec_size / 2; ++i) {
+      asm volatile("cvt.rn.f16x2.e5m2x2 %0, %1;"
+                   : "=h"(*(half2*)&dst[i * 2])
+                   : "r"(*(__nv_fp8x2_e5m2*)&src[i * 2]));
+    }
+  }
+}
+#endif
+
 #ifdef FLASHINFER_ENABLE_BF16
 template <size_t vec_size>
 FLASHINFER_INLINE void vec_cast<float, nv_bfloat16>(float* dst, const nv_bfloat16* src) {
