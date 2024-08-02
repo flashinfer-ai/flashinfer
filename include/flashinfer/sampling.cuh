@@ -65,6 +65,8 @@ template <typename T, uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM>
 struct SamplingTempStorage {
   union {
+    T deterministic_scan[BLOCK_THREADS / 32];
+    T deterministic_reduce[BLOCK_THREADS / 32];
     typename BlockScan<T, BLOCK_THREADS, SCAN_ALGORITHM>::TempStorage scan;
     typename BlockReduce<T, BLOCK_THREADS, REDUCE_ALGORITHM>::TempStorage reduce;
     typename BlockReduce<Pair<T>, BLOCK_THREADS, REDUCE_ALGORITHM>::TempStorage reduce_pair;
@@ -78,6 +80,90 @@ struct SamplingTempStorage {
     } block_aggregate;
   } data;
 };
+
+/*!
+ * \brief Deterministic inclusive scan implementation, use Belloch scan algorithm.
+ * \note This implementation is slower than the cub::BlockScan, but it is deterministic.
+ */
+template <uint32_t VEC_SIZE, uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
+          BlockReduceAlgorithm REDUCE_ALGORITHM, typename T>
+__device__ __forceinline__ void DeterministicInclusiveSum(
+    const T* in_data, T* out_data,
+    SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>* temp_storage) {
+  T* smem_prefix_sum = temp_storage->block_prim.deterministic_scan;
+  T thread_data[VEC_SIZE];
+  T thread_sum = 0;
+#pragma unroll
+  for (uint32_t i = 0; i < VEC_SIZE; ++i) {
+    thread_sum += in_data[i];
+    thread_data[i] = thread_sum;
+  }
+
+  T thread_exclusive_prefix_sum = thread_sum;
+
+#pragma unroll
+  for (uint32_t offset = 1; offset < 32; offset *= 2) {
+    T tmp = __shfl_up_sync(0xffffffff, thread_exclusive_prefix_sum, offset);
+    if ((threadIdx.x + 1) % (offset * 2) == 0) {
+      thread_exclusive_prefix_sum += tmp;
+    }
+  }
+
+  T warp_sum = __shfl_sync(0xffffffff, thread_exclusive_prefix_sum,
+                           threadIdx.x | 0xffffffff);
+  if (threadIdx.x % 32 == 31) {
+    thread_exclusive_prefix_sum = 0;
+  }
+
+#pragma unroll
+  for (uint32_t offset = 16; offset >= 1; offset /= 2) {
+    T tmp = __shfl_xor_sync(0xffffffff, thread_exclusive_prefix_sum, offset);
+    if ((threadIdx.x + 1) % (offset * 2) == 0) {
+      thread_exclusive_prefix_sum = tmp + thread_exclusive_prefix_sum;
+    }
+    if ((threadIdx.x + 1) % (offset * 2) == offset) {
+      thread_exclusive_prefix_sum = tmp;
+    }
+  }
+
+  smem_prefix_sum[threadIdx.x / 32] = warp_sum;
+  __syncthreads();
+
+  if (threadIdx.x < 32) {
+    T warp_exclusive_prefix_sum = smem_prefix_sum[threadIdx.x];
+
+#pragma unroll
+    for (uint32_t offset = 1; offset < 32; offset *= 2) {
+      T tmp = __shfl_up_sync(0xffffffff, warp_exclusive_prefix_sum, offset);
+      if ((threadIdx.x + 1) % (offset * 2) == 0) {
+        warp_exclusive_prefix_sum += tmp;
+      }
+    }
+
+    if (threadIdx.x % 32 == 31) {
+      warp_exclusive_prefix_sum = 0;
+    }
+
+#pragma unroll
+    for (uint32_t offset = 16; offset >= 1; offset /= 2) {
+      T tmp = __shfl_xor_sync(0xffffffff, warp_exclusive_prefix_sum, offset);
+      if ((threadIdx.x + 1) % (offset * 2) == 0) {
+        warp_exclusive_prefix_sum = tmp + warp_exclusive_prefix_sum;
+      }
+      if ((threadIdx.x + 1) % (offset * 2) == offset) {
+        warp_exclusive_prefix_sum = tmp;
+      }
+    }
+    smem_prefix_sum[threadIdx.x] = warp_exclusive_prefix_sum;
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (uint32_t i = 0; i < VEC_SIZE; ++i) {
+    out_data[i] = smem_prefix_sum[threadIdx.x / 32] +
+                  thread_exclusive_prefix_sum + thread_data[i];
+  }
+}
 
 template <uint32_t VEC_SIZE, uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, typename T>
@@ -103,8 +189,10 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
   aggregate_local = temp_storage->data.block_aggregate.value;
 
   if (aggregate + aggregate_local > u) {
-    BlockScan<T, BLOCK_THREADS, SCAN_ALGORITHM>(temp_storage->block_prim.scan)
-        .InclusiveSum<VEC_SIZE>(prob_greater_than_threshold, inclusive_cdf);
+    // BlockScan<T, BLOCK_THREADS, SCAN_ALGORITHM>(temp_storage->block_prim.scan)
+    //     .InclusiveSum<VEC_SIZE>(prob_greater_than_threshold, inclusive_cdf);
+    DeterministicInclusiveSum<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, T>(
+        prob_greater_than_threshold, inclusive_cdf, temp_storage);
     __syncthreads();
 
 #pragma unroll
