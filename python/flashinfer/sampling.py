@@ -32,7 +32,7 @@ except ImportError as e:
 
 
 def sampling_from_probs(
-    probs: torch.Tensor, uniform_samples: torch.Tensor
+    probs: torch.Tensor, uniform_samples: torch.Tensor, deterministic: bool = True
 ) -> torch.Tensor:
     r"""Fused GPU kernel for category sampling from probabilities.
 
@@ -43,6 +43,8 @@ def sampling_from_probs(
     uniform_samples: torch.Tensor
         The uniform samples used as needle for sampling, shape ``(batch_size,)``.
         Expected to be uniformly distributed in ``[0, 1)``.
+    deterministic: bool
+        Whether to use deterministic kernel implementation, default is ``True``.
 
     Returns
     -------
@@ -73,11 +75,14 @@ def sampling_from_probs(
     -----
     This function expects float32 inputs, and the output is int32.
     """
-    return _kernels.sampling_from_probs(probs, uniform_samples)
+    return _kernels.sampling_from_probs(probs, uniform_samples, deterministic)
 
 
 def top_p_sampling_from_probs(
-    probs: torch.Tensor, uniform_samples: torch.Tensor, top_p: float
+    probs: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    top_p: float,
+    deterministic: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Fused GPU kernel for top-p sampling (nucleus sampling) from probabilities,
     this operator implements GPU-based rejection sampling without explicit sorting.
@@ -95,6 +100,8 @@ def top_p_sampling_from_probs(
         Expected to be uniformly distributed in ``[0, 1)``.
     top_p: float
         The threshold for top-p sampling.
+    deterministic: bool
+        Whether to use deterministic kernel implementation, default is ``True``.
 
     Returns
     -------
@@ -134,11 +141,16 @@ def top_p_sampling_from_probs(
     We encourage users to set ``max_top_p_rounds`` to a reasonable value, e.g., 32. The actual
     implementation usually use much fewer rounds for rejection sampling because of early stopping.
     """
-    return _kernels.top_p_sampling_from_probs(probs, uniform_samples, top_p)
+    return _kernels.top_p_sampling_from_probs(
+        probs, uniform_samples, top_p, deterministic
+    )
 
 
 def top_k_sampling_from_probs(
-    probs: torch.Tensor, uniform_samples: torch.Tensor, top_k: int
+    probs: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    top_k: int,
+    deterministic: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Fused GPU kernel for top-k sampling from probabilities,
     this operator implements GPU-based rejection sampling without explicit sorting.
@@ -156,6 +168,8 @@ def top_k_sampling_from_probs(
         Expected to be uniformly distributed in ``[0, 1)``.
     top_k: int
         The k in "top-k".
+    deterministic: bool
+        Whether to use deterministic kernel implementation, default is ``True``.
 
     Returns
     -------
@@ -195,7 +209,9 @@ def top_k_sampling_from_probs(
     We encourage users to set ``max_top_k_rounds`` to a reasonable value, e.g., 32. The actual
     implementation usually use much fewer rounds for rejection sampling because of early stopping.
     """
-    return _kernels.top_k_sampling_from_probs(probs, uniform_samples, top_k)
+    return _kernels.top_k_sampling_from_probs(
+        probs, uniform_samples, top_k, deterministic
+    )
 
 
 def top_k_top_p_sampling_from_probs(
@@ -203,6 +219,7 @@ def top_k_top_p_sampling_from_probs(
     uniform_samples: torch.Tensor,
     top_k: torch.Tensor,
     top_p: torch.Tensor,
+    deterministic: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Fused GPU kernel for joint top-k and top-p sampling from probabilities,
 
@@ -223,6 +240,8 @@ def top_k_top_p_sampling_from_probs(
         The k in "top-k" for each request, shape ``(batch_size,)``.
     top_p: torch.Tensor
         The threshold for top-p sampling for each request, shape ``(batch_size,)``.
+    deterministic: bool
+        Whether to use deterministic kernel implementation, default is ``True``.
 
     Returns
     -------
@@ -264,7 +283,7 @@ def top_k_top_p_sampling_from_probs(
     implementation usually use much fewer rounds for rejection sampling because of early stopping.
     """
     return _kernels.top_k_top_p_sampling_from_probs(
-        probs, uniform_samples, top_k, top_p
+        probs, uniform_samples, top_k, top_p, deterministic
     )
 
 
@@ -328,6 +347,7 @@ def chain_speculative_sampling(
     draft_token_ids,
     uniform_samples,
     target_probs,
+    deterministic: bool = True,
 ) -> torch.Tensor:
     r"""Fused-GPU kernel for speculative sampling for sequence generation (proposed in
     paper `Accelerating Large Language Model Decoding with Speculative Sampling <https://arxiv.org/pdf/2302.01318>`_),
@@ -349,6 +369,8 @@ def chain_speculative_sampling(
         Compared to input :attr:`draft_probs`, the target model's probability has an additional
         slot at the end because the target model will generate one more token than the draft model.
         Shape: ``(batch_size, num_speculate_tokens + 1, vocab_size)``
+    deterministic: bool
+        Whether to use deterministic kernel implementation, default is ``True``.
 
     Returns
     -------
@@ -361,5 +383,5 @@ def chain_speculative_sampling(
         Shape: (batch_size, num_specutate_tokens + 1)
     """
     return _kernels.chain_speculative_sampling(
-        draft_probs, draft_token_ids, uniform_samples, target_probs
+        draft_probs, draft_token_ids, uniform_samples, target_probs, deterministic
     )

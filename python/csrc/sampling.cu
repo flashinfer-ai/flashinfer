@@ -20,7 +20,8 @@
 
 using namespace flashinfer;
 
-torch::Tensor sampling_from_probs(torch::Tensor probs, torch::Tensor uniform_samples) {
+torch::Tensor sampling_from_probs(torch::Tensor probs, torch::Tensor uniform_samples,
+                                  bool deterministic) {
   CHECK_INPUT(probs);
   CHECK_INPUT(uniform_samples);
   auto device = probs.device();
@@ -36,16 +37,18 @@ torch::Tensor sampling_from_probs(torch::Tensor probs, torch::Tensor uniform_sam
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto samples = torch::empty({batch_size}, torch::dtype(torch::kInt32).device(device));
 
-  cudaError_t status = sampling::SamplingFromProb(
-      static_cast<float*>(probs.data_ptr()), static_cast<float*>(uniform_samples.data_ptr()),
-      static_cast<int*>(samples.data_ptr()), batch_size, vocab_size, torch_current_stream);
+  cudaError_t status = sampling::SamplingFromProb(static_cast<float*>(probs.data_ptr()),
+                                                  static_cast<float*>(uniform_samples.data_ptr()),
+                                                  static_cast<int*>(samples.data_ptr()), batch_size,
+                                                  vocab_size, deterministic, torch_current_stream);
   TORCH_CHECK(status == cudaSuccess, "SamplingFromProbs failed with error code " +
                                          std::string(cudaGetErrorString(status)));
   return samples;
 }
 
 std::vector<torch::Tensor> top_p_sampling_from_probs(torch::Tensor probs,
-                                                     torch::Tensor uniform_samples, double top_p) {
+                                                     torch::Tensor uniform_samples, double top_p,
+                                                     bool deterministic) {
   CHECK_INPUT(probs);
   CHECK_INPUT(uniform_samples);
   auto device = probs.device();
@@ -66,7 +69,7 @@ std::vector<torch::Tensor> top_p_sampling_from_probs(torch::Tensor probs,
   cudaError_t status = sampling::TopPSamplingFromProb<float, int>(
       static_cast<float*>(probs.data_ptr()), static_cast<float*>(uniform_samples.data_ptr()),
       static_cast<int*>(samples.data_ptr()), static_cast<bool*>(success.data_ptr()), top_p,
-      batch_size, vocab_size, max_top_p_rounds, torch_current_stream);
+      batch_size, vocab_size, max_top_p_rounds, deterministic, torch_current_stream);
   TORCH_CHECK(status == cudaSuccess, "TopPSamplingFromProbs failed with error code " +
                                          std::string(cudaGetErrorString(status)));
 
@@ -75,7 +78,7 @@ std::vector<torch::Tensor> top_p_sampling_from_probs(torch::Tensor probs,
 
 std::vector<torch::Tensor> top_k_sampling_from_probs(torch::Tensor probs,
                                                      torch::Tensor uniform_samples,
-                                                     unsigned int top_k) {
+                                                     unsigned int top_k, bool deterministic) {
   CHECK_INPUT(probs);
   CHECK_INPUT(uniform_samples);
   auto device = probs.device();
@@ -96,7 +99,7 @@ std::vector<torch::Tensor> top_k_sampling_from_probs(torch::Tensor probs,
   cudaError_t status = sampling::TopKSamplingFromProb<float, int>(
       static_cast<float*>(probs.data_ptr()), static_cast<float*>(uniform_samples.data_ptr()),
       static_cast<int*>(samples.data_ptr()), static_cast<bool*>(success.data_ptr()), top_k,
-      batch_size, vocab_size, max_top_k_rounds, torch_current_stream);
+      batch_size, vocab_size, max_top_k_rounds, deterministic, torch_current_stream);
   TORCH_CHECK(status == cudaSuccess, "TopKSamplingFromProbs failed with error code " +
                                          std::string(cudaGetErrorString(status)));
 
@@ -105,8 +108,8 @@ std::vector<torch::Tensor> top_k_sampling_from_probs(torch::Tensor probs,
 
 std::vector<torch::Tensor> top_k_top_p_sampling_from_probs(torch::Tensor probs,
                                                            torch::Tensor uniform_samples,
-                                                           torch::Tensor top_k,
-                                                           torch::Tensor top_p) {
+                                                           torch::Tensor top_k, torch::Tensor top_p,
+                                                           bool deterministic) {
   CHECK_INPUT(probs);
   CHECK_INPUT(uniform_samples);
   CHECK_INPUT(top_k);
@@ -138,7 +141,7 @@ std::vector<torch::Tensor> top_k_top_p_sampling_from_probs(torch::Tensor probs,
       static_cast<float*>(probs.data_ptr()), static_cast<float*>(uniform_samples.data_ptr()),
       static_cast<int*>(top_k.data_ptr()), static_cast<float*>(top_p.data_ptr()),
       static_cast<int*>(samples.data_ptr()), static_cast<bool*>(success.data_ptr()), batch_size,
-      vocab_size, max_rounds, torch_current_stream);
+      vocab_size, max_rounds, deterministic, torch_current_stream);
   TORCH_CHECK(status == cudaSuccess, "TopKTopPSamplingFromProbs failed with error code " +
                                          std::string(cudaGetErrorString(status)));
 
@@ -187,8 +190,8 @@ torch::Tensor top_k_renorm_prob(torch::Tensor probs, unsigned int top_k, double 
 }
 
 torch::Tensor chain_speculative_sampling(torch::Tensor draft_probs, torch::Tensor draft_token_ids,
-                                         torch::Tensor uniform_samples,
-                                         torch::Tensor target_probs) {
+                                         torch::Tensor uniform_samples, torch::Tensor target_probs,
+                                         bool deterministic) {
   CHECK_INPUT(draft_probs);
   CHECK_INPUT(draft_token_ids);
   CHECK_INPUT(uniform_samples);
@@ -224,7 +227,7 @@ torch::Tensor chain_speculative_sampling(torch::Tensor draft_probs, torch::Tenso
       static_cast<float*>(draft_probs.data_ptr()), static_cast<int*>(draft_token_ids.data_ptr()),
       static_cast<float*>(uniform_samples.data_ptr()), static_cast<float*>(target_probs.data_ptr()),
       static_cast<int*>(output_token_ids.data_ptr()), batch_size, num_speculate_tokens, vocab_size,
-      torch_current_stream);
+      deterministic, torch_current_stream);
 
   TORCH_CHECK(status == cudaSuccess, "ChainSpeculativeSampling failed with error code " +
                                          std::string(cudaGetErrorString(status)));
