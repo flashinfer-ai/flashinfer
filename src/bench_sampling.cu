@@ -26,6 +26,7 @@ template <typename T>
 void bench_sampling_with_probability(nvbench::state& state) {
   size_t batch_size = state.get_int64("batch_size");
   size_t vocab_size = state.get_int64("vocab_size");
+  bool deterministic = state.get_int64("determinisic");
 
   std::vector<T> probs_h(batch_size * vocab_size);
   std::vector<T> uniform_samples_h(batch_size);
@@ -55,7 +56,7 @@ void bench_sampling_with_probability(nvbench::state& state) {
     cudaError_t status = sampling::SamplingFromProb<T>(
         thrust::raw_pointer_cast(probs_d.data()),
         thrust::raw_pointer_cast(uniform_samples_d.data()),
-        thrust::raw_pointer_cast(output_d.data()), batch_size, vocab_size);
+        thrust::raw_pointer_cast(output_d.data()), batch_size, vocab_size, deterministic);
     timer.stop();
     if (status != cudaSuccess) {
       state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
@@ -67,6 +68,7 @@ template <typename T>
 void bench_top_p_sampling_with_probability(nvbench::state& state) {
   size_t batch_size = state.get_int64("batch_size");
   size_t vocab_size = state.get_int64("vocab_size");
+  bool deterministic = state.get_int64("determinisic");
   double p = state.get_float64("p");
   constexpr uint32_t max_top_p_rounds = 32;
 
@@ -100,7 +102,7 @@ void bench_top_p_sampling_with_probability(nvbench::state& state) {
         thrust::raw_pointer_cast(probs_d.data()),
         thrust::raw_pointer_cast(uniform_samples_d.data()),
         thrust::raw_pointer_cast(output_d.data()), thrust::raw_pointer_cast(success_d.data()), p,
-        batch_size, vocab_size, max_top_p_rounds);
+        batch_size, vocab_size, max_top_p_rounds, deterministic);
     timer.stop();
     if (status != cudaSuccess) {
       state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
@@ -113,6 +115,7 @@ void bench_top_k_sampling_with_probability(nvbench::state& state) {
   size_t batch_size = state.get_int64("batch_size");
   size_t vocab_size = state.get_int64("vocab_size");
   size_t k = state.get_int64("k");
+  bool deterministic = state.get_int64("determinisic");
   constexpr uint32_t max_top_k_rounds = 32;
 
   std::vector<T> probs_h(batch_size * vocab_size);
@@ -145,7 +148,7 @@ void bench_top_k_sampling_with_probability(nvbench::state& state) {
         thrust::raw_pointer_cast(probs_d.data()),
         thrust::raw_pointer_cast(uniform_samples_d.data()),
         thrust::raw_pointer_cast(output_d.data()), thrust::raw_pointer_cast(success_d.data()), k,
-        batch_size, vocab_size, max_top_k_rounds);
+        batch_size, vocab_size, max_top_k_rounds, deterministic);
     timer.stop();
     if (status != cudaSuccess) {
       state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
@@ -157,18 +160,21 @@ auto bench_sampling_with_probability_f32 = bench_sampling_with_probability<float
 NVBENCH_BENCH(bench_sampling_with_probability_f32)
     .set_name("bench_sampling_with_probability_f32")
     .add_int64_axis("batch_size", {16, 32, 128, 512, 2048})
-    .add_int64_axis("vocab_size", {32000, 32001, 32002, 128000, 256000});
+    .add_int64_axis("vocab_size", {32000, 32001, 32002, 128000, 256000})
+    .add_int64_axis("determinisic", {0, 1});
 
 auto bench_top_p_sampling_with_probability_f32 = bench_top_p_sampling_with_probability<float>;
 NVBENCH_BENCH(bench_top_p_sampling_with_probability_f32)
     .set_name("bench_top_p_sampling_with_probability_f32")
     .add_int64_axis("batch_size", {16, 32, 128, 512, 2048})
     .add_int64_axis("vocab_size", {32000, 32001, 32002, 128000, 256000})
-    .add_float64_axis("p", {0.1, 0.5, 0.9, 1.0});
+    .add_float64_axis("p", {0.1, 0.5, 0.9, 1.0})
+    .add_int64_axis("determinisic", {0, 1});
 
 auto bench_top_k_sampling_with_probability_f32 = bench_top_k_sampling_with_probability<float>;
 NVBENCH_BENCH(bench_top_k_sampling_with_probability_f32)
     .set_name("bench_top_k_sampling_with_probability_f32")
     .add_int64_axis("batch_size", {16, 32, 128, 512, 2048})
     .add_int64_axis("vocab_size", {32000, 32001, 32002, 128000, 256000})
-    .add_int64_axis("k", {16, 32, 128, 1024});
+    .add_int64_axis("k", {16, 32, 128, 1024})
+    .add_int64_axis("determinisic", {0, 1});

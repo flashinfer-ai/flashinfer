@@ -54,26 +54,29 @@ void merge_state_in_place(torch::Tensor v, torch::Tensor s, torch::Tensor v_othe
 
 std::vector<torch::Tensor> merge_states(torch::Tensor v, torch::Tensor s);
 
-torch::Tensor sampling_from_probs(torch::Tensor probs, torch::Tensor uniform_samples);
+torch::Tensor sampling_from_probs(torch::Tensor probs, torch::Tensor uniform_samples,
+                                  bool deterministic);
 
 std::vector<torch::Tensor> top_p_sampling_from_probs(torch::Tensor probs,
-                                                     torch::Tensor uniform_samples, double top_p);
+                                                     torch::Tensor uniform_samples, double top_p,
+                                                     bool deterministic);
 
 std::vector<torch::Tensor> top_k_sampling_from_probs(torch::Tensor probs,
                                                      torch::Tensor uniform_samples,
-                                                     unsigned int top_k);
+                                                     unsigned int top_k, bool deterministic);
 
 std::vector<torch::Tensor> top_k_top_p_sampling_from_probs(torch::Tensor probs,
                                                            torch::Tensor uniform_samples,
-                                                           torch::Tensor top_k,
-                                                           torch::Tensor top_p);
+                                                           torch::Tensor top_k, torch::Tensor top_p,
+                                                           bool deterministic);
 
 torch::Tensor top_p_renorm_prob(torch::Tensor probs, double top_p, double eps);
 
 torch::Tensor top_k_renorm_prob(torch::Tensor probs, unsigned int top_k, double eps);
 
 torch::Tensor chain_speculative_sampling(torch::Tensor draft_probs, torch::Tensor draft_token_ids,
-                                         torch::Tensor uniform_samples, torch::Tensor target_probs);
+                                         torch::Tensor uniform_samples, torch::Tensor target_probs,
+                                         bool deterministic);
 
 torch::Tensor rmsnorm(torch::Tensor x, torch::Tensor w, double eps);
 

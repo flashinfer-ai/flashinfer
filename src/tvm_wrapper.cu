@@ -732,7 +732,7 @@ void _FlashInferParallelSamplingFromProb(DLTensor* probs, DLTensor* uniform_samp
   cudaError_t status = sampling::ParallelSamplingFromProb<float, int32_t>(
       static_cast<float*>(probs->data), static_cast<float*>(uniform_samples->data),
       static_cast<int32_t*>(sampled_token_ids->data), static_cast<int32_t*>(row_indices->data),
-      batch_size, vocab_size);
+      batch_size, vocab_size, /*deterministic=*/true);
   if (status != cudaSuccess) {
     LOG(FATAL) << "FlashInfer ParallelTopPSamplingFromProb error " << cudaGetErrorString(status);
   }
@@ -781,7 +781,7 @@ void _FlashInferParallelTopPSamplingFromProb(DLTensor* probs, DLTensor* uniform_
       static_cast<float*>(probs->data), static_cast<float*>(uniform_samples->data),
       static_cast<int32_t*>(sampled_token_ids->data), /*success=*/nullptr,
       static_cast<int32_t*>(row_indices->data), static_cast<float*>(top_p->data), batch_size,
-      vocab_size, num_rounds);
+      vocab_size, num_rounds, /*deterministic=*/true);
   if (status != cudaSuccess) {
     LOG(FATAL) << "FlashInfer ParallelTopPSamplingFromProb error " << cudaGetErrorString(status);
   }
