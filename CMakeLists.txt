@@ -91,6 +91,7 @@ set (IDTYPES "i32")
 if(FLASHINFER_ENABLE_FP8)
   list(APPEND DECODE_DTYPES "e4m3" "e5m2")
   list(APPEND DECODE_FP8_DTYPES "e4m3" "e5m2")
+  list(APPEND PREFILL_FP8_DTYPES "e4m3")
 endif(FLASHINFER_ENABLE_FP8)
 
 if(FLASHINFER_ENABLE_BF16)
@@ -204,6 +205,18 @@ foreach(head_dim IN LISTS HEAD_DIMS)
             )
             list(APPEND single_prefill_kernels_src ${generated_kernel_src})
           endforeach(dtype)
+
+          foreach(dtype_kv IN LISTS PREFILL_FP8_DTYPES)
+            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_prefill_head_${head_dim}_logitshook_${logits_post_hook}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypeq_f16_dtypekv_${dtype_kv}_dtypeout_f16.cu)
+            add_custom_command(
+              OUTPUT ${generated_kernel_src}
+              COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_single_prefill_inst.py ${generated_kernel_src}
+              DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_single_prefill_inst.py
+              COMMENT "Generating additional source file ${generated_kernel_src}"
+              VERBATIM
+            )
+            list(APPEND single_prefill_kernels_src ${generated_kernel_src})
+          endforeach(dtype_kv)
         endforeach(mask_mode)
       endforeach(allow_fp16_qk_reduction)
     endforeach(pos_encoding_mode)

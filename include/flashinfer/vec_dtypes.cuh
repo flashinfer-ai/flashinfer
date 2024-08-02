@@ -1050,7 +1050,7 @@ template <typename dst_t, typename src_t, size_t vec_size>
 FLASHINFER_INLINE void vec_cast(dst_t* dst, const src_t* src) {
 #pragma unroll
   for (size_t i = 0; i < vec_size; ++i) {
-    dst[i] = src[i];
+    dst[i] = (dst_t)src[i];
   }
 }
 

@@ -48,13 +48,14 @@ constexpr uint32_t warp_size = 32;
 
 namespace {
 
-template <typename DTypeQKAccum>
+template <PosEncodingMode pos_encoding_mode, typename DTypeKV, typename DTypeQKAccum>
 constexpr bool is_invalid_configuration(uint32_t num_frags_x, uint32_t num_frags_y,
                                         uint32_t num_frags_z, uint32_t num_warps_x,
                                         uint32_t num_warps_z) {
   return ((num_frags_y < 4) || (num_frags_y == 4 && num_frags_z % 2 == 1) ||
           (num_frags_y > 4 && num_frags_y % (2 * num_warps_x) != 0) ||
-          (num_frags_x * (8 * num_frags_y + 2 * sizeof(DTypeQKAccum) * num_frags_z) >= 256));
+          (num_frags_x * (8 * num_frags_y + 2 * sizeof(DTypeQKAccum) * num_frags_z) >= 256) ||
+          (sizeof(DTypeKV) == 1 && pos_encoding_mode == PosEncodingMode::kRoPELlama));
 }
 
 template <uint32_t num_warps_x, uint32_t num_warps_z>
@@ -97,6 +98,7 @@ __device__ __forceinline__ void k_frag_apply_llama_rope(T* x_first_half, T* x_se
                                                         const float* rope_freq,
                                                         const uint32_t kv_offset,
                                                         float scale = 1.f) {
+  static_assert(sizeof(T) == 2);
 #pragma unroll
   for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
     float cos, sin, tmp;
@@ -403,6 +405,7 @@ __device__ __forceinline__ void k_smem_inplace_apply_rotary(const uint32_t kv_id
                                                             smem_t* k_smem,
                                                             uint32_t* k_smem_offset_r,
                                                             float (*rope_freq)[4]) {
+  static_assert(sizeof(DTypeKV) == 2);
   constexpr uint32_t head_dim = num_frags_y * 16;
   constexpr uint32_t channel_size_128b_kv = head_dim / num_elems_per_128b<DTypeKV>();
   uint32_t k_frag_local[2][4];
@@ -498,14 +501,17 @@ __device__ __forceinline__ void compute_qk(smem_t* q_smem, uint32_t* q_smem_offs
     *q_smem_offset_r = q_smem->advance_offset_by_column<2>(*q_smem_offset_r, fy) -
                        num_frags_x * 16 * channel_size_128b_q;
 
+
+    uint32_t b_frag_f8[4];
 #pragma unroll
     for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
       if constexpr (sizeof(DTypeKV) == 1) {
-        uint32_t b_frag_f8[2];
-        k_smem->ldmatrix_m8n8x2(*k_smem_offset_r, b_frag_f8);
-        b_frag_f8[0] = frag_layout_transform_16b_to_8b(b_frag_f8[0]);
-        b_frag_f8[1] = frag_layout_transform_16b_to_8b(b_frag_f8[1]);
-        vec_cast<DTypeQ, DTypeKV, 8>((DTypeQ*)b_frag, (DTypeKV*)b_frag_f8);
+        if (fz % 2 == 0) {
+          k_smem->ldmatrix_m8n8x4(*k_smem_offset_r, b_frag_f8);
+        }
+        b_frag_f8[0 + 2 * (fz % 2)] = frag_layout_transform_16b_to_8b(b_frag_f8[0 + 2 * (fz % 2)]);
+        b_frag_f8[1 + 2 * (fz % 2)] = frag_layout_transform_16b_to_8b(b_frag_f8[1 + 2 * (fz % 2)]);
+        vec_cast<DTypeQ, DTypeKV, 8>((DTypeQ*)b_frag, (DTypeKV*)(b_frag_f8 + 2 * (fz % 2)));
       } else {
         k_smem->ldmatrix_m8n8x4(*k_smem_offset_r, b_frag);
       }
@@ -531,8 +537,15 @@ __device__ __forceinline__ void compute_qk(smem_t* q_smem, uint32_t* q_smem_offs
         }
       }
     }
-    *k_smem_offset_r = k_smem->advance_offset_by_column<sizeof(DTypeKV)>(*k_smem_offset_r, fy) -
-                       num_frags_z * 16 * channel_size_128b_kv;
+    if constexpr (sizeof(DTypeKV) == 1) {
+      if (fy % 2 == 1) {
+        *k_smem_offset_r = k_smem->advance_offset_by_column<2>(*k_smem_offset_r, fy / 2) -
+                          num_frags_z * 16 * channel_size_128b_kv;
+      }
+    } else {
+      *k_smem_offset_r = k_smem->advance_offset_by_column<2>(*k_smem_offset_r, fy) -
+                        num_frags_z * 16 * channel_size_128b_kv;
+    }
   }
   *q_smem_offset_r -= num_frags_y * 2;
   *k_smem_offset_r -= num_frags_y * sizeof(DTypeKV);
@@ -736,15 +749,17 @@ __device__ __forceinline__ void compute_sfm_v(smem_t* v_smem, uint32_t* v_smem_o
 
 #pragma unroll
   for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
+    uint32_t b_frag_f8[4];
 #pragma unroll
     for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
       uint32_t b_frag[4];
       if constexpr (sizeof(DTypeKV) == 1) {
-        uint32_t b_frag_f8[2];
-        v_smem->ldmatrix_m8n8x2_trans(*v_smem_offset_r, b_frag_f8);
-        b_frag_f8[0] = frag_layout_transform_16b_to_8b_trans(b_frag_f8[0]);
-        b_frag_f8[1] = frag_layout_transform_16b_to_8b_trans(b_frag_f8[1]);
-        vec_cast<DTypeQ, DTypeKV, 8>((DTypeQ*)b_frag, (DTypeKV*)b_frag_f8);
+        if (fy % 2 == 0) {
+          v_smem->ldmatrix_m8n8x4_trans(*v_smem_offset_r, b_frag_f8);
+        }
+        b_frag_f8[0 + 2 * (fy % 2)] = frag_layout_transform_16b_to_8b_trans(b_frag_f8[2 * (fy % 2)]);
+        b_frag_f8[1 + 2 * (fy % 2)] = frag_layout_transform_16b_to_8b_trans(b_frag_f8[2 * (fy % 2)]);
+        vec_cast<DTypeQ, DTypeKV, 8>((DTypeQ*)b_frag, (DTypeKV*)(b_frag_f8 + 2 * (fy % 2)));
       } else {
         v_smem->ldmatrix_m8n8x4_trans(*v_smem_offset_r, b_frag);
       }
@@ -758,7 +773,13 @@ __device__ __forceinline__ void compute_sfm_v(smem_t* v_smem, uint32_t* v_smem_o
                                                             (uint32_t*)s_frag[fx][fz], b_frag);
         }
       }
-      *v_smem_offset_r = v_smem->advance_offset_by_column<sizeof(DTypeKV)>(*v_smem_offset_r, fy);
+      if constexpr (sizeof(DTypeKV) == 1) {
+        if (fy % 2 == 1) {
+          *v_smem_offset_r = v_smem->advance_offset_by_column<2>(*v_smem_offset_r, fy / 2);
+        }
+      } else {
+        *v_smem_offset_r = v_smem->advance_offset_by_column<2>(*v_smem_offset_r, fy);
+      }
     }
     *v_smem_offset_r = v_smem->advance_offset_by_row<16, channel_size_128b_kv>(*v_smem_offset_r) -
                        sizeof(DTypeKV) * num_frags_y;
@@ -1865,7 +1886,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(
 
     // control num_frags_z for maximum warp occupancy
     DISPATCH_NUM_FRAGS_Z(min(max_num_frags_z_smem, max_num_frags_z_reg), num_frags_z, {
-      if constexpr (is_invalid_configuration<DTypeQKAccum>(num_frags_x, num_frags_y, num_frags_z,
+      if constexpr (is_invalid_configuration<pos_encoding_mode, DTypeKV, DTypeQKAccum>(num_frags_x, num_frags_y, num_frags_z,
                                                            num_warps_x, num_warps_z)) {
         // Invalid configuration, skip
         std::ostringstream err_msg;
@@ -2024,7 +2045,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
       (2 * num_warps_z);
 
   DISPATCH_NUM_FRAGS_Z(min(max_num_frags_z_smem, max_num_frags_z_reg), num_frags_z, {
-    if constexpr (is_invalid_configuration<DTypeQKAccum>(num_frags_x, num_frags_y, num_frags_z,
+    if constexpr (is_invalid_configuration<pos_encoding_mode, DTypeKV, DTypeQKAccum>(num_frags_x, num_frags_y, num_frags_z,
                                                          num_warps_x, num_warps_z)) {
       // Invalid configuration, skip
       std::ostringstream err_msg;
@@ -2176,7 +2197,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
       (2 * num_warps_z);
 
   DISPATCH_NUM_FRAGS_Z(min(max_num_frags_z_smem, max_num_frags_z_reg), num_frags_z, {
-    if constexpr (is_invalid_configuration<DTypeQKAccum>(num_frags_x, num_frags_y, num_frags_z,
+    if constexpr (is_invalid_configuration<pos_encoding_mode, DTypeKV, DTypeQKAccum>(num_frags_x, num_frags_y, num_frags_z,
                                                          num_warps_x, num_warps_z)) {
       // Invalid configuration, skip
       std::ostringstream err_msg;
