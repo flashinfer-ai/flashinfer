@@ -25,6 +25,7 @@
 
 #include "../cp_async.cuh"
 #include "../fastdiv.cuh"
+#include "../frag_layout_swizzle.cuh"
 #include "../layout.cuh"
 #include "../math.cuh"
 #include "../mma.cuh"
@@ -32,7 +33,6 @@
 #include "../permuted_smem.cuh"
 #include "../pos_enc.cuh"
 #include "../utils.cuh"
-#include "../frag_layout_swizzle.cuh"
 #include "cascade.cuh"
 #include "logits_post_hook.cuh"
 #include "mask.cuh"
@@ -501,7 +501,6 @@ __device__ __forceinline__ void compute_qk(smem_t* q_smem, uint32_t* q_smem_offs
     *q_smem_offset_r = q_smem->advance_offset_by_column<2>(*q_smem_offset_r, fy) -
                        num_frags_x * 16 * channel_size_128b_q;
 
-
     uint32_t b_frag_f8[4];
 #pragma unroll
     for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
@@ -540,11 +539,11 @@ __device__ __forceinline__ void compute_qk(smem_t* q_smem, uint32_t* q_smem_offs
     if constexpr (sizeof(DTypeKV) == 1) {
       if (fy % 2 == 1) {
         *k_smem_offset_r = k_smem->advance_offset_by_column<2>(*k_smem_offset_r, fy / 2) -
-                          num_frags_z * 16 * channel_size_128b_kv;
+                           num_frags_z * 16 * channel_size_128b_kv;
       }
     } else {
       *k_smem_offset_r = k_smem->advance_offset_by_column<2>(*k_smem_offset_r, fy) -
-                        num_frags_z * 16 * channel_size_128b_kv;
+                         num_frags_z * 16 * channel_size_128b_kv;
     }
   }
   *q_smem_offset_r -= num_frags_y * 2;
@@ -757,8 +756,10 @@ __device__ __forceinline__ void compute_sfm_v(smem_t* v_smem, uint32_t* v_smem_o
         if (fy % 2 == 0) {
           v_smem->ldmatrix_m8n8x4_trans(*v_smem_offset_r, b_frag_f8);
         }
-        b_frag_f8[0 + 2 * (fy % 2)] = frag_layout_transform_16b_to_8b_trans(b_frag_f8[2 * (fy % 2)]);
-        b_frag_f8[1 + 2 * (fy % 2)] = frag_layout_transform_16b_to_8b_trans(b_frag_f8[2 * (fy % 2)]);
+        b_frag_f8[0 + 2 * (fy % 2)] =
+            frag_layout_transform_16b_to_8b_trans(b_frag_f8[2 * (fy % 2)]);
+        b_frag_f8[1 + 2 * (fy % 2)] =
+            frag_layout_transform_16b_to_8b_trans(b_frag_f8[2 * (fy % 2)]);
         vec_cast<DTypeQ, DTypeKV, 8>((DTypeQ*)b_frag, (DTypeKV*)(b_frag_f8 + 2 * (fy % 2)));
       } else {
         v_smem->ldmatrix_m8n8x4_trans(*v_smem_offset_r, b_frag);
@@ -1886,8 +1887,8 @@ cudaError_t SinglePrefillWithKVCacheDispatched(
 
     // control num_frags_z for maximum warp occupancy
     DISPATCH_NUM_FRAGS_Z(min(max_num_frags_z_smem, max_num_frags_z_reg), num_frags_z, {
-      if constexpr (is_invalid_configuration<pos_encoding_mode, DTypeKV, DTypeQKAccum>(num_frags_x, num_frags_y, num_frags_z,
-                                                           num_warps_x, num_warps_z)) {
+      if constexpr (is_invalid_configuration<pos_encoding_mode, DTypeKV, DTypeQKAccum>(
+                        num_frags_x, num_frags_y, num_frags_z, num_warps_x, num_warps_z)) {
         // Invalid configuration, skip
         std::ostringstream err_msg;
         err_msg << "FlashInfer Internal Error: Invalid configuration : num_frags_x=" << num_frags_x
@@ -1905,8 +1906,9 @@ cudaError_t SinglePrefillWithKVCacheDispatched(
                                            num_warps_x, num_warps_z, DTypeQ, DTypeKV, DTypeQKAccum,
                                            DTypeOut>;
         // TODO(Zihao): fix the following computation
-        uint32_t smem_size = (num_frags_x * num_warps_x + num_frags_z * num_warps_z * 2) * 16 *
-                             HEAD_DIM * sizeof(DTypeQ);
+        uint32_t smem_size = (num_frags_x * num_warps_x * sizeof(DTypeQ) +
+                              num_frags_z * num_warps_z * 2 * sizeof(DTypeKV)) *
+                             16 * HEAD_DIM;
         FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
             partition_kv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         int num_blocks_per_sm = 0;
@@ -2045,8 +2047,8 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
       (2 * num_warps_z);
 
   DISPATCH_NUM_FRAGS_Z(min(max_num_frags_z_smem, max_num_frags_z_reg), num_frags_z, {
-    if constexpr (is_invalid_configuration<pos_encoding_mode, DTypeKV, DTypeQKAccum>(num_frags_x, num_frags_y, num_frags_z,
-                                                         num_warps_x, num_warps_z)) {
+    if constexpr (is_invalid_configuration<pos_encoding_mode, DTypeKV, DTypeQKAccum>(
+                      num_frags_x, num_frags_y, num_frags_z, num_warps_x, num_warps_z)) {
       // Invalid configuration, skip
       std::ostringstream err_msg;
       err_msg << "FlashInfer Internal Error: Invalid configuration : num_frags_x=" << num_frags_x
@@ -2057,8 +2059,9 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
       throw std::invalid_argument(err_msg.str());
     } else {
       // TODO(Zihao): fix the following computation
-      uint32_t smem_size = (num_frags_x * num_warps_x + num_frags_z * num_warps_z * 2) * 16 *
-                           HEAD_DIM * sizeof(DTypeQ);
+      uint32_t smem_size = (num_frags_x * num_warps_x * sizeof(DTypeQ) +
+                            num_frags_z * num_warps_z * 2 * sizeof(DTypeKV)) *
+                           16 * HEAD_DIM;
       if (tmp_v == nullptr) {
         // do not partition kv
         auto kernel = BatchPrefillWithRaggedKVCacheKernel<
@@ -2197,8 +2200,8 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
       (2 * num_warps_z);
 
   DISPATCH_NUM_FRAGS_Z(min(max_num_frags_z_smem, max_num_frags_z_reg), num_frags_z, {
-    if constexpr (is_invalid_configuration<pos_encoding_mode, DTypeKV, DTypeQKAccum>(num_frags_x, num_frags_y, num_frags_z,
-                                                         num_warps_x, num_warps_z)) {
+    if constexpr (is_invalid_configuration<pos_encoding_mode, DTypeKV, DTypeQKAccum>(
+                      num_frags_x, num_frags_y, num_frags_z, num_warps_x, num_warps_z)) {
       // Invalid configuration, skip
       std::ostringstream err_msg;
       err_msg << "FlashInfer Internal Error: Invalid configuration : num_frags_x=" << num_frags_x
@@ -2209,8 +2212,9 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
       throw std::invalid_argument(err_msg.str());
     } else {
       // TODO(Zihao): fix the following computation
-      uint32_t smem_size = (num_frags_x * num_warps_x + num_frags_z * num_warps_z * 2) * 16 *
-                           HEAD_DIM * sizeof(DTypeQ);
+      uint32_t smem_size = (num_frags_x * num_warps_x * sizeof(DTypeQ) +
+                            num_frags_z * num_warps_z * 2 * sizeof(DTypeKV)) *
+                           16 * HEAD_DIM;
 
       if (tmp_v == nullptr) {
         // do not partition kv

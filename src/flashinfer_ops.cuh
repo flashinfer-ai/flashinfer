@@ -73,8 +73,8 @@ cudaError_t SinglePrefillWithKVCacheCustomMask(
  * \param stream The cuda stream to execute the kernel on.
  * \return status Indicates whether CUDA calls are successful
  */
-template <typename DTypeIn, typename DTypeOut>
-cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o, DTypeOut* tmp,
+template <typename DTypeQ, typename DTypeKV, typename DTypeOut>
+cudaError_t SinglePrefillWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut* o, DTypeOut* tmp,
                                      float* lse, uint32_t num_qo_heads, uint32_t num_kv_heads,
                                      uint32_t qo_len, uint32_t kv_len, uint32_t head_dim,
                                      bool causal = true, QKVLayout kv_layout = QKVLayout::kNHD,

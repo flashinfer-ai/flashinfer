@@ -43,7 +43,7 @@ void _TestSinglePrefillKernelCorrectness(size_t qo_len, size_t kv_len, size_t nu
   thrust::device_vector<DTypeOut> o_d(o);
   thrust::device_vector<DTypeOut> tmp_d(16 * 1024 * 1024);
 
-  cudaError_t status = flashinfer::SinglePrefillWithKVCache<DTypeIn, DTypeOut>(
+  cudaError_t status = flashinfer::SinglePrefillWithKVCache<DTypeIn, DTypeIn, DTypeOut>(
       thrust::raw_pointer_cast(q_d.data()), thrust::raw_pointer_cast(k_d.data()),
       thrust::raw_pointer_cast(v_d.data()), thrust::raw_pointer_cast(o_d.data()),
       thrust::raw_pointer_cast(tmp_d.data()),
