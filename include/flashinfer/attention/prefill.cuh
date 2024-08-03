@@ -501,16 +501,18 @@ __device__ __forceinline__ void compute_qk(smem_t* q_smem, uint32_t* q_smem_offs
     *q_smem_offset_r = q_smem->advance_offset_by_column<2>(*q_smem_offset_r, fy) -
                        num_frags_x * 16 * channel_size_128b_q;
 
-    uint32_t b_frag_f8[4];
 #pragma unroll
     for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
       if constexpr (sizeof(DTypeKV) == 1) {
+        uint32_t b_frag_f8[2];
         if (fz % 2 == 0) {
-          k_smem->ldmatrix_m8n8x4(*k_smem_offset_r, b_frag_f8);
+          k_smem->ldmatrix_m8n8x4_left_half(*k_smem_offset_r, b_frag_f8);
+        } else {
+          k_smem->ldmatrix_m8n8x4_right_half(*k_smem_offset_r, b_frag_f8);
         }
-        b_frag_f8[0 + 2 * (fz % 2)] = frag_layout_transform_16b_to_8b(b_frag_f8[0 + 2 * (fz % 2)]);
-        b_frag_f8[1 + 2 * (fz % 2)] = frag_layout_transform_16b_to_8b(b_frag_f8[1 + 2 * (fz % 2)]);
-        vec_cast<DTypeQ, DTypeKV, 8>((DTypeQ*)b_frag, (DTypeKV*)(b_frag_f8 + 2 * (fz % 2)));
+        b_frag_f8[0] = frag_layout_transform_16b_to_8b(b_frag_f8[0]);
+        b_frag_f8[1] = frag_layout_transform_16b_to_8b(b_frag_f8[1]);
+        vec_cast<DTypeQ, DTypeKV, 8>((DTypeQ*)b_frag, (DTypeKV*)b_frag_f8);
       } else {
         k_smem->ldmatrix_m8n8x4(*k_smem_offset_r, b_frag);
       }
@@ -538,9 +540,9 @@ __device__ __forceinline__ void compute_qk(smem_t* q_smem, uint32_t* q_smem_offs
     }
     if constexpr (sizeof(DTypeKV) == 1) {
       if (fy % 2 == 1) {
-        *k_smem_offset_r = k_smem->advance_offset_by_column<2>(*k_smem_offset_r, fy / 2) -
-                           num_frags_z * 16 * channel_size_128b_kv;
+        *k_smem_offset_r = k_smem->advance_offset_by_column<2>(*k_smem_offset_r, fy / 2);
       }
+      *k_smem_offset_r -= num_frags_z * 16 * channel_size_128b_kv;
     } else {
       *k_smem_offset_r = k_smem->advance_offset_by_column<2>(*k_smem_offset_r, fy) -
                          num_frags_z * 16 * channel_size_128b_kv;
@@ -748,19 +750,19 @@ __device__ __forceinline__ void compute_sfm_v(smem_t* v_smem, uint32_t* v_smem_o
 
 #pragma unroll
   for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
-    uint32_t b_frag_f8[4];
 #pragma unroll
     for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
       uint32_t b_frag[4];
       if constexpr (sizeof(DTypeKV) == 1) {
-        if (fy % 2 == 0) {
-          v_smem->ldmatrix_m8n8x4_trans(*v_smem_offset_r, b_frag_f8);
+        uint32_t b_frag_f8[2];
+        if (fz % 2 == 0) {
+          v_smem->ldmatrix_m8n8x4_trans_left_half(*v_smem_offset_r, b_frag_f8);
+        } else {
+          v_smem->ldmatrix_m8n8x4_trans_right_half(*v_smem_offset_r, b_frag_f8);
         }
-        b_frag_f8[0 + 2 * (fy % 2)] =
-            frag_layout_transform_16b_to_8b_trans(b_frag_f8[0 + 2 * (fy % 2)]);
-        b_frag_f8[1 + 2 * (fy % 2)] =
-            frag_layout_transform_16b_to_8b_trans(b_frag_f8[1 + 2 * (fy % 2)]);
-        vec_cast<DTypeQ, DTypeKV, 8>((DTypeQ*)b_frag, (DTypeKV*)(b_frag_f8 + 2 * (fy % 2)));
+        b_frag_f8[0] = frag_layout_transform_16b_to_8b_trans(b_frag_f8[0]);
+        b_frag_f8[1] = frag_layout_transform_16b_to_8b_trans(b_frag_f8[1]);
+        vec_cast<DTypeQ, DTypeKV, 8>((DTypeQ*)b_frag, (DTypeKV*)b_frag_f8);
       } else {
         v_smem->ldmatrix_m8n8x4_trans(*v_smem_offset_r, b_frag);
       }
@@ -1097,7 +1099,9 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
   }
 
   smem_t k_smem(smem + (num_warps_x * num_frags_x) * 16 * head_dim * sizeof(DTypeQ)),
-      v_smem(smem + (num_warps_x * num_frags_x * sizeof(DTypeQ) + num_warps_z * num_frags_z * sizeof(DTypeKV)) * 16 * head_dim);
+      v_smem(smem + (num_warps_x * num_frags_x * sizeof(DTypeQ) +
+                     num_warps_z * num_frags_z * sizeof(DTypeKV)) *
+                        16 * head_dim);
 
   const uint32_t num_iterations = ceil_div(
       mask_mode == MaskMode::kCausal
@@ -1386,8 +1390,9 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
       (16 * num_warps_z * num_frags_z);
 
   smem_t k_smem(smem + (num_warps_x * num_frags_x) * 16 * head_dim * sizeof(DTypeQ)),
-      v_smem(smem + (num_warps_x * num_frags_x * sizeof(DTypeQ) + num_warps_z * num_frags_z *
-                        sizeof(DTypeKV)) * 16 * head_dim);
+      v_smem(smem + (num_warps_x * num_frags_x * sizeof(DTypeQ) +
+                     num_warps_z * num_frags_z * sizeof(DTypeKV)) *
+                        16 * head_dim);
 
   uint32_t k_smem_offset_r = smem_t::get_permuted_offset<channel_size_128b_kv>(
                get_warp_idx_z<num_warps_x, num_warps_z>() * num_frags_z * 16 + 8 * (lane_idx / 16) +
@@ -1643,7 +1648,9 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
   }
 
   smem_t k_smem(smem + (num_warps_x * num_frags_x) * 16 * head_dim * sizeof(DTypeQ)),
-      v_smem(smem + (num_warps_x * num_frags_x * sizeof(DTypeQ) + num_warps_z * num_frags_z * sizeof(DTypeKV)) * 16 * head_dim);
+      v_smem(smem + (num_warps_x * num_frags_x * sizeof(DTypeQ) +
+                     num_warps_z * num_frags_z * sizeof(DTypeKV)) *
+                        16 * head_dim);
   size_t kv_offset[num_frags_z * 4 / num_warps_x];
 
   uint32_t k_smem_offset_r = smem_t::get_permuted_offset<channel_size_128b_kv>(

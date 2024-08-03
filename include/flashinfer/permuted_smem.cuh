@@ -90,14 +90,19 @@ struct smem_t {
     mma::ldmatrix_m8n8x4(R, smem_ptr);
   }
 
+  __device__ __forceinline__ void ldmatrix_m8n8x4_left_half(uint32_t offset, uint32_t* R) {
+    b128_t* smem_ptr = base + offset;
+    mma::ldmatrix_m8n8x4_left_half(R, smem_ptr);
+  }
+
+  __device__ __forceinline__ void ldmatrix_m8n8x4_right_half(uint32_t offset, uint32_t* R) {
+    b128_t* smem_ptr = base + offset;
+    mma::ldmatrix_m8n8x4_right_half(R, smem_ptr);
+  }
+
   __device__ __forceinline__ void stmatrix_m8n8x4(uint32_t offset, uint32_t* R) {
     b128_t* smem_ptr = base + offset;
     mma::stmatrix_m8n8x4(R, smem_ptr);
-  }
-
-  __device__ __forceinline__ void ldmatrix_m8n8x2(uint32_t offset, uint32_t* R) {
-    b128_t* smem_ptr = base + offset;
-    mma::ldmatrix_m8n8x2(R, smem_ptr);
   }
 
   __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t offset, uint32_t* R) {
@@ -105,9 +110,14 @@ struct smem_t {
     mma::ldmatrix_m8n8x4_trans(R, smem_ptr);
   }
 
-  __device__ __forceinline__ void ldmatrix_m8n8x2_trans(uint32_t offset, uint32_t* R) {
+  __device__ __forceinline__ void ldmatrix_m8n8x4_trans_left_half(uint32_t offset, uint32_t* R) {
     b128_t* smem_ptr = base + offset;
-    mma::ldmatrix_m8n8x2_trans(R, smem_ptr);
+    mma::ldmatrix_m8n8x4_trans_left_half(R, smem_ptr);
+  }
+
+  __device__ __forceinline__ void ldmatrix_m8n8x4_trans_right_half(uint32_t offset, uint32_t* R) {
+    b128_t* smem_ptr = base + offset;
+    mma::ldmatrix_m8n8x4_trans_right_half(R, smem_ptr);
   }
 
   template <cp_async::SharedMemFillMode fill_mode, typename T>
