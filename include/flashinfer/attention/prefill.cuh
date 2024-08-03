@@ -1096,9 +1096,8 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
     }
   }
 
-  smem_t k_smem(smem + (num_warps_x * num_frags_x) * 16 * head_dim * sizeof(DTypeKV)),
-      v_smem(smem + (num_warps_x * num_frags_x + num_warps_z * num_frags_z) * 16 * head_dim *
-                        sizeof(DTypeKV));
+  smem_t k_smem(smem + (num_warps_x * num_frags_x) * 16 * head_dim * sizeof(DTypeQ)),
+      v_smem(smem + (num_warps_x * num_frags_x * sizeof(DTypeQ) + num_warps_z * num_frags_z * sizeof(DTypeKV)) * 16 * head_dim);
 
   const uint32_t num_iterations = ceil_div(
       mask_mode == MaskMode::kCausal
@@ -1386,9 +1385,9 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
            : chunk_end - chunk_start) /
       (16 * num_warps_z * num_frags_z);
 
-  smem_t k_smem(smem + (num_warps_x * num_frags_x) * 16 * head_dim * sizeof(DTypeKV)),
-      v_smem(smem + (num_warps_x * num_frags_x + num_warps_z * num_frags_z) * 16 * head_dim *
-                        sizeof(DTypeKV));
+  smem_t k_smem(smem + (num_warps_x * num_frags_x) * 16 * head_dim * sizeof(DTypeQ)),
+      v_smem(smem + (num_warps_x * num_frags_x * sizeof(DTypeQ) + num_warps_z * num_frags_z *
+                        sizeof(DTypeKV)) * 16 * head_dim);
 
   uint32_t k_smem_offset_r = smem_t::get_permuted_offset<channel_size_128b_kv>(
                get_warp_idx_z<num_warps_x, num_warps_z>() * num_frags_z * 16 + 8 * (lane_idx / 16) +
@@ -1643,9 +1642,8 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
     }
   }
 
-  smem_t k_smem(smem + (num_warps_x * num_frags_x) * 16 * head_dim * sizeof(DTypeKV)),
-      v_smem(smem + (num_warps_x * num_frags_x + num_warps_z * num_frags_z) * 16 * head_dim *
-                        sizeof(DTypeKV));
+  smem_t k_smem(smem + (num_warps_x * num_frags_x) * 16 * head_dim * sizeof(DTypeQ)),
+      v_smem(smem + (num_warps_x * num_frags_x * sizeof(DTypeQ) + num_warps_z * num_frags_z * sizeof(DTypeKV)) * 16 * head_dim);
   size_t kv_offset[num_frags_z * 4 / num_warps_x];
 
   uint32_t k_smem_offset_r = smem_t::get_permuted_offset<channel_size_128b_kv>(
