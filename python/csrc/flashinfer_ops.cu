@@ -42,6 +42,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("chain_speculative_sampling", &chain_speculative_sampling,
         "Speculative sampling from sequence of probabilities");
   m.def("rmsnorm", &rmsnorm, "Root mean square normalization");
+  m.def("fused_add_rmsnorm", &fused_add_rmsnorm, "Fused add root mean square normalization");
   m.def("apply_rope_inplace", &apply_rope_inplace, "Apply RoPE in-place");
   m.def("apply_llama31_rope_inplace", &apply_llama31_rope_inplace,
         "Apply Llama 3.1 style RoPE in-place");
