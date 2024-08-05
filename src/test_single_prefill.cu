@@ -135,7 +135,7 @@ void TestSinglePrefillFP8KernelShortContextCorrectness(bool allow_fp16_qk_reduct
   for (size_t qkv_len : {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37}) {
     for (size_t num_qo_heads : {32}) {
       for (size_t num_kv_heads : {4, 8, 32}) {
-        for (size_t head_dim : {128}) {
+        for (size_t head_dim : {128, 256}) {
           for (bool causal : {false, true}) {
             for (size_t pos_encoding_mode : {0}) {
               for (size_t kv_layout : {0, 1}) {
@@ -213,7 +213,7 @@ TEST(FlashInferCorrectnessTest, SinglePrefillKernelCorrectnessTestBF16) {
 TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelShortContextCorrectnessE4M3) {
   TestSinglePrefillFP8KernelShortContextCorrectness<__nv_fp8_e4m3>(false);
 }
-TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelShortContextCorrectnessE4M3) {
+TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelShortContextCorrectnessE5M2) {
   TestSinglePrefillFP8KernelShortContextCorrectness<__nv_fp8_e5m2>(false);
 }
 #endif
