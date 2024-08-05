@@ -17,6 +17,7 @@
 #define FLASHINFER_FRAG_LAYOUT_SWIZZLE_CUH_
 
 #include <cuda_runtime.h>
+#include <cstdint>
 
 __device__ __forceinline__ uint32_t frag_layout_transform_16b_to_8b(uint32_t x) {
   uint32_t tmp = __shfl_xor_sync(0xffffffff, x, 0x1);
@@ -35,6 +36,16 @@ __device__ __forceinline__ uint32_t frag_layout_transform_16b_to_8b_trans(uint32
   tmp = __shfl_xor_sync(0xffffffff, x, 0x10);
   x = __byte_perm(x, tmp, ((threadIdx.x & 0x10) == 0) ? 0x3276 : 0x5410);
   return x;
+}
+
+__device__ __forceinline__ void bfly_exch(uint32_t& a, uint32_t& b) {
+  uint32_t tmp = __byte_perm(a, b, 0x5410);
+  uint32_t tmp2 = __byte_perm(a, b, 0x7632);
+  if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+    printf("%x %x %x %x\n", a, b, tmp, tmp2);
+  }
+  a = tmp;
+  b = tmp2;
 }
 
 #endif  // FLASHINFER_FRAG_LAYOUT_SWIZZLE_CUH_

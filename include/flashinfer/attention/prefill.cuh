@@ -755,13 +755,14 @@ __device__ __forceinline__ void compute_sfm_v(smem_t* v_smem, uint32_t* v_smem_o
       uint32_t b_frag[4];
       if constexpr (sizeof(DTypeKV) == 1) {
         uint32_t b_frag_f8[2];
-        if (fz % 2 == 0) {
+        if (fy % 2 == 0) {
           v_smem->ldmatrix_m8n8x4_trans_left_half(*v_smem_offset_r, b_frag_f8);
         } else {
           v_smem->ldmatrix_m8n8x4_trans_right_half(*v_smem_offset_r, b_frag_f8);
         }
         b_frag_f8[0] = frag_layout_transform_16b_to_8b_trans(b_frag_f8[0]);
         b_frag_f8[1] = frag_layout_transform_16b_to_8b_trans(b_frag_f8[1]);
+        bfly_exch(b_frag_f8[0], b_frag_f8[1]);
         vec_cast<DTypeQ, DTypeKV, 8>((DTypeQ*)b_frag, (DTypeKV*)b_frag_f8);
       } else {
         v_smem->ldmatrix_m8n8x4_trans(*v_smem_offset_r, b_frag);
@@ -1098,7 +1099,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
     }
   }
 
-  smem_t k_smem(smem + (num_warps_x * num_frags_x) * 16 * head_dim * sizeof(DTypeQ)),
+  smem_t k_smem(smem + (num_warps_x * num_frags_x * sizeof(DTypeQ)) * 16 * head_dim),
       v_smem(smem + (num_warps_x * num_frags_x * sizeof(DTypeQ) +
                      num_warps_z * num_frags_z * sizeof(DTypeKV)) *
                         16 * head_dim);
@@ -1389,7 +1390,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
            : chunk_end - chunk_start) /
       (16 * num_warps_z * num_frags_z);
 
-  smem_t k_smem(smem + (num_warps_x * num_frags_x) * 16 * head_dim * sizeof(DTypeQ)),
+  smem_t k_smem(smem + (num_warps_x * num_frags_x * sizeof(DTypeQ)) * 16 * head_dim),
       v_smem(smem + (num_warps_x * num_frags_x * sizeof(DTypeQ) +
                      num_warps_z * num_frags_z * sizeof(DTypeKV)) *
                         16 * head_dim);
@@ -1647,7 +1648,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
     }
   }
 
-  smem_t k_smem(smem + (num_warps_x * num_frags_x) * 16 * head_dim * sizeof(DTypeQ)),
+  smem_t k_smem(smem + (num_warps_x * num_frags_x * sizeof(DTypeQ)) * 16 * head_dim),
       v_smem(smem + (num_warps_x * num_frags_x * sizeof(DTypeQ) +
                      num_warps_z * num_frags_z * sizeof(DTypeKV)) *
                         16 * head_dim);
