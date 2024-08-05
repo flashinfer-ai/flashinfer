@@ -505,13 +505,13 @@ __device__ __forceinline__ void compute_qk(smem_t* q_smem, uint32_t* q_smem_offs
     for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
       if constexpr (sizeof(DTypeKV) == 1) {
         uint32_t b_frag_f8[2];
-        if (fz % 2 == 0) {
+        if (fy % 2 == 0) {
           k_smem->ldmatrix_m8n8x4_left_half(*k_smem_offset_r, b_frag_f8);
         } else {
           k_smem->ldmatrix_m8n8x4_right_half(*k_smem_offset_r, b_frag_f8);
         }
-        b_frag_f8[0] = frag_layout_transform_16b_to_8b(b_frag_f8[0]);
-        b_frag_f8[1] = frag_layout_transform_16b_to_8b(b_frag_f8[1]);
+        b_frag_f8[0] = frag_layout_swizzle_16b_to_8b(b_frag_f8[0]);
+        b_frag_f8[1] = frag_layout_swizzle_16b_to_8b(b_frag_f8[1]);
         vec_cast<DTypeQ, DTypeKV, 8>((DTypeQ*)b_frag, (DTypeKV*)b_frag_f8);
       } else {
         k_smem->ldmatrix_m8n8x4(*k_smem_offset_r, b_frag);
@@ -760,8 +760,8 @@ __device__ __forceinline__ void compute_sfm_v(smem_t* v_smem, uint32_t* v_smem_o
         } else {
           v_smem->ldmatrix_m8n8x4_trans_right_half(*v_smem_offset_r, b_frag_f8);
         }
-        b_frag_f8[0] = frag_layout_transform_16b_to_8b_trans(b_frag_f8[0]);
-        b_frag_f8[1] = frag_layout_transform_16b_to_8b_trans(b_frag_f8[1]);
+        b_frag_f8[0] = frag_layout_swizzle_16b_to_8b_trans(b_frag_f8[0]);
+        b_frag_f8[1] = frag_layout_swizzle_16b_to_8b_trans(b_frag_f8[1]);
         bfly_exch(b_frag_f8[0], b_frag_f8[1]);
         vec_cast<DTypeQ, DTypeKV, 8>((DTypeQ*)b_frag, (DTypeKV*)b_frag_f8);
       } else {

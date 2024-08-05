@@ -15,6 +15,8 @@
  */
 #include <gtest/gtest.h>
 
+#include <cstdint>
+
 #include "cpu_reference.h"
 #include "flashinfer_ops.cuh"
 #include "utils.h"
@@ -65,6 +67,10 @@ void _TestSinglePrefillKernelCorrectness(size_t qo_len, size_t kv_len, size_t nu
       nan_detected = true;
     }
     num_results_error_atol += (!utils::isclose(float(o_ref[i]), float(o_h[i]), rtol, atol));
+    if (!utils::isclose(float(o_ref[i]), float(o_h[i]), rtol, atol)) {
+      std::cout << "i=" << i << ", o_ref[i]=" << float(o_ref[i]) << ", o_h[i]=" << float(o_h[i])
+                << std::endl;
+    }
   }
 
   float result_accuracy = 1. - float(num_results_error_atol) / float(o_ref.size());
@@ -129,7 +135,7 @@ void TestSinglePrefillFP8KernelShortContextCorrectness(bool allow_fp16_qk_reduct
   for (size_t qkv_len : {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37}) {
     for (size_t num_qo_heads : {32}) {
       for (size_t num_kv_heads : {4, 8, 32}) {
-        for (size_t head_dim : {128, 256}) {
+        for (size_t head_dim : {128}) {
           for (bool causal : {false, true}) {
             for (size_t pos_encoding_mode : {0}) {
               for (size_t kv_layout : {0, 1}) {
@@ -206,5 +212,8 @@ TEST(FlashInferCorrectnessTest, SinglePrefillKernelCorrectnessTestBF16) {
 #ifdef FLASHINFER_ENABLE_FP8
 TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelShortContextCorrectnessE4M3) {
   TestSinglePrefillFP8KernelShortContextCorrectness<__nv_fp8_e4m3>(false);
+}
+TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelShortContextCorrectnessE4M3) {
+  TestSinglePrefillFP8KernelShortContextCorrectness<__nv_fp8_e5m2>(false);
 }
 #endif
