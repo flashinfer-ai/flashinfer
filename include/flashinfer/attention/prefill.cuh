@@ -521,7 +521,7 @@ template <LogitsPostHook logits_post_hook, uint32_t num_frags_x, uint32_t num_fr
           typename DTypeQ, typename DTypeKV, typename DTypeQKAccum>
 __device__ __forceinline__ void compute_qk(
     smem_t<swizzle_mode_q>* q_smem, uint32_t* q_smem_offset_r, smem_t<swizzle_mode_kv>* k_smem,
-    uint32_t* k_smem_offset_r, DTypeQKAccum (*s_frag)[num_frags_z][8], const float soft_cap) {
+    uint32_t* k_smem_offset_r, DTypeQKAccum (*s_frag)[num_frags_z][8], const float soft_cap, const float sm_scale) {
   constexpr uint32_t head_dim = num_frags_y * 16;
   constexpr uint32_t channel_size_128b_q = head_dim / num_elems_per_128b<DTypeQ>();
   constexpr uint32_t channel_size_128b_kv = head_dim / num_elems_per_128b<DTypeKV>();
@@ -598,7 +598,7 @@ __device__ __forceinline__ void compute_qk(
 #pragma unroll
         for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
           s_frag[fx][fz][reg_id] =
-              apply_logits_post_hook<logits_post_hook>(s_frag[fx][fz][reg_id], soft_cap);
+              apply_logits_post_hook<logits_post_hook>(s_frag[fx][fz][reg_id] * sm_scale, soft_cap);
         }
       }
     }
@@ -1115,19 +1115,19 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
   load_q_global_smem<num_warps_x, num_warps_z, num_frags_x, num_frags_y>(
       qo_packed_idx_base, qo_len, q_ptr_base, q_stride_n, q_stride_h, group_size, &qo_smem);
 
-  cp_async::commit_group();
-  cp_async::wait_group<0>();
-  block.sync();
+  // cp_async::commit_group();
+  // cp_async::wait_group<0>();
+  // block.sync();
 
-  if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
-    q_smem_inplace_apply_rotary_multiply_sm_scale<num_warps_x, num_warps_z, num_frags_x,
-                                                  num_frags_y, swizzle_mode_q, DTypeQ>(
-        qo_packed_idx_base, qo_len, kv_len, group_size, &qo_smem, &q_smem_offset_r, rope_freq,
-        sm_scale);
-  } else {
-    q_smem_inplace_multiply_sm_scale<num_warps_x, num_warps_z, num_frags_x, num_frags_y,
-                                     swizzle_mode_q, DTypeQ>(&qo_smem, sm_scale);
-  }
+  // if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
+  //   q_smem_inplace_apply_rotary_multiply_sm_scale<num_warps_x, num_warps_z, num_frags_x,
+  //                                                 num_frags_y, swizzle_mode_q, DTypeQ>(
+  //       qo_packed_idx_base, qo_len, kv_len, group_size, &qo_smem, &q_smem_offset_r, rope_freq,
+  //       sm_scale);
+  // } else {
+  //   q_smem_inplace_multiply_sm_scale<num_warps_x, num_warps_z, num_frags_x, num_frags_y,
+  //                                    swizzle_mode_q, DTypeQ>(&qo_smem, sm_scale);
+  // }
 
   if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
 #pragma unroll
@@ -1211,7 +1211,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
     // compute attention score
     compute_qk<logits_post_hook, num_frags_x, num_frags_y, num_frags_z, swizzle_mode_q,
                swizzle_mode_kv, DTypeQ, DTypeKV>(&qo_smem, &q_smem_offset_r, &k_smem,
-                                                 &k_smem_offset_r, s_frag, logits_soft_cap);
+                                                 &k_smem_offset_r, s_frag, logits_soft_cap, sm_scale);
 
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
       apply_alibi_bias<num_frags_x, num_frags_z>(
@@ -1385,26 +1385,26 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
   load_q_global_smem<num_warps_x, num_warps_z, num_frags_x, num_frags_y>(
       qo_packed_idx_base, qo_upper_bound, q_ptr_base, q_stride_n, q_stride_h, group_size, &qo_smem);
 
-  cp_async::commit_group();
-  cp_async::wait_group<0>();
-  block.sync();
+  // cp_async::commit_group();
+  // cp_async::wait_group<0>();
+  // block.sync();
 
-  if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
-    if (!q_offset) {
-      q_smem_inplace_apply_rotary_multiply_sm_scale<num_warps_x, num_warps_z, num_frags_x,
-                                                    num_frags_y, swizzle_mode_q, DTypeQ>(
-          qo_packed_idx_base, qo_len, kv_len, group_size, &qo_smem, &q_smem_offset_r, rope_freq,
-          sm_scale);
-    } else {
-      q_smem_inplace_apply_rotary_with_pos_multiply_sm_scale<num_warps_x, num_warps_z, num_frags_x,
-                                                             num_frags_y, swizzle_mode_q, DTypeQ>(
-          qo_packed_idx_base, q_offset + q_indptr[request_idx], &qo_smem, group_size,
-          &q_smem_offset_r, rope_freq, sm_scale);
-    }
-  } else {
-    q_smem_inplace_multiply_sm_scale<num_warps_x, num_warps_z, num_frags_x, num_frags_y,
-                                     swizzle_mode_q, DTypeQ>(&qo_smem, sm_scale);
-  }
+  // if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
+  //   if (!q_offset) {
+  //     q_smem_inplace_apply_rotary_multiply_sm_scale<num_warps_x, num_warps_z, num_frags_x,
+  //                                                   num_frags_y, swizzle_mode_q, DTypeQ>(
+  //         qo_packed_idx_base, qo_len, kv_len, group_size, &qo_smem, &q_smem_offset_r, rope_freq,
+  //         sm_scale);
+  //   } else {
+  //     q_smem_inplace_apply_rotary_with_pos_multiply_sm_scale<num_warps_x, num_warps_z, num_frags_x,
+  //                                                            num_frags_y, swizzle_mode_q, DTypeQ>(
+  //         qo_packed_idx_base, q_offset + q_indptr[request_idx], &qo_smem, group_size,
+  //         &q_smem_offset_r, rope_freq, sm_scale);
+  //   }
+  // } else {
+  //   q_smem_inplace_multiply_sm_scale<num_warps_x, num_warps_z, num_frags_x, num_frags_y,
+  //                                    swizzle_mode_q, DTypeQ>(&qo_smem, sm_scale);
+  // }
 
   if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
 #pragma unroll
@@ -1494,7 +1494,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
     // compute attention score
     compute_qk<logits_post_hook, num_frags_x, num_frags_y, num_frags_z, swizzle_mode_q,
                swizzle_mode_kv, DTypeQ, DTypeKV>(&qo_smem, &q_smem_offset_r, &k_smem,
-                                                 &k_smem_offset_r, s_frag, logits_soft_cap);
+                                                 &k_smem_offset_r, s_frag, logits_soft_cap, sm_scale);
 
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
       // TODO(Zihao): handle the case that q_offset is specified
@@ -1675,26 +1675,26 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
   load_q_global_smem<num_warps_x, num_warps_z, num_frags_x, num_frags_y>(
       qo_packed_idx_base, qo_upper_bound, q_ptr_base, q_stride_n, q_stride_h, group_size, &qo_smem);
 
-  cp_async::commit_group();
-  cp_async::wait_group<0>();
-  block.sync();
+  // cp_async::commit_group();
+  // cp_async::wait_group<0>();
+  // block.sync();
 
-  if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
-    if (q_offset == nullptr) {
-      q_smem_inplace_apply_rotary_multiply_sm_scale<num_warps_x, num_warps_z, num_frags_x,
-                                                    num_frags_y, swizzle_mode_q, DTypeQ>(
-          qo_packed_idx_base, qo_len, kv_len, group_size, &qo_smem, &q_smem_offset_r, rope_freq,
-          sm_scale);
-    } else {
-      q_smem_inplace_apply_rotary_with_pos_multiply_sm_scale<num_warps_x, num_warps_z, num_frags_x,
-                                                             num_frags_y, swizzle_mode_q, DTypeQ>(
-          qo_packed_idx_base, q_offset + q_indptr[request_idx], &qo_smem, group_size,
-          &q_smem_offset_r, rope_freq, sm_scale);
-    }
-  } else {
-    q_smem_inplace_multiply_sm_scale<num_warps_x, num_warps_z, num_frags_x, num_frags_y,
-                                     swizzle_mode_q, DTypeQ>(&qo_smem, sm_scale);
-  }
+  // if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
+  //   if (q_offset == nullptr) {
+  //     q_smem_inplace_apply_rotary_multiply_sm_scale<num_warps_x, num_warps_z, num_frags_x,
+  //                                                   num_frags_y, swizzle_mode_q, DTypeQ>(
+  //         qo_packed_idx_base, qo_len, kv_len, group_size, &qo_smem, &q_smem_offset_r, rope_freq,
+  //         sm_scale);
+  //   } else {
+  //     q_smem_inplace_apply_rotary_with_pos_multiply_sm_scale<num_warps_x, num_warps_z, num_frags_x,
+  //                                                            num_frags_y, swizzle_mode_q, DTypeQ>(
+  //         qo_packed_idx_base, q_offset + q_indptr[request_idx], &qo_smem, group_size,
+  //         &q_smem_offset_r, rope_freq, sm_scale);
+  //   }
+  // } else {
+  //   q_smem_inplace_multiply_sm_scale<num_warps_x, num_warps_z, num_frags_x, num_frags_y,
+  //                                    swizzle_mode_q, DTypeQ>(&qo_smem, sm_scale);
+  // }
 
   if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
 #pragma unroll
@@ -1807,7 +1807,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
     // compute attention score
     compute_qk<logits_post_hook, num_frags_x, num_frags_y, num_frags_z, swizzle_mode_q,
                swizzle_mode_kv, DTypeQ, DTypeKV>(&qo_smem, &q_smem_offset_r, &k_smem,
-                                                 &k_smem_offset_r, s_frag, logits_soft_cap);
+                                                 &k_smem_offset_r, s_frag, logits_soft_cap, sm_scale);
 
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
       // TODO(Zihao): handle the case that q_offset is specified
