@@ -104,6 +104,27 @@ void TestSinglePrefillKernelLongContextCorrectness(bool allow_fp16_qk_reduction)
   }
 }
 
+template <typename DTypeKV>
+void TestSinglePrefillFP8KernelLongContextCorrectness(bool allow_fp16_qk_reduction) {
+  for (size_t qo_len : {1, 31, 63, 127}) {
+    for (size_t kv_len : {31717}) {
+      for (size_t num_heads : {1}) {
+        for (size_t head_dim : {64, 128, 256}) {
+          for (bool causal : {false, true}) {
+            for (size_t pos_encoding_mode : {0}) {
+              for (size_t kv_layout : {0, 1}) {
+                _TestSinglePrefillKernelCorrectness<half, DTypeKV, half>(
+                    qo_len, kv_len, num_heads, num_heads, head_dim, causal, QKVLayout(kv_layout),
+                    PosEncodingMode(pos_encoding_mode), allow_fp16_qk_reduction);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 template <typename DTypeIn, typename DTypeOut>
 void TestSinglePrefillKernelShortContextCorrectness(bool allow_fp16_qk_reduction) {
   float rtol = std::is_same<DTypeOut, nv_bfloat16>::value ? 1e-2 : 1e-3;
@@ -135,7 +156,7 @@ void TestSinglePrefillFP8KernelShortContextCorrectness(bool allow_fp16_qk_reduct
   for (size_t qkv_len : {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37}) {
     for (size_t num_qo_heads : {32}) {
       for (size_t num_kv_heads : {4, 8, 32}) {
-        for (size_t head_dim : {128, 256}) {
+        for (size_t head_dim : {64, 128, 256}) {
           for (bool causal : {false, true}) {
             for (size_t pos_encoding_mode : {0}) {
               for (size_t kv_layout : {0, 1}) {
@@ -173,6 +194,27 @@ void TestSinglePrefillKernelCorrectness(bool allow_fp16_qk_reduction) {
   }
 }
 
+template <typename DTypeKV>
+void TestSinglePrefillFP8KernelCorrectness(bool allow_fp16_qk_reduction) {
+  for (size_t qo_len : {399, 400, 401}) {
+    for (size_t kv_len : {533, 534, 535}) {
+      for (size_t num_heads : {12}) {
+        for (size_t head_dim : {64, 128, 256}) {
+          for (bool causal : {false, true}) {
+            for (size_t pos_encoding_mode : {0}) {
+              for (size_t kv_layout : {0, 1}) {
+                _TestSinglePrefillKernelCorrectness<half, DTypeKV, half>(
+                    qo_len, kv_len, num_heads, num_heads, head_dim, causal, QKVLayout(kv_layout),
+                    PosEncodingMode(pos_encoding_mode), allow_fp16_qk_reduction);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelLongContextCorrectnessFP16) {
   TestSinglePrefillKernelLongContextCorrectness<half, half>(false);
 }
@@ -189,11 +231,11 @@ TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelShortContextCorrectnessFP
   TestSinglePrefillKernelShortContextCorrectness<half, half>(true);
 }
 
-TEST(FlashInferCorrectnessTest, SinglePrefillKernelCorrectnessTestFP16) {
+TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelCorrectnessTestFP16) {
   TestSinglePrefillKernelCorrectness<half, half>(false);
 }
 
-TEST(FlashInferCorrectnessTest, SinglePrefillKernelCorrectnessTestFP16QKHalfAccum) {
+TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelCorrectnessTestFP16QKHalfAccum) {
   TestSinglePrefillKernelCorrectness<half, half>(true);
 }
 
@@ -204,7 +246,7 @@ TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelLongContextCorrectnessBF1
 TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelShortContextCorrectnessBF16) {
   TestSinglePrefillKernelShortContextCorrectness<nv_bfloat16, nv_bfloat16>(false);
 }
-TEST(FlashInferCorrectnessTest, SinglePrefillKernelCorrectnessTestBF16) {
+TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelCorrectnessTestBF16) {
   TestSinglePrefillKernelCorrectness<nv_bfloat16, nv_bfloat16>(false);
 }
 #endif
@@ -215,5 +257,17 @@ TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelShortContextCorrectnessE4
 }
 TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelShortContextCorrectnessE5M2) {
   TestSinglePrefillFP8KernelShortContextCorrectness<__nv_fp8_e5m2>(false);
+}
+TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelCorrectnessTestE4M3) {
+  TestSinglePrefillFP8KernelCorrectness<__nv_fp8_e4m3>(false);
+}
+TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelCorrectnessTestE5M2) {
+  TestSinglePrefillFP8KernelCorrectness<__nv_fp8_e5m2>(false);
+}
+TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelLongContextCorrectnessE4M3) {
+  TestSinglePrefillFP8KernelLongContextCorrectness<__nv_fp8_e4m3>(false);
+}
+TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelLongContextCorrectnessE5M2) {
+  TestSinglePrefillFP8KernelLongContextCorrectness<__nv_fp8_e5m2>(false);
 }
 #endif
