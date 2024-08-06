@@ -28,9 +28,8 @@
 namespace flashinfer {
 
 enum class SwizzleMode {
-  k32B,
   k64B,
-  // TODO(Zihao): k128B
+  k128B,
 };
 
 // Use 128bit as the granularity to fetch/store data per thread to maximize memory bandwidth
@@ -64,10 +63,10 @@ struct smem_t {
    */
   template <uint32_t stride>
   static __device__ __forceinline__ uint32_t get_permuted_offset(uint32_t i, uint32_t j) {
-    if constexpr (swizzle_mode == SwizzleMode::k64B) {
+    if constexpr (swizzle_mode == SwizzleMode::k128B) {
       return i * stride + (j ^ (i % 8));
     } else {
-      // swizzle_mode == SwizzleMode::k32B
+      // swizzle_mode == SwizzleMode::k64B
       static_assert(stride == 4);
       return i * stride + (j ^ ((i / 2) % 4));
     }
@@ -76,7 +75,7 @@ struct smem_t {
   template <uint32_t step_size>
   static __device__ __forceinline__ uint32_t advance_offset_by_column(uint32_t offset,
                                                                       uint32_t step_idx) {
-    if constexpr (swizzle_mode == SwizzleMode::k64B) {
+    if constexpr (swizzle_mode == SwizzleMode::k128B) {
       static_assert(step_size == 2 || step_size == 4 || step_size % 8 == 0,
                     "Unsupported step size");
       if constexpr (step_size == 2) {
@@ -88,7 +87,7 @@ struct smem_t {
         return offset + step_size;
       }
     } else {
-      // swizzle_mode == SwizzleMode::k32B
+      // swizzle_mode == SwizzleMode::k64B
       static_assert(step_size == 2, "Unsupported step size");
       return (offset ^ 0x2) + (step_idx % 2 == 1) * 4;
     }
@@ -96,7 +95,7 @@ struct smem_t {
 
   template <uint32_t step_size, uint32_t row_stride>
   static __device__ __forceinline__ uint32_t advance_offset_by_row(uint32_t offset) {
-    if constexpr (swizzle_mode == SwizzleMode::k64B) {
+    if constexpr (swizzle_mode == SwizzleMode::k128B) {
       static_assert(step_size == 4 || step_size % 8 == 0, "Unsupported step size");
       if constexpr (step_size == 4) {
         return (offset ^ 0x4) + step_size * row_stride;

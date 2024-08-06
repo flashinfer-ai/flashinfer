@@ -179,7 +179,7 @@ __device__ __forceinline__ void produce_kv(smem_t<swizzle_mode> smem, uint32_t* 
   constexpr uint32_t channel_size_128b_kv = head_dim / num_elems_per_128b<T>();
   const uint32_t warp_idx = get_warp_idx<num_warps_x, num_warps_z>(), lane_idx = threadIdx.x;
 
-  if constexpr (swizzle_mode == SwizzleMode::k64B) {
+  if constexpr (swizzle_mode == SwizzleMode::k128B) {
     uint32_t kv_idx = kv_idx_base + warp_idx * 4 + lane_idx / 8;
     // NOTE(Zihao): num_frags_z * 4 / num_warps_x = num_warps_z * num_frags_z * 4 / num_warps
     static_assert(num_frags_z * 4 % num_warps_x == 0);
@@ -228,7 +228,7 @@ __device__ __forceinline__ void page_produce_kv(smem_t<swizzle_mode> smem, uint3
   constexpr uint32_t num_warps = num_warps_x * num_warps_z;
   constexpr uint32_t channel_size_128b_kv = head_dim / num_elems_per_128b<DType>();
   const uint32_t warp_idx = get_warp_idx<num_warps_x, num_warps_z>(), lane_idx = threadIdx.x;
-  if constexpr (swizzle_mode == SwizzleMode::k64B) {
+  if constexpr (swizzle_mode == SwizzleMode::k128B) {
     uint32_t kv_idx = kv_idx_base + warp_idx * 4 + lane_idx / 8;
     // NOTE(Zihao): num_frags_z * 4 / num_warps_x = num_warps_z * num_frags_z * 4 / num_warps
     static_assert(num_frags_z * 4 % num_warps_x == 0);
@@ -1097,7 +1097,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
   // cooperative fetch q fragment from gmem to reg
   const uint32_t qo_packed_idx_base =
       (bx * num_warps_x + get_warp_idx_x<num_warps_x, num_warps_z>()) * num_frags_x * 16;
-  constexpr SwizzleMode swizzle_mode_q = SwizzleMode::k64B;
+  constexpr SwizzleMode swizzle_mode_q = SwizzleMode::k128B;
   smem_t<swizzle_mode_q> qo_smem(smem);
   DTypeQ* q_ptr_base =
       q + qkv_info.get_q_elem_offset(0, kv_head_idx * group_size,
@@ -1143,9 +1143,9 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
   }
 
   constexpr SwizzleMode swizzle_mode_kv =
-      (sizeof(DTypeKV) == 1 && head_dim == 64) ? SwizzleMode::k32B : SwizzleMode::k64B;
-  constexpr uint32_t kv_frag_rows = swizzle_mode_kv == SwizzleMode::k64B ? 4 : 8;
-  constexpr uint32_t kv_frag_cols = swizzle_mode_kv == SwizzleMode::k64B ? 8 : 4;
+      (sizeof(DTypeKV) == 1 && head_dim == 64) ? SwizzleMode::k64B : SwizzleMode::k128B;
+  constexpr uint32_t kv_frag_rows = swizzle_mode_kv == SwizzleMode::k128B ? 4 : 8;
+  constexpr uint32_t kv_frag_cols = swizzle_mode_kv == SwizzleMode::k128B ? 8 : 4;
   smem_t<swizzle_mode_kv> k_smem(smem +
                                  (num_warps_x * num_frags_x * sizeof(DTypeQ)) * 16 * head_dim),
       v_smem(smem + (num_warps_x * num_frags_x * sizeof(DTypeQ) +
@@ -1364,7 +1364,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
 
   const uint32_t qo_packed_idx_base =
       (qo_tile_idx * num_warps_x + get_warp_idx_x<num_warps_x, num_warps_z>()) * num_frags_x * 16;
-  constexpr SwizzleMode swizzle_mode_q = SwizzleMode::k64B;
+  constexpr SwizzleMode swizzle_mode_q = SwizzleMode::k128B;
   smem_t<swizzle_mode_q> qo_smem(smem);
 
   DTypeQ* q_ptr_base =
@@ -1442,9 +1442,9 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
       (16 * num_warps_z * num_frags_z);
 
   constexpr SwizzleMode swizzle_mode_kv =
-      (sizeof(DTypeKV) == 1 && head_dim == 64) ? SwizzleMode::k32B : SwizzleMode::k64B;
-  constexpr uint32_t kv_frag_rows = swizzle_mode_kv == SwizzleMode::k64B ? 4 : 8;
-  constexpr uint32_t kv_frag_cols = swizzle_mode_kv == SwizzleMode::k64B ? 8 : 4;
+      (sizeof(DTypeKV) == 1 && head_dim == 64) ? SwizzleMode::k64B : SwizzleMode::k128B;
+  constexpr uint32_t kv_frag_rows = swizzle_mode_kv == SwizzleMode::k128B ? 4 : 8;
+  constexpr uint32_t kv_frag_cols = swizzle_mode_kv == SwizzleMode::k128B ? 8 : 4;
   smem_t<swizzle_mode_kv> k_smem(smem +
                                  (num_warps_x * num_frags_x * sizeof(DTypeQ)) * 16 * head_dim),
       v_smem(smem + (num_warps_x * num_frags_x * sizeof(DTypeQ) +
@@ -1656,7 +1656,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
   const uint32_t qo_packed_idx_base =
       (qo_tile_idx * num_warps_x + get_warp_idx_x<num_warps_x, num_warps_z>()) * num_frags_x * 16;
   const uint32_t q_stride_n = num_qo_heads * head_dim, q_stride_h = head_dim;
-  constexpr SwizzleMode swizzle_mode_q = SwizzleMode::k64B;
+  constexpr SwizzleMode swizzle_mode_q = SwizzleMode::k128B;
   smem_t<swizzle_mode_q> qo_smem(smem);
   DTypeQ* q_ptr_base = q + get_elem_offset_impl(q_indptr[request_idx], kv_head_idx * group_size,
                                                 (lane_idx % 8) * num_elems_per_128b<DTypeQ>(),
@@ -1710,15 +1710,15 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
   }
 
   constexpr SwizzleMode swizzle_mode_kv =
-      (sizeof(DTypeKV) == 1 && head_dim == 64) ? SwizzleMode::k32B : SwizzleMode::k64B;
-  constexpr uint32_t kv_frag_rows = swizzle_mode_kv == SwizzleMode::k64B ? 4 : 8;
-  constexpr uint32_t kv_frag_cols = swizzle_mode_kv == SwizzleMode::k64B ? 8 : 4;
+      (sizeof(DTypeKV) == 1 && head_dim == 64) ? SwizzleMode::k64B : SwizzleMode::k128B;
+  constexpr uint32_t kv_frag_rows = swizzle_mode_kv == SwizzleMode::k128B ? 4 : 8;
+  constexpr uint32_t kv_frag_cols = swizzle_mode_kv == SwizzleMode::k128B ? 8 : 4;
   smem_t<swizzle_mode_kv> k_smem(smem +
                                  (num_warps_x * num_frags_x * sizeof(DTypeQ)) * 16 * head_dim),
       v_smem(smem + (num_warps_x * num_frags_x * sizeof(DTypeQ) +
                      num_warps_z * num_frags_z * sizeof(DTypeKV)) *
                         16 * head_dim);
-  size_t kv_offset[num_frags_z * (swizzle_mode_kv == SwizzleMode::k64B ? 4 : 2) / num_warps_x];
+  size_t kv_offset[num_frags_z * (swizzle_mode_kv == SwizzleMode::k128B ? 4 : 2) / num_warps_x];
 
   uint32_t k_smem_offset_r = k_smem.get_permuted_offset<channel_size_128b_kv>(
                get_warp_idx_z<num_warps_x, num_warps_z>() * num_frags_z * 16 + 8 * (lane_idx / 16) +
@@ -1734,7 +1734,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
   uint32_t packed_page_iter_base = paged_kv.indptr[request_idx] * paged_kv.page_size + chunk_start;
 #pragma unroll
   for (uint32_t i = 0;
-       i < num_frags_z * (swizzle_mode_kv == SwizzleMode::k64B ? 4 : 2) / num_warps_x; ++i) {
+       i < num_frags_z * (swizzle_mode_kv == SwizzleMode::k128B ? 4 : 2) / num_warps_x; ++i) {
     uint32_t page_iter, entry_idx;
     paged_kv.page_size.divmod(packed_page_iter_base + warp_idx * kv_frag_rows +
                                   lane_idx / kv_frag_cols +
@@ -1780,7 +1780,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
     packed_page_iter_base += 16 * num_warps_z * num_frags_z;
 #pragma unroll
     for (uint32_t i = 0;
-         i < num_frags_z * (swizzle_mode_kv == SwizzleMode::k64B ? 4 : 2) / num_warps_x; ++i) {
+         i < num_frags_z * (swizzle_mode_kv == SwizzleMode::k128B ? 4 : 2) / num_warps_x; ++i) {
       uint32_t page_iter, entry_idx;
       paged_kv.page_size.divmod(packed_page_iter_base + warp_idx * kv_frag_rows +
                                     lane_idx / kv_frag_cols +
