@@ -97,14 +97,11 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
     // [max_num_pages, 2, num_kv_heads, page_size, head_dim] for HND
     // [max_num_pages, 2, page_size, num_kv_heads, head_dim] for HND
     CHECK_DIM(5, paged_kv_cache.value());
-    CHECK_EQ(q.scalar_type(), paged_kv_cache->scalar_type());
   } else {
     // [max_num_pages, num_kv_heads, page_size, head_dim] for HND
     // [max_num_pages, page_size, num_kv_heads, head_dim] for HND
     CHECK_DIM(4, paged_k_cache.value());
     CHECK_DIM(4, paged_v_cache.value());
-    CHECK_EQ(q.scalar_type(), paged_k_cache->scalar_type());
-    CHECK_EQ(q.scalar_type(), paged_v_cache->scalar_type());
   }
 
   CHECK_DIM(1, paged_kv_indptr);         // (B + 1,)
@@ -158,7 +155,8 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
       logits_soft_cap > 0.f ? LogitsPostHook::kSoftCap : LogitsPostHook::kNone;
 
   auto q_scalar_type = q.scalar_type();
-  auto kv_scalar_type = paged_k_cache.scalar_type();
+  auto kv_scalar_type =
+      paged_kv_defined ? paged_kv_cache->scalar_type() : paged_k_cache->scalar_type();
 
   if (q_scalar_type == kv_scalar_type) {
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q_scalar_type, c_type, [&] {
@@ -304,12 +302,6 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCu
   CHECK_DIM(1, paged_kv_last_page_len);  // (B,)
   CHECK_DIM(1, custom_mask);             // (nnz_qk,)
   CHECK_DIM(1, qk_indptr);               // (B + 1,)
-  if (paged_kv_defined) {
-    CHECK_EQ(q.scalar_type(), paged_kv_cache->scalar_type());
-  } else {
-    CHECK_EQ(q.scalar_type(), paged_k_cache->scalar_type());
-    CHECK_EQ(q.scalar_type(), paged_v_cache->scalar_type());
-  }
   int64_t batch_size = qo_indptr.size(0) - 1;
   int64_t nnz_qo = q.size(0);
   int64_t num_qo_heads = q.size(1);
@@ -360,7 +352,8 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCu
       logits_soft_cap > 0.f ? LogitsPostHook::kSoftCap : LogitsPostHook::kNone;
 
   auto q_scalar_type = q.scalar_type();
-  auto kv_scalar_type = paged_k_cache.scalar_type();
+  auto kv_scalar_type =
+      paged_kv_defined ? paged_kv_cache->scalar_type() : paged_k_cache->scalar_type();
 
   if (q_scalar_type == kv_scalar_type) {
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q_scalar_type, c_type, [&] {
@@ -553,78 +546,43 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
   auto q_scalar_type = q.scalar_type();
   auto kv_scalar_type = k.scalar_type();
 
-  if (q_scalar_type == kv_scalar_type) {
-    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q_scalar_type, c_type, [&] {
-      return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-        return DISPATCH_mask_mode(mask_mode, MASK_MODE, [&] {
-          return DISPATCH_allow_fp16_qk_reduction(
-              allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
-                return DISPATCH_pos_encoding_mode(
-                    PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
-                      return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
-                        cudaError_t status = BatchPrefillWithRaggedKVCacheWrapperDispatched<
-                            HEAD_DIM, LOGITS_POST_HOOK, POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION,
-                            MASK_MODE, c_type, c_type, c_type, int32_t>(
-                            handler_.get(), static_cast<c_type*>(q.data_ptr()),
-                            static_cast<int32_t*>(qo_indptr.data_ptr()),
-                            static_cast<c_type*>(k.data_ptr()), static_cast<c_type*>(v.data_ptr()),
-                            static_cast<int32_t*>(kv_indptr.data_ptr()),
-                            /*custom_mask=*/nullptr, /*qk_indptr=*/nullptr,
-                            /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr,
-                            static_cast<c_type*>(o.data_ptr()),
-                            /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                            num_qo_heads, num_kv_heads, q_stride_n, q_stride_h, kv_stride_n,
-                            kv_stride_h, window_left, logits_soft_cap, sm_scale, rope_scale,
-                            rope_theta,
-                            /*stream=*/torch_current_stream);
-                        TORCH_CHECK(status == cudaSuccess,
-                                    "BatchPrefillWithRaggedKVCache failed with error ",
-                                    cudaGetErrorString(status));
-                        return true;
-                      });
+  TORCH_CHECK(q_scalar_type == kv_scalar_type,
+              "q and k must have the same scalar type, but got q: ", q_scalar_type,
+              " and k: ", kv_scalar_type);
+
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q_scalar_type, c_type, [&] {
+    return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
+      return DISPATCH_mask_mode(mask_mode, MASK_MODE, [&] {
+        return DISPATCH_allow_fp16_qk_reduction(
+            allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
+              return DISPATCH_pos_encoding_mode(
+                  PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
+                    return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
+                      cudaError_t status = BatchPrefillWithRaggedKVCacheWrapperDispatched<
+                          HEAD_DIM, LOGITS_POST_HOOK, POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION,
+                          MASK_MODE, c_type, c_type, c_type, int32_t>(
+                          handler_.get(), static_cast<c_type*>(q.data_ptr()),
+                          static_cast<int32_t*>(qo_indptr.data_ptr()),
+                          static_cast<c_type*>(k.data_ptr()), static_cast<c_type*>(v.data_ptr()),
+                          static_cast<int32_t*>(kv_indptr.data_ptr()),
+                          /*custom_mask=*/nullptr, /*qk_indptr=*/nullptr,
+                          /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr,
+                          static_cast<c_type*>(o.data_ptr()),
+                          /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
+                          num_qo_heads, num_kv_heads, q_stride_n, q_stride_h, kv_stride_n,
+                          kv_stride_h, window_left, logits_soft_cap, sm_scale, rope_scale,
+                          rope_theta,
+                          /*stream=*/torch_current_stream);
+                      TORCH_CHECK(status == cudaSuccess,
+                                  "BatchPrefillWithRaggedKVCache failed with error ",
+                                  cudaGetErrorString(status));
+                      return true;
                     });
-              });
-        });
+                  });
+            });
       });
     });
-  } else {
-    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q_scalar_type, q_type, [&] {
-      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(kv_scalar_type, kv_type, [&] {
-        return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-          return DISPATCH_mask_mode(mask_mode, MASK_MODE, [&] {
-            return DISPATCH_allow_fp16_qk_reduction(
-                allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
-                  return DISPATCH_pos_encoding_mode(
-                      PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
-                        return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
-                          cudaError_t status = BatchPrefillWithRaggedKVCacheWrapperDispatched<
-                              HEAD_DIM, LOGITS_POST_HOOK, POS_ENCODING_MODE,
-                              ALLOW_FP16_QK_REDUCTION, MASK_MODE, q_type, kv_type, q_type, int32_t>(
-                              handler_.get(), static_cast<q_type*>(q.data_ptr()),
-                              static_cast<int32_t*>(qo_indptr.data_ptr()),
-                              static_cast<kv_type*>(k.data_ptr()),
-                              static_cast<kv_type*>(v.data_ptr()),
-                              static_cast<int32_t*>(kv_indptr.data_ptr()),
-                              /*custom_mask=*/nullptr, /*qk_indptr=*/nullptr,
-                              /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr,
-                              static_cast<q_type*>(o.data_ptr()),
-                              /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                              num_qo_heads, num_kv_heads, q_stride_n, q_stride_h, kv_stride_n,
-                              kv_stride_h, window_left, logits_soft_cap, sm_scale, rope_scale,
-                              rope_theta,
-                              /*stream=*/torch_current_stream);
-                          TORCH_CHECK(status == cudaSuccess,
-                                      "BatchPrefillWithRaggedKVCache failed with error ",
-                                      cudaGetErrorString(status));
-                          return true;
-                        });
-                      });
-                });
-          });
-        });
-      });
-    });
-  }
+  });
 
   if (return_lse) {
     return {o, lse};
@@ -702,77 +660,41 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardC
 
   auto q_scalar_type = q.scalar_type();
   auto kv_scalar_type = k.scalar_type();
+  TORCH_CHECK(q_scalar_type == kv_scalar_type,
+              "q and k must have the same scalar type, but got q: ", q_scalar_type,
+              " and k: ", kv_scalar_type);
 
-  if (q_scalar_type == kv_scalar_type) {
-    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
-      return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-        return DISPATCH_allow_fp16_qk_reduction(
-            allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
-              return DISPATCH_pos_encoding_mode(
-                  PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
-                    return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
-                      cudaError_t status = BatchPrefillWithRaggedKVCacheWrapperDispatched<
-                          HEAD_DIM, LOGITS_POST_HOOK, POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION,
-                          MASK_MODE, c_type, c_type, c_type, int32_t>(
-                          handler_.get(), static_cast<c_type*>(q.data_ptr()),
-                          static_cast<int32_t*>(qo_indptr.data_ptr()),
-                          static_cast<c_type*>(k.data_ptr()), static_cast<c_type*>(v.data_ptr()),
-                          static_cast<int32_t*>(kv_indptr.data_ptr()),
-                          static_cast<uint8_t*>(custom_mask.data_ptr()),
-                          static_cast<int32_t*>(qk_indptr.data_ptr()),
-                          /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr,
-                          static_cast<c_type*>(o.data_ptr()),
-                          /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                          num_qo_heads, num_kv_heads, q_stride_n, q_stride_h, kv_stride_n,
-                          kv_stride_h, window_left, logits_soft_cap, sm_scale, rope_scale,
-                          rope_theta,
-                          /*stream=*/torch_current_stream);
-                      TORCH_CHECK(status == cudaSuccess,
-                                  "BatchPrefillWithRaggedKVCache failed with error ",
-                                  cudaGetErrorString(status));
-                      return true;
-                    });
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
+    return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
+      return DISPATCH_allow_fp16_qk_reduction(
+          allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
+            return DISPATCH_pos_encoding_mode(
+                PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
+                  return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
+                    cudaError_t status = BatchPrefillWithRaggedKVCacheWrapperDispatched<
+                        HEAD_DIM, LOGITS_POST_HOOK, POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION,
+                        MASK_MODE, c_type, c_type, c_type, int32_t>(
+                        handler_.get(), static_cast<c_type*>(q.data_ptr()),
+                        static_cast<int32_t*>(qo_indptr.data_ptr()),
+                        static_cast<c_type*>(k.data_ptr()), static_cast<c_type*>(v.data_ptr()),
+                        static_cast<int32_t*>(kv_indptr.data_ptr()),
+                        static_cast<uint8_t*>(custom_mask.data_ptr()),
+                        static_cast<int32_t*>(qk_indptr.data_ptr()),
+                        /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr,
+                        static_cast<c_type*>(o.data_ptr()),
+                        /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
+                        num_qo_heads, num_kv_heads, q_stride_n, q_stride_h, kv_stride_n,
+                        kv_stride_h, window_left, logits_soft_cap, sm_scale, rope_scale, rope_theta,
+                        /*stream=*/torch_current_stream);
+                    TORCH_CHECK(status == cudaSuccess,
+                                "BatchPrefillWithRaggedKVCache failed with error ",
+                                cudaGetErrorString(status));
+                    return true;
                   });
-            });
-      });
+                });
+          });
     });
-  } else {
-    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), q_type, [&] {
-      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(kv_scalar_type, kv_type, [&] {
-        return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-          return DISPATCH_allow_fp16_qk_reduction(
-              allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
-                return DISPATCH_pos_encoding_mode(
-                    PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
-                      return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
-                        cudaError_t status = BatchPrefillWithRaggedKVCacheWrapperDispatched<
-                            HEAD_DIM, LOGITS_POST_HOOK, POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION,
-                            MASK_MODE, q_type, kv_type, q_type, int32_t>(
-                            handler_.get(), static_cast<q_type*>(q.data_ptr()),
-                            static_cast<int32_t*>(qo_indptr.data_ptr()),
-                            static_cast<kv_type*>(k.data_ptr()),
-                            static_cast<kv_type*>(v.data_ptr()),
-                            static_cast<int32_t*>(kv_indptr.data_ptr()),
-                            static_cast<uint8_t*>(custom_mask.data_ptr()),
-                            static_cast<int32_t*>(qk_indptr.data_ptr()),
-                            /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr,
-                            static_cast<q_type*>(o.data_ptr()),
-                            /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                            num_qo_heads, num_kv_heads, q_stride_n, q_stride_h, kv_stride_n,
-                            kv_stride_h, window_left, logits_soft_cap, sm_scale, rope_scale,
-                            rope_theta,
-                            /*stream=*/torch_current_stream);
-                        TORCH_CHECK(status == cudaSuccess,
-                                    "BatchPrefillWithRaggedKVCache failed with error ",
-                                    cudaGetErrorString(status));
-                        return true;
-                      });
-                    });
-              });
-        });
-      });
-    });
-  }
+  });
 
   if (return_lse) {
     return {o, lse};

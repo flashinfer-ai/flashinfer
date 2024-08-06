@@ -818,6 +818,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         causal: bool = True,
         pos_encoding_mode: str = "NONE",
         allow_fp16_qk_reduction: bool = False,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
         window_left: int = -1,
         logits_soft_cap: Optional[float] = None,
         sm_scale: Optional[float] = None,
@@ -855,6 +857,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         allow_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
             loss).
+        k_scale : Optional[float]
+            The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
+        v_scale : Optional[float]
+            The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
         window_left : int
             The left (inclusive) window size for the attention window, when set to ``-1``, the window
             size will be set to the full length of the sequence. Defaults to ``-1``.
@@ -883,13 +889,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
             logits_soft_cap = 0.0
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
+        if k_scale is not None:
+            sm_scale *= k_scale
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
 
         if self._custom_mask_buf is None:
-            return self._wrapper.forward(
+            out = self._wrapper.forward(
                 q,
                 self._qo_indptr_buf,
                 *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
@@ -907,7 +915,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 False,  # return LSE
             )[0]
         else:
-            return self._wrapper.forward_custom_mask(
+            out = self._wrapper.forward_custom_mask(
                 q,
                 self._qo_indptr_buf,
                 *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
@@ -925,6 +933,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 rope_theta,
                 False,  # return LSE
             )[0]
+        if v_scale is not None:
+            out *= v_scale
+        return out
 
     def forward_return_lse(
         self,
@@ -933,6 +944,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         causal: bool = True,
         pos_encoding_mode: str = "NONE",
         allow_fp16_qk_reduction: bool = False,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
         window_left: int = -1,
         logits_soft_cap: Optional[float] = None,
         sm_scale: Optional[float] = None,
@@ -968,6 +981,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         allow_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
             loss).
+        k_scale : Optional[float]
+            The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
+        v_scale : Optional[float]
+            The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
         window_left : int
             The left (inclusive) window size for the attention window, when set to ``-1``, the window
             size will be set to the full length of the sequence. Defaults to ``-1``.
@@ -999,13 +1016,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
             logits_soft_cap = 0.0
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
+        if k_scale is not None:
+            sm_scale *= k_scale
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
 
         if self._custom_mask_buf is None:
-            return self._wrapper.forward(
+            out, lse = self._wrapper.forward(
                 q,
                 self._qo_indptr_buf,
                 *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
@@ -1023,7 +1042,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 True,  # return LSE
             )
         else:
-            return self._wrapper.forward(
+            out, lse = self._wrapper.forward(
                 q,
                 self._qo_indptr_buf,
                 *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
@@ -1041,6 +1060,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 rope_theta,
                 True,  # return LSE
             )
+
+        if v_scale is not None:
+            out *= v_scale
+        return out, lse
 
 
 def _compute_qk_indptr(

@@ -168,21 +168,20 @@ def get_instantiation_cu() -> List[str]:
         allow_fp16_qk_reduction_options,
         mask_modes,
     ):
-        for dtype in prefill_dtypes:
-            for dtype_kv in fp8_dtypes:
-                fname = f"single_prefill_head_{head_dim}_logitshook_{logits_hook}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype}_dtypekv_{dtype_kv}_dtypeout_{dtype}.cu"
-                files.append(prefix + "/" + fname)
-                content = generate_single_prefill_inst.get_cu_file_str(
-                    head_dim,
-                    logits_hook,
-                    pos_encoding_mode,
-                    allow_fp16_qk_reduction,
-                    mask_mode,
-                    dtype,  # dtype_q
-                    dtype_kv,  # dtype_kv
-                    dtype,  # dtype_out
-                )
-                write_if_different(root / prefix / fname, content)
+        for dtype_q, dtype_kv in list(zip(prefill_dtypes, prefill_dtypes)):
+            fname = f"single_prefill_head_{head_dim}_logitshook_{logits_hook}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}.cu"
+            files.append(prefix + "/" + fname)
+            content = generate_single_prefill_inst.get_cu_file_str(
+                head_dim,
+                logits_hook,
+                pos_encoding_mode,
+                allow_fp16_qk_reduction,
+                mask_mode,
+                dtype_q,  # dtype_q
+                dtype_kv,  # dtype_kv
+                dtype_q,  # dtype_out
+            )
+            write_if_different(root / prefix / fname, content)
 
     # batch paged prefill files
     for (
@@ -200,22 +199,23 @@ def get_instantiation_cu() -> List[str]:
         mask_modes,
         idtypes,
     ):
-        for dtype in prefill_dtypes:
-            for dtype_kv in fp8_dtypes:
-                fname = f"batch_paged_prefill_head_{head_dim}_logitshook_{logits_hook}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype}_dtypekv_{dtype_kv}_dtypeout_{dtype}_idtype_{idtype}.cu"
-                files.append(prefix + "/" + fname)
-                content = generate_batch_paged_prefill_inst.get_cu_file_str(
-                    head_dim,
-                    logits_hook,
-                    pos_encoding_mode,
-                    allow_fp16_qk_reduction,
-                    mask_mode,
-                    dtype,  # dtype_q
-                    dtype_kv,  # dtype_kv
-                    dtype,  # dtype_out
-                    idtype,
-                )
-                write_if_different(root / prefix / fname, content)
+        for dtype_q, dtype_kv in list(zip(prefill_dtypes, prefill_dtypes)) + list(
+            itertools.product(prefill_dtypes, fp8_dtypes)
+        ):
+            fname = f"batch_paged_prefill_head_{head_dim}_logitshook_{logits_hook}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}.cu"
+            files.append(prefix + "/" + fname)
+            content = generate_batch_paged_prefill_inst.get_cu_file_str(
+                head_dim,
+                logits_hook,
+                pos_encoding_mode,
+                allow_fp16_qk_reduction,
+                mask_mode,
+                dtype_q,  # dtype_q
+                dtype_kv,  # dtype_kv
+                dtype_q,  # dtype_out
+                idtype,
+            )
+            write_if_different(root / prefix / fname, content)
 
     # batch ragged prefill files
     for (
@@ -233,22 +233,21 @@ def get_instantiation_cu() -> List[str]:
         mask_modes,
         idtypes,
     ):
-        for dtype in prefill_dtypes:
-            for dtype_kv in fp8_dtypes:
-                fname = f"batch_ragged_prefill_head_{head_dim}_logitshook_{logits_hook}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype}_dtypekv_{dtype_kv}_dtypeout_{dtype}_idtype_{idtype}.cu"
-                files.append(prefix + "/" + fname)
-                content = generate_batch_ragged_prefill_inst.get_cu_file_str(
-                    head_dim,
-                    logits_hook,
-                    pos_encoding_mode,
-                    allow_fp16_qk_reduction,
-                    mask_mode,
-                    dtype,  # dtype_q
-                    dtype_kv,  # dtype_kv
-                    dtype,  # dtype_out
-                    idtype,
-                )
-                write_if_different(root / prefix / fname, content)
+        for dtype_q, dtype_kv in list(zip(prefill_dtypes, prefill_dtypes)):
+            fname = f"batch_ragged_prefill_head_{head_dim}_logitshook_{logits_hook}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}.cu"
+            files.append(prefix + "/" + fname)
+            content = generate_batch_ragged_prefill_inst.get_cu_file_str(
+                head_dim,
+                logits_hook,
+                pos_encoding_mode,
+                allow_fp16_qk_reduction,
+                mask_mode,
+                dtype_q,  # dtype_q
+                dtype_kv,  # dtype_kv
+                dtype_q,  # dtype_out
+                idtype,
+            )
+            write_if_different(root / prefix / fname, content)
 
     return files
 

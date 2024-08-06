@@ -1121,7 +1121,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
 
   if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
     q_smem_inplace_apply_rotary_multiply_sm_scale<num_warps_x, num_warps_z, num_frags_x,
-                                                  num_frags_y, DTypeQ>(
+                                                  num_frags_y, swizzle_mode_q, DTypeQ>(
         qo_packed_idx_base, qo_len, kv_len, group_size, &qo_smem, &q_smem_offset_r, rope_freq,
         sm_scale);
   } else {
@@ -1201,7 +1201,8 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
     block.sync();
 
     if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
-      k_smem_inplace_apply_rotary<num_warps_x, num_warps_z, num_frags_y, num_frags_z, DTypeKV>(
+      k_smem_inplace_apply_rotary<num_warps_x, num_warps_z, num_frags_y, num_frags_z,
+                                  swizzle_mode_kv, DTypeKV>(
           chunk_start + iter * 16 * num_warps_z * num_frags_z, &k_smem, &k_smem_offset_r,
           rope_freq);
       block.sync();
@@ -1391,12 +1392,12 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
   if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
     if (!q_offset) {
       q_smem_inplace_apply_rotary_multiply_sm_scale<num_warps_x, num_warps_z, num_frags_x,
-                                                    num_frags_y, DTypeQ>(
+                                                    num_frags_y, swizzle_mode_q, DTypeQ>(
           qo_packed_idx_base, qo_len, kv_len, group_size, &qo_smem, &q_smem_offset_r, rope_freq,
           sm_scale);
     } else {
       q_smem_inplace_apply_rotary_with_pos_multiply_sm_scale<num_warps_x, num_warps_z, num_frags_x,
-                                                             num_frags_y, DTypeQ>(
+                                                             num_frags_y, swizzle_mode_q, DTypeQ>(
           qo_packed_idx_base, q_offset + q_indptr[request_idx], &qo_smem, group_size,
           &q_smem_offset_r, rope_freq, sm_scale);
     }
@@ -1482,7 +1483,8 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
     block.sync();
 
     if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
-      k_smem_inplace_apply_rotary<num_warps_x, num_warps_z, num_frags_y, num_frags_z, DTypeKV>(
+      k_smem_inplace_apply_rotary<num_warps_x, num_warps_z, num_frags_y, num_frags_z,
+                                  swizzle_mode_kv, DTypeKV>(
           (k_rope_pos_offset == nullptr ? 0 : k_rope_pos_offset[request_idx]) + chunk_start +
               iter * 16 * num_warps_z * num_frags_z,
           &k_smem, &k_smem_offset_r, rope_freq);
@@ -1680,12 +1682,12 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
   if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
     if (q_offset == nullptr) {
       q_smem_inplace_apply_rotary_multiply_sm_scale<num_warps_x, num_warps_z, num_frags_x,
-                                                    num_frags_y, DTypeQ>(
+                                                    num_frags_y, swizzle_mode_q, DTypeQ>(
           qo_packed_idx_base, qo_len, kv_len, group_size, &qo_smem, &q_smem_offset_r, rope_freq,
           sm_scale);
     } else {
       q_smem_inplace_apply_rotary_with_pos_multiply_sm_scale<num_warps_x, num_warps_z, num_frags_x,
-                                                             num_frags_y, DTypeQ>(
+                                                             num_frags_y, swizzle_mode_q, DTypeQ>(
           qo_packed_idx_base, q_offset + q_indptr[request_idx], &qo_smem, group_size,
           &q_smem_offset_r, rope_freq, sm_scale);
     }
@@ -1794,7 +1796,8 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
     block.sync();
 
     if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
-      k_smem_inplace_apply_rotary<num_warps_x, num_warps_z, num_frags_y, num_frags_z, DTypeKV>(
+      k_smem_inplace_apply_rotary<num_warps_x, num_warps_z, num_frags_y, num_frags_z,
+                                  swizzle_mode_kv, DTypeKV>(
           (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[request_idx]) +
               chunk_start + iter * 16 * num_warps_z * num_frags_z,
           &k_smem, &k_smem_offset_r, rope_freq);
