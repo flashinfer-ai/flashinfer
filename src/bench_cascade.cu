@@ -263,7 +263,7 @@ void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
                    std::string(cudaGetErrorString(status)));
       }
 
-      status = BatchPrefillWithPagedKVCacheWrapper<page_storage, T, T, int32_t>(
+      status = BatchPrefillWithPagedKVCacheWrapper<page_storage, T, T, T, int32_t>(
           &cascade_handler, thrust::raw_pointer_cast(q_d.data()),
           thrust::raw_pointer_cast(qo_indptr_d.data()),
           /*q_offset=*/nullptr, paged_kv_casacde_d, thrust::raw_pointer_cast(o_cascade_1_d.data()),
@@ -305,7 +305,7 @@ void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
         kv_indptr_combined_h.data(), batch_size, num_qo_heads, num_kv_heads, head_dim, page_size);
     state.exec(nvbench::exec_tag::timer, [&](nvbench::launch& launch, auto& timer) {
       timer.start();
-      cudaError_t status = BatchPrefillWithPagedKVCacheWrapper<page_storage, T, T, int32_t>(
+      cudaError_t status = BatchPrefillWithPagedKVCacheWrapper<page_storage, T, T, T, int32_t>(
           &baseline_handler, thrust::raw_pointer_cast(q_d.data()),
           thrust::raw_pointer_cast(qo_indptr_d.data()),
           /*q_offset=*/nullptr, paged_kv_baseline_d, thrust::raw_pointer_cast(o_baseline_d.data()),

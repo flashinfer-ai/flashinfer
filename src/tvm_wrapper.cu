@@ -254,19 +254,17 @@ void _FlashInferAttentionPrefillWithPagedKVCache(int64_t handler_id, DLTensor* q
                     last_page_len->byte_offset / sizeof(dtype_idx),
                 static_cast<dtype_idx*>(k_rope_pos_offset->data) +
                     k_rope_pos_offset->byte_offset / sizeof(dtype_idx));
-            cudaError_t status =
-                BatchPrefillWithPagedKVCacheWrapper<page_storage, dtype_in, dtype_out, dtype_idx>(
-                    &batch_prefill_paged_kv_handlers[handler_id],
-                    static_cast<dtype_in*>(q_data->data),
-                    static_cast<dtype_idx*>(qo_indptr->data) +
-                        qo_indptr->byte_offset / sizeof(dtype_idx),
-                    static_cast<dtype_idx*>(q_offset->data) +
-                        q_offset->byte_offset / sizeof(dtype_idx),
-                    cache, static_cast<dtype_out*>(output->data),
-                    /*lse=*/static_cast<float*>(lse->data), nhead_qo,
-                    /*causal=*/causal, PosEncodingMode(pos_encoding_mode),
-                    /*allow_fp16_qk_reduction=*/false, sm_scale, rope_scale, rope_theta,
-                    /*stream=*/0);
+            cudaError_t status = BatchPrefillWithPagedKVCacheWrapper<
+                page_storage, dtype_in, dtype_in, dtype_out, dtype_idx>(
+                &batch_prefill_paged_kv_handlers[handler_id], static_cast<dtype_in*>(q_data->data),
+                static_cast<dtype_idx*>(qo_indptr->data) +
+                    qo_indptr->byte_offset / sizeof(dtype_idx),
+                static_cast<dtype_idx*>(q_offset->data) + q_offset->byte_offset / sizeof(dtype_idx),
+                cache, static_cast<dtype_out*>(output->data),
+                /*lse=*/static_cast<float*>(lse->data), nhead_qo,
+                /*causal=*/causal, PosEncodingMode(pos_encoding_mode),
+                /*allow_fp16_qk_reduction=*/false, sm_scale, rope_scale, rope_theta,
+                /*stream=*/0);
             if (status != cudaSuccess) {
               LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
             }
@@ -529,7 +527,7 @@ void _FlashInferAttentionPrefillWithRaggedKVCache(
       {DISPATCH_TVM_CUDA_DTYPE(
           output->dtype, dtype_out, {DISPATCH_TVM_CUDA_IDTYPE(qo_indptr->dtype, dtype_idx, {
             cudaError_t status =
-                BatchPrefillWithRaggedKVCacheWrapper<dtype_in, dtype_out, dtype_idx>(
+                BatchPrefillWithRaggedKVCacheWrapper<dtype_in, dtype_in, dtype_out, dtype_idx>(
                     &batch_prefill_ragged_kv_handler, static_cast<dtype_in*>(q_data->data),
                     static_cast<dtype_idx*>(qo_indptr->data) +
                         qo_indptr->byte_offset / sizeof(dtype_idx),

@@ -73,8 +73,8 @@ cudaError_t SinglePrefillWithKVCacheCustomMask(
  * \param stream The cuda stream to execute the kernel on.
  * \return status Indicates whether CUDA calls are successful
  */
-template <typename DTypeIn, typename DTypeOut>
-cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOut* o, DTypeOut* tmp,
+template <typename DTypeQ, typename DTypeKV, typename DTypeOut>
+cudaError_t SinglePrefillWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut* o, DTypeOut* tmp,
                                      float* lse, uint32_t num_qo_heads, uint32_t num_kv_heads,
                                      uint32_t qo_len, uint32_t kv_len, uint32_t head_dim,
                                      bool causal = true, QKVLayout kv_layout = QKVLayout::kNHD,
@@ -105,9 +105,9 @@ cudaError_t SinglePrefillWithKVCache(DTypeIn* q, DTypeIn* k, DTypeIn* v, DTypeOu
   return cudaSuccess;
 }
 
-template <typename DTypeIn, typename DTypeOut, typename IdType>
+template <typename DTypeQ, typename DTypeKV, typename DTypeOut, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
-    BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, DTypeIn* k, DTypeIn* v,
+    BatchPrefillHandler* handler, DTypeQ* q, IdType* qo_indptr, DTypeKV* k, DTypeKV* v,
     IdType* kv_indptr, IdType* q_offset, IdType* k_rope_pos_offset, DTypeOut* o, float* lse,
     const uint32_t batch_size, const uint32_t num_qo_heads, const uint32_t num_kv_heads,
     const uint32_t head_dim, bool causal = true, QKVLayout kv_layout = QKVLayout::kNHD,
@@ -127,7 +127,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
               {DISPATCH_allow_fp16_qk_reduction(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
                 return BatchPrefillWithRaggedKVCacheWrapperDispatched<
                     HEAD_DIM, LogitsPostHook::kNone, pos_encoding_mode, ALLOW_FP16_QK_REDUCTION,
-                    MASK_MODE, DTypeIn, DTypeOut, IdType>(
+                    MASK_MODE, DTypeQ, DTypeKV, DTypeOut, IdType>(
                     handler, q, qo_indptr, k, v, kv_indptr, /*custom_mask=*/nullptr,
                     /*qk_indptr=*/nullptr, q_offset, k_rope_pos_offset, o, lse, num_qo_heads,
                     num_kv_heads, qo_stride_n, qo_stride_h, kv_stride_n, kv_stride_h,
@@ -137,10 +137,11 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
   return cudaSuccess;
 }
 
-template <PageStorage PAGE_STORAGE, typename DTypeIn, typename DTypeOut, typename IdType>
+template <PageStorage PAGE_STORAGE, typename DTypeQ, typename DTypeKV, typename DTypeOut,
+          typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheWrapper(
-    BatchPrefillHandler* handler, DTypeIn* q, IdType* qo_indptr, IdType* q_offset,
-    paged_kv_t<PAGE_STORAGE, DTypeIn, IdType> paged_kv, DTypeOut* o, float* lse,
+    BatchPrefillHandler* handler, DTypeQ* q, IdType* qo_indptr, IdType* q_offset,
+    paged_kv_t<PAGE_STORAGE, DTypeKV, IdType> paged_kv, DTypeOut* o, float* lse,
     uint32_t num_qo_heads, bool causal = true,
     PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
     bool allow_fp16_qk_reduction = false, std::optional<float> maybe_sm_scale = std::nullopt,
@@ -158,7 +159,7 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
               {DISPATCH_allow_fp16_qk_reduction(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
                 return BatchPrefillWithPagedKVCacheWrapperDispatched<
                     PAGE_STORAGE, HEAD_DIM, LogitsPostHook::kNone, POS_ENCODING_MODE,
-                    ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeIn, DTypeOut, IdType>(
+                    ALLOW_FP16_QK_REDUCTION, MASK_MODE, DTypeQ, DTypeKV, DTypeOut, IdType>(
                     handler, q, qo_indptr, q_offset, paged_kv,
                     /*custom_mask=*/nullptr,
                     /*qk_indptr=*/nullptr, o, lse, num_qo_heads, /*window_left=*/-1,

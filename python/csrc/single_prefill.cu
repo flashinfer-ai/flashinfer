@@ -73,7 +73,13 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
   const LogitsPostHook logits_post_hook =
       logits_soft_cap > 0.f ? LogitsPostHook::kSoftCap : LogitsPostHook::kNone;
 
-  bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
+  auto q_scalar_type = q.scalar_type();
+  auto kv_scalar_type = k.scalar_type();
+  TORCH_CHECK(q_scalar_type == kv_scalar_type,
+              "q and k must have the same scalar type, but got q: ", q_scalar_type,
+              " and k: ", kv_scalar_type);
+
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q_scalar_type, c_type, [&] {
     return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
       return DISPATCH_mask_mode(mask_mode, MASK_MODE, [&] {
         return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
@@ -167,7 +173,13 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache_custom_mask(
   const LogitsPostHook logits_post_hook =
       logits_soft_cap > 0.f ? LogitsPostHook::kSoftCap : LogitsPostHook::kNone;
 
-  bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
+  auto q_scalar_type = q.scalar_type();
+  auto kv_scalar_type = k.scalar_type();
+  TORCH_CHECK(q_scalar_type == kv_scalar_type,
+              "q and k must have the same scalar type, but got q: ", q_scalar_type,
+              " and k: ", kv_scalar_type);
+
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
       return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
         return DISPATCH_allow_fp16_qk_reduction(

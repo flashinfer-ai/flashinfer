@@ -421,7 +421,7 @@ void _TestTwoLevelSinglePrefixCascadeAppendCorrectness(size_t batch_size,
                                            kv_indptr_unique_h.data(), batch_size, num_qo_heads,
                                            num_kv_heads, head_dim, page_size);
 
-  cudaError_t status = BatchPrefillWithPagedKVCacheWrapper<page_storage, T, T, int32_t>(
+  cudaError_t status = BatchPrefillWithPagedKVCacheWrapper<page_storage, T, T, T, int32_t>(
       &baseline_handler, thrust::raw_pointer_cast(q_d.data()),
       thrust::raw_pointer_cast(qo_indptr_d.data()),
       /*q_offset=*/nullptr, paged_kv_baseline_d, thrust::raw_pointer_cast(o_baseline_d.data()),
@@ -444,7 +444,7 @@ void _TestTwoLevelSinglePrefixCascadeAppendCorrectness(size_t batch_size,
       << "Cascade implementation shared prefix prefill failed with error: "
       << cudaGetErrorString(status);
 
-  status = BatchPrefillWithPagedKVCacheWrapper<page_storage, T, T, int32_t>(
+  status = BatchPrefillWithPagedKVCacheWrapper<page_storage, T, T, T, int32_t>(
       &cascade_handler, thrust::raw_pointer_cast(q_d.data()),
       thrust::raw_pointer_cast(qo_indptr_d.data()),
       /*r_rope_position=*/nullptr, paged_kv_casacde_d,
