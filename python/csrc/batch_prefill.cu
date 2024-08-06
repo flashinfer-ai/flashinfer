@@ -205,9 +205,12 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
         return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
           paged_kv_t<PageStorage::kIndices, kv_type, int32_t> paged_kv(
               num_kv_heads, page_size, head_dim, batch_size, kv_layout_,
-              static_cast<kv_type*>(paged_kv_cache.has_value() ? paged_kv_cache->data_ptr() : nullptr),
-              static_cast<kv_type*>(paged_k_cache.has_value() ? paged_k_cache->data_ptr() : nullptr),
-              static_cast<kv_type*>(paged_v_cache.has_value() ? paged_v_cache->data_ptr() : nullptr),
+              static_cast<kv_type*>(paged_kv_cache.has_value() ? paged_kv_cache->data_ptr()
+                                                               : nullptr),
+              static_cast<kv_type*>(paged_k_cache.has_value() ? paged_k_cache->data_ptr()
+                                                              : nullptr),
+              static_cast<kv_type*>(paged_v_cache.has_value() ? paged_v_cache->data_ptr()
+                                                              : nullptr),
               static_cast<int32_t*>(paged_kv_indices.data_ptr()),
               static_cast<int32_t*>(paged_kv_indptr.data_ptr()),
               static_cast<int32_t*>(paged_kv_last_page_len.data_ptr()));
@@ -403,9 +406,12 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCu
         return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
           paged_kv_t<PageStorage::kIndices, kv_type, int32_t> paged_kv(
               num_kv_heads, page_size, head_dim, batch_size, kv_layout_,
-              static_cast<kv_type*>(paged_kv_cache.has_value() ? paged_kv_cache->data_ptr() : nullptr),
-              static_cast<kv_type*>(paged_k_cache.has_value() ? paged_k_cache->data_ptr() : nullptr),
-              static_cast<kv_type*>(paged_v_cache.has_value() ? paged_v_cache->data_ptr() : nullptr),
+              static_cast<kv_type*>(paged_kv_cache.has_value() ? paged_kv_cache->data_ptr()
+                                                               : nullptr),
+              static_cast<kv_type*>(paged_k_cache.has_value() ? paged_k_cache->data_ptr()
+                                                              : nullptr),
+              static_cast<kv_type*>(paged_v_cache.has_value() ? paged_v_cache->data_ptr()
+                                                              : nullptr),
               static_cast<int32_t*>(paged_kv_indices.data_ptr()),
               static_cast<int32_t*>(paged_kv_indptr.data_ptr()),
               static_cast<int32_t*>(paged_kv_last_page_len.data_ptr()));
@@ -592,11 +598,12 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
                       PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
                         return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
                           cudaError_t status = BatchPrefillWithRaggedKVCacheWrapperDispatched<
-                              HEAD_DIM, LOGITS_POST_HOOK, POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION,
-                              MASK_MODE, q_type, kv_type, q_type, int32_t>(
+                              HEAD_DIM, LOGITS_POST_HOOK, POS_ENCODING_MODE,
+                              ALLOW_FP16_QK_REDUCTION, MASK_MODE, q_type, kv_type, q_type, int32_t>(
                               handler_.get(), static_cast<q_type*>(q.data_ptr()),
                               static_cast<int32_t*>(qo_indptr.data_ptr()),
-                              static_cast<kv_type*>(k.data_ptr()), static_cast<kv_type*>(v.data_ptr()),
+                              static_cast<kv_type*>(k.data_ptr()),
+                              static_cast<kv_type*>(v.data_ptr()),
                               static_cast<int32_t*>(kv_indptr.data_ptr()),
                               /*custom_mask=*/nullptr, /*qk_indptr=*/nullptr,
                               /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr,
@@ -717,7 +724,8 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardC
                           static_cast<c_type*>(o.data_ptr()),
                           /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
                           num_qo_heads, num_kv_heads, q_stride_n, q_stride_h, kv_stride_n,
-                          kv_stride_h, window_left, logits_soft_cap, sm_scale, rope_scale, rope_theta,
+                          kv_stride_h, window_left, logits_soft_cap, sm_scale, rope_scale,
+                          rope_theta,
                           /*stream=*/torch_current_stream);
                       TORCH_CHECK(status == cudaSuccess,
                                   "BatchPrefillWithRaggedKVCache failed with error ",
@@ -742,7 +750,8 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardC
                             MASK_MODE, q_type, kv_type, q_type, int32_t>(
                             handler_.get(), static_cast<q_type*>(q.data_ptr()),
                             static_cast<int32_t*>(qo_indptr.data_ptr()),
-                            static_cast<kv_type*>(k.data_ptr()), static_cast<kv_type*>(v.data_ptr()),
+                            static_cast<kv_type*>(k.data_ptr()),
+                            static_cast<kv_type*>(v.data_ptr()),
                             static_cast<int32_t*>(kv_indptr.data_ptr()),
                             static_cast<uint8_t*>(custom_mask.data_ptr()),
                             static_cast<int32_t*>(qk_indptr.data_ptr()),
@@ -750,7 +759,8 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardC
                             static_cast<q_type*>(o.data_ptr()),
                             /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
                             num_qo_heads, num_kv_heads, q_stride_n, q_stride_h, kv_stride_n,
-                            kv_stride_h, window_left, logits_soft_cap, sm_scale, rope_scale, rope_theta,
+                            kv_stride_h, window_left, logits_soft_cap, sm_scale, rope_scale,
+                            rope_theta,
                             /*stream=*/torch_current_stream);
                         TORCH_CHECK(status == cudaSuccess,
                                     "BatchPrefillWithRaggedKVCache failed with error ",

@@ -178,9 +178,9 @@ def get_instantiation_cu() -> List[str]:
                     pos_encoding_mode,
                     allow_fp16_qk_reduction,
                     mask_mode,
-                    dtype, # dtype_q
-                    dtype_kv, # dtype_kv
-                    dtype, # dtype_out
+                    dtype,  # dtype_q
+                    dtype_kv,  # dtype_kv
+                    dtype,  # dtype_out
                 )
                 write_if_different(root / prefix / fname, content)
 
@@ -210,9 +210,9 @@ def get_instantiation_cu() -> List[str]:
                     pos_encoding_mode,
                     allow_fp16_qk_reduction,
                     mask_mode,
-                    dtype, # dtype_q
-                    dtype_kv, # dtype_kv
-                    dtype, # dtype_out
+                    dtype,  # dtype_q
+                    dtype_kv,  # dtype_kv
+                    dtype,  # dtype_out
                     idtype,
                 )
                 write_if_different(root / prefix / fname, content)
@@ -243,9 +243,9 @@ def get_instantiation_cu() -> List[str]:
                     pos_encoding_mode,
                     allow_fp16_qk_reduction,
                     mask_mode,
-                    dtype, # dtype_q
-                    dtype_kv, # dtype_kv
-                    dtype, # dtype_out
+                    dtype,  # dtype_q
+                    dtype_kv,  # dtype_kv
+                    dtype,  # dtype_out
                     idtype,
                 )
                 write_if_different(root / prefix / fname, content)

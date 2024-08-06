@@ -192,8 +192,9 @@ __device__ __forceinline__ void produce_kv(smem_t<swizzle_mode> smem, uint32_t* 
         *gptr += 8 * num_elems_per_128b<T>();
       }
       kv_idx += num_warps * 4;
-      *smem_offset = smem.template advance_offset_by_row<num_warps * 4, channel_size_128b_kv>(*smem_offset) -
-                     sizeof(T) * num_frags_y;
+      *smem_offset =
+          smem.template advance_offset_by_row<num_warps * 4, channel_size_128b_kv>(*smem_offset) -
+          sizeof(T) * num_frags_y;
       *gptr += num_warps * 4 * kv_stride_n - sizeof(T) * num_frags_y * num_elems_per_128b<T>();
     }
     *smem_offset -= num_warps_z * num_frags_z * 16 * channel_size_128b_kv;
@@ -204,7 +205,8 @@ __device__ __forceinline__ void produce_kv(smem_t<swizzle_mode> smem, uint32_t* 
 #pragma unroll
     for (uint32_t i = 0; i < num_frags_z * 2 / num_warps_x; ++i) {
       smem.load_128b_async<fill_mode>(*smem_offset, *gptr, kv_idx < kv_len);
-      *smem_offset = smem.template advance_offset_by_row<num_warps * 8, channel_size_128b_kv>(*smem_offset);
+      *smem_offset =
+          smem.template advance_offset_by_row<num_warps * 8, channel_size_128b_kv>(*smem_offset);
       kv_idx += num_warps * 8;
       *gptr += num_warps * 8 * kv_stride_n;
     }
@@ -240,8 +242,9 @@ __device__ __forceinline__ void page_produce_kv(smem_t<swizzle_mode> smem, uint3
         gptr += 8 * num_elems_per_128b<DType>();
       }
       kv_idx += num_warps * 4;
-      *smem_offset = smem.template advance_offset_by_row<num_warps * 4, channel_size_128b_kv>(*smem_offset) -
-                     sizeof(DType) * num_frags_y;
+      *smem_offset =
+          smem.template advance_offset_by_row<num_warps * 4, channel_size_128b_kv>(*smem_offset) -
+          sizeof(DType) * num_frags_y;
     }
     *smem_offset -= num_warps_z * num_frags_z * 16 * channel_size_128b_kv;
   } else {
@@ -253,7 +256,8 @@ __device__ __forceinline__ void page_produce_kv(smem_t<swizzle_mode> smem, uint3
       DType* gptr = produce_v ? paged_kv.v_data + kv_offset[i] : paged_kv.k_data + kv_offset[i];
       smem.load_128b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
       kv_idx += num_warps * 8;
-      *smem_offset = smem.template advance_offset_by_row<num_warps * 8, channel_size_128b_kv>(*smem_offset);
+      *smem_offset =
+          smem.template advance_offset_by_row<num_warps * 8, channel_size_128b_kv>(*smem_offset);
     }
     *smem_offset -= num_warps_z * num_frags_z * 16 * channel_size_128b_kv;
   }
@@ -333,8 +337,9 @@ __device__ __forceinline__ void load_q_global_smem(uint32_t packed_offset,
           q_smem_offset_w = q_smem->template advance_offset_by_column<8>(q_smem_offset_w, fyo);
           q_ptr += 8 * num_elems_per_128b<DTypeQ>();
         }
-        q_smem_offset_w = q_smem->template advance_offset_by_row<4, channel_size_128b_q>(q_smem_offset_w) -
-                          2 * num_frags_y;
+        q_smem_offset_w =
+            q_smem->template advance_offset_by_row<4, channel_size_128b_q>(q_smem_offset_w) -
+            2 * num_frags_y;
       }
     }
   }
@@ -500,8 +505,8 @@ __device__ __forceinline__ void k_smem_inplace_apply_rotary(const uint32_t kv_id
                                          rope_freq[fyi], kv_idx);
         k_smem->stmatrix_m8n8x4(k_smem_offset_r_last_half, k_frag_local[1]);
         k_smem->stmatrix_m8n8x4(k_smem_offset_r_first_half, k_frag_local[0]);
-        k_smem_offset_r_first_half =
-            k_smem->template advance_offset_by_column<2 * num_warps_x>(k_smem_offset_r_first_half, fyi);
+        k_smem_offset_r_first_half = k_smem->template advance_offset_by_column<2 * num_warps_x>(
+            k_smem_offset_r_first_half, fyi);
       }
       *k_smem_offset_r += 16 * channel_size_128b_kv;
       kv_idx += 16;
@@ -527,7 +532,8 @@ __device__ __forceinline__ void compute_qk(
 #pragma unroll
     for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
       q_smem->ldmatrix_m8n8x4(*q_smem_offset_r, a_frag[fx]);
-      *q_smem_offset_r = q_smem->template advance_offset_by_row<16, channel_size_128b_q>(*q_smem_offset_r);
+      *q_smem_offset_r =
+          q_smem->template advance_offset_by_row<16, channel_size_128b_q>(*q_smem_offset_r);
     }
 
     *q_smem_offset_r = q_smem->template advance_offset_by_column<2>(*q_smem_offset_r, fy) -
@@ -548,7 +554,8 @@ __device__ __forceinline__ void compute_qk(
       } else {
         k_smem->ldmatrix_m8n8x4(*k_smem_offset_r, b_frag);
       }
-      *k_smem_offset_r = k_smem->template advance_offset_by_row<16, channel_size_128b_kv>(*k_smem_offset_r);
+      *k_smem_offset_r =
+          k_smem->template advance_offset_by_row<16, channel_size_128b_kv>(*k_smem_offset_r);
 
 #pragma unroll
       for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
@@ -818,8 +825,9 @@ __device__ __forceinline__ void compute_sfm_v(smem_t<swizzle_mode>* v_smem,
         *v_smem_offset_r = v_smem->template advance_offset_by_column<2>(*v_smem_offset_r, fy);
       }
     }
-    *v_smem_offset_r = v_smem->template advance_offset_by_row<16, channel_size_128b_kv>(*v_smem_offset_r) -
-                       sizeof(DTypeKV) * num_frags_y;
+    *v_smem_offset_r =
+        v_smem->template advance_offset_by_row<16, channel_size_128b_kv>(*v_smem_offset_r) -
+        sizeof(DTypeKV) * num_frags_y;
   }
   *v_smem_offset_r -= 16 * num_frags_z * channel_size_128b_kv;
 }
@@ -1003,8 +1011,9 @@ __device__ __forceinline__ void write_o_reg_gmem(
           o_ptr += 8 * num_elems_per_128b<DTypeOut>();
           o_smem_offset_w = o_smem->template advance_offset_by_column<8>(o_smem_offset_w, fyo);
         }
-        o_smem_offset_w = o_smem->template advance_offset_by_row<4, channel_size_128b_out>(o_smem_offset_w) -
-                          2 * num_frags_y;
+        o_smem_offset_w =
+            o_smem->template advance_offset_by_row<4, channel_size_128b_out>(o_smem_offset_w) -
+            2 * num_frags_y;
       }
     }
   }
@@ -1449,13 +1458,15 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
                get_warp_idx_z<num_warps_x, num_warps_z>() * num_frags_z * 16 + lane_idx % 16,
                lane_idx / 16),
            kv_smem_offset_w = k_smem.get_permuted_offset<channel_size_128b_kv>(
-                                        warp_idx * kv_frag_rows + lane_idx / kv_frag_cols, lane_idx % kv_frag_cols);
+               warp_idx * kv_frag_rows + lane_idx / kv_frag_cols, lane_idx % kv_frag_cols);
 
   DTypeKV* k_ptr = k + qkv_info.get_kv_elem_offset(
-                           kv_indptr[request_idx] + chunk_start + warp_idx * kv_frag_rows + lane_idx / kv_frag_cols,
+                           kv_indptr[request_idx] + chunk_start + warp_idx * kv_frag_rows +
+                               lane_idx / kv_frag_cols,
                            kv_head_idx, (lane_idx % kv_frag_cols) * num_elems_per_128b<DTypeKV>());
   DTypeKV* v_ptr = v + qkv_info.get_kv_elem_offset(
-                           kv_indptr[request_idx] + chunk_start + warp_idx * kv_frag_rows + lane_idx / kv_frag_cols,
+                           kv_indptr[request_idx] + chunk_start + warp_idx * kv_frag_rows +
+                               lane_idx / kv_frag_cols,
                            kv_head_idx, (lane_idx % kv_frag_cols) * num_elems_per_128b<DTypeKV>());
 
   produce_kv<SharedMemFillMode::kNoFill, num_warps_x, num_warps_z, num_frags_y, num_frags_z>(
@@ -1705,7 +1716,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
       v_smem(smem + (num_warps_x * num_frags_x * sizeof(DTypeQ) +
                      num_warps_z * num_frags_z * sizeof(DTypeKV)) *
                         16 * head_dim);
-  size_t kv_offset[num_frags_z * 4 / num_warps_x];
+  size_t kv_offset[num_frags_z * (swizzle_mode_kv == SwizzleMode::k64B ? 4 : 2) / num_warps_x];
 
   uint32_t k_smem_offset_r = k_smem.get_permuted_offset<channel_size_128b_kv>(
                get_warp_idx_z<num_warps_x, num_warps_z>() * num_frags_z * 16 + 8 * (lane_idx / 16) +
@@ -1715,20 +1726,22 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
                get_warp_idx_z<num_warps_x, num_warps_z>() * num_frags_z * 16 + lane_idx % 16,
                lane_idx / 16),
            kv_smem_offset_w = k_smem.get_permuted_offset<channel_size_128b_kv>(
-                                        warp_idx * kv_frag_rows + lane_idx / kv_frag_cols, lane_idx % kv_frag_cols);
+               warp_idx * kv_frag_rows + lane_idx / kv_frag_cols, lane_idx % kv_frag_cols);
   const IdType last_indptr = paged_kv.indptr[paged_kv.batch_size];
 
   uint32_t packed_page_iter_base = paged_kv.indptr[request_idx] * paged_kv.page_size + chunk_start;
 #pragma unroll
-  for (uint32_t i = 0; i < num_frags_z * 4 / num_warps_x; ++i) {
+  for (uint32_t i = 0;
+       i < num_frags_z * (swizzle_mode_kv == SwizzleMode::k64B ? 4 : 2) / num_warps_x; ++i) {
     uint32_t page_iter, entry_idx;
-    paged_kv.page_size.divmod(
-        packed_page_iter_base + warp_idx * 4 + lane_idx / 8 + 4 * num_warps_x * num_warps_z * i,
-        page_iter, entry_idx);
+    paged_kv.page_size.divmod(packed_page_iter_base + warp_idx * kv_frag_rows +
+                                  lane_idx / kv_frag_cols +
+                                  kv_frag_rows * num_warps_x * num_warps_z * i,
+                              page_iter, entry_idx);
     kv_offset[i] =
         page_iter < last_indptr
             ? paged_kv.get_elem_offset(__ldg(paged_kv.indices + page_iter), kv_head_idx, entry_idx,
-                                       (lane_idx % 8) * num_elems_per_128b<DTypeKV>())
+                                       (lane_idx % kv_frag_cols) * num_elems_per_128b<DTypeKV>())
             : 0;
   }
   page_produce_kv<false, num_warps_x, num_warps_z, num_frags_y, num_frags_z>(
@@ -1764,16 +1777,18 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
   for (uint32_t iter = 0; iter < num_iterations; ++iter) {
     packed_page_iter_base += 16 * num_warps_z * num_frags_z;
 #pragma unroll
-    for (uint32_t i = 0; i < num_frags_z * 4 / num_warps_x; ++i) {
+    for (uint32_t i = 0;
+         i < num_frags_z * (swizzle_mode_kv == SwizzleMode::k64B ? 4 : 2) / num_warps_x; ++i) {
       uint32_t page_iter, entry_idx;
-      paged_kv.page_size.divmod(
-          packed_page_iter_base + warp_idx * 4 + lane_idx / 8 + 4 * num_warps_x * num_warps_z * i,
-          page_iter, entry_idx);
-      kv_offset[i] =
-          page_iter < last_indptr
-              ? paged_kv.get_elem_offset(__ldg(paged_kv.indices + page_iter), kv_head_idx,
-                                         entry_idx, (lane_idx % 8) * num_elems_per_128b<DTypeKV>())
-              : 0;
+      paged_kv.page_size.divmod(packed_page_iter_base + warp_idx * kv_frag_rows +
+                                    lane_idx / kv_frag_cols +
+                                    kv_frag_rows * num_warps_x * num_warps_z * i,
+                                page_iter, entry_idx);
+      kv_offset[i] = page_iter < last_indptr
+                         ? paged_kv.get_elem_offset(
+                               __ldg(paged_kv.indices + page_iter), kv_head_idx, entry_idx,
+                               (lane_idx % kv_frag_cols) * num_elems_per_128b<DTypeKV>())
+                         : 0;
     }
     cp_async::wait_group<1>();
     block.sync();

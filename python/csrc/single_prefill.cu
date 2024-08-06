@@ -87,8 +87,8 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
                       PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
                         cudaError_t status =
                             SinglePrefillWithKVCacheDispatched<HEAD_DIM, LOGITS_POST_HOOK,
-                                                              POS_ENCODING_MODE,
-                                                              ALLOW_FP16_QK_REDUCTION, MASK_MODE>(
+                                                               POS_ENCODING_MODE,
+                                                               ALLOW_FP16_QK_REDUCTION, MASK_MODE>(
                                 static_cast<c_type*>(q.data_ptr()),
                                 static_cast<c_type*>(k.data_ptr()),
                                 static_cast<c_type*>(v.data_ptr()),
@@ -118,19 +118,18 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
                   allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
                     return DISPATCH_pos_encoding_mode(
                         PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
-                          cudaError_t status =
-                              SinglePrefillWithKVCacheDispatched<HEAD_DIM, LOGITS_POST_HOOK,
-                                                                POS_ENCODING_MODE,
-                                                                ALLOW_FP16_QK_REDUCTION, MASK_MODE>(
-                                  static_cast<q_type*>(q.data_ptr()),
-                                  static_cast<kv_type*>(k.data_ptr()),
-                                  static_cast<kv_type*>(v.data_ptr()),
-                                  /*custom_mask=*/nullptr, static_cast<q_type*>(o.data_ptr()),
-                                  static_cast<q_type*>(tmp.data_ptr()),
-                                  /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                                  num_qo_heads, num_kv_heads, qo_len, kv_len, q_stride_n, q_stride_h,
-                                  kv_stride_n, kv_stride_h, window_left, logits_soft_cap, sm_scale,
-                                  rope_scale, rope_theta, torch_current_stream);
+                          cudaError_t status = SinglePrefillWithKVCacheDispatched<
+                              HEAD_DIM, LOGITS_POST_HOOK, POS_ENCODING_MODE,
+                              ALLOW_FP16_QK_REDUCTION, MASK_MODE>(
+                              static_cast<q_type*>(q.data_ptr()),
+                              static_cast<kv_type*>(k.data_ptr()),
+                              static_cast<kv_type*>(v.data_ptr()),
+                              /*custom_mask=*/nullptr, static_cast<q_type*>(o.data_ptr()),
+                              static_cast<q_type*>(tmp.data_ptr()),
+                              /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
+                              num_qo_heads, num_kv_heads, qo_len, kv_len, q_stride_n, q_stride_h,
+                              kv_stride_n, kv_stride_h, window_left, logits_soft_cap, sm_scale,
+                              rope_scale, rope_theta, torch_current_stream);
                           TORCH_CHECK(status == cudaSuccess,
                                       "SinglePrefillWithKVCache kernel launch failed, error: " +
                                           std::string(cudaGetErrorString(status)));
@@ -217,19 +216,17 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache_custom_mask(
               allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, [&] {
                 return DISPATCH_pos_encoding_mode(
                     PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
-                      cudaError_t status =
-                          SinglePrefillWithKVCacheDispatched<HEAD_DIM, LOGITS_POST_HOOK,
-                                                            POS_ENCODING_MODE,
-                                                            ALLOW_FP16_QK_REDUCTION, MASK_MODE>(
-                              static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
-                              static_cast<c_type*>(v.data_ptr()),
-                              static_cast<uint8_t*>(packed_custom_mask.data_ptr()),
-                              static_cast<c_type*>(o.data_ptr()),
-                              static_cast<c_type*>(tmp.data_ptr()),
-                              /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                              num_qo_heads, num_kv_heads, qo_len, kv_len, q_stride_n, q_stride_h,
-                              kv_stride_n, kv_stride_h, window_left, logits_soft_cap, sm_scale,
-                              rope_scale, rope_theta, torch_current_stream);
+                      cudaError_t status = SinglePrefillWithKVCacheDispatched<
+                          HEAD_DIM, LOGITS_POST_HOOK, POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION,
+                          MASK_MODE>(
+                          static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
+                          static_cast<c_type*>(v.data_ptr()),
+                          static_cast<uint8_t*>(packed_custom_mask.data_ptr()),
+                          static_cast<c_type*>(o.data_ptr()), static_cast<c_type*>(tmp.data_ptr()),
+                          /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
+                          num_qo_heads, num_kv_heads, qo_len, kv_len, q_stride_n, q_stride_h,
+                          kv_stride_n, kv_stride_h, window_left, logits_soft_cap, sm_scale,
+                          rope_scale, rope_theta, torch_current_stream);
                       TORCH_CHECK(status == cudaSuccess,
                                   "SinglePrefillWithKVCache kernel launch failed, error: " +
                                       std::string(cudaGetErrorString(status)));
@@ -250,9 +247,10 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache_custom_mask(
                       PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
                         cudaError_t status =
                             SinglePrefillWithKVCacheDispatched<HEAD_DIM, LOGITS_POST_HOOK,
-                                                              POS_ENCODING_MODE,
-                                                              ALLOW_FP16_QK_REDUCTION, MASK_MODE>(
-                                static_cast<q_type*>(q.data_ptr()), static_cast<kv_type*>(k.data_ptr()),
+                                                               POS_ENCODING_MODE,
+                                                               ALLOW_FP16_QK_REDUCTION, MASK_MODE>(
+                                static_cast<q_type*>(q.data_ptr()),
+                                static_cast<kv_type*>(k.data_ptr()),
                                 static_cast<kv_type*>(v.data_ptr()),
                                 static_cast<uint8_t*>(packed_custom_mask.data_ptr()),
                                 static_cast<q_type*>(o.data_ptr()),

@@ -77,7 +77,7 @@ void bench_flashinfer_batch_prefill_with_ragged_kv(nvbench::state& state) {
   state.exec(nvbench::exec_tag::timer, [&](nvbench::launch& launch, auto& timer) {
     timer.start();
     cudaError_t status;
-    status = BatchPrefillWithRaggedKVCacheWrapper<dtype_in, dtype_out, int32_t>(
+    status = BatchPrefillWithRaggedKVCacheWrapper<dtype_in, dtype_in, dtype_out, int32_t>(
         &handler, thrust::raw_pointer_cast(Q.data()), thrust::raw_pointer_cast(qo_indptr_d.data()),
         thrust::raw_pointer_cast(K.data()), thrust::raw_pointer_cast(V.data()),
         thrust::raw_pointer_cast(kv_indptr_d.data()),
