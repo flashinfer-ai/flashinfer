@@ -33,6 +33,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("sampling_from_probs", &sampling_from_probs, "Sample from probabilities");
   m.def("top_k_sampling_from_probs", &top_k_sampling_from_probs,
         "Top-k sampling from probabilities");
+  m.def("min_p_sampling_from_probs", &min_p_sampling_from_probs,
+        "Min-p sampling from probabilities");
   m.def("top_p_sampling_from_probs", &top_p_sampling_from_probs,
         "Top-p sampling from probabilities");
   m.def("top_k_top_p_sampling_from_probs", &top_k_top_p_sampling_from_probs,
