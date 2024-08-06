@@ -512,7 +512,7 @@ __device__ __forceinline__ void compute_qk(smem_t* q_smem, uint32_t* q_smem_offs
         }
         b_frag_f8[0] = frag_layout_swizzle_16b_to_8b(b_frag_f8[0]);
         b_frag_f8[1] = frag_layout_swizzle_16b_to_8b(b_frag_f8[1]);
-        vec_cast<DTypeQ, DTypeKV, 8>((DTypeQ*)b_frag, (DTypeKV*)b_frag_f8);
+        vec_cast<DTypeQ, DTypeKV>::cast<8>((DTypeQ*)b_frag, (DTypeKV*)b_frag_f8);
       } else {
         k_smem->ldmatrix_m8n8x4(*k_smem_offset_r, b_frag);
       }
@@ -731,7 +731,7 @@ __device__ __forceinline__ void compute_sfm_v(smem_t* v_smem, uint32_t* v_smem_o
     for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
       for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
-        vec_cast<DTypeQ, float, 8>(s_frag_f16[fx][fz], s_frag[fx][fz]);
+        vec_cast<DTypeQ, float>::cast<8>(s_frag_f16[fx][fz], s_frag[fx][fz]);
       }
     }
   }
@@ -763,7 +763,7 @@ __device__ __forceinline__ void compute_sfm_v(smem_t* v_smem, uint32_t* v_smem_o
         b_frag_f8[0] = frag_layout_swizzle_16b_to_8b_trans(b_frag_f8[0]);
         b_frag_f8[1] = frag_layout_swizzle_16b_to_8b_trans(b_frag_f8[1]);
         bfly_exch(b_frag_f8[0], b_frag_f8[1]);
-        vec_cast<DTypeQ, DTypeKV, 8>((DTypeQ*)b_frag, (DTypeKV*)b_frag_f8);
+        vec_cast<DTypeQ, DTypeKV>::cast<8>((DTypeQ*)b_frag, (DTypeKV*)b_frag_f8);
       } else {
         v_smem->ldmatrix_m8n8x4_trans(*v_smem_offset_r, b_frag);
       }
@@ -933,7 +933,7 @@ __device__ __forceinline__ void write_o_reg_gmem(
 #pragma unroll
       for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
         uint32_t o_frag_f16[4];
-        vec_cast<DTypeOut, float, 8>((DTypeOut*)o_frag_f16, o_frag[fx][fy]);
+        vec_cast<DTypeOut, float>::cast<8>((DTypeOut*)o_frag_f16, o_frag[fx][fy]);
 #ifdef FLASHINFER_STMATRIX_M8N8X4_ENABLED
         uint32_t o_smem_offset_w = smem_t::get_permuted_offset<channel_size_128b_out>(
             (warp_idx_x * num_frags_x + fx) * 16 + lane_idx % 16, fy * 2 + lane_idx / 16);

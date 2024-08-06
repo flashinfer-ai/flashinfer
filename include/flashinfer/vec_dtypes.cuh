@@ -31,6 +31,157 @@ namespace flashinfer {
 
 #define FLASHINFER_INLINE inline __attribute__((always_inline)) __device__
 
+/******************* vec_t type cast *******************/
+
+template <typename dst_t, typename src_t>
+struct vec_cast {
+  template <size_t vec_size>
+  FLASHINFER_INLINE static void cast(dst_t* dst, const src_t* src) {
+#pragma unroll
+    for (size_t i = 0; i < vec_size; ++i) {
+      dst[i] = (dst_t)src[i];
+    }
+  }
+};
+
+template <>
+struct vec_cast<float, half> {
+  template <size_t vec_size>
+  FLASHINFER_INLINE static void cast(float* dst, const half* src) {
+    if constexpr (vec_size == 1) {
+      dst[0] = (float)src[0];
+    } else {
+#pragma unroll
+      for (size_t i = 0; i < vec_size / 2; ++i) {
+        ((float2*)dst)[i] = __half22float2(((half2*)src)[i]);
+      }
+    }
+  }
+};
+
+template <>
+struct vec_cast<half, float> {
+  template <size_t vec_size>
+  FLASHINFER_INLINE static void cast(half* dst, const float* src) {
+    if constexpr (vec_size == 1) {
+      dst[0] = __float2half(src[0]);
+    } else {
+#pragma unroll
+      for (size_t i = 0; i < vec_size / 2; ++i) {
+        ((half2*)dst)[i] = __float22half2_rn(((float2*)src)[i]);
+      }
+    }
+  }
+};
+
+#if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 890))
+template <>
+struct vec_cast<__nv_fp8_e4m3, half> {
+  template <size_t vec_size>
+  FLASHINFER_INLINE static void cast(__nv_fp8_e4m3* dst, const half* src) {
+    if constexpr (vec_size == 1) {
+      dst[0] = __nv_fp8_e4m3(src[0]);
+    } else {
+#pragma unroll
+      for (size_t i = 0; i < vec_size / 2; ++i) {
+        uint16_t y;
+        uint32_t x = *(uint32_t*)&src[i * 2];
+        asm volatile("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(y) : "r"(x));
+        *(uint16_t*)&dst[i * 2] = y;
+      }
+    }
+  }
+};
+
+template <>
+struct vec_cast<__nv_fp8_e5m2, half> {
+  template <size_t vec_size>
+  FLASHINFER_INLINE static void cast(__nv_fp8_e5m2* dst, const half* src) {
+    if constexpr (vec_size == 1) {
+      dst[0] = __nv_fp8_e5m2(src[0]);
+    } else {
+#pragma unroll
+      for (size_t i = 0; i < vec_size / 2; ++i) {
+        uint16_t y;
+        uint32_t x = *(uint32_t*)&src[i * 2];
+        asm volatile("cvt.rn.satfinite.e5m2x2.f16x2 %0, %1;" : "=h"(y) : "r"(x));
+        *(uint16_t*)&dst[i * 2] = y;
+      }
+    }
+  }
+};
+
+template <>
+struct vec_cast<half, __nv_fp8_e4m3> {
+  template <size_t vec_size>
+  FLASHINFER_INLINE static void cast(half* dst, const __nv_fp8_e4m3* src) {
+    if constexpr (vec_size == 1) {
+      dst[0] = half(src[0]);
+    } else {
+#pragma unroll
+      for (size_t i = 0; i < vec_size / 2; ++i) {
+        uint32_t y;
+        uint16_t x = *(uint16_t*)&src[i * 2];
+        asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(y) : "h"(x));
+        *(uint32_t*)&dst[i * 2] = y;
+      }
+    }
+  }
+};
+
+template <>
+struct vec_cast<half, __nv_fp8_e5m2> {
+  template <size_t vec_size>
+  FLASHINFER_INLINE static void cast(half* dst, const __nv_fp8_e5m2* src) {
+    if constexpr (vec_size == 1) {
+      dst[0] = half(src[0]);
+    } else {
+#pragma unroll
+      for (size_t i = 0; i < vec_size / 2; ++i) {
+        uint32_t y;
+        uint16_t x = *(uint16_t*)&src[i * 2];
+        asm volatile("cvt.rn.f16x2.e5m2x2 %0, %1;" : "=r"(y) : "h"(x));
+        *(uint32_t*)&dst[i * 2] = y;
+      }
+    }
+  }
+};
+
+#endif  // !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 890)
+
+#ifdef FLASHINFER_ENABLE_BF16
+
+template <>
+struct vec_cast<float, nv_bfloat16> {
+  template <size_t vec_size>
+  FLASHINFER_INLINE static void cast(float* dst, const nv_bfloat16* src) {
+    if constexpr (vec_size == 1) {
+      dst[0] = (float)src[0];
+    } else {
+#pragma unroll
+      for (size_t i = 0; i < vec_size / 2; ++i) {
+        ((float2*)dst)[i] = __bfloat1622float2(((nv_bfloat162*)src)[i]);
+      }
+    }
+  }
+};
+
+template <>
+struct vec_cast<nv_bfloat16, float> {
+  template <size_t vec_size>
+  FLASHINFER_INLINE static void cast(nv_bfloat16* dst, const float* src) {
+    if constexpr (vec_size == 1) {
+      dst[0] = nv_bfloat16(src[0]);
+    } else {
+#pragma unroll
+      for (size_t i = 0; i < vec_size / 2; ++i) {
+        ((nv_bfloat162*)dst)[i] = __float22bfloat162_rn(((float2*)src)[i]);
+      }
+    }
+  }
+};
+#endif  // FLASHINFER_ENABLE_BF16
+
 template <typename float_t, size_t vec_size>
 struct vec_t {
   FLASHINFER_INLINE float_t& operator[](size_t i);
@@ -51,10 +202,8 @@ struct vec_t {
 template <typename src_float_t, typename tgt_float_t, size_t vec_size>
 FLASHINFER_INLINE void cast_from_impl(vec_t<tgt_float_t, vec_size>& dst,
                                       const vec_t<src_float_t, vec_size>& src) {
-#pragma unroll
-  for (size_t i = 0; i < vec_size; ++i) {
-    dst[i] = tgt_float_t(src[i]);
-  }
+  vec_cast<tgt_float_t, src_float_t>::cast<vec_size>(
+      dst.ptr(), const_cast<vec_t<src_float_t, vec_size>*>(&src)->ptr());
 }
 
 template <typename src_float_t, typename tgt_float_t, size_t vec_size>
@@ -1043,286 +1192,6 @@ struct vec_t<float, vec_size> {
     }
   }
 };
-
-/******************* vec_t type cast *******************/
-
-template <typename dst_t, typename src_t, size_t vec_size>
-FLASHINFER_INLINE void vec_cast(dst_t* dst, const src_t* src) {
-#pragma unroll
-  for (size_t i = 0; i < vec_size; ++i) {
-    dst[i] = (dst_t)src[i];
-  }
-}
-
-template <size_t vec_size>
-FLASHINFER_INLINE void vec_cast<float, half>(float* dst, const half* src) {
-#pragma unroll
-  for (size_t i = 0; i < vec_size / 2; ++i) {
-    ((float2*)dst)[i] = __half22float2(((half2*)src)[i]);
-  }
-}
-
-template <size_t vec_size>
-FLASHINFER_INLINE void vec_cast<half, float>(half* dst, const float* src) {
-#pragma unroll
-  for (size_t i = 0; i < vec_size / 2; ++i) {
-    ((half2*)dst)[i] = __float22half2_rn(((float2*)src)[i]);
-  }
-}
-
-#if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 890))
-template <size_t vec_size>
-FLASHINFER_INLINE void vec_cast<__nv_fp8_e4m3, half>(__nv_fp8_e4m3* dst, const half* src) {
-  if constexpr (vec_size == 1) {
-    dst[0] = __nv_fp8_e4m3(src[0]);
-  } else {
-#pragma unroll
-    for (size_t i = 0; i < vec_size / 2; ++i) {
-      asm volatile("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;"
-                   : "=h"(*(__nv_fp8x2_e4m3*)&dst[i * 2])
-                   : "r"(*(half2*)&src[i * 2]));
-    }
-  }
-}
-
-template <size_t vec_size>
-FLASHINFER_INLINE void vec_cast<__nv_fp8_e5m2, half>(__nv_fp8_e5m2* dst, const half* src) {
-  if constexpr (vec_size == 1) {
-    dst[0] = __nv_fp8_e5m2(src[0]);
-  } else {
-#pragma unroll
-    for (size_t i = 0; i < vec_size / 2; ++i) {
-      asm volatile("cvt.rn.satfinite.e5m2x2.f16x2 %0, %1;"
-                   : "=h"(*(__nv_fp8x2_e5m2*)&dst[i * 2])
-                   : "r"(*(half2*)&src[i * 2]));
-    }
-  }
-}
-
-template <size_t vec_size>
-FLASHINFER_INLINE void vec_cast<half, __nv_fp8_e4m3>(half* dst, const __nv_fp8_e4m3* src) {
-  if constexpr (vec_size == 1) {
-    dst[0] = half(src[0]);
-  } else {
-#pragma unroll
-    for (size_t i = 0; i < vec_size / 2; ++i) {
-      asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;"
-                   : "=h"(*(half2*)&dst[i * 2])
-                   : "r"(*(__nv_fp8x2_e4m3*)&src[i * 2]));
-    }
-  }
-}
-
-template <size_t vec_size>
-FLASHINFER_INLINE void vec_cast<half, __nv_fp8_e5m2>(half* dst, const __nv_fp8_e5m2* src) {
-  if constexpr (vec_size == 1) {
-    dst[0] = half(src[0]);
-  } else {
-#pragma unroll
-    for (size_t i = 0; i < vec_size / 2; ++i) {
-      asm volatile("cvt.rn.f16x2.e5m2x2 %0, %1;"
-                   : "=h"(*(half2*)&dst[i * 2])
-                   : "r"(*(__nv_fp8x2_e5m2*)&src[i * 2]));
-    }
-  }
-}
-#endif
-
-#ifdef FLASHINFER_ENABLE_BF16
-template <size_t vec_size>
-FLASHINFER_INLINE void vec_cast<float, nv_bfloat16>(float* dst, const nv_bfloat16* src) {
-#pragma unroll
-  for (size_t i = 0; i < vec_size / 2; ++i) {
-    ((float2*)dst)[i] = __bfloat1622float2(((nv_bfloat162*)src)[i]);
-  }
-}
-
-template <size_t vec_size>
-FLASHINFER_INLINE void vec_cast<nv_bfloat16, float>(nv_bfloat16* dst, const float* src) {
-#pragma unroll
-  for (size_t i = 0; i < vec_size / 2; ++i) {
-    ((nv_bfloat162*)dst)[i] = __float22bfloat162_rn(((float2*)src)[i]);
-  }
-}
-#endif
-
-template <size_t vec_size>
-FLASHINFER_INLINE void cast_from_impl(vec_t<float, vec_size>& dst,
-                                      const vec_t<half, vec_size>& src) {
-  if constexpr (vec_size == 1) {
-    dst.data = float(src.data);
-  } else {
-#pragma unroll
-    for (size_t i = 0; i < vec_size / 2; ++i) {
-      ((float2*)(&dst.data))[i] = __half22float2(((half2*)(&src.data))[i]);
-    }
-  }
-}
-
-template <size_t vec_size>
-FLASHINFER_INLINE void cast_from_impl(vec_t<half, vec_size>& dst,
-                                      const vec_t<float, vec_size>& src) {
-  if constexpr (vec_size == 1) {
-    dst.data = half(src.data);
-  } else {
-#pragma unroll
-    for (size_t i = 0; i < vec_size / 2; ++i) {
-      ((half2*)(&dst.data))[i] = __float22half2_rn(((float2*)(&src.data))[i]);
-    }
-  }
-}
-
-#ifdef FLASHINFER_ENABLE_BF16
-template <size_t vec_size>
-FLASHINFER_INLINE void cast_from_impl(vec_t<float, vec_size>& dst,
-                                      const vec_t<nv_bfloat16, vec_size>& src) {
-  if constexpr (vec_size == 1) {
-    dst.data = float(src.data);
-  } else {
-#pragma unroll
-    for (size_t i = 0; i < vec_size / 2; ++i) {
-      ((float2*)(&dst.data))[i] = __bfloat1622float2(((nv_bfloat162*)(&src.data))[i]);
-    }
-  }
-}
-
-template <size_t vec_size>
-FLASHINFER_INLINE void cast_from_impl(vec_t<nv_bfloat16, vec_size>& dst,
-                                      const vec_t<float, vec_size>& src) {
-  if constexpr (vec_size == 1) {
-    dst.data = nv_bfloat16(src.data);
-  } else {
-#pragma unroll
-    for (size_t i = 0; i < vec_size / 2; ++i) {
-      ((nv_bfloat162*)(&dst.data))[i] = __float22bfloat162_rn(((float2*)(&src.data))[i]);
-    }
-  }
-}
-#endif
-
-#ifdef FLASHINFER_ENABLE_FP8
-
-template <size_t vec_size>
-FLASHINFER_INLINE void cast_from_impl(vec_t<float, vec_size>& dst,
-                                      const vec_t<__nv_fp8_e4m3, vec_size>& src) {
-  if constexpr (vec_size == 1) {
-    dst.data = float(src.data);
-  } else if constexpr (vec_size == 2) {
-    *(float2*)(&dst.data) = float2(*(__nv_fp8x2_e4m3*)(&src.data));
-  } else {
-#pragma unroll
-    for (size_t i = 0; i < vec_size / 4; ++i) {
-      ((float4*)(&dst.data))[i] = float4(((__nv_fp8x4_e4m3*)(&src.data))[i]);
-    }
-  }
-}
-
-template <size_t vec_size>
-FLASHINFER_INLINE void cast_from_impl(vec_t<half, vec_size>& dst,
-                                      const vec_t<__nv_fp8_e4m3, vec_size>& src) {
-  if constexpr (vec_size == 1) {
-    dst.data = float(src.data);
-  } else {
-#pragma unroll
-    for (size_t i = 0; i < vec_size / 2; ++i) {
-      ((half2*)(&dst.data))[i] = half2(((__nv_fp8x2_e4m3*)(&src.data))[i]);
-    }
-  }
-}
-
-template <size_t vec_size>
-FLASHINFER_INLINE void cast_from_impl(vec_t<__nv_fp8_e4m3, vec_size>& dst,
-                                      const vec_t<float, vec_size>& src) {
-  if constexpr (vec_size == 1) {
-    dst.data = __nv_fp8_e4m3(src.data);
-  } else if constexpr (vec_size == 2) {
-    *(__nv_fp8x2_e4m3*)(&dst.data) = __nv_fp8x2_e4m3(*(float2*)(&src.data));
-  } else {
-#pragma unroll
-    for (size_t i = 0; i < vec_size / 4; ++i) {
-      ((__nv_fp8x4_e4m3*)(&dst.data))[i] = __nv_fp8x4_e4m3(((float4*)(&src.data))[i]);
-    }
-  }
-}
-
-template <size_t vec_size>
-FLASHINFER_INLINE void cast_from_impl(vec_t<__nv_fp8_e4m3, vec_size>& dst,
-                                      const vec_t<half, vec_size>& src) {
-  if constexpr (vec_size == 1) {
-    dst.data = __nv_fp8_e4m3(src.data);
-  } else if constexpr (vec_size == 2) {
-    *(__nv_fp8x2_e4m3*)(&dst.data) = __nv_fp8x2_e4m3(*(half2*)(&src.data));
-  } else {
-#pragma unroll
-    for (size_t i = 0; i < vec_size / 4; ++i) {
-      // NOTE(Zihao): need to double check if we properly handle flo and fhi
-      ((__nv_fp8x4_e4m3*)(&dst.data))[i] =
-          __nv_fp8x4_e4m3(((half2*)(&src.data))[i * 2], ((half2*)(&src.data))[i * 2 + 1]);
-    }
-  }
-}
-
-template <size_t vec_size>
-FLASHINFER_INLINE void cast_from_impl(vec_t<float, vec_size>& dst,
-                                      const vec_t<__nv_fp8_e5m2, vec_size>& src) {
-  if constexpr (vec_size == 1) {
-    dst.data = float(src.data);
-  } else if constexpr (vec_size == 2) {
-    *(float2*)(&dst.data) = float2(*(__nv_fp8x2_e5m2*)(&src.data));
-  } else {
-#pragma unroll
-    for (size_t i = 0; i < vec_size / 4; ++i) {
-      ((float4*)(&dst.data))[i] = float4(((__nv_fp8x4_e5m2*)(&src.data))[i]);
-    }
-  }
-}
-
-template <size_t vec_size>
-FLASHINFER_INLINE void cast_from_impl(vec_t<half, vec_size>& dst,
-                                      const vec_t<__nv_fp8_e5m2, vec_size>& src) {
-  if constexpr (vec_size == 1) {
-    dst.data = float(src.data);
-  } else {
-#pragma unroll
-    for (size_t i = 0; i < vec_size / 2; ++i) {
-      ((half2*)(&dst.data))[i] = half2(((__nv_fp8x2_e5m2*)(&src.data))[i]);
-    }
-  }
-}
-
-template <size_t vec_size>
-FLASHINFER_INLINE void cast_from_impl(vec_t<__nv_fp8_e5m2, vec_size>& dst,
-                                      const vec_t<float, vec_size>& src) {
-  if constexpr (vec_size == 1) {
-    dst.data = __nv_fp8_e5m2(src.data);
-  } else if constexpr (vec_size == 2) {
-    *(__nv_fp8x2_e5m2*)(&dst.data) = __nv_fp8x2_e5m2(*(float2*)(&src.data));
-  } else {
-#pragma unroll
-    for (size_t i = 0; i < vec_size / 4; ++i) {
-      ((__nv_fp8x4_e5m2*)(&dst.data))[i] = __nv_fp8x4_e5m2(((float4*)(&src.data))[i]);
-    }
-  }
-}
-
-template <size_t vec_size>
-FLASHINFER_INLINE void cast_from_impl(vec_t<__nv_fp8_e5m2, vec_size>& dst,
-                                      const vec_t<half, vec_size>& src) {
-  if constexpr (vec_size == 1) {
-    dst.data = __nv_fp8_e5m2(src.data);
-  } else if constexpr (vec_size == 2) {
-    *(__nv_fp8x2_e5m2*)(&dst.data) = __nv_fp8x2_e5m2(*(half2*)(&src.data));
-  } else {
-#pragma unroll
-    for (size_t i = 0; i < vec_size / 4; ++i) {
-      // NOTE(Zihao): need to double check if we properly handle flo and fhi
-      ((__nv_fp8x4_e5m2*)(&dst.data))[i] =
-          __nv_fp8x4_e5m2(((half2*)(&src.data))[i * 2], ((half2*)(&src.data))[i * 2 + 1]);
-    }
-  }
-}
-
-#endif  // FLASHINFER_ENABLE_FP8
 
 }  // namespace flashinfer
 
