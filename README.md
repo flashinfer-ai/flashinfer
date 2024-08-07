@@ -51,11 +51,11 @@ cd flashinfer/python
 pip install -e .
 ```
 
-when building and testing on A100:
+to reduce binary size during build and testing:
 ```bash
 git clone https://github.com/flashinfer-ai/flashinfer.git --recursive
 cd flashinfer/python
-# workaround for undefined symbol `__gmon_start__' on A100
+# ref https://pytorch.org/docs/stable/generated/torch.cuda.get_device_capability.html#torch.cuda.get_device_capability
 export TORCH_CUDA_ARCH_LIST=8.0
 pip install -e .
 ```
