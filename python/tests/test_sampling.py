@@ -195,10 +195,12 @@ def test_top_k_renorm_prob(batch_size, vocab_size, k):
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
 @pytest.mark.parametrize("num_speculate_tokens", [1, 3, 5, 7])
+@pytest.mark.parametrize("onehot_target", [False, True])
 def test_chain_speculative_sampling(
     batch_size,
     vocab_size,
     num_speculate_tokens,
+    onehot_target,
 ):
     pre_norm_draft_prob = torch.rand(batch_size, num_speculate_tokens, vocab_size).to(0)
     normalized_draft_prob = pre_norm_draft_prob / pre_norm_draft_prob.sum(
@@ -208,12 +210,22 @@ def test_chain_speculative_sampling(
         0
     )
     uniform_samples = torch.empty(batch_size, num_speculate_tokens + 1).to(0)
-    pre_norm_target_prob = torch.rand(
-        batch_size, num_speculate_tokens + 1, vocab_size
-    ).to(0)
-    normalized_target_prob = pre_norm_target_prob / pre_norm_target_prob.sum(
-        dim=-1, keepdim=True
-    )
+    if not onehot_target:
+        pre_norm_target_prob = torch.rand(
+            batch_size, num_speculate_tokens + 1, vocab_size
+        ).to(0)
+        target_onehot_prob = pre_norm_target_prob / pre_norm_target_prob.sum(
+            dim=-1, keepdim=True
+        )
+    else:
+        target_token_ids = torch.randint(
+            vocab_size, (batch_size, num_speculate_tokens + 1)
+        ).to(0)
+        target_token_ids[..., :num_speculate_tokens] = draft_token_ids
+        target_onehot_prob = torch.zeros(
+            (batch_size, num_speculate_tokens + 1, vocab_size)
+        ).to(0)
+        target_onehot_prob.scatter_(2, target_token_ids.unsqueeze(-1), 1)
 
     # NOTE(Zihao): this is a very simple test that only checks whether output is valid or not.
     for trials in range(10):
@@ -222,18 +234,21 @@ def test_chain_speculative_sampling(
             normalized_draft_prob,
             draft_token_ids,
             uniform_samples,
-            normalized_target_prob,
+            target_onehot_prob,
         )
-        assert torch.all(output_token_ids[output_token_ids >= 0] < vocab_size)
-        assert output_token_ids.shape == (batch_size, num_speculate_tokens + 1)
-        matches = output_token_ids[..., :-1] != draft_token_ids
-        for row in range(batch_size):
-            mismatch_idx = torch.nonzero(matches[row], as_tuple=True)[0]
-            if len(mismatch_idx) > 0:
-                # mismatch_idx should be contiguous
-                assert torch.all(mismatch_idx[1:] == mismatch_idx[:-1] + 1)
-                # from the second mismatched token on, the output tokens should be -1
-                assert torch.all(output_token_ids[row, mismatch_idx[0] + 1 :] == -1)
+        if onehot_target:
+            assert torch.all(output_token_ids == target_token_ids)
+        else:
+            assert torch.all(output_token_ids[output_token_ids >= 0] < vocab_size)
+            assert output_token_ids.shape == (batch_size, num_speculate_tokens + 1)
+            matches = output_token_ids[..., :-1] != draft_token_ids
+            for row in range(batch_size):
+                mismatch_idx = torch.nonzero(matches[row], as_tuple=True)[0]
+                if len(mismatch_idx) > 0:
+                    # mismatch_idx should be contiguous
+                    assert torch.all(mismatch_idx[1:] == mismatch_idx[:-1] + 1)
+                    # from the second mismatched token on, the output tokens should be -1
+                    assert torch.all(output_token_ids[row, mismatch_idx[0] + 1 :] == -1)
 
 
 if __name__ == "__main__":
@@ -242,4 +257,5 @@ if __name__ == "__main__":
     test_top_k_sampling(3, 111, 10)
     test_top_p_renorm_prob(3, 111, 0.9)
     test_top_k_renorm_prob(3, 111, 10)
-    test_chain_speculative_sampling(3, 111, 3)
+    test_chain_speculative_sampling(3, 111, 3, False)
+    test_chain_speculative_sampling(3, 111, 3, True)

@@ -947,11 +947,11 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
     q_vec.fill(DType(0));
     p_vec.fill(DType(0));
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-      q_vec.load(target_probs + row_idx * (num_speculative_tokens + 1) * d +
+      q_vec.load(target_probs + (row_idx * (num_speculative_tokens + 1) + pos) * d +
                  i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
       if (pos != num_speculative_tokens) {
         // there is no draft_probs for the bonus token
-        p_vec.load(draft_probs + row_idx * num_speculative_tokens * d +
+        p_vec.load(draft_probs + (row_idx * num_speculative_tokens + pos) * d +
                    i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
       }
     }
@@ -980,11 +980,11 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
     q_vec.fill(DType(0));
     p_vec.fill(DType(0));
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-      q_vec.load(target_probs + row_idx * (num_speculative_tokens + 1) * d +
+      q_vec.load(target_probs + (row_idx * (num_speculative_tokens + 1) + pos) * d +
                  i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
       if (pos != num_speculative_tokens) {
         // there is no draft_probs for the bonus token
-        p_vec.load(draft_probs + row_idx * num_speculative_tokens * d +
+        p_vec.load(draft_probs + (row_idx * num_speculative_tokens + pos) * d +
                    i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
       }
     }
