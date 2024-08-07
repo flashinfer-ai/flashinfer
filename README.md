@@ -51,6 +51,15 @@ cd flashinfer/python
 pip install -e .
 ```
 
+to reduce binary size during build and testing:
+```bash
+git clone https://github.com/flashinfer-ai/flashinfer.git --recursive
+cd flashinfer/python
+# ref https://pytorch.org/docs/stable/generated/torch.cuda.get_device_capability.html#torch.cuda.get_device_capability
+export TORCH_CUDA_ARCH_LIST=8.0
+pip install -e .
+```
+
 ### Trying it out
 
 Below is a minimal example of using FlashInfer's single-request decode/append/prefill attention kernels:
