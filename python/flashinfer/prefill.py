@@ -21,13 +21,13 @@ import logging
 
 # mypy: disable-error-code="attr-defined"
 try:
-    from . import _kernels
+    from . import _prefill
 except ImportError as e:
     import os
     import logging
 
     if os.environ.get("BUILD_DOC", "0") == "1":
-        _kernels = None
+        _prefill = None
         logging.warning("Kernels are not loaded in documentation build mode.")
     else:
         raise e
@@ -187,7 +187,7 @@ def single_prefill_with_kv_cache(
             custom_mask.contiguous().view(-1), bitorder="little"
         )
     if packed_custom_mask is not None:
-        return _kernels.single_prefill_with_kv_cache_custom_mask(
+        return _prefill.single_prefill_with_kv_cache_custom_mask(
             q,
             k,
             v,
@@ -204,7 +204,7 @@ def single_prefill_with_kv_cache(
             False,  # return lse
         )[0]
     else:
-        return _kernels.single_prefill_with_kv_cache(
+        return _prefill.single_prefill_with_kv_cache(
             q,
             k,
             v,
@@ -372,7 +372,7 @@ def single_prefill_with_kv_cache_return_lse(
             custom_mask.contiguous().view(-1), bitorder="little"
         )
     if packed_custom_mask is not None:
-        return _kernels.single_prefill_with_kv_cache_custom_mask(
+        return _prefill.single_prefill_with_kv_cache_custom_mask(
             q,
             k,
             v,
@@ -389,7 +389,7 @@ def single_prefill_with_kv_cache_return_lse(
             True,  # return lse
         )
     else:
-        return _kernels.single_prefill_with_kv_cache(
+        return _prefill.single_prefill_with_kv_cache(
             q,
             k,
             v,
@@ -604,7 +604,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         _check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
         self._workspace_buffer = workspace_buffer
-        self._wrapper = _kernels.BatchPrefillWithPagedKVCachePyTorchWrapper(
+        self._wrapper = _prefill.BatchPrefillWithPagedKVCachePyTorchWrapper(
             TensorLayout[kv_layout].value,
             use_cuda_graph,
         )
@@ -1225,7 +1225,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         _check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
         self._workspace_buffer = workspace_buffer
-        self._wrapper = _kernels.BatchPrefillWithRaggedKVCachePyTorchWrapper(
+        self._wrapper = _prefill.BatchPrefillWithRaggedKVCachePyTorchWrapper(
             TensorLayout[kv_layout].value,
             use_cuda_graph,
         )
