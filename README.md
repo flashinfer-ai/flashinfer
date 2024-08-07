@@ -51,6 +51,15 @@ cd flashinfer/python
 pip install -e .
 ```
 
+when building and testing on A100:
+```bash
+git clone https://github.com/flashinfer-ai/flashinfer.git --recursive
+cd flashinfer/python
+# workaround for undefined symbol `__gmon_start__' on A100
+export TORCH_CUDA_ARCH_LIST=8.0
+pip install -e .
+```
+
 ### Trying it out
 
 Below is a minimal example of using FlashInfer's single-request decode/append/prefill attention kernels:
