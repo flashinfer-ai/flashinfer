@@ -962,6 +962,7 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
     sum_relu_q_minus_p +=
         BlockReduce<DType, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
             .Sum<VEC_SIZE>(relu_q_minus_p);
+    __syncthreads();
   }
   if (tx == 0) {
     temp_storage.data.block_aggregate.value = sum_relu_q_minus_p;
@@ -970,7 +971,9 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
   temp_storage.data.sampled_id = d - 1;
   __syncthreads();
   sum_relu_q_minus_p = temp_storage.data.block_aggregate.value;
-  DType u = uniform_samples[row_idx * (num_speculative_tokens + 1) + pos] * sum_relu_q_minus_p;
+  DType u = uniform_samples[row_idx * (num_speculative_tokens + 1) +
+                            min(pos + 1, num_speculative_tokens)] *
+            sum_relu_q_minus_p;
 
   DType aggregate_relu_q_minus_p(0);
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
