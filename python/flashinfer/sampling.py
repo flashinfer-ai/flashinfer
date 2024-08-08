@@ -213,6 +213,7 @@ def top_k_sampling_from_probs(
         probs, uniform_samples, top_k, deterministic
     )
 
+
 def min_p_sampling_from_probs(
     probs: torch.Tensor,
     uniform_samples: torch.Tensor,
@@ -281,6 +282,7 @@ def min_p_sampling_from_probs(
     return _kernels.min_p_sampling_from_probs(
         probs, uniform_samples, min_p, deterministic
     )
+
 
 def top_k_top_p_sampling_from_probs(
     probs: torch.Tensor,

@@ -66,8 +66,8 @@ std::vector<torch::Tensor> top_k_sampling_from_probs(torch::Tensor probs,
                                                      unsigned int top_k, bool deterministic);
 
 std::vector<torch::Tensor> min_p_sampling_from_probs(torch::Tensor probs,
-                                                    torch::Tensor uniform_samples,
-                                                    torch::Tensor min_p, bool deterministic);
+                                                     torch::Tensor uniform_samples,
+                                                     torch::Tensor min_p, bool deterministic);
 
 std::vector<torch::Tensor> top_k_top_p_sampling_from_probs(torch::Tensor probs,
                                                            torch::Tensor uniform_samples,

@@ -97,7 +97,7 @@ def test_top_k_sampling(batch_size, vocab_size, k):
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
-@pytest.mark.parametrize("p", [0.05, 0.1, 0.2, 1])
+@pytest.mark.parametrize("p", [0.05, 0.1, 0.2, 0.7, 1])
 def test_min_p_sampling(batch_size, vocab_size, p):
     torch.manual_seed(42)
     max_min_p_trails = 32
@@ -127,6 +127,7 @@ def test_min_p_sampling(batch_size, vocab_size, p):
         assert torch.all(mask[torch.arange(batch_size), samples] == 1), normalized_prob[
             torch.arange(batch_size), samples
         ]
+
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
