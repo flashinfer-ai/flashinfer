@@ -337,9 +337,6 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, DType* uniform_samples,
         temp_storage.data.block_aggregate.pair = aggregate_gt_pivot;
       }
       __syncthreads();
-      if (temp_storage.data.block_aggregate.pair.count < k) {
-        break;
-      }
     }
     q = temp_storage.data.block_aggregate.pair.value;
     if (temp_storage.data.block_aggregate.pair.count < k) {
@@ -361,8 +358,6 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, DType* uniform_samples,
     }
   }
 }
-
-constexpr float eps = 1e-5;
 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
@@ -430,18 +425,15 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
         temp_storage.data.block_aggregate.value = aggregate_gt_pivot;
       }
       __syncthreads();
-      if (float(temp_storage.data.block_aggregate.value) + eps < top_p) {
-        break;
-      }
     }
     q = temp_storage.data.block_aggregate.value;
-    if (float(q) + eps < top_p) {
+    if (float(q) < top_p) {
       break;
     }
   }
   __syncthreads();
   if (tx == 0) {
-    if (float(q) + eps >= top_p) {
+    if (float(q) >= top_p) {
       // failed to sample within MAX_TOP_P_ROUNDS
       if (success != nullptr) {
         success[bx] = false;
@@ -520,19 +512,15 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, DType* uniform_samp
         temp_storage.data.block_aggregate.pair = aggregate_gt_pivot;
       }
       __syncthreads();
-      if (temp_storage.data.block_aggregate.pair.count < k &&
-          float(temp_storage.data.block_aggregate.pair.value) + eps < p) {
-        break;
-      }
     }
     q = temp_storage.data.block_aggregate.pair.value;
-    if (temp_storage.data.block_aggregate.pair.count < k && float(q) + eps < p) {
+    if (temp_storage.data.block_aggregate.pair.count < k && float(q) < p) {
       break;
     }
   }
   __syncthreads();
   if (tx == 0) {
-    if (temp_storage.data.block_aggregate.pair.count >= k || float(q) + eps >= p) {
+    if (temp_storage.data.block_aggregate.pair.count >= k || float(q) >= p) {
       // failed to sample within MAX_TOP_P_ROUNDS
       if (success != nullptr) {
         success[bx] = false;
