@@ -59,7 +59,7 @@ def write_if_different(path: pathlib.Path, content: str) -> None:
         f.write(content)
 
 
-def get_instantiation_cu() -> List[str]:
+def get_instantiation_cu() -> Tuple[List[str], List[str]]:
     prefix = "csrc/generated"
     (root / prefix).mkdir(parents=True, exist_ok=True)
 
@@ -99,7 +99,8 @@ def get_instantiation_cu() -> List[str]:
     if enable_fp8:
         decode_dtypes.extend(fp8_dtypes)
 
-    files = []
+    files_decode = []
+    files_prefill = []
     # single decode files
     for (
         head_dim,
@@ -115,7 +116,7 @@ def get_instantiation_cu() -> List[str]:
         ):
             dtype_out = dtype_q
             fname = f"single_decode_head_{head_dim}_logitshook_{logits_hook}_posenc_{pos_encoding_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_out}.cu"
-            files.append(prefix + "/" + fname)
+            files_decode.append(prefix + "/" + fname)
             content = generate_single_decode_inst.get_cu_file_str(
                 head_dim,
                 logits_hook,
@@ -142,7 +143,7 @@ def get_instantiation_cu() -> List[str]:
             ):
                 dtype_out = dtype_q
                 fname = f"batch_paged_decode_head_{head_dim}_logitshook_{logits_hook}_posenc_{pos_encoding_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_out}_idtype_{idtype}.cu"
-                files.append(prefix + "/" + fname)
+                files_decode.append(prefix + "/" + fname)
                 content = generate_batch_paged_decode_inst.get_cu_file_str(
                     head_dim,
                     logits_hook,
@@ -170,7 +171,7 @@ def get_instantiation_cu() -> List[str]:
     ):
         for dtype_q, dtype_kv in list(zip(prefill_dtypes, prefill_dtypes)):
             fname = f"single_prefill_head_{head_dim}_logitshook_{logits_hook}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}.cu"
-            files.append(prefix + "/" + fname)
+            files_prefill.append(prefix + "/" + fname)
             content = generate_single_prefill_inst.get_cu_file_str(
                 head_dim,
                 logits_hook,
@@ -203,7 +204,7 @@ def get_instantiation_cu() -> List[str]:
             itertools.product(prefill_dtypes, fp8_dtypes)
         ):
             fname = f"batch_paged_prefill_head_{head_dim}_logitshook_{logits_hook}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}.cu"
-            files.append(prefix + "/" + fname)
+            files_prefill.append(prefix + "/" + fname)
             content = generate_batch_paged_prefill_inst.get_cu_file_str(
                 head_dim,
                 logits_hook,
@@ -235,7 +236,7 @@ def get_instantiation_cu() -> List[str]:
     ):
         for dtype_q, dtype_kv in list(zip(prefill_dtypes, prefill_dtypes)):
             fname = f"batch_ragged_prefill_head_{head_dim}_logitshook_{logits_hook}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}.cu"
-            files.append(prefix + "/" + fname)
+            files_prefill.append(prefix + "/" + fname)
             content = generate_batch_ragged_prefill_inst.get_cu_file_str(
                 head_dim,
                 logits_hook,
@@ -249,7 +250,7 @@ def get_instantiation_cu() -> List[str]:
             )
             write_if_different(root / prefix / fname, content)
 
-    return files
+    return files_prefill, files_decode
 
 
 def get_version():
@@ -309,48 +310,71 @@ class NinjaBuildExtension(torch_cpp_ext.BuildExtension):
 if __name__ == "__main__":
     remove_unwanted_pytorch_nvcc_flags()
     generate_build_meta()
+    files_prefill, files_decode = get_instantiation_cu()
+    include_dirs = [
+        str(root.resolve() / "include"),
+        str(
+            root.resolve() / "3rdparty" / "cutlass" / "include"
+        ),  # for group gemm
+    ]
+    extra_compile_args = {
+        "cxx": [
+            "-O3",
+            "-Wno-switch-bool",
+        ],
+        "nvcc": [
+            "-O3",
+            "-std=c++17",
+            "--threads",
+            "1",
+            "-Xfatbin",
+            "-compress-all",
+        ],
+    }
     ext_modules = []
     ext_modules.append(
         torch_cpp_ext.CUDAExtension(
             name="flashinfer._kernels",
             sources=[
-                "csrc/single_decode.cu",
-                "csrc/single_prefill.cu",
                 "csrc/cascade.cu",
                 "csrc/page.cu",
-                "csrc/batch_decode.cu",
                 "csrc/flashinfer_ops.cu",
-                "csrc/batch_prefill.cu",
                 "csrc/sampling.cu",
                 "csrc/norm.cu",
                 "csrc/rope.cu",
                 "csrc/group_gemm.cu",
                 "csrc/quantization.cu",
-            ]
-            + get_instantiation_cu(),
-            include_dirs=[
-                str(root.resolve() / "include"),
-                str(
-                    root.resolve() / "3rdparty" / "cutlass" / "include"
-                ),  # for group gemm
             ],
-            extra_compile_args={
-                "cxx": [
-                    "-O3",
-                    "-Wno-switch-bool",
-                ],
-                "nvcc": [
-                    "-O3",
-                    "-std=c++17",
-                    "--threads",
-                    "1",
-                    "-Xfatbin",
-                    "-compress-all",
-                ],
-            },
+            include_dirs=include_dirs,
+            extra_compile_args=extra_compile_args,
         )
     )
-
+    ext_modules.append(
+        torch_cpp_ext.CUDAExtension(
+            name="flashinfer._decode",
+            sources=[
+                "csrc/single_decode.cu",
+                "csrc/flashinfer_ops_decode.cu",
+                "csrc/batch_decode.cu",
+            ]
+            + files_decode,
+            include_dirs=include_dirs,
+            extra_compile_args=extra_compile_args,
+        )
+    )
+    ext_modules.append(
+        torch_cpp_ext.CUDAExtension(
+            name="flashinfer._prefill",
+            sources=[
+                "csrc/single_prefill.cu",
+                "csrc/flashinfer_ops_prefill.cu",
+                "csrc/batch_prefill.cu",
+            ]
+            + files_prefill,
+            include_dirs=include_dirs,
+            extra_compile_args=extra_compile_args,
+        )
+    )
     setuptools.setup(
         name="flashinfer",
         version=get_version(),

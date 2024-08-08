@@ -15,7 +15,7 @@
  */
 #include <flashinfer/prefill_attention_decl.cuh>
 
-#include "flashinfer_ops.h"
+#include "flashinfer_ops_prefill.h"
 #include "pytorch_extension_utils.h"
 
 using namespace flashinfer;

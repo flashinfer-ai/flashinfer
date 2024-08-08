@@ -20,13 +20,15 @@ import torch
 
 # mypy: disable-error-code="attr-defined"
 try:
-    from . import _kernels
+    from . import _decode
+    from . import _prefill
 except ImportError as e:
     import os
     import logging
 
     if os.environ.get("BUILD_DOC", "0") == "1":
-        _kernels = None
+        _decode = None
+        _prefill = None
         logging.warning("Kernels are not loaded in documentation build mode.")
     else:
         raise e
@@ -172,7 +174,7 @@ def single_decode_with_kv_cache(
         )
 
     if use_tensor_cores:
-        out = _kernels.single_prefill_with_kv_cache(
+        out = _prefill.single_prefill_with_kv_cache(
             q.unsqueeze(0),
             k,
             v,
@@ -189,7 +191,7 @@ def single_decode_with_kv_cache(
             False,  # return_lse
         )[0].squeeze(0)
     else:
-        out = _kernels.single_decode_with_kv_cache(
+        out = _decode.single_decode_with_kv_cache(
             q,
             k,
             v,
@@ -353,7 +355,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         if use_tensor_cores:
             self._use_tensor_cores = True
-            self._wrapper = _kernels.BatchPrefillWithPagedKVCachePyTorchWrapper(
+            self._wrapper = _prefill.BatchPrefillWithPagedKVCachePyTorchWrapper(
                 TensorLayout[kv_layout].value,
                 use_cuda_graph,
             )
@@ -365,7 +367,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 )
         else:
             self._use_tensor_cores = False
-            self._wrapper = _kernels.BatchDecodeWithPagedKVCachePyTorchWrapper(
+            self._wrapper = _decode.BatchDecodeWithPagedKVCachePyTorchWrapper(
                 TensorLayout[kv_layout].value,
                 use_cuda_graph,
                 self._fixed_batch_size,
