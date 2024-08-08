@@ -85,6 +85,7 @@ struct SamplingTempStorage {
     union {
       T value;
       Pair<T> pair;
+      T max_p;
     } block_aggregate;
   } data;
 };
@@ -483,7 +484,11 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
                            .Reduce<VEC_SIZE>(probs_, cub::Max()));
     __syncthreads();
   }
-  DType scaled_p = max_p * p;
+  if (tx == 0) {
+    temp_storage.data.block_aggregate.max_p = max_p;
+  }
+  __syncthreads();
+  DType scaled_p = temp_storage.data.block_aggregate.max_p * p;
 
   IdType sampled_id;
   for (uint32_t round = 0; round < max_min_p_rounds; ++round) {
@@ -507,10 +512,31 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
     __syncthreads();
     sampled_id = temp_storage.data.sampled_id;
     pivot = probs[bx * d + sampled_id];
-
     if (pivot >= scaled_p) {
       break;
     }
+
+    DType aggregate_leq_pivot = DType(0);
+    for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+      probs_vec.fill(DType(0));
+      if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+        probs_vec.load(probs + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+      }
+
+      DType probs_leq_pivot[VEC_SIZE];
+#pragma unroll
+      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+        probs_leq_pivot[j] = (probs_vec[j] <= pivot) ? probs_vec[j] : DType(0);
+      }
+
+      aggregate_leq_pivot += BlockReduce<DType, BLOCK_THREADS>(temp_storage.block_prim.reduce)
+                                 .Sum<VEC_SIZE>(probs_leq_pivot);
+      if (tx == 0) {
+        temp_storage.data.block_aggregate.value = aggregate_leq_pivot;
+      }
+      __syncthreads();
+    }
+    q = temp_storage.data.block_aggregate.value;
   }
   __syncthreads();
   if (tx == 0) {
