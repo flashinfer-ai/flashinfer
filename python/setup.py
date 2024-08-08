@@ -311,6 +311,26 @@ if __name__ == "__main__":
     remove_unwanted_pytorch_nvcc_flags()
     generate_build_meta()
     files_prefill, files_decode = get_instantiation_cu()
+    include_dirs = [
+        str(root.resolve() / "include"),
+        str(
+            root.resolve() / "3rdparty" / "cutlass" / "include"
+        ),  # for group gemm
+    ]
+    extra_compile_args = {
+        "cxx": [
+            "-O3",
+            "-Wno-switch-bool",
+        ],
+        "nvcc": [
+            "-O3",
+            "-std=c++17",
+            "--threads",
+            "1",
+            "-Xfatbin",
+            "-compress-all",
+        ],
+    }
     ext_modules = []
     ext_modules.append(
         torch_cpp_ext.CUDAExtension(
@@ -325,26 +345,8 @@ if __name__ == "__main__":
                 "csrc/group_gemm.cu",
                 "csrc/quantization.cu",
             ],
-            include_dirs=[
-                str(root.resolve() / "include"),
-                str(
-                    root.resolve() / "3rdparty" / "cutlass" / "include"
-                ),  # for group gemm
-            ],
-            extra_compile_args={
-                "cxx": [
-                    "-O3",
-                    "-Wno-switch-bool",
-                ],
-                "nvcc": [
-                    "-O3",
-                    "-std=c++17",
-                    "--threads",
-                    "1",
-                    "-Xfatbin",
-                    "-compress-all",
-                ],
-            },
+            include_dirs=include_dirs,
+            extra_compile_args=extra_compile_args,
         )
     )
     ext_modules.append(
@@ -356,26 +358,8 @@ if __name__ == "__main__":
                 "csrc/batch_decode.cu",
             ]
             + files_decode,
-            include_dirs=[
-                str(root.resolve() / "include"),
-                str(
-                    root.resolve() / "3rdparty" / "cutlass" / "include"
-                ),  # for group gemm
-            ],
-            extra_compile_args={
-                "cxx": [
-                    "-O3",
-                    "-Wno-switch-bool",
-                ],
-                "nvcc": [
-                    "-O3",
-                    "-std=c++17",
-                    "--threads",
-                    "1",
-                    "-Xfatbin",
-                    "-compress-all",
-                ],
-            },
+            include_dirs=include_dirs,
+            extra_compile_args=extra_compile_args,
         )
     )
     ext_modules.append(
@@ -387,26 +371,8 @@ if __name__ == "__main__":
                 "csrc/batch_prefill.cu",
             ]
             + files_prefill,
-            include_dirs=[
-                str(root.resolve() / "include"),
-                str(
-                    root.resolve() / "3rdparty" / "cutlass" / "include"
-                ),  # for group gemm
-            ],
-            extra_compile_args={
-                "cxx": [
-                    "-O3",
-                    "-Wno-switch-bool",
-                ],
-                "nvcc": [
-                    "-O3",
-                    "-std=c++17",
-                    "--threads",
-                    "1",
-                    "-Xfatbin",
-                    "-compress-all",
-                ],
-            },
+            include_dirs=include_dirs,
+            extra_compile_args=extra_compile_args,
         )
     )
     setuptools.setup(
