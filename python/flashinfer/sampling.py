@@ -219,7 +219,7 @@ def min_p_sampling_from_probs(
     min_p: torch.Tensor,
     deterministic: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Fused GPU kernel for min_p sampling from probabilities,
+    r"""Fused GPU kernel for `min_p sampling <https://arxiv.org/abs/2407.01082>`_ from probabilities,
 
     this operator implements GPU-based rejection sampling without explicit sorting.
 
@@ -235,7 +235,7 @@ def min_p_sampling_from_probs(
         where the first dimension is the maximum number of rounds for rejection sampling.
         Expected to be uniformly distributed in ``[0, 1)``.
     min_p: torch.Tensor
-        The threshold for min_p sampling for each request, shape ``(batch_size,)``.
+        The :math:`p_{\text{base}}` in min_p sampling for each request, shape ``(batch_size,)``.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
 
