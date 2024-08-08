@@ -106,6 +106,42 @@ std::vector<torch::Tensor> top_k_sampling_from_probs(torch::Tensor probs,
   return {samples, success};
 }
 
+std::vector<torch::Tensor> min_p_sampling_from_probs(torch::Tensor probs,
+                                                     torch::Tensor uniform_samples,
+                                                     torch::Tensor min_p, bool deterministic) {
+  CHECK_INPUT(probs);
+  CHECK_INPUT(uniform_samples);
+  CHECK_INPUT(min_p);
+  auto device = probs.device();
+  CHECK_EQ(uniform_samples.device(), device);
+  CHECK_EQ(min_p.device(), device);
+  CHECK_DIM(2, probs);            // probs: (batch_size, vocab_size)
+  CHECK_DIM(2, uniform_samples);  // uniform_samples: (max_rounds, batch_size)
+  CHECK_DIM(1, min_p);            // min_p: (batch_size,)
+  unsigned int batch_size = probs.size(0);
+  unsigned int vocab_size = probs.size(1);
+  unsigned int max_rounds = uniform_samples.size(0);
+  CHECK_EQ(uniform_samples.size(1), batch_size);
+  CHECK_EQ(min_p.size(0), batch_size);
+  probs = probs.to(torch::kFloat32);
+  uniform_samples = uniform_samples.to(torch::kFloat32);
+  min_p = min_p.to(torch::kFloat32);
+
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
+  auto samples = torch::empty({batch_size}, torch::dtype(torch::kInt32).device(device));
+  auto success = torch::empty({batch_size}, torch::dtype(torch::kBool).device(device));
+
+  cudaError_t status = sampling::MinPSamplingFromProb<float, int>(
+      static_cast<float*>(probs.data_ptr()), static_cast<float*>(uniform_samples.data_ptr()),
+      static_cast<float*>(min_p.data_ptr()), static_cast<int*>(samples.data_ptr()),
+      static_cast<bool*>(success.data_ptr()), batch_size, vocab_size, max_rounds, deterministic,
+      torch_current_stream);
+  TORCH_CHECK(status == cudaSuccess, "MinPSamplingFromProb failed with error code " +
+                                         std::string(cudaGetErrorString(status)));
+
+  return {samples, success};
+}
+
 std::vector<torch::Tensor> top_k_top_p_sampling_from_probs(torch::Tensor probs,
                                                            torch::Tensor uniform_samples,
                                                            torch::Tensor top_k, torch::Tensor top_p,

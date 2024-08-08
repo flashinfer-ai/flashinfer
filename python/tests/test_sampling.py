@@ -97,6 +97,40 @@ def test_top_k_sampling(batch_size, vocab_size, k):
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize("p", [0.05, 0.1, 0.2, 0.7, 1])
+def test_min_p_sampling(batch_size, vocab_size, p):
+    torch.manual_seed(42)
+    max_min_p_trails = 32
+    pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    sorted_prob, indices = torch.sort(normalized_prob, descending=False)
+    # scale min-p
+    top_probs = sorted_prob[:, -1].unsqueeze(-1)
+    scaled_p = p * top_probs
+    # min-p mask
+    mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32).to(0)
+    mask.scatter_add_(1, indices, (sorted_prob >= scaled_p).int())
+
+    uniform_samples = torch.empty(max_min_p_trails, batch_size, dtype=torch.float32).to(
+        0
+    )
+    min_p_tensor = torch.full((batch_size,), p).to(0)
+
+    num_trails = 1000
+    for _ in range(num_trails):
+        uniform_samples.uniform_()
+        samples, success = flashinfer.sampling.min_p_sampling_from_probs(
+            normalized_prob, uniform_samples, min_p_tensor
+        )
+        assert torch.all(success)
+        assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
+        assert torch.all(mask[torch.arange(batch_size), samples] == 1), normalized_prob[
+            torch.arange(batch_size), samples
+        ]
+
+
+@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
 @pytest.mark.parametrize("p", [0.1, 0.5])
 def test_top_k_top_p_sampling(batch_size, vocab_size, p):
     if p == 0.1:
