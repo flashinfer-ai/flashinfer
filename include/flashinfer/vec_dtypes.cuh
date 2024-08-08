@@ -77,7 +77,8 @@ struct vec_cast<half, float> {
 /*!
  * \brief Fallback to fastertransformer's implementation of fast dequantization if hardware support
  * is not available.
- * \ref https://github.com/vllm-project/vllm/blob/6dffa4b0a6120159ef2fe44d695a46817aff65bc/csrc/quantization/fp8/fp8_marlin.cu#L120
+ * \ref
+ * https://github.com/vllm-project/vllm/blob/6dffa4b0a6120159ef2fe44d695a46817aff65bc/csrc/quantization/fp8/fp8_marlin.cu#L120
  */
 template <>
 struct vec_cast<half, __nv_fp8_e4m3> {
@@ -85,7 +86,12 @@ struct vec_cast<half, __nv_fp8_e4m3> {
   FLASHINFER_INLINE static void cast(half* dst, const __nv_fp8_e4m3* src) {
     if constexpr (vec_size == 1) {
       dst[0] = half(src[0]);
+    } else if constexpr (vec_size == 2) {
+      dst[0] = half(src[0]);
+      dst[1] = half(src[1]);
     } else {
+      static_assert(vec_size % 4 == 0, "vec_size must be a multiple of 4");
+#pragma unroll
       for (uint32_t i = 0; i < vec_size / 4; ++i) {
         uint32_t q = *(uint32_t*)&src[i * 4];
         constexpr int FP8_EXPONENT = 4, FP8_MANTISSA = 3, FP16_EXPONENT = 5;
