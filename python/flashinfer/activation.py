@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import torch
+from typing import Optional
 
 # mypy: disable-error-code="attr-defined"
 try:
@@ -30,17 +31,41 @@ except ImportError as e:
         raise e
 
 
-def silu_and_mul(output: torch.Tensor, input: torch.Tensor):
-    r"""Fused SiLU and Mul.
+def _check_shape(input: torch.Tensor, output: torch.Tensor):
+    assert input.ndim == output.ndim, f"{input.ndim} != {output.ndim}"
+    assert (
+        input.shape[:-1] == output.shape[:-1]
+    ), f"{input.shape[:-1]} != {output.shape[:-1]}"
+    assert (
+        input.shape[-1] == 2 * output.shape[-1]
+    ), f"{input.shape[-1]} != {2 * output.shape[-1]}"
+
+
+def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+    r"""Fused SiLU and Mul operation.
 
     Parameters
     ----------
     input: torch.Tensor
         Input tensor, shape (..., 2 * hidden_size).
 
+    out: Optional[torch.Tensor]
+        The the output tensor, if specified, the kernel will update this tensor inplace.
+
     Returns
     -------
     output: torch.Tensor
         Output tensor, shape (..., hidden_size).
     """
-    _kernels.silu_and_mul(output, input)
+    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
+        raise ValueError("The pointers must be multiple of 16 bytes.")
+    if out is not None:
+        _check_shape(input, out)
+    else:
+        out = torch.empty(
+            input.shape[:-1] + (input.shape[-1] // 2,),
+            device=input.device,
+            dtype=input.dtype,
+        )
+    _kernels.silu_and_mul(out, input)
+    return out
