@@ -36,8 +36,7 @@ void _TestSinglePrefillKernelCorrectness(size_t qo_len, size_t kv_len, size_t nu
 
   utils::vec_normal_(q);
   utils::vec_normal_(k);
-  // utils::vec_normal_(v);
-  utils::vec_fill_(v, DTypeKV(1.0));
+  utils::vec_normal_(v);
   utils::vec_zero_(o);
 
   thrust::device_vector<DTypeQ> q_d(q);
