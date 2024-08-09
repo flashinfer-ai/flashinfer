@@ -304,6 +304,7 @@ def top_k_top_p_sampling_from_logits(
     top_p: Union[torch.Tensor, float],
     filter_apply_order: str = "top_k_first",
     deterministic: bool = True,
+    **kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Fused GPU kernel for top-k and top-p sampling from pre-softmax logits,
 
@@ -352,18 +353,28 @@ def top_k_top_p_sampling_from_logits(
     >>> batch_size = 4
     >>> vocab_size = 5
     >>> max_rounds = 3
-    >>> top_p = torch.full((batch_size,), 0.2).to(0)
-    >>> top_k = torch.full((batch_size,), 2).to(0)
-    >>> logits = torch.randn(batch_size, vocab_size).to(0)
+    >>> top_p = 0.5
+    >>> top_k = 3
+    >>> logits = torch.rand(batch_size, vocab_size).to(0)
     >>> logits
-    tensor([[0.2499, 0.2592, 0.1085, 0.2718, 0.1106],
-            [0.2205, 0.0942, 0.2912, 0.3452, 0.0489],
-            [0.2522, 0.1602, 0.2346, 0.1532, 0.2000],
-            [0.1543, 0.3182, 0.2062, 0.0958, 0.2255]], device='cuda:0')
+    tensor([[ 1.9269,  1.4873,  0.9007, -2.1055, -0.7581],
+            [ 1.0783,  0.8008,  1.6806,  0.3559, -0.6866],
+            [-0.4934,  0.2415, -0.2316,  0.0418, -0.2516],
+            [ 0.8599, -0.3097, -0.3957,  0.8034, -0.6216]], device='cuda:0')
     >>> uniform_samples = torch.rand(max_rounds, batch_size).to(0)
     >>> samples, success = flashinfer.sampling.top_k_top_p_sampling_from_logits(logits, uniform_samples, top_k, top_p)
     >>> samples
-    tensor([3, 3, 0, 1], device='cuda:0', dtype=torch.int32)
+    tensor([0, 2, 1, 3], device='cuda:0', dtype=torch.int32
+    >>> success
+    tensor([True, True, True, True], device='cuda:0')
+    >>> probs = torch.softmax(logits, dim=-1)
+    >>> probs
+    tensor([[0.4788, 0.3085, 0.1716, 0.0085, 0.0327],
+        [0.2358, 0.1787, 0.4307, 0.1145, 0.0404],
+        [0.1358, 0.2831, 0.1764, 0.2318, 0.1729],
+        [0.3613, 0.1122, 0.1029, 0.3415, 0.0821]], device='cuda:0')
+    >>> samples
+    tensor([0, 2, 1, 3], device='cuda:0', dtype=torch.int32)
     >>> success
     tensor([True, True, True, True], device='cuda:0')
 
@@ -374,7 +385,7 @@ def top_k_top_p_sampling_from_logits(
     implementation usually use much fewer rounds for rejection sampling because of early stopping.
     """
     if filter_apply_order == "top_k_first":
-        masked_logits = top_k_mask_logits(probs, top_k)
+        masked_logits = top_k_mask_logits(probs, top_k, **kwargs)
         probs = torch.softmax(masked_logits, dim=-1)
         return top_p_sampling_from_probs(probs, uniform_samples, top_p, deterministic)
     elif filter_apply_order == "joint":
@@ -397,6 +408,7 @@ def top_k_top_p_sampling_from_probs(
     top_p: Union[torch.Tensor, float],
     filter_apply_order: str = "top_k_first",
     deterministic: bool = True,
+    **kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Fused GPU kernel for top-k and top-p sampling from probabilities,
 
@@ -468,7 +480,7 @@ def top_k_top_p_sampling_from_probs(
     implementation usually use much fewer rounds for rejection sampling because of early stopping.
     """
     if filter_apply_order == "top_k_first":
-        renorm_probs = top_k_renorm_prob(probs, top_k)
+        renorm_probs = top_k_renorm_prob(probs, top_k, **kwargs)
         return top_p_sampling_from_probs(
             renorm_probs, uniform_samples, top_p, deterministic
         )
@@ -485,7 +497,7 @@ def top_k_top_p_sampling_from_probs(
 
 
 def top_p_renorm_prob(
-    probs: torch.Tensor, top_p: Union[torch.Tensor, float], eps: float = 1e-5
+    probs: torch.Tensor, top_p: Union[torch.Tensor, float], eps: float = 1e-6
 ) -> torch.Tensor:
     r"""Fused GPU kernel for renormalizing probabilities by top-p thresholding.
 
@@ -515,7 +527,7 @@ def top_p_renorm_prob(
 
 
 def top_k_renorm_prob(
-    probs: torch.Tensor, top_k: Union[torch.Tensor, int], eps: float = 1e-5
+    probs: torch.Tensor, top_k: Union[torch.Tensor, int], eps: float = 1e-6
 ) -> torch.Tensor:
     r"""Fused GPU kernel for renormalizing probabilities by top-k thresholding.
 
