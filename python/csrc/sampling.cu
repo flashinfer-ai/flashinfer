@@ -151,10 +151,8 @@ std::vector<torch::Tensor> min_p_sampling_from_probs(torch::Tensor probs,
     CHECK_EQ(min_p_arr.device(), device);
   }
   min_p_arr = min_p_arr.to(torch::kFloat32);
-
   probs = probs.to(torch::kFloat32);
   uniform_samples = uniform_samples.to(torch::kFloat32);
-  min_p = min_p.to(torch::kFloat32);
 
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto samples = torch::empty({batch_size}, torch::dtype(torch::kInt32).device(device));
