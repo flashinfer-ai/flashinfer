@@ -30,6 +30,20 @@ __device__ __forceinline__ float silu_kernel(const float& val) {
   return val / (1.0f + __expf(-val));
 }
 
+// https://github.com/NVIDIA/FasterTransformer/blob/d21dc02bc5f70bc7dc0d18ba5801ae263565e68e/src/fastertransformer/kernels/activation_kernels.cu#L37-L57
+__inline__ __device__ float tanh_opt(float x) {
+  float r;
+  asm("tanh.approx.f32 %0,%1; \n\t" : "=f"(r) : "f"(x));
+  return r;
+}
+
+template <typename T>
+__device__ __forceinline__ T gelu_tanh_kernel(const T& val) {
+  const float cdf =
+      0.5f * (1.0f + tanh_opt((0.7978845608028654f * (val + 0.044715f * val * val * val))));
+  return val * cdf;
+}
+
 template <typename T, float (*Activation)(const float&)>
 __global__ void act_and_mul_kernel(T* __restrict__ out, const T* __restrict__ input, const int d) {
   constexpr uint32_t vec_size = 16 / sizeof(T);
