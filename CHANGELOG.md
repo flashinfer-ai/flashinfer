@@ -18,6 +18,7 @@
 * improve numerical stability of sampling kernels ([#429](https://github.com/flashinfer-ai/flashinfer/pull/429)) ([898d8ea](https://github.com/flashinfer-ai/flashinfer/commit/898d8ea8a21f5850288bc4a860399678131a2d30))
 
 ### Other improvements
+
 * break up `_kernels` into multiple modules ([#428](https://github.com/flashinfer-ai/flashinfer/pull/428)) ([8e482d9](https://github.com/flashinfer-ai/flashinfer/commit/8e482d92cb0ad046ec5f57509f9473e76bd668fe))
 
 ### Acknowledgement
