@@ -297,6 +297,99 @@ def min_p_sampling_from_probs(
     )
 
 
+def top_k_top_p_sampling_from_logits(
+    probs: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    top_k: Union[torch.Tensor, int],
+    top_p: Union[torch.Tensor, float],
+    filter_apply_order: str = "top_k_first",
+    deterministic: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Fused GPU kernel for top-k and top-p sampling from pre-softmax logits,
+
+    this operator implements GPU-based rejection sampling without explicit sorting.
+
+    The multiple rounds of rejection sampling are implemented in a single CUDA kernel,
+    which is more efficient than the naive implementation that launches a series of kernels.
+
+    Parameters
+    ----------
+    logits: torch.Tensor
+        Pre-softmax logits, shape ``(batch_size, num_classes)``.
+    uniform_samples: torch.Tensor
+        The uniform samples used as needle for sampling, shape ``(max_top_k_rounds, batch_size,)``,
+        where the first dimension is the maximum number of rounds for rejection sampling.
+        Expected to be uniformly distributed in ``[0, 1)``.
+    top_k: Union[torch.Tensor, int]
+        Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for top-k sampling.
+        If a scalar, the same threshold is used for all requests.
+        If a tensor, each request has its own threshold.
+    top_p: Union[torch.Tensor, float]
+        Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for top-p sampling.
+        If a scalar, the same threshold is used for all requests.
+        If a tensor, each request has its own threshold.
+    filter_apply_order: str
+        The order of applying top-k and top-p sampling, should be either ``"top_k_first"`` or ``"joint"``.
+        If ``"top_k_first"``, we first apply top-k filter, then apply top-p sampling on the top-k results.
+        If ``"joint"``, we apply top-k and top-p filter simultaneously in each round.
+    deterministic: bool
+        Whether to use deterministic kernel implementation, default is ``True``.
+
+    Returns
+    -------
+    samples: torch.Tensor
+        Sampled categories, shape ``(batch_size,)``.
+    success: torch.Tensor
+        Whether the sampling is successful within ``max_top_k_rounds`` rounds,
+        shape ``(batch_size,)``.
+
+    Examples
+    --------
+
+    >>> import torch
+    >>> import flashinfer
+    >>> torch.manual_seed(42)
+    >>> batch_size = 4
+    >>> vocab_size = 5
+    >>> max_rounds = 3
+    >>> top_p = torch.full((batch_size,), 0.2).to(0)
+    >>> top_k = torch.full((batch_size,), 2).to(0)
+    >>> logits = torch.randn(batch_size, vocab_size).to(0)
+    >>> logits
+    tensor([[0.2499, 0.2592, 0.1085, 0.2718, 0.1106],
+            [0.2205, 0.0942, 0.2912, 0.3452, 0.0489],
+            [0.2522, 0.1602, 0.2346, 0.1532, 0.2000],
+            [0.1543, 0.3182, 0.2062, 0.0958, 0.2255]], device='cuda:0')
+    >>> uniform_samples = torch.rand(max_rounds, batch_size).to(0)
+    >>> samples, success = flashinfer.sampling.top_k_top_p_sampling_from_logits(logits, uniform_samples, top_k, top_p)
+    >>> samples
+    tensor([3, 3, 0, 1], device='cuda:0', dtype=torch.int32)
+    >>> success
+    tensor([True, True, True, True], device='cuda:0')
+
+    Notes
+    -----
+    This function expects float32 inputs, and the output is int32.
+    We encourage users to set ``max_rounds`` to a reasonable value, e.g., 32. The actual
+    implementation usually use much fewer rounds for rejection sampling because of early stopping.
+    """
+    if filter_apply_order == "top_k_first":
+        masked_logits = top_k_mask_logits(probs, top_k)
+        probs = torch.softmax(masked_logits, dim=-1)
+        return top_p_sampling_from_probs(probs, uniform_samples, top_p, deterministic)
+    elif filter_apply_order == "joint":
+        probs = torch.softmax(probs, dim=-1)
+        return _kernels.top_k_top_p_sampling_from_probs(
+            probs,
+            uniform_samples,
+            *_to_tensor_scalar_tuple(top_k),
+            *_to_tensor_scalar_tuple(top_p),
+            deterministic,
+        )
+    else:
+        raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
+
+
 def top_k_top_p_sampling_from_probs(
     probs: torch.Tensor,
     uniform_samples: torch.Tensor,
@@ -375,9 +468,10 @@ def top_k_top_p_sampling_from_probs(
     implementation usually use much fewer rounds for rejection sampling because of early stopping.
     """
     if filter_apply_order == "top_k_first":
-        masked_logits = top_k_mask_logits(probs, top_k)
-        probs = torch.softmax(masked_logits, dim=-1)
-        return top_p_sampling_from_probs(probs, uniform_samples, top_p, deterministic)
+        renorm_probs = top_k_renorm_prob(probs, top_k)
+        return top_p_sampling_from_probs(
+            renorm_probs, uniform_samples, top_p, deterministic
+        )
     elif filter_apply_order == "joint":
         return _kernels.top_k_top_p_sampling_from_probs(
             probs,

@@ -301,7 +301,7 @@ torch::Tensor top_k_mask_logits(torch::Tensor logits, std::optional<torch::Tenso
     CHECK_EQ(top_k_arr.device(), device);
   }
   top_k_arr = top_k_arr.to(torch::kInt32);
-  probs = probs.to(torch::kFloat32);
+  logits = logits.to(torch::kFloat32);
 
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto mask_logits =
