@@ -76,6 +76,8 @@ torch::Tensor rmsnorm(torch::Tensor input, torch::Tensor weight, double eps);
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight,
                        double eps);
 
+void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
+
 void apply_rope_inplace(torch::Tensor q, torch::Tensor k, torch::Tensor indptr,
                         torch::Tensor offsets, bool interleave, float rope_scale, float rope_theta);
 

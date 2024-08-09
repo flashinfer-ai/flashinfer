@@ -329,6 +329,7 @@ if __name__ == "__main__":
             "1",
             "-Xfatbin",
             "-compress-all",
+            "-use_fast_math",
         ],
     }
     ext_modules = []
@@ -341,6 +342,7 @@ if __name__ == "__main__":
                 "csrc/flashinfer_ops.cu",
                 "csrc/sampling.cu",
                 "csrc/norm.cu",
+                "csrc/activation.cu",
                 "csrc/rope.cu",
                 "csrc/group_gemm.cu",
                 "csrc/quantization.cu",
