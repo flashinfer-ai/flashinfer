@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.1.4](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.3...v0.1.4) (2024-08-09)
+
+
+### Features
+
+* append attention kernels for fp8 kv-cache ([#420](https://github.com/flashinfer-ai/flashinfer/issues/420)) ([906c2f5](https://github.com/flashinfer-ai/flashinfer/commit/906c2f5df3b35df45a4fb2614815308b662099ea))
+* support min_p sampling ([#422](https://github.com/flashinfer-ai/flashinfer/pull/422)) ([d52f2da](https://github.com/flashinfer-ai/flashinfer/commit/d52f2da6825f0fd7f614bf3a2db3b75c8fef961b))
+* deterministic sampling ([#417](https://github.com/flashinfer-ai/flashinfer/issues/417)) ([0dd801d](https://github.com/flashinfer-ai/flashinfer/commit/0dd801d2027af89f3603cbbf68a76e9503bb2f57))
+* more sampling operator options ([#431](https://github.com/flashinfer-ai/flashinfer/issues/431)) ([68df9c4](https://github.com/flashinfer-ai/flashinfer/commit/68df9c487e672b4a4ea3be97aed63a48aac5945b))
+* support fused add rmsnorm ([#419](https://github.com/flashinfer-ai/flashinfer/issues/419)) ([b781513](https://github.com/flashinfer-ai/flashinfer/commit/b78151383d4a75094195cba29aba45d694d5fdb7))
+* support fused silu mul ([#427](https://github.com/flashinfer-ai/flashinfer/issues/427)) ([ea0ba9a](https://github.com/flashinfer-ai/flashinfer/commit/ea0ba9a51238597bd7863b6e3c9bfda574df4df5))
+
+### Bug Fixes
+
+* fix dispatch fp16 type when enable fp8 ([#430](https://github.com/flashinfer-ai/flashinfer/pull/430)) ([daa5566](https://github.com/flashinfer-ai/flashinfer/commit/daa556697fed849810745f0aae0015d8e4460050))
+* improve numerical stability of sampling kernels ([#429](https://github.com/flashinfer-ai/flashinfer/pull/429)) ([898d8ea](https://github.com/flashinfer-ai/flashinfer/commit/898d8ea8a21f5850288bc4a860399678131a2d30))
+
+### Other improvements
+
+* break up `_kernels` into multiple modules ([#428](https://github.com/flashinfer-ai/flashinfer/pull/428)) ([8e482d9](https://github.com/flashinfer-ai/flashinfer/commit/8e482d92cb0ad046ec5f57509f9473e76bd668fe))
+
+### Acknowledgement
+
+We thank contributions and feedbacks from the community: [@comaniac](https://github.com/comaniac), [@esmeetu](https://github.com/esmeetu), [@LiuXiaoxuanPKU](https://github.com/LiuXiaoxuanPKU), [@peng1999](https://github.com/peng1999), [@xslingcn](https://github.com/xslingcn), [@Yard1](https://github.com/Yard1), [@zhyncs](https://github.com/zhyncs).
+
+
 ## [0.1.3](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.2...v0.1.3) (2024-07-31)
 
 ### Bugfix
@@ -7,7 +33,7 @@
 * bugfix: Fix cudagraph mode of BatchPrefillWithRaggedKVCacheWrapper ([#412](https://github.com/flashinfer-ai/flashinfer/pull/412)) ([9907bc](https://github.com/flashinfer-ai/flashinfer/commit/9907bc163eec7677870014b6ed5bb1789cc584f0))
 * fix cu118 cub usage for sampling kernels ([#410](https://github.com/flashinfer-ai/flashinfer/pull/410)) ([58d359](https://github.com/flashinfer-ai/flashinfer/commit/58d35930740083f27e65c9818ab857f9f4880aff))
 
-### Misc
+### MiscBreak up _kernels into multiple modules 
 
 * enhance allocator error info and add shape check for prefill begin forward functions ([#413](https://github.com/flashinfer-ai/flashinfer/pull/413)) ([5e36c5](https://github.com/flashinfer-ai/flashinfer/commit/5e36c527bb10c9331a17d4ecd609120406280979))
 
