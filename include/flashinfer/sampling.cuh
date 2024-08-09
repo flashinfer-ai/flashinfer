@@ -685,7 +685,7 @@ cudaError_t ParallelSamplingFromProb(T* probs, T* uniform_samples, IdType* outpu
 
 template <typename T, typename IdType>
 cudaError_t TopKSamplingFromProb(T* probs, T* uniform_samples, IdType* output, bool* success,
-                                 T* top_k_arr, uint32_t batch_size, IdType top_k_val, uint32_t d,
+                                 T* top_k_arr, uint32_t batch_size, uint32_t top_k_val, uint32_t d,
                                  uint32_t max_top_k_rounds, bool deterministic,
                                  cudaStream_t stream = 0) {
   constexpr uint32_t BLOCK_THREADS = 1024;
@@ -897,7 +897,7 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, DType* 
 
 template <uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE,
           typename DType, typename IdType>
-__global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType top_k_arr,
+__global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType* top_k_arr,
                                      uint32_t top_k_val, float eps, uint32_t d) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   const uint32_t row_idx = bx;

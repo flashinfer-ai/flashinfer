@@ -164,7 +164,7 @@ def test_top_k_top_p_sampling(batch_size, vocab_size, p):
     for _ in range(num_trails):
         uniform_samples.uniform_()
         samples, success = flashinfer.sampling.top_k_top_p_sampling_from_probs(
-            normalized_prob, uniform_samples, top_k_tensor, top_p_tensor
+            normalized_prob, uniform_samples, top_k_tensor, top_p_tensor, filter_apply_order="joint"
         )
         assert torch.all(success)
         assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
@@ -224,6 +224,27 @@ def test_top_k_renorm_prob(batch_size, vocab_size, k):
         rtol=1e-3,
         atol=1e-3,
     )
+
+
+# @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
+# @pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+# @pytest.mark.parametrize("k", [10, 100, 500])
+# def test_top_k_mask_logits(batch_size, vocab_size, k):
+#     if k > vocab_size:
+#         pytest.skip("k should be less than vocab_size")
+#     torch.manual_seed(42)
+#     logits = torch.randn(batch_size, vocab_size).to(0)
+#     probs = torch.softmax(logits, dim=-1)
+#     masked_logits = flashinfer.sampling.top_k_mask_logits(logits, k, eps=1e-3)
+#     renormed_probs = torch.softmax(masked_logits, dim=-1)
+#     renormed_probs_ref = flashinfer.sampling.top_k_renorm_prob(probs, k, eps=1e-8)
+
+#     numpy.testing.assert_allclose(
+#         renormed_probs.cpu().numpy(),
+#         renormed_probs_ref.cpu().numpy(),
+#         rtol=1e-3,
+#         atol=1e-3,
+#     )
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
@@ -286,10 +307,11 @@ def test_chain_speculative_sampling(
 
 
 if __name__ == "__main__":
-    test_sampling(1, 111)
-    test_top_p_sampling(3, 111, 0.9)
-    test_top_k_sampling(3, 111, 10)
-    test_top_p_renorm_prob(3, 111, 0.9)
-    test_top_k_renorm_prob(3, 111, 10)
-    test_chain_speculative_sampling(3, 111, 3, False)
-    test_chain_speculative_sampling(3, 111, 3, True)
+    # test_sampling(1, 111)
+    # test_top_p_sampling(3, 111, 0.9)
+    # test_top_k_sampling(3, 111, 10)
+    # test_top_p_renorm_prob(3, 111, 0.9)
+    # test_top_k_renorm_prob(3, 111, 10)
+    test_top_k_mask_logits(3, 111, 10)
+    # test_chain_speculative_sampling(3, 111, 3, False)
+    # test_chain_speculative_sampling(3, 111, 3, True)

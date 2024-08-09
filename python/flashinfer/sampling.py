@@ -293,7 +293,7 @@ def min_p_sampling_from_probs(
     implementation usually use much fewer rounds for rejection sampling because of early stopping.
     """
     return _kernels.min_p_sampling_from_probs(
-        probs, uniform_samples, _to_tensor_scalar_tuple(min_p), deterministic
+        probs, uniform_samples, *_to_tensor_scalar_tuple(min_p), deterministic
     )
 
 
@@ -511,7 +511,7 @@ def top_p_renorm_prob(
     This combination of ``top_p_renorm_prob`` and ``sampling_from_probs`` should be equivalent to
     ``top_p_sampling_from_probs``.
     """
-    return _kernels.top_p_renorm_prob(probs, _to_tensor_scalar_tuple(top_p), eps)
+    return _kernels.top_p_renorm_prob(probs, *_to_tensor_scalar_tuple(top_p), eps)
 
 
 def top_k_renorm_prob(
@@ -542,7 +542,7 @@ def top_k_renorm_prob(
     This combination of ``top_k_renorm_prob`` and ``sampling_from_probs`` should be equivalent to
     ``top_k_sampling_from_probs``.
     """
-    return _kernels.top_k_renorm_prob(probs, _to_tensor_scalar_tuple(top_k), eps)
+    return _kernels.top_k_renorm_prob(probs, *_to_tensor_scalar_tuple(top_k), eps)
 
 
 def top_k_mask_logits(
@@ -572,7 +572,7 @@ def top_k_mask_logits(
     ----
     The combination of ``top_k_mask_logits`` and ``softmax`` should be equivalent to ``top_k_renorm_prob``.
     """
-    return _kernels.top_k_mask_logits(logits, _to_tensor_scalar_tuple(top_k), eps)
+    return _kernels.top_k_mask_logits(logits, *_to_tensor_scalar_tuple(top_k), eps)
 
 
 def chain_speculative_sampling(
