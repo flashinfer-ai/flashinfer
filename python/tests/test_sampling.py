@@ -132,7 +132,8 @@ def test_min_p_sampling(batch_size, vocab_size, p):
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
 @pytest.mark.parametrize("p", [0.1, 0.5])
-def test_top_k_top_p_sampling(batch_size, vocab_size, p):
+def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
+    torch.manual_seed(42)
     if p == 0.1:
         k = int(vocab_size * 0.5)
     elif p == 0.5:
@@ -164,13 +165,66 @@ def test_top_k_top_p_sampling(batch_size, vocab_size, p):
     for _ in range(num_trails):
         uniform_samples.uniform_()
         samples, success = flashinfer.sampling.top_k_top_p_sampling_from_probs(
-            normalized_prob, uniform_samples, top_k_tensor, top_p_tensor
+            normalized_prob,
+            uniform_samples,
+            top_k_tensor,
+            top_p_tensor,
+            filter_apply_order="joint",
         )
         assert torch.all(success)
         assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
         assert torch.all(mask[torch.arange(batch_size), samples] == 1), normalized_prob[
             torch.arange(batch_size), samples
         ]
+
+
+@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize("k", [100])
+@pytest.mark.parametrize("p", [0.1, 0.5])
+def test_top_k_top_p_sampling_from_probs_logits_alignment(batch_size, vocab_size, k, p):
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size).to(0) * 5
+    uniform_samples = torch.empty(32, batch_size).to(0)
+    samples, success = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+        logits, uniform_samples, k, p, filter_apply_order="top_k_first"
+    )
+    samples_ref, success_ref = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+        torch.softmax(logits, dim=-1),
+        uniform_samples,
+        k,
+        p,
+        filter_apply_order="top_k_first",
+    )
+    assert torch.all(samples == samples_ref)
+    assert torch.all(success)
+    assert torch.all(success_ref)
+
+
+@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize("p", [0.1, 0.5])
+def test_top_k_top_p_joint_sampling_from_logits(batch_size, vocab_size, p):
+    torch.manual_seed(42)
+    logits = torch.rand(batch_size, vocab_size).to(0) * 5
+    uniform_samples = torch.empty(32, batch_size).to(0)
+    if p == 0.1:
+        k = int(vocab_size * 0.5)
+    elif p == 0.5:
+        k = int(vocab_size * 0.1)
+    else:
+        raise ValueError("p not recognized")
+
+    samples, success = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+        logits, uniform_samples, k, p, filter_apply_order="joint"
+    )
+
+    samples_ref, success_ref = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+        torch.softmax(logits, dim=-1), uniform_samples, k, p, filter_apply_order="joint"
+    )
+    assert torch.all(samples == samples_ref)
+    assert torch.all(success)
+    assert torch.all(success_ref)
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
@@ -221,6 +275,27 @@ def test_top_k_renorm_prob(batch_size, vocab_size, k):
     numpy.testing.assert_allclose(
         renorm_prob_ground_truth.cpu().numpy(),
         renorm_prob.cpu().numpy(),
+        rtol=1e-3,
+        atol=1e-3,
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize("k", [10, 100, 500])
+def test_top_k_mask_logits(batch_size, vocab_size, k):
+    if k > vocab_size:
+        pytest.skip("k should be less than vocab_size")
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size).to(0) * 5
+    probs = torch.softmax(logits, dim=-1)
+    masked_logits = flashinfer.sampling.top_k_mask_logits(logits, k)
+    renormed_probs = torch.softmax(masked_logits, dim=-1)
+    renormed_probs_ref = flashinfer.sampling.top_k_renorm_prob(probs, k, 1e-8)
+
+    numpy.testing.assert_allclose(
+        renormed_probs.cpu().numpy(),
+        renormed_probs_ref.cpu().numpy(),
         rtol=1e-3,
         atol=1e-3,
     )
@@ -291,5 +366,6 @@ if __name__ == "__main__":
     test_top_k_sampling(3, 111, 10)
     test_top_p_renorm_prob(3, 111, 0.9)
     test_top_k_renorm_prob(3, 111, 10)
+    test_top_k_mask_logits(99, 989, 10)
     test_chain_speculative_sampling(3, 111, 3, False)
     test_chain_speculative_sampling(3, 111, 3, True)

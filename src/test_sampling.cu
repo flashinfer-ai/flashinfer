@@ -61,7 +61,7 @@ void _TestTopKSamplingFromProb(size_t batch_size, uint32_t k, size_t vocab_size)
         thrust::raw_pointer_cast(probs_d.data()),
         thrust::raw_pointer_cast(uniform_samples_d.data()),
         thrust::raw_pointer_cast(sampled_ids_d.data()), thrust::raw_pointer_cast(success_d.data()),
-        k, batch_size, vocab_size, max_top_p_rounds, /*deterministic=*/true);
+        /*top_k_arr=*/nullptr, batch_size, k, vocab_size, max_top_p_rounds, /*deterministic=*/true);
 
     EXPECT_EQ(status, cudaSuccess) << "TopKSamplingFromProb kernel launch failed, error message: "
                                    << cudaGetErrorString(status);
@@ -126,7 +126,7 @@ void _TestTopPSamplingFromProb(size_t batch_size, uint32_t k, size_t vocab_size)
         thrust::raw_pointer_cast(probs_d.data()),
         thrust::raw_pointer_cast(uniform_samples_d.data()),
         thrust::raw_pointer_cast(sampled_ids_d.data()), thrust::raw_pointer_cast(success_d.data()),
-        p, batch_size, vocab_size, max_top_p_rounds, /*deterministic=*/true);
+        /*top_p_arr=*/nullptr, batch_size, p, vocab_size, max_top_p_rounds, /*deterministic=*/true);
 
     EXPECT_EQ(status, cudaSuccess) << "TopPSamplingFromProb kernel launch failed, error message: "
                                    << cudaGetErrorString(status);

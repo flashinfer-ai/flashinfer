@@ -39,25 +39,33 @@ torch::Tensor sampling_from_probs(torch::Tensor probs, torch::Tensor uniform_sam
                                   bool deterministic);
 
 std::vector<torch::Tensor> top_p_sampling_from_probs(torch::Tensor probs,
-                                                     torch::Tensor uniform_samples, double top_p,
-                                                     bool deterministic);
+                                                     torch::Tensor uniform_samples,
+                                                     std::optional<torch::Tensor> maybe_top_p_arr,
+                                                     double top_p_val, bool deterministic);
 
 std::vector<torch::Tensor> top_k_sampling_from_probs(torch::Tensor probs,
                                                      torch::Tensor uniform_samples,
-                                                     unsigned int top_k, bool deterministic);
+                                                     std::optional<torch::Tensor> maybe_top_k_arr,
+                                                     unsigned int top_k_val, bool deterministic);
 
 std::vector<torch::Tensor> min_p_sampling_from_probs(torch::Tensor probs,
                                                      torch::Tensor uniform_samples,
-                                                     torch::Tensor min_p, bool deterministic);
+                                                     std::optional<torch::Tensor> maybe_min_p_arr,
+                                                     double min_p_val, bool deterministic);
 
-std::vector<torch::Tensor> top_k_top_p_sampling_from_probs(torch::Tensor probs,
-                                                           torch::Tensor uniform_samples,
-                                                           torch::Tensor top_k, torch::Tensor top_p,
-                                                           bool deterministic);
+std::vector<torch::Tensor> top_k_top_p_sampling_from_probs(
+    torch::Tensor probs, torch::Tensor uniform_samples,
+    std::optional<torch::Tensor> maybe_top_k_arr, double top_k_val,
+    std::optional<torch::Tensor> maybe_top_p_arr, double top_p_val, bool deterministic);
 
-torch::Tensor top_p_renorm_prob(torch::Tensor probs, double top_p, double eps);
+torch::Tensor top_p_renorm_prob(torch::Tensor probs, std::optional<torch::Tensor> maybe_top_p_arr,
+                                double top_p_val, double eps);
 
-torch::Tensor top_k_renorm_prob(torch::Tensor probs, unsigned int top_k, double eps);
+torch::Tensor top_k_renorm_prob(torch::Tensor probs, std::optional<torch::Tensor> maybe_top_k_arr,
+                                unsigned int top_k_val, double eps);
+
+torch::Tensor top_k_mask_logits(torch::Tensor logits, std::optional<torch::Tensor> maybe_top_k_arr,
+                                unsigned int top_k_val, double eps);
 
 torch::Tensor chain_speculative_sampling(torch::Tensor draft_probs, torch::Tensor draft_token_ids,
                                          torch::Tensor uniform_samples, torch::Tensor target_probs,
