@@ -24,10 +24,18 @@ import flashinfer
 @pytest.mark.parametrize("dim", [128, 256, 512, 2048, 4096, 11008, 16384])
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
 @pytest.mark.parametrize("seq_len", [1, 2, 4, 8, 16, 32, 64, 128, 512])
-def test_fused_silu_mul(dim, batch_size, seq_len):
-    x = torch.randn(batch_size, seq_len, 2 * dim).to(0).to(torch.float16)
+@pytest.mark.parametrize("inplace", [True, False])
+def test_fused_silu_mul(dim, batch_size, seq_len, inplace):
+    x = torch.randn(batch_size, seq_len, 2 * dim, dtype=torch.float16, device="cuda:0")
     y_ref = x[..., dim:] * torch.nn.functional.silu(x[..., :dim])
-    y = flashinfer.activation.silu_and_mul(x)
-    numpy.testing.assert_allclose(
-        y_ref.cpu().numpy(), y.cpu().numpy(), rtol=1e-3, atol=1e-3
-    )
+    if not inplace:
+        y = flashinfer.activation.silu_and_mul(x)
+        numpy.testing.assert_allclose(
+            y_ref.cpu().numpy(), y.cpu().numpy(), rtol=1e-3, atol=1e-3
+        )
+    else:
+        y = torch.empty(batch_size, seq_len, dim, device=x.device, dtype=x.dtype)
+        flashinfer.activation.silu_and_mul(x, out=y)
+        numpy.testing.assert_allclose(
+            y_ref.cpu().numpy(), y.cpu().numpy(), rtol=1e-3, atol=1e-3
+        )
