@@ -283,7 +283,7 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, DType* uniform_samples,
                                            uint32_t d, uint32_t max_top_k_rounds) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
-  uint32_t top_k = top_k_arr == nullptr ? top_k_val : top_k_arr[bx];
+  uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[bx];
 
   extern __shared__ __align__(
       alignof(SamplingTempStorage<DType, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>))
@@ -455,7 +455,7 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
                                            uint32_t d, uint32_t max_min_p_rounds) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
-  DType min_p = (min_p_arr == nullptr) ? min_p_val : min_p_arr[bx];
+  DType p = (min_p_arr == nullptr) ? min_p_val : min_p_arr[bx];
 
   extern __shared__ __align__(
       alignof(SamplingTempStorage<DType, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>))
@@ -764,17 +764,16 @@ cudaError_t MinPSamplingFromProb(T* probs, T* uniform_samples, T* min_p_arr, IdT
 template <typename T, typename IdType>
 cudaError_t TopKTopPSamplingFromProb(T* probs, T* uniform_samples, IdType* top_k_arr, T* top_p_arr,
                                      IdType* output, bool* success, uint32_t batch_size,
-                                     IdType top_k_val, DType top_p_val, uint32_t d,
-                                     uint32_t max_rounds, bool deterministic,
-                                     cudaStream_t stream = 0) {
+                                     IdType top_k_val, T top_p_val, uint32_t d, uint32_t max_rounds,
+                                     bool deterministic, cudaStream_t stream = 0) {
   constexpr uint32_t BLOCK_THREADS = 1024;
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   const uint32_t smem_size = sizeof(SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
   dim3 nblks(batch_size);
   dim3 nthrs(BLOCK_THREADS);
-  void* args[] = {&probs,   &uniform_samples, &top_k,     &top_p, &output,
-                  &success, &top_k_val,       &top_p_val, &d,     &max_rounds};
+  void* args[] = {&probs,   &uniform_samples, &top_k_arr, &top_p_arr, &output,
+                  &success, &top_k_val,       &top_p_val, &d,         &max_rounds};
 
   DISPATCH_ALIGNED_VEC_SIZE(
       vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
@@ -797,6 +796,7 @@ struct RenormTempStorage {
   } block_prim;
   struct {
     T max_val;
+    T min_val;
     union {
       T value;
       int count;
@@ -902,16 +902,19 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   const uint32_t row_idx = bx;
   uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[bx];
+  if (k >= d) {
+    return;
+  }
 
   extern __shared__ __align__(alignof(RenormTempStorage<DType, BLOCK_THREADS, REDUCE_ALGO>))
       uint8_t smem_renorm[];
   auto& temp_storage =
       reinterpret_cast<RenormTempStorage<DType, BLOCK_THREADS, REDUCE_ALGO>&>(smem_renorm);
-  temp_storage.data.max_val = DType(0);
   vec_t<DType, VEC_SIZE> logits_vec;
   DType logits_greater_than_pivot[VEC_SIZE];  // pivot initialized to 0
 
-  DType threadlocal_max_val = DType(0);
+  DType threadlocal_max_val = DType(-std::numeric_limits<float>::infinity()),
+        threadlocal_min_val = DType(std::numeric_limits<float>::infinity());
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     logits_vec.fill(DType(0));
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
@@ -924,16 +927,22 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
     threadlocal_max_val =
         max(threadlocal_max_val,
             BlockReduce<DType, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-                .Reduce<VEC_SIZE>(probs_greater_than_pivot, cub::Max()));
+                .Reduce<VEC_SIZE>(logits_greater_than_pivot, cub::Max()));
     __syncthreads();
+    threadlocal_min_val =
+        min(threadlocal_min_val,
+            BlockReduce<DType, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
+                .Reduce<VEC_SIZE>(logits_greater_than_pivot, cub::Min()));
   }
   if (tx == 0) {
     temp_storage.data.max_val = threadlocal_max_val;
+    temp_storage.data.min_val = threadlocal_min_val;
   }
   __syncthreads();
   threadlocal_max_val = temp_storage.data.max_val;
+  threadlocal_min_val = temp_storage.data.min_val;
 
-  float low = 0, high = threadlocal_max_val;
+  float low = threadlocal_min_val - 1, high = threadlocal_max_val;
   // f(x) = len(nonzero(probs > x)), f(x) is non-increasing
   // loop invariant: f(low) >= k, f(high) < k
   while (high - low > eps) {
@@ -991,6 +1000,9 @@ __global__ void TopKRenormProbKernel(DType* probs, DType* renormed_prob, IdType*
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   const uint32_t row_idx = bx;
   uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[bx];
+  if (k >= d) {
+    return;
+  }
 
   extern __shared__ __align__(alignof(RenormTempStorage<DType, BLOCK_THREADS, REDUCE_ALGO>))
       uint8_t smem_renorm[];
@@ -1089,7 +1101,7 @@ cudaError_t TopPRenormProb(DType* probs, DType* renormed_prob, DType* top_p_arr,
   dim3 nthrs(BLOCK_THREADS);
   void* args[] = {&probs, &renormed_prob, &top_p_arr, &top_p_val, &eps, &d};
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    auto kernel = TopPRenormProbKernel<BLOCK_THREADS, REDUCE_ALGO, VEC_SIZE, DType, IdType>;
+    auto kernel = TopPRenormProbKernel<BLOCK_THREADS, REDUCE_ALGO, VEC_SIZE, DType>;
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
@@ -1097,7 +1109,7 @@ cudaError_t TopPRenormProb(DType* probs, DType* renormed_prob, DType* top_p_arr,
   return cudaSuccess;
 }
 
-template <typename DType>
+template <typename DType, typename IdType>
 cudaError_t TopKRenormProb(DType* probs, DType* renormed_prob, IdType* top_k_arr, float eps,
                            uint32_t batch_size, uint32_t top_k_val, uint32_t d,
                            cudaStream_t stream = 0) {
@@ -1127,7 +1139,7 @@ cudaError_t TopKMaskLogits(DType* logits, DType* masked_logits, IdType* top_k_ar
   const uint32_t smem_size = sizeof(RenormTempStorage<DType, BLOCK_THREADS, REDUCE_ALGO>);
   dim3 nblks(batch_size);
   dim3 nthrs(BLOCK_THREADS);
-  void* args[] = {&probs, &renormed_prob, &top_k_arr, &top_k_val, &eps, &d};
+  void* args[] = {&logits, &masked_logits, &top_k_arr, &top_k_val, &eps, &d};
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
     auto kernel = TopKMaskLogitsKernel<BLOCK_THREADS, REDUCE_ALGO, VEC_SIZE, DType, IdType>;
     FLASHINFER_CUDA_CALL(
