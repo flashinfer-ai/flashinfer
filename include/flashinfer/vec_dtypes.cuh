@@ -74,7 +74,7 @@ struct vec_cast<half, float> {
   }
 };
 
-#if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 890))
+#if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900))
 template <>
 struct vec_cast<__nv_fp8_e4m3, half> {
   template <size_t vec_size>
@@ -147,7 +147,7 @@ struct vec_cast<half, __nv_fp8_e5m2> {
   }
 };
 
-#endif  // !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 890)
+#endif  // !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900)
 
 #ifdef FLASHINFER_ENABLE_BF16
 
