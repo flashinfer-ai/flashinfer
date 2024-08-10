@@ -1588,11 +1588,10 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
   }
 }
 
-template <bool partition_kv, LogitsPostHook logits_post_hook, MaskMode mask_mode,
-          PosEncodingMode pos_encoding_mode, uint32_t num_frags_x, uint32_t num_frags_y,
-          uint32_t num_frags_z, uint32_t num_warps_x, uint32_t num_warps_z,
-          PageStorage page_storage, typename DTypeQ, typename DTypeKV, typename DTypeQKAccum,
-          typename DTypeOut, typename IdType>
+template <LogitsPostHook logits_post_hook, MaskMode mask_mode, PosEncodingMode pos_encoding_mode,
+          uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps_x,
+          uint32_t num_warps_z, PageStorage page_storage, typename DTypeQ, typename DTypeKV,
+          typename DTypeQKAccum, typename DTypeOut, typename IdType>
 __global__
 __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPagedKVCacheKernel(
     IdType* __restrict__ request_indices, IdType* __restrict__ q_tile_indices,
@@ -1601,7 +1600,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
     uint8_t* __restrict__ custom_mask, IdType* __restrict__ qk_indptr,
     IdType* __restrict__ q_offset, IdType* __restrict__ o_indptr, DTypeOut* __restrict__ o,
     float* __restrict__ lse, bool* __restrict__ block_valid_mask,
-    IdType* __restrict__ kv_chunk_size_ptr, const uint_fastdiv group_size,
+    IdType* __restrict__ kv_chunk_size_ptr, const bool partition_kv, const uint_fastdiv group_size,
     int32_t maybe_window_left, const float logits_soft_cap, float sm_scale,
     const float log2_rope_rcp_scale, const float log2_rope_rcp_theta) {
   static_assert(sizeof(DTypeQ) == 2);
@@ -1819,7 +1818,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
     }
     // apply mask
     if constexpr (mask_mode == MaskMode::kCustom) {
-      mask_s<partition_kv, mask_mode, num_frags_x, num_frags_y, num_frags_z>(
+      mask_s</*partition_kv=*/true, mask_mode, num_frags_x, num_frags_y, num_frags_z>(
           qo_packed_idx_base,
           chunk_start +
               (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) * num_frags_z * 16,
@@ -1827,7 +1826,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
           s_frag);
     } else {
       if (iter >= mask_iteration || iter < window_iteration) {
-        mask_s<partition_kv, mask_mode, num_frags_x, num_frags_y, num_frags_z>(
+        mask_s</*partition_kv=*/true, mask_mode, num_frags_x, num_frags_y, num_frags_z>(
             qo_packed_idx_base,
             chunk_start + (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) *
                               num_frags_z * 16,
@@ -1887,7 +1886,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
           const uint32_t qo_head_idx = kv_head_idx * group_size + r;
           const uint32_t qo_idx = q;
           if (qo_idx < qo_upper_bound) {
-            if constexpr (partition_kv) {
+            if (partition_kv) {
               lse[(o_indptr[request_idx] + qo_idx * num_kv_chunks + kv_tile_idx) * num_qo_heads +
                   qo_head_idx] = math::ptx_log2(d[fx][j]) + float(m[fx][j]);
             } else {
@@ -2293,16 +2292,14 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
       uint32_t smem_size = (num_frags_x * num_warps_x * sizeof(DTypeQ) +
                             num_frags_z * num_warps_z * 2 * sizeof(DTypeQ)) *
                            16 * HEAD_DIM;
-
+      auto kernel = BatchPrefillWithPagedKVCacheKernel<
+          LOGITS_POST_HOOK, MASK_MODE, pos_encoding_mode, num_frags_x, num_frags_y, num_frags_z,
+          num_warps_x, num_warps_z, page_storage, DTypeQ, DTypeKV, DTypeQKAccum, DTypeOut, IdType>;
+      FLASHINFER_CUDA_CALL(
+          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
       if (tmp_v == nullptr) {
         // do not partition kv
-        auto kernel = BatchPrefillWithPagedKVCacheKernel<
-            /*partition_kv=*/false, LOGITS_POST_HOOK, MASK_MODE, pos_encoding_mode, num_frags_x,
-            num_frags_y, num_frags_z, num_warps_x, num_warps_z, page_storage, DTypeQ, DTypeKV,
-            DTypeQKAccum, DTypeOut, IdType>;
-
-        FLASHINFER_CUDA_CALL(
-            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        bool partition_kv = false;
         void* args[] = {(void*)&request_indices,
                         (void*)&q_tile_indices,
                         (void*)&kv_tile_indices,
@@ -2317,6 +2314,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
                         (void*)&lse,
                         (void*)&block_valid_mask,
                         (void*)&kv_chunk_size_ptr,
+                        (void*)&partition_kv,
                         (void*)&group_size_fastdiv,
                         (void*)&window_left,
                         (void*)&logits_soft_cap,
@@ -2326,13 +2324,6 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
       } else {
-        auto kernel = BatchPrefillWithPagedKVCacheKernel<
-            /*partition_kv=*/true, LOGITS_POST_HOOK, MASK_MODE, pos_encoding_mode, num_frags_x,
-            num_frags_y, num_frags_z, num_warps_x, num_warps_z, page_storage, DTypeQ, DTypeKV,
-            DTypeQKAccum, DTypeOut, IdType>;
-
-        FLASHINFER_CUDA_CALL(
-            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         void* args[] = {(void*)&request_indices,
                         (void*)&q_tile_indices,
                         (void*)&kv_tile_indices,
@@ -2347,6 +2338,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
                         (void*)&tmp_s,
                         (void*)&block_valid_mask,
                         (void*)&kv_chunk_size_ptr,
+                        (void*)&partition_kv,
                         (void*)&group_size_fastdiv,
                         (void*)&window_left,
                         (void*)&logits_soft_cap,
