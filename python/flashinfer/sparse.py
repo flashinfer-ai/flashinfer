@@ -28,12 +28,12 @@ from .utils import (
 
 # mypy: disable-error-code="attr-defined"
 try:
-    from . import _kernels
+    from . import _prefill
 except ImportError as e:
     import os
 
     if os.environ.get("BUILD_DOC", "0") == "1":
-        _kernels = None
+        _prefill = None
         logging.warning("Kernels are not loaded in documentation build mode.")
     else:
         raise e
@@ -123,7 +123,7 @@ class BlockSparseAttentionWrapper:
             same as the device of the input tensors.
         """
         self._workspace_buffer = workspace_buffer
-        self._wrapper = _kernels.BatchPrefillWithPagedKVCachePyTorchWrapper(
+        self._wrapper = _prefill.BatchPrefillWithPagedKVCachePyTorchWrapper(
             TensorLayout["NHD"].value,
             False,  # use_cuda_graph
         )
@@ -342,6 +342,7 @@ class BlockSparseAttentionWrapper:
                 False,  # causal
                 PosEncodingMode[pos_encoding_mode].value,
                 allow_fp16_qk_reduction,
+                -1,  # window_left
                 logits_soft_cap,
                 sm_scale,
                 rope_scale,
@@ -362,6 +363,7 @@ class BlockSparseAttentionWrapper:
                 self._qk_indptr_buf,
                 PosEncodingMode[pos_encoding_mode].value,
                 allow_fp16_qk_reduction,
+                -1,  # window_left
                 logits_soft_cap,
                 sm_scale,
                 rope_scale,
