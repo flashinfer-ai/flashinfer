@@ -34,7 +34,7 @@
 
 namespace flashinfer {
 
-template <LogitsPostHook logits_post_hook, bool partition_kv, PosEncodingMode pos_encoding_mode,
+template <LogitsPostHook logits_post_hook, PosEncodingMode pos_encoding_mode,
           uint32_t num_stages_smem, uint32_t tile_size_per_bdx, uint32_t vec_size, uint32_t bdx,
           uint32_t bdy, uint32_t bdz, PageStorage page_storage, typename DTypeQ, typename DTypeKV,
           typename DTypeOut, typename IdType>
@@ -42,8 +42,9 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
     DTypeQ* __restrict__ q, IdType* __restrict__ q_offset,
     paged_kv_t<page_storage, DTypeKV, IdType> paged_kv,
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* __restrict__ o,
-    float* __restrict__ lse, bool* __restrict__ block_valid_mask, int maybe_window_left,
-    float logits_soft_cap, float sm_scale, float rope_rcp_scale, float rope_rcp_theta);
+    float* __restrict__ lse, bool* __restrict__ block_valid_mask, bool partition_kv,
+    int maybe_window_left, float logits_soft_cap, float sm_scale, float rope_rcp_scale,
+    float rope_rcp_theta);
 
 /*!
  * \brief Compute the maximum number of pages per batch and the new batch size
@@ -156,9 +157,8 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
       2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * HEAD_DIM * sizeof(DTypeKV) +
       std::max(tile_size_per_bdx * num_threads * sizeof(DTypeKV*), 2 * bdy * bdz * sizeof(float));
 
-  auto partition_kv_kernel =
-      BatchDecodeWithPagedKVCacheKernel<LOGITS_POST_HOOK,
-                                        /*partition_kv=*/true, POS_ENCODING_MODE, num_stages_smem,
+  auto kernel =
+      BatchDecodeWithPagedKVCacheKernel<LOGITS_POST_HOOK, POS_ENCODING_MODE, num_stages_smem,
                                         tile_size_per_bdx, vec_size, bdx, bdy, bdz, page_storage,
                                         DTypeQ, DTypeKV, DTypeOut, IdType>;
   int num_blocks_per_sm = 0;
@@ -166,8 +166,8 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
   int dev_id = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
-  FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &num_blocks_per_sm, partition_kv_kernel, num_threads, smem_size));
+  FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
+                                                                     num_threads, smem_size));
   max_grid_size = num_blocks_per_sm * num_sm;
   if (batch_size * num_kv_heads >= max_grid_size) {
     split_kv = false;
