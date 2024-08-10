@@ -17,6 +17,7 @@
 #ifndef FLASHINFER_ACTIVATION_CUH_
 #define FLASHINFER_ACTIVATION_CUH_
 
+#include "math.cuh"
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
 
@@ -28,6 +29,13 @@ namespace activation {
 __device__ __forceinline__ float silu_kernel(const float& val) {
   // NOTE(Zihao): use __fdividef might be faster, at the cost of precision
   return val / (1.0f + __expf(-val));
+}
+
+template <typename T>
+__device__ __forceinline__ T gelu_tanh_kernel(const T& val) {
+  const float cdf =
+      0.5f * (1.0f + math::tanh((0.7978845608028654f * (val + 0.044715f * val * val * val))));
+  return val * cdf;
 }
 
 template <typename T, float (*Activation)(const float&)>

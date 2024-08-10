@@ -26,7 +26,7 @@ from .decode import (
     CUDAGraphBatchDecodeWithPagedKVCacheWrapper,
     single_decode_with_kv_cache,
 )
-from .activation import silu_and_mul
+from .activation import gelu_tanh_and_mul, silu_and_mul
 from .group_gemm import SegmentGEMMWrapper
 from .norm import fused_add_rmsnorm, rmsnorm
 from .page import append_paged_kv_cache
