@@ -2324,6 +2324,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
       } else {
+        bool partition_kv = false;
         void* args[] = {(void*)&request_indices,
                         (void*)&q_tile_indices,
                         (void*)&kv_tile_indices,
