@@ -101,45 +101,54 @@ constexpr FLASHINFER_INLINE int get_mantissa_bits() {
 }
 
 /*!
- * \brief Fallback to Marlin's fast dequant implementation if hardware dequantization is
- * not available.
+ * \brief Fallback to software fast dequant implementation if hardware dequantization is not
+ * available.
+ * \note Inspired by Marlin's fast dequantization, but here we don't have to permute
+ * weights order.
  * \ref
  * https://github.com/vllm-project/vllm/blob/6dffa4b0a6120159ef2fe44d695a46817aff65bc/csrc/quantization/fp8/fp8_marlin.cu#L120
  */
 template <typename fp8_dtype, typename fp16_dtype>
-__device__ void marlin_dequant_f8f16x4(uint32_t* input, uint2* output) {
-  constexpr int FP8_EXPONENT = get_exponent_bits<fp8_dtype>();
-  constexpr int FP8_MANTISSA = get_mantissa_bits<fp8_dtype>();
-  constexpr int FP16_EXPONENT = get_exponent_bits<fp16_dtype>();
+__device__ void fast_dequant_f8f16x4(uint32_t* input, uint2* output) {
   uint32_t q = *input;
-  constexpr int RIGHT_SHIFT = FP16_EXPONENT - FP8_EXPONENT;
-  // Calculate MASK for extracting mantissa and exponent
-  constexpr int MASK1 = 0x80000000;
-  constexpr int MASK2 = MASK1 >> (FP8_EXPONENT + FP8_MANTISSA);
-  constexpr int MASK3 = MASK2 & 0x7fffffff;
-  constexpr int MASK = MASK3 | (MASK3 >> 16);
-  // Final MASK value: 0x7F007F00
-
-  // Extract and shift FP8 values to FP16 format
-  int Out1 = (q & 0x80008000) | ((q & MASK) >> RIGHT_SHIFT);
-  int Out2 = ((q << 8) & 0x80008000) | (((q << 8) & MASK) >> RIGHT_SHIFT);
-
-  constexpr int BIAS_OFFSET = (1 << (FP16_EXPONENT - 1)) - (1 << (FP8_EXPONENT - 1));
-  // Construct and apply exponent bias
-  if (std::is_same<fp16_dtype, half>::value) {
-    const half2 bias_reg = __float2half2_rn(float(1 << BIAS_OFFSET));
-
-    // Convert to half2 and apply bias
-    *(half2*)&(output->x) = __hmul2(*reinterpret_cast<const half2*>(&Out1), bias_reg);
-    *(half2*)&(output->y) = __hmul2(*reinterpret_cast<const half2*>(&Out2), bias_reg);
+  if constexpr (std::is_same<fp8_dtype, __nv_fp8_e5m2>::value &&
+                std::is_same<fp16_dtype, half>::value) {
+    output->x = __byte_perm(0U, q, 0x5140);
+    output->y = __byte_perm(0U, q, 0x7362);
   } else {
-    constexpr uint32_t BIAS = (BIAS_OFFSET + 127) << 23;
-    const nv_bfloat162 bias_reg =
-        __float2bfloat162_rn(*reinterpret_cast<const float*>(&BIAS));
+    constexpr int FP8_EXPONENT = get_exponent_bits<fp8_dtype>();
+    constexpr int FP8_MANTISSA = get_mantissa_bits<fp8_dtype>();
+    constexpr int FP16_EXPONENT = get_exponent_bits<fp16_dtype>();
 
-    // Convert to bfloat162 and apply bias
-    *(nv_bfloat162*)&(output->x) = __hmul2(*reinterpret_cast<const nv_bfloat162*>(&Out1), bias_reg);
-    *(nv_bfloat162*)&(output->y) = __hmul2(*reinterpret_cast<const nv_bfloat162*>(&Out2), bias_reg);
+    constexpr int RIGHT_SHIFT = FP16_EXPONENT - FP8_EXPONENT;
+    // Calculate MASK for extracting mantissa and exponent
+    constexpr int MASK1 = 0x80000000;
+    constexpr int MASK2 = MASK1 >> (FP8_EXPONENT + FP8_MANTISSA);
+    constexpr int MASK3 = MASK2 & 0x7fffffff;
+    constexpr int MASK = MASK3 | (MASK3 >> 16);
+    // Final MASK value: 0x7F007F00
+
+    // Extract and shift FP8 values to FP16 format
+    uint32_t Out1 = (q & 0x80008000) | ((q & MASK) >> RIGHT_SHIFT);
+    uint32_t Out2 = ((q << 8) & 0x80008000) | (((q << 8) & MASK) >> RIGHT_SHIFT);
+
+    constexpr int BIAS_OFFSET = (1 << (FP16_EXPONENT - 1)) - (1 << (FP8_EXPONENT - 1));
+    // Construct and apply exponent bias
+    if (std::is_same<fp16_dtype, half>::value) {
+      const half2 bias_reg = __float2half2_rn(float(1 << BIAS_OFFSET));
+
+      // Convert to half2 and apply bias
+      *(half2*)&Out1 = __hmul2(*reinterpret_cast<const half2*>(&Out1), bias_reg);
+      *(half2*)&Out2 = __hmul2(*reinterpret_cast<const half2*>(&Out2), bias_reg);
+    } else {
+      constexpr uint32_t BIAS = (BIAS_OFFSET + 127) << 23;
+      const nv_bfloat162 bias_reg = __float2bfloat162_rn(*reinterpret_cast<const float*>(&BIAS));
+      // Convert to bfloat162 and apply bias
+      *(nv_bfloat162*)&Out1 = __hmul2(*reinterpret_cast<const nv_bfloat162*>(&Out1), bias_reg);
+      *(nv_bfloat162*)&Out2 = __hmul2(*reinterpret_cast<const nv_bfloat162*>(&Out2), bias_reg);
+    }
+    output->x = __byte_perm(Out1, Out2, 0x1054);
+    output->y = __byte_perm(Out1, Out2, 0x3276);
   }
 }
 
@@ -156,8 +165,8 @@ struct vec_cast<nv_bfloat16, __nv_fp8_e4m3> {
       static_assert(vec_size % 4 == 0, "vec_size must be a multiple of 4");
 #pragma unroll
       for (uint32_t i = 0; i < vec_size / 4; ++i) {
-        marlin_dequant_f8f16x4<__nv_fp8_e4m3, nv_bfloat16>((uint32_t*)&src[i * 4],
-                                                           (uint2*)&dst[i * 4]);
+        fast_dequant_f8f16x4<__nv_fp8_e4m3, nv_bfloat16>((uint32_t*)&src[i * 4],
+                                                         (uint2*)&dst[i * 4]);
       }
     }
   }
@@ -176,8 +185,8 @@ struct vec_cast<nv_bfloat16, __nv_fp8_e5m2> {
       static_assert(vec_size % 4 == 0, "vec_size must be a multiple of 4");
 #pragma unroll
       for (uint32_t i = 0; i < vec_size / 4; ++i) {
-        marlin_dequant_f8f16x4<__nv_fp8_e5m2, nv_bfloat16>((uint32_t*)&src[i * 4],
-                                                           (uint2*)&dst[i * 4]);
+        fast_dequant_f8f16x4<__nv_fp8_e5m2, nv_bfloat16>((uint32_t*)&src[i * 4],
+                                                         (uint2*)&dst[i * 4]);
       }
     }
   }
@@ -259,7 +268,7 @@ struct vec_cast<half, __nv_fp8_e4m3> {
       static_assert(vec_size % 4 == 0, "vec_size must be a multiple of 4");
 #pragma unroll
       for (uint32_t i = 0; i < vec_size / 4; ++i) {
-        marlin_dequant_f8f16x4<__nv_fp8_e4m3, half>((uint32_t*)&src[i * 4], (uint2*)&dst[i * 4]);
+        fast_dequant_f8f16x4<__nv_fp8_e4m3, half>((uint32_t*)&src[i * 4], (uint2*)&dst[i * 4]);
       }
     }
 #endif  // FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
@@ -292,7 +301,7 @@ struct vec_cast<half, __nv_fp8_e5m2> {
       static_assert(vec_size % 4 == 0, "vec_size must be a multiple of 4");
 #pragma unroll
       for (uint32_t i = 0; i < vec_size / 4; ++i) {
-        marlin_dequant_f8f16x4<__nv_fp8_e4m3, half>((uint32_t*)&src[i * 4], (uint2*)&dst[i * 4]);
+        fast_dequant_f8f16x4<__nv_fp8_e5m2, half>((uint32_t*)&src[i * 4], (uint2*)&dst[i * 4]);
       }
     }
 #endif  // FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED

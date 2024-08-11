@@ -32,6 +32,8 @@ flashinfer_option(FLASHINFER_CASCADE "Whether to compile cascade kernel tests/be
 flashinfer_option(FLASHINFER_SAMPLING "Whether to compile sampling kernel tests/benchmarks or not." OFF)
 flashinfer_option(FLASHINFER_NORM "Whether to compile normalization kernel tests/benchmarks or not." OFF)
 flashinfer_option(FLASHINFER_DISTRIBUTED "Whether to compile distributed kernel tests/benchmarks or not." OFF)
+flashinfer_option(FLASHINFER_FASTDIV_TEST "Whether to compile fastdiv kernel tests or not." OFF)
+flashinfer_option(FLASHINFER_FASTDEQAUNT_TEST "Whether to compile fast dequant kernel tests or not." OFF)
 flashinfer_option(FLASHINFER_TVM_BINDING "Whether to compile tvm binding or not." OFF)
 flashinfer_option(FLASHINFER_TVM_SOURCE_DIR "The path to tvm for building tvm binding." "")
 
@@ -476,6 +478,17 @@ if(FLASHINFER_FASTDIV_TEST)
   target_include_directories(test_fastdiv PRIVATE ${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
   target_link_libraries(test_fastdiv PRIVATE gtest gtest_main)
 endif(FLASHINFER_FASTDIV_TEST)
+
+if(FLASHINFER_FASTDEQUANT_TEST)
+  message(STATUS "Compile fast dequant test.")
+  file(GLOB_RECURSE TEST_FAST_DEQUANT_SRCS ${PROJECT_SOURCE_DIR}/src/test_fast_dequant.cu)
+  add_executable(test_fast_dequant ${TEST_FAST_DEQUANT_SRCS})
+  target_include_directories(test_fast_dequant PRIVATE ${FLASHINFER_INCLUDE_DIR})
+  target_include_directories(test_fast_dequant PRIVATE ${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
+  target_link_libraries(test_fast_dequant PRIVATE gtest gtest_main)
+endif(FLASHINFER_FASTDIV_TEST)
+
+
 
 if (FLASHINFER_DISTRIBUTED)
   find_package(MPI REQUIRED)
