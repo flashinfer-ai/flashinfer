@@ -25,9 +25,9 @@
 
 namespace flashinfer {
 
-// #if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900))
-// #define FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
-// #endif
+#if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900))
+#define FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
+#endif
 
 #define FLASHINFER_INLINE inline __attribute__((always_inline)) __device__
 
