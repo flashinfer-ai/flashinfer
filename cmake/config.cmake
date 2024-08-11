@@ -18,6 +18,8 @@ set(FLASHINFER_SAMPLING ON)
 set(FLASHINFER_NORMALIZATION ON)
 # Whether to compile fastdiv tests
 set(FLASHINFER_FASTDIV_TEST ON)
+# Whether to compile fastdequant tests
+set(FLASHINFER_FASTDEQUANT_TEST ON)
 # Whether to compile distributed tests
 set(FLASHINFER_DISTRIBUTED ON)
 # The following configurations can impact the binary

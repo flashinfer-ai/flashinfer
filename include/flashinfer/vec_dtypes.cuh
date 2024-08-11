@@ -16,18 +16,18 @@
 #ifndef VEC_DTYPES_CUH_
 #define VEC_DTYPES_CUH_
 
-#ifdef FLASHINFER_ENABLE_BF16
 #include <cuda_bf16.h>
-#endif
 #include <cuda_fp16.h>
-#ifdef FLASHINFER_ENABLE_FP8
 #include <cuda_fp8.h>
-#endif
 #include <cuda_runtime.h>
 
 #include <type_traits>
 
 namespace flashinfer {
+
+#if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900))
+#define FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
+#endif
 
 #define FLASHINFER_INLINE inline __attribute__((always_inline)) __device__
 
@@ -74,11 +74,130 @@ struct vec_cast<half, float> {
   }
 };
 
-#if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900))
+template <typename T>
+constexpr FLASHINFER_INLINE int get_exponent_bits() {
+  if constexpr (std::is_same<T, __nv_fp8_e4m3>::value) {
+    return 4;
+  } else if constexpr (std::is_same<T, __nv_fp8_e5m2>::value) {
+    return 5;
+  } else if constexpr (std::is_same<T, half>::value) {
+    return 5;
+  } else if constexpr (std::is_same<T, nv_bfloat16>::value) {
+    return 8;
+  }
+}
+
+template <typename T>
+constexpr FLASHINFER_INLINE int get_mantissa_bits() {
+  if constexpr (std::is_same<T, __nv_fp8_e4m3>::value) {
+    return 3;
+  } else if constexpr (std::is_same<T, __nv_fp8_e5m2>::value) {
+    return 2;
+  } else if constexpr (std::is_same<T, half>::value) {
+    return 11;
+  } else if constexpr (std::is_same<T, nv_bfloat16>::value) {
+    return 7;
+  }
+}
+
+/*!
+ * \brief Fallback to software fast dequant implementation if hardware dequantization is not
+ * available.
+ * \note Inspired by Marlin's fast dequantization, but here we don't have to permute
+ * weights order.
+ * \ref
+ * https://github.com/vllm-project/vllm/blob/6dffa4b0a6120159ef2fe44d695a46817aff65bc/csrc/quantization/fp8/fp8_marlin.cu#L120
+ */
+template <typename fp8_dtype, typename fp16_dtype>
+__device__ void fast_dequant_f8f16x4(uint32_t* input, uint2* output) {
+  uint32_t q = *input;
+  if constexpr (std::is_same<fp8_dtype, __nv_fp8_e5m2>::value &&
+                std::is_same<fp16_dtype, half>::value) {
+    output->x = __byte_perm(0U, q, 0x5140);
+    output->y = __byte_perm(0U, q, 0x7362);
+  } else {
+    constexpr int FP8_EXPONENT = get_exponent_bits<fp8_dtype>();
+    constexpr int FP8_MANTISSA = get_mantissa_bits<fp8_dtype>();
+    constexpr int FP16_EXPONENT = get_exponent_bits<fp16_dtype>();
+
+    constexpr int RIGHT_SHIFT = FP16_EXPONENT - FP8_EXPONENT;
+    // Calculate MASK for extracting mantissa and exponent
+    constexpr int MASK1 = 0x80000000;
+    constexpr int MASK2 = MASK1 >> (FP8_EXPONENT + FP8_MANTISSA);
+    constexpr int MASK3 = MASK2 & 0x7fffffff;
+    constexpr int MASK = MASK3 | (MASK3 >> 16);
+    // Final MASK value: 0x7F007F00
+    q = __byte_perm(q, q, 0x1302);
+
+    // Extract and shift FP8 values to FP16 format
+    uint32_t Out1 = (q & 0x80008000) | ((q & MASK) >> RIGHT_SHIFT);
+    uint32_t Out2 = ((q << 8) & 0x80008000) | (((q << 8) & MASK) >> RIGHT_SHIFT);
+
+    constexpr int BIAS_OFFSET = (1 << (FP16_EXPONENT - 1)) - (1 << (FP8_EXPONENT - 1));
+    // Construct and apply exponent bias
+    if (std::is_same<fp16_dtype, half>::value) {
+      const half2 bias_reg = __float2half2_rn(float(1 << BIAS_OFFSET));
+
+      // Convert to half2 and apply bias
+      *(half2*)&(output->x) = __hmul2(*reinterpret_cast<const half2*>(&Out1), bias_reg);
+      *(half2*)&(output->y) = __hmul2(*reinterpret_cast<const half2*>(&Out2), bias_reg);
+    } else {
+      constexpr uint32_t BIAS = (BIAS_OFFSET + 127) << 23;
+      const nv_bfloat162 bias_reg = __float2bfloat162_rn(*reinterpret_cast<const float*>(&BIAS));
+      // Convert to bfloat162 and apply bias
+      *(nv_bfloat162*)&(output->x) =
+          __hmul2(*reinterpret_cast<const nv_bfloat162*>(&Out1), bias_reg);
+      *(nv_bfloat162*)&(output->y) =
+          __hmul2(*reinterpret_cast<const nv_bfloat162*>(&Out2), bias_reg);
+    }
+  }
+}
+
+template <>
+struct vec_cast<nv_bfloat16, __nv_fp8_e4m3> {
+  template <size_t vec_size>
+  FLASHINFER_INLINE static void cast(nv_bfloat16* dst, const __nv_fp8_e4m3* src) {
+    if constexpr (vec_size == 1) {
+      dst[0] = nv_bfloat16(src[0]);
+    } else if constexpr (vec_size == 2) {
+      dst[0] = nv_bfloat16(src[0]);
+      dst[1] = nv_bfloat16(src[1]);
+    } else {
+      static_assert(vec_size % 4 == 0, "vec_size must be a multiple of 4");
+#pragma unroll
+      for (uint32_t i = 0; i < vec_size / 4; ++i) {
+        fast_dequant_f8f16x4<__nv_fp8_e4m3, nv_bfloat16>((uint32_t*)&src[i * 4],
+                                                         (uint2*)&dst[i * 4]);
+      }
+    }
+  }
+};
+
+template <>
+struct vec_cast<nv_bfloat16, __nv_fp8_e5m2> {
+  template <size_t vec_size>
+  FLASHINFER_INLINE static void cast(nv_bfloat16* dst, const __nv_fp8_e5m2* src) {
+    if constexpr (vec_size == 1) {
+      dst[0] = nv_bfloat16(src[0]);
+    } else if constexpr (vec_size == 2) {
+      dst[0] = nv_bfloat16(src[0]);
+      dst[1] = nv_bfloat16(src[1]);
+    } else {
+      static_assert(vec_size % 4 == 0, "vec_size must be a multiple of 4");
+#pragma unroll
+      for (uint32_t i = 0; i < vec_size / 4; ++i) {
+        fast_dequant_f8f16x4<__nv_fp8_e5m2, nv_bfloat16>((uint32_t*)&src[i * 4],
+                                                         (uint2*)&dst[i * 4]);
+      }
+    }
+  }
+};
+
 template <>
 struct vec_cast<__nv_fp8_e4m3, half> {
   template <size_t vec_size>
   FLASHINFER_INLINE static void cast(__nv_fp8_e4m3* dst, const half* src) {
+#ifdef FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
     if constexpr (vec_size == 1) {
       dst[0] = __nv_fp8_e4m3(src[0]);
     } else {
@@ -90,6 +209,12 @@ struct vec_cast<__nv_fp8_e4m3, half> {
         *(uint16_t*)&dst[i * 2] = y;
       }
     }
+#else
+#pragma unroll
+    for (size_t i = 0; i < vec_size; ++i) {
+      dst[i] = __nv_fp8_e4m3(src[i]);
+    }
+#endif  // FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
   }
 };
 
@@ -97,6 +222,7 @@ template <>
 struct vec_cast<__nv_fp8_e5m2, half> {
   template <size_t vec_size>
   FLASHINFER_INLINE static void cast(__nv_fp8_e5m2* dst, const half* src) {
+#ifdef FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
     if constexpr (vec_size == 1) {
       dst[0] = __nv_fp8_e5m2(src[0]);
     } else {
@@ -108,6 +234,12 @@ struct vec_cast<__nv_fp8_e5m2, half> {
         *(uint16_t*)&dst[i * 2] = y;
       }
     }
+#else
+#pragma unroll
+    for (size_t i = 0; i < vec_size; ++i) {
+      dst[i] = __nv_fp8_e5m2(src[i]);
+    }
+#endif  // FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
   }
 };
 
@@ -115,6 +247,7 @@ template <>
 struct vec_cast<half, __nv_fp8_e4m3> {
   template <size_t vec_size>
   FLASHINFER_INLINE static void cast(half* dst, const __nv_fp8_e4m3* src) {
+#ifdef FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
     if constexpr (vec_size == 1) {
       dst[0] = half(src[0]);
     } else {
@@ -126,6 +259,20 @@ struct vec_cast<half, __nv_fp8_e4m3> {
         *(uint32_t*)&dst[i * 2] = y;
       }
     }
+#else
+    if constexpr (vec_size == 1) {
+      dst[0] = half(src[0]);
+    } else if constexpr (vec_size == 2) {
+      dst[0] = half(src[0]);
+      dst[1] = half(src[1]);
+    } else {
+      static_assert(vec_size % 4 == 0, "vec_size must be a multiple of 4");
+#pragma unroll
+      for (uint32_t i = 0; i < vec_size / 4; ++i) {
+        fast_dequant_f8f16x4<__nv_fp8_e4m3, half>((uint32_t*)&src[i * 4], (uint2*)&dst[i * 4]);
+      }
+    }
+#endif  // FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
   }
 };
 
@@ -133,6 +280,7 @@ template <>
 struct vec_cast<half, __nv_fp8_e5m2> {
   template <size_t vec_size>
   FLASHINFER_INLINE static void cast(half* dst, const __nv_fp8_e5m2* src) {
+#ifdef FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
     if constexpr (vec_size == 1) {
       dst[0] = half(src[0]);
     } else {
@@ -144,12 +292,22 @@ struct vec_cast<half, __nv_fp8_e5m2> {
         *(uint32_t*)&dst[i * 2] = y;
       }
     }
+#else
+    if constexpr (vec_size == 1) {
+      dst[0] = half(src[0]);
+    } else if constexpr (vec_size == 2) {
+      dst[0] = half(src[0]);
+      dst[1] = half(src[1]);
+    } else {
+      static_assert(vec_size % 4 == 0, "vec_size must be a multiple of 4");
+#pragma unroll
+      for (uint32_t i = 0; i < vec_size / 4; ++i) {
+        fast_dequant_f8f16x4<__nv_fp8_e5m2, half>((uint32_t*)&src[i * 4], (uint2*)&dst[i * 4]);
+      }
+    }
+#endif  // FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
   }
 };
-
-#endif  // !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900)
-
-#ifdef FLASHINFER_ENABLE_BF16
 
 template <>
 struct vec_cast<float, nv_bfloat16> {
@@ -180,7 +338,6 @@ struct vec_cast<nv_bfloat16, float> {
     }
   }
 };
-#endif  // FLASHINFER_ENABLE_BF16
 
 template <typename float_t, size_t vec_size>
 struct vec_t {
@@ -230,7 +387,6 @@ FLASHINFER_INLINE void cast_store_impl(tgt_float_t* dst_ptr,
   }
 }
 
-#ifdef FLASHINFER_ENABLE_FP8
 /******************* vec_t<__nv_fp8_e4m3> *******************/
 
 // __nv_fp8_e4m3 x 1
@@ -724,7 +880,6 @@ struct vec_t<__nv_fp8_e5m2, vec_size> {
     }
   }
 };
-#endif
 
 /******************* vec_t<half> *******************/
 
@@ -889,7 +1044,6 @@ struct vec_t<half, vec_size> {
   }
 };
 
-#ifdef FLASHINFER_ENABLE_BF16
 /******************* vec_t<nv_bfloat16> *******************/
 
 // nv_bfloat16 x 1
@@ -1070,8 +1224,6 @@ struct vec_t<nv_bfloat16, vec_size> {
     }
   }
 };
-
-#endif
 
 /******************* vec_t<float> *******************/
 
