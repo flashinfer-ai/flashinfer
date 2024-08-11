@@ -75,7 +75,7 @@ struct vec_cast<half, float> {
 };
 
 template <typename T>
-constexpr int get_exponent_bits() {
+constexpr FLASHINFER_INLINE int get_exponent_bits() {
   if constexpr (std::is_same<T, __nv_fp8_e4m3>::value) {
     return 4;
   } else if constexpr (std::is_same<T, __nv_fp8_e5m2>::value) {
@@ -88,7 +88,7 @@ constexpr int get_exponent_bits() {
 }
 
 template <typename T>
-constexpr int get_mantissa_bits() {
+constexpr FLASHINFER_INLINE int get_mantissa_bits() {
   if constexpr (std::is_same<T, __nv_fp8_e4m3>::value) {
     return 3;
   } else if constexpr (std::is_same<T, __nv_fp8_e5m2>::value) {
