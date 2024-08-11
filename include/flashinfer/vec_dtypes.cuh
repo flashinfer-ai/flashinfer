@@ -25,9 +25,9 @@
 
 namespace flashinfer {
 
-#if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900))
-#define FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
-#endif
+// #if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900))
+// #define FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
+// #endif
 
 #define FLASHINFER_INLINE inline __attribute__((always_inline)) __device__
 
@@ -127,6 +127,7 @@ __device__ void fast_dequant_f8f16x4(uint32_t* input, uint2* output) {
     constexpr int MASK3 = MASK2 & 0x7fffffff;
     constexpr int MASK = MASK3 | (MASK3 >> 16);
     // Final MASK value: 0x7F007F00
+    q = __byte_perm(q, q, 0x1302);
 
     // Extract and shift FP8 values to FP16 format
     uint32_t Out1 = (q & 0x80008000) | ((q & MASK) >> RIGHT_SHIFT);
@@ -138,17 +139,17 @@ __device__ void fast_dequant_f8f16x4(uint32_t* input, uint2* output) {
       const half2 bias_reg = __float2half2_rn(float(1 << BIAS_OFFSET));
 
       // Convert to half2 and apply bias
-      *(half2*)&Out1 = __hmul2(*reinterpret_cast<const half2*>(&Out1), bias_reg);
-      *(half2*)&Out2 = __hmul2(*reinterpret_cast<const half2*>(&Out2), bias_reg);
+      *(half2*)&(output->x) = __hmul2(*reinterpret_cast<const half2*>(&Out1), bias_reg);
+      *(half2*)&(output->y) = __hmul2(*reinterpret_cast<const half2*>(&Out2), bias_reg);
     } else {
       constexpr uint32_t BIAS = (BIAS_OFFSET + 127) << 23;
       const nv_bfloat162 bias_reg = __float2bfloat162_rn(*reinterpret_cast<const float*>(&BIAS));
       // Convert to bfloat162 and apply bias
-      *(nv_bfloat162*)&Out1 = __hmul2(*reinterpret_cast<const nv_bfloat162*>(&Out1), bias_reg);
-      *(nv_bfloat162*)&Out2 = __hmul2(*reinterpret_cast<const nv_bfloat162*>(&Out2), bias_reg);
+      *(nv_bfloat162*)&(output->x) =
+          __hmul2(*reinterpret_cast<const nv_bfloat162*>(&Out1), bias_reg);
+      *(nv_bfloat162*)&(output->y) =
+          __hmul2(*reinterpret_cast<const nv_bfloat162*>(&Out2), bias_reg);
     }
-    output->x = __byte_perm(Out1, Out2, 0x1054);
-    output->y = __byte_perm(Out1, Out2, 0x3276);
   }
 }
 
