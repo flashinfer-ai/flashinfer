@@ -74,6 +74,47 @@ struct vec_cast<half, float> {
   }
 };
 
+/*!
+ * \brief Fallback to fastertransformer's implementation of fast dequantization if hardware support
+ * is not available.
+ * \ref https://github.com/vllm-project/vllm/blob/6dffa4b0a6120159ef2fe44d695a46817aff65bc/csrc/quantization/fp8/fp8_marlin.cu#L120
+ */
+template <>
+struct vec_cast<half, __nv_fp8_e4m3> {
+  template <size_t vec_size>
+  FLASHINFER_INLINE static void cast(half* dst, const __nv_fp8_e4m3* src) {
+    if constexpr (vec_size == 1) {
+      dst[0] = half(src[0]);
+    } else {
+      for (uint32_t i = 0; i < vec_size / 4; ++i) {
+        uint32_t q = *(uint32_t*)&src[i * 4];
+        constexpr int FP8_EXPONENT = 4, FP8_MANTISSA = 3, FP16_EXPONENT = 5;
+        constexpr int RIGHT_SHIFT = FP16_EXPONENT - FP8_EXPONENT;
+
+        // Calculate MASK for extracting mantissa and exponent
+        constexpr int MASK1 = 0x80000000;
+        constexpr int MASK2 = MASK1 >> (FP8_EXPONENT + FP8_MANTISSA);
+        constexpr int MASK3 = MASK2 & 0x7fffffff;
+        constexpr int MASK = MASK3 | (MASK3 >> 16);
+        // Final MASK value: 0x7F007F00
+
+        // Extract and shift FP8 values to FP16 format
+        int Out1 = (q & 0x80008000) | ((q & MASK) >> RIGHT_SHIFT);
+        int Out2 = ((q << 8) & 0x80008000) | (((q << 8) & MASK) >> RIGHT_SHIFT);
+
+        // Construct and apply exponent bias
+        constexpr int BIAS_OFFSET = (1 << (FP16_EXPONENT - 1)) - (1 << (FP8_EXPONENT - 1));
+        const half2 bias_reg = __float2half2_rn(float(1 << BIAS_OFFSET));
+
+        // Convert to half2 and apply bias
+        // Note: reverse indexing is intentional because weights are permuted
+        *(half2*)&dst[i * 4] = __hmul2(*reinterpret_cast<const half2*>(&Out1), bias_reg);
+        *(half2*)&dst[i * 4 + 2] = __hmul2(*reinterpret_cast<const half2*>(&Out2), bias_reg);
+      }
+    }
+  }
+};
+
 #if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900))
 template <>
 struct vec_cast<__nv_fp8_e4m3, half> {
@@ -118,13 +159,40 @@ struct vec_cast<half, __nv_fp8_e4m3> {
     if constexpr (vec_size == 1) {
       dst[0] = half(src[0]);
     } else {
-#pragma unroll
-      for (size_t i = 0; i < vec_size / 2; ++i) {
-        uint32_t y;
-        uint16_t x = *(uint16_t*)&src[i * 2];
-        asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(y) : "h"(x));
-        *(uint32_t*)&dst[i * 2] = y;
+      for (uint32_t i = 0; i < vec_size / 4; ++i) {
+        uint32_t q = *(uint32_t*)&src[i * 4];
+        constexpr int FP8_EXPONENT = 4, FP8_MANTISSA = 3, FP16_EXPONENT = 5;
+        constexpr int RIGHT_SHIFT = FP16_EXPONENT - FP8_EXPONENT;
+
+        // Calculate MASK for extracting mantissa and exponent
+        constexpr int MASK1 = 0x80000000;
+        constexpr int MASK2 = MASK1 >> (FP8_EXPONENT + FP8_MANTISSA);
+        constexpr int MASK3 = MASK2 & 0x7fffffff;
+        constexpr int MASK = MASK3 | (MASK3 >> 16);
+        // Final MASK value: 0x7F007F00
+
+        // Extract and shift FP8 values to FP16 format
+        int Out1 = (q & 0x80008000) | ((q & MASK) >> RIGHT_SHIFT);
+        int Out2 = ((q << 8) & 0x80008000) | (((q << 8) & MASK) >> RIGHT_SHIFT);
+
+        // Construct and apply exponent bias
+        constexpr int BIAS_OFFSET = (1 << (FP16_EXPONENT - 1)) - (1 << (FP8_EXPONENT - 1));
+        const half2 bias_reg = __float2half2_rn(float(1 << BIAS_OFFSET));
+
+        // Convert to half2 and apply bias
+        // Note: reverse indexing is intentional because weights are permuted
+        *(half2*)&dst[i * 4] = __hmul2(*reinterpret_cast<const half2*>(&Out1), bias_reg);
+        *(half2*)&dst[i * 4 + 2] = __hmul2(*reinterpret_cast<const half2*>(&Out2), bias_reg);
       }
+      /*
+      #pragma unroll
+            for (size_t i = 0; i < vec_size / 2; ++i) {
+              uint32_t y;
+              uint16_t x = *(uint16_t*)&src[i * 2];
+              asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(y) : "h"(x));
+              *(uint32_t*)&dst[i * 2] = y;
+            }
+      */
     }
   }
 };
