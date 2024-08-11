@@ -13,7 +13,7 @@ Prerequisites
 
 - OS: Linux only
 
-- Python: 3.8, 3.9, 3.10, 3.11
+- Python: 3.8, 3.9, 3.10, 3.11, 3.12
 
 - PyTorch: 2.2/2.3/2.4 with CUDA 11.8/12.1/12.4 (only for torch 2.4)
 
