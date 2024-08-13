@@ -135,7 +135,7 @@ __device__ void fast_dequant_f8f16x4(uint32_t* input, uint2* output) {
 
     constexpr int BIAS_OFFSET = (1 << (FP16_EXPONENT - 1)) - (1 << (FP8_EXPONENT - 1));
     // Construct and apply exponent bias
-    if (std::is_same<fp16_dtype, half>::value) {
+    if constexpr (std::is_same<fp16_dtype, half>::value) {
       const half2 bias_reg = __float2half2_rn(float(1 << BIAS_OFFSET));
 
       // Convert to half2 and apply bias
