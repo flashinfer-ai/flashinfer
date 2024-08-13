@@ -28,7 +28,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
 
 class BatchDecodeWithPagedKVCachePyTorchWrapper {
  public:
-  void BeginForward(torch::Tensor float_workspace_buffer, DLTensor* int_workspace_buffer,
+  void BeginForward(torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
                     torch::Tensor indptr, torch::Tensor last_page_len, unsigned int batch_size,
                     unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int head_dim,
                     unsigned int page_size, unsigned int pos_encoding_mode, float logits_soft_cap,

@@ -257,22 +257,32 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
     manages the lifecycle of these data structures.
     """
 
-    def __init__(self, workspace_buffer: torch.Tensor, kv_layout: str = "NHD") -> None:
+    def __init__(
+        self, float_workspace_buffer: torch.Tensor, kv_layout: str = "NHD"
+    ) -> None:
         self._batch_decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
-            workspace_buffer, kv_layout
+            float_workspace_buffer, kv_layout
         )
         self._kv_layout = kv_layout
 
-    def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor) -> None:
+    def reset_workspace_buffer(
+        self, float_workspace_buffer: torch.Tensor, int_workspace_buffer
+    ) -> None:
         r"""Reset the workspace buffer.
 
         Parameters
         ----------
-        new_workspace_buffer : torch.Tensor
-            The new workspace buffer, the device of the new workspace buffer should
+        float_workspace_buffer : torch.Tensor
+            The new float workspace buffer, the device of the new float workspace buffer should
+            be the same as the device of the input tensors.
+
+        int_workspace_buffer : torch.Tensor
+            The new int workspace buffer, the device of the new int workspace buffer should
             be the same as the device of the input tensors.
         """
-        self._batch_decode_wrapper.reset_workspace_buffer(new_workspace_buffer)
+        self._batch_decode_wrapper.reset_workspace_buffer(
+            float_workspace_buffer, int_workspace_buffer
+        )
 
     def begin_forward(
         self,
@@ -503,33 +513,43 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
     layers). This wrapper class manages the lifecycle of these data structures.
     """
 
-    def __init__(self, workspace_buffer: torch.Tensor, kv_layout: str = "NHD") -> None:
+    def __init__(
+        self, float_workspace_buffer: torch.Tensor, kv_layout: str = "NHD"
+    ) -> None:
         r"""Constructor of :class:`BatchDecodeWithSharedPrefixPagedKVCacheWrapper`.
 
         Parameters
         ----------
-        workspace_buffer : torch.Tensor
-            The user reserved workspace buffer used to store auxiliary data structures,
-            recommended size is 128MB, the device of the workspace buffer should be the
-            same as the device of the input tensors.
+        float_workspace_buffer : torch.Tensor
+            The user reserved float workspace buffer used to store intermediate attention results
+            in the split-k algorithm. The recommended size is 128MB, the device of the workspace
+            buffer should be the same as the device of the input tensors.
         kv_layout : str
             The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
         """
         self._batch_prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
-            workspace_buffer, kv_layout
+            float_workspace_buffer, kv_layout
         )
         self._kv_layout = kv_layout
 
-    def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor) -> None:
+    def reset_workspace_buffer(
+        self, float_workspace_buffer: torch.Tensor, int_workspace_buffer
+    ) -> None:
         r"""Reset the workspace buffer.
 
         Parameters
         ----------
-        new_workspace_buffer : torch.Tensor
-            The new workspace buffer, the device of the new workspace buffer should
+        float_workspace_buffer : torch.Tensor
+            The new float workspace buffer, the device of the new float workspace buffer should
+            be the same as the device of the input tensors.
+
+        int_workspace_buffer : torch.Tensor
+            The new int workspace buffer, the device of the new int workspace buffer should
             be the same as the device of the input tensors.
         """
-        self._batch_prefill_wrapper.reset_workspace_buffer(new_workspace_buffer)
+        self._batch_prefill_wrapper.reset_workspace_buffer(
+            float_workspace_buffer, int_workspace_buffer
+        )
 
     def begin_forward(
         self,
