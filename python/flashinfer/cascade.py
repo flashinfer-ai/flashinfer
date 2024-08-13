@@ -374,7 +374,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
               ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
               :attr:`kv_layout` is ``NHD``, and
               ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
-              :attr:`kv_layout` is ``NHD``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
+              :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
               ``paged_kv_cache[:, 1]`` is the value-cache.
 
         allow_fp16_qk_reduction : bool
@@ -631,7 +631,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
               ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
               :attr:`kv_layout` is ``NHD``, and
               ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
-              :attr:`kv_layout` is ``NHD``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
+              :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
               ``paged_kv_cache[:, 1]`` is the value-cache.
 
         causal : bool
