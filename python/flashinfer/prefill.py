@@ -896,7 +896,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if rope_theta is None:
             rope_theta = 1e4
 
-        if self._custom_mask is None and self._custom_mask_buf is None:
+        if self._custom_mask_buf is None:
             out = self._wrapper.forward(
                 q,
                 self._qo_indptr_buf,
@@ -922,8 +922,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._paged_kv_indptr_buf,
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,
-                self._custom_mask_buf if self.is_cuda_graph_enabled else self._custom_mask,
-                self._qk_indptr_buf if self.is_cuda_graph_enabled else self._qk_indptr,
+                self._custom_mask_buf,
+                self._qk_indptr_buf,
                 PosEncodingMode[pos_encoding_mode].value,
                 allow_fp16_qk_reduction,
                 window_left,
