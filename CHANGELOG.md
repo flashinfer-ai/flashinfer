@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.0](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.4...v0.2.0) (2024-08-13)
+
+
+### Features
+
+* decouple float and int workspace buffer ([#442](https://github.com/flashinfer-ai/flashinfer/issues/442)) ([a7ee566](https://github.com/flashinfer-ai/flashinfer/commit/a7ee5662bf967ab1ee16910c73761d326fbeb9a0))
+
+
+### Performance Improvements
+
+* faster fp8-&gt;fp16 dequantization for pre sm_90 arch ([#439](https://github.com/flashinfer-ai/flashinfer/issues/439)) ([c93f647](https://github.com/flashinfer-ai/flashinfer/commit/c93f647a0dd6b58c9ac20b39438316202358463c))
+
 ## [0.1.4](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.3...v0.1.4) (2024-08-09)
 
 
