@@ -111,18 +111,21 @@ class BlockSparseAttentionWrapper:
 
     def __init__(
         self,
-        workspace_buffer: torch.Tensor,
+        float_workspace_buffer: torch.Tensor,
     ) -> None:
         r"""Constructs of :class:`BlockSparseAttentionWrapper`.
 
         Parameters
         ----------
-        workspace_buffer : torch.Tensor
-            The user reserved workspace buffer used to store auxiliary data structures,
-            recommended size is 128MB, the device of the workspace buffer should be the
-            same as the device of the input tensors.
+        float_workspace_buffer : torch.Tensor
+            The user reserved float workspace buffer used to store intermediate attention results
+            in the split-k algorithm. The recommended size is 128MB, the device of the workspace
+            buffer should be the same as the device of the input tensors.
         """
-        self._workspace_buffer = workspace_buffer
+        self._float_workspace_buffer = float_workspace_buffer
+        self._int_workspace_buffer = torch.empty(
+            (8 * 1024 * 1024,), dtype=torch.uint8, device=float_workspace_buffer.device
+        )
         self._wrapper = _prefill.BatchPrefillWithPagedKVCachePyTorchWrapper(
             TensorLayout["NHD"].value,
             False,  # use_cuda_graph
@@ -137,6 +140,27 @@ class BlockSparseAttentionWrapper:
         self.C: Optional[int] = None
         self.M: Optional[int] = None
         self.N: Optional[int] = None
+
+    def reset_workspace_buffer(
+        self, float_workspace_buffer: torch.Tensor, int_workspace_buffer
+    ) -> None:
+        r"""Reset the workspace buffer.
+
+        Parameters
+        ----------
+        float_workspace_buffer : torch.Tensor
+            The new float workspace buffer, the device of the new float workspace buffer should
+            be the same as the device of the input tensors.
+
+        int_workspace_buffer : torch.Tensor
+            The new int workspace buffer, the device of the new int workspace buffer should
+            be the same as the device of the input tensors.
+        """
+        self._float_workspace_buffer = float_workspace_buffer
+        self._int_workspace_buffer = int_workspace_buffer
+        self._wrapper.update_page_locked_buffer_size(
+            int_workspace_buffer.numel() * int_workspace_buffer.element_size()
+        )
 
     def begin_forward(
         self,
@@ -244,7 +268,8 @@ class BlockSparseAttentionWrapper:
         self.C = C
 
         self._wrapper.begin_forward(
-            self._workspace_buffer,
+            self._float_workspace_buffer,
+            self._int_workspace_buffer,
             self._qo_indptr,
             self._paged_kv_indptr_buf,
             num_blocks_row,
