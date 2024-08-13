@@ -289,11 +289,11 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCu
 
   if (paged_kv_defined) {
     // [max_num_pages, 2, num_kv_heads, page_size, head_dim] for HND
-    // [max_num_pages, 2, page_size, num_kv_heads, head_dim] for HND
+    // [max_num_pages, 2, page_size, num_kv_heads, head_dim] for NHD
     CHECK_DIM(5, paged_kv_cache.value());
   } else {
     // [max_num_pages, num_kv_heads, page_size, head_dim] for HND
-    // [max_num_pages, page_size, num_kv_heads, head_dim] for HND
+    // [max_num_pages, page_size, num_kv_heads, head_dim] for NHD
     CHECK_DIM(4, paged_k_cache.value());
     CHECK_DIM(4, paged_v_cache.value());
   }

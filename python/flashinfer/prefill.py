@@ -778,8 +778,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._paged_kv_indices_buf = paged_kv_indices
             self._paged_kv_last_page_len_buf = paged_kv_last_page_len
             if packed_custom_mask is not None:
-                self._custom_mask = packed_custom_mask
-                self._qk_indptr = qk_indptr
+                self._custom_mask_buf = packed_custom_mask
+                self._qk_indptr_buf = qk_indptr
         empty_q_data = torch.empty(
             0,
             dtype=(
@@ -843,7 +843,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
               ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
               :attr:`kv_layout` is ``NHD``, and
               ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
-              :attr:`kv_layout` is ``NHD``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
+              :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
               ``paged_kv_cache[:, 1]`` is the value-cache.
 
         causal : bool
@@ -969,7 +969,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
               ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
               :attr:`kv_layout` is ``NHD``, and
               ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
-              :attr:`kv_layout` is ``NHD``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
+              :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
               ``paged_kv_cache[:, 1]`` is the value-cache.
 
         causal : bool
