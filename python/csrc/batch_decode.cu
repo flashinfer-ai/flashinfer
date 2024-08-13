@@ -21,22 +21,28 @@
 using namespace flashinfer;
 
 void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
-    torch::Tensor workspace_buffer, torch::Tensor indptr, torch::Tensor last_page_len,
-    unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads,
-    unsigned int head_dim, unsigned int page_size, unsigned int pos_encoding_mode,
-    float logits_soft_cap, torch::Tensor empty_q_data, torch::Tensor empty_kv_data) {
-  CHECK_INPUT(workspace_buffer);
+    torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer, torch::Tensor indptr,
+    torch::Tensor last_page_len, unsigned int batch_size, unsigned int num_qo_heads,
+    unsigned int num_kv_heads, unsigned int head_dim, unsigned int page_size,
+    unsigned int pos_encoding_mode, float logits_soft_cap, torch::Tensor empty_q_data,
+    torch::Tensor empty_kv_data) {
+  CHECK_INPUT(float_workspace_buffer);
+  CHECK_INPUT(int_workspace_buffer);
   // NOTE(zihao): not necessary to be CUDA tensor
   CHECK_CONTIGUOUS(indptr);
   CHECK_CONTIGUOUS(last_page_len);
   CHECK_DIM(1, indptr);
   CHECK_DIM(1, last_page_len);
-  CHECK_DIM(1, workspace_buffer);
+  CHECK_DIM(1, float_workspace_buffer);
+  CHECK_DIM(1, int_workspace_buffer);
   CHECK_EQ(indptr.scalar_type(), torch::kInt32);
   CHECK_EQ(indptr.scalar_type(), torch::kInt32);
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
-  size_t workspace_size_in_bytes = workspace_buffer.size(0) * workspace_buffer.element_size();
-  auto device = workspace_buffer.device();
+  size_t float_workspace_size_in_bytes =
+      float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
+  size_t int_workspace_size_in_bytes =
+      int_workspace_buffer.size(0) * int_workspace_buffer.element_size();
+  auto device = float_workspace_buffer.device();
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   handler_->SetCUDAStream(torch_current_stream);
   indptr = indptr.to(torch::kCPU);
@@ -59,8 +65,10 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
                     handler_->BeginForwardDispatched<HEAD_DIM, PageStorage::kIndices,
                                                      LOGITS_POST_HOOK, POS_ENCODING_MODE, qkv_type,
                                                      qkv_type, qkv_type, int32_t>(
-                        static_cast<void*>(workspace_buffer.data_ptr()), workspace_size_in_bytes,
-                        static_cast<int32_t*>(indptr.data_ptr()),
+                        static_cast<void*>(float_workspace_buffer.data_ptr()),
+                        float_workspace_size_in_bytes,
+                        static_cast<void*>(int_workspace_buffer.data_ptr()),
+                        int_workspace_size_in_bytes, static_cast<int32_t*>(indptr.data_ptr()),
                         static_cast<int32_t*>(last_page_len.data_ptr()), batch_size, num_qo_heads,
                         num_kv_heads, page_size);
                 TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
@@ -81,8 +89,10 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
                       handler_->BeginForwardDispatched<HEAD_DIM, PageStorage::kIndices,
                                                        LOGITS_POST_HOOK, POS_ENCODING_MODE, q_type,
                                                        kv_type, q_type, int32_t>(
-                          static_cast<void*>(workspace_buffer.data_ptr()), workspace_size_in_bytes,
-                          static_cast<int32_t*>(indptr.data_ptr()),
+                          static_cast<void*>(float_workspace_buffer.data_ptr()),
+                          float_workspace_size_in_bytes,
+                          static_cast<void*>(int_workspace_buffer.data_ptr()),
+                          int_workspace_size_in_bytes, static_cast<int32_t*>(indptr.data_ptr()),
                           static_cast<int32_t*>(last_page_len.data_ptr()), batch_size, num_qo_heads,
                           num_kv_heads, page_size);
                   TORCH_CHECK(status == cudaSuccess,
@@ -100,8 +110,8 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
 void BatchDecodeWithPagedKVCachePyTorchWrapper::EndForward() { handler_->EndForward(); }
 
 void BatchDecodeWithPagedKVCachePyTorchWrapper::UpdatePageLockedBufferSize(
-    unsigned int max_workspace_size_in_bytes) {
-  handler_->UpdatePageLockedBufferSize(max_workspace_size_in_bytes);
+    unsigned int int_workspace_size_in_bytes) {
+  handler_->UpdatePageLockedBufferSize(int_workspace_size_in_bytes);
 }
 
 std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(

@@ -21,29 +21,36 @@
 using namespace flashinfer;
 
 void BatchPrefillWithPagedKVCachePyTorchWrapper::BeginForward(
-    torch::Tensor workspace_buffer, torch::Tensor qo_indptr, torch::Tensor paged_kv_indptr,
-    unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads,
-    unsigned int head_dim, unsigned int page_size, torch::Tensor empty_q_data) {
-  CHECK_INPUT(workspace_buffer);
+    torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
+    torch::Tensor qo_indptr, torch::Tensor paged_kv_indptr, unsigned int batch_size,
+    unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int head_dim,
+    unsigned int page_size, torch::Tensor empty_q_data) {
+  CHECK_INPUT(float_workspace_buffer);
+  CHECK_INPUT(int_workspace_buffer);
   // NOTE(Zihao): not necessary to be a CUDA tensor
   CHECK_CONTIGUOUS(qo_indptr);
   CHECK_CONTIGUOUS(paged_kv_indptr);
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
   CHECK_DIM(1, qo_indptr);
   CHECK_DIM(1, paged_kv_indptr);
-  CHECK_DIM(1, workspace_buffer);
+  CHECK_DIM(1, float_workspace_buffer);
+  CHECK_DIM(1, int_workspace_buffer);
   CHECK_EQ(qo_indptr.size(0), batch_size + 1);
   CHECK_EQ(paged_kv_indptr.size(0), batch_size + 1);
   qo_indptr = qo_indptr.to(torch::dtype(torch::kInt32).device(torch::kCPU));
   paged_kv_indptr = paged_kv_indptr.to(torch::dtype(torch::kInt32).device(torch::kCPU));
-  auto device = workspace_buffer.device();
-  size_t workspace_size_in_bytes = workspace_buffer.size(0) * workspace_buffer.element_size();
+  auto device = float_workspace_buffer.device();
+  size_t float_workspace_size_in_bytes =
+      float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
+  size_t int_workspace_size_in_bytes =
+      int_workspace_buffer.size(0) * int_workspace_buffer.element_size();
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   handler_->SetCUDAStream(torch_current_stream);
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(empty_q_data.scalar_type(), q_type, [&] {
     cudaError_t status = handler_->BeginForward<q_type, int32_t>(
-        static_cast<void*>(workspace_buffer.data_ptr()), workspace_size_in_bytes,
+        static_cast<void*>(float_workspace_buffer.data_ptr()), float_workspace_size_in_bytes,
+        static_cast<void*>(int_workspace_buffer.data_ptr()), int_workspace_size_in_bytes,
         static_cast<int32_t*>(qo_indptr.data_ptr()),
         static_cast<int32_t*>(paged_kv_indptr.data_ptr()), batch_size, num_qo_heads, num_kv_heads,
         head_dim, page_size);
@@ -56,8 +63,8 @@ void BatchPrefillWithPagedKVCachePyTorchWrapper::BeginForward(
 void BatchPrefillWithPagedKVCachePyTorchWrapper::EndForward() { handler_->EndForward(); }
 
 void BatchPrefillWithPagedKVCachePyTorchWrapper::UpdatePageLockedBufferSize(
-    unsigned int max_workspace_size_in_bytes) {
-  handler_->UpdatePageLockedBufferSize(max_workspace_size_in_bytes);
+    unsigned int int_workspace_size_in_bytes) {
+  handler_->UpdatePageLockedBufferSize(int_workspace_size_in_bytes);
 }
 
 std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
@@ -446,28 +453,35 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCu
 }
 
 void BatchPrefillWithRaggedKVCachePyTorchWrapper::BeginForward(
-    torch::Tensor workspace_buffer, torch::Tensor qo_indptr, torch::Tensor kv_indptr,
-    unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads,
-    unsigned int head_dim, torch::Tensor empty_q_data) {
-  CHECK_INPUT(workspace_buffer);
+    torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
+    torch::Tensor qo_indptr, torch::Tensor kv_indptr, unsigned int batch_size,
+    unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int head_dim,
+    torch::Tensor empty_q_data) {
+  CHECK_INPUT(float_workspace_buffer);
+  CHECK_INPUT(int_workspace_buffer);
   // NOTE(Zihao): not necessary to be a CUDA tensor
   CHECK_CONTIGUOUS(qo_indptr);
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
   CHECK_DIM(1, qo_indptr);
   CHECK_DIM(1, kv_indptr);
-  CHECK_DIM(1, workspace_buffer);
+  CHECK_DIM(1, float_workspace_buffer);
+  CHECK_DIM(1, int_workspace_buffer);
   CHECK_EQ(qo_indptr.size(0), batch_size + 1);
   CHECK_EQ(kv_indptr.size(0), batch_size + 1);
   qo_indptr = qo_indptr.to(torch::dtype(torch::kInt32).device(torch::kCPU));
   kv_indptr = kv_indptr.to(torch::dtype(torch::kInt32).device(torch::kCPU));
-  size_t workspace_size_in_bytes = workspace_buffer.size(0) * workspace_buffer.element_size();
-  auto device = workspace_buffer.device();
+  size_t float_workspace_size_in_bytes =
+      float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
+  size_t int_workspace_size_in_bytes =
+      int_workspace_buffer.size(0) * int_workspace_buffer.element_size();
+  auto device = float_workspace_buffer.device();
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   handler_->SetCUDAStream(torch_current_stream);
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(empty_q_data.scalar_type(), q_type, [&] {
     cudaError_t status = handler_->BeginForward<q_type, int32_t>(
-        static_cast<void*>(workspace_buffer.data_ptr()), workspace_size_in_bytes,
+        static_cast<void*>(float_workspace_buffer.data_ptr()), float_workspace_size_in_bytes,
+        static_cast<void*>(int_workspace_buffer.data_ptr()), int_workspace_size_in_bytes,
         static_cast<int32_t*>(qo_indptr.data_ptr()), static_cast<int32_t*>(kv_indptr.data_ptr()),
         batch_size, num_qo_heads, num_kv_heads, head_dim,
         /*page_size=*/1);
@@ -480,8 +494,8 @@ void BatchPrefillWithRaggedKVCachePyTorchWrapper::BeginForward(
 void BatchPrefillWithRaggedKVCachePyTorchWrapper::EndForward() { handler_->EndForward(); }
 
 void BatchPrefillWithRaggedKVCachePyTorchWrapper::UpdatePageLockedBufferSize(
-    unsigned int max_workspace_size_in_bytes) {
-  handler_->UpdatePageLockedBufferSize(max_workspace_size_in_bytes);
+    unsigned int int_workspace_size_in_bytes) {
+  handler_->UpdatePageLockedBufferSize(int_workspace_size_in_bytes);
 }
 
 std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(

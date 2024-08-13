@@ -279,7 +279,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
     def __init__(
         self,
-        workspace_buffer: torch.Tensor,
+        float_workspace_buffer: torch.Tensor,
         kv_layout: str = "NHD",
         use_cuda_graph: bool = False,
         use_tensor_cores: bool = False,
@@ -291,9 +291,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         Parameters
         ----------
-        workspace_buffer : torch.Tensor
-            The user reserved workspace buffer used to store auxiliary data structures,
-            recommended size is 128MB, the device of the workspace
+        float_workspace_buffer : torch.Tensor
+            The user reserved float workspace buffer used to store intermediate attention results
+            in the split-k algorithm. The recommended size is 128MB, the device of the workspace
             buffer should be the same as the device of the input tensors.
 
         kv_layout : str
@@ -326,7 +326,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
         """
         _check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
-        self._workspace_buffer = workspace_buffer
+        self._float_workspace_buffer = float_workspace_buffer
+        self._int_workspace_buffer = torch.empty(
+            (8 * 1024 * 1024,), dtype=torch.uint8, device=float_workspace_buffer.device
+        )
 
         if use_cuda_graph:
             if not torch.is_tensor(paged_kv_indptr_buffer):
@@ -363,7 +366,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._qo_indptr_buf = torch.arange(
                     self._fixed_batch_size + 1,
                     dtype=torch.int32,
-                    device=workspace_buffer.device,
+                    device=float_workspace_buffer.device,
                 )
         else:
             self._use_tensor_cores = False
@@ -381,16 +384,26 @@ class BatchDecodeWithPagedKVCacheWrapper:
     def is_cuda_graph_enabled(self) -> bool:
         return self._wrapper.is_cuda_graph_enabled()
 
-    def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor) -> None:
+    def reset_workspace_buffer(
+        self, float_workspace_buffer: torch.Tensor, int_workspace_buffer
+    ) -> None:
         r"""Reset the workspace buffer.
 
         Parameters
         ----------
-        new_workspace_buffer : torch.Tensor
-            The new workspace buffer, the device of the new workspace buffer should
+        float_workspace_buffer : torch.Tensor
+            The new float workspace buffer, the device of the new float workspace buffer should
+            be the same as the device of the input tensors.
+
+        int_workspace_buffer : torch.Tensor
+            The new int workspace buffer, the device of the new int workspace buffer should
             be the same as the device of the input tensors.
         """
-        self._workspace_buffer = new_workspace_buffer
+        self._float_workspace_buffer = float_workspace_buffer
+        self._int_workspace_buffer = int_workspace_buffer
+        self._wrapper.update_page_locked_buffer_size(
+            int_workspace_buffer.numel() * int_workspace_buffer.element_size()
+        )
 
     def begin_forward(
         self,
@@ -511,7 +524,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     batch_size + 1, dtype=torch.int32, device=indptr.device
                 )
             self._wrapper.begin_forward(
-                self._workspace_buffer,
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
                 self._qo_indptr_buf,
                 indptr,
                 batch_size,
@@ -523,7 +537,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
         else:
             self._wrapper.begin_forward(
-                self._workspace_buffer,
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
                 indptr,
                 last_page_len,
                 batch_size,

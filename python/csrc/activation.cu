@@ -51,8 +51,7 @@ void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input) {
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
     dim3 block(std::min(d / vec_size, 1024U));
-    flashinfer::activation::act_and_mul_kernel<c_type,
-                                               flashinfer::activation::gelu_tanh_kernel>
+    flashinfer::activation::act_and_mul_kernel<c_type, flashinfer::activation::gelu_tanh_kernel>
         <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()),
                                      static_cast<c_type*>(input.data_ptr()), d);
 

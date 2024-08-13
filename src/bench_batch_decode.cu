@@ -15,6 +15,7 @@
  */
 #include <thrust/device_vector.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <nvbench/nvbench.cuh>
 #include <vector>
@@ -71,13 +72,16 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
   BatchDecodeHandler handler;
 
   if (cooperative) {
-    size_t workspace_size_in_bytes = 32 * 1024 * 1024;
-    thrust::device_vector<char> buffer(workspace_size_in_bytes);
+    size_t float_workspace_size_in_bytes = 32 * 1024 * 1024;
+    thrust::device_vector<char> float_buffer(float_workspace_size_in_bytes);
+    size_t int_workspace_size_in_bytes = 8 * 1024 * 1024;
+    thrust::device_vector<char> int_buffer(int_workspace_size_in_bytes);
     // begin forward
     BatchDecodeHandlerBeginForward<PageStorage::kIndices, T, T, T, int32_t>(
-        &handler, (void*)thrust::raw_pointer_cast(buffer.data()), workspace_size_in_bytes,
-        kv_indptr_host.data(), kv_last_page_len_host.data(), batch_size, num_qo_heads, num_kv_heads,
-        head_dim, page_size, pos_encoding_mode);
+        &handler, (void*)thrust::raw_pointer_cast(float_buffer.data()),
+        float_workspace_size_in_bytes, (void*)thrust::raw_pointer_cast(int_buffer.data()),
+        int_workspace_size_in_bytes, kv_indptr_host.data(), kv_last_page_len_host.data(),
+        batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, pos_encoding_mode);
     state.exec([&](nvbench::launch&) {
       cudaError_t status =
           BatchDecodeWithPagedKVCacheWrapper<PageStorage::kIndices, T, T, T, int32_t>(
@@ -148,12 +152,16 @@ void bench_flashinfer_batch_decode_with_prefill(nvbench::state& state) {
       "Read");
   state.add_global_memory_writes<uint8_t>(vec_bytes(o), "Write");
   BatchPrefillHandler handler;
-  size_t workspace_size_in_bytes = 128 * 1024 * 1024;
-  thrust::device_vector<char> buffer(workspace_size_in_bytes);
+  size_t float_workspace_size_in_bytes = 128 * 1024 * 1024;
+  thrust::device_vector<char> float_buffer(float_workspace_size_in_bytes);
+  size_t int_workspace_size_in_bytes = 8 * 1024 * 1024;
+  thrust::device_vector<char> int_buffer(int_workspace_size_in_bytes);
 
   handler.BeginForward<T, int32_t>(
-      (void*)thrust::raw_pointer_cast(buffer.data()), workspace_size_in_bytes, qo_indptr_h.data(),
-      kv_indptr_host.data(), batch_size, num_qo_heads, num_kv_heads, head_dim, page_size);
+      (void*)thrust::raw_pointer_cast(float_buffer.data()), float_workspace_size_in_bytes,
+      (void*)thrust::raw_pointer_cast(int_buffer.data()), int_workspace_size_in_bytes,
+      qo_indptr_h.data(), kv_indptr_host.data(), batch_size, num_qo_heads, num_kv_heads, head_dim,
+      page_size);
 
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     cudaError_t status =
