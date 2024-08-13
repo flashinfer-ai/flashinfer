@@ -16,6 +16,7 @@
 #include <thrust/detail/raw_pointer_cast.h>
 #include <thrust/device_vector.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <nvbench/nvbench.cuh>
 #include <optional>
@@ -48,7 +49,10 @@ void bench_flashinfer_batch_prefill_with_ragged_kv(nvbench::state& state) {
   thrust::device_vector<dtype_in> K(batch_size * kv_len * num_kv_heads * head_dim);
   thrust::device_vector<dtype_in> V(batch_size * kv_len * num_kv_heads * head_dim);
   thrust::device_vector<dtype_out> O(batch_size * qo_len * num_qo_heads * head_dim);
-  thrust::device_vector<uint8_t> workspace(128 * 1024 * 1024);
+  size_t float_workspace_size_in_bytes = 128 * 1024 * 1024;
+  thrust::device_vector<uint8_t> float_workspace(float_workspace_size_in_bytes);
+  size_t int_workspace_size_in_bytes = 8 * 1024 * 1024;
+  thrust::device_vector<uint8_t> int_workspace(int_workspace_size_in_bytes);
 
   // Provide throughput information:
   state.add_global_memory_reads<dtype_in>(
@@ -69,10 +73,11 @@ void bench_flashinfer_batch_prefill_with_ragged_kv(nvbench::state& state) {
 
   BatchPrefillHandler handler;
 
-  handler.BeginForward<dtype_out>(thrust::raw_pointer_cast(workspace.data()),
-                                  workspace.size() * sizeof(uint8_t), qo_indptr_h.data(),
-                                  kv_indptr_h.data(), batch_size, num_qo_heads, num_kv_heads,
-                                  head_dim, /*page_size=*/1);
+  handler.BeginForward<dtype_out>(
+      thrust::raw_pointer_cast(float_workspace.data()), float_workspace_size_in_bytes,
+      thrust::raw_pointer_cast(int_workspace.data()), int_workspace_size_in_bytes,
+      qo_indptr_h.data(), kv_indptr_h.data(), batch_size, num_qo_heads, num_kv_heads, head_dim,
+      /*page_size=*/1);
 
   state.exec(nvbench::exec_tag::timer, [&](nvbench::launch& launch, auto& timer) {
     timer.start();

@@ -28,13 +28,13 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
 
 class BatchDecodeWithPagedKVCachePyTorchWrapper {
  public:
-  void BeginForward(torch::Tensor workspace_buffer, torch::Tensor indptr,
-                    torch::Tensor last_page_len, unsigned int batch_size, unsigned int num_qo_heads,
-                    unsigned int num_kv_heads, unsigned int head_dim, unsigned int page_size,
-                    unsigned int pos_encoding_mode, float logits_soft_cap,
+  void BeginForward(torch::Tensor float_workspace_buffer, DLTensor* int_workspace_buffer,
+                    torch::Tensor indptr, torch::Tensor last_page_len, unsigned int batch_size,
+                    unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int head_dim,
+                    unsigned int page_size, unsigned int pos_encoding_mode, float logits_soft_cap,
                     torch::Tensor empty_q_data, torch::Tensor empty_kv_data);
   void EndForward();
-  void UpdatePageLockedBufferSize(uint32_t max_workspace_size_in_bytes);
+  void UpdatePageLockedBufferSize(uint32_t int_workspace_size_in_bytes);
   bool IsCUDAGraphEnabled() const { return handler_->IsCUDAGraphEnabled(); }
   std::vector<torch::Tensor> Forward(torch::Tensor q, std::optional<torch::Tensor> paged_kv_cache,
                                      std::optional<torch::Tensor> paged_k_cache,

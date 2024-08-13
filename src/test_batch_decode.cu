@@ -98,10 +98,13 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
       thrust::raw_pointer_cast(kv_indptr_device.data()),
       thrust::raw_pointer_cast(kv_last_page_len_device.data()));
   flashinfer::BatchDecodeHandler handler;
-  size_t workspace_size_in_bytes = 32 * 1024 * 1024;
-  thrust::device_vector<char> buffer(workspace_size_in_bytes);
+  size_t float_workspace_size_in_bytes = 32 * 1024 * 1024;
+  thrust::device_vector<char> float_buffer(float_workspace_size_in_bytes);
+  size_t int_workspace_size_in_bytes = 8 * 1024 * 1024;
+  thrust::device_vector<char> int_buffer(int_workspace_size_in_bytes);
   BatchDecodeHandlerBeginForward<PageStorage::kIndices, DTypeQO, DTypeKV, DTypeQO, int32_t>(
-      &handler, (void*)thrust::raw_pointer_cast(buffer.data()), workspace_size_in_bytes,
+      &handler, (void*)thrust::raw_pointer_cast(float_buffer.data()), float_workspace_size_in_bytes,
+      (void*)thrust::raw_pointer_cast(int_buffer.data()), int_workspace_size_in_bytes,
       kv_indptr.data(), kv_last_page_len.data(), batch_size, num_qo_heads, num_kv_heads, head_dim,
       page_size, pos_encoding_mode);
 

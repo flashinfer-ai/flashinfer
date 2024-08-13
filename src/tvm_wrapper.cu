@@ -272,11 +272,15 @@ void _FlashInferAttentionPrefillWithPagedKVCache(int64_t handler_id, DLTensor* q
 }
 
 void _FlashInferAttentionPrefillWithPagedKVCacheBeginForward(
-    int64_t handler_idx, DLTensor* workspace_buffer, DLTensor* qo_indptr, DLTensor* kv_indptr,
-    int64_t batch_size, int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim,
-    int64_t page_size, TVMStreamHandle copy_stream) {
-  CHECK_EQ(workspace_buffer->ndim, 1) << "The workspace buffer must be a 1-D tensor";
-  size_t workspace_size_in_bytes = workspace_buffer->shape[0] * workspace_buffer->dtype.bits / 8;
+    int64_t handler_idx, DLTensor* float_workspace_buffer, DLTensor* int_workspace_buffer,
+    DLTensor* qo_indptr, DLTensor* kv_indptr, int64_t batch_size, int64_t num_qo_heads,
+    int64_t num_kv_heads, int64_t head_dim, int64_t page_size, TVMStreamHandle copy_stream) {
+  CHECK_EQ(float_workspace_buffer->ndim, 1) << "The float workspace buffer must be a 1-D tensor";
+  size_t float_workspace_size_in_bytes =
+      float_workspace_buffer->shape[0] * float_workspace_buffer->dtype.bits / 8;
+  CHECK_EQ(int_workspace_buffer->ndim, 1) << "The int workspace buffer must be a 1-D tensor";
+  size_t int_workspace_size_in_bytes =
+      int_workspace_buffer->shape[0] * int_workspace_buffer->dtype.bits / 8;
   CHECK(handler_idx < max_num_handlers) << "The handler id must be less than " << max_num_handlers;
 
   // NOTE(Zihao): here we presume the input data type is half, in the future we should
@@ -288,7 +292,8 @@ void _FlashInferAttentionPrefillWithPagedKVCacheBeginForward(
   DISPATCH_TVM_CUDA_IDTYPE(qo_indptr->dtype, dtype_idx, {
     cudaError_t status =
         batch_prefill_paged_kv_handlers[handler_idx].BeginForward<dtype_in, dtype_idx>(
-            static_cast<void*>(workspace_buffer->data), workspace_size_in_bytes,
+            static_cast<void*>(float_workspace_buffer->data), float_workspace_size_in_bytes,
+            static_cast<void*>(int_workspace_buffer->data), int_workspace_size_in_bytes,
             static_cast<dtype_idx*>(qo_indptr->data) + qo_indptr->byte_offset / sizeof(dtype_idx),
             static_cast<dtype_idx*>(kv_indptr->data) + kv_indptr->byte_offset / sizeof(dtype_idx),
             batch_size, num_qo_heads, num_kv_heads, head_dim, page_size);
@@ -416,11 +421,16 @@ void _FlashInferAttentionDecodeWithPagedKVCache(int64_t handler_id, DLTensor* q_
 }
 
 void _FlashInferAttentionDecodeWithPagedKVCacheBeginForward(
-    int64_t handler_idx, DLTensor* workspace_buffer, DLTensor* page_table_indptr,
-    DLTensor* last_page_len, int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim,
-    int64_t page_size, int64_t pos_encoding_mode, TVMStreamHandle copy_stream) {
-  CHECK_EQ(workspace_buffer->ndim, 1) << "The workspace buffer must be a 1-D tensor";
-  size_t workspace_size_in_bytes = workspace_buffer->shape[0] * workspace_buffer->dtype.bits / 8;
+    int64_t handler_idx, DLTensor* float_workspace_buffer, DLTensor* int_workspace_buffer,
+    DLTensor* page_table_indptr, DLTensor* last_page_len, int64_t num_qo_heads,
+    int64_t num_kv_heads, int64_t head_dim, int64_t page_size, int64_t pos_encoding_mode,
+    TVMStreamHandle copy_stream) {
+  CHECK_EQ(float_workspace_buffer->ndim, 1) << "The float workspace buffer must be a 1-D tensor";
+  size_t float_workspace_size_in_bytes =
+      float_workspace_buffer->shape[0] * float_workspace_buffer->dtype.bits / 8;
+  CHECK_EQ(int_workspace_buffer->ndim, 1) << "The int workspace buffer must be a 1-D tensor";
+  size_t int_workspace_size_in_bytes =
+      int_workspace_buffer->shape[0] * int_workspace_buffer->dtype.bits / 8;
   CHECK_LT(handler_idx, max_num_handlers)
       << "The handler id must be less than " << max_num_handlers;
   constexpr PageStorage page_storage = PageStorage::kIndices;
@@ -433,8 +443,9 @@ void _FlashInferAttentionDecodeWithPagedKVCacheBeginForward(
   DISPATCH_TVM_CUDA_IDTYPE(page_table_indptr->dtype, dtype_idx, {
     cudaError_t status =
         BatchDecodeHandlerBeginForward<page_storage, dtype_in, dtype_in, dtype_in, dtype_idx>(
-            batch_decode_handlers + handler_idx, static_cast<void*>(workspace_buffer->data),
-            workspace_size_in_bytes,
+            batch_decode_handlers + handler_idx, static_cast<void*>(float_workspace_buffer->data),
+            float_workspace_size_in_bytes, static_cast<void*>(int_workspace_buffer->data),
+            int_workspace_size_in_bytes,
             static_cast<dtype_idx*>(page_table_indptr->data) +
                 page_table_indptr->byte_offset / sizeof(dtype_idx),
             static_cast<dtype_idx*>(last_page_len->data) +
@@ -551,10 +562,15 @@ void _FlashInferAttentionPrefillWithRaggedKVCache(
 }
 
 void _FlashInferAttentionPrefillWithRaggedKVCacheBeginForward(
-    DLTensor* workspace_buffer, DLTensor* qo_indptr, DLTensor* kv_indptr, int64_t batch_size,
-    int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim, TVMStreamHandle copy_stream) {
-  CHECK_EQ(workspace_buffer->ndim, 1) << "The workspace buffer must be a 1-D tensor";
-  size_t workspace_size_in_bytes = workspace_buffer->shape[0] * workspace_buffer->dtype.bits / 8;
+    DLTensor* float_workspace_buffer, DLTensor* int_workspace_buffer, DLTensor* qo_indptr,
+    DLTensor* kv_indptr, int64_t batch_size, int64_t num_qo_heads, int64_t num_kv_heads,
+    int64_t head_dim, TVMStreamHandle copy_stream) {
+  CHECK_EQ(float_workspace_buffer->ndim, 1) << "The workspace buffer must be a 1-D tensor";
+  size_t float_workspace_size_in_bytes =
+      float_workspace_buffer->shape[0] * float_workspace_buffer->dtype.bits / 8;
+  CHECK_EQ(int_workspace_buffer->ndim, 1) << "The workspace buffer must be a 1-D tensor";
+  size_t int_workspace_size_in_bytes =
+      int_workspace_buffer->shape[0] * int_workspace_buffer->dtype.bits / 8;
   cudaStream_t original_stream = batch_prefill_ragged_kv_handler.GetCUDAStream();
   batch_prefill_ragged_kv_handler.SetCUDAStream(static_cast<cudaStream_t>(copy_stream));
 
@@ -564,7 +580,8 @@ void _FlashInferAttentionPrefillWithRaggedKVCacheBeginForward(
 
   DISPATCH_TVM_CUDA_IDTYPE(qo_indptr->dtype, dtype_idx, {
     cudaError_t status = batch_prefill_ragged_kv_handler.BeginForward<dtype_in, dtype_idx>(
-        static_cast<void*>(workspace_buffer->data), workspace_size_in_bytes,
+        static_cast<void*>(float_workspace_buffer->data), float_workspace_size_in_bytes,
+        static_cast<void*>(int_workspace_buffer->data), int_workspace_size_in_bytes,
         static_cast<dtype_idx*>(qo_indptr->data) + qo_indptr->byte_offset / sizeof(dtype_idx),
         static_cast<dtype_idx*>(kv_indptr->data) + kv_indptr->byte_offset / sizeof(dtype_idx),
         batch_size, num_qo_heads, num_kv_heads, head_dim,
