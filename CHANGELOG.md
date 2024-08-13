@@ -1,7 +1,12 @@
 # Changelog
 
-## [0.2.0](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.4...v0.2.0) (2024-08-13)
+## [0.1.5](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.4...v0.1.5) (2024-08-13)
 
+
+### Bugfix
+
+* Fix PagedPrefill python api and some typos ([#441](https://github.com/flashinfer-ai/flashinfer/pull/441)) ([3fff008](https://github.com/flashinfer-ai/flashinfer/commit/3fff008dc9af56c325d9c487bddf69ff014f3989))
+* fix prefill kernels' lse result for empty kv-cache ([#440](https://github.com/flashinfer-ai/flashinfer/pull/440)) ([6ac28f4](https://github.com/flashinfer-ai/flashinfer/commit/6ac28f4dd3a9a34a2b4abcbe0a815fc59a2d74ad))
 
 ### Features
 
@@ -11,6 +16,12 @@
 ### Performance Improvements
 
 * faster fp8-&gt;fp16 dequantization for pre sm_90 arch ([#439](https://github.com/flashinfer-ai/flashinfer/issues/439)) ([c93f647](https://github.com/flashinfer-ai/flashinfer/commit/c93f647a0dd6b58c9ac20b39438316202358463c))
+
+### Acknowledgement
+
+We thank contributions and feedbacks from the community: [@comaniac](https://github.com/comaniac), [@hnyls2002](https://github.com/hnyls2002), [@jianfei-wangg](https://github.com/jianfei-wangg), [@Yard1](https://github.com/Yard1).
+
+
 
 ## [0.1.4](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.3...v0.1.4) (2024-08-09)
 
