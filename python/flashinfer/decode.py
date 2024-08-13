@@ -418,6 +418,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
         logits_soft_cap: Optional[float] = None,
         data_type: Union[str, torch.dtype] = "float16",
         q_data_type: Optional[Union[str, torch.dtype]] = None,
+        q_scale: Optional[float] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        window_left: int = -1,
+        sm_scale: Optional[float] = None,
+        rope_scale: Optional[float] = None,
+        rope_theta: Optional[float] = None,
     ) -> None:
         r"""Create auxiliary data structures for batch decode for multiple forward calls
         within the same decode step.
@@ -454,6 +461,28 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_data_type : Optional[Union[str, torch.dtype]]
             The data type of the query tensor. If None, will be set to
             ``data_type``. Defaults to ``None``.
+        q_scale : Optional[float]
+            The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
+        k_scale : Optional[float]
+            The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
+        v_scale : Optional[float]
+            The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
+        window_left : int
+            The left (inclusive) window size for the attention window, when set to ``-1``, the window
+            size will be set to the full length of the sequence. Defaults to ``-1``.
+        logits_soft_cap : Optional[float]
+            The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
+            provided, will be set to ``0``. If greater than 0, the logits will be capped according to
+            formula:
+            :math:`\texttt{logits_soft_cap} \times \mathrm{tanh}(x / \texttt{logits_soft_cap})`,
+            where :math:`x` is the input logits.
+        sm_scale : Optional[float]
+            The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
+        rope_scale : Optional[float]
+            The scale used in RoPE interpolation, if not provided, will be set to
+            ``1.0``.
+        rope_theta : Optional[float]
+            The theta used in RoPE, if not provided, will be set to ``1e4``.
 
         Note
         ----
@@ -552,6 +581,31 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 empty_kv_cache,
             )
 
+        # Store non-tensor arguments
+        _check_pos_encoding_mode(pos_encoding_mode)
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
+        if sm_scale is None:
+            sm_scale = 1.0 / math.sqrt(head_dim)
+        if q_scale is not None:
+            sm_scale *= q_scale
+        if k_scale is not None:
+            sm_scale *= k_scale
+        if rope_scale is None:
+            rope_scale = 1.0
+        if rope_theta is None:
+            rope_theta = 1e4
+
+        self._pos_encoding_mode = pos_encoding_mode
+        self._q_scale = q_scale
+        self._k_scale = k_scale
+        self._v_scale = v_scale
+        self._window_left = window_left
+        self._logits_soft_cap = logits_soft_cap
+        self._sm_scale = sm_scale
+        self._rope_scale = rope_scale
+        self._rope_theta = rope_theta
+
     def end_forward(self) -> None:
         r"""Clear auxiliary data structures created by :meth:`begin_forward`."""
         if not self.is_cuda_graph_enabled:
@@ -565,15 +619,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self,
         q: torch.Tensor,
         paged_kv_cache: torch.Tensor,
-        pos_encoding_mode: str = "NONE",
-        q_scale: Optional[float] = None,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
-        window_left: int = -1,
-        logits_soft_cap: Optional[float] = None,
-        sm_scale: Optional[float] = None,
-        rope_scale: Optional[float] = None,
-        rope_theta: Optional[float] = None,
     ) -> torch.Tensor:
         r"""Compute batch decode attention between query and paged kv cache.
 
@@ -595,53 +640,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
               :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
               ``paged_kv_cache[:, 1]`` is the value-cache.
 
-        pos_encoding_mode : str
-            The position encoding applied inside attention kernels, could be
-            ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
-            Defaults to ``NONE``.
-        q_scale : Optional[float]
-            The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
-        k_scale : Optional[float]
-            The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
-        v_scale : Optional[float]
-            The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
-        window_left : int
-            The left (inclusive) window size for the attention window, when set to ``-1``, the window
-            size will be set to the full length of the sequence. Defaults to ``-1``.
-        logits_soft_cap : Optional[float]
-            The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
-            provided, will be set to ``0``. If greater than 0, the logits will be capped according to
-            formula:
-            :math:`\texttt{logits_soft_cap} \times \mathrm{tanh}(x / \texttt{logits_soft_cap})`,
-            where :math:`x` is the input logits.
-        sm_scale : Optional[float]
-            The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
-        rope_scale : Optional[float]
-            The scale used in RoPE interpolation, if not provided, will be set to
-            ``1.0``.
-        rope_theta : Optional[float]
-            The theta used in RoPE, if not provided, will be set to ``1e4``.
-
         Returns
         -------
         torch.Tensor
             The attention output, shape: ``[batch_size, num_qo_heads, head_dim]``.
         """
-        _check_pos_encoding_mode(pos_encoding_mode)
-        if logits_soft_cap is None:
-            logits_soft_cap = 0.0
-        if sm_scale is None:
-            head_dim = q.shape[-1]
-            sm_scale = 1.0 / math.sqrt(head_dim)
-        if q_scale is not None:
-            sm_scale *= q_scale
-        if k_scale is not None:
-            sm_scale *= k_scale
-        if rope_scale is None:
-            rope_scale = 1.0
-        if rope_theta is None:
-            rope_theta = 1e4
-
         if self.use_tensor_cores:
             out = self._wrapper.forward(
                 q,
@@ -651,13 +654,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,
                 False,  # causal
-                PosEncodingMode[pos_encoding_mode].value,
+                PosEncodingMode[self._pos_encoding_mode].value,
                 False,  # allow_fp16_qk_reduction
-                window_left,
-                logits_soft_cap,
-                sm_scale,
-                rope_scale,
-                rope_theta,
+                self_window_left,
+                self._logits_soft_cap,
+                self._sm_scale,
+                self._rope_scale,
+                self._rope_theta,
                 False,  # return_lse
             )[0]
         else:
@@ -667,31 +670,22 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._paged_kv_indptr_buf,
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,
-                PosEncodingMode[pos_encoding_mode].value,
-                window_left,
-                logits_soft_cap,
-                sm_scale,
-                rope_scale,
-                rope_theta,
+                PosEncodingMode[self._pos_encoding_mode].value,
+                self._window_left,
+                self._logits_soft_cap,
+                self._sm_scale,
+                self._rope_scale,
+                self._rope_theta,
                 False,  # return_lse
             )[0]
-        if v_scale is not None:
-            out *= v_scale
+        if self._v_scale is not None:
+            out *= self._v_scale
         return out
 
     def forward_return_lse(
         self,
         q: torch.Tensor,
         paged_kv_cache: torch.Tensor,
-        pos_encoding_mode: str = "NONE",
-        q_scale: Optional[float] = None,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
-        window_left: int = -1,
-        logits_soft_cap: Optional[float] = None,
-        sm_scale: Optional[float] = None,
-        rope_scale: Optional[float] = None,
-        rope_theta: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Compute batch decode attention with paged kv cache, return attention output
         and logsumexp of attention scores.
@@ -714,33 +708,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
               :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
               ``paged_kv_cache[:, 1]`` is the value-cache.
 
-        pos_encoding_mode : str
-            The position encoding applied inside attention kernels, could be
-            ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
-            Defaults to ``NONE``.
-        q_scale : Optional[float]
-            The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
-        k_scale : Optional[float]
-            The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
-        v_scale : Optional[float]
-            The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
-        window_left : int
-            The left (inclusive) window size for the attention window, when set to ``-1``, the window
-            size will be set to the full length of the sequence. Defaults to ``-1``.
-        logits_soft_cap : Optional[float]
-            The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
-            provided, will be set to ``0``. If greater than 0, the logits will be capped according to
-            formula:
-            :math:`\texttt{logits_soft_cap} \times \mathrm{tanh}(x / \texttt{logits_soft_cap})`,
-            where :math:`x` is the input logits.
-        sm_scale : Optional[float]
-            The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
-        rope_scale : Optional[float]
-            The scale used in RoPE interpolation, if not provided, will be set to
-            ``1.0``.
-        rope_theta : Optional[float]
-            The theta used in RoPE, if not provided, will be set to ``1e4``.
-
         Returns
         -------
         V : torch.Tensor
@@ -753,20 +720,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
         Please refer to the :ref:`tutorial <recursive-attention>` for a detailed
         explanation of the log-sum-exp function and attention states.
         """
-        _check_pos_encoding_mode(pos_encoding_mode)
-        if logits_soft_cap is None:
-            logits_soft_cap = 0.0
-        if sm_scale is None:
-            head_dim = q.shape[-1]
-            sm_scale = 1.0 / math.sqrt(head_dim)
-        if q_scale is not None:
-            sm_scale *= q_scale
-        if k_scale is not None:
-            sm_scale *= k_scale
-        if rope_scale is None:
-            rope_scale = 1.0
-        if rope_theta is None:
-            rope_theta = 1e4
         if self.use_tensor_cores:
             V, s = self._wrapper.forward(
                 q,
@@ -776,13 +729,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,
                 False,  # causal
-                PosEncodingMode[pos_encoding_mode].value,
+                PosEncodingMode[self._pos_encoding_mode].value,
                 False,  # allow_fp16_qk_reduction
-                window_left,
-                logits_soft_cap,
-                sm_scale,
-                rope_scale,
-                rope_theta,
+                self._window_left,
+                self._logits_soft_cap,
+                self._sm_scale,
+                self._rope_scale,
+                self._rope_theta,
                 True,  # return_lse
             )
         else:
@@ -792,16 +745,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._paged_kv_indptr_buf,
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,
-                PosEncodingMode[pos_encoding_mode].value,
-                window_left,
-                logits_soft_cap,
-                sm_scale,
-                rope_scale,
-                rope_theta,
+                PosEncodingMode[self._pos_encoding_mode].value,
+                self._window_left,
+                self._logits_soft_cap,
+                self._sm_scale,
+                self._rope_scale,
+                self._rope_theta,
                 True,  # return_lse
             )
-        if v_scale is not None:
-            V *= v_scale
+        if self._v_scale is not None:
+            V *= self._v_scale
         return V, s
 
 

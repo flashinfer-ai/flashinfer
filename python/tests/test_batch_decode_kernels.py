@@ -73,7 +73,7 @@ def test_batch_decode_with_paged_kv_cache(
         num_kv_heads,
         head_dim,
         page_size,
-        "NONE",
+        pos_encoding_mode,
         logits_soft_cap=logits_soft_cap,
         data_type=kv_dtype,
         q_data_type=q_dtype,
@@ -82,15 +82,11 @@ def test_batch_decode_with_paged_kv_cache(
         o, _ = wrapper.forward_return_lse(
             q,
             kv_data.to(kv_dtype),
-            pos_encoding_mode=pos_encoding_mode,
-            logits_soft_cap=logits_soft_cap,
         )
     else:
         o = wrapper.forward(
             q,
             kv_data.to(kv_dtype),
-            pos_encoding_mode=pos_encoding_mode,
-            logits_soft_cap=logits_soft_cap,
         )
 
     for i in range(batch_size):
@@ -194,7 +190,7 @@ def test_batch_decode_with_tuple_paged_kv_cache(
         num_kv_heads,
         head_dim,
         page_size,
-        "NONE",
+        pos_encoding_mode=pos_encoding_mode,
         logits_soft_cap=logits_soft_cap,
         data_type=kv_dtype,
         q_data_type=q_dtype,
@@ -203,15 +199,11 @@ def test_batch_decode_with_tuple_paged_kv_cache(
         o, _ = wrapper.forward_return_lse(
             q,
             tuple(map(lambda _: _.to(kv_dtype), kv_data)),
-            pos_encoding_mode=pos_encoding_mode,
-            logits_soft_cap=logits_soft_cap,
         )
     else:
         o = wrapper.forward(
             q,
             tuple(map(lambda _: _.to(kv_dtype), kv_data)),
-            pos_encoding_mode=pos_encoding_mode,
-            logits_soft_cap=logits_soft_cap,
         )
 
     k_cache, v_cache = kv_data
@@ -321,7 +313,7 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
         num_kv_heads,
         head_dim,
         page_size,
-        "NONE",
+        pos_encoding_mode=pos_encoding_mode,
         data_type=kv_dtype,
         q_data_type=q_dtype,
     )
@@ -330,13 +322,13 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         for _ in range(3):
-            o = wrapper.forward(q, kv_data_dtype, pos_encoding_mode=pos_encoding_mode)
+            o = wrapper.forward(q, kv_data_dtype)
     torch.cuda.current_stream().wait_stream(s)
 
     # capture
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        o = wrapper.forward(q, kv_data_dtype, pos_encoding_mode=pos_encoding_mode)
+        o = wrapper.forward(q, kv_data_dtype)
     wrapper.end_forward()
 
     # replay multiple times
