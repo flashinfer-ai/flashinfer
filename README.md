@@ -120,9 +120,10 @@ FlashInfer also provides C++ API and TVM bindings, please refer to [documentatio
 Currently FlashInfer is adopted by the following projects:
 - [MLC-LLM](https://github.com/mlc-ai/mlc-llm)
 - [Punica](https://github.com/punica-ai/punica)
-- [sglang](https://github.com/sgl-project/sglang)
+- [SGLang](https://github.com/sgl-project/sglang)
 - [ScaleLLM](https://github.com/vectorch-ai/ScaleLLM)
 - [vLLM](https://github.com/vllm-project/vllm)
+- [TGI](https://github.com/huggingface/text-generation-inference)
 
 ## Acknowledgement
 
