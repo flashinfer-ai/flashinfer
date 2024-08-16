@@ -420,7 +420,7 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
         "{%6},"
         "{%7, %8, %9, %10};\n"
         : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
-        : "r"(A[2]), "r"(A[3]), "r"(B[1]), "f"(0.f), "f"(0.f), "f"(0.f), "f"(0.f));
+        : "r"(A[2]), "r"(A[3]), "r"(B[1]), "f"(C[0]), "f"(C[1]), "f"(C[2]), "f"(C[3]));
     asm volatile(
         "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
         "{%0,  %1,  %2,  %3},"
@@ -436,7 +436,7 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
         "{%6},"
         "{%7, %8, %9, %10};\n"
         : "=f"(C[4]), "=f"(C[5]), "=f"(C[6]), "=f"(C[7])
-        : "r"(A[2]), "r"(A[3]), "r"(B[3]), "f"(0.f), "f"(0.f), "f"(0.f), "f"(0.f));
+        : "r"(A[2]), "r"(A[3]), "r"(B[3]), "f"(C[4]), "f"(C[5]), "f"(C[6]), "f"(C[7]));
   } else {
     asm volatile(
         "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
