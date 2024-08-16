@@ -556,12 +556,17 @@ cudaError_t PrefillSplitQOKVIndptr(bool& split_kv, uint32_t& split_max_batch_siz
   if (avg_packed_qo_len > 64 && head_dim < 256) {
     warp_layout = WarpLayout::k4x1x2;  // (num_warps_x = 4, num_warps_z = 1, num_frags_x = 2)
   } else {
+#if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 800))
     if (avg_packed_qo_len > 16) {
       warp_layout = WarpLayout::k4x1x1;  // (num_warps_x = 4, num_warps_z = 1, num_frags_x = 1)
     } else {
       // avg_packed_qo_len <= 16
       warp_layout = WarpLayout::k1x4x1;  // (num_warps_x = 1, num_warps_z = 4, num_frags_x = 1)
     }
+#else
+    // NOTE(Zihao): not enough shared memory for 1x4x1 layout
+    warp_layout = WarpLayout::k4x1x1;
+#endif
   }
   const uint32_t qo_chunk_size = get_num_rows_per_cta(warp_layout);
 
@@ -592,6 +597,34 @@ cudaError_t PrefillSplitQOKVIndptr(bool& split_kv, uint32_t& split_max_batch_siz
     }
     o_indptr.push_back(o_indptr.back() + qo_len * num_tiles_kv);
   }
+
+  std::cout << kv_chunk_size << " " << new_batch_size << std::endl;
+  // print request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr
+  std::cout << "request_indices: ";
+  for (uint32_t i = 0; i < request_indices.size(); ++i) {
+    std::cout << request_indices[i] << " ";
+  }
+  std::cout << std::endl;
+  std::cout << "qo_tile_indices: ";
+  for (uint32_t i = 0; i < qo_tile_indices.size(); ++i) {
+    std::cout << qo_tile_indices[i] << " ";
+  }
+  std::cout << std::endl;
+  std::cout << "kv_tile_indices: ";
+  for (uint32_t i = 0; i < kv_tile_indices.size(); ++i) {
+    std::cout << kv_tile_indices[i] << " ";
+  }
+  std::cout << std::endl;
+  std::cout << "merge_indptr: ";
+  for (uint32_t i = 0; i < merge_indptr.size(); ++i) {
+    std::cout << merge_indptr[i] << " ";
+  }
+  std::cout << std::endl;
+  std::cout << "o_indptr: ";
+  for (uint32_t i = 0; i < o_indptr.size(); ++i) {
+    std::cout << o_indptr[i] << " ";
+  }
+  std::cout << std::endl;
 
   // step 4: multiply kv_chunk_size by page_size
   kv_chunk_size *= page_size;
