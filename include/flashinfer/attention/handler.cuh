@@ -598,34 +598,6 @@ cudaError_t PrefillSplitQOKVIndptr(bool& split_kv, uint32_t& split_max_batch_siz
     o_indptr.push_back(o_indptr.back() + qo_len * num_tiles_kv);
   }
 
-  std::cout << kv_chunk_size << " " << new_batch_size << std::endl;
-  // print request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr
-  std::cout << "request_indices: ";
-  for (uint32_t i = 0; i < request_indices.size(); ++i) {
-    std::cout << request_indices[i] << " ";
-  }
-  std::cout << std::endl;
-  std::cout << "qo_tile_indices: ";
-  for (uint32_t i = 0; i < qo_tile_indices.size(); ++i) {
-    std::cout << qo_tile_indices[i] << " ";
-  }
-  std::cout << std::endl;
-  std::cout << "kv_tile_indices: ";
-  for (uint32_t i = 0; i < kv_tile_indices.size(); ++i) {
-    std::cout << kv_tile_indices[i] << " ";
-  }
-  std::cout << std::endl;
-  std::cout << "merge_indptr: ";
-  for (uint32_t i = 0; i < merge_indptr.size(); ++i) {
-    std::cout << merge_indptr[i] << " ";
-  }
-  std::cout << std::endl;
-  std::cout << "o_indptr: ";
-  for (uint32_t i = 0; i < o_indptr.size(); ++i) {
-    std::cout << o_indptr[i] << " ";
-  }
-  std::cout << std::endl;
-
   // step 4: multiply kv_chunk_size by page_size
   kv_chunk_size *= page_size;
 
