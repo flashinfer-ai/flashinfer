@@ -1943,7 +1943,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(
       warp_layout = WarpLayout::k1x4x1;
     }
 #else
-    NOTE(Zihao): not enough shared memory for 1x4x1 layout
+    # NOTE(Zihao): not enough shared memory for 1x4x1 layout
     warp_layout = WarpLayout::k4x1x1;
 #endif
   }
