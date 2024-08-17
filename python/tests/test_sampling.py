@@ -387,11 +387,11 @@ def test_chain_speculative_sampling(
 
 
 if __name__ == "__main__":
-    # test_sampling(1, 111)
-    # test_top_p_sampling(3, 111, 0.9)
-    # test_top_k_sampling(3, 111, 10)
-    # test_top_p_renorm_prob(3, 111, 0.9)
-    # test_top_k_renorm_prob(3, 111, 10)
-    # test_top_k_mask_logits(99, 989, 10)
+    test_sampling(1, 111)
+    test_top_p_sampling(3, 111, 0.9)
+    test_top_k_sampling(3, 111, 10)
+    test_top_p_renorm_prob(3, 111, 0.9)
+    test_top_k_renorm_prob(3, 111, 10)
+    test_top_k_mask_logits(99, 989, 10)
     test_chain_speculative_sampling(3, 111, 3, False)
     test_chain_speculative_sampling(3, 111, 3, True)
