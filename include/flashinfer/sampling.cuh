@@ -1154,8 +1154,10 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           typename DType, typename IdType>
 __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token_ids,
                                          DType* uniform_samples, DType* target_probs,
-                                         IdType* output_token_ids, uint32_t num_speculative_tokens,
-                                         uint32_t d) {
+                                         IdType* output_token_ids,
+                                         IdType* output_accepted_token_num,
+                                         IdType* output_emitted_token_num,
+                                         uint32_t num_speculative_tokens, uint32_t d) {
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   const uint32_t row_idx = bx;
 
@@ -1165,18 +1167,36 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
   auto& temp_storage = reinterpret_cast<
       SamplingTempStorage<DType, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>&>(smem_sampling);
 
-  uint32_t pos = 0;
-  for (pos = 0; pos < num_speculative_tokens; ++pos) {
-    IdType draft_id = draft_token_ids[row_idx * num_speculative_tokens + pos];
-    float q = target_probs[(row_idx * (num_speculative_tokens + 1) + pos) * d + draft_id],
-          p = draft_probs[(row_idx * num_speculative_tokens + pos) * d + draft_id];
-    DType u = uniform_samples[row_idx * (num_speculative_tokens + 1) + pos];
+  uint32_t pos = num_speculative_tokens;
+  for (uint32_t i = 0; i < num_speculative_tokens; ++i) {
+    IdType draft_id = draft_token_ids[row_idx * num_speculative_tokens + i];
+    float q = target_probs[(row_idx * (num_speculative_tokens + 1) + i) * d + draft_id],
+          p = draft_probs[(row_idx * num_speculative_tokens + i) * d + draft_id];
+    DType u = uniform_samples[row_idx * (num_speculative_tokens + 1) + i];
     if (u * p < q) {
       // accept the draft models output
-      output_token_ids[row_idx * (num_speculative_tokens + 1) + pos] = draft_id;
+      output_token_ids[row_idx * (num_speculative_tokens + 1) + i] = draft_id;
     } else {
+      pos = i;
       break;
     }
+  }
+
+  uint32_t emitted_token_num = pos;
+  uint32_t accepted_token_num = pos;
+  for (uint32_t i = pos; i < num_speculative_tokens; ++i) {
+    IdType draft_id = draft_token_ids[row_idx * num_speculative_tokens + i];
+    float q = target_probs[(row_idx * (num_speculative_tokens + 1) + i) * d + draft_id],
+          p = draft_probs[(row_idx * num_speculative_tokens + i) * d + draft_id];
+    DType u = uniform_samples[row_idx * (num_speculative_tokens + 1) + i];
+    if (u * p < q) {
+      ++accepted_token_num;
+    }
+  }
+
+  if (tx == 0) {
+    output_accepted_token_num[row_idx] += accepted_token_num;
+    output_emitted_token_num[row_idx] += emitted_token_num;
   }
 
   // sample from relu(target_probs - draft_probs)
@@ -1284,7 +1304,8 @@ cudaError_t ParallelTopPSamplingFromProb(T* probs, T* uniform_samples, IdType* o
 template <typename DType, typename IdType>
 cudaError_t ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token_ids,
                                      DType* uniform_samples, DType* target_probs,
-                                     IdType* output_token_ids, uint32_t batch_size,
+                                     IdType* output_token_ids, IdType* output_accepted_token_num,
+                                     IdType* output_emitted_token_num, uint32_t batch_size,
                                      uint32_t num_speculative_tokens, uint32_t d,
                                      bool deterministic, cudaStream_t stream = 0) {
   constexpr uint32_t BLOCK_THREADS = 1024;
@@ -1299,6 +1320,8 @@ cudaError_t ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token_ids
                   &uniform_samples,
                   &target_probs,
                   &output_token_ids,
+                  &output_accepted_token_num,
+                  &output_emitted_token_num,
                   &num_speculative_tokens,
                   &d};
   DISPATCH_ALIGNED_VEC_SIZE(

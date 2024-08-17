@@ -315,9 +315,10 @@ torch::Tensor top_k_mask_logits(torch::Tensor logits, std::optional<torch::Tenso
   return mask_logits;
 }
 
-torch::Tensor chain_speculative_sampling(torch::Tensor draft_probs, torch::Tensor draft_token_ids,
-                                         torch::Tensor uniform_samples, torch::Tensor target_probs,
-                                         bool deterministic) {
+std::vector<torch::Tensor> chain_speculative_sampling(
+    torch::Tensor draft_probs, torch::Tensor draft_token_ids, torch::Tensor uniform_samples,
+    torch::Tensor target_probs, std::optional<torch::Tensor> maybe_output_accepted_token_num,
+    std::optional<torch::Tensor> maybe_output_emitted_token_num, bool deterministic) {
   CHECK_INPUT(draft_probs);
   CHECK_INPUT(draft_token_ids);
   CHECK_INPUT(uniform_samples);
@@ -349,14 +350,28 @@ torch::Tensor chain_speculative_sampling(torch::Tensor draft_probs, torch::Tenso
   auto output_token_ids = torch::empty({batch_size, num_speculate_tokens + 1},
                                        torch::dtype(torch::kInt32).device(device));
 
+  bool has_output_accepted_token_num = maybe_output_accepted_token_num.has_value();
+  bool has_output_emitted_token_num = maybe_output_emitted_token_num.has_value();
+  auto output_accepted_token_num = maybe_output_accepted_token_num.value_or(
+      torch::zeros({batch_size}, torch::dtype(torch::kInt32).device(device)));
+  auto output_emitted_token_num = maybe_output_emitted_token_num.value_or(
+      torch::zeros({batch_size}, torch::dtype(torch::kInt32).device(device)));
+  if (has_output_accepted_token_num) {
+    CHECK_EQ(has_output_emitted_token_num, true);
+    CHECK_EQ(batch_size, output_accepted_token_num.size(0));
+    CHECK_EQ(batch_size, output_emitted_token_num.size(0));
+  }
+
   cudaError_t status = sampling::ChainSpeculativeSampling<float, int>(
       static_cast<float*>(draft_probs.data_ptr()), static_cast<int*>(draft_token_ids.data_ptr()),
       static_cast<float*>(uniform_samples.data_ptr()), static_cast<float*>(target_probs.data_ptr()),
-      static_cast<int*>(output_token_ids.data_ptr()), batch_size, num_speculate_tokens, vocab_size,
-      deterministic, torch_current_stream);
+      static_cast<int*>(output_token_ids.data_ptr()),
+      static_cast<int*>(output_accepted_token_num.data_ptr()),
+      static_cast<int*>(output_emitted_token_num.data_ptr()), batch_size, num_speculate_tokens,
+      vocab_size, deterministic, torch_current_stream);
 
   TORCH_CHECK(status == cudaSuccess, "ChainSpeculativeSampling failed with error code " +
                                          std::string(cudaGetErrorString(status)));
 
-  return output_token_ids;
+  return {output_token_ids, output_accepted_token_num, output_emitted_token_num};
 }

@@ -339,11 +339,17 @@ def test_chain_speculative_sampling(
     # NOTE(Zihao): this is a very simple test that only checks whether output is valid or not.
     for trials in range(10):
         uniform_samples.uniform_()
-        output_token_ids = flashinfer.sampling.chain_speculative_sampling(
-            normalized_draft_prob,
-            draft_token_ids,
-            uniform_samples,
-            target_onehot_prob,
+        accepted_num = torch.zeros(batch_size, dtype=torch.int32).to(0)
+        emitted_num = torch.zeros(batch_size, dtype=torch.int32).to(0)
+        output_token_ids, accepted_num, emitted_num = (
+            flashinfer.sampling.chain_speculative_sampling(
+                normalized_draft_prob,
+                draft_token_ids,
+                uniform_samples,
+                target_onehot_prob,
+                accepted_num,
+                emitted_num,
+            )
         )
         if onehot_target:
             assert torch.all(output_token_ids == target_token_ids)
@@ -358,6 +364,26 @@ def test_chain_speculative_sampling(
                     assert torch.all(mismatch_idx[1:] == mismatch_idx[:-1] + 1)
                     # from the second mismatched token on, the output tokens should be -1
                     assert torch.all(output_token_ids[row, mismatch_idx[0] + 1 :] == -1)
+
+        assert torch.all(emitted_num + 1 == (output_token_ids != -1).sum(dim=1))
+        batch_indices = torch.arange(batch_size, device=normalized_draft_prob.device)[
+            :, None
+        ]
+        probs_indicies = torch.arange(
+            num_speculate_tokens, device=normalized_draft_prob.device
+        )
+        selected_draft_probs = normalized_draft_prob[
+            batch_indices, probs_indicies, draft_token_ids
+        ]
+        selected_target_probs = target_onehot_prob[
+            batch_indices, probs_indicies, draft_token_ids
+        ]
+        capped_ratio = torch.minimum(
+            selected_target_probs / selected_draft_probs,
+            torch.full((1,), 1, device=normalized_draft_prob.device),
+        )
+        ref_accepted = (uniform_samples[:, :-1] < capped_ratio).sum(dim=1)
+        assert torch.all(accepted_num == ref_accepted)
 
 
 if __name__ == "__main__":
