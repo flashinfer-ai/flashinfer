@@ -339,12 +339,16 @@ def test_chain_speculative_sampling(
     # NOTE(Zihao): this is a very simple test that only checks whether output is valid or not.
     for trials in range(10):
         uniform_samples.uniform_()
+        accepted_num = torch.zeros(batch_size, dtype=torch.int32).to(0)
+        emitted_num = torch.zeros(batch_size, dtype=torch.int32).to(0)
         output_token_ids, accepted_num, emitted_num = (
             flashinfer.sampling.chain_speculative_sampling(
                 normalized_draft_prob,
                 draft_token_ids,
                 uniform_samples,
                 target_onehot_prob,
+                accepted_num,
+                emitted_num,
             )
         )
         if onehot_target:
@@ -383,11 +387,11 @@ def test_chain_speculative_sampling(
 
 
 if __name__ == "__main__":
-    test_sampling(1, 111)
-    test_top_p_sampling(3, 111, 0.9)
-    test_top_k_sampling(3, 111, 10)
-    test_top_p_renorm_prob(3, 111, 0.9)
-    test_top_k_renorm_prob(3, 111, 10)
-    test_top_k_mask_logits(99, 989, 10)
+    # test_sampling(1, 111)
+    # test_top_p_sampling(3, 111, 0.9)
+    # test_top_k_sampling(3, 111, 10)
+    # test_top_p_renorm_prob(3, 111, 0.9)
+    # test_top_k_renorm_prob(3, 111, 10)
+    # test_top_k_mask_logits(99, 989, 10)
     test_chain_speculative_sampling(3, 111, 3, False)
     test_chain_speculative_sampling(3, 111, 3, True)

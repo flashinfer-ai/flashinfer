@@ -592,6 +592,8 @@ def chain_speculative_sampling(
     draft_token_ids,
     uniform_samples,
     target_probs,
+    maybe_output_accepted_token_num: torch.Tensor = None,
+    maybe_output_emitted_token_num: torch.Tensor = None,
     deterministic: bool = True,
 ) -> torch.Tensor:
     r"""Fused-GPU kernel for speculative sampling for sequence generation (proposed in
@@ -614,6 +616,15 @@ def chain_speculative_sampling(
         Compared to input :attr:`draft_probs`, the target model's probability has an additional
         slot at the end because the target model will generate one more token than the draft model.
         Shape: ``(batch_size, num_speculate_tokens + 1, vocab_size)``
+    maybe_output_accepted_token_num: torch.Tensor
+        The number of tokens that can be accepted if each token is considered independently for each request.
+        This metric does not consider the fact that rejection sampling will stop at the first token that does not
+        satisfy the probablity requirement r < p/q.
+        It only evaluates the alignment of draft model and target model.
+        Shape: ``(batch_size)``
+    maybe_output_emitted_token_num: torch.Tensor
+        The number of tokens that are finally emitted/generated for each request.
+        Shape: ``(batch_size)``
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
 
@@ -628,5 +639,11 @@ def chain_speculative_sampling(
         Shape: (batch_size, num_specutate_tokens + 1)
     """
     return _kernels.chain_speculative_sampling(
-        draft_probs, draft_token_ids, uniform_samples, target_probs, deterministic
+        draft_probs,
+        draft_token_ids,
+        uniform_samples,
+        target_probs,
+        maybe_output_accepted_token_num,
+        maybe_output_emitted_token_num,
+        deterministic,
     )

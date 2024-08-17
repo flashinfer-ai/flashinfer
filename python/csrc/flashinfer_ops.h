@@ -67,11 +67,10 @@ torch::Tensor top_k_renorm_prob(torch::Tensor probs, std::optional<torch::Tensor
 torch::Tensor top_k_mask_logits(torch::Tensor logits, std::optional<torch::Tensor> maybe_top_k_arr,
                                 unsigned int top_k_val, double eps);
 
-std::vector<torch::Tensor> chain_speculative_sampling(torch::Tensor draft_probs,
-                                                      torch::Tensor draft_token_ids,
-                                                      torch::Tensor uniform_samples,
-                                                      torch::Tensor target_probs,
-                                                      bool deterministic);
+std::vector<torch::Tensor> chain_speculative_sampling(
+    torch::Tensor draft_probs, torch::Tensor draft_token_ids, torch::Tensor uniform_samples,
+    torch::Tensor target_probs, std::optional<torch::Tensor> maybe_output_accepted_token_num,
+    std::optional<torch::Tensor> maybe_output_emitted_token_num, bool deterministic);
 
 torch::Tensor rmsnorm(torch::Tensor input, torch::Tensor weight, double eps);
 

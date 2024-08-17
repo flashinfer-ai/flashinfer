@@ -1167,25 +1167,24 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
   auto& temp_storage = reinterpret_cast<
       SamplingTempStorage<DType, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>&>(smem_sampling);
 
-  uint32_t pos = 0;
-  uint32_t stop_pos = num_speculative_tokens;
-  for (pos = 0; pos < num_speculative_tokens; ++pos) {
-    IdType draft_id = draft_token_ids[row_idx * num_speculative_tokens + pos];
-    float q = target_probs[(row_idx * (num_speculative_tokens + 1) + pos) * d + draft_id],
-          p = draft_probs[(row_idx * num_speculative_tokens + pos) * d + draft_id];
-    DType u = uniform_samples[row_idx * (num_speculative_tokens + 1) + pos];
+  uint32_t pos = num_speculative_tokens;
+  for (uint32_t i = 0; i < num_speculative_tokens; ++i) {
+    IdType draft_id = draft_token_ids[row_idx * num_speculative_tokens + i];
+    float q = target_probs[(row_idx * (num_speculative_tokens + 1) + i) * d + draft_id],
+          p = draft_probs[(row_idx * num_speculative_tokens + i) * d + draft_id];
+    DType u = uniform_samples[row_idx * (num_speculative_tokens + 1) + i];
     if (u * p < q) {
       // accept the draft models output
-      output_token_ids[row_idx * (num_speculative_tokens + 1) + pos] = draft_id;
+      output_token_ids[row_idx * (num_speculative_tokens + 1) + i] = draft_id;
     } else {
-      stop_pos = pos;
+      pos = i;
       break;
     }
   }
 
-  uint32_t emitted_token_num = stop_pos;
-  uint32_t accepted_token_num = stop_pos;
-  for (uint32_t i = stop_pos; i < num_speculative_tokens; ++i) {
+  uint32_t emitted_token_num = pos;
+  uint32_t accepted_token_num = pos;
+  for (uint32_t i = pos; i < num_speculative_tokens; ++i) {
     IdType draft_id = draft_token_ids[row_idx * num_speculative_tokens + i];
     float q = target_probs[(row_idx * (num_speculative_tokens + 1) + i) * d + draft_id],
           p = draft_probs[(row_idx * num_speculative_tokens + i) * d + draft_id];
@@ -1196,8 +1195,8 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
   }
 
   if (tx == 0) {
-    output_accepted_token_num[row_idx] = accepted_token_num;
-    output_emitted_token_num[row_idx] = emitted_token_num;
+    output_accepted_token_num[row_idx] += accepted_token_num;
+    output_emitted_token_num[row_idx] += emitted_token_num;
   }
 
   // sample from relu(target_probs - draft_probs)
