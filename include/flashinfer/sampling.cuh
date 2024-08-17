@@ -686,11 +686,7 @@ cudaError_t TopKSamplingFromProb(T* probs, T* uniform_samples, IdType* output, b
                                  T* top_k_arr, uint32_t batch_size, uint32_t top_k_val, uint32_t d,
                                  uint32_t max_top_k_rounds, bool deterministic,
                                  cudaStream_t stream = 0) {
-#if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
-  constexpr uint32_t BLOCK_THREADS = 1024;
-#else
   constexpr uint32_t BLOCK_THREADS = 512;
-#endif
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   const uint32_t smem_size = sizeof(SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
@@ -716,11 +712,7 @@ cudaError_t TopPSamplingFromProb(T* probs, T* uniform_samples, IdType* output, b
                                  T* top_p_arr, uint32_t batch_size, T top_p_val, uint32_t d,
                                  uint32_t max_top_p_rounds, bool deterministic,
                                  cudaStream_t stream = 0) {
-#if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
   constexpr uint32_t BLOCK_THREADS = 1024;
-#else
-  constexpr uint32_t BLOCK_THREADS = 512;
-#endif
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   const uint32_t smem_size = sizeof(SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
@@ -746,11 +738,7 @@ template <typename T, typename IdType>
 cudaError_t MinPSamplingFromProb(T* probs, T* uniform_samples, T* min_p_arr, IdType* output,
                                  bool* success, uint32_t batch_size, float min_p_val, uint32_t d,
                                  uint32_t max_rounds, bool deterministic, cudaStream_t stream = 0) {
-#if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
   constexpr uint32_t BLOCK_THREADS = 1024;
-#else
-  constexpr uint32_t BLOCK_THREADS = 512;
-#endif
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   const uint32_t smem_size = sizeof(SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
@@ -776,11 +764,7 @@ cudaError_t TopKTopPSamplingFromProb(T* probs, T* uniform_samples, IdType* top_k
                                      IdType* output, bool* success, uint32_t batch_size,
                                      IdType top_k_val, T top_p_val, uint32_t d, uint32_t max_rounds,
                                      bool deterministic, cudaStream_t stream = 0) {
-#if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
-  constexpr uint32_t BLOCK_THREADS = 1024;
-#else
   constexpr uint32_t BLOCK_THREADS = 512;
-#endif
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   const uint32_t smem_size = sizeof(SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
@@ -1202,7 +1186,7 @@ template <typename DType, typename IdType>
 cudaError_t TopKRenormProb(DType* probs, DType* renormed_prob, IdType* top_k_arr,
                            uint32_t batch_size, uint32_t top_k_val, uint32_t d,
                            cudaStream_t stream = 0) {
-  constexpr uint32_t BLOCK_THREADS = 1024;
+  constexpr uint32_t BLOCK_THREADS = 512;
   const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
 
   const uint32_t smem_size = sizeof(RenormTempStorage<DType, BLOCK_THREADS, REDUCE_ALGO>);
@@ -1222,7 +1206,7 @@ template <typename DType, typename IdType>
 cudaError_t TopKMaskLogits(DType* logits, DType* masked_logits, IdType* top_k_arr,
                            uint32_t batch_size, uint32_t top_k_val, uint32_t d,
                            cudaStream_t stream = 0) {
-  constexpr uint32_t BLOCK_THREADS = 1024;
+  constexpr uint32_t BLOCK_THREADS = 512;
   const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
 
   const uint32_t smem_size = sizeof(RenormTempStorage<DType, BLOCK_THREADS, REDUCE_ALGO>);
