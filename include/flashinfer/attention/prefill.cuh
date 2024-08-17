@@ -18,9 +18,7 @@
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#ifdef FLASHINFER_ENABLE_FP8
 #include <cuda_fp8.h>
-#endif
 #include <cuda_runtime.h>
 
 #include "../cp_async.cuh"

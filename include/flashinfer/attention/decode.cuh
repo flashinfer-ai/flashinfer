@@ -20,9 +20,7 @@
 #include <cuda_fp16.h>
 
 #include <cstddef>
-#ifdef FLASHINFER_ENABLE_FP8
 #include <cuda_fp8.h>
-#endif
 #include <cuda_runtime.h>
 
 #include <cuda/pipeline>

@@ -18,9 +18,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#ifdef FLASHINFER_ENABLE_FP8
 #include <cuda_fp8.h>
-#endif
 #include <cuda_runtime.h>
 
 #include <type_traits>
@@ -206,7 +204,6 @@ __device__ __forceinline__ void stmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
 #endif
 }
 
-#ifdef FLASHINFER_ENABLE_FP8
 /*!
  * \brief Wrapper of two mma m16n8k32 instructions for row major and column major f8 matrix
  *   multiplication, accumulated in f32.
@@ -307,7 +304,6 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f32(float* C, uin
       "fp8 mma instruction is only available for sm89, PTX 8.4+ and CUDA 12.4+");
 #endif
 }
-#endif
 
 /*!
  * \brief Wrapper of two mma m16n8k16 instructions for row major and column major f16 matrix
@@ -476,7 +472,6 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
 #endif
 }
 
-#ifdef FLASHINFER_ENABLE_FP8
 /*!
  * \brief Use mma instructions to compute rowsum.
  */
@@ -515,7 +510,6 @@ __device__ __forceinline__ void rowsum_f8f8f32(float* d, DType* s) {
       "fp8 mma instruction is only available for sm89, PTX 8.4+ and CUDA 12.4+");
 #endif
 }
-#endif
 
 /*!
  * \brief Use mma instructions to compute rowsum.

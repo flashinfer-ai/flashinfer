@@ -22,12 +22,8 @@
 #include <flashinfer/pos_enc.cuh>
 
 #include "generated/dispatch.inc"
-#ifdef FLASHINFER_ENABLE_BF16
 #include <cuda_bf16.h>
-#endif
-#ifdef FLASHINFER_ENABLE_FP8
 #include <cuda_fp8.h>
-#endif
 
 using namespace flashinfer;
 
