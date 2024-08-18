@@ -253,6 +253,12 @@ __device__ __forceinline__ uint32_t sub_if_greater_or_zero(uint32_t x, uint32_t 
   return (x > y) ? x - y : 0U;
 }
 
+__device__ __forceinline__ void swap(uint32_t& a, uint32_t& b) {
+  uint32_t tmp = a;
+  a = b;
+  b = tmp;
+}
+
 }  // namespace flashinfer
 
 #endif  // FLASHINFER_UTILS_CUH_

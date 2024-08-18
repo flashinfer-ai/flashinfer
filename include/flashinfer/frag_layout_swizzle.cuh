@@ -39,11 +39,4 @@ __device__ __forceinline__ uint32_t frag_layout_swizzle_16b_to_8b_trans(uint32_t
   return x;
 }
 
-__device__ __forceinline__ void bfly_exch(uint32_t& a, uint32_t& b) {
-  uint32_t tmp = __byte_perm(a, b, 0x5410);
-  uint32_t tmp2 = __byte_perm(a, b, 0x7632);
-  a = tmp;
-  b = tmp2;
-}
-
 #endif  // FLASHINFER_FRAG_LAYOUT_SWIZZLE_CUH_

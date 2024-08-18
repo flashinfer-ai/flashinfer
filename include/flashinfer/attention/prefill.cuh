@@ -802,8 +802,8 @@ __device__ __forceinline__ void compute_sfm_v(smem_t<swizzle_mode>* v_smem,
         }
         b_frag_f8[0] = frag_layout_swizzle_16b_to_8b_trans(b_frag_f8[0]);
         b_frag_f8[1] = frag_layout_swizzle_16b_to_8b_trans(b_frag_f8[1]);
-        bfly_exch(b_frag_f8[0], b_frag_f8[1]);
         vec_cast<DTypeQ, DTypeKV>::cast<8>((DTypeQ*)b_frag, (DTypeKV*)b_frag_f8);
+        swap(b_frag[1], b_frag[2]);
       } else {
         v_smem->ldmatrix_m8n8x4_trans(*v_smem_offset_r, b_frag);
       }
