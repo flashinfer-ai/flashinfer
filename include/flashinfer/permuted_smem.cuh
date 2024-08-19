@@ -76,12 +76,14 @@ struct smem_t {
   static __device__ __forceinline__ uint32_t advance_offset_by_column(uint32_t offset,
                                                                       uint32_t step_idx) {
     if constexpr (swizzle_mode == SwizzleMode::k128B) {
-      static_assert(step_size == 2 || step_size == 4 || step_size % 8 == 0,
+      static_assert(step_size == 2 || step_size == 4 || step_size == 12 || step_size % 8 == 0,
                     "Unsupported step size");
       if constexpr (step_size == 2) {
         return (offset ^ (0x2 + (0x4 * (step_idx % 2 == 1)))) + (step_idx % 4 == 3) * 8;
       } else if constexpr (step_size == 4) {
         return (offset ^ 0x4) + (step_idx % 2 == 1) * 8;
+      } else if constexpr (step_size == 12) {
+        return (offset ^ 0x4) + (step_idx % 2 == 1) * 8 + 8;
       } else {
         // step_size % 8 == 0
         return offset + step_size;
