@@ -39,7 +39,10 @@ def _to_tensor_scalar_tuple(x):
 
 
 def sampling_from_probs(
-    probs: torch.Tensor, uniform_samples: torch.Tensor, deterministic: bool = True
+    probs: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    deterministic: bool = True,
+    check_nan: bool = False,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for category sampling from probabilities.
 
@@ -52,6 +55,8 @@ def sampling_from_probs(
         Expected to be uniformly distributed in ``[0, 1)``.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
+    check_nan: bool
+        Whether to check nan in :attr:`probs`, default is ``False``.
 
     Returns
     -------
@@ -82,6 +87,9 @@ def sampling_from_probs(
     -----
     This function expects float32 inputs, and the output is int32.
     """
+    if check_nan:
+        if torch.any(torch.isnan(probs)):
+            raise ValueError("Input probs contains NaN.")
     return _kernels.sampling_from_probs(probs, uniform_samples, deterministic)
 
 
@@ -90,6 +98,7 @@ def top_p_sampling_from_probs(
     uniform_samples: torch.Tensor,
     top_p: Union[torch.Tensor, float],
     deterministic: bool = True,
+    check_nan: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Fused GPU kernel for top-p sampling (nucleus sampling) from probabilities,
     this operator implements GPU-based rejection sampling without explicit sorting.
@@ -111,6 +120,8 @@ def top_p_sampling_from_probs(
         If a tensor, each request has its own threshold.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
+    check_nan: bool
+        Whether to check nan in :attr:`probs`, default is ``False``.
 
     Returns
     -------
@@ -150,6 +161,9 @@ def top_p_sampling_from_probs(
     We encourage users to set ``max_top_p_rounds`` to a reasonable value, e.g., 32. The actual
     implementation usually use much fewer rounds for rejection sampling because of early stopping.
     """
+    if check_nan:
+        if torch.any(torch.isnan(probs)):
+            raise ValueError("Input probs contains NaN.")
     return _kernels.top_p_sampling_from_probs(
         probs, uniform_samples, *_to_tensor_scalar_tuple(top_p), deterministic
     )
@@ -160,6 +174,7 @@ def top_k_sampling_from_probs(
     uniform_samples: torch.Tensor,
     top_k: Union[torch.Tensor, int],
     deterministic: bool = True,
+    check_nan: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Fused GPU kernel for top-k sampling from probabilities,
     this operator implements GPU-based rejection sampling without explicit sorting.
@@ -181,6 +196,8 @@ def top_k_sampling_from_probs(
         If a tensor, each request has its own threshold.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
+    check_nan: bool
+        Whether to check nan in :attr:`probs`, default is ``False``.
 
     Returns
     -------
@@ -220,6 +237,9 @@ def top_k_sampling_from_probs(
     We encourage users to set ``max_top_k_rounds`` to a reasonable value, e.g., 32. The actual
     implementation usually use much fewer rounds for rejection sampling because of early stopping.
     """
+    if check_nan:
+        if torch.any(torch.isnan(probs)):
+            raise ValueError("Input probs contains NaN.")
     return _kernels.top_k_sampling_from_probs(
         probs, uniform_samples, *_to_tensor_scalar_tuple(top_k), deterministic
     )
@@ -230,6 +250,7 @@ def min_p_sampling_from_probs(
     uniform_samples: torch.Tensor,
     min_p: Union[torch.Tensor, float],
     deterministic: bool = True,
+    check_nan: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Fused GPU kernel for `min_p sampling <https://arxiv.org/abs/2407.01082>`_ from probabilities,
 
@@ -252,6 +273,8 @@ def min_p_sampling_from_probs(
         If a tensor, each request has its own threshold.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
+    check_nan: bool
+        Whether to check nan in :attr:`probs`, default is ``False``.
 
     Returns
     -------
@@ -292,6 +315,9 @@ def min_p_sampling_from_probs(
     We encourage users to set ``max_rounds`` to a reasonable value, e.g., 32. The actual
     implementation usually use much fewer rounds for rejection sampling because of early stopping.
     """
+    if check_nan:
+        if torch.any(torch.isnan(probs)):
+            raise ValueError("Input probs contains NaN.")
     return _kernels.min_p_sampling_from_probs(
         probs, uniform_samples, *_to_tensor_scalar_tuple(min_p), deterministic
     )
@@ -304,6 +330,7 @@ def top_k_top_p_sampling_from_logits(
     top_p: Union[torch.Tensor, float],
     filter_apply_order: str = "top_k_first",
     deterministic: bool = True,
+    check_nan: bool = False,
     **kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Fused GPU kernel for top-k and top-p sampling from pre-softmax logits,
@@ -335,6 +362,8 @@ def top_k_top_p_sampling_from_logits(
         If ``"joint"``, we apply top-k and top-p filter simultaneously in each round.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
+    check_nan: bool
+        Whether to check nan in :attr:`probs`, default is ``False``.
 
     Returns
     -------
@@ -387,9 +416,14 @@ def top_k_top_p_sampling_from_logits(
     if filter_apply_order == "top_k_first":
         masked_logits = top_k_mask_logits(probs, top_k, **kwargs)
         probs = torch.softmax(masked_logits, dim=-1)
-        return top_p_sampling_from_probs(probs, uniform_samples, top_p, deterministic)
+        return top_p_sampling_from_probs(
+            probs, uniform_samples, top_p, deterministic, check_nan=check_nan
+        )
     elif filter_apply_order == "joint":
         probs = torch.softmax(probs, dim=-1)
+        if check_nan:
+            if torch.any(torch.isnan(probs)):
+                raise ValueError("Input probs contains NaN.")
         return _kernels.top_k_top_p_sampling_from_probs(
             probs,
             uniform_samples,
@@ -408,6 +442,7 @@ def top_k_top_p_sampling_from_probs(
     top_p: Union[torch.Tensor, float],
     filter_apply_order: str = "top_k_first",
     deterministic: bool = True,
+    check_nan: bool = False,
     **kwargs,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Fused GPU kernel for top-k and top-p sampling from probabilities,
@@ -439,6 +474,8 @@ def top_k_top_p_sampling_from_probs(
         If ``"joint"``, we apply top-k and top-p filter simultaneously in each round.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
+    check_nan: bool
+        Whether to check nan in :attr:`probs`, default is ``False``.
 
     Returns
     -------
@@ -482,9 +519,12 @@ def top_k_top_p_sampling_from_probs(
     if filter_apply_order == "top_k_first":
         renorm_probs = top_k_renorm_prob(probs, top_k, **kwargs)
         return top_p_sampling_from_probs(
-            renorm_probs, uniform_samples, top_p, deterministic
+            renorm_probs, uniform_samples, top_p, deterministic, check_nan=check_nan
         )
     elif filter_apply_order == "joint":
+        if check_nan:
+            if torch.any(torch.isnan(probs)):
+                raise ValueError("Input probs contains NaN.")
         return _kernels.top_k_top_p_sampling_from_probs(
             probs,
             uniform_samples,
@@ -497,7 +537,9 @@ def top_k_top_p_sampling_from_probs(
 
 
 def top_p_renorm_prob(
-    probs: torch.Tensor, top_p: Union[torch.Tensor, float], eps: float = 1e-6
+    probs: torch.Tensor,
+    top_p: Union[torch.Tensor, float],
+    eps: float = 1e-6,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for renormalizing probabilities by top-p thresholding.
 
@@ -527,7 +569,9 @@ def top_p_renorm_prob(
 
 
 def top_k_renorm_prob(
-    probs: torch.Tensor, top_k: Union[torch.Tensor, int], eps: float = 1e-6
+    probs: torch.Tensor,
+    top_k: Union[torch.Tensor, int],
+    eps: float = 1e-6,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for renormalizing probabilities by top-k thresholding.
 
