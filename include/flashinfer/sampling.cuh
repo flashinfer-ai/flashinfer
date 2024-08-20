@@ -953,6 +953,7 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
           min(threadlocal_min_val,
               BlockReduce<DType, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
                   .Reduce<VEC_SIZE>(logits_greater_than_pivot, cub::Min()));
+      __syncthreads();
     }
     if (tx == 0) {
       temp_storage.data.max_val = threadlocal_max_val;
@@ -1005,7 +1006,6 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
       max_le_high =
           BlockReduce<DType, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
               .Reduce(max_le_high, cub::Max());
-      __syncthreads();
       if (tx == 0) {
         temp_storage.data.block_aggregate.count = threadlocal_count_sum;
         temp_storage.data.min_val = min_gt_low;
@@ -1125,7 +1125,6 @@ __global__ void TopKRenormProbKernel(DType* probs, DType* renormed_prob, IdType*
       max_le_high =
           BlockReduce<DType, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
               .Reduce(max_le_high, cub::Max());
-      __syncthreads();
       if (tx == 0) {
         temp_storage.data.block_aggregate.pair = threadlocal_sum;
         temp_storage.data.min_val = min_gt_low;
