@@ -221,7 +221,7 @@ std::vector<torch::Tensor> top_k_top_p_sampling_from_probs(
 }
 
 torch::Tensor top_p_renorm_prob(torch::Tensor probs, std::optional<torch::Tensor> maybe_top_p_arr,
-                                double top_p_val, double eps) {
+                                double top_p_val) {
   CHECK_INPUT(probs);
   auto device = probs.device();
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
@@ -244,15 +244,15 @@ torch::Tensor top_p_renorm_prob(torch::Tensor probs, std::optional<torch::Tensor
 
   cudaError_t status = sampling::TopPRenormProb<float>(
       static_cast<float*>(probs.data_ptr()), static_cast<float*>(renorm_probs.data_ptr()),
-      has_top_p_arr ? static_cast<float*>(top_p_arr.data_ptr()) : nullptr, eps, batch_size,
-      top_p_val, vocab_size, torch_current_stream);
+      has_top_p_arr ? static_cast<float*>(top_p_arr.data_ptr()) : nullptr, batch_size, top_p_val,
+      vocab_size, torch_current_stream);
   TORCH_CHECK(status == cudaSuccess,
               "TopPRenormProb failed with error code " + std::string(cudaGetErrorString(status)));
   return renorm_probs;
 }
 
 torch::Tensor top_k_renorm_prob(torch::Tensor probs, std::optional<torch::Tensor> maybe_top_k_arr,
-                                unsigned int top_k_val, double eps) {
+                                unsigned int top_k_val) {
   CHECK_INPUT(probs);
   auto device = probs.device();
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
@@ -275,7 +275,7 @@ torch::Tensor top_k_renorm_prob(torch::Tensor probs, std::optional<torch::Tensor
 
   cudaError_t status = sampling::TopKRenormProb<float>(
       static_cast<float*>(probs.data_ptr()), static_cast<float*>(renorm_probs.data_ptr()),
-      has_top_k_arr ? static_cast<int*>(top_k_arr.data_ptr()) : nullptr, eps, batch_size, top_k_val,
+      has_top_k_arr ? static_cast<int*>(top_k_arr.data_ptr()) : nullptr, batch_size, top_k_val,
       vocab_size, torch_current_stream);
 
   TORCH_CHECK(status == cudaSuccess,
@@ -284,7 +284,7 @@ torch::Tensor top_k_renorm_prob(torch::Tensor probs, std::optional<torch::Tensor
 }
 
 torch::Tensor top_k_mask_logits(torch::Tensor logits, std::optional<torch::Tensor> maybe_top_k_arr,
-                                unsigned int top_k_val, double eps) {
+                                unsigned int top_k_val) {
   CHECK_INPUT(logits);
   auto device = logits.device();
   CHECK_DIM(2, logits);  // logits: (batch_size, vocab_size)
@@ -307,7 +307,7 @@ torch::Tensor top_k_mask_logits(torch::Tensor logits, std::optional<torch::Tenso
 
   cudaError_t status = sampling::TopKMaskLogits<float>(
       static_cast<float*>(logits.data_ptr()), static_cast<float*>(mask_logits.data_ptr()),
-      has_top_k_arr ? static_cast<int*>(top_k_arr.data_ptr()) : nullptr, eps, batch_size, top_k_val,
+      has_top_k_arr ? static_cast<int*>(top_k_arr.data_ptr()) : nullptr, batch_size, top_k_val,
       vocab_size, torch_current_stream);
 
   TORCH_CHECK(status == cudaSuccess,

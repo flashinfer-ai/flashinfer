@@ -196,7 +196,9 @@ def test_top_k_top_p_sampling_from_probs_logits_alignment(batch_size, vocab_size
         p,
         filter_apply_order="top_k_first",
     )
-    assert torch.all(samples == samples_ref)
+    assert torch.all(
+        samples == samples_ref
+    ), f"{samples} != {samples_ref}, {success}, {success_ref}"
     assert torch.all(success)
     assert torch.all(success_ref)
 
@@ -231,7 +233,6 @@ def test_top_k_top_p_joint_sampling_from_logits(batch_size, vocab_size, p):
 @pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
 @pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
 def test_top_p_renorm_prob(batch_size, vocab_size, p):
-    eps = 1e-6
     pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
     sorted_prob, indices = torch.sort(normalized_prob, descending=False)
@@ -244,7 +245,7 @@ def test_top_p_renorm_prob(batch_size, vocab_size, p):
         dim=-1, keepdim=True
     )
 
-    renorm_prob = flashinfer.sampling.top_p_renorm_prob(normalized_prob, p, eps=eps)
+    renorm_prob = flashinfer.sampling.top_p_renorm_prob(normalized_prob, p)
     numpy.testing.assert_allclose(
         renorm_prob_ground_truth.cpu().numpy(),
         renorm_prob.cpu().numpy(),
@@ -291,7 +292,7 @@ def test_top_k_mask_logits(batch_size, vocab_size, k):
     probs = torch.softmax(logits, dim=-1)
     masked_logits = flashinfer.sampling.top_k_mask_logits(logits, k)
     renormed_probs = torch.softmax(masked_logits, dim=-1)
-    renormed_probs_ref = flashinfer.sampling.top_k_renorm_prob(probs, k, 1e-8)
+    renormed_probs_ref = flashinfer.sampling.top_k_renorm_prob(probs, k)
 
     numpy.testing.assert_allclose(
         renormed_probs.cpu().numpy(),
