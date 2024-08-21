@@ -126,7 +126,6 @@ __device__ void fast_dequant_f8f16x4(uint32_t* input, uint2* output) {
     constexpr int MASK2 = MASK1 >> (FP8_EXPONENT + FP8_MANTISSA);
     constexpr int MASK3 = MASK2 & 0x7fffffff;
     constexpr int MASK = MASK3 | (MASK3 >> 16);
-    // Final MASK value: 0x7F007F00
     q = __byte_perm(q, q, 0x1302);
 
     // Extract and shift FP8 values to FP16 format
