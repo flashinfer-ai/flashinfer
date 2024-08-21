@@ -29,9 +29,8 @@ __device__ __forceinline__ uint32_t frag_layout_swizzle_16b_to_8b(uint32_t x) {
 }
 
 __device__ __forceinline__ uint32_t frag_layout_swizzle_16b_to_8b_trans(uint32_t x) {
-  x = __byte_perm(x, x, 0x3120);
   uint32_t tmp = __shfl_xor_sync(0xffffffff, x, 0x4);
-  x = __byte_perm(x, tmp, ((threadIdx.x & 0x4) == 0) ? 0x5410 : 0x3276);
+  x = __byte_perm(x, tmp, ((threadIdx.x & 0x4) == 0) ? 0x6420 : 0x3175);
   tmp = __shfl_xor_sync(0xffffffff, x, 0x8);
   x = __byte_perm(x, tmp, ((threadIdx.x & 0x8) == 0) ? 0x5410 : 0x3276);
   tmp = __shfl_xor_sync(0xffffffff, x, 0x10);
