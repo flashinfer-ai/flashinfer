@@ -511,7 +511,7 @@ cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* indptr, DTyp
   int dev_id = 0;
   int num_sms = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
-  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
 
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
