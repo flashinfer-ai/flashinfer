@@ -301,12 +301,15 @@ __global__ void MergeStatesLargeNumIndexSetsKernel(DTypeIn* __restrict__ V, floa
  */
 template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t num_smem_stages, typename DTypeIn,
           typename DTypeOut, typename IdType>
-__global__ void PersistentVariableLengthMergeStatesKernel(
-    DTypeIn* __restrict__ V, float* __restrict__ S, IdType* indptr, DTypeOut* __restrict__ v_merged,
-    float* __restrict__ s_merged, uint32_t seq_len, uint32_t num_heads, uint32_t num_sms) {
+__global__ void PersistentVariableLengthMergeStatesKernel(DTypeIn* __restrict__ V,
+                                                          float* __restrict__ S, IdType* indptr,
+                                                          DTypeOut* __restrict__ v_merged,
+                                                          float* __restrict__ s_merged,
+                                                          uint32_t seq_len, uint32_t num_heads) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
-  uint32_t sm_id = blockIdx.x;
-  uint32_t num_iters = ceil_div(seq_len * num_heads, num_sms);
+  uint32_t cta_id = blockIdx.x;
+  uint32_t num_ctas = gridDim.x;
+  uint32_t num_iters = ceil_div(seq_len * num_heads, num_ctas);
   constexpr uint32_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
   constexpr uint32_t head_dim = vec_size * bdx;
   extern __shared__ uint8_t smem[];
@@ -314,7 +317,7 @@ __global__ void PersistentVariableLengthMergeStatesKernel(
   float* s_smem = (float*)(smem + num_smem_stages * bdy * head_dim * sizeof(DTypeIn));
 
 #pragma unroll 1
-  for (uint32_t i = sm_id; i < seq_len * num_heads; i += num_sms) {
+  for (uint32_t i = cta_id; i < seq_len * num_heads; i += num_ctas) {
     uint32_t pos = i / num_heads;
     uint32_t head_idx = i % num_heads;
     state_t<vec_size> st;
@@ -510,6 +513,7 @@ cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* indptr, DTyp
                                       uint32_t head_dim, cudaStream_t stream = nullptr) {
   int dev_id = 0;
   int num_sms = 0;
+  int num_blocks_per_sm = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
 
@@ -518,15 +522,18 @@ cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* indptr, DTyp
     constexpr uint32_t bdx = HEAD_DIM / vec_size;
     constexpr uint32_t num_threads = 128;
     constexpr uint32_t bdy = num_threads / bdx;
-
-    dim3 nblks(num_sms);
-    dim3 nthrs(bdx, bdy);
     constexpr uint32_t num_smem_stages = 4;
-    auto kernel = PersistentVariableLengthMergeStatesKernel<vec_size, bdx, bdy, num_smem_stages,
-                                                            DTypeIn, DTypeOut, IdType>;
-    void* args[] = {&v, &s, &indptr, &v_merged, &s_merged, &seq_len, &num_heads, &num_sms};
     uint32_t smem_size =
         num_smem_stages * bdy * head_dim * sizeof(DTypeIn) + num_threads * sizeof(float);
+    auto kernel = PersistentVariableLengthMergeStatesKernel<vec_size, bdx, bdy, num_smem_stages,
+                                                            DTypeIn, DTypeOut, IdType>;
+    FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
+                                                                       num_threads, smem_size));
+    num_blocks_per_sm = min(num_blocks_per_sm, ceil_div(seq_len * num_heads, num_sms));
+
+    dim3 nblks(num_sms * num_blocks_per_sm);
+    dim3 nthrs(bdx, bdy);
+    void* args[] = {&v, &s, &indptr, &v_merged, &s_merged, &seq_len, &num_heads};
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
