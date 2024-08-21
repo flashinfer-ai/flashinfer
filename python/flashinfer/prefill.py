@@ -1056,7 +1056,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 True,  # return LSE
             )
         else:
-            out, lse = self._wrapper.forward(
+            out, lse = self._wrapper.forward_custom_mask(
                 q,
                 self._qo_indptr_buf,
                 *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
