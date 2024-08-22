@@ -585,8 +585,8 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
         page_size : int
             The page size of the paged kv-cache.
 
-        Notes
-        -----
+        Note
+        ----
         The :meth:`begin_forward` method should be called before any :meth:`forward`
         or :meth:`forward_return_lse` calls, auxiliary data structures will be created
         during this call and cached for multiple forward calls.

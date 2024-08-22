@@ -33,7 +33,56 @@ except ImportError as e:
 
 
 class SegmentGEMMWrapper:
-    r"""Wrapper for segment GEMM kernels."""
+    r"""Wrapper for segment GEMM kernels.
+
+    Example
+    -------
+    >>> import torch
+    >>> from flashinfer import SegmentGEMMWrapper
+
+    >>> # create a 1MB workspace buffer
+    >>> workspace_buffer = torch.empty(1 * 1024 * 1024, dtype=torch.int8, device="cuda")
+    >>> segment_gemm = SegmentGEMMWrapper(workspace_buffer)
+    >>> seq_lens = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="cuda")
+    >>> # create packed input tensor (10 = 1 + 2 + 3 + 4)
+    >>> x = torch.randn(10, 128, device="cuda", dtype=torch.float16)
+    >>> # create weight tensor with 4 weights, each with 128 input and 256 output channels, column major
+    >>> weights = torch.randn(4, 256, 128, device="cuda", dtype=torch.float16)
+    >>> # compute the segment GEMM
+    >>> y = segment_gemm.forward(x, weights, 4, True, seg_lens=seq_lens)
+    >>> y.shape
+    torch.Size([10, 256])
+    >>> y_ref_0 = torch.matmul(x[:1], weights[0].t())
+    >>> torch.allclose(y[:1], y_ref_0)
+    True
+    >>> y_ref_1 = torch.matmul(x[1:3], weights[1].t())
+    >>> torch.allclose(y[1:3], y_ref_1)
+    True
+    >>> y_ref_2 = torch.matmul(x[3:6], weights[2].t())
+    >>> torch.allclose(y[3:6], y_ref_2)
+    True
+    >>> y_ref_3 = torch.matmul(x[6:], weights[3].t())
+    >>> torch.allclose(y[6:], y_ref_3)
+    True
+    >>>
+    >>> # another example with weight indices
+    >>> weight_indices = torch.tensor([0, 1, 0, 1], dtype=torch.int64, device="cuda")
+    >>> y = segment_gemm.forward(x, weights, 4, True, seg_lens=seq_lens, weight_indices=weight_indices)
+    >>> y.shape
+    torch.Size([10, 256])
+    >>> y_ref_0 = torch.matmul(x[:1], weights[0].t())
+    >>> torch.allclose(y[:1], y_ref_0)
+    True
+    >>> y_ref_1 = torch.matmul(x[1:3], weights[1].t())
+    >>> torch.allclose(y[1:3], y_ref_1)
+    True
+    >>> y_ref_2 = torch.matmul(x[3:6], weights[0].t())
+    >>> torch.allclose(y[3:6], y_ref_2)
+    True
+    >>> y_ref_3 = torch.matmul(x[6:], weights[1].t())
+    >>> torch.allclose(y[6:], y_ref_3)
+    True
+    """
 
     def __init__(self, workspace_buffer: torch.Tensor) -> None:
         r"""Initialize the wrapper.

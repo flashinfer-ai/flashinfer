@@ -164,8 +164,8 @@ def single_prefill_with_kv_cache(
     >>> torch.allclose(o, o_custom, rtol=1e-3, atol=1e-3)
     True
 
-    Notes
-    -----
+    Note
+    ----
     The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads`` is
     not equal to ``num_kv_heads``, the function will use
     `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
@@ -336,8 +336,8 @@ def single_prefill_with_kv_cache_return_lse(
     >>> torch.allclose(S, S_custom, rtol=1e-3, atol=1e-3)
     True
 
-    Notes
-    -----
+    Note
+    ----
     Please refer to the :ref:`tutorial <recursive-attention>` for a detailed
     explanation of the log-sum-exp function and attention states.
 
@@ -727,8 +727,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         q_data_type : Optional[Union[str, torch.dtype]]
             The data type of the query tensor. If None, will be set to torch.float16.
 
-        Notes
-        -----
+        Note
+        ----
         The :meth:`begin_forward` method should be called before any :meth:`forward` or
         :meth:`forward_return_lse` calls, auxiliary data structures will be created
         during this call and cached for multiple forward calls.
@@ -1342,8 +1342,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         q_data_type : Optional[Union[str, torch.dtype]]
             The data type of the query tensor. If None, will be set to torch.float16.
 
-        Notes
-        -----
+        Note
+        ----
         The :meth:`begin_forward` method should be called before any :meth:`forward` or
         :meth:`forward_return_lse` calls, auxiliary data structures will be created
         during this call and cached for multiple forward calls.
