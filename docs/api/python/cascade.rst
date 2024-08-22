@@ -25,6 +25,10 @@ Cascade Attention
 Cascade Attention Wrapper Classes
 ---------------------------------
 
+.. autoclass:: MultiLevelCascadeAttentionWrapper
+    :members:
+
+
 .. autoclass:: BatchDecodeWithSharedPrefixPagedKVCacheWrapper
     :members:
 

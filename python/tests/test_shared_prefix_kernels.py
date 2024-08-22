@@ -110,93 +110,82 @@ def test_batch_attention_with_shared_prefix_paged_kv_cache(
     )
 
     if stage == "decode":
-        baseline_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-            torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0), kv_layout
+        multi_level_wrapper = flashinfer.MultiLevelCascadeAttentionWrapper(
+            2, torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0), kv_layout
         )
-        cascade_wrapper = flashinfer.BatchDecodeWithSharedPrefixPagedKVCacheWrapper(
-            torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0), kv_layout
+        shared_prefix_decode_wrapper = (
+            flashinfer.BatchDecodeWithSharedPrefixPagedKVCacheWrapper(
+                torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0), kv_layout
+            )
         )
     else:
-        baseline_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0), kv_layout
+        multi_level_wrapper = flashinfer.MultiLevelCascadeAttentionWrapper(
+            2, torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0), kv_layout
         )
-        cascade_wrapper = flashinfer.BatchPrefillWithSharedPrefixPagedKVCacheWrapper(
-            torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0), kv_layout
+        shared_prefix_prefill_wrapper = (
+            flashinfer.BatchPrefillWithSharedPrefixPagedKVCacheWrapper(
+                torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0), kv_layout
+            )
         )
 
-    baseline_kv_indices_arr = []
-    for i in range(batch_size):
-        baseline_kv_indices_arr.append(
-            torch.arange(0, ceil_div(shared_kv_len, page_size)).int()
-        )
-        baseline_kv_indices_arr.append(
-            torch.arange(
-                i * ceil_div(unique_kv_len, page_size),
-                (i + 1) * ceil_div(unique_kv_len, page_size),
-            ).int()
-            + ceil_div(shared_kv_len, page_size)
-        )
-    baseline_kv_indices = torch.cat(baseline_kv_indices_arr, dim=0).to(0)
-    baseline_kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * (
-        ceil_div(shared_kv_len, page_size) + ceil_div(unique_kv_len, page_size)
-    )
-    baseline_kv_last_page_len = unique_last_page_len
+    qo_indptr_top = torch.tensor([0, q.shape[0]], dtype=torch.int32).to(0)
     if stage == "decode":
-        baseline_wrapper.begin_forward(
-            baseline_kv_indptr,
-            baseline_kv_indices,
-            baseline_kv_last_page_len,
+        qo_indptr_bottom = torch.arange(0, batch_size + 1).to(0)
+        multi_level_wrapper.begin_forward(
+            [qo_indptr_top, qo_indptr_bottom],
+            [shared_kv_indptr, unique_kv_indptr],
+            [shared_kv_indices, unique_kv_indices],
+            [shared_last_page_len, unique_last_page_len],
             num_heads,
             num_heads,
             head_dim,
             page_size,
         )
-        o_baseline = baseline_wrapper.forward(q, kv_data)
+        o_multi_level = multi_level_wrapper.forward(q, kv_data)
     else:
-        baseline_wrapper.begin_forward(
-            q_indptr,
-            baseline_kv_indptr,
-            baseline_kv_indices,
-            baseline_kv_last_page_len,
+        qo_indptr_bottom = torch.arange(0, batch_size + 1).to(0) * unique_kv_len
+        multi_level_wrapper.begin_forward(
+            [qo_indptr_top, qo_indptr_bottom],
+            [shared_kv_indptr, unique_kv_indptr],
+            [shared_kv_indices, unique_kv_indices],
+            [shared_last_page_len, unique_last_page_len],
             num_heads,
             num_heads,
             head_dim,
             page_size,
         )
-        o_baseline = baseline_wrapper.forward(q, kv_data, causal=causal)
-
-    cascade_kv_indices = unique_kv_indices
-    cascade_kv_indptr = unique_kv_indptr
-    cascade_kv_last_page_len = unique_last_page_len
+        o_multi_level = multi_level_wrapper.forward(q, kv_data, causal=causal)
 
     if stage == "decode":
-        cascade_wrapper.begin_forward(
-            cascade_kv_indptr,
-            cascade_kv_indices,
-            cascade_kv_last_page_len,
+        shared_prefix_decode_wrapper.begin_forward(
+            unique_kv_indptr,
+            unique_kv_indices,
+            unique_last_page_len,
             num_heads,
             num_heads,
             head_dim,
             page_size,
         )
-        o_cascade = cascade_wrapper.forward(q, k_shared, v_shared, kv_data)
+        o_two_level = shared_prefix_decode_wrapper.forward(
+            q, k_shared, v_shared, kv_data
+        )
     else:
-        cascade_wrapper.begin_forward(
+        shared_prefix_prefill_wrapper.begin_forward(
             q_indptr,
-            cascade_kv_indptr,
-            cascade_kv_indices,
-            cascade_kv_last_page_len,
+            unique_kv_indptr,
+            unique_kv_indices,
+            unique_last_page_len,
             num_heads,
             num_heads,
             head_dim,
             page_size,
         )
-        o_cascade = cascade_wrapper.forward(
+        o_two_level = shared_prefix_prefill_wrapper.forward(
             q, k_shared, v_shared, kv_data, causal=causal
         )
 
     numpy.testing.assert_allclose(
-        o_baseline.cpu().numpy(), o_cascade.cpu().numpy(), rtol=1e-3, atol=1e-3
+        o_multi_level.cpu().numpy(), o_two_level.cpu().numpy(), rtol=1e-3, atol=1e-3
     )
 
 

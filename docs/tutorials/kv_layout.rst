@@ -41,6 +41,24 @@ shape ``(indptr[-1], num_heads, head_dim)`` when the layout is ``NHD``.
 
 We can use ``data[indptr[i]:indptr[i+1]]`` to slice the keys (or values) of request ``i``.
 
+.. _cascade-qo-indptr-layout:
+
+Multi-level Cascade Inference Query/Output Layout
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When using multi-level `cascade inference <https://flashinfer.ai/2024/02/02/cascade-inference.html>`_,
+the query and output of each level are stored in ragged tensors, each level's ``qo_indptr`` array stores
+the interval information of each node in the cascade tree at that level, the figure below shows the
+``qo_indptr`` for each level in cascade inference:
+
+.. image:: https://raw.githubusercontent.com/flashinfer-ai/web-data/main/tutorials/cascade_qo_indptr.png
+  :width: 800
+  :align: center
+  :alt: The ``qo_indptr`` for each level in cascade inference.
+
+Note that each level's ``qo_indptr`` array should start from 0, and the last element of the ``qo_indptr`` array
+should be equal to the sum of length for all query/output tensors.
+
 FlashInfer APIs
 ~~~~~~~~~~~~~~~
 
