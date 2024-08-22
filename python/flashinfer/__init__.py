@@ -28,6 +28,7 @@ from .decode import (
     single_decode_with_kv_cache,
 )
 from .activation import gelu_tanh_and_mul, silu_and_mul
+from .bmm_fp8 import bmm_fp8
 from .group_gemm import SegmentGEMMWrapper
 from .norm import fused_add_rmsnorm, rmsnorm
 from .page import append_paged_kv_cache

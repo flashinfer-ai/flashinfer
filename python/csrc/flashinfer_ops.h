@@ -104,6 +104,8 @@ torch::Tensor packbits(torch::Tensor x, const std::string& bitorder);
 torch::Tensor segment_packbits(torch::Tensor x, torch::Tensor input_indptr,
                                torch::Tensor output_indptr, const std::string& bitorder);
 
+void bmm_fp8(const torch::Tensor& input, const torch::Tensor& weight, torch::Tensor& result);
+
 class CutlassSegmentGEMMPyTorchWrapper {
  public:
   void RegisterWorkspaceBuffer(torch::Tensor workspace_buffer);
