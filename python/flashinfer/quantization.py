@@ -48,6 +48,16 @@ def packbits(x: torch.Tensor, bitorder: str = "big") -> torch.Tensor:
     y: torch.Tensor
         An uint8 packed array, shape ``((x.size(0) + 7) / 8),)``.
 
+    Examples
+    --------
+
+    >>> import torch
+    >>> from flashinfer import packbits
+    >>> x = torch.tensor([1, 0, 1, 1, 0, 0, 1, 1], dtype=torch.bool, device="cuda")
+    >>> x_packed = packbits(x)
+    >>> list(map(bin, x_packed.tolist()))
+    ['0b10110011']
+
     See Also
     --------
     segment_packbits
@@ -80,6 +90,18 @@ def segment_packbits(
     new_indptr: torch.Tensor
         The new index pointer of each packed segment in :attr:`y`, shape ``(batch_size + 1,)``.
         It's guaranteed that ``new_indptr[i+1] - new_indptr[i] == (indptr[i+1] - indptr[i] + 7) // 8``.
+
+    Examples
+    --------
+
+    >>> import torch
+    >>> from flashinfer import segment_packbits
+    >>> x = torch.tensor([1, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1], dtype=torch.bool, device="cuda")
+    >>> x_packed, new_indptr = segment_packbits(x, torch.tensor([0, 4, 7, 11], device="cuda"), bitorder="big")
+    >>> list(map(bin, x_packed.tolist()))
+    ['0b10110000', '0b100000', '0b11010000']
+    >>> new_indptr
+    tensor([0, 1, 2, 3], device='cuda:0')
 
     See Also
     --------

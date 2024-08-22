@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import torch
-from typing import Tuple, Union
+from typing import Tuple, Union, Optional
 
 # mypy: disable-error-code="attr-defined"
 try:
@@ -83,8 +83,8 @@ def sampling_from_probs(
     >>> samples
     tensor([1, 2, 1, 4], device='cuda:0', dtype=torch.int32)
 
-    Notes
-    -----
+    Note
+    ----
     This function expects float32 inputs, and the output is int32.
     """
     if check_nan:
@@ -155,11 +155,17 @@ def top_p_sampling_from_probs(
     >>> success
     tensor([True, True, True, True], device='cuda:0')
 
-    Notes
-    -----
+    Note
+    ----
     This function expects float32 inputs, and the output is int32.
     We encourage users to set ``max_top_p_rounds`` to a reasonable value, e.g., 32. The actual
     implementation usually use much fewer rounds for rejection sampling because of early stopping.
+
+    See Also
+    --------
+    top_k_top_p_sampling_from_probs
+    top_k_sampling_from_probs
+    top_p_renorm_prob
     """
     if check_nan:
         if torch.any(torch.isnan(probs)):
@@ -231,11 +237,17 @@ def top_k_sampling_from_probs(
     >>> success
     tensor([True, True, True, True], device='cuda:0')
 
-    Notes
-    -----
+    Note
+    ----
     This function expects float32 inputs, and the output is int32.
     We encourage users to set ``max_top_k_rounds`` to a reasonable value, e.g., 32. The actual
     implementation usually use much fewer rounds for rejection sampling because of early stopping.
+
+    See Also
+    --------
+    top_k_top_p_sampling_from_probs
+    top_p_sampling_from_probs
+    top_k_renorm_prob
     """
     if check_nan:
         if torch.any(torch.isnan(probs)):
@@ -309,8 +321,8 @@ def min_p_sampling_from_probs(
     >>> success
     tensor([True, True, True, True], device='cuda:0')
 
-    Notes
-    -----
+    Note
+    ----
     This function expects float32 inputs, and the output is int32.
     We encourage users to set ``max_rounds`` to a reasonable value, e.g., 32. The actual
     implementation usually use much fewer rounds for rejection sampling because of early stopping.
@@ -406,11 +418,17 @@ def top_k_top_p_sampling_from_logits(
     >>> success
     tensor([True, True, True, True], device='cuda:0')
 
-    Notes
-    -----
+    Note
+    ----
     This function expects float32 inputs, and the output is int32.
     We encourage users to set ``max_rounds`` to a reasonable value, e.g., 32. The actual
     implementation usually use much fewer rounds for rejection sampling because of early stopping.
+
+    See Also
+    --------
+    top_k_top_p_sampling_from_probs
+    top_k_mask_logits
+    top_p_sampling_from_probs
     """
     if filter_apply_order == "top_k_first":
         masked_logits = top_k_mask_logits(probs, top_k)
@@ -508,11 +526,19 @@ def top_k_top_p_sampling_from_probs(
     >>> success
     tensor([True, True, True, True], device='cuda:0')
 
-    Notes
-    -----
+    Note
+    ----
     This function expects float32 inputs, and the output is int32.
     We encourage users to set ``max_rounds`` to a reasonable value, e.g., 32. The actual
     implementation usually use much fewer rounds for rejection sampling because of early stopping.
+
+    See Also
+    --------
+    top_k_sampling_from_probs
+    top_p_sampling_from_probs
+    top_k_renorm_prob
+    top_p_renorm_prob
+    top_k_mask_logits
     """
     if filter_apply_order == "top_k_first":
         renorm_probs = top_k_renorm_prob(probs, top_k)
@@ -557,8 +583,39 @@ def top_p_renorm_prob(
     renorm_probs: torch.Tensor
         Renormalized probabilities, shape ``(batch_size, num_classes)``.
 
+    Examples
+    --------
+
+    >>> import torch
+    >>> import flashinfer
+    >>> torch.manual_seed(42)
+    >>> batch_size = 4
+    >>> vocab_size = 5
+    >>> top_p = 0.3
+    >>> pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
+    >>> prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    >>> prob
+    tensor([[0.2499, 0.2592, 0.1085, 0.2718, 0.1106],
+            [0.2205, 0.0942, 0.2912, 0.3452, 0.0489],
+            [0.2522, 0.1602, 0.2346, 0.1532, 0.2000],
+            [0.1543, 0.3182, 0.2062, 0.0958, 0.2255]], device='cuda:0')
+    >>> renormed_prob = flashinfer.sampling.top_p_renorm_prob(prob, top_p)
+    >>> renormed_prob
+    tensor([[0.0000, 0.4882, 0.0000, 0.5118, 0.0000],
+            [0.0000, 0.0000, 0.0000, 1.0000, 0.0000],
+            [0.5181, 0.0000, 0.4819, 0.0000, 0.0000],
+            [0.0000, 1.0000, 0.0000, 0.0000, 0.0000]], device='cuda:0')
+
+    Note
+    ----
     This combination of ``top_p_renorm_prob`` and ``sampling_from_probs`` should be equivalent to
     ``top_p_sampling_from_probs``.
+
+    See Also
+    --------
+    top_p_sampling_from_probs
+    sampling_from_probs
+    top_k_renorm_prob
     """
     return _kernels.top_p_renorm_prob(probs, *_to_tensor_scalar_tuple(top_p))
 
@@ -585,10 +642,39 @@ def top_k_renorm_prob(
     renorm_probs: torch.Tensor
         Renormalized probabilities, shape ``(batch_size, num_classes)``.
 
+    Examples
+    --------
+
+    >>> import torch
+    >>> import flashinfer
+    >>> torch.manual_seed(42)
+    >>> batch_size = 4
+    >>> vocab_size = 5
+    >>> top_k = 3
+    >>> pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
+    >>> prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    >>> prob
+    tensor([[0.2499, 0.2592, 0.1085, 0.2718, 0.1106],
+            [0.2205, 0.0942, 0.2912, 0.3452, 0.0489],
+            [0.2522, 0.1602, 0.2346, 0.1532, 0.2000],
+            [0.1543, 0.3182, 0.2062, 0.0958, 0.2255]], device='cuda:0')
+    >>> renormed_prob = flashinfer.sampling.top_k_renorm_prob(prob, top_k)
+    >>> renormed_prob
+    tensor([[0.3201, 0.3319, 0.0000, 0.3480, 0.0000],
+            [0.2573, 0.0000, 0.3398, 0.4028, 0.0000],
+            [0.3672, 0.0000, 0.3416, 0.0000, 0.2912],
+            [0.0000, 0.4243, 0.2750, 0.0000, 0.3007]], device='cuda:0')
+
     Note
     ----
     This combination of ``top_k_renorm_prob`` and ``sampling_from_probs`` should be equivalent to
     ``top_k_sampling_from_probs``.
+
+    See Also
+    --------
+    top_k_sampling_from_probs
+    sampling_from_probs
+    top_p_renorm_prob
     """
     return _kernels.top_k_renorm_prob(probs, *_to_tensor_scalar_tuple(top_k))
 
@@ -614,9 +700,35 @@ def top_k_mask_logits(
     masked_logits: torch.Tensor
         Masked logits, shape ``(batch_size, num_classes)``.
 
+    Examples
+    --------
+
+    >>> import torch
+    >>> import flashinfer
+    >>> torch.manual_seed(42)
+    >>> batch_size = 4
+    >>> vocab_size = 5
+    >>> top_k = 3
+    >>> logits = torch.randn(batch_size, vocab_size).to(0)
+    >>> logits
+    tensor([[ 1.9269,  1.4873,  0.9007, -2.1055, -0.7581],
+            [ 1.0783,  0.8008,  1.6806,  0.3559, -0.6866],
+            [-0.4934,  0.2415, -0.2316,  0.0418, -0.2516],
+            [ 0.8599, -0.3097, -0.3957,  0.8034, -0.6216]], device='cuda:0')
+    >>> masked_logits = flashinfer.sampling.top_k_mask_logits(logits, top_k)
+    >>> masked_logits
+    tensor([[ 1.9269,  1.4873,  0.9007,    -inf,    -inf],
+            [ 1.0783,  0.8008,  1.6806,    -inf,    -inf],
+            [   -inf,  0.2415, -0.2316,  0.0418,    -inf],
+            [ 0.8599, -0.3097,    -inf,  0.8034,    -inf]], device='cuda:0')
+
     Note
     ----
     The combination of ``top_k_mask_logits`` and ``softmax`` should be equivalent to ``top_k_renorm_prob``.
+
+    See Also
+    --------
+    top_k_renorm_prob
     """
     return _kernels.top_k_mask_logits(logits, *_to_tensor_scalar_tuple(top_k))
 
@@ -626,8 +738,8 @@ def chain_speculative_sampling(
     draft_token_ids,
     uniform_samples,
     target_probs,
-    maybe_output_accepted_token_num: torch.Tensor = None,
-    maybe_output_emitted_token_num: torch.Tensor = None,
+    maybe_output_accepted_token_num: Optional[torch.Tensor] = None,
+    maybe_output_emitted_token_num: Optional[torch.Tensor] = None,
     deterministic: bool = True,
 ) -> torch.Tensor:
     r"""Fused-GPU kernel for speculative sampling for sequence generation (proposed in
@@ -650,15 +762,17 @@ def chain_speculative_sampling(
         Compared to input :attr:`draft_probs`, the target model's probability has an additional
         slot at the end because the target model will generate one more token than the draft model.
         Shape: ``(batch_size, num_speculate_tokens + 1, vocab_size)``
-    maybe_output_accepted_token_num: torch.Tensor
+    maybe_output_accepted_token_num: Optional[torch.Tensor]
         The number of tokens that can be accepted if each token is considered independently for each request.
         This metric does not consider the fact that rejection sampling will stop at the first token that does not
         satisfy the probablity requirement r < p/q.
         It only evaluates the alignment of draft model and target model.
         Shape: ``(batch_size)``
-    maybe_output_emitted_token_num: torch.Tensor
+        If specified, the number of accepted token number will be added to this tensor inplace. Default is ``None``.
+    maybe_output_emitted_token_num: Optional[torch.Tensor]
         The number of tokens that are finally emitted/generated for each request.
         Shape: ``(batch_size)``
+        If specified, the number of emitted token number will be added to this tensor inplace. Default is ``None``.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
 
@@ -671,6 +785,44 @@ def chain_speculative_sampling(
         token index at the end for the final token, if all previous tokens are accepted,
         another "bonus" token will be sampled from the target model's probability.
         Shape: (batch_size, num_specutate_tokens + 1)
+    output_accepted_token_num: torch.Tensor
+        The number of tokens that can be accepted if each token is considered independently for each request.
+        This metric does not consider the fact that rejection sampling will stop at the first token that does not
+        satisfy the probablity requirement r < p/q.
+        It only evaluates the alignment of draft model and target model.
+        Shape: ``(batch_size)``
+    output_emitted_token_num: torch.Tensor
+        The number of tokens that are finally emitted/generated for each request.
+        Shape: ``(batch_size)``
+    
+    Examples
+    --------
+
+    >>> import torch
+    >>> import flashinfer
+    >>> torch.manual_seed(42)
+    >>> batch_size = 1
+    >>> num_speculate_tokens = 2
+    >>> vocab_size = 4
+    >>> draft_probs = torch.tensor([[[0.1, 0.2, 0.3, 0.4], [0.2, 0.3, 0.4, 0.1]]]).to(0)
+    >>> # token 2 was sampled from draft model for the first token, and
+    >>> # token 1 was sampled from draft model for the second token
+    >>> draft_token_ids = torch.tensor([[2, 1]], dtype=torch.int32).to(0)
+    >>> # uniform samples for rejection sampling
+    >>> uniform_samples = torch.rand(batch_size, num_speculate_tokens + 1).to(0)
+    tensor([[0.8823, 0.9150, 0.3829], device='cuda:0')
+    >>> target_probs = torch.tensor([[[0.0, 0.1, 0.6, 0.3], [1.0, 0.0, 0.0, 0.0], [0.7, 0.1, 0.1, 0.1]]]).to(0)
+    >>> output_token_ids, output_accepted_token_num, output_accepted_token_num =\
+    ...     flashinfer.sampling.chain_speculative_sampling(
+    ...         draft_probs, draft_token_ids, uniform_samples, target_probs)
+    >>> # the first token is accepted, the second token is rejected and sampled from the difference
+    >>> # between the target model and the draft model, the third token is padded with -1
+    >>> output_token_ids
+    tensor([[ 2,  0, -1]], device='cuda:0', dtype=torch.int32)
+    >>> output_accepted_token_num
+    tensor([1], device='cuda:0')
+    >>> output_emitted_token_num
+    tensor([1], device='cuda:0')
     """
     return _kernels.chain_speculative_sampling(
         draft_probs,

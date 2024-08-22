@@ -117,8 +117,8 @@ def append_paged_kv_cache(
     ...     kv_last_page_len
     ... )
 
-    Notes
-    -----
+    Note
+    ----
     Please refer to the :ref:`tutorial <recursive-attention>` for a detailed
     explanation of the log-sum-exp function and attention states.
 

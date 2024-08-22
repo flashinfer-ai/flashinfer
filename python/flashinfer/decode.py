@@ -142,8 +142,8 @@ def single_decode_with_kv_cache(
     >>> o.shape
     torch.Size([32, 128])
 
-    Notes
-    -----
+    Note
+    ----
     The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads`` is
     not equal to ``num_kv_heads``, the function will use
     `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
@@ -748,8 +748,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         S : torch.Tensor
             The logsumexp of attention scores, Shape: ``[batch_size, num_qo_heads]``.
 
-        Notes
-        -----
+        Note
+        ----
         Please refer to the :ref:`tutorial <recursive-attention>` for a detailed
         explanation of the log-sum-exp function and attention states.
         """
