@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 from .cascade import (
+    MultiLevelCascadeAttentionWrapper,
     BatchDecodeWithSharedPrefixPagedKVCacheWrapper,
     BatchPrefillWithSharedPrefixPagedKVCacheWrapper,
     merge_state,
