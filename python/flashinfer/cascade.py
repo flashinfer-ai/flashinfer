@@ -182,7 +182,7 @@ class MultiLevelCascadeAttentionWrapper:
     levels KV-Cache are stored in a unified paged table.
 
     Check :ref:`our tutorial<page-layout>` for page table layout, and
-    `Cascade Inference Query/Output Layout <cascade-qo-indptr-layout>` for query/output layout.
+    :ref:`Cascade Inference Query/Output Layout <cascade-qo-indptr-layout>` for query/output layout.
 
     The idea of cascade inference is introduced in our `blog post <https://flashinfer.ai/2024/02/02/cascade-inference.html>`_.
 
@@ -311,7 +311,7 @@ class MultiLevelCascadeAttentionWrapper:
         qo_indptr_arr : list[torch.Tensor]
             An array of qo indptr tensors for each level, the array length should be equal to
             the number of levels. Check
-            `Cascade Inference Query/Output Layout <cascade-qo-indptr-layout>` for query/output layout.
+            :ref:`Cascade Inference Query/Output Layout <cascade-qo-indptr-layout>` for query/output layout.
             The last element of each tensor should be the total number of queries/outputs.
         paged_kv_indptr_arr : list[torch.Tensor]
             An array of paged kv-cache indptr tensors for each level, the array length should be

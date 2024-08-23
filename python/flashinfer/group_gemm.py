@@ -39,7 +39,6 @@ class SegmentGEMMWrapper:
     -------
     >>> import torch
     >>> from flashinfer import SegmentGEMMWrapper
-
     >>> # create a 1MB workspace buffer
     >>> workspace_buffer = torch.empty(1 * 1024 * 1024, dtype=torch.int8, device="cuda")
     >>> segment_gemm = SegmentGEMMWrapper(workspace_buffer)
@@ -83,7 +82,6 @@ class SegmentGEMMWrapper:
     >>> torch.allclose(y[6:], y_ref_3)
     True
     """
-
     def __init__(self, workspace_buffer: torch.Tensor) -> None:
         r"""Initialize the wrapper.
 
