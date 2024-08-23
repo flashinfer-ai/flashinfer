@@ -370,7 +370,7 @@ def top_k_top_p_sampling_from_logits(
     filter_apply_order: str
         The order of applying top-k and top-p sampling, should be either ``"top_k_first"`` or ``"joint"``.
         If ``"top_k_first"``, we first apply top-k filter, then apply top-p sampling on the top-k results.
-        If ``"joint"``, we apply top-k and top-p filter simultaneously in each round.
+        If ``"joint"``, we apply top-k and top-p filter simultaneously in each round. Default is ``"top_k_first"``.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
     check_nan: bool
@@ -487,7 +487,7 @@ def top_k_top_p_sampling_from_probs(
     filter_apply_order: str
         The order of applying top-k and top-p sampling, should be either ``"top_k_first"`` or ``"joint"``.
         If ``"top_k_first"``, we first apply top-k filter, then apply top-p sampling on the top-k results.
-        If ``"joint"``, we apply top-k and top-p filter simultaneously in each round.
+        If ``"joint"``, we apply top-k and top-p filter simultaneously in each round. Default is ``"top_k_first"``.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
     check_nan: bool

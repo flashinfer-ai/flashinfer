@@ -74,6 +74,36 @@ def apply_rope_inplace(
         The scaling factor used in the rope embedding, default: ``1``.
     rope_theta : float
         The theta value used in the rope embedding, default: ``1e4``.
+    
+    Examples
+    --------
+    >>> import torch
+    >>> import flashinfer
+    >>> batch_size = 128
+    >>> qkv_len = 1024
+    >>> num_qo_heads = 32
+    >>> num_kv_heads = 32
+    >>> head_dim = 128
+    >>> nnz = batch_size * qkv_len
+    >>> qkv_packed = torch.randn(
+    >>>    nnz,
+    >>>    (num_qo_heads + 2 * num_kv_heads) * head_dim,
+    >>>    dtype=torch.float16,
+    >>>    device="cuda:0",
+    >>> )
+    >>> q = qkv_packed[:, : num_qo_heads * head_dim].reshape(nnz, num_qo_heads, head_dim)
+    >>> k = qkv_packed[
+    ...    :, num_qo_heads * head_dim : (num_qo_heads + num_kv_heads) * head_dim
+    ... ].reshape(nnz, num_kv_heads, head_dim)
+    >>> indptr = torch.tensor(
+    ...    [i * qkv_len for i in range(batch_size + 1)], dtype=torch.int32, device="cuda:0"
+    >>> )
+    >>> offsets = torch.full((batch_size,), 10, dtype=torch.int32, device="cuda:0")
+    >>> flashinfer.apply_rope_inplace(q, k, indptr, offsets)
+
+    See Also
+    --------
+    apply_rope
     """
     return _kernels.apply_rope_inplace(
         q, k, indptr, offsets, interleave, rope_scale, rope_theta
@@ -134,6 +164,36 @@ def apply_llama31_rope_inplace(
         The high frequency factor used in Llama 3.1 RoPE, default: ``4``.
     old_context_len : int
         The old context length used in Llama 3.1 RoPE, default: ``8192``.
+    
+    Examples
+    --------
+    >>> import torch
+    >>> import flashinfer
+    >>> batch_size = 128
+    >>> qkv_len = 1024
+    >>> num_qo_heads = 32
+    >>> num_kv_heads = 32
+    >>> head_dim = 128
+    >>> nnz = batch_size * qkv_len
+    >>> qkv_packed = torch.randn(
+    >>>    nnz,
+    >>>    (num_qo_heads + 2 * num_kv_heads) * head_dim,
+    >>>    dtype=torch.float16,
+    >>>    device="cuda:0",
+    >>> )
+    >>> q = qkv_packed[:, : num_qo_heads * head_dim].reshape(nnz, num_qo_heads, head_dim)
+    >>> k = qkv_packed[
+    ...    :, num_qo_heads * head_dim : (num_qo_heads + num_kv_heads) * head_dim
+    ... ].reshape(nnz, num_kv_heads, head_dim)
+    >>> indptr = torch.tensor(
+    ...    [i * qkv_len for i in range(batch_size + 1)], dtype=torch.int32, device="cuda:0"
+    >>> )
+    >>> offsets = torch.full((batch_size,), 10, dtype=torch.int32, device="cuda:0")
+    >>> flashinfer.apply_llama31_rope_inplace(q, k, indptr, offsets)
+
+    See Also
+    --------
+    apply_llama31_rope
     """
     return _kernels.apply_llama31_rope_inplace(
         q,
@@ -200,6 +260,40 @@ def apply_rope(
         The rotated query tensor, shape: ``(nnz, num_q_heads, head_dim)``.
     k_rope : torch.Tensor
         The rotated key tensor, shape: ``(nnz, num_k_heads, head_dim)``.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import flashinfer
+    >>> batch_size = 128
+    >>> qkv_len = 1024
+    >>> num_qo_heads = 32
+    >>> num_kv_heads = 32
+    >>> head_dim = 128
+    >>> nnz = batch_size * qkv_len
+    >>> qkv_packed = torch.randn(
+    >>>    nnz,
+    >>>    (num_qo_heads + 2 * num_kv_heads) * head_dim,
+    >>>    dtype=torch.float16,
+    >>>    device="cuda:0",
+    >>> )
+    >>> q = qkv_packed[:, : num_qo_heads * head_dim].reshape(nnz, num_qo_heads, head_dim)
+    >>> k = qkv_packed[
+    ...    :, num_qo_heads * head_dim : (num_qo_heads + num_kv_heads) * head_dim
+    ... ].reshape(nnz, num_kv_heads, head_dim)
+    >>> indptr = torch.tensor(
+    ...    [i * qkv_len for i in range(batch_size + 1)], dtype=torch.int32, device="cuda:0"
+    >>> )
+    >>> offsets = torch.full((batch_size,), 10, dtype=torch.int32, device="cuda:0")
+    >>> q_rope, k_rope = flashinfer.apply_rope(q, k, indptr, offsets)
+    >>> q_rope.shape
+    torch.Size([131072, 32, 128])
+    >>> k_rope.shape
+    torch.Size([131072, 32, 128])
+
+    See Also
+    --------
+    apply_rope_inplace
     """
     return _kernels.apply_rope(
         q, k, indptr, offsets, interleave, rope_scale, rope_theta
@@ -267,6 +361,40 @@ def apply_llama31_rope(
         The rotated query tensor, shape: ``(nnz, num_q_heads, head_dim)``.
     k_rope : torch.Tensor
         The rotated key tensor, shape: ``(nnz, num_k_heads, head_dim)``.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import flashinfer
+    >>> batch_size = 128
+    >>> qkv_len = 1024
+    >>> num_qo_heads = 32
+    >>> num_kv_heads = 32
+    >>> head_dim = 128
+    >>> nnz = batch_size * qkv_len
+    >>> qkv_packed = torch.randn(
+    >>>    nnz,
+    >>>    (num_qo_heads + 2 * num_kv_heads) * head_dim,
+    >>>    dtype=torch.float16,
+    >>>    device="cuda:0",
+    >>> )
+    >>> q = qkv_packed[:, : num_qo_heads * head_dim].reshape(nnz, num_qo_heads, head_dim)
+    >>> k = qkv_packed[
+    ...    :, num_qo_heads * head_dim : (num_qo_heads + num_kv_heads) * head_dim
+    ... ].reshape(nnz, num_kv_heads, head_dim)
+    >>> indptr = torch.tensor(
+    ...    [i * qkv_len for i in range(batch_size + 1)], dtype=torch.int32, device="cuda:0"
+    >>> )
+    >>> offsets = torch.full((batch_size,), 10, dtype=torch.int32, device="cuda:0")
+    >>> q_rope, k_rope = flashinfer.apply_llama31_rope(q, k, indptr, offsets)
+    >>> q_rope.shape
+    torch.Size([131072, 32, 128])
+    >>> k_rope.shape
+    torch.Size([131072, 32, 128])
+
+    See Also
+    --------
+    apply_llama31_rope_inplace
     """
     return _kernels.apply_llama31_rope(
         q,
