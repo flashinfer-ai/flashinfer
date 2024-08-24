@@ -41,24 +41,6 @@ shape ``(indptr[-1], num_heads, head_dim)`` when the layout is ``NHD``.
 
 We can use ``data[indptr[i]:indptr[i+1]]`` to slice the keys (or values) of request ``i``.
 
-.. _cascade-qo-indptr-layout:
-
-Multi-level Cascade Inference Query/Output Layout
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-When using multi-level `cascade inference <https://flashinfer.ai/2024/02/02/cascade-inference.html>`_,
-the query and output of each level are stored in ragged tensors, each level's ``qo_indptr`` array stores
-the interval information of each node in the cascade tree at that level, the figure below shows the
-``qo_indptr`` for each level in cascade inference:
-
-.. image:: https://raw.githubusercontent.com/flashinfer-ai/web-data/main/tutorials/cascade_qo_indptr.png
-  :width: 800
-  :align: center
-  :alt: The ``qo_indptr`` for each level in cascade inference.
-
-Note that each level's ``qo_indptr`` array should start from 0, and the last element of the ``qo_indptr`` array
-should be equal to the sum of length for all query/output tensors.
-
 FlashInfer APIs
 ~~~~~~~~~~~~~~~
 
@@ -110,8 +92,8 @@ to pack boolean mask into bit-packed array.
 
 .. _page-layout:
 
-Page Table
-----------
+Page Table Layout
+-----------------
 
 When KV-Cache is dynamic (e.g. in append or decode stage), packing all keys/values is not
 efficient because the sequence length per request changes over time. `vLLM <https://arxiv.org/pdf/2309.06180.pdf>`_ 
@@ -163,6 +145,34 @@ FlashInfer APIs
 
 :class:`flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper` and :class:`flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper` implements the decode attention
 and prefill/append attention between queries stored in ragged tensors and keys/values stored in paged KV-Cache.
+
+.. _cascade-inference-data-layout:
+
+Multi-level Cascade Inference Data Layout
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When using multi-level `cascade inference <https://flashinfer.ai/2024/02/02/cascade-inference.html>`_,
+the query and output are stored in ragged tensors, and KV-Cache of all levels are stored
+in a unified Paged KV-Cache. Each level has a unique ``qo_indptr`` array which is the prefix sum of the
+accumulated number of tokens to append in the subtree, as well as ``kv_page_indptr``, ``kv_page_indices``, and
+``kv_last_page_len`` which has same semantics as in :ref:`<page-layout>` section. The following figure
+introduce how to construct these data structures for append attention operation for 8 requests where we
+treat their KV-Cache as 3 levels for prefix reuse:
+
+.. image:: https://raw.githubusercontent.com/flashinfer-ai/web-data/main/tutorials/cascade_inference_data_layout.png
+  :width: 800
+  :align: center
+  :alt: Cascade inference data layout.
+
+Note that we don't have to change the data layout of ragged query/output tensor or paged kv-cache for each level.
+All levels share the same underlying data layout, but we use different ``qo_indptr`` / ``kv_page_indptr`` arrays
+so that we can view them in different ways.
+
+FlashInfer APIs
+~~~~~~~~~~~~~~~
+
+FlashInfer provides :class:`flashinfer.cascade.MultiLevelCascadeAttentionWrapper` to compute
+the cascade attention.
 
 FAQ
 ^^^
