@@ -271,7 +271,7 @@ void _FlashInferAttentionPrefillWithPagedKVCache(int64_t handler_id, DLTensor* q
           })})});
 }
 
-void _FlashInferAttentionPrefillWithPagedKVCacheBeginForward(
+void _FlashInferAttentionPrefillWithPagedKVCachePlan(
     int64_t handler_idx, DLTensor* float_workspace_buffer, DLTensor* int_workspace_buffer,
     DLTensor* qo_indptr, DLTensor* kv_indptr, int64_t batch_size, int64_t num_qo_heads,
     int64_t num_kv_heads, int64_t head_dim, int64_t page_size, TVMStreamHandle copy_stream) {
@@ -290,23 +290,17 @@ void _FlashInferAttentionPrefillWithPagedKVCacheBeginForward(
   batch_prefill_paged_kv_handlers[handler_idx].SetCUDAStream(
       static_cast<cudaStream_t>(copy_stream));
   DISPATCH_TVM_CUDA_IDTYPE(qo_indptr->dtype, dtype_idx, {
-    cudaError_t status =
-        batch_prefill_paged_kv_handlers[handler_idx].BeginForward<dtype_in, dtype_idx>(
-            static_cast<void*>(float_workspace_buffer->data), float_workspace_size_in_bytes,
-            static_cast<void*>(int_workspace_buffer->data), int_workspace_size_in_bytes,
-            static_cast<dtype_idx*>(qo_indptr->data) + qo_indptr->byte_offset / sizeof(dtype_idx),
-            static_cast<dtype_idx*>(kv_indptr->data) + kv_indptr->byte_offset / sizeof(dtype_idx),
-            batch_size, num_qo_heads, num_kv_heads, head_dim, page_size);
+    cudaError_t status = batch_prefill_paged_kv_handlers[handler_idx].Plan<dtype_in, dtype_idx>(
+        static_cast<void*>(float_workspace_buffer->data), float_workspace_size_in_bytes,
+        static_cast<void*>(int_workspace_buffer->data), int_workspace_size_in_bytes,
+        static_cast<dtype_idx*>(qo_indptr->data) + qo_indptr->byte_offset / sizeof(dtype_idx),
+        static_cast<dtype_idx*>(kv_indptr->data) + kv_indptr->byte_offset / sizeof(dtype_idx),
+        batch_size, num_qo_heads, num_kv_heads, head_dim, page_size);
     if (status != cudaSuccess) {
-      LOG(FATAL) << "FlashInfer prefill BeginForward error " << cudaGetErrorString(status);
+      LOG(FATAL) << "FlashInfer prefill Plan error " << cudaGetErrorString(status);
     }
   });
   batch_prefill_paged_kv_handlers[handler_idx].SetCUDAStream(original_stream);
-}
-
-void _FlashInferAttentionPrefillWithPagedKVCacheEndForward(int64_t handler_idx) {
-  CHECK(handler_idx < max_num_handlers) << "The handler id must be less than " << max_num_handlers;
-  batch_prefill_paged_kv_handlers[handler_idx].EndForward();
 }
 
 // Creates a pool of handlers with a fixed size to independently handle decoding forward passes.
@@ -420,7 +414,7 @@ void _FlashInferAttentionDecodeWithPagedKVCache(int64_t handler_id, DLTensor* q_
           })})});
 }
 
-void _FlashInferAttentionDecodeWithPagedKVCacheBeginForward(
+void _FlashInferAttentionDecodeWithPagedKVCachePlan(
     int64_t handler_idx, DLTensor* float_workspace_buffer, DLTensor* int_workspace_buffer,
     DLTensor* page_table_indptr, DLTensor* last_page_len, int64_t num_qo_heads,
     int64_t num_kv_heads, int64_t head_dim, int64_t page_size, int64_t pos_encoding_mode,
@@ -442,7 +436,7 @@ void _FlashInferAttentionDecodeWithPagedKVCacheBeginForward(
   batch_decode_handlers[handler_idx].SetCUDAStream(static_cast<cudaStream_t>(copy_stream));
   DISPATCH_TVM_CUDA_IDTYPE(page_table_indptr->dtype, dtype_idx, {
     cudaError_t status =
-        BatchDecodeHandlerBeginForward<page_storage, dtype_in, dtype_in, dtype_in, dtype_idx>(
+        BatchDecodeHandlerPlan<page_storage, dtype_in, dtype_in, dtype_in, dtype_idx>(
             batch_decode_handlers + handler_idx, static_cast<void*>(float_workspace_buffer->data),
             float_workspace_size_in_bytes, static_cast<void*>(int_workspace_buffer->data),
             int_workspace_size_in_bytes,
@@ -453,15 +447,10 @@ void _FlashInferAttentionDecodeWithPagedKVCacheBeginForward(
             batch_size, num_qo_heads, num_kv_heads, head_dim, page_size,
             PosEncodingMode(pos_encoding_mode));
     if (status != cudaSuccess) {
-      LOG(FATAL) << "FlashInfer decode BeginForward error " << cudaGetErrorString(status);
+      LOG(FATAL) << "FlashInfer decode Plan error " << cudaGetErrorString(status);
     }
   });
   batch_decode_handlers[handler_idx].SetCUDAStream(original_stream);
-}
-
-void _FlashInferAttentionDecodeWithPagedKVCacheEndForward(int64_t handler_id) {
-  CHECK_LT(handler_id, max_num_handlers) << "The handler id must be less than " << max_num_handlers;
-  batch_decode_handlers[handler_id].EndForward();
 }
 
 void _FlashInferAttentionPrefillWithRaggedKVCache(
@@ -561,10 +550,12 @@ void _FlashInferAttentionPrefillWithRaggedKVCache(
           })})})
 }
 
-void _FlashInferAttentionPrefillWithRaggedKVCacheBeginForward(
-    DLTensor* float_workspace_buffer, DLTensor* int_workspace_buffer, DLTensor* qo_indptr,
-    DLTensor* kv_indptr, int64_t batch_size, int64_t num_qo_heads, int64_t num_kv_heads,
-    int64_t head_dim, TVMStreamHandle copy_stream) {
+void _FlashInferAttentionPrefillWithRaggedKVCachePlan(DLTensor* float_workspace_buffer,
+                                                      DLTensor* int_workspace_buffer,
+                                                      DLTensor* qo_indptr, DLTensor* kv_indptr,
+                                                      int64_t batch_size, int64_t num_qo_heads,
+                                                      int64_t num_kv_heads, int64_t head_dim,
+                                                      TVMStreamHandle copy_stream) {
   CHECK_EQ(float_workspace_buffer->ndim, 1) << "The workspace buffer must be a 1-D tensor";
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer->shape[0] * float_workspace_buffer->dtype.bits / 8;
@@ -579,7 +570,7 @@ void _FlashInferAttentionPrefillWithRaggedKVCacheBeginForward(
   using dtype_in = half;
 
   DISPATCH_TVM_CUDA_IDTYPE(qo_indptr->dtype, dtype_idx, {
-    cudaError_t status = batch_prefill_ragged_kv_handler.BeginForward<dtype_in, dtype_idx>(
+    cudaError_t status = batch_prefill_ragged_kv_handler.Plan<dtype_in, dtype_idx>(
         static_cast<void*>(float_workspace_buffer->data), float_workspace_size_in_bytes,
         static_cast<void*>(int_workspace_buffer->data), int_workspace_size_in_bytes,
         static_cast<dtype_idx*>(qo_indptr->data) + qo_indptr->byte_offset / sizeof(dtype_idx),
@@ -587,15 +578,10 @@ void _FlashInferAttentionPrefillWithRaggedKVCacheBeginForward(
         batch_size, num_qo_heads, num_kv_heads, head_dim,
         /*page_size=*/1);
     if (status != cudaSuccess) {
-      LOG(FATAL) << "FlashInfer PrefillWithRaggedKVCache BeginForward error "
-                 << cudaGetErrorString(status);
+      LOG(FATAL) << "FlashInfer PrefillWithRaggedKVCache Plan error " << cudaGetErrorString(status);
     }
   });
   batch_prefill_ragged_kv_handler.SetCUDAStream(original_stream);
-}
-
-void _FlashInferAttentionPrefillWithRaggedKVCacheEndForward() {
-  batch_prefill_ragged_kv_handler.EndForward();
 }
 
 void _FlashInferMergeState(DLTensor* v_a, DLTensor* s_a, DLTensor* v_b, DLTensor* s_b,
@@ -806,28 +792,19 @@ TVM_REGISTER_GLOBAL("flashinfer.attention_kernel_prefill_with_paged_kv_cache")
     .set_body_typed(_FlashInferAttentionPrefillWithPagedKVCache);
 
 TVM_REGISTER_GLOBAL("flashinfer.attention_kernel_prefill_with_paged_kv_cache_begin_forward")
-    .set_body_typed(_FlashInferAttentionPrefillWithPagedKVCacheBeginForward);
-
-TVM_REGISTER_GLOBAL("flashinfer.attention_kernel_prefill_with_paged_kv_cache_end_forward")
-    .set_body_typed(_FlashInferAttentionPrefillWithPagedKVCacheEndForward);
+    .set_body_typed(_FlashInferAttentionPrefillWithPagedKVCachePlan);
 
 TVM_REGISTER_GLOBAL("flashinfer.attention_kernel_decode_with_paged_kv_cache")
     .set_body_typed(_FlashInferAttentionDecodeWithPagedKVCache);
 
 TVM_REGISTER_GLOBAL("flashinfer.attention_kernel_decode_with_paged_kv_cache_begin_forward")
-    .set_body_typed(_FlashInferAttentionDecodeWithPagedKVCacheBeginForward);
-
-TVM_REGISTER_GLOBAL("flashinfer.attention_kernel_decode_with_paged_kv_cache_end_forward")
-    .set_body_typed(_FlashInferAttentionDecodeWithPagedKVCacheEndForward);
+    .set_body_typed(_FlashInferAttentionDecodeWithPagedKVCachePlan);
 
 TVM_REGISTER_GLOBAL("flashinfer.attention_kernel_prefill_with_ragged_kv_cache")
     .set_body_typed(_FlashInferAttentionPrefillWithRaggedKVCache);
 
 TVM_REGISTER_GLOBAL("flashinfer.attention_kernel_prefill_with_ragged_kv_cache_begin_forward")
-    .set_body_typed(_FlashInferAttentionPrefillWithRaggedKVCacheBeginForward);
-
-TVM_REGISTER_GLOBAL("flashinfer.attention_kernel_prefill_with_ragged_kv_cache_end_forward")
-    .set_body_typed(_FlashInferAttentionPrefillWithRaggedKVCacheEndForward);
+    .set_body_typed(_FlashInferAttentionPrefillWithRaggedKVCachePlan);
 
 TVM_REGISTER_GLOBAL("flashinfer.merge_state").set_body_typed(_FlashInferMergeState);
 

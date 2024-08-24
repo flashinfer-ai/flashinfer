@@ -309,11 +309,11 @@ class BatchDecodeHandler {
   template <uint32_t HEAD_DIM, PageStorage page_storage, LogitsPostHook LOGITS_POST_HOOK,
             PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV, typename DTypeOut,
             typename IdType>
-  cudaError_t BeginForwardDispatched(void* float_buffer, size_t float_workspace_size_in_bytes,
-                                     void* int_buffer, size_t int_workspace_size_in_bytes,
-                                     IdType* indptr_h, IdType* last_page_len_h, uint32_t batch_size,
-                                     uint32_t num_qo_heads, uint32_t num_kv_heads,
-                                     uint32_t page_size) {
+  cudaError_t PlanDispatched(void* float_buffer, size_t float_workspace_size_in_bytes,
+                             void* int_buffer, size_t int_workspace_size_in_bytes, IdType* indptr_h,
+                             IdType* last_page_len_h, uint32_t batch_size, uint32_t num_qo_heads,
+                             uint32_t num_kv_heads, uint32_t page_size) {
+    Clear();
     batch_size_before_partition_ = batch_size;
     bool split_kv;
     uint32_t max_grid_size, max_num_pages_per_batch, new_batch_size;
@@ -438,12 +438,10 @@ class BatchDecodeHandler {
         }
       }
     });
-    forward_started_ = true;
     return cudaSuccess;
   }
 
-  cudaError_t EndForward() {
-    forward_started_ = false;
+  void Clear() {
     padded_batch_size_ = 0;
     batch_size_before_partition_ = 0;
     batch_size_after_partition_ = 0;
@@ -456,10 +454,7 @@ class BatchDecodeHandler {
     batch_idx_map_ = nullptr;
     chunk_start_pos_ = nullptr;
     seq_lengths_before_partition_ = nullptr;
-    return cudaSuccess;
   }
-
-  bool IsForwardStarted() const { return forward_started_; }
 
   void UpdatePageLockedBufferSize(size_t int_workspace_size_in_bytes) {
     cudaFreeHost(page_locked_buffer_);
@@ -490,16 +485,12 @@ class BatchDecodeHandler {
         batch_idx_map_(nullptr),
         chunk_start_pos_(nullptr),
         seq_lengths_before_partition_(nullptr),
-        forward_started_(false),
         cuda_graph_enabled_(enable_cuda_graph),
         fixed_batch_size_(batch_size),
         stream_(nullptr) {
     cudaMallocHost(&page_locked_buffer_, 8 * 1024 * 1024);
   }
-  ~BatchDecodeHandler() {
-    EndForward();
-    cudaFreeHost(page_locked_buffer_);
-  }
+  ~BatchDecodeHandler() { cudaFreeHost(page_locked_buffer_); }
 
   bool IsCUDAGraphEnabled() const { return cuda_graph_enabled_; }
 
@@ -516,7 +507,6 @@ class BatchDecodeHandler {
   void* batch_idx_map_;
   void* chunk_start_pos_;
   void* seq_lengths_before_partition_;
-  bool forward_started_;
   bool cuda_graph_enabled_;
   uint32_t padded_batch_size_;
   uint32_t fixed_batch_size_;
@@ -656,19 +646,17 @@ class BatchPrefillHandler {
 
   uint32_t GetTotalNumRows() const { return total_num_rows_; }
 
-  bool IsForwardStarted() const { return request_indices_ != nullptr; }
-
   void UpdatePageLockedBufferSize(size_t int_workspace_size_in_bytes) {
     cudaFreeHost(page_locked_buffer_);
     cudaMallocHost(&page_locked_buffer_, int_workspace_size_in_bytes);
   }
 
   template <typename DTypeOut, typename IdType>
-  cudaError_t BeginForward(void* float_buffer, size_t float_workspace_size_in_bytes,
-                           void* int_buffer, size_t int_workspace_size_in_bytes,
-                           IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t batch_size,
-                           uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
-                           uint32_t page_size) {
+  cudaError_t Plan(void* float_buffer, size_t float_workspace_size_in_bytes, void* int_buffer,
+                   size_t int_workspace_size_in_bytes, IdType* qo_indptr_h, IdType* kv_indptr_h,
+                   uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
+                   uint32_t head_dim, uint32_t page_size) {
+    Clear();
     if (num_qo_heads % num_kv_heads != 0) {
       std::ostringstream err_msg;
       err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -812,8 +800,7 @@ class BatchPrefillHandler {
     return cudaSuccess;
   }
 
-  cudaError_t EndForward() {
-    forward_started_ = false;
+  void Clear() {
     request_indices_ = nullptr;
     qo_tile_indices_ = nullptr;
     kv_tile_indices_ = nullptr;
@@ -826,7 +813,6 @@ class BatchPrefillHandler {
     total_num_rows_ = 0U;
     padded_batch_size_ = 0U;
     warp_layout_ = WarpLayout::k4x1x2;
-    return cudaSuccess;
   }
 
   cudaStream_t GetCUDAStream() const { return stream_; }
@@ -848,15 +834,11 @@ class BatchPrefillHandler {
         total_num_rows_(0U),
         padded_batch_size_(0U),
         warp_layout_(WarpLayout::k4x1x2),
-        forward_started_(false),
         enable_cuda_graph_(enable_cuda_graph),
         stream_(nullptr) {
     cudaMallocHost(&page_locked_buffer_, 8 * 1024 * 1024);
   }
-  ~BatchPrefillHandler() {
-    EndForward();
-    cudaFreeHost(page_locked_buffer_);
-  }
+  ~BatchPrefillHandler() { cudaFreeHost(page_locked_buffer_); }
 
  protected:
   void* page_locked_buffer_;
@@ -872,7 +854,6 @@ class BatchPrefillHandler {
   uint32_t total_num_rows_;
   uint32_t padded_batch_size_;
   WarpLayout warp_layout_;
-  bool forward_started_;
   bool enable_cuda_graph_;
   cudaStream_t stream_;
 };

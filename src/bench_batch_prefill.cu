@@ -73,7 +73,7 @@ void bench_flashinfer_batch_prefill_with_ragged_kv(nvbench::state& state) {
 
   BatchPrefillHandler handler;
 
-  handler.BeginForward<dtype_out>(
+  handler.Plan<dtype_out>(
       thrust::raw_pointer_cast(float_workspace.data()), float_workspace_size_in_bytes,
       thrust::raw_pointer_cast(int_workspace.data()), int_workspace_size_in_bytes,
       qo_indptr_h.data(), kv_indptr_h.data(), batch_size, num_qo_heads, num_kv_heads, head_dim,

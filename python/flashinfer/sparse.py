@@ -280,19 +280,6 @@ class BlockSparseAttentionWrapper:
             empty_q_data,
         )
 
-    def end_forward(self) -> None:
-        r"""Clear the auxiliary data structures created by :meth:`begin_forward`."""
-        self._qo_indptr = None
-        self._paged_kv_indptr_buf = None
-        self._paged_kv_indices_buf = None
-        self._paged_kv_last_page_len = None
-        self._packed_mask_buf = None
-        self._qk_indptr_buf = None
-        self.M = None
-        self.N = None
-        self.R = None
-        self.C = None
-
     def forward(
         self,
         q: torch.Tensor,

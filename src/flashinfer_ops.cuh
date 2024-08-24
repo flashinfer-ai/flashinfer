@@ -245,8 +245,6 @@ cudaError_t BatchDecodeWithPagedKVCacheNoSplitKV(
  * \param rope_scale The scale of rope.
  * \param rope_theta The theta of rope.
  * \param stream The CUDA stream.
- * \note This wrapper function should be only called after we call BeginForward function in the
- *   BatchDecodeHandler.
  */
 template <PageStorage PAGE_STORAGE, typename DTypeQ, typename DTypeKV, typename DTypeOut,
           typename IdType>
@@ -279,13 +277,12 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapper(
 
 template <PageStorage PAGE_STORAGE, typename DTypeQ, typename DTypeKV, typename DTypeOut,
           typename IdType>
-cudaError_t BatchDecodeHandlerBeginForward(BatchDecodeHandler* handler, void* float_buffer,
-                                           size_t float_workspace_size_in_bytes, void* int_buffer,
-                                           size_t int_workspace_size_in_bytes, IdType* indptr_h,
-                                           IdType* last_page_len_h, uint32_t batch_size,
-                                           uint32_t num_qo_heads, uint32_t num_kv_heads,
-                                           uint32_t head_dim, uint32_t page_size,
-                                           PosEncodingMode pos_encoding_mode) {
+cudaError_t BatchDecodeHandlerPlan(BatchDecodeHandler* handler, void* float_buffer,
+                                   size_t float_workspace_size_in_bytes, void* int_buffer,
+                                   size_t int_workspace_size_in_bytes, IdType* indptr_h,
+                                   IdType* last_page_len_h, uint32_t batch_size,
+                                   uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
+                                   uint32_t page_size, PosEncodingMode pos_encoding_mode) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -294,8 +291,8 @@ cudaError_t BatchDecodeHandlerBeginForward(BatchDecodeHandler* handler, void* fl
   }
   DISPATCH_head_dim(head_dim, HEAD_DIM, {
     DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
-      return handler->BeginForwardDispatched<HEAD_DIM, PAGE_STORAGE, LogitsPostHook::kNone,
-                                             POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeOut, IdType>(
+      return handler->PlanDispatched<HEAD_DIM, PAGE_STORAGE, LogitsPostHook::kNone,
+                                     POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeOut, IdType>(
           float_buffer, float_workspace_size_in_bytes, int_buffer, int_workspace_size_in_bytes,
           indptr_h, last_page_len_h, batch_size, num_qo_heads, num_kv_heads, page_size);
     });

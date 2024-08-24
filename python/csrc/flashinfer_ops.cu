@@ -51,5 +51,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<CutlassSegmentGEMMPyTorchWrapper>(m, "CutlassSegmentGEMMPyTorchWrapper")
       .def(py::init<torch::Tensor>())
       .def("register_workspace", &CutlassSegmentGEMMPyTorchWrapper::RegisterWorkspaceBuffer)
-      .def("forward", &CutlassSegmentGEMMPyTorchWrapper::Forward);
+      .def("run", &CutlassSegmentGEMMPyTorchWrapper::Run);
 }

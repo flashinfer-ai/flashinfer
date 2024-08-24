@@ -108,8 +108,8 @@ class CutlassSegmentGEMMPyTorchWrapper {
  public:
   void RegisterWorkspaceBuffer(torch::Tensor workspace_buffer);
 
-  torch::Tensor Forward(torch::Tensor seg_indptr, torch::Tensor weight_indices, torch::Tensor x,
-                        torch::Tensor weight, unsigned int batch_size, bool weight_column_major);
+  torch::Tensor Run(torch::Tensor seg_indptr, torch::Tensor weight_indices, torch::Tensor x,
+                    torch::Tensor weight, unsigned int batch_size, bool weight_column_major);
 
   CutlassSegmentGEMMPyTorchWrapper(torch::Tensor workspace_buffer)
       : handler_(std::make_shared<flashinfer::group_gemm::CutlassSegmentGEMMHandler>()) {

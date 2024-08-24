@@ -225,7 +225,7 @@ class MultiLevelCascadeAttentionWrapper:
     ...     torch.arange(batch_size + 1, dtype=torch.int32, device="cuda:0")    # bottom-level for unique KV-Cache
     ... ]
     >>> # create auxiliary data structures for batch decode attention
-    >>> wrapper.begin_forward(
+    >>> wrapper.plan(
     ...     qo_indptr_arr,
     ...     [shared_kv_page_indptr, unique_kv_page_indptr],
     ...     [shared_kv_page_indices, unique_kv_page_indices],
@@ -239,11 +239,9 @@ class MultiLevelCascadeAttentionWrapper:
     >>> for i in range(num_layers):
     ...     q = torch.randn(batch_size, num_qo_heads, head_dim).half().to("cuda:0")
     ...     # compute batch decode attention, reuse auxiliary data structures for all layers
-    ...     o = wrapper.forward(q, kv_cache_at_layer[i])
+    ...     o = wrapper.run(q, kv_cache_at_layer[i])
     ...     outputs.append(o)
     ...
-    >>> # clear auxiliary data structures
-    >>> wrapper.end_forward()
     >>> outputs[0].shape
     torch.Size([7, 64, 128])
     """
@@ -268,6 +266,7 @@ class MultiLevelCascadeAttentionWrapper:
             BatchPrefillWithPagedKVCacheWrapper(float_workspace_buffer, kv_layout)
             for _ in range(num_levels)
         ]
+        self._num_levels = num_levels
         self._kv_layout = kv_layout
 
     def reset_workspace_buffer(
@@ -292,7 +291,7 @@ class MultiLevelCascadeAttentionWrapper:
         ):
             wrapper.reset_workspace_buffer(float_workspace_buffer, int_workspace_buffer)
 
-    def begin_forward(
+    def plan(
         self,
         qo_indptr_arr: list[torch.Tensor],
         paged_kv_indptr_arr: list[torch.Tensor],
@@ -302,6 +301,7 @@ class MultiLevelCascadeAttentionWrapper:
         num_kv_heads: int,
         head_dim: int,
         page_size: int,
+        **kwargs,
     ):
         r"""Create auxiliary data structures for multi-level cascade attention for multiple
         forward calls within the same decode step.
@@ -330,21 +330,30 @@ class MultiLevelCascadeAttentionWrapper:
             The dimension of the heads.
         page_size : int
             The page size of the paged kv-cache.
+        **kwargs
+            Other keyword arguments for the plan method, 
+            the arguments should be consistent with
+            :meth:`flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper.plan`.
         """
-        for (
+        for i, (
             wrapper,
             qo_indptr,
             paged_kv_indptr,
             paged_kv_indices,
             paged_kv_last_page_len,
-        ) in zip(
-            self._batch_prefill_wrappers,
-            qo_indptr_arr,
-            paged_kv_indptr_arr,
-            paged_kv_indices_arr,
-            paged_kv_last_page_len,
+        ) in enumerate(
+            zip(
+                self._batch_prefill_wrappers,
+                qo_indptr_arr,
+                paged_kv_indptr_arr,
+                paged_kv_indices_arr,
+                paged_kv_last_page_len,
+            )
         ):
-            wrapper.begin_forward(
+            if i != self._num_levels - 1:
+                causal = kwargs.pop("causal", False)
+                kwargs["causal"] = False
+            wrapper.plan(
                 qo_indptr,
                 paged_kv_indptr,
                 paged_kv_indices,
@@ -353,18 +362,14 @@ class MultiLevelCascadeAttentionWrapper:
                 num_kv_heads,
                 head_dim,
                 page_size,
+                **kwargs,
             )
+            kwargs["causal"] = causal
 
-    def end_forward(self):
-        r"""Clear auxiliary data structures created by :meth:`begin_forward`."""
-        for wrapper in self._batch_prefill_wrappers:
-            wrapper.end_forward()
-
-    def forward(
+    def run(
         self,
         q: torch.Tensor,
         paged_kv_cache: torch.Tensor,
-        **kwargs,
     ):
         r"""Compute multi-level cascade attention.
 
@@ -386,13 +391,12 @@ class MultiLevelCascadeAttentionWrapper:
               :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
               ``paged_kv_cache[:, 1]`` is the value-cache.
         """
-        out, lse = self._batch_prefill_wrappers[-1].forward_return_lse(
-            q, paged_kv_cache, **kwargs
+        out, lse = self._batch_prefill_wrappers[-1].run_return_lse(
+            q,
+            paged_kv_cache,
         )
-        # NOTE(Zihao): causal mask should be False for all levels except the last level
-        kwargs["causal"] = False
         for wrapper in self._batch_prefill_wrappers[:-1]:
-            out_i, lse_i = wrapper.forward_return_lse(q, paged_kv_cache, **kwargs)
+            out_i, lse_i = wrapper.run_return_lse(q, paged_kv_cache)
             merge_state_in_place(out, lse, out_i, lse_i)
 
         return out
@@ -450,7 +454,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
     ...     ) for _ in range(num_layers)
     ... ]
     >>> # create auxiliary data structures for batch decode attention
-    >>> wrapper.begin_forward(
+    >>> wrapper.plan(
     ...     unique_kv_page_indptr,
     ...     unique_kv_page_indices,
     ...     unique_kv_last_page_len,
@@ -467,11 +471,9 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
     ...     v_shared = shared_v_data_at_layer[i]
     ...     unique_kv_cache = unique_kv_cache_at_layer[i]
     ...     # compute batch decode attention, reuse auxiliary data structures for all layers
-    ...     o = wrapper.forward(q, k_shared, v_shared, unique_kv_cache)
+    ...     o = wrapper.run(q, k_shared, v_shared, unique_kv_cache)
     ...     outputs.append(o)
     ...
-    >>> # clear auxiliary data structures
-    >>> wrapper.end_forward()
     >>> outputs[0].shape
     torch.Size([7, 64, 128])
 
@@ -510,7 +512,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
             float_workspace_buffer, int_workspace_buffer
         )
 
-    def begin_forward(
+    def plan(
         self,
         unique_kv_indptr: torch.Tensor,
         unique_kv_indices: torch.Tensor,
@@ -520,9 +522,9 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
         head_dim: int,
         page_size: int,
         data_type: str = "float16",
+        **kwargs,
     ) -> None:
-        r"""Create auxiliary data structures for shared-prefix batch decode for multiple
-        forward calls within the same decode step.
+        r"""Plan shared-prefix batch decode attention for given problem specification.
 
         Parameters
         ----------
@@ -543,10 +545,13 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
             The page size of the paged kv cache
         data_type : Union[str, torch.dtype]
             The data type of the paged kv cache
+        **kwargs
+            Other keyword arguments for the plan method, the arguments should be consistent with
+            :meth:`flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper.plan`.
 
         Note
         ----
-        The :meth:`begin_forward` method should be called before any :meth:`forward` or
+        The :meth:`plan` method should be called before any :meth:`forward` or
         :meth:`forward_return_lse` calls,
         auxiliary data structures will be created during this call and cached for
         multiple forward calls.
@@ -560,7 +565,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
         --------
         MultiLevelCascadeAttentionWrapper
         """
-        self._batch_decode_wrapper.begin_forward(
+        self._batch_decode_wrapper.plan(
             unique_kv_indptr,
             unique_kv_indices,
             unique_kv_last_page_len,
@@ -570,22 +575,19 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
             page_size,
             pos_encoding_mode="NONE",
             data_type=data_type,
+            **kwargs,
         )
 
     def end_forward(self) -> None:
-        r"""Clear auxiliary data structures created by :meth:`begin_forward`."""
+        r"""Clear auxiliary data structures created by :meth:`plan`."""
         self._batch_decode_wrapper.end_forward()
 
-    def forward(
+    def run(
         self,
         q: torch.Tensor,
         k_shared: torch.Tensor,
         v_shared: torch.Tensor,
         unique_kv_cache: torch.Tensor,
-        allow_fp16_qk_reduction=False,
-        sm_scale: Optional[float] = None,
-        rope_scale: Optional[float] = None,
-        rope_theta: Optional[float] = None,
     ) -> torch.Tensor:
         r"""Compute batch decode attention between queries and shared-prefix paged
         kv-cache.
@@ -618,17 +620,6 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
               :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
               ``paged_kv_cache[:, 1]`` is the value-cache.
 
-        allow_fp16_qk_reduction : bool
-            Whether to use f16 for qk reduction (faster at the cost of slight precision
-            loss).
-        sm_scale : Optional[float]
-            The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
-        rope_scale : Optional[float]
-            The scale used in RoPE interpolation, if not provided, will be set to
-            ``1.0``.
-        rope_theta : Optional[float]
-            The theta used in RoPE, if not provided, will be set to ``1e4``.
-
         Returns
         -------
         V : torch.Tensor
@@ -641,18 +632,14 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
             causal=False,
             pos_encoding_mode="NONE",
             kv_layout=self._kv_layout,
-            allow_fp16_qk_reduction=allow_fp16_qk_reduction,
-            sm_scale=sm_scale,
-            rope_scale=rope_scale,
-            rope_theta=rope_theta,
+            sm_scale=self._batch_decode_wrapper._sm_scale,
+            rope_scale=self._batch_decode_wrapper._rope_scale,
+            rope_theta=self._batch_decode_wrapper._rope_theta,
         )
-        V_unique, S_unique = self._batch_decode_wrapper.forward_return_lse(
+        V_unique, S_unique = self._batch_decode_wrapper.run_return_lse(
             q,
             unique_kv_cache,
             pos_encoding_mode="NONE",
-            sm_scale=sm_scale,
-            rope_scale=rope_scale,
-            rope_theta=rope_theta,
         )
         merge_state_in_place(V_shared, S_shared, V_unique, S_unique)
         return V_shared
@@ -713,7 +700,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
     ...     ) for _ in range(num_layers)
     ... ]
     >>> # create auxiliary data structures for batch prefill attention
-    >>> prefill_wrapper.begin_forward(
+    >>> prefill_wrapper.plan(
     ...     qo_indptr,
     ...     paged_kv_indptr,
     ...     paged_kv_indices,
@@ -786,7 +773,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
             float_workspace_buffer, int_workspace_buffer
         )
 
-    def begin_forward(
+    def plan(
         self,
         qo_indptr: torch.Tensor,
         paged_kv_indptr: torch.Tensor,
@@ -822,7 +809,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
 
         Note
         ----
-        The :meth:`begin_forward` method should be called before any :meth:`forward`
+        The :meth:`plan` method should be called before any :meth:`forward`
         or :meth:`forward_return_lse` calls, auxiliary data structures will be created
         during this call and cached for multiple forward calls.
 
@@ -831,7 +818,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
         """
 
-        self._batch_prefill_wrapper.begin_forward(
+        self._batch_prefill_wrapper.plan(
             qo_indptr,
             paged_kv_indptr,
             paged_kv_indices,
@@ -843,8 +830,8 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
         )
 
     def end_forward(self) -> None:
-        r"""Clear the auxiliary data structures created by :meth:`begin_forward`."""
-        self._batch_prefill_wrapper.end_forward()
+        r"""Warning: this function is deprecated and has no effect"""
+        pass
 
     def forward(
         self,

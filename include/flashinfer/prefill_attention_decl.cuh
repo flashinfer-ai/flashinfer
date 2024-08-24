@@ -81,25 +81,18 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapperDispatched(
   WarpLayout warp_layout;
   uint32_t padded_batch_size = 0U;
   uint32_t total_num_rows = 0U;
-  if (handler->IsForwardStarted()) {
-    tmp_v = handler->GetTempV<DTypeOut>();
-    tmp_s = handler->GetTempS();
-    request_indices = handler->GetRequestIndices<IdType>();
-    qo_tile_indices = handler->GetQOTileIndices<IdType>();
-    kv_tile_indices = handler->GetKVTileIndices<IdType>();
-    block_valid_mask = handler->GetBlockValidMask();
-    o_indptr = handler->GetOIndptr<IdType>();
-    merge_indptr = handler->GetMergeIndptr<IdType>();
-    kv_chunk_size_ptr = handler->GetKVChunkSizePtr<IdType>();
-    warp_layout = handler->GetWarpLayout();
-    padded_batch_size = handler->GetPaddedBatchSize();
-    total_num_rows = handler->GetTotalNumRows();
-  } else {
-    std::ostringstream err_msg;
-    err_msg << "Please call BatchPrefillHandler's BeginForward() before calling "
-               "BatchPrefillWithPagedKVCacheWrapper()";
-    throw std::runtime_error(err_msg.str());
-  }
+  tmp_v = handler->GetTempV<DTypeOut>();
+  tmp_s = handler->GetTempS();
+  request_indices = handler->GetRequestIndices<IdType>();
+  qo_tile_indices = handler->GetQOTileIndices<IdType>();
+  kv_tile_indices = handler->GetKVTileIndices<IdType>();
+  block_valid_mask = handler->GetBlockValidMask();
+  o_indptr = handler->GetOIndptr<IdType>();
+  merge_indptr = handler->GetMergeIndptr<IdType>();
+  kv_chunk_size_ptr = handler->GetKVChunkSizePtr<IdType>();
+  warp_layout = handler->GetWarpLayout();
+  padded_batch_size = handler->GetPaddedBatchSize();
+  total_num_rows = handler->GetTotalNumRows();
 
   DISPATCH_WARP_LAYOUT(warp_layout, WARP_LAYOUT, {
     return BatchPrefillWithPagedKVCacheDispatched<
@@ -131,25 +124,18 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapperDispatched(
   WarpLayout warp_layout;
   uint32_t padded_batch_size = 0U;
   uint32_t total_num_rows = 0U;
-  if (handler->IsForwardStarted()) {
-    tmp_v = handler->GetTempV<DTypeOut>();
-    tmp_s = handler->GetTempS();
-    request_indices = handler->GetRequestIndices<IdType>();
-    qo_tile_indices = handler->GetQOTileIndices<IdType>();
-    kv_tile_indices = handler->GetKVTileIndices<IdType>();
-    block_valid_mask = handler->GetBlockValidMask();
-    o_indptr = handler->GetOIndptr<IdType>();
-    merge_indptr = handler->GetMergeIndptr<IdType>();
-    kv_chunk_size_ptr = handler->GetKVChunkSizePtr<IdType>();
-    warp_layout = handler->GetWarpLayout();
-    padded_batch_size = handler->GetPaddedBatchSize();
-    total_num_rows = handler->GetTotalNumRows();
-  } else {
-    std::ostringstream err_msg;
-    err_msg << "Please call BatchPrefillHandler's BeginForward() before calling "
-               "BatchPrefillWithRaggedKVWrapperCache()";
-    throw std::runtime_error(err_msg.str());
-  }
+  tmp_v = handler->GetTempV<DTypeOut>();
+  tmp_s = handler->GetTempS();
+  request_indices = handler->GetRequestIndices<IdType>();
+  qo_tile_indices = handler->GetQOTileIndices<IdType>();
+  kv_tile_indices = handler->GetKVTileIndices<IdType>();
+  block_valid_mask = handler->GetBlockValidMask();
+  o_indptr = handler->GetOIndptr<IdType>();
+  merge_indptr = handler->GetMergeIndptr<IdType>();
+  kv_chunk_size_ptr = handler->GetKVChunkSizePtr<IdType>();
+  warp_layout = handler->GetWarpLayout();
+  padded_batch_size = handler->GetPaddedBatchSize();
+  total_num_rows = handler->GetTotalNumRows();
 
   DISPATCH_WARP_LAYOUT(warp_layout, WARP_LAYOUT, {
     return BatchPrefillWithRaggedKVCacheDispatched<WARP_LAYOUT, HEAD_DIM, LOGITS_POST_HOOK,

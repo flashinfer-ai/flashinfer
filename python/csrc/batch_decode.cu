@@ -20,7 +20,7 @@
 
 using namespace flashinfer;
 
-void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
+void BatchDecodeWithPagedKVCachePyTorchWrapper::Plan(
     torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer, torch::Tensor indptr,
     torch::Tensor last_page_len, unsigned int batch_size, unsigned int num_qo_heads,
     unsigned int num_kv_heads, unsigned int head_dim, unsigned int page_size,
@@ -62,15 +62,15 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
           return DISPATCH_pos_encoding_mode(
               PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
                 cudaError_t status =
-                    handler_->BeginForwardDispatched<HEAD_DIM, PageStorage::kIndices,
-                                                     LOGITS_POST_HOOK, POS_ENCODING_MODE, qkv_type,
-                                                     qkv_type, qkv_type, int32_t>(
-                        static_cast<void*>(float_workspace_buffer.data_ptr()),
-                        float_workspace_size_in_bytes,
-                        static_cast<void*>(int_workspace_buffer.data_ptr()),
-                        int_workspace_size_in_bytes, static_cast<int32_t*>(indptr.data_ptr()),
-                        static_cast<int32_t*>(last_page_len.data_ptr()), batch_size, num_qo_heads,
-                        num_kv_heads, page_size);
+                    handler_
+                        ->PlanDispatched<HEAD_DIM, PageStorage::kIndices, LOGITS_POST_HOOK,
+                                         POS_ENCODING_MODE, qkv_type, qkv_type, qkv_type, int32_t>(
+                            static_cast<void*>(float_workspace_buffer.data_ptr()),
+                            float_workspace_size_in_bytes,
+                            static_cast<void*>(int_workspace_buffer.data_ptr()),
+                            int_workspace_size_in_bytes, static_cast<int32_t*>(indptr.data_ptr()),
+                            static_cast<int32_t*>(last_page_len.data_ptr()), batch_size,
+                            num_qo_heads, num_kv_heads, page_size);
                 TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
                             cudaGetErrorString(status));
                 return true;
@@ -86,9 +86,8 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
             return DISPATCH_pos_encoding_mode(
                 PosEncodingMode(pos_encoding_mode), POS_ENCODING_MODE, [&] {
                   cudaError_t status =
-                      handler_->BeginForwardDispatched<HEAD_DIM, PageStorage::kIndices,
-                                                       LOGITS_POST_HOOK, POS_ENCODING_MODE, q_type,
-                                                       kv_type, q_type, int32_t>(
+                      handler_->PlanDispatched<HEAD_DIM, PageStorage::kIndices, LOGITS_POST_HOOK,
+                                               POS_ENCODING_MODE, q_type, kv_type, q_type, int32_t>(
                           static_cast<void*>(float_workspace_buffer.data_ptr()),
                           float_workspace_size_in_bytes,
                           static_cast<void*>(int_workspace_buffer.data_ptr()),
@@ -107,14 +106,12 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(
   }
 }
 
-void BatchDecodeWithPagedKVCachePyTorchWrapper::EndForward() { handler_->EndForward(); }
-
 void BatchDecodeWithPagedKVCachePyTorchWrapper::UpdatePageLockedBufferSize(
     unsigned int int_workspace_size_in_bytes) {
   handler_->UpdatePageLockedBufferSize(int_workspace_size_in_bytes);
 }
 
-std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Forward(
+std::vector<torch::Tensor> BatchDecodeWithPagedKVCachePyTorchWrapper::Run(
     torch::Tensor q, std::optional<torch::Tensor> paged_kv_cache,
     std::optional<torch::Tensor> paged_k_cache, std::optional<torch::Tensor> paged_v_cache,
     torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
