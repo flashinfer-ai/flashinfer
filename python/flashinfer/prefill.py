@@ -853,6 +853,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
 
+    begin_forward = plan
+
     def forward(
         self,
         q: torch.Tensor,
@@ -860,6 +862,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         causal: bool = True,
         pos_encoding_mode: str = "NONE",
         allow_fp16_qk_reduction: bool = False,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
         window_left: int = -1,
         logits_soft_cap: Optional[float] = None,
         sm_scale: Optional[float] = None,
@@ -875,7 +879,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
-        return self.run(q, paged_kv_cache)
+        return self.run(q, paged_kv_cache, k_scale=k_scale, v_scale=v_scale)
 
     def run(
         self,
@@ -1482,6 +1486,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
+
+    begin_forward = plan
 
     def forward(
         self,

@@ -563,6 +563,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
 
+    begin_forward = plan
+
     def forward(
         self,
         q: torch.Tensor,
@@ -584,7 +586,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
-        return self.run(q, paged_kv_cache, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale)
+        return self.run(
+            q, paged_kv_cache, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
+        )
 
     def run(
         self,
@@ -813,7 +817,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if v_scale is not None:
             V *= v_scale
         return V, s
-    
+
     def end_forward(self) -> None:
         r"""Warning: this function is deprecated and has no effect."""
         pass

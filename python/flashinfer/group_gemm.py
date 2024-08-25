@@ -192,5 +192,5 @@ class SegmentGEMMWrapper:
             batch_size,
             weight_column_major,
         )
-    
+
     forward = run
