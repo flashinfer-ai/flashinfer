@@ -245,7 +245,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
     ...     ) for _ in range(num_layers)
     ... ]
     >>> # create auxiliary data structures for batch decode attention
-    >>> decode_wrapper.begin_forward(
+    >>> decode_wrapper.plan(
     ...     kv_page_indptr,
     ...     kv_page_indices,
     ...     kv_last_page_len,
@@ -261,11 +261,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
     ...     q = torch.randn(batch_size, num_qo_heads, head_dim).half().to("cuda:0")
     ...     kv_cache = kv_cache_at_layer[i]
     ...     # compute batch decode attention, reuse auxiliary data structures for all layers
-    ...     o = decode_wrapper.forward(q, kv_cache)
+    ...     o = decode_wrapper.run(q, kv_cache)
     ...     outputs.append(o)
     ...
-    >>> # clear auxiliary data structures
-    >>> decode_wrapper.end_forward()
     >>> outputs[0].shape
     torch.Size([7, 64, 128])
 
@@ -405,7 +403,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             int_workspace_buffer.numel() * int_workspace_buffer.element_size()
         )
 
-    def begin_forward(
+    def plan(
         self,
         indptr: torch.Tensor,
         indices: torch.Tensor,
@@ -415,12 +413,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
         head_dim: int,
         page_size: int,
         pos_encoding_mode: str = "NONE",
+        window_left: int = -1,
         logits_soft_cap: Optional[float] = None,
         data_type: Union[str, torch.dtype] = "float16",
         q_data_type: Optional[Union[str, torch.dtype]] = None,
+        sm_scale: Optional[float] = None,
+        rope_scale: Optional[float] = None,
+        rope_theta: Optional[float] = None,
     ) -> None:
-        r"""Create auxiliary data structures for batch decode for multiple forward calls
-        within the same decode step.
+        r"""Plan batch decode for given problem specification.
 
         Parameters
         ----------
@@ -443,6 +444,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
             Defaults to ``NONE``.
+        window_left : int
+            The left (inclusive) window size for the attention window, when set to ``-1``, the window
+            size will be set to the full length of the sequence. Defaults to ``-1``.
         logits_soft_cap : Optional[float]
             The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
             provided, will be set to ``0``. If greater than 0, the logits will be capped according to
@@ -457,9 +461,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         Note
         ----
-        The :meth:`begin_forward` method should be called before any :meth:`forward` or
-        :meth:`forward_return_lse` calls, auxiliary data structures will be created
-        during this call and cached for multiple forward calls.
+        The :meth:`plan` method should be called before any :meth:`run` or
+        :meth:`run_return_lse` calls, auxiliary data structures will be created
+        during this call and cached for multiple run calls.
 
         The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads``
         is not equal to ``num_kv_heads``, the function will use
@@ -523,7 +527,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._qo_indptr_buf = torch.arange(
                     batch_size + 1, dtype=torch.int32, device=indptr.device
                 )
-            self._wrapper.begin_forward(
+            self._wrapper.plan(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._qo_indptr_buf,
@@ -536,7 +540,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 empty_q_data,
             )
         else:
-            self._wrapper.begin_forward(
+            self._wrapper.plan(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 indptr,
@@ -552,19 +556,19 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 empty_kv_cache,
             )
 
-    def end_forward(self) -> None:
-        r"""Clear auxiliary data structures created by :meth:`begin_forward`."""
-        if not self.is_cuda_graph_enabled:
-            self._paged_kv_indptr_buf = None
-            self._paged_kv_indices_buf = None
-            self._paged_kv_last_page_len_buf = None
-            self._qo_indptr_buf = None
-        self._wrapper.end_forward()
+        self._pos_encoding_mode = pos_encoding_mode
+        self._window_left = window_left
+        self._logits_soft_cap = logits_soft_cap
+        self._sm_scale = sm_scale
+        self._rope_scale = rope_scale
+        self._rope_theta = rope_theta
+
+    begin_forward = plan
 
     def forward(
         self,
         q: torch.Tensor,
-        paged_kv_cache: torch.Tensor,
+        paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         pos_encoding_mode: str = "NONE",
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
@@ -574,6 +578,25 @@ class BatchDecodeWithPagedKVCacheWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
+    ) -> torch.Tensor:
+        r"""Warning: this function is deprecated, please use :meth:`run` instead."""
+        self._pos_encoding_mode = pos_encoding_mode
+        self._window_left = window_left
+        self._logits_soft_cap = logits_soft_cap
+        self._sm_scale = sm_scale
+        self._rope_scale = rope_scale
+        self._rope_theta = rope_theta
+        return self.run(
+            q, paged_kv_cache, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
+        )
+
+    def run(
+        self,
+        q: torch.Tensor,
+        paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        q_scale: Optional[float] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
     ) -> torch.Tensor:
         r"""Compute batch decode attention between query and paged kv cache.
 
@@ -595,38 +618,24 @@ class BatchDecodeWithPagedKVCacheWrapper:
               :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
               ``paged_kv_cache[:, 1]`` is the value-cache.
 
-        pos_encoding_mode : str
-            The position encoding applied inside attention kernels, could be
-            ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
-            Defaults to ``NONE``.
         q_scale : Optional[float]
             The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
         k_scale : Optional[float]
             The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
         v_scale : Optional[float]
             The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
-        window_left : int
-            The left (inclusive) window size for the attention window, when set to ``-1``, the window
-            size will be set to the full length of the sequence. Defaults to ``-1``.
-        logits_soft_cap : Optional[float]
-            The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
-            provided, will be set to ``0``. If greater than 0, the logits will be capped according to
-            formula:
-            :math:`\texttt{logits_soft_cap} \times \mathrm{tanh}(x / \texttt{logits_soft_cap})`,
-            where :math:`x` is the input logits.
-        sm_scale : Optional[float]
-            The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
-        rope_scale : Optional[float]
-            The scale used in RoPE interpolation, if not provided, will be set to
-            ``1.0``.
-        rope_theta : Optional[float]
-            The theta used in RoPE, if not provided, will be set to ``1e4``.
 
         Returns
         -------
         torch.Tensor
             The attention output, shape: ``[batch_size, num_qo_heads, head_dim]``.
         """
+        pos_encoding_mode = self._pos_encoding_mode
+        window_left = self._window_left
+        logits_soft_cap = self._logits_soft_cap
+        sm_scale = self._sm_scale
+        rope_scale = self._rope_scale
+        rope_theta = self._rope_theta
         _check_pos_encoding_mode(pos_encoding_mode)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
@@ -643,7 +652,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             rope_theta = 1e4
 
         if self.use_tensor_cores:
-            out = self._wrapper.forward(
+            out = self._wrapper.run(
                 q,
                 self._qo_indptr_buf,
                 *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
@@ -661,7 +670,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 False,  # return_lse
             )[0]
         else:
-            out = self._wrapper.forward(
+            out = self._wrapper.run(
                 q,
                 *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
                 self._paged_kv_indptr_buf,
@@ -693,6 +702,25 @@ class BatchDecodeWithPagedKVCacheWrapper:
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""Warning: this function is deprecated, please use :meth:`run_return_lse` instead."""
+        self._pos_encoding_mode = pos_encoding_mode
+        self._window_left = window_left
+        self._logits_soft_cap = logits_soft_cap
+        self._sm_scale = sm_scale
+        self._rope_scale = rope_scale
+        self._rope_theta = rope_theta
+        return self.run_return_lse(
+            q, paged_kv_cache, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
+        )
+
+    def run_return_lse(
+        self,
+        q: torch.Tensor,
+        paged_kv_cache: torch.Tensor,
+        q_scale: Optional[float] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""Compute batch decode attention with paged kv cache, return attention output
         and logsumexp of attention scores.
 
@@ -714,32 +742,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
               :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
               ``paged_kv_cache[:, 1]`` is the value-cache.
 
-        pos_encoding_mode : str
-            The position encoding applied inside attention kernels, could be
-            ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
-            Defaults to ``NONE``.
         q_scale : Optional[float]
             The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
         k_scale : Optional[float]
             The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
         v_scale : Optional[float]
             The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
-        window_left : int
-            The left (inclusive) window size for the attention window, when set to ``-1``, the window
-            size will be set to the full length of the sequence. Defaults to ``-1``.
-        logits_soft_cap : Optional[float]
-            The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
-            provided, will be set to ``0``. If greater than 0, the logits will be capped according to
-            formula:
-            :math:`\texttt{logits_soft_cap} \times \mathrm{tanh}(x / \texttt{logits_soft_cap})`,
-            where :math:`x` is the input logits.
-        sm_scale : Optional[float]
-            The scale of softmax, if not provided, will be set to ``1 / sqrt(head_dim)``.
-        rope_scale : Optional[float]
-            The scale used in RoPE interpolation, if not provided, will be set to
-            ``1.0``.
-        rope_theta : Optional[float]
-            The theta used in RoPE, if not provided, will be set to ``1e4``.
 
         Returns
         -------
@@ -753,6 +761,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
         Please refer to the :ref:`tutorial <recursive-attention>` for a detailed
         explanation of the log-sum-exp function and attention states.
         """
+        pos_encoding_mode = self._pos_encoding_mode
+        window_left = self._window_left
+        logits_soft_cap = self._logits_soft_cap
+        sm_scale = self._sm_scale
+        rope_scale = self._rope_scale
+        rope_theta = self._rope_theta
         _check_pos_encoding_mode(pos_encoding_mode)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
@@ -768,7 +782,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if rope_theta is None:
             rope_theta = 1e4
         if self.use_tensor_cores:
-            V, s = self._wrapper.forward(
+            V, s = self._wrapper.run(
                 q,
                 self._qo_indptr_buf,
                 *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
@@ -786,7 +800,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 True,  # return_lse
             )
         else:
-            V, s = self._wrapper.forward(
+            V, s = self._wrapper.run(
                 q,
                 *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
                 self._paged_kv_indptr_buf,
@@ -804,6 +818,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             V *= v_scale
         return V, s
 
+    def end_forward(self) -> None:
+        r"""Warning: this function is deprecated and has no effect."""
+        pass
+
 
 class CUDAGraphBatchDecodeWithPagedKVCacheWrapper(BatchDecodeWithPagedKVCacheWrapper):
     r"""CUDAGraph-compatible Wrapper class for decode attention with paged kv-cache (first
@@ -817,7 +835,7 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper(BatchDecodeWithPagedKVCacheWra
 
     Note
     ----
-    The :meth:`begin_forward` method could not be captured by CUDAGraph.
+    The :meth:`plan` method could not be captured by CUDAGraph.
 
     See Also
     --------

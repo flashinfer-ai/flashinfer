@@ -48,7 +48,7 @@ class SegmentGEMMWrapper:
     >>> # create weight tensor with 4 weights, each with 128 input and 256 output channels, column major
     >>> weights = torch.randn(4, 256, 128, device="cuda", dtype=torch.float16)
     >>> # compute the segment GEMM
-    >>> y = segment_gemm.forward(x, weights, 4, True, seg_lens=seq_lens)
+    >>> y = segment_gemm.run(x, weights, 4, True, seg_lens=seq_lens)
     >>> y.shape
     torch.Size([10, 256])
     >>> y_ref_0 = torch.matmul(x[:1], weights[0].t())
@@ -66,7 +66,7 @@ class SegmentGEMMWrapper:
     >>>
     >>> # another example with weight indices
     >>> weight_indices = torch.tensor([0, 1, 0, 1], dtype=torch.int64, device="cuda")
-    >>> y = segment_gemm.forward(x, weights, 4, True, seg_lens=seq_lens, weight_indices=weight_indices)
+    >>> y = segment_gemm.run(x, weights, 4, True, seg_lens=seq_lens, weight_indices=weight_indices)
     >>> y.shape
     torch.Size([10, 256])
     >>> y_ref_0 = torch.matmul(x[:1], weights[0].t())
@@ -82,6 +82,7 @@ class SegmentGEMMWrapper:
     >>> torch.allclose(y[6:], y_ref_3)
     True
     """
+
     def __init__(self, workspace_buffer: torch.Tensor) -> None:
         r"""Initialize the wrapper.
 
@@ -108,7 +109,7 @@ class SegmentGEMMWrapper:
         self._workspace_buffer = new_workspace_buffer
         self._wrapper.register_workspace_buffer(new_workspace_buffer)
 
-    def forward(
+    def run(
         self,
         x: torch.Tensor,
         weights: torch.Tensor,
@@ -118,7 +119,7 @@ class SegmentGEMMWrapper:
         seg_indptr: Optional[torch.Tensor] = None,
         weight_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        r"""Forward pass of segment GEMM.
+        r"""Run the segment GEMM kernel.
 
         Compute the matrix multiplication between a batch of input tensor (with variable number of rows, but fixed
         number of columns) and a batch of weight tensor with fixed number of rows and columns:
@@ -183,7 +184,7 @@ class SegmentGEMMWrapper:
         if weight_indices is None:
             # create an empty CPU tensor as placeholder
             weight_indices = torch.empty(0, dtype=torch.int64)
-        return self._wrapper.forward(
+        return self._wrapper.run(
             seg_indptr,
             weight_indices,
             x,
@@ -191,3 +192,5 @@ class SegmentGEMMWrapper:
             batch_size,
             weight_column_major,
         )
+
+    forward = run

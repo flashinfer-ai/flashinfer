@@ -74,7 +74,7 @@ def apply_rope_inplace(
         The scaling factor used in the rope embedding, default: ``1``.
     rope_theta : float
         The theta value used in the rope embedding, default: ``1e4``.
-    
+
     Examples
     --------
     >>> import torch
@@ -164,7 +164,7 @@ def apply_llama31_rope_inplace(
         The high frequency factor used in Llama 3.1 RoPE, default: ``4``.
     old_context_len : int
         The old context length used in Llama 3.1 RoPE, default: ``8192``.
-    
+
     Examples
     --------
     >>> import torch

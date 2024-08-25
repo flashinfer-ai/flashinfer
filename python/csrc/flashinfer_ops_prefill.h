@@ -18,7 +18,6 @@
 
 #include <flashinfer/attention/handler.cuh>
 #include <flashinfer/layout.cuh>
-#include <memory>
 
 std::vector<torch::Tensor> single_prefill_with_kv_cache(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor tmp, bool causal,
@@ -34,23 +33,22 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache_custom_mask(
 
 class BatchPrefillWithPagedKVCachePyTorchWrapper {
  public:
-  void BeginForward(torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
-                    torch::Tensor qo_indptr, torch::Tensor page_kv_indptr, unsigned int batch_size,
-                    unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int head_dim,
-                    unsigned page_size, torch::Tensor empty_q_data);
-  void EndForward();
+  void Plan(torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
+            torch::Tensor qo_indptr, torch::Tensor page_kv_indptr, unsigned int batch_size,
+            unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int head_dim,
+            unsigned page_size, torch::Tensor empty_q_data);
   bool IsCUDAGraphEnabled() const { return handler_->IsCUDAGraphEnabled(); }
   void UpdatePageLockedBufferSize(uint32_t int_workspace_size_in_bytes);
-  std::vector<torch::Tensor> Forward(torch::Tensor q, torch::Tensor qo_indptr,
-                                     std::optional<torch::Tensor> paged_kv_cache,
-                                     std::optional<torch::Tensor> paged_k_cache,
-                                     std::optional<torch::Tensor> paged_v_cache,
-                                     torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
-                                     torch::Tensor paged_kv_last_page_len, bool causal,
-                                     unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction,
-                                     int window_left, float logits_soft_cap, float sm_scale,
-                                     float rope_scale, float rope_theta, bool return_lse);
-  std::vector<torch::Tensor> ForwardCustomMask(
+  std::vector<torch::Tensor> Run(torch::Tensor q, torch::Tensor qo_indptr,
+                                 std::optional<torch::Tensor> paged_kv_cache,
+                                 std::optional<torch::Tensor> paged_k_cache,
+                                 std::optional<torch::Tensor> paged_v_cache,
+                                 torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
+                                 torch::Tensor paged_kv_last_page_len, bool causal,
+                                 unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction,
+                                 int window_left, float logits_soft_cap, float sm_scale,
+                                 float rope_scale, float rope_theta, bool return_lse);
+  std::vector<torch::Tensor> RunCustomMask(
       torch::Tensor q, torch::Tensor qo_indptr, std::optional<torch::Tensor> paged_kv_cache,
       std::optional<torch::Tensor> paged_k_cache, std::optional<torch::Tensor> paged_v_cache,
       torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
@@ -69,19 +67,18 @@ class BatchPrefillWithPagedKVCachePyTorchWrapper {
 
 class BatchPrefillWithRaggedKVCachePyTorchWrapper {
  public:
-  void BeginForward(torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
-                    torch::Tensor qo_indptr, torch::Tensor kv_indptr, unsigned int batch_size,
-                    unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int head_dim,
-                    torch::Tensor empty_q_data);
-  void EndForward();
+  void Plan(torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
+            torch::Tensor qo_indptr, torch::Tensor kv_indptr, unsigned int batch_size,
+            unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int head_dim,
+            torch::Tensor empty_q_data);
   bool IsCUDAGraphEnabled() const { return handler_->IsCUDAGraphEnabled(); }
   void UpdatePageLockedBufferSize(uint32_t int_workspace_size_in_bytes);
-  std::vector<torch::Tensor> Forward(torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor k,
-                                     torch::Tensor v, torch::Tensor kv_indptr, bool causal,
-                                     unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction,
-                                     int window_left, float logits_soft_cap, float sm_scale,
-                                     float rope_scale, float rope_theta, bool return_lse);
-  std::vector<torch::Tensor> ForwardCustomMask(
+  std::vector<torch::Tensor> Run(torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor k,
+                                 torch::Tensor v, torch::Tensor kv_indptr, bool causal,
+                                 unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction,
+                                 int window_left, float logits_soft_cap, float sm_scale,
+                                 float rope_scale, float rope_theta, bool return_lse);
+  std::vector<torch::Tensor> RunCustomMask(
       torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor k, torch::Tensor v,
       torch::Tensor kv_indptr, torch::Tensor packed_custom_mask, torch::Tensor qk_indptr,
       unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction, int window_left,

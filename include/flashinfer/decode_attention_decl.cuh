@@ -57,23 +57,16 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapperDispatched(
   DTypeOut* tmp_v = handler->GetTempV<DTypeOut>();
   float* tmp_s = handler->GetTempS();
 
-  if (handler->IsForwardStarted()) {
-    if (tmp_v != nullptr) {
-      // create auxiliary information for cooperative kernels
-      new_paged_kv.batch_size = handler->GetBatchSizeAfterPartition();
-      new_paged_kv.indptr = handler->GetNewIndPtr<IdType>();
-      new_paged_kv.last_page_len = handler->GetNewLastPageLen<IdType>();
-      kv_partition_info.batch_size_before_partition = handler->GetBatchSizeBeforePartition();
-      kv_partition_info.chunk_indptr = handler->GetChunkIndPtr<IdType>();
-      kv_partition_info.batch_idx_map = handler->GetBatchIdxMap<IdType>();
-      kv_partition_info.chunk_start_pos = handler->GetChunkStartPos<IdType>();
-      kv_partition_info.seq_lens_before_partition = handler->GetSeqLengthsBeforePartition<IdType>();
-    }
-  } else {
-    std::ostringstream err_msg;
-    err_msg << "Please call BatchDecodeHandler's BeginForward() before calling "
-               "BatchDecodeWithPagedKVCacheWrapper()";
-    throw std::runtime_error(err_msg.str());
+  if (tmp_v != nullptr) {
+    // create auxiliary information for cooperative kernels
+    new_paged_kv.batch_size = handler->GetBatchSizeAfterPartition();
+    new_paged_kv.indptr = handler->GetNewIndPtr<IdType>();
+    new_paged_kv.last_page_len = handler->GetNewLastPageLen<IdType>();
+    kv_partition_info.batch_size_before_partition = handler->GetBatchSizeBeforePartition();
+    kv_partition_info.chunk_indptr = handler->GetChunkIndPtr<IdType>();
+    kv_partition_info.batch_idx_map = handler->GetBatchIdxMap<IdType>();
+    kv_partition_info.chunk_start_pos = handler->GetChunkStartPos<IdType>();
+    kv_partition_info.seq_lens_before_partition = handler->GetSeqLengthsBeforePartition<IdType>();
   }
 
   return BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, PAGE_STORAGE, LOGITS_POST_HOOK,

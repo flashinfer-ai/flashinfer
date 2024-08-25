@@ -289,13 +289,13 @@ void _TestTwoLevelSinglePrefixCascadeDecodeCorrectness(size_t batch_size,
   size_t int_workspace_size_in_bytes = 8 * 1024 * 1024;
   thrust::device_vector<char> int_buffer(int_workspace_size_in_bytes);
 
-  BatchDecodeHandlerBeginForward<page_storage, T, T, T, int32_t>(
+  BatchDecodeHandlerPlan<page_storage, T, T, T, int32_t>(
       &baseline_handler, (void*)thrust::raw_pointer_cast(float_buffer.data()),
       float_workspace_size_in_bytes, (void*)thrust::raw_pointer_cast(int_buffer.data()),
       int_workspace_size_in_bytes, kv_indptr_combined_h.data(), kv_last_page_len_combined_h.data(),
       batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, PosEncodingMode::kNone);
 
-  BatchDecodeHandlerBeginForward<page_storage, T, T, T, int32_t>(
+  BatchDecodeHandlerPlan<page_storage, T, T, T, int32_t>(
       &cascade_handler, (void*)thrust::raw_pointer_cast(float_buffer.data()),
       float_workspace_size_in_bytes, (void*)thrust::raw_pointer_cast(int_buffer.data()),
       int_workspace_size_in_bytes, kv_indptr_unique_h.data(), kv_last_page_len_unique_h.data(),
@@ -416,12 +416,12 @@ void _TestTwoLevelSinglePrefixCascadeAppendCorrectness(size_t batch_size,
   size_t int_workspace_size_in_bytes = 8 * 1024 * 1024;
   thrust::device_vector<char> int_buffer(int_workspace_size_in_bytes);
 
-  baseline_handler.BeginForward<T, int32_t>(
+  baseline_handler.Plan<T, int32_t>(
       (void*)thrust::raw_pointer_cast(float_buffer.data()), float_workspace_size_in_bytes,
       (void*)thrust::raw_pointer_cast(int_buffer.data()), int_workspace_size_in_bytes,
       qo_indptr_h.data(), kv_indptr_combined_h.data(), batch_size, num_qo_heads, num_kv_heads,
       head_dim, page_size);
-  cascade_handler.BeginForward<T, int32_t>(
+  cascade_handler.Plan<T, int32_t>(
       (void*)thrust::raw_pointer_cast(float_buffer.data()), float_workspace_size_in_bytes,
       (void*)thrust::raw_pointer_cast(int_buffer.data()), int_workspace_size_in_bytes,
       qo_indptr_h.data(), kv_indptr_unique_h.data(), batch_size, num_qo_heads, num_kv_heads,

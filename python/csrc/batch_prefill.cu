@@ -20,7 +20,7 @@
 
 using namespace flashinfer;
 
-void BatchPrefillWithPagedKVCachePyTorchWrapper::BeginForward(
+void BatchPrefillWithPagedKVCachePyTorchWrapper::Plan(
     torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
     torch::Tensor qo_indptr, torch::Tensor paged_kv_indptr, unsigned int batch_size,
     unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int head_dim,
@@ -48,7 +48,7 @@ void BatchPrefillWithPagedKVCachePyTorchWrapper::BeginForward(
   handler_->SetCUDAStream(torch_current_stream);
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(empty_q_data.scalar_type(), q_type, [&] {
-    cudaError_t status = handler_->BeginForward<q_type, int32_t>(
+    cudaError_t status = handler_->Plan<q_type, int32_t>(
         static_cast<void*>(float_workspace_buffer.data_ptr()), float_workspace_size_in_bytes,
         static_cast<void*>(int_workspace_buffer.data_ptr()), int_workspace_size_in_bytes,
         static_cast<int32_t*>(qo_indptr.data_ptr()),
@@ -60,14 +60,12 @@ void BatchPrefillWithPagedKVCachePyTorchWrapper::BeginForward(
   });
 }
 
-void BatchPrefillWithPagedKVCachePyTorchWrapper::EndForward() { handler_->EndForward(); }
-
 void BatchPrefillWithPagedKVCachePyTorchWrapper::UpdatePageLockedBufferSize(
     unsigned int int_workspace_size_in_bytes) {
   handler_->UpdatePageLockedBufferSize(int_workspace_size_in_bytes);
 }
 
-std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
+std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Run(
     torch::Tensor q, torch::Tensor qo_indptr, std::optional<torch::Tensor> paged_kv_cache,
     std::optional<torch::Tensor> paged_k_cache, std::optional<torch::Tensor> paged_v_cache,
     torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
@@ -257,7 +255,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Forward(
   }
 }
 
-std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCustomMask(
+std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::RunCustomMask(
     torch::Tensor q, torch::Tensor qo_indptr, std::optional<torch::Tensor> paged_kv_cache,
     std::optional<torch::Tensor> paged_k_cache, std::optional<torch::Tensor> paged_v_cache,
     torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
@@ -452,7 +450,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::ForwardCu
   }
 }
 
-void BatchPrefillWithRaggedKVCachePyTorchWrapper::BeginForward(
+void BatchPrefillWithRaggedKVCachePyTorchWrapper::Plan(
     torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
     torch::Tensor qo_indptr, torch::Tensor kv_indptr, unsigned int batch_size,
     unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int head_dim,
@@ -479,7 +477,7 @@ void BatchPrefillWithRaggedKVCachePyTorchWrapper::BeginForward(
   handler_->SetCUDAStream(torch_current_stream);
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(empty_q_data.scalar_type(), q_type, [&] {
-    cudaError_t status = handler_->BeginForward<q_type, int32_t>(
+    cudaError_t status = handler_->Plan<q_type, int32_t>(
         static_cast<void*>(float_workspace_buffer.data_ptr()), float_workspace_size_in_bytes,
         static_cast<void*>(int_workspace_buffer.data_ptr()), int_workspace_size_in_bytes,
         static_cast<int32_t*>(qo_indptr.data_ptr()), static_cast<int32_t*>(kv_indptr.data_ptr()),
@@ -491,14 +489,12 @@ void BatchPrefillWithRaggedKVCachePyTorchWrapper::BeginForward(
   });
 }
 
-void BatchPrefillWithRaggedKVCachePyTorchWrapper::EndForward() { handler_->EndForward(); }
-
 void BatchPrefillWithRaggedKVCachePyTorchWrapper::UpdatePageLockedBufferSize(
     unsigned int int_workspace_size_in_bytes) {
   handler_->UpdatePageLockedBufferSize(int_workspace_size_in_bytes);
 }
 
-std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
+std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Run(
     torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor k, torch::Tensor v,
     torch::Tensor kv_indptr, bool causal, unsigned int pos_encoding_mode,
     bool allow_fp16_qk_reduction, int window_left, float logits_soft_cap, float sm_scale,
@@ -605,7 +601,7 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::Forward(
   }
 }
 
-std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::ForwardCustomMask(
+std::vector<torch::Tensor> BatchPrefillWithRaggedKVCachePyTorchWrapper::RunCustomMask(
     torch::Tensor q, torch::Tensor qo_indptr, torch::Tensor k, torch::Tensor v,
     torch::Tensor kv_indptr, torch::Tensor custom_mask, torch::Tensor qk_indptr,
     unsigned int pos_encoding_mode, bool allow_fp16_qk_reduction, int window_left,

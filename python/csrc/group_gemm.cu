@@ -25,11 +25,10 @@ void CutlassSegmentGEMMPyTorchWrapper::RegisterWorkspaceBuffer(torch::Tensor wor
                               workspace_buffer.size(0) * workspace_buffer.element_size());
 }
 
-torch::Tensor CutlassSegmentGEMMPyTorchWrapper::Forward(torch::Tensor seg_indptr,
-                                                        torch::Tensor weight_indices,
-                                                        torch::Tensor x, torch::Tensor weight,
-                                                        unsigned int batch_size,
-                                                        bool weight_column_major) {
+torch::Tensor CutlassSegmentGEMMPyTorchWrapper::Run(torch::Tensor seg_indptr,
+                                                    torch::Tensor weight_indices, torch::Tensor x,
+                                                    torch::Tensor weight, unsigned int batch_size,
+                                                    bool weight_column_major) {
   // TODO(Zihao): Add more checks here
   CHECK_INPUT(seg_indptr);
   CHECK_INPUT(x);

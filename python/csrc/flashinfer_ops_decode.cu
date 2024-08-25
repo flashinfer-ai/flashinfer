@@ -23,10 +23,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<BatchDecodeWithPagedKVCachePyTorchWrapper>(m,
                                                         "BatchDecodeWithPagedKVCachePyTorchWrapper")
       .def(py::init<unsigned int, bool, unsigned int>())
-      .def("begin_forward", &BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward)
-      .def("end_forward", &BatchDecodeWithPagedKVCachePyTorchWrapper::EndForward)
+      .def("plan", &BatchDecodeWithPagedKVCachePyTorchWrapper::Plan)
       .def("is_cuda_graph_enabled", &BatchDecodeWithPagedKVCachePyTorchWrapper::IsCUDAGraphEnabled)
       .def("update_page_locked_buffer_size",
            &BatchDecodeWithPagedKVCachePyTorchWrapper::UpdatePageLockedBufferSize)
-      .def("forward", &BatchDecodeWithPagedKVCachePyTorchWrapper::Forward);
+      .def("run", &BatchDecodeWithPagedKVCachePyTorchWrapper::Run);
 }
