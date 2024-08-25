@@ -23,34 +23,32 @@
 
 using namespace flashinfer;
 
-void bmm_fp8(const torch::Tensor& input, const torch::Tensor& weight, torch::Tensor& result) {
-  TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
-  TORCH_CHECK(weight.is_cuda(), "Weight must be a CUDA tensor");
-  TORCH_CHECK(result.is_cuda(), "Result must be a CUDA tensor");
-  TORCH_CHECK(input.dim() == 3, "Expected 3D tensor for input");
-  TORCH_CHECK(weight.dim() == 3, "Expected 3D tensor for weight");
-  TORCH_CHECK(result.dim() == 3, "Expected 3D tensor for result");
-  TORCH_CHECK(input.size(0) == weight.size(0) && input.size(0) == result.size(0),
-              "Batch sizes must match");
-  TORCH_CHECK(input.size(2) == weight.size(1), "Incompatible matrix sizes");
-  TORCH_CHECK(input.size(1) == result.size(1) && weight.size(2) == result.size(2),
+void bmm_fp8(const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& D) {
+  TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
+  TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
+  TORCH_CHECK(D.is_cuda(), "D must be a CUDA tensor");
+  TORCH_CHECK(A.dim() == 3, "Expected 3D tensor for A");
+  TORCH_CHECK(B.dim() == 3, "Expected 3D tensor for B");
+  TORCH_CHECK(D.dim() == 3, "Expected 3D tensor for D");
+  TORCH_CHECK(A.size(0) == B.size(0) && A.size(0) == D.size(0), "Batch sizes must match");
+  TORCH_CHECK(A.size(2) == B.size(1), "Incompatible matrix sizes");
+  TORCH_CHECK(A.size(1) == D.size(1) && B.size(2) == D.size(2),
               "Result tensor has incorrect shape");
-  TORCH_CHECK(input.scalar_type() == torch::kFloat8_e4m3fn, "input must be Float8_e4m3fn");
-  TORCH_CHECK(weight.scalar_type() == torch::kFloat8_e4m3fn, "weight must be Float8_e4m3fn");
-  TORCH_CHECK(result.scalar_type() == torch::kBFloat16, "Result must be BFloat16");
+  TORCH_CHECK(A.scalar_type() == torch::kFloat8_e4m3fn, "A must be Float8_e4m3fn");
+  TORCH_CHECK(B.scalar_type() == torch::kFloat8_e4m3fn, "B must be Float8_e4m3fn");
+  TORCH_CHECK(D.scalar_type() == torch::kBFloat16, "D must be BFloat16");
 
-  auto batch_size = input.size(0);
-  auto m = input.size(1);
-  auto k = input.size(2);
-  auto n = weight.size(2);
+  auto batch_size = A.size(0);
+  auto m = A.size(1);
+  auto k = A.size(2);
+  auto n = B.size(2);
 
   // PyTorch is row major by default. cuBLASLt is column major by default.
-  // We need row major result as expected.
+  // We need row major D as expected.
   // A ^ T * B = D, so D ^ T = B ^ T * A
-  if (result.scalar_type() == at::ScalarType::BFloat16) {
-    flashinfer::bmm_fp8::bmm_fp8_internal_cublaslt(static_cast<__nv_fp8_e4m3*>(weight.data_ptr()),
-                                                   static_cast<__nv_fp8_e4m3*>(input.data_ptr()),
-                                                   static_cast<__nv_bfloat16*>(result.data_ptr()),
-                                                   batch_size, n, m, k);
+  if (D.scalar_type() == at::ScalarType::BFloat16) {
+    flashinfer::bmm_fp8::bmm_fp8_internal_cublaslt(
+        static_cast<__nv_fp8_e4m3*>(B.data_ptr()), static_cast<__nv_fp8_e4m3*>(A.data_ptr()),
+        static_cast<__nv_bfloat16*>(D.data_ptr()), batch_size, n, m, k);
   }
 }
