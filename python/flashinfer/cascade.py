@@ -496,7 +496,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
     ...     ) for _ in range(num_layers)
     ... ]
     >>> # create auxiliary data structures for batch decode attention
-    >>> wrapper.plan(
+    >>> wrapper.begin_forward(
     ...     unique_kv_page_indptr,
     ...     unique_kv_page_indices,
     ...     unique_kv_last_page_len,
@@ -564,7 +564,6 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
         head_dim: int,
         page_size: int,
         data_type: str = "float16",
-        **kwargs,
     ) -> None:
         r"""Plan shared-prefix batch decode attention for given problem specification.
 
@@ -590,7 +589,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
 
         Note
         ----
-        The :meth:`plan` method should be called before any :meth:`forward` or
+        The :meth:`begin_forward` method should be called before any :meth:`forward` or
         :meth:`forward_return_lse` calls,
         auxiliary data structures will be created during this call and cached for
         multiple forward calls.
@@ -845,13 +844,10 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
             The dimension of the heads.
         page_size : int
             The page size of the paged kv-cache.
-        **kwargs
-            Other keyword arguments for the plan method, the arguments should be consistent with
-            :meth:`flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper.plan`.
 
         Note
         ----
-        The :meth:`plan` method should be called before any :meth:`forward`
+        The :meth:`begin_forward` method should be called before any :meth:`forward`
         or :meth:`forward_return_lse` calls, auxiliary data structures will be created
         during this call and cached for multiple forward calls.
 

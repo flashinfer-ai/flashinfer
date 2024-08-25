@@ -240,9 +240,9 @@ class BlockSparseAttentionWrapper:
         q_data_type : str, optional
             The data type of the query tensor.
 
-        The :meth:`begin_forward` method should be called before any :meth:`forward` or
-        :meth:`forward_return_lse` calls, auxiliary data structures will be created
-        during this call and cached for multiple forward calls.
+        The :meth:`plan` method should be called before any :meth:`run` or
+        :meth:`run_return_lse` calls, auxiliary data structures will be created
+        during this call and cached for multiple kernel runs.
 
         The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads``
         is not equal to ``num_kv_heads``, the function will use
