@@ -45,9 +45,9 @@ void bmm_fp8(const torch::Tensor& input, const torch::Tensor& weight, torch::Ten
   auto n = weight.size(2);
 
   if (result.scalar_type() == at::ScalarType::BFloat16) {
-    flashinfer::bmm_fp8::bmm_fp8_internal_cublaslt(static_cast<__nv_fp8_e4m3*>(input.data_ptr()),
-                                                   static_cast<__nv_fp8_e4m3*>(weight.data_ptr()),
+    flashinfer::bmm_fp8::bmm_fp8_internal_cublaslt(static_cast<__nv_fp8_e4m3*>(weight.data_ptr()),
+                                                   static_cast<__nv_fp8_e4m3*>(input.data_ptr()),
                                                    static_cast<__nv_bfloat16*>(result.data_ptr()),
-                                                   batch_size, m, n, k);
+                                                   batch_size, n, m, k);
   }
 }
