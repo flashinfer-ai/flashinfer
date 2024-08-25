@@ -82,6 +82,8 @@ void bmm_fp8_internal_cublaslt(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* B, _
   auto matmul_desp = CuBlasLtMatmulDescriptor(CUBLAS_COMPUTE_32F, CUDA_R_32F);
   matmul_desp.setAttribute(CUBLASLT_MATMUL_DESC_TRANSA, CUBLAS_OP_T);
   matmul_desp.setAttribute(CUBLASLT_MATMUL_DESC_TRANSB, CUBLAS_OP_N);
+  int8_t fast_accum = 1;
+  matmul_desp.setAttribute(CUBLASLT_MATMUL_DESC_FAST_ACCUM, fast_accum);
 
   auto a_desp = CuBlasLtMatrixLayout(CUDA_R_8F_E4M3, m, k, k, true);
   auto b_desp = CuBlasLtMatrixLayout(CUDA_R_8F_E4M3, k, n, k);
