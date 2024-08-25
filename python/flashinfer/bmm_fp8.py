@@ -30,5 +30,11 @@ except ImportError as e:
         raise e
 
 
-def bmm_fp8(input: torch.Tensor, weight: torch.Tensor, result: torch.Tensor):
-    _kernels.bmm_fp8(input, weight, result)
+def bmm_fp8(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    result: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+):
+    _kernels.bmm_fp8(input, weight, result, A_scale, B_scale)

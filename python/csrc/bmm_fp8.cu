@@ -24,7 +24,8 @@
 
 using namespace flashinfer;
 
-void bmm_fp8(const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& D) {
+void bmm_fp8(const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& D,
+             torch::Tensor& A_scale, torch::Tensor& B_scale) {
   TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
   TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
   TORCH_CHECK(D.is_cuda(), "D must be a CUDA tensor");
@@ -42,6 +43,9 @@ void bmm_fp8(const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& D) {
   TORCH_CHECK(D.scalar_type() == torch::kBFloat16 || D.scalar_type() == torch::kHalf,
               "D must be BFloat16 or Half");
 
+  TORCH_CHECK(A_scale.scalar_type() == torch::kFloat32 && B_scale.scalar_type() == torch::kFloat32,
+              "A_scale and B_scale must be Float32");
+
   auto batch_size = A.size(0);
   auto m = A.size(1);
   auto k = A.size(2);
@@ -55,7 +59,8 @@ void bmm_fp8(const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& D) {
       return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(D.scalar_type(), d_type, [&] {
         flashinfer::bmm_fp8::bmm_fp8_internal_cublaslt(
             static_cast<b_type*>(B.data_ptr()), static_cast<a_type*>(A.data_ptr()),
-            static_cast<d_type*>(D.data_ptr()), batch_size, n, m, k);
+            static_cast<d_type*>(D.data_ptr()), batch_size, n, m, k,
+            static_cast<float*>(B_scale.data_ptr()), static_cast<float*>(A_scale.data_ptr()));
         return true;
       });
     });

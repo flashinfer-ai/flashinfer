@@ -109,13 +109,18 @@ cudaDataType_t get_cuda_data_type() {
 }
 
 template <typename AT, typename BT, typename DT>
-void bmm_fp8_internal_cublaslt(const AT* A, const BT* B, DT* D, int batch_size, int m, int n,
-                               int k) {
+void bmm_fp8_internal_cublaslt(const AT* A, const BT* B, DT* D, int batch_size, int m, int n, int k,
+                               const float* A_scale, const float* B_scale) {
+  const void* A_scale_ptr = static_cast<const void*>(A_scale);
+  const void* B_scale_ptr = static_cast<const void*>(B_scale);
   auto matmul_desp = CuBlasLtMatmulDescriptor(CUBLAS_COMPUTE_32F, CUDA_R_32F);
   matmul_desp.setAttribute(CUBLASLT_MATMUL_DESC_TRANSA, CUBLAS_OP_T);
   matmul_desp.setAttribute(CUBLASLT_MATMUL_DESC_TRANSB, CUBLAS_OP_N);
   int8_t fast_accum = 1;
   matmul_desp.setAttribute(CUBLASLT_MATMUL_DESC_FAST_ACCUM, fast_accum);
+
+  matmul_desp.setAttribute(CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, A_scale_ptr);
+  matmul_desp.setAttribute(CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, B_scale_ptr);
 
   cudaDataType_t a_type = get_cuda_data_type<AT>();
   cudaDataType_t b_type = get_cuda_data_type<BT>();
@@ -167,30 +172,27 @@ void bmm_fp8_internal_cublaslt(const AT* A, const BT* B, DT* D, int batch_size, 
 
 template void bmm_fp8_internal_cublaslt<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16>(
     const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* B, __nv_bfloat16* D, int batch_size, int m, int n,
-    int k);
+    int k, const float* A_scale, const float* B_scale);
 
-template void bmm_fp8_internal_cublaslt<__nv_fp8_e4m3, __nv_fp8_e4m3, half>(const __nv_fp8_e4m3* A,
-                                                                            const __nv_fp8_e4m3* B,
-                                                                            half* D, int batch_size,
-                                                                            int m, int n, int k);
+template void bmm_fp8_internal_cublaslt<__nv_fp8_e4m3, __nv_fp8_e4m3, half>(
+    const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* B, half* D, int batch_size, int m, int n, int k,
+    const float* A_scale, const float* B_scale);
 
 template void bmm_fp8_internal_cublaslt<__nv_fp8_e4m3, __nv_fp8_e5m2, __nv_bfloat16>(
     const __nv_fp8_e4m3* A, const __nv_fp8_e5m2* B, __nv_bfloat16* D, int batch_size, int m, int n,
-    int k);
+    int k, const float* A_scale, const float* B_scale);
 
-template void bmm_fp8_internal_cublaslt<__nv_fp8_e4m3, __nv_fp8_e5m2, half>(const __nv_fp8_e4m3* A,
-                                                                            const __nv_fp8_e5m2* B,
-                                                                            half* D, int batch_size,
-                                                                            int m, int n, int k);
+template void bmm_fp8_internal_cublaslt<__nv_fp8_e4m3, __nv_fp8_e5m2, half>(
+    const __nv_fp8_e4m3* A, const __nv_fp8_e5m2* B, half* D, int batch_size, int m, int n, int k,
+    const float* A_scale, const float* B_scale);
 
 template void bmm_fp8_internal_cublaslt<__nv_fp8_e5m2, __nv_fp8_e4m3, __nv_bfloat16>(
     const __nv_fp8_e5m2* A, const __nv_fp8_e4m3* B, __nv_bfloat16* D, int batch_size, int m, int n,
-    int k);
+    int k, const float* A_scale, const float* B_scale);
 
-template void bmm_fp8_internal_cublaslt<__nv_fp8_e5m2, __nv_fp8_e4m3, half>(const __nv_fp8_e5m2* A,
-                                                                            const __nv_fp8_e4m3* B,
-                                                                            half* D, int batch_size,
-                                                                            int m, int n, int k);
+template void bmm_fp8_internal_cublaslt<__nv_fp8_e5m2, __nv_fp8_e4m3, half>(
+    const __nv_fp8_e5m2* A, const __nv_fp8_e4m3* B, half* D, int batch_size, int m, int n, int k,
+    const float* A_scale, const float* B_scale);
 
 }  // namespace bmm_fp8
 }  // namespace flashinfer
