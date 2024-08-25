@@ -77,6 +77,21 @@ class CuBlasLtMatrixLayout
   }
 };
 
+class CuBlasLtMatmulPreference : public CuBlasLtDescriptor<cublasLtMatmulPreferenceOpaque_t,
+                                                           &cublasLtMatmulPreferenceDestroy> {
+ public:
+  CuBlasLtMatmulPreference() {
+    cublasLtMatmulPreference_t raw_descriptor = nullptr;
+    TORCH_CUDABLAS_CHECK(cublasLtMatmulPreferenceCreate(&raw_descriptor));
+    descriptor_.reset(raw_descriptor);
+  }
+  template <typename T>
+  inline void setAttribute(cublasLtMatmulPreferenceAttributes_t attr, const T value) {
+    TORCH_CUDABLAS_CHECK(
+        ::cublasLtMatmulPreferenceSetAttribute(descriptor(), attr, &value, sizeof(T)));
+  }
+};
+
 void bmm_fp8_internal_cublaslt(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* B, __nv_bfloat16* D,
                                int batch_size, int m, int n, int k) {
   auto matmul_desp = CuBlasLtMatmulDescriptor(CUBLAS_COMPUTE_32F, CUDA_R_32F);
@@ -101,12 +116,28 @@ void bmm_fp8_internal_cublaslt(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* B, _
     d_desp.setAttribute(CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, stride_d);
   }
 
+  CuBlasLtMatmulPreference preference;
+  size_t workspace_size = 1024 * 1024;  // 1 MiB
+  preference.setAttribute(CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, workspace_size);
+  auto& allocator = *::c10::cuda::CUDACachingAllocator::get();
+  auto workspace = allocator.allocate(workspace_size);
+  cublasLtMatmulHeuristicResult_t heuristic_result = {};
+  int returned_result = 0;
+  auto lt_handle = at::cuda::getCurrentCUDABlasLtHandle();
+  TORCH_CUDABLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(
+      lt_handle, matmul_desp.descriptor(), a_desp.descriptor(), b_desp.descriptor(),
+      d_desp.descriptor(), d_desp.descriptor(), preference.descriptor(), 1, &heuristic_result,
+      &returned_result));
+  if (returned_result == 0) {
+    TORCH_CUDABLAS_CHECK(CUBLAS_STATUS_NOT_SUPPORTED);
+  }
+
   const float alpha = 1.0f;
   const float beta = 0.0f;
   cublasStatus_t status = cublasLtMatmul(
-      at::cuda::getCurrentCUDABlasLtHandle(), matmul_desp.descriptor(), &alpha, A,
-      a_desp.descriptor(), B, b_desp.descriptor(), &beta, nullptr, d_desp.descriptor(), D,
-      d_desp.descriptor(), nullptr, nullptr, 0, at::cuda::getCurrentCUDAStream());
+      lt_handle, matmul_desp.descriptor(), &alpha, A, a_desp.descriptor(), B, b_desp.descriptor(),
+      &beta, nullptr, d_desp.descriptor(), D, d_desp.descriptor(), &heuristic_result.algo,
+      workspace.mutable_get(), workspace_size, at::cuda::getCurrentCUDAStream());
   TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, at::cuda::blas::_cublasGetErrorEnum(status));
 }
 
