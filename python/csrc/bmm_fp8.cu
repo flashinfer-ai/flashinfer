@@ -44,6 +44,9 @@ void bmm_fp8(const torch::Tensor& input, const torch::Tensor& weight, torch::Ten
   auto k = input.size(2);
   auto n = weight.size(2);
 
+  // PyTorch is row major by default. cuBLASLt is column major by default.
+  // We need row major result as expected.
+  // A ^ T * B = D, so D ^ T = B ^ T * A
   if (result.scalar_type() == at::ScalarType::BFloat16) {
     flashinfer::bmm_fp8::bmm_fp8_internal_cublaslt(static_cast<__nv_fp8_e4m3*>(weight.data_ptr()),
                                                    static_cast<__nv_fp8_e4m3*>(input.data_ptr()),
