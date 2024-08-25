@@ -1,5 +1,4 @@
 import torch
-import numpy as np
 from flashinfer import bmm_fp8
 
 input = torch.randn([16, 48, 64], device="cuda", dtype=torch.bfloat16)
@@ -14,6 +13,6 @@ res = torch.empty([16, 48, 80], device="cuda", dtype=torch.bfloat16)
 bmm_fp8(input_fp8, mat2_fp8, res)
 res_bf16 = input @ mat2
 
-np.testing.assert_allclose(
-    res.float().cpu().numpy(), res_bf16.float().cpu().numpy(), rtol=1e-1, atol=1e-1
+torch.testing.assert_close(
+    res.float().cpu(), res_bf16.float().cpu(), rtol=1e-1, atol=1e-1
 )
