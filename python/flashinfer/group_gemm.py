@@ -184,7 +184,7 @@ class SegmentGEMMWrapper:
         if weight_indices is None:
             # create an empty CPU tensor as placeholder
             weight_indices = torch.empty(0, dtype=torch.int64)
-        return self._wrapper.forward(
+        return self._wrapper.run(
             seg_indptr,
             weight_indices,
             x,
