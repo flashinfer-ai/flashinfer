@@ -83,7 +83,7 @@ void bmm_fp8_internal_cublaslt(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* B, _
   matmul_desp.setAttribute(CUBLASLT_MATMUL_DESC_TRANSA, CUBLAS_OP_T);
   matmul_desp.setAttribute(CUBLASLT_MATMUL_DESC_TRANSB, CUBLAS_OP_N);
 
-  auto a_desp = CuBlasLtMatrixLayout(CUDA_R_8F_E4M3, k, m, k);
+  auto a_desp = CuBlasLtMatrixLayout(CUDA_R_8F_E4M3, m, k, k, true);
   auto b_desp = CuBlasLtMatrixLayout(CUDA_R_8F_E4M3, k, n, k);
   auto d_desp = CuBlasLtMatrixLayout(CUDA_R_16BF, m, n, m);
 
@@ -101,10 +101,10 @@ void bmm_fp8_internal_cublaslt(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* B, _
 
   const float alpha = 1.0f;
   const float beta = 0.0f;
-  cublasStatus_t status =
-      cublasLtMatmul(at::cuda::getCurrentCUDABlasLtHandle(), matmul_desp.descriptor(), &alpha, A,
-                     a_desp.descriptor(), B, b_desp.descriptor(), &beta, D, d_desp.descriptor(), D,
-                     d_desp.descriptor(), nullptr, nullptr, 0, at::cuda::getCurrentCUDAStream());
+  cublasStatus_t status = cublasLtMatmul(
+      at::cuda::getCurrentCUDABlasLtHandle(), matmul_desp.descriptor(), &alpha, A,
+      a_desp.descriptor(), B, b_desp.descriptor(), &beta, nullptr, d_desp.descriptor(), D,
+      d_desp.descriptor(), nullptr, nullptr, 0, at::cuda::getCurrentCUDAStream());
   TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, at::cuda::blas::_cublasGetErrorEnum(status));
 }
 
