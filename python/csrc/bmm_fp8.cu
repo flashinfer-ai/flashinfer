@@ -20,6 +20,7 @@
 #include <flashinfer/bmm_fp8.cuh>
 
 #include "flashinfer_ops.h"
+#include "pytorch_extension_utils.h"
 
 using namespace flashinfer;
 
@@ -34,9 +35,12 @@ void bmm_fp8(const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& D) {
   TORCH_CHECK(A.size(2) == B.size(1), "Incompatible matrix sizes");
   TORCH_CHECK(A.size(1) == D.size(1) && B.size(2) == D.size(2),
               "Result tensor has incorrect shape");
-  TORCH_CHECK(A.scalar_type() == torch::kFloat8_e4m3fn, "A must be Float8_e4m3fn");
-  TORCH_CHECK(B.scalar_type() == torch::kFloat8_e4m3fn, "B must be Float8_e4m3fn");
-  TORCH_CHECK(D.scalar_type() == torch::kBFloat16, "D must be BFloat16");
+  TORCH_CHECK(A.scalar_type() == torch::kFloat8_e4m3fn || A.scalar_type() == torch::kFloat8_e5m2,
+              "A must be Float8_e4m3fn or Float8_e5m2");
+  TORCH_CHECK(B.scalar_type() == torch::kFloat8_e4m3fn || B.scalar_type() == torch::kFloat8_e5m2,
+              "B must be Float8_e4m3fn or Float8_e5m2");
+  TORCH_CHECK(D.scalar_type() == torch::kBFloat16 || D.scalar_type() == torch::kHalf,
+              "D must be BFloat16 or Half");
 
   auto batch_size = A.size(0);
   auto m = A.size(1);
@@ -46,9 +50,14 @@ void bmm_fp8(const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& D) {
   // PyTorch is row major by default. cuBLASLt is column major by default.
   // We need row major D as expected.
   // A ^ T * B = D, so D ^ T = B ^ T * A
-  if (D.scalar_type() == at::ScalarType::BFloat16) {
-    flashinfer::bmm_fp8::bmm_fp8_internal_cublaslt(
-        static_cast<__nv_fp8_e4m3*>(B.data_ptr()), static_cast<__nv_fp8_e4m3*>(A.data_ptr()),
-        static_cast<__nv_bfloat16*>(D.data_ptr()), batch_size, n, m, k);
-  }
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+    return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(A.scalar_type(), a_type, [&] {
+      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(D.scalar_type(), d_type, [&] {
+        flashinfer::bmm_fp8::bmm_fp8_internal_cublaslt(
+            static_cast<b_type*>(B.data_ptr()), static_cast<a_type*>(A.data_ptr()),
+            static_cast<d_type*>(D.data_ptr()), batch_size, n, m, k);
+        return true;
+      });
+    });
+  });
 }

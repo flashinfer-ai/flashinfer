@@ -23,6 +23,7 @@
 #include <torch/extension.h>
 
 #include <stdexcept>
+#include <type_traits>
 
 namespace flashinfer {
 
@@ -92,17 +93,40 @@ class CuBlasLtMatmulPreference : public CuBlasLtDescriptor<cublasLtMatmulPrefere
   }
 };
 
-void bmm_fp8_internal_cublaslt(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* B, __nv_bfloat16* D,
-                               int batch_size, int m, int n, int k) {
+template <typename T>
+cudaDataType_t get_cuda_data_type() {
+  if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
+    return CUDA_R_8F_E4M3;
+  } else if constexpr (std::is_same_v<T, __nv_fp8_e5m2>) {
+    return CUDA_R_8F_E5M2;
+  } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+    return CUDA_R_16BF;
+  } else if constexpr (std::is_same_v<T, half>) {
+    return CUDA_R_16F;
+  } else {
+    throw std::runtime_error("Unsupported type");
+  }
+}
+
+template <typename AT, typename BT, typename DT>
+void bmm_fp8_internal_cublaslt(const AT* A, const BT* B, DT* D, int batch_size, int m, int n,
+                               int k) {
   auto matmul_desp = CuBlasLtMatmulDescriptor(CUBLAS_COMPUTE_32F, CUDA_R_32F);
   matmul_desp.setAttribute(CUBLASLT_MATMUL_DESC_TRANSA, CUBLAS_OP_T);
   matmul_desp.setAttribute(CUBLASLT_MATMUL_DESC_TRANSB, CUBLAS_OP_N);
   int8_t fast_accum = 1;
   matmul_desp.setAttribute(CUBLASLT_MATMUL_DESC_FAST_ACCUM, fast_accum);
 
-  auto a_desp = CuBlasLtMatrixLayout(CUDA_R_8F_E4M3, m, k, k, true);
-  auto b_desp = CuBlasLtMatrixLayout(CUDA_R_8F_E4M3, k, n, k);
-  auto d_desp = CuBlasLtMatrixLayout(CUDA_R_16BF, m, n, m);
+  cudaDataType_t a_type = get_cuda_data_type<AT>();
+  cudaDataType_t b_type = get_cuda_data_type<BT>();
+  cudaDataType_t d_type = get_cuda_data_type<DT>();
+  if (std::is_same_v<AT, __nv_fp8_e5m2> && std::is_same_v<BT, __nv_fp8_e5m2>) {
+    throw std::runtime_error("Unsupported combination: both A and B are e5m2");
+  }
+
+  auto a_desp = CuBlasLtMatrixLayout(a_type, m, k, k, true);
+  auto b_desp = CuBlasLtMatrixLayout(b_type, k, n, k);
+  auto d_desp = CuBlasLtMatrixLayout(d_type, m, n, m);
 
   if (batch_size > 1) {
     int64_t stride_a = m * k;
@@ -140,6 +164,33 @@ void bmm_fp8_internal_cublaslt(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* B, _
       workspace.mutable_get(), workspace_size, at::cuda::getCurrentCUDAStream());
   TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, at::cuda::blas::_cublasGetErrorEnum(status));
 }
+
+template void bmm_fp8_internal_cublaslt<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16>(
+    const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* B, __nv_bfloat16* D, int batch_size, int m, int n,
+    int k);
+
+template void bmm_fp8_internal_cublaslt<__nv_fp8_e4m3, __nv_fp8_e4m3, half>(const __nv_fp8_e4m3* A,
+                                                                            const __nv_fp8_e4m3* B,
+                                                                            half* D, int batch_size,
+                                                                            int m, int n, int k);
+
+template void bmm_fp8_internal_cublaslt<__nv_fp8_e4m3, __nv_fp8_e5m2, __nv_bfloat16>(
+    const __nv_fp8_e4m3* A, const __nv_fp8_e5m2* B, __nv_bfloat16* D, int batch_size, int m, int n,
+    int k);
+
+template void bmm_fp8_internal_cublaslt<__nv_fp8_e4m3, __nv_fp8_e5m2, half>(const __nv_fp8_e4m3* A,
+                                                                            const __nv_fp8_e5m2* B,
+                                                                            half* D, int batch_size,
+                                                                            int m, int n, int k);
+
+template void bmm_fp8_internal_cublaslt<__nv_fp8_e5m2, __nv_fp8_e4m3, __nv_bfloat16>(
+    const __nv_fp8_e5m2* A, const __nv_fp8_e4m3* B, __nv_bfloat16* D, int batch_size, int m, int n,
+    int k);
+
+template void bmm_fp8_internal_cublaslt<__nv_fp8_e5m2, __nv_fp8_e4m3, half>(const __nv_fp8_e5m2* A,
+                                                                            const __nv_fp8_e4m3* B,
+                                                                            half* D, int batch_size,
+                                                                            int m, int n, int k);
 
 }  // namespace bmm_fp8
 }  // namespace flashinfer
