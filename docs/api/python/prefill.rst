@@ -21,14 +21,12 @@ Batch Prefill/Append Attention
 
 .. autoclass:: BatchPrefillWithPagedKVCacheWrapper
     :members:
+    :exclude-members: begin_forward, end_forward, forward, forward_return_lse
 
     .. automethod:: __init__
-
-    :exclude-members: begin_forward, end_forward, forward, forward_return_lse
 
 .. autoclass:: BatchPrefillWithRaggedKVCacheWrapper
     :members:
-    
-    .. automethod:: __init__
-    
     :exclude-members: begin_forward, end_forward, forward, forward_return_lse
+
+    .. automethod:: __init__

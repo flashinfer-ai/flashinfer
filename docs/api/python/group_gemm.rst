@@ -9,5 +9,6 @@ This module provides a set of functions to group GEMM operations.
 
 .. autoclass:: SegmentGEMMWrapper
     :members:
+    :exclude-members: forward
 
     .. automethod:: __init__
