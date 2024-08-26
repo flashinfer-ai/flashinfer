@@ -14,16 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import torch
 from typing import Optional
+
+import torch
+
 from .utils import get_indptr
 
 # mypy: disable-error-code="attr-defined"
 try:
     from . import _kernels
 except ImportError as e:
-    import os
     import logging
+    import os
 
     if os.environ.get("BUILD_DOC", "0") == "1":
         _kernels = None
@@ -194,3 +196,32 @@ class SegmentGEMMWrapper:
         )
 
     forward = run
+
+
+def bmm_fp8(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    D: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+):
+    r"""BMM FP8
+
+    Parameters
+    ----------
+    A: torch.Tensor
+        Input tensor, shape (b, m, k).
+
+    B: torch.Tensor
+        Mat2 tensor, shape (b, k, n), should be column major.
+
+    D: torch.Tensor
+        Out tensor, shape (b, m, n).
+
+    A_scale: torch.Tensor
+        Scale tensor for A.
+
+    B_scale: torch.Tensor
+        Scale tensor for B.
+    """
+    _kernels.bmm_fp8(A, B, D, A_scale, B_scale)
