@@ -37,4 +37,23 @@ def bmm_fp8(
     A_scale: torch.Tensor,
     B_scale: torch.Tensor,
 ):
+    r"""BMM FP8
+
+    Parameters
+    ----------
+    A: torch.Tensor
+        Input tensor, shape (b, m, k).
+
+    B: torch.Tensor
+        Mat2 tensor, shape (b, k, n), should be column major.
+
+    D: torch.Tensor
+        Out tensor, shape (b, m, n).
+
+    A_scale: torch.Tensor
+        Scale tensor for A.
+
+    B_scale: torch.Tensor
+        Scale tensor for B.
+    """
     _kernels.bmm_fp8(A, B, D, A_scale, B_scale)
