@@ -81,7 +81,6 @@ def test_batch_prefill_with_paged_kv_cache_fp8_calibration_scale(
         q_data_type=torch.float16,
     )
     o_fp16 = wrapper.run(q, kv_data)
-
     k_data, v_data = torch.chunk(kv_data, 2, dim=1)
     k_scale = k_data.amax().item() / 256
     v_scale = v_data.amax().item() / 256

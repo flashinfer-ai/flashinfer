@@ -242,6 +242,7 @@ def test_batch_paged_prefill_sliding_window(
         head_dim,
         page_size,
         window_left=window_left,
+        causal=True,
     )
     o = wrapper.run(
         q,
