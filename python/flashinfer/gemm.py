@@ -14,16 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import torch
 from typing import Optional
+
+import torch
+
 from .utils import get_indptr
 
 # mypy: disable-error-code="attr-defined"
 try:
     from . import _kernels
 except ImportError as e:
-    import os
     import logging
+    import os
 
     if os.environ.get("BUILD_DOC", "0") == "1":
         _kernels = None
@@ -194,3 +196,48 @@ class SegmentGEMMWrapper:
         )
 
     forward = run
+
+
+def bmm_fp8(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    dtype: torch.dtype,
+    out: torch.Tensor = None,
+) -> torch.Tensor:
+    r"""BMM FP8
+
+    Parameters
+    ----------
+    A: torch.Tensor
+        Input tensor, shape (b, m, k), fp8 e4m3 or fp8 e5m2.
+
+    B: torch.Tensor
+        Mat2 tensor, shape (b, k, n), should be column major, fp8 e4m3 or fp8 e5m2.
+
+    A_scale: torch.Tensor
+        Scale tensor for A, float.
+
+    B_scale: torch.Tensor
+        Scale tensor for B, float.
+
+    dtype: torch.dtype
+        out dtype, bf16 or fp16.
+
+    out: torch.Tensor
+        Out tensor, shape (b, m, n), bf16 or fp16.
+
+    Returns
+    -------
+    out: torch.Tensor
+        Out tensor, shape (b, m, n), bf16 or fp16.
+    """
+    if out is None:
+        out = torch.empty(
+            (A.shape[0], A.shape[1], B.shape[2]),
+            device=A.device,
+            dtype=dtype,
+        )
+    _kernels.bmm_fp8(A, B, out, A_scale, B_scale)
+    return out

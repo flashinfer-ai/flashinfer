@@ -344,6 +344,7 @@ if __name__ == "__main__":
                 "csrc/rope.cu",
                 "csrc/group_gemm.cu",
                 "csrc/quantization.cu",
+                "csrc/bmm_fp8.cu",
             ],
             include_dirs=include_dirs,
             extra_compile_args=extra_compile_args,

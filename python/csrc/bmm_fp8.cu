@@ -1,0 +1,68 @@
+/*
+ * Copyright (c) 2024 by FlashInfer team.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <ATen/cuda/CUDAContext.h>
+#include <torch/extension.h>
+
+#include <flashinfer/bmm_fp8.cuh>
+
+#include "flashinfer_ops.h"
+#include "pytorch_extension_utils.h"
+
+using namespace flashinfer;
+
+void bmm_fp8(const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& D,
+             torch::Tensor& A_scale, torch::Tensor& B_scale) {
+  TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");
+  TORCH_CHECK(B.is_cuda(), "B must be a CUDA tensor");
+  TORCH_CHECK(D.is_cuda(), "D must be a CUDA tensor");
+  TORCH_CHECK(A.dim() == 3, "Expected 3D tensor for A");
+  TORCH_CHECK(B.dim() == 3, "Expected 3D tensor for B");
+  TORCH_CHECK(D.dim() == 3, "Expected 3D tensor for D");
+  TORCH_CHECK(A.size(0) == B.size(0) && A.size(0) == D.size(0), "Batch sizes must match");
+  TORCH_CHECK(A.size(2) == B.size(1), "Incompatible matrix sizes");
+  TORCH_CHECK(A.size(1) == D.size(1) && B.size(2) == D.size(2),
+              "Result tensor has incorrect shape");
+  TORCH_CHECK(A.scalar_type() == torch::kFloat8_e4m3fn || A.scalar_type() == torch::kFloat8_e5m2,
+              "A must be Float8_e4m3fn or Float8_e5m2");
+  TORCH_CHECK(B.scalar_type() == torch::kFloat8_e4m3fn || B.scalar_type() == torch::kFloat8_e5m2,
+              "B must be Float8_e4m3fn or Float8_e5m2");
+  TORCH_CHECK(D.scalar_type() == torch::kBFloat16 || D.scalar_type() == torch::kHalf,
+              "D must be BFloat16 or Half");
+
+  TORCH_CHECK(A_scale.scalar_type() == torch::kFloat32 && B_scale.scalar_type() == torch::kFloat32,
+              "A_scale and B_scale must be Float32");
+
+  auto batch_size = A.size(0);
+  auto m = A.size(1);
+  auto k = A.size(2);
+  auto n = B.size(2);
+
+  // PyTorch is row major by default. cuBLASLt is column major by default.
+  // We need row major D as expected.
+  // A ^ T * B = D, so D ^ T = B ^ T * A
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
+    return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(A.scalar_type(), a_type, [&] {
+      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(D.scalar_type(), d_type, [&] {
+        flashinfer::bmm_fp8::bmm_fp8_internal_cublaslt(
+            static_cast<b_type*>(B.data_ptr()), static_cast<a_type*>(A.data_ptr()),
+            static_cast<d_type*>(D.data_ptr()), batch_size, n, m, k,
+            static_cast<float*>(B_scale.data_ptr()), static_cast<float*>(A_scale.data_ptr()));
+        return true;
+      });
+    });
+  });
+}
