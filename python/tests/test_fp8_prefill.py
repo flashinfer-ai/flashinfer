@@ -69,7 +69,7 @@ def test_batch_prefill_with_paged_kv_cache_fp8_calibration_scale(
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout
     )
-    wrapper.begin_forward(
+    wrapper.plan(
         qo_indptr,
         kv_indptr,
         kv_indices,
@@ -80,9 +80,7 @@ def test_batch_prefill_with_paged_kv_cache_fp8_calibration_scale(
         page_size,
         q_data_type=torch.float16,
     )
-    o_fp16 = wrapper.forward(q, kv_data)
-    wrapper.end_forward()
-
+    o_fp16 = wrapper.run(q, kv_data)
     k_data, v_data = torch.chunk(kv_data, 2, dim=1)
     k_scale = k_data.amax().item() / 256
     v_scale = v_data.amax().item() / 256
@@ -91,7 +89,7 @@ def test_batch_prefill_with_paged_kv_cache_fp8_calibration_scale(
     v_fp8 = (v_data / v_scale).to(dtype)
     kv_data_fp8 = torch.cat([k_fp8, v_fp8], dim=1)
 
-    wrapper.begin_forward(
+    wrapper.plan(
         qo_indptr,
         kv_indptr,
         kv_indices,
@@ -102,7 +100,7 @@ def test_batch_prefill_with_paged_kv_cache_fp8_calibration_scale(
         page_size,
         q_data_type=torch.float16,
     )
-    o_fp8 = wrapper.forward(
+    o_fp8 = wrapper.run(
         q,
         kv_data_fp8.to(dtype),
         k_scale=k_scale,
@@ -158,7 +156,7 @@ def test_batch_decode_with_prefill_with_paged_kv_cache(
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout
     )
-    wrapper.begin_forward(
+    wrapper.plan(
         qo_indptr,
         kv_indptr,
         kv_indices,
@@ -169,15 +167,12 @@ def test_batch_decode_with_prefill_with_paged_kv_cache(
         page_size,
         q_data_type=torch.float16,
     )
-    o_fp8 = wrapper.forward(
-        q,
-        kv_data,
-    )
+    o_fp8 = wrapper.run(q, kv_data)
 
     decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout
     )
-    decode_wrapper.begin_forward(
+    decode_wrapper.plan(
         kv_indptr,
         kv_indices,
         kv_last_page_len,
@@ -185,14 +180,10 @@ def test_batch_decode_with_prefill_with_paged_kv_cache(
         num_kv_heads,
         head_dim,
         page_size,
-        "NONE",
         data_type=dtype,
         q_data_type=torch.float16,
     )
-    o_decode_fp8 = decode_wrapper.forward(
-        q,
-        kv_data,
-    )
+    o_decode_fp8 = decode_wrapper.run(q, kv_data)
 
     np.testing.assert_allclose(
         o_decode_fp8.cpu().numpy(), o_fp8.cpu().numpy(), atol=1e-2, rtol=1e-2

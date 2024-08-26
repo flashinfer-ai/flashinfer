@@ -117,7 +117,7 @@ def test_batch_decode_with_paged_kv_cache_fp8_calibration_scale(
 
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
     wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, kv_layout)
-    wrapper.begin_forward(
+    wrapper.plan(
         kv_indptr,
         kv_indices,
         kv_last_page_len,
@@ -125,12 +125,11 @@ def test_batch_decode_with_paged_kv_cache_fp8_calibration_scale(
         num_kv_heads,
         head_dim,
         page_size,
-        "NONE",
+        pos_encoding_mode=pos_encoding_mode,
         data_type=torch.float16,
         q_data_type=torch.float16,
     )
-    o_fp16 = wrapper.forward(q, kv_data, pos_encoding_mode=pos_encoding_mode)
-    wrapper.end_forward()
+    o_fp16 = wrapper.run(q, kv_data)
 
     k_data, v_data = torch.chunk(kv_data, 2, dim=1)
     k_scale = k_data.amax().item() / 256
@@ -140,7 +139,7 @@ def test_batch_decode_with_paged_kv_cache_fp8_calibration_scale(
     v_fp8 = (v_data / v_scale).to(dtype)
     kv_data_fp8 = torch.cat([k_fp8, v_fp8], dim=1)
 
-    wrapper.begin_forward(
+    wrapper.plan(
         kv_indptr,
         kv_indices,
         kv_last_page_len,
@@ -148,17 +147,11 @@ def test_batch_decode_with_paged_kv_cache_fp8_calibration_scale(
         num_kv_heads,
         head_dim,
         page_size,
-        "NONE",
+        pos_encoding_mode=pos_encoding_mode,
         data_type=dtype,
         q_data_type=torch.float16,
     )
-    o_fp8 = wrapper.forward(
-        q,
-        kv_data_fp8.to(dtype),
-        pos_encoding_mode=pos_encoding_mode,
-        k_scale=k_scale,
-        v_scale=v_scale,
-    )
+    o_fp8 = wrapper.run(q, kv_data_fp8.to(dtype), k_scale=k_scale, v_scale=v_scale)
 
     np.testing.assert_allclose(
         o_fp16.cpu().numpy(), o_fp8.cpu().numpy(), atol=1e-2, rtol=2e-1

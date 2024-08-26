@@ -75,7 +75,7 @@ def test_batch_prefill_with_paged_kv_cache(
         wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer, kv_layout
         )
-        wrapper.begin_forward(
+        wrapper.plan(
             q_indptr_gpu,
             kv_indptr_gpu,
             kv_indices_gpu,
@@ -84,23 +84,14 @@ def test_batch_prefill_with_paged_kv_cache(
             num_kv_heads,
             head_dim,
             page_size,
+            causal=causal,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=logits_soft_cap,
         )
         if return_lse:
-            o, _ = wrapper.forward_return_lse(
-                q,
-                kv_data,
-                causal=causal,
-                pos_encoding_mode=pos_encoding_mode,
-                logits_soft_cap=logits_soft_cap,
-            )
+            o, _ = wrapper.run_return_lse(q, kv_data)
         else:
-            o = wrapper.forward(
-                q,
-                kv_data,
-                causal=causal,
-                pos_encoding_mode=pos_encoding_mode,
-                logits_soft_cap=logits_soft_cap,
-            )
+            o = wrapper.run(q, kv_data)
     else:
         q_indptr_buffer = torch.empty(batch_size + 1).int().to(0)
         kv_indptr_buffer = torch.empty(batch_size + 1).int().to(0)
@@ -121,7 +112,7 @@ def test_batch_prefill_with_paged_kv_cache(
         kv_last_page_len_warmup = torch.full(
             (batch_size,), page_size, dtype=torch.int32
         )
-        wrapper.begin_forward(
+        wrapper.plan(
             q_indptr_warmup,
             kv_indptr_warmup,
             kv_indices_warmup,
@@ -130,6 +121,9 @@ def test_batch_prefill_with_paged_kv_cache(
             num_kv_heads,
             head_dim,
             page_size,
+            causal=causal,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=logits_soft_cap,
         )
 
         # warmup
@@ -138,44 +132,19 @@ def test_batch_prefill_with_paged_kv_cache(
         with torch.cuda.stream(s):
             for _ in range(3):
                 if return_lse:
-                    o, _ = wrapper.forward_return_lse(
-                        q,
-                        kv_data,
-                        causal=causal,
-                        pos_encoding_mode=pos_encoding_mode,
-                        logits_soft_cap=logits_soft_cap,
-                    )
+                    o, _ = wrapper.run_return_lse(q, kv_data)
                 else:
-                    o = wrapper.forward(
-                        q,
-                        kv_data,
-                        causal=causal,
-                        pos_encoding_mode=pos_encoding_mode,
-                        logits_soft_cap=logits_soft_cap,
-                    )
+                    o = wrapper.run(q, kv_data)
         torch.cuda.current_stream().wait_stream(s)
         # capture
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             if return_lse:
-                o, _ = wrapper.forward_return_lse(
-                    q,
-                    kv_data,
-                    causal=causal,
-                    pos_encoding_mode=pos_encoding_mode,
-                    logits_soft_cap=logits_soft_cap,
-                )
+                o, _ = wrapper.run_return_lse(q, kv_data)
             else:
-                o = wrapper.forward(
-                    q,
-                    kv_data,
-                    causal=causal,
-                    pos_encoding_mode=pos_encoding_mode,
-                    logits_soft_cap=logits_soft_cap,
-                )
-        wrapper.end_forward()
+                o = wrapper.run(q, kv_data)
 
-        wrapper.begin_forward(
+        wrapper.plan(
             q_indptr_cpu,
             kv_indptr_cpu,
             kv_indices_cpu,
@@ -184,6 +153,9 @@ def test_batch_prefill_with_paged_kv_cache(
             num_kv_heads,
             head_dim,
             page_size,
+            causal=causal,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=logits_soft_cap,
         )
 
         g.replay()
@@ -296,7 +268,7 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
         wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer, kv_layout
         )
-        wrapper.begin_forward(
+        wrapper.plan(
             q_indptr_gpu,
             kv_indptr_gpu,
             kv_indices_gpu,
@@ -305,23 +277,14 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
             num_kv_heads,
             head_dim,
             page_size,
+            causal=causal,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=logits_soft_cap,
         )
         if return_lse:
-            o, _ = wrapper.forward_return_lse(
-                q,
-                kv_data,
-                causal=causal,
-                pos_encoding_mode=pos_encoding_mode,
-                logits_soft_cap=logits_soft_cap,
-            )
+            o, _ = wrapper.run_return_lse(q, kv_data)
         else:
-            o = wrapper.forward(
-                q,
-                kv_data,
-                causal=causal,
-                pos_encoding_mode=pos_encoding_mode,
-                logits_soft_cap=logits_soft_cap,
-            )
+            o = wrapper.run(q, kv_data)
     else:
         q_indptr_buffer = torch.empty(batch_size + 1).int().to(0)
         kv_indptr_buffer = torch.empty(batch_size + 1).int().to(0)
@@ -342,7 +305,7 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
         kv_last_page_len_warmup = torch.full(
             (batch_size,), page_size, dtype=torch.int32
         )
-        wrapper.begin_forward(
+        wrapper.plan(
             q_indptr_warmup,
             kv_indptr_warmup,
             kv_indices_warmup,
@@ -351,6 +314,9 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
             num_kv_heads,
             head_dim,
             page_size,
+            causal=causal,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=logits_soft_cap,
         )
 
         # warmup
@@ -359,44 +325,19 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
         with torch.cuda.stream(s):
             for _ in range(3):
                 if return_lse:
-                    o, _ = wrapper.forward_return_lse(
-                        q,
-                        kv_data,
-                        causal=causal,
-                        pos_encoding_mode=pos_encoding_mode,
-                        logits_soft_cap=logits_soft_cap,
-                    )
+                    o, _ = wrapper.run_return_lse(q, kv_data)
                 else:
-                    o = wrapper.forward(
-                        q,
-                        kv_data,
-                        causal=causal,
-                        pos_encoding_mode=pos_encoding_mode,
-                        logits_soft_cap=logits_soft_cap,
-                    )
+                    o = wrapper.run(q, kv_data)
         torch.cuda.current_stream().wait_stream(s)
         # capture
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             if return_lse:
-                o, _ = wrapper.forward_return_lse(
-                    q,
-                    kv_data,
-                    causal=causal,
-                    pos_encoding_mode=pos_encoding_mode,
-                    logits_soft_cap=logits_soft_cap,
-                )
+                o, _ = wrapper.run_return_lse(q, kv_data)
             else:
-                o = wrapper.forward(
-                    q,
-                    kv_data,
-                    causal=causal,
-                    pos_encoding_mode=pos_encoding_mode,
-                    logits_soft_cap=logits_soft_cap,
-                )
-        wrapper.end_forward()
+                o = wrapper.run(q, kv_data)
 
-        wrapper.begin_forward(
+        wrapper.plan(
             q_indptr_cpu,
             kv_indptr_cpu,
             kv_indices_cpu,
@@ -405,6 +346,9 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
             num_kv_heads,
             head_dim,
             page_size,
+            causal=causal,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=logits_soft_cap,
         )
 
         g.replay()
@@ -512,7 +456,7 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
     )
 
     # use custom mask
-    wrapper.begin_forward(
+    wrapper.plan(
         q_indptr,
         kv_indptr,
         kv_indices,
@@ -522,25 +466,16 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
         head_dim,
         page_size,
         custom_mask,
+        pos_encoding_mode=pos_encoding_mode,
+        logits_soft_cap=logits_soft_cap,
     )
     if return_lse:
-        o_custom, _ = wrapper.forward_return_lse(
-            q,
-            kv_data,
-            pos_encoding_mode=pos_encoding_mode,
-            logits_soft_cap=logits_soft_cap,
-        )
+        o_custom, _ = wrapper.run_return_lse(q, kv_data)
     else:
-        o_custom = wrapper.forward(
-            q,
-            kv_data,
-            pos_encoding_mode=pos_encoding_mode,
-            logits_soft_cap=logits_soft_cap,
-        )
-    wrapper.end_forward()
+        o_custom = wrapper.run(q, kv_data)
 
     # use causal
-    wrapper.begin_forward(
+    wrapper.plan(
         q_indptr,
         kv_indptr,
         kv_indices,
@@ -549,23 +484,14 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
         num_kv_heads,
         head_dim,
         page_size,
+        causal=True,
+        pos_encoding_mode=pos_encoding_mode,
+        logits_soft_cap=logits_soft_cap,
     )
     if return_lse:
-        o_causal, _ = wrapper.forward_return_lse(
-            q,
-            kv_data,
-            causal=True,
-            pos_encoding_mode=pos_encoding_mode,
-            logits_soft_cap=logits_soft_cap,
-        )
+        o_causal, _ = wrapper.run_return_lse(q, kv_data)
     else:
-        o_causal = wrapper.forward(
-            q,
-            kv_data,
-            causal=True,
-            pos_encoding_mode=pos_encoding_mode,
-            logits_soft_cap=logits_soft_cap,
-        )
+        o_causal = wrapper.run(q, kv_data)
     numpy.testing.assert_allclose(
         o_custom.cpu().numpy(), o_causal.cpu().numpy(), rtol=1e-3, atol=1e-3
     )
@@ -605,31 +531,20 @@ def test_batch_prefill_with_ragged_kv_cache(
     wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
         workspace_buffer, kv_layout
     )
-    wrapper.begin_forward(
+    wrapper.plan(
         q_indptr,
         kv_indptr,
         num_qo_heads,
         num_kv_heads,
         head_dim,
+        causal=causal,
+        pos_encoding_mode=pos_encoding_mode,
+        logits_soft_cap=logits_soft_cap,
     )
     if return_lse:
-        o, _ = wrapper.forward_return_lse(
-            q,
-            k,
-            v,
-            causal=causal,
-            pos_encoding_mode=pos_encoding_mode,
-            logits_soft_cap=logits_soft_cap,
-        )
+        o, _ = wrapper.run_return_lse(q, k, v)
     else:
-        o = wrapper.forward(
-            q,
-            k,
-            v,
-            causal=causal,
-            pos_encoding_mode=pos_encoding_mode,
-            logits_soft_cap=logits_soft_cap,
-        )
+        o = wrapper.run(q, k, v)
 
     for i in range(batch_size):
         o_ref_i = flashinfer.single_prefill_with_kv_cache(
@@ -688,52 +603,36 @@ def test_batch_prefill_with_ragged_kv_cache_custom_mask(
     )
 
     # use custom mask
-    wrapper.begin_forward(
+    wrapper.plan(
         q_indptr,
         kv_indptr,
         num_qo_heads,
         num_kv_heads,
         head_dim,
         custom_mask=custom_mask,
+        pos_encoding_mode=pos_encoding_mode,
+        logits_soft_cap=logits_soft_cap,
     )
     if return_lse:
-        o_custom, _ = wrapper.forward_return_lse(
-            q,
-            k,
-            v,
-            pos_encoding_mode=pos_encoding_mode,
-            logits_soft_cap=logits_soft_cap,
-        )
+        o_custom, _ = wrapper.run_return_lse(q, k, v)
     else:
-        o_custom = wrapper.forward(
-            q,
-            k,
-            v,
-            pos_encoding_mode=pos_encoding_mode,
-            logits_soft_cap=logits_soft_cap,
-        )
-    wrapper.end_forward()
+        o_custom = wrapper.run(q, k, v)
 
     # use causal
-    wrapper.begin_forward(q_indptr, kv_indptr, num_qo_heads, num_kv_heads, head_dim)
+    wrapper.plan(
+        q_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        causal=True,
+        pos_encoding_mode=pos_encoding_mode,
+        logits_soft_cap=logits_soft_cap,
+    )
     if return_lse:
-        o_causal, _ = wrapper.forward_return_lse(
-            q,
-            k,
-            v,
-            causal=True,
-            pos_encoding_mode=pos_encoding_mode,
-            logits_soft_cap=logits_soft_cap,
-        )
+        o_causal, _ = wrapper.run_return_lse(q, k, v)
     else:
-        o_causal = wrapper.forward(
-            q,
-            k,
-            v,
-            causal=True,
-            pos_encoding_mode=pos_encoding_mode,
-            logits_soft_cap=logits_soft_cap,
-        )
+        o_causal = wrapper.run(q, k, v)
     numpy.testing.assert_allclose(
         o_custom.cpu().numpy(), o_causal.cpu().numpy(), rtol=1e-3, atol=1e-3
     )

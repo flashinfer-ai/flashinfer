@@ -65,7 +65,7 @@ def test_batch_decode_with_paged_kv_cache(
 
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
     wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, kv_layout)
-    wrapper.begin_forward(
+    wrapper.plan(
         kv_indptr,
         kv_indices,
         kv_last_page_len,
@@ -73,25 +73,15 @@ def test_batch_decode_with_paged_kv_cache(
         num_kv_heads,
         head_dim,
         page_size,
-        "NONE",
         logits_soft_cap=logits_soft_cap,
+        pos_encoding_mode=pos_encoding_mode,
         data_type=kv_dtype,
         q_data_type=q_dtype,
     )
     if return_lse:
-        o, _ = wrapper.forward_return_lse(
-            q,
-            kv_data.to(kv_dtype),
-            pos_encoding_mode=pos_encoding_mode,
-            logits_soft_cap=logits_soft_cap,
-        )
+        o, _ = wrapper.run_return_lse(q, kv_data.to(kv_dtype))
     else:
-        o = wrapper.forward(
-            q,
-            kv_data.to(kv_dtype),
-            pos_encoding_mode=pos_encoding_mode,
-            logits_soft_cap=logits_soft_cap,
-        )
+        o = wrapper.run(q, kv_data.to(kv_dtype))
 
     for i in range(batch_size):
         perm_dims = [0, 2, 1, 3] if kv_layout == "HND" else [0, 1, 2, 3]
@@ -186,7 +176,7 @@ def test_batch_decode_with_tuple_paged_kv_cache(
 
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
     wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, kv_layout)
-    wrapper.begin_forward(
+    wrapper.plan(
         kv_indptr,
         kv_indices,
         kv_last_page_len,
@@ -194,25 +184,15 @@ def test_batch_decode_with_tuple_paged_kv_cache(
         num_kv_heads,
         head_dim,
         page_size,
-        "NONE",
         logits_soft_cap=logits_soft_cap,
+        pos_encoding_mode=pos_encoding_mode,
         data_type=kv_dtype,
         q_data_type=q_dtype,
     )
     if return_lse:
-        o, _ = wrapper.forward_return_lse(
-            q,
-            tuple(map(lambda _: _.to(kv_dtype), kv_data)),
-            pos_encoding_mode=pos_encoding_mode,
-            logits_soft_cap=logits_soft_cap,
-        )
+        o, _ = wrapper.run_return_lse(q, tuple(map(lambda _: _.to(kv_dtype), kv_data)))
     else:
-        o = wrapper.forward(
-            q,
-            tuple(map(lambda _: _.to(kv_dtype), kv_data)),
-            pos_encoding_mode=pos_encoding_mode,
-            logits_soft_cap=logits_soft_cap,
-        )
+        o = wrapper.run(q, tuple(map(lambda _: _.to(kv_dtype), kv_data)))
 
     k_cache, v_cache = kv_data
     for i in range(batch_size):
@@ -313,7 +293,7 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
         kv_last_page_device_buffer,
         kv_layout,
     )
-    wrapper.begin_forward(
+    wrapper.plan(
         kv_indptr_host_warmup,
         kv_indices_host_warmup,
         kv_last_page_len_host_warmup,
@@ -321,8 +301,8 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
         num_kv_heads,
         head_dim,
         page_size,
-        "NONE",
         data_type=kv_dtype,
+        pos_encoding_mode=pos_encoding_mode,
         q_data_type=q_dtype,
     )
     # warmup
@@ -330,14 +310,13 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         for _ in range(3):
-            o = wrapper.forward(q, kv_data_dtype, pos_encoding_mode=pos_encoding_mode)
+            o = wrapper.run(q, kv_data_dtype)
     torch.cuda.current_stream().wait_stream(s)
 
     # capture
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        o = wrapper.forward(q, kv_data_dtype, pos_encoding_mode=pos_encoding_mode)
-    wrapper.end_forward()
+        o = wrapper.run(q, kv_data_dtype)
 
     # replay multiple times
     for i in range(1, min(4, num_pages_per_seq)):
@@ -345,7 +324,7 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
         kv_indices_host = torch.arange(0, i * batch_size).int()
         kv_last_page_len_host = torch.full((batch_size,), page_size, dtype=torch.int32)
 
-        wrapper.begin_forward(
+        wrapper.plan(
             kv_indptr_host,
             kv_indices_host,
             kv_last_page_len_host,
@@ -353,8 +332,8 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
             num_kv_heads,
             head_dim,
             page_size,
-            "NONE",
             data_type=kv_dtype,
+            pos_encoding_mode=pos_encoding_mode,
             q_data_type=q_dtype,
         )
         g.replay()
@@ -366,7 +345,7 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
         (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
     )
 
-    wrapper.begin_forward(
+    wrapper.plan(
         kv_indptr_host,
         kv_indices_host,
         kv_last_page_len_host,
@@ -374,8 +353,8 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
         num_kv_heads,
         head_dim,
         page_size,
-        "NONE",
         data_type=kv_dtype,
+        pos_encoding_mode=pos_encoding_mode,
         q_data_type=q_dtype,
     )
     g.replay()

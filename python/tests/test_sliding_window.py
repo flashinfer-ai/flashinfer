@@ -84,7 +84,7 @@ def test_batch_decode_sliding_window(
 
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
     wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, "NHD")
-    wrapper.begin_forward(
+    wrapper.plan(
         kv_indptr,
         kv_indices,
         kv_last_page_len,
@@ -92,13 +92,9 @@ def test_batch_decode_sliding_window(
         num_kv_heads,
         head_dim,
         page_size,
-        "NONE",
-    )
-    o = wrapper.forward(
-        q,
-        (k_data, v_data),
         window_left=window_left,
     )
+    o = wrapper.run(q, (k_data, v_data))
 
     for i in range(batch_size):
         qi = q[i]
@@ -236,7 +232,7 @@ def test_batch_paged_prefill_sliding_window(
 
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(workspace_buffer, "NHD")
-    wrapper.begin_forward(
+    wrapper.plan(
         q_indptr,
         kv_indptr,
         kv_indices,
@@ -245,11 +241,12 @@ def test_batch_paged_prefill_sliding_window(
         num_kv_heads,
         head_dim,
         page_size,
+        window_left=window_left,
+        causal=True,
     )
-    o = wrapper.forward(
+    o = wrapper.run(
         q,
         (k_data, v_data),
-        window_left=window_left,
     )
 
     for i in range(batch_size):
@@ -319,19 +316,15 @@ def test_batch_ragged_prefill_sliding_window(
     kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
     wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(workspace_buffer, "NHD")
-    wrapper.begin_forward(
+    wrapper.plan(
         q_indptr,
         kv_indptr,
         num_qo_heads,
         num_kv_heads,
         head_dim,
-    )
-    o = wrapper.forward(
-        q,
-        k,
-        v,
         window_left=window_left,
     )
+    o = wrapper.run(q, k, v)
 
     for i in range(batch_size):
         qi = q[q_indptr[i] : q_indptr[i + 1]]
