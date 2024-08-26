@@ -121,6 +121,7 @@ def test_batch_decode_tensor_cores(
         num_kv_heads,
         head_dim,
         page_size,
+        pos_encoding_mode=pos_encoding_mode,
         data_type=torch.float16,
         q_data_type=torch.float16,
     )
