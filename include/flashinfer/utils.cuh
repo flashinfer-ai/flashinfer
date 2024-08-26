@@ -15,6 +15,7 @@
  */
 #ifndef FLASHINFER_UTILS_CUH_
 #define FLASHINFER_UTILS_CUH_
+#include <cuda_device_runtime_api.h>
 #include <cuda_runtime.h>
 
 #include <iostream>
@@ -233,6 +234,15 @@ namespace flashinfer {
 template <typename T1, typename T2>
 __forceinline__ __device__ __host__ T1 ceil_div(const T1 x, const T2 y) {
   return (x + y - 1) / y;
+}
+
+inline std::pair<int, int> GetCudaComputeCapability() {
+  int device_id = 0;
+  cudaGetDevice(&device_id);
+  int major = 0, minor = 0;
+  cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id);
+  cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id);
+  return std::make_pair(major, minor);
 }
 
 template <typename T>

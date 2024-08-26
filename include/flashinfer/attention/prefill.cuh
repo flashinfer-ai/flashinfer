@@ -1934,16 +1934,18 @@ cudaError_t SinglePrefillWithKVCacheDispatched(
   if (unpacked_qo_len > 64 && HEAD_DIM < 256) {
     warp_layout = WarpLayout::k4x1x2;
   } else {
-#if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 800))
-    if (unpacked_qo_len > 16) {
-      warp_layout = WarpLayout::k4x1x1;
+    auto compute_capacity = GetCudaComputeCapability();
+    if (compute_capacity.first >= 8) {
+      // Ampere or newer
+      if (unpacked_qo_len > 16) {
+        warp_layout = WarpLayout::k4x1x1;
+      } else {
+        warp_layout = WarpLayout::k1x4x1;
+      }
     } else {
-      warp_layout = WarpLayout::k1x4x1;
+      // NOTE(Zihao): not enough shared memory on Turing for 1x4x1 layout
+      warp_layout = WarpLayout::k4x1x1;
     }
-#else
-    // NOTE(Zihao): not enough shared memory for 1x4x1 layout
-    warp_layout = WarpLayout::k4x1x1;
-#endif
   }
 
   DISPATCH_WARP_LAYOUT(warp_layout, WARP_LAYOUT, {
