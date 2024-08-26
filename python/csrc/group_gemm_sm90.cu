@@ -13,13 +13,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <flashinfer/gemm/group_gemm.cuh>
+#include <flashinfer/gemm/group_gemm_sm90.cuh>
 
 #include "pytorch_extension_utils.h"
 
 using namespace flashinfer::group_gemm;
 
-torch::Tensor CutlassSegmentGEMM(torch::Tensor workspace_buffer, torch::Tensor seg_indptr,
+torch::Tensor CutlassSegmentGEMMSM90(torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer, torch::Tensor seg_indptr,
                                  torch::Tensor weight_indices, torch::Tensor x,
                                  torch::Tensor weight, unsigned int batch_size,
                                  bool weight_column_major) {
@@ -51,8 +51,9 @@ torch::Tensor CutlassSegmentGEMM(torch::Tensor workspace_buffer, torch::Tensor s
   // TODO(Zihao): add fp8 support
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(x.scalar_type(), c_type, [&] {
     using cutlass_t = typename cutlass_dtype<c_type>::type;
-    auto status = CutlassSegmentGEMMRun<cutlass_t>(
-        workspace_buffer.data_ptr(), workspace_buffer.element_size() * workspace_buffer.size(0),
+    auto status = CutlassSegmentGEMMSM90Run<cutlass_t>(
+        float_workspace_buffer.data_ptr(), float_workspace_buffer.element_size() * float_workspace_buffer.size(0),
+        int_workspace_buffer.data_ptr(), int_workspace_buffer.element_size() * int_workspace_buffer.size(0),
         static_cast<cutlass_t*>(x.data_ptr()), static_cast<cutlass_t*>(weight.data_ptr()),
         static_cast<cutlass_t*>(y.data_ptr()), static_cast<int64_t*>(seg_indptr.data_ptr()),
         weight_indices_defined ? static_cast<int64_t*>(weight_indices.data_ptr()) : nullptr,

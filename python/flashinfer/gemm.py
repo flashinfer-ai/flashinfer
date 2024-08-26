@@ -53,7 +53,7 @@ class SegmentGEMMWrapper:
     >>> import torch
     >>> from flashinfer import SegmentGEMMWrapper
     >>> # create a 1MB workspace buffer
-    >>> workspace_buffer = torch.empty(1 * 1024 * 1024, dtype=torch.int8, device="cuda")
+    >>> workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda")
     >>> segment_gemm = SegmentGEMMWrapper(workspace_buffer)
     >>> seq_lens = torch.tensor([1, 2, 3, 4], dtype=torch.int64, device="cuda")
     >>> # create packed input tensor (10 = 1 + 2 + 3 + 4)
@@ -96,27 +96,34 @@ class SegmentGEMMWrapper:
     True
     """
 
-    def __init__(self, workspace_buffer: torch.Tensor) -> None:
+    def __init__(self, float_workspace_buffer: torch.Tensor) -> None:
         r"""Initialize the wrapper.
 
         Parameters
         ----------
-        workspace_buffer : torch.Tensor
-            The workspace buffer for the kernels, we use it to store the metadata for the segment GEMM whose
-            size is proportional to the number of segments (batch size), 1MB workspace is enough for most cases.
+        float_workspace_buffer : torch.Tensor
+            The workspace buffer for the kernels, we use it for storing intermediate results in cutlass
+            segment GEMM kernels. Encouraged size is 128MB.
         """
-        self._workspace_buffer = workspace_buffer
+        self._int_workspace_buffer = torch.empty(
+            (1024 * 1024,), dtype=torch.int8, device=float_workspace_buffer.device
+        )
+        self._float_workspace_buffer = float_workspace_buffer
 
-    def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor) -> None:
+    def reset_workspace_buffer(
+        self, float_workspace_buffer: torch.Tensor, int_workspace_buffer: torch.Tensor
+    ) -> None:
         r"""Reset the workspace buffer.
 
         Parameters
         ----------
-        new_workspace_buffer : torch.Tensor
-            The new workspace buffer, the device of the new workspace buffer should
-            be the same as the device of the input tensors.
+        float_workspace_buffer : torch.Tensor
+            The new float workspace buffer for the kernels.
+        int_workspace_buffer : torch.Tensor
+            The new int workspace buffer for the kernels.
         """
-        self._workspace_buffer = new_workspace_buffer
+        self._float_workspace_buffer = float_workspace_buffer
+        self._int_workspace_buffer = int_workspace_buffer
 
     def run(
         self,
@@ -194,7 +201,7 @@ class SegmentGEMMWrapper:
             # create an empty CPU tensor as placeholder
             weight_indices = torch.empty(0, dtype=torch.int64)
         return get_gemm_module().cutlass_segment_gemm(
-            self._workspace_buffer,
+            self._int_workspace_buffer,
             seg_indptr,
             weight_indices,
             x,

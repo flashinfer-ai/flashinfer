@@ -84,8 +84,7 @@ def test_segment_gemm(
                     ),
                 ),
                 rtol=1e-3,
-                atol=1e-3,
-                msg="assertion failed at batch {}".format(i),
+                atol=1e-3
             )
     else:
         torch.testing.assert_close(
