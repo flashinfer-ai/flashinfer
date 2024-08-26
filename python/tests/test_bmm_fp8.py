@@ -1,6 +1,16 @@
 import pytest
 import torch
+import torch.nn.functional as F
+
 from flashinfer import bmm_fp8
+
+
+def to_float8(x, dtype=torch.float8_e4m3fn):
+    finfo = torch.finfo(dtype)
+    abs_max = x.abs().amax(dim=(1, 2), keepdim=True).clamp(min=1e-12)
+    scale = finfo.max / abs_max
+    x_scl_sat = (x * scale).clamp(min=finfo.min, max=finfo.max)
+    return x_scl_sat.to(dtype), scale.float().reciprocal()
 
 
 @pytest.mark.parametrize("input_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
@@ -11,28 +21,21 @@ def test_bmm_fp8(input_dtype, mat2_dtype, res_dtype):
         pytest.skip("Invalid combination: both input and mat2 are e5m2")
 
     input = torch.randn([16, 48, 64], device="cuda", dtype=torch.bfloat16)
-    input_fp8 = input.to(input_dtype)
+    input_fp8, input_inv_s = to_float8(input, dtype=input_dtype)
 
-    mat2 = torch.randn([16, 64, 80], device="cuda", dtype=torch.bfloat16)
-    # mat2 row major -> column major
-    mat2_fp8 = mat2.to(mat2_dtype).transpose(-1, -2).contiguous()
-    # make original shape unchanged
-    mat2_fp8 = mat2_fp8.transpose(-1, -2)
+    # mat2 row  major -> column major
+    mat2 = torch.randn([16, 80, 64], device="cuda", dtype=torch.bfloat16).transpose(
+        -2, -1
+    )
+    mat2_fp8, mat2_inv_s = to_float8(mat2, dtype=mat2_dtype)
 
     res = torch.empty([16, 48, 80], device="cuda", dtype=res_dtype)
-    bmm_fp8(input_fp8, mat2_fp8, res)
+    bmm_fp8(input_fp8, mat2_fp8, res, input_inv_s, mat2_inv_s)
 
-    res_ref = (input @ mat2).to(res_dtype)
+    reference = torch.bmm(input, mat2)
 
-    res_float = res.float().cpu()
-    res_ref_float = res_ref.float().cpu()
-
-    is_close = torch.isclose(res_float, res_ref_float, rtol=1e-1, atol=1e-1)
-
-    total_elements = res_float.numel()
-    unequal_elements = torch.sum(~is_close).item()
-    unequal_percentage = (unequal_elements / total_elements) * 100
-    assert unequal_percentage < 10
+    cos_sim = F.cosine_similarity(reference.reshape(-1), res.reshape(-1), dim=0)
+    assert cos_sim > 0.98
 
 
 if __name__ == "__main__":
