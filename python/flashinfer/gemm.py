@@ -201,27 +201,43 @@ class SegmentGEMMWrapper:
 def bmm_fp8(
     A: torch.Tensor,
     B: torch.Tensor,
-    D: torch.Tensor,
     A_scale: torch.Tensor,
     B_scale: torch.Tensor,
-):
+    dtype: torch.dtype,
+    out: torch.Tensor = None,
+) -> torch.Tensor:
     r"""BMM FP8
 
     Parameters
     ----------
     A: torch.Tensor
-        Input tensor, shape (b, m, k).
+        Input tensor, shape (b, m, k), fp8 e4m3 or fp8 e5m2.
 
     B: torch.Tensor
-        Mat2 tensor, shape (b, k, n), should be column major.
-
-    D: torch.Tensor
-        Out tensor, shape (b, m, n).
+        Mat2 tensor, shape (b, k, n), should be column major, fp8 e4m3 or fp8 e5m2.
 
     A_scale: torch.Tensor
-        Scale tensor for A.
+        Scale tensor for A, float.
 
     B_scale: torch.Tensor
-        Scale tensor for B.
+        Scale tensor for B, float.
+
+    dtype: torch.dtype
+        out dtype, bf16 or fp16.
+
+    out: torch.Tensor
+        Out tensor, shape (b, m, n), bf16 or fp16.
+
+    Returns
+    -------
+    out: torch.Tensor
+        Out tensor, shape (b, m, n), bf16 or fp16.
     """
-    _kernels.bmm_fp8(A, B, D, A_scale, B_scale)
+    if out is None:
+        out = torch.empty(
+            (A.shape[0], A.shape[1], B.shape[2]),
+            device=A.device,
+            dtype=dtype,
+        )
+    _kernels.bmm_fp8(A, B, out, A_scale, B_scale)
+    return out

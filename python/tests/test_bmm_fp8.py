@@ -30,7 +30,7 @@ def test_bmm_fp8(input_dtype, mat2_dtype, res_dtype):
     mat2_fp8, mat2_inv_s = to_float8(mat2, dtype=mat2_dtype)
 
     res = torch.empty([16, 48, 80], device="cuda", dtype=res_dtype)
-    bmm_fp8(input_fp8, mat2_fp8, res, input_inv_s, mat2_inv_s)
+    bmm_fp8(input_fp8, mat2_fp8, input_inv_s, mat2_inv_s, res_dtype, res)
 
     reference = torch.bmm(input, mat2)
 
