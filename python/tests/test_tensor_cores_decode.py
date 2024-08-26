@@ -96,7 +96,7 @@ def test_batch_decode_tensor_cores(
 
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
     wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, kv_layout)
-    wrapper.begin_forward(
+    wrapper.plan(
         kv_indptr,
         kv_indices,
         kv_last_page_len,
@@ -108,12 +108,12 @@ def test_batch_decode_tensor_cores(
         data_type=torch.float16,
         q_data_type=torch.float16,
     )
-    o = wrapper.forward(q, kv_data, pos_encoding_mode=pos_encoding_mode)
+    o = wrapper.run(q, kv_data)
 
     wrapper_tensor_cores = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout, use_tensor_cores=True
     )
-    wrapper_tensor_cores.begin_forward(
+    wrapper_tensor_cores.plan(
         kv_indptr,
         kv_indices,
         kv_last_page_len,
@@ -121,13 +121,10 @@ def test_batch_decode_tensor_cores(
         num_kv_heads,
         head_dim,
         page_size,
-        pos_encoding_mode=pos_encoding_mode,
         data_type=torch.float16,
         q_data_type=torch.float16,
     )
-    o_tensor_cores = wrapper_tensor_cores.forward(
-        q, kv_data, pos_encoding_mode=pos_encoding_mode
-    )
+    o_tensor_cores = wrapper_tensor_cores.run(q, kv_data)
 
     numpy.testing.assert_allclose(
         o.cpu().numpy(), o_tensor_cores.cpu().numpy(), rtol=1e-3, atol=1e-3
@@ -179,7 +176,7 @@ def test_batch_decode_tensor_cores_cuda_graph(
         paged_kv_indices_buffer=kv_indices,
         paged_kv_last_page_len_buffer=kv_last_page_len,
     )
-    wrapper.begin_forward(
+    wrapper.plan(
         kv_indptr,
         kv_indices,
         kv_last_page_len,
@@ -196,14 +193,13 @@ def test_batch_decode_tensor_cores_cuda_graph(
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         for _ in range(3):
-            o = wrapper.forward(q, kv_data, pos_encoding_mode=pos_encoding_mode)
+            o = wrapper.run(q, kv_data)
     torch.cuda.current_stream().wait_stream(s)
 
     # capture
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        o = wrapper.forward(q, kv_data, pos_encoding_mode=pos_encoding_mode)
-    wrapper.end_forward()
+        o = wrapper.run(q, kv_data)
 
     # replay
     g.replay()
@@ -218,7 +214,7 @@ def test_batch_decode_tensor_cores_cuda_graph(
         paged_kv_indices_buffer=kv_indices,
         paged_kv_last_page_len_buffer=kv_last_page_len,
     )
-    wrapper_tensor_cores.begin_forward(
+    wrapper_tensor_cores.plan(
         kv_indptr,
         kv_indices,
         kv_last_page_len,
@@ -235,18 +231,13 @@ def test_batch_decode_tensor_cores_cuda_graph(
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         for _ in range(3):
-            o_tensor_cores = wrapper_tensor_cores.forward(
-                q, kv_data, pos_encoding_mode=pos_encoding_mode
-            )
+            o_tensor_cores = wrapper_tensor_cores.run(q, kv_data)
     torch.cuda.current_stream().wait_stream(s)
 
     # capture
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        o_tensor_cores = wrapper_tensor_cores.forward(
-            q, kv_data, pos_encoding_mode=pos_encoding_mode
-        )
-    wrapper_tensor_cores.end_forward()
+        o_tensor_cores = wrapper_tensor_cores.run(q, kv_data)
 
     # replay
     g.replay()

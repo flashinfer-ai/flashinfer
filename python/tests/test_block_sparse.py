@@ -72,7 +72,7 @@ def test_block_sparse_attention(
     workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=0)
     sparse_attention_wrapper = flashinfer.BlockSparseAttentionWrapper(workspace_buffer)
 
-    sparse_attention_wrapper.begin_forward(
+    sparse_attention_wrapper.plan(
         indptr,
         indices,
         M,
@@ -85,8 +85,7 @@ def test_block_sparse_attention(
         mask=data_mask if mask_inside_block else None,
     )
 
-    o = sparse_attention_wrapper.forward(q, k, v)
-    sparse_attention_wrapper.end_forward()
+    o = sparse_attention_wrapper.run(q, k, v)
     np.testing.assert_allclose(o_ref.cpu(), o.cpu(), atol=1e-2, rtol=1e-3)
 
 

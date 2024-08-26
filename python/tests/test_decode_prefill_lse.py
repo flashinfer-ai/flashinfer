@@ -35,7 +35,7 @@ def test_mlc_failed_case():
 
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
     wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, kv_layout)
-    wrapper.begin_forward(
+    wrapper.plan(
         kv_indptr_1,
         kv_indices_1,
         kv_last_page_len_1,
@@ -47,12 +47,12 @@ def test_mlc_failed_case():
         data_type=torch.float16,
         q_data_type=torch.float16,
     )
-    o_1, lse_1 = wrapper.forward_return_lse(q, kv_data)
+    o_1, lse_1 = wrapper.run_return_lse(q, kv_data)
 
     wrapper_tensor_cores = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout, use_tensor_cores=True
     )
-    wrapper_tensor_cores.begin_forward(
+    wrapper_tensor_cores.plan(
         kv_indptr_1,
         kv_indices_1,
         kv_last_page_len_1,
@@ -64,7 +64,7 @@ def test_mlc_failed_case():
         data_type=torch.float16,
         q_data_type=torch.float16,
     )
-    o_1_tc, lse_1_tc = wrapper_tensor_cores.forward_return_lse(q, kv_data)
+    o_1_tc, lse_1_tc = wrapper_tensor_cores.run_return_lse(q, kv_data)
 
     np.testing.assert_allclose(
         lse_1.cpu().numpy(), lse_1_tc.cpu().numpy(), rtol=1e-3, atol=1e-3

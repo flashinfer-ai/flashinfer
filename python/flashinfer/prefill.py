@@ -478,15 +478,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
     ...     num_kv_heads,
     ...     head_dim,
     ...     page_size,
+    ...     causal=True,
     ... )
     >>> outputs = []
     >>> for i in range(num_layers):
     ...     q = q_at_layer[i]
     ...     kv_cache = kv_cache_at_layer[i]
     ...     # compute batch prefill attention, reuse auxiliary data structures
-    ...     o = prefill_wrapper.run(
-    ...         q, kv_cache, causal=True
-    ...     )
+    ...     o = prefill_wrapper.run(q, kv_cache)
     ...     outputs.append(o)
     ...
     >>> outputs[0].shape
@@ -513,18 +512,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
     ...     num_kv_heads,
     ...     head_dim,
     ...     page_size,
-    ...     mask
+    ...     custom_mask=mask,
     ... )
-    >>> outputs_custom_mask = []
     >>> for i in range(num_layers):
     ...     q = q_at_layer[i]
     ...     kv_cache = kv_cache_at_layer[i]
     ...     # compute batch prefill attention, reuse auxiliary data structures
-    ...     o_custom = prefill_wrapper.run(
-    ...         q, kv_cache
-    ...     )
+    ...     o_custom = prefill_wrapper.run(q, kv_cache)
     ...     assert torch.allclose(o_custom, outputs[i], rtol=1e-3, atol=1e-3)
     ...
+
 
 
     Note
@@ -1161,7 +1158,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
     ...     kv_indptr,
     ...     num_qo_heads,
     ...     num_kv_heads,
-    ...     head_dim
+    ...     head_dim,
+    ...     causal=True,
     ... )
     >>> outputs = []
     >>> for i in range(num_layers):
@@ -1169,9 +1167,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
     ...     k = k_at_layer[i]
     ...     v = v_at_layer[i]
     ...     # compute batch prefill attention, reuse auxiliary data structures
-    ...     o = prefill_wrapper.run(
-    ...         q, k, v, causal=True
-    ...     )
+    ...     o = prefill_wrapper.run(q, k, v)
     ...     outputs.append(o)
     ...
     >>> outputs[0].shape
@@ -1195,7 +1191,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
     ...     num_qo_heads,
     ...     num_kv_heads,
     ...     head_dim,
-    ...     mask
+    ...     custom_mask=mask
     ... )
     >>> outputs_custom_mask = []
     >>> for i in range(num_layers):

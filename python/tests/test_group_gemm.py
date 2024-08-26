@@ -59,7 +59,7 @@ def test_segment_gemm(
             weight = (torch.randn(batch_size, d_out, d_in) / 10).to(0).to(torch.float16)
         else:
             weight = (torch.randn(batch_size, d_in, d_out) / 10).to(0).to(torch.float16)
-    y = segment_gemm.forward(
+    y = segment_gemm.run(
         x,
         weight,
         batch_size,

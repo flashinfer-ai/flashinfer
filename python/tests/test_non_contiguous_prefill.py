@@ -91,17 +91,11 @@ def test_batch_ragged_prefill_packed_input(
         (256 * 1024 * 1024,), dtype=torch.uint8, device="cuda:0"
     )
     wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(workspace_buffer)
-    wrapper.begin_forward(
-        qo_indptr,
-        kv_indptr,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim,
+    wrapper.plan(
+        qo_indptr, kv_indptr, num_qo_heads, num_kv_heads, head_dim, causal=causal
     )
-    o_packed = wrapper.forward(q, k, v, causal=causal)
-    o_contiguous = wrapper.forward(
-        q.contiguous(), k.contiguous(), v.contiguous(), causal=causal
-    )
+    o_packed = wrapper.run(q, k, v)
+    o_contiguous = wrapper.run(q.contiguous(), k.contiguous(), v.contiguous())
 
     numpy.testing.assert_allclose(
         o_packed.cpu(), o_contiguous.cpu(), rtol=1e-3, atol=1e-3

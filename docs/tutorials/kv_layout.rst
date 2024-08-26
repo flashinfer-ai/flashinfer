@@ -155,7 +155,7 @@ When using multi-level `cascade inference <https://flashinfer.ai/2024/02/02/casc
 the query and output are stored in ragged tensors, and KV-Cache of all levels are stored
 in a unified Paged KV-Cache. Each level has a unique ``qo_indptr`` array which is the prefix sum of the
 accumulated number of tokens to append in the subtree, as well as ``kv_page_indptr``, ``kv_page_indices``, and
-``kv_last_page_len`` which has same semantics as in :ref:`<page-layout>` section. The following figure
+``kv_last_page_len`` which has same semantics as in :ref:`page-layout` section. The following figure
 introduce how to construct these data structures for append attention operation for 8 requests where we
 treat their KV-Cache as 3 levels for prefix reuse:
 

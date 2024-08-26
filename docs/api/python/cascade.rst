@@ -28,11 +28,17 @@ Cascade Attention Wrapper Classes
 .. autoclass:: MultiLevelCascadeAttentionWrapper
     :members:
 
+    .. automethod:: __init__
+    
+    :exclude-members: begin_forward, end_forward, forward, forward_return_lse
 
 .. autoclass:: BatchDecodeWithSharedPrefixPagedKVCacheWrapper
     :members:
 
+    .. automethod:: __init__
 
 .. autoclass:: BatchPrefillWithSharedPrefixPagedKVCacheWrapper
     :members:
+
+    .. automethod:: __init__
 
