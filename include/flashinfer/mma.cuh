@@ -18,9 +18,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#ifdef FLASHINFER_ENABLE_FP8
 #include <cuda_fp8.h>
-#endif
 #include <cuda_runtime.h>
 
 #include <type_traits>
@@ -206,7 +204,6 @@ __device__ __forceinline__ void stmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
 #endif
 }
 
-#ifdef FLASHINFER_ENABLE_FP8
 /*!
  * \brief Wrapper of two mma m16n8k32 instructions for row major and column major f8 matrix
  *   multiplication, accumulated in f32.
@@ -307,7 +304,6 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f32(float* C, uin
       "fp8 mma instruction is only available for sm89, PTX 8.4+ and CUDA 12.4+");
 #endif
 }
-#endif
 
 /*!
  * \brief Wrapper of two mma m16n8k16 instructions for row major and column major f16 matrix
@@ -404,79 +400,82 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
     }
   }
 #elif defined(FLASHINFER_MMA_F16F16F32_M16N8K8_ENABLED)
-  if constexpr (mma_mode == MMAMode::kInit) {
-    asm volatile(
-        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-        "{%0,  %1,  %2,  %3},"
-        "{%4,  %5},"
-        "{%6},"
-        "{%7, %8, %9, %10};\n"
-        : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
-        : "r"(A[0]), "r"(A[1]), "r"(B[0]), "f"(0.f), "f"(0.f), "f"(0.f), "f"(0.f));
-    asm volatile(
-        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-        "{%0,  %1,  %2,  %3},"
-        "{%4,  %5},"
-        "{%6},"
-        "{%7, %8, %9, %10};\n"
-        : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
-        : "r"(A[2]), "r"(A[3]), "r"(B[1]), "f"(C[0]), "f"(C[1]), "f"(C[2]), "f"(C[3]));
-    asm volatile(
-        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-        "{%0,  %1,  %2,  %3},"
-        "{%4,  %5},"
-        "{%6},"
-        "{%7, %8, %9, %10};\n"
-        : "=f"(C[4]), "=f"(C[5]), "=f"(C[6]), "=f"(C[7])
-        : "r"(A[0]), "r"(A[1]), "r"(B[2]), "f"(0.f), "f"(0.f), "f"(0.f), "f"(0.f));
-    asm volatile(
-        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-        "{%0,  %1,  %2,  %3},"
-        "{%4,  %5},"
-        "{%6},"
-        "{%7, %8, %9, %10};\n"
-        : "=f"(C[4]), "=f"(C[5]), "=f"(C[6]), "=f"(C[7])
-        : "r"(A[2]), "r"(A[3]), "r"(B[3]), "f"(C[4]), "f"(C[5]), "f"(C[6]), "f"(C[7]));
+  if constexpr (std::is_same<T, half>::value) {
+    if constexpr (mma_mode == MMAMode::kInit) {
+      asm volatile(
+          "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+          "{%0,  %1,  %2,  %3},"
+          "{%4,  %5},"
+          "{%6},"
+          "{%7, %8, %9, %10};\n"
+          : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
+          : "r"(A[0]), "r"(A[1]), "r"(B[0]), "f"(0.f), "f"(0.f), "f"(0.f), "f"(0.f));
+      asm volatile(
+          "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+          "{%0,  %1,  %2,  %3},"
+          "{%4,  %5},"
+          "{%6},"
+          "{%7, %8, %9, %10};\n"
+          : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
+          : "r"(A[2]), "r"(A[3]), "r"(B[1]), "f"(C[0]), "f"(C[1]), "f"(C[2]), "f"(C[3]));
+      asm volatile(
+          "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+          "{%0,  %1,  %2,  %3},"
+          "{%4,  %5},"
+          "{%6},"
+          "{%7, %8, %9, %10};\n"
+          : "=f"(C[4]), "=f"(C[5]), "=f"(C[6]), "=f"(C[7])
+          : "r"(A[0]), "r"(A[1]), "r"(B[2]), "f"(0.f), "f"(0.f), "f"(0.f), "f"(0.f));
+      asm volatile(
+          "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+          "{%0,  %1,  %2,  %3},"
+          "{%4,  %5},"
+          "{%6},"
+          "{%7, %8, %9, %10};\n"
+          : "=f"(C[4]), "=f"(C[5]), "=f"(C[6]), "=f"(C[7])
+          : "r"(A[2]), "r"(A[3]), "r"(B[3]), "f"(C[4]), "f"(C[5]), "f"(C[6]), "f"(C[7]));
+    } else {
+      asm volatile(
+          "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+          "{%0,  %1,  %2,  %3},"
+          "{%4,  %5},"
+          "{%6},"
+          "{%7, %8, %9, %10};\n"
+          : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
+          : "r"(A[0]), "r"(A[1]), "r"(B[0]), "f"(C[0]), "f"(C[1]), "f"(C[2]), "f"(C[3]));
+      asm volatile(
+          "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+          "{%0,  %1,  %2,  %3},"
+          "{%4,  %5},"
+          "{%6},"
+          "{%7, %8, %9, %10};\n"
+          : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
+          : "r"(A[2]), "r"(A[3]), "r"(B[1]), "f"(C[0]), "f"(C[1]), "f"(C[2]), "f"(C[3]));
+      asm volatile(
+          "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+          "{%0,  %1,  %2,  %3},"
+          "{%4,  %5},"
+          "{%6},"
+          "{%7, %8, %9, %10};\n"
+          : "=f"(C[4]), "=f"(C[5]), "=f"(C[6]), "=f"(C[7])
+          : "r"(A[0]), "r"(A[1]), "r"(B[2]), "f"(C[4]), "f"(C[5]), "f"(C[6]), "f"(C[7]));
+      asm volatile(
+          "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+          "{%0,  %1,  %2,  %3},"
+          "{%4,  %5},"
+          "{%6},"
+          "{%7, %8, %9, %10};\n"
+          : "=f"(C[4]), "=f"(C[5]), "=f"(C[6]), "=f"(C[7])
+          : "r"(A[2]), "r"(A[3]), "r"(B[3]), "f"(C[4]), "f"(C[5]), "f"(C[6]), "f"(C[7]));
+    }
   } else {
-    asm volatile(
-        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-        "{%0,  %1,  %2,  %3},"
-        "{%4,  %5},"
-        "{%6},"
-        "{%7, %8, %9, %10};\n"
-        : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
-        : "r"(A[0]), "r"(A[1]), "r"(B[0]), "f"(C[0]), "f"(C[1]), "f"(C[2]), "f"(C[3]));
-    asm volatile(
-        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-        "{%0,  %1,  %2,  %3},"
-        "{%4,  %5},"
-        "{%6},"
-        "{%7, %8, %9, %10};\n"
-        : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
-        : "r"(A[2]), "r"(A[3]), "r"(B[1]), "f"(C[0]), "f"(C[1]), "f"(C[2]), "f"(C[3]));
-    asm volatile(
-        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-        "{%0,  %1,  %2,  %3},"
-        "{%4,  %5},"
-        "{%6},"
-        "{%7, %8, %9, %10};\n"
-        : "=f"(C[4]), "=f"(C[5]), "=f"(C[6]), "=f"(C[7])
-        : "r"(A[0]), "r"(A[1]), "r"(B[2]), "f"(C[4]), "f"(C[5]), "f"(C[6]), "f"(C[7]));
-    asm volatile(
-        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-        "{%0,  %1,  %2,  %3},"
-        "{%4,  %5},"
-        "{%6},"
-        "{%7, %8, %9, %10};\n"
-        : "=f"(C[4]), "=f"(C[5]), "=f"(C[6]), "=f"(C[7])
-        : "r"(A[2]), "r"(A[3]), "r"(B[3]), "f"(C[4]), "f"(C[5]), "f"(C[6]), "f"(C[7]));
+    FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
   }
 #else
   FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
 #endif
 }
 
-#ifdef FLASHINFER_ENABLE_FP8
 /*!
  * \brief Use mma instructions to compute rowsum.
  */
@@ -515,7 +514,6 @@ __device__ __forceinline__ void rowsum_f8f8f32(float* d, DType* s) {
       "fp8 mma instruction is only available for sm89, PTX 8.4+ and CUDA 12.4+");
 #endif
 }
-#endif
 
 /*!
  * \brief Use mma instructions to compute rowsum.
@@ -551,27 +549,30 @@ __device__ __forceinline__ void rowsum_f16f16f32(float* d, DType* s) {
           "r"(1065369472), "f"(d[0]), "f"(d[1]));
   }
 #elif defined(FLASHINFER_MMA_F16F16F32_M16N8K8_ENABLED)
-  static_assert(std::is_same<DType, half>::value, "bf16 mma instruction is not supported on sm_75");
-  asm volatile(
-      "{\n"
-      "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-      "{%0,  _,  %1,  _},"
-      "{%2,  %3},"
-      "{%4},"
-      "{%5,  0.,  %6,  0.};\n"
-      "}\n"
-      : "=f"(d[0]), "=f"(d[1])
-      : "r"(s_u32[0]), "r"(s_u32[1]), "r"(1006648320), "f"(d[0]), "f"(d[1]));
-  asm volatile(
-      "{\n"
-      "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
-      "{%0,  _,  %1,  _},"
-      "{%2,  %3},"
-      "{%4},"
-      "{%5,  0.,  %6,  0.};\n"
-      "}\n"
-      : "=f"(d[0]), "=f"(d[1])
-      : "r"(s_u32[2]), "r"(s_u32[3]), "r"(1006648320), "f"(d[0]), "f"(d[1]));
+  if constexpr (std::is_same<DType, half>::value) {
+    asm volatile(
+        "{\n"
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,  _,  %1,  _},"
+        "{%2,  %3},"
+        "{%4},"
+        "{%5,  0.,  %6,  0.};\n"
+        "}\n"
+        : "=f"(d[0]), "=f"(d[1])
+        : "r"(s_u32[0]), "r"(s_u32[1]), "r"(1006648320), "f"(d[0]), "f"(d[1]));
+    asm volatile(
+        "{\n"
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,  _,  %1,  _},"
+        "{%2,  %3},"
+        "{%4},"
+        "{%5,  0.,  %6,  0.};\n"
+        "}\n"
+        : "=f"(d[0]), "=f"(d[1])
+        : "r"(s_u32[2]), "r"(s_u32[3]), "r"(1006648320), "f"(d[0]), "f"(d[1]));
+  } else {
+    FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
+  }
 #else
   FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
 #endif

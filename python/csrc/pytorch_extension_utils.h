@@ -15,19 +15,15 @@
  */
 #pragma once
 #include <c10/cuda/CUDAStream.h>
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <torch/extension.h>
 
 #include <flashinfer/layout.cuh>
 #include <flashinfer/pos_enc.cuh>
 
 #include "generated/dispatch.inc"
-#ifdef FLASHINFER_ENABLE_BF16
-#include <cuda_bf16.h>
-#endif
-#ifdef FLASHINFER_ENABLE_FP8
-#include <cuda_fp8.h>
-#endif
 
 using namespace flashinfer;
 

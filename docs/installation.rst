@@ -19,7 +19,7 @@ Prerequisites
 
   - Use ``python -c "import torch; print(torch.version.cuda)"`` to check your PyTorch CUDA version.
 
-- Supported GPU architectures: ``sm80``, ``sm86``, ``sm89``, ``sm90`` (``sm75`` / ``sm70`` support is working in progress).
+- Supported GPU architectures: ``sm75``, ``sm80``, ``sm86``, ``sm89``, ``sm90``.
 
 Quick Start
 ^^^^^^^^^^^
