@@ -20,7 +20,6 @@ import torch
 
 import flashinfer
 
-"""
 @pytest.mark.parametrize("dim", [128, 256, 512, 2048, 4096, 11008, 16384])
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
 @pytest.mark.parametrize("seq_len", [1, 2, 4, 8, 16, 32, 64, 128, 512])
@@ -31,8 +30,7 @@ def test_fused_silu_mul(dim, batch_size, seq_len):
     numpy.testing.assert_allclose(
         y_ref.cpu().numpy(), y.cpu().numpy(), rtol=1e-3, atol=1e-3
     )
-"""
-"""
+
 @pytest.mark.parametrize("dim", [128, 256, 512, 2048, 4096, 11008, 16384])
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
 @pytest.mark.parametrize("seq_len", [1, 2, 4, 8, 16, 32, 64, 128, 512])
@@ -43,7 +41,6 @@ def test_fused_gelu_tanh_mul(dim, batch_size, seq_len):
     numpy.testing.assert_allclose(
         y_ref.cpu().numpy(), y.cpu().numpy(), rtol=1e-3, atol=1e-3
     )
-"""
 
 @pytest.mark.parametrize("dim", [128, 256, 512, 2048, 4096, 11008, 16384])
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
