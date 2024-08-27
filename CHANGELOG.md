@@ -2,6 +2,10 @@
 
 ## [0.1.6](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.5...v0.1.6) (2024-08-27)
 
+### SM75 Support
+
+Starting from [0.1.6](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.5...v0.1.6), our pre-built wheels include experimental support sm75 (Turing architecture GPUs such as Tesla T4, Quadro RTX 6000 and RTX 2080).
+
 ### API Changes
 
 #### `plan`/`run`
@@ -47,6 +51,10 @@ The old `BatchDecodeWithSharedPrefixPagedKVCacheWrapper` and `BatchPrefillWithSh
 * slight optimization on f16-&gt;f8 fragment layout swizzling ([#453](https://github.com/flashinfer-ai/flashinfer/issues/453)) ([0d61871](https://github.com/flashinfer-ai/flashinfer/commit/0d618712faff20a84bbd513d02ac01e16be19306))
 * slight optimization on fragment layout swizzle ([#458](https://github.com/flashinfer-ai/flashinfer/issues/458)) ([7c397cb](https://github.com/flashinfer-ai/flashinfer/commit/7c397cbd81d4fa5da8aef9f105576dbe67f6c22b))
 * use persistent kernel for merging attention states ([#459](https://github.com/flashinfer-ai/flashinfer/issues/459)) ([be6bf5b](https://github.com/flashinfer-ai/flashinfer/commit/be6bf5bb26f1f1b3edf094d903544600c574ee09))
+
+### Acknowledgement
+
+We thank [@LiuXiaoxuanPKU](https://github.com/LiuXiaoxuanPKU) on enhance of speculative sampling operator, [@merrymercy](https://github.com/merrymercy) on API change suggestion and [@zhyncs](https://github.com/zhyncs) on integrating fp8 BMM cublas implementation.
 
 ## [0.1.5](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.4...v0.1.5) (2024-08-13)
 
