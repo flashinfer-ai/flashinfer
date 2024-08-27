@@ -515,13 +515,6 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
             cur_page_indptr_begin + q, kv_head_idx, r, 0, last_indptr);
       }
     }
-#pragma unroll
-    for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
-      k_ptrs[j] = k_ptrs_smem[((((iter + num_stages_smem) % bdx) * bdz + tz) * bdy + ty) *
-                                  tile_size_per_bdx +
-                              j] +
-                  tx * vec_size;
-    }
     // compute qk
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
@@ -533,6 +526,14 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
         iter * tile_size_per_bdx * bdy * bdz, left_close_bound, kv_chunk_len, q_offset_val,
         alibi_slope, s, st, logits_soft_cap);
     block.sync();
+
+#pragma unroll
+    for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
+      k_ptrs[j] = k_ptrs_smem[((((iter + num_stages_smem) % bdx) * bdz + tz) * bdy + ty) *
+                                  tile_size_per_bdx +
+                              j] +
+                  tx * vec_size;
+    }
 
     // load k tiles
 #pragma unroll
