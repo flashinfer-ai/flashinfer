@@ -41,6 +41,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fused_add_rmsnorm", &fused_add_rmsnorm, "Fused add root mean square normalization");
   m.def("silu_and_mul", &silu_and_mul, "Fused SiLU and Mul");
   m.def("gelu_tanh_and_mul", &gelu_tanh_and_mul, "Fused GeLU Tanh and Mul");
+  m.def("gelu_and_mul", &gelu_and_mul, "Fused GeLU and Mul");
   m.def("apply_rope_inplace", &apply_rope_inplace, "Apply RoPE in-place");
   m.def("apply_llama31_rope_inplace", &apply_llama31_rope_inplace,
         "Apply Llama 3.1 style RoPE in-place");

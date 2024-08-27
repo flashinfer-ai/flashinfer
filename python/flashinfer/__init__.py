@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from .activation import gelu_tanh_and_mul, silu_and_mul
+from .activation import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 from .cascade import (
     BatchDecodeWithSharedPrefixPagedKVCacheWrapper,
     BatchPrefillWithSharedPrefixPagedKVCacheWrapper,

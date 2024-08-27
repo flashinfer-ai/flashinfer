@@ -100,3 +100,33 @@ def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Te
         )
     _kernels.gelu_tanh_and_mul(out, input)
     return out
+
+
+def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+    r"""Fused GeLU and Mul operation.
+
+    Parameters
+    ----------
+    input: torch.Tensor
+        Input tensor, shape (..., 2 * hidden_size).
+
+    out: Optional[torch.Tensor]
+        The the output tensor, if specified, the kernel will update this tensor inplace.
+
+    Returns
+    -------
+    output: torch.Tensor
+        Output tensor, shape (..., hidden_size).
+    """
+    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
+        raise ValueError("The pointers must be multiple of 16 bytes.")
+    if out is not None:
+        _check_shape(input, out)
+    else:
+        out = torch.empty(
+            input.shape[:-1] + (input.shape[-1] // 2,),
+            device=input.device,
+            dtype=input.dtype,
+        )
+    _kernels.gelu_and_mul(out, input)
+    return out

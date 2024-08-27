@@ -31,6 +31,12 @@ __device__ __forceinline__ float silu_kernel(const float& val) {
   return val / (1.0f + __expf(-val));
 }
 
+// https://github.com/pytorch/pytorch/blob/f48038527792814b06dafa6d471acb04c837b972/aten/src/ATen/native/cuda/ActivationGeluKernel.cu#L36-L38
+__device__ __forceinline__ float gelu_kernel(const float& val) {
+  constexpr float kAlpha = M_SQRT1_2;
+  return val * 0.5f * (1.0f + ::erf(val * kAlpha));
+}
+
 template <typename T>
 __device__ __forceinline__ T gelu_tanh_kernel(const T& val) {
   const float cdf =
