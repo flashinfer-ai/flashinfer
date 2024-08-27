@@ -152,7 +152,7 @@ void bmm_fp8_internal_cublaslt(const AT* A, const BT* B, DT* D, int batch_size, 
   auto workspace = allocator.allocate(workspace_size);
   cublasLtMatmulHeuristicResult_t heuristic_result = {};
   int returned_result = 0;
-  auto lt_handle = at::cuda::getCurrentCUDABlasLtHandle();
+  auto lt_handle = reinterpret_cast<cublasLtHandle_t>(at::cuda::getCurrentCUDABlasHandle());
   TORCH_CUDABLAS_CHECK(cublasLtMatmulAlgoGetHeuristic(
       lt_handle, matmul_desp.descriptor(), a_desp.descriptor(), b_desp.descriptor(),
       d_desp.descriptor(), d_desp.descriptor(), preference.descriptor(), 1, &heuristic_result,
