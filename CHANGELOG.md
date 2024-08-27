@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.2.0](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.5...v0.2.0) (2024-08-27)
+
+
+### Features
+
+* add `MultiLevelCascadeAttentionWrapper` API ([#462](https://github.com/flashinfer-ai/flashinfer/issues/462)) ([1e37989](https://github.com/flashinfer-ai/flashinfer/commit/1e379898a589cdd4ff18a4621fcbe18d63501545))
+* add accept num, emit num metric for ChainSpeculativeSampling ([#450](https://github.com/flashinfer-ai/flashinfer/issues/450)) ([fa38b5e](https://github.com/flashinfer-ai/flashinfer/commit/fa38b5e34b9591bd5ab07186bea229ea95307755))
+* support bmm fp8 ([#469](https://github.com/flashinfer-ai/flashinfer/issues/469)) ([f1c0b68](https://github.com/flashinfer-ai/flashinfer/commit/f1c0b68d0f4a77ff3bf705307b3529b996fc9826))
+
+
+### Bug Fixes
+
+* resolve cu121 compile wired issue ([2740a02](https://github.com/flashinfer-ai/flashinfer/commit/2740a0202bf11252d31536e9dedd6722c9c29aa6))
+* resolve cu121 compile wired issue ([#446](https://github.com/flashinfer-ai/flashinfer/issues/446)) ([5f0159e](https://github.com/flashinfer-ai/flashinfer/commit/5f0159e6abeb7308d965bb1b9aef05547b8a57b3))
+
+
+### Performance Improvements
+
+* slight optimization on f16-&gt;f8 fragment layout swizzling ([#453](https://github.com/flashinfer-ai/flashinfer/issues/453)) ([0d61871](https://github.com/flashinfer-ai/flashinfer/commit/0d618712faff20a84bbd513d02ac01e16be19306))
+* slight optimization on fragment layout swizzle ([#458](https://github.com/flashinfer-ai/flashinfer/issues/458)) ([7c397cb](https://github.com/flashinfer-ai/flashinfer/commit/7c397cbd81d4fa5da8aef9f105576dbe67f6c22b))
+* use persistent kernel for merging attention states ([#459](https://github.com/flashinfer-ai/flashinfer/issues/459)) ([be6bf5b](https://github.com/flashinfer-ai/flashinfer/commit/be6bf5bb26f1f1b3edf094d903544600c574ee09))
+
 ## [0.1.5](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.4...v0.1.5) (2024-08-13)
 
 
