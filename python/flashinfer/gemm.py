@@ -19,6 +19,7 @@ from typing import Optional
 import torch
 
 from .utils import get_indptr
+from typing import Optional
 
 # mypy: disable-error-code="attr-defined"
 try:
@@ -204,7 +205,7 @@ def bmm_fp8(
     A_scale: torch.Tensor,
     B_scale: torch.Tensor,
     dtype: torch.dtype,
-    out: torch.Tensor = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""BMM FP8
 
@@ -225,13 +226,36 @@ def bmm_fp8(
     dtype: torch.dtype
         out dtype, bf16 or fp16.
 
-    out: torch.Tensor
-        Out tensor, shape (b, m, n), bf16 or fp16.
+    out: Optional[torch.Tensor]
+        Out tensor, shape (b, m, n), bf16 or fp16, defaults to ``None``.
 
     Returns
     -------
     out: torch.Tensor
         Out tensor, shape (b, m, n), bf16 or fp16.
+
+    Examples
+    --------
+    >>> import torch
+    >>> import torch.nn.functional as F
+    >>> import flashinfer
+    >>> def to_float8(x, dtype=torch.float8_e4m3fn):
+    ...     finfo = torch.finfo(dtype)
+    ...     abs_max = x.abs().amax(dim=(1, 2), keepdim=True).clamp(min=1e-12)
+    ...     scale = finfo.max / abs_max
+    ...     x_scl_sat = (x * scale).clamp(min=finfo.min, max=finfo.max)
+    ...     return x_scl_sat.to(dtype), scale.float().reciprocal()
+    >>>
+    >>> input = torch.randn([16, 48, 64], device="cuda", dtype=torch.bfloat16)
+    >>> input_fp8, input_inv_s = to_float8(input, dtype=torch.float8_e4m3fn)
+    >>> # column major weight
+    >>> weight = torch.randn([16, 80, 64], device="cuda", dtype=torch.bfloat16).transpose(-2, -1)
+    >>> weight_fp8, weight_inv_s = to_float8(weight, dtype=torch.float8_e4m3fn)
+    >>> out = flashinfer.bmm_fp8(input_fp8, weight_fp8, input_inv_s, weight_inv_s, torch.bfloat16)
+    >>> out.shape
+    torch.Size([16, 48, 80])
+    >>> out.dtype
+    torch.bfloat16
     """
     if out is None:
         out = torch.empty(

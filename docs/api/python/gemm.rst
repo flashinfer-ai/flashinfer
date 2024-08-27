@@ -1,11 +1,22 @@
-.. _apigroup_gemm:
+.. _apigemm:
 
-flashinfer.group_gemm
-=====================
+flashinfer.gemm
+===============
 
-This module provides a set of functions to group GEMM operations.
+.. currentmodule:: flashinfer.gemm
 
-.. currentmodule:: flashinfer.group_gemm
+This module provides a set of GEMM operations.
+
+FP8 Batch GEMM
+--------------
+
+.. autosummary::
+    :toctree: ../../generated
+
+    bmm_fp8
+
+Grouped GEMM
+------------
 
 .. autoclass:: SegmentGEMMWrapper
     :members:
