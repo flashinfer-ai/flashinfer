@@ -428,7 +428,7 @@ __device__ __forceinline__ void q_smem_inplace_multiply_sm_scale(smem_t<swizzle_
     tmp.load((DTypeQ*)(q_smem->base) + (i * num_warps + warp_idx) * 256 + lane_idx * 8);
 #pragma unroll
     for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
-      tmp[reg_id] *= sm_scale;
+      tmp[reg_id] *= DTypeQ(sm_scale);
     }
     tmp.store((DTypeQ*)(q_smem->base) + (i * num_warps + warp_idx) * 256 + lane_idx * 8);
   }
