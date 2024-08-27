@@ -1,8 +1,7 @@
-import pytest
-import torch
-
 import flashinfer
 import flashinfer.triton
+import pytest
+import torch
 
 
 @pytest.mark.parametrize("seq_len", [2048])

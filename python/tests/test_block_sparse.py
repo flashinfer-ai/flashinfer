@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import pytest
-import torch
-import numpy as np
-import scipy as sp
 import flashinfer
+import numpy as np
+import pytest
+import scipy as sp
+import torch
 
 
 def bsr_attention_ref(
@@ -86,7 +86,7 @@ def test_block_sparse_attention(
     )
 
     o = sparse_attention_wrapper.run(q, k, v)
-    np.testing.assert_allclose(o_ref.cpu(), o.cpu(), atol=1e-2, rtol=1e-3)
+    torch.testing.assert_close(o_ref.cpu(), o.cpu(), atol=1e-2, rtol=1e-3)
 
 
 if __name__ == "__main__":

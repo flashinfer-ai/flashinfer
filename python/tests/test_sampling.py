@@ -14,10 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import numpy
-import torch
-import pytest
 import flashinfer
+import pytest
+import torch
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
@@ -246,7 +245,7 @@ def test_top_p_renorm_prob(batch_size, vocab_size, p):
     )
 
     renorm_prob = flashinfer.sampling.top_p_renorm_prob(normalized_prob, p)
-    numpy.testing.assert_allclose(
+    torch.testing.assert_close(
         renorm_prob_ground_truth.cpu().numpy(),
         renorm_prob.cpu().numpy(),
         rtol=1e-3,
@@ -273,7 +272,7 @@ def test_top_k_renorm_prob(batch_size, vocab_size, k):
     )
 
     renorm_prob = flashinfer.sampling.top_k_renorm_prob(normalized_prob, k)
-    numpy.testing.assert_allclose(
+    torch.testing.assert_close(
         renorm_prob_ground_truth.cpu().numpy(),
         renorm_prob.cpu().numpy(),
         rtol=1e-3,
@@ -294,7 +293,7 @@ def test_top_k_mask_logits(batch_size, vocab_size, k):
     renormed_probs = torch.softmax(masked_logits, dim=-1)
     renormed_probs_ref = flashinfer.sampling.top_k_renorm_prob(probs, k)
 
-    numpy.testing.assert_allclose(
+    torch.testing.assert_close(
         renormed_probs.cpu().numpy(),
         renormed_probs_ref.cpu().numpy(),
         rtol=1e-3,
@@ -342,15 +341,17 @@ def test_chain_speculative_sampling(
         uniform_samples.uniform_()
         accepted_num = torch.zeros(batch_size, dtype=torch.int32).to(0)
         emitted_num = torch.zeros(batch_size, dtype=torch.int32).to(0)
-        output_token_ids, accepted_num, emitted_num = (
-            flashinfer.sampling.chain_speculative_sampling(
-                normalized_draft_prob,
-                draft_token_ids,
-                uniform_samples,
-                target_onehot_prob,
-                accepted_num,
-                emitted_num,
-            )
+        (
+            output_token_ids,
+            accepted_num,
+            emitted_num,
+        ) = flashinfer.sampling.chain_speculative_sampling(
+            normalized_draft_prob,
+            draft_token_ids,
+            uniform_samples,
+            target_onehot_prob,
+            accepted_num,
+            emitted_num,
         )
         if onehot_target:
             assert torch.all(output_token_ids == target_token_ids)

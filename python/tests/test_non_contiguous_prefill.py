@@ -14,11 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import numpy
+import flashinfer
 import pytest
 import torch
-
-import flashinfer
 
 
 @pytest.mark.parametrize("seq_len", [1, 7, 127, 999, 3579])
@@ -52,9 +50,7 @@ def test_single_prefill_packed_input(
         q.contiguous(), k.contiguous(), v.contiguous(), causal=causal
     )
 
-    numpy.testing.assert_allclose(
-        o_packed.cpu(), o_contiguous.cpu(), rtol=1e-3, atol=1e-3
-    )
+    torch.testing.assert_close(o_packed.cpu(), o_contiguous.cpu(), rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99])
@@ -97,9 +93,7 @@ def test_batch_ragged_prefill_packed_input(
     o_packed = wrapper.run(q, k, v)
     o_contiguous = wrapper.run(q.contiguous(), k.contiguous(), v.contiguous())
 
-    numpy.testing.assert_allclose(
-        o_packed.cpu(), o_contiguous.cpu(), rtol=1e-3, atol=1e-3
-    )
+    torch.testing.assert_close(o_packed.cpu(), o_contiguous.cpu(), rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":

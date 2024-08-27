@@ -14,10 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import numpy
+import flashinfer
 import pytest
 import torch
-import flashinfer
 
 
 @pytest.mark.parametrize("seq_len", [1, 3, 19, 99, 199, 1999])
@@ -42,7 +41,7 @@ def test_single_decode_sliding_window(
     o_ref = flashinfer.single_decode_with_kv_cache(q, k_sliced, v_sliced)
     o = flashinfer.single_decode_with_kv_cache(q, k, v, window_left=window_left)
 
-    numpy.testing.assert_allclose(o.cpu(), o_ref.cpu(), rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(o.cpu(), o_ref.cpu(), rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [1, 3, 13, 32])
@@ -124,7 +123,7 @@ def test_batch_decode_sliding_window(
         )
         o_i_np = o[i].cpu().numpy()
         o_ref_i_np = o_ref_i.cpu().numpy()
-        numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("seq_len", [1, 3, 19, 99, 199, 1999])
@@ -148,7 +147,7 @@ def test_single_decode_prefill_sliding_window_match(
     o_decoded = flashinfer.single_decode_with_kv_cache(
         q[0], k, v, window_left=window_left
     )
-    numpy.testing.assert_allclose(o.cpu()[0], o_decoded.cpu(), rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(o.cpu()[0], o_decoded.cpu(), rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("seq_len", [99, 199, 1999])
@@ -177,7 +176,7 @@ def test_single_prefill_sliding_window(
     o = flashinfer.single_prefill_with_kv_cache(
         q, k, v, window_left=window_left, causal=True
     )
-    numpy.testing.assert_allclose(o.cpu(), o_ref.cpu(), rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(o.cpu(), o_ref.cpu(), rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -278,7 +277,7 @@ def test_batch_paged_prefill_sliding_window(
         )
         o_i_np = o[q_indptr[i] : q_indptr[i + 1]].cpu().numpy()
         o_ref_i_np = o_ref_i.cpu().numpy()
-        numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -339,7 +338,7 @@ def test_batch_ragged_prefill_sliding_window(
         )
         o_i_np = o[q_indptr[i] : q_indptr[i + 1]].cpu().numpy()
         o_ref_i_np = o_ref_i.cpu().numpy()
-        numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":

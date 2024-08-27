@@ -14,11 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import numpy
+import flashinfer
 import pytest
 import torch
-
-import flashinfer
 
 
 def ceil_div(a, b):
@@ -185,7 +183,7 @@ def test_batch_attention_with_shared_prefix_paged_kv_cache(
             q, k_shared, v_shared, kv_data, causal=causal
         )
 
-    numpy.testing.assert_allclose(
+    torch.testing.assert_close(
         o_multi_level.cpu().numpy(), o_two_level.cpu().numpy(), rtol=1e-3, atol=1e-3
     )
 
@@ -217,10 +215,10 @@ def test_merge_state_in_place_with_mask(seed, num_tries):
     flashinfer.merge_state_in_place(va, sa, vb, sb, mask=mask)
     va_merged = va
     sa_merged = sa
-    numpy.testing.assert_allclose(
+    torch.testing.assert_close(
         va_merged.cpu().numpy(), va_merged_ref.cpu().numpy(), rtol=1e-3, atol=1e-3
     )
-    numpy.testing.assert_allclose(
+    torch.testing.assert_close(
         sa_merged.cpu().numpy(), sa_merged_ref.cpu().numpy(), rtol=1e-3, atol=1e-3
     )
 
@@ -231,10 +229,10 @@ def test_merge_state_in_place_with_mask(seed, num_tries):
     flashinfer.merge_state_in_place(va, sa, vb, sb, mask=mask)
     va_merged = va
     sa_merged = sa
-    numpy.testing.assert_allclose(
+    torch.testing.assert_close(
         va_merged.cpu().numpy(), va_orginal.cpu().numpy(), rtol=1e-3, atol=1e-3
     )
-    numpy.testing.assert_allclose(
+    torch.testing.assert_close(
         sa_merged.cpu().numpy(), sa_original.cpu().numpy(), rtol=1e-3, atol=1e-3
     )
 
@@ -254,25 +252,25 @@ def test_merge_state_in_place_with_mask(seed, num_tries):
         va_merged = va
         sa_merged = sa
 
-        numpy.testing.assert_allclose(
+        torch.testing.assert_close(
             va_merged[false_indices].cpu().numpy(),
             va_orginal[false_indices].cpu().numpy(),
             rtol=1e-3,
             atol=1e-3,
         )
-        numpy.testing.assert_allclose(
+        torch.testing.assert_close(
             sa_merged[false_indices].cpu().numpy(),
             sa_original[false_indices].cpu().numpy(),
             rtol=1e-3,
             atol=1e-3,
         )
-        numpy.testing.assert_allclose(
+        torch.testing.assert_close(
             va_merged[true_indices].cpu().numpy(),
             va_merged_ref[true_indices].cpu().numpy(),
             rtol=1e-3,
             atol=1e-3,
         )
-        numpy.testing.assert_allclose(
+        torch.testing.assert_close(
             sa_merged[true_indices].cpu().numpy(),
             sa_merged_ref[true_indices].cpu().numpy(),
             rtol=1e-3,

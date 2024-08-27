@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import numpy
-import torch
-import pytest
 import flashinfer
+import numpy
+import pytest
+import torch
 
 
 def numpy_packbits_ref(x_cpu: torch.Tensor, bitorder: str):
