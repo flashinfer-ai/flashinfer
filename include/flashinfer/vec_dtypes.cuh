@@ -34,30 +34,30 @@ namespace flashinfer {
 #if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 < 120400) && \
     (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ < 800))
 // CUDA version < 12.4 and GPU architecture < 80
-FLASHINFER_INLINE __nv_bfloat162 make_bfloat162(const __nv_bfloat16 x, const __nv_bfloat16 y) {
-  __nv_bfloat162 t;
-  t.x = x;
-  t.y = y;
-  return t;
-}
+// FLASHINFER_INLINE __nv_bfloat162 make_bfloat162(const __nv_bfloat16 x, const __nv_bfloat16 y) {
+//   __nv_bfloat162 t;
+//   t.x = x;
+//   t.y = y;
+//   return t;
+// }
 
-FLASHINFER_INLINE __nv_bfloat162 __floats2bfloat162_rn(const float a, const float b) {
-  __nv_bfloat162 val;
-  val = __nv_bfloat162(__float2bfloat16_rn(a), __float2bfloat16_rn(b));
-  return val;
-}
+// FLASHINFER_INLINE __nv_bfloat162 __floats2bfloat162_rn(const float a, const float b) {
+//   __nv_bfloat162 val;
+//   val = __nv_bfloat162(__float2bfloat16_rn(a), __float2bfloat16_rn(b));
+//   return val;
+// }
 
-FLASHINFER_INLINE __nv_bfloat162 __float22bfloat162_rn(const float2 a) {
-  __nv_bfloat162 val = __floats2bfloat162_rn(a.x, a.y);
-  return val;
-}
-FLASHINFER_INLINE float2 __bfloat1622float2(const __nv_bfloat162 a) {
-  float hi_float;
-  float lo_float;
-  lo_float = __internal_bfloat162float(((__nv_bfloat162_raw)a).x);
-  hi_float = __internal_bfloat162float(((__nv_bfloat162_raw)a).y);
-  return make_float2(lo_float, hi_float);
-}
+// FLASHINFER_INLINE __nv_bfloat162 __float22bfloat162_rn(const float2 a) {
+//   __nv_bfloat162 val = __floats2bfloat162_rn(a.x, a.y);
+//   return val;
+// }
+// FLASHINFER_INLINE float2 __bfloat1622float2(const __nv_bfloat162 a) {
+//   float hi_float;
+//   float lo_float;
+//   lo_float = __internal_bfloat162float(((__nv_bfloat162_raw)a).x);
+//   hi_float = __internal_bfloat162float(((__nv_bfloat162_raw)a).y);
+//   return make_float2(lo_float, hi_float);
+// }
 #endif
 
 /******************* vec_t type cast *******************/
