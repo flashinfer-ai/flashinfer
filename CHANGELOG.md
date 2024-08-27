@@ -1,10 +1,67 @@
 # Changelog
 
+## [0.1.6](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.5...v0.1.6) (2024-08-27)
+
+### SM75 Support
+
+Starting from [0.1.6](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.5...v0.1.6), our pre-built wheels include experimental support sm75 (Turing architecture GPUs such as Tesla T4, Quadro RTX 6000 and RTX 2080).
+
+### API Changes
+
+#### `plan`/`run`
+
+Since [0.1.6](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.5...v0.1.6) on, `begin_forward`/`forward`/`end_forward` APIs are replaced with the new `plan`/`run` API.
+- `forward` is renamed to `run`, which is more precise and consistent with the naming convention of cutlass's python API.
+- `begin_forward` is renamed to `plan`, which is consistent with the naming convention of nvmath API.
+- `end_forward` is deprecated and has no effect after this PR.
+
+There is some slight difference between the old `forward` and the new `run` API:
+- All extra arguments such as `causal` and `logits_soft_cap` will be provided in `plan` (previously `begin_forward`) API, and cached until next `plan` call, and we only need to provide query and KV-Cache tensors in `run` API.
+
+The old `begin_forward`/`forward`/`end_forward` APIs are still functional, but we will gradually deprecate them in future releases.
+
+Check [#466](https://github.com/flashinfer-ai/flashinfer/pull/466) for more details.
+
+#### `MultiLevelCascadeAttentionWrapper`
+
+Since [0.1.6](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.5...v0.1.6) on, we introduce a new `MultiLevelCascadeAttentionWrapper` API for cascade inference,
+which supports multi-level cascade inference where all levels' KV-Cache can be managed in a unified Paged KV-Cache.
+
+See [documentation](https://docs.flashinfer.ai/api/python/cascade.html#flashinfer.cascade.MultiLevelCascadeAttentionWrapper) and [tutorial](https://docs.flashinfer.ai/tutorials/kv_layout.html#multi-level-cascade-inference-data-layout) on API usage and layout explaination.
+
+The old `BatchDecodeWithSharedPrefixPagedKVCacheWrapper` and `BatchPrefillWithSharedPrefixPagedKVCacheWrapper` will be deprecated in future releases.
+
+### Features
+
+* sm75 support ([#448](https://github.com/flashinfer-ai/flashinfer/pull/448), [#449](https://github.com/flashinfer-ai/flashinfer/pull/449))
+* add `MultiLevelCascadeAttentionWrapper` API ([#462](https://github.com/flashinfer-ai/flashinfer/issues/462)) ([1e37989](https://github.com/flashinfer-ai/flashinfer/commit/1e379898a589cdd4ff18a4621fcbe18d63501545))
+* add accept num, emit num metric for ChainSpeculativeSampling ([#450](https://github.com/flashinfer-ai/flashinfer/issues/450)) ([fa38b5e](https://github.com/flashinfer-ai/flashinfer/commit/fa38b5e34b9591bd5ab07186bea229ea95307755))
+* support bmm fp8 ([#469](https://github.com/flashinfer-ai/flashinfer/issues/469)) ([f1c0b68](https://github.com/flashinfer-ai/flashinfer/commit/f1c0b68d0f4a77ff3bf705307b3529b996fc9826))
+
+### Refactor
+
+* refactor: replace `begin_forward`/`forward`/`end_forward` with `plan`/`run` [#466](https://github.com/flashinfer-ai/flashinfer/pull/466)
+
+### Misc
+
+* misc: improve error handling of sampling kernels ([#456](https://github.com/flashinfer-ai/flashinfer/pull/456)) ([0dce178](https://github.com/flashinfer-ai/flashinfer/commit/0dce178389e5e85b1d40212b1d12d1754304e46))
+
+### Performance Improvements
+
+* slight optimization on f16-&gt;f8 fragment layout swizzling ([#453](https://github.com/flashinfer-ai/flashinfer/issues/453)) ([0d61871](https://github.com/flashinfer-ai/flashinfer/commit/0d618712faff20a84bbd513d02ac01e16be19306))
+* slight optimization on fragment layout swizzle ([#458](https://github.com/flashinfer-ai/flashinfer/issues/458)) ([7c397cb](https://github.com/flashinfer-ai/flashinfer/commit/7c397cbd81d4fa5da8aef9f105576dbe67f6c22b))
+* use persistent kernel for merging attention states ([#459](https://github.com/flashinfer-ai/flashinfer/issues/459)) ([be6bf5b](https://github.com/flashinfer-ai/flashinfer/commit/be6bf5bb26f1f1b3edf094d903544600c574ee09))
+
+### Acknowledgement
+
+We thank [@LiuXiaoxuanPKU](https://github.com/LiuXiaoxuanPKU) on enhance of speculative sampling operator, [@merrymercy](https://github.com/merrymercy) on API change suggestion and [@zhyncs](https://github.com/zhyncs) on integrating fp8 BMM cublas implementation.
+
 ## [0.1.5](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.4...v0.1.5) (2024-08-13)
 
 
 ### Bugfix
 
+* resolve cu121 compile wired issue ([#446](https://github.com/flashinfer-ai/flashinfer/issues/446)) ([5f0159e](https://github.com/flashinfer-ai/flashinfer/commit/5f0159e6abeb7308d965bb1b9aef05547b8a57b3))
 * Fix PagedPrefill python api and some typos ([#441](https://github.com/flashinfer-ai/flashinfer/pull/441)) ([3fff008](https://github.com/flashinfer-ai/flashinfer/commit/3fff008dc9af56c325d9c487bddf69ff014f3989))
 * fix prefill kernels' lse result for empty kv-cache ([#440](https://github.com/flashinfer-ai/flashinfer/pull/440)) ([6ac28f4](https://github.com/flashinfer-ai/flashinfer/commit/6ac28f4dd3a9a34a2b4abcbe0a815fc59a2d74ad))
 
