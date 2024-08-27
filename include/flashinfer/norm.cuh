@@ -44,7 +44,7 @@ __global__ void RMSNormKernel(T* __restrict__ input, T* __restrict__ weight, T* 
 
   for (uint32_t i = 0; i < rounds; i++) {
     vec_t<T, VEC_SIZE> input_vec;
-    input_vec.fill(0);
+    input_vec.fill(0.f);
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       input_vec.load(input + bx * d + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
     }
@@ -79,8 +79,8 @@ __global__ void RMSNormKernel(T* __restrict__ input, T* __restrict__ weight, T* 
     vec_t<T, VEC_SIZE> input_vec;
     vec_t<T, VEC_SIZE> weight_vec;
     vec_t<T, VEC_SIZE> output_vec;
-    input_vec.fill(0);
-    weight_vec.fill(0);
+    input_vec.fill(0.f);
+    weight_vec.fill(0.f);
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       input_vec.load(input + bx * d + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
       weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
@@ -130,9 +130,9 @@ __global__ void FusedAddRMSNormKernel(T* __restrict__ input, T* __restrict__ res
 
   for (uint32_t i = 0; i < rounds; i++) {
     vec_t<T, VEC_SIZE> input_vec;
-    input_vec.fill(0);
+    input_vec.fill(0.f);
     vec_t<T, VEC_SIZE> residual_vec;
-    residual_vec.fill(0);
+    residual_vec.fill(0.f);
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       input_vec.load(input + bx * d + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
       residual_vec.load(residual + bx * d + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
@@ -174,9 +174,9 @@ __global__ void FusedAddRMSNormKernel(T* __restrict__ input, T* __restrict__ res
     vec_t<T, VEC_SIZE> input_vec;
     vec_t<T, VEC_SIZE> weight_vec;
     vec_t<T, VEC_SIZE> residual_vec;
-    input_vec.fill(0);
-    weight_vec.fill(0);
-    residual_vec.fill(0);
+    input_vec.fill(0.f);
+    weight_vec.fill(0.f);
+    residual_vec.fill(0.f);
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       input_vec.load(input + bx * d + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
       weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
