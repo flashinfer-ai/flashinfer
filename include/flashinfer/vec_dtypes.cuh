@@ -41,7 +41,7 @@ FLASHINFER_INLINE __nv_bfloat162 make_bfloat162(const __nv_bfloat16 x, const __n
   return t;
 }
 
-FLASHFLASHINFER_INLINE __nv_bfloat16 __hmul(const __nv_bfloat16 a, const __nv_bfloat16 b) {
+FLASHINFER_INLINE __nv_bfloat16 __hmul(const __nv_bfloat16 a, const __nv_bfloat16 b) {
   __nv_bfloat16 val;
   const float fa = __bfloat162float(a);
   const float fb = __bfloat162float(b);
