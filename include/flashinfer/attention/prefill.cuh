@@ -1059,7 +1059,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
     const float log2_rope_rcp_theta) {
 #if (__CUDA_ARCH__ < 800)
   if (std::is_same<DTypeQ, nv_bfloat16>::value) {
-    FLASHINFER_RUNTIME_ASSERT("Prefill kernels do not support bf16 on sm75.")
+    FLASHINFER_RUNTIME_ASSERT("Prefill kernels do not support bf16 on sm75.");
   } else {
 #endif
     static_assert(sizeof(DTypeQ) == 2);
@@ -1333,7 +1333,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
     float sm_scale, const float log2_rope_rcp_scale, const float log2_rope_rcp_theta) {
 #if (__CUDA_ARCH__ < 800)
   if (std::is_same<DTypeQ, nv_bfloat16>::value) {
-    FLASHINFER_RUNTIME_ASSERT("Prefill kernels do not support bf16 on sm75.")
+    FLASHINFER_RUNTIME_ASSERT("Prefill kernels do not support bf16 on sm75.");
   } else {
 #endif
     static_assert(sizeof(DTypeQ) == 2);
@@ -1635,7 +1635,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
     const float log2_rope_rcp_scale, const float log2_rope_rcp_theta) {
 #if (__CUDA_ARCH__ < 800)
   if (std::is_same<DTypeQ, nv_bfloat16>::value) {
-    FLASHINFER_RUNTIME_ASSERT("Prefill kernels do not support bf16 on sm75.")
+    FLASHINFER_RUNTIME_ASSERT("Prefill kernels do not support bf16 on sm75.");
   } else {
 #endif
     static_assert(sizeof(DTypeQ) == 2);
