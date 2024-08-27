@@ -149,7 +149,7 @@ and prefill/append attention between queries stored in ragged tensors and keys/v
 .. _cascade-inference-data-layout:
 
 Multi-level Cascade Inference Data Layout
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-----------------------------------------
 
 When using multi-level `cascade inference <https://flashinfer.ai/2024/02/02/cascade-inference.html>`_,
 the query and output are stored in ragged tensors, and KV-Cache of all levels are stored
@@ -175,7 +175,7 @@ FlashInfer provides :class:`flashinfer.cascade.MultiLevelCascadeAttentionWrapper
 the cascade attention.
 
 FAQ
-^^^
+---
 
 How do FlashInfer manages KV-Cache?
   FlashInfer itself is not responsible for managing the page-table (pop and allocate new pages, etc.) and we leave the strategy
