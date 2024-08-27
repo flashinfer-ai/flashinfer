@@ -79,6 +79,9 @@ void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tenso
 
 torch::Tensor gemma_rmsnorm(torch::Tensor input, torch::Tensor weight, double eps);
 
+void gemma_fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight,
+                             double eps);
+
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 
 void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);

@@ -40,6 +40,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rmsnorm", &rmsnorm, "Root mean square normalization");
   m.def("fused_add_rmsnorm", &fused_add_rmsnorm, "Fused add root mean square normalization");
   m.def("gemma_rmsnorm", &gemma_rmsnorm, "Gemma Root mean square normalization");
+  m.def("gemma_fused_add_rmsnorm", &gemma_fused_add_rmsnorm,
+        "Gemma Fused add root mean square normalization");
   m.def("silu_and_mul", &silu_and_mul, "Fused SiLU and Mul");
   m.def("gelu_tanh_and_mul", &gelu_tanh_and_mul, "Fused GeLU Tanh and Mul");
   m.def("gelu_and_mul", &gelu_and_mul, "Fused GeLU and Mul");
