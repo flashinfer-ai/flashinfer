@@ -69,3 +69,23 @@ def fused_add_rmsnorm(
         Epsilon for numerical stability.
     """
     _kernels.fused_add_rmsnorm(input, residual, weight, eps)
+
+
+def gemma_rmsnorm(input: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6):
+    r"""Gemma Root mean square normalization.
+
+    Parameters
+    ----------
+    input: torch.Tensor
+        Input tensor, shape (batch_size, hidden_size).
+    weight: torch.Tensor
+        Weight tensor, shape (hidden_size,).
+    eps: float
+        Epsilon for numerical stability.
+
+    Returns
+    -------
+    output: torch.Tensor
+        Gemma Normalized tensor, shape (batch_size, hidden_size).
+    """
+    return _kernels.gemma_rmsnorm(input, weight, eps)

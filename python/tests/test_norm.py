@@ -29,6 +29,16 @@ def llama_rms_norm(x, w, eps=1e-6):
     return output * w
 
 
+def gemma_rms_norm(x, w, eps=1e-6):
+    orig_dtype = x.dtype
+    x = x.float()
+    variance = x.pow(2).mean(dim=-1, keepdim=True)
+    x = x * torch.rsqrt(variance + eps)
+    x = x * (1.0 + w)
+    x = x.to(orig_dtype)
+    return x
+
+
 def fused_add_rms_norm(x, residual, weight, eps):
     orig_dtype = x.dtype
     x = x.to(torch.float32)
@@ -76,3 +86,18 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype):
 
     torch.testing.assert_close(x_fused, x_native, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(residual_fused, residual_native, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
+@pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 4096, 8192])
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_gemma_norm(batch_size, hidden_size, dtype):
+    x = torch.randn(batch_size, hidden_size).to(0).to(dtype)
+    w = torch.randn(hidden_size).to(0).to(dtype)
+
+    y_ref = gemma_rms_norm(x, w)
+    y = flashinfer.norm.gemma_rmsnorm(x, w)
+
+    numpy.testing.assert_allclose(
+        y_ref.cpu().numpy(), y.cpu().numpy(), rtol=1e-3, atol=1e-3
+    )
