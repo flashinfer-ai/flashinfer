@@ -486,7 +486,7 @@ if(FLASHINFER_FASTDEQUANT_TEST)
   target_include_directories(test_fast_dequant PRIVATE ${FLASHINFER_INCLUDE_DIR})
   target_include_directories(test_fast_dequant PRIVATE ${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
   target_link_libraries(test_fast_dequant PRIVATE gtest gtest_main)
-endif(FLASHINFER_FASTDIV_TEST)
+endif(FLASHINFER_FASTDEQUANT_TEST)
 
 
 
