@@ -452,9 +452,10 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
 
     Check :ref:`our tutorial<page-layout>` for page table layout.
 
-    It is recommended to use :class:`MultiLevelCascadeAttentionWrapper` instead for general
-    multi-level cascade inference, where the KV-Cache of each level is stored in a unified
-    page table. This API will be deprecated in the future.
+    Warning
+    -------
+    This API will be deprecated in the future, please use
+    :class:`MultiLevelCascadeAttentionWrapper` instead.
 
     Example
     -------

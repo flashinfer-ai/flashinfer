@@ -38,7 +38,7 @@ def test_segment_gemm(
         pytest.skip("batch_size * num_rows_per_batch too large for test.")
     torch.manual_seed(42)
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
-    segment_gemm = flashinfer.group_gemm.SegmentGEMMWrapper(workspace_buffer)
+    segment_gemm = flashinfer.gemm.SegmentGEMMWrapper(workspace_buffer)
     x = (
         (torch.randn(batch_size * num_rows_per_batch, d_in) / 10)
         .to(0)
