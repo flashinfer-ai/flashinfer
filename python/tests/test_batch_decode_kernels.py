@@ -14,11 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import numpy
+import flashinfer
 import pytest
 import torch
-
-import flashinfer
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -126,7 +124,7 @@ def test_batch_decode_with_paged_kv_cache(
         )
         o_i_np = o[i].cpu().numpy()
         o_ref_i_np = o_ref_i.cpu().numpy()
-        numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -238,7 +236,7 @@ def test_batch_decode_with_tuple_paged_kv_cache(
         )
         o_i_np = o[i].cpu().numpy()
         o_ref_i_np = o_ref_i.cpu().numpy()
-        numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -402,7 +400,7 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
         )
         o_i_np = o[i].cpu().numpy()
         o_ref_i_np = o_ref_i.cpu().numpy()
-        numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":

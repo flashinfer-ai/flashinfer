@@ -14,11 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import numpy
+import flashinfer
 import pytest
 import torch
-
-import flashinfer
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -208,7 +206,7 @@ def test_batch_prefill_with_paged_kv_cache(
         )
         o_i_np = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]].cpu().numpy()
         o_ref_i_np = o_ref_i.cpu().numpy()
-        numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -398,7 +396,7 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
         )
         o_i_np = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]].cpu().numpy()
         o_ref_i_np = o_ref_i.cpu().numpy()
-        numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -492,7 +490,7 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
         o_causal, _ = wrapper.run_return_lse(q, kv_data)
     else:
         o_causal = wrapper.run(q, kv_data)
-    numpy.testing.assert_allclose(
+    torch.testing.assert_close(
         o_custom.cpu().numpy(), o_causal.cpu().numpy(), rtol=1e-3, atol=1e-3
     )
 
@@ -557,7 +555,7 @@ def test_batch_prefill_with_ragged_kv_cache(
         )
         o_i_np = o[q_indptr[i] : q_indptr[i + 1]].cpu().numpy()
         o_ref_i_np = o_ref_i.cpu().numpy()
-        numpy.testing.assert_allclose(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -633,7 +631,7 @@ def test_batch_prefill_with_ragged_kv_cache_custom_mask(
         o_causal, _ = wrapper.run_return_lse(q, k, v)
     else:
         o_causal = wrapper.run(q, k, v)
-    numpy.testing.assert_allclose(
+    torch.testing.assert_close(
         o_custom.cpu().numpy(), o_causal.cpu().numpy(), rtol=1e-3, atol=1e-3
     )
 

@@ -15,9 +15,8 @@ limitations under the License.
 """
 
 import flashinfer
-import numpy as np
-import torch
 import pytest
+import torch
 
 
 @pytest.mark.parametrize("batch_size", [1, 77, 199])
@@ -74,7 +73,7 @@ def test_segment_gemm(
 
     if use_weight_indices:
         for i in range(batch_size):
-            np.testing.assert_allclose(
+            torch.testing.assert_close(
                 y[i * num_rows_per_batch : (i + 1) * num_rows_per_batch].cpu().numpy(),
                 torch.matmul(
                     x[i * num_rows_per_batch : (i + 1) * num_rows_per_batch],
@@ -91,7 +90,7 @@ def test_segment_gemm(
                 err_msg="assertion failed at batch {}".format(i),
             )
     else:
-        np.testing.assert_allclose(
+        torch.testing.assert_close(
             y.cpu().numpy(),
             torch.matmul(
                 x.view(batch_size, num_rows_per_batch, d_in),

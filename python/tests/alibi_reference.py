@@ -12,10 +12,11 @@ Source:
 - https://github.com/labmlai/annotated_deep_learning_paper_implementations/blob/285cb3735bde02fbc8c19ddeb24d0ae7e77135c1/labml_nn/transformers/alibi/__init__.py
 """
 
-import torch
 import math
+from typing import List, Optional
+
+import torch
 from torch import nn
-from typing import Optional, List
 
 
 def get_slopes(n_heads: int):

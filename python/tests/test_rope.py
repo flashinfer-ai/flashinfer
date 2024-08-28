@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import torch
-import numpy as np
 import flashinfer
 import pytest
+import torch
+
 from rope_reference import *
 
 
@@ -69,10 +69,10 @@ def test_llama_rope_inplace(
     )
 
     # compare
-    np.testing.assert_allclose(
+    torch.testing.assert_close(
         q_rope_ref.cpu().numpy(), q.cpu().numpy(), rtol=1e-3, atol=1e-3
     )
-    np.testing.assert_allclose(
+    torch.testing.assert_close(
         k_rope_ref.cpu().numpy(), k.cpu().numpy(), rtol=1e-3, atol=1e-3
     )
 
@@ -125,10 +125,10 @@ def test_llama_rope(
     )
 
     # compare
-    np.testing.assert_allclose(
+    torch.testing.assert_close(
         q_rope_ref.cpu().numpy(), q_rope.cpu().numpy(), rtol=1e-3, atol=1e-3
     )
-    np.testing.assert_allclose(
+    torch.testing.assert_close(
         k_rope_ref.cpu().numpy(), k_rope.cpu().numpy(), rtol=1e-3, atol=1e-3
     )
 
@@ -181,10 +181,10 @@ def test_llama31_rope_inplace(
     )
 
     # compare
-    np.testing.assert_allclose(
+    torch.testing.assert_close(
         q_rope_ref.cpu().numpy(), q.cpu().numpy(), rtol=1e-3, atol=1e-3
     )
-    np.testing.assert_allclose(
+    torch.testing.assert_close(
         k_rope_ref.cpu().numpy(), k.cpu().numpy(), rtol=1e-3, atol=1e-3
     )
 
@@ -237,10 +237,10 @@ def test_llama31_rope(
     )
 
     # compare
-    np.testing.assert_allclose(
+    torch.testing.assert_close(
         q_rope_ref.cpu().numpy(), q_rope.cpu().numpy(), rtol=1e-3, atol=1e-3
     )
-    np.testing.assert_allclose(
+    torch.testing.assert_close(
         k_rope_ref.cpu().numpy(), k_rope.cpu().numpy(), rtol=1e-3, atol=1e-3
     )
 

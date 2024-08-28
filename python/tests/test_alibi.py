@@ -14,11 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import numpy
+import flashinfer
 import pytest
 import torch
-
-import flashinfer
 
 from alibi_reference import alibi_attention
 
@@ -38,7 +36,7 @@ def test_single_decode_alibi(
     o = flashinfer.single_decode_with_kv_cache(q, k, v, pos_encoding_mode="ALIBI")
     mask = torch.ones(1, seq_len, dtype=torch.bool).to(0)
     o_ref = alibi_attention(q.unsqueeze(0), k, v, mask).squeeze(0)
-    numpy.testing.assert_allclose(
+    torch.testing.assert_close(
         o.cpu().numpy(), o_ref.cpu().numpy(), rtol=1e-3, atol=1e-3
     )
 
@@ -68,7 +66,7 @@ def test_single_prefill_alibi(
     if causal:
         mask = torch.tril(mask, diagonal=kv_len - q_len)
     o_ref = alibi_attention(q, k, v, mask)
-    numpy.testing.assert_allclose(
+    torch.testing.assert_close(
         o.cpu().numpy(), o_ref.cpu().numpy(), rtol=1e-2, atol=1e-2
     )
 
