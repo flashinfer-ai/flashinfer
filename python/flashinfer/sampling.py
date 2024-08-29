@@ -165,7 +165,7 @@ def top_p_sampling_from_probs(
     --------
     top_k_top_p_sampling_from_probs
     top_k_sampling_from_probs
-    top_p_renorm_prob
+    top_p_renorm_probs
     """
     if check_nan:
         if torch.any(torch.isnan(probs)):
@@ -247,7 +247,7 @@ def top_k_sampling_from_probs(
     --------
     top_k_top_p_sampling_from_probs
     top_p_sampling_from_probs
-    top_k_renorm_prob
+    top_k_renorm_probs
     """
     if check_nan:
         if torch.any(torch.isnan(probs)):
@@ -536,12 +536,12 @@ def top_k_top_p_sampling_from_probs(
     --------
     top_k_sampling_from_probs
     top_p_sampling_from_probs
-    top_k_renorm_prob
-    top_p_renorm_prob
+    top_k_renorm_probs
+    top_p_renorm_probs
     top_k_mask_logits
     """
     if filter_apply_order == "top_k_first":
-        renorm_probs = top_k_renorm_prob(probs, top_k)
+        renorm_probs = top_k_renorm_probs(probs, top_k)
         return top_p_sampling_from_probs(
             renorm_probs, uniform_samples, top_p, deterministic, check_nan=check_nan
         )
@@ -560,7 +560,7 @@ def top_k_top_p_sampling_from_probs(
         raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
 
 
-def top_p_renorm_prob(
+def top_p_renorm_probs(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
 ) -> torch.Tensor:
@@ -599,8 +599,8 @@ def top_p_renorm_prob(
             [0.2205, 0.0942, 0.2912, 0.3452, 0.0489],
             [0.2522, 0.1602, 0.2346, 0.1532, 0.2000],
             [0.1543, 0.3182, 0.2062, 0.0958, 0.2255]], device='cuda:0')
-    >>> renormed_prob = flashinfer.sampling.top_p_renorm_prob(prob, top_p)
-    >>> renormed_prob
+    >>> renormed_probs = flashinfer.sampling.top_p_renorm_probs(prob, top_p)
+    >>> renormed_probs
     tensor([[0.0000, 0.4882, 0.0000, 0.5118, 0.0000],
             [0.0000, 0.0000, 0.0000, 1.0000, 0.0000],
             [0.5181, 0.0000, 0.4819, 0.0000, 0.0000],
@@ -608,19 +608,22 @@ def top_p_renorm_prob(
 
     Note
     ----
-    This combination of ``top_p_renorm_prob`` and ``sampling_from_probs`` should be equivalent to
+    This combination of ``top_p_renorm_probs`` and ``sampling_from_probs`` should be equivalent to
     ``top_p_sampling_from_probs``.
 
     See Also
     --------
     top_p_sampling_from_probs
     sampling_from_probs
-    top_k_renorm_prob
+    top_k_renorm_probs
     """
-    return _kernels.top_p_renorm_prob(probs, *_to_tensor_scalar_tuple(top_p))
+    return _kernels.top_p_renorm_probs(probs, *_to_tensor_scalar_tuple(top_p))
 
 
-def top_k_renorm_prob(
+top_p_renorm_prob = top_p_renorm_probs
+
+
+def top_k_renorm_probs(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
 ) -> torch.Tensor:
@@ -658,8 +661,8 @@ def top_k_renorm_prob(
             [0.2205, 0.0942, 0.2912, 0.3452, 0.0489],
             [0.2522, 0.1602, 0.2346, 0.1532, 0.2000],
             [0.1543, 0.3182, 0.2062, 0.0958, 0.2255]], device='cuda:0')
-    >>> renormed_prob = flashinfer.sampling.top_k_renorm_prob(prob, top_k)
-    >>> renormed_prob
+    >>> renormed_probs = flashinfer.sampling.top_k_renorm_probs(prob, top_k)
+    >>> renormed_probs
     tensor([[0.3201, 0.3319, 0.0000, 0.3480, 0.0000],
             [0.2573, 0.0000, 0.3398, 0.4028, 0.0000],
             [0.3672, 0.0000, 0.3416, 0.0000, 0.2912],
@@ -667,16 +670,19 @@ def top_k_renorm_prob(
 
     Note
     ----
-    This combination of ``top_k_renorm_prob`` and ``sampling_from_probs`` should be equivalent to
+    This combination of ``top_k_renorm_probs`` and ``sampling_from_probs`` should be equivalent to
     ``top_k_sampling_from_probs``.
 
     See Also
     --------
     top_k_sampling_from_probs
     sampling_from_probs
-    top_p_renorm_prob
+    top_p_renorm_probs
     """
-    return _kernels.top_k_renorm_prob(probs, *_to_tensor_scalar_tuple(top_k))
+    return _kernels.top_k_renorm_probs(probs, *_to_tensor_scalar_tuple(top_k))
+
+
+top_k_renorm_prob = top_k_renorm_probs
 
 
 def top_k_mask_logits(
@@ -724,11 +730,11 @@ def top_k_mask_logits(
 
     Note
     ----
-    The combination of ``top_k_mask_logits`` and ``softmax`` should be equivalent to ``top_k_renorm_prob``.
+    The combination of ``top_k_mask_logits`` and ``softmax`` should be equivalent to ``top_k_renorm_probs``.
 
     See Also
     --------
-    top_k_renorm_prob
+    top_k_renorm_probs
     """
     return _kernels.top_k_mask_logits(logits, *_to_tensor_scalar_tuple(top_k))
 
