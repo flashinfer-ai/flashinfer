@@ -231,7 +231,7 @@ def test_top_k_top_p_joint_sampling_from_logits(batch_size, vocab_size, p):
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
 @pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
-def test_top_p_renorm_prob(batch_size, vocab_size, p):
+def test_top_p_renorm_probs(batch_size, vocab_size, p):
     pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
     sorted_prob, indices = torch.sort(normalized_prob, descending=False)
@@ -244,7 +244,7 @@ def test_top_p_renorm_prob(batch_size, vocab_size, p):
         dim=-1, keepdim=True
     )
 
-    renorm_prob = flashinfer.sampling.top_p_renorm_prob(normalized_prob, p)
+    renorm_prob = flashinfer.sampling.top_p_renorm_probs(normalized_prob, p)
     torch.testing.assert_close(
         renorm_prob_ground_truth.cpu().numpy(),
         renorm_prob.cpu().numpy(),
@@ -256,7 +256,7 @@ def test_top_p_renorm_prob(batch_size, vocab_size, p):
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 100, 500])
-def test_top_k_renorm_prob(batch_size, vocab_size, k):
+def test_top_k_renorm_probs(batch_size, vocab_size, k):
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
     torch.manual_seed(42)
@@ -271,7 +271,7 @@ def test_top_k_renorm_prob(batch_size, vocab_size, k):
         dim=-1, keepdim=True
     )
 
-    renorm_prob = flashinfer.sampling.top_k_renorm_prob(normalized_prob, k)
+    renorm_prob = flashinfer.sampling.top_k_renorm_probs(normalized_prob, k)
     torch.testing.assert_close(
         renorm_prob_ground_truth.cpu().numpy(),
         renorm_prob.cpu().numpy(),
@@ -392,8 +392,8 @@ if __name__ == "__main__":
     test_sampling(1, 111)
     test_top_p_sampling(3, 111, 0.9)
     test_top_k_sampling(3, 111, 10)
-    test_top_p_renorm_prob(3, 111, 0.9)
-    test_top_k_renorm_prob(3, 111, 10)
+    test_top_p_renorm_probs(3, 111, 0.9)
+    test_top_k_renorm_probs(3, 111, 10)
     test_top_k_mask_logits(99, 989, 10)
     test_chain_speculative_sampling(3, 111, 3, False)
     test_chain_speculative_sampling(3, 111, 3, True)

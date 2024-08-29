@@ -220,8 +220,8 @@ std::vector<torch::Tensor> top_k_top_p_sampling_from_probs(
   return {samples, success};
 }
 
-torch::Tensor top_p_renorm_prob(torch::Tensor probs, std::optional<torch::Tensor> maybe_top_p_arr,
-                                double top_p_val) {
+torch::Tensor top_p_renorm_probs(torch::Tensor probs, std::optional<torch::Tensor> maybe_top_p_arr,
+                                 double top_p_val) {
   CHECK_INPUT(probs);
   auto device = probs.device();
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
@@ -251,8 +251,8 @@ torch::Tensor top_p_renorm_prob(torch::Tensor probs, std::optional<torch::Tensor
   return renorm_probs;
 }
 
-torch::Tensor top_k_renorm_prob(torch::Tensor probs, std::optional<torch::Tensor> maybe_top_k_arr,
-                                unsigned int top_k_val) {
+torch::Tensor top_k_renorm_probs(torch::Tensor probs, std::optional<torch::Tensor> maybe_top_k_arr,
+                                 unsigned int top_k_val) {
   CHECK_INPUT(probs);
   auto device = probs.device();
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)

@@ -32,8 +32,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Top-p sampling from probabilities");
   m.def("top_k_top_p_sampling_from_probs", &top_k_top_p_sampling_from_probs,
         "Top-k and top-p sampling from probabilities");
-  m.def("top_k_renorm_prob", &top_k_renorm_prob, "Renormalize probabilities by top-k mask");
-  m.def("top_p_renorm_prob", &top_p_renorm_prob, "Renormalize probabilities by top-p mask");
+  m.def("top_k_renorm_probs", &top_k_renorm_probs, "Renormalize probabilities by top-k mask");
+  m.def("top_p_renorm_probs", &top_p_renorm_probs, "Renormalize probabilities by top-p mask");
   m.def("top_k_mask_logits", &top_k_mask_logits, "Mask logits by top-k mask");
   m.def("chain_speculative_sampling", &chain_speculative_sampling,
         "Speculative sampling from sequence of probabilities");
