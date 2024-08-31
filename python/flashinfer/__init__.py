@@ -28,7 +28,7 @@ from .decode import (
     CUDAGraphBatchDecodeWithPagedKVCacheWrapper,
     single_decode_with_kv_cache,
 )
-from .gemm import SegmentGEMMWrapper, bmm_fp8
+from .gemm import SegmentGEMMWrapper, bmm_fp8, bmm_fp8_no_scale
 from .norm import fused_add_rmsnorm, gemma_fused_add_rmsnorm, gemma_rmsnorm, rmsnorm
 from .page import append_paged_kv_cache
 from .prefill import (

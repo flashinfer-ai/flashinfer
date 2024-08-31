@@ -1,7 +1,7 @@
 import pytest
 import torch
 import torch.nn.functional as F
-from flashinfer import bmm_fp8
+from flashinfer import bmm_fp8, bmm_fp8_no_scale
 
 
 def to_float8(x, dtype=torch.float8_e4m3fn):
@@ -30,6 +30,34 @@ def test_bmm_fp8(input_dtype, mat2_dtype, res_dtype):
 
     res = torch.empty([16, 48, 80], device="cuda", dtype=res_dtype)
     bmm_fp8(input_fp8, mat2_fp8, input_inv_s, mat2_inv_s, res_dtype, res)
+
+    reference = torch.bmm(input, mat2)
+
+    cos_sim = F.cosine_similarity(reference.reshape(-1), res.reshape(-1), dim=0)
+    assert cos_sim > 0.98
+
+
+@pytest.mark.parametrize("input_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("mat2_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
+def test_bmm_fp8_no_scale(input_dtype, mat2_dtype, res_dtype):
+    if input_dtype == torch.float8_e5m2 and mat2_dtype == torch.float8_e5m2:
+        pytest.skip("Invalid combination: both input and mat2 are e5m2")
+
+    if res_dtype == torch.float16:
+        pytest.skip("Invalid res_dtype: res_dtype must be torch.bfloat16")
+
+    input = torch.randn([16, 48, 64], device="cuda", dtype=torch.bfloat16)
+    input_fp8, _ = to_float8(input, dtype=input_dtype)
+
+    # mat2 row  major -> column major
+    mat2 = torch.randn([16, 80, 64], device="cuda", dtype=torch.bfloat16).transpose(
+        -2, -1
+    )
+    mat2_fp8, _ = to_float8(mat2, dtype=mat2_dtype)
+
+    res = torch.empty([16, 48, 80], device="cuda", dtype=res_dtype)
+    bmm_fp8_no_scale(input_fp8, mat2_fp8, res_dtype, res)
 
     reference = torch.bmm(input, mat2)
 

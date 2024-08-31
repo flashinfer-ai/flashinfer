@@ -224,7 +224,7 @@ def bmm_fp8(
         Scale tensor for B, float.
 
     dtype: torch.dtype
-        out dtype, bf16 or fp16.
+        Out dtype, bf16 or fp16.
 
     out: Optional[torch.Tensor]
         Out tensor, shape (b, m, n), bf16 or fp16, defaults to ``None``.
@@ -264,4 +264,44 @@ def bmm_fp8(
             dtype=dtype,
         )
     _kernels.bmm_fp8(A, B, out, A_scale, B_scale)
+    return out
+
+
+def bmm_fp8_no_scale(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    dtype: Optional[torch.dtype] = torch.bfloat16,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""BMM FP8 No Scale
+
+    Parameters
+    ----------
+    A: torch.Tensor
+        Input tensor, shape (b, m, k), fp8 e4m3 or fp8 e5m2.
+
+    B: torch.Tensor
+        Mat2 tensor, shape (b, k, n), should be column major, fp8 e4m3 or fp8 e5m2.
+
+    dtype: torch.dtype
+        Out dtype, bf16, defaults to ``torch.bfloat16``.
+
+    out: Optional[torch.Tensor]
+        Out tensor, shape (b, m, n), bf16, defaults to ``None``.
+
+    Returns
+    -------
+    out: torch.Tensor
+        Out tensor, shape (b, m, n), bf16.
+    """
+    if dtype != torch.bfloat16:
+        raise RuntimeError("bmm_fp8_no_scale dtype must be torch.bfloat16")
+
+    if out is None:
+        out = torch.empty(
+            (A.shape[0], A.shape[1], B.shape[2]),
+            device=A.device,
+            dtype=dtype,
+        )
+    _kernels.bmm_fp8(A, B, out, torch.Tensor(), torch.Tensor())
     return out

@@ -42,10 +42,11 @@ void bmm_fp8(const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& D,
               "B must be Float8_e4m3fn or Float8_e5m2");
   TORCH_CHECK(D.scalar_type() == torch::kBFloat16 || D.scalar_type() == torch::kHalf,
               "D must be BFloat16 or Half");
-
-  TORCH_CHECK(A_scale.scalar_type() == torch::kFloat32 && B_scale.scalar_type() == torch::kFloat32,
-              "A_scale and B_scale must be Float32");
-
+  if (A_scale.defined() && B_scale.defined()) {
+    TORCH_CHECK(
+        A_scale.scalar_type() == torch::kFloat32 && B_scale.scalar_type() == torch::kFloat32,
+        "A_scale and B_scale must be Float32");
+  }
   auto batch_size = A.size(0);
   auto m = A.size(1);
   auto k = A.size(2);
@@ -57,10 +58,17 @@ void bmm_fp8(const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& D,
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
     return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(A.scalar_type(), a_type, [&] {
       return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(D.scalar_type(), d_type, [&] {
-        flashinfer::bmm_fp8::bmm_fp8_internal_cublaslt(
-            static_cast<b_type*>(B.data_ptr()), static_cast<a_type*>(A.data_ptr()),
-            static_cast<d_type*>(D.data_ptr()), batch_size, n, m, k,
-            static_cast<float*>(B_scale.data_ptr()), static_cast<float*>(A_scale.data_ptr()));
+        if (A_scale.defined() && B_scale.defined()) {
+          flashinfer::bmm_fp8::bmm_fp8_internal_cublaslt(
+              static_cast<b_type*>(B.data_ptr()), static_cast<a_type*>(A.data_ptr()),
+              static_cast<d_type*>(D.data_ptr()), batch_size, n, m, k,
+              static_cast<float*>(B_scale.data_ptr()), static_cast<float*>(A_scale.data_ptr()));
+        } else {
+          flashinfer::bmm_fp8::bmm_fp8_internal_cublaslt(
+              static_cast<b_type*>(B.data_ptr()), static_cast<a_type*>(A.data_ptr()),
+              static_cast<d_type*>(D.data_ptr()), batch_size, n, m, k, nullptr, nullptr);
+        }
+
         return true;
       });
     });

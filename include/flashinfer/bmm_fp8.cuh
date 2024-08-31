@@ -111,16 +111,23 @@ cudaDataType_t get_cuda_data_type() {
 template <typename AT, typename BT, typename DT>
 void bmm_fp8_internal_cublaslt(const AT* A, const BT* B, DT* D, int batch_size, int m, int n, int k,
                                const float* A_scale, const float* B_scale) {
-  const void* A_scale_ptr = static_cast<const void*>(A_scale);
-  const void* B_scale_ptr = static_cast<const void*>(B_scale);
+  const void* A_scale_ptr = nullptr;
+  const void* B_scale_ptr = nullptr;
+  if (A_scale != nullptr && B_scale != nullptr) {
+    A_scale_ptr = static_cast<const void*>(A_scale);
+    B_scale_ptr = static_cast<const void*>(B_scale);
+  }
+
   auto matmul_desp = CuBlasLtMatmulDescriptor(CUBLAS_COMPUTE_32F, CUDA_R_32F);
   matmul_desp.setAttribute(CUBLASLT_MATMUL_DESC_TRANSA, CUBLAS_OP_T);
   matmul_desp.setAttribute(CUBLASLT_MATMUL_DESC_TRANSB, CUBLAS_OP_N);
   int8_t fast_accum = 1;
   matmul_desp.setAttribute(CUBLASLT_MATMUL_DESC_FAST_ACCUM, fast_accum);
 
-  matmul_desp.setAttribute(CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, A_scale_ptr);
-  matmul_desp.setAttribute(CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, B_scale_ptr);
+  if (A_scale_ptr != nullptr && B_scale_ptr != nullptr) {
+    matmul_desp.setAttribute(CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, A_scale_ptr);
+    matmul_desp.setAttribute(CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, B_scale_ptr);
+  }
 
   cudaDataType_t a_type = get_cuda_data_type<AT>();
   cudaDataType_t b_type = get_cuda_data_type<BT>();
