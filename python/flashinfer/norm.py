@@ -16,18 +16,22 @@ limitations under the License.
 
 import torch
 
-# mypy: disable-error-code="attr-defined"
-try:
-    from . import _kernels
-except ImportError as e:
-    import logging
-    import os
+from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR
 
-    if os.environ.get("BUILD_DOC", "0") == "1":
-        _kernels = None
-        logging.warning("Kernels are not loaded in documentation build mode.")
-    else:
-        raise e
+_norm_module = None
+
+
+def get_norm_module():
+    global _norm_module
+    if _norm_module is None:
+        _norm_module = load_cuda_ops(
+            "norm",
+            [
+                FLASHINFER_CSRC_DIR / "norm.cu",
+                FLASHINFER_CSRC_DIR / "flashinfer_norm_ops.cu",
+            ],
+        )
+    return _norm_module
 
 
 def rmsnorm(
@@ -56,7 +60,7 @@ def rmsnorm(
     """
     if out is None:
         out = torch.empty_like(input)
-    _kernels.rmsnorm(out, input, weight, eps)
+    get_norm_module().rmsnorm(out, input, weight, eps)
     return out
 
 
@@ -76,7 +80,7 @@ def fused_add_rmsnorm(
     eps: float
         Epsilon for numerical stability.
     """
-    _kernels.fused_add_rmsnorm(input, residual, weight, eps)
+    get_norm_module().fused_add_rmsnorm(input, residual, weight, eps)
 
 
 def gemma_rmsnorm(
@@ -105,7 +109,7 @@ def gemma_rmsnorm(
     """
     if out is None:
         out = torch.empty_like(input)
-    _kernels.gemma_rmsnorm(out, input, weight, eps)
+    get_norm_module().gemma_rmsnorm(out, input, weight, eps)
     return out
 
 
@@ -125,4 +129,4 @@ def gemma_fused_add_rmsnorm(
     eps: float
         Epsilon for numerical stability.
     """
-    _kernels.gemma_fused_add_rmsnorm(input, residual, weight, eps)
+    get_norm_module().gemma_fused_add_rmsnorm(input, residual, weight, eps)

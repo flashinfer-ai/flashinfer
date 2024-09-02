@@ -16,19 +16,23 @@ limitations under the License.
 
 import torch
 from typing import Tuple
+from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR
 
-# mypy: disable-error-code="attr-defined"
-try:
-    from . import _kernels
-except ImportError as e:
-    import os
-    import logging
 
-    if os.environ.get("BUILD_DOC", "0") == "1":
-        _kernels = None
-        logging.warning("Kernels are not loaded in documentation build mode.")
-    else:
-        raise e
+_quantization_module = None
+
+
+def get_quantization_module():
+    global _quantization_module
+    if _quantization_module is None:
+        quantization_ops = load_cuda_ops(
+            "quantization",
+            [
+                FLASHINFER_CSRC_DIR / "quantization.cu",
+                FLASHINFER_CSRC_DIR / "flashinfer_quantization_ops.cu",
+            ],
+        )
+    return quantization_ops
 
 
 def packbits(x: torch.Tensor, bitorder: str = "big") -> torch.Tensor:
@@ -62,7 +66,7 @@ def packbits(x: torch.Tensor, bitorder: str = "big") -> torch.Tensor:
     --------
     segment_packbits
     """
-    return _kernels.packbits(x, bitorder)
+    return get_quantization_module().packbits(x, bitorder)
 
 
 def segment_packbits(
@@ -111,4 +115,7 @@ def segment_packbits(
     packed_len = (seglen + 7) // 8
     indptr_new = torch.zeros(len(indptr), dtype=indptr.dtype, device=indptr.device)
     indptr_new[1:] = torch.cumsum(packed_len, 0)
-    return _kernels.segment_packbits(x, indptr, indptr_new, bitorder), indptr_new
+    return (
+        get_quantization_module().segment_packbits(x, indptr, indptr_new, bitorder),
+        indptr_new,
+    )

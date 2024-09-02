@@ -37,6 +37,8 @@
 #include "cascade.cuh"
 #include "logits_post_hook.cuh"
 #include "state.cuh"
+#include "decode_traits.cuh"
+#include "decode_params.cuh"
 
 namespace flashinfer {
 
@@ -623,14 +625,8 @@ constexpr uint32_t get_heuristic_num_threads(uint32_t group_size, uint32_t sizeo
  * \param stream The cuda stream to launch the kernel
  * \return status Indicates whether CUDA calls are successful
  */
-template <uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK, PosEncodingMode POS_ENCODING_MODE,
-          typename DTypeQ, typename DTypeKV, typename DTypeOut>
-cudaError_t SingleDecodeWithKVCacheDispatched(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut* o,
-                                              DTypeOut* tmp, uint32_t num_qo_heads,
-                                              uint32_t num_kv_heads, uint32_t seq_len,
-                                              QKVLayout kv_layout, int32_t window_left,
-                                              float logits_soft_cap, float sm_scale,
-                                              float rope_scale, float rope_theta,
+template <typename Traits, typename Params>
+cudaError_t SingleDecodeWithKVCacheDispatched(Params<Traits::DTypeQ, Traits::DTypeKV, Traits::DTypeO> params,
                                               cudaStream_t stream) {
   const float rope_rcp_scale = 1.f / rope_scale;
   const float rope_rcp_theta = 1.f / rope_theta;

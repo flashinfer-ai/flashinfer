@@ -15,21 +15,24 @@ limitations under the License.
 """
 
 import torch
+from .utils import TensorLayout, _check_kv_layout, _unpack_paged_kv_cache
+from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR
 
-# mypy: disable-error-code="attr-defined"
-try:
-    from . import _kernels
-except ImportError as e:
-    import os
-    import logging
 
-    if os.environ.get("BUILD_DOC", "0") == "1":
-        _kernels = None
-        logging.warning("Kernels are not loaded in documentation build mode.")
-    else:
-        raise e
+_page_module = None
 
-from .utils import _check_kv_layout, TensorLayout, _unpack_paged_kv_cache
+
+def get_page_module():
+    global _page_module
+    if _page_module is None:
+        _page_module = load_cuda_ops(
+            "page",
+            [
+                FLASHINFER_CSRC_DIR / "page.cu",
+                FLASHINFER_CSRC_DIR / "flashinfer_page_ops.cu",
+            ],
+        )
+    return _page_module
 
 
 def append_paged_kv_cache(
@@ -127,7 +130,7 @@ def append_paged_kv_cache(
     incorporated appended k/v.
     """
     _check_kv_layout(kv_layout)
-    _kernels.append_paged_kv_cache(
+    get_page_module().append_paged_kv_cache(
         append_key,
         append_value,
         append_indptr,

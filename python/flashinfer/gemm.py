@@ -19,20 +19,25 @@ from typing import Optional
 import torch
 
 from .utils import get_indptr
+from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR
 from typing import Optional
 
-# mypy: disable-error-code="attr-defined"
-try:
-    from . import _kernels
-except ImportError as e:
-    import logging
-    import os
 
-    if os.environ.get("BUILD_DOC", "0") == "1":
-        _kernels = None
-        logging.warning("Kernels are not loaded in documentation build mode.")
-    else:
-        raise e
+_gemm_module = None
+
+def get_gemm_module():
+    global _gemm_module
+    if _gemm_module is None:
+        _gemm_module = load_cuda_ops(
+            "gemm",
+            [
+                FLASHINFER_CSRC_DIR / "group_gemm.cu",
+                FLASHINFER_CSRC_DIR / "bmm_fp8.cu",
+                FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops.cu",
+            ],
+        )
+    print(_gemm_module)
+    return _gemm_module
 
 
 class SegmentGEMMWrapper:
@@ -96,7 +101,7 @@ class SegmentGEMMWrapper:
             size is proportional to the number of segments (batch size), 1MB workspace is enough for most cases.
         """
         self._workspace_buffer = workspace_buffer
-        self._wrapper = _kernels.CutlassSegmentGEMMPyTorchWrapper(
+        self._wrapper = get_gemm_module().CutlassSegmentGEMMPyTorchWrapper(
             self._workspace_buffer
         )
 
@@ -264,5 +269,5 @@ def bmm_fp8(
             device=A.device,
             dtype=dtype,
         )
-    _kernels.bmm_fp8(A, B, out, A_scale, B_scale)
+    get_gemm_module().bmm_fp8(A, B, out, A_scale, B_scale)
     return out

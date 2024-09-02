@@ -16,20 +16,25 @@ limitations under the License.
 
 import math
 from typing import Optional, Tuple, List
+from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR
 import torch
 
-# mypy: disable-error-code="attr-defined"
-try:
-    from . import _kernels
-except ImportError as e:
-    import os
-    import logging
 
-    if os.environ.get("BUILD_DOC", "0") == "1":
-        _kernels = None
-        logging.warning("Kernels are not loaded in documentation build mode.")
-    else:
-        raise e
+_cascade_module = None
+
+
+def get_cascade_module():
+    global _cascade_module
+    if _cascade_module is None:
+        _cascade_module = load_cuda_ops(
+            "cascade",
+            [
+                FLASHINFER_CSRC_DIR / "cascade.cu",
+                FLASHINFER_CSRC_DIR / "flashinfer_cascade_ops.cu",
+            ],
+        )
+    return _cascade_module
+
 
 from .decode import (
     BatchDecodeWithPagedKVCacheWrapper,
@@ -88,7 +93,7 @@ def merge_state(
     >>> s_merged.shape
     torch.Size([2048, 32])
     """
-    return _kernels.merge_state(v_a, s_a, v_b, s_b)
+    return get_cascade_module().merge_state(v_a, s_a, v_b, s_b)
 
 
 def merge_state_in_place(
@@ -134,7 +139,7 @@ def merge_state_in_place(
     >>> s_other = torch.randn(seq_len, num_heads, dtype=torch.float32).to("cuda:0")
     >>> flashinfer.merge_state_in_place(v, s, v_other, s_other)
     """
-    _kernels.merge_state_in_place(v, s, v_other, s_other, mask)
+    get_cascade_module().merge_state_in_place(v, s, v_other, s_other, mask)
 
 
 def merge_states(v: torch.Tensor, s: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -174,7 +179,7 @@ def merge_states(v: torch.Tensor, s: torch.Tensor) -> Tuple[torch.Tensor, torch.
     >>> s_merged.shape
     torch.Size([2048, 32])
     """
-    return _kernels.merge_states(v, s)
+    return get_cascade_module().merge_states(v, s)
 
 
 class MultiLevelCascadeAttentionWrapper:
