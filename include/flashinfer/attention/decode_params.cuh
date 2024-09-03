@@ -25,8 +25,11 @@
 
 namespace flashinfer {
 
-template <typename DTypeQ, typename DTypeKV, typename DTypeO>
+template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_>
 struct DecodeParamsBase {
+  using DTypeQ = DTypeQ_;
+  using DTypeKV = DTypeKV_;
+  using DTypeO = DTypeO_;
   DTypeQ* q;
   DTypeO* o;
   float* lse;
@@ -37,8 +40,8 @@ struct DecodeParamsBase {
   float rope_rcp_theta;
 };
 
-template <typename DTypeQ, typename DTypeKV, typename DTypeO>
-struct SingleDecodeParams : DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
+template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_>
+struct SingleDecodeParams : DecodeParamsBase<DTypeQ_, DTypeKV_, DTypeO_> {
   DTypeKV* k;
   DTypeKV* v;
   tensor_info_t info;

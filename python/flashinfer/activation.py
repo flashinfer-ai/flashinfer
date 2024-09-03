@@ -48,12 +48,13 @@ device_func_str = {
 }
 
 
-def compile_act_and_mul_module(name: str, act_func: str):
+def compile_act_and_mul_module(name: str, act_func: str, verbose: bool = False):
     return load_cuda_ops(
         f"{name}_and_mul",
         [
             FLASHINFER_GEN_SRC_DIR / f"{name}_and_mul.cu",
         ],
+        verbose=verbose,
     )
 
 

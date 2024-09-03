@@ -35,10 +35,8 @@
 #include "../utils.cuh"
 #include "../vec_dtypes.cuh"
 #include "cascade.cuh"
-#include "logits_post_hook.cuh"
-#include "state.cuh"
-#include "decode_traits.cuh"
 #include "decode_params.cuh"
+#include "state.cuh"
 
 namespace flashinfer {
 
@@ -50,7 +48,6 @@ namespace {
 
 /*!
  * \brief Load k tile from smem and compute qk
- * \tparam logits_post_hook The logits post hook used in the kernel
  * \tparam pos_encoding_mode The positional encoding mode used in the kernel
  * \tparam head_dim A template integer indicates the head dimension
  * \tparam vec_size A template integer indicates the vector size
@@ -68,15 +65,13 @@ namespace {
  * \param s A float indicates the thread-local result of qk
  * \param st The self-attention state to be updated
  */
-template <LogitsPostHook logits_post_hook, PosEncodingMode pos_encoding_mode, uint32_t vec_size,
-          uint32_t bdx, uint32_t tile_size, typename T>
-__device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage_idx,
-                                           const vec_t<float, vec_size>& q_vec,
-                                           const vec_t<float, vec_size>& freq, uint32_t kv_idx_base,
-                                           uint32_t iter_base, uint32_t left_close_bound,
-                                           uint32_t iter_bound, const int32_t q_offset,
-                                           float alibi_slope, float* s, state_t<vec_size>& st,
-                                           const float logits_soft_cap) {
+template <PosEncodingMode pos_encoding_mode, uint32_t vec_size, uint32_t bdx, uint32_t tile_size,
+          typename AttentionVariant, typename T>
+__device__ __forceinline__ void compute_qk(
+    const typename AttentionVariant::ParamsT& params, const T* smem, uint32_t compute_stage_idx,
+    const vec_t<float, vec_size>& q_vec, const vec_t<float, vec_size>& freq, uint32_t kv_idx_base,
+    uint32_t iter_base, uint32_t iter_bound, uint32_t qo_head_idx, uint32_t kv_head_idx,
+    const int32_t q_offset, float* s, state_t<vec_size>& st) {
   uint32_t tx = threadIdx.x, tz = threadIdx.z;
   float m_prev = st.m;
 #pragma unroll
@@ -99,9 +94,12 @@ __device__ __forceinline__ void compute_qk(const T* smem, uint32_t compute_stage
     for (uint32_t offset = bdx / 2; offset > 0; offset /= 2) {
       s[j] += math::shfl_xor_sync(s[j], offset);
     }
-    s[j] = apply_logits_post_hook<logits_post_hook>(s[j], logits_soft_cap);
+    // s[j] = apply_logits_post_hook<logits_post_hook>(s[j], logits_soft_cap);
+    // TODO(Zihao): apply logits processors
     const uint32_t pos = kv_idx_base + tz * tile_size + j;
-    s[j] = (iter_base + tz * tile_size + j < iter_bound && pos >= left_close_bound) ? s[j] : -5e4;
+    s[j] = (iter_base + tz * tile_size + j < iter_bound) ? s[j] : -math::inf;
+    s[j] = AttentionVariant::LogitsTransform(params, s[j], 0, pos,
+                                             qo_head_idx, kv_head_idx);
     if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
       s[j] += alibi_slope * float(int(pos) - q_offset);
     }
@@ -182,9 +180,61 @@ __device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, f
 
 }  // namespace
 
+// Query Transform function that multiplies the query matrix by sm_scale
+template <typename ParamsT_>
+struct StandardAttention {
+  using ParamsT = ParamsT_;
+  using DTypeQ = typename ParamsT::DTypeQ;
+  using DTypeKV = typename ParamsT::DTypeKV;
+  using DTypeO = typename ParamsT::DTypeO;
+  static __device__ __forceinline__ DTypeQ QueryTransform(const ParamsT& params, DTypeQ q) {
+    return q * params.sm_scale * math::log2e;
+  }
+
+  static __device__ __forceinline__ float LogitsTransform(const ParamsT& params, float logits,
+                                                          int32_t qo_idx, int32_t kv_idx,
+                                                          int32_t qo_head_idx,
+                                                          int32_t kv_head_idx) {
+    return logits;
+  }
+};
+
+template <typename ParamsT_>
+struct SlidingWindowAttention {
+  using DTypeQ = typename ParamsT::DTypeQ;
+  using DTypeKV = typename ParamsT::DTypeKV;
+  using DTypeO = typename ParamsT::DTypeO;
+  static __device__ __forceinline__ DTypeQ QueryTransform(const ParamsT& params, DTypeQ q) {
+    return q * params.sm_scale * math::log2e;
+  }
+
+  static __device__ __forceinline__ float LogitsTransform(const ParamsT& params, float logits,
+                                                          int32_t qo_idx, int32_t kv_idx,
+                                                          int32_t qo_head_idx,
+                                                          int32_t kv_head_idx) {
+    return (kv_idx >= params.left_close_bound) ? logits : -math::inf;
+  }
+};
+
+template <typename ParamsT>
+struct LogitsSoftCap {
+  using DTypeQ = typename ParamsT::DTypeQ;
+  using DTypeKV = typename ParamsT::DTypeKV;
+  using DTypeO = typename ParamsT::DTypeO;
+  static __device__ __forceinline__ DTypeQ QueryTransform(const ParamsT& params, DTypeQ q) {
+    return q * params.sm_scale * math::ptx_rcp(params.logits_soft_cap);
+  }
+
+  static __device__ __forceinline__ float LogitsTransform(const ParamsT& params, float logits,
+                                                          int32_t qo_idx, int32_t kv_idx,
+                                                          int32_t qo_head_idx,
+                                                          int32_t kv_head_idx) {
+    return  //;
+  }
+};
+
 /*!
  * \brief FlashAttention decoding cuda kernel with kv-cache for a single request
- * \tparam logits_post_hook The logits post hook used in the kernel
  * \tparam pos_encoding_mode The positional encoding mode
  * \tparam vec_size A template integer indicates the vector size
  * \tparam bdx A template integer indicates the block size in x dimension
@@ -206,19 +256,14 @@ __device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, f
  *   of "theta" used in RoPE (Rotary Positional Embeddings)
  * \param kv_chunk_size A integer indicates the kv-chunk size
  */
-template <LogitsPostHook logits_post_hook, PosEncodingMode pos_encoding_mode,
-          uint32_t num_stages_smem, uint32_t tile_size_per_bdx, uint32_t vec_size, uint32_t bdx,
-          uint32_t bdy, uint32_t bdz, typename DTypeQ, typename DTypeKV, typename DTypeOut>
-__global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* __restrict__ k,
-                                              DTypeKV* __restrict__ v, DTypeOut* __restrict__ o,
-                                              float* __restrict__ lse, tensor_info_t info,
-                                              int32_t window_left, float logits_soft_cap,
-                                              float sm_scale, float rope_rcp_scale,
-                                              float rope_rcp_theta, uint32_t kv_chunk_size) {
+template <PosEncodingMode pos_encoding_mode, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
+          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
+          typename DTypeQ, typename DTypeKV, typename DTypeOut>
+__global__ void SingleDecodeWithKVCacheKernel(
+    __grid_constant__ SingleDecodeParams<DTypeQ, DTypeKV, DTypeOut> params) {
   auto block = cg::this_thread_block();
   auto grid = cg::this_grid();
-  sm_scale *=
-      (logits_post_hook == LogitsPostHook::kNone ? math::log2e : math::ptx_rcp(logits_soft_cap));
+  sm_scale *= math::log2e;
 
   constexpr uint32_t head_dim = bdx * vec_size;
   uint32_t kv_head_idx = blockIdx.y;
@@ -303,7 +348,7 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
     // compute qk
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    compute_qk<logits_post_hook, pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
+    compute_qk<pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
         k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, stage_idx, q_vec,
         freq, consumer_kv_idx_base, iter * bdy * tile_size_per_bdx * bdz, left_close_bound,
         kv_chunk_size, seq_len - 1, alibi_slope, s, st_local, logits_soft_cap);
@@ -359,7 +404,6 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
 
 /*!
  * \brief FlashAttention decoding cuda kernel with paged kv-cache for multiple requests
- * \tparam logits_post_hook The logits post hook used in the kernel
  * \tparam pos_encoding_mode The positional encoding mode
  * \tparam vec_size A template integer indicates the vector size
  * \tparam bdx A template integer indicates the block size in x dimension
@@ -382,20 +426,14 @@ __global__ void SingleDecodeWithKVCacheKernel(DTypeQ* __restrict__ q, DTypeKV* _
  * \param rope_rcp_theta A floating number indicate the reciprocal
  *   of "theta" used in RoPE (Rotary Positional Embeddings)
  */
-template <LogitsPostHook logits_post_hook, PosEncodingMode pos_encoding_mode,
-          uint32_t num_stages_smem, uint32_t tile_size_per_bdx, uint32_t vec_size, uint32_t bdx,
-          uint32_t bdy, uint32_t bdz, PageStorage page_storage, typename DTypeQ, typename DTypeKV,
-          typename DTypeOut, typename IdType>
+template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
+          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, PageStorage page_storage,
+          typename DTypeQ, typename DTypeKV, typename DTypeOut, typename IdType>
 __global__ void BatchDecodeWithPagedKVCacheKernel(
-    DTypeQ* __restrict__ q, IdType* __restrict__ q_offset,
-    paged_kv_t<page_storage, DTypeKV, IdType> paged_kv,
-    kv_partition_info_t<IdType> kv_partition_info, DTypeOut* __restrict__ o,
-    float* __restrict__ lse, bool* __restrict__ block_valid_mask, bool partition_kv,
-    int32_t window_left, float logits_soft_cap, float sm_scale, float rope_rcp_scale,
-    float rope_rcp_theta) {
+    __grid_constant__ BatchDecodeParams<POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeOut, IdType>
+        params) {
   auto block = cg::this_thread_block();
-  sm_scale *=
-      (logits_post_hook == LogitsPostHook::kNone ? math::log2e : math::ptx_rcp(logits_soft_cap));
+  sm_scale *= math::log2e;
 
   constexpr uint32_t head_dim = bdx * vec_size;
   const uint32_t batch_idx = blockIdx.x;
@@ -520,7 +558,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
     // compute qk
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
-    compute_qk<logits_post_hook, pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
+    compute_qk<pos_encoding_mode, vec_size, bdx, bdy * tile_size_per_bdx>(
         k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, stage_idx, q_vec,
         freq,
         (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[mapped_batch_idx]) +
@@ -625,8 +663,8 @@ constexpr uint32_t get_heuristic_num_threads(uint32_t group_size, uint32_t sizeo
  * \param stream The cuda stream to launch the kernel
  * \return status Indicates whether CUDA calls are successful
  */
-template <typename Traits, typename Params>
-cudaError_t SingleDecodeWithKVCacheDispatched(Params<Traits::DTypeQ, Traits::DTypeKV, Traits::DTypeO> params,
+template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename Params>
+cudaError_t SingleDecodeWithKVCacheDispatched(Params<DTypeQ, DTypeKV, DTypeO> params,
                                               cudaStream_t stream) {
   const float rope_rcp_scale = 1.f / rope_scale;
   const float rope_rcp_theta = 1.f / rope_theta;
@@ -713,9 +751,8 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params<Traits::DTypeQ, Traits::DTy
   return cudaSuccess;
 }
 
-template <uint32_t HEAD_DIM, PageStorage page_storage, LogitsPostHook LOGITS_POST_HOOK,
-          PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV, typename DTypeOut,
-          typename IdType>
+template <uint32_t HEAD_DIM, PageStorage page_storage, PosEncodingMode POS_ENCODING_MODE,
+          typename DTypeQ, typename DTypeKV, typename DTypeOut, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(
     DTypeQ* q, IdType* q_offset, paged_kv_t<page_storage, DTypeKV, IdType> paged_kv,
     kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, DTypeOut* tmp_v, float* tmp_s,

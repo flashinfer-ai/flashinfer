@@ -297,7 +297,7 @@ __device__ __forceinline__ void init_states(float (*o_frag)[num_frags_y][8], DTy
   for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
     for (uint32_t j = 0; j < 2; ++j) {
-      m[fx][j] = DTypeQKAccum(-5e4);
+      m[fx][j] = DTypeQKAccum(-math::inf);
       d[fx][j] = 1.f;
     }
   }
@@ -671,7 +671,7 @@ __device__ __forceinline__ void mask_s(const uint32_t qo_packed_idx_base,
              (mask_mode == MaskMode::kCustom && q_idx < qo_len &&
               !((custom_mask[(q_idx * kv_len + kv_idx) / 8] >> ((q_idx * kv_len + kv_idx) % 8)) &
                 1)))
-                ? DTypeQKAccum(-5e4)
+                ? DTypeQKAccum(-math::inf)
                 : s_frag[fx][fz][reg_id];
       }
     }
@@ -839,7 +839,7 @@ __device__ __forceinline__ void normalize_d(float (*o_frag)[num_frags_y][8], DTy
   for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 #pragma unroll
     for (uint32_t j = 0; j < 2; ++j) {
-      d_rcp[fx][j] = (m[fx][j] != DTypeQKAccum(-5e4)) ? math::ptx_rcp(d[fx][j]) : 0.f;
+      d_rcp[fx][j] = (m[fx][j] != DTypeQKAccum(-math::inf)) ? math::ptx_rcp(d[fx][j]) : 0.f;
     }
   }
 
@@ -898,7 +898,7 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(float (*o_frag)[num_
       float o_scale[2][num_warps_z];
 #pragma unroll
       for (uint32_t j = 0; j < 2; ++j) {
-        float m_new = -5e4, d_new = 1.f;
+        float m_new = -math::inf, d_new = 1.f;
 #pragma unroll
         for (uint32_t i = 0; i < num_warps_z; ++i) {
           float2 md = smem_md[(((i * num_warps_x + get_warp_idx_x<num_warps_x, num_warps_z>()) *
