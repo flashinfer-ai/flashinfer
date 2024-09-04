@@ -16,6 +16,15 @@
 #ifndef FLASHINFER_PAGE_CUH_
 #define FLASHINFER_PAGE_CUH_
 
+#ifdef USE_ROCM
+
+#include <hip/hip_runtime.h>
+
+// CUDA API Portable interfaces
+#include "flashinfer/hip_defs.h"
+
+#endif // USE_ROCM
+
 #include <vector>
 
 #include "fastdiv.cuh"
@@ -451,7 +460,11 @@ cudaError_t AppendPagedKVCacheDecode(paged_kv_t<page_storage, DType, IdType> pag
     dim3 nthrs(bdx, bdy);
     auto kernel = AppendPagedKVCacheDecodeKernel<HEAD_DIM, vec_size, page_storage, DType, IdType>;
     void* args[] = {(void*)&paged_kv, (void*)&key, (void*)&value};
+    #ifdef USE_ROCM
+    FLASHINFER_CUDA_CALL(hipLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+    #else
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+    #endif
   });
   return cudaSuccess;
 }
@@ -484,7 +497,11 @@ cudaError_t AppendPagedKVCache(paged_kv_t<page_storage, DType, IdType> paged_kv,
     dim3 nthrs(bdx, bdy);
     auto kernel = AppendPagedKVCachePrefillKernel<HEAD_DIM, vec_size, page_storage, DType, IdType>;
     void* args[] = {(void*)&paged_kv, (void*)&key, (void*)&value, (void*)&append_indptr};
+    #ifdef USE_ROCM
+    FLASHINFER_CUDA_CALL(hipLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+    #else
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+    #endif
   });
   return cudaSuccess;
 }

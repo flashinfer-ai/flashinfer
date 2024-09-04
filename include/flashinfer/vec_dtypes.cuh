@@ -16,21 +16,44 @@
 #ifndef VEC_DTYPES_CUH_
 #define VEC_DTYPES_CUH_
 
+#ifdef USE_ROCM
+
+#include <hip/hip_runtime_api.h>
+
+#include "flashinfer/hip_cuda_type_utils.h"
+// CUDA API Portable interfaces
+#include "flashinfer/hip_defs.h"
+
+#else
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#endif // USE_ROCM
+
 #include <type_traits>
 
 namespace flashinfer {
 
-#if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900))
+// TODO (yiakwy) : remove
+// #if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900))
+#if __CUDA_ARCH__ >= 900 && defined(__CUDA_ARCH__)
 #define FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
+#endif
+
+#if USE_ROCM
+// TODO(yiakwy) : since roc fp8 is different from NV fp8, more efforts need to port functionalities
+#ifdef FLASHINFER_FP8_ENABLED
+#undef FLASHINFER_FP8_ENABLED
+#endif
+
 #endif
 
 #define FLASHINFER_INLINE inline __attribute__((always_inline)) __device__
 
+// TODO (yiakwy) : add support in HIP
 #if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 < 120400) && \
     (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800))
 // CUDA version < 12.4 and GPU architecture < 80
@@ -119,6 +142,8 @@ struct vec_cast<half, float> {
   }
 };
 
+#ifdef FLASHINFER_FP8_ENABLED
+
 template <typename T>
 constexpr FLASHINFER_INLINE int get_exponent_bits() {
   if constexpr (std::is_same<T, __nv_fp8_e4m3>::value) {
@@ -187,7 +212,7 @@ __device__ void fast_dequant_f8f16x4(uint32_t* input, uint2* output) {
       *(half2*)&(output->y) = __hmul2(*reinterpret_cast<const half2*>(&Out2), bias_reg);
     } else {
       constexpr uint32_t BIAS = (BIAS_OFFSET + 127) << 23;
-      const nv_bfloat162 bias_reg = __float2bfloat162_rn(*reinterpret_cast<const float*>(&BIAS));
+      const nv_bfloat162 bias_reg = __float22bfloat162_rn(*reinterpret_cast<const float*>(&BIAS));
       // Convert to bfloat162 and apply bias
       *(nv_bfloat162*)&(output->x) =
           __hmul2(*reinterpret_cast<const nv_bfloat162*>(&Out1), bias_reg);
@@ -353,6 +378,8 @@ struct vec_cast<half, __nv_fp8_e5m2> {
   }
 };
 
+#endif // FLASHINFER_FP8_ENABLED
+
 template <>
 struct vec_cast<float, nv_bfloat16> {
   template <size_t vec_size>
@@ -432,6 +459,8 @@ FLASHINFER_INLINE void cast_store_impl(tgt_float_t* dst_ptr,
 }
 
 /******************* vec_t<__nv_fp8_e4m3> *******************/
+
+#ifdef FLASHINFER_FP8_ENABLED
 
 // __nv_fp8_e4m3 x 1
 template <>
@@ -924,6 +953,8 @@ struct vec_t<__nv_fp8_e5m2, vec_size> {
     }
   }
 };
+
+#endif // FLASHINFER_FP8_ENABLED
 
 /******************* vec_t<half> *******************/
 

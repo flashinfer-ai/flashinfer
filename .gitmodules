@@ -1,6 +1,9 @@
 [submodule "3rdparty/nvbench"]
 	path = 3rdparty/nvbench
 	url = https://github.com/NVIDIA/nvbench.git
+[submodule "3rdparty/hipbench"]
+        path = 3rdparty/hipbench
+        url = https://github.com/ROCm/hipBench.git
 [submodule "3rdparty/googletest"]
 	path = 3rdparty/googletest
 	url = https://github.com/google/googletest.git

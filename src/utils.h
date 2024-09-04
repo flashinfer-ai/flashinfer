@@ -15,10 +15,18 @@
  */
 #pragma once
 
+#ifdef USE_ROCM
+#include <flashinfer/hip_cuda_type_utils.h>
+#include <hip/hip_runtime.h>
+#else
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+
+#endif
+
 #include <thrust/device_vector.h>
 #include <thrust/execution_policy.h>
 #include <thrust/host_vector.h>

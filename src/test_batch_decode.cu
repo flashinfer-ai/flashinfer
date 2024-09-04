@@ -209,3 +209,8 @@ TEST(FlashInferCorrectnessTest, TestBatchDecodeKernelCorrectnessE5M2) {
 TEST(FlashInferCorrectnessTest, TestCooperativeBatchDecodeKernelCorrectnessTestFP16) {
   TestCooperativeBatchDecodeKernelCorrectness<half, half>();
 }
+
+int main(int argc, char **argv) {
+  ::testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}

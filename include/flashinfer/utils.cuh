@@ -15,11 +15,24 @@
  */
 #ifndef FLASHINFER_UTILS_CUH_
 #define FLASHINFER_UTILS_CUH_
+
+#ifdef USE_ROCM
+
+#include <hip/hip_runtime_api.h>
+
+#include "flashinfer/hip_cuda_type_utils.h"
+// CUDA API Portable interfaces
+#include "flashinfer/hip_defs.h"
+
+#else
+
 #include <cuda_bf16.h>
 #include <cuda_device_runtime_api.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+
+#endif
 
 #include <cstdint>
 #include <iostream>
@@ -249,6 +262,7 @@ __forceinline__ __device__ __host__ T1 ceil_div(const T1 x, const T2 y) {
   return (x + y - 1) / y;
 }
 
+#ifdef ROCM
 inline std::pair<int, int> GetCudaComputeCapability() {
   int device_id = 0;
   cudaGetDevice(&device_id);
@@ -257,6 +271,18 @@ inline std::pair<int, int> GetCudaComputeCapability() {
   cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id);
   return std::make_pair(major, minor);
 }
+#else
+
+// see hip device initialization and version
+inline std::pair<int, int> GetCudaComputeCapability() {
+  int device_id = 0;
+  hipGetDevice(&device_id);
+  int major = 0, minor = 0;
+  hipDeviceComputeCapability(&major, &minor, device_id);
+  return std::make_pair(major, minor);
+}
+
+#endif
 
 template <typename T>
 inline void DebugPrintCUDAArray(T* device_ptr, size_t size, std::string prefix = "") {
