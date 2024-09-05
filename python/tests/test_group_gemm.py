@@ -46,24 +46,24 @@ def test_segment_gemm(
     torch.manual_seed(42)
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(device)
     segment_gemm = flashinfer.gemm.SegmentGEMMWrapper(workspace_buffer)
-    x = (torch.randn(batch_size * num_rows_per_batch, d_in, dtype=dtype) / 10).to(
+    x = torch.randn(batch_size * num_rows_per_batch, d_in, dtype=dtype).to(
         device
     )
     if use_weight_indices:
         num_weights = 1024
         if column_major:
-            weight = (torch.randn(num_weights, d_out, d_in, dtype=dtype) / 10).to(
+            weight = torch.randn(num_weights, d_out, d_in, dtype=dtype).to(
                 device
             )
         else:
-            weight = (torch.randn(num_weights, d_in, d_out, dtype=dtype) / 10).to(
+            weight = torch.randn(num_weights, d_in, d_out, dtype=dtype).to(
                 device
             )
     else:
         if column_major:
-            weight = (torch.randn(batch_size, d_out, d_in, dtype=dtype) / 10).to(device)
+            weight = torch.randn(batch_size, d_out, d_in, dtype=dtype).to(device)
         else:
-            weight = (torch.randn(batch_size, d_in, d_out, dtype=dtype) / 10).to(device)
+            weight = torch.randn(batch_size, d_in, d_out, dtype=dtype).to(device)
     y = segment_gemm.run(
         x,
         weight,
