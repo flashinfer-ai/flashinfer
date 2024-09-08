@@ -21,6 +21,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <cstdint>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
