@@ -85,7 +85,7 @@ cudaError_t CutlassSegmentGEMMWrapper(CutlassSegmentGEMMHandler* handler, DType*
         cutlass::gemm::GemmShape<16, 8, 16>,     // Instruction Shape
         cutlass::epilogue::thread::LinearCombination<DType, 8, float, float>,  // Epilogue
         cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,     // Swizzling Operator
-        8                                                                      // Stages
+        4                                                                      // Stages
         >::GemmKernel;
 
     using EpilogueOutputOp = typename GemmKernel::Epilogue::OutputOp;
