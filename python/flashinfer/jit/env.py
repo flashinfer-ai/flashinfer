@@ -16,10 +16,10 @@ limitations under the License.
 
 import pathlib
 
-# set $HOME/.flashinfer/cached_ops as the default cache directory
 # use pathlib
-FLASHINFER_JIT_DIR = pathlib.Path.home() / ".flashinfer" / "cached_ops"
-FLASHINFER_GEN_SRC_DIR = FLASHINFER_JIT_DIR / "generated"
+FLASHINFER_WORKSPACE_DIR = pathlib.Path.home() / ".flashinfer"
+FLASHINFER_JIT_DIR = FLASHINFER_WORKSPACE_DIR / "cached_ops"
+FLASHINFER_GEN_SRC_DIR = FLASHINFER_WORKSPACE_DIR / "generated"
 _project_root = pathlib.Path(__file__).resolve().parent.parent.parent
 FLASHINFER_INCLUDE_DIR = _project_root / "include"
 FLASHINFER_CSRC_DIR = _project_root / "csrc"

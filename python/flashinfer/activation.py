@@ -20,20 +20,20 @@ from .jit import load_cuda_ops, FLASHINFER_GEN_SRC_DIR, gen_act_and_mul_cu
 import torch
 
 
-silu_cu_str = r"""
+silu_def_cu_str = r"""
 __device__ __forceinline__ float silu(const float& val) {
   return val / (1.0f + __expf(-val));
 }
 """
 
-gelu_cu_str = r"""
+gelu_def_cu_str = r"""
 __device__ __forceinline__ float gelu(const float& val) {
   constexpr float kAlpha = M_SQRT1_2;
   return val * 0.5f * (1.0f + ::erf(val * kAlpha));
 }
 """
 
-gelu_tanh_cu_str = r"""
+gelu_def_tanh_cu_str = r"""
 __device__ __forceinline__ float gelu_tanh(const float& val) {
   const float cdf =
       0.5f * (1.0f + math::tanh((0.7978845608028654f * (val + 0.044715f * val * val * val))));
@@ -41,14 +41,15 @@ __device__ __forceinline__ float gelu_tanh(const float& val) {
 }
 """
 
-device_func_str = {
-    "silu": silu_cu_str,
-    "gelu": gelu_cu_str,
-    "gelu_tanh": gelu_tanh_cu_str,
+act_func_def_str = {
+    "silu": silu_def_cu_str,
+    "gelu": gelu_def_cu_str,
+    "gelu_tanh": gelu_def_tanh_cu_str,
 }
 
 
-def compile_act_and_mul_module(name: str, act_func: str, verbose: bool = False):
+def compile_act_and_mul_module(name: str, act_func_def: str, verbose: bool = False):
+    gen_act_and_mul_cu(name, act_func_def)
     return load_cuda_ops(
         f"{name}_and_mul",
         [
@@ -61,13 +62,13 @@ def compile_act_and_mul_module(name: str, act_func: str, verbose: bool = False):
 _jit_modules = {}
 
 
-def get_act_and_mul_module(act_func: str):
+def get_act_and_mul_module(act_func_name: str):
     global _jit_modules
-    if act_func not in _jit_modules:
-        _jit_modules[act_func] = compile_act_and_mul_module(
-            act_func, gen_act_and_mul_cu(act_func, device_func_str[act_func])
+    if act_func_name not in _jit_modules:
+        _jit_modules[act_func_name] = compile_act_and_mul_module(
+            act_func_name, act_func_def_str[act_func_name]
         )
-    return _jit_modules[act_func]
+    return _jit_modules[act_func_name]
 
 
 def _check_shape(input: torch.Tensor, output: torch.Tensor):

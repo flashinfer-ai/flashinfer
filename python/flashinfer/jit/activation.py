@@ -30,7 +30,7 @@ activation_templ = r"""
 
 using namespace flashinfer;
 
-{{ act_func }}
+{{ act_func_def }}
 
 void {{ func_name }}(torch::Tensor& out, torch::Tensor& input) {
   int d = input.size(-1) / 2;
@@ -56,16 +56,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 """
 
 
-def get_act_and_mul_cu(act_func_name: str, act_func: str) -> str:
+def get_act_and_mul_cu_str(act_func_name: str, act_func_def: str) -> str:
     template = jinja2.Template(activation_templ)
-    return template.render(act_func_name=act_func_name, act_func=act_func)
+    return template.render(act_func_name=act_func_name, act_func_def=act_func_def)
 
 
-def gen_act_and_mul_cu(act_func_name: str, act_func: str) -> None:
+def gen_act_and_mul_cu(act_func_name: str, act_func_def: str) -> None:
     gen_directory = FLASHINFER_GEN_SRC_DIR
     if not os.path.exists(gen_directory):
         os.makedirs(gen_directory)
     write_if_different(
         gen_directory / f"{act_func_name}_and_mul.cu",
-        get_act_and_mul_cu(act_func_name, act_func),
+        get_act_and_mul_cu_str(act_func_name, act_func_def),
     )

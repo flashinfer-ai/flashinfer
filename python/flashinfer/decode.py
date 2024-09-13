@@ -19,20 +19,28 @@ from typing import Optional, Union, Dict, Tuple
 import torch
 
 # mypy: disable-error-code="attr-defined"
-try:
-    from . import _decode
-    from . import _prefill
-except ImportError as e:
-    import os
-    import logging
+# try:
+#     from . import _decode
+#     from . import _prefill
+# except ImportError as e:
+#     import os
+#     import logging
 
-    if os.environ.get("BUILD_DOC", "0") == "1":
-        _decode = None
-        _prefill = None
-        logging.warning("Kernels are not loaded in documentation build mode.")
-    else:
-        raise e
+#     if os.environ.get("BUILD_DOC", "0") == "1":
+#         _decode = None
+#         _prefill = None
+#         logging.warning("Kernels are not loaded in documentation build mode.")
+#     else:
+#         raise e
 
+from .jit import (
+    load_cuda_ops,
+    FLASHINFER_GEN_SRC_DIR,
+    gen_single_decode_cu,
+    get_single_decode_uri,
+    gen_batch_decode_cu,
+    get_batch_decode_uri,
+)
 
 from .utils import (
     PosEncodingMode,
@@ -54,10 +62,72 @@ def _get_cache_buf(name: str, bytes: int, device: torch.device) -> torch.Tensor:
     return buf
 
 
-def _grouped_size_compiled_for_decode_kernels(
-    num_qo_heads: int, num_kv_heads: int
-) -> bool:
-    return (num_qo_heads // num_kv_heads) in [1, 2, 4, 8]
+def _get_cache_alibi_slopes_buf(
+    num_qo_heads: int, device: torch.device
+) -> torch.Tensor:
+    key = (f"alibi_slopes_{num_qo_heads}", device)
+    buf = _cache_buf.get(key)
+    if buf is None:
+        buf = torch.empty(num_qo_heads, dtype=torch.float32, device=device)
+        # TODO(Zihao): fill with alibi slopes
+
+        _cache_buf[key] = buf
+    return buf
+
+
+def compile_single_decode_module(
+    *args,
+    verbose: bool = False,
+):
+    gen_single_decode_cu(*args)
+    uri = get_single_decode_uri(*args)
+    return load_cuda_ops(
+        uri,
+        [FLASHINFER_GEN_SRC_DIR / f"{uri}.cu"],
+        verbose=verbose,
+    )
+
+
+def compile_batch_decode_module(
+    *args,
+    verbose: bool = False,
+):
+    gen_batch_decode_cu(*args)
+    uri = get_batch_decode_uri(*args)
+    return load_cuda_ops(
+        uri,
+        [FLASHINFER_GEN_SRC_DIR / f"{uri}.cu"],
+        verbose=verbose,
+    )
+
+compile_batch_decode_module(
+    torch.float16,
+    torch.float16,
+    torch.float16,
+    torch.int32,
+    128,
+    PosEncodingMode.NONE.value,
+    False,
+    False,
+    False, 
+)
+
+_single_decode_modules = {}
+_batch_decode_modules = {}
+
+
+def get_single_decode_module(*args):
+    global _single_decode_modules
+    if args not in _single_decode_modules:
+        _single_decode_modules[args] = compile_single_decode_module(*args)
+    return _single_decode_modules[args]
+
+
+def get_batch_decode_module(*args):
+    global _batch_decode_modules
+    if args not in _batch_decode_modules:
+        _batch_decode_modules[args] = compile_batch_decode_module(*args)
+    return _batch_decode_modules[args]
 
 
 def single_decode_with_kv_cache(
@@ -165,38 +235,26 @@ def single_decode_with_kv_cache(
     if rope_theta is None:
         rope_theta = 1e4
     num_qo_heads = q.shape[0]
-    num_kv_heads = k.shape[1] if kv_layout == "NHD" else k.shape[0]
-    if not _grouped_size_compiled_for_decode_kernels(num_qo_heads, num_kv_heads):
-        raise RuntimeError(
-            "Please set `use_tensor_cores=True` in single_decode_with_kv_cache for group size {}.".format(
-                num_qo_heads // num_kv_heads
-            )
-        )
 
     if use_tensor_cores:
-        out = _prefill.single_prefill_with_kv_cache(
-            q.unsqueeze(0),
-            k,
-            v,
-            tmp,
-            False,  # causal
-            TensorLayout[kv_layout].value,
-            PosEncodingMode[pos_encoding_mode].value,
-            False,  # allow_fp16_qk_reduction
-            window_left,
-            logits_soft_cap,
-            sm_scale,
-            rope_scale,
-            rope_theta,
-            False,  # return_lse
-        )[0].squeeze(0)
+        # TODO(Zihao): fix this
+        pass
     else:
-        out = _decode.single_decode_with_kv_cache(
+        out = get_single_decode_module(
+            q.dtype,
+            k.dtype,
+            q.dtype,
+            head_dim,
+            PosEncodingMode[pos_encoding_mode].value,
+            window_left != -1,  # use_sliding_window
+            logits_soft_cap > 0,  # use_logits_soft_cap
+            pos_encoding_mode == "ALIBI",  # use_alibi
+        ).single_decode_with_kv_cache(
             q,
             k,
             v,
             tmp,
-            PosEncodingMode[pos_encoding_mode].value,
+            _get_cache_alibi_slopes_buf(num_qo_heads, q.device),
             TensorLayout[kv_layout].value,
             window_left,
             logits_soft_cap,
@@ -204,6 +262,38 @@ def single_decode_with_kv_cache(
             rope_scale,
             rope_theta,
         )
+
+    # if use_tensor_cores:
+    #     out = _prefill.single_prefill_with_kv_cache(
+    #         q.unsqueeze(0),
+    #         k,
+    #         v,
+    #         tmp,
+    #         False,  # causal
+    #         TensorLayout[kv_layout].value,
+    #         PosEncodingMode[pos_encoding_mode].value,
+    #         False,  # allow_fp16_qk_reduction
+    #         window_left,
+    #         logits_soft_cap,
+    #         sm_scale,
+    #         rope_scale,
+    #         rope_theta,
+    #         False,  # return_lse
+    #     )[0].squeeze(0)
+    # else:
+    #     out = _decode.single_decode_with_kv_cache(
+    #         q,
+    #         k,
+    #         v,
+    #         tmp,
+    #         PosEncodingMode[pos_encoding_mode].value,
+    #         TensorLayout[kv_layout].value,
+    #         window_left,
+    #         logits_soft_cap,
+    #         sm_scale,
+    #         rope_scale,
+    #         rope_theta,
+    #     )
     if v_scale is not None:
         out *= v_scale
     return out
@@ -510,15 +600,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 getattr(torch, data_type) if isinstance(data_type, str) else data_type
             ),
         )
-
-        if not _grouped_size_compiled_for_decode_kernels(num_qo_heads, num_kv_heads):
-            if not self.use_tensor_cores:
-                # NOTE(Zihao): group size not compiled for decode (cuda cores) kernels, user should use prefill (tensor cores) kernels instead
-                raise RuntimeError(
-                    "Please set `use_tensor_cores=True` in BatchDecodeWithPagedKVCacheWrapper for group size {}.".format(
-                        num_qo_heads // num_kv_heads
-                    )
-                )
 
         if self.use_tensor_cores:
             if not self.is_cuda_graph_enabled:

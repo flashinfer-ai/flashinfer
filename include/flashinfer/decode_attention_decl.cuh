@@ -34,26 +34,18 @@ cudaError_t SingleDecodeWithKVCacheDispatched(
     uint32_t num_kv_heads, uint32_t seq_len, QKVLayout kv_layout, int32_t window_left,
     float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream);
 
-template <uint32_t HEAD_DIM, PageStorage page_storage, LogitsPostHook LOGITS_POST_HOOK,
-          PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV, typename DTypeOut,
-          typename IdType>
-cudaError_t BatchDecodeWithPagedKVCacheDispatched(
-    DTypeQ* q, IdType* q_offset, paged_kv_t<page_storage, DTypeKV, IdType> paged_kv,
-    kv_partition_info_t<IdType> kv_partition_info, DTypeOut* o, DTypeOut* tmp_v, float* tmp_s,
-    float* lse, bool* block_valid_mask, uint32_t padded_batch_size, uint32_t num_qo_heads,
-    int32_t window_left, float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta,
-    cudaStream_t stream);
+template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant>
+cudaError_t BatchDecodeWithPagedKVCacheDispatched(typename AttentionVariant::ParamsT params,
+                                                  typename AttentionVariant::DTypeOut* tmp_v,
+                                                  float* tmp_s, cudaStream_t stream);
 
-template <PageStorage PAGE_STORAGE, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK,
-          PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV, typename DTypeOut,
-          typename IdType>
-cudaError_t BatchDecodeWithPagedKVCacheWrapperDispatched(
-    BatchDecodeHandler* handler, DTypeQ* q, IdType* q_offset,
-    paged_kv_t<PAGE_STORAGE, DTypeKV, IdType> paged_kv, DTypeOut* o, float* lse,
-    uint32_t num_qo_heads, int32_t window_left, float logits_soft_cap, float sm_scale,
-    float rope_scale, float rope_theta, cudaStream_t stream) {
-  paged_kv_t<PAGE_STORAGE, DTypeKV, IdType> new_paged_kv = paged_kv;
-  kv_partition_info_t<IdType> kv_partition_info;
+template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant>
+cudaError_t BatchDecodeWithPagedKVCacheWrapperDispatched(BatchDecodeHandler* handler,
+                                                         typename AttentionVariant::ParamsT params,
+                                                         cudaStream_t stream) {
+  using DTypeOut = typename AttentionVariant::DTypeO;
+  using IdType = typename AttentionVariant::IdType;
+  auto new_paged_kv = params.paged_kv;
   DTypeOut* tmp_v = handler->GetTempV<DTypeOut>();
   float* tmp_s = handler->GetTempS();
 
@@ -62,19 +54,19 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapperDispatched(
     new_paged_kv.batch_size = handler->GetBatchSizeAfterPartition();
     new_paged_kv.indptr = handler->GetNewIndPtr<IdType>();
     new_paged_kv.last_page_len = handler->GetNewLastPageLen<IdType>();
-    kv_partition_info.batch_size_before_partition = handler->GetBatchSizeBeforePartition();
-    kv_partition_info.chunk_indptr = handler->GetChunkIndPtr<IdType>();
-    kv_partition_info.batch_idx_map = handler->GetBatchIdxMap<IdType>();
-    kv_partition_info.chunk_start_pos = handler->GetChunkStartPos<IdType>();
-    kv_partition_info.seq_lens_before_partition = handler->GetSeqLengthsBeforePartition<IdType>();
+    params.paged_kv = new_paged_kv;
+    params.kv_partition_info.batch_size_before_partition = handler->GetBatchSizeBeforePartition();
+    params.kv_partition_info.chunk_indptr = handler->GetChunkIndPtr<IdType>();
+    params.kv_partition_info.batch_idx_map = handler->GetBatchIdxMap<IdType>();
+    params.kv_partition_info.chunk_start_pos = handler->GetChunkStartPos<IdType>();
+    params.kv_partition_info.seq_lens_before_partition =
+        handler->GetSeqLengthsBeforePartition<IdType>();
   }
+  params.block_valid_mask = handler->GetBlockValidMask();
+  params.padded_batch_size = handler->GetPaddedBatchSize();
 
-  return BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, PAGE_STORAGE, LOGITS_POST_HOOK,
-                                               POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeOut,
-                                               IdType>(
-      q, q_offset, new_paged_kv, kv_partition_info, o, tmp_v, tmp_s, lse,
-      handler->GetBlockValidMask(), handler->GetPaddedBatchSize(), num_qo_heads, window_left,
-      logits_soft_cap, sm_scale, rope_scale, rope_theta, stream);
+  return BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, POS_ENCODING_MODE, AttentionVariant>(
+      params, tmp_v, tmp_s, stream);
 }
 
 }  // namespace flashinfer

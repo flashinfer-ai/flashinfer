@@ -35,8 +35,8 @@ def get_gemm_module():
                 FLASHINFER_CSRC_DIR / "bmm_fp8.cu",
                 FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops.cu",
             ],
+            verbose=True
         )
-    print(_gemm_module)
     return _gemm_module
 
 

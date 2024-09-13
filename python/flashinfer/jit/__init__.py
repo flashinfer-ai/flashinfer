@@ -25,7 +25,8 @@ from .env import (
     FLASHINFER_CSRC_DIR,
     CUTLASS_INCLUDE_DIR,
 )
-from .activation import get_act_and_mul_cu, gen_act_and_mul_cu
+from .activation import get_act_and_mul_cu_str, gen_act_and_mul_cu
+from .attention import gen_single_decode_cu, get_single_decode_uri, gen_batch_decode_cu, get_batch_decode_uri
 
 
 def check_cuda_arch():
@@ -67,9 +68,9 @@ def load_cuda_ops(
         "-O3",
         "-std=c++17",
         "--threads",
-        "1",
-        "-Xfatbin",
-        "-compress-all",
+        "4",
+        # "-Xfatbin",
+        # "-compress-all",
         "-use_fast_math",
         "-DFLASHINFER_ENABLE_BF16",
         "-DFLASHINFER_ENABLE_FP8",

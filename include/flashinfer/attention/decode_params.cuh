@@ -33,65 +33,110 @@ struct DecodeParamsBase {
   DTypeQ* q;
   DTypeO* o;
   float* lse;
-  uint32_t window_left;
-  float logits_soft_cap;
   float sm_scale;
-  float rope_rcp_scale;
-  float rope_rcp_theta;
 };
 
-template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_>
-struct SingleDecodeParams : DecodeParamsBase<DTypeQ_, DTypeKV_, DTypeO_> {
+template <typename DTypeQ, typename DTypeKV, typename DTypeO>
+struct SingleDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
+  using IdType = int32_t;
   DTypeKV* k;
   DTypeKV* v;
-  tensor_info_t info;
+  float* alibi_slopes;
+  uint32_t kv_len;
+  uint32_t num_qo_heads;
+  uint32_t num_kv_heads;
+  uint32_t q_stride_n;
+  uint32_t q_stride_h;
+  uint32_t kv_stride_n;
+  uint32_t kv_stride_h;
+  uint32_t head_dim;
+  uint32_t window_left;
+  float logits_soft_cap;
+  float rope_rcp_scale;
+  float rope_rcp_theta;
   uint32_t kv_chunk_size;
 
-  __device__ __host__ SingleDecodeParams(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeO* o, float* lse,
-                                         tensor_info_t info, uint32_t window_left,
-                                         float logits_soft_cap, float sm_scale,
-                                         float rope_rcp_scale, float rope_rcp_theta,
-                                         uint32_t kv_chunk_size)
-      : DecodeParamsBase<DTypeQ, DTypeKV, DTypeO>{q,
-                                                  o,
-                                                  lse,
-                                                  window_left,
-                                                  logits_soft_cap,
-                                                  sm_scale,
-                                                  rope_rcp_scale,
-                                                  rope_rcp_theta},
+  __device__ __host__ SingleDecodeParams(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeO* o,
+                                         float* alibi_slopes, uint32_t seq_len,
+                                         uint32_t num_qo_heads, uint32_t num_kv_heads,
+                                         QKVLayout kv_layout, uint32_t head_dim,
+                                         uint32_t window_left, float logits_soft_cap,
+                                         float sm_scale, float rope_rcp_scale, float rope_rcp_theta)
+      : DecodeParamsBase<DTypeQ, DTypeKV, DTypeO>{q, o, /*lse=*/nullptr, sm_scale},
         k(k),
         v(v),
-        info(info),
-        kv_chunk_size(kv_chunk_size) {}
+        alibi_slopes(alibi_slopes),
+        kv_len(seq_len),
+        num_qo_heads(num_qo_heads),
+        num_kv_heads(num_kv_heads),
+        q_stride_n(num_qo_heads * head_dim),
+        q_stride_h(head_dim),
+        kv_stride_n((kv_layout == QKVLayout::kNHD) ? num_kv_heads * head_dim : head_dim),
+        kv_stride_h((kv_layout == QKVLayout::kNHD) ? head_dim : seq_len * head_dim),
+        head_dim(head_dim),
+        window_left(window_left),
+        logits_soft_cap(logits_soft_cap),
+        rope_rcp_scale(rope_rcp_scale),
+        rope_rcp_theta(rope_rcp_theta),
+        kv_chunk_size(0) {}
+
+  __host__ __device__ __forceinline__ size_t get_q_elem_offset(uint32_t qo_idx,
+                                                               uint32_t qo_head_idx,
+                                                               uint32_t feat_idx) const {
+    return get_elem_offset_impl(qo_idx, qo_head_idx, feat_idx, q_stride_n, q_stride_h);
+  }
+
+  __host__ __device__ __forceinline__ size_t get_o_elem_offset(uint32_t qo_idx,
+                                                               uint32_t qo_head_idx,
+                                                               uint32_t feat_idx) const {
+    return get_elem_offset_impl(qo_idx, qo_head_idx, feat_idx, num_qo_heads * head_dim, head_dim);
+  }
+
+  __host__ __device__ __forceinline__ size_t get_kv_elem_offset(uint32_t kv_idx,
+                                                                uint32_t kv_head_idx,
+                                                                uint32_t feat_idx) const {
+    return get_elem_offset_impl(kv_idx, kv_head_idx, feat_idx, kv_stride_n, kv_stride_h);
+  }
 };
 
-template <PageStorage page_storage, typename DTypeQ, typename DTypeKV, typename DTypeO,
-          typename IdType>
-struct BatchDecodeParams : DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
+template <PageStorage PAGE_STORAGE_, typename DTypeQ, typename DTypeKV, typename DTypeO,
+          typename IdType_>
+struct BatchDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
+  static constexpr auto PAGE_STORAGE = PAGE_STORAGE_;
+  using IdType = IdType_;
   IdType* q_offset;
-  paged_kv_t<page_storage, DTypeKV, IdType> paged_kv;
+  paged_kv_t<PAGE_STORAGE, DTypeKV, IdType> paged_kv;
   kv_partition_info_t<IdType> kv_partition_info;
-  bool* bool_valid_mask;
+  bool* block_valid_mask;
+  float* alibi_slopes;
+  uint32_t padded_batch_size;
+  uint32_t num_qo_heads;
+  uint32_t window_left;
+  float logits_soft_cap;
+  float rope_rcp_scale;
+  float rope_rcp_theta;
+
+  bool partition_kv;
 
   __device__ __host__ BatchDecodeParams(DTypeQ* q, IdType* q_offset,
-                                        paged_kv_t<page_storage, DTypeKV, IdType> paged_kv,
-                                        kv_partition_info_t<IdType> kv_partition_info,
-                                        DTypeO* o, float* lse, bool* bool_valid_mask,
-                                        uint32_t window_left, float logits_soft_cap, float sm_scale,
-                                        float rope_rcp_scale, float rope_rcp_theta)
-      : DecodeParamsBase<DTypeQ, DTypeKV, DTypeO>{q,
-                                                  o,
-                                                  lse,
-                                                  window_left,
-                                                  logits_soft_cap,
-                                                  sm_scale,
-                                                  rope_rcp_scale,
-                                                  rope_rcp_theta},
+                                        paged_kv_t<PAGE_STORAGE, DTypeKV, IdType> paged_kv,
+                                        DTypeO* o, float* lse, float* alibi_slopes,
+                                        uint32_t num_qo_heads, uint32_t window_left,
+                                        float logits_soft_cap, float sm_scale, float rope_rcp_scale,
+                                        float rope_rcp_theta)
+      : DecodeParamsBase<DTypeQ, DTypeKV, DTypeO>{q, o, lse, sm_scale},
         q_offset(q_offset),
         paged_kv(paged_kv),
-        kv_partition_info(kv_partition_info),
-        bool_valid_mask(bool_valid_mask) {}
+        kv_partition_info(),
+        block_valid_mask(nullptr),
+        alibi_slopes(alibi_slopes),
+        padded_batch_size(0),
+        num_qo_heads(num_qo_heads),
+        window_left(window_left),
+        logits_soft_cap(logits_soft_cap),
+        rope_rcp_scale(rope_rcp_scale),
+        rope_rcp_theta(rope_rcp_theta),
+        partition_kv(false) {}
 };
 
 }  // namespace flashinfer

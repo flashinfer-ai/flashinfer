@@ -18,13 +18,6 @@
 
 #include <flashinfer/attention/handler.cuh>
 #include <flashinfer/layout.cuh>
-#include <memory>
-
-torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torch::Tensor v,
-                                          torch::Tensor tmp, unsigned int pos_encoding_mode,
-                                          unsigned int layout, int window_left,
-                                          float logits_soft_cap, float sm_scale, float rope_scale,
-                                          float rope_theta);
 
 class BatchDecodeWithPagedKVCachePyTorchWrapper {
  public:
@@ -40,6 +33,7 @@ class BatchDecodeWithPagedKVCachePyTorchWrapper {
                                  std::optional<torch::Tensor> paged_v_cache,
                                  torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
                                  torch::Tensor paged_kv_last_page_len,
+                                 std::optional<torch::Tensor> alibi_slopes,
                                  unsigned int pos_encoding_mode, int window_left,
                                  float logits_soft_cap, float sm_scale, float rope_scale,
                                  float rope_theta, bool return_lse);
