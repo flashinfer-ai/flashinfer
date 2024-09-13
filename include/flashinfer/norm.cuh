@@ -256,7 +256,7 @@ __global__ void GemmaRMSNormKernel(T* __restrict__ input, T* __restrict__ weight
   }
   __syncthreads();
 
-  float rms_rcp = math::rsqrt(smem[0] / float(d) + eps);
+  float rms_rcp = math::rsqrt(smem[0] / (float(d) + eps));
 
   for (uint32_t i = 0; i < rounds; i++) {
     vec_t<T, VEC_SIZE> input_vec;
@@ -351,7 +351,7 @@ __global__ void GemmaFusedAddRMSNormKernel(T* __restrict__ input, T* __restrict_
   }
   __syncthreads();
 
-  float rms_rcp = math::rsqrt(smem[0] / float(d) + eps);
+  float rms_rcp = math::rsqrt(smem[0] / (float(d) + eps));
 
   for (uint32_t i = 0; i < rounds; i++) {
     vec_t<T, VEC_SIZE> input_vec;
@@ -361,7 +361,6 @@ __global__ void GemmaFusedAddRMSNormKernel(T* __restrict__ input, T* __restrict_
     weight_vec.fill(0.f);
     residual_vec.fill(0.f);
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
-      input_vec.load(input + bx * d + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
       weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
       residual_vec.load(residual + bx * d + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
     }
