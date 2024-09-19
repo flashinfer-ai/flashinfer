@@ -23,9 +23,10 @@
 namespace flashinfer {
 
 struct AlignedAllocator {
+  void* buf_ptr;
   void* ptr;
   size_t space;
-  AlignedAllocator(void* buf, size_t space) : ptr(buf), space(space) {}
+  AlignedAllocator(void* buf, size_t space) : buf_ptr(buf), ptr(buf), space(space) {}
   template <typename T>
   T* aligned_alloc(size_t size, size_t alignment, std::string name) {
     if (std::align(alignment, size, ptr, space)) {
@@ -41,6 +42,12 @@ struct AlignedAllocator {
     }
     return nullptr;
   }
+
+  size_t aligned_alloc_offset(size_t size, size_t alignment, std::string name) {
+    return (char*)aligned_alloc<char>(size, alignment, name) - (char*)buf_ptr;
+  }
+
+  size_t num_allocated_bytes() { return (char*)ptr - (char*)buf_ptr; }
 };
 
 }  // namespace flashinfer

@@ -100,8 +100,15 @@ __device__ __forceinline__ void compute_qk(const typename AttentionVariant::Para
     // s[j] = apply_logits_post_hook<logits_post_hook>(s[j], logits_soft_cap);
     // TODO(Zihao): apply logits processors
     const uint32_t pos = kv_idx_base + tz * tile_size + j;
+<<<<<<< Updated upstream
     s[j] = AttentionVariant::DecodeLogitsTransform(params, s[j], 0, pos, qo_head_idx, kv_head_idx);
     s[j] = (iter_base + tz * tile_size + j < iter_bound) ? s[j] : -math::inf;
+=======
+    if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
+      s[j] += alibi_slope * float(int(pos) - q_offset);
+    }
+    s[j] = (iter_base + tz * tile_size + j < iter_bound && pos >= left_close_bound) ? s[j] : -10e4;
+>>>>>>> Stashed changes
     st.m = max(st.m, s[j]);
   }
 
