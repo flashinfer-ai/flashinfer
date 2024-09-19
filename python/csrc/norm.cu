@@ -20,7 +20,7 @@
 
 using namespace flashinfer;
 
-torch::Tensor rmsnorm(torch::Tensor input, torch::Tensor weight, double eps) {
+void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps) {
   CHECK_INPUT(input);
   CHECK_INPUT(weight);
   auto device = input.device();
@@ -30,9 +30,10 @@ torch::Tensor rmsnorm(torch::Tensor input, torch::Tensor weight, double eps) {
   CHECK_EQ(input.size(1), weight.size(0));
   unsigned int batch_size = input.size(0);
   unsigned int hidden_size = input.size(1);
+  CHECK_EQ(output.size(0), batch_size);
+  CHECK_EQ(output.size(1), hidden_size);
 
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  auto output = torch::empty_like(input);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
     cudaError_t status = norm::RMSNorm(static_cast<c_type*>(input.data_ptr()),
                                        static_cast<c_type*>(weight.data_ptr()),
@@ -42,10 +43,9 @@ torch::Tensor rmsnorm(torch::Tensor input, torch::Tensor weight, double eps) {
                 "RMSNorm failed with error code " + std::string(cudaGetErrorString(status)));
     return true;
   });
-  return output;
 }
 
-void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight,
+void fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight,
                        double eps) {
   CHECK_INPUT(input);
   CHECK_INPUT(residual);
@@ -74,7 +74,7 @@ void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tenso
   });
 }
 
-torch::Tensor gemma_rmsnorm(torch::Tensor input, torch::Tensor weight, double eps) {
+void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps) {
   CHECK_INPUT(input);
   CHECK_INPUT(weight);
   auto device = input.device();
@@ -84,9 +84,10 @@ torch::Tensor gemma_rmsnorm(torch::Tensor input, torch::Tensor weight, double ep
   CHECK_EQ(input.size(1), weight.size(0));
   unsigned int batch_size = input.size(0);
   unsigned int hidden_size = input.size(1);
+  CHECK_EQ(output.size(0), batch_size);
+  CHECK_EQ(output.size(1), hidden_size);
 
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  auto output = torch::empty_like(input);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
     cudaError_t status = norm::GemmaRMSNorm(static_cast<c_type*>(input.data_ptr()),
                                             static_cast<c_type*>(weight.data_ptr()),
@@ -96,10 +97,9 @@ torch::Tensor gemma_rmsnorm(torch::Tensor input, torch::Tensor weight, double ep
                 "GemmaRMSNorm failed with error code " + std::string(cudaGetErrorString(status)));
     return true;
   });
-  return output;
 }
 
-void gemma_fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight,
+void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight,
                              double eps) {
   CHECK_INPUT(input);
   CHECK_INPUT(residual);

@@ -31,7 +31,10 @@ except ImportError as e:
 
 
 def rmsnorm(
-    input: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    out: torch.Tensor = None,
 ) -> torch.Tensor:
     r"""Root mean square normalization.
 
@@ -43,13 +46,18 @@ def rmsnorm(
         Weight tensor, shape (hidden_size,).
     eps: float
         Epsilon for numerical stability.
+    out: Optional[torch.Tensor]
+        The the output tensor, if specified, the kernel will update this tensor inplace.
 
     Returns
     -------
     output: torch.Tensor
         Normalized tensor, shape (batch_size, hidden_size).
     """
-    return _kernels.rmsnorm(input, weight, eps)
+    if out is None:
+        out = torch.empty_like(input)
+    _kernels.rmsnorm(out, input, weight, eps)
+    return out
 
 
 def fused_add_rmsnorm(
@@ -71,7 +79,12 @@ def fused_add_rmsnorm(
     _kernels.fused_add_rmsnorm(input, residual, weight, eps)
 
 
-def gemma_rmsnorm(input: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6):
+def gemma_rmsnorm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    out: torch.Tensor = None,
+):
     r"""Gemma Root mean square normalization.
 
     Parameters
@@ -82,13 +95,18 @@ def gemma_rmsnorm(input: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6):
         Weight tensor, shape (hidden_size,).
     eps: float
         Epsilon for numerical stability.
+    out: Optional[torch.Tensor]
+        The the output tensor, if specified, the kernel will update this tensor inplace.
 
     Returns
     -------
     output: torch.Tensor
         Gemma Normalized tensor, shape (batch_size, hidden_size).
     """
-    return _kernels.gemma_rmsnorm(input, weight, eps)
+    if out is None:
+        out = torch.empty_like(input)
+    _kernels.gemma_rmsnorm(out, input, weight, eps)
+    return out
 
 
 def gemma_fused_add_rmsnorm(
