@@ -40,8 +40,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(typename AttentionVariant::Par
                                                   float* tmp_s, cudaStream_t stream);
 
 template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant>
-cudaError_t BatchDecodeWithPagedKVCacheWrapperDispatched(BatchDecodeHandler* handler,
-                                                         typename AttentionVariant::ParamsT params,
+cudaError_t BatchDecodeWithPagedKVCacheWrapperDispatched(typename AttentionVariant::ParamsT params,
                                                          cudaStream_t stream) {
   using DTypeOut = typename AttentionVariant::DTypeO;
   using IdType = typename AttentionVariant::IdType;
