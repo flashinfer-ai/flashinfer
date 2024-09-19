@@ -72,14 +72,14 @@ std::vector<torch::Tensor> chain_speculative_sampling(
     torch::Tensor target_probs, std::optional<torch::Tensor> maybe_output_accepted_token_num,
     std::optional<torch::Tensor> maybe_output_emitted_token_num, bool deterministic);
 
-torch::Tensor rmsnorm(torch::Tensor input, torch::Tensor weight, double eps);
+void rmsnorm(torch::Tensor& out, torch::Tensor& input, torch::Tensor& weight, double eps);
 
-void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight,
+void fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight,
                        double eps);
 
-torch::Tensor gemma_rmsnorm(torch::Tensor input, torch::Tensor weight, double eps);
+void gemma_rmsnorm(torch::Tensor& out, torch::Tensor& input, torch::Tensor& weight, double eps);
 
-void gemma_fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight,
+void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight,
                              double eps);
 
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);

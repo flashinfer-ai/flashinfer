@@ -64,12 +64,17 @@ def fused_add_rms_norm(x, residual, weight, eps):
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 4096, 8192])
 @pytest.mark.parametrize("dtype", [torch.float16])
-def test_norm(batch_size, hidden_size, dtype):
+@pytest.mark.parametrize("specify_out", [True, False])
+def test_norm(batch_size, hidden_size, dtype, specify_out):
     x = torch.randn(batch_size, hidden_size).to(0).to(dtype)
     w = torch.randn(hidden_size).to(0).to(dtype)
 
     y_ref = llama_rms_norm(x, w)
-    y = flashinfer.norm.rmsnorm(x, w)
+    if specify_out:
+        y = torch.empty_like(x)
+        flashinfer.norm.rmsnorm(x, w, out=y)
+    else:
+        y = flashinfer.norm.rmsnorm(x, w)
 
     torch.testing.assert_close(
         y_ref.cpu().numpy(), y.cpu().numpy(), rtol=1e-3, atol=1e-3
@@ -101,12 +106,17 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype):
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 4096, 8192])
 @pytest.mark.parametrize("dtype", [torch.float16])
-def test_gemma_norm(batch_size, hidden_size, dtype):
+@pytest.mark.parametrize("specify_out", [True, False])
+def test_gemma_norm(batch_size, hidden_size, dtype, specify_out):
     x = torch.randn(batch_size, hidden_size).to(0).to(dtype)
     w = torch.randn(hidden_size).to(0).to(dtype)
 
     y_ref = gemma_rms_norm(x, w)
-    y = flashinfer.norm.gemma_rmsnorm(x, w)
+    if specify_out:
+        y = torch.empty_like(x)
+        flashinfer.norm.gemma_rmsnorm(x, w, out=y)
+    else:
+        y = flashinfer.norm.gemma_rmsnorm(x, w)
 
     torch.testing.assert_close(
         y_ref.cpu().numpy(), y.cpu().numpy(), rtol=1e-3, atol=1e-3
