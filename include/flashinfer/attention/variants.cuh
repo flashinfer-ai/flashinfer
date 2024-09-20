@@ -288,6 +288,10 @@ struct ComposedAttention {
       logits = ALIBIAttention<ParamsT>::DecodeLogitsTransform(params, logits, qo_idx, kv_idx,
                                                               qo_head_idx, kv_head_idx);
     }
+    if constexpr (use_logits_soft_cap) {
+      logits = LogitsSoftCap<ParamsT>::DecodeLogitsTransform(params, logits, qo_idx, kv_idx,
+                                                             qo_head_idx, kv_head_idx);
+    }
     if constexpr (use_sliding_window) {
       logits = SlidingWindowAttention<ParamsT>::DecodeLogitsTransform(
           params, logits, qo_idx, kv_idx, qo_head_idx, kv_head_idx);
@@ -306,6 +310,10 @@ struct ComposedAttention {
     if constexpr (use_alibi) {
       logits = ALIBIAttention<ParamsT>::PrefillLogitsTransform(params, logits, qo_idx, kv_idx,
                                                                qo_head_idx, kv_head_idx);
+    }
+    if constexpr (use_logits_soft_cap) {
+      logits = LogitsSoftCap<ParamsT>::PrefillLogitsTransform(params, logits, qo_idx, kv_idx,
+                                                              qo_head_idx, kv_head_idx);
     }
     if constexpr (use_custom_mask) {
       logits = CustomMaskAttention<ParamsT>::PrefillLogitsTransform(params, logits, qo_idx, kv_idx,
@@ -327,6 +335,10 @@ struct ComposedAttention {
       logits = ALIBIAttention<ParamsT>::BatchDecodeLogitsTransform(
           params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx);
     }
+    if constexpr (use_logits_soft_cap) {
+      logits = LogitsSoftCap<ParamsT>::BatchDecodeLogitsTransform(params, logits, batch_idx, qo_idx,
+                                                                  kv_idx, qo_head_idx, kv_head_idx);
+    }
     if constexpr (use_sliding_window) {
       logits = SlidingWindowAttention<ParamsT>::BatchDecodeLogitsTransform(
           params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx);
@@ -342,6 +354,10 @@ struct ComposedAttention {
       int32_t qo_head_idx, int32_t kv_head_idx) {
     if constexpr (use_alibi) {
       logits = ALIBIAttention<ParamsT>::BatchPrefillLogitsTransform(
+          params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx);
+    }
+    if constexpr (use_logits_soft_cap) {
+      logits = LogitsSoftCap<ParamsT>::BatchPrefillLogitsTransform(
           params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx);
     }
     if constexpr (use_custom_mask) {

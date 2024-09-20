@@ -92,7 +92,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
     {% if mask_mode == "MaskMode::kCustom" %}static_cast<uint8_t*>(maybe_packed_custom_mask->data_ptr()){% else %}nullptr{% endif %},
     static_cast<{{ dtype_kv }}*>(o.data_ptr()),
     /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-    {% if use_alibi %}static_cast<float*>(maybe_alibi_slopes->data_ptr()){% else %}nullptr{% endif %},
+    {% if use_alibi == "true" %}static_cast<float*>(alibi_slopes->data_ptr()){% else %}nullptr{% endif %}
     num_qo_heads, num_kv_heads, qo_len, kv_len, q_stride_n, q_stride_h,
     kv_stride_n, kv_stride_h, head_dim, window_left, logits_soft_cap, sm_scale,
     rope_scale, rope_theta);
