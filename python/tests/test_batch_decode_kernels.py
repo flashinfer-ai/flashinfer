@@ -80,7 +80,7 @@ def test_batch_decode_with_paged_kv_cache(
         o, _ = wrapper.run_return_lse(q, kv_data.to(kv_dtype))
     else:
         o = wrapper.run(q, kv_data.to(kv_dtype))
-
+    
     for i in range(batch_size):
         perm_dims = [0, 2, 1, 3] if kv_layout == "HND" else [0, 1, 2, 3]
         perm_dims_last = [1, 0, 2] if kv_layout == "HND" else [0, 1, 2]

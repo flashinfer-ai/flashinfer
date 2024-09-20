@@ -32,8 +32,7 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
     torch::Tensor indptr,
     torch::Tensor last_page_len, unsigned int batch_size, unsigned int num_qo_heads,
     unsigned int num_kv_heads, unsigned int head_dim, unsigned int page_size,
-    unsigned int pos_encoding_mode, float logits_soft_cap, bool enable_cuda_graph, torch::Tensor empty_q_data,
-    torch::Tensor empty_kv_data) {
+    float logits_soft_cap, bool enable_cuda_graph) {
   CHECK_INPUT(float_workspace_buffer);
   CHECK_INPUT(int_workspace_buffer);
   // NOTE(zihao): not necessary to be CUDA tensor
@@ -199,8 +198,10 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
     params.kv_partition_info.batch_idx_map = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer, plan_info.batch_idx_map_offset);
     params.kv_partition_info.chunk_start_pos = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer, plan_info.chunk_start_pos_offset);
     params.kv_partition_info.seq_lens_before_partition = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer, plan_info.seq_lengths_before_partition_offset);
+    if (plan_info.enable_cuda_graph) {
+      params.block_valid_mask = GetPtrFromBaseOffset<bool>(int_buffer, plan_info.block_valid_mask_offset);
+    }
   }
-  params.block_valid_mask = GetPtrFromBaseOffset<bool>(int_buffer, plan_info.block_valid_mask_offset);
   params.padded_batch_size = plan_info.padded_batch_size;
   
   cudaError_t status = BatchDecodeWithPagedKVCacheDispatched<

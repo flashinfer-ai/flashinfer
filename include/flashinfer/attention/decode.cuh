@@ -688,8 +688,8 @@ cudaError_t SingleDecodeWithKVCacheDispatched(typename AttentionVariant::ParamsT
         void* args[] = {(void*)&params};
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-        FLASHINFER_CUDA_CALL(MergeStates(tmp, tmp_lse, o, nullptr, num_chunks, 1,
-                                         num_qo_heads, HEAD_DIM, stream));
+        FLASHINFER_CUDA_CALL(
+            MergeStates(tmp, tmp_lse, o, nullptr, num_chunks, 1, num_qo_heads, HEAD_DIM, stream));
       }
     });
   });
@@ -729,6 +729,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(typename AttentionVariant::Par
                                             vec_size, bdx, bdy, bdz, AttentionVariant>;
       FLASHINFER_CUDA_CALL(
           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+      
       if (tmp_v == nullptr) {
         // do not use partition-kv kernel
         dim3 nblks(padded_batch_size, num_kv_heads);
@@ -741,6 +742,8 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(typename AttentionVariant::Par
       } else {
         // use partition-kv kernel
         params.partition_kv = true;
+        auto o = params.o;
+        auto lse = params.lse;
         params.o = tmp_v;
         params.lse = tmp_s;
         void* args[] = {(void*)&params};
@@ -749,7 +752,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(typename AttentionVariant::Par
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
-            tmp_v, tmp_s, kv_partition_info.chunk_indptr, params.o, params.lse,
+            tmp_v, tmp_s, kv_partition_info.chunk_indptr, o, lse,
             kv_partition_info.batch_size_before_partition, num_qo_heads, HEAD_DIM, stream));
       }
     });

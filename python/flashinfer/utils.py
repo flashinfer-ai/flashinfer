@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import torch
+import math
 from enum import Enum
 from typing import Optional, Tuple, Union
 
@@ -28,6 +29,8 @@ class PosEncodingMode(Enum):
 class TensorLayout(Enum):
     NHD = 0
     HND = 1
+
+log2e = 1.4426950408889634
 
 
 def _expand_5d(x: torch.Tensor, kv_layout: str) -> torch.Tensor:
@@ -106,3 +109,13 @@ def _unpack_paged_kv_cache(
                 type(paged_kv_cache)
             )
         )
+
+def get_alibi_slopes(n_heads: int) -> torch.Tensor:
+    n = 2 ** math.floor(math.log2(n_heads))
+    m_0 = 2.0 ** (-8.0 / n)
+    m = torch.pow(m_0, torch.arange(1, 1 + n))
+    if n < n_heads:
+        m_hat_0 = 2.0 ** (-4.0 / n)
+        m_hat = torch.pow(m_hat_0, torch.arange(1, 1 + 2 * (n_heads - n), 2))
+        m = torch.cat([m, m_hat])
+    return m

@@ -23,8 +23,8 @@ import flashinfer
 from alibi_reference import alibi_attention
 
 
-@pytest.mark.parametrize("seq_len", [33001])#[1, 9, 81, 729, 33001])
-@pytest.mark.parametrize("num_heads", [32]) #[4, 8, 32])
+@pytest.mark.parametrize("seq_len", [1, 9, 81, 729])
+@pytest.mark.parametrize("num_heads", [4, 8, 32])
 @pytest.mark.parametrize("head_dim", [128, 256])
 def test_single_decode_alibi(
     seq_len,
@@ -73,6 +73,6 @@ def test_single_decode_alibi(
 #     )
 
 
-if __name__ == "__main__":
-    test_single_decode_alibi(32000, 32, 128)
+# if __name__ == "__main__":
+#     test_single_decode_alibi(33001, 32, 128)
 #     test_single_prefill_alibi(1, 64, 1, 128, False)

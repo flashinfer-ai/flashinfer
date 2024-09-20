@@ -48,6 +48,8 @@ from .utils import (
     _check_pos_encoding_mode,
     _check_kv_layout,
     _unpack_paged_kv_cache,
+    get_alibi_slopes,
+    log2e
 )
 
 _cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}
@@ -68,9 +70,7 @@ def _get_cache_alibi_slopes_buf(
     key = (f"alibi_slopes_{num_qo_heads}", device)
     buf = _cache_buf.get(key)
     if buf is None:
-        buf = torch.empty(num_qo_heads, dtype=torch.float32, device=device)
-        # TODO(Zihao): fill with alibi slopes
-
+        buf = (get_alibi_slopes(num_qo_heads) * log2e).to(device)
         _cache_buf[key] = buf
     return buf
 
@@ -463,7 +463,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
-        return self._use_tensor_cores
+        return self._use_cuda_graph
 
     def reset_workspace_buffer(
         self, float_workspace_buffer: torch.Tensor, int_workspace_buffer: torch.Tensor
@@ -614,6 +614,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._plan_info = self._cached_module.plan(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
+                self._pin_memory_int_workspace_buffer,
                 indptr,
                 last_page_len,
                 batch_size,
@@ -621,7 +622,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 num_kv_heads,
                 head_dim,
                 page_size,
-                PosEncodingMode[pos_encoding_mode].value,
                 logits_soft_cap,
                 self.is_cuda_graph_enabled
             )
@@ -753,7 +753,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,
                 _get_cache_alibi_slopes_buf(q.shape[1], q.device),
-                self._kv_layout, # kv_layout
+                TensorLayout[self._kv_layout].value,
                 window_left,
                 logits_soft_cap,
                 sm_scale,
@@ -890,7 +890,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,
                 _get_cache_alibi_slopes_buf(q.shape[1], q.device),
-                self._kv_layout, # kv_layout
+                TensorLayout[self._kv_layout].value,
                 window_left,
                 logits_soft_cap,
                 sm_scale,
