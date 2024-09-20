@@ -73,6 +73,6 @@ def test_single_decode_alibi(
 #     )
 
 
-# if __name__ == "__main__":
-#     test_single_decode_alibi(9, 32, 128)
+if __name__ == "__main__":
+    test_single_decode_alibi(32000, 32, 128)
 #     test_single_prefill_alibi(1, 64, 1, 128, False)

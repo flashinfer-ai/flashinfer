@@ -64,7 +64,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
       alibi_slopes_defined ? static_cast<float*>(alibi_slopes->data_ptr()): nullptr,
       kv_len, num_qo_heads, num_kv_heads, kv_layout, head_dim, window_left,
       logits_soft_cap, sm_scale, 1.f / rope_scale, 1.f / rope_theta);
-
+  
   cudaError_t status = SingleDecodeWithKVCacheDispatched<{{ head_dim }}, {{ pos_encoding_mode }}, AttentionVariant>(
       params, static_cast<{{ dtype_o }}*>(tmp.data_ptr()), torch_current_stream);
   TORCH_CHECK(status == cudaSuccess,
@@ -75,7 +75,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("single_decode_with_kv_cache", &single_decode_with_kv_cache,
+  m.def("run", &single_decode_with_kv_cache,
         "Single-request decode with KV-Cache operator");
 }
 """

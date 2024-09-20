@@ -18,6 +18,7 @@ batch_decode_templ = r"""
 #include <torch/extension.h>
 #include <optional>
 #include <flashinfer/attention/decode.cuh>
+#include <flashinfer/attention/handler.cuh>
 #include "pytorch_extension_utils.h"
 
 using namespace flashinfer;
@@ -31,7 +32,7 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
     torch::Tensor indptr,
     torch::Tensor last_page_len, unsigned int batch_size, unsigned int num_qo_heads,
     unsigned int num_kv_heads, unsigned int head_dim, unsigned int page_size,
-    unsigned int pos_encoding_mode, float logits_soft_cap, torch::Tensor empty_q_data,
+    unsigned int pos_encoding_mode, float logits_soft_cap, bool enable_cuda_graph, torch::Tensor empty_q_data,
     torch::Tensor empty_kv_data) {
   CHECK_INPUT(float_workspace_buffer);
   CHECK_INPUT(int_workspace_buffer);
@@ -65,7 +66,7 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
       plan_info,
       static_cast<{{ dtype_idx }}*>(indptr.data_ptr()),
       static_cast<{{ dtype_idx }}*>(last_page_len.data_ptr()),
-      batch_size, num_qo_heads, num_kv_heads, page_size);
+      batch_size, num_qo_heads, num_kv_heads, page_size, enable_cuda_graph, /*stream=*/torch_current_stream);
 
   TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
               cudaGetErrorString(status));
@@ -176,10 +177,10 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
                                                           : nullptr),
       static_cast<{{ dtype_idx }}*>(paged_kv_indices.data_ptr()),
       plan_info.split_kv ?
-      static_cast<{{ dtype_idx }}*>(int_buffer + plan_info.new_indptr_offset):
+      GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer, plan_info.new_indptr_offset):
       static_cast<{{ dtype_idx }}*>(paged_kv_indptr.data_ptr()),
       plan_info.split_kv ?
-      static_cast<{{ dtype_idx }}*>(int_buffer + plan_info.new_last_page_len_offset):
+      GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer, plan_info.new_last_page_len_offset):
       static_cast<{{ dtype_idx }}*>(paged_kv_last_page_len.data_ptr()));
   ParamsT params(
     static_cast<{{ dtype_q }}*>(q.data_ptr()),
@@ -188,18 +189,18 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
     alibi_slopes_defined ? static_cast<float*>(alibi_slopes->data_ptr()): nullptr,
     num_qo_heads, window_left, logits_soft_cap, sm_scale, 1.f / rope_scale, 1.f / rope_theta);
   
-  {{ dtype_out }}* tmp_v = nullptr;
+  {{ dtype_o }}* tmp_v = nullptr;
   float* tmp_s = nullptr;
   if (plan_info.split_kv) {
-    tmp_v = static_cast<{{ dtype_out }}*>(float_buffer + plan_info.v_offset);
-    tmp_s = static_cast<float*>(float_buffer + plan_info.s_offset);
+    tmp_v = GetPtrFromBaseOffset<{{ dtype_o }}>(float_buffer, plan_info.v_offset);
+    tmp_s = GetPtrFromBaseOffset<float>(float_buffer, plan_info.s_offset);
     params.kv_partition_info.batch_size_before_partition = plan_info.batch_size_before_partition;
-    params.kv_partition_info.chunk_indptr = static_cast<{{ dtype_idx }}*>(int_buffer + plan_info.chunk_indptr_offset);
-    params.kv_partition_info.batch_idx_map = static_cast<{{ dtype_idx }}*>(int_buffer + plan_info.batch_idx_map_offset);
-    params.kv_partition_info.chunk_start_pos = static_cast<{{ dtype_idx }}*>(int_buffer + plan_info.chunk_start_pos_offset);
-    params.kv_partition_info.seq_lens_before_partition = static_cast<{{ dtype_idx }}*>(int_buffer + plan_info.seq_lens_before_partition_offset);
+    params.kv_partition_info.chunk_indptr = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer, plan_info.chunk_indptr_offset);
+    params.kv_partition_info.batch_idx_map = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer, plan_info.batch_idx_map_offset);
+    params.kv_partition_info.chunk_start_pos = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer, plan_info.chunk_start_pos_offset);
+    params.kv_partition_info.seq_lens_before_partition = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer, plan_info.seq_lengths_before_partition_offset);
   }
-  params.block_valid_mask = static_cast<bool*>(int_buffer + plan_info.block_valid_mask_offset); 
+  params.block_valid_mask = GetPtrFromBaseOffset<bool>(int_buffer, plan_info.block_valid_mask_offset);
   params.padded_batch_size = plan_info.padded_batch_size;
   
   cudaError_t status = BatchDecodeWithPagedKVCacheDispatched<
@@ -216,6 +217,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  
+  m.def("plan", &BatchDecodeWithPagedKVCachePlan);
+  m.def("run", &BatchDecodeWithPagedKVCacheRun);
 }
 """

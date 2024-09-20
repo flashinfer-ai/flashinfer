@@ -313,7 +313,7 @@ struct DecodePlanInfo {
 
 // create a function that returns T* from base pointer and offset
 template <typename T>
-T* GetPtrFromOffset(void* base_ptr, int64_t offset) {
+T* GetPtrFromBaseOffset(void* base_ptr, int64_t offset) {
   return reinterpret_cast<T*>(reinterpret_cast<char*>(base_ptr) + offset);
 }
 
@@ -370,23 +370,23 @@ cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
     }
 
     IdType* new_indptr_h =
-        GetPtrFromOffset<IdType>(page_locked_int_buffer, plan_info.new_indptr_offset);
+        GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.new_indptr_offset);
     IdType* new_last_page_len_h =
-        GetPtrFromOffset<IdType>(page_locked_int_buffer, plan_info.new_last_page_len_offset);
+        GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.new_last_page_len_offset);
     IdType* chunk_indptr_h =
-        GetPtrFromOffset<IdType>(page_locked_int_buffer, plan_info.chunk_indptr_offset);
+        GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.chunk_indptr_offset);
     IdType* batch_idx_map_h =
-        GetPtrFromOffset<IdType>(page_locked_int_buffer, plan_info.batch_idx_map_offset);
+        GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.batch_idx_map_offset);
     IdType* chunk_start_pos_h =
-        GetPtrFromOffset<IdType>(page_locked_int_buffer, plan_info.chunk_start_pos_offset);
-    IdType* seq_lengths_before_partition_h = GetPtrFromOffset<IdType>(
+        GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.chunk_start_pos_offset);
+    IdType* seq_lengths_before_partition_h = GetPtrFromBaseOffset<IdType>(
         page_locked_int_buffer, plan_info.seq_lengths_before_partition_offset);
 
     bool* block_valid_mask_h = nullptr;
 
     if (split_kv) {
       block_valid_mask_h =
-          GetPtrFromOffset<bool>(page_locked_int_buffer, plan_info.block_valid_mask_offset);
+          GetPtrFromBaseOffset<bool>(page_locked_int_buffer, plan_info.block_valid_mask_offset);
       std::fill(block_valid_mask_h, block_valid_mask_h + padded_batch_size, 0);
     }
 
@@ -576,14 +576,14 @@ cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_in_bytes
   }
 
   IdType* request_indices_h =
-      GetPtrFromOffset<IdType>(page_locked_int_buffer, plan_info.request_indices_offset);
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.request_indices_offset);
   IdType* qo_tile_indices_h =
-      GetPtrFromOffset<IdType>(page_locked_int_buffer, plan_info.qo_tile_indices_offset);
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.qo_tile_indices_offset);
   IdType* kv_tile_indices_h =
-      GetPtrFromOffset<IdType>(page_locked_int_buffer, plan_info.kv_tile_indices_offset);
-  IdType* o_indptr_h = GetPtrFromOffset<IdType>(page_locked_int_buffer, plan_info.o_indptr_offset);
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_tile_indices_offset);
+  IdType* o_indptr_h = GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.o_indptr_offset);
   IdType* kv_chunk_size_ptr_h =
-      GetPtrFromOffset<IdType>(page_locked_int_buffer, plan_info.kv_chunk_size_ptr_offset);
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_chunk_size_ptr_offset);
   std::copy(request_indices_vec.begin(), request_indices_vec.end(), request_indices_h);
   std::copy(qo_tile_indices_vec.begin(), qo_tile_indices_vec.end(), qo_tile_indices_h);
   std::copy(kv_tile_indices_vec.begin(), kv_tile_indices_vec.end(), kv_tile_indices_h);
@@ -592,9 +592,9 @@ cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_in_bytes
 
   if (split_kv) {
     IdType* merge_indptr_h =
-        GetPtrFromOffset<IdType>(page_locked_int_buffer, plan_info.merge_indptr_offset);
+        GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.merge_indptr_offset);
     IdType* block_valid_mask_h =
-        GetPtrFromOffset<IdType>(page_locked_int_buffer, plan_info.block_valid_mask_offset);
+        GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.block_valid_mask_offset);
     std::copy(merge_indptr_vec.begin(), merge_indptr_vec.end(), merge_indptr_h);
     for (uint32_t i = 0; i < padded_batch_size; ++i) {
       block_valid_mask_h[i] = i < new_batch_size;

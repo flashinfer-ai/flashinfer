@@ -100,17 +100,17 @@ def compile_batch_decode_module(
         verbose=verbose,
     )
 
-compile_batch_decode_module(
-    torch.float16,
-    torch.float16,
-    torch.float16,
-    torch.int32,
-    128,
-    PosEncodingMode.NONE.value,
-    False,
-    False,
-    False, 
-)
+# compile_batch_decode_module(
+#     torch.float16,
+#     torch.float16,
+#     torch.float16,
+#     torch.int32,
+#     128,
+#     PosEncodingMode.NONE.value,
+#     False,
+#     False,
+#     False, 
+# )
 
 _single_decode_modules = {}
 _batch_decode_modules = {}
@@ -238,7 +238,7 @@ def single_decode_with_kv_cache(
 
     if use_tensor_cores:
         # TODO(Zihao): fix this
-        pass
+        raise NotImplementedError("Tensor cores is not supported in single_decode_with_kv_cache")
     else:
         out = get_single_decode_module(
             q.dtype,
@@ -249,7 +249,7 @@ def single_decode_with_kv_cache(
             window_left != -1,  # use_sliding_window
             logits_soft_cap > 0,  # use_logits_soft_cap
             pos_encoding_mode == "ALIBI",  # use_alibi
-        ).single_decode_with_kv_cache(
+        ).run(
             q,
             k,
             v,
@@ -418,6 +418,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._int_workspace_buffer = torch.empty(
             (8 * 1024 * 1024,), dtype=torch.uint8, device=float_workspace_buffer.device
         )
+        self._pin_memory_int_workspace_buffer = torch.empty(
+            (8 * 1024 * 1024,), dtype=torch.uint8, pin_memory=True
+        )
 
         if use_cuda_graph:
             if not torch.is_tensor(paged_kv_indptr_buffer):
@@ -443,26 +446,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._paged_kv_indptr_buf = paged_kv_indptr_buffer
         self._paged_kv_indices_buf = paged_kv_indices_buffer
         self._paged_kv_last_page_len_buf = paged_kv_last_page_len_buffer
+        self._use_tensor_cores = use_tensor_cores
+        self._use_cuda_graph = use_cuda_graph
 
         if use_tensor_cores:
-            self._use_tensor_cores = True
-            self._wrapper = _prefill.BatchPrefillWithPagedKVCachePyTorchWrapper(
-                TensorLayout[kv_layout].value,
-                use_cuda_graph,
-            )
             if use_cuda_graph:
                 self._qo_indptr_buf = torch.arange(
                     self._fixed_batch_size + 1,
                     dtype=torch.int32,
                     device=float_workspace_buffer.device,
                 )
-        else:
-            self._use_tensor_cores = False
-            self._wrapper = _decode.BatchDecodeWithPagedKVCachePyTorchWrapper(
-                TensorLayout[kv_layout].value,
-                use_cuda_graph,
-                self._fixed_batch_size,
-            )
 
     @property
     def use_tensor_cores(self) -> bool:
@@ -470,10 +463,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
-        return self._wrapper.is_cuda_graph_enabled()
+        return self._use_tensor_cores
 
     def reset_workspace_buffer(
-        self, float_workspace_buffer: torch.Tensor, int_workspace_buffer
+        self, float_workspace_buffer: torch.Tensor, int_workspace_buffer: torch.Tensor
     ) -> None:
         r"""Reset the workspace buffer.
 
@@ -489,9 +482,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         """
         self._float_workspace_buffer = float_workspace_buffer
         self._int_workspace_buffer = int_workspace_buffer
-        self._wrapper.update_page_locked_buffer_size(
-            int_workspace_buffer.numel() * int_workspace_buffer.element_size()
-        )
+        self._pin_memory_int_workspace_buffer = torch.empty(self._int_workspace_buffer.shape, pin_memory=True)
 
     def plan(
         self,
@@ -586,20 +577,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
         # NOTE(Zihao): the following tensors acts as placeholder to pass dtype info
         if not q_data_type:
             q_data_type = data_type
-        empty_q_data = torch.empty(
-            0,
-            dtype=(
-                getattr(torch, q_data_type)
-                if isinstance(q_data_type, str)
-                else q_data_type
-            ),
-        )
-        empty_kv_cache = torch.empty(
-            0,
-            dtype=(
-                getattr(torch, data_type) if isinstance(data_type, str) else data_type
-            ),
-        )
 
         if self.use_tensor_cores:
             if not self.is_cuda_graph_enabled:
@@ -608,6 +585,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._qo_indptr_buf = torch.arange(
                     batch_size + 1, dtype=torch.int32, device=indptr.device
                 )
+            """ 
             self._wrapper.plan(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
@@ -620,8 +598,20 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 page_size,
                 empty_q_data,
             )
+            """
         else:
-            self._wrapper.plan(
+            self._cached_module = get_batch_decode_module(
+                q_data_type,
+                data_type,
+                q_data_type,
+                indptr.dtype,
+                head_dim,
+                PosEncodingMode[pos_encoding_mode].value,
+                window_left != -1,  # use_sliding_window
+                logits_soft_cap > 0,  # use_logits_soft_cap
+                pos_encoding_mode == "ALIBI",  # use_alibi
+            )
+            self._plan_info = self._cached_module.plan(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 indptr,
@@ -633,8 +623,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 page_size,
                 PosEncodingMode[pos_encoding_mode].value,
                 logits_soft_cap,
-                empty_q_data,
-                empty_kv_cache,
+                self.is_cuda_graph_enabled
             )
 
         self._pos_encoding_mode = pos_encoding_mode
@@ -733,6 +722,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             rope_theta = 1e4
 
         if self.use_tensor_cores:
+            raise NotImplementedError("Tensor cores is not supported in batch_decode_with_paged_kv_cache")
+            """
             out = self._wrapper.run(
                 q,
                 self._qo_indptr_buf,
@@ -750,14 +741,19 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 rope_theta,
                 False,  # return_lse
             )[0]
+            """
         else:
-            out = self._wrapper.run(
+            out = self._cached_module.run(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._plan_info,
                 q,
                 *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
                 self._paged_kv_indptr_buf,
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,
-                PosEncodingMode[pos_encoding_mode].value,
+                _get_cache_alibi_slopes_buf(q.shape[1], q.device),
+                self._kv_layout, # kv_layout
                 window_left,
                 logits_soft_cap,
                 sm_scale,
@@ -863,6 +859,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if rope_theta is None:
             rope_theta = 1e4
         if self.use_tensor_cores:
+            raise NotImplementedError("Tensor cores is not supported in batch_decode_with_paged_kv_cache")
+            """
             V, s = self._wrapper.run(
                 q,
                 self._qo_indptr_buf,
@@ -880,14 +878,19 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 rope_theta,
                 True,  # return_lse
             )
+            """
         else:
-            V, s = self._wrapper.run(
+            V, s = self._cached_module.run(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._plan_info,
                 q,
                 *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
                 self._paged_kv_indptr_buf,
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,
-                PosEncodingMode[pos_encoding_mode].value,
+                _get_cache_alibi_slopes_buf(q.shape[1], q.device),
+                self._kv_layout, # kv_layout
                 window_left,
                 logits_soft_cap,
                 sm_scale,
