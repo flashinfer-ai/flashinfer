@@ -48,31 +48,9 @@ from .utils import (
     _check_pos_encoding_mode,
     _check_kv_layout,
     _unpack_paged_kv_cache,
-    get_alibi_slopes,
-    log2e
+    _get_cache_buf,
+    _get_cache_alibi_slopes_buf
 )
-
-_cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}
-
-
-def _get_cache_buf(name: str, bytes: int, device: torch.device) -> torch.Tensor:
-    key = (name, device)
-    buf = _cache_buf.get(key)
-    if buf is None:
-        buf = torch.empty(bytes, dtype=torch.uint8, device=device)
-        _cache_buf[key] = buf
-    return buf
-
-
-def _get_cache_alibi_slopes_buf(
-    num_qo_heads: int, device: torch.device
-) -> torch.Tensor:
-    key = (f"alibi_slopes_{num_qo_heads}", device)
-    buf = _cache_buf.get(key)
-    if buf is None:
-        buf = (get_alibi_slopes(num_qo_heads) * log2e).to(device)
-        _cache_buf[key] = buf
-    return buf
 
 
 def compile_single_decode_module(

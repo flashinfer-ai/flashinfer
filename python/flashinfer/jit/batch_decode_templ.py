@@ -19,6 +19,8 @@ batch_decode_templ = r"""
 #include <optional>
 #include <flashinfer/attention/decode.cuh>
 #include <flashinfer/attention/handler.cuh>
+#include <flashinfer/attention/variants.cuh>
+#include <flashinfer/attention/decode_params.cuh>
 #include "pytorch_extension_utils.h"
 
 using namespace flashinfer;
@@ -159,7 +161,6 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
   }
 
   TORCH_CHECK(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
-  bool alibi_slopes_defined = alibi_slopes.has_value();
 
   void* float_buffer = static_cast<void*>(float_workspace_buffer.data_ptr());
   void* int_buffer = static_cast<void*>(int_workspace_buffer.data_ptr());
@@ -185,7 +186,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
     static_cast<{{ dtype_q }}*>(q.data_ptr()),
     /*q_offset=*/nullptr, paged_kv, static_cast<{{ dtype_o }}*>(o.data_ptr()),
     /*lse=*/(return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr),
-    alibi_slopes_defined ? static_cast<float*>(alibi_slopes->data_ptr()): nullptr,
+    {% if use_alibi %}static_cast<float*>(alibi_slopes->data_ptr()){% else %}nullptr{% endif %},
     num_qo_heads, window_left, logits_soft_cap, sm_scale, 1.f / rope_scale, 1.f / rope_theta);
   
   {{ dtype_o }}* tmp_v = nullptr;

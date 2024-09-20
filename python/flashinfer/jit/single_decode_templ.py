@@ -18,6 +18,8 @@ single_decode_templ = r"""
 #include <torch/extension.h>
 #include <optional>
 #include <flashinfer/attention/decode.cuh>
+#include <flashinfer/attention/variants.cuh>
+#include <flashinfer/attention/decode_params.cuh>
 #include "pytorch_extension_utils.h"
 
 torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torch::Tensor v,
@@ -54,14 +56,13 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto o = torch::empty_like(q);
   TORCH_CHECK(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
-  bool alibi_slopes_defined = alibi_slopes.has_value();
 
   using ParamsT = SingleDecodeParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}>;
   using AttentionVariant = ComposedAttention<ParamsT, get_variant_code(/*use_custom_mask=*/false, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, {{ use_alibi }})>;
   ParamsT params(
       static_cast<{{ dtype_q }}*>(q.data_ptr()), static_cast<{{ dtype_kv }}*>(k.data_ptr()),
       static_cast<{{ dtype_kv }}*>(v.data_ptr()), static_cast<{{ dtype_o }}*>(o.data_ptr()),
-      alibi_slopes_defined ? static_cast<float*>(alibi_slopes->data_ptr()): nullptr,
+      {% if use_alibi %}static_cast<float*>(alibi_slopes->data_ptr()){% else %}nullptr{% endif %},
       kv_len, num_qo_heads, num_kv_heads, kv_layout, head_dim, window_left,
       logits_soft_cap, sm_scale, 1.f / rope_scale, 1.f / rope_theta);
   

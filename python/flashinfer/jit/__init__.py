@@ -26,7 +26,18 @@ from .env import (
     CUTLASS_INCLUDE_DIR,
 )
 from .activation import get_act_and_mul_cu_str, gen_act_and_mul_cu
-from .attention import gen_single_decode_cu, get_single_decode_uri, gen_batch_decode_cu, get_batch_decode_uri
+from .attention import (
+    gen_single_decode_cu,
+    get_single_decode_uri,
+    gen_batch_decode_cu,
+    get_batch_decode_uri,
+    gen_single_prefill_cu,
+    get_single_prefill_uri,
+    gen_batch_prefill_ragged_cu,
+    get_batch_prefill_ragged_uri,
+    gen_batch_prefill_paged_cu,
+    get_batch_prefill_paged_uri,
+)
 
 
 def check_cuda_arch():

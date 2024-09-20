@@ -20,39 +20,105 @@ import torch
 import logging
 
 # mypy: disable-error-code="attr-defined"
-try:
-    from . import _prefill
-except ImportError as e:
-    import os
-    import logging
+# try:
+#     from . import _prefill
+# except ImportError as e:
+#     import os
+#     import logging
 
-    if os.environ.get("BUILD_DOC", "0") == "1":
-        _prefill = None
-        logging.warning("Kernels are not loaded in documentation build mode.")
-    else:
-        raise e
+#     if os.environ.get("BUILD_DOC", "0") == "1":
+#         _prefill = None
+#         logging.warning("Kernels are not loaded in documentation build mode.")
+#     else:
+#         raise e
 
+from .jit import (
+    load_cuda_ops,
+    FLASHINFER_GEN_SRC_DIR,
+    gen_single_prefill_cu,
+    get_single_prefill_uri,
+    gen_batch_prefill_ragged_cu,
+    get_batch_prefill_ragged_uri,
+    gen_batch_prefill_paged_cu,
+    get_batch_prefill_paged_uri,
+)
 from .utils import (
     PosEncodingMode,
+    MaskMode,
     TensorLayout,
     _check_pos_encoding_mode,
     _check_kv_layout,
     _unpack_paged_kv_cache,
     is_float8,
+    _get_cache_buf,
+    _get_cache_alibi_slopes_buf,
 )
 from .quantization import packbits, segment_packbits
 
 
-_cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}
+def compile_single_prefill_module(
+    *args,
+    verbose: bool = False,
+):
+    gen_single_prefill_cu(*args)
+    uri = get_single_prefill_uri(*args)
+    return load_cuda_ops(
+        uri,
+        [FLASHINFER_GEN_SRC_DIR / f"{uri}.cu"],
+        verbose=verbose,
+    )
 
 
-def _get_cache_buf(name: str, bytes: int, device: torch.device) -> torch.Tensor:
-    key = (name, device)
-    buf = _cache_buf.get(key)
-    if buf is None:
-        buf = torch.empty(bytes, dtype=torch.uint8, device=device)
-        _cache_buf[key] = buf
-    return buf
+def compile_batch_prefill_ragged_module(
+    *args,
+    verbose: bool = False,
+):
+    gen_batch_prefill_ragged_cu(*args)
+    uri = get_batch_prefill_ragged_uri(*args)
+    return load_cuda_ops(
+        uri,
+        [FLASHINFER_GEN_SRC_DIR / f"{uri}.cu"],
+        verbose=verbose,
+    )
+
+
+def compile_batch_prefill_paged_module(
+    *args,
+    verbose: bool = False,
+):
+    gen_batch_prefill_paged_cu(*args)
+    uri = get_batch_prefill_paged_uri(*args)
+    return load_cuda_ops(
+        uri,
+        [FLASHINFER_GEN_SRC_DIR / f"{uri}.cu"],
+        verbose=verbose,
+    )
+
+
+_single_prefill_modules = {}
+_batch_prefill_ragged_modules = {}
+_batch_prefill_paged_modules = {}
+
+
+def get_single_prefill_module(*args):
+    global _single_prefill_modules
+    if args not in _single_prefill_modules:
+        _single_prefill_modules[args] = compile_single_prefill_module(*args)
+    return _single_prefill_modules[args]
+
+
+def get_batch_prefill_ragged_module(*args):
+    global _batch_prefill_ragged_modules
+    if args not in _batch_prefill_ragged_modules:
+        _batch_prefill_ragged_modules[args] = compile_batch_prefill_ragged_module(*args)
+    return _batch_prefill_ragged_modules[args]
+
+
+def get_batch_prefill_page_module(*args):
+    global _batch_prefill_paged_modules
+    if args not in _batch_prefill_paged_modules:
+        _batch_prefill_paged_modules[args] = compile_batch_prefill_paged_module(*args)
+    return _batch_prefill_paged_modules[args]
 
 
 def single_prefill_with_kv_cache(
@@ -186,40 +252,41 @@ def single_prefill_with_kv_cache(
         packed_custom_mask = packbits(
             custom_mask.contiguous().view(-1), bitorder="little"
         )
+    
     if packed_custom_mask is not None:
-        return _prefill.single_prefill_with_kv_cache_custom_mask(
-            q,
-            k,
-            v,
-            packed_custom_mask,
-            tmp,
-            TensorLayout[kv_layout].value,
-            PosEncodingMode[pos_encoding_mode].value,
-            allow_fp16_qk_reduction,
-            window_left,
-            logits_soft_cap,
-            sm_scale,
-            rope_scale,
-            rope_theta,
-            False,  # return lse
-        )[0]
+        mask_mode = MaskMode.CUSTOM.value
     else:
-        return _prefill.single_prefill_with_kv_cache(
-            q,
-            k,
-            v,
-            tmp,
-            causal,
-            TensorLayout[kv_layout].value,
-            PosEncodingMode[pos_encoding_mode].value,
-            allow_fp16_qk_reduction,
-            window_left,
-            logits_soft_cap,
-            sm_scale,
-            rope_scale,
-            rope_theta,
-            False,  # return lse
-        )[0]
+        if causal:
+            mask_mode = MaskMode.CAUSAL.value
+        else:
+            mask_mode = MaskMode.NON_CAUSAL.value
+
+    return get_single_prefill_module(
+        q.dtype,
+        k.dtype,
+        q.dtype,
+        q.shape[-1],
+        PosEncodingMode[pos_encoding_mode].value,
+        mask_mode,
+        window_left >= 0,  # use_sliding_window
+        logits_soft_cap > 0,  # use_logits_soft_cap
+        pos_encoding_mode == "ALIBI",  # use_alibi
+        allow_fp16_qk_reduction
+    ).run(
+        q,
+        k,
+        v,
+        packed_custom_mask,
+        tmp,
+        _get_cache_alibi_slopes_buf(q.shape[1], q.device),
+        TensorLayout[kv_layout].value,
+        window_left,
+        logits_soft_cap,
+        sm_scale,
+        rope_scale,
+        rope_theta,
+        False,  # return lse
+    )[0]
 
 
 def single_prefill_with_kv_cache_return_lse(

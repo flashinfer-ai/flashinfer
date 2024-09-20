@@ -119,8 +119,8 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
 }
 
 std::vector<torch::Tensor> single_prefill_with_kv_cache_custom_mask(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor packed_custom_mask,
-    torch::Tensor tmp, unsigned int layout, unsigned int pos_encoding_mode,
+    torch::Tensor q, torch::Tensor k, torch::Tensor v, std::optional<torch::Tensor> maybe_packed_custom_mask,
+    torch::Tensor tmp, bool causal, unsigned int layout, unsigned int pos_encoding_mode,
     bool allow_fp16_qk_reduction, int32_t window_left, float logits_soft_cap, float sm_scale,
     float rope_scale, float rope_theta, bool return_lse) {
   CHECK_CUDA(q);

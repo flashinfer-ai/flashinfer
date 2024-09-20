@@ -35,9 +35,7 @@
 #include "../utils.cuh"
 #include "../vec_dtypes.cuh"
 #include "cascade.cuh"
-#include "decode_params.cuh"
 #include "state.cuh"
-#include "variants.cuh"
 
 namespace flashinfer {
 

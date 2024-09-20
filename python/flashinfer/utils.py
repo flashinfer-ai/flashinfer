@@ -17,7 +17,7 @@ limitations under the License.
 import torch
 import math
 from enum import Enum
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, Dict
 
 
 class PosEncodingMode(Enum):
@@ -26,9 +26,16 @@ class PosEncodingMode(Enum):
     ALIBI = 2
 
 
+class MaskMode(Enum):
+    NON_CAUSAL = 0
+    CAUSAL = 1
+    CUSTOM = 2
+
+
 class TensorLayout(Enum):
     NHD = 0
     HND = 1
+
 
 log2e = 1.4426950408889634
 
@@ -110,6 +117,7 @@ def _unpack_paged_kv_cache(
             )
         )
 
+
 def get_alibi_slopes(n_heads: int) -> torch.Tensor:
     n = 2 ** math.floor(math.log2(n_heads))
     m_0 = 2.0 ** (-8.0 / n)
@@ -119,3 +127,26 @@ def get_alibi_slopes(n_heads: int) -> torch.Tensor:
         m_hat = torch.pow(m_hat_0, torch.arange(1, 1 + 2 * (n_heads - n), 2))
         m = torch.cat([m, m_hat])
     return m
+
+
+_cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}
+
+
+def _get_cache_buf(name: str, bytes: int, device: torch.device) -> torch.Tensor:
+    key = (name, device)
+    buf = _cache_buf.get(key)
+    if buf is None:
+        buf = torch.empty(bytes, dtype=torch.uint8, device=device)
+        _cache_buf[key] = buf
+    return buf
+
+
+def _get_cache_alibi_slopes_buf(
+    num_qo_heads: int, device: torch.device
+) -> torch.Tensor:
+    key = (f"alibi_slopes_{num_qo_heads}", device)
+    buf = _cache_buf.get(key)
+    if buf is None:
+        buf = (get_alibi_slopes(num_qo_heads) * log2e).to(device)
+        _cache_buf[key] = buf
+    return buf
