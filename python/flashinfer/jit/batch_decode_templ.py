@@ -186,7 +186,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
     static_cast<{{ dtype_q }}*>(q.data_ptr()),
     /*q_offset=*/nullptr, paged_kv, static_cast<{{ dtype_o }}*>(o.data_ptr()),
     /*lse=*/(return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr),
-    {% if use_alibi == "true" %}static_cast<float*>(alibi_slopes->data_ptr()){% else %}nullptr{% endif %}
+    {% if use_alibi == "true" %}static_cast<float*>(alibi_slopes->data_ptr()){% else %}nullptr{% endif %},
     num_qo_heads, window_left, logits_soft_cap, sm_scale, 1.f / rope_scale, 1.f / rope_theta);
   
   {{ dtype_o }}* tmp_v = nullptr;
