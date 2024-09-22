@@ -16,7 +16,7 @@
 #ifndef FLASHINFER_FRAG_LAYOUT_SWIZZLE_CUH_
 #define FLASHINFER_FRAG_LAYOUT_SWIZZLE_CUH_
 
-#if USE_ROCM
+#ifdef USE_ROCM
 
 #include <hip/hip_runtime.h>
 
@@ -24,7 +24,7 @@
 
 #include <cuda_runtime.h>
 
-#endif
+#endif // USE_ROCM
 
 #include <cstdint>
 
@@ -70,7 +70,7 @@ __device__ __forceinline__ uint32_t frag_layout_swizzle_16b_to_8b_trans(uint32_t
   tmp = __shfl_xor_sync(0xffffffffffffffff, x, 0x10);
   #else
   tmp = __shfl_xor_sync(0xffffffff, x, 0x10);
-  #endifgi
+  #endif
 
   x = __byte_perm(x, tmp, ((threadIdx.x & 0x10) == 0) ? 0x5410 : 0x3276);
   return x;
