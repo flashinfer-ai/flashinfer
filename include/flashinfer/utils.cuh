@@ -32,7 +32,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
-#endif
+#endif // USE_ROCM
 
 #include <cstdint>
 #include <iostream>

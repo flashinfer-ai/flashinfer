@@ -67,6 +67,9 @@ __forceinline__ __device__ T shfl_xor_sync(T, int);
 template<typename T>
 __forceinline__ __device__ T rsqrt(T);
 
+template<typename T>
+__forceinline__ __device__ T tanh(T);
+
 // sepicalization
 
 // TODO (yiakwy) : add equivalent asm version for fast exp computation (polynomial approx)
@@ -78,6 +81,11 @@ inline __device__ float exp2(float x) {
 template<>
 inline __device__ half exp2(half x) {
   return hexp2(x);
+}
+
+template<>
+inline __device__ half2 exp2(half2 x) {
+  return h2exp2(x);
 }
 
 template<>
@@ -93,6 +101,8 @@ inline __device__ half log2(half x) {
 template<>
 __forceinline__ __device__ float rcp(float x) {
   // TODO (yiakwy) : __frcp_rn is not supported in ROCM 6.2
+  // TODO (yiakwy) : accelerate __frcp_rn for float input with fast rcp algorithm
+  // return __frcp_rn(x);
   return 1.f / x;
 }
 
@@ -129,6 +139,32 @@ __forceinline__ __device__ float rsqrt(float x) {
   return rsqrtf(x);
 }
 
+template<>
+__forceinline__ __device__ float tanh(float x) {
+  return tanhf(x);
+}
+
+template<>
+__forceinline__ __device__ half tanh(half x) {
+  // TODO (yiakwy) : SDK 6.2 does not define htanh
+  /*
+  return htanh(x);
+  */
+  // TODO (yiakwy) : optimize this with fast polynomial fitting
+  half a = hexp(x);
+  half b = hexp(-x);
+  return (a - b) / (a + b);
+}
+
+template<>
+__forceinline__ __device__ half2 tanh(half2 x) {
+  // TODO (yiakwy) : SDK 6.2 does not define h2tanh
+  /*
+  return h2tanh(x);
+  */
+  return half2{tanh(x.x), tanh(x.y)};
+}
+
 } // amdgpu
 
 /*!
@@ -139,6 +175,13 @@ __forceinline__ __device__ float ptx_exp2(float x) {
   return amdgpu::exp2(x);
 }
 
+__forceinline__ __device__ half ptx_exp2(half x) {
+  return amdgpu::exp2(x);
+}
+
+__forceinline__ __device__ half2 ptx_exp2(half2 x) {
+  return amdgpu::exp2(x);
+}
 
 /*!
  * \brief Wrapper of PTX lg2.approx instruction, which computes log2(x)
@@ -167,12 +210,32 @@ __forceinline__ __device__ float shfl_xor_sync(float x, int lane_mask) {
   return amdgpu::shfl_xor_sync(x, lane_mask);
 }
 
+__forceinline__ __device__ half shfl_xor_sync(half x, int lane_mask) {
+  return amdgpu::shfl_xor_sync(x, lane_mask);
+}
+
+__forceinline__ __device__ half2 shfl_xor_sync(half2 x, int lane_mask) {
+  return amdgpu::shfl_xor_sync(x, lane_mask);
+}
+
 /*!
  * \brief Wrapper of PTX rsqrt approximation instruction, which computes 1/sqrt(x)
  * \param x input
  */
 __forceinline__ __device__ float rsqrt(float x) {
   return amdgpu::rsqrt(x);
+}
+
+__forceinline__ __device__ float tanh(float x) {
+  return amdgpu::tanh(x);
+}
+
+__forceinline__ __device__ half tanh(half x) {
+  return amdgpu::tanh(x);
+}
+
+__forceinline__ __device__ half2 tanh(half2 x) {
+  return amdgpu::tanh(x);
 }
 
 #else

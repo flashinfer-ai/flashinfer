@@ -1,15 +1,62 @@
 // adpated from MSC mscclpp project, also see examples from cholla (https://github.com/cholla-hydro/cholla/blob/main/src/utils/gpu.hpp)
-
+// Copyright LEI WANG (yiak.wy@gmail.com)
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
 #ifndef FLASHINFER_HIP_DEFS_H_
 #define FLASHINFER_HIP_DEFS_H_
 
+#ifndef __HIP_PLATFORM_AMD__
+#define __HIP_PLATFORM_AMD__
+#endif
+
+#ifdef __HIP_PLATFORM_NVIDIA__
+#undef __HIP_PLATFORM_NVIDIA__
+#endif
+
 #if defined(__HIP_PLATFORM_AMD__)
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
 
+// enum alias
+using cudaFuncAttribute = hipFuncAttribute;
+const cudaFuncAttribute cudaFuncAttributeMaxDynamicSharedMemorySize = hipFuncAttribute::hipFuncAttributeMaxDynamicSharedMemorySize;
+const cudaFuncAttribute cudaFuncAttributePreferredSharedMemoryCarveout = hipFuncAttribute::hipFuncAttributePreferredSharedMemoryCarveout;
+const cudaFuncAttribute cudaFuncAttributeMax = hipFuncAttribute::hipFuncAttributeMax;
+
+using cudaDeviceAttr = hipDeviceAttribute_t;
+// Number of multiprocessors on the device
+const cudaDeviceAttr cudaDevAttrMultiProcessorCount = hipDeviceAttribute_t::hipDeviceAttributeMultiprocessorCount;
+const cudaDeviceAttr cudaDevAttrMaxSharedMemoryPerMultiprocessor = hipDeviceAttribute_t::hipDeviceAttributeMaxSharedMemoryPerMultiprocessor;
+
+// function alas
+template<typename Func>
+inline static hipError_t cudaFuncSetAttribute(Func&& func, const hipFuncAttribute& attr, int value) {
+    return hipFuncSetAttribute((void*)func, attr, value);
+}
+
+template <typename... Args>
+static __inline__ __host__ __device__
+auto cudaLaunchKernel(Args&&... args) -> decltype(hipLaunchKernel(std::forward<Args>(args)...)) {
+  return hipLaunchKernel(std::forward<Args>(args)...);
+}
+
+static __inline__ __host__ __device__
+hipError_t cudaDeviceGetAttribute(int *value, cudaDeviceAttr attr, int device) {
+  return hipDeviceGetAttribute(value, attr, device);
+}
+
+template<typename Func>
+inline static hipError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int* numBlocks,
+                                                                       Func func,
+                                                                       int blockSize,
+                                                                       size_t dynamicSMemSize) {
+    return hipOccupancyMaxActiveBlocksPerMultiprocessor(numBlocks, (void*)func,
+                                                        blockSize, dynamicSMemSize);
+}
+
+// Type alias
 using cudaError_t = hipError_t;
 using cudaGraph_t = hipGraph_t;
 using cudaGraphExec_t = hipGraphExec_t;
@@ -56,6 +103,7 @@ constexpr auto CU_MEM_ACCESS_FLAGS_PROT_READWRITE = hipMemAccessFlagsProtReadWri
 #define cudaDeviceGetPCIBusId(...) hipDeviceGetPCIBusId(__VA_ARGS__)
 #define cudaHostAlloc(...) hipHostMalloc(__VA_ARGS__)
 #define cudaMalloc(...) hipMalloc(__VA_ARGS__)
+#define cudaMallocHost(...) hipMallocHost(__VA_ARGS__)
 #define cudaFree(...) hipFree(__VA_ARGS__)
 #define cudaFreeHost(...) hipHostFree(__VA_ARGS__)
 #define cudaMemset(...) hipMemset(__VA_ARGS__)

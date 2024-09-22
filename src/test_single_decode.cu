@@ -13,6 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <math.h> // isnan used
+
 #include <gtest/gtest.h>
 
 #include <type_traits>
@@ -104,6 +106,7 @@ TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestFP16) {
 
 #ifdef FLASHINFER_ENABLE_BF16
 TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestBF16) {
+  // TODO (yiakwy)
   TestSingleDecodeKernelCorrectness<nv_bfloat16, nv_bfloat16>();
 }
 #endif

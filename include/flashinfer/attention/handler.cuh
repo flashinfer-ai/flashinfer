@@ -16,8 +16,22 @@
 #ifndef FLASHINFER_ATTENTION_HANDLER_CUH_
 #define FLASHINFER_ATTENTION_HANDLER_CUH_
 
+#ifdef USE_ROCM
+
+#include <hip/hip_runtime_api.h>
+// CUDA API Portable interfaces
+#include "flashinfer/hip_defs.h"
+
+#include <hip/driver_types.h>
+
+#else
+
 #include <cuda_runtime_api.h>
+
+// Note this is part of NV SDK
 #include <driver_types.h>
+
+#endif // USE_ROCM
 
 #include <algorithm>
 #include <cstddef>

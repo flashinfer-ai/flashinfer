@@ -15,11 +15,24 @@
  */
 #ifndef FLASHINFER_PREFILL_CUH_
 #define FLASHINFER_PREFILL_CUH_
+
+#ifdef USE_ROCM
+
+#include <hip/hip_cooperative_groups.h>
+
+#include "flashinfer/hip_cuda_type_utils.h"
+// CUDA API Portable interfaces
+#include "flashinfer/hip_defs.h"
+
+#else
+
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+
+#endif // USE_ROCM
 
 #include "../cp_async.cuh"
 #include "../fastdiv.cuh"

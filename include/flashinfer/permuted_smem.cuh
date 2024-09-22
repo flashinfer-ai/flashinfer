@@ -16,11 +16,23 @@
 #ifndef FLASHINFER_PERMUTED_SMEM_CUH_
 #define FLASHINFER_PERMUTED_SMEM_CUH_
 
+#if USE_ROCM
+
+#include "flashinfer/hip_cuda_type_utils.h"
+// CUDA API Portable interfaces
+#include "flashinfer/hip_defs.h"
+
+#include <hip/pipeline.h>
+
+#else
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cuda/pipeline>
+
+#endif
 
 #include "cp_async.cuh"
 #include "mma.cuh"

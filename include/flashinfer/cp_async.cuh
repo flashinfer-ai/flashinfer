@@ -16,7 +16,15 @@
 #ifndef FLASHINFER_CP_ASYNC_CUH_
 #define FLASHINFER_CP_ASYNC_CUH_
 
+#ifdef USE_ROCM
+
+#include <hip/hip_runtime.h>
+// CUDA API Portable interfaces
+#include "flashinfer/hip_defs.h"
+
+#else
 #include <cuda_runtime.h>
+#endif // USE_ROCM
 
 namespace flashinfer {
 

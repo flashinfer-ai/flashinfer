@@ -16,7 +16,15 @@
 #ifndef FLASHINFER_CASCADE_CUH_
 #define FLASHINFER_CASCADE_CUH_
 
+#ifdef USE_ROCM
+
+#include <hip/hip_cooperative_groups.h>
+// CUDA API Portable interfaces
+#include "flashinfer/hip_defs.h"
+
+# else
 #include <cooperative_groups.h>
+#endif //  USE_ROCM
 
 #include "../cp_async.cuh"
 #include "../math.cuh"

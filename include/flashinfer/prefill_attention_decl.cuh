@@ -16,7 +16,17 @@
 #ifndef FLASHINFER_PREFILL_ATTENTION_DECL_CUH_
 #define FLASHINFER_PREFILL_ATTENTION_DECL_CUH_
 
+#ifdef USE_ROCM
+
+#include <hip/hip_runtime.h>
+// CUDA API Portable interfaces
+#include "flashinfer/hip_defs.h"
+
+#else
+
 #include <cuda_runtime.h>
+
+#endif
 
 #include "attention/handler.cuh"
 #include "attention/logits_post_hook.cuh"

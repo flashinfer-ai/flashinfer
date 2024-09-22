@@ -15,14 +15,28 @@
  */
 #ifndef FLASHINFER_DECODE_CUH_
 #define FLASHINFER_DECODE_CUH_
+
+#ifdef USE_ROCM
+
+#include <hip/hip_cooperative_groups.h>
+#include <hip/pipeline.h>
+
+#include "flashinfer/hip_cuda_type_utils.h"
+// CUDA API Portable interfaces
+#include "flashinfer/hip_defs.h"
+
+# else
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+// this is used 
+#include <cuda/pipeline>
+#endif //  USE_ROCM
 
 #include <cstddef>
-#include <cuda/pipeline>
+
 #include <iostream>
 #include <optional>
 #include <random>

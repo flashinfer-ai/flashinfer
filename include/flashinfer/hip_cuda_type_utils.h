@@ -42,6 +42,8 @@ using __nv_bfloat162 = __hip_bfloat162;
 using nv_bfloat16 = __hip_bfloat16;
 using __nv_bfloat16 = __hip_bfloat16;
 
+using half2 = __half2;
+
 // ROCM FP8 is different from nv FP8 : https://github.com/ROCm/rocBLAS/blob/9b7f692abe3c54b88d1e77e045a7db7f1f188b69/library/include/internal/rocblas_hip_f8_impl.h#L39
 
 // TODO (yiakwy) : FP8 datatype support
@@ -63,6 +65,14 @@ __BF16_HOST_DEVICE_STATIC__ __hip_bfloat162 make_bfloat162(const __hip_bfloat16 
 // __float22bfloat162_rn: float2 -> __hip_bfloat162,
 // __float2bfloat162_rn: float -> __hip_bfloat162,
 // __bfloat1622float2: __hip_bfloat162 -> float2
+
+// half utils
+// TODO (yiakwy) : add native half2 support implementation
+__device__ half2 __hmax2(const half2 a, const half2 b) {
+  return half2{
+      __float2half(__ocml_fmax_f32(__half2float(a.x), __half2float(b.x))),
+      __float2half(__ocml_fmax_f32(__half2float(a.y), __half2float(b.y)))};
+}
 
 #endif
 

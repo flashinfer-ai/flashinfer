@@ -1,12 +1,18 @@
-// ported from #include <hip/amd_detail/amd_warp_sync_functions.h>
+// ported from <hip/amd_detail/amd_warp_sync_functions.h> in SDK 6.2
 #ifndef FLASHINFER_HIP_WARP_SYNC_FUNCTIONS_PORTED_H_
 #define FLASHINFER_HIP_WARP_SYNC_FUNCTIONS_PORTED_H_
 
 #include <hip/hip_runtime.h>
 
+// note in SDK we have this statement device_prop.warpSize
+#ifndef __warpSize
+#define __warpSize 64
+#endif
+
+// compiling for 64 bit, ignoring upper 32 bit
 #define __hip_adjust_mask_for_wave32(MASK)            \
   do {                                          \
-    if (warpSize == 32) MASK &= 0xFFFFFFFF;     \
+    if (__warpSize == 32) MASK &= 0xFFFFFFFF;     \
   } while (0)
 
 #if defined(NDEBUG)
@@ -67,6 +73,20 @@ T __shfl_xor_sync(MaskT mask, T var, int laneMask,
   __hip_adjust_mask_for_wave32(mask);
   __hip_check_mask(mask);
   return __shfl_xor(var, laneMask, width);
+}
+
+// used by libhipcxx
+template <typename MaskT, typename T>
+__device__ inline
+T __shfl_sync(MaskT mask, T var, int srcLane,
+              int width = __AMDGCN_WAVEFRONT_SIZE) {
+  static_assert(
+      __hip_internal::is_integral<MaskT>::value && sizeof(MaskT) == 8,
+      "The mask must be a 64-bit integer. "
+      "Implicitly promoting a smaller integer is almost always an error.");
+  __hip_adjust_mask_for_wave32(mask);
+  __hip_check_mask(mask);
+  return __shfl(var, srcLane, width);
 }
 
 #endif
