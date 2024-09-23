@@ -129,7 +129,7 @@ class BatchDecodeHandler {
               (bool*)page_locked_buffer_ + ((bool*)block_valid_mask_ - (bool*)new_indptr_);
           std::fill(block_valid_mask_h_, block_valid_mask_h_ + padded_batch_size, 0);
 
-          size_t num_bytes_to_copy = (char*)int_allocator.ptr - (char*)new_indptr_;
+          size_t num_bytes_to_copy = (char*)int_allocator.cur_ptr - (char*)new_indptr_;
           FLASHINFER_CUDA_CALL(PartitionPagedKVCacheComputeAuxiliaryInfo(
               max_num_pages_per_batch, batch_size, padded_batch_size, page_size, indptr_h,
               last_page_len_h, (IdType*)new_indptr_h_, (IdType*)new_last_page_len_h_,
@@ -179,7 +179,7 @@ class BatchDecodeHandler {
           void* seq_lengths_before_partition_h_ =
               (char*)page_locked_buffer_ +
               ((char*)seq_lengths_before_partition_ - (char*)new_indptr_);
-          size_t num_bytes_to_copy = (char*)int_allocator.ptr - (char*)new_indptr_;
+          size_t num_bytes_to_copy = (char*)int_allocator.cur_ptr - (char*)new_indptr_;
           FLASHINFER_CUDA_CALL(PartitionPagedKVCacheComputeAuxiliaryInfo(
               max_num_pages_per_batch, batch_size, batch_size_after_partition_, page_size, indptr_h,
               last_page_len_h, (IdType*)new_indptr_h_, (IdType*)new_last_page_len_h_,
@@ -391,7 +391,7 @@ class BatchPrefillHandler {
                 (IdType*)kv_tile_indices_h_);
       std::copy(o_indptr_vec.begin(), o_indptr_vec.end(), (IdType*)o_indptr_h_);
 
-      size_t num_bytes_to_copy = (char*)int_allocator.ptr - (char*)request_indices_;
+      size_t num_bytes_to_copy = (char*)int_allocator.cur_ptr - (char*)request_indices_;
       FLASHINFER_CUDA_CALL(cudaMemcpyAsync(request_indices_, page_locked_buffer_, num_bytes_to_copy,
                                            cudaMemcpyHostToDevice, stream_))
 
@@ -444,7 +444,7 @@ class BatchPrefillHandler {
       std::copy(kv_tile_indices_vec.begin(), kv_tile_indices_vec.end(),
                 (IdType*)kv_tile_indices_h_);
       std::copy(o_indptr_vec.begin(), o_indptr_vec.end(), (IdType*)o_indptr_h_);
-      size_t num_bytes_to_copy = (char*)int_allocator.ptr - (char*)request_indices_;
+      size_t num_bytes_to_copy = (char*)int_allocator.cur_ptr - (char*)request_indices_;
 
       FLASHINFER_CUDA_CALL(cudaMemcpyAsync(request_indices_, page_locked_buffer_, num_bytes_to_copy,
                                            cudaMemcpyHostToDevice, stream_))

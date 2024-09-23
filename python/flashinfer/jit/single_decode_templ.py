@@ -64,7 +64,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
       static_cast<{{ dtype_kv }}*>(v.data_ptr()), static_cast<{{ dtype_o }}*>(o.data_ptr()),
       {% if use_alibi == "true" %}static_cast<float*>(alibi_slopes->data_ptr()){% else %}nullptr{% endif %},
       kv_len, num_qo_heads, num_kv_heads, kv_layout, head_dim, window_left,
-      logits_soft_cap, sm_scale, 1.f / rope_scale, 1.f / rope_theta);
+      logits_soft_cap, sm_scale, rope_scale, rope_theta);
   
   cudaError_t status = SingleDecodeWithKVCacheDispatched<{{ head_dim }}, {{ pos_encoding_mode }}, AttentionVariant>(
       params, static_cast<{{ dtype_o }}*>(tmp.data_ptr()), torch_current_stream);

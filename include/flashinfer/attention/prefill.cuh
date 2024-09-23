@@ -20,6 +20,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <driver_types.h>
 
 #include "../cp_async.cuh"
 #include "../fastdiv.cuh"
@@ -45,7 +46,7 @@ constexpr uint32_t warp_size = 32;
 
 namespace {
 
-template <PosEncodingMode pos_encoding_mode, typename DTypeKV, typename DTypeQKAccum>
+template <PosEncodingMode POS_ENCODING_MODE, typename DTypeKV, typename DTypeQKAccum>
 constexpr bool is_invalid_configuration(uint32_t num_frags_x, uint32_t num_frags_y,
                                         uint32_t num_frags_z, uint32_t num_warps_x,
                                         uint32_t num_warps_z) {
@@ -53,7 +54,7 @@ constexpr bool is_invalid_configuration(uint32_t num_frags_x, uint32_t num_frags
           (num_frags_y > 4 && num_frags_y % (2 * num_warps_x) != 0) ||
           (num_frags_x * (8 * num_frags_y + 2 * sizeof(DTypeQKAccum) * num_frags_z) >= 256) ||
           (sizeof(DTypeKV) == 1 && num_frags_z * 2 % num_warps_x != 0) ||
-          (sizeof(DTypeKV) == 1 && pos_encoding_mode == PosEncodingMode::kRoPELlama));
+          (sizeof(DTypeKV) == 1 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama));
 }
 
 template <uint32_t num_warps_x, uint32_t num_warps_z>
@@ -588,42 +589,16 @@ __device__ __forceinline__ void compute_qk(smem_t<swizzle_mode_q>* q_smem,
   }
   *q_smem_offset_r -= num_frags_y * 2;
   *k_smem_offset_r -= num_frags_y * sizeof(DTypeKV);
-  //   if constexpr (std::is_same<DTypeQKAccum, float>::value) {
-  // #pragma unroll
-  //     for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
-  // #pragma unroll
-  //       for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
-  // #pragma unroll
-  //         for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
-  //           s_frag[fx][fz][reg_id] =
-  //               apply_logits_post_hook<logits_post_hook>(s_frag[fx][fz][reg_id], soft_cap);
-  //         }
-  //       }
-  //     }
-  //   } else {
-  //     static_assert(std::is_same<DTypeQKAccum, half>::value);
-  // #pragma unroll
-  //     for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
-  // #pragma unroll
-  //       for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
-  // #pragma unroll
-  //         for (uint32_t reg_id = 0; reg_id < 4; ++reg_id) {
-  //           *(half2*)(&s_frag[fx][fz][reg_id * 2]) = apply_logits_post_hook<logits_post_hook>(
-  //               *(half2*)(&s_frag[fx][fz][reg_id * 2]), soft_cap);
-  //         }
-  //       }
-  //     }
-  //   }
 }
 
-template <MaskMode mask_mode, uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z,
+template <uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z,
           typename AttentionVariant, typename DTypeQKAccum>
-__device__ __forceinline__ void mask_s(const typename AttentionVariant::ParamsT& params,
-                                       const uint32_t qo_packed_idx_base,
-                                       const uint32_t kv_idx_base, const uint32_t qo_len,
-                                       const uint32_t kv_len, const uint32_t chunk_end,
-                                       const uint_fastdiv group_size,
-                                       DTypeQKAccum (*s_frag)[num_frags_z][8]) {
+__device__ __forceinline__ void logits_transform(const typename AttentionVariant::ParamsT& params,
+                                                 const uint32_t batch_idx,
+                                                 const uint32_t qo_packed_idx_base,
+                                                 const uint32_t kv_idx_base,
+                                                 const uint_fastdiv group_size,
+                                                 DTypeQKAccum (*s_frag)[num_frags_z][8]) {
   const uint32_t lane_idx = threadIdx.x, kv_head_idx = blockIdx.z;
 #pragma unroll
   for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
@@ -636,14 +611,40 @@ __device__ __forceinline__ void mask_s(const typename AttentionVariant::ParamsT&
         const uint32_t q_idx = q, kv_idx = kv_idx_base + fz * 16 + 2 * (lane_idx % 4) +
                                            8 * (reg_id / 4) + reg_id % 2;
         const uint32_t qo_head_idx = kv_head_idx * group_size + r;
-        s_frag[fx][fz][reg_id] = AttentionVariant::PrefillLogitsTransform(
-            params, s_frag[fx][fz][reg_id], q_idx, kv_idx, qo_head_idx, kv_head_idx);
-        const bool out_of_boundary =
-            (mask_mode == MaskMode::kCausal
-                 ? (kv_idx + qo_len > kv_len + q_idx || (kv_idx >= chunk_end))
-                 : kv_idx >= chunk_end);
-        s_frag[fx][fz][reg_id] =
-            (out_of_boundary) ? DTypeQKAccum(-math::inf) : s_frag[fx][fz][reg_id];
+        s_frag[fx][fz][reg_id] = AttentionVariant::LogitsTransform(
+            params, s_frag[fx][fz][reg_id], batch_idx, q_idx, kv_idx, qo_head_idx, kv_head_idx);
+      }
+    }
+  }
+}
+
+template <MaskMode MASK_MODE, uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z,
+          typename AttentionVariant, typename DTypeQKAccum>
+__device__ __forceinline__ void logits_mask(const typename AttentionVariant::ParamsT& params,
+                                            const uint32_t batch_idx,
+                                            const uint32_t qo_packed_idx_base,
+                                            const uint32_t kv_idx_base, const uint32_t qo_len,
+                                            const uint32_t kv_len, const uint32_t chunk_end,
+                                            const uint_fastdiv group_size,
+                                            DTypeQKAccum (*s_frag)[num_frags_z][8]) {
+  const uint32_t lane_idx = threadIdx.x, kv_head_idx = blockIdx.z;
+#pragma unroll
+  for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+#pragma unroll
+    for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
+#pragma unroll
+      for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+        uint32_t q, r;
+        group_size.divmod(qo_packed_idx_base + fx * 16 + lane_idx / 4 + 8 * (reg_id / 2), q, r);
+        const uint32_t q_idx = q, kv_idx = kv_idx_base + fz * 16 + 2 * (lane_idx % 4) +
+                                           8 * (reg_id / 4) + reg_id % 2;
+        const uint32_t qo_head_idx = kv_head_idx * group_size + r;
+        const bool mask = (!(MASK_MODE == MaskMode::kCausal
+                                 ? (kv_idx + qo_len > kv_len + q_idx || (kv_idx >= chunk_end))
+                                 : kv_idx >= chunk_end)) &&
+                          AttentionVariant::LogitsMask(params, batch_idx, q_idx, kv_idx,
+                                                       qo_head_idx, kv_head_idx);
+        s_frag[fx][fz][reg_id] = (mask) ? s_frag[fx][fz][reg_id] : DTypeQKAccum(-math::inf);
       }
     }
   }
@@ -994,7 +995,7 @@ __device__ __forceinline__ void write_o_reg_gmem(
  * \brief FlashAttention prefill CUDA kernel for a single request.
  * \tparam partition_kv Whether to split kv_len into chunks.
  * \tparam mask_mode The mask mode used in the attention operation.
- * \tparam pos_encoding_mode The positional encoding mode.
+ * \tparam POS_ENCODING_MODE The positional encoding mode.
  * \tparam num_frags_x The number of fragments in x dimension.
  * \tparam num_frags_y The number of fragments in y dimension.
  * \tparam num_frags_z The number of fragments in z dimension.
@@ -1188,10 +1189,16 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
       compute_qk<num_frags_x, num_frags_y, num_frags_z, swizzle_mode_q, swizzle_mode_kv, DTypeQ,
                  DTypeKV>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
 
+      logits_transform<num_frags_x, num_frags_y, num_frags_z, AttentionVariant>(
+          params, /*batch_idx=*/0, qo_packed_idx_base,
+          chunk_start +
+              (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) * num_frags_z * 16,
+          group_size, s_frag);
+
       // apply mask
       if (MASK_MODE == MaskMode::kCustom || (iter >= mask_iteration || iter < window_iteration)) {
-        mask_s<MASK_MODE, num_frags_x, num_frags_y, num_frags_z, AttentionVariant>(
-            params, qo_packed_idx_base,
+        logits_mask<MASK_MODE, num_frags_x, num_frags_y, num_frags_z, AttentionVariant>(
+            params, /*batch_idx=*/0, qo_packed_idx_base,
             chunk_start + (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) *
                               num_frags_z * 16,
             qo_len, kv_len, chunk_end, group_size, s_frag);
@@ -1404,34 +1411,51 @@ cudaError_t SinglePrefillWithKVCacheDispatched(typename AttentionVariant::Params
   return cudaSuccess;
 }
 
-template <LogitsPostHook logits_post_hook, MaskMode mask_mode, PosEncodingMode pos_encoding_mode,
-          uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps_x,
-          uint32_t num_warps_z, typename DTypeQ, typename DTypeKV, typename DTypeQKAccum,
-          typename DTypeOut, typename IdType>
+template <MaskMode MASK_MODE, PosEncodingMode POS_ENCODING_MODE, uint32_t num_frags_x,
+          uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps_x, uint32_t num_warps_z,
+          typename DTypeQKAccum, typename AttentionVariant>
 __global__
 __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRaggedKVCacheKernel(
-    DTypeQ* __restrict__ q, IdType* __restrict__ request_indices,
-    IdType* __restrict__ q_tile_indices, IdType* __restrict__ kv_tile_indices,
-    IdType* __restrict__ q_indptr, DTypeKV* __restrict__ k, DTypeKV* __restrict__ v,
-    IdType* __restrict__ kv_indptr, uint8_t* __restrict__ custom_mask,
-    IdType* __restrict__ qk_indptr, IdType* __restrict__ q_offset,
-    IdType* __restrict__ k_rope_pos_offset, IdType* __restrict__ o_indptr, DTypeOut* __restrict__ o,
-    float* __restrict__ lse, bool* __restrict__ block_valid_mask,
-    IdType* __restrict__ kv_chunk_size_ptr, const bool partition_kv, const uint_fastdiv group_size,
-    const uint32_t q_stride_n, const uint32_t q_stride_h, const uint32_t kv_stride_n,
-    const uint32_t kv_stride_h, const int32_t maybe_window_left, const float logits_soft_cap,
-    float sm_scale, const float log2_rope_rcp_scale, const float log2_rope_rcp_theta) {
+    const __grid_constant__ typename AttentionVariant::ParamsT params) {
+  using DTypeQ = typename AttentionVariant::DTypeQ;
 #if (__CUDA_ARCH__ < 800)
   if constexpr (std::is_same<DTypeQ, nv_bfloat16>::value) {
     FLASHINFER_RUNTIME_ASSERT("Prefill kernels do not support bf16 on sm75.");
   } else {
 #endif
+    using DTypeKV = typename AttentionVariant::DTypeKV;
+    using DTypeOut = typename AttentionVariant::DTypeO;
+    DTypeQ* q = params.q;
+    IdType* request_indices = params.request_indices;
+    IdType* q_tile_indices = params.q_tile_indices;
+    IdType* kv_tile_indices = params.kv_tile_indices;
+    IdType* q_indptr = params.q_indptr;
+    IdType* kv_indptr = params.kv_indptr;
+    DTypeKV* k = params.k;
+    DTypeKV* v = params.v;
+    IdType* q_offset = params.q_offset;
+    IdType* k_rope_pos_offset = params.k_rope_pos_offset;
+    IdType* o_indptr = params.o_indptr;
+    DTypeOut* o = params.o;
+    float* lse = params.lse;
+    bool* block_valid_mask = params.block_valid_mask;
+    const bool partition_kv = params.partition_kv;
+    const uint_fastdiv group_size = params.group_size;
+    const uint32_t q_stride_n = params.q_stride_n;
+    const uint32_t q_stride_h = params.q_stride_h;
+    const uint32_t kv_stride_n = params.kv_stride_n;
+    const uint32_t kv_stride_h = params.kv_stride_h;
+    const int32_t maybe_window_left = params.window_left;
+    float sm_scale = params.sm_scale;
+    const float log2_rope_rcp_scale = params.log2_rope_rcp_scale;
+    const float log2_rope_rcp_theta = params.log2_rope_rcp_theta;
+
     static_assert(sizeof(DTypeQ) == 2);
     static_assert(sizeof(DTypeOut) == 2);
     sm_scale *=
         (logits_post_hook == LogitsPostHook::kNone ? math::log2e : math::ptx_rcp(logits_soft_cap));
     constexpr uint32_t head_dim = num_frags_y * 16;
-    const uint32_t kv_chunk_size = *kv_chunk_size_ptr;
+    const uint32_t kv_chunk_size = *(params.kv_chunk_size_ptr);
 
     auto block = cg::this_thread_block();
     const uint32_t bx = blockIdx.x, lane_idx = threadIdx.x,
@@ -1454,7 +1478,6 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
     const uint32_t chunk_size = chunk_end - chunk_start;
     const tensor_info_t qkv_info(qo_len, kv_len, num_qo_heads, num_kv_heads, q_stride_n, q_stride_h,
                                  kv_stride_n, kv_stride_h, /*head_dim=*/num_frags_y * 16);
-    float alibi_slopes[num_frags_x][2];
     const uint32_t qo_upper_bound =
         min(qo_len, ceil_div((qo_tile_idx + 1) * num_rows_per_cta, group_size));
 
@@ -1470,7 +1493,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
     float d[num_frags_x][2];
     float rope_freq[num_frags_y / 2][4];
 
-    if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
+    if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
       init_rope_freq<num_frags_y>(rope_freq, log2_rope_rcp_scale, log2_rope_rcp_theta);
     }
     init_states<num_frags_x, num_frags_y>(o_frag, m, d);
@@ -1504,7 +1527,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
     cp_async::wait_group<0>();
     block.sync();
 
-    if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
+    if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
       if (!q_offset) {
         q_smem_inplace_apply_rotary<num_warps_x, num_warps_z, num_frags_x, num_frags_y,
                                     swizzle_mode_q, DTypeQ>(
@@ -1519,21 +1542,8 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
     q_smem_inplace_transform<num_warps_x, num_warps_z, num_frags_x, num_frags_y, swizzle_mode_q,
                              AttentionVariant>(params, &qo_smem);
 
-    if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
-#pragma unroll
-      for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
-#pragma unroll
-        for (uint32_t j = 0; j < 2; ++j) {
-          const uint32_t qo_head_idx =
-              kv_head_idx * group_size +
-              (qo_packed_idx_base + lane_idx / 4 + j * 8 + fx * 16) % group_size;
-          alibi_slopes[fx][j] = get_alibi_slope(qo_head_idx, num_qo_heads) * math::log2e;
-        }
-      }
-    }
-
-    const uint32_t num_iterations = ceil_div(
-        (mask_mode == MaskMode::kCausal
+    onst uint32_t num_iterations = ceil_div(
+        (MASK_MODE == MaskMode::kCausal
              ? min(chunk_size,
                    sub_if_greater_or_zero(
                        kv_len - qo_len + ((qo_tile_idx + 1) * num_rows_per_cta) / group_size,
@@ -1547,7 +1557,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
                  (16 * num_warps_z * num_frags_z));
 
     const uint32_t mask_iteration =
-        (mask_mode == MaskMode::kCausal
+        (MASK_MODE == MaskMode::kCausal
              ? min(chunk_size, sub_if_greater_or_zero(
                                    kv_len + (qo_tile_idx * num_rows_per_cta) / group_size - qo_len,
                                    chunk_start))
@@ -1597,7 +1607,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
       cp_async::wait_group<1>();
       block.sync();
 
-      if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
+      if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
         k_smem_inplace_apply_rotary<num_warps_x, num_warps_z, num_frags_y, num_frags_z,
                                     swizzle_mode_kv, DTypeKV>(
             (k_rope_pos_offset == nullptr ? 0 : k_rope_pos_offset[request_idx]) + chunk_start +
@@ -1607,34 +1617,23 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
       }
 
       // compute attention score
-      compute_qk<logits_post_hook, num_frags_x, num_frags_y, num_frags_z, swizzle_mode_q,
-                 swizzle_mode_kv, DTypeQ, DTypeKV>(&qo_smem, &q_smem_offset_r, &k_smem,
-                                                   &k_smem_offset_r, s_frag, logits_soft_cap);
+      compute_qk<num_frags_x, num_frags_y, num_frags_z, swizzle_mode_q, swizzle_mode_kv, DTypeQ,
+                 DTypeKV>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
 
-      if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
-        // TODO(Zihao): handle the case that q_offset is specified
-        apply_alibi_bias<num_frags_x, num_frags_z>(
-            qo_packed_idx_base,
-            chunk_start + (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) *
-                              num_frags_z * 16,
-            int(kv_len) - int(qo_len), group_size, alibi_slopes, s_frag);
-      }
+      logits_transform<num_frags_x, num_frags_y, num_frags_z, AttentionVariant>(
+          params, /*batch_idx=*/request_idx, qo_packed_idx_base,
+          chunk_start +
+              (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) * num_frags_z * 16,
+          group_size, s_frag);
+
       // apply mask
-      if constexpr (mask_mode == MaskMode::kCustom) {
-        mask_s<mask_mode, num_frags_x, num_frags_y, num_frags_z>(
-            qo_packed_idx_base,
+      if constexpr (MASK_MODE == MaskMode::kCustom ||
+                    (iter >= mask_iteration || iter < window_iteration)) {
+        logits_mask<MASK_MODE, num_frags_x, num_frags_y, num_frags_z, AttentionVariant>(
+            params, /*batch_idx=*/request_idx, qo_packed_idx_base,
             chunk_start + (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) *
                               num_frags_z * 16,
-            qo_len, kv_len, window_left, chunk_end, group_size,
-            custom_mask + qk_indptr[request_idx], s_frag);
-      } else {
-        if (iter >= mask_iteration || iter < window_iteration) {
-          mask_s<mask_mode, num_frags_x, num_frags_y, num_frags_z>(
-              qo_packed_idx_base,
-              chunk_start + (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) *
-                                num_frags_z * 16,
-              qo_len, kv_len, window_left, chunk_end, group_size, nullptr, s_frag);
-        }
+            qo_len, kv_len, window_left, chunk_end, group_size, s_frag);
       }
 
       // compute m,d states in online softmax
@@ -1706,32 +1705,44 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
 #endif
 }
 
-template <LogitsPostHook logits_post_hook, MaskMode mask_mode, PosEncodingMode pos_encoding_mode,
-          uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps_x,
-          uint32_t num_warps_z, PageStorage page_storage, typename DTypeQ, typename DTypeKV,
-          typename DTypeQKAccum, typename DTypeOut, typename IdType>
+template <MaskMode MASK_MODE, PosEncodingMode POS_ENCODING_MODE, uint32_t num_frags_x,
+          uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps_x, uint32_t num_warps_z,
+          PageStorage page_storage, typename DTypeQKAccum, typename AttentionVariant>
 __global__
 __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPagedKVCacheKernel(
-    IdType* __restrict__ request_indices, IdType* __restrict__ q_tile_indices,
-    IdType* __restrict__ kv_tile_indices, DTypeQ* __restrict__ q,
-    paged_kv_t<page_storage, DTypeKV, IdType> paged_kv, IdType* __restrict__ q_indptr,
-    uint8_t* __restrict__ custom_mask, IdType* __restrict__ qk_indptr,
-    IdType* __restrict__ q_offset, IdType* __restrict__ o_indptr, DTypeOut* __restrict__ o,
-    float* __restrict__ lse, bool* __restrict__ block_valid_mask,
-    IdType* __restrict__ kv_chunk_size_ptr, const bool partition_kv, const uint_fastdiv group_size,
-    int32_t maybe_window_left, const float logits_soft_cap, float sm_scale,
-    const float log2_rope_rcp_scale, const float log2_rope_rcp_theta) {
+    const __grid_constant__ typename AttentionVariant::ParamsT params) {
+  using DTypeQ = typename AttentionVariant::DTypeQ;
 #if (__CUDA_ARCH__ < 800)
   if constexpr (std::is_same<DTypeQ, nv_bfloat16>::value) {
     FLASHINFER_RUNTIME_ASSERT("Prefill kernels do not support bf16 on sm75.");
   } else {
 #endif
+    using DTypeKV = typename AttentionVariant::DTypeKV;
+    using DTypeOut = typename AttentionVariant::DTypeO;
+    IdType* request_indices = params.request_indices;
+    IdType* q_tile_indices = params.q_tile_indices;
+    IdType* kv_tile_indices = params.kv_tile_indices;
+    DTypeQ* q = params.q;
+    paged_kv_t<page_storage, DTypeKV, IdType> paged_kv = params.paged_kv;
+    IdType* q_indptr = params.q_indptr;
+    IdType* q_offset = params.q_offset;
+    IdType* o_indptr = params.o_indptr;
+    DTypeOut* o = params.o;
+    float* lse = params.lse;
+    bool* block_valid_mask = params.block_valid_mask;
+    const bool partition_kv = params.partition_kv;
+    const uint_fastdiv group_size = params.group_size;
+    const int32_t maybe_window_left = params.window_left;
+    float sm_scale = params.sm_scale;
+    const float log2_rope_rcp_scale = params.log2_rope_rcp_scale;
+    const float log2_rope_rcp_theta = params.log2_rope_rcp_theta;
+
     static_assert(sizeof(DTypeQ) == 2);
     static_assert(sizeof(DTypeOut) == 2);
     sm_scale *=
         (logits_post_hook == LogitsPostHook::kNone ? math::log2e : math::ptx_rcp(logits_soft_cap));
     auto block = cg::this_thread_block();
-    const uint32_t kv_chunk_size = *kv_chunk_size_ptr;
+    const uint32_t kv_chunk_size = *(params.kv_chunk_size_ptr);
 
     const uint32_t bx = blockIdx.x, lane_idx = threadIdx.x,
                    warp_idx = get_warp_idx<num_warps_x, num_warps_z>(), kv_head_idx = blockIdx.z;
@@ -1739,7 +1750,6 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
       return;
     }
     const uint32_t num_kv_heads = gridDim.z, num_qo_heads = num_kv_heads * group_size;
-    float alibi_slopes[num_frags_x][2];
 
     const uint32_t request_idx = request_indices[bx], qo_tile_idx = q_tile_indices[bx],
                    kv_tile_idx = kv_tile_indices[bx];
@@ -1773,7 +1783,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
     float d[num_frags_x][2];
     float rope_freq[num_frags_y / 2][4];
 
-    if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
+    if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
       init_rope_freq<num_frags_y>(rope_freq, log2_rope_rcp_scale, log2_rope_rcp_theta);
     }
     init_states<num_frags_x, num_frags_y>(o_frag, m, d);
@@ -1806,7 +1816,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
     cp_async::wait_group<0>();
     block.sync();
 
-    if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
+    if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
       if (q_offset == nullptr) {
         q_smem_inplace_apply_rotary_multiply<num_warps_x, num_warps_z, num_frags_x, num_frags_y,
                                              swizzle_mode_q, DTypeQ>(
@@ -1819,20 +1829,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
       }
     }
     q_smem_inplace_transform<num_warps_x, num_warps_z, num_frags_x, num_frags_y, swizzle_mode_q,
-                             DTypeQ>(params, &qo_smem);
-
-    if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
-#pragma unroll
-      for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
-#pragma unroll
-        for (uint32_t j = 0; j < 2; ++j) {
-          const uint32_t qo_head_idx =
-              kv_head_idx * group_size +
-              (qo_packed_idx_base + lane_idx / 4 + j * 8 + fx * 16) % group_size;
-          alibi_slopes[fx][j] = get_alibi_slope(qo_head_idx, num_qo_heads) * math::log2e;
-        }
-      }
-    }
+                             AttentionVariant>(params, &qo_smem);
 
     constexpr SwizzleMode swizzle_mode_kv =
         (sizeof(DTypeKV) == 1 && head_dim == 64) ? SwizzleMode::k64B : SwizzleMode::k128B;
@@ -1880,7 +1877,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
     cp_async::commit_group();
 
     const uint32_t num_iterations = ceil_div(
-        (mask_mode == MaskMode::kCausal
+        (MASK_MODE == MaskMode::kCausal
              ? min(chunk_size,
                    sub_if_greater_or_zero(
                        kv_len - qo_len + ((qo_tile_idx + 1) * num_rows_per_cta) / group_size,
@@ -1894,7 +1891,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
                  (16 * num_warps_z * num_frags_z));
 
     const uint32_t mask_iteration =
-        (mask_mode == MaskMode::kCausal
+        (MASK_MODE == MaskMode::kCausal
              ? min(chunk_size, sub_if_greater_or_zero(
                                    kv_len + (qo_tile_idx * num_rows_per_cta) / group_size - qo_len,
                                    chunk_start))
@@ -1921,7 +1918,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
       cp_async::wait_group<1>();
       block.sync();
 
-      if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
+      if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
         k_smem_inplace_apply_rotary<num_warps_x, num_warps_z, num_frags_y, num_frags_z,
                                     swizzle_mode_kv, DTypeKV>(
             (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[request_idx]) +
@@ -1931,34 +1928,22 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
       }
 
       // compute attention score
-      compute_qk<logits_post_hook, num_frags_x, num_frags_y, num_frags_z, swizzle_mode_q,
-                 swizzle_mode_kv, DTypeQ, DTypeKV>(&qo_smem, &q_smem_offset_r, &k_smem,
-                                                   &k_smem_offset_r, s_frag, logits_soft_cap);
+      compute_qk<num_frags_x, num_frags_y, num_frags_z, swizzle_mode_q, swizzle_mode_kv, DTypeQ,
+                 DTypeKV>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r, s_frag);
 
-      if constexpr (pos_encoding_mode == PosEncodingMode::kALiBi) {
-        // TODO(Zihao): handle the case that q_offset is specified
-        apply_alibi_bias<num_frags_x, num_frags_z>(
-            qo_packed_idx_base,
-            chunk_start + (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) *
-                              num_frags_z * 16,
-            int(kv_len) - int(qo_len), group_size, alibi_slopes, s_frag);
-      }
+      logits_transform<num_frags_x, num_frags_y, num_frags_z, AttentionVariant>(
+          params, /*batch_idx=*/request_idx, qo_packed_idx_base,
+          chunk_start +
+              (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) * num_frags_z * 16,
+          group_size, s_frag);
+
       // apply mask
-      if constexpr (mask_mode == MaskMode::kCustom) {
-        mask_s<mask_mode, num_frags_x, num_frags_y, num_frags_z>(
-            qo_packed_idx_base,
+      if (MASK_MODE == MaskMode::kCustom || (iter >= mask_iteration || iter < window_iteration)) {
+        logits_mask<MASK_MODE, num_frags_x, num_frags_y, num_frags_z, AttentionVariant>(
+            params, /*batch_idx=*/request_idx, qo_packed_idx_base,
             chunk_start + (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) *
                               num_frags_z * 16,
-            qo_len, kv_len, window_left, chunk_end, group_size,
-            custom_mask + qk_indptr[request_idx], s_frag);
-      } else {
-        if (iter >= mask_iteration || iter < window_iteration) {
-          mask_s<mask_mode, num_frags_x, num_frags_y, num_frags_z>(
-              qo_packed_idx_base,
-              chunk_start + (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) *
-                                num_frags_z * 16,
-              qo_len, kv_len, window_left, chunk_end, group_size, nullptr, s_frag);
-        }
+            qo_len, kv_len, window_left, chunk_end, group_size, s_frag);
       }
 
       // compute m,d states in online softmax
@@ -2030,25 +2015,29 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
 #endif
 }
 
-template <WarpLayout WARP_LAYOUT, uint32_t HEAD_DIM, LogitsPostHook LOGITS_POST_HOOK,
-          PosEncodingMode pos_encoding_mode, bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE,
-          typename DTypeQ, typename DTypeKV, typename DTypeOut, typename IdType>
+template <WarpLayout WARP_LAYOUT, uint32_t HEAD_DIM, 
+          PosEncodingMode POS_ENCODING_MODE, bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE,
+          typename AttentionVariant>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
-    DTypeQ* q, IdType* request_indices, IdType* q_tile_indices, IdType* kv_tile_indices,
-    IdType* q_indptr, DTypeKV* k, DTypeKV* v, IdType* kv_indptr, uint8_t* custom_mask,
-    IdType* qk_indptr, IdType* q_offset, IdType* k_rope_pos_offset, IdType* o_indptr, DTypeOut* o,
-    DTypeOut* tmp_v, float* tmp_s, float* lse, IdType* merge_indptr, bool* block_valid_mask,
-    IdType* kv_chunk_size_ptr, uint32_t total_num_rows, uint32_t num_qo_heads,
-    uint32_t padded_batch_size, uint32_t num_kv_heads, uint32_t q_stride_n, uint32_t q_stride_h,
-    uint32_t kv_stride_n, uint32_t kv_stride_h, int32_t window_left, float logits_soft_cap,
-    float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream = nullptr) {
-  const float log2_rope_rcp_scale = -std::log2f(rope_scale);
-  const float log2_rope_rcp_theta = -std::log2f(rope_theta);
+    typename AttentionVariant::ParamsT params,
+    typename AttentionVariant::DTypeO* tmp_v,
+    float* tmp_s,
+    cudaStream_t stream) {
+    // DTypeQ* q, IdType* request_indices, IdType* q_tile_indices, IdType* kv_tile_indices,
+    // IdType* q_indptr, DTypeKV* k, DTypeKV* v, IdType* kv_indptr, uint8_t* custom_mask,
+    // IdType* qk_indptr, IdType* q_offset, IdType* k_rope_pos_offset, IdType* o_indptr, DTypeOut* o,
+    // DTypeOut* tmp_v, float* tmp_s, float* lse, IdType* merge_indptr, bool* block_valid_mask,
+    // IdType* kv_chunk_size_ptr, uint32_t total_num_rows, uint32_t num_qo_heads,
+    // uint32_t padded_batch_size, uint32_t num_kv_heads, uint32_t q_stride_n, uint32_t q_stride_h,
+    // uint32_t kv_stride_n, uint32_t kv_stride_h, int32_t window_left, float logits_soft_cap,
+    // float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream = nullptr) {
+  using DTypeQ = typename AttentionVariant::DTypeQ;
+  using DTypeKV = typename AttentionVariant::DTypeKV;
+  const uint32_t padded_batch_size = params.padded_batch_size;
+  const uint32_t num_kv_heads = params.num_kv_heads;
   constexpr uint32_t num_frags_x = get_num_frags_x<WARP_LAYOUT>();
   constexpr uint32_t num_warps_x = get_num_warps_x<WARP_LAYOUT>();
   constexpr uint32_t num_warps_z = get_num_warps_z<WARP_LAYOUT>();
-  const uint32_t group_size = num_qo_heads / num_kv_heads;
-  const uint_fastdiv group_size_fastdiv(group_size);
 
   if (padded_batch_size == 0) {
     // No request, skip
@@ -2074,7 +2063,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
   const int max_smem_per_threadblock = max_smem_per_sm / num_ctas_per_sm;
 
   const uint32_t max_num_frags_z_reg =
-      (HEAD_DIM >= 128 && num_frags_x == 2 && pos_encoding_mode == PosEncodingMode::kRoPELlama &&
+      (HEAD_DIM >= 128 && num_frags_x == 2 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
        !ALLOW_FP16_QK_REDUCTION)
           ? 2
           : (8 / num_frags_x);
@@ -2084,7 +2073,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
       (2 * num_warps_z);
 
   DISPATCH_NUM_FRAGS_Z(min(max_num_frags_z_smem, max_num_frags_z_reg), num_frags_z, {
-    if constexpr (is_invalid_configuration<pos_encoding_mode, DTypeKV, DTypeQKAccum>(
+    if constexpr (is_invalid_configuration<POS_ENCODING_MODE, DTypeKV, DTypeQKAccum>(
                       num_frags_x, num_frags_y, num_frags_z, num_warps_x, num_warps_z)) {
       // Invalid configuration, skip
       std::ostringstream err_msg;
@@ -2100,75 +2089,80 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
                             num_frags_z * num_warps_z * 2 * sizeof(DTypeQ)) *
                            16 * HEAD_DIM;
       auto kernel = BatchPrefillWithRaggedKVCacheKernel<
-          LOGITS_POST_HOOK, MASK_MODE, pos_encoding_mode, num_frags_x, num_frags_y, num_frags_z,
+          LOGITS_POST_HOOK, MASK_MODE, POS_ENCODING_MODE, num_frags_x, num_frags_y, num_frags_z,
           num_warps_x, num_warps_z, DTypeQ, DTypeKV, DTypeQKAccum, DTypeOut, IdType>;
       FLASHINFER_CUDA_CALL(
           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
       if (tmp_v == nullptr) {
         // do not partition kv
-        bool partition_kv = false;
-
-        void* args[] = {(void*)&q,
-                        (void*)&request_indices,
-                        (void*)&q_tile_indices,
-                        (void*)&kv_tile_indices,
-                        (void*)&q_indptr,
-                        (void*)&k,
-                        (void*)&v,
-                        (void*)&kv_indptr,
-                        (void*)&custom_mask,
-                        (void*)&qk_indptr,
-                        (void*)&q_offset,
-                        (void*)&k_rope_pos_offset,
-                        (void*)&o_indptr,
-                        (void*)&o,
-                        (void*)&lse,
-                        (void*)&block_valid_mask,
-                        (void*)&kv_chunk_size_ptr,
-                        (void*)&partition_kv,
-                        (void*)&group_size_fastdiv,
-                        (void*)&q_stride_n,
-                        (void*)&q_stride_h,
-                        (void*)&kv_stride_n,
-                        (void*)&kv_stride_h,
-                        (void*)&window_left,
-                        (void*)&logits_soft_cap,
-                        (void*)&sm_scale,
-                        (void*)&log2_rope_rcp_scale,
-                        (void*)&log2_rope_rcp_theta};
+        params.partition_kv = false;
+        void* args[] = {(void*)&params};
+        // void* args[] = {(void*)&q,
+        //                 (void*)&request_indices,
+        //                 (void*)&q_tile_indices,
+        //                 (void*)&kv_tile_indices,
+        //                 (void*)&q_indptr,
+        //                 (void*)&k,
+        //                 (void*)&v,
+        //                 (void*)&kv_indptr,
+        //                 (void*)&custom_mask,
+        //                 (void*)&qk_indptr,
+        //                 (void*)&q_offset,
+        //                 (void*)&k_rope_pos_offset,
+        //                 (void*)&o_indptr,
+        //                 (void*)&o,
+        //                 (void*)&lse,
+        //                 (void*)&block_valid_mask,
+        //                 (void*)&kv_chunk_size_ptr,
+        //                 (void*)&partition_kv,
+        //                 (void*)&group_size_fastdiv,
+        //                 (void*)&q_stride_n,
+        //                 (void*)&q_stride_h,
+        //                 (void*)&kv_stride_n,
+        //                 (void*)&kv_stride_h,
+        //                 (void*)&window_left,
+        //                 (void*)&logits_soft_cap,
+        //                 (void*)&sm_scale,
+        //                 (void*)&log2_rope_rcp_scale,
+        //                 (void*)&log2_rope_rcp_theta};
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
       } else {
         // partition kv
-        bool partition_kv = true;
-        void* args[] = {(void*)&q,
-                        (void*)&request_indices,
-                        (void*)&q_tile_indices,
-                        (void*)&kv_tile_indices,
-                        (void*)&q_indptr,
-                        (void*)&k,
-                        (void*)&v,
-                        (void*)&kv_indptr,
-                        (void*)&custom_mask,
-                        (void*)&qk_indptr,
-                        (void*)&q_offset,
-                        (void*)&k_rope_pos_offset,
-                        (void*)&o_indptr,
-                        (void*)&tmp_v,
-                        (void*)&tmp_s,
-                        (void*)&block_valid_mask,
-                        (void*)&kv_chunk_size_ptr,
-                        (void*)&partition_kv,
-                        (void*)&group_size_fastdiv,
-                        (void*)&q_stride_n,
-                        (void*)&q_stride_h,
-                        (void*)&kv_stride_n,
-                        (void*)&kv_stride_h,
-                        (void*)&window_left,
-                        (void*)&logits_soft_cap,
-                        (void*)&sm_scale,
-                        (void*)&log2_rope_rcp_scale,
-                        (void*)&log2_rope_rcp_theta};
+        params.partition_kv = true;
+        auto o = params.o;
+        auto lse = params.lse;
+        params.o = tmp_v;
+        params.lse = tmp_s;
+        void* args[] = {(void*)&params};
+        // void* args[] = {(void*)&q,
+        //                 (void*)&request_indices,
+        //                 (void*)&q_tile_indices,
+        //                 (void*)&kv_tile_indices,
+        //                 (void*)&q_indptr,
+        //                 (void*)&k,
+        //                 (void*)&v,
+        //                 (void*)&kv_indptr,
+        //                 (void*)&custom_mask,
+        //                 (void*)&qk_indptr,
+        //                 (void*)&q_offset,
+        //                 (void*)&k_rope_pos_offset,
+        //                 (void*)&o_indptr,
+        //                 (void*)&tmp_v,
+        //                 (void*)&tmp_s,
+        //                 (void*)&block_valid_mask,
+        //                 (void*)&kv_chunk_size_ptr,
+        //                 (void*)&partition_kv,
+        //                 (void*)&group_size_fastdiv,
+        //                 (void*)&q_stride_n,
+        //                 (void*)&q_stride_h,
+        //                 (void*)&kv_stride_n,
+        //                 (void*)&kv_stride_h,
+        //                 (void*)&window_left,
+        //                 (void*)&logits_soft_cap,
+        //                 (void*)&sm_scale,
+        //                 (void*)&log2_rope_rcp_scale,
+        //                 (void*)&log2_rope_rcp_theta};
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
@@ -2179,26 +2173,29 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
   return cudaSuccess;
 }
 
-template <PageStorage page_storage, WarpLayout WARP_LAYOUT, uint32_t HEAD_DIM,
-          LogitsPostHook LOGITS_POST_HOOK, PosEncodingMode pos_encoding_mode,
-          bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename DTypeQ, typename DTypeKV,
-          typename DTypeOut, typename IdType>
+template <WarpLayout WARP_LAYOUT, uint32_t HEAD_DIM,
+          PosEncodingMode POS_ENCODING_MODE,
+          bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(
-    DTypeQ* q, IdType* request_indices, IdType* q_tile_indices, IdType* kv_tile_indices,
-    IdType* q_indptr, IdType* q_offset, paged_kv_t<page_storage, DTypeKV, IdType> paged_kv,
-    uint8_t* custom_mask, IdType* qk_indptr, IdType* o_indptr, DTypeOut* o, DTypeOut* tmp_v,
-    float* tmp_s, float* lse, IdType* merge_indptr, bool* block_valid_mask,
-    IdType* kv_chunk_size_ptr, uint32_t total_num_rows, uint32_t num_qo_heads,
-    uint32_t padded_batch_size, int32_t window_left, float logits_soft_cap, float sm_scale,
-    float rope_scale, float rope_theta, cudaStream_t stream) {
-  const float log2_rope_rcp_scale = -std::log2f(rope_scale);
-  const float log2_rope_rcp_theta = -std::log2f(rope_theta);
+    typename AttentionVariant::ParamsT params,
+    typename AttentionVariant::DTypeO* tmp_v,
+    float* tmp_s,
+    cudaStream_t stream
+) {
+    // DTypeQ* q, IdType* request_indices, IdType* q_tile_indices, IdType* kv_tile_indices,
+    // IdType* q_indptr, IdType* q_offset, paged_kv_t<page_storage, DTypeKV, IdType> paged_kv,
+    // uint8_t* custom_mask, IdType* qk_indptr, IdType* o_indptr, DTypeOut* o, DTypeOut* tmp_v,
+    // float* tmp_s, float* lse, IdType* merge_indptr, bool* block_valid_mask,
+    // IdType* kv_chunk_size_ptr, uint32_t total_num_rows, uint32_t num_qo_heads,
+    // uint32_t padded_batch_size, int32_t window_left, float logits_soft_cap, float sm_scale,
+    // float rope_scale, float rope_theta, cudaStream_t stream) {
+  using DTypeQ = typename AttentionVariant::DTypeQ;
+  using DTypeKV = typename AttentionVariant::DTypeKV;
+  const uint32_t padded_batch_size = params.padded_batch_size;
+  const uint32_t num_kv_heads = params.num_kv_heads;
   constexpr uint32_t num_frags_x = get_num_frags_x<WARP_LAYOUT>();
   constexpr uint32_t num_warps_x = get_num_warps_x<WARP_LAYOUT>();
   constexpr uint32_t num_warps_z = get_num_warps_z<WARP_LAYOUT>();
-  const uint32_t num_kv_heads = paged_kv.num_heads;
-  const uint32_t group_size = num_qo_heads / num_kv_heads;
-  const uint_fastdiv group_size_fastdiv(group_size);
 
   if (padded_batch_size == 0) {
     // No request, skip
@@ -2225,7 +2222,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
   const int max_smem_per_threadblock = max_smem_per_sm / num_ctas_per_sm;
 
   const uint32_t max_num_frags_z_reg =
-      (HEAD_DIM >= 128 && num_frags_x == 2 && pos_encoding_mode == PosEncodingMode::kRoPELlama &&
+      (HEAD_DIM >= 128 && num_frags_x == 2 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
        !ALLOW_FP16_QK_REDUCTION)
           ? 2
           : (8 / num_frags_x);
@@ -2235,7 +2232,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
       (2 * num_warps_z);
 
   DISPATCH_NUM_FRAGS_Z(min(max_num_frags_z_smem, max_num_frags_z_reg), num_frags_z, {
-    if constexpr (is_invalid_configuration<pos_encoding_mode, DTypeKV, DTypeQKAccum>(
+    if constexpr (is_invalid_configuration<POS_ENCODING_MODE, DTypeKV, DTypeQKAccum>(
                       num_frags_x, num_frags_y, num_frags_z, num_warps_x, num_warps_z)) {
       // Invalid configuration, skip
       std::ostringstream err_msg;
@@ -2251,59 +2248,65 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
                             num_frags_z * num_warps_z * 2 * sizeof(DTypeQ)) *
                            16 * HEAD_DIM;
       auto kernel = BatchPrefillWithPagedKVCacheKernel<
-          LOGITS_POST_HOOK, MASK_MODE, pos_encoding_mode, num_frags_x, num_frags_y, num_frags_z,
+          LOGITS_POST_HOOK, MASK_MODE, POS_ENCODING_MODE, num_frags_x, num_frags_y, num_frags_z,
           num_warps_x, num_warps_z, page_storage, DTypeQ, DTypeKV, DTypeQKAccum, DTypeOut, IdType>;
       FLASHINFER_CUDA_CALL(
           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
       if (tmp_v == nullptr) {
         // do not partition kv
-        bool partition_kv = false;
-        void* args[] = {(void*)&request_indices,
-                        (void*)&q_tile_indices,
-                        (void*)&kv_tile_indices,
-                        (void*)&q,
-                        (void*)&paged_kv,
-                        (void*)&q_indptr,
-                        (void*)&custom_mask,
-                        (void*)&qk_indptr,
-                        (void*)&q_offset,
-                        (void*)&o_indptr,
-                        (void*)&o,
-                        (void*)&lse,
-                        (void*)&block_valid_mask,
-                        (void*)&kv_chunk_size_ptr,
-                        (void*)&partition_kv,
-                        (void*)&group_size_fastdiv,
-                        (void*)&window_left,
-                        (void*)&logits_soft_cap,
-                        (void*)&sm_scale,
-                        (void*)&log2_rope_rcp_scale,
-                        (void*)&log2_rope_rcp_theta};
+        params.partition_kv = false;
+        void* args[] = {(void*)&params};
+        // void* args[] = {(void*)&request_indices,
+        //                 (void*)&q_tile_indices,
+        //                 (void*)&kv_tile_indices,
+        //                 (void*)&q,
+        //                 (void*)&paged_kv,
+        //                 (void*)&q_indptr,
+        //                 (void*)&custom_mask,
+        //                 (void*)&qk_indptr,
+        //                 (void*)&q_offset,
+        //                 (void*)&o_indptr,
+        //                 (void*)&o,
+        //                 (void*)&lse,
+        //                 (void*)&block_valid_mask,
+        //                 (void*)&kv_chunk_size_ptr,
+        //                 (void*)&partition_kv,
+        //                 (void*)&group_size_fastdiv,
+        //                 (void*)&window_left,
+        //                 (void*)&logits_soft_cap,
+        //                 (void*)&sm_scale,
+        //                 (void*)&log2_rope_rcp_scale,
+        //                 (void*)&log2_rope_rcp_theta};
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
       } else {
-        bool partition_kv = true;
-        void* args[] = {(void*)&request_indices,
-                        (void*)&q_tile_indices,
-                        (void*)&kv_tile_indices,
-                        (void*)&q,
-                        (void*)&paged_kv,
-                        (void*)&q_indptr,
-                        (void*)&custom_mask,
-                        (void*)&qk_indptr,
-                        (void*)&q_offset,
-                        (void*)&o_indptr,
-                        (void*)&tmp_v,
-                        (void*)&tmp_s,
-                        (void*)&block_valid_mask,
-                        (void*)&kv_chunk_size_ptr,
-                        (void*)&partition_kv,
-                        (void*)&group_size_fastdiv,
-                        (void*)&window_left,
-                        (void*)&logits_soft_cap,
-                        (void*)&sm_scale,
-                        (void*)&log2_rope_rcp_scale,
-                        (void*)&log2_rope_rcp_theta};
+        params.partition_kv = true;
+        auto o = params.o;
+        auto lse = params.lse;
+        params.o = tmp_v;
+        params.lse = tmp_s;
+        void *args[] = {(void*)&params};
+        // void* args[] = {(void*)&request_indices,
+        //                 (void*)&q_tile_indices,
+        //                 (void*)&kv_tile_indices,
+        //                 (void*)&q,
+        //                 (void*)&paged_kv,
+        //                 (void*)&q_indptr,
+        //                 (void*)&custom_mask,
+        //                 (void*)&qk_indptr,
+        //                 (void*)&q_offset,
+        //                 (void*)&o_indptr,
+        //                 (void*)&tmp_v,
+        //                 (void*)&tmp_s,
+        //                 (void*)&block_valid_mask,
+        //                 (void*)&kv_chunk_size_ptr,
+        //                 (void*)&partition_kv,
+        //                 (void*)&group_size_fastdiv,
+        //                 (void*)&window_left,
+        //                 (void*)&logits_soft_cap,
+        //                 (void*)&sm_scale,
+        //                 (void*)&log2_rope_rcp_scale,
+        //                 (void*)&log2_rope_rcp_theta};
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         FLASHINFER_CUDA_CALL(VariableLengthMergeStates(

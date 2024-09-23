@@ -32,36 +32,6 @@ enum class PageStorage {
 };
 
 /*!
- * \brief The auxiliary information about kv sequence partitioning
- */
-template <typename IdType>
-struct kv_partition_info_t {
-  uint32_t batch_size_before_partition;
-  IdType* chunk_indptr;
-  IdType* batch_idx_map;
-  IdType* chunk_start_pos;
-  IdType* seq_lens_before_partition;
-
-  __host__ __device__ __forceinline__ kv_partition_info_t(uint32_t batch_size_before_partition,
-                                                          IdType* chunk_indptr,
-                                                          IdType* batch_idx_map,
-                                                          IdType* chunk_start_pos,
-                                                          IdType* seq_lens_before_partition)
-      : batch_size_before_partition(batch_size_before_partition),
-        chunk_indptr(chunk_indptr),
-        batch_idx_map(batch_idx_map),
-        chunk_start_pos(chunk_start_pos),
-        seq_lens_before_partition(seq_lens_before_partition) {}
-
-  __host__ __device__ __forceinline__ kv_partition_info_t()
-      : batch_size_before_partition(0),
-        chunk_indptr(nullptr),
-        batch_idx_map(nullptr),
-        chunk_start_pos(nullptr),
-        seq_lens_before_partition(nullptr) {}
-};
-
-/*!
  * \brief Paged key-value cache
  * \tparam page_storage Whether to store indices or pointers of each active page
  * \tparam layout The layout of last 3 dimensions in KV-Cache.
@@ -258,6 +228,10 @@ struct paged_kv_t {
     return page_storage == PageStorage::kPointer
                ? num_heads * page_size * head_dim
                : (int64_t(v_data) - int64_t(k_data)) / sizeof(DType);
+  }
+
+  __host__ __device__ __forceinline__ uint32_t get_length(uint32_t batch_idx) const {
+    return (indptr[batch_idx + 1] - indptr[batch_idx] - 1) * page_size + last_page_len[batch_idx];
   }
 
   /*!

@@ -61,7 +61,7 @@ struct SingleDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
                                          uint32_t num_qo_heads, uint32_t num_kv_heads,
                                          QKVLayout kv_layout, uint32_t head_dim,
                                          uint32_t window_left, float logits_soft_cap,
-                                         float sm_scale, float rope_rcp_scale, float rope_rcp_theta)
+                                         float sm_scale, float rope_scale, float rope_theta)
       : DecodeParamsBase<DTypeQ, DTypeKV, DTypeO>{q, o, /*lse=*/nullptr, sm_scale},
         k(k),
         v(v),
@@ -76,8 +76,8 @@ struct SingleDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
         head_dim(head_dim),
         window_left(window_left),
         logits_soft_cap(logits_soft_cap),
-        rope_rcp_scale(rope_rcp_scale),
-        rope_rcp_theta(rope_rcp_theta),
+        rope_rcp_scale(1.f / rope_scale),
+        rope_rcp_theta(1.f / rope_theta),
         kv_chunk_size(0) {}
 
   __host__ __device__ __forceinline__ size_t get_q_elem_offset(uint32_t qo_idx,
@@ -97,6 +97,12 @@ struct SingleDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
                                                                 uint32_t feat_idx) const {
     return get_elem_offset_impl(kv_idx, kv_head_idx, feat_idx, kv_stride_n, kv_stride_h);
   }
+
+  __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const { return 1; }
+
+  __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
+    return kv_len;
+  }
 };
 
 template <PageStorage PAGE_STORAGE_, typename DTypeQ, typename DTypeKV, typename DTypeO,
@@ -105,8 +111,11 @@ struct BatchDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
   static constexpr auto PAGE_STORAGE = PAGE_STORAGE_;
   using IdType = IdType_;
   IdType* q_offset;
+  IdType* request_indices;
+  IdType* kv_tile_indices;
+  IdType* o_indptr;
+  IdType* kv_chunk_size_ptr;
   paged_kv_t<PAGE_STORAGE, DTypeKV, IdType> paged_kv;
-  kv_partition_info_t<IdType> kv_partition_info;
   bool* block_valid_mask;
   float* alibi_slopes;
   uint32_t padded_batch_size;
@@ -122,21 +131,26 @@ struct BatchDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
                                         paged_kv_t<PAGE_STORAGE, DTypeKV, IdType> paged_kv,
                                         DTypeO* o, float* lse, float* alibi_slopes,
                                         uint32_t num_qo_heads, uint32_t window_left,
-                                        float logits_soft_cap, float sm_scale, float rope_rcp_scale,
-                                        float rope_rcp_theta)
+                                        float logits_soft_cap, float sm_scale, float rope_scale,
+                                        float rope_theta)
       : DecodeParamsBase<DTypeQ, DTypeKV, DTypeO>{q, o, lse, sm_scale},
         q_offset(q_offset),
         paged_kv(paged_kv),
-        kv_partition_info(),
         block_valid_mask(nullptr),
         alibi_slopes(alibi_slopes),
         padded_batch_size(0),
         num_qo_heads(num_qo_heads),
         window_left(window_left),
         logits_soft_cap(logits_soft_cap),
-        rope_rcp_scale(rope_rcp_scale),
-        rope_rcp_theta(rope_rcp_theta),
+        rope_rcp_scale(1.f / rope_scale),
+        rope_rcp_theta(1.f / rope_theta),
         partition_kv(false) {}
+
+  __host__ __device__ __forceinline__ int32_t get_qo_len(int32_t batch_idx) const { return 1; }
+
+  __host__ __device__ __forceinline__ int32_t get_kv_len(int32_t batch_idx) const {
+    return paged_kv.get_length(batch_idx);
+  }
 };
 
 }  // namespace flashinfer

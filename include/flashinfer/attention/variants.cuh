@@ -36,37 +36,18 @@ struct StandardAttention {
   }
 
   template <typename T>
-  static __device__ __forceinline__ T DecodeLogitsTransform(const ParamsT& params, T logits,
-                                                            int32_t qo_idx, int32_t kv_idx,
-                                                            int32_t qo_head_idx,
-                                                            int32_t kv_head_idx) {
+  static __device__ __forceinline__ T LogitsTransform(const ParamsT& params, T logits,
+                                                      int32_t batch_idx, int32_t qo_idx,
+                                                      int32_t kv_idx, int32_t qo_head_idx,
+                                                      int32_t kv_head_idx) {
     return logits;
   }
 
   template <typename T>
-  static __device__ __forceinline__ T PrefillLogitsTransform(const ParamsT& params, T logits,
-                                                             int32_t qo_idx, int32_t kv_idx,
-                                                             int32_t qo_head_idx,
-                                                             int32_t kv_head_idx) {
-    return logits;
-  }
-
-  template <typename T>
-  static __device__ __forceinline__ T BatchDecodeLogitsTransform(const ParamsT& params, T logits,
-                                                                 int32_t batch_idx, int32_t qo_idx,
-                                                                 int32_t kv_idx,
-                                                                 int32_t qo_head_idx,
-                                                                 int32_t kv_head_idx) {
-    return logits;
-  }
-
-  template <typename T>
-  static __device__ __forceinline__ T BatchPrefillLogitsTransform(const ParamsT& params, T logits,
-                                                                  int32_t batch_idx, int32_t qo_idx,
-                                                                  int32_t kv_idx,
-                                                                  int32_t qo_head_idx,
-                                                                  int32_t kv_head_idx) {
-    return logits;
+  static __device__ __forceinline__ bool LogitsMask(const ParamsT& params, int32_t batch_idx,
+                                                    int32_t qo_idx, int32_t kv_idx,
+                                                    int32_t qo_head_idx, int32_t kv_head_idx) {
+    return true;
   }
 };
 
@@ -81,28 +62,20 @@ struct CustomMaskAttention {
   }
 
   template <typename T>
-  static __device__ __forceinline__ T PrefillLogitsTransform(const ParamsT& params, T logits,
-                                                             int32_t qo_idx, int32_t kv_idx,
-                                                             int32_t qo_head_idx,
-                                                             int32_t kv_head_idx) {
-    uint8_t* custom_mask = params.custom_mask;
-    const uint32_t kv_len = params.kv_len;
-    return ((custom_mask[(qo_idx * kv_len + kv_idx) / 8] >> ((qo_idx * kv_len + kv_idx) % 8)) & 1)
-               ? logits
-               : -T(math::inf);
+  static __device__ __forceinline__ T LogitsTransform(const ParamsT& params, T logits,
+                                                      int32_t batch_idx, int32_t qo_idx,
+                                                      int32_t kv_idx, int32_t qo_head_idx,
+                                                      int32_t kv_head_idx) {
+    return logits;
   }
 
   template <typename T>
-  static __device__ __forceinline__ T BatchPrefillLogitsTransform(const ParamsT& params, T logits,
-                                                                  int32_t batch_idx, int32_t qo_idx,
-                                                                  int32_t kv_idx,
-                                                                  int32_t qo_head_idx,
-                                                                  int32_t kv_head_idx) {
-    uint8_t* custom_mask = params.custom_mask + params.mask_indptr[batch_idx];
-    const uint32_t kv_len = params.kv_indptr[batch_idx + 1] - params.kv_indptr[batch_idx];
-    return ((custom_mask[(qo_idx * kv_len + kv_idx) / 8] >> ((qo_idx * kv_len + kv_idx) % 8)) & 1)
-               ? logits
-               : -T(math::inf);
+  static __device__ __forceinline__ bool LogitsMask(const ParamsT& params, int32_t batch_idx,
+                                                    int32_t qo_idx, int32_t kv_idx,
+                                                    int32_t qo_head_idx, int32_t kv_head_idx) {
+    uint8_t* custom_mask = params.custom_mask;
+    const uint32_t offset = params.get_mask_offset(batch_idx, qo_idx, kv_idx);
+    return ((custom_mask[offset / 8] >> (offset % 8)) & 1);
   }
 };
 
@@ -118,45 +91,20 @@ struct SlidingWindowAttention {
   }
 
   template <typename T>
-  static __device__ __forceinline__ T DecodeLogitsTransform(const ParamsT& params, T logits,
-                                                            int32_t qo_idx, int32_t kv_idx,
-                                                            int32_t qo_head_idx,
-                                                            int32_t kv_head_idx) {
-    const int32_t qo_len = 1;
-    const int32_t kv_len = params.info.kv_len;
-    return (kv_idx + qo_len + params.window_left < kv_len + qo_idx) ? logits : -T(math::inf);
+  static __device__ __forceinline__ T LogitsTransform(const ParamsT& params, T logits,
+                                                      int32_t batch_idx, int32_t qo_idx,
+                                                      int32_t kv_idx, int32_t qo_head_idx,
+                                                      int32_t kv_head_idx) {
+    return logits;
   }
 
   template <typename T>
-  static __device__ __forceinline__ T PrefillLogitsTransform(const ParamsT& params, T logits,
-                                                             int32_t qo_idx, int32_t kv_idx,
-                                                             int32_t qo_head_idx,
-                                                             int32_t kv_head_idx) {
-    const int32_t qo_len = params.qo_len;
-    const int32_t kv_len = params.kv_len;
-    return (kv_idx + qo_len + params.window_left < kv_len + qo_idx) ? logits : -T(math::inf);
-  }
-
-  template <typename T>
-  static __device__ __forceinline__ T BatchDecodeLogitsTransform(const ParamsT& params, T logits,
-                                                                 int32_t batch_idx, int32_t qo_idx,
-                                                                 int32_t kv_idx,
-                                                                 int32_t qo_head_idx,
-                                                                 int32_t kv_head_idx) {
-    const int32_t qo_len = 1;
-    const int32_t kv_len = params.kv_indptr[batch_idx + 1] - params.kv_indptr[batch_idx];
-    return (kv_idx + qo_len + params.window_left < kv_len + qo_idx) ? logits : -T(math::inf);
-  }
-
-  template <typename T>
-  static __device__ __forceinline__ T BatchPrefillLogitsTransform(const ParamsT& params, T logits,
-                                                                  int32_t batch_idx, int32_t qo_idx,
-                                                                  int32_t kv_idx,
-                                                                  int32_t qo_head_idx,
-                                                                  int32_t kv_head_idx) {
-    const int32_t qo_len = params.qo_indptr[batch_idx + 1] - params.qo_indptr[batch_idx];
-    const int32_t kv_len = params.kv_indptr[batch_idx + 1] - params.kv_indptr[batch_idx];
-    return (kv_idx + qo_len + params.window_left < kv_len + qo_idx) ? logits : -T(math::inf);
+  static __device__ __forceinline__ bool LogitsMask(const ParamsT& params, int32_t batch_idx,
+                                                    int32_t qo_idx, int32_t kv_idx,
+                                                    int32_t qo_head_idx, int32_t kv_head_idx) {
+    const int32_t qo_len = params.get_qo_len(batch_idx);
+    const int32_t kv_len = params.get_kv_len(batch_idx);
+    return (kv_idx + qo_len + params.window_left < kv_len + qo_idx);
   }
 };
 
@@ -170,37 +118,18 @@ struct LogitsSoftCap {
   }
 
   template <typename T>
-  static __device__ __forceinline__ T DecodeLogitsTransform(const ParamsT& params, T logits,
-                                                            int32_t qo_idx, int32_t kv_idx,
-                                                            int32_t qo_head_idx,
-                                                            int32_t kv_head_idx) {
+  static __device__ __forceinline__ T LogitsTransform(const ParamsT& params, T logits,
+                                                      int32_t batch_idx, int32_t qo_idx,
+                                                      int32_t kv_idx, int32_t qo_head_idx,
+                                                      int32_t kv_head_idx) {
     return params.logits_soft_cap * math::log2e * math::tanh(logits);
   }
 
   template <typename T>
-  static __device__ __forceinline__ T PrefillLogitsTransform(const ParamsT& params, T logits,
-                                                             int32_t qo_idx, int32_t kv_idx,
-                                                             int32_t qo_head_idx,
-                                                             int32_t kv_head_idx) {
-    return params.logits_soft_cap * math::log2e * math::tanh(logits);
-  }
-
-  template <typename T>
-  static __device__ __forceinline__ T BatchDecodeLogitsTransform(const ParamsT& params, T logits,
-                                                                 int32_t batch_idx, int32_t qo_idx,
-                                                                 int32_t kv_idx,
-                                                                 int32_t qo_head_idx,
-                                                                 int32_t kv_head_idx) {
-    return DecodeLogitsTransform(params, logits, qo_idx, kv_idx, qo_head_idx, kv_head_idx);
-  }
-
-  template <typename T>
-  static __device__ __forceinline__ T BatchPrefillLogitsTransform(const ParamsT& params, T logits,
-                                                                  int32_t batch_idx, int32_t qo_idx,
-                                                                  int32_t kv_idx,
-                                                                  int32_t qo_head_idx,
-                                                                  int32_t kv_head_idx) {
-    return PrefillLogitsTransform(params, logits, qo_idx, kv_idx, qo_head_idx, kv_head_idx);
+  static __device__ __forceinline__ T LogitsMask(const ParamsT& params, int32_t batch_idx,
+                                                 int32_t qo_idx, int32_t kv_idx,
+                                                 int32_t qo_head_idx, int32_t kv_head_idx) {
+    return true;
   }
 };
 
@@ -215,37 +144,18 @@ struct ALIBIAttention {
   }
 
   template <typename T>
-  static __device__ __forceinline__ T DecodeLogitsTransform(const ParamsT& params, T logits,
-                                                            int32_t qo_idx, int32_t kv_idx,
-                                                            int32_t qo_head_idx,
-                                                            int32_t kv_head_idx) {
+  static __device__ __forceinline__ T LogitsTransform(const ParamsT& params, T logits,
+                                                      int32_t batch_idx, int32_t qo_idx,
+                                                      int32_t kv_idx, int32_t qo_head_idx,
+                                                      int32_t kv_head_idx) {
     return logits + params.alibi_slopes[qo_head_idx] * float(kv_idx - qo_idx);
   }
 
   template <typename T>
-  static __device__ __forceinline__ T PrefillLogitsTransform(const ParamsT& params, T logits,
-                                                             int32_t qo_idx, int32_t kv_idx,
-                                                             int32_t qo_head_idx,
-                                                             int32_t kv_head_idx) {
-    return logits + params.alibi_slopes[qo_head_idx] * float(kv_idx - qo_idx);
-  }
-
-  template <typename T>
-  static __device__ __forceinline__ T BatchDecodeLogitsTransform(const ParamsT& params, T logits,
-                                                                 int32_t batch_idx, int32_t qo_idx,
-                                                                 int32_t kv_idx,
-                                                                 int32_t qo_head_idx,
-                                                                 int32_t kv_head_idx) {
-    return DecodeLogitsTransform(params, logits, qo_idx, kv_idx, qo_head_idx, kv_head_idx);
-  }
-
-  template <typename T>
-  static __device__ __forceinline__ T BatchPrefillLogitsTransform(const ParamsT& params, T logits,
-                                                                  int32_t batch_idx, int32_t qo_idx,
-                                                                  int32_t kv_idx,
-                                                                  int32_t qo_head_idx,
-                                                                  int32_t kv_head_idx) {
-    return PrefillLogitsTransform(params, logits, qo_idx, kv_idx, qo_head_idx, kv_head_idx);
+  static __device__ __forceinline__ T LogitsMask(const ParamsT& params, int32_t batch_idx,
+                                                 int32_t qo_idx, int32_t kv_idx,
+                                                 int32_t qo_head_idx, int32_t kv_head_idx) {
+    return true;
   }
 };
 
@@ -280,97 +190,34 @@ struct ComposedAttention {
     }
   }
 
-  static __device__ __forceinline__ float DecodeLogitsTransform(const ParamsT& params, float logits,
-                                                                int32_t qo_idx, int32_t kv_idx,
-                                                                int32_t qo_head_idx,
-                                                                int32_t kv_head_idx) {
+  static __device__ __forceinline__ float LogitsTransform(const ParamsT& params, float logits,
+                                                          int32_t batch_idx, int32_t qo_idx,
+                                                          int32_t kv_idx, int32_t qo_head_idx,
+                                                          int32_t kv_head_idx) {
     if constexpr (use_alibi) {
-      logits = ALIBIAttention<ParamsT>::DecodeLogitsTransform(params, logits, qo_idx, kv_idx,
-                                                              qo_head_idx, kv_head_idx);
+      logits = ALIBIAttention<ParamsT>::LogitsTransform(params, logits, batch_idx, qo_idx, kv_idx,
+                                                        qo_head_idx, kv_head_idx);
     }
     if constexpr (use_logits_soft_cap) {
-      logits = LogitsSoftCap<ParamsT>::DecodeLogitsTransform(params, logits, qo_idx, kv_idx,
-                                                             qo_head_idx, kv_head_idx);
+      logits = LogitsSoftCap<ParamsT>::LogitsTransform(params, logits, batch_idx, qo_idx, kv_idx,
+                                                       qo_head_idx, kv_head_idx);
+    }
+    return logits;
+  }
+
+  static __device__ __forceinline__ bool LogitsMask(const ParamsT& params, int32_t batch_idx,
+                                                    int32_t qo_idx, int32_t kv_idx,
+                                                    int32_t qo_head_idx, int32_t kv_head_idx) {
+    bool mask = true;
+    if constexpr (use_custom_mask) {
+      mask &= CustomMaskAttention<ParamsT>::LogitsMask(params, batch_idx, qo_idx, kv_idx,
+                                                       qo_head_idx, kv_head_idx);
     }
     if constexpr (use_sliding_window) {
-      logits = SlidingWindowAttention<ParamsT>::DecodeLogitsTransform(
-          params, logits, qo_idx, kv_idx, qo_head_idx, kv_head_idx);
-    } else {
-      logits = StandardAttention<ParamsT>::DecodeLogitsTransform(params, logits, qo_idx, kv_idx,
-                                                                 qo_head_idx, kv_head_idx);
+      mask &= SlidingWindowAttention<ParamsT>::LogitsMask(params, batch_idx, qo_idx, kv_idx,
+                                                          qo_head_idx, kv_head_idx);
     }
-    return logits;
-  }
-
-  static __device__ __forceinline__ float PrefillLogitsTransform(const ParamsT& params,
-                                                                 float logits, int32_t qo_idx,
-                                                                 int32_t kv_idx,
-                                                                 int32_t qo_head_idx,
-                                                                 int32_t kv_head_idx) {
-    if constexpr (use_alibi) {
-      logits = ALIBIAttention<ParamsT>::PrefillLogitsTransform(params, logits, qo_idx, kv_idx,
-                                                               qo_head_idx, kv_head_idx);
-    }
-    if constexpr (use_logits_soft_cap) {
-      logits = LogitsSoftCap<ParamsT>::PrefillLogitsTransform(params, logits, qo_idx, kv_idx,
-                                                              qo_head_idx, kv_head_idx);
-    }
-    if constexpr (use_custom_mask) {
-      logits = CustomMaskAttention<ParamsT>::PrefillLogitsTransform(params, logits, qo_idx, kv_idx,
-                                                                    qo_head_idx, kv_head_idx);
-    } else if constexpr (use_sliding_window) {
-      logits = SlidingWindowAttention<ParamsT>::PrefillLogitsTransform(
-          params, logits, qo_idx, kv_idx, qo_head_idx, kv_head_idx);
-    } else {
-      logits = StandardAttention<ParamsT>::PrefillLogitsTransform(params, logits, qo_idx, kv_idx,
-                                                                  qo_head_idx, kv_head_idx);
-    }
-    return logits;
-  }
-
-  static __device__ __forceinline__ float BatchDecodeLogitsTransform(
-      const ParamsT& params, float logits, int32_t batch_idx, int32_t qo_idx, int32_t kv_idx,
-      int32_t qo_head_idx, int32_t kv_head_idx) {
-    if constexpr (use_alibi) {
-      logits = ALIBIAttention<ParamsT>::BatchDecodeLogitsTransform(
-          params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx);
-    }
-    if constexpr (use_logits_soft_cap) {
-      logits = LogitsSoftCap<ParamsT>::BatchDecodeLogitsTransform(params, logits, batch_idx, qo_idx,
-                                                                  kv_idx, qo_head_idx, kv_head_idx);
-    }
-    if constexpr (use_sliding_window) {
-      logits = SlidingWindowAttention<ParamsT>::BatchDecodeLogitsTransform(
-          params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx);
-    } else {
-      logits = StandardAttention<ParamsT>::BatchDecodeLogitsTransform(
-          params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx);
-    }
-    return logits;
-  }
-
-  static __device__ __forceinline__ float BatchPrefillLogitsTransform(
-      const ParamsT& params, float logits, int32_t batch_idx, int32_t qo_idx, int32_t kv_idx,
-      int32_t qo_head_idx, int32_t kv_head_idx) {
-    if constexpr (use_alibi) {
-      logits = ALIBIAttention<ParamsT>::BatchPrefillLogitsTransform(
-          params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx);
-    }
-    if constexpr (use_logits_soft_cap) {
-      logits = LogitsSoftCap<ParamsT>::BatchPrefillLogitsTransform(
-          params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx);
-    }
-    if constexpr (use_custom_mask) {
-      logits = CustomMaskAttention<ParamsT>::BatchPrefillLogitsTransform(
-          params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx);
-    } else if constexpr (use_sliding_window) {
-      logits = SlidingWindowAttention<ParamsT>::BatchPrefillLogitsTransform(
-          params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx);
-    } else {
-      logits = StandardAttention<ParamsT>::BatchPrefillLogitsTransform(
-          params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx);
-    }
-    return logits;
+    return mask;
   }
 };
 
