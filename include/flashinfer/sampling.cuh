@@ -37,6 +37,8 @@
 #define FULL_MASK 0xffffffffffffffff
 #endif
 
+#define WAVE_SIZE 64
+
 #else
 
 #include <cub/block/block_adjacent_difference.cuh>
@@ -46,6 +48,8 @@
 #ifndef FULL_MASK
 #define FULL_MASK 0xffffffff
 #endif
+
+#define WAVE_SIZE 32
 
 #endif
 
@@ -159,7 +163,7 @@ __device__ __forceinline__ void DeterministicInclusiveSum(
   T thread_exclusive_prefix_sum = thread_sum;
 
 #pragma unroll
-  for (uint32_t offset = 1; offset < 32; offset *= 2) {
+  for (uint32_t offset = 1; offset < WAVE_SIZE; offset *= 2) {
     T tmp = __shfl_up_sync(FULL_MASK, thread_exclusive_prefix_sum, offset);
     if ((threadIdx.x + 1) % (offset * 2) == 0) {
       thread_exclusive_prefix_sum += tmp;
@@ -167,12 +171,12 @@ __device__ __forceinline__ void DeterministicInclusiveSum(
   }
 
   T warp_sum = __shfl_sync(FULL_MASK, thread_exclusive_prefix_sum, threadIdx.x | FULL_MASK);
-  if (threadIdx.x % 32 == 31) {
+  if (threadIdx.x % WAVE_SIZE == WAVE_SIZE - 1) {
     thread_exclusive_prefix_sum = 0;
   }
 
 #pragma unroll
-  for (uint32_t offset = 16; offset >= 1; offset /= 2) {
+  for (uint32_t offset = WAVE_SIZE / 2; offset >= 1; offset /= 2) {
     T tmp = __shfl_xor_sync(FULL_MASK, thread_exclusive_prefix_sum, offset);
     if ((threadIdx.x + 1) % (offset * 2) == 0) {
       thread_exclusive_prefix_sum = tmp + thread_exclusive_prefix_sum;
@@ -182,27 +186,27 @@ __device__ __forceinline__ void DeterministicInclusiveSum(
     }
   }
 
-  smem_prefix_sum[threadIdx.x / 32] = warp_sum;
+  smem_prefix_sum[threadIdx.x / WAVE_SIZE] = warp_sum;
   __syncthreads();
 
-  if (threadIdx.x < 32) {
+  if (threadIdx.x < WAVE_SIZE) {
     T warp_exclusive_prefix_sum =
-        (threadIdx.x < BLOCK_THREADS / 32) ? smem_prefix_sum[threadIdx.x] : 0;
+        (threadIdx.x < BLOCK_THREADS / WAVE_SIZE) ? smem_prefix_sum[threadIdx.x] : 0;
 
 #pragma unroll
-    for (uint32_t offset = 1; offset < 32; offset *= 2) {
+    for (uint32_t offset = 1; offset < WAVE_SIZE; offset *= 2) {
       T tmp = __shfl_up_sync(FULL_MASK, warp_exclusive_prefix_sum, offset);
       if ((threadIdx.x + 1) % (offset * 2) == 0) {
         warp_exclusive_prefix_sum += tmp;
       }
     }
 
-    if (threadIdx.x % 32 == 31) {
+    if (threadIdx.x % WAVE_SIZE == WAVE_SIZE - 1) {
       warp_exclusive_prefix_sum = 0;
     }
 
 #pragma unroll
-    for (uint32_t offset = 16; offset >= 1; offset /= 2) {
+    for (uint32_t offset = WAVE_SIZE / 2; offset >= 1; offset /= 2) {
       T tmp = __shfl_xor_sync(FULL_MASK, warp_exclusive_prefix_sum, offset);
       if ((threadIdx.x + 1) % (offset * 2) == 0) {
         warp_exclusive_prefix_sum = tmp + warp_exclusive_prefix_sum;
@@ -211,7 +215,7 @@ __device__ __forceinline__ void DeterministicInclusiveSum(
         warp_exclusive_prefix_sum = tmp;
       }
     }
-    if (threadIdx.x < BLOCK_THREADS / 32) {
+    if (threadIdx.x < BLOCK_THREADS / WAVE_SIZE) {
       smem_prefix_sum[threadIdx.x] = warp_exclusive_prefix_sum;
     }
   }
@@ -219,7 +223,7 @@ __device__ __forceinline__ void DeterministicInclusiveSum(
 
 #pragma unroll
   for (uint32_t i = 0; i < VEC_SIZE; ++i) {
-    out_data[i] = smem_prefix_sum[threadIdx.x / 32] + thread_exclusive_prefix_sum + thread_data[i];
+    out_data[i] = smem_prefix_sum[threadIdx.x / WAVE_SIZE] + thread_exclusive_prefix_sum + thread_data[i];
   }
 }
 
@@ -255,7 +259,7 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
   aggregate_local = temp_storage->data.block_aggregate.value;
   if (aggregate + aggregate_local > u) {
     #ifdef USE_ROCM
-    if constexpr (false) {
+    if constexpr (true) {
     #else
     if constexpr (DETERMINISTIC) {
     #endif
