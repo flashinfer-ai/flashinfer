@@ -184,16 +184,15 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
   }
 };
 
-template <PageStorage PAGE_STORAGE_, typename DTypeQ, typename DTypeKV, typename DTypeO,
+template <typename DTypeQ, typename DTypeKV, typename DTypeO,
           typename IdType_>
 struct BatchPrefillPagedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTypeO> {
-  static constexpr auto PAGE_STORAGE = PAGE_STORAGE_;
   using IdType = IdType_;
 
   IdType* request_indices;
   IdType* q_tile_indices;
   IdType* kv_tile_indices;
-  paged_kv_t<PAGE_STORAGE, DTypeKV, IdType> paged_kv;
+  paged_kv_t<DTypeKV, IdType> paged_kv;
   IdType* q_indptr;
   uint8_t* custom_mask;
   IdType* qk_indptr;
@@ -212,7 +211,7 @@ struct BatchPrefillPagedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DType
   float log2_rope_rcp_scale;
   float log2_rope_rcp_theta;
 
-  __host__ BatchPrefillPagedParams(DTypeQ* q, IdType* q_indptr, paged_kv_t<PAGE_STORAGE, DTypeKV, IdType> paged_kv,
+  __host__ BatchPrefillPagedParams(DTypeQ* q, IdType* q_indptr, paged_kv_t<DTypeKV, IdType> paged_kv,
     uint8_t* custom_mask, IdType* qk_indptr, DTypeO* o, float* lse, uint32_t num_qo_heads, int32_t window_left, float logits_soft_cap,
     float sm_scale, float rope_scale, float rope_theta):
     PrefillParamsBase<DTypeQ, DTypeKV, DTypeO>{q, custom_mask, o, lse, sm_scale},

@@ -117,7 +117,6 @@ inline std::tuple<bool, uint32_t, uint32_t> PrefillBinarySearchKVChunkSize(
 /*!
  * \brief Estimate the temporary buffer size and the maximum grid size for the
  *   partition-kv BatchDecodeWithPagedKVCache kernel
- * \tparam page_storage Whether to store indices or pointers of each active page
  * \tparam DTypeKV A template type indicates the key-value data type
  * \tparam DTypeOut A template type indicates the output data type
  * \tparam IdType A template type indicates the index data type
@@ -208,7 +207,7 @@ std::tuple<std::vector<IdType>, std::vector<IdType>, std::vector<IdType>> Decode
 
   for (uint32_t batch_idx = 0; batch_idx < batch_size; batch_idx++) {
     uint32_t num_tiles_kv =
-        ceil_div(std::max(indptr_h[batch_idx + 1] - indptr_h[batch_idx], 1U), kv_chunk_size);
+        ceil_div(std::max(int(indptr_h[batch_idx + 1] - indptr_h[batch_idx]), 1), kv_chunk_size);
     for (uint32_t kv_tile_idx = 0; kv_tile_idx < num_tiles_kv; ++kv_tile_idx) {
       request_indices.push_back(batch_idx);
       kv_tile_indices.push_back(kv_tile_idx);
@@ -227,6 +226,7 @@ struct DecodePlanInfo {
   int64_t kv_tile_indices_offset;
   int64_t o_indptr_offset;
   int64_t block_valid_mask_offset;
+  int64_t kv_chunk_size_ptr_offset;
   bool enable_cuda_graph;
   bool split_kv;
 
@@ -238,6 +238,7 @@ struct DecodePlanInfo {
         kv_tile_indices_offset(0),
         o_indptr_offset(0),
         block_valid_mask_offset(0),
+        kv_chunk_size_ptr_offset(0),
         enable_cuda_graph(false),
         split_kv(false) {}
 
@@ -250,15 +251,16 @@ struct DecodePlanInfo {
             kv_tile_indices_offset,
             o_indptr_offset,
             block_valid_mask_offset,
+            kv_chunk_size_ptr_offset,
             enable_cuda_graph,
             split_kv};
   }
 
   // From std::vector<int64_t> to DecodePlanInfo
   void FromVector(const std::vector<int64_t>& vec) {
-    if (vec.size() != 8) {
+    if (vec.size() != 10) {
       std::ostringstream err_msg;
-      err_msg << "DecodePlanInfo::FromVector: vec.size() should be 8, but got " << vec.size();
+      err_msg << "DecodePlanInfo::FromVector: vec.size() should be 10, but got " << vec.size();
       throw std::invalid_argument(err_msg.str());
     }
     padded_batch_size = vec[0];
@@ -268,8 +270,9 @@ struct DecodePlanInfo {
     kv_tile_indices_offset = vec[4];
     o_indptr_offset = vec[5];
     block_valid_mask_offset = vec[6];
-    enable_cuda_graph = vec[7];
-    split_kv = vec[8];
+    kv_chunk_size_ptr_offset = vec[7];
+    enable_cuda_graph = vec[8];
+    split_kv = vec[9];
   }
 };
 
@@ -283,12 +286,12 @@ cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
   using DTypeOut = typename AttentionVariant::DTypeO;
   using IdType = typename AttentionVariant::IdType;
   bool split_kv;
-  uint32_t max_grid_size, max_num_pages_per_batch, new_batch_size;
+  uint32_t max_grid_size, kv_chunk_size, new_batch_size;
   DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
     auto work_estimation_func =
         BatchDecodeWithPagedKVCacheWorkEstimationDispatched<GROUP_SIZE, HEAD_DIM, POS_ENCODING_MODE,
                                                             AttentionVariant>;
-    FLASHINFER_CUDA_CALL(work_estimation_func(split_kv, max_grid_size, max_num_pages_per_batch,
+    FLASHINFER_CUDA_CALL(work_estimation_func(split_kv, max_grid_size, kv_chunk_size,
                                               new_batch_size, batch_size, indptr_h, num_qo_heads,
                                               page_size, enable_cuda_graph, stream));
     size_t padded_batch_size;
@@ -299,8 +302,8 @@ cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
     plan_info.padded_batch_size = padded_batch_size;
 
     auto [request_indices_vec, kv_tile_indices_vec, o_indptr_vec] =
-        DecodeSplitKVIndptr(indptr_h, batch_size, max_num_pages_per_batch);
-
+        DecodeSplitKVIndptr(indptr_h, batch_size, kv_chunk_size);
+    
     AlignedAllocator int_allocator(int_buffer, int_workspace_size_in_bytes);
     plan_info.request_indices_offset = int_allocator.aligned_alloc_offset(
         padded_batch_size * sizeof(IdType), 16, "batch_decode_request_indices");
@@ -308,15 +311,20 @@ cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
         padded_batch_size * sizeof(IdType), 16, "batch_decode_kv_tile_indices");
     plan_info.o_indptr_offset = int_allocator.aligned_alloc_offset(
         (padded_batch_size + 1) * sizeof(IdType), 16, "batch_decode_o_indptr");
+    plan_info.kv_chunk_size_ptr_offset =
+        int_allocator.aligned_alloc_offset(sizeof(IdType), 1, "batch_decode_kv_chunk_size_ptr");
     IdType* request_indices_h =
         GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.request_indices_offset);
     IdType* kv_tile_indices_h =
         GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_tile_indices_offset);
     IdType* o_indptr_h =
         GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.o_indptr_offset);   
+    IdType* kv_chunk_size_ptr_h =
+        GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_chunk_size_ptr_offset);
     std::copy(request_indices_vec.begin(), request_indices_vec.end(), request_indices_h);
     std::copy(kv_tile_indices_vec.begin(), kv_tile_indices_vec.end(), kv_tile_indices_h);
     std::copy(o_indptr_vec.begin(), o_indptr_vec.end(), o_indptr_h);
+    kv_chunk_size_ptr_h[0] = kv_chunk_size;
 
     if (split_kv) {
       AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);

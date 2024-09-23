@@ -213,10 +213,10 @@ __device__ __forceinline__ void produce_kv(smem_t<swizzle_mode> smem, uint32_t* 
 }
 
 template <bool produce_v, uint32_t num_warps_x, uint32_t num_warps_z, uint32_t num_frags_y,
-          uint32_t num_frags_z, PageStorage page_storage, SwizzleMode swizzle_mode, typename DType,
+          uint32_t num_frags_z, SwizzleMode swizzle_mode, typename DType,
           typename IdType>
 __device__ __forceinline__ void page_produce_kv(smem_t<swizzle_mode> smem, uint32_t* smem_offset,
-                                                paged_kv_t<page_storage, DType, IdType>& paged_kv,
+                                                paged_kv_t<DType, IdType>& paged_kv,
                                                 const uint32_t kv_idx_base, const size_t* kv_offset,
                                                 const uint32_t kv_len) {
   // NOTE(Zihao): for fp8, this function doesn't work for head_dim = 64 at the moment
@@ -1707,7 +1707,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
 
 template <MaskMode MASK_MODE, PosEncodingMode POS_ENCODING_MODE, uint32_t num_frags_x,
           uint32_t num_frags_y, uint32_t num_frags_z, uint32_t num_warps_x, uint32_t num_warps_z,
-          PageStorage page_storage, typename DTypeQKAccum, typename AttentionVariant>
+          typename DTypeQKAccum, typename AttentionVariant>
 __global__
 __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPagedKVCacheKernel(
     const __grid_constant__ typename AttentionVariant::ParamsT params) {
@@ -1723,7 +1723,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
     IdType* q_tile_indices = params.q_tile_indices;
     IdType* kv_tile_indices = params.kv_tile_indices;
     DTypeQ* q = params.q;
-    paged_kv_t<page_storage, DTypeKV, IdType> paged_kv = params.paged_kv;
+    paged_kv_t<DTypeKV, IdType> paged_kv = params.paged_kv;
     IdType* q_indptr = params.q_indptr;
     IdType* q_offset = params.q_offset;
     IdType* o_indptr = params.o_indptr;
@@ -2183,7 +2183,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
     cudaStream_t stream
 ) {
     // DTypeQ* q, IdType* request_indices, IdType* q_tile_indices, IdType* kv_tile_indices,
-    // IdType* q_indptr, IdType* q_offset, paged_kv_t<page_storage, DTypeKV, IdType> paged_kv,
+    // IdType* q_indptr, IdType* q_offset, paged_kv_t<DTypeKV, IdType> paged_kv,
     // uint8_t* custom_mask, IdType* qk_indptr, IdType* o_indptr, DTypeOut* o, DTypeOut* tmp_v,
     // float* tmp_s, float* lse, IdType* merge_indptr, bool* block_valid_mask,
     // IdType* kv_chunk_size_ptr, uint32_t total_num_rows, uint32_t num_qo_heads,
@@ -2249,7 +2249,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(
                            16 * HEAD_DIM;
       auto kernel = BatchPrefillWithPagedKVCacheKernel<
           LOGITS_POST_HOOK, MASK_MODE, POS_ENCODING_MODE, num_frags_x, num_frags_y, num_frags_z,
-          num_warps_x, num_warps_z, page_storage, DTypeQ, DTypeKV, DTypeQKAccum, DTypeOut, IdType>;
+          num_warps_x, num_warps_z, DTypeQ, DTypeKV, DTypeQKAccum, DTypeOut, IdType>;
       FLASHINFER_CUDA_CALL(
           cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
       if (tmp_v == nullptr) {

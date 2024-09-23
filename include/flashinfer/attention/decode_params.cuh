@@ -105,17 +105,16 @@ struct SingleDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
   }
 };
 
-template <PageStorage PAGE_STORAGE_, typename DTypeQ, typename DTypeKV, typename DTypeO,
+template <typename DTypeQ, typename DTypeKV, typename DTypeO,
           typename IdType_>
 struct BatchDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
-  static constexpr auto PAGE_STORAGE = PAGE_STORAGE_;
   using IdType = IdType_;
   IdType* q_offset;
   IdType* request_indices;
   IdType* kv_tile_indices;
   IdType* o_indptr;
   IdType* kv_chunk_size_ptr;
-  paged_kv_t<PAGE_STORAGE, DTypeKV, IdType> paged_kv;
+  paged_kv_t<DTypeKV, IdType> paged_kv;
   bool* block_valid_mask;
   float* alibi_slopes;
   uint32_t padded_batch_size;
@@ -128,7 +127,7 @@ struct BatchDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
   bool partition_kv;
 
   __device__ __host__ BatchDecodeParams(DTypeQ* q, IdType* q_offset,
-                                        paged_kv_t<PAGE_STORAGE, DTypeKV, IdType> paged_kv,
+                                        paged_kv_t<DTypeKV, IdType> paged_kv,
                                         DTypeO* o, float* lse, float* alibi_slopes,
                                         uint32_t num_qo_heads, uint32_t window_left,
                                         float logits_soft_cap, float sm_scale, float rope_scale,
