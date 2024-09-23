@@ -166,6 +166,11 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     max_grid_size = num_blocks_per_sm * num_sm;
     if (batch_size * num_kv_heads >= max_grid_size) {
       split_kv = false;
+      max_num_pages_per_batch = 1;
+      for (uint32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+        max_num_pages_per_batch =
+            std::max<uint32_t>(max_num_pages_per_batch, kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx]);
+      }
       new_batch_size = batch_size;
     } else {
       // compute max_num_pages_per_batch and new_batch_size
@@ -207,7 +212,7 @@ std::tuple<std::vector<IdType>, std::vector<IdType>, std::vector<IdType>> Decode
 
   for (uint32_t batch_idx = 0; batch_idx < batch_size; batch_idx++) {
     uint32_t num_tiles_kv =
-        ceil_div(std::max(int(indptr_h[batch_idx + 1] - indptr_h[batch_idx]), 1), kv_chunk_size);
+        ceil_div(std::max<uint32_t>(indptr_h[batch_idx + 1] - indptr_h[batch_idx], 1U), kv_chunk_size);
     for (uint32_t kv_tile_idx = 0; kv_tile_idx < num_tiles_kv; ++kv_tile_idx) {
       request_indices.push_back(batch_idx);
       kv_tile_indices.push_back(kv_tile_idx);
@@ -286,12 +291,12 @@ cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
   using DTypeOut = typename AttentionVariant::DTypeO;
   using IdType = typename AttentionVariant::IdType;
   bool split_kv;
-  uint32_t max_grid_size, kv_chunk_size, new_batch_size;
+  uint32_t max_grid_size, kv_chunk_size_in_pages, new_batch_size;
   DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
     auto work_estimation_func =
         BatchDecodeWithPagedKVCacheWorkEstimationDispatched<GROUP_SIZE, HEAD_DIM, POS_ENCODING_MODE,
                                                             AttentionVariant>;
-    FLASHINFER_CUDA_CALL(work_estimation_func(split_kv, max_grid_size, kv_chunk_size,
+    FLASHINFER_CUDA_CALL(work_estimation_func(split_kv, max_grid_size, kv_chunk_size_in_pages,
                                               new_batch_size, batch_size, indptr_h, num_qo_heads,
                                               page_size, enable_cuda_graph, stream));
     size_t padded_batch_size;
@@ -302,7 +307,7 @@ cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
     plan_info.padded_batch_size = padded_batch_size;
 
     auto [request_indices_vec, kv_tile_indices_vec, o_indptr_vec] =
-        DecodeSplitKVIndptr(indptr_h, batch_size, kv_chunk_size);
+        DecodeSplitKVIndptr(indptr_h, batch_size, kv_chunk_size_in_pages);
     
     AlignedAllocator int_allocator(int_buffer, int_workspace_size_in_bytes);
     plan_info.request_indices_offset = int_allocator.aligned_alloc_offset(
@@ -324,7 +329,7 @@ cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
     std::copy(request_indices_vec.begin(), request_indices_vec.end(), request_indices_h);
     std::copy(kv_tile_indices_vec.begin(), kv_tile_indices_vec.end(), kv_tile_indices_h);
     std::copy(o_indptr_vec.begin(), o_indptr_vec.end(), o_indptr_h);
-    kv_chunk_size_ptr_h[0] = kv_chunk_size;
+    kv_chunk_size_ptr_h[0] = kv_chunk_size_in_pages * page_size;
 
     if (split_kv) {
       AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);

@@ -25,7 +25,7 @@ batch_decode_templ = r"""
 
 using namespace flashinfer;
 
-using ParamsT = BatchDecodeParams<PageStorage::kIndices, {{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ dtype_idx }}>;
+using ParamsT = BatchDecodeParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ dtype_idx }}>;
 using AttentionVariant = ComposedAttention<ParamsT, get_variant_code(/*use_custom_mask=*/false, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, {{ use_alibi }})>;
 
 std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
@@ -165,10 +165,9 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
   void* float_buffer = static_cast<void*>(float_workspace_buffer.data_ptr());
   void* int_buffer = static_cast<void*>(int_workspace_buffer.data_ptr());
 
-  paged_kv_t<PageStorage::kIndices, {{ dtype_kv }}, {{ dtype_idx }}> paged_kv(
+  paged_kv_t<{{ dtype_kv }}, {{ dtype_idx }}> paged_kv(
       num_kv_heads, page_size, head_dim,
-      plan_info.split_kv ? batch_size: plan_info.batch_size_after_partition,
-      kv_layout,
+      batch_size, kv_layout,
       static_cast<{{ dtype_kv }}*>(paged_kv_cache.has_value() ? paged_kv_cache->data_ptr()
                                                           : nullptr),
       static_cast<{{ dtype_kv }} *>(paged_k_cache.has_value() ? paged_k_cache->data_ptr()
@@ -176,11 +175,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
       static_cast<{{ dtype_kv }}*>(paged_v_cache.has_value() ? paged_v_cache->data_ptr()
                                                           : nullptr),
       static_cast<{{ dtype_idx }}*>(paged_kv_indices.data_ptr()),
-      plan_info.split_kv ?
-      GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer, plan_info.new_indptr_offset):
       static_cast<{{ dtype_idx }}*>(paged_kv_indptr.data_ptr()),
-      plan_info.split_kv ?
-      GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer, plan_info.new_last_page_len_offset):
       static_cast<{{ dtype_idx }}*>(paged_kv_last_page_len.data_ptr()));
   ParamsT params(
     static_cast<{{ dtype_q }}*>(q.data_ptr()),
@@ -191,14 +186,13 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
   
   {{ dtype_o }}* tmp_v = nullptr;
   float* tmp_s = nullptr;
+  params.request_indices = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer, plan_info.request_indices_offset);
+  params.kv_tile_indices = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer, plan_info.kv_tile_indices_offset);
+  params.o_indptr = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer, plan_info.o_indptr_offset);
+  params.kv_chunk_size_ptr = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer, plan_info.kv_chunk_size_ptr_offset);
   if (plan_info.split_kv) {
     tmp_v = GetPtrFromBaseOffset<{{ dtype_o }}>(float_buffer, plan_info.v_offset);
     tmp_s = GetPtrFromBaseOffset<float>(float_buffer, plan_info.s_offset);
-    params.kv_partition_info.batch_size_before_partition = plan_info.batch_size_before_partition;
-    params.kv_partition_info.chunk_indptr = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer, plan_info.chunk_indptr_offset);
-    params.kv_partition_info.batch_idx_map = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer, plan_info.batch_idx_map_offset);
-    params.kv_partition_info.chunk_start_pos = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer, plan_info.chunk_start_pos_offset);
-    params.kv_partition_info.seq_lens_before_partition = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer, plan_info.seq_lengths_before_partition_offset);
     if (plan_info.enable_cuda_graph) {
       params.block_valid_mask = GetPtrFromBaseOffset<bool>(int_buffer, plan_info.block_valid_mask_offset);
     }
