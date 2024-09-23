@@ -16,9 +16,39 @@
 #ifndef FLASHINFER_SAMPLING_CUH_
 #define FLASHINFER_SAMPLING_CUH_
 
+#ifdef USE_ROCM
+
+#include <hip/hip_runtime.h>
+
+#include <hipcub/config.hpp>
+
+#include <hipcub/block/block_adjacent_difference.hpp>
+#include <hipcub/block/block_reduce.hpp>
+#include <hipcub/block/block_scan.hpp>
+
+#include <hip/amd_detail/amd_warp_sync_functions.h>
+
+#include "flashinfer/hip_warp_sync_functions.h"
+
+// CUDA API Portable interfaces
+#include "flashinfer/hip_defs.h"
+
+#ifndef FULL_MASK
+#define FULL_MASK 0xffffffffffffffff
+#endif
+
+#else
+
 #include <cub/block/block_adjacent_difference.cuh>
 #include <cub/block/block_reduce.cuh>
 #include <cub/block/block_scan.cuh>
+
+#ifndef FULL_MASK
+#define FULL_MASK 0xffffffff
+#endif
+
+#endif
+
 #include <numeric>
 
 #include "math.cuh"
@@ -29,7 +59,18 @@ namespace flashinfer {
 
 namespace sampling {
 
+#ifdef USE_ROCM
+
+using namespace hipcub;
+
+// do hip namespace alias
+namespace cub = hipcub;
+
+#else
+
 using namespace cub;
+
+#endif
 
 #define DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, ...) \
   if (deterministic) {                                            \
@@ -119,20 +160,20 @@ __device__ __forceinline__ void DeterministicInclusiveSum(
 
 #pragma unroll
   for (uint32_t offset = 1; offset < 32; offset *= 2) {
-    T tmp = __shfl_up_sync(0xffffffff, thread_exclusive_prefix_sum, offset);
+    T tmp = __shfl_up_sync(FULL_MASK, thread_exclusive_prefix_sum, offset);
     if ((threadIdx.x + 1) % (offset * 2) == 0) {
       thread_exclusive_prefix_sum += tmp;
     }
   }
 
-  T warp_sum = __shfl_sync(0xffffffff, thread_exclusive_prefix_sum, threadIdx.x | 0xffffffff);
+  T warp_sum = __shfl_sync(FULL_MASK, thread_exclusive_prefix_sum, threadIdx.x | FULL_MASK);
   if (threadIdx.x % 32 == 31) {
     thread_exclusive_prefix_sum = 0;
   }
 
 #pragma unroll
   for (uint32_t offset = 16; offset >= 1; offset /= 2) {
-    T tmp = __shfl_xor_sync(0xffffffff, thread_exclusive_prefix_sum, offset);
+    T tmp = __shfl_xor_sync(FULL_MASK, thread_exclusive_prefix_sum, offset);
     if ((threadIdx.x + 1) % (offset * 2) == 0) {
       thread_exclusive_prefix_sum = tmp + thread_exclusive_prefix_sum;
     }
@@ -150,7 +191,7 @@ __device__ __forceinline__ void DeterministicInclusiveSum(
 
 #pragma unroll
     for (uint32_t offset = 1; offset < 32; offset *= 2) {
-      T tmp = __shfl_up_sync(0xffffffff, warp_exclusive_prefix_sum, offset);
+      T tmp = __shfl_up_sync(FULL_MASK, warp_exclusive_prefix_sum, offset);
       if ((threadIdx.x + 1) % (offset * 2) == 0) {
         warp_exclusive_prefix_sum += tmp;
       }
@@ -162,7 +203,7 @@ __device__ __forceinline__ void DeterministicInclusiveSum(
 
 #pragma unroll
     for (uint32_t offset = 16; offset >= 1; offset /= 2) {
-      T tmp = __shfl_xor_sync(0xffffffff, warp_exclusive_prefix_sum, offset);
+      T tmp = __shfl_xor_sync(FULL_MASK, warp_exclusive_prefix_sum, offset);
       if ((threadIdx.x + 1) % (offset * 2) == 0) {
         warp_exclusive_prefix_sum = tmp + warp_exclusive_prefix_sum;
       }
@@ -196,26 +237,42 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
     prob_greater_than_threshold[j] = (prob_vec[j] > threshold) ? prob_vec[j] : T(0);
     valid[j] = prob_vec[j] > threshold && (i * BLOCK_THREADS + tx) * VEC_SIZE < d;
   }
+
+  #ifdef USE_ROCM
+  T aggregate_local =
+      BlockReduce<T, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce)
+          .template Sum<VEC_SIZE>(prob_greater_than_threshold);
+  #else
   T aggregate_local =
       BlockReduce<T, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce)
           .Sum<VEC_SIZE>(prob_greater_than_threshold);
+  #endif
+
   if (tx == 0) {
     temp_storage->data.block_aggregate.value = aggregate_local;
   }
   __syncthreads();
   aggregate_local = temp_storage->data.block_aggregate.value;
-
   if (aggregate + aggregate_local > u) {
+    #ifdef USE_ROCM
+    if constexpr (false) {
+    #else
     if constexpr (DETERMINISTIC) {
+    #endif
+      // (TODO) yiakwy : fix this function in ROCM platform
       DeterministicInclusiveSum<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, T>(
           prob_greater_than_threshold, inclusive_cdf, temp_storage);
     } else {
+      #ifdef USE_ROCM
+      BlockScan<T, BLOCK_THREADS, SCAN_ALGORITHM>(temp_storage->block_prim.scan)
+          .template InclusiveSum<VEC_SIZE>(prob_greater_than_threshold, inclusive_cdf);
+      #else
       BlockScan<T, BLOCK_THREADS, SCAN_ALGORITHM>(temp_storage->block_prim.scan)
           .InclusiveSum<VEC_SIZE>(prob_greater_than_threshold, inclusive_cdf);
-
-      __syncthreads();
+      #endif
     }
-
+    // NOTE (yiakwy) : sync all threads in a divergent block is dangerous, moved here
+    __syncthreads();
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
       greater_than_u[j] = inclusive_cdf[j] + aggregate > u;
@@ -226,8 +283,16 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
     BlockAdjacentDifference<bool, BLOCK_THREADS>(temp_storage->block_prim.adj_diff)
         .SubtractLeft<VEC_SIZE>(greater_than_u, greater_than_u_diff, BoolDiffOp());
 #else
+
+    #ifdef USE_ROCM
+    // ROCM has deprecated FlagHeads API
+    BlockAdjacentDifference<bool, BLOCK_THREADS>(temp_storage->block_prim.adj_diff)
+        .template SubtractLeft<VEC_SIZE>(greater_than_u, greater_than_u_diff, BoolDiffOp());
+    #else
     BlockAdjacentDifference<bool, BLOCK_THREADS>(temp_storage->block_prim.adj_diff)
         .FlagHeads<VEC_SIZE>(greater_than_u_diff, greater_than_u, BoolDiffOp(), 0);
+    #endif
+    
 #endif
     __syncthreads();
 
@@ -313,7 +378,7 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, DType* uniform_samples,
       if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
         probs_vec.load(probs + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
       }
-
+      // TODO (yiakwy) : kernel corruption here (2)
       DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
                              DETERMINISTIC, DType>(i, d, pivot, u, probs_vec, aggregate,
                                                    &temp_storage);
@@ -339,14 +404,22 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, DType* uniform_samples,
                              (probs_vec[j] > pivot && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
       }
 
+      #ifdef USE_ROCM
+      aggregate_gt_pivot += BlockReduce<Pair<DType>, BLOCK_THREADS, REDUCE_ALGORITHM>(
+                                temp_storage.block_prim.reduce_pair)
+                                .template Sum<VEC_SIZE>(probs_gt_pivot);
+      #else
       aggregate_gt_pivot += BlockReduce<Pair<DType>, BLOCK_THREADS, REDUCE_ALGORITHM>(
                                 temp_storage.block_prim.reduce_pair)
                                 .Sum<VEC_SIZE>(probs_gt_pivot);
+      #endif
+
       if (tx == 0) {
         temp_storage.data.block_aggregate.pair = aggregate_gt_pivot;
       }
       __syncthreads();
     }
+
     q = temp_storage.data.block_aggregate.pair.value;
     if (temp_storage.data.block_aggregate.pair.count < k) {
       break;
@@ -426,8 +499,14 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
         probs_gt_pivot[j] = (probs_vec[j] > pivot) ? probs_vec[j] : DType(0);
       }
 
+      #ifdef USE_ROCM
+      aggregate_gt_pivot += BlockReduce<DType, BLOCK_THREADS>(temp_storage.block_prim.reduce)
+                                .template Sum<VEC_SIZE>(probs_gt_pivot);
+      #else
       aggregate_gt_pivot += BlockReduce<DType, BLOCK_THREADS>(temp_storage.block_prim.reduce)
                                 .Sum<VEC_SIZE>(probs_gt_pivot);
+      #endif
+
       if (tx == 0) {
         temp_storage.data.block_aggregate.value = aggregate_gt_pivot;
       }
@@ -486,8 +565,15 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
       probs_[j] = probs_vec[j];
     }
+
+    #ifdef USE_ROCM
+    max_p = max(max_p, BlockReduce<DType, BLOCK_THREADS>(temp_storage.block_prim.reduce)
+                           .template Reduce<VEC_SIZE>(probs_, cub::Max()));
+    #else
     max_p = max(max_p, BlockReduce<DType, BLOCK_THREADS>(temp_storage.block_prim.reduce)
                            .Reduce<VEC_SIZE>(probs_, cub::Max()));
+    #endif
+
     __syncthreads();
   }
   if (tx == 0) {
@@ -535,8 +621,14 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
         probs_gt_pivot[j] = (probs_vec[j] > pivot) ? probs_vec[j] : DType(0);
       }
 
+      #ifdef USE_ROCM
+      aggregate_gt_pivot += BlockReduce<DType, BLOCK_THREADS>(temp_storage.block_prim.reduce)
+                                .template Sum<VEC_SIZE>(probs_gt_pivot);
+      #else
       aggregate_gt_pivot += BlockReduce<DType, BLOCK_THREADS>(temp_storage.block_prim.reduce)
                                 .Sum<VEC_SIZE>(probs_gt_pivot);
+      #endif
+
       if (tx == 0) {
         temp_storage.data.block_aggregate.value = aggregate_gt_pivot;
       }
@@ -619,9 +711,16 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, DType* uniform_samp
                              (probs_vec[j] > pivot && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
       }
 
+      #ifdef USE_ROCM
+      aggregate_gt_pivot += BlockReduce<Pair<DType>, BLOCK_THREADS, REDUCE_ALGORITHM>(
+                                temp_storage.block_prim.reduce_pair)
+                                .template Sum<VEC_SIZE>(probs_gt_pivot);
+      #else
       aggregate_gt_pivot += BlockReduce<Pair<DType>, BLOCK_THREADS, REDUCE_ALGORITHM>(
                                 temp_storage.block_prim.reduce_pair)
                                 .Sum<VEC_SIZE>(probs_gt_pivot);
+      #endif
+      
       if (tx == 0) {
         temp_storage.data.block_aggregate.pair = aggregate_gt_pivot;
       }
@@ -712,6 +811,7 @@ cudaError_t TopKSamplingFromProb(T* probs, T* uniform_samples, IdType* output, b
                                                    DETERMINISTIC, T, IdType>;
           FLASHINFER_CUDA_CALL(
               cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+              // TODO (yiakwy) : kernel corruption here
           FLASHINFER_CUDA_CALL(
               cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         })});
@@ -844,10 +944,18 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, DType* 
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
       probs_greater_than_pivot[j] = probs_vec[j];
     }
+
+    #ifdef USE_ROCM
+    threadlocal_max_val =
+        max(threadlocal_max_val,
+            BlockReduce<DType, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
+                .template Reduce<VEC_SIZE>(probs_greater_than_pivot, cub::Max()));
+    #else
     threadlocal_max_val =
         max(threadlocal_max_val,
             BlockReduce<DType, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
                 .Reduce<VEC_SIZE>(probs_greater_than_pivot, cub::Max()));
+    #endif
     __syncthreads();
   }
   if (tx == 0) {
@@ -886,9 +994,16 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, DType* 
           max_le_high = max(max_le_high, probs_vec[j]);
         }
       }
+
+      #ifdef USE_ROCM
+      threadlocal_sum +=
+          BlockReduce<DType, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
+              .template Sum<VEC_SIZE>(probs_greater_than_pivot);
+      #else
       threadlocal_sum +=
           BlockReduce<DType, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
               .Sum<VEC_SIZE>(probs_greater_than_pivot);
+      #endif
       __syncthreads();
     }
     min_gt_low = BlockReduce<DType, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
@@ -1009,9 +1124,16 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
             max_le_high = max(max_le_high, logits_vec[j]);
           }
         }
+
+        #ifdef USE_ROCM
+        threadlocal_count_sum +=
+            BlockReduce<int, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce_int)
+                .template Sum<VEC_SIZE>(probs_greater_than_pivot_count);
+        #else
         threadlocal_count_sum +=
             BlockReduce<int, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce_int)
                 .Sum<VEC_SIZE>(probs_greater_than_pivot_count);
+        #endif
         __syncthreads();
       }
       min_gt_low =
@@ -1128,9 +1250,16 @@ __global__ void TopKRenormProbKernel(DType* probs, DType* renormed_prob, IdType*
             max_le_high = max(max_le_high, probs_vec[j]);
           }
         }
+
+        #ifdef USE_ROCM
+        threadlocal_sum += BlockReduce<Pair<DType>, BLOCK_THREADS, REDUCE_ALGORITHM>(
+                               temp_storage.block_prim.reduce_pair)
+                               .template Sum<VEC_SIZE>(probs_greater_than_pivot_pair);
+        #else
         threadlocal_sum += BlockReduce<Pair<DType>, BLOCK_THREADS, REDUCE_ALGORITHM>(
                                temp_storage.block_prim.reduce_pair)
                                .Sum<VEC_SIZE>(probs_greater_than_pivot_pair);
+        #endif
         __syncthreads();
       }
       min_gt_low =
@@ -1311,9 +1440,16 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
       relu_q_minus_p[j] = max(q_vec[j] - p_vec[j], DType(0));
     }
+
+    #ifdef USE_ROCM
+    sum_relu_q_minus_p +=
+        BlockReduce<DType, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
+            .template Sum<VEC_SIZE>(relu_q_minus_p);
+    #else
     sum_relu_q_minus_p +=
         BlockReduce<DType, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
             .Sum<VEC_SIZE>(relu_q_minus_p);
+    #endif
     __syncthreads();
   }
   if (tx == 0) {

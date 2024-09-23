@@ -89,4 +89,17 @@ T __shfl_sync(MaskT mask, T var, int srcLane,
   return __shfl(var, srcLane, width);
 }
 
+template <typename MaskT, typename T>
+__device__ inline
+T __shfl_up_sync(MaskT mask, T var, unsigned int delta,
+                                   int width = __AMDGCN_WAVEFRONT_SIZE) {
+  static_assert(
+      __hip_internal::is_integral<MaskT>::value && sizeof(MaskT) == 8,
+      "The mask must be a 64-bit integer. "
+      "Implicitly promoting a smaller integer is almost always an error.");
+  __hip_adjust_mask_for_wave32(mask);
+  __hip_check_mask(mask);
+  return __shfl_up(var, delta, width);
+}
+
 #endif

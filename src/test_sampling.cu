@@ -1923,6 +1923,7 @@ TEST(FlashInferCorrectnessTests, TestTopPSamplingFromProbFP32) {
   TestTopPSamplingFromProb<float, int32_t>();
 }
 
+
 TEST(FlashInferCorrectnessTests, TestSamplingFromProbOneHotFP32) {
   TestSamplingFromProbOneHot<float, int32_t>();
 }

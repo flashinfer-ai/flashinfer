@@ -22,7 +22,7 @@ if(NOT DEFINED HIP_CMAKE_PATH)
         # Add hip-config.cmake to CMake module search path.
         # set(HIP_CMAKE_PATH "${ROCM_HOME}/share/rocm/cmake" "${ROCM_HOME}/share/rocmcmakebuildtools/cmake/" CACHE PATH "Path to which HIP has been installed")
         # NOTE(yiakwy) : adding ${ROCM_HOME}/lib/cmake/hip has conflicts with 3rdparty/mscclpp
-        set(HIP_CMAKE_PATH "${ROCM_HOME}/lib/cmake/AMDDeviceLibs" "${ROCM_HOME}/lib/cmake/amd_comgr" "${ROCM_HOME}/lib/cmake/hsa-runtime64" CACHE PATH "Path to which HIP has been installed")
+        set(HIP_CMAKE_PATH "${ROCM_HOME}/lib/cmake/AMDDeviceLibs" "${ROCM_HOME}/lib/cmake/amd_comgr" "${ROCM_HOME}/lib/cmake/hsa-runtime64" "${ROCM_HOME}/lib/cmake/hipcub" "${ROCM_HOME}/lib/cmake/composable_kernel" CACHE PATH "Path to which HIP has been installed")
         message(WARNING "System variable HIP_CMAKE_PATH is nonexist, defaults to ${HIP_CMAKE_PATH}")
 
         set(CMAKE_PREFIX_PATH "${ROCM_HOME};${CMAKE_PREFIX_PATH}")
@@ -556,10 +556,19 @@ if (FLASHINFER_SAMPLING)
 
   message(STATUS "Compile sampling kernel tests.")
   file(GLOB_RECURSE TEST_SAMPLING_SRCS ${PROJECT_SOURCE_DIR}/src/test_sampling.cu)
-  add_executable(test_sampling ${TEST_SAMPLING_SRCS})
+
+  set(THIS_BIANRY_LIB "")
+  if (HIP_FOUND)
+    set_source_files_properties(${TEST_SAMPLING_SRCS} PROPERTIES HIP_SOURCE_PROPERTY_FORMAT 1)
+    hip_add_executable(test_sampling ${TEST_SAMPLING_SRCS})
+    # set(THIS_BIANRY_LIB "hipcub")
+  else (HIP_FOUND)
+    add_executable(test_sampling ${TEST_SAMPLING_SRCS})
+  endif()
+
   target_include_directories(test_sampling PRIVATE ${FLASHINFER_INCLUDE_DIR})
   target_include_directories(test_sampling PRIVATE ${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
-  target_link_libraries(test_sampling PRIVATE gtest gtest_main)
+  target_link_libraries(test_sampling PRIVATE gtest gtest_main ${THIS_BIANRY_LIB})
   target_compile_options(test_sampling PRIVATE -Wno-switch-bool)
 
   if (HIP_FOUND)
