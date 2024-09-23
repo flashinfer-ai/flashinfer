@@ -43,7 +43,7 @@ namespace flashinfer {
 #define FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
 #endif
 
-#if USE_ROCM
+#ifdef USE_ROCM
 // TODO(yiakwy) : since roc fp8 is different from NV fp8, more efforts need to port functionalities
 #ifdef FLASHINFER_FP8_ENABLED
 #undef FLASHINFER_FP8_ENABLED

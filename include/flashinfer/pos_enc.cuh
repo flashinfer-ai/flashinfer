@@ -326,7 +326,7 @@ cudaError_t BatchQKApplyRotaryInPlace(DType* __restrict__ q, DType* __restrict__
                       (void*)&smooth_b,
                       (void*)&rope_rcp_scale,
                       (void*)&rope_rcp_theta};
-      #if USE_ROCM
+      #ifdef USE_ROCM
       FLASHINFER_CUDA_CALL(hipLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
       #else
       FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
@@ -374,7 +374,7 @@ cudaError_t BatchQKApplyLlama31RotaryInPlace(
                       (void*)&smooth_b,
                       (void*)&rope_rcp_scale,
                       (void*)&rope_rcp_theta};
-      #if USE_ROCM
+      #ifdef USE_ROCM
       FLASHINFER_CUDA_CALL(hipLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
       #else
       FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
@@ -424,7 +424,7 @@ cudaError_t BatchQKApplyRotary(DType* __restrict__ q, DType* __restrict__ k,
                       (void*)&smooth_b,
                       (void*)&rope_rcp_scale,
                       (void*)&rope_rcp_theta};
-      #if USE_ROCM
+      #ifdef USE_ROCM
       FLASHINFER_CUDA_CALL(hipLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
       #else
       FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
@@ -476,7 +476,7 @@ cudaError_t BatchQKApplyLlama31Rotary(DType* __restrict__ q, DType* __restrict__
                       (void*)&smooth_b,
                       (void*)&rope_rcp_scale,
                       (void*)&rope_rcp_theta};
-      #if USE_ROCM
+      #ifdef USE_ROCM
       FLASHINFER_CUDA_CALL(hipLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
       #else
       FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));

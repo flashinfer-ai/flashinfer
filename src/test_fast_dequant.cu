@@ -57,6 +57,16 @@ void TestFastDequant() {
   }
 }
 
+#ifdef USE_ROCM
+// TODO(yiakwy) : since roc fp8 is different from NV fp8, more efforts need to port functionalities
+#ifdef FLASHINFER_FP8_ENABLED
+#undef FLASHINFER_FP8_ENABLED
+#endif
+
+#endif
+
+#ifdef FLASHINFER_FP8_ENABLED
+
 TEST(FlashInferCorrectnessTest, TestFastDequantCorrectnessE4M3ToFloat16) {
   TestFastDequant<__nv_fp8_e4m3, half>();
 }
@@ -69,3 +79,5 @@ TEST(FlashInferCorrectnessTest, TestFastDequantCorrectnessE4M3ToBFloat16) {
 TEST(FlashInferCorrectnessTest, TestFastDequantCorrectnessE5M2ToBFloat16) {
   TestFastDequant<__nv_fp8_e5m2, __nv_bfloat16>();
 }
+
+#endif

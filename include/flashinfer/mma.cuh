@@ -16,7 +16,7 @@
 #ifndef FLASHINFER_MMA_CUH_
 #define FLASHINFER_MMA_CUH_
 
-#if USE_ROCM
+#ifdef USE_ROCM
 
 #include "flashinfer/hip_cuda_type_utils.h"
 // CUDA API Portable interfaces
