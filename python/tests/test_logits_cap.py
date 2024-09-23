@@ -77,4 +77,4 @@ def test_single_prefill_logits_soft_cap(
 
 if __name__ == "__main__":
     test_single_decode_logits_soft_cap(9, 32, 128, 30.0)
-    test_single_prefill_logits_soft_cap(1, 64, 1, 128, 30.0)
+    test_single_prefill_logits_soft_cap(64, 64, 1, 128, 30.0)

@@ -60,7 +60,6 @@ namespace {
  *   in shared memory of different pipeline stages
  * \param kv_idx A integer indicates the thread-local kv position in kv-cache
  * \param compute_stage_idx A integer indicates the compute stage index in the pipeline
- * \param sm_scale A float indicates the scale applied to pre-softmax logits
  * \param s A float indicates the thread-local result of qk
  * \param st The self-attention state to be updated
  */
@@ -191,7 +190,6 @@ __device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, f
  * \param k [seq_len, num_kv_heads, head_dim] The key matrix in kv-cache
  * \param v [seq_len, num_kv_heads, head_dim] The value matrix in kv-cache
  * \param o [num_qo_heads, head_dim] The output matrix
- * \param sm_scale A float indicates the scale applied to pre-softmax logits
  * \param head_dim A integer indicates the head dimension
  * \param rope_rcp_scale A floating number indicate the reciprocal
  *   of scaling ratio used in PI(Position Interpolation) for RoPE (Rotary

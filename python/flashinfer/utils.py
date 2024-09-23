@@ -37,8 +37,7 @@ class TensorLayout(Enum):
     HND = 1
 
 
-log2e = 1.4426950408889634
-
+log2e = 1.44269504088896340736
 
 def _expand_5d(x: torch.Tensor, kv_layout: str) -> torch.Tensor:
     if not x.ndim in [4, 5]:
@@ -126,7 +125,7 @@ def get_alibi_slopes(n_heads: int) -> torch.Tensor:
         m_hat_0 = 2.0 ** (-4.0 / n)
         m_hat = torch.pow(m_hat_0, torch.arange(1, 1 + 2 * (n_heads - n), 2))
         m = torch.cat([m, m_hat])
-    return m
+    return m.float()
 
 
 _cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}

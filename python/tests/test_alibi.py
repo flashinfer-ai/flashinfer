@@ -58,7 +58,8 @@ def test_single_prefill_alibi(
     if causal and q_len > kv_len:
         pytest.skip("Causal attention requires q_len <= kv_len")
     q = torch.randn(q_len, num_heads, head_dim).to(0).half()
-    k = torch.randn(kv_len, num_heads, head_dim).to(0).half()
+    # k = torch.randn(kv_len, num_heads, head_dim).to(0).half()
+    k = torch.zeros(kv_len, num_heads, head_dim).to(0).half()
     v = torch.randn(kv_len, num_heads, head_dim).to(0).half()
 
     o = flashinfer.single_prefill_with_kv_cache(
@@ -74,5 +75,5 @@ def test_single_prefill_alibi(
 
 
 if __name__ == "__main__":
-    # test_single_decode_alibi(33001, 32, 128)
-    test_single_prefill_alibi(1, 64, 1, 128, False)
+    test_single_decode_alibi(4096, 32, 128)
+    test_single_prefill_alibi(128, 128, 8, 128, False)

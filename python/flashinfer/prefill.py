@@ -261,6 +261,7 @@ def single_prefill_with_kv_cache(
         else:
             mask_mode = MaskMode.NON_CAUSAL.value
 
+    print(q.shape)
     return get_single_prefill_module(
         q.dtype,
         k.dtype,
