@@ -21,6 +21,19 @@
 #define FLASHINFER_FASTDIV_CUH_
 #include <cstdint>
 
+#ifdef USE_ROCM
+
+#include <hip/hip_runtime.h>
+
+// CUDA API Portable interfaces
+#include "flashinfer/hip_defs.h"
+
+#else
+
+#include <cuda_runtime.h>
+
+#endif // USE_ROCM
+
 namespace flashinfer {
 
 struct uint_fastdiv {
