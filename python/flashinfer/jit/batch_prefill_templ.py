@@ -18,7 +18,7 @@ batch_prefill_templ = r"""
 #include <torch/extension.h>
 #include <optional>
 #include <flashinfer/attention/prefill.cuh>
-#include <flashinfer/attention/handler.cuh>
+#include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/attention/prefill_params.cuh>
 #include <flashinfer/attention/variants.cuh>
 #include "pytorch_extension_utils.h"

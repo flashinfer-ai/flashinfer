@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_ATTENTION_HANDLER_CUH_
-#define FLASHINFER_ATTENTION_HANDLER_CUH_
+#ifndef FLASHINFER_ATTENTION_SCHEDULER_CUH_
+#define FLASHINFER_ATTENTION_SCHEDULER_CUH_
 
 #include <cuda_runtime_api.h>
 #include <driver_types.h>
@@ -611,4 +611,4 @@ cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_in_bytes
 }
 
 }  // namespace flashinfer
-#endif  // FLASHINFER_ATTENTION_HANDLER_CUH_
+#endif  // FLASHINFER_ATTENTION_SCHEDULER_CUH_
