@@ -633,6 +633,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._int_workspace_buffer = torch.empty(
             (8 * 1024 * 1024,), dtype=torch.uint8, device=float_workspace_buffer.device
         )
+        self._pin_memory_int_workspace_buffer = torch.empty(
+            self._int_workspace_buffer.shape,
+            dtype=self._int_workspace_buffer.dtype,
+            pin_memory=True,
+        )
         self._use_cuda_graph = use_cuda_graph
         if use_cuda_graph:
             if not torch.is_tensor(qo_indptr_buf):
@@ -893,6 +898,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             num_kv_heads,
             self.is_cuda_graph_enabled 
         )
+        print(self._plan_info)
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode
         self._allow_fp16_qk_reduction = allow_fp16_qk_reduction
@@ -988,14 +994,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._int_workspace_buffer,
             self._plan_info,
             q,
-            paged_kv_cache,
+            *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
             self._custom_mask_buf,
             self._qo_indptr_buf,
             self._paged_kv_indptr_buf,
             self._paged_kv_indices_buf,
             self._paged_kv_last_page_len_buf,
             self._qk_indptr_buf,
-            self._kv_layout,
+            TensorLayout[self._kv_layout].value,
             window_left,
             logits_soft_cap,
             sm_scale,
@@ -1095,14 +1101,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._int_workspace_buffer,
             self._plan_info,
             q,
-            paged_kv_cache,
+            *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
             self._custom_mask_buf,
             self._qo_indptr_buf,
             self._paged_kv_indptr_buf,
             self._paged_kv_indices_buf,
             self._paged_kv_last_page_len_buf,
             self._qk_indptr_buf,
-            self._kv_layout,
+            TensorLayout[self._kv_layout].value,
             window_left,
             logits_soft_cap,
             sm_scale,
@@ -1600,7 +1606,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._qo_indptr_buf,
             self._kv_indptr_buf,
             self._qk_indptr_buf,
-            self._kv_layout,
+            TensorLayout[self._kv_layout].value,
             window_left,
             logits_soft_cap,
             sm_scale,
@@ -1719,7 +1725,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._qo_indptr_buf,
             self._kv_indptr_buf,
             self._qk_indptr_buf,
-            self._kv_layout,
+            TensorLayout[self._kv_layout].value,
             window_left,
             logits_soft_cap,
             sm_scale,

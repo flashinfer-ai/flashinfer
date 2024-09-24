@@ -265,8 +265,8 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("plan", &BatchPrefillWithKVCachePlan, "Plan prefill with ragged KV cache");
-  m.def("ragged_run", &BatchPrefillWithRaggedKVCacheRun, "Run prefill with ragged KV cache");
-  m.def("paged_run", &BatchPrefillWithPagedKVCacheRun, "Run prefill with paged KV cache");
+  m.def("plan", &BatchPrefillWithKVCachePlan);
+  m.def("ragged_run", &BatchPrefillWithRaggedKVCacheRun);
+  m.def("paged_run", &BatchPrefillWithPagedKVCacheRun);
 }
 """

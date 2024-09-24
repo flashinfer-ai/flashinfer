@@ -58,7 +58,7 @@ struct SinglePrefillParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTypeO> {
   float logits_soft_cap;
   float log2_rope_rcp_scale;
   float log2_rope_rcp_theta;
-  uint_fastdiv group_size;
+  uint_fastdiv group_size_fastdiv;
 
   bool partition_kv;
 
@@ -86,7 +86,7 @@ struct SinglePrefillParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTypeO> {
         logits_soft_cap(logits_soft_cap),
         log2_rope_rcp_scale(-std::log2f(rope_scale)),
         log2_rope_rcp_theta(-std::log2f(rope_theta)),
-        group_size(num_qo_heads / num_kv_heads),
+        group_size_fastdiv(num_qo_heads / num_kv_heads),
         partition_kv(false) {}
 
   __host__ __device__ __forceinline__ size_t get_q_elem_offset(uint32_t qo_idx,
@@ -172,6 +172,7 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
         o(o),
         lse(lse),
         alibi_slopes(alibi_slopes),
+        block_valid_mask(nullptr),
         num_qo_heads(num_qo_heads),
         num_kv_heads(num_kv_heads),
         group_size_fastdiv(num_qo_heads / num_kv_heads),
@@ -241,6 +242,7 @@ struct BatchPrefillPagedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DType
         o(o),
         lse(lse),
         alibi_slopes(alibi_slopes),
+        block_valid_mask(nullptr),
         num_qo_heads(num_qo_heads),
         group_size_fastdiv(num_qo_heads / paged_kv.num_heads),
         window_left(window_left),

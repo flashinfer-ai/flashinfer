@@ -2012,14 +2012,6 @@ template <WarpLayout WARP_LAYOUT, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODIN
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(typename AttentionVariant::ParamsT params,
                                                     typename AttentionVariant::DTypeO* tmp_v,
                                                     float* tmp_s, cudaStream_t stream) {
-  // DTypeQ* q, IdType* request_indices, IdType* q_tile_indices, IdType* kv_tile_indices,
-  // IdType* q_indptr, DTypeKV* k, DTypeKV* v, IdType* kv_indptr, uint8_t* custom_mask,
-  // IdType* qk_indptr, IdType* q_offset, IdType* k_rope_pos_offset, IdType* o_indptr, DTypeOut* o,
-  // DTypeOut* tmp_v, float* tmp_s, float* lse, IdType* merge_indptr, bool* block_valid_mask,
-  // IdType* kv_chunk_size_ptr, uint32_t total_num_rows, uint32_t num_qo_heads,
-  // uint32_t padded_batch_size, uint32_t num_kv_heads, uint32_t q_stride_n, uint32_t q_stride_h,
-  // uint32_t kv_stride_n, uint32_t kv_stride_h, int32_t window_left, float logits_soft_cap,
-  // float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream = nullptr) {
   using DTypeQ = typename AttentionVariant::DTypeQ;
   using DTypeKV = typename AttentionVariant::DTypeKV;
   const uint32_t padded_batch_size = params.padded_batch_size;
@@ -2089,34 +2081,6 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(typename AttentionVariant::P
         // do not partition kv
         params.partition_kv = false;
         void* args[] = {(void*)&params};
-        // void* args[] = {(void*)&q,
-        //                 (void*)&request_indices,
-        //                 (void*)&q_tile_indices,
-        //                 (void*)&kv_tile_indices,
-        //                 (void*)&q_indptr,
-        //                 (void*)&k,
-        //                 (void*)&v,
-        //                 (void*)&kv_indptr,
-        //                 (void*)&custom_mask,
-        //                 (void*)&qk_indptr,
-        //                 (void*)&q_offset,
-        //                 (void*)&k_rope_pos_offset,
-        //                 (void*)&o_indptr,
-        //                 (void*)&o,
-        //                 (void*)&lse,
-        //                 (void*)&block_valid_mask,
-        //                 (void*)&kv_chunk_size_ptr,
-        //                 (void*)&partition_kv,
-        //                 (void*)&group_size_fastdiv,
-        //                 (void*)&q_stride_n,
-        //                 (void*)&q_stride_h,
-        //                 (void*)&kv_stride_n,
-        //                 (void*)&kv_stride_h,
-        //                 (void*)&window_left,
-        //                 (void*)&logits_soft_cap,
-        //                 (void*)&sm_scale,
-        //                 (void*)&log2_rope_rcp_scale,
-        //                 (void*)&log2_rope_rcp_theta};
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
       } else {
@@ -2127,34 +2091,6 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(typename AttentionVariant::P
         params.o = tmp_v;
         params.lse = tmp_s;
         void* args[] = {(void*)&params};
-        // void* args[] = {(void*)&q,
-        //                 (void*)&request_indices,
-        //                 (void*)&q_tile_indices,
-        //                 (void*)&kv_tile_indices,
-        //                 (void*)&q_indptr,
-        //                 (void*)&k,
-        //                 (void*)&v,
-        //                 (void*)&kv_indptr,
-        //                 (void*)&custom_mask,
-        //                 (void*)&qk_indptr,
-        //                 (void*)&q_offset,
-        //                 (void*)&k_rope_pos_offset,
-        //                 (void*)&o_indptr,
-        //                 (void*)&tmp_v,
-        //                 (void*)&tmp_s,
-        //                 (void*)&block_valid_mask,
-        //                 (void*)&kv_chunk_size_ptr,
-        //                 (void*)&partition_kv,
-        //                 (void*)&group_size_fastdiv,
-        //                 (void*)&q_stride_n,
-        //                 (void*)&q_stride_h,
-        //                 (void*)&kv_stride_n,
-        //                 (void*)&kv_stride_h,
-        //                 (void*)&window_left,
-        //                 (void*)&logits_soft_cap,
-        //                 (void*)&sm_scale,
-        //                 (void*)&log2_rope_rcp_scale,
-        //                 (void*)&log2_rope_rcp_theta};
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         FLASHINFER_CUDA_CALL(VariableLengthMergeStates(tmp_v, tmp_s, params.merge_indptr, o, lse,
@@ -2171,13 +2107,6 @@ template <WarpLayout WARP_LAYOUT, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODIN
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(typename AttentionVariant::ParamsT params,
                                                    typename AttentionVariant::DTypeO* tmp_v,
                                                    float* tmp_s, cudaStream_t stream) {
-  // DTypeQ* q, IdType* request_indices, IdType* q_tile_indices, IdType* kv_tile_indices,
-  // IdType* q_indptr, IdType* q_offset, paged_kv_t<DTypeKV, IdType> paged_kv,
-  // uint8_t* custom_mask, IdType* qk_indptr, IdType* o_indptr, DTypeOut* o, DTypeOut* tmp_v,
-  // float* tmp_s, float* lse, IdType* merge_indptr, bool* block_valid_mask,
-  // IdType* kv_chunk_size_ptr, uint32_t total_num_rows, uint32_t num_qo_heads,
-  // uint32_t padded_batch_size, int32_t window_left, float logits_soft_cap, float sm_scale,
-  // float rope_scale, float rope_theta, cudaStream_t stream) {
   using DTypeQ = typename AttentionVariant::DTypeQ;
   using DTypeKV = typename AttentionVariant::DTypeKV;
   const uint32_t padded_batch_size = params.padded_batch_size;
@@ -2247,27 +2176,6 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(typename AttentionVariant::Pa
         // do not partition kv
         params.partition_kv = false;
         void* args[] = {(void*)&params};
-        // void* args[] = {(void*)&request_indices,
-        //                 (void*)&q_tile_indices,
-        //                 (void*)&kv_tile_indices,
-        //                 (void*)&q,
-        //                 (void*)&paged_kv,
-        //                 (void*)&q_indptr,
-        //                 (void*)&custom_mask,
-        //                 (void*)&qk_indptr,
-        //                 (void*)&q_offset,
-        //                 (void*)&o_indptr,
-        //                 (void*)&o,
-        //                 (void*)&lse,
-        //                 (void*)&block_valid_mask,
-        //                 (void*)&kv_chunk_size_ptr,
-        //                 (void*)&partition_kv,
-        //                 (void*)&group_size_fastdiv,
-        //                 (void*)&window_left,
-        //                 (void*)&logits_soft_cap,
-        //                 (void*)&sm_scale,
-        //                 (void*)&log2_rope_rcp_scale,
-        //                 (void*)&log2_rope_rcp_theta};
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
       } else {
@@ -2277,27 +2185,6 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(typename AttentionVariant::Pa
         params.o = tmp_v;
         params.lse = tmp_s;
         void* args[] = {(void*)&params};
-        // void* args[] = {(void*)&request_indices,
-        //                 (void*)&q_tile_indices,
-        //                 (void*)&kv_tile_indices,
-        //                 (void*)&q,
-        //                 (void*)&paged_kv,
-        //                 (void*)&q_indptr,
-        //                 (void*)&custom_mask,
-        //                 (void*)&qk_indptr,
-        //                 (void*)&q_offset,
-        //                 (void*)&o_indptr,
-        //                 (void*)&tmp_v,
-        //                 (void*)&tmp_s,
-        //                 (void*)&block_valid_mask,
-        //                 (void*)&kv_chunk_size_ptr,
-        //                 (void*)&partition_kv,
-        //                 (void*)&group_size_fastdiv,
-        //                 (void*)&window_left,
-        //                 (void*)&logits_soft_cap,
-        //                 (void*)&sm_scale,
-        //                 (void*)&log2_rope_rcp_scale,
-        //                 (void*)&log2_rope_rcp_theta};
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         FLASHINFER_CUDA_CALL(VariableLengthMergeStates(tmp_v, tmp_s, params.merge_indptr, o, lse,
