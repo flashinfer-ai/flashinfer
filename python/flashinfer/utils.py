@@ -39,6 +39,7 @@ class TensorLayout(Enum):
 
 log2e = 1.44269504088896340736
 
+
 def _expand_5d(x: torch.Tensor, kv_layout: str) -> torch.Tensor:
     if not x.ndim in [4, 5]:
         raise ValueError("x must be 4D or 5D")
@@ -149,3 +150,14 @@ def _get_cache_alibi_slopes_buf(
         buf = (get_alibi_slopes(num_qo_heads) * log2e).to(device)
         _cache_buf[key] = buf
     return buf
+
+
+def canonicalize_torch_dtype(dtype: Union[torch.dtype, str]) -> torch.dtype:
+    if isinstance(dtype, str):
+        return getattr(torch, dtype)
+    elif isinstance(dtype, torch.dtype):
+        return dtype
+    else:
+        raise TypeError(
+            "dtype must be a string or torch.dtype, got {}".format(type(dtype))
+        )

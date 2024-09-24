@@ -356,26 +356,17 @@ cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
 }
 
 template <typename IdType>
-std::tuple<bool, uint32_t, uint32_t, uint32_t, WarpLayout, uint32_t, uint32_t, std::vector<IdType>,
+std::tuple<bool, uint32_t, uint32_t, WarpLayout, uint32_t, uint32_t, std::vector<IdType>,
            std::vector<IdType>, std::vector<IdType>, std::vector<IdType>, std::vector<IdType>>
 PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t batch_size,
                        uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
-                       uint32_t page_size) {
+                       uint32_t page_size, uint32_t max_grid_size) {
   std::vector<IdType> request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr;
   merge_indptr.push_back(0);
   o_indptr.push_back(0);
 
   const uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
   uint32_t total_num_rows = qo_indptr_h[batch_size];
-
-  // step 0: get the number of SMs
-  int num_sm = 0;
-  int dev_id = 0;
-  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
-  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
-  int num_blocks_per_sm = 2;
-  int max_grid_size = num_blocks_per_sm * num_sm;
-  uint32_t split_max_batch_size = max_grid_size / num_kv_heads;
 
   // step 1: compute qo_chunk_size
   std::vector<int64_t> packed_qo_len_arr(batch_size), kv_len_arr(batch_size);
@@ -438,7 +429,6 @@ PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t batch_
   kv_chunk_size *= page_size;
 
   return {split_kv,
-          split_max_batch_size,
           total_num_tiles_q,
           new_batch_size,
           warp_layout,
@@ -466,6 +456,63 @@ struct PrefillPlanInfo {
   int64_t block_valid_mask_offset;
   bool enable_cuda_graph;
   bool split_kv;
+
+  PrefillPlanInfo()
+      : padded_batch_size(0),
+        total_num_rows(0),
+        warp_layout_code(0),
+        request_indices_offset(0),
+        qo_tile_indices_offset(0),
+        kv_tile_indices_offset(0),
+        merge_indptr_offset(0),
+        o_indptr_offset(0),
+        kv_chunk_size_ptr_offset(0),
+        v_offset(0),
+        s_offset(0),
+        block_valid_mask_offset(0),
+        enable_cuda_graph(false),
+        split_kv(false) {}
+
+  // convert PrefillPlanInfo to std::vector<int64_t>
+  std::vector<int64_t> ToVector() const {
+    return {padded_batch_size,
+            total_num_rows,
+            warp_layout_code,
+            request_indices_offset,
+            qo_tile_indices_offset,
+            kv_tile_indices_offset,
+            merge_indptr_offset,
+            o_indptr_offset,
+            kv_chunk_size_ptr_offset,
+            v_offset,
+            s_offset,
+            block_valid_mask_offset,
+            enable_cuda_graph,
+            split_kv};
+  }
+
+  // From std::vector<int64_t> to PrefillPlanInfo
+  void FromVector(const std::vector<int64_t>& vec) {
+    if (vec.size() != 14) {
+      std::ostringstream err_msg;
+      err_msg << "PrefillPlanInfo::FromVector: vec.size() should be 14, but got " << vec.size();
+      throw std::invalid_argument(err_msg.str());
+    }
+    padded_batch_size = vec[0];
+    total_num_rows = vec[1];
+    warp_layout_code = vec[2];
+    request_indices_offset = vec[3];
+    qo_tile_indices_offset = vec[4];
+    kv_tile_indices_offset = vec[5];
+    merge_indptr_offset = vec[6];
+    o_indptr_offset = vec[7];
+    kv_chunk_size_ptr_offset = vec[8];
+    v_offset = vec[9];
+    s_offset = vec[10];
+    block_valid_mask_offset = vec[11];
+    enable_cuda_graph = vec[12];
+    split_kv = vec[13];
+  }
 };
 
 template <typename DTypeOut, typename IdType>
@@ -481,11 +528,22 @@ cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_in_bytes
             << num_kv_heads;
     throw std::invalid_argument(err_msg.str());
   }
-  auto [split_kv, split_max_batch_size, total_num_tiles_q, new_batch_size, warp_layout,
+
+  // step 0: get the number of SMs
+  int num_sm = 0;
+  int dev_id = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
+  int num_blocks_per_sm = 2;
+  int max_grid_size = num_blocks_per_sm * num_sm;
+  uint32_t split_max_batch_size = max_grid_size / num_kv_heads;
+
+  // step 2: determine kv_chunk_size
+  auto [split_kv, total_num_tiles_q, new_batch_size, warp_layout,
         kv_chunk_size, total_num_rows, request_indices_vec, qo_tile_indices_vec,
         kv_tile_indices_vec, merge_indptr_vec, o_indptr_vec] =
       PrefillSplitQOKVIndptr(qo_indptr_h, kv_indptr_h, batch_size, num_qo_heads, num_kv_heads,
-                             head_dim, page_size);
+                             head_dim, page_size, max_grid_size);
   const uint32_t qo_tile_size = get_num_rows_per_cta(warp_layout);
   plan_info.warp_layout_code = static_cast<int64_t>(warp_layout);
   plan_info.total_num_rows = total_num_rows;

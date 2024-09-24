@@ -24,12 +24,7 @@ single_prefill_templ = r"""
 
 using namespace flashinfer;
 
-{% if mask_mode == 0 %}
-    {% set use_custom_mask = "true" %}
-{% else %}
-    {% set use_custom_mask = "false" %}
-{% endif %}
-
+{% set use_custom_mask = "true" if mask_mode == 0 else "false" %}
 using ParamsT = SinglePrefillParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}>;
 using AttentionVariant = ComposedAttention<ParamsT, get_variant_code({{ use_custom_mask }}, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, {{ use_alibi }})>;
 

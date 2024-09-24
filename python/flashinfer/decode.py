@@ -18,21 +18,6 @@ import math
 from typing import Optional, Union, Dict, Tuple
 import torch
 
-# mypy: disable-error-code="attr-defined"
-# try:
-#     from . import _decode
-#     from . import _prefill
-# except ImportError as e:
-#     import os
-#     import logging
-
-#     if os.environ.get("BUILD_DOC", "0") == "1":
-#         _decode = None
-#         _prefill = None
-#         logging.warning("Kernels are not loaded in documentation build mode.")
-#     else:
-#         raise e
-
 from .jit import (
     load_cuda_ops,
     FLASHINFER_GEN_SRC_DIR,
@@ -49,7 +34,7 @@ from .utils import (
     _check_kv_layout,
     _unpack_paged_kv_cache,
     _get_cache_buf,
-    _get_cache_alibi_slopes_buf
+    _get_cache_alibi_slopes_buf,
 )
 
 
@@ -78,17 +63,6 @@ def compile_batch_decode_module(
         verbose=verbose,
     )
 
-# compile_batch_decode_module(
-#     torch.float16,
-#     torch.float16,
-#     torch.float16,
-#     torch.int32,
-#     128,
-#     PosEncodingMode.NONE.value,
-#     False,
-#     False,
-#     False, 
-# )
 
 _single_decode_modules = {}
 _batch_decode_modules = {}
@@ -216,7 +190,9 @@ def single_decode_with_kv_cache(
 
     if use_tensor_cores:
         # TODO(Zihao): fix this
-        raise NotImplementedError("Tensor cores is not supported in single_decode_with_kv_cache")
+        raise NotImplementedError(
+            "Tensor cores is not supported in single_decode_with_kv_cache"
+        )
     else:
         out = get_single_decode_module(
             q.dtype,
@@ -460,7 +436,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
         """
         self._float_workspace_buffer = float_workspace_buffer
         self._int_workspace_buffer = int_workspace_buffer
-        self._pin_memory_int_workspace_buffer = torch.empty(self._int_workspace_buffer.shape, pin_memory=True)
+        self._pin_memory_int_workspace_buffer = torch.empty(
+            self._int_workspace_buffer.shape,
+            dtype=self._int_workspace_buffer.dtype,
+            pin_memory=True,
+        )
 
     def plan(
         self,
@@ -598,10 +578,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 batch_size,
                 num_qo_heads,
                 num_kv_heads,
-                head_dim,
                 page_size,
-                logits_soft_cap,
-                self.is_cuda_graph_enabled
+                self.is_cuda_graph_enabled,
             )
 
         self._pos_encoding_mode = pos_encoding_mode
@@ -700,7 +678,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             rope_theta = 1e4
 
         if self.use_tensor_cores:
-            raise NotImplementedError("Tensor cores is not supported in batch_decode_with_paged_kv_cache")
+            raise NotImplementedError(
+                "Tensor cores is not supported in batch_decode_with_paged_kv_cache"
+            )
             """
             out = self._wrapper.run(
                 q,
@@ -837,7 +817,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if rope_theta is None:
             rope_theta = 1e4
         if self.use_tensor_cores:
-            raise NotImplementedError("Tensor cores is not supported in batch_decode_with_paged_kv_cache")
+            raise NotImplementedError(
+                "Tensor cores is not supported in batch_decode_with_paged_kv_cache"
+            )
             """
             V, s = self._wrapper.run(
                 q,

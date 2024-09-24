@@ -1038,7 +1038,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
     const uint32_t qo_len = params.qo_len;
     const uint32_t kv_len = params.kv_len;
     const bool partition_kv = params.partition_kv;
-    const uint_fastdiv group_size = params.group_size;
+    const uint_fastdiv group_size = params.group_size_fastdiv;
     const uint32_t q_stride_n = params.q_stride_n;
     const uint32_t q_stride_h = params.q_stride_h;
     const uint32_t kv_stride_n = params.kv_stride_n;
@@ -1425,7 +1425,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
     using IdType = typename AttentionVariant::IdType;
     DTypeQ* q = params.q;
     IdType* request_indices = params.request_indices;
-    IdType* q_tile_indices = params.q_tile_indices;
+    IdType* qo_tile_indices = params.qo_tile_indices;
     IdType* kv_tile_indices = params.kv_tile_indices;
     IdType* q_indptr = params.q_indptr;
     IdType* kv_indptr = params.kv_indptr;
@@ -1438,7 +1438,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
     float* lse = params.lse;
     bool* block_valid_mask = params.block_valid_mask;
     const bool partition_kv = params.partition_kv;
-    const uint_fastdiv group_size = params.group_size;
+    const uint_fastdiv group_size = params.group_size_fastdiv;
     const uint32_t q_stride_n = params.q_stride_n;
     const uint32_t q_stride_h = params.q_stride_h;
     const uint32_t kv_stride_n = params.kv_stride_n;
@@ -1459,7 +1459,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
       return;
     }
     const uint32_t num_kv_heads = gridDim.z, num_qo_heads = group_size * num_kv_heads;
-    const uint32_t request_idx = request_indices[bx], qo_tile_idx = q_tile_indices[bx],
+    const uint32_t request_idx = request_indices[bx], qo_tile_idx = qo_tile_indices[bx],
                    kv_tile_idx = kv_tile_indices[bx];
     constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps_x * 16;
     const uint32_t qo_len = q_indptr[request_idx + 1] - q_indptr[request_idx],
@@ -1622,13 +1622,12 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
           group_size, s_frag);
 
       // apply mask
-      if constexpr (MASK_MODE == MaskMode::kCustom ||
-                    (iter >= mask_iteration || iter < window_iteration)) {
+      if (MASK_MODE == MaskMode::kCustom || (iter >= mask_iteration || iter < window_iteration)) {
         logits_mask<MASK_MODE, num_frags_x, num_frags_y, num_frags_z, AttentionVariant>(
             params, /*batch_idx=*/request_idx, qo_packed_idx_base,
             chunk_start + (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) *
                               num_frags_z * 16,
-            qo_len, kv_len, window_left, chunk_end, group_size, s_frag);
+            qo_len, kv_len, chunk_end, group_size, s_frag);
       }
 
       // compute m,d states in online softmax
@@ -1716,7 +1715,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
     using DTypeOut = typename AttentionVariant::DTypeO;
     using IdType = typename AttentionVariant::IdType;
     IdType* request_indices = params.request_indices;
-    IdType* q_tile_indices = params.q_tile_indices;
+    IdType* qo_tile_indices = params.qo_tile_indices;
     IdType* kv_tile_indices = params.kv_tile_indices;
     DTypeQ* q = params.q;
     paged_kv_t<DTypeKV, IdType> paged_kv = params.paged_kv;
@@ -1727,7 +1726,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
     float* lse = params.lse;
     bool* block_valid_mask = params.block_valid_mask;
     const bool partition_kv = params.partition_kv;
-    const uint_fastdiv group_size = params.group_size;
+    const uint_fastdiv group_size = params.group_size_fastdiv;
     const int32_t maybe_window_left = params.window_left;
     const float log2_rope_rcp_scale = params.log2_rope_rcp_scale;
     const float log2_rope_rcp_theta = params.log2_rope_rcp_theta;
@@ -1744,7 +1743,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
     }
     const uint32_t num_kv_heads = gridDim.z, num_qo_heads = num_kv_heads * group_size;
 
-    const uint32_t request_idx = request_indices[bx], qo_tile_idx = q_tile_indices[bx],
+    const uint32_t request_idx = request_indices[bx], qo_tile_idx = qo_tile_indices[bx],
                    kv_tile_idx = kv_tile_indices[bx];
     constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps_x * 16;
     const uint32_t qo_len = q_indptr[request_idx + 1] - q_indptr[request_idx],
@@ -1936,7 +1935,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
             params, /*batch_idx=*/request_idx, qo_packed_idx_base,
             chunk_start + (iter * num_warps_z + get_warp_idx_z<num_warps_x, num_warps_z>()) *
                               num_frags_z * 16,
-            qo_len, kv_len, window_left, chunk_end, group_size, s_frag);
+            qo_len, kv_len, chunk_end, group_size, s_frag);
       }
 
       // compute m,d states in online softmax
@@ -2183,7 +2182,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(typename AttentionVariant::Pa
   using DTypeKV = typename AttentionVariant::DTypeKV;
   const uint32_t padded_batch_size = params.padded_batch_size;
   const uint32_t num_qo_heads = params.num_qo_heads;
-  const uint32_t num_kv_heads = params.num_kv_heads;
+  const uint32_t num_kv_heads = params.paged_kv.num_heads;
   const uint32_t total_num_rows = params.total_num_rows;
   constexpr uint32_t num_frags_x = get_num_frags_x<WARP_LAYOUT>();
   constexpr uint32_t num_warps_x = get_num_warps_x<WARP_LAYOUT>();

@@ -121,11 +121,13 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
   using IdType = IdType_;
 
   IdType* request_indices;
-  IdType* q_tile_indices;
+  IdType* qo_tile_indices;
   IdType* kv_tile_indices;
-  IdType* q_indptr;
+  IdType* merge_indptr;
+  IdType* o_indptr;
   DTypeKV* k;
   DTypeKV* v;
+  IdType* q_indptr;
   IdType* kv_indptr;
   uint8_t* custom_mask;
   IdType* qk_indptr;
@@ -135,8 +137,12 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
   float* lse;
   float* alibi_slopes;
   bool* block_valid_mask;
-  uint32_t* kv_chunk_size_ptr;
+  IdType* kv_chunk_size_ptr;
+  uint32_t total_num_rows;
+  uint32_t padded_batch_size;
   bool partition_kv;
+  uint32_t num_qo_heads;
+  uint32_t num_kv_heads;
   uint_fastdiv group_size_fastdiv;
   uint32_t q_stride_n;
   uint32_t q_stride_h;
@@ -148,9 +154,10 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
   float log2_rope_rcp_scale;
   float log2_rope_rcp_theta;
 
-  __host__ BatchPrefillRaggedParams(DTypeQ* q, IdType* q_indptr, DTypeKV* k, DTypeKV* v,
-                                    IdType* kv_indptr, uint8_t* custom_mask, IdType* qk_indptr,
-                                    DTypeO* o, float* lse, float* alibi_slopes, uint32_t group_size,
+  __host__ BatchPrefillRaggedParams(DTypeQ* q, DTypeKV* k, DTypeKV* v, uint8_t* custom_mask,
+                                    IdType* q_indptr, IdType* kv_indptr, IdType* qk_indptr,
+                                    DTypeO* o, float* lse, float* alibi_slopes,
+                                    uint32_t num_qo_heads, uint32_t num_kv_heads,
                                     uint32_t q_stride_n, uint32_t q_stride_h, uint32_t kv_stride_n,
                                     uint32_t kv_stride_h, int32_t window_left,
                                     float logits_soft_cap, float sm_scale, float rope_scale,
@@ -165,7 +172,9 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
         o(o),
         lse(lse),
         alibi_slopes(alibi_slopes),
-        group_size_fastdiv(group_size),
+        num_qo_heads(num_qo_heads),
+        num_kv_heads(num_kv_heads),
+        group_size_fastdiv(num_qo_heads / num_kv_heads),
         q_stride_n(q_stride_n),
         q_stride_h(q_stride_h),
         kv_stride_n(kv_stride_n),
@@ -174,7 +183,7 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
         logits_soft_cap(logits_soft_cap),
         log2_rope_rcp_scale(-std::log2f(rope_scale)),
         log2_rope_rcp_theta(-std::log2f(rope_theta)) {}
-    
+
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];
   }
@@ -182,28 +191,36 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
   __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
     return kv_indptr[batch_idx + 1] - kv_indptr[batch_idx];
   }
+
+  __host__ __device__ __forceinline__ uint32_t get_mask_offset(uint32_t batch_idx, uint32_t qo_idx,
+                                                               uint32_t kv_idx) const {
+    return qk_indptr[batch_idx] + qo_idx * get_kv_len(batch_idx) + kv_idx;
+  }
 };
 
-template <typename DTypeQ, typename DTypeKV, typename DTypeO,
-          typename IdType_>
+template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType_>
 struct BatchPrefillPagedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTypeO> {
   using IdType = IdType_;
 
   IdType* request_indices;
-  IdType* q_tile_indices;
+  IdType* qo_tile_indices;
   IdType* kv_tile_indices;
+  IdType* merge_indptr;
+  IdType* o_indptr;
   paged_kv_t<DTypeKV, IdType> paged_kv;
   IdType* q_indptr;
   uint8_t* custom_mask;
   IdType* qk_indptr;
   IdType* q_offset;
-  IdType* o_indptr;
   DTypeO* o;
   float* lse;
   float* alibi_slopes;
   bool* block_valid_mask;
-  uint32_t* kv_chunk_size_ptr;
+  IdType* kv_chunk_size_ptr;
+  uint32_t total_num_rows;
+  uint32_t padded_batch_size;
   bool partition_kv;
+  uint32_t num_qo_heads;
   uint_fastdiv group_size_fastdiv;
   int32_t window_left;
   float logits_soft_cap;
@@ -211,28 +228,37 @@ struct BatchPrefillPagedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DType
   float log2_rope_rcp_scale;
   float log2_rope_rcp_theta;
 
-  __host__ BatchPrefillPagedParams(DTypeQ* q, IdType* q_indptr, paged_kv_t<DTypeKV, IdType> paged_kv,
-    uint8_t* custom_mask, IdType* qk_indptr, DTypeO* o, float* lse, uint32_t num_qo_heads, int32_t window_left, float logits_soft_cap,
-    float sm_scale, float rope_scale, float rope_theta):
-    PrefillParamsBase<DTypeQ, DTypeKV, DTypeO>{q, custom_mask, o, lse, sm_scale},
-    q_indptr(q_indptr),
-    paged_kv(paged_kv),
-    custom_mask(custom_mask),
-    qk_indptr(qk_indptr),
-    o(o),
-    lse(lse),
-    group_size_fastdiv(num_qo_heads / paged_kv.num_heads),
-    window_left(window_left),
-    logits_soft_cap(logits_soft_cap),
-    log2_rope_rcp_scale(-std::log2f(rope_scale)),
-    log2_rope_rcp_theta(-std::log2f(rope_theta)) {}
-  
+  __host__ BatchPrefillPagedParams(DTypeQ* q, paged_kv_t<DTypeKV, IdType> paged_kv,
+                                   uint8_t* custom_mask, IdType* q_indptr, IdType* qk_indptr,
+                                   DTypeO* o, float* lse, float* alibi_slopes, uint32_t num_qo_heads,
+                                   int32_t window_left, float logits_soft_cap, float sm_scale,
+                                   float rope_scale, float rope_theta)
+      : PrefillParamsBase<DTypeQ, DTypeKV, DTypeO>{q, custom_mask, o, lse, sm_scale},
+        paged_kv(paged_kv),
+        custom_mask(custom_mask),
+        q_indptr(q_indptr),
+        qk_indptr(qk_indptr),
+        o(o),
+        lse(lse),
+        alibi_slopes(alibi_slopes),
+        num_qo_heads(num_qo_heads),
+        group_size_fastdiv(num_qo_heads / paged_kv.num_heads),
+        window_left(window_left),
+        logits_soft_cap(logits_soft_cap),
+        log2_rope_rcp_scale(-std::log2f(rope_scale)),
+        log2_rope_rcp_theta(-std::log2f(rope_theta)) {}
+
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];
   }
 
   __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
     return paged_kv.get_length(batch_idx);
+  }
+
+  __host__ __device__ __forceinline__ uint32_t get_mask_offset(uint32_t batch_idx, uint32_t qo_idx,
+                                                               uint32_t kv_idx) const {
+    return qk_indptr[batch_idx] + qo_idx * get_kv_len(batch_idx) + kv_idx;
   }
 };
 

@@ -33,18 +33,8 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
     torch::Tensor page_locked_int_workspace_buffer,
     torch::Tensor indptr,
     torch::Tensor last_page_len, unsigned int batch_size, unsigned int num_qo_heads,
-    unsigned int num_kv_heads, unsigned int head_dim, unsigned int page_size,
-    float logits_soft_cap, bool enable_cuda_graph) {
-  CHECK_INPUT(float_workspace_buffer);
-  CHECK_INPUT(int_workspace_buffer);
-  // NOTE(zihao): not necessary to be CUDA tensor
-  CHECK_CONTIGUOUS(indptr);
-  CHECK_CONTIGUOUS(last_page_len);
-  CHECK_DIM(1, indptr);
-  CHECK_DIM(1, last_page_len);
-  CHECK_DIM(1, float_workspace_buffer);
-  CHECK_DIM(1, int_workspace_buffer);
-  CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
+    unsigned int num_kv_heads, unsigned int page_size,
+    bool enable_cuda_graph) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =
@@ -53,8 +43,6 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   indptr = indptr.to(torch::kCPU);
   last_page_len = last_page_len.to(torch::kCPU);
-
-  TORCH_CHECK(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
 
   DecodePlanInfo plan_info;
 
@@ -89,48 +77,12 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
   DecodePlanInfo plan_info;
   plan_info.FromVector(plan_info_vec);
   QKVLayout kv_layout = static_cast<QKVLayout>(kv_layout_code);
-  CHECK_INPUT(q);
   bool paged_kv_defined = paged_kv_cache.has_value();
-  if (paged_kv_defined) {
-    CHECK_INPUT(paged_kv_cache.value());
-  } else {
-    CHECK_INPUT(paged_k_cache.value());
-    CHECK_INPUT(paged_v_cache.value());
-  }
-  CHECK_INPUT(paged_kv_indptr);
-  CHECK_INPUT(paged_kv_indices);
-  CHECK_INPUT(paged_kv_last_page_len);
   auto device = q.device();
-  if (paged_kv_defined) {
-    CHECK_EQ(paged_kv_cache->device(), device);
-  } else {
-    CHECK_EQ(paged_k_cache->device(), device);
-    CHECK_EQ(paged_v_cache->device(), device);
-  }
-  CHECK_EQ(paged_kv_indices.device(), device);
-  CHECK_EQ(paged_kv_indptr.device(), device);
-  CHECK_EQ(paged_kv_last_page_len.device(), device);
-  CHECK_DIM(3, q);                       // (B, H_qo, D)
-  CHECK_DIM(1, paged_kv_last_page_len);  // (B,)
-  CHECK_DIM(1, paged_kv_indptr);         // (B+1,)
-  CHECK_DIM(1, paged_kv_indices);        // (nnz,)
-  if (paged_kv_defined) {
-    // (num_max_pages, 2, H_kv, page_size, head_dim) for HND
-    // (num_max_pages, 2, page_size, H_kv, head_dim) for NHD
-    CHECK_DIM(5, paged_kv_cache.value());
-  } else {
-    // (num_max_pages, H_kv, page_size, head_dim) for HND
-    // (num_max_pages, page_size, H_kv, head_dim) for NHD
-    CHECK_DIM(4, paged_k_cache.value());
-    CHECK_DIM(4, paged_v_cache.value());
-  }
   int64_t batch_size = q.size(0);
   int64_t num_qo_heads = q.size(1);
-  int64_t head_dim = q.size(2);
   int64_t num_kv_heads, page_size;
   if (paged_kv_defined) {
-    CHECK_EQ(paged_kv_cache->size(1), 2);
-    CHECK_EQ(paged_kv_cache->size(4), head_dim);
     if (kv_layout == QKVLayout::kHND) {
       num_kv_heads = paged_kv_cache->size(2);
       page_size = paged_kv_cache->size(3);
@@ -139,8 +91,6 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
       num_kv_heads = paged_kv_cache->size(3);
     }
   } else {
-    CHECK_EQ(paged_k_cache->size(3), head_dim);
-    CHECK_EQ(paged_v_cache->size(3), head_dim);
     if (kv_layout == QKVLayout::kHND) {
       num_kv_heads = paged_k_cache->size(1);
       page_size = paged_k_cache->size(2);
@@ -149,9 +99,6 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
       num_kv_heads = paged_k_cache->size(2);
     }
   }
-  CHECK_GE(paged_kv_indptr.size(0), batch_size + 1);
-  CHECK_GE(paged_kv_last_page_len.size(0), batch_size);
-  CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
 
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   torch::Tensor o = torch::empty_like(q);
@@ -166,7 +113,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
   void* int_buffer = static_cast<void*>(int_workspace_buffer.data_ptr());
 
   paged_kv_t<{{ dtype_kv }}, {{ dtype_idx }}> paged_kv(
-      num_kv_heads, page_size, head_dim,
+      num_kv_heads, page_size, {{ head_dim }},
       batch_size, kv_layout,
       static_cast<{{ dtype_kv }}*>(paged_kv_cache.has_value() ? paged_kv_cache->data_ptr()
                                                           : nullptr),

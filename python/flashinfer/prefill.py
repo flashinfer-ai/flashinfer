@@ -19,28 +19,13 @@ from typing import Optional, Dict, Tuple, Union
 import torch
 import logging
 
-# mypy: disable-error-code="attr-defined"
-# try:
-#     from . import _prefill
-# except ImportError as e:
-#     import os
-#     import logging
-
-#     if os.environ.get("BUILD_DOC", "0") == "1":
-#         _prefill = None
-#         logging.warning("Kernels are not loaded in documentation build mode.")
-#     else:
-#         raise e
-
 from .jit import (
     load_cuda_ops,
     FLASHINFER_GEN_SRC_DIR,
     gen_single_prefill_cu,
     get_single_prefill_uri,
-    gen_batch_prefill_ragged_cu,
-    get_batch_prefill_ragged_uri,
-    gen_batch_prefill_paged_cu,
-    get_batch_prefill_paged_uri,
+    gen_batch_prefill_cu,
+    get_batch_prefill_uri,
 )
 from .utils import (
     PosEncodingMode,
@@ -50,6 +35,7 @@ from .utils import (
     _check_kv_layout,
     _unpack_paged_kv_cache,
     is_float8,
+    canonicalize_torch_dtype,
     _get_cache_buf,
     _get_cache_alibi_slopes_buf,
 )
@@ -69,35 +55,20 @@ def compile_single_prefill_module(
     )
 
 
-def compile_batch_prefill_ragged_module(
+def compile_batch_prefill_module(
     *args,
     verbose: bool = False,
 ):
-    gen_batch_prefill_ragged_cu(*args)
-    uri = get_batch_prefill_ragged_uri(*args)
+    gen_batch_prefill_cu(*args)
+    uri = get_batch_prefill_uri(*args)
     return load_cuda_ops(
         uri,
         [FLASHINFER_GEN_SRC_DIR / f"{uri}.cu"],
         verbose=verbose,
     )
-
-
-def compile_batch_prefill_paged_module(
-    *args,
-    verbose: bool = False,
-):
-    gen_batch_prefill_paged_cu(*args)
-    uri = get_batch_prefill_paged_uri(*args)
-    return load_cuda_ops(
-        uri,
-        [FLASHINFER_GEN_SRC_DIR / f"{uri}.cu"],
-        verbose=verbose,
-    )
-
 
 _single_prefill_modules = {}
-_batch_prefill_ragged_modules = {}
-_batch_prefill_paged_modules = {}
+_batch_prefill_modules = {}
 
 
 def get_single_prefill_module(*args):
@@ -107,18 +78,11 @@ def get_single_prefill_module(*args):
     return _single_prefill_modules[args]
 
 
-def get_batch_prefill_ragged_module(*args):
-    global _batch_prefill_ragged_modules
-    if args not in _batch_prefill_ragged_modules:
-        _batch_prefill_ragged_modules[args] = compile_batch_prefill_ragged_module(*args)
-    return _batch_prefill_ragged_modules[args]
-
-
-def get_batch_prefill_page_module(*args):
-    global _batch_prefill_paged_modules
-    if args not in _batch_prefill_paged_modules:
-        _batch_prefill_paged_modules[args] = compile_batch_prefill_paged_module(*args)
-    return _batch_prefill_paged_modules[args]
+def get_batch_prefill_module(*args):
+    global _batch_prefill_modules
+    if args not in _batch_prefill_modules:
+        _batch_prefill_modules[args] = compile_batch_prefill_module(*args)
+    return _batch_prefill_modules[args]
 
 
 def single_prefill_with_kv_cache(
@@ -252,7 +216,7 @@ def single_prefill_with_kv_cache(
         packed_custom_mask = packbits(
             custom_mask.contiguous().view(-1), bitorder="little"
         )
-    
+
     if packed_custom_mask is not None:
         mask_mode = MaskMode.CUSTOM.value
     else:
@@ -261,7 +225,6 @@ def single_prefill_with_kv_cache(
         else:
             mask_mode = MaskMode.NON_CAUSAL.value
 
-    print(q.shape)
     return get_single_prefill_module(
         q.dtype,
         k.dtype,
@@ -272,7 +235,7 @@ def single_prefill_with_kv_cache(
         window_left >= 0,  # use_sliding_window
         logits_soft_cap > 0,  # use_logits_soft_cap
         pos_encoding_mode == "ALIBI",  # use_alibi
-        allow_fp16_qk_reduction
+        allow_fp16_qk_reduction,
     ).run(
         q,
         k,
@@ -287,7 +250,9 @@ def single_prefill_with_kv_cache(
         rope_scale,
         rope_theta,
         False,  # return lse
-    )[0]
+    )[
+        0
+    ]
 
 
 def single_prefill_with_kv_cache_return_lse(
@@ -668,10 +633,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._int_workspace_buffer = torch.empty(
             (8 * 1024 * 1024,), dtype=torch.uint8, device=float_workspace_buffer.device
         )
-        self._wrapper = _prefill.BatchPrefillWithPagedKVCachePyTorchWrapper(
-            TensorLayout[kv_layout].value,
-            use_cuda_graph,
-        )
+        self._use_cuda_graph = use_cuda_graph
         if use_cuda_graph:
             if not torch.is_tensor(qo_indptr_buf):
                 raise ValueError(
@@ -711,7 +673,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
-        return self._wrapper.is_cuda_graph_enabled()
+        return self._use_cuda_graph
 
     def reset_workspace_buffer(
         self, float_workspace_buffer: torch.Tensor, int_workspace_buffer: torch.Tensor
@@ -730,8 +692,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         """
         self._float_workspace_buffer = float_workspace_buffer
         self._int_workspace_buffer = int_workspace_buffer
-        self._wrapper.update_page_locked_buffer_size(
-            int_workspace_buffer.numel() * int_workspace_buffer.element_size()
+        self._pin_memory_int_workspace_buffer = torch.empty(
+            self._int_workspace_buffer.shape,
+            dtype=self._int_workspace_buffer.dtype,
+            pin_memory=True,
         )
 
     def plan(
@@ -754,7 +718,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         logits_soft_cap: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
-        q_data_type: str = "float16",
+        q_data_type: Union[str, torch.dtype] = "float16",
+        kv_data_type: Optional[Union[str, torch.dtype]] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -820,8 +785,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             ``1.0``.
         rope_theta : Optional[float]
             The theta used in RoPE, if not provided, will be set to ``1e4``.
-        q_data_type : Optional[Union[str, torch.dtype]]
-            The data type of the query tensor. If None, will be set to torch.float16.
+        q_data_type : Union[str, torch.dtype]
+            The data type of the query tensor, defaults torch.float16.
+        kv_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
 
         Note
         ----
@@ -833,8 +800,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
         is not equal to ``num_kv_heads``, the function will use
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
         """
-        batch_size = len(qo_indptr) - 1
+        q_data_type = canonicalize_torch_dtype(q_data_type)
+        if kv_data_type is None:
+            kv_data_type = q_data_type
+        kv_data_type = canonicalize_torch_dtype(kv_data_type)
 
+        batch_size = len(qo_indptr) - 1
         if custom_mask is not None or packed_custom_mask is not None:
             qk_indptr = _compute_page_qk_indptr(
                 qo_indptr,
@@ -889,25 +860,38 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if packed_custom_mask is not None:
                 self._custom_mask_buf = packed_custom_mask
                 self._qk_indptr_buf = qk_indptr
-        empty_q_data = torch.empty(
-            0,
-            dtype=(
-                getattr(torch, q_data_type)
-                if isinstance(q_data_type, str)
-                else q_data_type
-            ),
+
+        if packed_custom_mask is not None:
+            mask_mode = MaskMode.CUSTOM.value
+        else:
+            if causal:
+                mask_mode = MaskMode.CAUSAL.value
+            else:
+                mask_mode = MaskMode.NON_CAUSAL.value
+
+        self._cached_module = get_batch_prefill_module(
+            q_data_type,
+            kv_data_type,
+            q_data_type,
+            paged_kv_indptr.dtype,
+            head_dim,
+            PosEncodingMode[pos_encoding_mode].value,
+            mask_mode,
+            window_left >= 0,  # use_sliding_window
+            logits_soft_cap > 0,  # use_logits_soft_cap
+            pos_encoding_mode == "ALIBI",  # use_alibi
+            allow_fp16_qk_reduction,
         )
-        self._wrapper.plan(
+        self._plan_info = self._cached_module.plan(
             self._float_workspace_buffer,
             self._int_workspace_buffer,
+            self._pin_memory_int_workspace_buffer,
             qo_indptr,
             paged_kv_indptr,
             batch_size,
             num_qo_heads,
             num_kv_heads,
-            head_dim,
-            page_size,
-            empty_q_data,
+            self.is_cuda_graph_enabled 
         )
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode
@@ -983,15 +967,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
         torch.Tensor
             The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
         """
-        causal = self._causal
-        pos_encoding_mode = self._pos_encoding_mode
-        allow_fp16_qk_reduction = self._allow_fp16_qk_reduction
         window_left = self._window_left
         logits_soft_cap = self._logits_soft_cap
         sm_scale = self._sm_scale
         rope_scale = self._rope_scale
         rope_theta = self._rope_theta
-        _check_pos_encoding_mode(pos_encoding_mode)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         if sm_scale is None:
@@ -1003,43 +983,27 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if rope_theta is None:
             rope_theta = 1e4
 
-        if self._custom_mask_buf is None:
-            out = self._wrapper.run(
-                q,
-                self._qo_indptr_buf,
-                *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
-                self._paged_kv_indptr_buf,
-                self._paged_kv_indices_buf,
-                self._paged_kv_last_page_len_buf,
-                causal,
-                PosEncodingMode[pos_encoding_mode].value,
-                allow_fp16_qk_reduction,
-                window_left,
-                logits_soft_cap,
-                sm_scale,
-                rope_scale,
-                rope_theta,
-                False,  # return LSE
-            )[0]
-        else:
-            out = self._wrapper.run_custom_mask(
-                q,
-                self._qo_indptr_buf,
-                *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
-                self._paged_kv_indptr_buf,
-                self._paged_kv_indices_buf,
-                self._paged_kv_last_page_len_buf,
-                self._custom_mask_buf,
-                self._qk_indptr_buf,
-                PosEncodingMode[pos_encoding_mode].value,
-                allow_fp16_qk_reduction,
-                window_left,
-                logits_soft_cap,
-                sm_scale,
-                rope_scale,
-                rope_theta,
-                False,  # return LSE
-            )[0]
+        out = self._cached_module.paged_run(
+            self._float_workspace_buffer,
+            self._int_workspace_buffer,
+            self._plan_info,
+            q,
+            paged_kv_cache,
+            self._custom_mask_buf,
+            self._qo_indptr_buf,
+            self._paged_kv_indptr_buf,
+            self._paged_kv_indices_buf,
+            self._paged_kv_last_page_len_buf,
+            self._qk_indptr_buf,
+            self._kv_layout,
+            window_left,
+            logits_soft_cap,
+            sm_scale,
+            rope_scale,
+            rope_theta,
+            False, # return LSE
+        )[0]
+
         if v_scale is not None:
             out *= v_scale
         return out
@@ -1110,15 +1074,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The logsumexp of attention output, shape:
             ``[qo_indptr[-1], num_qo_heads, head_dim]``.
         """
-        causal = self._causal
-        pos_encoding_mode = self._pos_encoding_mode
-        allow_fp16_qk_reduction = self._allow_fp16_qk_reduction
         window_left = self._window_left
         logits_soft_cap = self._logits_soft_cap
         sm_scale = self._sm_scale
         rope_scale = self._rope_scale
         rope_theta = self._rope_theta
-        _check_pos_encoding_mode(pos_encoding_mode)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         if sm_scale is None:
@@ -1130,43 +1090,26 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if rope_theta is None:
             rope_theta = 1e4
 
-        if self._custom_mask_buf is None:
-            out, lse = self._wrapper.run(
-                q,
-                self._qo_indptr_buf,
-                *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
-                self._paged_kv_indptr_buf,
-                self._paged_kv_indices_buf,
-                self._paged_kv_last_page_len_buf,
-                causal,
-                PosEncodingMode[pos_encoding_mode].value,
-                allow_fp16_qk_reduction,
-                window_left,
-                logits_soft_cap,
-                sm_scale,
-                rope_scale,
-                rope_theta,
-                True,  # return LSE
-            )
-        else:
-            out, lse = self._wrapper.run_custom_mask(
-                q,
-                self._qo_indptr_buf,
-                *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
-                self._paged_kv_indptr_buf,
-                self._paged_kv_indices_buf,
-                self._paged_kv_last_page_len_buf,
-                self._custom_mask_buf,
-                self._qk_indptr_buf,
-                PosEncodingMode[pos_encoding_mode].value,
-                allow_fp16_qk_reduction,
-                window_left,
-                logits_soft_cap,
-                sm_scale,
-                rope_scale,
-                rope_theta,
-                True,  # return LSE
-            )
+        out, lse = self._cached_module.paged_run(
+            self._float_workspace_buffer,
+            self._int_workspace_buffer,
+            self._plan_info,
+            q,
+            paged_kv_cache,
+            self._custom_mask_buf,
+            self._qo_indptr_buf,
+            self._paged_kv_indptr_buf,
+            self._paged_kv_indices_buf,
+            self._paged_kv_last_page_len_buf,
+            self._qk_indptr_buf,
+            self._kv_layout,
+            window_left,
+            logits_soft_cap,
+            sm_scale,
+            rope_scale,
+            rope_theta,
+            True, # return LSE
+        )
 
         if v_scale is not None:
             out *= v_scale
@@ -1336,10 +1279,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._int_workspace_buffer = torch.empty(
             (8 * 1024 * 1024,), dtype=torch.uint8, device=float_workspace_buffer.device
         )
-        self._wrapper = _prefill.BatchPrefillWithRaggedKVCachePyTorchWrapper(
-            TensorLayout[kv_layout].value,
-            use_cuda_graph,
+        self._pin_memory_int_workspace_buffer = torch.empty(
+            (8 * 1024 * 1024,), dtype=torch.uint8, pin_memory=True
         )
+        self._use_cuda_graph = use_cuda_graph
         if use_cuda_graph:
             if not torch.is_tensor(qo_indptr_buf):
                 raise ValueError(
@@ -1366,7 +1309,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
-        return self._wrapper.is_cuda_graph_enabled()
+        return self._use_cuda_graph
 
     def reset_workspace_buffer(
         self, float_workspace_buffer: torch.Tensor, int_workspace_buffer
@@ -1385,8 +1328,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         """
         self._float_workspace_buffer = float_workspace_buffer
         self._int_workspace_buffer = int_workspace_buffer
-        self._wrapper.update_page_locked_buffer_size(
-            int_workspace_buffer.numel() * int_workspace_buffer.element_size()
+        self._pin_memory_int_workspace_buffer = torch.empty(
+            self._int_workspace_buffer.shape,
+            dtype=self._int_workspace_buffer.dtype,
+            pin_memory=True,
         )
 
     def plan(
@@ -1407,6 +1352,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
         q_data_type: str = "float16",
+        kv_data_type: Optional[str] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -1467,9 +1413,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             ``1.0``.
         rope_theta : Optional[float]
             The theta used in RoPE, if not provided, will be set to ``1e4``.
-
-        q_data_type : Optional[Union[str, torch.dtype]]
-            The data type of the query tensor. If None, will be set to torch.float16.
+        q_data_type : Union[str, torch.dtype]
+            The data type of the query tensor, defaults to torch.float16.
+        kv_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
 
         Note
         ----
@@ -1481,6 +1428,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         is not equal to ``num_kv_heads``, the function will use
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
         """
+        q_data_type = canonicalize_torch_dtype(q_data_type)
+        if kv_data_type is None:
+            kv_data_type = q_data_type
+        kv_data_type = canonicalize_torch_dtype(kv_data_type)
+
         batch_size = len(qo_indptr) - 1
         if len(kv_indptr) != batch_size + 1:
             raise ValueError(
@@ -1523,24 +1475,38 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             if packed_custom_mask is not None:
                 self._custom_mask_buf = packed_custom_mask
                 self._qk_indptr_buf = qk_indptr
-        empty_q_data = torch.empty(
-            0,
-            dtype=(
-                getattr(torch, q_data_type)
-                if isinstance(q_data_type, str)
-                else q_data_type
-            ),
+
+        if packed_custom_mask is not None:
+            mask_mode = MaskMode.CUSTOM.value
+        else:
+            if causal:
+                mask_mode = MaskMode.CAUSAL.value
+            else:
+                mask_mode = MaskMode.NON_CAUSAL.value
+
+        self._cached_module = get_batch_prefill_module(
+            q_data_type,
+            kv_data_type,
+            q_data_type,
+            kv_indptr.dtype,
+            head_dim,
+            PosEncodingMode[pos_encoding_mode].value,
+            mask_mode,
+            window_left >= 0,  # use_sliding_window
+            logits_soft_cap > 0,  # use_logits_soft_cap
+            pos_encoding_mode == "ALIBI",  # use_alibi
+            allow_fp16_qk_reduction,
         )
-        self._wrapper.plan(
+        self._plan_info = self._cached_module.plan(
             self._float_workspace_buffer,
             self._int_workspace_buffer,
+            self._pin_memory_int_workspace_buffer,
             qo_indptr,
             kv_indptr,
             batch_size,
             num_qo_heads,
             num_kv_heads,
-            head_dim,
-            empty_q_data,
+            self.is_cuda_graph_enabled
         )
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode
@@ -1601,15 +1567,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         torch.Tensor
             The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
         """
-        causal = self._causal
-        pos_encoding_mode = self._pos_encoding_mode
-        allow_fp16_qk_reduction = self._allow_fp16_qk_reduction
         window_left = self._window_left
         logits_soft_cap = self._logits_soft_cap
         sm_scale = self._sm_scale
         rope_scale = self._rope_scale
         rope_theta = self._rope_theta
-        _check_pos_encoding_mode(pos_encoding_mode)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         if sm_scale is None:
@@ -1626,41 +1588,26 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             q = q.to(torch.float16)
             k = k.to(torch.float16)
             v = v.to(torch.float16)
-        if self._custom_mask_buf is None:
-            return self._wrapper.run(
-                q,
-                self._qo_indptr_buf,
-                k,
-                v,
-                self._kv_indptr_buf,
-                causal,
-                PosEncodingMode[pos_encoding_mode].value,
-                allow_fp16_qk_reduction,
-                window_left,
-                logits_soft_cap,
-                sm_scale,
-                rope_scale,
-                rope_theta,
-                False,
-            )[0]
-        else:
-            return self._wrapper.run_custom_mask(
-                q,
-                self._qo_indptr_buf,
-                k,
-                v,
-                self._kv_indptr_buf,
-                self._custom_mask_buf,
-                self._qk_indptr_buf,
-                PosEncodingMode[pos_encoding_mode].value,
-                allow_fp16_qk_reduction,
-                window_left,
-                logits_soft_cap,
-                sm_scale,
-                rope_scale,
-                rope_theta,
-                False,
-            )[0]
+
+        return self._cached_module.ragged_run(
+            self._float_workspace_buffer,
+            self._int_workspace_buffer,
+            self._plan_info,
+            q,
+            k,
+            v,
+            self._custom_mask_buf,
+            self._qo_indptr_buf,
+            self._kv_indptr_buf,
+            self._qk_indptr_buf,
+            self._kv_layout,
+            window_left,
+            logits_soft_cap,
+            sm_scale,
+            rope_scale,
+            rope_theta,
+            False,  # return LSE
+        )[0]
 
     def forward_return_lse(
         self,
@@ -1739,15 +1686,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The logsumexp of attention output, shape:
             ``[qo_indptr[-1], num_qo_heads, head_dim]``.
         """
-        causal = self._causal
-        pos_encoding_mode = self._pos_encoding_mode
-        allow_fp16_qk_reduction = self._allow_fp16_qk_reduction
         window_left = self._window_left
         logits_soft_cap = self._logits_soft_cap
         sm_scale = self._sm_scale
         rope_scale = self._rope_scale
         rope_theta = self._rope_theta
-        _check_pos_encoding_mode(pos_encoding_mode)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         if sm_scale is None:
@@ -1764,41 +1707,26 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             q = q.to(torch.float16)
             k = k.to(torch.float16)
             v = v.to(torch.float16)
-        if self._custom_mask_buf is None:
-            return self._wrapper.run(
-                q,
-                self._qo_indptr_buf,
-                k,
-                v,
-                self._kv_indptr_buf,
-                causal,
-                PosEncodingMode[pos_encoding_mode].value,
-                allow_fp16_qk_reduction,
-                window_left,
-                logits_soft_cap,
-                sm_scale,
-                rope_scale,
-                rope_theta,
-                True,
-            )
-        else:
-            return self._wrapper.run_custom_mask(
-                q,
-                self._qo_indptr_buf,
-                k,
-                v,
-                self._kv_indptr_buf,
-                self._custom_mask_buf,
-                self._qk_indptr_buf,
-                PosEncodingMode[pos_encoding_mode].value,
-                allow_fp16_qk_reduction,
-                window_left,
-                logits_soft_cap,
-                sm_scale,
-                rope_scale,
-                rope_theta,
-                True,
-            )
+
+        return self._cached_module.ragged_run(
+            self._float_workspace_buffer,
+            self._int_workspace_buffer,
+            self._plan_info,
+            q,
+            k,
+            v,
+            self._custom_mask_buf,
+            self._qo_indptr_buf,
+            self._kv_indptr_buf,
+            self._qk_indptr_buf,
+            self._kv_layout,
+            window_left,
+            logits_soft_cap,
+            sm_scale,
+            rope_scale,
+            rope_theta,
+            True,  # return LSE
+        )
 
     def end_forward(self) -> None:
         r"""Warning: this function is deprecated and has no effect."""

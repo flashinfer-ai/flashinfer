@@ -22,6 +22,7 @@ from .prefill import _compute_page_qk_indptr
 from .quantization import segment_packbits
 from .utils import (
     _check_pos_encoding_mode,
+    canonicalize_torch_dtype,
     PosEncodingMode,
     TensorLayout,
 )
@@ -282,14 +283,7 @@ class BlockSparseAttentionWrapper:
         else:
             self._packed_mask_buf = None
 
-        empty_q_data = torch.empty(
-            0,
-            dtype=(
-                getattr(torch, q_data_type)
-                if isinstance(q_data_type, str)
-                else q_data_type
-            ),
-        )
+        empty_q_data = torch.empty(0, dtype=canonicalize_torch_dtype(q_data_type))
 
         self.M = M
         self.N = N
