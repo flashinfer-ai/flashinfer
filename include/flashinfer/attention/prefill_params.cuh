@@ -129,12 +129,9 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
   DTypeKV* v;
   IdType* q_indptr;
   IdType* kv_indptr;
-  uint8_t* custom_mask;
   IdType* qk_indptr;
   IdType* q_offset;
   IdType* k_rope_pos_offset;
-  DTypeO* o;
-  float* lse;
   float* alibi_slopes;
   bool* block_valid_mask;
   IdType* kv_chunk_size_ptr;
@@ -150,7 +147,6 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
   uint32_t kv_stride_h;
   int32_t window_left;
   float logits_soft_cap;
-  float sm_scale;
   float log2_rope_rcp_scale;
   float log2_rope_rcp_theta;
 
@@ -167,10 +163,7 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
         k(k),
         v(v),
         kv_indptr(kv_indptr),
-        custom_mask(custom_mask),
         qk_indptr(qk_indptr),
-        o(o),
-        lse(lse),
         alibi_slopes(alibi_slopes),
         block_valid_mask(nullptr),
         num_qo_heads(num_qo_heads),
@@ -210,11 +203,8 @@ struct BatchPrefillPagedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DType
   IdType* o_indptr;
   paged_kv_t<DTypeKV, IdType> paged_kv;
   IdType* q_indptr;
-  uint8_t* custom_mask;
   IdType* qk_indptr;
   IdType* q_offset;
-  DTypeO* o;
-  float* lse;
   float* alibi_slopes;
   bool* block_valid_mask;
   IdType* kv_chunk_size_ptr;
@@ -225,7 +215,6 @@ struct BatchPrefillPagedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DType
   uint_fastdiv group_size_fastdiv;
   int32_t window_left;
   float logits_soft_cap;
-  float sm_scale;
   float log2_rope_rcp_scale;
   float log2_rope_rcp_theta;
 
@@ -236,11 +225,8 @@ struct BatchPrefillPagedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DType
                                    float rope_scale, float rope_theta)
       : PrefillParamsBase<DTypeQ, DTypeKV, DTypeO>{q, custom_mask, o, lse, sm_scale},
         paged_kv(paged_kv),
-        custom_mask(custom_mask),
         q_indptr(q_indptr),
         qk_indptr(qk_indptr),
-        o(o),
-        lse(lse),
         alibi_slopes(alibi_slopes),
         block_valid_mask(nullptr),
         num_qo_heads(num_qo_heads),

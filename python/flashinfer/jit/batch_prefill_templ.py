@@ -39,6 +39,7 @@ std::vector<int64_t> BatchPrefillWithKVCachePlan(
     unsigned int batch_size,
     unsigned int num_qo_heads,
     unsigned int num_kv_heads,
+    unsigned int page_size,
     bool enable_cuda_graph) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
@@ -57,7 +58,7 @@ std::vector<int64_t> BatchPrefillWithKVCachePlan(
     int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
     int_workspace_size_in_bytes,
     plan_info, qo_indptr.data_ptr<{{ dtype_idx }}>(), kv_indptr.data_ptr<{{ dtype_idx }}>(),
-    batch_size, num_qo_heads, num_kv_heads, {{ head_dim }}, /*page_size=*/1, enable_cuda_graph,
+    batch_size, num_qo_heads, num_kv_heads, {{ head_dim }}, page_size, enable_cuda_graph,
     torch_current_stream);
 
   TORCH_CHECK(status == cudaSuccess, "Failed to plan prefill with error: ", cudaGetErrorString(status));
@@ -99,8 +100,8 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCacheRun(
     lse = torch::empty({nnz_qo, num_qo_heads}, q.options().dtype(torch::kFloat32));
   }
 
-  void* float_buffer_ptr = static_cast<void*>(float_workspace_buffer.data_ptr());
-  void* int_buffer_ptr = static_cast<void*>(int_workspace_buffer.data_ptr());
+  void* float_buffer_ptr = float_workspace_buffer.data_ptr();
+  void* int_buffer_ptr = int_workspace_buffer.data_ptr();
 
   RaggedParamsT params(
     static_cast<{{ dtype_q }}*>(q.data_ptr()), static_cast<{{ dtype_kv }}*>(k.data_ptr()),
@@ -114,17 +115,17 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCacheRun(
     {% if use_alibi == "true" %}static_cast<float*>(maybe_alibi_slopes->data_ptr()){% else %}nullptr{% endif %},
     num_qo_heads, num_kv_heads, q_stride_n, q_stride_h, kv_stride_n, kv_stride_h,
     window_left, logits_soft_cap, sm_scale, rope_scale, rope_theta);
-
+  
   {{ dtype_o }}* tmp_v = nullptr;
   float* tmp_s = nullptr;
 
   params.request_indices = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.request_indices_offset);
   params.qo_tile_indices = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.qo_tile_indices_offset);
   params.kv_tile_indices = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.kv_tile_indices_offset);
-  params.merge_indptr = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.merge_indptr_offset);
   params.o_indptr = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.o_indptr_offset);
   params.kv_chunk_size_ptr = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.kv_chunk_size_ptr_offset);
   if (plan_info.split_kv) {
+    params.merge_indptr = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.merge_indptr_offset);
     tmp_v = GetPtrFromBaseOffset<{{ dtype_o }}>(float_buffer_ptr, plan_info.v_offset);
     tmp_s = GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.s_offset);
     if (plan_info.enable_cuda_graph) {
@@ -172,7 +173,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
   bool paged_kv_defined = paged_kv_cache.has_value();
   auto device = q.device();
-  int64_t batch_size = q.size(0);
+  int64_t batch_size = qo_indptr.size(0) - 1;
   int64_t num_qo_heads = q.size(1);
   int64_t num_kv_heads, page_size;
   if (paged_kv_defined) {
@@ -233,10 +234,10 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
   params.request_indices = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.request_indices_offset);
   params.qo_tile_indices = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.qo_tile_indices_offset);
   params.kv_tile_indices = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.kv_tile_indices_offset);
-  params.merge_indptr = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.merge_indptr_offset);
   params.o_indptr = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.o_indptr_offset);
   params.kv_chunk_size_ptr = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.kv_chunk_size_ptr_offset);
   if (plan_info.split_kv) {
+    params.merge_indptr = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.merge_indptr_offset);
     tmp_v = GetPtrFromBaseOffset<{{ dtype_o }}>(float_buffer_ptr, plan_info.v_offset);
     tmp_s = GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.s_offset);
     if (plan_info.enable_cuda_graph) {

@@ -250,9 +250,7 @@ def single_prefill_with_kv_cache(
         rope_scale,
         rope_theta,
         False,  # return lse
-    )[
-        0
-    ]
+    )[0]
 
 
 def single_prefill_with_kv_cache_return_lse(
@@ -896,9 +894,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             batch_size,
             num_qo_heads,
             num_kv_heads,
+            page_size,
             self.is_cuda_graph_enabled 
         )
-        print(self._plan_info)
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode
         self._allow_fp16_qk_reduction = allow_fp16_qk_reduction
@@ -1512,6 +1510,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             batch_size,
             num_qo_heads,
             num_kv_heads,
+            1,  # page_size
             self.is_cuda_graph_enabled
         )
         self._causal = causal

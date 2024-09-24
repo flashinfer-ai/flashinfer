@@ -161,7 +161,6 @@ __device__ __forceinline__ void q_frag_apply_llama_rope_with_pos(T* x_first_half
  * \tparam T The data type of the input tensor.
  * \param smem The shared memory to store kv fragments.
  * \param gptr The global memory pointer.
- * \param qkv_info The tensor info of the input tensor.
  * \param kv_idx_base The base kv index.
  * \param kv_len The length of kv tensor.
  */
@@ -1009,7 +1008,6 @@ __device__ __forceinline__ void write_o_reg_gmem(
  * \param o The output tensor.
  * \param tmp The temporary buffer (used when partition_kv is true).
  * \param lse The logsumexp value.
- * \param qkv_info The tensor info of the input tensor.
  * \param log2_rope_rcp_scale log2(1/(rope_scale)), where rope_scale is the scaling
  *   factor used in RoPE interpolation.
  * \param log2_rope_rcp_theta log2(1/(rope_theta)), where rope_theta is the theta
@@ -1095,6 +1093,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
                                            (lane_idx % 8) * num_elems_per_128b<DTypeOut>())
             : o + params.get_o_elem_offset(0, kv_head_idx * group_size,
                                            (lane_idx % 8) * num_elems_per_128b<DTypeOut>());
+
     uint32_t q_smem_offset_r = qo_smem.get_permuted_offset<channel_size_128b_q>(
         get_warp_idx_x<num_warps_x, num_warps_z>() * num_frags_x * 16 + lane_idx % 16,
         lane_idx / 16);
@@ -1153,6 +1152,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
         v + params.get_kv_elem_offset(
                 chunk_start + warp_idx * kv_frag_rows + lane_idx / kv_frag_cols, kv_head_idx,
                 (lane_idx % kv_frag_cols) * num_elems_per_128b<DTypeKV>());
+
     uint32_t k_smem_offset_r = k_smem.get_permuted_offset<channel_size_128b_kv>(
                  get_warp_idx_z<num_warps_x, num_warps_z>() * num_frags_z * 16 +
                      8 * (lane_idx / 16) + lane_idx % 8,
@@ -1462,8 +1462,8 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
     const uint32_t request_idx = request_indices[bx], qo_tile_idx = qo_tile_indices[bx],
                    kv_tile_idx = kv_tile_indices[bx];
     constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps_x * 16;
-    const uint32_t qo_len = q_indptr[request_idx + 1] - q_indptr[request_idx],
-                   kv_len = kv_indptr[request_idx + 1] - kv_indptr[request_idx];
+    const uint32_t qo_len = params.get_qo_len(request_idx),
+                   kv_len = params.get_kv_len(request_idx);
     const uint32_t kv_len_safe = kv_len > 0 ? kv_len : 1;
     const uint32_t window_left = (maybe_window_left >= 0) ? maybe_window_left : kv_len;
     const uint32_t max_chunk_size = partition_kv ? kv_chunk_size : kv_len;
