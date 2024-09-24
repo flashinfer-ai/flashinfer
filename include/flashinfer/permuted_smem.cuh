@@ -24,6 +24,8 @@
 
 #include <hip/pipeline.h>
 
+#include <rocwmma/rocwmma.hpp>
+
 #else
 
 #include <cuda_bf16.h>
@@ -75,6 +77,14 @@ struct smem_t {
    */
   template <uint32_t stride>
   static __device__ __forceinline__ uint32_t get_permuted_offset(uint32_t i, uint32_t j) {
+
+    #ifdef USE_ROCM
+
+    // TODO (yiakwy) : add swizzle mode
+    return i * stride + j;
+
+    #else
+
     if constexpr (swizzle_mode == SwizzleMode::k128B) {
       return i * stride + (j ^ (i % 8));
     } else {
@@ -82,11 +92,20 @@ struct smem_t {
       static_assert(stride == 4);
       return i * stride + (j ^ ((i / 2) % 4));
     }
+
+    #endif // USE_ROCM
   }
 
   template <uint32_t step_size>
   static __device__ __forceinline__ uint32_t advance_offset_by_column(uint32_t offset,
                                                                       uint32_t step_idx) {
+    #ifdef USE_ROCM
+
+    // TODO(yiakwy) : add swizzle mode
+    return offset + step_size;
+
+    #else
+
     if constexpr (swizzle_mode == SwizzleMode::k128B) {
       static_assert(step_size == 2 || step_size == 4 || step_size % 8 == 0,
                     "Unsupported step size");
@@ -103,10 +122,19 @@ struct smem_t {
       static_assert(step_size == 2, "Unsupported step size");
       return (offset ^ 0x2) + (step_idx % 2 == 1) * 4;
     }
+
+    #endif
   }
 
   template <uint32_t step_size, uint32_t row_stride>
   static __device__ __forceinline__ uint32_t advance_offset_by_row(uint32_t offset) {
+    #ifdef USE_ROCM
+
+    // TODO(yiakwy) : add swizzle mode
+    return offset + step_size * row_stride;
+
+    #else
+
     if constexpr (swizzle_mode == SwizzleMode::k128B) {
       static_assert(step_size == 4 || step_size % 8 == 0, "Unsupported step size");
       if constexpr (step_size == 4) {
@@ -124,6 +152,8 @@ struct smem_t {
         return offset + step_size * row_stride;
       }
     }
+
+    #endif // USE_ROCM
   }
 
   __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t offset, uint32_t* R) {

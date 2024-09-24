@@ -36,6 +36,9 @@ set(CMAKE_MODULE_PATH "${HIP_CMAKE_PATH}" ${CMAKE_MODULE_PATH})
 ##### Flash infer project
 project(flashinfer C CXX)
 
+set(CMAKE_CXX_FLAGS_DEBUG "-g -ggdb -O0") # clang++ crashes without -O2
+set( CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "" FORCE )
+
 # set CMAKE_CXX_COMPILER to hipcc
 # set(CMAKE_FIND_DEBUG_MODE TRUE)
 add_definitions(-Wall)
@@ -393,7 +396,15 @@ foreach(head_dim IN LISTS HEAD_DIMS)
   endforeach(logits_post_hook)
 endforeach(head_dim)
 
-add_library(prefill_kernels STATIC ${single_prefill_kernels_src} ${batch_paged_prefill_kernels_src} ${batch_ragged_prefill_kernels_src})
+if (HIP_FOUND)
+  set_source_files_properties(${single_prefill_kernels_src} PROPERTIES HIP_SOURCE_PROPERTY_FORMAT 1)
+  set_source_files_properties(${batch_paged_prefill_kernels_src} PROPERTIES HIP_SOURCE_PROPERTY_FORMAT 1)
+  set_source_files_properties(${batch_ragged_prefill_kernels_src} PROPERTIES HIP_SOURCE_PROPERTY_FORMAT 1)
+  hip_add_library(prefill_kernels STATIC ${single_prefill_kernels_src} ${batch_paged_prefill_kernels_src} ${batch_ragged_prefill_kernels_src})
+else(HIP_FOUND)
+  add_library(prefill_kernels STATIC ${single_prefill_kernels_src} ${batch_paged_prefill_kernels_src} ${batch_ragged_prefill_kernels_src})
+endif()
+
 target_include_directories(prefill_kernels PRIVATE ${FLASHINFER_INCLUDE_DIR})
 target_compile_options(prefill_kernels PRIVATE -Xcompiler=-fPIC --fatbin-options -compress-all)
 if (HIP_FOUND)
@@ -474,7 +485,14 @@ if (FLASHINFER_PREFILL)
 
   message(STATUS "Compile single prefill kernel tests.")
   file(GLOB_RECURSE TEST_PREFILL_SRCS ${PROJECT_SOURCE_DIR}/src/test_single_prefill.cu)
-  add_executable(test_single_prefill ${TEST_PREFILL_SRCS})
+
+  if (HIP_FOUND)
+    set_source_files_properties(${TEST_PREFILL_SRCS} PROPERTIES HIP_SOURCE_PROPERTY_FORMAT 1)
+    hip_add_executable(test_single_prefill ${TEST_PREFILL_SRCS})
+  else(HIP_FOUND)
+    add_executable(test_single_prefill ${TEST_PREFILL_SRCS})
+  endif()
+
   target_include_directories(test_single_prefill PRIVATE ${FLASHINFER_INCLUDE_DIR})
   target_include_directories(test_single_prefill PRIVATE ${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
   add_dependencies(test_single_prefill dispatch_inc)
@@ -540,7 +558,14 @@ if (FLASHINFER_CASCADE)
 
   message(STATUS "Compile cascade kernel tests.")
   file(GLOB_RECURSE TEST_CASCADE_SRCS ${PROJECT_SOURCE_DIR}/src/test_cascade.cu)
-  add_executable(test_cascade ${TEST_CASCADE_SRCS})
+
+  if (HIP_FOUND)
+    set_source_files_properties(${TEST_CASCADE_SRCS} PROPERTIES HIP_SOURCE_PROPERTY_FORMAT 1)
+    hip_add_executable(test_cascade ${TEST_CASCADE_SRCS})
+  else(HIP_FOUND)
+    add_executable(test_cascade ${TEST_CASCADE_SRCS})
+  endif()
+
   target_include_directories(test_cascade PRIVATE ${FLASHINFER_INCLUDE_DIR})
   target_include_directories(test_cascade PRIVATE ${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
   add_dependencies(test_cascade dispatch_inc)

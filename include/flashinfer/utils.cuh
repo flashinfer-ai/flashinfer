@@ -278,7 +278,11 @@ inline std::pair<int, int> GetCudaComputeCapability() {
   int device_id = 0;
   hipGetDevice(&device_id);
   int major = 0, minor = 0;
-  hipDeviceComputeCapability(&major, &minor, device_id);
+  hipError_t err = hipDeviceComputeCapability(&major, &minor, device_id);
+  if(err != hipSuccess)
+  {
+      throw std::runtime_error("hip_api_call");
+  }
   return std::make_pair(major, minor);
 }
 

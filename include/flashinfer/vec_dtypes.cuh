@@ -216,7 +216,7 @@ __device__ void fast_dequant_f8f16x4(uint32_t* input, uint2* output) {
       *(half2*)&(output->y) = __hmul2(*reinterpret_cast<const half2*>(&Out2), bias_reg);
     } else {
       constexpr uint32_t BIAS = (BIAS_OFFSET + 127) << 23;
-      const nv_bfloat162 bias_reg = __float22bfloat162_rn(*reinterpret_cast<const float*>(&BIAS));
+      const nv_bfloat162 bias_reg = __float2bfloat162_rn(*reinterpret_cast<const float*>(&BIAS));
       // Convert to bfloat162 and apply bias
       *(nv_bfloat162*)&(output->x) =
           __hmul2(*reinterpret_cast<const nv_bfloat162*>(&Out1), bias_reg);

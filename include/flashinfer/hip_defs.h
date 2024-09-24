@@ -30,7 +30,7 @@ using cudaDeviceAttr = hipDeviceAttribute_t;
 const cudaDeviceAttr cudaDevAttrMultiProcessorCount = hipDeviceAttribute_t::hipDeviceAttributeMultiprocessorCount;
 const cudaDeviceAttr cudaDevAttrMaxSharedMemoryPerMultiprocessor = hipDeviceAttribute_t::hipDeviceAttributeMaxSharedMemoryPerMultiprocessor;
 
-// function alas
+// function alias
 template<typename Func>
 inline static hipError_t cudaFuncSetAttribute(Func&& func, const hipFuncAttribute& attr, int value) {
     return hipFuncSetAttribute((void*)func, attr, value);

@@ -4,7 +4,7 @@
 
 #include <hip/hip_runtime.h>
 
-// note in SDK we have this statement device_prop.warpSize
+// note in SDK we have this value from statement device_prop.warpSize
 #ifndef __warpSize
 #define __warpSize 64
 #endif

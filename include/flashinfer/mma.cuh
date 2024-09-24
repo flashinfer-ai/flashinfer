@@ -17,10 +17,19 @@
 #define FLASHINFER_MMA_CUH_
 
 #ifdef USE_ROCM
+#include <type_traits>
 
 #include "flashinfer/hip_cuda_type_utils.h"
 // CUDA API Portable interfaces
 #include "flashinfer/hip_defs.h"
+
+#ifndef FULL_MASK
+#define FULL_MASK 0xffffffff
+#endif
+
+#include <rocwmma/rocwmma.hpp>
+
+// using bfloat16x4 = __attribute__((__vector_size__(4 * sizeof(bfloat16_t)))) bfloat16_t;
 
 #else
 
@@ -28,6 +37,10 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+
+#ifndef FULL_MASK
+#define FULL_MASK 0xffffffffffffffff
+#endif
 
 #endif // USE_ROCM
 
@@ -84,7 +97,11 @@ __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
                : "=r"(R[0]), "=r"(R[1]), "=r"(R[2]), "=r"(R[3])
                : "r"(smem_int_ptr));
 #else
+  #ifdef USE_ROCM
+  FLASHINFER_RUNTIME_ASSERT("v_mfma_f32_8x8x4bf16 not supported, see https://rocmdocs.amd.com/projects/llvm-project/en/latest/LLVM/llvm/html/AMDGPU/AMDGPUAsmGFX940.html");
+  #else
   FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
+  #endif
 #endif
 }
 
@@ -103,7 +120,11 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_left_half(uint32_t* R, T* smem_p
                : "=r"(R[0]), "=r"(R[1])
                : "r"(smem_int_ptr));
 #else
+  #ifdef USE_ROCM
+  FLASHINFER_RUNTIME_ASSERT("ROCM suppoort of ldmatrix_m8n8x4_left_half is pending, see https://rocmdocs.amd.com/projects/llvm-project/en/latest/LLVM/llvm/html/AMDGPU/AMDGPUAsmGFX940.html");
+  #else
   FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
+  #endif
 #endif
 }
 
@@ -122,7 +143,11 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_right_half(uint32_t* R, T* smem_
                : "=r"(R[0]), "=r"(R[1])
                : "r"(smem_int_ptr));
 #else
+  #ifdef USE_ROCM
+  FLASHINFER_RUNTIME_ASSERT("ROCM support of ldmatrix_m8n8x4_right_half is pending, see https://rocmdocs.amd.com/projects/llvm-project/en/latest/LLVM/llvm/html/AMDGPU/AMDGPUAsmGFX940.html");
+  #else
   FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
+  #endif
 #endif
 }
 
@@ -141,7 +166,11 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t* R, T* smem_ptr) 
                : "=r"(R[0]), "=r"(R[1]), "=r"(R[2]), "=r"(R[3])
                : "r"(smem_int_ptr));
 #else
+  #ifdef USE_ROCM
+  FLASHINFER_RUNTIME_ASSERT("ROCM support of ldmatrix_m8n8x4_trans is pending, see https://rocmdocs.amd.com/projects/llvm-project/en/latest/LLVM/llvm/html/AMDGPU/AMDGPUAsmGFX940.html");
+  #else
   FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
+  #endif
 #endif
 }
 
@@ -160,7 +189,11 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_trans_left_half(uint32_t* R, T* 
                : "=r"(R[0]), "=r"(R[1])
                : "r"(smem_int_ptr));
 #else
+  #ifdef USE_ROCM
+  FLASHINFER_RUNTIME_ASSERT("ROCM support of ldmatrix_m8n8x4_trans_left_half is pending, see https://rocmdocs.amd.com/projects/llvm-project/en/latest/LLVM/llvm/html/AMDGPU/AMDGPUAsmGFX940.html");
+  #else
   FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
+  #endif
 #endif
 }
 
@@ -180,6 +213,11 @@ __device__ __forceinline__ void ldmatrix_m8n8x4_trans_right_half(uint32_t* R, T*
                : "r"(smem_int_ptr));
 #else
   FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
+  #ifdef USE_ROCM
+  FLASHINFER_RUNTIME_ASSERT("ROCM support of ldmatrix_m8n8x4_trans_right_half is pending, see https://rocmdocs.amd.com/projects/llvm-project/en/latest/LLVM/llvm/html/AMDGPU/AMDGPUAsmGFX940.html");
+  #else
+  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
+  #endif
 #endif
 }
 
@@ -203,10 +241,10 @@ __device__ __forceinline__ void stmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
   uint4 word;
 #pragma unroll
   for (uint32_t reg_id = 0; reg_id < 4; ++reg_id) {
-    word.x = __shfl_sync(0xffffffff, R[reg_id], (tx % 8) * 4);
-    word.y = __shfl_sync(0xffffffff, R[reg_id], (tx % 8) * 4 + 1);
-    word.z = __shfl_sync(0xffffffff, R[reg_id], (tx % 8) * 4 + 2);
-    word.w = __shfl_sync(0xffffffff, R[reg_id], (tx % 8) * 4 + 3);
+    word.x = __shfl_sync(FULL_MASK, R[reg_id], (tx % 8) * 4);
+    word.y = __shfl_sync(FULL_MASK, R[reg_id], (tx % 8) * 4 + 1);
+    word.z = __shfl_sync(FULL_MASK, R[reg_id], (tx % 8) * 4 + 2);
+    word.w = __shfl_sync(FULL_MASK, R[reg_id], (tx % 8) * 4 + 3);
     if (tx / 8 == reg_id) {
       *(uint4*)smem_ptr = word;
     }
@@ -310,8 +348,12 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f32(float* C, uin
     }
   }
 #else
+  #ifdef USE_ROCM
+  FLASHINFER_RUNTIME_ASSERT("ROCM support of mma_sync_m16n16k32_row_col_f8f8f32 is pending, see https://rocmdocs.amd.com/projects/llvm-project/en/latest/LLVM/llvm/html/AMDGPU/AMDGPUAsmGFX940.html");
+  #else
   FLASHINFER_RUNTIME_ASSERT(
       "fp8 mma instruction is only available for sm89, PTX 8.4+ and CUDA 12.4+");
+  #endif
 #endif
 }
 
@@ -482,7 +524,11 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
     FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
   }
 #else
+  #ifdef USE_ROCM
+  FLASHINFER_RUNTIME_ASSERT("ROCM support of mma_sync_m16n16k16_row_col_f16f16f32 is pending, see https://rocmdocs.amd.com/projects/llvm-project/en/latest/LLVM/llvm/html/AMDGPU/AMDGPUAsmGFX940.html");
+  #else
   FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
+  #endif
 #endif
 }
 
@@ -520,8 +566,12 @@ __device__ __forceinline__ void rowsum_f8f8f32(float* d, DType* s) {
           "r"(1010580540), "f"(d[0]), "f"(d[1]));
   }
 #else
+  #ifdef USE_ROCM
+  FLASHINFER_RUNTIME_ASSERT("ROCM fp8 mma instruction is pending, see https://rocmdocs.amd.com/projects/llvm-project/en/latest/LLVM/llvm/html/AMDGPU/AMDGPUAsmGFX940.html");
+  #else
   FLASHINFER_RUNTIME_ASSERT(
       "fp8 mma instruction is only available for sm89, PTX 8.4+ and CUDA 12.4+");
+  #endif
 #endif
 }
 
@@ -584,7 +634,11 @@ __device__ __forceinline__ void rowsum_f16f16f32(float* d, DType* s) {
     FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
   }
 #else
-  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
+  #ifdef USE_ROCM
+  FLASHINFER_RUNTIME_ASSERT("v_mfma_f32_16x8x{8,16}_fp16 is not supported, see https://rocmdocs.amd.com/projects/llvm-project/en/latest/LLVM/llvm/html/AMDGPU/AMDGPUAsmGFX940.html");
+  #else
+  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
+  #endif
 #endif
 }
 
@@ -704,7 +758,11 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f16(uint32_t* C
         : "r"(A[2]), "r"(A[3]), "r"(B[3]), "r"(C[2]), "r"(C[3]));
   }
 #else
-  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
+  #ifdef USE_ROCM
+  FLASHINFER_RUNTIME_ASSERT("v_mfma_f32_16x16x16_fp16 is pending, see https://rocmdocs.amd.com/projects/llvm-project/en/latest/LLVM/llvm/html/AMDGPU/AMDGPUAsmGFX940.html");
+  #else
+  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
+  #endif
 #endif
 }
 

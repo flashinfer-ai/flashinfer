@@ -34,6 +34,17 @@ THE SOFTWARE.
 
 // CUDA DEVICE API Supported : https://rocm.docs.amd.com/projects/HIPIFY/en/latest/tables/CUDA_Device_API_supported_by_HIP.html
 
+// #if defined(_Float16) && !defined(float16_t)
+// NOTE(yiakwy) : used by rocWMMA
+// TODO(yiakwy) : unifying fp16/half definition
+
+#include <rocwmma/rocwmma.hpp>
+
+// using float16_t = _Float16;
+using float16_t = rocwmma::float16_t;
+
+// #endif
+
 /*! \brief Struct to packet two 16 bit brain floating point numbers. */
 using nv_bfloat162 = __hip_bfloat162;
 using __nv_bfloat162 = __hip_bfloat162;
