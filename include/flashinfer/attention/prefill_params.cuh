@@ -220,9 +220,10 @@ struct BatchPrefillPagedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DType
 
   __host__ BatchPrefillPagedParams(DTypeQ* q, paged_kv_t<DTypeKV, IdType> paged_kv,
                                    uint8_t* custom_mask, IdType* q_indptr, IdType* qk_indptr,
-                                   DTypeO* o, float* lse, float* alibi_slopes, uint32_t num_qo_heads,
-                                   int32_t window_left, float logits_soft_cap, float sm_scale,
-                                   float rope_scale, float rope_theta)
+                                   DTypeO* o, float* lse, float* alibi_slopes,
+                                   uint32_t num_qo_heads, int32_t window_left,
+                                   float logits_soft_cap, float sm_scale, float rope_scale,
+                                   float rope_theta)
       : PrefillParamsBase<DTypeQ, DTypeKV, DTypeO>{q, custom_mask, o, lse, sm_scale},
         paged_kv(paged_kv),
         q_indptr(q_indptr),

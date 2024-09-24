@@ -67,6 +67,7 @@ def compile_batch_prefill_module(
         verbose=verbose,
     )
 
+
 _single_prefill_modules = {}
 _batch_prefill_modules = {}
 
@@ -250,7 +251,9 @@ def single_prefill_with_kv_cache(
         rope_scale,
         rope_theta,
         False,  # return lse
-    )[0]
+    )[
+        0
+    ]
 
 
 def single_prefill_with_kv_cache_return_lse(
@@ -895,7 +898,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             num_qo_heads,
             num_kv_heads,
             page_size,
-            self.is_cuda_graph_enabled 
+            self.is_cuda_graph_enabled,
         )
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode
@@ -1005,7 +1008,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             sm_scale,
             rope_scale,
             rope_theta,
-            False, # return LSE
+            False,  # return LSE
         )[0]
 
         if v_scale is not None:
@@ -1112,7 +1115,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             sm_scale,
             rope_scale,
             rope_theta,
-            True, # return LSE
+            True,  # return LSE
         )
 
         if v_scale is not None:
@@ -1511,7 +1514,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             num_qo_heads,
             num_kv_heads,
             1,  # page_size
-            self.is_cuda_graph_enabled
+            self.is_cuda_graph_enabled,
         )
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode

@@ -105,8 +105,7 @@ struct SingleDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
   }
 };
 
-template <typename DTypeQ, typename DTypeKV, typename DTypeO,
-          typename IdType_>
+template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType_>
 struct BatchDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
   using IdType = IdType_;
   IdType* q_offset;
@@ -127,11 +126,10 @@ struct BatchDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
   bool partition_kv;
 
   __device__ __host__ BatchDecodeParams(DTypeQ* q, IdType* q_offset,
-                                        paged_kv_t<DTypeKV, IdType> paged_kv,
-                                        DTypeO* o, float* lse, float* alibi_slopes,
-                                        uint32_t num_qo_heads, uint32_t window_left,
-                                        float logits_soft_cap, float sm_scale, float rope_scale,
-                                        float rope_theta)
+                                        paged_kv_t<DTypeKV, IdType> paged_kv, DTypeO* o, float* lse,
+                                        float* alibi_slopes, uint32_t num_qo_heads,
+                                        uint32_t window_left, float logits_soft_cap, float sm_scale,
+                                        float rope_scale, float rope_theta)
       : DecodeParamsBase<DTypeQ, DTypeKV, DTypeO>{q, o, lse, sm_scale},
         q_offset(q_offset),
         paged_kv(paged_kv),

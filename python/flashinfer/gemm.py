@@ -25,6 +25,7 @@ from typing import Optional
 
 _gemm_module = None
 
+
 def get_gemm_module():
     global _gemm_module
     if _gemm_module is None:
@@ -35,7 +36,7 @@ def get_gemm_module():
                 FLASHINFER_CSRC_DIR / "bmm_fp8.cu",
                 FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops.cu",
             ],
-            verbose=True
+            verbose=True,
         )
     return _gemm_module
 

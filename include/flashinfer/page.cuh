@@ -220,26 +220,26 @@ struct paged_kv_t {
   __device__ __forceinline__ DType* protective_get_k_ptr(IdType page_iter, uint32_t head_idx,
                                                          uint32_t entry_idx, uint32_t feat_idx,
                                                          IdType last_indptr) const {
-      if (page_iter < last_indptr) {
-        return k_data + get_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
-      } else {
-        return k_data;
-      }
+    if (page_iter < last_indptr) {
+      return k_data + get_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
+    } else {
+      return k_data;
+    }
   }
 
   __device__ __forceinline__ DType* get_v_ptr(IdType page_iter, uint32_t head_idx,
                                               uint32_t entry_idx, uint32_t feat_idx) const {
-      return v_data + get_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
+    return v_data + get_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
   }
 
   __device__ __forceinline__ DType* protective_get_v_ptr(IdType page_iter, uint32_t head_idx,
                                                          uint32_t entry_idx, uint32_t feat_idx,
                                                          IdType last_indptr) const {
-      if (page_iter < last_indptr) {
-        return v_data + get_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
-      } else {
-        return v_data;
-      }
+    if (page_iter < last_indptr) {
+      return v_data + get_elem_offset(__ldg(indices + page_iter), head_idx, entry_idx, feat_idx);
+    } else {
+      return v_data;
+    }
   }
 };
 
@@ -253,8 +253,7 @@ struct paged_kv_t {
  * \param key The key to be appended
  * \param value The value to be appended
  */
-template <uint32_t head_dim, uint32_t vec_size, typename DType,
-          typename IdType>
+template <uint32_t head_dim, uint32_t vec_size, typename DType, typename IdType>
 __global__ void AppendPagedKVCacheDecodeKernel(paged_kv_t<DType, IdType> paged_kv,
                                                DType* __restrict__ key, DType* __restrict__ value) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
@@ -289,8 +288,7 @@ __global__ void AppendPagedKVCacheDecodeKernel(paged_kv_t<DType, IdType> paged_k
  * \param value The value to be appended
  * \param append_indptr The indptr array of the appended ragged tensor
  */
-template <uint32_t head_dim, uint32_t vec_size, typename DType,
-          typename IdType>
+template <uint32_t head_dim, uint32_t vec_size, typename DType, typename IdType>
 __global__ void AppendPagedKVCachePrefillKernel(paged_kv_t<DType, IdType> paged_kv,
                                                 DType* __restrict__ key, DType* __restrict__ value,
                                                 IdType* __restrict__ append_indptr) {
@@ -334,8 +332,8 @@ __global__ void AppendPagedKVCachePrefillKernel(paged_kv_t<DType, IdType> paged_
  * \return status Indicates whether CUDA calls are successful
  */
 template <typename DType, typename IdType>
-cudaError_t AppendPagedKVCacheDecode(paged_kv_t<DType, IdType> paged_kv, DType* key,
-                                     DType* value, cudaStream_t stream = nullptr) {
+cudaError_t AppendPagedKVCacheDecode(paged_kv_t<DType, IdType> paged_kv, DType* key, DType* value,
+                                     cudaStream_t stream = nullptr) {
   uint32_t head_dim = paged_kv.head_dim;
   uint32_t batch_size = paged_kv.batch_size;
   uint32_t num_heads = paged_kv.num_heads;
@@ -366,8 +364,8 @@ cudaError_t AppendPagedKVCacheDecode(paged_kv_t<DType, IdType> paged_kv, DType* 
  * \return status Indicates whether CUDA calls are successful
  */
 template <typename DType, typename IdType>
-cudaError_t AppendPagedKVCache(paged_kv_t<DType, IdType> paged_kv, DType* key,
-                               DType* value, IdType* append_indptr, cudaStream_t stream = nullptr) {
+cudaError_t AppendPagedKVCache(paged_kv_t<DType, IdType> paged_kv, DType* key, DType* value,
+                               IdType* append_indptr, cudaStream_t stream = nullptr) {
   uint32_t head_dim = paged_kv.head_dim;
   uint32_t batch_size = paged_kv.batch_size;
   uint32_t num_heads = paged_kv.num_heads;

@@ -539,11 +539,10 @@ cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_in_bytes
   uint32_t split_max_batch_size = max_grid_size / num_kv_heads;
 
   // step 2: determine kv_chunk_size
-  auto [split_kv, total_num_tiles_q, new_batch_size, warp_layout,
-        kv_chunk_size, total_num_rows, request_indices_vec, qo_tile_indices_vec,
-        kv_tile_indices_vec, merge_indptr_vec, o_indptr_vec] =
-      PrefillSplitQOKVIndptr(qo_indptr_h, kv_indptr_h, batch_size, num_qo_heads, num_kv_heads,
-                             head_dim, page_size, max_grid_size);
+  auto [split_kv, total_num_tiles_q, new_batch_size, warp_layout, kv_chunk_size, total_num_rows,
+        request_indices_vec, qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec,
+        o_indptr_vec] = PrefillSplitQOKVIndptr(qo_indptr_h, kv_indptr_h, batch_size, num_qo_heads,
+                                               num_kv_heads, head_dim, page_size, max_grid_size);
   const uint32_t qo_tile_size = get_num_rows_per_cta(warp_layout);
   plan_info.warp_layout_code = static_cast<int64_t>(warp_layout);
   plan_info.total_num_rows = total_num_rows;

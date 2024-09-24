@@ -740,8 +740,8 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(typename AttentionVariant::Par
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         FLASHINFER_CUDA_CALL(VariableLengthMergeStates(tmp_v, tmp_s, params.o_indptr, o, lse,
-                                                       params.paged_kv.batch_size, num_qo_heads, HEAD_DIM,
-                                                       stream));
+                                                       params.paged_kv.batch_size, num_qo_heads,
+                                                       HEAD_DIM, stream));
       }
     });
   });
