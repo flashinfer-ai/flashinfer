@@ -39,7 +39,7 @@ namespace flashinfer {{
 using ParamsT = BatchDecodeParams<{dtype_q}, {dtype_kv}, {dtype_out}, {idtype}>;
 using AttentionVariant = ComposedAttention<ParamsT, get_variant_code(false, false, false, false)>;
 
-template cudaError_t BatchDecodeWithKVCacheDispatched<{head_dim}, {pos_encoding_mode}, AttentionVariant>(
+template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{head_dim}, {pos_encoding_mode}, AttentionVariant>(
     typename AttentionVariant::ParamsT params,
     typename AttentionVariant::DTypeO* tmp,
     cudaStream_t stream);
