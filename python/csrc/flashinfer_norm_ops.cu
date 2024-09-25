@@ -15,14 +15,14 @@
  */
 #include <torch/extension.h>
 
-torch::Tensor rmsnorm(torch::Tensor input, torch::Tensor weight, double eps);
+void rmsnorm(torch::Tensor& out, torch::Tensor& input, torch::Tensor& weight, double eps);
 
-void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight,
+void fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight,
                        double eps);
 
-torch::Tensor gemma_rmsnorm(torch::Tensor input, torch::Tensor weight, double eps);
+void gemma_rmsnorm(torch::Tensor& out, torch::Tensor& input, torch::Tensor& weight, double eps);
 
-void gemma_fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight,
+void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight,
                              double eps);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
