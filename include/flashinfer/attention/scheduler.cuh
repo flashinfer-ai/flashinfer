@@ -117,7 +117,7 @@ inline std::tuple<bool, uint32_t, uint32_t> PrefillBinarySearchKVChunkSize(
  * \brief Estimate the temporary buffer size and the maximum grid size for the
  *   partition-kv BatchDecodeWithPagedKVCache kernel
  * \tparam DTypeKV A template type indicates the key-value data type
- * \tparam DTypeOut A template type indicates the output data type
+ * \tparam DTypeO A template type indicates the output data type
  * \tparam IdType A template type indicates the index data type
  * \param split_kv Whether to split the KV cache into multiple chunks
  * \param max_grid_size The maximum grid size that can be used in a partiton-kv kernel
@@ -285,7 +285,7 @@ cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
                        DecodePlanInfo& plan_info, typename AttentionVariant::IdType* indptr_h,
                        uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
                        uint32_t page_size, bool enable_cuda_graph, cudaStream_t stream) {
-  using DTypeOut = typename AttentionVariant::DTypeO;
+  using DTypeO = typename AttentionVariant::DTypeO;
   using IdType = typename AttentionVariant::IdType;
   bool split_kv;
   uint32_t max_grid_size, kv_chunk_size_in_pages, new_batch_size;
@@ -331,7 +331,7 @@ cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
     if (split_kv) {
       AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
       plan_info.v_offset = float_allocator.aligned_alloc_offset(
-          num_qo_heads * padded_batch_size * HEAD_DIM * sizeof(DTypeOut), 16, "batch_decode_tmp_v");
+          num_qo_heads * padded_batch_size * HEAD_DIM * sizeof(DTypeO), 16, "batch_decode_tmp_v");
       plan_info.s_offset = float_allocator.aligned_alloc_offset(
           num_qo_heads * padded_batch_size * sizeof(float), 16, "batch_decode_tmp_s");
 
@@ -512,7 +512,7 @@ struct PrefillPlanInfo {
   }
 };
 
-template <typename DTypeOut, typename IdType>
+template <typename DTypeO, typename IdType>
 cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_in_bytes, void* int_buffer,
                         void* page_locked_int_buffer, size_t int_workspace_size_in_bytes,
                         PrefillPlanInfo& plan_info, IdType* qo_indptr_h, IdType* kv_indptr_h,
@@ -581,7 +581,7 @@ cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_in_bytes
   if (split_kv) {
     AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
     plan_info.v_offset = float_allocator.aligned_alloc_offset(
-        num_qo_heads * split_max_batch_size * qo_tile_size * head_dim * sizeof(DTypeOut), 16,
+        num_qo_heads * split_max_batch_size * qo_tile_size * head_dim * sizeof(DTypeO), 16,
         "batch_prefill_tmp_v");
     plan_info.s_offset = float_allocator.aligned_alloc_offset(
         num_qo_heads * split_max_batch_size * qo_tile_size * sizeof(float), 16,

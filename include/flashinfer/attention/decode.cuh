@@ -185,7 +185,7 @@ __device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, f
  * \tparam bdy A template integer indicates the block size in y dimension
  * \tparam DTypeQ A template type indicates the query data type
  * \tparam DTypeKV A template type indicates the key-value data type
- * \tparam DTypeOut A template type indicates the output data type
+ * \tparam DTypeO A template type indicates the output data type
  * \param q [num_qo_heads, head_dim] The query matrix
  * \param k [seq_len, num_kv_heads, head_dim] The key matrix in kv-cache
  * \param v [seq_len, num_kv_heads, head_dim] The value matrix in kv-cache
@@ -204,11 +204,11 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__
                                               typename AttentionVariant::ParamsT params) {
   using DTypeQ = typename AttentionVariant::DTypeQ;
   using DTypeKV = typename AttentionVariant::DTypeKV;
-  using DTypeOut = typename AttentionVariant::DTypeO;
+  using DTypeO = typename AttentionVariant::DTypeO;
   const DTypeQ* q = params.q;
   const DTypeKV* k = params.k;
   const DTypeKV* v = params.v;
-  DTypeOut* o = params.o;
+  DTypeO* o = params.o;
   float* lse = params.lse;
   const float rope_rcp_scale = params.rope_rcp_scale;
   const float rope_rcp_theta = params.rope_rcp_theta;
@@ -361,7 +361,7 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__
  * \tparam bdz A template integer indicates the block size in z dimension
  * \tparam DTypeQ A template type indicates the query data type
  * \tparam DTypeKV A template type indicates the key-value data type
- * \tparam DTypeOut A template type indicates the output data type
+ * \tparam DTypeO A template type indicates the output data type
  * \tparam IdType A template type indicates the index data type
  * \param q [batch_size, num_qo_heads, head_dim] The query matrix
  * \param paged_kv The paged kv-cache data structure
@@ -382,10 +382,10 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__
   auto block = cg::this_thread_block();
   using DTypeQ = typename AttentionVariant::DTypeQ;
   using DTypeKV = typename AttentionVariant::DTypeKV;
-  using DTypeOut = typename AttentionVariant::DTypeO;
+  using DTypeO = typename AttentionVariant::DTypeO;
   using IdType = typename AttentionVariant::IdType;
   const DTypeQ* q = params.q;
-  DTypeOut* o = params.o;
+  DTypeO* o = params.o;
   float* lse = params.lse;
   const auto paged_kv = params.paged_kv;
   const IdType* q_offset = params.q_offset;
@@ -594,7 +594,7 @@ constexpr uint32_t get_heuristic_num_threads(uint32_t group_size, uint32_t sizeo
  * \brief FlashAttention decoding with kv-cache for a single request
  * \tparam DTypeQ A template type indicates the query data type
  * \tparam DTypeKV A template type indicates the key-value data type
- * \tparam DTypeOut A template type indicates the output data type
+ * \tparam DTypeO A template type indicates the output data type
  * \param q The query matrix, shape: [num_qo_heads, head_dim]
  * \param k The key matrix in kv-cache, shape: [seq_len, num_kv_heads, head_dim]
  *   for NHD layout, [num_kv_heads, seq_len, head_dim] for HND layout
@@ -618,7 +618,7 @@ cudaError_t SingleDecodeWithKVCacheDispatched(typename AttentionVariant::ParamsT
                                               cudaStream_t stream) {
   using DTypeQ = typename AttentionVariant::DTypeQ;
   using DTypeKV = typename AttentionVariant::DTypeKV;
-  using DTypeOut = typename AttentionVariant::DTypeO;
+  using DTypeO = typename AttentionVariant::DTypeO;
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.num_kv_heads;
   const uint32_t seq_len = params.kv_len;
@@ -693,7 +693,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(typename AttentionVariant::Par
                                                   float* tmp_s, cudaStream_t stream) {
   using DTypeQ = typename AttentionVariant::DTypeQ;
   using DTypeKV = typename AttentionVariant::DTypeKV;
-  using DTypeOut = typename AttentionVariant::DTypeO;
+  using DTypeO = typename AttentionVariant::DTypeO;
   using IdType = typename AttentionVariant::IdType;
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.paged_kv.num_heads;

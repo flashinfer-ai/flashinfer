@@ -927,13 +927,13 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(float (*o_frag)[num_
 }
 
 template <uint32_t num_warps_x, uint32_t num_warps_z, uint32_t num_frags_x, uint32_t num_frags_y,
-          SwizzleMode swizzle_mode, typename DTypeOut>
+          SwizzleMode swizzle_mode, typename DTypeO>
 __device__ __forceinline__ void write_o_reg_gmem(
-    float (*o_frag)[num_frags_y][8], smem_t<swizzle_mode>* o_smem, DTypeOut* o_ptr_base,
+    float (*o_frag)[num_frags_y][8], smem_t<swizzle_mode>* o_smem, DTypeO* o_ptr_base,
     const uint32_t o_packed_idx_base, const uint32_t qo_upper_bound, const uint32_t o_stride_n,
     const uint32_t o_stride_h, const uint_fastdiv group_size) {
   constexpr uint32_t head_dim = num_frags_y * 16;
-  constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeOut>();
+  constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeO>();
   const uint32_t warp_idx_x = get_warp_idx_x<num_warps_x, num_warps_z>();
   const uint32_t lane_idx = threadIdx.x;
 
@@ -943,7 +943,7 @@ __device__ __forceinline__ void write_o_reg_gmem(
 #pragma unroll
       for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
         uint32_t o_frag_f16[4];
-        vec_cast<DTypeOut, float>::cast<8>((DTypeOut*)o_frag_f16, o_frag[fx][fy]);
+        vec_cast<DTypeO, float>::cast<8>((DTypeO*)o_frag_f16, o_frag[fx][fy]);
 #ifdef FLASHINFER_STMATRIX_M8N8X4_ENABLED
         uint32_t o_smem_offset_w = o_smem->get_permuted_offset<channel_size_128b_out>(
             (warp_idx_x * num_frags_x + fx) * 16 + lane_idx % 16, fy * 2 + lane_idx / 16);
@@ -971,13 +971,13 @@ __device__ __forceinline__ void write_o_reg_gmem(
         uint32_t q, r;
         group_size.divmod(o_packed_idx_base + lane_idx / 8 + fx * 16 + j * 4, q, r);
         const uint32_t o_idx = q;
-        DTypeOut* o_ptr = o_ptr_base + q * o_stride_n + r * o_stride_h;
+        DTypeO* o_ptr = o_ptr_base + q * o_stride_n + r * o_stride_h;
 #pragma unroll
         for (uint32_t fyo = 0; fyo < num_frags_y / 4; ++fyo) {
           if (o_idx < qo_upper_bound) {
             o_smem->store_128b(o_smem_offset_w, o_ptr);
           }
-          o_ptr += 8 * num_elems_per_128b<DTypeOut>();
+          o_ptr += 8 * num_elems_per_128b<DTypeO>();
           o_smem_offset_w = o_smem->template advance_offset_by_column<8>(o_smem_offset_w, fyo);
         }
         o_smem_offset_w =
@@ -1001,7 +1001,7 @@ __device__ __forceinline__ void write_o_reg_gmem(
  * \tparam num_warps The number of warps in the threadblock.
  * \tparam DTypeQ The data type of the query tensor.
  * \tparam DTypeKV The data type of the key/value tensor.
- * \tparam DTypeOut The data type of the output tensor.
+ * \tparam DTypeO The data type of the output tensor.
  * \param q The query tensor.
  * \param k The key tensor.
  * \param v The value tensor.
@@ -1026,12 +1026,12 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
   } else {
 #endif
     using DTypeKV = typename AttentionVariant::DTypeKV;
-    using DTypeOut = typename AttentionVariant::DTypeO;
+    using DTypeO = typename AttentionVariant::DTypeO;
     DTypeQ* q = params.q;
     DTypeKV* k = params.k;
     DTypeKV* v = params.v;
     uint8_t* custom_mask = params.custom_mask;
-    DTypeOut* o = params.o;
+    DTypeO* o = params.o;
     float* lse = params.lse;
     const uint32_t qo_len = params.qo_len;
     const uint32_t kv_len = params.kv_len;
@@ -1045,7 +1045,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
     const float log2_rope_rcp_scale = params.log2_rope_rcp_scale;
     const float log2_rope_rcp_theta = params.log2_rope_rcp_theta;
     static_assert(sizeof(DTypeQ) == 2);
-    static_assert(sizeof(DTypeOut) == 2);
+    static_assert(sizeof(DTypeO) == 2);
     const uint32_t lane_idx = threadIdx.x, warp_idx = get_warp_idx<num_warps_x, num_warps_z>();
     const uint32_t bx = blockIdx.x, chunk_idx = blockIdx.y, kv_head_idx = blockIdx.z;
     const uint32_t num_kv_heads = gridDim.z, num_qo_heads = num_kv_heads * group_size;
@@ -1064,7 +1064,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
     constexpr uint32_t head_dim = num_frags_y * 16;
     constexpr uint32_t channel_size_128b_q = head_dim / num_elems_per_128b<DTypeQ>();
     constexpr uint32_t channel_size_128b_kv = head_dim / num_elems_per_128b<DTypeKV>();
-    constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeOut>();
+    constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeO>();
 
     extern __shared__ uint8_t smem[];
 
@@ -1086,13 +1086,13 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
     DTypeQ* q_ptr_base =
         q + params.get_q_elem_offset(0, kv_head_idx * group_size,
                                      (lane_idx % 8) * num_elems_per_128b<DTypeQ>());
-    DTypeOut* o_ptr_base =
+    DTypeO* o_ptr_base =
         partition_kv
             ? o + chunk_idx * num_qo_heads * head_dim +
                   params.get_o_elem_offset(0, kv_head_idx * group_size,
-                                           (lane_idx % 8) * num_elems_per_128b<DTypeOut>())
+                                           (lane_idx % 8) * num_elems_per_128b<DTypeO>())
             : o + params.get_o_elem_offset(0, kv_head_idx * group_size,
-                                           (lane_idx % 8) * num_elems_per_128b<DTypeOut>());
+                                           (lane_idx % 8) * num_elems_per_128b<DTypeO>());
 
     uint32_t q_smem_offset_r = qo_smem.get_permuted_offset<channel_size_128b_q>(
         get_warp_idx_x<num_warps_x, num_warps_z>() * num_frags_x * 16 + lane_idx % 16,
@@ -1109,6 +1109,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
       q_smem_inplace_apply_rotary<num_warps_x, num_warps_z, num_frags_x, num_frags_y,
                                   swizzle_mode_q, DTypeQ>(
           qo_packed_idx_base, qo_len, kv_len, group_size, &qo_smem, &q_smem_offset_r, rope_freq);
+      block.sync();
     }
     q_smem_inplace_transform<num_warps_x, num_warps_z, num_frags_x, num_frags_y, swizzle_mode_q,
                              AttentionVariant>(params, &qo_smem);
@@ -1275,7 +1276,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(typename AttentionVariant::Params
                                                cudaStream_t stream) {
   using DTypeQ = typename AttentionVariant::DTypeQ;
   using DTypeKV = typename AttentionVariant::DTypeKV;
-  using DTypeOut = typename AttentionVariant::DTypeO;
+  using DTypeO = typename AttentionVariant::DTypeO;
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.num_kv_heads;
   const uint32_t qo_len = params.qo_len;
@@ -1421,7 +1422,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
   } else {
 #endif
     using DTypeKV = typename AttentionVariant::DTypeKV;
-    using DTypeOut = typename AttentionVariant::DTypeO;
+    using DTypeO = typename AttentionVariant::DTypeO;
     using IdType = typename AttentionVariant::IdType;
     DTypeQ* q = params.q;
     IdType* request_indices = params.request_indices;
@@ -1434,7 +1435,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
     IdType* q_offset = params.q_offset;
     IdType* k_rope_pos_offset = params.k_rope_pos_offset;
     IdType* o_indptr = params.o_indptr;
-    DTypeOut* o = params.o;
+    DTypeO* o = params.o;
     float* lse = params.lse;
     bool* block_valid_mask = params.block_valid_mask;
     const bool partition_kv = params.partition_kv;
@@ -1448,7 +1449,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
     const float log2_rope_rcp_theta = params.log2_rope_rcp_theta;
 
     static_assert(sizeof(DTypeQ) == 2);
-    static_assert(sizeof(DTypeOut) == 2);
+    static_assert(sizeof(DTypeO) == 2);
     constexpr uint32_t head_dim = num_frags_y * 16;
     const uint32_t kv_chunk_size = *(params.kv_chunk_size_ptr);
 
@@ -1477,7 +1478,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
 
     constexpr uint32_t channel_size_128b_q = head_dim / num_elems_per_128b<DTypeQ>();
     constexpr uint32_t channel_size_128b_kv = head_dim / num_elems_per_128b<DTypeKV>();
-    constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeOut>();
+    constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeO>();
 
     extern __shared__ uint8_t smem[];
 
@@ -1501,13 +1502,13 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
         q + qkv_info.get_q_elem_offset(q_indptr[request_idx], kv_head_idx * group_size,
                                        (lane_idx % 8) * num_elems_per_128b<DTypeQ>());
 
-    DTypeOut* o_ptr_base =
+    DTypeO* o_ptr_base =
         partition_kv
             ? o + kv_tile_idx * num_qo_heads * head_dim +
                   qkv_info.get_o_elem_offset(o_indptr[request_idx], kv_head_idx * group_size,
-                                             (lane_idx % 8) * num_elems_per_128b<DTypeOut>())
+                                             (lane_idx % 8) * num_elems_per_128b<DTypeO>())
             : o + qkv_info.get_o_elem_offset(o_indptr[request_idx], kv_head_idx * group_size,
-                                             (lane_idx % 8) * num_elems_per_128b<DTypeOut>());
+                                             (lane_idx % 8) * num_elems_per_128b<DTypeO>());
 
     uint32_t q_smem_offset_r = qo_smem.get_permuted_offset<channel_size_128b_q>(
         get_warp_idx_x<num_warps_x, num_warps_z>() * num_frags_x * 16 + lane_idx % 16,
@@ -1532,6 +1533,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
             qo_packed_idx_base, q_offset + q_indptr[request_idx], &qo_smem, group_size,
             &q_smem_offset_r, rope_freq);
       }
+      block.sync();
     }
     q_smem_inplace_transform<num_warps_x, num_warps_z, num_frags_x, num_frags_y, swizzle_mode_q,
                              AttentionVariant>(params, &qo_smem);
@@ -1711,7 +1713,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
   } else {
 #endif
     using DTypeKV = typename AttentionVariant::DTypeKV;
-    using DTypeOut = typename AttentionVariant::DTypeO;
+    using DTypeO = typename AttentionVariant::DTypeO;
     using IdType = typename AttentionVariant::IdType;
     IdType* request_indices = params.request_indices;
     IdType* qo_tile_indices = params.qo_tile_indices;
@@ -1721,7 +1723,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
     IdType* q_indptr = params.q_indptr;
     IdType* q_offset = params.q_offset;
     IdType* o_indptr = params.o_indptr;
-    DTypeOut* o = params.o;
+    DTypeO* o = params.o;
     float* lse = params.lse;
     bool* block_valid_mask = params.block_valid_mask;
     const bool partition_kv = params.partition_kv;
@@ -1731,7 +1733,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
     const float log2_rope_rcp_theta = params.log2_rope_rcp_theta;
 
     static_assert(sizeof(DTypeQ) == 2);
-    static_assert(sizeof(DTypeOut) == 2);
+    static_assert(sizeof(DTypeO) == 2);
     auto block = cg::this_thread_block();
     const uint32_t kv_chunk_size = *(params.kv_chunk_size_ptr);
 
@@ -1759,7 +1761,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
     constexpr uint32_t head_dim = num_frags_y * 16;
     constexpr uint32_t channel_size_128b_q = head_dim / num_elems_per_128b<DTypeQ>();
     constexpr uint32_t channel_size_128b_kv = head_dim / num_elems_per_128b<DTypeKV>();
-    constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeOut>();
+    constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeO>();
 
     extern __shared__ uint8_t smem[];
 
@@ -1782,13 +1784,13 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
     DTypeQ* q_ptr_base = q + get_elem_offset_impl(q_indptr[request_idx], kv_head_idx * group_size,
                                                   (lane_idx % 8) * num_elems_per_128b<DTypeQ>(),
                                                   q_stride_n, q_stride_h);
-    DTypeOut* o_ptr_base =
+    DTypeO* o_ptr_base =
         partition_kv ? o + kv_tile_idx * num_qo_heads * head_dim +
                            get_elem_offset_impl(o_indptr[request_idx], kv_head_idx * group_size,
-                                                (lane_idx % 8) * num_elems_per_128b<DTypeOut>(),
+                                                (lane_idx % 8) * num_elems_per_128b<DTypeO>(),
                                                 num_qo_heads * head_dim, head_dim)
                      : o + get_elem_offset_impl(o_indptr[request_idx], kv_head_idx * group_size,
-                                                (lane_idx % 8) * num_elems_per_128b<DTypeOut>(),
+                                                (lane_idx % 8) * num_elems_per_128b<DTypeO>(),
                                                 num_qo_heads * head_dim, head_dim);
     uint32_t q_smem_offset_r = qo_smem.get_permuted_offset<channel_size_128b_q>(
         get_warp_idx_x<num_warps_x, num_warps_z>() * num_frags_x * 16 + lane_idx % 16,
@@ -1813,6 +1815,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
             qo_packed_idx_base, q_offset + q_indptr[request_idx], &qo_smem, group_size,
             &q_smem_offset_r, rope_freq);
       }
+      block.sync();
     }
     q_smem_inplace_transform<num_warps_x, num_warps_z, num_frags_x, num_frags_y, swizzle_mode_q,
                              AttentionVariant>(params, &qo_smem);
