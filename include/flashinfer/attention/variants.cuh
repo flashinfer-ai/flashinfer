@@ -101,7 +101,7 @@ struct SlidingWindowAttention {
                                                     int32_t qo_head_idx, int32_t kv_head_idx) {
     const int32_t qo_len = params.get_qo_len(batch_idx);
     const int32_t kv_len = params.get_kv_len(batch_idx);
-    return (kv_idx + qo_len + params.window_left < kv_len + qo_idx);
+    return (kv_idx + qo_len + params.window_left >= kv_len + qo_idx);
   }
 };
 

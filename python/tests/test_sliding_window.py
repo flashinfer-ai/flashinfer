@@ -342,6 +342,7 @@ def test_batch_ragged_prefill_sliding_window(
 
 
 if __name__ == "__main__":
+    test_single_decode_sliding_window(13, 20, 1, 4, 128)
     test_single_prefill_sliding_window(13, 20, 1, 4, 128)
     test_batch_paged_prefill_sliding_window(12, 54, 37, 13, 1, 4, 128, 1)
     test_batch_ragged_prefill_sliding_window(12, 54, 37, 13, 1, 4, 128)
