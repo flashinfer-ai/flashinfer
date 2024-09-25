@@ -156,7 +156,7 @@ std::vector<dtype_out> single_mha(const std::vector<dtype_q>& q, const std::vect
 }
 
 template <typename T, typename IdxType>
-void append_paged_kv_cache(paged_kv_t<PageStorage::kIndices, T, IdxType> page_cpu,
+void append_paged_kv_cache(paged_kv_t<T, IdxType> page_cpu,
                            const std::vector<std::vector<T>>& keys,
                            const std::vector<std::vector<T>>& values,
                            const std::vector<IdxType>& append_indptr) {

@@ -62,7 +62,7 @@ void _TestBatchPagedPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t n
   }
 
   kv_data.resize(page_counter * 2 * num_kv_heads * page_size * head_dim);
-  flashinfer::paged_kv_t<PageStorage::kIndices, DTypeKV, int32_t> paged_kv_cpu(
+  flashinfer::paged_kv_t<DTypeKV, int32_t> paged_kv_cpu(
       num_kv_heads, page_size, head_dim, batch_size, kv_layout, kv_data.data(), kv_indices.data(),
       kv_indptr.data(), kv_last_page_len.data());
   cpu_reference::append_paged_kv_cache<DTypeKV, int32_t>(paged_kv_cpu, key, value, append_indptr);
@@ -74,7 +74,7 @@ void _TestBatchPagedPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t n
   thrust::device_vector<int32_t> kv_last_page_len_device(kv_last_page_len);
 
   // create paged_kv object
-  flashinfer::paged_kv_t<PageStorage::kIndices, DTypeKV, int32_t> paged_kv = paged_kv_cpu;
+  flashinfer::paged_kv_t<DTypeKV, int32_t> paged_kv = paged_kv_cpu;
   paged_kv.k_data = thrust::raw_pointer_cast(kv_data_device.data());
   paged_kv.v_data = paged_kv.k_data + paged_kv_cpu.kv_ptr_delta();
   paged_kv.indices = thrust::raw_pointer_cast(kv_indices_device.data());
@@ -112,7 +112,7 @@ void _TestBatchPagedPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t n
                                    batch_size, num_qo_heads, num_kv_heads, head_dim, page_size);
 
     for (uint32_t num_runs = 0; num_runs < 10; ++num_runs) {
-      auto status = flashinfer::BatchPrefillWithPagedKVCacheWrapper<PageStorage::kIndices, DTypeQO,
+      auto status = flashinfer::BatchPrefillWithPagedKVCacheWrapper<DTypeQO,
                                                                     DTypeKV, DTypeQO, int32_t>(
           &handler, thrust::raw_pointer_cast(q_device.data()),
           thrust::raw_pointer_cast(q_indptr_device.data()), /*q_offset=*/nullptr, paged_kv,
@@ -278,7 +278,7 @@ void _TestBatchPagedPrefillKernelShortContextCorrectness(size_t num_kv_heads, si
   }
 
   kv_data.resize(page_counter * 2 * num_kv_heads * page_size * head_dim);
-  flashinfer::paged_kv_t<PageStorage::kIndices, DTypeKV, int32_t> paged_kv_cpu(
+  flashinfer::paged_kv_t<DTypeKV, int32_t> paged_kv_cpu(
       num_kv_heads, page_size, head_dim, batch_size, kv_layout, kv_data.data(), kv_indices.data(),
       kv_indptr.data(), kv_last_page_len.data());
   cpu_reference::append_paged_kv_cache<DTypeKV, int32_t>(paged_kv_cpu, key, value, append_indptr);
@@ -290,7 +290,7 @@ void _TestBatchPagedPrefillKernelShortContextCorrectness(size_t num_kv_heads, si
   thrust::device_vector<int32_t> kv_last_page_len_device(kv_last_page_len);
 
   // create paged_kv object
-  flashinfer::paged_kv_t<PageStorage::kIndices, DTypeKV, int32_t> paged_kv = paged_kv_cpu;
+  flashinfer::paged_kv_t<DTypeKV, int32_t> paged_kv = paged_kv_cpu;
   paged_kv.k_data = thrust::raw_pointer_cast(kv_data_device.data());
   paged_kv.v_data = paged_kv.k_data + paged_kv_cpu.kv_ptr_delta();
   paged_kv.indices = thrust::raw_pointer_cast(kv_indices_device.data());
@@ -334,7 +334,7 @@ void _TestBatchPagedPrefillKernelShortContextCorrectness(size_t num_kv_heads, si
                                  int_workspace_size_in_bytes, q_indptr.data(), kv_indptr.data(),
                                  batch_size, num_qo_heads, num_kv_heads, head_dim, page_size);
 
-  auto status = BatchPrefillWithPagedKVCacheWrapper<PageStorage::kIndices, DTypeQO, DTypeKV,
+  auto status = BatchPrefillWithPagedKVCacheWrapper<DTypeQO, DTypeKV,
                                                     DTypeQO, int32_t>(
       &handler, thrust::raw_pointer_cast(q_device.data()),
       thrust::raw_pointer_cast(q_indptr_device.data()),
@@ -404,7 +404,7 @@ void _TestBatchPagedPrefillKernelQMinMaxKVMinMaxCorrectness(
   }
 
   kv_data.resize(page_counter * 2 * num_kv_heads * page_size * head_dim);
-  flashinfer::paged_kv_t<PageStorage::kIndices, DTypeKV, int32_t> paged_kv_cpu(
+  flashinfer::paged_kv_t<DTypeKV, int32_t> paged_kv_cpu(
       num_kv_heads, page_size, head_dim, batch_size, kv_layout, kv_data.data(), kv_indices.data(),
       kv_indptr.data(), kv_last_page_len.data());
   cpu_reference::append_paged_kv_cache<DTypeKV, int32_t>(paged_kv_cpu, key, value, append_indptr);
@@ -416,7 +416,7 @@ void _TestBatchPagedPrefillKernelQMinMaxKVMinMaxCorrectness(
   thrust::device_vector<int32_t> kv_last_page_len_device(kv_last_page_len);
 
   // create paged_kv object
-  flashinfer::paged_kv_t<PageStorage::kIndices, DTypeKV, int32_t> paged_kv = paged_kv_cpu;
+  flashinfer::paged_kv_t<DTypeKV, int32_t> paged_kv = paged_kv_cpu;
   paged_kv.k_data = thrust::raw_pointer_cast(kv_data_device.data());
   paged_kv.v_data = paged_kv.k_data + paged_kv_cpu.kv_ptr_delta();
   paged_kv.indices = thrust::raw_pointer_cast(kv_indices_device.data());
@@ -461,7 +461,7 @@ void _TestBatchPagedPrefillKernelQMinMaxKVMinMaxCorrectness(
                                  int_workspace_size_in_bytes, q_indptr.data(), kv_indptr.data(),
                                  batch_size, num_qo_heads, num_kv_heads, head_dim, page_size);
 
-  auto status = BatchPrefillWithPagedKVCacheWrapper<PageStorage::kIndices, DTypeQO, DTypeKV,
+  auto status = BatchPrefillWithPagedKVCacheWrapper<DTypeQO, DTypeKV,
                                                     DTypeQO, int32_t>(
       &handler, thrust::raw_pointer_cast(q_device.data()),
       thrust::raw_pointer_cast(q_indptr_device.data()),
@@ -518,7 +518,7 @@ void _TestBatchPagedPrefillKernelLongContextCorrectness(size_t num_kv_heads, siz
   }
 
   kv_data.resize(page_counter * 1 * 2 * num_kv_heads * page_size * head_dim);
-  flashinfer::paged_kv_t<PageStorage::kIndices, DTypeKV, int32_t> paged_kv_cpu(
+  flashinfer::paged_kv_t<DTypeKV, int32_t> paged_kv_cpu(
       num_kv_heads, page_size, head_dim, 1, kv_layout, kv_data.data(), kv_indices.data(),
       kv_indptr.data(), kv_last_page_len.data());
   cpu_reference::append_paged_kv_cache<DTypeKV, int32_t>(paged_kv_cpu, {k}, {v}, append_indptr);
@@ -530,7 +530,7 @@ void _TestBatchPagedPrefillKernelLongContextCorrectness(size_t num_kv_heads, siz
   thrust::device_vector<int32_t> kv_last_page_len_device(kv_last_page_len);
 
   // create paged_kv object
-  flashinfer::paged_kv_t<PageStorage::kIndices, DTypeKV, int32_t> paged_kv = paged_kv_cpu;
+  flashinfer::paged_kv_t<DTypeKV, int32_t> paged_kv = paged_kv_cpu;
   paged_kv.k_data = thrust::raw_pointer_cast(kv_data_device.data());
   paged_kv.v_data = paged_kv.k_data + paged_kv_cpu.kv_ptr_delta();
   paged_kv.indices = thrust::raw_pointer_cast(kv_indices_device.data());
@@ -561,7 +561,7 @@ void _TestBatchPagedPrefillKernelLongContextCorrectness(size_t num_kv_heads, siz
       append_indptr.data(), kv_indptr.data(),
       /*batch_size=*/1, num_qo_heads, num_kv_heads, head_dim, page_size);
 
-  auto status = BatchPrefillWithPagedKVCacheWrapper<PageStorage::kIndices, DTypeQO, DTypeKV,
+  auto status = BatchPrefillWithPagedKVCacheWrapper<DTypeQO, DTypeKV,
                                                     DTypeQO, int32_t>(
       &handler, thrust::raw_pointer_cast(q_device.data()),
       thrust::raw_pointer_cast(q_indptr_device.data()),
