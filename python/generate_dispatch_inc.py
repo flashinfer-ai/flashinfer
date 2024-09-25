@@ -36,19 +36,6 @@ def get_dispatch_inc_str(args: argparse.Namespace) -> str:
 {dispatch_head_dims_entries}
 // EOL
 """
-    # logits post hooks
-    dispatch_logits_post_hooks_entries = "\n".join(
-        [
-            "  _DISPATCH_CASE({}, case_var, __VA_ARGS__) \\".format(
-                logits_hook_literal[_]
-            )
-            for _ in args.logits_post_hooks
-        ]
-    )
-    dispatch_logits_post_hooks_str = f"""#define _DISPATCH_CASES_logits_post_hook(case_var, ...)         \\
-{dispatch_logits_post_hooks_entries}
-// EOL
-"""
     # positional encoding modes
     dispatch_pos_encoding_modes_entries = "\n".join(
         [
@@ -90,7 +77,6 @@ def get_dispatch_inc_str(args: argparse.Namespace) -> str:
     return "\n".join(
         [
             dispatch_head_dims_str,
-            dispatch_logits_post_hooks_str,
             dispatch_pos_encoding_modes_str,
             dispatch_allow_fp16_qk_reductions_str,
             dispatch_mask_mode_str,
@@ -105,13 +91,6 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--head_dims", type=int, required=True, nargs="+", help="Head dimensions"
-    )
-    parser.add_argument(
-        "--logits_post_hooks",
-        type=int,
-        required=True,
-        nargs="+",
-        help="Logit post hooks",
     )
     parser.add_argument(
         "--pos_encoding_modes",
