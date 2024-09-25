@@ -114,7 +114,7 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
         flashinfer::BatchDecodeWithPagedKVCacheNoSplitKV<PageStorage::kIndices, DTypeQO, DTypeKV,
                                                          DTypeQO, int32_t>(
             thrust::raw_pointer_cast(q_device.data()), /*q_offset=*/nullptr, paged_kv,
-            kv_partition_info_t<int32_t>(), thrust::raw_pointer_cast(o_device.data()),
+            thrust::raw_pointer_cast(o_device.data()),
             /*lse=*/nullptr, num_qo_heads, pos_encoding_mode);
     EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
   } else {

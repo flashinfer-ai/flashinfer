@@ -96,7 +96,7 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
       cudaError_t status =
           BatchDecodeWithPagedKVCacheNoSplitKV<PageStorage::kIndices, T, T, T, int32_t>(
               thrust::raw_pointer_cast(q.data()), /*q_offset=*/nullptr, paged_kv,
-              kv_partition_info_t<int32_t>(), thrust::raw_pointer_cast(o.data()),
+              thrust::raw_pointer_cast(o.data()),
               /*lse=*/nullptr, num_qo_heads, pos_encoding_mode);
       if (status != cudaSuccess) {
         state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
