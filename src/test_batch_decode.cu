@@ -28,8 +28,7 @@ constexpr QKVLayout kv_layout = QKVLayout::kNHD;
 template <typename DTypeQO, typename DTypeKV>
 void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, size_t num_qo_heads,
                                          size_t num_kv_heads, size_t head_dim,
-                                         flashinfer::PosEncodingMode pos_encoding_mode,
-                                         bool cooperative) {
+                                         flashinfer::PosEncodingMode pos_encoding_mode) {
   std::vector<int32_t> seq_lens(batch_size);
   utils::vec_randint_(seq_lens, 1, 1024);
   std::vector<int32_t> append_indptr{0};
@@ -108,24 +107,13 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
       kv_indptr.data(), kv_last_page_len.data(), batch_size, num_qo_heads, num_kv_heads, head_dim,
       page_size, pos_encoding_mode);
 
-  if (!cooperative) {
-    // use non-cooperative kernel
-    cudaError_t status =
-        flashinfer::BatchDecodeWithPagedKVCacheNoSplitKV<DTypeQO, DTypeKV,
-                                                         DTypeQO, int32_t>(
-            thrust::raw_pointer_cast(q_device.data()), /*q_offset=*/nullptr, paged_kv,
-            thrust::raw_pointer_cast(o_device.data()),
-            /*lse=*/nullptr, num_qo_heads, pos_encoding_mode);
-    EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
-  } else {
-    cudaError_t status =
-        flashinfer::BatchDecodeWithPagedKVCacheWrapper<DTypeQO, DTypeKV,
-                                                       DTypeQO, int32_t>(
-            &handler, thrust::raw_pointer_cast(q_device.data()), /*q_offset=*/nullptr, paged_kv,
-            thrust::raw_pointer_cast(o_device.data()), /*lse=*/nullptr, num_qo_heads,
-            pos_encoding_mode);
-    EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
-  }
+  cudaError_t status =
+      flashinfer::BatchDecodeWithPagedKVCacheWrapper<DTypeQO, DTypeKV,
+                                                      DTypeQO, int32_t>(
+          &handler, thrust::raw_pointer_cast(q_device.data()), /*q_offset=*/nullptr, paged_kv,
+          thrust::raw_pointer_cast(o_device.data()), /*lse=*/nullptr, num_qo_heads,
+          pos_encoding_mode);
+  EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
   // compare result
   thrust::host_vector<DTypeQO> o_host = o_device;
   size_t num_result_errors_atol_1e_3_rtol_1e_3 = 0;
@@ -151,25 +139,6 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
 template <typename DTypeQO, typename DTypeKV>
 void TestBatchDecodeKernelCorrectness() {
   for (size_t page_size : {1, 3, 7, 16}) {
-    for (size_t batch_size : {1, 7, 37, 61}) {
-      for (size_t num_qo_heads : {32}) {
-        for (size_t num_kv_heads : {32, 8, 4}) {
-          for (size_t head_dim : {64, 128, 256}) {
-            for (size_t pos_encoding_mode : {0U, 1U}) {
-              _TestBatchDecodingKernelCorrectness<DTypeQO, DTypeKV>(
-                  page_size, batch_size, num_qo_heads, num_kv_heads, head_dim,
-                  flashinfer::PosEncodingMode(pos_encoding_mode), false);
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
-template <typename DTypeQO, typename DTypeKV>
-void TestCooperativeBatchDecodeKernelCorrectness() {
-  for (size_t page_size : {1, 3, 7, 16}) {
     for (size_t batch_size : {1, 2, 4, 8}) {
       for (size_t num_qo_heads : {32}) {
         for (size_t num_kv_heads : {32, 8, 4}) {
@@ -177,7 +146,7 @@ void TestCooperativeBatchDecodeKernelCorrectness() {
             for (size_t pos_encoding_mode : {0U, 1U}) {
               _TestBatchDecodingKernelCorrectness<DTypeQO, DTypeKV>(
                   page_size, batch_size, num_qo_heads, num_kv_heads, head_dim,
-                  flashinfer::PosEncodingMode(pos_encoding_mode), true);
+                  flashinfer::PosEncodingMode(pos_encoding_mode));
             }
           }
         }
@@ -206,6 +175,3 @@ TEST(FlashInferCorrectnessTest, TestBatchDecodeKernelCorrectnessE5M2) {
 }
 #endif
 
-TEST(FlashInferCorrectnessTest, TestCooperativeBatchDecodeKernelCorrectnessTestFP16) {
-  TestCooperativeBatchDecodeKernelCorrectness<half, half>();
-}
