@@ -235,6 +235,9 @@ inline constexpr uint32_t pack_u16(uint16_t a, uint16_t b) {
 
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
+#define CHECK_LAST_DIM_CONTIGUOUS(x) \
+  TORCH_CHECK(x.strides()[x.strides().size() - 1] == 1, #x "'s last dim must be contiguous")
+
 #define CHECK_INPUT(x) \
   CHECK_CUDA(x);       \
   CHECK_CONTIGUOUS(x)

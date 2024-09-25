@@ -76,10 +76,13 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Run(
   CHECK_INPUT(q);
   CHECK_INPUT(qo_indptr);
   if (paged_kv_defined) {
-    CHECK_INPUT(paged_kv_cache.value());
+    CHECK_CUDA(paged_kv_cache.value());
+    CHECK_LAST_DIM_CONTIGUOUS(paged_kv_cache.value());
   } else {
-    CHECK_INPUT(paged_k_cache.value());
-    CHECK_INPUT(paged_v_cache.value());
+    CHECK_CUDA(paged_k_cache.value());
+    CHECK_LAST_DIM_CONTIGUOUS(paged_k_cache.value());
+    CHECK_CUDA(paged_v_cache.value());
+    CHECK_LAST_DIM_CONTIGUOUS(paged_v_cache.value());
   }
   CHECK_INPUT(paged_kv_indptr);
   CHECK_INPUT(paged_kv_indices);
@@ -163,6 +166,17 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Run(
   auto kv_scalar_type =
       paged_kv_defined ? paged_kv_cache->scalar_type() : paged_k_cache->scalar_type();
 
+
+  const int64_t* kv_cache_strides = nullptr;
+  if (paged_kv_cache.has_value()) {
+    kv_cache_strides = paged_kv_cache->strides().data();
+  } else {
+    auto k_strides = paged_k_cache->strides();
+    auto v_strides = paged_v_cache->strides();
+    TORCH_CHECK(k_strides == v_strides, "k/v cache strides not match");
+    kv_cache_strides = k_strides.data();
+  }
+
   if (q_scalar_type == kv_scalar_type) {
     DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q_scalar_type, c_type, [&] {
       return DISPATCH_logits_post_hook(logits_post_hook, LOGITS_POST_HOOK, [&] {
@@ -171,6 +185,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Run(
             static_cast<c_type*>(paged_kv_cache.has_value() ? paged_kv_cache->data_ptr() : nullptr),
             static_cast<c_type*>(paged_k_cache.has_value() ? paged_k_cache->data_ptr() : nullptr),
             static_cast<c_type*>(paged_v_cache.has_value() ? paged_v_cache->data_ptr() : nullptr),
+            kv_cache_strides,
             static_cast<int32_t*>(paged_kv_indices.data_ptr()),
             static_cast<int32_t*>(paged_kv_indptr.data_ptr()),
             static_cast<int32_t*>(paged_kv_last_page_len.data_ptr()));
@@ -214,6 +229,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCachePyTorchWrapper::Run(
                                                               : nullptr),
               static_cast<kv_type*>(paged_v_cache.has_value() ? paged_v_cache->data_ptr()
                                                               : nullptr),
+              kv_cache_strides,
               static_cast<int32_t*>(paged_kv_indices.data_ptr()),
               static_cast<int32_t*>(paged_kv_indptr.data_ptr()),
               static_cast<int32_t*>(paged_kv_last_page_len.data_ptr()));
