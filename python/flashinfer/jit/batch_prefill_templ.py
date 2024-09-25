@@ -107,7 +107,7 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCacheRun(
   RaggedParamsT params(
     static_cast<{{ dtype_q }}*>(q.data_ptr()), static_cast<{{ dtype_kv }}*>(k.data_ptr()),
     static_cast<{{ dtype_kv }}*>(v.data_ptr()),
-    {% if mask_mode == "MaskMode::kCustom" %}static_cast<uint8_t*>(maybe_packed_custom_mask->data_ptr()){% else %}nullptr{% endif %},
+    {% if mask_mode == "MaskMode::kCustom" %}static_cast<uint8_t*>(maybe_custom_mask->data_ptr()){% else %}nullptr{% endif %},
     static_cast<{{ dtype_idx }}*>(qo_indptr.data_ptr()),
     static_cast<{{ dtype_idx }}*>(kv_indptr.data_ptr()),
     {% if mask_mode == "MaskMode::kCustom" %}static_cast<{{ dtype_idx }}*>(maybe_qk_indptr->data_ptr()){% else %}nullptr{% endif %},
@@ -222,7 +222,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
 
   PagedParamsT params(
     static_cast<{{ dtype_q }}*>(q.data_ptr()), paged_kv,
-    {% if mask_mode == "MaskMode::kCustom" %}static_cast<uint8_t*>(maybe_packed_custom_mask->data_ptr()){% else %}nullptr{% endif %},
+    {% if mask_mode == "MaskMode::kCustom" %}static_cast<uint8_t*>(maybe_custom_mask->data_ptr()){% else %}nullptr{% endif %},
     static_cast<{{ dtype_idx }}*>(qo_indptr.data_ptr()),
     {% if mask_mode == "MaskMode::kCustom" %}static_cast<{{ dtype_idx }}*>(maybe_qk_indptr->data_ptr()){% else %}nullptr{% endif %},
     static_cast<{{ dtype_o }}*>(o.data_ptr()),

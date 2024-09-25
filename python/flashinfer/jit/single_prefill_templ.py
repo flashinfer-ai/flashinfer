@@ -32,28 +32,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, std::optional<torch::Tensor> maybe_packed_custom_mask,
     torch::Tensor tmp, std::optional<torch::Tensor> maybe_alibi_slopes, unsigned int layout, int32_t window_left, float logits_soft_cap, float sm_scale,
     float rope_scale, float rope_theta, bool return_lse) {
-  CHECK_CUDA(q);
-  CHECK_CUDA(k);
-  CHECK_CUDA(v);
   auto device = q.device();
-  CHECK_EQ(k.device(), device);
-  CHECK_EQ(v.device(), device);
-  CHECK_DIM(3, q);
-  CHECK_DIM(3, k);
-  CHECK_DIM(3, v);
-  CHECK_SHAPE(k, v);
-  CHECK_EQ(q.stride(2), 1);
-  CHECK_EQ(k.stride(2), 1);
-  CHECK_EQ(v.stride(2), 1);
-  CHECK_EQ(q.size(2), k.size(2));
-  {% if mask_mode == "MaskMode::kCustom" %}
-    CHECK_INPUT(maybe_packed_custom_mask.value());
-    CHECK_EQ(maybe_packed_custom_mask->device(), device);
-    CHECK_DIM(1, maybe_packed_custom_mask.value());
-    // packed_custom_mask must be uint8
-    TORCH_CHECK(maybe_packed_custom_mask->scalar_type() == torch::kUInt8,
-                "packed_custom_mask must be uint8");
-  {% endif %}
   unsigned int head_dim = q.size(2);
   unsigned int kv_len, qo_len, num_kv_heads, num_qo_heads;
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
@@ -71,15 +50,12 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
     kv_stride_h = k.stride(0);
     kv_stride_n = k.stride(1);
   }
-  CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto o = torch::empty_like(q, q.options());
   torch::Tensor lse = torch::empty({0});
   if (return_lse) {
     lse = torch::empty({qo_len, num_qo_heads}, q.options().dtype(torch::kFloat32));
   }
-
-  TORCH_CHECK(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
 
   ParamsT params(
     static_cast<{{ dtype_q }}*>(q.data_ptr()), static_cast<{{ dtype_kv }}*>(k.data_ptr()),
