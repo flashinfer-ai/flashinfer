@@ -15,7 +15,10 @@
  */
 #include <torch/extension.h>
 
-#include "flashinfer_ops.h"
+torch::Tensor packbits(torch::Tensor x, const std::string& bitorder);
+
+torch::Tensor segment_packbits(torch::Tensor x, torch::Tensor input_indptr,
+                               torch::Tensor output_indptr, const std::string& bitorder);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("packbits", &packbits, "GPU packbits operator");

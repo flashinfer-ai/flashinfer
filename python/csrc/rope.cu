@@ -15,7 +15,6 @@
  */
 #include <flashinfer/pos_enc.cuh>
 
-#include "flashinfer_ops.h"
 #include "pytorch_extension_utils.h"
 
 using namespace flashinfer;

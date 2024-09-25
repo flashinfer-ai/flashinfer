@@ -13,12 +13,28 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <flashinfer/group_gemm/handler.cuh>
 #include <flashinfer/group_gemm/wrapper.cuh>
 
-#include "flashinfer_ops.h"
 #include "pytorch_extension_utils.h"
 
 using namespace flashinfer::group_gemm;
+
+class CutlassSegmentGEMMPyTorchWrapper {
+ public:
+  void RegisterWorkspaceBuffer(torch::Tensor workspace_buffer);
+
+  torch::Tensor Run(torch::Tensor seg_indptr, torch::Tensor weight_indices, torch::Tensor x,
+                    torch::Tensor weight, unsigned int batch_size, bool weight_column_major);
+
+  CutlassSegmentGEMMPyTorchWrapper(torch::Tensor workspace_buffer)
+      : handler_(std::make_shared<flashinfer::group_gemm::CutlassSegmentGEMMHandler>()) {
+    RegisterWorkspaceBuffer(workspace_buffer);
+  }
+
+ private:
+  std::shared_ptr<flashinfer::group_gemm::CutlassSegmentGEMMHandler> handler_;
+};
 
 void CutlassSegmentGEMMPyTorchWrapper::RegisterWorkspaceBuffer(torch::Tensor workspace_buffer) {
   handler_->RegisterWorkspace(static_cast<void*>(workspace_buffer.data_ptr()),

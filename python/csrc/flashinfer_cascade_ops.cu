@@ -15,7 +15,13 @@
  */
 #include <torch/extension.h>
 
-#include "flashinfer_ops.h"
+std::vector<torch::Tensor> merge_state(torch::Tensor v_a, torch::Tensor s_a, torch::Tensor v_b,
+                                       torch::Tensor s_b);
+
+void merge_state_in_place(torch::Tensor v, torch::Tensor s, torch::Tensor v_other,
+                          torch::Tensor s_other, std::optional<torch::Tensor> mask = std::nullopt);
+
+std::vector<torch::Tensor> merge_states(torch::Tensor v, torch::Tensor s);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("merge_state", &merge_state, "Merge two self-attention states");

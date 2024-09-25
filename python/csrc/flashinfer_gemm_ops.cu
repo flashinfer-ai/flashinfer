@@ -15,7 +15,8 @@
  */
 #include <torch/extension.h>
 
-#include "flashinfer_ops.h"
+void bmm_fp8(const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& D,
+             torch::Tensor& A_scale, torch::Tensor& B_scale);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("bmm_fp8", &bmm_fp8, "BMM FP8");

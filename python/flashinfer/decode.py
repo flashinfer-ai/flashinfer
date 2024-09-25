@@ -17,6 +17,7 @@ limitations under the License.
 import math
 from typing import Optional, Union, Dict, Tuple
 import torch
+import functools
 
 from .jit import (
     load_cuda_ops,
@@ -26,15 +27,18 @@ from .jit import (
     gen_batch_decode_cu,
     get_batch_decode_uri,
 )
+from .prefill import get_single_prefill_module, get_batch_prefill_module
 
 from .utils import (
     PosEncodingMode,
     TensorLayout,
+    MaskMode,
     _check_pos_encoding_mode,
     _check_kv_layout,
     _unpack_paged_kv_cache,
     _get_cache_buf,
     _get_cache_alibi_slopes_buf,
+    _get_range_buf,
 )
 
 
@@ -189,9 +193,35 @@ def single_decode_with_kv_cache(
     num_qo_heads = q.shape[0]
 
     if use_tensor_cores:
-        # TODO(Zihao): fix this
-        raise NotImplementedError(
-            "Tensor cores is not supported in single_decode_with_kv_cache"
+        out = (
+            get_single_prefill_module(
+                q.dtype,
+                k.dtype,
+                q.dtype,
+                head_dim,
+                MaskMode.NON_CAUSAL.value,
+                PosEncodingMode[pos_encoding_mode].value,
+                window_left != -1,  # use_sliding_window
+                logits_soft_cap > 0,  # use_logits_soft_cap
+                pos_encoding_mode == "ALIBI",  # use_alibi
+                False,  # allow_fp16_qk_reduction
+            )
+            .run(
+                q.unsqueeze(0),
+                k,
+                v,
+                None,  # packed_custom_mask
+                tmp,
+                _get_cache_alibi_slopes_buf(num_qo_heads, q.device),
+                TensorLayout[kv_layout].value,
+                window_left,
+                logits_soft_cap,
+                sm_scale,
+                rope_scale,
+                rope_theta,
+                False,  # return_lse
+            )[0]
+            .squeeze(0)
         )
     else:
         out = get_single_decode_module(
@@ -217,37 +247,6 @@ def single_decode_with_kv_cache(
             rope_theta,
         )
 
-    # if use_tensor_cores:
-    #     out = _prefill.single_prefill_with_kv_cache(
-    #         q.unsqueeze(0),
-    #         k,
-    #         v,
-    #         tmp,
-    #         False,  # causal
-    #         TensorLayout[kv_layout].value,
-    #         PosEncodingMode[pos_encoding_mode].value,
-    #         False,  # allow_fp16_qk_reduction
-    #         window_left,
-    #         logits_soft_cap,
-    #         sm_scale,
-    #         rope_scale,
-    #         rope_theta,
-    #         False,  # return_lse
-    #     )[0].squeeze(0)
-    # else:
-    #     out = _decode.single_decode_with_kv_cache(
-    #         q,
-    #         k,
-    #         v,
-    #         tmp,
-    #         PosEncodingMode[pos_encoding_mode].value,
-    #         TensorLayout[kv_layout].value,
-    #         window_left,
-    #         logits_soft_cap,
-    #         sm_scale,
-    #         rope_scale,
-    #         rope_theta,
-    #     )
     if v_scale is not None:
         out *= v_scale
     return out
@@ -532,31 +531,38 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._paged_kv_indices_buf = indices
             self._paged_kv_last_page_len_buf = last_page_len
 
-        # NOTE(Zihao): the following tensors acts as placeholder to pass dtype info
         if not q_data_type:
             q_data_type = data_type
 
         if self.use_tensor_cores:
-            if not self.is_cuda_graph_enabled:
-                # when not using cudagraph, we need to create the indptr buffer, otherwise
-                # the buffer is already created during initialization
-                self._qo_indptr_buf = torch.arange(
-                    batch_size + 1, dtype=torch.int32, device=indptr.device
-                )
-            """ 
-            self._wrapper.plan(
+            self._qo_indptr_buf = (
+                _get_range_buf(batch_size, self._float_workspace_buffer.device),
+            )
+            self._cached_module = get_batch_prefill_module(
+                q_data_type,
+                data_type,
+                q_data_type,
+                indptr.dtype,
+                head_dim,
+                PosEncodingMode[pos_encoding_mode].value,
+                MaskMode.NON_CAUSAL.value,
+                window_left != -1,  # use_sliding_window
+                logits_soft_cap > 0,  # use_logits_soft_cap
+                pos_encoding_mode == "ALIBI",  # use_alibi
+                False,  # allow_fp16_qk_reduction
+            )
+            self._plan_info = self._cached_module.plan(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
+                self._pin_memory_int_workspace_buffer,
                 self._qo_indptr_buf,
                 indptr,
                 batch_size,
                 num_qo_heads,
                 num_kv_heads,
-                head_dim,
                 page_size,
-                empty_q_data,
+                self.is_cuda_graph_enabled,
             )
-            """
         else:
             self._cached_module = get_batch_decode_module(
                 q_data_type,
@@ -574,7 +580,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._int_workspace_buffer,
                 self._pin_memory_int_workspace_buffer,
                 indptr,
-                last_page_len,
                 batch_size,
                 num_qo_heads,
                 num_kv_heads,
@@ -623,7 +628,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
-    ) -> torch.Tensor:
+        return_lse: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
 
         Parameters
@@ -650,11 +656,17 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
         v_scale : Optional[float]
             The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
+        return_lse : bool
+            Whether to return the logsumexp of attention scores, defaults to ``False``.
 
         Returns
         -------
-        torch.Tensor
-            The attention output, shape: ``[batch_size, num_qo_heads, head_dim]``.
+        Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+            If :attr:`return_lse` is ``False``, the attention output, shape: ``[batch_size, num_qo_heads, head_dim]``.
+            If :attr:`return_lse` is ``True``, a tuple of two tensors:
+
+            * attention output, shape: ``[batch_size, num_qo_heads, head_dim]``
+            * logsumexp of attention scores, shape: ``[batch_size, num_qo_heads]``.
         """
         pos_encoding_mode = self._pos_encoding_mode
         window_left = self._window_left
@@ -678,28 +690,27 @@ class BatchDecodeWithPagedKVCacheWrapper:
             rope_theta = 1e4
 
         if self.use_tensor_cores:
-            raise NotImplementedError(
-                "Tensor cores is not supported in batch_decode_with_paged_kv_cache"
-            )
-            """
-            out = self._wrapper.run(
+            out = self._cached_module.paged_run(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._plan_info,
                 q,
-                self._qo_indptr_buf,
                 *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
+                None,  # packed_custom_mask
+                _get_cache_alibi_slopes_buf(q.shape[1], q.device),
+                self._qo_indptr_buf,
                 self._paged_kv_indptr_buf,
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,
-                False,  # causal
-                PosEncodingMode[pos_encoding_mode].value,
-                False,  # allow_fp16_qk_reduction
+                None,  # qk_indptr_buf
+                TensorLayout[self._kv_layout].value,
                 window_left,
                 logits_soft_cap,
                 sm_scale,
                 rope_scale,
                 rope_theta,
-                False,  # return_lse
-            )[0]
-            """
+                return_lse,
+            )
         else:
             out = self._cached_module.run(
                 self._float_workspace_buffer,
@@ -717,11 +728,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 sm_scale,
                 rope_scale,
                 rope_theta,
-                False,  # return_lse
-            )[0]
+                return_lse,
+            )
         if v_scale is not None:
-            out *= v_scale
-        return out
+            out[0] *= v_scale
+
+        return out if return_lse else out[0]
 
     def forward_return_lse(
         self,
@@ -748,119 +760,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             q, paged_kv_cache, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
         )
 
-    def run_return_lse(
-        self,
-        q: torch.Tensor,
-        paged_kv_cache: torch.Tensor,
-        q_scale: Optional[float] = None,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        r"""Compute batch decode attention with paged kv cache, return attention output
-        and logsumexp of attention scores.
-
-        Parameters
-        ----------
-        q : torch.Tensor
-            The query tensor, shape: ``[batch_size, num_qo_heads, head_dim]``
-        paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-            The paged KV-Cache stored as a tuple of tensors or a single tensor:
-
-            * a tuple ``(k_cache, v_cache)`` of 4-D tensors, each with shape:
-              ``[max_num_pages, page_size, num_kv_heads, head_dim]`` if :attr:`kv_layout` is ``NHD``,
-              and ``[max_num_pages, num_kv_heads, page_size, head_dim]`` if :attr:`kv_layout` is ``HND``.
-
-            * a single 5-D tensor with shape:
-              ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
-              :attr:`kv_layout` is ``NHD``, and
-              ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
-              :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
-              ``paged_kv_cache[:, 1]`` is the value-cache.
-
-        q_scale : Optional[float]
-            The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
-        k_scale : Optional[float]
-            The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
-        v_scale : Optional[float]
-            The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
-
-        Returns
-        -------
-        V : torch.Tensor
-            The attention output, shape: ``[batch_size, num_qo_heads, head_dim]``.
-        S : torch.Tensor
-            The logsumexp of attention scores, Shape: ``[batch_size, num_qo_heads]``.
-
-        Note
-        ----
-        Please refer to the :ref:`tutorial <recursive-attention>` for a detailed
-        explanation of the log-sum-exp function and attention states.
-        """
-        pos_encoding_mode = self._pos_encoding_mode
-        window_left = self._window_left
-        logits_soft_cap = self._logits_soft_cap
-        sm_scale = self._sm_scale
-        rope_scale = self._rope_scale
-        rope_theta = self._rope_theta
-        _check_pos_encoding_mode(pos_encoding_mode)
-        if logits_soft_cap is None:
-            logits_soft_cap = 0.0
-        if sm_scale is None:
-            head_dim = q.shape[-1]
-            sm_scale = 1.0 / math.sqrt(head_dim)
-        if q_scale is not None:
-            sm_scale *= q_scale
-        if k_scale is not None:
-            sm_scale *= k_scale
-        if rope_scale is None:
-            rope_scale = 1.0
-        if rope_theta is None:
-            rope_theta = 1e4
-        if self.use_tensor_cores:
-            raise NotImplementedError(
-                "Tensor cores is not supported in batch_decode_with_paged_kv_cache"
-            )
-            """
-            V, s = self._wrapper.run(
-                q,
-                self._qo_indptr_buf,
-                *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
-                self._paged_kv_indptr_buf,
-                self._paged_kv_indices_buf,
-                self._paged_kv_last_page_len_buf,
-                False,  # causal
-                PosEncodingMode[pos_encoding_mode].value,
-                False,  # allow_fp16_qk_reduction
-                window_left,
-                logits_soft_cap,
-                sm_scale,
-                rope_scale,
-                rope_theta,
-                True,  # return_lse
-            )
-            """
-        else:
-            V, s = self._cached_module.run(
-                self._float_workspace_buffer,
-                self._int_workspace_buffer,
-                self._plan_info,
-                q,
-                *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
-                self._paged_kv_indptr_buf,
-                self._paged_kv_indices_buf,
-                self._paged_kv_last_page_len_buf,
-                _get_cache_alibi_slopes_buf(q.shape[1], q.device),
-                TensorLayout[self._kv_layout].value,
-                window_left,
-                logits_soft_cap,
-                sm_scale,
-                rope_scale,
-                rope_theta,
-                True,  # return_lse
-            )
-        if v_scale is not None:
-            V *= v_scale
-        return V, s
+    run_return_lse = functools.partialmethod(run, return_lse=True)
 
     def end_forward(self) -> None:
         r"""Warning: this function is deprecated and has no effect."""

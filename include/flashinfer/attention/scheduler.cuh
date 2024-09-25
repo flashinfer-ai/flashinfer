@@ -198,7 +198,6 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
  * \tparam IdType A template type indicates the index data type
  * \param old_batch_size The batch size of the old Paged KV-Cache
  * \param old_page_indptr_h The host-side page indptr of the old Paged KV-Cache
- * \param old_last_page_len_h The host-side last page offset of the old Paged KV-Cache
  * \param max_num_pages_per_batch The maximum number of pages per batch
  * \param new_paged_kv_d The device-side new Paged KV-Cache
  * \param stream The cuda stream to launch the kernel
@@ -285,9 +284,8 @@ template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename Attenti
 cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes, void* int_buffer,
                        void* page_locked_int_buffer, size_t int_workspace_size_in_bytes,
                        DecodePlanInfo& plan_info, typename AttentionVariant::IdType* indptr_h,
-                       typename AttentionVariant::IdType* last_page_len_h, uint32_t batch_size,
-                       uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t page_size,
-                       bool enable_cuda_graph, cudaStream_t stream) {
+                       uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
+                       uint32_t page_size, bool enable_cuda_graph, cudaStream_t stream) {
   using DTypeOut = typename AttentionVariant::DTypeO;
   using IdType = typename AttentionVariant::IdType;
   bool split_kv;

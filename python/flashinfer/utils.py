@@ -141,6 +141,21 @@ def _get_cache_buf(name: str, bytes: int, device: torch.device) -> torch.Tensor:
     return buf
 
 
+# find the least power of 2 that is greater than or equal to x
+def _ceil_pow2(x: int) -> int:
+    return 1 << (x - 1).bit_length()
+
+
+def _get_range_buf(seq_len: int, device: torch.device) -> torch.Tensor:
+    seq_len_pow2 = _ceil_pow2(seq_len)
+    key = (f"range_{seq_len_pow2}", device)
+    buf = _cache_buf.get(key)
+    if buf is None:
+        buf = torch.arange(seq_len_pow2, device=device)
+        _cache_buf[key] = buf
+    return buf[:seq_len]
+
+
 def _get_cache_alibi_slopes_buf(
     num_qo_heads: int, device: torch.device
 ) -> torch.Tensor:

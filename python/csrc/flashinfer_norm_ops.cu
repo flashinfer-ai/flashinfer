@@ -15,7 +15,15 @@
  */
 #include <torch/extension.h>
 
-#include "flashinfer_ops.h"
+torch::Tensor rmsnorm(torch::Tensor input, torch::Tensor weight, double eps);
+
+void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight,
+                       double eps);
+
+torch::Tensor gemma_rmsnorm(torch::Tensor input, torch::Tensor weight, double eps);
+
+void gemma_fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight,
+                             double eps);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rmsnorm", &rmsnorm, "Root mean square normalization");

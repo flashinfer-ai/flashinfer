@@ -15,7 +15,23 @@
  */
 #include <torch/extension.h>
 
-#include "flashinfer_ops.h"
+void apply_rope_inplace(torch::Tensor q, torch::Tensor k, torch::Tensor indptr,
+                        torch::Tensor offsets, bool interleave, float rope_scale, float rope_theta);
+
+void apply_llama31_rope_inplace(torch::Tensor q, torch::Tensor k, torch::Tensor indptr,
+                                torch::Tensor offsets, bool interleave, float rope_scale,
+                                float rope_theta, float low_freq_factor, float high_freq_factor,
+                                float old_context_length);
+
+std::vector<torch::Tensor> apply_rope(torch::Tensor q, torch::Tensor k, torch::Tensor indptr,
+                                      torch::Tensor offsets, bool interleave, float rope_scale,
+                                      float rope_theta);
+
+std::vector<torch::Tensor> apply_llama31_rope(torch::Tensor q, torch::Tensor k,
+                                              torch::Tensor indptr, torch::Tensor offsets,
+                                              bool interleave, float rope_scale, float rope_theta,
+                                              float low_freq_factor, float high_freq_factor,
+                                              float old_context_length);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("apply_rope_inplace", &apply_rope_inplace, "Apply RoPE in-place");

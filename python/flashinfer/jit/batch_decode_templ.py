@@ -32,7 +32,7 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
     torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
     torch::Tensor page_locked_int_workspace_buffer,
     torch::Tensor indptr,
-    torch::Tensor last_page_len, unsigned int batch_size, unsigned int num_qo_heads,
+    unsigned int batch_size, unsigned int num_qo_heads,
     unsigned int num_kv_heads, unsigned int page_size,
     bool enable_cuda_graph) {
   size_t float_workspace_size_in_bytes =
@@ -42,7 +42,6 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
   auto device = float_workspace_buffer.device();
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   indptr = indptr.to(torch::kCPU);
-  last_page_len = last_page_len.to(torch::kCPU);
 
   DecodePlanInfo plan_info;
 
@@ -54,7 +53,6 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
       int_workspace_size_in_bytes,
       plan_info,
       static_cast<{{ dtype_idx }}*>(indptr.data_ptr()),
-      static_cast<{{ dtype_idx }}*>(last_page_len.data_ptr()),
       batch_size, num_qo_heads, num_kv_heads, page_size, enable_cuda_graph, /*stream=*/torch_current_stream);
 
   TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
