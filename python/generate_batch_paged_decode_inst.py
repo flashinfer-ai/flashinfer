@@ -41,7 +41,7 @@ using AttentionVariant = ComposedAttention<ParamsT, get_variant_code(false, fals
 
 template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{head_dim}, {pos_encoding_mode}, AttentionVariant>(
     typename AttentionVariant::ParamsT params,
-    typename AttentionVariant::DTypeO* tmp,
+    typename AttentionVariant::DTypeO* tmp_v, float* tmp_s,
     cudaStream_t stream);
 }}
     """.format(
