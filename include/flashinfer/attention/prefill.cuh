@@ -1087,12 +1087,11 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
         q + params.get_q_elem_offset(0, kv_head_idx * group_size,
                                      (lane_idx % 8) * num_elems_per_128b<DTypeQ>());
     DTypeO* o_ptr_base =
-        partition_kv
-            ? o + chunk_idx * num_qo_heads * head_dim +
-                  params.get_o_elem_offset(0, kv_head_idx * group_size,
-                                           (lane_idx % 8) * num_elems_per_128b<DTypeO>())
-            : o + params.get_o_elem_offset(0, kv_head_idx * group_size,
-                                           (lane_idx % 8) * num_elems_per_128b<DTypeO>());
+        partition_kv ? o + chunk_idx * num_qo_heads * head_dim +
+                           params.get_o_elem_offset(0, kv_head_idx * group_size,
+                                                    (lane_idx % 8) * num_elems_per_128b<DTypeO>())
+                     : o + params.get_o_elem_offset(0, kv_head_idx * group_size,
+                                                    (lane_idx % 8) * num_elems_per_128b<DTypeO>());
 
     uint32_t q_smem_offset_r = qo_smem.get_permuted_offset<channel_size_128b_q>(
         get_warp_idx_x<num_warps_x, num_warps_z>() * num_frags_x * 16 + lane_idx % 16,

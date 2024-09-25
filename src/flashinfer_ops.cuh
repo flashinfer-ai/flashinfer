@@ -20,6 +20,7 @@
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/attention/variants.cuh>
 #include <optional>
+#include <vector>
 
 #include "flashinfer/allocator.h"
 #include "flashinfer/attention/mask.cuh"
@@ -39,14 +40,14 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(typename AttentionVariant::Par
 class BatchDecodeHandler {
  public:
   template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV,
-            typename DTypeOut, typename IdType>
+            typename DTypeO, typename IdType>
   cudaError_t PlanDispatched(void* float_buffer, size_t float_workspace_size_in_bytes,
                              void* int_buffer, size_t int_workspace_size_in_bytes, IdType* indptr_h,
                              IdType* last_page_len_h, uint32_t batch_size, uint32_t num_qo_heads,
                              uint32_t num_kv_heads, uint32_t page_size) {
     int_buffer_ = int_buffer;
     float_buffer_ = float_buffer;
-    using ParamsT = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
+    using ParamsT = BatchDecodeParams<DTypeQ, DTypeKV, DTypeO, IdType>;
     using AttentionVariant =
         ComposedAttention<ParamsT,
                           get_variant_code(/*use_custom_mask=*/false, /*use_sliding_window=*/false,
@@ -101,10 +102,10 @@ class BatchDecodeHandler {
     return GetPtrFromBaseOffset<IdType>(int_buffer_, plan_info_.kv_chunk_size_ptr_offset);
   }
 
-  template <typename DTypeOut>
-  DTypeOut* GetTmpV() {
+  template <typename DTypeO>
+  DTypeO* GetTmpV() {
     if (plan_info_.split_kv) {
-      return GetPtrFromBaseOffset<DTypeOut>(float_buffer_, plan_info_.v_offset);
+      return GetPtrFromBaseOffset<DTypeO>(float_buffer_, plan_info_.v_offset);
     }
     return nullptr;
   }
@@ -151,14 +152,14 @@ class BatchPrefillHandler {
     cudaMallocHost(&page_locked_buffer_, int_workspace_size_in_bytes);
   }
 
-  template <typename DTypeOut, typename IdType>
+  template <typename DTypeO, typename IdType>
   cudaError_t Plan(void* float_buffer, size_t float_workspace_size_in_bytes, void* int_buffer,
                    size_t int_workspace_size_in_bytes, IdType* qo_indptr_h, IdType* kv_indptr_h,
                    uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
                    uint32_t head_dim, uint32_t page_size) {
     int_buffer_ = int_buffer;
     float_buffer_ = float_buffer;
-    return PrefillPlan<DTypeOut, IdType>(
+    return PrefillPlan<DTypeO, IdType>(
         float_buffer, float_workspace_size_in_bytes, int_buffer, page_locked_buffer_,
         int_workspace_size_in_bytes, plan_info_, qo_indptr_h, kv_indptr_h, batch_size, num_qo_heads,
         num_kv_heads, head_dim, page_size, enable_cuda_graph_, stream_);
@@ -211,10 +212,10 @@ class BatchPrefillHandler {
     return nullptr;
   }
 
-  template <typename DTypeOut>
-  DTypeOut* GetTmpV() {
+  template <typename DTypeO>
+  DTypeO* GetTmpV() {
     if (plan_info_.split_kv) {
-      return GetPtrFromBaseOffset<DTypeOut>(float_buffer_, plan_info_.v_offset);
+      return GetPtrFromBaseOffset<DTypeO>(float_buffer_, plan_info_.v_offset);
     }
     return nullptr;
   }
@@ -248,10 +249,10 @@ cudaError_t SinglePrefillWithKVCacheDispatched(typename AttentionVariant::Params
                                                typename AttentionVariant::DTypeO* tmp,
                                                cudaStream_t stream);
 
-template <typename DTypeIn, typename DTypeOut>
+template <typename DTypeIn, typename DTypeO>
 cudaError_t SinglePrefillWithKVCacheCustomMask(
-    DTypeIn* q, DTypeIn* k, DTypeIn* v, uint8_t* custom_mask, DTypeOut* o, DTypeOut* tmp,
-    float* lse, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t qo_len, uint32_t kv_len,
+    DTypeIn* q, DTypeIn* k, DTypeIn* v, uint8_t* custom_mask, DTypeO* o, DTypeO* tmp, float* lse,
+    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t qo_len, uint32_t kv_len,
     uint32_t head_dim, QKVLayout kv_layout = QKVLayout::kNHD,
     PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
     bool allow_fp16_qk_reduction = false, std::optional<float> maybe_sm_scale = std::nullopt,
@@ -263,7 +264,7 @@ cudaError_t SinglePrefillWithKVCacheCustomMask(
       allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION,
       {DISPATCH_head_dim(
           head_dim, HEAD_DIM, {DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
-            using ParamsT = SinglePrefillParams<DTypeIn, DTypeIn, DTypeOut>;
+            using ParamsT = SinglePrefillParams<DTypeIn, DTypeIn, DTypeO>;
             using AttentionVariant =
                 ComposedAttention<ParamsT,
                                   get_variant_code(
@@ -284,7 +285,7 @@ cudaError_t SinglePrefillWithKVCacheCustomMask(
 /*!
  * \brief FlashAttention prefill CUDA function for a single request.
  * \tparam DTypeIn The data type of input
- * \tparam DTypeOut The data type of output
+ * \tparam DTypeO The data type of output
  * \param q The query tensor.
  * \param k The key tensor.
  * \param v The value tensor.
@@ -305,8 +306,8 @@ cudaError_t SinglePrefillWithKVCacheCustomMask(
  * \param stream The cuda stream to execute the kernel on.
  * \return status Indicates whether CUDA calls are successful
  */
-template <typename DTypeQ, typename DTypeKV, typename DTypeOut>
-cudaError_t SinglePrefillWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut* o, DTypeOut* tmp,
+template <typename DTypeQ, typename DTypeKV, typename DTypeO>
+cudaError_t SinglePrefillWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeO* o, DTypeO* tmp,
                                      float* lse, uint32_t num_qo_heads, uint32_t num_kv_heads,
                                      uint32_t qo_len, uint32_t kv_len, uint32_t head_dim,
                                      bool causal = true, QKVLayout kv_layout = QKVLayout::kNHD,
@@ -326,7 +327,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut
           {DISPATCH_head_dim(
               head_dim, HEAD_DIM,
               {DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
-                using ParamsT = SinglePrefillParams<DTypeQ, DTypeKV, DTypeOut>;
+                using ParamsT = SinglePrefillParams<DTypeQ, DTypeKV, DTypeO>;
                 using AttentionVariant =
                     ComposedAttention<ParamsT,
                                       get_variant_code(
@@ -345,10 +346,10 @@ cudaError_t SinglePrefillWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut
   return cudaSuccess;
 }
 
-template <typename DTypeQ, typename DTypeKV, typename DTypeOut, typename IdType>
+template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
     BatchPrefillHandler* handler, DTypeQ* q, IdType* qo_indptr, DTypeKV* k, DTypeKV* v,
-    IdType* kv_indptr, IdType* q_offset, IdType* k_rope_pos_offset, DTypeOut* o, float* lse,
+    IdType* kv_indptr, IdType* q_offset, IdType* k_rope_pos_offset, DTypeO* o, float* lse,
     const uint32_t batch_size, const uint32_t num_qo_heads, const uint32_t num_kv_heads,
     const uint32_t head_dim, bool causal = true, QKVLayout kv_layout = QKVLayout::kNHD,
     PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
@@ -367,7 +368,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
           {DISPATCH_pos_encoding_mode(
               pos_encoding_mode, POS_ENCODING_MODE,
               {DISPATCH_allow_fp16_qk_reduction(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
-                using ParamsT = BatchPrefillRaggedParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
+                using ParamsT = BatchPrefillRaggedParams<DTypeQ, DTypeKV, DTypeO, IdType>;
                 using AttentionVariant =
                     ComposedAttention<ParamsT,
                                       get_variant_code(
@@ -393,16 +394,16 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
                   BatchPrefillWithRaggedKVCacheDispatched<WARP_LAYOUT, HEAD_DIM, POS_ENCODING_MODE,
                                                           ALLOW_FP16_QK_REDUCTION, MASK_MODE,
                                                           AttentionVariant>(
-                      params, handler->GetTmpV<DTypeOut>(), handler->GetTmpS(), stream);
+                      params, handler->GetTmpV<DTypeO>(), handler->GetTmpS(), stream);
                 });
               })})})});
   return cudaSuccess;
 }
 
-template <typename DTypeQ, typename DTypeKV, typename DTypeOut, typename IdType>
+template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheWrapper(
     BatchPrefillHandler* handler, DTypeQ* q, IdType* qo_indptr, IdType* q_offset,
-    paged_kv_t<DTypeKV, IdType> paged_kv, DTypeOut* o, float* lse, uint32_t num_qo_heads,
+    paged_kv_t<DTypeKV, IdType> paged_kv, DTypeO* o, float* lse, uint32_t num_qo_heads,
     bool causal = true, PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
     bool allow_fp16_qk_reduction = false, std::optional<float> maybe_sm_scale = std::nullopt,
     float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {
@@ -420,7 +421,7 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
           {DISPATCH_pos_encoding_mode(
               pos_encoding_mode, POS_ENCODING_MODE,
               {DISPATCH_allow_fp16_qk_reduction(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
-                using ParamsT = BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
+                using ParamsT = BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO, IdType>;
                 using AttentionVariant =
                     ComposedAttention<ParamsT, get_variant_code(/*use_custom_mask=*/(
                                                                     MASK_MODE == MaskMode::kCustom),
@@ -443,7 +444,7 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
                 DISPATCH_WARP_LAYOUT(warp_layout, WARP_LAYOUT, {
                   return BatchPrefillWithPagedKVCacheDispatched<
                       WARP_LAYOUT, HEAD_DIM, POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION, MASK_MODE,
-                      AttentionVariant>(params, handler->GetTmpV<DTypeOut>(), handler->GetTmpS(),
+                      AttentionVariant>(params, handler->GetTmpV<DTypeO>(), handler->GetTmpS(),
                                         stream);
                 })
               })})})});
@@ -455,8 +456,8 @@ cudaError_t SingleDecodeWithKVCacheDispatched(typename AttentionVariant::ParamsT
                                               typename AttentionVariant::DTypeO* tmp,
                                               cudaStream_t stream);
 
-template <typename DTypeQ, typename DTypeKV, typename DTypeOut>
-cudaError_t SingleDecodeWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut* o, DTypeOut* tmp,
+template <typename DTypeQ, typename DTypeKV, typename DTypeO>
+cudaError_t SingleDecodeWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeO* o, DTypeO* tmp,
                                     uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t seq_len,
                                     uint32_t head_dim, QKVLayout kv_layout = QKVLayout::kNHD,
                                     PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
@@ -473,7 +474,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut*
 
   DISPATCH_head_dim(
       head_dim, HEAD_DIM, {DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
-        using ParamsT = SingleDecodeParams<DTypeQ, DTypeKV, DTypeOut>;
+        using ParamsT = SingleDecodeParams<DTypeQ, DTypeKV, DTypeO>;
         using AttentionVariant =
             ComposedAttention<ParamsT, get_variant_code(
                                            /*use_custom_mask=*/false, /*use_sliding_window=*/false,
@@ -493,7 +494,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut*
  *   for cooperative kernels.
  * \tparam DTypeQ The data type of query tensor.
  * \tparam DTypeKV The data type of key-value tensor.
- * \tparam DTypeOut The data type of output tensor.
+ * \tparam DTypeO The data type of output tensor.
  * \tparam IdType The data type of index tensor.
  * \param handler The handler for the batch decode forward request.
  * \param q The input tensor.
@@ -506,10 +507,10 @@ cudaError_t SingleDecodeWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut*
  * \param rope_theta The theta of rope.
  * \param stream The CUDA stream.
  */
-template <typename DTypeQ, typename DTypeKV, typename DTypeOut, typename IdType>
+template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheWrapper(
     BatchDecodeHandler* handler, DTypeQ* q, IdType* q_offset, paged_kv_t<DTypeKV, IdType> paged_kv,
-    DTypeOut* o, float* lse, uint32_t num_qo_heads,
+    DTypeO* o, float* lse, uint32_t num_qo_heads,
     PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
     std::optional<float> maybe_sm_scale = std::nullopt, float rope_scale = 1.f,
     float rope_theta = 1e4, cudaStream_t stream = nullptr) {
@@ -525,7 +526,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapper(
   DISPATCH_head_dim(
       paged_kv.head_dim, HEAD_DIM,
       {DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
-        using ParamsT = BatchDecodeParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
+        using ParamsT = BatchDecodeParams<DTypeQ, DTypeKV, DTypeO, IdType>;
         using AttentionVariant =
             ComposedAttention<ParamsT, get_variant_code(
                                            /*use_custom_mask=*/false, /*use_sliding_window=*/false,
@@ -541,12 +542,12 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapper(
         params.padded_batch_size = handler->GetPlanInfo().padded_batch_size;
 
         return BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, POS_ENCODING_MODE, AttentionVariant>(
-            params, handler->GetTmpV<DTypeOut>(), handler->GetTmpS(), stream);
+            params, handler->GetTmpV<DTypeO>(), handler->GetTmpS(), stream);
       })});
   return cudaSuccess;
 }
 
-template <typename DTypeQ, typename DTypeKV, typename DTypeOut, typename IdType>
+template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType>
 cudaError_t BatchDecodeHandlerPlan(BatchDecodeHandler* handler, void* float_buffer,
                                    size_t float_workspace_size_in_bytes, void* int_buffer,
                                    size_t int_workspace_size_in_bytes, IdType* indptr_h,
@@ -561,10 +562,9 @@ cudaError_t BatchDecodeHandlerPlan(BatchDecodeHandler* handler, void* float_buff
   }
   DISPATCH_head_dim(head_dim, HEAD_DIM, {
     DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
-      return handler
-          ->PlanDispatched<HEAD_DIM, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeOut, IdType>(
-              float_buffer, float_workspace_size_in_bytes, int_buffer, int_workspace_size_in_bytes,
-              indptr_h, last_page_len_h, batch_size, num_qo_heads, num_kv_heads, page_size);
+      return handler->PlanDispatched<HEAD_DIM, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO, IdType>(
+          float_buffer, float_workspace_size_in_bytes, int_buffer, int_workspace_size_in_bytes,
+          indptr_h, last_page_len_h, batch_size, num_qo_heads, num_kv_heads, page_size);
     });
   });
 }
