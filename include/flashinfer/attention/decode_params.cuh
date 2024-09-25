@@ -118,7 +118,7 @@ struct BatchDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
   float* alibi_slopes;
   uint32_t padded_batch_size;
   uint32_t num_qo_heads;
-  uint32_t window_left;
+  int32_t window_left;
   float logits_soft_cap;
   float rope_rcp_scale;
   float rope_rcp_theta;
@@ -128,7 +128,7 @@ struct BatchDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
   __device__ __host__ BatchDecodeParams(DTypeQ* q, IdType* q_offset,
                                         paged_kv_t<DTypeKV, IdType> paged_kv, DTypeO* o, float* lse,
                                         float* alibi_slopes, uint32_t num_qo_heads,
-                                        uint32_t window_left, float logits_soft_cap, float sm_scale,
+                                        int32_t window_left, float logits_soft_cap, float sm_scale,
                                         float rope_scale, float rope_theta)
       : DecodeParamsBase<DTypeQ, DTypeKV, DTypeO>{q, o, lse, sm_scale},
         q_offset(q_offset),
