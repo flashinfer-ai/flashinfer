@@ -37,7 +37,6 @@ namespace flashinfer {{
 using ParamsT = SingleDecodeParams<{dtype_q}, {dtype_kv}, {dtype_out}>;
 using AttentionVariant = ComposedAttention<ParamsT, get_variant_code(false, false, false, false)>;
 
-template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant>
 template cudaError_t SingleDecodeWithKVCacheDispatched<{head_dim}, {pos_encoding_mode}, AttentionVariant>(
     typename AttentionVariant::ParamsT params,
     typename AttentionVariant::DTypeO* tmp,
