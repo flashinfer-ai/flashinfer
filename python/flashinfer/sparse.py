@@ -29,6 +29,7 @@ from .utils import (
     TensorLayout,
 )
 
+
 def convert_bsr_mask_layout(mask: torch.Tensor, indptr: torch.Tensor) -> torch.Tensor:
     r"""Convert mask from BSR data layout to flashinfer's flattened mask layout.
 

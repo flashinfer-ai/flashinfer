@@ -512,7 +512,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
-        
+
         qo_indptr = _get_range_buf(batch_size + 1, indptr.device)
 
         if self.is_cuda_graph_enabled:
@@ -693,7 +693,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
-        
+
         if self.use_tensor_cores:
             out = self._cached_module.paged_run(
                 self._float_workspace_buffer,
