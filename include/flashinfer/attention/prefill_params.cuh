@@ -114,6 +114,11 @@ struct SinglePrefillParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTypeO> {
   __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
     return kv_len;
   }
+
+  __host__ __device__ __forceinline__ uint32_t get_mask_offset(uint32_t batch_idx, uint32_t qo_idx,
+                                                               uint32_t kv_idx) const {
+    return qo_idx * get_kv_len(batch_idx) + kv_idx;
+  }
 };
 
 template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType_>
@@ -188,7 +193,7 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
 
   __host__ __device__ __forceinline__ uint32_t get_mask_offset(uint32_t batch_idx, uint32_t qo_idx,
                                                                uint32_t kv_idx) const {
-    return qk_indptr[batch_idx] + qo_idx * get_kv_len(batch_idx) + kv_idx;
+    return qk_indptr[batch_idx] * 8 + qo_idx * get_kv_len(batch_idx) + kv_idx;
   }
 };
 
@@ -247,7 +252,7 @@ struct BatchPrefillPagedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DType
 
   __host__ __device__ __forceinline__ uint32_t get_mask_offset(uint32_t batch_idx, uint32_t qo_idx,
                                                                uint32_t kv_idx) const {
-    return qk_indptr[batch_idx] + qo_idx * get_kv_len(batch_idx) + kv_idx;
+    return qk_indptr[batch_idx] * 8 + qo_idx * get_kv_len(batch_idx) + kv_idx;
   }
 };
 

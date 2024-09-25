@@ -128,7 +128,7 @@ def test_batch_attention_with_shared_prefix_paged_kv_cache(
 
     qo_indptr_top = torch.tensor([0, q.shape[0]], dtype=torch.int32).to(0)
     if stage == "decode":
-        qo_indptr_bottom = torch.arange(0, batch_size + 1).to(0)
+        qo_indptr_bottom = torch.arange(0, batch_size + 1, dtype=torch.int32).to(0)
         multi_level_wrapper.plan(
             [qo_indptr_top, qo_indptr_bottom],
             [shared_kv_indptr, unique_kv_indptr],
@@ -141,7 +141,7 @@ def test_batch_attention_with_shared_prefix_paged_kv_cache(
         )
         o_multi_level = multi_level_wrapper.run(q, kv_data)
     else:
-        qo_indptr_bottom = torch.arange(0, batch_size + 1).to(0) * unique_kv_len
+        qo_indptr_bottom = torch.arange(0, batch_size + 1, dtype=torch.int32).to(0) * unique_kv_len
         multi_level_wrapper.plan(
             [qo_indptr_top, qo_indptr_bottom],
             [shared_kv_indptr, unique_kv_indptr],

@@ -70,7 +70,6 @@ void append_paged_kv_cache(torch::Tensor append_key, torch::Tensor append_value,
   CHECK_EQ(kv_indptr.device(), device);
   CHECK_EQ(kv_last_page_len.device(), device);
 
-  constexpr PageStorage page_storage = PageStorage::kIndices;
   QKVLayout kv_layout = QKVLayout(layout);
 
   unsigned int num_heads, page_size, head_dim;
@@ -105,7 +104,7 @@ void append_paged_kv_cache(torch::Tensor append_key, torch::Tensor append_value,
       paged_kv_cache.has_value() ? paged_kv_cache->scalar_type() : paged_k_cache->scalar_type();
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(kv_scalar_dtype, c_type, [&] {
-    paged_kv_t<page_storage, c_type, int32_t> paged_kv(
+    paged_kv_t<c_type, int32_t> paged_kv(
         num_heads, page_size, head_dim, batch_size, kv_layout,
         static_cast<c_type*>(paged_kv_cache.has_value() ? paged_kv_cache->data_ptr() : nullptr),
         static_cast<c_type*>(paged_k_cache.has_value() ? paged_k_cache->data_ptr() : nullptr),

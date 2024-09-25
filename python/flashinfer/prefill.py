@@ -640,6 +640,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
 
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
+
         batch_size = len(qo_indptr) - 1
         if custom_mask is not None or packed_custom_mask is not None:
             qk_indptr = _compute_page_qk_indptr(
@@ -1199,6 +1202,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
 
         batch_size = len(qo_indptr) - 1
         if len(kv_indptr) != batch_size + 1:

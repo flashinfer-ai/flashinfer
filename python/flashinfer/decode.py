@@ -33,6 +33,7 @@ from .utils import (
     PosEncodingMode,
     TensorLayout,
     MaskMode,
+    canonicalize_torch_dtype,
     _check_pos_encoding_mode,
     _check_kv_layout,
     _unpack_paged_kv_cache,
@@ -536,8 +537,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._paged_kv_last_page_len_buf = last_page_len.to(self.device)
             self._qo_indptr_buf = qo_indptr.to(self.device)
 
+        data_type = canonicalize_torch_dtype(data_type)
         if not q_data_type:
             q_data_type = data_type
+        q_data_type = canonicalize_torch_dtype(q_data_type)
 
         if self.use_tensor_cores:
             self._cached_module = get_batch_prefill_module(
