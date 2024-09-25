@@ -108,13 +108,9 @@ struct SingleDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
 template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType_>
 struct BatchDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
   using IdType = IdType_;
+
   IdType* q_offset;
-  IdType* request_indices;
-  IdType* kv_tile_indices;
-  IdType* o_indptr;
-  IdType* kv_chunk_size_ptr;
   paged_kv_t<DTypeKV, IdType> paged_kv;
-  bool* block_valid_mask;
   float* alibi_slopes;
   uint32_t padded_batch_size;
   uint32_t num_qo_heads;
@@ -123,6 +119,11 @@ struct BatchDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
   float rope_rcp_scale;
   float rope_rcp_theta;
 
+  IdType* request_indices;
+  IdType* kv_tile_indices;
+  IdType* o_indptr;
+  IdType* kv_chunk_size_ptr;
+  bool* block_valid_mask;
   bool partition_kv;
 
   __device__ __host__ BatchDecodeParams(DTypeQ* q, IdType* q_offset,
@@ -133,7 +134,6 @@ struct BatchDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
       : DecodeParamsBase<DTypeQ, DTypeKV, DTypeO>{q, o, lse, sm_scale},
         q_offset(q_offset),
         paged_kv(paged_kv),
-        block_valid_mask(nullptr),
         alibi_slopes(alibi_slopes),
         padded_batch_size(0),
         num_qo_heads(num_qo_heads),
@@ -141,6 +141,11 @@ struct BatchDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
         logits_soft_cap(logits_soft_cap),
         rope_rcp_scale(1.f / rope_scale),
         rope_rcp_theta(1.f / rope_theta),
+        request_indices(nullptr),
+        kv_tile_indices(nullptr),
+        o_indptr(nullptr),
+        kv_chunk_size_ptr(nullptr),
+        block_valid_mask(nullptr),
         partition_kv(false) {}
 
   __host__ __device__ __forceinline__ int32_t get_qo_len(int32_t batch_idx) const { return 1; }

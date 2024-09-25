@@ -125,11 +125,6 @@ template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType_>
 struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTypeO> {
   using IdType = IdType_;
 
-  IdType* request_indices;
-  IdType* qo_tile_indices;
-  IdType* kv_tile_indices;
-  IdType* merge_indptr;
-  IdType* o_indptr;
   DTypeKV* k;
   DTypeKV* v;
   IdType* q_indptr;
@@ -138,11 +133,6 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
   IdType* q_offset;
   IdType* k_rope_pos_offset;
   float* alibi_slopes;
-  bool* block_valid_mask;
-  IdType* kv_chunk_size_ptr;
-  uint32_t total_num_rows;
-  uint32_t padded_batch_size;
-  bool partition_kv;
   uint32_t num_qo_heads;
   uint32_t num_kv_heads;
   uint_fastdiv group_size_fastdiv;
@@ -155,6 +145,17 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
   float log2_rope_rcp_scale;
   float log2_rope_rcp_theta;
 
+  IdType* request_indices;
+  IdType* qo_tile_indices;
+  IdType* kv_tile_indices;
+  IdType* merge_indptr;
+  IdType* o_indptr;
+  IdType* kv_chunk_size_ptr;
+  bool* block_valid_mask;
+  uint32_t total_num_rows;
+  uint32_t padded_batch_size;
+  bool partition_kv;
+
   __host__ BatchPrefillRaggedParams(DTypeQ* q, DTypeKV* k, DTypeKV* v, uint8_t* custom_mask,
                                     IdType* q_indptr, IdType* kv_indptr, IdType* qk_indptr,
                                     DTypeO* o, float* lse, float* alibi_slopes,
@@ -164,13 +165,14 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
                                     float logits_soft_cap, float sm_scale, float rope_scale,
                                     float rope_theta)
       : PrefillParamsBase<DTypeQ, DTypeKV, DTypeO>{q, custom_mask, o, lse, sm_scale},
-        q_indptr(q_indptr),
         k(k),
         v(v),
+        q_indptr(q_indptr),
         kv_indptr(kv_indptr),
         qk_indptr(qk_indptr),
+        q_offset(nullptr),
+        k_rope_pos_offset(nullptr),
         alibi_slopes(alibi_slopes),
-        block_valid_mask(nullptr),
         num_qo_heads(num_qo_heads),
         num_kv_heads(num_kv_heads),
         group_size_fastdiv(num_qo_heads / num_kv_heads),
@@ -181,7 +183,17 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
         window_left(window_left),
         logits_soft_cap(logits_soft_cap),
         log2_rope_rcp_scale(-std::log2f(rope_scale)),
-        log2_rope_rcp_theta(-std::log2f(rope_theta)) {}
+        log2_rope_rcp_theta(-std::log2f(rope_theta)),
+        request_indices(nullptr),
+        qo_tile_indices(nullptr),
+        kv_tile_indices(nullptr),
+        merge_indptr(nullptr),
+        o_indptr(nullptr),
+        kv_chunk_size_ptr(nullptr),
+        block_valid_mask(nullptr),
+        total_num_rows(0),
+        padded_batch_size(0),
+        partition_kv(false) {}
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];
@@ -201,27 +213,28 @@ template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType_>
 struct BatchPrefillPagedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTypeO> {
   using IdType = IdType_;
 
-  IdType* request_indices;
-  IdType* qo_tile_indices;
-  IdType* kv_tile_indices;
-  IdType* merge_indptr;
-  IdType* o_indptr;
   paged_kv_t<DTypeKV, IdType> paged_kv;
   IdType* q_indptr;
   IdType* qk_indptr;
   IdType* q_offset;
   float* alibi_slopes;
-  bool* block_valid_mask;
-  IdType* kv_chunk_size_ptr;
-  uint32_t total_num_rows;
-  uint32_t padded_batch_size;
-  bool partition_kv;
   uint32_t num_qo_heads;
   uint_fastdiv group_size_fastdiv;
   int32_t window_left;
   float logits_soft_cap;
   float log2_rope_rcp_scale;
   float log2_rope_rcp_theta;
+
+  IdType* request_indices;
+  IdType* qo_tile_indices;
+  IdType* kv_tile_indices;
+  IdType* merge_indptr;
+  IdType* o_indptr;
+  bool* block_valid_mask;
+  IdType* kv_chunk_size_ptr;
+  uint32_t total_num_rows;
+  uint32_t padded_batch_size;
+  bool partition_kv;
 
   __host__ BatchPrefillPagedParams(DTypeQ* q, paged_kv_t<DTypeKV, IdType> paged_kv,
                                    uint8_t* custom_mask, IdType* q_indptr, IdType* qk_indptr,
@@ -233,14 +246,24 @@ struct BatchPrefillPagedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DType
         paged_kv(paged_kv),
         q_indptr(q_indptr),
         qk_indptr(qk_indptr),
+        q_offset(nullptr),
         alibi_slopes(alibi_slopes),
-        block_valid_mask(nullptr),
         num_qo_heads(num_qo_heads),
         group_size_fastdiv(num_qo_heads / paged_kv.num_heads),
         window_left(window_left),
         logits_soft_cap(logits_soft_cap),
         log2_rope_rcp_scale(-std::log2f(rope_scale)),
-        log2_rope_rcp_theta(-std::log2f(rope_theta)) {}
+        log2_rope_rcp_theta(-std::log2f(rope_theta)),
+        request_indices(nullptr),
+        qo_tile_indices(nullptr),
+        kv_tile_indices(nullptr),
+        merge_indptr(nullptr),
+        o_indptr(nullptr),
+        block_valid_mask(nullptr),
+        kv_chunk_size_ptr(nullptr),
+        total_num_rows(0),
+        padded_batch_size(0),
+        partition_kv(false) {}
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];
