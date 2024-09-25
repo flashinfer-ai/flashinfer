@@ -138,19 +138,6 @@
     }                                                         \
   }
 
-#define DISPATCH_LOGITS_POST_HOOK(logits_soft_cap, LOGITS_POST_HOOK, ...)       \
-  if (logits_soft_cap > 0.f) {                                                  \
-    constexpr LogitsPostHook LOGITS_POST_HOOK = LogitsPostHook::kSoftCap;       \
-    __VA_ARGS__                                                                 \
-  } else if (logits_soft_cap == 0.f) {                                          \
-    constexpr LogitsPostHook LOGITS_POST_HOOK = LogitsPostHook::kNone;          \
-    __VA_ARGS__                                                                 \
-  } else {                                                                      \
-    std::ostringstream err_msg;                                                 \
-    err_msg << "Invalid logits_soft_cap (should be >= 0): " << logits_soft_cap; \
-    throw std::invalid_argument(err_msg.str());                                 \
-  }
-
 #define DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, ...)     \
   switch (head_dim) {                                  \
     case 64: {                                         \

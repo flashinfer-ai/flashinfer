@@ -22,14 +22,12 @@ from literal_map import (
     warp_layout_literal,
     dtype_literal,
     idtype_literal,
-    logits_hook_literal,
 )
 from pathlib import Path
 
 
 def get_cu_file_str(
     head_dim,
-    logits_hook,
     pos_encoding_mode,
     allow_fp16_qk_reduction,
     mask_mode,
@@ -41,35 +39,34 @@ def get_cu_file_str(
     warp_layout_choice = [0, 1, 2]
     insts = "\n".join(
         [
-            """template cudaError_t BatchPrefillWithRaggedKVCacheDispatched<{warp_layout}, {head_dim}, {logits_hook}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {dtype_q}, {dtype_kv}, {dtype_out}, {idtype}>(
-    {dtype_q}* q, {idtype}* request_indices, {idtype}* q_tile_indices, {idtype}* kv_tile_indices,
-    {idtype}* q_indptr, {dtype_kv}* k, {dtype_kv}* v, {idtype}* kv_indptr,
-    uint8_t* custom_mask, {idtype}* qk_indptr, {idtype}* q_offset, {idtype}* k_rope_pos_offset,
-    {idtype}* o_indptr, {dtype_out}* o, {dtype_out}* tmp_v, float* tmp_s, float* lse, {idtype}* merge_indptr,
-    bool* block_valid_mask, {idtype}* kv_chunk_size_ptr, uint32_t total_num_rows, uint32_t num_qo_heads,
-    uint32_t padded_batch_size, uint32_t num_kv_heads, uint32_t q_stride_n, uint32_t q_stride_h,
-    uint32_t kv_stride_n, uint32_t kv_stride_h, int32_t window_left,
-    float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta,
-    cudaStream_t stream);
+            """template cudaError_t BatchPrefillWithRaggedKVCacheDispatched<{warp_layout}, {head_dim}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, AttentionVariant>(
+    typename AttentionVariant::ParamsT params,
+    typename AttentionVariant::DTypeO* tmp_v,
+    float* tmp_s, cudaStream_t stream);
         """.format(
                 warp_layout=warp_layout_literal[warp_layout],
-                logits_hook=logits_hook_literal[int(logits_hook)],
                 head_dim=head_dim,
                 pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
                 allow_fp16_qk_reduction=allow_fp16_qk_reduction,
                 mask_mode=mask_mode_literal[int(mask_mode)],
-                dtype_q=dtype_literal[dtype_q],
-                dtype_kv=dtype_literal[dtype_kv],
-                dtype_out=dtype_literal[dtype_out],
-                idtype=idtype_literal[idtype],
             )
             for warp_layout in warp_layout_choice
         ]
     )
 
+    use_custom_mask = "true" if int(mask_mode) == 2 else "false"
+
+    dtype_q = dtype_literal[dtype_q]
+    dtype_kv = dtype_literal[dtype_kv]
+    dtype_out = dtype_literal[dtype_out]
+    idtype = idtype_literal[idtype]
+
     content = f"""#include <flashinfer/attention_impl.cuh>
 
 namespace flashinfer {{
+
+using ParamsT = BatchPrefillRaggedParams<{dtype_q}, {dtype_kv}, {dtype_out}, {idtype}>;
+using AttentionVariant = ComposedAttention<ParamsT, get_variant_code({use_custom_mask}, false, false, false)>;
 
 {insts}
 
@@ -80,7 +77,7 @@ namespace flashinfer {{
 
 if __name__ == "__main__":
     pattern = (
-        r"batch_ragged_prefill_head_([0-9]+)_logitshook_([0-9]+)_posenc_([0-9]+)_"
+        r"batch_ragged_prefill_head_([0-9]+)_posenc_([0-9]+)_"
         r"fp16qkred_([a-z]+)_mask_([0-9]+)_dtypeq_([a-z0-9]+)_dtypekv_([a-z0-9]+)_dtypeout_([a-z0-9]+)_idtype_([a-z0-9]+)\.cu"
     )
     compiled_pattern = re.compile(pattern)

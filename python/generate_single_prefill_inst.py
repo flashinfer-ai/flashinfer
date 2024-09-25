@@ -20,14 +20,12 @@ from literal_map import (
     pos_encoding_mode_literal,
     dtype_literal,
     mask_mode_literal,
-    logits_hook_literal,
 )
 from pathlib import Path
 
 
 def get_cu_file_str(
     head_dim,
-    logits_hook,
     pos_encoding_mode,
     allow_fp16_qk_reduction,
     mask_mode,
@@ -40,15 +38,16 @@ def get_cu_file_str(
 
 namespace flashinfer {{
 
-template cudaError_t SinglePrefillWithKVCacheDispatched<{head_dim}, {logits_hook}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {dtype_q}, {dtype_kv}, {dtype_out}>(
-    {dtype_q}* q, {dtype_kv}* k, {dtype_kv}* v, uint8_t* custom_mask, {dtype_out}* o,
-    {dtype_out}* tmp, float* lse, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t qo_len, uint32_t kv_len,
-    uint32_t q_stride_n, uint32_t q_stride_h, uint32_t kv_stride_n, uint32_t kv_stride_h, int32_t window_left,
-    float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta, cudaStream_t stream);
+using ParamsT = SinglePrefillParams<{dtype_q}, {dtype_kv}, {dtype_out}>;
+using AttentionVariant = ComposedAttention<ParamsT, get_variant_code({use_custom_mask}, false, false, false)>;
+
+template cudaError_t SinglePrefillWithKVCacheDispatched<{head_dim}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, AttentionVariant>(
+    typename AttentionVariant::ParamsT params,
+    typename AttentionVariant::DTypeO* tmp,
+    cudaStream_t stream);
 
 }}
     """.format(
-        logits_hook=logits_hook_literal[int(logits_hook)],
         head_dim=head_dim,
         pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
         allow_fp16_qk_reduction=allow_fp16_qk_reduction,
@@ -56,13 +55,14 @@ template cudaError_t SinglePrefillWithKVCacheDispatched<{head_dim}, {logits_hook
         dtype_q=dtype_literal[dtype_q],
         dtype_kv=dtype_literal[dtype_kv],
         dtype_out=dtype_literal[dtype_out],
+        use_custom_mask="true" if int(mask_mode) == 2 else "false",
     )
     return content
 
 
 if __name__ == "__main__":
     pattern = (
-        r"single_prefill_head_([0-9]+)_logitshook_([0-9]+)_posenc_([0-9]+)_"
+        r"single_prefill_head_([0-9]+)_posenc_([0-9]+)_"
         r"fp16qkred_([a-z]+)_mask_([0-9]+)_dtypeq_([a-z0-9]+)_dtypekv_([a-z0-9]+)_dtypeout_([a-z0-9]+)\.cu"
     )
 

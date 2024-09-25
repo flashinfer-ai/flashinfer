@@ -20,7 +20,6 @@ from literal_map import (
     pos_encoding_mode_literal,
     bool_literal,
     mask_mode_literal,
-    logits_hook_literal,
 )
 
 

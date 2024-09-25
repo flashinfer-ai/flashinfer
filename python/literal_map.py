@@ -20,11 +20,6 @@ mask_mode_literal = {
     2: "MaskMode::kCustom",
 }
 
-logits_hook_literal = {
-    0: "LogitsPostHook::kNone",
-    1: "LogitsPostHook::kSoftCap",
-}
-
 warp_layout_literal = {
     0: "WarpLayout::k4x1x2",
     1: "WarpLayout::k4x1x1",

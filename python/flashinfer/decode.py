@@ -530,12 +530,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._paged_kv_indptr_buf.copy_(indptr)
             self._paged_kv_indices_buf[: len(indices)] = indices
             self._paged_kv_last_page_len_buf.copy_(last_page_len)
-            self._qo_indptr_buf.copy_(qo_indptr)
+            if self.use_tensor_cores:
+                self._qo_indptr_buf.copy_(qo_indptr)
         else:
             self._paged_kv_indptr_buf = indptr.to(self.device)
             self._paged_kv_indices_buf = indices.to(self.device)
             self._paged_kv_last_page_len_buf = last_page_len.to(self.device)
-            self._qo_indptr_buf = qo_indptr.to(self.device)
+            if self.use_tensor_cores:
+                self._qo_indptr_buf = qo_indptr.to(self.device)
 
         data_type = canonicalize_torch_dtype(data_type)
         if not q_data_type:
