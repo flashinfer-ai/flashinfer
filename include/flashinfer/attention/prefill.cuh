@@ -1745,12 +1745,8 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
     const uint32_t request_idx = request_indices[bx], qo_tile_idx = qo_tile_indices[bx],
                    kv_tile_idx = kv_tile_indices[bx];
     constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps_x * 16;
-    const uint32_t qo_len = q_indptr[request_idx + 1] - q_indptr[request_idx],
-                   kv_len = (paged_kv.indptr[request_idx + 1] != paged_kv.indptr[request_idx])
-                                ? (paged_kv.indptr[request_idx + 1] - paged_kv.indptr[request_idx] -
-                                   1) * paged_kv.page_size +
-                                      paged_kv.last_page_len[request_idx]
-                                : 0;
+    const uint32_t qo_len = params.get_qo_len(request_idx),
+                   kv_len = params.get_kv_len(request_idx);
     const uint32_t kv_len_safe = kv_len > 0 ? kv_len : 1;
     const uint32_t window_left = (maybe_window_left >= 0) ? maybe_window_left : kv_len;
     const uint32_t max_chunk_size = partition_kv ? kv_chunk_size : kv_len;

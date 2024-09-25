@@ -27,20 +27,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
                                           unsigned int layout, int window_left,
                                           float logits_soft_cap, float sm_scale, float rope_scale,
                                           float rope_theta) {
-  CHECK_INPUT(q);
-  CHECK_INPUT(k);
-  CHECK_INPUT(v);
-  CHECK_INPUT(tmp);
   auto device = q.device();
-  CHECK_EQ(k.device(), device);
-  CHECK_EQ(v.device(), device);
-  CHECK_EQ(tmp.device(), device);
-  CHECK_DIM(2, q);
-  CHECK_DIM(3, k);
-  CHECK_DIM(3, v);
-  CHECK_SHAPE(k, v);
-  CHECK_EQ(q.size(1), k.size(2));
-  CHECK_EQ(v.scalar_type(), k.scalar_type());
   unsigned int num_qo_heads = q.size(0);
   unsigned int head_dim = q.size(1);
   unsigned int kv_len, num_kv_heads;
@@ -52,10 +39,8 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
     num_kv_heads = k.size(0);
     kv_len = k.size(1);
   }
-  CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto o = torch::empty_like(q);
-  TORCH_CHECK(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
 
   using ParamsT = SingleDecodeParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}>;
   using AttentionVariant = ComposedAttention<ParamsT, get_variant_code(/*use_custom_mask=*/false, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, {{ use_alibi }})>;

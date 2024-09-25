@@ -459,8 +459,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         _check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
         self._float_workspace_buffer = float_workspace_buffer
+        self.device = float_workspace_buffer.device
         self._int_workspace_buffer = torch.empty(
-            (8 * 1024 * 1024,), dtype=torch.uint8, device=float_workspace_buffer.device
+            (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
         )
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
@@ -687,13 +688,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 # NOTE(Zihao): qk_indptr has the same length as qo_indptr
                 self._qk_indptr_buf.copy_(qk_indptr)
         else:
-            self._qo_indptr_buf = qo_indptr
-            self._paged_kv_indptr_buf = paged_kv_indptr
-            self._paged_kv_indices_buf = paged_kv_indices
-            self._paged_kv_last_page_len_buf = paged_kv_last_page_len
+            self._qo_indptr_buf = qo_indptr.to(self.device)
+            self._paged_kv_indptr_buf = paged_kv_indptr.to(self.device)
+            self._paged_kv_indices_buf = paged_kv_indices.to(self.device)
+            self._paged_kv_last_page_len_buf = paged_kv_last_page_len.to(self.device)
             if packed_custom_mask is not None:
-                self._custom_mask_buf = packed_custom_mask
-                self._qk_indptr_buf = qk_indptr
+                self._custom_mask_buf = packed_custom_mask.to(self.device)
+                self._qk_indptr_buf = qk_indptr.to(self.device)
 
         if packed_custom_mask is not None:
             mask_mode = MaskMode.CUSTOM.value
@@ -1041,8 +1042,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         _check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
         self._float_workspace_buffer = float_workspace_buffer
+        self.device = float_workspace_buffer.device
         self._int_workspace_buffer = torch.empty(
-            (8 * 1024 * 1024,), dtype=torch.uint8, device=float_workspace_buffer.device
+            (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
         )
         self._pin_memory_int_workspace_buffer = torch.empty(
             (8 * 1024 * 1024,), dtype=torch.uint8, pin_memory=True
@@ -1235,11 +1237,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._custom_mask_buf[: len(packed_custom_mask)] = packed_custom_mask
                 self._qk_indptr_buf.copy_(qk_indptr)
         else:
-            self._qo_indptr_buf = qo_indptr
-            self._kv_indptr_buf = kv_indptr
+            self._qo_indptr_buf = qo_indptr.to(self.device)
+            self._kv_indptr_buf = kv_indptr.to(self.device)
             if packed_custom_mask is not None:
-                self._custom_mask_buf = packed_custom_mask
-                self._qk_indptr_buf = qk_indptr
+                self._custom_mask_buf = packed_custom_mask.to(self.device)
+                self._qk_indptr_buf = qk_indptr.to(self.device)
 
         if packed_custom_mask is not None:
             mask_mode = MaskMode.CUSTOM.value
@@ -1370,7 +1372,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             k,
             v,
             self._custom_mask_buf,
-            _get_cache_alibi_slopes_buf(q.shape[1], q.device),
+            _get_cache_alibi_slopes_buf(q.shape[1], self.device),
             self._qo_indptr_buf,
             self._kv_indptr_buf,
             self._qk_indptr_buf,

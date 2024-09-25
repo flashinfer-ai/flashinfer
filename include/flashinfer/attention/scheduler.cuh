@@ -30,7 +30,6 @@
 #include "../page.cuh"
 #include "../pos_enc.cuh"
 #include "../utils.cuh"
-#include "logits_post_hook.cuh"
 #include "warp_layout.cuh"
 
 namespace flashinfer {

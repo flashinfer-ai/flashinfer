@@ -184,6 +184,9 @@ struct paged_kv_t {
   }
 
   __host__ __device__ __forceinline__ uint32_t get_length(uint32_t batch_idx) const {
+    if (indptr[batch_idx + 1] == indptr[batch_idx]) {
+      return 0;
+    }
     return (indptr[batch_idx + 1] - indptr[batch_idx] - 1) * page_size + last_page_len[batch_idx];
   }
 

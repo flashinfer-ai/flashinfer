@@ -65,6 +65,9 @@ def test_mlc_failed_case():
     )
     o_1_tc, lse_1_tc = wrapper_tensor_cores.run_return_lse(q, kv_data)
 
+    print(lse_1, lse_1_tc)
+    print(o_1, o_1_tc)
+
     torch.testing.assert_close(
         lse_1.cpu().numpy(), lse_1_tc.cpu().numpy(), rtol=1e-3, atol=1e-3
     )

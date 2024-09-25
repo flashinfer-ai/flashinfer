@@ -175,7 +175,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
   bool paged_kv_defined = paged_kv_cache.has_value();
   auto device = q.device();
-  int64_t batch_size = qo_indptr.size(0) - 1;
+  int64_t batch_size = paged_kv_indptr.size(0) - 1;
   int64_t num_qo_heads = q.size(1);
   int64_t num_kv_heads, page_size;
   if (paged_kv_defined) {

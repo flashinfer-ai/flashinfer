@@ -368,8 +368,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         _check_kv_layout(kv_layout)
         self._kv_layout = kv_layout
         self._float_workspace_buffer = float_workspace_buffer
+        self.device = float_workspace_buffer.device
         self._int_workspace_buffer = torch.empty(
-            (8 * 1024 * 1024,), dtype=torch.uint8, device=float_workspace_buffer.device
+            (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
         )
         self._pin_memory_int_workspace_buffer = torch.empty(
             (8 * 1024 * 1024,), dtype=torch.uint8, pin_memory=True
@@ -510,6 +511,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
+        
+        qo_indptr = _get_range_buf(batch_size + 1, indptr.device)
 
         if self.is_cuda_graph_enabled:
             if batch_size != self._fixed_batch_size:
@@ -526,18 +529,17 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._paged_kv_indptr_buf.copy_(indptr)
             self._paged_kv_indices_buf[: len(indices)] = indices
             self._paged_kv_last_page_len_buf.copy_(last_page_len)
+            self._qo_indptr_buf.copy_(qo_indptr)
         else:
-            self._paged_kv_indptr_buf = indptr
-            self._paged_kv_indices_buf = indices
-            self._paged_kv_last_page_len_buf = last_page_len
+            self._paged_kv_indptr_buf = indptr.to(self.device)
+            self._paged_kv_indices_buf = indices.to(self.device)
+            self._paged_kv_last_page_len_buf = last_page_len.to(self.device)
+            self._qo_indptr_buf = qo_indptr.to(self.device)
 
         if not q_data_type:
             q_data_type = data_type
 
         if self.use_tensor_cores:
-            self._qo_indptr_buf = (
-                _get_range_buf(batch_size, self._float_workspace_buffer.device),
-            )
             self._cached_module = get_batch_prefill_module(
                 q_data_type,
                 data_type,
@@ -555,7 +557,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._pin_memory_int_workspace_buffer,
-                self._qo_indptr_buf,
+                qo_indptr,
                 indptr,
                 batch_size,
                 num_qo_heads,
@@ -688,7 +690,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
-
+        
         if self.use_tensor_cores:
             out = self._cached_module.paged_run(
                 self._float_workspace_buffer,

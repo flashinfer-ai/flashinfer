@@ -151,7 +151,7 @@ def _get_range_buf(seq_len: int, device: torch.device) -> torch.Tensor:
     key = (f"range_{seq_len_pow2}", device)
     buf = _cache_buf.get(key)
     if buf is None:
-        buf = torch.arange(seq_len_pow2, device=device)
+        buf = torch.arange(seq_len_pow2, device=device, dtype=torch.int32)
         _cache_buf[key] = buf
     return buf[:seq_len]
 
