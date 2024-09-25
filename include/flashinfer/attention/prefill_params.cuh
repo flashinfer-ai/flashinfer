@@ -54,7 +54,7 @@ struct SinglePrefillParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTypeO> {
   uint32_t kv_stride_n;
   uint32_t kv_stride_h;
   uint32_t head_dim;
-  uint32_t window_left;
+  int32_t window_left;
   float logits_soft_cap;
   float log2_rope_rcp_scale;
   float log2_rope_rcp_theta;
@@ -66,7 +66,7 @@ struct SinglePrefillParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTypeO> {
                                float* lse, float* alibi_slopes, uint32_t num_qo_heads,
                                uint32_t num_kv_heads, uint32_t qo_len, uint32_t kv_len,
                                uint32_t q_stride_n, uint32_t q_stride_h, uint32_t kv_stride_n,
-                               uint32_t kv_stride_h, uint32_t head_dim, uint32_t window_left,
+                               uint32_t kv_stride_h, uint32_t head_dim, int32_t window_left,
                                float logits_soft_cap, float sm_scale, float rope_scale,
                                float rope_theta)
       : PrefillParamsBase<DTypeQ, DTypeKV, DTypeO>{q, custom_mask, o, lse, sm_scale},

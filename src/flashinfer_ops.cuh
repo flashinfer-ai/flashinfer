@@ -22,8 +22,8 @@
 #include <optional>
 
 #include "flashinfer/allocator.h"
-#include "flashinfer/attention/scheduler.cuh"
 #include "flashinfer/attention/mask.cuh"
+#include "flashinfer/attention/scheduler.cuh"
 #include "flashinfer/attention/warp_layout.cuh"
 #include "flashinfer/layout.cuh"
 #include "flashinfer/utils.cuh"
@@ -332,7 +332,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut
                                       get_variant_code(
                                           /*use_custom_mask=*/false, /*use_sliding_window=*/false,
                                           /*use_logits_soft_cap=*/false, /*use_alibi=*/false)>;
-                ParamsT params(q, k, v, o, /*custom_mask=*/nullptr, o, lse,
+                ParamsT params(q, k, v, /*custom_mask=*/nullptr, o, lse,
                                /*alibi_slopes=*/nullptr, num_qo_heads, num_kv_heads, qo_len, kv_len,
                                qo_stride_n, qo_stride_h, kv_stride_n, kv_stride_h, head_dim,
                                /*window_left=*/-1,
@@ -437,10 +437,12 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
                 params.block_valid_mask = handler->GetBlockValidMask();
                 params.total_num_rows = plan_info.total_num_rows;
                 params.padded_batch_size = plan_info.padded_batch_size;
-                return BatchPrefillWithPagedKVCacheDispatched<HEAD_DIM, POS_ENCODING_MODE,
-                                                              ALLOW_FP16_QK_REDUCTION, MASK_MODE,
-                                                              AttentionVariant>(
-                    params, handler->GetTmpV<DTypeOut>(), handler->GetTmpS(), stream);
+                DISPATCH_WARP_LAYOUT(warp_layout, WARP_LAYOUT, {
+                  return BatchPrefillWithPagedKVCacheDispatched<
+                      WARP_LAYOUT, HEAD_DIM, POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION, MASK_MODE,
+                      AttentionVariant>(params, handler->GetTmpV<DTypeOut>(), handler->GetTmpS(),
+                                        stream);
+                })
               })})})});
   return cudaSuccess;
 }

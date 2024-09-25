@@ -31,7 +31,8 @@ struct StandardAttention {
   using DTypeKV = typename ParamsT::DTypeKV;
   using DTypeO = typename ParamsT::DTypeO;
   using IdType = typename ParamsT::IdType;
-  static __device__ __forceinline__ DTypeQ QueryTransform(const ParamsT& params, DTypeQ q) {
+  template <typename T>
+  static __device__ __forceinline__ T QueryTransform(const ParamsT& params, T q) {
     return float(q) * params.sm_scale * math::log2e;
   }
 
@@ -56,7 +57,8 @@ struct CustomMaskAttention {
   using DTypeQ = typename ParamsT::DTypeQ;
   using DTypeKV = typename ParamsT::DTypeKV;
   using DTypeO = typename ParamsT::DTypeO;
-  static __device__ __forceinline__ DTypeQ QueryTransform(const ParamsT& params, DTypeQ q) {
+  template <typename T>
+  static __device__ __forceinline__ T QueryTransform(const ParamsT& params, T q) {
     return StandardAttention<ParamsT>::QueryTransform(params, q);
   }
 
@@ -84,7 +86,8 @@ struct SlidingWindowAttention {
   using DTypeKV = typename ParamsT::DTypeKV;
   using DTypeO = typename ParamsT::DTypeO;
   using IdType = typename ParamsT::IdType;
-  static __device__ __forceinline__ DTypeQ QueryTransform(const ParamsT& params, DTypeQ q) {
+  template <typename T>
+  static __device__ __forceinline__ T QueryTransform(const ParamsT& params, T q) {
     return StandardAttention<ParamsT>::QueryTransform(params, q);
   }
 
@@ -110,7 +113,8 @@ struct LogitsSoftCap {
   using DTypeQ = typename ParamsT::DTypeQ;
   using DTypeKV = typename ParamsT::DTypeKV;
   using DTypeO = typename ParamsT::DTypeO;
-  static __device__ __forceinline__ DTypeQ QueryTransform(const ParamsT& params, DTypeQ q) {
+  template <typename T>
+  static __device__ __forceinline__ T QueryTransform(const ParamsT& params, T q) {
     return float(q) * params.sm_scale * math::ptx_rcp(params.logits_soft_cap);
   }
 
@@ -135,7 +139,8 @@ struct ALIBIAttention {
   using DTypeKV = typename ParamsT::DTypeKV;
   using DTypeO = typename ParamsT::DTypeO;
   using IdType = typename ParamsT::IdType;
-  static __device__ __forceinline__ DTypeQ QueryTransform(const ParamsT& params, DTypeQ q) {
+  template <typename T>
+  static __device__ __forceinline__ T QueryTransform(const ParamsT& params, T q) {
     return StandardAttention<ParamsT>::QueryTransform(params, q);
   }
 
@@ -177,7 +182,8 @@ struct ComposedAttention {
   static constexpr bool use_logits_soft_cap = (VARIANT_CODE & LOGITS_SOFT_CAP) != 0;
   static constexpr bool use_alibi = (VARIANT_CODE & ALIBI) != 0;
 
-  static __device__ __forceinline__ DTypeQ QueryTransform(const ParamsT& params, DTypeQ q) {
+  template <typename T>
+  static __device__ __forceinline__ T QueryTransform(const ParamsT& params, T q) {
     if constexpr (use_logits_soft_cap) {
       return LogitsSoftCap<ParamsT>::QueryTransform(params, q);
     } else {

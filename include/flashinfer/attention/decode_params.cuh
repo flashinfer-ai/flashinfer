@@ -50,7 +50,7 @@ struct SingleDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
   uint32_t kv_stride_n;
   uint32_t kv_stride_h;
   uint32_t head_dim;
-  uint32_t window_left;
+  int32_t window_left;
   float logits_soft_cap;
   float rope_rcp_scale;
   float rope_rcp_theta;
@@ -60,7 +60,7 @@ struct SingleDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
                                          float* alibi_slopes, uint32_t seq_len,
                                          uint32_t num_qo_heads, uint32_t num_kv_heads,
                                          QKVLayout kv_layout, uint32_t head_dim,
-                                         uint32_t window_left, float logits_soft_cap,
+                                         int32_t window_left, float logits_soft_cap,
                                          float sm_scale, float rope_scale, float rope_theta)
       : DecodeParamsBase<DTypeQ, DTypeKV, DTypeO>{q, o, /*lse=*/nullptr, sm_scale},
         k(k),
