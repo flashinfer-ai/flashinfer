@@ -21,7 +21,7 @@
 #include <nvbench/nvbench.cuh>
 #include <optional>
 
-#include "flashinfer/attention/handler.cuh"
+#include "flashinfer/attention/scheduler.cuh"
 #include "flashinfer/layout.cuh"
 #include "flashinfer/pos_enc.cuh"
 #include "flashinfer_ops.cuh"
