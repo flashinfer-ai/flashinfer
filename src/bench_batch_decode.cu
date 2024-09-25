@@ -76,10 +76,10 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
   thrust::device_vector<char> int_buffer(int_workspace_size_in_bytes);
   // begin forward
   BatchDecodeHandlerPlan<T, T, T, int32_t>(
-      &handler, (void*)thrust::raw_pointer_cast(float_buffer.data()),
-      float_workspace_size_in_bytes, (void*)thrust::raw_pointer_cast(int_buffer.data()),
-      int_workspace_size_in_bytes, kv_indptr_host.data(), kv_last_page_len_host.data(),
-      batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, pos_encoding_mode);
+      &handler, (void*)thrust::raw_pointer_cast(float_buffer.data()), float_workspace_size_in_bytes,
+      (void*)thrust::raw_pointer_cast(int_buffer.data()), int_workspace_size_in_bytes,
+      kv_indptr_host.data(), kv_last_page_len_host.data(), batch_size, num_qo_heads, num_kv_heads,
+      head_dim, page_size, pos_encoding_mode);
   state.exec([&](nvbench::launch&) {
     cudaError_t status = BatchDecodeWithPagedKVCacheWrapper<T, T, T, int32_t>(
         &handler, thrust::raw_pointer_cast(q.data()), /*q_offset=*/nullptr, paged_kv,

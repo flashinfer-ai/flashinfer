@@ -330,7 +330,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeOut
                 using AttentionVariant =
                     ComposedAttention<ParamsT,
                                       get_variant_code(
-                                          /*use_custom_mask=*/false, /*use_sliding_window=*/false,
+                                          /*use_custom_mask=*/(MASK_MODE == MaskMode::kCustom), /*use_sliding_window=*/false,
                                           /*use_logits_soft_cap=*/false, /*use_alibi=*/false)>;
                 ParamsT params(q, k, v, /*custom_mask=*/nullptr, o, lse,
                                /*alibi_slopes=*/nullptr, num_qo_heads, num_kv_heads, qo_len, kv_len,
@@ -370,7 +370,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
                 using AttentionVariant =
                     ComposedAttention<ParamsT,
                                       get_variant_code(
-                                          /*use_custom_mask=*/false, /*use_sliding_window=*/false,
+                                          /*use_custom_mask=*/(MASK_MODE == MaskMode::kCustom), /*use_sliding_window=*/false,
                                           /*use_logits_soft_cap=*/false, /*use_alibi=*/false)>;
                 ParamsT params(q, k, v, /*custom_mask=*/nullptr, qo_indptr, kv_indptr,
                                /*qk_indptr=*/nullptr, o, lse, /*alibi_slopes=*/nullptr,
@@ -420,7 +420,7 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
               {DISPATCH_allow_fp16_qk_reduction(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, {
                 using ParamsT = BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeOut, IdType>;
                 using AttentionVariant =
-                    ComposedAttention<ParamsT, get_variant_code(/*use_custom_mask=*/false,
+                    ComposedAttention<ParamsT, get_variant_code(/*use_custom_mask=*/(MASK_MODE == MaskMode::kCustom),
                                                                 /*use_sliding_window=*/false,
                                                                 /*use_logits_soft_cap=*/false,
                                                                 /*use_alibi=*/false)>;
