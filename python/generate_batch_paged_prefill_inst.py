@@ -40,7 +40,7 @@ def get_cu_file_str(
     warp_layout_choice = [0, 1, 2]
     insts = "\n".join(
         [
-            """template cudaError_t BatchPrefillWithPagedKVCacheDispatched<{warp_layout}, {head_dim}, {logits_hook}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, AttentionVariant>(
+            """template cudaError_t BatchPrefillWithPagedKVCacheDispatched<{warp_layout}, {head_dim}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, AttentionVariant>(
     typename AttentionVariant::ParamsT params,
     typename AttentionVariant::DTypeO* tmp_v,
     float* tmp_s, cudaStream_t stream);
