@@ -108,8 +108,7 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
       page_size, pos_encoding_mode);
 
   cudaError_t status =
-      flashinfer::BatchDecodeWithPagedKVCacheWrapper<DTypeQO, DTypeKV,
-                                                      DTypeQO, int32_t>(
+      flashinfer::BatchDecodeWithPagedKVCacheWrapper<DTypeQO, DTypeKV, DTypeQO, int32_t>(
           &handler, thrust::raw_pointer_cast(q_device.data()), /*q_offset=*/nullptr, paged_kv,
           thrust::raw_pointer_cast(o_device.data()), /*lse=*/nullptr, num_qo_heads,
           pos_encoding_mode);
@@ -174,4 +173,3 @@ TEST(FlashInferCorrectnessTest, TestBatchDecodeKernelCorrectnessE5M2) {
   TestBatchDecodeKernelCorrectness<half, __nv_fp8_e5m2>();
 }
 #endif
-
