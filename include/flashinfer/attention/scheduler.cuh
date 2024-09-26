@@ -17,7 +17,6 @@
 #define FLASHINFER_ATTENTION_SCHEDULER_CUH_
 
 #include <cuda_runtime_api.h>
-#include <driver_types.h>
 
 #include <algorithm>
 #include <cstddef>
