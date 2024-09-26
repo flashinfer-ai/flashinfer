@@ -575,10 +575,12 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(
   sync_state<vec_size, bdx, bdy, bdz>(st, reinterpret_cast<float*>(smem), smem_md);
   st.normalize();
 
-  st.o.cast_store(o + (batch_idx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
-  // write lse
-  if (lse != nullptr) {
-    lse[batch_idx * num_qo_heads + qo_head_idx] = st.get_lse();
+  if (tz == 0) {
+    st.o.cast_store(o + (batch_idx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
+    // write lse
+    if (lse != nullptr) {
+      lse[batch_idx * num_qo_heads + qo_head_idx] = st.get_lse();
+    }
   }
 }
 
