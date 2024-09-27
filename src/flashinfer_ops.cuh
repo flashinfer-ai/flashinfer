@@ -13,21 +13,17 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <driver_types.h>
-
 #include <flashinfer/attention/decode_params.cuh>
 #include <flashinfer/attention/prefill_params.cuh>
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/attention/variants.cuh>
 #include <optional>
-#include <vector>
 
 #include "flashinfer/allocator.h"
 #include "flashinfer/attention/mask.cuh"
 #include "flashinfer/attention/scheduler.cuh"
 #include "flashinfer/attention/warp_layout.cuh"
 #include "flashinfer/layout.cuh"
-#include "flashinfer/utils.cuh"
 #include "utils.h"
 
 namespace flashinfer {

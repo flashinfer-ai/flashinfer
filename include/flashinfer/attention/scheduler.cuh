@@ -26,7 +26,6 @@
 #include <vector>
 
 #include "../allocator.h"
-#include "../page.cuh"
 #include "../pos_enc.cuh"
 #include "../utils.cuh"
 #include "warp_layout.cuh"
