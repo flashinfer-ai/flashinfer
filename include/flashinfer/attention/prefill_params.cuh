@@ -130,8 +130,8 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
   IdType* q_indptr;
   IdType* kv_indptr;
   IdType* qk_indptr;
-  IdType* q_offset;
-  IdType* k_rope_pos_offset;
+  IdType* q_offset;           // q_offset is only used for fused-rope attention
+  IdType* k_rope_pos_offset;  // k_rope_pos_offset is only used for fused-rope attention
   float* alibi_slopes;
   uint32_t num_qo_heads;
   uint32_t num_kv_heads;
@@ -158,10 +158,10 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
 
   __host__ BatchPrefillRaggedParams(DTypeQ* q, DTypeKV* k, DTypeKV* v, uint8_t* custom_mask,
                                     IdType* q_indptr, IdType* kv_indptr, IdType* qk_indptr,
-                                    DTypeO* o, float* lse, float* alibi_slopes,
-                                    uint32_t num_qo_heads, uint32_t num_kv_heads,
-                                    uint32_t q_stride_n, uint32_t q_stride_h, uint32_t kv_stride_n,
-                                    uint32_t kv_stride_h, int32_t window_left,
+                                    IdType* q_offset, IdType* k_rope_pos_offset, DTypeO* o,
+                                    float* lse, float* alibi_slopes, uint32_t num_qo_heads,
+                                    uint32_t num_kv_heads, uint32_t q_stride_n, uint32_t q_stride_h,
+                                    uint32_t kv_stride_n, uint32_t kv_stride_h, int32_t window_left,
                                     float logits_soft_cap, float sm_scale, float rope_scale,
                                     float rope_theta)
       : PrefillParamsBase<DTypeQ, DTypeKV, DTypeO>{q, custom_mask, o, lse, sm_scale},
@@ -170,8 +170,8 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
         q_indptr(q_indptr),
         kv_indptr(kv_indptr),
         qk_indptr(qk_indptr),
-        q_offset(nullptr),
-        k_rope_pos_offset(nullptr),
+        q_offset(q_offset),
+        k_rope_pos_offset(k_rope_pos_offset),
         alibi_slopes(alibi_slopes),
         num_qo_heads(num_qo_heads),
         num_kv_heads(num_kv_heads),
@@ -216,7 +216,7 @@ struct BatchPrefillPagedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DType
   paged_kv_t<DTypeKV, IdType> paged_kv;
   IdType* q_indptr;
   IdType* qk_indptr;
-  IdType* q_offset;
+  IdType* q_offset;  // q_offset is only used for fused-rope attention
   float* alibi_slopes;
   uint32_t num_qo_heads;
   uint_fastdiv group_size_fastdiv;
@@ -238,7 +238,7 @@ struct BatchPrefillPagedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DType
 
   __host__ BatchPrefillPagedParams(DTypeQ* q, paged_kv_t<DTypeKV, IdType> paged_kv,
                                    uint8_t* custom_mask, IdType* q_indptr, IdType* qk_indptr,
-                                   DTypeO* o, float* lse, float* alibi_slopes,
+                                   IdType* q_offset, DTypeO* o, float* lse, float* alibi_slopes,
                                    uint32_t num_qo_heads, int32_t window_left,
                                    float logits_soft_cap, float sm_scale, float rope_scale,
                                    float rope_theta)
@@ -246,7 +246,7 @@ struct BatchPrefillPagedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DType
         paged_kv(paged_kv),
         q_indptr(q_indptr),
         qk_indptr(qk_indptr),
-        q_offset(nullptr),
+        q_offset(q_offset),
         alibi_slopes(alibi_slopes),
         num_qo_heads(num_qo_heads),
         group_size_fastdiv(num_qo_heads / paged_kv.num_heads),

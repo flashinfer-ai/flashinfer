@@ -372,9 +372,9 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
                                           /*use_sliding_window=*/false,
                                           /*use_logits_soft_cap=*/false, /*use_alibi=*/false)>;
                 ParamsT params(q, k, v, /*custom_mask=*/nullptr, qo_indptr, kv_indptr,
-                               /*qk_indptr=*/nullptr, o, lse, /*alibi_slopes=*/nullptr,
-                               num_qo_heads, num_kv_heads, qo_stride_n, qo_stride_h, kv_stride_n,
-                               kv_stride_h, /*window_left=*/-1,
+                               /*qk_indptr=*/nullptr, q_offset, k_rope_pos_offset, o, lse,
+                               /*alibi_slopes=*/nullptr, num_qo_heads, num_kv_heads, qo_stride_n,
+                               qo_stride_h, kv_stride_n, kv_stride_h, /*window_left=*/-1,
                                /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta);
                 params.request_indices = handler->GetRequestIndices<IdType>();
                 params.qo_tile_indices = handler->GetQOTileIndices<IdType>();
@@ -403,7 +403,6 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
     bool causal = true, PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
     bool allow_fp16_qk_reduction = false, std::optional<float> maybe_sm_scale = std::nullopt,
     float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {
-  // NOTE(Zihao): q_offset is not used in the current implementation, should fix this in the future.
   const float sm_scale = maybe_sm_scale.value_or(1.f / std::sqrt(float(paged_kv.head_dim)));
   const uint32_t num_kv_heads = paged_kv.num_heads;
   const uint32_t head_dim = paged_kv.head_dim;
@@ -424,10 +423,11 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
                                                                 /*use_sliding_window=*/false,
                                                                 /*use_logits_soft_cap=*/false,
                                                                 /*use_alibi=*/false)>;
-                ParamsT params(
-                    q, paged_kv, /*custom_mask=*/nullptr, qo_indptr, /*qk_indptr=*/nullptr, o, lse,
-                    /*alibi_slopes=*/nullptr, num_qo_heads,
-                    /*window_left=*/-1, /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta);
+                ParamsT params(q, paged_kv, /*custom_mask=*/nullptr, qo_indptr,
+                               /*qk_indptr=*/nullptr, q_offset, o, lse,
+                               /*alibi_slopes=*/nullptr, num_qo_heads,
+                               /*window_left=*/-1, /*logits_soft_cap=*/0.f, sm_scale, rope_scale,
+                               rope_theta);
                 params.request_indices = handler->GetRequestIndices<IdType>();
                 params.qo_tile_indices = handler->GetQOTileIndices<IdType>();
                 params.kv_tile_indices = handler->GetKVTileIndices<IdType>();
