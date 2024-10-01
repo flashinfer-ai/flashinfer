@@ -53,13 +53,13 @@ std::vector<int64_t> BatchPrefillWithKVCachePlan(
 
   PrefillPlanInfo plan_info;
 
-  cudaError_t status = PrefillPlan<{{ dtype_o }}, {{ dtype_idx }}>(
+  cudaError_t status = PrefillPlan<{{ dtype_idx }}>(
     float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
     int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
     int_workspace_size_in_bytes,
     plan_info, qo_indptr.data_ptr<{{ dtype_idx }}>(), kv_indptr.data_ptr<{{ dtype_idx }}>(),
     batch_size, num_qo_heads, num_kv_heads, {{ head_dim }}, page_size, enable_cuda_graph,
-    torch_current_stream);
+    sizeof({{ dtype_o }}), torch_current_stream);
 
   TORCH_CHECK(status == cudaSuccess, "Failed to plan prefill with error: ", cudaGetErrorString(status));
 

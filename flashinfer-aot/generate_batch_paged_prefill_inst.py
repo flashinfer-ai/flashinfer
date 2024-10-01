@@ -38,22 +38,26 @@ def get_cu_file_str(
     idtype,
 ):
     warp_layout_choice = [0, 1, 2]
-    insts = "\n".join(
-        [
-            """template cudaError_t BatchPrefillWithPagedKVCacheDispatched<{warp_layout}, {head_dim}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, AttentionVariant>(
-    typename AttentionVariant::ParamsT params,
-    typename AttentionVariant::DTypeO* tmp_v,
+
+    def get_insts(attention_variant, dtype_out):
+        return "\n".join(
+            [
+                """template cudaError_t BatchPrefillWithPagedKVCacheDispatched<{warp_layout}, {head_dim}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {attention_variant}>(
+    ParamsT params,
+    {dtype_out}* tmp_v,
     float* tmp_s, cudaStream_t stream);
     """.format(
-                warp_layout=warp_layout_literal[warp_layout],
-                head_dim=head_dim,
-                pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
-                allow_fp16_qk_reduction=allow_fp16_qk_reduction,
-                mask_mode=mask_mode_literal[int(mask_mode)],
-            )
-            for warp_layout in warp_layout_choice
-        ]
-    )
+                    warp_layout=warp_layout_literal[warp_layout],
+                    head_dim=head_dim,
+                    pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
+                    allow_fp16_qk_reduction=allow_fp16_qk_reduction,
+                    mask_mode=mask_mode_literal[int(mask_mode)],
+                    attention_variant=attention_variant,
+                    dtype_out=dtype_out,
+                )
+                for warp_layout in warp_layout_choice
+            ]
+        )
 
     use_custom_mask = "true" if int(mask_mode) == 2 else "false"
     dtype_q = dtype_literal[dtype_q]
@@ -66,9 +70,16 @@ def get_cu_file_str(
 namespace flashinfer {{
 
 using ParamsT = BatchPrefillPagedParams<{dtype_q}, {dtype_kv}, {dtype_out}, {idtype}>;
-using AttentionVariant = ComposedAttention<ParamsT, get_variant_code({use_custom_mask}, false, false, false)>;
 
-{insts}
+using AttentionVariant1 = ComposedAttention<ParamsT, get_variant_code(
+    {use_custom_mask}, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false)>;
+
+{get_insts("AttentionVariant1", dtype_out)}
+
+using AttentionVariant2 = ComposedAttention<ParamsT, get_variant_code(
+    {use_custom_mask}, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false)>;
+
+{get_insts("AttentionVariant2", dtype_out)}
 
 }}"""
     return content

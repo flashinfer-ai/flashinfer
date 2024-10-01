@@ -13,9 +13,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_BMM_FP8_CUH_
-#define FLASHINFER_BMM_FP8_CUH_
+#ifndef FLASHINFER_GEMM_BMM_FP8_CUH_
+#define FLASHINFER_GEMM_BMM_FP8_CUH_
 
+// NOTE(Zihao): we should leave pytorch related includes outside of the header files.
 #include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <cublasLt.h>
@@ -170,6 +171,7 @@ void bmm_fp8_internal_cublaslt(const AT* A, const BT* B, DT* D, int batch_size, 
   TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, at::cuda::blas::_cublasGetErrorEnum(status));
 }
 
+// NOTE(Zihao): templates should not be initialized in the header files!
 template void bmm_fp8_internal_cublaslt<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16>(
     const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* B, __nv_bfloat16* D, int batch_size, int m, int n,
     int k, const float* A_scale, const float* B_scale);
@@ -197,4 +199,4 @@ template void bmm_fp8_internal_cublaslt<__nv_fp8_e5m2, __nv_fp8_e4m3, half>(
 }  // namespace bmm_fp8
 }  // namespace flashinfer
 
-#endif  // FLASHINFER_BMM_FP8_CUH_
+#endif  // FLASHINFER_GEMM_BMM_FP8_CUH_

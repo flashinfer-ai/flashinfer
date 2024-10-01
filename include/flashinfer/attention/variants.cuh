@@ -123,7 +123,7 @@ struct LogitsSoftCap {
                                                       int32_t batch_idx, int32_t qo_idx,
                                                       int32_t kv_idx, int32_t qo_head_idx,
                                                       int32_t kv_head_idx) {
-    return params.logits_soft_cap * math::log2e * math::tanh(logits);
+    return params.logits_soft_cap * math::log2e * float(math::tanh(logits));
   }
 
   static __device__ __forceinline__ bool LogitsMask(const ParamsT& params, int32_t batch_idx,

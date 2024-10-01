@@ -37,11 +37,17 @@ def get_cu_file_str(
 namespace flashinfer {{
 
 using ParamsT = BatchDecodeParams<{dtype_q}, {dtype_kv}, {dtype_out}, {idtype}>;
-using AttentionVariant = ComposedAttention<ParamsT, get_variant_code(false, false, false, false)>;
 
-template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{head_dim}, {pos_encoding_mode}, AttentionVariant>(
-    typename AttentionVariant::ParamsT params,
-    typename AttentionVariant::DTypeO* tmp_v, float* tmp_s,
+template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{head_dim}, {pos_encoding_mode}, ComposedAttention<ParamsT, get_variant_code(
+    /*use_custom_mask=*/false, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false)>>(
+    ParamsT params,
+    {dtype_out}* tmp_v, float* tmp_s,
+    cudaStream_t stream);
+
+template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{head_dim}, {pos_encoding_mode}, ComposedAttention<ParamsT, get_variant_code(
+    /*use_custom_mask=*/false, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false)>>(
+    ParamsT params,
+    {dtype_out}* tmp_v, float* tmp_s,
     cudaStream_t stream);
 }}
     """.format(

@@ -20,6 +20,11 @@
 #include <cuda_fp8.h>
 #include <torch/extension.h>
 
+#include <flashinfer/layout.cuh>
+#include <flashinfer/pos_enc.cuh>
+
+#include "generated/dispatch.inc"
+
 using namespace flashinfer;
 
 #ifdef FLASHINFER_ENABLE_BF16
@@ -173,6 +178,21 @@ using namespace flashinfer;
   }()
 #endif
 
+#define DISPATCH_PYTORCH_QKV_DTYPE_TO_CTYPE(q_dtype, kv_dtype, c_type_q, c_type_kv, ...) \
+  [&]() -> bool {                                                                        \
+    if (kv_dtype == q_dtype) {                                                           \
+      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q_dtype, c_type_q, [&] {                    \
+        using c_type_kv = c_type_q;                                                      \
+        return __VA_ARGS__();                                                            \
+      });                                                                                \
+    } else {                                                                             \
+      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q_dtype, c_type_q, [&] {               \
+        return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(kv_dtype, c_type_kv,                  \
+                                                   [&] { return __VA_ARGS__(); });       \
+      });                                                                                \
+    }                                                                                    \
+  }()
+
 #define _DISPATCH_SWITCH(var_name, cond, ...)                                           \
   [&]() -> bool {                                                                       \
     switch (cond) {                                                                     \
@@ -190,6 +210,31 @@ using namespace flashinfer;
     constexpr auto case_var = case_expr;         \
     return __VA_ARGS__();                        \
   }
+
+#define DISPATCH_head_dim(expr, const_expr, ...) \
+  _DISPATCH_SWITCH("head_dim", expr, _DISPATCH_CASES_head_dim(const_expr, __VA_ARGS__))
+
+#define DISPATCH_pos_encoding_mode(expr, const_expr, ...) \
+  _DISPATCH_SWITCH("positional encoding mode", expr,      \
+                   _DISPATCH_CASES_pos_encoding_mode(const_expr, __VA_ARGS__))
+
+#define DISPATCH_allow_fp16_qk_reduction(expr, const_expr, ...) \
+  _DISPATCH_SWITCH("allow_fp16_qk_reduction", expr,             \
+                   _DISPATCH_CASES_allow_fp16_qk_reduction(const_expr, __VA_ARGS__))
+
+#define DISPATCH_mask_mode(expr, const_expr, ...) \
+  _DISPATCH_SWITCH("mask_mode", expr, _DISPATCH_CASES_mask_mode(const_expr, __VA_ARGS__))
+
+#define DISPATCH_LOGITS_SOFT_CAP(use_logits_soft_cap, USE_LOGITS_SOFT_CAP, ...) \
+  [&]() -> bool {                                                               \
+    if (use_logits_soft_cap) {                                                  \
+      constexpr bool USE_LOGITS_SOFT_CAP = true;                                \
+      return __VA_ARGS__();                                                     \
+    } else {                                                                    \
+      constexpr bool USE_LOGITS_SOFT_CAP = false;                               \
+      return __VA_ARGS__();                                                     \
+    }                                                                           \
+  }()
 
 inline void check_shape(const torch::Tensor& a, const torch::Tensor& b, const char* a_name,
                         const char* b_name) {

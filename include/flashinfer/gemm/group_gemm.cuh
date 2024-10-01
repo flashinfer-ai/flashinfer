@@ -13,13 +13,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef FLASHINFER_GROUP_GEMM_WRAPPER_CUH_
-#define FLASHINFER_GROUP_GEMM_WRAPPER_CUH_
+#ifndef FLASHINFER_GEMM_GROUP_GEMM_CUH_
+#define FLASHINFER_GEMM_GROUP_GEMM_CUH_
 
 #include <sstream>
 
 #include "../allocator.h"
-#include "handler.cuh"
+#include "group_gemm_cutlass.cuh"
 
 namespace flashinfer {
 
@@ -35,12 +35,12 @@ namespace group_gemm {
   }
 
 template <typename DType>
-cudaError_t CutlassSegmentGEMMWrapper(CutlassSegmentGEMMHandler* handler, DType* x, DType* w,
-                                      DType* y, int64_t* xy_indptr_d, int64_t* w_indices_d,
-                                      unsigned int batch_size, unsigned int d_in,
-                                      unsigned int d_out, bool weight_column_major,
-                                      cudaStream_t stream) {
-  AlignedAllocator allocator(handler->GetWorkspace(), handler->GetWorkspaceSizeInBytes());
+cudaError_t CutlassSegmentGEMMWrapper(void* workspace_buffer, size_t workspace_buffer_size_in_bytes,
+                                      DType* x, DType* w, DType* y, int64_t* xy_indptr_d,
+                                      int64_t* w_indices_d, unsigned int batch_size,
+                                      unsigned int d_in, unsigned int d_out,
+                                      bool weight_column_major, cudaStream_t stream) {
+  AlignedAllocator allocator(workspace_buffer, workspace_buffer_size_in_bytes);
   cutlass::gemm::GemmCoord* problem_sizes_device =
       allocator.aligned_alloc<cutlass::gemm::GemmCoord>(
           batch_size * sizeof(cutlass::gemm::GemmCoord), 16, "problem_sizes_device");
@@ -116,4 +116,4 @@ cudaError_t CutlassSegmentGEMMWrapper(CutlassSegmentGEMMHandler* handler, DType*
 
 }  // namespace flashinfer
 
-#endif  // FLASHINFER_GROUP_GEMM_WRAPPER_CUH_
+#endif  // FLASHINFER_GEMM_GROUP_GEMM_CUH_

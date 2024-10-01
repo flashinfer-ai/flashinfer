@@ -510,13 +510,13 @@ struct PrefillPlanInfo {
   }
 };
 
-template <typename DTypeO, typename IdType>
+template <typename IdType>
 cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_in_bytes, void* int_buffer,
                         void* page_locked_int_buffer, size_t int_workspace_size_in_bytes,
                         PrefillPlanInfo& plan_info, IdType* qo_indptr_h, IdType* kv_indptr_h,
                         uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
                         uint32_t head_dim, uint32_t page_size, bool enable_cuda_graph,
-                        cudaStream_t stream) {
+                        uint32_t sizeof_dtype_o, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -579,7 +579,7 @@ cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_in_bytes
   if (split_kv) {
     AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
     plan_info.v_offset = float_allocator.aligned_alloc_offset(
-        num_qo_heads * split_max_batch_size * qo_tile_size * head_dim * sizeof(DTypeO), 16,
+        num_qo_heads * split_max_batch_size * qo_tile_size * head_dim * sizeof_dtype_o, 16,
         "batch_prefill_tmp_v");
     plan_info.s_offset = float_allocator.aligned_alloc_offset(
         num_qo_heads * split_max_batch_size * qo_tile_size * sizeof(float), 16,

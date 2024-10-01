@@ -35,6 +35,7 @@ pos_encoding_mode_literal = {
 dtype_literal = {
     "f16": "half",
     "bf16": "nv_bfloat16",
+    "f32": "float",
     "e4m3": "__nv_fp8_e4m3",
     "e5m2": "__nv_fp8_e5m2",
 }

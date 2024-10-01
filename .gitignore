@@ -12,6 +12,7 @@ src/dispatch.inc
 src/generated/
 python/csrc/generated/
 python/flashinfer/_build_meta.py
+flashinfer_aot/csrc_aot/generated/
 
 # Generated documentation files
 docs/generated

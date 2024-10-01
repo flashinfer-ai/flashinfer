@@ -13,38 +13,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <flashinfer/group_gemm/handler.cuh>
-#include <flashinfer/group_gemm/wrapper.cuh>
+#include <flashinfer/group_gemm/group_gemm.cuh>
 
 #include "pytorch_extension_utils.h"
 
 using namespace flashinfer::group_gemm;
 
-class CutlassSegmentGEMMPyTorchWrapper {
- public:
-  void RegisterWorkspaceBuffer(torch::Tensor workspace_buffer);
-
-  torch::Tensor Run(torch::Tensor seg_indptr, torch::Tensor weight_indices, torch::Tensor x,
-                    torch::Tensor weight, unsigned int batch_size, bool weight_column_major);
-
-  CutlassSegmentGEMMPyTorchWrapper(torch::Tensor workspace_buffer)
-      : handler_(std::make_shared<flashinfer::group_gemm::CutlassSegmentGEMMHandler>()) {
-    RegisterWorkspaceBuffer(workspace_buffer);
-  }
-
- private:
-  std::shared_ptr<flashinfer::group_gemm::CutlassSegmentGEMMHandler> handler_;
-};
-
-void CutlassSegmentGEMMPyTorchWrapper::RegisterWorkspaceBuffer(torch::Tensor workspace_buffer) {
-  handler_->RegisterWorkspace(static_cast<void*>(workspace_buffer.data_ptr()),
-                              workspace_buffer.size(0) * workspace_buffer.element_size());
-}
-
-torch::Tensor CutlassSegmentGEMMPyTorchWrapper::Run(torch::Tensor seg_indptr,
-                                                    torch::Tensor weight_indices, torch::Tensor x,
-                                                    torch::Tensor weight, unsigned int batch_size,
-                                                    bool weight_column_major) {
+torch::Tensor CutlassSegmentGEMM(torch::Tensor workspace_buffer, torch::Tensor seg_indptr,
+                                 torch::Tensor weight_indices, torch::Tensor x,
+                                 torch::Tensor weight, unsigned int batch_size,
+                                 bool weight_column_major) {
   // TODO(Zihao): Add more checks here
   CHECK_INPUT(seg_indptr);
   CHECK_INPUT(x);
@@ -73,9 +51,9 @@ torch::Tensor CutlassSegmentGEMMPyTorchWrapper::Run(torch::Tensor seg_indptr,
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(x.scalar_type(), c_type, [&] {
     using cutlass_t = typename cutlass_dtype<c_type>::type;
     auto status = CutlassSegmentGEMMWrapper<cutlass_t>(
-        handler_.get(), static_cast<cutlass_t*>(x.data_ptr()),
-        static_cast<cutlass_t*>(weight.data_ptr()), static_cast<cutlass_t*>(y.data_ptr()),
-        static_cast<int64_t*>(seg_indptr.data_ptr()),
+        workspace_buffer.data_ptr(), workspace_buffer.element_size() * workspace_buffer.size(0),
+        static_cast<cutlass_t*>(x.data_ptr()), static_cast<cutlass_t*>(weight.data_ptr()),
+        static_cast<cutlass_t*>(y.data_ptr()), static_cast<int64_t*>(seg_indptr.data_ptr()),
         weight_indices_defined ? static_cast<int64_t*>(weight_indices.data_ptr()) : nullptr,
         batch_size, d_in, d_out, weight_column_major, torch_current_stream);
     TORCH_CHECK(status == cudaSuccess,

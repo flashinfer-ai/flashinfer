@@ -17,9 +17,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 
-#include <flashinfer/bmm_fp8.cuh>
+#include <flashinfer/gemm/bmm_fp8.cuh>
 
-#include "flashinfer_ops.h"
 #include "pytorch_extension_utils.h"
 
 using namespace flashinfer;
