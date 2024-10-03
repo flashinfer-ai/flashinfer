@@ -58,7 +58,6 @@ struct SinglePrefillParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTypeO> {
   float logits_soft_cap;
   float log2_rope_rcp_scale;
   float log2_rope_rcp_theta;
-  uint_fastdiv group_size_fastdiv;
 
   bool partition_kv;
 
@@ -75,6 +74,7 @@ struct SinglePrefillParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTypeO> {
         alibi_slopes(alibi_slopes),
         num_qo_heads(num_qo_heads),
         num_kv_heads(num_kv_heads),
+        // group_size_fastdiv(num_qo_heads / num_kv_heads),
         qo_len(qo_len),
         kv_len(kv_len),
         q_stride_n(q_stride_n),
@@ -86,26 +86,7 @@ struct SinglePrefillParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTypeO> {
         logits_soft_cap(logits_soft_cap),
         log2_rope_rcp_scale(-std::log2f(rope_scale)),
         log2_rope_rcp_theta(-std::log2f(rope_theta)),
-        group_size_fastdiv(num_qo_heads / num_kv_heads),
         partition_kv(false) {}
-
-  __host__ __device__ __forceinline__ size_t get_q_elem_offset(uint32_t qo_idx,
-                                                               uint32_t qo_head_idx,
-                                                               uint32_t feat_idx) const {
-    return get_elem_offset_impl(qo_idx, qo_head_idx, feat_idx, q_stride_n, q_stride_h);
-  }
-
-  __host__ __device__ __forceinline__ size_t get_o_elem_offset(uint32_t qo_idx,
-                                                               uint32_t qo_head_idx,
-                                                               uint32_t feat_idx) const {
-    return get_elem_offset_impl(qo_idx, qo_head_idx, feat_idx, num_qo_heads * head_dim, head_dim);
-  }
-
-  __host__ __device__ __forceinline__ size_t get_kv_elem_offset(uint32_t kv_idx,
-                                                                uint32_t kv_head_idx,
-                                                                uint32_t feat_idx) const {
-    return get_elem_offset_impl(kv_idx, kv_head_idx, feat_idx, kv_stride_n, kv_stride_h);
-  }
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
     return qo_len;
@@ -115,9 +96,8 @@ struct SinglePrefillParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTypeO> {
     return kv_len;
   }
 
-  __host__ __device__ __forceinline__ uint32_t get_mask_offset(uint32_t batch_idx, uint32_t qo_idx,
-                                                               uint32_t kv_idx) const {
-    return qo_idx * get_kv_len(batch_idx) + kv_idx;
+  __host__ __device__ __forceinline__ uint8_t* get_batch_local_mask_ptr(uint32_t batch_idx) const {
+    return this->custom_mask;
   }
 };
 
@@ -135,7 +115,6 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
   float* alibi_slopes;
   uint32_t num_qo_heads;
   uint32_t num_kv_heads;
-  uint_fastdiv group_size_fastdiv;
   uint32_t q_stride_n;
   uint32_t q_stride_h;
   uint32_t kv_stride_n;
@@ -175,7 +154,6 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
         alibi_slopes(alibi_slopes),
         num_qo_heads(num_qo_heads),
         num_kv_heads(num_kv_heads),
-        group_size_fastdiv(num_qo_heads / num_kv_heads),
         q_stride_n(q_stride_n),
         q_stride_h(q_stride_h),
         kv_stride_n(kv_stride_n),
@@ -203,9 +181,8 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
     return kv_indptr[batch_idx + 1] - kv_indptr[batch_idx];
   }
 
-  __host__ __device__ __forceinline__ uint32_t get_mask_offset(uint32_t batch_idx, uint32_t qo_idx,
-                                                               uint32_t kv_idx) const {
-    return qk_indptr[batch_idx] * 8 + qo_idx * get_kv_len(batch_idx) + kv_idx;
+  __host__ __device__ __forceinline__ uint8_t* get_batch_local_mask_ptr(uint32_t batch_idx) const {
+    return this->custom_mask + qk_indptr[batch_idx];
   }
 };
 
@@ -219,7 +196,6 @@ struct BatchPrefillPagedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DType
   IdType* q_offset;  // q_offset is only used for fused-rope attention
   float* alibi_slopes;
   uint32_t num_qo_heads;
-  uint_fastdiv group_size_fastdiv;
   int32_t window_left;
   float logits_soft_cap;
   float log2_rope_rcp_scale;
@@ -249,7 +225,6 @@ struct BatchPrefillPagedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DType
         q_offset(q_offset),
         alibi_slopes(alibi_slopes),
         num_qo_heads(num_qo_heads),
-        group_size_fastdiv(num_qo_heads / paged_kv.num_heads),
         window_left(window_left),
         logits_soft_cap(logits_soft_cap),
         log2_rope_rcp_scale(-std::log2f(rope_scale)),
@@ -273,9 +248,13 @@ struct BatchPrefillPagedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DType
     return paged_kv.get_length(batch_idx);
   }
 
+  __host__ __device__ __forceinline__ uint8_t* get_batch_local_mask_ptr(uint32_t batch_idx) const {
+    return this->custom_mask + qk_indptr[batch_idx];
+  }
+
   __host__ __device__ __forceinline__ uint32_t get_mask_offset(uint32_t batch_idx, uint32_t qo_idx,
-                                                               uint32_t kv_idx) const {
-    return qk_indptr[batch_idx] * 8 + qo_idx * get_kv_len(batch_idx) + kv_idx;
+                                                               uint32_t kv_idx, uint32_t kv_len) const {
+    return qk_indptr[batch_idx] * 8 + qo_idx * kv_len + kv_idx;
   }
 };
 
