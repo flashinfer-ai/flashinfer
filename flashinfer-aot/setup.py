@@ -328,8 +328,8 @@ if __name__ == "__main__":
                 "csrc_aot/activation.cu",
                 "csrc/rope.cu",
                 "csrc/quantization.cu",
-                # "csrc/group_gemm.cu",
-                # "csrc/bmm_fp8.cu",
+                "csrc/group_gemm.cu",
+                "csrc/bmm_fp8.cu",
                 "csrc_aot/flashinfer_ops.cu"
             ],
             include_dirs=include_dirs,

@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <flashinfer/group_gemm/group_gemm.cuh>
+#include <flashinfer/gemm/group_gemm.cuh>
 
 #include "pytorch_extension_utils.h"
 
@@ -50,7 +50,7 @@ torch::Tensor CutlassSegmentGEMM(torch::Tensor workspace_buffer, torch::Tensor s
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(x.scalar_type(), c_type, [&] {
     using cutlass_t = typename cutlass_dtype<c_type>::type;
-    auto status = CutlassSegmentGEMMWrapper<cutlass_t>(
+    auto status = CutlassSegmentGEMMRun<cutlass_t>(
         workspace_buffer.data_ptr(), workspace_buffer.element_size() * workspace_buffer.size(0),
         static_cast<cutlass_t*>(x.data_ptr()), static_cast<cutlass_t*>(weight.data_ptr()),
         static_cast<cutlass_t*>(y.data_ptr()), static_cast<int64_t*>(seg_indptr.data_ptr()),

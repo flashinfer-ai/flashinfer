@@ -107,24 +107,13 @@ torch::Tensor packbits(torch::Tensor x, const std::string& bitorder);
 torch::Tensor segment_packbits(torch::Tensor x, torch::Tensor input_indptr,
                                torch::Tensor output_indptr, const std::string& bitorder);
 
-// void bmm_fp8(const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& D,
-//              torch::Tensor& A_scale, torch::Tensor& B_scale);
+void bmm_fp8(const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& D,
+             torch::Tensor& A_scale, torch::Tensor& B_scale);
 
-// class CutlassSegmentGEMMPyTorchWrapper {
-//  public:
-//   void RegisterWorkspaceBuffer(torch::Tensor workspace_buffer);
-
-//   torch::Tensor Run(torch::Tensor seg_indptr, torch::Tensor weight_indices, torch::Tensor x,
-//                     torch::Tensor weight, unsigned int batch_size, bool weight_column_major);
-
-//   CutlassSegmentGEMMPyTorchWrapper(torch::Tensor workspace_buffer)
-//       : handler_(std::make_shared<flashinfer::group_gemm::CutlassSegmentGEMMHandler>()) {
-//     RegisterWorkspaceBuffer(workspace_buffer);
-//   }
-
-//  private:
-//   std::shared_ptr<flashinfer::group_gemm::CutlassSegmentGEMMHandler> handler_;
-// };
+torch::Tensor CutlassSegmentGEMM(torch::Tensor workspace_buffer, torch::Tensor seg_indptr,
+                                 torch::Tensor weight_indices, torch::Tensor x,
+                                 torch::Tensor weight, unsigned int batch_size,
+                                 bool weight_column_major);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("append_paged_kv_cache", &append_paged_kv_cache, "Append paged KV-Cache operator");
@@ -161,9 +150,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("apply_llama31_rope", &apply_llama31_rope, "Apply Llama 3.1 style RoPE");
   m.def("packbits", &packbits, "GPU packbits operator");
   m.def("segment_packbits", &segment_packbits, "GPU segment packbits operator");
-//   m.def("bmm_fp8", &bmm_fp8, "BMM FP8");
-//   py::class_<CutlassSegmentGEMMPyTorchWrapper>(m, "CutlassSegmentGEMMPyTorchWrapper")
-//       .def(py::init<torch::Tensor>())
-//       .def("register_workspace", &CutlassSegmentGEMMPyTorchWrapper::RegisterWorkspaceBuffer)
-//       .def("run", &CutlassSegmentGEMMPyTorchWrapper::Run);
+  m.def("cutlass_segment_gemm", &CutlassSegmentGEMM, "Cutlass Segment GEMM operator");
+  m.def("bmm_fp8", &bmm_fp8, "BMM FP8");
 }

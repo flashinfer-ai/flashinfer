@@ -36,7 +36,6 @@ def get_gemm_module():
                 FLASHINFER_CSRC_DIR / "bmm_fp8.cu",
                 FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops.cu",
             ],
-            verbose=True,
         )
     return _gemm_module
 
@@ -102,9 +101,7 @@ class SegmentGEMMWrapper:
             size is proportional to the number of segments (batch size), 1MB workspace is enough for most cases.
         """
         self._workspace_buffer = workspace_buffer
-        self._wrapper = get_gemm_module().CutlassSegmentGEMMPyTorchWrapper(
-            self._workspace_buffer
-        )
+        self._cached_module = get_gemm_module()
 
     def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor) -> None:
         r"""Reset the workspace buffer.
@@ -116,7 +113,6 @@ class SegmentGEMMWrapper:
             be the same as the device of the input tensors.
         """
         self._workspace_buffer = new_workspace_buffer
-        self._wrapper.register_workspace_buffer(new_workspace_buffer)
 
     def run(
         self,
@@ -193,7 +189,8 @@ class SegmentGEMMWrapper:
         if weight_indices is None:
             # create an empty CPU tensor as placeholder
             weight_indices = torch.empty(0, dtype=torch.int64)
-        return self._wrapper.run(
+        return self._cached_module.cutlass_segment_gemm(
+            self._workspace_buffer,
             seg_indptr,
             weight_indices,
             x,

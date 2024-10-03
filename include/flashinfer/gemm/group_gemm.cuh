@@ -35,11 +35,11 @@ namespace group_gemm {
   }
 
 template <typename DType>
-cudaError_t CutlassSegmentGEMMWrapper(void* workspace_buffer, size_t workspace_buffer_size_in_bytes,
-                                      DType* x, DType* w, DType* y, int64_t* xy_indptr_d,
-                                      int64_t* w_indices_d, unsigned int batch_size,
-                                      unsigned int d_in, unsigned int d_out,
-                                      bool weight_column_major, cudaStream_t stream) {
+cudaError_t CutlassSegmentGEMMRun(void* workspace_buffer, size_t workspace_buffer_size_in_bytes,
+                                  DType* x, DType* w, DType* y, int64_t* xy_indptr_d,
+                                  int64_t* w_indices_d, unsigned int batch_size, unsigned int d_in,
+                                  unsigned int d_out, bool weight_column_major,
+                                  cudaStream_t stream) {
   AlignedAllocator allocator(workspace_buffer, workspace_buffer_size_in_bytes);
   cutlass::gemm::GemmCoord* problem_sizes_device =
       allocator.aligned_alloc<cutlass::gemm::GemmCoord>(

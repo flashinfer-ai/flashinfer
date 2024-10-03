@@ -18,10 +18,12 @@
 void bmm_fp8(const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& D,
              torch::Tensor& A_scale, torch::Tensor& B_scale);
 
+torch::Tensor CutlassSegmentGEMM(torch::Tensor workspace_buffer, torch::Tensor seg_indptr,
+                                 torch::Tensor weight_indices, torch::Tensor x,
+                                 torch::Tensor weight, unsigned int batch_size,
+                                 bool weight_column_major);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("cutlass_segment_gemm", &CutlassSegmentGEMM, "Cutlass Segment GEMM");
   m.def("bmm_fp8", &bmm_fp8, "BMM FP8");
-  py::class_<CutlassSegmentGEMMPyTorchWrapper>(m, "CutlassSegmentGEMMPyTorchWrapper")
-      .def(py::init<torch::Tensor>())
-      .def("register_workspace", &CutlassSegmentGEMMPyTorchWrapper::RegisterWorkspaceBuffer)
-      .def("run", &CutlassSegmentGEMMPyTorchWrapper::Run);
 }
