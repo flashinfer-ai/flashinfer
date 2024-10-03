@@ -611,9 +611,8 @@ __device__ __forceinline__ void logits_transform(const typename AttentionVariant
         const uint32_t q_idx = q, kv_idx = kv_idx_base + fz * 16 + 2 * (lane_idx % 4) +
                                            8 * (reg_id / 4) + reg_id % 2;
         const uint32_t qo_head_idx = kv_head_idx * group_size + r;
-        s_frag[fx][fz][reg_id] =
-            variant.LogitsTransform(params, s_frag[fx][fz][reg_id], batch_idx, q_idx, kv_idx,
-                                    qo_head_idx, kv_head_idx);
+        s_frag[fx][fz][reg_id] = variant.LogitsTransform(params, s_frag[fx][fz][reg_id], batch_idx,
+                                                         q_idx, kv_idx, qo_head_idx, kv_head_idx);
       }
     }
   }
@@ -641,11 +640,11 @@ __device__ __forceinline__ void logits_mask(const typename AttentionVariant::Par
         const uint32_t q_idx = q, kv_idx = kv_idx_base + fz * 16 + 2 * (lane_idx % 4) +
                                            8 * (reg_id / 4) + reg_id % 2;
         const uint32_t qo_head_idx = kv_head_idx * group_size + r;
-        const bool mask = (!(MASK_MODE == MaskMode::kCausal
-                                 ? (kv_idx + qo_len > kv_len + q_idx || (kv_idx >= chunk_end))
-                                 : kv_idx >= chunk_end)) &&
-                          variant.LogitsMask(params, batch_idx, q_idx, kv_idx, qo_head_idx,
-                                             kv_head_idx);
+        const bool mask =
+            (!(MASK_MODE == MaskMode::kCausal
+                   ? (kv_idx + qo_len > kv_len + q_idx || (kv_idx >= chunk_end))
+                   : kv_idx >= chunk_end)) &&
+            variant.LogitsMask(params, batch_idx, q_idx, kv_idx, qo_head_idx, kv_head_idx);
         s_frag[fx][fz][reg_id] = (mask) ? s_frag[fx][fz][reg_id] : DTypeQKAccum(-math::inf);
       }
     }
@@ -1063,15 +1062,14 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
     const uint32_t chunk_size = chunk_end - chunk_start;
 
     auto block = cg::this_thread_block();
-    const uint32_t window_left = (maybe_window_left >= 0) ? maybe_window_left : kv_len;
+    extern __shared__ uint8_t smem[];
+    AttentionVariant variant(params, /*batch_idx=*/0, smem);
+    const uint32_t window_left = variant.window_left;
 
     constexpr uint32_t head_dim = num_frags_y * 16;
     constexpr uint32_t channel_size_128b_q = head_dim / num_elems_per_128b<DTypeQ>();
     constexpr uint32_t channel_size_128b_kv = head_dim / num_elems_per_128b<DTypeKV>();
     constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeO>();
-
-    extern __shared__ uint8_t smem[];
-    AttentionVariant variant(params, /*batch_idx=*/0, smem);
 
     DTypeQKAccum s_frag[num_frags_x][num_frags_z][8];
     float o_frag[num_frags_x][num_frags_y][8];
@@ -1469,9 +1467,11 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
     const uint32_t request_idx = request_indices[bx], qo_tile_idx = qo_tile_indices[bx],
                    kv_tile_idx = kv_tile_indices[bx];
     constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps_x * 16;
-    const uint32_t qo_len = params.get_qo_len(request_idx), kv_len = params.get_kv_len(request_idx);
+    extern __shared__ uint8_t smem[];
+    AttentionVariant variant(params, /*batch_idx=*/request_idx, smem);
+    const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len,
+                   window_left = variant.window_left;
     const uint32_t kv_len_safe = kv_len > 0 ? kv_len : 1;
-    const uint32_t window_left = (maybe_window_left >= 0) ? maybe_window_left : kv_len;
     const uint32_t max_chunk_size = partition_kv ? kv_chunk_size : kv_len;
     const uint32_t chunk_start = partition_kv ? kv_tile_idx * max_chunk_size : 0;
     const uint32_t chunk_end =
@@ -1485,9 +1485,6 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
     constexpr uint32_t channel_size_128b_q = head_dim / num_elems_per_128b<DTypeQ>();
     constexpr uint32_t channel_size_128b_kv = head_dim / num_elems_per_128b<DTypeKV>();
     constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeO>();
-
-    extern __shared__ uint8_t smem[];
-    AttentionVariant variant(params, /*batch_idx=*/request_idx, smem);
 
     DTypeQKAccum s_frag[num_frags_x][num_frags_z][8];
     float o_frag[num_frags_x][num_frags_y][8];
@@ -1542,7 +1539,8 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithRagg
       }
       block.sync();
     }
-    q_smem_inplace_transform<num_warps_x, num_warps_z, num_frags_x, num_frags_y, swizzle_mode_q>(params, variant, &qo_smem);
+    q_smem_inplace_transform<num_warps_x, num_warps_z, num_frags_x, num_frags_y, swizzle_mode_q>(
+        params, variant, &qo_smem);
 
     const uint32_t num_iterations = ceil_div(
         (MASK_MODE == MaskMode::kCausal
@@ -1753,9 +1751,11 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
     const uint32_t request_idx = request_indices[bx], qo_tile_idx = qo_tile_indices[bx],
                    kv_tile_idx = kv_tile_indices[bx];
     constexpr uint32_t num_rows_per_cta = num_frags_x * num_warps_x * 16;
-    const uint32_t qo_len = params.get_qo_len(request_idx), kv_len = params.get_kv_len(request_idx);
+    extern __shared__ uint8_t smem[];
+    AttentionVariant variant(params, /*batch_idx=*/request_idx, smem);
+    const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len,
+                   window_left = variant.window_left;
     const uint32_t kv_len_safe = kv_len > 0 ? kv_len : 1;
-    const uint32_t window_left = (maybe_window_left >= 0) ? maybe_window_left : kv_len;
     const uint32_t max_chunk_size = partition_kv ? kv_chunk_size : kv_len;
     const uint32_t chunk_start = partition_kv ? kv_tile_idx * max_chunk_size : 0;
     const uint32_t chunk_end =
@@ -1768,9 +1768,6 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
     constexpr uint32_t channel_size_128b_q = head_dim / num_elems_per_128b<DTypeQ>();
     constexpr uint32_t channel_size_128b_kv = head_dim / num_elems_per_128b<DTypeKV>();
     constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeO>();
-
-    extern __shared__ uint8_t smem[];
-    AttentionVariant variant(params, /*batch_idx=*/request_idx, smem);
 
     DTypeQKAccum s_frag[num_frags_x][num_frags_z][8];
     float o_frag[num_frags_x][num_frags_y][8];
@@ -1824,7 +1821,8 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
       }
       block.sync();
     }
-    q_smem_inplace_transform<num_warps_x, num_warps_z, num_frags_x, num_frags_y, swizzle_mode_q>(params, variant, &qo_smem);
+    q_smem_inplace_transform<num_warps_x, num_warps_z, num_frags_x, num_frags_y, swizzle_mode_q>(
+        params, variant, &qo_smem);
 
     constexpr SwizzleMode swizzle_mode_kv =
         (sizeof(DTypeKV) == 1 && head_dim == 64) ? SwizzleMode::k64B : SwizzleMode::k128B;
