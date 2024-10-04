@@ -19,7 +19,7 @@ from typing import Optional
 import torch
 
 from .utils import get_indptr
-from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR
+from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR, has_prebuilt_ops
 from typing import Optional
 
 
@@ -29,14 +29,19 @@ _gemm_module = None
 def get_gemm_module():
     global _gemm_module
     if _gemm_module is None:
-        _gemm_module = load_cuda_ops(
-            "gemm",
-            [
-                FLASHINFER_CSRC_DIR / "group_gemm.cu",
-                FLASHINFER_CSRC_DIR / "bmm_fp8.cu",
-                FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops.cu",
-            ],
-        )
+        if has_prebuilt_ops:
+            from . import _kernels
+
+            _gemm_module = _kernels
+        else:
+            _gemm_module = load_cuda_ops(
+                "gemm",
+                [
+                    FLASHINFER_CSRC_DIR / "group_gemm.cu",
+                    FLASHINFER_CSRC_DIR / "bmm_fp8.cu",
+                    FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops.cu",
+                ],
+            )
     return _gemm_module
 
 
@@ -101,7 +106,6 @@ class SegmentGEMMWrapper:
             size is proportional to the number of segments (batch size), 1MB workspace is enough for most cases.
         """
         self._workspace_buffer = workspace_buffer
-        self._cached_module = get_gemm_module()
 
     def reset_workspace_buffer(self, new_workspace_buffer: torch.Tensor) -> None:
         r"""Reset the workspace buffer.
@@ -189,7 +193,7 @@ class SegmentGEMMWrapper:
         if weight_indices is None:
             # create an empty CPU tensor as placeholder
             weight_indices = torch.empty(0, dtype=torch.int64)
-        return self._cached_module.cutlass_segment_gemm(
+        return get_gemm_module().cutlass_segment_gemm(
             self._workspace_buffer,
             seg_indptr,
             weight_indices,

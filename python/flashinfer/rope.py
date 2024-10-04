@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import torch
-from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR
+from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR, has_prebuilt_ops
 
 
 _rope_module = None
@@ -24,13 +24,18 @@ _rope_module = None
 def get_rope_module():
     global _rope_module
     if _rope_module is None:
-        _rope_module = load_cuda_ops(
-            "rope",
-            [
-                FLASHINFER_CSRC_DIR / "rope.cu",
-                FLASHINFER_CSRC_DIR / "flashinfer_rope_ops.cu",
-            ],
-        )
+        if has_prebuilt_ops:
+            from . import _kernels
+
+            _rope_module = _kernels
+        else:
+            _rope_module = load_cuda_ops(
+                "rope",
+                [
+                    FLASHINFER_CSRC_DIR / "rope.cu",
+                    FLASHINFER_CSRC_DIR / "flashinfer_rope_ops.cu",
+                ],
+            )
     return _rope_module
 
 

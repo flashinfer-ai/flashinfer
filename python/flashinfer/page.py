@@ -16,7 +16,7 @@ limitations under the License.
 
 import torch
 from .utils import TensorLayout, _check_kv_layout, _unpack_paged_kv_cache
-from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR
+from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR, has_prebuilt_ops
 
 
 _page_module = None
@@ -25,13 +25,18 @@ _page_module = None
 def get_page_module():
     global _page_module
     if _page_module is None:
-        _page_module = load_cuda_ops(
-            "page",
-            [
-                FLASHINFER_CSRC_DIR / "page.cu",
-                FLASHINFER_CSRC_DIR / "flashinfer_page_ops.cu",
-            ],
-        )
+        if has_prebuilt_ops:
+            from . import _kernels
+
+            _page_module = _kernels
+        else:
+            _page_module = load_cuda_ops(
+                "page",
+                [
+                    FLASHINFER_CSRC_DIR / "page.cu",
+                    FLASHINFER_CSRC_DIR / "flashinfer_page_ops.cu",
+                ],
+            )
     return _page_module
 
 

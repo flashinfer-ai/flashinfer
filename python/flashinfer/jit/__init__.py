@@ -16,9 +16,11 @@ limitations under the License.
 
 import os
 import re
+import logging
 import torch.utils.cpp_extension as torch_cpp_ext
 from typing import List
 from .env import (
+    FLASHINFER_WORKSPACE_DIR,
     FLASHINFER_JIT_DIR,
     FLASHINFER_GEN_SRC_DIR,
     FLASHINFER_INCLUDE_DIR,
@@ -36,6 +38,42 @@ from .attention import (
     gen_batch_prefill_cu,
     get_batch_prefill_uri,
 )
+
+try:
+    from .aot_config import prebuilt_ops_uri
+    has_prebuilt_ops = True
+except ImportError as e:
+    prebuilt_ops_uri = {}
+    has_prebuilt_ops = False
+
+if not os.path.exists(FLASHINFER_WORKSPACE_DIR):
+    os.makedirs(FLASHINFER_WORKSPACE_DIR)
+
+
+class FlashInferJITLogger(logging.Logger):
+    def __init__(self, name):
+        super().__init__(name)
+        self.setLevel(logging.INFO)
+        self.addHandler(logging.StreamHandler())
+        log_path = FLASHINFER_WORKSPACE_DIR / "flashinfer_jit.log"
+        if not os.path.exists(log_path):
+            # create an empty file
+            with open(log_path, "w") as f:
+                pass
+        self.addHandler(logging.FileHandler(log_path))
+        # set the format of the log
+        self.handlers[0].setFormatter(
+            logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        )
+        self.handlers[1].setFormatter(
+            logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        )
+
+    def info(self, msg):
+        super().info("flashinfer.jit: " + msg)
+
+
+logger = FlashInferJITLogger("flashinfer.jit")
 
 
 def check_cuda_arch():
@@ -88,6 +126,7 @@ def load_cuda_ops(
     extra_include_paths=None,
     verbose=False,
 ):
+    logger.info(f"Loading JIT ops: {name}")
     check_cuda_arch()
     build_directory = FLASHINFER_JIT_DIR / name
     if not os.path.exists(build_directory):

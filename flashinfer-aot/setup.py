@@ -27,10 +27,72 @@ import setuptools
 import argparse
 import torch
 import torch.utils.cpp_extension as torch_cpp_ext
+from collections import namedtuple
 
 import generate_single_decode_inst, generate_single_prefill_inst, generate_batch_paged_decode_inst, generate_batch_paged_prefill_inst, generate_batch_ragged_prefill_inst, generate_dispatch_inc
 
+
 root = pathlib.Path(__name__).parent
+
+SingleDecodeConfig = namedtuple(
+    "SingleDecodeConfig",
+    [
+        "dtype_q",
+        "dtype_kv",
+        "dtype_out",
+        "head_dim",
+        "pos_encoding_mode",
+        "use_sliding_window",
+        "use_logits_soft_cap",
+        "use_alibi",
+    ],
+)
+BatchDecodeConfig = namedtuple(
+    "BatchDecodeConfig",
+    [
+        "dtype_q",
+        "dtype_kv",
+        "dtype_out",
+        "dtype_idx",
+        "head_dim",
+        "pos_encoding_mode",
+        "use_sliding_window",
+        "use_logits_soft_cap",
+        "use_alibi",
+    ],
+)
+SinglePrefillConfig = namedtuple(
+    "SinglePrefillConfig",
+    [
+        "dtype_q",
+        "dtype_kv",
+        "dtype_out",
+        "head_dim",
+        "pos_encoding_mode",
+        "mask_mode",
+        "use_sliding_window",
+        "use_logits_soft_cap",
+        "use_alibi",
+        "allow_fp16_qk_reduction",
+    ],
+)
+BatchPrefillConfig = namedtuple(
+    "BatchPrefillConfig",
+    [
+        "dtype_q",
+        "dtype_kv",
+        "dtype_out",
+        "dtype_idx",
+        "head_dim",
+        "pos_encoding_mode",
+        "mask_mode",
+        "use_sliding_window",
+        "use_logits_soft_cap",
+        "use_alibi",
+        "allow_fp16_qk_reduction",
+    ],
+)
+
 
 # cuda arch check for fp8 at the moment.
 for cuda_arch_flags in torch_cpp_ext._get_cuda_arch_flags():
@@ -56,14 +118,12 @@ def write_if_different(path: pathlib.Path, content: str) -> None:
         f.write(content)
 
 
-def get_instantiation_cu() -> Tuple[List[str], List[str]]:
+def get_instantiation_cu() -> Tuple[List[str], List[str], List[str]]:
     path = root / "csrc_aot" / "generated"
     path.mkdir(parents=True, exist_ok=True)
 
     head_dims = os.environ.get("FLASHINFER_HEAD_DIMS", "64,128,256").split(",")
-    pos_encoding_modes = os.environ.get("FLASHINFER_POS_ENCODING_MODES", "0").split(
-        ","
-    )
+    pos_encoding_modes = os.environ.get("FLASHINFER_POS_ENCODING_MODES", "0").split(",")
     allow_fp16_qk_reduction_options = os.environ.get(
         "FLASHINFER_ALLOW_FP16_QK_REDUCTION_OPTIONS", "0"
     ).split(",")
@@ -95,6 +155,7 @@ def get_instantiation_cu() -> Tuple[List[str], List[str]]:
 
     files_decode = []
     files_prefill = []
+    single_decode_configs = []
     # single decode files
     for (
         head_dim,
@@ -116,9 +177,25 @@ def get_instantiation_cu() -> Tuple[List[str], List[str]]:
                 dtype_kv,
                 dtype_out,
             )
+            for use_sliding_window in [True, False]:
+                for use_logits_soft_cap in [True, False]:
+                    for use_alibi in [False]:
+                        single_decode_configs.append(
+                            SingleDecodeConfig(
+                                dtype_q,
+                                dtype_kv,
+                                dtype_out,
+                                head_dim,
+                                pos_encoding_mode,
+                                use_sliding_window,
+                                use_logits_soft_cap,
+                                use_alibi,
+                            )
+                        )
             write_if_different(path / fname, content)
 
     # batch decode files
+    batch_decode_configs = []
     for (
         head_dim,
         pos_encoding_mode,
@@ -141,9 +218,26 @@ def get_instantiation_cu() -> Tuple[List[str], List[str]]:
                     dtype_out,
                     idtype,
                 )
+                for use_sliding_window in [True, False]:
+                    for use_logits_soft_cap in [True, False]:
+                        for use_alibi in [False]:
+                            batch_decode_configs.append(
+                                BatchDecodeConfig(
+                                    dtype_q,
+                                    dtype_kv,
+                                    dtype_out,
+                                    idtype,
+                                    head_dim,
+                                    pos_encoding_mode,
+                                    use_sliding_window,
+                                    use_logits_soft_cap,
+                                    use_alibi,
+                                )
+                            )
                 write_if_different(path / fname, content)
 
     # single prefill files
+    single_prefill_configs = []
     for (
         head_dim,
         pos_encoding_mode,
@@ -167,9 +261,27 @@ def get_instantiation_cu() -> Tuple[List[str], List[str]]:
                 dtype_kv,  # dtype_kv
                 dtype_q,  # dtype_out
             )
+            for use_sliding_window in [True, False]:
+                for use_logits_soft_cap in [True, False]:
+                    for use_alibi in [False]:
+                        single_prefill_configs.append(
+                            SinglePrefillConfig(
+                                dtype_q,
+                                dtype_kv,
+                                dtype_q,
+                                head_dim,
+                                pos_encoding_mode,
+                                mask_mode,
+                                use_sliding_window,
+                                use_logits_soft_cap,
+                                use_alibi,
+                                allow_fp16_qk_reduction,
+                            )
+                        )
             write_if_different(path / fname, content)
 
-    # batch paged prefill files
+    # batch prefill files
+    batch_prefill_configs = []
     for (
         head_dim,
         pos_encoding_mode,
@@ -200,21 +312,6 @@ def get_instantiation_cu() -> Tuple[List[str], List[str]]:
             )
             write_if_different(path / fname, content)
 
-    # batch ragged prefill files
-    for (
-        head_dim,
-        pos_encoding_mode,
-        allow_fp16_qk_reduction,
-        mask_mode,
-        idtype,
-    ) in itertools.product(
-        head_dims,
-        pos_encoding_modes,
-        allow_fp16_qk_reduction_options,
-        mask_modes,
-        idtypes,
-    ):
-        for dtype_q, dtype_kv in list(zip(prefill_dtypes, prefill_dtypes)):
             fname = f"batch_ragged_prefill_head_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}.cu"
             files_prefill.append(str(path / fname))
             content = generate_batch_ragged_prefill_inst.get_cu_file_str(
@@ -229,7 +326,26 @@ def get_instantiation_cu() -> Tuple[List[str], List[str]]:
             )
             write_if_different(path / fname, content)
 
-    return files_prefill, files_decode
+            for sliding_window in [True, False]:
+                for logits_soft_cap in [True, False]:
+                    for alibi in [False]:
+                        batch_prefill_configs.append(
+                            BatchPrefillConfig(
+                                dtype_q,
+                                dtype_kv,
+                                dtype_q,
+                                idtype,
+                                head_dim,
+                                pos_encoding_mode,
+                                mask_mode,
+                                sliding_window,
+                                logits_soft_cap,
+                                alibi,
+                                allow_fp16_qk_reduction,
+                            )
+                        )
+
+    return files_prefill, files_decode, None
 
 
 def get_version():
@@ -257,14 +373,16 @@ def generate_build_meta() -> None:
     d["torch"] = torch.__version__
     d["python"] = platform.python_version()
     d["TORCH_CUDA_ARCH_LIST"] = os.environ.get("TORCH_CUDA_ARCH_LIST", None)
-    with open(root / "flashinfer/_build_meta.py", "w") as f:
+    with open(root / "flashinfer" / "_build_meta.py", "w") as f:
         f.write(f"__version__ = {version!r}\n")
         f.write(f"build_meta = {d!r}")
 
 
 def generate_aot_config() -> None:
-    aot_config_str = ""
-    with open(root / "flashinfer/aot_config.py", "w") as f:
+    aot_config_str = """
+prebuilt_ops_uri = set()    
+"""
+    with open(root / "flashinfer" / "jit" / "aot_config.py", "w") as f:
         f.write(aot_config_str)
 
 
@@ -295,8 +413,8 @@ class NinjaBuildExtension(torch_cpp_ext.BuildExtension):
 if __name__ == "__main__":
     remove_unwanted_pytorch_nvcc_flags()
     generate_build_meta()
+    files_prefill, files_decode, _ = get_instantiation_cu()
     generate_aot_config()
-    files_prefill, files_decode = get_instantiation_cu()
     include_dirs = [
         str(root.resolve() / "include"),
         str(root.resolve() / "3rdparty" / "cutlass" / "include"),  # for group gemm
@@ -330,7 +448,7 @@ if __name__ == "__main__":
                 "csrc/quantization.cu",
                 "csrc/group_gemm.cu",
                 "csrc/bmm_fp8.cu",
-                "csrc_aot/flashinfer_ops.cu"
+                "csrc_aot/flashinfer_ops.cu",
             ],
             include_dirs=include_dirs,
             extra_compile_args=extra_compile_args,

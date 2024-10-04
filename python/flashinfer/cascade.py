@@ -16,7 +16,7 @@ limitations under the License.
 
 import math
 from typing import Optional, Tuple, List
-from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR
+from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR, has_prebuilt_ops
 import torch
 
 
@@ -26,13 +26,18 @@ _cascade_module = None
 def get_cascade_module():
     global _cascade_module
     if _cascade_module is None:
-        _cascade_module = load_cuda_ops(
-            "cascade",
-            [
-                FLASHINFER_CSRC_DIR / "cascade.cu",
-                FLASHINFER_CSRC_DIR / "flashinfer_cascade_ops.cu",
-            ],
-        )
+        if has_prebuilt_ops:
+            from . import _kernels
+
+            _cascade_module = _kernels
+        else:
+            _cascade_module = load_cuda_ops(
+                "cascade",
+                [
+                    FLASHINFER_CSRC_DIR / "cascade.cu",
+                    FLASHINFER_CSRC_DIR / "flashinfer_cascade_ops.cu",
+                ],
+            )
     return _cascade_module
 
 

@@ -16,7 +16,7 @@ limitations under the License.
 
 import torch
 
-from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR
+from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR, has_prebuilt_ops
 
 _norm_module = None
 
@@ -24,13 +24,18 @@ _norm_module = None
 def get_norm_module():
     global _norm_module
     if _norm_module is None:
-        _norm_module = load_cuda_ops(
-            "norm",
-            [
-                FLASHINFER_CSRC_DIR / "norm.cu",
-                FLASHINFER_CSRC_DIR / "flashinfer_norm_ops.cu",
-            ],
-        )
+        if has_prebuilt_ops:
+            from . import _kernels
+
+            _norm_module = _kernels
+        else:
+            _norm_module = load_cuda_ops(
+                "norm",
+                [
+                    FLASHINFER_CSRC_DIR / "norm.cu",
+                    FLASHINFER_CSRC_DIR / "flashinfer_norm_ops.cu",
+                ],
+            )
     return _norm_module
 
 

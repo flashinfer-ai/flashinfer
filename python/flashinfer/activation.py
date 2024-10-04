@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 from typing import Optional
-from .jit import load_cuda_ops, FLASHINFER_GEN_SRC_DIR, gen_act_and_mul_cu
+from .jit import load_cuda_ops, FLASHINFER_GEN_SRC_DIR, gen_act_and_mul_cu, has_prebuilt_ops
 
 import torch
 
@@ -65,9 +65,14 @@ _jit_modules = {}
 def get_act_and_mul_module(act_func_name: str):
     global _jit_modules
     if act_func_name not in _jit_modules:
-        _jit_modules[act_func_name] = compile_act_and_mul_module(
-            act_func_name, act_func_def_str[act_func_name]
-        )
+        if has_prebuilt_ops:
+            from . import _kernels
+
+            _jit_modules[act_func_name] = _kernels
+        else:
+            _jit_modules[act_func_name] = compile_act_and_mul_module(
+                act_func_name, act_func_def_str[act_func_name]
+            )
     return _jit_modules[act_func_name]
 
 

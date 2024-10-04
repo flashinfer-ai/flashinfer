@@ -16,7 +16,7 @@ limitations under the License.
 
 import torch
 from typing import Tuple, Union, Optional
-from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR
+from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR, has_prebuilt_ops
 
 
 _sampling_module = None
@@ -25,13 +25,18 @@ _sampling_module = None
 def get_sampling_module():
     global _sampling_module
     if _sampling_module is None:
-        _sampling_module = load_cuda_ops(
-            "sampling",
-            [
-                FLASHINFER_CSRC_DIR / "sampling.cu",
-                FLASHINFER_CSRC_DIR / "flashinfer_sampling_ops.cu",
-            ],
-        )
+        if has_prebuilt_ops:
+            from . import _kernels
+
+            _sampling_module = _kernels
+        else:
+            _sampling_module = load_cuda_ops(
+                "sampling",
+                [
+                    FLASHINFER_CSRC_DIR / "sampling.cu",
+                    FLASHINFER_CSRC_DIR / "flashinfer_sampling_ops.cu",
+                ],
+            )
     return _sampling_module
 
 

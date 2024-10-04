@@ -37,6 +37,13 @@ def generate_build_meta() -> None:
         f.write(f"__version__ = {version!r}\n")
 
 
+def clear_aot_config():
+    # remove aot_config.py
+    aot_config_path = root / "flashinfer" / "jit" / "aot_config.py"
+    if os.path.exists(aot_config_path):
+        os.remove(aot_config_path)
+
+
 if __name__ == "__main__":
     generate_build_meta()
     setuptools.setup(

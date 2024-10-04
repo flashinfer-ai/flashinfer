@@ -16,7 +16,7 @@ limitations under the License.
 
 import torch
 from typing import Tuple
-from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR
+from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR, has_prebuilt_ops
 
 
 _quantization_module = None
@@ -25,13 +25,18 @@ _quantization_module = None
 def get_quantization_module():
     global _quantization_module
     if _quantization_module is None:
-        quantization_ops = load_cuda_ops(
-            "quantization",
-            [
-                FLASHINFER_CSRC_DIR / "quantization.cu",
-                FLASHINFER_CSRC_DIR / "flashinfer_quantization_ops.cu",
-            ],
-        )
+        if has_prebuilt_ops:
+            from . import _kernels
+
+            _quantization_module = _kernels
+        else:
+            quantization_ops = load_cuda_ops(
+                "quantization",
+                [
+                    FLASHINFER_CSRC_DIR / "quantization.cu",
+                    FLASHINFER_CSRC_DIR / "flashinfer_quantization_ops.cu",
+                ],
+            )
     return quantization_ops
 
 
