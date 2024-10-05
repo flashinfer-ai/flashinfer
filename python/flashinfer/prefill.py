@@ -27,6 +27,8 @@ from .jit import (
     get_single_prefill_uri,
     gen_batch_prefill_cu,
     get_batch_prefill_uri,
+    has_prebuilt_ops,
+    prebuilt_ops_uri
 )
 from .utils import (
     PosEncodingMode,
@@ -76,14 +78,24 @@ _batch_prefill_modules = {}
 def get_single_prefill_module(*args):
     global _single_prefill_modules
     if args not in _single_prefill_modules:
-        _single_prefill_modules[args] = compile_single_prefill_module(*args)
+        if has_prebuilt_ops and get_single_prefill_uri(*args) in prebuilt_ops_uri:
+            from . import _prefill_kernels
+
+            # TODO(Zihao)
+        else:
+            _single_prefill_modules[args] = compile_single_prefill_module(*args)
     return _single_prefill_modules[args]
 
 
 def get_batch_prefill_module(*args):
     global _batch_prefill_modules
     if args not in _batch_prefill_modules:
-        _batch_prefill_modules[args] = compile_batch_prefill_module(*args)
+        if has_prebuilt_ops and get_batch_prefill_uri(*args) in prebuilt_ops_uri:
+            from . import _prefill_kernels
+
+            # TODO(Zihao)
+        else:
+            _batch_prefill_modules[args] = compile_batch_prefill_module(*args)
     return _batch_prefill_modules[args]
 
 

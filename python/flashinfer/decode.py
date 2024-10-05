@@ -16,6 +16,7 @@ limitations under the License.
 
 import math
 from typing import Optional, Union, Dict, Tuple
+from types import SimpleNamespace
 import torch
 import functools
 
@@ -26,6 +27,8 @@ from .jit import (
     get_single_decode_uri,
     gen_batch_decode_cu,
     get_batch_decode_uri,
+    has_prebuilt_ops,
+    prebuilt_ops_uri,
 )
 from .prefill import get_single_prefill_module, get_batch_prefill_module
 
@@ -76,14 +79,24 @@ _batch_decode_modules = {}
 def get_single_decode_module(*args):
     global _single_decode_modules
     if args not in _single_decode_modules:
-        _single_decode_modules[args] = compile_single_decode_module(*args)
+        if has_prebuilt_ops and get_single_decode_uri(*args) in prebuilt_ops_uri:
+            from . import _decode_kernels
+
+            pass
+        else:
+            _single_decode_modules[args] = compile_single_decode_module(*args)
     return _single_decode_modules[args]
 
 
 def get_batch_decode_module(*args):
     global _batch_decode_modules
     if args not in _batch_decode_modules:
-        _batch_decode_modules[args] = compile_batch_decode_module(*args)
+        if has_prebuilt_ops and get_batch_decode_uri(*args) in prebuilt_ops_uri:
+            from . import _decode_kernels
+
+            # TODO(Zihao)
+        else:
+            _batch_decode_modules[args] = compile_batch_decode_module(*args)
     return _batch_decode_modules[args]
 
 

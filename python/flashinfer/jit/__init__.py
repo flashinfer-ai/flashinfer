@@ -44,7 +44,7 @@ try:
 
     has_prebuilt_ops = True
 except ImportError as e:
-    prebuilt_ops_uri = {}
+    prebuilt_ops_uri = set()
     has_prebuilt_ops = False
 
 if not os.path.exists(FLASHINFER_WORKSPACE_DIR):
