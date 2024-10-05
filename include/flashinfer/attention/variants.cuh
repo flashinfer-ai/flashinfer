@@ -16,9 +16,9 @@
 #ifndef FLASHINFER_ATTENTION_VARIANTS_CUH_
 #define FLASHINFER_ATTENTION_VARIANTS_CUH_
 #include <cuda_runtime.h>
-#include <type_traits>
 
 #include <cstdint>
+#include <type_traits>
 
 #include "../math.cuh"
 
@@ -44,8 +44,8 @@ struct StandardAttention {
 
   template <typename T>
   __device__ __forceinline__ T LogitsTransform(const ParamsT& params, T logits, uint32_t batch_idx,
-                                               uint32_t qo_idx, uint32_t kv_idx, uint32_t qo_head_idx,
-                                               uint32_t kv_head_idx) {
+                                               uint32_t qo_idx, uint32_t kv_idx,
+                                               uint32_t qo_head_idx, uint32_t kv_head_idx) {
     return logits;
   }
 
@@ -81,8 +81,8 @@ struct CustomMaskAttention {
 
   template <typename T>
   __device__ __forceinline__ T LogitsTransform(const ParamsT& params, T logits, uint32_t batch_idx,
-                                               uint32_t qo_idx, uint32_t kv_idx, uint32_t qo_head_idx,
-                                               uint32_t kv_head_idx) {
+                                               uint32_t qo_idx, uint32_t kv_idx,
+                                               uint32_t qo_head_idx, uint32_t kv_head_idx) {
     return logits;
   }
 
@@ -120,8 +120,8 @@ struct SlidingWindowAttention {
 
   template <typename T>
   __device__ __forceinline__ T LogitsTransform(const ParamsT& params, T logits, uint32_t batch_idx,
-                                               uint32_t qo_idx, uint32_t kv_idx, uint32_t qo_head_idx,
-                                               uint32_t kv_head_idx) {
+                                               uint32_t qo_idx, uint32_t kv_idx,
+                                               uint32_t qo_head_idx, uint32_t kv_head_idx) {
     return logits;
   }
 
@@ -147,8 +147,8 @@ struct LogitsSoftCap {
 
   template <typename T>
   __device__ __forceinline__ T LogitsTransform(const ParamsT& params, T logits, uint32_t batch_idx,
-                                               uint32_t qo_idx, uint32_t kv_idx, uint32_t qo_head_idx,
-                                               uint32_t kv_head_idx) {
+                                               uint32_t qo_idx, uint32_t kv_idx,
+                                               uint32_t qo_head_idx, uint32_t kv_head_idx) {
     return params.logits_soft_cap * math::log2e * float(math::tanh(logits));
   }
 
@@ -166,7 +166,8 @@ struct ALIBIAttention {
   using DTypeO = typename ParamsT::DTypeO;
   using IdType = typename ParamsT::IdType;
 
-  __device__ __host__ ALIBIAttention(const ParamsT& params, uint32_t batch_idx, uint8_t* smem_ptr) {}
+  __device__ __host__ ALIBIAttention(const ParamsT& params, uint32_t batch_idx, uint8_t* smem_ptr) {
+  }
 
   template <typename T>
   __device__ __forceinline__ T QueryTransform(const ParamsT& params, T q) {
@@ -175,8 +176,8 @@ struct ALIBIAttention {
 
   template <typename T>
   __device__ __forceinline__ T LogitsTransform(const ParamsT& params, T logits, uint32_t batch_idx,
-                                               uint32_t qo_idx, uint32_t kv_idx, uint32_t qo_head_idx,
-                                               uint32_t kv_head_idx) {
+                                               uint32_t qo_idx, uint32_t kv_idx,
+                                               uint32_t qo_head_idx, uint32_t kv_head_idx) {
     return logits + params.alibi_slopes[qo_head_idx] * float(kv_idx - qo_idx);
   }
 
@@ -238,8 +239,8 @@ struct ComposedAttention {
 
   template <typename T>
   __device__ __forceinline__ T LogitsTransform(const ParamsT& params, T logits, uint32_t batch_idx,
-                                    uint32_t qo_idx, uint32_t kv_idx, uint32_t qo_head_idx,
-                                    uint32_t kv_head_idx) {
+                                               uint32_t qo_idx, uint32_t kv_idx,
+                                               uint32_t qo_head_idx, uint32_t kv_head_idx) {
     if constexpr (use_alibi) {
       logits = logits + params.alibi_slopes[qo_head_idx] * float(kv_idx - qo_idx);
     }
@@ -249,8 +250,9 @@ struct ComposedAttention {
     return logits;
   }
 
-  __device__ __forceinline__ bool LogitsMask(const ParamsT& params, uint32_t batch_idx, uint32_t qo_idx,
-                                  uint32_t kv_idx, uint32_t qo_head_idx, uint32_t kv_head_idx) {
+  __device__ __forceinline__ bool LogitsMask(const ParamsT& params, uint32_t batch_idx,
+                                             uint32_t qo_idx, uint32_t kv_idx, uint32_t qo_head_idx,
+                                             uint32_t kv_head_idx) {
     bool mask = true;
     if constexpr (use_custom_mask) {
       const uint32_t offset = qo_idx * kv_len + kv_idx;

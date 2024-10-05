@@ -69,7 +69,7 @@ def get_single_decode_uri(
         f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"head_dim_{head_dim}_"
-        f"pos_encoding_mode_{pos_encoding_mode}_"
+        f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
         f"use_alibi_{use_alibi}"
@@ -129,7 +129,7 @@ def get_batch_decode_uri(
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_{head_dim}_"
-        f"pos_encoding_mode_{pos_encoding_mode}_"
+        f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
         f"use_alibi_{use_alibi}"
@@ -191,12 +191,12 @@ def get_single_prefill_uri(
         f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"head_dim_{head_dim}_"
-        f"pos_encoding_mode_{pos_encoding_mode}_"
-        f"mask_mode_{mask_mode}_"
+        f"posenc_{pos_encoding_mode}_"
+        f"mask_{mask_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
         f"use_alibi_{use_alibi}_"
-        f"use_fp16_qk_reduction_{use_fp16_qk_reduction}"
+        f"f16qk_{use_fp16_qk_reduction}"
     )
 
 

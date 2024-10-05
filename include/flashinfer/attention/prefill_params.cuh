@@ -253,7 +253,8 @@ struct BatchPrefillPagedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DType
   }
 
   __host__ __device__ __forceinline__ uint32_t get_mask_offset(uint32_t batch_idx, uint32_t qo_idx,
-                                                               uint32_t kv_idx, uint32_t kv_len) const {
+                                                               uint32_t kv_idx,
+                                                               uint32_t kv_len) const {
     return qk_indptr[batch_idx] * 8 + qo_idx * kv_len + kv_idx;
   }
 };

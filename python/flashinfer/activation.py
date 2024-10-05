@@ -15,7 +15,12 @@ limitations under the License.
 """
 
 from typing import Optional
-from .jit import load_cuda_ops, FLASHINFER_GEN_SRC_DIR, gen_act_and_mul_cu, has_prebuilt_ops
+from .jit import (
+    load_cuda_ops,
+    FLASHINFER_GEN_SRC_DIR,
+    gen_act_and_mul_cu,
+    has_prebuilt_ops,
+)
 
 import torch
 
