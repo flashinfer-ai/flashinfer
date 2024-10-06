@@ -39,7 +39,6 @@ def get_single_decode_cu_str(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
-    use_alibi: bool,
 ) -> str:
     template = jinja2.Template(single_decode_templ)
     return template.render(
@@ -50,7 +49,6 @@ def get_single_decode_cu_str(
         pos_encoding_mode=pos_encoding_mode_literal[pos_encoding_mode],
         use_sliding_window="true" if use_sliding_window else "false",
         use_logits_soft_cap="true" if use_logits_soft_cap else "false",
-        use_alibi="true" if use_alibi else "false",
     )
 
 
@@ -62,7 +60,6 @@ def get_single_decode_uri(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
-    use_alibi: bool,
 ) -> str:
     return (
         f"single_decode_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -71,8 +68,7 @@ def get_single_decode_uri(
         f"head_dim_{head_dim}_"
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
-        f"use_logits_cap_{use_logits_soft_cap}_"
-        f"use_alibi_{use_alibi}"
+        f"use_logits_cap_{use_logits_soft_cap}"
     )
 
 
@@ -96,7 +92,6 @@ def get_batch_decode_cu_str(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
-    use_alibi: bool,
 ) -> str:
     template = jinja2.Template(batch_decode_templ)
     return template.render(
@@ -108,7 +103,6 @@ def get_batch_decode_cu_str(
         pos_encoding_mode=pos_encoding_mode_literal[pos_encoding_mode],
         use_sliding_window="true" if use_sliding_window else "false",
         use_logits_soft_cap="true" if use_logits_soft_cap else "false",
-        use_alibi="true" if use_alibi else "false",
     )
 
 
@@ -121,7 +115,6 @@ def get_batch_decode_uri(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
-    use_alibi: bool,
 ) -> str:
     return (
         f"batch_decode_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -131,8 +124,7 @@ def get_batch_decode_uri(
         f"head_dim_{head_dim}_"
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
-        f"use_logits_cap_{use_logits_soft_cap}_"
-        f"use_alibi_{use_alibi}"
+        f"use_logits_cap_{use_logits_soft_cap}"
     )
 
 
@@ -156,7 +148,6 @@ def get_single_prefill_cu_str(
     mask_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
-    use_alibi: bool,
     use_fp16_qk_reduction: bool,
 ) -> str:
     template = jinja2.Template(single_prefill_templ)
@@ -169,7 +160,6 @@ def get_single_prefill_cu_str(
         mask_mode=mask_mode_literal[mask_mode],
         use_sliding_window="true" if use_sliding_window else "false",
         use_logits_soft_cap="true" if use_logits_soft_cap else "false",
-        use_alibi="true" if use_alibi else "false",
         use_fp16_qk_reduction="true" if use_fp16_qk_reduction else "false",
     )
 
@@ -183,7 +173,6 @@ def get_single_prefill_uri(
     mask_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
-    use_alibi: bool,
     use_fp16_qk_reduction: bool,
 ) -> str:
     return (
@@ -195,7 +184,6 @@ def get_single_prefill_uri(
         f"mask_{mask_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"use_alibi_{use_alibi}_"
         f"f16qk_{use_fp16_qk_reduction}"
     )
 
@@ -221,7 +209,6 @@ def get_batch_prefill_cu_str(
     mask_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
-    use_alibi: bool,
     use_fp16_qk_reduction: bool,
 ) -> str:
     template = jinja2.Template(batch_prefill_templ)
@@ -235,7 +222,6 @@ def get_batch_prefill_cu_str(
         mask_mode=mask_mode_literal[mask_mode],
         use_sliding_window="true" if use_sliding_window else "false",
         use_logits_soft_cap="true" if use_logits_soft_cap else "false",
-        use_alibi="true" if use_alibi else "false",
         use_fp16_qk_reduction="true" if use_fp16_qk_reduction else "false",
     )
 
@@ -250,7 +236,6 @@ def get_batch_prefill_uri(
     mask_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
-    use_alibi: bool,
     use_fp16_qk_reduction: bool,
 ) -> str:
     return (
@@ -263,7 +248,6 @@ def get_batch_prefill_uri(
         f"mask_{mask_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"use_alibi_{use_alibi}_"
         f"f16qk_{use_fp16_qk_reduction}"
     )
 

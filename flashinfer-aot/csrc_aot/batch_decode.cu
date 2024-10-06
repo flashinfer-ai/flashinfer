@@ -22,19 +22,21 @@
 
 #include "pytorch_extension_utils.h"
 
-using namespace flashinfer;
+namespace flashinfer {
 
 template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant>
 cudaError_t BatchDecodeWithPagedKVCacheDispatched(typename AttentionVariant::ParamsT params,
                                                   typename AttentionVariant::DTypeO* tmp_v,
                                                   float* tmp_s, cudaStream_t stream);
 
+}  // namespace flashinfer
+
 std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
-    torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
-    torch::Tensor page_locked_int_workspace_buffer, torch::Tensor indptr, unsigned int batch_size,
-    unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int page_size,
-    bool enable_cuda_graph, bool use_logits_soft_cap, unsigned int head_dim,
-    torch::Tensor empty_q_data, torch::Tensor empty_kv_data) {
+    bool use_logits_soft_cap, unsigned int head_dim, torch::Tensor empty_q_data,
+    torch::Tensor empty_kv_data, torch::Tensor float_workspace_buffer,
+    torch::Tensor int_workspace_buffer, torch::Tensor page_locked_int_workspace_buffer,
+    torch::Tensor indptr, unsigned int batch_size, unsigned int num_qo_heads,
+    unsigned int num_kv_heads, unsigned int page_size, bool enable_cuda_graph) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =
@@ -132,11 +134,11 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
 
   using IdType = int32_t;
   constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;
-  
+
   // get q_scalar_type and kv_scalar_type
   auto q_scalar_type = q.scalar_type();
-  auto kv_scalar_type = paged_kv_cache.has_value() ? paged_kv_cache->scalar_type()
-                                                    : paged_k_cache->scalar_type();
+  auto kv_scalar_type =
+      paged_kv_cache.has_value() ? paged_kv_cache->scalar_type() : paged_k_cache->scalar_type();
 
   DISPATCH_PYTORCH_QKV_DTYPE_TO_CTYPE(q_scalar_type, kv_scalar_type, q_type, kv_type, [&] {
     using DTypeQ = q_type;
@@ -185,8 +187,8 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
         params.padded_batch_size = plan_info.padded_batch_size;
 
         cudaError_t status =
-            BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, POS_ENCODING_MODE,
-                                                  AttentionVariant>(
+            flashinfer::BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, POS_ENCODING_MODE,
+                                                              AttentionVariant>(
                 params, tmp_v, tmp_s, /*stream=*/torch_current_stream);
         TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
                     cudaGetErrorString(status));

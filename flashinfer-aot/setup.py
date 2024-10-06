@@ -69,15 +69,20 @@ def get_instantiation_cu() -> Tuple[List[str], List[str], List[str]]:
         "FLASHINFER_ALLOW_FP16_QK_REDUCTION_OPTIONS", "0"
     ).split(",")
     mask_modes = os.environ.get("FLASHINFER_MASK_MODES", "0,1").split(",")
+
+    head_dims = list(map(int, head_dims))
+    pos_encoding_modes = list(map(int, pos_encoding_modes))
+    allow_fp16_qk_reduction_options = list(map(int, allow_fp16_qk_reduction_options))
+    mask_modes = list(map(int, mask_modes))
     # dispatch.inc
     write_if_different(
         path / "dispatch.inc",
         generate_dispatch_inc.get_dispatch_inc_str(
             argparse.Namespace(
-                head_dims=map(int, head_dims),
-                pos_encoding_modes=map(int, pos_encoding_modes),
-                allow_fp16_qk_reductions=map(int, allow_fp16_qk_reduction_options),
-                mask_modes=map(int, mask_modes),
+                head_dims=head_dims,
+                pos_encoding_modes=pos_encoding_modes,
+                allow_fp16_qk_reductions=allow_fp16_qk_reduction_options,
+                mask_modes=mask_modes,
             )
         ),
     )
@@ -120,17 +125,15 @@ def get_instantiation_cu() -> Tuple[List[str], List[str], List[str]]:
             )
             for use_sliding_window in [True, False]:
                 for use_logits_soft_cap in [True, False]:
-                    for use_alibi in [False]:
-                        single_decode_uris.append(
-                            f"single_decode_with_kv_cache_q_{dtype_q}_"
-                            f"dtype_kv_{dtype_kv}_"
-                            f"dtype_o_{dtype_out}_"
-                            f"head_dim_{head_dim}_"
-                            f"posenc_{pos_encoding_mode}_"
-                            f"use_swa_{use_sliding_window}_"
-                            f"use_logits_cap_{use_logits_soft_cap}_"
-                            f"use_alibi_{use_alibi}"
-                        )
+                    single_decode_uris.append(
+                        f"single_decode_with_kv_cache_dtype_q_{dtype_q}_"
+                        f"dtype_kv_{dtype_kv}_"
+                        f"dtype_o_{dtype_out}_"
+                        f"head_dim_{head_dim}_"
+                        f"posenc_{pos_encoding_mode}_"
+                        f"use_swa_{use_sliding_window}_"
+                        f"use_logits_cap_{use_logits_soft_cap}"
+                    )
             write_if_different(path / fname, content)
 
     # batch decode files
@@ -159,18 +162,16 @@ def get_instantiation_cu() -> Tuple[List[str], List[str], List[str]]:
                 )
                 for use_sliding_window in [True, False]:
                     for use_logits_soft_cap in [True, False]:
-                        for use_alibi in [False]:
-                            batch_decode_uris.append(
-                                f"batch_paged_decode_with_kv_cache_q_{dtype_q}_"
-                                f"dtype_kv_{dtype_kv}_"
-                                f"dtype_o_{dtype_out}_"
-                                f"dtype_idx_{idtype}_"
-                                f"head_dim_{head_dim}_"
-                                f"posenc_{pos_encoding_mode}_"
-                                f"use_swa_{use_sliding_window}_"
-                                f"use_logits_cap_{use_logits_soft_cap}_"
-                                f"use_alibi_{use_alibi}"
-                            )
+                        batch_decode_uris.append(
+                            f"batch_decode_with_kv_cache_dtype_q_{dtype_q}_"
+                            f"dtype_kv_{dtype_kv}_"
+                            f"dtype_o_{dtype_out}_"
+                            f"dtype_idx_{idtype}_"
+                            f"head_dim_{head_dim}_"
+                            f"posenc_{pos_encoding_mode}_"
+                            f"use_swa_{use_sliding_window}_"
+                            f"use_logits_cap_{use_logits_soft_cap}"
+                        )
                 write_if_different(path / fname, content)
 
     # single prefill files
@@ -186,7 +187,9 @@ def get_instantiation_cu() -> Tuple[List[str], List[str], List[str]]:
         allow_fp16_qk_reduction_options,
         mask_modes,
     ):
-        for dtype_q, dtype_kv in list(zip(prefill_dtypes, prefill_dtypes)):
+        for dtype_q, dtype_kv in list(zip(prefill_dtypes, prefill_dtypes)) + list(
+            itertools.product(prefill_dtypes, fp8_dtypes)
+        ):
             fname = f"single_prefill_head_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}.cu"
             files_prefill.append(str(path / fname))
             content = generate_single_prefill_inst.get_cu_file_str(
@@ -200,19 +203,17 @@ def get_instantiation_cu() -> Tuple[List[str], List[str], List[str]]:
             )
             for use_sliding_window in [True, False]:
                 for use_logits_soft_cap in [True, False]:
-                    for use_alibi in [False]:
-                        single_prefill_uris.append(
-                            f"single_prefill_with_kv_cache_q_{dtype_q}_"
-                            f"dtype_kv_{dtype_kv}_"
-                            f"dtype_o_{dtype_q}_"
-                            f"head_dim_{head_dim}_"
-                            f"posenc_{pos_encoding_mode}_"
-                            f"mask_{mask_mode}_"
-                            f"use_swa_{use_sliding_window}_"
-                            f"use_logits_cap_{use_logits_soft_cap}_"
-                            f"use_alibi_{use_alibi}"
-                            f"f16qk_{allow_fp16_qk_reduction}"
-                        )
+                    single_prefill_uris.append(
+                        f"single_prefill_with_kv_cache_dtype_q_{dtype_q}_"
+                        f"dtype_kv_{dtype_kv}_"
+                        f"dtype_o_{dtype_q}_"
+                        f"head_dim_{head_dim}_"
+                        f"posenc_{pos_encoding_mode}_"
+                        f"mask_{mask_mode}_"
+                        f"use_swa_{use_sliding_window}_"
+                        f"use_logits_cap_{use_logits_soft_cap}_"
+                        f"f16qk_{bool(allow_fp16_qk_reduction)}"
+                    )
             write_if_different(path / fname, content)
 
     # batch prefill files
@@ -263,22 +264,27 @@ def get_instantiation_cu() -> Tuple[List[str], List[str], List[str]]:
 
             for sliding_window in [True, False]:
                 for logits_soft_cap in [True, False]:
-                    for alibi in [False]:
-                        batch_prefill_uris.append(
-                            f"batch_paged_prefill_with_kv_cache_q_{dtype_q}_"
-                            f"dtype_kv_{dtype_kv}_"
-                            f"dtype_o_{dtype_q}_"
-                            f"dtype_idx_{idtype}_"
-                            f"head_dim_{head_dim}_"
-                            f"posenc_{pos_encoding_mode}_"
-                            f"mask_{mask_mode}_"
-                            f"use_swa_{sliding_window}_"
-                            f"use_logits_cap_{logits_soft_cap}_"
-                            f"use_alibi_{alibi}_"
-                            f"f16qk_{allow_fp16_qk_reduction}"
-                        )
+                    batch_prefill_uris.append(
+                        f"batch_prefill_with_kv_cache_dtype_q_{dtype_q}_"
+                        f"dtype_kv_{dtype_kv}_"
+                        f"dtype_o_{dtype_q}_"
+                        f"dtype_idx_{idtype}_"
+                        f"head_dim_{head_dim}_"
+                        f"posenc_{pos_encoding_mode}_"
+                        f"mask_{mask_mode}_"
+                        f"use_swa_{sliding_window}_"
+                        f"use_logits_cap_{logits_soft_cap}_"
+                        f"f16qk_{bool(allow_fp16_qk_reduction)}"
+                    )
 
-    return files_prefill, files_decode, single_decode_uris + batch_decode_uris + single_prefill_uris + batch_prefill_uris
+    return (
+        files_prefill,
+        files_decode,
+        single_decode_uris
+        + batch_decode_uris
+        + single_prefill_uris
+        + batch_prefill_uris,
+    )
 
 
 def get_version():
@@ -387,7 +393,7 @@ if __name__ == "__main__":
     )
     ext_modules.append(
         torch_cpp_ext.CUDAExtension(
-            name="flashinfer._decode",
+            name="flashinfer._decode_kernels",
             sources=[
                 "csrc_aot/single_decode.cu",
                 "csrc_aot/flashinfer_ops_decode.cu",
@@ -400,7 +406,7 @@ if __name__ == "__main__":
     )
     ext_modules.append(
         torch_cpp_ext.CUDAExtension(
-            name="flashinfer._prefill",
+            name="flashinfer._prefill_kernels",
             sources=[
                 "csrc_aot/single_prefill.cu",
                 "csrc_aot/flashinfer_ops_prefill.cu",

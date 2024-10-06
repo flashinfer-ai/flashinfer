@@ -22,7 +22,7 @@
 
 #include "pytorch_extension_utils.h"
 
-using namespace flashinfer;
+namespace flashinfer {
 
 template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, bool ALLOW_FP16_QK_REDUCTION,
           MaskMode MASK_MODE, typename AttentionVariant>
@@ -30,10 +30,12 @@ cudaError_t SinglePrefillWithKVCacheDispatched(typename AttentionVariant::Params
                                                typename AttentionVariant::DTypeO* tmp,
                                                cudaStream_t stream);
 
+}  // namespace flashinfer
+
 std::vector<torch::Tensor> single_prefill_with_kv_cache(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v,
+    unsigned int mask_mode_code, torch::Tensor q, torch::Tensor k, torch::Tensor v,
     std::optional<torch::Tensor> maybe_packed_custom_mask, torch::Tensor tmp,
-    std::optional<torch::Tensor> maybe_alibi_slopes, bool causal, unsigned int layout,
+    std::optional<torch::Tensor> maybe_alibi_slopes, unsigned int layout,
     int32_t window_left, float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta,
     bool return_lse) {
   auto device = q.device();
@@ -62,7 +64,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
   }
 
   constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;
-  const MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
+  const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
   bool use_logits_soft_cap = logits_soft_cap > 0.f;
 
   auto q_scalar_type = q.scalar_type();
@@ -93,10 +95,11 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
                          q_stride_n, q_stride_h, kv_stride_n, kv_stride_h, head_dim, window_left,
                          logits_soft_cap, sm_scale, rope_scale, rope_theta);
 
-          cudaError_t status = SinglePrefillWithKVCacheDispatched<HEAD_DIM, POS_ENCODING_MODE,
-                                                                  /*use_fp16_qk_reduction=*/false,
-                                                                  MASK_MODE, AttentionVariant>(
-              params, static_cast<DTypeO*>(tmp.data_ptr()), torch_current_stream);
+          cudaError_t status =
+              flashinfer::SinglePrefillWithKVCacheDispatched<HEAD_DIM, POS_ENCODING_MODE,
+                                                             /*use_fp16_qk_reduction=*/false,
+                                                             MASK_MODE, AttentionVariant>(
+                  params, static_cast<DTypeO*>(tmp.data_ptr()), torch_current_stream);
           TORCH_CHECK(status == cudaSuccess,
                       "SinglePrefillWithKVCache kernel launch failed, error: " +
                           std::string(cudaGetErrorString(status)));

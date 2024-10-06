@@ -20,12 +20,13 @@
 #include "flashinfer/pos_enc.cuh"
 #include "pytorch_extension_utils.h"
 
-using namespace flashinfer;
+namespace flashinfer {
 
 template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant>
 cudaError_t SingleDecodeWithKVCacheDispatched(typename AttentionVariant::ParamsT params,
                                               typename AttentionVariant::DTypeO* tmp,
                                               cudaStream_t stream);
+}  // namespace flashinfer
 
 torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                                           torch::Tensor tmp,
@@ -86,7 +87,8 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
                        /*alibi_slopes=*/nullptr, kv_len, num_qo_heads, num_kv_heads, kv_layout,
                        head_dim, window_left, logits_soft_cap, sm_scale, rope_scale, rope_theta);
         cudaError_t status =
-            SingleDecodeWithKVCacheDispatched<HEAD_DIM, POS_ENCODING_MODE, AttentionVariant>(
+            flashinfer::SingleDecodeWithKVCacheDispatched<HEAD_DIM, POS_ENCODING_MODE,
+                                                          AttentionVariant>(
                 params, static_cast<DTypeO*>(tmp.data_ptr()), torch_current_stream);
         TORCH_CHECK(status == cudaSuccess, "SingleDecodeWithKVCache kernel launch failed, error: " +
                                                std::string(cudaGetErrorString(status)));

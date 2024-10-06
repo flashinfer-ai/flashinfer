@@ -16,6 +16,7 @@ limitations under the License.
 
 import math
 from typing import Optional, Dict, Tuple, Union
+from types import SimpleNamespace
 import functools
 import torch
 import logging
@@ -28,7 +29,7 @@ from .jit import (
     gen_batch_prefill_cu,
     get_batch_prefill_uri,
     has_prebuilt_ops,
-    prebuilt_ops_uri
+    prebuilt_ops_uri,
 )
 from .utils import (
     PosEncodingMode,
@@ -81,7 +82,15 @@ def get_single_prefill_module(*args):
         if has_prebuilt_ops and get_single_prefill_uri(*args) in prebuilt_ops_uri:
             from . import _prefill_kernels
 
-            # TODO(Zihao)
+            # NOTE(Zihao): we should avoid hard-coded index like this, refactor it later
+            mask_mode = args[5]
+            run_func = lambda *run_args: _prefill_kernels.single_prefill_with_kv_cache(
+                mask_mode,
+                *run_args,
+            )
+            _single_prefill_modules[args] = SimpleNamespace(
+                run=run_func,
+            )
         else:
             _single_prefill_modules[args] = compile_single_prefill_module(*args)
     return _single_prefill_modules[args]
@@ -93,7 +102,25 @@ def get_batch_prefill_module(*args):
         if has_prebuilt_ops and get_batch_prefill_uri(*args) in prebuilt_ops_uri:
             from . import _prefill_kernels
 
-            # TODO(Zihao)
+            # NOTE(Zihao): we should avoid hard-coded index like this, refactor it later
+            head_dim = args[4]
+            plan_func = lambda *plan_args: _prefill_kernels.batch_prefill_with_kv_cache_plan(
+                head_dim, *plan_args,
+            )
+            mask_mode = args[6]
+            ragged_run_func = lambda *run_args: _prefill_kernels.batch_prefill_with_ragged_kv_cache_run(
+                mask_mode,
+                *run_args,
+            )
+            paged_run_func = lambda *run_args: _prefill_kernels.batch_prefill_with_paged_kv_cache_run(
+                mask_mode,
+                *run_args,
+            )
+            _batch_prefill_modules[args] = SimpleNamespace(
+                plan=plan_func,
+                ragged_run=ragged_run_func,
+                paged_run=paged_run_func,
+            )
         else:
             _batch_prefill_modules[args] = compile_batch_prefill_module(*args)
     return _batch_prefill_modules[args]
@@ -255,7 +282,6 @@ def single_prefill_with_kv_cache(
         mask_mode,
         window_left >= 0,  # use_sliding_window
         logits_soft_cap > 0,  # use_logits_soft_cap
-        pos_encoding_mode == "ALIBI",  # use_alibi
         allow_fp16_qk_reduction,
     ).run(
         q,
@@ -729,7 +755,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             mask_mode,
             window_left >= 0,  # use_sliding_window
             logits_soft_cap > 0,  # use_logits_soft_cap
-            pos_encoding_mode == "ALIBI",  # use_alibi
             allow_fp16_qk_reduction,
         )
         self._plan_info = self._cached_module.plan(
@@ -1279,7 +1304,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             mask_mode,
             window_left >= 0,  # use_sliding_window
             logits_soft_cap > 0,  # use_logits_soft_cap
-            pos_encoding_mode == "ALIBI",  # use_alibi
             allow_fp16_qk_reduction,
         )
         self._plan_info = self._cached_module.plan(

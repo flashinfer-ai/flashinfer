@@ -23,7 +23,7 @@
 
 #include "pytorch_extension_utils.h"
 
-using namespace flashinfer;
+namespace flashinfer {
 
 template <WarpLayout WARP_LAYOUT, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
           bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant>
@@ -37,13 +37,13 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(typename AttentionVariant::P
                                                     typename AttentionVariant::DTypeO* tmp_v,
                                                     float* tmp_s, cudaStream_t stream);
 
-std::vector<int64_t> BatchPrefillWithKVCachePlan(torch::Tensor float_workspace_buffer,
-                                                 torch::Tensor int_workspace_buffer,
-                                                 torch::Tensor page_locked_int_workspace_buffer,
-                                                 torch::Tensor qo_indptr, torch::Tensor kv_indptr,
-                                                 unsigned int batch_size, unsigned int num_qo_heads,
-                                                 unsigned int num_kv_heads, unsigned int page_size,
-                                                 bool enable_cuda_graph, unsigned int head_dim) {
+}  // namespace flashinfer
+
+std::vector<int64_t> BatchPrefillWithKVCachePlan(
+    unsigned int head_dim, torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
+    torch::Tensor page_locked_int_workspace_buffer, torch::Tensor qo_indptr,
+    torch::Tensor kv_indptr, unsigned int batch_size, unsigned int num_qo_heads,
+    unsigned int num_kv_heads, unsigned int page_size, bool enable_cuda_graph) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =
@@ -72,12 +72,13 @@ std::vector<int64_t> BatchPrefillWithKVCachePlan(torch::Tensor float_workspace_b
 }
 
 std::vector<torch::Tensor> BatchPrefillWithRaggedKVCacheRun(
-    torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
-    std::vector<int64_t> plan_info_vec, torch::Tensor q, torch::Tensor k, torch::Tensor v,
-    std::optional<torch::Tensor> maybe_custom_mask, std::optional<torch::Tensor> maybe_alibi_slopes,
-    torch::Tensor qo_indptr, torch::Tensor kv_indptr, std::optional<torch::Tensor> maybe_qk_indptr,
-    bool causal, unsigned int layout, int32_t window_left, float logits_soft_cap, float sm_scale,
-    float rope_scale, float rope_theta, bool return_lse) {
+    unsigned int mask_mode_code, torch::Tensor float_workspace_buffer,
+    torch::Tensor int_workspace_buffer, std::vector<int64_t> plan_info_vec, torch::Tensor q,
+    torch::Tensor k, torch::Tensor v, std::optional<torch::Tensor> maybe_custom_mask,
+    std::optional<torch::Tensor> maybe_alibi_slopes, torch::Tensor qo_indptr,
+    torch::Tensor kv_indptr, std::optional<torch::Tensor> maybe_qk_indptr, unsigned int layout,
+    int32_t window_left, float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta,
+    bool return_lse) {
   PrefillPlanInfo plan_info;
   plan_info.FromVector(plan_info_vec);
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
@@ -107,7 +108,7 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCacheRun(
   void* int_buffer_ptr = int_workspace_buffer.data_ptr();
 
   constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;
-  const MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
+  const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
   const bool use_logits_soft_cap = logits_soft_cap > 0.f;
   using IdType = int32_t;
 
@@ -131,9 +132,8 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCacheRun(
           RaggedParamsT params(
               static_cast<DTypeQ*>(q.data_ptr()), static_cast<DTypeKV*>(k.data_ptr()),
               static_cast<DTypeKV*>(v.data_ptr()),
-              maybe_custom_mask.has_value()
-                  ? static_cast<uint8_t*>(maybe_custom_mask->data_ptr())
-                  : nullptr,
+              maybe_custom_mask.has_value() ? static_cast<uint8_t*>(maybe_custom_mask->data_ptr())
+                                            : nullptr,
               static_cast<IdType*>(qo_indptr.data_ptr()),
               static_cast<IdType*>(kv_indptr.data_ptr()),
               maybe_qk_indptr.has_value() ? static_cast<IdType*>(maybe_qk_indptr->data_ptr())
@@ -174,11 +174,10 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCacheRun(
           cudaError_t status = cudaSuccess;
 
           DISPATCH_WARP_LAYOUT(warp_layout, WARP_LAYOUT, {
-            status =
-                BatchPrefillWithRaggedKVCacheDispatched<WARP_LAYOUT, HEAD_DIM, POS_ENCODING_MODE,
-                                                        /*use_fp16_qk_reduction=*/false, MASK_MODE,
-                                                        RaggedAttentionVariant>(
-                    params, tmp_v, tmp_s, torch_current_stream);
+            status = flashinfer::BatchPrefillWithRaggedKVCacheDispatched<
+                WARP_LAYOUT, HEAD_DIM, POS_ENCODING_MODE,
+                /*use_fp16_qk_reduction=*/false, MASK_MODE, RaggedAttentionVariant>(
+                params, tmp_v, tmp_s, torch_current_stream);
           });
 
           TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithRaggedKVCache failed with error ",
@@ -197,13 +196,13 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCacheRun(
 }
 
 std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
-    torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
-    std::vector<int64_t> plan_info_vec, torch::Tensor q,
+    unsigned int mask_mode_code, torch::Tensor float_workspace_buffer,
+    torch::Tensor int_workspace_buffer, std::vector<int64_t> plan_info_vec, torch::Tensor q,
     std::optional<torch::Tensor> paged_kv_cache, std::optional<torch::Tensor> paged_k_cache,
     std::optional<torch::Tensor> paged_v_cache, std::optional<torch::Tensor> maybe_custom_mask,
     std::optional<torch::Tensor> maybe_alibi_slopes, torch::Tensor qo_indptr,
     torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
-    torch::Tensor paged_kv_last_page_len, std::optional<torch::Tensor> maybe_qk_indptr, bool causal,
+    torch::Tensor paged_kv_last_page_len, std::optional<torch::Tensor> maybe_qk_indptr,
     unsigned int layout, int32_t window_left, float logits_soft_cap, float sm_scale,
     float rope_scale, float rope_theta, bool return_lse) {
   PrefillPlanInfo plan_info;
@@ -245,7 +244,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
   void* int_buffer_ptr = static_cast<void*>(int_workspace_buffer.data_ptr());
 
   constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;
-  const MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
+  const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
   using IdType = int32_t;
   bool use_logits_soft_cap = logits_soft_cap > 0.f;
   auto q_scalar_type = q.scalar_type();
@@ -278,18 +277,17 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
                                                  /*use_sliding_window=*/true, USE_LOGITS_SOFT_CAP,
                                                  /*use_alibi_slopes=*/false)>;
 
-          PagedParamsT params(static_cast<DTypeQ*>(q.data_ptr()), paged_kv,
-                              maybe_custom_mask.has_value()
-                                  ? static_cast<uint8_t*>(maybe_custom_mask->data_ptr())
-                                  : nullptr,
-                              static_cast<IdType*>(qo_indptr.data_ptr()),
-                              maybe_qk_indptr.has_value()
-                                  ? static_cast<IdType*>(maybe_qk_indptr->data_ptr())
-                                  : nullptr,
-                              /*q_offset=*/nullptr, static_cast<DTypeO*>(o.data_ptr()),
-                              /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-                              /*alibi_slopes=*/nullptr, num_qo_heads, window_left, logits_soft_cap,
-                              sm_scale, rope_scale, rope_theta);
+          PagedParamsT params(
+              static_cast<DTypeQ*>(q.data_ptr()), paged_kv,
+              maybe_custom_mask.has_value() ? static_cast<uint8_t*>(maybe_custom_mask->data_ptr())
+                                            : nullptr,
+              static_cast<IdType*>(qo_indptr.data_ptr()),
+              maybe_qk_indptr.has_value() ? static_cast<IdType*>(maybe_qk_indptr->data_ptr())
+                                          : nullptr,
+              /*q_offset=*/nullptr, static_cast<DTypeO*>(o.data_ptr()),
+              /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
+              /*alibi_slopes=*/nullptr, num_qo_heads, window_left, logits_soft_cap, sm_scale,
+              rope_scale, rope_theta);
 
           DTypeO* tmp_v = nullptr;
           float* tmp_s = nullptr;
@@ -320,11 +318,10 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
           cudaError_t status = cudaSuccess;
 
           DISPATCH_WARP_LAYOUT(warp_layout, WARP_LAYOUT, {
-            status =
-                BatchPrefillWithPagedKVCacheDispatched<WARP_LAYOUT, HEAD_DIM, POS_ENCODING_MODE,
-                                                       /*use_fp16_qk_reduction=*/false, MASK_MODE,
-                                                       PagedAttentionVariant>(params, tmp_v, tmp_s,
-                                                                              torch_current_stream);
+            status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
+                WARP_LAYOUT, HEAD_DIM, POS_ENCODING_MODE,
+                /*use_fp16_qk_reduction=*/false, MASK_MODE, PagedAttentionVariant>(
+                params, tmp_v, tmp_s, torch_current_stream);
           });
 
           TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithPagedKVCache failed with error ",

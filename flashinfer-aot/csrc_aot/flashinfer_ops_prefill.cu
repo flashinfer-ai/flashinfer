@@ -16,30 +16,29 @@
 #include <torch/extension.h>
 
 std::vector<torch::Tensor> single_prefill_with_kv_cache(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v,
+    unsigned int mask_mode_code, torch::Tensor q, torch::Tensor k, torch::Tensor v,
     std::optional<torch::Tensor> maybe_packed_custom_mask, torch::Tensor tmp,
     std::optional<torch::Tensor> maybe_alibi_slopes, unsigned int layout, int32_t window_left,
     float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta, bool return_lse);
 
-std::vector<int64_t> BatchPrefillWithKVCachePlan(torch::Tensor float_workspace_buffer,
-                                                 torch::Tensor int_workspace_buffer,
-                                                 torch::Tensor page_locked_int_workspace_buffer,
-                                                 torch::Tensor qo_indptr, torch::Tensor kv_indptr,
-                                                 unsigned int batch_size, unsigned int num_qo_heads,
-                                                 unsigned int num_kv_heads, unsigned int page_size,
-                                                 bool enable_cuda_graph, unsigned int head_dim);
+std::vector<int64_t> BatchPrefillWithKVCachePlan(
+    unsigned int head_dim, torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
+    torch::Tensor page_locked_int_workspace_buffer, torch::Tensor qo_indptr,
+    torch::Tensor kv_indptr, unsigned int batch_size, unsigned int num_qo_heads,
+    unsigned int num_kv_heads, unsigned int page_size, bool enable_cuda_graph);
 
 std::vector<torch::Tensor> BatchPrefillWithRaggedKVCacheRun(
-    torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
-    std::vector<int64_t> plan_info_vec, torch::Tensor q, torch::Tensor k, torch::Tensor v,
-    std::optional<torch::Tensor> maybe_custom_mask, std::optional<torch::Tensor> maybe_alibi_slopes,
-    torch::Tensor qo_indptr, torch::Tensor kv_indptr, std::optional<torch::Tensor> maybe_qk_indptr,
-    unsigned int layout, int32_t window_left, float logits_soft_cap, float sm_scale,
-    float rope_scale, float rope_theta, bool return_lse);
+    unsigned int mask_mode_code, torch::Tensor float_workspace_buffer,
+    torch::Tensor int_workspace_buffer, std::vector<int64_t> plan_info_vec, torch::Tensor q,
+    torch::Tensor k, torch::Tensor v, std::optional<torch::Tensor> maybe_custom_mask,
+    std::optional<torch::Tensor> maybe_alibi_slopes, torch::Tensor qo_indptr,
+    torch::Tensor kv_indptr, std::optional<torch::Tensor> maybe_qk_indptr, unsigned int layout,
+    int32_t window_left, float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta,
+    bool return_lse);
 
 std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
-    torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
-    std::vector<int64_t> plan_info_vec, torch::Tensor q,
+    unsigned int mask_mode_code, torch::Tensor float_workspace_buffer,
+    torch::Tensor int_workspace_buffer, std::vector<int64_t> plan_info_vec, torch::Tensor q,
     std::optional<torch::Tensor> paged_kv_cache, std::optional<torch::Tensor> paged_k_cache,
     std::optional<torch::Tensor> paged_v_cache, std::optional<torch::Tensor> maybe_custom_mask,
     std::optional<torch::Tensor> maybe_alibi_slopes, torch::Tensor qo_indptr,

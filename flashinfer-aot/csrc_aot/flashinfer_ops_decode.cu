@@ -23,22 +23,19 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
                                           float rope_theta);
 
 std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
-    torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
-    torch::Tensor page_locked_int_workspace_buffer, torch::Tensor indptr, unsigned int batch_size,
-    unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int page_size,
-    bool enable_cuda_graph, bool use_logits_soft_cap, unsigned int head_dim,
-    torch::Tensor empty_q_data, torch::Tensor empty_kv_data);
+    bool use_logits_soft_cap, unsigned int head_dim, torch::Tensor empty_q_data,
+    torch::Tensor empty_kv_data, torch::Tensor float_workspace_buffer,
+    torch::Tensor int_workspace_buffer, torch::Tensor page_locked_int_workspace_buffer,
+    torch::Tensor indptr, unsigned int batch_size, unsigned int num_qo_heads,
+    unsigned int num_kv_heads, unsigned int page_size, bool enable_cuda_graph);
 
 std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
-    torch::Tensor float_workspace_buffer,
-    torch::Tensor int_workspace_buffer,
-    std::vector<int64_t> plan_info_vec,
-    torch::Tensor q, std::optional<torch::Tensor> paged_kv_cache,
-    std::optional<torch::Tensor> paged_k_cache, std::optional<torch::Tensor> paged_v_cache,
-    torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
-    torch::Tensor paged_kv_last_page_len,
-    std::optional<torch::Tensor> alibi_slopes,
-    unsigned int kv_layout_code, int window_left,
+    torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
+    std::vector<int64_t> plan_info_vec, torch::Tensor q,
+    std::optional<torch::Tensor> paged_kv_cache, std::optional<torch::Tensor> paged_k_cache,
+    std::optional<torch::Tensor> paged_v_cache, torch::Tensor paged_kv_indptr,
+    torch::Tensor paged_kv_indices, torch::Tensor paged_kv_last_page_len,
+    std::optional<torch::Tensor> alibi_slopes, unsigned int kv_layout_code, int window_left,
     float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta, bool return_lse);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

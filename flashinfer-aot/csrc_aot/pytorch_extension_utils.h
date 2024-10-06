@@ -181,7 +181,7 @@ using namespace flashinfer;
 #define DISPATCH_PYTORCH_QKV_DTYPE_TO_CTYPE(q_dtype, kv_dtype, c_type_q, c_type_kv, ...) \
   [&]() -> bool {                                                                        \
     if (kv_dtype == q_dtype) {                                                           \
-      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q_dtype, c_type_q, [&] {                    \
+      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q_dtype, c_type_q, [&] {               \
         using c_type_kv = c_type_q;                                                      \
         return __VA_ARGS__();                                                            \
       });                                                                                \

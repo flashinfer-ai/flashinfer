@@ -30,14 +30,14 @@ def get_quantization_module():
 
             _quantization_module = _kernels
         else:
-            quantization_ops = load_cuda_ops(
+            _quantization_module = load_cuda_ops(
                 "quantization",
                 [
                     FLASHINFER_CSRC_DIR / "quantization.cu",
                     FLASHINFER_CSRC_DIR / "flashinfer_quantization_ops.cu",
                 ],
             )
-    return quantization_ops
+    return _quantization_module
 
 
 def packbits(x: torch.Tensor, bitorder: str = "big") -> torch.Tensor:

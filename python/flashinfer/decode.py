@@ -82,7 +82,9 @@ def get_single_decode_module(*args):
         if has_prebuilt_ops and get_single_decode_uri(*args) in prebuilt_ops_uri:
             from . import _decode_kernels
 
-            pass
+            _single_decode_modules[args] = SimpleNamespace(
+                run=_decode_kernels.single_decode_with_kv_cache,
+            )
         else:
             _single_decode_modules[args] = compile_single_decode_module(*args)
     return _single_decode_modules[args]
@@ -94,7 +96,23 @@ def get_batch_decode_module(*args):
         if has_prebuilt_ops and get_batch_decode_uri(*args) in prebuilt_ops_uri:
             from . import _decode_kernels
 
-            # TODO(Zihao)
+            # NOTE(Zihao): we should avoid hard-coded index like this, refactor it later
+            dtype_q = args[0]
+            dtype_kv = args[1]
+            head_dim = args[4]
+            use_logits_cap = args[7]
+            plan_func = lambda *plan_args: _decode_kernels.batch_decode_with_paged_kv_cache_plan(
+                use_logits_cap,
+                head_dim,
+                torch.empty(0, dtype=dtype_q),
+                torch.empty(0, dtype=dtype_kv),
+                *plan_args,
+            )
+            run_func = _decode_kernels.batch_decode_with_paged_kv_cache_run
+            _batch_decode_modules[args] = SimpleNamespace(
+                plan=plan_func,
+                run=run_func,
+            )
         else:
             _batch_decode_modules[args] = compile_batch_decode_module(*args)
     return _batch_decode_modules[args]
@@ -217,7 +235,6 @@ def single_decode_with_kv_cache(
                 PosEncodingMode[pos_encoding_mode].value,
                 window_left != -1,  # use_sliding_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
-                pos_encoding_mode == "ALIBI",  # use_alibi
                 False,  # allow_fp16_qk_reduction
             )
             .run(
@@ -246,7 +263,6 @@ def single_decode_with_kv_cache(
             PosEncodingMode[pos_encoding_mode].value,
             window_left != -1,  # use_sliding_window
             logits_soft_cap > 0,  # use_logits_soft_cap
-            pos_encoding_mode == "ALIBI",  # use_alibi
         ).run(
             q,
             k,
@@ -568,7 +584,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 MaskMode.NON_CAUSAL.value,
                 window_left != -1,  # use_sliding_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
-                pos_encoding_mode == "ALIBI",  # use_alibi
                 False,  # allow_fp16_qk_reduction
             )
             self._plan_info = self._cached_module.plan(
@@ -593,7 +608,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 PosEncodingMode[pos_encoding_mode].value,
                 window_left != -1,  # use_sliding_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
-                pos_encoding_mode == "ALIBI",  # use_alibi
             )
             self._plan_info = self._cached_module.plan(
                 self._float_workspace_buffer,

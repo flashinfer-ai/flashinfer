@@ -22,6 +22,7 @@ single_decode_templ = r"""
 #include <flashinfer/attention/decode_params.cuh>
 #include "pytorch_extension_utils.h"
 
+{% set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
 torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                                           torch::Tensor tmp, std::optional<torch::Tensor> alibi_slopes,
                                           unsigned int layout, int window_left,
