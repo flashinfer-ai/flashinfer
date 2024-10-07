@@ -25,7 +25,7 @@ from .env import (
     FLASHINFER_GEN_SRC_DIR,
     FLASHINFER_INCLUDE_DIR,
     FLASHINFER_CSRC_DIR,
-    CUTLASS_INCLUDE_DIR,
+    CUTLASS_INCLUDE_DIRS,
 )
 from .activation import get_act_and_mul_cu_str, gen_act_and_mul_cu
 from .attention import (
@@ -135,9 +135,8 @@ def load_cuda_ops(
     if extra_include_paths is None:
         extra_include_paths = [
             FLASHINFER_INCLUDE_DIR,
-            CUTLASS_INCLUDE_DIR,
             FLASHINFER_CSRC_DIR,
-        ]
+        ] + CUTLASS_INCLUDE_DIRS
     return torch_cpp_ext.load(
         name,
         list(map(lambda _: str(_), sources)),

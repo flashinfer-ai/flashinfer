@@ -53,7 +53,7 @@ cudaError_t CutlassSegmentGEMMRun(void* workspace_buffer, size_t workspace_buffe
 
   // NOTE(Zihao): I didn't successfully launch the kernel with cudaLaunchKernel API,
   // so I just use the kernel function directly, need to investigate more.
-  auto compute_args_kernel = compute_cutlass_group_gemm_args<DType>;
+  auto compute_args_kernel = compute_sm80_cutlass_group_gemm_args<DType, DType>;
   compute_args_kernel<<<batch_size, 1, 0, stream>>>(
       problem_sizes_device, x_data, w_data, y_data, ld_x, ld_w, ld_y, (DType*)x, (DType*)w,
       (DType*)y, xy_indptr_d, w_indices_d, d_in, d_out, weight_column_major);

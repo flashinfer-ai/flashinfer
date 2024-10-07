@@ -48,7 +48,6 @@ torch::Tensor CutlassSegmentGEMM(torch::Tensor workspace_buffer, torch::Tensor s
     weight_indices = weight_indices.to(torch::kInt64);
   }
 
-  // TODO(Zihao): add fp8 support
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(x.scalar_type(), c_type, [&] {
     using cutlass_t = typename cutlass_dtype<c_type>::type;
     auto status = CutlassSegmentGEMMRun<cutlass_t>(
