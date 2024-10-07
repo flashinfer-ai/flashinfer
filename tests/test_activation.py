@@ -27,7 +27,7 @@ def test_fused_silu_mul(dim, batch_size, seq_len):
     y_ref = x[..., dim:] * torch.nn.functional.silu(x[..., :dim])
     y = flashinfer.activation.silu_and_mul(x)
     torch.testing.assert_close(
-        y_ref.cpu().numpy(), y.cpu().numpy(), rtol=1e-3, atol=1e-3
+        y_ref, y, rtol=1e-3, atol=1e-3
     )
 
 
@@ -39,7 +39,7 @@ def test_fused_gelu_tanh_mul(dim, batch_size, seq_len):
     y_ref = x[..., dim:] * torch.nn.functional.gelu(x[..., :dim], approximate="tanh")
     y = flashinfer.activation.gelu_tanh_and_mul(x)
     torch.testing.assert_close(
-        y_ref.cpu().numpy(), y.cpu().numpy(), rtol=1e-3, atol=1e-3
+        y_ref, y, rtol=1e-3, atol=1e-3
     )
 
 
@@ -51,5 +51,5 @@ def test_fused_gelu_mul(dim, batch_size, seq_len):
     y_ref = x[..., dim:] * torch.nn.functional.gelu(x[..., :dim], approximate="none")
     y = flashinfer.activation.gelu_and_mul(x)
     torch.testing.assert_close(
-        y_ref.cpu().numpy(), y.cpu().numpy(), rtol=1e-3, atol=1e-3
+        y_ref, y, rtol=1e-3, atol=1e-3
     )

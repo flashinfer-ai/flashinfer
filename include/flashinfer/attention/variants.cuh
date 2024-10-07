@@ -178,7 +178,7 @@ struct ALIBIAttention {
   __device__ __forceinline__ T LogitsTransform(const ParamsT& params, T logits, uint32_t batch_idx,
                                                uint32_t qo_idx, uint32_t kv_idx,
                                                uint32_t qo_head_idx, uint32_t kv_head_idx) {
-    return logits + params.alibi_slopes[qo_head_idx] * float(kv_idx - qo_idx);
+    return logits + params.alibi_slopes[qo_head_idx] * float(int(kv_idx) - int(qo_idx));
   }
 
   __device__ __forceinline__ bool LogitsMask(const ParamsT& params, uint32_t batch_idx,
@@ -242,7 +242,7 @@ struct ComposedAttention {
                                                uint32_t qo_idx, uint32_t kv_idx,
                                                uint32_t qo_head_idx, uint32_t kv_head_idx) {
     if constexpr (use_alibi) {
-      logits = logits + params.alibi_slopes[qo_head_idx] * float(kv_idx - qo_idx);
+      logits = logits + params.alibi_slopes[qo_head_idx] * float(int(kv_idx) - int(qo_idx));
     }
     if constexpr (use_logits_soft_cap) {
       logits = params.logits_soft_cap * math::log2e * float(math::tanh(logits));

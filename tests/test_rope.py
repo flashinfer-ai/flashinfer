@@ -70,10 +70,10 @@ def test_llama_rope_inplace(
 
     # compare
     torch.testing.assert_close(
-        q_rope_ref.cpu().numpy(), q.cpu().numpy(), rtol=1e-3, atol=1e-3
+        q_rope_ref, q, rtol=1e-3, atol=1e-3
     )
     torch.testing.assert_close(
-        k_rope_ref.cpu().numpy(), k.cpu().numpy(), rtol=1e-3, atol=1e-3
+        k_rope_ref, k, rtol=1e-3, atol=1e-3
     )
 
 
@@ -126,10 +126,10 @@ def test_llama_rope(
 
     # compare
     torch.testing.assert_close(
-        q_rope_ref.cpu().numpy(), q_rope.cpu().numpy(), rtol=1e-3, atol=1e-3
+        q_rope_ref, q_rope, rtol=1e-3, atol=1e-3
     )
     torch.testing.assert_close(
-        k_rope_ref.cpu().numpy(), k_rope.cpu().numpy(), rtol=1e-3, atol=1e-3
+        k_rope_ref, k_rope, rtol=1e-3, atol=1e-3
     )
 
 
@@ -182,10 +182,10 @@ def test_llama31_rope_inplace(
 
     # compare
     torch.testing.assert_close(
-        q_rope_ref.cpu().numpy(), q.cpu().numpy(), rtol=1e-3, atol=1e-3
+        q_rope_ref, q, rtol=1e-3, atol=1e-3
     )
     torch.testing.assert_close(
-        k_rope_ref.cpu().numpy(), k.cpu().numpy(), rtol=1e-3, atol=1e-3
+        k_rope_ref, k, rtol=1e-3, atol=1e-3
     )
 
 
@@ -238,10 +238,10 @@ def test_llama31_rope(
 
     # compare
     torch.testing.assert_close(
-        q_rope_ref.cpu().numpy(), q_rope.cpu().numpy(), rtol=1e-3, atol=1e-3
+        q_rope_ref, q_rope, rtol=1e-3, atol=1e-3
     )
     torch.testing.assert_close(
-        k_rope_ref.cpu().numpy(), k_rope.cpu().numpy(), rtol=1e-3, atol=1e-3
+        k_rope_ref, k_rope, rtol=1e-3, atol=1e-3
     )
 
 

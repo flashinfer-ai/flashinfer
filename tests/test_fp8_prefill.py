@@ -106,7 +106,7 @@ def test_batch_prefill_with_paged_kv_cache_fp8_calibration_scale(
     )
 
     torch.testing.assert_close(
-        o_fp16.cpu().numpy(), o_fp8.cpu().numpy(), atol=1e-2, rtol=2e-1
+        o_fp16, o_fp8, atol=1e-2, rtol=2e-1
     )
 
 
@@ -184,7 +184,7 @@ def test_batch_decode_with_prefill_with_paged_kv_cache(
     o_decode_fp8 = decode_wrapper.run(q, kv_data)
 
     torch.testing.assert_close(
-        o_decode_fp8.cpu().numpy(), o_fp8.cpu().numpy(), atol=1e-2, rtol=1e-2
+        o_decode_fp8, o_fp8, atol=1e-2, rtol=1e-2
     )
 
 

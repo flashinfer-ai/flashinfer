@@ -246,8 +246,8 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
 
     renorm_prob = flashinfer.sampling.top_p_renorm_probs(normalized_prob, p)
     torch.testing.assert_close(
-        renorm_prob_ground_truth.cpu().numpy(),
-        renorm_prob.cpu().numpy(),
+        renorm_prob_ground_truth,
+        renorm_prob,
         rtol=1e-3,
         atol=1e-3,
     )
@@ -273,8 +273,8 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k):
 
     renorm_prob = flashinfer.sampling.top_k_renorm_probs(normalized_prob, k)
     torch.testing.assert_close(
-        renorm_prob_ground_truth.cpu().numpy(),
-        renorm_prob.cpu().numpy(),
+        renorm_prob_ground_truth,
+        renorm_prob,
         rtol=1e-3,
         atol=1e-3,
     )
@@ -294,8 +294,8 @@ def test_top_k_mask_logits(batch_size, vocab_size, k):
     renormed_probs_ref = flashinfer.sampling.top_k_renorm_prob(probs, k)
 
     torch.testing.assert_close(
-        renormed_probs.cpu().numpy(),
-        renormed_probs_ref.cpu().numpy(),
+        renormed_probs,
+        renormed_probs_ref,
         rtol=1e-3,
         atol=1e-3,
     )

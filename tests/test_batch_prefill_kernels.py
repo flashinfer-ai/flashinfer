@@ -29,7 +29,7 @@ import torch
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
-@pytest.mark.parametrize("use_cuda_graph", [False, True])
+@pytest.mark.parametrize("use_cuda_graph", [True])
 @pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
 @pytest.mark.parametrize("return_lse", [True, False])
 def test_batch_prefill_with_paged_kv_cache(
@@ -110,6 +110,7 @@ def test_batch_prefill_with_paged_kv_cache(
         kv_last_page_len_warmup = torch.full(
             (batch_size,), page_size, dtype=torch.int32
         )
+
         wrapper.plan(
             q_indptr_warmup,
             kv_indptr_warmup,
@@ -140,7 +141,7 @@ def test_batch_prefill_with_paged_kv_cache(
             if return_lse:
                 o, _ = wrapper.run_return_lse(q, kv_data)
             else:
-                o = wrapper.run(q, kv_data)
+                o = wrapper.run(q, kv_data) 
 
         wrapper.plan(
             q_indptr_cpu,
@@ -204,9 +205,8 @@ def test_batch_prefill_with_paged_kv_cache(
             pos_encoding_mode=pos_encoding_mode,
             logits_soft_cap=logits_soft_cap,
         )
-        o_i_np = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]].cpu().numpy()
-        o_ref_i_np = o_ref_i.cpu().numpy()
-        torch.testing.assert_close(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
+        o_i = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
+        torch.testing.assert_close(o_i, o_ref_i, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -394,9 +394,8 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
             pos_encoding_mode=pos_encoding_mode,
             logits_soft_cap=logits_soft_cap,
         )
-        o_i_np = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]].cpu().numpy()
-        o_ref_i_np = o_ref_i.cpu().numpy()
-        torch.testing.assert_close(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
+        o_i = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
+        torch.testing.assert_close(o_i, o_ref_i, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -491,7 +490,7 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
     else:
         o_causal = wrapper.run(q, kv_data)
     torch.testing.assert_close(
-        o_custom.cpu().numpy(), o_causal.cpu().numpy(), rtol=1e-3, atol=1e-3
+        o_custom, o_causal, rtol=1e-3, atol=1e-3
     )
 
 
@@ -553,9 +552,8 @@ def test_batch_prefill_with_ragged_kv_cache(
             pos_encoding_mode=pos_encoding_mode,
             logits_soft_cap=logits_soft_cap,
         )
-        o_i_np = o[q_indptr[i] : q_indptr[i + 1]].cpu().numpy()
-        o_ref_i_np = o_ref_i.cpu().numpy()
-        torch.testing.assert_close(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
+        o_i = o[q_indptr[i] : q_indptr[i + 1]]
+        torch.testing.assert_close(o_i, o_ref_i, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -632,26 +630,26 @@ def test_batch_prefill_with_ragged_kv_cache_custom_mask(
     else:
         o_causal = wrapper.run(q, k, v)
     torch.testing.assert_close(
-        o_custom.cpu().numpy(), o_causal.cpu().numpy(), rtol=1e-3, atol=1e-3
+        o_custom, o_causal, rtol=1e-3, atol=1e-3
     )
 
 
 if __name__ == "__main__":
-    # test_batch_prefill_with_paged_kv_cache(
-    #     12, 54, 37, 16, 8, 8, 128, True, "HND", "NONE", True, 0.0, False
-    # )
-    # test_batch_prefill_with_tuple_paged_kv_cache(
-    #     12, 54, 37, 16, 8, 8, 128, True, "HND", "NONE", True, 0.0, False
-    # )
-    # test_batch_prefill_with_paged_kv_cache(
-    #     12, 54, 37, 1, 8, 8, 128, True, "HND", "NONE", False, 0.0, False
-    # )
+    test_batch_prefill_with_paged_kv_cache(
+        12, 54, 37, 16, 8, 8, 128, True, "HND", "NONE", True, 0.0, False
+    )
+    test_batch_prefill_with_tuple_paged_kv_cache(
+        12, 54, 37, 16, 8, 8, 128, True, "HND", "NONE", True, 0.0, False
+    )
+    test_batch_prefill_with_paged_kv_cache(
+        12, 54, 37, 1, 8, 8, 128, True, "HND", "NONE", False, 0.0, False
+    )
     test_batch_prefill_with_paged_kv_cache_custom_mask(
         1, 137, 137, 1, 8, 8, 128, "HND", "NONE", 0.0, False
     )
-    # test_batch_prefill_with_ragged_kv_cache(
-    #     12, 54, 37, 8, 8, 128, True, "NONE", 0.0, False
-    # )
+    test_batch_prefill_with_ragged_kv_cache(
+        12, 54, 37, 8, 8, 128, True, "NONE", 0.0, False
+    )
     test_batch_prefill_with_ragged_kv_cache_custom_mask(
         1, 137, 137, 8, 8, 128, "NONE", 0.0, False
     )

@@ -46,6 +46,10 @@ from .utils import (
 from .quantization import packbits, segment_packbits
 
 
+if has_prebuilt_ops:
+    from . import _prefill_kernels
+
+
 def compile_single_prefill_module(
     *args,
     verbose: bool = False,
@@ -80,8 +84,6 @@ def get_single_prefill_module(*args):
     global _single_prefill_modules
     if args not in _single_prefill_modules:
         if has_prebuilt_ops and get_single_prefill_uri(*args) in prebuilt_ops_uri:
-            from . import _prefill_kernels
-
             # NOTE(Zihao): we should avoid hard-coded index like this, refactor it later
             mask_mode = args[5]
             run_func = lambda *run_args: _prefill_kernels.single_prefill_with_kv_cache(
@@ -100,12 +102,13 @@ def get_batch_prefill_module(*args):
     global _batch_prefill_modules
     if args not in _batch_prefill_modules:
         if has_prebuilt_ops and get_batch_prefill_uri(*args) in prebuilt_ops_uri:
-            from . import _prefill_kernels
-
             # NOTE(Zihao): we should avoid hard-coded index like this, refactor it later
             head_dim = args[4]
-            plan_func = lambda *plan_args: _prefill_kernels.batch_prefill_with_kv_cache_plan(
-                head_dim, *plan_args,
+            plan_func = (
+                lambda *plan_args: _prefill_kernels.batch_prefill_with_kv_cache_plan(
+                    head_dim,
+                    *plan_args,
+                )
             )
             mask_mode = args[6]
             ragged_run_func = lambda *run_args: _prefill_kernels.batch_prefill_with_ragged_kv_cache_run(

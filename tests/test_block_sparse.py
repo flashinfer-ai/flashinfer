@@ -86,7 +86,7 @@ def test_block_sparse_attention(
     )
 
     o = sparse_attention_wrapper.run(q, k, v)
-    torch.testing.assert_close(o_ref.cpu(), o.cpu(), atol=1e-2, rtol=1e-3)
+    torch.testing.assert_close(o_ref, o, atol=1e-2, rtol=1e-3)
 
 
 if __name__ == "__main__":

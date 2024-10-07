@@ -77,7 +77,7 @@ def test_norm(batch_size, hidden_size, dtype, specify_out):
         y = flashinfer.norm.rmsnorm(x, w)
 
     torch.testing.assert_close(
-        y_ref.cpu().numpy(), y.cpu().numpy(), rtol=1e-3, atol=1e-3
+        y_ref, y, rtol=1e-3, atol=1e-3
     )
 
 
@@ -119,7 +119,7 @@ def test_gemma_norm(batch_size, hidden_size, dtype, specify_out):
         y = flashinfer.norm.gemma_rmsnorm(x, w)
 
     torch.testing.assert_close(
-        y_ref.cpu().numpy(), y.cpu().numpy(), rtol=1e-3, atol=1e-3
+        y_ref, y, rtol=1e-3, atol=1e-3
     )
 
 

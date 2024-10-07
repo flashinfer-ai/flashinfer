@@ -54,7 +54,7 @@ def test_single_decode_tensor_cores(
     )
 
     torch.testing.assert_close(
-        o.cpu().numpy(), o_tensor_cores.cpu().numpy(), rtol=1e-3, atol=1e-3
+        o, o_tensor_cores, rtol=1e-3, atol=1e-3
     )
 
 
@@ -126,7 +126,7 @@ def test_batch_decode_tensor_cores(
     o_tensor_cores = wrapper_tensor_cores.run(q, kv_data)
 
     torch.testing.assert_close(
-        o.cpu().numpy(), o_tensor_cores.cpu().numpy(), rtol=1e-3, atol=1e-3
+        o, o_tensor_cores, rtol=1e-3, atol=1e-3
     )
 
 
@@ -242,5 +242,5 @@ def test_batch_decode_tensor_cores_cuda_graph(
     g.replay()
 
     torch.testing.assert_close(
-        o.cpu().numpy(), o_tensor_cores.cpu().numpy(), rtol=1e-3, atol=1e-3
+        o, o_tensor_cores, rtol=1e-3, atol=1e-3
     )

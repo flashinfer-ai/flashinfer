@@ -69,10 +69,10 @@ def test_mlc_failed_case():
     print(o_1, o_1_tc)
 
     torch.testing.assert_close(
-        lse_1.cpu().numpy(), lse_1_tc.cpu().numpy(), rtol=1e-3, atol=1e-3
+        lse_1, lse_1_tc, rtol=1e-3, atol=1e-3
     )
     torch.testing.assert_close(
-        o_1.cpu().numpy(), o_1_tc.cpu().numpy(), rtol=1e-3, atol=1e-3
+        o_1, o_1_tc, rtol=1e-3, atol=1e-3
     )
 
 

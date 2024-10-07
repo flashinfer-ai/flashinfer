@@ -48,7 +48,7 @@ def test_single_decode_logits_soft_cap(
     o = flashinfer.single_decode_with_kv_cache(q, k, v, logits_soft_cap=soft_cap)
     o_ref = attention_logits_soft_cap_torch(q.unsqueeze(0), k, v, soft_cap).squeeze(0)
     torch.testing.assert_close(
-        o.cpu().numpy(), o_ref.cpu().numpy(), rtol=1e-3, atol=1e-3
+        o, o_ref, rtol=1e-3, atol=1e-3
     )
 
 
@@ -71,7 +71,7 @@ def test_single_prefill_logits_soft_cap(
     o = flashinfer.single_prefill_with_kv_cache(q, k, v, logits_soft_cap=soft_cap)
     o_ref = attention_logits_soft_cap_torch(q, k, v, soft_cap)
     torch.testing.assert_close(
-        o.cpu().numpy(), o_ref.cpu().numpy(), rtol=1e-2, atol=1e-2
+        o, o_ref, rtol=1e-2, atol=1e-2
     )
 
 

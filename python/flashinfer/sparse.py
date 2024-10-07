@@ -307,7 +307,6 @@ class BlockSparseAttentionWrapper:
             mask_mode,
             False,  # use_sliding_window
             logits_soft_cap > 0,  # use_logits_soft_cap
-            pos_encoding_mode == "ALIBI",  # use_alibi
             allow_fp16_qk_reduction,
         )
 

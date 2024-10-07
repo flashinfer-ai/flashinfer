@@ -355,7 +355,8 @@ std::tuple<bool, uint32_t, uint32_t, WarpLayout, uint32_t, uint32_t, std::vector
            std::vector<IdType>, std::vector<IdType>, std::vector<IdType>, std::vector<IdType>>
 PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t batch_size,
                        uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
-                       uint32_t page_size, uint32_t max_grid_size) {
+                       uint32_t page_size, uint32_t max_grid_size, uint32_t max_batch_size_if_split,
+                       bool enable_cuda_graph) {
   std::vector<IdType> request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr;
   merge_indptr.push_back(0);
   o_indptr.push_back(0);
@@ -420,7 +421,12 @@ PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t batch_
     o_indptr.push_back(o_indptr.back() + qo_len * num_tiles_kv);
   }
 
-  // step 4: multiply kv_chunk_size by page_size
+  // step 4: reset split_kv if enable_cuda_graph is true
+  if (enable_cuda_graph) {
+    split_kv = total_num_tiles_q < max_batch_size_if_split;
+  }
+
+  // step 5: multiply kv_chunk_size by page_size
   kv_chunk_size *= page_size;
 
   return {split_kv,
@@ -531,20 +537,21 @@ cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_in_bytes
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
   int num_blocks_per_sm = 2;
   int max_grid_size = num_blocks_per_sm * num_sm;
-  uint32_t split_max_batch_size = max_grid_size / num_kv_heads;
+  uint32_t max_batch_size_if_split = max_grid_size / num_kv_heads;
 
   // step 2: determine kv_chunk_size
   auto [split_kv, total_num_tiles_q, new_batch_size, warp_layout, kv_chunk_size, total_num_rows,
         request_indices_vec, qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec,
         o_indptr_vec] = PrefillSplitQOKVIndptr(qo_indptr_h, kv_indptr_h, batch_size, num_qo_heads,
-                                               num_kv_heads, head_dim, page_size, max_grid_size);
+                                               num_kv_heads, head_dim, page_size, max_grid_size,
+                                               max_batch_size_if_split, enable_cuda_graph);
   const uint32_t qo_tile_size = get_num_rows_per_cta(warp_layout);
   plan_info.warp_layout_code = static_cast<int64_t>(warp_layout);
   plan_info.total_num_rows = total_num_rows;
 
   plan_info.enable_cuda_graph = enable_cuda_graph;
   size_t padded_batch_size =
-      enable_cuda_graph ? std::max(split_max_batch_size, total_num_tiles_q) : new_batch_size;
+      enable_cuda_graph ? std::max(max_batch_size_if_split, total_num_tiles_q) : new_batch_size;
   plan_info.padded_batch_size = padded_batch_size;
   plan_info.split_kv = split_kv;
 
@@ -579,19 +586,18 @@ cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_in_bytes
   if (split_kv) {
     AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
     plan_info.v_offset = float_allocator.aligned_alloc_offset(
-        num_qo_heads * split_max_batch_size * qo_tile_size * head_dim * sizeof_dtype_o, 16,
+        num_qo_heads * padded_batch_size * qo_tile_size * head_dim * sizeof_dtype_o, 16,
         "batch_prefill_tmp_v");
     plan_info.s_offset = float_allocator.aligned_alloc_offset(
-        num_qo_heads * split_max_batch_size * qo_tile_size * sizeof(float), 16,
-        "batch_prefill_tmp_s");
+        num_qo_heads * padded_batch_size * qo_tile_size * sizeof(float), 16, "batch_prefill_tmp_s");
     plan_info.merge_indptr_offset = int_allocator.aligned_alloc_offset(
         sizeof(IdType) * (plan_info.total_num_rows + 1), 16, "batch_prefill_merge_indptr");
     plan_info.block_valid_mask_offset = int_allocator.aligned_alloc_offset(
         sizeof(bool) * padded_batch_size, 16, "batch_prefill_block_valid_mask");
     IdType* merge_indptr_h =
         GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.merge_indptr_offset);
-    IdType* block_valid_mask_h =
-        GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.block_valid_mask_offset);
+    bool* block_valid_mask_h =
+        GetPtrFromBaseOffset<bool>(page_locked_int_buffer, plan_info.block_valid_mask_offset);
     std::copy(merge_indptr_vec.begin(), merge_indptr_vec.end(), merge_indptr_h);
     for (uint32_t i = 0; i < padded_batch_size; ++i) {
       block_valid_mask_h[i] = i < new_batch_size;

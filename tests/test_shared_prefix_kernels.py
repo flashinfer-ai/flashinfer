@@ -186,7 +186,7 @@ def test_batch_attention_with_shared_prefix_paged_kv_cache(
         )
 
     torch.testing.assert_close(
-        o_multi_level.cpu().numpy(), o_two_level.cpu().numpy(), rtol=1e-3, atol=1e-3
+        o_multi_level, o_two_level, rtol=1e-3, atol=1e-3
     )
 
 
@@ -218,10 +218,10 @@ def test_merge_state_in_place_with_mask(seed, num_tries):
     va_merged = va
     sa_merged = sa
     torch.testing.assert_close(
-        va_merged.cpu().numpy(), va_merged_ref.cpu().numpy(), rtol=1e-3, atol=1e-3
+        va_merged, va_merged_ref, rtol=1e-3, atol=1e-3
     )
     torch.testing.assert_close(
-        sa_merged.cpu().numpy(), sa_merged_ref.cpu().numpy(), rtol=1e-3, atol=1e-3
+        sa_merged, sa_merged_ref, rtol=1e-3, atol=1e-3
     )
 
     # Mask with all zeros. Input and output should be identical.
@@ -232,10 +232,10 @@ def test_merge_state_in_place_with_mask(seed, num_tries):
     va_merged = va
     sa_merged = sa
     torch.testing.assert_close(
-        va_merged.cpu().numpy(), va_orginal.cpu().numpy(), rtol=1e-3, atol=1e-3
+        va_merged, va_orginal, rtol=1e-3, atol=1e-3
     )
     torch.testing.assert_close(
-        sa_merged.cpu().numpy(), sa_original.cpu().numpy(), rtol=1e-3, atol=1e-3
+        sa_merged, sa_original, rtol=1e-3, atol=1e-3
     )
 
     # Test some random masks.
@@ -255,26 +255,26 @@ def test_merge_state_in_place_with_mask(seed, num_tries):
         sa_merged = sa
 
         torch.testing.assert_close(
-            va_merged[false_indices].cpu().numpy(),
-            va_orginal[false_indices].cpu().numpy(),
+            va_merged[false_indices],
+            va_orginal[false_indices],
             rtol=1e-3,
             atol=1e-3,
         )
         torch.testing.assert_close(
-            sa_merged[false_indices].cpu().numpy(),
-            sa_original[false_indices].cpu().numpy(),
+            sa_merged[false_indices],
+            sa_original[false_indices],
             rtol=1e-3,
             atol=1e-3,
         )
         torch.testing.assert_close(
-            va_merged[true_indices].cpu().numpy(),
-            va_merged_ref[true_indices].cpu().numpy(),
+            va_merged[true_indices],
+            va_merged_ref[true_indices],
             rtol=1e-3,
             atol=1e-3,
         )
         torch.testing.assert_close(
-            sa_merged[true_indices].cpu().numpy(),
-            sa_merged_ref[true_indices].cpu().numpy(),
+            sa_merged[true_indices],
+            sa_merged_ref[true_indices],
             rtol=1e-3,
             atol=1e-3,
         )

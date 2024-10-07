@@ -122,9 +122,7 @@ def test_batch_decode_with_paged_kv_cache(
             pos_encoding_mode=pos_encoding_mode,
             logits_soft_cap=logits_soft_cap,
         )
-        o_i_np = o[i].cpu().numpy()
-        o_ref_i_np = o_ref_i.cpu().numpy()
-        torch.testing.assert_close(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(o[i], o_ref_i, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -234,9 +232,7 @@ def test_batch_decode_with_tuple_paged_kv_cache(
             pos_encoding_mode=pos_encoding_mode,
             logits_soft_cap=logits_soft_cap,
         )
-        o_i_np = o[i].cpu().numpy()
-        o_ref_i_np = o_ref_i.cpu().numpy()
-        torch.testing.assert_close(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(o[i], o_ref_i, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -398,9 +394,7 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
         o_ref_i = flashinfer.single_decode_with_kv_cache(
             qi, ki, vi, pos_encoding_mode=pos_encoding_mode
         )
-        o_i_np = o[i].cpu().numpy()
-        o_ref_i_np = o_ref_i.cpu().numpy()
-        torch.testing.assert_close(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(o[i], o_ref_i, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":

@@ -121,9 +121,7 @@ def test_batch_decode_sliding_window(
             vi,
             window_left=window_left,
         )
-        o_i_np = o[i].cpu().numpy()
-        o_ref_i_np = o_ref_i.cpu().numpy()
-        torch.testing.assert_close(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(o[i], o_ref_i, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("seq_len", [1, 3, 19, 99, 199, 1999])
@@ -275,9 +273,8 @@ def test_batch_paged_prefill_sliding_window(
             window_left=window_left,
             causal=True,
         )
-        o_i_np = o[q_indptr[i] : q_indptr[i + 1]].cpu().numpy()
-        o_ref_i_np = o_ref_i.cpu().numpy()
-        torch.testing.assert_close(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
+        o_i = o[q_indptr[i] : q_indptr[i + 1]]
+        torch.testing.assert_close(o_i, o_ref_i, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -336,9 +333,8 @@ def test_batch_ragged_prefill_sliding_window(
             window_left=window_left,
             causal=True,
         )
-        o_i_np = o[q_indptr[i] : q_indptr[i + 1]].cpu().numpy()
-        o_ref_i_np = o_ref_i.cpu().numpy()
-        torch.testing.assert_close(o_i_np, o_ref_i_np, rtol=1e-3, atol=1e-3)
+        o_i = o[q_indptr[i] : q_indptr[i + 1]]
+        torch.testing.assert_close(o_i, o_ref_i, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":

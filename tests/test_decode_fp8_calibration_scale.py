@@ -68,7 +68,7 @@ def test_single_decode_fp8_calibration_scale(
     )
 
     torch.testing.assert_close(
-        o_fp16.cpu().numpy(), o_fp8.cpu().numpy(), atol=1e-2, rtol=2e-2
+        o_fp16, o_fp8, atol=1e-2, rtol=2e-2
     )
 
 
@@ -152,7 +152,7 @@ def test_batch_decode_with_paged_kv_cache_fp8_calibration_scale(
     o_fp8 = wrapper.run(q, kv_data_fp8.to(dtype), k_scale=k_scale, v_scale=v_scale)
 
     torch.testing.assert_close(
-        o_fp16.cpu().numpy(), o_fp8.cpu().numpy(), atol=1e-2, rtol=2e-1
+        o_fp16, o_fp8, atol=1e-2, rtol=2e-1
     )
 
 

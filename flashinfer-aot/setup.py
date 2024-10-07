@@ -68,7 +68,7 @@ def get_instantiation_cu() -> Tuple[List[str], List[str], List[str]]:
     allow_fp16_qk_reduction_options = os.environ.get(
         "FLASHINFER_ALLOW_FP16_QK_REDUCTION_OPTIONS", "0"
     ).split(",")
-    mask_modes = os.environ.get("FLASHINFER_MASK_MODES", "0,1").split(",")
+    mask_modes = os.environ.get("FLASHINFER_MASK_MODES", "0,1,2").split(",")
 
     head_dims = list(map(int, head_dims))
     pos_encoding_modes = list(map(int, pos_encoding_modes))
