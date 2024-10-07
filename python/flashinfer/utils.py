@@ -15,8 +15,9 @@ limitations under the License.
 """
 
 import torch
+import math
 from enum import Enum
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, Dict
 
 
 class PosEncodingMode(Enum):
@@ -25,9 +26,18 @@ class PosEncodingMode(Enum):
     ALIBI = 2
 
 
+class MaskMode(Enum):
+    NON_CAUSAL = 0
+    CAUSAL = 1
+    CUSTOM = 2
+
+
 class TensorLayout(Enum):
     NHD = 0
     HND = 1
+
+
+log2e = 1.44269504088896340736
 
 
 def _expand_5d(x: torch.Tensor, kv_layout: str) -> torch.Tensor:
@@ -105,4 +115,64 @@ def _unpack_paged_kv_cache(
             "Unrecongized paged_kv_cache type {}, expect a single tensor or a tuple of tensor.".format(
                 type(paged_kv_cache)
             )
+        )
+
+
+def get_alibi_slopes(n_heads: int) -> torch.Tensor:
+    n = 2 ** math.floor(math.log2(n_heads))
+    m_0 = 2.0 ** (-8.0 / n)
+    m = torch.pow(m_0, torch.arange(1, 1 + n))
+    if n < n_heads:
+        m_hat_0 = 2.0 ** (-4.0 / n)
+        m_hat = torch.pow(m_hat_0, torch.arange(1, 1 + 2 * (n_heads - n), 2))
+        m = torch.cat([m, m_hat])
+    return m.float()
+
+
+_cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}
+
+
+def _get_cache_buf(name: str, bytes: int, device: torch.device) -> torch.Tensor:
+    key = (name, device)
+    buf = _cache_buf.get(key)
+    if buf is None:
+        buf = torch.empty(bytes, dtype=torch.uint8, device=device)
+        _cache_buf[key] = buf
+    return buf
+
+
+# find the least power of 2 that is greater than or equal to x
+def _ceil_pow2(x: int) -> int:
+    return 1 << (x - 1).bit_length()
+
+
+def _get_range_buf(seq_len: int, device: torch.device) -> torch.Tensor:
+    seq_len_pow2 = _ceil_pow2(seq_len)
+    key = (f"range_{seq_len_pow2}", device)
+    buf = _cache_buf.get(key)
+    if buf is None:
+        buf = torch.arange(seq_len_pow2, device=device, dtype=torch.int32)
+        _cache_buf[key] = buf
+    return buf[:seq_len]
+
+
+def _get_cache_alibi_slopes_buf(
+    num_qo_heads: int, device: torch.device
+) -> torch.Tensor:
+    key = (f"alibi_slopes_{num_qo_heads}", device)
+    buf = _cache_buf.get(key)
+    if buf is None:
+        buf = (get_alibi_slopes(num_qo_heads) * log2e).to(device)
+        _cache_buf[key] = buf
+    return buf
+
+
+def canonicalize_torch_dtype(dtype: Union[torch.dtype, str]) -> torch.dtype:
+    if isinstance(dtype, str):
+        return getattr(torch, dtype)
+    elif isinstance(dtype, torch.dtype):
+        return dtype
+    else:
+        raise TypeError(
+            "dtype must be a string or torch.dtype, got {}".format(type(dtype))
         )

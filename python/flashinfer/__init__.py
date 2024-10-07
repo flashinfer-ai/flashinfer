@@ -63,3 +63,8 @@ try:
 except ImportError:
     with open("version.txt") as f:
         __version__ = f.read().strip()
+
+try:
+    import aot_config
+except ImportError:
+    aot_config = None

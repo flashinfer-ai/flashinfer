@@ -33,7 +33,7 @@ using cp_async::SharedMemFillMode;
  * \brief The CUDA kernel that merges the self-attention state of two index sets A and B.
  * \tparam vec_size The vector size used in the kernel.
  * \tparam DTypeIn The data type of v_a and v_b.
- * \tparam DTypeOut The data type of v_merged.
+ * \tparam DTypeO The data type of v_merged.
  * \param v_a The partial v of index set A. (n, h, d)
  * \param s_a The logsumexp value of index set A. (n, h)
  * \param v_b The partial v of index set B. (n, h, d)
@@ -44,10 +44,10 @@ using cp_async::SharedMemFillMode;
  * \param head_dim The dimension of each head.
  * \note Both s_a and s_b are logsumexp values with base 2.
  */
-template <uint32_t vec_size, typename DTypeIn, typename DTypeOut>
+template <uint32_t vec_size, typename DTypeIn, typename DTypeO>
 __global__ void MergeStateKernel(DTypeIn* __restrict__ v_a, float* __restrict__ s_a,
                                  DTypeIn* __restrict__ v_b, float* __restrict__ s_b,
-                                 DTypeOut* __restrict__ v_merged, float* __restrict__ s_merged,
+                                 DTypeO* __restrict__ v_merged, float* __restrict__ s_merged,
                                  uint32_t num_heads, uint32_t head_dim) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t pos = blockIdx.x;
@@ -141,7 +141,7 @@ __device__ __forceinline__ void threadblock_sync_state(state_t<vec_size>& st, DT
  * \brief The CUDA kernel that merges self-attention states of a list of index sets.
  * \param vec_size The vector size used in the kernel.
  * \tparam DTypeIn The data type of v.
- * \tparam DTypeOut The data type of v_merged.
+ * \tparam DTypeO The data type of v_merged.
  * \param v The partial v of index sets. (n, num_index_sets, h, d)
  * \param s The logsumexp value of index sets. (n, num_index_sets, h)
  * \param v_merged The merged v of index sets union. (n, h, d)
@@ -150,26 +150,26 @@ __device__ __forceinline__ void threadblock_sync_state(state_t<vec_size>& st, DT
  * \param head_dim The dimension of each head.
  * \note s are logsumexp values with base 2.
  */
-template <uint32_t vec_size, typename DTypeIn, typename DTypeOut>
+template <uint32_t vec_size, typename DTypeIn, typename DTypeO>
 __global__ void MergeStatesKernel(DTypeIn* __restrict__ V, float* __restrict__ S,
-                                  DTypeOut* __restrict__ v_merged, float* __restrict__ s_merged,
+                                  DTypeO* __restrict__ v_merged, float* __restrict__ s_merged,
                                   uint32_t num_index_sets, uint32_t num_heads, uint32_t head_dim) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t pos = blockIdx.x;
   uint32_t head_idx = ty;
 
   if (num_index_sets == 0) {
-    vec_t<DTypeOut, vec_size> v;
-    v.fill(DTypeOut(0.f));
+    vec_t<DTypeO, vec_size> v;
+    v.fill(DTypeO(0.f));
     v.store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
     if (s_merged != nullptr) {
-      s_merged[pos * num_heads + head_idx] = -5e4;
+      s_merged[pos * num_heads + head_idx] = -math::inf;
     }
     return;
   }
 
   if (num_index_sets == 1) {
-    vec_t<DTypeOut, vec_size> v;
+    vec_t<DTypeO, vec_size> v;
     v.cast_load(V + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
     v.store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
     if (s_merged != nullptr) {
@@ -205,7 +205,7 @@ __global__ void MergeStatesKernel(DTypeIn* __restrict__ V, float* __restrict__ S
  * \tparam bdy The blockDim.y used in the kernel.
  * \tparam num_smem_stages The number of stages of shared memory used in the kernel.
  * \tparam DTypeIn The data type of v.
- * \tparam DTypeOut The data type of v_merged.
+ * \tparam DTypeO The data type of v_merged.
  * \param V The partial v of index sets. (n, num_index_sets, h, d)
  * \param S The logsumexp value of index sets. (n, num_index_sets, h)
  * \param v_merged The merged v of index sets union. (n, h, d)
@@ -215,9 +215,9 @@ __global__ void MergeStatesKernel(DTypeIn* __restrict__ V, float* __restrict__ S
  * \note s are logsumexp values with base 2.
  */
 template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t num_smem_stages, typename DTypeIn,
-          typename DTypeOut>
+          typename DTypeO>
 __global__ void MergeStatesLargeNumIndexSetsKernel(DTypeIn* __restrict__ V, float* __restrict__ S,
-                                                   DTypeOut* __restrict__ v_merged,
+                                                   DTypeO* __restrict__ v_merged,
                                                    float* __restrict__ s_merged,
                                                    uint32_t num_index_sets, uint32_t num_heads) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
@@ -289,7 +289,7 @@ __global__ void MergeStatesLargeNumIndexSetsKernel(DTypeIn* __restrict__ V, floa
  * \tparam bdy The blockDim.y used in the kernel.
  * \tparam num_smem_stages The number of stages of shared memory used in the kernel.
  * \tparam DTypeIn The data type of v.
- * \tparam DTypeOut The data type of v_merged.
+ * \tparam DTypeO The data type of v_merged.
  * \param V The partial v of index sets. (nnz, h, d)
  * \param S The logsumexp value of index sets. (nnz, h)
  * \param indptr The start offsets of each position in the variable length array.
@@ -300,10 +300,10 @@ __global__ void MergeStatesLargeNumIndexSetsKernel(DTypeIn* __restrict__ V, floa
  * \note s are logsumexp values with base 2.
  */
 template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t num_smem_stages, typename DTypeIn,
-          typename DTypeOut, typename IdType>
+          typename DTypeO, typename IdType>
 __global__ void PersistentVariableLengthMergeStatesKernel(DTypeIn* __restrict__ V,
                                                           float* __restrict__ S, IdType* indptr,
-                                                          DTypeOut* __restrict__ v_merged,
+                                                          DTypeO* __restrict__ v_merged,
                                                           float* __restrict__ s_merged,
                                                           uint32_t seq_len, uint32_t num_heads) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
@@ -324,17 +324,17 @@ __global__ void PersistentVariableLengthMergeStatesKernel(DTypeIn* __restrict__ 
     const uint32_t num_index_sets = indptr[pos + 1] - indptr[pos];
 
     if (num_index_sets == 0) {
-      vec_t<DTypeOut, vec_size> v;
-      v.fill(DTypeOut(0.f));
+      vec_t<DTypeO, vec_size> v;
+      v.fill(DTypeO(0.f));
       v.store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
       if (s_merged != nullptr) {
-        s_merged[pos * num_heads + head_idx] = -5e4;
+        s_merged[pos * num_heads + head_idx] = -math::inf;
       }
       continue;
     }
 
     if (num_index_sets == 1) {
-      vec_t<DTypeOut, vec_size> v;
+      vec_t<DTypeO, vec_size> v;
       v.cast_load(V + (indptr[pos] * num_heads + head_idx) * head_dim + tx * vec_size);
       v.store(v_merged + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
       if (s_merged != nullptr) {
@@ -395,7 +395,7 @@ __global__ void PersistentVariableLengthMergeStatesKernel(DTypeIn* __restrict__ 
 /*!
  * \brief Merge the self-attention state of two index sets A and B.
  * \tparam DTypeIn The data type of v_a and v_b.
- * \tparam DTypeOut The data type of v_merged.
+ * \tparam DTypeO The data type of v_merged.
  * \param v_a The partial v of index set A (n, h, d)
  * \param s_a The logsumexp value of index set A. (n, h)
  * \param v_b The partial v of index set B. (n, h, d)
@@ -409,8 +409,8 @@ __global__ void PersistentVariableLengthMergeStatesKernel(DTypeIn* __restrict__ 
  * \return status Indicates whether CUDA calls are successful
  * \note Both s_a and s_b are logsumexp values with base 2.
  */
-template <typename DTypeIn, typename DTypeOut>
-cudaError_t MergeState(DTypeIn* v_a, float* s_a, DTypeIn* v_b, float* s_b, DTypeOut* v_merged,
+template <typename DTypeIn, typename DTypeO>
+cudaError_t MergeState(DTypeIn* v_a, float* s_a, DTypeIn* v_b, float* s_b, DTypeO* v_merged,
                        float* s_merged, uint32_t seq_len, uint32_t num_heads, uint32_t head_dim,
                        cudaStream_t stream = nullptr) {
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
@@ -419,7 +419,7 @@ cudaError_t MergeState(DTypeIn* v_a, float* s_a, DTypeIn* v_b, float* s_b, DType
     uint32_t bdy = num_heads;
     dim3 nblks(seq_len);
     dim3 nthrs(bdx, bdy);
-    auto kernel = MergeStateKernel<vec_size, DTypeIn, DTypeOut>;
+    auto kernel = MergeStateKernel<vec_size, DTypeIn, DTypeO>;
     void* args[] = {&v_a, &s_a, &v_b, &s_b, &v_merged, &s_merged, &num_heads, &head_dim};
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
   });
@@ -461,7 +461,7 @@ cudaError_t MergeStateInPlace(DType* v, float* s, DType* v_other, float* s_other
 /*!
  * \brief Merge self-attention states of a list of index sets.
  * \tparam DTypeIn The data type of v.
- * \tparam DTypeOut The data type of v_merged.
+ * \tparam DTypeO The data type of v_merged.
  * \param v The partial v of index sets. (n, num_index_sets, h, d)
  * \param s The logsumexp value of index sets. (n, num_index_sets, h)
  * \param v_merged The merged v of index sets union. (n, h, d)
@@ -474,8 +474,8 @@ cudaError_t MergeStateInPlace(DType* v, float* s, DType* v_other, float* s_other
  * \return status Indicates whether CUDA calls are successful
  * \note s are logsumexp values with base 2.
  */
-template <typename DTypeIn, typename DTypeOut>
-cudaError_t MergeStates(DTypeIn* v, float* s, DTypeOut* v_merged, float* s_merged,
+template <typename DTypeIn, typename DTypeO>
+cudaError_t MergeStates(DTypeIn* v, float* s, DTypeO* v_merged, float* s_merged,
                         uint32_t num_index_sets, uint32_t seq_len, uint32_t num_heads,
                         uint32_t head_dim, cudaStream_t stream = nullptr) {
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
@@ -487,8 +487,8 @@ cudaError_t MergeStates(DTypeIn* v, float* s, DTypeOut* v_merged, float* s_merge
       dim3 nblks(seq_len, num_heads);
       dim3 nthrs(bdx, bdy);
       constexpr uint32_t num_smem_stages = 4;
-      auto kernel = MergeStatesLargeNumIndexSetsKernel<vec_size, bdx, bdy, num_smem_stages, DTypeIn,
-                                                       DTypeOut>;
+      auto kernel =
+          MergeStatesLargeNumIndexSetsKernel<vec_size, bdx, bdy, num_smem_stages, DTypeIn, DTypeO>;
       void* args[] = {&v, &s, &v_merged, &s_merged, &num_index_sets, &num_heads};
       uint32_t smem_size =
           num_smem_stages * bdy * head_dim * sizeof(DTypeIn) + num_threads * sizeof(float);
@@ -499,7 +499,7 @@ cudaError_t MergeStates(DTypeIn* v, float* s, DTypeOut* v_merged, float* s_merge
       uint32_t bdy = num_heads;
       dim3 nblks(seq_len);
       dim3 nthrs(bdx, bdy);
-      auto kernel = MergeStatesKernel<vec_size, DTypeIn, DTypeOut>;
+      auto kernel = MergeStatesKernel<vec_size, DTypeIn, DTypeO>;
       void* args[] = {&v, &s, &v_merged, &s_merged, &num_index_sets, &num_heads, &head_dim};
       FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
     }
@@ -507,8 +507,8 @@ cudaError_t MergeStates(DTypeIn* v, float* s, DTypeOut* v_merged, float* s_merge
   return cudaSuccess;
 }
 
-template <typename DTypeIn, typename DTypeOut, typename IdType>
-cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* indptr, DTypeOut* v_merged,
+template <typename DTypeIn, typename DTypeO, typename IdType>
+cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* indptr, DTypeO* v_merged,
                                       float* s_merged, uint32_t seq_len, uint32_t num_heads,
                                       uint32_t head_dim, cudaStream_t stream = nullptr) {
   int dev_id = 0;
@@ -526,7 +526,7 @@ cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* indptr, DTyp
     uint32_t smem_size =
         num_smem_stages * bdy * head_dim * sizeof(DTypeIn) + num_threads * sizeof(float);
     auto kernel = PersistentVariableLengthMergeStatesKernel<vec_size, bdx, bdy, num_smem_stages,
-                                                            DTypeIn, DTypeOut, IdType>;
+                                                            DTypeIn, DTypeO, IdType>;
     FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
                                                                        num_threads, smem_size));
     num_blocks_per_sm = min(num_blocks_per_sm, ceil_div(seq_len * num_heads, num_sms));

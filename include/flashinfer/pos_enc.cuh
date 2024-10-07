@@ -265,7 +265,7 @@ __global__ void BatchQKApplyRotaryKernel(DType* __restrict__ q, DType* __restric
         } else {
           k_vec = vec_apply_llama_rope<vec_size, bdx>(k_ptr, freq, offset + i * bdy + ty);
         }
-        k_vec.cast_store(k_rope_ptr + +tx * vec_size);
+        k_vec.cast_store(k_rope_ptr + tx * vec_size);
       }
     }
   }

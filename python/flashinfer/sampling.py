@@ -16,19 +16,28 @@ limitations under the License.
 
 import torch
 from typing import Tuple, Union, Optional
+from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR, has_prebuilt_ops
 
-# mypy: disable-error-code="attr-defined"
-try:
-    from . import _kernels
-except ImportError as e:
-    import os
-    import logging
 
-    if os.environ.get("BUILD_DOC", "0") == "1":
-        _kernels = None
-        logging.warning("Kernels are not loaded in documentation build mode.")
-    else:
-        raise e
+_sampling_module = None
+
+
+def get_sampling_module():
+    global _sampling_module
+    if _sampling_module is None:
+        if has_prebuilt_ops:
+            from . import _kernels
+
+            _sampling_module = _kernels
+        else:
+            _sampling_module = load_cuda_ops(
+                "sampling",
+                [
+                    FLASHINFER_CSRC_DIR / "sampling.cu",
+                    FLASHINFER_CSRC_DIR / "flashinfer_sampling_ops.cu",
+                ],
+            )
+    return _sampling_module
 
 
 def _to_tensor_scalar_tuple(x):
@@ -90,7 +99,9 @@ def sampling_from_probs(
     if check_nan:
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
-    return _kernels.sampling_from_probs(probs, uniform_samples, deterministic)
+    return get_sampling_module().sampling_from_probs(
+        probs, uniform_samples, deterministic
+    )
 
 
 def top_p_sampling_from_probs(
@@ -170,7 +181,7 @@ def top_p_sampling_from_probs(
     if check_nan:
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
-    return _kernels.top_p_sampling_from_probs(
+    return get_sampling_module().top_p_sampling_from_probs(
         probs, uniform_samples, *_to_tensor_scalar_tuple(top_p), deterministic
     )
 
@@ -252,7 +263,7 @@ def top_k_sampling_from_probs(
     if check_nan:
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
-    return _kernels.top_k_sampling_from_probs(
+    return get_sampling_module().top_k_sampling_from_probs(
         probs, uniform_samples, *_to_tensor_scalar_tuple(top_k), deterministic
     )
 
@@ -330,7 +341,7 @@ def min_p_sampling_from_probs(
     if check_nan:
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
-    return _kernels.min_p_sampling_from_probs(
+    return get_sampling_module().min_p_sampling_from_probs(
         probs, uniform_samples, *_to_tensor_scalar_tuple(min_p), deterministic
     )
 
@@ -441,7 +452,7 @@ def top_k_top_p_sampling_from_logits(
         if check_nan:
             if torch.any(torch.isnan(probs)):
                 raise ValueError("Input probs contains NaN.")
-        return _kernels.top_k_top_p_sampling_from_probs(
+        return get_sampling_module().top_k_top_p_sampling_from_probs(
             probs,
             uniform_samples,
             *_to_tensor_scalar_tuple(top_k),
@@ -549,7 +560,7 @@ def top_k_top_p_sampling_from_probs(
         if check_nan:
             if torch.any(torch.isnan(probs)):
                 raise ValueError("Input probs contains NaN.")
-        return _kernels.top_k_top_p_sampling_from_probs(
+        return get_sampling_module().top_k_top_p_sampling_from_probs(
             probs,
             uniform_samples,
             *_to_tensor_scalar_tuple(top_k),
@@ -617,7 +628,9 @@ def top_p_renorm_probs(
     sampling_from_probs
     top_k_renorm_probs
     """
-    return _kernels.top_p_renorm_probs(probs, *_to_tensor_scalar_tuple(top_p))
+    return get_sampling_module().top_p_renorm_probs(
+        probs, *_to_tensor_scalar_tuple(top_p)
+    )
 
 
 top_p_renorm_prob = top_p_renorm_probs
@@ -679,7 +692,9 @@ def top_k_renorm_probs(
     sampling_from_probs
     top_p_renorm_probs
     """
-    return _kernels.top_k_renorm_probs(probs, *_to_tensor_scalar_tuple(top_k))
+    return get_sampling_module().top_k_renorm_probs(
+        probs, *_to_tensor_scalar_tuple(top_k)
+    )
 
 
 top_k_renorm_prob = top_k_renorm_probs
@@ -736,7 +751,9 @@ def top_k_mask_logits(
     --------
     top_k_renorm_probs
     """
-    return _kernels.top_k_mask_logits(logits, *_to_tensor_scalar_tuple(top_k))
+    return get_sampling_module().top_k_mask_logits(
+        logits, *_to_tensor_scalar_tuple(top_k)
+    )
 
 
 def chain_speculative_sampling(
@@ -830,7 +847,7 @@ def chain_speculative_sampling(
     >>> output_emitted_token_num
     tensor([1], device='cuda:0')
     """
-    return _kernels.chain_speculative_sampling(
+    return get_sampling_module().chain_speculative_sampling(
         draft_probs,
         draft_token_ids,
         uniform_samples,

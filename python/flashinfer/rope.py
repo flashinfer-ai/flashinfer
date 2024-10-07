@@ -15,19 +15,28 @@ limitations under the License.
 """
 
 import torch
+from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR, has_prebuilt_ops
 
-# mypy: disable-error-code="attr-defined"
-try:
-    from . import _kernels
-except ImportError as e:
-    import os
-    import logging
 
-    if os.environ.get("BUILD_DOC", "0") == "1":
-        _kernels = None
-        logging.warning("Kernels are not loaded in documentation build mode.")
-    else:
-        raise e
+_rope_module = None
+
+
+def get_rope_module():
+    global _rope_module
+    if _rope_module is None:
+        if has_prebuilt_ops:
+            from . import _kernels
+
+            _rope_module = _kernels
+        else:
+            _rope_module = load_cuda_ops(
+                "rope",
+                [
+                    FLASHINFER_CSRC_DIR / "rope.cu",
+                    FLASHINFER_CSRC_DIR / "flashinfer_rope_ops.cu",
+                ],
+            )
+    return _rope_module
 
 
 def apply_rope_inplace(
@@ -105,7 +114,7 @@ def apply_rope_inplace(
     --------
     apply_rope
     """
-    return _kernels.apply_rope_inplace(
+    return get_rope_module().apply_rope_inplace(
         q, k, indptr, offsets, interleave, rope_scale, rope_theta
     )
 
@@ -195,7 +204,7 @@ def apply_llama31_rope_inplace(
     --------
     apply_llama31_rope
     """
-    return _kernels.apply_llama31_rope_inplace(
+    return get_rope_module().apply_llama31_rope_inplace(
         q,
         k,
         indptr,
@@ -295,7 +304,7 @@ def apply_rope(
     --------
     apply_rope_inplace
     """
-    return _kernels.apply_rope(
+    return get_rope_module().apply_rope(
         q, k, indptr, offsets, interleave, rope_scale, rope_theta
     )
 
@@ -396,7 +405,7 @@ def apply_llama31_rope(
     --------
     apply_llama31_rope_inplace
     """
-    return _kernels.apply_llama31_rope(
+    return get_rope_module().apply_llama31_rope(
         q,
         k,
         indptr,

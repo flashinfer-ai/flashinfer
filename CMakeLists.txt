@@ -40,7 +40,6 @@ flashinfer_option(FLASHINFER_TVM_SOURCE_DIR "The path to tvm for building tvm bi
 # The following configurations can impact the binary
 # size of the generated library
 flashinfer_option(FLASHINFER_GEN_HEAD_DIMS "Head dims to enable" 64 128 256)
-flashinfer_option(FLASHINFER_GEN_LOGITS_POST_HOOKS "Logits post hooks" 0 1)
 flashinfer_option(FLASHINFER_GEN_POS_ENCODING_MODES "Pos encodings to enable" 0 1 2)
 flashinfer_option(FLASHINFER_GEN_ALLOW_FP16_QK_REDUCTIONS "QK reductions to enable" "false" "true")
 flashinfer_option(FLASHINFER_GEN_MASK_MODES "Mask modes to enable" 0 1 2)
@@ -81,7 +80,6 @@ endif(FLASHINFER_ENABLE_BF16)
 
 # generate kernel inst
 set (HEAD_DIMS ${FLASHINFER_GEN_HEAD_DIMS})
-set (LOGITS_POST_HOOKS ${FLASHINFER_GEN_LOGITS_POST_HOOKS})
 set (POS_ENCODING_MODES ${FLASHINFER_GEN_POS_ENCODING_MODES})
 set (ALLOW_FP16_QK_REDUCTIONS ${FLASHINFER_GEN_ALLOW_FP16_QK_REDUCTIONS})
 set (MASK_MODES ${FLASHINFER_GEN_MASK_MODES})
@@ -112,8 +110,8 @@ file(MAKE_DIRECTORY ${PROJECT_SOURCE_DIR}/src/generated)
 set(dispatch_inc_file ${PROJECT_SOURCE_DIR}/src/dispatch.inc)
 add_custom_command(
   OUTPUT ${dispatch_inc_file}
-  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_dispatch_inc.py --path ${PROJECT_SOURCE_DIR}/src/dispatch.inc --head_dims ${HEAD_DIMS} --logits_post_hooks ${LOGITS_POST_HOOKS} --pos_encoding_modes ${POS_ENCODING_MODES} --allow_fp16_qk_reductions ${ALLOW_FP16_QK_REDUCTIONS} --mask_modes ${MASK_MODES}
-  DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_dispatch_inc.py
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/flashinfer-aot/generate_dispatch_inc.py --path ${PROJECT_SOURCE_DIR}/src/dispatch.inc --head_dims ${HEAD_DIMS} --pos_encoding_modes ${POS_ENCODING_MODES} --allow_fp16_qk_reductions ${ALLOW_FP16_QK_REDUCTIONS} --mask_modes ${MASK_MODES}
+  DEPENDS ${PROJECT_SOURCE_DIR}/flashinfer-aot/generate_dispatch_inc.py
   COMMENT "Generating additional source file ${generated_dispatch_inc}"
   VERBATIM
 )
@@ -121,69 +119,65 @@ add_custom_target(dispatch_inc DEPENDS ${dispatch_inc_file})
 
 # single decode kernel inst generation
 foreach(head_dim IN LISTS HEAD_DIMS)
-  foreach(logits_post_hook IN LISTS LOGITS_POST_HOOKS)
-    foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
-      foreach(dtype IN LISTS DECODE_DTYPES)
-        set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_decode_head_${head_dim}_logitshook_${logits_post_hook}_posenc_${pos_encoding_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_${dtype}.cu)
-        add_custom_command(
-          OUTPUT ${generated_kernel_src}
-          COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_single_decode_inst.py ${generated_kernel_src}
-          DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_single_decode_inst.py
-          COMMENT "Generating additional source file ${generated_kernel_src}"
-          VERBATIM
-        )
-        list(APPEND single_decode_kernels_src ${generated_kernel_src})
-      endforeach(dtype)
+  foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
+    foreach(dtype IN LISTS DECODE_DTYPES)
+      set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_decode_head_${head_dim}_posenc_${pos_encoding_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_${dtype}.cu)
+      add_custom_command(
+        OUTPUT ${generated_kernel_src}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/flashinfer-aot/generate_single_decode_inst.py ${generated_kernel_src}
+        DEPENDS ${PROJECT_SOURCE_DIR}/flashinfer-aot/generate_single_decode_inst.py
+        COMMENT "Generating additional source file ${generated_kernel_src}"
+        VERBATIM
+      )
+      list(APPEND single_decode_kernels_src ${generated_kernel_src})
+    endforeach(dtype)
 
-      # fp8 kv-cache
-      foreach(dtype_kv IN LISTS DECODE_FP8_DTYPES)
-        set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_decode_head_${head_dim}_logitshook_${logits_post_hook}_posenc_${pos_encoding_mode}_dtypeq_f16_dtypekv_${dtype_kv}_dtypeout_f16.cu)
-        add_custom_command(
-          OUTPUT ${generated_kernel_src}
-          COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_single_decode_inst.py ${generated_kernel_src}
-          DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_single_decode_inst.py
-          COMMENT "Generating additional source file ${generated_kernel_src}"
-          VERBATIM
-        )
-        list(APPEND single_decode_kernels_src ${generated_kernel_src})
-      endforeach(dtype_kv)
-    endforeach(pos_encoding_mode)
-  endforeach(logits_post_hook)
+    # fp8 kv-cache
+    foreach(dtype_kv IN LISTS DECODE_FP8_DTYPES)
+      set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_decode_head_${head_dim}_posenc_${pos_encoding_mode}_dtypeq_f16_dtypekv_${dtype_kv}_dtypeout_f16.cu)
+      add_custom_command(
+        OUTPUT ${generated_kernel_src}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/flashinfer-aot/generate_single_decode_inst.py ${generated_kernel_src}
+        DEPENDS ${PROJECT_SOURCE_DIR}/flashinfer-aot/generate_single_decode_inst.py
+        COMMENT "Generating additional source file ${generated_kernel_src}"
+        VERBATIM
+      )
+      list(APPEND single_decode_kernels_src ${generated_kernel_src})
+    endforeach(dtype_kv)
+  endforeach(pos_encoding_mode)
 endforeach(head_dim)
 
 # batch decode kernel inst generation
 foreach(head_dim IN LISTS HEAD_DIMS)
-  foreach(logits_post_hook IN LISTS LOGITS_POST_HOOKS)
-    foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
-      # paged kv-cache
-      foreach(idtype IN LISTS IDTYPES)
-        foreach(dtype IN LISTS DECODE_DTYPES)
-          set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_decode_head_${head_dim}_logitshook_${logits_post_hook}_posenc_${pos_encoding_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
-          add_custom_command(
-            OUTPUT ${generated_kernel_src}
-            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_decode_inst.py ${generated_kernel_src}
-            DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_decode_inst.py
-            COMMENT "Generating additional source file ${generated_kernel_src}"
-            VERBATIM
-          )
-          list(APPEND batch_decode_kernels_src ${generated_kernel_src})
-        endforeach(dtype)
+  foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
+    # paged kv-cache
+    foreach(idtype IN LISTS IDTYPES)
+      foreach(dtype IN LISTS DECODE_DTYPES)
+        set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_decode_head_${head_dim}_posenc_${pos_encoding_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
+        add_custom_command(
+          OUTPUT ${generated_kernel_src}
+          COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/flashinfer-aot/generate_batch_paged_decode_inst.py ${generated_kernel_src}
+          DEPENDS ${PROJECT_SOURCE_DIR}/flashinfer-aot/generate_batch_paged_decode_inst.py
+          COMMENT "Generating additional source file ${generated_kernel_src}"
+          VERBATIM
+        )
+        list(APPEND batch_decode_kernels_src ${generated_kernel_src})
+      endforeach(dtype)
 
-        # fp8 kv-cache
-        foreach(dtype_kv IN LISTS DECODE_FP8_DTYPES)
-          set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_decode_head_${head_dim}_logitshook_${logits_post_hook}_posenc_${pos_encoding_mode}_dtypeq_f16_dtypekv_${dtype_kv}_dtypeout_f16_idtype_${idtype}.cu)
-          add_custom_command(
-            OUTPUT ${generated_kernel_src}
-            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_decode_inst.py ${generated_kernel_src}
-            DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_decode_inst.py
-            COMMENT "Generating additional source file ${generated_kernel_src}"
-            VERBATIM
-          )
-          list(APPEND batch_decode_kernels_src ${generated_kernel_src})
-        endforeach(dtype_kv)
-      endforeach(idtype)
-    endforeach(pos_encoding_mode)
-  endforeach(logits_post_hook)
+      # fp8 kv-cache
+      foreach(dtype_kv IN LISTS DECODE_FP8_DTYPES)
+        set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_decode_head_${head_dim}_posenc_${pos_encoding_mode}_dtypeq_f16_dtypekv_${dtype_kv}_dtypeout_f16_idtype_${idtype}.cu)
+        add_custom_command(
+          OUTPUT ${generated_kernel_src}
+          COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/flashinfer-aot/generate_batch_paged_decode_inst.py ${generated_kernel_src}
+          DEPENDS ${PROJECT_SOURCE_DIR}/flashinfer-aot/generate_batch_paged_decode_inst.py
+          COMMENT "Generating additional source file ${generated_kernel_src}"
+          VERBATIM
+        )
+        list(APPEND batch_decode_kernels_src ${generated_kernel_src})
+      endforeach(dtype_kv)
+    endforeach(idtype)
+  endforeach(pos_encoding_mode)
 endforeach(head_dim)
 
 add_library(decode_kernels STATIC ${single_decode_kernels_src} ${batch_decode_kernels_src})
@@ -192,111 +186,105 @@ target_compile_options(decode_kernels PRIVATE -Xcompiler=-fPIC --fatbin-options 
 
 # single prefill kernel inst generation
 foreach(head_dim IN LISTS HEAD_DIMS)
-  foreach(logits_post_hook IN LISTS LOGITS_POST_HOOKS)
-    foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
-      foreach(allow_fp16_qk_reduction IN LISTS ALLOW_FP16_QK_REDUCTIONS)
-        foreach(mask_mode IN LISTS MASK_MODES)
-          foreach(dtype IN LISTS PREFILL_DTYPES)
-            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_prefill_head_${head_dim}_logitshook_${logits_post_hook}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_${dtype}.cu)
-            add_custom_command(
-              OUTPUT ${generated_kernel_src}
-              COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_single_prefill_inst.py ${generated_kernel_src}
-              DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_single_prefill_inst.py
-              COMMENT "Generating additional source file ${generated_kernel_src}"
-              VERBATIM
-            )
-            list(APPEND single_prefill_kernels_src ${generated_kernel_src})
-          endforeach(dtype)
+  foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
+    foreach(allow_fp16_qk_reduction IN LISTS ALLOW_FP16_QK_REDUCTIONS)
+      foreach(mask_mode IN LISTS MASK_MODES)
+        foreach(dtype IN LISTS PREFILL_DTYPES)
+          set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_prefill_head_${head_dim}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_${dtype}.cu)
+          add_custom_command(
+            OUTPUT ${generated_kernel_src}
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/flashinfer-aot/generate_single_prefill_inst.py ${generated_kernel_src}
+            DEPENDS ${PROJECT_SOURCE_DIR}/flashinfer-aot/generate_single_prefill_inst.py
+            COMMENT "Generating additional source file ${generated_kernel_src}"
+            VERBATIM
+          )
+          list(APPEND single_prefill_kernels_src ${generated_kernel_src})
+        endforeach(dtype)
 
-          foreach(dtype_kv IN LISTS PREFILL_FP8_DTYPES)
-            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_prefill_head_${head_dim}_logitshook_${logits_post_hook}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypeq_f16_dtypekv_${dtype_kv}_dtypeout_f16.cu)
-            add_custom_command(
-              OUTPUT ${generated_kernel_src}
-              COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_single_prefill_inst.py ${generated_kernel_src}
-              DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_single_prefill_inst.py
-              COMMENT "Generating additional source file ${generated_kernel_src}"
-              VERBATIM
-            )
-            list(APPEND single_prefill_kernels_src ${generated_kernel_src})
-          endforeach(dtype_kv)
-        endforeach(mask_mode)
-      endforeach(allow_fp16_qk_reduction)
-    endforeach(pos_encoding_mode)
-  endforeach(logits_post_hook)
+        foreach(dtype_kv IN LISTS PREFILL_FP8_DTYPES)
+          set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/single_prefill_head_${head_dim}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypeq_f16_dtypekv_${dtype_kv}_dtypeout_f16.cu)
+          add_custom_command(
+            OUTPUT ${generated_kernel_src}
+            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/flashinfer-aot/generate_single_prefill_inst.py ${generated_kernel_src}
+            DEPENDS ${PROJECT_SOURCE_DIR}/flashinfer-aot/generate_single_prefill_inst.py
+            COMMENT "Generating additional source file ${generated_kernel_src}"
+            VERBATIM
+          )
+          list(APPEND single_prefill_kernels_src ${generated_kernel_src})
+        endforeach(dtype_kv)
+      endforeach(mask_mode)
+    endforeach(allow_fp16_qk_reduction)
+  endforeach(pos_encoding_mode)
 endforeach(head_dim)
 
 # batch paged prefill kernel inst generation
 foreach(head_dim IN LISTS HEAD_DIMS)
-  foreach(logits_post_hook IN LISTS LOGITS_POST_HOOKS)
-    foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
-      foreach(allow_fp16_qk_reduction IN LISTS ALLOW_FP16_QK_REDUCTIONS)
-        foreach(mask_mode IN LISTS MASK_MODES)
-          foreach(idtype IN LISTS IDTYPES)
-            foreach(dtype IN LISTS PREFILL_DTYPES)
-              set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_prefill_head_${head_dim}_logitshook_${logits_post_hook}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
-              add_custom_command(
-                OUTPUT ${generated_kernel_src}
-                COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py ${generated_kernel_src}
-                DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py
-                COMMENT "Generating additional source file ${generated_kernel_src}"
-                VERBATIM
-              )
-              list(APPEND batch_paged_prefill_kernels_src ${generated_kernel_src})
-            endforeach(dtype)
+  foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
+    foreach(allow_fp16_qk_reduction IN LISTS ALLOW_FP16_QK_REDUCTIONS)
+      foreach(mask_mode IN LISTS MASK_MODES)
+        foreach(idtype IN LISTS IDTYPES)
+          foreach(dtype IN LISTS PREFILL_DTYPES)
+            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_prefill_head_${head_dim}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
+            add_custom_command(
+              OUTPUT ${generated_kernel_src}
+              COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/flashinfer-aot/generate_batch_paged_prefill_inst.py ${generated_kernel_src}
+              DEPENDS ${PROJECT_SOURCE_DIR}/flashinfer-aot/generate_batch_paged_prefill_inst.py
+              COMMENT "Generating additional source file ${generated_kernel_src}"
+              VERBATIM
+            )
+            list(APPEND batch_paged_prefill_kernels_src ${generated_kernel_src})
+          endforeach(dtype)
 
-            foreach(dtype_kv IN LISTS PREFILL_FP8_DTYPES)
-              set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_prefill_head_${head_dim}_logitshook_${logits_post_hook}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypeq_f16_dtypekv_${dtype_kv}_dtypeout_f16_idtype_${idtype}.cu)
-              add_custom_command(
-                OUTPUT ${generated_kernel_src}
-                COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py ${generated_kernel_src}
-                DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_paged_prefill_inst.py
-                COMMENT "Generating additional source file ${generated_kernel_src}"
-                VERBATIM
-              )
-              list(APPEND batch_paged_prefill_kernels_src ${generated_kernel_src})
-            endforeach(dtype_kv)
-          endforeach(idtype)
-        endforeach(mask_mode)
-      endforeach(allow_fp16_qk_reduction)
-    endforeach(pos_encoding_mode)
-  endforeach(logits_post_hook)
+          foreach(dtype_kv IN LISTS PREFILL_FP8_DTYPES)
+            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_prefill_head_${head_dim}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypeq_f16_dtypekv_${dtype_kv}_dtypeout_f16_idtype_${idtype}.cu)
+            add_custom_command(
+              OUTPUT ${generated_kernel_src}
+              COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/flashinfer-aot/generate_batch_paged_prefill_inst.py ${generated_kernel_src}
+              DEPENDS ${PROJECT_SOURCE_DIR}/flashinfer-aot/generate_batch_paged_prefill_inst.py
+              COMMENT "Generating additional source file ${generated_kernel_src}"
+              VERBATIM
+            )
+            list(APPEND batch_paged_prefill_kernels_src ${generated_kernel_src})
+          endforeach(dtype_kv)
+        endforeach(idtype)
+      endforeach(mask_mode)
+    endforeach(allow_fp16_qk_reduction)
+  endforeach(pos_encoding_mode)
 endforeach(head_dim)
 
 # batch ragged prefill kernel inst generation
 foreach(head_dim IN LISTS HEAD_DIMS)
-  foreach(logits_post_hook IN LISTS LOGITS_POST_HOOKS)
-    foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
-      foreach(allow_fp16_qk_reduction IN LISTS ALLOW_FP16_QK_REDUCTIONS)
-        foreach(mask_mode IN LISTS MASK_MODES)
-          foreach(idtype IN LISTS IDTYPES)
-            foreach(dtype IN LISTS PREFILL_DTYPES)
-              set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_ragged_prefill_head_${head_dim}_logitshook_${logits_post_hook}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
-              add_custom_command(
-                OUTPUT ${generated_kernel_src}
-                COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_ragged_prefill_inst.py ${generated_kernel_src}
-                DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_ragged_prefill_inst.py
-                COMMENT "Generating additional source file ${generated_kernel_src}"
-                VERBATIM
-              )
-              list(APPEND batch_ragged_prefill_kernels_src ${generated_kernel_src})
-            endforeach(dtype)
+  foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
+    foreach(allow_fp16_qk_reduction IN LISTS ALLOW_FP16_QK_REDUCTIONS)
+      foreach(mask_mode IN LISTS MASK_MODES)
+        foreach(idtype IN LISTS IDTYPES)
+          foreach(dtype IN LISTS PREFILL_DTYPES)
+            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_ragged_prefill_head_${head_dim}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu)
+            add_custom_command(
+              OUTPUT ${generated_kernel_src}
+              COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/flashinfer-aot/generate_batch_ragged_prefill_inst.py ${generated_kernel_src}
+              DEPENDS ${PROJECT_SOURCE_DIR}/flashinfer-aot/generate_batch_ragged_prefill_inst.py
+              COMMENT "Generating additional source file ${generated_kernel_src}"
+              VERBATIM
+            )
+            list(APPEND batch_ragged_prefill_kernels_src ${generated_kernel_src})
+          endforeach(dtype)
 
-            foreach(dtype_kv IN LISTS PREFILL_FP8_DTYPES)
-              set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_ragged_prefill_head_${head_dim}_logitshook_${logits_post_hook}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypeq_f16_dtypekv_${dtype_kv}_dtypeout_f16_idtype_${idtype}.cu)
-              add_custom_command(
-                OUTPUT ${generated_kernel_src}
-                COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/python/generate_batch_ragged_prefill_inst.py ${generated_kernel_src}
-                DEPENDS ${PROJECT_SOURCE_DIR}/python/generate_batch_ragged_prefill_inst.py
-                COMMENT "Generating additional source file ${generated_kernel_src}"
-                VERBATIM
-              )
-              list(APPEND batch_ragged_prefill_kernels_src ${generated_kernel_src})
-            endforeach(dtype_kv)
-          endforeach(idtype)
-        endforeach(mask_mode)
-      endforeach(allow_fp16_qk_reduction)
-    endforeach(pos_encoding_mode)
-  endforeach(logits_post_hook)
+          foreach(dtype_kv IN LISTS PREFILL_FP8_DTYPES)
+            set(generated_kernel_src ${PROJECT_SOURCE_DIR}/src/generated/batch_ragged_prefill_head_${head_dim}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypeq_f16_dtypekv_${dtype_kv}_dtypeout_f16_idtype_${idtype}.cu)
+            add_custom_command(
+              OUTPUT ${generated_kernel_src}
+              COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/flashinfer-aot/generate_batch_ragged_prefill_inst.py ${generated_kernel_src}
+              DEPENDS ${PROJECT_SOURCE_DIR}/flashinfer-aot/generate_batch_ragged_prefill_inst.py
+              COMMENT "Generating additional source file ${generated_kernel_src}"
+              VERBATIM
+            )
+            list(APPEND batch_ragged_prefill_kernels_src ${generated_kernel_src})
+          endforeach(dtype_kv)
+        endforeach(idtype)
+      endforeach(mask_mode)
+    endforeach(allow_fp16_qk_reduction)
+  endforeach(pos_encoding_mode)
 endforeach(head_dim)
 
 add_library(prefill_kernels STATIC ${single_prefill_kernels_src} ${batch_paged_prefill_kernels_src} ${batch_ragged_prefill_kernels_src})
@@ -487,8 +475,6 @@ if(FLASHINFER_FASTDEQUANT_TEST)
   target_include_directories(test_fast_dequant PRIVATE ${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
   target_link_libraries(test_fast_dequant PRIVATE gtest gtest_main)
 endif(FLASHINFER_FASTDEQUANT_TEST)
-
-
 
 if (FLASHINFER_DISTRIBUTED)
   find_package(MPI REQUIRED)

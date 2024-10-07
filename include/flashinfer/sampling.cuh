@@ -19,6 +19,7 @@
 #include <cub/block/block_adjacent_difference.cuh>
 #include <cub/block/block_reduce.cuh>
 #include <cub/block/block_scan.cuh>
+#include <cuda/std/limits>
 #include <numeric>
 
 #include "math.cuh"
@@ -939,7 +940,7 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   const uint32_t row_idx = bx;
   uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[bx];
-  float pivot = -std::numeric_limits<float>::infinity();
+  float pivot = -cuda::std::numeric_limits<float>::infinity();
   vec_t<DType, VEC_SIZE> logits_vec;
   if (k < d) {
     extern __shared__ __align__(alignof(RenormTempStorage<DType, BLOCK_THREADS, REDUCE_ALGO>))
@@ -948,8 +949,8 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
         reinterpret_cast<RenormTempStorage<DType, BLOCK_THREADS, REDUCE_ALGO>&>(smem_renorm);
     DType logits_greater_than_pivot[VEC_SIZE];  // pivot initialized to 0
 
-    DType threadlocal_max_val = DType(-std::numeric_limits<float>::infinity()),
-          threadlocal_min_val = DType(std::numeric_limits<float>::infinity());
+    DType threadlocal_max_val = DType(-cuda::std::numeric_limits<float>::infinity()),
+          threadlocal_min_val = DType(cuda::std::numeric_limits<float>::infinity());
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
       logits_vec.fill(DType(0));
       if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
@@ -1047,8 +1048,9 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      logits_vec[j] =
-          (logits_vec[j] > pivot) ? logits_vec[j] : DType(-std::numeric_limits<float>::infinity());
+      logits_vec[j] = (logits_vec[j] > pivot)
+                          ? logits_vec[j]
+                          : DType(-cuda::std::numeric_limits<float>::infinity());
     }
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
       logits_vec.store(masked_logits + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
@@ -1063,7 +1065,7 @@ __global__ void TopKRenormProbKernel(DType* probs, DType* renormed_prob, IdType*
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   const uint32_t row_idx = bx;
   uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[bx];
-  float pivot = -std::numeric_limits<float>::infinity(), normalizer = 1;
+  float pivot = -cuda::std::numeric_limits<float>::infinity(), normalizer = 1;
   vec_t<DType, VEC_SIZE> probs_vec;
   if (k < d) {
     extern __shared__ __align__(alignof(RenormTempStorage<DType, BLOCK_THREADS, REDUCE_ALGO>))

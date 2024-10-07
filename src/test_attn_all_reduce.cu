@@ -13,7 +13,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <driver_types.h>
 #include <mpi.h>
 #include <spdlog/spdlog.h>
 #include <thrust/detail/raw_pointer_cast.h>

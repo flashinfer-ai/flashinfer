@@ -15,28 +15,19 @@ limitations under the License.
 """
 
 import math
-from typing import Optional
+from typing import Optional, Union, Tuple
 import logging
 import torch
-from .prefill import _compute_page_qk_indptr
+from .prefill import _compute_page_qk_indptr, get_batch_prefill_module
 from .quantization import segment_packbits
 from .utils import (
     _check_pos_encoding_mode,
+    _get_cache_alibi_slopes_buf,
+    canonicalize_torch_dtype,
     PosEncodingMode,
+    MaskMode,
     TensorLayout,
 )
-
-# mypy: disable-error-code="attr-defined"
-try:
-    from . import _prefill
-except ImportError as e:
-    import os
-
-    if os.environ.get("BUILD_DOC", "0") == "1":
-        _prefill = None
-        logging.warning("Kernels are not loaded in documentation build mode.")
-    else:
-        raise e
 
 
 def convert_bsr_mask_layout(mask: torch.Tensor, indptr: torch.Tensor) -> torch.Tensor:
@@ -123,13 +114,17 @@ class BlockSparseAttentionWrapper:
             buffer should be the same as the device of the input tensors.
         """
         self._float_workspace_buffer = float_workspace_buffer
+        self.device = float_workspace_buffer.device
         self._int_workspace_buffer = torch.empty(
             (8 * 1024 * 1024,), dtype=torch.uint8, device=float_workspace_buffer.device
         )
-        self._wrapper = _prefill.BatchPrefillWithPagedKVCachePyTorchWrapper(
-            TensorLayout["NHD"].value,
-            False,  # use_cuda_graph
+        self._pin_memory_int_workspace_buffer = torch.empty(
+            self._int_workspace_buffer.shape,
+            dtype=self._int_workspace_buffer.dtype,
+            pin_memory=True,
         )
+        self._use_cuda_graph = False
+        self._kv_layout = "NHD"
         self._qo_indptr: Optional[torch.Tensor] = None
         self._paged_kv_indptr_buf: Optional[torch.Tensor] = None
         self._paged_kv_indices_buf: Optional[torch.Tensor] = None
@@ -142,7 +137,7 @@ class BlockSparseAttentionWrapper:
         self.N: Optional[int] = None
 
     def reset_workspace_buffer(
-        self, float_workspace_buffer: torch.Tensor, int_workspace_buffer
+        self, float_workspace_buffer: torch.Tensor, int_workspace_buffer: torch.Tensor
     ) -> None:
         r"""Reset the workspace buffer.
 
@@ -158,8 +153,10 @@ class BlockSparseAttentionWrapper:
         """
         self._float_workspace_buffer = float_workspace_buffer
         self._int_workspace_buffer = int_workspace_buffer
-        self._wrapper.update_page_locked_buffer_size(
-            int_workspace_buffer.numel() * int_workspace_buffer.element_size()
+        self._pin_memory_int_workspace_buffer = torch.empty(
+            self._int_workspace_buffer.shape,
+            dtype=self._int_workspace_buffer.dtype,
+            pin_memory=True,
         )
 
     def plan(
@@ -181,7 +178,8 @@ class BlockSparseAttentionWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
-        q_data_type: str = "float16",
+        q_data_type: Union[str, torch.dtype] = "float16",
+        kv_data_type: Optional[Union[str, torch.dtype]] = None,
     ) -> None:
         r"""Create auxiliary data structures for block sparse attention.
 
@@ -235,10 +233,10 @@ class BlockSparseAttentionWrapper:
             ``1.0``.
         rope_theta : Optional[float]
             The theta used in RoPE, if not provided, will be set to ``1e4``.
-
-
         q_data_type : str, optional
             The data type of the query tensor.
+        kv_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
 
         The :meth:`plan` method should be called before any :meth:`run` or
         :meth:`run_return_lse` calls, auxiliary data structures will be created
@@ -248,10 +246,18 @@ class BlockSparseAttentionWrapper:
         is not equal to ``num_kv_heads``, the function will use
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
         """
+        q_data_type = canonicalize_torch_dtype(q_data_type)
+        if kv_data_type is None:
+            kv_data_type = q_data_type
+        kv_data_type = canonicalize_torch_dtype(kv_data_type)
+
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
+
         num_blocks_row = len(indptr) - 1
         qo_indptr_host = R * torch.arange(num_blocks_row + 1, dtype=torch.int32)
         qo_indptr_host[-1] = M
-        self._qo_indptr = qo_indptr_host.to(indptr.device)
+        qo_indptr = qo_indptr_host.to(indptr.device)
         if indices.max().item() * C > N:
             raise ValueError("indices out of bound")
         last_block_len = torch.full(
@@ -260,7 +266,7 @@ class BlockSparseAttentionWrapper:
 
         if mask is not None or packed_mask is not None:
             qk_indptr = _compute_page_qk_indptr(
-                self._qo_indptr,
+                qo_indptr,
                 indptr,  # paged_kv_indptr
                 last_block_len,  # paged_kv_last_page_len
                 C,  # page_size
@@ -273,40 +279,48 @@ class BlockSparseAttentionWrapper:
                 mask.contiguous().view(-1), qk_indptr, bitorder="little"
             )
 
-        self._paged_kv_indptr_buf = indptr
-        self._paged_kv_indices_buf = indices
-        self._paged_kv_last_page_len = last_block_len
+        self._qo_indptr = qo_indptr.to(self.device)
+        self._paged_kv_indptr_buf = indptr.to(self.device)
+        self._paged_kv_indices_buf = indices.to(self.device)
+        self._paged_kv_last_page_len = last_block_len.to(self.device)
         if packed_mask is not None:
-            self._packed_mask_buf = packed_mask
-            self._qk_indptr_buf = qk_indptr
+            self._packed_mask_buf = packed_mask.to(self.device)
+            self._qk_indptr_buf = qk_indptr.to(self.device)
+            mask_mode = MaskMode.CUSTOM.value
         else:
             self._packed_mask_buf = None
-
-        empty_q_data = torch.empty(
-            0,
-            dtype=(
-                getattr(torch, q_data_type)
-                if isinstance(q_data_type, str)
-                else q_data_type
-            ),
-        )
+            self._qk_indptr_buf = None
+            mask_mode = MaskMode.NON_CAUSAL.value
 
         self.M = M
         self.N = N
         self.R = R
         self.C = C
 
-        self._wrapper.plan(
+        self._cached_module = get_batch_prefill_module(
+            q_data_type,
+            kv_data_type,
+            q_data_type,
+            indptr.dtype,
+            head_dim,
+            PosEncodingMode[pos_encoding_mode].value,
+            mask_mode,
+            False,  # use_sliding_window
+            logits_soft_cap > 0,  # use_logits_soft_cap
+            allow_fp16_qk_reduction,
+        )
+
+        self._plan_info = self._cached_module.plan(
             self._float_workspace_buffer,
             self._int_workspace_buffer,
-            self._qo_indptr,
-            self._paged_kv_indptr_buf,
+            self._pin_memory_int_workspace_buffer,
+            qo_indptr,
+            indptr,
             num_blocks_row,
             num_qo_heads,
             num_kv_heads,
-            head_dim,
             C,
-            empty_q_data,
+            False,  # is_cuda_graph_enabled
         )
 
         self._pos_encoding_mode = pos_encoding_mode
@@ -344,7 +358,8 @@ class BlockSparseAttentionWrapper:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-    ) -> torch.Tensor:
+        return_lse: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute block-sparse attention between Q/K/V tensors.
 
         Parameters
@@ -355,11 +370,18 @@ class BlockSparseAttentionWrapper:
             The key tensor with shape ``(N, num_kv_heads, head_dim)``.
         v : torch.Tensor
             The value tensor with shape ``(N, num_kv_heads, head_dim)``.
+        return_lse : bool
+            Whether to return the logsumexp of attention output
+
 
         Returns
         -------
-        torch.Tensor
-            The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
+        Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+            If :attr:`return_lse` is ``False``, the attention output, shape: ``[M, num_qo_heads, head_dim]``.
+            If :attr:`return_lse` is ``True``, a tuple of two tensors:
+
+            * The attention output, shape: ``[M, num_qo_heads, head_dim]``.
+            * The logsumexp of attention output, shape: ``[M, num_qo_heads]``.
         """
         pos_encoding_mode = self._pos_encoding_mode
         allow_fp16_qk_reduction = self._allow_fp16_qk_reduction
@@ -379,47 +401,32 @@ class BlockSparseAttentionWrapper:
 
         k = k.reshape(-1, self.C, *k.shape[-2:]).contiguous()
         v = v.reshape(-1, self.C, *v.shape[-2:]).contiguous()
-        if self._packed_mask_buf is None:
-            return self._wrapper.run(
-                q,
-                self._qo_indptr,
-                None,
-                k,
-                v,
-                self._paged_kv_indptr_buf,
-                self._paged_kv_indices_buf,
-                self._paged_kv_last_page_len,
-                False,  # causal
-                PosEncodingMode[pos_encoding_mode].value,
-                allow_fp16_qk_reduction,
-                -1,  # window_left
-                logits_soft_cap,
-                sm_scale,
-                rope_scale,
-                rope_theta,
-                False,  # return LSE
-            )[0]
-        else:
-            return self._wrapper.run_custom_mask(
-                q,
-                self._qo_indptr,
-                None,
-                k,
-                v,
-                self._paged_kv_indptr_buf,
-                self._paged_kv_indices_buf,
-                self._paged_kv_last_page_len,
-                self._packed_mask_buf,
-                self._qk_indptr_buf,
-                PosEncodingMode[pos_encoding_mode].value,
-                allow_fp16_qk_reduction,
-                -1,  # window_left
-                logits_soft_cap,
-                sm_scale,
-                rope_scale,
-                rope_theta,
-                False,  # return LSE
-            )[0]
+
+        out = self._cached_module.paged_run(
+            self._float_workspace_buffer,
+            self._int_workspace_buffer,
+            self._plan_info,
+            q,
+            None,
+            k,
+            v,
+            self._packed_mask_buf,
+            _get_cache_alibi_slopes_buf(q.shape[1], self.device),
+            self._qo_indptr,
+            self._paged_kv_indptr_buf,
+            self._paged_kv_indices_buf,
+            self._paged_kv_last_page_len,
+            self._qk_indptr_buf,
+            TensorLayout[self._kv_layout].value,
+            -1,  # window_left
+            logits_soft_cap,
+            sm_scale,
+            rope_scale,
+            rope_theta,
+            return_lse,
+        )
+
+        return out if return_lse else out[0]
 
     def end_forward(self) -> None:
         r"""Warning: This method is deprecated and has no effect."""

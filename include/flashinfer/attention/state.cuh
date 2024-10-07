@@ -36,7 +36,7 @@ struct state_t {
 
   __device__ __forceinline__ void init() {
     o.fill(0.f);
-    m = -5e4;
+    m = -math::inf;
     d = 1.f;
   }
 

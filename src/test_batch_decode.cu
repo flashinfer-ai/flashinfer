@@ -28,8 +28,7 @@ constexpr QKVLayout kv_layout = QKVLayout::kNHD;
 template <typename DTypeQO, typename DTypeKV>
 void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, size_t num_qo_heads,
                                          size_t num_kv_heads, size_t head_dim,
-                                         flashinfer::PosEncodingMode pos_encoding_mode,
-                                         bool cooperative) {
+                                         flashinfer::PosEncodingMode pos_encoding_mode) {
   std::vector<int32_t> seq_lens(batch_size);
   utils::vec_randint_(seq_lens, 1, 1024);
   std::vector<int32_t> append_indptr{0};
@@ -77,7 +76,7 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
   assert(q.size() == batch_size * num_qo_heads * head_dim);
   assert(o_ref.size() == batch_size * num_qo_heads * head_dim);
 
-  flashinfer::paged_kv_t<PageStorage::kIndices, DTypeKV, int32_t> paged_kv_cpu(
+  flashinfer::paged_kv_t<DTypeKV, int32_t> paged_kv_cpu(
       num_kv_heads, page_size, head_dim, batch_size, kv_layout, kv_data.data(), kv_indices.data(),
       kv_indptr.data(), kv_last_page_len.data());
   cpu_reference::append_paged_kv_cache<DTypeKV, int32_t>(paged_kv_cpu, keys, values, append_indptr);
@@ -91,7 +90,7 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
   thrust::device_vector<DTypeQO> o_device(o_ref.size());
 
   // create paged_kv object
-  flashinfer::paged_kv_t<PageStorage::kIndices, DTypeKV, int32_t> paged_kv(
+  flashinfer::paged_kv_t<DTypeKV, int32_t> paged_kv(
       num_kv_heads, page_size, head_dim, batch_size, kv_layout,
       thrust::raw_pointer_cast(kv_data_device.data()),
       thrust::raw_pointer_cast(kv_indices_device.data()),
@@ -102,30 +101,18 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
   thrust::device_vector<char> float_buffer(float_workspace_size_in_bytes);
   size_t int_workspace_size_in_bytes = 8 * 1024 * 1024;
   thrust::device_vector<char> int_buffer(int_workspace_size_in_bytes);
-  BatchDecodeHandlerPlan<PageStorage::kIndices, DTypeQO, DTypeKV, DTypeQO, int32_t>(
+  BatchDecodeHandlerPlan<DTypeQO, DTypeKV, DTypeQO, int32_t>(
       &handler, (void*)thrust::raw_pointer_cast(float_buffer.data()), float_workspace_size_in_bytes,
       (void*)thrust::raw_pointer_cast(int_buffer.data()), int_workspace_size_in_bytes,
       kv_indptr.data(), kv_last_page_len.data(), batch_size, num_qo_heads, num_kv_heads, head_dim,
       page_size, pos_encoding_mode);
 
-  if (!cooperative) {
-    // use non-cooperative kernel
-    cudaError_t status =
-        flashinfer::BatchDecodeWithPagedKVCacheNoSplitKV<PageStorage::kIndices, DTypeQO, DTypeKV,
-                                                         DTypeQO, int32_t>(
-            thrust::raw_pointer_cast(q_device.data()), /*q_offset=*/nullptr, paged_kv,
-            kv_partition_info_t<int32_t>(), thrust::raw_pointer_cast(o_device.data()),
-            /*lse=*/nullptr, num_qo_heads, pos_encoding_mode);
-    EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
-  } else {
-    cudaError_t status =
-        flashinfer::BatchDecodeWithPagedKVCacheWrapper<PageStorage::kIndices, DTypeQO, DTypeKV,
-                                                       DTypeQO, int32_t>(
-            &handler, thrust::raw_pointer_cast(q_device.data()), /*q_offset=*/nullptr, paged_kv,
-            thrust::raw_pointer_cast(o_device.data()), /*lse=*/nullptr, num_qo_heads,
-            pos_encoding_mode);
-    EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
-  }
+  cudaError_t status =
+      flashinfer::BatchDecodeWithPagedKVCacheWrapper<DTypeQO, DTypeKV, DTypeQO, int32_t>(
+          &handler, thrust::raw_pointer_cast(q_device.data()), /*q_offset=*/nullptr, paged_kv,
+          thrust::raw_pointer_cast(o_device.data()), /*lse=*/nullptr, num_qo_heads,
+          pos_encoding_mode);
+  EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
   // compare result
   thrust::host_vector<DTypeQO> o_host = o_device;
   size_t num_result_errors_atol_1e_3_rtol_1e_3 = 0;
@@ -151,25 +138,6 @@ void _TestBatchDecodingKernelCorrectness(size_t page_size, size_t batch_size, si
 template <typename DTypeQO, typename DTypeKV>
 void TestBatchDecodeKernelCorrectness() {
   for (size_t page_size : {1, 3, 7, 16}) {
-    for (size_t batch_size : {1, 7, 37, 61}) {
-      for (size_t num_qo_heads : {32}) {
-        for (size_t num_kv_heads : {32, 8, 4}) {
-          for (size_t head_dim : {64, 128, 256}) {
-            for (size_t pos_encoding_mode : {0U, 1U}) {
-              _TestBatchDecodingKernelCorrectness<DTypeQO, DTypeKV>(
-                  page_size, batch_size, num_qo_heads, num_kv_heads, head_dim,
-                  flashinfer::PosEncodingMode(pos_encoding_mode), false);
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
-template <typename DTypeQO, typename DTypeKV>
-void TestCooperativeBatchDecodeKernelCorrectness() {
-  for (size_t page_size : {1, 3, 7, 16}) {
     for (size_t batch_size : {1, 2, 4, 8}) {
       for (size_t num_qo_heads : {32}) {
         for (size_t num_kv_heads : {32, 8, 4}) {
@@ -177,7 +145,7 @@ void TestCooperativeBatchDecodeKernelCorrectness() {
             for (size_t pos_encoding_mode : {0U, 1U}) {
               _TestBatchDecodingKernelCorrectness<DTypeQO, DTypeKV>(
                   page_size, batch_size, num_qo_heads, num_kv_heads, head_dim,
-                  flashinfer::PosEncodingMode(pos_encoding_mode), true);
+                  flashinfer::PosEncodingMode(pos_encoding_mode));
             }
           }
         }
@@ -205,7 +173,3 @@ TEST(FlashInferCorrectnessTest, TestBatchDecodeKernelCorrectnessE5M2) {
   TestBatchDecodeKernelCorrectness<half, __nv_fp8_e5m2>();
 }
 #endif
-
-TEST(FlashInferCorrectnessTest, TestCooperativeBatchDecodeKernelCorrectnessTestFP16) {
-  TestCooperativeBatchDecodeKernelCorrectness<half, half>();
-}
