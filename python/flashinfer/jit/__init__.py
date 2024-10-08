@@ -94,6 +94,8 @@ def get_cuda_version() -> Tuple[int, int]:
     major, minor = map(int, re.findall(r"release (\d+)\.(\d+),", txt)[0])
     return major, minor
 
+is_sm90_capable = get_cuda_version() >= (9, 0)
+
 def clear_cache_dir():
     if os.path.exists(FLASHINFER_JIT_DIR):
         for file in os.listdir(FLASHINFER_JIT_DIR):
@@ -114,16 +116,15 @@ def remove_unwanted_pytorch_nvcc_flags():
             pass
 
 def get_gemm_src_files():
-    cuda_major, _ = get_cuda_version()
-    if cuda_major < 9:
-        return [
-            FLASHINFER_CSRC_DIR / "group_gemm.cu",
-            FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops.cu",
-        ]
-    else:
+    if is_sm90_capable:
         return [
             FLASHINFER_CSRC_DIR / "group_gemm_sm90.cu",
             FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops_sm90.cu",
+        ]
+    else:
+        return [
+            FLASHINFER_CSRC_DIR / "group_gemm.cu",
+            FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops.cu",
         ]
 
 remove_unwanted_pytorch_nvcc_flags()

@@ -150,6 +150,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("apply_llama31_rope", &apply_llama31_rope, "Apply Llama 3.1 style RoPE");
   m.def("packbits", &packbits, "GPU packbits operator");
   m.def("segment_packbits", &segment_packbits, "GPU segment packbits operator");
-  m.def("cutlass_segment_gemms_sm90", &CutlassSegmentGEMMSM90, "Cutlass Segment GEMM operator for SM90");
+  m.def("cutlass_segment_gemm_sm90", &CutlassSegmentGEMMSM90, "Cutlass Segment GEMM operator for SM90");
   m.def("bmm_fp8", &bmm_fp8, "BMM FP8");
 }

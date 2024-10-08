@@ -19,7 +19,7 @@ from typing import Optional
 import torch
 
 from .utils import get_indptr
-from .jit import get_gemm_src_files, load_cuda_ops, FLASHINFER_CSRC_DIR, has_prebuilt_ops
+from .jit import get_gemm_src_files, load_cuda_ops, FLASHINFER_CSRC_DIR, has_prebuilt_ops, is_sm90_capable
 from typing import Optional
 
 
@@ -198,15 +198,27 @@ class SegmentGEMMWrapper:
         if weight_indices is None:
             # create an empty CPU tensor as placeholder
             weight_indices = torch.empty(0, dtype=torch.int64)
-        return get_gemm_module().cutlass_segment_gemm(
-            self._int_workspace_buffer,
-            seg_indptr,
-            weight_indices,
-            x,
-            weights,
-            batch_size,
-            weight_column_major,
-        )
+        if is_sm90_capable:
+            return get_gemm_module().cutlass_segment_gemm_sm90(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                seg_indptr,
+                weight_indices,
+                x,
+                weights,
+                batch_size,
+                weight_column_major,
+            )
+        else:
+            return get_gemm_module().cutlass_segment_gemm(
+                self._int_workspace_buffer,
+                seg_indptr,
+                weight_indices,
+                x,
+                weights,
+                batch_size,
+                weight_column_major,
+            )
 
     forward = run
 

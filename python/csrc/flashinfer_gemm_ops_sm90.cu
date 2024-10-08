@@ -26,6 +26,6 @@ torch::Tensor CutlassSegmentGEMMSM90(torch::Tensor float_workspace_buffer, torch
                                  bool weight_column_major);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("cutlass_segment_gemms_sm90", &CutlassSegmentGEMMSM90, "Cutlass Segment GEMM operator for SM90");
+  m.def("cutlass_segment_gemm_sm90", &CutlassSegmentGEMMSM90, "Cutlass Segment GEMM operator for SM90");
   m.def("bmm_fp8", &bmm_fp8, "BMM FP8");
 }

@@ -21,6 +21,7 @@
 #include "../allocator.h"
 #include "../utils.cuh"
 #include "cutlass/cutlass.h"
+#include "group_gemm_cutlass.cuh"
 
 #include "cute/tensor.hpp"
 #include "cutlass/tensor_ref.h"
