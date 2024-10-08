@@ -17,8 +17,9 @@ limitations under the License.
 import os
 import re
 import logging
+import subprocess
 import torch.utils.cpp_extension as torch_cpp_ext
-from typing import List
+from typing import List, Tuple
 from .env import (
     FLASHINFER_WORKSPACE_DIR,
     FLASHINFER_JIT_DIR,
@@ -84,6 +85,14 @@ def check_cuda_arch():
         if arch < 75:
             raise RuntimeError("FlashInfer requires sm75+")
 
+def get_cuda_version() -> Tuple[int, int]:
+    if torch_cpp_ext.CUDA_HOME is None:
+        nvcc = "nvcc"
+    else:
+        nvcc = os.path.join(torch_cpp_ext.CUDA_HOME, "bin/nvcc")
+    txt = subprocess.check_output([nvcc, "--version"], text=True)
+    major, minor = map(int, re.findall(r"release (\d+)\.(\d+),", txt)[0])
+    return major, minor
 
 def clear_cache_dir():
     if os.path.exists(FLASHINFER_JIT_DIR):
@@ -104,6 +113,18 @@ def remove_unwanted_pytorch_nvcc_flags():
         except ValueError:
             pass
 
+def get_gemm_src_files():
+    cuda_major, _ = get_cuda_version()
+    if cuda_major < 9:
+        return [
+            FLASHINFER_CSRC_DIR / "group_gemm.cu",
+            FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops.cu",
+        ]
+    else:
+        return [
+            FLASHINFER_CSRC_DIR / "group_gemm_sm90.cu",
+            FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops_sm90.cu",
+        ]
 
 remove_unwanted_pytorch_nvcc_flags()
 

@@ -71,7 +71,7 @@ using namespace cute;
   }
 
 template <typename DTypeIn, typename DTypeOut>
-cudaError_t CutlassSegmentGEMMWrapper_SM90(
+cudaError_t CutlassSegmentGEMMSM90Run(
   void* float_buffer, size_t float_buffer_size_in_bytes,
   void* int_buffer, size_t int_buffer_size_in_bytes, DTypeIn* x,
                                            DTypeIn* w, DTypeOut* y, int64_t* xy_indptr_d,
@@ -80,7 +80,7 @@ cudaError_t CutlassSegmentGEMMWrapper_SM90(
                                            bool weight_column_major, cudaStream_t stream) {
   auto compute_capacity = GetCudaComputeCapability();
   if (compute_capacity.first < 9) {
-    std::cerr << "CutlassSegmentGEMMWrapper_SM90 requires compute capability of at least 9.0"
+    std::cerr << "CutlassSegmentGEMMSM90Run requires compute capability of at least 9.0"
               << std::endl;
     return cudaErrorNotSupported;
   } else {

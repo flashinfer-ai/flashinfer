@@ -336,6 +336,18 @@ def remove_unwanted_pytorch_nvcc_flags():
         except ValueError:
             pass
 
+def get_gemm_src_files():
+    cuda_major, _ = get_cuda_version()
+    if cuda_major < 9:
+        return [
+            "csrc/group_gemm.cu",
+            "csrc_aot/flashinfer_ops.cu",
+        ]
+    else:
+        return [
+            "csrc/group_gemm_sm90.cu",
+            "csrc_aot/flashinfer_ops_sm90.cu",
+        ]
 
 class NinjaBuildExtension(torch_cpp_ext.BuildExtension):
     def __init__(self, *args, **kwargs) -> None:
@@ -386,8 +398,7 @@ if __name__ == "__main__":
                 "csrc/quantization.cu",
                 "csrc/group_gemm.cu",
                 "csrc/bmm_fp8.cu",
-                "csrc_aot/flashinfer_ops.cu",
-            ],
+            ] + get_gemm_src_files(),
             include_dirs=include_dirs,
             extra_compile_args=extra_compile_args,
         )

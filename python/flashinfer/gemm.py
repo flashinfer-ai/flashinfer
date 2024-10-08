@@ -19,7 +19,7 @@ from typing import Optional
 import torch
 
 from .utils import get_indptr
-from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR, has_prebuilt_ops
+from .jit import get_gemm_src_files, load_cuda_ops, FLASHINFER_CSRC_DIR, has_prebuilt_ops
 from typing import Optional
 
 
@@ -37,10 +37,8 @@ def get_gemm_module():
             _gemm_module = load_cuda_ops(
                 "gemm",
                 [
-                    FLASHINFER_CSRC_DIR / "group_gemm.cu",
                     FLASHINFER_CSRC_DIR / "bmm_fp8.cu",
-                    FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops.cu",
-                ],
+                ] + get_gemm_src_files(),
             )
     return _gemm_module
 
