@@ -85,16 +85,6 @@ def check_cuda_arch():
         if arch < 75:
             raise RuntimeError("FlashInfer requires sm75+")
 
-def get_cuda_version() -> Tuple[int, int]:
-    if torch_cpp_ext.CUDA_HOME is None:
-        nvcc = "nvcc"
-    else:
-        nvcc = os.path.join(torch_cpp_ext.CUDA_HOME, "bin/nvcc")
-    txt = subprocess.check_output([nvcc, "--version"], text=True)
-    major, minor = map(int, re.findall(r"release (\d+)\.(\d+),", txt)[0])
-    return major, minor
-
-is_sm90_capable = get_cuda_version() >= (9, 0)
 
 def clear_cache_dir():
     if os.path.exists(FLASHINFER_JIT_DIR):
@@ -115,17 +105,6 @@ def remove_unwanted_pytorch_nvcc_flags():
         except ValueError:
             pass
 
-def get_gemm_src_files():
-    if is_sm90_capable:
-        return [
-            FLASHINFER_CSRC_DIR / "group_gemm_sm90.cu",
-            FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops_sm90.cu",
-        ]
-    else:
-        return [
-            FLASHINFER_CSRC_DIR / "group_gemm.cu",
-            FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops.cu",
-        ]
 
 remove_unwanted_pytorch_nvcc_flags()
 
@@ -133,22 +112,24 @@ remove_unwanted_pytorch_nvcc_flags()
 def load_cuda_ops(
     name: str,
     sources: List[str],
-    extra_cflags: List[str] = ["-O3", "-Wno-switch-bool"],
-    extra_cuda_cflags: List[str] = [
-        "-O3",
-        "-std=c++17",
-        "--threads",
-        "4",
-        # "-Xfatbin",
-        # "-compress-all",
-        "-use_fast_math",
-        "-DFLASHINFER_ENABLE_BF16",
-        "-DFLASHINFER_ENABLE_FP8",
-    ],
+    extra_cflags: List[str] = [],
+    extra_cuda_cflags: List[str] = [],
     extra_ldflags=None,
     extra_include_paths=None,
     verbose=False,
 ):
+    cflags = ["-O3", "-Wno-switch-bool"]
+    cuda_cflags = [
+        "-O3",
+        "-std=c++17",
+        "--threads",
+        "4",
+        "-use_fast_math",
+        "-DFLASHINFER_ENABLE_BF16",
+        "-DFLASHINFER_ENABLE_FP8",
+    ]
+    cflags += extra_cflags
+    cuda_cflags += extra_cuda_cflags
     logger.info(f"Loading JIT ops: {name}")
     check_cuda_arch()
     build_directory = FLASHINFER_JIT_DIR / name
@@ -162,8 +143,8 @@ def load_cuda_ops(
     return torch_cpp_ext.load(
         name,
         list(map(lambda _: str(_), sources)),
-        extra_cflags=extra_cflags,
-        extra_cuda_cflags=extra_cuda_cflags,
+        extra_cflags=cflags,
+        extra_cuda_cflags=cuda_cflags,
         extra_ldflags=extra_ldflags,
         extra_include_paths=list(map(lambda _: str(_), extra_include_paths)),
         build_directory=build_directory,

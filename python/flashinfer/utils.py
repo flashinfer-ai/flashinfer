@@ -176,3 +176,9 @@ def canonicalize_torch_dtype(dtype: Union[torch.dtype, str]) -> torch.dtype:
         raise TypeError(
             "dtype must be a string or torch.dtype, got {}".format(type(dtype))
         )
+
+
+def get_compute_capability(device: torch.device) -> Tuple[int, int]:
+    if device.type != "cuda":
+        raise ValueError("device must be a cuda device")
+    return torch.cuda.get_device_capability(device.index)

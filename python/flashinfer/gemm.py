@@ -18,12 +18,13 @@ from typing import Optional
 
 import torch
 
-from .utils import get_indptr
-from .jit import get_gemm_src_files, load_cuda_ops, FLASHINFER_CSRC_DIR, has_prebuilt_ops, is_sm90_capable
+from .utils import get_indptr, get_compute_capability
+from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR, has_prebuilt_ops
 from typing import Optional
 
 
 _gemm_module = None
+_gemm_module_sm90 = None
 
 
 def get_gemm_module():
@@ -38,9 +39,30 @@ def get_gemm_module():
                 "gemm",
                 [
                     FLASHINFER_CSRC_DIR / "bmm_fp8.cu",
-                ] + get_gemm_src_files(),
+                    FLASHINFER_CSRC_DIR / "group_gemm.cu",
+                    FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops.cu",
+                ],
             )
     return _gemm_module
+
+def get_gemm_sm90_module():
+    print("get_gemm_sm90_module")
+    global _gemm_module_sm90
+    if _gemm_module_sm90 is None:
+        if has_prebuilt_ops:
+            from . import _kernels_sm90
+
+            _gemm_module_sm90 = _kernels_sm90
+        else:
+            _gemm_module_sm90 = load_cuda_ops(
+                "gemm_sm90",
+                [
+                    FLASHINFER_CSRC_DIR / "group_gemm_sm90.cu",
+                    FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops_sm90.cu",
+                ],
+                extra_cuda_cflags=["-gencode", "arch=compute_90a,code=sm_90a"],
+            )
+    return _gemm_module_sm90
 
 
 class SegmentGEMMWrapper:
@@ -198,8 +220,9 @@ class SegmentGEMMWrapper:
         if weight_indices is None:
             # create an empty CPU tensor as placeholder
             weight_indices = torch.empty(0, dtype=torch.int64)
-        if is_sm90_capable:
-            return get_gemm_module().cutlass_segment_gemm_sm90(
+        major, _ = get_compute_capability(x.device)
+        if major >= 9:
+            return get_gemm_sm90_module().cutlass_segment_gemm_sm90(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 seg_indptr,

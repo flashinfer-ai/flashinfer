@@ -15,9 +15,6 @@
  */
 #include <torch/extension.h>
 
-void bmm_fp8(const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& D,
-             torch::Tensor& A_scale, torch::Tensor& B_scale);
-
 
 // (... Tensor x_arr, Tensor w_arr, Tensor y_arr, Tensor x_stride, Tensor weight_stride, Tensor y_stride, Tensor problem_shape ...)
 torch::Tensor CutlassSegmentGEMMSM90(torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer, torch::Tensor seg_indptr,
@@ -27,5 +24,4 @@ torch::Tensor CutlassSegmentGEMMSM90(torch::Tensor float_workspace_buffer, torch
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("cutlass_segment_gemm_sm90", &CutlassSegmentGEMMSM90, "Cutlass Segment GEMM operator for SM90");
-  m.def("bmm_fp8", &bmm_fp8, "BMM FP8");
 }
