@@ -21,7 +21,41 @@
 
 #include "pytorch_extension_utils.h"
 
-using namespace flashinfer;
+namespace flashinfer {
+namespace bmm_fp8 {
+
+template cublasStatus_t bmm_fp8_internal_cublaslt<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16>(
+    void* workspace, size_t workspace_size_in_bytes, const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* B,
+    __nv_bfloat16* D, int batch_size, int m, int n, int k, const float* A_scale,
+    const float* B_scale, cublasLtHandle_t lt_handle, cudaStream_t stream);
+
+template cublasStatus_t bmm_fp8_internal_cublaslt<__nv_fp8_e4m3, __nv_fp8_e4m3, half>(
+    void* workspace, size_t workspace_size_in_bytes, const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* B,
+    half* D, int batch_size, int m, int n, int k, const float* A_scale, const float* B_scale,
+    cublasLtHandle_t lt_handle, cudaStream_t stream);
+
+template cublasStatus_t bmm_fp8_internal_cublaslt<__nv_fp8_e4m3, __nv_fp8_e5m2, __nv_bfloat16>(
+    void* workspace, size_t workspace_size_in_bytes, const __nv_fp8_e4m3* A, const __nv_fp8_e5m2* B,
+    __nv_bfloat16* D, int batch_size, int m, int n, int k, const float* A_scale,
+    const float* B_scale, cublasLtHandle_t lt_handle, cudaStream_t stream);
+
+template cublasStatus_t bmm_fp8_internal_cublaslt<__nv_fp8_e4m3, __nv_fp8_e5m2, half>(
+    void* workspace, size_t workspace_size_in_bytes, const __nv_fp8_e4m3* A, const __nv_fp8_e5m2* B,
+    half* D, int batch_size, int m, int n, int k, const float* A_scale, const float* B_scale,
+    cublasLtHandle_t lt_handle, cudaStream_t stream);
+
+template cublasStatus_t bmm_fp8_internal_cublaslt<__nv_fp8_e5m2, __nv_fp8_e4m3, __nv_bfloat16>(
+    void* workspace, size_t workspace_size_in_bytes, const __nv_fp8_e5m2* A, const __nv_fp8_e4m3* B,
+    __nv_bfloat16* D, int batch_size, int m, int n, int k, const float* A_scale,
+    const float* B_scale, cublasLtHandle_t lt_handle, cudaStream_t stream);
+
+template cublasStatus_t bmm_fp8_internal_cublaslt<__nv_fp8_e5m2, __nv_fp8_e4m3, half>(
+    void* workspace, size_t workspace_size_in_bytes, const __nv_fp8_e5m2* A, const __nv_fp8_e4m3* B,
+    half* D, int batch_size, int m, int n, int k, const float* A_scale, const float* B_scale,
+    cublasLtHandle_t lt_handle, cudaStream_t stream);
+
+}  // namespace bmm_fp8
+}  // namespace flashinfer
 
 void bmm_fp8(const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& D,
              torch::Tensor& A_scale, torch::Tensor& B_scale) {
@@ -50,16 +84,28 @@ void bmm_fp8(const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& D,
   auto k = A.size(2);
   auto n = B.size(2);
 
+  // Per the cublas documentation, the recommended workspace buffer size for hopper is 32MB.
+  // https://docs.nvidia.com/cuda/cublas/#cublassetworkspace
+  // create an empty buffer of 32MB, with data type uint8 and on the same device as A
+  auto workspace_buffer = torch::empty(
+      {32 * 1024 * 1024}, torch::TensorOptions().dtype(torch::kUInt8).device(A.device()));
+  auto lt_handle = reinterpret_cast<cublasLtHandle_t>(at::cuda::getCurrentCUDABlasHandle());
+  auto stream = at::cuda::getCurrentCUDAStream();
+
   // PyTorch is row major by default. cuBLASLt is column major by default.
   // We need row major D as expected.
   // A ^ T * B = D, so D ^ T = B ^ T * A
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(B.scalar_type(), b_type, [&] {
     return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(A.scalar_type(), a_type, [&] {
       return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(D.scalar_type(), d_type, [&] {
-        flashinfer::bmm_fp8::bmm_fp8_internal_cublaslt(
+        auto status = flashinfer::bmm_fp8::bmm_fp8_internal_cublaslt(
+            workspace_buffer.data_ptr(), workspace_buffer.numel(),
             static_cast<b_type*>(B.data_ptr()), static_cast<a_type*>(A.data_ptr()),
             static_cast<d_type*>(D.data_ptr()), batch_size, n, m, k,
-            static_cast<float*>(B_scale.data_ptr()), static_cast<float*>(A_scale.data_ptr()));
+            static_cast<float*>(B_scale.data_ptr()), static_cast<float*>(A_scale.data_ptr()),
+            lt_handle, stream);
+        TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "bmm_fp8_internal_cublaslt failed: ",
+                    cublasGetStatusString(status));
         return true;
       });
     });
