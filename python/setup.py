@@ -46,6 +46,7 @@ def clear_aot_config():
 
 if __name__ == "__main__":
     generate_build_meta()
+    clear_aot_config()
     setuptools.setup(
         name="flashinfer",
         version=get_version(),

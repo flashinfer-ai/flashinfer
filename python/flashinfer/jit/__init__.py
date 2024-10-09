@@ -17,15 +17,16 @@ limitations under the License.
 import os
 import re
 import logging
+import subprocess
 import torch.utils.cpp_extension as torch_cpp_ext
-from typing import List
+from typing import List, Tuple
 from .env import (
     FLASHINFER_WORKSPACE_DIR,
     FLASHINFER_JIT_DIR,
     FLASHINFER_GEN_SRC_DIR,
     FLASHINFER_INCLUDE_DIR,
     FLASHINFER_CSRC_DIR,
-    CUTLASS_INCLUDE_DIR,
+    CUTLASS_INCLUDE_DIRS,
 )
 from .activation import get_act_and_mul_cu_str, gen_act_and_mul_cu
 from .attention import (
@@ -111,22 +112,24 @@ remove_unwanted_pytorch_nvcc_flags()
 def load_cuda_ops(
     name: str,
     sources: List[str],
-    extra_cflags: List[str] = ["-O3", "-Wno-switch-bool"],
-    extra_cuda_cflags: List[str] = [
-        "-O3",
-        "-std=c++17",
-        "--threads",
-        "4",
-        # "-Xfatbin",
-        # "-compress-all",
-        "-use_fast_math",
-        "-DFLASHINFER_ENABLE_BF16",
-        "-DFLASHINFER_ENABLE_FP8",
-    ],
+    extra_cflags: List[str] = [],
+    extra_cuda_cflags: List[str] = [],
     extra_ldflags=None,
     extra_include_paths=None,
     verbose=False,
 ):
+    cflags = ["-O3", "-Wno-switch-bool"]
+    cuda_cflags = [
+        "-O3",
+        "-std=c++17",
+        "--threads",
+        "4",
+        "-use_fast_math",
+        "-DFLASHINFER_ENABLE_BF16",
+        "-DFLASHINFER_ENABLE_FP8",
+    ]
+    cflags += extra_cflags
+    cuda_cflags += extra_cuda_cflags
     logger.info(f"Loading JIT ops: {name}")
     check_cuda_arch()
     build_directory = FLASHINFER_JIT_DIR / name
@@ -135,14 +138,13 @@ def load_cuda_ops(
     if extra_include_paths is None:
         extra_include_paths = [
             FLASHINFER_INCLUDE_DIR,
-            CUTLASS_INCLUDE_DIR,
             FLASHINFER_CSRC_DIR,
-        ]
+        ] + CUTLASS_INCLUDE_DIRS
     return torch_cpp_ext.load(
         name,
         list(map(lambda _: str(_), sources)),
-        extra_cflags=extra_cflags,
-        extra_cuda_cflags=extra_cuda_cflags,
+        extra_cflags=cflags,
+        extra_cuda_cflags=cuda_cflags,
         extra_ldflags=extra_ldflags,
         extra_include_paths=list(map(lambda _: str(_), extra_include_paths)),
         build_directory=build_directory,

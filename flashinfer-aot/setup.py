@@ -355,6 +355,7 @@ if __name__ == "__main__":
     include_dirs = [
         str(root.resolve() / "include"),
         str(root.resolve() / "3rdparty" / "cutlass" / "include"),  # for group gemm
+        str(root.resolve() / "3rdparty" / "cutlass" / "tools" / "util" / "include"),
     ]
     extra_compile_args = {
         "cxx": [
@@ -371,6 +372,10 @@ if __name__ == "__main__":
             "-use_fast_math",
         ],
     }
+    extra_compile_args_sm90 = extra_compile_args.copy()
+    extra_compile_args_sm90["nvcc"].extend(
+        "-gencode arch=compute_90a,code=sm_90a".split()
+    )
     ext_modules = []
     ext_modules.append(
         torch_cpp_ext.CUDAExtension(
@@ -385,10 +390,21 @@ if __name__ == "__main__":
                 "csrc/quantization.cu",
                 "csrc/group_gemm.cu",
                 "csrc/bmm_fp8.cu",
-                "csrc_aot/flashinfer_ops.cu",
+                "csrc_aot/flashinfer_ops.cu"
             ],
             include_dirs=include_dirs,
             extra_compile_args=extra_compile_args,
+        )
+    )
+    ext_modules.append(
+        torch_cpp_ext.CUDAExtension(
+            name="flashinfer._kernels_sm90",
+            sources=[
+                "csrc/group_gemm_sm90.cu",
+                "csrc_aot/flashinfer_sm90_ops.cu",
+            ],
+            include_dirs=include_dirs,
+            extra_compile_args=extra_compile_args_sm90,
         )
     )
     ext_modules.append(
