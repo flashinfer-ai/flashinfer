@@ -51,15 +51,16 @@ void bench_flashinfer_batch_decode(nvbench::state& state) {
     kv_indptr_host.push_back(kv_indptr_host.back() + pages_per_seq);
     kv_last_page_len_host.push_back((seqlen - 1) % page_size + 1);
   }
-  thrust::device_vector<T> kv_data(num_pages * 2 * num_kv_heads * page_size * head_dim);
+  thrust::device_vector<T> k_data(num_pages * num_kv_heads * page_size * head_dim);
+  thrust::device_vector<T> v_data(num_pages * num_kv_heads * page_size * head_dim);
   thrust::device_vector<int32_t> kv_indptr(kv_indptr_host);
   thrust::device_vector<int32_t> kv_indices(kv_indicies_host);
   thrust::device_vector<int32_t> kv_last_page_len(kv_last_page_len_host);
-  paged_kv_t<T, int32_t> paged_kv(num_kv_heads, page_size, head_dim, batch_size, kv_layout,
-                                  thrust::raw_pointer_cast(kv_data.data()),
-                                  thrust::raw_pointer_cast(kv_indices.data()),
-                                  thrust::raw_pointer_cast(kv_indptr.data()),
-                                  thrust::raw_pointer_cast(kv_last_page_len.data()));
+  paged_kv_t<T, int32_t> paged_kv(
+      num_kv_heads, page_size, head_dim, batch_size, kv_layout,
+      thrust::raw_pointer_cast(k_data.data()), thrust::raw_pointer_cast(v_data.data()),
+      thrust::raw_pointer_cast(kv_indices.data()), thrust::raw_pointer_cast(kv_indptr.data()),
+      thrust::raw_pointer_cast(kv_last_page_len.data()));
   // Allocate input data:
   thrust::device_vector<T> q(batch_size * num_qo_heads * head_dim);
   thrust::device_vector<T> o(batch_size * num_qo_heads * head_dim);
@@ -113,15 +114,16 @@ void bench_flashinfer_batch_decode_with_prefill(nvbench::state& state) {
     kv_indptr_host.push_back(kv_indptr_host.back() + pages_per_seq);
     kv_last_page_len_host.push_back((seqlen - 1) % page_size + 1);
   }
-  thrust::device_vector<T> kv_data(num_pages * 2 * num_kv_heads * page_size * head_dim);
+  thrust::device_vector<T> k_data(num_pages * num_kv_heads * page_size * head_dim);
+  thrust::device_vector<T> v_data(num_pages * num_kv_heads * page_size * head_dim);
   thrust::device_vector<int32_t> kv_indptr(kv_indptr_host);
   thrust::device_vector<int32_t> kv_indices(kv_indicies_host);
   thrust::device_vector<int32_t> kv_last_page_len(kv_last_page_len_host);
-  paged_kv_t<T, int32_t> paged_kv(num_kv_heads, page_size, head_dim, batch_size, kv_layout,
-                                  thrust::raw_pointer_cast(kv_data.data()),
-                                  thrust::raw_pointer_cast(kv_indices.data()),
-                                  thrust::raw_pointer_cast(kv_indptr.data()),
-                                  thrust::raw_pointer_cast(kv_last_page_len.data()));
+  paged_kv_t<T, int32_t> paged_kv(
+      num_kv_heads, page_size, head_dim, batch_size, kv_layout,
+      thrust::raw_pointer_cast(k_data.data()), thrust::raw_pointer_cast(v_data.data()),
+      thrust::raw_pointer_cast(kv_indices.data()), thrust::raw_pointer_cast(kv_indptr.data()),
+      thrust::raw_pointer_cast(kv_last_page_len.data()));
 
   // Allocate input data:
   thrust::device_vector<T> q(batch_size * num_qo_heads * head_dim);

@@ -198,38 +198,26 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCacheRun(
 std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
     unsigned int mask_mode_code, torch::Tensor float_workspace_buffer,
     torch::Tensor int_workspace_buffer, std::vector<int64_t> plan_info_vec, torch::Tensor q,
-    std::optional<torch::Tensor> paged_kv_cache, std::optional<torch::Tensor> paged_k_cache,
-    std::optional<torch::Tensor> paged_v_cache, std::optional<torch::Tensor> maybe_custom_mask,
-    std::optional<torch::Tensor> maybe_alibi_slopes, torch::Tensor qo_indptr,
-    torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
+    torch::Tensor paged_k_cache, torch::Tensor paged_v_cache,
+    std::optional<torch::Tensor> maybe_custom_mask, std::optional<torch::Tensor> maybe_alibi_slopes,
+    torch::Tensor qo_indptr, torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
     torch::Tensor paged_kv_last_page_len, std::optional<torch::Tensor> maybe_qk_indptr,
     unsigned int layout, int32_t window_left, float logits_soft_cap, float sm_scale,
     float rope_scale, float rope_theta, bool return_lse) {
   PrefillPlanInfo plan_info;
   plan_info.FromVector(plan_info_vec);
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
-  bool paged_kv_defined = paged_kv_cache.has_value();
   auto device = q.device();
   int64_t batch_size = paged_kv_indptr.size(0) - 1;
   int64_t num_qo_heads = q.size(1);
   int64_t num_kv_heads, page_size;
   uint32_t head_dim = q.size(2);
-  if (paged_kv_defined) {
-    if (kv_layout == QKVLayout::kHND) {
-      num_kv_heads = paged_kv_cache->size(2);
-      page_size = paged_kv_cache->size(3);
-    } else {
-      page_size = paged_kv_cache->size(2);
-      num_kv_heads = paged_kv_cache->size(3);
-    }
+  if (kv_layout == QKVLayout::kHND) {
+    num_kv_heads = paged_k_cache.size(1);
+    page_size = paged_k_cache.size(2);
   } else {
-    if (kv_layout == QKVLayout::kHND) {
-      num_kv_heads = paged_k_cache->size(1);
-      page_size = paged_k_cache->size(2);
-    } else {
-      page_size = paged_k_cache->size(1);
-      num_kv_heads = paged_k_cache->size(2);
-    }
+    page_size = paged_k_cache.size(1);
+    num_kv_heads = paged_k_cache.size(2);
   }
 
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
@@ -248,8 +236,14 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
   using IdType = int32_t;
   bool use_logits_soft_cap = logits_soft_cap > 0.f;
   auto q_scalar_type = q.scalar_type();
-  auto kv_scalar_type =
-      paged_kv_cache.has_value() ? paged_kv_cache->scalar_type() : paged_k_cache->scalar_type();
+  auto kv_scalar_type = paged_k_cache.scalar_type();
+
+  // get kv_cache_strides
+  const int64_t* kv_cache_strides = nullptr;
+  auto k_strides = paged_k_cache.strides();
+  auto v_strides = paged_v_cache.strides();
+  TORCH_CHECK(k_strides == v_strides, "k/v strides must be identical");
+  kv_cache_strides = k_strides.data();
 
   DISPATCH_PYTORCH_QKV_DTYPE_TO_CTYPE(q_scalar_type, kv_scalar_type, q_type, kv_type, [&] {
     using DTypeQ = q_type;
@@ -260,12 +254,9 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
         return DISPATCH_LOGITS_SOFT_CAP(use_logits_soft_cap, USE_LOGITS_SOFT_CAP, [&] {
           paged_kv_t<DTypeKV, IdType> paged_kv(
               num_kv_heads, page_size, HEAD_DIM, batch_size, kv_layout,
-              static_cast<DTypeKV*>(paged_kv_cache.has_value() ? paged_kv_cache->data_ptr()
-                                                               : nullptr),
-              static_cast<DTypeKV*>(paged_k_cache.has_value() ? paged_k_cache->data_ptr()
-                                                              : nullptr),
-              static_cast<DTypeKV*>(paged_v_cache.has_value() ? paged_v_cache->data_ptr()
-                                                              : nullptr),
+              static_cast<DTypeKV*>(paged_k_cache.data_ptr()),
+              static_cast<DTypeKV*>(paged_v_cache.data_ptr()),
+              kv_cache_strides,
               static_cast<IdType*>(paged_kv_indices.data_ptr()),
               static_cast<IdType*>(paged_kv_indptr.data_ptr()),
               static_cast<IdType*>(paged_kv_last_page_len.data_ptr()));

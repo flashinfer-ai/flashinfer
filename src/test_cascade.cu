@@ -245,7 +245,8 @@ void _TestTwoLevelSinglePrefixCascadeDecodeCorrectness(size_t batch_size,
   std::vector<T> q_h = std::move(testcase_float_data[0]),
                  shared_k_h = std::move(testcase_float_data[1]),
                  shared_v_h = std::move(testcase_float_data[2]),
-                 kv_data_h = std::move(testcase_float_data[3]);
+                 k_data_h = std::move(testcase_float_data[3]),
+                 v_data_h = std::move(testcase_float_data[3]);
 
   std::vector<int32_t> kv_indices_combined_h = std::move(testcase_int_data[1]),
                        kv_indices_unique_h = std::move(testcase_int_data[2]),
@@ -254,8 +255,9 @@ void _TestTwoLevelSinglePrefixCascadeDecodeCorrectness(size_t batch_size,
                        kv_last_page_len_combined_h = std::move(testcase_int_data[5]),
                        kv_last_page_len_unique_h = std::move(testcase_int_data[6]);
 
-  thrust::device_vector<T> shared_k_d(shared_k_h), shared_v_d(shared_v_h), kv_data_d(kv_data_h),
-      q_d(q_h), o_baseline_d(q_h.size()), o_cascade_0_d(q_h.size()), o_cascade_1_d(q_h.size());
+  thrust::device_vector<T> shared_k_d(shared_k_h), shared_v_d(shared_v_h), k_data_d(k_data_h),
+      v_data_d(v_data_h), q_d(q_h), o_baseline_d(q_h.size()), o_cascade_0_d(q_h.size()),
+      o_cascade_1_d(q_h.size());
   thrust::device_vector<T> tmp_0_d(16 * 1024 * 1024);
   thrust::device_vector<float> lse_cascade_0_d(batch_size * num_qo_heads),
       lse_cascade_1_d(batch_size * num_qo_heads);
@@ -268,14 +270,14 @@ void _TestTwoLevelSinglePrefixCascadeDecodeCorrectness(size_t batch_size,
 
   paged_kv_t<T, int32_t> paged_kv_baseline_d(
       num_kv_heads, page_size, head_dim, batch_size, kv_layout,
-      thrust::raw_pointer_cast(kv_data_d.data()),
+      thrust::raw_pointer_cast(k_data_d.data()), thrust::raw_pointer_cast(v_data_d.data()),
       thrust::raw_pointer_cast(kv_indices_combined_d.data()),
       thrust::raw_pointer_cast(kv_indptr_combined_d.data()),
       thrust::raw_pointer_cast(kv_last_page_len_combined_d.data()));
 
   paged_kv_t<T, int32_t> paged_kv_casacde_d(
       num_kv_heads, page_size, head_dim, batch_size, kv_layout,
-      thrust::raw_pointer_cast(kv_data_d.data()),
+      thrust::raw_pointer_cast(k_data_d.data()), thrust::raw_pointer_cast(v_data_d.data()),
       thrust::raw_pointer_cast(kv_indices_unique_d.data()),
       thrust::raw_pointer_cast(kv_indptr_unique_d.data()),
       thrust::raw_pointer_cast(kv_last_page_len_unique_d.data()));
@@ -370,7 +372,8 @@ void _TestTwoLevelSinglePrefixCascadeAppendCorrectness(size_t batch_size,
   std::vector<T> q_h = std::move(testcase_float_data[0]),
                  shared_k_h = std::move(testcase_float_data[1]),
                  shared_v_h = std::move(testcase_float_data[2]),
-                 kv_data_h = std::move(testcase_float_data[3]);
+                 k_data_h = std::move(testcase_float_data[3]),
+                 v_data_h = std::move(testcase_float_data[4]);
 
   std::vector<int32_t> qo_indptr_h = std::move(testcase_int_data[0]),
                        kv_indices_combined_h = std::move(testcase_int_data[1]),
@@ -380,8 +383,9 @@ void _TestTwoLevelSinglePrefixCascadeAppendCorrectness(size_t batch_size,
                        kv_last_page_len_combined_h = std::move(testcase_int_data[5]),
                        kv_last_page_len_unique_h = std::move(testcase_int_data[6]);
 
-  thrust::device_vector<T> shared_k_d(shared_k_h), shared_v_d(shared_v_h), kv_data_d(kv_data_h),
-      q_d(q_h), o_baseline_d(q_h.size()), o_cascade_0_d(q_h.size()), o_cascade_1_d(q_h.size());
+  thrust::device_vector<T> shared_k_d(shared_k_h), shared_v_d(shared_v_h), k_data_d(k_data_h),
+      v_data_d(v_data_h), q_d(q_h), o_baseline_d(q_h.size()), o_cascade_0_d(q_h.size()),
+      o_cascade_1_d(q_h.size());
   thrust::device_vector<T> tmp_0_d(16 * 1024 * 1024);
   thrust::device_vector<float> lse_cascade_0_d((batch_size * qo_append_length) * num_qo_heads),
       lse_cascade_1_d((batch_size * qo_append_length) * num_qo_heads);
@@ -394,14 +398,14 @@ void _TestTwoLevelSinglePrefixCascadeAppendCorrectness(size_t batch_size,
 
   paged_kv_t<T, int32_t> paged_kv_baseline_d(
       num_kv_heads, page_size, head_dim, batch_size, kv_layout,
-      thrust::raw_pointer_cast(kv_data_d.data()),
+      thrust::raw_pointer_cast(k_data_d.data()), thrust::raw_pointer_cast(v_data_d.data()),
       thrust::raw_pointer_cast(kv_indices_combined_d.data()),
       thrust::raw_pointer_cast(kv_indptr_combined_d.data()),
       thrust::raw_pointer_cast(kv_last_page_len_combined_d.data()));
 
   paged_kv_t<T, int32_t> paged_kv_casacde_d(
       num_kv_heads, page_size, head_dim, batch_size, kv_layout,
-      thrust::raw_pointer_cast(kv_data_d.data()),
+      thrust::raw_pointer_cast(k_data_d.data()), thrust::raw_pointer_cast(v_data_d.data()),
       thrust::raw_pointer_cast(kv_indices_unique_d.data()),
       thrust::raw_pointer_cast(kv_indptr_unique_d.data()),
       thrust::raw_pointer_cast(kv_last_page_len_unique_d.data()));

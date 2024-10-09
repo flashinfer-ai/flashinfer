@@ -76,7 +76,8 @@ void bench_two_level_single_prefix_cascade_decode(nvbench::state& state) {
   std::vector<T> q_h = std::move(testcase_float_data[0]),
                  shared_k_h = std::move(testcase_float_data[1]),
                  shared_v_h = std::move(testcase_float_data[2]),
-                 kv_data_h = std::move(testcase_float_data[3]);
+                 k_data_h = std::move(testcase_float_data[3]),
+                 v_data_h = std::move(testcase_float_data[4]);
 
   std::vector<int32_t> kv_indices_combined_h = std::move(testcase_int_data[1]),
                        kv_indices_unique_h = std::move(testcase_int_data[2]),
@@ -85,10 +86,10 @@ void bench_two_level_single_prefix_cascade_decode(nvbench::state& state) {
                        kv_last_page_len_combined_h = std::move(testcase_int_data[5]),
                        kv_last_page_len_unique_h = std::move(testcase_int_data[6]);
 
-  thrust::device_vector<T> kv_data_d(kv_data_h);
+  thrust::device_vector<T> k_data_d(k_data_h), v_data_d(v_data_h);
   thrust::device_vector<T> q_d(q_h);
 
-  state.add_global_memory_reads<T>(kv_data_h.size() + q_h.size(), "Read");
+  state.add_global_memory_reads<T>(k_data_h.size() + v_data_h.size() + q_h.size(), "Read");
   state.add_global_memory_writes<T>(q_h.size(), "Write");
 
   if (use_cascade) {
@@ -102,7 +103,7 @@ void bench_two_level_single_prefix_cascade_decode(nvbench::state& state) {
         kv_last_page_len_unique_d(kv_last_page_len_unique_h);
     paged_kv_t<T, int32_t> paged_kv_casacde_d(
         num_kv_heads, page_size, head_dim, batch_size, kv_layout,
-        thrust::raw_pointer_cast(kv_data_d.data()),
+        thrust::raw_pointer_cast(k_data_d.data()), thrust::raw_pointer_cast(v_data_d.data()),
         thrust::raw_pointer_cast(kv_indices_unique_d.data()),
         thrust::raw_pointer_cast(kv_indptr_unique_d.data()),
         thrust::raw_pointer_cast(kv_last_page_len_unique_d.data()));
@@ -163,7 +164,7 @@ void bench_two_level_single_prefix_cascade_decode(nvbench::state& state) {
         kv_last_page_len_combined_d(kv_last_page_len_combined_h);
     paged_kv_t<T, int32_t> paged_kv_baseline_d(
         num_kv_heads, page_size, head_dim, batch_size, kv_layout,
-        thrust::raw_pointer_cast(kv_data_d.data()),
+        thrust::raw_pointer_cast(k_data_d.data()), thrust::raw_pointer_cast(v_data_d.data()),
         thrust::raw_pointer_cast(kv_indices_combined_d.data()),
         thrust::raw_pointer_cast(kv_indptr_combined_d.data()),
         thrust::raw_pointer_cast(kv_last_page_len_combined_d.data()));
@@ -214,7 +215,8 @@ void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
   std::vector<T> q_h = std::move(testcase_float_data[0]),
                  shared_k_h = std::move(testcase_float_data[1]),
                  shared_v_h = std::move(testcase_float_data[2]),
-                 kv_data_h = std::move(testcase_float_data[3]);
+                 k_data_h = std::move(testcase_float_data[3]),
+                 v_data_h = std::move(testcase_float_data[4]);
 
   std::vector<int32_t> qo_indptr_h = std::move(testcase_int_data[0]),
                        kv_indices_combined_h = std::move(testcase_int_data[1]),
@@ -224,11 +226,11 @@ void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
                        kv_last_page_len_combined_h = std::move(testcase_int_data[5]),
                        kv_last_page_len_unique_h = std::move(testcase_int_data[6]);
 
-  thrust::device_vector<T> kv_data_d(kv_data_h);
+  thrust::device_vector<T> k_data_d(k_data_h), v_data_d(k_data_h);
   thrust::device_vector<T> q_d(q_h);
   thrust::device_vector<int32_t> qo_indptr_d(qo_indptr_h);
 
-  state.add_global_memory_reads<T>(kv_data_h.size() + q_h.size(), "Read");
+  state.add_global_memory_reads<T>(k_data_h.size() + v_data_h.size() + q_h.size(), "Read");
   state.add_global_memory_writes<T>(q_h.size(), "Write");
 
   if (use_cascade) {
@@ -242,7 +244,7 @@ void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
         kv_last_page_len_unique_d(kv_last_page_len_unique_h);
     paged_kv_t<T, int32_t> paged_kv_casacde_d(
         num_kv_heads, page_size, head_dim, batch_size, kv_layout,
-        thrust::raw_pointer_cast(kv_data_d.data()),
+        thrust::raw_pointer_cast(k_data_d.data()), thrust::raw_pointer_cast(v_data_d.data()),
         thrust::raw_pointer_cast(kv_indices_unique_d.data()),
         thrust::raw_pointer_cast(kv_indptr_unique_d.data()),
         thrust::raw_pointer_cast(kv_last_page_len_unique_d.data()));
@@ -303,7 +305,7 @@ void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
         kv_last_page_len_combined_d(kv_last_page_len_combined_h);
     paged_kv_t<T, int32_t> paged_kv_baseline_d(
         num_kv_heads, page_size, head_dim, batch_size, kv_layout,
-        thrust::raw_pointer_cast(kv_data_d.data()),
+        thrust::raw_pointer_cast(k_data_d.data()), thrust::raw_pointer_cast(v_data_d.data()),
         thrust::raw_pointer_cast(kv_indices_combined_d.data()),
         thrust::raw_pointer_cast(kv_indptr_combined_d.data()),
         thrust::raw_pointer_cast(kv_last_page_len_combined_d.data()));

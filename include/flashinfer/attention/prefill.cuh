@@ -1856,11 +1856,9 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
                                     lane_idx / kv_frag_cols +
                                     kv_frag_rows * num_warps_x * num_warps_z * i,
                                 page_iter, entry_idx);
-      kv_offset[i] = page_iter < last_indptr
-                         ? paged_kv.get_elem_offset(
-                               __ldg(paged_kv.indices + page_iter), kv_head_idx, entry_idx,
-                               (lane_idx % kv_frag_cols) * num_elems_per_128b<DTypeKV>())
-                         : 0;
+      kv_offset[i] = paged_kv.protective_get_kv_offset(
+          page_iter, kv_head_idx, entry_idx,
+          (lane_idx % kv_frag_cols) * num_elems_per_128b<DTypeKV>(), last_indptr);
     }
     page_produce_kv<false, num_warps_x, num_warps_z, num_frags_y, num_frags_z>(
         k_smem, &kv_smem_offset_w, paged_kv, 0, kv_offset, chunk_size);
@@ -1902,11 +1900,9 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void BatchPrefillWithPage
                                       lane_idx / kv_frag_cols +
                                       kv_frag_rows * num_warps_x * num_warps_z * i,
                                   page_iter, entry_idx);
-        kv_offset[i] = page_iter < last_indptr
-                           ? paged_kv.get_elem_offset(
-                                 __ldg(paged_kv.indices + page_iter), kv_head_idx, entry_idx,
-                                 (lane_idx % kv_frag_cols) * num_elems_per_128b<DTypeKV>())
-                           : 0;
+        kv_offset[i] = paged_kv.protective_get_kv_offset(
+            page_iter, kv_head_idx, entry_idx,
+            (lane_idx % kv_frag_cols) * num_elems_per_128b<DTypeKV>(), last_indptr);
       }
       cp_async::wait_group<1>();
       block.sync();

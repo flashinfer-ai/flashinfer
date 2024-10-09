@@ -150,26 +150,25 @@ create_shared_prefix_testcase_data(size_t batch_size, size_t shared_prefix_lengt
   std::vector<int32_t> kv_indices_combined_h(kv_indptr_combined_h.back());
   std::vector<int32_t> kv_indices_unique_h(kv_indptr_unique_h.back());
 
-  std::vector<T> kv_data_h(num_pages * 2 * num_kv_heads * page_size * head_dim);
+  std::vector<T> k_data_h(num_pages * num_kv_heads * page_size * head_dim);
+  std::vector<T> v_data_h(num_pages * num_kv_heads * page_size * head_dim);
   uint32_t page_id = 0;
 
   for (; page_id < (shared_prefix_length / page_size); page_id++) {
     for (uint32_t entry_idx = 0; entry_idx < page_size; entry_idx++) {
       for (uint32_t head_idx = 0; head_idx < num_kv_heads; head_idx++) {
-        std::copy(
-            shared_k_h.begin() +
-                ((page_id * page_size + entry_idx) * num_kv_heads + head_idx) * head_dim,
-            shared_k_h.begin() +
-                ((page_id * page_size + entry_idx) * num_kv_heads + head_idx + 1) * head_dim,
-            kv_data_h.begin() +
-                (((page_id * 2 + 0) * num_kv_heads + head_idx) * page_size + entry_idx) * head_dim);
-        std::copy(
-            shared_v_h.begin() +
-                ((page_id * page_size + entry_idx) * num_kv_heads + head_idx) * head_dim,
-            shared_v_h.begin() +
-                ((page_id * page_size + entry_idx) * num_kv_heads + head_idx + 1) * head_dim,
-            kv_data_h.begin() +
-                (((page_id * 2 + 1) * num_kv_heads + head_idx) * page_size + entry_idx) * head_dim);
+        std::copy(shared_k_h.begin() +
+                      ((page_id * page_size + entry_idx) * num_kv_heads + head_idx) * head_dim,
+                  shared_k_h.begin() +
+                      ((page_id * page_size + entry_idx) * num_kv_heads + head_idx + 1) * head_dim,
+                  k_data_h.begin() +
+                      ((page_id * num_kv_heads + head_idx) * page_size + entry_idx) * head_dim);
+        std::copy(shared_v_h.begin() +
+                      ((page_id * page_size + entry_idx) * num_kv_heads + head_idx) * head_dim,
+                  shared_v_h.begin() +
+                      ((page_id * page_size + entry_idx) * num_kv_heads + head_idx + 1) * head_dim,
+                  v_data_h.begin() +
+                      ((page_id * num_kv_heads + head_idx) * page_size + entry_idx) * head_dim);
       }
     }
     for (uint32_t request_id = 0; request_id < batch_size; ++request_id) {
@@ -187,13 +186,11 @@ create_shared_prefix_testcase_data(size_t batch_size, size_t shared_prefix_lengt
           utils::vec_normal_(k);
           utils::vec_normal_(v);
           std::copy(k.begin(), k.end(),
-                    kv_data_h.begin() +
-                        (((page_id * 2 + 0) * num_kv_heads + head_idx) * page_size + entry_idx) *
-                            head_dim);
+                    k_data_h.begin() +
+                        ((page_id * num_kv_heads + head_idx) * page_size + entry_idx) * head_dim);
           std::copy(v.begin(), v.end(),
-                    kv_data_h.begin() +
-                        (((page_id * 2 + 1) * num_kv_heads + head_idx) * page_size + entry_idx) *
-                            head_dim);
+                    v_data_h.begin() +
+                        ((page_id * num_kv_heads + head_idx) * page_size + entry_idx) * head_dim);
         }
       }
       kv_indices_combined_h[request_id * ((shared_prefix_length + unique_kv_length) / page_size) +
@@ -202,7 +199,8 @@ create_shared_prefix_testcase_data(size_t batch_size, size_t shared_prefix_lengt
     }
   }
   return std::make_tuple<std::vector<std::vector<T>>, std::vector<std::vector<int32_t>>>(
-      {std::move(q_h), std::move(shared_k_h), std::move(shared_v_h), std::move(kv_data_h)},
+      {std::move(q_h), std::move(shared_k_h), std::move(shared_v_h), std::move(k_data_h),
+       std::move(v_data_h)},
       {std::move(qo_indptr), std::move(kv_indices_combined_h), std::move(kv_indices_unique_h),
        std::move(kv_indptr_combined_h), std::move(kv_indptr_unique_h),
        std::move(kv_last_page_len_combined_h), std::move(kv_last_page_len_unique_h)});

@@ -66,8 +66,9 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
     torch::Tensor float_workspace_buffer,
     torch::Tensor int_workspace_buffer,
     std::vector<int64_t> plan_info_vec,
-    torch::Tensor q, std::optional<torch::Tensor> paged_kv_cache,
-    std::optional<torch::Tensor> paged_k_cache, std::optional<torch::Tensor> paged_v_cache,
+    torch::Tensor q,
+    torch::Tensor paged_k_cache,
+    torch::Tensor paged_v_cache,
     torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
     torch::Tensor paged_kv_last_page_len,
     std::optional<torch::Tensor> alibi_slopes,
@@ -76,27 +77,16 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
   DecodePlanInfo plan_info;
   plan_info.FromVector(plan_info_vec);
   QKVLayout kv_layout = static_cast<QKVLayout>(kv_layout_code);
-  bool paged_kv_defined = paged_kv_cache.has_value();
   auto device = q.device();
   int64_t batch_size = q.size(0);
   int64_t num_qo_heads = q.size(1);
   int64_t num_kv_heads, page_size;
-  if (paged_kv_defined) {
-    if (kv_layout == QKVLayout::kHND) {
-      num_kv_heads = paged_kv_cache->size(2);
-      page_size = paged_kv_cache->size(3);
-    } else {
-      page_size = paged_kv_cache->size(2);
-      num_kv_heads = paged_kv_cache->size(3);
-    }
+  if (kv_layout == QKVLayout::kHND) {
+    num_kv_heads = paged_k_cache.size(1);
+    page_size = paged_k_cache.size(2);
   } else {
-    if (kv_layout == QKVLayout::kHND) {
-      num_kv_heads = paged_k_cache->size(1);
-      page_size = paged_k_cache->size(2);
-    } else {
-      page_size = paged_k_cache->size(1);
-      num_kv_heads = paged_k_cache->size(2);
-    }
+    page_size = paged_k_cache.size(1);
+    num_kv_heads = paged_k_cache.size(2);
   }
 
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
@@ -111,15 +101,18 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
   void* float_buffer = static_cast<void*>(float_workspace_buffer.data_ptr());
   void* int_buffer = static_cast<void*>(int_workspace_buffer.data_ptr());
 
+  const int64_t* kv_cache_strides = nullptr;
+  auto k_strides = paged_k_cache.strides();
+  auto v_strides = paged_v_cache.strides();
+  TORCH_CHECK(k_strides == v_strides, "k/v strides must be identical");
+  kv_cache_strides = k_strides.data();
+
   paged_kv_t<{{ dtype_kv }}, {{ dtype_idx }}> paged_kv(
       num_kv_heads, page_size, {{ head_dim }},
       batch_size, kv_layout,
-      static_cast<{{ dtype_kv }}*>(paged_kv_cache.has_value() ? paged_kv_cache->data_ptr()
-                                                          : nullptr),
-      static_cast<{{ dtype_kv }} *>(paged_k_cache.has_value() ? paged_k_cache->data_ptr()
-                                                          : nullptr),
-      static_cast<{{ dtype_kv }}*>(paged_v_cache.has_value() ? paged_v_cache->data_ptr()
-                                                          : nullptr),
+      static_cast<{{ dtype_kv }}*>(paged_k_cache.data_ptr()),
+      static_cast<{{ dtype_kv }}*>(paged_v_cache.data_ptr()),
+      kv_cache_strides,
       static_cast<{{ dtype_idx }}*>(paged_kv_indices.data_ptr()),
       static_cast<{{ dtype_idx }}*>(paged_kv_indptr.data_ptr()),
       static_cast<{{ dtype_idx }}*>(paged_kv_last_page_len.data_ptr()));

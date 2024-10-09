@@ -38,7 +38,8 @@ void _TestBatchPagedPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t n
   for (size_t request_idx = 0; request_idx < batch_size; ++request_idx) {
     append_indptr.push_back(append_indptr.back() + kv_lens[request_idx]);
   }
-  std::vector<DTypeKV> kv_data;
+  std::vector<DTypeKV> k_data;
+  std::vector<DTypeKV> v_data;
   std::vector<int32_t> kv_indptr{0};
   std::vector<int32_t> kv_indices;
   std::vector<int32_t> kv_last_page_len;
@@ -61,22 +62,24 @@ void _TestBatchPagedPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t n
     }
   }
 
-  kv_data.resize(page_counter * 2 * num_kv_heads * page_size * head_dim);
+  k_data.resize(page_counter * num_kv_heads * page_size * head_dim);
+  v_data.resize(page_counter * num_kv_heads * page_size * head_dim);
   flashinfer::paged_kv_t<DTypeKV, int32_t> paged_kv_cpu(
-      num_kv_heads, page_size, head_dim, batch_size, kv_layout, kv_data.data(), kv_indices.data(),
-      kv_indptr.data(), kv_last_page_len.data());
+      num_kv_heads, page_size, head_dim, batch_size, kv_layout, k_data.data(), v_data.data(),
+      kv_indices.data(), kv_indptr.data(), kv_last_page_len.data());
   cpu_reference::append_paged_kv_cache<DTypeKV, int32_t>(paged_kv_cpu, key, value, append_indptr);
 
   // copy data to device
-  thrust::device_vector<DTypeKV> kv_data_device(kv_data);
+  thrust::device_vector<DTypeKV> k_data_device(k_data);
+  thrust::device_vector<DTypeKV> v_data_device(v_data);
   thrust::device_vector<int32_t> kv_indptr_device(kv_indptr);
   thrust::device_vector<int32_t> kv_indices_device(kv_indices);
   thrust::device_vector<int32_t> kv_last_page_len_device(kv_last_page_len);
 
   // create paged_kv object
   flashinfer::paged_kv_t<DTypeKV, int32_t> paged_kv = paged_kv_cpu;
-  paged_kv.k_data = thrust::raw_pointer_cast(kv_data_device.data());
-  paged_kv.v_data = paged_kv.k_data + paged_kv_cpu.kv_ptr_delta();
+  paged_kv.k_data = thrust::raw_pointer_cast(k_data_device.data());
+  paged_kv.v_data = thrust::raw_pointer_cast(v_data_device.data());
   paged_kv.indices = thrust::raw_pointer_cast(kv_indices_device.data());
   paged_kv.indptr = thrust::raw_pointer_cast(kv_indptr_device.data());
   paged_kv.last_page_len = thrust::raw_pointer_cast(kv_last_page_len_device.data());
@@ -255,7 +258,8 @@ void _TestBatchPagedPrefillKernelShortContextCorrectness(size_t num_kv_heads, si
   for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
     append_indptr.push_back(append_indptr.back() + kv_lens[request_idx]);
   }
-  std::vector<DTypeKV> kv_data;
+  std::vector<DTypeKV> k_data;
+  std::vector<DTypeKV> v_data;
   std::vector<int32_t> kv_indptr{0};
   std::vector<int32_t> kv_indices;
   std::vector<int32_t> kv_last_page_len;
@@ -277,22 +281,24 @@ void _TestBatchPagedPrefillKernelShortContextCorrectness(size_t num_kv_heads, si
     }
   }
 
-  kv_data.resize(page_counter * 2 * num_kv_heads * page_size * head_dim);
+  k_data.resize(page_counter * num_kv_heads * page_size * head_dim);
+  v_data.resize(page_counter * num_kv_heads * page_size * head_dim);
   flashinfer::paged_kv_t<DTypeKV, int32_t> paged_kv_cpu(
-      num_kv_heads, page_size, head_dim, batch_size, kv_layout, kv_data.data(), kv_indices.data(),
-      kv_indptr.data(), kv_last_page_len.data());
+      num_kv_heads, page_size, head_dim, batch_size, kv_layout, k_data.data(), v_data.data(),
+      kv_indices.data(), kv_indptr.data(), kv_last_page_len.data());
   cpu_reference::append_paged_kv_cache<DTypeKV, int32_t>(paged_kv_cpu, key, value, append_indptr);
 
   // copy data to device
-  thrust::device_vector<DTypeKV> kv_data_device(kv_data);
+  thrust::device_vector<DTypeKV> k_data_device(k_data);
+  thrust::device_vector<DTypeKV> v_data_device(v_data);
   thrust::device_vector<int32_t> kv_indptr_device(kv_indptr);
   thrust::device_vector<int32_t> kv_indices_device(kv_indices);
   thrust::device_vector<int32_t> kv_last_page_len_device(kv_last_page_len);
 
   // create paged_kv object
   flashinfer::paged_kv_t<DTypeKV, int32_t> paged_kv = paged_kv_cpu;
-  paged_kv.k_data = thrust::raw_pointer_cast(kv_data_device.data());
-  paged_kv.v_data = paged_kv.k_data + paged_kv_cpu.kv_ptr_delta();
+  paged_kv.k_data = thrust::raw_pointer_cast(k_data_device.data());
+  paged_kv.v_data = thrust::raw_pointer_cast(v_data_device.data());
   paged_kv.indices = thrust::raw_pointer_cast(kv_indices_device.data());
   paged_kv.indptr = thrust::raw_pointer_cast(kv_indptr_device.data());
   paged_kv.last_page_len = thrust::raw_pointer_cast(kv_last_page_len_device.data());
@@ -380,7 +386,8 @@ void _TestBatchPagedPrefillKernelQMinMaxKVMinMaxCorrectness(
   for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
     append_indptr.push_back(append_indptr.back() + kv_lens[request_idx]);
   }
-  std::vector<DTypeKV> kv_data;
+  std::vector<DTypeKV> k_data;
+  std::vector<DTypeKV> v_data;
   std::vector<int32_t> kv_indptr{0};
   std::vector<int32_t> kv_indices;
   std::vector<int32_t> kv_last_page_len;
@@ -402,22 +409,24 @@ void _TestBatchPagedPrefillKernelQMinMaxKVMinMaxCorrectness(
     }
   }
 
-  kv_data.resize(page_counter * 2 * num_kv_heads * page_size * head_dim);
+  k_data.resize(page_counter * num_kv_heads * page_size * head_dim);
+  v_data.resize(page_counter * num_kv_heads * page_size * head_dim);
   flashinfer::paged_kv_t<DTypeKV, int32_t> paged_kv_cpu(
-      num_kv_heads, page_size, head_dim, batch_size, kv_layout, kv_data.data(), kv_indices.data(),
-      kv_indptr.data(), kv_last_page_len.data());
+      num_kv_heads, page_size, head_dim, batch_size, kv_layout, k_data.data(), v_data.data(),
+      kv_indices.data(), kv_indptr.data(), kv_last_page_len.data());
   cpu_reference::append_paged_kv_cache<DTypeKV, int32_t>(paged_kv_cpu, key, value, append_indptr);
 
   // copy data to device
-  thrust::device_vector<DTypeKV> kv_data_device(kv_data);
+  thrust::device_vector<DTypeKV> k_data_device(k_data);
+  thrust::device_vector<DTypeKV> v_data_device(v_data);
   thrust::device_vector<int32_t> kv_indptr_device(kv_indptr);
   thrust::device_vector<int32_t> kv_indices_device(kv_indices);
   thrust::device_vector<int32_t> kv_last_page_len_device(kv_last_page_len);
 
   // create paged_kv object
   flashinfer::paged_kv_t<DTypeKV, int32_t> paged_kv = paged_kv_cpu;
-  paged_kv.k_data = thrust::raw_pointer_cast(kv_data_device.data());
-  paged_kv.v_data = paged_kv.k_data + paged_kv_cpu.kv_ptr_delta();
+  paged_kv.k_data = thrust::raw_pointer_cast(k_data_device.data());
+  paged_kv.v_data = thrust::raw_pointer_cast(v_data_device.data());
   paged_kv.indices = thrust::raw_pointer_cast(kv_indices_device.data());
   paged_kv.indptr = thrust::raw_pointer_cast(kv_indptr_device.data());
   paged_kv.last_page_len = thrust::raw_pointer_cast(kv_last_page_len_device.data());
@@ -497,7 +506,8 @@ void _TestBatchPagedPrefillKernelLongContextCorrectness(size_t num_kv_heads, siz
   std::vector<int32_t> q_lens{33}, kv_lens{32768};
   std::vector<int32_t> q_indptr{0, 33};
   std::vector<int32_t> append_indptr{0, 32768};
-  std::vector<DTypeKV> kv_data;
+  std::vector<DTypeKV> k_data;
+  std::vector<DTypeKV> v_data;
   std::vector<int32_t> kv_indptr{0};
   std::vector<int32_t> kv_indices;
   std::vector<int32_t> kv_last_page_len;
@@ -515,22 +525,24 @@ void _TestBatchPagedPrefillKernelLongContextCorrectness(size_t num_kv_heads, siz
     kv_indices.push_back(page_counter++);
   }
 
-  kv_data.resize(page_counter * 1 * 2 * num_kv_heads * page_size * head_dim);
+  k_data.resize(page_counter * 1 * num_kv_heads * page_size * head_dim);
+  v_data.resize(page_counter * 1 * num_kv_heads * page_size * head_dim);
   flashinfer::paged_kv_t<DTypeKV, int32_t> paged_kv_cpu(
-      num_kv_heads, page_size, head_dim, 1, kv_layout, kv_data.data(), kv_indices.data(),
-      kv_indptr.data(), kv_last_page_len.data());
+      num_kv_heads, page_size, head_dim, 1, kv_layout, k_data.data(), v_data.data(),
+      kv_indices.data(), kv_indptr.data(), kv_last_page_len.data());
   cpu_reference::append_paged_kv_cache<DTypeKV, int32_t>(paged_kv_cpu, {k}, {v}, append_indptr);
 
   // copy data to device
-  thrust::device_vector<DTypeKV> kv_data_device(kv_data);
+  thrust::device_vector<DTypeKV> k_data_device(k_data);
+  thrust::device_vector<DTypeKV> v_data_device(v_data);
   thrust::device_vector<int32_t> kv_indptr_device(kv_indptr);
   thrust::device_vector<int32_t> kv_indices_device(kv_indices);
   thrust::device_vector<int32_t> kv_last_page_len_device(kv_last_page_len);
 
   // create paged_kv object
   flashinfer::paged_kv_t<DTypeKV, int32_t> paged_kv = paged_kv_cpu;
-  paged_kv.k_data = thrust::raw_pointer_cast(kv_data_device.data());
-  paged_kv.v_data = paged_kv.k_data + paged_kv_cpu.kv_ptr_delta();
+  paged_kv.k_data = thrust::raw_pointer_cast(k_data_device.data());
+  paged_kv.v_data = thrust::raw_pointer_cast(v_data_device.data());
   paged_kv.indices = thrust::raw_pointer_cast(kv_indices_device.data());
   paged_kv.indptr = thrust::raw_pointer_cast(kv_indptr_device.data());
   paged_kv.last_page_len = thrust::raw_pointer_cast(kv_last_page_len_device.data());

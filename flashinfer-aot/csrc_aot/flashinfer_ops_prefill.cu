@@ -39,10 +39,9 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCacheRun(
 std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
     unsigned int mask_mode_code, torch::Tensor float_workspace_buffer,
     torch::Tensor int_workspace_buffer, std::vector<int64_t> plan_info_vec, torch::Tensor q,
-    std::optional<torch::Tensor> paged_kv_cache, std::optional<torch::Tensor> paged_k_cache,
-    std::optional<torch::Tensor> paged_v_cache, std::optional<torch::Tensor> maybe_custom_mask,
-    std::optional<torch::Tensor> maybe_alibi_slopes, torch::Tensor qo_indptr,
-    torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
+    torch::Tensor paged_k_cache, torch::Tensor paged_v_cache,
+    std::optional<torch::Tensor> maybe_custom_mask, std::optional<torch::Tensor> maybe_alibi_slopes,
+    torch::Tensor qo_indptr, torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
     torch::Tensor paged_kv_last_page_len, std::optional<torch::Tensor> maybe_qk_indptr,
     unsigned int layout, int32_t window_left, float logits_soft_cap, float sm_scale,
     float rope_scale, float rope_theta, bool return_lse);
