@@ -45,6 +45,7 @@ def get_gemm_module():
             )
     return _gemm_module
 
+
 def get_gemm_sm90_module():
     print("get_gemm_sm90_module")
     global _gemm_module_sm90

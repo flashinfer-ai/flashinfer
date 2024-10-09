@@ -25,5 +25,5 @@ FLASHINFER_INCLUDE_DIR = _project_root / "include"
 FLASHINFER_CSRC_DIR = _project_root / "csrc"
 CUTLASS_INCLUDE_DIRS = [
     _project_root / "3rdparty" / "cutlass" / "include",
-    _project_root / "3rdparty" / "cutlass" / "tools" / "util" / "include"
+    _project_root / "3rdparty" / "cutlass" / "tools" / "util" / "include",
 ]

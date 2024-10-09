@@ -19,10 +19,11 @@
 
 using namespace flashinfer::group_gemm;
 
-torch::Tensor CutlassSegmentGEMMSM90(torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer, torch::Tensor seg_indptr,
-                                 torch::Tensor weight_indices, torch::Tensor x,
-                                 torch::Tensor weight, unsigned int batch_size,
-                                 bool weight_column_major) {
+torch::Tensor CutlassSegmentGEMMSM90(torch::Tensor float_workspace_buffer,
+                                     torch::Tensor int_workspace_buffer, torch::Tensor seg_indptr,
+                                     torch::Tensor weight_indices, torch::Tensor x,
+                                     torch::Tensor weight, unsigned int batch_size,
+                                     bool weight_column_major) {
   // TODO(Zihao): Add more checks here
   CHECK_INPUT(seg_indptr);
   CHECK_INPUT(x);
@@ -52,8 +53,10 @@ torch::Tensor CutlassSegmentGEMMSM90(torch::Tensor float_workspace_buffer, torch
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(x.scalar_type(), c_type, [&] {
     using cutlass_t = typename cutlass_dtype<c_type>::type;
     auto status = CutlassSegmentGEMMSM90Run<cutlass_t>(
-        float_workspace_buffer.data_ptr(), float_workspace_buffer.element_size() * float_workspace_buffer.size(0),
-        int_workspace_buffer.data_ptr(), int_workspace_buffer.element_size() * int_workspace_buffer.size(0),
+        float_workspace_buffer.data_ptr(),
+        float_workspace_buffer.element_size() * float_workspace_buffer.size(0),
+        int_workspace_buffer.data_ptr(),
+        int_workspace_buffer.element_size() * int_workspace_buffer.size(0),
         static_cast<cutlass_t*>(x.data_ptr()), static_cast<cutlass_t*>(weight.data_ptr()),
         static_cast<cutlass_t*>(y.data_ptr()), static_cast<int64_t*>(seg_indptr.data_ptr()),
         weight_indices_defined ? static_cast<int64_t*>(weight_indices.data_ptr()) : nullptr,

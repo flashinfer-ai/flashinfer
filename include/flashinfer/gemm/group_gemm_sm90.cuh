@@ -18,30 +18,30 @@
 
 #include <sstream>
 
-#include "../allocator.h"
-#include "../utils.cuh"
-#include "cutlass/cutlass.h"
 #include "group_gemm_cutlass.cuh"
 
+#include "../allocator.h"
+#include "../utils.cuh"
 #include "cute/tensor.hpp"
+#include "cutlass/cutlass.h"
 #include "cutlass/tensor_ref.h"
+#include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/epilogue/thread/linear_combination.h"
+#include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
-#include "cutlass/gemm/collective/collective_builder.hpp"
-#include "cutlass/epilogue/collective/collective_builder.hpp"
-#include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
-
 #include "cutlass/util/command_line.h"
 #include "cutlass/util/distribution.h"
 #include "cutlass/util/host_tensor.h"
 #include "cutlass/util/packed_stride.hpp"
-#include "cutlass/util/tensor_view_io.h"
 #include "cutlass/util/reference/device/gemm.h"
 #include "cutlass/util/reference/device/tensor_compare.h"
 #include "cutlass/util/reference/device/tensor_fill.h"
+#include "cutlass/util/tensor_view_io.h"
+
 
 namespace flashinfer {
 
@@ -72,13 +72,12 @@ using namespace cute;
   }
 
 template <typename DTypeIn, typename DTypeOut>
-cudaError_t CutlassSegmentGEMMSM90Run(
-  void* float_buffer, size_t float_buffer_size_in_bytes,
-  void* int_buffer, size_t int_buffer_size_in_bytes, DTypeIn* x,
-                                           DTypeIn* w, DTypeOut* y, int64_t* xy_indptr_d,
-                                           int64_t* w_indices_d, unsigned int batch_size,
-                                           unsigned int d_in, unsigned int d_out,
-                                           bool weight_column_major, cudaStream_t stream) {
+cudaError_t CutlassSegmentGEMMSM90Run(void* float_buffer, size_t float_buffer_size_in_bytes,
+                                      void* int_buffer, size_t int_buffer_size_in_bytes, DTypeIn* x,
+                                      DTypeIn* w, DTypeOut* y, int64_t* xy_indptr_d,
+                                      int64_t* w_indices_d, unsigned int batch_size,
+                                      unsigned int d_in, unsigned int d_out,
+                                      bool weight_column_major, cudaStream_t stream) {
   auto compute_capacity = GetCudaComputeCapability();
   if (compute_capacity.first < 9) {
     std::cerr << "CutlassSegmentGEMMSM90Run requires compute capability of at least 9.0"
@@ -167,8 +166,7 @@ cudaError_t CutlassSegmentGEMMSM90Run(
         using StrideC = typename Gemm::GemmKernel::InternalStrideC;
         using StrideD = typename Gemm::GemmKernel::InternalStrideD;
 
-        AlignedAllocator allocator(int_buffer,
-                                   int_buffer_size_in_bytes);
+        AlignedAllocator allocator(int_buffer, int_buffer_size_in_bytes);
         ProblemShape::UnderlyingProblemShape* problem_sizes_device =
             allocator.aligned_alloc<ProblemShape::UnderlyingProblemShape>(
                 batch_size * sizeof(ProblemShape::UnderlyingProblemShape), 16,
@@ -224,8 +222,7 @@ cudaError_t CutlassSegmentGEMMSM90Run(
         size_t workspace_size = Gemm::get_workspace_size(arguments);
 
         // Allocate workspace memory
-        AlignedAllocator float_allocator(float_buffer,
-                                         float_buffer_size_in_bytes);
+        AlignedAllocator float_allocator(float_buffer, float_buffer_size_in_bytes);
         auto workspace_ptr = float_allocator.aligned_alloc<void>(workspace_size, 64,
                                                                  "sm90_group_gemm_float_workspace");
 
