@@ -22,7 +22,6 @@
 #include "flashinfer/allocator.h"
 #include "flashinfer/attention/mask.cuh"
 #include "flashinfer/attention/scheduler.cuh"
-#include "flashinfer/attention/warp_layout.cuh"
 #include "flashinfer/layout.cuh"
 #include "utils.h"
 

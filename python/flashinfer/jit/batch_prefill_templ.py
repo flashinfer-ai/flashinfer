@@ -138,12 +138,11 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCacheRun(
   params.total_num_rows = plan_info.total_num_rows;
   params.padded_batch_size = plan_info.padded_batch_size;
 
-  WarpLayout warp_layout = WarpLayout(plan_info.warp_layout_code);
   cudaError_t status = cudaSuccess;
 
-  DISPATCH_WARP_LAYOUT(warp_layout, WARP_LAYOUT, {
+  DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
     status = BatchPrefillWithRaggedKVCacheDispatched<
-      WARP_LAYOUT, {{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, {{ mask_mode }}, RaggedAttentionVariant>(
+      CTA_TILE_Q, {{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, {{ mask_mode }}, RaggedAttentionVariant>(
         params, tmp_v, tmp_s, torch_current_stream);
   });
 
@@ -243,12 +242,11 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
   params.total_num_rows = plan_info.total_num_rows;
   params.padded_batch_size = plan_info.padded_batch_size;
 
-  WarpLayout warp_layout = WarpLayout(plan_info.warp_layout_code);
   cudaError_t status = cudaSuccess;
 
-  DISPATCH_WARP_LAYOUT(warp_layout, WARP_LAYOUT, {
+  DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
     status = BatchPrefillWithPagedKVCacheDispatched<
-      WARP_LAYOUT, {{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, {{ mask_mode }}, PagedAttentionVariant>(
+      CTA_TILE_Q, {{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, {{ mask_mode }}, PagedAttentionVariant>(
         params, tmp_v, tmp_s, torch_current_stream);
   });
 

@@ -63,36 +63,65 @@
     __VA_ARGS__                                                                                 \
   }
 
-#define DISPATCH_NUM_FRAGS_X(num_frags_x, NUM_FRAGS_X, ...) \
-  if (num_frags_x == 1) {                                   \
-    constexpr size_t NUM_FRAGS_X = 1;                       \
+#define DISPATCH_NUM_FRAGS_Q(num_frags_q, NUM_FRAGS_Q, ...) \
+  if (num_frags_q == 1) {                                   \
+    constexpr size_t NUM_FRAGS_Q = 1;                       \
     __VA_ARGS__                                             \
-  } else if (num_frags_x == 2) {                            \
-    constexpr size_t NUM_FRAGS_X = 2;                       \
+  } else if (num_frags_q == 2) {                            \
+    constexpr size_t NUM_FRAGS_Q = 2;                       \
     __VA_ARGS__                                             \
   } else {                                                  \
     std::ostringstream err_msg;                             \
-    err_msg << "Unsupported num_frags_x: " << num_frags_x;  \
+    err_msg << "Unsupported num_frags_q: " << num_frags_q;  \
     throw std::invalid_argument(err_msg.str());             \
   }
 
-#define DISPATCH_NUM_FRAGS_Z(max_frags_z, NUM_FRAGS_Z, ...) \
-  if (max_frags_z >= 8) {                                   \
-    constexpr size_t NUM_FRAGS_Z = 8;                       \
-    __VA_ARGS__                                             \
-  } else if (max_frags_z >= 4) {                            \
-    constexpr size_t NUM_FRAGS_Z = 4;                       \
-    __VA_ARGS__                                             \
-  } else if (max_frags_z >= 2) {                            \
-    constexpr size_t NUM_FRAGS_Z = 2;                       \
-    __VA_ARGS__                                             \
-  } else if (max_frags_z >= 1) {                            \
-    constexpr size_t NUM_FRAGS_Z = 1;                       \
-    __VA_ARGS__                                             \
-  } else {                                                  \
-    std::ostringstream err_msg;                             \
-    err_msg << "Unsupported max_frags_z: " << max_frags_z;  \
-    throw std::invalid_argument(err_msg.str());             \
+#define DISPATCH_NUM_FRAGS_KV(max_frags_kv, NUM_FRAGS_KV, ...) \
+  if (max_frags_kv >= 8) {                                     \
+    constexpr size_t NUM_FRAGS_KV = 8;                         \
+    __VA_ARGS__                                                \
+  } else if (max_frags_kv >= 4) {                              \
+    constexpr size_t NUM_FRAGS_KV = 4;                         \
+    __VA_ARGS__                                                \
+  } else if (max_frags_kv >= 2) {                              \
+    constexpr size_t NUM_FRAGS_KV = 2;                         \
+    __VA_ARGS__                                                \
+  } else if (max_frags_kv >= 1) {                              \
+    constexpr size_t NUM_FRAGS_KV = 1;                         \
+    __VA_ARGS__                                                \
+  } else {                                                     \
+    std::ostringstream err_msg;                                \
+    err_msg << "Unsupported max_frags_kv: " << max_frags_kv;   \
+    throw std::invalid_argument(err_msg.str());                \
+  }
+
+#define DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, ...)   \
+  switch (cta_tile_q) {                                    \
+    case 128: {                                            \
+      constexpr uint32_t CTA_TILE_Q = 128;                 \
+      __VA_ARGS__                                          \
+      break;                                               \
+    }                                                      \
+    case 64: {                                             \
+      constexpr uint32_t CTA_TILE_Q = 64;                  \
+      __VA_ARGS__                                          \
+      break;                                               \
+    }                                                      \
+    case 32: {                                             \
+      constexpr uint32_t CTA_TILE_Q = 32;                  \
+      __VA_ARGS__                                          \
+      break;                                               \
+    }                                                      \
+    case 16: {                                             \
+      constexpr uint32_t CTA_TILE_Q = 16;                  \
+      __VA_ARGS__                                          \
+      break;                                               \
+    }                                                      \
+    default: {                                             \
+      std::ostringstream err_msg;                          \
+      err_msg << "Unsupported cta_tile_q: " << cta_tile_q; \
+      throw std::invalid_argument(err_msg.str());          \
+    }                                                      \
   }
 
 #define DISPATCH_GQA_GROUP_SIZE(group_size, GROUP_SIZE, ...) \
