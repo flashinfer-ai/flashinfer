@@ -419,8 +419,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__
   DTypeKV* k_smem = (DTypeKV*)smem;
   DTypeKV* v_smem = (DTypeKV*)(smem + num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
                                           sizeof(DTypeKV));
-  DTypeKV** k_ptrs_smem = (DTypeKV**)(smem + 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz *
-                                                 head_dim * sizeof(DTypeKV));
+  size_t* kv_offset_smem = (size_t*)(smem + 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz *
+                                                head_dim * sizeof(DTypeKV));
   float* smem_md = (float*)(smem + 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
                                        sizeof(DTypeKV));
 
@@ -459,34 +459,35 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__
   for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
     uint32_t q, r;
     paged_kv.page_size.divmod(packed_page_iter_base + ((j * bdz + tz) * bdy + ty) * bdx + tx, q, r);
-    k_ptrs_smem[((j * bdz + tz) * bdy + ty) * bdx + tx] =
-        paged_kv.protective_get_k_ptr(q, kv_head_idx, r, 0, last_indptr);
+    kv_offset_smem[((j * bdz + tz) * bdy + ty) * bdx + tx] =
+        paged_kv.protective_get_kv_offset(q, kv_head_idx, r, 0, last_indptr);
   }
   block.sync();
 
-  DTypeKV* k_ptrs[tile_size_per_bdx];
+  size_t kv_offset[tile_size_per_bdx];
 #pragma unroll
   for (uint32_t iter = 0; iter < num_stages_smem; ++iter) {
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
-      k_ptrs[j] =
-          k_ptrs_smem[((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j] + tx * vec_size;
+      kv_offset[j] =
+          kv_offset_smem[((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j] + tx * vec_size;
     }
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
           k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
-          k_ptrs[j], ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
+          paged_kv.k_data + kv_offset[j],
+          ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
     }
     cp_async::commit_group();
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
-      DTypeKV* v_ptr = k_ptrs[j] + paged_kv.kv_ptr_delta();
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
           v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
-          v_ptr, ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
+          paged_kv.v_data + kv_offset[j],
+          ((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
     }
     cp_async::commit_group();
     stage_idx = (stage_idx + 1) % num_stages_smem;
@@ -505,8 +506,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__
             packed_page_iter_base + ((iter + num_stages_smem) * tile_size_per_bdx * bdy * bdz +
                                      ((j * bdz + tz) * bdy + ty) * bdx + tx),
             q, r);
-        k_ptrs_smem[((j * bdz + tz) * bdy + ty) * bdx + tx] =
-            paged_kv.protective_get_k_ptr(q, kv_head_idx, r, 0, last_indptr);
+        kv_offset_smem[((j * bdz + tz) * bdy + ty) * bdx + tx] =
+            paged_kv.protective_get_kv_offset(q, kv_head_idx, r, 0, last_indptr);
       }
     }
     // compute qk
@@ -522,10 +523,10 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__
 
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
-      k_ptrs[j] = k_ptrs_smem[((((iter + num_stages_smem) % bdx) * bdz + tz) * bdy + ty) *
-                                  tile_size_per_bdx +
-                              j] +
-                  tx * vec_size;
+      kv_offset[j] = kv_offset_smem[((((iter + num_stages_smem) % bdx) * bdz + tz) * bdy + ty) *
+                                        tile_size_per_bdx +
+                                    j] +
+                     tx * vec_size;
     }
 
     // load k tiles
@@ -534,7 +535,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
           k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
-          k_ptrs[j],
+          paged_kv.k_data + kv_offset[j],
           (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
     }
     cp_async::commit_group();
@@ -549,11 +550,10 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__
     // load v tiles
 #pragma unroll
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
-      DTypeKV* v_ptr = k_ptrs[j] + paged_kv.kv_ptr_delta();
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
           v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
-          v_ptr,
+          paged_kv.v_data + kv_offset[j],
           (((iter + num_stages_smem) * bdz + tz) * bdy + ty) * tile_size_per_bdx + j < chunk_size);
     }
     cp_async::commit_group();

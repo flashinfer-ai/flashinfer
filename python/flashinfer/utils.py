@@ -100,16 +100,18 @@ def get_indptr(x: torch.Tensor) -> torch.Tensor:
 def _unpack_paged_kv_cache(
     paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     kv_layout: str,
-) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     if isinstance(paged_kv_cache, tuple):
         paged_k_cache, paged_v_cache = paged_kv_cache
         return (
-            None,
             _expand_4d(paged_k_cache, kv_layout),
             _expand_4d(paged_v_cache, kv_layout),
         )
     elif torch.is_tensor(paged_kv_cache):
-        return (_expand_5d(paged_kv_cache, kv_layout), None, None)
+        # NOTE(Zihao): split on the second dimension
+        paged_kv_cache = _expand_5d(paged_kv_cache, kv_layout)
+        paged_k_cache, paged_v_cache = paged_kv_cache.unbind(dim=1)
+        return paged_k_cache, paged_v_cache
     else:
         raise KeyError(
             "Unrecongized paged_kv_cache type {}, expect a single tensor or a tuple of tensor.".format(
