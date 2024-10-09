@@ -128,13 +128,13 @@ class BatchDecodeHandler {
   cudaStream_t stream_;
 };
 
-template <WarpLayout WARP_LAYOUT, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
+template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
           bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(typename AttentionVariant::ParamsT params,
                                                     typename AttentionVariant::DTypeO* tmp_v,
                                                     float* tmp_s, cudaStream_t stream);
 
-template <WarpLayout WARP_LAYOUT, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
+template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
           bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(typename AttentionVariant::ParamsT params,
                                                    typename AttentionVariant::DTypeO* tmp_v,
@@ -355,7 +355,6 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
   auto [qo_stride_n, qo_stride_h, kv_stride_n, kv_stride_h] =
       get_qkv_strides(kv_layout, 0, num_qo_heads, num_kv_heads, head_dim);
   auto plan_info = handler->GetPlanInfo();
-  auto warp_layout = WarpLayout(plan_info.warp_layout_code);
   DISPATCH_head_dim(
       head_dim, HEAD_DIM,
       {DISPATCH_mask_mode(
@@ -385,8 +384,8 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
                 params.total_num_rows = plan_info.total_num_rows;
                 params.padded_batch_size = plan_info.padded_batch_size;
 
-                DISPATCH_WARP_LAYOUT(warp_layout, WARP_LAYOUT, {
-                  BatchPrefillWithRaggedKVCacheDispatched<WARP_LAYOUT, HEAD_DIM, POS_ENCODING_MODE,
+                DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
+                  BatchPrefillWithRaggedKVCacheDispatched<CTA_TILE_Q, HEAD_DIM, POS_ENCODING_MODE,
                                                           ALLOW_FP16_QK_REDUCTION, MASK_MODE,
                                                           AttentionVariant>(
                       params, handler->GetTmpV<DTypeO>(), handler->GetTmpS(), stream);
@@ -407,7 +406,6 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
   const uint32_t head_dim = paged_kv.head_dim;
   const MaskMode mask_mode = causal ? MaskMode::kCausal : MaskMode::kNone;
   auto plan_info = handler->GetPlanInfo();
-  auto warp_layout = WarpLayout(plan_info.warp_layout_code);
   DISPATCH_head_dim(
       head_dim, HEAD_DIM,
       {DISPATCH_mask_mode(
@@ -436,9 +434,9 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
                 params.block_valid_mask = handler->GetBlockValidMask();
                 params.total_num_rows = plan_info.total_num_rows;
                 params.padded_batch_size = plan_info.padded_batch_size;
-                DISPATCH_WARP_LAYOUT(warp_layout, WARP_LAYOUT, {
+                DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
                   return BatchPrefillWithPagedKVCacheDispatched<
-                      WARP_LAYOUT, HEAD_DIM, POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION, MASK_MODE,
+                      CTA_TILE_Q, HEAD_DIM, POS_ENCODING_MODE, ALLOW_FP16_QK_REDUCTION, MASK_MODE,
                       AttentionVariant>(params, handler->GetTmpV<DTypeO>(), handler->GetTmpS(),
                                         stream);
                 })

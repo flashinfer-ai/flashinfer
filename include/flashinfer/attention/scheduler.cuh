@@ -350,7 +350,7 @@ cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
 }
 
 template <typename IdType>
-std::tuple<bool, uint32_t, uint32_t, WarpLayout, uint32_t, uint32_t, std::vector<IdType>,
+std::tuple<bool, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, std::vector<IdType>,
            std::vector<IdType>, std::vector<IdType>, std::vector<IdType>, std::vector<IdType>>
 PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t batch_size,
                        uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
