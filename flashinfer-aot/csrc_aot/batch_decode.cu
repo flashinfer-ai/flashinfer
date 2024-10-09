@@ -95,7 +95,6 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
   DecodePlanInfo plan_info;
   plan_info.FromVector(plan_info_vec);
   QKVLayout kv_layout = static_cast<QKVLayout>(kv_layout_code);
-  bool paged_kv_defined = paged_kv_cache.has_value();
   auto device = q.device();
   int64_t batch_size = q.size(0);
   int64_t num_qo_heads = q.size(1);

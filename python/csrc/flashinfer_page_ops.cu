@@ -16,9 +16,8 @@
 #include <torch/extension.h>
 
 void append_paged_kv_cache(torch::Tensor append_key, torch::Tensor append_value,
-                           torch::Tensor append_indptr, std::optional<torch::Tensor> paged_kv_cache,
-                           std::optional<torch::Tensor> paged_k_cache,
-                           std::optional<torch::Tensor> paged_v_cache, torch::Tensor kv_indices,
+                           torch::Tensor append_indptr, torch::Tensor paged_k_cache,
+                           torch::Tensor paged_v_cache, torch::Tensor kv_indices,
                            torch::Tensor kv_indptr, torch::Tensor kv_last_page_len,
                            unsigned int layout);
 

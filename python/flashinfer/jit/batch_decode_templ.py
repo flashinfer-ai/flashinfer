@@ -82,11 +82,11 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
   int64_t num_qo_heads = q.size(1);
   int64_t num_kv_heads, page_size;
   if (kv_layout == QKVLayout::kHND) {
-    num_kv_heads = paged_k_cache->size(1);
-    page_size = paged_k_cache->size(2);
+    num_kv_heads = paged_k_cache.size(1);
+    page_size = paged_k_cache.size(2);
   } else {
-    page_size = paged_k_cache->size(1);
-    num_kv_heads = paged_k_cache->size(2);
+    page_size = paged_k_cache.size(1);
+    num_kv_heads = paged_k_cache.size(2);
   }
 
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
