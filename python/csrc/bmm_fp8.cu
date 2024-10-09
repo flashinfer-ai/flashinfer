@@ -21,41 +21,6 @@
 
 #include "pytorch_extension_utils.h"
 
-namespace flashinfer {
-namespace bmm_fp8 {
-
-template cublasStatus_t bmm_fp8_internal_cublaslt<__nv_fp8_e4m3, __nv_fp8_e4m3, __nv_bfloat16>(
-    void* workspace, size_t workspace_size_in_bytes, const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* B,
-    __nv_bfloat16* D, int batch_size, int m, int n, int k, const float* A_scale,
-    const float* B_scale, cublasLtHandle_t lt_handle, cudaStream_t stream);
-
-template cublasStatus_t bmm_fp8_internal_cublaslt<__nv_fp8_e4m3, __nv_fp8_e4m3, half>(
-    void* workspace, size_t workspace_size_in_bytes, const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* B,
-    half* D, int batch_size, int m, int n, int k, const float* A_scale, const float* B_scale,
-    cublasLtHandle_t lt_handle, cudaStream_t stream);
-
-template cublasStatus_t bmm_fp8_internal_cublaslt<__nv_fp8_e4m3, __nv_fp8_e5m2, __nv_bfloat16>(
-    void* workspace, size_t workspace_size_in_bytes, const __nv_fp8_e4m3* A, const __nv_fp8_e5m2* B,
-    __nv_bfloat16* D, int batch_size, int m, int n, int k, const float* A_scale,
-    const float* B_scale, cublasLtHandle_t lt_handle, cudaStream_t stream);
-
-template cublasStatus_t bmm_fp8_internal_cublaslt<__nv_fp8_e4m3, __nv_fp8_e5m2, half>(
-    void* workspace, size_t workspace_size_in_bytes, const __nv_fp8_e4m3* A, const __nv_fp8_e5m2* B,
-    half* D, int batch_size, int m, int n, int k, const float* A_scale, const float* B_scale,
-    cublasLtHandle_t lt_handle, cudaStream_t stream);
-
-template cublasStatus_t bmm_fp8_internal_cublaslt<__nv_fp8_e5m2, __nv_fp8_e4m3, __nv_bfloat16>(
-    void* workspace, size_t workspace_size_in_bytes, const __nv_fp8_e5m2* A, const __nv_fp8_e4m3* B,
-    __nv_bfloat16* D, int batch_size, int m, int n, int k, const float* A_scale,
-    const float* B_scale, cublasLtHandle_t lt_handle, cudaStream_t stream);
-
-template cublasStatus_t bmm_fp8_internal_cublaslt<__nv_fp8_e5m2, __nv_fp8_e4m3, half>(
-    void* workspace, size_t workspace_size_in_bytes, const __nv_fp8_e5m2* A, const __nv_fp8_e4m3* B,
-    half* D, int batch_size, int m, int n, int k, const float* A_scale, const float* B_scale,
-    cublasLtHandle_t lt_handle, cudaStream_t stream);
-
-}  // namespace bmm_fp8
-}  // namespace flashinfer
 
 void bmm_fp8(const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& D,
              torch::Tensor& A_scale, torch::Tensor& B_scale) {
