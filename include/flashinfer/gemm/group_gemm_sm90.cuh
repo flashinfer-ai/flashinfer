@@ -18,10 +18,13 @@
 
 #include <sstream>
 
+#include "group_gemm_cutlass.cuh"
+
 #include "../allocator.h"
 #include "../utils.cuh"
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
+#include "cutlass/tensor_ref.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/epilogue/thread/linear_combination.h"
