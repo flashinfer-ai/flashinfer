@@ -25,13 +25,13 @@
 
 namespace flashinfer {
 
-template <WarpLayout WARP_LAYOUT, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
+template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
           bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(typename AttentionVariant::ParamsT params,
                                                    typename AttentionVariant::DTypeO* tmp_v,
                                                    float* tmp_s, cudaStream_t stream);
 
-template <WarpLayout WARP_LAYOUT, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
+template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
           bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(typename AttentionVariant::ParamsT params,
                                                     typename AttentionVariant::DTypeO* tmp_v,
@@ -170,12 +170,11 @@ std::vector<torch::Tensor> BatchPrefillWithRaggedKVCacheRun(
           params.total_num_rows = plan_info.total_num_rows;
           params.padded_batch_size = plan_info.padded_batch_size;
 
-          WarpLayout warp_layout = WarpLayout(plan_info.warp_layout_code);
           cudaError_t status = cudaSuccess;
 
-          DISPATCH_WARP_LAYOUT(warp_layout, WARP_LAYOUT, {
+          DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
             status = flashinfer::BatchPrefillWithRaggedKVCacheDispatched<
-                WARP_LAYOUT, HEAD_DIM, POS_ENCODING_MODE,
+                CTA_TILE_Q, HEAD_DIM, POS_ENCODING_MODE,
                 /*use_fp16_qk_reduction=*/false, MASK_MODE, RaggedAttentionVariant>(
                 params, tmp_v, tmp_s, torch_current_stream);
           });
@@ -305,12 +304,11 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
           params.total_num_rows = plan_info.total_num_rows;
           params.padded_batch_size = plan_info.padded_batch_size;
 
-          WarpLayout warp_layout = WarpLayout(plan_info.warp_layout_code);
           cudaError_t status = cudaSuccess;
 
-          DISPATCH_WARP_LAYOUT(warp_layout, WARP_LAYOUT, {
+          DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
             status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
-                WARP_LAYOUT, HEAD_DIM, POS_ENCODING_MODE,
+                CTA_TILE_Q, HEAD_DIM, POS_ENCODING_MODE,
                 /*use_fp16_qk_reduction=*/false, MASK_MODE, PagedAttentionVariant>(
                 params, tmp_v, tmp_s, torch_current_stream);
           });

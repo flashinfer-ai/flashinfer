@@ -28,7 +28,6 @@
 #include "../allocator.h"
 #include "../pos_enc.cuh"
 #include "../utils.cuh"
-#include "warp_layout.cuh"
 
 namespace flashinfer {
 
@@ -351,7 +350,7 @@ cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
 }
 
 template <typename IdType>
-std::tuple<bool, uint32_t, uint32_t, WarpLayout, uint32_t, uint32_t, std::vector<IdType>,
+std::tuple<bool, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, std::vector<IdType>,
            std::vector<IdType>, std::vector<IdType>, std::vector<IdType>, std::vector<IdType>>
 PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t batch_size,
                        uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
@@ -373,29 +372,31 @@ PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t batch_
     sum_packed_qo_len += packed_qo_len_arr[i];
   }
   int64_t avg_packed_qo_len = sum_packed_qo_len / batch_size;
-  WarpLayout warp_layout;
+  uint32_t cta_tile_q;
   if (avg_packed_qo_len > 64 && head_dim < 256) {
-    warp_layout = WarpLayout::k4x1x2;  // (num_warps_x = 4, num_warps_z = 1, num_frags_x = 2)
+    cta_tile_q = 128;
   } else {
     auto compute_capacity = GetCudaComputeCapability();
     if (compute_capacity.first >= 8) {
       // Ampere or newer
-      if (avg_packed_qo_len > 16) {
-        warp_layout = WarpLayout::k4x1x1;  // (num_warps_x = 4, num_warps_z = 1, num_frags_x = 1)
+      if (avg_packed_qo_len > 32) {
+        cta_tile_q = 64;
+      } else if (avg_packed_qo_len > 16) {
+        // avg_packed_qo_len <= 32
+        cta_tile_q = 32;
       } else {
         // avg_packed_qo_len <= 16
-        warp_layout = WarpLayout::k1x4x1;  // (num_warps_x = 1, num_warps_z = 4, num_frags_x = 1)
+        cta_tile_q = 16;
       }
     } else {
-      // NOTE(Zihao): not enough shared memory on Turing for 1x4x1 layout
-      warp_layout = WarpLayout::k4x1x1;
+      // NOTE(Zihao): not enough shared memory on Turing for 1x4 warp layout
+      cta_tile_q = 64;
     }
   }
-  const uint32_t qo_chunk_size = get_num_rows_per_cta(warp_layout);
 
   // step 2: determine kv_chunk_size
   auto [split_kv, kv_chunk_size, new_batch_size] = PrefillBinarySearchKVChunkSize(
-      max_grid_size, num_kv_heads, packed_qo_len_arr, kv_len_arr, qo_chunk_size,
+      max_grid_size, num_kv_heads, packed_qo_len_arr, kv_len_arr, cta_tile_q,
       /*min_kv_chunk_size=*/std::max((128 / page_size), 1U));
 
   // step 3: split qo_indptr and kv_indptr
@@ -403,7 +404,7 @@ PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t batch_
   for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
     int64_t packed_qo_len = packed_qo_len_arr[request_idx],
             kv_len = std::max(int(kv_len_arr[request_idx]), 1);
-    int64_t num_tiles_q = ceil_div(packed_qo_len, qo_chunk_size),
+    int64_t num_tiles_q = ceil_div(packed_qo_len, cta_tile_q),
             num_tiles_kv = ceil_div(kv_len, kv_chunk_size);
     total_num_tiles_q += num_tiles_q;
     for (uint32_t q_tile_idx = 0; q_tile_idx < num_tiles_q; ++q_tile_idx) {
@@ -432,7 +433,7 @@ PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t batch_
   return {split_kv,
           total_num_tiles_q,
           new_batch_size,
-          warp_layout,
+          cta_tile_q,
           kv_chunk_size,
           total_num_rows,
           std::move(request_indices),
@@ -445,7 +446,7 @@ PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t batch_
 struct PrefillPlanInfo {
   int64_t padded_batch_size;
   int64_t total_num_rows;
-  int64_t warp_layout_code;
+  int64_t cta_tile_q;
   int64_t request_indices_offset;
   int64_t qo_tile_indices_offset;
   int64_t kv_tile_indices_offset;
@@ -461,7 +462,7 @@ struct PrefillPlanInfo {
   PrefillPlanInfo()
       : padded_batch_size(0),
         total_num_rows(0),
-        warp_layout_code(0),
+        cta_tile_q(0),
         request_indices_offset(0),
         qo_tile_indices_offset(0),
         kv_tile_indices_offset(0),
@@ -478,7 +479,7 @@ struct PrefillPlanInfo {
   std::vector<int64_t> ToVector() const {
     return {padded_batch_size,
             total_num_rows,
-            warp_layout_code,
+            cta_tile_q,
             request_indices_offset,
             qo_tile_indices_offset,
             kv_tile_indices_offset,
@@ -501,7 +502,7 @@ struct PrefillPlanInfo {
     }
     padded_batch_size = vec[0];
     total_num_rows = vec[1];
-    warp_layout_code = vec[2];
+    cta_tile_q = vec[2];
     request_indices_offset = vec[3];
     qo_tile_indices_offset = vec[4];
     kv_tile_indices_offset = vec[5];
@@ -540,13 +541,12 @@ cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_in_bytes
   uint32_t max_batch_size_if_split = max_grid_size / num_kv_heads;
 
   // step 2: determine kv_chunk_size
-  auto [split_kv, total_num_tiles_q, new_batch_size, warp_layout, kv_chunk_size, total_num_rows,
+  auto [split_kv, total_num_tiles_q, new_batch_size, cta_tile_q, kv_chunk_size, total_num_rows,
         request_indices_vec, qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec,
         o_indptr_vec] = PrefillSplitQOKVIndptr(qo_indptr_h, kv_indptr_h, batch_size, num_qo_heads,
                                                num_kv_heads, head_dim, page_size, max_grid_size,
                                                max_batch_size_if_split, enable_cuda_graph);
-  const uint32_t qo_tile_size = get_num_rows_per_cta(warp_layout);
-  plan_info.warp_layout_code = static_cast<int64_t>(warp_layout);
+  plan_info.cta_tile_q = cta_tile_q;
   plan_info.total_num_rows = total_num_rows;
 
   plan_info.enable_cuda_graph = enable_cuda_graph;
@@ -586,10 +586,10 @@ cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_in_bytes
   if (split_kv) {
     AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
     plan_info.v_offset = float_allocator.aligned_alloc_offset(
-        num_qo_heads * padded_batch_size * qo_tile_size * head_dim * sizeof_dtype_o, 16,
+        num_qo_heads * padded_batch_size * cta_tile_q * head_dim * sizeof_dtype_o, 16,
         "batch_prefill_tmp_v");
     plan_info.s_offset = float_allocator.aligned_alloc_offset(
-        num_qo_heads * padded_batch_size * qo_tile_size * sizeof(float), 16, "batch_prefill_tmp_s");
+        num_qo_heads * padded_batch_size * cta_tile_q * sizeof(float), 16, "batch_prefill_tmp_s");
     plan_info.merge_indptr_offset = int_allocator.aligned_alloc_offset(
         sizeof(IdType) * (plan_info.total_num_rows + 1), 16, "batch_prefill_merge_indptr");
     plan_info.block_valid_mask_offset = int_allocator.aligned_alloc_offset(

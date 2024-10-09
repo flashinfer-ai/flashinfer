@@ -15,7 +15,6 @@
  */
 #include <torch/extension.h>
 
-
 torch::Tensor CutlassSegmentGEMMSM90(torch::Tensor float_workspace_buffer,
                                      torch::Tensor int_workspace_buffer, torch::Tensor seg_indptr,
                                      torch::Tensor weight_indices, torch::Tensor x,

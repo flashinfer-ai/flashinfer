@@ -20,12 +20,6 @@ mask_mode_literal = {
     2: "MaskMode::kCustom",
 }
 
-warp_layout_literal = {
-    0: "WarpLayout::k4x1x2",
-    1: "WarpLayout::k4x1x1",
-    2: "WarpLayout::k1x4x1",
-}
-
 pos_encoding_mode_literal = {
     0: "PosEncodingMode::kNone",
     1: "PosEncodingMode::kRoPELlama",

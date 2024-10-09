@@ -33,6 +33,7 @@
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/tensor_ref.h"
 #include "cutlass/util/command_line.h"
 #include "cutlass/util/distribution.h"
 #include "cutlass/util/host_tensor.h"
@@ -41,7 +42,7 @@
 #include "cutlass/util/reference/device/tensor_compare.h"
 #include "cutlass/util/reference/device/tensor_fill.h"
 #include "cutlass/util/tensor_view_io.h"
-
+#include "group_gemm_cutlass.cuh"
 
 namespace flashinfer {
 

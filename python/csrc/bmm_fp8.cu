@@ -104,8 +104,8 @@ void bmm_fp8(const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& D,
             static_cast<d_type*>(D.data_ptr()), batch_size, n, m, k,
             static_cast<float*>(B_scale.data_ptr()), static_cast<float*>(A_scale.data_ptr()),
             lt_handle, stream);
-        TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS, "bmm_fp8_internal_cublaslt failed: ",
-                    cublasGetStatusString(status));
+        TORCH_CHECK(status == CUBLAS_STATUS_SUCCESS,
+                    "bmm_fp8_internal_cublaslt failed: ", cublasGetStatusString(status));
         return true;
       });
     });
