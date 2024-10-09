@@ -197,11 +197,18 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
   void* float_buffer_ptr = static_cast<void*>(float_workspace_buffer.data_ptr());
   void* int_buffer_ptr = static_cast<void*>(int_workspace_buffer.data_ptr());
 
+  const int64_t* kv_cache_strides = nullptr;
+  auto k_strides = paged_k_cache.strides();
+  auto v_strides = paged_v_cache.strides();
+  TORCH_CHECK(k_strides == v_strides, "k/v strides must be identical");
+  kv_cache_strides = k_strides.data();
+
   paged_kv_t<{{ dtype_kv }}, {{ dtype_idx }}> paged_kv(
     num_kv_heads, page_size, {{ head_dim }},
     batch_size, kv_layout,
     static_cast<{{ dtype_kv }}*>(paged_k_cache.data_ptr()),
     static_cast<{{ dtype_kv }}*>(paged_v_cache.data_ptr()),
+    kv_cache_strides,
     static_cast<{{ dtype_idx }}*>(paged_kv_indices.data_ptr()),
     static_cast<{{ dtype_idx }}*>(paged_kv_indptr.data_ptr()),
     static_cast<{{ dtype_idx }}*>(paged_kv_last_page_len.data_ptr()));

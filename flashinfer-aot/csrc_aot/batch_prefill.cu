@@ -238,6 +238,13 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
   auto q_scalar_type = q.scalar_type();
   auto kv_scalar_type = paged_k_cache.scalar_type();
 
+  // get kv_cache_strides
+  const int64_t* kv_cache_strides = nullptr;
+  auto k_strides = paged_k_cache.strides();
+  auto v_strides = paged_v_cache.strides();
+  TORCH_CHECK(k_strides == v_strides, "k/v strides must be identical");
+  kv_cache_strides = k_strides.data();
+
   DISPATCH_PYTORCH_QKV_DTYPE_TO_CTYPE(q_scalar_type, kv_scalar_type, q_type, kv_type, [&] {
     using DTypeQ = q_type;
     using DTypeKV = kv_type;
@@ -249,6 +256,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
               num_kv_heads, page_size, HEAD_DIM, batch_size, kv_layout,
               static_cast<DTypeKV*>(paged_k_cache.data_ptr()),
               static_cast<DTypeKV*>(paged_v_cache.data_ptr()),
+              kv_cache_strides,
               static_cast<IdType*>(paged_kv_indices.data_ptr()),
               static_cast<IdType*>(paged_kv_indptr.data_ptr()),
               static_cast<IdType*>(paged_kv_last_page_len.data_ptr()));
