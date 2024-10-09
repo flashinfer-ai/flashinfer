@@ -401,7 +401,7 @@ if __name__ == "__main__":
             name="flashinfer._kernels_sm90",
             sources=[
                 "csrc/group_gemm_sm90.cu",
-                "csrc_aot/flashinfer_ops_sm90.cu",
+                "csrc_aot/flashinfer_sm90_ops.cu",
             ],
             include_dirs=include_dirs,
             extra_compile_args=extra_compile_args_sm90,

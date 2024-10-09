@@ -59,7 +59,7 @@ def get_gemm_sm90_module():
                 "gemm_sm90",
                 [
                     FLASHINFER_CSRC_DIR / "group_gemm_sm90.cu",
-                    FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops_sm90.cu",
+                    FLASHINFER_CSRC_DIR / "flashinfer_gemm_sm90_ops.cu",
                 ],
                 extra_cuda_cflags=["-gencode", "arch=compute_90a,code=sm_90a"],
             )
