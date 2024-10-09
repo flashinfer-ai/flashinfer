@@ -18,13 +18,10 @@
 
 #include <sstream>
 
-#include "group_gemm_cutlass.cuh"
-
 #include "../allocator.h"
 #include "../utils.cuh"
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
-#include "cutlass/tensor_ref.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/epilogue/thread/linear_combination.h"
@@ -33,6 +30,7 @@
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/group_array_problem_shape.hpp"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/tensor_ref.h"
 #include "cutlass/util/command_line.h"
 #include "cutlass/util/distribution.h"
 #include "cutlass/util/host_tensor.h"
@@ -41,7 +39,7 @@
 #include "cutlass/util/reference/device/tensor_compare.h"
 #include "cutlass/util/reference/device/tensor_fill.h"
 #include "cutlass/util/tensor_view_io.h"
-
+#include "group_gemm_cutlass.cuh"
 
 namespace flashinfer {
 

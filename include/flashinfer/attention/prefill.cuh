@@ -632,8 +632,8 @@ __device__ __forceinline__ void logits_transform(const typename AttentionVariant
         const uint32_t q_idx = q, kv_idx = kv_idx_base + fkv * 16 + 2 * (lane_idx % 4) +
                                            8 * (reg_id / 4) + reg_id % 2;
         const uint32_t qo_head_idx = kv_head_idx * group_size + r;
-        s_frag[fq][fkv][reg_id] = variant.LogitsTransform(params, s_frag[fq][fkv][reg_id], batch_idx,
-                                                         q_idx, kv_idx, qo_head_idx, kv_head_idx);
+        s_frag[fq][fkv][reg_id] = variant.LogitsTransform(
+            params, s_frag[fq][fkv][reg_id], batch_idx, q_idx, kv_idx, qo_head_idx, kv_head_idx);
       }
     }
   }
