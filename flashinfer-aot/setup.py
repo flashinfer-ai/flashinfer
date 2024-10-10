@@ -16,6 +16,7 @@ limitations under the License.
 
 from typing import List, Tuple
 
+import copy
 import pathlib
 import os
 import re
@@ -372,7 +373,7 @@ if __name__ == "__main__":
             "-use_fast_math",
         ],
     }
-    extra_compile_args_sm90 = extra_compile_args.copy()
+    extra_compile_args_sm90 = copy.deepcopy(extra_compile_args)
     extra_compile_args_sm90["nvcc"].extend(
         "-gencode arch=compute_90a,code=sm_90a".split()
     )
