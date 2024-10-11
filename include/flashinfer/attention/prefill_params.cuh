@@ -251,12 +251,6 @@ struct BatchPrefillPagedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DType
   __host__ __device__ __forceinline__ uint8_t* get_batch_local_mask_ptr(uint32_t batch_idx) const {
     return this->custom_mask + qk_indptr[batch_idx];
   }
-
-  __host__ __device__ __forceinline__ uint32_t get_mask_offset(uint32_t batch_idx, uint32_t qo_idx,
-                                                               uint32_t kv_idx,
-                                                               uint32_t kv_len) const {
-    return qk_indptr[batch_idx] * 8 + qo_idx * kv_len + kv_idx;
-  }
 };
 
 }  // namespace flashinfer
