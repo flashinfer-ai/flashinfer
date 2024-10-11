@@ -85,7 +85,7 @@ The easiest way to install FlashInfer is via pip:
     .. tab:: PyTorch 2.1
 
         Since FlashInfer version 0.1.2, support for PyTorch 2.1 has been ended. Users are encouraged to upgrade to a newer
-        PyTorch version or :ref:`compile FlashInfer from source code. <compile-from-source>` .
+        PyTorch version or :ref:`install FlashInfer from source code. <install-from-source>` .
 
         .. tabs::
 
@@ -101,13 +101,24 @@ The easiest way to install FlashInfer is via pip:
 
                     pip install flashinfer -i https://flashinfer.ai/whl/cu118/torch2.1/
 
-.. _compile-from-source:
+.. _install-from-source:
 
-Compile from Source
+Install from Source
 ^^^^^^^^^^^^^^^^^^^
 
-In certain cases, you may want to compile FlashInfer from source code to trying out the latest features in the main branch, or to customize the library for your specific needs.
-You can follow the steps below to compile FlashInfer from source code:
+In certain cases, you may want to install FlashInfer from source code to trying out the latest features in the main branch, or to customize the library for your specific needs.
+
+FlashInfer offers two installation modes:
+
+JIT mode
+   - CUDA kernels are compiled at runtime using PyTorch's JIT, with compiled kernels cached for future use.
+   - JIT mode allows fast installation, as no CUDA kernels are pre-compiled, making it ideal for development and testing.
+
+AOT mode
+   - Core CUDA kernels are pre-compiled and included in the library, reducing runtime compilation overhead.
+   - If a required kernel is not pre-compiled, it will be compiled at runtime using JIT. AOT mode is recommended for production environments.
+
+You can follow the steps below to install FlashInfer from source code:
 
 1. Clone the FlashInfer repository:
 
@@ -129,11 +140,21 @@ You can follow the steps below to compile FlashInfer from source code:
 
 4. Compile FlashInfer:
 
-   .. code-block:: bash
+   .. tabs::
 
-       cd flashinfer
-       pip install -e . -v
+       .. tab:: JIT mode
 
+           .. code-block:: bash
+
+               cd flashinfer/python
+               pip install -e . -v
+
+       .. tab:: AOT mode
+
+           .. code-block:: bash
+
+               cd flashinfer/flashinfer-aot
+               pip install -e . -v
 
 C++ API
 -------
