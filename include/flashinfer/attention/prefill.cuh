@@ -344,11 +344,11 @@ __device__ __forceinline__ void load_q_global_smem(uint32_t packed_offset,
 
     // NOTE(yiakwy) : each thread of a 32 threads block, cooperatively load 128 bit (uint4/float4/halfx8) data from system memory to shared memory
     // qsmem shape = (_, 128 Byte)
-    // -- frags x -> (but loaded into SMEM the next 16 rows)
+    // -- frags y ->
     // qsmem row/col 0                       1                       ... 7               warp_idx {0..3}  
     //       0       0  1  2  3  4  5  6  7  8  9  10 11 12 13 14 15 ... 60  61  62  63  0                |
     //       1       64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 ... 124 125 126 127 0                |
-    //       2       .  .  .  .  .  .  .  .  .  .  .  .  .  .  .  .  ... .   .   .   .   0               frags y
+    //       2       .  .  .  .  .  .  .  .  .  .  .  .  .  .  .  .  ... .   .   .   .   0               frags x
     //       3       .  .  .  .  .  .  .  .  .  .  .  .  .  .  .  .  ... .   .   .   .   0                |
     //       ...     .  .  .  .  .  .  .  .  .  .  .  .  .  .  .  .  ... .   .   .   .   0                |
     //       0+4*3   .  .  .  .  .  .  .  .  .  .  .  .  .  .  .  .  ... .   .   .   .   0                v
@@ -589,10 +589,11 @@ __device__ __forceinline__ void compute_qk(
   }
 
   // NOTE(yiakwy) : each thread of 64=16x4 threads block, cooperatively loads 4 x consecutive fp16/bf16 data to cover 16x16 matrix frag
-  uint32_t a_frag[num_frags_x][num_frags_y][2];
-  uint32_t b_frag[num_frags_x][num_frags_z][2];
+  uint32_t a_frag[num_frags_x][2];
+  uint32_t b_frag[2];
 
   // hence 
+  // TODO (yiakwy) : if we change blckDim.x from 32 to 64
   uint32_t lane_id = threadIdx.x + threadIdx.z * 32;
 
   uint32_t lane_id_x = lane_id % 16;
@@ -605,7 +606,8 @@ __device__ __forceinline__ void compute_qk(
   using float16x4  = __attribute__((__vector_size__(4 * sizeof(float16_t)))) float16_t;
   using floatx4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
   
-  #define MTX_FRAG_LDA 64
+  #define MTX_FRAG_LDA (head_dim)
+  #define MTX_FRAG_LDB (num_frags_z * 16)
 
   #else
   
@@ -618,82 +620,90 @@ __device__ __forceinline__ void compute_qk(
   #ifdef USE_ROCM
 
 #pragma unroll
-  for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+  for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
 
-      // TODO (yiakwy) : check
+    // load q
+#pragma unroll
+    for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+
       if (lane_id >= 64) {
         continue;
       }
 
-      // load q
-#pragma unroll
-      for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
-
-        // NOTE (yiakwy) : q_smem has shape of (num_frags_x, 16, 8x8), v_mfma_m16n16k16_fp16 will be applied 4 times along feat dim, then do sum
-        b128_t* smem_ptr = q_smem->base + (warp_idx_x * num_frags_x * 16) * channel_size_128b_q;
-        float16_t *s = reinterpret_cast<float16_t *>(smem_ptr);
+      // NOTE (yiakwy) : q_smem has shape of (num_frags_x, 16, 8x8), v_mfma_m16n16k16_fp16 will be applied 4 times along feat dim
+      b128_t* smem_ptr = q_smem->base + (warp_idx_x * num_frags_x * 16) * channel_size_128b_q;
+      float16_t *s = reinterpret_cast<float16_t *>(smem_ptr);
         
-        float16x4 *a = reinterpret_cast<float16x4 *>(a_frag[fx][fy]);
+      float16x4 *a = reinterpret_cast<float16x4 *>(a_frag[fx][fy]);
 
-        float ref_0 = (float)(*(s+(threadIdx.x / 8 + fy * 4) * 64 + threadIdx.x % 8 ));
-        float ref_1 = (float)(*(s+(threadIdx.x / 8 + fy * 4) * 64 + threadIdx.x % 8 + 7));
-        printf("[compute_qk] s[%d, %d]=%f..%f\n", threadIdx.x / 8 + fy * 4, threadIdx.x % 8, ref_0, ref_1);
+      #ifdef DEBUG
+      if (lane_id < 32) {
+      uint32_t nv_lane_id = threadIdx.x;
+      uint32_t nv_mtx_frag_thread_load_row_offset = nv_lane_id % 16 * 16;
+      uint32_t nv_mtx_frag_thread_load_col_offset = nv_lane_id / 16 * 8 + fy * 16;
+      uint32_t nv_mtx_frag_thread_load_offset = nv_mtx_frag_thread_load_row_offset * 64 + nv_mtx_frag_thread_load_col_offset;
 
-        // TODO (yiakwy) : replaced with more efficient load instruction
+      float ref_0 = (float)(*(s+ nv_mtx_frag_thread_load_offset));
+      float ref_1 = (float)(*(s+ nv_mtx_frag_thread_load_offset + 8));
+
+      printf("[compute_qk] s[%d, %d]=%f..%f\n", nv_mtx_frag_thread_load_row_offset, nv_mtx_frag_thread_load_col_offset, ref_0, ref_1);
+      }
+
+      #endif
+
+      // TODO (yiakwy) : replaced with more efficient load instruction
 #pragma unroll
-        for (uint32_t j=0; j < 4; j++) {
-          // NOTE (yiakwy) : loads 1 columns of data
-          uint32_t offset = lane_id_x * MTX_FRAG_LDA + j + lane_id_y * 4 + fy * 16;
-          s += offset;
+      for (uint32_t j=0; j < 4; j++) {
+        // NOTE (yiakwy) : loads 1 columns (16xfp16) of data
+        uint32_t offset = lane_id_x * MTX_FRAG_LDA + j + lane_id_y * 4;
+        s += offset;
 
-          (*a)[j] = *(s);
+        (*a)[j] = *(s);
+      }
+    } // num_frags_x
+    
+    // NOTE(yiakwy) : next to 16 = 2x8 columns
+    *q_smem_offset_r = q_smem->template advance_offset_by_column<2>(*q_smem_offset_r, fy) -
+                       num_frags_x * 16 * channel_size_128b_q;
 
-          // TODO (yiakwy) : REMOVE
-          if (fx==0 && fy== 0) {
-            // printf("[compute_qk] (fy=%d, lane_id_x=%d, lane_id_y=%d, j=%d), [compute_qk] a_frag[fx=%d][fy=%d][j=%d]=%f, s[%d]=%f\n", fy, lane_id_x, lane_id_y, j, fx, fy, j, (float)((*a)[j]), offset, (float)(*s));
-          }
+    // load k
+#pragma unroll
+    for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
+
+      if (lane_id >= 64) {
+        continue;
+      }
+
+      if constexpr (sizeof(DTypeKV) == 1) {
+        assert(0 && "KV Cache with FP8 data type is not supported in ROCM");
+      }
+
+      b128_t* smem_ptr = k_smem->base + (warp_idx_x * num_frags_x * 16) * channel_size_128b_q;
+      float16_t *s = reinterpret_cast<float16_t *>(smem_ptr);
+
+      float16x4 *b = reinterpret_cast<float16x4 *>(b_frag);
+
+      // TODO (yiakwy) : replaced with more efficient load instruction
+#pragma unroll
+      for (int j=0; j < 4; j++) {
+        // NOTE (yiakwy) : loads 16 consecutive data of 1 row
+        s += lane_id_x + lane_id_y * MTX_FRAG_LDB * 4 + j * MTX_FRAG_LDB + fz * 16;
+
+        (*b)[j] = *s;
+
+        // TODO (yiakwy) : REMOVE
+        if (fy==0 && fz== 0) {
+          printf("[compute_qk] (lane_id_x=%d, lane_id_y=%d, j=%d), [compute_qk] b_frag[%d]=%f\n", lane_id_x, lane_id_y, j, j, (float)((*b)[j]));
         }
       }
 
-      *q_smem_offset_r =
-        q_smem->template advance_offset_by_row<16, channel_size_128b_q>(*q_smem_offset_r);
-
-      // load k
-#pragma unroll
-      for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
-
-        if constexpr (sizeof(DTypeKV) == 1) {
-          assert(0 && "KV Cache with FP8 data type is not supported in ROCM");
-        }
-
-        b128_t* smem_ptr = k_smem->base + (warp_idx_x * num_frags_x * 16) * channel_size_128b_q;
-        float16_t *s = reinterpret_cast<float16_t *>(smem_ptr);
-
-        float16x4 *b = reinterpret_cast<float16x4 *>(b_frag[fx][fz]);
-
-        // TODO (yiakwy) : replaced with more efficient load instruction
-#pragma unroll
-        for (int j=0; j < 4; j++) {
-            // NOTE (yiakwy) : loads 16 consecutive data of 1 row
-            s += lane_id_x + lane_id_y * MTX_FRAG_LDA * 4 + j * MTX_FRAG_LDA + fz * MTX_FRAG_LDA * 16;
-
-            (*b)[j] = *s;
-            // TODO (yiakwy) : REMOVE
-            if (fx==0 && fz== 0) {
-              // printf("[compute_qk] (%d, %d, %d), [compute_qk] b_frag[%d][%d][%d]=%f\n", lane_id_x, j, lane_id_y, fx, fz, j, (float)((*b)[j]));
-            }
-        }
-
-        *k_smem_offset_r =
-                  k_smem->template advance_offset_by_row<16, channel_size_128b_kv>(*k_smem_offset_r);
-
-      }
+      *k_smem_offset_r =
+          k_smem->template advance_offset_by_row<16, channel_size_128b_kv>(*k_smem_offset_r);
 
       // compute
-      assert( num_frags_y == num_frags_z && "num_frags_y is not equal to num_frags_z");
-      for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
-        float16x4 *a = reinterpret_cast<float16x4 *>(a_frag[fx][fz]);
-        float16x4 *b = reinterpret_cast<float16x4 *>(b_frag[fx][fz]);
+      for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
+        float16x4 *a = reinterpret_cast<float16x4 *>(a_frag[fx]);
+        float16x4 *b = reinterpret_cast<float16x4 *>(b_frag);
 
         floatx4 *d = reinterpret_cast<floatx4 *>(s_frag[fx][fz]);
 
@@ -705,12 +715,31 @@ __device__ __forceinline__ void compute_qk(
           // *d = __builtin_amdgcn_mfma_f16_16x16x16f16(*a, *b, *d, 0, 0, 0);
         }
       }
+    }
+    if constexpr (sizeof(DTypeKV) == 1) {
+      assert(0 && "FP8 KV Cache will be suppported soon.");
+    } else {
+      *k_smem_offset_r = k_smem->template advance_offset_by_column<2>(*k_smem_offset_r, fy) -
+                         num_frags_z * 16 * channel_size_128b_kv;
+    }
   }
 
   #else
 
 #pragma unroll
-  // NOTE(yiakwy) each thead read 2 elments and repeat 4 times (num_frags_y), threads cooperatively loads 16x64
+  // NOTE(yiakwy) each thead read 2 elments and repeat 4xnum_frags_y times , threads cooperatively loads 16x64
+  // 
+  // frag_a:
+  // Dtype=fp16/bf16
+  //      cols             0  .. 15 16 .. 31 32     63
+  // frag_x\frag_y   rows  0        1        2  ..  4
+  //  0              0
+  //                 ..
+  //                 15
+  //  1              16
+  //  
+  //frag_b
+  //
   for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
 #pragma unroll
     for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
@@ -721,6 +750,7 @@ __device__ __forceinline__ void compute_qk(
               q_smem->template advance_offset_by_row<16, channel_size_128b_q>(*q_smem_offset_r);
 
     }
+    // NOTE(yiakwy) : next to 16 = 2x8 columns
     *q_smem_offset_r = q_smem->template advance_offset_by_column<2>(*q_smem_offset_r, fy) -
                        num_frags_x * 16 * channel_size_128b_q;
 
