@@ -80,8 +80,8 @@ struct paged_kv_t {
    * \param head_dim The dimension of each head
    * \param batch_size The batch size
    * \param layout The layout of last 3 dimensions in KV-Cache.
-   * \param k_data The flattened key cache
-   * \param v_data The flattened value cache
+   * \param k_data The start pointer of key cache, k_cache should be contiguous
+   * \param v_data The start pointer of value cache, v_cache should be contiguous
    * \param indices The page indices array
    * \param indptr The page indptr array
    * \param last_page_len The offset of the last page for each request in the batch
@@ -107,20 +107,19 @@ struct paged_kv_t {
   }
 
   /*!
-   * \brief Construct a paged key-value cache
+   * \brief Construct a paged key-value cache with custom kv-cache strides
    * \param num_heads The number of heads
    * \param page_size The size of each page
    * \param head_dim The dimension of each head
    * \param batch_size The batch size
    * \param layout The layout of last 3 dimensions in KV-Cache.
-   * \param k_data The flattened key cache
-   * \param v_data The flattened value cache
+   * \param k_data The start pointer of key cache, k_cache doesn't have to be contiguous
+   * \param v_data The start pointer of value cache, v_cache doesn't have to be contiguous
    * \param kv_strides custom strides of each dimensions of k_data and v_data
    * \param indices The page indices array
    * \param indptr The page indptr array
    * \param last_page_len The offset of the last page for each request in the batch
    * \param rope_pos_offset The start position of each request in the batch.
-   * \note This constructor should only be used when page_storage == kIndices
    */
   __host__ __forceinline__ paged_kv_t(uint32_t num_heads, uint32_t page_size, uint32_t head_dim,
                                       uint32_t batch_size, QKVLayout layout, DType* k_data,

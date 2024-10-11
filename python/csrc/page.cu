@@ -69,6 +69,13 @@ void append_paged_kv_cache(torch::Tensor append_key, torch::Tensor append_value,
     num_heads = paged_k_cache.size(2);
   }
 
+  // get kv_cache_strides
+  const int64_t* kv_cache_strides = nullptr;
+  auto k_strides = paged_k_cache.strides();
+  auto v_strides = paged_v_cache.strides();
+  TORCH_CHECK(k_strides == v_strides, "k/v strides must be identical");
+  kv_cache_strides = k_strides.data();
+
   CHECK_EQ(append_key.size(1), num_heads);
   CHECK_EQ(append_key.size(2), head_dim);
   CHECK_EQ(append_value.size(1), num_heads);
@@ -79,12 +86,12 @@ void append_paged_kv_cache(torch::Tensor append_key, torch::Tensor append_value,
   auto kv_scalar_dtype = paged_k_cache.scalar_type();
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(kv_scalar_dtype, c_type, [&] {
-    paged_kv_t<c_type, int32_t> paged_kv(num_heads, page_size, head_dim, batch_size, kv_layout,
-                                         static_cast<c_type*>(paged_k_cache.data_ptr()),
-                                         static_cast<c_type*>(paged_v_cache.data_ptr()),
-                                         static_cast<int32_t*>(kv_indices.data_ptr()),
-                                         static_cast<int32_t*>(kv_indptr.data_ptr()),
-                                         static_cast<int32_t*>(kv_last_page_len.data_ptr()));
+    paged_kv_t<c_type, int32_t> paged_kv(
+        num_heads, page_size, head_dim, batch_size, kv_layout,
+        static_cast<c_type*>(paged_k_cache.data_ptr()),
+        static_cast<c_type*>(paged_v_cache.data_ptr()), kv_cache_strides,
+        static_cast<int32_t*>(kv_indices.data_ptr()), static_cast<int32_t*>(kv_indptr.data_ptr()),
+        static_cast<int32_t*>(kv_last_page_len.data_ptr()));
     cudaError_t status =
         AppendPagedKVCache(paged_kv, static_cast<c_type*>(append_key.data_ptr()),
                            static_cast<c_type*>(append_value.data_ptr()),
