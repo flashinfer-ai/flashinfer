@@ -108,12 +108,15 @@ Install from Source
 
 In certain cases, you may want to install FlashInfer from source code to trying out the latest features in the main branch, or to customize the library for your specific needs.
 
-We provide two options for installing FlashInfer from source code:
+FlashInfer offers two installation modes:
 
-1. JIT mode: all of the CUDA kernels are compiled at runtime using PyTorch's JIT, the compiled kernels are cached for future use.
-JIT mode do not require compiling the CUDA kernels in advance, which is convenient for development and testing.
-2. AOT mode: we pre-compile a set of core CUDA kernels and include them in the library, which can reduce the overhead of compiling kernels at runtime.
-If a kernel is not pre-compiled, it will be compiled at runtime using PyTorch's JIT. AOT mode is recommended for production use.
+JIT mode
+   - CUDA kernels are compiled at runtime using PyTorch's JIT, with compiled kernels cached for future use.
+   - JIT mode allows fast installation, as no CUDA kernels are pre-compiled, making it ideal for development and testing.
+
+AOT mode
+   - Core CUDA kernels are pre-compiled and included in the library, reducing runtime compilation overhead.
+   - If a required kernel is not pre-compiled, it will be compiled at runtime using JIT. AOT mode is recommended for production environments.
 
 You can follow the steps below to install FlashInfer from source code:
 
