@@ -379,11 +379,9 @@ PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t batch_
     auto compute_capacity = GetCudaComputeCapability();
     if (compute_capacity.first >= 8) {
       // Ampere or newer
-      if (avg_packed_qo_len > 32) {
+      if (avg_packed_qo_len > 16) {
+        // avg_packed_qo_len <= 64
         cta_tile_q = 64;
-      } else if (avg_packed_qo_len > 16) {
-        // avg_packed_qo_len <= 32
-        cta_tile_q = 32;
       } else {
         // avg_packed_qo_len <= 16
         cta_tile_q = 16;

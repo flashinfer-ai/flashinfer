@@ -35,7 +35,7 @@ def get_cu_file_str(
     dtype_out,
     idtype,
 ):
-    cta_tile_q_choice = [128, 64, 32, 16]
+    cta_tile_q_choice = [128, 64, 16]
     def get_insts(attention_variant, dtype_out):
         return "\n".join(
         [

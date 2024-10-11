@@ -107,11 +107,6 @@
       __VA_ARGS__                                          \
       break;                                               \
     }                                                      \
-    case 32: {                                             \
-      constexpr uint32_t CTA_TILE_Q = 32;                  \
-      __VA_ARGS__                                          \
-      break;                                               \
-    }                                                      \
     case 16: {                                             \
       constexpr uint32_t CTA_TILE_Q = 16;                  \
       __VA_ARGS__                                          \
