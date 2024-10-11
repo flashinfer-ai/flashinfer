@@ -44,10 +44,8 @@ using mma::MMAMode;
 constexpr uint32_t WARP_SIZE = 32;
 
 constexpr uint32_t get_num_warps_q(const uint32_t cta_tile_q) {
-  if (cta_tile_q > 32) {
+  if (cta_tile_q > 16) {
     return 4;
-  } else if (cta_tile_q > 16) {
-    return 2;
   } else {
     return 1;
   }
@@ -1324,11 +1322,9 @@ cudaError_t SinglePrefillWithKVCacheDispatched(typename AttentionVariant::Params
     auto compute_capacity = GetCudaComputeCapability();
     if (compute_capacity.first >= 8) {
       // Ampere or newer
-      if (unpacked_qo_len > 32) {
+      if (unpacked_qo_len > 16) {
+        // avg_packed_qo_len <= 64
         cta_tile_q = 64;
-      } else if (unpacked_qo_len > 16) {
-        // avg_packed_qo_len <= 32
-        cta_tile_q = 32;
       } else {
         // avg_packed_qo_len <= 16
         cta_tile_q = 16;
