@@ -296,6 +296,41 @@ __device__ __forceinline__ void swap(uint32_t& a, uint32_t& b) {
   b = tmp;
 }
 
+struct Dim2 {
+  const uint32_t dim_a;
+  const uint32_t dim_b;
+  __device__ __forceinline__ Dim2(const uint32_t& dim_b, const uint32_t& dim_a):
+    dim_a(dim_a), dim_b(dim_b){
+  }
+  __device__ __forceinline__ uint32_t offset(const uint32_t& idx_b, const uint32_t& idx_a) {
+    return idx_b * dim_a + idx_a;
+  }
+};
+struct Dim3 {
+  const uint32_t dim_a;
+  const uint32_t dim_b;
+  const uint32_t dim_c;
+  __device__ __forceinline__ Dim3(const uint32_t& dim_c, const uint32_t& dim_b, const uint32_t& dim_a):
+    dim_a(dim_a), dim_b(dim_b), dim_c(dim_c){
+  }
+  __device__ __forceinline__ uint32_t offset(const uint32_t& idx_c, const uint32_t& idx_b, const uint32_t& idx_a) {
+    return (idx_c * dim_b + idx_b) * dim_a + idx_a;
+  }
+};
+
+struct Dim4 {
+  const uint32_t dim_a;
+  const uint32_t dim_b;
+  const uint32_t dim_c;
+  const uint32_t dim_d_;
+  __device__ __forceinline__ Dim4(const uint32_t& dim_d, const uint32_t& dim_c, const uint32_t& dim_b, const uint32_t& dim_a):
+    dim_a(dim_a), dim_b(dim_b), dim_c(dim_c), dim_d_(dim_d) {
+  }
+  __device__ __forceinline__ uint32_t offset(const uint32_t& idx_d, const uint32_t& idx_c, const uint32_t& idx_b, const uint32_t& idx_a) {
+    return ((idx_d * dim_c + idx_c) * dim_b + idx_b) * dim_a + idx_a;
+  }
+};
+
 }  // namespace flashinfer
 
 #endif  // FLASHINFER_UTILS_CUH_
