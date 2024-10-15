@@ -32,6 +32,11 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(typename AttentionVariant::Par
                                                   typename AttentionVariant::DTypeO* tmp_v,
                                                   float* tmp_s, cudaStream_t stream);
 
+template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant>
+cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA(typename AttentionVariant::ParamsT params,
+                                                  typename AttentionVariant::DTypeO* tmp_v,
+                                                  float* tmp_s, cudaStream_t stream);
+
 class BatchDecodeHandler {
  public:
   template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV,
@@ -50,6 +55,29 @@ class BatchDecodeHandler {
     
     auto work_estimation_func =
         BatchDecodeWithPagedKVCacheWorkEstimationDispatched<GROUP_SIZE, HEAD_DIM, POS_ENCODING_MODE,
+                                                            AttentionVariant>;
+    return DecodePlan<HEAD_DIM, POS_ENCODING_MODE, AttentionVariant>(
+        float_buffer, float_workspace_size_in_bytes, int_buffer, page_locked_buffer_,
+        int_workspace_size_in_bytes, plan_info_, indptr_h, batch_size, num_qo_heads,
+        page_size, cuda_graph_enabled_, stream_, work_estimation_func);
+  }
+
+  template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV,
+            typename DTypeO, typename IdType>
+  cudaError_t PlanDispatchedMLA(void* float_buffer, size_t float_workspace_size_in_bytes,
+                             void* int_buffer, size_t int_workspace_size_in_bytes, IdType* indptr_h,
+                             IdType* last_page_len_h, uint32_t batch_size, uint32_t num_qo_heads,
+                             uint32_t page_size) {
+    int_buffer_ = int_buffer;
+    float_buffer_ = float_buffer;
+    using ParamsT = BatchDecodeParams<DTypeQ, DTypeKV, DTypeO, IdType>;
+    using AttentionVariant =
+        ComposedAttention<ParamsT,
+                          get_variant_code(/*use_custom_mask=*/false, /*use_sliding_window=*/true,
+                                           /*use_logits_soft_cap=*/false, /*use_alibi=*/false)>;
+    
+    auto work_estimation_func =
+        BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA<HEAD_DIM, POS_ENCODING_MODE,
                                                             AttentionVariant>;
     return DecodePlan<HEAD_DIM, POS_ENCODING_MODE, AttentionVariant>(
         float_buffer, float_workspace_size_in_bytes, int_buffer, page_locked_buffer_,
@@ -566,6 +594,56 @@ cudaError_t BatchDecodeHandlerPlan(BatchDecodeHandler* handler, void* float_buff
             float_buffer, float_workspace_size_in_bytes, int_buffer, int_workspace_size_in_bytes,
             indptr_h, last_page_len_h, batch_size, num_qo_heads, page_size);
       });
+    });
+  });
+}
+
+template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType>
+cudaError_t BatchDecodeWithPagedKVCacheWrapperMLA(
+    BatchDecodeHandler* handler, DTypeQ* q, IdType* q_offset, paged_kv_t<DTypeKV, IdType> paged_kv,
+    DTypeO* o, float* lse, uint32_t num_qo_heads,
+    PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
+    std::optional<float> maybe_sm_scale = std::nullopt, float rope_scale = 1.f,
+    float rope_theta = 1e4, cudaStream_t stream = nullptr) {
+  
+  float sm_scale = maybe_sm_scale.value_or(1.f / std::sqrt(float(paged_kv.head_dim)));
+
+  DISPATCH_head_dim(
+      paged_kv.head_dim, HEAD_DIM,
+      {DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
+        using ParamsT = BatchDecodeParams<DTypeQ, DTypeKV, DTypeO, IdType>;
+        using AttentionVariant =
+            ComposedAttention<ParamsT, get_variant_code(
+                                           /*use_custom_mask=*/false, /*use_sliding_window=*/true,
+                                           /*use_logits_soft_cap=*/false, /*use_alibi=*/false)>;
+        ParamsT params(q, q_offset, paged_kv, o, lse, /*alibi_slopes=*/nullptr, num_qo_heads,
+                       /*window_left=*/-1, /*logits_soft_cap=*/0.f, sm_scale, rope_scale,
+                       rope_theta);
+        params.request_indices = handler->GetRequestIndices<IdType>();
+        params.kv_tile_indices = handler->GetKVTileIndices<IdType>();
+        params.o_indptr = handler->GetOIndptr<IdType>();
+        params.kv_chunk_size_ptr = handler->GetKVChunkSizePtr<IdType>();
+        params.block_valid_mask = handler->GetBlockValidMask();
+        params.padded_batch_size = handler->GetPlanInfo().padded_batch_size;
+
+        return BatchDecodeWithPagedKVCacheDispatchedMLA<HEAD_DIM, POS_ENCODING_MODE, AttentionVariant>(
+            params, handler->GetTmpV<DTypeO>(), handler->GetTmpS(), stream);
+      })});
+  return cudaSuccess;
+}
+
+template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType>
+cudaError_t BatchDecodeHandlerPlanMLA(BatchDecodeHandler* handler, void* float_buffer,
+                                   size_t float_workspace_size_in_bytes, void* int_buffer,
+                                   size_t int_workspace_size_in_bytes, IdType* indptr_h,
+                                   IdType* last_page_len_h, uint32_t batch_size,
+                                   uint32_t num_qo_heads, uint32_t head_dim,
+                                   uint32_t page_size, PosEncodingMode pos_encoding_mode) {
+  DISPATCH_head_dim(head_dim, HEAD_DIM, {
+    DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
+      return handler->PlanDispatchedMLA<HEAD_DIM, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO, IdType>(
+          float_buffer, float_workspace_size_in_bytes, int_buffer, int_workspace_size_in_bytes,
+          indptr_h, last_page_len_h, batch_size, num_qo_heads, page_size);
     });
   });
 }
