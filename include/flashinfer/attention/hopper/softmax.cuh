@@ -161,16 +161,16 @@ struct Softmax {
   template <bool Is_first, bool Check_inf = false, typename Tensor0>
   __forceinline__ __device__ TensorT max(Tensor0& acc_s) {
     // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
-    Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+    Tensor scores = make_tensor(acc_s.data(), convert_layout_acc_rowcol(acc_s.layout()));
     static_assert(decltype(size<0>(scores))::value == kNRows);
     TensorT scores_scale;
     if constexpr (Is_first) {
-      flash::template reduce_max</*zero_init=*/true>(scores, row_max);
+      reduce_max</*zero_init=*/true>(scores, row_max);
       cute::fill(scores_scale, 1.f);
     } else {
       Tensor scores_max_prev = make_fragment_like(row_max);
       cute::copy(row_max, scores_max_prev);
-      flash::template reduce_max</*zero_init=*/false>(scores, row_max);
+      reduce_max</*zero_init=*/false>(scores, row_max);
 #pragma unroll
       for (int mi = 0; mi < size(row_max); ++mi) {
         float scores_max_cur =
@@ -185,21 +185,21 @@ struct Softmax {
   template <bool Is_first, bool Check_inf = false, typename Tensor0>
   __forceinline__ __device__ TensorT online_softmax(Tensor0& acc_s) {
     // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
-    Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+    Tensor scores = make_tensor(acc_s.data(), convert_layout_acc_rowcol(acc_s.layout()));
     static_assert(decltype(size<0>(scores))::value == kNRows);
     TensorT scores_scale;
     if constexpr (Is_first) {
-      flash::template reduce_max</*zero_init=*/true>(scores, row_max);
-      flash::template scale_apply_exp2</*Scale_max=*/true, /*Check_inf=*/true, Use_max_offset>(
+      reduce_max</*zero_init=*/true>(scores, row_max);
+      scale_apply_exp2</*Scale_max=*/true, /*Check_inf=*/true, Use_max_offset>(
           scores, row_max, softmax_scale_log2);
-      flash::reduce_sum</*zero_init=*/true, /*warp_reduce=*/false>(scores, row_sum);
+      reduce_sum</*zero_init=*/true, /*warp_reduce=*/false>(scores, row_sum);
       cute::fill(scores_scale, 1.f);
       // if (cute::thread0()) { print_tensor(scores); printf("\n scale = %f\n", softmax_scale_log2);
       // print_tensor(row_sum); }
     } else {
       // Tensor scores_max_prev = make_fragment_like(row_max);
       // cute::copy(row_max, scores_max_prev);
-      // flash::template reduce_max</*zero_init=*/false>(scores, row_max);
+      // template reduce_max</*zero_init=*/false>(scores, row_max);
       // // if (cute::thread0()) { print_tensor(scores); printf("\n"); print_tensor(row_max);
       // printf("\n"); } #pragma unroll for (int mi = 0; mi < size(row_max); ++mi) {
       //     float scores_max_cur = !Check_inf
@@ -208,12 +208,12 @@ struct Softmax {
       //     scores_scale(mi) = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
       //     row_sum(mi) *= scores_scale(mi);
       // }
-      flash::template scale_apply_exp2</*Scale_max=*/true, Check_inf, Use_max_offset>(
+      scale_apply_exp2</*Scale_max=*/true, Check_inf, Use_max_offset>(
           scores, row_max, softmax_scale_log2);
       // We don't do the reduce across threads here since we don't need to use the row_sum.
       // We do that reduce at the end when we need to normalize the softmax.
 
-      flash::reduce_sum</*zero_init=*/false, /*warp_reduce=*/false>(scores, row_sum);
+      reduce_sum</*zero_init=*/false, /*warp_reduce=*/false>(scores, row_sum);
     }
     return scores_scale;
   };
@@ -223,7 +223,7 @@ struct Softmax {
                                               float rp_dropout = 1.f) {
     constexpr static float max_offset_E = Use_max_offset ? 8.f * float(M_LN2) : 0.f;
     // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
-    Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+    Tensor scores = make_tensor(acc_s.data(), convert_layout_acc_rowcol(acc_s.layout()));
     static_assert(decltype(size<0>(scores))::value == kNRows);
     SumOp<float> sum_op;
     quad_allreduce_(row_sum, row_sum, sum_op);
@@ -244,7 +244,7 @@ struct Softmax {
   __forceinline__ __device__ void rescale_o(Tensor1& acc_o, TensorT const& scores_scale) {
     // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
     Tensor acc_o_rowcol =
-        make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
+        make_tensor(acc_o.data(), convert_layout_acc_rowcol(acc_o.layout()));
     static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);
 #pragma unroll
     for (int mi = 0; mi < size(row_max); ++mi) {

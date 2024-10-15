@@ -163,7 +163,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
                                                                                  work_tile_info)) {
       // Attention output (GEMM-II) accumulator.
       Tensor tOrO = partition_fragment_C(tiled_mma1, select<0, 2>(TileShape_MNK{}));
-      flash::Softmax<2 * (2 * kBlockM / NumMmaThreads)> softmax(mainloop_params.softmax_scale_log2);
+      Softmax<2 * (2 * kBlockM / NumMmaThreads)> softmax(mainloop_params.softmax_scale_log2);
 
       auto block_coord = work_tile_info.get_block_coord(scheduler_params);
       auto [m_block, bidh, bidb] = block_coord;
@@ -226,10 +226,10 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
   [&] {                                           \
     bool useSeqLen = USE_VAR_SEQ_LEN;             \
     if (useSeqLen) {                              \
-      using NAME = flash::VarSeqLenTraits;        \
+      using NAME = VarSeqLenTraits;        \
       return __VA_ARGS__();                       \
     } else {                                      \
-      using NAME = flash::FixedSeqLenTraits;      \
+      using NAME = FixedSeqLenTraits;      \
       return __VA_ARGS__();                       \
     }                                             \
   }()
@@ -241,15 +241,15 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
   using TileShape_MNK = typename Kernel_traits::TileShape_MNK;
   using ClusterShape = typename Kernel_traits::ClusterShape_MNK;
 
-  using CollectiveMainloop = flash::CollectiveMainloopFwd<Kernel_traits, Is_causal, Seqlen_traits>;
-  using CollectiveEpilogue = flash::CollectiveEpilogueFwd<Kernel_traits, Seqlen_traits>;
+  using CollectiveMainloop = CollectiveMainloopFwd<Kernel_traits, Is_causal, Seqlen_traits>;
+  using CollectiveEpilogue = CollectiveEpilogueFwd<Kernel_traits, Seqlen_traits>;
   using Scheduler = std::conditional_t<
-      Seqlen_traits::kUseVarSeqLen, flash::SingleTileScheduler,
-      std::conditional_t<!Is_causal, flash::StaticPersistentTileScheduler,
-                         flash::DynamicPersistentTileScheduler<Kernel_traits::kNThreads -
+      Seqlen_traits::kUseVarSeqLen, SingleTileScheduler,
+      std::conditional_t<!Is_causal, StaticPersistentTileScheduler,
+                         DynamicPersistentTileScheduler<Kernel_traits::kNThreads -
                                                                    cutlass::NumThreadsPerWarpGroup,
                                                                Kernel_traits::NumProducerThreads>>>;
-  // using Scheduler = flash::SingleTileScheduler;
+  // using Scheduler = SingleTileScheduler;
   Seqlen_traits seqlen_traits_q(params.total_q, params.seqlen_q, params.cu_seqlens_q);
   Seqlen_traits seqlen_traits_k(params.total_k, params.seqlen_k, params.cu_seqlens_k,
                                 params.seqused_k);
@@ -287,7 +287,7 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
 
   // Get the ptr to kernel function.
   void* kernel;
-  kernel = (void*)flash::compute_attn_ws<Kernel_traits, Is_causal, Scheduler, Seqlen_traits>;
+  kernel = (void*)compute_attn_ws<Kernel_traits, Is_causal, Scheduler, Seqlen_traits>;
   int smem_size = sizeof(typename Kernel_traits::SharedStorage);
   // int smem_size_q = sizeof(decltype((typename
   // Kernel_traits::SharedStorage{}).smem_q)); int smem_size_k =

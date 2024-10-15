@@ -116,7 +116,7 @@ struct CollectiveEpilogueFwd {
     auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, tiled_mma);
     auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(thread_idx);
 
-    Tensor tOrO_out = flash::convert_type<Element>(tOrO);
+    Tensor tOrO_out = convert_type<Element>(tOrO);
     Tensor taccOrO = smem_thr_copy_O.retile_S(tOrO_out);  // ((Atom,AtomNum), MMA_M, MMA_N)
     Tensor taccOsO = smem_thr_copy_O.partition_D(sO);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
 
@@ -155,7 +155,7 @@ struct CollectiveEpilogueFwd {
                                         cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
     }
     TiledCopyO gmem_tiled_copy_O;
-    flash::write_O<!Seqlen_traits::kUseVarSeqLen, NumCopyThreads>(
+    write_O<!Seqlen_traits::kUseVarSeqLen, NumCopyThreads>(
         epilogue_params.ptr_O, epilogue_params.tma_store_O, gmem_tiled_copy_O,
         epilogue_params.layout_O, select<0, 2>(TileShape_MNK{}), sO, m_block, bidh, bidb,
         seqlen_traits_q, write_warp_idx);
@@ -176,7 +176,7 @@ struct CollectiveEpilogueFwd {
     auto rmem_thr_copy_O = rmem_tiled_copy_O.get_thread_slice(thread_idx);
 
     Tensor taccOsO = rmem_thr_copy_O.partition_D(sOacc);
-    Tensor tOrO_out = flash::convert_type<Element>(tOrO);  // Element is Ktraits::OutputType
+    Tensor tOrO_out = convert_type<Element>(tOrO);  // Element is Ktraits::OutputType
     Tensor taccOrO = make_tensor(tOrO_out.data(), shape(taccOsO));
 
     // Make sure all WGs have finished reading V
@@ -222,7 +222,7 @@ struct CollectiveEpilogueFwd {
     }
     TiledCopyO gmem_tiled_copy_O;
     Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutO{});
-    flash::write_O<!Seqlen_traits::kUseVarSeqLen, NumCopyThreads>(
+    write_O<!Seqlen_traits::kUseVarSeqLen, NumCopyThreads>(
         epilogue_params.ptr_O, epilogue_params.tma_store_O, gmem_tiled_copy_O,
         epilogue_params.layout_O, select<0, 2>(TileShape_MNK{}), sO, m_block, bidh, bidb,
         seqlen_traits_q, write_warp_idx);
@@ -260,7 +260,7 @@ struct CollectiveEpilogueFwd {
       tOpO(k) = get<1>(tOcO(_0{}, _0{}, k)) < get<1>(epilogue_params.layout_O.shape());
     }
     // Clear_OOB_K must be false since we don't want to write zeros to gmem
-    flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false,
+    copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false,
                 /*Clear_OOB_K=*/false>(gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO,
                                        seqlen_traits_q.actual_seq_len - m_block * kBlockM);
     static_assert(kBlockM <= NumMmaThreads);

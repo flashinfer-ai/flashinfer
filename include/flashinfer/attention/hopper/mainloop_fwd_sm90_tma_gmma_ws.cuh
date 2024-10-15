@@ -404,7 +404,7 @@ struct CollectiveMainloopFwd {
     Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
     consumer_wait(pipeline_k, smem_pipe_read_k);
     warp_scheduler_barrier_sync();
-    flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma0, tSrQ,
+    gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma0, tSrQ,
                                                     tSrK(_, _, _, smem_pipe_read_k.index()), tSrS);
     warp_scheduler_barrier_arrive();
 
@@ -461,13 +461,13 @@ struct CollectiveMainloopFwd {
       Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
       consumer_wait(pipeline_k, smem_pipe_read_k);
       warp_scheduler_barrier_sync();
-      flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(
+      gemm</*zero_init=*/true, /*wg_wait=*/-1>(
           tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()), tSrS);
       if (masking_step > 0) {
         softmax.rescale_o(tOrO, scores_scale);
       }
       consumer_wait(pipeline_v, smem_pipe_read_v);
-      flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(
+      gemm</*zero_init=*/false, /*wg_wait=*/-1>(
           tiled_mma1, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
       warp_scheduler_barrier_arrive();
       warpgroup_wait<1>();
@@ -496,11 +496,11 @@ struct CollectiveMainloopFwd {
       Tensor tSrS = partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
       consumer_wait(pipeline_k, smem_pipe_read_k);
       warp_scheduler_barrier_sync();
-      flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(
+      gemm</*zero_init=*/true, /*wg_wait=*/-1>(
           tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()), tSrS);
       softmax.rescale_o(tOrO, scores_scale);
       consumer_wait(pipeline_v, smem_pipe_read_v);
-      flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(
+      gemm</*zero_init=*/false, /*wg_wait=*/-1>(
           tiled_mma1, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
       warp_scheduler_barrier_arrive();
       warpgroup_wait<1>();
@@ -522,7 +522,7 @@ struct CollectiveMainloopFwd {
                                         static_cast<int>(FwdNamedBarriers::QueryEmpty) /*id*/);
     softmax.rescale_o(tOrO, scores_scale);
     consumer_wait(pipeline_v, smem_pipe_read_v);
-    flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma1, tOrP,
+    gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma1, tOrP,
                                                      tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
     cute::copy(softmax.template finalize</*Check_inf=*/Is_causal>(tSrS), scores_scale);
     warpgroup_wait<0>();
