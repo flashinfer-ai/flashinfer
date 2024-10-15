@@ -26,6 +26,7 @@ from .cascade import (
 from .decode import (
     BatchDecodeWithPagedKVCacheWrapper,
     CUDAGraphBatchDecodeWithPagedKVCacheWrapper,
+    BatchDecodeMlaWithPagedKVCacheWrapper,
     single_decode_with_kv_cache,
 )
 from .gemm import SegmentGEMMWrapper, bmm_fp8
