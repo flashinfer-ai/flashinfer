@@ -179,6 +179,11 @@
       __VA_ARGS__                                      \
       break;                                           \
     }                                                  \
+    case 512: {                                        \
+      constexpr size_t HEAD_DIM = 512;                 \
+      __VA_ARGS__                                      \
+      break;                                           \
+    }                                                  \
     default: {                                         \
       std::ostringstream err_msg;                      \
       err_msg << "Unsupported head_dim: " << head_dim; \
