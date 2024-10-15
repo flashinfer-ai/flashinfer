@@ -100,7 +100,6 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
     __syncthreads();
   }
 
-  static_assert(Ktraits::kNWarps == 12 || Ktraits::kNWarps == 16);
   if (warp_group_idx == 0) {  // Producer
     cutlass::arch::warpgroup_reg_dealloc<Ktraits::kNWarps == 12 ? 24 : 32>();
     // cutlass::arch::warpgroup_reg_dealloc<56>();
@@ -249,7 +248,6 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
                          DynamicPersistentTileScheduler<Kernel_traits::kNThreads -
                                                                    cutlass::NumThreadsPerWarpGroup,
                                                                Kernel_traits::NumProducerThreads>>>;
-  // using Scheduler = SingleTileScheduler;
   Seqlen_traits seqlen_traits_q(params.total_q, params.seqlen_q, params.cu_seqlens_q);
   Seqlen_traits seqlen_traits_k(params.total_k, params.seqlen_k, params.cu_seqlens_k,
                                 params.seqused_k);
