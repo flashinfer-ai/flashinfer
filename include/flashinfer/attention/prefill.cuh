@@ -234,9 +234,12 @@ __device__ __forceinline__ void produce_kv(smem_t<swizzle_mode> smem, uint32_t* 
         // NOTE (yiakwy) : kvsmem[warp_idx * 4 + lane_idx / 8 + i * 16, lane_idx % 8 + j * 8] = kv[0, warp_idx * 4 + lane_idx / 8 + i * 16, lane_idx % 8 + j * 8]
         smem.template load_128b_async<fill_mode>(*smem_offset, *gptr, kv_idx < kv_len);
 
-        b128_t* smem_ptr = smem.base + (warp_idx * 4 + lane_idx / 8 + i * 16) * 8 + lane_idx % 8 + j * 8;
+        T* kv_base_r = *gptr;
+        T* kv_ptr = kv_base_r + (/* warp_idx * 4 + lane_idx / 8 */ + i * 16) * kv_stride_n + /* lane_idx % 8 */ + j * 8;
+
+        b128_t* smem_ptr = smem.base + (/* warp_idx * 4 + lane_idx / 8 */ + i * 16) * 8 + /* lane_idx % 8 */ + j * 8;
         float16_t *s = reinterpret_cast<float16_t *>(smem_ptr);
-        printf("[produce_kv] (i=%d,j=%d,warp_idx=%d), kv_smem[%d, %d]=kv[H=0, N_CTX=%d/%d, %d](%f..%f)\n", i, j, warp_idx, warp_idx * 4 + lane_idx / 8 + i * 16, lane_idx % 8 + j * 8, warp_idx * 4 + lane_idx / 8 + i * 16, kv_len, lane_idx % 8 + j * 8, (float)(*s), (float)(*(s+8)));
+        printf("[produce_kv] (i=%d,j=%d,warp_idx=%d), kv_smem[%d, %d] (%f..%f) = kv[H=0, N_CTX=%d/%d, %d](%f..%f,%f)\n", i, j, warp_idx, warp_idx * 4 + lane_idx / 8 + i * 16, lane_idx % 8 + j * 8, (float)(*s), (float)(*(s+7)), warp_idx * 4 + lane_idx / 8 + i * 16, kv_len, lane_idx % 8 + j * 8, (float)(*kv_ptr), (float)(*(kv_ptr+6)), (float)(*(kv_ptr+7)));
 
         *smem_offset = smem.template advance_offset_by_column<8>(*smem_offset, j);
         *gptr += 8 * num_elems_per_128b<T>();
@@ -647,6 +650,7 @@ __device__ __forceinline__ void compute_qk(
   using floatx4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
   
   #define MTX_FRAG_LDA (head_dim)
+  // #define MTX_FRAG_LDB (head_dim)
   #define MTX_FRAG_LDB (num_frags_z * 16)
 
   #else
@@ -683,8 +687,8 @@ __device__ __forceinline__ void compute_qk(
 
         (*a)[j] = *(s);
 
-        if (j==0) {
-          printf("[compute_qk] (fx=%d, fy=%d) a_frag[%d][%d]=%f\n", fx, fy, lane_id_x, j + lane_id_y * 4, (float)((*a)[j]));
+        if (fx == 0 && fy == 0) {
+        printf("[compute_qk] (x=%d, y=%d, j=%d) (fx=%d, fy=%d) a_mtx_frag[%d, %d]=%f\n", lane_id_x, lane_id_y, j, fx, fy, lane_id_x, j + lane_id_y * 4, (float)((*a)[j]));
         }
       }
 
@@ -711,14 +715,15 @@ __device__ __forceinline__ void compute_qk(
 
       // TODO (yiakwy) : replaced with more efficient load inst
 #pragma unroll
-      for (int j=0; j < 4; j++) {
+      for (uint32_t j=0; j < 4; j++) {
         // NOTE (yiakwy) : loads 16 consecutive data of 1 row
         s += lane_id_x + lane_id_y * MTX_FRAG_LDB * 4 + j * MTX_FRAG_LDB;
+        // s += lane_id_x * MTX_FRAG_LDB + j + lane_id_y * 4;
 
         (*b)[j] = *s;
 
-        if (j==0) {
-          printf("[compute_qk] (fz=%d, fy=%d) b_frag[%d][%d]=%f\n", fz, fy, lane_id_y * 4 + j, lane_id_x, (float)((*b)[j]));
+        if (fy == 0 && fz == 0) {
+        printf("[compute_qk] (x=%d, y=%d, j=%d) (fz=%d, fy=%d) b_mtx_frag[%d, %d]=%f\n", lane_id_x, lane_id_y, j, fz, fy, lane_id_y * 4 + j, lane_id_x, (float)((*b)[j]));
         }
       }
 
@@ -731,23 +736,21 @@ __device__ __forceinline__ void compute_qk(
         float16x4 *a = reinterpret_cast<float16x4 *>(a_frag[fx]);
         float16x4 *b = reinterpret_cast<float16x4 *>(b_frag);
 
-        floatx4 *d = reinterpret_cast<floatx4 *>(s_frag[fx][fz]);
-
         if constexpr (std::is_same<DTypeQKAccum, float>::value) {
+          floatx4 *d = reinterpret_cast<floatx4 *>(s_frag[fx][fz]);
           *d = __builtin_amdgcn_mfma_f32_16x16x16f16(*a, *b, *d, 0, 0, 0);
-
           __asm__ volatile("s_barrier" ::);
+
           if (fx == 0 && fy == 0 && fz == 0) { 
 
-            for (int reg_id=0; reg_id < 4; reg_id++) {
-              printf("[compute_qk] s_frag[fx=%d][fy=0][fz=%d][%d, %d] = %f\n", fx, fz, reg_id * 16 + lane_id_y * 4, lane_id_x, (*d)[reg_id]);
+            for (uint32_t reg_id=0; reg_id < 4; reg_id++) {
+              printf("[compute_qk] (x=%d, y=%d, reg_id=%d) s_frag[fx=%d][fy=0][fz=%d][%d, %d] = %f\n", lane_id_x, lane_id_y, reg_id, fx, fz, reg_id + lane_id_y * 4, lane_id_x, (*d)[reg_id]);
             }
 
           }
         } else {
           // TODO (yiakwy) : device cast fp32 to fp16
           assert(0 && "AMD v_mfma instruction does not support fp16 output.");
-          // *d = __builtin_amdgcn_mfma_f16_16x16x16f16(*a, *b, *d, 0, 0, 0);
         }
       }
     }
@@ -1499,7 +1502,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
     #endif
 
     if (threadIdx.x == 0 && threadIdx.z == 0) {
-      printf("[prefill kernel] channel_size_128b_q = %d\n", channel_size_128b_q);
+      printf("[single prefill kernel] channel_size_128b_q = %d\n", channel_size_128b_q);
     }
 
     // NOTE(yiakwy) : FA2 outter loop (block level) load q first and iterate over sequence dimension inside a block
@@ -1517,7 +1520,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
           sm_scale);
     } else {
       if (threadIdx.x==0 && threadIdx.z==0) {
-        printf("[prefill kernel] skip q_smem_inplace_multiply_sm_scale.\n");
+        printf("[single prefill kernel] skip q_smem_inplace_multiply_sm_scale.\n");
       }
       // TODO (yiakwy) : recover
       /*
@@ -1613,9 +1616,16 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
                  warp_idx * kv_frag_rows + lane_idx / kv_frag_cols, lane_idx % kv_frag_cols);
     #endif // USE_ROCM
 
+    if (threadIdx.x==0 && threadIdx.z==0) {
+    printf("[single prefill kernel] ===== producing key =====\n");
+    }
     produce_kv<SharedMemFillMode::kNoFill, num_warps_x, num_warps_z, num_frags_y, num_frags_z>(
         k_smem, &kv_smem_offset_w, &k_ptr, kv_stride_n, 0, chunk_size);
     cp_async::commit_group();
+    
+    if (threadIdx.x==0 && threadIdx.z==0) {
+    printf("[single prefill kernel] ***** producing value *****\n");
+    }
     produce_kv<SharedMemFillMode::kFillZero, num_warps_x, num_warps_z, num_frags_y, num_frags_z>(
         v_smem, &kv_smem_offset_w, &v_ptr, kv_stride_n, 0, chunk_size);
     cp_async::commit_group();
@@ -1638,6 +1648,9 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
       }
 
       // compute attention score
+      if (threadIdx.x == 0 && threadIdx.z == 0) {
+        printf("[single prefill kernel] start calling compute_qk...\n");
+      }
       compute_qk<logits_post_hook, num_frags_x, num_frags_y, num_frags_z, swizzle_mode_q,
                  swizzle_mode_kv, DTypeQ, DTypeKV>(&qo_smem, &q_smem_offset_r, &k_smem,
                                                    &k_smem_offset_r, s_frag, logits_soft_cap);
@@ -1670,22 +1683,39 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
       update_mdo_states<num_frags_x, num_frags_y, num_frags_z>(s_frag, o_frag, m, d);
 
       block.sync();
+
+      // TODO (yiakwy) : REMOVE
+      if (threadIdx.x == 0 && threadIdx.z == 0) {
+        printf("[single prefill kernel] calling pdate_mdo_states completes.");
+      }
+
+      // NOTE (yiakwy) : prepare the next loading
+      if (iter + 1 < num_iterations) {
+
       produce_kv<SharedMemFillMode::kNoFill, num_warps_x, num_warps_z, num_frags_y, num_frags_z>(
           k_smem, &kv_smem_offset_w, &k_ptr, kv_stride_n,
           (iter + 1) * 16 * num_warps_z * num_frags_z, chunk_size);
       cp_async::commit_group();
       cp_async::wait_group<1>();
       block.sync();
+
+      }
       
       // compute sfm*v
       compute_sfm_v<num_frags_x, num_frags_y, num_frags_z, swizzle_mode_kv, DTypeQ, DTypeKV>(
           &v_smem, &v_smem_offset_r, s_frag, o_frag, d);
 
       block.sync();
+
+      // NOTE (yiakwy) : prepare the next loading
+      if (iter + 1 < num_iterations) {
+
       produce_kv<SharedMemFillMode::kFillZero, num_warps_x, num_warps_z, num_frags_y, num_frags_z>(
           v_smem, &kv_smem_offset_w, &v_ptr, kv_stride_n,
           (iter + 1) * 16 * num_warps_z * num_frags_z, chunk_size);
       cp_async::commit_group();
+
+      }
     }
   
     cp_async::wait_group<0>();
