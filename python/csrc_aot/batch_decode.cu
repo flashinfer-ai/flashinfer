@@ -66,18 +66,23 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
             ComposedAttention<ParamsT, get_variant_code(/*use_custom_mask=*/false,
                                                         /*use_sliding_window=*/true,
                                                         USE_LOGITS_SOFT_CAP, /*use_alibi=*/false)>;
+        DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
+          auto work_estimation_func =
+              BatchDecodeWithPagedKVCacheWorkEstimationDispatched<GROUP_SIZE, HEAD_DIM, POS_ENCODING_MODE,
+                                                                  AttentionVariant>;
+          cudaError_t status = DecodePlan<HEAD_DIM, POS_ENCODING_MODE, AttentionVariant>(
+              static_cast<void*>(float_workspace_buffer.data_ptr()), float_workspace_size_in_bytes,
+              static_cast<void*>(int_workspace_buffer.data_ptr()),
+              static_cast<void*>(page_locked_int_workspace_buffer.data_ptr()),
+              int_workspace_size_in_bytes, plan_info, static_cast<IdType*>(indptr.data_ptr()),
+              batch_size, num_qo_heads, page_size, enable_cuda_graph,
+              /*stream=*/torch_current_stream,
+              work_estimation_func);
 
-        cudaError_t status = DecodePlan<HEAD_DIM, POS_ENCODING_MODE, AttentionVariant>(
-            static_cast<void*>(float_workspace_buffer.data_ptr()), float_workspace_size_in_bytes,
-            static_cast<void*>(int_workspace_buffer.data_ptr()),
-            static_cast<void*>(page_locked_int_workspace_buffer.data_ptr()),
-            int_workspace_size_in_bytes, plan_info, static_cast<IdType*>(indptr.data_ptr()),
-            batch_size, num_qo_heads, num_kv_heads, page_size, enable_cuda_graph,
-            /*stream=*/torch_current_stream);
-
-        TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
-                    cudaGetErrorString(status));
-        return true;
+          TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
+                      cudaGetErrorString(status));
+          return true;
+        });
       });
     });
   });
