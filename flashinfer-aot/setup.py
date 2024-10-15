@@ -379,6 +379,14 @@ if __name__ == "__main__":
     )
     ext_modules = []
     ext_modules.append(
+        torch_cpp_ext.CppExtension(
+            name="flashinfer._prefill_sm90",
+            sources=["csrc_aot/single_prefill_sm90.cu"],
+            include_dirs=include_dirs,
+            extra_compile_args=extra_compile_args_sm90,
+        )
+    )
+    ext_modules.append(
         torch_cpp_ext.CUDAExtension(
             name="flashinfer._kernels",
             sources=[
