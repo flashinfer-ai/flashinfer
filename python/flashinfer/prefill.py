@@ -740,6 +740,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._custom_mask_buf = packed_custom_mask.to(self.device)
                 self._qk_indptr_buf = qk_indptr.to(self.device)
 
+        qo_indptr = qo_indptr.to('cpu', non_blocking=True)
+        paged_kv_indptr = paged_kv_indptr.to('cpu', non_blocking=True)
+
         if packed_custom_mask is not None:
             mask_mode = MaskMode.CUSTOM.value
         else:
