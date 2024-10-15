@@ -568,6 +568,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if self.use_tensor_cores:
                 self._qo_indptr_buf = qo_indptr.to(self.device)
 
+        qo_indptr = qo_indptr.to('cpu', non_blocking=True)
+        indptr = indptr.to('cpu', non_blocking=True)
+
         data_type = canonicalize_torch_dtype(data_type)
         if not q_data_type:
             q_data_type = data_type
