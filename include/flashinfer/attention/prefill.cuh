@@ -1479,8 +1479,13 @@ cudaError_t SinglePrefillWithKVCacheDispatched(typename AttentionVariant::Params
           dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
           FLASHINFER_CUDA_CALL(
               cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-          FLASHINFER_CUDA_CALL(MergeStates(tmp, tmp_lse, o, lse, num_chunks, qo_len, num_qo_heads,
-                                           HEAD_DIM, stream));
+          if constexpr (AttentionVariant::use_softmax) {
+            FLASHINFER_CUDA_CALL(MergeStates(tmp, tmp_lse, o, lse, num_chunks, qo_len, num_qo_heads,
+                                             HEAD_DIM, stream));
+          } else {
+            FLASHINFER_CUDA_CALL(
+                AttentionSum(tmp, o, num_chunks, qo_len, num_qo_heads, HEAD_DIM, stream));
+          }
         }
       }
     })
@@ -2174,9 +2179,14 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(typename AttentionVariant::P
         void* args[] = {(void*)&group_size_fastdiv, (void*)&params};
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-        FLASHINFER_CUDA_CALL(VariableLengthMergeStates(tmp_v, tmp_s, params.merge_indptr, o, lse,
-                                                       total_num_rows, num_qo_heads, HEAD_DIM,
-                                                       stream));
+        if constexpr (AttentionVariant::use_softmax) {
+          FLASHINFER_CUDA_CALL(VariableLengthMergeStates(tmp_v, tmp_s, params.merge_indptr, o, lse,
+                                                         total_num_rows, num_qo_heads, HEAD_DIM,
+                                                         stream));
+        } else {
+          FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(
+              tmp_v, params.merge_indptr, o, total_num_rows, num_qo_heads, HEAD_DIM, stream));
+        }
       }
     }
   });
@@ -2270,9 +2280,14 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(typename AttentionVariant::Pa
         void* args[] = {(void*)&group_size_fastdiv, (void*)&params};
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-        FLASHINFER_CUDA_CALL(VariableLengthMergeStates(tmp_v, tmp_s, params.merge_indptr, o, lse,
-                                                       total_num_rows, num_qo_heads, HEAD_DIM,
-                                                       stream));
+        if constexpr (AttentionVariant::use_softmax) {
+          FLASHINFER_CUDA_CALL(VariableLengthMergeStates(tmp_v, tmp_s, params.merge_indptr, o, lse,
+                                                         total_num_rows, num_qo_heads, HEAD_DIM,
+                                                         stream));
+        } else {
+          FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(
+              tmp_v, params.merge_indptr, o, total_num_rows, num_qo_heads, HEAD_DIM, stream));
+        }
       }
     }
   });
