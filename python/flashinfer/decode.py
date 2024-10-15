@@ -40,6 +40,7 @@ from .utils import (
     _check_pos_encoding_mode,
     _check_kv_layout,
     _unpack_paged_kv_cache,
+    _check_cached_qkv_data_type,
     _get_cache_buf,
     _get_cache_alibi_slopes_buf,
     _get_range_buf,
@@ -484,8 +485,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         pos_encoding_mode: str = "NONE",
         window_left: int = -1,
         logits_soft_cap: Optional[float] = None,
-        data_type: Union[str, torch.dtype] = "float16",
-        q_data_type: Optional[Union[str, torch.dtype]] = None,
+        q_data_type: Optional[Union[str, torch.dtype]] = "float16",
+        kv_data_type: Optional[Union[str, torch.dtype]] = None,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
@@ -522,11 +523,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
             formula:
             :math:`\texttt{logits_soft_cap} \times \mathrm{tanh}(x / \texttt{logits_soft_cap})`,
             where :math:`x` is the input logits.
-        data_type : Union[str, torch.dtype]
-            The data type of the paged kv cache. Defaults to ``float16``.
         q_data_type : Optional[Union[str, torch.dtype]]
-            The data type of the query tensor. If None, will be set to
-            ``data_type``. Defaults to ``None``.
+            The data type of the query tensor, defaults torch.float16.
+        kv_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the key/value tensor. If None, will be set to
+            ``q_data_type``. Defaults to ``None``.
 
         Note
         ----
@@ -568,18 +569,20 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if self.use_tensor_cores:
                 self._qo_indptr_buf = qo_indptr.to(self.device)
 
-        qo_indptr = qo_indptr.to('cpu', non_blocking=True)
-        indptr = indptr.to('cpu', non_blocking=True)
+        qo_indptr = qo_indptr.to("cpu", non_blocking=True)
+        indptr = indptr.to("cpu", non_blocking=True)
 
-        data_type = canonicalize_torch_dtype(data_type)
-        if not q_data_type:
-            q_data_type = data_type
         q_data_type = canonicalize_torch_dtype(q_data_type)
+        if kv_data_type is None:
+            kv_data_type = q_data_type
+        kv_data_type = canonicalize_torch_dtype(kv_data_type)
 
+        self._cached_q_data_type = q_data_type
+        self._cached_kv_data_type = kv_data_type
         if self.use_tensor_cores:
             self._cached_module = get_batch_prefill_module(
                 q_data_type,
-                data_type,
+                kv_data_type,
                 q_data_type,
                 indptr.dtype,
                 head_dim,
@@ -604,7 +607,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         else:
             self._cached_module = get_batch_decode_module(
                 q_data_type,
-                data_type,
+                kv_data_type,
                 q_data_type,
                 indptr.dtype,
                 head_dim,
@@ -705,6 +708,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
             * attention output, shape: ``[batch_size, num_qo_heads, head_dim]``
             * logsumexp of attention scores, shape: ``[batch_size, num_qo_heads]``.
         """
+        k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+        _check_cached_qkv_data_type(
+            q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
+        )
+
         pos_encoding_mode = self._pos_encoding_mode
         window_left = self._window_left
         logits_soft_cap = self._logits_soft_cap
@@ -732,7 +740,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._int_workspace_buffer,
                 self._plan_info,
                 q,
-                *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
+                k_cache,
+                v_cache,
                 None,  # packed_custom_mask
                 _get_cache_alibi_slopes_buf(q.shape[1], q.device),
                 self._qo_indptr_buf,
@@ -754,7 +763,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._int_workspace_buffer,
                 self._plan_info,
                 q,
-                *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
+                k_cache,
+                v_cache,
                 self._paged_kv_indptr_buf,
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,
