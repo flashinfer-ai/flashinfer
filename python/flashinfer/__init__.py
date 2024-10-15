@@ -19,10 +19,12 @@ from .activation import (
     gelu_tanh_and_mul as gelu_tanh_and_mul,
     silu_and_mul as silu_and_mul,
 )
+
 from .cascade import (
     BatchDecodeWithSharedPrefixPagedKVCacheWrapper as BatchDecodeWithSharedPrefixPagedKVCacheWrapper,
     BatchPrefillWithSharedPrefixPagedKVCacheWrapper as BatchPrefillWithSharedPrefixPagedKVCacheWrapper,
     MultiLevelCascadeAttentionWrapper as MultiLevelCascadeAttentionWrapper,
+    BatchDecodeMlaWithPagedKVCacheWrapper as BatchDecodeMlaWithPagedKVCacheWrapper,
     merge_state as merge_state,
     merge_state_in_place as merge_state_in_place,
     merge_states as merge_states,
