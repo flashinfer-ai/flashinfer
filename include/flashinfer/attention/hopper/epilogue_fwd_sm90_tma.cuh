@@ -12,7 +12,7 @@
 #include "named_barrier.cuh"
 #include "utils.cuh"
 
-namespace flash {
+namespace flashinfer {
 
 using namespace cute;
 
@@ -270,4 +270,4 @@ struct CollectiveEpilogueFwd {
   }
 };
 
-}  // namespace flash
+}  // namespace flashinfer

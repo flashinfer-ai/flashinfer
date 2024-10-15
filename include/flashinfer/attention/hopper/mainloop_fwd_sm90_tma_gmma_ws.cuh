@@ -16,7 +16,7 @@
 #include "named_barrier.cuh"
 #include "utils.cuh"
 
-namespace flash {
+namespace flashinfer {
 
 using namespace cute;
 
@@ -534,4 +534,4 @@ struct CollectiveMainloopFwd {
   }
 };
 
-}  // namespace flash
+}  // namespace flashinfer

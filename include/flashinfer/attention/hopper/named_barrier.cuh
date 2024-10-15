@@ -7,7 +7,7 @@
 
 #include "cutlass/arch/barrier.h"
 
-namespace flash {
+namespace flashinfer {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Enumerates the reserved named barriers to avoid potential conflicts
@@ -23,4 +23,4 @@ enum class FwdNamedBarriers {
   ProducerWG = 7
 };
 
-}  // namespace flash
+}  // namespace flashinfer

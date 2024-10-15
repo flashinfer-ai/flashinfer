@@ -13,7 +13,7 @@
 #include "cutlass/fast_math.h"
 #include "utils.cuh"
 
-namespace flash {
+namespace flashinfer {
 
 using namespace cute;
 
@@ -256,4 +256,4 @@ struct Softmax {
   };
 };
 
-}  // namespace flash
+}  // namespace flashinfer

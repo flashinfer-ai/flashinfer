@@ -9,7 +9,7 @@
 #include "cutlass/fast_math.h"
 #include "named_barrier.cuh"
 
-namespace flash {
+namespace flashinfer {
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -227,4 +227,4 @@ class DynamicPersistentTileScheduler {
   }
 };
 
-}  // namespace flash
+}  // namespace flashinfer

@@ -9,7 +9,7 @@
 
 #include <cute/layout.hpp>
 
-namespace flash {
+namespace flashinfer {
 
 static constexpr int kMaxTileSize = 128;
 
@@ -140,4 +140,4 @@ CUTLASS_DEVICE auto VarSeqLenTraits::get_lse_local_tile_tensor(const MTensor& m_
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-}  // namespace flash
+}  // namespace flashinfer

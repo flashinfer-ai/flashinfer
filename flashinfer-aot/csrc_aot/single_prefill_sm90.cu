@@ -19,6 +19,8 @@
               #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
+using namespace flashinfer;
+
 void set_params_fprop(Flash_fwd_params& params,
                       // sizes
                       const size_t b, const size_t seqlen_q, const size_t seqlen_k,

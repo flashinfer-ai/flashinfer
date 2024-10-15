@@ -23,7 +23,7 @@
 #include "tile_scheduler.cuh"
 #include "utils.cuh"
 
-namespace flash {
+namespace flashinfer {
 
 using namespace cute;
 
@@ -351,4 +351,4 @@ void run_mha_fwd_hdim256(Flash_fwd_params& params, cudaStream_t stream) {
   });
 }
 
-}  // namespace flash
+}  // namespace flashinfer

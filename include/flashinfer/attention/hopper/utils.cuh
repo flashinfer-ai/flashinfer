@@ -33,7 +33,7 @@
 
 #define CHECK_CUDA_KERNEL_LAUNCH() CHECK_CUDA(cudaGetLastError())
 
-namespace flash {
+namespace flashinfer {
 
 using namespace cute;
 
@@ -359,4 +359,4 @@ __forceinline__ __device__ void write_O(ElemO* O, const TMACopyO& tma_copy_O,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-}  // namespace flash
+}  // namespace flashinfer
