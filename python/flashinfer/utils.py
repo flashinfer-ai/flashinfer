@@ -184,3 +184,16 @@ def get_compute_capability(device: torch.device) -> Tuple[int, int]:
     if device.type != "cuda":
         raise ValueError("device must be a cuda device")
     return torch.cuda.get_device_capability(device.index)
+
+
+def _check_cached_qkv_data_type(
+    q: torch.Tensor, k: torch.Tensor, dtype_q: torch.dtype, dtype_kv: torch.dtype
+) -> None:
+    if q.dtype != dtype_q:
+        raise ValueError(
+            f"The dtype of q {q.dtype} does not match the q_data_type {dtype_q} specified in plan function."
+        )
+    if k.dtype != dtype_kv:
+        raise ValueError(
+            f"The dtype of k {k.dtype} does not match the kv_data_type {dtype_kv} specified in plan function."
+        )

@@ -37,6 +37,7 @@ from .utils import (
     TensorLayout,
     _check_pos_encoding_mode,
     _check_kv_layout,
+    _check_cached_qkv_data_type,
     _unpack_paged_kv_cache,
     is_float8,
     canonicalize_torch_dtype,
@@ -740,8 +741,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._custom_mask_buf = packed_custom_mask.to(self.device)
                 self._qk_indptr_buf = qk_indptr.to(self.device)
 
-        qo_indptr = qo_indptr.to('cpu', non_blocking=True)
-        paged_kv_indptr = paged_kv_indptr.to('cpu', non_blocking=True)
+        qo_indptr = qo_indptr.to("cpu", non_blocking=True)
+        paged_kv_indptr = paged_kv_indptr.to("cpu", non_blocking=True)
 
         if packed_custom_mask is not None:
             mask_mode = MaskMode.CUSTOM.value
@@ -751,6 +752,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             else:
                 mask_mode = MaskMode.NON_CAUSAL.value
 
+        self._cached_q_data_type = q_data_type
+        self._cached_kv_data_type = kv_data_type
         self._cached_module = get_batch_prefill_module(
             q_data_type,
             kv_data_type,
@@ -856,6 +859,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
             * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``.
         """
+        k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+        _check_cached_qkv_data_type(
+            q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
+        )
         window_left = self._window_left
         logits_soft_cap = self._logits_soft_cap
         sm_scale = self._sm_scale
@@ -877,7 +884,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._int_workspace_buffer,
             self._plan_info,
             q,
-            *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
+            k_cache,
+            v_cache,
             self._custom_mask_buf,
             _get_cache_alibi_slopes_buf(q.shape[1], q.device),
             self._qo_indptr_buf,
@@ -1300,6 +1308,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             else:
                 mask_mode = MaskMode.NON_CAUSAL.value
 
+        self._cached_q_data_type = q_data_type
+        self._cached_kv_data_type = kv_data_type
         self._cached_module = get_batch_prefill_module(
             q_data_type,
             kv_data_type,
@@ -1390,6 +1400,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
             * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``.
         """
+        _check_cached_qkv_data_type(
+            q, k, self._cached_q_data_type, self._cached_kv_data_type
+        )
+
         window_left = self._window_left
         logits_soft_cap = self._logits_soft_cap
         sm_scale = self._sm_scale
