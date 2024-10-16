@@ -26,21 +26,16 @@
 namespace flashinfer {
 
 template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_>
-struct DecodeParamsBase {
+struct SingleDecodeParams {
   using DTypeQ = DTypeQ_;
   using DTypeKV = DTypeKV_;
   using DTypeO = DTypeO_;
-  DTypeQ* q;
-  DTypeO* o;
-  float* lse;
-  float sm_scale;
-};
-
-template <typename DTypeQ, typename DTypeKV, typename DTypeO>
-struct SingleDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
   using IdType = int32_t;
+  DTypeQ* q;
   DTypeKV* k;
   DTypeKV* v;
+  DTypeO* o;
+  float* lse;
   float* alibi_slopes;
   uint32_t kv_len;
   uint32_t num_qo_heads;
@@ -52,6 +47,7 @@ struct SingleDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
   uint32_t head_dim;
   int32_t window_left;
   float logits_soft_cap;
+  float sm_scale;
   float rope_rcp_scale;
   float rope_rcp_theta;
   uint32_t kv_chunk_size;
@@ -62,9 +58,11 @@ struct SingleDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
                                          QKVLayout kv_layout, uint32_t head_dim,
                                          int32_t window_left, float logits_soft_cap, float sm_scale,
                                          float rope_scale, float rope_theta)
-      : DecodeParamsBase<DTypeQ, DTypeKV, DTypeO>{q, o, /*lse=*/nullptr, sm_scale},
+      : q(q),
         k(k),
         v(v),
+        o(o),
+        lse(nullptr),
         alibi_slopes(alibi_slopes),
         kv_len(seq_len),
         num_qo_heads(num_qo_heads),
@@ -76,6 +74,7 @@ struct SingleDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
         head_dim(head_dim),
         window_left(window_left),
         logits_soft_cap(logits_soft_cap),
+        sm_scale(sm_scale),
         rope_rcp_scale(1.f / rope_scale),
         rope_rcp_theta(1.f / rope_theta),
         kv_chunk_size(0) {}
@@ -105,17 +104,24 @@ struct SingleDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
   }
 };
 
-template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType_>
-struct BatchDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
+template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_>
+struct BatchDecodeParams {
+  using DTypeQ = DTypeQ_;
+  using DTypeKV = DTypeKV_;
+  using DTypeO = DTypeO_;
   using IdType = IdType_;
 
+  DTypeQ* q;
   IdType* q_offset;
   paged_kv_t<DTypeKV, IdType> paged_kv;
+  DTypeO* o;
+  float* lse;
   float* alibi_slopes;
   uint32_t padded_batch_size;
   uint32_t num_qo_heads;
   int32_t window_left;
   float logits_soft_cap;
+  float sm_scale;
   float rope_rcp_scale;
   float rope_rcp_theta;
 
@@ -131,14 +137,17 @@ struct BatchDecodeParams : public DecodeParamsBase<DTypeQ, DTypeKV, DTypeO> {
                                         float* alibi_slopes, uint32_t num_qo_heads,
                                         int32_t window_left, float logits_soft_cap, float sm_scale,
                                         float rope_scale, float rope_theta)
-      : DecodeParamsBase<DTypeQ, DTypeKV, DTypeO>{q, o, lse, sm_scale},
+      : q(q),
         q_offset(q_offset),
         paged_kv(paged_kv),
+        o(o),
+        lse(lse),
         alibi_slopes(alibi_slopes),
         padded_batch_size(0),
         num_qo_heads(num_qo_heads),
         window_left(window_left),
         logits_soft_cap(logits_soft_cap),
+        sm_scale(sm_scale),
         rope_rcp_scale(1.f / rope_scale),
         rope_rcp_theta(1.f / rope_theta),
         request_indices(nullptr),
