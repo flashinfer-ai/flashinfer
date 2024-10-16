@@ -97,16 +97,18 @@ __device__ __forceinline__ void compute_qk(const typename AttentionVariant::Para
     st.m = max(st.m, s[j]);
   }
 
-  float o_scale = math::ptx_exp2(m_prev - st.m);
-  st.d *= o_scale;
+  if constexpr (variant.use_softmax) {
+    float o_scale = math::ptx_exp2(m_prev - st.m);
+    st.d *= o_scale;
 #pragma unroll
-  for (uint32_t j = 0; j < tile_size; ++j) {
-    s[j] = math::ptx_exp2(s[j] - st.m);
-    st.d += s[j];
-  }
+    for (uint32_t j = 0; j < tile_size; ++j) {
+      s[j] = math::ptx_exp2(s[j] - st.m);
+      st.d += s[j];
+    }
 #pragma unroll
-  for (uint32_t i = 0; i < vec_size; ++i) {
-    st.o[i] = st.o[i] * o_scale;
+    for (uint32_t i = 0; i < vec_size; ++i) {
+      st.o[i] = st.o[i] * o_scale;
+    }
   }
 }
 
@@ -148,23 +150,38 @@ __device__ __forceinline__ void update_local_state(const T* smem, const float* s
  * \param smem The pointer to shared memory buffer for o
  * \param smem_md The pointer to shared memory buffer for m/d
  */
-template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz>
-__device__ __forceinline__ void sync_state(state_t<vec_size>& st, float* smem, float* smem_md) {
+template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant>
+__device__ __forceinline__ void sync_state(AttentionVariant variant, state_t<vec_size>& st,
+                                           float* smem, float* smem_md) {
   if constexpr (bdz > 1) {
     constexpr uint32_t head_dim = bdx * vec_size;
     auto block = cg::this_thread_block();
     uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
     st.o.store(smem + (tz * bdy + ty) * head_dim + tx * vec_size);
-    smem_md[(tz * bdy + ty) * 2] = st.m;
-    smem_md[(tz * bdy + ty) * 2 + 1] = st.d;
-    block.sync();
-    st.init();
+    if constexpr (variant.use_softmax) {
+      smem_md[(tz * bdy + ty) * 2] = st.m;
+      smem_md[(tz * bdy + ty) * 2 + 1] = st.d;
+      block.sync();
+      st.init();
 #pragma unroll
-    for (uint32_t j = 0; j < bdz; ++j) {
-      float mz = smem_md[(j * bdy + ty) * 2], dz = smem_md[(j * bdy + ty) * 2 + 1];
-      vec_t<float, vec_size> oz;
-      oz.load(smem + (j * bdy + ty) * head_dim + tx * vec_size);
-      st.merge(oz, mz, dz);
+      for (uint32_t j = 0; j < bdz; ++j) {
+        float mz = smem_md[(j * bdy + ty) * 2], dz = smem_md[(j * bdy + ty) * 2 + 1];
+        vec_t<float, vec_size> oz;
+        oz.load(smem + (j * bdy + ty) * head_dim + tx * vec_size);
+        st.merge(oz, mz, dz);
+      }
+    } else {
+      block.sync();
+      st.init();
+#pragma unroll
+      for (uint32_t j = 0; j < bdz; ++j) {
+        vec_t<float, vec_size> oz;
+        oz.load(smem + (j * bdy + ty) * head_dim + tx * vec_size);
+#pragma unroll
+        for (uint32_t i = 0; i < vec_size; ++i) {
+          st.o[i] += oz[i];
+        }
+      }
     }
   }
 }
@@ -338,8 +355,10 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__
   block.sync();
 
   // sync local state of all warps inside a threadblock
-  sync_state<vec_size, bdx, bdy, bdz>(st_local, reinterpret_cast<float*>(smem), smem_md);
-  st_local.normalize();
+  sync_state<vec_size, bdx, bdy, bdz>(variant, st_local, reinterpret_cast<float*>(smem), smem_md);
+  if constexpr (variant.use_softmax) {
+    st_local.normalize();
+  }
 
   st_local.o.cast_store(o + (kv_chunk_idx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
   if (lse != nullptr) {
@@ -557,8 +576,10 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__
   block.sync();
 
   // sync local state of all warps inside a threadblock
-  sync_state<vec_size, bdx, bdy, bdz>(st, reinterpret_cast<float*>(smem), smem_md);
-  st.normalize();
+  sync_state<vec_size, bdx, bdy, bdz>(variant, st, reinterpret_cast<float*>(smem), smem_md);
+  if constexpr (variant.use_softmax) {
+    st.normalize();
+  }
 
   if (tz == 0) {
     st.o.cast_store(o + (bx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
