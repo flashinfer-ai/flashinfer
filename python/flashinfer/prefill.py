@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import math
-from typing import Optional, Dict, Tuple, Union
+from typing import Optional, Dict, Tuple, Union, Any
 from types import SimpleNamespace
 import functools
 import torch
@@ -55,11 +55,9 @@ def compile_single_prefill_module(
     *args,
     verbose: bool = False,
 ):
-    gen_single_prefill_cu(*args)
-    uri = get_single_prefill_uri(*args)
+    uri, path = get_single_prefill_uri(*args)
     return load_cuda_ops(
-        uri,
-        [FLASHINFER_GEN_SRC_DIR / f"{uri}.cu"],
+        uri, [path],
         verbose=verbose,
     )
 
@@ -68,11 +66,9 @@ def compile_batch_prefill_module(
     *args,
     verbose: bool = False,
 ):
-    gen_batch_prefill_cu(*args)
-    uri = get_batch_prefill_uri(*args)
+    uri, path = get_batch_prefill_uri(*args)
     return load_cuda_ops(
-        uri,
-        [FLASHINFER_GEN_SRC_DIR / f"{uri}.cu"],
+        uri, [path],
         verbose=verbose,
     )
 
@@ -128,6 +124,21 @@ def get_batch_prefill_module(*args):
         else:
             _batch_prefill_modules[args] = compile_batch_prefill_module(*args)
     return _batch_prefill_modules[args]
+
+def single_prefill_with_kv_cache_with_jit_module(
+    jit_module: Any,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *args,
+    kv_layout: str = "NHD",
+    window_left: int = -1,
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    tmp = _get_cache_buf("single_prefill_with_kv_cache_tmp", 32 * 1024 * 1024, q.device)
+    out = jit_module.run(
+        q, k, v, tmp, TensorLayout[kv_layout].value, window_left, return_lse, *args)
+    return out if return_lse else out[0]
 
 
 def single_prefill_with_kv_cache(

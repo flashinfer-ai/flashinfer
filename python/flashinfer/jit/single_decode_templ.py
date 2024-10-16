@@ -30,7 +30,6 @@ struct SingleDecodeParams {
   DTypeKV* v;
   DTypeO* o;
   float* lse;
-  float* alibi_slopes;
   {{ additional_params_decl }}
   uint32_t kv_len;
   uint32_t num_qo_heads;
@@ -41,24 +40,18 @@ struct SingleDecodeParams {
   uint32_t kv_stride_h;
   uint32_t head_dim;
   int32_t window_left;
-  float logits_soft_cap;
-  float sm_scale;
-  float rope_rcp_scale;
-  float rope_rcp_theta;
   uint32_t kv_chunk_size;
 
   __device__ __host__ SingleDecodeParams(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeO* o,
-                                         float* alibi_slopes, uint32_t seq_len,
+                                         uint32_t seq_len,
                                          uint32_t num_qo_heads, uint32_t num_kv_heads,
                                          QKVLayout kv_layout, uint32_t head_dim,
-                                         int32_t window_left, float logits_soft_cap, float sm_scale,
-                                         float rope_scale, float rope_theta{{ additional_params }})
+                                         int32_t window_left{{ additional_params }})
       : q(q),
         k(k),
         v(v),
         o(o),
         lse(nullptr),
-        alibi_slopes(alibi_slopes),
         kv_len(seq_len),
         num_qo_heads(num_qo_heads),
         num_kv_heads(num_kv_heads),
@@ -68,10 +61,6 @@ struct SingleDecodeParams {
         kv_stride_h((kv_layout == QKVLayout::kNHD) ? head_dim : seq_len * head_dim),
         head_dim(head_dim),
         window_left(window_left),
-        logits_soft_cap(logits_soft_cap),
-        sm_scale(sm_scale),
-        rope_rcp_scale(1.f / rope_scale),
-        rope_rcp_theta(1.f / rope_theta),
         kv_chunk_size(0){{ additional_params_init }} {}
 
   __host__ __device__ __forceinline__ size_t get_q_elem_offset(uint32_t qo_idx,
@@ -103,10 +92,8 @@ struct SingleDecodeParams {
 
 
 torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torch::Tensor v,
-                                          torch::Tensor tmp, std::optional<torch::Tensor> alibi_slopes,
-                                          unsigned int layout, int window_left,
-                                          float logits_soft_cap, float sm_scale, float rope_scale,
-                                          float rope_theta{{ additional_tensor_params }}) {
+                                          torch::Tensor tmp,
+                                          unsigned int layout, int window_left{{ additional_func_params }}) {
   auto device = q.device();
   unsigned int num_qo_heads = q.size(0);
   unsigned int head_dim = q.size(1);
@@ -127,9 +114,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
   ParamsT params(
       static_cast<{{ dtype_q }}*>(q.data_ptr()), static_cast<{{ dtype_kv }}*>(k.data_ptr()),
       static_cast<{{ dtype_kv }}*>(v.data_ptr()), static_cast<{{ dtype_o }}*>(o.data_ptr()),
-      nullptr,
-      kv_len, num_qo_heads, num_kv_heads, kv_layout, head_dim, window_left,
-      logits_soft_cap, sm_scale, rope_scale, rope_theta{{ additional_tensor_pointers }});
+      kv_len, num_qo_heads, num_kv_heads, kv_layout, head_dim, window_left{{ additional_params_data }});
   
   cudaError_t status = SingleDecodeWithKVCacheDispatched<{{ head_dim }}, PosEncodingMode::kNone, AttentionVariant>(
       params, static_cast<{{ dtype_o }}*>(tmp.data_ptr()), torch_current_stream);

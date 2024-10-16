@@ -1,9 +1,12 @@
+
+import torch
 import flashinfer
 import flashinfer.jit
+import functools
 from flashinfer.utils import MaskMode
-import torch
 from flashinfer.jit.attention import get_customize_single_decode_cu_str, get_customize_single_prefill_cu_str
-import jinja2
+from flashinfer.decode import single_decode_with_kv_cache_with_jit_module
+from flashinfer.prefill import single_prefill_with_kv_cache_with_jit_module
 
 
 def test_single_decode_mask():
@@ -53,8 +56,10 @@ struct SingleDecodeWithCustomMask {
         torch.float16,
         torch.float16,
         128,
-        ["custom_mask"],
-        ["uint8_t"],
+        ["sm_scale"],  # # additional_input_scalar_var_names
+        ["float"],  # additional_input_scalar_var_types
+        ["custom_mask"],  # additional_input_tensor_var_names
+        ["uint8_t"],  # additional_input_tensor_var_types
         "SingleDecodeWithCustomMask",
         variant_decl,
     )
@@ -64,10 +69,12 @@ struct SingleDecodeWithCustomMask {
         cuda_ops_str,
     )
     
-    ops = flashinfer.jit.load_cuda_ops(
+    jit_module = flashinfer.jit.load_cuda_ops(
         "single_decode_with_custom_mask",
         [gen_directory / "single_decode_with_custom_mask.cu"],
     )
+
+    f = functools.partial(single_decode_with_kv_cache_with_jit_module, jit_module)
 
 def test_flash_sigmoid():
     variant_decl = r"""
@@ -84,7 +91,7 @@ struct FlashSigmoid {
 
   // Create closure
   __device__ __host__ FlashSigmoid(const ParamsT& params, uint32_t batch_idx,
-                                        uint8_t* smem_ptr) {
+                                   uint8_t* smem_ptr) {
     qo_len = params.get_qo_len(batch_idx);
     kv_len = params.get_kv_len(batch_idx);
     window_left = kv_len;
@@ -92,14 +99,14 @@ struct FlashSigmoid {
 
   template <typename T>
   __device__ __forceinline__ T QueryTransform(const ParamsT& params, T q) {
-    return float(q) * params.sm_scale * math::log2e;
+    return float(q) * math::log2e;
   }
 
   template <typename T>
   __device__ __forceinline__ T LogitsTransform(const ParamsT& params, T logits, uint32_t batch_idx,
                                                uint32_t qo_idx, uint32_t kv_idx,
                                                uint32_t qo_head_idx, uint32_t kv_head_idx) {
-    return math::ptx_rcp(1.f + math::ptx_exp2(float(logits)));
+    return math::ptx_rcp(1.f + math::ptx_exp2(-float(logits)));
   }
 
   __device__ __forceinline__ bool LogitsMask(const ParamsT& params, uint32_t batch_idx,
@@ -114,9 +121,11 @@ struct FlashSigmoid {
         torch.float16,
         torch.float16,
         128,
-        MaskMode.CAUSAL.value,
-        [],
-        [],
+        MaskMode.NON_CAUSAL.value,
+        [],  # additional_input_scalar_var_names
+        [],  # additional_input_scalar_var_types
+        [],  # additional_input_tensor_var_names
+        [],  # additional_input_tensor_var_types
         "FlashSigmoid",
         variant_decl,
     )
@@ -127,11 +136,23 @@ struct FlashSigmoid {
         cuda_ops_str,
     )
     
-    ops = flashinfer.jit.load_cuda_ops(
+    jit_module = flashinfer.jit.load_cuda_ops(
         "flash_sigmoid",
         [gen_directory / "flash_sigmoid.cu"],
     )
 
+    f = functools.partial(single_prefill_with_kv_cache_with_jit_module, jit_module)
+
+    q = torch.randn(128, 1, 128, dtype=torch.float16, device="cuda")
+    k = torch.randn(254, 1, 128, dtype=torch.float16, device="cuda")
+    v = torch.randn(254, 1, 128, dtype=torch.float16, device="cuda")
+    o = f(q, k, v)
+
+    p = torch.sigmoid(torch.einsum("mhd,nhd->hmn", q, k).float())
+    o_ref = torch.einsum("hmn,nhd->mhd", p.half(), v)
+    torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=2e-3)
+
+
 if __name__ == "__main__":
-    # test_single_decode_mask()
+    test_single_decode_mask()
     test_flash_sigmoid()
