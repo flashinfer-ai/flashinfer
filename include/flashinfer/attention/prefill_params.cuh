@@ -21,29 +21,22 @@
 #include <cmath>
 #include <cstdint>
 
-#include "../fastdiv.cuh"
-#include "../layout.cuh"
 #include "../page.cuh"
 
 namespace flashinfer {
 
 template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_>
-struct PrefillParamsBase {
+struct SinglePrefillParams {
   using DTypeQ = DTypeQ_;
   using DTypeKV = DTypeKV_;
   using DTypeO = DTypeO_;
+  using IdType = int32_t;
   DTypeQ* q;
+  DTypeKV* k;
+  DTypeKV* v;
   uint8_t* custom_mask;
   DTypeO* o;
   float* lse;
-  float sm_scale;
-};
-
-template <typename DTypeQ, typename DTypeKV, typename DTypeO>
-struct SinglePrefillParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTypeO> {
-  using IdType = int32_t;
-  DTypeKV* k;
-  DTypeKV* v;
   float* alibi_slopes;
   uint32_t qo_len;
   uint32_t kv_len;
@@ -56,6 +49,7 @@ struct SinglePrefillParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTypeO> {
   uint32_t head_dim;
   int32_t window_left;
   float logits_soft_cap;
+  float sm_scale;
   float log2_rope_rcp_scale;
   float log2_rope_rcp_theta;
 
@@ -68,13 +62,15 @@ struct SinglePrefillParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTypeO> {
                                uint32_t kv_stride_h, uint32_t head_dim, int32_t window_left,
                                float logits_soft_cap, float sm_scale, float rope_scale,
                                float rope_theta)
-      : PrefillParamsBase<DTypeQ, DTypeKV, DTypeO>{q, custom_mask, o, lse, sm_scale},
+      : q(q),
         k(k),
         v(v),
+        custom_mask(custom_mask),
+        o(o),
+        lse(lse),
         alibi_slopes(alibi_slopes),
         num_qo_heads(num_qo_heads),
         num_kv_heads(num_kv_heads),
-        // group_size_fastdiv(num_qo_heads / num_kv_heads),
         qo_len(qo_len),
         kv_len(kv_len),
         q_stride_n(q_stride_n),
@@ -84,6 +80,7 @@ struct SinglePrefillParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTypeO> {
         head_dim(head_dim),
         window_left(window_left),
         logits_soft_cap(logits_soft_cap),
+        sm_scale(sm_scale),
         log2_rope_rcp_scale(-std::log2f(rope_scale)),
         log2_rope_rcp_theta(-std::log2f(rope_theta)),
         partition_kv(false) {}
@@ -101,17 +98,24 @@ struct SinglePrefillParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTypeO> {
   }
 };
 
-template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType_>
-struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTypeO> {
+template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_>
+struct BatchPrefillRaggedParams {
+  using DTypeQ = DTypeQ_;
+  using DTypeKV = DTypeKV_;
+  using DTypeO = DTypeO_;
   using IdType = IdType_;
 
+  DTypeQ* q;
   DTypeKV* k;
   DTypeKV* v;
+  uint8_t* custom_mask;
   IdType* q_indptr;
   IdType* kv_indptr;
   IdType* qk_indptr;
   IdType* q_offset;           // q_offset is only used for fused-rope attention
   IdType* k_rope_pos_offset;  // k_rope_pos_offset is only used for fused-rope attention
+  DTypeO* o;
+  float* lse;
   float* alibi_slopes;
   uint32_t num_qo_heads;
   uint32_t num_kv_heads;
@@ -121,6 +125,7 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
   uint32_t kv_stride_h;
   int32_t window_left;
   float logits_soft_cap;
+  float sm_scale;
   float log2_rope_rcp_scale;
   float log2_rope_rcp_theta;
 
@@ -143,14 +148,17 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
                                     uint32_t kv_stride_n, uint32_t kv_stride_h, int32_t window_left,
                                     float logits_soft_cap, float sm_scale, float rope_scale,
                                     float rope_theta)
-      : PrefillParamsBase<DTypeQ, DTypeKV, DTypeO>{q, custom_mask, o, lse, sm_scale},
+      : q(q),
         k(k),
         v(v),
+        custom_mask(custom_mask),
         q_indptr(q_indptr),
         kv_indptr(kv_indptr),
         qk_indptr(qk_indptr),
         q_offset(q_offset),
         k_rope_pos_offset(k_rope_pos_offset),
+        o(o),
+        lse(lse),
         alibi_slopes(alibi_slopes),
         num_qo_heads(num_qo_heads),
         num_kv_heads(num_kv_heads),
@@ -160,6 +168,7 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
         kv_stride_h(kv_stride_h),
         window_left(window_left),
         logits_soft_cap(logits_soft_cap),
+        sm_scale(sm_scale),
         log2_rope_rcp_scale(-std::log2f(rope_scale)),
         log2_rope_rcp_theta(-std::log2f(rope_theta)),
         request_indices(nullptr),
@@ -186,18 +195,26 @@ struct BatchPrefillRaggedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTyp
   }
 };
 
-template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType_>
-struct BatchPrefillPagedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DTypeO> {
+template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_>
+struct BatchPrefillPagedParams {
+  using DTypeQ = DTypeQ_;
+  using DTypeKV = DTypeKV_;
+  using DTypeO = DTypeO_;
   using IdType = IdType_;
 
+  DTypeQ* q;
   paged_kv_t<DTypeKV, IdType> paged_kv;
+  uint8_t* custom_mask;
   IdType* q_indptr;
   IdType* qk_indptr;
   IdType* q_offset;  // q_offset is only used for fused-rope attention
+  DTypeO* o;
+  float* lse;
   float* alibi_slopes;
   uint32_t num_qo_heads;
   int32_t window_left;
   float logits_soft_cap;
+  float sm_scale;
   float log2_rope_rcp_scale;
   float log2_rope_rcp_theta;
 
@@ -218,15 +235,19 @@ struct BatchPrefillPagedParams : public PrefillParamsBase<DTypeQ, DTypeKV, DType
                                    uint32_t num_qo_heads, int32_t window_left,
                                    float logits_soft_cap, float sm_scale, float rope_scale,
                                    float rope_theta)
-      : PrefillParamsBase<DTypeQ, DTypeKV, DTypeO>{q, custom_mask, o, lse, sm_scale},
+      : q(q),
         paged_kv(paged_kv),
+        custom_mask(custom_mask),
         q_indptr(q_indptr),
         qk_indptr(qk_indptr),
         q_offset(q_offset),
+        o(o),
+        lse(lse),
         alibi_slopes(alibi_slopes),
         num_qo_heads(num_qo_heads),
         window_left(window_left),
         logits_soft_cap(logits_soft_cap),
+        sm_scale(sm_scale),
         log2_rope_rcp_scale(-std::log2f(rope_scale)),
         log2_rope_rcp_theta(-std::log2f(rope_theta)),
         request_indices(nullptr),

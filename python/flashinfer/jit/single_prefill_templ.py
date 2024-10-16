@@ -14,6 +14,131 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+customizable_single_prefill_templ = r"""
+#include <torch/extension.h>
+#include <optional>
+#include <flashinfer/attention/prefill.cuh>
+#include "pytorch_extension_utils.h"
+
+using namespace flashinfer;
+
+
+struct SinglePrefillParams {
+  using DTypeQ = {{ dtype_q }};
+  using DTypeKV = {{ dtype_kv }};
+  using DTypeO = {{ dtype_o }};
+  using IdType = int32_t;
+  DTypeQ* q;
+  DTypeKV* k;
+  DTypeKV* v;
+  DTypeO* o;
+  float* lse;
+  {{ additional_params_decl }}
+  uint32_t qo_len;
+  uint32_t kv_len;
+  uint32_t num_qo_heads;
+  uint32_t num_kv_heads;
+  uint32_t q_stride_n;
+  uint32_t q_stride_h;
+  uint32_t kv_stride_n;
+  uint32_t kv_stride_h;
+  uint32_t head_dim;
+  int32_t window_left;
+
+  bool partition_kv;
+
+  __host__ SinglePrefillParams(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeO* o,
+                               float* lse, uint32_t num_qo_heads,
+                               uint32_t num_kv_heads, uint32_t qo_len, uint32_t kv_len,
+                               uint32_t q_stride_n, uint32_t q_stride_h, uint32_t kv_stride_n,
+                               uint32_t kv_stride_h, uint32_t head_dim, int32_t window_left{{ additional_params }})
+      : q(q),
+        k(k),
+        v(v),
+        o(o),
+        lse(lse),
+        num_qo_heads(num_qo_heads),
+        num_kv_heads(num_kv_heads),
+        qo_len(qo_len),
+        kv_len(kv_len),
+        q_stride_n(q_stride_n),
+        q_stride_h(q_stride_h),
+        kv_stride_n(kv_stride_n),
+        kv_stride_h(kv_stride_h),
+        head_dim(head_dim),
+        window_left(window_left),
+        partition_kv(false){{ additional_params_init }} {}
+
+  __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
+    return qo_len;
+  }
+
+  __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
+    return kv_len;
+  }
+};
+
+
+{{ variant_decl }}
+
+std::vector<torch::Tensor> single_prefill_with_kv_cache(
+    torch::Tensor q, torch::Tensor k, torch::Tensor v,
+    torch::Tensor tmp, unsigned int layout, int32_t window_left, bool return_lse{{ additional_func_params }}) {
+  auto device = q.device();
+  unsigned int head_dim = q.size(2);
+  unsigned int kv_len, qo_len, num_kv_heads, num_qo_heads;
+  QKVLayout kv_layout = static_cast<QKVLayout>(layout);
+  qo_len = q.size(0);
+  num_qo_heads = q.size(1);
+  uint32_t q_stride_n = q.stride(0), q_stride_h = q.stride(1), kv_stride_n, kv_stride_h;
+  if (kv_layout == QKVLayout::kNHD) {
+    kv_len = k.size(0);
+    num_kv_heads = k.size(1);
+    kv_stride_n = k.stride(0);
+    kv_stride_h = k.stride(1);
+  } else {
+    kv_len = k.size(1);
+    num_kv_heads = k.size(0);
+    kv_stride_h = k.stride(0);
+    kv_stride_n = k.stride(1);
+  }
+  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
+  auto o = torch::empty_like(q, q.options());
+  torch::Tensor lse = torch::empty({0});
+  if (return_lse) {
+    lse = torch::empty({qo_len, num_qo_heads}, q.options().dtype(torch::kFloat32));
+  }
+
+  using ParamsT = SinglePrefillParams;
+  using AttentionVariant = {{ variant_name }}<ParamsT>;
+  ParamsT params(
+    static_cast<{{ dtype_q }}*>(q.data_ptr()), static_cast<{{ dtype_kv }}*>(k.data_ptr()),
+    static_cast<{{ dtype_kv }}*>(v.data_ptr()),
+    static_cast<{{ dtype_o }}*>(o.data_ptr()),
+    /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
+    num_qo_heads, num_kv_heads, qo_len, kv_len, q_stride_n, q_stride_h,
+    kv_stride_n, kv_stride_h, head_dim, window_left{{ additional_params_data }});
+  
+  cudaError_t status =
+      SinglePrefillWithKVCacheDispatched<{{ head_dim }}, PosEncodingMode::kNone, false, {{ mask_mode }}, AttentionVariant>(
+            params, static_cast<{{ dtype_o }}*>(tmp.data_ptr()), torch_current_stream);
+  TORCH_CHECK(status == cudaSuccess,
+             "SinglePrefillWithKVCache kernel launch failed, error: " +
+              std::string(cudaGetErrorString(status)));
+
+  if (return_lse) {
+    return {o, lse};
+  } else {
+    return {o};
+  }
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("run", &single_prefill_with_kv_cache,
+        "Single-request prefill attention with KV-Cache operator");
+}
+"""
+
 single_prefill_templ = r"""
 #include <torch/extension.h>
 #include <optional>

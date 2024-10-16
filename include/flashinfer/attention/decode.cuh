@@ -221,8 +221,6 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__
   const DTypeKV* v = params.v;
   DTypeO* o = params.o;
   float* lse = params.lse;
-  const float rope_rcp_scale = params.rope_rcp_scale;
-  const float rope_rcp_theta = params.rope_rcp_theta;
   uint32_t kv_chunk_size = params.kv_chunk_size;
 
   auto block = cg::this_thread_block();
@@ -247,6 +245,8 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__
   vec_t<float, vec_size> q_vec;
   vec_t<float, vec_size> freq;
   if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
+    const float rope_rcp_scale = params.rope_rcp_scale;
+    const float rope_rcp_theta = params.rope_rcp_theta;
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
       freq[i] = rope_rcp_scale *
@@ -406,8 +406,6 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__
   const bool* block_valid_mask = params.block_valid_mask;
   const uint32_t padded_batch_size = params.padded_batch_size;
   const uint32_t num_qo_heads = params.num_qo_heads;
-  const float rope_rcp_scale = params.rope_rcp_scale;
-  const float rope_rcp_theta = params.rope_rcp_theta;
   const bool partition_kv = params.partition_kv;
 
   constexpr uint32_t head_dim = bdx * vec_size;
@@ -442,6 +440,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__
   vec_t<float, vec_size> freq;
   int32_t q_offset_val = q_offset == nullptr ? (kv_len - 1) : q_offset[batch_idx];
   if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
+    const float rope_rcp_scale = params.rope_rcp_scale;
+    const float rope_rcp_theta = params.rope_rcp_theta;
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
       freq[i] = rope_rcp_scale *

@@ -669,7 +669,9 @@ __device__ __forceinline__ void logits_mask(const typename AttentionVariant::Par
                    ? (kv_idx + qo_len > kv_len + q_idx || (kv_idx >= chunk_end))
                    : kv_idx >= chunk_end)) &&
             variant.LogitsMask(params, batch_idx, q_idx, kv_idx, qo_head_idx, kv_head_idx);
-        s_frag[fq][fkv][reg_id] = (mask) ? s_frag[fq][fkv][reg_id] : DTypeQKAccum(-math::inf);
+        s_frag[fq][fkv][reg_id] =
+            (mask) ? s_frag[fq][fkv][reg_id]
+                   : (variant.use_softmax ? DTypeQKAccum(-math::inf) : DTypeQKAccum(0.f));
       }
     }
   }
@@ -757,8 +759,10 @@ __device__ __forceinline__ void update_mdo_states(AttentionVariant variant,
 }
 
 template <uint32_t NUM_FRAGS_Q, uint32_t NUM_FRAGS_D, uint32_t NUM_FRAGS_KV,
-          SwizzleMode swizzle_mode, typename DTypeQ, typename DTypeKV, typename DTypeQKAccum>
-__device__ __forceinline__ void compute_sfm_v(smem_t<swizzle_mode>* v_smem,
+          SwizzleMode swizzle_mode, typename DTypeQ, typename DTypeKV, typename DTypeQKAccum,
+          typename AttentionVariant>
+__device__ __forceinline__ void compute_sfm_v(AttentionVariant variant,
+                                              smem_t<swizzle_mode>* v_smem,
                                               uint32_t* v_smem_offset_r,
                                               DTypeQKAccum (*s_frag)[NUM_FRAGS_KV][8],
                                               float (*o_frag)[NUM_FRAGS_D][8], float (*d)[2]) {
@@ -776,14 +780,16 @@ __device__ __forceinline__ void compute_sfm_v(smem_t<swizzle_mode>* v_smem,
     }
   }
 
+  if constexpr (variant.use_softmax) {
 #pragma unroll
-  for (uint32_t fq = 0; fq < NUM_FRAGS_Q; ++fq) {
+    for (uint32_t fq = 0; fq < NUM_FRAGS_Q; ++fq) {
 #pragma unroll
-    for (uint32_t fkv = 0; fkv < NUM_FRAGS_KV; ++fkv) {
-      if constexpr (std::is_same<DTypeQKAccum, float>::value) {
-        mma::rowsum_f16f16f32(d[fq], s_frag_f16[fq][fkv]);
-      } else {
-        mma::rowsum_f16f16f32(d[fq], s_frag[fq][fkv]);
+      for (uint32_t fkv = 0; fkv < NUM_FRAGS_KV; ++fkv) {
+        if constexpr (std::is_same<DTypeQKAccum, float>::value) {
+          mma::rowsum_f16f16f32(d[fq], s_frag_f16[fq][fkv]);
+        } else {
+          mma::rowsum_f16f16f32(d[fq], s_frag[fq][fkv]);
+        }
       }
     }
   }
@@ -1106,8 +1112,7 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void SinglePrefillWithKV
     const uint32_t kv_stride_n = params.kv_stride_n;
     const uint32_t kv_stride_h = params.kv_stride_h;
     const int32_t maybe_window_left = params.window_left;
-    const float log2_rope_rcp_scale = params.log2_rope_rcp_scale;
-    const float log2_rope_rcp_theta = params.log2_rope_rcp_theta;
+
     static_assert(sizeof(DTypeQ) == 2);
     static_assert(sizeof(DTypeO) == 2);
     const uint32_t lane_idx = threadIdx.x, warp_idx = get_warp_idx<NUM_WARPS_Q, NUM_WARPS_KV>();
@@ -1140,6 +1145,8 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void SinglePrefillWithKV
     float d[NUM_FRAGS_Q][2];
     float rope_freq[NUM_FRAGS_D / 2][4];
     if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
+      const float log2_rope_rcp_scale = params.log2_rope_rcp_scale;
+      const float log2_rope_rcp_theta = params.log2_rope_rcp_theta;
       init_rope_freq<NUM_FRAGS_D>(rope_freq, log2_rope_rcp_scale, log2_rope_rcp_theta);
     }
     init_states<NUM_FRAGS_Q, NUM_FRAGS_D>(variant, o_frag, m, d);
@@ -1281,7 +1288,7 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void SinglePrefillWithKV
 
       // compute sfm*v
       compute_sfm_v<NUM_FRAGS_Q, NUM_FRAGS_D, NUM_FRAGS_KV, swizzle_mode_kv, DTypeQ, DTypeKV>(
-          &v_smem, &v_smem_offset_r, s_frag, o_frag, d);
+          variant, &v_smem, &v_smem_offset_r, s_frag, o_frag, d);
 
       block.sync();
       produce_kv<SharedMemFillMode::kFillZero, NUM_WARPS_Q, NUM_WARPS_KV, NUM_FRAGS_D,
@@ -1517,8 +1524,6 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithRag
     const uint32_t kv_stride_n = params.kv_stride_n;
     const uint32_t kv_stride_h = params.kv_stride_h;
     const int32_t maybe_window_left = params.window_left;
-    const float log2_rope_rcp_scale = params.log2_rope_rcp_scale;
-    const float log2_rope_rcp_theta = params.log2_rope_rcp_theta;
 
     static_assert(sizeof(DTypeQ) == 2);
     static_assert(sizeof(DTypeO) == 2);
@@ -1561,6 +1566,8 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithRag
     float rope_freq[NUM_FRAGS_D / 2][4];
 
     if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
+      const float log2_rope_rcp_scale = params.log2_rope_rcp_scale;
+      const float log2_rope_rcp_theta = params.log2_rope_rcp_theta;
       init_rope_freq<NUM_FRAGS_D>(rope_freq, log2_rope_rcp_scale, log2_rope_rcp_theta);
     }
     init_states<NUM_FRAGS_Q, NUM_FRAGS_D>(variant, o_frag, m, d);
@@ -1717,7 +1724,7 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithRag
 
       // compute sfm*v
       compute_sfm_v<NUM_FRAGS_Q, NUM_FRAGS_D, NUM_FRAGS_KV, swizzle_mode_kv, DTypeQ, DTypeKV>(
-          &v_smem, &v_smem_offset_r, s_frag, o_frag, d);
+          variant, &v_smem, &v_smem_offset_r, s_frag, o_frag, d);
 
       block.sync();
       produce_kv<SharedMemFillMode::kFillZero, NUM_WARPS_Q, NUM_WARPS_KV, NUM_FRAGS_D,
@@ -1805,8 +1812,6 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPag
     const paged_kv_t<DTypeKV, IdType>& paged_kv = params.paged_kv;
     const bool partition_kv = params.partition_kv;
     const int32_t maybe_window_left = params.window_left;
-    const float log2_rope_rcp_scale = params.log2_rope_rcp_scale;
-    const float log2_rope_rcp_theta = params.log2_rope_rcp_theta;
 
     static_assert(sizeof(DTypeQ) == 2);
     static_assert(sizeof(DTypeO) == 2);
@@ -1848,6 +1853,8 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPag
     float rope_freq[NUM_FRAGS_D / 2][4];
 
     if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
+      const float log2_rope_rcp_scale = params.log2_rope_rcp_scale;
+      const float log2_rope_rcp_theta = params.log2_rope_rcp_theta;
       init_rope_freq<NUM_FRAGS_D>(rope_freq, log2_rope_rcp_scale, log2_rope_rcp_theta);
     }
     init_states<NUM_FRAGS_Q, NUM_FRAGS_D>(variant, o_frag, m, d);
@@ -2021,7 +2028,7 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPag
 
       // compute sfm*v
       compute_sfm_v<NUM_FRAGS_Q, NUM_FRAGS_D, NUM_FRAGS_KV, swizzle_mode_kv, DTypeQ, DTypeKV>(
-          &v_smem, &v_smem_offset_r, s_frag, o_frag, d);
+          variant, &v_smem, &v_smem_offset_r, s_frag, o_frag, d);
 
       block.sync();
       page_produce_kv<true, NUM_WARPS_Q, NUM_WARPS_KV, NUM_FRAGS_D, NUM_FRAGS_KV>(

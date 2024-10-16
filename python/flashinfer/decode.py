@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import math
-from typing import Optional, Union, Dict, Tuple
+from typing import Optional, Union, Dict, Tuple, Any
 from types import SimpleNamespace
 import torch
 import functools
@@ -51,11 +51,9 @@ def compile_single_decode_module(
     *args,
     verbose: bool = False,
 ):
-    gen_single_decode_cu(*args)
-    uri = get_single_decode_uri(*args)
+    uri, path = gen_single_decode_cu(*args)
     return load_cuda_ops(
-        uri,
-        [FLASHINFER_GEN_SRC_DIR / f"{uri}.cu"],
+        uri, [path],
         verbose=verbose,
     )
 
@@ -64,11 +62,9 @@ def compile_batch_decode_module(
     *args,
     verbose: bool = False,
 ):
-    gen_batch_decode_cu(*args)
-    uri = get_batch_decode_uri(*args)
+    uri, path = gen_batch_decode_cu(*args),
     return load_cuda_ops(
-        uri,
-        [FLASHINFER_GEN_SRC_DIR / f"{uri}.cu"],
+        uri, [path],
         verbose=verbose,
     )
 
@@ -117,6 +113,18 @@ def get_batch_decode_module(*args):
         else:
             _batch_decode_modules[args] = compile_batch_decode_module(*args)
     return _batch_decode_modules[args]
+
+def single_decode_with_kv_cache_with_jit_module(
+    jit_module: Any,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *args,
+    kv_layout: str = "NHD",
+    window_left: int = -1,
+):
+    tmp = _get_cache_buf("single_decode_with_kv_cache_tmp", 32 * 1024 * 1024, q.device)    
+    return jit_module.run(q, k, v, tmp, TensorLayout[kv_layout].value, window_left, *args)
 
 
 def single_decode_with_kv_cache(
