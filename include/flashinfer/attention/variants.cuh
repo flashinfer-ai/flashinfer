@@ -32,10 +32,17 @@ struct StandardAttention {
   using DTypeKV = typename ParamsT::DTypeKV;
   using DTypeO = typename ParamsT::DTypeO;
   using IdType = typename ParamsT::IdType;
+  static constexpr bool use_softmax = true;
+
+  uint32_t window_left, qo_len, kv_len;
 
   // Create closure
   __device__ __host__ StandardAttention(const ParamsT& params, uint32_t batch_idx,
-                                        uint8_t* smem_ptr) {}
+                                        uint8_t* smem_ptr) {
+    qo_len = params.get_qo_len(batch_idx);
+    kv_len = params.get_kv_len(batch_idx);
+    window_left = kv_len;
+  }
 
   template <typename T>
   __device__ __forceinline__ T QueryTransform(const ParamsT& params, T q) {
@@ -62,9 +69,10 @@ struct CustomMaskAttention {
   using DTypeQ = typename ParamsT::DTypeQ;
   using DTypeKV = typename ParamsT::DTypeKV;
   using DTypeO = typename ParamsT::DTypeO;
+  static constexpr bool use_softmax = true;
 
   uint8_t* custom_mask_ptr;
-  uint32_t qo_len, kv_len;
+  uint32_t window_left, qo_len, kv_len;
 
   // Create closure
   __device__ __host__ CustomMaskAttention(const ParamsT& params, uint32_t batch_idx,
@@ -72,6 +80,7 @@ struct CustomMaskAttention {
     custom_mask_ptr = params.get_batch_local_mask_ptr(batch_idx);
     qo_len = params.get_qo_len(batch_idx);
     kv_len = params.get_kv_len(batch_idx);
+    window_left = kv_len;
   }
 
   template <typename T>
@@ -101,6 +110,7 @@ struct SlidingWindowAttention {
   using DTypeKV = typename ParamsT::DTypeKV;
   using DTypeO = typename ParamsT::DTypeO;
   using IdType = typename ParamsT::IdType;
+  static constexpr bool use_softmax = true;
 
   uint32_t window_left, qo_len, kv_len;
 
@@ -137,8 +147,15 @@ struct LogitsSoftCap {
   using DTypeQ = typename ParamsT::DTypeQ;
   using DTypeKV = typename ParamsT::DTypeKV;
   using DTypeO = typename ParamsT::DTypeO;
+  static constexpr bool use_softmax = true;
 
-  __device__ __host__ LogitsSoftCap(const ParamsT& params, uint32_t batch_idx, uint8_t* smem_ptr) {}
+  uint32_t window_left, qo_len, kv_len;
+
+  __device__ __host__ LogitsSoftCap(const ParamsT& params, uint32_t batch_idx, uint8_t* smem_ptr) {
+    qo_len = params.get_qo_len(batch_idx);
+    kv_len = params.get_kv_len(batch_idx);
+    window_left = kv_len;
+  }
 
   template <typename T>
   __device__ __forceinline__ T QueryTransform(const ParamsT& params, T q) {
@@ -165,8 +182,14 @@ struct ALIBIAttention {
   using DTypeKV = typename ParamsT::DTypeKV;
   using DTypeO = typename ParamsT::DTypeO;
   using IdType = typename ParamsT::IdType;
+  static constexpr bool use_softmax = true;
+
+  uint32_t window_left, qo_len, kv_len;
 
   __device__ __host__ ALIBIAttention(const ParamsT& params, uint32_t batch_idx, uint8_t* smem_ptr) {
+    qo_len = params.get_qo_len(batch_idx);
+    kv_len = params.get_kv_len(batch_idx);
+    window_left = kv_len;
   }
 
   template <typename T>
@@ -206,6 +229,7 @@ struct ComposedAttention {
   using DTypeKV = typename ParamsT::DTypeKV;
   using DTypeO = typename ParamsT::DTypeO;
   using IdType = typename ParamsT::IdType;
+  static constexpr bool use_softmax = true;
   static constexpr bool use_custom_mask = (VARIANT_CODE & CUSTOM_MASK) != 0;
   static constexpr bool use_sliding_window = (VARIANT_CODE & SLIDING_WINDOW) != 0;
   static constexpr bool use_logits_soft_cap = (VARIANT_CODE & LOGITS_SOFT_CAP) != 0;
