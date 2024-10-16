@@ -26,18 +26,6 @@
 namespace flashinfer {
 
 template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_>
-struct PrefillParamsBase {
-  using DTypeQ = DTypeQ_;
-  using DTypeKV = DTypeKV_;
-  using DTypeO = DTypeO_;
-  DTypeQ* q;
-  uint8_t* custom_mask;
-  DTypeO* o;
-  float* lse;
-  float sm_scale;
-};
-
-template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_>
 struct SinglePrefillParams {
   using DTypeQ = DTypeQ_;
   using DTypeKV = DTypeKV_;

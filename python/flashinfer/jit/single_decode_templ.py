@@ -102,7 +102,6 @@ struct SingleDecodeParams {
 {{ variant_decl }}
 
 
-{% set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
 torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                                           torch::Tensor tmp, std::optional<torch::Tensor> alibi_slopes,
                                           unsigned int layout, int window_left,
@@ -128,7 +127,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
   ParamsT params(
       static_cast<{{ dtype_q }}*>(q.data_ptr()), static_cast<{{ dtype_kv }}*>(k.data_ptr()),
       static_cast<{{ dtype_kv }}*>(v.data_ptr()), static_cast<{{ dtype_o }}*>(o.data_ptr()),
-      {% if use_alibi == "true" %}static_cast<float*>(alibi_slopes->data_ptr()){% else %}nullptr{% endif %},
+      nullptr,
       kv_len, num_qo_heads, num_kv_heads, kv_layout, head_dim, window_left,
       logits_soft_cap, sm_scale, rope_scale, rope_theta{{ additional_tensor_pointers }});
   

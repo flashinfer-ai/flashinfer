@@ -27,7 +27,7 @@ from .utils import (
 )
 from .single_decode_templ import single_decode_templ, customizable_single_decode_templ
 from .batch_decode_templ import batch_decode_templ
-from .single_prefill_templ import single_prefill_templ
+from .single_prefill_templ import single_prefill_templ, customizable_single_prefill_templ
 from .batch_prefill_templ import batch_prefill_templ
 from typing import List
 
@@ -305,6 +305,59 @@ def get_customize_single_decode_cu_str(
         dtype_kv=dtype_map[dtype_kv],
         dtype_o=dtype_map[dtype_o],
         head_dim=head_dim,
+        additional_params_decl=additional_params_decl,
+        additional_params=additional_params,
+        additional_params_init=additional_params_init,
+        variant_decl=variant_decl,
+        variant_name=variant_name,
+        additional_tensor_params=additional_tensor_params,
+        additional_tensor_pointers=additional_tensor_pointers,
+    )
+
+
+def get_customize_single_prefill_cu_str(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    head_dim: int,
+    mask_mode: int,
+    additional_input_tensor_var_names: List[str],
+    additional_input_tensor_var_types: List[str],
+    variant_name: str,
+    variant_decl: str,
+) -> str:
+    template = jinja2.Template(customizable_single_prefill_templ)
+    additional_params_decl = "".join(
+        f"{dtype}* {var};\n"
+        for dtype, var in zip(
+            additional_input_tensor_var_types, additional_input_tensor_var_names
+        )
+    )
+    additional_params = "".join(
+        f", {dtype}* {var}"
+        for dtype, var in zip(
+            additional_input_tensor_var_types, additional_input_tensor_var_names
+        )
+    )
+    additional_params_init = "".join(
+        f", {var}({var})" for var in additional_input_tensor_var_names
+    )
+    additional_tensor_params = "".join(
+        f", torch::Tensor {var}" for var in additional_input_tensor_var_names
+    )
+    additional_tensor_pointers = "".join(
+        f", static_cast<{dtype}*>({var}.data_ptr())"
+        for dtype, var in zip(
+            additional_input_tensor_var_types, additional_input_tensor_var_names
+        )
+    )
+
+    return template.render(
+        dtype_q=dtype_map[dtype_q],
+        dtype_kv=dtype_map[dtype_kv],
+        dtype_o=dtype_map[dtype_o],
+        head_dim=head_dim,
+        mask_mode=mask_mode_literal[mask_mode],
         additional_params_decl=additional_params_decl,
         additional_params=additional_params,
         additional_params_init=additional_params_init,
