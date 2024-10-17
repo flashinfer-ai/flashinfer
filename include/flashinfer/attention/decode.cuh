@@ -850,7 +850,7 @@ __device__ __forceinline__ void compute_qk_and_update_local_stat_mla(
 
 
 template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem,
-          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant>
+          uint32_t vec_size_ckv, uint32_t vec_size_kpe, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant>
 __global__ void BatchDecodeWithPagedKVCacheKernelMLA(typename AttentionVariant::ParamsT params) {
 
   auto block = cg::this_thread_block();
@@ -869,7 +869,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(typename AttentionVariant::
   const float rope_rcp_theta = params.rope_rcp_theta;
   const bool partition_kv = params.partition_kv;
 
-  constexpr uint32_t head_dim = bdx * vec_size;
+  constexpr uint32_t head_dim_ckv = bdx * vec_size_ckv;
+  constexpr uint32_t head_dim_kpe = bdx * vec_size_kpe;
   const uint32_t batch_idx = blockIdx.x;
   const uint32_t qo_head_idx = blockIdx.y * bdy + threadIdx.y;
   const uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
@@ -895,33 +896,33 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(typename AttentionVariant::
   
   extern __attribute__((shared)) uint8_t smem[];
   DTypeKV* k_smem = (DTypeKV*)smem;
-  size_t* kv_offset_smem = (size_t*)(smem + 1 * num_stages_smem * bdy * bdz * head_dim * sizeof(DTypeKV));                                      
+  size_t* kv_offset_smem = (size_t*)(smem + 1 * num_stages_smem * bdy * bdz * head_dim_ckv * sizeof(DTypeKV));                                      
   float* smem_md = reinterpret_cast<float*>(kv_offset_smem);
   AttentionVariant variant(params, batch_idx, smem);                                     
   
 
-  vec_t<float, vec_size> q_vec;
-  vec_t<float, vec_size> freq;
+  vec_t<float, vec_size_ckv> q_vec;
+  vec_t<float, vec_size_ckv> freq;
   if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
-    for (uint32_t i = 0; i < vec_size; ++i) {
+    for (uint32_t i = 0; i < vec_size_ckv; ++i) {
       freq[i] = rope_rcp_scale *
                 __powf(rope_rcp_theta,
-                       float(2 * ((tx * vec_size + i) % (head_dim / 2))) / float(head_dim));
+                       float(2 * ((tx * vec_size_ckv + i) % (head_dim_ckv / 2))) / float(head_dim_ckv));
     }
-    q_vec = vec_apply_llama_rope<vec_size, bdx>(
-        q + (mapped_batch_idx * num_qo_heads + qo_head_idx) * head_dim, freq, q_offset_val);
+    q_vec = vec_apply_llama_rope<vec_size_ckv, bdx>(
+        q + (mapped_batch_idx * num_qo_heads + qo_head_idx) * head_dim_ckv, freq, q_offset_val);
   } else {
-    q_vec.cast_load(q + (mapped_batch_idx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
+    q_vec.cast_load(q + (mapped_batch_idx * num_qo_heads + qo_head_idx) * head_dim_ckv + tx * vec_size_ckv);
   }
 
-  for (uint32_t i = 0; i < vec_size; ++i) {
+  for (uint32_t i = 0; i < vec_size_ckv; ++i) {
     q_vec[i] = variant.QueryTransform(params, q_vec[i]);
   }
   block.sync();
 
 
   uint32_t stage_idx = 0;
-  constexpr uint32_t vec_bits = sizeof(DTypeKV) * vec_size * 8;
+  constexpr uint32_t vec_bits = sizeof(DTypeKV) * vec_size_ckv * 8;
 
   static_assert(num_stages_smem <= bdx);
   {
@@ -939,13 +940,13 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(typename AttentionVariant::
   for (uint32_t iter = 0; iter < num_stages_smem; ++iter) {
     {
       kv_offset[0] =
-          kv_offset_smem[Dim3(bdx, bdz, bdy).offset(iter, tz, ty)] + tx * vec_size;
+          kv_offset_smem[Dim3(bdx, bdz, bdy).offset(iter, tz, ty)] + tx * vec_size_ckv;
     }
 
     {
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
-          k_smem + ( stage_idx * kv_iter_len + Dim2(bdz, bdy).offset(tz, ty) ) * head_dim +
-              tx * vec_size,
+          k_smem + ( stage_idx * kv_iter_len + Dim2(bdz, bdy).offset(tz, ty) ) * head_dim_ckv +
+              tx * vec_size_ckv,
           paged_kv.ckv_data + kv_offset[0],
           ( iter * kv_iter_len + Dim2(bdz, bdy).offset(tz, ty) ) < cur_batch_chunk_len );
     }
@@ -953,16 +954,16 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(typename AttentionVariant::
     stage_idx = (stage_idx + 1) % num_stages_smem;
   }
 
-  state_t<vec_size> st;
+  state_t<vec_size_ckv> st;
 
   for (uint32_t iter = 0; iter < ceil_div(cur_batch_chunk_len, kv_iter_len); ++iter) {
     cp_async::wait_group<1 * num_stages_smem - 1>();
     block.sync();
     const int32_t kv_idx_base = (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[mapped_batch_idx]) +
             cur_batch_chunk_start + iter * kv_iter_len;
-    compute_qk_and_update_local_stat_mla<POS_ENCODING_MODE, vec_size, bdx, compute_qk_tile, AttentionVariant>(
+    compute_qk_and_update_local_stat_mla<POS_ENCODING_MODE, vec_size_ckv, bdx, compute_qk_tile, AttentionVariant>(
         params, variant, mapped_batch_idx,
-        k_smem + (stage_idx * kv_iter_len + tz * compute_qk_tile )*head_dim,
+        k_smem + (stage_idx * kv_iter_len + tz * compute_qk_tile )*head_dim_ckv,
         q_vec,
         freq,
         kv_idx_base,
@@ -985,13 +986,13 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(typename AttentionVariant::
     {
       kv_offset[0] =
           kv_offset_smem[Dim3(bdx, bdz, bdy).offset((iter + num_stages_smem) % bdx, tz, ty)] + 
-          tx * vec_size;
+          tx * vec_size_ckv;
     }
 
     {
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
-          k_smem + ( stage_idx * kv_iter_len + Dim2(bdz, bdy).offset(tz, ty) ) * head_dim +
-              tx * vec_size,
+          k_smem + ( stage_idx * kv_iter_len + Dim2(bdz, bdy).offset(tz, ty) ) * head_dim_ckv +
+              tx * vec_size_ckv,
           paged_kv.ckv_data + kv_offset[0],
           ( (iter + num_stages_smem) * kv_iter_len + Dim2(bdz, bdy).offset(tz, ty) ) < cur_batch_chunk_len );
     }
@@ -1003,11 +1004,11 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(typename AttentionVariant::
   block.sync();
 
   if (bdz != 0)
-    sync_state<vec_size, bdx, bdy, bdz>(variant, st, reinterpret_cast<float*>(smem), smem_md);
+    sync_state<vec_size_ckv, bdx, bdy, bdz>(variant, st, reinterpret_cast<float*>(smem), smem_md);
 
   if (tz == 0) {
     st.normalize();
-    st.o.cast_store(o + (batch_idx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
+    st.o.cast_store(o + (batch_idx * num_qo_heads + qo_head_idx) * head_dim_ckv + tx * vec_size_ckv);
 
     if (lse != nullptr) {
       lse[batch_idx * num_qo_heads + qo_head_idx] = st.get_lse();
@@ -1016,7 +1017,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(typename AttentionVariant::
 }
 
 
-template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant>
+template <uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant>
 cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA(typename AttentionVariant::ParamsT params,
                                                   typename AttentionVariant::DTypeO* tmp_v,
                                                   float* tmp_s, cudaStream_t stream) {
@@ -1028,7 +1029,8 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA(typename AttentionVariant::
   const uint32_t padded_batch_size = params.padded_batch_size;
 
   constexpr uint32_t bdx = 32;
-  constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL);
+  constexpr uint32_t vec_size_ckv = std::max(16UL / sizeof(DTypeKV), HEAD_DIM_CKV / 32UL);
+  constexpr uint32_t vec_size_kpe = std::max(16UL / sizeof(DTypeKV), HEAD_DIM_KPE / 32UL);
   constexpr uint32_t bdy = 4;
   constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
   constexpr uint32_t bdz = num_threads / (bdx * bdy);
@@ -1043,15 +1045,16 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA(typename AttentionVariant::
   auto compute_capacity = GetCudaComputeCapability();
   DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
     const uint32_t smem_size =
-        1 * NUM_STAGES_SMEM * bdy * bdz * HEAD_DIM * sizeof(DTypeKV) +
-        std::max(num_threads * sizeof(size_t),
+        1 * NUM_STAGES_SMEM * bdy * bdz * (HEAD_DIM_CKV + HEAD_DIM_KPE) * sizeof(DTypeKV) +
+        std::max(num_threads * sizeof(size_t) * 2,
                   2 * bdy * bdz * sizeof(float));
-    std::cout<<"BatchDecodeWithPagedKVCacheDispatchedMLA: vec_size="<<vec_size<<" bdx="<<bdx<<" bdy="<<bdy<<" bdz="<<bdz
+    std::cout<<"BatchDecodeWithPagedKVCacheDispatchedMLA: vec_size_ckv="<<vec_size_ckv<<" vec_size_kpe="<<vec_size_kpe
+      <<" bdx="<<bdx<<" bdy="<<bdy<<" bdz="<<bdz
       <<" smem_size="<<smem_size<<" padded_batch_size="<<padded_batch_size<<"\n\n";
     
     auto kernel =
         BatchDecodeWithPagedKVCacheKernelMLA<POS_ENCODING_MODE, NUM_STAGES_SMEM,
-                                          vec_size, bdx, bdy, bdz, AttentionVariant>;
+                                          vec_size_ckv, vec_size_kpe, bdx, bdy, bdz, AttentionVariant>;
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -1077,7 +1080,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA(typename AttentionVariant::
           cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
       FLASHINFER_CUDA_CALL(VariableLengthMergeStates(tmp_v, tmp_s, params.o_indptr, o, lse,
                                                       params.paged_kv.batch_size, num_qo_heads,
-                                                      HEAD_DIM, stream));
+                                                      HEAD_DIM_CKV, stream));
     }
   });
   return cudaSuccess;

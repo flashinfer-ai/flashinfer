@@ -37,7 +37,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__
                                                   typename AttentionVariant::ParamsT params);
 
 template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem,
-          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant>
+          uint32_t vec_size_ckv, uint32_t vec_size_kpe, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant>
 __global__ void BatchDecodeWithPagedKVCacheKernelMLA(typename AttentionVariant::ParamsT params);
 
 /*!
@@ -196,7 +196,7 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
   })
 }
 
-template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
+template <uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, PosEncodingMode POS_ENCODING_MODE,
           typename AttentionVariant>
 cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA(
     bool& split_kv, uint32_t& max_grid_size, uint32_t& max_num_pages_per_batch,
@@ -211,7 +211,8 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA(
   DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
 
     constexpr uint32_t bdx = 32;
-    constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL);
+    constexpr uint32_t vec_size_ckv = std::max(16UL / sizeof(DTypeKV), HEAD_DIM_CKV / 32UL);
+    constexpr uint32_t vec_size_kpe = std::max(16UL / sizeof(DTypeKV), HEAD_DIM_KPE / 32UL);
     constexpr uint32_t bdy = 4;
     constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
     constexpr uint32_t bdz = num_threads / (bdx * bdy);
@@ -224,13 +225,13 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA(
     gdy = ceil_div(num_qo_heads, bdy);
 
     const uint32_t smem_size =
-        1 * NUM_STAGES_SMEM * bdy * bdz * HEAD_DIM * sizeof(DTypeKV) +
-        std::max(num_threads * sizeof(size_t),
+        1 * NUM_STAGES_SMEM * bdy * bdz * (HEAD_DIM_CKV + HEAD_DIM_KPE) * sizeof(DTypeKV) +
+        std::max(num_threads * sizeof(size_t) * 2,
                   2 * bdy * bdz * sizeof(float));
 
     auto kernel =
         BatchDecodeWithPagedKVCacheKernelMLA<POS_ENCODING_MODE, NUM_STAGES_SMEM,
-                                          vec_size, bdx, bdy, bdz, AttentionVariant>;
+                                          vec_size_ckv, vec_size_kpe, bdx, bdy, bdz, AttentionVariant>;
     int num_blocks_per_sm = 0;
     int num_sm = 0;
     int dev_id = 0;
@@ -265,7 +266,8 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA(
       }
     }
 
-    std::cout<<"BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA: vec_size="<<vec_size<<" bdx="<<bdx<<" bdy="<<bdy<<" bdz="<<bdz
+    std::cout<<"BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA: vec_size_ckv="<<vec_size_ckv<<" vec_size_kpe="<<vec_size_kpe
+      <<" bdx="<<bdx<<" bdy="<<bdy<<" bdz="<<bdz
       <<"\nsmem_size="<<smem_size<<" num_blocks_per_sm="<<num_blocks_per_sm
       <<"\nbatch_size="<<batch_size<<" new_batch_size="<<new_batch_size<<" max_num_pages_per_batch="<<max_num_pages_per_batch<<"\n\n";
     

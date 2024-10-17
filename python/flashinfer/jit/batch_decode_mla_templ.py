@@ -47,9 +47,9 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlanMLA(
   DecodePlanInfo plan_info;
 
   auto work_estimation_func =
-      BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA<{{ head_dim }}, {{ pos_encoding_mode }},
+      BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA<{{ head_dim_ckv }}, {{ head_dim_kpe }}, {{ pos_encoding_mode }},
                                                           AttentionVariant>;
-  cudaError_t status = DecodePlan<{{ head_dim }}, {{ pos_encoding_mode }}, AttentionVariant>(
+  cudaError_t status = DecodePlan<{{ head_dim_ckv }}, {{ pos_encoding_mode }}, AttentionVariant>(
       static_cast<void*>(float_workspace_buffer.data_ptr()),
       float_workspace_size_in_bytes,
       static_cast<void*>(int_workspace_buffer.data_ptr()),
@@ -99,12 +99,12 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRunMLA(
   void* int_buffer = static_cast<void*>(int_workspace_buffer.data_ptr());
 
   paged_kv_mla_t<{{ dtype_kv }}, {{ dtype_idx }}> paged_kv(
-      page_size, {{ head_dim }}, 666, // fixme
+      page_size, {{ head_dim_ckv }}, {{ head_dim_kpe }},
       batch_size,
       static_cast<{{ dtype_kv }}*>(paged_ckv_cache.data_ptr()),
       paged_ckv_cache.strides().data(),
-      static_cast<{{ dtype_kv }}*>(paged_ckv_cache.data_ptr()), // fixme
-      paged_ckv_cache.strides().data(), // fixme
+      static_cast<{{ dtype_kv }}*>(paged_kpe_cache.data_ptr()),
+      paged_kpe_cache.strides().data(),
       static_cast<{{ dtype_idx }}*>(paged_kv_indices.data_ptr()),
       static_cast<{{ dtype_idx }}*>(paged_kv_indptr.data_ptr()),
       static_cast<{{ dtype_idx }}*>(paged_kv_last_page_len.data_ptr()));
@@ -131,7 +131,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRunMLA(
   params.padded_batch_size = plan_info.padded_batch_size;
   
   cudaError_t status = BatchDecodeWithPagedKVCacheDispatchedMLA<
-      {{ head_dim }}, {{ pos_encoding_mode }}, AttentionVariant>(
+      {{ head_dim_ckv }}, {{ head_dim_kpe }}, {{ pos_encoding_mode }}, AttentionVariant>(
       params, tmp_v, tmp_s, /*stream=*/torch_current_stream);
   TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
               cudaGetErrorString(status));

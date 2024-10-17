@@ -32,7 +32,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(typename AttentionVariant::Par
                                                   typename AttentionVariant::DTypeO* tmp_v,
                                                   float* tmp_s, cudaStream_t stream);
 
-template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant>
+template <uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant>
 cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA(typename AttentionVariant::ParamsT params,
                                                   typename AttentionVariant::DTypeO* tmp_v,
                                                   float* tmp_s, cudaStream_t stream);
@@ -62,7 +62,7 @@ class BatchDecodeHandler {
         page_size, cuda_graph_enabled_, stream_, work_estimation_func);
   }
 
-  template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV,
+  template <uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV,
             typename DTypeO, typename IdType>
   cudaError_t PlanDispatchedMLA(void* float_buffer, size_t float_workspace_size_in_bytes,
                              void* int_buffer, size_t int_workspace_size_in_bytes, IdType* indptr_h,
@@ -77,9 +77,9 @@ class BatchDecodeHandler {
                                            /*use_logits_soft_cap=*/false, /*use_alibi=*/false)>;
     
     auto work_estimation_func =
-        BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA<HEAD_DIM, POS_ENCODING_MODE,
+        BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA<HEAD_DIM_CKV, HEAD_DIM_KPE, POS_ENCODING_MODE,
                                                             AttentionVariant>;
-    return DecodePlan<HEAD_DIM, POS_ENCODING_MODE, AttentionVariant>(
+    return DecodePlan<HEAD_DIM_CKV, POS_ENCODING_MODE, AttentionVariant>(
         float_buffer, float_workspace_size_in_bytes, int_buffer, page_locked_buffer_,
         int_workspace_size_in_bytes, plan_info_, indptr_h, batch_size, num_qo_heads,
         page_size, cuda_graph_enabled_, stream_, work_estimation_func);
@@ -608,17 +608,19 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapperMLA(
   
   float sm_scale = maybe_sm_scale.value_or(1.f / std::sqrt(float(paged_kv.head_dim_ckv)));
 
-  DISPATCH_head_dim(
-      paged_kv.head_dim_ckv, HEAD_DIM,
-      {DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
+  DISPATCH_head_dim(paged_kv.head_dim_ckv, HEAD_DIM_CKV, {
+    // fixme: head_dim_ckv(kv_lora_rank) is 8 times the size of head_dim_kpe(qk_rope_head_dim) for all MLA model (DeepSeek-V2-Lite, DeepSeek-V, MiniCPM3) at the time Oct.2024
+    constexpr auto HEAD_DIM_KPE = HEAD_DIM_CKV/8;
+    // DISPATCH_head_dim(paged_kv.head_dim_kpe, HEAD_DIM_KPE, {
+      DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
         using ParamsT = BatchDecodeParamsMLA<DTypeQ, DTypeKV, DTypeO, IdType>;
         using AttentionVariant =
             ComposedAttention<ParamsT, get_variant_code(
-                                           /*use_custom_mask=*/false, /*use_sliding_window=*/true,
-                                           /*use_logits_soft_cap=*/false, /*use_alibi=*/false)>;
+                                            /*use_custom_mask=*/false, /*use_sliding_window=*/true,
+                                            /*use_logits_soft_cap=*/false, /*use_alibi=*/false)>;
         ParamsT params(q, q_offset, paged_kv, o, lse, /*alibi_slopes=*/nullptr, num_qo_heads,
-                       /*window_left=*/-1, /*logits_soft_cap=*/0.f, sm_scale, rope_scale,
-                       rope_theta);
+                        /*window_left=*/-1, /*logits_soft_cap=*/0.f, sm_scale, rope_scale,
+                        rope_theta);
         params.request_indices = handler->GetRequestIndices<IdType>();
         params.kv_tile_indices = handler->GetKVTileIndices<IdType>();
         params.o_indptr = handler->GetOIndptr<IdType>();
@@ -626,9 +628,11 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapperMLA(
         params.block_valid_mask = handler->GetBlockValidMask();
         params.padded_batch_size = handler->GetPlanInfo().padded_batch_size;
 
-        return BatchDecodeWithPagedKVCacheDispatchedMLA<HEAD_DIM, POS_ENCODING_MODE, AttentionVariant>(
+        return BatchDecodeWithPagedKVCacheDispatchedMLA<HEAD_DIM_CKV, HEAD_DIM_KPE, POS_ENCODING_MODE, AttentionVariant>(
             params, handler->GetTmpV<DTypeO>(), handler->GetTmpS(), stream);
-      })});
+      });
+    // });
+  });
   return cudaSuccess;
 }
 
@@ -637,14 +641,18 @@ cudaError_t BatchDecodeHandlerPlanMLA(BatchDecodeHandler* handler, void* float_b
                                    size_t float_workspace_size_in_bytes, void* int_buffer,
                                    size_t int_workspace_size_in_bytes, IdType* indptr_h,
                                    IdType* last_page_len_h, uint32_t batch_size,
-                                   uint32_t num_qo_heads, uint32_t head_dim,
+                                   uint32_t num_qo_heads, uint32_t head_dim_ckv, uint32_t head_dim_kpe,
                                    uint32_t page_size, PosEncodingMode pos_encoding_mode) {
-  DISPATCH_head_dim(head_dim, HEAD_DIM, {
-    DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
-      return handler->PlanDispatchedMLA<HEAD_DIM, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO, IdType>(
-          float_buffer, float_workspace_size_in_bytes, int_buffer, int_workspace_size_in_bytes,
-          indptr_h, last_page_len_h, batch_size, num_qo_heads, page_size);
-    });
+  DISPATCH_head_dim(head_dim_ckv, HEAD_DIM_CKV, {
+    // fixme: head_dim_ckv(kv_lora_rank) is 8 times the size of head_dim_kpe(qk_rope_head_dim) for all MLA model (DeepSeek-V2-Lite, DeepSeek-V, MiniCPM3) at the time Oct.2024
+    constexpr auto HEAD_DIM_KPE = HEAD_DIM_CKV/8;
+    // DISPATCH_head_dim(head_dim_kpe, HEAD_DIM_KPE, {
+      DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
+        return handler->PlanDispatchedMLA<HEAD_DIM_CKV, HEAD_DIM_KPE, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO, IdType>(
+            float_buffer, float_workspace_size_in_bytes, int_buffer, int_workspace_size_in_bytes,
+            indptr_h, last_page_len_h, batch_size, num_qo_heads, page_size);
+      });
+    // });
   });
 }
 
