@@ -17,7 +17,6 @@
 #define FLASHINFER_CASCADE_CUH_
 
 #include <cooperative_groups.h>
-#include <driver_types.h>
 
 #include "../cp_async.cuh"
 #include "../math.cuh"
