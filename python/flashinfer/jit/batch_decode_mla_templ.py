@@ -26,7 +26,7 @@ batch_decode_mla_templ = r"""
 using namespace flashinfer;
 
 {% set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
-using ParamsT = BatchDecodeParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ dtype_idx }}>;
+using ParamsT = BatchDecodeParamsMLA<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ dtype_idx }}>;
 using AttentionVariant = ComposedAttention<ParamsT, get_variant_code(/*use_custom_mask=*/false, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, {{ use_alibi }})>;
 
 std::vector<int64_t> BatchDecodeWithPagedKVCachePlanMLA(
@@ -71,27 +71,20 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRunMLA(
     torch::Tensor int_workspace_buffer,
     std::vector<int64_t> plan_info_vec,
     torch::Tensor q,
-    torch::Tensor paged_k_cache,
-    torch::Tensor paged_v_cache,
+    torch::Tensor paged_ckv_cache,
+    torch::Tensor paged_kpe_cache,
     torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
     torch::Tensor paged_kv_last_page_len,
     std::optional<torch::Tensor> alibi_slopes,
-    unsigned int kv_layout_code, int window_left,
+    int window_left,
     float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta, bool return_lse) {
   DecodePlanInfo plan_info;
   plan_info.FromVector(plan_info_vec);
-  QKVLayout kv_layout = static_cast<QKVLayout>(kv_layout_code);
+
   auto device = q.device();
   int64_t batch_size = q.size(0);
   int64_t num_qo_heads = q.size(1);
-  int64_t num_kv_heads, page_size;
-  if (kv_layout == QKVLayout::kHND) {
-    num_kv_heads = paged_k_cache.size(1);
-    page_size = paged_k_cache.size(2);
-  } else {
-    page_size = paged_k_cache.size(1);
-    num_kv_heads = paged_k_cache.size(2);
-  }
+  int64_t page_size = paged_ckv_cache.size(1);;
 
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   torch::Tensor o = torch::empty_like(q);
@@ -105,18 +98,13 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRunMLA(
   void* float_buffer = static_cast<void*>(float_workspace_buffer.data_ptr());
   void* int_buffer = static_cast<void*>(int_workspace_buffer.data_ptr());
 
-  const int64_t* kv_cache_strides = nullptr;
-  auto k_strides = paged_k_cache.strides();
-  auto v_strides = paged_v_cache.strides();
-  TORCH_CHECK(k_strides == v_strides, "k/v strides must be identical");
-  kv_cache_strides = k_strides.data();
-
-  paged_kv_t<{{ dtype_kv }}, {{ dtype_idx }}> paged_kv(
-      num_kv_heads, page_size, {{ head_dim }},
-      batch_size, kv_layout,
-      static_cast<{{ dtype_kv }}*>(paged_k_cache.data_ptr()),
-      static_cast<{{ dtype_kv }}*>(paged_v_cache.data_ptr()),
-      kv_cache_strides,
+  paged_kv_mla_t<{{ dtype_kv }}, {{ dtype_idx }}> paged_kv(
+      page_size, {{ head_dim }}, 666, // fixme
+      batch_size,
+      static_cast<{{ dtype_kv }}*>(paged_ckv_cache.data_ptr()),
+      paged_ckv_cache.strides().data(),
+      static_cast<{{ dtype_kv }}*>(paged_ckv_cache.data_ptr()), // fixme
+      paged_ckv_cache.strides().data(), // fixme
       static_cast<{{ dtype_idx }}*>(paged_kv_indices.data_ptr()),
       static_cast<{{ dtype_idx }}*>(paged_kv_indptr.data_ptr()),
       static_cast<{{ dtype_idx }}*>(paged_kv_last_page_len.data_ptr()));
