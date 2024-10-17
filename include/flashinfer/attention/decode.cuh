@@ -791,6 +791,7 @@ __device__ __forceinline__ void compute_qk_and_update_local_stat_mla(
                                            state_t<vec_size>& st
                                            ) {
   uint32_t tx = threadIdx.x, tz = threadIdx.z;
+  constexpr uint32_t head_dim = bdx * vec_size;
   float s[tile_size];
   float m_prev = st.m;
 #pragma unroll
@@ -798,10 +799,10 @@ __device__ __forceinline__ void compute_qk_and_update_local_stat_mla(
     vec_t<float, vec_size> k_vec;
     if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
 
-      k_vec = vec_apply_llama_rope<vec_size, bdx>(smem + j * bdx * vec_size, freq,
+      k_vec = vec_apply_llama_rope<vec_size, bdx>(smem + j * head_dim, freq,
                                                   kv_idx_base + tz * tile_size + j);
     } else {
-
+      // k_vec.cast_load(smem + j * head_dim + tx * vec_size);
       k_vec.cast_load(smem + (j * bdx + tx) * vec_size);
     }
     s[j] = 0.f;
@@ -838,6 +839,7 @@ __device__ __forceinline__ void compute_qk_and_update_local_stat_mla(
 #pragma unroll
   for (uint32_t j = 0; j < tile_size; ++j) {
     vec_t<float, vec_size> v_vec;
+    // v_vec.cast_load(smem + j * head_dim + tx * vec_size);
     v_vec.cast_load(smem + (j * bdx + tx) * vec_size);
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
@@ -926,7 +928,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(typename AttentionVariant::
     uint32_t q, r;
     paged_kv.page_size.divmod(packed_page_iter_base + t_offset, q, r);
     kv_offset_smem[t_offset] =
-        paged_kv.protective_get_kv_offset(q, /*kv_head_idx*/0, r, /*feat_idx*/0, last_indptr);
+        paged_kv.protective_get_offset_ckv(q, r, /*feat_idx*/0, last_indptr);
   }
   block.sync();
 
@@ -944,7 +946,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(typename AttentionVariant::
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
           k_smem + ( stage_idx * kv_iter_len + Dim2(bdz, bdy).offset(tz, ty) ) * head_dim +
               tx * vec_size,
-          paged_kv.k_data + kv_offset[0],
+          paged_kv.ckv_data + kv_offset[0],
           ( iter * kv_iter_len + Dim2(bdz, bdy).offset(tz, ty) ) < cur_batch_chunk_len );
     }
     cp_async::commit_group();
@@ -966,7 +968,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(typename AttentionVariant::
         kv_idx_base,
         /*iter_base*/iter * kv_iter_len, /*iter_bound*/cur_batch_chunk_len,
         qo_head_idx, 
-        st);
+        st); // kv_idx_base + tz * tile_size + j
     
     if ((iter + num_stages_smem) % bdx == 0) {
       {
@@ -975,7 +977,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(typename AttentionVariant::
         paged_kv.page_size.divmod(packed_page_iter_base + (iter + num_stages_smem) * kv_iter_len + t_offset,
                                   q, r);
         kv_offset_smem[t_offset] =
-            paged_kv.protective_get_kv_offset(q, /*kv_head_idx*/0, r, /*feat_idx*/0, last_indptr);
+            paged_kv.protective_get_offset_ckv(q, r, /*feat_idx*/0, last_indptr);
       }
     }
     block.sync();
@@ -990,7 +992,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(typename AttentionVariant::
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
           k_smem + ( stage_idx * kv_iter_len + Dim2(bdz, bdy).offset(tz, ty) ) * head_dim +
               tx * vec_size,
-          paged_kv.k_data + kv_offset[0],
+          paged_kv.ckv_data + kv_offset[0],
           ( (iter + num_stages_smem) * kv_iter_len + Dim2(bdz, bdy).offset(tz, ty) ) < cur_batch_chunk_len );
     }
     cp_async::commit_group();
@@ -1000,10 +1002,11 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(typename AttentionVariant::
   cp_async::wait_group<0>();
   block.sync();
 
-  sync_state<vec_size, bdx, bdy, bdz>(st, reinterpret_cast<float*>(smem), smem_md);
-  st.normalize();
+  if (bdz != 0)
+    sync_state<vec_size, bdx, bdy, bdz>(variant, st, reinterpret_cast<float*>(smem), smem_md);
 
   if (tz == 0) {
+    st.normalize();
     st.o.cast_store(o + (batch_idx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
 
     if (lse != nullptr) {

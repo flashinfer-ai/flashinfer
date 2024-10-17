@@ -1304,7 +1304,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
     def run(
         self,
         q: torch.Tensor,
-        paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        paged_ckv_cache: torch.Tensor,
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
@@ -1316,20 +1316,9 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         ----------
         q : torch.Tensor
             The query tensor, shape: ``[batch_size, num_qo_heads, head_dim]``
-        paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-            The paged KV-Cache stored as a tuple of tensors or a single tensor:
-
-            * a tuple ``(k_cache, v_cache)`` of 4-D tensors, each with shape:
-              ``[max_num_pages, page_size, num_kv_heads, head_dim]`` if :attr:`kv_layout` is ``NHD``,
-              and ``[max_num_pages, num_kv_heads, page_size, head_dim]`` if :attr:`kv_layout` is ``HND``.
-
-            * a single 5-D tensor with shape:
-              ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
-              :attr:`kv_layout` is ``NHD``, and
-              ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
-              :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
-              ``paged_kv_cache[:, 1]`` is the value-cache.
-
+        paged_ckv_cache : torch.Tensor
+            The paged compressed-KV-Cache stored as a single tensor:
+            * 3-D tensors, each with shape: ``[max_num_pages, page_size, head_dim_ckv]``.
         q_scale : Optional[float]
             The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
         k_scale : Optional[float]
@@ -1374,12 +1363,11 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             self._int_workspace_buffer,
             self._plan_info,
             q,
-            *_unpack_paged_kv_cache(paged_kv_cache, self._kv_layout),
+            paged_ckv_cache, paged_ckv_cache,
             self._paged_kv_indptr_buf,
             self._paged_kv_indices_buf,
             self._paged_kv_last_page_len_buf,
             _get_cache_alibi_slopes_buf(q.shape[1], q.device),
-            TensorLayout[self._kv_layout].value,
             window_left,
             logits_soft_cap,
             sm_scale,

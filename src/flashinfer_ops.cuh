@@ -70,7 +70,7 @@ class BatchDecodeHandler {
                              uint32_t page_size) {
     int_buffer_ = int_buffer;
     float_buffer_ = float_buffer;
-    using ParamsT = BatchDecodeParams<DTypeQ, DTypeKV, DTypeO, IdType>;
+    using ParamsT = BatchDecodeParamsMLA<DTypeQ, DTypeKV, DTypeO, IdType>;
     using AttentionVariant =
         ComposedAttention<ParamsT,
                           get_variant_code(/*use_custom_mask=*/false, /*use_sliding_window=*/true,
@@ -600,18 +600,18 @@ cudaError_t BatchDecodeHandlerPlan(BatchDecodeHandler* handler, void* float_buff
 
 template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheWrapperMLA(
-    BatchDecodeHandler* handler, DTypeQ* q, IdType* q_offset, paged_kv_t<DTypeKV, IdType> paged_kv,
+    BatchDecodeHandler* handler, DTypeQ* q, IdType* q_offset, paged_kv_mla_t<DTypeKV, IdType> paged_kv,
     DTypeO* o, float* lse, uint32_t num_qo_heads,
     PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
     std::optional<float> maybe_sm_scale = std::nullopt, float rope_scale = 1.f,
     float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   
-  float sm_scale = maybe_sm_scale.value_or(1.f / std::sqrt(float(paged_kv.head_dim)));
+  float sm_scale = maybe_sm_scale.value_or(1.f / std::sqrt(float(paged_kv.head_dim_ckv)));
 
   DISPATCH_head_dim(
-      paged_kv.head_dim, HEAD_DIM,
+      paged_kv.head_dim_ckv, HEAD_DIM,
       {DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
-        using ParamsT = BatchDecodeParams<DTypeQ, DTypeKV, DTypeO, IdType>;
+        using ParamsT = BatchDecodeParamsMLA<DTypeQ, DTypeKV, DTypeO, IdType>;
         using AttentionVariant =
             ComposedAttention<ParamsT, get_variant_code(
                                            /*use_custom_mask=*/false, /*use_sliding_window=*/true,
