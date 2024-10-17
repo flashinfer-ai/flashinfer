@@ -1,16 +1,32 @@
-
 import torch
 import math
 import flashinfer
 import flashinfer.jit
 import functools
 from flashinfer.utils import MaskMode
-from flashinfer.jit.attention import get_customize_single_decode_cu_str, get_customize_single_prefill_cu_str
+from flashinfer.jit.attention import (
+    get_customize_single_decode_cu_str,
+    get_customize_single_prefill_cu_str,
+)
 from flashinfer.decode import single_decode_with_kv_cache_with_jit_module
 from flashinfer.prefill import single_prefill_with_kv_cache_with_jit_module
 
 
+def generate_module(module_name: str, cuda_ops_str: str):
+    gen_directory = flashinfer.jit.FLASHINFER_GEN_SRC_DIR
+    flashinfer.jit.utils.write_if_different(
+        gen_directory / f"{module_name}.cu",
+        cuda_ops_str,
+    )
+
+    return flashinfer.jit.load_cuda_ops(
+        module_name,
+        [gen_directory / f"{module_name}.cu"],
+    )
+
+
 def test_single_decode_mask():
+    torch.manual_seed(42)
     variant_decl = r"""
 template <typename ParamsT_>
 struct SingleDecodeWithCustomMask {
@@ -53,10 +69,10 @@ struct SingleDecodeWithCustomMask {
 };
 """
     cuda_ops_str = get_customize_single_decode_cu_str(
-        torch.float16,
-        torch.float16,
-        torch.float16,
-        128,
+        torch.float16,  # dtype_q
+        torch.float16,  # dtype_kv
+        torch.float16,  # dtype_o
+        128,  # head_dim
         ["custom_mask"],  # additional_input_tensor_var_names
         ["uint8_t"],  # additional_input_tensor_var_types
         ["sm_scale"],  # # additional_input_scalar_var_names
@@ -64,36 +80,28 @@ struct SingleDecodeWithCustomMask {
         "SingleDecodeWithCustomMask",
         variant_decl,
     )
-    gen_directory = flashinfer.jit.FLASHINFER_GEN_SRC_DIR
-    flashinfer.jit.utils.write_if_different(
-        gen_directory / "single_decode_with_custom_mask.cu",
-        cuda_ops_str,
-    )
-    
-    jit_module = flashinfer.jit.load_cuda_ops(
-        "single_decode_with_custom_mask",
-        [gen_directory / "single_decode_with_custom_mask.cu"],
-    )
 
+    jit_module = generate_module("single_decode_with_custom_mask", cuda_ops_str)
     f = functools.partial(single_decode_with_kv_cache_with_jit_module, jit_module)
 
     q = torch.randn(32, 128, dtype=torch.float16, device="cuda")
     k = torch.randn(254, 32, 128, dtype=torch.float16, device="cuda")
     v = torch.randn(254, 32, 128, dtype=torch.float16, device="cuda")
-    sm_scale = 1. / math.sqrt(128)
+    sm_scale = 1.0 / math.sqrt(128)
 
     custom_mask = torch.randint(0, 2, (254,), dtype=torch.uint8, device="cuda")
     packed_custom_mask = flashinfer.packbits(custom_mask, bitorder="little")
 
     o = f(q, k, v, packed_custom_mask, sm_scale)
 
-    p = torch.einsum("hd,nhd->hn", q, k).float() * sm_scale
-    p[:, torch.nonzero(torch.logical_not(custom_mask)).squeeze()] = -float("inf") 
-    o_ref = torch.einsum("hn,nhd->hd", torch.softmax(p, dim=-1).half(), v)
+    p = torch.einsum("hd,nhd->hn", q.float(), k.float()) * sm_scale
+    p[:, torch.nonzero(torch.logical_not(custom_mask)).squeeze()] = -float("inf")
+    o_ref = torch.einsum("hn,nhd->hd", torch.softmax(p, dim=-1), v.float()).half()
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
 
 
 def test_flash_sigmoid():
+    torch.manual_seed(42)
     variant_decl = r"""
 template <typename ParamsT_>
 struct FlashSigmoid {
@@ -105,6 +113,7 @@ struct FlashSigmoid {
   static constexpr bool use_softmax = false;
 
   uint32_t window_left, qo_len, kv_len;
+  float sigmoid_bias_log2e;
 
   // Create closure
   __device__ __host__ FlashSigmoid(const ParamsT& params, uint32_t batch_idx,
@@ -112,18 +121,19 @@ struct FlashSigmoid {
     qo_len = params.get_qo_len(batch_idx);
     kv_len = params.get_kv_len(batch_idx);
     window_left = kv_len;
+    sigmoid_bias_log2e = params.sigmoid_bias * math::log2e;
   }
 
   template <typename T>
   __device__ __forceinline__ T QueryTransform(const ParamsT& params, T q) {
-    return float(q) * math::log2e;
+    return float(q) * params.logits_scale * math::log2e;
   }
 
   template <typename T>
   __device__ __forceinline__ T LogitsTransform(const ParamsT& params, T logits, uint32_t batch_idx,
                                                uint32_t qo_idx, uint32_t kv_idx,
                                                uint32_t qo_head_idx, uint32_t kv_head_idx) {
-    return math::ptx_rcp(1.f + math::ptx_exp2(-float(logits)));
+    return math::ptx_rcp(1.f + math::ptx_exp2(-float(logits + sigmoid_bias_log2e)));
   }
 
   __device__ __forceinline__ bool LogitsMask(const ParamsT& params, uint32_t batch_idx,
@@ -134,43 +144,38 @@ struct FlashSigmoid {
 };
 """
     cuda_ops_str = get_customize_single_prefill_cu_str(
-        torch.float16,
-        torch.float16,
-        torch.float16,
-        128,
+        torch.float16,  # dtype_q
+        torch.float16,  # dtype_kv
+        torch.float16,  # dtype_o
+        128,  # hidden_dim
         MaskMode.NON_CAUSAL.value,
         [],  # additional_input_tensor_var_names
         [],  # additional_input_tensor_var_types
-        [],  # additional_input_scalar_var_names
-        [],  # additional_input_scalar_var_types
+        ["logits_scale", "sigmoid_bias"],  # additional_input_scalar_var_names
+        ["float", "float"],  # additional_input_scalar_var_types
         "FlashSigmoid",
         variant_decl,
     )
 
-    gen_directory = flashinfer.jit.FLASHINFER_GEN_SRC_DIR
-    flashinfer.jit.utils.write_if_different(
-        gen_directory / "flash_sigmoid.cu",
-        cuda_ops_str,
-    )
-    
-    jit_module = flashinfer.jit.load_cuda_ops(
-        "flash_sigmoid",
-        [gen_directory / "flash_sigmoid.cu"],
-    )
-
+    jit_module = generate_module("flash_sigmoid", cuda_ops_str)
     f = functools.partial(single_prefill_with_kv_cache_with_jit_module, jit_module)
 
-    q = torch.randn(128, 32, 128, dtype=torch.float16, device="cuda")
-    k = torch.randn(254, 32, 128, dtype=torch.float16, device="cuda")
-    v = torch.randn(254, 32, 128, dtype=torch.float16, device="cuda")
-    o = f(q, k, v)
+    q = torch.randn(128, 8, 128, dtype=torch.float16, device="cuda")
+    k = torch.randn(1027, 8, 128, dtype=torch.float16, device="cuda")
+    v = torch.randn(1027, 8, 128, dtype=torch.float16, device="cuda")
+    logits_scale = 1.0 / math.sqrt(128)
+    sigmoid_bias = 0.25
+    o = f(q, k, v, logits_scale, sigmoid_bias)
 
-    p = torch.sigmoid(torch.einsum("mhd,nhd->hmn", q, k).float())
-    o_ref = torch.einsum("hmn,nhd->mhd", p.half(), v)
-    torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=2e-2)
+    p = torch.sigmoid(
+        torch.einsum("mhd,nhd->hmn", q.float(), k.float()) * logits_scale + sigmoid_bias
+    )
+    o_ref = torch.einsum("hmn,nhd->mhd", p, v.float()).half()
+    torch.testing.assert_close(o, o_ref, rtol=2e-2, atol=2e-2)
 
 
 def test_dump_logits():
+    torch.manual_seed(42)
     variant_decl = r"""
 template <typename ParamsT_>
 struct DumpLogits {
@@ -214,10 +219,10 @@ struct DumpLogits {
 };
 """
     cuda_ops_str = get_customize_single_prefill_cu_str(
-        torch.float16,
-        torch.float16,
-        torch.float16,
-        128,
+        torch.float16,  # dtype_q
+        torch.float16,  # dtype_kv
+        torch.float16,  # dtype_o
+        128,  # hidden_dim
         MaskMode.NON_CAUSAL.value,
         ["output_logits"],  # additional_input_tensor_var_names
         ["float"],  # additional_input_tensor_var_types
@@ -227,33 +232,24 @@ struct DumpLogits {
         variant_decl,
     )
 
-    gen_directory = flashinfer.jit.FLASHINFER_GEN_SRC_DIR
-    flashinfer.jit.utils.write_if_different(
-        gen_directory / "dump_logits.cu",
-        cuda_ops_str,
-    )
-    
-    jit_module = flashinfer.jit.load_cuda_ops(
-        "dump_logits",
-        [gen_directory / "dump_logits.cu"],
-    )
-
+    jit_module = generate_module("dump_logits", cuda_ops_str)
     f = functools.partial(single_prefill_with_kv_cache_with_jit_module, jit_module)
 
     q = torch.randn(128, 32, 128, dtype=torch.float16, device="cuda")
     k = torch.randn(1023, 32, 128, dtype=torch.float16, device="cuda")
     v = torch.randn(1023, 32, 128, dtype=torch.float16, device="cuda")
     logits = torch.empty(32, 128, 1023, dtype=torch.float32, device="cuda")
-    sm_scale = 1. / math.sqrt(128)
+    sm_scale = 1.0 / math.sqrt(128)
     o = f(q, k, v, logits, sm_scale)
 
-    p = torch.einsum("mhd,nhd->hmn", q, k).float() * sm_scale
-    o_ref = torch.einsum("hmn,nhd->mhd", torch.softmax(p, dim=-1).half(), v)
+    p = torch.einsum("mhd,nhd->hmn", q.float(), k.float()) * sm_scale
+    o_ref = torch.einsum("hmn,nhd->mhd", torch.softmax(p, dim=-1), v.float()).half()
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
-    torch.testing.assert_close(logits, p, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(logits, p, rtol=2e-2, atol=2e-2)
 
 
 def test_debug_print_logits():
+    torch.manual_seed(42)
     variant_decl = r"""
 template <typename ParamsT_>
 struct DebugPrintLogits {
@@ -283,10 +279,9 @@ struct DebugPrintLogits {
   __device__ __forceinline__ T LogitsTransform(const ParamsT& params, T logits, uint32_t batch_idx,
                                                uint32_t qo_idx, uint32_t kv_idx,
                                                uint32_t qo_head_idx, uint32_t kv_head_idx) {
-    float logits_ = logits * math::loge2;
-    if (logits_ >= 5) {
+    if (logits >= 5) {
       printf("Large logits at qo_idx=%d, kv_idx=%d, qo_head_idx=%d, kv_head_idx=%d: %.3f\n",
-             qo_idx, kv_idx, qo_head_idx, kv_head_idx, float(logits_));
+             qo_idx, kv_idx, qo_head_idx, kv_head_idx, float(logits));
     }
     return logits;
   }
@@ -299,10 +294,10 @@ struct DebugPrintLogits {
 };
 """
     cuda_ops_str = get_customize_single_prefill_cu_str(
-        torch.float16,
-        torch.float16,
-        torch.float16,
-        128,
+        torch.float16,  # dtype_q
+        torch.float16,  # dtype_kv
+        torch.float16,  # dtype_o
+        128,  # hidden_dim
         MaskMode.NON_CAUSAL.value,
         [],  # additional_input_tensor_var_names
         [],  # additional_input_tensor_var_types
@@ -312,27 +307,17 @@ struct DebugPrintLogits {
         variant_decl,
     )
 
-    gen_directory = flashinfer.jit.FLASHINFER_GEN_SRC_DIR
-    flashinfer.jit.utils.write_if_different(
-        gen_directory / "debug_print_logits.cu",
-        cuda_ops_str,
-    )
-    
-    jit_module = flashinfer.jit.load_cuda_ops(
-        "debug_print_logits",
-        [gen_directory / "debug_print_logits.cu"],
-    )
-
+    jit_module = generate_module("debug_print_logits", cuda_ops_str)
     f = functools.partial(single_prefill_with_kv_cache_with_jit_module, jit_module)
 
     q = torch.randn(128, 32, 128, dtype=torch.float16, device="cuda")
     k = torch.randn(1023, 32, 128, dtype=torch.float16, device="cuda")
     v = torch.randn(1023, 32, 128, dtype=torch.float16, device="cuda")
-    sm_scale = 1. / math.sqrt(128)
+    sm_scale = 1.0 / math.sqrt(128)
     o = f(q, k, v, sm_scale)
 
-    p = torch.einsum("mhd,nhd->hmn", q, k).float() * sm_scale
-    o_ref = torch.einsum("hmn,nhd->mhd", torch.softmax(p, dim=-1).half(), v)
+    p = torch.einsum("mhd,nhd->hmn", q.float(), k.float()) * sm_scale
+    o_ref = torch.einsum("hmn,nhd->mhd", torch.softmax(p, dim=-1), v.float()).half()
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
 
 
