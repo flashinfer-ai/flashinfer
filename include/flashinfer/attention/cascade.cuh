@@ -137,19 +137,62 @@ __device__ __forceinline__ void threadblock_sync_state(state_t<vec_size>& st, DT
   }
 }
 
-/*!
- * \brief The CUDA kernel that merges self-attention states of a list of index sets.
- * \param vec_size The vector size used in the kernel.
- * \tparam DTypeIn The data type of v.
- * \tparam DTypeO The data type of v_merged.
- * \param v The partial v of index sets. (n, num_index_sets, h, d)
- * \param s The logsumexp value of index sets. (n, num_index_sets, h)
- * \param v_merged The merged v of index sets union. (n, h, d)
- * \param s_merged The merged logsumexp value of index sets union. (n, h)
- * \param num_heads The number of heads of v.
- * \param head_dim The dimension of each head.
- * \note s are logsumexp values with base 2.
- */
+template <uint32_t bdx, uint32_t bdy, uint32_t vec_size, typename DTypeIn>
+__device__ __forceinline__ void threadblock_sum(vec_t<float, vec_size>& v, DTypeIn* v_smem) {
+  const uint32_t tx = threadIdx.x, ty = threadIdx.y;
+  constexpr uint32_t head_dim = vec_size * bdx;
+  v.cast_store(v_smem + ty * head_dim + tx * vec_size);
+  v.fill(DTypeIn(0.f));
+  __syncthreads();
+
+#pragma unroll
+  for (uint32_t iter = 0; iter < bdy; ++iter) {
+    vec_t<float, vec_size> v_iter;
+    v_iter.cast_load(v_smem + iter * head_dim + tx * vec_size);
+#pragma unroll
+    for (uint32_t i = 0; i < vec_size; ++i) {
+      v[i] += v_iter[i];
+    }
+  }
+}
+
+template <uint32_t vec_size, typename DTypeIn, typename DTypeO>
+__global__ void AttentionSumKernel(DTypeIn* __restrict__ V, DTypeO* __restrict__ v_sum,
+                                   uint32_t num_index_sets, uint32_t num_heads, uint32_t head_dim) {
+  uint32_t tx = threadIdx.x, ty = threadIdx.y;
+  uint32_t pos = blockIdx.x;
+  uint32_t head_idx = ty;
+
+  if (num_index_sets == 0) {
+    vec_t<DTypeO, vec_size> v;
+    v.fill(DTypeO(0.f));
+    v.store(v_sum + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+    return;
+  }
+
+  if (num_index_sets == 1) {
+    vec_t<DTypeO, vec_size> v;
+    v.cast_load(V + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+    v.store(v_sum + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+    return;
+  }
+
+  vec_t<float, vec_size> v_sum_vec;
+  v_sum_vec.fill(0.f);
+#pragma unroll 2
+  for (uint32_t iter = 0; iter < num_index_sets; ++iter) {
+    vec_t<float, vec_size> v;
+    v.cast_load(V + ((pos * num_index_sets + iter) * num_heads + head_idx) * head_dim +
+                tx * vec_size);
+#pragma unroll
+    for (uint32_t i = 0; i < vec_size; ++i) {
+      v_sum_vec[i] += v[i];
+    }
+  }
+
+  v_sum_vec.cast_store(v_sum + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+}
+
 template <uint32_t vec_size, typename DTypeIn, typename DTypeO>
 __global__ void MergeStatesKernel(DTypeIn* __restrict__ V, float* __restrict__ S,
                                   DTypeO* __restrict__ v_merged, float* __restrict__ s_merged,
@@ -178,9 +221,7 @@ __global__ void MergeStatesKernel(DTypeIn* __restrict__ V, float* __restrict__ S
     return;
   }
 
-  vec_t<float, vec_size> v_merged_vec;
   state_t<vec_size> st;
-  v_merged_vec.fill(0.f);
 #pragma unroll 2
   for (uint32_t iter = 0; iter < num_index_sets; ++iter) {
     float s = S[(pos * num_index_sets + iter) * num_heads + head_idx];
@@ -392,6 +433,81 @@ __global__ void PersistentVariableLengthMergeStatesKernel(DTypeIn* __restrict__ 
   }
 }
 
+template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t num_smem_stages, typename DTypeIn,
+          typename DTypeO, typename IdType>
+__global__ void PersistentVariableLengthAttentionSumKernel(DTypeIn* __restrict__ V, IdType* indptr,
+                                                           DTypeO* __restrict__ v_sum,
+                                                           uint32_t seq_len, uint32_t num_heads) {
+  uint32_t tx = threadIdx.x, ty = threadIdx.y;
+  uint32_t cta_id = blockIdx.x;
+  uint32_t num_ctas = gridDim.x;
+  uint32_t num_iters = ceil_div(seq_len * num_heads, num_ctas);
+  constexpr uint32_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
+  constexpr uint32_t head_dim = vec_size * bdx;
+  extern __shared__ uint8_t smem[];
+  DTypeIn* v_smem = (DTypeIn*)smem;
+
+  vec_t<float, vec_size> v_sum_vec;
+
+#pragma unroll 1
+  for (uint32_t i = cta_id; i < seq_len * num_heads; i += num_ctas) {
+    uint32_t pos = i / num_heads;
+    uint32_t head_idx = i % num_heads;
+    const uint32_t num_index_sets = indptr[pos + 1] - indptr[pos];
+
+    if (num_index_sets == 0) {
+      vec_t<DTypeO, vec_size> v;
+      v.fill(DTypeO(0.f));
+      v.store(v_sum + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+      continue;
+    }
+
+    if (num_index_sets == 1) {
+      vec_t<DTypeO, vec_size> v;
+      v.cast_load(V + (indptr[pos] * num_heads + head_idx) * head_dim + tx * vec_size);
+      v.store(v_sum + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+      continue;
+    }
+
+#pragma unroll
+    for (uint32_t iter = 0; iter < num_smem_stages; ++iter) {
+      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+          v_smem + (iter * bdy + ty) * head_dim + tx * vec_size,
+          V + ((indptr[pos] + (iter * bdy + ty)) * num_heads + head_idx) * head_dim + tx * vec_size,
+          (iter * bdy + ty) < num_index_sets);
+      cp_async::commit_group();
+    }
+#pragma unroll 4
+    for (uint32_t iter = 0; iter < ceil_div(num_index_sets, bdy); ++iter) {
+      cp_async::wait_group<num_smem_stages - 1>();
+      __syncthreads();
+      vec_t<float, vec_size> v;
+      v.cast_load(v_smem + ((iter % num_smem_stages) * bdy + ty) * head_dim + tx * vec_size);
+      if (iter * bdy + ty < num_index_sets) {
+#pragma unroll
+        for (uint32_t i = 0; i < vec_size; ++i) {
+          v_sum_vec[i] += v[i];
+        }
+      }
+      __syncthreads();
+      cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
+          v_smem + ((iter % num_smem_stages) * bdy + ty) * head_dim + tx * vec_size,
+          V +
+              ((indptr[pos] + ((iter + num_smem_stages) * bdy + ty)) * num_heads + head_idx) *
+                  head_dim +
+              tx * vec_size,
+          (iter + num_smem_stages) * bdy + ty < num_index_sets);
+      cp_async::commit_group();
+    }
+    cp_async::wait_group<0>();
+    __syncthreads();
+
+    threadblock_sum<bdx, bdy, vec_size>(v_sum_vec, v_smem);
+
+    v_sum_vec.cast_store(v_sum + (pos * num_heads + head_idx) * head_dim + tx * vec_size);
+  }
+}
+
 /*!
  * \brief Merge the self-attention state of two index sets A and B.
  * \tparam DTypeIn The data type of v_a and v_b.
@@ -507,6 +623,22 @@ cudaError_t MergeStates(DTypeIn* v, float* s, DTypeO* v_merged, float* s_merged,
   return cudaSuccess;
 }
 
+template <typename DTypeIn, typename DTypeO>
+cudaError_t AttentionSum(DTypeIn* v, DTypeO* v_sum, uint32_t num_index_sets, uint32_t seq_len,
+                         uint32_t num_heads, uint32_t head_dim, cudaStream_t stream = nullptr) {
+  DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+    constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
+    constexpr uint32_t bdx = HEAD_DIM / vec_size;
+    uint32_t bdy = num_heads;
+    dim3 nblks(seq_len);
+    dim3 nthrs(bdx, bdy);
+    auto kernel = AttentionSumKernel<vec_size, DTypeIn, DTypeO>;
+    void* args[] = {&v, &v_sum, &num_index_sets, &num_heads, &head_dim};
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+  });
+  return cudaSuccess;
+}
+
 template <typename DTypeIn, typename DTypeO, typename IdType>
 cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* indptr, DTypeO* v_merged,
                                       float* s_merged, uint32_t seq_len, uint32_t num_heads,
@@ -534,6 +666,39 @@ cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* indptr, DTyp
     dim3 nblks(num_sms * num_blocks_per_sm);
     dim3 nthrs(bdx, bdy);
     void* args[] = {&v, &s, &indptr, &v_merged, &s_merged, &seq_len, &num_heads};
+    FLASHINFER_CUDA_CALL(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  });
+  return cudaSuccess;
+}
+
+template <typename DTypeIn, typename DTypeO, typename IdType>
+cudaError_t VariableLengthAttentionSum(DTypeIn* v, IdType* indptr, DTypeO* v_sum, uint32_t seq_len,
+                                       uint32_t num_heads, uint32_t head_dim,
+                                       cudaStream_t stream = nullptr) {
+  int dev_id = 0;
+  int num_sms = 0;
+  int num_blocks_per_sm = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
+
+  DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+    constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
+    constexpr uint32_t bdx = HEAD_DIM / vec_size;
+    constexpr uint32_t num_threads = 128;
+    constexpr uint32_t bdy = num_threads / bdx;
+    constexpr uint32_t num_smem_stages = 4;
+    uint32_t smem_size = num_smem_stages * bdy * head_dim * sizeof(DTypeIn);
+    auto kernel = PersistentVariableLengthAttentionSumKernel<vec_size, bdx, bdy, num_smem_stages,
+                                                             DTypeIn, DTypeO, IdType>;
+    FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
+                                                                       num_threads, smem_size));
+    num_blocks_per_sm = min(num_blocks_per_sm, ceil_div(seq_len * num_heads, num_sms));
+
+    dim3 nblks(num_sms * num_blocks_per_sm);
+    dim3 nthrs(bdx, bdy);
+    void* args[] = {&v, &indptr, &v_sum, &seq_len, &num_heads};
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
