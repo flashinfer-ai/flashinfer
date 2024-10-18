@@ -68,7 +68,8 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRunMLA(
     torch::Tensor float_workspace_buffer,
     torch::Tensor int_workspace_buffer,
     std::vector<int64_t> plan_info_vec,
-    torch::Tensor q,
+    torch::Tensor q_nope,
+    torch::Tensor q_pe,
     torch::Tensor paged_ckv_cache,
     torch::Tensor paged_kpe_cache,
     torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
@@ -79,16 +80,16 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRunMLA(
   DecodePlanInfo plan_info;
   plan_info.FromVector(plan_info_vec);
 
-  auto device = q.device();
-  int64_t batch_size = q.size(0);
-  int64_t num_qo_heads = q.size(1);
+  auto device = q_nope.device();
+  int64_t batch_size = q_nope.size(0);
+  int64_t num_qo_heads = q_nope.size(1);
   int64_t page_size = paged_ckv_cache.size(1);;
 
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  torch::Tensor o = torch::empty_like(q);
+  torch::Tensor o = torch::empty_like(q_nope);
   torch::Tensor lse;
   if (return_lse) {
-    lse = torch::empty({batch_size, num_qo_heads}, q.options().dtype((torch::kFloat32)));
+    lse = torch::empty({batch_size, num_qo_heads}, q_nope.options().dtype((torch::kFloat32)));
   }
 
   TORCH_CHECK(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
@@ -107,7 +108,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRunMLA(
       static_cast<{{ dtype_idx }}*>(paged_kv_indptr.data_ptr()),
       static_cast<{{ dtype_idx }}*>(paged_kv_last_page_len.data_ptr()));
   ParamsT params(
-    static_cast<{{ dtype_q }}*>(q.data_ptr()),
+    static_cast<{{ dtype_q }}*>(q_nope.data_ptr()), static_cast<{{ dtype_q }}*>(q_pe.data_ptr()),
     /*q_offset=*/nullptr, paged_kv, static_cast<{{ dtype_o }}*>(o.data_ptr()),
     /*lse=*/(return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr),
     num_qo_heads, window_left, logits_soft_cap, sm_scale, rope_scale, rope_theta);
