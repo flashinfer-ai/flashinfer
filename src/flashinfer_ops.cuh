@@ -600,7 +600,7 @@ cudaError_t BatchDecodeHandlerPlan(BatchDecodeHandler* handler, void* float_buff
 
 template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheWrapperMLA(
-    BatchDecodeHandler* handler, DTypeQ* q, IdType* q_offset, paged_kv_mla_t<DTypeKV, IdType> paged_kv,
+    BatchDecodeHandler* handler, DTypeQ* q_nope, DTypeQ* q_pe, IdType* q_offset, paged_kv_mla_t<DTypeKV, IdType> paged_kv,
     DTypeO* o, float* lse, uint32_t num_qo_heads, float sm_scale,
     float rope_scale = 1.f, float rope_theta = 1e4, 
     cudaStream_t stream = nullptr) {
@@ -613,7 +613,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapperMLA(
             ComposedAttention<ParamsT, get_variant_code(
                                             /*use_custom_mask=*/false, /*use_sliding_window=*/true,
                                             /*use_logits_soft_cap=*/false, /*use_alibi=*/false)>;
-        ParamsT params(q, q_offset, paged_kv, o, lse, num_qo_heads,
+        ParamsT params(q_nope, q_pe, q_offset, paged_kv, o, lse, num_qo_heads,
                         /*window_left=*/-1, /*logits_soft_cap=*/0.f, sm_scale, rope_scale,
                         rope_theta);
         params.request_indices = handler->GetRequestIndices<IdType>();

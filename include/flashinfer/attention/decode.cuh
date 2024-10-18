@@ -852,7 +852,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(typename AttentionVariant::
   using DTypeKV = typename AttentionVariant::DTypeKV;
   using DTypeO = typename AttentionVariant::DTypeO;
   using IdType = typename AttentionVariant::IdType;
-  const DTypeQ* q = params.q;
+  const DTypeQ* q = params.q_nope;
   DTypeO* o = params.o;
   float* lse = params.lse;
   const auto paged_kv = params.paged_kv;

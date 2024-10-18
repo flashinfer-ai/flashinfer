@@ -177,7 +177,8 @@ struct BatchDecodeParamsMLA {
   using DTypeO = DTypeO_;
   using IdType = IdType_;
 
-  DTypeQ* q;
+  DTypeQ* q_nope;
+  DTypeQ* q_pe;
   DTypeO* o;
   float* lse;
   float sm_scale;
@@ -198,12 +199,12 @@ struct BatchDecodeParamsMLA {
   bool* block_valid_mask;
   bool partition_kv;
 
-  __device__ __host__ BatchDecodeParamsMLA(DTypeQ* q, IdType* q_offset,
+  __device__ __host__ BatchDecodeParamsMLA(DTypeQ* q_nope, DTypeQ* q_pe, IdType* q_offset,
                                         paged_kv_mla_t<DTypeKV, IdType> paged_kv, DTypeO* o, float* lse,
                                         uint32_t num_qo_heads,
                                         int32_t window_left, float logits_soft_cap, float sm_scale,
                                         float rope_scale, float rope_theta)
-      : q(q), o(o), lse(lse), sm_scale(sm_scale),
+      : q_nope(q_nope), q_pe(q_pe), o(o), lse(lse), sm_scale(sm_scale),
         q_offset(q_offset),
         paged_kv(paged_kv),
         padded_batch_size(0),

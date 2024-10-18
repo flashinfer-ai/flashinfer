@@ -1281,7 +1281,8 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
 
     def run(
         self,
-        q: torch.Tensor,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
         paged_ckv_cache: torch.Tensor,
         paged_kpe_cache: torch.Tensor,
         q_scale: Optional[float] = None,
@@ -1293,8 +1294,10 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
 
         Parameters
         ----------
-        q : torch.Tensor
-            The query tensor, shape: ``[batch_size, num_qo_heads, head_dim]``
+        q_nope : torch.Tensor
+            The query tensor not related to ROPE, shape: ``[batch_size, num_qo_heads, head_dim_ckv]``
+        q_pe : torch.Tensor
+            The query tensor related to ROPE, shape: ``[batch_size, num_qo_heads, head_dim_kpe]``
         paged_ckv_cache : torch.Tensor
             The paged compressed-KV-Cache stored as a single tensor:
             * 3-D tensors, each with shape: ``[max_num_pages, page_size, head_dim_ckv]``.
@@ -1339,7 +1342,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             self._float_workspace_buffer,
             self._int_workspace_buffer,
             self._plan_info,
-            q,
+            q_nope, q_pe,
             paged_ckv_cache, paged_kpe_cache,
             self._paged_kv_indptr_buf,
             self._paged_kv_indices_buf,
