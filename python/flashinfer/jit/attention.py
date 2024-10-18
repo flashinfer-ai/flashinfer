@@ -269,8 +269,9 @@ def gen_batch_prefill_cu(*args) -> Tuple[str, pathlib.Path]:
         os.makedirs(gen_directory)
     uri = get_batch_prefill_uri(*args)
     file_name = f"{uri}.cu"
-    path = gen_directory / file_name,
+    path = gen_directory / file_name
     write_if_different(
+        path,
         get_batch_prefill_cu_str(*args),
     )
     return uri, path
