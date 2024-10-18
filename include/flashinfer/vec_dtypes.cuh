@@ -121,26 +121,26 @@ struct vec_cast<half, float> {
 
 template <typename T>
 constexpr FLASHINFER_INLINE int get_exponent_bits() {
-  if constexpr (std::is_same<T, __nv_fp8_e4m3>::value) {
+  if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
     return 4;
-  } else if constexpr (std::is_same<T, __nv_fp8_e5m2>::value) {
+  } else if constexpr (std::is_same_v<T, __nv_fp8_e5m2>) {
     return 5;
-  } else if constexpr (std::is_same<T, half>::value) {
+  } else if constexpr (std::is_same_v<T, half>) {
     return 5;
-  } else if constexpr (std::is_same<T, nv_bfloat16>::value) {
+  } else if constexpr (std::is_same_v<T, nv_bfloat16>) {
     return 8;
   }
 }
 
 template <typename T>
 constexpr FLASHINFER_INLINE int get_mantissa_bits() {
-  if constexpr (std::is_same<T, __nv_fp8_e4m3>::value) {
+  if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
     return 3;
-  } else if constexpr (std::is_same<T, __nv_fp8_e5m2>::value) {
+  } else if constexpr (std::is_same_v<T, __nv_fp8_e5m2>) {
     return 2;
-  } else if constexpr (std::is_same<T, half>::value) {
+  } else if constexpr (std::is_same_v<T, half>) {
     return 11;
-  } else if constexpr (std::is_same<T, nv_bfloat16>::value) {
+  } else if constexpr (std::is_same_v<T, nv_bfloat16>) {
     return 7;
   }
 }
@@ -156,8 +156,7 @@ constexpr FLASHINFER_INLINE int get_mantissa_bits() {
 template <typename fp8_dtype, typename fp16_dtype>
 __device__ void fast_dequant_f8f16x4(uint32_t* input, uint2* output) {
   uint32_t q = *input;
-  if constexpr (std::is_same<fp8_dtype, __nv_fp8_e5m2>::value &&
-                std::is_same<fp16_dtype, half>::value) {
+  if constexpr (std::is_same_v<fp8_dtype, __nv_fp8_e5m2> && std::is_same_v<fp16_dtype, half>) {
     output->x = __byte_perm(0U, q, 0x5140);
     output->y = __byte_perm(0U, q, 0x7362);
   } else {
@@ -179,7 +178,7 @@ __device__ void fast_dequant_f8f16x4(uint32_t* input, uint2* output) {
 
     constexpr int BIAS_OFFSET = (1 << (FP16_EXPONENT - 1)) - (1 << (FP8_EXPONENT - 1));
     // Construct and apply exponent bias
-    if constexpr (std::is_same<fp16_dtype, half>::value) {
+    if constexpr (std::is_same_v<fp16_dtype, half>) {
       const half2 bias_reg = __float2half2_rn(float(1 << BIAS_OFFSET));
 
       // Convert to half2 and apply bias
@@ -410,7 +409,7 @@ FLASHINFER_INLINE void cast_from_impl(vec_t<tgt_float_t, vec_size>& dst,
 template <typename src_float_t, typename tgt_float_t, size_t vec_size>
 FLASHINFER_INLINE void cast_load_impl(vec_t<tgt_float_t, vec_size>& dst,
                                       const src_float_t* src_ptr) {
-  if constexpr (std::is_same<src_float_t, tgt_float_t>::value) {
+  if constexpr (std::is_same_v<src_float_t, tgt_float_t>) {
     dst.load(src_ptr);
   } else {
     vec_t<src_float_t, vec_size> tmp;
@@ -422,7 +421,7 @@ FLASHINFER_INLINE void cast_load_impl(vec_t<tgt_float_t, vec_size>& dst,
 template <typename src_float_t, typename tgt_float_t, size_t vec_size>
 FLASHINFER_INLINE void cast_store_impl(tgt_float_t* dst_ptr,
                                        const vec_t<src_float_t, vec_size>& src) {
-  if constexpr (std::is_same<src_float_t, tgt_float_t>::value) {
+  if constexpr (std::is_same_v<src_float_t, tgt_float_t>) {
     src.store(dst_ptr);
   } else {
     vec_t<tgt_float_t, vec_size> tmp;

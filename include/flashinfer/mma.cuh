@@ -219,7 +219,7 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f32(float* C, uin
   static_assert(sizeof(T) == 1, "DType must be 8bit floating data type");
 #if defined(FLASHINFER_MMA_F8F8F32_M16N8K32_ENABLED)
   if constexpr (mma_mode == MMAMode::kInit) {
-    if constexpr (std::is_same<T, __nv_fp8_e4m3>::value) {
+    if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
       asm volatile(
           "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
           "{%0,  %1,  %2,  %3},"
@@ -259,7 +259,7 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f32(float* C, uin
             "f"(0.f), "f"(0.f));
     }
   } else {
-    if constexpr (std::is_same<T, __nv_fp8_e4m3>::value) {
+    if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
       asm volatile(
           "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
           "{%0,  %1,  %2,  %3},"
@@ -319,7 +319,7 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
                                                                      uint32_t* B) {
 #if defined(FLASHINFER_MMA_F16F16F32_M16N8K16_ENABLED)
   if constexpr (mma_mode == MMAMode::kInit) {
-    if constexpr (std::is_same<T, half>::value) {
+    if constexpr (std::is_same_v<T, half>) {
       asm volatile(
           "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
           "{%0,  %1,  %2,  %3},"
@@ -359,7 +359,7 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
             "f"(0.f), "f"(0.f));
     }
   } else {
-    if constexpr (std::is_same<T, half>::value) {
+    if constexpr (std::is_same_v<T, half>) {
       asm volatile(
           "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
           "{%0,  %1,  %2,  %3},"
@@ -400,7 +400,7 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
     }
   }
 #elif defined(FLASHINFER_MMA_F16F16F32_M16N8K8_ENABLED)
-  if constexpr (std::is_same<T, half>::value) {
+  if constexpr (std::is_same_v<T, half>) {
     if constexpr (mma_mode == MMAMode::kInit) {
       asm volatile(
           "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
@@ -484,7 +484,7 @@ __device__ __forceinline__ void rowsum_f8f8f32(float* d, DType* s) {
   static_assert(sizeof(DType) == 1, "DType must be 8bit floating data type");
   uint32_t* s_u32 = (uint32_t*)(s);
 #if defined(FLASHINFER_MMA_F8F8F32_M16N8K32_ENABLED)
-  if constexpr (std::is_same<DType, __nv_fp8_e4m3>::value) {
+  if constexpr (std::is_same_v<DType, __nv_fp8_e4m3>) {
     asm volatile(
         "{\n"
         "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
@@ -523,7 +523,7 @@ __device__ __forceinline__ void rowsum_f16f16f32(float* d, DType* s) {
   static_assert(sizeof(DType) == 2, "DType must be 16bit floating data type");
   uint32_t* s_u32 = (uint32_t*)(s);
 #if defined(FLASHINFER_MMA_F16F16F32_M16N8K16_ENABLED)
-  if constexpr (std::is_same<DType, half>::value) {
+  if constexpr (std::is_same_v<DType, half>) {
     asm volatile(
         "{\n"
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
@@ -549,7 +549,7 @@ __device__ __forceinline__ void rowsum_f16f16f32(float* d, DType* s) {
           "r"(1065369472), "f"(d[0]), "f"(d[1]));
   }
 #elif defined(FLASHINFER_MMA_F16F16F32_M16N8K8_ENABLED)
-  if constexpr (std::is_same<DType, half>::value) {
+  if constexpr (std::is_same_v<DType, half>) {
     asm volatile(
         "{\n"
         "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
