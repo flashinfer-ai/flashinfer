@@ -154,7 +154,6 @@ def get_batch_decode_mla_cu_str(
     dtype_o: torch.dtype,
     dtype_idx: torch.dtype,
     head_dim: int,
-    pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
 ) -> str:
@@ -166,7 +165,6 @@ def get_batch_decode_mla_cu_str(
         dtype_idx=dtype_map[dtype_idx],
         head_dim_ckv=head_dim,
         head_dim_kpe=head_dim//8, # fixme: head_dim_ckv(kv_lora_rank) is 8 times the size of head_dim_kpe(qk_rope_head_dim) for all MLA model (DeepSeek-V2-Lite, DeepSeek-V, MiniCPM3) at the time Oct.2024
-        pos_encoding_mode=pos_encoding_mode_literal[pos_encoding_mode],
         use_sliding_window="true" if use_sliding_window else "false",
         use_logits_soft_cap="true" if use_logits_soft_cap else "false",
     )
@@ -178,7 +176,6 @@ def get_batch_decode_mla_uri(
     dtype_o: torch.dtype,
     dtype_idx: torch.dtype,
     head_dim: int,
-    pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
 ) -> str:
@@ -188,7 +185,6 @@ def get_batch_decode_mla_uri(
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_{head_dim}_"
-        f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}"
     )

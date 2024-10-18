@@ -1069,7 +1069,6 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
-        # kv_layout: str = "NHD",
         use_cuda_graph: bool = False,
         paged_kv_indptr_buffer: Optional[torch.Tensor] = None,
         paged_kv_indices_buffer: Optional[torch.Tensor] = None,
@@ -1084,35 +1083,27 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
             buffer should be the same as the device of the input tensors.
 
-        kv_layout : str
-            The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
-
         use_cuda_graph : bool
             Whether to enable CUDAGraph for batch decode attention, if enabled, the
             auxiliary data structures will be stored as the provided buffers. The ``batch_size``
             cannot change during the lifecycle of this wrapper when CUDAGraph is enabled.
 
-        use_tensor_cores : bool
-            Whether to use tensor cores for the computation. Will be faster for large group
-            size in grouped query attention. Defaults to ``False``.
-
-        indptr_buffer : Optional[torch.Tensor]
+        paged_kv_indptr_buffer : Optional[torch.Tensor]
             The user reserved buffer on GPU to store the indptr of the paged kv cache, the size
             of the buffer should be ``[batch_size + 1]``.
             Only needed when ``use_cuda_graph`` is ``True``.
 
-        indices_buffer : Optional[torch.Tensor]
+        paged_kv_indices_buffer : Optional[torch.Tensor]
             The user reserved buffer on GPU to store the page indices of the paged kv cache,
             should be large enough to store the maximum number of page indices
             (``max_num_pages``) during the lifecycle of this wrapper.
             Only needed when ``use_cuda_graph`` is ``True``.
 
-        last_page_len_buffer : Optional[torch.Tensor]
+        paged_kv_last_page_len_buffer : Optional[torch.Tensor]
             The user reserved buffer on GPU to store the number of entries in the last page, the
             size of the buffer should be ``[batch_size]``.
             Only needed when ``use_cuda_graph`` is ``True``.
         """
-        self._kv_layout = "NHD"
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
         self._int_workspace_buffer = torch.empty(
@@ -1182,15 +1173,13 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         indices: torch.Tensor,
         last_page_len: torch.Tensor,
         num_qo_heads: int,
-        # num_kv_heads: int,
-        head_dim: int,
+        head_dim_compressed_kv: int,
         page_size: int,
-        pos_encoding_mode: str = "NONE",
+        sm_scale: float,
         window_left: int = -1,
         logits_soft_cap: Optional[float] = None,
         data_type: Union[str, torch.dtype] = "float16",
         q_data_type: Optional[Union[str, torch.dtype]] = None,
-        sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
     ) -> None:
@@ -1207,16 +1196,12 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             cache, shape: ``[batch_size]``
         num_qo_heads : int
             The number of query/output heads
-        num_kv_heads : int
-            The number of key/value heads
-        head_dim : int
-            The dimension of the heads
+        head_dim_compressed_kv : int
+            The dimension of the compressed kv, is also kv_lora_rank
         page_size : int
             The page size of the paged kv cache
-        pos_encoding_mode : str
-            The position encoding applied inside attention kernels, could be
-            ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
-            Defaults to ``NONE``.
+        sm_scale : float
+            The scale of softmax, should be ``1 / sqrt(qk_nope_head_dim + qk_rope_head_dim)``
         window_left : int
             The left (inclusive) window size for the attention window, when set to ``-1``, the window
             size will be set to the full length of the sequence. Defaults to ``-1``.
@@ -1237,10 +1222,6 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         The :meth:`plan` method should be called before any :meth:`run` or
         :meth:`run_return_lse` calls, auxiliary data structures will be created
         during this call and cached for multiple run calls.
-
-        The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads``
-        is not equal to ``num_kv_heads``, the function will use
-        `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
         """
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
@@ -1276,8 +1257,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             data_type,
             q_data_type,
             indptr.dtype,
-            head_dim,
-            PosEncodingMode[pos_encoding_mode].value,
+            head_dim_compressed_kv,
             window_left != -1,  # use_sliding_window
             logits_soft_cap > 0,  # use_logits_soft_cap
         )
@@ -1288,15 +1268,13 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             indptr,
             batch_size,
             num_qo_heads,
-            # num_kv_heads,
             page_size,
             self.is_cuda_graph_enabled,
         )
-
-        self._pos_encoding_mode = pos_encoding_mode
+        
+        self._sm_scale = sm_scale
         self._window_left = window_left
         self._logits_soft_cap = logits_soft_cap
-        self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
         
@@ -1305,6 +1283,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         self,
         q: torch.Tensor,
         paged_ckv_cache: torch.Tensor,
+        paged_kpe_cache: torch.Tensor,
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
@@ -1319,6 +1298,9 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         paged_ckv_cache : torch.Tensor
             The paged compressed-KV-Cache stored as a single tensor:
             * 3-D tensors, each with shape: ``[max_num_pages, page_size, head_dim_ckv]``.
+        paged_kpe_cache : torch.Tensor
+            The paged k-pe-Cache stored as a single tensor:
+            * 3-D tensors, each with shape: ``[max_num_pages, page_size, head_dim_kpe]``.
         q_scale : Optional[float]
             The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
         k_scale : Optional[float]
@@ -1337,18 +1319,13 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             * attention output, shape: ``[batch_size, num_qo_heads, head_dim]``
             * logsumexp of attention scores, shape: ``[batch_size, num_qo_heads]``.
         """
-        pos_encoding_mode = self._pos_encoding_mode
         window_left = self._window_left
         logits_soft_cap = self._logits_soft_cap
         sm_scale = self._sm_scale
         rope_scale = self._rope_scale
         rope_theta = self._rope_theta
-        _check_pos_encoding_mode(pos_encoding_mode)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
-        if sm_scale is None:
-            head_dim = q.shape[-1]
-            sm_scale = 1.0 / math.sqrt(head_dim)
         if q_scale is not None:
             sm_scale *= q_scale
         if k_scale is not None:
@@ -1363,14 +1340,13 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             self._int_workspace_buffer,
             self._plan_info,
             q,
-            paged_ckv_cache, paged_ckv_cache,
+            paged_ckv_cache, paged_kpe_cache,
             self._paged_kv_indptr_buf,
             self._paged_kv_indices_buf,
             self._paged_kv_last_page_len_buf,
-            _get_cache_alibi_slopes_buf(q.shape[1], q.device),
+            sm_scale,
             window_left,
             logits_soft_cap,
-            sm_scale,
             rope_scale,
             rope_theta,
             return_lse,

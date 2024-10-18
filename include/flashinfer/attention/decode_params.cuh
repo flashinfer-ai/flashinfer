@@ -184,7 +184,6 @@ struct BatchDecodeParamsMLA {
 
   IdType* q_offset;
   paged_kv_mla_t<DTypeKV, IdType> paged_kv;
-  float* alibi_slopes;
   uint32_t padded_batch_size;
   uint32_t num_qo_heads;
   int32_t window_left;
@@ -201,13 +200,12 @@ struct BatchDecodeParamsMLA {
 
   __device__ __host__ BatchDecodeParamsMLA(DTypeQ* q, IdType* q_offset,
                                         paged_kv_mla_t<DTypeKV, IdType> paged_kv, DTypeO* o, float* lse,
-                                        float* alibi_slopes, uint32_t num_qo_heads,
+                                        uint32_t num_qo_heads,
                                         int32_t window_left, float logits_soft_cap, float sm_scale,
                                         float rope_scale, float rope_theta)
       : q(q), o(o), lse(lse), sm_scale(sm_scale),
         q_offset(q_offset),
         paged_kv(paged_kv),
-        alibi_slopes(alibi_slopes),
         padded_batch_size(0),
         num_qo_heads(num_qo_heads),
         window_left(window_left),

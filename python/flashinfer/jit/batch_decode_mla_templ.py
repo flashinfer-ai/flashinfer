@@ -25,16 +25,15 @@ batch_decode_mla_templ = r"""
 
 using namespace flashinfer;
 
-{% set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
 using ParamsT = BatchDecodeParamsMLA<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ dtype_idx }}>;
-using AttentionVariant = ComposedAttention<ParamsT, get_variant_code(/*use_custom_mask=*/false, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, {{ use_alibi }})>;
+using AttentionVariant = ComposedAttention<ParamsT, get_variant_code(/*use_custom_mask=*/false, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, /*use_alibi*/false)>;
 
 std::vector<int64_t> BatchDecodeWithPagedKVCachePlanMLA(
     torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
     torch::Tensor page_locked_int_workspace_buffer,
     torch::Tensor indptr,
     unsigned int batch_size, unsigned int num_qo_heads,
-    /*unsigned int num_kv_heads,*/ unsigned int page_size,
+    unsigned int page_size,
     bool enable_cuda_graph) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
@@ -47,9 +46,8 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlanMLA(
   DecodePlanInfo plan_info;
 
   auto work_estimation_func =
-      BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA<{{ head_dim_ckv }}, {{ head_dim_kpe }}, {{ pos_encoding_mode }},
-                                                          AttentionVariant>;
-  cudaError_t status = DecodePlan<{{ head_dim_ckv }}, {{ pos_encoding_mode }}, AttentionVariant>(
+      BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA<{{ head_dim_ckv }}, {{ head_dim_kpe }}, AttentionVariant>;
+  cudaError_t status = DecodePlan<{{ head_dim_ckv }}, flashinfer::PosEncodingMode::kRoPELlama, AttentionVariant>(
       static_cast<void*>(float_workspace_buffer.data_ptr()),
       float_workspace_size_in_bytes,
       static_cast<void*>(int_workspace_buffer.data_ptr()),
@@ -57,7 +55,7 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlanMLA(
       int_workspace_size_in_bytes,
       plan_info,
       static_cast<{{ dtype_idx }}*>(indptr.data_ptr()),
-      batch_size, num_qo_heads, /*num_kv_heads,*/ page_size, enable_cuda_graph, /*stream=*/torch_current_stream,
+      batch_size, num_qo_heads, page_size, enable_cuda_graph, /*stream=*/torch_current_stream,
       work_estimation_func);
 
   TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCachePlanMLA failed with error ",
@@ -75,9 +73,9 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRunMLA(
     torch::Tensor paged_kpe_cache,
     torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
     torch::Tensor paged_kv_last_page_len,
-    std::optional<torch::Tensor> alibi_slopes,
+    float sm_scale, 
     int window_left,
-    float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta, bool return_lse) {
+    float logits_soft_cap, float rope_scale, float rope_theta, bool return_lse) {
   DecodePlanInfo plan_info;
   plan_info.FromVector(plan_info_vec);
 
@@ -112,7 +110,6 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRunMLA(
     static_cast<{{ dtype_q }}*>(q.data_ptr()),
     /*q_offset=*/nullptr, paged_kv, static_cast<{{ dtype_o }}*>(o.data_ptr()),
     /*lse=*/(return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr),
-    {% if use_alibi == "true" %}static_cast<float*>(alibi_slopes->data_ptr()){% else %}nullptr{% endif %},
     num_qo_heads, window_left, logits_soft_cap, sm_scale, rope_scale, rope_theta);
   
   {{ dtype_o }}* tmp_v = nullptr;
@@ -131,7 +128,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRunMLA(
   params.padded_batch_size = plan_info.padded_batch_size;
   
   cudaError_t status = BatchDecodeWithPagedKVCacheDispatchedMLA<
-      {{ head_dim_ckv }}, {{ head_dim_kpe }}, {{ pos_encoding_mode }}, AttentionVariant>(
+      {{ head_dim_ckv }}, {{ head_dim_kpe }}, AttentionVariant>(
       params, tmp_v, tmp_s, /*stream=*/torch_current_stream);
   TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
               cudaGetErrorString(status));
