@@ -208,9 +208,10 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA(
 
   auto compute_capacity = GetCudaComputeCapability();
   DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
-    constexpr uint32_t bdx = 32;
     constexpr uint32_t vec_size_ckv = std::max(16UL / sizeof(DTypeKV), HEAD_DIM_CKV / 32UL);
-    constexpr uint32_t vec_size_kpe = std::max(16UL / sizeof(DTypeKV), HEAD_DIM_KPE / 32UL);
+    constexpr uint32_t bdx = HEAD_DIM_CKV / vec_size_ckv;
+    constexpr uint32_t vec_size_kpe = HEAD_DIM_KPE / bdx;
+
     constexpr uint32_t bdy = 4;
     constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
     constexpr uint32_t bdz = num_threads / (bdx * bdy);
