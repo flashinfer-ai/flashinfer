@@ -50,7 +50,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__
  *   the new batch size after the partition.
  */
 template <typename IdType>
-std::pair<uint32_t, uint32_t> PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(
+auto PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(
     const uint32_t max_grid_size, const uint32_t num_kv_heads, const std::vector<IdType>& num_pages,
     const uint32_t min_num_pages_per_batch = 1) {
   uint32_t low = min_num_pages_per_batch, high = 0;
@@ -74,13 +74,14 @@ std::pair<uint32_t, uint32_t> PartitionPagedKVCacheBinarySearchMinNumPagePerBatc
   for (const IdType& elem : num_pages) {
     new_batch_size += ceil_div(std::max(elem, 1), low);
   }
-  return {low, new_batch_size};
+  return std::make_tuple(low, new_batch_size);
 }
 
-inline std::tuple<bool, uint32_t, uint32_t> PrefillBinarySearchKVChunkSize(
-    const uint32_t max_batch_size_if_split, const std::vector<int64_t>& packed_qo_len_arr,
-    const std::vector<int64_t>& kv_len_arr, const uint32_t qo_chunk_size,
-    const uint32_t min_kv_chunk_size = 1) {
+auto PrefillBinarySearchKVChunkSize(const uint32_t max_batch_size_if_split,
+                                    const std::vector<int64_t>& packed_qo_len_arr,
+                                    const std::vector<int64_t>& kv_len_arr,
+                                    const uint32_t qo_chunk_size,
+                                    const uint32_t min_kv_chunk_size = 1) {
   int64_t low = min_kv_chunk_size, high = 0;
   int64_t batch_size = packed_qo_len_arr.size();
   int64_t max_kv_len = 1;
@@ -107,7 +108,7 @@ inline std::tuple<bool, uint32_t, uint32_t> PrefillBinarySearchKVChunkSize(
     new_batch_size += ceil_div(packed_qo_len_arr[i], qo_chunk_size) *
                       ceil_div(std::max(int(kv_len_arr[i]), 1), low);
   }
-  return {low < max_kv_len, low, new_batch_size};
+  return std::make_tuple(low < max_kv_len, low, new_batch_size);
 }
 
 /*!
@@ -200,8 +201,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
  * \return status Indicates whether CUDA calls are successful
  */
 template <typename IdType>
-std::tuple<std::vector<IdType>, std::vector<IdType>, std::vector<IdType>> DecodeSplitKVIndptr(
-    IdType* indptr_h, uint32_t batch_size, uint32_t kv_chunk_size) {
+auto DecodeSplitKVIndptr(IdType* indptr_h, uint32_t batch_size, uint32_t kv_chunk_size) {
   std::vector<IdType> request_indices, kv_tile_indices, o_indptr;
   o_indptr.push_back(0);
 
@@ -215,7 +215,7 @@ std::tuple<std::vector<IdType>, std::vector<IdType>, std::vector<IdType>> Decode
     o_indptr.push_back(o_indptr.back() + num_tiles_kv);
   }
 
-  return {request_indices, kv_tile_indices, o_indptr};
+  return std::make_tuple(request_indices, kv_tile_indices, o_indptr);
 }
 
 struct DecodePlanInfo {
@@ -350,12 +350,10 @@ cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
 }
 
 template <typename IdType>
-std::tuple<bool, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, std::vector<IdType>,
-           std::vector<IdType>, std::vector<IdType>, std::vector<IdType>, std::vector<IdType>>
-PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t batch_size,
-                       uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
-                       uint32_t page_size, uint32_t max_batch_size_if_split,
-                       bool enable_cuda_graph) {
+auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t batch_size,
+                            uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
+                            uint32_t page_size, uint32_t max_batch_size_if_split,
+                            bool enable_cuda_graph) {
   std::vector<IdType> request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr;
   merge_indptr.push_back(0);
   o_indptr.push_back(0);
@@ -442,17 +440,9 @@ PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t batch_
   // step 4: multiply kv_chunk_size by page_size
   kv_chunk_size *= page_size;
 
-  return {split_kv,
-          total_num_tiles_q,
-          new_batch_size,
-          cta_tile_q,
-          kv_chunk_size,
-          total_num_rows,
-          std::move(request_indices),
-          std::move(qo_tile_indices),
-          std::move(kv_tile_indices),
-          std::move(merge_indptr),
-          std::move(o_indptr)};
+  return std::make_tuple(split_kv, total_num_tiles_q, new_batch_size, cta_tile_q, kv_chunk_size,
+                         total_num_rows, std::move(request_indices), std::move(qo_tile_indices),
+                         std::move(kv_tile_indices), std::move(merge_indptr), std::move(o_indptr));
 }
 
 struct PrefillPlanInfo {
