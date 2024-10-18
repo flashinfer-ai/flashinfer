@@ -581,14 +581,14 @@ __device__ __forceinline__ void compute_qk(smem_t<swizzle_mode_q>* q_smem,
 
 #pragma unroll
       for (uint32_t fq = 0; fq < NUM_FRAGS_Q; ++fq) {
-        if constexpr (std::is_same<DTypeQKAccum, float>::value) {
+        if constexpr (std::is_same_v<DTypeQKAccum, float>) {
           if (fd == 0) {
             mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeQ, MMAMode::kInit>(s_frag[fq][fkv],
                                                                               a_frag[fq], b_frag);
           } else {
             mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeQ>(s_frag[fq][fkv], a_frag[fq], b_frag);
           }
-        } else if (std::is_same<DTypeQKAccum, half>::value) {
+        } else if (std::is_same_v<DTypeQKAccum, half>) {
           if (fd == 0) {
             mma::mma_sync_m16n16k16_row_col_f16f16f16<MMAMode::kInit>((uint32_t*)s_frag[fq][fkv],
                                                                       a_frag[fq], b_frag);
@@ -684,7 +684,7 @@ __device__ __forceinline__ void update_mdo_states(AttentionVariant variant,
                                                   float (*o_frag)[NUM_FRAGS_D][8],
                                                   DTypeQKAccum (*m)[2], float (*d)[2]) {
   if constexpr (variant.use_softmax) {
-    if constexpr (std::is_same<DTypeQKAccum, float>::value) {
+    if constexpr (std::is_same_v<DTypeQKAccum, float>) {
 #pragma unroll
       for (uint32_t fq = 0; fq < NUM_FRAGS_Q; ++fq) {
 #pragma unroll
@@ -717,7 +717,7 @@ __device__ __forceinline__ void update_mdo_states(AttentionVariant variant,
           }
         }
       }
-    } else if constexpr (std::is_same<DTypeQKAccum, half>::value) {
+    } else if constexpr (std::is_same_v<DTypeQKAccum, half>) {
 #pragma unroll
       for (uint32_t fq = 0; fq < NUM_FRAGS_Q; ++fq) {
         half m_prev[2];
@@ -770,7 +770,7 @@ __device__ __forceinline__ void compute_sfm_v(AttentionVariant variant,
   constexpr uint32_t channel_size_128b_kv = head_dim / num_elems_per_128b<DTypeKV>();
 
   DTypeQ s_frag_f16[NUM_FRAGS_Q][NUM_FRAGS_KV][8];
-  if constexpr (std::is_same<DTypeQKAccum, float>::value) {
+  if constexpr (std::is_same_v<DTypeQKAccum, float>) {
 #pragma unroll
     for (uint32_t fq = 0; fq < NUM_FRAGS_Q; ++fq) {
 #pragma unroll
@@ -785,7 +785,7 @@ __device__ __forceinline__ void compute_sfm_v(AttentionVariant variant,
     for (uint32_t fq = 0; fq < NUM_FRAGS_Q; ++fq) {
 #pragma unroll
       for (uint32_t fkv = 0; fkv < NUM_FRAGS_KV; ++fkv) {
-        if constexpr (std::is_same<DTypeQKAccum, float>::value) {
+        if constexpr (std::is_same_v<DTypeQKAccum, float>) {
           mma::rowsum_f16f16f32(d[fq], s_frag_f16[fq][fkv]);
         } else {
           mma::rowsum_f16f16f32(d[fq], s_frag[fq][fkv]);
@@ -815,7 +815,7 @@ __device__ __forceinline__ void compute_sfm_v(AttentionVariant variant,
       }
 #pragma unroll
       for (uint32_t fq = 0; fq < NUM_FRAGS_Q; ++fq) {
-        if constexpr (std::is_same<DTypeQKAccum, float>::value) {
+        if constexpr (std::is_same_v<DTypeQKAccum, float>) {
           mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeQ>(
               o_frag[fq][fd], (uint32_t*)(s_frag_f16[fq][fkv]), b_frag);
         } else {
@@ -1093,7 +1093,7 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void SinglePrefillWithKV
     const __grid_constant__ typename AttentionVariant::ParamsT params) {
   using DTypeQ = typename AttentionVariant::DTypeQ;
 #if (__CUDA_ARCH__ < 800)
-  if constexpr (std::is_same<DTypeQ, nv_bfloat16>::value) {
+  if constexpr (std::is_same_v<DTypeQ, nv_bfloat16>) {
     FLASHINFER_RUNTIME_ASSERT("Prefill kernels do not support bf16 on sm75.");
   } else {
 #endif
@@ -1394,8 +1394,8 @@ cudaError_t SinglePrefillWithKVCacheDispatched(typename AttentionVariant::Params
     constexpr uint32_t NUM_FRAGS_Q = get_num_frags_q(CTA_TILE_Q);
 
     using DTypeQKAccum =
-        typename std::conditional<ALLOW_FP16_QK_REDUCTION && std::is_same<DTypeQ, half>::value,
-                                  half, float>::type;
+        typename std::conditional<ALLOW_FP16_QK_REDUCTION && std::is_same_v<DTypeQ, half>, half,
+                                  float>::type;
 
     int dev_id = 0;
     FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
@@ -1502,7 +1502,7 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithRag
     const __grid_constant__ typename AttentionVariant::ParamsT params) {
   using DTypeQ = typename AttentionVariant::DTypeQ;
 #if (__CUDA_ARCH__ < 800)
-  if constexpr (std::is_same<DTypeQ, nv_bfloat16>::value) {
+  if constexpr (std::is_same_v<DTypeQ, nv_bfloat16>) {
     FLASHINFER_RUNTIME_ASSERT("Prefill kernels do not support bf16 on sm75.");
   } else {
 #endif
@@ -1797,7 +1797,7 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPag
     const __grid_constant__ typename AttentionVariant::ParamsT params) {
   using DTypeQ = typename AttentionVariant::DTypeQ;
 #if (__CUDA_ARCH__ < 800)
-  if constexpr (std::is_same<DTypeQ, nv_bfloat16>::value) {
+  if constexpr (std::is_same_v<DTypeQ, nv_bfloat16>) {
     FLASHINFER_RUNTIME_ASSERT("Prefill kernels do not support bf16 on sm75.");
   } else {
 #endif
@@ -2118,7 +2118,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(typename AttentionVariant::P
   dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
   constexpr uint32_t NUM_FRAGS_D = HEAD_DIM / 16;
   using DTypeQKAccum =
-      typename std::conditional<ALLOW_FP16_QK_REDUCTION && std::is_same<DTypeQ, half>::value, half,
+      typename std::conditional<ALLOW_FP16_QK_REDUCTION && std::is_same_v<DTypeQ, half>, half,
                                 float>::type;
 
   int dev_id = 0;
@@ -2220,7 +2220,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(typename AttentionVariant::Pa
 
   constexpr uint32_t NUM_FRAGS_D = HEAD_DIM / 16;
   using DTypeQKAccum =
-      typename std::conditional<ALLOW_FP16_QK_REDUCTION && std::is_same<DTypeQ, half>::value, half,
+      typename std::conditional<ALLOW_FP16_QK_REDUCTION && std::is_same_v<DTypeQ, half>, half,
                                 float>::type;
 
   int dev_id = 0;
