@@ -78,12 +78,12 @@ std::pair<uint32_t, uint32_t> PartitionPagedKVCacheBinarySearchMinNumPagePerBatc
 }
 
 inline std::tuple<bool, uint32_t, uint32_t> PrefillBinarySearchKVChunkSize(
-    const uint32_t max_grid_size, const uint32_t num_kv_heads,
-    const std::vector<int64_t>& packed_qo_len_arr, const std::vector<int64_t>& kv_len_arr,
-    const uint32_t qo_chunk_size, const uint32_t min_kv_chunk_size = 1) {
+    const uint32_t max_batch_size_if_split, const std::vector<int64_t>& packed_qo_len_arr,
+    const std::vector<int64_t>& kv_len_arr, const uint32_t qo_chunk_size,
+    const uint32_t min_kv_chunk_size = 1) {
   int64_t low = min_kv_chunk_size, high = 0;
   int64_t batch_size = packed_qo_len_arr.size();
-  int64_t max_kv_len = 0;
+  int64_t max_kv_len = 1;
   for (const int64_t& kv_len : kv_len_arr) {
     max_kv_len = std::max(max_kv_len, kv_len);
   }
@@ -96,7 +96,7 @@ inline std::tuple<bool, uint32_t, uint32_t> PrefillBinarySearchKVChunkSize(
       new_batch_size +=
           ceil_div(packed_qo_len_arr[i], qo_chunk_size) * ceil_div(kv_len_arr[i], mid);
     }
-    if (new_batch_size * num_kv_heads > max_grid_size) {
+    if (new_batch_size > max_batch_size_if_split) {
       low = mid + 1;
     } else {
       high = mid;
@@ -354,7 +354,7 @@ std::tuple<bool, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, std::vector<I
            std::vector<IdType>, std::vector<IdType>, std::vector<IdType>, std::vector<IdType>>
 PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t batch_size,
                        uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
-                       uint32_t page_size, uint32_t max_grid_size, uint32_t max_batch_size_if_split,
+                       uint32_t page_size, uint32_t max_batch_size_if_split,
                        bool enable_cuda_graph) {
   std::vector<IdType> request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr;
   merge_indptr.push_back(0);
@@ -368,7 +368,19 @@ PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t batch_
   int64_t sum_packed_qo_len = 0;
   for (uint32_t i = 0; i < batch_size; ++i) {
     packed_qo_len_arr[i] = int64_t(qo_indptr_h[i + 1] - qo_indptr_h[i]) * int64_t(gqa_group_size);
+    if (packed_qo_len_arr[i] < 0) {
+      std::ostringstream err_msg;
+      err_msg << "qo_indptr[" << i + 1 << "]" << qo_indptr_h[i + 1] << " - qo_indptr[" << i << "]"
+              << qo_indptr_h[i] << " should be non-negative";
+      throw std::invalid_argument(err_msg.str());
+    }
     kv_len_arr[i] = int64_t(kv_indptr_h[i + 1] - kv_indptr_h[i]);
+    if (kv_len_arr[i] < 0) {
+      std::ostringstream err_msg;
+      err_msg << "kv_indptr[" << i + 1 << "]" << kv_indptr_h[i + 1] << " - kv_indptr[" << i << "]"
+              << kv_indptr_h[i] << " should be non-negative";
+      throw std::invalid_argument(err_msg.str());
+    }
     sum_packed_qo_len += packed_qo_len_arr[i];
   }
   int64_t avg_packed_qo_len = sum_packed_qo_len / batch_size;
@@ -392,19 +404,26 @@ PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t batch_
     }
   }
 
+  uint32_t total_num_tiles_q = 0;
+  for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
+    total_num_tiles_q += ceil_div(packed_qo_len_arr[request_idx], cta_tile_q);
+  }
+
   // step 2: determine kv_chunk_size
   auto [split_kv, kv_chunk_size, new_batch_size] = PrefillBinarySearchKVChunkSize(
-      max_grid_size, num_kv_heads, packed_qo_len_arr, kv_len_arr, cta_tile_q,
+      max_batch_size_if_split, packed_qo_len_arr, kv_len_arr, cta_tile_q,
       /*min_kv_chunk_size=*/std::max((128 / page_size), 1U));
 
+  if (enable_cuda_graph) {
+    split_kv = total_num_tiles_q < max_batch_size_if_split;
+  }
+
   // step 3: split qo_indptr and kv_indptr
-  uint32_t total_num_tiles_q = 0;
   for (uint32_t request_idx = 0; request_idx < batch_size; ++request_idx) {
     int64_t packed_qo_len = packed_qo_len_arr[request_idx],
             kv_len = std::max(int(kv_len_arr[request_idx]), 1);
     int64_t num_tiles_q = ceil_div(packed_qo_len, cta_tile_q),
             num_tiles_kv = ceil_div(kv_len, kv_chunk_size);
-    total_num_tiles_q += num_tiles_q;
     for (uint32_t q_tile_idx = 0; q_tile_idx < num_tiles_q; ++q_tile_idx) {
       for (uint32_t kv_tile_idx = 0; kv_tile_idx < num_tiles_kv; ++kv_tile_idx) {
         request_indices.push_back(request_idx);
@@ -420,12 +439,7 @@ PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t batch_
     o_indptr.push_back(o_indptr.back() + qo_len * num_tiles_kv);
   }
 
-  // step 4: reset split_kv if enable_cuda_graph is true
-  if (enable_cuda_graph) {
-    split_kv = total_num_tiles_q < max_batch_size_if_split;
-  }
-
-  // step 5: multiply kv_chunk_size by page_size
+  // step 4: multiply kv_chunk_size by page_size
   kv_chunk_size *= page_size;
 
   return {split_kv,
@@ -541,9 +555,9 @@ cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_in_bytes
   // step 2: determine kv_chunk_size
   auto [split_kv, total_num_tiles_q, new_batch_size, cta_tile_q, kv_chunk_size, total_num_rows,
         request_indices_vec, qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec,
-        o_indptr_vec] = PrefillSplitQOKVIndptr(qo_indptr_h, kv_indptr_h, batch_size, num_qo_heads,
-                                               num_kv_heads, head_dim, page_size, max_grid_size,
-                                               max_batch_size_if_split, enable_cuda_graph);
+        o_indptr_vec] =
+      PrefillSplitQOKVIndptr(qo_indptr_h, kv_indptr_h, batch_size, num_qo_heads, num_kv_heads,
+                             head_dim, page_size, max_batch_size_if_split, enable_cuda_graph);
   plan_info.cta_tile_q = cta_tile_q;
   plan_info.total_num_rows = total_num_rows;
 
