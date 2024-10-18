@@ -19,6 +19,7 @@ import re
 import logging
 import subprocess
 import torch.utils.cpp_extension as torch_cpp_ext
+from filelock import FileLock
 from typing import List, Tuple
 from .env import (
     FLASHINFER_WORKSPACE_DIR,
@@ -140,14 +141,16 @@ def load_cuda_ops(
             FLASHINFER_INCLUDE_DIR,
             FLASHINFER_CSRC_DIR,
         ] + CUTLASS_INCLUDE_DIRS
-    return torch_cpp_ext.load(
-        name,
-        list(map(lambda _: str(_), sources)),
-        extra_cflags=cflags,
-        extra_cuda_cflags=cuda_cflags,
-        extra_ldflags=extra_ldflags,
-        extra_include_paths=list(map(lambda _: str(_), extra_include_paths)),
-        build_directory=build_directory,
-        verbose=verbose,
-        with_cuda=True,
-    )
+    lock = FileLock(FLASHINFER_JIT_DIR / f"{name}.lock", thread_local=False)
+    with lock:
+        return torch_cpp_ext.load(
+            name,
+            list(map(lambda _: str(_), sources)),
+            extra_cflags=cflags,
+            extra_cuda_cflags=cuda_cflags,
+            extra_ldflags=extra_ldflags,
+            extra_include_paths=list(map(lambda _: str(_), extra_include_paths)),
+            build_directory=build_directory,
+            verbose=verbose,
+            with_cuda=True,
+        )
