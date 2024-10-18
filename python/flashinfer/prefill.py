@@ -55,7 +55,7 @@ def compile_single_prefill_module(
     *args,
     verbose: bool = False,
 ):
-    uri, path = get_single_prefill_uri(*args)
+    uri, path = gen_single_prefill_cu(*args)
     return load_cuda_ops(
         uri, [path],
         verbose=verbose,
@@ -66,7 +66,7 @@ def compile_batch_prefill_module(
     *args,
     verbose: bool = False,
 ):
-    uri, path = get_batch_prefill_uri(*args)
+    uri, path = gen_batch_prefill_cu(*args)
     return load_cuda_ops(
         uri, [path],
         verbose=verbose,
