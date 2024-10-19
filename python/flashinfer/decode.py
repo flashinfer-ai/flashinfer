@@ -62,7 +62,7 @@ def compile_batch_decode_module(
     *args,
     verbose: bool = False,
 ):
-    uri, path = gen_batch_decode_cu(*args),
+    uri, path = gen_batch_decode_cu(*args)
     return load_cuda_ops(
         uri, [path],
         verbose=verbose,
