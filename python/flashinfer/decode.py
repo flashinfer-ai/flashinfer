@@ -493,6 +493,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         pos_encoding_mode: str = "NONE",
         window_left: int = -1,
         logits_soft_cap: Optional[float] = None,
+        data_type: Optional[Union[str, torch.dtype]] = "float16",
         q_data_type: Optional[Union[str, torch.dtype]] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
         sm_scale: Optional[float] = None,
@@ -536,6 +537,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         kv_data_type : Optional[Union[str, torch.dtype]]
             The data type of the key/value tensor. If None, will be set to
             ``q_data_type``. Defaults to ``None``.
+        data_type: Optional[Union[str, torch.dtype]]
+            The data type of both the query and key/value tensors. Defaults to torch.float16.
+            data_type is deprecated, please use q_data_type and kv_data_type instead.
 
         Note
         ----
@@ -579,6 +583,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         qo_indptr = qo_indptr.to("cpu", non_blocking=True)
         indptr = indptr.to("cpu", non_blocking=True)
+
+        if data_type is not None:
+            q_data_type = data_type
+            kv_data_type = data_type
 
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
