@@ -85,7 +85,7 @@ def gen_single_decode_cu(*args) -> Tuple[str, pathlib.Path]:
         path,
         get_single_decode_cu_str(*args),
     )
-    return file_name, path
+    return uri, path
 
 
 def get_batch_decode_cu_str(
