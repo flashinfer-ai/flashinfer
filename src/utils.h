@@ -82,7 +82,7 @@ void vec_normal_(std::vector<T>& vec, float mean = 0.f, float std = 1.f) {
   std::normal_distribution d{mean, std};
   for (size_t i = 0; i < vec.size(); ++i) {
     // TODO (yiakwy) : RECOVER
-    vec[i] = T(1.f);//T(d(gen));
+    vec[i] = T(1.f);//T(i);//T(d(gen));
   }
 }
 

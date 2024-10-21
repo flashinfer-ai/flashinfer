@@ -202,7 +202,10 @@ __device__ __forceinline__ void produce_kv(smem_t<swizzle_mode> smem, uint32_t* 
   constexpr uint32_t head_dim = num_frags_y * 16;
   constexpr uint32_t num_warps = num_warps_x * num_warps_z;
   constexpr uint32_t channel_size_128b_kv = head_dim / num_elems_per_128b<T>();
-  const uint32_t warp_idx = get_warp_idx<num_warps_x, num_warps_z>(), lane_idx = threadIdx.x;
+  // TODO (yiakwy) : compute it;
+  constexpr uint32_t kv_frag_cols = 8;
+  const uint32_t warp_idx = get_warp_idx<num_warps_x, num_warps_z>();
+  const uint32_t warp_idx_z = warp_idx, lane_idx = threadIdx.x;
 
   if constexpr (swizzle_mode == SwizzleMode::k128B) {
     // NOTE(yiakwy) : each thread of a 32 threads block, cooperatively load 128 bit (uint4/float4/halfx8) data from system memory to shared memory
@@ -221,25 +224,26 @@ __device__ __forceinline__ void produce_kv(smem_t<swizzle_mode> smem, uint32_t* 
     //              2+4*3
     //              3+4*3
     //
-    uint32_t kv_idx = kv_idx_base + warp_idx * 4 + lane_idx / 8;
+    uint32_t kv_idx = kv_idx_base + warp_idx_z * 4/*kv_frag_rows*/ + lane_idx / 8;
     // NOTE(Zihao): num_frags_z * 4 / num_warps_x = num_warps_z * num_frags_z * 4 / num_warps
     static_assert(num_frags_z * 4 % num_warps_x == 0);
+    
+    T* kv_base_r = *gptr;
+    uint32_t kv_offset_r = ( lane_idx % kv_frag_cols ) * channel_size_128b_kv + (lane_idx / kv_frag_cols ) * kv_stride_n;
 
     // NOTE (yiakwy) : for kv = (1/*head*/, 16/*seq*/, 64), at least 128 rows will be loaded
 #pragma unroll
-    for (uint32_t i = 0; i < num_frags_z * 4 / num_warps_x && ((warp_idx * 4 + lane_idx / 8 + i * 16) < kv_len); ++i) { // for (uint32_t i = 0; i < num_frags_z * 4 / num_warps_x; ++i) {
+    for (uint32_t i = 0; i < num_frags_z * 4 / num_warps_x && ((warp_idx_z * 4/*kv_frag_rows*/ + lane_idx / 8/*kv_frag_cols*/ + i * 16) < kv_len); ++i) { // for (uint32_t i = 0; i < num_frags_z * 4 / num_warps_x; ++i) {
 #pragma unroll
       for (uint32_t j = 0; j < num_frags_y / (8 / sizeof(T)); ++j) {
 
         // NOTE (yiakwy) : kvsmem[warp_idx * 4 + lane_idx / 8 + i * 16, lane_idx % 8 + j * 8] = kv[0, warp_idx * 4 + lane_idx / 8 + i * 16, lane_idx % 8 + j * 8]
-        smem.template load_128b_async<fill_mode>(*smem_offset, *gptr, kv_idx < kv_len);
+        smem.template load_128b_async<fill_mode>(*smem_offset, kv_base_r + kv_offset_r, kv_idx < kv_len);
 
-        T* kv_base_r = *gptr;
-        T* kv_ptr = kv_base_r + (/* warp_idx * 4 + lane_idx / 8 */ + i * 16) * kv_stride_n + /* lane_idx % 8 */ + j * 8;
-
-        b128_t* smem_ptr = smem.base + (/* warp_idx * 4 + lane_idx / 8 */ + i * 16) * 8 + /* lane_idx % 8 */ + j * 8;
+        T* kv_ptr = kv_base_r + kv_offset_r + (/* warp_idx * 4 + lane_idx / 8 */ + i * 16) * kv_stride_n + /* lane_idx % 8 */ + j * 8;
+        b128_t* smem_ptr = smem.base + *smem_offset + (/* warp_idx * 4 + lane_idx / 8 */ + i * 16) * 8/* 64=8x8 */ + /* lane_idx % 8 */ + j * 8;
         float16_t *s = reinterpret_cast<float16_t *>(smem_ptr);
-        printf("[produce_kv] (i=%d,j=%d,warp_idx=%d), kv_smem[%d, %d] (%f..%f) = kv[H=0, N_CTX=%d/%d, %d](%f..%f,%f)\n", i, j, warp_idx, warp_idx * 4 + lane_idx / 8 + i * 16, lane_idx % 8 + j * 8, (float)(*s), (float)(*(s+7)), warp_idx * 4 + lane_idx / 8 + i * 16, kv_len, lane_idx % 8 + j * 8, (float)(*kv_ptr), (float)(*(kv_ptr+6)), (float)(*(kv_ptr+7)));
+        printf("[produce_kv] (i=%d,j=%d,warp_idx=%d, x = %d, z = %d), kv_smem[%d, %d] (%f..%f) = kv[H=0, N_CTX=%d/%d, %d](%f..%f,%f)\n", i, j, warp_idx, threadIdx.x, threadIdx.z, warp_idx * 4 + lane_idx / 8 + i * 16, lane_idx % 8 + j * 8, (float)(*s), (float)(*(s+7)), warp_idx * 4 + lane_idx / 8 + i * 16, kv_len, lane_idx % 8 + j * 8, (float)(*kv_ptr), (float)(*(kv_ptr+6)), (float)(*(kv_ptr+7)));
 
         *smem_offset = smem.template advance_offset_by_column<8>(*smem_offset, j);
         *gptr += 8 * num_elems_per_128b<T>();
@@ -404,7 +408,10 @@ __device__ __forceinline__ void load_q_global_smem(uint32_t packed_offset,
         const uint32_t q_idx = q;
 
         // NOTE (yiakwy) : q_ptr = q[bz/*head*/, bx{0} * num_rows_per_cta{16} + warp_idx_x * num_frags_x * 16 + lane_idx / 8 + j * 4 /*seqlen*/, 0/*hdim*/] + (lane_idx % 8) * 8
+        /*
         DTypeQ* q_ptr = q_ptr_base + q * q_stride_n + r * q_stride_h;
+        */
+        DTypeQ* q_ptr = q_ptr_base + q * q_stride_n + r * q_stride_h + lane_idx % 8 * 8;
 
 #pragma unroll
         for (uint32_t fyo = 0; fyo < num_frags_y / 4; ++fyo) {
@@ -632,17 +639,21 @@ __device__ __forceinline__ void compute_qk(
   uint32_t b_frag[2];
 
   // hence 
-  // TODO (yiakwy) : what if we change blckDim.x from 32 to 64
-  uint32_t lane_id = threadIdx.x + threadIdx.z * blockDim.x;
+  // TODO (yiakwy) : z={0,1} is used for lane mappping, z={2,3} used for warps mapping what if we change blckDim.x from 32 to 64
+  uint32_t lane_id = ( threadIdx.x + threadIdx.z * blockDim.x ) % 64 ;
 
   uint32_t lane_id_x = lane_id % 16;
   uint32_t lane_id_y = lane_id / 16;
 
   // TODO (yiakwy) : replace these variables later
+  /*
   uint32_t warp_idx_x = get_warp_idx_x<1, 4>();
   uint32_t warp_idx_z = get_warp_idx_z<1, 4>();
   
   uint32_t warp_idx   = get_warp_idx<1, 4>();
+   */
+  uint32_t warp_idx_z = get_warp_idx_z<1, 4>();
+  uint32_t warp64_idx_z = warp_idx_z / 2;
 
   using float16_t = rocwmma::float16_t;
 
@@ -650,8 +661,7 @@ __device__ __forceinline__ void compute_qk(
   using floatx4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
   
   #define MTX_FRAG_LDA (head_dim)
-  // #define MTX_FRAG_LDB (head_dim)
-  #define MTX_FRAG_LDB (num_frags_z * 16)
+  #define MTX_FRAG_LDB (head_dim)
 
   #else
   
@@ -663,7 +673,8 @@ __device__ __forceinline__ void compute_qk(
   // compute q*k^T
   #ifdef USE_ROCM
 
-  if (lane_id < 64U) {
+  // if (lane_id < 64U) {
+  if (warp64_idx_z * num_frags_z * 16U < 16U/*kv_len*/ ) {
 
 #pragma unroll
   for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
@@ -673,7 +684,7 @@ __device__ __forceinline__ void compute_qk(
     for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 
       // NOTE (yiakwy) : q_smem has shape of (num_frags_x, 16, 8x8), v_mfma_m16n16k16_fp16 will be applied 4 times along feat dim
-      b128_t* smem_ptr = q_smem->base + (warp_idx_x * num_frags_x * 16) * channel_size_128b_q;
+      b128_t* smem_ptr = q_smem->base + *q_smem_offset_r;// (warp_idx_x * num_frags_x * 16) * channel_size_128b_q;
       float16_t *s = reinterpret_cast<float16_t *>(smem_ptr);
         
       float16x4 *a = reinterpret_cast<float16x4 *>(a_frag[fx]);
@@ -683,12 +694,11 @@ __device__ __forceinline__ void compute_qk(
       for (uint32_t j=0; j < 4; j++) {
         // NOTE (yiakwy) : 16 threads loads 4 columns (16x4fp16) of data cooperatively
         uint32_t offset = lane_id_x * MTX_FRAG_LDA + j + lane_id_y * 4;
-        s += offset;
 
-        (*a)[j] = *(s);
+        (*a)[j] = *(s + offset);
 
         if (fx == 0 && fy == 0) {
-        printf("[compute_qk] (x=%d, y=%d, j=%d) (fx=%d, fy=%d) a_mtx_frag[%d, %d]=%f\n", lane_id_x, lane_id_y, j, fx, fy, lane_id_x, j + lane_id_y * 4, (float)((*a)[j]));
+        printf("[compute_qk] (x=%d, y=%d, z=%d) (lane_id_x=%d, lane_id_y=%d, j=%d) (fx=%d, fy=%d) a_mtx_frag[%d, %d]=%f, *(s)=%f\n", threadIdx.x, threadIdx.y, threadIdx.z, lane_id_x, lane_id_y, j, fx, fy, lane_id_x, j + lane_id_y * 4, (float)((*a)[j]), (float)(*(s+offset)));
         }
       }
 
@@ -708,7 +718,7 @@ __device__ __forceinline__ void compute_qk(
         assert(0 && "KV Cache with FP8 data type is not supported in ROCM");
       }
 
-      b128_t* smem_ptr = k_smem->base + (warp_idx * 4) * channel_size_128b_q;
+      b128_t* smem_ptr = k_smem->base + *k_smem_offset_r;
       float16_t *s = reinterpret_cast<float16_t *>(smem_ptr);
 
       float16x4 *b = reinterpret_cast<float16x4 *>(b_frag);
@@ -717,13 +727,13 @@ __device__ __forceinline__ void compute_qk(
 #pragma unroll
       for (uint32_t j=0; j < 4; j++) {
         // NOTE (yiakwy) : loads 16 consecutive data of 1 row
-        s += lane_id_x + lane_id_y * MTX_FRAG_LDB * 4 + j * MTX_FRAG_LDB;
-        // s += lane_id_x * MTX_FRAG_LDB + j + lane_id_y * 4;
+        uint32_t offset = lane_id_x + (lane_id_y * 4 + j) * MTX_FRAG_LDB;
+        // uint32_t offset = lane_id_x * MTX_FRAG_LDB + j + lane_id_y * 4;
 
-        (*b)[j] = *s;
+        (*b)[j] = *(s+offset);
 
         if (fy == 0 && fz == 0) {
-        printf("[compute_qk] (x=%d, y=%d, j=%d) (fz=%d, fy=%d) b_mtx_frag[%d, %d]=%f\n", lane_id_x, lane_id_y, j, fz, fy, lane_id_y * 4 + j, lane_id_x, (float)((*b)[j]));
+        printf("[compute_qk] (x=%d, y=%d, z=%d) (lane_id_x=%d, lane_id_y=%d, j=%d) (fz=%d, fy=%d) b_mtx_frag[%d, %d]=%f\n", threadIdx.x, threadIdx.y, threadIdx.z, lane_id_x, lane_id_y, j, fz, fy, lane_id_y * 4 + j, lane_id_x, (float)((*b)[j]));
         }
       }
 
@@ -762,7 +772,8 @@ __device__ __forceinline__ void compute_qk(
     }
   }
 
-  } // if lane_id < 64
+  // } // if lane_id < 64
+  } // if warp64_idx_z * num_frags_z * 16 < kv_len
   #else
 
 #pragma unroll
@@ -1579,23 +1590,28 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
     DTypeKV* k_ptr =
         k + qkv_info.get_kv_elem_offset(
                 chunk_start + warp_idx * kv_frag_rows + 0/* nvgpu : (lane_idx / 8) */, kv_head_idx,
-                0/* nvgpu : (lane_idx % 8 ) * 8 */);
+                0/* nvgpu : (lane_idx % 8 ) * 8 */);    
     DTypeKV* v_ptr =
         v + qkv_info.get_kv_elem_offset(
                 chunk_start + warp_idx * kv_frag_rows + 0, kv_head_idx,
                 0);
-    // NOTE (yiakwy) : _w is used for storing (produce_kv) and _r is used for reading (compute_qk)
-    // NOTE (yiakwy) : We reuse NV GPU uint4 loading layout
+
+    // NOTE (yiakwy) : _w is used for storing (produce_kv) and _r is used for reading (compute_qk), (32x2, warp_idz)
+    // NOTE (yiakwy) : We reuse NV GPU uint4 loading layout for writing
+    uint32_t warp_idx_z = get_warp_idx_z<num_warps_x, num_warps_z>();
+    uint32_t warp64_idx_z = warp_idx_z / 2; /*(32, 1, 2) threads to form a warp*/
+
     uint32_t k_smem_offset_r = k_smem.template get_permuted_offset<channel_size_128b_kv>(
-                 get_warp_idx_z<num_warps_x, num_warps_z>() * num_frags_z * 16 +
-                     0/* nvgpu : (lane_idx / 16) * 8 + lane_idx % 8 */,
-                 0/* nvgpu : (lane_idx % 16) / 8) => {0, 1}*/),
+                 warp64_idx_z * num_frags_z * 16 +
+                     0/* nvgpu ldmatrix layout : (lane_idx / 16) * 8 + lane_idx % 8 */,
+                 0/* nvgpu ldmatrix layout : (lane_idx % 16) / 8) => {0, 1}*/),
              v_smem_offset_r = v_smem.template get_permuted_offset<channel_size_128b_kv>(
-                 get_warp_idx_z<num_warps_x, num_warps_z>() * num_frags_z * 16 + 0 /* nvgpu : lane_idx % 16 => {0..15} */,
-                 0/* nvgpu : lane_idx / 16 => {0, 1} */),
+                 warp64_idx_z * num_frags_z * 16 + 
+                     0 /* nvgpu ldmatrix layout : lane_idx % 16 => {0..15} */,
+                 0/* nvgpu ldmatrix layout : lane_idx / 16 => {0, 1} */),
              kv_smem_offset_w = k_smem.template get_permuted_offset<channel_size_128b_kv>(
                  warp_idx * kv_frag_rows + lane_idx / kv_frag_cols, lane_idx % kv_frag_cols);
-    
+
     #else
     DTypeKV* k_ptr =
         k + qkv_info.get_kv_elem_offset(
@@ -1606,11 +1622,11 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
                 chunk_start + warp_idx * kv_frag_rows + lane_idx / kv_frag_cols, kv_head_idx,
                 (lane_idx % kv_frag_cols) * num_elems_per_128b<DTypeKV>());
     uint32_t k_smem_offset_r = k_smem.template get_permuted_offset<channel_size_128b_kv>(
-                 get_warp_idx_z<num_warps_x, num_warps_z>() * num_frags_z * 16 +
+                get_warp_idx_z<num_warps_x, num_warps_z>() * num_frags_z * 16 +
                      8 * (lane_idx / 16) + lane_idx % 8,
                  (lane_idx % 16) / 8),
              v_smem_offset_r = v_smem.template get_permuted_offset<channel_size_128b_kv>(
-                 get_warp_idx_z<num_warps_x, num_warps_z>() * num_frags_z * 16 + lane_idx % 16,
+                get_warp_idx_z<num_warps_x, num_warps_z>() * num_frags_z * 16 + lane_idx % 16,
                  lane_idx / 16),
              kv_smem_offset_w = k_smem.template get_permuted_offset<channel_size_128b_kv>(
                  warp_idx * kv_frag_rows + lane_idx / kv_frag_cols, lane_idx % kv_frag_cols);
