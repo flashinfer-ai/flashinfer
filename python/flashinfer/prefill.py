@@ -770,7 +770,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
                 self._qk_indptr_buf = qk_indptr.to(self.device, non_blocking=True)
 
-        # TODO(Zihao): these are only required if qo_indptr or paged_kv_indptr are device tensors
+        # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
         qo_indptr_host = qo_indptr.to("cpu", non_blocking=True)
         paged_kv_indptr_host = paged_kv_indptr.to("cpu", non_blocking=True)
 
