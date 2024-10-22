@@ -29,9 +29,9 @@ import torch
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
 @pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
 @pytest.mark.parametrize("return_lse", [True, False])
-@pytest.mark.parametrize("q_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("q_dtype", [torch.float16])
 @pytest.mark.parametrize(
-    "kv_dtype", [torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2]
+    "kv_dtype", [torch.float16, torch.float8_e4m3fn, torch.float8_e5m2]
 )
 @pytest.mark.parametrize("contiguous_kv", [True, False])
 def test_batch_decode_with_paged_kv_cache(
@@ -92,7 +92,7 @@ def test_batch_decode_with_paged_kv_cache(
         page_size,
         logits_soft_cap=logits_soft_cap,
         pos_encoding_mode=pos_encoding_mode,
-        kv_data_type=kv_dtype,
+        data_type=kv_dtype,
         q_data_type=q_dtype,
     )
     if return_lse:
