@@ -43,7 +43,7 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
       int_workspace_buffer.size(0) * int_workspace_buffer.element_size();
   auto device = float_workspace_buffer.device();
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  indptr = indptr.to(torch::kCPU);
+  TORCH_CHECK(indptr.device() == torch::kCPU, "indptr must be on CPU");
 
   DecodePlanInfo plan_info;
 
@@ -150,8 +150,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
         paged_kv_t<DTypeKV, IdType> paged_kv(
             num_kv_heads, page_size, HEAD_DIM, batch_size, kv_layout,
             static_cast<DTypeKV*>(paged_k_cache.data_ptr()),
-            static_cast<DTypeKV*>(paged_v_cache.data_ptr()),
-            kv_cache_strides,
+            static_cast<DTypeKV*>(paged_v_cache.data_ptr()), kv_cache_strides,
             static_cast<IdType*>(paged_kv_indices.data_ptr()),
             static_cast<IdType*>(paged_kv_indptr.data_ptr()),
             static_cast<IdType*>(paged_kv_last_page_len.data_ptr()));

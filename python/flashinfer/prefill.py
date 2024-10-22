@@ -726,10 +726,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "The length of paged_kv_indices exceeds the allocated buffer size."
                 )
 
-            self._qo_indptr_buf.copy_(qo_indptr)
-            self._paged_kv_indptr_buf.copy_(paged_kv_indptr)
-            self._paged_kv_indices_buf[: len(paged_kv_indices)] = paged_kv_indices
-            self._paged_kv_last_page_len_buf.copy_(paged_kv_last_page_len)
+            self._qo_indptr_buf.copy_(qo_indptr, non_blocking=True)
+            self._paged_kv_indptr_buf.copy_(paged_kv_indptr, non_blocking=True)
+            self._paged_kv_indices_buf[: len(paged_kv_indices)].copy_(paged_kv_indices, non_blocking=True)
+            self._paged_kv_last_page_len_buf.copy_(paged_kv_last_page_len, non_blocking=True)
 
             if packed_custom_mask is not None:
                 if not torch.is_tensor(self._custom_mask_buf):
@@ -740,20 +740,21 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     raise ValueError(
                         "qk_indptr_buf must be initialized with a torch.Tensor in cuda graph mode if we use custom mask in attention computation."
                     )
-                self._custom_mask_buf[: len(packed_custom_mask)] = packed_custom_mask
+                self._custom_mask_buf[: len(packed_custom_mask)].copy_(packed_custom_mask, non_blocking=True)
                 # NOTE(Zihao): qk_indptr has the same length as qo_indptr
-                self._qk_indptr_buf.copy_(qk_indptr)
+                self._qk_indptr_buf.copy_(qk_indptr, non_blocking=True)
         else:
-            self._qo_indptr_buf = qo_indptr.to(self.device)
-            self._paged_kv_indptr_buf = paged_kv_indptr.to(self.device)
-            self._paged_kv_indices_buf = paged_kv_indices.to(self.device)
-            self._paged_kv_last_page_len_buf = paged_kv_last_page_len.to(self.device)
+            self._qo_indptr_buf = qo_indptr.to(self.device, non_blocking=True)
+            self._paged_kv_indptr_buf = paged_kv_indptr.to(self.device, non_blocking=True)
+            self._paged_kv_indices_buf = paged_kv_indices.to(self.device, non_blocking=True)
+            self._paged_kv_last_page_len_buf = paged_kv_last_page_len.to(self.device, non_blocking=True)
             if packed_custom_mask is not None:
-                self._custom_mask_buf = packed_custom_mask.to(self.device)
-                self._qk_indptr_buf = qk_indptr.to(self.device)
+                self._custom_mask_buf = packed_custom_mask.to(self.device, non_blocking=True)
+                self._qk_indptr_buf = qk_indptr.to(self.device, non_blocking=True)
 
-        qo_indptr = qo_indptr.to("cpu", non_blocking=True)
-        paged_kv_indptr = paged_kv_indptr.to("cpu", non_blocking=True)
+        # TODO(Zihao): these are only required if qo_indptr or paged_kv_indptr are device tensors
+        qo_indptr_host = qo_indptr.to("cpu", non_blocking=True)
+        paged_kv_indptr_host = paged_kv_indptr.to("cpu", non_blocking=True)
 
         if packed_custom_mask is not None:
             mask_mode = MaskMode.CUSTOM.value
@@ -781,8 +782,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._float_workspace_buffer,
             self._int_workspace_buffer,
             self._pin_memory_int_workspace_buffer,
-            qo_indptr,
-            paged_kv_indptr,
+            qo_indptr_host,
+            paged_kv_indptr_host,
             batch_size,
             num_qo_heads,
             num_kv_heads,

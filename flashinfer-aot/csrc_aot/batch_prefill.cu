@@ -51,8 +51,8 @@ std::vector<int64_t> BatchPrefillWithKVCachePlan(
 
   auto device = float_workspace_buffer.device();
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  qo_indptr = qo_indptr.to(torch::kCPU);
-  kv_indptr = kv_indptr.to(torch::kCPU);
+  TORCH_CHECK(qo_indptr.device() == torch::kCPU, "qo_indptr must be on CPU");
+  TORCH_CHECK(kv_indptr.device() == torch::kCPU, "kv_indptr must be on CPU");
 
   PrefillPlanInfo plan_info;
 
