@@ -57,7 +57,8 @@ def compile_single_prefill_module(
 ):
     uri, path = gen_single_prefill_cu(*args)
     return load_cuda_ops(
-        uri, [path],
+        uri,
+        [path],
         verbose=verbose,
     )
 
@@ -68,7 +69,8 @@ def compile_batch_prefill_module(
 ):
     uri, path = gen_batch_prefill_cu(*args)
     return load_cuda_ops(
-        uri, [path],
+        uri,
+        [path],
         verbose=verbose,
     )
 
@@ -125,6 +127,7 @@ def get_batch_prefill_module(*args):
             _batch_prefill_modules[args] = compile_batch_prefill_module(*args)
     return _batch_prefill_modules[args]
 
+
 def single_prefill_with_kv_cache_with_jit_module(
     jit_module: Any,
     q: torch.Tensor,
@@ -137,7 +140,8 @@ def single_prefill_with_kv_cache_with_jit_module(
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     tmp = _get_cache_buf("single_prefill_with_kv_cache_tmp", 32 * 1024 * 1024, q.device)
     out = jit_module.run(
-        q, k, v, tmp, TensorLayout[kv_layout].value, window_left, return_lse, *args)
+        q, k, v, tmp, TensorLayout[kv_layout].value, window_left, return_lse, *args
+    )
     return out if return_lse else out[0]
 
 
@@ -728,8 +732,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
             self._qo_indptr_buf.copy_(qo_indptr, non_blocking=True)
             self._paged_kv_indptr_buf.copy_(paged_kv_indptr, non_blocking=True)
-            self._paged_kv_indices_buf[: len(paged_kv_indices)].copy_(paged_kv_indices, non_blocking=True)
-            self._paged_kv_last_page_len_buf.copy_(paged_kv_last_page_len, non_blocking=True)
+            self._paged_kv_indices_buf[: len(paged_kv_indices)].copy_(
+                paged_kv_indices, non_blocking=True
+            )
+            self._paged_kv_last_page_len_buf.copy_(
+                paged_kv_last_page_len, non_blocking=True
+            )
 
             if packed_custom_mask is not None:
                 if not torch.is_tensor(self._custom_mask_buf):
@@ -740,16 +748,26 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     raise ValueError(
                         "qk_indptr_buf must be initialized with a torch.Tensor in cuda graph mode if we use custom mask in attention computation."
                     )
-                self._custom_mask_buf[: len(packed_custom_mask)].copy_(packed_custom_mask, non_blocking=True)
+                self._custom_mask_buf[: len(packed_custom_mask)].copy_(
+                    packed_custom_mask, non_blocking=True
+                )
                 # NOTE(Zihao): qk_indptr has the same length as qo_indptr
                 self._qk_indptr_buf.copy_(qk_indptr, non_blocking=True)
         else:
             self._qo_indptr_buf = qo_indptr.to(self.device, non_blocking=True)
-            self._paged_kv_indptr_buf = paged_kv_indptr.to(self.device, non_blocking=True)
-            self._paged_kv_indices_buf = paged_kv_indices.to(self.device, non_blocking=True)
-            self._paged_kv_last_page_len_buf = paged_kv_last_page_len.to(self.device, non_blocking=True)
+            self._paged_kv_indptr_buf = paged_kv_indptr.to(
+                self.device, non_blocking=True
+            )
+            self._paged_kv_indices_buf = paged_kv_indices.to(
+                self.device, non_blocking=True
+            )
+            self._paged_kv_last_page_len_buf = paged_kv_last_page_len.to(
+                self.device, non_blocking=True
+            )
             if packed_custom_mask is not None:
-                self._custom_mask_buf = packed_custom_mask.to(self.device, non_blocking=True)
+                self._custom_mask_buf = packed_custom_mask.to(
+                    self.device, non_blocking=True
+                )
                 self._qk_indptr_buf = qk_indptr.to(self.device, non_blocking=True)
 
         # TODO(Zihao): these are only required if qo_indptr or paged_kv_indptr are device tensors
