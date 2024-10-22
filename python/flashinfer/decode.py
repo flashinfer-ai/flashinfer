@@ -449,7 +449,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         if use_tensor_cores:
             if use_cuda_graph:
-                # NOTE(Zihao): once created, no need to update it in plan/run
+                # NOTE(Zihao): if once created, no need to update it in plan/run
                 self._qo_indptr_buf = torch.arange(
                     self._fixed_batch_size + 1,
                     dtype=torch.int32,
@@ -583,6 +583,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._paged_kv_last_page_len_buf = last_page_len.to(
                 self.device, non_blocking=True
             )
+            self._qo_indptr_buf = qo_indptr_host.to(self.device, non_blocking=True)
 
         indptr_host = indptr.to("cpu", non_blocking=True)
         if data_type is not None:
