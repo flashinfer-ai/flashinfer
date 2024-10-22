@@ -42,7 +42,7 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
       int_workspace_buffer.size(0) * int_workspace_buffer.element_size();
   auto device = float_workspace_buffer.device();
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  indptr = indptr.to(torch::kCPU);
+  TORCH_CHECK(indptr.device() == torch::kCPU, "indptr must be on CPU");
 
   DecodePlanInfo plan_info;
 

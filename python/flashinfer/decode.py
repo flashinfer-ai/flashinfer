@@ -53,7 +53,8 @@ def compile_single_decode_module(
 ):
     uri, path = gen_single_decode_cu(*args)
     return load_cuda_ops(
-        uri, [path],
+        uri,
+        [path],
         verbose=verbose,
     )
 
@@ -64,7 +65,8 @@ def compile_batch_decode_module(
 ):
     uri, path = gen_batch_decode_cu(*args)
     return load_cuda_ops(
-        uri, [path],
+        uri,
+        [path],
         verbose=verbose,
     )
 
@@ -114,6 +116,7 @@ def get_batch_decode_module(*args):
             _batch_decode_modules[args] = compile_batch_decode_module(*args)
     return _batch_decode_modules[args]
 
+
 def single_decode_with_kv_cache_with_jit_module(
     jit_module: Any,
     q: torch.Tensor,
@@ -123,8 +126,10 @@ def single_decode_with_kv_cache_with_jit_module(
     kv_layout: str = "NHD",
     window_left: int = -1,
 ):
-    tmp = _get_cache_buf("single_decode_with_kv_cache_tmp", 32 * 1024 * 1024, q.device)    
-    return jit_module.run(q, k, v, tmp, TensorLayout[kv_layout].value, window_left, *args)
+    tmp = _get_cache_buf("single_decode_with_kv_cache_tmp", 32 * 1024 * 1024, q.device)
+    return jit_module.run(
+        q, k, v, tmp, TensorLayout[kv_layout].value, window_left, *args
+    )
 
 
 def single_decode_with_kv_cache(
@@ -444,6 +449,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         if use_tensor_cores:
             if use_cuda_graph:
+                # NOTE(Zihao): if once created, no need to update it in plan/run
                 self._qo_indptr_buf = torch.arange(
                     self._fixed_batch_size + 1,
                     dtype=torch.int32,
@@ -555,8 +561,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
 
-        qo_indptr = _get_range_buf(batch_size + 1, indptr.device)
-
+        qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
         if self.is_cuda_graph_enabled:
             if batch_size != self._fixed_batch_size:
                 raise ValueError(
@@ -569,21 +574,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 raise ValueError(
                     "The size of indices should be less than or equal to the allocated buffer"
                 )
-            self._paged_kv_indptr_buf.copy_(indptr)
-            self._paged_kv_indices_buf[: len(indices)] = indices
-            self._paged_kv_last_page_len_buf.copy_(last_page_len)
-            if self.use_tensor_cores:
-                self._qo_indptr_buf.copy_(qo_indptr)
+            self._paged_kv_indptr_buf.copy_(indptr, non_blocking=True)
+            self._paged_kv_indices_buf[: len(indices)].copy_(indices, non_blocking=True)
+            self._paged_kv_last_page_len_buf.copy_(last_page_len, non_blocking=True)
         else:
-            self._paged_kv_indptr_buf = indptr.to(self.device)
-            self._paged_kv_indices_buf = indices.to(self.device)
-            self._paged_kv_last_page_len_buf = last_page_len.to(self.device)
-            if self.use_tensor_cores:
-                self._qo_indptr_buf = qo_indptr.to(self.device)
+            self._paged_kv_indptr_buf = indptr.to(self.device, non_blocking=True)
+            self._paged_kv_indices_buf = indices.to(self.device, non_blocking=True)
+            self._paged_kv_last_page_len_buf = last_page_len.to(
+                self.device, non_blocking=True
+            )
+            self._qo_indptr_buf = qo_indptr_host.to(self.device, non_blocking=True)
 
-        qo_indptr = qo_indptr.to("cpu", non_blocking=True)
-        indptr = indptr.to("cpu", non_blocking=True)
-
+        indptr_host = indptr.to("cpu", non_blocking=True)
         if data_type is not None:
             q_data_type = data_type
             kv_data_type = data_type
@@ -612,8 +614,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._pin_memory_int_workspace_buffer,
-                qo_indptr,
-                indptr,
+                qo_indptr_host,
+                indptr_host,
                 batch_size,
                 num_qo_heads,
                 num_kv_heads,
@@ -635,7 +637,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._pin_memory_int_workspace_buffer,
-                indptr,
+                indptr_host,
                 batch_size,
                 num_qo_heads,
                 num_kv_heads,

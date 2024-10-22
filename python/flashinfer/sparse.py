@@ -257,7 +257,7 @@ class BlockSparseAttentionWrapper:
         num_blocks_row = len(indptr) - 1
         qo_indptr_host = R * torch.arange(num_blocks_row + 1, dtype=torch.int32)
         qo_indptr_host[-1] = M
-        qo_indptr = qo_indptr_host.to(indptr.device)
+        qo_indptr = qo_indptr_host.to(indptr.device, non_blocking=True)
         if indices.max().item() * C > N:
             raise ValueError("indices out of bound")
         last_block_len = torch.full(
@@ -279,13 +279,13 @@ class BlockSparseAttentionWrapper:
                 mask.contiguous().view(-1), qk_indptr, bitorder="little"
             )
 
-        self._qo_indptr = qo_indptr.to(self.device)
-        self._paged_kv_indptr_buf = indptr.to(self.device)
-        self._paged_kv_indices_buf = indices.to(self.device)
-        self._paged_kv_last_page_len = last_block_len.to(self.device)
+        self._qo_indptr = qo_indptr.to(self.device, non_blocking=True)
+        self._paged_kv_indptr_buf = indptr.to(self.device, non_blocking=True)
+        self._paged_kv_indices_buf = indices.to(self.device, non_blocking=True)
+        self._paged_kv_last_page_len = last_block_len.to(self.device, non_blocking=True)
         if packed_mask is not None:
-            self._packed_mask_buf = packed_mask.to(self.device)
-            self._qk_indptr_buf = qk_indptr.to(self.device)
+            self._packed_mask_buf = packed_mask.to(self.device, non_blocking=True)
+            self._qk_indptr_buf = qk_indptr.to(self.device, non_blocking=True)
             mask_mode = MaskMode.CUSTOM.value
         else:
             self._packed_mask_buf = None
