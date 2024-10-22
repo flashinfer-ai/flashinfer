@@ -240,8 +240,8 @@ def single_decode_with_kv_cache(
                 k.dtype,
                 q.dtype,
                 head_dim,
-                MaskMode.NON_CAUSAL.value,
                 PosEncodingMode[pos_encoding_mode].value,
+                MaskMode.NON_CAUSAL.value,
                 window_left != -1,  # use_sliding_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 False,  # allow_fp16_qk_reduction
