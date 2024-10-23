@@ -212,7 +212,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA(
     constexpr uint32_t bdx = HEAD_DIM_CKV / vec_size_ckv;
     constexpr uint32_t vec_size_kpe = HEAD_DIM_KPE / bdx;
 
-    constexpr uint32_t bdy = 4;
+    constexpr uint32_t bdy = 8;
     constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
     constexpr uint32_t bdz = num_threads / (bdx * bdy);
     if (num_qo_heads % bdy != 0) {
@@ -224,7 +224,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA(
     gdy = ceil_div(num_qo_heads, bdy);
 
     const uint32_t smem_size =
-        1 * NUM_STAGES_SMEM * bdy * bdz * (HEAD_DIM_CKV + HEAD_DIM_KPE) * sizeof(DTypeKV) +
+        NUM_STAGES_SMEM * bdy * bdz * (HEAD_DIM_CKV + HEAD_DIM_KPE) * sizeof(DTypeKV) +
         std::max(num_threads * sizeof(size_t) * 2,
                   2 * bdy * bdz * sizeof(float));
 
@@ -265,11 +265,6 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA(
       }
     }
 
-    std::cout<<"BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA: vec_size_ckv="<<vec_size_ckv<<" vec_size_kpe="<<vec_size_kpe
-      <<" bdx="<<bdx<<" bdy="<<bdy<<" bdz="<<bdz
-      <<"\nsmem_size="<<smem_size<<" num_blocks_per_sm="<<num_blocks_per_sm
-      <<"\nbatch_size="<<batch_size<<" new_batch_size="<<new_batch_size<<" max_num_pages_per_batch="<<max_num_pages_per_batch<<"\n\n";
-    
     return cudaSuccess;
   });
 }
