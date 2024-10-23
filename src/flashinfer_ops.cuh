@@ -34,12 +34,12 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(typename AttentionVariant::Par
 
 class BatchDecodeHandler {
  public:
-  template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV,
+  template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename DTypeQ, typename DTypeKV,
             typename DTypeO, typename IdType>
   cudaError_t PlanDispatched(void* float_buffer, size_t float_workspace_size_in_bytes,
                              void* int_buffer, size_t int_workspace_size_in_bytes, IdType* indptr_h,
                              IdType* last_page_len_h, uint32_t batch_size, uint32_t num_qo_heads,
-                             uint32_t num_kv_heads, uint32_t page_size) {
+                             uint32_t page_size) {
     int_buffer_ = int_buffer;
     float_buffer_ = float_buffer;
     using ParamsT = BatchDecodeParams<DTypeQ, DTypeKV, DTypeO, IdType>;
@@ -47,10 +47,14 @@ class BatchDecodeHandler {
         ComposedAttention<ParamsT,
                           get_variant_code(/*use_custom_mask=*/false, /*use_sliding_window=*/true,
                                            /*use_logits_soft_cap=*/false, /*use_alibi=*/false)>;
+    
+    auto work_estimation_func =
+        BatchDecodeWithPagedKVCacheWorkEstimationDispatched<GROUP_SIZE, HEAD_DIM, POS_ENCODING_MODE,
+                                                            AttentionVariant>;
     return DecodePlan<HEAD_DIM, POS_ENCODING_MODE, AttentionVariant>(
         float_buffer, float_workspace_size_in_bytes, int_buffer, page_locked_buffer_,
-        int_workspace_size_in_bytes, plan_info_, indptr_h, batch_size, num_qo_heads, num_kv_heads,
-        page_size, cuda_graph_enabled_, stream_);
+        int_workspace_size_in_bytes, plan_info_, indptr_h, batch_size, num_qo_heads,
+        page_size, cuda_graph_enabled_, stream_, work_estimation_func);
   }
 
   void UpdatePageLockedBufferSize(size_t int_workspace_size_in_bytes) {
@@ -557,9 +561,11 @@ cudaError_t BatchDecodeHandlerPlan(BatchDecodeHandler* handler, void* float_buff
   }
   DISPATCH_head_dim(head_dim, HEAD_DIM, {
     DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
-      return handler->PlanDispatched<HEAD_DIM, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO, IdType>(
-          float_buffer, float_workspace_size_in_bytes, int_buffer, int_workspace_size_in_bytes,
-          indptr_h, last_page_len_h, batch_size, num_qo_heads, num_kv_heads, page_size);
+      DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
+        return handler->PlanDispatched<GROUP_SIZE, HEAD_DIM, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO, IdType>(
+            float_buffer, float_workspace_size_in_bytes, int_buffer, int_workspace_size_in_bytes,
+            indptr_h, last_page_len_h, batch_size, num_qo_heads, page_size);
+      });
     });
   });
 }
