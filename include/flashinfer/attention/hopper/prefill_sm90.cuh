@@ -15,10 +15,9 @@
 #include "cutlass/cluster_launch.hpp"
 #include "cutlass/pipeline/pipeline.hpp"
 #include "epilogue.cuh"
-#include "params.cuh"
 #include "kernel_traits.cuh"
 #include "mainloop.cuh"
-#include "seq_len.cuh"
+#include "params.cuh"
 #include "softmax.cuh"
 #include "tile_scheduler.cuh"
 #include "utils.cuh"
@@ -27,14 +26,13 @@ namespace flashinfer {
 
 using namespace cute;
 
-template <typename Ktraits, bool Is_causal, typename TileScheduler, typename Seqlen_traits>
-__global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 1) compute_attn_ws(
-    CUTE_GRID_CONSTANT
-    typename CollectiveMainloopFwd<Ktraits, Is_causal, Seqlen_traits>::Params const mainloop_params,
-    CUTE_GRID_CONSTANT
-    typename CollectiveEpilogueFwd<Ktraits, Seqlen_traits>::Params const epilogue_params,
-    CUTE_GRID_CONSTANT typename TileScheduler::Params const scheduler_params,
-    Seqlen_traits seqlen_traits_q, Seqlen_traits seqlen_traits_k) {
+template <typename Ktraits, bool CAUSAL, typename TileScheduler>
+__global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 1)
+    SinglePrefillWithKVCacheKernel(
+        CUTE_GRID_CONSTANT
+        typename CollectiveMainloop<Ktraits, CAUSAL>::Params const mainloop_params,
+        CUTE_GRID_CONSTANT typename CollectiveEpilogue<Ktraits>::Params const epilogue_params,
+        CUTE_GRID_CONSTANT typename TileScheduler::Params const scheduler_params) {
   using Element = typename Ktraits::Element;
   using ElementAccum = typename Ktraits::ElementAccum;
   using SoftType = ElementAccum;
@@ -46,12 +44,10 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
 
   static constexpr int NumMmaThreads = size(typename Ktraits::TiledMma0{});
   static constexpr int NumCopyThreads = !Is_WS ? 0 : cutlass::NumThreadsPerWarpGroup;
-  static constexpr int kBlockM = Ktraits::kBlockM;
-  // static constexpr int kBlockN = Ktraits::kBlockN;
-  // constexpr int kHeadDim = Ktraits::kHeadDim;
+  static constexpr int CTA_Q = Ktraits::CTA_Q;
 
-  using CollectiveMainloop = CollectiveMainloopFwd<Ktraits, Is_causal, Seqlen_traits>;
-  using CollectiveEpilogue = CollectiveEpilogueFwd<Ktraits, Seqlen_traits>;
+  using CollectiveMainloop = CollectiveMainloop<Ktraits, CAUSAL>;
+  using CollectiveEpilogue = CollectiveEpilogue<Ktraits>;
 
   using MainloopPipeline = typename Ktraits::MainloopPipeline;
   using PipelineParams = typename MainloopPipeline::Params;
@@ -111,30 +107,27 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
 
       int work_idx = 0;
 
-      TileScheduler scheduler(&shared_storage.tile_count_semaphore);
+      TileScheduler scheduler;
       for (auto work_tile_info = scheduler.get_initial_work();
            work_tile_info.is_valid(scheduler_params);
            work_tile_info = scheduler.template get_next_work</*IsProducer=*/true>(scheduler_params,
                                                                                   work_tile_info)) {
         auto block_coord = work_tile_info.get_block_coord(scheduler_params);
-        auto [m_block, bidh, bidb] = block_coord;
+        auto [q_block, head_idx, batch_idx] = block_coord;
 
-        seqlen_traits_q.init(bidb);
-        seqlen_traits_k.init(bidb);
-        if (m_block * kBlockM >= seqlen_traits_q.actual_seq_len) {
+        if (q_block * CTA_Q >= qo_len) {
           continue;
         }
-        int n_block_max = collective_mainloop.get_n_block_max(mainloop_params, m_block,
-                                                              seqlen_traits_q, seqlen_traits_k);
-        if ((Is_causal || seqlen_traits_k.kUseVarSeqLen) && n_block_max <= 0) {
+        int kv_tile_max =
+            collective_mainloop.get_num_kv_tiles(mainloop_params, q_block, qo_len, kv_len);
+        if (kv_tile_max <= 0) {
           scheduler.prefetch_next_work(scheduler_params, work_tile_info);
           scheduler.broadcast_next_work(work_tile_info);
           continue;
         }
         collective_mainloop.load(mainloop_params, pipeline_k, pipeline_v, smem_pipe_write_k,
                                  smem_pipe_write_v, shared_storage, scheduler, scheduler_params,
-                                 work_tile_info, block_coord, work_idx, seqlen_traits_q,
-                                 seqlen_traits_k);
+                                 work_tile_info, block_coord, work_idx, qo_len, kv_len);
         ++work_idx;
       }
       collective_mainloop.load_tail(pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v);
@@ -143,7 +136,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
     cutlass::arch::warpgroup_reg_alloc<Ktraits::kNWarps == 12 ? 240 : 160>();
     // cutlass::arch::warpgroup_reg_alloc<Ktraits::kNWarps == 12 ? 224 : 160>();
 
-    TileScheduler scheduler(&shared_storage.tile_count_semaphore);
+    TileScheduler scheduler;
     // Initialize matmul objects.
     typename Ktraits::TiledMma1 tiled_mma1;
 
@@ -162,33 +155,31 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
                                                                                  work_tile_info)) {
       // Attention output (GEMM-II) accumulator.
       Tensor tOrO = partition_fragment_C(tiled_mma1, select<0, 2>(TileShape_MNK{}));
-      Softmax<2 * (2 * kBlockM / NumMmaThreads)> softmax(mainloop_params.softmax_scale_log2);
+      Softmax<2 * (2 * CTA_Q / NumMmaThreads)> softmax(mainloop_params.sm_scale_log2);
 
       auto block_coord = work_tile_info.get_block_coord(scheduler_params);
-      auto [m_block, bidh, bidb] = block_coord;
+      auto [q_block, head_idx] = block_coord;
 
-      seqlen_traits_q.init(bidb);
-      seqlen_traits_k.init(bidb);
-      if (m_block * kBlockM >= seqlen_traits_q.actual_seq_len) {
+      // TODO(Zihao): get qo_len and kv_len here
+      if (q_block * CTA_Q >= qo_len) {
         continue;
       }
-      int n_block_max = collective_mainloop.get_n_block_max(mainloop_params, m_block,
-                                                            seqlen_traits_q, seqlen_traits_k);
-      if ((Is_causal || seqlen_traits_k.kUseVarSeqLen) &&
-          n_block_max <= 0) {  // We exit early and write 0 to gO and -inf to gLSE.
+      int kv_tile_max =
+          collective_mainloop.get_num_kv_tiles(mainloop_params, q_block, qo_len, kv_len);
+      if (kv_tile_max <= 0) {  // We exit early and write 0 to gO and -inf to gLSE.
         collective_epilogue.store_zero(epilogue_params, shared_storage,
-                                       threadIdx.x - NumCopyThreads, block_coord, seqlen_traits_q);
+                                       threadIdx.x - NumCopyThreads, block_coord, qo_len);
         continue;
       }
 
       collective_mainloop.mma(mainloop_params, pipeline_k, pipeline_v, smem_pipe_read_k,
-                              smem_pipe_read_v, tOrO, softmax, n_block_max,
-                              threadIdx.x - NumCopyThreads, work_idx, m_block, shared_storage,
-                              seqlen_traits_q, seqlen_traits_k);
-      // tOrO, softmax, n_block_max, threadIdx.x - NumCopyThreads + (work_idx >> 30), work_idx,
+                              smem_pipe_read_v, tOrO, softmax, kv_tile_max,
+                              threadIdx.x - NumCopyThreads, work_idx, q_block, shared_storage,
+                              qo_len, kv_len);
+      // tOrO, softmax, kv_tile_max, threadIdx.x - NumCopyThreads + (work_idx >> 30), work_idx,
       // shared_storage);
       collective_epilogue.store(epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
-                                threadIdx.x - NumCopyThreads, block_coord, seqlen_traits_q);
+                                threadIdx.x - NumCopyThreads, block_coord, qo_len);
 
       ++work_idx;
     }
@@ -221,80 +212,47 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
     }                                       \
   }()
 
-#define SEQLEN_SWITCH(USE_VAR_SEQ_LEN, NAME, ...) \
-  [&] {                                           \
-    bool useSeqLen = USE_VAR_SEQ_LEN;             \
-    if (useSeqLen) {                              \
-      using NAME = VarSeqLenTraits;        \
-      return __VA_ARGS__();                       \
-    } else {                                      \
-      using NAME = FixedSeqLenTraits;      \
-      return __VA_ARGS__();                       \
-    }                                             \
-  }()
+template <typename KernelTraits, bool CAUSAL>
+void SinglePrefillWithKVCacheDispatched(
+    SinglePrefillParams<typename KernelTraits::Element, typename KernelTraits::Element,
+                        typename KernelTraits::Element>& params,
+    cudaStream_t stream) {
+  using Element = typename KernelTraits::Element;
+  using OutputType = typename KernelTraits::OutputType;
+  using TileShape_MNK = typename KernelTraits::TileShape_MNK;
+  using ClusterShape = typename KernelTraits::ClusterShape_MNK;
 
-template <typename Kernel_traits, bool Is_causal, typename Seqlen_traits>
-void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
-  using Element = typename Kernel_traits::Element;
-  using OutputType = typename Kernel_traits::OutputType;
-  using TileShape_MNK = typename Kernel_traits::TileShape_MNK;
-  using ClusterShape = typename Kernel_traits::ClusterShape_MNK;
-
-  using CollectiveMainloop = CollectiveMainloopFwd<Kernel_traits, Is_causal, Seqlen_traits>;
-  using CollectiveEpilogue = CollectiveEpilogueFwd<Kernel_traits, Seqlen_traits>;
-  using Scheduler = std::conditional_t<
-      Seqlen_traits::kUseVarSeqLen, SingleTileScheduler,
-      std::conditional_t<!Is_causal, StaticPersistentTileScheduler,
-                         DynamicPersistentTileScheduler<Kernel_traits::kNThreads -
-                                                                   cutlass::NumThreadsPerWarpGroup,
-                                                               Kernel_traits::NumProducerThreads>>>;
-  Seqlen_traits seqlen_traits_q(params.total_q, params.seqlen_q, params.cu_seqlens_q);
-  Seqlen_traits seqlen_traits_k(params.total_k, params.seqlen_k, params.cu_seqlens_k,
-                                params.seqused_k);
+  using CollectiveMainloop = CollectiveMainloop<KernelTraits, CAUSAL>;
+  using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
+  using Scheduler = SingleTileScheduler;
   typename CollectiveMainloop::Params mainloop_params = CollectiveMainloop::to_underlying_arguments(
       {static_cast<Element const*>(params.q_ptr),
-       seqlen_traits_q.get_gmem_layout(params.seqlen_q, params.d, params.h, params.b,
-                                       params.q_row_stride, params.q_head_stride,
-                                       params.q_batch_stride),  // layout_Q
+       get_gmem_layout(params.total_q, params.num_qo_heads, params.head_dim, params.q_stride_n,
+                       params.q_stride_h),  // layout_Q
        static_cast<Element const*>(params.k_ptr),
-       seqlen_traits_k.get_gmem_layout(params.seqlen_k, params.d, params.h_k, params.b,
-                                       params.k_row_stride, params.k_head_stride,
-                                       params.k_batch_stride),  // layout_K
+       get_gmem_layout(params.total_k, params.num_kv_heads, params.head_dim, params.k_stride_n,
+                       params.k_stride_h),  // layout_K
        static_cast<Element const*>(params.v_ptr),
-       seqlen_traits_k.get_gmem_layout(params.seqlen_k, params.d, params.h_k, params.b,
-                                       params.v_row_stride, params.v_head_stride,
-                                       params.v_batch_stride),  // layout_V
-       params.scale_softmax_log2, params.descale_q_ptr, params.descale_k_ptr,
-       params.descale_v_ptr});
+       get_gmem_layout(params.total_k, params.num_kv_heads, params.head_dim, params.v_stride_n,
+                       params.v_stride_h),  // layout_V
+       params.sm_scale_log2});
   typename CollectiveEpilogue::Params epilogue_params =
       CollectiveEpilogue::to_underlying_arguments({
           static_cast<OutputType*>(params.o_ptr),
-          seqlen_traits_q.get_gmem_layout(params.seqlen_q, params.d, params.h, params.b,
-                                          params.o_row_stride, params.o_head_stride,
-                                          params.o_batch_stride),  // layout_O
-          static_cast<float*>(params.softmax_lse_ptr),
-          seqlen_traits_q.get_lse_gmem_layout(params.seqlen_q, params.h,
-                                              params.b)  // layout_LSE
+          get_gmem_layout(params.total_q, params.num_qo_heads, params.head_dim, params.o_stride_n,
+                          params.o_stride_h),  // layout_O
+          static_cast<float*>(params.lse_ptr),
+          get_lse_gmem_layout(params.total_q, params.num_qo_heads),  // layout_LSE
       });
 
-  int num_blocks_m = cutlass::ceil_div(params.seqlen_q, Kernel_traits::kBlockM);
-  num_blocks_m = cutlass::ceil_div(num_blocks_m, size<0>(ClusterShape{})) * size<0>(ClusterShape{});
-  typename Scheduler::Arguments scheduler_args = {num_blocks_m, params.h, params.b,
-                                                  params.tile_count_semaphore};
+  int num_blocks_q = cutlass::ceil_div(params.qo_len, KernelTraits::CTA_Q);
+  num_blocks_q = cutlass::ceil_div(num_blocks_q, size<0>(ClusterShape{})) * size<0>(ClusterShape{});
+  typename Scheduler::Arguments scheduler_args = {num_blocks_q, params.head_dim};
   typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
 
   // Get the ptr to kernel function.
-  void* kernel;
-  kernel = (void*)compute_attn_ws<Kernel_traits, Is_causal, Scheduler, Seqlen_traits>;
-  int smem_size = sizeof(typename Kernel_traits::SharedStorage);
-  // int smem_size_q = sizeof(decltype((typename
-  // Kernel_traits::SharedStorage{}).smem_q)); int smem_size_k =
-  // sizeof(decltype((typename Kernel_traits::SharedStorage{}).smem_k)); int
-  // smem_size_v = sizeof(decltype((typename
-  // Kernel_traits::SharedStorage{}).smem_v)); int smem_size_o =
-  // sizeof(decltype((typename Kernel_traits::SharedStorage{}).smem_o));
-  // printf("smem_size = %d, q = %d, k = %d, v = %d, o = %d.\n", smem_size,
-  // smem_size_q, smem_size_k, smem_size_v, smem_size_o);
+  auto kernel = (void*)SinglePrefillWithKVCacheKernel<KernelTraits, CAUSAL, Scheduler>;
+  int smem_size = sizeof(typename KernelTraits::SharedStorage);
   CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
   int device;
@@ -302,50 +260,41 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
   int multiprocessor_count;
   CHECK_CUDA(cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
   dim3 grid_dims = Scheduler::get_grid_dim(scheduler_args, multiprocessor_count);
-  static constexpr int ctaSize = Kernel_traits::kNWarps * 32;
+  static constexpr int ctaSize = KernelTraits::kNWarps * 32;
   dim3 block_dims(ctaSize);
   dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}), size<2>(ClusterShape{}));
   cutlass::ClusterLaunchParams launch_params{grid_dims, block_dims, cluster_dims, smem_size,
                                              stream};
   cutlass::launch_kernel_on_cluster(launch_params, kernel, mainloop_params, epilogue_params,
-                                    scheduler_params, seqlen_traits_q, seqlen_traits_k);
+                                    scheduler_params);
   CHECK_CUDA_KERNEL_LAUNCH();
 }
 
 template <typename T>
 void run_mha_fwd_hdim64(Flash_fwd_params& params, cudaStream_t stream) {
   constexpr static int Headdim = 64;
-  BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-    SEQLEN_SWITCH(params.cu_seqlens_q, Seqlen_traits, [&] {
-      run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 192, 128, 16, 2, false, /*use_cluster=*/1, T>,
-                    Is_causal, Seqlen_traits>(params, stream);
-    });
+  BOOL_SWITCH(params.causal, CAUSAL, [&] {
+    run_flash_fwd<AttentionKernelTraits<Headdim, 192, 128, 16, 2, false, /*use_cluster=*/1, T>,
+                  CAUSAL>(params, stream);
   });
 }
 
 template <typename T>
 void run_mha_fwd_hdim128(Flash_fwd_params& params, cudaStream_t stream) {
   constexpr static int Headdim = 128;
-  BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-    SEQLEN_SWITCH(params.cu_seqlens_q, Seqlen_traits, [&] {
-      // Only use Cluster if number of tiles along seqlen_q is even and not
-      // NOTE(Zihao): use 128x192 achieves better performance than 128x128 for non-causal
-      run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 192, 12,  // 128 : 192, 12,
-                                            2, false, /*use_cluster=*/1, T>,
-                    Is_causal, Seqlen_traits>(params, stream);
-    });
+  BOOL_SWITCH(params.causal, CAUSAL, [&] {
+    // NOTE(Zihao): use 128x192 achieves better performance than 128x128 for non-causal
+    run_flash_fwd<AttentionKernelTraits<Headdim, 128, 192, 12, 2, false, /*use_cluster=*/1, T>,
+                  CAUSAL>(params, stream);
   });
 }
 
 template <typename T>
 void run_mha_fwd_hdim256(Flash_fwd_params& params, cudaStream_t stream) {
   constexpr static int Headdim = 256;
-  BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-    SEQLEN_SWITCH(params.cu_seqlens_q, Seqlen_traits, [&] {
-      // Only use Cluster if number of tiles along seqlen_q is even
-      run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 80, 12, 2, false, /*use_cluster=*/1, T>,
-                    Is_causal, Seqlen_traits>(params, stream);
-    });
+  BOOL_SWITCH(params.causal, CAUSAL, [&] {
+    run_flash_fwd<AttentionKernelTraits<Headdim, 128, 80, 12, 2, false, /*use_cluster=*/1, T>,
+                  CAUSAL>(params, stream);
   });
 }
 

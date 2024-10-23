@@ -37,7 +37,37 @@ namespace flashinfer {
 
 using namespace cute;
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
+CUTLASS_HOST_DEVICE auto get_gmem_layout(int nnz, int num_heads, int head_dim, int64_t n_stride,
+                                         int64_t h_stride) const {
+  return make_layout(make_shape(nnz, head_dim, num_heads),
+                     make_stride(n_stride, cute::_1{}, h_stride));
+}
+
+CUTLASS_HOST_DEVICE auto get_lse_gmem_layout(int nnz, int num_heads) const {
+  return make_layout(make_shape(num_heads, nnz), make_stride(int64_t(nnz), cute::_1()));
+}
+
+template <typename MTensor, typename Shape>
+CUTLASS_DEVICE auto get_local_tile_tensor(const MTensor& m_tensor, const Shape& tile_shape,
+                                          int offset, int seq_len, int head_idx) const {
+  auto g_offset = local_tile(m_tensor(_, _, head_idx), cute::make_shape(1, get<1>(tile_shape)),
+                             make_coord(offset, _0{}));
+  auto g_sequence =
+      make_tensor(g_offset.data(),
+                  make_layout(cute::make_shape(seq_len, get<1>(tile_shape)), g_offset.stride()));
+  auto g_tensor = local_tile(g_sequence, tile_shape, make_coord(_, _0{}));
+  return g_tensor;
+}
+
+template <typename MTensor, typename Shape>
+CUTLASS_DEVICE auto get_lse_local_tile_tensor(const MTensor& m_tensor, const Shape& tile_shape,
+                                              int offset, int seq_len, int head_idx) const {
+  auto g_offset = local_tile(m_tensor(head_idx, _), cute::make_shape(_1{}), make_coord(offset));
+  auto g_sequence =
+      make_tensor(g_offset.data(), make_layout(cute::make_shape(seq_len), cute::make_shape(_1{})));
+  auto g_tensor = local_tile(g_sequence, tile_shape, make_coord(_));
+  return g_tensor;
+}
 
 template <typename T>
 struct MaxOp {
@@ -50,14 +80,10 @@ struct MaxOp<float> {
   __device__ __forceinline__ float operator()(float const& x, float const& y) { return max(x, y); }
 };
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
 template <typename T>
 struct SumOp {
   __device__ __forceinline__ T operator()(T const& x, T const& y) { return x + y; }
 };
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int THREADS>
 struct Allreduce {
@@ -70,8 +96,6 @@ struct Allreduce {
   }
 };
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
 template <>
 struct Allreduce<2> {
   template <typename T, typename Operator>
@@ -81,104 +105,31 @@ struct Allreduce<2> {
   }
 };
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// For SM80, convert acc_layout from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
 // For SM90, convert acc_layout from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V,
 // MMA_N))
 template <typename Layout>
 __forceinline__ __device__ auto convert_layout_acc_rowcol(Layout acc_layout) {
-  if constexpr (decltype(rank<0>(acc_layout))::value == 3) {  // SM90
-    static_assert(decltype(size<0, 0>(acc_layout))::value == 2);
-    static_assert(decltype(size<0, 1>(acc_layout))::value == 2);
-    static_assert(decltype(rank(acc_layout))::value == 3);
-    auto l = acc_layout;
-    return make_layout(make_layout(get<0, 1>(l), get<1>(l)),
-                       make_layout(get<0, 0>(l), get<0, 2>(l), get<2>(l)));
-  } else {  // SM80
-    static_assert(decltype(size<0>(acc_layout))::value == 4);
-    static_assert(decltype(rank(acc_layout))::value == 3);
-    auto l = logical_divide(acc_layout, Shape<_2>{});  // ((2, 2), MMA_M, MMA_N)
-    return make_layout(make_layout(get<0, 1>(l), get<1>(l)), make_layout(get<0, 0>(l), get<2>(l)));
-  }
-};
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// For SM90, convert acc_layout from ((2, 2, V), MMA_N, MMA_M) to (nrow=(2, V, MMA_M), ncol=(2,
-// MMA_N))
-template <typename Layout>
-__forceinline__ __device__ auto convert_layout_acc_transposed_rowcol(Layout acc_layout) {
   static_assert(decltype(size<0, 0>(acc_layout))::value == 2);
   static_assert(decltype(size<0, 1>(acc_layout))::value == 2);
   static_assert(decltype(rank(acc_layout))::value == 3);
   auto l = acc_layout;
-  return make_layout(make_layout(get<0, 0>(l), get<0, 2>(l), get<2>(l)),
-                     make_layout(get<0, 1>(l), get<1>(l)));
+  return make_layout(make_layout(get<0, 1>(l), get<1>(l)),
+                     make_layout(get<0, 0>(l), get<0, 2>(l), get<2>(l)));
 };
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// For SM80, convert acc_layout from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
-// if using m16n8k16, or to (4, MMA_M, MMA_N) if using m16n8k8.
 // For SM90, convert acc_layout from ((2, 2, N / 8), MMA_M, MMA_N) to ((2, 2, 2), MMA_M, (N / 16,
 // MMA_N))
 template <typename MMA_traits, typename Layout>
 __forceinline__ __device__ auto convert_layout_acc_Aregs(Layout acc_layout) {
   using X = Underscore;
-  if constexpr (decltype(rank<0>(acc_layout))::value == 3) {  // SM90
-    static_assert(decltype(size<0, 0>(acc_layout))::value == 2);
-    static_assert(decltype(size<0, 1>(acc_layout))::value == 2);
-    static_assert(decltype(rank(acc_layout))::value == 3);
-    static_assert(decltype(rank(get<0>(acc_layout)))::value == 3);
-    auto l = logical_divide(get<0>(acc_layout), Shape<X, X, _2>{});  // (2, 2, (2, N / 16)))
-    return make_layout(make_layout(get<0>(l), get<1>(l), get<2, 0>(l)), get<1>(acc_layout),
-                       make_layout(get<2, 1>(l), get<2>(acc_layout)));
-  } else {  // SM80
-    static_assert(decltype(size<0>(acc_layout))::value == 4);
-    static_assert(decltype(rank(acc_layout))::value == 3);
-    constexpr int mma_shape_K = get<2>(typename MMA_traits::Shape_MNK{});
-    static_assert(mma_shape_K == 8 || mma_shape_K == 16);
-    if constexpr (mma_shape_K == 8) {
-      return acc_layout;
-    } else {
-      auto l = logical_divide(acc_layout, Shape<X, X, _2>{});  // (4, MMA_M, (2, MMA_N / 2)))
-      return make_layout(make_layout(get<0>(l), get<2, 0>(l)), get<1>(l), get<2, 1>(l));
-    }
-  }
-};
-
-// Convert acc_layout from ((2, 2, N / 8), MMA_M, MMA_N) to ((4, 2, 2), MMA_M, (N / 32, MMA_N))
-template <typename Layout>
-__forceinline__ __device__ auto convert_layout_acc_Aregs_fp8(Layout acc_layout) {
-  using X = Underscore;
   static_assert(decltype(size<0, 0>(acc_layout))::value == 2);
   static_assert(decltype(size<0, 1>(acc_layout))::value == 2);
   static_assert(decltype(rank(acc_layout))::value == 3);
   static_assert(decltype(rank(get<0>(acc_layout)))::value == 3);
-  auto l = logical_divide(get<0>(acc_layout), Shape<X, X, _4>{});  // (2, 2, (2, N / 32)))
-  return make_layout(make_layout(Shape<_4, _2, _2>{}), get<1>(acc_layout),
+  auto l = logical_divide(get<0>(acc_layout), Shape<X, X, _2>{});  // (2, 2, (2, N / 16)))
+  return make_layout(make_layout(get<0>(l), get<1>(l), get<2, 0>(l)), get<1>(acc_layout),
                      make_layout(get<2, 1>(l), get<2>(acc_layout)));
 };
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// Byte permute for fp8 kernel
-template <typename Fragment>
-CUTLASS_DEVICE void permute_regs_A_to_C(Fragment& accum) {
-  auto data = accum.data();
-
-#pragma unroll
-  for (int n = 0; n < size(accum); n += 8) {
-    uint32_t* data_32bit = reinterpret_cast<uint32_t*>(&data[n]);
-    auto upper = data_32bit[0];
-    auto lower = data_32bit[1];
-    data_32bit[0] = __byte_perm(upper, lower, 0x5410);
-    data_32bit[1] = __byte_perm(upper, lower, 0x7632);
-  }
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename To_type, typename Engine, typename Layout>
 __forceinline__ __device__ auto convert_type(Tensor<Engine, Layout> const& tensor) {
@@ -188,12 +139,7 @@ __forceinline__ __device__ auto convert_type(Tensor<Engine, Layout> const& tenso
   // HACK: this requires tensor to be "contiguous"
   auto frag = convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel>*>(tensor.data()));
   return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
-  // Tensor out = make_tensor_like<To_type>(tensor);
-  // cute::copy(make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout()), out);
-  // return out;
 }
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <bool zero_init = false, int wg_wait = 0, bool arrive = true, bool commit = true,
           typename Tensor0, typename Tensor1, typename Tensor2, typename TiledMma>
@@ -273,40 +219,15 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
   }
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-template <int NumCopyThreads, typename ElemO, typename TMACopyO, typename LayoutO,
-          typename TileShapeO, typename SMemO, typename SeqLenTraits>
-__forceinline__ __device__ void write_tma(ElemO* O, const TMACopyO& tma_store_O,
-                                          const LayoutO& layout_O, const TileShapeO& tile_shape_O,
-                                          const SMemO& sO, int m_block, int bidh, int bidb,
-                                          const SeqLenTraits& seqlen_traits_o, int write_warp_idx) {
-  Tensor mO = tma_store_O.get_tma_tensor(layout_O.shape());
-  Tensor gO =
-      seqlen_traits_o.get_local_tile_tensor(mO, tile_shape_O, bidh, bidb)(_, _, m_block);  // (M, K)
-  auto block_tma_O = tma_store_O.get_slice(_0{});
-  Tensor tOgO = block_tma_O.partition_D(gO);  // (TMA, TMA_M, TMA_K)
-  Tensor tOsO = block_tma_O.partition_S(sO);  // (TMA, TMA_M, TMA_K)
-
-  int const lane_predicate = cute::elect_one_sync();
-  int const warp_idx = cutlass::canonical_warp_idx_sync();
-  if (warp_idx == write_warp_idx && lane_predicate) {
-    cute::copy(tma_store_O, tOsO, tOgO);
-    tma_store_arrive();
-  }
-  // Note: no wait here.
-  // tma_store_wait<0>();
-}
-
 template <int NumCopyThreads, typename ElemO, typename TiledCopyO, typename LayoutO,
           typename TileShapeO, typename SMemO, typename SeqLenTraits>
 __forceinline__ __device__ void write_tiled(ElemO* O, const TiledCopyO& tiled_copy_O,
                                             const LayoutO& layout_O, const TileShapeO& tile_shape_O,
-                                            const SMemO& sO, int m_block, int bidh, int bidb,
-                                            const SeqLenTraits& seqlen_traits_o) {
+                                            const SMemO& sO, int q_tile_idx, int head_idx,
+                                            int64_t qo_len) {
   Tensor mO = make_tensor(make_gmem_ptr(O), layout_O);
-  Tensor gO =
-      seqlen_traits_o.get_local_tile_tensor(mO, tile_shape_O, bidh, bidb)(_, _, m_block);  // (M, K)
+  Tensor gO = get_local_tile_tensor(mO, tile_shape_O, head_idx, /*offset=*/0, qo_len)(
+      _, _, q_tile_idx);  // (M, K)
 
   ThrCopy thr_copy_O = tiled_copy_O.get_slice(threadIdx.x - NumCopyThreads);
   Tensor tOgO = thr_copy_O.partition_D(gO);  // (CPY,CPY_M,CPY_K,k)
@@ -328,7 +249,7 @@ __forceinline__ __device__ void write_tiled(ElemO* O, const TiledCopyO& tiled_co
 
   // Write out to GMEM.
   const int kNumMsPerTile = get<0>(tile_shape_O);
-  int cta_m = std::min(seqlen_traits_o.actual_seq_len - m_block * kNumMsPerTile, kNumMsPerTile);
+  int cta_m = std::min(qo_len - q_tile_idx * kNumMsPerTile, kNumMsPerTile);
   if (cta_m == kNumMsPerTile) {
     copy(tiled_copy_O, tOsOGroup, tOgOGroup);
   } else {
@@ -340,23 +261,15 @@ __forceinline__ __device__ void write_tiled(ElemO* O, const TiledCopyO& tiled_co
   }
 }
 
-template <bool IsTMACopy, int NumCopyThreads, typename ElemO, typename TMACopyO,
-          typename TiledCopyO, typename LayoutO, typename TileShapeO, typename SMemO,
-          typename SeqLenTraits>
+template <int NumCopyThreads, typename ElemO, typename TMACopyO, typename TiledCopyO,
+          typename LayoutO, typename TileShapeO, typename SMemO>
 __forceinline__ __device__ void write_O(ElemO* O, const TMACopyO& tma_copy_O,
                                         const TiledCopyO& tiled_copy_O, const LayoutO& layout_O,
                                         const TileShapeO& tile_shape_O, const SMemO& sO,
-                                        int m_block, int bidh, int bidb,
-                                        const SeqLenTraits& seqlen_traits_o, int write_warp_idx) {
-  if constexpr (IsTMACopy) {
-    write_tma<NumCopyThreads>(O, tma_copy_O, layout_O, tile_shape_O, sO, m_block, bidh, bidb,
-                              seqlen_traits_o, write_warp_idx);
-  } else {
-    write_tiled<NumCopyThreads>(O, tiled_copy_O, layout_O, tile_shape_O, sO, m_block, bidh, bidb,
-                                seqlen_traits_o);
-  }
+                                        int q_tile_idx, int head_idx, int qo_len,
+                                        int write_warp_idx) {
+  write_tiled<NumCopyThreads>(O, tiled_copy_O, layout_O, tile_shape_O, sO, q_tile_idx, head_idx,
+                              qo_len);
 }
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
 
 }  // namespace flashinfer
