@@ -14,9 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from typing import Optional
+
 import torch
 
-from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR, has_prebuilt_ops
+from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
+from .utils import register_custom_op, register_fake_op
 
 _norm_module = None
 
@@ -43,7 +46,7 @@ def rmsnorm(
     input: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
-    out: torch.Tensor = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Root mean square normalization.
 
@@ -65,13 +68,28 @@ def rmsnorm(
     """
     if out is None:
         out = torch.empty_like(input)
-    get_norm_module().rmsnorm(out, input, weight, eps)
+    _rmsnorm(out, input, weight, eps)
     return out
 
 
+@register_custom_op("flashinfer::rmsnorm", mutates_args=("out",))
+def _rmsnorm(
+    out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor, eps: float
+) -> None:
+    get_norm_module().rmsnorm(out, input, weight, eps)
+
+
+@register_fake_op("flashinfer::rmsnorm")
+def _rmsnorm_fake(
+    out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor, eps: float
+) -> None:
+    pass
+
+
+@register_custom_op("flashinfer::fused_add_rmsnorm", mutates_args=("input", "residual"))
 def fused_add_rmsnorm(
     input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
-):
+) -> None:
     r"""Fused add root mean square normalization.
 
     Parameters
@@ -88,12 +106,19 @@ def fused_add_rmsnorm(
     get_norm_module().fused_add_rmsnorm(input, residual, weight, eps)
 
 
+@register_fake_op("flashinfer::fused_add_rmsnorm")
+def _fused_add_rmsnorm_fake(
+    input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
+) -> None:
+    pass
+
+
 def gemma_rmsnorm(
     input: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
-    out: torch.Tensor = None,
-):
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     r"""Gemma Root mean square normalization.
 
     Parameters
@@ -114,13 +139,30 @@ def gemma_rmsnorm(
     """
     if out is None:
         out = torch.empty_like(input)
-    get_norm_module().gemma_rmsnorm(out, input, weight, eps)
+    _gemma_rmsnorm(out, input, weight, eps)
     return out
 
 
+@register_custom_op("flashinfer::gemma_rmsnorm", mutates_args=("out",))
+def _gemma_rmsnorm(
+    out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor, eps: float
+) -> None:
+    get_norm_module().gemma_rmsnorm(out, input, weight, eps)
+
+
+@register_fake_op("flashinfer::gemma_rmsnorm")
+def _gemma_rmsnorm_fake(
+    out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor, eps: float
+) -> None:
+    pass
+
+
+@register_custom_op(
+    "flashinfer::gemma_fused_add_rmsnorm", mutates_args=("input", "residual")
+)
 def gemma_fused_add_rmsnorm(
     input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
-):
+) -> None:
     r"""Gemma Fused add root mean square normalization.
 
     Parameters
@@ -135,3 +177,10 @@ def gemma_fused_add_rmsnorm(
         Epsilon for numerical stability.
     """
     get_norm_module().gemma_fused_add_rmsnorm(input, residual, weight, eps)
+
+
+@register_fake_op("flashinfer::gemma_fused_add_rmsnorm")
+def _gemma_fused_add_rmsnorm_fake(
+    input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
+) -> None:
+    pass

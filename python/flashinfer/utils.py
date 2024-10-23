@@ -14,10 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import torch
 import math
 from enum import Enum
-from typing import Optional, Tuple, Union, Dict
+from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
+
+import torch
+from torch.torch_version import TorchVersion
+from torch.torch_version import __version__ as torch_version
 
 
 class PosEncodingMode(Enum):
@@ -197,3 +200,28 @@ def _check_cached_qkv_data_type(
         raise ValueError(
             f"The dtype of k {k.dtype} does not match the kv_data_type {dtype_kv} specified in plan function."
         )
+
+
+def register_custom_op(
+    name: str,
+    fn: Optional[Callable] = None,
+    /,
+    *,
+    mutates_args: Union[str, Iterable[str]],
+    device_types: Optional[Union[str, Sequence[str]]] = None,
+    schema: Optional[str] = None,
+) -> Callable:
+    if TorchVersion(torch_version) < TorchVersion("2.4"):
+        return fn
+    return torch.library.custom_op(
+        name, fn, mutates_args=mutates_args, device_types=device_types, schema=schema
+    )
+
+
+def register_fake_op(
+    name: str,
+    fn: Optional[Callable] = None,
+) -> Callable:
+    if TorchVersion(torch_version) < TorchVersion("2.4"):
+        return fn
+    return torch.library.register_fake(name, fn)
