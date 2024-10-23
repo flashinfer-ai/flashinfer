@@ -22,7 +22,7 @@ struct SharedStorageQKVO {
   cute::array_aligned<Gemm1Type, cute::cosize_v<SmemLayoutK>> smem_k;
   union {
     cute::array_aligned<Gemm2Type, cute::cosize_v<SmemLayoutV>> smem_v;
-    cute::array_aligned<OutputType, cute::cosize_v<SmemLayoutO>> smem_o;
+    cute::array_aligned<DTypeOut, cute::cosize_v<SmemLayoutO>> smem_o;
   };
   struct {
     cutlass::arch::ClusterTransactionBarrier barrier_Q;
@@ -54,8 +54,7 @@ struct AttentionKernelTraits {
   static_assert(HEAD_DIM % 32 == 0);
   using TileShape_MNK = Shape<Int<CTA_Q>, Int<CTA_KV>, Int<HEAD_DIM>>;
 
-  static constexpr int kClusterM = kClusterM_;
-  using ClusterShape_MNK = Shape<Int<kClusterM>, _1, _1>;
+  using ClusterShape_MNK = Shape<_1, _1, _1>;
 
   static constexpr int NUM_STAGES = NUM_STAGES_;
 

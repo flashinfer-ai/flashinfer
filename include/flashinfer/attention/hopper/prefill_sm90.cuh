@@ -11,6 +11,8 @@
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
 
+#include <stdexcept>
+
 #include "cute/tensor.hpp"
 #include "cutlass/cluster_launch.hpp"
 #include "cutlass/pipeline/pipeline.hpp"
@@ -32,7 +34,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
         CUTE_GRID_CONSTANT
         typename CollectiveMainloop<Ktraits, CAUSAL>::Params const mainloop_params,
         CUTE_GRID_CONSTANT typename CollectiveEpilogue<Ktraits>::Params const epilogue_params,
-        CUTE_GRID_CONSTANT typename TileScheduler::Params const scheduler_params) {
+        CUTE_GRID_CONSTANT typename TileScheduler::Params const scheduler_params, const int qo_len,
+        const int kv_len) {
   using Element = typename Ktraits::Element;
   using ElementAccum = typename Ktraits::ElementAccum;
   using SoftType = ElementAccum;
@@ -113,7 +116,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
            work_tile_info = scheduler.template get_next_work</*IsProducer=*/true>(scheduler_params,
                                                                                   work_tile_info)) {
         auto block_coord = work_tile_info.get_block_coord(scheduler_params);
-        auto [q_block, head_idx, batch_idx] = block_coord;
+        auto [q_block, head_idx] = block_coord;
 
         if (q_block * CTA_Q >= qo_len) {
           continue;
@@ -227,22 +230,22 @@ void SinglePrefillWithKVCacheDispatched(
   using Scheduler = SingleTileScheduler;
   typename CollectiveMainloop::Params mainloop_params = CollectiveMainloop::to_underlying_arguments(
       {static_cast<Element const*>(params.q_ptr),
-       get_gmem_layout(params.total_q, params.num_qo_heads, params.head_dim, params.q_stride_n,
+       get_gmem_layout(params.qo_len, params.num_qo_heads, params.head_dim, params.q_stride_n,
                        params.q_stride_h),  // layout_Q
        static_cast<Element const*>(params.k_ptr),
-       get_gmem_layout(params.total_k, params.num_kv_heads, params.head_dim, params.k_stride_n,
+       get_gmem_layout(params.kv_len, params.num_kv_heads, params.head_dim, params.k_stride_n,
                        params.k_stride_h),  // layout_K
        static_cast<Element const*>(params.v_ptr),
-       get_gmem_layout(params.total_k, params.num_kv_heads, params.head_dim, params.v_stride_n,
+       get_gmem_layout(params.kv_len, params.num_kv_heads, params.head_dim, params.v_stride_n,
                        params.v_stride_h),  // layout_V
        params.sm_scale_log2});
   typename CollectiveEpilogue::Params epilogue_params =
       CollectiveEpilogue::to_underlying_arguments({
           static_cast<OutputType*>(params.o_ptr),
-          get_gmem_layout(params.total_q, params.num_qo_heads, params.head_dim, params.o_stride_n,
+          get_gmem_layout(params.qo_len, params.num_qo_heads, params.head_dim, params.o_stride_n,
                           params.o_stride_h),  // layout_O
           static_cast<float*>(params.lse_ptr),
-          get_lse_gmem_layout(params.total_q, params.num_qo_heads),  // layout_LSE
+          get_lse_gmem_layout(params.qo_len, params.num_qo_heads),  // layout_LSE
       });
 
   int num_blocks_q = cutlass::ceil_div(params.qo_len, KernelTraits::CTA_Q);
@@ -266,35 +269,31 @@ void SinglePrefillWithKVCacheDispatched(
   cutlass::ClusterLaunchParams launch_params{grid_dims, block_dims, cluster_dims, smem_size,
                                              stream};
   cutlass::launch_kernel_on_cluster(launch_params, kernel, mainloop_params, epilogue_params,
-                                    scheduler_params);
+                                    scheduler_params, params.qo_len, params.kv_len);
   CHECK_CUDA_KERNEL_LAUNCH();
 }
 
 template <typename T>
-void run_mha_fwd_hdim64(Flash_fwd_params& params, cudaStream_t stream) {
-  constexpr static int Headdim = 64;
+void SinglePrefillWithKVCache(SinglePrefillParams<T, T, T>& params, cudaStream_t stream) {
   BOOL_SWITCH(params.causal, CAUSAL, [&] {
-    run_flash_fwd<AttentionKernelTraits<Headdim, 192, 128, 16, 2, false, /*use_cluster=*/1, T>,
-                  CAUSAL>(params, stream);
-  });
-}
-
-template <typename T>
-void run_mha_fwd_hdim128(Flash_fwd_params& params, cudaStream_t stream) {
-  constexpr static int Headdim = 128;
-  BOOL_SWITCH(params.causal, CAUSAL, [&] {
-    // NOTE(Zihao): use 128x192 achieves better performance than 128x128 for non-causal
-    run_flash_fwd<AttentionKernelTraits<Headdim, 128, 192, 12, 2, false, /*use_cluster=*/1, T>,
-                  CAUSAL>(params, stream);
-  });
-}
-
-template <typename T>
-void run_mha_fwd_hdim256(Flash_fwd_params& params, cudaStream_t stream) {
-  constexpr static int Headdim = 256;
-  BOOL_SWITCH(params.causal, CAUSAL, [&] {
-    run_flash_fwd<AttentionKernelTraits<Headdim, 128, 80, 12, 2, false, /*use_cluster=*/1, T>,
-                  CAUSAL>(params, stream);
+    if (params.head_dim == 64) {
+      constexpr int HEAD_DIM = 64;
+      SinglePrefillWithKVCacheDispatched<
+          AttentionKernelTraits<HEAD_DIM, 192, 128, 16, 2, T>, CAUSAL>(
+          params, stream);
+    } else if (params.head_dim == 128) {
+      constexpr int HEAD_DIM = 128;
+      SinglePrefillWithKVCacheDispatched<
+          AttentionKernelTraits<HEAD_DIM, 128, 192, 12, 2, T>, CAUSAL>(
+          params, stream);
+    } else if (params.head_dim == 256) {
+      constexpr int HEAD_DIM = 256;
+      SinglePrefillWithKVCacheDispatched<
+          AttentionKernelTraits<HEAD_DIM, 128, 80, 12, 2, T>, CAUSAL>(
+          params, stream);
+    } else {
+      throw std::runtime_error("Unsupported head_dim");
+    }
   });
 }
 

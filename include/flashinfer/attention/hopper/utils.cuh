@@ -38,18 +38,18 @@ namespace flashinfer {
 using namespace cute;
 
 CUTLASS_HOST_DEVICE auto get_gmem_layout(int nnz, int num_heads, int head_dim, int64_t n_stride,
-                                         int64_t h_stride) const {
+                                         int64_t h_stride) {
   return make_layout(make_shape(nnz, head_dim, num_heads),
                      make_stride(n_stride, cute::_1{}, h_stride));
 }
 
-CUTLASS_HOST_DEVICE auto get_lse_gmem_layout(int nnz, int num_heads) const {
+CUTLASS_HOST_DEVICE auto get_lse_gmem_layout(int nnz, int num_heads) {
   return make_layout(make_shape(num_heads, nnz), make_stride(int64_t(nnz), cute::_1()));
 }
 
 template <typename MTensor, typename Shape>
 CUTLASS_DEVICE auto get_local_tile_tensor(const MTensor& m_tensor, const Shape& tile_shape,
-                                          int offset, int seq_len, int head_idx) const {
+                                          int offset, int seq_len, int head_idx) {
   auto g_offset = local_tile(m_tensor(_, _, head_idx), cute::make_shape(1, get<1>(tile_shape)),
                              make_coord(offset, _0{}));
   auto g_sequence =
@@ -61,7 +61,7 @@ CUTLASS_DEVICE auto get_local_tile_tensor(const MTensor& m_tensor, const Shape& 
 
 template <typename MTensor, typename Shape>
 CUTLASS_DEVICE auto get_lse_local_tile_tensor(const MTensor& m_tensor, const Shape& tile_shape,
-                                              int offset, int seq_len, int head_idx) const {
+                                              int offset, int seq_len, int head_idx) {
   auto g_offset = local_tile(m_tensor(head_idx, _), cute::make_shape(_1{}), make_coord(offset));
   auto g_sequence =
       make_tensor(g_offset.data(), make_layout(cute::make_shape(seq_len), cute::make_shape(_1{})));
@@ -220,7 +220,7 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
 }
 
 template <int NumCopyThreads, typename ElemO, typename TiledCopyO, typename LayoutO,
-          typename TileShapeO, typename SMemO, typename SeqLenTraits>
+          typename TileShapeO, typename SMemO>
 __forceinline__ __device__ void write_tiled(ElemO* O, const TiledCopyO& tiled_copy_O,
                                             const LayoutO& layout_O, const TileShapeO& tile_shape_O,
                                             const SMemO& sO, int q_tile_idx, int head_idx,
@@ -249,7 +249,7 @@ __forceinline__ __device__ void write_tiled(ElemO* O, const TiledCopyO& tiled_co
 
   // Write out to GMEM.
   const int kNumMsPerTile = get<0>(tile_shape_O);
-  int cta_m = std::min(qo_len - q_tile_idx * kNumMsPerTile, kNumMsPerTile);
+  int cta_m = std::min<int>(qo_len - q_tile_idx * kNumMsPerTile, kNumMsPerTile);
   if (cta_m == kNumMsPerTile) {
     copy(tiled_copy_O, tOsOGroup, tOgOGroup);
   } else {

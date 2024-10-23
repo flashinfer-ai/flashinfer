@@ -177,7 +177,7 @@ struct CollectiveEpilogue {
     Tensor gO = get_local_tile_tensor(mO, select<0, 2>(TileShape_MNK{}), head_idx, /*offset=*/0,
                                       qo_len)(_, _, q_tile_idx);  // (M, K)
     Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.ptr_LSE), epilogue_params.layout_LSE);
-    Tensor gLSE = get_lse_local_tile_tensor(mLSE, Shape<Int<CTA_Q>>{}, head_idxm /*offset=*/0,
+    Tensor gLSE = get_lse_local_tile_tensor(mLSE, Shape<Int<CTA_Q>>{}, head_idx, /*offset=*/0,
                                             qo_len)(_, q_tile_idx);
 
     TiledCopyO gmem_tiled_copy_O;

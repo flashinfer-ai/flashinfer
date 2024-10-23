@@ -40,8 +40,6 @@ struct SinglePrefillParams {
   int num_kv_heads;
   int group_size;
 
-  float sm_scale;
   float sm_scale_log2;
-
   bool causal;
 };

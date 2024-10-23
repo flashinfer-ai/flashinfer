@@ -43,7 +43,7 @@ struct CollectiveMainloop {
   using SmemLayoutVt = typename Ktraits::SmemLayoutVt;
 
   using ShapeT = cute::Shape<int32_t, int32_t, int32_t>;
-  using StrideT = cute::Shape<int64_t, _1, int64_t>;
+  using StrideT = cute::Shape<int64_t, _1, int64_t>;  // (N, D, H)
   using LayoutT = cute::Layout<ShapeT, StrideT>;
 
   using ShapeLseT = cute::Shape<int32_t, int32_t>;
@@ -149,7 +149,7 @@ struct CollectiveMainloop {
     int num_kv_tiles = cute::ceil_div(kv_len, CTA_KV);
     if constexpr (CAUSAL) {
       num_kv_tiles =
-          std::min(kv_tile_max, cute::ceil_div((q_tile_idx + 1) * CTA_Q + kv_len - qo_len, CTA_KV));
+          std::min(num_kv_tiles, cute::ceil_div((q_tile_idx + 1) * CTA_Q + kv_len - qo_len, CTA_KV));
     }
     return num_kv_tiles;
   }
@@ -432,7 +432,7 @@ struct CollectiveMainloop {
       }
     }
 
-    softmax.template online_softmax</*Is_first=*/true>(tSrS);
+    softmax.template online_softmax</*is_first=*/true>(tSrS);
     Tensor tOrP = make_tensor(convert_type<Element>(tSrS).data(),
                               convert_layout_acc_Aregs<typename Ktraits::TiledMma1>(tSrS.layout()));
     Tensor scores_scale = make_fragment_like(softmax.row_max);
@@ -465,8 +465,8 @@ struct CollectiveMainloop {
           tSrS(i) = -math::inf;
         }
       }
-      cute::copy(softmax.template max</*Is_first=*/false, /*Check_inf=*/true>(tSrS), scores_scale);
-      softmax.template online_softmax</*Is_first=*/false, /*Check_inf=*/true>(tSrS);
+      cute::copy(softmax.template max</*is_first=*/false>(tSrS), scores_scale);
+      softmax.template online_softmax</*is_first=*/false>(tSrS);
       warpgroup_wait<0>();
       pipeline_v.consumer_release(smem_pipe_read_v);  // release V
       ++smem_pipe_read_k;
@@ -490,9 +490,9 @@ struct CollectiveMainloop {
       warp_scheduler_barrier_arrive();
       warpgroup_wait<1>();
       pipeline_k.consumer_release(smem_pipe_read_k);  // release K
-      // auto scores_scale = softmax.template max</*Is_first=*/false>(tSrS);
-      cute::copy(softmax.template max</*Is_first=*/false>(tSrS), scores_scale);
-      softmax.template online_softmax</*Is_first=*/false>(tSrS);
+      // auto scores_scale = softmax.template max</*is_first=*/false>(tSrS);
+      cute::copy(softmax.template max</*is_first=*/false>(tSrS), scores_scale);
+      softmax.template online_softmax</*is_first=*/false>(tSrS);
       warpgroup_wait<0>();
       pipeline_v.consumer_release(smem_pipe_read_v);  // release V
       ++smem_pipe_read_k;
@@ -509,7 +509,7 @@ struct CollectiveMainloop {
     consumer_wait(pipeline_v, smem_pipe_read_v);
     gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma1, tOrP,
                                               tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
-    cute::copy(softmax.template finalize</*Check_inf=*/CAUSAL>(tSrS), scores_scale);
+    cute::copy(softmax.template finalize(tSrS), scores_scale);
     warpgroup_wait<0>();
     pipeline_v.consumer_release(smem_pipe_read_v);  // release V, otherwise producers will hang
     ++smem_pipe_read_v;

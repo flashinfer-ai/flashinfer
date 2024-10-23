@@ -61,7 +61,7 @@ struct SingleTileScheduler {
   template <bool IsProducer = false>
   CUTLASS_DEVICE WorkTileInfo get_next_work(Params const& params,
                                             WorkTileInfo const& current_work) const {
-    return {-1, -1, -1, false};
+    return {-1, -1, false};
   }
 };
 

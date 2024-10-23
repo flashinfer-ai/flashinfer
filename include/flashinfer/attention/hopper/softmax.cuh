@@ -10,9 +10,9 @@
 #include <cmath>
 #include <cute/tensor.hpp>
 
+#include "../../math.cuh"
 #include "cutlass/fast_math.h"
 #include "utils.cuh"
-#include "../../math.cuh"
 
 namespace flashinfer {
 
@@ -101,13 +101,13 @@ struct Softmax {
 
   CUTLASS_DEVICE Softmax(float scale_ = 1.f) : sm_scale_log2(scale_){};
 
-  template <bool Is_first, typename Tensor0>
+  template <bool is_first, typename Tensor0>
   __forceinline__ __device__ TensorT max(Tensor0& acc_s) {
     // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
     Tensor scores = make_tensor(acc_s.data(), convert_layout_acc_rowcol(acc_s.layout()));
     static_assert(decltype(size<0>(scores))::value == kNRows);
     TensorT scores_scale;
-    if constexpr (Is_first) {
+    if constexpr (is_first) {
       reduce_max</*zero_init=*/true>(scores, row_max);
       cute::fill(scores_scale, 1.f);
     } else {
@@ -124,21 +124,19 @@ struct Softmax {
     return scores_scale;
   };
 
-  template <bool Is_first, bool Check_inf = false, typename Tensor0>
+  template <bool is_first, typename Tensor0>
   __forceinline__ __device__ TensorT online_softmax(Tensor0& acc_s) {
     // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
     Tensor scores = make_tensor(acc_s.data(), convert_layout_acc_rowcol(acc_s.layout()));
     static_assert(decltype(size<0>(scores))::value == kNRows);
     TensorT scores_scale;
-    if constexpr (Is_first) {
+    if constexpr (is_first) {
       reduce_max</*zero_init=*/true>(scores, row_max);
-      scale_apply_exp2(scores, row_max,
-                                                                               sm_scale_log2);
+      scale_apply_exp2(scores, row_max, sm_scale_log2);
       reduce_sum</*zero_init=*/true, /*warp_reduce=*/false>(scores, row_sum);
       cute::fill(scores_scale, 1.f);
     } else {
-      scale_apply_exp2(scores, row_max,
-                                                                      sm_scale_log2);
+      scale_apply_exp2(scores, row_max, sm_scale_log2);
       reduce_sum</*zero_init=*/false, /*warp_reduce=*/false>(scores, row_sum);
     }
     return scores_scale;
