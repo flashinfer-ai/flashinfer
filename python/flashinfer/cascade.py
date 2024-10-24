@@ -14,11 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import math
-from typing import Optional, Tuple, List
-from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR, has_prebuilt_ops
+from typing import List, Optional, Tuple
+
 import torch
 
+from .decode import (
+    BatchDecodeWithPagedKVCacheWrapper,
+)
+from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
+from .prefill import (
+    BatchPrefillWithPagedKVCacheWrapper,
+    single_prefill_with_kv_cache,
+)
+from .utils import register_custom_op, register_fake_op
 
 _cascade_module = None
 
@@ -41,15 +49,7 @@ def get_cascade_module():
     return _cascade_module
 
 
-from .decode import (
-    BatchDecodeWithPagedKVCacheWrapper,
-)
-from .prefill import (
-    single_prefill_with_kv_cache_return_lse,
-    BatchPrefillWithPagedKVCacheWrapper,
-)
-
-
+@register_custom_op("flashinfer::merge_state", mutates_args=())
 def merge_state(
     v_a: torch.Tensor, s_a: torch.Tensor, v_b: torch.Tensor, s_b: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -76,10 +76,10 @@ def merge_state(
     -------
     V : torch.Tensor
         The merged attention output (equivalent to attention with merged KV-segment
-        ``[A: B]``), shape: ``[batch_size, num_heads, head_dim]``.
+        ``[A: B]``), shape: ``[seq_len, num_heads, head_dim]``.
     S : torch.Tensor
         The logsumexp value from the merged KV-segment ``[A: B]``, shape:
-        ``[batch_size, num_heads]``.
+        ``[seq_len, num_heads]``.
 
     Example
     -------
@@ -101,6 +101,16 @@ def merge_state(
     return get_cascade_module().merge_state(v_a, s_a, v_b, s_b)
 
 
+@register_fake_op("flashinfer::merge_state")
+def _fake_merge_state(
+    v_a: torch.Tensor, s_a: torch.Tensor, v_b: torch.Tensor, s_b: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    v = torch.empty_like(v_a)
+    s = torch.empty_like(s_a)
+    return v, s
+
+
+@register_custom_op("flashinfer::merge_state_in_place", mutates_args=("v", "s"))
 def merge_state_in_place(
     v: torch.Tensor,
     s: torch.Tensor,
@@ -147,6 +157,18 @@ def merge_state_in_place(
     get_cascade_module().merge_state_in_place(v, s, v_other, s_other, mask)
 
 
+@register_fake_op("flashinfer::merge_state_in_place")
+def _fake_merge_state_in_place(
+    v: torch.Tensor,
+    s: torch.Tensor,
+    v_other: torch.Tensor,
+    s_other: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+) -> None:
+    pass
+
+
+@register_custom_op("flashinfer::merge_states", mutates_args=())
 def merge_states(v: torch.Tensor, s: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Merge multiple attention states (v, s).
 
@@ -185,6 +207,15 @@ def merge_states(v: torch.Tensor, s: torch.Tensor) -> Tuple[torch.Tensor, torch.
     torch.Size([2048, 32])
     """
     return get_cascade_module().merge_states(v, s)
+
+
+@register_fake_op("flashinfer::merge_states")
+def _fake_merge_states(
+    v: torch.Tensor, s: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    v = torch.empty_like(v)
+    s = torch.empty_like(s)
+    return v, s
 
 
 class MultiLevelCascadeAttentionWrapper:
@@ -442,12 +473,13 @@ class MultiLevelCascadeAttentionWrapper:
               :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
               ``paged_kv_cache[:, 1]`` is the value-cache.
         """
-        out, lse = self._batch_prefill_wrappers[-1].run_return_lse(
+        out, lse = self._batch_prefill_wrappers[-1].run(
             q,
             paged_kv_cache,
+            return_lse=True,
         )
         for wrapper in self._batch_prefill_wrappers[:-1]:
-            out_i, lse_i = wrapper.run_return_lse(q, paged_kv_cache)
+            out_i, lse_i = wrapper.run(q, paged_kv_cache, return_lse=True)
             merge_state_in_place(out, lse, out_i, lse_i)
 
         return out
@@ -670,7 +702,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
         V : torch.Tensor
             The attention output, shape: ``[batch_size, num_heads, head_dim]``
         """
-        V_shared, S_shared = single_prefill_with_kv_cache_return_lse(
+        V_shared, S_shared = single_prefill_with_kv_cache(
             q,
             k_shared,
             v_shared,
@@ -680,6 +712,7 @@ class BatchDecodeWithSharedPrefixPagedKVCacheWrapper:
             sm_scale=self._batch_decode_wrapper._sm_scale,
             rope_scale=self._batch_decode_wrapper._rope_scale,
             rope_theta=self._batch_decode_wrapper._rope_theta,
+            return_lse=True,
         )
         V_unique, S_unique = self._batch_decode_wrapper.forward_return_lse(
             q,
@@ -943,7 +976,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
         --------
         MultiLevelCascadeAttentionWrapper
         """
-        V_shared, S_shared = single_prefill_with_kv_cache_return_lse(
+        V_shared, S_shared = single_prefill_with_kv_cache(
             q,
             k_shared,
             v_shared,
@@ -954,6 +987,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
             sm_scale=sm_scale,
             rope_scale=rope_scale,
             rope_theta=rope_theta,
+            return_lse=True,
         )
         V_unique, S_unique = self._batch_prefill_wrapper.forward_return_lse(
             q,

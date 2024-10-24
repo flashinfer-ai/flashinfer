@@ -47,10 +47,10 @@ torch::Tensor top_k_renorm_probs(torch::Tensor probs, std::optional<torch::Tenso
 torch::Tensor top_k_mask_logits(torch::Tensor logits, std::optional<torch::Tensor> maybe_top_k_arr,
                                 unsigned int top_k_val);
 
-std::vector<torch::Tensor> chain_speculative_sampling(
+torch::Tensor chain_speculative_sampling(
     torch::Tensor draft_probs, torch::Tensor draft_token_ids, torch::Tensor uniform_samples,
-    torch::Tensor target_probs, std::optional<torch::Tensor> maybe_output_accepted_token_num,
-    std::optional<torch::Tensor> maybe_output_emitted_token_num, bool deterministic);
+    torch::Tensor target_probs, torch::Tensor output_accepted_token_num,
+    torch::Tensor output_emitted_token_num, bool deterministic);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("sampling_from_probs", &sampling_from_probs, "Sample from probabilities");
