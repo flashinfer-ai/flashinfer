@@ -30,11 +30,6 @@
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
 
-// macro to turn off fp16 qk reduction to reduce binary
-#ifndef FLASHINFER_ALWAYS_DISALLOW_FP16_QK_REDUCTION
-#define FLASHINFER_ALWAYS_DISALLOW_FP16_QK_REDUCTION 0
-#endif
-
 #ifndef NDEBUG
 #define FLASHINFER_CUDA_CALL(func, ...)                                                     \
   {                                                                                         \

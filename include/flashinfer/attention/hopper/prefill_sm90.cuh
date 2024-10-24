@@ -212,7 +212,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   }()
 
 template <typename KernelTraits, bool CAUSAL>
-void SinglePrefillWithKVCacheDispatched(
+cudaError_t SinglePrefillWithKVCacheDispatched(
     SinglePrefillParams<typename KernelTraits::Element, typename KernelTraits::Element,
                         typename KernelTraits::Element>& params,
     cudaStream_t stream) {
@@ -266,7 +266,8 @@ void SinglePrefillWithKVCacheDispatched(
                                              stream};
   cutlass::launch_kernel_on_cluster(launch_params, kernel, mainloop_params, epilogue_params,
                                     scheduler_params, params.qo_len, params.kv_len);
-  FLASHINFER_CUDA_CALL(cudaGetLastError());
+
+  return cudaGetLastError();
 }
 
 template <typename T>

@@ -13,17 +13,39 @@
 #include <cuda_bf16.h>
 #endif
 
+#include <cuda_runtime.h>
 #include <cutlass/array.h>
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
-#include "../../utils.cuh"
 
 #include <cute/arch/cluster_sm90.hpp>  // For cute::elect_one_sync()
 #include <cute/tensor.hpp>
 
-
 namespace flashinfer {
+
+#define STR_HELPER(x) #x
+#define STR(x) STR_HELPER(x)
+
+#ifndef NDEBUG
+#define FLASHINFER_CUDA_CALL(func, ...)                                                     \
+  {                                                                                         \
+    cudaError_t e = (func);                                                                 \
+    if (e != cudaSuccess) {                                                                 \
+      std::cerr << "CUDA Error: " << cudaGetErrorString(e) << " (" << e << ") " << __FILE__ \
+                << ": line " << __LINE__ << " at function " << STR(func) << std::endl;      \
+      return e;                                                                             \
+    }                                                                                       \
+  }
+#else
+#define FLASHINFER_CUDA_CALL(func, ...) \
+  {                                     \
+    cudaError_t e = (func);             \
+    if (e != cudaSuccess) {             \
+      return e;                         \
+    }                                   \
+  }
+#endif
 
 using namespace cute;
 
@@ -259,7 +281,7 @@ __forceinline__ __device__ void write_O(ElemO* O, const TMACopyO& tma_copy_O,
                                         int q_tile_idx, int head_idx, int qo_len,
                                         int write_warp_idx) {
   write_tiled<NUM_TMA_THREADS>(O, tiled_copy_O, layout_O, tile_shape_O, sO, q_tile_idx, head_idx,
-                              qo_len);
+                               qo_len);
 }
 
 }  // namespace flashinfer
