@@ -14,16 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from typing import Optional
-from .jit import (
-    load_cuda_ops,
-    FLASHINFER_GEN_SRC_DIR,
-    gen_act_and_mul_cu,
-    has_prebuilt_ops,
-)
+from types import SimpleNamespace
 
 import torch
 
+from .jit import (
+    FLASHINFER_GEN_SRC_DIR,
+    gen_act_and_mul_cu,
+    has_prebuilt_ops,
+    load_cuda_ops,
+)
+from .utils import register_custom_op, register_fake_op
 
 silu_def_cu_str = r"""
 __device__ __forceinline__ float silu(const float& val) {
@@ -73,15 +74,31 @@ def get_act_and_mul_module(act_func_name: str):
         if has_prebuilt_ops:
             from . import _kernels
 
-            _jit_modules[act_func_name] = _kernels
+            module = _kernels
         else:
-            _jit_modules[act_func_name] = compile_act_and_mul_module(
+            module = compile_act_and_mul_module(
                 act_func_name, act_func_def_str[act_func_name]
             )
+
+        # torch library for act_and_mul
+        fname = f"{act_func_name}_and_mul"
+        fn = getattr(module, fname)
+
+        @register_custom_op(f"flashinfer::{fname}", mutates_args=("out",))
+        def _act_and_mul(out: torch.Tensor, input: torch.Tensor) -> None:
+            fn(out, input)
+
+        @register_fake_op(f"flashinfer::{fname}")
+        def _fake_act_and_mul(out: torch.Tensor, input: torch.Tensor) -> None:
+            pass
+
+        # Register the module
+        _jit_modules[act_func_name] = SimpleNamespace(**{fname: _act_and_mul})
+
     return _jit_modules[act_func_name]
 
 
-def _check_shape(input: torch.Tensor, output: torch.Tensor):
+def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
     assert input.ndim == output.ndim, f"{input.ndim} != {output.ndim}"
     assert (
         input.shape[:-1] == output.shape[:-1]

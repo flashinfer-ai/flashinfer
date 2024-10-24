@@ -14,14 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from types import SimpleNamespace
 from typing import Optional
 
 import torch
 
-from .utils import get_indptr, get_compute_capability
-from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR, has_prebuilt_ops
-from typing import Optional
-
+from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
+from .utils import (
+    get_compute_capability,
+    get_indptr,
+    register_custom_op,
+    register_fake_op,
+)
 
 _gemm_module = None
 _gemm_module_sm90 = None
@@ -33,9 +37,9 @@ def get_gemm_module():
         if has_prebuilt_ops:
             from . import _kernels
 
-            _gemm_module = _kernels
+            module = _kernels
         else:
-            _gemm_module = load_cuda_ops(
+            module = load_cuda_ops(
                 "gemm",
                 [
                     FLASHINFER_CSRC_DIR / "bmm_fp8.cu",
@@ -43,6 +47,69 @@ def get_gemm_module():
                     FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops.cu",
                 ],
             )
+
+        # torch library for bmm_fp8
+
+        @register_custom_op("flashinfer::bmm_fp8", mutates_args=("D",))
+        def bmm_fp8(
+            A: torch.Tensor,
+            B: torch.Tensor,
+            D: torch.Tensor,
+            A_scale: torch.Tensor,
+            B_scale: torch.Tensor,
+        ) -> None:
+            module.bmm_fp8(A, B, D, A_scale, B_scale)
+
+        @register_fake_op("flashinfer::bmm_fp8")
+        def _fake_bmm_fp8(
+            A: torch.Tensor,
+            B: torch.Tensor,
+            D: torch.Tensor,
+            A_scale: torch.Tensor,
+            B_scale: torch.Tensor,
+        ) -> None:
+            pass
+
+        # torch library for cutlass_segment_gemm
+
+        @register_custom_op("flashinfer::cutlass_segment_gemm", mutates_args=())
+        def cutlass_segment_gemm(
+            workspace_buffer: torch.Tensor,
+            seg_indptr: torch.Tensor,
+            weight_indices: torch.Tensor,
+            x: torch.Tensor,
+            weights: torch.Tensor,
+            batch_size: int,
+            weight_column_major: bool,
+        ) -> torch.Tensor:
+            return module.cutlass_segment_gemm(
+                workspace_buffer,
+                seg_indptr,
+                weight_indices,
+                x,
+                weights,
+                batch_size,
+                weight_column_major,
+            )
+
+        @register_fake_op("flashinfer::cutlass_segment_gemm")
+        def _fake_cutlass_segment_gemm(
+            workspace_buffer: torch.Tensor,
+            seg_indptr: torch.Tensor,
+            weight_indices: torch.Tensor,
+            x: torch.Tensor,
+            weights: torch.Tensor,
+            batch_size: int,
+            weight_column_major: bool,
+        ) -> torch.Tensor:
+            return torch.empty_like(x)
+
+        # Register the module
+        _gemm_module = SimpleNamespace(
+            bmm_fp8=bmm_fp8,
+            cutlass_segment_gemm=cutlass_segment_gemm,
+        )
+
     return _gemm_module
 
 
@@ -53,9 +120,9 @@ def get_gemm_sm90_module():
         if has_prebuilt_ops:
             from . import _kernels_sm90
 
-            _gemm_module_sm90 = _kernels_sm90
+            module = _kernels_sm90
         else:
-            _gemm_module_sm90 = load_cuda_ops(
+            module = load_cuda_ops(
                 "gemm_sm90",
                 [
                     FLASHINFER_CSRC_DIR / "group_gemm_sm90.cu",
@@ -63,6 +130,49 @@ def get_gemm_sm90_module():
                 ],
                 extra_cuda_cflags=["-gencode", "arch=compute_90a,code=sm_90a"],
             )
+
+        # torch library for cutlass_segment_gemm_sm90
+
+        @register_custom_op("flashinfer::cutlass_segment_gemm_sm90", mutates_args=())
+        def cutlass_segment_gemm_sm90(
+            workspace_buffer: torch.Tensor,
+            int_workspace_buffer: torch.Tensor,
+            seg_indptr: torch.Tensor,
+            weight_indices: torch.Tensor,
+            x: torch.Tensor,
+            weights: torch.Tensor,
+            batch_size: int,
+            weight_column_major: bool,
+        ) -> torch.Tensor:
+            return module.cutlass_segment_gemm_sm90(
+                workspace_buffer,
+                int_workspace_buffer,
+                seg_indptr,
+                weight_indices,
+                x,
+                weights,
+                batch_size,
+                weight_column_major,
+            )
+
+        @register_fake_op("flashinfer::cutlass_segment_gemm_sm90")
+        def _fake_cutlass_segment_gemm_sm90(
+            workspace_buffer: torch.Tensor,
+            int_workspace_buffer: torch.Tensor,
+            seg_indptr: torch.Tensor,
+            weight_indices: torch.Tensor,
+            x: torch.Tensor,
+            weights: torch.Tensor,
+            batch_size: int,
+            weight_column_major: bool,
+        ) -> torch.Tensor:
+            return torch.empty_like(x)
+
+        # Register the module
+        _gemm_module_sm90 = SimpleNamespace(
+            cutlass_segment_gemm_sm90=cutlass_segment_gemm_sm90,
+        )
+
     return _gemm_module_sm90
 
 
