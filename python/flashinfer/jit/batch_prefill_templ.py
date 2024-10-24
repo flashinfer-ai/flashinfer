@@ -196,7 +196,8 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
   void* float_buffer_ptr = static_cast<void*>(float_workspace_buffer.data_ptr());
   void* int_buffer_ptr = static_cast<void*>(int_workspace_buffer.data_ptr());
   
-  const auto q_stride_n = q.stride(0), q_stride_h = q.stride(1);
+  const auto q_stride_n = q.stride(0);
+  const auto q_stride_h = q.stride(1);
 
   const int64_t* kv_cache_strides = nullptr;
   auto k_strides = paged_k_cache.strides();

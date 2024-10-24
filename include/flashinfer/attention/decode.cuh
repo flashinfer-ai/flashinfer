@@ -439,7 +439,6 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__
   vec_t<float, vec_size> q_vec;
   vec_t<float, vec_size> freq;
   int32_t q_offset_val = q_offset == nullptr ? (kv_len - 1) : q_offset[batch_idx];
-  // TODO(cilei): set q_vec according to stride values from params
   const uint32_t q_stride_n = params.q_stride_n;
   const uint32_t q_stride_h = params.q_stride_h;
   if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {

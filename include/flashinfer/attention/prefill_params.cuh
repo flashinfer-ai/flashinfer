@@ -231,8 +231,6 @@ struct BatchPrefillPagedParams {
   uint32_t padded_batch_size;
   bool partition_kv;
 
-  // TODO(cilei): add q_stride_n, q_stride_h
-
   __host__ BatchPrefillPagedParams(DTypeQ* q, paged_kv_t<DTypeKV, IdType> paged_kv,
                                    uint8_t* custom_mask, IdType* q_indptr, IdType* qk_indptr,
                                    IdType* q_offset, DTypeO* o, float* lse, float* alibi_slopes,

@@ -1867,8 +1867,6 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPag
     const uint32_t qo_packed_idx_base =
         (qo_tile_idx * NUM_WARPS_Q + get_warp_idx_q<NUM_WARPS_Q, NUM_WARPS_KV>()) * NUM_FRAGS_Q *
         16;
-    // TODO(cilei): set q_stride_n, q_stride_h from params
-    // const uint32_t q_stride_n = num_qo_heads * head_dim, q_stride_h = head_dim;
     const uint32_t q_stride_n = params.q_stride_n, q_stride_h = params.q_stride_h;
     constexpr SwizzleMode swizzle_mode_q = SwizzleMode::k128B;
     smem_t<swizzle_mode_q> qo_smem(smem);

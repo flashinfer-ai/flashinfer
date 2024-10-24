@@ -238,7 +238,8 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
   auto kv_scalar_type = paged_k_cache.scalar_type();
 
   // get q_stride_n and q_stride_h
-  const auto q_stride_n = q.stride(0), q_stride_h = q.stride(1);
+  const auto q_stride_n = q.stride(0);
+  const auto q_stride_h = q.stride(1);
 
   // get kv_cache_strides
   const int64_t* kv_cache_strides = nullptr;
@@ -268,7 +269,6 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
                                 get_variant_code(/*use_custom_mask=*/MASK_MODE == MaskMode::kCustom,
                                                  /*use_sliding_window=*/true, USE_LOGITS_SOFT_CAP,
                                                  /*use_alibi_slopes=*/false)>;
-          // TODO(cilei): set q_stride_n, q_stride_h
           PagedParamsT params(
               static_cast<DTypeQ*>(q.data_ptr()), paged_kv,
               maybe_custom_mask.has_value() ? static_cast<uint8_t*>(maybe_custom_mask->data_ptr())
