@@ -41,9 +41,9 @@ struct AttentionKernelTraits {
   using index_t = int64_t;
 
   // The number of threads.
-  static constexpr int kNWarps = NUM_WARPS_;
-  static constexpr int kNThreads = kNWarps * cutlass::NumThreadsPerWarp;
-  static constexpr int NumProducerThreads = cutlass::NumThreadsPerWarp;
+  static constexpr int NUM_WARPS = NUM_WARPS_;
+  static constexpr int NUM_THREADS = NUM_WARPS * cutlass::NumThreadsPerWarp;
+  static constexpr int NUM_PRODUCER_THREADS = cutlass::NumThreadsPerWarp;
 
   static_assert(NUM_WARPS_ == 4 || NUM_WARPS_ == 8 || NUM_WARPS_ == 12 || NUM_WARPS_ == 16);
   static constexpr bool Is_WS = NUM_WARPS_ >= 12;

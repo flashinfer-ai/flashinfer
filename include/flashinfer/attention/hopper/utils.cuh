@@ -17,21 +17,11 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
+#include "../../utils.cuh"
 
 #include <cute/arch/cluster_sm90.hpp>  // For cute::elect_one_sync()
 #include <cute/tensor.hpp>
 
-#define CHECK_CUDA(call)                                              \
-  do {                                                                \
-    cudaError_t status_ = call;                                       \
-    if (status_ != cudaSuccess) {                                     \
-      fprintf(stderr, "CUDA error (%s:%d): %s\n", __FILE__, __LINE__, \
-              cudaGetErrorString(status_));                           \
-      exit(1);                                                        \
-    }                                                                 \
-  } while (0)
-
-#define CHECK_CUDA_KERNEL_LAUNCH() CHECK_CUDA(cudaGetLastError())
 
 namespace flashinfer {
 
@@ -219,7 +209,7 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
   }
 }
 
-template <int NumCopyThreads, typename ElemO, typename TiledCopyO, typename LayoutO,
+template <int NUM_TMA_THREADS, typename ElemO, typename TiledCopyO, typename LayoutO,
           typename TileShapeO, typename SMemO>
 __forceinline__ __device__ void write_tiled(ElemO* O, const TiledCopyO& tiled_copy_O,
                                             const LayoutO& layout_O, const TileShapeO& tile_shape_O,
@@ -229,7 +219,7 @@ __forceinline__ __device__ void write_tiled(ElemO* O, const TiledCopyO& tiled_co
   Tensor gO = get_local_tile_tensor(mO, tile_shape_O, head_idx, /*offset=*/0, qo_len)(
       _, _, q_tile_idx);  // (M, K)
 
-  ThrCopy thr_copy_O = tiled_copy_O.get_slice(threadIdx.x - NumCopyThreads);
+  ThrCopy thr_copy_O = tiled_copy_O.get_slice(threadIdx.x - NUM_TMA_THREADS);
   Tensor tOgO = thr_copy_O.partition_D(gO);  // (CPY,CPY_M,CPY_K,k)
   Tensor tOsO = thr_copy_O.partition_S(sO);  // (CPY,CPY_M,CPY_K)
 
@@ -261,14 +251,14 @@ __forceinline__ __device__ void write_tiled(ElemO* O, const TiledCopyO& tiled_co
   }
 }
 
-template <int NumCopyThreads, typename ElemO, typename TMACopyO, typename TiledCopyO,
+template <int NUM_TMA_THREADS, typename ElemO, typename TMACopyO, typename TiledCopyO,
           typename LayoutO, typename TileShapeO, typename SMemO>
 __forceinline__ __device__ void write_O(ElemO* O, const TMACopyO& tma_copy_O,
                                         const TiledCopyO& tiled_copy_O, const LayoutO& layout_O,
                                         const TileShapeO& tile_shape_O, const SMemO& sO,
                                         int q_tile_idx, int head_idx, int qo_len,
                                         int write_warp_idx) {
-  write_tiled<NumCopyThreads>(O, tiled_copy_O, layout_O, tile_shape_O, sO, q_tile_idx, head_idx,
+  write_tiled<NUM_TMA_THREADS>(O, tiled_copy_O, layout_O, tile_shape_O, sO, q_tile_idx, head_idx,
                               qo_len);
 }
 

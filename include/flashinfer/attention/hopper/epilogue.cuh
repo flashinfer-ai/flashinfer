@@ -17,7 +17,7 @@ namespace flashinfer {
 
 using namespace cute;
 
-// template <int HEAD_DIM_, int CTA_Q_, int CTA_KV_, int kNWarps_, typename Element_>
+// template <int HEAD_DIM_, int CTA_Q_, int CTA_KV_, int NUM_WARPS_, typename Element_>
 template <typename Ktraits>
 struct CollectiveEpilogue {
   using Element = typename Ktraits::OutputType;
@@ -26,12 +26,12 @@ struct CollectiveEpilogue {
   static constexpr int HEAD_DIM = Ktraits::HEAD_DIM;
   using TileShape_MNK = Shape<Int<CTA_Q>, Int<CTA_KV>, Int<HEAD_DIM>>;
 
-  static constexpr int kNWarps = Ktraits::kNWarps;
-  static constexpr int kNThreads = kNWarps * cutlass::NumThreadsPerWarp;
-  static constexpr bool Is_WS = kNWarps >= 12;
+  static constexpr int NUM_WARPS = Ktraits::NUM_WARPS;
+  static constexpr int NUM_THREADS = NUM_WARPS * cutlass::NumThreadsPerWarp;
+  static constexpr bool Is_WS = NUM_WARPS >= 12;
 
-  static constexpr int NumCopyThreads = !Is_WS ? 0 : cutlass::NumThreadsPerWarpGroup;
-  static constexpr int NumMmaThreads = kNThreads - NumCopyThreads;
+  static constexpr int NUM_TMA_THREADS = !Is_WS ? 0 : cutlass::NumThreadsPerWarpGroup;
+  static constexpr int NUM_MMA_THREADS = NUM_THREADS - NUM_TMA_THREADS;
 
   using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::ss_smem_selector<
                                    GMMA::Major::K, Element, decltype(cute::get<0>(TileShape_MNK{})),
@@ -61,8 +61,8 @@ struct CollectiveEpilogue {
   static constexpr int kNumVecElem = ceil_div(128, sizeof_bits_v<Element>);
   static_assert(HEAD_DIM % kNumVecElem == 0);
   static constexpr int kNumThreadsPerRow = HEAD_DIM / kNumVecElem;
-  static_assert(NumMmaThreads % kNumThreadsPerRow == 0);
-  static constexpr int kNumRows = NumMmaThreads / kNumThreadsPerRow;
+  static_assert(NUM_MMA_THREADS % kNumThreadsPerRow == 0);
+  static constexpr int kNumRows = NUM_MMA_THREADS / kNumThreadsPerRow;
   using TiledCopyOAtom = cute::Copy_Atom<cute::UniversalCopy<cutlass::uint128_t>, Element>;
   using TiledCopyOThrLayout = decltype(cute::make_layout(
       cute::make_shape(Int<kNumRows>{}, Int<kNumThreadsPerRow>{}), LayoutRight{}));
@@ -126,11 +126,11 @@ struct CollectiveEpilogue {
     Tensor taccOsO = smem_thr_copy_O.partition_D(sO);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
 
     // Make sure all WGs have finished reading V
-    cutlass::arch::NamedBarrier::sync(NumMmaThreads,
+    cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS,
                                       static_cast<int>(NamedBarriers::kValueEmpty) /*id*/);
     cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
     cutlass::arch::fence_view_async_shared();  // ensure smem writes are visible to TMA
-    cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp,
+    cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + cutlass::NumThreadsPerWarp,
                                         cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
 
     Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.ptr_LSE), epilogue_params.layout_LSE);
@@ -154,13 +154,13 @@ struct CollectiveEpilogue {
       }
     }
 
-    int write_warp_idx = kNWarps - 1;
+    int write_warp_idx = NUM_WARPS - 1;
     if (cutlass::canonical_warp_idx_sync() == write_warp_idx) {
-      cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarp,
+      cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + cutlass::NumThreadsPerWarp,
                                         cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
     }
     TiledCopyO gmem_tiled_copy_O;
-    write_O<NumCopyThreads>(epilogue_params.ptr_O, epilogue_params.tma_store_O, gmem_tiled_copy_O,
+    write_O<NUM_TMA_THREADS>(epilogue_params.ptr_O, epilogue_params.tma_store_O, gmem_tiled_copy_O,
                             epilogue_params.layout_O, select<0, 2>(TileShape_MNK{}), sO, q_tile_idx,
                             head_idx, qo_len, write_warp_idx);
   }
@@ -199,7 +199,7 @@ struct CollectiveEpilogue {
     copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false,
          /*Clear_OOB_K=*/false>(gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO,
                                 qo_len - q_tile_idx * CTA_Q);
-    static_assert(CTA_Q <= NumMmaThreads);
+    static_assert(CTA_Q <= NUM_MMA_THREADS);
     if (thread_idx < qo_len - q_tile_idx * CTA_Q) {
       gLSE(thread_idx) = -math::inf;
     }

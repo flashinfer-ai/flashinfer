@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <cuda_device_runtime_api.h>
 #include <cutlass/arch/reg_reconfig.h>
 #include <cutlass/array.h>
 #include <cutlass/cutlass.h>
@@ -29,7 +30,7 @@ namespace flashinfer {
 using namespace cute;
 
 template <typename Ktraits, bool CAUSAL, typename TileScheduler>
-__global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 1)
+__global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp, 1)
     SinglePrefillWithKVCacheKernel(
         CUTE_GRID_CONSTANT
         typename CollectiveMainloop<Ktraits, CAUSAL>::Params const mainloop_params,
@@ -45,8 +46,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
   static_assert(Ktraits::Is_WS);
   static constexpr bool Is_WS = Ktraits::Is_WS;
 
-  static constexpr int NumMmaThreads = size(typename Ktraits::TiledMma0{});
-  static constexpr int NumCopyThreads = !Is_WS ? 0 : cutlass::NumThreadsPerWarpGroup;
+  static constexpr int NUM_MMA_THREADS = size(typename Ktraits::TiledMma0{});
+  static constexpr int NUM_TMA_THREADS = !Is_WS ? 0 : cutlass::NumThreadsPerWarpGroup;
   static constexpr int CTA_Q = Ktraits::CTA_Q;
 
   using CollectiveMainloop = CollectiveMainloop<Ktraits, CAUSAL>;
@@ -77,7 +78,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
   pipeline_params.role = warp_group_idx == 0 ? MainloopPipeline::ThreadCategory::Producer
                                              : MainloopPipeline::ThreadCategory::Consumer;
   pipeline_params.is_leader = warp_group_thread_idx == 0;
-  pipeline_params.num_consumers = NumMmaThreads;
+  pipeline_params.num_consumers = NUM_MMA_THREADS;
 
   if (warp_idx == 0 && lane_predicate) {
     shared_storage.barrier_Q.init(1 /*numThreads*/);
@@ -100,8 +101,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
   }
 
   if (warp_group_idx == 0) {  // Producer
-    cutlass::arch::warpgroup_reg_dealloc<Ktraits::kNWarps == 12 ? 24 : 32>();
-    // cutlass::arch::warpgroup_reg_dealloc<56>();
+    cutlass::arch::warpgroup_reg_dealloc<Ktraits::NUM_WARPS == 12 ? 24 : 32>();
 
     int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
     if (warp_idx_in_warpgroup == 0) {  // Load Q, K, V
@@ -136,8 +136,7 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
       collective_mainloop.load_tail(pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v);
     }
   } else {  // Consumer
-    cutlass::arch::warpgroup_reg_alloc<Ktraits::kNWarps == 12 ? 240 : 160>();
-    // cutlass::arch::warpgroup_reg_alloc<Ktraits::kNWarps == 12 ? 224 : 160>();
+    cutlass::arch::warpgroup_reg_alloc<Ktraits::NUM_WARPS == 12 ? 240 : 160>();
 
     TileScheduler scheduler;
     // Initialize matmul objects.
@@ -158,12 +157,11 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
                                                                                  work_tile_info)) {
       // Attention output (GEMM-II) accumulator.
       Tensor tOrO = partition_fragment_C(tiled_mma1, select<0, 2>(TileShape_MNK{}));
-      Softmax<2 * (2 * CTA_Q / NumMmaThreads)> softmax(mainloop_params.sm_scale_log2);
+      Softmax<2 * (2 * CTA_Q / NUM_MMA_THREADS)> softmax(mainloop_params.sm_scale_log2);
 
       auto block_coord = work_tile_info.get_block_coord(scheduler_params);
       auto [q_block, head_idx] = block_coord;
 
-      // TODO(Zihao): get qo_len and kv_len here
       if (q_block * CTA_Q >= qo_len) {
         continue;
       }
@@ -171,18 +169,16 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
           collective_mainloop.get_num_kv_tiles(mainloop_params, q_block, qo_len, kv_len);
       if (kv_tile_max <= 0) {  // We exit early and write 0 to gO and -inf to gLSE.
         collective_epilogue.store_zero(epilogue_params, shared_storage,
-                                       threadIdx.x - NumCopyThreads, block_coord, qo_len);
+                                       threadIdx.x - NUM_TMA_THREADS, block_coord, qo_len);
         continue;
       }
 
       collective_mainloop.mma(mainloop_params, pipeline_k, pipeline_v, smem_pipe_read_k,
                               smem_pipe_read_v, tOrO, softmax, kv_tile_max,
-                              threadIdx.x - NumCopyThreads, work_idx, q_block, shared_storage,
+                              threadIdx.x - NUM_TMA_THREADS, work_idx, q_block, shared_storage,
                               qo_len, kv_len);
-      // tOrO, softmax, kv_tile_max, threadIdx.x - NumCopyThreads + (work_idx >> 30), work_idx,
-      // shared_storage);
       collective_epilogue.store(epilogue_params, tOrO, softmax.row_sum, shared_storage, tiled_mma1,
-                                threadIdx.x - NumCopyThreads, block_coord, qo_len);
+                                threadIdx.x - NUM_TMA_THREADS, block_coord, qo_len);
 
       ++work_idx;
     }
@@ -256,21 +252,21 @@ void SinglePrefillWithKVCacheDispatched(
   // Get the ptr to kernel function.
   auto kernel = (void*)SinglePrefillWithKVCacheKernel<KernelTraits, CAUSAL, Scheduler>;
   int smem_size = sizeof(typename KernelTraits::SharedStorage);
-  CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+  FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
   int device;
   cudaGetDevice(&device);
   int multiprocessor_count;
-  CHECK_CUDA(cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
   dim3 grid_dims = Scheduler::get_grid_dim(scheduler_args, multiprocessor_count);
-  static constexpr int ctaSize = KernelTraits::kNWarps * 32;
+  static constexpr int ctaSize = KernelTraits::NUM_WARPS * 32;
   dim3 block_dims(ctaSize);
   dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}), size<2>(ClusterShape{}));
   cutlass::ClusterLaunchParams launch_params{grid_dims, block_dims, cluster_dims, smem_size,
                                              stream};
   cutlass::launch_kernel_on_cluster(launch_params, kernel, mainloop_params, epilogue_params,
                                     scheduler_params, params.qo_len, params.kv_len);
-  CHECK_CUDA_KERNEL_LAUNCH();
+  FLASHINFER_CUDA_CALL(cudaGetLastError());
 }
 
 template <typename T>

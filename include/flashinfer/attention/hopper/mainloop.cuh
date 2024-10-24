@@ -71,7 +71,7 @@ struct CollectiveMainloop {
       take<0, 2>(SmemLayoutV{}), select<1, 2>(TileShape_MNK{}),
       size<0>(ClusterShape{})));  // mcast along M mode for this N load, if any
 
-  static constexpr int NumMmaThreads = size(typename Ktraits::TiledMma0{});
+  static constexpr int NUM_MMA_THREADS = size(typename Ktraits::TiledMma0{});
   using MainloopPipeline = typename Ktraits::MainloopPipeline;
   using MainloopPipelineNoTMA = typename Ktraits::MainloopPipelineNoTMA;
   using PipelineParams = typename MainloopPipeline::Params;
@@ -210,7 +210,7 @@ struct CollectiveMainloop {
     }
 
     // Wait for the MMA warpgroups to say that smem_q is ready
-    cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarp,
+    cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + cutlass::NumThreadsPerWarp,
                                       static_cast<int>(NamedBarriers::kQueryEmpty));
 
     if (lane_predicate) {
@@ -292,7 +292,7 @@ struct CollectiveMainloop {
 
   CUTLASS_DEVICE void warp_scheduler_barrier_sync() {
     if constexpr (UseSchedulerBarrier) {
-      cutlass::arch::NamedBarrier::sync(NumMmaThreads,
+      cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS,
                                         static_cast<int>(NamedBarriers::kWarpSchedulerWG1) - 1 +
                                             cutlass::canonical_warp_group_idx() /*id*/);
     }
@@ -302,20 +302,20 @@ struct CollectiveMainloop {
     if constexpr (!UseSchedulerBarrier) {
       return;
     }
-    static_assert(NumMmaThreads == 2 * cutlass::NumThreadsPerWarpGroup ||
-                  NumMmaThreads == 3 * cutlass::NumThreadsPerWarpGroup);
-    if constexpr (NumMmaThreads == 2 * cutlass::NumThreadsPerWarpGroup) {
-      cutlass::arch::NamedBarrier::arrive(NumMmaThreads,
+    static_assert(NUM_MMA_THREADS == 2 * cutlass::NumThreadsPerWarpGroup ||
+                  NUM_MMA_THREADS == 3 * cutlass::NumThreadsPerWarpGroup);
+    if constexpr (NUM_MMA_THREADS == 2 * cutlass::NumThreadsPerWarpGroup) {
+      cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS,
                                           static_cast<int>(NamedBarriers::kWarpSchedulerWG1) - 1 +
                                               (3 - cutlass::canonical_warp_group_idx()) /*id*/);
     } else {
       cutlass::arch::NamedBarrier::arrive(
-          NumMmaThreads, static_cast<int>(NamedBarriers::kWarpSchedulerWG1) - 1 +
+          NUM_MMA_THREADS, static_cast<int>(NamedBarriers::kWarpSchedulerWG1) - 1 +
                              (cutlass::canonical_warp_group_idx() <= 2
                                   ? cutlass::canonical_warp_group_idx() + 1
                                   : cutlass::canonical_warp_group_idx() + 1 - 3) /*id*/);
       cutlass::arch::NamedBarrier::arrive(
-          NumMmaThreads, static_cast<int>(NamedBarriers::kWarpSchedulerWG1) - 1 +
+          NUM_MMA_THREADS, static_cast<int>(NamedBarriers::kWarpSchedulerWG1) - 1 +
                              (cutlass::canonical_warp_group_idx() <= 1
                                   ? cutlass::canonical_warp_group_idx() + 2
                                   : cutlass::canonical_warp_group_idx() + 2 - 3) /*id*/);
@@ -324,21 +324,21 @@ struct CollectiveMainloop {
 
   CUTLASS_DEVICE void mma_init() {
     // Tell producer (warp 0) that smem_q is ready
-    cutlass::arch::NamedBarrier::arrive(NumMmaThreads + Ktraits::NumProducerThreads,
+    cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
                                         static_cast<int>(NamedBarriers::kQueryEmpty) /*id*/);
     if constexpr (!UseSchedulerBarrier) {
       return;
     }
-    static_assert(NumMmaThreads == 2 * cutlass::NumThreadsPerWarpGroup ||
-                  NumMmaThreads == 3 * cutlass::NumThreadsPerWarpGroup);
+    static_assert(NUM_MMA_THREADS == 2 * cutlass::NumThreadsPerWarpGroup ||
+                  NUM_MMA_THREADS == 3 * cutlass::NumThreadsPerWarpGroup);
     if (cutlass::canonical_warp_group_idx() > 1) {
       cutlass::arch::NamedBarrier::arrive(
-          NumMmaThreads, static_cast<int>(NamedBarriers::kWarpSchedulerWG1) - 1 + 1 /*id*/);
+          NUM_MMA_THREADS, static_cast<int>(NamedBarriers::kWarpSchedulerWG1) - 1 + 1 /*id*/);
     }
-    if constexpr (NumMmaThreads == 3 * cutlass::NumThreadsPerWarpGroup) {
+    if constexpr (NUM_MMA_THREADS == 3 * cutlass::NumThreadsPerWarpGroup) {
       if (cutlass::canonical_warp_group_idx() > 2) {
         cutlass::arch::NamedBarrier::arrive(
-            NumMmaThreads, static_cast<int>(NamedBarriers::kWarpSchedulerWG1) - 1 + 2 /*id*/);
+            NUM_MMA_THREADS, static_cast<int>(NamedBarriers::kWarpSchedulerWG1) - 1 + 2 /*id*/);
       }
     }
   }
@@ -394,7 +394,7 @@ struct CollectiveMainloop {
 
     if (work_idx != 0) {
       int lane_predicate = cute::elect_one_sync();
-      if (cutlass::canonical_warp_idx_sync() == Ktraits::kNWarps - 1 && lane_predicate) {
+      if (cutlass::canonical_warp_idx_sync() == Ktraits::NUM_WARPS - 1 && lane_predicate) {
         tma_store_wait<0>();
 #pragma unroll
         for (uint32_t cta_id = 0; cta_id < size(ClusterShape{}); ++cta_id) {
@@ -503,7 +503,7 @@ struct CollectiveMainloop {
                  tOrP);
     }
     // Tell warp 0 that smem_q is ready
-    cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp,
+    cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + cutlass::NumThreadsPerWarp,
                                         static_cast<int>(NamedBarriers::kQueryEmpty) /*id*/);
     softmax.rescale_o(tOrO, scores_scale);
     consumer_wait(pipeline_v, smem_pipe_read_v);
