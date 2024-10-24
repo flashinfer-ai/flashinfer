@@ -18,8 +18,6 @@ namespace flashinfer {
 
 using namespace cute;
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
 template <bool zero_init = true, typename Engine0, typename Layout0, typename Engine1,
           typename Layout1, typename Operator>
 __device__ __forceinline__ void thread_reduce_(Tensor<Engine0, Layout0> const& tensor,
@@ -84,14 +82,13 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0>& tenso
   CUTE_STATIC_ASSERT_V(size<0>(max) == size<0>(tensor));
 #pragma unroll
   for (int mi = 0; mi < size<0>(tensor); ++mi) {
+    auto row_max = max(mi);
 #pragma unroll
     for (int ni = 0; ni < size<1>(tensor); ++ni) {
-      tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max(mi) * scale);
+      tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - row_max * scale);
     }
   }
 }
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int kNRows>
 struct Softmax {
@@ -143,7 +140,7 @@ struct Softmax {
   };
 
   template <typename Tensor0>
-  __forceinline__ __device__ TensorT finalize(Tensor0& acc_s, float descale_v = 1.f) {
+  __forceinline__ __device__ TensorT finalize(Tensor0& acc_s) {
     // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
     Tensor scores = make_tensor(acc_s.data(), convert_layout_acc_rowcol(acc_s.layout()));
     static_assert(decltype(size<0>(scores))::value == kNRows);
@@ -153,10 +150,9 @@ struct Softmax {
 #pragma unroll
     for (int mi = 0; mi < size(row_max); ++mi) {
       float sum = row_sum(mi);
-      float inv_sum = (sum == 0.f || sum != sum) ? 0.f : descale_v / sum;
-      // NOTE(Zihao) we don't scale it back
-      // row_sum(mi) = (row_max(mi) * sm_scale_log2) * float(math::loge2) + __logf(sum);
+      float inv_sum = 1.f / sum;
       scores_scale(mi) = inv_sum;
+      row_sum(mi) = row_max(mi) * sm_scale_log2 + math::ptx_log2(sum);
     }
     return scores_scale;
   };

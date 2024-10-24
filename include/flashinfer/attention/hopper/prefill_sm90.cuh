@@ -43,11 +43,8 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   using TileShape_MNK = typename Ktraits::TileShape_MNK;
   using ClusterShape = typename Ktraits::ClusterShape_MNK;
 
-  static_assert(Ktraits::Is_WS);
-  static constexpr bool Is_WS = Ktraits::Is_WS;
-
   static constexpr int NUM_MMA_THREADS = size(typename Ktraits::TiledMma0{});
-  static constexpr int NUM_TMA_THREADS = !Is_WS ? 0 : cutlass::NumThreadsPerWarpGroup;
+  static constexpr int NUM_TMA_THREADS = cutlass::NumThreadsPerWarpGroup;
   static constexpr int CTA_Q = Ktraits::CTA_Q;
 
   using CollectiveMainloop = CollectiveMainloop<Ktraits, CAUSAL>;
@@ -244,20 +241,23 @@ cudaError_t SinglePrefillWithKVCacheDispatched(
           get_lse_gmem_layout(params.qo_len, params.num_qo_heads),  // layout_LSE
       });
 
-  int num_blocks_q = cutlass::ceil_div(params.qo_len, KernelTraits::CTA_Q);
-  num_blocks_q = cutlass::ceil_div(num_blocks_q, size<0>(ClusterShape{})) * size<0>(ClusterShape{});
-  typename Scheduler::Arguments scheduler_args = {num_blocks_q, params.head_dim};
+  int num_tiles_q = cutlass::ceil_div(params.qo_len, KernelTraits::CTA_Q);
+  num_tiles_q = cutlass::ceil_div(num_tiles_q, size<0>(ClusterShape{})) * size<0>(ClusterShape{});
+  // NOTE(Zihao): change to num_kv_heads later
+  typename Scheduler::Arguments scheduler_args = {num_tiles_q, params.num_qo_heads};
   typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
 
   // Get the ptr to kernel function.
   auto kernel = (void*)SinglePrefillWithKVCacheKernel<KernelTraits, CAUSAL, Scheduler>;
   int smem_size = sizeof(typename KernelTraits::SharedStorage);
-  FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+  FLASHINFER_CUDA_CALL(
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
   int device;
   cudaGetDevice(&device);
   int multiprocessor_count;
-  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
+  FLASHINFER_CUDA_CALL(
+      cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
   dim3 grid_dims = Scheduler::get_grid_dim(scheduler_args, multiprocessor_count);
   static constexpr int ctaSize = KernelTraits::NUM_WARPS * 32;
   dim3 block_dims(ctaSize);
@@ -275,19 +275,16 @@ void SinglePrefillWithKVCache(SinglePrefillParams<T, T, T>& params, cudaStream_t
   BOOL_SWITCH(params.causal, CAUSAL, [&] {
     if (params.head_dim == 64) {
       constexpr int HEAD_DIM = 64;
-      SinglePrefillWithKVCacheDispatched<
-          AttentionKernelTraits<HEAD_DIM, 192, 128, 16, 2, T>, CAUSAL>(
-          params, stream);
+      SinglePrefillWithKVCacheDispatched<AttentionKernelTraits<HEAD_DIM, 192, 128, 16, 2, T>,
+                                         CAUSAL>(params, stream);
     } else if (params.head_dim == 128) {
       constexpr int HEAD_DIM = 128;
-      SinglePrefillWithKVCacheDispatched<
-          AttentionKernelTraits<HEAD_DIM, 128, 192, 12, 2, T>, CAUSAL>(
-          params, stream);
+      SinglePrefillWithKVCacheDispatched<AttentionKernelTraits<HEAD_DIM, 128, 192, 12, 2, T>,
+                                         CAUSAL>(params, stream);
     } else if (params.head_dim == 256) {
       constexpr int HEAD_DIM = 256;
-      SinglePrefillWithKVCacheDispatched<
-          AttentionKernelTraits<HEAD_DIM, 128, 80, 12, 2, T>, CAUSAL>(
-          params, stream);
+      SinglePrefillWithKVCacheDispatched<AttentionKernelTraits<HEAD_DIM, 128, 80, 12, 2, T>,
+                                         CAUSAL>(params, stream);
     } else {
       throw std::runtime_error("Unsupported head_dim");
     }

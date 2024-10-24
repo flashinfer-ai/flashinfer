@@ -25,12 +25,10 @@ std::vector<at::Tensor> single_prefill_with_kv_cache(
     at::Tensor& q,                    // qo_len x num_qo_heads x head_dim
     at::Tensor& k,                    // kv_len x num_kv_heads x head_dim
     at::Tensor& v,                    // kv_len x num_kv_heads x head_dim
-    c10::optional<at::Tensor>& out_,  // qo_len x num_qo_heads x head_dim
+    at::Tensor& out_,  // qo_len x num_qo_heads x head_dim
     bool causal,                      // whether to apply causal masking
     float sm_scale) {
   auto q_dtype = q.dtype();
-
-  at::Tensor out = torch::empty_like(q);
 
   // Otherwise the kernel will be launched from cuda:0 device
   // Cast to char to avoid compiler warning about narrowing
@@ -39,21 +37,21 @@ std::vector<at::Tensor> single_prefill_with_kv_cache(
   int64_t qo_len = q.size(0);
 
   auto opts = q.options();
-  auto lse = torch::empty({qo_len, num_qo_heads}, opts.dtype(at::kFloat));
-  SinglePrefillParams<cutlass::half_t, cutlass::half_t, cutlass::half_t> params;
-  params.q_ptr = q.data_ptr<cutlass::half_t>();
-  params.k_ptr = k.data_ptr<cutlass::half_t>();
-  params.v_ptr = v.data_ptr<cutlass::half_t>();
-  params.o_ptr = out.data_ptr<cutlass::half_t>();
-  params.lse_ptr = lse.data_ptr<float>();
+  auto lse = torch::empty({num_qo_heads, qo_len}, opts.dtype(at::kFloat));
+  SinglePrefillParams<cutlass::half_t, cutlass::half_t, cutlass::half_t> params; 
+  params.q_ptr = static_cast<cutlass::half_t*>(q.data_ptr());
+  params.k_ptr = static_cast<cutlass::half_t*>(k.data_ptr());
+  params.v_ptr = static_cast<cutlass::half_t*>(v.data_ptr());
+  params.o_ptr = static_cast<cutlass::half_t*>(out_.data_ptr());
+  params.lse_ptr = static_cast<float*>(lse.data_ptr());
   params.q_stride_n = q.stride(0);
   params.k_stride_n = k.stride(0);
   params.v_stride_n = v.stride(0);
-  params.o_stride_n = out.stride(0);
+  params.o_stride_n = out_.stride(0);
   params.q_stride_h = q.stride(1);
   params.k_stride_h = k.stride(1);
   params.v_stride_h = v.stride(1);
-  params.o_stride_h = out.stride(1);
+  params.o_stride_h = out_.stride(1);
   params.qo_len = q.size(0);
   params.kv_len = k.size(0);
   params.head_dim = q.size(2);
@@ -65,7 +63,7 @@ std::vector<at::Tensor> single_prefill_with_kv_cache(
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   SinglePrefillWithKVCache(params, stream);
 
-  return {out, lse};
+  return {out_, lse};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

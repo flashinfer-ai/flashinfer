@@ -61,7 +61,7 @@ CUTLASS_HOST_DEVICE auto get_lse_gmem_layout(int nnz, int num_heads) {
 
 template <typename MTensor, typename Shape>
 CUTLASS_DEVICE auto get_local_tile_tensor(const MTensor& m_tensor, const Shape& tile_shape,
-                                          int offset, int seq_len, int head_idx) {
+                                          int head_idx, int offset, int seq_len) {
   auto g_offset = local_tile(m_tensor(_, _, head_idx), cute::make_shape(1, get<1>(tile_shape)),
                              make_coord(offset, _0{}));
   auto g_sequence =
@@ -73,8 +73,9 @@ CUTLASS_DEVICE auto get_local_tile_tensor(const MTensor& m_tensor, const Shape& 
 
 template <typename MTensor, typename Shape>
 CUTLASS_DEVICE auto get_lse_local_tile_tensor(const MTensor& m_tensor, const Shape& tile_shape,
-                                              int offset, int seq_len, int head_idx) {
+                                              int head_idx, int offset, int seq_len) {
   auto g_offset = local_tile(m_tensor(head_idx, _), cute::make_shape(_1{}), make_coord(offset));
+  
   auto g_sequence =
       make_tensor(g_offset.data(), make_layout(cute::make_shape(seq_len), cute::make_shape(_1{})));
   auto g_tensor = local_tile(g_sequence, tile_shape, make_coord(_));
@@ -196,8 +197,6 @@ __forceinline__ __device__ void gemm(TiledMma& tiled_mma, Tensor0 const& tCrA, T
   }
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
 template <bool Is_even_MN = true, bool Is_even_K = true, bool Clear_OOB_MN = false,
           bool Clear_OOB_K = true, typename TiledCopy, typename Engine0, typename Layout0,
           typename Engine1, typename Layout1, typename Engine2, typename Layout2, typename Engine3,
@@ -229,59 +228,6 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
       cute::clear(D(_, m, _));
     }
   }
-}
-
-template <int NUM_TMA_THREADS, typename ElemO, typename TiledCopyO, typename LayoutO,
-          typename TileShapeO, typename SMemO>
-__forceinline__ __device__ void write_tiled(ElemO* O, const TiledCopyO& tiled_copy_O,
-                                            const LayoutO& layout_O, const TileShapeO& tile_shape_O,
-                                            const SMemO& sO, int q_tile_idx, int head_idx,
-                                            int64_t qo_len) {
-  Tensor mO = make_tensor(make_gmem_ptr(O), layout_O);
-  Tensor gO = get_local_tile_tensor(mO, tile_shape_O, head_idx, /*offset=*/0, qo_len)(
-      _, _, q_tile_idx);  // (M, K)
-
-  ThrCopy thr_copy_O = tiled_copy_O.get_slice(threadIdx.x - NUM_TMA_THREADS);
-  Tensor tOgO = thr_copy_O.partition_D(gO);  // (CPY,CPY_M,CPY_K,k)
-  Tensor tOsO = thr_copy_O.partition_S(sO);  // (CPY,CPY_M,CPY_K)
-
-  // Prepare for TiledCopy.
-  // Grouping is needed because cute::copy_if() does group_modes<1, R> for src and dst.
-  // After grouping, the first dim is number of elements to read together.
-  Tensor tOsOFlatten = cute::flatten(tOsO);
-  Tensor tOsOGroup = cute::group_modes<1, rank(tOsOFlatten)>(tOsOFlatten);
-  Tensor tOgOFlatten = cute::flatten(tOgO);
-  Tensor tOgOGroup = cute::group_modes<1, rank(tOgOFlatten)>(tOgOFlatten);
-
-  // Get thread coords to global index mapping.
-  Tensor gOCounting = cute::make_identity_tensor(gO.shape());
-  Tensor tSgOCounting = thr_copy_O.partition_D(gOCounting);
-  Tensor tSgOCountingFlatten = cute::flatten(tSgOCounting);
-  Tensor tSgOCountingGrouped = cute::group_modes<1, rank(tSgOCountingFlatten)>(tSgOCountingFlatten);
-
-  // Write out to GMEM.
-  const int kNumMsPerTile = get<0>(tile_shape_O);
-  int cta_m = std::min<int>(qo_len - q_tile_idx * kNumMsPerTile, kNumMsPerTile);
-  if (cta_m == kNumMsPerTile) {
-    copy(tiled_copy_O, tOsOGroup, tOgOGroup);
-  } else {
-    auto predicate_fn = [&](auto coords) {
-      auto s_coords = tSgOCountingGrouped(_0{}, coords);
-      return elem_less(get<0>(s_coords), cta_m);
-    };
-    copy_if(tiled_copy_O, predicate_fn, tOsOGroup, tOgOGroup);
-  }
-}
-
-template <int NUM_TMA_THREADS, typename ElemO, typename TMACopyO, typename TiledCopyO,
-          typename LayoutO, typename TileShapeO, typename SMemO>
-__forceinline__ __device__ void write_O(ElemO* O, const TMACopyO& tma_copy_O,
-                                        const TiledCopyO& tiled_copy_O, const LayoutO& layout_O,
-                                        const TileShapeO& tile_shape_O, const SMemO& sO,
-                                        int q_tile_idx, int head_idx, int qo_len,
-                                        int write_warp_idx) {
-  write_tiled<NUM_TMA_THREADS>(O, tiled_copy_O, layout_O, tile_shape_O, sO, q_tile_idx, head_idx,
-                               qo_len);
 }
 
 }  // namespace flashinfer

@@ -12,6 +12,9 @@
 #include "cutlass/layout/layout.h"
 #include "cutlass/numeric_types.h"
 #include "cutlass/pipeline/pipeline.hpp"
+#include "../../cutlass_utils.cuh"
+
+namespace flashinfer {
 
 using namespace cute;
 
@@ -46,7 +49,6 @@ struct AttentionKernelTraits {
   static constexpr int NUM_PRODUCER_THREADS = cutlass::NumThreadsPerWarp;
 
   static_assert(NUM_WARPS_ == 4 || NUM_WARPS_ == 8 || NUM_WARPS_ == 12 || NUM_WARPS_ == 16);
-  static constexpr bool Is_WS = NUM_WARPS_ >= 12;
 
   static constexpr int CTA_Q = CTA_Q_;
   static constexpr int CTA_KV = CTA_KV_;
@@ -109,4 +111,4 @@ struct AttentionKernelTraits {
   using PipelineState = typename cutlass::PipelineState<NUM_STAGES>;
 };
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
+}  // namespace flashinfer

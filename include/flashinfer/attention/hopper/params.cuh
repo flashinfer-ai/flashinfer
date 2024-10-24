@@ -10,6 +10,7 @@
 
 #include "cutlass/fast_math.h"  // For cutlass::FastDivmod
 
+namespace flashinfer {
 
 template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_>
 struct SinglePrefillParams {
@@ -43,3 +44,5 @@ struct SinglePrefillParams {
   float sm_scale_log2;
   bool causal;
 };
+
+} // namespace flashinfer

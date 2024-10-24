@@ -7,15 +7,67 @@
 
 #include <cutlass/cutlass.h>
 
+#include "../../math.cuh"
 #include "cute/tensor.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "named_barrier.cuh"
 #include "utils.cuh"
-#include "../../math.cuh"
 
 namespace flashinfer {
 
 using namespace cute;
+
+template <int NUM_TMA_THREADS, typename ElemO, typename TiledCopyO, typename LayoutO,
+          typename TileShapeO, typename SMemO>
+__forceinline__ __device__ void write_tiled(ElemO* O, const TiledCopyO& tiled_copy_O,
+                                            const LayoutO& layout_O, const TileShapeO& tile_shape_O,
+                                            const SMemO& sO, int q_tile_idx, int head_idx,
+                                            int64_t qo_len) {
+  Tensor mO = make_tensor(make_gmem_ptr(O), layout_O);
+  Tensor gO = get_local_tile_tensor(mO, tile_shape_O, head_idx, /*offset=*/0, qo_len)(
+      _, _, q_tile_idx);  // (M, K)
+
+  ThrCopy thr_copy_O = tiled_copy_O.get_slice(threadIdx.x - NUM_TMA_THREADS);
+  Tensor tOgO = thr_copy_O.partition_D(gO);  // (CPY,CPY_M,CPY_K,k)
+  Tensor tOsO = thr_copy_O.partition_S(sO);  // (CPY,CPY_M,CPY_K)
+
+  // Prepare for TiledCopy.
+  // Grouping is needed because cute::copy_if() does group_modes<1, R> for src and dst.
+  // After grouping, the first dim is number of elements to read together.
+  Tensor tOsOFlatten = cute::flatten(tOsO);
+  Tensor tOsOGroup = cute::group_modes<1, rank(tOsOFlatten)>(tOsOFlatten);
+  Tensor tOgOFlatten = cute::flatten(tOgO);
+  Tensor tOgOGroup = cute::group_modes<1, rank(tOgOFlatten)>(tOgOFlatten);
+
+  // Get thread coords to global index mapping.
+  Tensor gOCounting = cute::make_identity_tensor(gO.shape());
+  Tensor tSgOCounting = thr_copy_O.partition_D(gOCounting);
+  Tensor tSgOCountingFlatten = cute::flatten(tSgOCounting);
+  Tensor tSgOCountingGrouped = cute::group_modes<1, rank(tSgOCountingFlatten)>(tSgOCountingFlatten);
+
+  // Write out to GMEM.
+  const int kNumMsPerTile = get<0>(tile_shape_O);
+  int cta_m = std::min<int>(qo_len - q_tile_idx * kNumMsPerTile, kNumMsPerTile);
+  if (cta_m == kNumMsPerTile) {
+    copy(tiled_copy_O, tOsOGroup, tOgOGroup);
+  } else {
+    auto predicate_fn = [&](auto coords) {
+      auto s_coords = tSgOCountingGrouped(_0{}, coords);
+      return elem_less(get<0>(s_coords), cta_m);
+    };
+    copy_if(tiled_copy_O, predicate_fn, tOsOGroup, tOgOGroup);
+  }
+}
+
+template <int NUM_TMA_THREADS, typename ElemO, typename TiledCopyO, typename LayoutO,
+          typename TileShapeO, typename SMemO>
+__forceinline__ __device__ void write_O(ElemO* O, const TiledCopyO& tiled_copy_O,
+                                        const LayoutO& layout_O, const TileShapeO& tile_shape_O,
+                                        const SMemO& sO, int q_tile_idx, int head_idx, int qo_len,
+                                        int write_warp_idx) {
+  write_tiled<NUM_TMA_THREADS>(O, tiled_copy_O, layout_O, tile_shape_O, sO, q_tile_idx, head_idx,
+                               qo_len);
+}
 
 // template <int HEAD_DIM_, int CTA_Q_, int CTA_KV_, int NUM_WARPS_, typename Element_>
 template <typename Ktraits>
@@ -28,9 +80,8 @@ struct CollectiveEpilogue {
 
   static constexpr int NUM_WARPS = Ktraits::NUM_WARPS;
   static constexpr int NUM_THREADS = NUM_WARPS * cutlass::NumThreadsPerWarp;
-  static constexpr bool Is_WS = NUM_WARPS >= 12;
 
-  static constexpr int NUM_TMA_THREADS = !Is_WS ? 0 : cutlass::NumThreadsPerWarpGroup;
+  static constexpr int NUM_TMA_THREADS = cutlass::NumThreadsPerWarpGroup;
   static constexpr int NUM_MMA_THREADS = NUM_THREADS - NUM_TMA_THREADS;
 
   using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::ss_smem_selector<
@@ -41,8 +92,6 @@ struct CollectiveEpilogue {
   using SmemCopyAtomO = Copy_Atom<cute::SM90_U32x4_STSM_N, Element>;
   using SharedStorage = cute::array_aligned<Element, cute::cosize_v<SmemLayoutO>>;
 
-  using GmemTiledCopyOTMA = cute::SM90_TMA_STORE;
-
   using ShapeT = cute::Shape<int32_t, int32_t, int32_t>;
   using StrideT = cute::Shape<int64_t, _1, int64_t>;
   using LayoutT = cute::Layout<ShapeT, StrideT>;
@@ -50,11 +99,6 @@ struct CollectiveEpilogue {
   using ShapeLseT = cute::Shape<int32_t, int32_t>;
   using StrideLseT = cute::Shape<int64_t, _1>;
   using LayoutLseT = cute::Layout<ShapeLseT, StrideLseT>;
-
-  using TMA_O = decltype(make_tma_copy(
-      GmemTiledCopyOTMA{},
-      make_tensor(make_gmem_ptr(static_cast<Element*>(nullptr)), ShapeT{}, StrideT{}),
-      SmemLayoutO{}, select<0, 2>(TileShape_MNK{}), _1{}));  // no mcast for O
 
   // These are for storing the output tensor without TMA (e.g., for setting output to zero and
   // var-seq-len)
@@ -96,14 +140,11 @@ struct CollectiveEpilogue {
     LayoutT const layout_O;
     float* ptr_LSE;
     LayoutLseT const layout_LSE;
-    TMA_O tma_store_O;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
     Tensor mO = make_tensor(make_gmem_ptr(args.ptr_O), args.layout_O);
-    TMA_O tma_store_O = make_tma_copy(GmemTiledCopyOTMA{}, mO, SmemLayoutO{},
-                                      select<0, 2>(TileShape_MNK{}), _1{});  // no mcast for O
-    return {args.ptr_O, args.layout_O, args.ptr_LSE, args.layout_LSE, tma_store_O};
+    return {args.ptr_O, args.layout_O, args.ptr_LSE, args.layout_LSE};
   }
 
   /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -127,15 +168,15 @@ struct CollectiveEpilogue {
 
     // Make sure all WGs have finished reading V
     cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS,
-                                      static_cast<int>(NamedBarriers::kValueEmpty) /*id*/);
+                                      /*id=*/static_cast<int>(NamedBarriers::kValueEmpty));
     cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
     cutlass::arch::fence_view_async_shared();  // ensure smem writes are visible to TMA
     cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + cutlass::NumThreadsPerWarp,
                                         cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
 
     Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.ptr_LSE), epilogue_params.layout_LSE);
-    Tensor gLSE = get_lse_local_tile_tensor(mLSE, Shape<Int<CTA_Q>>{}, /*offset=*/0, qo_len,
-                                            head_idx)(_, q_tile_idx);
+    Tensor gLSE = get_lse_local_tile_tensor(mLSE, Shape<Int<CTA_Q>>{}, head_idx, /*offset=*/0,
+                                            qo_len)(_, q_tile_idx);
     Tensor caccO = cute::make_identity_tensor(select<0, 2>(TileShape_MNK{}));
     auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
     Tensor taccOcO = thread_mma.partition_C(caccO);  // (MMA,MMA_M,MMA_K)
@@ -160,12 +201,14 @@ struct CollectiveEpilogue {
                                         cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
     }
     TiledCopyO gmem_tiled_copy_O;
-    write_O<NUM_TMA_THREADS>(epilogue_params.ptr_O, epilogue_params.tma_store_O, gmem_tiled_copy_O,
-                            epilogue_params.layout_O, select<0, 2>(TileShape_MNK{}), sO, q_tile_idx,
-                            head_idx, qo_len, write_warp_idx);
+    write_O<NUM_TMA_THREADS>(epilogue_params.ptr_O, gmem_tiled_copy_O, epilogue_params.layout_O,
+                             select<0, 2>(TileShape_MNK{}), sO, q_tile_idx, head_idx, qo_len,
+                             write_warp_idx);
   }
 
-  CUTLASS_DEVICE void store_tail() { tma_store_wait<0>(); }
+  CUTLASS_DEVICE void store_tail() { 
+    // tma_store_wait<0>();
+  }
 
   // Write 0 to output and -inf to LSE
   template <typename SharedStorage>

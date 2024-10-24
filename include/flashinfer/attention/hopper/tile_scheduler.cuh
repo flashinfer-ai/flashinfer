@@ -11,8 +11,6 @@
 
 namespace flashinfer {
 
-///////////////////////////////////////////////////////////////////////////////
-
 struct SingleTileScheduler {
  public:
   // Host side kernel arguments

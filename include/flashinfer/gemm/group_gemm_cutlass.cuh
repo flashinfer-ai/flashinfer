@@ -26,35 +26,11 @@
 #include "cutlass/layout/matrix.h"
 #include "cutlass/numeric_types.h"
 #include "cutlass/util/packed_stride.hpp"
+#include "../cutlass_utils.cuh"
 
 namespace flashinfer {
 
 namespace group_gemm {
-
-template <typename T>
-struct cutlass_dtype {
-  using type = T;
-};
-
-template <>
-struct cutlass_dtype<half> {
-  using type = cutlass::half_t;
-};
-
-template <>
-struct cutlass_dtype<nv_bfloat16> {
-  using type = cutlass::bfloat16_t;
-};
-
-template <>
-struct cutlass_dtype<__nv_fp8_e4m3> {
-  using type = cutlass::float_e4m3_t;
-};
-
-template <>
-struct cutlass_dtype<__nv_fp8_e5m2> {
-  using type = cutlass::float_e5m2_t;
-};
 
 template <typename DTypeIn, typename DTypeOut>
 __global__ void compute_sm80_cutlass_group_gemm_args(
