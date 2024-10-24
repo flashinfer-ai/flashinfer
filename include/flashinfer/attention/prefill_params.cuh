@@ -212,6 +212,8 @@ struct BatchPrefillPagedParams {
   float* lse;
   float* alibi_slopes;
   uint32_t num_qo_heads;
+  IdType q_stride_n;
+  IdType q_stride_h;
   int32_t window_left;
   float logits_soft_cap;
   float sm_scale;
@@ -232,9 +234,9 @@ struct BatchPrefillPagedParams {
   __host__ BatchPrefillPagedParams(DTypeQ* q, paged_kv_t<DTypeKV, IdType> paged_kv,
                                    uint8_t* custom_mask, IdType* q_indptr, IdType* qk_indptr,
                                    IdType* q_offset, DTypeO* o, float* lse, float* alibi_slopes,
-                                   uint32_t num_qo_heads, int32_t window_left,
-                                   float logits_soft_cap, float sm_scale, float rope_scale,
-                                   float rope_theta)
+                                   uint32_t num_qo_heads, IdType q_stride_n, IdType q_stride_h,
+                                   int32_t window_left, float logits_soft_cap, float sm_scale,
+                                   float rope_scale, float rope_theta)
       : q(q),
         paged_kv(paged_kv),
         custom_mask(custom_mask),
@@ -245,6 +247,8 @@ struct BatchPrefillPagedParams {
         lse(lse),
         alibi_slopes(alibi_slopes),
         num_qo_heads(num_qo_heads),
+        q_stride_n(q_stride_n),
+        q_stride_h(q_stride_h),
         window_left(window_left),
         logits_soft_cap(logits_soft_cap),
         sm_scale(sm_scale),
