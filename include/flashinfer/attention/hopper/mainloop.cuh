@@ -12,11 +12,11 @@
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
 
+#include "../../math.cuh"
 #include "cute/tensor.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/pipeline/pipeline.hpp"
 #include "named_barrier.cuh"
-#include "../../math.cuh"
 #include "utils.cuh"
 
 namespace flashinfer {
@@ -27,15 +27,12 @@ template <typename Ktraits, bool CAUSAL>
 struct CollectiveMainloop {
   using Element = typename Ktraits::Element;
   using TileShape_MNK = typename Ktraits::TileShape_MNK;
-  using ClusterShape = typename Ktraits::ClusterShape_MNK;
 
   static constexpr int NUM_STAGES = Ktraits::NUM_STAGES;
   static constexpr int HEAD_DIM = Ktraits::HEAD_DIM;
 
   using GmemTiledCopyQ = cute::SM90_TMA_LOAD;
-  using GmemTiledCopyKV =
-      decltype(cutlass::gemm::collective::detail::sm90_cluster_shape_to_tma_atom(
-          shape<0>(ClusterShape{})));
+  using GmemTiledCopyKV = cute::SM90_TMA_LOAD;
 
   using SmemLayoutQ = typename Ktraits::SmemLayoutQ;
   using SmemLayoutK = typename Ktraits::SmemLayoutK;
@@ -60,16 +57,13 @@ struct CollectiveMainloop {
       GmemTiledCopyKV{},
       make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)),
                   repeat_like(StrideT{}, int32_t(0)), StrideT{}),
-      take<0, 2>(SmemLayoutK{}), select<1, 2>(TileShape_MNK{}),
-      size<0>(ClusterShape{})));  // mcast along M mode for this N load, if any
+      take<0, 2>(SmemLayoutK{}), select<1, 2>(TileShape_MNK{}), _1{}));  // no mcast
 
-  // TMA_V may differ from TMA_K for fp8 kernel (e.g. swizzling mode)
   using TMA_V = decltype(make_tma_copy(
       GmemTiledCopyKV{},
       make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)),
                   repeat_like(StrideT{}, int32_t(0)), StrideT{}),
-      take<0, 2>(SmemLayoutV{}), select<1, 2>(TileShape_MNK{}),
-      size<0>(ClusterShape{})));  // mcast along M mode for this N load, if any
+      take<0, 2>(SmemLayoutV{}), select<1, 2>(TileShape_MNK{}), _1{}));  // no mcast
 
   static constexpr int NUM_MMA_THREADS = size(typename Ktraits::TiledMma0{});
   using MainloopPipeline = typename Ktraits::MainloopPipeline;
@@ -115,13 +109,11 @@ struct CollectiveMainloop {
     TMA_Q tma_load_Q = make_tma_copy(GmemTiledCopyQ{}, mQ, SmemLayoutQ{},
                                      select<0, 2>(TileShape_MNK{}), _1{});  // no mcast for Q
     Tensor mK = make_tensor(make_gmem_ptr(args.ptr_K), args.layout_K);
-    TMA_K tma_load_K = make_tma_copy(
-        GmemTiledCopyKV{}, mK, SmemLayoutK{}(_, _, _0{}), select<1, 2>(TileShape_MNK{}),
-        size<0>(ClusterShape{}));  // mcast along M mode for this N load, if any
+    TMA_K tma_load_K = make_tma_copy(GmemTiledCopyKV{}, mK, SmemLayoutK{}(_, _, _0{}),
+                                     select<1, 2>(TileShape_MNK{}), _1{});  // no mcast
     Tensor mV = make_tensor(make_gmem_ptr(args.ptr_V), args.layout_V);
-    TMA_V tma_load_V = make_tma_copy(
-        GmemTiledCopyKV{}, mV, SmemLayoutV{}(_, _, _0{}), select<1, 2>(TileShape_MNK{}),
-        size<0>(ClusterShape{}));  // mcast along M mode for this N load, if any
+    TMA_V tma_load_V = make_tma_copy(GmemTiledCopyKV{}, mV, SmemLayoutV{}(_, _, _0{}),
+                                     select<1, 2>(TileShape_MNK{}), _1{});  // no mcast
     return {args.layout_Q,
             args.layout_K,
             args.layout_V,
@@ -148,8 +140,8 @@ struct CollectiveMainloop {
     static constexpr int CTA_KV = get<1>(TileShape_MNK{});
     int num_kv_tiles = cute::ceil_div(kv_len, CTA_KV);
     if constexpr (CAUSAL) {
-      num_kv_tiles =
-          std::min(num_kv_tiles, cute::ceil_div((q_tile_idx + 1) * CTA_Q + kv_len - qo_len, CTA_KV));
+      num_kv_tiles = std::min(num_kv_tiles,
+                              cute::ceil_div((q_tile_idx + 1) * CTA_Q + kv_len - qo_len, CTA_KV));
     }
     return num_kv_tiles;
   }
@@ -174,10 +166,6 @@ struct CollectiveMainloop {
     int kv_head_idx = mainloop_params.group_size_fastdiv.divide(head_idx);
 
     // Prepare the TMA loads
-    uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
-    constexpr uint32_t cluster_shape_x = get<0>(ClusterShape());
-    uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x,
-                                    block_rank_in_cluster / cluster_shape_x};
     Tensor gQ = get_local_tile_tensor(mQ, select<0, 2>(TileShape_MNK{}), head_idx, /*offset=*/0,
                                       qo_len)(_, _, q_tile_idx);  // (M, K)
     Tensor gK = get_local_tile_tensor(mK, select<1, 2>(TileShape_MNK{}), kv_head_idx, /*offset=*/0,
@@ -191,11 +179,11 @@ struct CollectiveMainloop {
         tma_partition(mainloop_params.tma_load_Q, _0{}, Layout<_1>{}, group_modes<0, 2>(sQ_x),
                       group_modes<0, 2>(gQ_x));  // (TMA), (TMA)
     auto [tKgK, tKsK] =
-        tma_partition(mainloop_params.tma_load_K, block_rank_in_cluster, Layout<ClusterShape>{},
-                      group_modes<0, 2>(sK), group_modes<0, 2>(gK));  // (TMA, k), (TMA, PIPE)
+        tma_partition(mainloop_params.tma_load_K, _0{}, Layout<_1>{}, group_modes<0, 2>(sK),
+                      group_modes<0, 2>(gK));  // (TMA, k), (TMA, PIPE)
     auto [tVgV, tVsV] =
-        tma_partition(mainloop_params.tma_load_V, block_rank_in_cluster, Layout<ClusterShape>{},
-                      group_modes<0, 2>(sV), group_modes<0, 2>(gV));  // (TMA, k), (TMA, PIPE)
+        tma_partition(mainloop_params.tma_load_V, _0{}, Layout<_1>{}, group_modes<0, 2>(sV),
+                      group_modes<0, 2>(gV));  // (TMA, k), (TMA, PIPE)
 
     int kv_tile_max = get_num_kv_tiles(mainloop_params, q_tile_idx, qo_len, kv_len);
     int kv_tile_idx = kv_tile_max - 1;
@@ -311,14 +299,14 @@ struct CollectiveMainloop {
     } else {
       cutlass::arch::NamedBarrier::arrive(
           NUM_MMA_THREADS, static_cast<int>(NamedBarriers::kWarpSchedulerWG1) - 1 +
-                             (cutlass::canonical_warp_group_idx() <= 2
-                                  ? cutlass::canonical_warp_group_idx() + 1
-                                  : cutlass::canonical_warp_group_idx() + 1 - 3) /*id*/);
+                               (cutlass::canonical_warp_group_idx() <= 2
+                                    ? cutlass::canonical_warp_group_idx() + 1
+                                    : cutlass::canonical_warp_group_idx() + 1 - 3) /*id*/);
       cutlass::arch::NamedBarrier::arrive(
           NUM_MMA_THREADS, static_cast<int>(NamedBarriers::kWarpSchedulerWG1) - 1 +
-                             (cutlass::canonical_warp_group_idx() <= 1
-                                  ? cutlass::canonical_warp_group_idx() + 2
-                                  : cutlass::canonical_warp_group_idx() + 2 - 3) /*id*/);
+                               (cutlass::canonical_warp_group_idx() <= 1
+                                    ? cutlass::canonical_warp_group_idx() + 2
+                                    : cutlass::canonical_warp_group_idx() + 2 - 3) /*id*/);
     }
   }
 
@@ -397,7 +385,7 @@ struct CollectiveMainloop {
       if (cutlass::canonical_warp_idx_sync() == Ktraits::NUM_WARPS - 1 && lane_predicate) {
         tma_store_wait<0>();
 #pragma unroll
-        for (uint32_t cta_id = 0; cta_id < size(ClusterShape{}); ++cta_id) {
+        for (uint32_t cta_id = 0; cta_id < 1; ++cta_id) {
           shared_storage.barrier_O.arrive(cta_id, lane_predicate);
         }
       }

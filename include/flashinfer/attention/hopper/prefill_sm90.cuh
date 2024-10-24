@@ -11,11 +11,11 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
+#include <driver_types.h>
 
 #include <stdexcept>
 
 #include "cute/tensor.hpp"
-#include "cutlass/cluster_launch.hpp"
 #include "cutlass/pipeline/pipeline.hpp"
 #include "epilogue.cuh"
 #include "kernel_traits.cuh"
@@ -41,7 +41,6 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   using ElementAccum = typename Ktraits::ElementAccum;
   using SoftType = ElementAccum;
   using TileShape_MNK = typename Ktraits::TileShape_MNK;
-  using ClusterShape = typename Ktraits::ClusterShape_MNK;
 
   static constexpr int NUM_MMA_THREADS = size(typename Ktraits::TiledMma0{});
   static constexpr int NUM_TMA_THREADS = cutlass::NumThreadsPerWarpGroup;
@@ -79,23 +78,20 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
 
   if (warp_idx == 0 && lane_predicate) {
     shared_storage.barrier_Q.init(1 /*numThreads*/);
-    shared_storage.barrier_O.init(size(ClusterShape{}) /*numThreads*/);
+    shared_storage.barrier_O.init(1 /*numThreads*/);
   }
   // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();
-  MainloopPipeline pipeline_k(shared_storage.pipeline_k, pipeline_params, ClusterShape{});
-  MainloopPipeline pipeline_v(shared_storage.pipeline_v, pipeline_params, ClusterShape{});
+  MainloopPipeline pipeline_k(shared_storage.pipeline_k, pipeline_params,
+                              /*cluster_shape=*/Shape<_1, _1, _1>{});
+  MainloopPipeline pipeline_v(shared_storage.pipeline_v, pipeline_params,
+                              /*cluster_shape=*/Shape<_1, _1, _1>{});
 
   CollectiveMainloop collective_mainloop;
   CollectiveEpilogue collective_epilogue;
 
   // We need this to guarantee that the Pipeline init is visible to all producers and consumer
   // blocks in the Cluster
-  if constexpr (size(ClusterShape{}) > 1) {
-    cute::cluster_arrive_relaxed();
-    cute::cluster_wait();
-  } else {
-    __syncthreads();
-  }
+  __syncthreads();
 
   if (warp_group_idx == 0) {  // Producer
     cutlass::arch::warpgroup_reg_dealloc<Ktraits::NUM_WARPS == 12 ? 24 : 32>();
@@ -216,7 +212,6 @@ cudaError_t SinglePrefillWithKVCacheDispatched(
   using Element = typename KernelTraits::Element;
   using OutputType = typename KernelTraits::OutputType;
   using TileShape_MNK = typename KernelTraits::TileShape_MNK;
-  using ClusterShape = typename KernelTraits::ClusterShape_MNK;
 
   using CollectiveMainloop = CollectiveMainloop<KernelTraits, CAUSAL>;
   using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
@@ -242,7 +237,6 @@ cudaError_t SinglePrefillWithKVCacheDispatched(
       });
 
   int num_tiles_q = cutlass::ceil_div(params.qo_len, KernelTraits::CTA_Q);
-  num_tiles_q = cutlass::ceil_div(num_tiles_q, size<0>(ClusterShape{})) * size<0>(ClusterShape{});
   // NOTE(Zihao): change to num_kv_heads later
   typename Scheduler::Arguments scheduler_args = {num_tiles_q, params.num_qo_heads};
   typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
@@ -261,13 +255,11 @@ cudaError_t SinglePrefillWithKVCacheDispatched(
   dim3 grid_dims = Scheduler::get_grid_dim(scheduler_args, multiprocessor_count);
   static constexpr int ctaSize = KernelTraits::NUM_WARPS * 32;
   dim3 block_dims(ctaSize);
-  dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}), size<2>(ClusterShape{}));
-  cutlass::ClusterLaunchParams launch_params{grid_dims, block_dims, cluster_dims, smem_size,
-                                             stream};
-  cutlass::launch_kernel_on_cluster(launch_params, kernel, mainloop_params, epilogue_params,
-                                    scheduler_params, params.qo_len, params.kv_len);
+  void* args[] = {&mainloop_params, &epilogue_params, &scheduler_params, &params.qo_len,
+                  &params.kv_len};
+  FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, grid_dims, block_dims, args, smem_size, stream));
 
-  return cudaGetLastError();
+  return cudaSuccess;
 }
 
 template <typename T>

@@ -56,8 +56,6 @@ struct AttentionKernelTraits {
   static_assert(HEAD_DIM % 32 == 0);
   using TileShape_MNK = Shape<Int<CTA_Q>, Int<CTA_KV>, Int<HEAD_DIM>>;
 
-  using ClusterShape_MNK = Shape<_1, _1, _1>;
-
   static constexpr int NUM_STAGES = NUM_STAGES_;
 
   using AtomLayoutMNK = Layout<Shape<Int<CTA_Q / 64>, _1, _1>>;
