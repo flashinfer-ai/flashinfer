@@ -237,6 +237,9 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
   auto q_scalar_type = q.scalar_type();
   auto kv_scalar_type = paged_k_cache.scalar_type();
 
+  // get q_stride_n and q_stride_h
+  const auto q_stride_n = q.stride(0), q_stride_h = q.stride(1);
+
   // get kv_cache_strides
   const int64_t* kv_cache_strides = nullptr;
   auto k_strides = paged_k_cache.strides();
@@ -254,8 +257,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
           paged_kv_t<DTypeKV, IdType> paged_kv(
               num_kv_heads, page_size, HEAD_DIM, batch_size, kv_layout,
               static_cast<DTypeKV*>(paged_k_cache.data_ptr()),
-              static_cast<DTypeKV*>(paged_v_cache.data_ptr()),
-              kv_cache_strides,
+              static_cast<DTypeKV*>(paged_v_cache.data_ptr()), kv_cache_strides,
               static_cast<IdType*>(paged_kv_indices.data_ptr()),
               static_cast<IdType*>(paged_kv_indptr.data_ptr()),
               static_cast<IdType*>(paged_kv_last_page_len.data_ptr()));
@@ -266,7 +268,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
                                 get_variant_code(/*use_custom_mask=*/MASK_MODE == MaskMode::kCustom,
                                                  /*use_sliding_window=*/true, USE_LOGITS_SOFT_CAP,
                                                  /*use_alibi_slopes=*/false)>;
-
+          // TODO(cilei): set q_stride_n, q_stride_h
           PagedParamsT params(
               static_cast<DTypeQ*>(q.data_ptr()), paged_kv,
               maybe_custom_mask.has_value() ? static_cast<uint8_t*>(maybe_custom_mask->data_ptr())
@@ -276,8 +278,8 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
                                           : nullptr,
               /*q_offset=*/nullptr, static_cast<DTypeO*>(o.data_ptr()),
               /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
-              /*alibi_slopes=*/nullptr, num_qo_heads, window_left, logits_soft_cap, sm_scale,
-              rope_scale, rope_theta);
+              /*alibi_slopes=*/nullptr, num_qo_heads, q_stride_n, q_stride_h, window_left,
+              logits_soft_cap, sm_scale, rope_scale, rope_theta);
 
           DTypeO* tmp_v = nullptr;
           float* tmp_s = nullptr;

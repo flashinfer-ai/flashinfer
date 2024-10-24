@@ -195,6 +195,8 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
 
   void* float_buffer_ptr = static_cast<void*>(float_workspace_buffer.data_ptr());
   void* int_buffer_ptr = static_cast<void*>(int_workspace_buffer.data_ptr());
+  
+  const auto q_stride_n = q.stride(0), q_stride_h = q.stride(1);
 
   const int64_t* kv_cache_strides = nullptr;
   auto k_strides = paged_k_cache.strides();
@@ -221,7 +223,7 @@ std::vector<torch::Tensor> BatchPrefillWithPagedKVCacheRun(
     static_cast<{{ dtype_o }}*>(o.data_ptr()),
     /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
     {% if use_alibi == "true" %}static_cast<float*>(maybe_alibi_slopes->data_ptr()){% else %}nullptr{% endif %},
-    num_qo_heads, window_left, logits_soft_cap, sm_scale, rope_scale, rope_theta);
+    num_qo_heads, q_stride_n, q_stride_h, window_left, logits_soft_cap, sm_scale, rope_scale, rope_theta);
 
   {{ dtype_o }}* tmp_v = nullptr;
   float* tmp_s = nullptr;

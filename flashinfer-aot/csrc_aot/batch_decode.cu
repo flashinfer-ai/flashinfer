@@ -128,6 +128,9 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
   auto q_scalar_type = q.scalar_type();
   auto kv_scalar_type = paged_k_cache.scalar_type();
 
+  // get q_stride_n and q_stride_h
+  const auto q_stride_n = q.stride(0), q_stride_h = q.stride(1);
+
   // get kv_cache_strides
   const int64_t* kv_cache_strides = nullptr;
   auto k_strides = paged_k_cache.strides();
@@ -154,11 +157,12 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
             static_cast<IdType*>(paged_kv_indices.data_ptr()),
             static_cast<IdType*>(paged_kv_indptr.data_ptr()),
             static_cast<IdType*>(paged_kv_last_page_len.data_ptr()));
+        // TODO(cilei): set q_stride_n, q_stride_h
         ParamsT params(static_cast<DTypeQ*>(q.data_ptr()),
                        /*q_offset=*/nullptr, paged_kv, static_cast<DTypeO*>(o.data_ptr()),
                        /*lse=*/(return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr),
-                       /*alibi_slopes=*/nullptr, num_qo_heads, window_left, logits_soft_cap,
-                       sm_scale, rope_scale, rope_theta);
+                       /*alibi_slopes=*/nullptr, num_qo_heads, q_stride_n, q_stride_h, window_left,
+                       logits_soft_cap, sm_scale, rope_scale, rope_theta);
 
         DTypeO* tmp_v = nullptr;
         float* tmp_s = nullptr;

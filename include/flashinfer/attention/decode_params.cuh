@@ -119,6 +119,8 @@ struct BatchDecodeParams {
   float* alibi_slopes;
   uint32_t padded_batch_size;
   uint32_t num_qo_heads;
+  IdType q_stride_n;
+  IdType q_stride_h;
   int32_t window_left;
   float logits_soft_cap;
   float sm_scale;
@@ -132,9 +134,12 @@ struct BatchDecodeParams {
   bool* block_valid_mask;
   bool partition_kv;
 
+  // TODO(cilei): add q_stride_n, q_stride_h
+
   __device__ __host__ BatchDecodeParams(DTypeQ* q, IdType* q_offset,
                                         paged_kv_t<DTypeKV, IdType> paged_kv, DTypeO* o, float* lse,
                                         float* alibi_slopes, uint32_t num_qo_heads,
+                                        IdType q_stride_n, IdType q_stride_h,
                                         int32_t window_left, float logits_soft_cap, float sm_scale,
                                         float rope_scale, float rope_theta)
       : q(q),
@@ -145,6 +150,8 @@ struct BatchDecodeParams {
         alibi_slopes(alibi_slopes),
         padded_batch_size(0),
         num_qo_heads(num_qo_heads),
+        q_stride_n(q_stride_n),
+        q_stride_h(q_stride_h),
         window_left(window_left),
         logits_soft_cap(logits_soft_cap),
         sm_scale(sm_scale),
