@@ -126,6 +126,9 @@
   } else if (group_size == 2) {                              \
     constexpr size_t GROUP_SIZE = 2;                         \
     __VA_ARGS__                                              \
+  } else if (group_size == 3) {                              \
+    constexpr size_t GROUP_SIZE = 3;                         \
+    __VA_ARGS__                                              \
   } else if (group_size == 4) {                              \
     constexpr size_t GROUP_SIZE = 4;                         \
     __VA_ARGS__                                              \
