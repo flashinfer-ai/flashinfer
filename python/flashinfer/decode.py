@@ -688,6 +688,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads``
         is not equal to ``num_kv_heads``, the function will use
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
+
+        The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
         batch_size = len(last_page_len)
         if logits_soft_cap is None:

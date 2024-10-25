@@ -120,12 +120,14 @@ def segment_packbits(
     >>> new_indptr
     tensor([0, 1, 2, 3], device='cuda:0')
 
+    Note
+    ----
+    ``torch.compile`` is not supported for this function because it's data dependent.
+
     See Also
     --------
     packbits
     """
-    # NOTE: torch.compile not supported for this function because it's data dependent.
-
     seglen = indptr[1:] - indptr[:-1]
     packed_len = (seglen + 7) // 8
     indptr_new = torch.zeros(len(indptr), dtype=indptr.dtype, device=indptr.device)
