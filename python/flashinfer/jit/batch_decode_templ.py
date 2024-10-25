@@ -62,7 +62,7 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
   return plan_info.ToVector();
 }
 
-std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
+torch::Tensor BatchDecodeWithPagedKVCacheRun(
     torch::Tensor float_workspace_buffer,
     torch::Tensor int_workspace_buffer,
     std::vector<int64_t> plan_info_vec,
@@ -73,7 +73,8 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
     torch::Tensor paged_kv_last_page_len,
     std::optional<torch::Tensor> alibi_slopes,
     unsigned int kv_layout_code, int window_left,
-    float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta, bool return_lse) {
+    float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta,
+    std::optional<torch::Tensor> maybe_lse) {
   DecodePlanInfo plan_info;
   plan_info.FromVector(plan_info_vec);
   QKVLayout kv_layout = static_cast<QKVLayout>(kv_layout_code);
@@ -91,9 +92,11 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
 
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   torch::Tensor o = torch::empty_like(q);
-  torch::Tensor lse;
-  if (return_lse) {
-    lse = torch::empty({batch_size, num_qo_heads}, q.options().dtype((torch::kFloat32)));
+  if (maybe_lse) {
+    const auto& lse = *maybe_lse;
+    TORCH_CHECK(lse.size(0) == q.size(0), lse.size(0), q.size(0));
+    TORCH_CHECK(lse.size(1) == q.size(1), lse.size(1), q.size(1));
+    TORCH_CHECK(lse.dtype() == torch::kFloat32, "lse must be float32");
   }
 
   TORCH_CHECK(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
@@ -122,7 +125,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
   ParamsT params(
     static_cast<{{ dtype_q }}*>(q.data_ptr()),
     /*q_offset=*/nullptr, paged_kv, static_cast<{{ dtype_o }}*>(o.data_ptr()),
-    /*lse=*/(return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr),
+    /*lse=*/(maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr),
     {% if use_alibi == "true" %}static_cast<float*>(alibi_slopes->data_ptr()){% else %}nullptr{% endif %},
     num_qo_heads, q_stride_n, q_stride_h, window_left, logits_soft_cap, sm_scale, rope_scale, rope_theta);
   
@@ -147,11 +150,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRun(
   TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
               cudaGetErrorString(status));
 
-  if (return_lse) {
-    return {o, lse};
-  } else {
-    return {o};
-  }
+  return o;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
