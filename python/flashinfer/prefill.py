@@ -49,7 +49,7 @@ from .utils import (
 )
 
 if has_prebuilt_ops:
-    from . import _prefill_kernels
+    from . import _prefill_kernels  # type: ignore[attr-defined]
 
 
 def compile_single_prefill_module(
