@@ -32,12 +32,12 @@ cudaError_t SinglePrefillWithKVCacheDispatched(typename AttentionVariant::Params
 
 }  // namespace flashinfer
 
-std::vector<torch::Tensor> single_prefill_with_kv_cache(
+torch::Tensor single_prefill_with_kv_cache(
     unsigned int mask_mode_code, torch::Tensor q, torch::Tensor k, torch::Tensor v,
     std::optional<torch::Tensor> maybe_packed_custom_mask, torch::Tensor tmp,
     std::optional<torch::Tensor> maybe_alibi_slopes, unsigned int layout,
     int32_t window_left, float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta,
-    bool return_lse) {
+    std::optional<torch::Tensor> maybe_lse) {
   auto device = q.device();
   unsigned int head_dim = q.size(2);
   unsigned int kv_len, qo_len, num_kv_heads, num_qo_heads;
@@ -58,9 +58,11 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
   }
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto o = torch::empty_like(q, q.options());
-  torch::Tensor lse = torch::empty({0});
-  if (return_lse) {
-    lse = torch::empty({qo_len, num_qo_heads}, q.options().dtype(torch::kFloat32));
+  if (maybe_lse) {
+    const auto& lse = *maybe_lse;
+    TORCH_CHECK(lse.size(0) == qo_len, lse.size(0), q.size(0));
+    TORCH_CHECK(lse.size(1) == num_qo_heads, lse.size(1), q.size(1));
+    TORCH_CHECK(lse.dtype() == torch::kFloat32, "lse must be float32");
   }
 
   constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;
@@ -90,7 +92,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
                              ? static_cast<uint8_t*>(maybe_packed_custom_mask->data_ptr())
                              : nullptr,
                          static_cast<DTypeO*>(o.data_ptr()),
-                         /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
+                         /*lse=*/(maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr),
                          /*alibi_slopes=*/nullptr, num_qo_heads, num_kv_heads, qo_len, kv_len,
                          q_stride_n, q_stride_h, kv_stride_n, kv_stride_h, head_dim, window_left,
                          logits_soft_cap, sm_scale, rope_scale, rope_theta);
@@ -109,9 +111,5 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
     });
   });
 
-  if (return_lse) {
-    return {o, lse};
-  } else {
-    return {o};
-  }
+  return o;
 }

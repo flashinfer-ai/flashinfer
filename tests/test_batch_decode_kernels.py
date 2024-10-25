@@ -81,7 +81,9 @@ def test_batch_decode_with_paged_kv_cache(
     ).to(0)
 
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
-    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, kv_layout)
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout
+    )
     wrapper.plan(
         kv_indptr,
         kv_indices,
@@ -96,7 +98,7 @@ def test_batch_decode_with_paged_kv_cache(
         q_data_type=q_dtype,
     )
     if return_lse:
-        o, _ = wrapper.run_return_lse(q, kv_data)
+        o, _ = wrapper.run(q, kv_data, return_lse=True)
     else:
         o = wrapper.run(q, kv_data)
 
@@ -134,7 +136,7 @@ def test_batch_decode_with_paged_kv_cache(
             ],
             dim=0,
         ).to(kv_dtype)
-        o_ref_i = flashinfer.single_decode_with_kv_cache(
+        o_ref_i = flashinfer.decode.single_decode_with_kv_cache(
             qi,
             ki,
             vi,
@@ -212,7 +214,9 @@ def test_batch_decode_with_tuple_paged_kv_cache(
     ).to(0)
 
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
-    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, kv_layout)
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout
+    )
     wrapper.plan(
         kv_indptr,
         kv_indices,
@@ -227,7 +231,7 @@ def test_batch_decode_with_tuple_paged_kv_cache(
         q_data_type=q_dtype,
     )
     if return_lse:
-        o, _ = wrapper.run_return_lse(q, kv_data)
+        o, _ = wrapper.run(q, kv_data, return_lse=True)
     else:
         o = wrapper.run(q, kv_data)
 
@@ -267,7 +271,7 @@ def test_batch_decode_with_tuple_paged_kv_cache(
             ],
             dim=0,
         ).to(kv_dtype)
-        o_ref_i = flashinfer.single_decode_with_kv_cache(
+        o_ref_i = flashinfer.decode.single_decode_with_kv_cache(
             qi,
             ki,
             vi,
@@ -289,7 +293,6 @@ def test_batch_decode_with_tuple_paged_kv_cache(
 @pytest.mark.parametrize(
     "kv_dtype", [torch.float16, torch.float8_e4m3fn, torch.float8_e5m2]
 )
-@pytest.mark.parametrize("contiguous_kv", [True, False])
 def test_cuda_graph_batch_decode_with_paged_kv_cache(
     batch_size,
     kv_len,
@@ -340,7 +343,7 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
     kv_last_page_device_buffer = torch.empty(batch_size).int().to(0)
 
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
-    wrapper = flashinfer.CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
+    wrapper = flashinfer.decode.CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
         workspace_buffer,
         kv_indptr_device_buffer,
         kv_indices_device_buffer,
@@ -451,7 +454,7 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
             ],
             dim=0,
         ).to(kv_dtype)
-        o_ref_i = flashinfer.single_decode_with_kv_cache(
+        o_ref_i = flashinfer.decode.single_decode_with_kv_cache(
             qi, ki, vi, pos_encoding_mode=pos_encoding_mode
         )
         torch.testing.assert_close(o[i], o_ref_i, rtol=1e-3, atol=1e-3)

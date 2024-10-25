@@ -33,7 +33,7 @@ def test_packbits(num_elements, bitorder):
     x_cpu = torch.rand(num_elements) < 0.5
     x_gpu = x_cpu.to(0)
     x_packed_ref = numpy_packbits_ref(x_cpu, bitorder)
-    x_packed = flashinfer.packbits(x_gpu, bitorder)
+    x_packed = flashinfer.quantization.packbits(x_gpu, bitorder)
 
     assert torch.equal(x_packed_ref.cpu(), x_packed.cpu())
 
@@ -47,7 +47,9 @@ def test_segment_packbits(batch_size, bitorder):
     x_cpu = torch.rand(num_elements) < 0.5
     x_gpu = x_cpu.to(0)
 
-    y_gpu, new_indptr = flashinfer.segment_packbits(x_gpu, old_indptr, bitorder)
+    y_gpu, new_indptr = flashinfer.quantization.segment_packbits(
+        x_gpu, old_indptr, bitorder
+    )
 
     for i in range(batch_size):
         x_segment_i = x_gpu[old_indptr[i] : old_indptr[i + 1]]
