@@ -180,7 +180,7 @@ struct DecodePlanInfo {
 };
 
 float cost_function(int kv_len, int page_size, int group_size) {
-  return float(group_size) / float(page_size) + float(kv_len);
+  return float(group_size) / float(page_size) + kv_len;
 }
 
 template <typename T>
@@ -216,7 +216,7 @@ cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
   std::vector<int64_t> kv_len_vec(batch_size);
   float total_cost = 0.f;
   for (uint32_t i = 0; i < batch_size; ++i) {
-    kv_len_vec[i] = indptr_h[i + 1 + batch_size] - indptr_h[i + batch_size];
+    kv_len_vec[i] = indptr_h[i + 1] - indptr_h[i];
     if (kv_len_vec[i] < 0) {
       std::ostringstream err_msg;
       err_msg << "indptr[" << i + 1 + batch_size << "]" << indptr_h[i + 1 + batch_size]
@@ -253,7 +253,7 @@ cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
 
   std::vector<IdType> work_indptr_vec(num_ctas + 1, 0);
   for (uint32_t i = 0; i < num_ctas; ++i) {
-    work_indptr_vec[i + 1] = work_indptr_vec[i] + cta_request_indices.size();
+    work_indptr_vec[i + 1] = work_indptr_vec[i] + cta_request_indices[i].size();
   }
   IdType total_num_works = work_indptr_vec[num_ctas];
   auto request_indices_vec = flatten(cta_request_indices, total_num_works);
@@ -318,9 +318,9 @@ cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
 
   AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
   plan_info.v_offset = float_allocator.aligned_alloc_offset(
-      num_qo_heads * 16384 * HEAD_DIM * sizeof(DTypeO), 16, "batch_decode_tmp_v");
-  plan_info.s_offset = float_allocator.aligned_alloc_offset(num_qo_heads * 16384 * sizeof(float),
-                                                            16, "batch_decode_tmp_s");
+      num_qo_heads * 8192 * HEAD_DIM * sizeof(DTypeO), 16, "batch_decode_tmp_v");
+  plan_info.s_offset = float_allocator.aligned_alloc_offset(num_qo_heads * 8192 * sizeof(float), 16,
+                                                            "batch_decode_tmp_s");
 
   size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
 

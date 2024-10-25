@@ -43,6 +43,7 @@ class MinHeap {
     }
     heap_.back() = element;
     std::push_heap(heap_.begin(), heap_.end(), compare);
+    full_ = true;
   }
 
   Element pop() {
@@ -51,6 +52,7 @@ class MinHeap {
     }
     std::pop_heap(heap_.begin(), heap_.end(), compare);
     Element minElement = heap_.back();
+    full_ = false;
     return minElement;
   }
 
