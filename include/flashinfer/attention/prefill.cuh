@@ -628,11 +628,10 @@ __device__ __forceinline__ void compute_qk(
 
   #ifdef USE_ROCM
 
-  // TODO (yiakwy) : REMOVE
-  if (threadIdx.x == 0 && threadIdx.z == 0) {
-    printf("[compute_qk] channel_size_128b_q=%d, channel_size_128b_kv=%d\n", channel_size_128b_q, channel_size_128b_kv);
-    printf("[compute_qk] num_frags_x=%d, num_frags_y=%d, num_frags_z=%d\n", num_frags_x, num_frags_y, num_frags_z);
-  }
+  using float16_t = rocwmma::float16_t;
+
+  using float16x4  = __attribute__((__vector_size__(4 * sizeof(float16_t)))) float16_t;
+  using floatx4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
 
   // NOTE(yiakwy) : each thread of 64=16x4 threads block, cooperatively loads 4 x consecutive fp16/bf16 data to cover 16x16 matrix frag
   uint32_t a_frag[num_frags_x][2];
@@ -642,23 +641,13 @@ __device__ __forceinline__ void compute_qk(
   // TODO (yiakwy) : z={0,1} is used for lane mappping, z={2,3} used for warps mapping what if we change blckDim.x from 32 to 64
   uint32_t lane_id = ( threadIdx.x + threadIdx.z * blockDim.x ) % 64 ;
 
+  // TODO (yiakwy) : CONSTANTS
   uint32_t lane_id_x = lane_id % 16;
   uint32_t lane_id_y = lane_id / 16;
 
-  // TODO (yiakwy) : replace these variables later
-  /*
-  uint32_t warp_idx_x = get_warp_idx_x<1, 4>();
-  uint32_t warp_idx_z = get_warp_idx_z<1, 4>();
-  
-  uint32_t warp_idx   = get_warp_idx<1, 4>();
-   */
+  // TODO (yiakwy) : CONSTANTS
   uint32_t warp_idx_z = get_warp_idx_z<1, 4>();
   uint32_t warp64_idx_z = warp_idx_z / 2;
-
-  using float16_t = rocwmma::float16_t;
-
-  using float16x4  = __attribute__((__vector_size__(4 * sizeof(float16_t)))) float16_t;
-  using floatx4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
   
   #define MTX_FRAG_LDA (head_dim)
   #define MTX_FRAG_LDB (head_dim)
@@ -684,7 +673,7 @@ __device__ __forceinline__ void compute_qk(
     for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 
       // NOTE (yiakwy) : q_smem has shape of (num_frags_x, 16, 8x8), v_mfma_m16n16k16_fp16 will be applied 4 times along feat dim
-      b128_t* smem_ptr = q_smem->base + *q_smem_offset_r;// (warp_idx_x * num_frags_x * 16) * channel_size_128b_q;
+      b128_t* smem_ptr = q_smem->base + *q_smem_offset_r;
       float16_t *s = reinterpret_cast<float16_t *>(smem_ptr);
         
       float16x4 *a = reinterpret_cast<float16x4 *>(a_frag[fx]);
@@ -697,9 +686,11 @@ __device__ __forceinline__ void compute_qk(
 
         (*a)[j] = *(s + offset);
 
+        #if defined(DEBUG_PREFILL) || defined(DEBUG_PREFILL_COMPUTE_QK)
         if (fx == 0 && fy == 0) {
         printf("[compute_qk] (x=%d, y=%d, z=%d) (lane_id_x=%d, lane_id_y=%d, j=%d) (fx=%d, fy=%d) a_mtx_frag[%d, %d]=%f, *(s)=%f\n", threadIdx.x, threadIdx.y, threadIdx.z, lane_id_x, lane_id_y, j, fx, fy, lane_id_x, j + lane_id_y * 4, (float)((*a)[j]), (float)(*(s+offset)));
         }
+        #endif
       }
 
       *q_smem_offset_r =
@@ -728,13 +719,14 @@ __device__ __forceinline__ void compute_qk(
       for (uint32_t j=0; j < 4; j++) {
         // NOTE (yiakwy) : loads 16 consecutive data of 1 row
         uint32_t offset = lane_id_x + (lane_id_y * 4 + j) * MTX_FRAG_LDB;
-        // uint32_t offset = lane_id_x * MTX_FRAG_LDB + j + lane_id_y * 4;
 
         (*b)[j] = *(s+offset);
 
+        #if defined(DEBUG_PREFILL) || defined(DEBUG_PREFILL_COMPUTE_QK)
         if (fy == 0 && fz == 0) {
         printf("[compute_qk] (x=%d, y=%d, z=%d) (lane_id_x=%d, lane_id_y=%d, j=%d) (fz=%d, fy=%d) b_mtx_frag[%d, %d]=%f\n", threadIdx.x, threadIdx.y, threadIdx.z, lane_id_x, lane_id_y, j, fz, fy, lane_id_y * 4 + j, lane_id_x, (float)((*b)[j]));
         }
+        #endif
       }
 
       // NOTE(yiakwy) : k is still in row-major layout
@@ -749,15 +741,20 @@ __device__ __forceinline__ void compute_qk(
         if constexpr (std::is_same<DTypeQKAccum, float>::value) {
           floatx4 *d = reinterpret_cast<floatx4 *>(s_frag[fx][fz]);
           *d = __builtin_amdgcn_mfma_f32_16x16x16f16(*a, *b, *d, 0, 0, 0);
-          __asm__ volatile("s_barrier" ::);
 
-          if (fx == 0 && fy == 0 && fz == 0) { 
+          // __asm__ volatile("s_barrier" ::);
+          __builtin_amdgcn_s_waitcnt(0);
+          __builtin_amdgcn_s_barrier();
+
+          // #if defined(DEBUG_PREFILL) || defined(DEBUG_PREFILL_COMPUTE_QK)
+          if (fx == 0 && fy == 3 && fz == 0) { 
 
             for (uint32_t reg_id=0; reg_id < 4; reg_id++) {
-              printf("[compute_qk] (x=%d, y=%d, reg_id=%d) s_frag[fx=%d][fy=0][fz=%d][%d, %d] = %f\n", lane_id_x, lane_id_y, reg_id, fx, fz, reg_id + lane_id_y * 4, lane_id_x, (*d)[reg_id]);
+              printf("[compute_qk] (lane_id_x=%d, lane_id_y=%d, reg_id=%d) s_frag[fx=%d][fy=0][fz=%d][%d, %d] = %f\n", lane_id_x, lane_id_y, reg_id, fx, fz, reg_id + lane_id_y * 4, lane_id_x, (*d)[reg_id]);
             }
 
           }
+          // #endif
         } else {
           // TODO (yiakwy) : device cast fp32 to fp16
           assert(0 && "AMD v_mfma instruction does not support fp16 output.");
@@ -772,8 +769,10 @@ __device__ __forceinline__ void compute_qk(
     }
   }
 
-  // } // if lane_id < 64
   } // if warp64_idx_z * num_frags_z * 16 < kv_len
+  
+  // NOTE(yiakwy) : we have threads not in USE, so we must synchrose the whole threads block before prceeding
+  __syncthreads();
   #else
 
 #pragma unroll
@@ -982,6 +981,15 @@ template <uint32_t num_frags_x, uint32_t num_frags_y, uint32_t num_frags_z, type
 __device__ __forceinline__ void update_mdo_states(DTypeQKAccum (*s_frag)[num_frags_z][8],
                                                   float (*o_frag)[num_frags_y][8],
                                                   DTypeQKAccum (*m)[2], float (*d)[2]) {
+
+  #ifdef USE_ROCM
+  uint32_t lane_id = ( threadIdx.x + threadIdx.z * blockDim.x ) % 64;
+  uint32_t lane_id_x = lane_id % 16;
+  uint32_t lane_id_y = lane_id / 16;
+
+  __shared__ DTypeQKAccum s_smem[16][16];
+  #endif
+
   if constexpr (std::is_same<DTypeQKAccum, float>::value) {
 #pragma unroll
     for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
@@ -990,15 +998,78 @@ __device__ __forceinline__ void update_mdo_states(DTypeQKAccum (*s_frag)[num_fra
         float m_prev = m[fx][j];
 #pragma unroll
         for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
+
+          // NOTE(yiakwy) : should we reuse j ?
+          #ifdef USE_ROCM
+
+          for (uint32_t i=0; i < 2; i++) {
+            // TODO (yiakwy) : check s_smem swizzle strategy
+            s_smem[j * 2 + i + lane_id_y * 4][lane_id_x] = s_frag[fx][fz][j * 2 + i];
+          }
+
+          // __asm__ volatile("s_barrier" ::);
+          __builtin_amdgcn_s_waitcnt(0);
+          __builtin_amdgcn_s_barrier();
+
+          // NOTE(yiakwy) at this moment, only half of 16x16 matrix filled
+          // rows / cols     0      1     2     3  ..  7
+          //      0          0   1  2  3  4  5  6  .. 14 15 
+          //      1          16 17 18 19 20 21 22  .. 30 31
+          //                 -   -  -  -  -  -  -  ..  -  -
+          //                 -   -  -  -  -  -  -  ..  -  -
+          //      4          64 65 66 67 68 69 70  .. 71 72
+          //      5          ...
+          //     ...
+
+          // NOTE(yiakwy) : now we mimic CUDA mma rules (2 rows of registers per thread) to avoid update signature of m, d
+          // NOTE(yiakwy) : design decision, for 16x16 (implementation) fragment each thread process 4 elements, i.e. 2 elements per row (row 0, row 8 for example), 8 threads per row
+          //                each row is mapped to 8 rows {0, 1, 4, 5, 8, 9, 12, 13}
+          //                maybe we could have a good math, but let's get thing done quickly
+          constexpr uint32_t rows_map[8] = {0, 1, 4, 5, 8, 9, 12, 13};
+          uint32_t reduceop_lane_id_x = rows_map[lane_id / 8] + j * 2;
+          uint32_t reduceop_lane_id_y = (lane_id % 8) * 2;
+          float m_local = max(s_smem[reduceop_lane_id_x][reduceop_lane_id_y], s_smem[reduceop_lane_id_x][reduceop_lane_id_y + 1]);
+          m[fx][j] = max(m[fx][j], m_local);
+
+          if (fx == 0 && fz == 0) {
+            for (uint32_t i=0; i < 2; i++) {
+              printf("[update_mdo_states] (x = %d, y = %d, z = %d) , frag (fx=%d, fz=%d) (reduceop_lane_id_x=%d, reduceop_lane_id_y=%d, reg_id=%d) s_smem[%d][%d] = %f, m[%d][%d]= %f\n", threadIdx.x, threadIdx.y, threadIdx.z, fx, fz, reduceop_lane_id_x, reduceop_lane_id_y, j * 2 + i, reduceop_lane_id_x, reduceop_lane_id_y, s_smem[reduceop_lane_id_x][reduceop_lane_id_y + i], fx, j, m[fx][j]);
+            }
+          }
+
+          #else
+
           float m_local = max(max(s_frag[fx][fz][j * 2 + 0], s_frag[fx][fz][j * 2 + 1]),
                               max(s_frag[fx][fz][j * 2 + 4], s_frag[fx][fz][j * 2 + 5]));
           m[fx][j] = max(m[fx][j], m_local);
+
+          #endif // USE_ROCM
+
         }
-        m[fx][j] = max(m[fx][j], math::shfl_xor_sync(m[fx][j], 0x2));
-        m[fx][j] = max(m[fx][j], math::shfl_xor_sync(m[fx][j], 0x1));
+        #ifdef USE_ROCM
+        m[fx][j] = max(m[fx][j], math::shfl_xor_sync(m[fx][j], 0x4)); // NOTE (yiakwy) : 8 -> 4
+        #endif // USE_ROCM
+        m[fx][j] = max(m[fx][j], math::shfl_xor_sync(m[fx][j], 0x2)); // NOTE (yiakwy) : 4 -> 2
+        m[fx][j] = max(m[fx][j], math::shfl_xor_sync(m[fx][j], 0x1)); // NOTE (yiakwy) : 2 -> 1
 
         float o_scale = math::ptx_exp2(m_prev - m[fx][j]);
         d[fx][j] *= o_scale;
+
+        #ifdef USE_ROCM
+
+#pragma unroll
+        for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
+          o_frag[fx][fy][j * 2 + 0] *= o_scale;
+          o_frag[fx][fy][j * 2 + 1] *= o_scale;
+        }
+#pragma unroll
+        for (uint32_t fz = 0; fz < num_frags_z; ++ fz) {
+          // TODO (yiakwy) : check s_smem swizzle strategy
+          s_frag[fx][fz][j * 2 + 0] = math::ptx_exp2(s_smem[j * 2 + 0 + lane_id_y * 4][lane_id_x] - m[fx][j]);
+          s_frag[fx][fz][j * 2 + 1] = math::ptx_exp2(s_smem[j * 2 + 1 + lane_id_y * 4][lane_id_x] - m[fx][j]);
+        }
+
+        #else
 #pragma unroll
         for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
           o_frag[fx][fy][j * 2 + 0] *= o_scale;
@@ -1013,9 +1084,16 @@ __device__ __forceinline__ void update_mdo_states(DTypeQKAccum (*s_frag)[num_fra
           s_frag[fx][fz][j * 2 + 4] = math::ptx_exp2(s_frag[fx][fz][j * 2 + 4] - m[fx][j]);
           s_frag[fx][fz][j * 2 + 5] = math::ptx_exp2(s_frag[fx][fz][j * 2 + 5] - m[fx][j]);
         }
+        #endif // USE_ROCM
       }
     }
   } else if constexpr (std::is_same<DTypeQKAccum, half>::value) {
+
+    #ifdef USE_ROCM
+    // TODO (yiakwy) : remove assert
+    assert(0 && "[update_mdo_state] half output for accumulator is not supported yet, defaults to fp32 mixed precision!");
+    #endif
+
 #pragma unroll
     for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
       half m_prev[2];
@@ -1064,11 +1142,36 @@ __device__ __forceinline__ void compute_sfm_v(smem_t<swizzle_mode>* v_smem,
   constexpr uint32_t channel_size_128b_kv = head_dim / num_elems_per_128b<DTypeKV>();
 
   #ifdef USE_ROCM
+  
+  using float16_t = rocwmma::float16_t;
+
   using float16x4  = __attribute__((__vector_size__(4 * sizeof(rocwmma::float16_t)))) rocwmma::float16_t;
   using floatx4 = __attribute__((__vector_size__(4 * sizeof(float)))) float;
-  #endif
+
+  // TODO (yiakwy) : CONSTANTS
+  uint32_t lane_id = ( threadIdx.x + threadIdx.z * blockDim.x ) % 64;
+  uint32_t lane_id_x = lane_id % 16;
+  uint32_t lane_id_y = lane_id / 16;
+
+  // TODO (yiakwy) : CONSTANTS
+  uint32_t warp_idx_z = get_warp_idx_z<1, 4>();
+  uint32_t warp64_idx_z = warp_idx_z / 2;
+
+  // NOTE(yiakwy) : only floatx4 of s_frag is used
+
+  #define MTX_FRAG_LDA 16
+
+  DTypeQ s_frag_f16[num_frags_x][num_frags_z][4];
+ 
+  // NOTE(yiakwy) : we will write thread private memory to this to synchronize data cross lanes
+  __shared__ DTypeQKAccum s_smem[16][16];
+
+  #else
 
   DTypeQ s_frag_f16[num_frags_x][num_frags_z][8];
+
+  #endif // USE_ROCM
+
   if constexpr (std::is_same<DTypeQKAccum, float>::value) {
 #pragma unroll
     for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
@@ -1085,14 +1188,14 @@ __device__ __forceinline__ void compute_sfm_v(smem_t<swizzle_mode>* v_smem,
     for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
       
       #ifdef USE_ROCM
-        // TODO (yiakwy) : check feasibility with v_mfma_fp32_m16xn16xk16_fp16
 #pragma unroll
-        for (int i=0; i < 8; ++i) {
+        // NOTE(yiakwy) : registers points to 4 consecutive rows S[reg_id + lane_id_y * 4][lane_id_x]
+        for (int i=0; i < 4/*rows of s frag*/; ++i) {
           if constexpr (std::is_same<DTypeQKAccum, float>::value) {
-            // device cast from half to float
+            // NOTE(yiakwy) : device cast from half to float, accumulated cross lanes
             d[fx][i] += (float)s_frag_f16[fx][fz][i];
           } else {
-            // device cast from half to float
+            // NOTE(yiakwy) : device cast from float to half
             d[fx][i] += (float)s_frag[fx][fz][i];
           }
         }
@@ -1113,57 +1216,81 @@ __device__ __forceinline__ void compute_sfm_v(smem_t<swizzle_mode>* v_smem,
   for (uint32_t fz = 0; fz < num_frags_z; ++fz) {
 #pragma unroll
     for (uint32_t fy = 0; fy < num_frags_y; ++fy) {
+
+      if (warp64_idx_z * num_frags_z * 16U < 16U/*kv_len*/ ) {
+
       uint32_t b_frag[4];
       if constexpr (sizeof(DTypeKV) == 1) {
 
-        // TODO (yiakwy) : add FP8 support for KV Cache
-        assert(0 && "FP8 KV Cache is not supported.");
+          #ifdef USE_ROCM
+          // TODO (yiakwy) : add FP8 support for KV Cache
+          assert(0 && "FP8 KV Cache is not supported.");
+          #endif
 
-        uint32_t b_frag_f8[2];
-        if (fy % 2 == 0) {
-          v_smem->ldmatrix_m8n8x4_trans_left_half(*v_smem_offset_r, b_frag_f8);
-        } else {
-          v_smem->ldmatrix_m8n8x4_trans_right_half(*v_smem_offset_r, b_frag_f8);
-        }
-        b_frag_f8[0] = frag_layout_swizzle_16b_to_8b_trans(b_frag_f8[0]);
-        b_frag_f8[1] = frag_layout_swizzle_16b_to_8b_trans(b_frag_f8[1]);
-        vec_cast<DTypeQ, DTypeKV>::template cast<8>((DTypeQ*)b_frag, (DTypeKV*)b_frag_f8);
-        swap(b_frag[1], b_frag[2]);
+          uint32_t b_frag_f8[2];
+          if (fy % 2 == 0) {
+            v_smem->ldmatrix_m8n8x4_trans_left_half(*v_smem_offset_r, b_frag_f8);
+          } else {
+            v_smem->ldmatrix_m8n8x4_trans_right_half(*v_smem_offset_r, b_frag_f8);
+          }
+          b_frag_f8[0] = frag_layout_swizzle_16b_to_8b_trans(b_frag_f8[0]);
+          b_frag_f8[1] = frag_layout_swizzle_16b_to_8b_trans(b_frag_f8[1]);
+          vec_cast<DTypeQ, DTypeKV>::template cast<8>((DTypeQ*)b_frag, (DTypeKV*)b_frag_f8);
+          swap(b_frag[1], b_frag[2]);
       } else {
-        
+          
         #ifdef USE_ROCM
         
         b128_t* smem_ptr = v_smem->base + *v_smem_offset_r;
+        float16_t *s = reinterpret_cast<float16_t *>(smem_ptr);
 
         float16x4 *b = reinterpret_cast<float16x4 *>(b_frag);
 
 #pragma unroll
         for (int j=0; j < 4; j++) {
-            (*b)[j] = (rocwmma::float16_t)(*b)[j];
+          
+          uint32_t offset = lane_id_x + (lane_id_y * 4 + j) * MTX_FRAG_LDB;
+
+          (*b)[j] = (float16_t)(*(s + offset));
         }
 
         #else
         v_smem->ldmatrix_m8n8x4_trans(*v_smem_offset_r, b_frag);
         #endif // USE_ROCM
 
-      }
+      } // load v from global
+
 #pragma unroll
       for (uint32_t fx = 0; fx < num_frags_x; ++fx) {
 
         #ifdef USE_ROCM
 
+        for (uint32_t i=0; i < 4; i++) {
+          s_smem[i+lane_id_y * 4][lane_id_x] = s_frag_f16[fx][fz][i];
+        }
+
+        __asm__ volatile("s_barrier" ::);
+
         float16x4 *b = reinterpret_cast<float16x4 *>(b_frag);
-        floatx4 *o = reinterpret_cast<floatx4 *>(o_frag[fx][fz]);
+        floatx4 *o = reinterpret_cast<floatx4 *>(o_frag[fx][fy]);
 
         if constexpr (std::is_same<DTypeQKAccum, float>::value) {
-          float16x4 *a = reinterpret_cast<float16x4 *>(s_frag_f16[fx][fz]);
+          float16x4 *a = reinterpret_cast<float16x4 *>(s_smem + lane_id_x * 16 + lane_id_y * 4);
           *o = __builtin_amdgcn_mfma_f32_16x16x16f16(*a, *b, *o, 0, 0, 0);
         } else {
-          float16x4 *a = reinterpret_cast<float16x4 *>(s_frag[fx][fz]);
+          float16x4 *a = reinterpret_cast<float16x4 *>(s_smem + lane_id_x * 16 + lane_id_y * 4);
           *o = __builtin_amdgcn_mfma_f32_16x16x16f16(*a, *b, *o, 0, 0, 0);
         }
 
-        #else
+        __asm__ volatile("s_barrier" ::);
+        
+        if (fz == 0 && fy == 0 && fx == 0) {
+          for (uint32_t reg_id = 0; reg_id < 4; reg_id++) {
+            printf("[compute_sfm_v] (lane_id_x=%d, lane_id_y=%d, reg_id=%d) o_frag[fx=%d][fy=%d][%d, %d] = %f\n", lane_id_x, lane_id_y, reg_id, fx, fy, reg_id + lane_id_y * 4, lane_id_x, (*o)[reg_id]);
+          }
+        }
+
+        #else // USE_ROCM
 
         if constexpr (std::is_same<DTypeQKAccum, float>::value) {
           mma::mma_sync_m16n16k16_row_col_f16f16f32<DTypeQ>(
@@ -1184,10 +1311,13 @@ __device__ __forceinline__ void compute_sfm_v(smem_t<swizzle_mode>* v_smem,
       } else {
         *v_smem_offset_r = v_smem->template advance_offset_by_column<2>(*v_smem_offset_r, fy);
       }
+
+      } // if warp64_idx_z * num_frags_z * 16U < kv_len
+
+      *v_smem_offset_r =
+          v_smem->template advance_offset_by_row<16, channel_size_128b_kv>(*v_smem_offset_r) -
+          sizeof(DTypeKV) * num_frags_y;
     }
-    *v_smem_offset_r =
-        v_smem->template advance_offset_by_row<16, channel_size_128b_kv>(*v_smem_offset_r) -
-        sizeof(DTypeKV) * num_frags_y;
   }
   *v_smem_offset_r -= 16 * num_frags_z * channel_size_128b_kv;
 }
@@ -1453,14 +1583,30 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
     constexpr uint32_t channel_size_128b_kv = head_dim / num_elems_per_128b<DTypeKV>();
     constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeOut>(); // e.g.: 64/4
 
-    extern __shared__ uint8_t smem[];
+    extern __shared__ uint8_t smem[]; // NOTE(yaikwy) : e.g. 128 (num_frags x 4 x 16) x 64
+
+    #ifdef USE_ROCM
 
     // NOTE(yiakwy) : e.g. 1x4 fragments, threads cooperatively ld/st 16 bf16/half elements in each frag
     DTypeQKAccum s_frag[num_frags_x][num_frags_z][8];
     // NOTE(yiakwy) : e.g. 1x4 fragments, threads cooperatively ld/st 16 bf16/half elements in each frag
     float o_frag[num_frags_x][num_frags_y][8];
+    
+    DTypeQKAccum m[num_frags_x][2];
+    __shared__ float d[num_frags_x][2];
+
+    #else
+
+    // NOTE(yiakwy) : e.g. 1x4 fragments, threads cooperatively ld/st 16 bf16/half elements in each frag
+    DTypeQKAccum s_frag[num_frags_x][num_frags_z][8];
+    // NOTE(yiakwy) : e.g. 1x4 fragments, threads cooperatively ld/st 16 bf16/half elements in each frag
+    float o_frag[num_frags_x][num_frags_y][8];
+
     DTypeQKAccum m[num_frags_x][2];
     float d[num_frags_x][2];
+
+    #endif
+
     float rope_freq[num_frags_y / 2][4];
     if constexpr (pos_encoding_mode == PosEncodingMode::kRoPELlama) {
       init_rope_freq<num_frags_y>(rope_freq, log2_rope_rcp_scale, log2_rope_rcp_theta);
@@ -1702,7 +1848,7 @@ __launch_bounds__(num_warps_x* num_warps_z* warp_size) void SinglePrefillWithKVC
 
       // TODO (yiakwy) : REMOVE
       if (threadIdx.x == 0 && threadIdx.z == 0) {
-        printf("[single prefill kernel] calling pdate_mdo_states completes.");
+        printf("[single prefill kernel] calling udate_mdo_states completes.\n");
       }
 
       // NOTE (yiakwy) : prepare the next loading
@@ -2556,8 +2702,11 @@ cudaError_t SinglePrefillWithKVCacheDispatched(
         
         std::cout << "num_rows_per_cta : " << num_rows_per_cta << std::endl;
         std::cout << "num_threads : " << num_threads << std::endl;
-        std::cout << "num_warps_x : " << num_warps_x << std::endl;
-        std::cout << "num_warps_z : " << num_warps_z << std::endl;
+        std::cout << "num_warps_x (threads block) : " << num_warps_x << std::endl;
+        std::cout << "num_warps_z (threads block) : " << num_warps_z << std::endl;
+        std::cout << "num_x_frags : " << num_frags_x << std::endl;
+        std::cout << "num_y_frags : " << num_frags_y << std::endl;
+        std::cout << "num_z_frags : " << num_frags_z << std::endl;
 
         if (num_chunks <= 1 || tmp == nullptr) {
           // Enough parallelism, do not split-kv
