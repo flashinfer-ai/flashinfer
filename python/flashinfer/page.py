@@ -14,10 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import torch
-from .utils import TensorLayout, _check_kv_layout, _unpack_paged_kv_cache
-from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR, has_prebuilt_ops
+from typing import Optional
 
+import torch
+
+from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
+from .utils import (
+    TensorLayout,
+    _check_kv_layout,
+    _unpack_paged_kv_cache,
+    register_custom_op,
+    register_fake_op,
+)
 
 _page_module = None
 
@@ -38,6 +46,49 @@ def get_page_module():
                 ],
             )
     return _page_module
+
+
+@register_custom_op(
+    "flashinfer::append_paged_kv_cache",
+    mutates_args=("paged_k_cache", "paged_v_cache"),
+)
+def _append_paged_kv_cache_kernel(
+    append_key: torch.Tensor,
+    append_value: torch.Tensor,
+    append_indptr: torch.Tensor,
+    paged_k_cache: Optional[torch.Tensor],
+    paged_v_cache: Optional[torch.Tensor],
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
+    layout: int,
+) -> None:
+    get_page_module().append_paged_kv_cache(
+        append_key,
+        append_value,
+        append_indptr,
+        paged_k_cache,
+        paged_v_cache,
+        kv_indices,
+        kv_indptr,
+        kv_last_page_len,
+        layout,
+    )
+
+
+@register_fake_op("flashinfer::append_paged_kv_cache")
+def _fake_append_paged_kv_cache_kernel(
+    append_key: torch.Tensor,
+    append_value: torch.Tensor,
+    append_indptr: torch.Tensor,
+    paged_k_cache: Optional[torch.Tensor],
+    paged_v_cache: Optional[torch.Tensor],
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
+    layout: int,
+) -> None:
+    pass
 
 
 def append_paged_kv_cache(
@@ -135,7 +186,7 @@ def append_paged_kv_cache(
     incorporated appended k/v.
     """
     _check_kv_layout(kv_layout)
-    get_page_module().append_paged_kv_cache(
+    _append_paged_kv_cache_kernel(
         append_key,
         append_value,
         append_indptr,

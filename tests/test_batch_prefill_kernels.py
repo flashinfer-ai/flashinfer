@@ -87,7 +87,7 @@ def test_batch_prefill_with_paged_kv_cache(
         kv_indptr_gpu = kv_indptr_cpu.to(0)
         kv_indices_gpu = kv_indices_cpu.to(0)
         kv_last_page_len_gpu = kv_last_page_len_cpu.to(0)
-        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer, kv_layout
         )
         wrapper.plan(
@@ -104,7 +104,7 @@ def test_batch_prefill_with_paged_kv_cache(
             logits_soft_cap=logits_soft_cap,
         )
         if return_lse:
-            o, _ = wrapper.run_return_lse(q, kv_data)
+            o, _ = wrapper.run(q, kv_data, return_lse=True)
         else:
             o = wrapper.run(q, kv_data)
     else:
@@ -112,7 +112,7 @@ def test_batch_prefill_with_paged_kv_cache(
         kv_indptr_buffer = torch.empty(batch_size + 1).int().to(0)
         kv_indices_buffer = torch.empty(total_num_pages).int().to(0)
         kv_last_page_len_buffer = torch.empty(batch_size).int().to(0)
-        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer,
             kv_layout,
             use_cuda_graph=True,
@@ -148,7 +148,7 @@ def test_batch_prefill_with_paged_kv_cache(
         with torch.cuda.stream(s):
             for _ in range(3):
                 if return_lse:
-                    o, _ = wrapper.run_return_lse(q, kv_data)
+                    o, _ = wrapper.run(q, kv_data, return_lse=True)
                 else:
                     o = wrapper.run(q, kv_data)
         torch.cuda.current_stream().wait_stream(s)
@@ -156,9 +156,9 @@ def test_batch_prefill_with_paged_kv_cache(
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             if return_lse:
-                o, _ = wrapper.run_return_lse(q, kv_data)
+                o, _ = wrapper.run(q, kv_data, return_lse=True)
             else:
-                o = wrapper.run(q, kv_data) 
+                o = wrapper.run(q, kv_data)
 
         wrapper.plan(
             q_indptr_cpu,
@@ -218,7 +218,7 @@ def test_batch_prefill_with_paged_kv_cache(
             ],
             dim=0,
         ).half()
-        o_ref_i = flashinfer.single_prefill_with_kv_cache(
+        o_ref_i = flashinfer.prefill.single_prefill_with_kv_cache(
             qi,
             ki,
             vi,
@@ -304,7 +304,7 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
         kv_indptr_gpu = kv_indptr_cpu.to(0)
         kv_indices_gpu = kv_indices_cpu.to(0)
         kv_last_page_len_gpu = kv_last_page_len_cpu.to(0)
-        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer, kv_layout
         )
         wrapper.plan(
@@ -321,7 +321,7 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
             logits_soft_cap=logits_soft_cap,
         )
         if return_lse:
-            o, _ = wrapper.run_return_lse(q, kv_data)
+            o, _ = wrapper.run(q, kv_data, return_lse=True)
         else:
             o = wrapper.run(q, kv_data)
     else:
@@ -329,7 +329,7 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
         kv_indptr_buffer = torch.empty(batch_size + 1).int().to(0)
         kv_indices_buffer = torch.empty(total_num_pages).int().to(0)
         kv_last_page_len_buffer = torch.empty(batch_size).int().to(0)
-        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer,
             kv_layout,
             use_cuda_graph=True,
@@ -364,7 +364,7 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
         with torch.cuda.stream(s):
             for _ in range(3):
                 if return_lse:
-                    o, _ = wrapper.run_return_lse(q, kv_data)
+                    o, _ = wrapper.run(q, kv_data, return_lse=True)
                 else:
                     o = wrapper.run(q, kv_data)
         torch.cuda.current_stream().wait_stream(s)
@@ -372,7 +372,7 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             if return_lse:
-                o, _ = wrapper.run_return_lse(q, kv_data)
+                o, _ = wrapper.run(q, kv_data, return_lse=True)
             else:
                 o = wrapper.run(q, kv_data)
 
@@ -427,7 +427,7 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
             ],
             dim=0,
         ).half()
-        o_ref_i = flashinfer.single_prefill_with_kv_cache(
+        o_ref_i = flashinfer.prefill.single_prefill_with_kv_cache(
             qi,
             ki,
             vi,
@@ -495,7 +495,7 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
     ).to(0)
 
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
-    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+    wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout
     )
     custom_mask = (
@@ -522,7 +522,7 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
         logits_soft_cap=logits_soft_cap,
     )
     if return_lse:
-        o_custom, _ = wrapper.run_return_lse(q, kv_data)
+        o_custom, _ = wrapper.run(q, kv_data, return_lse=True)
     else:
         o_custom = wrapper.run(q, kv_data)
 
@@ -541,12 +541,10 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
         logits_soft_cap=logits_soft_cap,
     )
     if return_lse:
-        o_causal, _ = wrapper.run_return_lse(q, kv_data)
+        o_causal, _ = wrapper.run(q, kv_data, return_lse=True)
     else:
         o_causal = wrapper.run(q, kv_data)
-    torch.testing.assert_close(
-        o_custom, o_causal, rtol=1e-3, atol=1e-3
-    )
+    torch.testing.assert_close(o_custom, o_causal, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -580,7 +578,7 @@ def test_batch_prefill_with_ragged_kv_cache(
     kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len
 
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
-    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+    wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
         workspace_buffer, kv_layout
     )
     wrapper.plan(
@@ -594,12 +592,12 @@ def test_batch_prefill_with_ragged_kv_cache(
         logits_soft_cap=logits_soft_cap,
     )
     if return_lse:
-        o, _ = wrapper.run_return_lse(q, k, v)
+        o, _ = wrapper.run(q, k, v, return_lse=True)
     else:
         o = wrapper.run(q, k, v)
 
     for i in range(batch_size):
-        o_ref_i = flashinfer.single_prefill_with_kv_cache(
+        o_ref_i = flashinfer.prefill.single_prefill_with_kv_cache(
             q[q_indptr[i] : q_indptr[i + 1]],
             k[kv_indptr[i] : kv_indptr[i + 1]],
             v[kv_indptr[i] : kv_indptr[i + 1]],
@@ -640,7 +638,7 @@ def test_batch_prefill_with_ragged_kv_cache_custom_mask(
     kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len
 
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
-    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+    wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
         workspace_buffer, kv_layout
     )
 
@@ -665,7 +663,7 @@ def test_batch_prefill_with_ragged_kv_cache_custom_mask(
         logits_soft_cap=logits_soft_cap,
     )
     if return_lse:
-        o_custom, _ = wrapper.run_return_lse(q, k, v)
+        o_custom, _ = wrapper.run(q, k, v, return_lse=True)
     else:
         o_custom = wrapper.run(q, k, v)
 
@@ -681,12 +679,10 @@ def test_batch_prefill_with_ragged_kv_cache_custom_mask(
         logits_soft_cap=logits_soft_cap,
     )
     if return_lse:
-        o_causal, _ = wrapper.run_return_lse(q, k, v)
+        o_causal, _ = wrapper.run(q, k, v, return_lse=True)
     else:
         o_causal = wrapper.run(q, k, v)
-    torch.testing.assert_close(
-        o_custom, o_causal, rtol=1e-3, atol=1e-3
-    )
+    torch.testing.assert_close(o_custom, o_causal, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":

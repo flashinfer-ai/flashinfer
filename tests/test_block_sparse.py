@@ -36,7 +36,7 @@ def bsr_attention_ref(
         shape=(M, N),
     )
     dense_mask = torch.tensor(bsr.toarray(), dtype=bool, device=q.device)
-    o = flashinfer.single_prefill_with_kv_cache(q, k, v, custom_mask=dense_mask)
+    o = flashinfer.prefill.single_prefill_with_kv_cache(q, k, v, custom_mask=dense_mask)
     return o
 
 
@@ -70,7 +70,9 @@ def test_block_sparse_attention(
 
     o_ref = bsr_attention_ref(q, k, v, indptr, indices, data_mask)
     workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=0)
-    sparse_attention_wrapper = flashinfer.BlockSparseAttentionWrapper(workspace_buffer)
+    sparse_attention_wrapper = flashinfer.sparse.BlockSparseAttentionWrapper(
+        workspace_buffer
+    )
 
     sparse_attention_wrapper.plan(
         indptr,

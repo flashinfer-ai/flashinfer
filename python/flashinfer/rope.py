@@ -14,9 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import torch
-from .jit import load_cuda_ops, FLASHINFER_CSRC_DIR, has_prebuilt_ops
+from typing import Tuple
 
+import torch
+
+from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
+from .utils import register_custom_op, register_fake_op
 
 _rope_module = None
 
@@ -39,6 +42,7 @@ def get_rope_module():
     return _rope_module
 
 
+@register_custom_op("flashinfer::apply_rope_inplace", mutates_args=("q", "k"))
 def apply_rope_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -119,6 +123,20 @@ def apply_rope_inplace(
     )
 
 
+@register_fake_op("flashinfer::apply_rope_inplace")
+def _fake_apply_rope_inplace(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    indptr: torch.Tensor,
+    offsets: torch.Tensor,
+    interleave: bool = False,
+    rope_scale: float = 1,
+    rope_theta: float = 1e4,
+) -> None:
+    pass
+
+
+@register_custom_op("flashinfer::apply_llama31_rope_inplace", mutates_args=("q", "k"))
 def apply_llama31_rope_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -218,6 +236,23 @@ def apply_llama31_rope_inplace(
     )
 
 
+@register_fake_op("flashinfer::apply_llama31_rope_inplace")
+def _fake_apply_llama31_rope_inplace(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    indptr: torch.Tensor,
+    offsets: torch.Tensor,
+    interleave: bool = True,
+    rope_scale: float = 8,
+    rope_theta: float = 5e5,
+    low_freq_factor: float = 1,
+    high_freq_factor: float = 4,
+    old_context_len: int = 8192,
+) -> None:
+    pass
+
+
+@register_custom_op("flashinfer::apply_rope", mutates_args=())
 def apply_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -226,7 +261,7 @@ def apply_rope(
     interleave: bool = False,
     rope_scale: float = 1,
     rope_theta: float = 1e4,
-) -> None:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor).
 
     We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
@@ -309,6 +344,20 @@ def apply_rope(
     )
 
 
+@register_fake_op("flashinfer::apply_rope")
+def _fake_apply_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    indptr: torch.Tensor,
+    offsets: torch.Tensor,
+    interleave: bool = False,
+    rope_scale: float = 1,
+    rope_theta: float = 1e4,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(q), torch.empty_like(k)
+
+
+@register_custom_op("flashinfer::apply_llama31_rope", mutates_args=())
 def apply_llama31_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -320,7 +369,7 @@ def apply_llama31_rope(
     low_freq_factor: float = 1,
     high_freq_factor: float = 4,
     old_context_len: int = 8192,
-) -> None:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Apply Llama 3.1 style rotary embedding to a batch of queries/keys (stored as
     RaggedTensor).
 
@@ -417,3 +466,19 @@ def apply_llama31_rope(
         high_freq_factor,
         float(old_context_len),
     )
+
+
+@register_fake_op("flashinfer::apply_llama31_rope")
+def _fake_apply_llama31_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    indptr: torch.Tensor,
+    offsets: torch.Tensor,
+    interleave: bool = True,
+    rope_scale: float = 8,
+    rope_theta: float = 5e5,
+    low_freq_factor: float = 1,
+    high_freq_factor: float = 4,
+    old_context_len: int = 8192,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(q), torch.empty_like(k)
