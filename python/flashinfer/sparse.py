@@ -297,6 +297,8 @@ class BlockSparseAttentionWrapper:
         self.R = R
         self.C = C
 
+        kv_indptr_host = indptr.to("cpu", non_blocking=True)
+
         self._cached_module = get_batch_prefill_module(
             q_data_type,
             kv_data_type,
@@ -314,8 +316,8 @@ class BlockSparseAttentionWrapper:
             self._float_workspace_buffer,
             self._int_workspace_buffer,
             self._pin_memory_int_workspace_buffer,
-            qo_indptr,
-            indptr,
+            qo_indptr_host,
+            kv_indptr_host,
             num_blocks_row,
             num_qo_heads,
             num_kv_heads,
@@ -407,7 +409,6 @@ class BlockSparseAttentionWrapper:
             self._int_workspace_buffer,
             self._plan_info,
             q,
-            None,
             k,
             v,
             self._packed_mask_buf,
