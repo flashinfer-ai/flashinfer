@@ -166,24 +166,21 @@ torch::Tensor BatchDecodeWithPagedKVCacheRun(
                        /*alibi_slopes=*/nullptr, num_qo_heads, q_stride_n, q_stride_h, window_left,
                        logits_soft_cap, sm_scale, rope_scale, rope_theta);
 
-        DTypeO* tmp_v = nullptr;
-        float* tmp_s = nullptr;
+        DTypeO* tmp_v = GetPtrFromBaseOffset<DTypeO>(float_buffer, plan_info.v_offset);
+        float* tmp_s = GetPtrFromBaseOffset<float>(float_buffer, plan_info.s_offset);
+        params.work_indptr = GetPtrFromBaseOffset<IdType>(int_buffer, plan_info.work_indptr_offset);
         params.request_indices =
             GetPtrFromBaseOffset<IdType>(int_buffer, plan_info.request_indices_offset);
-        params.kv_tile_indices =
-            GetPtrFromBaseOffset<IdType>(int_buffer, plan_info.kv_tile_indices_offset);
-        params.o_indptr = GetPtrFromBaseOffset<IdType>(int_buffer, plan_info.o_indptr_offset);
-        params.kv_chunk_size_ptr =
-            GetPtrFromBaseOffset<IdType>(int_buffer, plan_info.kv_chunk_size_ptr_offset);
-        if (plan_info.split_kv) {
-          tmp_v = GetPtrFromBaseOffset<DTypeO>(float_buffer, plan_info.v_offset);
-          tmp_s = GetPtrFromBaseOffset<float>(float_buffer, plan_info.s_offset);
-          if (plan_info.enable_cuda_graph) {
-            params.block_valid_mask =
-                GetPtrFromBaseOffset<bool>(int_buffer, plan_info.block_valid_mask_offset);
-          }
-        }
-        params.padded_batch_size = plan_info.padded_batch_size;
+        params.kv_indptr_start =
+            GetPtrFromBaseOffset<IdType>(int_buffer, plan_info.kv_indptr_start_offset);
+        params.kv_indptr_end =
+            GetPtrFromBaseOffset<IdType>(int_buffer, plan_info.kv_indptr_end_offset);
+        params.kv_head_idx = GetPtrFromBaseOffset<IdType>(int_buffer, plan_info.kv_head_idx_offset);
+        params.merge_indptr =
+            GetPtrFromBaseOffset<IdType>(int_buffer, plan_info.merge_indptr_offset);
+        params.merge_indices =
+            GetPtrFromBaseOffset<IdType>(int_buffer, plan_info.merge_indices_offset);
+        params.num_ctas = plan_info.num_ctas;
 
         cudaError_t status =
             flashinfer::BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, POS_ENCODING_MODE,

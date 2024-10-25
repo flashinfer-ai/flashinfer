@@ -433,6 +433,70 @@ __global__ void PersistentVariableLengthMergeStatesKernel(DTypeIn* __restrict__ 
   }
 }
 
+template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, typename DTypeIn, typename DTypeO,
+          typename IdType>
+__global__ void NewPersistentVariableLengthMergeStatesKernel(
+    DTypeIn* __restrict__ V, float* __restrict__ S, IdType* merge_indptr, IdType* merge_indices,
+    DTypeO* __restrict__ v_merged, float* __restrict__ s_merged, uint32_t seq_len) {
+  uint32_t tx = threadIdx.x, ty = threadIdx.y;
+  uint32_t cta_id = blockIdx.x;
+  uint32_t num_ctas = gridDim.x;
+  uint32_t num_iters = ceil_div(seq_len, num_ctas);
+  extern __shared__ uint8_t smem[];
+  DTypeIn* v_smem = (DTypeIn*)smem;
+  float* s_smem = (float*)(smem + bdy * vec_size * bdx * sizeof(DTypeIn));
+  constexpr uint32_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
+  constexpr uint32_t head_dim = vec_size * bdx;
+
+#pragma unroll 1
+  for (uint32_t i = cta_id; i < seq_len; i += num_ctas) {
+    state_t<vec_size> st;
+    const uint32_t num_index_sets = merge_indptr[i + 1] - merge_indptr[i];
+
+    if (num_index_sets == 0) {
+      vec_t<DTypeO, vec_size> v;
+      v.fill(DTypeO(0.f));
+      v.store(v_merged + i * head_dim + tx * vec_size);
+      if (s_merged != nullptr) {
+        s_merged[i] = -math::inf;
+      }
+      continue;
+    }
+
+    if (num_index_sets == 1) {
+      vec_t<DTypeO, vec_size> v;
+      v.cast_load(V + (merge_indices[merge_indptr[i]]) * head_dim + tx * vec_size);
+      v.store(v_merged + i * head_dim + tx * vec_size);
+      if (s_merged != nullptr) {
+        s_merged[i] = S[merge_indices[merge_indptr[i]]];
+      }
+      continue;
+    }
+
+#pragma unroll 4
+    for (uint32_t iter = 0; iter < ceil_div(num_index_sets, bdy); ++iter) {
+      __syncthreads();
+      vec_t<float, vec_size> v;
+      v.cast_load(V + (merge_indices[merge_indptr[i] + iter * bdy + ty]) * head_dim +
+                  tx * vec_size);
+      if (iter * bdy + ty < num_index_sets) {
+        float s = S[merge_indices[merge_indptr[i] + iter * bdy + ty]];
+        st.merge(v, s, 1);
+      }
+    }
+    __syncthreads();
+
+    st.normalize();
+    threadblock_sync_state<bdx, bdy, vec_size>(st, v_smem, s_smem);
+    st.normalize();
+
+    st.o.cast_store(v_merged + i * head_dim + tx * vec_size);
+    if (s_merged != nullptr) {
+      s_merged[i] = st.get_lse();
+    }
+  }
+}
+
 template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t num_smem_stages, typename DTypeIn,
           typename DTypeO, typename IdType>
 __global__ void PersistentVariableLengthAttentionSumKernel(DTypeIn* __restrict__ V, IdType* indptr,
@@ -666,6 +730,40 @@ cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* indptr, DTyp
     dim3 nblks(num_sms * num_blocks_per_sm);
     dim3 nthrs(bdx, bdy);
     void* args[] = {&v, &s, &indptr, &v_merged, &s_merged, &seq_len, &num_heads};
+    FLASHINFER_CUDA_CALL(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  });
+  return cudaSuccess;
+}
+
+template <typename DTypeIn, typename DTypeO, typename IdType>
+cudaError_t NewVariableLengthMergeStates(DTypeIn* v, float* s, IdType* merge_indptr,
+                                         IdType* merge_indices, DTypeO* v_merged, float* s_merged,
+                                         uint32_t seq_len, uint32_t head_dim,
+                                         cudaStream_t stream = nullptr) {
+  int dev_id = 0;
+  int num_sms = 0;
+  int num_blocks_per_sm = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
+
+  DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+    constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
+    constexpr uint32_t bdx = HEAD_DIM / vec_size;
+    constexpr uint32_t num_threads = 128;
+    constexpr uint32_t bdy = num_threads / bdx;
+    uint32_t smem_size =
+        bdy * head_dim * sizeof(DTypeIn) + bdy * sizeof(float);
+    auto kernel = NewPersistentVariableLengthMergeStatesKernel<vec_size, bdx, bdy,
+                                                               DTypeIn, DTypeO, IdType>;
+    FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
+                                                                       num_threads, smem_size));
+    num_blocks_per_sm = min(num_blocks_per_sm, ceil_div(seq_len, num_sms));
+
+    dim3 nblks(num_sms * num_blocks_per_sm);
+    dim3 nthrs(bdx, bdy);
+    void* args[] = {&v, &s, &merge_indptr, &merge_indices, &v_merged, &s_merged, &seq_len};
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));

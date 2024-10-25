@@ -40,6 +40,7 @@ struct SingleDecodeParams {
   uint32_t kv_len;
   uint32_t num_qo_heads;
   uint32_t num_kv_heads;
+  uint32_t gqa_group_size;
   uint32_t q_stride_n;
   uint32_t q_stride_h;
   uint32_t kv_stride_n;
@@ -67,6 +68,7 @@ struct SingleDecodeParams {
         kv_len(seq_len),
         num_qo_heads(num_qo_heads),
         num_kv_heads(num_kv_heads),
+        gqa_group_size(num_qo_heads / num_kv_heads),
         q_stride_n(num_qo_heads * head_dim),
         q_stride_h(head_dim),
         kv_stride_n((kv_layout == QKVLayout::kNHD) ? num_kv_heads * head_dim : head_dim),
@@ -119,6 +121,7 @@ struct BatchDecodeParams {
   float* alibi_slopes;
   uint32_t padded_batch_size;
   uint32_t num_qo_heads;
+  uint32_t gqa_group_size;
   IdType q_stride_n;
   IdType q_stride_h;
   int32_t window_left;
@@ -127,12 +130,14 @@ struct BatchDecodeParams {
   float rope_rcp_scale;
   float rope_rcp_theta;
 
+  IdType* work_indptr;
   IdType* request_indices;
-  IdType* kv_tile_indices;
-  IdType* o_indptr;
-  IdType* kv_chunk_size_ptr;
-  bool* block_valid_mask;
-  bool partition_kv;
+  IdType* kv_indptr_start;
+  IdType* kv_indptr_end;
+  IdType* kv_head_idx;
+  IdType* merge_indices;
+  IdType* merge_indptr;
+  int num_ctas;
 
   __device__ __host__ BatchDecodeParams(DTypeQ* q, IdType* q_offset,
                                         paged_kv_t<DTypeKV, IdType> paged_kv, DTypeO* o, float* lse,
@@ -148,6 +153,7 @@ struct BatchDecodeParams {
         alibi_slopes(alibi_slopes),
         padded_batch_size(0),
         num_qo_heads(num_qo_heads),
+        gqa_group_size(num_qo_heads / paged_kv.num_heads),
         q_stride_n(q_stride_n),
         q_stride_h(q_stride_h),
         window_left(window_left),
@@ -155,12 +161,14 @@ struct BatchDecodeParams {
         sm_scale(sm_scale),
         rope_rcp_scale(1.f / rope_scale),
         rope_rcp_theta(1.f / rope_theta),
+        work_indptr(nullptr),
         request_indices(nullptr),
-        kv_tile_indices(nullptr),
-        o_indptr(nullptr),
-        kv_chunk_size_ptr(nullptr),
-        block_valid_mask(nullptr),
-        partition_kv(false) {}
+        kv_indptr_start(nullptr),
+        kv_indptr_end(nullptr),
+        kv_head_idx(nullptr),
+        merge_indices(nullptr),
+        merge_indptr(nullptr),
+        num_ctas(num_ctas) {}
 
   __host__ __device__ __forceinline__ int32_t get_qo_len(int32_t batch_idx) const { return 1; }
 

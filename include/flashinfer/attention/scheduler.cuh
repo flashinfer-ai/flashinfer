@@ -17,6 +17,7 @@
 #define FLASHINFER_ATTENTION_SCHEDULER_CUH_
 
 #include <cuda_runtime_api.h>
+#include <driver_types.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -28,6 +29,7 @@
 #include "../allocator.h"
 #include "../pos_enc.cuh"
 #include "../utils.cuh"
+#include "heap.h"
 
 namespace flashinfer {
 
@@ -35,47 +37,6 @@ template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t 
           uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant>
 __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__
                                                   typename AttentionVariant::ParamsT params);
-
-/*!
- * \brief Compute the maximum number of pages per batch and the new batch size
- *   after we partition Paged KV-Cache into multiple chunks on KV sequence length
- *   dimension.
- * \tparam IdType A template type indicates the index data type
- * \param max_grid_size The maximum grid size of the kernel
- * \param num_kv_heads The number of KV heads
- * \param num_pages The number of pages per request in the batch
- * \param max_num_pages_per_batch_lb The pre-set lower bound of maximum number of
- *   pages per batch, default to 1
- * \return (max_num_pages_per_batch, new_batch_size) The number of pages per batch and
- *   the new batch size after the partition.
- */
-template <typename IdType>
-auto PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(
-    const uint32_t max_grid_size, const uint32_t num_kv_heads, const std::vector<IdType>& num_pages,
-    const uint32_t min_num_pages_per_batch = 1) {
-  uint32_t low = min_num_pages_per_batch, high = 0;
-  for (const IdType& elem : num_pages) {
-    high = max(high, elem);
-  }
-  uint32_t new_batch_size;
-  while (low < high) {
-    uint32_t mid = (low + high) / 2;
-    new_batch_size = 0;
-    for (const IdType& elem : num_pages) {
-      new_batch_size += ceil_div(elem, mid);
-    }
-    if (new_batch_size * num_kv_heads > max_grid_size) {
-      low = mid + 1;
-    } else {
-      high = mid;
-    }
-  }
-  new_batch_size = 0;
-  for (const IdType& elem : num_pages) {
-    new_batch_size += ceil_div(std::max(elem, 1), low);
-  }
-  return std::make_tuple(low, new_batch_size);
-}
 
 auto PrefillBinarySearchKVChunkSize(const uint32_t max_batch_size_if_split,
                                     const std::vector<int64_t>& packed_qo_len_arr,
@@ -129,11 +90,7 @@ auto PrefillBinarySearchKVChunkSize(const uint32_t max_batch_size_if_split,
  */
 template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
           typename AttentionVariant>
-cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
-    bool& split_kv, uint32_t& max_grid_size, uint32_t& max_num_pages_per_batch,
-    uint32_t& new_batch_size, uint32_t batch_size, typename AttentionVariant::IdType* kv_indptr_h,
-    const uint32_t num_qo_heads, const uint32_t page_size, bool enable_cuda_graph,
-    cudaStream_t stream) {
+cudaError_t BatchDecodeWithPagedKVCacheNumCTAs(uint32_t& num_ctas) {
   using DTypeKV = typename AttentionVariant::DTypeKV;
   using IdType = typename AttentionVariant::IdType;
   constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL);
@@ -145,7 +102,6 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
     constexpr uint32_t bdz = num_threads / (bdx * bdy);
     constexpr uint32_t tile_size_per_bdx = GROUP_SIZE == 1 ? (sizeof(DTypeKV) == 1 ? 2U : 4U) : 1U;
-    const uint32_t num_kv_heads = num_qo_heads / GROUP_SIZE;
     const uint32_t smem_size =
         2 * NUM_STAGES_SMEM * tile_size_per_bdx * bdy * bdz * HEAD_DIM * sizeof(DTypeKV) +
         std::max(tile_size_per_bdx * num_threads * sizeof(DTypeKV*), 2 * bdy * bdz * sizeof(float));
@@ -153,107 +109,54 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     auto kernel =
         BatchDecodeWithPagedKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx,
                                           vec_size, bdx, bdy, bdz, AttentionVariant>;
-    int num_blocks_per_sm = 0;
+    int num_ctas_per_sm = 0;
     int num_sm = 0;
     int dev_id = 0;
     FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
     FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
-    FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
+    FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_ctas_per_sm, kernel,
                                                                        num_threads, smem_size));
-    max_grid_size = num_blocks_per_sm * num_sm;
-    if (batch_size * num_kv_heads >= max_grid_size) {
-      split_kv = false;
-      max_num_pages_per_batch = 1;
-      for (uint32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-        max_num_pages_per_batch = std::max<uint32_t>(
-            max_num_pages_per_batch, kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx]);
-      }
-      new_batch_size = batch_size;
-    } else {
-      // compute max_num_pages_per_batch and new_batch_size
-      std::vector<IdType> num_pages(batch_size);
-      for (uint32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-        num_pages[batch_idx] = kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx];
-      }
-      std::tie(max_num_pages_per_batch, new_batch_size) =
-          PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(
-              max_grid_size, num_kv_heads, num_pages, std::max(128 / page_size, 1U));
-      if (new_batch_size == batch_size && !enable_cuda_graph) {
-        // do not use partition-kv kernel for short sequence, when not using CUDAGraph
-        split_kv = false;
-      } else {
-        // when using CUDAGraph, we always use partition-kv kernel
-        split_kv = true;
-      }
-    }
-    return cudaSuccess;
-  })
-}
-
-/*!
- * \brief Partition Paged KV-Cache into multiple chunks on KV sequence length
- * \tparam IdType A template type indicates the index data type
- * \param old_batch_size The batch size of the old Paged KV-Cache
- * \param old_page_indptr_h The host-side page indptr of the old Paged KV-Cache
- * \param max_num_pages_per_batch The maximum number of pages per batch
- * \param new_paged_kv_d The device-side new Paged KV-Cache
- * \param stream The cuda stream to launch the kernel
- * \return status Indicates whether CUDA calls are successful
- */
-template <typename IdType>
-auto DecodeSplitKVIndptr(IdType* indptr_h, uint32_t batch_size, uint32_t kv_chunk_size) {
-  std::vector<IdType> request_indices, kv_tile_indices, o_indptr;
-  o_indptr.push_back(0);
-
-  for (uint32_t batch_idx = 0; batch_idx < batch_size; batch_idx++) {
-    uint32_t num_tiles_kv = ceil_div(
-        std::max<uint32_t>(indptr_h[batch_idx + 1] - indptr_h[batch_idx], 1U), kv_chunk_size);
-    for (uint32_t kv_tile_idx = 0; kv_tile_idx < num_tiles_kv; ++kv_tile_idx) {
-      request_indices.push_back(batch_idx);
-      kv_tile_indices.push_back(kv_tile_idx);
-    }
-    o_indptr.push_back(o_indptr.back() + num_tiles_kv);
-  }
-
-  return std::make_tuple(request_indices, kv_tile_indices, o_indptr);
+    num_ctas = num_ctas_per_sm * num_sm;
+  });
+  return cudaSuccess;
 }
 
 struct DecodePlanInfo {
-  int64_t padded_batch_size;
+  int64_t work_indptr_offset;
+  int64_t request_indices_offset;
+  int64_t kv_indptr_start_offset;
+  int64_t kv_indptr_end_offset;
+  int64_t kv_head_idx_offset;
+  int64_t merge_indptr_offset;
+  int64_t merge_indices_offset;
   int64_t v_offset;
   int64_t s_offset;
-  int64_t request_indices_offset;
-  int64_t kv_tile_indices_offset;
-  int64_t o_indptr_offset;
-  int64_t block_valid_mask_offset;
-  int64_t kv_chunk_size_ptr_offset;
-  bool enable_cuda_graph;
-  bool split_kv;
+  int num_ctas;
 
   DecodePlanInfo()
-      : padded_batch_size(0),
+      : work_indptr_offset(0),
+        request_indices_offset(0),
+        kv_indptr_start_offset(0),
+        kv_indptr_end_offset(0),
+        kv_head_idx_offset(0),
+        merge_indptr_offset(0),
+        merge_indices_offset(0),
         v_offset(0),
         s_offset(0),
-        request_indices_offset(0),
-        kv_tile_indices_offset(0),
-        o_indptr_offset(0),
-        block_valid_mask_offset(0),
-        kv_chunk_size_ptr_offset(0),
-        enable_cuda_graph(false),
-        split_kv(false) {}
+        num_ctas(0) {}
 
   // convert DecodePlanInfo to std::vector<int64_t>
   std::vector<int64_t> ToVector() const {
-    return {padded_batch_size,
+    return {work_indptr_offset,
+            request_indices_offset,
+            kv_indptr_start_offset,
+            kv_indptr_end_offset,
+            kv_head_idx_offset,
+            merge_indptr_offset,
+            merge_indices_offset,
             v_offset,
             s_offset,
-            request_indices_offset,
-            kv_tile_indices_offset,
-            o_indptr_offset,
-            block_valid_mask_offset,
-            kv_chunk_size_ptr_offset,
-            enable_cuda_graph,
-            split_kv};
+            num_ctas};
   }
 
   // From std::vector<int64_t> to DecodePlanInfo
@@ -263,18 +166,32 @@ struct DecodePlanInfo {
       err_msg << "DecodePlanInfo::FromVector: vec.size() should be 10, but got " << vec.size();
       throw std::invalid_argument(err_msg.str());
     }
-    padded_batch_size = vec[0];
-    v_offset = vec[1];
-    s_offset = vec[2];
-    request_indices_offset = vec[3];
-    kv_tile_indices_offset = vec[4];
-    o_indptr_offset = vec[5];
-    block_valid_mask_offset = vec[6];
-    kv_chunk_size_ptr_offset = vec[7];
-    enable_cuda_graph = vec[8];
-    split_kv = vec[9];
+    work_indptr_offset = vec[0];
+    request_indices_offset = vec[1];
+    kv_indptr_start_offset = vec[2];
+    kv_indptr_end_offset = vec[3];
+    kv_head_idx_offset = vec[4];
+    merge_indptr_offset = vec[5];
+    merge_indices_offset = vec[6];
+    v_offset = vec[7];
+    s_offset = vec[8];
+    num_ctas = vec[9];
   }
 };
+
+float cost_function(int kv_len, int page_size, int group_size) {
+  return float(group_size) / float(page_size) + float(kv_len);
+}
+
+template <typename T>
+std::vector<T> flatten(const std::vector<std::vector<T>>& vec, int size_after_flatten) {
+  std::vector<T> result;
+  result.reserve(size_after_flatten);
+  for (const auto& inner_vec : vec) {
+    result.insert(result.end(), inner_vec.begin(), inner_vec.end());
+  }
+  return std::move(result);
+}
 
 template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant>
 cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes, void* int_buffer,
@@ -284,68 +201,131 @@ cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
                        uint32_t page_size, bool enable_cuda_graph, cudaStream_t stream) {
   using DTypeO = typename AttentionVariant::DTypeO;
   using IdType = typename AttentionVariant::IdType;
-  bool split_kv;
-  uint32_t max_grid_size, kv_chunk_size_in_pages, new_batch_size;
-  DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
-    auto work_estimation_func =
-        BatchDecodeWithPagedKVCacheWorkEstimationDispatched<GROUP_SIZE, HEAD_DIM, POS_ENCODING_MODE,
-                                                            AttentionVariant>;
-    FLASHINFER_CUDA_CALL(work_estimation_func(split_kv, max_grid_size, kv_chunk_size_in_pages,
-                                              new_batch_size, batch_size, indptr_h, num_qo_heads,
-                                              page_size, enable_cuda_graph, stream));
-    size_t padded_batch_size;
-    plan_info.enable_cuda_graph = enable_cuda_graph;
-    plan_info.split_kv = split_kv;
-    padded_batch_size = (enable_cuda_graph) ? (split_kv ? max_grid_size / num_kv_heads : batch_size)
-                                            : new_batch_size;
-    plan_info.padded_batch_size = padded_batch_size;
+  uint32_t num_ctas;
+  uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
+  DISPATCH_GQA_GROUP_SIZE(gqa_group_size, GROUP_SIZE, {
+    auto get_num_ctas_func =
+        BatchDecodeWithPagedKVCacheNumCTAs<GROUP_SIZE, HEAD_DIM, POS_ENCODING_MODE,
+                                           AttentionVariant>;
+    FLASHINFER_CUDA_CALL(get_num_ctas_func(num_ctas));
+  });
+  plan_info.num_ctas = num_ctas;
 
-    auto [request_indices_vec, kv_tile_indices_vec, o_indptr_vec] =
-        DecodeSplitKVIndptr(indptr_h, batch_size, kv_chunk_size_in_pages);
+  MinHeap heap(num_ctas);
 
-    AlignedAllocator int_allocator(int_buffer, int_workspace_size_in_bytes);
-    plan_info.request_indices_offset = int_allocator.aligned_alloc_offset(
-        padded_batch_size * sizeof(IdType), 16, "batch_decode_request_indices");
-    plan_info.kv_tile_indices_offset = int_allocator.aligned_alloc_offset(
-        padded_batch_size * sizeof(IdType), 16, "batch_decode_kv_tile_indices");
-    plan_info.o_indptr_offset = int_allocator.aligned_alloc_offset(
-        (padded_batch_size + 1) * sizeof(IdType), 16, "batch_decode_o_indptr");
-    plan_info.kv_chunk_size_ptr_offset =
-        int_allocator.aligned_alloc_offset(sizeof(IdType), 1, "batch_decode_kv_chunk_size_ptr");
-    IdType* request_indices_h =
-        GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.request_indices_offset);
-    IdType* kv_tile_indices_h =
-        GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_tile_indices_offset);
-    IdType* o_indptr_h =
-        GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.o_indptr_offset);
-    IdType* kv_chunk_size_ptr_h =
-        GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_chunk_size_ptr_offset);
-    std::copy(request_indices_vec.begin(), request_indices_vec.end(), request_indices_h);
-    std::copy(kv_tile_indices_vec.begin(), kv_tile_indices_vec.end(), kv_tile_indices_h);
-    std::copy(o_indptr_vec.begin(), o_indptr_vec.end(), o_indptr_h);
-    kv_chunk_size_ptr_h[0] = kv_chunk_size_in_pages * page_size;
+  std::vector<int64_t> kv_len_vec(batch_size);
+  float total_cost = 0.f;
+  for (uint32_t i = 0; i < batch_size; ++i) {
+    kv_len_vec[i] = indptr_h[i + 1 + batch_size] - indptr_h[i + batch_size];
+    if (kv_len_vec[i] < 0) {
+      std::ostringstream err_msg;
+      err_msg << "indptr[" << i + 1 + batch_size << "]" << indptr_h[i + 1 + batch_size]
+              << " - indptr[" << i + batch_size << "]" << indptr_h[i + batch_size]
+              << " should be non-negative";
+      throw std::invalid_argument(err_msg.str());
+    }
+    total_cost += cost_function(kv_len_vec[i], page_size, gqa_group_size);
+  }
+  total_cost = total_cost * float(num_kv_heads);
+  float bucket_cost_limit = total_cost / float(num_ctas);
 
-    if (split_kv) {
-      AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
-      plan_info.v_offset = float_allocator.aligned_alloc_offset(
-          num_qo_heads * padded_batch_size * HEAD_DIM * sizeof(DTypeO), 16, "batch_decode_tmp_v");
-      plan_info.s_offset = float_allocator.aligned_alloc_offset(
-          num_qo_heads * padded_batch_size * sizeof(float), 16, "batch_decode_tmp_s");
+  std::vector<std::vector<IdType>> cta_request_indices(num_ctas, std::vector<IdType>()),
+      cta_kv_indptr_start(num_ctas, std::vector<IdType>()),
+      cta_kv_indptr_end(num_ctas, std::vector<IdType>()),
+      cta_kv_head_idx(num_ctas, std::vector<IdType>());
 
-      plan_info.block_valid_mask_offset = int_allocator.aligned_alloc_offset(
-          padded_batch_size * sizeof(bool), 16, "batch_decode_block_valid_mask");
-      bool* block_valid_mask_h =
-          GetPtrFromBaseOffset<bool>(page_locked_int_buffer, plan_info.block_valid_mask_offset);
-      for (uint32_t i = 0; i < padded_batch_size; ++i) {
-        block_valid_mask_h[i] = i < new_batch_size;
+  for (uint32_t kv_head_idx = 0; kv_head_idx < num_kv_heads; ++kv_head_idx) {
+    for (uint32_t i = 0; i < batch_size; ++i) {
+      int64_t remaining_len = kv_len_vec[i];
+      while (remaining_len > 0) {
+        auto [cta_idx, accum_cost] = heap.pop();
+        int64_t actual_len =
+            std::min(remaining_len, int64_t(std::ceil(bucket_cost_limit - accum_cost)));
+        heap.insert({cta_idx, accum_cost + cost_function(actual_len, page_size, gqa_group_size)});
+        cta_request_indices[cta_idx].push_back(i);
+        cta_kv_indptr_start[cta_idx].push_back(kv_len_vec[i] - remaining_len);
+        cta_kv_indptr_end[cta_idx].push_back(kv_len_vec[i] - remaining_len + actual_len);
+        cta_kv_head_idx[cta_idx].push_back(kv_head_idx);
+        remaining_len -= actual_len;
       }
     }
+  }
 
-    size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
+  std::vector<IdType> work_indptr_vec(num_ctas + 1, 0);
+  for (uint32_t i = 0; i < num_ctas; ++i) {
+    work_indptr_vec[i + 1] = work_indptr_vec[i] + cta_request_indices.size();
+  }
+  IdType total_num_works = work_indptr_vec[num_ctas];
+  auto request_indices_vec = flatten(cta_request_indices, total_num_works);
+  auto kv_indptr_start_vec = flatten(cta_kv_indptr_start, total_num_works);
+  auto kv_indptr_end_vec = flatten(cta_kv_indptr_end, total_num_works);
+  auto kv_head_idx_vec = flatten(cta_kv_head_idx, total_num_works);
+  std::vector<std::vector<IdType>> local_merge_indices(batch_size * num_qo_heads,
+                                                       std::vector<IdType>());
+  std::vector<IdType> merge_indptr_vec(batch_size * num_qo_heads + 1, 0);
+  for (uint32_t work_iter = 0; work_iter < total_num_works; ++work_iter) {
+    int kv_head_idx = kv_head_idx_vec[work_iter];
+    int batch_idx = request_indices_vec[work_iter];
+    for (uint32_t i = 0; i < gqa_group_size; ++i) {
+      int qo_head_idx = kv_head_idx * gqa_group_size + i;
+      local_merge_indices[batch_idx * num_qo_heads + qo_head_idx].push_back(
+          work_iter * gqa_group_size + i);
+    }
+  }
+  for (uint32_t i = 0; i < batch_size * num_qo_heads + 1; ++i) {
+    merge_indptr_vec[i + 1] = merge_indptr_vec[i] + local_merge_indices[i].size();
+  }
+  auto merge_indices_vec = flatten(local_merge_indices, merge_indptr_vec.back());
 
-    FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,
-                                         cudaMemcpyHostToDevice, stream));
-  });
+  AlignedAllocator int_allocator(int_buffer, int_workspace_size_in_bytes);
+
+  plan_info.work_indptr_offset =
+      int_allocator.aligned_alloc_offset(16384 * sizeof(IdType), 16, "batch_decode_work_indptr");
+  plan_info.request_indices_offset = int_allocator.aligned_alloc_offset(
+      131072 * sizeof(IdType), 16, "batch_decode_request_indices");
+  plan_info.kv_indptr_start_offset = int_allocator.aligned_alloc_offset(
+      131072 * sizeof(IdType), 16, "batch_decode_kv_indptr_start");
+  plan_info.kv_indptr_end_offset =
+      int_allocator.aligned_alloc_offset(131072 * sizeof(IdType), 16, "batch_decode_kv_indptr_end");
+  plan_info.kv_head_idx_offset =
+      int_allocator.aligned_alloc_offset(131072 * sizeof(IdType), 16, "batch_decode_kv_head_idx");
+  plan_info.merge_indptr_offset =
+      int_allocator.aligned_alloc_offset(131072 * sizeof(IdType), 16, "batch_decode_merge_indptr");
+  plan_info.merge_indices_offset =
+      int_allocator.aligned_alloc_offset(131072 * sizeof(IdType), 16, "batch_decode_merge_indices");
+
+  IdType* work_indptr_h =
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.work_indptr_offset);
+  IdType* request_indices_h =
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.request_indices_offset);
+  IdType* kv_indptr_start_h =
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_indptr_start_offset);
+  IdType* kv_indptr_end_h =
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_indptr_end_offset);
+  IdType* kv_head_idx_h =
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_head_idx_offset);
+  IdType* merge_indptr_h =
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.merge_indptr_offset);
+  IdType* merge_indices_h =
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.merge_indices_offset);
+  std::copy(work_indptr_vec.begin(), work_indptr_vec.end(), work_indptr_h);
+  std::copy(request_indices_vec.begin(), request_indices_vec.end(), request_indices_h);
+  std::copy(kv_indptr_start_vec.begin(), kv_indptr_start_vec.end(), kv_indptr_start_h);
+  std::copy(kv_indptr_end_vec.begin(), kv_indptr_end_vec.end(), kv_indptr_end_h);
+  std::copy(kv_head_idx_vec.begin(), kv_head_idx_vec.end(), kv_head_idx_h);
+  std::copy(merge_indptr_vec.begin(), merge_indptr_vec.end(), merge_indptr_h);
+  std::copy(merge_indices_vec.begin(), merge_indices_vec.end(), merge_indices_h);
+
+  AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
+  plan_info.v_offset = float_allocator.aligned_alloc_offset(
+      num_qo_heads * 16384 * HEAD_DIM * sizeof(DTypeO), 16, "batch_decode_tmp_v");
+  plan_info.s_offset = float_allocator.aligned_alloc_offset(num_qo_heads * 16384 * sizeof(float),
+                                                            16, "batch_decode_tmp_s");
+
+  size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
+
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,
+                                       cudaMemcpyHostToDevice, stream));
   return cudaSuccess;
 }
 
