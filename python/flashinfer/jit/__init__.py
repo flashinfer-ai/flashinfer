@@ -14,38 +14,44 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import logging
 import os
 import re
-import logging
-import subprocess
+from pathlib import Path
+from typing import List, Union
+
 import torch.utils.cpp_extension as torch_cpp_ext
 from filelock import FileLock
-from typing import List, Tuple
-from .env import (
-    FLASHINFER_WORKSPACE_DIR,
-    FLASHINFER_JIT_DIR,
-    FLASHINFER_GEN_SRC_DIR,
-    FLASHINFER_INCLUDE_DIR,
-    FLASHINFER_CSRC_DIR,
-    CUTLASS_INCLUDE_DIRS,
+
+# Re-export
+from .activation import (
+    gen_act_and_mul_cu as gen_act_and_mul_cu,
+    get_act_and_mul_cu_str as get_act_and_mul_cu_str,
 )
-from .activation import get_act_and_mul_cu_str, gen_act_and_mul_cu
 from .attention import (
-    gen_single_decode_cu,
-    get_single_decode_uri,
-    gen_batch_decode_cu,
-    get_batch_decode_uri,
-    gen_single_prefill_cu,
-    get_single_prefill_uri,
-    gen_batch_prefill_cu,
-    get_batch_prefill_uri,
+    gen_batch_decode_cu as gen_batch_decode_cu,
+    gen_batch_prefill_cu as gen_batch_prefill_cu,
+    gen_single_decode_cu as gen_single_decode_cu,
+    gen_single_prefill_cu as gen_single_prefill_cu,
+    get_batch_decode_uri as get_batch_decode_uri,
+    get_batch_prefill_uri as get_batch_prefill_uri,
+    get_single_decode_uri as get_single_decode_uri,
+    get_single_prefill_uri as get_single_prefill_uri,
+)
+from .env import (
+    CUTLASS_INCLUDE_DIRS as CUTLASS_INCLUDE_DIRS,
+    FLASHINFER_CSRC_DIR as FLASHINFER_CSRC_DIR,
+    FLASHINFER_GEN_SRC_DIR as FLASHINFER_GEN_SRC_DIR,
+    FLASHINFER_INCLUDE_DIR as FLASHINFER_INCLUDE_DIR,
+    FLASHINFER_JIT_DIR as FLASHINFER_JIT_DIR,
+    FLASHINFER_WORKSPACE_DIR as FLASHINFER_WORKSPACE_DIR,
 )
 
 try:
-    from .aot_config import prebuilt_ops_uri
+    from .aot_config import prebuilt_ops_uri as prebuilt_ops_uri  # type: ignore[import]
 
     has_prebuilt_ops = True
-except ImportError as e:
+except ImportError:
     prebuilt_ops_uri = set()
     has_prebuilt_ops = False
 
@@ -112,7 +118,7 @@ remove_unwanted_pytorch_nvcc_flags()
 
 def load_cuda_ops(
     name: str,
-    sources: List[str],
+    sources: List[Union[str, Path]],
     extra_cflags: List[str] = [],
     extra_cuda_cflags: List[str] = [],
     extra_ldflags=None,

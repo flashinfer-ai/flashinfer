@@ -1,5 +1,5 @@
-import triton
-import triton.language as tl
+import triton  # type: ignore[import]
+import triton.language as tl  # type: ignore[import]
 
 
 @triton.jit

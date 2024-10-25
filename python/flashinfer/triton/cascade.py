@@ -69,7 +69,7 @@ def merge_state_in_place(
     if mask is not None:
         check_dim(1, mask)
         assert v.size(0) == mask.size(0)
-        assert mask.device == device
+        assert mask.device == v.device
     seq_len = v.size(0)
     num_heads = v.size(1)
     head_dim = v.size(2)
