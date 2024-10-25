@@ -439,6 +439,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__
   vec_t<float, vec_size> q_vec;
   vec_t<float, vec_size> freq;
   int32_t q_offset_val = q_offset == nullptr ? (kv_len - 1) : q_offset[batch_idx];
+  const uint32_t q_stride_n = params.q_stride_n;
+  const uint32_t q_stride_h = params.q_stride_h;
   if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
     const float rope_rcp_scale = params.rope_rcp_scale;
     const float rope_rcp_theta = params.rope_rcp_theta;
@@ -450,10 +452,10 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__
     }
     // apply rotary embedding to q matrix
     q_vec = vec_apply_llama_rope<vec_size, bdx>(
-        q + (batch_idx * num_qo_heads + qo_head_idx) * head_dim, freq, q_offset_val);
+        q + batch_idx * q_stride_n + qo_head_idx * q_stride_h, freq, q_offset_val);
   } else {
     // do not apply rotary embedding to q matrix
-    q_vec.cast_load(q + (batch_idx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
+    q_vec.cast_load(q + batch_idx * q_stride_n + qo_head_idx * q_stride_h + tx * vec_size);
   }
 #pragma unroll
   for (uint32_t i = 0; i < vec_size; ++i) {
