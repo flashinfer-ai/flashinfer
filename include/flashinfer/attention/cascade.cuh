@@ -477,9 +477,9 @@ __global__ void NewPersistentVariableLengthMergeStatesKernel(
     for (uint32_t iter = 0; iter < ceil_div(num_index_sets, bdy); ++iter) {
       __syncthreads();
       vec_t<float, vec_size> v;
-      v.cast_load(V + (merge_indices[merge_indptr[i] + iter * bdy + ty]) * head_dim +
-                  tx * vec_size);
       if (iter * bdy + ty < num_index_sets) {
+        v.cast_load(V + (merge_indices[merge_indptr[i] + iter * bdy + ty]) * head_dim +
+                    tx * vec_size);
         float s = S[merge_indices[merge_indptr[i] + iter * bdy + ty]];
         st.merge(v, s, 1);
       }
@@ -759,7 +759,6 @@ cudaError_t NewVariableLengthMergeStates(DTypeIn* v, float* s, IdType* merge_ind
     FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
                                                                        num_threads, smem_size));
     num_blocks_per_sm = min(num_blocks_per_sm, ceil_div(seq_len, num_sms));
-    // num_blocks_per_sm = 1;
 
     dim3 nblks(num_sms * num_blocks_per_sm);
     dim3 nthrs(bdx, bdy);
