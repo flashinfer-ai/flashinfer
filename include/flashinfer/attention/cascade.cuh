@@ -751,15 +751,15 @@ cudaError_t NewVariableLengthMergeStates(DTypeIn* v, float* s, IdType* merge_ind
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16U / sizeof(DTypeIn), HEAD_DIM / 32U);
     constexpr uint32_t bdx = HEAD_DIM / vec_size;
-    constexpr uint32_t num_threads = 128;
+    constexpr uint32_t num_threads = 64;  // 128;
     constexpr uint32_t bdy = num_threads / bdx;
-    uint32_t smem_size =
-        bdy * head_dim * sizeof(DTypeIn) + bdy * sizeof(float);
-    auto kernel = NewPersistentVariableLengthMergeStatesKernel<vec_size, bdx, bdy,
-                                                               DTypeIn, DTypeO, IdType>;
+    uint32_t smem_size = bdy * head_dim * sizeof(DTypeIn) + bdy * sizeof(float);
+    auto kernel =
+        NewPersistentVariableLengthMergeStatesKernel<vec_size, bdx, bdy, DTypeIn, DTypeO, IdType>;
     FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
                                                                        num_threads, smem_size));
     num_blocks_per_sm = min(num_blocks_per_sm, ceil_div(seq_len, num_sms));
+    // num_blocks_per_sm = 1;
 
     dim3 nblks(num_sms * num_blocks_per_sm);
     dim3 nthrs(bdx, bdy);

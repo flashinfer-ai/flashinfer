@@ -179,8 +179,8 @@ struct DecodePlanInfo {
   }
 };
 
-float cost_function(int kv_len, int page_size, int group_size) {
-  return float(group_size) / float(page_size) + kv_len;
+float cost_function(int qo_len, int kv_len, int page_size, int group_size) {
+  return 2 * float(qo_len) * float(group_size) / float(page_size) + kv_len;
 }
 
 template <typename T>
@@ -211,9 +211,9 @@ cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
   });
   plan_info.num_ctas = num_ctas;
 
-  MinHeap heap(num_ctas);
+  CTACostHeap cta_cost_heap(num_ctas);
 
-  std::vector<int64_t> kv_len_vec(batch_size);
+  std::vector<int> kv_len_vec(batch_size);
   float total_cost = 0.f;
   for (uint32_t i = 0; i < batch_size; ++i) {
     kv_len_vec[i] = indptr_h[i + 1] - indptr_h[i];
@@ -224,10 +224,10 @@ cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
               << " should be non-negative";
       throw std::invalid_argument(err_msg.str());
     }
-    total_cost += cost_function(kv_len_vec[i], page_size, gqa_group_size);
+    total_cost += cost_function(1, kv_len_vec[i], page_size, gqa_group_size);
   }
   total_cost = total_cost * float(num_kv_heads);
-  float bucket_cost_limit = total_cost / float(num_ctas);
+  float bucket_cost_limit = ceil(total_cost / float(num_ctas));
 
   std::vector<std::vector<IdType>> cta_request_indices(num_ctas, std::vector<IdType>()),
       cta_kv_indptr_start(num_ctas, std::vector<IdType>()),
@@ -238,10 +238,11 @@ cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
     for (uint32_t i = 0; i < batch_size; ++i) {
       int64_t remaining_len = kv_len_vec[i];
       while (remaining_len > 0) {
-        auto [cta_idx, accum_cost] = heap.pop();
+        auto [cta_idx, accum_cost] = cta_cost_heap.pop();
         int64_t actual_len =
             std::min(remaining_len, int64_t(std::ceil(bucket_cost_limit - accum_cost)));
-        heap.insert({cta_idx, accum_cost + cost_function(actual_len, page_size, gqa_group_size)});
+        cta_cost_heap.insert(
+            {cta_idx, accum_cost + cost_function(1, actual_len, page_size, gqa_group_size)});
         cta_request_indices[cta_idx].push_back(i);
         cta_kv_indptr_start[cta_idx].push_back(kv_len_vec[i] - remaining_len);
         cta_kv_indptr_end[cta_idx].push_back(kv_len_vec[i] - remaining_len + actual_len);
@@ -272,7 +273,7 @@ cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
           work_iter * gqa_group_size + i);
     }
   }
-  for (uint32_t i = 0; i < batch_size * num_qo_heads + 1; ++i) {
+  for (uint32_t i = 0; i < batch_size * num_qo_heads; ++i) {
     merge_indptr_vec[i + 1] = merge_indptr_vec[i] + local_merge_indices[i].size();
   }
   auto merge_indices_vec = flatten(local_merge_indices, merge_indptr_vec.back());

@@ -13,25 +13,26 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-// Write a heap data structure (minimal element on top) with the following methods:
-// insert(int value) - insert the value into the heap
-// pop() - remove and return the minimal element from the heap
+#ifndef FLASHINFER_ATTENTION_HEAP_H
+#define FLASHINFER_ATTENTION_HEAP_H
 
 #include <algorithm>
 #include <stdexcept>
 #include <utility>
 #include <vector>
 
+namespace flashinfer {
+
 /*!
  * \brief Heap data structure for (index, value) pairs
- * \note
+ * \note minimal element on top
  */
-class MinHeap {
+class CTACostHeap {
  public:
   // first: index, second: value
   using Element = std::pair<int, float>;
 
-  MinHeap(int capacity) : full_(true), heap_(capacity) {
+  CTACostHeap(int capacity) : full_(true), heap_(capacity) {
     for (int i = 0; i < capacity; ++i) {
       heap_[i] = std::make_pair(i, 0.f);
     }
@@ -65,3 +66,7 @@ class MinHeap {
 
   std::vector<Element> heap_;
 };
+
+}  // namespace flashinfer
+
+#endif  // FLASHINFER_ATTENTION_HEAP_H
