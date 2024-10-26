@@ -435,9 +435,8 @@ class BlockSparseAttentionWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
-
-        k = k.reshape(-1, self.C, *k.shape[-2:]).contiguous()
-        v = v.reshape(-1, self.C, *v.shape[-2:]).contiguous()
+        k = k.reshape(-1, self.C, *k.shape[-2:])
+        v = v.reshape(-1, self.C, *v.shape[-2:])
 
         lse = None
         if return_lse:
