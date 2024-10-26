@@ -890,22 +890,22 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(typename AttentionVariant::
   int32_t q_offset_val = q_offset == nullptr ? (orig_seq_len - 1) : q_offset[mapped_batch_idx];
   
   const uint32_t kv_chunk_idx_in_orig_mapped_batch = params.kv_tile_indices[batch_idx];
-  const uint32_t kv_chunk_size_per_batch = *(params.kv_chunk_size_ptr);
-  const uint32_t cur_batch_chunk_start = partition_kv ? kv_chunk_idx_in_orig_mapped_batch * kv_chunk_size_per_batch : 0;
-  const uint32_t cur_batch_chunk_end = 
-      partition_kv ? min((kv_chunk_idx_in_orig_mapped_batch + 1) * kv_chunk_size_per_batch, orig_seq_len) : orig_seq_len;
-  const uint32_t cur_batch_chunk_len = cur_batch_chunk_end - cur_batch_chunk_start;
+  const uint32_t kv_chunk_size = *(params.kv_chunk_size_ptr);
+  const uint32_t cur_chunk_start = partition_kv ? kv_chunk_idx_in_orig_mapped_batch * kv_chunk_size : 0;
+  const uint32_t cur_chunk_end = 
+      partition_kv ? min((kv_chunk_idx_in_orig_mapped_batch + 1) * kv_chunk_size, orig_seq_len) : orig_seq_len;
+  const uint32_t cur_chunk_len = cur_chunk_end - cur_chunk_start;
 
-  uint32_t packed_page_iter_base = paged_kv.indptr[mapped_batch_idx] * paged_kv.page_size + cur_batch_chunk_start;
+  uint32_t packed_page_iter_base = paged_kv.indptr[mapped_batch_idx] * paged_kv.page_size + cur_chunk_start;
   const IdType last_indptr = paged_kv.indptr[paged_kv.batch_size];
   
-  constexpr uint32_t kv_iter_len = 1 * bdy * bdz;
-  constexpr uint32_t compute_qk_tile = 1 * bdy;
+  constexpr uint32_t kv_iter_len = bdy * bdz;
+  constexpr uint32_t compute_qk_tile = bdy;
 
   extern __attribute__((shared)) uint8_t smem[];
   DTypeKV* ckv_smem = (DTypeKV*)smem;
-  DTypeKV* kpe_smem = (DTypeKV*)((uint8_t*)ckv_smem + 1 * num_stages_smem * kv_iter_len * head_dim_ckv * sizeof(DTypeKV));
-  size_t* ckv_offset_smem = (size_t*)((uint8_t*)kpe_smem + 1 * num_stages_smem * kv_iter_len * head_dim_kpe * sizeof(DTypeKV));
+  DTypeKV* kpe_smem = (DTypeKV*)((uint8_t*)ckv_smem + num_stages_smem * kv_iter_len * head_dim_ckv * sizeof(DTypeKV));
+  size_t* ckv_offset_smem = (size_t*)((uint8_t*)kpe_smem + num_stages_smem * kv_iter_len * head_dim_kpe * sizeof(DTypeKV));
   size_t* kpe_offset_smem = (size_t*)((uint8_t*)ckv_offset_smem + bdx*bdy*bdz * sizeof(size_t) );                                  
   float* smem_md = (float*)ckv_offset_smem;
 
@@ -925,7 +925,6 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(typename AttentionVariant::
   vec_t<float, vec_size_kpe> q_pe_vec;
   q_pe_vec = vec_apply_llama_rope_interleave<vec_size_kpe, bdx>(
       q_pe + (mapped_batch_idx * num_qo_heads + qo_head_idx) * head_dim_kpe, freq, q_offset_val);
-  // block.sync();
 
   // init paged-cache read offset to be used
   uint32_t q, r;
@@ -944,7 +943,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(typename AttentionVariant::
   bool is_valid_range;
 #pragma unroll
   for (uint32_t iter = 0; iter < num_stages_smem; ++iter) {
-    is_valid_range = ( iter * kv_iter_len + dim2_offset(bdy, tz, ty) ) < cur_batch_chunk_len;
+    is_valid_range = ( iter * kv_iter_len + dim2_offset(bdy, tz, ty) ) < cur_chunk_len;
 
     offset_bytes =
         ckv_offset_smem[dim3_offset(bdz, bdy, iter, tz, ty)] + tx * vec_size_ckv;
@@ -968,11 +967,11 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(typename AttentionVariant::
 
   state_t<vec_size_ckv> st;
 #pragma unroll
-  for (uint32_t iter = 0; iter < ceil_div(cur_batch_chunk_len, kv_iter_len); ++iter) {
+  for (uint32_t iter = 0; iter < ceil_div(cur_chunk_len, kv_iter_len); ++iter) {
     cp_async::wait_group<1 * num_stages_smem - 1>();
     block.sync();
     const int32_t kv_idx_base = (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[mapped_batch_idx]) +
-            cur_batch_chunk_start + iter * kv_iter_len;
+            cur_chunk_start + iter * kv_iter_len;
     compute_qk_and_update_local_stat_mla<vec_size_ckv, vec_size_kpe, bdx, compute_qk_tile, AttentionVariant>(
         params, variant, mapped_batch_idx,
         ckv_smem + (stage_idx * kv_iter_len + tz * compute_qk_tile )*head_dim_ckv,
@@ -981,7 +980,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(typename AttentionVariant::
         q_pe_vec,
         freq,
         kv_idx_base,
-        /*iter_base*/iter * kv_iter_len, /*iter_bound*/cur_batch_chunk_len,
+        /*iter_base*/iter * kv_iter_len, /*iter_bound*/cur_chunk_len,
         qo_head_idx, 
         st);
     
@@ -996,7 +995,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(typename AttentionVariant::
     }
     block.sync();
 
-    is_valid_range = ( (iter + num_stages_smem) * kv_iter_len + dim2_offset(bdy, tz, ty) ) < cur_batch_chunk_len;
+    is_valid_range = ( (iter + num_stages_smem) * kv_iter_len + dim2_offset(bdy, tz, ty) ) < cur_chunk_len;
     offset_bytes =
         ckv_offset_smem[dim3_offset(bdz, bdy, (iter + num_stages_smem) % bdx, tz, ty)] + 
         tx * vec_size_ckv;
