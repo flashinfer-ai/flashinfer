@@ -43,6 +43,15 @@ def get_quantization_module():
 
 
 @register_custom_op("flashinfer::packbits", mutates_args=())
+def _packbits(x: torch.Tensor, bitorder: str) -> torch.Tensor:
+    return get_quantization_module().packbits(x, bitorder)
+
+
+@register_fake_op("flashinfer::packbits")
+def _fake_packbits(x: torch.Tensor, bitorder: str) -> torch.Tensor:
+    return torch.empty((x.size(0) + 7) // 8, dtype=torch.uint8, device=x.device)
+
+
 def packbits(x: torch.Tensor, bitorder: str = "big") -> torch.Tensor:
     r"""Pack the elements of a binary-valued array into bits in a uint8 array.
 
@@ -74,12 +83,7 @@ def packbits(x: torch.Tensor, bitorder: str = "big") -> torch.Tensor:
     --------
     segment_packbits
     """
-    return get_quantization_module().packbits(x, bitorder)
-
-
-@register_fake_op("flashinfer::packbits")
-def _fake_packbits(x: torch.Tensor, bitorder: str = "big") -> torch.Tensor:
-    return torch.empty((x.size(0) + 7) // 8, dtype=torch.uint8, device=x.device)
+    return _packbits(x, bitorder)
 
 
 def segment_packbits(

@@ -212,7 +212,7 @@ def register_custom_op(
     schema: Optional[str] = None,
 ) -> Callable:
     if TorchVersion(torch_version) < TorchVersion("2.4"):
-        return fn
+        return lambda x: x
     return torch.library.custom_op(
         name, fn, mutates_args=mutates_args, device_types=device_types, schema=schema
     )
@@ -223,5 +223,5 @@ def register_fake_op(
     fn: Optional[Callable] = None,
 ) -> Callable:
     if TorchVersion(torch_version) < TorchVersion("2.4"):
-        return fn
+        return lambda x: x
     return torch.library.register_fake(name, fn)
