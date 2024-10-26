@@ -303,7 +303,10 @@ class BlockSparseAttentionWrapper:
         # NOTE(Zihao): we haven't supported mask in cuda-core implementations but it should
         # be easy to add support for it if needed, leave it as a future work.
         # at this moment, when mask is provided, we use the tensor-core implementation
-        if R * (num_qo_heads // num_kv_heads) < 4 and mask_mode == MaskMode.NON_CAUSAL.value:
+        if (
+            R * (num_qo_heads // num_kv_heads) < 4
+            and mask_mode == MaskMode.NON_CAUSAL.value
+        ):
             # If the operation is not compute-bound, we use the cuda-core implementation
             self._use_tensor_cores = False
             self._cached_module = get_batch_decode_module(
