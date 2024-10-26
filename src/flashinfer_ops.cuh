@@ -605,7 +605,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapperMLA(
     float rope_scale = 1.f, float rope_theta = 1e4, 
     cudaStream_t stream = nullptr) {
   DISPATCH_head_dim(paged_kv.head_dim_ckv, HEAD_DIM_CKV, {
-    // fixme: head_dim_ckv(kv_lora_rank) is 8 times the size of head_dim_kpe(qk_rope_head_dim) for all MLA model (DeepSeek-V2-Lite, DeepSeek-V, MiniCPM3) at the time Oct.2024
+    // fixme: head_dim_ckv(kv_lora_rank) is 8 times the size of head_dim_kpe(qk_rope_head_dim) for all MLA model (DeepSeek-V2-Lite, DeepSeek-V2.5, MiniCPM3) at the time Oct.2024
     constexpr auto HEAD_DIM_KPE = HEAD_DIM_CKV/8;
     // DISPATCH_head_dim(paged_kv.head_dim_kpe, HEAD_DIM_KPE, {
         using ParamsT = BatchDecodeParamsMLA<DTypeQ, DTypeKV, DTypeO, IdType>;
@@ -635,10 +635,10 @@ cudaError_t BatchDecodeHandlerPlanMLA(BatchDecodeHandler* handler, void* float_b
                                    size_t float_workspace_size_in_bytes, void* int_buffer,
                                    size_t int_workspace_size_in_bytes, IdType* indptr_h,
                                    IdType* last_page_len_h, uint32_t batch_size,
-                                   uint32_t num_qo_heads, uint32_t head_dim_ckv, uint32_t head_dim_kpe,
+                                   uint32_t num_qo_heads, uint32_t head_dim_ckv,
                                    uint32_t page_size) {
   DISPATCH_head_dim(head_dim_ckv, HEAD_DIM_CKV, {
-    // fixme: head_dim_ckv(kv_lora_rank) is 8 times the size of head_dim_kpe(qk_rope_head_dim) for all MLA model (DeepSeek-V2-Lite, DeepSeek-V, MiniCPM3) at the time Oct.2024
+    // fixme: head_dim_ckv(kv_lora_rank) is 8 times the size of head_dim_kpe(qk_rope_head_dim) for all MLA model (DeepSeek-V2-Lite, DeepSeek-V2.5, MiniCPM3) at the time Oct.2024
     constexpr auto HEAD_DIM_KPE = HEAD_DIM_CKV/8;
     // DISPATCH_head_dim(head_dim_kpe, HEAD_DIM_KPE, {
         return handler->PlanDispatchedMLA<HEAD_DIM_CKV, HEAD_DIM_KPE, DTypeQ, DTypeKV, DTypeO, IdType>(

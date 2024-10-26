@@ -164,7 +164,7 @@ def get_batch_decode_mla_cu_str(
         dtype_o=dtype_map[dtype_o],
         dtype_idx=dtype_map[dtype_idx],
         head_dim_ckv=head_dim,
-        head_dim_kpe=head_dim//8, # fixme: head_dim_ckv(kv_lora_rank) is 8 times the size of head_dim_kpe(qk_rope_head_dim) for all MLA model (DeepSeek-V2-Lite, DeepSeek-V, MiniCPM3) at the time Oct.2024
+        head_dim_kpe=head_dim//8, # fixme: head_dim_ckv(kv_lora_rank) is 8 times the size of head_dim_kpe(qk_rope_head_dim) for all MLA model (DeepSeek-V2-Lite, DeepSeek-V2.5, MiniCPM3) at the time Oct.2024
         use_sliding_window="true" if use_sliding_window else "false",
         use_logits_soft_cap="true" if use_logits_soft_cap else "false",
     )

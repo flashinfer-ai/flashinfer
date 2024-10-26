@@ -75,7 +75,7 @@ template cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA<{head_dim}, {head_
         dtype_kv=dtype_literal[dtype_kv],
         dtype_out=dtype_literal[dtype_out],
         idtype=idtype_literal[idtype],
-        head_dim_kpe=str(int(head_dim)//8) # fixme: head_dim_ckv(kv_lora_rank) is 8 times the size of head_dim_kpe(qk_rope_head_dim) for all MLA model (DeepSeek-V2-Lite, DeepSeek-V, MiniCPM3) at the time Oct.2024
+        head_dim_kpe=str(int(head_dim)//8) # fixme: head_dim_ckv(kv_lora_rank) is 8 times the size of head_dim_kpe(qk_rope_head_dim) for all MLA model (DeepSeek-V2-Lite, DeepSeek-V2.5, MiniCPM3) at the time Oct.2024
     )
     return content
 
