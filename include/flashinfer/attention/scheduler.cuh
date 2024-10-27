@@ -234,8 +234,15 @@ cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
       cta_kv_indptr_end(num_ctas, std::vector<IdType>()),
       cta_kv_head_idx(num_ctas, std::vector<IdType>());
 
-  for (uint32_t kv_head_idx = 0; kv_head_idx < num_kv_heads; ++kv_head_idx) {
-    for (uint32_t i = 0; i < batch_size; ++i) {
+  std::vector<std::pair<int, int>> idx_len_vec;
+  for (uint32_t i = 0; i < batch_size; ++i) {
+    idx_len_vec.push_back({i, kv_len_vec[i]});
+  }
+  std::sort(idx_len_vec.begin(), idx_len_vec.end(),
+            [](const auto& a, const auto& b) { return a.second > b.second; });
+
+  for (auto& [i, _] : idx_len_vec) {
+    for (uint32_t kv_head_idx = 0; kv_head_idx < num_kv_heads; ++kv_head_idx) {
       int64_t remaining_len = kv_len_vec[i];
       while (remaining_len > 0) {
         auto [cta_idx, accum_cost] = cta_cost_heap.pop();
