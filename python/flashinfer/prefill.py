@@ -1004,8 +1004,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._qk_indptr_buf = qk_indptr.to(self.device, non_blocking=True)
 
         # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
-        qo_indptr_host = qo_indptr.to("cpu", non_blocking=True)
-        paged_kv_indptr_host = paged_kv_indptr.to("cpu", non_blocking=True)
+        qo_indptr_host = qo_indptr.to("cpu")
+        paged_kv_indptr_host = paged_kv_indptr.to("cpu")
 
         if packed_custom_mask is not None:
             mask_mode = MaskMode.CUSTOM.value
@@ -1571,8 +1571,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._qk_indptr_buf = qk_indptr.to(self.device)
 
         # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
-        qo_indptr_host = qo_indptr.to("cpu", non_blocking=True)
-        kv_indptr_host = kv_indptr.to("cpu", non_blocking=True)
+        qo_indptr_host = qo_indptr.to("cpu")
+        kv_indptr_host = kv_indptr.to("cpu")
 
         if packed_custom_mask is not None:
             mask_mode = MaskMode.CUSTOM.value

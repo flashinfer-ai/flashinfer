@@ -719,7 +719,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
             self._qo_indptr_buf = qo_indptr_host.to(self.device, non_blocking=True)
 
-        indptr_host = indptr.to("cpu", non_blocking=True)
+        indptr_host = indptr.to("cpu")
         if data_type is not None:
             q_data_type = data_type
             kv_data_type = data_type
