@@ -298,7 +298,7 @@ class BlockSparseAttentionWrapper:
         self.R = R
         self.C = C
 
-        kv_indptr_host = indptr.to("cpu", non_blocking=True)
+        kv_indptr_host = indptr.to("cpu")
 
         # NOTE(Zihao): we haven't supported mask in cuda-core implementations but it should
         # be easy to add support for it if needed, leave it as a future work.
