@@ -213,18 +213,19 @@ cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
 
   CTACostHeap cta_cost_heap(num_ctas);
 
-  std::vector<int> kv_len_vec(batch_size);
+  std::vector<std::pair<int, int>> idx_len_vec;
   float total_cost = 0.f;
   for (uint32_t i = 0; i < batch_size; ++i) {
-    kv_len_vec[i] = indptr_h[i + 1] - indptr_h[i];
-    if (kv_len_vec[i] < 0) {
+    int kv_len = indptr_h[i + 1] - indptr_h[i];
+    if (kv_len < 0) {
       std::ostringstream err_msg;
       err_msg << "indptr[" << i + 1 + batch_size << "]" << indptr_h[i + 1 + batch_size]
               << " - indptr[" << i + batch_size << "]" << indptr_h[i + batch_size]
               << " should be non-negative";
       throw std::invalid_argument(err_msg.str());
     }
-    total_cost += cost_function(1, kv_len_vec[i], page_size, gqa_group_size);
+    total_cost += cost_function(1, kv_len, page_size, gqa_group_size);
+    idx_len_vec.push_back({i, kv_len});
   }
   total_cost = total_cost * float(num_kv_heads);
   float bucket_cost_limit = ceil(total_cost / float(num_ctas));
@@ -234,16 +235,12 @@ cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
       cta_kv_indptr_end(num_ctas, std::vector<IdType>()),
       cta_kv_head_idx(num_ctas, std::vector<IdType>());
 
-  std::vector<std::pair<int, int>> idx_len_vec;
-  for (uint32_t i = 0; i < batch_size; ++i) {
-    idx_len_vec.push_back({i, kv_len_vec[i]});
-  }
   std::sort(idx_len_vec.begin(), idx_len_vec.end(),
             [](const auto& a, const auto& b) { return a.second > b.second; });
 
-  for (auto& [i, _] : idx_len_vec) {
+  for (auto& [i, kv_len] : idx_len_vec) {
     for (uint32_t kv_head_idx = 0; kv_head_idx < num_kv_heads; ++kv_head_idx) {
-      int64_t remaining_len = kv_len_vec[i];
+      int64_t remaining_len = kv_len;
       while (remaining_len > 0) {
         auto [cta_idx, accum_cost] = cta_cost_heap.pop();
         int64_t actual_len =
@@ -251,8 +248,8 @@ cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
         cta_cost_heap.insert(
             {cta_idx, accum_cost + cost_function(1, actual_len, page_size, gqa_group_size)});
         cta_request_indices[cta_idx].push_back(i);
-        cta_kv_indptr_start[cta_idx].push_back(kv_len_vec[i] - remaining_len);
-        cta_kv_indptr_end[cta_idx].push_back(kv_len_vec[i] - remaining_len + actual_len);
+        cta_kv_indptr_start[cta_idx].push_back(kv_len - remaining_len);
+        cta_kv_indptr_end[cta_idx].push_back(kv_len - remaining_len + actual_len);
         cta_kv_head_idx[cta_idx].push_back(kv_head_idx);
         remaining_len -= actual_len;
       }
