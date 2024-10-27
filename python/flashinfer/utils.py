@@ -211,17 +211,19 @@ def register_custom_op(
     device_types: Optional[Union[str, Sequence[str]]] = None,
     schema: Optional[str] = None,
 ) -> Callable:
-    if TorchVersion(torch_version) < TorchVersion("2.4"):
-        return lambda x: x
-    return torch.library.custom_op(
-        name, fn, mutates_args=mutates_args, device_types=device_types, schema=schema
-    )
+    # if TorchVersion(torch_version) < TorchVersion("2.4"):
+    #     return lambda x: x
+    # return torch.library.custom_op(
+    #     name, fn, mutates_args=mutates_args, device_types=device_types, schema=schema
+    # )
+    return lambda x: x
 
 
 def register_fake_op(
     name: str,
     fn: Optional[Callable] = None,
 ) -> Callable:
-    if TorchVersion(torch_version) < TorchVersion("2.4"):
-        return lambda x: x
-    return torch.library.register_fake(name, fn)
+    # if TorchVersion(torch_version) < TorchVersion("2.4"):
+    #     return lambda x: x
+    # return torch.library.register_fake(name, fn)
+    return lambda x: x
