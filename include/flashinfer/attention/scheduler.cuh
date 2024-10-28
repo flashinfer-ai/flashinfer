@@ -37,7 +37,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__
                                                   typename AttentionVariant::ParamsT params);
 
 template <uint32_t num_stages_smem, uint32_t vec_size_ckv, uint32_t vec_size_kpe, 
-          uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant>
+          uint32_t bdx, uint32_t bdy, uint32_t bdz, uint32_t tile_size_qo_heads, 
+          typename AttentionVariant>
 __global__ void BatchDecodeWithPagedKVCacheKernelMLA(typename AttentionVariant::ParamsT params);
 
 /*!
@@ -213,15 +214,17 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA(
     constexpr uint32_t vec_size_kpe = HEAD_DIM_KPE / bdx;
 
     constexpr uint32_t bdy = 8;
+    constexpr uint32_t tile_size_qo_heads = 2;
+    constexpr uint32_t qo_heads_per_block = bdy * tile_size_qo_heads;
     constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
     constexpr uint32_t bdz = num_threads / (bdx * bdy);
-    if (num_qo_heads % bdy != 0) {
+    if (num_qo_heads % qo_heads_per_block != 0) {
       std::ostringstream err_msg;
-      err_msg << "num_qo_heads " << num_qo_heads << " is not a multiple of bdy "
-              << bdy;
+      err_msg << "num_qo_heads " << num_qo_heads << " is not a multiple of qo_heads_per_block "
+              << qo_heads_per_block;
       throw std::invalid_argument(err_msg.str());
     }
-    gdy = ceil_div(num_qo_heads, bdy);
+    const uint32_t gdy = ceil_div(num_qo_heads, qo_heads_per_block);
 
     const uint32_t smem_size =
         NUM_STAGES_SMEM * bdy * bdz * (HEAD_DIM_CKV + HEAD_DIM_KPE) * sizeof(DTypeKV) +
@@ -229,8 +232,9 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA(
                   2 * bdy * bdz * sizeof(float));
 
     auto kernel =
-        BatchDecodeWithPagedKVCacheKernelMLA<NUM_STAGES_SMEM,
-                                          vec_size_ckv, vec_size_kpe, bdx, bdy, bdz, AttentionVariant>;
+        BatchDecodeWithPagedKVCacheKernelMLA<NUM_STAGES_SMEM, vec_size_ckv, vec_size_kpe, 
+                                          bdx, bdy, bdz, tile_size_qo_heads,
+                                          AttentionVariant>;
     int num_blocks_per_sm = 0;
     int num_sm = 0;
     int dev_id = 0;
