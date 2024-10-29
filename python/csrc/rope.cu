@@ -19,10 +19,9 @@
 
 using namespace flashinfer;
 
-std::vector<torch::Tensor> apply_rope(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope,
-                                      torch::Tensor k_rope, torch::Tensor indptr,
-                                      torch::Tensor offsets, bool interleave, float rope_scale,
-                                      float rope_theta) {
+void apply_rope(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope, torch::Tensor k_rope,
+                torch::Tensor indptr, torch::Tensor offsets, bool interleave, float rope_scale,
+                float rope_theta) {
   CHECK_CUDA(q);  // not necessarily contiguous
   CHECK_CUDA(k);  // not necessarily contiguous
   CHECK_INPUT(indptr);
@@ -65,14 +64,11 @@ std::vector<torch::Tensor> apply_rope(torch::Tensor q, torch::Tensor k, torch::T
                                            std::string(cudaGetErrorString(status)));
     return true;
   });
-
-  return {q_rope, k_rope};
 }
 
-std::vector<torch::Tensor> apply_rope_pos_ids(torch::Tensor q, torch::Tensor k,
-                                              torch::Tensor q_rope, torch::Tensor k_rope,
-                                              torch::Tensor pos_ids, bool interleave,
-                                              float rope_scale, float rope_theta) {
+void apply_rope_pos_ids(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope,
+                        torch::Tensor k_rope, torch::Tensor pos_ids, bool interleave,
+                        float rope_scale, float rope_theta) {
   CHECK_CUDA(q);  // not necessarily contiguous
   CHECK_CUDA(k);  // not necessarily contiguous
   CHECK_INPUT(pos_ids);
@@ -109,16 +105,12 @@ std::vector<torch::Tensor> apply_rope_pos_ids(torch::Tensor q, torch::Tensor k,
                                            std::string(cudaGetErrorString(status)));
     return true;
   });
-
-  return {q_rope, k_rope};
 }
 
-std::vector<torch::Tensor> apply_llama31_rope(torch::Tensor q, torch::Tensor k,
-                                              torch::Tensor q_rope, torch::Tensor k_rope,
-                                              torch::Tensor indptr, torch::Tensor offsets,
-                                              bool interleave, float rope_scale, float rope_theta,
-                                              float low_freq_factor, float high_freq_factor,
-                                              float old_context_length) {
+void apply_llama31_rope(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope,
+                        torch::Tensor k_rope, torch::Tensor indptr, torch::Tensor offsets,
+                        bool interleave, float rope_scale, float rope_theta, float low_freq_factor,
+                        float high_freq_factor, float old_context_length) {
   CHECK_CUDA(q);  // not necessarily contiguous
   CHECK_CUDA(k);  // not necessarily contiguous
   CHECK_INPUT(indptr);
@@ -162,16 +154,12 @@ std::vector<torch::Tensor> apply_llama31_rope(torch::Tensor q, torch::Tensor k,
                                            std::string(cudaGetErrorString(status)));
     return true;
   });
-
-  return {q_rope, k_rope};
 }
 
-std::vector<torch::Tensor> apply_llama31_rope_pos_ids(torch::Tensor q, torch::Tensor k,
-                                                      torch::Tensor q_rope, torch::Tensor k_rope,
-                                                      torch::Tensor pos_ids, bool interleave,
-                                                      float rope_scale, float rope_theta,
-                                                      float low_freq_factor, float high_freq_factor,
-                                                      float old_context_length) {
+void apply_llama31_rope_pos_ids(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope,
+                                torch::Tensor k_rope, torch::Tensor pos_ids, bool interleave,
+                                float rope_scale, float rope_theta, float low_freq_factor,
+                                float high_freq_factor, float old_context_length) {
   CHECK_CUDA(q);  // not necessarily contiguous
   CHECK_CUDA(k);  // not necessarily contiguous
   CHECK_INPUT(pos_ids);
@@ -209,6 +197,4 @@ std::vector<torch::Tensor> apply_llama31_rope_pos_ids(torch::Tensor q, torch::Te
                                            std::string(cudaGetErrorString(status)));
     return true;
   });
-
-  return {q_rope, k_rope};
 }
