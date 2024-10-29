@@ -14,16 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import sys
 import re
-import itertools
-from literal_map import (
-    mask_mode_literal,
-    pos_encoding_mode_literal,
+import sys
+from pathlib import Path
+
+from .literal_map import (
     dtype_literal,
     idtype_literal,
+    mask_mode_literal,
+    pos_encoding_mode_literal,
 )
-from pathlib import Path
 
 
 def get_cu_file_str(

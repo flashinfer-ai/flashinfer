@@ -42,7 +42,8 @@ echo "::endgroup::"
 
 echo "::group::Build wheel for FlashInfer"
 cd "$PROJECT_ROOT/python"
-FLASHINFER_BUILD_VERSION="${FLASHINFER_BUILD_VERSION}+cu${CUDA_MAJOR}${CUDA_MINOR}torch${FLASHINFER_CI_TORCH_VERSION}" python -m build --no-isolation
+FLASHINFER_BUILD_VERSION="${FLASHINFER_BUILD_VERSION}+cu${CUDA_MAJOR}${CUDA_MINOR}torch${FLASHINFER_CI_TORCH_VERSION}" python aot_setup.py bdist_wheel
 rm -f dist/*.tar.gz
 python -m build --no-isolation --sdist
+ls -la dist/
 echo "::endgroup::"
