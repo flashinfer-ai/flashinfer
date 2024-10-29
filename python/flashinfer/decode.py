@@ -77,11 +77,10 @@ def compile_batch_decode_mla_module(
     *args,
     verbose: bool = False,
 ):
-    gen_batch_decode_mla_cu(*args)
-    uri = get_batch_decode_mla_uri(*args)
+    uri, path = gen_batch_decode_mla_cu(*args)
     return load_cuda_ops(
         uri,
-        [FLASHINFER_GEN_SRC_DIR / f"{uri}.cu"],
+        [path],
         verbose=verbose,
     )
 

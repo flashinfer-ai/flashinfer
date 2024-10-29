@@ -24,7 +24,6 @@ from .cascade import (
     BatchDecodeWithSharedPrefixPagedKVCacheWrapper as BatchDecodeWithSharedPrefixPagedKVCacheWrapper,
     BatchPrefillWithSharedPrefixPagedKVCacheWrapper as BatchPrefillWithSharedPrefixPagedKVCacheWrapper,
     MultiLevelCascadeAttentionWrapper as MultiLevelCascadeAttentionWrapper,
-    BatchDecodeMlaWithPagedKVCacheWrapper as BatchDecodeMlaWithPagedKVCacheWrapper,
     merge_state as merge_state,
     merge_state_in_place as merge_state_in_place,
     merge_states as merge_states,
@@ -32,6 +31,7 @@ from .cascade import (
 from .decode import (
     BatchDecodeWithPagedKVCacheWrapper as BatchDecodeWithPagedKVCacheWrapper,
     CUDAGraphBatchDecodeWithPagedKVCacheWrapper as CUDAGraphBatchDecodeWithPagedKVCacheWrapper,
+    BatchDecodeMlaWithPagedKVCacheWrapper as BatchDecodeMlaWithPagedKVCacheWrapper,
     single_decode_with_kv_cache as single_decode_with_kv_cache,
 )
 from .gemm import (

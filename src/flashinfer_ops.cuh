@@ -607,25 +607,23 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapperMLA(
   DISPATCH_head_dim(paged_kv.head_dim_ckv, HEAD_DIM_CKV, {
     // fixme: head_dim_ckv(kv_lora_rank) is 8 times the size of head_dim_kpe(qk_rope_head_dim) for all MLA model (DeepSeek-V2-Lite, DeepSeek-V2.5, MiniCPM3) at the time Oct.2024
     constexpr auto HEAD_DIM_KPE = HEAD_DIM_CKV/8;
-    // DISPATCH_head_dim(paged_kv.head_dim_kpe, HEAD_DIM_KPE, {
-        using ParamsT = BatchDecodeParamsMLA<DTypeQ, DTypeKV, DTypeO, IdType>;
-        using AttentionVariant =
-            ComposedAttention<ParamsT, get_variant_code(
-                                            /*use_custom_mask=*/false, /*use_sliding_window=*/true,
-                                            /*use_logits_soft_cap=*/false, /*use_alibi=*/false)>;
-        ParamsT params(q_nope, q_pe, q_offset, paged_kv, o, lse, num_qo_heads,
-                        /*window_left=*/-1, /*logits_soft_cap=*/0.f, sm_scale, rope_scale,
-                        rope_theta);
-        params.request_indices = handler->GetRequestIndices<IdType>();
-        params.kv_tile_indices = handler->GetKVTileIndices<IdType>();
-        params.o_indptr = handler->GetOIndptr<IdType>();
-        params.kv_chunk_size_ptr = handler->GetKVChunkSizePtr<IdType>();
-        params.block_valid_mask = handler->GetBlockValidMask();
-        params.padded_batch_size = handler->GetPlanInfo().padded_batch_size;
+    using ParamsT = BatchDecodeParamsMLA<DTypeQ, DTypeKV, DTypeO, IdType>;
+    using AttentionVariant =
+        ComposedAttention<ParamsT, get_variant_code(
+                                        /*use_custom_mask=*/false, /*use_sliding_window=*/true,
+                                        /*use_logits_soft_cap=*/false, /*use_alibi=*/false)>;
+    ParamsT params(q_nope, q_pe, q_offset, paged_kv, o, lse, num_qo_heads,
+                    /*window_left=*/-1, /*logits_soft_cap=*/0.f, sm_scale, rope_scale,
+                    rope_theta);
+    params.request_indices = handler->GetRequestIndices<IdType>();
+    params.kv_tile_indices = handler->GetKVTileIndices<IdType>();
+    params.o_indptr = handler->GetOIndptr<IdType>();
+    params.kv_chunk_size_ptr = handler->GetKVChunkSizePtr<IdType>();
+    params.block_valid_mask = handler->GetBlockValidMask();
+    params.padded_batch_size = handler->GetPlanInfo().padded_batch_size;
 
-        return BatchDecodeWithPagedKVCacheDispatchedMLA<HEAD_DIM_CKV, HEAD_DIM_KPE, AttentionVariant>(
-            params, handler->GetTmpV<DTypeO>(), handler->GetTmpS(), stream);
-    // });
+    return BatchDecodeWithPagedKVCacheDispatchedMLA<HEAD_DIM_CKV, HEAD_DIM_KPE, AttentionVariant>(
+        params, handler->GetTmpV<DTypeO>(), handler->GetTmpS(), stream);
   });
   return cudaSuccess;
 }
@@ -640,12 +638,10 @@ cudaError_t BatchDecodeHandlerPlanMLA(BatchDecodeHandler* handler, void* float_b
   DISPATCH_head_dim(head_dim_ckv, HEAD_DIM_CKV, {
     // fixme: head_dim_ckv(kv_lora_rank) is 8 times the size of head_dim_kpe(qk_rope_head_dim) for all MLA model (DeepSeek-V2-Lite, DeepSeek-V2.5, MiniCPM3) at the time Oct.2024
     constexpr auto HEAD_DIM_KPE = HEAD_DIM_CKV/8;
-    // DISPATCH_head_dim(head_dim_kpe, HEAD_DIM_KPE, {
-        return handler->PlanDispatchedMLA<HEAD_DIM_CKV, HEAD_DIM_KPE, DTypeQ, DTypeKV, DTypeO, IdType>(
-            float_buffer, float_workspace_size_in_bytes, int_buffer, int_workspace_size_in_bytes,
-            indptr_h, last_page_len_h, batch_size, num_qo_heads, page_size);
-    // });
-  });
+    return handler->PlanDispatchedMLA<HEAD_DIM_CKV, HEAD_DIM_KPE, DTypeQ, DTypeKV, DTypeO, IdType>(
+        float_buffer, float_workspace_size_in_bytes, int_buffer, int_workspace_size_in_bytes,
+        indptr_h, last_page_len_h, batch_size, num_qo_heads, page_size);
+});
 }
 
 }  // namespace flashinfer

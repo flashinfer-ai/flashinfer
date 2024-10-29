@@ -194,11 +194,14 @@ def gen_batch_decode_mla_cu(*args) -> None:
     gen_directory = FLASHINFER_GEN_SRC_DIR
     if not os.path.exists(gen_directory):
         os.makedirs(gen_directory)
-    file_name = f"{get_batch_decode_mla_uri(*args)}.cu"
+    uri = get_batch_decode_mla_uri(*args)
+    file_name = f"{uri}.cu"
+    path = gen_directory / file_name
     write_if_different(
-        gen_directory / file_name,
+        path,
         get_batch_decode_mla_cu_str(*args),
     )
+    return uri, path
 
 def get_single_prefill_cu_str(
     dtype_q: torch.dtype,
