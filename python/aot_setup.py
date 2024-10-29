@@ -451,8 +451,8 @@ if __name__ == "__main__":
             name="flashinfer",
             version=get_version(),
             packages=setuptools.find_packages(
-                include=["flashinfer.*"],
-                exclude=["flashinfer.data.*"],
+                include=["flashinfer*"],
+                exclude=["flashinfer.data*"],
             ),
             include_package_data=True,
             author="FlashInfer team",
