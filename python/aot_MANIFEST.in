@@ -1,4 +1,4 @@
-# MANIFEST.in for AOT
+# MANIFEST.in for AOT wheel
 
 prune */__pycache__
 prune csrc
