@@ -69,12 +69,8 @@ def test_llama_rope_inplace(
     )
 
     # compare
-    torch.testing.assert_close(
-        q_rope_ref, q, rtol=1e-3, atol=1e-3
-    )
-    torch.testing.assert_close(
-        k_rope_ref, k, rtol=1e-3, atol=1e-3
-    )
+    torch.testing.assert_close(q_rope_ref, q, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(k_rope_ref, k, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
@@ -125,12 +121,111 @@ def test_llama_rope(
     )
 
     # compare
-    torch.testing.assert_close(
-        q_rope_ref, q_rope, rtol=1e-3, atol=1e-3
+    torch.testing.assert_close(q_rope_ref, q_rope, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(k_rope_ref, k_rope, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
+@pytest.mark.parametrize("qkv_len", [1, 4, 19, 204])
+@pytest.mark.parametrize("num_qo_heads", [8, 16])
+@pytest.mark.parametrize("num_kv_heads", [8])
+@pytest.mark.parametrize("offset", [0, 15, 99])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+def test_llama_rope_pos_ids(
+    batch_size,
+    qkv_len,
+    num_qo_heads,
+    num_kv_heads,
+    offset,
+    head_dim,
+):
+    nnz = batch_size * qkv_len
+    qkv_packed = torch.randn(
+        nnz,
+        (num_qo_heads + 2 * num_kv_heads) * head_dim,
+        dtype=torch.float16,
+        device="cuda:0",
     )
-    torch.testing.assert_close(
-        k_rope_ref, k_rope, rtol=1e-3, atol=1e-3
+    q = qkv_packed[:, : num_qo_heads * head_dim].reshape(nnz, num_qo_heads, head_dim)
+    k = qkv_packed[
+        :, num_qo_heads * head_dim : (num_qo_heads + num_kv_heads) * head_dim
+    ].reshape(nnz, num_kv_heads, head_dim)
+    indptr = torch.tensor(
+        [i * qkv_len for i in range(batch_size + 1)], dtype=torch.int32, device="cuda:0"
     )
+    offsets = torch.full((batch_size,), offset, dtype=torch.int32, device="cuda:0")
+
+    pos_ids = torch.cat(
+        [
+            torch.arange(offset, qkv_len + offset, dtype=torch.int32)
+            for _ in range(batch_size)
+        ]
+    ).to("cuda:0")
+
+    q_rope, k_rope = flashinfer.apply_rope(
+        q, k, indptr, offsets, interleave=True, rope_theta=1e4
+    )
+
+    q_rope_pos_ids, k_rope_pos_ids = flashinfer.apply_rope_pos_ids(
+        q, k, pos_ids, interleave=True, rope_theta=1e4
+    )
+
+    # compare
+    torch.testing.assert_close(q_rope_pos_ids, q_rope, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(k_rope_pos_ids, k_rope, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
+@pytest.mark.parametrize("qkv_len", [1, 4, 19, 204])
+@pytest.mark.parametrize("num_qo_heads", [8, 16])
+@pytest.mark.parametrize("num_kv_heads", [8])
+@pytest.mark.parametrize("offset", [0, 15, 99])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+def test_llama_rope_pos_ids_inplace(
+    batch_size,
+    qkv_len,
+    num_qo_heads,
+    num_kv_heads,
+    offset,
+    head_dim,
+):
+    nnz = batch_size * qkv_len
+    qkv_packed = torch.randn(
+        nnz,
+        (num_qo_heads + 2 * num_kv_heads) * head_dim,
+        dtype=torch.float16,
+        device="cuda:0",
+    )
+    q = qkv_packed[:, : num_qo_heads * head_dim].reshape(nnz, num_qo_heads, head_dim)
+    k = qkv_packed[
+        :, num_qo_heads * head_dim : (num_qo_heads + num_kv_heads) * head_dim
+    ].reshape(nnz, num_kv_heads, head_dim)
+    indptr = torch.tensor(
+        [i * qkv_len for i in range(batch_size + 1)], dtype=torch.int32, device="cuda:0"
+    )
+    offsets = torch.full((batch_size,), offset, dtype=torch.int32, device="cuda:0")
+
+    pos_ids = torch.cat(
+        [
+            torch.arange(offset, qkv_len + offset, dtype=torch.int32)
+            for _ in range(batch_size)
+        ]
+    ).to("cuda:0")
+
+    q_clone = q.clone()
+    k_clone = k.clone()
+
+    flashinfer.apply_rope_inplace(
+        q, k, indptr, offsets, interleave=True, rope_theta=1e4
+    )
+
+    flashinfer.apply_rope_pos_ids_inplace(
+        q_clone, k_clone, pos_ids, interleave=True, rope_theta=1e4
+    )
+
+    # compare
+    torch.testing.assert_close(q_clone, q, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(k_clone, k, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
@@ -181,12 +276,8 @@ def test_llama31_rope_inplace(
     )
 
     # compare
-    torch.testing.assert_close(
-        q_rope_ref, q, rtol=1e-3, atol=1e-3
-    )
-    torch.testing.assert_close(
-        k_rope_ref, k, rtol=1e-3, atol=1e-3
-    )
+    torch.testing.assert_close(q_rope_ref, q, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(k_rope_ref, k, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
@@ -237,12 +328,8 @@ def test_llama31_rope(
     )
 
     # compare
-    torch.testing.assert_close(
-        q_rope_ref, q_rope, rtol=1e-3, atol=1e-3
-    )
-    torch.testing.assert_close(
-        k_rope_ref, k_rope, rtol=1e-3, atol=1e-3
-    )
+    torch.testing.assert_close(q_rope_ref, q_rope, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(k_rope_ref, k_rope, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":
@@ -250,3 +337,5 @@ if __name__ == "__main__":
     test_llama31_rope_inplace(1, 1, 8, 8, 0, 128)
     test_llama_rope(2, 1, 8, 8, 1, 128)
     test_llama31_rope(1, 1, 8, 8, 0, 128)
+    test_llama_rope_pos_ids(2, 1, 8, 8, 1, 128)
+    test_llama_rope_pos_ids_inplace(2, 1, 8, 8, 1, 128)

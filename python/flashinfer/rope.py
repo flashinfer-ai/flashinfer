@@ -118,8 +118,8 @@ def apply_rope_inplace(
     --------
     apply_rope
     """
-    return get_rope_module().apply_rope_inplace(
-        q, k, indptr, offsets, interleave, rope_scale, rope_theta
+    get_rope_module().apply_rope(
+        q, k, q, k, indptr, offsets, interleave, rope_scale, rope_theta
     )
 
 
@@ -129,6 +129,70 @@ def _fake_apply_rope_inplace(
     k: torch.Tensor,
     indptr: torch.Tensor,
     offsets: torch.Tensor,
+    interleave: bool = False,
+    rope_scale: float = 1,
+    rope_theta: float = 1e4,
+) -> None:
+    pass
+
+
+@register_custom_op("flashinfer::apply_rope_pos_ids_inplace", mutates_args=("q", "k"))
+def apply_rope_pos_ids_inplace(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    pos_ids: torch.Tensor,
+    interleave: bool = False,
+    rope_scale: float = 1,
+    rope_theta: float = 1e4,
+) -> None:
+    r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor) inplace.
+
+    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
+    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
+    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
+    0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
+    Please see :ref:`Ragged Tensor tutorial <ragged-layout>` for more details about the
+    ragged tensor.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)`, where ``nnz`` is the last
+        element of ``indptr``.
+    k : torch.Tensor
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
+        element of ``indptr``.
+    pos_ids : torch.Tensor
+        Position indices, shape: ``(nnz)``.
+    interleave : bool
+        Whether to use interleaved layout in the last dimension, default: ``False``.
+
+        * If ``True``, the last dimension of the query/key tensor is interleaved, i.e.,
+          we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
+
+        * If ``False``, the last dimension of the query/key tensor is not interleaved, i.e.,
+          we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          dimensions ``([..., head_dim//2:])``.
+
+    rope_scale : float
+        The scaling factor used in the rope embedding, default: ``1``.
+    rope_theta : float
+        The theta value used in the rope embedding, default: ``1e4``.
+
+    See Also
+    --------
+    apply_rope_pos_ids
+    """
+    get_rope_module().apply_rope_pos_ids(
+        q, k, q, k, pos_ids, interleave, rope_scale, rope_theta
+    )
+
+
+@register_fake_op("flashinfer::apply_rope_pos_ids_inplace")
+def _fake_apply_rope_pos_ids_inplace(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    pos_ids: torch.Tensor,
     interleave: bool = False,
     rope_scale: float = 1,
     rope_theta: float = 1e4,
@@ -222,7 +286,9 @@ def apply_llama31_rope_inplace(
     --------
     apply_llama31_rope
     """
-    return get_rope_module().apply_llama31_rope_inplace(
+    get_rope_module().apply_llama31_rope(
+        q,
+        k,
         q,
         k,
         indptr,
@@ -339,8 +405,10 @@ def apply_rope(
     --------
     apply_rope_inplace
     """
+    q_rope = torch.empty_like(q)
+    k_rope = torch.empty_like(k)
     return get_rope_module().apply_rope(
-        q, k, indptr, offsets, interleave, rope_scale, rope_theta
+        q, k, q_rope, k_rope, indptr, offsets, interleave, rope_scale, rope_theta
     )
 
 
@@ -350,6 +418,79 @@ def _fake_apply_rope(
     k: torch.Tensor,
     indptr: torch.Tensor,
     offsets: torch.Tensor,
+    interleave: bool = False,
+    rope_scale: float = 1,
+    rope_theta: float = 1e4,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(q), torch.empty_like(k)
+
+
+@register_custom_op("flashinfer::apply_rope_pos_ids", mutates_args=())
+def apply_rope_pos_ids(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    pos_ids: torch.Tensor,
+    interleave: bool = False,
+    rope_scale: float = 1,
+    rope_theta: float = 1e4,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor).
+
+    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
+    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
+    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
+    0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
+    Please see :ref:`Ragged Tensor tutorial <ragged-layout>` for more details about the
+    ragged tensor.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)`, where ``nnz`` is the last
+        element of ``indptr``.
+    k : torch.Tensor
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
+        element of ``indptr``.
+    pos_ids : torch.Tensor
+        Position indices, shape: ``(batch_size + 1)``.
+    interleave : bool
+        Whether to use interleaved layout in the last dimension, default: ``False``.
+
+        * If ``True``, the last dimension of the query/key tensor is interleaved, i.e.,
+          we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
+
+        * If ``False``, the last dimension of the query/key tensor is not interleaved, i.e.,
+          we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          dimensions ``([..., head_dim//2:])``.
+
+    rope_scale : float
+        The scaling factor used in the rope embedding, default: ``1``.
+    rope_theta : float
+        The theta value used in the rope embedding, default: ``1e4``.
+
+    Returns
+    -------
+    q_rope : torch.Tensor
+        The rotated query tensor, shape: ``(nnz, num_q_heads, head_dim)``.
+    k_rope : torch.Tensor
+        The rotated key tensor, shape: ``(nnz, num_k_heads, head_dim)``.
+
+    See Also
+    --------
+    apply_rope_inplace
+    """
+    q_rope = torch.empty_like(q)
+    k_rope = torch.empty_like(k)
+    return get_rope_module().apply_rope_pos_ids(
+        q, k, q_rope, k_rope, pos_ids, interleave, rope_scale, rope_theta
+    )
+
+
+@register_fake_op("flashinfer::apply_rope_pos_ids")
+def _fake_apply_rope_pos_ids(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    pos_ids: torch.Tensor,
     interleave: bool = False,
     rope_scale: float = 1,
     rope_theta: float = 1e4,
@@ -454,9 +595,13 @@ def apply_llama31_rope(
     --------
     apply_llama31_rope_inplace
     """
+    q_rope = torch.empty_like(q)
+    k_rope = torch.empty_like(k)
     return get_rope_module().apply_llama31_rope(
         q,
         k,
+        q_rope,
+        k_rope,
         indptr,
         offsets,
         interleave,
