@@ -65,11 +65,6 @@ torch::Tensor CutlassSegmentGEMM(torch::Tensor workspace_buffer, torch::Tensor s
                                  torch::Tensor weight, unsigned int batch_size,
                                  bool weight_column_major);
 
-torch::Tensor CutlassSegmentGEMMSM90(torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer, torch::Tensor seg_indptr,
-                                 torch::Tensor weight_indices, torch::Tensor x,
-                                 torch::Tensor weight, unsigned int batch_size,
-                                 bool weight_column_major);
-
 //========== norm ==========
 
 void rmsnorm(torch::Tensor& out, torch::Tensor& input, torch::Tensor& weight, double eps);
@@ -133,23 +128,23 @@ torch::Tensor segment_packbits(torch::Tensor x, torch::Tensor input_indptr,
 
 //========== rope ==========
 
-void apply_rope_inplace(torch::Tensor q, torch::Tensor k, torch::Tensor indptr,
-                        torch::Tensor offsets, bool interleave, float rope_scale, float rope_theta);
+void apply_rope(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope, torch::Tensor k_rope,
+                torch::Tensor indptr, torch::Tensor offsets, bool interleave, float rope_scale,
+                float rope_theta);
 
-void apply_llama31_rope_inplace(torch::Tensor q, torch::Tensor k, torch::Tensor indptr,
-                                torch::Tensor offsets, bool interleave, float rope_scale,
-                                float rope_theta, float low_freq_factor, float high_freq_factor,
-                                float old_context_length);
+void apply_llama31_rope(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope,
+                        torch::Tensor k_rope, torch::Tensor indptr, torch::Tensor offsets,
+                        bool interleave, float rope_scale, float rope_theta, float low_freq_factor,
+                        float high_freq_factor, float old_context_length);
 
-std::vector<torch::Tensor> apply_rope(torch::Tensor q, torch::Tensor k, torch::Tensor indptr,
-                                      torch::Tensor offsets, bool interleave, float rope_scale,
-                                      float rope_theta);
+void apply_rope_pos_ids(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope,
+                        torch::Tensor k_rope, torch::Tensor pos_ids, bool interleave,
+                        float rope_scale, float rope_theta);
 
-std::vector<torch::Tensor> apply_llama31_rope(torch::Tensor q, torch::Tensor k,
-                                              torch::Tensor indptr, torch::Tensor offsets,
-                                              bool interleave, float rope_scale, float rope_theta,
-                                              float low_freq_factor, float high_freq_factor,
-                                              float old_context_length);
+void apply_llama31_rope_pos_ids(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope,
+                                torch::Tensor k_rope, torch::Tensor pos_ids, bool interleave,
+                                float rope_scale, float rope_theta, float low_freq_factor,
+                                float high_freq_factor, float old_context_length);
 
 //========== sampling ==========
 
@@ -185,10 +180,11 @@ torch::Tensor top_k_renorm_probs(torch::Tensor probs, std::optional<torch::Tenso
 torch::Tensor top_k_mask_logits(torch::Tensor logits, std::optional<torch::Tensor> maybe_top_k_arr,
                                 unsigned int top_k_val);
 
-torch::Tensor chain_speculative_sampling(
-    torch::Tensor draft_probs, torch::Tensor draft_token_ids, torch::Tensor uniform_samples,
-    torch::Tensor target_probs, torch::Tensor output_accepted_token_num,
-    torch::Tensor output_emitted_token_num, bool deterministic);
+torch::Tensor chain_speculative_sampling(torch::Tensor draft_probs, torch::Tensor draft_token_ids,
+                                         torch::Tensor uniform_samples, torch::Tensor target_probs,
+                                         torch::Tensor output_accepted_token_num,
+                                         torch::Tensor output_emitted_token_num,
+                                         bool deterministic);
 
 //========== pybind11 ==========
 
@@ -236,11 +232,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("segment_packbits", &segment_packbits, "GPU segment packbits operator");
 
   // rope
-  m.def("apply_rope_inplace", &apply_rope_inplace, "Apply RoPE in-place");
-  m.def("apply_llama31_rope_inplace", &apply_llama31_rope_inplace,
-        "Apply Llama 3.1 style RoPE in-place");
   m.def("apply_rope", &apply_rope, "Apply RoPE");
   m.def("apply_llama31_rope", &apply_llama31_rope, "Apply Llama 3.1 style RoPE");
+  m.def("apply_rope_pos_ids", &apply_rope_pos_ids, "Apply RoPE with positional ids");
+  m.def("apply_llama31_rope_pos_ids", &apply_llama31_rope_pos_ids,
+        "Apply Llama 3.1 style RoPE with positional ids");
 
   // sampling
   m.def("sampling_from_probs", &sampling_from_probs, "Sample from probabilities");

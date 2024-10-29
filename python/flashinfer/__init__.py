@@ -60,6 +60,8 @@ from .rope import (
     apply_llama31_rope_inplace as apply_llama31_rope_inplace,
     apply_rope as apply_rope,
     apply_rope_inplace as apply_rope_inplace,
+    apply_rope_pos_ids as apply_rope_pos_ids,
+    apply_rope_pos_ids_inplace as apply_rope_pos_ids_inplace,
 )
 from .sampling import (
     chain_speculative_sampling as chain_speculative_sampling,
