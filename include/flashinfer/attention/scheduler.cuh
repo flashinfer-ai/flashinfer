@@ -218,12 +218,6 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA(
     constexpr uint32_t qo_heads_per_block = bdy * tile_size_qo_heads;
     constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
     constexpr uint32_t bdz = num_threads / (bdx * bdy);
-    if (num_qo_heads % qo_heads_per_block != 0) {
-      std::ostringstream err_msg;
-      err_msg << "num_qo_heads " << num_qo_heads << " is not a multiple of qo_heads_per_block "
-              << qo_heads_per_block;
-      throw std::invalid_argument(err_msg.str());
-    }
     const uint32_t gdy = ceil_div(num_qo_heads, qo_heads_per_block);
 
     const uint32_t smem_size =

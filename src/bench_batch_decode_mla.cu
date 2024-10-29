@@ -124,6 +124,6 @@ void bench_flashinfer_batch_decode_mla(nvbench::state& state) {
       .add_int64_axis("page_size", {64})                                                           \
       .add_int64_axis("batch_size", {16, 256})                                                     \
       .add_int64_axis("seqlen", {1024, 16384})                                                     \
-      .add_int64_axis("num_qo_heads",  {8, 16, 32, 64, 128})
+      .add_int64_axis("num_qo_heads",  {8, 16, 32, 40, 64, 128})
 
 BENCH_FLASHINFER_BATCH_DECODE(half);
