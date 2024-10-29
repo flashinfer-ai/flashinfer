@@ -16,6 +16,7 @@ limitations under the License.
 
 import argparse
 import contextlib
+import copy
 import itertools
 import os
 import pathlib
@@ -403,34 +404,48 @@ if __name__ == "__main__":
             "-use_fast_math",
         ],
     }
-    sources = files_decode + files_prefill
-    sources += [
-        "csrc/bmm_fp8.cu",
-        "csrc/cascade.cu",
-        "csrc/group_gemm.cu",
-        "csrc/group_gemm_sm90.cu",
-        "csrc/norm.cu",
-        "csrc/page.cu",
-        "csrc/quantization.cu",
-        "csrc/rope.cu",
-        "csrc/sampling.cu",
-        "csrc_aot/activation.cu",
-        "csrc_aot/batch_decode.cu",
-        "csrc_aot/batch_prefill.cu",
-        "csrc_aot/flashinfer_ops.cu",
-        "csrc_aot/single_decode.cu",
-        "csrc_aot/single_prefill.cu",
-    ]
-
+    extra_compile_args_sm90 = copy.deepcopy(extra_compile_args)
+    extra_compile_args_sm90["nvcc"].extend(
+        "-gencode arch=compute_90a,code=sm_90a".split()
+    )
     ext_modules = []
     ext_modules.append(
         torch_cpp_ext.CUDAExtension(
             name="flashinfer._kernels",
-            sources=sources,
+            sources=[
+                "csrc/bmm_fp8.cu",
+                "csrc/cascade.cu",
+                "csrc/group_gemm.cu",
+                "csrc/norm.cu",
+                "csrc/page.cu",
+                "csrc/quantization.cu",
+                "csrc/rope.cu",
+                "csrc/sampling.cu",
+                "csrc_aot/activation.cu",
+                "csrc_aot/batch_decode.cu",
+                "csrc_aot/batch_prefill.cu",
+                "csrc_aot/flashinfer_ops.cu",
+                "csrc_aot/single_decode.cu",
+                "csrc_aot/single_prefill.cu",
+            ]
+            + files_decode
+            + files_prefill,
             include_dirs=include_dirs,
             extra_compile_args=extra_compile_args,
         )
     )
+    ext_modules.append(
+        torch_cpp_ext.CUDAExtension(
+            name="flashinfer._kernels_sm90",
+            sources=[
+                "csrc/group_gemm_sm90.cu",
+                "csrc_aot/flashinfer_sm90_ops.cu",
+            ],
+            include_dirs=include_dirs,
+            extra_compile_args=extra_compile_args_sm90,
+        )
+    )
+
     with link_data_files():
         setuptools.setup(
             name="flashinfer",

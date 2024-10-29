@@ -213,7 +213,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   // gemm
   m.def("bmm_fp8", &bmm_fp8, "BMM FP8");
   m.def("cutlass_segment_gemm", &CutlassSegmentGEMM, "Cutlass Segment GEMM operator");
-  m.def("cutlass_segment_gemm_sm90", &CutlassSegmentGEMMSM90, "Cutlass Segment GEMM operator for SM90");
 
   // norm
   m.def("rmsnorm", &rmsnorm, "Root mean square normalization");

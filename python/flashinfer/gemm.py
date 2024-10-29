@@ -118,9 +118,9 @@ def get_gemm_sm90_module():
     global _gemm_module_sm90
     if _gemm_module_sm90 is None:
         if has_prebuilt_ops:
-            from . import _kernels
+            from . import _kernels_sm90
 
-            module = _kernels
+            module = _kernels_sm90
         else:
             module = load_cuda_ops(
                 "gemm_sm90",
