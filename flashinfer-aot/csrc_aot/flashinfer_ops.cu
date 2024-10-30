@@ -83,29 +83,23 @@ void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);
 
 void gelu_and_mul(torch::Tensor& out, torch::Tensor& input);
 
-std::vector<torch::Tensor> apply_rope(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope,
-                                      torch::Tensor k_rope, torch::Tensor indptr,
-                                      torch::Tensor offsets, bool interleave, float rope_scale,
-                                      float rope_theta);
+void apply_rope(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope, torch::Tensor k_rope,
+                torch::Tensor indptr, torch::Tensor offsets, bool interleave, float rope_scale,
+                float rope_theta);
 
-std::vector<torch::Tensor> apply_llama31_rope(torch::Tensor q, torch::Tensor k,
-                                              torch::Tensor q_rope, torch::Tensor k_rope,
-                                              torch::Tensor indptr, torch::Tensor offsets,
-                                              bool interleave, float rope_scale, float rope_theta,
-                                              float low_freq_factor, float high_freq_factor,
-                                              float old_context_length);
+void apply_llama31_rope(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope,
+                        torch::Tensor k_rope, torch::Tensor indptr, torch::Tensor offsets,
+                        bool interleave, float rope_scale, float rope_theta, float low_freq_factor,
+                        float high_freq_factor, float old_context_length);
 
-std::vector<torch::Tensor> apply_rope_pos_ids(torch::Tensor q, torch::Tensor k,
-                                              torch::Tensor q_rope, torch::Tensor k_rope,
-                                              torch::Tensor pos_ids, bool interleave,
-                                              float rope_scale, float rope_theta);
+void apply_rope_pos_ids(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope,
+                        torch::Tensor k_rope, torch::Tensor pos_ids, bool interleave,
+                        float rope_scale, float rope_theta);
 
-std::vector<torch::Tensor> apply_llama31_rope_pos_ids(torch::Tensor q, torch::Tensor k,
-                                                      torch::Tensor q_rope, torch::Tensor k_rope,
-                                                      torch::Tensor pos_ids, bool interleave,
-                                                      float rope_scale, float rope_theta,
-                                                      float low_freq_factor, float high_freq_factor,
-                                                      float old_context_length);
+void apply_llama31_rope_pos_ids(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope,
+                                torch::Tensor k_rope, torch::Tensor pos_ids, bool interleave,
+                                float rope_scale, float rope_theta, float low_freq_factor,
+                                float high_freq_factor, float old_context_length);
 
 torch::Tensor packbits(torch::Tensor x, const std::string& bitorder);
 
