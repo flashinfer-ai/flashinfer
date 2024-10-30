@@ -16,10 +16,11 @@ limitations under the License.
 
 import argparse
 from pathlib import Path
-from literal_map import (
-    pos_encoding_mode_literal,
+
+from .literal_map import (
     bool_literal,
     mask_mode_literal,
+    pos_encoding_mode_literal,
 )
 
 

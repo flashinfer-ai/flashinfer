@@ -14,33 +14,36 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from typing import List, Tuple
-
+import argparse
+import contextlib
 import copy
-import pathlib
-import os
-import re
 import itertools
-import subprocess
+import os
+import pathlib
 import platform
+import re
+import shutil
+import subprocess
+import sys
+import warnings
+from typing import Iterator, List, Tuple
 
 import setuptools
-import argparse
 import torch
 import torch.utils.cpp_extension as torch_cpp_ext
-from collections import namedtuple
 
-import generate_single_decode_inst, generate_single_prefill_inst, generate_batch_paged_decode_inst, generate_batch_paged_prefill_inst, generate_batch_ragged_prefill_inst, generate_dispatch_inc
+root = pathlib.Path(__file__).resolve().parents[1]
 
+sys.path.append(str(root / "python"))
 
-root = pathlib.Path(__name__).parent
-
-
-# cuda arch check for fp8 at the moment.
-for cuda_arch_flags in torch_cpp_ext._get_cuda_arch_flags():
-    arch = int(re.search("compute_\d+", cuda_arch_flags).group()[-2:])
-    if arch < 75:
-        raise RuntimeError("FlashInfer requires sm75+")
+from _aot_build_utils import (
+    generate_batch_paged_decode_inst,
+    generate_batch_paged_prefill_inst,
+    generate_batch_ragged_prefill_inst,
+    generate_dispatch_inc,
+    generate_single_decode_inst,
+    generate_single_prefill_inst,
+)
 
 enable_bf16 = os.environ.get("FLASHINFER_ENABLE_BF16", "1") == "1"
 enable_fp8 = os.environ.get("FLASHINFER_ENABLE_FP8", "1") == "1"
@@ -61,7 +64,7 @@ def write_if_different(path: pathlib.Path, content: str) -> None:
 
 
 def get_instantiation_cu() -> Tuple[List[str], List[str], List[str]]:
-    path = root / "csrc_aot" / "generated"
+    path = root / "python" / "csrc_aot" / "generated"
     path.mkdir(parents=True, exist_ok=True)
 
     head_dims = os.environ.get("FLASHINFER_HEAD_DIMS", "64,128,256").split(",")
@@ -104,13 +107,7 @@ def get_instantiation_cu() -> Tuple[List[str], List[str], List[str]]:
     files_prefill = []
     single_decode_uris = []
     # single decode files
-    for (
-        head_dim,
-        pos_encoding_mode,
-    ) in itertools.product(
-        head_dims,
-        pos_encoding_modes,
-    ):
+    for head_dim, pos_encoding_mode in itertools.product(head_dims, pos_encoding_modes):
         for dtype_q, dtype_kv in list(zip(decode_dtypes, decode_dtypes)) + list(
             itertools.product(fp16_dtypes, fp8_dtypes)
         ):
@@ -278,6 +275,11 @@ def get_instantiation_cu() -> Tuple[List[str], List[str], List[str]]:
                         f"f16qk_{bool(allow_fp16_qk_reduction)}"
                     )
 
+    # Change to relative path
+    this_dir = pathlib.Path(__file__).parent.resolve()
+    files_prefill = [str(pathlib.Path(p).relative_to(this_dir)) for p in files_prefill]
+    files_decode = [str(pathlib.Path(p).relative_to(this_dir)) for p in files_decode]
+
     return (
         files_prefill,
         files_decode,
@@ -313,14 +315,14 @@ def generate_build_meta() -> None:
     d["torch"] = torch.__version__
     d["python"] = platform.python_version()
     d["TORCH_CUDA_ARCH_LIST"] = os.environ.get("TORCH_CUDA_ARCH_LIST", None)
-    with open(root / "flashinfer" / "_build_meta.py", "w") as f:
+    with open(root / "python" / "flashinfer" / "_build_meta.py", "w") as f:
         f.write(f"__version__ = {version!r}\n")
         f.write(f"build_meta = {d!r}")
 
 
 def generate_aot_config(aot_kernel_uris: List[str]) -> None:
     aot_config_str = f"""prebuilt_ops_uri = set({aot_kernel_uris})"""
-    with open(root / "flashinfer" / "jit" / "aot_config.py", "w") as f:
+    with open(root / "python" / "flashinfer" / "jit" / "aot_config.py", "w") as f:
         f.write(aot_config_str)
 
 
@@ -348,11 +350,43 @@ class NinjaBuildExtension(torch_cpp_ext.BuildExtension):
         super().__init__(*args, **kwargs)
 
 
+@contextlib.contextmanager
+def link_data_files() -> Iterator[None]:
+    this_dir = pathlib.Path(__file__).parent
+    data_dir = root / "python" / "flashinfer" / "data"
+    if data_dir.exists():
+        shutil.rmtree(data_dir)
+    data_dir.mkdir(parents=True)
+
+    def ln(src: str, dst: str, is_dir: bool = False) -> None:
+        (data_dir / dst).symlink_to(root / src, target_is_directory=is_dir)
+
+    ln("3rdparty/cutlass", "cutlass", True)
+    ln("include", "include", True)
+    ln("python/csrc", "csrc", True)
+    ln("version.txt", "version.txt")
+    (this_dir / "MANIFEST.in").unlink(True)
+    (this_dir / "MANIFEST.in").symlink_to("jit_MANIFEST.in")
+
+    yield
+
+    if sys.argv[1] != "develop":
+        shutil.rmtree(data_dir)
+        (this_dir / "MANIFEST.in").unlink(True)
+
+
 if __name__ == "__main__":
+    # cuda arch check for fp8 at the moment.
+    for cuda_arch_flags in torch_cpp_ext._get_cuda_arch_flags():
+        arch = int(re.search(r"compute_(\d+)", cuda_arch_flags).group(1))
+        if arch < 75:
+            raise RuntimeError("FlashInfer requires sm75+")
+
     remove_unwanted_pytorch_nvcc_flags()
     generate_build_meta()
     files_prefill, files_decode, aot_kernel_uris = get_instantiation_cu()
     generate_aot_config(aot_kernel_uris)
+
     include_dirs = [
         str(root.resolve() / "include"),
         str(root.resolve() / "3rdparty" / "cutlass" / "include"),  # for group gemm
@@ -366,8 +400,7 @@ if __name__ == "__main__":
         "nvcc": [
             "-O3",
             "-std=c++17",
-            "--threads",
-            "1",
+            "--threads=1",
             "-Xfatbin",
             "-compress-all",
             "-use_fast_math",
@@ -382,17 +415,23 @@ if __name__ == "__main__":
         torch_cpp_ext.CUDAExtension(
             name="flashinfer._kernels",
             sources=[
-                "csrc/cascade.cu",
-                "csrc/page.cu",
-                "csrc/sampling.cu",
-                "csrc/norm.cu",
-                "csrc_aot/activation.cu",
-                "csrc/rope.cu",
-                "csrc/quantization.cu",
-                "csrc/group_gemm.cu",
                 "csrc/bmm_fp8.cu",
-                "csrc_aot/flashinfer_ops.cu"
-            ],
+                "csrc/cascade.cu",
+                "csrc/group_gemm.cu",
+                "csrc/norm.cu",
+                "csrc/page.cu",
+                "csrc/quantization.cu",
+                "csrc/rope.cu",
+                "csrc/sampling.cu",
+                "csrc_aot/activation.cu",
+                "csrc_aot/batch_decode.cu",
+                "csrc_aot/batch_prefill.cu",
+                "csrc_aot/flashinfer_ops.cu",
+                "csrc_aot/single_decode.cu",
+                "csrc_aot/single_prefill.cu",
+            ]
+            + files_decode
+            + files_prefill,
             include_dirs=include_dirs,
             extra_compile_args=extra_compile_args,
         )
@@ -408,41 +447,25 @@ if __name__ == "__main__":
             extra_compile_args=extra_compile_args_sm90,
         )
     )
-    ext_modules.append(
-        torch_cpp_ext.CUDAExtension(
-            name="flashinfer._decode_kernels",
-            sources=[
-                "csrc_aot/single_decode.cu",
-                "csrc_aot/flashinfer_ops_decode.cu",
-                "csrc_aot/batch_decode.cu",
-            ]
-            + files_decode,
-            include_dirs=include_dirs,
-            extra_compile_args=extra_compile_args,
+
+    # Suppress warnings complaining that:
+    # Package 'flashinfer.data*' is absent from the `packages` configuration.
+    warnings.filterwarnings("ignore", r".*flashinfer\.data.*", UserWarning)
+
+    with link_data_files():
+        setuptools.setup(
+            name="flashinfer",
+            version=get_version(),
+            packages=setuptools.find_packages(
+                include=["flashinfer*"],
+                exclude=["flashinfer.data*"],
+            ),
+            include_package_data=True,
+            author="FlashInfer team",
+            license="Apache License 2.0",
+            description="FlashInfer: Kernel Library for LLM Serving",
+            url="https://github.com/flashinfer-ai/flashinfer",
+            python_requires=">=3.8",
+            ext_modules=ext_modules,
+            cmdclass={"build_ext": NinjaBuildExtension},
         )
-    )
-    ext_modules.append(
-        torch_cpp_ext.CUDAExtension(
-            name="flashinfer._prefill_kernels",
-            sources=[
-                "csrc_aot/single_prefill.cu",
-                "csrc_aot/flashinfer_ops_prefill.cu",
-                "csrc_aot/batch_prefill.cu",
-            ]
-            + files_prefill,
-            include_dirs=include_dirs,
-            extra_compile_args=extra_compile_args,
-        )
-    )
-    setuptools.setup(
-        name="flashinfer",
-        version=get_version(),
-        packages=setuptools.find_packages(),
-        author="FlashInfer team",
-        license="Apache License 2.0",
-        description="FlashInfer: Kernel Library for LLM Serving",
-        url="https://github.com/flashinfer-ai/flashinfer",
-        python_requires=">=3.8",
-        ext_modules=ext_modules,
-        cmdclass={"build_ext": NinjaBuildExtension},
-    )

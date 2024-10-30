@@ -81,9 +81,9 @@ def get_single_decode_module(*args):
     if args not in _single_decode_modules:
         uri = get_single_decode_uri(*args)
         if has_prebuilt_ops and uri in prebuilt_ops_uri:
-            from . import _decode_kernels
+            from . import _kernels
 
-            run_func = _decode_kernels.single_decode_with_kv_cache
+            run_func = _kernels.single_decode_with_kv_cache
         else:
             run_func = compile_single_decode_module(*args).run
 
@@ -143,7 +143,7 @@ def get_batch_decode_module(*args):
     if args not in _batch_decode_modules:
         uri = get_batch_decode_uri(*args)
         if has_prebuilt_ops and uri in prebuilt_ops_uri:
-            from . import _decode_kernels
+            from . import _kernels
 
             # NOTE(Zihao): we should avoid hard-coded index like this, refactor it later
             dtype_q = args[0]
@@ -151,7 +151,7 @@ def get_batch_decode_module(*args):
             head_dim = args[4]
             use_logits_cap = args[7]
             plan_func = (
-                lambda *plan_args: _decode_kernels.batch_decode_with_paged_kv_cache_plan(
+                lambda *plan_args: _kernels.batch_decode_with_paged_kv_cache_plan(
                     use_logits_cap,
                     head_dim,
                     torch.empty(0, dtype=dtype_q),
@@ -159,7 +159,7 @@ def get_batch_decode_module(*args):
                     *plan_args,
                 )
             )
-            run_func = _decode_kernels.batch_decode_with_paged_kv_cache_run
+            run_func = _kernels.batch_decode_with_paged_kv_cache_run
         else:
             mod = compile_batch_decode_module(*args)
             plan_func = mod.plan

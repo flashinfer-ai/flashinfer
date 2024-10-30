@@ -49,7 +49,7 @@ from .utils import (
 )
 
 if has_prebuilt_ops:
-    from . import _prefill_kernels  # type: ignore[attr-defined]
+    from . import _kernels  # type: ignore[attr-defined]
 
 
 def compile_single_prefill_module(
@@ -87,7 +87,7 @@ def get_single_prefill_module(*args):
         if has_prebuilt_ops and uri in prebuilt_ops_uri:
             # NOTE(Zihao): we should avoid hard-coded index like this, refactor it later
             mask_mode = args[5]
-            run_func = lambda *run_args: _prefill_kernels.single_prefill_with_kv_cache(
+            run_func = lambda *run_args: _kernels.single_prefill_with_kv_cache(
                 mask_mode,
                 *run_args,
             )
@@ -159,21 +159,19 @@ def get_batch_prefill_module(*args):
         if has_prebuilt_ops and uri in prebuilt_ops_uri:
             # NOTE(Zihao): we should avoid hard-coded index like this, refactor it later
             head_dim = args[4]
-            plan_func = (
-                lambda *plan_args: _prefill_kernels.batch_prefill_with_kv_cache_plan(
-                    head_dim,
-                    *plan_args,
-                )
+            plan_func = lambda *plan_args: _kernels.batch_prefill_with_kv_cache_plan(
+                head_dim,
+                *plan_args,
             )
             mask_mode = args[6]
             ragged_run_func = (
-                lambda *run_args: _prefill_kernels.batch_prefill_with_ragged_kv_cache_run(
+                lambda *run_args: _kernels.batch_prefill_with_ragged_kv_cache_run(
                     mask_mode,
                     *run_args,
                 )
             )
             paged_run_func = (
-                lambda *run_args: _prefill_kernels.batch_prefill_with_paged_kv_cache_run(
+                lambda *run_args: _kernels.batch_prefill_with_paged_kv_cache_run(
                     mask_mode,
                     *run_args,
                 )

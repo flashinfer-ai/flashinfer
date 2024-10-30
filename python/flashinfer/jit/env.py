@@ -31,10 +31,10 @@ def _get_workspace_dir_name() -> pathlib.Path:
 FLASHINFER_WORKSPACE_DIR = _get_workspace_dir_name()
 FLASHINFER_JIT_DIR = FLASHINFER_WORKSPACE_DIR / "cached_ops"
 FLASHINFER_GEN_SRC_DIR = FLASHINFER_WORKSPACE_DIR / "generated"
-_project_root = pathlib.Path(__file__).resolve().parent.parent.parent
-FLASHINFER_INCLUDE_DIR = _project_root / "include"
-FLASHINFER_CSRC_DIR = _project_root / "csrc"
+_package_root = pathlib.Path(__file__).resolve().parents[1]
+FLASHINFER_INCLUDE_DIR = _package_root / "data" / "include"
+FLASHINFER_CSRC_DIR = _package_root / "data" / "csrc"
 CUTLASS_INCLUDE_DIRS = [
-    _project_root / "3rdparty" / "cutlass" / "include",
-    _project_root / "3rdparty" / "cutlass" / "tools" / "util" / "include",
+    _package_root / "data" / "cutlass" / "include",
+    _package_root / "data" / "cutlass" / "tools" / "util" / "include",
 ]

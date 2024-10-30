@@ -13,7 +13,12 @@ src/generated/
 python/csrc/generated/
 python/flashinfer/_build_meta.py
 python/flashinfer/jit/aot_config.py
-flashinfer-aot/csrc_aot/generated/
+python/csrc_aot/generated/
+
+# Package files
+python/flashinfer/data/
+python/flashinfer/version.txt
+python/MANIFEST.in
 
 # Generated documentation files
 docs/generated
