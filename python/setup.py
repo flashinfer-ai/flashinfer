@@ -18,6 +18,7 @@ import os
 import pathlib
 import shutil
 from typing import Iterator
+import warnings
 
 import setuptools
 
@@ -71,6 +72,11 @@ if __name__ == "__main__":
     link_data_files()
     generate_build_meta()
     clear_aot_config()
+
+    # Suppress warnings complaining that:
+    # Package 'flashinfer.data*' is absent from the `packages` configuration.
+    warnings.filterwarnings("ignore", r".*flashinfer\.data.*", UserWarning)
+
     setuptools.setup(
         name="flashinfer",
         version=get_version(),

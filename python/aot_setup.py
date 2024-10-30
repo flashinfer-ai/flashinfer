@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+import warnings
 from typing import Iterator, List, Tuple
 
 import setuptools
@@ -445,6 +446,10 @@ if __name__ == "__main__":
             extra_compile_args=extra_compile_args_sm90,
         )
     )
+
+    # Suppress warnings complaining that:
+    # Package 'flashinfer.data*' is absent from the `packages` configuration.
+    warnings.filterwarnings("ignore", r".*flashinfer\.data.*", UserWarning)
 
     with link_data_files():
         setuptools.setup(
