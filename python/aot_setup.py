@@ -370,8 +370,9 @@ def link_data_files() -> Iterator[None]:
 
     yield
 
-    shutil.rmtree(data_dir)
-    (this_dir / "MANIFEST.in").unlink(True)
+    if sys.argv[1] != "develop":
+        shutil.rmtree(data_dir)
+        (this_dir / "MANIFEST.in").unlink(True)
 
 
 if __name__ == "__main__":

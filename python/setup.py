@@ -14,9 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import contextlib
 import os
 import pathlib
 import shutil
+import sys
 from typing import Iterator
 import warnings
 
@@ -47,6 +49,7 @@ def clear_aot_config():
         os.remove(aot_config_path)
 
 
+@contextlib.contextmanager
 def link_data_files() -> Iterator[None]:
     this_dir = pathlib.Path(__file__).parent
     data_dir = root / "python" / "flashinfer" / "data"
@@ -64,8 +67,11 @@ def link_data_files() -> Iterator[None]:
     (this_dir / "MANIFEST.in").unlink(True)
     (this_dir / "MANIFEST.in").symlink_to("jit_MANIFEST.in")
 
-    # Unlike aot_setup.py, don't delete the symlinks after the build
-    # because editable installs rely on them.
+    yield
+
+    if sys.argv[1] != "develop":
+        shutil.rmtree(data_dir)
+        (this_dir / "MANIFEST.in").unlink(True)
 
 
 if __name__ == "__main__":
@@ -77,17 +83,18 @@ if __name__ == "__main__":
     # Package 'flashinfer.data*' is absent from the `packages` configuration.
     warnings.filterwarnings("ignore", r".*flashinfer\.data.*", UserWarning)
 
-    setuptools.setup(
-        name="flashinfer",
-        version=get_version(),
-        packages=setuptools.find_packages(
-            include=["flashinfer*"],
-            exclude=["flashinfer.data*"],
-        ),
-        include_package_data=True,
-        author="FlashInfer team",
-        license="Apache License 2.0",
-        description="FlashInfer: Kernel Library for LLM Serving",
-        url="https://github.com/flashinfer-ai/flashinfer",
-        python_requires=">=3.8",
-    )
+    with link_data_files():
+        setuptools.setup(
+            name="flashinfer",
+            version=get_version(),
+            packages=setuptools.find_packages(
+                include=["flashinfer*"],
+                exclude=["flashinfer.data*"],
+            ),
+            include_package_data=True,
+            author="FlashInfer team",
+            license="Apache License 2.0",
+            description="FlashInfer: Kernel Library for LLM Serving",
+            url="https://github.com/flashinfer-ai/flashinfer",
+            python_requires=">=3.8",
+        )
