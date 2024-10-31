@@ -15,12 +15,15 @@ limitations under the License.
 """
 
 import math
+import os
 from enum import Enum
 from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
 
 import torch
 from torch.torch_version import TorchVersion
 from torch.torch_version import __version__ as torch_version
+
+IS_BUILDING_DOCS = os.environ.get("FLASHINFER_BUILDING_DOCS") == "1"
 
 
 class PosEncodingMode(Enum):
@@ -202,26 +205,46 @@ def _check_cached_qkv_data_type(
         )
 
 
-def register_custom_op(
-    name: str,
-    fn: Optional[Callable] = None,
-    /,
-    *,
-    mutates_args: Union[str, Iterable[str]],
-    device_types: Optional[Union[str, Sequence[str]]] = None,
-    schema: Optional[str] = None,
-) -> Callable:
-    if TorchVersion(torch_version) < TorchVersion("2.4"):
-        return lambda x: x
-    return torch.library.custom_op(
-        name, fn, mutates_args=mutates_args, device_types=device_types, schema=schema
-    )
+if IS_BUILDING_DOCS or TorchVersion(torch_version) < TorchVersion("2.4"):
 
-
-def register_fake_op(
-    name: str,
-    fn: Optional[Callable] = None,
-) -> Callable:
-    if TorchVersion(torch_version) < TorchVersion("2.4"):
+    def register_custom_op(
+        name: str,
+        fn: Optional[Callable] = None,
+        /,
+        *,
+        mutates_args: Union[str, Iterable[str]],
+        device_types: Optional[Union[str, Sequence[str]]] = None,
+        schema: Optional[str] = None,
+    ) -> Callable:
         return lambda x: x
-    return torch.library.register_fake(name, fn)
+
+    def register_fake_op(
+        name: str,
+        fn: Optional[Callable] = None,
+    ) -> Callable:
+        return lambda x: x
+
+else:
+
+    def register_custom_op(
+        name: str,
+        fn: Optional[Callable] = None,
+        /,
+        *,
+        mutates_args: Union[str, Iterable[str]],
+        device_types: Optional[Union[str, Sequence[str]]] = None,
+        schema: Optional[str] = None,
+    ) -> Callable:
+        return torch.library.custom_op(
+            name,
+            fn,
+            mutates_args=mutates_args,
+            device_types=device_types,
+            schema=schema,
+        )
+
+    def register_fake_op(
+        name: str,
+        fn: Optional[Callable] = None,
+    ) -> Callable:
+        return torch.library.register_fake(name, fn)

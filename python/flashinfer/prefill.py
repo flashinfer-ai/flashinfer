@@ -48,9 +48,6 @@ from .utils import (
     register_fake_op,
 )
 
-if has_prebuilt_ops:
-    from . import _kernels  # type: ignore[attr-defined]
-
 
 def compile_single_prefill_module(
     *args,
@@ -85,6 +82,8 @@ def get_single_prefill_module(*args):
     if args not in _single_prefill_modules:
         uri = get_single_prefill_uri(*args)
         if has_prebuilt_ops and uri in prebuilt_ops_uri:
+            from . import _kernels
+
             # NOTE(Zihao): we should avoid hard-coded index like this, refactor it later
             mask_mode = args[5]
             run_func = lambda *run_args: _kernels.single_prefill_with_kv_cache(
@@ -157,6 +156,8 @@ def get_batch_prefill_module(*args):
     if args not in _batch_prefill_modules:
         uri = get_batch_prefill_uri(*args)
         if has_prebuilt_ops and uri in prebuilt_ops_uri:
+            from . import _kernels
+
             # NOTE(Zihao): we should avoid hard-coded index like this, refactor it later
             head_dim = args[4]
             plan_func = lambda *plan_args: _kernels.batch_prefill_with_kv_cache_plan(
