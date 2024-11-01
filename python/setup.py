@@ -75,8 +75,6 @@ def link_data_files() -> Iterator[None]:
 
 
 if __name__ == "__main__":
-    link_data_files()
-    generate_build_meta()
     clear_aot_config()
 
     # Suppress warnings complaining that:
@@ -84,6 +82,8 @@ if __name__ == "__main__":
     warnings.filterwarnings("ignore", r".*flashinfer\.data.*", UserWarning)
 
     with link_data_files():
+        generate_build_meta()
+
         setuptools.setup(
             name="flashinfer",
             version=get_version(),
