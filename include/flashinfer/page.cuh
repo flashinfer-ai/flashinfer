@@ -346,6 +346,159 @@ cudaError_t AppendPagedKVCache(paged_kv_t<DType, IdType> paged_kv, DType* key, D
   return cudaSuccess;
 }
 
+template <typename DType, typename IdType>
+struct paged_kv_mla_t {
+  uint_fastdiv page_size;
+  uint32_t head_dim_ckv;
+  uint32_t head_dim_kpe;
+  uint32_t batch_size;
+  uint32_t stride_page_ckv;
+  uint32_t stride_page_kpe;
+  uint32_t stride_n_ckv;
+  uint32_t stride_n_kpe;
+
+  // Internal layout:
+  // [max_num_pages, page_size, head_dim]
+  DType* ckv_data;
+  DType* kpe_data;
+  IdType* indices;
+
+  // [batch_size + 1] The page indptr array, with the first element 0, the last element nnz_pages
+  IdType* indptr;
+  // [batch_size] The offset of the last page for each request in the batch
+  IdType* last_page_len;
+  // [batch_size] The start position of each request in the batch.
+  IdType* rope_pos_offset;
+
+  /*!
+   * \brief Construct an empty paged key-value cache
+   */
+  __host__ __device__ __forceinline__ paged_kv_mla_t()
+      : head_dim_ckv(0),
+        head_dim_kpe(0),
+        batch_size(0),
+        stride_page_ckv(0),
+        stride_page_kpe(0),
+        stride_n_ckv(0),
+        stride_n_kpe(0),
+        ckv_data(nullptr),
+        kpe_data(nullptr),
+        indices(nullptr),
+        indptr(nullptr),
+        last_page_len(nullptr),
+        rope_pos_offset(nullptr) {}
+
+  /*!
+   * \brief Construct a paged mla kv cache
+   * \param page_size The size of each page
+   * \param head_dim_compressed_kv The dimension of compressed-kv 
+   * \param head_dim_kpe The dimension of k-pe
+   * \param batch_size The batch size
+   * \param compressed_kv_data The start pointer of compressed-kv cache, cache should be contiguous
+   * \param kpe_data The start pointer of k-pe cache, cache should be contiguous
+   * \param indices The page indices array
+   * \param indptr The page indptr array
+   * \param last_page_len The offset of the last page for each request in the batch
+   * \param rope_pos_offset The start position of each request in the batch.
+   */
+  __host__ __forceinline__ paged_kv_mla_t(uint32_t page_size, 
+                                      uint32_t head_dim_compressed_kv, uint32_t head_dim_kpe,
+                                      uint32_t batch_size, 
+                                      DType* compressed_kv_data, DType* kpe_data, 
+                                      IdType* indices, IdType* indptr, IdType* last_page_len, 
+                                      IdType* rope_pos_offset = nullptr)
+      : page_size(page_size),
+        head_dim_ckv(head_dim_compressed_kv),
+        head_dim_kpe(head_dim_kpe),
+        batch_size(batch_size),
+        ckv_data(compressed_kv_data),
+        kpe_data(kpe_data),
+        indices(indices),
+        indptr(indptr),
+        last_page_len(last_page_len),
+        rope_pos_offset(rope_pos_offset) {
+    stride_page_ckv = page_size * head_dim_ckv;
+    stride_n_ckv = head_dim_ckv;
+    stride_page_kpe = page_size * head_dim_kpe;
+    stride_n_kpe = head_dim_kpe;
+  }
+
+  /*!
+   * \brief Construct a paged key-value cache with custom kv-cache strides
+   * \param page_size The size of each page
+   * \param head_dim_compressed_kv The dimension of compressed-kv 
+   * \param head_dim_kpe The dimension of k-pe
+   * \param batch_size The batch size
+   * \param compressed_kv_data The start pointer of compressed-kv cache, cache should be contiguous
+   * \param compressed_kv_strides custom strides of each dimensions of compressed-kv cache
+   * \param kpe_data The start pointer of k-pe cache, cache should be contiguous
+   * \param kpe_strides custom strides of each dimensions of k-pe cache
+   * \param indices The page indices array
+   * \param indptr The page indptr array
+   * \param last_page_len The offset of the last page for each request in the batch
+   * \param rope_pos_offset The start position of each request in the batch.
+   */
+  __host__ __forceinline__ paged_kv_mla_t(uint32_t page_size, 
+                                      uint32_t head_dim_compressed_kv, uint32_t head_dim_kpe,
+                                      uint32_t batch_size, 
+                                      DType* compressed_kv_data, const int64_t* compressed_kv_strides,
+                                      DType* kpe_data, const int64_t* kpe_strides, 
+                                      IdType* indices, IdType* indptr, IdType* last_page_len,
+                                      IdType* rope_pos_offset = nullptr)
+      : page_size(page_size),
+        head_dim_ckv(head_dim_compressed_kv),
+        head_dim_kpe(head_dim_kpe),
+        batch_size(batch_size),
+        ckv_data(compressed_kv_data),
+        kpe_data(kpe_data),
+        indices(indices),
+        indptr(indptr),
+        last_page_len(last_page_len),
+        rope_pos_offset(rope_pos_offset) {
+    stride_page_ckv = compressed_kv_strides[0];
+    stride_n_ckv = compressed_kv_strides[1];
+    stride_page_kpe = kpe_strides[0];
+    stride_n_kpe = kpe_strides[1];
+  }
+
+  __host__ __device__ __forceinline__ uint32_t get_length(uint32_t batch_idx) const {
+    if (indptr[batch_idx + 1] == indptr[batch_idx]) {
+      return 0;
+    }
+    return (indptr[batch_idx + 1] - indptr[batch_idx] - 1) * page_size + last_page_len[batch_idx];
+  }
+
+  __host__ __device__ __forceinline__ size_t get_elem_offset_ckv(size_t page_idx, size_t entry_idx,
+                                                             size_t feat_idx) const {
+    return page_idx * stride_page_ckv + entry_idx * stride_n_ckv + feat_idx;
+  }
+
+  __device__ __forceinline__ size_t protective_get_offset_ckv(IdType page_iter, uint32_t entry_idx, 
+                                                             uint32_t feat_idx,
+                                                             IdType last_indptr) const {
+    if (page_iter < last_indptr) {
+      return get_elem_offset_ckv(__ldg(indices + page_iter), entry_idx, feat_idx);
+    } else {
+      return 0;
+    }
+  }
+
+  __host__ __device__ __forceinline__ size_t get_elem_offset_kpe(size_t page_idx, size_t entry_idx,
+                                                             size_t feat_idx) const {
+    return page_idx * stride_page_kpe + entry_idx * stride_n_kpe + feat_idx;
+  }
+
+  __device__ __forceinline__ size_t protective_get_offset_kpe(IdType page_iter, uint32_t entry_idx, 
+                                                             uint32_t feat_idx,
+                                                             IdType last_indptr) const {
+    if (page_iter < last_indptr) {
+      return get_elem_offset_kpe(__ldg(indices + page_iter), entry_idx, feat_idx);
+    } else {
+      return 0;
+    }
+  }
+};
+
 }  // namespace flashinfer
 
 #endif  // FLAHSINFER_PAGE_CUH_

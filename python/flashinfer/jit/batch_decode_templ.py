@@ -45,20 +45,24 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
   TORCH_CHECK(indptr.device() == torch::kCPU, "indptr must be on CPU");
 
   DecodePlanInfo plan_info;
+  DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
+    auto work_estimation_func =
+        BatchDecodeWithPagedKVCacheWorkEstimationDispatched<GROUP_SIZE, {{ head_dim }}, {{ pos_encoding_mode }},
+                                                            AttentionVariant>;
+    cudaError_t status = DecodePlan<{{ head_dim }}, {{ pos_encoding_mode }}, AttentionVariant>(
+        static_cast<void*>(float_workspace_buffer.data_ptr()),
+        float_workspace_size_in_bytes,
+        static_cast<void*>(int_workspace_buffer.data_ptr()),
+        static_cast<void*>(page_locked_int_workspace_buffer.data_ptr()),
+        int_workspace_size_in_bytes,
+        plan_info,
+        static_cast<{{ dtype_idx }}*>(indptr.data_ptr()),
+        batch_size, num_qo_heads, /*num_kv_heads,*/ page_size, enable_cuda_graph, /*stream=*/torch_current_stream,
+        work_estimation_func);
 
-  cudaError_t status = DecodePlan<{{ head_dim }}, {{ pos_encoding_mode }}, AttentionVariant>(
-      static_cast<void*>(float_workspace_buffer.data_ptr()),
-      float_workspace_size_in_bytes,
-      static_cast<void*>(int_workspace_buffer.data_ptr()),
-      static_cast<void*>(page_locked_int_workspace_buffer.data_ptr()),
-      int_workspace_size_in_bytes,
-      plan_info,
-      static_cast<{{ dtype_idx }}*>(indptr.data_ptr()),
-      batch_size, num_qo_heads, num_kv_heads, page_size, enable_cuda_graph, /*stream=*/torch_current_stream);
-
-  TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
-              cudaGetErrorString(status));
-  
+    TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
+                cudaGetErrorString(status));
+  });
   return plan_info.ToVector();
 }
 

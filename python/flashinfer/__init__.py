@@ -19,6 +19,7 @@ from .activation import (
     gelu_tanh_and_mul as gelu_tanh_and_mul,
     silu_and_mul as silu_and_mul,
 )
+
 from .cascade import (
     BatchDecodeWithSharedPrefixPagedKVCacheWrapper as BatchDecodeWithSharedPrefixPagedKVCacheWrapper,
     BatchPrefillWithSharedPrefixPagedKVCacheWrapper as BatchPrefillWithSharedPrefixPagedKVCacheWrapper,
@@ -30,6 +31,7 @@ from .cascade import (
 from .decode import (
     BatchDecodeWithPagedKVCacheWrapper as BatchDecodeWithPagedKVCacheWrapper,
     CUDAGraphBatchDecodeWithPagedKVCacheWrapper as CUDAGraphBatchDecodeWithPagedKVCacheWrapper,
+    BatchDecodeMlaWithPagedKVCacheWrapper as BatchDecodeMlaWithPagedKVCacheWrapper,
     single_decode_with_kv_cache as single_decode_with_kv_cache,
 )
 from .gemm import (

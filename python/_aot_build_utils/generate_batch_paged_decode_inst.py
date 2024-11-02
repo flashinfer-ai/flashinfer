@@ -58,6 +58,15 @@ template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{head_dim}, {pos_enco
     ParamsT params,
     {dtype_out}* tmp_v, float* tmp_s,
     cudaStream_t stream);
+    
+    
+using ParamsMlaT = BatchDecodeParamsMLA<{dtype_q}, {dtype_kv}, {dtype_out}, {idtype}>;
+
+template cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA<{head_dim}, {head_dim_kpe}, ComposedAttention<ParamsMlaT, get_variant_code(
+    /*use_custom_mask=*/false, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false)>>(
+    ParamsMlaT params,
+    {dtype_out}* tmp_v, float* tmp_s,
+    cudaStream_t stream);
 }}
     """.format(
         head_dim=head_dim,
@@ -66,6 +75,7 @@ template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{head_dim}, {pos_enco
         dtype_kv=dtype_literal[dtype_kv],
         dtype_out=dtype_literal[dtype_out],
         idtype=idtype_literal[idtype],
+        head_dim_kpe=str(int(head_dim)//8) # fixme: head_dim_ckv(kv_lora_rank) is 8 times the size of head_dim_kpe(qk_rope_head_dim) for all MLA model (DeepSeek-V2-Lite, DeepSeek-V2.5, MiniCPM3) at the time Oct.2024
     )
     return content
 

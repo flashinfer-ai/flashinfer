@@ -169,6 +169,63 @@ struct BatchDecodeParams {
   }
 };
 
+
+template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_>
+struct BatchDecodeParamsMLA {
+  using DTypeQ = DTypeQ_;
+  using DTypeKV = DTypeKV_;
+  using DTypeO = DTypeO_;
+  using IdType = IdType_;
+
+  DTypeQ* q_nope;
+  DTypeQ* q_pe;
+  DTypeO* o;
+  float* lse;
+  float sm_scale;
+
+  IdType* q_offset;
+  paged_kv_mla_t<DTypeKV, IdType> paged_kv;
+  uint32_t padded_batch_size;
+  uint32_t num_qo_heads;
+  int32_t window_left;
+  float logits_soft_cap;
+  float rope_rcp_scale;
+  float rope_rcp_theta;
+
+  IdType* request_indices;
+  IdType* kv_tile_indices;
+  IdType* o_indptr;
+  IdType* kv_chunk_size_ptr;
+  bool* block_valid_mask;
+  bool partition_kv;
+
+  __device__ __host__ BatchDecodeParamsMLA(DTypeQ* q_nope, DTypeQ* q_pe, IdType* q_offset,
+                                        paged_kv_mla_t<DTypeKV, IdType> paged_kv, DTypeO* o, float* lse,
+                                        uint32_t num_qo_heads,
+                                        int32_t window_left, float logits_soft_cap, float sm_scale,
+                                        float rope_scale, float rope_theta)
+      : q_nope(q_nope), q_pe(q_pe), o(o), lse(lse), sm_scale(sm_scale),
+        q_offset(q_offset),
+        paged_kv(paged_kv),
+        padded_batch_size(0),
+        num_qo_heads(num_qo_heads),
+        window_left(window_left),
+        logits_soft_cap(logits_soft_cap),
+        rope_rcp_scale(1.f / rope_scale),
+        rope_rcp_theta(1.f / rope_theta),
+        request_indices(nullptr),
+        kv_tile_indices(nullptr),
+        o_indptr(nullptr),
+        kv_chunk_size_ptr(nullptr),
+        block_valid_mask(nullptr),
+        partition_kv(false) {}
+
+  __host__ __device__ __forceinline__ int32_t get_qo_len(int32_t batch_idx) const { return 1; }
+  __host__ __device__ __forceinline__ int32_t get_kv_len(int32_t batch_idx) const {
+    return paged_kv.get_length(batch_idx);
+  }
+};
+
 }  // namespace flashinfer
 
 #endif  // FLASHINFER_DECODE_PARAMS_CUH_

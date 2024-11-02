@@ -33,10 +33,12 @@ from .attention import (
     gen_batch_prefill_cu as gen_batch_prefill_cu,
     gen_single_decode_cu as gen_single_decode_cu,
     gen_single_prefill_cu as gen_single_prefill_cu,
+    gen_batch_decode_mla_cu as gen_batch_decode_mla_cu,
     get_batch_decode_uri as get_batch_decode_uri,
     get_batch_prefill_uri as get_batch_prefill_uri,
     get_single_decode_uri as get_single_decode_uri,
     get_single_prefill_uri as get_single_prefill_uri,
+    get_batch_decode_mla_uri as get_batch_decode_mla_uri,
 )
 from .env import (
     CUTLASS_INCLUDE_DIRS as CUTLASS_INCLUDE_DIRS,
