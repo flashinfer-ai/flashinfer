@@ -18,7 +18,7 @@ import functools
 import logging
 import math
 from types import SimpleNamespace
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
@@ -369,6 +369,46 @@ def single_prefill_with_kv_cache_with_jit_module(
         q, k, v, tmp, TensorLayout[kv_layout].value, window_left, lse, *args
     )
     return (out, lse) if return_lse else out
+
+
+@overload
+def single_prefill_with_kv_cache(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    custom_mask: Optional[torch.Tensor] = None,
+    packed_custom_mask: Optional[torch.Tensor] = None,
+    causal: bool = False,
+    kv_layout: str = "NHD",
+    pos_encoding_mode: str = "NONE",
+    allow_fp16_qk_reduction: bool = False,
+    sm_scale: Optional[float] = None,
+    window_left: int = -1,
+    logits_soft_cap: Optional[float] = None,
+    rope_scale: Optional[float] = None,
+    rope_theta: Optional[float] = None,
+    return_lse: Literal[False] = False,
+) -> torch.Tensor: ...
+
+
+@overload
+def single_prefill_with_kv_cache(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    custom_mask: Optional[torch.Tensor] = None,
+    packed_custom_mask: Optional[torch.Tensor] = None,
+    causal: bool = False,
+    kv_layout: str = "NHD",
+    pos_encoding_mode: str = "NONE",
+    allow_fp16_qk_reduction: bool = False,
+    sm_scale: Optional[float] = None,
+    window_left: int = -1,
+    logits_soft_cap: Optional[float] = None,
+    rope_scale: Optional[float] = None,
+    rope_theta: Optional[float] = None,
+    return_lse: Literal[True] = True,
+) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
 def single_prefill_with_kv_cache(
@@ -1077,6 +1117,26 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._rope_theta = rope_theta
         return self.run(q, paged_kv_cache, k_scale=k_scale, v_scale=v_scale)
 
+    @overload
+    def run(
+        self,
+        q: torch.Tensor,
+        paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        return_lse: Literal[False] = False,
+    ) -> torch.Tensor: ...
+
+    @overload
+    def run(
+        self,
+        q: torch.Tensor,
+        paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        return_lse: Literal[True] = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]: ...
+
     def run(
         self,
         q: torch.Tensor,
@@ -1642,6 +1702,24 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
         return self.run(q, k, v)
+
+    @overload
+    def run(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        return_lse: Literal[False] = False,
+    ) -> torch.Tensor: ...
+
+    @overload
+    def run(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        return_lse: Literal[True] = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     def run(
         self,

@@ -17,7 +17,7 @@ limitations under the License.
 import functools
 import math
 from types import SimpleNamespace
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
@@ -830,6 +830,28 @@ class BatchDecodeWithPagedKVCacheWrapper:
         return self.run(
             q, paged_kv_cache, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
         )
+
+    @overload
+    def run(
+        self,
+        q: torch.Tensor,
+        paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        q_scale: Optional[float] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        return_lse: Literal[False] = False,
+    ) -> torch.Tensor: ...
+
+    @overload
+    def run(
+        self,
+        q: torch.Tensor,
+        paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        q_scale: Optional[float] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        return_lse: Literal[True] = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     def run(
         self,
