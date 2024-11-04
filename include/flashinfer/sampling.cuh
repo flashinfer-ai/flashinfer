@@ -95,7 +95,7 @@ struct SamplingTempStorage {
       Pair<T> pair;
       T max_p;
     } block_aggregate;
-  } data;
+  };
 };
 
 /*!
@@ -201,10 +201,10 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
       BlockReduce<T, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce)
           .Sum<VEC_SIZE>(prob_greater_than_threshold);
   if (tx == 0) {
-    temp_storage->data.block_aggregate.value = aggregate_local;
+    temp_storage->block_aggregate.value = aggregate_local;
   }
   __syncthreads();
-  aggregate_local = temp_storage->data.block_aggregate.value;
+  aggregate_local = temp_storage->block_aggregate.value;
 
   if (aggregate + aggregate_local > u) {
     if constexpr (DETERMINISTIC) {
@@ -236,10 +236,10 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
       if (greater_than_u_diff[j] && valid[j]) {
         if constexpr (DETERMINISTIC) {
-          temp_storage->data.sampled_id = (i * BLOCK_THREADS + tx) * VEC_SIZE + j;
+          temp_storage->sampled_id = (i * BLOCK_THREADS + tx) * VEC_SIZE + j;
         } else {
           // cub's block scan result might not be monotonic, so we need to find the first element
-          atomicMin(&(temp_storage->data.sampled_id), (i * BLOCK_THREADS + tx) * VEC_SIZE + j);
+          atomicMin(&(temp_storage->sampled_id), (i * BLOCK_THREADS + tx) * VEC_SIZE + j);
         }
       }
     }
@@ -261,7 +261,7 @@ __global__ void SamplingFromProbKernel(DType* probs, DType* uniform_samples, IdT
       uint8_t smem_sampling[];
   auto& temp_storage = reinterpret_cast<
       SamplingTempStorage<DType, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>&>(smem_sampling);
-  temp_storage.data.sampled_id = d - 1;
+  temp_storage.sampled_id = d - 1;
   __syncthreads();
 
   vec_t<DType, VEC_SIZE> probs_vec;
@@ -280,7 +280,7 @@ __global__ void SamplingFromProbKernel(DType* probs, DType* uniform_samples, IdT
       break;
     }
   }
-  output[bx] = temp_storage.data.sampled_id;
+  output[bx] = temp_storage.sampled_id;
 }
 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
@@ -305,7 +305,7 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, DType* uniform_samples,
   DType pivot = DType(0);
   IdType sampled_id;
   for (uint32_t round = 0; round < max_top_k_rounds; ++round) {
-    temp_storage.data.sampled_id = d - 1;
+    temp_storage.sampled_id = d - 1;
     __syncthreads();
     DType u = uniform_samples[round * batch_size + bx] * q;
     aggregate = DType(0);
@@ -323,7 +323,7 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, DType* uniform_samples,
       }
     }
     __syncthreads();
-    sampled_id = temp_storage.data.sampled_id;
+    sampled_id = temp_storage.sampled_id;
     pivot = max(pivot, probs[bx * d + sampled_id]);
 
     Pair<DType> aggregate_gt_pivot{DType(0), 0};
@@ -344,19 +344,19 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, DType* uniform_samples,
                                 temp_storage.block_prim.reduce_pair)
                                 .Sum<VEC_SIZE>(probs_gt_pivot);
       if (tx == 0) {
-        temp_storage.data.block_aggregate.pair = aggregate_gt_pivot;
+        temp_storage.block_aggregate.pair = aggregate_gt_pivot;
       }
       __syncthreads();
     }
-    q = temp_storage.data.block_aggregate.pair.value;
-    if (temp_storage.data.block_aggregate.pair.count < k) {
+    q = temp_storage.block_aggregate.pair.value;
+    if (temp_storage.block_aggregate.pair.count < k) {
       break;
     }
   }
   __syncthreads();
   if (tx == 0) {
     output[bx] = sampled_id;
-    if (temp_storage.data.block_aggregate.pair.count >= k) {
+    if (temp_storage.block_aggregate.pair.count >= k) {
       // failed to sample within MAX_TOP_P_ROUNDS
       if (success != nullptr) {
         success[bx] = false;
@@ -393,7 +393,7 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
   DType pivot = DType(0);
   IdType sampled_id;
   for (uint32_t round = 0; round < max_top_p_rounds; ++round) {
-    temp_storage.data.sampled_id = d - 1;
+    temp_storage.sampled_id = d - 1;
     __syncthreads();
     DType u = uniform_samples[round * batch_size + bx] * q;
     aggregate = DType(0);
@@ -411,7 +411,7 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
       }
     }
     __syncthreads();
-    sampled_id = temp_storage.data.sampled_id;
+    sampled_id = temp_storage.sampled_id;
     pivot = max(pivot, probs[row_idx * d + sampled_id]);
 
     DType aggregate_gt_pivot = DType(0);
@@ -430,11 +430,11 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
       aggregate_gt_pivot += BlockReduce<DType, BLOCK_THREADS>(temp_storage.block_prim.reduce)
                                 .Sum<VEC_SIZE>(probs_gt_pivot);
       if (tx == 0) {
-        temp_storage.data.block_aggregate.value = aggregate_gt_pivot;
+        temp_storage.block_aggregate.value = aggregate_gt_pivot;
       }
       __syncthreads();
     }
-    q = temp_storage.data.block_aggregate.value;
+    q = temp_storage.block_aggregate.value;
     if (float(q) < top_p) {
       break;
     }
@@ -492,14 +492,14 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
     __syncthreads();
   }
   if (tx == 0) {
-    temp_storage.data.block_aggregate.max_p = max_p;
+    temp_storage.block_aggregate.max_p = max_p;
   }
   __syncthreads();
-  DType scaled_p = temp_storage.data.block_aggregate.max_p * p;
+  DType scaled_p = temp_storage.block_aggregate.max_p * p;
 
   IdType sampled_id;
   for (uint32_t round = 0; round < max_min_p_rounds; ++round) {
-    temp_storage.data.sampled_id = d - 1;
+    temp_storage.sampled_id = d - 1;
     __syncthreads();
     DType u = uniform_samples[round * batch_size + bx] * q;
     aggregate = DType(0);
@@ -517,7 +517,7 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
       }
     }
     __syncthreads();
-    sampled_id = temp_storage.data.sampled_id;
+    sampled_id = temp_storage.sampled_id;
     pivot = max(pivot, probs[bx * d + sampled_id]);
     if (pivot >= scaled_p) {
       break;
@@ -539,11 +539,11 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
       aggregate_gt_pivot += BlockReduce<DType, BLOCK_THREADS>(temp_storage.block_prim.reduce)
                                 .Sum<VEC_SIZE>(probs_gt_pivot);
       if (tx == 0) {
-        temp_storage.data.block_aggregate.value = aggregate_gt_pivot;
+        temp_storage.block_aggregate.value = aggregate_gt_pivot;
       }
       __syncthreads();
     }
-    q = temp_storage.data.block_aggregate.value;
+    q = temp_storage.block_aggregate.value;
   }
   __syncthreads();
   if (tx == 0) {
@@ -585,7 +585,7 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, DType* uniform_samp
   DType pivot = DType(0);
   IdType sampled_id;
   for (uint32_t round = 0; round < max_rounds; ++round) {
-    temp_storage.data.sampled_id = d - 1;
+    temp_storage.sampled_id = d - 1;
     __syncthreads();
     DType u = uniform_samples[round * batch_size + bx] * q;
     aggregate = DType(0);
@@ -603,7 +603,7 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, DType* uniform_samp
       }
     }
     __syncthreads();
-    sampled_id = temp_storage.data.sampled_id;
+    sampled_id = temp_storage.sampled_id;
     pivot = max(pivot, probs[bx * d + sampled_id]);
 
     Pair<DType> aggregate_gt_pivot{DType(0), 0};
@@ -624,19 +624,19 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, DType* uniform_samp
                                 temp_storage.block_prim.reduce_pair)
                                 .Sum<VEC_SIZE>(probs_gt_pivot);
       if (tx == 0) {
-        temp_storage.data.block_aggregate.pair = aggregate_gt_pivot;
+        temp_storage.block_aggregate.pair = aggregate_gt_pivot;
       }
       __syncthreads();
     }
-    q = temp_storage.data.block_aggregate.pair.value;
-    if (temp_storage.data.block_aggregate.pair.count < k && float(q) < p) {
+    q = temp_storage.block_aggregate.pair.value;
+    if (temp_storage.block_aggregate.pair.count < k && float(q) < p) {
       break;
     }
   }
   __syncthreads();
   if (tx == 0) {
     output[bx] = sampled_id;
-    if (temp_storage.data.block_aggregate.pair.count >= k || float(q) >= p) {
+    if (temp_storage.block_aggregate.pair.count >= k || float(q) >= p) {
       // failed to sample within MAX_TOP_P_ROUNDS
       if (success != nullptr) {
         success[bx] = false;
@@ -816,7 +816,7 @@ struct RenormTempStorage {
       int count;
       Pair<T> pair;
     } block_aggregate;
-  } data;
+  };
 };
 
 template <uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE,
@@ -831,7 +831,7 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, DType* 
       uint8_t smem_renorm[];
   auto& temp_storage =
       reinterpret_cast<RenormTempStorage<DType, BLOCK_THREADS, REDUCE_ALGO>&>(smem_renorm);
-  temp_storage.data.max_val = DType(0);
+  temp_storage.max_val = DType(0);
   vec_t<DType, VEC_SIZE> probs_vec;
   DType probs_greater_than_pivot[VEC_SIZE];  // pivot initialized to 0
 
@@ -852,10 +852,10 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, DType* 
     __syncthreads();
   }
   if (tx == 0) {
-    temp_storage.data.max_val = threadlocal_max_val;
+    temp_storage.max_val = threadlocal_max_val;
   }
   __syncthreads();
-  threadlocal_max_val = temp_storage.data.max_val;
+  threadlocal_max_val = temp_storage.max_val;
 
   float low = 0, high = threadlocal_max_val;
   DType min_gt_low, max_le_high;
@@ -899,14 +899,14 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, DType* 
         BlockReduce<DType, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
             .Reduce(max_le_high, cub::Max());
     if (tx == 0) {
-      temp_storage.data.block_aggregate.value = threadlocal_sum;
-      temp_storage.data.min_val = min_gt_low;
-      temp_storage.data.max_val = max_le_high;
+      temp_storage.block_aggregate.value = threadlocal_sum;
+      temp_storage.min_val = min_gt_low;
+      temp_storage.max_val = max_le_high;
     }
     __syncthreads();
-    threadlocal_sum = temp_storage.data.block_aggregate.value;
-    min_gt_low = temp_storage.data.min_val;
-    max_le_high = temp_storage.data.max_val;
+    threadlocal_sum = temp_storage.block_aggregate.value;
+    min_gt_low = temp_storage.min_val;
+    max_le_high = temp_storage.max_val;
     if (threadlocal_sum >= p) {
       low = mid;
       sum_low = float(threadlocal_sum);
@@ -972,12 +972,12 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
       __syncthreads();
     }
     if (tx == 0) {
-      temp_storage.data.max_val = threadlocal_max_val;
-      temp_storage.data.min_val = threadlocal_min_val;
+      temp_storage.max_val = threadlocal_max_val;
+      temp_storage.min_val = threadlocal_min_val;
     }
     __syncthreads();
-    threadlocal_max_val = temp_storage.data.max_val;
-    threadlocal_min_val = temp_storage.data.min_val;
+    threadlocal_max_val = temp_storage.max_val;
+    threadlocal_min_val = temp_storage.min_val;
 
     float low = threadlocal_min_val - 1, high = threadlocal_max_val;
     DType min_gt_low, max_le_high;
@@ -1023,14 +1023,14 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
           BlockReduce<DType, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
               .Reduce(max_le_high, cub::Max());
       if (tx == 0) {
-        temp_storage.data.block_aggregate.count = threadlocal_count_sum;
-        temp_storage.data.min_val = min_gt_low;
-        temp_storage.data.max_val = max_le_high;
+        temp_storage.block_aggregate.count = threadlocal_count_sum;
+        temp_storage.min_val = min_gt_low;
+        temp_storage.max_val = max_le_high;
       }
       __syncthreads();
-      threadlocal_count_sum = temp_storage.data.block_aggregate.count;
-      min_gt_low = temp_storage.data.min_val;
-      max_le_high = temp_storage.data.max_val;
+      threadlocal_count_sum = temp_storage.block_aggregate.count;
+      min_gt_low = temp_storage.min_val;
+      max_le_high = temp_storage.max_val;
       if (threadlocal_count_sum >= k) {
         low = mid;
       } else {
@@ -1072,7 +1072,7 @@ __global__ void TopKRenormProbKernel(DType* probs, DType* renormed_prob, IdType*
         uint8_t smem_renorm[];
     auto& temp_storage =
         reinterpret_cast<RenormTempStorage<DType, BLOCK_THREADS, REDUCE_ALGO>&>(smem_renorm);
-    temp_storage.data.max_val = DType(0);
+    temp_storage.max_val = DType(0);
     DType probs_greater_than_pivot[VEC_SIZE];  // pivot initialized to 0
 
     DType threadlocal_max_val = DType(0);
@@ -1092,10 +1092,10 @@ __global__ void TopKRenormProbKernel(DType* probs, DType* renormed_prob, IdType*
       __syncthreads();
     }
     if (tx == 0) {
-      temp_storage.data.max_val = threadlocal_max_val;
+      temp_storage.max_val = threadlocal_max_val;
     }
     __syncthreads();
-    threadlocal_max_val = temp_storage.data.max_val;
+    threadlocal_max_val = temp_storage.max_val;
 
     float low = 0, high = threadlocal_max_val;
     DType min_gt_low, max_le_high;
@@ -1143,14 +1143,14 @@ __global__ void TopKRenormProbKernel(DType* probs, DType* renormed_prob, IdType*
           BlockReduce<DType, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
               .Reduce(max_le_high, cub::Max());
       if (tx == 0) {
-        temp_storage.data.block_aggregate.pair = threadlocal_sum;
-        temp_storage.data.min_val = min_gt_low;
-        temp_storage.data.max_val = max_le_high;
+        temp_storage.block_aggregate.pair = threadlocal_sum;
+        temp_storage.min_val = min_gt_low;
+        temp_storage.max_val = max_le_high;
       }
       __syncthreads();
-      threadlocal_sum = temp_storage.data.block_aggregate.pair;
-      min_gt_low = temp_storage.data.min_val;
-      max_le_high = temp_storage.data.max_val;
+      threadlocal_sum = temp_storage.block_aggregate.pair;
+      min_gt_low = temp_storage.min_val;
+      max_le_high = temp_storage.max_val;
       if (threadlocal_sum.count >= k) {
         low = mid;
         sum_low = float(threadlocal_sum.value);
@@ -1319,12 +1319,12 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
     __syncthreads();
   }
   if (tx == 0) {
-    temp_storage.data.block_aggregate.value = sum_relu_q_minus_p;
+    temp_storage.block_aggregate.value = sum_relu_q_minus_p;
   }
   // init the first rejected token to (d - 1)
-  temp_storage.data.sampled_id = d - 1;
+  temp_storage.sampled_id = d - 1;
   __syncthreads();
-  sum_relu_q_minus_p = temp_storage.data.block_aggregate.value;
+  sum_relu_q_minus_p = temp_storage.block_aggregate.value;
   DType u = uniform_samples[row_idx * (num_speculative_tokens + 1) +
                             min(pos + 1, num_speculative_tokens)] *
             sum_relu_q_minus_p;
@@ -1358,7 +1358,7 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
   }
   __syncthreads();
   // set the first rejected token
-  output_token_ids[row_idx * (num_speculative_tokens + 1) + pos] = temp_storage.data.sampled_id;
+  output_token_ids[row_idx * (num_speculative_tokens + 1) + pos] = temp_storage.sampled_id;
   // move to the next token
   pos++;
 
