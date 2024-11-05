@@ -16,8 +16,6 @@
 #ifndef FLASHINFER_POS_ENC_CUH_
 #define FLASHINFER_POS_ENC_CUH_
 
-#include <driver_types.h>
-
 #include <cmath>
 #include <cstdint>
 #include <iostream>
