@@ -154,6 +154,45 @@ def _fake_apply_rope_pos_ids(
 
 
 @register_custom_op(
+    "flashinfer::apply_rope_pos_ids_cos_sin_cache", mutates_args=("q_rope", "k_rope")
+)
+def _apply_rope_pos_ids_cos_sin_cache(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    pos_ids: torch.Tensor,
+    interleave: bool,
+) -> None:
+    get_rope_module().apply_rope_pos_ids_cos_sin_cache(
+        q,
+        k,
+        q_rope,
+        k_rope,
+        cos_cache,
+        sin_cache,
+        pos_ids,
+        interleave,
+    )
+
+
+@register_fake_op("flashinfer::apply_rope_pos_ids_cos_sin_cache")
+def _fake_apply_rope_pos_ids_cos_sin_cache(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    pos_ids: torch.Tensor,
+    interleave: bool,
+) -> None:
+    pass
+
+
+@register_custom_op(
     "flashinfer::apply_llama31_rope_pos_ids", mutates_args=("q_rope", "k_rope")
 )
 def _apply_llama31_rope_pos_ids(
@@ -211,6 +250,7 @@ def apply_rope_inplace(
     rope_theta: float = 1e4,
 ) -> None:
     r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor) inplace.
+    cos/sin values are computed on the fly inside the kernel.
 
     We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
     segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
@@ -288,6 +328,7 @@ def apply_rope_pos_ids_inplace(
     rope_theta: float = 1e4,
 ) -> None:
     r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor) inplace.
+    cos/sin values are computed on the fly inside the kernel.
 
     We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
     segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
@@ -341,7 +382,7 @@ def apply_llama31_rope_inplace(
     old_context_len: int = 8192,
 ) -> None:
     r"""Apply Llama 3.1 style rotary embedding to a batch of queries/keys (stored as
-    RaggedTensor) inplace.
+    RaggedTensor) inplace. cos/sin values are computed on the fly inside the kernel.
 
     We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
     segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
@@ -441,7 +482,7 @@ def apply_llama31_rope_pos_ids_inplace(
     old_context_len: int = 8192,
 ) -> None:
     r"""Apply Llama 3.1 style rotary embedding to a batch of queries/keys (stored as
-    RaggedTensor) inplace.
+    RaggedTensor) inplace. cos/sin values are computed on the fly inside the kernel.
 
     We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
     segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
@@ -510,6 +551,7 @@ def apply_rope(
     rope_theta: float = 1e4,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor).
+    cos/sin values are computed on the fly inside the kernel.
 
     We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
     segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
@@ -603,6 +645,7 @@ def apply_rope_pos_ids(
     rope_theta: float = 1e4,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor).
+    cos/sin values are computed on the fly inside the kernel.
 
     We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
     segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
@@ -668,7 +711,7 @@ def apply_llama31_rope(
     old_context_len: int = 8192,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Apply Llama 3.1 style rotary embedding to a batch of queries/keys (stored as
-    RaggedTensor).
+    RaggedTensor). cos/sin values are computed on the fly inside the kernel.
 
     We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
     segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
@@ -782,7 +825,7 @@ def apply_llama31_rope_pos_ids(
     old_context_len: int = 8192,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Apply Llama 3.1 style rotary embedding to a batch of queries/keys (stored as
-    RaggedTensor).
+    RaggedTensor). cos/sin values are computed on the fly inside the kernel.
 
     We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
     segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
@@ -848,3 +891,94 @@ def apply_llama31_rope_pos_ids(
         float(old_context_len),
     )
     return q_rope, k_rope
+
+
+def apply_rope_with_cos_sin_cache(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    pos_ids: torch.Tensor,
+    interleave: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Apply rotary embedding to keys and queries with precomputed cos/sin values.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Query tensor, shape: ``(nnz, num_q_heads, head_dim)``.
+    k : torch.Tensor
+        Key tensor, shape: ``(nnz, num_k_heads, head_dim)``.
+    cos_cache : torch.Tensor
+        Cosine cache tensor, shape: ``(max_seq_len, head_dim)``.
+    sin_cache : torch.Tensor
+        Sine cache tensor, shape: ``(max_seq_len, head_dim)``.
+    pos_ids : torch.Tensor
+        Position indices, shape: ``(nnz)``.
+    interleave : bool
+        Whether to use interleaved layout in the last dimension, default: ``False``.
+
+        * If ``True``, the last dimension of the query/key tensor is interleaved, i.e.,
+          we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
+
+        * If ``False``, the last dimension of the query/key tensor is not interleaved, i.e.,
+          we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          dimensions ``([..., head_dim//2:])``.
+
+    Returns
+    -------
+    q_rope : torch.Tensor
+        The rotated query tensor, shape: ``(nnz, num_q_heads, head_dim)``.
+    k_rope : torch.Tensor
+        The rotated key tensor, shape: ``(nnz, num_k_heads, head_dim)``.
+    """
+    if cos_cache.dtype != torch.float32 or sin_cache.dtype != torch.float32:
+        raise ValueError("cos_cache and sin_cache should be float32")
+    q_rope = torch.empty_like(q)
+    k_rope = torch.empty_like(k)
+    _apply_rope_pos_ids_cos_sin_cache(
+        q, k, q_rope, k_rope, cos_cache, sin_cache, pos_ids, interleave
+    )
+    return q_rope, k_rope
+
+
+def apply_rope_with_cos_sin_cache_inplace(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    pos_ids: torch.Tensor,
+    interleave: bool = False,
+) -> None:
+    r"""Apply rotary embedding to keys and queries with precomputed cos/sin values.
+    The result is stored in the input tensors inplace.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Query tensor, shape: ``(nnz, num_q_heads, head_dim)``.
+    k : torch.Tensor
+        Key tensor, shape: ``(nnz, num_k_heads, head_dim)``.
+    cos_cache : torch.Tensor
+        Cosine cache tensor, shape: ``(max_seq_len, head_dim)``.
+        Expect float32 data type.
+    sin_cache : torch.Tensor
+        Sine cache tensor, shape: ``(max_seq_len, head_dim)``.
+        Expect float32 data type.
+    pos_ids : torch.Tensor
+        Position indices, shape: ``(nnz)``.
+    interleave : bool
+        Whether to use interleaved layout in the last dimension, default: ``False``.
+
+        * If ``True``, the last dimension of the query/key tensor is interleaved, i.e.,
+          we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
+
+        * If ``False``, the last dimension of the query/key tensor is not interleaved, i.e.,
+          we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          dimensions ``([..., head_dim//2:])``.
+    """
+    if cos_cache.dtype != torch.float32 or sin_cache.dtype != torch.float32:
+        raise ValueError("cos_cache and sin_cache should be float32")
+    _apply_rope_pos_ids_cos_sin_cache(
+        q, k, q, k, cos_cache, sin_cache, pos_ids, interleave
+    )
