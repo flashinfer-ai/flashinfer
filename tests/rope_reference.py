@@ -69,3 +69,31 @@ def apply_rotary_emb(
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed.to(q.dtype), k_embed.to(k.dtype)
+
+
+def rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def generate_cos_sin_f32_cache(
+    max_seq_len, head_dim, theta=1e4, use_scaled: bool = False
+):
+    position = torch.arange(max_seq_len).float().unsqueeze(1)
+    freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    freqs = torch.cat([freqs, freqs], dim=-1).contiguous()
+    if use_scaled:
+        freqs = apply_scaling(freqs)
+    args = position * freqs
+    sin_cache = torch.sin(args)
+    cos_cache = torch.cos(args)
+    return cos_cache, sin_cache

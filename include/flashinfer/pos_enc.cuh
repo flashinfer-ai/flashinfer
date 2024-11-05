@@ -18,6 +18,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <iostream>
 #include <string>
 
 #include "layout.cuh"
@@ -154,6 +155,55 @@ __device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope_cos_sin_i
     vec[i] = vec[i] * cos[i] + ((i % 2 == 0) ? -vec_before[i ^ 1] : vec_before[i ^ 1]) * sin[i];
   }
   return vec;
+}
+
+template <bool interleave, uint32_t head_dim, uint32_t vec_size, uint32_t bdx, typename DType,
+          typename IdType>
+__global__ void BatchQKApplyRotaryPosIdsCosSinCacheKernel(
+    DType* q, DType* k, DType* q_rope, DType* k_rope, float* __restrict__ cos_cache,
+    float* __restrict__ sin_cache, IdType* __restrict__ pos_ids, uint32_t nnz,
+    uint32_t num_qo_heads, uint32_t num_kv_heads, size_t q_stride_n, size_t q_stride_h,
+    size_t k_stride_n, size_t k_stride_h, size_t q_rope_stride_n, size_t q_rope_stride_h,
+    size_t k_rope_stride_n, size_t k_rope_stride_h) {
+  uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
+  const uint32_t bdy = blockDim.y;
+
+  vec_t<float, vec_size> cos, sin;
+  if (bx * bdy + ty < nnz) {
+    const uint32_t idx = bx * bdy + ty;
+    const IdType pos = pos_ids[idx];
+
+    cos.load(cos_cache + pos * head_dim + tx * vec_size);
+    sin.load(sin_cache + pos * head_dim + tx * vec_size);
+
+#pragma unroll 1
+    for (uint32_t qo_head_idx = 0; qo_head_idx < num_qo_heads; ++qo_head_idx) {
+      DType* q_ptr = q + get_elem_offset_impl(idx, qo_head_idx, 0, q_stride_n, q_stride_h);
+      DType* q_rope_ptr =
+          q_rope + get_elem_offset_impl(idx, qo_head_idx, 0, q_rope_stride_n, q_rope_stride_h);
+      vec_t<float, vec_size> q_vec;
+      if constexpr (interleave) {
+        q_vec = vec_apply_llama_rope_cos_sin_interleave<vec_size, bdx>(q_ptr, cos, sin);
+      } else {
+        q_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_ptr, cos, sin);
+      }
+      q_vec.cast_store(q_rope_ptr + tx * vec_size);
+    }
+
+#pragma unroll 1
+    for (uint32_t kv_head_idx = 0; kv_head_idx < num_kv_heads; ++kv_head_idx) {
+      DType* k_ptr = k + get_elem_offset_impl(idx, kv_head_idx, 0, k_stride_n, k_stride_h);
+      DType* k_rope_ptr =
+          k_rope + get_elem_offset_impl(idx, kv_head_idx, 0, k_rope_stride_n, k_rope_stride_h);
+      vec_t<float, vec_size> k_vec;
+      if constexpr (interleave) {
+        k_vec = vec_apply_llama_rope_cos_sin_interleave<vec_size, bdx>(k_ptr, cos, sin);
+      } else {
+        k_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_ptr, cos, sin);
+      }
+      k_vec.cast_store(k_rope_ptr + tx * vec_size);
+    }
+  }
 }
 
 template <bool interleave, uint32_t head_dim, uint32_t vec_size, uint32_t bdx, typename DType,
@@ -308,6 +358,48 @@ __global__ void BatchQKApplyRotaryKernel(
     const bool INTERLEAVE = false;                       \
     __VA_ARGS__                                          \
   }
+
+template <typename DType, typename IdType>
+cudaError_t BatchQKApplyRotaryPosIdsCosSinCache(
+    DType* q, DType* k, DType* q_rope, DType* k_rope, float* cos_cache, float* sin_cache,
+    IdType* pos_ids, uint32_t nnz, uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
+    size_t q_stride_n, size_t q_stride_h, size_t k_stride_n, size_t k_stride_h,
+    size_t q_rope_stride_n, size_t q_rope_stride_h, size_t k_rope_stride_n, size_t k_rope_stride_h,
+    bool interleave, cudaStream_t stream = nullptr) {
+  DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
+    DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+      constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
+      constexpr uint32_t bdx = HEAD_DIM / vec_size;
+      uint32_t num_threads = std::max(128U, bdx);
+      uint32_t bdy = num_threads / bdx;
+      dim3 nblks((nnz + bdy - 1) / bdy);
+      dim3 nthrs(bdx, bdy);
+      auto kernel = BatchQKApplyRotaryPosIdsCosSinCacheKernel<INTERLEAVE, HEAD_DIM, vec_size, bdx,
+                                                              DType, IdType>;
+      void* args[] = {(void*)&q,
+                      (void*)&k,
+                      (void*)&q_rope,
+                      (void*)&k_rope,
+                      (void*)&cos_cache,
+                      (void*)&sin_cache,
+                      (void*)&pos_ids,
+                      (void*)&nnz,
+                      (void*)&num_qo_heads,
+                      (void*)&num_kv_heads,
+                      (void*)&q_stride_n,
+                      (void*)&q_stride_h,
+                      (void*)&k_stride_n,
+                      (void*)&k_stride_h,
+                      (void*)&q_rope_stride_n,
+                      (void*)&q_rope_stride_h,
+                      (void*)&k_rope_stride_n,
+                      (void*)&k_rope_stride_h};
+      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+    });
+  });
+
+  return cudaSuccess;
+}
 
 template <typename DType, typename IdType>
 cudaError_t BatchQKApplyRotaryPosIds(DType* q, DType* k, DType* q_rope, DType* k_rope,
