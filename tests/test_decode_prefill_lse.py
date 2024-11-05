@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import flashinfer
 import pytest
 import torch
+
+import flashinfer
 
 
 def test_mlc_failed_case():
@@ -68,12 +69,8 @@ def test_mlc_failed_case():
     print(lse_1, lse_1_tc)
     print(o_1, o_1_tc)
 
-    torch.testing.assert_close(
-        lse_1, lse_1_tc, rtol=1e-3, atol=1e-3
-    )
-    torch.testing.assert_close(
-        o_1, o_1_tc, rtol=1e-3, atol=1e-3
-    )
+    torch.testing.assert_close(lse_1, lse_1_tc, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(o_1, o_1_tc, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":

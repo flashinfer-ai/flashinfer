@@ -14,8 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import jinja2
 import os
+
+import jinja2
+
 from .env import FLASHINFER_GEN_SRC_DIR
 from .utils import write_if_different
 

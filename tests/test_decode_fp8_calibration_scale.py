@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import flashinfer
 import pytest
 import torch
+
+import flashinfer
 
 
 @pytest.mark.parametrize("kv_len", [7, 19, 39, 1170, 39275])
@@ -67,9 +68,7 @@ def test_single_decode_fp8_calibration_scale(
         v_scale=v_scale,
     )
 
-    torch.testing.assert_close(
-        o_fp16, o_fp8, atol=1e-2, rtol=2e-2
-    )
+    torch.testing.assert_close(o_fp16, o_fp8, atol=1e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -151,9 +150,7 @@ def test_batch_decode_with_paged_kv_cache_fp8_calibration_scale(
     )
     o_fp8 = wrapper.run(q, kv_data_fp8.to(dtype), k_scale=k_scale, v_scale=v_scale)
 
-    torch.testing.assert_close(
-        o_fp16, o_fp8, atol=1e-2, rtol=2e-1
-    )
+    torch.testing.assert_close(o_fp16, o_fp8, atol=1e-2, rtol=2e-1)
 
 
 if __name__ == "__main__":

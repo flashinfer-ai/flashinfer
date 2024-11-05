@@ -1053,7 +1053,7 @@ def chain_speculative_sampling(
     output_emitted_token_num: torch.Tensor
         The number of tokens that are finally emitted/generated for each request.
         Shape: ``(batch_size)``
-    
+
     Examples
     --------
 

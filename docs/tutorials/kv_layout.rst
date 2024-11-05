@@ -96,7 +96,7 @@ Page Table Layout
 -----------------
 
 When KV-Cache is dynamic (e.g. in append or decode stage), packing all keys/values is not
-efficient because the sequence length per request changes over time. `vLLM <https://arxiv.org/pdf/2309.06180.pdf>`_ 
+efficient because the sequence length per request changes over time. `vLLM <https://arxiv.org/pdf/2309.06180.pdf>`_
 proposes to organize KV-Cache as a Page Table. In FlashInfer, we treat the page-table as
 a block sparse matrix (each used page can be viewed as an non-zero block in block sparse matrix)
 and uses the `CSR format <https://docs.scipy.org/doc/scipy/reference/generated/scipy.sparse.csr_matrix.html>`_

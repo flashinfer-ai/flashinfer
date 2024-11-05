@@ -1,5 +1,6 @@
-import flashinfer
 import torch
+
+import flashinfer
 
 
 def test_append_paged_kv_cache():

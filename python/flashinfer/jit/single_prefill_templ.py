@@ -118,7 +118,7 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
     /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
     num_qo_heads, num_kv_heads, qo_len, kv_len, q_stride_n, q_stride_h,
     kv_stride_n, kv_stride_h, head_dim, window_left{{ additional_params_data }});
-  
+
   cudaError_t status =
       SinglePrefillWithKVCacheDispatched<{{ head_dim }}, PosEncodingMode::kNone, false, {{ mask_mode }}, AttentionVariant>(
             params, static_cast<{{ dtype_o }}*>(tmp.data_ptr()), torch_current_stream);
@@ -195,7 +195,7 @@ torch::Tensor single_prefill_with_kv_cache(
     num_qo_heads, num_kv_heads, qo_len, kv_len, q_stride_n, q_stride_h,
     kv_stride_n, kv_stride_h, head_dim, window_left, logits_soft_cap, sm_scale,
     rope_scale, rope_theta);
-  
+
   cudaError_t status =
       SinglePrefillWithKVCacheDispatched<{{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, {{ mask_mode }}, AttentionVariant>(
             params, static_cast<{{ dtype_o }}*>(tmp.data_ptr()), torch_current_stream);

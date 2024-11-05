@@ -19,8 +19,8 @@ import os
 import pathlib
 import shutil
 import sys
-from typing import Iterator
 import warnings
+from typing import Iterator
 
 import setuptools
 

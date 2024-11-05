@@ -40,4 +40,3 @@ Cascade Attention Wrapper Classes
     :members:
 
     .. automethod:: __init__
-

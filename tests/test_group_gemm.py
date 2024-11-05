@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import flashinfer
 import pytest
 import torch
 
+import flashinfer
 
 DTYPES = [torch.float16]
 CUDA_DEVICES = ["cuda:0"]
@@ -84,7 +84,7 @@ def test_segment_gemm(
                     ),
                 ),
                 rtol=1e-3,
-                atol=1e-3
+                atol=1e-3,
             )
     else:
         torch.testing.assert_close(

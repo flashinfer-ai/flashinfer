@@ -14,11 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import flashinfer
 import numpy as np
 import pytest
 import scipy as sp
 import torch
+
+import flashinfer
 
 
 def bsr_attention_ref(

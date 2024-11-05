@@ -115,7 +115,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
       static_cast<{{ dtype_q }}*>(q.data_ptr()), static_cast<{{ dtype_kv }}*>(k.data_ptr()),
       static_cast<{{ dtype_kv }}*>(v.data_ptr()), static_cast<{{ dtype_o }}*>(o.data_ptr()),
       kv_len, num_qo_heads, num_kv_heads, kv_layout, head_dim, window_left{{ additional_params_data }});
-  
+
   cudaError_t status = SingleDecodeWithKVCacheDispatched<{{ head_dim }}, PosEncodingMode::kNone, AttentionVariant>(
       params, static_cast<{{ dtype_o }}*>(tmp.data_ptr()), torch_current_stream);
   TORCH_CHECK(status == cudaSuccess,
@@ -168,7 +168,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
       {% if use_alibi == "true" %}static_cast<float*>(alibi_slopes->data_ptr()){% else %}nullptr{% endif %},
       kv_len, num_qo_heads, num_kv_heads, kv_layout, head_dim, window_left,
       logits_soft_cap, sm_scale, rope_scale, rope_theta);
-  
+
   cudaError_t status = SingleDecodeWithKVCacheDispatched<{{ head_dim }}, {{ pos_encoding_mode }}, AttentionVariant>(
       params, static_cast<{{ dtype_o }}*>(tmp.data_ptr()), torch_current_stream);
   TORCH_CHECK(status == cudaSuccess,

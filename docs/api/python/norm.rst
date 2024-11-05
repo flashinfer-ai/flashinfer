@@ -9,5 +9,5 @@ Kernels for normalization layers.
 
 .. autosummary::
     :toctree: _generate
-    
+
     rmsnorm

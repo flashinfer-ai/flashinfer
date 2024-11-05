@@ -74,7 +74,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRunMLA(
     torch::Tensor paged_kpe_cache,
     torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
     torch::Tensor paged_kv_last_page_len,
-    float sm_scale, 
+    float sm_scale,
     int window_left,
     float logits_soft_cap, float rope_scale, float rope_theta, bool return_lse) {
   DecodePlanInfo plan_info;
@@ -112,7 +112,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRunMLA(
     /*q_offset=*/nullptr, paged_kv, static_cast<{{ dtype_o }}*>(o.data_ptr()),
     /*lse=*/(return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr),
     num_qo_heads, window_left, logits_soft_cap, sm_scale, rope_scale, rope_theta);
-  
+
   {{ dtype_o }}* tmp_v = nullptr;
   float* tmp_s = nullptr;
   params.request_indices = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer, plan_info.request_indices_offset);
@@ -127,7 +127,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRunMLA(
     }
   }
   params.padded_batch_size = plan_info.padded_batch_size;
-  
+
   cudaError_t status = BatchDecodeWithPagedKVCacheDispatchedMLA<
       {{ head_dim_ckv }}, {{ head_dim_kpe }}, AttentionVariant>(
       params, tmp_v, tmp_s, /*stream=*/torch_current_stream);

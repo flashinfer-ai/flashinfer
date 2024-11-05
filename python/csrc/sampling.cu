@@ -314,10 +314,11 @@ torch::Tensor top_k_mask_logits(torch::Tensor logits, std::optional<torch::Tenso
   return mask_logits;
 }
 
-torch::Tensor chain_speculative_sampling(
-    torch::Tensor draft_probs, torch::Tensor draft_token_ids, torch::Tensor uniform_samples,
-    torch::Tensor target_probs, torch::Tensor output_accepted_token_num,
-    torch::Tensor output_emitted_token_num, bool deterministic) {
+torch::Tensor chain_speculative_sampling(torch::Tensor draft_probs, torch::Tensor draft_token_ids,
+                                         torch::Tensor uniform_samples, torch::Tensor target_probs,
+                                         torch::Tensor output_accepted_token_num,
+                                         torch::Tensor output_emitted_token_num,
+                                         bool deterministic) {
   CHECK_INPUT(draft_probs);
   CHECK_INPUT(draft_token_ids);
   CHECK_INPUT(uniform_samples);

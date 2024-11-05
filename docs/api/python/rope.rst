@@ -9,7 +9,7 @@ Kernels for applying rotary embeddings.
 
 .. autosummary::
     :toctree: _generate
-    
+
     apply_rope_inplace
     apply_llama31_rope_inplace
     apply_rope

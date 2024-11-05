@@ -21,7 +21,6 @@
 
 #include "pytorch_extension_utils.h"
 
-
 void bmm_fp8(const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& D,
              torch::Tensor& A_scale, torch::Tensor& B_scale) {
   TORCH_CHECK(A.is_cuda(), "A must be a CUDA tensor");

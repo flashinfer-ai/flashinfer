@@ -107,7 +107,7 @@ torch::Tensor BatchDecodeWithPagedKVCacheRun(
 
   void* float_buffer = static_cast<void*>(float_workspace_buffer.data_ptr());
   void* int_buffer = static_cast<void*>(int_workspace_buffer.data_ptr());
-  
+
   const auto q_stride_n = q.stride(0);
   const auto q_stride_h = q.stride(1);
 
@@ -132,7 +132,7 @@ torch::Tensor BatchDecodeWithPagedKVCacheRun(
     /*lse=*/(maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr),
     {% if use_alibi == "true" %}static_cast<float*>(alibi_slopes->data_ptr()){% else %}nullptr{% endif %},
     num_qo_heads, q_stride_n, q_stride_h, window_left, logits_soft_cap, sm_scale, rope_scale, rope_theta);
-  
+
   {{ dtype_o }}* tmp_v = nullptr;
   float* tmp_s = nullptr;
   params.request_indices = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer, plan_info.request_indices_offset);
@@ -147,7 +147,7 @@ torch::Tensor BatchDecodeWithPagedKVCacheRun(
     }
   }
   params.padded_batch_size = plan_info.padded_batch_size;
-  
+
   cudaError_t status = BatchDecodeWithPagedKVCacheDispatched<
       {{ head_dim }}, {{ pos_encoding_mode }}, AttentionVariant>(
       params, tmp_v, tmp_s, /*stream=*/torch_current_stream);
