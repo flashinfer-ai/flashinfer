@@ -9,7 +9,6 @@ from triton.testing import do_bench
 
 @dataclasses.dataclass(kw_only=True)
 class ModelConfig:
-    hidden_size: int
     num_kv_heads: int
     num_layers: int
     head_dim: int
@@ -17,7 +16,6 @@ class ModelConfig:
 
 def _make_70b(tp: int) -> ModelConfig:
     return ModelConfig(
-        hidden_size=8192,
         num_kv_heads=8 // tp,
         num_layers=80,
         head_dim=128,
@@ -26,19 +24,16 @@ def _make_70b(tp: int) -> ModelConfig:
 
 MODELS = {
     "l1b": ModelConfig(
-        hidden_size=2048,
         num_kv_heads=8,
         num_layers=16,
         head_dim=64,
     ),
     "l3b": ModelConfig(
-        hidden_size=3072,
         num_kv_heads=8,
         num_layers=28,
         head_dim=128,
     ),
     "l8b": ModelConfig(
-        hidden_size=4096,
         num_kv_heads=8,
         num_layers=32,
         head_dim=128,
