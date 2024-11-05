@@ -284,7 +284,15 @@ class MultiLevelCascadeAttentionWrapper:
     """
 
     def __init__(
-        self, num_levels, float_workspace_buffer: torch.Tensor, kv_layout: str = "NHD"
+        self,
+        num_levels,
+        float_workspace_buffer: torch.Tensor,
+        kv_layout: str = "NHD",
+        use_cuda_graph: bool = False,
+        qo_indptr_buf_arr: Optional[list[torch.Tensor]] = None,
+        paged_kv_indptr_buf_arr: Optional[list[torch.Tensor]] = None,
+        paged_kv_indices_buf_arr: Optional[list[torch.Tensor]] = None,
+        paged_kv_last_page_len_buf_arr: Optional[list[torch.Tensor]] = None,
     ) -> None:
         r"""Constructor of :class:`MultiLevelCascadeAttentionWrapper`.
 
@@ -299,12 +307,43 @@ class MultiLevelCascadeAttentionWrapper:
         kv_layout : str
             The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
         """
-        self._batch_prefill_wrappers = [
-            BatchPrefillWithPagedKVCacheWrapper(float_workspace_buffer, kv_layout)
-            for _ in range(num_levels)
-        ]
+        self._use_cuda_graph = use_cuda_graph
+        if use_cuda_graph:
+            self._batch_prefill_wrappers = [
+                BatchPrefillWithPagedKVCacheWrapper(
+                    float_workspace_buffer,
+                    kv_layout,
+                    use_cuda_graph=True,
+                    qo_indptr_buf=qo_indptr_buf,
+                    paged_kv_indptr_buf=paged_kv_indptr_buf,
+                    paged_kv_indices_buf=paged_kv_indices_buf,
+                    paged_kv_last_page_len_buf=paged_kv_last_page_len_buf,
+                )
+                for _, (
+                    qo_indptr_buf,
+                    paged_kv_indptr_buf,
+                    paged_kv_indices_buf,
+                    paged_kv_last_page_len_buf,
+                ) in enumerate(
+                    zip(
+                        qo_indptr_buf_arr,
+                        paged_kv_indptr_buf_arr,
+                        paged_kv_indices_buf_arr,
+                        paged_kv_last_page_len_buf_arr,
+                    )
+                )
+            ]
+        else:
+            self._batch_prefill_wrappers = [
+                BatchPrefillWithPagedKVCacheWrapper(float_workspace_buffer, kv_layout)
+                for _ in range(num_levels)
+            ]
         self._num_levels = num_levels
         self._kv_layout = kv_layout
+
+    @property
+    def is_cuda_graph_enabled(self) -> bool:
+        return self._use_cuda_graph
 
     def reset_workspace_buffer(
         self,
