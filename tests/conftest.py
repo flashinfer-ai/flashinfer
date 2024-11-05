@@ -1,11 +1,12 @@
 import os
 import types
 
-import flashinfer
 import pytest
 import torch
 from torch.torch_version import TorchVersion
 from torch.torch_version import __version__ as torch_version
+
+import flashinfer
 
 TORCH_COMPILE_FNS = [
     flashinfer.activation.silu_and_mul,

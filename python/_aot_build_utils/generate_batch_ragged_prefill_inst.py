@@ -46,25 +46,26 @@ def get_cu_file_str(
     idtype,
 ):
     cta_tile_q_choice = [128, 64, 16]
+
     def get_insts(attention_variant, dtype_out):
         return "\n".join(
-        [
-            """template cudaError_t BatchPrefillWithRaggedKVCacheDispatched<{cta_tile_q}, {head_dim}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {attention_variant}>(
+            [
+                """template cudaError_t BatchPrefillWithRaggedKVCacheDispatched<{cta_tile_q}, {head_dim}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {attention_variant}>(
     ParamsT params,
     {dtype_out}* tmp_v,
     float* tmp_s, cudaStream_t stream);
         """.format(
-                cta_tile_q=cta_tile_q,
-                head_dim=head_dim,
-                pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
-                allow_fp16_qk_reduction=allow_fp16_qk_reduction,
-                mask_mode=mask_mode_literal[int(mask_mode)],
-                attention_variant=attention_variant,
-                dtype_out=dtype_out,
-            )
-            for cta_tile_q in cta_tile_q_choice
-        ]
-    )
+                    cta_tile_q=cta_tile_q,
+                    head_dim=head_dim,
+                    pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
+                    allow_fp16_qk_reduction=allow_fp16_qk_reduction,
+                    mask_mode=mask_mode_literal[int(mask_mode)],
+                    attention_variant=attention_variant,
+                    dtype_out=dtype_out,
+                )
+                for cta_tile_q in cta_tile_q_choice
+            ]
+        )
 
     use_custom_mask = "true" if int(mask_mode) == 2 else "false"
 

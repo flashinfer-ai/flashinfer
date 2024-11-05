@@ -22,8 +22,8 @@ set(FLASHINFER_FASTDIV_TEST ON)
 set(FLASHINFER_FASTDEQUANT_TEST ON)
 # Whether to compile distributed tests
 set(FLASHINFER_DISTRIBUTED ON)
-# The following configurations can impact the binary
-# size of the generated library
+# The following configurations can impact the binary size of the generated
+# library
 set(FLASHINFER_GEN_HEAD_DIMS 64 128 256 512)
 set(FLASHINFER_GEN_KV_LAYOUTS 0 1)
 set(FLASHINFER_GEN_POS_ENCODING_MODES 0 1 2)
@@ -31,12 +31,13 @@ set(FLASHINFER_GEN_ALLOW_FP16_QK_REDUCTIONS "false" "true")
 set(FLASHINFER_GEN_MASK_MODES 0 1 2)
 
 # Set target cuda architectures for tests/benchmarks, defaults to native.
-# "native" is a special value for CMAKE_CUDA_ARCHITECTURES which means use the architectures of the host's GPU.
-# it's new in CMake 3.24, if you are using an older of CMake or you want to use a different value, you can
-# set its value here. Supported CUDA architctures include 80;86;89;90
-# NOTE(Zihao): using "native" might be slow because whenever compile a cuda file with `-arch=native`, nvcc will spawn
-# a `__nvcc_device_query` process to get the architecture of the host's GPU, which could stall the compilation process.
-# So it's recommended to set it to a specific value if you know the architecture of the target GPU.
-# Example:
-# set(FLASHINFER_CUDA_ARCHITECTURES 80)
+# "native" is a special value for CMAKE_CUDA_ARCHITECTURES which means use the
+# architectures of the host's GPU. it's new in CMake 3.24, if you are using an
+# older of CMake or you want to use a different value, you can set its value
+# here. Supported CUDA architctures include 80;86;89;90
+# NOTE(Zihao): using "native" might be slow because whenever compile a cuda file
+# with `-arch=native`, nvcc will spawn a `__nvcc_device_query` process to get
+# the architecture of the host's GPU, which could stall the compilation process.
+# So it's recommended to set it to a specific value if you know the architecture
+# of the target GPU. Example: set(FLASHINFER_CUDA_ARCHITECTURES 80)
 set(FLASHINFER_CUDA_ARCHITECTURES native)

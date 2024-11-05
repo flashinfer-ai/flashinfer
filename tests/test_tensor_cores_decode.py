@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import flashinfer
 import pytest
 import torch
+
+import flashinfer
 
 
 @pytest.mark.parametrize("kv_len", [54, 128, 999, 32789])
@@ -53,9 +54,7 @@ def test_single_decode_tensor_cores(
         q, k, v, kv_layout, pos_encoding_mode, use_tensor_cores=True
     )
 
-    torch.testing.assert_close(
-        o, o_tensor_cores, rtol=1e-3, atol=1e-3
-    )
+    torch.testing.assert_close(o, o_tensor_cores, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -125,9 +124,7 @@ def test_batch_decode_tensor_cores(
     )
     o_tensor_cores = wrapper_tensor_cores.run(q, kv_data)
 
-    torch.testing.assert_close(
-        o, o_tensor_cores, rtol=1e-3, atol=1e-3
-    )
+    torch.testing.assert_close(o, o_tensor_cores, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -241,6 +238,4 @@ def test_batch_decode_tensor_cores_cuda_graph(
     # replay
     g.replay()
 
-    torch.testing.assert_close(
-        o, o_tensor_cores, rtol=1e-3, atol=1e-3
-    )
+    torch.testing.assert_close(o, o_tensor_cores, rtol=1e-3, atol=1e-3)

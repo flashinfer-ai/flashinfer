@@ -73,8 +73,8 @@ kv_len = 2048
 num_kv_heads = 32
 head_dim = 128
 
-k = torch.randn(kv_len, num_kv_heads, head_dim).half().to(0) 
-v = torch.randn(kv_len, num_kv_heads, head_dim).half().to(0) 
+k = torch.randn(kv_len, num_kv_heads, head_dim).half().to(0)
+v = torch.randn(kv_len, num_kv_heads, head_dim).half().to(0)
 
 # decode attention
 
@@ -110,7 +110,7 @@ cmake ..
 make -j12
 ```
 
-You can run `./bench_{single/batch}_{prefill/decode}` to benchmark the performance (e.g. `./bench_single_prefill` for single-request prefill attention). `./bench_{single/batch}_{prefill/decode} --help` will show you the available options. 
+You can run `./bench_{single/batch}_{prefill/decode}` to benchmark the performance (e.g. `./bench_single_prefill` for single-request prefill attention). `./bench_{single/batch}_{prefill/decode} --help` will show you the available options.
 
 ## C++ API and TVM Bindings
 

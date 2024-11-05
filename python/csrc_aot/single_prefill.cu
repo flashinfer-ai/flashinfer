@@ -35,8 +35,8 @@ cudaError_t SinglePrefillWithKVCacheDispatched(typename AttentionVariant::Params
 torch::Tensor single_prefill_with_kv_cache(
     unsigned int mask_mode_code, torch::Tensor q, torch::Tensor k, torch::Tensor v,
     std::optional<torch::Tensor> maybe_packed_custom_mask, torch::Tensor tmp,
-    std::optional<torch::Tensor> maybe_alibi_slopes, unsigned int layout,
-    int32_t window_left, float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta,
+    std::optional<torch::Tensor> maybe_alibi_slopes, unsigned int layout, int32_t window_left,
+    float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta,
     std::optional<torch::Tensor> maybe_lse) {
   auto device = q.device();
   unsigned int head_dim = q.size(2);

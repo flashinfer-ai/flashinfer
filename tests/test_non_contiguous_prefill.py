@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import flashinfer
 import pytest
 import torch
+
+import flashinfer
 
 
 @pytest.mark.parametrize("seq_len", [1, 7, 127, 999, 3579])

@@ -18,14 +18,9 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from .decode import (
-    BatchDecodeWithPagedKVCacheWrapper,
-)
+from .decode import BatchDecodeWithPagedKVCacheWrapper
 from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
-from .prefill import (
-    BatchPrefillWithPagedKVCacheWrapper,
-    single_prefill_with_kv_cache,
-)
+from .prefill import BatchPrefillWithPagedKVCacheWrapper, single_prefill_with_kv_cache
 from .utils import register_custom_op, register_fake_op
 
 _cascade_module = None

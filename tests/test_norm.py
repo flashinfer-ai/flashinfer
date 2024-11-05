@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import flashinfer
 import pytest
 import torch
+
+import flashinfer
 
 
 def llama_rms_norm(x, w, eps=1e-6):
@@ -76,9 +77,7 @@ def test_norm(batch_size, hidden_size, dtype, specify_out):
     else:
         y = flashinfer.norm.rmsnorm(x, w)
 
-    torch.testing.assert_close(
-        y_ref, y, rtol=1e-3, atol=1e-3
-    )
+    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
@@ -118,9 +117,7 @@ def test_gemma_norm(batch_size, hidden_size, dtype, specify_out):
     else:
         y = flashinfer.norm.gemma_rmsnorm(x, w)
 
-    torch.testing.assert_close(
-        y_ref, y, rtol=1e-3, atol=1e-3
-    )
+    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])

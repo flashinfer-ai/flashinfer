@@ -9,6 +9,6 @@ Quantization related kernels.
 
 .. autosummary::
     :toctree: _generate
-    
+
     packbits
     segment_packbits

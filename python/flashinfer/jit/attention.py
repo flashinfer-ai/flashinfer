@@ -14,24 +14,29 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import torch
-import jinja2
 import os
 import pathlib
+from typing import List, Tuple
+
+import jinja2
+import torch
+
+from .batch_decode_mla_templ import batch_decode_mla_templ
+from .batch_decode_templ import batch_decode_templ
+from .batch_prefill_templ import batch_prefill_templ
 from .env import FLASHINFER_GEN_SRC_DIR
+from .single_decode_templ import customizable_single_decode_templ, single_decode_templ
+from .single_prefill_templ import (
+    customizable_single_prefill_templ,
+    single_prefill_templ,
+)
 from .utils import (
-    write_if_different,
     dtype_map,
     filename_safe_dtype_map,
-    pos_encoding_mode_literal,
     mask_mode_literal,
+    pos_encoding_mode_literal,
+    write_if_different,
 )
-from .single_decode_templ import single_decode_templ, customizable_single_decode_templ
-from .batch_decode_templ import batch_decode_templ
-from .batch_decode_mla_templ import batch_decode_mla_templ
-from .single_prefill_templ import single_prefill_templ, customizable_single_prefill_templ
-from .batch_prefill_templ import batch_prefill_templ
-from typing import List, Tuple
 
 
 def get_single_decode_cu_str(
@@ -164,7 +169,8 @@ def get_batch_decode_mla_cu_str(
         dtype_o=dtype_map[dtype_o],
         dtype_idx=dtype_map[dtype_idx],
         head_dim_ckv=head_dim,
-        head_dim_kpe=head_dim//8, # fixme: head_dim_ckv(kv_lora_rank) is 8 times the size of head_dim_kpe(qk_rope_head_dim) for all MLA model (DeepSeek-V2-Lite, DeepSeek-V2.5, MiniCPM3) at the time Oct.2024
+        head_dim_kpe=head_dim
+        // 8,  # fixme: head_dim_ckv(kv_lora_rank) is 8 times the size of head_dim_kpe(qk_rope_head_dim) for all MLA model (DeepSeek-V2-Lite, DeepSeek-V2.5, MiniCPM3) at the time Oct.2024
         use_sliding_window="true" if use_sliding_window else "false",
         use_logits_soft_cap="true" if use_logits_soft_cap else "false",
     )
@@ -202,6 +208,7 @@ def gen_batch_decode_mla_cu(*args) -> None:
         get_batch_decode_mla_cu_str(*args),
     )
     return uri, path
+
 
 def get_single_prefill_cu_str(
     dtype_q: torch.dtype,
@@ -347,39 +354,54 @@ def get_customize_single_decode_cu_str(
 ) -> str:
     template = jinja2.Template(customizable_single_decode_templ)
     additional_params_decl = "".join(
-        [f"{dtype}* {var};\n"
-        for dtype, var in zip(
-            additional_input_tensor_var_types, additional_input_tensor_var_names
-        )] + [f"{dtype} {var};\n"
-        for dtype, var in zip(
-            additional_input_scalar_var_types, additional_input_scalar_var_names
-        )]
+        [
+            f"{dtype}* {var};\n"
+            for dtype, var in zip(
+                additional_input_tensor_var_types, additional_input_tensor_var_names
+            )
+        ]
+        + [
+            f"{dtype} {var};\n"
+            for dtype, var in zip(
+                additional_input_scalar_var_types, additional_input_scalar_var_names
+            )
+        ]
     )
     additional_params = "".join(
-        [f", {dtype}* {var}"
-        for dtype, var in zip(
-            additional_input_tensor_var_types, additional_input_tensor_var_names
-        )] + [f", {dtype} {var}"
-        for dtype, var in zip(
-            additional_input_scalar_var_types, additional_input_scalar_var_names
-        )]
+        [
+            f", {dtype}* {var}"
+            for dtype, var in zip(
+                additional_input_tensor_var_types, additional_input_tensor_var_names
+            )
+        ]
+        + [
+            f", {dtype} {var}"
+            for dtype, var in zip(
+                additional_input_scalar_var_types, additional_input_scalar_var_names
+            )
+        ]
     )
     additional_params_init = "".join(
-        [f", {var}({var})" for var in additional_input_tensor_var_names] +
-        [f", {var}({var})" for var in additional_input_scalar_var_names]
+        [f", {var}({var})" for var in additional_input_tensor_var_names]
+        + [f", {var}({var})" for var in additional_input_scalar_var_names]
     )
     additional_func_params = "".join(
-        [f", torch::Tensor {var}" for var in additional_input_tensor_var_names] +
-        [f", {dtype} {var}" for dtype, var in zip(
-            additional_input_scalar_var_types, additional_input_scalar_var_names
-        )]
+        [f", torch::Tensor {var}" for var in additional_input_tensor_var_names]
+        + [
+            f", {dtype} {var}"
+            for dtype, var in zip(
+                additional_input_scalar_var_types, additional_input_scalar_var_names
+            )
+        ]
     )
     additional_params_data = "".join(
-        [f", static_cast<{dtype}*>({var}.data_ptr())"
-        for dtype, var in zip(
-            additional_input_tensor_var_types, additional_input_tensor_var_names
-        )] + [f", {var}"
-        for var in additional_input_scalar_var_names]
+        [
+            f", static_cast<{dtype}*>({var}.data_ptr())"
+            for dtype, var in zip(
+                additional_input_tensor_var_types, additional_input_tensor_var_names
+            )
+        ]
+        + [f", {var}" for var in additional_input_scalar_var_names]
     )
 
     return template.render(
@@ -393,7 +415,7 @@ def get_customize_single_decode_cu_str(
         variant_decl=variant_decl,
         variant_name=variant_name,
         additional_func_params=additional_func_params,
-        additional_params_data=additional_params_data
+        additional_params_data=additional_params_data,
     )
 
 
@@ -412,39 +434,54 @@ def get_customize_single_prefill_cu_str(
 ) -> str:
     template = jinja2.Template(customizable_single_prefill_templ)
     additional_params_decl = "".join(
-        [f"{dtype}* {var};\n"
-        for dtype, var in zip(
-            additional_input_tensor_var_types, additional_input_tensor_var_names
-        )] + [f"{dtype} {var};\n"
-        for dtype, var in zip(
-            additional_input_scalar_var_types, additional_input_scalar_var_names
-        )]
+        [
+            f"{dtype}* {var};\n"
+            for dtype, var in zip(
+                additional_input_tensor_var_types, additional_input_tensor_var_names
+            )
+        ]
+        + [
+            f"{dtype} {var};\n"
+            for dtype, var in zip(
+                additional_input_scalar_var_types, additional_input_scalar_var_names
+            )
+        ]
     )
     additional_params = "".join(
-        [f", {dtype}* {var}"
-        for dtype, var in zip(
-            additional_input_tensor_var_types, additional_input_tensor_var_names
-        )] + [f", {dtype} {var}"
-        for dtype, var in zip(
-            additional_input_scalar_var_types, additional_input_scalar_var_names
-        )]
+        [
+            f", {dtype}* {var}"
+            for dtype, var in zip(
+                additional_input_tensor_var_types, additional_input_tensor_var_names
+            )
+        ]
+        + [
+            f", {dtype} {var}"
+            for dtype, var in zip(
+                additional_input_scalar_var_types, additional_input_scalar_var_names
+            )
+        ]
     )
     additional_params_init = "".join(
-        [f", {var}({var})" for var in additional_input_tensor_var_names] +
-        [f", {var}({var})" for var in additional_input_scalar_var_names]
+        [f", {var}({var})" for var in additional_input_tensor_var_names]
+        + [f", {var}({var})" for var in additional_input_scalar_var_names]
     )
     additional_func_params = "".join(
-        [f", torch::Tensor {var}" for var in additional_input_tensor_var_names] +
-        [f", {dtype} {var}" for dtype, var in zip(
-            additional_input_scalar_var_types, additional_input_scalar_var_names
-        )]
+        [f", torch::Tensor {var}" for var in additional_input_tensor_var_names]
+        + [
+            f", {dtype} {var}"
+            for dtype, var in zip(
+                additional_input_scalar_var_types, additional_input_scalar_var_names
+            )
+        ]
     )
     additional_params_data = "".join(
-        [f", static_cast<{dtype}*>({var}.data_ptr())"
-        for dtype, var in zip(
-            additional_input_tensor_var_types, additional_input_tensor_var_names
-        )] + [f", {var}"
-        for var in additional_input_scalar_var_names]
+        [
+            f", static_cast<{dtype}*>({var}.data_ptr())"
+            for dtype, var in zip(
+                additional_input_tensor_var_types, additional_input_tensor_var_names
+            )
+        ]
+        + [f", {var}" for var in additional_input_scalar_var_names]
     )
 
     return template.render(

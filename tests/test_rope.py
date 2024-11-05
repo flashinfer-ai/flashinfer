@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import flashinfer
 import pytest
 import torch
-
 from rope_reference import *
+
+import flashinfer
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])

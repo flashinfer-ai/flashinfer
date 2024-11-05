@@ -14,9 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import flashinfer
 import pytest
 import torch
+
+import flashinfer
 
 
 def ceil_div(a, b):
@@ -185,9 +186,7 @@ def test_batch_attention_with_shared_prefix_paged_kv_cache(
             q, k_shared, v_shared, kv_data, causal=causal
         )
 
-    torch.testing.assert_close(
-        o_multi_level, o_two_level, rtol=1e-3, atol=1e-3
-    )
+    torch.testing.assert_close(o_multi_level, o_two_level, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("seed", [0])
@@ -217,12 +216,8 @@ def test_merge_state_in_place_with_mask(seed, num_tries):
     flashinfer.merge_state_in_place(va, sa, vb, sb, mask=mask)
     va_merged = va
     sa_merged = sa
-    torch.testing.assert_close(
-        va_merged, va_merged_ref, rtol=1e-3, atol=1e-3
-    )
-    torch.testing.assert_close(
-        sa_merged, sa_merged_ref, rtol=1e-3, atol=1e-3
-    )
+    torch.testing.assert_close(va_merged, va_merged_ref, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(sa_merged, sa_merged_ref, rtol=1e-3, atol=1e-3)
 
     # Mask with all zeros. Input and output should be identical.
     mask = torch.zeros(seq_len, dtype=torch.bool).to("cuda:0")
@@ -231,12 +226,8 @@ def test_merge_state_in_place_with_mask(seed, num_tries):
     flashinfer.merge_state_in_place(va, sa, vb, sb, mask=mask)
     va_merged = va
     sa_merged = sa
-    torch.testing.assert_close(
-        va_merged, va_orginal, rtol=1e-3, atol=1e-3
-    )
-    torch.testing.assert_close(
-        sa_merged, sa_original, rtol=1e-3, atol=1e-3
-    )
+    torch.testing.assert_close(va_merged, va_orginal, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(sa_merged, sa_original, rtol=1e-3, atol=1e-3)
 
     # Test some random masks.
     randgen = torch.Generator(device="cuda:0")

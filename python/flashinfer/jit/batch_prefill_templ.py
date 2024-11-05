@@ -46,7 +46,7 @@ std::vector<int64_t> BatchPrefillWithKVCachePlan(
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =
       int_workspace_buffer.size(0) * int_workspace_buffer.element_size();
-  
+
   auto device = float_workspace_buffer.device();
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   TORCH_CHECK(qo_indptr.device() == torch::kCPU, "qo_indptr must be on CPU");
@@ -119,7 +119,7 @@ torch::Tensor BatchPrefillWithRaggedKVCacheRun(
     {% if use_alibi == "true" %}static_cast<float*>(maybe_alibi_slopes->data_ptr()){% else %}nullptr{% endif %},
     num_qo_heads, num_kv_heads, q_stride_n, q_stride_h, kv_stride_n, kv_stride_h,
     window_left, logits_soft_cap, sm_scale, rope_scale, rope_theta);
-  
+
   {{ dtype_o }}* tmp_v = nullptr;
   float* tmp_s = nullptr;
 
@@ -193,7 +193,7 @@ torch::Tensor BatchPrefillWithPagedKVCacheRun(
 
   void* float_buffer_ptr = static_cast<void*>(float_workspace_buffer.data_ptr());
   void* int_buffer_ptr = static_cast<void*>(int_workspace_buffer.data_ptr());
-  
+
   const auto q_stride_n = q.stride(0);
   const auto q_stride_h = q.stride(1);
 

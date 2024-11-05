@@ -23,11 +23,11 @@ import torch
 
 from .jit import (
     gen_batch_decode_cu,
-    gen_single_decode_cu,
     gen_batch_decode_mla_cu,
+    gen_single_decode_cu,
+    get_batch_decode_mla_uri,
     get_batch_decode_uri,
     get_single_decode_uri,
-    get_batch_decode_mla_uri,
     has_prebuilt_ops,
     load_cuda_ops,
     prebuilt_ops_uri,
@@ -72,7 +72,8 @@ def compile_batch_decode_module(
         [path],
         verbose=verbose,
     )
-    
+
+
 def compile_batch_decode_mla_module(
     *args,
     verbose: bool = False,
@@ -83,6 +84,7 @@ def compile_batch_decode_mla_module(
         [path],
         verbose=verbose,
     )
+
 
 _single_decode_modules = {}
 _batch_decode_modules = {}
@@ -276,11 +278,13 @@ def single_decode_with_kv_cache_with_jit_module(
         q, k, v, tmp, TensorLayout[kv_layout].value, window_left, *args
     )
 
+
 def get_batch_decode_mla_module(*args):
     global _batch_decode_mla_modules
     if args not in _batch_decode_mla_modules:
         _batch_decode_mla_modules[args] = compile_batch_decode_mla_module(*args)
     return _batch_decode_mla_modules[args]
+
 
 def single_decode_with_kv_cache(
     q: torch.Tensor,
@@ -1086,6 +1090,7 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper(BatchDecodeWithPagedKVCacheWra
             paged_kv_last_page_len_buffer=last_page_len_buffer,
         )
 
+
 class BatchDecodeMlaWithPagedKVCacheWrapper:
     def __init__(
         self,
@@ -1159,7 +1164,6 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         self._paged_kv_indices_buf = paged_kv_indices_buffer
         self._paged_kv_last_page_len_buf = paged_kv_last_page_len_buffer
         self._use_cuda_graph = use_cuda_graph
-    
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -1272,7 +1276,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         if not q_data_type:
             q_data_type = data_type
         q_data_type = canonicalize_torch_dtype(q_data_type)
-        
+
         self._cached_module = get_batch_decode_mla_module(
             q_data_type,
             data_type,
@@ -1292,13 +1296,12 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             page_size,
             self.is_cuda_graph_enabled,
         )
-        
+
         self._sm_scale = sm_scale
         self._window_left = window_left
         self._logits_soft_cap = logits_soft_cap
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
-        
 
     def run(
         self,
@@ -1363,8 +1366,10 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             self._float_workspace_buffer,
             self._int_workspace_buffer,
             self._plan_info,
-            q_nope, q_pe,
-            paged_ckv_cache, paged_kpe_cache,
+            q_nope,
+            q_pe,
+            paged_ckv_cache,
+            paged_kpe_cache,
             self._paged_kv_indptr_buf,
             self._paged_kv_indices_buf,
             self._paged_kv_last_page_len_buf,

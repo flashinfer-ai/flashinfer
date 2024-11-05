@@ -1,15 +1,17 @@
-import torch
-import math
-import flashinfer
-import flashinfer.jit
 import functools
-from flashinfer.utils import MaskMode
+import math
+
+import flashinfer.jit
+import torch
+from flashinfer.decode import single_decode_with_kv_cache_with_jit_module
 from flashinfer.jit.attention import (
     get_customize_single_decode_cu_str,
     get_customize_single_prefill_cu_str,
 )
-from flashinfer.decode import single_decode_with_kv_cache_with_jit_module
 from flashinfer.prefill import single_prefill_with_kv_cache_with_jit_module
+from flashinfer.utils import MaskMode
+
+import flashinfer
 
 
 def generate_module(module_name: str, cuda_ops_str: str):

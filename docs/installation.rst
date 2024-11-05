@@ -135,7 +135,7 @@ You can follow the steps below to install FlashInfer from source code:
 3. Install Ninja build system:
 
    .. code-block:: bash
-    
+
        pip install ninja
 
 4. Install FlashInfer:
@@ -208,12 +208,12 @@ To compile the C++ benchmarks (using `nvbench <https://github.com/NVIDIA/nvbench
 3. Create build directory and copy configuration files
 
    .. code-block:: bash
-       
+
        mkdir -p build
        cp cmake/config.cmake build/  # you can modify the configuration file if needed
 
 4. Compile the benchmarks and unittests:
-   
+
    .. code-block:: bash
 
        cd build

@@ -1,6 +1,8 @@
 macro(__flashinfer_option variable description value)
   if(NOT DEFINED ${variable})
-    set(${variable} ${value} CACHE STRING ${description})
+    set(${variable}
+        ${value}
+        CACHE STRING ${description})
   endif()
 endmacro()
 
@@ -10,11 +12,11 @@ endmacro()
 
 set(FLASHINFER_ALL_OPTIONS)
 
-#######################################################
-# An option that the user can select. Can accept condition to control when option is available for user.
-# Usage:
-#   tvm_option(<option_variable> "doc string" <initial value or boolean expression> [IF <condition>])
-# The macro snippet is copied from Apache TVM codebase.
+# ##############################################################################
+# An option that the user can select. Can accept condition to control when
+# option is available for user. Usage: tvm_option(<option_variable> "doc string"
+# <initial value or boolean expression> [IF <condition>]) The macro snippet is
+# copied from Apache TVM codebase.
 macro(flashinfer_option variable description value)
   set(__value ${value})
   set(__condition "")
