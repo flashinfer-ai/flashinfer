@@ -2,9 +2,10 @@ import argparse
 import dataclasses
 from typing import cast
 
-import flashinfer
 import torch
 from triton.testing import do_bench
+
+import flashinfer
 
 
 @dataclasses.dataclass(kw_only=True)

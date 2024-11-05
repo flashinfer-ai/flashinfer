@@ -29,13 +29,7 @@ import flashinfer
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("llama_version", ["llama", "llama31"])
 def test_llama_rope_inplace(
-    batch_size,
-    qkv_len,
-    num_qo_heads,
-    num_kv_heads,
-    offset,
-    head_dim,
-    llama_version
+    batch_size, qkv_len, num_qo_heads, num_kv_heads, offset, head_dim, llama_version
 ):
     nnz = batch_size * qkv_len
     qkv_packed = torch.randn(
@@ -94,13 +88,7 @@ def test_llama_rope_inplace(
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("llama_version", ["llama", "llama31"])
 def test_llama_rope(
-    batch_size,
-    qkv_len,
-    num_qo_heads,
-    num_kv_heads,
-    offset,
-    head_dim,
-    llama_version
+    batch_size, qkv_len, num_qo_heads, num_kv_heads, offset, head_dim, llama_version
 ):
     nnz = batch_size * qkv_len
     qkv_packed = torch.randn(
@@ -158,13 +146,7 @@ def test_llama_rope(
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("llama_version", ["llama", "llama31"])
 def test_llama_rope_pos_ids(
-    batch_size,
-    qkv_len,
-    num_qo_heads,
-    num_kv_heads,
-    offset,
-    head_dim,
-    llama_version
+    batch_size, qkv_len, num_qo_heads, num_kv_heads, offset, head_dim, llama_version
 ):
     nnz = batch_size * qkv_len
     qkv_packed = torch.randn(
@@ -219,13 +201,7 @@ def test_llama_rope_pos_ids(
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("llama_version", ["llama", "llama31"])
 def test_llama_rope_pos_ids_inplace(
-    batch_size,
-    qkv_len,
-    num_qo_heads,
-    num_kv_heads,
-    offset,
-    head_dim,
-    llama_version
+    batch_size, qkv_len, num_qo_heads, num_kv_heads, offset, head_dim, llama_version
 ):
     nnz = batch_size * qkv_len
     qkv_packed = torch.randn(
