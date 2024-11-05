@@ -60,6 +60,8 @@ from .quantization import packbits as packbits
 from .quantization import segment_packbits as segment_packbits
 from .rope import apply_llama31_rope as apply_llama31_rope
 from .rope import apply_llama31_rope_inplace as apply_llama31_rope_inplace
+from .rope import apply_llama31_rope_pos_ids as apply_llama31_rope_pos_ids
+from .rope import apply_llama31_rope_pos_ids_inplace as apply_llama31_rope_pos_ids_inplace
 from .rope import apply_rope as apply_rope
 from .rope import apply_rope_inplace as apply_rope_inplace
 from .rope import apply_rope_pos_ids as apply_rope_pos_ids
