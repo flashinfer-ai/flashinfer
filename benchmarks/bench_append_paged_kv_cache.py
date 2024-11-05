@@ -57,6 +57,7 @@ def main():
         [args.seqlen],
         [args.seqlen // args.batch_size] * args.batch_size,
     ]
+    seqlen_strlen = max(len(str(seqlens)) for seqlens in seqlens_)
     page_len = int(args.page_len)
     dtype = getattr(torch, args.dtype)
     assert isinstance(dtype, torch.dtype)
@@ -121,7 +122,7 @@ def main():
             )
             print(
                 f"model: {model_name:8}",
-                f"seqlens: {str(seqlens):50}",
+                f"seqlens: {seqlens!r:{seqlen_strlen}}",
                 f"single_layer: {latency_ms:5.3f}ms",
                 f"all_layers: {all_layers_latency_ms:7.3f}ms",
                 f"throughput: {throughput*1e-9:8.3f}GB/s",
