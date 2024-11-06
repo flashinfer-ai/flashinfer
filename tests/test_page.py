@@ -1,19 +1,28 @@
+import pytest
 import torch
 
 import flashinfer
 
 
-def test_append_paged_kv_cache():
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_append_paged_kv_cache(contiguous):
     nnz_kv = 100
     num_kv_heads = 32
     head_dim = 128
-    k_append = torch.randn(nnz_kv, num_kv_heads, head_dim).half().to(0)
-    v_append = torch.randn(nnz_kv, num_kv_heads, head_dim).half().to(0)
+
+    if contiguous:
+        k_append = torch.randn(nnz_kv, num_kv_heads, head_dim).half().to(0)
+        v_append = torch.randn(nnz_kv, num_kv_heads, head_dim).half().to(0)
+    else:
+        kv_append = torch.randn(nnz_kv, 2, num_kv_heads, head_dim).half().to(0)
+        k_append = kv_append[:, 0]
+        v_append = kv_append[:, 1]
     # 45 + 8 + 25 + 22 = nnz_kv
     kv_append_length = torch.tensor([45, 8, 25, 22], dtype=torch.int32, device="cuda:0")
     kv_append_indptr = torch.cat(
         [torch.zeros(1).int().to(0), torch.cumsum(kv_append_length, dim=0)]
     ).int()
+
     max_num_pages = 1000
     page_size = 16
     paged_kv_cache = (
@@ -30,11 +39,17 @@ def test_append_paged_kv_cache():
     # 25 = (2 - 1) * 16 + 9
     # 22 = (2 - 1) * 16 + 6
     kv_last_page_len = torch.tensor([13, 8, 9, 6], dtype=torch.int32, device="cuda:0")
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
+        kv_append_indptr,
+        flashinfer.get_seq_lens(kv_append_indptr, kv_last_page_len, page_size),
+        nnz_kv,
+    )
 
-    flashinfer.page.append_paged_kv_cache(
+    flashinfer.append_paged_kv_cache(
         k_append,
         v_append,
-        kv_append_indptr,
+        batch_indices,
+        positions,
         paged_kv_cache,
         kv_page_indices,
         kv_page_indptr,

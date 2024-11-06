@@ -99,12 +99,19 @@ def main():
                 dtype=torch.int32,
             )
 
+            batch_indices, positions = flashinfer.get_batch_indices_positions(
+                x_indptr,
+                flashinfer.get_seq_lens(kv_indptr, kv_last_page_len, page_len),
+                k.shape[0],
+            )
+
             @torch.cuda.nvtx.range(f"model={model_name}, seqlens={seqlens}")
             def fn():
                 flashinfer.append_paged_kv_cache(
                     k,
                     v,
-                    x_indptr,
+                    batch_indices,
+                    positions,
                     layer_buf,
                     kv_indices,
                     kv_indptr,

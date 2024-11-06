@@ -249,38 +249,34 @@ __global__ void AppendPagedKVCacheDecodeKernel(paged_kv_t<DType, IdType> paged_k
  * \param paged_kv The paged key-value cache
  * \param key The key to be appended
  * \param value The value to be appended
- * \param append_indptr The indptr array of the appended ragged tensor
+ * \param batch_indices The batch indices of elements to be appended
+ * \param positions The positions of elements to be appended
  */
 template <uint32_t head_dim, uint32_t vec_size, typename DType, typename IdType>
-__global__ void AppendPagedKVCachePrefillKernel(paged_kv_t<DType, IdType> paged_kv,
-                                                DType* __restrict__ key, DType* __restrict__ value,
-                                                IdType* __restrict__ append_indptr) {
+__global__ void AppendPagedKVCacheKernel(paged_kv_t<DType, IdType> paged_kv,
+                                         DType* __restrict__ append_key,
+                                         DType* __restrict__ append_value,
+                                         IdType* __restrict__ batch_indices,
+                                         IdType* __restrict__ positions, uint32_t nnz,
+                                         size_t append_k_stride_n, size_t append_k_stride_h,
+                                         size_t append_v_stride_n, size_t append_v_stride_h) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t num_heads = paged_kv.num_heads;
-  uint32_t batch_idx = blockIdx.x;
   uint32_t head_idx = ty;
+  uint32_t cta_id = blockIdx.x;
+  uint32_t num_ctas = gridDim.x;
 
-  uint32_t seq_len =
-      (paged_kv.indptr[batch_idx + 1] - paged_kv.indptr[batch_idx] - 1) * paged_kv.page_size +
-      paged_kv.last_page_len[batch_idx];
-  uint32_t append_seq_len = append_indptr[batch_idx + 1] - append_indptr[batch_idx];
-  uint32_t append_start = seq_len - append_seq_len;
-
-#pragma unroll 2
-  for (uint32_t j = 0; j < append_seq_len; ++j) {
-    uint32_t page_seq_idx = j + append_start;
-    uint32_t page_iter = paged_kv.indptr[batch_idx] + page_seq_idx / paged_kv.page_size;
-    uint32_t entry_idx = page_seq_idx % paged_kv.page_size;
-
+#pragma unroll 4
+  for (uint32_t i = cta_id; i < nnz; i += num_ctas) {
+    uint32_t page_iter, entry_idx;
+    paged_kv.page_size.divmod(paged_kv.indptr[batch_indices[i]] * paged_kv.page_size + positions[i],
+                              page_iter, entry_idx);
     DType* k_ptr = paged_kv.get_k_ptr(page_iter, head_idx, entry_idx, tx * vec_size);
     DType* v_ptr = paged_kv.get_v_ptr(page_iter, head_idx, entry_idx, tx * vec_size);
     vec_t<DType, vec_size>::memcpy(
-        k_ptr,
-        key + ((append_indptr[batch_idx] + j) * num_heads + head_idx) * head_dim + tx * vec_size);
-
+        k_ptr, append_key + i * append_k_stride_n + head_idx * append_k_stride_h + tx * vec_size);
     vec_t<DType, vec_size>::memcpy(
-        v_ptr,
-        value + ((append_indptr[batch_idx] + j) * num_heads + head_idx) * head_dim + tx * vec_size);
+        v_ptr, append_value + i * append_v_stride_n + head_idx * append_v_stride_h + tx * vec_size);
   }
 }
 
@@ -327,20 +323,36 @@ cudaError_t AppendPagedKVCacheDecode(paged_kv_t<DType, IdType> paged_kv, DType* 
  * \return status Indicates whether CUDA calls are successful
  */
 template <typename DType, typename IdType>
-cudaError_t AppendPagedKVCache(paged_kv_t<DType, IdType> paged_kv, DType* key, DType* value,
-                               IdType* append_indptr, cudaStream_t stream = nullptr) {
+cudaError_t AppendPagedKVCache(paged_kv_t<DType, IdType> paged_kv, DType* append_key,
+                               DType* append_value, IdType* batch_indices, IdType* positions,
+                               uint32_t nnz, size_t append_k_stride_n, size_t append_k_stride_h,
+                               size_t append_v_stride_n, size_t append_v_stride_h,
+                               cudaStream_t stream = nullptr) {
   uint32_t head_dim = paged_kv.head_dim;
-  uint32_t batch_size = paged_kv.batch_size;
   uint32_t num_heads = paged_kv.num_heads;
+  int dev_id = 0;
+  int num_sms = 0;
+  int num_blocks_per_sm = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
+
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
     constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
     uint32_t bdx = HEAD_DIM / vec_size;
     uint32_t bdy = num_heads;
-    // NOTE(Zihao): could be slow for small batch size, will optimize later
-    dim3 nblks(batch_size);
+    uint32_t num_threads = bdx * bdy;
+    uint32_t smem_size = 0;
+    auto kernel = AppendPagedKVCacheKernel<HEAD_DIM, vec_size, DType, IdType>;
+    FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
+                                                                       num_threads, smem_size));
+    num_blocks_per_sm = min(num_blocks_per_sm, ceil_div(int(nnz), num_sms));
+    dim3 nblks(num_blocks_per_sm * num_sms);
     dim3 nthrs(bdx, bdy);
-    auto kernel = AppendPagedKVCachePrefillKernel<HEAD_DIM, vec_size, DType, IdType>;
-    void* args[] = {(void*)&paged_kv, (void*)&key, (void*)&value, (void*)&append_indptr};
+
+    void* args[] = {(void*)&paged_kv,          (void*)&append_key,        (void*)&append_value,
+                    (void*)&batch_indices,     (void*)&positions,         (void*)&nnz,
+                    (void*)&append_k_stride_n, (void*)&append_k_stride_h, (void*)&append_v_stride_n,
+                    (void*)&append_v_stride_h};
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
   });
   return cudaSuccess;

@@ -46,6 +46,8 @@ from .norm import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm
 from .norm import gemma_rmsnorm as gemma_rmsnorm
 from .norm import rmsnorm as rmsnorm
 from .page import append_paged_kv_cache as append_paged_kv_cache
+from .page import get_batch_indices_positions as get_batch_indices_positions
+from .page import get_seq_lens as get_seq_lens
 from .prefill import (
     BatchPrefillWithPagedKVCacheWrapper as BatchPrefillWithPagedKVCacheWrapper,
 )
