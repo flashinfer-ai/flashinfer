@@ -265,13 +265,12 @@ __global__ void AppendPagedKVCacheKernel(paged_kv_t<DType, IdType> paged_kv,
   uint32_t head_idx = ty;
   uint32_t cta_id = blockIdx.x;
   uint32_t num_ctas = gridDim.x;
-  uint32_t num_iters = ceil_div(nnz, num_ctas);
 
 #pragma unroll 2
   for (uint32_t i = cta_id; i < nnz; i += num_ctas) {
     uint32_t page_iter, entry_idx;
-    paged_kv.page_size.divmod(paged_kv.indptr[batch_indices[i]] + positions[i], page_iter,
-                              entry_idx);
+    paged_kv.page_size.divmod(paged_kv.indptr[batch_indices[i]] * paged_kv.page_size + positions[i],
+                              page_iter, entry_idx);
     DType* k_ptr = paged_kv.get_k_ptr(page_iter, head_idx, entry_idx, tx * vec_size);
     DType* v_ptr = paged_kv.get_v_ptr(page_iter, head_idx, entry_idx, tx * vec_size);
     vec_t<DType, vec_size>::memcpy(

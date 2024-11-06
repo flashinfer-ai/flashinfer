@@ -24,8 +24,8 @@ void append_paged_kv_cache(torch::Tensor append_key, torch::Tensor append_value,
                            torch::Tensor paged_k_cache, torch::Tensor paged_v_cache,
                            torch::Tensor kv_indices, torch::Tensor kv_indptr,
                            torch::Tensor kv_last_page_len, unsigned int layout) {
-  CHECK_INPUT(append_key);
-  CHECK_INPUT(append_value);
+  CHECK_LAST_DIM_CONTIGUOUS(append_key);
+  CHECK_LAST_DIM_CONTIGUOUS(append_value);
   CHECK_INPUT(batch_indices);
   CHECK_INPUT(positions);
   // NOTE(Zihao): doesn't have to be contiguous

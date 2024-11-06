@@ -32,9 +32,11 @@ void _TestAppendPagedKVKernelCorrectness(size_t page_size, size_t batch_size, si
   size_t max_prefill_len = 128;
   size_t max_num_pages =
       num_conv_rounds * batch_size * ((max_decode_len + max_prefill_len) / page_size + 1);
-  std::vector<T> kv_data_cpu(2 * max_num_pages * page_size * num_heads * head_dim);
-  utils::vec_zero_(kv_data_cpu);
-  thrust::device_vector<T> kv_data_gpu(kv_data_cpu);
+  std::vector<T> k_data_cpu(max_num_pages * page_size * num_heads * head_dim);
+  std::vector<T> v_data_cpu(max_num_pages * page_size * num_heads * head_dim);
+  utils::vec_zero_(k_data_cpu);
+  utils::vec_zero_(v_data_cpu);
+  thrust::device_vector<T> k_data_gpu(k_data_cpu), v_data_gpu(v_data_cpu);
   std::vector<int32_t> seq_len(batch_size);
   utils::vec_fill_(seq_len, 0);
   std::vector<std::vector<int32_t>> page_indices(batch_size);
@@ -45,6 +47,8 @@ void _TestAppendPagedKVKernelCorrectness(size_t page_size, size_t batch_size, si
   for (size_t round = 0; round < 2 * num_conv_rounds; ++round) {
     std::vector<int32_t> append_len(batch_size);
     std::vector<int32_t> append_indptr{0};
+    std::vector<int32_t> batch_indices;
+    std::vector<int32_t> positions;
     std::vector<std::vector<T>> keys;
     std::vector<std::vector<T>> values;
     if (round % 2 == 0) {
@@ -62,6 +66,8 @@ void _TestAppendPagedKVKernelCorrectness(size_t page_size, size_t batch_size, si
         } else {
           last_page_len[i] += 1;
         }
+        batch_indices.push_back(i);
+        positions.push_back(seq_len[i] - append_len[i] + j);
       }
       std::vector<T> ki(append_len[i] * num_heads * head_dim),
           vi(append_len[i] * num_heads * head_dim);
@@ -79,24 +85,24 @@ void _TestAppendPagedKVKernelCorrectness(size_t page_size, size_t batch_size, si
       }
       indptr_cpu.push_back(indptr_cpu.back() + page_indices[i].size());
     }
-    paged_kv_t<T, int32_t> paged_kv_cpu(
-        num_heads, page_size, head_dim, batch_size, kv_layout,
-        /*k_data=*/kv_data_cpu.data(),
-        /*v_data=*/kv_data_cpu.data() + page_size * num_heads * head_dim, indices_cpu.data(),
-        indptr_cpu.data(), last_page_len.data());
+    paged_kv_t<T, int32_t> paged_kv_cpu(num_heads, page_size, head_dim, batch_size, kv_layout,
+                                        /*k_data=*/k_data_cpu.data(),
+                                        /*v_data=*/v_data_cpu.data(), indices_cpu.data(),
+                                        indptr_cpu.data(), last_page_len.data());
     cpu_reference::append_paged_kv_cache(paged_kv_cpu, keys, values, append_indptr);
 
     thrust::device_vector<int32_t> indptr_gpu(indptr_cpu);
     thrust::device_vector<int32_t> indices_gpu(indices_cpu);
     thrust::device_vector<int32_t> last_page_len_gpu(last_page_len);
-    paged_kv_t<T, int32_t> paged_kv_gpu(
-        num_heads, page_size, head_dim, batch_size, kv_layout,
-        /*k_data=*/thrust::raw_pointer_cast(kv_data_gpu.data()),
-        /*v_data=*/thrust::raw_pointer_cast(kv_data_gpu.data()) + page_size * num_heads * head_dim,
-        thrust::raw_pointer_cast(indices_gpu.data()), thrust::raw_pointer_cast(indptr_gpu.data()),
-        thrust::raw_pointer_cast(last_page_len_gpu.data()));
+    paged_kv_t<T, int32_t> paged_kv_gpu(num_heads, page_size, head_dim, batch_size, kv_layout,
+                                        /*k_data=*/thrust::raw_pointer_cast(k_data_gpu.data()),
+                                        /*v_data=*/thrust::raw_pointer_cast(v_data_gpu.data()),
+                                        thrust::raw_pointer_cast(indices_gpu.data()),
+                                        thrust::raw_pointer_cast(indptr_gpu.data()),
+                                        thrust::raw_pointer_cast(last_page_len_gpu.data()));
 
-    thrust::device_vector<int32_t> append_indptr_gpu(append_indptr);
+    thrust::device_vector<int32_t> batch_indices_gpu(batch_indices);
+    thrust::device_vector<int32_t> positions_gpu(positions);
     thrust::device_vector<T> keys_gpu(append_indptr.back() * num_heads * head_dim);
     thrust::device_vector<T> values_gpu(append_indptr.back() * num_heads * head_dim);
     for (size_t i = 0; i < batch_size; ++i) {
@@ -107,12 +113,19 @@ void _TestAppendPagedKVKernelCorrectness(size_t page_size, size_t batch_size, si
       thrust::copy(vi.begin(), vi.end(),
                    values_gpu.begin() + append_indptr[i] * num_heads * head_dim);
     }
+
     if (round % 2 == 0) {
       // call prefill kernel
       cudaError_t status =
           AppendPagedKVCache(paged_kv_gpu, thrust::raw_pointer_cast(keys_gpu.data()),
                              thrust::raw_pointer_cast(values_gpu.data()),
-                             thrust::raw_pointer_cast(append_indptr_gpu.data()));
+                             thrust::raw_pointer_cast(batch_indices_gpu.data()),
+                             thrust::raw_pointer_cast(positions_gpu.data()),
+                             /*nnz=*/append_indptr.back(),
+                             /*append_k_stride_n=*/num_heads * head_dim,
+                             /*append_k_stride_h=*/head_dim,
+                             /*append_v_stride_n=*/num_heads * head_dim,
+                             /*append_v_stride_h=*/head_dim);
       EXPECT_EQ(status, cudaSuccess) << "AppendPagedKVCache kernel launch failed, error message: "
                                      << cudaGetErrorString(status);
     } else {
@@ -126,18 +139,25 @@ void _TestAppendPagedKVKernelCorrectness(size_t page_size, size_t batch_size, si
     }
   }
 
-  thrust::host_vector<T> kv_data_gpu_h(kv_data_gpu);
+  thrust::host_vector<T> k_data_gpu_h(k_data_gpu), v_data_gpu_h(v_data_gpu);
   size_t num_result_errors_atol_1e_3_rtol_1e_3 = 0;
   bool nan_detected = false;
-  for (size_t i = 0; i < kv_data_cpu.size(); ++i) {
-    if (std::isnan(float(kv_data_gpu_h[i]))) {
+  for (size_t i = 0; i < k_data_cpu.size(); ++i) {
+    if (std::isnan(float(k_data_gpu_h[i]))) {
       nan_detected = true;
     }
     num_result_errors_atol_1e_3_rtol_1e_3 +=
-        (!utils::isclose(float(kv_data_cpu[i]), float(kv_data_gpu_h[i]), 1e-3, 1e-3));
+        (!utils::isclose(float(k_data_cpu[i]), float(k_data_gpu_h[i]), 1e-3, 1e-3));
   }
-  float result_accuracy =
-      1. - float(num_result_errors_atol_1e_3_rtol_1e_3) / float(kv_data_cpu.size());
+  for (size_t i = 0; i < v_data_cpu.size(); ++i) {
+    if (std::isnan(float(v_data_gpu_h[i]))) {
+      nan_detected = true;
+    }
+    num_result_errors_atol_1e_3_rtol_1e_3 +=
+        (!utils::isclose(float(v_data_cpu[i]), float(v_data_gpu_h[i]), 1e-3, 1e-3));
+  }
+  float result_accuracy = 1. - float(num_result_errors_atol_1e_3_rtol_1e_3) /
+                                   float(k_data_cpu.size() + v_data_cpu.size());
   std::cout << "kv_layout=" << QKVLayoutToString(kv_layout) << ", page_size=" << page_size
             << ", batch_size=" << batch_size << ", num_heads=" << num_heads
             << ", head_dim=" << head_dim << ", result_accuracy=" << result_accuracy << std::endl;

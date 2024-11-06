@@ -1,14 +1,22 @@
+import pytest
 import torch
 
 import flashinfer
 
 
-def test_append_paged_kv_cache():
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_append_paged_kv_cache(contiguous):
     nnz_kv = 100
     num_kv_heads = 32
     head_dim = 128
-    k_append = torch.randn(nnz_kv, num_kv_heads, head_dim).half().to(0)
-    v_append = torch.randn(nnz_kv, num_kv_heads, head_dim).half().to(0)
+
+    if contiguous:
+        k_append = torch.randn(nnz_kv, num_kv_heads, head_dim).half().to(0)
+        v_append = torch.randn(nnz_kv, num_kv_heads, head_dim).half().to(0)
+    else:
+        kv_append = torch.randn(nnz_kv, 2, num_kv_heads, head_dim).half().to(0)
+        k_append = kv_append[:, 0]
+        v_append = kv_append[:, 1]
     # 45 + 8 + 25 + 22 = nnz_kv
     kv_append_length = torch.tensor([45, 8, 25, 22], dtype=torch.int32, device="cuda:0")
     kv_append_indptr = torch.cat(
