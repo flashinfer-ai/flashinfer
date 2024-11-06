@@ -142,15 +142,10 @@ __global__ void FusedAddRMSNormKernel(T* __restrict__ input, T* __restrict__ res
       float x = float(input_vec[j]);
       x += float(residual_vec[j]);
       sum_sq += x * x;
-      if constexpr (sizeof(T) == 2) {
-        input_vec[j] = *((T *)((uint16_t *)(&x)) + 1);
-        residual_vec[j] = *(T *)((uint16_t *)(&x));
-      } else {
-        residual_vec[j] = (T)x;
-      }
+      residual_vec[j] = (T)x;
+      smem[num_warps + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE + j] = x;
     }
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
-      input_vec.store(input + bx * d + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
       residual_vec.store(residual + bx * d + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
     }
   }
@@ -179,33 +174,18 @@ __global__ void FusedAddRMSNormKernel(T* __restrict__ input, T* __restrict__ res
   for (uint32_t i = 0; i < rounds; i++) {
     vec_t<T, VEC_SIZE> input_vec;
     vec_t<T, VEC_SIZE> weight_vec;
-    vec_t<T, VEC_SIZE> residual_vec;
     input_vec.fill(0.f);
     weight_vec.fill(0.f);
-    residual_vec.fill(0.f);
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
-      if constexpr (sizeof(T) == 2) {
-        input_vec.load(input + bx * d + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
-      }
       weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
-      residual_vec.load(residual + bx * d + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
-      if constexpr (sizeof(T) == 2) {
-        uint32_t combine = (*(uint16_t *)(&input_vec[j])) << 16 | (*(uint16_t *)(&residual_vec[j]));
-        float x = *(float *)(&combine);
-        input_vec[j] = x * rms_rcp * float(weight_vec[j]);
-        residual_vec[j] = (T)x;
-      } else {
-        input_vec[j] = float(residual_vec[j]) * rms_rcp * float(weight_vec[j]);
-      }
+      float x = smem[num_warps + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE + j];
+      input_vec[j] = x * rms_rcp * float(weight_vec[j]);
     }
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       input_vec.store(input + bx * d + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
-      if constexpr (sizeof(T) == 2) {
-        residual_vec.store(residual + bx * d + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
-      }
     }
   }
 }
