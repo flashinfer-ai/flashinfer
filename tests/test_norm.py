@@ -98,8 +98,8 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     residual_fused = residual.clone()
     flashinfer.fused_add_rmsnorm(x_fused, residual_fused, weight, eps)
 
-    torch.testing.assert_close(x_fused, x_native, rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(residual_fused, residual_native, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(x_fused, x_native, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
