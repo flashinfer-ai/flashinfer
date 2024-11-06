@@ -31,13 +31,13 @@ def test_append_paged_kv_cache():
     # 25 = (2 - 1) * 16 + 9
     # 22 = (2 - 1) * 16 + 6
     kv_last_page_len = torch.tensor([13, 8, 9, 6], dtype=torch.int32, device="cuda:0")
-    batch_indices, positions = flashinfer.page.get_batch_indices_positions(
+    batch_indices, positions = flashinfer.get_batch_indices_positions(
         kv_append_indptr,
-        flashinfer.page.get_seq_lens(kv_append_indptr, kv_last_page_len, page_size),
+        flashinfer.get_seq_lens(kv_append_indptr, kv_last_page_len, page_size),
         nnz_kv,
     )
 
-    flashinfer.page.append_paged_kv_cache(
+    flashinfer.append_paged_kv_cache(
         k_append,
         v_append,
         batch_indices,

@@ -99,9 +99,9 @@ def main():
                 dtype=torch.int32,
             )
 
-            batch_indices, positions = flashinfer.page.get_batch_indices_positions(
+            batch_indices, positions = flashinfer.get_batch_indices_positions(
                 x_indptr,
-                flashinfer.page.get_seq_lens(kv_indptr, kv_last_page_len, page_len),
+                flashinfer.get_seq_lens(kv_indptr, kv_last_page_len, page_len),
                 k.shape[0],
             )
 

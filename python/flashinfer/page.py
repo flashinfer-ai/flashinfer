@@ -120,6 +120,30 @@ def get_batch_indices_positions_kernel(
 def get_batch_indices_positions(
     append_indptr: torch.Tensor, seq_lens: torch.Tensor, nnz: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Convert append indptr and sequence lengths to batch indices and positions.
+
+    Parameters
+    ----------
+    append_indptr : torch.Tensor
+        The indptr of the ragged tensor, shape: ``[batch_size + 1]``.
+    seq_lens: torch.Tensor
+        The sequence lengths of each request in the KV-Cache, shape: ``[batch_size]``.
+    nnz : int
+        The number of entries in the ragged tensor.
+
+    Returns
+    -------
+    batch_indices: torch.Tensor
+        The batch indices of the each entry in the ragged tensor, shape: ``[nnz]``.
+    positions: torch.Tensor
+        The positions of the each entry in the ragged tensor, shape: ``[nnz]``.
+
+    Notes
+    -----
+    This function is similar to `CSR2COO <https://docs.nvidia.com/cuda/cusparse/#csr2coo>`_
+    conversion in cuSPARSE library, with the difference that we are converting from a ragged
+    tensor (which don't require a column indices array) to a COO format.
+    """
     batch_size = append_indptr.size(0) - 1
     batch_indices = torch.empty((nnz,), device=append_indptr.device, dtype=torch.int32)
     positions = torch.empty((nnz,), device=append_indptr.device, dtype=torch.int32)
@@ -132,6 +156,23 @@ def get_batch_indices_positions(
 def get_seq_lens(
     kv_indptr: torch.Tensor, kv_last_page_len: torch.Tensor, page_size: int
 ) -> torch.Tensor:
+    r"""Convert KV indptr and last page length to sequence lengths.
+
+    Parameters
+    ----------
+    kv_indptr : torch.Tensor
+        The indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
+    kv_last_page_len : torch.Tensor
+        The number of entries in the last page of each request in the paged kv cache,
+        shape: ``[batch_size]``.
+    page_size : int
+        The size of a page in the paged kv-cache.
+
+    Returns
+    -------
+    seq_lens: torch.Tensor
+        The sequence lengths of each request in the paged kv-cache, shape: ``[batch_size]``.
+    """
     return (
         torch.clamp(kv_indptr[1:] - kv_indptr[:-1] - 1, min=0) * page_size
         + kv_last_page_len
