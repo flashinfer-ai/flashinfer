@@ -747,7 +747,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         use_cuda_graph : bool
             Whether to enable CUDA graph capture for the prefill kernels, if enabled, the
-            auxiliary data structures will be stored as provided buffers. The ``batch_size``
+            auxiliary data structures will be stored in provided buffers. The ``batch_size``
             cannot change during the lifecycle of this wrapper when CUDAGraph is enabled.
 
         qo_indptr_buf : Optional[torch.Tensor]
@@ -1095,7 +1095,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self,
         q: torch.Tensor,
         paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-        causal: bool = True,
+        causal: bool = False,
         pos_encoding_mode: str = "NONE",
         allow_fp16_qk_reduction: bool = False,
         k_scale: Optional[float] = None,
@@ -1240,7 +1240,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self,
         q: torch.Tensor,
         paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-        causal: bool = True,
+        causal: bool = False,
         pos_encoding_mode: str = "NONE",
         allow_fp16_qk_reduction: bool = False,
         k_scale: Optional[float] = None,
@@ -1491,7 +1491,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         head_dim: int,
         custom_mask: Optional[torch.Tensor] = None,
         packed_custom_mask: Optional[torch.Tensor] = None,
-        causal: bool = True,
+        causal: bool = False,
         pos_encoding_mode: str = "NONE",
         allow_fp16_qk_reduction: bool = False,
         window_left: int = -1,
@@ -1683,7 +1683,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        causal: bool = True,
+        causal: bool = False,
         pos_encoding_mode: str = "NONE",
         allow_fp16_qk_reduction: bool = False,
         window_left: int = -1,
@@ -1812,7 +1812,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        causal: bool = True,
+        causal: bool = False,
         pos_encoding_mode: str = "NONE",
         allow_fp16_qk_reduction: bool = False,
         window_left: int = -1,

@@ -281,10 +281,22 @@ class MultiLevelCascadeAttentionWrapper:
     ...
     >>> outputs[0].shape
     torch.Size([7, 64, 128])
+
+    See Also
+    --------
+    BatchPrefillWithPagedKVCacheWrapper
     """
 
     def __init__(
-        self, num_levels, float_workspace_buffer: torch.Tensor, kv_layout: str = "NHD"
+        self,
+        num_levels,
+        float_workspace_buffer: torch.Tensor,
+        kv_layout: str = "NHD",
+        use_cuda_graph: bool = False,
+        qo_indptr_buf_arr: Optional[list[torch.Tensor]] = None,
+        paged_kv_indptr_buf_arr: Optional[list[torch.Tensor]] = None,
+        paged_kv_indices_buf_arr: Optional[list[torch.Tensor]] = None,
+        paged_kv_last_page_len_buf_arr: Optional[list[torch.Tensor]] = None,
     ) -> None:
         r"""Constructor of :class:`MultiLevelCascadeAttentionWrapper`.
 
@@ -298,13 +310,58 @@ class MultiLevelCascadeAttentionWrapper:
             buffer should be the same as the device of the input tensors.
         kv_layout : str
             The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
+        use_cuda_graph : bool
+            Whether to use CUDA graph to capture the kernels, if enabled, the auxiliary data structures
+            will be stored in provided buffers.
+        qo_indptr_buf_arr : Optional[List[torch.Tensor]]
+            An array of qo indptr buffers for each level, the array length should be equal to
+            the number of levels.
+            The last element of each tensor should be the total number of queries/outputs.
+        paged_kv_indptr_buf_arr : Optional[List[torch.Tensor]]
+            An array of paged kv-cache indptr buffers for each level, the array length should be
+            equal to the number of levels.
+        paged_kv_indices_buf_arr : Optional[List[torch.Tensor]]
+            An array of paged kv-cache indices buffers for each level, the array length should be
+            equal to the number of levels.
+        paged_kv_last_page_len_buf_arr : Optional[List[torch.Tensor]]
+            An array of paged kv-cache last page length buffers for each level, the array length
+            should be equal to the number of levels.
         """
-        self._batch_prefill_wrappers = [
-            BatchPrefillWithPagedKVCacheWrapper(float_workspace_buffer, kv_layout)
-            for _ in range(num_levels)
-        ]
+        self._use_cuda_graph = use_cuda_graph
+        if use_cuda_graph:
+            self._batch_prefill_wrappers = [
+                BatchPrefillWithPagedKVCacheWrapper(
+                    float_workspace_buffer,
+                    kv_layout,
+                    use_cuda_graph=True,
+                    qo_indptr_buf=qo_indptr_buf,
+                    paged_kv_indptr_buf=paged_kv_indptr_buf,
+                    paged_kv_indices_buf=paged_kv_indices_buf,
+                    paged_kv_last_page_len_buf=paged_kv_last_page_len_buf,
+                )
+                for (
+                    qo_indptr_buf,
+                    paged_kv_indptr_buf,
+                    paged_kv_indices_buf,
+                    paged_kv_last_page_len_buf,
+                ) in zip(
+                    qo_indptr_buf_arr,
+                    paged_kv_indptr_buf_arr,
+                    paged_kv_indices_buf_arr,
+                    paged_kv_last_page_len_buf_arr,
+                )
+            ]
+        else:
+            self._batch_prefill_wrappers = [
+                BatchPrefillWithPagedKVCacheWrapper(float_workspace_buffer, kv_layout)
+                for _ in range(num_levels)
+            ]
         self._num_levels = num_levels
         self._kv_layout = kv_layout
+
+    @property
+    def is_cuda_graph_enabled(self) -> bool:
+        return self._use_cuda_graph
 
     def reset_workspace_buffer(
         self,
@@ -912,7 +969,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
         k_shared: torch.Tensor,
         v_shared: torch.Tensor,
         unique_kv_cache: torch.Tensor,
-        causal: bool = True,
+        causal: bool = False,
         allow_fp16_qk_reduction: bool = False,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
