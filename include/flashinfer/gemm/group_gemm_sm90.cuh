@@ -16,6 +16,12 @@
 #ifndef FLASHINFER_GEMM_GROUP_GEMM_SM90_CUH_
 #define FLASHINFER_GEMM_GROUP_GEMM_SM90_CUH_
 
+// clang-format off
+// NOTE: This header needs to be included before cutlass headers.
+// See: https://github.com/NVIDIA/cutlass/issues/1827
+#include "group_gemm_cutlass.cuh"
+// clang-format on
+
 #include <sstream>
 
 #include "../allocator.h"
@@ -39,7 +45,6 @@
 #include "cutlass/util/reference/device/tensor_compare.h"
 #include "cutlass/util/reference/device/tensor_fill.h"
 #include "cutlass/util/tensor_view_io.h"
-#include "group_gemm_cutlass.cuh"
 
 namespace flashinfer {
 
