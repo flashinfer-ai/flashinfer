@@ -138,6 +138,19 @@ def get_batch_indices_positions(
     positions: torch.Tensor
         The positions of the each entry in the ragged tensor, shape: ``[nnz]``.
 
+    Example
+    -------
+    >>> import torch
+    >>> import flashinfer
+    >>> nnz_kv = 10
+    >>> append_indptr = torch.tensor([0, 1, 3, 6, 10], dtype=torch.int32, device="cuda:0")
+    >>> seq_lens = torch.tensor([5, 5, 5, 5])
+    >>> batch_indices, positions = flashinfer.get_batch_indices_positions(append_indptr, seq_lens, nnz_kv)
+    >>> batch_indices
+    tensor([0, 1, 1, 2, 2, 2, 3, 3, 3, 3], device='cuda:0', dtype=torch.int32)
+    >>> positions  # the rightmost column index of each row
+    tensor([4, 3, 4, 2, 3, 4, 1, 2, 3, 4], device='cuda:0', dtype=torch.int32)
+
     Notes
     -----
     This function is similar to `CSR2COO <https://docs.nvidia.com/cuda/cusparse/#csr2coo>`_
@@ -256,11 +269,28 @@ def append_paged_kv_cache(
     >>> # 25 = (2 - 1) * 16 + 9
     >>> # 22 = (2 - 1) * 16 + 6
     >>> kv_last_page_len = torch.tensor([13, 8, 9, 6], dtype=torch.int32, device="cuda:0")
-    >>>
+    >>> batch_indices, positions = flashinfer.get_batch_indices_positions(
+    ...     kv_append_indptr, flashinfer.get_seq_lens(kv_page_indptr, kv_last_page_len, page_size), nnz_kv
+    ... )
+    >>> batch_indices
+    tensor([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1,
+            1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+            2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+            3, 3, 3, 3], device='cuda:0', dtype=torch.int32)
+    >>> positions
+    tensor([ 0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16, 17,
+            18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+            36, 37, 38, 39, 40, 41, 42, 43, 44,  0,  1,  2,  3,  4,  5,  6,  7,  0,
+            1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+            19, 20, 21, 22, 23, 24,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11,
+            12, 13, 14, 15, 16, 17, 18, 19, 20, 21], device='cuda:0',
+        dtype=torch.int32)
     >>> flashinfer.append_paged_kv_cache(
     ...     k_append,
     ...     v_append,
-    ...     kv_append_indptr,
+    ...     batch_indices,
+    ...     positions,
     ...     paged_kv_cache,
     ...     kv_page_indices,
     ...     kv_page_indptr,
