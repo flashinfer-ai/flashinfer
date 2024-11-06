@@ -15,11 +15,11 @@
  */
 #include <torch/extension.h>
 
-torch::Tensor CutlassSegmentGEMMSM90(torch::Tensor float_workspace_buffer,
-                                     torch::Tensor int_workspace_buffer, torch::Tensor seg_indptr,
-                                     torch::Tensor weight_indices, torch::Tensor x,
-                                     torch::Tensor weight, unsigned int batch_size,
-                                     bool weight_column_major);
+
+void CutlassSegmentGEMMSM90(torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer, torch::Tensor seg_indptr,
+                                 torch::Tensor weight_indices, torch::Tensor x,
+                                 torch::Tensor weight, unsigned int batch_size,
+                                 bool weight_column_major);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("cutlass_segment_gemm_sm90", &CutlassSegmentGEMMSM90,
