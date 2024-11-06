@@ -199,7 +199,7 @@ cudaError_t FusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batch_siz
   const uint32_t num_warps = ceil_div(block_size, 32);
   dim3 nblks(batch_size);
   dim3 nthrs(32, num_warps);
-  const uint32_t smem_size = num_warps * sizeof(float);
+  const uint32_t smem_size = (num_warps + d) * sizeof(float);
   void* args[] = {&input, &residual, &weight, &d, &eps};
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
