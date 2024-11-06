@@ -14,9 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
+import triton
+import triton.language as tl
 
 from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
 from .utils import (
@@ -55,7 +57,8 @@ def get_page_module():
 def _append_paged_kv_cache_kernel(
     append_key: torch.Tensor,
     append_value: torch.Tensor,
-    append_indptr: torch.Tensor,
+    batch_indices: torch.Tensor,
+    positions: torch.Tensor,
     paged_k_cache: Optional[torch.Tensor],
     paged_v_cache: Optional[torch.Tensor],
     kv_indices: torch.Tensor,
@@ -66,7 +69,8 @@ def _append_paged_kv_cache_kernel(
     get_page_module().append_paged_kv_cache(
         append_key,
         append_value,
-        append_indptr,
+        batch_indices,
+        positions,
         paged_k_cache,
         paged_v_cache,
         kv_indices,
@@ -80,7 +84,8 @@ def _append_paged_kv_cache_kernel(
 def _fake_append_paged_kv_cache_kernel(
     append_key: torch.Tensor,
     append_value: torch.Tensor,
-    append_indptr: torch.Tensor,
+    batch_indices: torch.Tensor,
+    positions: torch.Tensor,
     paged_k_cache: Optional[torch.Tensor],
     paged_v_cache: Optional[torch.Tensor],
     kv_indices: torch.Tensor,
@@ -91,10 +96,53 @@ def _fake_append_paged_kv_cache_kernel(
     pass
 
 
+@triton.jit
+def get_batch_indices_positions_kernel(
+    append_indptr,
+    seq_lens_ptr,
+    batch_indices_ptr,
+    positions_ptr,
+    num_stages: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+
+    batch_start = tl.load(append_indptr + batch_idx)
+    batch_end = tl.load(append_indptr + batch_idx + 1)
+    seq_len = tl.load(seq_lens_ptr + batch_idx)
+
+    for i in tl.range(batch_start, batch_end, 128, num_stages=num_stages):
+        offsets = tl.arange(0, 128) + i
+        mask = offsets < batch_end
+        tl.store(batch_indices_ptr + offsets, batch_idx, mask)
+        tl.store(positions_ptr + offsets, offsets + seq_len - batch_end, mask)
+
+
+def get_batch_indices_positions(
+    append_indptr: torch.Tensor, seq_lens: torch.Tensor, nnz: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    batch_size = append_indptr.size(0) - 1
+    batch_indices = torch.empty((nnz,), device=append_indptr.device, dtype=torch.int32)
+    positions = torch.empty((nnz,), device=append_indptr.device, dtype=torch.int32)
+    get_batch_indices_positions_kernel[(batch_size,)](
+        append_indptr, seq_lens, batch_indices, positions, num_stages=2
+    )
+    return batch_indices, positions
+
+
+def get_seq_lens(
+    kv_indptr: torch.Tensor, kv_last_page_len: torch.Tensor, page_size: int
+) -> torch.Tensor:
+    return (
+        torch.clamp(kv_indptr[1:] - kv_indptr[:-1] - 1, min=0) * page_size
+        + kv_last_page_len
+    )
+
+
 def append_paged_kv_cache(
     append_key: torch.Tensor,
     append_value: torch.Tensor,
-    append_indptr: torch.Tensor,
+    batch_indices: torch.Tensor,
+    positions: torch.Tensor,
     paged_kv_cache: torch.Tensor,
     kv_indices: torch.Tensor,
     kv_indptr: torch.Tensor,
@@ -111,8 +159,10 @@ def append_paged_kv_cache(
     append_value : torch.Tensor
         The value tensor to append in ragged tensor format, shape:
         ``[append_indptr[-1], num_kv_heads, head_dim]``.
-    append_indptr : torch.Tensor
-        The indptr tensor of the key-value pairs to append, shape: ``[batch_size + 1]``.
+    batch_indices : torch.Tensor
+        The batch indices of the each entry in the appended key-value pairs, shape: ``[append_indptr[-1]]``.
+    positions : torch.Tensor
+        The positions of the each entry in the appended key-value pairs, shape: ``[append_indptr[-1]]``.
     paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         The paged KV-Cache stored as a tuple of tensors or a single tensor:
 
@@ -189,7 +239,8 @@ def append_paged_kv_cache(
     _append_paged_kv_cache_kernel(
         append_key,
         append_value,
-        append_indptr,
+        batch_indices,
+        positions,
         *_unpack_paged_kv_cache(paged_kv_cache, kv_layout),
         kv_indices,
         kv_indptr,
