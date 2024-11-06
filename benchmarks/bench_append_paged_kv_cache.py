@@ -1,6 +1,6 @@
 import argparse
 import dataclasses
-from typing import cast
+from typing import Tuple, cast
 
 import torch
 from triton.testing import do_bench
@@ -99,14 +99,19 @@ def main():
                 dtype=torch.int32,
             )
 
-            batch_indices, positions = flashinfer.get_batch_indices_positions(
-                x_indptr,
-                flashinfer.get_seq_lens(kv_indptr, kv_last_page_len, page_len),
-                k.shape[0],
-            )
+            @torch.cuda.nvtx.range(f"convert model={model_name}, seqlens={seqlens}")
+            def fn_convert() -> Tuple[torch.Tensor, torch.Tensor]:
+                return flashinfer.get_batch_indices_positions(
+                    x_indptr,
+                    flashinfer.get_seq_lens(kv_indptr, kv_last_page_len, page_len),
+                    k.shape[0],
+                )
 
-            @torch.cuda.nvtx.range(f"model={model_name}, seqlens={seqlens}")
-            def fn():
+            batch_indices, positions = fn_convert()
+            convert_latency_ms = cast(float, do_bench(fn_convert))
+
+            @torch.cuda.nvtx.range(f"append model={model_name}, seqlens={seqlens}")
+            def fn() -> None:
                 flashinfer.append_paged_kv_cache(
                     k,
                     v,
@@ -120,7 +125,7 @@ def main():
                 )
 
             latency_ms = cast(float, do_bench(fn))
-            all_layers_latency_ms = latency_ms * model.num_layers
+            all_layers_latency_ms = convert_latency_ms + latency_ms * model.num_layers
             throughput = (
                 k.numel()
                 * k.element_size()
@@ -131,8 +136,9 @@ def main():
             print(
                 f"model: {model_name:8}",
                 f"seqlens: {seqlens!r:{seqlen_strlen}}",
-                f"single_layer: {latency_ms:5.3f}ms",
-                f"all_layers: {all_layers_latency_ms:7.3f}ms",
+                f"convert: {convert_latency_ms*1e3:2.0f}us",
+                f"1layer: {latency_ms*1e3:2.0f}us",
+                f"{model.num_layers}layers: {all_layers_latency_ms*1e3:3.0f}us",
                 f"throughput: {throughput*1e-9:8.3f}GB/s",
             )
         print("---")
