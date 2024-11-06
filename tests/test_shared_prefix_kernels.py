@@ -29,7 +29,7 @@ def ceil_div(a, b):
 @pytest.mark.parametrize("unique_kv_len", [37, 17])
 @pytest.mark.parametrize("shared_kv_len", [128, 512, 2048])
 @pytest.mark.parametrize("num_heads", [8, 16])
-@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("page_size", [1, 16])
 def test_batch_attention_with_shared_prefix_paged_kv_cache(

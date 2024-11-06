@@ -281,6 +281,10 @@ class MultiLevelCascadeAttentionWrapper:
     ...
     >>> outputs[0].shape
     torch.Size([7, 64, 128])
+
+    See Also
+    --------
+    BatchPrefillWithPagedKVCacheWrapper
     """
 
     def __init__(
@@ -306,6 +310,22 @@ class MultiLevelCascadeAttentionWrapper:
             buffer should be the same as the device of the input tensors.
         kv_layout : str
             The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
+        use_cuda_graph : bool
+            Whether to use CUDA graph to capture the kernels, if enabled, the auxiliary data structures
+            will be stored in provided buffers.
+        qo_indptr_buf_arr : Optional[List[torch.Tensor]]
+            An array of qo indptr buffers for each level, the array length should be equal to
+            the number of levels.
+            The last element of each tensor should be the total number of queries/outputs.
+        paged_kv_indptr_buf_arr : Optional[List[torch.Tensor]]
+            An array of paged kv-cache indptr buffers for each level, the array length should be
+            equal to the number of levels.
+        paged_kv_indices_buf_arr : Optional[List[torch.Tensor]]
+            An array of paged kv-cache indices buffers for each level, the array length should be
+            equal to the number of levels.
+        paged_kv_last_page_len_buf_arr : Optional[List[torch.Tensor]]
+            An array of paged kv-cache last page length buffers for each level, the array length
+            should be equal to the number of levels.
         """
         self._use_cuda_graph = use_cuda_graph
         if use_cuda_graph:
@@ -319,18 +339,16 @@ class MultiLevelCascadeAttentionWrapper:
                     paged_kv_indices_buf=paged_kv_indices_buf,
                     paged_kv_last_page_len_buf=paged_kv_last_page_len_buf,
                 )
-                for _, (
+                for (
                     qo_indptr_buf,
                     paged_kv_indptr_buf,
                     paged_kv_indices_buf,
                     paged_kv_last_page_len_buf,
-                ) in enumerate(
-                    zip(
-                        qo_indptr_buf_arr,
-                        paged_kv_indptr_buf_arr,
-                        paged_kv_indices_buf_arr,
-                        paged_kv_last_page_len_buf_arr,
-                    )
+                ) in zip(
+                    qo_indptr_buf_arr,
+                    paged_kv_indptr_buf_arr,
+                    paged_kv_indices_buf_arr,
+                    paged_kv_last_page_len_buf_arr,
                 )
             ]
         else:
@@ -951,7 +969,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
         k_shared: torch.Tensor,
         v_shared: torch.Tensor,
         unique_kv_cache: torch.Tensor,
-        causal: bool = True,
+        causal: bool = False,
         allow_fp16_qk_reduction: bool = False,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
