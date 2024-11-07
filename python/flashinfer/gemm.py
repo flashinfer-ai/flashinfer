@@ -134,40 +134,45 @@ def get_gemm_sm90_module():
 
         # torch library for cutlass_segment_gemm_sm90
 
-        @register_custom_op("flashinfer::cutlass_segment_gemm_sm90", mutates_args=())
+        @register_custom_op("flashinfer::cutlass_segment_gemm_sm90", mutates_args=("y"))
         def cutlass_segment_gemm_sm90(
             workspace_buffer: torch.Tensor,
             int_workspace_buffer: torch.Tensor,
-            seg_indptr: torch.Tensor,
-            weight_indices: torch.Tensor,
-            x: torch.Tensor,
-            weights: torch.Tensor,
-            batch_size: int,
-            weight_column_major: bool,
+            all_problems: torch.Tensor,
+            x_data: torch.Tensor,
+            w_data: torch.Tensor,
+            y_data: torch.Tensor,
+            x_stride: torch.Tensor,
+            w_stride: torch.Tensor,
+            y_stride: torch.Tensor,
+            y: torch.Tensor,
         ) -> torch.Tensor:
             return module.cutlass_segment_gemm_sm90(
                 workspace_buffer,
                 int_workspace_buffer,
-                seg_indptr,
-                weight_indices,
-                x,
-                weights,
-                batch_size,
-                weight_column_major,
+                all_problems,
+                x_data,
+                w_data,
+                y_data,
+                x_stride,
+                w_stride,
+                y_stride,
             )
 
         @register_fake_op("flashinfer::cutlass_segment_gemm_sm90")
         def _fake_cutlass_segment_gemm_sm90(
             workspace_buffer: torch.Tensor,
             int_workspace_buffer: torch.Tensor,
-            seg_indptr: torch.Tensor,
-            weight_indices: torch.Tensor,
-            x: torch.Tensor,
-            weights: torch.Tensor,
-            batch_size: int,
-            weight_column_major: bool,
+            all_problems: torch.Tensor,
+            x_data: torch.Tensor,
+            w_data: torch.Tensor,
+            y_data: torch.Tensor,
+            x_stride: torch.Tensor,
+            w_stride: torch.Tensor,
+            y_stride: torch.Tensor,
+            y: torch.Tensor,
         ) -> torch.Tensor:
-            return torch.empty_like(x)
+            pass
 
         # Register the module
         _gemm_module_sm90 = SimpleNamespace(
@@ -578,6 +583,7 @@ class SegmentGEMMWrapper:
                 x_stride_data,
                 w_stride_data,
                 y_stride_data,
+                y,  # for torch compile mutates_args
             )
             return y
         else:

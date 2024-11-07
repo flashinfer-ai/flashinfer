@@ -16,6 +16,12 @@
 #ifndef FLASHINFER_GEMM_GROUP_GEMM_SM90_CUH_
 #define FLASHINFER_GEMM_GROUP_GEMM_SM90_CUH_
 
+// clang-format off
+// NOTE: This header needs to be included before cutlass headers.
+// See: https://github.com/NVIDIA/cutlass/issues/1827
+#include "group_gemm_cutlass.cuh"
+// clang-format on
+
 #include <sstream>
 
 #include "../allocator.h"
@@ -39,7 +45,6 @@
 #include "cutlass/util/reference/device/tensor_compare.h"
 #include "cutlass/util/reference/device/tensor_fill.h"
 #include "cutlass/util/tensor_view_io.h"
-#include "group_gemm_cutlass.cuh"
 
 namespace flashinfer {
 
@@ -81,12 +86,6 @@ cudaError_t CutlassSegmentGEMMSM90DirectRun(void* float_buffer, size_t float_buf
               << std::endl;
     return cudaErrorNotSupported;
   }
-
-  printf("Direct Run\n");
-  printf("THE x: %p", x);
-  auto x_1 = static_cast<DTypeIn**>(x);
-  printf("THE x_1_ptr: %p", *x_1);
-  printf("THE x_1_v: %f", **x_1);
 
   using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
   using ElementA = DTypeIn;
