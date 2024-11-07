@@ -18,13 +18,10 @@
 
 #include <sstream>
 
-#include "group_gemm_cutlass.cuh"
-
 #include "../allocator.h"
 #include "../utils.cuh"
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
-#include "cutlass/tensor_ref.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/epilogue/thread/linear_combination.h"
@@ -76,8 +73,8 @@ template <typename DTypeIn, typename DTypeOut>
 cudaError_t CutlassSegmentGEMMSM90DirectRun(void* float_buffer, size_t float_buffer_size_in_bytes,
                                             void* int_buffer, size_t int_buffer_size_in_bytes,
                                             void* all_problems, unsigned int batch_size, void* x,
-                                            void* w, void* y, void* x_stride,
-                                            void* w_stride, void* y_stride) {
+                                            void* w, void* y, void* x_stride, void* w_stride,
+                                            void* y_stride) {
   auto compute_capacity = GetCudaComputeCapability();
   if (compute_capacity.first < 9) {
     std::cerr << "CutlassSegmentGEMMSM90DirectRun requires compute capability of at least 9.0"
@@ -96,7 +93,8 @@ cudaError_t CutlassSegmentGEMMSM90DirectRun(void* float_buffer, size_t float_buf
   using ElementB = DTypeIn;
   using ElementC = DTypeOut;
 
-  if constexpr (std::is_same_v<cutlass::layout::RowMajor, cutlass::layout::RowMajor> && sizeof(DTypeIn) == 1) {
+  if constexpr (std::is_same_v<cutlass::layout::RowMajor, cutlass::layout::RowMajor> &&
+                sizeof(DTypeIn) == 1) {
     std::ostringstream err_msg;
     err_msg << "Row-major layout is not supported for fp8 data type";
     throw std::runtime_error(err_msg.str());
@@ -104,7 +102,7 @@ cudaError_t CutlassSegmentGEMMSM90DirectRun(void* float_buffer, size_t float_buf
     using LayoutA = cutlass::layout::RowMajor;
     constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
 
-    using LayoutB = cutlass::layout::ColumnMajor; // TODO: check this
+    using LayoutB = cutlass::layout::ColumnMajor;  // TODO: check this
     constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
 
     using LayoutC = cutlass::layout::RowMajor;

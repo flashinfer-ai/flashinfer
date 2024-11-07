@@ -20,10 +20,10 @@
 using namespace flashinfer::group_gemm;
 
 void CutlassSegmentGEMMSM90(torch::Tensor float_workspace_buffer,
-                                     torch::Tensor int_workspace_buffer, torch::Tensor all_problems,
-                                     torch::Tensor x_ptr, torch::Tensor w_ptr, torch::Tensor y_ptr,
-                                     torch::Tensor x_stride, torch::Tensor weight_stride,
-                                     torch::Tensor y_stride) {
+                            torch::Tensor int_workspace_buffer, torch::Tensor all_problems,
+                            torch::Tensor x_ptr, torch::Tensor w_ptr, torch::Tensor y_ptr,
+                            torch::Tensor x_stride, torch::Tensor weight_stride,
+                            torch::Tensor y_stride) {
   using cutlass_t = typename cutlass_dtype<nv_half>::type;
   unsigned int batch_size = x_ptr.size(0);
 
@@ -31,10 +31,9 @@ void CutlassSegmentGEMMSM90(torch::Tensor float_workspace_buffer,
       float_workspace_buffer.data_ptr(),
       float_workspace_buffer.element_size() * float_workspace_buffer.size(0),
       int_workspace_buffer.data_ptr(),
-      int_workspace_buffer.element_size() * int_workspace_buffer.size(0),
-      all_problems.data_ptr(), batch_size,
-      x_ptr.data_ptr(), w_ptr.data_ptr(), y_ptr.data_ptr(),
-      x_stride.data_ptr(), weight_stride.data_ptr(), y_stride.data_ptr());
+      int_workspace_buffer.element_size() * int_workspace_buffer.size(0), all_problems.data_ptr(),
+      batch_size, x_ptr.data_ptr(), w_ptr.data_ptr(), y_ptr.data_ptr(), x_stride.data_ptr(),
+      weight_stride.data_ptr(), y_stride.data_ptr());
   TORCH_CHECK(status == cudaSuccess,
               "Failed to run CutlassSegmentGEMM: ", cudaGetErrorString(status));
 

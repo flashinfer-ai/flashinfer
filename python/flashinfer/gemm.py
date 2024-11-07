@@ -21,7 +21,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
 from .utils import (
     get_compute_capability,
@@ -561,7 +560,13 @@ class SegmentGEMMWrapper:
                 w_stride_data,
                 y_stride_data,
             ) = launch_compute_sm90_group_gemm_args(
-                x, weights, y, weight_column_major, batch_size, seg_indptr, weight_indices
+                x,
+                weights,
+                y,
+                weight_column_major,
+                batch_size,
+                seg_indptr,
+                weight_indices,
             )
             get_gemm_sm90_module().cutlass_segment_gemm_sm90(
                 self._float_workspace_buffer,
