@@ -157,14 +157,14 @@ __device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope_cos_sin_i
   return vec;
 }
 
-template <bool interleave, uint32_t head_dim, uint32_t vec_size, uint32_t bdx, typename DType,
-          typename IdType>
+template <bool interleave, bool partial, uint32_t head_dim, uint32_t vec_size, uint32_t bdx,
+          typename DType, typename IdType>
 __global__ void BatchQKApplyRotaryPosIdsCosSinCacheKernel(
     DType* q, DType* k, DType* q_rope, DType* k_rope, float* __restrict__ cos_cache,
     float* __restrict__ sin_cache, IdType* __restrict__ pos_ids, uint32_t nnz,
-    uint32_t num_qo_heads, uint32_t num_kv_heads, size_t q_stride_n, size_t q_stride_h,
-    size_t k_stride_n, size_t k_stride_h, size_t q_rope_stride_n, size_t q_rope_stride_h,
-    size_t k_rope_stride_n, size_t k_rope_stride_h) {
+    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t rope_dim, size_t q_stride_n,
+    size_t q_stride_h, size_t k_stride_n, size_t k_stride_h, size_t q_rope_stride_n,
+    size_t q_rope_stride_h, size_t k_rope_stride_n, size_t k_rope_stride_h) {
   uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
   const uint32_t bdy = blockDim.y;
 
@@ -506,16 +506,15 @@ cudaError_t BatchQKApplyRotary(DType* q, DType* k, DType* q_rope, DType* k_rope,
 template <typename DType, typename IdType>
 cudaError_t BatchQKApplyRotaryInPlace(DType* __restrict__ q, DType* __restrict__ k,
                                       IdType* __restrict__ indptr, IdType* __restrict__ offsets,
-                                      uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads, 
-                                      uint32_t head_dim, size_t q_stride_n, size_t q_stride_h, 
-                                      size_t k_stride_n, size_t k_stride_h,
+                                      uint32_t batch_size, uint32_t num_qo_heads,
+                                      uint32_t num_kv_heads, uint32_t head_dim, size_t q_stride_n,
+                                      size_t q_stride_h, size_t k_stride_n, size_t k_stride_h,
                                       bool interleave, float rope_scale, float rope_theta,
                                       cudaStream_t stream = nullptr) {
-  return BatchQKApplyRotary<DType, IdType>(q, k, q, k, indptr, offsets, batch_size, num_qo_heads, num_kv_heads,
-                            head_dim, q_stride_n, q_stride_h, k_stride_n, k_stride_h,
-                            q_stride_n, q_stride_h, k_stride_n, k_stride_h, 
-                            interleave, rope_scale, rope_theta, stream);
-
+  return BatchQKApplyRotary<DType, IdType>(
+      q, k, q, k, indptr, offsets, batch_size, num_qo_heads, num_kv_heads, head_dim, q_stride_n,
+      q_stride_h, k_stride_n, k_stride_h, q_stride_n, q_stride_h, k_stride_n, k_stride_h,
+      interleave, rope_scale, rope_theta, stream);
 }
 
 template <typename DType, typename IdType>
