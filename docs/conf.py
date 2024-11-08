@@ -12,7 +12,7 @@ import sys
 
 sys.path.insert(0, os.path.abspath("../python"))
 os.environ["BUILD_DOC"] = "1"
-autodoc_mock_imports = ["torch"]
+autodoc_mock_imports = ["torch", "triton"]
 
 project = "FlashInfer"
 author = "FlashInfer Contributors"
