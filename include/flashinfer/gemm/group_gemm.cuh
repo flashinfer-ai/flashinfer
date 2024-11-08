@@ -19,7 +19,7 @@
 #include <sstream>
 
 #include "../allocator.h"
-#include "group_gemm_cutlass.cuh"
+#include "../cutlass_utils.cuh"
 
 namespace flashinfer {
 

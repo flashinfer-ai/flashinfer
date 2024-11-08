@@ -28,7 +28,7 @@ void CutlassSegmentGEMM(torch::Tensor workspace_buffer, torch::Tensor all_proble
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(empty_x_data.scalar_type(), c_type, [&] {
-    using cutlass_t = typename cutlass_dtype<c_type>::type;
+    using cutlass_t = typename cutlass_dtype<c_type>::value;
     auto status = CutlassSegmentGEMMRun<cutlass_t>(
         workspace_buffer.data_ptr(), workspace_buffer.element_size() * workspace_buffer.size(0),
         all_problems.data_ptr(), batch_size, x_ptr.data_ptr(), w_ptr.data_ptr(), y_ptr.data_ptr(),
