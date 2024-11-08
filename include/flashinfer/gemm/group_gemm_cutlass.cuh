@@ -20,43 +20,9 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
-#include "cutlass/cutlass.h"
-#include "cutlass/gemm/device/gemm_grouped.h"
-#include "cutlass/gemm/kernel/default_gemm_grouped.h"
-#include "cutlass/layout/matrix.h"
-#include "cutlass/numeric_types.h"
-#include "cutlass/util/packed_stride.hpp"
-
 namespace flashinfer {
 
-namespace group_gemm {
-
-template <typename T>
-struct cutlass_dtype {
-  using type = T;
-};
-
-template <>
-struct cutlass_dtype<half> {
-  using type = cutlass::half_t;
-};
-
-template <>
-struct cutlass_dtype<nv_bfloat16> {
-  using type = cutlass::bfloat16_t;
-};
-
-template <>
-struct cutlass_dtype<__nv_fp8_e4m3> {
-  using type = cutlass::float_e4m3_t;
-};
-
-template <>
-struct cutlass_dtype<__nv_fp8_e5m2> {
-  using type = cutlass::float_e5m2_t;
-};
-
-}  // namespace group_gemm
+namespace group_gemm {}  // namespace group_gemm
 
 }  // namespace flashinfer
 

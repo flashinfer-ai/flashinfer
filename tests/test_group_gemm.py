@@ -99,7 +99,7 @@ def test_segment_gemm(
 
 
 if __name__ == "__main__":
-    test_segment_gemm(199, 99, 128, 1024, False, False)
-    test_segment_gemm(199, 99, 128, 1024, False, True)
-    test_segment_gemm(199, 99, 128, 1024, True, False)
-    test_segment_gemm(199, 99, 128, 1024, True, True)
+    test_segment_gemm(199, 17, 128, 1024, False, False, torch.float16, "cuda:0")
+    test_segment_gemm(199, 17, 128, 1024, False, True, torch.float16, "cuda:0")
+    test_segment_gemm(199, 17, 128, 1024, True, False, torch.float16, "cuda:0")
+    test_segment_gemm(199, 17, 128, 1024, True, True, torch.float16, "cuda:0")
