@@ -36,33 +36,9 @@ namespace group_gemm {
 
 template <typename DType>
 cudaError_t CutlassSegmentGEMMRun(void* workspace_buffer, size_t workspace_buffer_size_in_bytes,
-                                  DType* x, DType* w, DType* y, int64_t* xy_indptr_d,
-                                  int64_t* w_indices_d, unsigned int batch_size, unsigned int d_in,
-                                  unsigned int d_out, bool weight_column_major,
-                                  cudaStream_t stream) {
-  AlignedAllocator allocator(workspace_buffer, workspace_buffer_size_in_bytes);
-  cutlass::gemm::GemmCoord* problem_sizes_device =
-      allocator.aligned_alloc<cutlass::gemm::GemmCoord>(
-          batch_size * sizeof(cutlass::gemm::GemmCoord), 16, "problem_sizes_device");
-  DType** x_data = allocator.aligned_alloc<DType*>(batch_size * sizeof(DType*), 16, "x_data");
-  DType** w_data = allocator.aligned_alloc<DType*>(batch_size * sizeof(DType*), 16, "w_data");
-  DType** y_data = allocator.aligned_alloc<DType*>(batch_size * sizeof(DType*), 16, "y_data");
-  int64_t* ld_x = allocator.aligned_alloc<int64_t>(batch_size * sizeof(int64_t), 16, "ld_x");
-  int64_t* ld_w = allocator.aligned_alloc<int64_t>(batch_size * sizeof(int64_t), 16, "ld_w");
-  int64_t* ld_y = allocator.aligned_alloc<int64_t>(batch_size * sizeof(int64_t), 16, "ld_y");
-
-  // NOTE(Zihao): I didn't successfully launch the kernel with cudaLaunchKernel API,
-  // so I just use the kernel function directly, need to investigate more.
-  auto compute_args_kernel = compute_sm80_cutlass_group_gemm_args<DType, DType>;
-  compute_args_kernel<<<batch_size, 1, 0, stream>>>(
-      problem_sizes_device, x_data, w_data, y_data, ld_x, ld_w, ld_y, (DType*)x, (DType*)w,
-      (DType*)y, xy_indptr_d, w_indices_d, d_in, d_out, weight_column_major);
-  cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    std::cerr << "Failed to launch kernel: " << cudaGetErrorString(err) << std::endl;
-    return err;
-  }
-
+                                  void* all_problems, unsigned int batch_size, void* x, void* w,
+                                  void* y, void* x_ld, void* w_ld, void* y_ld,
+                                  bool weight_column_major, cudaStream_t stream) {
   using cutlass::epilogue::thread::LinearCombination;
   using cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle;
   DISPATCH_WEIGHT_LAYOUT(weight_column_major, WEIGHT_LAYOUT, {
@@ -91,8 +67,12 @@ cudaError_t CutlassSegmentGEMMRun(void* workspace_buffer, size_t workspace_buffe
     using EpilogueOutputOp = typename GemmKernel::Epilogue::OutputOp;
     typename EpilogueOutputOp::Params epilogue_op(1.0, 1.0);
     using GemmGrouped = cutlass::gemm::device::GemmGrouped<GemmKernel>;
-    typename GemmGrouped::Arguments args(problem_sizes_device, batch_size, 4, epilogue_op, x_data,
-                                         w_data, y_data, y_data, ld_x, ld_w, ld_y, ld_y);
+    typename GemmGrouped::Arguments args(
+        reinterpret_cast<cutlass::gemm::GemmCoord*>(all_problems), (int)batch_size,
+        /*threadblock_count=*/4, epilogue_op, static_cast<DType**>(x), static_cast<DType**>(w),
+        static_cast<DType**>(y), static_cast<DType**>(y), reinterpret_cast<int64_t*>(x_ld),
+        reinterpret_cast<int64_t*>(w_ld), reinterpret_cast<int64_t*>(y_ld),
+        reinterpret_cast<int64_t*>(y_ld));
 
     GemmGrouped gemm;
     auto status = gemm.initialize(args, nullptr, stream);

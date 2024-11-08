@@ -18,6 +18,8 @@ from types import SimpleNamespace
 from typing import Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
 from .utils import (
@@ -72,37 +74,48 @@ def get_gemm_module():
 
         # torch library for cutlass_segment_gemm
 
-        @register_custom_op("flashinfer::cutlass_segment_gemm", mutates_args=())
+        @register_custom_op("flashinfer::cutlass_segment_gemm", mutates_args=("y"))
         def cutlass_segment_gemm(
             workspace_buffer: torch.Tensor,
-            seg_indptr: torch.Tensor,
-            weight_indices: torch.Tensor,
-            x: torch.Tensor,
-            weights: torch.Tensor,
-            batch_size: int,
+            all_problems: torch.Tensor,
+            x_data: torch.Tensor,
+            w_data: torch.Tensor,
+            y_data: torch.Tensor,
+            x_ld: torch.Tensor,
+            w_ld: torch.Tensor,
+            y_ld: torch.Tensor,
+            y: torch.Tensor,
+            empty_x_data: torch.Tensor,
             weight_column_major: bool,
-        ) -> torch.Tensor:
-            return module.cutlass_segment_gemm(
+        ) -> None:
+            module.cutlass_segment_gemm(
                 workspace_buffer,
-                seg_indptr,
-                weight_indices,
-                x,
-                weights,
-                batch_size,
+                all_problems,
+                x_data,
+                w_data,
+                y_data,
+                x_ld,
+                w_ld,
+                y_ld,
+                empty_x_data,
                 weight_column_major,
             )
 
         @register_fake_op("flashinfer::cutlass_segment_gemm")
         def _fake_cutlass_segment_gemm(
             workspace_buffer: torch.Tensor,
-            seg_indptr: torch.Tensor,
-            weight_indices: torch.Tensor,
-            x: torch.Tensor,
-            weights: torch.Tensor,
-            batch_size: int,
+            all_problems: torch.Tensor,
+            x_data: torch.Tensor,
+            w_data: torch.Tensor,
+            y_data: torch.Tensor,
+            x_ld: torch.Tensor,
+            w_ld: torch.Tensor,
+            y_ld: torch.Tensor,
+            y: torch.Tensor,
+            empty_x_data: torch.Tensor,
             weight_column_major: bool,
-        ) -> torch.Tensor:
-            return torch.empty_like(x)
+        ) -> None:
+            pass
 
         # Register the module
         _gemm_module = SimpleNamespace(
@@ -114,7 +127,6 @@ def get_gemm_module():
 
 
 def get_gemm_sm90_module():
-    print("get_gemm_sm90_module")
     global _gemm_module_sm90
     if _gemm_module_sm90 is None:
         if has_prebuilt_ops:
@@ -133,25 +145,32 @@ def get_gemm_sm90_module():
 
         # torch library for cutlass_segment_gemm_sm90
 
-        @register_custom_op("flashinfer::cutlass_segment_gemm_sm90", mutates_args=())
+        @register_custom_op("flashinfer::cutlass_segment_gemm_sm90", mutates_args=("y"))
         def cutlass_segment_gemm_sm90(
             workspace_buffer: torch.Tensor,
             int_workspace_buffer: torch.Tensor,
-            seg_indptr: torch.Tensor,
-            weight_indices: torch.Tensor,
-            x: torch.Tensor,
-            weights: torch.Tensor,
-            batch_size: int,
+            all_problems: torch.Tensor,
+            x_data: torch.Tensor,
+            w_data: torch.Tensor,
+            y_data: torch.Tensor,
+            x_stride: torch.Tensor,
+            w_stride: torch.Tensor,
+            y_stride: torch.Tensor,
+            y: torch.Tensor,
+            empty_x_data: torch.Tensor,
             weight_column_major: bool,
-        ) -> torch.Tensor:
-            return module.cutlass_segment_gemm_sm90(
+        ) -> None:
+            module.cutlass_segment_gemm_sm90(
                 workspace_buffer,
                 int_workspace_buffer,
-                seg_indptr,
-                weight_indices,
-                x,
-                weights,
-                batch_size,
+                all_problems,
+                x_data,
+                w_data,
+                y_data,
+                x_stride,
+                w_stride,
+                y_stride,
+                empty_x_data,
                 weight_column_major,
             )
 
@@ -159,14 +178,18 @@ def get_gemm_sm90_module():
         def _fake_cutlass_segment_gemm_sm90(
             workspace_buffer: torch.Tensor,
             int_workspace_buffer: torch.Tensor,
-            seg_indptr: torch.Tensor,
-            weight_indices: torch.Tensor,
-            x: torch.Tensor,
-            weights: torch.Tensor,
-            batch_size: int,
+            all_problems: torch.Tensor,
+            x_data: torch.Tensor,
+            w_data: torch.Tensor,
+            y_data: torch.Tensor,
+            x_stride: torch.Tensor,
+            w_stride: torch.Tensor,
+            y_stride: torch.Tensor,
+            y: torch.Tensor,
+            empty_x_data: torch.Tensor,
             weight_column_major: bool,
-        ) -> torch.Tensor:
-            return torch.empty_like(x)
+        ) -> None:
+            pass
 
         # Register the module
         _gemm_module_sm90 = SimpleNamespace(
@@ -174,6 +197,212 @@ def get_gemm_sm90_module():
         )
 
     return _gemm_module_sm90
+
+
+@triton.jit
+def compute_sm80_group_gemm_args(
+    all_problems_ptr,
+    x_ptr,
+    w_ptr,
+    y_ptr,
+    x_ld_ptr,
+    w_ld_ptr,
+    y_ld_ptr,
+    x,
+    w,
+    y,
+    xy_indptr,
+    w_indices,
+    d_in,
+    d_out,
+    w_column_major,
+):
+
+    pid = tl.program_id(0)
+
+    m = tl.load(xy_indptr + pid + 1) - tl.load(xy_indptr + pid)
+    k, n = d_in, d_out
+
+    tl.store(all_problems_ptr + pid * 3, m)
+    tl.store(all_problems_ptr + pid * 3 + 1, n)
+    tl.store(all_problems_ptr + pid * 3 + 2, k)
+
+    w_i = tl.load(w_indices + pid) if w_indices else tl.cast(pid, tl.int64)
+    w_curr_ptr = w + w_i * k * n
+    tl.store(w_ptr + pid, w_curr_ptr)
+
+    x_curr_ptr = x + tl.load(xy_indptr + pid) * k
+    tl.store(x_ptr + pid, x_curr_ptr)
+
+    y_curr_ptr = y + tl.load(xy_indptr + pid) * n
+    tl.store(y_ptr + pid, y_curr_ptr)
+
+    tl.store(x_ld_ptr + pid, k)
+    tl.store(w_ld_ptr + pid, k if w_column_major else n)
+    tl.store(y_ld_ptr + pid, n)
+
+
+@triton.jit
+def compute_sm90_group_gemm_args(
+    all_problems_ptr,
+    x_ptr,
+    w_ptr,
+    y_ptr,
+    x_stride_ptr,
+    w_stride_ptr,
+    y_stride_ptr,
+    x,
+    w,
+    y,
+    xy_indptr,
+    w_indices,
+    d_in,
+    d_out,
+    w_column_major,
+):
+
+    pid = tl.program_id(0)
+
+    m = tl.load(xy_indptr + pid + 1) - tl.load(xy_indptr + pid)
+    k, n = d_in, d_out
+
+    tl.store(all_problems_ptr + pid * 3, m)
+    tl.store(all_problems_ptr + pid * 3 + 1, n)
+    tl.store(all_problems_ptr + pid * 3 + 2, k)
+
+    w_i = tl.load(w_indices + pid) if w_indices else tl.cast(pid, tl.int64)
+    w_curr_ptr = w + w_i * k * n
+    tl.store(w_ptr + pid, w_curr_ptr)
+
+    x_curr_ptr = x + tl.load(xy_indptr + pid) * k
+    tl.store(x_ptr + pid, x_curr_ptr)
+
+    y_curr_ptr = y + tl.load(xy_indptr + pid) * n
+    tl.store(y_ptr + pid, y_curr_ptr)
+
+    tl.store(x_stride_ptr + pid, k)
+    tl.store(w_stride_ptr + pid, k if w_column_major else n)
+    tl.store(y_stride_ptr + pid, n)
+
+
+def launch_compute_sm80_group_gemm_args(
+    x: torch.Tensor,
+    weights: torch.Tensor,
+    y: torch.Tensor,
+    w_column_major: bool,
+    batch_size: int,
+    seg_indptr: torch.Tensor,
+    weight_indices: Optional[torch.Tensor] = None,
+):
+    device = x.device
+    prob_type = torch.int32  # problem sizes -> int
+    ptr_type = torch.int64  # pointers -> int64_t
+    ld_type = torch.int64  # strides -> int64_t
+
+    seg_indptr = seg_indptr.to(ptr_type)
+    if weight_indices is not None:
+        weight_indices = weight_indices.to(ptr_type)
+
+    d_out = weights.size(1) if w_column_major else weights.size(2)
+    d_in = weights.size(2) if w_column_major else weights.size(1)
+
+    all_problems = torch.empty((batch_size, 3), dtype=prob_type, device=device)
+
+    x_data = torch.empty(batch_size, dtype=ptr_type, device=device)
+    w_data = torch.empty(batch_size, dtype=ptr_type, device=device)
+    y_data = torch.empty(batch_size, dtype=ptr_type, device=device)
+
+    x_stride_data = torch.empty(batch_size, dtype=ld_type, device=device)
+    w_stride_data = torch.empty(batch_size, dtype=ld_type, device=device)
+    y_stride_data = torch.empty(batch_size, dtype=ld_type, device=device)
+
+    compute_sm80_group_gemm_args[(batch_size,)](
+        all_problems,
+        x_data,
+        w_data,
+        y_data,
+        x_stride_data,
+        w_stride_data,
+        y_stride_data,
+        x,
+        weights,
+        y,
+        seg_indptr,
+        weight_indices,
+        d_in,
+        d_out,
+        w_column_major,
+    )
+
+    return (
+        all_problems,
+        x_data,
+        w_data,
+        y_data,
+        x_stride_data,
+        w_stride_data,
+        y_stride_data,
+    )
+
+
+def launch_compute_sm90_group_gemm_args(
+    x: torch.Tensor,
+    weights: torch.Tensor,
+    y: torch.Tensor,
+    w_column_major: bool,
+    batch_size: int,
+    seg_indptr: torch.Tensor,
+    weight_indices: Optional[torch.Tensor] = None,
+):
+    device = x.device
+    prob_type = torch.int32  # problem sizes -> int
+    ptr_type = torch.int64  # pointers -> int64_t
+    stride_type = torch.int64  # strides -> int64_t
+
+    seg_indptr = seg_indptr.to(ptr_type)
+    if weight_indices is not None:
+        weight_indices = weight_indices.to(ptr_type)
+
+    d_out = weights.size(1) if w_column_major else weights.size(2)
+    d_in = weights.size(2) if w_column_major else weights.size(1)
+
+    all_problems = torch.empty((batch_size, 3), dtype=prob_type, device=device)
+
+    x_data = torch.empty(batch_size, dtype=ptr_type, device=device)
+    w_data = torch.empty(batch_size, dtype=ptr_type, device=device)
+    y_data = torch.empty(batch_size, dtype=ptr_type, device=device)
+
+    x_stride_data = torch.empty(batch_size, dtype=stride_type, device=device)
+    w_stride_data = torch.empty(batch_size, dtype=stride_type, device=device)
+    y_stride_data = torch.empty(batch_size, dtype=stride_type, device=device)
+
+    compute_sm90_group_gemm_args[(batch_size,)](
+        all_problems,
+        x_data,
+        w_data,
+        y_data,
+        x_stride_data,
+        w_stride_data,
+        y_stride_data,
+        x,
+        weights,
+        y,
+        seg_indptr,
+        weight_indices,
+        d_in,
+        d_out,
+        w_column_major,
+    )
+
+    return (
+        all_problems,
+        x_data,
+        w_data,
+        y_data,
+        x_stride_data,
+        w_stride_data,
+        y_stride_data,
+    )
 
 
 class SegmentGEMMWrapper:
@@ -332,27 +561,75 @@ class SegmentGEMMWrapper:
             # create an empty CPU tensor as placeholder
             weight_indices = torch.empty(0, dtype=torch.int64)
         major, _ = get_compute_capability(x.device)
+        cumulative_batch_size = x.size(0)
+        d_out = weights.size(1) if weight_column_major else weights.size(2)
+        y = torch.zeros((cumulative_batch_size, d_out), dtype=x.dtype, device=x.device)
+        empty_x_data = torch.empty(0, dtype=x.dtype, device=x.device)
+
         if major >= 9:
-            return get_gemm_sm90_module().cutlass_segment_gemm_sm90(
-                self._float_workspace_buffer,
-                self._int_workspace_buffer,
-                seg_indptr,
-                weight_indices,
+            (
+                all_problems,
+                x_data,
+                w_data,
+                y_data,
+                x_stride_data,
+                w_stride_data,
+                y_stride_data,
+            ) = launch_compute_sm90_group_gemm_args(
                 x,
                 weights,
+                y,
+                weight_column_major,
                 batch_size,
+                seg_indptr,
+                weight_indices,
+            )
+            get_gemm_sm90_module().cutlass_segment_gemm_sm90(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                all_problems,
+                x_data,
+                w_data,
+                y_data,
+                x_stride_data,
+                w_stride_data,
+                y_stride_data,
+                y,  # for torch compile mutates_args
+                empty_x_data,  # for kernel type dispatch
                 weight_column_major,
             )
         else:
-            return get_gemm_module().cutlass_segment_gemm(
-                self._int_workspace_buffer,
-                seg_indptr,
-                weight_indices,
+            (
+                all_problems,
+                x_data,
+                w_data,
+                y_data,
+                x_ld_data,
+                w_ld_data,
+                y_ld_data,
+            ) = launch_compute_sm80_group_gemm_args(
                 x,
                 weights,
+                y,
+                weight_column_major,
                 batch_size,
+                seg_indptr,
+                weight_indices,
+            )
+            get_gemm_module().cutlass_segment_gemm(
+                self._int_workspace_buffer,
+                all_problems,
+                x_data,
+                w_data,
+                y_data,
+                x_ld_data,
+                w_ld_data,
+                y_ld_data,
+                y,
+                empty_x_data,
                 weight_column_major,
             )
+        return y
 
     forward = run
 
