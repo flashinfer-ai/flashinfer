@@ -34,7 +34,10 @@ def main():
                 # Run benchmarking
                 latency_ms = cast(float, do_bench(fn))
                 throughput = (
-                    (x.numel() * x.element_size() * 2 + weight.numel() * weight.element_size()) / (latency_ms * 1e-3)
+                    (x.numel() * x.element_size() * 2
+                     + residual.numel() * residual.element_size() * 2
+                     + weight.numel() * weight.element_size())
+                    / (latency_ms * 1e-3)
                 )
                 print(
                     f"batch_size: {batch_size:3},",
