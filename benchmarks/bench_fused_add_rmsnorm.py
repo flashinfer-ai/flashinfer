@@ -11,7 +11,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-sizes", nargs='+', type=int, default=[1, 19, 99, 989])
     parser.add_argument("--hidden-sizes", nargs='+', type=int, default=[111, 500, 1024, 3072, 4096, 8192])
-    parser.add_argument("--dtypes", nargs='+', choices=["float16", "float32"], default=["float16"])
+    parser.add_argument("--dtypes", nargs='+', choices=["float16", "bfloat16"], default=["float16"])
     args = parser.parse_args()
 
     eps = 1e-6
@@ -42,7 +42,7 @@ def main():
                 print(
                     f"batch_size: {batch_size:3},",
                     f"hidden_size: {hidden_size:5},",
-                    f"dtype: {dtype_str:2},",
+                    f"dtype: {dtype_str:8},",
                     f"latency: {latency_ms*1e3:2.0f}us,",
                     f"throughput: {throughput*1e-9:7.3f}GB/s",
                 )
