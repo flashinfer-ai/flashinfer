@@ -133,6 +133,8 @@ __global__ void FusedAddRMSNormKernel(T* __restrict__ input, T* __restrict__ res
     input_vec.fill(0.f);
     vec_t<T, VEC_SIZE> residual_vec;
     residual_vec.fill(0.f);
+    vec_t<float, VEC_SIZE> x_vec;
+    x_vec.fill(0.f);
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       input_vec.load(input + bx * d + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
       residual_vec.load(residual + bx * d + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
@@ -143,10 +145,11 @@ __global__ void FusedAddRMSNormKernel(T* __restrict__ input, T* __restrict__ res
       x += float(residual_vec[j]);
       sum_sq += x * x;
       residual_vec[j] = (T)x;
-      smem[num_warps + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE + j] = x;
+      x_vec[j] = x;
     }
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       residual_vec.store(residual + bx * d + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+      x_vec.store(smem + num_warps + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
     }
   }
 
@@ -174,15 +177,17 @@ __global__ void FusedAddRMSNormKernel(T* __restrict__ input, T* __restrict__ res
   for (uint32_t i = 0; i < rounds; i++) {
     vec_t<T, VEC_SIZE> input_vec;
     vec_t<T, VEC_SIZE> weight_vec;
+    vec_t<float, VEC_SIZE> x_vec;
     input_vec.fill(0.f);
     weight_vec.fill(0.f);
+    x_vec.fill(0.f);
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+      x_vec.load(smem + num_warps + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
-      float x = smem[num_warps + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE + j];
-      input_vec[j] = x * rms_rcp * float(weight_vec[j]);
+      input_vec[j] = x_vec[j] * rms_rcp * float(weight_vec[j]);
     }
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       input_vec.store(input + bx * d + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
