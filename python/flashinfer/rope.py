@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -50,12 +50,22 @@ def _apply_rope(
     k_rope: torch.Tensor,
     indptr: torch.Tensor,
     offsets: torch.Tensor,
+    rotary_dim: int,
     interleave: bool,
     rope_scale: float,
     rope_theta: float,
 ) -> None:
     get_rope_module().apply_rope(
-        q, k, q_rope, k_rope, indptr, offsets, interleave, rope_scale, rope_theta
+        q,
+        k,
+        q_rope,
+        k_rope,
+        indptr,
+        offsets,
+        rotary_dim,
+        interleave,
+        rope_scale,
+        rope_theta,
     )
 
 
@@ -67,6 +77,7 @@ def _fake_apply_rope(
     k_rope: torch.Tensor,
     indptr: torch.Tensor,
     offsets: torch.Tensor,
+    rotary_dim: int,
     interleave: bool,
     rope_scale: float,
     rope_theta: float,
@@ -82,6 +93,7 @@ def _apply_llama31_rope(
     k_rope: torch.Tensor,
     indptr: torch.Tensor,
     offsets: torch.Tensor,
+    rotary_dim: int,
     interleave: bool,
     rope_scale: float,
     rope_theta: float,
@@ -96,6 +108,7 @@ def _apply_llama31_rope(
         k_rope,
         indptr,
         offsets,
+        rotary_dim,
         interleave,
         rope_scale,
         rope_theta,
@@ -113,6 +126,7 @@ def _fake_apply_llama31_rope(
     k_rope: torch.Tensor,
     indptr: torch.Tensor,
     offsets: torch.Tensor,
+    rotary_dim: int,
     interleave: bool,
     rope_scale: float,
     rope_theta: float,
@@ -130,12 +144,13 @@ def _apply_rope_pos_ids(
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
     pos_ids: torch.Tensor,
+    rotary_dim: int,
     interleave: bool,
     rope_scale: float,
     rope_theta: float,
 ) -> None:
     get_rope_module().apply_rope_pos_ids(
-        q, k, q_rope, k_rope, pos_ids, interleave, rope_scale, rope_theta
+        q, k, q_rope, k_rope, pos_ids, rotary_dim, interleave, rope_scale, rope_theta
     )
 
 
@@ -146,6 +161,7 @@ def _fake_apply_rope_pos_ids(
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
     pos_ids: torch.Tensor,
+    rotary_dim: int,
     interleave: bool,
     rope_scale: float,
     rope_theta: float,
@@ -201,6 +217,7 @@ def _apply_llama31_rope_pos_ids(
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
     pos_ids: torch.Tensor,
+    rotary_dim: int,
     interleave: bool,
     rope_scale: float,
     rope_theta: float,
@@ -214,6 +231,7 @@ def _apply_llama31_rope_pos_ids(
         q_rope,
         k_rope,
         pos_ids,
+        rotary_dim,
         interleave,
         rope_scale,
         rope_theta,
@@ -230,6 +248,7 @@ def _fake_apply_llama31_rope_pos_ids(
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
     pos_ids: torch.Tensor,
+    rotary_dim: int,
     interleave: bool,
     rope_scale: float,
     rope_theta: float,
@@ -245,6 +264,7 @@ def apply_rope_inplace(
     k: torch.Tensor,
     indptr: torch.Tensor,
     offsets: torch.Tensor,
+    rotary_dim: Optional[int] = None,
     interleave: bool = False,
     rope_scale: float = 1,
     rope_theta: float = 1e4,
@@ -271,6 +291,9 @@ def apply_rope_inplace(
         Indptr tensor, shape: ``(batch_size + 1)``.
     offsets : torch.Tensor
         The relative position offsets of each query in the batch, shape: ``(batch_size)``.
+    rotary_dim : Optional[int]
+        The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
+        otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -316,13 +339,18 @@ def apply_rope_inplace(
     --------
     apply_rope
     """
-    _apply_rope(q, k, q, k, indptr, offsets, interleave, rope_scale, rope_theta)
+    if rotary_dim is None:
+        rotary_dim = q.size(-1)
+    _apply_rope(
+        q, k, q, k, indptr, offsets, rotary_dim, interleave, rope_scale, rope_theta
+    )
 
 
 def apply_rope_pos_ids_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
     pos_ids: torch.Tensor,
+    rotary_dim: Optional[int] = None,
     interleave: bool = False,
     rope_scale: float = 1,
     rope_theta: float = 1e4,
@@ -347,6 +375,9 @@ def apply_rope_pos_ids_inplace(
         element of ``indptr``.
     pos_ids : torch.Tensor
         Position indices, shape: ``(nnz)``.
+    rotary_dim : Optional[int]
+        The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
+        otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -366,7 +397,11 @@ def apply_rope_pos_ids_inplace(
     --------
     apply_rope_pos_ids
     """
-    _apply_rope_pos_ids(q, k, q, k, pos_ids, interleave, rope_scale, rope_theta)
+    if rotary_dim is None:
+        rotary_dim = q.size(-1)
+    _apply_rope_pos_ids(
+        q, k, q, k, pos_ids, rotary_dim, interleave, rope_scale, rope_theta
+    )
 
 
 def apply_llama31_rope_inplace(
@@ -374,6 +409,7 @@ def apply_llama31_rope_inplace(
     k: torch.Tensor,
     indptr: torch.Tensor,
     offsets: torch.Tensor,
+    rotary_dim: Optional[int] = None,
     interleave: bool = False,
     rope_scale: float = 8,
     rope_theta: float = 5e5,
@@ -403,6 +439,9 @@ def apply_llama31_rope_inplace(
         Indptr tensor, shape: ``(batch_size + 1)``.
     offsets : torch.Tensor
         The relative position offsets of each query in the batch, shape: ``(batch_size)``.
+    rotary_dim : Optional[int]
+        The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
+        otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -454,6 +493,8 @@ def apply_llama31_rope_inplace(
     --------
     apply_llama31_rope
     """
+    if rotary_dim is None:
+        rotary_dim = q.size(-1)
     _apply_llama31_rope(
         q,
         k,
@@ -461,6 +502,7 @@ def apply_llama31_rope_inplace(
         k,
         indptr,
         offsets,
+        rotary_dim,
         interleave,
         rope_scale,
         rope_theta,
@@ -474,6 +516,7 @@ def apply_llama31_rope_pos_ids_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
     pos_ids: torch.Tensor,
+    rotary_dim: Optional[int] = None,
     interleave: bool = False,
     rope_scale: float = 8,
     rope_theta: float = 5e5,
@@ -501,6 +544,9 @@ def apply_llama31_rope_pos_ids_inplace(
         element of ``indptr``.
     pos_ids : torch.Tensor
         Position indices, shape: ``(nnz)``.
+    rotary_dim : Optional[int]
+        The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
+        otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -526,12 +572,15 @@ def apply_llama31_rope_pos_ids_inplace(
     --------
     apply_llama31_rope_pos_ids
     """
+    if rotary_dim is None:
+        rotary_dim = q.size(-1)
     _apply_llama31_rope_pos_ids(
         q,
         k,
         q,
         k,
         pos_ids,
+        rotary_dim,
         interleave,
         rope_scale,
         rope_theta,
@@ -546,6 +595,7 @@ def apply_rope(
     k: torch.Tensor,
     indptr: torch.Tensor,
     offsets: torch.Tensor,
+    rotary_dim: Optional[int] = None,
     interleave: bool = False,
     rope_scale: float = 1,
     rope_theta: float = 1e4,
@@ -572,6 +622,9 @@ def apply_rope(
         Indptr tensor, shape: ``(batch_size + 1)``.
     offsets : torch.Tensor
         The relative position offsets of each query in the batch, shape: ``(batch_size)``.
+    rotary_dim : Optional[int]
+        The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
+        otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -630,8 +683,19 @@ def apply_rope(
     """
     q_rope = torch.empty_like(q)
     k_rope = torch.empty_like(k)
+    if rotary_dim is None:
+        rotary_dim = q.size(-1)
     _apply_rope(
-        q, k, q_rope, k_rope, indptr, offsets, interleave, rope_scale, rope_theta
+        q,
+        k,
+        q_rope,
+        k_rope,
+        indptr,
+        offsets,
+        rotary_dim,
+        interleave,
+        rope_scale,
+        rope_theta,
     )
     return q_rope, k_rope
 
@@ -640,6 +704,7 @@ def apply_rope_pos_ids(
     q: torch.Tensor,
     k: torch.Tensor,
     pos_ids: torch.Tensor,
+    rotary_dim: Optional[int] = None,
     interleave: bool = False,
     rope_scale: float = 1,
     rope_theta: float = 1e4,
@@ -664,6 +729,9 @@ def apply_rope_pos_ids(
         element of ``indptr``.
     pos_ids : torch.Tensor
         Position indices, shape: ``(batch_size + 1)``.
+    rotary_dim : Optional[int]
+        The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
+        otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -692,8 +760,10 @@ def apply_rope_pos_ids(
     """
     q_rope = torch.empty_like(q)
     k_rope = torch.empty_like(k)
+    if rotary_dim is None:
+        rotary_dim = q.size(-1)
     _apply_rope_pos_ids(
-        q, k, q_rope, k_rope, pos_ids, interleave, rope_scale, rope_theta
+        q, k, q_rope, k_rope, pos_ids, rotary_dim, interleave, rope_scale, rope_theta
     )
     return q_rope, k_rope
 
@@ -703,6 +773,7 @@ def apply_llama31_rope(
     k: torch.Tensor,
     indptr: torch.Tensor,
     offsets: torch.Tensor,
+    rotary_dim: Optional[int] = None,
     interleave: bool = False,
     rope_scale: float = 8,
     rope_theta: float = 5e5,
@@ -732,6 +803,9 @@ def apply_llama31_rope(
         Indptr tensor, shape: ``(batch_size + 1)``.
     offsets : torch.Tensor
         The relative position offsets of each query in the batch, shape: ``(batch_size)``.
+    rotary_dim : Optional[int]
+        The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
+        otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -796,6 +870,8 @@ def apply_llama31_rope(
     """
     q_rope = torch.empty_like(q)
     k_rope = torch.empty_like(k)
+    if rotary_dim is None:
+        rotary_dim = q.size(-1)
     _apply_llama31_rope(
         q,
         k,
@@ -803,6 +879,7 @@ def apply_llama31_rope(
         k_rope,
         indptr,
         offsets,
+        rotary_dim,
         interleave,
         rope_scale,
         rope_theta,
@@ -817,6 +894,7 @@ def apply_llama31_rope_pos_ids(
     q: torch.Tensor,
     k: torch.Tensor,
     pos_ids: torch.Tensor,
+    rotary_dim: Optional[int] = None,
     interleave: bool = False,
     rope_scale: float = 8,
     rope_theta: float = 5e5,
@@ -844,6 +922,9 @@ def apply_llama31_rope_pos_ids(
         element of ``indptr``.
     pos_ids : torch.Tensor
         Position indices, shape: ``(nnz)``.
+    rotary_dim : Optional[int]
+        The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
+        otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
     interleave : bool
         Whether to use interleaved layout in the last dimension, default: ``False``.
 
@@ -877,12 +958,15 @@ def apply_llama31_rope_pos_ids(
     """
     q_rope = torch.empty_like(q)
     k_rope = torch.empty_like(k)
+    if rotary_dim is None:
+        rotary_dim = q.size(-1)
     _apply_llama31_rope_pos_ids(
         q,
         k,
         q_rope,
         k_rope,
         pos_ids,
+        rotary_dim,
         interleave,
         rope_scale,
         rope_theta,
@@ -910,9 +994,9 @@ def apply_rope_with_cos_sin_cache(
     k : torch.Tensor
         Key tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     cos_cache : torch.Tensor
-        Cosine cache tensor, shape: ``(max_seq_len, head_dim)``.
+        Cosine cache tensor, shape: ``(max_seq_len, rotary_dim)``.
     sin_cache : torch.Tensor
-        Sine cache tensor, shape: ``(max_seq_len, head_dim)``.
+        Sine cache tensor, shape: ``(max_seq_len, rotary_dim)``.
     pos_ids : torch.Tensor
         Position indices, shape: ``(nnz)``.
     interleave : bool
@@ -931,6 +1015,10 @@ def apply_rope_with_cos_sin_cache(
         The rotated query tensor, shape: ``(nnz, num_q_heads, head_dim)``.
     k_rope : torch.Tensor
         The rotated key tensor, shape: ``(nnz, num_k_heads, head_dim)``.
+
+    Note
+    ----
+    The rotary dimension is determined by the cosine cache and sine cache.
     """
     if cos_cache.dtype != torch.float32 or sin_cache.dtype != torch.float32:
         raise ValueError("cos_cache and sin_cache should be float32")
@@ -960,10 +1048,10 @@ def apply_rope_with_cos_sin_cache_inplace(
     k : torch.Tensor
         Key tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     cos_cache : torch.Tensor
-        Cosine cache tensor, shape: ``(max_seq_len, head_dim)``.
+        Cosine cache tensor, shape: ``(max_seq_len, rotary_dim)``.
         Expect float32 data type.
     sin_cache : torch.Tensor
-        Sine cache tensor, shape: ``(max_seq_len, head_dim)``.
+        Sine cache tensor, shape: ``(max_seq_len, rotary_dim)``.
         Expect float32 data type.
     pos_ids : torch.Tensor
         Position indices, shape: ``(nnz)``.
@@ -976,6 +1064,10 @@ def apply_rope_with_cos_sin_cache_inplace(
         * If ``False``, the last dimension of the query/key tensor is not interleaved, i.e.,
           we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
           dimensions ``([..., head_dim//2:])``.
+
+    Note
+    ----
+    The rotary dimension is determined by the cosine cache and sine cache.
     """
     if cos_cache.dtype != torch.float32 or sin_cache.dtype != torch.float32:
         raise ValueError("cos_cache and sin_cache should be float32")

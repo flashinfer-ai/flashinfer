@@ -16,9 +16,6 @@
 #ifndef FLASHINFER_CUTLASS_UTILS_CUH_
 #define FLASHINFER_CUTLASS_UTILS_CUH_
 
-#include <cuda_runtime.h>
-#include <cutlass/cutlass.h>
-
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
