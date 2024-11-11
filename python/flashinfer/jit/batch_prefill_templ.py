@@ -107,7 +107,7 @@ torch::Tensor BatchPrefillWithRaggedKVCacheRun(
   RaggedParamsT params(
     static_cast<{{ dtype_q }}*>(q.data_ptr()), static_cast<{{ dtype_kv }}*>(k.data_ptr()),
     static_cast<{{ dtype_kv }}*>(v.data_ptr()),
-    /*custom_mask=*/(maybe_packed_custom_mask ? static_cast<uint8_t*>(maybe_packed_custom_mask->data_ptr()) : nullptr),
+    /*custom_mask=*/(maybe_custom_mask ? static_cast<uint8_t*>(maybe_custom_mask->data_ptr()) : nullptr),
     static_cast<{{ dtype_idx }}*>(qo_indptr.data_ptr()),
     static_cast<{{ dtype_idx }}*>(kv_indptr.data_ptr()),
     /*qk_indptr=*/(maybe_qk_indptr ? static_cast<{{ dtype_idx }}*>(maybe_qk_indptr->data_ptr()) : nullptr),

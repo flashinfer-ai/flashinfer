@@ -418,7 +418,7 @@ def single_decode_with_kv_cache(
                 sm_scale,
                 rope_scale,
                 rope_theta,
-                False,  # return_lse
+                None,  # maybe_lse
             )[0]
             .squeeze(0)
         )
