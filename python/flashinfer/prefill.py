@@ -84,12 +84,7 @@ def get_single_prefill_module(*args):
         if has_prebuilt_ops and uri in prebuilt_ops_uri:
             from . import _kernels
 
-            # NOTE(Zihao): we should avoid hard-coded index like this, refactor it later
-            mask_mode = args[5]
-            run_func = lambda *run_args: _kernels.single_prefill_with_kv_cache(
-                mask_mode,
-                *run_args,
-            )
+            run_func = _kernels.single_prefill_with_kv_cache
         else:
             run_func = compile_single_prefill_module(*args).run
 
@@ -97,6 +92,7 @@ def get_single_prefill_module(*args):
 
         @register_custom_op(f"flashinfer::{uri}_run", mutates_args=("tmp", "maybe_lse"))
         def run_single_prefill(
+            mask_mode: int,
             q: torch.Tensor,
             k: torch.Tensor,
             v: torch.Tensor,
@@ -112,6 +108,7 @@ def get_single_prefill_module(*args):
             maybe_lse: Optional[torch.Tensor],
         ) -> torch.Tensor:
             return run_func(
+                mask_mode,
                 q,
                 k,
                 v,
@@ -129,6 +126,7 @@ def get_single_prefill_module(*args):
 
         @register_fake_op(f"flashinfer::{uri}_run")
         def _fake_run_single_prefill(
+            mask_mode: int,
             q: torch.Tensor,
             k: torch.Tensor,
             v: torch.Tensor,
@@ -164,19 +162,8 @@ def get_batch_prefill_module(*args):
                 head_dim,
                 *plan_args,
             )
-            mask_mode = args[6]
-            ragged_run_func = (
-                lambda *run_args: _kernels.batch_prefill_with_ragged_kv_cache_run(
-                    mask_mode,
-                    *run_args,
-                )
-            )
-            paged_run_func = (
-                lambda *run_args: _kernels.batch_prefill_with_paged_kv_cache_run(
-                    mask_mode,
-                    *run_args,
-                )
-            )
+            ragged_run_func = _kernels.batch_prefill_with_ragged_kv_cache_run
+            paged_run_func = _kernels.batch_prefill_with_paged_kv_cache_run
         else:
             module = compile_batch_prefill_module(*args)
             plan_func = module.plan
@@ -194,6 +181,7 @@ def get_batch_prefill_module(*args):
             ),
         )
         def ragged_run(
+            mask_mode: int,
             float_workspace_buffer: torch.Tensor,
             int_workspace_buffer: torch.Tensor,
             plan_info_vec: List[int],
@@ -214,6 +202,7 @@ def get_batch_prefill_module(*args):
             maybe_lse: Optional[torch.Tensor],
         ) -> torch.Tensor:
             return ragged_run_func(
+                mask_mode,
                 float_workspace_buffer,
                 int_workspace_buffer,
                 plan_info_vec,
@@ -236,6 +225,7 @@ def get_batch_prefill_module(*args):
 
         @register_fake_op(f"flashinfer::{uri}_ragged_run")
         def _fake_ragged_run(
+            mask_mode: int,
             float_workspace_buffer: torch.Tensor,
             int_workspace_buffer: torch.Tensor,
             plan_info_vec: List[int],
@@ -270,6 +260,7 @@ def get_batch_prefill_module(*args):
             ),
         )
         def paged_run(
+            mask_mode: int,
             float_workspace_buffer: torch.Tensor,
             int_workspace_buffer: torch.Tensor,
             plan_info_vec: List[int],
@@ -292,6 +283,7 @@ def get_batch_prefill_module(*args):
             maybe_lse: Optional[torch.Tensor],
         ) -> torch.Tensor:
             return paged_run_func(
+                mask_mode,
                 float_workspace_buffer,
                 int_workspace_buffer,
                 plan_info_vec,
@@ -316,6 +308,7 @@ def get_batch_prefill_module(*args):
 
         @register_fake_op(f"flashinfer::{uri}_paged_run")
         def _fake_paged_run(
+            mask_mode: int,
             float_workspace_buffer: torch.Tensor,
             int_workspace_buffer: torch.Tensor,
             plan_info_vec: List[int],
@@ -358,6 +351,7 @@ def single_prefill_with_kv_cache_with_jit_module(
     v: torch.Tensor,
     *args,
     kv_layout: str = "NHD",
+    mask_mode: int = MaskMode.NON_CAUSAL.value,
     window_left: int = -1,
     return_lse: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -366,7 +360,7 @@ def single_prefill_with_kv_cache_with_jit_module(
     if return_lse:
         lse = torch.empty((q.size(0), q.size(1)), dtype=torch.float32, device=q.device)
     out = jit_module.run(
-        q, k, v, tmp, TensorLayout[kv_layout].value, window_left, lse, *args
+        mask_mode, q, k, v, tmp, TensorLayout[kv_layout].value, window_left, lse, *args
     )
     return (out, lse) if return_lse else out
 
@@ -568,11 +562,11 @@ def single_prefill_with_kv_cache(
         q.dtype,
         q.shape[-1],
         PosEncodingMode[pos_encoding_mode].value,
-        mask_mode,
         window_left >= 0,  # use_sliding_window
         logits_soft_cap > 0,  # use_logits_soft_cap
         allow_fp16_qk_reduction,
     ).run(
+        mask_mode,
         q,
         k,
         v,
@@ -1046,14 +1040,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
         qo_indptr_host = qo_indptr.to("cpu")
         paged_kv_indptr_host = paged_kv_indptr.to("cpu")
 
-        if packed_custom_mask is not None:
-            mask_mode = MaskMode.CUSTOM.value
-        else:
-            if causal:
-                mask_mode = MaskMode.CAUSAL.value
-            else:
-                mask_mode = MaskMode.NON_CAUSAL.value
-
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
         self._cached_module = get_batch_prefill_module(
@@ -1063,7 +1049,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             paged_kv_indptr.dtype,
             head_dim,
             PosEncodingMode[pos_encoding_mode].value,
-            mask_mode,
             window_left >= 0,  # use_sliding_window
             logits_soft_cap > 0,  # use_logits_soft_cap
             allow_fp16_qk_reduction,
@@ -1206,7 +1191,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
             )
 
+        if self._custom_mask_buf is not None:
+            mask_mode = MaskMode.CUSTOM.value
+        else:
+            if self._causal:
+                mask_mode = MaskMode.CAUSAL.value
+            else:
+                mask_mode = MaskMode.NON_CAUSAL.value
+
         out = self._cached_module.paged_run(
+            mask_mode,
             self._float_workspace_buffer,
             self._int_workspace_buffer,
             self._plan_info,
@@ -1633,14 +1627,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         qo_indptr_host = qo_indptr.to("cpu")
         kv_indptr_host = kv_indptr.to("cpu")
 
-        if packed_custom_mask is not None:
-            mask_mode = MaskMode.CUSTOM.value
-        else:
-            if causal:
-                mask_mode = MaskMode.CAUSAL.value
-            else:
-                mask_mode = MaskMode.NON_CAUSAL.value
-
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
         self._cached_module = get_batch_prefill_module(
@@ -1650,7 +1636,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             kv_indptr.dtype,
             head_dim,
             PosEncodingMode[pos_encoding_mode].value,
-            mask_mode,
             window_left >= 0,  # use_sliding_window
             logits_soft_cap > 0,  # use_logits_soft_cap
             allow_fp16_qk_reduction,
@@ -1782,7 +1767,16 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             k = k.to(torch.float16)
             v = v.to(torch.float16)
 
+        if self._custom_mask_buf is not None:
+            mask_mode = MaskMode.CUSTOM.value
+        else:
+            if self._causal:
+                mask_mode = MaskMode.CAUSAL.value
+            else:
+                mask_mode = MaskMode.NON_CAUSAL.value
+
         out = self._cached_module.ragged_run(
+            mask_mode,
             self._float_workspace_buffer,
             self._int_workspace_buffer,
             self._plan_info,

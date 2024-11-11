@@ -81,9 +81,9 @@ struct SinglePrefillParams {
 
 {{ variant_decl }}
 
-std::vector<torch::Tensor> single_prefill_with_kv_cache(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v,
-    torch::Tensor tmp, unsigned int layout, int32_t window_left, bool return_lse{{ additional_func_params }}) {
+torch::Tensor single_prefill_with_kv_cache(
+    unsigned int mask_mode_code, torch::Tensor q, torch::Tensor k, torch::Tensor v,
+    torch::Tensor tmp, unsigned int layout, int32_t window_left, std::optional<torch::Tensor> maybe_lse{{ additional_func_params }}) {
   auto device = q.device();
   unsigned int head_dim = q.size(2);
   unsigned int kv_len, qo_len, num_kv_heads, num_qo_heads;
@@ -104,9 +104,11 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
   }
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto o = torch::empty_like(q, q.options());
-  torch::Tensor lse = torch::empty({0});
-  if (return_lse) {
-    lse = torch::empty({qo_len, num_qo_heads}, q.options().dtype(torch::kFloat32));
+  if (maybe_lse) {
+    const auto& lse = *maybe_lse;
+    TORCH_CHECK(lse.size(0) == q.size(0), lse.size(0), q.size(0));
+    TORCH_CHECK(lse.size(1) == q.size(1), lse.size(1), q.size(1));
+    TORCH_CHECK(lse.dtype() == torch::kFloat32, "lse must be float32");
   }
 
   using ParamsT = SinglePrefillParams;
@@ -115,22 +117,22 @@ std::vector<torch::Tensor> single_prefill_with_kv_cache(
     static_cast<{{ dtype_q }}*>(q.data_ptr()), static_cast<{{ dtype_kv }}*>(k.data_ptr()),
     static_cast<{{ dtype_kv }}*>(v.data_ptr()),
     static_cast<{{ dtype_o }}*>(o.data_ptr()),
-    /*lse=*/return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr,
+    /*lse=*/(maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr),
     num_qo_heads, num_kv_heads, qo_len, kv_len, q_stride_n, q_stride_h,
     kv_stride_n, kv_stride_h, head_dim, window_left{{ additional_params_data }});
 
-  cudaError_t status =
-      SinglePrefillWithKVCacheDispatched<{{ head_dim }}, PosEncodingMode::kNone, false, {{ mask_mode }}, AttentionVariant>(
-            params, static_cast<{{ dtype_o }}*>(tmp.data_ptr()), torch_current_stream);
-  TORCH_CHECK(status == cudaSuccess,
-             "SinglePrefillWithKVCache kernel launch failed, error: " +
-              std::string(cudaGetErrorString(status)));
+  MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
 
-  if (return_lse) {
-    return {o, lse};
-  } else {
-    return {o};
-  }
+  DISPATCH_MASK_MODE(mask_mode, MASK_MODE, {
+    cudaError_t status =
+        SinglePrefillWithKVCacheDispatched<{{ head_dim }}, PosEncodingMode::kNone, false, MASK_MODE, AttentionVariant>(
+              params, static_cast<{{ dtype_o }}*>(tmp.data_ptr()), torch_current_stream);
+    TORCH_CHECK(status == cudaSuccess,
+              "SinglePrefillWithKVCache kernel launch failed, error: " +
+                std::string(cudaGetErrorString(status)));
+  });
+
+  return o;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -149,12 +151,11 @@ single_prefill_templ = r"""
 
 using namespace flashinfer;
 
-{% set use_custom_mask = "true" if mask_mode == "MaskMode::kCustom" else "false" %}
 {% set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
 using ParamsT = SinglePrefillParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}>;
-using AttentionVariant = ComposedAttention<ParamsT, get_variant_code({{ use_custom_mask }}, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, {{ use_alibi }})>;
 
 torch::Tensor single_prefill_with_kv_cache(
+    unsigned int mask_mode_code,
     torch::Tensor q, torch::Tensor k, torch::Tensor v, std::optional<torch::Tensor> maybe_packed_custom_mask,
     torch::Tensor tmp, std::optional<torch::Tensor> maybe_alibi_slopes, unsigned int layout, int32_t window_left, float logits_soft_cap, float sm_scale,
     float rope_scale, float rope_theta, std::optional<torch::Tensor> maybe_lse) {
@@ -196,12 +197,19 @@ torch::Tensor single_prefill_with_kv_cache(
     kv_stride_n, kv_stride_h, head_dim, window_left, logits_soft_cap, sm_scale,
     rope_scale, rope_theta);
 
-  cudaError_t status =
-      SinglePrefillWithKVCacheDispatched<{{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, {{ mask_mode }}, AttentionVariant>(
-            params, static_cast<{{ dtype_o }}*>(tmp.data_ptr()), torch_current_stream);
-  TORCH_CHECK(status == cudaSuccess,
-             "SinglePrefillWithKVCache kernel launch failed, error: " +
-              std::string(cudaGetErrorString(status)));
+
+  MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
+
+  DISPATCH_MASK_MODE(mask_mode, MASK_MODE, {
+    constexpr bool use_custom_mask = MASK_MODE == MaskMode::kCustom;
+    using AttentionVariant = ComposedAttention<ParamsT, get_variant_code(use_custom_mask, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, {{ use_alibi }})>;
+    cudaError_t status =
+        SinglePrefillWithKVCacheDispatched<{{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, MASK_MODE, AttentionVariant>(
+              params, static_cast<{{ dtype_o }}*>(tmp.data_ptr()), torch_current_stream);
+    TORCH_CHECK(status == cudaSuccess,
+              "SinglePrefillWithKVCache kernel launch failed, error: " +
+                std::string(cudaGetErrorString(status)));
+  });
 
   return o;
 }

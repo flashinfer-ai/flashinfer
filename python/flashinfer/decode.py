@@ -400,12 +400,12 @@ def single_decode_with_kv_cache(
                 q.dtype,
                 head_dim,
                 PosEncodingMode[pos_encoding_mode].value,
-                MaskMode.NON_CAUSAL.value,
                 window_left != -1,  # use_sliding_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 False,  # allow_fp16_qk_reduction
             )
             .run(
+                MaskMode.NON_CAUSAL.value,
                 q.unsqueeze(0),
                 k,
                 v,
@@ -761,7 +761,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 indptr.dtype,
                 head_dim,
                 PosEncodingMode[pos_encoding_mode].value,
-                MaskMode.NON_CAUSAL.value,
                 window_left != -1,  # use_sliding_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 False,  # allow_fp16_qk_reduction
@@ -938,6 +937,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         if self.use_tensor_cores:
             out = self._cached_module.paged_run(
+                MaskMode.NON_CAUSAL.value,
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._plan_info,

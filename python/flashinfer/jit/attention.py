@@ -33,7 +33,6 @@ from .single_prefill_templ import (
 from .utils import (
     dtype_map,
     filename_safe_dtype_map,
-    mask_mode_literal,
     pos_encoding_mode_literal,
     write_if_different,
 )
@@ -216,7 +215,6 @@ def get_single_prefill_cu_str(
     dtype_o: torch.dtype,
     head_dim: int,
     pos_encoding_mode: int,
-    mask_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
@@ -228,7 +226,6 @@ def get_single_prefill_cu_str(
         dtype_o=dtype_map[dtype_o],
         head_dim=head_dim,
         pos_encoding_mode=pos_encoding_mode_literal[pos_encoding_mode],
-        mask_mode=mask_mode_literal[mask_mode],
         use_sliding_window="true" if use_sliding_window else "false",
         use_logits_soft_cap="true" if use_logits_soft_cap else "false",
         use_fp16_qk_reduction="true" if use_fp16_qk_reduction else "false",
@@ -241,7 +238,6 @@ def get_single_prefill_uri(
     dtype_o: torch.dtype,
     head_dim: int,
     pos_encoding_mode: int,
-    mask_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
@@ -252,7 +248,6 @@ def get_single_prefill_uri(
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"head_dim_{head_dim}_"
         f"posenc_{pos_encoding_mode}_"
-        f"mask_{mask_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
         f"f16qk_{use_fp16_qk_reduction}"
@@ -280,7 +275,6 @@ def get_batch_prefill_cu_str(
     dtype_idx: torch.dtype,
     head_dim: int,
     pos_encoding_mode: int,
-    mask_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
@@ -293,7 +287,6 @@ def get_batch_prefill_cu_str(
         dtype_idx=dtype_map[dtype_idx],
         head_dim=head_dim,
         pos_encoding_mode=pos_encoding_mode_literal[pos_encoding_mode],
-        mask_mode=mask_mode_literal[mask_mode],
         use_sliding_window="true" if use_sliding_window else "false",
         use_logits_soft_cap="true" if use_logits_soft_cap else "false",
         use_fp16_qk_reduction="true" if use_fp16_qk_reduction else "false",
@@ -307,7 +300,6 @@ def get_batch_prefill_uri(
     dtype_idx: torch.dtype,
     head_dim: int,
     pos_encoding_mode: int,
-    mask_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
@@ -319,7 +311,6 @@ def get_batch_prefill_uri(
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_{head_dim}_"
         f"posenc_{pos_encoding_mode}_"
-        f"mask_{mask_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
         f"f16qk_{use_fp16_qk_reduction}"
@@ -424,7 +415,6 @@ def get_customize_single_prefill_cu_str(
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
     head_dim: int,
-    mask_mode: int,
     additional_input_tensor_var_names: List[str],
     additional_input_tensor_var_types: List[str],
     additional_input_scalar_var_names: List[str],
@@ -489,7 +479,6 @@ def get_customize_single_prefill_cu_str(
         dtype_kv=dtype_map[dtype_kv],
         dtype_o=dtype_map[dtype_o],
         head_dim=head_dim,
-        mask_mode=mask_mode_literal[mask_mode],
         additional_params_decl=additional_params_decl,
         additional_params=additional_params,
         additional_params_init=additional_params_init,

@@ -25,12 +25,9 @@ batch_prefill_templ = r"""
 
 using namespace flashinfer;
 
-{% set use_custom_mask = "true" if mask_mode == "MaskMode::kCustom" else "false" %}
 {% set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
 using RaggedParamsT = BatchPrefillRaggedParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ dtype_idx }}>;
-using RaggedAttentionVariant = ComposedAttention<RaggedParamsT, get_variant_code({{ use_custom_mask }}, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, {{ use_alibi }})>;
 using PagedParamsT = BatchPrefillPagedParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ dtype_idx }}>;
-using PagedAttentionVariant = ComposedAttention<PagedParamsT, get_variant_code({{ use_custom_mask }}, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, {{ use_alibi }})>;
 
 std::vector<int64_t> BatchPrefillWithKVCachePlan(
     torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
@@ -68,6 +65,7 @@ std::vector<int64_t> BatchPrefillWithKVCachePlan(
 }
 
 torch::Tensor BatchPrefillWithRaggedKVCacheRun(
+  unsigned int mask_mode_code,
   torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
   std::vector<int64_t> plan_info_vec,
   torch::Tensor q, torch::Tensor k, torch::Tensor v,
@@ -141,10 +139,16 @@ torch::Tensor BatchPrefillWithRaggedKVCacheRun(
 
   cudaError_t status = cudaSuccess;
 
-  DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
-    status = BatchPrefillWithRaggedKVCacheDispatched<
-      CTA_TILE_Q, {{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, {{ mask_mode }}, RaggedAttentionVariant>(
-        params, tmp_v, tmp_s, torch_current_stream);
+  MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
+
+  DISPATCH_MASK_MODE(mask_mode, MASK_MODE, {
+    constexpr bool use_custom_mask = MASK_MODE == MaskMode::kCustom;
+    using RaggedAttentionVariant = ComposedAttention<RaggedParamsT, get_variant_code(use_custom_mask, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, {{ use_alibi }})>;
+    DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
+      status = BatchPrefillWithRaggedKVCacheDispatched<
+        CTA_TILE_Q, {{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, MASK_MODE, RaggedAttentionVariant>(
+          params, tmp_v, tmp_s, torch_current_stream);
+    });
   });
 
   TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithRaggedKVCache failed with error ", cudaGetErrorString(status));
@@ -153,6 +157,7 @@ torch::Tensor BatchPrefillWithRaggedKVCacheRun(
 }
 
 torch::Tensor BatchPrefillWithPagedKVCacheRun(
+  unsigned int mask_mode_code,
   torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
   std::vector<int64_t> plan_info_vec,
   torch::Tensor q,
@@ -245,10 +250,16 @@ torch::Tensor BatchPrefillWithPagedKVCacheRun(
 
   cudaError_t status = cudaSuccess;
 
-  DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
-    status = BatchPrefillWithPagedKVCacheDispatched<
-      CTA_TILE_Q, {{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, {{ mask_mode }}, PagedAttentionVariant>(
-        params, tmp_v, tmp_s, torch_current_stream);
+  MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
+
+  DISPATCH_MASK_MODE(mask_mode, MASK_MODE, {
+    constexpr bool use_custom_mask = MASK_MODE == MaskMode::kCustom;
+    using PagedAttentionVariant = ComposedAttention<PagedParamsT, get_variant_code(use_custom_mask, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, {{ use_alibi }})>;
+    DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
+      status = BatchPrefillWithPagedKVCacheDispatched<
+        CTA_TILE_Q, {{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, MASK_MODE, PagedAttentionVariant>(
+          params, tmp_v, tmp_s, torch_current_stream);
+    });
   });
 
   TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithPagedKVCache failed with error ", cudaGetErrorString(status));
