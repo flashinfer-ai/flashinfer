@@ -463,26 +463,86 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
 
 if __name__ == "__main__":
     test_batch_decode_with_paged_kv_cache(
-        256, 54, 8, 8, 8, 128, "NHD", "NONE", 0.0, False, torch.float16, torch.float16
+        256,
+        54,
+        8,
+        8,
+        8,
+        128,
+        "NHD",
+        "NONE",
+        0.0,
+        False,
+        torch.float16,
+        torch.float16,
+        True,
     )
     test_batch_decode_with_tuple_paged_kv_cache(
-        256, 54, 8, 8, 8, 128, "NHD", "NONE", 0.0, False, torch.float16, torch.float16
+        256,
+        54,
+        8,
+        8,
+        8,
+        128,
+        "NHD",
+        "NONE",
+        0.0,
+        False,
+        torch.float16,
+        torch.float16,
+        True,
     )
     test_batch_decode_with_paged_kv_cache(
-        12, 2048, 8, 8, 8, 128, "NHD", "NONE", 0.0, False, torch.float16, torch.float16
+        12,
+        2048,
+        8,
+        8,
+        8,
+        128,
+        "NHD",
+        "NONE",
+        0.0,
+        False,
+        torch.float16,
+        torch.float16,
+        True,
     )
     test_batch_decode_with_paged_kv_cache(
-        12, 54, 1, 8, 8, 128, "HND", "NONE", 0.0, True, torch.float16, torch.float8_e5m2
+        12,
+        54,
+        1,
+        8,
+        8,
+        128,
+        "HND",
+        "NONE",
+        0.0,
+        True,
+        torch.float16,
+        torch.float8_e5m2,
+        True,
     )
     test_cuda_graph_batch_decode_with_paged_kv_cache(
-        12, 2048, 8, 8, 8, 128, "NHD", "NONE", torch.float16, torch.float16
+        12, 2048, 8, 8, 8, 128, "NHD", "NONE", torch.float16, torch.float16, True
     )
     test_cuda_graph_batch_decode_with_paged_kv_cache(
-        128, 54, 8, 8, 8, 128, "NHD", "NONE", torch.float16, torch.float16
+        128, 54, 8, 8, 8, 128, "NHD", "NONE", torch.float16, torch.float16, True
     )
     test_batch_decode_with_paged_kv_cache(
-        12, 54, 1, 8, 8, 128, "HND", "NONE", 0.0, True, torch.float16, torch.float8_e5m2
+        12,
+        54,
+        1,
+        8,
+        8,
+        128,
+        "HND",
+        "NONE",
+        0.0,
+        True,
+        torch.float16,
+        torch.float8_e5m2,
+        True,
     )
     test_cuda_graph_batch_decode_with_paged_kv_cache(
-        12, 54, 8, 8, 8, 128, "HND", "NONE", torch.float16, torch.float8_e5m2
+        12, 54, 8, 8, 8, 128, "HND", "NONE", torch.float16, torch.float8_e5m2, True
     )

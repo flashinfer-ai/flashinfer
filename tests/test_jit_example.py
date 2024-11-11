@@ -150,7 +150,6 @@ struct FlashSigmoid {
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
         128,  # hidden_dim
-        MaskMode.NON_CAUSAL.value,
         [],  # additional_input_tensor_var_names
         [],  # additional_input_tensor_var_types
         ["logits_scale", "sigmoid_bias"],  # additional_input_scalar_var_names
@@ -167,7 +166,7 @@ struct FlashSigmoid {
     v = torch.randn(1027, 8, 128, dtype=torch.float16, device="cuda")
     logits_scale = 1.0 / math.sqrt(128)
     sigmoid_bias = 0.25
-    o = f(q, k, v, logits_scale, sigmoid_bias)
+    o = f(q, k, v, logits_scale, sigmoid_bias, mask_mode=MaskMode.NON_CAUSAL.value)
 
     p = torch.sigmoid(
         torch.einsum("mhd,nhd->hmn", q.float(), k.float()) * logits_scale + sigmoid_bias
@@ -225,7 +224,6 @@ struct DumpLogits {
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
         128,  # hidden_dim
-        MaskMode.NON_CAUSAL.value,
         ["output_logits"],  # additional_input_tensor_var_names
         ["float"],  # additional_input_tensor_var_types
         ["sm_scale"],  # additional_input_scalar_var_names
@@ -242,7 +240,7 @@ struct DumpLogits {
     v = torch.randn(1023, 32, 128, dtype=torch.float16, device="cuda")
     logits = torch.empty(32, 128, 1023, dtype=torch.float32, device="cuda")
     sm_scale = 1.0 / math.sqrt(128)
-    o = f(q, k, v, logits, sm_scale)
+    o = f(q, k, v, logits, sm_scale, mask_mode=MaskMode.NON_CAUSAL.value)
 
     p = torch.einsum("mhd,nhd->hmn", q.float(), k.float()) * sm_scale
     o_ref = torch.einsum("hmn,nhd->mhd", torch.softmax(p, dim=-1), v.float()).half()
@@ -300,7 +298,6 @@ struct DebugPrintLogits {
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
         128,  # hidden_dim
-        MaskMode.NON_CAUSAL.value,
         [],  # additional_input_tensor_var_names
         [],  # additional_input_tensor_var_types
         ["sm_scale"],  # additional_input_scalar_var_names
@@ -316,7 +313,7 @@ struct DebugPrintLogits {
     k = torch.randn(1023, 32, 128, dtype=torch.float16, device="cuda")
     v = torch.randn(1023, 32, 128, dtype=torch.float16, device="cuda")
     sm_scale = 1.0 / math.sqrt(128)
-    o = f(q, k, v, sm_scale)
+    o = f(q, k, v, sm_scale, mask_mode=MaskMode.NON_CAUSAL.value)
 
     p = torch.einsum("mhd,nhd->hmn", q.float(), k.float()) * sm_scale
     o_ref = torch.einsum("hmn,nhd->mhd", torch.softmax(p, dim=-1), v.float()).half()

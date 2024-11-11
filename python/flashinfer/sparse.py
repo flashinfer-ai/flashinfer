@@ -294,6 +294,7 @@ class BlockSparseAttentionWrapper:
             self._packed_mask_buf = None
             self._qk_indptr_buf = None
             mask_mode = MaskMode.NON_CAUSAL.value
+        self._mask_mode = mask_mode
 
         self.M = M
         self.N = N
@@ -343,7 +344,6 @@ class BlockSparseAttentionWrapper:
                 indptr.dtype,
                 head_dim,
                 PosEncodingMode[pos_encoding_mode].value,
-                mask_mode,
                 False,  # use_sliding_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 allow_fp16_qk_reduction,
@@ -448,6 +448,7 @@ class BlockSparseAttentionWrapper:
 
         if self._use_tensor_cores:
             out = self._cached_module.paged_run(
+                self._mask_mode,
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._plan_info,

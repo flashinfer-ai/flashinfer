@@ -688,16 +688,16 @@ def test_batch_prefill_with_ragged_kv_cache_custom_mask(
 
 if __name__ == "__main__":
     test_batch_prefill_with_paged_kv_cache(
-        12, 54, 37, 16, 8, 8, 128, True, "HND", "NONE", True, 0.0, False
+        12, 54, 37, 16, 8, 8, 128, True, "HND", "NONE", True, 0.0, False, True
     )
     test_batch_prefill_with_tuple_paged_kv_cache(
-        12, 54, 37, 16, 8, 8, 128, True, "HND", "NONE", True, 0.0, False
+        12, 54, 37, 16, 8, 8, 128, True, "HND", "NONE", True, 0.0, False, True
     )
     test_batch_prefill_with_paged_kv_cache(
-        12, 54, 37, 1, 8, 8, 128, True, "HND", "NONE", False, 0.0, False
+        12, 54, 37, 1, 8, 8, 128, True, "HND", "NONE", False, 0.0, False, True
     )
     test_batch_prefill_with_paged_kv_cache_custom_mask(
-        1, 137, 137, 1, 8, 8, 128, "HND", "NONE", 0.0, False
+        1, 137, 137, 1, 8, 8, 128, "HND", "NONE", 0.0, False, True
     )
     test_batch_prefill_with_ragged_kv_cache(
         12, 54, 37, 8, 8, 128, True, "NONE", 0.0, False
