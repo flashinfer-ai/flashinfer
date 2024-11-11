@@ -65,10 +65,10 @@ def test_batch_prefill_with_paged_kv_cache_fp8_calibration_scale(
     ).to(0)
 
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
-    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+    wrapper_f16 = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout
     )
-    wrapper.plan(
+    wrapper_f16.plan(
         qo_indptr,
         kv_indptr,
         kv_indices,
@@ -78,8 +78,9 @@ def test_batch_prefill_with_paged_kv_cache_fp8_calibration_scale(
         head_dim,
         page_size,
         q_data_type=torch.float16,
+        kv_data_type=torch.float16,
     )
-    o_fp16 = wrapper.run(q, kv_data)
+    o_fp16 = wrapper_f16.run(q, kv_data)
     k_data, v_data = torch.chunk(kv_data, 2, dim=1)
     k_scale = k_data.amax().item() / 256
     v_scale = v_data.amax().item() / 256
@@ -88,7 +89,10 @@ def test_batch_prefill_with_paged_kv_cache_fp8_calibration_scale(
     v_fp8 = (v_data / v_scale).to(dtype)
     kv_data_fp8 = torch.cat([k_fp8, v_fp8], dim=1)
 
-    wrapper.plan(
+    wrapper_f8 = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout
+    )
+    wrapper_f8.plan(
         qo_indptr,
         kv_indptr,
         kv_indices,
@@ -98,8 +102,9 @@ def test_batch_prefill_with_paged_kv_cache_fp8_calibration_scale(
         head_dim,
         page_size,
         q_data_type=torch.float16,
+        kv_data_type=dtype,
     )
-    o_fp8 = wrapper.run(
+    o_fp8 = wrapper_f8.run(
         q,
         kv_data_fp8.to(dtype),
         k_scale=k_scale,
@@ -163,6 +168,7 @@ def test_batch_decode_with_prefill_with_paged_kv_cache(
         head_dim,
         page_size,
         q_data_type=torch.float16,
+        kv_data_type=dtype,
     )
     o_fp8 = wrapper.run(q, kv_data)
 
@@ -177,8 +183,8 @@ def test_batch_decode_with_prefill_with_paged_kv_cache(
         num_kv_heads,
         head_dim,
         page_size,
-        data_type=dtype,
         q_data_type=torch.float16,
+        kv_data_type=dtype,
     )
     o_decode_fp8 = decode_wrapper.run(q, kv_data)
 
