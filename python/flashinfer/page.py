@@ -258,7 +258,7 @@ def append_paged_kv_cache(
     >>> kv_append_length = torch.tensor([45, 8, 25, 22], dtype=torch.int32, device="cuda:0")
     >>> kv_append_indptr = torch.cat(
     ...     [torch.zeros(1).int().to(0), torch.cumsum(kv_append_length, dim=0)]
-    ... ).int()
+    ... ).int()  # [0, 45, 53, 78, 100]
     >>> max_num_pages = 1000
     >>> page_size = 16
     >>> paged_kv_cache = torch.randn(max_num_pages, 2, page_size, num_kv_heads, head_dim).half().to(0)
@@ -303,9 +303,6 @@ def append_paged_kv_cache(
 
     Note
     ----
-    Please refer to the :ref:`tutorial <recursive-attention>` for a detailed
-    explanation of the log-sum-exp function and attention states.
-
     The function assumes that the space for appended k/v have already been allocated,
     which means :attr:`kv_indices`, :attr:`kv_indptr`, :attr:`kv_last_page_len` has
     incorporated appended k/v.
