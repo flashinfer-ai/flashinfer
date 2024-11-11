@@ -743,8 +743,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         indptr_host = indptr.to("cpu")
         if data_type is not None:
-            q_data_type = data_type
-            kv_data_type = data_type
+            if q_data_type is None:
+                q_data_type = data_type
+            if kv_data_type is None:
+                kv_data_type = data_type
 
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
