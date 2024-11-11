@@ -151,11 +151,15 @@ def get_batch_indices_positions(
     >>> positions  # the rightmost column index of each row
     tensor([4, 3, 4, 2, 3, 4, 1, 2, 3, 4], device='cuda:0', dtype=torch.int32)
 
-    Notes
-    -----
+    Note
+    ----
     This function is similar to `CSR2COO <https://docs.nvidia.com/cuda/cusparse/#csr2coo>`_
     conversion in cuSPARSE library, with the difference that we are converting from a ragged
     tensor (which don't require a column indices array) to a COO format.
+
+    See Also
+    --------
+    append_paged_kv_cache
     """
     batch_size = append_indptr.size(0) - 1
     batch_indices = torch.empty((nnz,), device=append_indptr.device, dtype=torch.int32)
@@ -305,6 +309,10 @@ def append_paged_kv_cache(
     The function assumes that the space for appended k/v have already been allocated,
     which means :attr:`kv_indices`, :attr:`kv_indptr`, :attr:`kv_last_page_len` has
     incorporated appended k/v.
+
+    See Also
+    --------
+    get_batch_indices_positions
     """
     _check_kv_layout(kv_layout)
     _append_paged_kv_cache_kernel(

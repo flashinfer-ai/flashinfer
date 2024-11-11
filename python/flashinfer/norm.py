@@ -50,6 +50,8 @@ def rmsnorm(
 ) -> torch.Tensor:
     r"""Root mean square normalization.
 
+    ``out[i] = (input[i] / RMS(input)) * weight[i]``
+
     Parameters
     ----------
     input: torch.Tensor
@@ -92,6 +94,12 @@ def fused_add_rmsnorm(
 ) -> None:
     r"""Fused add root mean square normalization.
 
+    Step 1:
+    ``residual[i] += input[i]``
+
+    Step 2:
+    ``input[i] = (residual[i] / RMS(residual)) * weight[i]``
+
     Parameters
     ----------
     input: torch.Tensor
@@ -119,7 +127,9 @@ def gemma_rmsnorm(
     eps: float = 1e-6,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    r"""Gemma Root mean square normalization.
+    r"""Gemma-style root mean square normalization.
+
+    ``out[i] = (input[i] / RMS(input)) * (weight[i] + 1)``
 
     Parameters
     ----------
@@ -163,7 +173,13 @@ def _gemma_rmsnorm_fake(
 def gemma_fused_add_rmsnorm(
     input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
 ) -> None:
-    r"""Gemma Fused add root mean square normalization.
+    r"""Gemma-style fused add root mean square normalization.
+
+    Step 1:
+    ``residual[i] += input[i]``
+
+    Step 2:
+    ``input[i] = (residual[i] / RMS(residual)) * (weight + 1)``
 
     Parameters
     ----------

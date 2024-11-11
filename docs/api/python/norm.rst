@@ -11,3 +11,6 @@ Kernels for normalization layers.
     :toctree: _generate
 
     rmsnorm
+    fused_add_rmsnorm
+    gemma_rmsnorm
+    gemma_fused_add_rmsnorm

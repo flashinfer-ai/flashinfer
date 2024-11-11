@@ -111,6 +111,8 @@ def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
 def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
     r"""Fused SiLU and Mul operation.
 
+    ``silu(input[..., :hidden_size]) * input[..., hidden_size:]``
+
     Parameters
     ----------
     input: torch.Tensor
@@ -141,6 +143,8 @@ def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
 def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
     r"""Fused GeLU Tanh and Mul operation.
 
+    ``gelu(tanh(input[..., :hidden_size])) * input[..., hidden_size:]``
+
     Parameters
     ----------
     input: torch.Tensor
@@ -170,6 +174,8 @@ def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Te
 
 def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
     r"""Fused GeLU and Mul operation.
+
+    ``gelu(input[..., :hidden_size]) * input[..., hidden_size:]``
 
     Parameters
     ----------
