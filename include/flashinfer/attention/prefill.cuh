@@ -1154,7 +1154,7 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void SinglePrefillWithKV
     constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeO>();
 
     DTypeQKAccum s_frag[NUM_FRAGS_Q][NUM_FRAGS_KV][8];
-    float o_frag[NUM_FRAGS_Q][NUM_FRAGS_D][8];
+    alignas(16) float o_frag[NUM_FRAGS_Q][NUM_FRAGS_D][8];
     DTypeQKAccum m[NUM_FRAGS_Q][2];
     float d[NUM_FRAGS_Q][2];
     float rope_freq[NUM_FRAGS_D / 2][4];
@@ -1579,7 +1579,7 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithRag
     constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeO>();
 
     DTypeQKAccum s_frag[NUM_FRAGS_Q][NUM_FRAGS_KV][8];
-    float o_frag[NUM_FRAGS_Q][NUM_FRAGS_D][8];
+    alignas(16) float o_frag[NUM_FRAGS_Q][NUM_FRAGS_D][8];
     DTypeQKAccum m[NUM_FRAGS_Q][2];
     float d[NUM_FRAGS_Q][2];
     float rope_freq[NUM_FRAGS_D / 2][4];
@@ -1866,7 +1866,7 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPag
     constexpr uint32_t channel_size_128b_out = head_dim / num_elems_per_128b<DTypeO>();
 
     DTypeQKAccum s_frag[NUM_FRAGS_Q][NUM_FRAGS_KV][8];
-    float o_frag[NUM_FRAGS_Q][NUM_FRAGS_D][8];
+    alignas(16) float o_frag[NUM_FRAGS_Q][NUM_FRAGS_D][8];
     DTypeQKAccum m[NUM_FRAGS_Q][2];
     float d[NUM_FRAGS_Q][2];
     float rope_freq[NUM_FRAGS_D / 2][4];
