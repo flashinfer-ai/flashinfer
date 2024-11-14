@@ -137,7 +137,7 @@ def load_cuda_ops(
     check_cuda_arch()
     build_directory = FLASHINFER_JIT_DIR / name
     if not os.path.exists(build_directory):
-        os.makedirs(build_directory)
+        os.makedirs(build_directory, exist_ok=True)
     if extra_include_paths is None:
         extra_include_paths = [
             FLASHINFER_INCLUDE_DIR,
