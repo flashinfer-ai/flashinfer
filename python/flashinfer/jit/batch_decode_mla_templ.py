@@ -40,6 +40,7 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlanMLA(
   size_t int_workspace_size_in_bytes =
       int_workspace_buffer.size(0) * int_workspace_buffer.element_size();
   auto device = float_workspace_buffer.device();
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   indptr = indptr.to(torch::kCPU);
 
@@ -83,8 +84,9 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRunMLA(
   auto device = q_nope.device();
   int64_t batch_size = q_nope.size(0);
   int64_t num_qo_heads = q_nope.size(1);
-  int64_t page_size = paged_ckv_cache.size(1);;
+  int64_t page_size = paged_ckv_cache.size(1);
 
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   torch::Tensor o = torch::empty_like(q_nope);
   torch::Tensor lse;
