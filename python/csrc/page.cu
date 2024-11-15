@@ -92,7 +92,8 @@ void append_paged_kv_cache(torch::Tensor append_key, torch::Tensor append_value,
   CHECK_EQ(append_key.size(2), head_dim);
   CHECK_EQ(append_value.size(1), num_heads);
   CHECK_EQ(append_value.size(2), head_dim);
-
+  
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
 
   auto kv_scalar_dtype = paged_k_cache.scalar_type();

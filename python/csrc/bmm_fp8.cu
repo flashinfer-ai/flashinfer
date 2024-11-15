@@ -54,6 +54,7 @@ void bmm_fp8(const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& D,
   auto workspace_buffer = torch::empty(
       {32 * 1024 * 1024}, torch::TensorOptions().dtype(torch::kUInt8).device(A.device()));
   auto lt_handle = reinterpret_cast<cublasLtHandle_t>(at::cuda::getCurrentCUDABlasHandle());
+  const at::cuda::OptionalCUDAGuard device_guard(A.device());
   auto stream = at::cuda::getCurrentCUDAStream();
 
   // PyTorch is row major by default. cuBLASLt is column major by default.

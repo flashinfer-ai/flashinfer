@@ -33,6 +33,7 @@ torch::Tensor sampling_from_probs(torch::Tensor probs, torch::Tensor uniform_sam
   probs = probs.to(torch::kFloat32);
   uniform_samples = uniform_samples.to(torch::kFloat32);
 
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto samples = torch::empty({batch_size}, torch::dtype(torch::kInt32).device(device));
 
@@ -71,6 +72,7 @@ std::vector<torch::Tensor> top_p_sampling_from_probs(torch::Tensor probs,
   uniform_samples = uniform_samples.to(torch::kFloat32);
   top_p_arr = top_p_arr.to(torch::kFloat32);
 
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto samples = torch::empty({batch_size}, torch::dtype(torch::kInt32).device(device));
   auto success = torch::empty({batch_size}, torch::dtype(torch::kBool).device(device));
@@ -112,6 +114,7 @@ std::vector<torch::Tensor> top_k_sampling_from_probs(torch::Tensor probs,
   uniform_samples = uniform_samples.to(torch::kFloat32);
   top_k_arr = top_k_arr.to(torch::kInt32);
 
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto samples = torch::empty({batch_size}, torch::dtype(torch::kInt32).device(device));
   auto success = torch::empty({batch_size}, torch::dtype(torch::kBool).device(device));
@@ -153,6 +156,7 @@ std::vector<torch::Tensor> min_p_sampling_from_probs(torch::Tensor probs,
   probs = probs.to(torch::kFloat32);
   uniform_samples = uniform_samples.to(torch::kFloat32);
 
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto samples = torch::empty({batch_size}, torch::dtype(torch::kInt32).device(device));
   auto success = torch::empty({batch_size}, torch::dtype(torch::kBool).device(device));
@@ -203,6 +207,7 @@ std::vector<torch::Tensor> top_k_top_p_sampling_from_probs(
   probs = probs.to(torch::kFloat32);
   uniform_samples = uniform_samples.to(torch::kFloat32);
 
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto samples = torch::empty({batch_size}, torch::dtype(torch::kInt32).device(device));
   auto success = torch::empty({batch_size}, torch::dtype(torch::kBool).device(device));
@@ -236,7 +241,8 @@ torch::Tensor top_p_renorm_probs(torch::Tensor probs, std::optional<torch::Tenso
   }
   top_p_arr = top_p_arr.to(torch::kFloat32);
   probs = probs.to(torch::kFloat32);
-
+  
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto renorm_probs =
       torch::empty({batch_size, vocab_size}, torch::dtype(torch::kFloat32).device(device));
@@ -268,6 +274,7 @@ torch::Tensor top_k_renorm_probs(torch::Tensor probs, std::optional<torch::Tenso
   top_k_arr = top_k_arr.to(torch::kInt32);
   probs = probs.to(torch::kFloat32);
 
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto renorm_probs =
       torch::empty({batch_size, vocab_size}, torch::dtype(torch::kFloat32).device(device));
@@ -300,6 +307,7 @@ torch::Tensor top_k_mask_logits(torch::Tensor logits, std::optional<torch::Tenso
   top_k_arr = top_k_arr.to(torch::kInt32);
   logits = logits.to(torch::kFloat32);
 
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto mask_logits =
       torch::empty({batch_size, vocab_size}, torch::dtype(torch::kFloat32).device(device));
@@ -348,6 +356,7 @@ torch::Tensor chain_speculative_sampling(torch::Tensor draft_probs, torch::Tenso
   uniform_samples = uniform_samples.to(torch::kFloat32);
   target_probs = target_probs.to(torch::kFloat32);
 
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto output_token_ids = torch::empty({batch_size, num_speculate_tokens + 1},
                                        torch::dtype(torch::kInt32).device(device));

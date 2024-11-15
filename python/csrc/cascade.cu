@@ -42,6 +42,8 @@ std::vector<torch::Tensor> merge_state(torch::Tensor v_a, torch::Tensor s_a, tor
   unsigned int seq_len = v_a.size(0);
   unsigned int num_heads = v_a.size(1);
   unsigned int head_dim = v_a.size(2);
+
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto v_merged = torch::empty_like(v_a, v_a.options());
   auto s_merged = torch::empty({seq_len, num_heads}, s_a.options());
@@ -91,6 +93,8 @@ void merge_state_in_place(torch::Tensor v, torch::Tensor s, torch::Tensor v_othe
   unsigned int seq_len = v.size(0);
   unsigned int num_heads = v.size(1);
   unsigned int head_dim = v.size(2);
+
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(v.scalar_type(), c_type, [&] {
@@ -121,6 +125,7 @@ std::vector<torch::Tensor> merge_states(torch::Tensor v, torch::Tensor s) {
   unsigned int num_heads = v.size(2);
   unsigned int head_dim = v.size(3);
   s = s.to(torch::kFloat32);
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto v_merged = torch::empty({seq_len, num_heads, head_dim}, v.options());
   auto s_merged = torch::empty({seq_len, num_heads}, s.options());

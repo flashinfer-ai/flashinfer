@@ -32,6 +32,7 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
   CHECK_EQ(output.size(0), batch_size);
   CHECK_EQ(output.size(1), hidden_size);
 
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
     cudaError_t status = norm::RMSNorm(static_cast<c_type*>(input.data_ptr()),
@@ -61,6 +62,7 @@ void fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Ten
   unsigned int batch_size = input.size(0);
   unsigned int hidden_size = input.size(1);
 
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
     cudaError_t status = norm::FusedAddRMSNorm(static_cast<c_type*>(input.data_ptr()),
@@ -86,6 +88,7 @@ void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& w
   CHECK_EQ(output.size(0), batch_size);
   CHECK_EQ(output.size(1), hidden_size);
 
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
     cudaError_t status = norm::GemmaRMSNorm(static_cast<c_type*>(input.data_ptr()),
@@ -115,6 +118,7 @@ void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torc
   unsigned int batch_size = input.size(0);
   unsigned int hidden_size = input.size(1);
 
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
     cudaError_t status = norm::GemmaFusedAddRMSNorm(
