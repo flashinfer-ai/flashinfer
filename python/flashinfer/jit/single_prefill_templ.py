@@ -102,6 +102,7 @@ torch::Tensor single_prefill_with_kv_cache(
     kv_stride_h = k.stride(0);
     kv_stride_n = k.stride(1);
   }
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto o = torch::empty_like(q, q.options());
   if (maybe_lse) {
@@ -177,6 +178,7 @@ torch::Tensor single_prefill_with_kv_cache(
     kv_stride_h = k.stride(0);
     kv_stride_n = k.stride(1);
   }
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto o = torch::empty_like(q, q.options());
   if (maybe_lse) {

@@ -50,7 +50,8 @@ void apply_rope(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope, torch::T
   size_t k_rope_stride_h = k_rope.stride(1);
   indptr = indptr.to(torch::kInt32);
   offsets = offsets.to(torch::kInt32);
-
+  
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     cudaError_t status = BatchQKApplyRotary(
@@ -93,6 +94,7 @@ void apply_rope_pos_ids(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope,
   size_t k_rope_stride_h = k_rope.stride(1);
   pos_ids = pos_ids.to(torch::kInt32);
 
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     cudaError_t status = BatchQKApplyRotaryPosIds(
@@ -145,6 +147,7 @@ void apply_rope_pos_ids_cos_sin_cache(torch::Tensor q, torch::Tensor k, torch::T
   size_t k_rope_stride_h = k_rope.stride(1);
   pos_ids = pos_ids.to(torch::kInt32);
 
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     cudaError_t status = BatchQKApplyRotaryPosIdsCosSinCache(
@@ -195,6 +198,7 @@ void apply_llama31_rope(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope,
   indptr = indptr.to(torch::kInt32);
   offsets = offsets.to(torch::kInt32);
 
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     cudaError_t status = BatchQKApplyLlama31Rotary(
@@ -240,6 +244,7 @@ void apply_llama31_rope_pos_ids(torch::Tensor q, torch::Tensor k, torch::Tensor 
   size_t k_rope_stride_h = k_rope.stride(1);
   pos_ids = pos_ids.to(torch::kInt32);
 
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     cudaError_t status = BatchQKApplyLlama31RotaryPosIds(

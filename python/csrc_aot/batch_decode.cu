@@ -42,6 +42,7 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
   size_t int_workspace_size_in_bytes =
       int_workspace_buffer.size(0) * int_workspace_buffer.element_size();
   auto device = float_workspace_buffer.device();
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(device));
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   TORCH_CHECK(indptr.device() == torch::kCPU, "indptr must be on CPU");
 
@@ -112,6 +113,7 @@ torch::Tensor BatchDecodeWithPagedKVCacheRun(
   }
   uint32_t head_dim = q.size(2);
 
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(device));
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   torch::Tensor o = torch::empty_like(q);
   if (maybe_lse) {

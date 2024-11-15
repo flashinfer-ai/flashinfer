@@ -15,6 +15,7 @@
  */
 #pragma once
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>

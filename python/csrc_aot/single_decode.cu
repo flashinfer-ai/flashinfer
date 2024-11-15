@@ -60,6 +60,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
     kv_len = k.size(1);
   }
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(device));
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto o = torch::empty_like(q);
 

@@ -50,6 +50,7 @@ std::vector<int64_t> BatchPrefillWithKVCachePlan(
       int_workspace_buffer.size(0) * int_workspace_buffer.element_size();
 
   auto device = float_workspace_buffer.device();
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(device));
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   TORCH_CHECK(qo_indptr.device() == torch::kCPU, "qo_indptr must be on CPU");
   TORCH_CHECK(kv_indptr.device() == torch::kCPU, "kv_indptr must be on CPU");

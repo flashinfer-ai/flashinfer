@@ -27,6 +27,8 @@ void CutlassSegmentGEMMSM90(torch::Tensor float_workspace_buffer,
                             bool weight_column_major) {
   unsigned int batch_size = x_ptr.size(0);
   auto device = float_workspace_buffer.device();
+  
+  const at::cuda::OptionalCUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(empty_x_data.scalar_type(), c_type, [&] {
