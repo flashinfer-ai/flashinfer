@@ -13,6 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <c10/cuda/CUDAGuard.h>
+
 #include <flashinfer/attention/decode_params.cuh>
 #include <flashinfer/attention/variants.cuh>
 #include <optional>
@@ -60,7 +62,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
     kv_len = k.size(1);
   }
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(device));
+  const at::cuda::CUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto o = torch::empty_like(q);
 
