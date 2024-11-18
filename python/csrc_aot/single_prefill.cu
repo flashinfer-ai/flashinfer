@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 
 #include <flashinfer/attention/mask.cuh>
@@ -56,7 +57,7 @@ torch::Tensor single_prefill_with_kv_cache(
     kv_stride_h = k.stride(0);
     kv_stride_n = k.stride(1);
   }
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(device));
+  const at::cuda::CUDAGuard device_guard(device);
   cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
   auto o = torch::empty_like(q, q.options());
   if (maybe_lse) {
