@@ -23,8 +23,8 @@ from typing import Any, List, Literal, Optional, Tuple, Union, overload
 import torch
 
 from .jit import (
-    gen_batch_prefill_cu,
-    gen_single_prefill_cu,
+    gen_batch_prefill_module,
+    gen_single_prefill_module,
     get_batch_prefill_uri,
     get_single_prefill_uri,
     has_prebuilt_ops,
@@ -49,31 +49,6 @@ from .utils import (
     register_fake_op,
 )
 
-
-def compile_single_prefill_module(
-    *args,
-    verbose: bool = False,
-):
-    uri, sources = gen_single_prefill_cu(*args)
-    return load_cuda_ops(
-        uri,
-        sources,
-        verbose=verbose,
-    )
-
-
-def compile_batch_prefill_module(
-    *args,
-    verbose: bool = False,
-):
-    uri, sources = gen_batch_prefill_cu(*args)
-    return load_cuda_ops(
-        uri,
-        sources,
-        verbose=verbose,
-    )
-
-
 _single_prefill_modules = {}
 _batch_prefill_modules = {}
 
@@ -87,7 +62,7 @@ def get_single_prefill_module(*args):
 
             run_func = _kernels.single_prefill_with_kv_cache
         else:
-            run_func = compile_single_prefill_module(*args).run
+            run_func = gen_single_prefill_module(*args).run
 
         # torch library for single_prefill_with_kv_cache
 
@@ -171,7 +146,7 @@ def get_batch_prefill_module(*args):
             ragged_run_func = _kernels.batch_prefill_with_ragged_kv_cache_run
             paged_run_func = _kernels.batch_prefill_with_paged_kv_cache_run
         else:
-            module = compile_batch_prefill_module(*args)
+            module = gen_batch_prefill_module(*args)
             plan_func = module.plan
             ragged_run_func = module.ragged_run
             paged_run_func = module.paged_run

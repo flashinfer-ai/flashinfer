@@ -14,20 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+batch_prefill_suffix = [
+    "_plan.cu",
+    "_ragged_run.cu",
+    "_paged_run.cu",
+    "_pybind.cc",
+]
+
 batch_prefill_templ = [
-    r"""
-#include <optional>
-#include <flashinfer/attention/prefill.cuh>
-#include <flashinfer/attention/scheduler.cuh>
-#include <flashinfer/attention/prefill_params.cuh>
-#include <flashinfer/attention/variants.cuh>
+    r"""#include <flashinfer/attention/scheduler.cuh>
 #include "pytorch_extension_utils.h"
 
 using namespace flashinfer;
-
-{% set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
-using RaggedParamsT = BatchPrefillRaggedParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ dtype_idx }}>;
-using PagedParamsT = BatchPrefillPagedParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ dtype_idx }}>;
 
 std::vector<int64_t> BatchPrefillWithKVCachePlan(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
@@ -59,6 +57,19 @@ std::vector<int64_t> BatchPrefillWithKVCachePlan(
 
   return plan_info.ToVector();
 }
+""",
+    r"""
+#include <optional>
+#include <flashinfer/attention/scheduler.cuh>
+#include <flashinfer/attention/prefill.cuh>
+#include <flashinfer/attention/prefill_params.cuh>
+#include <flashinfer/attention/variants.cuh>
+#include "pytorch_extension_utils.h"
+
+using namespace flashinfer;
+
+{% set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
+using RaggedParamsT = BatchPrefillRaggedParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ dtype_idx }}>;
 
 void BatchPrefillWithRaggedKVCacheRun(
   unsigned int mask_mode_code,
@@ -148,6 +159,18 @@ void BatchPrefillWithRaggedKVCacheRun(
 
   TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithRaggedKVCache failed with error ", cudaGetErrorString(status));
 }
+""",
+    r"""#include <optional>
+#include <flashinfer/attention/scheduler.cuh>
+#include <flashinfer/attention/prefill.cuh>
+#include <flashinfer/attention/prefill_params.cuh>
+#include <flashinfer/attention/variants.cuh>
+#include "pytorch_extension_utils.h"
+
+using namespace flashinfer;
+
+{% set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
+using PagedParamsT = BatchPrefillPagedParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ dtype_idx }}>;
 
 void BatchPrefillWithPagedKVCacheRun(
   unsigned int mask_mode_code,
@@ -256,7 +279,6 @@ void BatchPrefillWithPagedKVCacheRun(
   });
   TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithPagedKVCache failed with error ", cudaGetErrorString(status));
 }
-
 """,
     r"""#include "pytorch_extension_utils.h"
 

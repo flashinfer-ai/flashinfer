@@ -14,9 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+batch_decode_mla_suffix = [
+    "_plan.cu",
+    "_run.cu",
+    "_pybind.cc",
+]
+
 batch_decode_mla_templ = [
-    r"""
-#include <optional>
+    r"""#include <optional>
 #include <flashinfer/attention/decode.cuh>
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/attention/variants.cuh>
@@ -62,6 +67,19 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlanMLA(
 
   return plan_info.ToVector();
 }
+"""
+    r"""
+#include <optional>
+#include <flashinfer/attention/decode.cuh>
+#include <flashinfer/attention/scheduler.cuh>
+#include <flashinfer/attention/variants.cuh>
+#include <flashinfer/attention/decode_params.cuh>
+#include "pytorch_extension_utils.h"
+
+using namespace flashinfer;
+
+using ParamsT = BatchDecodeParamsMLA<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ dtype_idx }}>;
+using AttentionVariant = ComposedAttention<ParamsT, get_variant_code(/*use_custom_mask=*/false, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, /*use_alibi*/false)>;
 
 void BatchDecodeWithPagedKVCacheRunMLA(
     at::Tensor float_workspace_buffer,

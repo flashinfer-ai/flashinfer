@@ -14,6 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+single_decode_suffix = [
+    ".cu",
+    "_pybind.cc",
+]
+
 customizable_single_decode_templ = [
     r"""
 #include <optional>

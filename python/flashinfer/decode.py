@@ -22,14 +22,13 @@ from typing import Any, List, Literal, Optional, Tuple, Union, overload
 import torch
 
 from .jit import (
-    gen_batch_decode_cu,
-    gen_batch_decode_mla_cu,
-    gen_single_decode_cu,
+    gen_batch_decode_mla_module,
+    gen_batch_decode_module,
+    gen_single_decode_module,
     get_batch_decode_mla_uri,
     get_batch_decode_uri,
     get_single_decode_uri,
     has_prebuilt_ops,
-    load_cuda_ops,
     prebuilt_ops_uri,
 )
 from .prefill import get_batch_prefill_module, get_single_prefill_module
@@ -50,43 +49,6 @@ from .utils import (
     register_fake_op,
 )
 
-
-def compile_single_decode_module(
-    *args,
-    verbose: bool = False,
-):
-    uri, sources = gen_single_decode_cu(*args)
-    return load_cuda_ops(
-        uri,
-        sources,
-        verbose=verbose,
-    )
-
-
-def compile_batch_decode_module(
-    *args,
-    verbose: bool = False,
-):
-    uri, sources = gen_batch_decode_cu(*args)
-    return load_cuda_ops(
-        uri,
-        sources,
-        verbose=verbose,
-    )
-
-
-def compile_batch_decode_mla_module(
-    *args,
-    verbose: bool = False,
-):
-    uri, sources = gen_batch_decode_mla_cu(*args)
-    return load_cuda_ops(
-        uri,
-        sources,
-        verbose=verbose,
-    )
-
-
 _single_decode_modules = {}
 _batch_decode_modules = {}
 _batch_decode_mla_modules = {}
@@ -101,7 +63,7 @@ def get_single_decode_module(*args):
 
             run_func = _kernels.single_decode_with_kv_cache
         else:
-            run_func = compile_single_decode_module(*args).run
+            run_func = gen_single_decode_module(*args).run
 
         # torch library for single_decode_with_kv_cache
 
@@ -183,7 +145,7 @@ def get_batch_decode_module(*args):
             )
             run_func = _kernels.batch_decode_with_paged_kv_cache_run
         else:
-            mod = compile_batch_decode_module(*args)
+            mod = gen_batch_decode_module(*args)
             plan_func = mod.plan
             run_func = mod.run
 
@@ -307,7 +269,7 @@ def single_decode_with_kv_cache_with_jit_module(
 def get_batch_decode_mla_module(*args):
     global _batch_decode_mla_modules
     if args not in _batch_decode_mla_modules:
-        _batch_decode_mla_modules[args] = compile_batch_decode_mla_module(*args)
+        _batch_decode_mla_modules[args] = gen_batch_decode_mla_module(*args)
     return _batch_decode_mla_modules[args]
 
 

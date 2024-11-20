@@ -18,12 +18,7 @@ from types import SimpleNamespace
 
 import torch
 
-from .jit import (
-    FLASHINFER_GEN_SRC_DIR,
-    gen_act_and_mul_cu,
-    has_prebuilt_ops,
-    load_cuda_ops,
-)
+from .jit import gen_act_and_mul_module, has_prebuilt_ops, load_cuda_ops
 from .utils import get_cuda_stream, register_custom_op, register_fake_op
 
 silu_def_cu_str = r"""
@@ -54,17 +49,6 @@ act_func_def_str = {
 }
 
 
-def compile_act_and_mul_module(name: str, act_func_def: str, verbose: bool = False):
-    gen_act_and_mul_cu(name, act_func_def)
-    return load_cuda_ops(
-        f"{name}_and_mul",
-        [
-            FLASHINFER_GEN_SRC_DIR / f"{name}_and_mul.cu",
-        ],
-        verbose=verbose,
-    )
-
-
 _jit_modules = {}
 
 
@@ -76,7 +60,7 @@ def get_act_and_mul_module(act_func_name: str):
 
             module = _kernels
         else:
-            module = compile_act_and_mul_module(
+            module = gen_act_and_mul_module(
                 act_func_name, act_func_def_str[act_func_name]
             )
 

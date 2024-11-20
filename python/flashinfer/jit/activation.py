@@ -18,6 +18,7 @@ import os
 
 import jinja2
 
+from .core import load_cuda_ops
 from .env import FLASHINFER_GEN_SRC_DIR
 from .utils import write_if_different
 
@@ -59,11 +60,16 @@ def get_act_and_mul_cu_str(act_func_name: str, act_func_def: str) -> str:
     return template.render(act_func_name=act_func_name, act_func_def=act_func_def)
 
 
-def gen_act_and_mul_cu(act_func_name: str, act_func_def: str) -> None:
+def gen_act_and_mul_module(act_func_name: str, act_func_def: str) -> None:
     gen_directory = FLASHINFER_GEN_SRC_DIR
     if not os.path.exists(gen_directory):
         os.makedirs(gen_directory)
+    sources = [gen_directory / f"{act_func_name}_and_mul.cu"]
     write_if_different(
-        gen_directory / f"{act_func_name}_and_mul.cu",
+        sources[0],
         get_act_and_mul_cu_str(act_func_name, act_func_def),
+    )
+    return load_cuda_ops(
+        f"{act_func_name}_and_mul",
+        sources,
     )
