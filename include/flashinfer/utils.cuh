@@ -63,36 +63,36 @@
     __VA_ARGS__                                                                                 \
   }
 
-#define DISPATCH_NUM_FRAGS_Q(num_frags_q, NUM_FRAGS_Q, ...) \
-  if (num_frags_q == 1) {                                   \
-    constexpr size_t NUM_FRAGS_Q = 1;                       \
-    __VA_ARGS__                                             \
-  } else if (num_frags_q == 2) {                            \
-    constexpr size_t NUM_FRAGS_Q = 2;                       \
-    __VA_ARGS__                                             \
-  } else {                                                  \
-    std::ostringstream err_msg;                             \
-    err_msg << "Unsupported num_frags_q: " << num_frags_q;  \
-    FLASHINFER_ERROR(err_msg.str());                        \
+#define DISPATCH_NUM_MMA_Q(num_mma_q, NUM_MMA_Q, ...)  \
+  if (num_mma_q == 1) {                                \
+    constexpr size_t NUM_MMA_Q = 1;                    \
+    __VA_ARGS__                                        \
+  } else if (num_mma_q == 2) {                         \
+    constexpr size_t NUM_MMA_Q = 2;                    \
+    __VA_ARGS__                                        \
+  } else {                                             \
+    std::ostringstream err_msg;                        \
+    err_msg << "Unsupported num_mma_q: " << num_mma_q; \
+    FLASHINFER_ERROR(err_msg.str());                   \
   }
 
-#define DISPATCH_NUM_FRAGS_KV(max_frags_kv, NUM_FRAGS_KV, ...) \
-  if (max_frags_kv >= 8) {                                     \
-    constexpr size_t NUM_FRAGS_KV = 8;                         \
-    __VA_ARGS__                                                \
-  } else if (max_frags_kv >= 4) {                              \
-    constexpr size_t NUM_FRAGS_KV = 4;                         \
-    __VA_ARGS__                                                \
-  } else if (max_frags_kv >= 2) {                              \
-    constexpr size_t NUM_FRAGS_KV = 2;                         \
-    __VA_ARGS__                                                \
-  } else if (max_frags_kv >= 1) {                              \
-    constexpr size_t NUM_FRAGS_KV = 1;                         \
-    __VA_ARGS__                                                \
-  } else {                                                     \
-    std::ostringstream err_msg;                                \
-    err_msg << "Unsupported max_frags_kv: " << max_frags_kv;   \
-    FLASHINFER_ERROR(err_msg.str());                           \
+#define DISPATCH_NUM_MMA_KV(max_mma_kv, NUM_MMA_KV, ...) \
+  if (max_mma_kv >= 8) {                                 \
+    constexpr size_t NUM_MMA_KV = 8;                     \
+    __VA_ARGS__                                          \
+  } else if (max_mma_kv >= 4) {                          \
+    constexpr size_t NUM_MMA_KV = 4;                     \
+    __VA_ARGS__                                          \
+  } else if (max_mma_kv >= 2) {                          \
+    constexpr size_t NUM_MMA_KV = 2;                     \
+    __VA_ARGS__                                          \
+  } else if (max_mma_kv >= 1) {                          \
+    constexpr size_t NUM_MMA_KV = 1;                     \
+    __VA_ARGS__                                          \
+  } else {                                               \
+    std::ostringstream err_msg;                          \
+    err_msg << "Unsupported max_mma_kv: " << max_mma_kv; \
+    FLASHINFER_ERROR(err_msg.str());                     \
   }
 
 #define DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, ...)   \
