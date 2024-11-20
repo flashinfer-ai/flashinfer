@@ -4,7 +4,6 @@ global-exclude *.so
 
 prune */__pycache__
 prune csrc
-prune csrc_aot
 exclude flashinfer/jit/aot_config.py
 exclude aot_setup.py
 exclude mypy.ini

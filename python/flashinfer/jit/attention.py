@@ -38,7 +38,7 @@ from .utils import (
 )
 
 
-def get_single_decode_cu_str(
+def get_single_decode_cu_pybind_str(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
@@ -46,17 +46,20 @@ def get_single_decode_cu_str(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
-) -> str:
-    template = jinja2.Template(single_decode_templ)
-    return template.render(
-        dtype_q=dtype_map[dtype_q],
-        dtype_kv=dtype_map[dtype_kv],
-        dtype_o=dtype_map[dtype_o],
-        head_dim=head_dim,
-        pos_encoding_mode=pos_encoding_mode_literal[pos_encoding_mode],
-        use_sliding_window="true" if use_sliding_window else "false",
-        use_logits_soft_cap="true" if use_logits_soft_cap else "false",
-    )
+) -> Tuple[str, str]:
+    cu_templ, pybind_templ = map(jinja2.Template, single_decode_templ)
+    return [
+        cu_templ.render(
+            dtype_q=dtype_map[dtype_q],
+            dtype_kv=dtype_map[dtype_kv],
+            dtype_o=dtype_map[dtype_o],
+            head_dim=head_dim,
+            pos_encoding_mode=pos_encoding_mode_literal[pos_encoding_mode],
+            use_sliding_window="true" if use_sliding_window else "false",
+            use_logits_soft_cap="true" if use_logits_soft_cap else "false",
+        ),
+        pybind_templ.render(),
+    ]
 
 
 def get_single_decode_uri(
@@ -79,21 +82,19 @@ def get_single_decode_uri(
     )
 
 
-def gen_single_decode_cu(*args) -> Tuple[str, pathlib.Path]:
+def gen_single_decode_cu(*args) -> Tuple[str, Tuple[pathlib.Path, pathlib.Path]]:
     gen_directory = FLASHINFER_GEN_SRC_DIR
-    if not os.path.exists(gen_directory):
-        os.makedirs(gen_directory)
+    os.makedirs(gen_directory, exist_ok=True)
     uri = get_single_decode_uri(*args)
-    file_name = f"{uri}.cu"
-    path = gen_directory / file_name
-    write_if_different(
-        path,
-        get_single_decode_cu_str(*args),
-    )
-    return uri, path
+    cu_path = gen_directory / f"{uri}.cu"
+    pybind_path = gen_directory / f"{uri}_pybind.cc"
+    cu_str, pybind_str = get_single_decode_cu_pybind_str(*args)
+    write_if_different(cu_path, cu_str)
+    write_if_different(pybind_path, pybind_str)
+    return uri, [cu_path, pybind_path]
 
 
-def get_batch_decode_cu_str(
+def get_batch_decode_cu_pybind_str(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
@@ -102,18 +103,21 @@ def get_batch_decode_cu_str(
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
-) -> str:
-    template = jinja2.Template(batch_decode_templ)
-    return template.render(
-        dtype_q=dtype_map[dtype_q],
-        dtype_kv=dtype_map[dtype_kv],
-        dtype_o=dtype_map[dtype_o],
-        dtype_idx=dtype_map[dtype_idx],
-        head_dim=head_dim,
-        pos_encoding_mode=pos_encoding_mode_literal[pos_encoding_mode],
-        use_sliding_window="true" if use_sliding_window else "false",
-        use_logits_soft_cap="true" if use_logits_soft_cap else "false",
-    )
+) -> Tuple[str, str]:
+    cu_templ, pybind_templ = map(jinja2.Template, batch_decode_templ)
+    return [
+        cu_templ.render(
+            dtype_q=dtype_map[dtype_q],
+            dtype_kv=dtype_map[dtype_kv],
+            dtype_o=dtype_map[dtype_o],
+            dtype_idx=dtype_map[dtype_idx],
+            head_dim=head_dim,
+            pos_encoding_mode=pos_encoding_mode_literal[pos_encoding_mode],
+            use_sliding_window="true" if use_sliding_window else "false",
+            use_logits_soft_cap="true" if use_logits_soft_cap else "false",
+        ),
+        pybind_templ.render(),
+    ]
 
 
 def get_batch_decode_uri(
@@ -138,21 +142,20 @@ def get_batch_decode_uri(
     )
 
 
-def gen_batch_decode_cu(*args) -> Tuple[str, pathlib.Path]:
+def gen_batch_decode_cu(*args) -> Tuple[str, Tuple[pathlib.Path, pathlib.Path]]:
     gen_directory = FLASHINFER_GEN_SRC_DIR
     if not os.path.exists(gen_directory):
         os.makedirs(gen_directory)
     uri = get_batch_decode_uri(*args)
-    file_name = f"{uri}.cu"
-    path = gen_directory / file_name
-    write_if_different(
-        path,
-        get_batch_decode_cu_str(*args),
-    )
-    return uri, path
+    cu_path = gen_directory / f"{uri}.cu"
+    pybind_path = gen_directory / f"{uri}_pybind.cc"
+    cu_str, pybind_str = get_batch_decode_cu_pybind_str(*args)
+    write_if_different(cu_path, cu_str)
+    write_if_different(pybind_path, pybind_str)
+    return uri, [cu_path, pybind_path]
 
 
-def get_batch_decode_mla_cu_str(
+def get_batch_decode_mla_cu_pybind_str(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
@@ -161,18 +164,21 @@ def get_batch_decode_mla_cu_str(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
 ) -> str:
-    template = jinja2.Template(batch_decode_mla_templ)
-    return template.render(
-        dtype_q=dtype_map[dtype_q],
-        dtype_kv=dtype_map[dtype_kv],
-        dtype_o=dtype_map[dtype_o],
-        dtype_idx=dtype_map[dtype_idx],
-        head_dim_ckv=head_dim,
-        head_dim_kpe=head_dim
-        // 8,  # fixme: head_dim_ckv(kv_lora_rank) is 8 times the size of head_dim_kpe(qk_rope_head_dim) for all MLA model (DeepSeek-V2-Lite, DeepSeek-V2.5, MiniCPM3) at the time Oct.2024
-        use_sliding_window="true" if use_sliding_window else "false",
-        use_logits_soft_cap="true" if use_logits_soft_cap else "false",
-    )
+    cu_templ, pybind_templ = map(jinja2.Template, batch_decode_mla_templ)
+    return [
+        cu_templ.render(
+            dtype_q=dtype_map[dtype_q],
+            dtype_kv=dtype_map[dtype_kv],
+            dtype_o=dtype_map[dtype_o],
+            dtype_idx=dtype_map[dtype_idx],
+            head_dim_ckv=head_dim,
+            head_dim_kpe=head_dim
+            // 8,  # fixme: head_dim_ckv(kv_lora_rank) is 8 times the size of head_dim_kpe(qk_rope_head_dim) for all MLA model (DeepSeek-V2-Lite, DeepSeek-V2.5, MiniCPM3) at the time Oct.2024
+            use_sliding_window="true" if use_sliding_window else "false",
+            use_logits_soft_cap="true" if use_logits_soft_cap else "false",
+        ),
+        pybind_templ.render(),
+    ]
 
 
 def get_batch_decode_mla_uri(
@@ -200,16 +206,15 @@ def gen_batch_decode_mla_cu(*args) -> None:
     if not os.path.exists(gen_directory):
         os.makedirs(gen_directory)
     uri = get_batch_decode_mla_uri(*args)
-    file_name = f"{uri}.cu"
-    path = gen_directory / file_name
-    write_if_different(
-        path,
-        get_batch_decode_mla_cu_str(*args),
-    )
-    return uri, path
+    cu_path = gen_directory / f"{uri}.cu"
+    pybind_path = gen_directory / f"{uri}_pybind.cc"
+    cu_str, pybind_str = get_batch_decode_mla_cu_pybind_str(*args)
+    write_if_different(cu_path, cu_str)
+    write_if_different(pybind_path, pybind_str)
+    return uri, [cu_path, pybind_path]
 
 
-def get_single_prefill_cu_str(
+def get_single_prefill_cu_pybind_str(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
@@ -219,17 +224,20 @@ def get_single_prefill_cu_str(
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
 ) -> str:
-    template = jinja2.Template(single_prefill_templ)
-    return template.render(
-        dtype_q=dtype_map[dtype_q],
-        dtype_kv=dtype_map[dtype_kv],
-        dtype_o=dtype_map[dtype_o],
-        head_dim=head_dim,
-        pos_encoding_mode=pos_encoding_mode_literal[pos_encoding_mode],
-        use_sliding_window="true" if use_sliding_window else "false",
-        use_logits_soft_cap="true" if use_logits_soft_cap else "false",
-        use_fp16_qk_reduction="true" if use_fp16_qk_reduction else "false",
-    )
+    cu_templ, pybind_templ = map(jinja2.Template, single_prefill_templ)
+    return [
+        cu_templ.render(
+            dtype_q=dtype_map[dtype_q],
+            dtype_kv=dtype_map[dtype_kv],
+            dtype_o=dtype_map[dtype_o],
+            head_dim=head_dim,
+            pos_encoding_mode=pos_encoding_mode_literal[pos_encoding_mode],
+            use_sliding_window="true" if use_sliding_window else "false",
+            use_logits_soft_cap="true" if use_logits_soft_cap else "false",
+            use_fp16_qk_reduction="true" if use_fp16_qk_reduction else "false",
+        ),
+        pybind_templ.render(),
+    ]
 
 
 def get_single_prefill_uri(
@@ -254,21 +262,20 @@ def get_single_prefill_uri(
     )
 
 
-def gen_single_prefill_cu(*args) -> Tuple[str, pathlib.Path]:
+def gen_single_prefill_cu(*args) -> Tuple[str, Tuple[pathlib.Path, pathlib.Path]]:
     gen_directory = FLASHINFER_GEN_SRC_DIR
     if not os.path.exists(gen_directory):
         os.makedirs(gen_directory)
     uri = get_single_prefill_uri(*args)
-    file_name = f"{uri}.cu"
-    path = gen_directory / file_name
-    write_if_different(
-        path,
-        get_single_prefill_cu_str(*args),
-    )
-    return uri, path
+    cu_path = gen_directory / f"{uri}.cu"
+    pybind_path = gen_directory / f"{uri}_pybind.cc"
+    cu_str, pybind_str = get_single_prefill_cu_pybind_str(*args)
+    write_if_different(cu_path, cu_str)
+    write_if_different(pybind_path, pybind_str)
+    return uri, [cu_path, pybind_path]
 
 
-def get_batch_prefill_cu_str(
+def get_batch_prefill_cu_pybind_str(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
@@ -278,19 +285,22 @@ def get_batch_prefill_cu_str(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
-) -> str:
-    template = jinja2.Template(batch_prefill_templ)
-    return template.render(
-        dtype_q=dtype_map[dtype_q],
-        dtype_kv=dtype_map[dtype_kv],
-        dtype_o=dtype_map[dtype_o],
-        dtype_idx=dtype_map[dtype_idx],
-        head_dim=head_dim,
-        pos_encoding_mode=pos_encoding_mode_literal[pos_encoding_mode],
-        use_sliding_window="true" if use_sliding_window else "false",
-        use_logits_soft_cap="true" if use_logits_soft_cap else "false",
-        use_fp16_qk_reduction="true" if use_fp16_qk_reduction else "false",
-    )
+) -> Tuple[str, str]:
+    cu_templ, pybind_templ = map(jinja2.Template, batch_prefill_templ)
+    return [
+        cu_templ.render(
+            dtype_q=dtype_map[dtype_q],
+            dtype_kv=dtype_map[dtype_kv],
+            dtype_o=dtype_map[dtype_o],
+            dtype_idx=dtype_map[dtype_idx],
+            head_dim=head_dim,
+            pos_encoding_mode=pos_encoding_mode_literal[pos_encoding_mode],
+            use_sliding_window="true" if use_sliding_window else "false",
+            use_logits_soft_cap="true" if use_logits_soft_cap else "false",
+            use_fp16_qk_reduction="true" if use_fp16_qk_reduction else "false",
+        ),
+        pybind_templ.render(),
+    ]
 
 
 def get_batch_prefill_uri(
@@ -317,21 +327,20 @@ def get_batch_prefill_uri(
     )
 
 
-def gen_batch_prefill_cu(*args) -> Tuple[str, pathlib.Path]:
+def gen_batch_prefill_cu(*args) -> Tuple[str, Tuple[pathlib.Path, pathlib.Path]]:
     gen_directory = FLASHINFER_GEN_SRC_DIR
     if not os.path.exists(gen_directory):
         os.makedirs(gen_directory)
     uri = get_batch_prefill_uri(*args)
-    file_name = f"{uri}.cu"
-    path = gen_directory / file_name
-    write_if_different(
-        path,
-        get_batch_prefill_cu_str(*args),
-    )
-    return uri, path
+    cu_path = gen_directory / f"{uri}.cu"
+    pybind_path = gen_directory / f"{uri}_pybind.cc"
+    cu_str, pybind_str = get_batch_prefill_cu_pybind_str(*args)
+    write_if_different(cu_path, cu_str)
+    write_if_different(pybind_path, pybind_str)
+    return uri, [cu_path, pybind_path]
 
 
-def get_customize_single_decode_cu_str(
+def get_customize_single_decode_cu_pybind_str(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
@@ -342,8 +351,8 @@ def get_customize_single_decode_cu_str(
     additional_input_scalar_var_types: List[str],
     variant_name: str,
     variant_decl: str,
-) -> str:
-    template = jinja2.Template(customizable_single_decode_templ)
+) -> Tuple[str, str]:
+    cu_templ, pybind_templ = map(jinja2.Template, customizable_single_decode_templ)
     additional_params_decl = "".join(
         [
             f"{dtype}* {var};\n"
@@ -377,7 +386,7 @@ def get_customize_single_decode_cu_str(
         + [f", {var}({var})" for var in additional_input_scalar_var_names]
     )
     additional_func_params = "".join(
-        [f", torch::Tensor {var}" for var in additional_input_tensor_var_names]
+        [f", at::Tensor {var}" for var in additional_input_tensor_var_names]
         + [
             f", {dtype} {var}"
             for dtype, var in zip(
@@ -395,22 +404,27 @@ def get_customize_single_decode_cu_str(
         + [f", {var}" for var in additional_input_scalar_var_names]
     )
 
-    return template.render(
-        dtype_q=dtype_map[dtype_q],
-        dtype_kv=dtype_map[dtype_kv],
-        dtype_o=dtype_map[dtype_o],
-        head_dim=head_dim,
-        additional_params_decl=additional_params_decl,
-        additional_params=additional_params,
-        additional_params_init=additional_params_init,
-        variant_decl=variant_decl,
-        variant_name=variant_name,
-        additional_func_params=additional_func_params,
-        additional_params_data=additional_params_data,
-    )
+    return [
+        cu_templ.render(
+            dtype_q=dtype_map[dtype_q],
+            dtype_kv=dtype_map[dtype_kv],
+            dtype_o=dtype_map[dtype_o],
+            head_dim=head_dim,
+            additional_params_decl=additional_params_decl,
+            additional_params=additional_params,
+            additional_params_init=additional_params_init,
+            variant_decl=variant_decl,
+            variant_name=variant_name,
+            additional_func_params=additional_func_params,
+            additional_params_data=additional_params_data,
+        ),
+        pybind_templ.render(
+            additional_func_params=additional_func_params,
+        ),
+    ]
 
 
-def get_customize_single_prefill_cu_str(
+def get_customize_single_prefill_cu_pybind_str(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
@@ -421,8 +435,8 @@ def get_customize_single_prefill_cu_str(
     additional_input_scalar_var_types: List[str],
     variant_name: str,
     variant_decl: str,
-) -> str:
-    template = jinja2.Template(customizable_single_prefill_templ)
+) -> Tuple[str, str]:
+    cu_templ, pybind_templ = map(jinja2.Template, customizable_single_prefill_templ)
     additional_params_decl = "".join(
         [
             f"{dtype}* {var};\n"
@@ -456,7 +470,7 @@ def get_customize_single_prefill_cu_str(
         + [f", {var}({var})" for var in additional_input_scalar_var_names]
     )
     additional_func_params = "".join(
-        [f", torch::Tensor {var}" for var in additional_input_tensor_var_names]
+        [f", at::Tensor {var}" for var in additional_input_tensor_var_names]
         + [
             f", {dtype} {var}"
             for dtype, var in zip(
@@ -474,16 +488,21 @@ def get_customize_single_prefill_cu_str(
         + [f", {var}" for var in additional_input_scalar_var_names]
     )
 
-    return template.render(
-        dtype_q=dtype_map[dtype_q],
-        dtype_kv=dtype_map[dtype_kv],
-        dtype_o=dtype_map[dtype_o],
-        head_dim=head_dim,
-        additional_params_decl=additional_params_decl,
-        additional_params=additional_params,
-        additional_params_init=additional_params_init,
-        variant_decl=variant_decl,
-        variant_name=variant_name,
-        additional_func_params=additional_func_params,
-        additional_params_data=additional_params_data,
-    )
+    return [
+        cu_templ.render(
+            dtype_q=dtype_map[dtype_q],
+            dtype_kv=dtype_map[dtype_kv],
+            dtype_o=dtype_map[dtype_o],
+            head_dim=head_dim,
+            additional_params_decl=additional_params_decl,
+            additional_params=additional_params,
+            additional_params_init=additional_params_init,
+            variant_decl=variant_decl,
+            variant_name=variant_name,
+            additional_func_params=additional_func_params,
+            additional_params_data=additional_params_data,
+        ),
+        pybind_templ.render(
+            additional_func_params=additional_func_params,
+        ),
+    ]

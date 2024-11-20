@@ -333,7 +333,7 @@ struct DecodePlanInfo {
     if (vec.size() != 10) {
       std::ostringstream err_msg;
       err_msg << "DecodePlanInfo::FromVector: vec.size() should be 10, but got " << vec.size();
-      throw std::invalid_argument(err_msg.str());
+      FLASHINFER_ERROR(err_msg.str());
     }
     padded_batch_size = vec[0];
     v_offset = vec[1];
@@ -440,14 +440,14 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h, uin
       std::ostringstream err_msg;
       err_msg << "qo_indptr[" << i + 1 << "]" << qo_indptr_h[i + 1] << " - qo_indptr[" << i << "]"
               << qo_indptr_h[i] << " should be non-negative";
-      throw std::invalid_argument(err_msg.str());
+      FLASHINFER_ERROR(err_msg.str());
     }
     kv_len_arr[i] = int64_t(kv_indptr_h[i + 1] - kv_indptr_h[i]);
     if (kv_len_arr[i] < 0) {
       std::ostringstream err_msg;
       err_msg << "kv_indptr[" << i + 1 << "]" << kv_indptr_h[i + 1] << " - kv_indptr[" << i << "]"
               << kv_indptr_h[i] << " should be non-negative";
-      throw std::invalid_argument(err_msg.str());
+      FLASHINFER_ERROR(err_msg.str());
     }
     sum_packed_qo_len += packed_qo_len_arr[i];
   }
@@ -570,7 +570,7 @@ struct PrefillPlanInfo {
     if (vec.size() != 14) {
       std::ostringstream err_msg;
       err_msg << "PrefillPlanInfo::FromVector: vec.size() should be 14, but got " << vec.size();
-      throw std::invalid_argument(err_msg.str());
+      FLASHINFER_ERROR(err_msg.str());
     }
     padded_batch_size = vec[0];
     total_num_rows = vec[1];
@@ -601,7 +601,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
             << num_kv_heads;
-    throw std::invalid_argument(err_msg.str());
+    FLASHINFER_ERROR(err_msg.str());
   }
 
   // step 0: get the number of SMs

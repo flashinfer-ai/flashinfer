@@ -184,5 +184,5 @@ void bench_flashinfer_batch_decode_with_prefill(nvbench::state& state) {
       .add_int64_axis("num_qo_heads", {32})                                                 \
       .add_int64_axis("num_kv_heads", {32, 4})
 
-kENCH_FLASHINFER_BATCH_DECODE(half, half);
+BENCH_FLASHINFER_BATCH_DECODE(half, half);
 BENCH_FLASHINFER_BATCH_DECODE_WITH_PREFILL(half, half);

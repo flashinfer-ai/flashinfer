@@ -19,8 +19,8 @@
 
 using namespace flashinfer;
 
-torch::Tensor sampling_from_probs(torch::Tensor probs, torch::Tensor uniform_samples,
-                                  bool deterministic) {
+void sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
+                         bool deterministic, int64_t cuda_stream) {
   CHECK_INPUT(probs);
   CHECK_INPUT(uniform_samples);
   auto device = probs.device();
@@ -30,26 +30,18 @@ torch::Tensor sampling_from_probs(torch::Tensor probs, torch::Tensor uniform_sam
   CHECK_EQ(probs.size(0), uniform_samples.size(0));
   unsigned int batch_size = probs.size(0);
   unsigned int vocab_size = probs.size(1);
-  probs = probs.to(torch::kFloat32);
-  uniform_samples = uniform_samples.to(torch::kFloat32);
 
-  const at::cuda::OptionalCUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  auto samples = torch::empty({batch_size}, torch::dtype(torch::kInt32).device(device));
-
-  cudaError_t status = sampling::SamplingFromProb(static_cast<float*>(probs.data_ptr()),
-                                                  static_cast<float*>(uniform_samples.data_ptr()),
-                                                  static_cast<int*>(samples.data_ptr()), batch_size,
-                                                  vocab_size, deterministic, torch_current_stream);
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  cudaError_t status = sampling::SamplingFromProb(
+      static_cast<float*>(probs.data_ptr()), static_cast<float*>(uniform_samples.data_ptr()),
+      static_cast<int*>(samples.data_ptr()), batch_size, vocab_size, deterministic, stream);
   TORCH_CHECK(status == cudaSuccess, "SamplingFromProbs failed with error code " +
                                          std::string(cudaGetErrorString(status)));
-  return samples;
 }
 
-std::vector<torch::Tensor> top_p_sampling_from_probs(torch::Tensor probs,
-                                                     torch::Tensor uniform_samples,
-                                                     std::optional<torch::Tensor> maybe_top_p_arr,
-                                                     double top_p_val, bool deterministic) {
+void top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
+                               at::Tensor success, std::optional<at::Tensor> maybe_top_p_arr,
+                               double top_p_val, bool deterministic, int64_t cuda_stream) {
   CHECK_INPUT(probs);
   CHECK_INPUT(uniform_samples);
   auto device = probs.device();
@@ -61,37 +53,20 @@ std::vector<torch::Tensor> top_p_sampling_from_probs(torch::Tensor probs,
   unsigned int vocab_size = probs.size(1);
   unsigned int max_top_p_rounds = uniform_samples.size(0);
   bool has_top_p_arr = maybe_top_p_arr.has_value();
-  auto top_p_arr = maybe_top_p_arr.value_or(torch::empty({0}, torch::dtype(torch::kFloat32)));
-  if (has_top_p_arr) {
-    CHECK_INPUT(top_p_arr);
-    CHECK_DIM(1, top_p_arr);  // top_p_arr: (batch_size,)
-    CHECK_EQ(top_p_arr.size(0), batch_size);
-    CHECK_EQ(top_p_arr.device(), device);
-  }
-  probs = probs.to(torch::kFloat32);
-  uniform_samples = uniform_samples.to(torch::kFloat32);
-  top_p_arr = top_p_arr.to(torch::kFloat32);
 
-  const at::cuda::OptionalCUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  auto samples = torch::empty({batch_size}, torch::dtype(torch::kInt32).device(device));
-  auto success = torch::empty({batch_size}, torch::dtype(torch::kBool).device(device));
-
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaError_t status = sampling::TopPSamplingFromProb<float, int>(
       static_cast<float*>(probs.data_ptr()), static_cast<float*>(uniform_samples.data_ptr()),
       static_cast<int*>(samples.data_ptr()), static_cast<bool*>(success.data_ptr()),
-      has_top_p_arr ? static_cast<float*>(top_p_arr.data_ptr()) : nullptr, batch_size, top_p_val,
-      vocab_size, max_top_p_rounds, deterministic, torch_current_stream);
+      has_top_p_arr ? static_cast<float*>(maybe_top_p_arr->data_ptr()) : nullptr, batch_size,
+      top_p_val, vocab_size, max_top_p_rounds, deterministic, stream);
   TORCH_CHECK(status == cudaSuccess, "TopPSamplingFromProbs failed with error code " +
                                          std::string(cudaGetErrorString(status)));
-
-  return {samples, success};
 }
 
-std::vector<torch::Tensor> top_k_sampling_from_probs(torch::Tensor probs,
-                                                     torch::Tensor uniform_samples,
-                                                     std::optional<torch::Tensor> maybe_top_k_arr,
-                                                     unsigned int top_k_val, bool deterministic) {
+void top_k_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
+                               at::Tensor success, std::optional<at::Tensor> maybe_top_k_arr,
+                               unsigned int top_k_val, bool deterministic, int64_t cuda_stream) {
   CHECK_INPUT(probs);
   CHECK_INPUT(uniform_samples);
   auto device = probs.device();
@@ -103,37 +78,20 @@ std::vector<torch::Tensor> top_k_sampling_from_probs(torch::Tensor probs,
   unsigned int vocab_size = probs.size(1);
   unsigned int max_top_k_rounds = uniform_samples.size(0);
   bool has_top_k_arr = maybe_top_k_arr.has_value();
-  auto top_k_arr = maybe_top_k_arr.value_or(torch::empty({0}, torch::dtype(torch::kInt32)));
-  if (has_top_k_arr) {
-    CHECK_INPUT(top_k_arr);
-    CHECK_DIM(1, top_k_arr);  // top_k_arr: (batch_size,)
-    CHECK_EQ(top_k_arr.size(0), batch_size);
-    CHECK_EQ(top_k_arr.device(), device);
-  }
-  probs = probs.to(torch::kFloat32);
-  uniform_samples = uniform_samples.to(torch::kFloat32);
-  top_k_arr = top_k_arr.to(torch::kInt32);
 
-  const at::cuda::OptionalCUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  auto samples = torch::empty({batch_size}, torch::dtype(torch::kInt32).device(device));
-  auto success = torch::empty({batch_size}, torch::dtype(torch::kBool).device(device));
-
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaError_t status = sampling::TopKSamplingFromProb<float, int>(
       static_cast<float*>(probs.data_ptr()), static_cast<float*>(uniform_samples.data_ptr()),
       static_cast<int*>(samples.data_ptr()), static_cast<bool*>(success.data_ptr()),
-      has_top_k_arr ? static_cast<float*>(top_k_arr.data_ptr()) : nullptr, batch_size, top_k_val,
-      vocab_size, max_top_k_rounds, deterministic, torch_current_stream);
+      has_top_k_arr ? static_cast<float*>(maybe_top_k_arr->data_ptr()) : nullptr, batch_size,
+      top_k_val, vocab_size, max_top_k_rounds, deterministic, stream);
   TORCH_CHECK(status == cudaSuccess, "TopKSamplingFromProbs failed with error code " +
                                          std::string(cudaGetErrorString(status)));
-
-  return {samples, success};
 }
 
-std::vector<torch::Tensor> min_p_sampling_from_probs(torch::Tensor probs,
-                                                     torch::Tensor uniform_samples,
-                                                     std::optional<torch::Tensor> maybe_min_p_arr,
-                                                     double min_p_val, bool deterministic) {
+void min_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
+                               at::Tensor success, std::optional<at::Tensor> maybe_min_p_arr,
+                               double min_p_val, bool deterministic, int64_t cuda_stream) {
   CHECK_INPUT(probs);
   CHECK_INPUT(uniform_samples);
   auto device = probs.device();
@@ -145,37 +103,22 @@ std::vector<torch::Tensor> min_p_sampling_from_probs(torch::Tensor probs,
   unsigned int max_rounds = uniform_samples.size(0);
   CHECK_EQ(uniform_samples.size(1), batch_size);
   bool has_min_p_arr = maybe_min_p_arr.has_value();
-  auto min_p_arr = maybe_min_p_arr.value_or(torch::empty({0}, torch::dtype(torch::kFloat32)));
-  if (has_min_p_arr) {
-    CHECK_INPUT(min_p_arr);
-    CHECK_DIM(1, min_p_arr);  // min_p_arr: (batch_size,)
-    CHECK_EQ(min_p_arr.size(0), batch_size);
-    CHECK_EQ(min_p_arr.device(), device);
-  }
-  min_p_arr = min_p_arr.to(torch::kFloat32);
-  probs = probs.to(torch::kFloat32);
-  uniform_samples = uniform_samples.to(torch::kFloat32);
 
-  const at::cuda::OptionalCUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  auto samples = torch::empty({batch_size}, torch::dtype(torch::kInt32).device(device));
-  auto success = torch::empty({batch_size}, torch::dtype(torch::kBool).device(device));
-
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaError_t status = sampling::MinPSamplingFromProb<float, int>(
       static_cast<float*>(probs.data_ptr()), static_cast<float*>(uniform_samples.data_ptr()),
-      has_min_p_arr ? static_cast<float*>(min_p_arr.data_ptr()) : nullptr,
+      has_min_p_arr ? static_cast<float*>(maybe_min_p_arr->data_ptr()) : nullptr,
       static_cast<int*>(samples.data_ptr()), static_cast<bool*>(success.data_ptr()), batch_size,
-      min_p_val, vocab_size, max_rounds, deterministic, torch_current_stream);
+      min_p_val, vocab_size, max_rounds, deterministic, stream);
   TORCH_CHECK(status == cudaSuccess, "MinPSamplingFromProb failed with error code " +
                                          std::string(cudaGetErrorString(status)));
-
-  return {samples, success};
 }
 
-std::vector<torch::Tensor> top_k_top_p_sampling_from_probs(
-    torch::Tensor probs, torch::Tensor uniform_samples,
-    std::optional<torch::Tensor> maybe_top_k_arr, double top_k_val,
-    std::optional<torch::Tensor> maybe_top_p_arr, double top_p_val, bool deterministic) {
+void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples,
+                                     at::Tensor samples, at::Tensor success,
+                                     std::optional<at::Tensor> maybe_top_k_arr, double top_k_val,
+                                     std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
+                                     bool deterministic, int64_t cuda_stream) {
   CHECK_INPUT(probs);
   CHECK_INPUT(uniform_samples);
   auto device = probs.device();
@@ -187,146 +130,83 @@ std::vector<torch::Tensor> top_k_top_p_sampling_from_probs(
   unsigned int max_rounds = uniform_samples.size(0);
   CHECK_EQ(uniform_samples.size(1), batch_size);
   bool has_top_k_arr = maybe_top_k_arr.has_value();
-  auto top_k_arr = maybe_top_k_arr.value_or(torch::empty({0}, torch::dtype(torch::kInt32)));
-  if (has_top_k_arr) {
-    CHECK_INPUT(top_k_arr);
-    CHECK_DIM(1, top_k_arr);  // top_k_arr: (batch_size,)
-    CHECK_EQ(top_k_arr.size(0), batch_size);
-    CHECK_EQ(top_k_arr.device(), device);
-  }
-  top_k_arr = top_k_arr.to(torch::kInt32);
   bool has_top_p_arr = maybe_top_p_arr.has_value();
-  auto top_p_arr = maybe_top_p_arr.value_or(torch::empty({0}, torch::dtype(torch::kFloat32)));
-  if (has_top_p_arr) {
-    CHECK_INPUT(top_p_arr);
-    CHECK_DIM(1, top_p_arr);  // top_p_arr: (batch_size,)
-    CHECK_EQ(top_p_arr.size(0), batch_size);
-    CHECK_EQ(top_p_arr.device(), device);
-  }
-  top_p_arr = top_p_arr.to(torch::kFloat32);
-  probs = probs.to(torch::kFloat32);
-  uniform_samples = uniform_samples.to(torch::kFloat32);
 
-  const at::cuda::OptionalCUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  auto samples = torch::empty({batch_size}, torch::dtype(torch::kInt32).device(device));
-  auto success = torch::empty({batch_size}, torch::dtype(torch::kBool).device(device));
-
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaError_t status = sampling::TopKTopPSamplingFromProb<float, int>(
       static_cast<float*>(probs.data_ptr()), static_cast<float*>(uniform_samples.data_ptr()),
-      has_top_k_arr ? static_cast<int*>(top_k_arr.data_ptr()) : nullptr,
-      has_top_p_arr ? static_cast<float*>(top_p_arr.data_ptr()) : nullptr,
+      has_top_k_arr ? static_cast<int*>(maybe_top_k_arr->data_ptr()) : nullptr,
+      has_top_p_arr ? static_cast<float*>(maybe_top_p_arr->data_ptr()) : nullptr,
       static_cast<int*>(samples.data_ptr()), static_cast<bool*>(success.data_ptr()), batch_size,
-      top_k_val, top_p_val, vocab_size, max_rounds, deterministic, torch_current_stream);
+      top_k_val, top_p_val, vocab_size, max_rounds, deterministic, stream);
   TORCH_CHECK(status == cudaSuccess, "TopKTopPSamplingFromProbs failed with error code " +
                                          std::string(cudaGetErrorString(status)));
-
-  return {samples, success};
 }
 
-torch::Tensor top_p_renorm_probs(torch::Tensor probs, std::optional<torch::Tensor> maybe_top_p_arr,
-                                 double top_p_val) {
+void top_p_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
+                        std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
+                        int64_t cuda_stream) {
   CHECK_INPUT(probs);
   auto device = probs.device();
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
   unsigned int batch_size = probs.size(0);
   unsigned int vocab_size = probs.size(1);
   bool has_top_p_arr = maybe_top_p_arr.has_value();
-  auto top_p_arr = maybe_top_p_arr.value_or(torch::empty({0}, torch::dtype(torch::kFloat32)));
-  if (has_top_p_arr) {
-    CHECK_INPUT(top_p_arr);
-    CHECK_DIM(1, top_p_arr);  // top_p_arr: (batch_size,)
-    CHECK_EQ(top_p_arr.size(0), batch_size);
-    CHECK_EQ(top_p_arr.device(), device);
-  }
-  top_p_arr = top_p_arr.to(torch::kFloat32);
-  probs = probs.to(torch::kFloat32);
-  
-  const at::cuda::OptionalCUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  auto renorm_probs =
-      torch::empty({batch_size, vocab_size}, torch::dtype(torch::kFloat32).device(device));
 
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaError_t status = sampling::TopPRenormProb<float>(
       static_cast<float*>(probs.data_ptr()), static_cast<float*>(renorm_probs.data_ptr()),
-      has_top_p_arr ? static_cast<float*>(top_p_arr.data_ptr()) : nullptr, batch_size, top_p_val,
-      vocab_size, torch_current_stream);
+      has_top_p_arr ? static_cast<float*>(maybe_top_p_arr->data_ptr()) : nullptr, batch_size,
+      top_p_val, vocab_size, stream);
   TORCH_CHECK(status == cudaSuccess,
               "TopPRenormProb failed with error code " + std::string(cudaGetErrorString(status)));
-  return renorm_probs;
 }
 
-torch::Tensor top_k_renorm_probs(torch::Tensor probs, std::optional<torch::Tensor> maybe_top_k_arr,
-                                 unsigned int top_k_val) {
+void top_k_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
+                        std::optional<at::Tensor> maybe_top_k_arr, unsigned int top_k_val,
+                        int64_t cuda_stream) {
   CHECK_INPUT(probs);
   auto device = probs.device();
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
   unsigned int batch_size = probs.size(0);
   unsigned int vocab_size = probs.size(1);
   bool has_top_k_arr = maybe_top_k_arr.has_value();
-  auto top_k_arr = maybe_top_k_arr.value_or(torch::empty({0}, torch::dtype(torch::kInt32)));
-  if (has_top_k_arr) {
-    CHECK_INPUT(top_k_arr);
-    CHECK_DIM(1, top_k_arr);  // top_k_arr: (batch_size,)
-    CHECK_EQ(top_k_arr.size(0), batch_size);
-    CHECK_EQ(top_k_arr.device(), device);
-  }
-  top_k_arr = top_k_arr.to(torch::kInt32);
-  probs = probs.to(torch::kFloat32);
 
-  const at::cuda::OptionalCUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  auto renorm_probs =
-      torch::empty({batch_size, vocab_size}, torch::dtype(torch::kFloat32).device(device));
-
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaError_t status = sampling::TopKRenormProb<float>(
       static_cast<float*>(probs.data_ptr()), static_cast<float*>(renorm_probs.data_ptr()),
-      has_top_k_arr ? static_cast<int*>(top_k_arr.data_ptr()) : nullptr, batch_size, top_k_val,
-      vocab_size, torch_current_stream);
+      has_top_k_arr ? static_cast<int*>(maybe_top_k_arr->data_ptr()) : nullptr, batch_size,
+      top_k_val, vocab_size, stream);
 
   TORCH_CHECK(status == cudaSuccess,
               "TopKRenormProb failed with error code " + std::string(cudaGetErrorString(status)));
-  return renorm_probs;
 }
 
-torch::Tensor top_k_mask_logits(torch::Tensor logits, std::optional<torch::Tensor> maybe_top_k_arr,
-                                unsigned int top_k_val) {
+void top_k_mask_logits(at::Tensor logits, at::Tensor mask_logits,
+                       std::optional<at::Tensor> maybe_top_k_arr, unsigned int top_k_val,
+                       int64_t cuda_stream) {
   CHECK_INPUT(logits);
   auto device = logits.device();
   CHECK_DIM(2, logits);  // logits: (batch_size, vocab_size)
   unsigned int batch_size = logits.size(0);
   unsigned int vocab_size = logits.size(1);
   bool has_top_k_arr = maybe_top_k_arr.has_value();
-  auto top_k_arr = maybe_top_k_arr.value_or(torch::empty({0}, torch::dtype(torch::kInt32)));
-  if (has_top_k_arr) {
-    CHECK_INPUT(top_k_arr);
-    CHECK_DIM(1, top_k_arr);  // top_k_arr: (batch_size,)
-    CHECK_EQ(top_k_arr.size(0), batch_size);
-    CHECK_EQ(top_k_arr.device(), device);
-  }
-  top_k_arr = top_k_arr.to(torch::kInt32);
-  logits = logits.to(torch::kFloat32);
 
-  const at::cuda::OptionalCUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  auto mask_logits =
-      torch::empty({batch_size, vocab_size}, torch::dtype(torch::kFloat32).device(device));
-
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaError_t status = sampling::TopKMaskLogits<float>(
       static_cast<float*>(logits.data_ptr()), static_cast<float*>(mask_logits.data_ptr()),
-      has_top_k_arr ? static_cast<int*>(top_k_arr.data_ptr()) : nullptr, batch_size, top_k_val,
-      vocab_size, torch_current_stream);
+      has_top_k_arr ? static_cast<int*>(maybe_top_k_arr->data_ptr()) : nullptr, batch_size,
+      top_k_val, vocab_size, stream);
 
   TORCH_CHECK(status == cudaSuccess,
               "TopKMaskLogits failed with error code " + std::string(cudaGetErrorString(status)));
-  return mask_logits;
 }
 
-torch::Tensor chain_speculative_sampling(torch::Tensor draft_probs, torch::Tensor draft_token_ids,
-                                         torch::Tensor uniform_samples, torch::Tensor target_probs,
-                                         torch::Tensor output_accepted_token_num,
-                                         torch::Tensor output_emitted_token_num,
-                                         bool deterministic) {
+void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_ids,
+                                at::Tensor uniform_samples, at::Tensor target_probs,
+                                at::Tensor output_token_ids, at::Tensor output_accepted_token_num,
+                                at::Tensor output_emitted_token_num, bool deterministic,
+                                int64_t cuda_stream) {
   CHECK_INPUT(draft_probs);
   CHECK_INPUT(draft_token_ids);
   CHECK_INPUT(uniform_samples);
@@ -351,26 +231,15 @@ torch::Tensor chain_speculative_sampling(torch::Tensor draft_probs, torch::Tenso
   CHECK_EQ(batch_size, output_accepted_token_num.size(0));
   CHECK_EQ(batch_size, output_emitted_token_num.size(0));
 
-  draft_probs = draft_probs.to(torch::kFloat32);
-  draft_token_ids = draft_token_ids.to(torch::kInt32);
-  uniform_samples = uniform_samples.to(torch::kFloat32);
-  target_probs = target_probs.to(torch::kFloat32);
-
-  const at::cuda::OptionalCUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  auto output_token_ids = torch::empty({batch_size, num_speculate_tokens + 1},
-                                       torch::dtype(torch::kInt32).device(device));
-
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaError_t status = sampling::ChainSpeculativeSampling<float, int>(
       static_cast<float*>(draft_probs.data_ptr()), static_cast<int*>(draft_token_ids.data_ptr()),
       static_cast<float*>(uniform_samples.data_ptr()), static_cast<float*>(target_probs.data_ptr()),
       static_cast<int*>(output_token_ids.data_ptr()),
       static_cast<int*>(output_accepted_token_num.data_ptr()),
       static_cast<int*>(output_emitted_token_num.data_ptr()), batch_size, num_speculate_tokens,
-      vocab_size, deterministic, torch_current_stream);
+      vocab_size, deterministic, stream);
 
   TORCH_CHECK(status == cudaSuccess, "ChainSpeculativeSampling failed with error code " +
                                          std::string(cudaGetErrorString(status)));
-
-  return output_token_ids;
 }

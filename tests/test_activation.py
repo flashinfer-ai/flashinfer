@@ -48,3 +48,6 @@ def test_fused_gelu_mul(dim, batch_size, seq_len):
     y_ref = x[..., dim:] * torch.nn.functional.gelu(x[..., :dim], approximate="none")
     y = flashinfer.activation.gelu_and_mul(x)
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+
+
+test_fused_silu_mul(128, 1, 1)

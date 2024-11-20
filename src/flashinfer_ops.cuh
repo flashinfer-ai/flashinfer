@@ -22,6 +22,7 @@
 #include "flashinfer/allocator.h"
 #include "flashinfer/attention/mask.cuh"
 #include "flashinfer/attention/scheduler.cuh"
+#include "flashinfer/exception.h"
 #include "flashinfer/layout.cuh"
 #include "utils.h"
 
@@ -495,7 +496,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeO* o
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " is not a multiple of num_kv_heads "
             << num_kv_heads;
-    throw std::invalid_argument(err_msg.str());
+    FLASHINFER_ERROR(err_msg.str());
   }
 
   DISPATCH_head_dim(
@@ -546,7 +547,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapper(
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " is not a multiple of num_kv_heads "
             << num_kv_heads;
-    throw std::invalid_argument(err_msg.str());
+    FLASHINFER_ERROR(err_msg.str());
   }
 
   DISPATCH_head_dim(
@@ -585,7 +586,7 @@ cudaError_t BatchDecodeHandlerPlan(BatchDecodeHandler* handler, void* float_buff
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
             << num_kv_heads;
-    throw std::invalid_argument(err_msg.str());
+    FLASHINFER_ERROR(err_msg.str());
   }
   DISPATCH_head_dim(head_dim, HEAD_DIM, {
     DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {

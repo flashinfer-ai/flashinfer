@@ -64,7 +64,7 @@ def write_if_different(path: pathlib.Path, content: str) -> None:
 
 
 def get_instantiation_cu() -> Tuple[List[str], List[str], List[str]]:
-    path = root / "python" / "csrc_aot" / "generated"
+    path = root / "python" / "csrc" / "generated"
     path.mkdir(parents=True, exist_ok=True)
 
     head_dims = os.environ.get("FLASHINFER_HEAD_DIMS", "64,128,256").split(",")
@@ -423,12 +423,12 @@ if __name__ == "__main__":
                 "csrc/quantization.cu",
                 "csrc/rope.cu",
                 "csrc/sampling.cu",
-                "csrc_aot/activation.cu",
-                "csrc_aot/batch_decode.cu",
-                "csrc_aot/batch_prefill.cu",
-                "csrc_aot/flashinfer_ops.cu",
-                "csrc_aot/single_decode.cu",
-                "csrc_aot/single_prefill.cu",
+                "csrc/activation.cu",
+                "csrc/batch_decode.cu",
+                "csrc/batch_prefill.cu",
+                "csrc/single_decode.cu",
+                "csrc/single_prefill.cu",
+                "csrc/flashinfer_ops.cu",
             ]
             + files_decode
             + files_prefill,

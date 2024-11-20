@@ -13,34 +13,32 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <torch/extension.h>
-
 #include <vector>
 
-void apply_rope(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope, torch::Tensor k_rope,
-                torch::Tensor indptr, torch::Tensor offsets, unsigned int rotary_dim,
-                bool interleave, float rope_scale, float rope_theta);
+#include "pytorch_extension_utils.h"
 
-void apply_llama31_rope(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope,
-                        torch::Tensor k_rope, torch::Tensor indptr, torch::Tensor offsets,
-                        unsigned int rotary_dim, bool interleave, float rope_scale,
-                        float rope_theta, float low_freq_factor, float high_freq_factor,
-                        float old_context_length);
+void apply_rope(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope, at::Tensor indptr,
+                at::Tensor offsets, unsigned int rotary_dim, bool interleave, float rope_scale,
+                float rope_theta, int64_t cuda_stream);
 
-void apply_rope_pos_ids(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope,
-                        torch::Tensor k_rope, torch::Tensor pos_ids, unsigned int rotary_dim,
-                        bool interleave, float rope_scale, float rope_theta);
+void apply_llama31_rope(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
+                        at::Tensor indptr, at::Tensor offsets, unsigned int rotary_dim,
+                        bool interleave, float rope_scale, float rope_theta, float low_freq_factor,
+                        float high_freq_factor, float old_context_length, int64_t cuda_stream);
 
-void apply_llama31_rope_pos_ids(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope,
-                                torch::Tensor k_rope, torch::Tensor pos_ids,
-                                unsigned int rotary_dim, bool interleave, float rope_scale,
-                                float rope_theta, float low_freq_factor, float high_freq_factor,
-                                float old_context_length);
+void apply_rope_pos_ids(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
+                        at::Tensor pos_ids, unsigned int rotary_dim, bool interleave,
+                        float rope_scale, float rope_theta, int64_t cuda_stream);
 
-void apply_rope_pos_ids_cos_sin_cache(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope,
-                                      torch::Tensor k_rope, torch::Tensor cos_cache,
-                                      torch::Tensor sin_cache, torch::Tensor pos_ids,
-                                      bool interleave);
+void apply_llama31_rope_pos_ids(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
+                                at::Tensor pos_ids, unsigned int rotary_dim, bool interleave,
+                                float rope_scale, float rope_theta, float low_freq_factor,
+                                float high_freq_factor, float old_context_length,
+                                int64_t cuda_stream);
+
+void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_rope,
+                                      at::Tensor k_rope, at::Tensor cos_cache, at::Tensor sin_cache,
+                                      at::Tensor pos_ids, bool interleave, int64_t cuda_stream);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("apply_rope", &apply_rope, "Apply RoPE");

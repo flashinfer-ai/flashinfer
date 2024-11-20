@@ -19,7 +19,7 @@ from typing import Optional, Tuple
 import torch
 
 from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
-from .utils import register_custom_op, register_fake_op
+from .utils import get_cuda_stream, register_custom_op, register_fake_op
 
 _rope_module = None
 
@@ -55,18 +55,20 @@ def _apply_rope(
     rope_scale: float,
     rope_theta: float,
 ) -> None:
-    get_rope_module().apply_rope(
-        q,
-        k,
-        q_rope,
-        k_rope,
-        indptr,
-        offsets,
-        rotary_dim,
-        interleave,
-        rope_scale,
-        rope_theta,
-    )
+    with q.device as device:
+        get_rope_module().apply_rope(
+            q,
+            k,
+            q_rope,
+            k_rope,
+            indptr,
+            offsets,
+            rotary_dim,
+            interleave,
+            rope_scale,
+            rope_theta,
+            get_cuda_stream(device),
+        )
 
 
 @register_fake_op("flashinfer::apply_rope")
@@ -101,21 +103,23 @@ def _apply_llama31_rope(
     high_freq_factor: float,
     old_context_len: float,
 ) -> None:
-    get_rope_module().apply_llama31_rope(
-        q,
-        k,
-        q_rope,
-        k_rope,
-        indptr,
-        offsets,
-        rotary_dim,
-        interleave,
-        rope_scale,
-        rope_theta,
-        low_freq_factor,
-        high_freq_factor,
-        old_context_len,
-    )
+    with q.device as device:
+        get_rope_module().apply_llama31_rope(
+            q,
+            k,
+            q_rope,
+            k_rope,
+            indptr,
+            offsets,
+            rotary_dim,
+            interleave,
+            rope_scale,
+            rope_theta,
+            low_freq_factor,
+            high_freq_factor,
+            old_context_len,
+            get_cuda_stream(device),
+        )
 
 
 @register_fake_op("flashinfer::apply_llama31_rope")
@@ -149,9 +153,19 @@ def _apply_rope_pos_ids(
     rope_scale: float,
     rope_theta: float,
 ) -> None:
-    get_rope_module().apply_rope_pos_ids(
-        q, k, q_rope, k_rope, pos_ids, rotary_dim, interleave, rope_scale, rope_theta
-    )
+    with q.device as device:
+        get_rope_module().apply_rope_pos_ids(
+            q,
+            k,
+            q_rope,
+            k_rope,
+            pos_ids,
+            rotary_dim,
+            interleave,
+            rope_scale,
+            rope_theta,
+            get_cuda_stream(device),
+        )
 
 
 @register_fake_op("flashinfer::apply_rope_pos_ids")
@@ -182,16 +196,18 @@ def _apply_rope_pos_ids_cos_sin_cache(
     pos_ids: torch.Tensor,
     interleave: bool,
 ) -> None:
-    get_rope_module().apply_rope_pos_ids_cos_sin_cache(
-        q,
-        k,
-        q_rope,
-        k_rope,
-        cos_cache,
-        sin_cache,
-        pos_ids,
-        interleave,
-    )
+    with q.device as device:
+        get_rope_module().apply_rope_pos_ids_cos_sin_cache(
+            q,
+            k,
+            q_rope,
+            k_rope,
+            cos_cache,
+            sin_cache,
+            pos_ids,
+            interleave,
+            get_cuda_stream(device),
+        )
 
 
 @register_fake_op("flashinfer::apply_rope_pos_ids_cos_sin_cache")
@@ -225,20 +241,22 @@ def _apply_llama31_rope_pos_ids(
     high_freq_factor: float,
     old_context_len: float,
 ) -> None:
-    get_rope_module().apply_llama31_rope_pos_ids(
-        q,
-        k,
-        q_rope,
-        k_rope,
-        pos_ids,
-        rotary_dim,
-        interleave,
-        rope_scale,
-        rope_theta,
-        low_freq_factor,
-        high_freq_factor,
-        old_context_len,
-    )
+    with q.device as device:
+        get_rope_module().apply_llama31_rope_pos_ids(
+            q,
+            k,
+            q_rope,
+            k_rope,
+            pos_ids,
+            rotary_dim,
+            interleave,
+            rope_scale,
+            rope_theta,
+            low_freq_factor,
+            high_freq_factor,
+            old_context_len,
+            get_cuda_stream(device),
+        )
 
 
 @register_fake_op("flashinfer::apply_llama31_rope_pos_ids")

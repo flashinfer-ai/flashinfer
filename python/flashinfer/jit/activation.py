@@ -22,10 +22,7 @@ from .env import FLASHINFER_GEN_SRC_DIR
 from .utils import write_if_different
 
 activation_templ = r"""
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <flashinfer/activation.cuh>
-#include <torch/extension.h>
 #include "pytorch_extension_utils.h"
 
 {% set func_name = act_func_name ~ '_and_mul' %}
@@ -34,13 +31,12 @@ using namespace flashinfer;
 
 {{ act_func_def }}
 
-void {{ func_name }}(torch::Tensor& out, torch::Tensor& input) {
+void {{ func_name }}(at::Tensor& out, at::Tensor& input, int64_t cuda_stream) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
   dim3 grid(num_tokens);
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
     dim3 block(std::min(d / vec_size, 1024U));

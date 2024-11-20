@@ -13,15 +13,15 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <torch/extension.h>
+#include "pytorch_extension_utils.h"
 
-void bmm_fp8(const torch::Tensor& A, const torch::Tensor& B, torch::Tensor& D,
-             torch::Tensor& A_scale, torch::Tensor& B_scale);
+void bmm_fp8(at::Tensor A, at::Tensor B, at::Tensor D, at::Tensor A_scale, at::Tensor B_scale,
+             at::Tensor workspace_buffer, int64_t cublas_handle, int64_t cuda_stream);
 
-void CutlassSegmentGEMM(torch::Tensor workspace_buffer, torch::Tensor all_problems,
-                        torch::Tensor x_ptr, torch::Tensor w_ptr, torch::Tensor y_ptr,
-                        torch::Tensor x_ld, torch::Tensor w_ld, torch::Tensor y_ld,
-                        torch::Tensor empty_x_data, bool weight_column_major);
+void CutlassSegmentGEMM(at::Tensor workspace_buffer, at::Tensor all_problems, at::Tensor x_ptr,
+                        at::Tensor w_ptr, at::Tensor y_ptr, at::Tensor x_ld, at::Tensor w_ld,
+                        at::Tensor y_ld, at::Tensor empty_x_data, bool weight_column_major,
+                        int64_t cuda_stream);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("cutlass_segment_gemm", &CutlassSegmentGEMM, "Cutlass Segment GEMM");

@@ -45,6 +45,7 @@ from .utils import (
     _get_range_buf,
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
+    get_cuda_stream,
     register_custom_op,
     register_fake_op,
 )
@@ -54,10 +55,10 @@ def compile_single_decode_module(
     *args,
     verbose: bool = False,
 ):
-    uri, path = gen_single_decode_cu(*args)
+    uri, sources = gen_single_decode_cu(*args)
     return load_cuda_ops(
         uri,
-        [path],
+        sources,
         verbose=verbose,
     )
 
@@ -66,10 +67,10 @@ def compile_batch_decode_module(
     *args,
     verbose: bool = False,
 ):
-    uri, path = gen_batch_decode_cu(*args)
+    uri, sources = gen_batch_decode_cu(*args)
     return load_cuda_ops(
         uri,
-        [path],
+        sources,
         verbose=verbose,
     )
 
@@ -78,10 +79,10 @@ def compile_batch_decode_mla_module(
     *args,
     verbose: bool = False,
 ):
-    uri, path = gen_batch_decode_mla_cu(*args)
+    uri, sources = gen_batch_decode_mla_cu(*args)
     return load_cuda_ops(
         uri,
-        [path],
+        sources,
         verbose=verbose,
     )
 
@@ -118,19 +119,25 @@ def get_single_decode_module(*args):
             rope_scale: float,
             rope_theta: float,
         ) -> torch.Tensor:
-            return run_func(
-                q,
-                k,
-                v,
-                tmp,
-                alibi_slopes,
-                kv_layout_code,
-                window_left,
-                logits_soft_cap,
-                sm_scale,
-                rope_scale,
-                rope_theta,
-            )
+            with q.device as device:
+                o = torch.empty_like(q)
+                run_func(
+                    q,
+                    k,
+                    v,
+                    tmp,
+                    alibi_slopes,
+                    o,
+                    kv_layout_code,
+                    window_left,
+                    logits_soft_cap,
+                    sm_scale,
+                    rope_scale,
+                    rope_theta,
+                    get_cuda_stream(device),
+                )
+
+                return o
 
         @register_fake_op(f"flashinfer::{uri}_run")
         def _fake_run_single_decode(
@@ -211,25 +218,30 @@ def get_batch_decode_module(*args):
             rope_theta: float,
             maybe_lse: Optional[torch.Tensor],
         ) -> torch.Tensor:
-            return run_func(
-                float_workspace_buffer,
-                int_workspace_buffer,
-                plan_info_vec,
-                q,
-                paged_k_cache,
-                paged_v_cache,
-                paged_kv_indptr,
-                paged_kv_indices,
-                paged_kv_last_page_len,
-                alibi_slopes,
-                kv_layout_code,
-                window_left,
-                logits_soft_cap,
-                sm_scale,
-                rope_scale,
-                rope_theta,
-                maybe_lse,
-            )
+            with q.device as device:
+                o = torch.empty_like(q)
+                run_func(
+                    float_workspace_buffer,
+                    int_workspace_buffer,
+                    plan_info_vec,
+                    q,
+                    paged_k_cache,
+                    paged_v_cache,
+                    paged_kv_indptr,
+                    paged_kv_indices,
+                    paged_kv_last_page_len,
+                    alibi_slopes,
+                    o,
+                    kv_layout_code,
+                    window_left,
+                    logits_soft_cap,
+                    sm_scale,
+                    rope_scale,
+                    rope_theta,
+                    maybe_lse,
+                    get_cuda_stream(device),
+                )
+                return o
 
         @register_fake_op(f"flashinfer::{uri}_run")
         def _fake_run_batch_decode(
@@ -273,10 +285,23 @@ def single_decode_with_kv_cache_with_jit_module(
     kv_layout: str = "NHD",
     window_left: int = -1,
 ):
-    tmp = _get_cache_buf("single_decode_with_kv_cache_tmp", 32 * 1024 * 1024, q.device)
-    return jit_module.run(
-        q, k, v, tmp, TensorLayout[kv_layout].value, window_left, *args
-    )
+    with q.device as device:
+        tmp = _get_cache_buf(
+            "single_decode_with_kv_cache_tmp", 32 * 1024 * 1024, device
+        )
+        o = torch.empty_like(q)
+        jit_module.run(
+            q,
+            k,
+            v,
+            tmp,
+            o,
+            TensorLayout[kv_layout].value,
+            window_left,
+            *args,
+            get_cuda_stream(device),
+        )
+        return o
 
 
 def get_batch_decode_mla_module(*args):
@@ -767,18 +792,20 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 False,  # allow_fp16_qk_reduction
             )
-            self._plan_info = self._cached_module.plan(
-                self._float_workspace_buffer,
-                self._int_workspace_buffer,
-                self._pin_memory_int_workspace_buffer,
-                qo_indptr_host,
-                indptr_host,
-                batch_size,
-                num_qo_heads,
-                num_kv_heads,
-                page_size,
-                self.is_cuda_graph_enabled,
-            )
+            with self._float_workspace_buffer.device as device:
+                self._plan_info = self._cached_module.plan(
+                    self._float_workspace_buffer,
+                    self._int_workspace_buffer,
+                    self._pin_memory_int_workspace_buffer,
+                    qo_indptr_host,
+                    indptr_host,
+                    batch_size,
+                    num_qo_heads,
+                    num_kv_heads,
+                    page_size,
+                    self.is_cuda_graph_enabled,
+                    get_cuda_stream(device),
+                )
         else:
             self._cached_module = get_batch_decode_module(
                 q_data_type,
@@ -790,17 +817,19 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 window_left != -1,  # use_sliding_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
             )
-            self._plan_info = self._cached_module.plan(
-                self._float_workspace_buffer,
-                self._int_workspace_buffer,
-                self._pin_memory_int_workspace_buffer,
-                indptr_host,
-                batch_size,
-                num_qo_heads,
-                num_kv_heads,
-                page_size,
-                self.is_cuda_graph_enabled,
-            )
+            with self._float_workspace_buffer.device as device:
+                self._plan_info = self._cached_module.plan(
+                    self._float_workspace_buffer,
+                    self._int_workspace_buffer,
+                    self._pin_memory_int_workspace_buffer,
+                    indptr_host,
+                    batch_size,
+                    num_qo_heads,
+                    num_kv_heads,
+                    page_size,
+                    self.is_cuda_graph_enabled,
+                    get_cuda_stream(device),
+                )
 
         self._pos_encoding_mode = pos_encoding_mode
         self._window_left = window_left
@@ -1288,16 +1317,18 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             window_left != -1,  # use_sliding_window
             logits_soft_cap > 0,  # use_logits_soft_cap
         )
-        self._plan_info = self._cached_module.plan(
-            self._float_workspace_buffer,
-            self._int_workspace_buffer,
-            self._pin_memory_int_workspace_buffer,
-            indptr,
-            batch_size,
-            num_qo_heads,
-            page_size,
-            self.is_cuda_graph_enabled,
-        )
+        with self._float_workspace_buffer.device as device:
+            self._plan_info = self._cached_module.plan(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._pin_memory_int_workspace_buffer,
+                indptr,
+                batch_size,
+                num_qo_heads,
+                page_size,
+                self.is_cuda_graph_enabled,
+                get_cuda_stream(device),
+            )
 
         self._sm_scale = sm_scale
         self._window_left = window_left

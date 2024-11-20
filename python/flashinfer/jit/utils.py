@@ -24,6 +24,8 @@ def write_if_different(path: pathlib.Path, content: str) -> None:
         with open(path, "r") as f:
             if f.read() == content:
                 return
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         f.write(content)
 

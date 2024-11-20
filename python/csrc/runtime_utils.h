@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 by FlashInfer team.
+ * Copyright (c) 2024 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,14 +13,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "pytorch_extension_utils.h"
+#pragma once
 
-void packbits(at::Tensor x, const std::string& bitorder, at::Tensor y, int64_t cuda_stream);
-
-void segment_packbits(at::Tensor x, at::Tensor input_indptr, at::Tensor output_indptr,
-                      const std::string& bitorder, at::Tensor y, int64_t cuda_stream);
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("packbits", &packbits, "GPU packbits operator");
-  m.def("segment_packbits", &segment_packbits, "GPU segment packbits operator");
-}
+#define FLASHINFER_DLL __attribute__((visibility("default")))

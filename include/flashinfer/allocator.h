@@ -18,7 +18,8 @@
 
 #include <memory>
 #include <sstream>
-#include <stdexcept>
+
+#include "exception.h"
 
 namespace flashinfer {
 
@@ -44,7 +45,7 @@ struct AlignedAllocator {
       std::ostringstream oss;
       oss << "Failed to allocate memory for " << name << " with size " << size << " and alignment "
           << alignment << " in AlignedAllocator";
-      throw std::runtime_error(oss.str());
+      FLASHINFER_ERROR(oss.str());
     }
     return nullptr;
   }

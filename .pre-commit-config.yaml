@@ -52,7 +52,7 @@ repos:
       - id: clang-format
         types_or: [c++, c, cuda]
         exclude: |
-          (?x)^(3rdparty/.* src/generated/.* python/flashinfer/jit/aot_config.py python/csrc_aot/generated/.*)$
+          (?x)^(3rdparty/.* src/generated/.* python/flashinfer/jit/aot_config.py)$
 
   - repo: https://github.com/cheshirekow/cmake-format-precommit
     rev: v0.6.13

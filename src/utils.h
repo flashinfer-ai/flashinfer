@@ -28,9 +28,9 @@
 
 #include <random>
 #include <sstream>
-#include <stdexcept>
 
 #include "dispatch.inc"
+#include "flashinfer/exception.h"
 
 #define _DISPATCH_SWITCH(var_name, cond, ...)                                         \
   switch (cond) {                                                                     \
@@ -38,7 +38,7 @@
     default:                                                                          \
       std::ostringstream oss;                                                         \
       oss << __PRETTY_FUNCTION__ << " failed to dispatch " var_name " " << int(cond); \
-      throw std::invalid_argument(oss.str());                                         \
+      FLASHINFER_ERROR(oss.str());                                                    \
   }
 
 #define _DISPATCH_CASE(case_expr, case_var, ...) \

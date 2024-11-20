@@ -13,12 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-
 #include <flashinfer/activation.cuh>
 
-#include "pytorch_extension_utils.h"
+#include "aot_extension_utils.h"
 
 using namespace flashinfer;
 
@@ -35,13 +32,12 @@ __device__ __forceinline__ float gelu_tanh(const float& val) {
   return val * cdf;
 }
 
-void silu_and_mul(torch::Tensor& out, torch::Tensor& input) {
+void silu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
   dim3 grid(num_tokens);
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
     dim3 block(std::min(d / vec_size, 1024U));
@@ -52,13 +48,12 @@ void silu_and_mul(torch::Tensor& out, torch::Tensor& input) {
   });
 }
 
-void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input) {
+void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
   dim3 grid(num_tokens);
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
     dim3 block(std::min(d / vec_size, 1024U));
@@ -69,13 +64,12 @@ void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input) {
   });
 }
 
-void gelu_and_mul(torch::Tensor& out, torch::Tensor& input) {
+void gelu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
   dim3 grid(num_tokens);
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
     dim3 block(std::min(d / vec_size, 1024U));

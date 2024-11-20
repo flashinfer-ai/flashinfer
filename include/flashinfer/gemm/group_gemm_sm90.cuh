@@ -73,7 +73,7 @@ cudaError_t CutlassSegmentGEMMSM90Run(void* float_buffer, size_t float_buffer_si
                   sizeof(DTypeIn) == 1) {
       std::ostringstream err_msg;
       err_msg << "Row-major layout is not supported for fp8 data type";
-      throw std::runtime_error(err_msg.str());
+      FLASHINFER_ERROR(err_msg.str());
     } else {
       using LayoutA = cutlass::layout::RowMajor;
       constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;

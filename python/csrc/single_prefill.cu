@@ -13,15 +13,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <c10/cuda/CUDAGuard.h>
-#include <torch/extension.h>
-
 #include <flashinfer/attention/mask.cuh>
 #include <flashinfer/attention/prefill_params.cuh>
 #include <flashinfer/attention/variants.cuh>
+#include <flashinfer/pos_enc.cuh>
 #include <optional>
 
-#include "pytorch_extension_utils.h"
+#include "aot_extension_utils.h"
 
 namespace flashinfer {
 
@@ -33,12 +31,15 @@ cudaError_t SinglePrefillWithKVCacheDispatched(typename AttentionVariant::Params
 
 }  // namespace flashinfer
 
-torch::Tensor single_prefill_with_kv_cache(
-    unsigned int mask_mode_code, torch::Tensor q, torch::Tensor k, torch::Tensor v,
-    std::optional<torch::Tensor> maybe_packed_custom_mask, torch::Tensor tmp,
-    std::optional<torch::Tensor> maybe_alibi_slopes, unsigned int layout, int32_t window_left,
-    float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta,
-    std::optional<torch::Tensor> maybe_lse) {
+using namespace flashinfer;
+
+void single_prefill_with_kv_cache(unsigned int mask_mode_code, at::Tensor q, at::Tensor k,
+                                  at::Tensor v, std::optional<at::Tensor> maybe_packed_custom_mask,
+                                  at::Tensor tmp, std::optional<at::Tensor> maybe_alibi_slopes,
+                                  at::Tensor o, unsigned int layout, int32_t window_left,
+                                  float logits_soft_cap, float sm_scale, float rope_scale,
+                                  float rope_theta, std::optional<at::Tensor> maybe_lse,
+                                  int64_t cuda_stream) {
   auto device = q.device();
   unsigned int head_dim = q.size(2);
   unsigned int kv_len, qo_len, num_kv_heads, num_qo_heads;
@@ -57,14 +58,10 @@ torch::Tensor single_prefill_with_kv_cache(
     kv_stride_h = k.stride(0);
     kv_stride_n = k.stride(1);
   }
-  const at::cuda::CUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  auto o = torch::empty_like(q, q.options());
   if (maybe_lse) {
     const auto& lse = *maybe_lse;
     TORCH_CHECK(lse.size(0) == qo_len, lse.size(0), q.size(0));
     TORCH_CHECK(lse.size(1) == num_qo_heads, lse.size(1), q.size(1));
-    TORCH_CHECK(lse.dtype() == torch::kFloat32, "lse must be float32");
   }
 
   constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;
@@ -74,6 +71,7 @@ torch::Tensor single_prefill_with_kv_cache(
   auto q_scalar_type = q.scalar_type();
   auto kv_scalar_type = k.scalar_type();
 
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   DISPATCH_PYTORCH_QKV_DTYPE_TO_CTYPE(q_scalar_type, kv_scalar_type, q_type, kv_type, [&] {
     using DTypeQ = q_type;
     using DTypeKV = kv_type;
@@ -103,7 +101,7 @@ torch::Tensor single_prefill_with_kv_cache(
               flashinfer::SinglePrefillWithKVCacheDispatched<HEAD_DIM, POS_ENCODING_MODE,
                                                              /*use_fp16_qk_reduction=*/false,
                                                              MASK_MODE, AttentionVariant>(
-                  params, static_cast<DTypeO*>(tmp.data_ptr()), torch_current_stream);
+                  params, static_cast<DTypeO*>(tmp.data_ptr()), stream);
           TORCH_CHECK(status == cudaSuccess,
                       "SinglePrefillWithKVCache kernel launch failed, error: " +
                           std::string(cudaGetErrorString(status)));
@@ -112,6 +110,4 @@ torch::Tensor single_prefill_with_kv_cache(
       });
     });
   });
-
-  return o;
 }

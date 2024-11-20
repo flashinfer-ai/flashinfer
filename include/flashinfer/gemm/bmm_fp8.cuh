@@ -19,15 +19,17 @@
 #include <cublasLt.h>
 #include <cuda_fp8.h>
 
-#include <stdexcept>
+#include <iostream>
+#include <memory>
 #include <type_traits>
 
-#define FLASHINFER_CUBLAS_CHECK(EXPR)                                                     \
-  {                                                                                       \
-    cublasStatus_t e = (EXPR);                                                            \
-    if (e != CUBLAS_STATUS_SUCCESS) {                                                     \
-      throw std::runtime_error("CUBLAS Error: " + std::string(cublasGetStatusString(e))); \
-    }                                                                                     \
+#include "../exception.h"
+
+#define FLASHINFER_CUBLAS_CHECK(EXPR)                                           \
+  {                                                                             \
+    cublasStatus_t e = (EXPR);                                                  \
+    FLASHINFER_CHECK(e == CUBLAS_STATUS_SUCCESS,                                \
+                     "CUBLAS Error: " + std::string(cublasGetStatusString(e))); \
   }
 
 #ifndef NDEBUG
@@ -131,7 +133,7 @@ cudaDataType_t get_cuda_data_type() {
   } else if constexpr (std::is_same_v<T, half>) {
     return CUDA_R_16F;
   } else {
-    throw std::runtime_error("Unsupported type");
+    FLASHINFER_ERROR("Unsupported type");
   }
 }
 
@@ -155,7 +157,7 @@ cublasStatus_t bmm_fp8_internal_cublaslt(void* workspace, size_t workspace_size_
   cudaDataType_t b_type = get_cuda_data_type<BT>();
   cudaDataType_t d_type = get_cuda_data_type<DT>();
   if (std::is_same_v<AT, __nv_fp8_e5m2> && std::is_same_v<BT, __nv_fp8_e5m2>) {
-    throw std::runtime_error("Unsupported combination: both A and B are e5m2");
+    FLASHINFER_ERROR("Unsupported combination: both A and B are e5m2");
   }
 
   auto a_desp = CuBlasLtMatrixLayout(a_type, m, k, k, true);

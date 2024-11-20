@@ -13,15 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <c10/cuda/CUDAGuard.h>
-#include <torch/extension.h>
-
 #include <flashinfer/attention/decode_params.cuh>
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/attention/variants.cuh>
 #include <optional>
 
-#include "pytorch_extension_utils.h"
+#include "aot_extension_utils.h"
 
 namespace flashinfer {
 
@@ -32,31 +29,28 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(typename AttentionVariant::Par
 
 }  // namespace flashinfer
 
+using namespace flashinfer;
+
 std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
-    bool use_logits_soft_cap, unsigned int head_dim, torch::Tensor empty_q_data,
-    torch::Tensor empty_kv_data, torch::Tensor float_workspace_buffer,
-    torch::Tensor int_workspace_buffer, torch::Tensor page_locked_int_workspace_buffer,
-    torch::Tensor indptr, unsigned int batch_size, unsigned int num_qo_heads,
-    unsigned int num_kv_heads, unsigned int page_size, bool enable_cuda_graph) {
+    bool use_logits_soft_cap, unsigned int head_dim, at::Tensor empty_q_data,
+    at::Tensor empty_kv_data, at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
+    at::Tensor page_locked_int_workspace_buffer, at::Tensor indptr, unsigned int batch_size,
+    unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int page_size,
+    bool enable_cuda_graph, int64_t cuda_stream) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =
       int_workspace_buffer.size(0) * int_workspace_buffer.element_size();
-  auto device = float_workspace_buffer.device();
-  const at::cuda::CUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  TORCH_CHECK(indptr.device() == torch::kCPU, "indptr must be on CPU");
 
   DecodePlanInfo plan_info;
 
   using IdType = int32_t;
-  // check indptr has idtype int32
-  TORCH_CHECK(indptr.scalar_type() == torch::kInt32, "indptr must be int32");
   constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;
 
   auto q_scalar_type = empty_q_data.scalar_type();
   auto kv_scalar_type = empty_kv_data.scalar_type();
 
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   DISPATCH_PYTORCH_QKV_DTYPE_TO_CTYPE(q_scalar_type, kv_scalar_type, q_type, kv_type, [&] {
     using DTypeQ = q_type;
     using DTypeKV = kv_type;
@@ -77,7 +71,7 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
               static_cast<void*>(page_locked_int_workspace_buffer.data_ptr()),
               int_workspace_size_in_bytes, plan_info, static_cast<IdType*>(indptr.data_ptr()),
               batch_size, num_qo_heads, page_size, enable_cuda_graph,
-              /*stream=*/torch_current_stream, work_estimation_func);
+              /*stream=*/stream, work_estimation_func);
 
           TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
                       cudaGetErrorString(status));
@@ -90,13 +84,13 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
   return plan_info.ToVector();
 }
 
-torch::Tensor BatchDecodeWithPagedKVCacheRun(
-    torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
-    std::vector<int64_t> plan_info_vec, torch::Tensor q, torch::Tensor paged_k_cache,
-    torch::Tensor paged_v_cache, torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
-    torch::Tensor paged_kv_last_page_len, std::optional<torch::Tensor> alibi_slopes,
+void BatchDecodeWithPagedKVCacheRun(
+    at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
+    std::vector<int64_t> plan_info_vec, at::Tensor q, at::Tensor paged_k_cache,
+    at::Tensor paged_v_cache, at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices,
+    at::Tensor paged_kv_last_page_len, std::optional<at::Tensor> alibi_slopes, at::Tensor o,
     unsigned int kv_layout_code, int window_left, float logits_soft_cap, float sm_scale,
-    float rope_scale, float rope_theta, std::optional<torch::Tensor> maybe_lse) {
+    float rope_scale, float rope_theta, std::optional<at::Tensor> maybe_lse, int64_t cuda_stream) {
   DecodePlanInfo plan_info;
   plan_info.FromVector(plan_info_vec);
   QKVLayout kv_layout = static_cast<QKVLayout>(kv_layout_code);
@@ -114,14 +108,10 @@ torch::Tensor BatchDecodeWithPagedKVCacheRun(
   }
   uint32_t head_dim = q.size(2);
 
-  const at::cuda::CUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  torch::Tensor o = torch::empty_like(q);
   if (maybe_lse) {
     const auto& lse = *maybe_lse;
     TORCH_CHECK(lse.size(0) == batch_size, lse.size(0), q.size(0));
     TORCH_CHECK(lse.size(1) == num_qo_heads, lse.size(1), q.size(1));
-    TORCH_CHECK(lse.dtype() == torch::kFloat32, "lse must be float32");
   }
 
   TORCH_CHECK(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
@@ -146,6 +136,8 @@ torch::Tensor BatchDecodeWithPagedKVCacheRun(
   auto v_strides = paged_v_cache.strides();
   TORCH_CHECK(k_strides == v_strides, "k/v strides must be identical");
   kv_cache_strides = k_strides.data();
+
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
 
   DISPATCH_PYTORCH_QKV_DTYPE_TO_CTYPE(q_scalar_type, kv_scalar_type, q_type, kv_type, [&] {
     using DTypeQ = q_type;
@@ -194,13 +186,11 @@ torch::Tensor BatchDecodeWithPagedKVCacheRun(
         cudaError_t status =
             flashinfer::BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, POS_ENCODING_MODE,
                                                               AttentionVariant>(
-                params, tmp_v, tmp_s, /*stream=*/torch_current_stream);
+                params, tmp_v, tmp_s, /*stream=*/stream);
         TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
                     cudaGetErrorString(status));
         return true;
       });
     });
   });
-
-  return o;
 }

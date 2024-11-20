@@ -79,13 +79,13 @@ cudaError_t CutlassSegmentGEMMRun(void* workspace_buffer, size_t workspace_buffe
     if (status != cutlass::Status::kSuccess) {
       std::ostringstream err_msg;
       err_msg << "cutlass group_gemm.initialize failed: " << cutlassGetStatusString(status);
-      throw std::runtime_error(err_msg.str());
+      FLASHINFER_ERROR(err_msg.str());
     }
     status = gemm.run(stream);
     if (status != cutlass::Status::kSuccess) {
       std::ostringstream err_msg;
       err_msg << "cutlass group_gemm.run failed: " << cutlassGetStatusString(status);
-      throw std::runtime_error(err_msg.str());
+      FLASHINFER_ERROR(err_msg.str());
     }
   });
 

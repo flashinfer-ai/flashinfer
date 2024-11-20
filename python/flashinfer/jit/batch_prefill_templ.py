@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-batch_prefill_templ = r"""
-#include <torch/extension.h>
+batch_prefill_templ = [
+    r"""
 #include <optional>
 #include <flashinfer/attention/prefill.cuh>
 #include <flashinfer/attention/scheduler.cuh>
@@ -30,26 +30,21 @@ using RaggedParamsT = BatchPrefillRaggedParams<{{ dtype_q }}, {{ dtype_kv }}, {{
 using PagedParamsT = BatchPrefillPagedParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ dtype_idx }}>;
 
 std::vector<int64_t> BatchPrefillWithKVCachePlan(
-    torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
-    torch::Tensor page_locked_int_workspace_buffer,
-    torch::Tensor qo_indptr,
-    torch::Tensor kv_indptr,
+    at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
+    at::Tensor page_locked_int_workspace_buffer,
+    at::Tensor qo_indptr,
+    at::Tensor kv_indptr,
     unsigned int batch_size,
     unsigned int num_qo_heads,
     unsigned int num_kv_heads,
     unsigned int page_size,
-    bool enable_cuda_graph) {
+    bool enable_cuda_graph, int64_t cuda_stream) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =
       int_workspace_buffer.size(0) * int_workspace_buffer.element_size();
 
-  auto device = float_workspace_buffer.device();
-  const at::cuda::OptionalCUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  TORCH_CHECK(qo_indptr.device() == torch::kCPU, "qo_indptr must be on CPU");
-  TORCH_CHECK(kv_indptr.device() == torch::kCPU, "kv_indptr must be on CPU");
-
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   PrefillPlanInfo plan_info;
 
   cudaError_t status = PrefillPlan<{{ dtype_idx }}>(
@@ -58,24 +53,26 @@ std::vector<int64_t> BatchPrefillWithKVCachePlan(
     int_workspace_size_in_bytes,
     plan_info, qo_indptr.data_ptr<{{ dtype_idx }}>(), kv_indptr.data_ptr<{{ dtype_idx }}>(),
     batch_size, num_qo_heads, num_kv_heads, {{ head_dim }}, page_size, enable_cuda_graph,
-    sizeof({{ dtype_o }}), torch_current_stream);
+    sizeof({{ dtype_o }}), stream);
 
   TORCH_CHECK(status == cudaSuccess, "Failed to plan prefill with error: ", cudaGetErrorString(status));
 
   return plan_info.ToVector();
 }
 
-torch::Tensor BatchPrefillWithRaggedKVCacheRun(
+void BatchPrefillWithRaggedKVCacheRun(
   unsigned int mask_mode_code,
-  torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
+  at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
   std::vector<int64_t> plan_info_vec,
-  torch::Tensor q, torch::Tensor k, torch::Tensor v,
-  std::optional<torch::Tensor> maybe_custom_mask,
-  std::optional<torch::Tensor> maybe_alibi_slopes,
-  torch::Tensor qo_indptr, torch::Tensor kv_indptr,
-  std::optional<torch::Tensor> maybe_qk_indptr,
+  at::Tensor q, at::Tensor k, at::Tensor v,
+  std::optional<at::Tensor> maybe_custom_mask,
+  std::optional<at::Tensor> maybe_alibi_slopes,
+  at::Tensor qo_indptr, at::Tensor kv_indptr,
+  std::optional<at::Tensor> maybe_qk_indptr,
+  at::Tensor o,
   unsigned int layout, int32_t window_left, float logits_soft_cap, float sm_scale,
-  float rope_scale, float rope_theta, std::optional<torch::Tensor> maybe_lse) {
+  float rope_scale, float rope_theta, std::optional<at::Tensor> maybe_lse,
+  int64_t cuda_stream) {
   PrefillPlanInfo plan_info;
   plan_info.FromVector(plan_info_vec);
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
@@ -92,15 +89,10 @@ torch::Tensor BatchPrefillWithRaggedKVCacheRun(
     kv_stride_n = k.stride(1);
   }
 
-  auto device = float_workspace_buffer.device();
-  const at::cuda::OptionalCUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  auto o = torch::empty_like(q, q.options());
   if (maybe_lse) {
     const auto& lse = *maybe_lse;
     TORCH_CHECK(lse.size(0) == q.size(0), lse.size(0), q.size(0));
     TORCH_CHECK(lse.size(1) == q.size(1), lse.size(1), q.size(1));
-    TORCH_CHECK(lse.dtype() == torch::kFloat32, "lse must be float32");
   }
 
   void* float_buffer_ptr = float_workspace_buffer.data_ptr();
@@ -142,6 +134,7 @@ torch::Tensor BatchPrefillWithRaggedKVCacheRun(
   cudaError_t status = cudaSuccess;
 
   MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
 
   DISPATCH_MASK_MODE(mask_mode, MASK_MODE, {
     constexpr bool use_custom_mask = MASK_MODE == MaskMode::kCustom;
@@ -149,31 +142,31 @@ torch::Tensor BatchPrefillWithRaggedKVCacheRun(
     DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
       status = BatchPrefillWithRaggedKVCacheDispatched<
         CTA_TILE_Q, {{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, MASK_MODE, RaggedAttentionVariant>(
-          params, tmp_v, tmp_s, torch_current_stream);
+          params, tmp_v, tmp_s, stream);
     });
   });
 
   TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithRaggedKVCache failed with error ", cudaGetErrorString(status));
-
-  return o;
 }
 
-torch::Tensor BatchPrefillWithPagedKVCacheRun(
+void BatchPrefillWithPagedKVCacheRun(
   unsigned int mask_mode_code,
-  torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
+  at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
   std::vector<int64_t> plan_info_vec,
-  torch::Tensor q,
-  torch::Tensor paged_k_cache,
-  torch::Tensor paged_v_cache,
-  std::optional<torch::Tensor> maybe_custom_mask,
-  std::optional<torch::Tensor> maybe_alibi_slopes,
-  torch::Tensor qo_indptr,
-  torch::Tensor paged_kv_indptr,
-  torch::Tensor paged_kv_indices,
-  torch::Tensor paged_kv_last_page_len,
-  std::optional<torch::Tensor> maybe_qk_indptr,
+  at::Tensor q,
+  at::Tensor paged_k_cache,
+  at::Tensor paged_v_cache,
+  std::optional<at::Tensor> maybe_custom_mask,
+  std::optional<at::Tensor> maybe_alibi_slopes,
+  at::Tensor qo_indptr,
+  at::Tensor paged_kv_indptr,
+  at::Tensor paged_kv_indices,
+  at::Tensor paged_kv_last_page_len,
+  std::optional<at::Tensor> maybe_qk_indptr,
+  at::Tensor o,
   unsigned int layout, int32_t window_left, float logits_soft_cap, float sm_scale,
-  float rope_scale, float rope_theta, std::optional<torch::Tensor> maybe_lse) {
+  float rope_scale, float rope_theta, std::optional<at::Tensor> maybe_lse,
+  int64_t cuda_stream) {
   PrefillPlanInfo plan_info;
   plan_info.FromVector(plan_info_vec);
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
@@ -189,14 +182,10 @@ torch::Tensor BatchPrefillWithPagedKVCacheRun(
     num_kv_heads = paged_k_cache.size(2);
   }
 
-  const at::cuda::OptionalCUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  auto o = torch::empty_like(q, q.options());
   if (maybe_lse) {
     const auto& lse = *maybe_lse;
     TORCH_CHECK(lse.size(0) == q.size(0), lse.size(0), q.size(0));
     TORCH_CHECK(lse.size(1) == q.size(1), lse.size(1), q.size(1));
-    TORCH_CHECK(lse.dtype() == torch::kFloat32, "lse must be float32");
   }
 
   void* float_buffer_ptr = static_cast<void*>(float_workspace_buffer.data_ptr());
@@ -254,6 +243,7 @@ torch::Tensor BatchPrefillWithPagedKVCacheRun(
   cudaError_t status = cudaSuccess;
 
   MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
 
   DISPATCH_MASK_MODE(mask_mode, MASK_MODE, {
     constexpr bool use_custom_mask = MASK_MODE == MaskMode::kCustom;
@@ -261,18 +251,63 @@ torch::Tensor BatchPrefillWithPagedKVCacheRun(
     DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
       status = BatchPrefillWithPagedKVCacheDispatched<
         CTA_TILE_Q, {{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, MASK_MODE, PagedAttentionVariant>(
-          params, tmp_v, tmp_s, torch_current_stream);
+          params, tmp_v, tmp_s, stream);
     });
   });
-
   TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithPagedKVCache failed with error ", cudaGetErrorString(status));
-
-  return o;
 }
+
+""",
+    r"""#include "pytorch_extension_utils.h"
+
+std::vector<int64_t> BatchPrefillWithKVCachePlan(
+    at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
+    at::Tensor page_locked_int_workspace_buffer,
+    at::Tensor qo_indptr,
+    at::Tensor kv_indptr,
+    unsigned int batch_size,
+    unsigned int num_qo_heads,
+    unsigned int num_kv_heads,
+    unsigned int page_size,
+    bool enable_cuda_graph, int64_t cuda_stream);
+
+void BatchPrefillWithRaggedKVCacheRun(
+  unsigned int mask_mode_code,
+  at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
+  std::vector<int64_t> plan_info_vec,
+  at::Tensor q, at::Tensor k, at::Tensor v,
+  std::optional<at::Tensor> maybe_custom_mask,
+  std::optional<at::Tensor> maybe_alibi_slopes,
+  at::Tensor qo_indptr, at::Tensor kv_indptr,
+  std::optional<at::Tensor> maybe_qk_indptr,
+  at::Tensor o,
+  unsigned int layout, int32_t window_left, float logits_soft_cap, float sm_scale,
+  float rope_scale, float rope_theta, std::optional<at::Tensor> maybe_lse,
+  int64_t cuda_stream);
+
+void BatchPrefillWithPagedKVCacheRun(
+  unsigned int mask_mode_code,
+  at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
+  std::vector<int64_t> plan_info_vec,
+  at::Tensor q,
+  at::Tensor paged_k_cache,
+  at::Tensor paged_v_cache,
+  std::optional<at::Tensor> maybe_custom_mask,
+  std::optional<at::Tensor> maybe_alibi_slopes,
+  at::Tensor qo_indptr,
+  at::Tensor paged_kv_indptr,
+  at::Tensor paged_kv_indices,
+  at::Tensor paged_kv_last_page_len,
+  std::optional<at::Tensor> maybe_qk_indptr,
+  at::Tensor o,
+  unsigned int layout, int32_t window_left, float logits_soft_cap, float sm_scale,
+  float rope_scale, float rope_theta, std::optional<at::Tensor> maybe_lse,
+  int64_t cuda_stream);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("plan", &BatchPrefillWithKVCachePlan);
   m.def("ragged_run", &BatchPrefillWithRaggedKVCacheRun);
   m.def("paged_run", &BatchPrefillWithPagedKVCacheRun);
 }
-"""
+""",
+]

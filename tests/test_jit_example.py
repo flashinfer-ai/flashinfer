@@ -5,8 +5,8 @@ import flashinfer.jit
 import torch
 from flashinfer.decode import single_decode_with_kv_cache_with_jit_module
 from flashinfer.jit.attention import (
-    get_customize_single_decode_cu_str,
-    get_customize_single_prefill_cu_str,
+    get_customize_single_decode_cu_pybind_str,
+    get_customize_single_prefill_cu_pybind_str,
 )
 from flashinfer.prefill import single_prefill_with_kv_cache_with_jit_module
 from flashinfer.utils import MaskMode
@@ -14,17 +14,14 @@ from flashinfer.utils import MaskMode
 import flashinfer
 
 
-def generate_module(module_name: str, cuda_ops_str: str):
+def generate_module(module_name: str, cu_str: str, pybind_str: str):
     gen_directory = flashinfer.jit.FLASHINFER_GEN_SRC_DIR
-    flashinfer.jit.utils.write_if_different(
-        gen_directory / f"{module_name}.cu",
-        cuda_ops_str,
-    )
+    cu_path = gen_directory / f"{module_name}.cu"
+    pybind_path = gen_directory / f"{module_name}_pybind.cc"
+    flashinfer.jit.utils.write_if_different(cu_path, cu_str)
+    flashinfer.jit.utils.write_if_different(pybind_path, pybind_str)
 
-    return flashinfer.jit.load_cuda_ops(
-        module_name,
-        [gen_directory / f"{module_name}.cu"],
-    )
+    return flashinfer.jit.load_cuda_ops(module_name, [cu_path, pybind_path])
 
 
 def test_single_decode_mask():
@@ -70,7 +67,7 @@ struct SingleDecodeWithCustomMask {
   }
 };
 """
-    cuda_ops_str = get_customize_single_decode_cu_str(
+    cu_str, pybind_str = get_customize_single_decode_cu_pybind_str(
         torch.float16,  # dtype_q
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
@@ -83,7 +80,7 @@ struct SingleDecodeWithCustomMask {
         variant_decl,
     )
 
-    jit_module = generate_module("single_decode_with_custom_mask", cuda_ops_str)
+    jit_module = generate_module("single_decode_with_custom_mask", cu_str, pybind_str)
     f = functools.partial(single_decode_with_kv_cache_with_jit_module, jit_module)
 
     q = torch.randn(32, 128, dtype=torch.float16, device="cuda")
@@ -145,7 +142,7 @@ struct FlashSigmoid {
   }
 };
 """
-    cuda_ops_str = get_customize_single_prefill_cu_str(
+    cu_str, pybind_str = get_customize_single_prefill_cu_pybind_str(
         torch.float16,  # dtype_q
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
@@ -158,7 +155,7 @@ struct FlashSigmoid {
         variant_decl,
     )
 
-    jit_module = generate_module("flash_sigmoid", cuda_ops_str)
+    jit_module = generate_module("flash_sigmoid", cu_str, pybind_str)
     f = functools.partial(single_prefill_with_kv_cache_with_jit_module, jit_module)
 
     q = torch.randn(128, 8, 128, dtype=torch.float16, device="cuda")
@@ -219,7 +216,7 @@ struct DumpLogits {
   }
 };
 """
-    cuda_ops_str = get_customize_single_prefill_cu_str(
+    cu_str, pybind_str = get_customize_single_prefill_cu_pybind_str(
         torch.float16,  # dtype_q
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
@@ -232,7 +229,7 @@ struct DumpLogits {
         variant_decl,
     )
 
-    jit_module = generate_module("dump_logits", cuda_ops_str)
+    jit_module = generate_module("dump_logits", cu_str, pybind_str)
     f = functools.partial(single_prefill_with_kv_cache_with_jit_module, jit_module)
 
     q = torch.randn(128, 32, 128, dtype=torch.float16, device="cuda")
@@ -293,7 +290,7 @@ struct DebugPrintLogits {
   }
 };
 """
-    cuda_ops_str = get_customize_single_prefill_cu_str(
+    cu_str, pybind_str = get_customize_single_prefill_cu_pybind_str(
         torch.float16,  # dtype_q
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
@@ -306,7 +303,7 @@ struct DebugPrintLogits {
         variant_decl,
     )
 
-    jit_module = generate_module("debug_print_logits", cuda_ops_str)
+    jit_module = generate_module("debug_print_logits", cu_str, pybind_str)
     f = functools.partial(single_prefill_with_kv_cache_with_jit_module, jit_module)
 
     q = torch.randn(128, 32, 128, dtype=torch.float16, device="cuda")

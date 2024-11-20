@@ -13,45 +13,46 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <torch/extension.h>
+#include "pytorch_extension_utils.h"
 
-torch::Tensor sampling_from_probs(torch::Tensor probs, torch::Tensor uniform_samples,
-                                  bool deterministic);
+void sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
+                         bool deterministic, int64_t cuda_stream);
 
-std::vector<torch::Tensor> top_p_sampling_from_probs(torch::Tensor probs,
-                                                     torch::Tensor uniform_samples,
-                                                     std::optional<torch::Tensor> maybe_top_p_arr,
-                                                     double top_p_val, bool deterministic);
+void top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
+                               at::Tensor success, std::optional<at::Tensor> maybe_top_p_arr,
+                               double top_p_val, bool deterministic, int64_t cuda_stream);
 
-std::vector<torch::Tensor> top_k_sampling_from_probs(torch::Tensor probs,
-                                                     torch::Tensor uniform_samples,
-                                                     std::optional<torch::Tensor> maybe_top_k_arr,
-                                                     unsigned int top_k_val, bool deterministic);
+void top_k_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
+                               at::Tensor success, std::optional<at::Tensor> maybe_top_k_arr,
+                               unsigned int top_k_val, bool deterministic, int64_t cuda_stream);
 
-std::vector<torch::Tensor> min_p_sampling_from_probs(torch::Tensor probs,
-                                                     torch::Tensor uniform_samples,
-                                                     std::optional<torch::Tensor> maybe_min_p_arr,
-                                                     double min_p_val, bool deterministic);
+void min_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
+                               at::Tensor success, std::optional<at::Tensor> maybe_min_p_arr,
+                               double min_p_val, bool deterministic, int64_t cuda_stream);
 
-std::vector<torch::Tensor> top_k_top_p_sampling_from_probs(
-    torch::Tensor probs, torch::Tensor uniform_samples,
-    std::optional<torch::Tensor> maybe_top_k_arr, double top_k_val,
-    std::optional<torch::Tensor> maybe_top_p_arr, double top_p_val, bool deterministic);
+void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples,
+                                     at::Tensor samples, at::Tensor success,
+                                     std::optional<at::Tensor> maybe_top_k_arr, double top_k_val,
+                                     std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
+                                     bool deterministic, int64_t cuda_stream);
 
-torch::Tensor top_p_renorm_probs(torch::Tensor probs, std::optional<torch::Tensor> maybe_top_p_arr,
-                                 double top_p_val);
+void top_p_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
+                        std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
+                        int64_t cuda_stream);
 
-torch::Tensor top_k_renorm_probs(torch::Tensor probs, std::optional<torch::Tensor> maybe_top_k_arr,
-                                 unsigned int top_k_val);
+void top_k_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
+                        std::optional<at::Tensor> maybe_top_k_arr, unsigned int top_k_val,
+                        int64_t cuda_stream);
 
-torch::Tensor top_k_mask_logits(torch::Tensor logits, std::optional<torch::Tensor> maybe_top_k_arr,
-                                unsigned int top_k_val);
+void top_k_mask_logits(at::Tensor logits, at::Tensor mask_logits,
+                       std::optional<at::Tensor> maybe_top_k_arr, unsigned int top_k_val,
+                       int64_t cuda_stream);
 
-torch::Tensor chain_speculative_sampling(torch::Tensor draft_probs, torch::Tensor draft_token_ids,
-                                         torch::Tensor uniform_samples, torch::Tensor target_probs,
-                                         torch::Tensor output_accepted_token_num,
-                                         torch::Tensor output_emitted_token_num,
-                                         bool deterministic);
+void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_ids,
+                                at::Tensor uniform_samples, at::Tensor target_probs,
+                                at::Tensor output_token_ids, at::Tensor output_accepted_token_num,
+                                at::Tensor output_emitted_token_num, bool deterministic,
+                                int64_t cuda_stream);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("sampling_from_probs", &sampling_from_probs, "Sample from probabilities");

@@ -15,9 +15,10 @@
  */
 #pragma once
 
+#include <flashinfer/exception.h>
+
 #include <flashinfer/page.cuh>
 #include <flashinfer/pos_enc.cuh>
-#include <stdexcept>
 
 #include "utils.h"
 
@@ -120,7 +121,7 @@ std::vector<dtype_out> single_mha(const std::vector<dtype_q>& q, const std::vect
             default: {
               std::ostringstream err_msg;
               err_msg << "Unsupported rotary mode.";
-              throw std::invalid_argument(err_msg.str());
+              FLASHINFER_ERROR(err_msg.str());
             }
           }
           // apply mask

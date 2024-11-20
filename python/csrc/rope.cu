@@ -19,9 +19,9 @@
 
 using namespace flashinfer;
 
-void apply_rope(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope, torch::Tensor k_rope,
-                torch::Tensor indptr, torch::Tensor offsets, unsigned int rotary_dim,
-                bool interleave, float rope_scale, float rope_theta) {
+void apply_rope(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope, at::Tensor indptr,
+                at::Tensor offsets, unsigned int rotary_dim, bool interleave, float rope_scale,
+                float rope_theta, int64_t cuda_stream) {
   CHECK_LAST_DIM_CONTIGUOUS(q);
   CHECK_LAST_DIM_CONTIGUOUS(k);
   CHECK_INPUT(indptr);
@@ -48,11 +48,8 @@ void apply_rope(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope, torch::T
   size_t q_rope_stride_h = q_rope.stride(1);
   size_t k_rope_stride_n = k_rope.stride(0);
   size_t k_rope_stride_h = k_rope.stride(1);
-  indptr = indptr.to(torch::kInt32);
-  offsets = offsets.to(torch::kInt32);
-  
-  const at::cuda::OptionalCUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
+
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     cudaError_t status = BatchQKApplyRotary(
         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
@@ -60,16 +57,16 @@ void apply_rope(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope, torch::T
         static_cast<int32_t*>(indptr.data_ptr()), static_cast<int32_t*>(offsets.data_ptr()),
         batch_size, num_qo_heads, num_kv_heads, rotary_dim, head_dim, q_stride_n, q_stride_h,
         k_stride_n, k_stride_h, q_rope_stride_n, q_rope_stride_h, k_rope_stride_n, k_rope_stride_h,
-        interleave, rope_scale, rope_theta, torch_current_stream);
+        interleave, rope_scale, rope_theta, stream);
     TORCH_CHECK(status == cudaSuccess, "BatchQKApplyRotary failed with error code " +
                                            std::string(cudaGetErrorString(status)));
     return true;
   });
 }
 
-void apply_rope_pos_ids(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope,
-                        torch::Tensor k_rope, torch::Tensor pos_ids, unsigned int rotary_dim,
-                        bool interleave, float rope_scale, float rope_theta) {
+void apply_rope_pos_ids(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
+                        at::Tensor pos_ids, unsigned int rotary_dim, bool interleave,
+                        float rope_scale, float rope_theta, int64_t cuda_stream) {
   CHECK_LAST_DIM_CONTIGUOUS(q);
   CHECK_LAST_DIM_CONTIGUOUS(k);
   CHECK_INPUT(pos_ids);
@@ -92,27 +89,24 @@ void apply_rope_pos_ids(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope,
   size_t q_rope_stride_h = q_rope.stride(1);
   size_t k_rope_stride_n = k_rope.stride(0);
   size_t k_rope_stride_h = k_rope.stride(1);
-  pos_ids = pos_ids.to(torch::kInt32);
 
-  const at::cuda::OptionalCUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     cudaError_t status = BatchQKApplyRotaryPosIds(
         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
         static_cast<c_type*>(q_rope.data_ptr()), static_cast<c_type*>(k_rope.data_ptr()),
         static_cast<int32_t*>(pos_ids.data_ptr()), nnz, num_qo_heads, num_kv_heads, rotary_dim,
         head_dim, q_stride_n, q_stride_h, k_stride_n, k_stride_h, q_rope_stride_n, q_rope_stride_h,
-        k_rope_stride_n, k_rope_stride_h, interleave, rope_scale, rope_theta, torch_current_stream);
+        k_rope_stride_n, k_rope_stride_h, interleave, rope_scale, rope_theta, stream);
     TORCH_CHECK(status == cudaSuccess, "BatchQKApplyRotaryPosIds failed with error code " +
                                            std::string(cudaGetErrorString(status)));
     return true;
   });
 }
 
-void apply_rope_pos_ids_cos_sin_cache(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope,
-                                      torch::Tensor k_rope, torch::Tensor cos_cache,
-                                      torch::Tensor sin_cache, torch::Tensor pos_ids,
-                                      bool interleave) {
+void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_rope,
+                                      at::Tensor k_rope, at::Tensor cos_cache, at::Tensor sin_cache,
+                                      at::Tensor pos_ids, bool interleave, int64_t cuda_stream) {
   CHECK_LAST_DIM_CONTIGUOUS(q);
   CHECK_LAST_DIM_CONTIGUOUS(k);
   CHECK_INPUT(cos_cache);
@@ -131,8 +125,6 @@ void apply_rope_pos_ids_cos_sin_cache(torch::Tensor q, torch::Tensor k, torch::T
   CHECK_EQ(q.size(2), k.size(2));
   unsigned int rotary_dim = cos_cache.size(1);
   CHECK_EQ(sin_cache.size(1), rotary_dim);
-  CHECK_EQ(cos_cache.dtype(), torch::kFloat32);
-  CHECK_EQ(sin_cache.dtype(), torch::kFloat32);
   unsigned int num_qo_heads = q.size(1);
   unsigned int num_kv_heads = k.size(1);
   unsigned int head_dim = q.size(2);
@@ -145,10 +137,9 @@ void apply_rope_pos_ids_cos_sin_cache(torch::Tensor q, torch::Tensor k, torch::T
   size_t q_rope_stride_h = q_rope.stride(1);
   size_t k_rope_stride_n = k_rope.stride(0);
   size_t k_rope_stride_h = k_rope.stride(1);
-  pos_ids = pos_ids.to(torch::kInt32);
 
-  const at::cuda::OptionalCUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  cudaStream_t torch_current_stream(nullptr);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     cudaError_t status = BatchQKApplyRotaryPosIdsCosSinCache(
         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
@@ -156,7 +147,7 @@ void apply_rope_pos_ids_cos_sin_cache(torch::Tensor q, torch::Tensor k, torch::T
         static_cast<float*>(cos_cache.data_ptr()), static_cast<float*>(sin_cache.data_ptr()),
         static_cast<int32_t*>(pos_ids.data_ptr()), nnz, num_qo_heads, num_kv_heads, rotary_dim,
         head_dim, q_stride_n, q_stride_h, k_stride_n, k_stride_h, q_rope_stride_n, q_rope_stride_h,
-        k_rope_stride_n, k_rope_stride_h, interleave, torch_current_stream);
+        k_rope_stride_n, k_rope_stride_h, interleave, stream);
     TORCH_CHECK(status == cudaSuccess,
                 "BatchQKApplyRotaryPosIdsCosSinCache failed with error code " +
                     std::string(cudaGetErrorString(status)));
@@ -164,11 +155,10 @@ void apply_rope_pos_ids_cos_sin_cache(torch::Tensor q, torch::Tensor k, torch::T
   });
 }
 
-void apply_llama31_rope(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope,
-                        torch::Tensor k_rope, torch::Tensor indptr, torch::Tensor offsets,
-                        unsigned int rotary_dim, bool interleave, float rope_scale,
-                        float rope_theta, float low_freq_factor, float high_freq_factor,
-                        float old_context_length) {
+void apply_llama31_rope(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
+                        at::Tensor indptr, at::Tensor offsets, unsigned int rotary_dim,
+                        bool interleave, float rope_scale, float rope_theta, float low_freq_factor,
+                        float high_freq_factor, float old_context_length, int64_t cuda_stream) {
   CHECK_CUDA(q);  // not necessarily contiguous
   CHECK_CUDA(k);  // not necessarily contiguous
   CHECK_INPUT(indptr);
@@ -195,11 +185,8 @@ void apply_llama31_rope(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope,
   size_t q_rope_stride_h = q_rope.stride(1);
   size_t k_rope_stride_n = k_rope.stride(0);
   size_t k_rope_stride_h = k_rope.stride(1);
-  indptr = indptr.to(torch::kInt32);
-  offsets = offsets.to(torch::kInt32);
 
-  const at::cuda::OptionalCUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     cudaError_t status = BatchQKApplyLlama31Rotary(
         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
@@ -208,18 +195,18 @@ void apply_llama31_rope(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope,
         batch_size, num_qo_heads, num_kv_heads, rotary_dim, head_dim, q_stride_n, q_stride_h,
         k_stride_n, k_stride_h, q_rope_stride_n, q_rope_stride_h, k_rope_stride_n, k_rope_stride_h,
         interleave, rope_scale, rope_theta, low_freq_factor, high_freq_factor, old_context_length,
-        torch_current_stream);
+        stream);
     TORCH_CHECK(status == cudaSuccess, "BatchQKApplyLlama31Rotary failed with error code " +
                                            std::string(cudaGetErrorString(status)));
     return true;
   });
 }
 
-void apply_llama31_rope_pos_ids(torch::Tensor q, torch::Tensor k, torch::Tensor q_rope,
-                                torch::Tensor k_rope, torch::Tensor pos_ids,
-                                unsigned int rotary_dim, bool interleave, float rope_scale,
-                                float rope_theta, float low_freq_factor, float high_freq_factor,
-                                float old_context_length) {
+void apply_llama31_rope_pos_ids(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
+                                at::Tensor pos_ids, unsigned int rotary_dim, bool interleave,
+                                float rope_scale, float rope_theta, float low_freq_factor,
+                                float high_freq_factor, float old_context_length,
+                                int64_t cuda_stream) {
   CHECK_CUDA(q);  // not necessarily contiguous
   CHECK_CUDA(k);  // not necessarily contiguous
   CHECK_INPUT(pos_ids);
@@ -242,10 +229,9 @@ void apply_llama31_rope_pos_ids(torch::Tensor q, torch::Tensor k, torch::Tensor 
   size_t q_rope_stride_h = q_rope.stride(1);
   size_t k_rope_stride_n = k_rope.stride(0);
   size_t k_rope_stride_h = k_rope.stride(1);
-  pos_ids = pos_ids.to(torch::kInt32);
 
-  const at::cuda::OptionalCUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  cudaStream_t torch_current_stream(nullptr);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     cudaError_t status = BatchQKApplyLlama31RotaryPosIds(
         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
@@ -253,7 +239,7 @@ void apply_llama31_rope_pos_ids(torch::Tensor q, torch::Tensor k, torch::Tensor 
         static_cast<int32_t*>(pos_ids.data_ptr()), nnz, num_qo_heads, num_kv_heads, rotary_dim,
         head_dim, q_stride_n, q_stride_h, k_stride_n, k_stride_h, q_rope_stride_n, q_rope_stride_h,
         k_rope_stride_n, k_rope_stride_h, interleave, rope_scale, rope_theta, low_freq_factor,
-        high_freq_factor, old_context_length, torch_current_stream);
+        high_freq_factor, old_context_length, stream);
     TORCH_CHECK(status == cudaSuccess, "BatchQKApplyLlama31RotaryPosIds failed with error code " +
                                            std::string(cudaGetErrorString(status)));
     return true;

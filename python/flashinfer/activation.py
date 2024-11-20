@@ -24,7 +24,7 @@ from .jit import (
     has_prebuilt_ops,
     load_cuda_ops,
 )
-from .utils import register_custom_op, register_fake_op
+from .utils import get_cuda_stream, register_custom_op, register_fake_op
 
 silu_def_cu_str = r"""
 __device__ __forceinline__ float silu(const float& val) {
@@ -86,7 +86,8 @@ def get_act_and_mul_module(act_func_name: str):
 
         @register_custom_op(f"flashinfer::{fname}", mutates_args=("out",))
         def _act_and_mul(out: torch.Tensor, input: torch.Tensor) -> None:
-            fn(out, input)
+            with input.device as device:  # device guard
+                fn(out, input, get_cuda_stream(device))
 
         @register_fake_op(f"flashinfer::{fname}")
         def _fake_act_and_mul(out: torch.Tensor, input: torch.Tensor) -> None:
@@ -136,7 +137,10 @@ def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
             device=input.device,
             dtype=input.dtype,
         )
-    get_act_and_mul_module("silu").silu_and_mul(out, input)
+    get_act_and_mul_module("silu").silu_and_mul(
+        out,
+        input,
+    )
     return out
 
 

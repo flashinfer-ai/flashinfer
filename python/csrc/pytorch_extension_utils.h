@@ -14,14 +14,11 @@
  * limitations under the License.
  */
 #pragma once
-#include <c10/cuda/CUDAStream.h>
-#include <c10/cuda/CUDAGuard.h>
+// NOTE(Zihao): only include minimal headers to accelerate compilation
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
-#include <torch/extension.h>
-
-using namespace flashinfer;
+#include <torch/csrc/utils/pybind.h>
 
 #ifdef FLASHINFER_ENABLE_BF16
 #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(pytorch_dtype, c_type, ...)                 \
@@ -192,7 +189,7 @@ using namespace flashinfer;
     return __VA_ARGS__();                        \
   }
 
-inline void check_shape(const torch::Tensor& a, const torch::Tensor& b, const char* a_name,
+inline void check_shape(const at::Tensor& a, const at::Tensor& b, const char* a_name,
                         const char* b_name) {
   TORCH_CHECK(a.dim() == b.dim(), a_name, ".dim() != ", b_name, ".dim(). ", a.dim(), " vs ",
               b.dim());
@@ -230,7 +227,7 @@ inline constexpr uint32_t pack_u16(uint16_t a, uint16_t b) {
 
 #define CHECK_GE(a, b) TORCH_CHECK((a) >= (b), "CHECK_GE(" #a ", " #b ") failed. ", a, " vs ", b)
 
-inline bool is_float8_tensor(const torch::Tensor& tensor) {
+inline bool is_float8_tensor(const at::Tensor& tensor) {
   return tensor.scalar_type() == at::ScalarType::Float8_e4m3fn ||
          tensor.scalar_type() == at::ScalarType::Float8_e5m2;
 }
