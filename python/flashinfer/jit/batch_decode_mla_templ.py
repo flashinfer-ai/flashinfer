@@ -106,8 +106,8 @@ void BatchDecodeWithPagedKVCacheRunMLA(
 
   if (maybe_lse) {
     const auto& lse = *maybe_lse;
-    TORCH_CHECK(lse.size(0) == batch_size, lse.size(0), q.size(0));
-    TORCH_CHECK(lse.size(1) == num_qo_heads, lse.size(1), q.size(1));
+    TORCH_CHECK(lse.size(0) == batch_size, lse.size(0), q_nope.size(0));
+    TORCH_CHECK(lse.size(1) == num_qo_heads, lse.size(1), q_nope.size(1));
   }
 
   TORCH_CHECK(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
@@ -146,9 +146,10 @@ void BatchDecodeWithPagedKVCacheRunMLA(
   }
   params.padded_batch_size = plan_info.padded_batch_size;
 
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaError_t status = BatchDecodeWithPagedKVCacheDispatchedMLA<
       {{ head_dim_ckv }}, {{ head_dim_kpe }}, AttentionVariant>(
-      params, tmp_v, tmp_s, /*stream=*/torch_current_stream);
+      params, tmp_v, tmp_s, /*stream=*/stream);
   TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
               cudaGetErrorString(status));
 }

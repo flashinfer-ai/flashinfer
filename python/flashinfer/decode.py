@@ -1270,6 +1270,8 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             q_data_type = data_type
         q_data_type = canonicalize_torch_dtype(q_data_type)
 
+        indptr_host = indptr.to("cpu")
+
         self._cached_module = get_batch_decode_mla_module(
             q_data_type,
             data_type,
@@ -1284,7 +1286,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._pin_memory_int_workspace_buffer,
-                indptr,
+                indptr_host,
                 batch_size,
                 num_qo_heads,
                 page_size,
@@ -1357,24 +1359,36 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         if rope_theta is None:
             rope_theta = 1e4
 
-        out = self._cached_module.run(
-            self._float_workspace_buffer,
-            self._int_workspace_buffer,
-            self._plan_info,
-            q_nope,
-            q_pe,
-            paged_ckv_cache,
-            paged_kpe_cache,
-            self._paged_kv_indptr_buf,
-            self._paged_kv_indices_buf,
-            self._paged_kv_last_page_len_buf,
-            sm_scale,
-            window_left,
-            logits_soft_cap,
-            rope_scale,
-            rope_theta,
-            return_lse,
-        )
+        with self.device as device:
+            o = torch.empty_like(q_nope, device=device)
+            maybe_lse = (
+                torch.empty(
+                    (q_nope.size(0), q_nope.size(1)), dtype=torch.float32, device=device
+                )
+                if return_lse
+                else None
+            )
+            self._cached_module.run(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._plan_info,
+                q_nope,
+                q_pe,
+                paged_ckv_cache,
+                paged_kpe_cache,
+                self._paged_kv_indptr_buf,
+                self._paged_kv_indices_buf,
+                self._paged_kv_last_page_len_buf,
+                o,
+                sm_scale,
+                window_left,
+                logits_soft_cap,
+                rope_scale,
+                rope_theta,
+                maybe_lse,
+                get_cuda_stream(device),
+            )
+            out = (o, maybe_lse) if return_lse else (o,)
         if v_scale is not None:
             out[0] *= v_scale
 
