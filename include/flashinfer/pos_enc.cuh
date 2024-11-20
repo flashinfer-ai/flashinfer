@@ -170,6 +170,56 @@ __device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope_cos_sin_i
 
 template <bool interleave, uint32_t head_dim, uint32_t vec_size, uint32_t bdx, typename DType,
           typename IdType>
+__global__ void BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel(
+    DType* q, DType* k, DType* q_rope, DType* k_rope, float* __restrict__ cos_cache,
+    float* __restrict__ sin_cache, IdType* __restrict__ pos_ids, uint32_t nnz,
+    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t rotary_dim, size_t q_stride_n,
+    size_t q_stride_h, size_t k_stride_n, size_t k_stride_h, size_t q_rope_stride_n,
+    size_t q_rope_stride_h, size_t k_rope_stride_n, size_t k_rope_stride_h) {
+  uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
+  uint32_t by = blockIdx.y;
+  const uint32_t bdy = blockDim.y;
+
+  vec_t<float, vec_size> cos, sin;
+  if (bx * bdy + ty < nnz) {
+    const uint32_t idx = bx * bdy + ty;
+    const IdType pos = pos_ids[idx];
+
+    if (tx * vec_size < rotary_dim) {
+      cos.load(cos_cache + pos * rotary_dim + tx * vec_size);
+      sin.load(sin_cache + pos * rotary_dim + tx * vec_size);
+    }
+
+    if (by < num_qo_heads) {
+      uint32_t qo_head_idx = by;
+      DType* q_ptr = q + get_elem_offset_impl(idx, qo_head_idx, 0, q_stride_n, q_stride_h);
+      DType* q_rope_ptr =
+          q_rope + get_elem_offset_impl(idx, qo_head_idx, 0, q_rope_stride_n, q_rope_stride_h);
+      vec_t<float, vec_size> q_vec;
+      if constexpr (interleave) {
+        q_vec = vec_apply_llama_rope_cos_sin_interleave<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
+      } else {
+        q_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
+      }
+      q_vec.cast_store(q_rope_ptr + tx * vec_size);
+    } else {
+      uint32_t kv_head_idx = by - num_qo_heads;
+      DType* k_ptr = k + get_elem_offset_impl(idx, kv_head_idx, 0, k_stride_n, k_stride_h);
+      DType* k_rope_ptr =
+          k_rope + get_elem_offset_impl(idx, kv_head_idx, 0, k_rope_stride_n, k_rope_stride_h);
+      vec_t<float, vec_size> k_vec;
+      if constexpr (interleave) {
+        k_vec = vec_apply_llama_rope_cos_sin_interleave<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
+      } else {
+        k_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
+      }
+      k_vec.cast_store(k_rope_ptr + tx * vec_size);
+    }
+  }
+}
+
+template <bool interleave, uint32_t head_dim, uint32_t vec_size, uint32_t bdx, typename DType,
+          typename IdType>
 __global__ void BatchQKApplyRotaryPosIdsCosSinCacheKernel(
     DType* q, DType* k, DType* q_rope, DType* k_rope, float* __restrict__ cos_cache,
     float* __restrict__ sin_cache, IdType* __restrict__ pos_ids, uint32_t nnz,
@@ -221,6 +271,77 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheKernel(
 
 template <bool interleave, uint32_t head_dim, uint32_t vec_size, uint32_t bdx, typename DType,
           typename IdType>
+__global__ void BatchQKApplyRotaryPosIdsHeadParallelismKernel(
+    DType* q, DType* k, DType* q_rope, DType* k_rope, IdType* __restrict__ pos_ids, uint32_t nnz,
+    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t rotary_dim, size_t q_stride_n,
+    size_t q_stride_h, size_t k_stride_n, size_t k_stride_h, size_t q_rope_stride_n,
+    size_t q_rope_stride_h, size_t k_rope_stride_n, size_t k_rope_stride_h, float smooth_a,
+    float smooth_b, float rope_rcp_scale, float rope_rcp_theta) {
+  // NOTE: q and q_rope may be the same ptr, so do k and k_rope
+  uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
+  uint32_t by = blockIdx.y;
+  const uint32_t bdy = blockDim.y;
+  vec_t<float, vec_size> freq;
+  if (tx * vec_size < rotary_dim) {
+#pragma unroll
+    for (uint32_t i = 0; i < vec_size; ++i) {
+      if constexpr (interleave) {
+        freq[i] = __powf(rope_rcp_theta, float(2 * ((tx * vec_size + i) / 2)) / float(rotary_dim));
+      } else {
+        freq[i] = __powf(rope_rcp_theta,
+                         float(2 * ((tx * vec_size + i) % (rotary_dim / 2))) / float(rotary_dim));
+      }
+
+      float smooth = freq[i] * smooth_a + smooth_b;
+      smooth = max(0.0f, min(1.0f, smooth));  // clamp to [0, 1]
+      freq[i] = (1 - smooth) * (freq[i] * rope_rcp_scale) + smooth * freq[i];
+    }
+  }
+
+  vec_t<float, vec_size> cos, sin;
+
+  if (bx * bdy + ty < nnz) {
+    const uint32_t idx = bx * bdy + ty;
+    const IdType pos = pos_ids[idx];
+
+    if (tx * vec_size < rotary_dim) {
+#pragma unroll
+      for (uint32_t i = 0; i < vec_size; ++i) {
+        float embed = float(pos) * freq[i];
+        __sincosf(embed, &sin[i], &cos[i]);
+      }
+    }
+
+    if (by < num_qo_heads) {
+      uint32_t qo_head_idx = by;
+      DType* q_ptr = q + get_elem_offset_impl(idx, qo_head_idx, 0, q_stride_n, q_stride_h);
+      DType* q_rope_ptr =
+          q_rope + get_elem_offset_impl(idx, qo_head_idx, 0, q_rope_stride_n, q_rope_stride_h);
+      vec_t<float, vec_size> q_vec;
+      if constexpr (interleave) {
+        q_vec = vec_apply_llama_rope_cos_sin_interleave<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
+      } else {
+        q_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
+      }
+      q_vec.cast_store(q_rope_ptr + tx * vec_size);
+    } else {
+      uint32_t kv_head_idx = by - num_qo_heads;
+      DType* k_ptr = k + get_elem_offset_impl(idx, kv_head_idx, 0, k_stride_n, k_stride_h);
+      DType* k_rope_ptr =
+          k_rope + get_elem_offset_impl(idx, kv_head_idx, 0, k_rope_stride_n, k_rope_stride_h);
+      vec_t<float, vec_size> k_vec;
+      if constexpr (interleave) {
+        k_vec = vec_apply_llama_rope_cos_sin_interleave<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
+      } else {
+        k_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
+      }
+      k_vec.cast_store(k_rope_ptr + tx * vec_size);
+    }
+  }
+}
+
+template <bool interleave, uint32_t head_dim, uint32_t vec_size, uint32_t bdx, typename DType,
+          typename IdType>
 __global__ void BatchQKApplyRotaryPosIdsKernel(
     DType* q, DType* k, DType* q_rope, DType* k_rope, IdType* __restrict__ pos_ids, uint32_t nnz,
     uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t rotary_dim, size_t q_stride_n,
@@ -229,61 +350,65 @@ __global__ void BatchQKApplyRotaryPosIdsKernel(
     float smooth_b, float rope_rcp_scale, float rope_rcp_theta) {
   // NOTE: q and q_rope may be the same ptr, so do k and k_rope
   uint32_t bx = blockIdx.x, tx = threadIdx.x, ty = threadIdx.y;
-
-  const uint32_t idx = bx *  blockDim.y + ty;
-  const uint32_t pos_idx = idx / (num_qo_heads + num_kv_heads);
-  if (pos_idx >= nnz) {
-    return;
-  }
-
-  const IdType pos = pos_ids[pos_idx];
-
-  vec_t<float, vec_size> cos, sin;
+  const uint32_t bdy = blockDim.y;
+  vec_t<float, vec_size> freq;
   if (tx * vec_size < rotary_dim) {
-  #pragma unroll
+#pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
-      float freq;
       if constexpr (interleave) {
-        freq = __powf(rope_rcp_theta, float(2 * ((tx * vec_size + i) / 2)) / float(rotary_dim));
+        freq[i] = __powf(rope_rcp_theta, float(2 * ((tx * vec_size + i) / 2)) / float(rotary_dim));
       } else {
-        freq = __powf(rope_rcp_theta,
-                        float(2 * ((tx * vec_size + i) % (rotary_dim / 2))) / float(rotary_dim));
+        freq[i] = __powf(rope_rcp_theta,
+                         float(2 * ((tx * vec_size + i) % (rotary_dim / 2))) / float(rotary_dim));
       }
 
-      float smooth = freq * smooth_a + smooth_b;
+      float smooth = freq[i] * smooth_a + smooth_b;
       smooth = max(0.0f, min(1.0f, smooth));  // clamp to [0, 1]
-      freq = (1 - smooth) * (freq * rope_rcp_scale) + smooth * freq;
-
-      const float embed = float(pos) * freq;
-      __sincosf(embed, &sin[i], &cos[i]);
+      freq[i] = (1 - smooth) * (freq[i] * rope_rcp_scale) + smooth * freq[i];
     }
   }
 
-  const uint32_t head_idx = idx % (num_qo_heads + num_kv_heads);
-  if (head_idx < num_qo_heads) {
-    const uint32_t qo_head_idx = head_idx;
-    DType* q_ptr = q + get_elem_offset_impl(pos_idx, qo_head_idx, 0, q_stride_n, q_stride_h);
-    DType* q_rope_ptr =
-        q_rope + get_elem_offset_impl(pos_idx, qo_head_idx, 0, q_rope_stride_n, q_rope_stride_h);
-    vec_t<float, vec_size> q_vec;
-    if constexpr (interleave) {
-      q_vec = vec_apply_llama_rope_cos_sin_interleave<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
-    } else {
-      q_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
+  vec_t<float, vec_size> cos, sin;
+
+  if (bx * bdy + ty < nnz) {
+    const uint32_t idx = bx * bdy + ty;
+    const IdType pos = pos_ids[idx];
+
+    if (tx * vec_size < rotary_dim) {
+#pragma unroll
+      for (uint32_t i = 0; i < vec_size; ++i) {
+        float embed = float(pos) * freq[i];
+        __sincosf(embed, &sin[i], &cos[i]);
+      }
     }
-    q_vec.cast_store(q_rope_ptr + tx * vec_size);
-  } else {
-    const uint32_t kv_head_idx = head_idx - num_qo_heads;
-    DType* k_ptr = k + get_elem_offset_impl(pos_idx, kv_head_idx, 0, k_stride_n, k_stride_h);
-    DType* k_rope_ptr =
-        k_rope + get_elem_offset_impl(pos_idx, kv_head_idx, 0, k_rope_stride_n, k_rope_stride_h);
-    vec_t<float, vec_size> k_vec;
-    if constexpr (interleave) {
-      k_vec = vec_apply_llama_rope_cos_sin_interleave<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
-    } else {
-      k_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
+
+#pragma unroll 1
+    for (uint32_t qo_head_idx = 0; qo_head_idx < num_qo_heads; ++qo_head_idx) {
+      DType* q_ptr = q + get_elem_offset_impl(idx, qo_head_idx, 0, q_stride_n, q_stride_h);
+      DType* q_rope_ptr =
+          q_rope + get_elem_offset_impl(idx, qo_head_idx, 0, q_rope_stride_n, q_rope_stride_h);
+      vec_t<float, vec_size> q_vec;
+      if constexpr (interleave) {
+        q_vec = vec_apply_llama_rope_cos_sin_interleave<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
+      } else {
+        q_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
+      }
+      q_vec.cast_store(q_rope_ptr + tx * vec_size);
     }
-    k_vec.cast_store(k_rope_ptr + tx * vec_size);
+
+#pragma unroll 1
+    for (uint32_t kv_head_idx = 0; kv_head_idx < num_kv_heads; ++kv_head_idx) {
+      DType* k_ptr = k + get_elem_offset_impl(idx, kv_head_idx, 0, k_stride_n, k_stride_h);
+      DType* k_rope_ptr =
+          k_rope + get_elem_offset_impl(idx, kv_head_idx, 0, k_rope_stride_n, k_rope_stride_h);
+      vec_t<float, vec_size> k_vec;
+      if constexpr (interleave) {
+        k_vec = vec_apply_llama_rope_cos_sin_interleave<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
+      } else {
+        k_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
+      }
+      k_vec.cast_store(k_rope_ptr + tx * vec_size);
+    }
   }
 }
 
@@ -383,16 +508,18 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCache(
     uint32_t rotary_dim, uint32_t head_dim, size_t q_stride_n, size_t q_stride_h, size_t k_stride_n,
     size_t k_stride_h, size_t q_rope_stride_n, size_t q_rope_stride_h, size_t k_rope_stride_n,
     size_t k_rope_stride_h, bool interleave, cudaStream_t stream = nullptr) {
+  int dev_id = 0;
+  int num_sms = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
+
   DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
       constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
       constexpr uint32_t bdx = HEAD_DIM / vec_size;
       uint32_t num_threads = std::max(128U, bdx);
       uint32_t bdy = num_threads / bdx;
-      dim3 nblks((nnz + bdy - 1) / bdy);
-      dim3 nthrs(bdx, bdy);
-      auto kernel = BatchQKApplyRotaryPosIdsCosSinCacheKernel<INTERLEAVE, HEAD_DIM, vec_size, bdx,
-                                                              DType, IdType>;
+      uint32_t nblks_x = (nnz + bdy - 1) / bdy;
       void* args[] = {(void*)&q,
                       (void*)&k,
                       (void*)&q_rope,
@@ -412,7 +539,26 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCache(
                       (void*)&q_rope_stride_h,
                       (void*)&k_rope_stride_n,
                       (void*)&k_rope_stride_h};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+      auto kernel_0 = BatchQKApplyRotaryPosIdsCosSinCacheKernel<INTERLEAVE, HEAD_DIM, vec_size, bdx,
+                                                                DType, IdType>;
+
+      int num_blocks_per_sm_0 = 0;
+      FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+          &num_blocks_per_sm_0, kernel_0, num_threads, /*smem_size=*/0));
+      uint32_t num_ctas_0 = num_blocks_per_sm_0 * num_sms;
+
+      if ((nnz + bdy - 1) / bdy >= num_ctas_0) {
+        dim3 nblks(nblks_x);
+        dim3 nthrs(bdx, bdy);
+        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel_0, nblks, nthrs, args, 0, stream));
+      } else {
+        dim3 nblks(nblks_x, num_qo_heads + num_kv_heads);
+        dim3 nthrs(bdx, bdy);
+        auto kernel_1 =
+            BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel<INTERLEAVE, HEAD_DIM, vec_size,
+                                                                     bdx, DType, IdType>;
+        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel_1, nblks, nthrs, args, 0, stream));
+      }
     });
   });
 
@@ -430,6 +576,10 @@ cudaError_t BatchQKApplyRotaryPosIds(
   float rope_rcp_theta = 1.0f / rope_theta;
   float smooth_a = 0.f;
   float smooth_b = 0.f;
+  int dev_id = 0;
+  int num_sms = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
 
   DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
@@ -437,10 +587,8 @@ cudaError_t BatchQKApplyRotaryPosIds(
       constexpr uint32_t bdx = HEAD_DIM / vec_size;
       uint32_t num_threads = std::max(128U, bdx);
       uint32_t bdy = num_threads / bdx;
-      dim3 nblks((nnz + bdy - 1) / bdy);
-      dim3 nthrs(bdx, bdy);
-      auto kernel =
-          BatchQKApplyRotaryPosIdsKernel<INTERLEAVE, HEAD_DIM, vec_size, bdx, DType, IdType>;
+      uint32_t nblks_x = (nnz + bdy - 1) / bdy;
+
       void* args[] = {(void*)&q,
                       (void*)&k,
                       (void*)&q_rope,
@@ -462,7 +610,26 @@ cudaError_t BatchQKApplyRotaryPosIds(
                       (void*)&smooth_b,
                       (void*)&rope_rcp_scale,
                       (void*)&rope_rcp_theta};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+      auto kernel_0 =
+          BatchQKApplyRotaryPosIdsKernel<INTERLEAVE, HEAD_DIM, vec_size, bdx, DType, IdType>;
+
+      int num_blocks_per_sm_0 = 0;
+      FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+          &num_blocks_per_sm_0, kernel_0, num_threads, /*smem_size=*/0));
+      uint32_t num_ctas_0 = num_blocks_per_sm_0 * num_sms;
+      if (nblks_x >= num_ctas_0) {
+        dim3 nblks(nblks_x);
+        dim3 nthrs(bdx, bdy);
+
+        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel_0, nblks, nthrs, args, 0, stream));
+      } else {
+        dim3 nblks(nblks_x, num_qo_heads + num_kv_heads);
+        dim3 nthrs(bdx, bdy);
+        auto kernel_1 = BatchQKApplyRotaryPosIdsHeadParallelismKernel<INTERLEAVE, HEAD_DIM,
+                                                                      vec_size, bdx, DType, IdType>;
+
+        FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel_1, nblks, nthrs, args, 0, stream));
+      }
     });
   });
 
@@ -606,7 +773,7 @@ cudaError_t BatchQKApplyLlama31RotaryPosIds(
       constexpr uint32_t bdx = HEAD_DIM / vec_size;
       uint32_t num_threads = std::max(128U, bdx);
       uint32_t bdy = num_threads / bdx;
-      dim3 nblks((nnz + bdy - 1) / bdy * (num_qo_heads + num_kv_heads));
+      dim3 nblks((nnz + bdy - 1) / bdy);
       dim3 nthrs(bdx, bdy);
       auto kernel =
           BatchQKApplyRotaryPosIdsKernel<INTERLEAVE, HEAD_DIM, vec_size, bdx, DType, IdType>;
