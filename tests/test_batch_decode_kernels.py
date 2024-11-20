@@ -294,6 +294,7 @@ def test_batch_decode_with_tuple_paged_kv_cache(
 @pytest.mark.parametrize(
     "kv_dtype", [torch.float16, torch.float8_e4m3fn, torch.float8_e5m2]
 )
+@pytest.mark.parametrize("contiguous_kv", [True, False])
 def test_cuda_graph_batch_decode_with_paged_kv_cache(
     batch_size,
     kv_len,

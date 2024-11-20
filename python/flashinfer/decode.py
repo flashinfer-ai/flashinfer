@@ -646,6 +646,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
+        non_blocking: bool = False,
     ) -> None:
         r"""Plan batch decode for given problem specification.
 
@@ -687,6 +688,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
         data_type: Optional[Union[str, torch.dtype]]
             The data type of both the query and key/value tensors. Defaults to torch.float16.
             data_type is deprecated, please use q_data_type and kv_data_type instead.
+        non_blocking : bool
+            Whether to copy the input tensors to the device asynchronously, defaults to ``False``.
+            If ``True``, user should synchronize before calling :meth:`run` or cuda graph replay.
+
 
         Note
         ----
@@ -717,16 +722,26 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 raise ValueError(
                     "The size of indices should be less than or equal to the allocated buffer"
                 )
-            self._paged_kv_indptr_buf.copy_(indptr, non_blocking=True)
-            self._paged_kv_indices_buf[: len(indices)].copy_(indices, non_blocking=True)
-            self._paged_kv_last_page_len_buf.copy_(last_page_len, non_blocking=True)
-        else:
-            self._paged_kv_indptr_buf = indptr.to(self.device, non_blocking=True)
-            self._paged_kv_indices_buf = indices.to(self.device, non_blocking=True)
-            self._paged_kv_last_page_len_buf = last_page_len.to(
-                self.device, non_blocking=True
+            self._paged_kv_indptr_buf.copy_(indptr, non_blocking=non_blocking)
+            self._paged_kv_indices_buf[: len(indices)].copy_(
+                indices, non_blocking=non_blocking
             )
-            self._qo_indptr_buf = qo_indptr_host.to(self.device, non_blocking=True)
+            self._paged_kv_last_page_len_buf.copy_(
+                last_page_len, non_blocking=non_blocking
+            )
+        else:
+            self._paged_kv_indptr_buf = indptr.to(
+                self.device, non_blocking=non_blocking
+            )
+            self._paged_kv_indices_buf = indices.to(
+                self.device, non_blocking=non_blocking
+            )
+            self._paged_kv_last_page_len_buf = last_page_len.to(
+                self.device, non_blocking=non_blocking
+            )
+            self._qo_indptr_buf = qo_indptr_host.to(
+                self.device, non_blocking=non_blocking
+            )
 
         indptr_host = indptr.to("cpu")
         if data_type is not None:

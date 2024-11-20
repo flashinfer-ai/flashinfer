@@ -883,6 +883,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         rope_theta: Optional[float] = None,
         q_data_type: Union[str, torch.dtype] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        non_blocking: bool = False,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -952,6 +953,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The data type of the query tensor, defaults torch.float16.
         kv_data_type : Optional[Union[str, torch.dtype]]
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
+        non_blocking : bool
+            Whether to copy the input tensors to the device asynchronously, defaults to ``False``.
+            If ``True``, user should synchronize before calling :meth:`run` or cuda graph replay.
 
         Note
         ----
@@ -1003,13 +1007,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "The length of paged_kv_indices exceeds the allocated buffer size."
                 )
 
-            self._qo_indptr_buf.copy_(qo_indptr, non_blocking=True)
-            self._paged_kv_indptr_buf.copy_(paged_kv_indptr, non_blocking=True)
+            self._qo_indptr_buf.copy_(qo_indptr, non_blocking=non_blocking)
+            self._paged_kv_indptr_buf.copy_(paged_kv_indptr, non_blocking=non_blocking)
             self._paged_kv_indices_buf[: len(paged_kv_indices)].copy_(
-                paged_kv_indices, non_blocking=True
+                paged_kv_indices, non_blocking=non_blocking
             )
             self._paged_kv_last_page_len_buf.copy_(
-                paged_kv_last_page_len, non_blocking=True
+                paged_kv_last_page_len, non_blocking=non_blocking
             )
 
             if packed_custom_mask is not None:
@@ -1022,26 +1026,28 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         "qk_indptr_buf must be initialized with a torch.Tensor in cuda graph mode if we use custom mask in attention computation."
                     )
                 self._custom_mask_buf[: len(packed_custom_mask)].copy_(
-                    packed_custom_mask, non_blocking=True
+                    packed_custom_mask, non_blocking=non_blocking
                 )
                 # NOTE(Zihao): qk_indptr has the same length as qo_indptr
-                self._qk_indptr_buf.copy_(qk_indptr, non_blocking=True)
+                self._qk_indptr_buf.copy_(qk_indptr, non_blocking=non_blocking)
         else:
-            self._qo_indptr_buf = qo_indptr.to(self.device, non_blocking=True)
+            self._qo_indptr_buf = qo_indptr.to(self.device, non_blocking=non_blocking)
             self._paged_kv_indptr_buf = paged_kv_indptr.to(
-                self.device, non_blocking=True
+                self.device, non_blocking=non_blocking
             )
             self._paged_kv_indices_buf = paged_kv_indices.to(
-                self.device, non_blocking=True
+                self.device, non_blocking=non_blocking
             )
             self._paged_kv_last_page_len_buf = paged_kv_last_page_len.to(
-                self.device, non_blocking=True
+                self.device, non_blocking=non_blocking
             )
             if packed_custom_mask is not None:
                 self._custom_mask_buf = packed_custom_mask.to(
-                    self.device, non_blocking=True
+                    self.device, non_blocking=non_blocking
                 )
-                self._qk_indptr_buf = qk_indptr.to(self.device, non_blocking=True)
+                self._qk_indptr_buf = qk_indptr.to(
+                    self.device, non_blocking=non_blocking
+                )
 
         # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
         qo_indptr_host = qo_indptr.to("cpu")
