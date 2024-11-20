@@ -184,6 +184,7 @@ class BlockSparseAttentionWrapper:
         rope_theta: Optional[float] = None,
         q_data_type: Union[str, torch.dtype] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        non_blocking: bool = False,
     ) -> None:
         r"""Create auxiliary data structures for block sparse attention.
 
@@ -241,6 +242,10 @@ class BlockSparseAttentionWrapper:
             The data type of the query tensor.
         kv_data_type : Optional[Union[str, torch.dtype]]
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
+        non_blocking : bool
+            Whether to copy the input tensors to the device asynchronously, defaults to ``False``.
+            If ``True``, user should synchronize before calling :meth:`run` or cuda graph replay.
+
 
         The :meth:`plan` method should be called before any :meth:`run` or
         :meth:`run_return_lse` calls, auxiliary data structures will be created
@@ -261,7 +266,7 @@ class BlockSparseAttentionWrapper:
         num_blocks_row = len(indptr) - 1
         qo_indptr_host = R * torch.arange(num_blocks_row + 1, dtype=torch.int32)
         qo_indptr_host[-1] = M
-        qo_indptr = qo_indptr_host.to(indptr.device, non_blocking=True)
+        qo_indptr = qo_indptr_host.to(indptr.device, non_blocking=non_blocking)
         if indices.max().item() * C > N:
             raise ValueError("indices out of bound")
         last_block_len = torch.full(
@@ -283,13 +288,17 @@ class BlockSparseAttentionWrapper:
                 mask.contiguous().view(-1), qk_indptr, bitorder="little"
             )
 
-        self._qo_indptr = qo_indptr.to(self.device, non_blocking=True)
-        self._paged_kv_indptr_buf = indptr.to(self.device, non_blocking=True)
-        self._paged_kv_indices_buf = indices.to(self.device, non_blocking=True)
-        self._paged_kv_last_page_len = last_block_len.to(self.device, non_blocking=True)
+        self._qo_indptr = qo_indptr.to(self.device, non_blocking=non_blocking)
+        self._paged_kv_indptr_buf = indptr.to(self.device, non_blocking=non_blocking)
+        self._paged_kv_indices_buf = indices.to(self.device, non_blocking=non_blocking)
+        self._paged_kv_last_page_len = last_block_len.to(
+            self.device, non_blocking=non_blocking
+        )
         if packed_mask is not None:
-            self._packed_mask_buf = packed_mask.to(self.device, non_blocking=True)
-            self._qk_indptr_buf = qk_indptr.to(self.device, non_blocking=True)
+            self._packed_mask_buf = packed_mask.to(
+                self.device, non_blocking=non_blocking
+            )
+            self._qk_indptr_buf = qk_indptr.to(self.device, non_blocking=non_blocking)
             mask_mode = MaskMode.CUSTOM.value
         else:
             self._packed_mask_buf = None
