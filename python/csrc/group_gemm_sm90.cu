@@ -17,20 +17,18 @@
 
 #include "pytorch_extension_utils.h"
 
+using namespace flashinfer;
 using namespace flashinfer::group_gemm;
 
-void CutlassSegmentGEMMSM90(torch::Tensor float_workspace_buffer,
-                            torch::Tensor int_workspace_buffer, torch::Tensor all_problems,
-                            torch::Tensor x_ptr, torch::Tensor w_ptr, torch::Tensor y_ptr,
-                            torch::Tensor x_stride, torch::Tensor weight_stride,
-                            torch::Tensor y_stride, torch::Tensor empty_x_data,
-                            bool weight_column_major) {
+void CutlassSegmentGEMMSM90(at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
+                            at::Tensor all_problems, at::Tensor x_ptr, at::Tensor w_ptr,
+                            at::Tensor y_ptr, at::Tensor x_stride, at::Tensor weight_stride,
+                            at::Tensor y_stride, at::Tensor empty_x_data, bool weight_column_major,
+                            int64_t cuda_stream) {
   unsigned int batch_size = x_ptr.size(0);
   auto device = float_workspace_buffer.device();
-  
-  const at::cuda::OptionalCUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
 
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(empty_x_data.scalar_type(), c_type, [&] {
     using cutlass_t = typename cutlass_dtype<c_type>::value;
     auto status = CutlassSegmentGEMMSM90Run<cutlass_t, cutlass_t>(
@@ -39,7 +37,7 @@ void CutlassSegmentGEMMSM90(torch::Tensor float_workspace_buffer,
         int_workspace_buffer.data_ptr(),
         int_workspace_buffer.element_size() * int_workspace_buffer.size(0), all_problems.data_ptr(),
         batch_size, x_ptr.data_ptr(), w_ptr.data_ptr(), y_ptr.data_ptr(), x_stride.data_ptr(),
-        weight_stride.data_ptr(), y_stride.data_ptr(), weight_column_major, torch_current_stream);
+        weight_stride.data_ptr(), y_stride.data_ptr(), weight_column_major, stream);
     TORCH_CHECK(status == cudaSuccess,
                 "Failed to run CutlassSegmentGEMM: ", cudaGetErrorString(status));
     return true;

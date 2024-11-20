@@ -13,15 +13,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <torch/extension.h>
+#include "pytorch_extension_utils.h"
 
-std::vector<torch::Tensor> merge_state(torch::Tensor v_a, torch::Tensor s_a, torch::Tensor v_b,
-                                       torch::Tensor s_b);
+void merge_state(at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b,
+                 at::Tensor v_merged, at::Tensor s_merged, int64_t cuda_stream);
 
-void merge_state_in_place(torch::Tensor v, torch::Tensor s, torch::Tensor v_other,
-                          torch::Tensor s_other, std::optional<torch::Tensor> mask = std::nullopt);
+void merge_state_in_place(at::Tensor v, at::Tensor s, at::Tensor v_other, at::Tensor s_other,
+                          std::optional<at::Tensor> mask, int64_t cuda_stream);
 
-std::vector<torch::Tensor> merge_states(torch::Tensor v, torch::Tensor s);
+void merge_states(at::Tensor v, at::Tensor s, at::Tensor v_merged, at::Tensor s_merged,
+                  int64_t cuda_stream);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("merge_state", &merge_state, "Merge two self-attention states");

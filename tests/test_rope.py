@@ -348,6 +348,6 @@ def test_rope_cos_sin_cache(
 
 
 if __name__ == "__main__":
-    test_rope(2, 1, 8, 8, 1, 128, "llama31", 1.0, False)
-    test_rope_pos_ids(2, 1, 8, 8, 1, 128, "llama31", 1.0, False)
-    test_rope_cos_sin_cache(99, 19, 16, 8, 99, 256, "llama31", 0.5, False)
+    test_rope(2, 1, 8, 8, 1, 128, "llama", 1.0, False)
+    # test_rope_pos_ids(2, 1, 8, 8, 1, 128, "llama31", 1.0, False)
+    # test_rope_cos_sin_cache(99, 19, 16, 8, 99, 256, "llama31", 0.5, False)

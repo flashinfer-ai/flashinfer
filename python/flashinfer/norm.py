@@ -19,7 +19,7 @@ from typing import Optional
 import torch
 
 from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
-from .utils import register_custom_op, register_fake_op
+from .utils import get_cuda_stream, register_custom_op, register_fake_op
 
 _norm_module = None
 
@@ -78,7 +78,8 @@ def rmsnorm(
 def _rmsnorm(
     out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor, eps: float
 ) -> None:
-    get_norm_module().rmsnorm(out, input, weight, eps)
+    with input.device as device:  # device guard
+        get_norm_module().rmsnorm(out, input, weight, eps, get_cuda_stream(device))
 
 
 @register_fake_op("flashinfer::rmsnorm")
@@ -111,7 +112,10 @@ def fused_add_rmsnorm(
     eps: float
         Epsilon for numerical stability.
     """
-    get_norm_module().fused_add_rmsnorm(input, residual, weight, eps)
+    with input.device as device:  # device guard
+        get_norm_module().fused_add_rmsnorm(
+            input, residual, weight, eps, get_cuda_stream(device)
+        )
 
 
 @register_fake_op("flashinfer::fused_add_rmsnorm")
@@ -157,7 +161,10 @@ def gemma_rmsnorm(
 def _gemma_rmsnorm(
     out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor, eps: float
 ) -> None:
-    get_norm_module().gemma_rmsnorm(out, input, weight, eps)
+    with input.device as device:  # device guard
+        get_norm_module().gemma_rmsnorm(
+            out, input, weight, eps, get_cuda_stream(device)
+        )
 
 
 @register_fake_op("flashinfer::gemma_rmsnorm")
@@ -192,7 +199,10 @@ def gemma_fused_add_rmsnorm(
     eps: float
         Epsilon for numerical stability.
     """
-    get_norm_module().gemma_fused_add_rmsnorm(input, residual, weight, eps)
+    with input.device as device:
+        get_norm_module().gemma_fused_add_rmsnorm(
+            input, residual, weight, eps, get_cuda_stream(device)
+        )
 
 
 @register_fake_op("flashinfer::gemma_fused_add_rmsnorm")

@@ -687,7 +687,7 @@ cudaError_t SingleDecodeWithKVCacheDispatched(typename AttentionVariant::ParamsT
         if (nblks.x == 0 || nblks.y == 0) {
           std::ostringstream err_msg;
           err_msg << "Invalid kernel configuration: nblks=(" << nblks.x << "," << nblks.y << ")";
-          throw std::runtime_error(err_msg.str());
+          FLASHINFER_ERROR(err_msg.str());
         }
         dim3 nthrs = dim3(bdx, bdy, bdz);
         float* tmp_lse = (float*)(tmp + num_chunks * num_qo_heads * HEAD_DIM);

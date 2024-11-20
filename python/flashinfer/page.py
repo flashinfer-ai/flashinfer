@@ -25,6 +25,7 @@ from .utils import (
     TensorLayout,
     _check_kv_layout,
     _unpack_paged_kv_cache,
+    get_cuda_stream,
     register_custom_op,
     register_fake_op,
 )
@@ -66,18 +67,25 @@ def _append_paged_kv_cache_kernel(
     kv_last_page_len: torch.Tensor,
     layout: int,
 ) -> None:
-    get_page_module().append_paged_kv_cache(
-        append_key,
-        append_value,
-        batch_indices,
-        positions,
-        paged_k_cache,
-        paged_v_cache,
-        kv_indices,
-        kv_indptr,
-        kv_last_page_len,
-        layout,
-    )
+    with append_key.device as device:
+        batch_indices = batch_indices.int()
+        positions = positions.int()
+        kv_indices = kv_indices.int()
+        kv_indptr = kv_indptr.int()
+        kv_last_page_len = kv_last_page_len.int()
+        get_page_module().append_paged_kv_cache(
+            append_key,
+            append_value,
+            batch_indices,
+            positions,
+            paged_k_cache,
+            paged_v_cache,
+            kv_indices,
+            kv_indptr,
+            kv_last_page_len,
+            layout,
+            get_cuda_stream(device),
+        )
 
 
 @register_fake_op("flashinfer::append_paged_kv_cache")

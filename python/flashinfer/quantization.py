@@ -19,7 +19,7 @@ from typing import Tuple
 import torch
 
 from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
-from .utils import register_custom_op, register_fake_op
+from .utils import get_cuda_stream, register_custom_op, register_fake_op
 
 _quantization_module = None
 
@@ -44,7 +44,11 @@ def get_quantization_module():
 
 @register_custom_op("flashinfer::packbits", mutates_args=())
 def _packbits(x: torch.Tensor, bitorder: str) -> torch.Tensor:
-    return get_quantization_module().packbits(x, bitorder)
+    with x.device as device:  # device guard
+        x = x.to(torch.bool)
+        y = torch.empty((x.size(0) + 7) // 8, dtype=torch.uint8, device=device)
+        get_quantization_module().packbits(x, bitorder, y, get_cuda_stream(device))
+        return y
 
 
 @register_fake_op("flashinfer::packbits")
@@ -136,7 +140,16 @@ def segment_packbits(
     packed_len = (seglen + 7) // 8
     indptr_new = torch.zeros(len(indptr), dtype=indptr.dtype, device=indptr.device)
     indptr_new[1:] = torch.cumsum(packed_len, 0)
-    return (
-        get_quantization_module().segment_packbits(x, indptr, indptr_new, bitorder),
-        indptr_new,
-    )
+    output_nnzs = indptr_new[-1].item()
+
+    with x.device as device:
+        indptr = indptr.to(torch.int32)
+        indptr_new = indptr_new.to(torch.int32)
+        y = torch.empty(output_nnzs, dtype=torch.uint8, device=device)
+        get_quantization_module().segment_packbits(
+            x, indptr, indptr_new, bitorder, y, get_cuda_stream(device)
+        )
+        return (
+            y,
+            indptr_new,
+        )

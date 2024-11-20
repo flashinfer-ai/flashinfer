@@ -80,7 +80,11 @@ def test_batch_attention_with_shared_prefix_paged_kv_cache(
     flashinfer.append_paged_kv_cache(
         k_shared,
         v_shared,
-        shared_append_indptr,
+        *flashinfer.get_batch_indices_positions(
+            shared_append_indptr,
+            flashinfer.get_seq_lens(shared_kv_indptr, shared_last_page_len, page_size),
+            k_shared.shape[0],
+        ),
         kv_data,
         shared_kv_indices,
         shared_kv_indptr,
@@ -100,7 +104,11 @@ def test_batch_attention_with_shared_prefix_paged_kv_cache(
     flashinfer.append_paged_kv_cache(
         k_unique,
         v_unique,
-        unique_append_indptr,
+        *flashinfer.get_batch_indices_positions(
+            unique_append_indptr,
+            flashinfer.get_seq_lens(unique_kv_indptr, unique_last_page_len, page_size),
+            k_unique.shape[0],
+        ),
         kv_data,
         unique_kv_indices,
         unique_kv_indptr,

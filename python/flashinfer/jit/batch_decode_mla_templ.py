@@ -14,9 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-batch_decode_mla_templ = r"""
-#include <torch/extension.h>
-#include <optional>
+batch_decode_mla_suffix = [
+    "_plan.cu",
+    "_run.cu",
+    "_pybind.cc",
+]
+
+batch_decode_mla_templ = [
+    r"""#include <optional>
 #include <flashinfer/attention/decode.cuh>
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/attention/variants.cuh>
@@ -29,22 +34,20 @@ using ParamsT = BatchDecodeParamsMLA<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }
 using AttentionVariant = ComposedAttention<ParamsT, get_variant_code(/*use_custom_mask=*/false, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, /*use_alibi*/false)>;
 
 std::vector<int64_t> BatchDecodeWithPagedKVCachePlanMLA(
-    torch::Tensor float_workspace_buffer, torch::Tensor int_workspace_buffer,
-    torch::Tensor page_locked_int_workspace_buffer,
-    torch::Tensor indptr,
+    at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
+    at::Tensor page_locked_int_workspace_buffer,
+    at::Tensor indptr,
     unsigned int batch_size, unsigned int num_qo_heads,
     unsigned int page_size,
-    bool enable_cuda_graph) {
+    bool enable_cuda_graph,
+    int64_t cuda_stream) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =
       int_workspace_buffer.size(0) * int_workspace_buffer.element_size();
-  auto device = float_workspace_buffer.device();
-  const at::cuda::OptionalCUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  indptr = indptr.to(torch::kCPU);
 
   DecodePlanInfo plan_info;
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
 
   auto work_estimation_func =
       BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA<{{ head_dim_ckv }}, {{ head_dim_kpe }}, AttentionVariant>;
@@ -56,7 +59,7 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlanMLA(
       int_workspace_size_in_bytes,
       plan_info,
       static_cast<{{ dtype_idx }}*>(indptr.data_ptr()),
-      batch_size, num_qo_heads, page_size, enable_cuda_graph, /*stream=*/torch_current_stream,
+      batch_size, num_qo_heads, page_size, enable_cuda_graph, /*stream=*/stream,
       work_estimation_func);
 
   TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCachePlanMLA failed with error ",
@@ -64,20 +67,35 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlanMLA(
 
   return plan_info.ToVector();
 }
+"""
+    r"""
+#include <optional>
+#include <flashinfer/attention/decode.cuh>
+#include <flashinfer/attention/scheduler.cuh>
+#include <flashinfer/attention/variants.cuh>
+#include <flashinfer/attention/decode_params.cuh>
+#include "pytorch_extension_utils.h"
 
-std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRunMLA(
-    torch::Tensor float_workspace_buffer,
-    torch::Tensor int_workspace_buffer,
+using namespace flashinfer;
+
+using ParamsT = BatchDecodeParamsMLA<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ dtype_idx }}>;
+using AttentionVariant = ComposedAttention<ParamsT, get_variant_code(/*use_custom_mask=*/false, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, /*use_alibi*/false)>;
+
+void BatchDecodeWithPagedKVCacheRunMLA(
+    at::Tensor float_workspace_buffer,
+    at::Tensor int_workspace_buffer,
     std::vector<int64_t> plan_info_vec,
-    torch::Tensor q_nope,
-    torch::Tensor q_pe,
-    torch::Tensor paged_ckv_cache,
-    torch::Tensor paged_kpe_cache,
-    torch::Tensor paged_kv_indptr, torch::Tensor paged_kv_indices,
-    torch::Tensor paged_kv_last_page_len,
+    at::Tensor q_nope,
+    at::Tensor q_pe,
+    at::Tensor paged_ckv_cache,
+    at::Tensor paged_kpe_cache,
+    at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices,
+    at::Tensor paged_kv_last_page_len,
+    at::Tensor o,
     float sm_scale,
     int window_left,
-    float logits_soft_cap, float rope_scale, float rope_theta, bool return_lse) {
+    float logits_soft_cap, float rope_scale, float rope_theta, std::optional<at::Tensor> maybe_lse,
+    int64_t cuda_stream) {
   DecodePlanInfo plan_info;
   plan_info.FromVector(plan_info_vec);
 
@@ -86,12 +104,10 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRunMLA(
   int64_t num_qo_heads = q_nope.size(1);
   int64_t page_size = paged_ckv_cache.size(1);
 
-  const at::cuda::OptionalCUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  torch::Tensor o = torch::empty_like(q_nope);
-  torch::Tensor lse;
-  if (return_lse) {
-    lse = torch::empty({batch_size, num_qo_heads}, q_nope.options().dtype((torch::kFloat32)));
+  if (maybe_lse) {
+    const auto& lse = *maybe_lse;
+    TORCH_CHECK(lse.size(0) == batch_size, lse.size(0), q.size(0));
+    TORCH_CHECK(lse.size(1) == num_qo_heads, lse.size(1), q.size(1));
   }
 
   TORCH_CHECK(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
@@ -112,7 +128,7 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRunMLA(
   ParamsT params(
     static_cast<{{ dtype_q }}*>(q_nope.data_ptr()), static_cast<{{ dtype_q }}*>(q_pe.data_ptr()),
     /*q_offset=*/nullptr, paged_kv, static_cast<{{ dtype_o }}*>(o.data_ptr()),
-    /*lse=*/(return_lse ? static_cast<float*>(lse.data_ptr()) : nullptr),
+    /*lse=*/(maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr),
     num_qo_heads, window_left, logits_soft_cap, sm_scale, rope_scale, rope_theta);
 
   {{ dtype_o }}* tmp_v = nullptr;
@@ -135,16 +151,38 @@ std::vector<torch::Tensor> BatchDecodeWithPagedKVCacheRunMLA(
       params, tmp_v, tmp_s, /*stream=*/torch_current_stream);
   TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
               cudaGetErrorString(status));
-
-  if (return_lse) {
-    return {o, lse};
-  } else {
-    return {o};
-  }
 }
+""",
+    r"""#include "pytorch_extension_utils.h"
+
+std::vector<int64_t> BatchDecodeWithPagedKVCachePlanMLA(
+    at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
+    at::Tensor page_locked_int_workspace_buffer,
+    at::Tensor indptr,
+    unsigned int batch_size, unsigned int num_qo_heads,
+    unsigned int page_size,
+    bool enable_cuda_graph,
+    int64_t cuda_stream);
+
+void BatchDecodeWithPagedKVCacheRunMLA(
+    at::Tensor float_workspace_buffer,
+    at::Tensor int_workspace_buffer,
+    std::vector<int64_t> plan_info_vec,
+    at::Tensor q_nope,
+    at::Tensor q_pe,
+    at::Tensor paged_ckv_cache,
+    at::Tensor paged_kpe_cache,
+    at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices,
+    at::Tensor paged_kv_last_page_len,
+    at::Tensor o,
+    float sm_scale,
+    int window_left,
+    float logits_soft_cap, float rope_scale, float rope_theta, std::optional<at::Tensor> maybe_lse,
+    int64_t cuda_stream);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("plan", &BatchDecodeWithPagedKVCachePlanMLA);
   m.def("run", &BatchDecodeWithPagedKVCacheRunMLA);
 }
-"""
+""",
+]

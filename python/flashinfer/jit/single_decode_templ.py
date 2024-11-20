@@ -14,11 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-customizable_single_decode_templ = r"""
-#include <torch/extension.h>
+single_decode_suffix = [
+    ".cu",
+    "_pybind.cc",
+]
+
+customizable_single_decode_templ = [
+    r"""
 #include <optional>
 #include <flashinfer/attention/decode.cuh>
 #include "pytorch_extension_utils.h"
+
+using namespace flashinfer;
 
 struct SingleDecodeParams {
   using DTypeQ = {{ dtype_q }};
@@ -91,9 +98,10 @@ struct SingleDecodeParams {
 {{ variant_decl }}
 
 
-torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torch::Tensor v,
-                                          torch::Tensor tmp,
-                                          unsigned int layout, int window_left{{ additional_func_params }}) {
+void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v,
+                                 at::Tensor tmp, at::Tensor o,
+                                 unsigned int layout, int window_left{{ additional_func_params }},
+                                 int64_t cuda_stream) {
   auto device = q.device();
   unsigned int num_qo_heads = q.size(0);
   unsigned int head_dim = q.size(1);
@@ -106,9 +114,6 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
     num_kv_heads = k.size(0);
     kv_len = k.size(1);
   }
-  const at::cuda::OptionalCUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  auto o = torch::empty_like(q);
 
   using ParamsT = SingleDecodeParams;
   using AttentionVariant = {{ variant_name }}<ParamsT>;
@@ -117,35 +122,44 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
       static_cast<{{ dtype_kv }}*>(v.data_ptr()), static_cast<{{ dtype_o }}*>(o.data_ptr()),
       kv_len, num_qo_heads, num_kv_heads, kv_layout, head_dim, window_left{{ additional_params_data }});
 
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaError_t status = SingleDecodeWithKVCacheDispatched<{{ head_dim }}, PosEncodingMode::kNone, AttentionVariant>(
-      params, static_cast<{{ dtype_o }}*>(tmp.data_ptr()), torch_current_stream);
+      params, static_cast<{{ dtype_o }}*>(tmp.data_ptr()), stream);
   TORCH_CHECK(status == cudaSuccess,
               "SingleDecodeWithKVCache kernel launch failed, error: " +
                   std::string(cudaGetErrorString(status)));
-
-  return o;
 }
+""",
+    r"""#include "pytorch_extension_utils.h"
+
+void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v,
+                                 at::Tensor tmp, at::Tensor o,
+                                 unsigned int layout, int window_left{{ additional_func_params }},
+                                 int64_t cuda_stream);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("run", &single_decode_with_kv_cache,
         "Single-request decode with KV-Cache operator");
 }
-"""
+""",
+]
 
-single_decode_templ = r"""
-#include <torch/extension.h>
+single_decode_templ = [
+    r"""
 #include <optional>
 #include <flashinfer/attention/decode.cuh>
 #include <flashinfer/attention/variants.cuh>
 #include <flashinfer/attention/decode_params.cuh>
 #include "pytorch_extension_utils.h"
 
+using namespace flashinfer;
+
 {% set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
-torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torch::Tensor v,
-                                          torch::Tensor tmp, std::optional<torch::Tensor> alibi_slopes,
-                                          unsigned int layout, int window_left,
-                                          float logits_soft_cap, float sm_scale, float rope_scale,
-                                          float rope_theta) {
+void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v,
+                                 at::Tensor tmp, std::optional<at::Tensor> alibi_slopes,
+                                 at::Tensor o, unsigned int layout, int window_left,
+                                 float logits_soft_cap, float sm_scale, float rope_scale,
+                                 float rope_theta, int64_t cuda_stream) {
   auto device = q.device();
   unsigned int num_qo_heads = q.size(0);
   unsigned int head_dim = q.size(1);
@@ -158,10 +172,8 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
     num_kv_heads = k.size(0);
     kv_len = k.size(1);
   }
-  const at::cuda::OptionalCUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  auto o = torch::empty_like(q);
 
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   using ParamsT = SingleDecodeParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}>;
   using AttentionVariant = ComposedAttention<ParamsT, get_variant_code(/*use_custom_mask=*/false, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, {{ use_alibi }})>;
   ParamsT params(
@@ -172,16 +184,22 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
       logits_soft_cap, sm_scale, rope_scale, rope_theta);
 
   cudaError_t status = SingleDecodeWithKVCacheDispatched<{{ head_dim }}, {{ pos_encoding_mode }}, AttentionVariant>(
-      params, static_cast<{{ dtype_o }}*>(tmp.data_ptr()), torch_current_stream);
+      params, static_cast<{{ dtype_o }}*>(tmp.data_ptr()), stream);
   TORCH_CHECK(status == cudaSuccess,
               "SingleDecodeWithKVCache kernel launch failed, error: " +
                   std::string(cudaGetErrorString(status)));
-
-  return o;
 }
+""",
+    r"""#include "pytorch_extension_utils.h"
+void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v,
+                                 at::Tensor tmp, std::optional<at::Tensor> alibi_slopes,
+                                 at::Tensor o, unsigned int layout, int window_left,
+                                 float logits_soft_cap, float sm_scale, float rope_scale,
+                                 float rope_theta, int64_t cuda_stream);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("run", &single_decode_with_kv_cache,
         "Single-request decode with KV-Cache operator");
 }
-"""
+""",
+]

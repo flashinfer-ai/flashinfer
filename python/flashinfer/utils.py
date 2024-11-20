@@ -248,3 +248,7 @@ else:
         fn: Optional[Callable] = None,
     ) -> Callable:
         return torch.library.register_fake(name, fn)
+
+
+def get_cuda_stream(device: torch.device) -> int:
+    return torch.cuda.current_stream(device).cuda_stream

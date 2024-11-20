@@ -23,9 +23,9 @@
 
 #include <cstdint>
 #include <iostream>
-#include <sstream>
-#include <stdexcept>
 #include <vector>
+
+#include "exception.h"
 
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
@@ -57,7 +57,7 @@
 
 #define DISPATCH_ALLOW_FP16_QK_REDUCTION(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, ...) \
   if (allow_fp16_qk_reduction) {                                                                \
-    throw std::runtime_error("FP16_QK_REDUCTION disabled at compile time");                     \
+    FLASHINFER_ERROR("FP16_QK_REDUCTION disabled at compile time");                             \
   } else {                                                                                      \
     constexpr bool ALLOW_FP16_QK_REDUCTION = false;                                             \
     __VA_ARGS__                                                                                 \
@@ -73,7 +73,7 @@
   } else {                                                  \
     std::ostringstream err_msg;                             \
     err_msg << "Unsupported num_frags_q: " << num_frags_q;  \
-    throw std::invalid_argument(err_msg.str());             \
+    FLASHINFER_ERROR(err_msg.str());                        \
   }
 
 #define DISPATCH_NUM_FRAGS_KV(max_frags_kv, NUM_FRAGS_KV, ...) \
@@ -92,7 +92,7 @@
   } else {                                                     \
     std::ostringstream err_msg;                                \
     err_msg << "Unsupported max_frags_kv: " << max_frags_kv;   \
-    throw std::invalid_argument(err_msg.str());                \
+    FLASHINFER_ERROR(err_msg.str());                           \
   }
 
 #define DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, ...)   \
@@ -115,7 +115,7 @@
     default: {                                             \
       std::ostringstream err_msg;                          \
       err_msg << "Unsupported cta_tile_q: " << cta_tile_q; \
-      throw std::invalid_argument(err_msg.str());          \
+      FLASHINFER_ERROR(err_msg.str());                     \
     }                                                      \
   }
 
@@ -138,7 +138,7 @@
   } else {                                                   \
     std::ostringstream err_msg;                              \
     err_msg << "Unsupported group_size: " << group_size;     \
-    throw std::invalid_argument(err_msg.str());              \
+    FLASHINFER_ERROR(err_msg.str());                         \
   }
 
 #define DISPATCH_MASK_MODE(mask_mode, MASK_MODE, ...)         \
@@ -161,7 +161,7 @@
     default: {                                                \
       std::ostringstream err_msg;                             \
       err_msg << "Unsupported mask_mode: " << int(mask_mode); \
-      throw std::invalid_argument(err_msg.str());             \
+      FLASHINFER_ERROR(err_msg.str());                        \
     }                                                         \
   }
 
@@ -190,7 +190,7 @@
     default: {                                         \
       std::ostringstream err_msg;                      \
       err_msg << "Unsupported head_dim: " << head_dim; \
-      throw std::invalid_argument(err_msg.str());      \
+      FLASHINFER_ERROR(err_msg.str());                 \
     }                                                  \
   }
 
@@ -214,7 +214,7 @@
     default: {                                                                   \
       std::ostringstream err_msg;                                                \
       err_msg << "Unsupported pos_encoding_mode: " << int(pos_encoding_mode);    \
-      throw std::invalid_argument(err_msg.str());                                \
+      FLASHINFER_ERROR(err_msg.str());                                           \
     }                                                                            \
   }
 
@@ -248,7 +248,7 @@
     default: {                                                             \
       std::ostringstream err_msg;                                          \
       err_msg << "Unsupported aligned_vec_size: " << aligned_vec_size;     \
-      throw std::invalid_argument(err_msg.str());                          \
+      FLASHINFER_ERROR(err_msg.str());                                     \
     }                                                                      \
   }
 

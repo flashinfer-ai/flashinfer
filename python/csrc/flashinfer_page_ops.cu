@@ -13,13 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <torch/extension.h>
+#include "pytorch_extension_utils.h"
 
-void append_paged_kv_cache(torch::Tensor append_key, torch::Tensor append_value,
-                           torch::Tensor batch_indices, torch::Tensor positions,
-                           torch::Tensor paged_k_cache, torch::Tensor paged_v_cache,
-                           torch::Tensor kv_indices, torch::Tensor kv_indptr,
-                           torch::Tensor kv_last_page_len, unsigned int layout);
+void append_paged_kv_cache(at::Tensor append_key, at::Tensor append_value, at::Tensor batch_indices,
+                           at::Tensor positions, at::Tensor paged_k_cache, at::Tensor paged_v_cache,
+                           at::Tensor kv_indices, at::Tensor kv_indptr, at::Tensor kv_last_page_len,
+                           unsigned int layout, int64_t cuda_stream);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("append_paged_kv_cache", &append_paged_kv_cache, "Append paged KV-Cache operator");

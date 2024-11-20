@@ -72,7 +72,3 @@ def test_batch_paged_decode_packed_input(
     o_packed = wrapper.run(q, paged_kv_cache)
     o_contiguous = wrapper.run(q.contiguous(), paged_kv_cache)
     torch.testing.assert_close(o_packed, o_contiguous, rtol=1e-3, atol=1e-3)
-
-
-if __name__ == "__main__":
-    test_batch_paged_decode_packed_input(37, 127, 1, 4, 64, 128)

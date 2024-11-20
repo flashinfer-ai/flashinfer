@@ -13,17 +13,19 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <torch/extension.h>
+#include "pytorch_extension_utils.h"
 
-void rmsnorm(torch::Tensor& out, torch::Tensor& input, torch::Tensor& weight, double eps);
+void rmsnorm(at::Tensor& out, at::Tensor& input, at::Tensor& weight, double eps,
+             int64_t cuda_stream);
 
-void fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight,
-                       double eps);
+void fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps,
+                       int64_t cuda_stream);
 
-void gemma_rmsnorm(torch::Tensor& out, torch::Tensor& input, torch::Tensor& weight, double eps);
+void gemma_rmsnorm(at::Tensor& out, at::Tensor& input, at::Tensor& weight, double eps,
+                   int64_t cuda_stream);
 
-void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight,
-                             double eps);
+void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight,
+                             double eps, int64_t cuda_stream);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rmsnorm", &rmsnorm, "Root mean square normalization");

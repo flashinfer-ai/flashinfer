@@ -19,11 +19,10 @@
 
 using namespace flashinfer;
 
-void append_paged_kv_cache(torch::Tensor append_key, torch::Tensor append_value,
-                           torch::Tensor batch_indices, torch::Tensor positions,
-                           torch::Tensor paged_k_cache, torch::Tensor paged_v_cache,
-                           torch::Tensor kv_indices, torch::Tensor kv_indptr,
-                           torch::Tensor kv_last_page_len, unsigned int layout) {
+void append_paged_kv_cache(at::Tensor append_key, at::Tensor append_value, at::Tensor batch_indices,
+                           at::Tensor positions, at::Tensor paged_k_cache, at::Tensor paged_v_cache,
+                           at::Tensor kv_indices, at::Tensor kv_indptr, at::Tensor kv_last_page_len,
+                           unsigned int layout, int64_t cuda_stream) {
   CHECK_LAST_DIM_CONTIGUOUS(append_key);
   CHECK_LAST_DIM_CONTIGUOUS(append_value);
   CHECK_INPUT(batch_indices);
@@ -48,11 +47,6 @@ void append_paged_kv_cache(torch::Tensor append_key, torch::Tensor append_value,
   CHECK_EQ(kv_indptr.size(0), batch_size + 1);
   CHECK_EQ(batch_indices.size(0), nnz);
   CHECK_EQ(positions.size(0), nnz);
-  CHECK_EQ(batch_indices.scalar_type(), torch::kInt32);
-  CHECK_EQ(positions.scalar_type(), torch::kInt32);
-  CHECK_EQ(kv_indptr.scalar_type(), torch::kInt32);
-  CHECK_EQ(kv_indices.scalar_type(), torch::kInt32);
-  CHECK_EQ(kv_last_page_len.scalar_type(), torch::kInt32);
   auto device = append_key.device();
   CHECK_EQ(append_key.device(), device);
   CHECK_EQ(append_value.device(), device);
@@ -92,12 +86,10 @@ void append_paged_kv_cache(torch::Tensor append_key, torch::Tensor append_value,
   CHECK_EQ(append_key.size(2), head_dim);
   CHECK_EQ(append_value.size(1), num_heads);
   CHECK_EQ(append_value.size(2), head_dim);
-  
-  const at::cuda::OptionalCUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
 
   auto kv_scalar_dtype = paged_k_cache.scalar_type();
 
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(kv_scalar_dtype, c_type, [&] {
     paged_kv_t<c_type, int32_t> paged_kv(
         num_heads, page_size, head_dim, batch_size, kv_layout,
@@ -105,12 +97,12 @@ void append_paged_kv_cache(torch::Tensor append_key, torch::Tensor append_value,
         static_cast<c_type*>(paged_v_cache.data_ptr()), kv_cache_strides,
         static_cast<int32_t*>(kv_indices.data_ptr()), static_cast<int32_t*>(kv_indptr.data_ptr()),
         static_cast<int32_t*>(kv_last_page_len.data_ptr()));
-    cudaError_t status = AppendPagedKVCache(paged_kv, static_cast<c_type*>(append_key.data_ptr()),
-                                            static_cast<c_type*>(append_value.data_ptr()),
-                                            static_cast<int32_t*>(batch_indices.data_ptr()),
-                                            static_cast<int32_t*>(positions.data_ptr()), nnz,
-                                            append_k_stride_n, append_k_stride_h, append_v_stride_n,
-                                            append_v_stride_h, torch_current_stream);
+    cudaError_t status =
+        AppendPagedKVCache(paged_kv, static_cast<c_type*>(append_key.data_ptr()),
+                           static_cast<c_type*>(append_value.data_ptr()),
+                           static_cast<int32_t*>(batch_indices.data_ptr()),
+                           static_cast<int32_t*>(positions.data_ptr()), nnz, append_k_stride_n,
+                           append_k_stride_h, append_v_stride_n, append_v_stride_h, stream);
     TORCH_CHECK(status == cudaSuccess,
                 "AppendPagedKVCache failed with error: ", cudaGetErrorString(status));
     return true;

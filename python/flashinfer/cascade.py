@@ -21,7 +21,7 @@ import torch
 from .decode import BatchDecodeWithPagedKVCacheWrapper
 from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
 from .prefill import BatchPrefillWithPagedKVCacheWrapper, single_prefill_with_kv_cache
-from .utils import register_custom_op, register_fake_op
+from .utils import get_cuda_stream, register_custom_op, register_fake_op
 
 _cascade_module = None
 
@@ -93,7 +93,15 @@ def merge_state(
     >>> s_merged.shape
     torch.Size([2048, 32])
     """
-    return get_cascade_module().merge_state(v_a, s_a, v_b, s_b)
+    with v_a.device as device:  # device guard
+        s_a = s_a.to(torch.float32)
+        s_b = s_b.to(torch.float32)
+        v_merged = torch.empty_like(v_a)
+        s_merged = torch.empty_like(s_a)
+        get_cascade_module().merge_state(
+            v_a, s_a, v_b, s_b, v_merged, s_merged, get_cuda_stream(device)
+        )
+        return v_merged, s_merged
 
 
 @register_fake_op("flashinfer::merge_state")
@@ -149,7 +157,12 @@ def merge_state_in_place(
     >>> s_other = torch.randn(seq_len, num_heads, dtype=torch.float32).to("cuda:0")
     >>> flashinfer.merge_state_in_place(v, s, v_other, s_other)
     """
-    get_cascade_module().merge_state_in_place(v, s, v_other, s_other, mask)
+    with v.device as device:  # device guard
+        s = s.to(torch.float32)
+        s_other = s_other.to(torch.float32)
+        get_cascade_module().merge_state_in_place(
+            v, s, v_other, s_other, mask, get_cuda_stream(device)
+        )
 
 
 @register_fake_op("flashinfer::merge_state_in_place")
@@ -201,16 +214,27 @@ def merge_states(v: torch.Tensor, s: torch.Tensor) -> Tuple[torch.Tensor, torch.
     >>> s_merged.shape
     torch.Size([2048, 32])
     """
-    return get_cascade_module().merge_states(v, s)
+    with v.device as device:  # device guard
+        s = s.to(torch.float32)
+        seq_len, _, num_heads, head_dim = v.size()
+        v_merged = torch.empty(
+            seq_len, num_heads, head_dim, dtype=v.dtype, device=device
+        )
+        s_merged = torch.empty(seq_len, num_heads, dtype=torch.float32, device=device)
+        get_cascade_module().merge_states(
+            v, s, v_merged, s_merged, get_cuda_stream(device)
+        )
+        return v_merged, s_merged
 
 
 @register_fake_op("flashinfer::merge_states")
 def _fake_merge_states(
     v: torch.Tensor, s: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    v = torch.empty_like(v)
-    s = torch.empty_like(s)
-    return v, s
+    seq_len, _, num_heads, head_dim = v.size()
+    v_merged = torch.empty(seq_len, num_heads, head_dim, dtype=v.dtype)
+    s_merged = torch.empty(seq_len, num_heads, dtype=torch.float32)
+    return v_merged, s_merged
 
 
 class MultiLevelCascadeAttentionWrapper:

@@ -23,7 +23,9 @@ import triton.language as tl
 
 from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
 from .utils import (
+    _get_cache_buf,
     get_compute_capability,
+    get_cuda_stream,
     get_indptr,
     register_custom_op,
     register_fake_op,
@@ -52,18 +54,33 @@ def get_gemm_module():
 
         # torch library for bmm_fp8
 
-        @register_custom_op("flashinfer::bmm_fp8", mutates_args=("D",))
+        @register_custom_op(
+            "flashinfer::bmm_fp8", mutates_args=("workspace_buffer", "D")
+        )
         def bmm_fp8(
+            workspace_buffer: torch.Tensor,
             A: torch.Tensor,
             B: torch.Tensor,
             D: torch.Tensor,
             A_scale: torch.Tensor,
             B_scale: torch.Tensor,
         ) -> None:
-            module.bmm_fp8(A, B, D, A_scale, B_scale)
+            with A.device as device:
+                cublas_handle = torch.cuda.current_blas_handle()
+                module.bmm_fp8(
+                    A,
+                    B,
+                    D,
+                    A_scale,
+                    B_scale,
+                    workspace_buffer,
+                    cublas_handle,
+                    get_cuda_stream(device),
+                )
 
         @register_fake_op("flashinfer::bmm_fp8")
         def _fake_bmm_fp8(
+            workspace_buffer: torch.Tensor,
             A: torch.Tensor,
             B: torch.Tensor,
             D: torch.Tensor,
@@ -88,18 +105,20 @@ def get_gemm_module():
             empty_x_data: torch.Tensor,
             weight_column_major: bool,
         ) -> None:
-            module.cutlass_segment_gemm(
-                workspace_buffer,
-                all_problems,
-                x_data,
-                w_data,
-                y_data,
-                x_ld,
-                w_ld,
-                y_ld,
-                empty_x_data,
-                weight_column_major,
-            )
+            with x_data.device as device:
+                module.cutlass_segment_gemm(
+                    workspace_buffer,
+                    all_problems,
+                    x_data,
+                    w_data,
+                    y_data,
+                    x_ld,
+                    w_ld,
+                    y_ld,
+                    empty_x_data,
+                    weight_column_major,
+                    get_cuda_stream(device),
+                )
 
         @register_fake_op("flashinfer::cutlass_segment_gemm")
         def _fake_cutlass_segment_gemm(
@@ -145,7 +164,10 @@ def get_gemm_sm90_module():
 
         # torch library for cutlass_segment_gemm_sm90
 
-        @register_custom_op("flashinfer::cutlass_segment_gemm_sm90", mutates_args=("y"))
+        @register_custom_op(
+            "flashinfer::cutlass_segment_gemm_sm90",
+            mutates_args=("workspace_buffer", "y"),
+        )
         def cutlass_segment_gemm_sm90(
             workspace_buffer: torch.Tensor,
             int_workspace_buffer: torch.Tensor,
@@ -160,19 +182,21 @@ def get_gemm_sm90_module():
             empty_x_data: torch.Tensor,
             weight_column_major: bool,
         ) -> None:
-            module.cutlass_segment_gemm_sm90(
-                workspace_buffer,
-                int_workspace_buffer,
-                all_problems,
-                x_data,
-                w_data,
-                y_data,
-                x_stride,
-                w_stride,
-                y_stride,
-                empty_x_data,
-                weight_column_major,
-            )
+            with x_data.device as device:
+                module.cutlass_segment_gemm_sm90(
+                    workspace_buffer,
+                    int_workspace_buffer,
+                    all_problems,
+                    x_data,
+                    w_data,
+                    y_data,
+                    x_stride,
+                    w_stride,
+                    y_stride,
+                    empty_x_data,
+                    weight_column_major,
+                    get_cuda_stream(device),
+                )
 
         @register_fake_op("flashinfer::cutlass_segment_gemm_sm90")
         def _fake_cutlass_segment_gemm_sm90(
@@ -699,5 +723,6 @@ def bmm_fp8(
             device=A.device,
             dtype=dtype,
         )
-    get_gemm_module().bmm_fp8(A, B, out, A_scale, B_scale)
+    workspace_buffer = _get_cache_buf("bmm_fp8_workspace", 32 * 1024 * 1024, A.device)
+    get_gemm_module().bmm_fp8(workspace_buffer, A, B, out, A_scale, B_scale)
     return out

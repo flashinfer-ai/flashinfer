@@ -1375,7 +1375,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(typename AttentionVariant::Params
     err_msg << "When mask_mode is set to MaskMode::kCausal, kv_len must be greater than or equal "
                "to qo_len, got kv_len"
             << kv_len << " and qo_len " << qo_len;
-    throw std::invalid_argument(err_msg.str());
+    FLASHINFER_ERROR(err_msg.str());
   }
 
   const uint32_t group_size = num_qo_heads / num_kv_heads;
@@ -1442,7 +1442,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(typename AttentionVariant::Params
                 << " NUM_WARPS_Q=" << NUM_WARPS_Q << " NUM_WARPS_KV=" << NUM_WARPS_KV
                 << " please create an issue (https://github.com/flashinfer-ai/flashinfer/issues)"
                    " and report the issue to the developers.";
-        throw std::invalid_argument(err_msg.str());
+        FLASHINFER_ERROR(err_msg.str());
       } else {
         constexpr uint32_t num_threads = (NUM_WARPS_Q * NUM_WARPS_KV) * WARP_SIZE;
         constexpr uint32_t num_rows_per_cta = NUM_FRAGS_Q * NUM_WARPS_Q * 16;
@@ -2165,7 +2165,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(typename AttentionVariant::P
               << " NUM_WARPS_Q=" << NUM_WARPS_Q << " NUM_WARPS_KV=" << NUM_WARPS_KV
               << " please create an issue (https://github.com/flashinfer-ai/flashinfer/issues)"
                  " and report the issue to the developers.";
-      throw std::invalid_argument(err_msg.str());
+      FLASHINFER_ERROR(err_msg.str());
     } else {
       // TODO(Zihao): fix the following computation
       uint32_t smem_size = (NUM_FRAGS_Q * NUM_WARPS_Q * sizeof(DTypeQ) +
@@ -2267,7 +2267,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(typename AttentionVariant::Pa
               << " NUM_WARPS_Q=" << NUM_WARPS_Q << " NUM_WARPS_KV=" << NUM_WARPS_KV
               << " please create an issue (https://github.com/flashinfer-ai/flashinfer/issues)"
                  " and report the issue to the developers.";
-      throw std::invalid_argument(err_msg.str());
+      FLASHINFER_ERROR(err_msg.str());
     } else {
       // TODO(Zihao): fix the following computation
       uint32_t smem_size = (NUM_FRAGS_Q * NUM_WARPS_Q * sizeof(DTypeQ) +

@@ -17,10 +17,10 @@
 
 #include <flashinfer/attention/decode_params.cuh>
 #include <flashinfer/attention/variants.cuh>
+#include <flashinfer/pos_enc.cuh>
 #include <optional>
 
-#include "flashinfer/pos_enc.cuh"
-#include "pytorch_extension_utils.h"
+#include "aot_extension_utils.h"
 
 namespace flashinfer {
 
@@ -30,12 +30,13 @@ cudaError_t SingleDecodeWithKVCacheDispatched(typename AttentionVariant::ParamsT
                                               cudaStream_t stream);
 }  // namespace flashinfer
 
-torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torch::Tensor v,
-                                          torch::Tensor tmp,
-                                          std::optional<torch::Tensor> alibi_slopes,
-                                          unsigned int layout, int window_left,
-                                          float logits_soft_cap, float sm_scale, float rope_scale,
-                                          float rope_theta) {
+using namespace flashinfer;
+
+void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor tmp,
+                                 std::optional<at::Tensor> alibi_slopes, at::Tensor o,
+                                 unsigned int layout, int window_left, float logits_soft_cap,
+                                 float sm_scale, float rope_scale, float rope_theta,
+                                 int64_t cuda_stream) {
   CHECK_INPUT(q);
   CHECK_INPUT(k);
   CHECK_INPUT(v);
@@ -62,9 +63,6 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
     kv_len = k.size(1);
   }
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
-  const at::cuda::CUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
-  auto o = torch::empty_like(q);
 
   TORCH_CHECK(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
 
@@ -72,7 +70,7 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
   auto kv_scalar_type = k.scalar_type();
 
   constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;
-
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   DISPATCH_PYTORCH_QKV_DTYPE_TO_CTYPE(q_scalar_type, kv_scalar_type, q_type, kv_type, [&] {
     using DTypeQ = q_type;
     using DTypeKV = kv_type;
@@ -92,13 +90,11 @@ torch::Tensor single_decode_with_kv_cache(torch::Tensor q, torch::Tensor k, torc
         cudaError_t status =
             flashinfer::SingleDecodeWithKVCacheDispatched<HEAD_DIM, POS_ENCODING_MODE,
                                                           AttentionVariant>(
-                params, static_cast<DTypeO*>(tmp.data_ptr()), torch_current_stream);
+                params, static_cast<DTypeO*>(tmp.data_ptr()), stream);
         TORCH_CHECK(status == cudaSuccess, "SingleDecodeWithKVCache kernel launch failed, error: " +
                                                std::string(cudaGetErrorString(status)));
         return true;
       });
     });
   });
-
-  return o;
 }

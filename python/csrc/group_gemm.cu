@@ -17,25 +17,22 @@
 
 #include "pytorch_extension_utils.h"
 
+using namespace flashinfer;
 using namespace flashinfer::group_gemm;
 
-void CutlassSegmentGEMM(torch::Tensor workspace_buffer, torch::Tensor all_problems,
-                        torch::Tensor x_ptr, torch::Tensor w_ptr, torch::Tensor y_ptr,
-                        torch::Tensor x_ld, torch::Tensor w_ld, torch::Tensor y_ld,
-                        torch::Tensor empty_x_data, bool weight_column_major) {
+void CutlassSegmentGEMM(at::Tensor workspace_buffer, at::Tensor all_problems, at::Tensor x_ptr,
+                        at::Tensor w_ptr, at::Tensor y_ptr, at::Tensor x_ld, at::Tensor w_ld,
+                        at::Tensor y_ld, at::Tensor empty_x_data, bool weight_column_major,
+                        int64_t cuda_stream) {
   unsigned int batch_size = x_ptr.size(0);
-  auto device = workspace_buffer.device();
-  
-  const at::cuda::OptionalCUDAGuard device_guard(device);
-  cudaStream_t torch_current_stream = c10::cuda::getCurrentCUDAStream(device.index());
 
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(empty_x_data.scalar_type(), c_type, [&] {
     using cutlass_t = typename cutlass_dtype<c_type>::value;
     auto status = CutlassSegmentGEMMRun<cutlass_t>(
         workspace_buffer.data_ptr(), workspace_buffer.element_size() * workspace_buffer.size(0),
         all_problems.data_ptr(), batch_size, x_ptr.data_ptr(), w_ptr.data_ptr(), y_ptr.data_ptr(),
-        x_ld.data_ptr(), w_ld.data_ptr(), y_ld.data_ptr(), weight_column_major,
-        torch_current_stream);
+        x_ld.data_ptr(), w_ld.data_ptr(), y_ld.data_ptr(), weight_column_major, stream);
     TORCH_CHECK(status == cudaSuccess,
                 "Failed to run CutlassSegmentGEMM: ", cudaGetErrorString(status));
     return true;

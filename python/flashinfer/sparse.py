@@ -30,6 +30,7 @@ from .utils import (
     _check_pos_encoding_mode,
     _get_cache_alibi_slopes_buf,
     canonicalize_torch_dtype,
+    get_cuda_stream,
 )
 
 
@@ -323,17 +324,19 @@ class BlockSparseAttentionWrapper:
                 logits_soft_cap > 0,  # use_logits_soft_cap
             )
 
-            self._plan_info = self._cached_module.plan(
-                self._float_workspace_buffer,
-                self._int_workspace_buffer,
-                self._pin_memory_int_workspace_buffer,
-                kv_indptr_host,
-                num_blocks_row,
-                num_qo_heads,
-                num_kv_heads,
-                C,
-                False,  # is_cuda_graph_enabled
-            )
+            with self.device as device:
+                self._plan_info = self._cached_module.plan(
+                    self._float_workspace_buffer,
+                    self._int_workspace_buffer,
+                    self._pin_memory_int_workspace_buffer,
+                    kv_indptr_host,
+                    num_blocks_row,
+                    num_qo_heads,
+                    num_kv_heads,
+                    C,
+                    False,  # is_cuda_graph_enabled
+                    get_cuda_stream(device),
+                )
         else:
             # if the operation is compute-bound, we use the tensor-core implementation
             self._use_tensor_cores = True
@@ -349,18 +352,20 @@ class BlockSparseAttentionWrapper:
                 allow_fp16_qk_reduction,
             )
 
-            self._plan_info = self._cached_module.plan(
-                self._float_workspace_buffer,
-                self._int_workspace_buffer,
-                self._pin_memory_int_workspace_buffer,
-                qo_indptr_host,
-                kv_indptr_host,
-                num_blocks_row,
-                num_qo_heads,
-                num_kv_heads,
-                C,
-                False,  # is_cuda_graph_enabled
-            )
+            with self.device as device:
+                self._plan_info = self._cached_module.plan(
+                    self._float_workspace_buffer,
+                    self._int_workspace_buffer,
+                    self._pin_memory_int_workspace_buffer,
+                    qo_indptr_host,
+                    kv_indptr_host,
+                    num_blocks_row,
+                    num_qo_heads,
+                    num_kv_heads,
+                    C,
+                    False,  # is_cuda_graph_enabled
+                    get_cuda_stream(device),
+                )
 
         self._pos_encoding_mode = pos_encoding_mode
         self._allow_fp16_qk_reduction = allow_fp16_qk_reduction
