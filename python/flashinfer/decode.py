@@ -754,7 +754,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 False,  # allow_fp16_qk_reduction
             )
-            with self._float_workspace_buffer.device as device:
+            with self.device as device:
                 self._plan_info = self._cached_module.plan(
                     self._float_workspace_buffer,
                     self._int_workspace_buffer,
@@ -779,7 +779,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 window_left != -1,  # use_sliding_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
             )
-            with self._float_workspace_buffer.device as device:
+            with self.device as device:
                 self._plan_info = self._cached_module.plan(
                     self._float_workspace_buffer,
                     self._int_workspace_buffer,
@@ -1279,7 +1279,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             window_left != -1,  # use_sliding_window
             logits_soft_cap > 0,  # use_logits_soft_cap
         )
-        with self._float_workspace_buffer.device as device:
+        with self.device as device:
             self._plan_info = self._cached_module.plan(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
