@@ -256,8 +256,10 @@ void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
     cascade_handler.Plan<T, int32_t>(
         (void*)thrust::raw_pointer_cast(float_buffer.data()), float_workspace_size_in_bytes,
         (void*)thrust::raw_pointer_cast(int_buffer.data()), int_workspace_size_in_bytes,
-        qo_indptr_h.data(), kv_indptr_unique_h.data(), batch_size, num_qo_heads, num_kv_heads,
-        head_dim, page_size);
+        qo_indptr_h.data(), kv_indptr_unique_h.data(),
+        /*total_num_rows=*/batch_size * qo_append_length,
+        /*max_seq_len=*/qo_append_length, batch_size, num_qo_heads, num_kv_heads, head_dim,
+        page_size);
     state.exec(nvbench::exec_tag::timer, [&](nvbench::launch& launch, auto& timer) {
       timer.start();
       cudaError_t status = SinglePrefillWithKVCache(
@@ -317,8 +319,10 @@ void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
     baseline_handler.Plan<T, int32_t>(
         (void*)thrust::raw_pointer_cast(float_buffer.data()), float_workspace_size_in_bytes,
         (void*)thrust::raw_pointer_cast(int_buffer.data()), int_workspace_size_in_bytes,
-        qo_indptr_h.data(), kv_indptr_combined_h.data(), batch_size, num_qo_heads, num_kv_heads,
-        head_dim, page_size);
+        qo_indptr_h.data(), kv_indptr_combined_h.data(),
+        /*total_num_rows=*/batch_size * qo_append_length,
+        /*max_seq_len=*/qo_append_length, batch_size, num_qo_heads, num_kv_heads, head_dim,
+        page_size);
     state.exec(nvbench::exec_tag::timer, [&](nvbench::launch& launch, auto& timer) {
       timer.start();
       cudaError_t status = BatchPrefillWithPagedKVCacheWrapper<T, T, T, int32_t>(

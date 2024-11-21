@@ -776,7 +776,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     self._pin_memory_int_workspace_buffer,
                     qo_indptr_host,
                     indptr_host,
+                    batch_size,  # total_num_rows
                     batch_size,
+                    1,  # max_seq_len
                     num_qo_heads,
                     num_kv_heads,
                     page_size,
