@@ -764,12 +764,12 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(typename AttentionVariant::Par
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         if constexpr (AttentionVariant::use_softmax) {
           FLASHINFER_CUDA_CALL(VariableLengthMergeStates(tmp_v, tmp_s, params.o_indptr, o, lse,
-                                                         params.paged_kv.batch_size, num_qo_heads,
-                                                         HEAD_DIM, stream));
+                                                         params.paged_kv.batch_size, nullptr,
+                                                         num_qo_heads, HEAD_DIM, stream));
         } else {
           FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(tmp_v, o, params.o_indptr,
-                                                          params.paged_kv.batch_size, num_qo_heads,
-                                                          HEAD_DIM, stream));
+                                                          params.paged_kv.batch_size, nullptr,
+                                                          num_qo_heads, HEAD_DIM, stream));
         }
       }
     });
@@ -1087,8 +1087,8 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA(typename AttentionVariant::
       dim3 nthrs(bdx, bdy, bdz);
       FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
       FLASHINFER_CUDA_CALL(VariableLengthMergeStates(tmp_v, tmp_s, params.o_indptr, o, lse,
-                                                     params.paged_kv.batch_size, num_qo_heads,
-                                                     HEAD_DIM_CKV, stream));
+                                                     params.paged_kv.batch_size, nullptr,
+                                                     num_qo_heads, HEAD_DIM_CKV, stream));
     }
   });
   return cudaSuccess;

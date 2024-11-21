@@ -100,8 +100,8 @@ void _TestVariableLengthMergeKernelCorrectness(size_t seq_len, size_t num_heads,
                             thrust::raw_pointer_cast(S_ragged_device.data()),
                             thrust::raw_pointer_cast(indptr_device.data()),
                             thrust::raw_pointer_cast(V_merged_1_device.data()),
-                            thrust::raw_pointer_cast(S_merged_1_device.data()), seq_len, num_heads,
-                            head_dim);
+                            thrust::raw_pointer_cast(S_merged_1_device.data()), seq_len, nullptr,
+                            num_heads, head_dim);
 
   thrust::host_vector<T> V_merged_0_host(V_merged_0_device), V_merged_1_host(V_merged_1_device);
   thrust::host_vector<float> S_merged_0_host(S_merged_0_device), S_merged_1_host(S_merged_1_device);
@@ -126,6 +126,81 @@ void _TestVariableLengthMergeKernelCorrectness(size_t seq_len, size_t num_heads,
       1.0 - float(num_S_result_errors_atol_1e_3_rtol_1e_3) / (seq_len * num_heads);
   std::cout << "seq_len=" << seq_len << ", num_heads=" << num_heads << ", head_dim=" << head_dim
             << ", sparse_s=" << sparse_s
+            << ", V accuracy (atol=1e-3, rtol=1e-3)=" << V_result_accuracy
+            << ", S accuracy (atol=1e-3, rtol=1e-3)=" << S_result_accuracy << std::endl;
+
+  EXPECT_GT(V_result_accuracy, 0.99) << "V result correctness test failed.";
+  EXPECT_GT(S_result_accuracy, 0.99) << "S result correctness test failed.";
+}
+
+template <typename T>
+void _TestVariableLengthMergeKernelPaddedCorrectness(size_t max_seq_len, size_t seq_len) {
+  ASSERT_LE(seq_len, max_seq_len);
+
+  const size_t num_heads = 4;
+  const size_t head_dim = 64;
+  const uint32_t max_num_index_sets = 512;
+
+  std::vector<int32_t> lengths(max_seq_len);
+  utils::vec_randint_(lengths, 1, max_num_index_sets);
+  std::vector<int32_t> indptr(max_seq_len + 1, 0);
+  for (size_t i = 0; i < seq_len; ++i) {
+    indptr[i + 1] = indptr[i] + lengths[i];
+  }
+
+  uint32_t last_indptr = indptr[seq_len];
+  std::vector<T> V_ragged_host(last_indptr * num_heads * head_dim);
+  std::vector<float> S_ragged_host(last_indptr * num_heads);
+
+  utils::vec_normal_(V_ragged_host);
+  utils::vec_uniform_(S_ragged_host, -10, 10);
+
+  thrust::device_vector<T> V_ragged_device(V_ragged_host);
+  thrust::device_vector<float> S_ragged_device(S_ragged_host);
+  thrust::device_vector<int32_t> indptr_device(indptr);
+  thrust::device_vector<T> V_merged_0_device(max_seq_len * num_heads * head_dim);
+  thrust::device_vector<T> V_merged_1_device(max_seq_len * num_heads * head_dim);
+  thrust::device_vector<float> S_merged_0_device(max_seq_len * num_heads);
+  thrust::device_vector<float> S_merged_1_device(max_seq_len * num_heads);
+  thrust::device_vector<uint32_t> seq_len_device(
+      std::vector<uint32_t>{static_cast<uint32_t>(seq_len)});
+
+  // Reference: use VariableLengthMergeStates on the precisely-sized input.
+  VariableLengthMergeStates(thrust::raw_pointer_cast(V_ragged_device.data()),
+                            thrust::raw_pointer_cast(S_ragged_device.data()),
+                            thrust::raw_pointer_cast(indptr_device.data()),
+                            thrust::raw_pointer_cast(V_merged_0_device.data()),
+                            thrust::raw_pointer_cast(S_merged_0_device.data()), seq_len, nullptr,
+                            num_heads, head_dim);
+  // Expected: use VariableLengthMergeStates on a padded input
+  VariableLengthMergeStates(thrust::raw_pointer_cast(V_ragged_device.data()),
+                            thrust::raw_pointer_cast(S_ragged_device.data()),
+                            thrust::raw_pointer_cast(indptr_device.data()),
+                            thrust::raw_pointer_cast(V_merged_1_device.data()),
+                            thrust::raw_pointer_cast(S_merged_1_device.data()), max_seq_len,
+                            thrust::raw_pointer_cast(seq_len_device.data()), num_heads, head_dim);
+
+  thrust::host_vector<T> V_merged_0_host(V_merged_0_device), V_merged_1_host(V_merged_1_device);
+  thrust::host_vector<float> S_merged_0_host(S_merged_0_device), S_merged_1_host(S_merged_1_device);
+
+  // Compare results
+  size_t num_V_result_errors_atol_1e_3_rtol_1e_3 = 0, num_S_result_errors_atol_1e_3_rtol_1e_3 = 0;
+  for (size_t i = 0; i < seq_len * num_heads * head_dim; ++i) {
+    EXPECT_FALSE(std::isnan(float(V_merged_1_host[i]))) << "V_merged_1_host[" << i << "] is nan";
+    num_V_result_errors_atol_1e_3_rtol_1e_3 +=
+        (!utils::isclose(float(V_merged_0_host[i]), float(V_merged_1_host[i]), 1e-3, 1e-3));
+  }
+  for (size_t i = 0; i < seq_len * num_heads; ++i) {
+    EXPECT_FALSE(std::isnan(float(S_merged_0_host[i]))) << "S_merged_0_host[" << i << "] is nan";
+    EXPECT_FALSE(std::isnan(float(S_merged_1_host[i]))) << "S_merged_1_host[" << i << "] is nan";
+    num_S_result_errors_atol_1e_3_rtol_1e_3 +=
+        (!utils::isclose(float(S_merged_0_host[i]), float(S_merged_1_host[i]), 1e-3, 1e-3));
+  }
+  float V_result_accuracy =
+      1.0 - float(num_V_result_errors_atol_1e_3_rtol_1e_3) / (seq_len * num_heads * head_dim);
+  float S_result_accuracy =
+      1.0 - float(num_S_result_errors_atol_1e_3_rtol_1e_3) / (seq_len * num_heads);
+  std::cout << "seq_len=" << seq_len << ", num_heads=" << num_heads << ", head_dim=" << head_dim
             << ", V accuracy (atol=1e-3, rtol=1e-3)=" << V_result_accuracy
             << ", S accuracy (atol=1e-3, rtol=1e-3)=" << S_result_accuracy << std::endl;
 
@@ -516,6 +591,12 @@ void TestVariableLengthMergeKernelCorrectness() {
 }
 
 template <typename T>
+void TestVariableLengthMergeKernelPaddedCorrectness() {
+  _TestVariableLengthMergeKernelPaddedCorrectness<T>(8, 1);
+  _TestVariableLengthMergeKernelPaddedCorrectness<T>(128, 77);
+}
+
+template <typename T>
 void TestTwoLevelSinglePrefixCascadeDecodeCorrectness() {
   for (size_t batch_size : {1, 8, 16, 64, 128}) {
     for (size_t shared_prefix_length : {1024, 2048, 8192, 32768}) {
@@ -561,6 +642,10 @@ TEST(FlashInferCorrectnessTest, MergeKernelCorrectnessTestFP16) {
 
 TEST(FlashInferCorrectnessTest, VariableLengthMergeKernelCorrectnessTestFP16) {
   TestVariableLengthMergeKernelCorrectness<half>();
+}
+
+TEST(FlashInferCorrectnessTest, VariableLengthMergeKernelPaddedCorrectnessTestFP16) {
+  TestVariableLengthMergeKernelPaddedCorrectness<half>();
 }
 
 TEST(FlashInferCorrectnessTest, TwoLevelSinglePrefixCascadeDecodeTestFP16) {
