@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import itertools
+
 batch_prefill_suffix = [
     "_plan.cu",
     "_ragged_run.cu",

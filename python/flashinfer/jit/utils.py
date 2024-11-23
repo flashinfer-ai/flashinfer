@@ -15,8 +15,12 @@ limitations under the License.
 """
 
 import pathlib
+import threading
+from typing import Callable, List
 
 import torch
+
+from .core import logger
 
 
 def write_if_different(path: pathlib.Path, content: str) -> None:
@@ -28,6 +32,34 @@ def write_if_different(path: pathlib.Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         f.write(content)
+
+
+def parallel_load_modules(
+    load_module_funcs: List[Callable],
+):
+    threads = []
+    exceptions = []
+
+    def wrapper(func):
+        try:
+            func()
+        except Exception as e:
+            exceptions.append((func, e))
+
+    for func in load_module_funcs:
+        thread = threading.Thread(target=wrapper, args=(func,))
+        thread.start()
+        threads.append(thread)
+
+    for thread in threads:
+        thread.join()
+
+    if exceptions:
+        for func, e in exceptions:
+            print(f"Exception occurred in {func.__name__}: {e}")
+        raise RuntimeError("One or more exceptions occurred during module loading")
+
+    logger.info("Finished loading modules")
 
 
 dtype_map = {

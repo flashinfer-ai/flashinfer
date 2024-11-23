@@ -37,6 +37,7 @@ def get_sampling_module():
                 "sampling",
                 [
                     FLASHINFER_CSRC_DIR / "sampling.cu",
+                    FLASHINFER_CSRC_DIR / "renorm.cu",
                     FLASHINFER_CSRC_DIR / "flashinfer_sampling_ops.cu",
                 ],
             )

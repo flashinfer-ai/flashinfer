@@ -108,7 +108,7 @@ def load_cuda_ops(
         ] + CUTLASS_INCLUDE_DIRS
     lock = FileLock(FLASHINFER_JIT_DIR / f"{name}.lock", thread_local=False)
     with lock:
-        return torch_cpp_ext.load(
+        module = torch_cpp_ext.load(
             name,
             list(map(lambda _: str(_), sources)),
             extra_cflags=cflags,
@@ -119,3 +119,5 @@ def load_cuda_ops(
             verbose=verbose,
             with_cuda=True,
         )
+    logger.info(f"Finished loading JIT ops: {name}")
+    return module

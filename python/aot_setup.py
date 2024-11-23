@@ -427,6 +427,7 @@ if __name__ == "__main__":
                 "csrc/quantization.cu",
                 "csrc/rope.cu",
                 "csrc/sampling.cu",
+                "csrc/renorm.cu",
                 "csrc/activation.cu",
                 "csrc/batch_decode.cu",
                 "csrc/batch_prefill.cu",
