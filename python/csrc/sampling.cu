@@ -143,65 +143,6 @@ void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_sample
                                          std::string(cudaGetErrorString(status)));
 }
 
-void top_p_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
-                        std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
-                        int64_t cuda_stream) {
-  CHECK_INPUT(probs);
-  auto device = probs.device();
-  CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
-  unsigned int batch_size = probs.size(0);
-  unsigned int vocab_size = probs.size(1);
-  bool has_top_p_arr = maybe_top_p_arr.has_value();
-
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-  cudaError_t status = sampling::TopPRenormProb<float>(
-      static_cast<float*>(probs.data_ptr()), static_cast<float*>(renorm_probs.data_ptr()),
-      has_top_p_arr ? static_cast<float*>(maybe_top_p_arr->data_ptr()) : nullptr, batch_size,
-      top_p_val, vocab_size, stream);
-  TORCH_CHECK(status == cudaSuccess,
-              "TopPRenormProb failed with error code " + std::string(cudaGetErrorString(status)));
-}
-
-void top_k_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
-                        std::optional<at::Tensor> maybe_top_k_arr, unsigned int top_k_val,
-                        int64_t cuda_stream) {
-  CHECK_INPUT(probs);
-  auto device = probs.device();
-  CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
-  unsigned int batch_size = probs.size(0);
-  unsigned int vocab_size = probs.size(1);
-  bool has_top_k_arr = maybe_top_k_arr.has_value();
-
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-  cudaError_t status = sampling::TopKRenormProb<float>(
-      static_cast<float*>(probs.data_ptr()), static_cast<float*>(renorm_probs.data_ptr()),
-      has_top_k_arr ? static_cast<int*>(maybe_top_k_arr->data_ptr()) : nullptr, batch_size,
-      top_k_val, vocab_size, stream);
-
-  TORCH_CHECK(status == cudaSuccess,
-              "TopKRenormProb failed with error code " + std::string(cudaGetErrorString(status)));
-}
-
-void top_k_mask_logits(at::Tensor logits, at::Tensor mask_logits,
-                       std::optional<at::Tensor> maybe_top_k_arr, unsigned int top_k_val,
-                       int64_t cuda_stream) {
-  CHECK_INPUT(logits);
-  auto device = logits.device();
-  CHECK_DIM(2, logits);  // logits: (batch_size, vocab_size)
-  unsigned int batch_size = logits.size(0);
-  unsigned int vocab_size = logits.size(1);
-  bool has_top_k_arr = maybe_top_k_arr.has_value();
-
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-  cudaError_t status = sampling::TopKMaskLogits<float>(
-      static_cast<float*>(logits.data_ptr()), static_cast<float*>(mask_logits.data_ptr()),
-      has_top_k_arr ? static_cast<int*>(maybe_top_k_arr->data_ptr()) : nullptr, batch_size,
-      top_k_val, vocab_size, stream);
-
-  TORCH_CHECK(status == cudaSuccess,
-              "TopKMaskLogits failed with error code " + std::string(cudaGetErrorString(status)));
-}
-
 void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_ids,
                                 at::Tensor uniform_samples, at::Tensor target_probs,
                                 at::Tensor output_token_ids, at::Tensor output_accepted_token_num,
