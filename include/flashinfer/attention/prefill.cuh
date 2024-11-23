@@ -2199,11 +2199,12 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(typename AttentionVariant::P
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         if constexpr (AttentionVariant::use_softmax) {
           FLASHINFER_CUDA_CALL(VariableLengthMergeStates(tmp_v, tmp_s, params.merge_indptr, o, lse,
-                                                         total_num_rows, num_qo_heads, HEAD_DIM,
-                                                         stream));
+                                                         total_num_rows, nullptr, num_qo_heads,
+                                                         HEAD_DIM, stream));
         } else {
-          FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(
-              tmp_v, params.merge_indptr, o, total_num_rows, num_qo_heads, HEAD_DIM, stream));
+          FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(tmp_v, params.merge_indptr, o,
+                                                          total_num_rows, nullptr, num_qo_heads,
+                                                          HEAD_DIM, stream));
         }
       }
     }
@@ -2300,11 +2301,12 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(typename AttentionVariant::Pa
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         if constexpr (AttentionVariant::use_softmax) {
           FLASHINFER_CUDA_CALL(VariableLengthMergeStates(tmp_v, tmp_s, params.merge_indptr, o, lse,
-                                                         total_num_rows, num_qo_heads, HEAD_DIM,
-                                                         stream));
+                                                         total_num_rows, nullptr, num_qo_heads,
+                                                         HEAD_DIM, stream));
         } else {
-          FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(
-              tmp_v, params.merge_indptr, o, total_num_rows, num_qo_heads, HEAD_DIM, stream));
+          FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(tmp_v, params.merge_indptr, o,
+                                                          total_num_rows, nullptr, num_qo_heads,
+                                                          HEAD_DIM, stream));
         }
       }
     }

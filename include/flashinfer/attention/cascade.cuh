@@ -325,6 +325,10 @@ __global__ void MergeStatesLargeNumIndexSetsKernel(DTypeIn* __restrict__ V, floa
 /*!
  * \brief The CUDA kernel to merge self-attention states of multiple index sets, the number of index
  *   sets at each position might vary.
+ *
+ * For CUDA graph support, the kernel can be built with a maximum sequence length and executed
+ * using a truncated, dynamic sequence length passed through `seq_len_ptr`.
+ *
  * \tparam vec_size The vector size used in the kernel.
  * \tparam bdx The blockDim.x used in the kernel.
  * \tparam bdy The blockDim.y used in the kernel.
@@ -336,20 +340,22 @@ __global__ void MergeStatesLargeNumIndexSetsKernel(DTypeIn* __restrict__ V, floa
  * \param indptr The start offsets of each position in the variable length array.
  * \param v_merged The merged v of index sets union. (n, h, d)
  * \param s_merged The merged logsumexp value of index sets union. (n, h)
+ * \param max_seq_len The maximum sequence length supported by the kernel.
+ * \param seq_len_ptr The current sequence length (number of positions populated in indptr).
  * \param num_heads The number of heads of v.
  * \param head_dim The dimension of each head.
  * \note s are logsumexp values with base 2.
  */
 template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t num_smem_stages, typename DTypeIn,
           typename DTypeO, typename IdType>
-__global__ void PersistentVariableLengthMergeStatesKernel(DTypeIn* __restrict__ V,
-                                                          float* __restrict__ S, IdType* indptr,
-                                                          DTypeO* __restrict__ v_merged,
-                                                          float* __restrict__ s_merged,
-                                                          uint32_t seq_len, uint32_t num_heads) {
+__global__ void PersistentVariableLengthMergeStatesKernel(
+    DTypeIn* __restrict__ V, float* __restrict__ S, IdType* indptr, DTypeO* __restrict__ v_merged,
+    float* __restrict__ s_merged, uint32_t max_seq_len, uint32_t* __restrict__ seq_len_ptr,
+    uint32_t num_heads) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t cta_id = blockIdx.x;
   uint32_t num_ctas = gridDim.x;
+  const uint32_t seq_len = seq_len_ptr ? *seq_len_ptr : max_seq_len;
   uint32_t num_iters = ceil_div(seq_len * num_heads, num_ctas);
   constexpr uint32_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
   constexpr uint32_t head_dim = vec_size * bdx;
@@ -437,10 +443,13 @@ template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t num_smem_stage
           typename DTypeO, typename IdType>
 __global__ void PersistentVariableLengthAttentionSumKernel(DTypeIn* __restrict__ V, IdType* indptr,
                                                            DTypeO* __restrict__ v_sum,
-                                                           uint32_t seq_len, uint32_t num_heads) {
+                                                           uint32_t max_seq_len,
+                                                           uint32_t* __restrict__ seq_len_ptr,
+                                                           uint32_t num_heads) {
   uint32_t tx = threadIdx.x, ty = threadIdx.y;
   uint32_t cta_id = blockIdx.x;
   uint32_t num_ctas = gridDim.x;
+  const uint32_t seq_len = seq_len_ptr ? *seq_len_ptr : max_seq_len;
   uint32_t num_iters = ceil_div(seq_len * num_heads, num_ctas);
   constexpr uint32_t vec_bits = sizeof(DTypeIn) * vec_size * 8;
   constexpr uint32_t head_dim = vec_size * bdx;
@@ -641,8 +650,9 @@ cudaError_t AttentionSum(DTypeIn* v, DTypeO* v_sum, uint32_t num_index_sets, uin
 
 template <typename DTypeIn, typename DTypeO, typename IdType>
 cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* indptr, DTypeO* v_merged,
-                                      float* s_merged, uint32_t seq_len, uint32_t num_heads,
-                                      uint32_t head_dim, cudaStream_t stream = nullptr) {
+                                      float* s_merged, uint32_t max_seq_len, uint32_t* seq_len,
+                                      uint32_t num_heads, uint32_t head_dim,
+                                      cudaStream_t stream = nullptr) {
   int dev_id = 0;
   int num_sms = 0;
   int num_blocks_per_sm = 0;
@@ -661,11 +671,11 @@ cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* indptr, DTyp
                                                             DTypeIn, DTypeO, IdType>;
     FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
                                                                        num_threads, smem_size));
-    num_blocks_per_sm = min(num_blocks_per_sm, ceil_div(seq_len * num_heads, num_sms));
+    num_blocks_per_sm = min(num_blocks_per_sm, ceil_div(max_seq_len * num_heads, num_sms));
 
     dim3 nblks(num_sms * num_blocks_per_sm);
     dim3 nthrs(bdx, bdy);
-    void* args[] = {&v, &s, &indptr, &v_merged, &s_merged, &seq_len, &num_heads};
+    void* args[] = {&v, &s, &indptr, &v_merged, &s_merged, &max_seq_len, &seq_len, &num_heads};
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
@@ -674,9 +684,9 @@ cudaError_t VariableLengthMergeStates(DTypeIn* v, float* s, IdType* indptr, DTyp
 }
 
 template <typename DTypeIn, typename DTypeO, typename IdType>
-cudaError_t VariableLengthAttentionSum(DTypeIn* v, IdType* indptr, DTypeO* v_sum, uint32_t seq_len,
-                                       uint32_t num_heads, uint32_t head_dim,
-                                       cudaStream_t stream = nullptr) {
+cudaError_t VariableLengthAttentionSum(DTypeIn* v, IdType* indptr, DTypeO* v_sum,
+                                       uint32_t max_seq_len, uint32_t* seq_len, uint32_t num_heads,
+                                       uint32_t head_dim, cudaStream_t stream = nullptr) {
   int dev_id = 0;
   int num_sms = 0;
   int num_blocks_per_sm = 0;
@@ -694,11 +704,11 @@ cudaError_t VariableLengthAttentionSum(DTypeIn* v, IdType* indptr, DTypeO* v_sum
                                                              DTypeIn, DTypeO, IdType>;
     FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
                                                                        num_threads, smem_size));
-    num_blocks_per_sm = min(num_blocks_per_sm, ceil_div(seq_len * num_heads, num_sms));
+    num_blocks_per_sm = min(num_blocks_per_sm, ceil_div(max_seq_len * num_heads, num_sms));
 
     dim3 nblks(num_sms * num_blocks_per_sm);
     dim3 nthrs(bdx, bdy);
-    void* args[] = {&v, &indptr, &v_sum, &seq_len, &num_heads};
+    void* args[] = {&v, &indptr, &v_sum, &max_seq_len, &seq_len, &num_heads};
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
