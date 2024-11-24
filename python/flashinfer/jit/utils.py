@@ -16,7 +16,7 @@ limitations under the License.
 
 import pathlib
 import threading
-from typing import Callable, List
+from typing import Any, Callable, List, Tuple
 
 import torch
 
@@ -35,19 +35,19 @@ def write_if_different(path: pathlib.Path, content: str) -> None:
 
 
 def parallel_load_modules(
-    load_module_funcs: List[Callable],
+    load_module_func_args: List[Tuple[Callable, List[Any]]],
 ):
     threads = []
     exceptions = []
 
-    def wrapper(func):
+    def wrapper(func, args):
         try:
-            func()
+            func(*args)
         except Exception as e:
             exceptions.append((func, e))
 
-    for func in load_module_funcs:
-        thread = threading.Thread(target=wrapper, args=(func,))
+    for func, args in load_module_func_args:
+        thread = threading.Thread(target=wrapper, args=(func, args))
         thread.start()
         threads.append(thread)
 

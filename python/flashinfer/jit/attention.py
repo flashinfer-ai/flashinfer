@@ -155,8 +155,6 @@ def get_batch_decode_uri(
 
 def gen_batch_decode_module(*args):
     gen_directory = FLASHINFER_GEN_SRC_DIR
-    if not os.path.exists(gen_directory):
-        os.makedirs(gen_directory)
     uri = get_batch_decode_uri(*args)
     sources = get_batch_decode_sources(*args)
     source_paths = []
@@ -214,8 +212,6 @@ def get_batch_decode_mla_uri(
 
 def gen_batch_decode_mla_module(*args):
     gen_directory = FLASHINFER_GEN_SRC_DIR
-    if not os.path.exists(gen_directory):
-        os.makedirs(gen_directory)
     uri = get_batch_decode_mla_uri(*args)
     sources = get_batch_decode_mla_sources(*args)
     source_paths = []
@@ -275,8 +271,6 @@ def get_single_prefill_uri(
 
 def gen_single_prefill_module(*args):
     gen_directory = FLASHINFER_GEN_SRC_DIR
-    if not os.path.exists(gen_directory):
-        os.makedirs(gen_directory)
     uri = get_single_prefill_uri(*args)
     sources = get_single_prefill_sources(*args)
     source_paths = []
@@ -341,8 +335,6 @@ def get_batch_prefill_uri(
 
 def gen_batch_prefill_module(*args):
     gen_directory = FLASHINFER_GEN_SRC_DIR
-    if not os.path.exists(gen_directory):
-        os.makedirs(gen_directory)
     uri = get_batch_prefill_uri(*args)
     sources = get_batch_prefill_sources(*args)
     source_paths = []
@@ -518,8 +510,6 @@ def get_customize_single_prefill_sources(
 
 def gen_customize_single_decode_module(module_name, *args):
     gen_directory = FLASHINFER_GEN_SRC_DIR
-    if not os.path.exists(gen_directory):
-        os.makedirs(gen_directory)
     sources = get_customize_single_decode_sources(*args)
     source_paths = []
     for suffix, source in zip(single_decode_suffix, sources):
@@ -532,8 +522,6 @@ def gen_customize_single_decode_module(module_name, *args):
 
 def gen_customize_single_prefill_module(module_name, *args):
     gen_directory = FLASHINFER_GEN_SRC_DIR
-    if not os.path.exists(gen_directory):
-        os.makedirs(gen_directory)
     sources = get_customize_single_prefill_sources(*args)
     source_paths = []
     for suffix, source in zip(single_prefill_suffix, sources):
