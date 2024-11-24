@@ -352,6 +352,7 @@ def test_batch_ragged_prefill_sliding_window(
         num_kv_heads,
         head_dim,
         window_left=window_left,
+        causal=True,
     )
     o = wrapper.run(q, k, v)
 
