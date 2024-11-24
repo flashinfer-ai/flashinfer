@@ -44,6 +44,7 @@ def warmup_jit():
                 [False],  # use_logits_soft_caps
                 [False],  # allow_fp16_qk_reductions
             )
+            + [flashinfer.page.get_page_module, []]
         )
     except Exception as e:
         # abort the test session if warmup fails
