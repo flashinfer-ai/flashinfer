@@ -1,7 +1,8 @@
 """
-Copyright (c) 2024 by FlashInfer team.
+    Copyright(c) 2024 by FlashInfer team.
 
-Licensed under the Apache License, Version 2.0 (the "License");
+    Licensed under the Apache License,
+    Version 2.0(the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
@@ -31,13 +32,22 @@ def ragged_prefill_inst_templ(mask_mode: str) -> str:
 #include <flashinfer/attention/variants.cuh>
 
 namespace flashinfer {
-
-{% set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
-using RaggedParamsT = BatchPrefillRaggedParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ dtype_idx }}>;
-constexpr bool use_custom_mask = """
-        + mask_mode
-        + r""" == MaskMode::kCustom;
-using RaggedAttentionVariant = ComposedAttention<RaggedParamsT, get_variant_code(use_custom_mask, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, {{ use_alibi }})>;
+  {
+    % set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %
+  }
+  using RaggedParamsT =
+      BatchPrefillRaggedParams<{{dtype_q}}, {{dtype_kv}}, {{dtype_o}}, {{dtype_idx}}>;
+  constexpr bool use_custom_mask =
+      ""
+      "
+      + mask_mode +
+      r
+      ""
+      " == MaskMode::kCustom;
+      using RaggedAttentionVariant =
+          ComposedAttention<RaggedParamsT,
+                            get_variant_code(use_custom_mask, {{use_sliding_window}},
+                                             {{use_logits_soft_cap}}, {{use_alibi}})>;
 
 template
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched</*cta_tile_q=*/16, {{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, """
@@ -74,13 +84,21 @@ def paged_prefill_inst_templ(mask_mode: str) -> str:
 #include <flashinfer/attention/variants.cuh>
 
 namespace flashinfer {
-
-{% set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
-using PagedParamsT = BatchPrefillPagedParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ dtype_idx }}>;
-constexpr bool use_custom_mask = """
-        + mask_mode
-        + r""" == MaskMode::kCustom;
-using PagedAttentionVariant = ComposedAttention<PagedParamsT, get_variant_code(use_custom_mask, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, {{ use_alibi }})>;
+  {
+    % set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %
+  }
+  using PagedParamsT =
+      BatchPrefillPagedParams<{{dtype_q}}, {{dtype_kv}}, {{dtype_o}}, {{dtype_idx}}>;
+  constexpr bool use_custom_mask =
+      ""
+      "
+      + mask_mode +
+      r
+      ""
+      " == MaskMode::kCustom;
+      using PagedAttentionVariant =
+          ComposedAttention<PagedParamsT, get_variant_code(use_custom_mask, {{use_sliding_window}},
+                                                           {{use_logits_soft_cap}}, {{use_alibi}})>;
 
 template
 cudaError_t BatchPrefillWithPagedKVCacheDispatched</*cta_tile_q=*/16, {{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, """
@@ -134,15 +152,15 @@ std::vector<int64_t> BatchPrefillWithKVCachePlan(
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   PrefillPlanInfo plan_info;
 
-  cudaError_t status = PrefillPlan<{{ dtype_idx }}>(
-    float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
-    int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
-    int_workspace_size_in_bytes,
-    plan_info, qo_indptr.data_ptr<{{ dtype_idx }}>(), kv_indptr.data_ptr<{{ dtype_idx }}>(),
-    batch_size, num_qo_heads, num_kv_heads, {{ head_dim }}, page_size, enable_cuda_graph,
-    sizeof({{ dtype_o }}), stream);
+  cudaError_t status = PrefillPlan<{{dtype_idx}}>(
+      float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
+      int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
+      int_workspace_size_in_bytes, plan_info, qo_indptr.data_ptr<{{dtype_idx}}>(),
+      kv_indptr.data_ptr<{{dtype_idx}}>(), batch_size, num_qo_heads, num_kv_heads, {{head_dim}},
+      page_size, enable_cuda_graph, sizeof({{dtype_o}}), stream);
 
-  TORCH_CHECK(status == cudaSuccess, "Failed to plan prefill with error: ", cudaGetErrorString(status));
+  TORCH_CHECK(status == cudaSuccess,
+              "Failed to plan prefill with error: ", cudaGetErrorString(status));
 
   return plan_info.ToVector();
 }
@@ -152,26 +170,27 @@ std::vector<int64_t> BatchPrefillWithKVCachePlan(
         for mask_mode in ["MaskMode::kNone", "MaskMode::kCausal", "MaskMode::kCustom"]
     ],
     r"""
-#include <optional>
-#include <flashinfer/pos_enc.cuh>
-#include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/attention/mask.cuh>
 #include <flashinfer/attention/prefill_params.cuh>
+#include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/attention/variants.cuh>
+#include <flashinfer/pos_enc.cuh>
+#include <optional>
+
 #include "pytorch_extension_utils.h"
 
 using namespace flashinfer;
 
-{% set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
+{
+  % set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
 using RaggedParamsT = BatchPrefillRaggedParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ dtype_idx }}>;
 
 namespace flashinfer {
-
-template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
-          bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant>
-cudaError_t BatchPrefillWithRaggedKVCacheDispatched(typename AttentionVariant::ParamsT params,
-                                                                typename AttentionVariant::DTypeO* tmp_v,
-                                                                float* tmp_s, cudaStream_t stream);
+  template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
+            bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant>
+  cudaError_t BatchPrefillWithRaggedKVCacheDispatched(typename AttentionVariant::ParamsT params,
+                                                      typename AttentionVariant::DTypeO * tmp_v,
+                                                      float* tmp_s, cudaStream_t stream);
 
 };
 
@@ -214,37 +233,50 @@ void BatchPrefillWithRaggedKVCacheRun(
   void* int_buffer_ptr = int_workspace_buffer.data_ptr();
 
   RaggedParamsT params(
-    static_cast<{{ dtype_q }}*>(q.data_ptr()), static_cast<{{ dtype_kv }}*>(k.data_ptr()),
-    static_cast<{{ dtype_kv }}*>(v.data_ptr()),
-    /*custom_mask=*/(maybe_custom_mask ? static_cast<uint8_t*>(maybe_custom_mask->data_ptr()) : nullptr),
-    static_cast<{{ dtype_idx }}*>(qo_indptr.data_ptr()),
-    static_cast<{{ dtype_idx }}*>(kv_indptr.data_ptr()),
-    /*qk_indptr=*/(maybe_qk_indptr ? static_cast<{{ dtype_idx }}*>(maybe_qk_indptr->data_ptr()) : nullptr),
-    /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr,
-    static_cast<{{ dtype_o }}*>(o.data_ptr()),
-    /*lse=*/(maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr),
-    {% if use_alibi == "true" %}static_cast<float*>(maybe_alibi_slopes->data_ptr()){% else %}nullptr{% endif %},
-    num_qo_heads, num_kv_heads, q_stride_n, q_stride_h, kv_stride_n, kv_stride_h,
-    window_left, logits_soft_cap, sm_scale, rope_scale, rope_theta);
+      static_cast<{{dtype_q}}*>(q.data_ptr()), static_cast<{{dtype_kv}}*>(k.data_ptr()),
+      static_cast<{{dtype_kv}}*>(v.data_ptr()),
+      /*custom_mask=*/
+      (maybe_custom_mask ? static_cast<uint8_t*>(maybe_custom_mask->data_ptr()) : nullptr),
+      static_cast<{{dtype_idx}}*>(qo_indptr.data_ptr()),
+      static_cast<{{dtype_idx}}*>(kv_indptr.data_ptr()),
+      /*qk_indptr=*/
+      (maybe_qk_indptr ? static_cast<{{dtype_idx}}*>(maybe_qk_indptr->data_ptr()) : nullptr),
+      /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr, static_cast<{{dtype_o}}*>(o.data_ptr()),
+      /*lse=*/(maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr),
+      { % if use_alibi == "true" % } static_cast<float*>(maybe_alibi_slopes->data_ptr()) {
+        % else %
+      } nullptr { % endif % },
+      num_qo_heads, num_kv_heads, q_stride_n, q_stride_h, kv_stride_n, kv_stride_h, window_left,
+      logits_soft_cap, sm_scale, rope_scale, rope_theta);
 
-  {{ dtype_o }}* tmp_v = nullptr;
+  {{dtype_o}}* tmp_v = nullptr;
   float* tmp_s = nullptr;
 
-  params.request_indices = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.request_indices_offset);
-  params.qo_tile_indices = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.qo_tile_indices_offset);
-  params.kv_tile_indices = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.kv_tile_indices_offset);
-  params.o_indptr = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.o_indptr_offset);
-  params.kv_chunk_size_ptr = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.kv_chunk_size_ptr_offset);
+  params.request_indices =
+      GetPtrFromBaseOffset<{{dtype_idx}}>(int_buffer_ptr, plan_info.request_indices_offset);
+  params.qo_tile_indices =
+      GetPtrFromBaseOffset<{{dtype_idx}}>(int_buffer_ptr, plan_info.qo_tile_indices_offset);
+  params.kv_tile_indices =
+      GetPtrFromBaseOffset<{{dtype_idx}}>(int_buffer_ptr, plan_info.kv_tile_indices_offset);
+  params.o_indptr = GetPtrFromBaseOffset<{{dtype_idx}}>(int_buffer_ptr, plan_info.o_indptr_offset);
+  params.kv_chunk_size_ptr =
+      GetPtrFromBaseOffset<{{dtype_idx}}>(int_buffer_ptr, plan_info.kv_chunk_size_ptr_offset);
   if (plan_info.split_kv) {
-    params.merge_indptr = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.merge_indptr_offset);
-    tmp_v = GetPtrFromBaseOffset<{{ dtype_o }}>(float_buffer_ptr, plan_info.v_offset);
+    params.merge_indptr =
+        GetPtrFromBaseOffset<{{dtype_idx}}>(int_buffer_ptr, plan_info.merge_indptr_offset);
+    tmp_v = GetPtrFromBaseOffset<{{dtype_o}}>(float_buffer_ptr, plan_info.v_offset);
     tmp_s = GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.s_offset);
     if (plan_info.enable_cuda_graph) {
-      params.block_valid_mask = GetPtrFromBaseOffset<bool>(int_buffer_ptr, plan_info.block_valid_mask_offset);
+      params.block_valid_mask =
+          GetPtrFromBaseOffset<bool>(int_buffer_ptr, plan_info.block_valid_mask_offset);
     }
   }
-  params.total_num_rows = plan_info.total_num_rows;
   params.padded_batch_size = plan_info.padded_batch_size;
+  params.max_total_num_rows = plan_info.total_num_rows;
+  if (plan_info.enable_cuda_graph) {
+    params.total_num_rows =
+        GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr, plan_info.total_num_rows_offset);
+  }
 
   cudaError_t status = cudaSuccess;
 
@@ -253,15 +285,18 @@ void BatchPrefillWithRaggedKVCacheRun(
 
   DISPATCH_MASK_MODE(mask_mode, MASK_MODE, {
     constexpr bool use_custom_mask = MASK_MODE == MaskMode::kCustom;
-    using RaggedAttentionVariant = ComposedAttention<RaggedParamsT, get_variant_code(use_custom_mask, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, {{ use_alibi }})>;
+    using RaggedAttentionVariant =
+        ComposedAttention<RaggedParamsT, get_variant_code(use_custom_mask, {{use_sliding_window}},
+                                                          {{use_logits_soft_cap}}, {{use_alibi}})>;
     DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
       status = flashinfer::BatchPrefillWithRaggedKVCacheDispatched<
-        CTA_TILE_Q, {{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, MASK_MODE, RaggedAttentionVariant>(
-          params, tmp_v, tmp_s, stream);
+          CTA_TILE_Q, {{head_dim}}, {{pos_encoding_mode}}, {{use_fp16_qk_reduction}}, MASK_MODE,
+          RaggedAttentionVariant>(params, tmp_v, tmp_s, stream);
     });
   });
 
-  TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithRaggedKVCache failed with error ", cudaGetErrorString(status));
+  TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithRaggedKVCache failed with error ",
+              cudaGetErrorString(status));
 }
 """,
     *[
@@ -269,25 +304,26 @@ void BatchPrefillWithRaggedKVCacheRun(
         for mask_mode in ["MaskMode::kNone", "MaskMode::kCausal", "MaskMode::kCustom"]
     ],
     r"""#include <optional>
-#include <flashinfer/pos_enc.cuh>
-#include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/attention/mask.cuh>
 #include <flashinfer/attention/prefill_params.cuh>
+#include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/attention/variants.cuh>
+#include <flashinfer/pos_enc.cuh>
+
 #include "pytorch_extension_utils.h"
 
 using namespace flashinfer;
 
-{% set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
+{
+  % set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
 using PagedParamsT = BatchPrefillPagedParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ dtype_idx }}>;
 
 namespace flashinfer {
-
-template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
-          bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant>
-cudaError_t BatchPrefillWithPagedKVCacheDispatched(typename AttentionVariant::ParamsT params,
-                                                               typename AttentionVariant::DTypeO* tmp_v,
-                                                               float* tmp_s, cudaStream_t stream);
+  template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
+            bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant>
+  cudaError_t BatchPrefillWithPagedKVCacheDispatched(typename AttentionVariant::ParamsT params,
+                                                     typename AttentionVariant::DTypeO * tmp_v,
+                                                     float* tmp_s, cudaStream_t stream);
 
 };
 
@@ -342,45 +378,57 @@ void BatchPrefillWithPagedKVCacheRun(
   TORCH_CHECK(k_strides == v_strides, "k/v strides must be identical");
   kv_cache_strides = k_strides.data();
 
-  paged_kv_t<{{ dtype_kv }}, {{ dtype_idx }}> paged_kv(
-    num_kv_heads, page_size, {{ head_dim }},
-    batch_size, kv_layout,
-    static_cast<{{ dtype_kv }}*>(paged_k_cache.data_ptr()),
-    static_cast<{{ dtype_kv }}*>(paged_v_cache.data_ptr()),
-    kv_cache_strides,
-    static_cast<{{ dtype_idx }}*>(paged_kv_indices.data_ptr()),
-    static_cast<{{ dtype_idx }}*>(paged_kv_indptr.data_ptr()),
-    static_cast<{{ dtype_idx }}*>(paged_kv_last_page_len.data_ptr()));
+  paged_kv_t<{{dtype_kv}}, {{dtype_idx}}> paged_kv(
+      num_kv_heads, page_size, {{head_dim}}, batch_size, kv_layout,
+      static_cast<{{dtype_kv}}*>(paged_k_cache.data_ptr()),
+      static_cast<{{dtype_kv}}*>(paged_v_cache.data_ptr()), kv_cache_strides,
+      static_cast<{{dtype_idx}}*>(paged_kv_indices.data_ptr()),
+      static_cast<{{dtype_idx}}*>(paged_kv_indptr.data_ptr()),
+      static_cast<{{dtype_idx}}*>(paged_kv_last_page_len.data_ptr()));
 
   PagedParamsT params(
-    static_cast<{{ dtype_q }}*>(q.data_ptr()), paged_kv,
-    /*custom_mask=*/(maybe_custom_mask ? static_cast<uint8_t*>(maybe_custom_mask->data_ptr()) : nullptr),
-    static_cast<{{ dtype_idx }}*>(qo_indptr.data_ptr()),
-    /*qk_indptr=*/(maybe_qk_indptr ? static_cast<{{ dtype_idx }}*>(maybe_qk_indptr->data_ptr()) : nullptr),
-    /*q_offset=*/nullptr,
-    static_cast<{{ dtype_o }}*>(o.data_ptr()),
-    /*lse=*/(maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr),
-    {% if use_alibi == "true" %}static_cast<float*>(maybe_alibi_slopes->data_ptr()){% else %}nullptr{% endif %},
-    num_qo_heads, q_stride_n, q_stride_h, window_left, logits_soft_cap, sm_scale, rope_scale, rope_theta);
+      static_cast<{{dtype_q}}*>(q.data_ptr()), paged_kv,
+      /*custom_mask=*/
+      (maybe_custom_mask ? static_cast<uint8_t*>(maybe_custom_mask->data_ptr()) : nullptr),
+      static_cast<{{dtype_idx}}*>(qo_indptr.data_ptr()),
+      /*qk_indptr=*/
+      (maybe_qk_indptr ? static_cast<{{dtype_idx}}*>(maybe_qk_indptr->data_ptr()) : nullptr),
+      /*q_offset=*/nullptr, static_cast<{{dtype_o}}*>(o.data_ptr()),
+      /*lse=*/(maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr),
+      { % if use_alibi == "true" % } static_cast<float*>(maybe_alibi_slopes->data_ptr()) {
+        % else %
+      } nullptr { % endif % },
+      num_qo_heads, q_stride_n, q_stride_h, window_left, logits_soft_cap, sm_scale, rope_scale,
+      rope_theta);
 
-  {{ dtype_o }}* tmp_v = nullptr;
+  {{dtype_o}}* tmp_v = nullptr;
   float* tmp_s = nullptr;
 
-  params.request_indices = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.request_indices_offset);
-  params.qo_tile_indices = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.qo_tile_indices_offset);
-  params.kv_tile_indices = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.kv_tile_indices_offset);
-  params.o_indptr = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.o_indptr_offset);
-  params.kv_chunk_size_ptr = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.kv_chunk_size_ptr_offset);
+  params.request_indices =
+      GetPtrFromBaseOffset<{{dtype_idx}}>(int_buffer_ptr, plan_info.request_indices_offset);
+  params.qo_tile_indices =
+      GetPtrFromBaseOffset<{{dtype_idx}}>(int_buffer_ptr, plan_info.qo_tile_indices_offset);
+  params.kv_tile_indices =
+      GetPtrFromBaseOffset<{{dtype_idx}}>(int_buffer_ptr, plan_info.kv_tile_indices_offset);
+  params.o_indptr = GetPtrFromBaseOffset<{{dtype_idx}}>(int_buffer_ptr, plan_info.o_indptr_offset);
+  params.kv_chunk_size_ptr =
+      GetPtrFromBaseOffset<{{dtype_idx}}>(int_buffer_ptr, plan_info.kv_chunk_size_ptr_offset);
   if (plan_info.split_kv) {
-    params.merge_indptr = GetPtrFromBaseOffset<{{ dtype_idx }}>(int_buffer_ptr, plan_info.merge_indptr_offset);
-    tmp_v = GetPtrFromBaseOffset<{{ dtype_o }}>(float_buffer_ptr, plan_info.v_offset);
+    params.merge_indptr =
+        GetPtrFromBaseOffset<{{dtype_idx}}>(int_buffer_ptr, plan_info.merge_indptr_offset);
+    tmp_v = GetPtrFromBaseOffset<{{dtype_o}}>(float_buffer_ptr, plan_info.v_offset);
     tmp_s = GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.s_offset);
     if (plan_info.enable_cuda_graph) {
-      params.block_valid_mask = GetPtrFromBaseOffset<bool>(int_buffer_ptr, plan_info.block_valid_mask_offset);
+      params.block_valid_mask =
+          GetPtrFromBaseOffset<bool>(int_buffer_ptr, plan_info.block_valid_mask_offset);
     }
   }
-  params.total_num_rows = plan_info.total_num_rows;
   params.padded_batch_size = plan_info.padded_batch_size;
+  params.max_total_num_rows = plan_info.total_num_rows;
+  if (plan_info.enable_cuda_graph) {
+    params.total_num_rows =
+        GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr, plan_info.total_num_rows_offset);
+  }
 
   cudaError_t status = cudaSuccess;
 
@@ -389,14 +437,17 @@ void BatchPrefillWithPagedKVCacheRun(
 
   DISPATCH_MASK_MODE(mask_mode, MASK_MODE, {
     constexpr bool use_custom_mask = MASK_MODE == MaskMode::kCustom;
-    using PagedAttentionVariant = ComposedAttention<PagedParamsT, get_variant_code(use_custom_mask, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, {{ use_alibi }})>;
+    using PagedAttentionVariant =
+        ComposedAttention<PagedParamsT, get_variant_code(use_custom_mask, {{use_sliding_window}},
+                                                         {{use_logits_soft_cap}}, {{use_alibi}})>;
     DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
       status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
-        CTA_TILE_Q, {{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, MASK_MODE, PagedAttentionVariant>(
-          params, tmp_v, tmp_s, stream);
+          CTA_TILE_Q, {{head_dim}}, {{pos_encoding_mode}}, {{use_fp16_qk_reduction}}, MASK_MODE,
+          PagedAttentionVariant>(params, tmp_v, tmp_s, stream);
     });
   });
-  TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithPagedKVCache failed with error ", cudaGetErrorString(status));
+  TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithPagedKVCache failed with error ",
+              cudaGetErrorString(status));
 }
 """,
     r"""#include "pytorch_extension_utils.h"

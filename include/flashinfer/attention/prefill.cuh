@@ -2121,7 +2121,6 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(typename AttentionVariant::P
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.num_kv_heads;
   const uint_fastdiv group_size_fastdiv(num_qo_heads / num_kv_heads);
-  const uint32_t total_num_rows = params.total_num_rows;
   constexpr uint32_t NUM_MMA_Q = get_num_mma_q(CTA_TILE_Q);
   constexpr uint32_t NUM_WARPS_Q = get_num_warps_q(CTA_TILE_Q);
   constexpr uint32_t NUM_WARPS_KV = get_num_warps_kv(CTA_TILE_Q);
@@ -2198,13 +2197,13 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(typename AttentionVariant::P
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         if constexpr (AttentionVariant::use_softmax) {
-          FLASHINFER_CUDA_CALL(VariableLengthMergeStates(tmp_v, tmp_s, params.merge_indptr, o, lse,
-                                                         total_num_rows, nullptr, num_qo_heads,
-                                                         HEAD_DIM, stream));
+          FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
+              tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
+              params.total_num_rows, num_qo_heads, HEAD_DIM, stream));
         } else {
-          FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(tmp_v, params.merge_indptr, o,
-                                                          total_num_rows, nullptr, num_qo_heads,
-                                                          HEAD_DIM, stream));
+          FLASHINFER_CUDA_CALL(
+              VariableLengthAttentionSum(tmp_v, params.merge_indptr, o, params.max_total_num_rows,
+                                         params.total_num_rows, num_qo_heads, HEAD_DIM, stream));
         }
       }
     }
@@ -2223,7 +2222,6 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(typename AttentionVariant::Pa
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.paged_kv.num_heads;
   const uint_fastdiv group_size_fastdiv(num_qo_heads / num_kv_heads);
-  const uint32_t total_num_rows = params.total_num_rows;
   constexpr uint32_t NUM_MMA_Q = get_num_mma_q(CTA_TILE_Q);
   constexpr uint32_t NUM_WARPS_Q = get_num_warps_q(CTA_TILE_Q);
   constexpr uint32_t NUM_WARPS_KV = get_num_warps_kv(CTA_TILE_Q);
@@ -2300,13 +2298,13 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(typename AttentionVariant::Pa
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         if constexpr (AttentionVariant::use_softmax) {
-          FLASHINFER_CUDA_CALL(VariableLengthMergeStates(tmp_v, tmp_s, params.merge_indptr, o, lse,
-                                                         total_num_rows, nullptr, num_qo_heads,
-                                                         HEAD_DIM, stream));
+          FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
+              tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
+              params.total_num_rows, num_qo_heads, HEAD_DIM, stream));
         } else {
-          FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(tmp_v, params.merge_indptr, o,
-                                                          total_num_rows, nullptr, num_qo_heads,
-                                                          HEAD_DIM, stream));
+          FLASHINFER_CUDA_CALL(
+              VariableLengthAttentionSum(tmp_v, params.merge_indptr, o, params.max_total_num_rows,
+                                         params.total_num_rows, num_qo_heads, HEAD_DIM, stream));
         }
       }
     }
