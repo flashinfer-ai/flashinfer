@@ -44,6 +44,7 @@ include-package-data = false
 "flashinfer.data.cutlass" = "../3rdparty/cutlass"
 
 [tool.setuptools.package-data]
+"flashinfer.data" = ["version.txt"]
 "flashinfer.data.csrc" = ["**"]
 "flashinfer.data.cutlass" = ["include/**", "tools/util/include/**"]
 "flashinfer.data.include" = ["**"]

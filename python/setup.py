@@ -32,7 +32,6 @@ this_dir = Path(__file__).parent.resolve()
 
 sys.path.append(str(this_dir))
 
-package_version = "0.1.6"
 enable_aot = os.environ.get("FLASHINFER_ENABLE_AOT", "0") == "1"
 enable_bf16 = os.environ.get("FLASHINFER_ENABLE_BF16", "1") == "1"
 enable_fp8 = os.environ.get("FLASHINFER_ENABLE_FP8", "1") == "1"
@@ -289,6 +288,7 @@ def get_instantiation_cu() -> Tuple[List[str], List[str], List[str]]:
 
 
 def get_version():
+    package_version = (this_dir.parent / "version.txt").read_text().strip()
     local_version = os.getenv("FLASHINFER_LOCAL_VERSION")
     if local_version is None:
         return package_version
