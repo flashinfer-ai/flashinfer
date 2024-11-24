@@ -21,11 +21,13 @@ import flashinfer
 
 
 def llama_rms_norm(x, w, eps=1e-6):
-    def _norm(x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
-
-    output = _norm(x.float()).type_as(x)
-    return output * w
+    orig_dtype = x.dtype
+    x = x.float()
+    variance = x.pow(2).mean(dim=-1, keepdim=True)
+    x = x * torch.rsqrt(variance + eps)
+    x = x * w.float()
+    x = x.to(orig_dtype)
+    return x
 
 
 def gemma_rms_norm(x, w, eps=1e-6):
@@ -33,7 +35,7 @@ def gemma_rms_norm(x, w, eps=1e-6):
     x = x.float()
     variance = x.pow(2).mean(dim=-1, keepdim=True)
     x = x * torch.rsqrt(variance + eps)
-    x = x * (1.0 + w)
+    x = x * (1.0 + w.float())
     x = x.to(orig_dtype)
     return x
 
@@ -45,7 +47,7 @@ def gemma_fused_add_rms_norm(x, residual, w, eps=1e-6):
     x = x.float()
     variance = x.pow(2).mean(dim=-1, keepdim=True)
     x = x * torch.rsqrt(variance + eps)
-    x = x * (1.0 + w)
+    x = x * (1.0 + w.float())
     x = x.to(orig_dtype)
     return x, residual
 
@@ -58,7 +60,7 @@ def fused_add_rms_norm(x, residual, weight, eps):
 
     variance = x.pow(2).mean(dim=-1, keepdim=True)
     x = x * torch.rsqrt(variance + eps)
-    x = x.to(orig_dtype) * weight
+    x = (x * weight.float()).to(orig_dtype)
     return x, residual
 
 
