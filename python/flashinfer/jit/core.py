@@ -14,8 +14,8 @@ from .env import FLASHINFER_INCLUDE_DIR as FLASHINFER_INCLUDE_DIR
 from .env import FLASHINFER_JIT_DIR as FLASHINFER_JIT_DIR
 from .env import FLASHINFER_WORKSPACE_DIR as FLASHINFER_WORKSPACE_DIR
 
-if not os.path.exists(FLASHINFER_WORKSPACE_DIR):
-    os.makedirs(FLASHINFER_WORKSPACE_DIR)
+os.makedirs(FLASHINFER_WORKSPACE_DIR, exist_ok=True)
+os.makedirs(FLASHINFER_CSRC_DIR, exist_ok=True)
 
 
 class FlashInferJITLogger(logging.Logger):
@@ -99,8 +99,7 @@ def load_cuda_ops(
     logger.info(f"Loading JIT ops: {name}")
     check_cuda_arch()
     build_directory = FLASHINFER_JIT_DIR / name
-    if not os.path.exists(build_directory):
-        os.makedirs(build_directory, exist_ok=True)
+    os.makedirs(build_directory, exist_ok=True)
     if extra_include_paths is None:
         extra_include_paths = [
             FLASHINFER_INCLUDE_DIR,

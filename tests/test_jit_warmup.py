@@ -24,31 +24,37 @@ import flashinfer
 def test_warmpup_llama():
     parallel_load_modules(
         [
-            lambda: flashinfer.activation.get_act_and_mul_module("silu"),
-            flashinfer.norm.get_norm_module,
-            flashinfer.sampling.get_sampling_module,
-            flashinfer.quantization.get_quantization_module,
-            flashinfer.page.get_page_module,
-            lambda: flashinfer.decode.get_batch_decode_module(
-                torch.float16,
-                torch.float16,
-                torch.float16,
-                torch.int32,
-                128,
-                PosEncodingMode.NONE.value,
-                False,  # use_sliding_window
-                False,  # use_logits_soft_cap
+            (flashinfer.activation.get_act_and_mul_module, ["silu"]),
+            (flashinfer.norm.get_norm_module, []),
+            (flashinfer.sampling.get_sampling_module, []),
+            (flashinfer.quantization.get_quantization_module, []),
+            (flashinfer.page.get_page_module, []),
+            (
+                flashinfer.decode.get_batch_decode_module,
+                [
+                    torch.float16,
+                    torch.float16,
+                    torch.float16,
+                    torch.int32,
+                    128,
+                    PosEncodingMode.NONE.value,
+                    False,  # use_sliding_window
+                    False,  # use_logits_soft_cap
+                ],
             ),
-            lambda: flashinfer.prefill.gen_batch_prefill_module(
-                torch.float16,
-                torch.float16,
-                torch.float16,
-                torch.int32,
-                128,
-                PosEncodingMode.NONE.value,
-                False,  # use_sliding_window
-                False,  # use_logits_soft_cap
-                False,  # allow_fp16_qk_reduction
+            (
+                flashinfer.prefill.gen_batch_prefill_module,
+                [
+                    torch.float16,
+                    torch.float16,
+                    torch.float16,
+                    torch.int32,
+                    128,
+                    PosEncodingMode.NONE.value,
+                    False,  # use_sliding_window
+                    False,  # use_logits_soft_cap
+                    False,  # allow_fp16_qk_reduction
+                ],
             ),
         ]
     )

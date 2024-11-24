@@ -18,8 +18,40 @@ import numpy
 import pytest
 import torch
 from alibi_reference import alibi_attention
+from jit_utils import jit_decode_attention_func_args, jit_prefill_attention_func_args
 
 import flashinfer
+
+
+@pytest.fixture(autouse=True, scope="module")
+def warmup_jit():
+    if flashinfer.jit.has_prebuilt_ops:
+        return
+    try:
+        flashinfer.jit.parallel_load_modules(
+            jit_decode_attention_func_args(
+                [torch.float16],  # q_dtypes
+                [torch.float16],  # kv_dtypes
+                [128, 256],  # head_dims
+                [0, 2],  # pos_encoding_modes
+                [False],  # use_sliding_windows
+                [False],  # use_logits_soft_caps
+            )
+            + jit_prefill_attention_func_args(
+                [torch.float16],  # q_dtypes
+                [torch.float16],  # kv_dtypes
+                [128, 256],  # head_dims
+                [0, 2],  # pos_encoding_modes
+                [False],  # use_sliding_windows
+                [False],  # use_logits_soft_caps
+                [False],  # allow_fp16_qk_reductions
+            )
+        )
+    except Exception as e:
+        # abort the test session if warmup fails
+        pytest.exit(str(e))
+    finally:
+        yield
 
 
 @pytest.mark.parametrize("seq_len", [1, 9, 81, 729])
