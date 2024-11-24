@@ -14,14 +14,101 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import itertools
-
 batch_prefill_suffix = [
     "_plan.cu",
+    *[f"_ragged_kernel_mask_{mask_mode}.cu" for mask_mode in [0, 1, 2]],
     "_ragged_run.cu",
+    *[f"_paged_kernel_mask_{mask_mode}.cu" for mask_mode in [0, 1, 2]],
     "_paged_run.cu",
     "_pybind.cc",
 ]
+
+
+def ragged_prefill_inst_templ(mask_mode: str) -> str:
+    return (
+        r"""#include <flashinfer/attention/prefill.cuh>
+#include <flashinfer/attention/prefill_params.cuh>
+#include <flashinfer/attention/variants.cuh>
+
+namespace flashinfer {
+
+{% set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
+using RaggedParamsT = BatchPrefillRaggedParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ dtype_idx }}>;
+constexpr bool use_custom_mask = """
+        + mask_mode
+        + r""" == MaskMode::kCustom;
+using RaggedAttentionVariant = ComposedAttention<RaggedParamsT, get_variant_code(use_custom_mask, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, {{ use_alibi }})>;
+
+template
+cudaError_t BatchPrefillWithRaggedKVCacheDispatched</*cta_tile_q=*/16, {{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, """
+        + mask_mode
+        + r""", RaggedAttentionVariant>(
+    typename RaggedAttentionVariant::ParamsT params,
+    typename RaggedAttentionVariant::DTypeO* tmp_v,
+    float* tmp_s, cudaStream_t stream);
+
+template
+cudaError_t BatchPrefillWithRaggedKVCacheDispatched</*cta_tile_q=*/64, {{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, """
+        + mask_mode
+        + r""", RaggedAttentionVariant>(
+    typename RaggedAttentionVariant::ParamsT params,
+    typename RaggedAttentionVariant::DTypeO* tmp_v,
+    float* tmp_s, cudaStream_t stream);
+
+template
+cudaError_t BatchPrefillWithRaggedKVCacheDispatched</*cta_tile_q=*/128, {{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, """
+        + mask_mode
+        + r""", RaggedAttentionVariant>(
+    typename RaggedAttentionVariant::ParamsT params,
+    typename RaggedAttentionVariant::DTypeO* tmp_v,
+    float* tmp_s, cudaStream_t stream);
+}
+"""
+    )
+
+
+def paged_prefill_inst_templ(mask_mode: str) -> str:
+    return (
+        r"""#include <flashinfer/attention/prefill.cuh>
+#include <flashinfer/attention/prefill_params.cuh>
+#include <flashinfer/attention/variants.cuh>
+
+namespace flashinfer {
+
+{% set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
+using PagedParamsT = BatchPrefillPagedParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ dtype_idx }}>;
+constexpr bool use_custom_mask = """
+        + mask_mode
+        + r""" == MaskMode::kCustom;
+using PagedAttentionVariant = ComposedAttention<PagedParamsT, get_variant_code(use_custom_mask, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, {{ use_alibi }})>;
+
+template
+cudaError_t BatchPrefillWithPagedKVCacheDispatched</*cta_tile_q=*/16, {{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, """
+        + mask_mode
+        + r""", PagedAttentionVariant>(
+    typename PagedAttentionVariant::ParamsT params,
+    typename PagedAttentionVariant::DTypeO* tmp_v,
+    float* tmp_s, cudaStream_t stream);
+
+template
+cudaError_t BatchPrefillWithPagedKVCacheDispatched</*cta_tile_q=*/64, {{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, """
+        + mask_mode
+        + r""", PagedAttentionVariant>(
+    typename PagedAttentionVariant::ParamsT params,
+    typename PagedAttentionVariant::DTypeO* tmp_v,
+    float* tmp_s, cudaStream_t stream);
+
+template
+cudaError_t BatchPrefillWithPagedKVCacheDispatched</*cta_tile_q=*/128, {{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, """
+        + mask_mode
+        + r""", PagedAttentionVariant>(
+    typename PagedAttentionVariant::ParamsT params,
+    typename PagedAttentionVariant::DTypeO* tmp_v,
+    float* tmp_s, cudaStream_t stream);
+}
+"""
+    )
+
 
 batch_prefill_templ = [
     r"""#include <flashinfer/attention/scheduler.cuh>
@@ -60,10 +147,15 @@ std::vector<int64_t> BatchPrefillWithKVCachePlan(
   return plan_info.ToVector();
 }
 """,
+    *[
+        ragged_prefill_inst_templ(mask_mode)
+        for mask_mode in ["MaskMode::kNone", "MaskMode::kCausal", "MaskMode::kCustom"]
+    ],
     r"""
 #include <optional>
+#include <flashinfer/pos_enc.cuh>
 #include <flashinfer/attention/scheduler.cuh>
-#include <flashinfer/attention/prefill.cuh>
+#include <flashinfer/attention/mask.cuh>
 #include <flashinfer/attention/prefill_params.cuh>
 #include <flashinfer/attention/variants.cuh>
 #include "pytorch_extension_utils.h"
@@ -72,6 +164,16 @@ using namespace flashinfer;
 
 {% set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
 using RaggedParamsT = BatchPrefillRaggedParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ dtype_idx }}>;
+
+namespace flashinfer {
+
+template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
+          bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant>
+cudaError_t BatchPrefillWithRaggedKVCacheDispatched(typename AttentionVariant::ParamsT params,
+                                                                typename AttentionVariant::DTypeO* tmp_v,
+                                                                float* tmp_s, cudaStream_t stream);
+
+};
 
 void BatchPrefillWithRaggedKVCacheRun(
   unsigned int mask_mode_code,
@@ -153,7 +255,7 @@ void BatchPrefillWithRaggedKVCacheRun(
     constexpr bool use_custom_mask = MASK_MODE == MaskMode::kCustom;
     using RaggedAttentionVariant = ComposedAttention<RaggedParamsT, get_variant_code(use_custom_mask, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, {{ use_alibi }})>;
     DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
-      status = BatchPrefillWithRaggedKVCacheDispatched<
+      status = flashinfer::BatchPrefillWithRaggedKVCacheDispatched<
         CTA_TILE_Q, {{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, MASK_MODE, RaggedAttentionVariant>(
           params, tmp_v, tmp_s, stream);
     });
@@ -162,9 +264,14 @@ void BatchPrefillWithRaggedKVCacheRun(
   TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithRaggedKVCache failed with error ", cudaGetErrorString(status));
 }
 """,
+    *[
+        paged_prefill_inst_templ(mask_mode)
+        for mask_mode in ["MaskMode::kNone", "MaskMode::kCausal", "MaskMode::kCustom"]
+    ],
     r"""#include <optional>
+#include <flashinfer/pos_enc.cuh>
 #include <flashinfer/attention/scheduler.cuh>
-#include <flashinfer/attention/prefill.cuh>
+#include <flashinfer/attention/mask.cuh>
 #include <flashinfer/attention/prefill_params.cuh>
 #include <flashinfer/attention/variants.cuh>
 #include "pytorch_extension_utils.h"
@@ -173,6 +280,16 @@ using namespace flashinfer;
 
 {% set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
 using PagedParamsT = BatchPrefillPagedParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ dtype_idx }}>;
+
+namespace flashinfer {
+
+template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
+          bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant>
+cudaError_t BatchPrefillWithPagedKVCacheDispatched(typename AttentionVariant::ParamsT params,
+                                                               typename AttentionVariant::DTypeO* tmp_v,
+                                                               float* tmp_s, cudaStream_t stream);
+
+};
 
 void BatchPrefillWithPagedKVCacheRun(
   unsigned int mask_mode_code,
@@ -274,7 +391,7 @@ void BatchPrefillWithPagedKVCacheRun(
     constexpr bool use_custom_mask = MASK_MODE == MaskMode::kCustom;
     using PagedAttentionVariant = ComposedAttention<PagedParamsT, get_variant_code(use_custom_mask, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, {{ use_alibi }})>;
     DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
-      status = BatchPrefillWithPagedKVCacheDispatched<
+      status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
         CTA_TILE_Q, {{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, MASK_MODE, PagedAttentionVariant>(
           params, tmp_v, tmp_s, stream);
     });

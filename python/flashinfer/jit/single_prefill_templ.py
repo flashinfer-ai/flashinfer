@@ -15,19 +15,12 @@ limitations under the License.
 """
 
 single_prefill_suffix = [
+    *[f"_kernel_mask_{mask_mode}.cu" for mask_mode in [0, 1, 2]],
     ".cu",
     "_pybind.cc",
 ]
 
-customizable_single_prefill_templ = [
-    r"""
-#include <optional>
-#include <flashinfer/attention/prefill.cuh>
-#include "pytorch_extension_utils.h"
-
-using namespace flashinfer;
-
-
+customizable_struct_templ = r"""
 struct SinglePrefillParams {
   using DTypeQ = {{ dtype_q }};
   using DTypeKV = {{ dtype_kv }};
@@ -82,9 +75,62 @@ struct SinglePrefillParams {
     return kv_len;
   }
 };
+"""
 
 
+def customizable_single_prefill_inst_templ(mask_mode: str) -> str:
+    return (
+        r"""#include <flashinfer/attention/prefill.cuh>
+
+using namespace flashinfer;
+"""
+        + customizable_struct_templ
+        + r"""{{ variant_decl }}
+using ParamsT = SinglePrefillParams;
+using AttentionVariant = {{ variant_name }}<ParamsT>;
+
+namespace flashinfer {
+
+template
+cudaError_t SinglePrefillWithKVCacheDispatched<{{ head_dim }}, PosEncodingMode::kNone, false, """
+        f"{mask_mode}"
+        r""", AttentionVariant>(
+    typename AttentionVariant::ParamsT params,
+    typename AttentionVariant::DTypeO* tmp,
+    cudaStream_t stream);
+
+};
+"""
+    )
+
+
+customizable_single_prefill_templ = [
+    *[
+        customizable_single_prefill_inst_templ(mask_mode)
+        for mask_mode in ["MaskMode::kNone", "MaskMode::kCausal", "MaskMode::kCustom"]
+    ],
+    r"""
+#include <optional>
+#include <flashinfer/pos_enc.cuh>
+#include <flashinfer/attention/mask.cuh>
+#include "pytorch_extension_utils.h"
+
+using namespace flashinfer;
+
+"""
+    + customizable_struct_templ
+    + r"""
 {{ variant_decl }}
+
+namespace flashinfer {
+
+template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, bool ALLOW_FP16_QK_REDUCTION,
+          MaskMode MASK_MODE, typename AttentionVariant>
+cudaError_t SinglePrefillWithKVCacheDispatched(typename AttentionVariant::ParamsT params,
+                                               typename AttentionVariant::DTypeO* tmp,
+                                               cudaStream_t stream);
+
+}
 
 at::Tensor single_prefill_with_kv_cache(
     unsigned int mask_mode_code, at::Tensor q, at::Tensor k, at::Tensor v,
@@ -155,10 +201,43 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 """,
 ]
 
+
+def single_prefill_inst_templ(mask_mode: str) -> str:
+    return (
+        r"""#include <flashinfer/attention/prefill.cuh>
+#include <flashinfer/attention/prefill_params.cuh>
+#include <flashinfer/attention/variants.cuh>
+
+namespace flashinfer {
+
+{% set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
+using ParamsT = SinglePrefillParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}>;
+constexpr bool use_custom_mask = """
+        f"{mask_mode}"
+        r"""== MaskMode::kCustom;
+using AttentionVariant = ComposedAttention<ParamsT, get_variant_code(use_custom_mask, {{ use_sliding_window }}, {{ use_logits_soft_cap }}, {{ use_alibi }})>;
+
+template
+cudaError_t SinglePrefillWithKVCacheDispatched<{{ head_dim }}, {{ pos_encoding_mode }}, {{ use_fp16_qk_reduction }}, """
+        f"{mask_mode}"
+        r""", AttentionVariant>(
+    typename AttentionVariant::ParamsT params,
+    typename AttentionVariant::DTypeO* tmp,
+    cudaStream_t stream);
+
+}
+"""
+    )
+
+
 single_prefill_templ = [
-    r"""
-#include <optional>
-#include <flashinfer/attention/prefill.cuh>
+    *[
+        single_prefill_inst_templ(mask_mode)
+        for mask_mode in ["MaskMode::kNone", "MaskMode::kCausal", "MaskMode::kCustom"]
+    ],
+    r"""#include <optional>
+#include <flashinfer/pos_enc.cuh>
+#include <flashinfer/attention/mask.cuh>
 #include <flashinfer/attention/variants.cuh>
 #include <flashinfer/attention/prefill_params.cuh>
 #include "pytorch_extension_utils.h"
@@ -167,6 +246,16 @@ using namespace flashinfer;
 
 {% set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
 using ParamsT = SinglePrefillParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}>;
+
+namespace flashinfer {
+
+template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, bool ALLOW_FP16_QK_REDUCTION,
+          MaskMode MASK_MODE, typename AttentionVariant>
+cudaError_t SinglePrefillWithKVCacheDispatched(typename AttentionVariant::ParamsT params,
+                                               typename AttentionVariant::DTypeO* tmp,
+                                               cudaStream_t stream);
+
+}
 
 void single_prefill_with_kv_cache(
     unsigned int mask_mode_code,
