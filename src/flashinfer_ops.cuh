@@ -255,6 +255,13 @@ class BatchPrefillHandler {
     return nullptr;
   }
 
+  uint32_t* GetTotalNumRows() {
+    if (plan_info_.enable_cuda_graph) {
+      return GetPtrFromBaseOffset<uint32_t>(int_buffer_, plan_info_.total_num_rows_offset);
+    }
+    return nullptr;
+  }
+
   bool* GetBlockValidMask() {
     if (plan_info_.split_kv && plan_info_.enable_cuda_graph) {
       return GetPtrFromBaseOffset<bool>(int_buffer_, plan_info_.block_valid_mask_offset);
@@ -414,7 +421,8 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
                 params.kv_chunk_size_ptr = handler->GetKVChunkSizePtr<IdType>();
                 params.merge_indptr = handler->GetMergeIndptr<IdType>();
                 params.block_valid_mask = handler->GetBlockValidMask();
-                params.total_num_rows = plan_info.total_num_rows;
+                params.max_total_num_rows = plan_info.total_num_rows;
+                params.total_num_rows = handler->GetTotalNumRows();
                 params.padded_batch_size = plan_info.padded_batch_size;
 
                 DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
@@ -466,7 +474,8 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
                 params.kv_chunk_size_ptr = handler->GetKVChunkSizePtr<IdType>();
                 params.merge_indptr = handler->GetMergeIndptr<IdType>();
                 params.block_valid_mask = handler->GetBlockValidMask();
-                params.total_num_rows = plan_info.total_num_rows;
+                params.max_total_num_rows = plan_info.total_num_rows;
+                params.total_num_rows = handler->GetTotalNumRows();
                 params.padded_batch_size = plan_info.padded_batch_size;
                 DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
                   return BatchPrefillWithPagedKVCacheDispatched<

@@ -518,6 +518,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h, uin
 struct PrefillPlanInfo {
   int64_t padded_batch_size;
   int64_t total_num_rows;
+  int64_t total_num_rows_offset;
   int64_t cta_tile_q;
   int64_t request_indices_offset;
   int64_t qo_tile_indices_offset;
@@ -534,6 +535,7 @@ struct PrefillPlanInfo {
   PrefillPlanInfo()
       : padded_batch_size(0),
         total_num_rows(0),
+        total_num_rows_offset(0),
         cta_tile_q(0),
         request_indices_offset(0),
         qo_tile_indices_offset(0),
@@ -551,6 +553,7 @@ struct PrefillPlanInfo {
   std::vector<int64_t> ToVector() const {
     return {padded_batch_size,
             total_num_rows,
+            total_num_rows_offset,
             cta_tile_q,
             request_indices_offset,
             qo_tile_indices_offset,
@@ -567,25 +570,26 @@ struct PrefillPlanInfo {
 
   // From std::vector<int64_t> to PrefillPlanInfo
   void FromVector(const std::vector<int64_t>& vec) {
-    if (vec.size() != 14) {
+    if (vec.size() != 15) {
       std::ostringstream err_msg;
       err_msg << "PrefillPlanInfo::FromVector: vec.size() should be 14, but got " << vec.size();
       FLASHINFER_ERROR(err_msg.str());
     }
     padded_batch_size = vec[0];
     total_num_rows = vec[1];
-    cta_tile_q = vec[2];
-    request_indices_offset = vec[3];
-    qo_tile_indices_offset = vec[4];
-    kv_tile_indices_offset = vec[5];
-    merge_indptr_offset = vec[6];
-    o_indptr_offset = vec[7];
-    kv_chunk_size_ptr_offset = vec[8];
-    v_offset = vec[9];
-    s_offset = vec[10];
-    block_valid_mask_offset = vec[11];
-    enable_cuda_graph = vec[12];
-    split_kv = vec[13];
+    total_num_rows_offset = vec[2];
+    cta_tile_q = vec[3];
+    request_indices_offset = vec[4];
+    qo_tile_indices_offset = vec[5];
+    kv_tile_indices_offset = vec[6];
+    merge_indptr_offset = vec[7];
+    o_indptr_offset = vec[8];
+    kv_chunk_size_ptr_offset = vec[9];
+    v_offset = vec[10];
+    s_offset = vec[11];
+    block_valid_mask_offset = vec[12];
+    enable_cuda_graph = vec[13];
+    split_kv = vec[14];
   }
 };
 
@@ -639,6 +643,14 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
                                                                  16, "batch_prefill_o_indptr");
   plan_info.kv_chunk_size_ptr_offset =
       int_allocator.aligned_alloc_offset(sizeof(IdType), 1, "batch_prefill_kv_chunk_size_ptr");
+
+  if (plan_info.enable_cuda_graph) {
+    plan_info.total_num_rows_offset =
+        int_allocator.aligned_alloc_offset(sizeof(uint32_t), 16, "batch_prefill_total_num_rows");
+    uint32_t* total_num_rows_h =
+        GetPtrFromBaseOffset<uint32_t>(page_locked_int_buffer, plan_info.total_num_rows_offset);
+    *total_num_rows_h = qo_indptr_h[batch_size];
+  }
 
   IdType* request_indices_h =
       GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.request_indices_offset);

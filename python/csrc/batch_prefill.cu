@@ -160,8 +160,12 @@ void BatchPrefillWithRaggedKVCacheRun(
                   GetPtrFromBaseOffset<bool>(int_buffer_ptr, plan_info.block_valid_mask_offset);
             }
           }
-          params.total_num_rows = plan_info.total_num_rows;
           params.padded_batch_size = plan_info.padded_batch_size;
+          params.max_total_num_rows = plan_info.total_num_rows;
+          if (plan_info.enable_cuda_graph) {
+            params.total_num_rows =
+                GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr, plan_info.total_num_rows_offset);
+          }
 
           cudaError_t status = cudaSuccess;
 
@@ -290,8 +294,12 @@ void BatchPrefillWithPagedKVCacheRun(
                   GetPtrFromBaseOffset<bool>(int_buffer_ptr, plan_info.block_valid_mask_offset);
             }
           }
-          params.total_num_rows = plan_info.total_num_rows;
           params.padded_batch_size = plan_info.padded_batch_size;
+          params.max_total_num_rows = plan_info.total_num_rows;
+          if (plan_info.enable_cuda_graph) {
+            params.total_num_rows =
+                GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr, plan_info.total_num_rows_offset);
+          }
 
           cudaError_t status = cudaSuccess;
 
