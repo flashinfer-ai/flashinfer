@@ -127,6 +127,7 @@ __global__ void FusedAddRMSNormKernel(T* __restrict__ input, T* __restrict__ res
   const uint32_t num_threads = num_warps * warp_size;
   const uint32_t rounds = ceil_div(d, VEC_SIZE * num_threads);
   extern __shared__ float smem[];
+  float* smem_x = smem + ceil_div(num_warps, 4) * 4;
 
   float sum_sq = 0.f;
 
@@ -151,7 +152,7 @@ __global__ void FusedAddRMSNormKernel(T* __restrict__ input, T* __restrict__ res
     }
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       residual_vec.store(residual + bx * d + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
-      x_vec.store(smem + num_warps + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+      x_vec.store(smem_x + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
     }
   }
 
@@ -185,7 +186,7 @@ __global__ void FusedAddRMSNormKernel(T* __restrict__ input, T* __restrict__ res
     x_vec.fill(0.f);
     if ((i * num_threads + thread_id) * VEC_SIZE < d) {
       weight_vec.load(weight + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
-      x_vec.load(smem + num_warps + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
+      x_vec.load(smem_x + i * num_threads * VEC_SIZE + thread_id * VEC_SIZE);
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; j++) {
@@ -247,7 +248,8 @@ cudaError_t GemmaFusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batc
   const uint32_t num_warps = ceil_div(block_size, 32);
   dim3 nblks(batch_size);
   dim3 nthrs(32, num_warps);
-  const uint32_t smem_size = (num_warps + d) * sizeof(float);
+  // NOTE(Zihao): use ceil_div(num_warps, 4) * 4 for address alignment to 16 bytes
+  const uint32_t smem_size = (ceil_div(num_warps, 4) * 4 + d) * sizeof(float);
   float weight_bias = 1.f;
   void* args[] = {&input, &residual, &weight, &d, &weight_bias, &eps};
 
