@@ -42,8 +42,9 @@ using namespace flashinfer;
 std::vector<int64_t> BatchPrefillWithKVCachePlan(
     unsigned int head_dim, at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr, at::Tensor kv_indptr,
-    unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads,
-    unsigned int page_size, bool enable_cuda_graph, int64_t cuda_stream) {
+    unsigned int total_num_rows, unsigned int max_seq_len, unsigned int batch_size,
+    unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int page_size,
+    bool enable_cuda_graph, int64_t cuda_stream) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =
@@ -58,8 +59,8 @@ std::vector<int64_t> BatchPrefillWithKVCachePlan(
       float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
       int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
       int_workspace_size_in_bytes, plan_info, qo_indptr.data_ptr<IdType>(),
-      kv_indptr.data_ptr<IdType>(), batch_size, num_qo_heads, num_kv_heads, head_dim, page_size,
-      enable_cuda_graph, /*sizeof_dtype_o=*/2, stream);
+      kv_indptr.data_ptr<IdType>(), total_num_rows, max_seq_len, batch_size, num_qo_heads,
+      num_kv_heads, head_dim, page_size, enable_cuda_graph, /*sizeof_dtype_o=*/2, stream);
 
   TORCH_CHECK(status == cudaSuccess,
               "Failed to plan prefill with error: ", cudaGetErrorString(status));

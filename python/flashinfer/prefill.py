@@ -833,6 +833,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._paged_kv_last_page_len_buf = paged_kv_last_page_len_buf
         self._custom_mask_buf = custom_mask_buf
         self._qk_indptr_buf = qk_indptr_buf
+        self._max_total_num_rows = None
+        self._max_seq_len = None
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -993,7 +995,33 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 bitorder="little",
             )
 
+        # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
+        qo_indptr_host = qo_indptr.to("cpu")
+        paged_kv_indptr_host = paged_kv_indptr.to("cpu")
+
+        total_num_rows = qo_indptr_host[-1]
+        max_seq_len = torch.max(qo_indptr_host[1:] - qo_indptr_host[:-1]).item()
+
         if self.is_cuda_graph_enabled:
+            if self._max_total_num_rows is None:
+                self._max_total_num_rows = total_num_rows
+            elif total_num_rows > self._max_total_num_rows:
+                raise ValueError(
+                    "The total number of rows in qo_indptr {} in cuda graph mode cannot "
+                    "exceed the number of rows set during initialization {}.".format(
+                        total_num_rows, self._max_total_num_rows
+                    )
+                )
+            if self._max_seq_len is None:
+                self._max_seq_len = max_seq_len
+            elif max_seq_len > self._max_seq_len:
+                raise ValueError(
+                    "The maximum sequence length in qo_indptr {} in cuda graph mode cannot "
+                    "exceed the sequence length set during initialization {}.".format(
+                        max_seq_len, self._max_seq_len
+                    )
+                )
+
             if batch_size != self._fixed_batch_size:
                 raise ValueError(
                     "The batch size should be fixed during the lifecycle of the wrapper in "
@@ -1049,10 +1077,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self.device, non_blocking=non_blocking
                 )
 
-        # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
-        qo_indptr_host = qo_indptr.to("cpu")
-        paged_kv_indptr_host = paged_kv_indptr.to("cpu")
-
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
         self._cached_module = get_batch_prefill_module(
@@ -1073,6 +1097,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._pin_memory_int_workspace_buffer,
                 qo_indptr_host,
                 paged_kv_indptr_host,
+                total_num_rows,
+                max_seq_len,
                 batch_size,
                 num_qo_heads,
                 num_kv_heads,
@@ -1463,6 +1489,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._kv_indptr_buf = kv_indptr_buf
         self._custom_mask_buf = custom_mask_buf
         self._qk_indptr_buf = qk_indptr_buf
+        self._max_total_num_rows = None
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -1610,7 +1637,33 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 bitorder="little",
             )
 
+        # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
+        qo_indptr_host = qo_indptr.to("cpu")
+        paged_kv_indptr_host = paged_kv_indptr.to("cpu")
+
+        total_num_rows = qo_indptr_host[-1]
+        max_seq_len = torch.max(qo_indptr_host[1:] - qo_indptr_host[:-1]).item()
+
         if self.is_cuda_graph_enabled:
+            if self._max_total_num_rows is None:
+                self._max_total_num_rows = total_num_rows
+            elif total_num_rows > self._max_total_num_rows:
+                raise ValueError(
+                    "The total number of rows in qo_indptr {} in cuda graph mode cannot "
+                    "exceed the number of rows set during initialization {}.".format(
+                        total_num_rows, self._max_total_num_rows
+                    )
+                )
+            if self._max_seq_len is None:
+                self._max_seq_len = max_seq_len
+            elif max_seq_len > self._max_seq_len:
+                raise ValueError(
+                    "The maximum sequence length in qo_indptr {} in cuda graph mode cannot "
+                    "exceed the sequence length set during initialization {}.".format(
+                        max_seq_len, self._max_seq_len
+                    )
+                )
+
             if batch_size != self._fixed_batch_size:
                 raise ValueError(
                     "The batch size should be fixed in cudagraph mode, the runtime batch size {} "
@@ -1638,10 +1691,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._custom_mask_buf = packed_custom_mask.to(self.device)
                 self._qk_indptr_buf = qk_indptr.to(self.device)
 
-        # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
-        qo_indptr_host = qo_indptr.to("cpu")
-        kv_indptr_host = kv_indptr.to("cpu")
-
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
         self._cached_module = get_batch_prefill_module(
@@ -1662,6 +1711,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._pin_memory_int_workspace_buffer,
                 qo_indptr_host,
                 kv_indptr_host,
+                total_num_rows,
+                max_seq_len,
                 batch_size,
                 num_qo_heads,
                 num_kv_heads,

@@ -183,14 +183,16 @@ class BatchPrefillHandler {
   template <typename DTypeO, typename IdType>
   cudaError_t Plan(void* float_buffer, size_t float_workspace_size_in_bytes, void* int_buffer,
                    size_t int_workspace_size_in_bytes, IdType* qo_indptr_h, IdType* kv_indptr_h,
-                   uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
-                   uint32_t head_dim, uint32_t page_size) {
+                   uint32_t total_num_rows, uint32_t max_seq_len, uint32_t batch_size,
+                   uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
+                   uint32_t page_size) {
     int_buffer_ = int_buffer;
     float_buffer_ = float_buffer;
     return PrefillPlan<IdType>(float_buffer, float_workspace_size_in_bytes, int_buffer,
                                page_locked_buffer_, int_workspace_size_in_bytes, plan_info_,
-                               qo_indptr_h, kv_indptr_h, batch_size, num_qo_heads, num_kv_heads,
-                               head_dim, page_size, enable_cuda_graph_, sizeof(DTypeO), stream_);
+                               qo_indptr_h, kv_indptr_h, total_num_rows, max_seq_len, batch_size,
+                               num_qo_heads, num_kv_heads, head_dim, page_size, enable_cuda_graph_,
+                               sizeof(DTypeO), stream_);
   }
 
   cudaStream_t GetCUDAStream() const { return stream_; }

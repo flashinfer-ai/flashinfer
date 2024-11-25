@@ -108,11 +108,11 @@ void _TestBatchPagedPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t n
     thrust::device_vector<DTypeQO> q_device(q);
     thrust::device_vector<DTypeQO> o_device(q_len * num_qo_heads * head_dim);
 
-    handler.Plan<DTypeQO, int32_t>((void*)thrust::raw_pointer_cast(float_buffer.data()),
-                                   float_workspace_size_in_bytes,
-                                   (void*)thrust::raw_pointer_cast(int_buffer.data()),
-                                   int_workspace_size_in_bytes, q_indptr.data(), kv_indptr.data(),
-                                   batch_size, num_qo_heads, num_kv_heads, head_dim, page_size);
+    handler.Plan<DTypeQO, int32_t>(
+        (void*)thrust::raw_pointer_cast(float_buffer.data()), float_workspace_size_in_bytes,
+        (void*)thrust::raw_pointer_cast(int_buffer.data()), int_workspace_size_in_bytes,
+        q_indptr.data(), kv_indptr.data(), /*total_num_rows=*/q_indptr.back(),
+        /*max_seq_len=*/q_len, batch_size, num_qo_heads, num_kv_heads, head_dim, page_size);
 
     for (uint32_t num_runs = 0; num_runs < 10; ++num_runs) {
       auto status =
@@ -154,7 +154,8 @@ void _TestBatchRaggedPrefillKernelCorrectness(size_t num_kv_heads, size_t num_qo
                                               bool allow_fp16_qk_reduction) {
   uint32_t batch_size = 9;
   std::vector<int32_t> q_lens(batch_size), kv_lens(batch_size);
-  utils::vec_randint_(q_lens, 10, 15);
+  const uint32_t max_seq_len = 15;
+  utils::vec_randint_(q_lens, 10, max_seq_len);
   utils::vec_randint_(kv_lens, 128, 2048);
   std::vector<int32_t> append_indptr{0}, kv_indptr{0};
 
@@ -202,8 +203,8 @@ void _TestBatchRaggedPrefillKernelCorrectness(size_t num_kv_heads, size_t num_qo
   handler.Plan<DTypeQO, int32_t>(
       (void*)thrust::raw_pointer_cast(float_buffer.data()), float_workspace_size_in_bytes,
       (void*)thrust::raw_pointer_cast(int_buffer.data()), int_workspace_size_in_bytes,
-      append_indptr.data(), kv_indptr.data(), batch_size, num_qo_heads, num_kv_heads, head_dim,
-      /*page_size=*/1);
+      append_indptr.data(), kv_indptr.data(), /*total_num_rows=*/append_indptr.back(), max_seq_len,
+      batch_size, num_qo_heads, num_kv_heads, head_dim, /*page_size=*/1);
 
   auto status = BatchPrefillWithRaggedKVCacheWrapper<DTypeQO, DTypeKV, DTypeQO, int32_t>(
       &handler, thrust::raw_pointer_cast(queries_device.data()),
@@ -245,9 +246,10 @@ void _TestBatchPagedPrefillKernelShortContextCorrectness(size_t num_kv_heads, si
                                                          bool causal,
                                                          PosEncodingMode pos_encoding_mode,
                                                          bool allow_fp16_qk_reduction) {
-  uint32_t batch_size = 7;
+  const uint32_t batch_size = 7;
+  const uint32_t max_seq_len = 64;
   std::vector<int32_t> q_lens(batch_size);
-  utils::vec_randint_(q_lens, 1, 64);
+  utils::vec_randint_(q_lens, 1, max_seq_len);
   std::vector<int32_t> kv_lens(q_lens);
 
   std::vector<int32_t> q_indptr{0};
@@ -334,11 +336,11 @@ void _TestBatchPagedPrefillKernelShortContextCorrectness(size_t num_kv_heads, si
   size_t int_workspace_size_in_bytes = 8 * 1024 * 1024;
   thrust::device_vector<char> int_buffer(int_workspace_size_in_bytes);
 
-  handler.Plan<DTypeQO, int32_t>((void*)thrust::raw_pointer_cast(float_buffer.data()),
-                                 float_workspace_size_in_bytes,
-                                 (void*)thrust::raw_pointer_cast(int_buffer.data()),
-                                 int_workspace_size_in_bytes, q_indptr.data(), kv_indptr.data(),
-                                 batch_size, num_qo_heads, num_kv_heads, head_dim, page_size);
+  handler.Plan<DTypeQO, int32_t>(
+      (void*)thrust::raw_pointer_cast(float_buffer.data()), float_workspace_size_in_bytes,
+      (void*)thrust::raw_pointer_cast(int_buffer.data()), int_workspace_size_in_bytes,
+      q_indptr.data(), kv_indptr.data(), /*total_num_rows=*/q_indptr.back(), max_seq_len,
+      batch_size, num_qo_heads, num_kv_heads, head_dim, page_size);
 
   auto status = BatchPrefillWithPagedKVCacheWrapper<DTypeQO, DTypeKV, DTypeQO, int32_t>(
       &handler, thrust::raw_pointer_cast(q_device.data()),
@@ -463,11 +465,11 @@ void _TestBatchPagedPrefillKernelQMinMaxKVMinMaxCorrectness(
   size_t int_workspace_size_in_bytes = 8 * 1024 * 1024;
   thrust::device_vector<char> int_buffer(int_workspace_size_in_bytes);
 
-  handler.Plan<DTypeQO, int32_t>((void*)thrust::raw_pointer_cast(float_buffer.data()),
-                                 float_workspace_size_in_bytes,
-                                 (void*)thrust::raw_pointer_cast(int_buffer.data()),
-                                 int_workspace_size_in_bytes, q_indptr.data(), kv_indptr.data(),
-                                 batch_size, num_qo_heads, num_kv_heads, head_dim, page_size);
+  handler.Plan<DTypeQO, int32_t>(
+      (void*)thrust::raw_pointer_cast(float_buffer.data()), float_workspace_size_in_bytes,
+      (void*)thrust::raw_pointer_cast(int_buffer.data()), int_workspace_size_in_bytes,
+      q_indptr.data(), kv_indptr.data(), /*total_num_rows=*/q_indptr.back(), q_len_max, batch_size,
+      num_qo_heads, num_kv_heads, head_dim, page_size);
 
   auto status = BatchPrefillWithPagedKVCacheWrapper<DTypeQO, DTypeKV, DTypeQO, int32_t>(
       &handler, thrust::raw_pointer_cast(q_device.data()),
@@ -568,7 +570,8 @@ void _TestBatchPagedPrefillKernelLongContextCorrectness(size_t num_kv_heads, siz
   handler.Plan<DTypeQO, int32_t>(
       (void*)thrust::raw_pointer_cast(float_buffer.data()), float_workspace_size_in_bytes,
       (void*)thrust::raw_pointer_cast(int_buffer.data()), int_workspace_size_in_bytes,
-      append_indptr.data(), kv_indptr.data(),
+      append_indptr.data(), kv_indptr.data(), /*total_num_rows=*/append_indptr.back(),
+      /*max_seq_len=*/append_indptr.back(),
       /*batch_size=*/1, num_qo_heads, num_kv_heads, head_dim, page_size);
 
   auto status = BatchPrefillWithPagedKVCacheWrapper<DTypeQO, DTypeKV, DTypeQO, int32_t>(

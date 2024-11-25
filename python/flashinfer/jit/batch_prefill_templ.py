@@ -139,6 +139,8 @@ std::vector<int64_t> BatchPrefillWithKVCachePlan(
     at::Tensor page_locked_int_workspace_buffer,
     at::Tensor qo_indptr,
     at::Tensor kv_indptr,
+    unsigned int total_num_rows,
+    unsigned int max_seq_len,
     unsigned int batch_size,
     unsigned int num_qo_heads,
     unsigned int num_kv_heads,
@@ -156,8 +158,9 @@ std::vector<int64_t> BatchPrefillWithKVCachePlan(
       float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
       int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
       int_workspace_size_in_bytes, plan_info, qo_indptr.data_ptr<{{dtype_idx}}>(),
-      kv_indptr.data_ptr<{{dtype_idx}}>(), batch_size, num_qo_heads, num_kv_heads, {{head_dim}},
-      page_size, enable_cuda_graph, sizeof({{dtype_o}}), stream);
+      kv_indptr.data_ptr<{{dtype_idx}}>(), total_num_rows, max_seq_len,
+      batch_size, num_qo_heads, num_kv_heads, {{head_dim}}, page_size,
+      enable_cuda_graph, sizeof({{dtype_o}}), stream);
 
   TORCH_CHECK(status == cudaSuccess,
               "Failed to plan prefill with error: ", cudaGetErrorString(status));
@@ -457,6 +460,8 @@ std::vector<int64_t> BatchPrefillWithKVCachePlan(
     at::Tensor page_locked_int_workspace_buffer,
     at::Tensor qo_indptr,
     at::Tensor kv_indptr,
+    unsigned int total_num_rows,
+    unsigned int max_seq_len,
     unsigned int batch_size,
     unsigned int num_qo_heads,
     unsigned int num_kv_heads,
