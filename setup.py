@@ -45,8 +45,11 @@ enable_fp8 = os.environ.get("FLASHINFER_ENABLE_FP8", "1") == "1"
 
 
 def get_version():
+    build_version = os.environ.get("FLASHINFER_BUILD_VERSION")
+    if build_version is not None:
+        return build_version
     package_version = (root / "version.txt").read_text().strip()
-    local_version = os.getenv("FLASHINFER_LOCAL_VERSION")
+    local_version = os.environ.get("FLASHINFER_LOCAL_VERSION")
     if local_version is None:
         return package_version
     return f"{package_version}+{local_version}"
