@@ -1490,6 +1490,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._custom_mask_buf = custom_mask_buf
         self._qk_indptr_buf = qk_indptr_buf
         self._max_total_num_rows = None
+        self._max_seq_len = None
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -1639,7 +1640,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
         qo_indptr_host = qo_indptr.to("cpu")
-        paged_kv_indptr_host = paged_kv_indptr.to("cpu")
+        kv_indptr_host = kv_indptr.to("cpu")
 
         total_num_rows = qo_indptr_host[-1]
         max_seq_len = torch.max(qo_indptr_host[1:] - qo_indptr_host[:-1]).item()
