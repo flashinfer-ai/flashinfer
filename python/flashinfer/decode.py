@@ -777,8 +777,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     qo_indptr_host,
                     indptr_host,
                     batch_size,  # total_num_rows
-                    batch_size,
                     1,  # max_seq_len
+                    batch_size,
                     num_qo_heads,
                     num_kv_heads,
                     page_size,
