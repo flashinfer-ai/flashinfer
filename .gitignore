@@ -5,23 +5,11 @@ python/dist
 # Compile commands json file
 compile_commands.json
 
-# Generated inst files
-src/dispatch.inc
-
-# Generated cu files
-src/generated/
+# Generated files
+docs/generated
 python/csrc/generated/
 python/flashinfer/_build_meta.py
 python/flashinfer/jit/aot_config.py
-python/csrc-aot/generated/
-
-# Package files
-python/flashinfer/data/
-python/flashinfer/version.txt
-python/MANIFEST.in
-
-# Generated documentation files
-docs/generated
 
 # DS_Store files
 .DS_store

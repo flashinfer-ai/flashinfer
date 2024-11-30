@@ -154,7 +154,7 @@ You can follow the steps below to install FlashInfer from source code:
            .. code-block:: bash
 
                cd flashinfer/python
-               TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a" python3 aot_setup.py bdist_wheel
+               TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a" FLASHINFER_ENABLE_AOT=1 python3 -m build --wheel
                pip install dist/flashinfer-*.whl
 
        .. tab:: Create sdist for JIT mode

@@ -37,10 +37,6 @@ from .core import clear_cache_dir, load_cuda_ops
 from .env import *
 from .utils import parallel_load_modules as parallel_load_modules
 
-try:
-    from .aot_config import prebuilt_ops_uri as prebuilt_ops_uri  # type: ignore[import]
+from .aot_config import prebuilt_ops_uri as prebuilt_ops_uri
 
-    has_prebuilt_ops = True
-except ImportError:
-    prebuilt_ops_uri = set()
-    has_prebuilt_ops = False
+has_prebuilt_ops = len(prebuilt_ops_uri) != 0
