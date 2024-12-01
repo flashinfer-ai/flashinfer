@@ -23,6 +23,10 @@ import torch
 
 from .batch_decode_mla_templ import batch_decode_mla_suffix, batch_decode_mla_templ
 from .batch_decode_templ import batch_decode_suffix, batch_decode_templ
+from .batch_prefill_sm90_templ import (
+    batch_prefill_sm90_suffix,
+    batch_prefill_sm90_templ,
+)
 from .batch_prefill_templ import batch_prefill_suffix, batch_prefill_templ
 from .core import load_cuda_ops
 from .env import FLASHINFER_GEN_SRC_DIR
@@ -30,6 +34,10 @@ from .single_decode_templ import (
     customizable_single_decode_templ,
     single_decode_suffix,
     single_decode_templ,
+)
+from .single_prefill_sm90_templ import (
+    single_prefill_sm90_suffix,
+    single_prefill_sm90_templ,
 )
 from .single_prefill_templ import (
     customizable_single_prefill_templ,
@@ -247,6 +255,35 @@ def get_single_prefill_sources(
     )
 
 
+def get_single_prefill_sm90_sources(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    head_dim: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+    use_fp16_qk_reduction: bool,
+) -> List[str]:
+    assert not use_fp16_qk_reduction, "fp16 qk reduction is not supported on sm90"
+    assert (
+        pos_encoding_mode == 0
+    ), "Currently we only support pos_encoding_mode=0 on sm90"
+    return render_templates(
+        single_prefill_sm90_templ,
+        {
+            "dtype_q": dtype_map[dtype_q],
+            "dtype_kv": dtype_map[dtype_kv],
+            "dtype_o": dtype_map[dtype_o],
+            "head_dim": head_dim,
+            "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
+            "use_sliding_window": "true" if use_sliding_window else "false",
+            "use_logits_soft_cap": "true" if use_logits_soft_cap else "false",
+            "use_fp16_qk_reduction": "true" if use_fp16_qk_reduction else "false",
+        },
+    )
+
+
 def get_single_prefill_uri(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
@@ -269,12 +306,29 @@ def get_single_prefill_uri(
     )
 
 
+def get_single_prefill_sm90_uri(*args):
+    return get_single_prefill_uri(*args) + "_sm90"
+
+
 def gen_single_prefill_module(*args):
     gen_directory = FLASHINFER_GEN_SRC_DIR
     uri = get_single_prefill_uri(*args)
     sources = get_single_prefill_sources(*args)
     source_paths = []
     for suffix, source in zip(single_prefill_suffix, sources):
+        path = gen_directory / f"{uri}{suffix}"
+        source_paths.append(path)
+        write_if_different(path, source)
+
+    return load_cuda_ops(uri, source_paths)
+
+
+def gen_single_prefill_sm90_module(*args):
+    gen_directory = FLASHINFER_GEN_SRC_DIR
+    uri = get_single_prefill_sm90_uri(*args)
+    sources = get_single_prefill_sm90_sources(*args)
+    source_paths = []
+    for suffix, source in zip(single_prefill_sm90_suffix, sources):
         path = gen_directory / f"{uri}{suffix}"
         source_paths.append(path)
         write_if_different(path, source)
@@ -295,6 +349,37 @@ def get_batch_prefill_sources(
 ) -> List[str]:
     return render_templates(
         batch_prefill_templ,
+        {
+            "dtype_q": dtype_map[dtype_q],
+            "dtype_kv": dtype_map[dtype_kv],
+            "dtype_o": dtype_map[dtype_o],
+            "dtype_idx": dtype_map[dtype_idx],
+            "head_dim": head_dim,
+            "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
+            "use_sliding_window": "true" if use_sliding_window else "false",
+            "use_logits_soft_cap": "true" if use_logits_soft_cap else "false",
+            "use_fp16_qk_reduction": "true" if use_fp16_qk_reduction else "false",
+        },
+    )
+
+
+def get_batch_prefill_sm90_sources(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+    use_fp16_qk_reduction: bool,
+) -> List[str]:
+    assert not use_fp16_qk_reduction, "fp16 qk reduction is not supported on sm90"
+    assert (
+        pos_encoding_mode == 0
+    ), "Currently we only support pos_encoding_mode=0 on sm90"
+    return render_templates(
+        batch_prefill_sm90_templ,
         {
             "dtype_q": dtype_map[dtype_q],
             "dtype_kv": dtype_map[dtype_kv],
@@ -333,12 +418,29 @@ def get_batch_prefill_uri(
     )
 
 
+def get_batch_prefill_sm90_uri(*args):
+    return get_batch_prefill_uri(*args) + "_sm90"
+
+
 def gen_batch_prefill_module(*args):
     gen_directory = FLASHINFER_GEN_SRC_DIR
     uri = get_batch_prefill_uri(*args)
     sources = get_batch_prefill_sources(*args)
     source_paths = []
     for suffix, source in zip(batch_prefill_suffix, sources):
+        path = gen_directory / f"{uri}{suffix}"
+        source_paths.append(path)
+        write_if_different(path, source)
+
+    return load_cuda_ops(uri, source_paths)
+
+
+def gen_batch_prefill_sm90_module(*args):
+    gen_directory = FLASHINFER_GEN_SRC_DIR
+    uri = get_batch_prefill_sm90_uri(*args)
+    sources = get_batch_prefill_sm90_sources(*args)
+    source_paths = []
+    for suffix, source in zip(batch_prefill_sm90_suffix, sources):
         path = gen_directory / f"{uri}{suffix}"
         source_paths.append(path)
         write_if_different(path, source)

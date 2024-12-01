@@ -59,13 +59,13 @@ using namespace flashinfer;
 #define DISPATCH_mask_mode(expr, const_expr, ...) \
   _DISPATCH_SWITCH("mask_mode", expr, _DISPATCH_CASES_mask_mode(const_expr, __VA_ARGS__))
 
-#define DISPATCH_LOGITS_SOFT_CAP(use_logits_soft_cap, USE_LOGITS_SOFT_CAP, ...) \
-  [&]() -> bool {                                                               \
-    if (use_logits_soft_cap) {                                                  \
-      constexpr bool USE_LOGITS_SOFT_CAP = true;                                \
-      return __VA_ARGS__();                                                     \
-    } else {                                                                    \
-      constexpr bool USE_LOGITS_SOFT_CAP = false;                               \
-      return __VA_ARGS__();                                                     \
-    }                                                                           \
+#define DISPATCH_BOOL(use_logits_soft_cap, USE_LOGITS_SOFT_CAP, ...) \
+  [&]() -> bool {                                                    \
+    if (use_logits_soft_cap) {                                       \
+      constexpr bool USE_LOGITS_SOFT_CAP = true;                     \
+      return __VA_ARGS__();                                          \
+    } else {                                                         \
+      constexpr bool USE_LOGITS_SOFT_CAP = false;                    \
+      return __VA_ARGS__();                                          \
+    }                                                                \
   }()

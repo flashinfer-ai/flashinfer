@@ -22,13 +22,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <sstream>
-#include <stdexcept>
 #include <vector>
 
 #include "../allocator.h"
 #include "../exception.h"
 #include "../pos_enc.cuh"
 #include "../utils.cuh"
+#include "heap.h"
 
 namespace flashinfer {
 
@@ -717,6 +717,197 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
   FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,
                                        cudaMemcpyHostToDevice, stream));
 
+  return cudaSuccess;
+}
+
+inline float cost_function(int qo_len, int kv_len, int group_size) {
+  return 2 * float(qo_len) * float(group_size) + kv_len;
+}
+
+template <typename T>
+std::vector<T> flatten(const std::vector<std::vector<T>>& vec, int size_after_flatten) {
+  std::vector<T> result;
+  result.reserve(size_after_flatten);
+  for (const auto& inner_vec : vec) {
+    result.insert(result.end(), inner_vec.begin(), inner_vec.end());
+  }
+  return std::move(result);
+}
+
+struct PrefillPlanSM90Info {
+  int64_t qo_tile_indices_offset;
+  int64_t qo_indptr_offset;
+  int64_t kv_indptr_offset;
+  int64_t qo_len_offset;
+  int64_t kv_len_offset;
+  int64_t head_indices_offset;
+  int64_t work_indptr_offset;
+
+  PrefillPlanSM90Info()
+      : qo_tile_indices_offset(0),
+        qo_indptr_offset(0),
+        kv_indptr_offset(0),
+        qo_len_offset(0),
+        kv_len_offset(0),
+        head_indices_offset(0),
+        work_indptr_offset(0) {}
+
+  // convert PrefillPlanSM90Info to std::vector<int64_t>
+  std::vector<int64_t> ToVector() const {
+    return {qo_tile_indices_offset, qo_indptr_offset,    kv_indptr_offset,  qo_len_offset,
+            kv_len_offset,          head_indices_offset, work_indptr_offset};
+  }
+
+  // From std::vector<int64_t> to PrefillPlanSM90Info
+  void FromVector(const std::vector<int64_t>& vec) {
+    if (vec.size() != 7) {
+      std::ostringstream err_msg;
+      err_msg << "PrefillPlanSM90Info::FromVector: vec.size() should be 8, but got " << vec.size();
+      FLASHINFER_ERROR(err_msg.str());
+    }
+    qo_tile_indices_offset = vec[0];
+    qo_indptr_offset = vec[1];
+    kv_indptr_offset = vec[2];
+    qo_len_offset = vec[3];
+    kv_len_offset = vec[4];
+    head_indices_offset = vec[5];
+    work_indptr_offset = vec[6];
+  }
+};
+
+template <typename IdType>
+cudaError_t PrefillSM90Plan(void* float_buffer, size_t float_workspace_size_in_bytes,
+                            void* int_buffer, void* page_locked_int_buffer,
+                            size_t int_workspace_size_in_bytes, PrefillPlanSM90Info& plan_info,
+                            IdType* qo_indptr_h, IdType* kv_indptr_h, IdType* kv_len_arr_h,
+                            uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
+                            uint32_t head_dim, uint32_t page_size, bool causal,
+                            bool enable_cuda_graph, uint32_t sizeof_dtype_o, cudaStream_t stream) {
+  if (num_qo_heads % num_kv_heads != 0) {
+    std::ostringstream err_msg;
+    err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
+            << num_kv_heads;
+    FLASHINFER_ERROR(err_msg.str());
+  }
+
+  std::vector<std::tuple<int, int, int>> idx_qo_kv_len_vec;
+  for (uint32_t i = 0; i < batch_size; ++i) {
+    int qo_len = qo_indptr_h[i + 1] - qo_indptr_h[i];
+    int kv_len = kv_len_arr_h[i];
+    if (kv_len < 0) {
+      std::ostringstream err_msg;
+      err_msg << "kv_len[" << i << "]" << kv_len << " should be non-negative";
+      FLASHINFER_ERROR(err_msg.str());
+    }
+    if (qo_len < 0) {
+      std::ostringstream err_msg;
+      err_msg << "qo_indptr[" << i + 1 << "]" << qo_indptr_h[i + 1] << " - qo_indptr[" << i << "]"
+              << qo_indptr_h[i] << " should be non-negative";
+      FLASHINFER_ERROR(err_msg.str());
+    }
+    idx_qo_kv_len_vec.push_back({i, qo_len, kv_len});
+  }
+
+  std::sort(idx_qo_kv_len_vec.begin(), idx_qo_kv_len_vec.end(),
+            [](const auto& a, const auto& b) { return std::get<2>(a) > std::get<2>(b); });
+  int cta_tile_q = 128;
+  if (head_dim == 64) {
+    cta_tile_q = 192;
+  }
+
+  const int num_sm90_ctas = 132;  // for sm90, the num_ctas is fixed
+
+  CTACostHeap cta_cost_heap(num_sm90_ctas);
+  std::vector<std::vector<IdType>> cta_qo_tile_indices(num_sm90_ctas, std::vector<IdType>()),
+      cta_qo_indptr(num_sm90_ctas, std::vector<IdType>()),
+      cta_kv_indptr(num_sm90_ctas, std::vector<IdType>()),
+      cta_qo_len(num_sm90_ctas, std::vector<IdType>()),
+      cta_kv_len(num_sm90_ctas, std::vector<IdType>()),
+      cta_head_indices(num_sm90_ctas, std::vector<IdType>());
+
+  for (int qo_head_idx = 0; qo_head_idx < num_qo_heads; ++qo_head_idx) {
+    for (auto& [i, qo_len, kv_len] : idx_qo_kv_len_vec) {
+      int num_qo_tiles = ceil_div(qo_len, cta_tile_q);
+      for (int qo_tile_idx = num_qo_tiles - 1; qo_tile_idx >= 0; --qo_tile_idx) {
+        auto [cta_idx, accum_cost] = cta_cost_heap.pop();
+        // NOTE(Zihao): our current FA3 implementation do not fuse query and group heads
+        // so the group_size in cost_function is always 1
+        cta_cost_heap.insert(
+            {cta_idx,
+             accum_cost + cost_function(cta_tile_q,
+                                        causal
+                                            ? kv_len - (num_qo_tiles - qo_tile_idx - 1) * cta_tile_q
+                                            : kv_len,
+                                        /*group_size=*/1)});
+        cta_qo_tile_indices[cta_idx].push_back(qo_tile_idx);
+        cta_qo_indptr[cta_idx].push_back(qo_indptr_h[i]);
+        cta_qo_len[cta_idx].push_back(qo_len);
+        cta_kv_indptr[cta_idx].push_back(kv_indptr_h[i]);
+        cta_kv_len[cta_idx].push_back(kv_len);
+        cta_head_indices[cta_idx].push_back(qo_head_idx);
+      }
+    }
+  }
+
+  std::vector<IdType> work_indptr_vec(num_sm90_ctas + 1, 0);
+  for (uint32_t i = 0; i < num_sm90_ctas; ++i) {
+    work_indptr_vec[i + 1] = work_indptr_vec[i] + cta_qo_tile_indices[i].size();
+  }
+  IdType total_num_works = work_indptr_vec[num_sm90_ctas];
+  auto qo_tile_indices_vec = flatten(cta_qo_tile_indices, total_num_works);
+  auto qo_indptr_vec = flatten(cta_qo_indptr, total_num_works);
+  auto kv_indptr_vec = flatten(cta_kv_indptr, total_num_works);
+  auto qo_len_vec = flatten(cta_qo_len, total_num_works);
+  auto kv_len_vec = flatten(cta_kv_len, total_num_works);
+  auto head_indices_vec = flatten(cta_head_indices, total_num_works);
+
+  AlignedAllocator int_allocator(int_buffer, int_workspace_size_in_bytes);
+  const int max_total_num_works = 1048576;
+  if (total_num_works > max_total_num_works) {
+    std::ostringstream err_msg;
+    err_msg << "total_num_works " << total_num_works << " should be less than "
+            << max_total_num_works;
+    FLASHINFER_ERROR(err_msg.str());
+  }
+  plan_info.qo_tile_indices_offset = int_allocator.aligned_alloc_offset(
+      sizeof(IdType) * max_total_num_works, 16, "batch_prefill_sm90_qo_tile_indices");
+  plan_info.qo_indptr_offset = int_allocator.aligned_alloc_offset(
+      sizeof(IdType) * max_total_num_works, 16, "batch_prefill_sm90_qo_offset");
+  plan_info.kv_indptr_offset = int_allocator.aligned_alloc_offset(
+      sizeof(IdType) * max_total_num_works, 16, "batch_prefill_sm90_kv_offset");
+  plan_info.qo_len_offset = int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works,
+                                                               16, "batch_prefill_sm90_qo_len");
+  plan_info.kv_len_offset = int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works,
+                                                               16, "batch_prefill_sm90_kv_len");
+  plan_info.head_indices_offset = int_allocator.aligned_alloc_offset(
+      sizeof(IdType) * max_total_num_works, 16, "batch_prefill_sm90_head_indices");
+  plan_info.work_indptr_offset = int_allocator.aligned_alloc_offset(
+      sizeof(IdType) * (num_sm90_ctas + 1), 16, "batch_prefill_sm90_work_indptr");
+
+  IdType* qo_tile_indices_h =
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.qo_tile_indices_offset);
+  IdType* qo_offset_h =
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.qo_indptr_offset);
+  IdType* kv_offset_h =
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_indptr_offset);
+  IdType* qo_len_h = GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.qo_len_offset);
+  IdType* kv_len_h = GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.kv_len_offset);
+  IdType* head_indices_h =
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.head_indices_offset);
+  IdType* work_indptr_h =
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.work_indptr_offset);
+
+  std::copy(qo_tile_indices_vec.begin(), qo_tile_indices_vec.end(), qo_tile_indices_h);
+  std::copy(qo_indptr_vec.begin(), qo_indptr_vec.end(), qo_offset_h);
+  std::copy(kv_indptr_vec.begin(), kv_indptr_vec.end(), kv_offset_h);
+  std::copy(qo_len_vec.begin(), qo_len_vec.end(), qo_len_h);
+  std::copy(kv_len_vec.begin(), kv_len_vec.end(), kv_len_h);
+  std::copy(head_indices_vec.begin(), head_indices_vec.end(), head_indices_h);
+  std::copy(work_indptr_vec.begin(), work_indptr_vec.end(), work_indptr_h);
+
+  size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
+  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,
+                                       cudaMemcpyHostToDevice, stream));
   return cudaSuccess;
 }
 

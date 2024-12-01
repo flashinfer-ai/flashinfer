@@ -115,7 +115,7 @@ void BatchPrefillWithRaggedKVCacheRun(
     using DTypeO = DTypeQ;
     return DISPATCH_mask_mode(mask_mode, MASK_MODE, [&] {
       return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-        return DISPATCH_LOGITS_SOFT_CAP(use_logits_soft_cap, USE_LOGITS_SOFT_CAP, [&] {
+        return DISPATCH_BOOL(use_logits_soft_cap, USE_LOGITS_SOFT_CAP, [&] {
           using RaggedParamsT = BatchPrefillRaggedParams<DTypeQ, DTypeKV, DTypeO, IdType>;
           using RaggedAttentionVariant =
               ComposedAttention<RaggedParamsT,
@@ -246,7 +246,7 @@ void BatchPrefillWithPagedKVCacheRun(
     using DTypeO = DTypeQ;
     return DISPATCH_mask_mode(mask_mode, MASK_MODE, [&] {
       return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-        return DISPATCH_LOGITS_SOFT_CAP(use_logits_soft_cap, USE_LOGITS_SOFT_CAP, [&] {
+        return DISPATCH_BOOL(use_logits_soft_cap, USE_LOGITS_SOFT_CAP, [&] {
           paged_kv_t<DTypeKV, IdType> paged_kv(
               num_kv_heads, page_size, HEAD_DIM, batch_size, kv_layout,
               static_cast<DTypeKV*>(paged_k_cache.data_ptr()),

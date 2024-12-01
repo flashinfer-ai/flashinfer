@@ -56,7 +56,7 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
     using DTypeKV = kv_type;
     using DTypeO = DTypeQ;
     return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-      return DISPATCH_LOGITS_SOFT_CAP(use_logits_soft_cap, USE_LOGITS_SOFT_CAP, [&] {
+      return DISPATCH_BOOL(use_logits_soft_cap, USE_LOGITS_SOFT_CAP, [&] {
         using ParamsT = BatchDecodeParams<DTypeQ, DTypeKV, DTypeO, IdType>;
         using AttentionVariant =
             ComposedAttention<ParamsT, get_variant_code(/*use_custom_mask=*/false,
@@ -144,7 +144,7 @@ void BatchDecodeWithPagedKVCacheRun(
     using DTypeKV = kv_type;
     using DTypeO = DTypeQ;
     return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-      return DISPATCH_LOGITS_SOFT_CAP(logits_soft_cap > 0, USE_LOGITS_SOFT_CAP, [&] {
+      return DISPATCH_BOOL(logits_soft_cap > 0, USE_LOGITS_SOFT_CAP, [&] {
         using ParamsT = BatchDecodeParams<DTypeQ, DTypeKV, DTypeO, IdType>;
         using AttentionVariant =
             ComposedAttention<ParamsT, get_variant_code(/*use_custom_mask=*/false,

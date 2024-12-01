@@ -30,7 +30,7 @@ void CutlassSegmentGEMMSM90(at::Tensor float_workspace_buffer, at::Tensor int_wo
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(empty_x_data.scalar_type(), c_type, [&] {
-    using cutlass_t = typename cutlass_dtype<c_type>::value;
+    using cutlass_t = cutlass_dtype_t<c_type>;
     auto status = CutlassSegmentGEMMSM90Run<cutlass_t, cutlass_t>(
         float_workspace_buffer.data_ptr(),
         float_workspace_buffer.element_size() * float_workspace_buffer.size(0),
