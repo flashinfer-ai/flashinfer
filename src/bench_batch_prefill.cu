@@ -76,8 +76,8 @@ void bench_flashinfer_batch_prefill_with_ragged_kv(nvbench::state& state) {
   handler.Plan<dtype_out>(
       thrust::raw_pointer_cast(float_workspace.data()), float_workspace_size_in_bytes,
       thrust::raw_pointer_cast(int_workspace.data()), int_workspace_size_in_bytes,
-      qo_indptr_h.data(), kv_indptr_h.data(), /*total_num_rows=*/batch_size * qo_len,
-      /*max_seq_len=*/qo_len, batch_size, num_qo_heads, num_kv_heads, head_dim,
+      qo_indptr_h.data(), kv_indptr_h.data(), /*total_num_rows=*/batch_size * qo_len, batch_size,
+      num_qo_heads, num_kv_heads, head_dim,
       /*page_size=*/1);
 
   state.exec(nvbench::exec_tag::timer, [&](nvbench::launch& launch, auto& timer) {

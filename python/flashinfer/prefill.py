@@ -834,7 +834,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._custom_mask_buf = custom_mask_buf
         self._qk_indptr_buf = qk_indptr_buf
         self._max_total_num_rows = None
-        self._max_seq_len = None
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -1000,7 +999,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
         paged_kv_indptr_host = paged_kv_indptr.to("cpu")
 
         total_num_rows = qo_indptr_host[-1]
-        max_seq_len = torch.max(qo_indptr_host[1:] - qo_indptr_host[:-1]).item()
 
         if self.is_cuda_graph_enabled:
             if self._max_total_num_rows is None:
@@ -1010,15 +1008,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "The total number of rows in qo_indptr {} in cuda graph mode cannot "
                     "exceed the number of rows set during initialization {}.".format(
                         total_num_rows, self._max_total_num_rows
-                    )
-                )
-            if self._max_seq_len is None:
-                self._max_seq_len = max_seq_len
-            elif max_seq_len > self._max_seq_len:
-                raise ValueError(
-                    "The maximum sequence length in qo_indptr {} in cuda graph mode cannot "
-                    "exceed the sequence length set during initialization {}.".format(
-                        max_seq_len, self._max_seq_len
                     )
                 )
 
@@ -1097,8 +1086,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._pin_memory_int_workspace_buffer,
                 qo_indptr_host,
                 paged_kv_indptr_host,
-                total_num_rows,
-                max_seq_len,
+                self._max_total_num_rows or total_num_rows,
                 batch_size,
                 num_qo_heads,
                 num_kv_heads,
@@ -1490,7 +1478,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._custom_mask_buf = custom_mask_buf
         self._qk_indptr_buf = qk_indptr_buf
         self._max_total_num_rows = None
-        self._max_seq_len = None
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -1643,7 +1630,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         kv_indptr_host = kv_indptr.to("cpu")
 
         total_num_rows = qo_indptr_host[-1]
-        max_seq_len = torch.max(qo_indptr_host[1:] - qo_indptr_host[:-1]).item()
 
         if self.is_cuda_graph_enabled:
             if self._max_total_num_rows is None:
@@ -1653,15 +1639,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     "The total number of rows in qo_indptr {} in cuda graph mode cannot "
                     "exceed the number of rows set during initialization {}.".format(
                         total_num_rows, self._max_total_num_rows
-                    )
-                )
-            if self._max_seq_len is None:
-                self._max_seq_len = max_seq_len
-            elif max_seq_len > self._max_seq_len:
-                raise ValueError(
-                    "The maximum sequence length in qo_indptr {} in cuda graph mode cannot "
-                    "exceed the sequence length set during initialization {}.".format(
-                        max_seq_len, self._max_seq_len
                     )
                 )
 
@@ -1712,8 +1689,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._pin_memory_int_workspace_buffer,
                 qo_indptr_host,
                 kv_indptr_host,
-                total_num_rows,
-                max_seq_len,
+                self._max_total_num_rows or total_num_rows,
                 batch_size,
                 num_qo_heads,
                 num_kv_heads,

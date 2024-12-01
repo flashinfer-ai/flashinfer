@@ -147,8 +147,8 @@ void bench_flashinfer_batch_decode_with_prefill(nvbench::state& state) {
   handler.Plan<T, int32_t>(
       (void*)thrust::raw_pointer_cast(float_buffer.data()), float_workspace_size_in_bytes,
       (void*)thrust::raw_pointer_cast(int_buffer.data()), int_workspace_size_in_bytes,
-      qo_indptr_h.data(), kv_indptr_host.data(), /*total_num_rows=*/batch_size, /*max_seq_len=*/1,
-      batch_size, num_qo_heads, num_kv_heads, head_dim, page_size);
+      qo_indptr_h.data(), kv_indptr_host.data(), /*total_num_rows=*/batch_size, batch_size,
+      num_qo_heads, num_kv_heads, head_dim, page_size);
 
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch&) {
     cudaError_t status = BatchPrefillWithPagedKVCacheWrapper<T, TKV, T, int32_t>(
