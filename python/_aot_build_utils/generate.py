@@ -2,7 +2,7 @@ import argparse
 import sys
 from pathlib import Path
 from itertools import product
-from typing import List, Tuple
+from typing import List
 
 if __package__:
     from . import generate_batch_paged_decode_inst
