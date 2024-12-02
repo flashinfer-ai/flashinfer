@@ -165,7 +165,7 @@ You can follow the steps below to install FlashInfer from source code:
            .. code-block:: bash
 
                cd flashinfer/python
-               python -m build --sdist
+               python -m build --no-isolation --sdist
                ls -la dist/
 
        .. tab:: Create wheel for JIT mode
