@@ -147,22 +147,41 @@ You can follow the steps below to install FlashInfer from source code:
            .. code-block:: bash
 
                cd flashinfer/python
-               pip install -e . -v
+               pip install --no-build-isolation --verbose --editable .
 
        .. tab:: AOT mode
 
            .. code-block:: bash
 
                cd flashinfer/python
-               TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a" FLASHINFER_ENABLE_AOT=1 python3 -m build --wheel
-               pip install dist/flashinfer-*.whl
+               TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a" FLASHINFER_ENABLE_AOT=1 pip install --no-build-isolation --verbose --editable .
 
-       .. tab:: Create sdist for JIT mode
+5. Create FlashInfer distributions
+
+   .. tabs::
+
+       .. tab:: Create sdist
 
            .. code-block:: bash
 
                cd flashinfer/python
                python -m build --sdist
+               ls -la dist/
+
+       .. tab:: Create wheel for JIT mode
+
+           .. code-block:: bash
+
+               cd flashinfer/python
+               python3 -m build --no-isolation --wheel
+               ls -la dist/
+
+       .. tab:: Create wheel for AOT mode
+
+           .. code-block:: bash
+
+               cd flashinfer/python
+               TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a" FLASHINFER_ENABLE_AOT=1 python3 -m build --no-isolation --wheel
                ls -la dist/
 
 C++ API

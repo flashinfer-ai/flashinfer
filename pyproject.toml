@@ -18,12 +18,14 @@ description = "FlashInfer: Kernel Library for LLM Serving"
 requires-python = ">=3.8,<4.0"
 authors = [{ name = "FlashInfer team" }]
 license = { text = "Apache License 2.0" }
+readme = "README.md"
 urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
-dynamic = ["version"]
+dynamic = ["dependencies", "version"]
 
 [build-system]
-build-backend = "setuptools.build_meta"
 requires = ["setuptools"]
+build-backend = "custom_backend"
+backend-path = ["."]
 
 [tool.setuptools]
 packages = [
@@ -39,18 +41,16 @@ packages = [
 include-package-data = false
 
 [tool.setuptools.package-dir]
-"flashinfer.data" = ".."
-"flashinfer.data.csrc" = "csrc"
-"flashinfer.data.cutlass" = "../3rdparty/cutlass"
+"flashinfer" = "python/flashinfer"
+"flashinfer.data" = "."
+"flashinfer.data.csrc" = "python/csrc"
+"flashinfer.data.cutlass" = "3rdparty/cutlass"
 
 [tool.setuptools.package-data]
-"flashinfer.data" = ["version.txt"]
+"flashinfer.data" = ["custom_backend.py", "version.txt"]
 "flashinfer.data.csrc" = ["**"]
 "flashinfer.data.cutlass" = ["include/**", "tools/util/include/**"]
 "flashinfer.data.include" = ["**"]
-
-[tool.setuptools.exclude-package-data]
-"flashinfer.data.csrc" = ["generated/**"]
 
 [tool.mypy]
 ignore_missing_imports = false
