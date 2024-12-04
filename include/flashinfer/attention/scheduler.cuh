@@ -483,7 +483,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
     // number of rows and the batch size.  The sum of qo lengths rounded
     // up to cta_tile_q will not exceed this number derived from the total
     // number of rows.
-    total_num_tiles_q = ceil_div(total_num_rows, cta_tile_q) + batch_size;
+    total_num_tiles_q = ceil_div(total_num_rows, cta_tile_q) + batch_size - 1;
   } else {
     int64_t sum_packed_qo_len = 0;
     for (uint32_t i = 0; i < batch_size; ++i) {
