@@ -21,10 +21,8 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
 
 import setuptools
-import setuptools.command.sdist as setuptools_sdist
 
 root = Path(__file__).parent.resolve()
 
@@ -57,56 +55,52 @@ def get_version():
     return f"{package_version}+{local_version}"
 
 
-def generate_build_meta(aot_build_meta: Dict) -> None:
+def generate_build_meta(aot_build_meta: dict) -> None:
     build_meta_str = f"__version__ = {get_version()!r}\n"
     if len(aot_build_meta) != 0:
         build_meta_str += f"build_meta = {aot_build_meta!r}\n"
     (root / "flashinfer" / "_build_meta.py").write_text(build_meta_str)
 
 
-def generate_aot_config(aot_kernel_uris: List[str]) -> None:
+def generate_cuda() -> None:
+    try:  # no aot_build_utils in sdist
+        from aot_build_utils.generate import get_instantiation_cu
+    except ImportError:
+        return
+
+    aot_kernel_uris = get_instantiation_cu(
+        argparse.Namespace(
+            path=gen_dir,
+            head_dims=head_dims,
+            pos_encoding_modes=pos_encoding_modes,
+            allow_fp16_qk_reductions=allow_fp16_qk_reductions,
+            mask_modes=mask_modes,
+            enable_bf16=enable_bf16,
+            enable_fp8=enable_fp8,
+        )
+    )
     aot_config_str = f"""prebuilt_ops_uri = set({aot_kernel_uris})"""
     (root / "flashinfer" / "jit" / "aot_config.py").write_text(aot_config_str)
 
 
-class GenerateCuda(setuptools_sdist.sdist):
-    def run(self) -> None:
-        from aot_build_utils.generate import get_instantiation_cu
-
-        aot_kernel_uris = get_instantiation_cu(
-            argparse.Namespace(
-                path=gen_dir,
-                head_dims=head_dims,
-                pos_encoding_modes=pos_encoding_modes,
-                allow_fp16_qk_reductions=allow_fp16_qk_reductions,
-                mask_modes=mask_modes,
-                enable_bf16=enable_bf16,
-                enable_fp8=enable_fp8,
-            )
-        )
-        generate_aot_config(aot_kernel_uris)
-        super().run()
-
-
 ext_modules = []
-cmdclass = {"sdist": GenerateCuda}
+cmdclass = {}
 install_requires = ["torch"]
 generate_build_meta({})
-generate_aot_config([])
+generate_cuda()
 
 if enable_aot:
-    import packaging.version
     import torch
     import torch.utils.cpp_extension as torch_cpp_ext
+    from packaging.version import Version
 
-    def get_cuda_version() -> Tuple[int, int]:
+    def get_cuda_version() -> Version:
         if torch_cpp_ext.CUDA_HOME is None:
             nvcc = "nvcc"
         else:
             nvcc = os.path.join(torch_cpp_ext.CUDA_HOME, "bin/nvcc")
         txt = subprocess.check_output([nvcc, "--version"], text=True)
-        major, minor = map(int, re.findall(r"release (\d+)\.(\d+),", txt)[0])
-        return major, minor
+        return Version(re.findall(r"release (\d+\.\d+),", txt)[0])
 
     class NinjaBuildExtension(torch_cpp_ext.BuildExtension):
         def __init__(self, *args, **kwargs) -> None:
@@ -123,12 +117,14 @@ if enable_aot:
         if arch < 75:
             raise RuntimeError("FlashInfer requires sm75+")
 
-    torch_version = packaging.version.Version(torch.__version__).base_version
+    cuda_version = get_cuda_version()
+    torch_version = Version(torch.__version__).base_version
     cmdclass["build_ext"] = NinjaBuildExtension
     install_requires = [f"torch == {torch_version}"]
 
     aot_build_meta = {}
-    aot_build_meta["cuda_major"], aot_build_meta["cuda_minor"] = get_cuda_version()
+    aot_build_meta["cuda_major"] = cuda_version.major
+    aot_build_meta["cuda_minor"] = cuda_version.minor
     aot_build_meta["torch"] = torch_version
     aot_build_meta["python"] = platform.python_version()
     aot_build_meta["TORCH_CUDA_ARCH_LIST"] = os.environ.get("TORCH_CUDA_ARCH_LIST")
@@ -191,16 +187,12 @@ if enable_aot:
         "csrc/flashinfer_gemm_sm90_ops.cu",
     ]
     # Change to relative path
-    files_prefill = [
-        (Path(p).relative_to(root)) for p in gen_dir.glob("*prefill_head*.cu")
-    ]
-    files_decode = [
-        (Path(p).relative_to(root)) for p in gen_dir.glob("*decode_head*.cu")
-    ]
+    prefills = list(gen_dir.glob("*prefill_head*.cu"))
+    decodes = list(gen_dir.glob("*decode_head*.cu"))
     ext_modules = [
         torch_cpp_ext.CUDAExtension(
             name="flashinfer._kernels",
-            sources=kernel_sources + files_decode + files_prefill,
+            sources=kernel_sources + decodes + prefills,
             include_dirs=include_dirs,
             extra_compile_args={
                 "cxx": cxx_flags,

@@ -39,4 +39,9 @@ from .utils import parallel_load_modules as parallel_load_modules
 
 from .aot_config import prebuilt_ops_uri as prebuilt_ops_uri
 
-has_prebuilt_ops = len(prebuilt_ops_uri) != 0
+try:
+    from .. import _kernels
+    from .. import _kernels_sm90
+    has_prebuilt_ops = True
+except ImportError:
+    has_prebuilt_ops = False
