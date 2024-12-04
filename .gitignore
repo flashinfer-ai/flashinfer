@@ -7,9 +7,9 @@ compile_commands.json
 
 # Generated files
 docs/generated
-python/csrc/generated/
-python/flashinfer/_build_meta.py
-python/flashinfer/jit/aot_config.py
+csrc/generated/
+flashinfer/_build_meta.py
+flashinfer/jit/aot_config.py
 src/generated/
 
 # DS_Store files

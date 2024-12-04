@@ -41,16 +41,19 @@ packages = [
 include-package-data = false
 
 [tool.setuptools.package-dir]
-"flashinfer" = "python/flashinfer"
 "flashinfer.data" = "."
-"flashinfer.data.csrc" = "python/csrc"
 "flashinfer.data.cutlass" = "3rdparty/cutlass"
 
 [tool.setuptools.package-data]
-"flashinfer.data" = ["custom_backend.py", "version.txt"]
-"flashinfer.data.csrc" = ["**"]
-"flashinfer.data.cutlass" = ["include/**", "tools/util/include/**"]
-"flashinfer.data.include" = ["**"]
+"flashinfer.data" = [
+    "csrc/**",
+    "include/**",
+    "version.txt"
+]
+"flashinfer.data.cutlass" = [
+    "include/**",
+    "tools/util/include/**"
+]
 
 [tool.mypy]
 ignore_missing_imports = false

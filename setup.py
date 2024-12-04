@@ -30,8 +30,7 @@ root = Path(__file__).parent.resolve()
 
 sys.path.append(str(root))
 
-py_dir = root / "python"
-gen_dir = py_dir / "csrc" / "generated"
+gen_dir = root / "csrc" / "generated"
 
 head_dims = os.environ.get("FLASHINFER_HEAD_DIMS", "64,128,256").split(",")
 pos_encoding_modes = os.environ.get("FLASHINFER_POS_ENCODING_MODES", "0").split(",")
@@ -62,21 +61,21 @@ def generate_build_meta(aot_build_meta: Dict) -> None:
     build_meta_str = f"__version__ = {get_version()!r}\n"
     if len(aot_build_meta) != 0:
         build_meta_str += f"build_meta = {aot_build_meta!r}\n"
-    (py_dir / "flashinfer" / "_build_meta.py").write_text(build_meta_str)
+    (root / "flashinfer" / "_build_meta.py").write_text(build_meta_str)
 
 
 def generate_aot_config(aot_kernel_uris: List[str]) -> None:
     aot_config_str = f"""prebuilt_ops_uri = set({aot_kernel_uris})"""
-    (py_dir / "flashinfer" / "jit" / "aot_config.py").write_text(aot_config_str)
+    (root / "flashinfer" / "jit" / "aot_config.py").write_text(aot_config_str)
 
 
 class GenerateCuda(setuptools_sdist.sdist):
     def run(self) -> None:
-        from python._aot_build_utils.generate import get_instantiation_cu
+        from aot_build_utils.generate import get_instantiation_cu
 
         aot_kernel_uris = get_instantiation_cu(
             argparse.Namespace(
-                path=py_dir / "csrc" / "generated",
+                path=gen_dir,
                 head_dims=head_dims,
                 pos_encoding_modes=pos_encoding_modes,
                 allow_fp16_qk_reductions=allow_fp16_qk_reductions,
@@ -153,9 +152,9 @@ if enable_aot:
 
     cutlass = root / "3rdparty" / "cutlass"
     include_dirs = [
-        str(root.resolve() / "include"),
-        str(cutlass.resolve() / "include"),  # for group gemm
-        str(cutlass.resolve() / "tools" / "util" / "include"),
+        root.resolve() / "include",
+        cutlass.resolve() / "include",  # for group gemm
+        cutlass.resolve() / "tools" / "util" / "include",
     ]
     cxx_flags = [
         "-O3",
@@ -192,10 +191,6 @@ if enable_aot:
         "csrc/flashinfer_gemm_sm90_ops.cu",
     ]
     # Change to relative path
-    kernel_sources = [(Path(py_dir) / p).relative_to(root) for p in kernel_sources]
-    kernel_sm90_sources = [
-        (Path(py_dir) / p).relative_to(root) for p in kernel_sm90_sources
-    ]
     files_prefill = [
         (Path(p).relative_to(root)) for p in gen_dir.glob("*prefill_head*.cu")
     ]
