@@ -207,7 +207,7 @@ cudaError_t FusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batch_siz
   const uint32_t num_warps = ceil_div(block_size, 32);
   dim3 nblks(batch_size);
   dim3 nthrs(32, num_warps);
-  const uint32_t smem_size = (num_warps + d) * sizeof(float);
+  const uint32_t smem_size = (ceil_div(num_warps, 4) * 4 + d) * sizeof(float);
   float weight_bias = 0.f;
   void* args[] = {&input, &residual, &weight, &d, &weight_bias, &eps};
 
