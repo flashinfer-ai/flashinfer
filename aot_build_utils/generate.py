@@ -30,7 +30,7 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
     path: Path = args.path
     head_dims: List[int] = args.head_dims
     pos_encoding_modes: List[int] = args.pos_encoding_modes
-    allow_fp16_qk_reductions: bool = args.allow_fp16_qk_reductions
+    allow_fp16_qk_reductions: List[int] = args.allow_fp16_qk_reductions
     mask_modes: List[int] = args.mask_modes
     enable_bf16: bool = args.enable_bf16
     enable_fp8: bool = args.enable_fp8
@@ -256,7 +256,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--allow_fp16_qk_reductions",
-        type=lambda x: x if isinstance(x, int) else x.lower() == "true",
+        type=lambda x: x if isinstance(x, int) else int(x.lower() == "true"),
         required=True,
         nargs="+",
         help="Allow fp16 qk reductions",
@@ -283,5 +283,4 @@ if __name__ == "__main__":
         help="Enable fp8",
     )
     args = parser.parse_args()
-    print(args)
     get_instantiation_cu(args)

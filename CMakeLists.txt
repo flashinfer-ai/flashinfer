@@ -112,21 +112,6 @@ set(HEAD_DIMS ${FLASHINFER_GEN_HEAD_DIMS})
 set(POS_ENCODING_MODES ${FLASHINFER_GEN_POS_ENCODING_MODES})
 set(ALLOW_FP16_QK_REDUCTIONS ${FLASHINFER_GEN_ALLOW_FP16_QK_REDUCTIONS})
 set(MASK_MODES ${FLASHINFER_GEN_MASK_MODES})
-set(DECODE_DTYPES "f16")
-set(PREFILL_DTYPES "f16")
-set(DECODE_FP8_DTYPES)
-set(IDTYPES "i32")
-
-if(FLASHINFER_ENABLE_FP8)
-  list(APPEND DECODE_DTYPES "e4m3" "e5m2")
-  list(APPEND DECODE_FP8_DTYPES "e4m3" "e5m2")
-  list(APPEND PREFILL_FP8_DTYPES "e4m3" "e5m2")
-endif(FLASHINFER_ENABLE_FP8)
-
-if(FLASHINFER_ENABLE_BF16)
-  list(APPEND DECODE_DTYPES "bf16")
-  list(APPEND PREFILL_DTYPES "bf16")
-endif(FLASHINFER_ENABLE_BF16)
 
 # log options
 message(STATUS "FLASHINFER_HEAD_DIMS=${HEAD_DIMS}")
@@ -137,255 +122,51 @@ message(STATUS "FLASHINFER_MASK_MODES=${MASK_MODES}")
 
 file(MAKE_DIRECTORY ${PROJECT_SOURCE_DIR}/src/generated)
 
-set(dispatch_inc_file ${PROJECT_SOURCE_DIR}/src/dispatch.inc)
-add_custom_command(
-  OUTPUT ${dispatch_inc_file}
+execute_process(
   COMMAND
     ${Python3_EXECUTABLE}
-    ${PROJECT_SOURCE_DIR}/python/_aot_build_utils/generate_dispatch_inc.py
-    --path ${PROJECT_SOURCE_DIR}/src/dispatch.inc --head_dims ${HEAD_DIMS}
-    --pos_encoding_modes ${POS_ENCODING_MODES} --allow_fp16_qk_reductions
-    ${ALLOW_FP16_QK_REDUCTIONS} --mask_modes ${MASK_MODES}
-  DEPENDS ${PROJECT_SOURCE_DIR}/python/_aot_build_utils/generate_dispatch_inc.py
-  COMMENT "Generating additional source file ${generated_dispatch_inc}"
+    ${PROJECT_SOURCE_DIR}/aot_build_utils/generate.py
+    --path ${PROJECT_SOURCE_DIR}/src/generated
+    --head_dims ${HEAD_DIMS}
+    --pos_encoding_modes ${POS_ENCODING_MODES}
+    --allow_fp16_qk_reductions ${ALLOW_FP16_QK_REDUCTIONS}
+    --mask_modes ${MASK_MODES}
+    --enable_bf16 ${FLASHINFER_ENABLE_BF16}
+    --enable_fp8 ${FLASHINFER_ENABLE_FP8})
+
+file(GLOB_RECURSE
+  FLASHINFER_GENERATORS ${PROJECT_SOURCE_DIR}/aot_build_utils/*.py)
+file(GLOB_RECURSE
+  DECODE_KERNELS_SRCS ${PROJECT_SOURCE_DIR}/src/generated/*decode_head*.cu)
+file(GLOB_RECURSE
+  PREFILL_KERNELS_SRCS ${PROJECT_SOURCE_DIR}/src/generated/*prefill_head*.cu)
+
+add_custom_command(
+  OUTPUT ${DECODE_KERNELS_SRCS} ${PREFILL_KERNELS_SRCS}
+  COMMAND
+    ${Python3_EXECUTABLE}
+    ${PROJECT_SOURCE_DIR}/aot_build_utils/generate.py
+    --path ${PROJECT_SOURCE_DIR}/src/generated
+    --head_dims ${HEAD_DIMS}
+    --pos_encoding_modes ${POS_ENCODING_MODES}
+    --allow_fp16_qk_reductions ${ALLOW_FP16_QK_REDUCTIONS}
+    --mask_modes ${MASK_MODES}
+    --enable_bf16 ${FLASHINFER_ENABLE_BF16}
+    --enable_fp8 ${FLASHINFER_ENABLE_FP8}
+  DEPENDS
+    ${FLASHINFER_GENERATORS}
+  COMMENT "Generating source kernel CUDA files"
   VERBATIM)
-add_custom_target(dispatch_inc DEPENDS ${dispatch_inc_file})
 
-# single decode kernel inst generation
-foreach(head_dim IN LISTS HEAD_DIMS)
-  foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
-    foreach(dtype IN LISTS DECODE_DTYPES)
-      set(generated_kernel_src
-          ${PROJECT_SOURCE_DIR}/src/generated/single_decode_head_${head_dim}_posenc_${pos_encoding_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_${dtype}.cu
-      )
-      add_custom_command(
-        OUTPUT ${generated_kernel_src}
-        COMMAND
-          ${Python3_EXECUTABLE}
-          ${PROJECT_SOURCE_DIR}/python/_aot_build_utils/generate_single_decode_inst.py
-          ${generated_kernel_src}
-        DEPENDS
-          ${PROJECT_SOURCE_DIR}/python/_aot_build_utils/generate_single_decode_inst.py
-        COMMENT "Generating additional source file ${generated_kernel_src}"
-        VERBATIM)
-      list(APPEND single_decode_kernels_src ${generated_kernel_src})
-    endforeach(dtype)
-
-    # fp8 kv-cache
-    foreach(dtype_kv IN LISTS DECODE_FP8_DTYPES)
-      set(generated_kernel_src
-          ${PROJECT_SOURCE_DIR}/src/generated/single_decode_head_${head_dim}_posenc_${pos_encoding_mode}_dtypeq_f16_dtypekv_${dtype_kv}_dtypeout_f16.cu
-      )
-      add_custom_command(
-        OUTPUT ${generated_kernel_src}
-        COMMAND
-          ${Python3_EXECUTABLE}
-          ${PROJECT_SOURCE_DIR}/python/_aot_build_utils/generate_single_decode_inst.py
-          ${generated_kernel_src}
-        DEPENDS
-          ${PROJECT_SOURCE_DIR}/python/_aot_build_utils/generate_single_decode_inst.py
-        COMMENT "Generating additional source file ${generated_kernel_src}"
-        VERBATIM)
-      list(APPEND single_decode_kernels_src ${generated_kernel_src})
-    endforeach(dtype_kv)
-  endforeach(pos_encoding_mode)
-endforeach(head_dim)
-
-# batch decode kernel inst generation
-foreach(head_dim IN LISTS HEAD_DIMS)
-  foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
-    # paged kv-cache
-    foreach(idtype IN LISTS IDTYPES)
-      foreach(dtype IN LISTS DECODE_DTYPES)
-        set(generated_kernel_src
-            ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_decode_head_${head_dim}_posenc_${pos_encoding_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu
-        )
-        add_custom_command(
-          OUTPUT ${generated_kernel_src}
-          COMMAND
-            ${Python3_EXECUTABLE}
-            ${PROJECT_SOURCE_DIR}/python/_aot_build_utils/generate_batch_paged_decode_inst.py
-            ${generated_kernel_src}
-          DEPENDS
-            ${PROJECT_SOURCE_DIR}/python/_aot_build_utils/generate_batch_paged_decode_inst.py
-          COMMENT "Generating additional source file ${generated_kernel_src}"
-          VERBATIM)
-        list(APPEND batch_decode_kernels_src ${generated_kernel_src})
-      endforeach(dtype)
-
-      # fp8 kv-cache
-      foreach(dtype_kv IN LISTS DECODE_FP8_DTYPES)
-        set(generated_kernel_src
-            ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_decode_head_${head_dim}_posenc_${pos_encoding_mode}_dtypeq_f16_dtypekv_${dtype_kv}_dtypeout_f16_idtype_${idtype}.cu
-        )
-        add_custom_command(
-          OUTPUT ${generated_kernel_src}
-          COMMAND
-            ${Python3_EXECUTABLE}
-            ${PROJECT_SOURCE_DIR}/python/_aot_build_utils/generate_batch_paged_decode_inst.py
-            ${generated_kernel_src}
-          DEPENDS
-            ${PROJECT_SOURCE_DIR}/python/_aot_build_utils/generate_batch_paged_decode_inst.py
-          COMMENT "Generating additional source file ${generated_kernel_src}"
-          VERBATIM)
-        list(APPEND batch_decode_kernels_src ${generated_kernel_src})
-      endforeach(dtype_kv)
-    endforeach(idtype)
-  endforeach(pos_encoding_mode)
-endforeach(head_dim)
-
-add_library(decode_kernels STATIC ${single_decode_kernels_src}
-                                  ${batch_decode_kernels_src})
+add_library(decode_kernels STATIC ${DECODE_KERNELS_SRCS})
 target_include_directories(decode_kernels PRIVATE ${FLASHINFER_INCLUDE_DIR})
-target_compile_options(decode_kernels PRIVATE -Xcompiler=-fPIC --fatbin-options
-                                              -compress-all)
+target_compile_options(decode_kernels PRIVATE
+  -Xcompiler=-fPIC --fatbin-options -compress-all)
 
-# single prefill kernel inst generation
-foreach(head_dim IN LISTS HEAD_DIMS)
-  foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
-    foreach(allow_fp16_qk_reduction IN LISTS ALLOW_FP16_QK_REDUCTIONS)
-      foreach(mask_mode IN LISTS MASK_MODES)
-        foreach(dtype IN LISTS PREFILL_DTYPES)
-          set(generated_kernel_src
-              ${PROJECT_SOURCE_DIR}/src/generated/single_prefill_head_${head_dim}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_${dtype}.cu
-          )
-          add_custom_command(
-            OUTPUT ${generated_kernel_src}
-            COMMAND
-              ${Python3_EXECUTABLE}
-              ${PROJECT_SOURCE_DIR}/python/_aot_build_utils/generate_single_prefill_inst.py
-              ${generated_kernel_src}
-            DEPENDS
-              ${PROJECT_SOURCE_DIR}/python/_aot_build_utils/generate_single_prefill_inst.py
-            COMMENT "Generating additional source file ${generated_kernel_src}"
-            VERBATIM)
-          list(APPEND single_prefill_kernels_src ${generated_kernel_src})
-        endforeach(dtype)
-
-        foreach(dtype_kv IN LISTS PREFILL_FP8_DTYPES)
-          set(generated_kernel_src
-              ${PROJECT_SOURCE_DIR}/src/generated/single_prefill_head_${head_dim}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypeq_f16_dtypekv_${dtype_kv}_dtypeout_f16.cu
-          )
-          add_custom_command(
-            OUTPUT ${generated_kernel_src}
-            COMMAND
-              ${Python3_EXECUTABLE}
-              ${PROJECT_SOURCE_DIR}/python/_aot_build_utils/generate_single_prefill_inst.py
-              ${generated_kernel_src}
-            DEPENDS
-              ${PROJECT_SOURCE_DIR}/python/_aot_build_utils/generate_single_prefill_inst.py
-            COMMENT "Generating additional source file ${generated_kernel_src}"
-            VERBATIM)
-          list(APPEND single_prefill_kernels_src ${generated_kernel_src})
-        endforeach(dtype_kv)
-      endforeach(mask_mode)
-    endforeach(allow_fp16_qk_reduction)
-  endforeach(pos_encoding_mode)
-endforeach(head_dim)
-
-# batch paged prefill kernel inst generation
-foreach(head_dim IN LISTS HEAD_DIMS)
-  foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
-    foreach(allow_fp16_qk_reduction IN LISTS ALLOW_FP16_QK_REDUCTIONS)
-      foreach(mask_mode IN LISTS MASK_MODES)
-        foreach(idtype IN LISTS IDTYPES)
-          foreach(dtype IN LISTS PREFILL_DTYPES)
-            set(generated_kernel_src
-                ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_prefill_head_${head_dim}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu
-            )
-            add_custom_command(
-              OUTPUT ${generated_kernel_src}
-              COMMAND
-                ${Python3_EXECUTABLE}
-                ${PROJECT_SOURCE_DIR}/python/_aot_build_utils/generate_batch_paged_prefill_inst.py
-                ${generated_kernel_src}
-              DEPENDS
-                ${PROJECT_SOURCE_DIR}/python/_aot_build_utils/generate_batch_paged_prefill_inst.py
-              COMMENT
-                "Generating additional source file ${generated_kernel_src}"
-              VERBATIM)
-            list(APPEND batch_paged_prefill_kernels_src ${generated_kernel_src})
-          endforeach(dtype)
-
-          foreach(dtype_kv IN LISTS PREFILL_FP8_DTYPES)
-            set(generated_kernel_src
-                ${PROJECT_SOURCE_DIR}/src/generated/batch_paged_prefill_head_${head_dim}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypeq_f16_dtypekv_${dtype_kv}_dtypeout_f16_idtype_${idtype}.cu
-            )
-            add_custom_command(
-              OUTPUT ${generated_kernel_src}
-              COMMAND
-                ${Python3_EXECUTABLE}
-                ${PROJECT_SOURCE_DIR}/python/_aot_build_utils/generate_batch_paged_prefill_inst.py
-                ${generated_kernel_src}
-              DEPENDS
-                ${PROJECT_SOURCE_DIR}/python/_aot_build_utils/generate_batch_paged_prefill_inst.py
-              COMMENT
-                "Generating additional source file ${generated_kernel_src}"
-              VERBATIM)
-            list(APPEND batch_paged_prefill_kernels_src ${generated_kernel_src})
-          endforeach(dtype_kv)
-        endforeach(idtype)
-      endforeach(mask_mode)
-    endforeach(allow_fp16_qk_reduction)
-  endforeach(pos_encoding_mode)
-endforeach(head_dim)
-
-# batch ragged prefill kernel inst generation
-foreach(head_dim IN LISTS HEAD_DIMS)
-  foreach(pos_encoding_mode IN LISTS POS_ENCODING_MODES)
-    foreach(allow_fp16_qk_reduction IN LISTS ALLOW_FP16_QK_REDUCTIONS)
-      foreach(mask_mode IN LISTS MASK_MODES)
-        foreach(idtype IN LISTS IDTYPES)
-          foreach(dtype IN LISTS PREFILL_DTYPES)
-            set(generated_kernel_src
-                ${PROJECT_SOURCE_DIR}/src/generated/batch_ragged_prefill_head_${head_dim}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypeq_${dtype}_dtypekv_${dtype}_dtypeout_${dtype}_idtype_${idtype}.cu
-            )
-            add_custom_command(
-              OUTPUT ${generated_kernel_src}
-              COMMAND
-                ${Python3_EXECUTABLE}
-                ${PROJECT_SOURCE_DIR}/python/_aot_build_utils/generate_batch_ragged_prefill_inst.py
-                ${generated_kernel_src}
-              DEPENDS
-                ${PROJECT_SOURCE_DIR}/python/_aot_build_utils/generate_batch_ragged_prefill_inst.py
-              COMMENT
-                "Generating additional source file ${generated_kernel_src}"
-              VERBATIM)
-            list(APPEND batch_ragged_prefill_kernels_src
-                 ${generated_kernel_src})
-          endforeach(dtype)
-
-          foreach(dtype_kv IN LISTS PREFILL_FP8_DTYPES)
-            set(generated_kernel_src
-                ${PROJECT_SOURCE_DIR}/src/generated/batch_ragged_prefill_head_${head_dim}_posenc_${pos_encoding_mode}_fp16qkred_${allow_fp16_qk_reduction}_mask_${mask_mode}_dtypeq_f16_dtypekv_${dtype_kv}_dtypeout_f16_idtype_${idtype}.cu
-            )
-            add_custom_command(
-              OUTPUT ${generated_kernel_src}
-              COMMAND
-                ${Python3_EXECUTABLE}
-                ${PROJECT_SOURCE_DIR}/python/_aot_build_utils/generate_batch_ragged_prefill_inst.py
-                ${generated_kernel_src}
-              DEPENDS
-                ${PROJECT_SOURCE_DIR}/python/_aot_build_utils/generate_batch_ragged_prefill_inst.py
-              COMMENT
-                "Generating additional source file ${generated_kernel_src}"
-              VERBATIM)
-            list(APPEND batch_ragged_prefill_kernels_src
-                 ${generated_kernel_src})
-          endforeach(dtype_kv)
-        endforeach(idtype)
-      endforeach(mask_mode)
-    endforeach(allow_fp16_qk_reduction)
-  endforeach(pos_encoding_mode)
-endforeach(head_dim)
-
-add_library(
-  prefill_kernels STATIC
-  ${single_prefill_kernels_src} ${batch_paged_prefill_kernels_src}
-  ${batch_ragged_prefill_kernels_src})
+add_library(prefill_kernels STATIC ${PREFILL_KERNELS_SRCS})
 target_include_directories(prefill_kernels PRIVATE ${FLASHINFER_INCLUDE_DIR})
-target_compile_options(prefill_kernels PRIVATE -Xcompiler=-fPIC
-                                               --fatbin-options -compress-all)
+target_compile_options(prefill_kernels PRIVATE
+  -Xcompiler=-fPIC --fatbin-options -compress-all)
 
 if(FLASHINFER_DECODE)
   message(STATUS "Compile single decode kernel benchmarks.")

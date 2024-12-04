@@ -187,12 +187,12 @@ if enable_aot:
         "csrc/flashinfer_gemm_sm90_ops.cu",
     ]
     # Change to relative path
-    prefills = list(gen_dir.glob("*prefill_head*.cu"))
-    decodes = list(gen_dir.glob("*decode_head*.cu"))
+    prefill_sources = list(gen_dir.glob("*prefill_head*.cu"))
+    decode_sources = list(gen_dir.glob("*decode_head*.cu"))
     ext_modules = [
         torch_cpp_ext.CUDAExtension(
             name="flashinfer._kernels",
-            sources=kernel_sources + decodes + prefills,
+            sources=kernel_sources + decode_sources + prefill_sources,
             include_dirs=include_dirs,
             extra_compile_args={
                 "cxx": cxx_flags,
