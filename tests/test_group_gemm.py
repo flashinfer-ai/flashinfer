@@ -51,7 +51,7 @@ def test_segment_gemm(
         pytest.skip("sm90 backend not supported on this device.")
     torch.manual_seed(42)
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(device)
-    segment_gemm = flashinfer.gemm.SegmentGEMMWrapper(workspace_buffer, backend)
+    segment_gemm = flashinfer.gemm.SegmentGEMMWrapper(workspace_buffer, backend=backend)
     x = torch.randn(batch_size * num_rows_per_batch, d_in, dtype=dtype).to(device)
     if use_weight_indices:
         num_weights = 1024
