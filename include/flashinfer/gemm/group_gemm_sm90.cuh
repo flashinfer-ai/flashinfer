@@ -16,8 +16,6 @@
 #ifndef FLASHINFER_GEMM_GROUP_GEMM_SM90_CUH_
 #define FLASHINFER_GEMM_GROUP_GEMM_SM90_CUH_
 
-#include <sstream>
-
 #include "../allocator.h"
 #include "../cutlass_utils.cuh"
 #include "../utils.cuh"
