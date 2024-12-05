@@ -146,14 +146,14 @@ You can follow the steps below to install FlashInfer from source code:
 
            .. code-block:: bash
 
-               cd flashinfer/python
+               cd flashinfer
                pip install --no-build-isolation --verbose --editable .
 
        .. tab:: AOT mode
 
            .. code-block:: bash
 
-               cd flashinfer/python
+               cd flashinfer
                TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a" FLASHINFER_ENABLE_AOT=1 pip install --no-build-isolation --verbose --editable .
 
 5. Create FlashInfer distributions
@@ -164,7 +164,7 @@ You can follow the steps below to install FlashInfer from source code:
 
            .. code-block:: bash
 
-               cd flashinfer/python
+               cd flashinfer
                python -m build --no-isolation --sdist
                ls -la dist/
 
@@ -172,7 +172,7 @@ You can follow the steps below to install FlashInfer from source code:
 
            .. code-block:: bash
 
-               cd flashinfer/python
+               cd flashinfer
                python3 -m build --no-isolation --wheel
                ls -la dist/
 
@@ -180,7 +180,7 @@ You can follow the steps below to install FlashInfer from source code:
 
            .. code-block:: bash
 
-               cd flashinfer/python
+               cd flashinfer
                TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a" FLASHINFER_ENABLE_AOT=1 python3 -m build --no-isolation --wheel
                ls -la dist/
 

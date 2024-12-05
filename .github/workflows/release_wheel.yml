@@ -55,12 +55,12 @@ jobs:
               pytorch/manylinux-builder:cuda${{ matrix.cuda }} \
               bash /app/scripts/run-ci-build-wheel.sh
         timeout-minutes: 120
-      - run: du -h python/dist/*
+      - run: du -h dist/*
 
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-cuda${{ matrix.cuda }}-torch${{ matrix.torch }}-python${{ matrix.python }}
-          path: python/dist/*
+          path: dist/*
 
   release:
     needs: build
@@ -68,47 +68,47 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          path: python/dist/
+          path: dist/
           merge-multiple: true
           pattern: wheel-*
 
-      - run: ls -lah python/dist/
+      - run: ls -lah dist/
 
       - uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ inputs.tag_name }}
           files: |
-            python/dist/flashinfer*cp38*.whl
+            dist/flashinfer*cp38*.whl
 
       - uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ inputs.tag_name }}
           files: |
-            python/dist/flashinfer*cp39*.whl
+            dist/flashinfer*cp39*.whl
 
       - uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ inputs.tag_name }}
           files: |
-            python/dist/flashinfer*cp310*.whl
+            dist/flashinfer*cp310*.whl
 
       - uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ inputs.tag_name }}
           files: |
-            python/dist/flashinfer*cp311*.whl
+            dist/flashinfer*cp311*.whl
 
       - uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ inputs.tag_name }}
           files: |
-            python/dist/flashinfer*cp312*.whl
+            dist/flashinfer*cp312*.whl
 
       - uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ inputs.tag_name }}
           files: |
-            python/dist/flashinfer-*.tar.gz
+            dist/flashinfer-*.tar.gz
 
       - name: Clone wheel index
         run: git clone https://oauth2:${WHL_TOKEN}@github.com/flashinfer-ai/whl.git flashinfer-whl

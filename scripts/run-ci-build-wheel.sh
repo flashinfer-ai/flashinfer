@@ -40,7 +40,7 @@ echo "::endgroup::"
 
 
 echo "::group::Build wheel for FlashInfer"
-cd "$PROJECT_ROOT/python"
+cd "$PROJECT_ROOT"
 FLASHINFER_ENABLE_AOT=1 FLASHINFER_LOCAL_VERSION="cu${CUDA_MAJOR}${CUDA_MINOR}torch${FLASHINFER_CI_TORCH_VERSION}" python -m build --no-isolation --wheel
 python -m build --no-isolation --sdist
 ls -la dist/

@@ -1,6 +1,6 @@
 # ci
 flashinfer-whl/
-python/dist
+dist/
 
 # Compile commands json file
 compile_commands.json
