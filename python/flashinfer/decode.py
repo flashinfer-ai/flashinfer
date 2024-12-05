@@ -1404,10 +1404,10 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
                 maybe_lse,
                 get_cuda_stream(device),
             )
-            out = (o, maybe_lse) if return_lse else (o,)
+            out = [o, maybe_lse] if return_lse else [o]
         if v_scale is not None:
             out[0] *= v_scale
 
-        return out if return_lse else out[0]
+        return tuple(out) if return_lse else out[0]
 
     run_return_lse = functools.partialmethod(run, return_lse=True)
