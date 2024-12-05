@@ -18,6 +18,7 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.utils import determine_gemm_backend
 
 DTYPES = [torch.float16]
 CUDA_DEVICES = ["cuda:0"]
@@ -45,6 +46,9 @@ def test_segment_gemm(
 ):
     if batch_size * num_rows_per_batch > 8192:
         pytest.skip("batch_size * num_rows_per_batch too large for test.")
+    latest_supported_backend = determine_gemm_backend(torch.device(device))
+    if backend == "sm90" and latest_supported_backend == "sm80":
+        pytest.skip("sm90 backend not supported on this device.")
     torch.manual_seed(42)
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(device)
     segment_gemm = flashinfer.gemm.SegmentGEMMWrapper(workspace_buffer, backend)
