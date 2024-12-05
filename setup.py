@@ -25,7 +25,6 @@ from pathlib import Path
 import setuptools
 
 root = Path(__file__).parent.resolve()
-
 gen_dir = root / "csrc" / "generated"
 
 head_dims = os.environ.get("FLASHINFER_HEAD_DIMS", "64,128,256").split(",")
@@ -185,9 +184,8 @@ if enable_aot:
         "csrc/group_gemm_sm90.cu",
         "csrc/flashinfer_gemm_sm90_ops.cu",
     ]
-    # Change to relative path
-    prefill_sources = list(gen_dir.glob("*prefill_head*.cu"))
     decode_sources = list(gen_dir.glob("*decode_head*.cu"))
+    prefill_sources = list(gen_dir.glob("*prefill_head*.cu"))
     ext_modules = [
         torch_cpp_ext.CUDAExtension(
             name="flashinfer._kernels",
