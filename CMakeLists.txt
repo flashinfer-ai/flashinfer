@@ -125,27 +125,7 @@ file(MAKE_DIRECTORY ${PROJECT_SOURCE_DIR}/src/generated)
 execute_process(
   COMMAND
     ${Python3_EXECUTABLE}
-    ${PROJECT_SOURCE_DIR}/aot_build_utils/generate.py
-    --path ${PROJECT_SOURCE_DIR}/src/generated
-    --head_dims ${HEAD_DIMS}
-    --pos_encoding_modes ${POS_ENCODING_MODES}
-    --allow_fp16_qk_reductions ${ALLOW_FP16_QK_REDUCTIONS}
-    --mask_modes ${MASK_MODES}
-    --enable_bf16 ${FLASHINFER_ENABLE_BF16}
-    --enable_fp8 ${FLASHINFER_ENABLE_FP8})
-
-file(GLOB_RECURSE
-  FLASHINFER_GENERATORS ${PROJECT_SOURCE_DIR}/aot_build_utils/*.py)
-file(GLOB_RECURSE
-  DECODE_KERNELS_SRCS ${PROJECT_SOURCE_DIR}/src/generated/*decode_head*.cu)
-file(GLOB_RECURSE
-  PREFILL_KERNELS_SRCS ${PROJECT_SOURCE_DIR}/src/generated/*prefill_head*.cu)
-
-add_custom_command(
-  OUTPUT ${DECODE_KERNELS_SRCS} ${PREFILL_KERNELS_SRCS}
-  COMMAND
-    ${Python3_EXECUTABLE}
-    ${PROJECT_SOURCE_DIR}/aot_build_utils/generate.py
+    -m aot_build_utils.generate
     --path ${PROJECT_SOURCE_DIR}/src/generated
     --head_dims ${HEAD_DIMS}
     --pos_encoding_modes ${POS_ENCODING_MODES}
@@ -153,9 +133,30 @@ add_custom_command(
     --mask_modes ${MASK_MODES}
     --enable_bf16 ${FLASHINFER_ENABLE_BF16}
     --enable_fp8 ${FLASHINFER_ENABLE_FP8}
-  DEPENDS
-    ${FLASHINFER_GENERATORS}
-  COMMENT "Generating source kernel CUDA files"
+  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+
+file(GLOB_RECURSE FLASHINFER_GENERATORS
+     ${PROJECT_SOURCE_DIR}/aot_build_utils/*.py)
+file(GLOB_RECURSE DECODE_KERNELS_SRCS
+     ${PROJECT_SOURCE_DIR}/src/generated/*decode_head*.cu)
+file(GLOB_RECURSE PREFILL_KERNELS_SRCS
+     ${PROJECT_SOURCE_DIR}/src/generated/*prefill_head*.cu)
+
+add_custom_command(
+  OUTPUT ${DECODE_KERNELS_SRCS} ${PREFILL_KERNELS_SRCS}
+  COMMAND
+    ${Python3_EXECUTABLE}
+    -m aot_build_utils.generate
+    --path ${PROJECT_SOURCE_DIR}/src/generated
+    --head_dims ${HEAD_DIMS}
+    --pos_encoding_modes ${POS_ENCODING_MODES}
+    --allow_fp16_qk_reductions ${ALLOW_FP16_QK_REDUCTIONS}
+    --mask_modes ${MASK_MODES}
+    --enable_bf16 ${FLASHINFER_ENABLE_BF16}
+    --enable_fp8 ${FLASHINFER_ENABLE_FP8}
+  DEPENDS ${FLASHINFER_GENERATORS}
+  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+  COMMENT "Generating kernel sources"
   VERBATIM)
 
 add_library(decode_kernels STATIC ${DECODE_KERNELS_SRCS})

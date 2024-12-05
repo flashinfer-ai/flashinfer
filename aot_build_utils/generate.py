@@ -1,24 +1,32 @@
+"""
+Copyright (c) 2024 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 import argparse
-import sys
-from pathlib import Path
 from itertools import product
+from pathlib import Path
 from typing import List
 
-if __package__:
-    from . import generate_batch_paged_decode_inst
-    from . import generate_batch_paged_prefill_inst
-    from . import generate_batch_ragged_prefill_inst
-    from . import generate_dispatch_inc
-    from . import generate_single_decode_inst
-    from . import generate_single_prefill_inst
-else:
-    sys.path.append(str(Path(__file__).resolve()))
-    import generate_batch_paged_decode_inst
-    import generate_batch_paged_prefill_inst
-    import generate_batch_ragged_prefill_inst
-    import generate_dispatch_inc
-    import generate_single_decode_inst
-    import generate_single_prefill_inst
+from . import (
+    generate_batch_paged_decode_inst,
+    generate_batch_paged_prefill_inst,
+    generate_batch_ragged_prefill_inst,
+    generate_dispatch_inc,
+    generate_single_decode_inst,
+    generate_single_prefill_inst,
+)
 
 
 def get_instantiation_cu(args: argparse.Namespace) -> List[str]:

@@ -26,8 +26,6 @@ import setuptools
 
 root = Path(__file__).parent.resolve()
 
-sys.path.append(str(root))
-
 gen_dir = root / "csrc" / "generated"
 
 head_dims = os.environ.get("FLASHINFER_HEAD_DIMS", "64,128,256").split(",")
@@ -64,6 +62,7 @@ def generate_build_meta(aot_build_meta: dict) -> None:
 
 def generate_cuda() -> None:
     try:  # no aot_build_utils in sdist
+        sys.path.append(str(root))
         from aot_build_utils.generate import get_instantiation_cu
     except ImportError:
         return
