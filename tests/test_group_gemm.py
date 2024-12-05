@@ -18,6 +18,7 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.utils import determine_gemm_backend
 
 DTYPES = [torch.float16]
 CUDA_DEVICES = ["cuda:0"]
@@ -31,6 +32,7 @@ CUDA_DEVICES = ["cuda:0"]
 @pytest.mark.parametrize("column_major", [False, True])
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
+@pytest.mark.parametrize("backend", ["auto", "sm90", "sm80"])
 def test_segment_gemm(
     batch_size,
     num_rows_per_batch,
@@ -40,12 +42,16 @@ def test_segment_gemm(
     column_major,
     dtype,
     device,
+    backend,
 ):
     if batch_size * num_rows_per_batch > 8192:
         pytest.skip("batch_size * num_rows_per_batch too large for test.")
+    latest_supported_backend = determine_gemm_backend(torch.device(device))
+    if backend == "sm90" and latest_supported_backend == "sm80":
+        pytest.skip("sm90 backend not supported on this device.")
     torch.manual_seed(42)
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(device)
-    segment_gemm = flashinfer.gemm.SegmentGEMMWrapper(workspace_buffer)
+    segment_gemm = flashinfer.gemm.SegmentGEMMWrapper(workspace_buffer, backend=backend)
     x = torch.randn(batch_size * num_rows_per_batch, d_in, dtype=dtype).to(device)
     if use_weight_indices:
         num_weights = 1024
@@ -99,7 +105,7 @@ def test_segment_gemm(
 
 
 if __name__ == "__main__":
-    test_segment_gemm(199, 17, 128, 1024, False, False, torch.float16, "cuda:0")
-    test_segment_gemm(199, 17, 128, 1024, False, True, torch.float16, "cuda:0")
-    test_segment_gemm(199, 17, 128, 1024, True, False, torch.float16, "cuda:0")
-    test_segment_gemm(199, 17, 128, 1024, True, True, torch.float16, "cuda:0")
+    test_segment_gemm(199, 17, 128, 1024, False, False, torch.float16, "cuda:0", "auto")
+    test_segment_gemm(199, 17, 128, 1024, False, True, torch.float16, "cuda:0", "auto")
+    test_segment_gemm(199, 17, 128, 1024, True, False, torch.float16, "cuda:0", "auto")
+    test_segment_gemm(199, 17, 128, 1024, True, True, torch.float16, "cuda:0", "auto")

@@ -24,7 +24,7 @@ import triton.language as tl
 from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
 from .utils import (
     _get_cache_buf,
-    get_compute_capability,
+    determine_gemm_backend,
     get_cuda_stream,
     get_indptr,
     register_custom_op,
@@ -480,7 +480,9 @@ class SegmentGEMMWrapper:
     True
     """
 
-    def __init__(self, float_workspace_buffer: torch.Tensor) -> None:
+    def __init__(
+        self, float_workspace_buffer: torch.Tensor, backend: str = "auto"
+    ) -> None:
         r"""Initialize the wrapper.
 
         Parameters
@@ -493,6 +495,7 @@ class SegmentGEMMWrapper:
             (1024 * 1024,), dtype=torch.int8, device=float_workspace_buffer.device
         )
         self._float_workspace_buffer = float_workspace_buffer
+        self.backend = backend
 
     def reset_workspace_buffer(
         self, float_workspace_buffer: torch.Tensor, int_workspace_buffer: torch.Tensor
@@ -584,75 +587,82 @@ class SegmentGEMMWrapper:
         if weight_indices is None:
             # create an empty CPU tensor as placeholder
             weight_indices = torch.empty(0, dtype=torch.int64)
-        major, _ = get_compute_capability(x.device)
         cumulative_batch_size = x.size(0)
         d_out = weights.size(1) if weight_column_major else weights.size(2)
         y = torch.zeros((cumulative_batch_size, d_out), dtype=x.dtype, device=x.device)
         empty_x_data = torch.empty(0, dtype=x.dtype, device=x.device)
 
-        if major >= 9:
-            (
-                all_problems,
-                x_data,
-                w_data,
-                y_data,
-                x_stride_data,
-                w_stride_data,
-                y_stride_data,
-            ) = launch_compute_sm90_group_gemm_args(
-                x,
-                weights,
-                y,
-                weight_column_major,
-                batch_size,
-                seg_indptr,
-                weight_indices,
-            )
-            get_gemm_sm90_module().cutlass_segment_gemm_sm90(
-                self._float_workspace_buffer,
-                self._int_workspace_buffer,
-                all_problems,
-                x_data,
-                w_data,
-                y_data,
-                x_stride_data,
-                w_stride_data,
-                y_stride_data,
-                y,  # for torch compile mutates_args
-                empty_x_data,  # for kernel type dispatch
-                weight_column_major,
-            )
+        if self.backend == "auto":
+            backend = determine_gemm_backend(x.device)
         else:
-            (
-                all_problems,
-                x_data,
-                w_data,
-                y_data,
-                x_ld_data,
-                w_ld_data,
-                y_ld_data,
-            ) = launch_compute_sm80_group_gemm_args(
-                x,
-                weights,
-                y,
-                weight_column_major,
-                batch_size,
-                seg_indptr,
-                weight_indices,
-            )
-            get_gemm_module().cutlass_segment_gemm(
-                self._int_workspace_buffer,
-                all_problems,
-                x_data,
-                w_data,
-                y_data,
-                x_ld_data,
-                w_ld_data,
-                y_ld_data,
-                y,
-                empty_x_data,
-                weight_column_major,
-            )
+            backend = self.backend
+
+        match backend:
+            case "sm90":
+                (
+                    all_problems,
+                    x_data,
+                    w_data,
+                    y_data,
+                    x_stride_data,
+                    w_stride_data,
+                    y_stride_data,
+                ) = launch_compute_sm90_group_gemm_args(
+                    x,
+                    weights,
+                    y,
+                    weight_column_major,
+                    batch_size,
+                    seg_indptr,
+                    weight_indices,
+                )
+                get_gemm_sm90_module().cutlass_segment_gemm_sm90(
+                    self._float_workspace_buffer,
+                    self._int_workspace_buffer,
+                    all_problems,
+                    x_data,
+                    w_data,
+                    y_data,
+                    x_stride_data,
+                    w_stride_data,
+                    y_stride_data,
+                    y,  # for torch compile mutates_args
+                    empty_x_data,  # for kernel type dispatch
+                    weight_column_major,
+                )
+            case "sm80":
+                (
+                    all_problems,
+                    x_data,
+                    w_data,
+                    y_data,
+                    x_ld_data,
+                    w_ld_data,
+                    y_ld_data,
+                ) = launch_compute_sm80_group_gemm_args(
+                    x,
+                    weights,
+                    y,
+                    weight_column_major,
+                    batch_size,
+                    seg_indptr,
+                    weight_indices,
+                )
+                get_gemm_module().cutlass_segment_gemm(
+                    self._int_workspace_buffer,
+                    all_problems,
+                    x_data,
+                    w_data,
+                    y_data,
+                    x_ld_data,
+                    w_ld_data,
+                    y_ld_data,
+                    y,
+                    empty_x_data,
+                    weight_column_major,
+                )
+            case _:
+                raise ValueError(f"Unsupported gemm backend: {backend}")
         return y
 
     forward = run
