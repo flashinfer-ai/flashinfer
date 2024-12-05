@@ -18,11 +18,10 @@ import re
 import sys
 from pathlib import Path
 
-if __package__:
-    from .literal_map import dtype_literal, idtype_literal, pos_encoding_mode_literal
-else:
-    sys.path.append(str(Path(__file__).resolve().parents[1] / "_aot_build_utils"))
-    from literal_map import dtype_literal, idtype_literal, pos_encoding_mode_literal
+from .literal_map import (
+    dtype_literal,
+    pos_encoding_mode_literal,
+)
 
 
 def get_cu_file_str(
@@ -31,33 +30,23 @@ def get_cu_file_str(
     dtype_q,
     dtype_kv,
     dtype_out,
-    idtype,
 ):
     content = """#include <flashinfer/attention_impl.cuh>
 
 namespace flashinfer {{
 
-using ParamsT = BatchDecodeParams<{dtype_q}, {dtype_kv}, {dtype_out}, {idtype}>;
+using ParamsT = SingleDecodeParams<{dtype_q}, {dtype_kv}, {dtype_out}>;
 
-template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{head_dim}, {pos_encoding_mode}, ComposedAttention<ParamsT, get_variant_code(
+template cudaError_t SingleDecodeWithKVCacheDispatched<{head_dim}, {pos_encoding_mode}, ComposedAttention<ParamsT, get_variant_code(
     /*use_custom_mask=*/false, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false)>>(
     ParamsT params,
-    {dtype_out}* tmp_v, float* tmp_s,
+    {dtype_out}* tmp,
     cudaStream_t stream);
 
-template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{head_dim}, {pos_encoding_mode}, ComposedAttention<ParamsT, get_variant_code(
+template cudaError_t SingleDecodeWithKVCacheDispatched<{head_dim}, {pos_encoding_mode}, ComposedAttention<ParamsT, get_variant_code(
     /*use_custom_mask=*/false, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false)>>(
     ParamsT params,
-    {dtype_out}* tmp_v, float* tmp_s,
-    cudaStream_t stream);
-
-
-using ParamsMlaT = BatchDecodeParamsMLA<{dtype_q}, {dtype_kv}, {dtype_out}, {idtype}>;
-
-template cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA<{head_dim}, {head_dim_kpe}, ComposedAttention<ParamsMlaT, get_variant_code(
-    /*use_custom_mask=*/false, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false)>>(
-    ParamsMlaT params,
-    {dtype_out}* tmp_v, float* tmp_s,
+    {dtype_out}* tmp,
     cudaStream_t stream);
 }}
     """.format(
@@ -66,23 +55,20 @@ template cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA<{head_dim}, {head_
         dtype_q=dtype_literal[dtype_q],
         dtype_kv=dtype_literal[dtype_kv],
         dtype_out=dtype_literal[dtype_out],
-        idtype=idtype_literal[idtype],
-        head_dim_kpe=str(
-            int(head_dim) // 8
-        ),  # fixme: head_dim_ckv(kv_lora_rank) is 8 times the size of head_dim_kpe(qk_rope_head_dim) for all MLA model (DeepSeek-V2-Lite, DeepSeek-V2.5, MiniCPM3) at the time Oct.2024
     )
     return content
 
 
 if __name__ == "__main__":
     pattern = (
-        r"batch_paged_decode_head_([0-9]+)_posenc_([0-9]+)_"
-        r"dtypeq_([a-z0-9]+)_dtypekv_([a-z0-9]+)_dtypeout_([a-z0-9]+)_idtype_([a-z0-9]+)\.cu"
+        r"single_decode_head_([0-9]+)_posenc_([0-9]+)_"
+        r"dtypeq_([a-z0-9]+)_dtypekv_([a-z0-9]+)_dtypeout_([a-z0-9]+)\.cu"
     )
 
     compiled_pattern = re.compile(pattern)
     path = Path(sys.argv[1])
     fname = path.name
     match = compiled_pattern.match(fname)
+
     with open(path, "w") as f:
         f.write(get_cu_file_str(*match.groups()))

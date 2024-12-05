@@ -18,11 +18,11 @@ import re
 import sys
 from pathlib import Path
 
-if __package__:
-    from .literal_map import dtype_literal, mask_mode_literal, pos_encoding_mode_literal
-else:
-    sys.path.append(str(Path(__file__).resolve().parents[1] / "_aot_build_utils"))
-    from literal_map import dtype_literal, mask_mode_literal, pos_encoding_mode_literal
+from .literal_map import (
+    dtype_literal,
+    mask_mode_literal,
+    pos_encoding_mode_literal,
+)
 
 
 def get_cu_file_str(
@@ -34,7 +34,6 @@ def get_cu_file_str(
     dtype_kv,
     dtype_out,
 ):
-
     content = """#include <flashinfer/attention_impl.cuh>
 
 namespace flashinfer {{

@@ -1,0 +1,64 @@
+# Copyright (c) 2024 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[project]
+name = "flashinfer"
+description = "FlashInfer: Kernel Library for LLM Serving"
+requires-python = ">=3.8,<4.0"
+authors = [{ name = "FlashInfer team" }]
+license = { text = "Apache License 2.0" }
+readme = "README.md"
+urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
+dynamic = ["dependencies", "version"]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "custom_backend"
+backend-path = ["."]
+
+[tool.setuptools]
+packages = [
+    "flashinfer",
+    "flashinfer.data",
+    "flashinfer.data.csrc",
+    "flashinfer.data.cutlass",
+    "flashinfer.data.include",
+    "flashinfer.jit",
+    "flashinfer.triton",
+    "flashinfer.triton.kernels",
+]
+include-package-data = false
+
+[tool.setuptools.package-dir]
+"flashinfer.data" = "."
+"flashinfer.data.cutlass" = "3rdparty/cutlass"
+
+[tool.setuptools.package-data]
+"flashinfer.data" = [
+    "csrc/**",
+    "include/**",
+    "version.txt"
+]
+"flashinfer.data.cutlass" = [
+    "include/**",
+    "tools/util/include/**"
+]
+
+[tool.mypy]
+ignore_missing_imports = false
+show_column_numbers = true
+show_error_context = true
+follow_imports = "skip"
+ignore_errors = false
+strict_optional = false
