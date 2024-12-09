@@ -122,17 +122,19 @@ message(STATUS "FLASHINFER_MASK_MODES=${MASK_MODES}")
 
 file(MAKE_DIRECTORY ${PROJECT_SOURCE_DIR}/src/generated)
 
+set(AOT_GENERATE_COMMAND
+  ${Python3_EXECUTABLE}
+  -m aot_build_utils.generate
+  --path ${PROJECT_SOURCE_DIR}/src/generated
+  --head_dims ${HEAD_DIMS}
+  --pos_encoding_modes ${POS_ENCODING_MODES}
+  --allow_fp16_qk_reductions ${ALLOW_FP16_QK_REDUCTIONS}
+  --mask_modes ${MASK_MODES}
+  --enable_bf16 ${FLASHINFER_ENABLE_BF16}
+  --enable_fp8 ${FLASHINFER_ENABLE_FP8})
+
 execute_process(
-  COMMAND
-    ${Python3_EXECUTABLE}
-    -m aot_build_utils.generate
-    --path ${PROJECT_SOURCE_DIR}/src/generated
-    --head_dims ${HEAD_DIMS}
-    --pos_encoding_modes ${POS_ENCODING_MODES}
-    --allow_fp16_qk_reductions ${ALLOW_FP16_QK_REDUCTIONS}
-    --mask_modes ${MASK_MODES}
-    --enable_bf16 ${FLASHINFER_ENABLE_BF16}
-    --enable_fp8 ${FLASHINFER_ENABLE_FP8}
+  COMMAND ${AOT_GENERATE_COMMAND}
   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 
 file(GLOB_RECURSE FLASHINFER_GENERATORS
@@ -144,16 +146,7 @@ file(GLOB_RECURSE PREFILL_KERNELS_SRCS
 
 add_custom_command(
   OUTPUT ${DECODE_KERNELS_SRCS} ${PREFILL_KERNELS_SRCS}
-  COMMAND
-    ${Python3_EXECUTABLE}
-    -m aot_build_utils.generate
-    --path ${PROJECT_SOURCE_DIR}/src/generated
-    --head_dims ${HEAD_DIMS}
-    --pos_encoding_modes ${POS_ENCODING_MODES}
-    --allow_fp16_qk_reductions ${ALLOW_FP16_QK_REDUCTIONS}
-    --mask_modes ${MASK_MODES}
-    --enable_bf16 ${FLASHINFER_ENABLE_BF16}
-    --enable_fp8 ${FLASHINFER_ENABLE_FP8}
+  COMMAND ${AOT_GENERATE_COMMAND}
   DEPENDS ${FLASHINFER_GENERATORS}
   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
   COMMENT "Generating kernel sources"
