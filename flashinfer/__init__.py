@@ -88,13 +88,4 @@ from .sampling import top_p_renorm_probs as top_p_renorm_probs
 from .sampling import top_p_sampling_from_probs as top_p_sampling_from_probs
 from .sparse import BlockSparseAttentionWrapper as BlockSparseAttentionWrapper
 
-try:
-    from ._build_meta import __version__ as __version__
-except ImportError:
-    with open("version.txt") as f:
-        __version__ = f.read().strip()
-
-try:
-    import aot_config as aot_config  # type: ignore[import]
-except ImportError:
-    aot_config = None
+from ._build_meta import __version__ as __version__

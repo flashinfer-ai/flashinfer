@@ -2,7 +2,7 @@ import hashlib
 import pathlib
 import re
 
-for path in sorted(pathlib.Path("python/dist").glob("*.whl")):
+for path in sorted(pathlib.Path("dist").glob("*.whl")):
     with open(path, "rb") as f:
         sha256 = hashlib.sha256(f.read()).hexdigest()
     ver, cu, torch = re.findall(
@@ -10,8 +10,7 @@ for path in sorted(pathlib.Path("python/dist").glob("*.whl")):
     )[0]
     index_dir = pathlib.Path(f"flashinfer-whl/cu{cu}/torch{torch}/flashinfer")
     index_dir.mkdir(exist_ok=True)
-    index_path = index_dir / "index.html"
-    with index_path.open("a") as f:
-        f.write(
-            f'<a href="https://github.com/flashinfer-ai/flashinfer/releases/download/v{ver}/{path.name}#sha256={sha256}">{path.name}</a><br>\n'
-        )
+    base_url = "https://github.com/flashinfer-ai/flashinfer/releases/download"
+    full_url = f"{base_url}/v{ver}/{path.name}#sha256={sha256}"
+    with (index_dir / "index.html").open("a") as f:
+        f.write(f'<a href="{full_url}">{path.name}</a><br>\n')

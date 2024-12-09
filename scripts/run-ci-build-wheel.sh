@@ -13,7 +13,6 @@ assert_env() {
 assert_env FLASHINFER_CI_PYTHON_VERSION
 assert_env FLASHINFER_CI_TORCH_VERSION
 assert_env FLASHINFER_CI_CUDA_VERSION
-assert_env FLASHINFER_BUILD_VERSION
 assert_env TORCH_CUDA_ARCH_LIST
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export CONDA_pkgs_dirs=/ci-cache/conda-pkgs
@@ -36,14 +35,13 @@ echo "::endgroup::"
 
 echo "::group::Install build system"
 pip install ninja numpy
-pip install --upgrade setuptools==69.5.1 wheel build
+pip install --upgrade setuptools wheel build
 echo "::endgroup::"
 
 
 echo "::group::Build wheel for FlashInfer"
-cd "$PROJECT_ROOT/python"
-FLASHINFER_BUILD_VERSION="${FLASHINFER_BUILD_VERSION}+cu${CUDA_MAJOR}${CUDA_MINOR}torch${FLASHINFER_CI_TORCH_VERSION}" python aot_setup.py bdist_wheel
-rm -f dist/*.tar.gz
+cd "$PROJECT_ROOT"
+FLASHINFER_ENABLE_AOT=1 FLASHINFER_LOCAL_VERSION="cu${CUDA_MAJOR}${CUDA_MINOR}torch${FLASHINFER_CI_TORCH_VERSION}" python -m build --no-isolation --wheel
 python -m build --no-isolation --sdist
 ls -la dist/
 echo "::endgroup::"

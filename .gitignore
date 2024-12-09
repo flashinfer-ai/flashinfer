@@ -1,27 +1,17 @@
 # ci
 flashinfer-whl/
-python/dist
+dist/
 
 # Compile commands json file
 compile_commands.json
 
-# Generated inst files
-src/dispatch.inc
-
-# Generated cu files
+# Generated files
+csrc/generated/
+docs/generated/
+flashinfer/_build_meta.py
+flashinfer/data/
+flashinfer/jit/aot_config.py
 src/generated/
-python/csrc/generated/
-python/flashinfer/_build_meta.py
-python/flashinfer/jit/aot_config.py
-python/csrc-aot/generated/
-
-# Package files
-python/flashinfer/data/
-python/flashinfer/version.txt
-python/MANIFEST.in
-
-# Generated documentation files
-docs/generated
 
 # DS_Store files
 .DS_store
