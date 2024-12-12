@@ -11,7 +11,7 @@ Up/Gate output activation
 -------------------------
 
 .. autosummary::
-    :toctree: ../../generated
+    :toctree: ../generated
 
     silu_and_mul
     gelu_tanh_and_mul

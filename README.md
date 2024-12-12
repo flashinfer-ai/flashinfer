@@ -36,7 +36,7 @@ Using our PyTorch API is the easiest way to get started:
 
 ### Installation
 
-We provide prebuilt wheels for Linux and you can try out FlashInfer with the following command:
+We provide prebuilt wheels for Linux. You can install FlashInfer with the following command:
 
 ```bash
 # For CUDA 12.4 & torch 2.4
@@ -44,22 +44,27 @@ pip install flashinfer -i https://flashinfer.ai/whl/cu124/torch2.4
 # For other CUDA & torch versions, please check https://docs.flashinfer.ai/installation.html
 ```
 
-or you can build from source:
+We also offer nightly-built wheels to try the latest features from the main branch:
+
+```bash
+pip install flashinfer -i https://flashinfer.ai/whl/nightly/cu124/torch2.4
+```
+
+Alternatively, you can build FlashInfer from source:
 
 ```bash
 git clone https://github.com/flashinfer-ai/flashinfer.git --recursive
 cd flashinfer
-pip install -e .
+pip install -e . -v
 ```
 
-to reduce binary size during build and testing:
+By default, FlashInfer uses Just-In-Time (JIT) compilation for its kernels. To pre-compile essential kernels, set the environment variable `FLASHINFER_ENABLE_AOT=1` before running the installation command:
+
 ```bash
-git clone https://github.com/flashinfer-ai/flashinfer.git --recursive
-cd flashinfer
-# ref https://pytorch.org/docs/stable/generated/torch.cuda.get_device_capability.html#torch.cuda.get_device_capability
-export TORCH_CUDA_ARCH_LIST=8.0
-pip install -e .
+FLASHINFER_ENABLE_AOT=1 pip install -e . -v
 ```
+
+For more details, refer to the [Install from Source documentation](https://docs.flashinfer.ai/installation.html#install-from-source).
 
 ### Trying it out
 
@@ -118,7 +123,7 @@ FlashInfer also provides C++ API and TVM bindings, please refer to [documentatio
 
 ## Adoption
 
-Currently FlashInfer is adopted by the following projects:
+We are thrilled to share that FlashInfer is being adopted by many cutting-edge projects, including but not limited to:
 - [MLC-LLM](https://github.com/mlc-ai/mlc-llm)
 - [Punica](https://github.com/punica-ai/punica)
 - [SGLang](https://github.com/sgl-project/sglang)

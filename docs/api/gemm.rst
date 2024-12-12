@@ -11,7 +11,7 @@ FP8 Batch GEMM
 --------------
 
 .. autosummary::
-    :toctree: ../../generated
+    :toctree: ../generated
 
     bmm_fp8
 

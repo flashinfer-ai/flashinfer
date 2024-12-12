@@ -8,7 +8,7 @@ Kernels for applying rotary embeddings.
 .. currentmodule:: flashinfer.rope
 
 .. autosummary::
-    :toctree: _generate
+    :toctree: ../generated
 
     apply_rope_inplace
     apply_llama31_rope_inplace

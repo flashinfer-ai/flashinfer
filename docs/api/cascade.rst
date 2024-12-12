@@ -11,7 +11,7 @@ Merge Attention States
 ----------------------
 
 .. autosummary::
-   :toctree: ../../generated
+   :toctree: ../generated
 
    merge_state
    merge_state_in_place

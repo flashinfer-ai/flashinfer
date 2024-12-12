@@ -8,7 +8,7 @@ Quantization related kernels.
 .. currentmodule:: flashinfer.quantization
 
 .. autosummary::
-    :toctree: _generate
+    :toctree: ../generated
 
     packbits
     segment_packbits
