@@ -8,7 +8,7 @@ Kernels for normalization layers.
 .. currentmodule:: flashinfer.norm
 
 .. autosummary::
-    :toctree: _generate
+    :toctree: ../generated
 
     rmsnorm
     fused_add_rmsnorm

@@ -11,7 +11,7 @@ Single Request Prefill/Append Attention
 ---------------------------------------
 
 .. autosummary::
-    :toctree: ../../generated
+    :toctree: ../generated
 
     single_prefill_with_kv_cache
     single_prefill_with_kv_cache_return_lse

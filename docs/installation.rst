@@ -118,6 +118,7 @@ AOT mode
    - Core CUDA kernels are pre-compiled and included in the library, reducing runtime compilation overhead.
    - If a required kernel is not pre-compiled, it will be compiled at runtime using JIT. AOT mode is recommended for production environments.
 
+JIT mode is the default installation mode. To enable AOT mode, set the environment variable ``FLASHINFER_ENABLE_AOT=1`` before installing FlashInfer.
 You can follow the steps below to install FlashInfer from source code:
 
 1. Clone the FlashInfer repository:
@@ -156,7 +157,7 @@ You can follow the steps below to install FlashInfer from source code:
                cd flashinfer
                TORCH_CUDA_ARCH_LIST="7.5 8.0 8.9 9.0a" FLASHINFER_ENABLE_AOT=1 pip install --no-build-isolation --verbose --editable .
 
-5. Create FlashInfer distributions
+5. Create FlashInfer distributions (optional):
 
    .. tabs::
 

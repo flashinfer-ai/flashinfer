@@ -9,7 +9,7 @@ Single Request Decoding
 -----------------------
 
 .. autosummary::
-    :toctree: ../../generated
+    :toctree: ../generated
 
     single_decode_with_kv_cache
 
