@@ -317,10 +317,10 @@ class MultiLevelCascadeAttentionWrapper:
         float_workspace_buffer: torch.Tensor,
         kv_layout: str = "NHD",
         use_cuda_graph: bool = False,
-        qo_indptr_buf_arr: Optional[list[torch.Tensor]] = None,
-        paged_kv_indptr_buf_arr: Optional[list[torch.Tensor]] = None,
-        paged_kv_indices_buf_arr: Optional[list[torch.Tensor]] = None,
-        paged_kv_last_page_len_buf_arr: Optional[list[torch.Tensor]] = None,
+        qo_indptr_buf_arr: Optional[List[torch.Tensor]] = None,
+        paged_kv_indptr_buf_arr: Optional[List[torch.Tensor]] = None,
+        paged_kv_indices_buf_arr: Optional[List[torch.Tensor]] = None,
+        paged_kv_last_page_len_buf_arr: Optional[List[torch.Tensor]] = None,
     ) -> None:
         r"""Constructor of :class:`MultiLevelCascadeAttentionWrapper`.
 
