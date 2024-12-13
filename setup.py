@@ -83,7 +83,7 @@ def generate_cuda() -> None:
 
 ext_modules = []
 cmdclass = {}
-install_requires = ["torch"]
+install_requires = ["torch", "ninja"]
 generate_build_meta({})
 generate_cuda()
 
