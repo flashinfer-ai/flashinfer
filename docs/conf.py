@@ -1,5 +1,6 @@
 import os
 import sys
+from pathlib import Path
 
 # import tlcpack_sphinx_addon
 # Configuration file for the Sphinx documentation builder.
@@ -10,16 +11,18 @@ import sys
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
-sys.path.insert(0, os.path.abspath(".."))
+root = Path(__file__).parents[1].resolve()
+sys.path.append(str(root))
 os.environ["BUILD_DOC"] = "1"
-autodoc_mock_imports = ["torch", "triton"]
+autodoc_mock_imports = ["torch", "triton", "flashinfer.jit.aot_config"]
 
 project = "FlashInfer"
 author = "FlashInfer Contributors"
-copyright = "2023-2024, {}".format(author)
+copyright = f"2023-2024, {author}"
 
-version = "0.1.6"
-release = "0.1.6"
+package_version = (root / "version.txt").read_text().strip()
+version = package_version
+release = package_version
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
