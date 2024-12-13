@@ -29,8 +29,11 @@ def build_editable(wheel_directory, config_settings=None, metadata_directory=Non
     def ln(src: str, dst: str) -> None:
         src: Path = root / src
         dst: Path = data_dir / dst
-        if dst.exists() and dst.is_symlink():
-            dst.unlink()
+        if dst.exists():
+            if dst.is_symlink():
+                dst.unlink()
+            elif dst.is_dir():
+                dst.rmdir()
         dst.symlink_to(src, target_is_directory=True)
 
     ln("3rdparty/cutlass", "cutlass")
