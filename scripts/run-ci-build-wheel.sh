@@ -10,7 +10,6 @@ assert_env() {
     fi
 }
 
-assert_env FLASHINFER_CI_PYTHON_VERSION
 assert_env FLASHINFER_CI_TORCH_VERSION
 assert_env FLASHINFER_CI_CUDA_VERSION
 assert_env TORCH_CUDA_ARCH_LIST
@@ -25,8 +24,8 @@ CUDA_MAJOR="${FLASHINFER_CI_CUDA_VERSION%.*}"
 CUDA_MINOR="${FLASHINFER_CI_CUDA_VERSION#*.}"
 TORCH_MAJOR="${FLASHINFER_CI_TORCH_VERSION%.*}"
 TORCH_MINOR="${FLASHINFER_CI_TORCH_VERSION#*.}"
-PYVER="${FLASHINFER_CI_PYTHON_VERSION//./}"
-export PATH="/opt/python/cp${PYVER}-cp${PYVER}/bin:$PATH"
+#PYVER="${FLASHINFER_CI_PYTHON_VERSION//./}"
+#export PATH="/opt/python/cp${PYVER}-cp${PYVER}/bin:$PATH"
 
 
 echo "::group::Install PyTorch"
@@ -41,7 +40,7 @@ echo "::endgroup::"
 
 echo "::group::Build wheel for FlashInfer"
 cd "$PROJECT_ROOT"
-FLASHINFER_ENABLE_AOT=1 FLASHINFER_LOCAL_VERSION="cu${CUDA_MAJOR}${CUDA_MINOR}torch${FLASHINFER_CI_TORCH_VERSION}" python -m build --no-isolation --wheel
+FLASHINFER_ENABLE_AOT=1 FLASHINFER_LOCAL_VERSION="cu${CUDA_MAJOR}${CUDA_MINOR}torch${FLASHINFER_CI_TORCH_VERSION}" python -m build --no-isolation --wheel -C--py-limited-api=cp38
 python -m build --no-isolation --sdist
 ls -la dist/
 echo "::endgroup::"
