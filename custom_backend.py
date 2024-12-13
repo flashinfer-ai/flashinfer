@@ -6,11 +6,10 @@ from setuptools.build_meta import *  # noqa: F403
 
 
 def _get_requires_for_build():
-    return (
-        ["torch", "ninja"]
-        if os.environ.get("FLASHINFER_ENABLE_AOT", "0") == "1"
-        else ["ninja"]
-    )
+    requires = []
+    if os.environ.get("FLASHINFER_ENABLE_AOT", "0") == "1":
+        requires += ["torch", "ninja"]
+    return requires
 
 
 def get_requires_for_build_wheel(config_settings=None):
