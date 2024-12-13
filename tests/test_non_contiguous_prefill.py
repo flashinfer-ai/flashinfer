@@ -24,7 +24,7 @@ import flashinfer
 @pytest.fixture(autouse=True, scope="module")
 def warmup_jit():
     if flashinfer.jit.has_prebuilt_ops:
-        return
+        yield
     try:
         flashinfer.jit.parallel_load_modules(
             jit_prefill_attention_func_args(
