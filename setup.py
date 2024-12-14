@@ -198,6 +198,7 @@ if enable_aot:
                 "cxx": cxx_flags,
                 "nvcc": nvcc_flags,
             },
+            py_limited_api=True,
         ),
         torch_cpp_ext.CUDAExtension(
             name="flashinfer._kernels_sm90",
@@ -207,6 +208,7 @@ if enable_aot:
                 "cxx": cxx_flags,
                 "nvcc": nvcc_flags + sm90a_flags,
             },
+            py_limited_api=True,
         ),
     ]
 
@@ -214,5 +216,6 @@ setuptools.setup(
     version=get_version(),
     ext_modules=ext_modules,
     cmdclass=cmdclass,
+    options={"bdist_wheel": {"py_limited_api": "cp38"}},
     install_requires=install_requires,
 )
