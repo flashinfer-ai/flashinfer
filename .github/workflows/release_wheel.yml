@@ -60,75 +60,74 @@ jobs:
           name: wheel-cuda${{ matrix.cuda }}-torch${{ matrix.torch }}
           path: dist/*
 
-# Commented for testing unified-wheel-build
-  # release:
-  #   needs: build
-  #   runs-on: [self-hosted]
-  #   steps:
-  #     - uses: actions/download-artifact@v4
-  #       with:
-  #         path: dist/
-  #         merge-multiple: true
-  #         pattern: wheel-*
+  release:
+    needs: build
+    runs-on: [self-hosted]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+          pattern: wheel-*
 
-  #     - run: ls -lah dist/
+      - run: ls -lah dist/
 
-  #     - uses: softprops/action-gh-release@v1
-  #       with:
-  #         tag_name: ${{ inputs.tag_name }}
-  #         files: |
-  #           dist/flashinfer*cp38*.whl
+      - uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          files: |
+            dist/flashinfer*cp38*.whl
 
-  #     - uses: softprops/action-gh-release@v1
-  #       with:
-  #         tag_name: ${{ inputs.tag_name }}
-  #         files: |
-  #           dist/flashinfer*cp39*.whl
+      - uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          files: |
+            dist/flashinfer*cp39*.whl
 
-  #     - uses: softprops/action-gh-release@v1
-  #       with:
-  #         tag_name: ${{ inputs.tag_name }}
-  #         files: |
-  #           dist/flashinfer*cp310*.whl
+      - uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          files: |
+            dist/flashinfer*cp310*.whl
 
-  #     - uses: softprops/action-gh-release@v1
-  #       with:
-  #         tag_name: ${{ inputs.tag_name }}
-  #         files: |
-  #           dist/flashinfer*cp311*.whl
+      - uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          files: |
+            dist/flashinfer*cp311*.whl
 
-  #     - uses: softprops/action-gh-release@v1
-  #       with:
-  #         tag_name: ${{ inputs.tag_name }}
-  #         files: |
-  #           dist/flashinfer*cp312*.whl
+      - uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          files: |
+            dist/flashinfer*cp312*.whl
 
-  #     - uses: softprops/action-gh-release@v1
-  #       with:
-  #         tag_name: ${{ inputs.tag_name }}
-  #         files: |
-  #           dist/flashinfer-*.tar.gz
+      - uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          files: |
+            dist/flashinfer-*.tar.gz
 
-  #     - name: Clone wheel index
-  #       run: git clone https://oauth2:${WHL_TOKEN}@github.com/flashinfer-ai/whl.git flashinfer-whl
-  #       env:
-  #         WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
+      - name: Clone wheel index
+        run: git clone https://oauth2:${WHL_TOKEN}@github.com/flashinfer-ai/whl.git flashinfer-whl
+        env:
+          WHL_TOKEN: ${{ secrets.WHL_TOKEN }}
 
-  #     - name: Update wheel index
-  #       run: python3 scripts/update_whl_index.py
+      - name: Update wheel index
+        run: python3 scripts/update_whl_index.py
 
-  #     - name: Push wheel index
-  #       run: |
-  #         cd flashinfer-whl
-  #         git config --local user.name "github-actions[bot]"
-  #         git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
-  #         git add -A
-  #         git commit -m "update whl"
-  #         git push
+      - name: Push wheel index
+        run: |
+          cd flashinfer-whl
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "update whl"
+          git push
 
-  #     # - name: Upload sdist to pypi
-  #     #   run: |
-  #     #     pip install twine
-  #     #     python -m twine upload --repository testpypi --username=__token__ dist/*.tar.gz
-  #     #   env:
-  #     #     TWINE_PASSWORD: ${{ secrets.PYPI_TEST_TOKEN }}
+      # - name: Upload sdist to pypi
+      #   run: |
+      #     pip install twine
+      #     python -m twine upload --repository testpypi --username=__token__ dist/*.tar.gz
+      #   env:
+      #     TWINE_PASSWORD: ${{ secrets.PYPI_TEST_TOKEN }}
