@@ -100,10 +100,3 @@ jobs:
           git add -A
           git commit -m "update whl"
           git push
-
-      # - name: Upload sdist to pypi
-      #   run: |
-      #     pip install twine
-      #     python -m twine upload --repository testpypi --username=__token__ dist/*.tar.gz
-      #   env:
-      #     TWINE_PASSWORD: ${{ secrets.PYPI_TEST_TOKEN }}
