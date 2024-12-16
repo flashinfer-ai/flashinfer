@@ -14,8 +14,8 @@ assert_env FLASHINFER_CI_TORCH_VERSION
 assert_env FLASHINFER_CI_CUDA_VERSION
 assert_env TORCH_CUDA_ARCH_LIST
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-export CONDA_pkgs_dirs=/ci-cache/conda-pkgs
-export XDG_CACHE_HOME=/ci-cache/xdg-cache
+export CONDA_pkgs_dirs="${FLASHINFER_CI_CACHE:=/ci-cache}/conda-pkgs"
+export XDG_CACHE_HOME="${FLASHINFER_CI_CACHE:=/ci-cache}/xdg-cache"
 mkdir -p "$CONDA_pkgs_dirs" "$XDG_CACHE_HOME"
 export HOME=/tmp/home
 mkdir -p $HOME
