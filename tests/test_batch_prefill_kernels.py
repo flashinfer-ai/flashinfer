@@ -25,23 +25,24 @@ import flashinfer
 def warmup_jit():
     if flashinfer.jit.has_prebuilt_ops:
         yield
-    try:
-        flashinfer.jit.parallel_load_modules(
-            jit_prefill_attention_func_args(
-                [torch.float16],  # q_dtypes
-                [torch.float16, torch.float8_e4m3fn, torch.float8_e5m2],  # kv_dtypes
-                [128, 256],  # head_dims
-                [0, 1, 2],  # pos_encoding_modes
-                [False],  # use_sliding_windows
-                [False, True],  # use_logits_soft_caps
-                [False],  # allow_fp16_qk_reductions
+    else:
+        try:
+            flashinfer.jit.parallel_load_modules(
+                jit_prefill_attention_func_args(
+                    [torch.float16],  # q_dtypes
+                    [torch.float16, torch.float8_e4m3fn, torch.float8_e5m2],  # kv_dtypes
+                    [128, 256],  # head_dims
+                    [0, 1, 2],  # pos_encoding_modes
+                    [False],  # use_sliding_windows
+                    [False, True],  # use_logits_soft_caps
+                    [False],  # allow_fp16_qk_reductions
+                )
             )
-        )
-    except Exception as e:
-        # abort the test session if warmup fails
-        pytest.exit(str(e))
-    finally:
-        yield
+        except Exception as e:
+            # abort the test session if warmup fails
+            pytest.exit(str(e))
+        finally:
+            yield
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])

@@ -25,32 +25,33 @@ import flashinfer
 def warmup_jit():
     if flashinfer.jit.has_prebuilt_ops:
         yield
-    try:
-        flashinfer.jit.parallel_load_modules(
-            jit_decode_attention_func_args(
-                [torch.float16],  # q_dtypes
-                [torch.float16],  # kv_dtypes
-                [128, 256],  # head_dims
-                [0],  # pos_encoding_modes
-                [False],  # use_sliding_windows
-                [False],  # use_logits_soft_caps
+    else:
+        try:
+            flashinfer.jit.parallel_load_modules(
+                jit_decode_attention_func_args(
+                    [torch.float16],  # q_dtypes
+                    [torch.float16],  # kv_dtypes
+                    [128, 256],  # head_dims
+                    [0],  # pos_encoding_modes
+                    [False],  # use_sliding_windows
+                    [False],  # use_logits_soft_caps
+                )
+                + jit_prefill_attention_func_args(
+                    [torch.float16],  # q_dtypes
+                    [torch.float16],  # kv_dtypes
+                    [128, 256],  # head_dims
+                    [0],  # pos_encoding_modes
+                    [False],  # use_sliding_windows
+                    [False],  # use_logits_soft_caps
+                    [False],  # allow_fp16_qk_reductions
+                )
+                + [flashinfer.page.get_page_module, []]
             )
-            + jit_prefill_attention_func_args(
-                [torch.float16],  # q_dtypes
-                [torch.float16],  # kv_dtypes
-                [128, 256],  # head_dims
-                [0],  # pos_encoding_modes
-                [False],  # use_sliding_windows
-                [False],  # use_logits_soft_caps
-                [False],  # allow_fp16_qk_reductions
-            )
-            + [flashinfer.page.get_page_module, []]
-        )
-    except Exception as e:
-        # abort the test session if warmup fails
-        pytest.exit(str(e))
-    finally:
-        yield
+        except Exception as e:
+            # abort the test session if warmup fails
+            pytest.exit(str(e))
+        finally:
+            yield
 
 
 def ceil_div(a, b):

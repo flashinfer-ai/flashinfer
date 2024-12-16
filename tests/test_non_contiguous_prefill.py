@@ -25,23 +25,24 @@ import flashinfer
 def warmup_jit():
     if flashinfer.jit.has_prebuilt_ops:
         yield
-    try:
-        flashinfer.jit.parallel_load_modules(
-            jit_prefill_attention_func_args(
-                [torch.float16],  # q_dtypes
-                [torch.float16],  # kv_dtypes
-                [64, 128, 256],  # head_dims
-                [0],  # pos_encoding_modes
-                [False],  # use_sliding_windows
-                [False],  # use_logits_soft_caps
-                [False],  # allow_fp16_qk_reductions
+    else:
+        try:
+            flashinfer.jit.parallel_load_modules(
+                jit_prefill_attention_func_args(
+                    [torch.float16],  # q_dtypes
+                    [torch.float16],  # kv_dtypes
+                    [64, 128, 256],  # head_dims
+                    [0],  # pos_encoding_modes
+                    [False],  # use_sliding_windows
+                    [False],  # use_logits_soft_caps
+                    [False],  # allow_fp16_qk_reductions
+                )
             )
-        )
-    except Exception as e:
-        # abort the test session if warmup fails
-        pytest.exit(str(e))
-    finally:
-        yield
+        except Exception as e:
+            # abort the test session if warmup fails
+            pytest.exit(str(e))
+        finally:
+            yield
 
 
 @pytest.mark.parametrize("seq_len", [1, 7, 127, 999, 3579])
