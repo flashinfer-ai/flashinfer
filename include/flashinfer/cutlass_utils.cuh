@@ -44,28 +44,36 @@ namespace flashinfer {
 
 template <typename T>
 struct cutlass_dtype {
-  using value = T;
+  using type = T;
 };
 
 template <>
 struct cutlass_dtype<half> {
-  using value = cutlass::half_t;
+  using type = cutlass::half_t;
 };
 
 template <>
 struct cutlass_dtype<nv_bfloat16> {
-  using value = cutlass::bfloat16_t;
+  using type = cutlass::bfloat16_t;
 };
 
 template <>
 struct cutlass_dtype<__nv_fp8_e4m3> {
-  using value = cutlass::float_e4m3_t;
+  using type = cutlass::float_e4m3_t;
 };
 
 template <>
 struct cutlass_dtype<__nv_fp8_e5m2> {
-  using value = cutlass::float_e5m2_t;
+  using type = cutlass::float_e5m2_t;
 };
+
+template <typename T>
+using cutlass_dtype_t = typename cutlass_dtype<T>::type;
+
+template <typename T>
+void compileTimeDebug(T&&) {
+  static_assert(sizeof(T) == 0, "Compile time debug");
+}
 
 }  // namespace flashinfer
 

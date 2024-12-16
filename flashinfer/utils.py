@@ -260,3 +260,95 @@ def determine_gemm_backend(device: torch.device) -> str:
         return "sm90"
     else:
         return "sm80"
+
+
+def is_fa3_backend_supported(
+    pos_encoding_mode: int,
+    allow_fp16_qk_reductions: bool,
+    use_custom_mask: bool,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+) -> bool:
+    """
+    Check if the FA3 backend is supported based on the given parameters.
+    NOTE(Zihao): this function is a workaround for the lack of support for certain features in
+    our FA3 backend, and will be removed once the backend is fully supported.
+
+    Parameters
+    ----------
+    pos_encoding_mode : int
+        The positional encoding mode.
+    allow_fp16_qk_reductions : bool
+        Whether FP16 QK reductions are allowed.
+    use_custom_mask : bool
+        Whether a custom mask is used.
+    dtype_q : torch.dtype
+        The data type of the query tensor.
+    dtype_kv : torch.dtype
+        The data type of the key-value tensor.
+
+    Returns
+    -------
+    bool
+        True if the FA3 backend is supported, False otherwise.
+    """
+    if use_custom_mask:
+        return False
+    if pos_encoding_mode != PosEncodingMode.NONE.value:
+        return False
+    if allow_fp16_qk_reductions:
+        return False
+    # NOTE: currently fp8 is not supported in our FA3 backend
+    # will add support soon
+    if dtype_q in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        return False
+    if dtype_kv in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        return False
+    return True
+
+
+def determine_attention_backend(
+    device: torch.device,
+    pos_encoding_mode: int,
+    allow_fp16_qk_reductions: bool,
+    use_custom_mask: bool,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+) -> str:
+    """
+    Determine the appropriate attention backend based on the device and parameters.
+
+    Parameters
+    ----------
+    device : torch.device
+        The device to be used.
+    mask_mode : int
+        The mask mode.
+    pos_encoding_mode : int
+        The positional encoding mode.
+    allow_fp16_qk_reductions : bool
+        Whether FP16 QK reductions are allowed.
+    use_custom_mask : bool
+        Whether a custom mask is used.
+    dtype_q : torch.dtype
+        The data type of the query tensor.
+    dtype_kv : torch.dtype
+        The data type of the key-value tensor.
+
+    Returns
+    -------
+    str
+        The name of the attention backend to be used.
+    """
+    major, _ = get_compute_capability(device)
+
+    if major >= 9 and is_fa3_backend_supported(
+        pos_encoding_mode,
+        allow_fp16_qk_reductions,
+        use_custom_mask,
+        dtype_q,
+        dtype_kv,
+    ):
+        return "fa3"
+    else:
+        return "fa2"

@@ -78,7 +78,7 @@ void single_prefill_with_kv_cache(unsigned int mask_mode_code, at::Tensor q, at:
     using DTypeO = DTypeQ;
     return DISPATCH_mask_mode(mask_mode, MASK_MODE, [&] {
       return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-        return DISPATCH_LOGITS_SOFT_CAP(use_logits_soft_cap, USE_LOGITS_SOFT_CAP, [&] {
+        return DISPATCH_BOOL(use_logits_soft_cap, USE_LOGITS_SOFT_CAP, [&] {
           using ParamsT = SinglePrefillParams<DTypeQ, DTypeKV, DTypeO>;
           using AttentionVariant =
               ComposedAttention<ParamsT, get_variant_code(

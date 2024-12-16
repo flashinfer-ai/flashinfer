@@ -76,7 +76,7 @@ void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::T
     using DTypeKV = kv_type;
     using DTypeO = DTypeQ;
     return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-      return DISPATCH_LOGITS_SOFT_CAP(logits_soft_cap > 0, USE_LOGITS_SOFT_CAP, [&] {
+      return DISPATCH_BOOL(logits_soft_cap > 0, USE_LOGITS_SOFT_CAP, [&] {
         using ParamsT = SingleDecodeParams<DTypeQ, DTypeKV, DTypeO>;
         using AttentionVariant =
             ComposedAttention<ParamsT,

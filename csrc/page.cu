@@ -110,3 +110,30 @@ void append_paged_kv_cache(at::Tensor append_key, at::Tensor append_value, at::T
 
   TORCH_CHECK(success, "AppendPagedKVCache failed to dispatch with dtype ", kv_scalar_dtype);
 }
+
+void block_sparse_indices_to_vector_sparse_offsets(at::Tensor block_sparse_indices,
+                                                   at::Tensor block_sparse_indptr,
+                                                   at::Tensor vector_sparse_offsets,
+                                                   at::Tensor vector_sparse_indptr,
+                                                   at::Tensor kv_len_arr, unsigned int stride_block,
+                                                   unsigned int stride_n, unsigned int batch_size,
+                                                   unsigned int block_size, int64_t cuda_stream) {
+  CHECK_INPUT(block_sparse_indices);
+  CHECK_INPUT(block_sparse_indptr);
+  CHECK_INPUT(vector_sparse_offsets);
+  CHECK_INPUT(vector_sparse_indptr);
+  CHECK_INPUT(kv_len_arr);
+
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+
+  cudaError_t status = BlockSparseIndicesToVectorSparseOffset(
+      static_cast<int32_t*>(block_sparse_indices.data_ptr()),
+      static_cast<int32_t*>(block_sparse_indptr.data_ptr()),
+      static_cast<int32_t*>(vector_sparse_offsets.data_ptr()),
+      static_cast<int32_t*>(vector_sparse_indptr.data_ptr()),
+      static_cast<int32_t*>(kv_len_arr.data_ptr()), stride_block, stride_n, batch_size, block_size,
+      stream);
+
+  TORCH_CHECK(status == cudaSuccess, "BlockSparseIndicesToVectorSparseOffset failed with error: ",
+              cudaGetErrorString(status));
+}

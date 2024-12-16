@@ -36,7 +36,9 @@ mask_modes = os.environ.get("FLASHINFER_MASK_MODES", "0,1,2").split(",")
 
 head_dims = list(map(int, head_dims))
 pos_encoding_modes = list(map(int, pos_encoding_modes))
+pos_encoding_modes_sm90 = [mode for mode in pos_encoding_modes if mode != 2]
 allow_fp16_qk_reductions = list(map(int, allow_fp16_qk_reductions))
+allow_fp16_qk_reductions_sm90 = [mode for mode in allow_fp16_qk_reductions if mode != 1]
 mask_modes = list(map(int, mask_modes))
 
 enable_aot = os.environ.get("FLASHINFER_ENABLE_AOT", "0") == "1"
@@ -66,6 +68,7 @@ def generate_cuda() -> None:
     try:  # no aot_build_utils in sdist
         sys.path.append(str(root))
         from aot_build_utils.generate import get_instantiation_cu
+        from aot_build_utils.generate_sm90 import get_sm90_instantiation_cu
     except ImportError:
         return
 
@@ -78,6 +81,15 @@ def generate_cuda() -> None:
             mask_modes=mask_modes,
             enable_bf16=enable_bf16,
             enable_fp8=enable_fp8,
+        )
+    ) + get_sm90_instantiation_cu(
+        argparse.Namespace(
+            path=gen_dir,
+            head_dims=head_dims,
+            pos_encoding_modes=pos_encoding_modes_sm90,
+            allow_fp16_qk_reductions=allow_fp16_qk_reductions_sm90,
+            mask_modes=mask_modes,
+            enable_bf16=enable_bf16,
         )
     )
     aot_config_str = f"""prebuilt_ops_uri = set({aot_kernel_uris})"""
@@ -185,10 +197,15 @@ if enable_aot:
     ]
     kernel_sm90_sources = [
         "csrc/group_gemm_sm90.cu",
-        "csrc/flashinfer_gemm_sm90_ops.cu",
+        "csrc/single_prefill_sm90.cu",
+        "csrc/batch_prefill_sm90.cu",
+        "csrc/flashinfer_ops_sm90.cu",
     ]
     decode_sources = list(gen_dir.glob("*decode_head*.cu"))
-    prefill_sources = list(gen_dir.glob("*prefill_head*.cu"))
+    prefill_sources = [
+        f for f in gen_dir.glob("*prefill_head*.cu") if "_sm90" not in f.name
+    ]
+    prefill_sm90_sources = list(gen_dir.glob("*prefill_head*_sm90.cu"))
     ext_modules = [
         torch_cpp_ext.CUDAExtension(
             name="flashinfer._kernels",
@@ -202,7 +219,7 @@ if enable_aot:
         ),
         torch_cpp_ext.CUDAExtension(
             name="flashinfer._kernels_sm90",
-            sources=kernel_sm90_sources,
+            sources=kernel_sm90_sources + prefill_sm90_sources,
             include_dirs=include_dirs,
             extra_compile_args={
                 "cxx": cxx_flags,

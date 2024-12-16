@@ -139,7 +139,6 @@ void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_r
   size_t k_rope_stride_h = k_rope.stride(1);
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-  cudaStream_t torch_current_stream(nullptr);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     cudaError_t status = BatchQKApplyRotaryPosIdsCosSinCache(
         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
@@ -231,7 +230,6 @@ void apply_llama31_rope_pos_ids(at::Tensor q, at::Tensor k, at::Tensor q_rope, a
   size_t k_rope_stride_h = k_rope.stride(1);
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-  cudaStream_t torch_current_stream(nullptr);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     cudaError_t status = BatchQKApplyLlama31RotaryPosIds(
         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
