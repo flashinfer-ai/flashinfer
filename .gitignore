@@ -9,6 +9,7 @@ compile_commands.json
 csrc/generated/
 docs/generated/
 flashinfer/_build_meta.py
+flashinfer/_version.py
 flashinfer/data/
 flashinfer/jit/aot_config.py
 src/generated/

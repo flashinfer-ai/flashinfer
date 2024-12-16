@@ -88,4 +88,4 @@ from .sampling import top_p_renorm_probs as top_p_renorm_probs
 from .sampling import top_p_sampling_from_probs as top_p_sampling_from_probs
 from .sparse import BlockSparseAttentionWrapper as BlockSparseAttentionWrapper
 
-from ._build_meta import __version__ as __version__
+from ._version import __version__ as __version__
