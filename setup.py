@@ -104,7 +104,8 @@ if enable_aot:
             raise RuntimeError("FlashInfer requires sm75+")
 
     cuda_version = get_cuda_version()
-    torch_version = Version(torch.__version__).base_version
+    torch_full_version = Version(torch.__version__)
+    torch_version = f"{torch_full_version.major}.{torch_full_version.minor}"
     local_version = f"cu{cuda_version.major}{cuda_version.minor}torch{torch_version}"
 
     aot_build_meta = {}
