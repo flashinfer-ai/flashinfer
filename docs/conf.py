@@ -1,6 +1,8 @@
 import os
 import sys
 from pathlib import Path
+from setuptools_scm import get_version
+from packaging.version import Version
 
 # import tlcpack_sphinx_addon
 # Configuration file for the Sphinx documentation builder.
@@ -20,9 +22,9 @@ project = "FlashInfer"
 author = "FlashInfer Contributors"
 copyright = f"2023-2024, {author}"
 
-package_version = (root / "version.txt").read_text().strip()
-version = package_version
-release = package_version
+package_version = Version(get_version(root=root, version_scheme="only-version"))
+version = str(package_version)
+release = package_version.base_version
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration

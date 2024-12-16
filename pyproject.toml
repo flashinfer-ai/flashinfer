@@ -23,7 +23,7 @@ urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 dynamic = ["dependencies", "version"]
 
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools", "setuptools-scm"]
 build-backend = "custom_backend"
 backend-path = ["."]
 
@@ -48,12 +48,15 @@ include-package-data = false
 "flashinfer.data" = [
     "csrc/**",
     "include/**",
-    "version.txt"
 ]
 "flashinfer.data.cutlass" = [
     "include/**",
     "tools/util/include/**"
 ]
+
+[tool.setuptools_scm]
+version_file = "flashinfer/_version.py"
+version_scheme = "only-version"
 
 [tool.mypy]
 ignore_missing_imports = false
