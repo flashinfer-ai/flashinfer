@@ -47,9 +47,6 @@ enable_fp8 = os.environ.get("FLASHINFER_ENABLE_FP8", "1") == "1"
 
 
 def get_version():
-    build_version = os.environ.get("FLASHINFER_BUILD_VERSION")
-    if build_version is not None:
-        return build_version
     package_version = (root / "version.txt").read_text().strip()
     local_version = os.environ.get("FLASHINFER_LOCAL_VERSION")
     if local_version is None:
@@ -131,7 +128,8 @@ if enable_aot:
             raise RuntimeError("FlashInfer requires sm75+")
 
     cuda_version = get_cuda_version()
-    torch_version = Version(torch.__version__).base_version
+    torch_full_version = Version(torch.__version__)
+    torch_version = f"{torch_full_version.major}.{torch_full_version.minor}"
     cmdclass["build_ext"] = NinjaBuildExtension
     install_requires = [f"torch == {torch_version}"]
 

@@ -45,6 +45,7 @@ jobs:
           docker run --rm -t \
               -v "$CI_RUNNER_CACHE_DIR":/ci-cache \
               -v "$GITHUB_WORKSPACE":/app \
+              -e FLASHINFER_CI_CACHE=/ci-cache \
               -e FLASHINFER_CI_CUDA_VERSION=${{ matrix.cuda }} \
               -e FLASHINFER_CI_TORCH_VERSION=${{ matrix.torch }} \
               -e TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" \
