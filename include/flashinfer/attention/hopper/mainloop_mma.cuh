@@ -204,11 +204,8 @@ CUTLASS_DEVICE void mma_f16(const Params& mainloop_params, AttentionVariant& var
   }
 
   if constexpr (LEFT_SLIDING_WINDOW) {
-    constexpr int n_swa_masking_steps = cute::ceil_div(CTA_Q, CTA_KV) + 1;
-#pragma unroll
-    for (int masking_step = 0;
-         masking_step < n_swa_masking_steps && kv_tile_idx > swa_begin_kv_tile_idx;
-         ++masking_step, --kv_tile_idx) {
+#pragma unroll 1
+    for (; kv_tile_idx > swa_begin_kv_tile_idx; --kv_tile_idx) {
       Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_QKD{}));
       consumer_wait(pipeline_k, smem_pipe_read_k);
       WarpScheduler::barrier_sync();
