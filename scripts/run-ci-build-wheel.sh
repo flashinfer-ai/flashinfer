@@ -10,12 +10,13 @@ assert_env() {
     fi
 }
 
-assert_env FLASHINFER_CI_TORCH_VERSION
+assert_env FLASHINFER_CI_CACHE
 assert_env FLASHINFER_CI_CUDA_VERSION
+assert_env FLASHINFER_CI_TORCH_VERSION
 assert_env TORCH_CUDA_ARCH_LIST
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-export CONDA_pkgs_dirs="${FLASHINFER_CI_CACHE:=/ci-cache}/conda-pkgs"
-export XDG_CACHE_HOME="${FLASHINFER_CI_CACHE:=/ci-cache}/xdg-cache"
+export CONDA_pkgs_dirs="${FLASHINFER_CI_CACHE}/conda-pkgs"
+export XDG_CACHE_HOME="${FLASHINFER_CI_CACHE}/xdg-cache"
 mkdir -p "$CONDA_pkgs_dirs" "$XDG_CACHE_HOME"
 export HOME=/tmp/home
 mkdir -p $HOME
@@ -25,6 +26,10 @@ CUDA_MINOR="${FLASHINFER_CI_CUDA_VERSION#*.}"
 TORCH_MAJOR="${FLASHINFER_CI_TORCH_VERSION%.*}"
 TORCH_MINOR="${FLASHINFER_CI_TORCH_VERSION#*.}"
 
+FLASHINFER_LOCAL_VERSION="cu${CUDA_MAJOR}${CUDA_MINOR}torch${FLASHINFER_CI_TORCH_VERSION}"
+if [ -n "${FLASHINFER_GIT_SHA}" ]; then
+    FLASHINFER_LOCAL_VERSION="${FLASHINFER_GIT_SHA}.${FLASHINFER_LOCAL_VERSION}"
+fi
 
 echo "::group::Install PyTorch"
 pip install torch==$FLASHINFER_CI_TORCH_VERSION --index-url "https://download.pytorch.org/whl/cu${CUDA_MAJOR}${CUDA_MINOR}"
@@ -32,13 +37,13 @@ echo "::endgroup::"
 
 echo "::group::Install build system"
 pip install ninja numpy
-pip install --upgrade build setuptools setuptools-scm wheel
+pip install --upgrade setuptools wheel build
 echo "::endgroup::"
 
 
 echo "::group::Build wheel for FlashInfer"
 cd "$PROJECT_ROOT"
-FLASHINFER_ENABLE_AOT=1 python -m build --no-isolation --wheel
+FLASHINFER_ENABLE_AOT=1 FLASHINFER_LOCAL_VERSION=$FLASHINFER_LOCAL_VERSION python -m build --no-isolation --wheel
 python -m build --no-isolation --sdist
 ls -la dist/
 echo "::endgroup::"
