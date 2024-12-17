@@ -28,7 +28,7 @@ from .batch_prefill_sm90_templ import (
     batch_prefill_sm90_templ,
 )
 from .batch_prefill_templ import batch_prefill_suffix, batch_prefill_templ
-from .core import load_cuda_ops
+from .core import load_cuda_ops, sm90a_nvcc_flags
 from .env import FLASHINFER_GEN_SRC_DIR
 from .single_decode_templ import (
     customizable_single_decode_templ,
@@ -333,7 +333,7 @@ def gen_single_prefill_sm90_module(*args):
         source_paths.append(path)
         write_if_different(path, source)
 
-    return load_cuda_ops(uri, source_paths)
+    return load_cuda_ops(uri, source_paths, extra_cuda_cflags=sm90a_nvcc_flags)
 
 
 def get_batch_prefill_sources(
@@ -445,7 +445,7 @@ def gen_batch_prefill_sm90_module(*args):
         source_paths.append(path)
         write_if_different(path, source)
 
-    return load_cuda_ops(uri, source_paths)
+    return load_cuda_ops(uri, source_paths, extra_cuda_cflags=sm90a_nvcc_flags)
 
 
 def get_customize_single_decode_sources(

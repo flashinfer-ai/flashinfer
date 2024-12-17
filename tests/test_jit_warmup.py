@@ -15,10 +15,10 @@ limitations under the License.
 """
 
 import torch
-from flashinfer.jit import parallel_load_modules
-from flashinfer.utils import PosEncodingMode
 
 import flashinfer
+from flashinfer.jit import parallel_load_modules
+from flashinfer.utils import PosEncodingMode
 
 
 def test_warmpup_llama():
@@ -44,6 +44,59 @@ def test_warmpup_llama():
             ),
             (
                 flashinfer.prefill.gen_batch_prefill_module,
+                [
+                    torch.float16,
+                    torch.float16,
+                    torch.float16,
+                    torch.int32,
+                    128,
+                    PosEncodingMode.NONE.value,
+                    False,  # use_sliding_window
+                    False,  # use_logits_soft_cap
+                    False,  # allow_fp16_qk_reduction
+                ],
+            ),
+        ]
+    )
+
+
+def test_warmpup_llama_sm90():
+    parallel_load_modules(
+        [
+            (flashinfer.activation.get_act_and_mul_module, ["silu"]),
+            (flashinfer.norm.get_norm_module, []),
+            (flashinfer.sampling.get_sampling_module, []),
+            (flashinfer.quantization.get_quantization_module, []),
+            (flashinfer.page.get_page_module, []),
+            (
+                flashinfer.decode.get_batch_decode_module,
+                [
+                    torch.float16,
+                    torch.float16,
+                    torch.float16,
+                    torch.int32,
+                    128,
+                    PosEncodingMode.NONE.value,
+                    False,  # use_sliding_window
+                    False,  # use_logits_soft_cap
+                ],
+            ),
+            (
+                flashinfer.prefill.gen_batch_prefill_module,
+                [
+                    torch.float16,
+                    torch.float16,
+                    torch.float16,
+                    torch.int32,
+                    128,
+                    PosEncodingMode.NONE.value,
+                    False,  # use_sliding_window
+                    False,  # use_logits_soft_cap
+                    False,  # allow_fp16_qk_reduction
+                ],
+            ),
+            (
+                flashinfer.prefill.gen_batch_prefill_sm90_module,
                 [
                     torch.float16,
                     torch.float16,
