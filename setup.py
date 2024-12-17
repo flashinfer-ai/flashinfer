@@ -26,7 +26,6 @@ import setuptools
 
 root = Path(__file__).parent.resolve()
 gen_dir = root / "csrc" / "generated"
-build_meta = root / "flashinfer" / "_build_meta.py"
 
 head_dims = os.environ.get("FLASHINFER_HEAD_DIMS", "64,128,256").split(",")
 pos_encoding_modes = os.environ.get("FLASHINFER_POS_ENCODING_MODES", "0").split(",")
@@ -45,6 +44,24 @@ mask_modes = list(map(int, mask_modes))
 enable_aot = os.environ.get("FLASHINFER_ENABLE_AOT", "0") == "1"
 enable_bf16 = os.environ.get("FLASHINFER_ENABLE_BF16", "1") == "1"
 enable_fp8 = os.environ.get("FLASHINFER_ENABLE_FP8", "1") == "1"
+
+
+def get_version():
+    build_version = os.environ.get("FLASHINFER_BUILD_VERSION")
+    if build_version is not None:
+        return build_version
+    package_version = (root / "version.txt").read_text().strip()
+    local_version = os.environ.get("FLASHINFER_LOCAL_VERSION")
+    if local_version is None:
+        return package_version
+    return f"{package_version}+{local_version}"
+
+
+def generate_build_meta(aot_build_meta: dict) -> None:
+    build_meta_str = f"__version__ = {get_version()!r}\n"
+    if len(aot_build_meta) != 0:
+        build_meta_str += f"build_meta = {aot_build_meta!r}\n"
+    (root / "flashinfer" / "_build_meta.py").write_text(build_meta_str)
 
 
 def generate_cuda() -> None:
@@ -81,16 +98,14 @@ def generate_cuda() -> None:
 
 ext_modules = []
 cmdclass = {}
-use_scm_version = {}
 install_requires = ["torch", "ninja"]
-build_meta.write_text("\n")
+generate_build_meta({})
 generate_cuda()
 
 if enable_aot:
     import torch
     import torch.utils.cpp_extension as torch_cpp_ext
     from packaging.version import Version
-    from setuptools_scm.version import get_local_node_and_date as default
 
     def get_cuda_version() -> Version:
         if torch_cpp_ext.CUDA_HOME is None:
@@ -116,9 +131,9 @@ if enable_aot:
             raise RuntimeError("FlashInfer requires sm75+")
 
     cuda_version = get_cuda_version()
-    torch_full_version = Version(torch.__version__)
-    torch_version = f"{torch_full_version.major}.{torch_full_version.minor}"
-    local_version = f"cu{cuda_version.major}{cuda_version.minor}torch{torch_version}"
+    torch_version = Version(torch.__version__).base_version
+    cmdclass["build_ext"] = NinjaBuildExtension
+    install_requires = [f"torch == {torch_version}"]
 
     aot_build_meta = {}
     aot_build_meta["cuda_major"] = cuda_version.major
@@ -126,11 +141,7 @@ if enable_aot:
     aot_build_meta["torch"] = torch_version
     aot_build_meta["python"] = platform.python_version()
     aot_build_meta["TORCH_CUDA_ARCH_LIST"] = os.environ.get("TORCH_CUDA_ARCH_LIST")
-    build_meta.write_text(f"build_meta = {aot_build_meta!r}\n")
-
-    cmdclass["build_ext"] = NinjaBuildExtension
-    use_scm_version["local_scheme"] = lambda x: f"{default(x)}.{local_version}"
-    install_requires = [f"torch == {torch_version}"]
+    generate_build_meta(aot_build_meta)
 
     if enable_bf16:
         torch_cpp_ext.COMMON_NVCC_FLAGS.append("-DFLASHINFER_ENABLE_BF16")
@@ -219,9 +230,9 @@ if enable_aot:
     ]
 
 setuptools.setup(
+    version=get_version(),
     ext_modules=ext_modules,
     cmdclass=cmdclass,
     options={"bdist_wheel": {"py_limited_api": "cp38"}},
     install_requires=install_requires,
-    use_scm_version=use_scm_version,
 )

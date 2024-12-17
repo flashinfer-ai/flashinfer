@@ -32,13 +32,13 @@ echo "::endgroup::"
 
 echo "::group::Install build system"
 pip install ninja numpy
-pip install --upgrade build setuptools setuptools-scm wheel
+pip install --upgrade setuptools wheel build
 echo "::endgroup::"
 
 
 echo "::group::Build wheel for FlashInfer"
 cd "$PROJECT_ROOT"
-FLASHINFER_ENABLE_AOT=1 python -m build --no-isolation --wheel
+FLASHINFER_ENABLE_AOT=1 FLASHINFER_LOCAL_VERSION="cu${CUDA_MAJOR}${CUDA_MINOR}torch${FLASHINFER_CI_TORCH_VERSION}" python -m build --no-isolation --wheel
 python -m build --no-isolation --sdist
 ls -la dist/
 echo "::endgroup::"
