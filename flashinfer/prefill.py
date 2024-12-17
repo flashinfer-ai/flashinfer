@@ -66,12 +66,12 @@ def get_single_prefill_sm90_module(*args):
     global _single_prefill_sm90_modules
     if args not in _single_prefill_sm90_modules:
         uri = get_single_prefill_sm90_uri(*args)
-        # if has_prebuilt_ops and uri in prebuilt_ops_uri:
-        from . import _kernels_sm90
+        if has_prebuilt_ops and uri in prebuilt_ops_uri:
+            from . import _kernels_sm90
 
-        run_func = _kernels_sm90.single_prefill_with_kv_cache_sm90
-        # else:
-        #     run_func = gen_single_prefill_sm90_module(*args).run
+            run_func = _kernels_sm90.single_prefill_with_kv_cache_sm90
+        else:
+            run_func = gen_single_prefill_sm90_module(*args).run
 
         @register_custom_op(f"flashinfer::{uri}_run", mutates_args=("tmp", "maybe_lse"))
         def run_single_prefill_sm90(
@@ -221,17 +221,23 @@ def get_batch_prefill_sm90_module(*args):
     if args not in _batch_prefill_sm90_modules:
         uri = get_batch_prefill_sm90_uri(*args)
 
-        from . import _kernels_sm90
+        if has_prebuilt_ops and uri in prebuilt_ops_uri:
+            from . import _kernels_sm90
 
-        head_dim = args[4]
-        plan_func = (
-            lambda *plan_args: _kernels_sm90.batch_prefill_with_kv_cache_sm90_plan(
-                head_dim,
-                *plan_args,
+            head_dim = args[4]
+            plan_func = (
+                lambda *plan_args: _kernels_sm90.batch_prefill_with_kv_cache_sm90_plan(
+                    head_dim,
+                    *plan_args,
+                )
             )
-        )
-        ragged_run_func = _kernels_sm90.batch_prefill_with_ragged_kv_cache_sm90_run
-        paged_run_func = _kernels_sm90.batch_prefill_with_paged_kv_cache_sm90_run
+            ragged_run_func = _kernels_sm90.batch_prefill_with_ragged_kv_cache_sm90_run
+            paged_run_func = _kernels_sm90.batch_prefill_with_paged_kv_cache_sm90_run
+        else:
+            module = gen_batch_prefill_sm90_module(*args)
+            plan_func = module.plan
+            ragged_run_func = module.ragged_run
+            paged_run_func = module.paged_run
 
         # torch library for ragged_run
 
