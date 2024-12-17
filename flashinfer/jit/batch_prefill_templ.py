@@ -1,8 +1,7 @@
 """
-    Copyright(c) 2024 by FlashInfer team.
+Copyright (c) 2024 by FlashInfer team.
 
-    Licensed under the Apache License,
-    Version 2.0(the "License");
+Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
@@ -32,18 +31,13 @@ def ragged_prefill_inst_templ(mask_mode: str) -> str:
 #include <flashinfer/attention/variants.cuh>
 
 namespace flashinfer {
-  {
-    % set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %
-  }
+  {% set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
   using RaggedParamsT =
       BatchPrefillRaggedParams<{{dtype_q}}, {{dtype_kv}}, {{dtype_o}}, {{dtype_idx}}>;
   constexpr bool use_custom_mask =
-      ""
-      "
-      + mask_mode +
-      r
-      ""
-      " == MaskMode::kCustom;
+      """
+        + mask_mode
+        + r""" == MaskMode::kCustom;
       using RaggedAttentionVariant =
           ComposedAttention<RaggedParamsT,
                             get_variant_code(use_custom_mask, {{use_sliding_window}},
@@ -84,18 +78,13 @@ def paged_prefill_inst_templ(mask_mode: str) -> str:
 #include <flashinfer/attention/variants.cuh>
 
 namespace flashinfer {
-  {
-    % set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %
-  }
+  {% set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
   using PagedParamsT =
       BatchPrefillPagedParams<{{dtype_q}}, {{dtype_kv}}, {{dtype_o}}, {{dtype_idx}}>;
   constexpr bool use_custom_mask =
-      ""
-      "
-      + mask_mode +
-      r
-      ""
-      " == MaskMode::kCustom;
+      """
+        + mask_mode
+        + r""" == MaskMode::kCustom;
       using PagedAttentionVariant =
           ComposedAttention<PagedParamsT, get_variant_code(use_custom_mask, {{use_sliding_window}},
                                                            {{use_logits_soft_cap}}, {{use_alibi}})>;
@@ -183,8 +172,7 @@ std::vector<int64_t> BatchPrefillWithKVCachePlan(
 
 using namespace flashinfer;
 
-{
-  % set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
+{% set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
 using RaggedParamsT = BatchPrefillRaggedParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ dtype_idx }}>;
 
 namespace flashinfer {
@@ -245,9 +233,7 @@ void BatchPrefillWithRaggedKVCacheRun(
       (maybe_qk_indptr ? static_cast<{{dtype_idx}}*>(maybe_qk_indptr->data_ptr()) : nullptr),
       /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr, static_cast<{{dtype_o}}*>(o.data_ptr()),
       /*lse=*/(maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr),
-      { % if use_alibi == "true" % } static_cast<float*>(maybe_alibi_slopes->data_ptr()) {
-        % else %
-      } nullptr { % endif % },
+      {% if use_alibi == "true" %} static_cast<float*>(maybe_alibi_slopes->data_ptr()) {% else %} nullptr {% endif %},
       num_qo_heads, num_kv_heads, q_stride_n, q_stride_h, kv_stride_n, kv_stride_h, window_left,
       logits_soft_cap, sm_scale, rope_scale, rope_theta);
 
@@ -316,8 +302,7 @@ void BatchPrefillWithRaggedKVCacheRun(
 
 using namespace flashinfer;
 
-{
-  % set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
+{% set use_alibi = "true" if pos_encoding_mode == "PosEncodingMode::kALiBi" else "false" %}
 using PagedParamsT = BatchPrefillPagedParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_o }}, {{ dtype_idx }}>;
 
 namespace flashinfer {
@@ -397,9 +382,7 @@ void BatchPrefillWithPagedKVCacheRun(
       (maybe_qk_indptr ? static_cast<{{dtype_idx}}*>(maybe_qk_indptr->data_ptr()) : nullptr),
       /*q_offset=*/nullptr, static_cast<{{dtype_o}}*>(o.data_ptr()),
       /*lse=*/(maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr),
-      { % if use_alibi == "true" % } static_cast<float*>(maybe_alibi_slopes->data_ptr()) {
-        % else %
-      } nullptr { % endif % },
+      {% if use_alibi == "true" %} static_cast<float*>(maybe_alibi_slopes->data_ptr()) {% else %} nullptr {% endif %},
       num_qo_heads, q_stride_n, q_stride_h, window_left, logits_soft_cap, sm_scale, rope_scale,
       rope_theta);
 
