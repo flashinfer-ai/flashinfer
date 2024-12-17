@@ -2,6 +2,9 @@
 
 ## [0.2.0](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.6...v0.2.0) (2024-12-17)
 
+### Release Blog
+
+[FlashInfer 0.2 - Efficient and Customizable Kernels for LLM Inference Serving](https://flashinfer.ai/2024/12/16/flashinfer-v02-release.html)
 
 ### Features
 
