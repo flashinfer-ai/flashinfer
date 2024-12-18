@@ -44,6 +44,7 @@ mask_modes = list(map(int, mask_modes))
 enable_aot = os.environ.get("FLASHINFER_ENABLE_AOT", "0") == "1"
 enable_bf16 = os.environ.get("FLASHINFER_ENABLE_BF16", "1") == "1"
 enable_fp8 = os.environ.get("FLASHINFER_ENABLE_FP8", "1") == "1"
+enable_sm90 = os.environ.get("FLASHINFER_ENABLE_SM90", "1") == "1"
 
 
 def get_version():
@@ -79,16 +80,19 @@ def generate_cuda() -> None:
             enable_bf16=enable_bf16,
             enable_fp8=enable_fp8,
         )
-    ) + get_sm90_instantiation_cu(
-        argparse.Namespace(
-            path=gen_dir,
-            head_dims=head_dims,
-            pos_encoding_modes=pos_encoding_modes_sm90,
-            allow_fp16_qk_reductions=allow_fp16_qk_reductions_sm90,
-            mask_modes=mask_modes,
-            enable_bf16=enable_bf16,
-        )
     )
+
+    if enable_sm90:
+        aot_kernel_uris += get_sm90_instantiation_cu(
+            argparse.Namespace(
+                path=gen_dir,
+                head_dims=head_dims,
+                pos_encoding_modes=pos_encoding_modes_sm90,
+                allow_fp16_qk_reductions=allow_fp16_qk_reductions_sm90,
+                mask_modes=mask_modes,
+                enable_bf16=enable_bf16,
+            )
+        )
     aot_config_str = f"""prebuilt_ops_uri = set({aot_kernel_uris})"""
     (root / "flashinfer" / "jit" / "aot_config.py").write_text(aot_config_str)
 
@@ -213,17 +217,20 @@ if enable_aot:
                 "cxx": cxx_flags,
                 "nvcc": nvcc_flags,
             },
-        ),
-        torch_cpp_ext.CUDAExtension(
-            name="flashinfer._kernels_sm90",
-            sources=kernel_sm90_sources + prefill_sm90_sources,
-            include_dirs=include_dirs,
-            extra_compile_args={
-                "cxx": cxx_flags,
-                "nvcc": nvcc_flags + sm90a_flags,
-            },
-        ),
+        )
     ]
+    if enable_sm90:
+        ext_modules += [
+            torch_cpp_ext.CUDAExtension(
+                name="flashinfer._kernels_sm90",
+                sources=kernel_sm90_sources + prefill_sm90_sources,
+                include_dirs=include_dirs,
+                extra_compile_args={
+                    "cxx": cxx_flags,
+                    "nvcc": nvcc_flags + sm90a_flags,
+                },
+            ),
+        ]
 
 setuptools.setup(
     version=get_version(),
