@@ -33,7 +33,8 @@ FLASHINFER_LOCAL_VERSION="cu${CUDA_MAJOR}${CUDA_MINOR}torch${FLASHINFER_CI_TORCH
 if [ -n "${FLASHINFER_GIT_SHA}" ]; then
     FLASHINFER_LOCAL_VERSION="${FLASHINFER_GIT_SHA}.${FLASHINFER_LOCAL_VERSION}"
 fi
-if [ "$CUDA_MAJOR" -ge 12 ]; then
+# wgmma work for cuda 12.3 and above
+if [ "$CUDA_MAJOR" -gt 12 ] || { [ "$CUDA_MAJOR" -eq 12 ] && [ "$CUDA_MINOR" -ge 3 ]; }; then
     FLASHINFER_ENABLE_SM90=1
 else
     FLASHINFER_ENABLE_SM90=0
