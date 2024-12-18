@@ -143,14 +143,17 @@ file(GLOB_RECURSE DECODE_KERNELS_SRCS
      ${PROJECT_SOURCE_DIR}/src/generated/*decode_head*.cu)
 file(GLOB_RECURSE PREFILL_KERNELS_SRCS
      ${PROJECT_SOURCE_DIR}/src/generated/*prefill_head*.cu)
+file(GLOB_RECURSE DISPATCH_INC_FILE
+     ${PROJECT_SOURCE_DIR}/src/generated/dispatch.inc)
 
 add_custom_command(
-  OUTPUT ${DECODE_KERNELS_SRCS} ${PREFILL_KERNELS_SRCS}
+  OUTPUT ${DECODE_KERNELS_SRCS} ${PREFILL_KERNELS_SRCS} ${DISPATCH_INC_FILE}
   COMMAND ${AOT_GENERATE_COMMAND}
   DEPENDS ${FLASHINFER_GENERATORS}
   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
   COMMENT "Generating kernel sources"
   VERBATIM)
+add_custom_target(dispatch_inc DEPENDS ${DISPATCH_INC_FILE})
 
 add_library(decode_kernels STATIC ${DECODE_KERNELS_SRCS})
 target_include_directories(decode_kernels PRIVATE ${FLASHINFER_INCLUDE_DIR})
