@@ -52,7 +52,8 @@ echo "::endgroup::"
 
 echo "::group::Build wheel for FlashInfer"
 cd "$PROJECT_ROOT"
-FLASHINFER_ENABLE_AOT=1 FLASHINFER_LOCAL_VERSION=$FLASHINFER_LOCAL_VERSION python -m build --no-isolation --wheel
+FLASHINFER_ENABLE_AOT=1 FLASHINFER_LOCAL_VERSION=$FLASHINFER_LOCAL_VERSION FLASHINFER_ENABLE_SM90=$FLASHINFER_ENABLE_SM90 \
+    python -m build --no-isolation --wheel
 python -m build --no-isolation --sdist
 ls -la dist/
 echo "::endgroup::"
