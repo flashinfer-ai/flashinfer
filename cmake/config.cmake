@@ -15,7 +15,7 @@ set(FLASHINFER_CASCADE ON)
 # Whether to compile sampling kernel tests/benchmarks or not.
 set(FLASHINFER_SAMPLING ON)
 # Whether to compile normalization kernel tests/benchmarks or not.
-set(FLASHINFER_NORMALIZATION ON)
+set(FLASHINFER_NORM ON)
 # Whether to compile fastdiv tests
 set(FLASHINFER_FASTDIV_TEST ON)
 # Whether to compile fastdequant tests
