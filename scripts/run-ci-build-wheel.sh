@@ -33,6 +33,11 @@ FLASHINFER_LOCAL_VERSION="cu${CUDA_MAJOR}${CUDA_MINOR}torch${FLASHINFER_CI_TORCH
 if [ -n "${FLASHINFER_GIT_SHA}" ]; then
     FLASHINFER_LOCAL_VERSION="${FLASHINFER_GIT_SHA}.${FLASHINFER_LOCAL_VERSION}"
 fi
+if [ "$CUDA_MAJOR" -ge 12 ]; then
+    FLASHINFER_ENABLE_SM90=1
+else
+    FLASHINFER_ENABLE_SM90=0
+fi
 
 echo "::group::Install PyTorch"
 pip install torch==$FLASHINFER_CI_TORCH_VERSION --index-url "https://download.pytorch.org/whl/cu${CUDA_MAJOR}${CUDA_MINOR}"
