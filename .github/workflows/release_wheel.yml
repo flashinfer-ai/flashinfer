@@ -25,6 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        python: ["3.8", "3.9", "3.10", "3.11", "3.12"]
         cuda: ["11.8", "12.1", "12.4"]
         torch: ["2.2", "2.3", "2.4"]
         exclude: # for cuda 12.4, we only support torch 2.4+
@@ -46,6 +47,7 @@ jobs:
               -v "$CI_RUNNER_CACHE_DIR":/ci-cache \
               -v "$GITHUB_WORKSPACE":/app \
               -e FLASHINFER_CI_CACHE=/ci-cache \
+              -e FLASHINFER_CI_PYTHON_VERSION=${{ matrix.python }} \
               -e FLASHINFER_CI_CUDA_VERSION=${{ matrix.cuda }} \
               -e FLASHINFER_CI_TORCH_VERSION=${{ matrix.torch }} \
               -e TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" \
@@ -58,7 +60,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wheel-cuda${{ matrix.cuda }}-torch${{ matrix.torch }}
+          name: wheel-cuda${{ matrix.cuda }}-torch${{ matrix.torch }}-python${{ matrix.python }}
           path: dist/*
 
   release:
@@ -77,7 +79,31 @@ jobs:
         with:
           tag_name: ${{ inputs.tag_name }}
           files: |
-            dist/flashinfer*.whl
+            dist/flashinfer*cp38*.whl
+
+      - uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          files: |
+            dist/flashinfer*cp39*.whl
+
+      - uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          files: |
+            dist/flashinfer*cp310*.whl
+
+      - uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          files: |
+            dist/flashinfer*cp311*.whl
+
+      - uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          files: |
+            dist/flashinfer*cp312*.whl
 
       - uses: softprops/action-gh-release@v1
         with:
