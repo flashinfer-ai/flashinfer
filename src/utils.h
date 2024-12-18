@@ -29,7 +29,7 @@
 #include <random>
 #include <sstream>
 
-#include "dispatch.inc"
+#include "generated/dispatch.inc"
 #include "flashinfer/exception.h"
 
 #define _DISPATCH_SWITCH(var_name, cond, ...)                                         \
