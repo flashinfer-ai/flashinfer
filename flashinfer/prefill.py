@@ -1106,13 +1106,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._kv_layout = kv_layout
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
+        self._int_workspace_buffer = torch.empty(
+            (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
+        )
         if backend in ["fa3", "auto"]:
-            self._int_workspace_buffer = torch.empty(
-                (64 * 1024 * 1024,), dtype=torch.uint8, device=self.device
-            )
-            # NOTE(Zihao): assume maximum accumulate kv length is 16M
+            # NOTE(Zihao): assume maximum accumulate kv length is 4M
             self._vector_sparse_indices_buffer = torch.empty(
-                (16 * 1024 * 1024,), dtype=torch.int32, device=self.device
+                (4 * 1024 * 1024,), dtype=torch.int32, device=self.device
             )
             # NOTE(Zihao): assume maximum batch size is 32768
             self._vector_sparse_indptr_buffer = torch.empty(
@@ -1120,10 +1120,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
             )
             self._kv_lens_buffer = torch.empty(
                 (32768,), dtype=torch.int32, device=self.device
-            )
-        else:
-            self._int_workspace_buffer = torch.empty(
-                (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
             )
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
@@ -1474,6 +1470,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     qo_indptr_host,
                     vector_sparse_indptr_host,
                     kv_lens_arr_host,
+                    self._max_total_num_rows or total_num_rows,
                     batch_size,
                     num_qo_heads,
                     num_kv_heads,
@@ -1864,14 +1861,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._kv_layout = kv_layout
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
-        if backend in ["fa3", "auto"]:
-            self._int_workspace_buffer = torch.empty(
-                (64 * 1024 * 1024,), dtype=torch.uint8, device=self.device
-            )
-        else:
-            self._int_workspace_buffer = torch.empty(
-                (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
-            )
+        self._int_workspace_buffer = torch.empty(
+            (64 * 1024 * 1024,), dtype=torch.uint8, device=self.device
+        )
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape, dtype=torch.uint8, pin_memory=True
         )
@@ -2147,6 +2139,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     qo_indptr_host,
                     kv_indptr_host,
                     kv_len_arr,
+                    self._max_total_num_rows or total_num_rows,
                     batch_size,
                     num_qo_heads,
                     num_kv_heads,

@@ -30,17 +30,6 @@
 #define DISPATCH_mask_mode(expr, const_expr, ...) \
   _DISPATCH_SWITCH("mask_mode", expr, _DISPATCH_CASES_mask_mode(const_expr, __VA_ARGS__))
 
-#define DISPATCH_BOOL(expr, const_expr, ...) \
-  [&]() -> bool {                            \
-    if (expr) {                              \
-      constexpr bool const_expr = true;      \
-      return __VA_ARGS__();                  \
-    } else {                                 \
-      constexpr bool const_expr = false;     \
-      return __VA_ARGS__();                  \
-    }                                        \
-  }()
-
 #define DISPATCH_PYTORCH_QKV_DTYPE_TO_CTYPE(q_dtype, kv_dtype, c_type_q, c_type_kv, ...) \
   [&]() -> bool {                                                                        \
     if (kv_dtype == q_dtype) {                                                           \

@@ -742,6 +742,7 @@ struct PrefillPlanSM90Info {
   int64_t kv_len_offset;
   int64_t head_indices_offset;
   int64_t work_indptr_offset;
+  bool same_schedule_for_all_heads;
 
   PrefillPlanSM90Info()
       : qo_tile_indices_offset(0),
@@ -750,17 +751,20 @@ struct PrefillPlanSM90Info {
         qo_len_offset(0),
         kv_len_offset(0),
         head_indices_offset(0),
-        work_indptr_offset(0) {}
+        work_indptr_offset(0),
+        same_schedule_for_all_heads(false) {}
 
   // convert PrefillPlanSM90Info to std::vector<int64_t>
   std::vector<int64_t> ToVector() const {
-    return {qo_tile_indices_offset, qo_indptr_offset,    kv_indptr_offset,  qo_len_offset,
-            kv_len_offset,          head_indices_offset, work_indptr_offset};
+    return {qo_tile_indices_offset, qo_indptr_offset,
+            kv_indptr_offset,       qo_len_offset,
+            kv_len_offset,          head_indices_offset,
+            work_indptr_offset,     same_schedule_for_all_heads};
   }
 
   // From std::vector<int64_t> to PrefillPlanSM90Info
   void FromVector(const std::vector<int64_t>& vec) {
-    if (vec.size() != 7) {
+    if (vec.size() != 8) {
       std::ostringstream err_msg;
       err_msg << "PrefillPlanSM90Info::FromVector: vec.size() should be 8, but got " << vec.size();
       FLASHINFER_ERROR(err_msg.str());
@@ -772,6 +776,7 @@ struct PrefillPlanSM90Info {
     kv_len_offset = vec[4];
     head_indices_offset = vec[5];
     work_indptr_offset = vec[6];
+    same_schedule_for_all_heads = vec[7];
   }
 };
 
@@ -780,9 +785,10 @@ cudaError_t PrefillSM90Plan(void* float_buffer, size_t float_workspace_size_in_b
                             void* int_buffer, void* page_locked_int_buffer,
                             size_t int_workspace_size_in_bytes, PrefillPlanSM90Info& plan_info,
                             IdType* qo_indptr_h, IdType* kv_indptr_h, IdType* kv_len_arr_h,
-                            uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
-                            uint32_t head_dim, uint32_t page_size, bool causal,
-                            bool enable_cuda_graph, uint32_t sizeof_dtype_o, cudaStream_t stream) {
+                            uint32_t total_num_rows, uint32_t batch_size, uint32_t num_qo_heads,
+                            uint32_t num_kv_heads, uint32_t head_dim, uint32_t page_size,
+                            bool causal, bool enable_cuda_graph, uint32_t sizeof_dtype_o,
+                            cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -825,7 +831,11 @@ cudaError_t PrefillSM90Plan(void* float_buffer, size_t float_workspace_size_in_b
       cta_kv_len(num_sm90_ctas, std::vector<IdType>()),
       cta_head_indices(num_sm90_ctas, std::vector<IdType>());
 
-  for (int qo_head_idx = 0; qo_head_idx < num_qo_heads; ++qo_head_idx) {
+  int max_num_works_per_head = ceil_div(total_num_rows, cta_tile_q);
+  plan_info.same_schedule_for_all_heads = max_num_works_per_head > 4096;
+
+  for (int qo_head_idx = 0;
+       qo_head_idx < (plan_info.same_schedule_for_all_heads ? 1 : num_qo_heads); ++qo_head_idx) {
     for (auto& [i, qo_len, kv_len] : idx_qo_kv_len_vec) {
       int num_qo_tiles = ceil_div(qo_len, cta_tile_q);
       for (int qo_tile_idx = num_qo_tiles - 1; qo_tile_idx >= 0; --qo_tile_idx) {
@@ -853,7 +863,7 @@ cudaError_t PrefillSM90Plan(void* float_buffer, size_t float_workspace_size_in_b
   for (uint32_t i = 0; i < num_sm90_ctas; ++i) {
     work_indptr_vec[i + 1] = work_indptr_vec[i] + cta_qo_tile_indices[i].size();
   }
-  IdType total_num_works = work_indptr_vec[num_sm90_ctas];
+  int total_num_works = work_indptr_vec.back();
   auto qo_tile_indices_vec = flatten(cta_qo_tile_indices, total_num_works);
   auto qo_indptr_vec = flatten(cta_qo_indptr, total_num_works);
   auto kv_indptr_vec = flatten(cta_kv_indptr, total_num_works);
@@ -862,13 +872,16 @@ cudaError_t PrefillSM90Plan(void* float_buffer, size_t float_workspace_size_in_b
   auto head_indices_vec = flatten(cta_head_indices, total_num_works);
 
   AlignedAllocator int_allocator(int_buffer, int_workspace_size_in_bytes);
-  const int max_total_num_works = 1048576;
-  if (total_num_works > max_total_num_works) {
-    std::ostringstream err_msg;
-    err_msg << "total_num_works " << total_num_works << " should be less than "
-            << max_total_num_works;
-    FLASHINFER_ERROR(err_msg.str());
+  int max_total_num_works;
+
+  if (enable_cuda_graph) {
+    max_total_num_works = plan_info.same_schedule_for_all_heads
+                              ? max_num_works_per_head
+                              : max_num_works_per_head * num_qo_heads;
+  } else {
+    max_total_num_works = total_num_works;
   }
+
   plan_info.qo_tile_indices_offset = int_allocator.aligned_alloc_offset(
       sizeof(IdType) * max_total_num_works, 16, "batch_prefill_sm90_qo_tile_indices");
   plan_info.qo_indptr_offset = int_allocator.aligned_alloc_offset(
