@@ -147,7 +147,7 @@ class BlockSparseAttentionWrapper:
             )
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
-            dtype=self.device,
+            dtype=torch.uint8,
             pin_memory=True,
         )
         self._use_cuda_graph = False
