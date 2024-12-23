@@ -33,9 +33,9 @@ void single_prefill_with_kv_cache_sm90(unsigned int mask_mode_code, at::Tensor q
 std::vector<int64_t> BatchPrefillWithKVCacheSM90Plan(
     unsigned int head_dim, bool causal, at::Tensor float_workspace_buffer,
     at::Tensor int_workspace_buffer, at::Tensor page_locked_int_workspace_buffer,
-    at::Tensor qo_indptr, at::Tensor kv_indptr, at::Tensor kv_len_arr, unsigned int batch_size,
-    unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int page_size,
-    bool enable_cuda_graph, int64_t cuda_stream);
+    at::Tensor qo_indptr, at::Tensor kv_indptr, at::Tensor kv_len_arr, unsigned int total_num_rows,
+    unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads,
+    unsigned int page_size, bool enable_cuda_graph, int64_t cuda_stream);
 
 void BatchPrefillWithRaggedKVCacheSM90Run(
     unsigned int mask_mode_code, at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,

@@ -44,13 +44,25 @@ using AttentionVariant = std::conditional_t<{{use_logits_soft_cap}}, LogitsSoftC
 
 template cudaError_t BatchPrefillWithRaggedKVCacheDispatched<{{ head_dim }}, """
         + mask_mode
-        + r""", /*USE_SWA=*/true, AttentionVariant>(
+        + r""", /*USE_SWA=*/true, /*SAME_SCHEDULER_FOR_ALL_HEADS=*/true, AttentionVariant>(
     RaggedParams& params,
     cudaStream_t stream);
 
 template cudaError_t BatchPrefillWithRaggedKVCacheDispatched<{{ head_dim }}, """
         + mask_mode
-        + r""", /*USE_SWA=*/false, AttentionVariant>(
+        + r""", /*USE_SWA=*/false, /*SAME_SCHEDULER_FOR_ALL_HEADS=*/true, AttentionVariant>(
+    RaggedParams& params,
+    cudaStream_t stream);
+
+template cudaError_t BatchPrefillWithRaggedKVCacheDispatched<{{ head_dim }}, """
+        + mask_mode
+        + r""", /*USE_SWA=*/true, /*SAME_SCHEDULER_FOR_ALL_HEADS=*/false, AttentionVariant>(
+    RaggedParams& params,
+    cudaStream_t stream);
+
+template cudaError_t BatchPrefillWithRaggedKVCacheDispatched<{{ head_dim }}, """
+        + mask_mode
+        + r""", /*USE_SWA=*/false, /*SAME_SCHEDULER_FOR_ALL_HEADS=*/false, AttentionVariant>(
     RaggedParams& params,
     cudaStream_t stream);
 
@@ -77,13 +89,25 @@ using AttentionVariant = std::conditional_t<{{use_logits_soft_cap}}, LogitsSoftC
 
 template cudaError_t BatchPrefillWithPagedKVCacheDispatched<{{ head_dim }}, """
         + mask_mode
-        + r""", /*USE_SWA=*/true, AttentionVariant>(
+        + r""", /*USE_SWA=*/true, /*SAME_SCHEDULER_FOR_ALL_HEADS=*/true, AttentionVariant>(
     PagedParams& params,
     cudaStream_t stream);
 
 template cudaError_t BatchPrefillWithPagedKVCacheDispatched<{{ head_dim }}, """
         + mask_mode
-        + r""", /*USE_SWA=*/false, AttentionVariant>(
+        + r""", /*USE_SWA=*/false, /*SAME_SCHEDULER_FOR_ALL_HEADS=*/true, AttentionVariant>(
+    PagedParams& params,
+    cudaStream_t stream);
+
+template cudaError_t BatchPrefillWithPagedKVCacheDispatched<{{ head_dim }}, """
+        + mask_mode
+        + r""", /*USE_SWA=*/true, /*SAME_SCHEDULER_FOR_ALL_HEADS=*/false, AttentionVariant>(
+    PagedParams& params,
+    cudaStream_t stream);
+
+template cudaError_t BatchPrefillWithPagedKVCacheDispatched<{{ head_dim }}, """
+        + mask_mode
+        + r""", /*USE_SWA=*/false, /*SAME_SCHEDULER_FOR_ALL_HEADS=*/false, AttentionVariant>(
     PagedParams& params,
     cudaStream_t stream);
 
@@ -100,8 +124,8 @@ using namespace flashinfer;
 std::vector<int64_t> BatchPrefillWithKVCacheSM90Plan(
     bool causal, at::Tensor float_workspace_buffer,
     at::Tensor int_workspace_buffer, at::Tensor page_locked_int_workspace_buffer,
-    at::Tensor qo_indptr, at::Tensor kv_indptr, at::Tensor kv_len_arr, unsigned int batch_size,
-    unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int page_size,
+    at::Tensor qo_indptr, at::Tensor kv_indptr, at::Tensor kv_len_arr, unsigned int total_num_rows,
+    unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int page_size,
     bool enable_cuda_graph, int64_t cuda_stream) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
@@ -115,8 +139,9 @@ std::vector<int64_t> BatchPrefillWithKVCacheSM90Plan(
       float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
       int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
       int_workspace_size_in_bytes, plan_info, qo_indptr.data_ptr<{{ dtype_idx }}>(),
-      kv_indptr.data_ptr<{{ dtype_idx }}>(), kv_len_arr.data_ptr<{{ dtype_idx }}>(), batch_size, num_qo_heads,
-      num_kv_heads, {{ head_dim }}, page_size, causal, enable_cuda_graph, sizeof({{dtype_o}}), stream);
+      kv_indptr.data_ptr<{{ dtype_idx }}>(), kv_len_arr.data_ptr<{{ dtype_idx }}>(),
+      total_num_rows, batch_size, num_qo_heads, num_kv_heads, {{ head_dim }}, page_size,
+      causal, enable_cuda_graph, sizeof({{dtype_o}}), stream);
 
   TORCH_CHECK(status == cudaSuccess,
               "PrefillSM90Plan failed with error: ", cudaGetErrorString(status));
@@ -141,7 +166,7 @@ std::vector<int64_t> BatchPrefillWithKVCacheSM90Plan(
 
 namespace flashinfer {
 
-template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLINDING_WINDOW,
+template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLINDING_WINDOW, bool SAME_SCHEDULER_FOR_ALL_HEADS,
           typename AttentionVariant, typename DTypeQ, typename DTypeKV, typename DTypeO,
           typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
@@ -224,16 +249,21 @@ void BatchPrefillWithRaggedKVCacheSM90Run(
   params.head_indices =
       GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.head_indices_offset);
   params.work_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.work_indptr_offset);
+  bool same_schedule_for_all_heads = plan_info.same_schedule_for_all_heads;
 
   DISPATCH_MASK_MODE(mask_mode, MASK_MODE, {
-    using AttentionVariant =
-        std::conditional_t<{{ use_logits_soft_cap }}, LogitsSoftCap, StandardAttention>;
-    cudaError_t status =
-        BatchPrefillWithRaggedKVCacheDispatched<{{ head_dim }}, MASK_MODE, {{ use_sliding_window }},
-                                                AttentionVariant>(params, stream);
-    TORCH_CHECK(status == cudaSuccess,
-                "BatchPrefillWithRaggedKVCacheSM90Run failed with error: ",
-                cudaGetErrorString(status));
+    DISPATCH_BOOL(same_schedule_for_all_heads, SAME_SCHEDULER_FOR_ALL_HEADS, [&] {
+      using AttentionVariant =
+          std::conditional_t<{{ use_logits_soft_cap }}, LogitsSoftCap, StandardAttention>;
+      cudaError_t status =
+          BatchPrefillWithRaggedKVCacheDispatched<{{ head_dim }}, MASK_MODE, {{ use_sliding_window }},
+                                                  SAME_SCHEDULER_FOR_ALL_HEADS, AttentionVariant>(params, stream);
+      TORCH_CHECK(status == cudaSuccess,
+                  "BatchPrefillWithRaggedKVCacheSM90Run failed with error: ",
+                  cudaGetErrorString(status));
+
+      return true;
+    });
   });
 }
 """,
@@ -255,7 +285,7 @@ void BatchPrefillWithRaggedKVCacheSM90Run(
 
 namespace flashinfer {
 
-template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLINDING_WINDOW,
+template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLINDING_WINDOW, bool SAME_SCHEDULER_FOR_ALL_HEADS,
           typename AttentionVariant, typename DTypeQ, typename DTypeKV, typename DTypeO,
           typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(
@@ -352,16 +382,20 @@ void BatchPrefillWithPagedKVCacheSM90Run(
       GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.head_indices_offset);
   params.work_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.work_indptr_offset);
   params.kv_indices = static_cast<IdType*>(paged_kv_indices.data_ptr());
+  bool same_schedule_for_all_heads = plan_info.same_schedule_for_all_heads;
 
   DISPATCH_MASK_MODE(mask_mode, MASK_MODE, {
-    using AttentionVariant =
-        std::conditional_t<{{ use_logits_soft_cap }}, LogitsSoftCap, StandardAttention>;
-    cudaError_t status =
-        BatchPrefillWithPagedKVCacheDispatched<{{ head_dim }}, MASK_MODE, {{ use_sliding_window }},
-                                                AttentionVariant>(params, stream);
-    TORCH_CHECK(status == cudaSuccess,
-                "BatchPrefillWithPagedKVCacheSM90Run failed with error: ",
-                cudaGetErrorString(status));
+    DISPATCH_BOOL(same_schedule_for_all_heads, SAME_SCHEDULER_FOR_ALL_HEADS, [&] {
+      using AttentionVariant =
+          std::conditional_t<{{ use_logits_soft_cap }}, LogitsSoftCap, StandardAttention>;
+      cudaError_t status =
+          BatchPrefillWithPagedKVCacheDispatched<{{ head_dim }}, MASK_MODE, {{ use_sliding_window }},
+                                                 SAME_SCHEDULER_FOR_ALL_HEADS, AttentionVariant>(params, stream);
+      TORCH_CHECK(status == cudaSuccess,
+                  "BatchPrefillWithPagedKVCacheSM90Run failed with error: ",
+                  cudaGetErrorString(status));
+      return true;
+    });
   });
 }
 """,
@@ -370,8 +404,8 @@ void BatchPrefillWithPagedKVCacheSM90Run(
 std::vector<int64_t> BatchPrefillWithKVCacheSM90Plan(
     bool causal, at::Tensor float_workspace_buffer,
     at::Tensor int_workspace_buffer, at::Tensor page_locked_int_workspace_buffer,
-    at::Tensor qo_indptr, at::Tensor kv_indptr, at::Tensor kv_len_arr, unsigned int batch_size,
-    unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int page_size,
+    at::Tensor qo_indptr, at::Tensor kv_indptr, at::Tensor kv_len_arr, unsigned int total_num_rows,
+    unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int page_size,
     bool enable_cuda_graph, int64_t cuda_stream);
 
 void BatchPrefillWithRaggedKVCacheSM90Run(

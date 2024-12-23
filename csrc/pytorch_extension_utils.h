@@ -189,6 +189,17 @@
     return __VA_ARGS__();                        \
   }
 
+#define DISPATCH_BOOL(expr, const_expr, ...) \
+  [&]() -> bool {                            \
+    if (expr) {                              \
+      constexpr bool const_expr = true;      \
+      return __VA_ARGS__();                  \
+    } else {                                 \
+      constexpr bool const_expr = false;     \
+      return __VA_ARGS__();                  \
+    }                                        \
+  }()
+
 inline void check_shape(const at::Tensor& a, const at::Tensor& b, const char* a_name,
                         const char* b_name) {
   TORCH_CHECK(a.dim() == b.dim(), a_name, ".dim() != ", b_name, ".dim(). ", a.dim(), " vs ",

@@ -175,7 +175,8 @@ def test_batch_paged_prefill(
     kv_indptr = torch.arange(
         0, batch_size * num_pages_per_request + 1, num_pages_per_request
     ).int()
-    kv_indices = torch.arange(0, batch_size * num_pages_per_request).int()
+    # NOTE(Zihao): pad 256 elements to avoid out-of-bound because we didn't check the boundary in the kernel
+    kv_indices = torch.arange(0, batch_size * num_pages_per_request + 256).int()
     last_page_len = torch.full((batch_size,), last_page_len, dtype=torch.int32)
 
     wrapper_sm80.plan(

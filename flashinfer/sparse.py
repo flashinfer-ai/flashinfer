@@ -130,13 +130,13 @@ class BlockSparseAttentionWrapper:
         """
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
+        self._int_workspace_buffer = torch.empty(
+            (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
+        )
         if backend in ["fa3", "auto"]:
-            self._int_workspace_buffer = torch.empty(
-                (64 * 1024 * 1024,), dtype=torch.uint8, device=self.device
-            )
-            # NOTE(Zihao): assume maximum accumulate kv length is 16M
+            # NOTE(Zihao): assume maximum accumulate kv length is 4M
             self._vector_sparse_indices_buffer = torch.empty(
-                (16 * 1024 * 1024,), dtype=torch.int32, device=self.device
+                (4 * 1024 * 1024,), dtype=torch.int32, device=self.device
             )
             # NOTE(Zihao): assume maximum batch size is 32768
             self._vector_sparse_indptr_buffer = torch.empty(
@@ -145,15 +145,9 @@ class BlockSparseAttentionWrapper:
             self._kv_lens_buffer = torch.empty(
                 (32768,), dtype=torch.int32, device=self.device
             )
-        else:
-            self._int_workspace_buffer = torch.empty(
-                (8 * 1024 * 1024,),
-                dtype=torch.uint8,
-                device=float_workspace_buffer.device,
-            )
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
-            dtype=self._int_workspace_buffer.dtype,
+            dtype=torch.uint8,
             pin_memory=True,
         )
         self._use_cuda_graph = False
@@ -453,6 +447,7 @@ class BlockSparseAttentionWrapper:
                         qo_indptr_host,
                         vector_sparse_indptr_host,
                         kv_lens_arr_host,
+                        M,  # total_num_rows
                         num_blocks_row,  # batch_size
                         num_qo_heads,
                         num_kv_heads,
