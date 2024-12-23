@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0.post1](https://github.com/flashinfer-ai/flashinfer/compare/v0.2.0...v0.2.0.post1) (2024-12-22)
+
+### Bug Fixes
+
+* bug fix on determine_attention_backend condition ([#688](https://github.com/flashinfer-ai/flashinfer/pull/688)) ([bcf7a3e](https://github.com/flashinfer-ai/flashinfer/commit/bcf7a3ee0d919eca45d2f07241479b5776975bc3))
+* accelerate plan speed of fa3 template ([#690](https://github.com/flashinfer-ai/flashinfer/pull/690)) ([db8f04d](https://github.com/flashinfer-ai/flashinfer/commit/db8f04d30989f57acef3fbde41cbd3ce373727f1))
+
 ## [0.2.0](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.6...v0.2.0) (2024-12-17)
 
 ### Release Blog
