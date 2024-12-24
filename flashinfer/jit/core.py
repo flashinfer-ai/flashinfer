@@ -49,7 +49,9 @@ def check_cuda_arch():
     for cuda_arch_flags in torch_cpp_ext._get_cuda_arch_flags():
         arch = int(re.search(r"compute_(\d+)", cuda_arch_flags).group(1))
         if arch < 75:
-            raise RuntimeError("FlashInfer requires sm75+")
+            raise RuntimeError("FlashInfer requires sm75+ for FP8 support,"
+                 	       " set TORCH_CUDA_ARCH_LIST env variable if"
+                               " your device supports FP8.")
 
 
 def clear_cache_dir():
@@ -99,7 +101,8 @@ def load_cuda_ops(
     cflags += extra_cflags
     cuda_cflags += extra_cuda_cflags
     logger.info(f"Loading JIT ops: {name}")
-    check_cuda_arch()
+    if "kv_e4m3" in name or "kv_e5m2" in name:
+     check_cuda_arch()
     build_directory = FLASHINFER_JIT_DIR / name
     os.makedirs(build_directory, exist_ok=True)
     if extra_include_paths is None:
