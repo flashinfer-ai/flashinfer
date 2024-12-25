@@ -254,6 +254,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("apply_rope_pos_ids", &apply_rope_pos_ids, "Apply RoPE with positional ids");
   m.def("apply_llama31_rope_pos_ids", &apply_llama31_rope_pos_ids,
         "Apply Llama 3.1 style RoPE with positional ids");
+  m.def("apply_rope_pos_ids_cos_sin_cache", &apply_rope_pos_ids_cos_sin_cache,
+        "Apply RoPE with positional ids and cosine/sine cache");
 
   // sampling
   m.def("sampling_from_probs", &sampling_from_probs, "Sample from probabilities");
