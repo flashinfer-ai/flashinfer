@@ -56,6 +56,8 @@ def _apply_rope(
     rope_theta: float,
 ) -> None:
     with q.device as device:
+        indptr = indptr.int()
+        offsets = offsets.int()
         get_rope_module().apply_rope(
             q,
             k,
@@ -104,6 +106,8 @@ def _apply_llama31_rope(
     old_context_len: float,
 ) -> None:
     with q.device as device:
+        indptr = indptr.int()
+        offsets = offsets.int()
         get_rope_module().apply_llama31_rope(
             q,
             k,
@@ -154,6 +158,7 @@ def _apply_rope_pos_ids(
     rope_theta: float,
 ) -> None:
     with q.device as device:
+        pos_ids = pos_ids.int()
         get_rope_module().apply_rope_pos_ids(
             q,
             k,
@@ -197,6 +202,7 @@ def _apply_rope_pos_ids_cos_sin_cache(
     interleave: bool,
 ) -> None:
     with q.device as device:
+        pos_ids = pos_ids.int()
         get_rope_module().apply_rope_pos_ids_cos_sin_cache(
             q,
             k,
@@ -242,6 +248,7 @@ def _apply_llama31_rope_pos_ids(
     old_context_len: float,
 ) -> None:
     with q.device as device:
+        pos_ids = pos_ids.int()
         get_rope_module().apply_llama31_rope_pos_ids(
             q,
             k,
