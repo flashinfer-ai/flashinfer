@@ -26,6 +26,8 @@ from .batch_decode_templ import batch_decode_suffix, batch_decode_templ
 from .batch_prefill_sm90_templ import (
     batch_prefill_sm90_suffix,
     batch_prefill_sm90_templ,
+    customizable_batch_prefill_sm90_suffix,
+    customizable_batch_prefill_sm90_templ,
 )
 from .batch_prefill_templ import batch_prefill_suffix, batch_prefill_templ
 from .core import load_cuda_ops, sm90a_nvcc_flags
@@ -101,11 +103,11 @@ def get_single_decode_uri(
     )
 
 
-def gen_single_decode_module(*args):
+def gen_single_decode_module(*args, **kwargs):
     gen_directory = FLASHINFER_GEN_SRC_DIR
     os.makedirs(gen_directory, exist_ok=True)
-    uri = get_single_decode_uri(*args)
-    sources = get_single_decode_sources(*args)
+    uri = get_single_decode_uri(*args, **kwargs)
+    sources = get_single_decode_sources(*args, **kwargs)
     source_paths = []
     for suffix, source in zip(single_decode_suffix, sources):
         path = gen_directory / f"{uri}{suffix}"
@@ -161,10 +163,10 @@ def get_batch_decode_uri(
     )
 
 
-def gen_batch_decode_module(*args):
+def gen_batch_decode_module(*args, **kwargs):
     gen_directory = FLASHINFER_GEN_SRC_DIR
-    uri = get_batch_decode_uri(*args)
-    sources = get_batch_decode_sources(*args)
+    uri = get_batch_decode_uri(*args, **kwargs)
+    sources = get_batch_decode_sources(*args, **kwargs)
     source_paths = []
     for suffix, source in zip(batch_decode_suffix, sources):
         path = gen_directory / f"{uri}{suffix}"
@@ -218,10 +220,10 @@ def get_batch_decode_mla_uri(
     )
 
 
-def gen_batch_decode_mla_module(*args):
+def gen_batch_decode_mla_module(*args, **kwargs):
     gen_directory = FLASHINFER_GEN_SRC_DIR
-    uri = get_batch_decode_mla_uri(*args)
-    sources = get_batch_decode_mla_sources(*args)
+    uri = get_batch_decode_mla_uri(*args, **kwargs)
+    sources = get_batch_decode_mla_sources(*args, **kwargs)
     source_paths = []
     for suffix, source in zip(batch_decode_mla_suffix, sources):
         path = gen_directory / f"{uri}{suffix}"
@@ -306,14 +308,14 @@ def get_single_prefill_uri(
     )
 
 
-def get_single_prefill_sm90_uri(*args):
-    return get_single_prefill_uri(*args) + "_sm90"
+def get_single_prefill_sm90_uri(*args, **kwargs):
+    return get_single_prefill_uri(*args, **kwargs) + "_sm90"
 
 
-def gen_single_prefill_module(*args):
+def gen_single_prefill_module(*args, **kwargs):
     gen_directory = FLASHINFER_GEN_SRC_DIR
-    uri = get_single_prefill_uri(*args)
-    sources = get_single_prefill_sources(*args)
+    uri = get_single_prefill_uri(*args, **kwargs)
+    sources = get_single_prefill_sources(*args, **kwargs)
     source_paths = []
     for suffix, source in zip(single_prefill_suffix, sources):
         path = gen_directory / f"{uri}{suffix}"
@@ -323,10 +325,10 @@ def gen_single_prefill_module(*args):
     return load_cuda_ops(uri, source_paths)
 
 
-def gen_single_prefill_sm90_module(*args):
+def gen_single_prefill_sm90_module(*args, **kwargs):
     gen_directory = FLASHINFER_GEN_SRC_DIR
-    uri = get_single_prefill_sm90_uri(*args)
-    sources = get_single_prefill_sm90_sources(*args)
+    uri = get_single_prefill_sm90_uri(*args, **kwargs)
+    sources = get_single_prefill_sm90_sources(*args, **kwargs)
     source_paths = []
     for suffix, source in zip(single_prefill_sm90_suffix, sources):
         path = gen_directory / f"{uri}{suffix}"
@@ -418,14 +420,14 @@ def get_batch_prefill_uri(
     )
 
 
-def get_batch_prefill_sm90_uri(*args):
-    return get_batch_prefill_uri(*args) + "_sm90"
+def get_batch_prefill_sm90_uri(*args, **kwargs):
+    return get_batch_prefill_uri(*args, **kwargs) + "_sm90"
 
 
-def gen_batch_prefill_module(*args):
+def gen_batch_prefill_module(*args, **kwargs):
     gen_directory = FLASHINFER_GEN_SRC_DIR
-    uri = get_batch_prefill_uri(*args)
-    sources = get_batch_prefill_sources(*args)
+    uri = get_batch_prefill_uri(*args, **kwargs)
+    sources = get_batch_prefill_sources(*args, **kwargs)
     source_paths = []
     for suffix, source in zip(batch_prefill_suffix, sources):
         path = gen_directory / f"{uri}{suffix}"
@@ -435,10 +437,10 @@ def gen_batch_prefill_module(*args):
     return load_cuda_ops(uri, source_paths)
 
 
-def gen_batch_prefill_sm90_module(*args):
+def gen_batch_prefill_sm90_module(*args, **kwargs):
     gen_directory = FLASHINFER_GEN_SRC_DIR
-    uri = get_batch_prefill_sm90_uri(*args)
-    sources = get_batch_prefill_sm90_sources(*args)
+    uri = get_batch_prefill_sm90_uri(*args, **kwargs)
+    sources = get_batch_prefill_sm90_sources(*args, **kwargs)
     source_paths = []
     for suffix, source in zip(batch_prefill_sm90_suffix, sources):
         path = gen_directory / f"{uri}{suffix}"
@@ -610,9 +612,9 @@ def get_customize_single_prefill_sources(
     )
 
 
-def gen_customize_single_decode_module(module_name, *args):
+def gen_customize_single_decode_module(module_name, *args, **kwargs):
     gen_directory = FLASHINFER_GEN_SRC_DIR
-    sources = get_customize_single_decode_sources(*args)
+    sources = get_customize_single_decode_sources(*args, **kwargs)
     source_paths = []
     for suffix, source in zip(single_decode_suffix, sources):
         path = gen_directory / f"{module_name}{suffix}"
@@ -622,13 +624,91 @@ def gen_customize_single_decode_module(module_name, *args):
     return load_cuda_ops(module_name, source_paths)
 
 
-def gen_customize_single_prefill_module(module_name, *args):
+def gen_customize_single_prefill_module(module_name, *args, **kwargs):
     gen_directory = FLASHINFER_GEN_SRC_DIR
-    sources = get_customize_single_prefill_sources(*args)
+    sources = get_customize_single_prefill_sources(*args, **kwargs)
     source_paths = []
     for suffix, source in zip(single_prefill_suffix, sources):
         path = gen_directory / f"{module_name}{suffix}"
         source_paths.append(path)
         write_if_different(path, source)
 
+    return load_cuda_ops(module_name, source_paths)
+
+
+def get_customize_batch_prefill_sm90_sources(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim: int,
+    additional_input_tensor_var_names: List[str],
+    additional_input_tensor_var_types: List[str],
+    additional_input_scalar_var_names: List[str],
+    additional_input_scalar_var_types: List[str],
+    variant_name: str,
+    variant_decl: str,
+) -> List[str]:
+    additional_params_decl = ";\n  ".join(
+        [
+            f"{dtype}* {var}_ptr"
+            for dtype, var in zip(
+                additional_input_tensor_var_types, additional_input_tensor_var_names
+            )
+        ] +
+        [
+            f"{dtype} {var}"
+            for dtype, var in zip(
+                additional_input_scalar_var_types, additional_input_scalar_var_names
+            )
+        ]
+    )
+    additional_func_params = ",\n    ".join(
+        [f"at::Tensor {var}" for var in additional_input_tensor_var_names] +
+        [
+            f"{dtype} {var}"
+            for dtype, var in zip(
+                additional_input_scalar_var_types, additional_input_scalar_var_names
+            )
+        ]
+    )
+    additional_params_setter = ";\n  ".join(
+        [
+            f"params.{var}_ptr = static_cast<{dtype}*>({var}.data_ptr())"
+            for dtype, var in zip(
+                additional_input_tensor_var_types, additional_input_tensor_var_names
+            )
+        ] +
+        [f"params.{var} = {var}" for var in additional_input_scalar_var_names]
+    )
+
+    if additional_func_params:
+        additional_func_params += ","
+
+    return render_templates(
+        customizable_batch_prefill_sm90_templ,
+        {
+            "dtype_q": dtype_map[dtype_q],
+            "dtype_kv": dtype_map[dtype_kv],
+            "dtype_o": dtype_map[dtype_o],
+            "dtype_idx": dtype_map[dtype_idx],
+            "head_dim": head_dim,
+            "variant_decl": variant_decl,
+            "variant_name": variant_name,
+            "use_sliding_window": "false",
+            "additional_params_decl": additional_params_decl,
+            "additional_params_setter": additional_params_setter,
+            "additional_func_params": additional_func_params,
+        },
+    )
+
+
+def gen_customize_batch_prefill_sm90_module(module_name, *args, **kwargs):
+    gen_directory = FLASHINFER_GEN_SRC_DIR
+    sources = get_customize_batch_prefill_sm90_sources(*args, **kwargs)
+    source_paths = []
+    for suffix, source in zip(customizable_batch_prefill_sm90_suffix, sources):
+        path = gen_directory / f"{module_name}{suffix}"
+        source_paths.append(path)
+        write_if_different(path, source)
     return load_cuda_ops(module_name, source_paths)

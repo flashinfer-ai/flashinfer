@@ -23,36 +23,48 @@
 
 namespace flashinfer {
 
+template <typename ParamsT_>
 struct StandardAttention {
+  using ParamsT = ParamsT_;
+  using DTypeQ = typename ParamsT::DTypeQ;
+  using DTypeKV = typename ParamsT::DTypeKV;
+  using DTypeO = typename ParamsT::DTypeO;
+  using IdType = typename ParamsT::IdType;
+
   template <int NUM_ROWS_PER_THREAD>
   using Updater = OnlineSoftmaxWithScale<NUM_ROWS_PER_THREAD>;
 
-  template <typename ParamsT>
   __device__ StandardAttention(const ParamsT& params) {}
 
-  template <typename ParamsT, typename T>
-  __device__ __forceinline__ T LogitsTransform(const ParamsT& params, T logits, uint32_t batch_idx,
-                                               uint32_t qo_idx, uint32_t kv_idx,
+  template <typename MainloopParams, typename T>
+  __device__ __forceinline__ T LogitsTransform(const MainloopParams& params, T logits,
+                                               uint32_t batch_idx, uint32_t qo_idx, uint32_t kv_idx,
                                                uint32_t qo_head_idx, uint32_t kv_head_idx) {
     return logits;
   }
 };
 
+template <typename ParamsT_>
 struct LogitsSoftCap {
+  using ParamsT = ParamsT_;
+  using DTypeQ = typename ParamsT::DTypeQ;
+  using DTypeKV = typename ParamsT::DTypeKV;
+  using DTypeO = typename ParamsT::DTypeO;
+  using IdType = typename ParamsT::IdType;
   float pre_tanh_scale;
   float post_tanh_scale;
+
   template <int NUM_ROWS_PER_THREAD>
   using Updater = OnlineSoftmaxWithoutScale<NUM_ROWS_PER_THREAD>;
 
-  template <typename ParamsT>
   __device__ LogitsSoftCap(const ParamsT& params) {
     pre_tanh_scale = (params.sm_scale_log2 * math::loge2) * math::ptx_rcp(params.logits_soft_cap);
     post_tanh_scale = math::log2e * params.logits_soft_cap;
   }
 
-  template <typename ParamsT, typename T>
-  __device__ __forceinline__ T LogitsTransform(const ParamsT& params, T logits, uint32_t batch_idx,
-                                               uint32_t qo_idx, uint32_t kv_idx,
+  template <typename MainloopParams, typename T>
+  __device__ __forceinline__ T LogitsTransform(const MainloopParams& params, T logits,
+                                               uint32_t batch_idx, uint32_t qo_idx, uint32_t kv_idx,
                                                uint32_t qo_head_idx, uint32_t kv_head_idx) {
     return math::tanh(logits * pre_tanh_scale) * post_tanh_scale;
   }

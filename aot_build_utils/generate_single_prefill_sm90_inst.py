@@ -30,7 +30,9 @@ def get_cu_file_str(
     dtype_kv,
     dtype_out,
 ):
-    content = """#include <flashinfer/attention/hopper/prefill_sm90.cuh>
+    content = """ // single_prefill_sm90 template inst
+#include <flashinfer/attention/hopper/params.cuh>
+#include <flashinfer/attention/hopper/prefill_sm90.cuh>
 #include <flashinfer/attention/hopper/variants.cuh>
 #include <flashinfer/cutlass_utils.cuh>
 
@@ -42,31 +44,32 @@ using DTypeO = cutlass_dtype_t<{dtype_out}>;
 
 using Params = SinglePrefillParams<DTypeQ, DTypeKV, DTypeO>;
 
-template cudaError_t SinglePrefillWithKVCacheDispatched<{head_dim}, {mask_mode}, /*USE_SWA=*/true, LogitsSoftCap>(
-    Params& params,
-    cudaStream_t stream);
+template cudaError_t SinglePrefillWithKVCacheDispatched
+    <{head_dim}, {mask_mode}, /*USE_SWA=*/true, LogitsSoftCap<Params>>
+    (Params& params, cudaStream_t stream);
 
-template cudaError_t SinglePrefillWithKVCacheDispatched<{head_dim}, {mask_mode}, /*USE_SWA=*/false, LogitsSoftCap>(
-    Params& params,
-    cudaStream_t stream);
+template cudaError_t SinglePrefillWithKVCacheDispatched
+    <{head_dim}, {mask_mode}, /*USE_SWA=*/false, LogitsSoftCap<Params>>
+    (Params& params, cudaStream_t stream);
 
-template cudaError_t SinglePrefillWithKVCacheDispatched<{head_dim}, {mask_mode}, /*USE_SWA=*/true, StandardAttention>(
-    Params& params,
-    cudaStream_t stream);
+template cudaError_t SinglePrefillWithKVCacheDispatched
+    <{head_dim}, {mask_mode}, /*USE_SWA=*/true, StandardAttention<Params>>
+    (Params& params, cudaStream_t stream);
 
-template cudaError_t SinglePrefillWithKVCacheDispatched<{head_dim}, {mask_mode}, /*USE_SWA=*/false, StandardAttention>(
-    Params& params,
-    cudaStream_t stream);
+template cudaError_t SinglePrefillWithKVCacheDispatched
+    <{head_dim}, {mask_mode}, /*USE_SWA=*/false, StandardAttention<Params>>
+    (Params& params, cudaStream_t stream);
+
 }}
     """.format(
         head_dim=head_dim,
-        pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
-        allow_fp16_qk_reduction=allow_fp16_qk_reduction,
+        # pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
+        # allow_fp16_qk_reduction=allow_fp16_qk_reduction,
         mask_mode=mask_mode_literal[int(mask_mode)],
         dtype_q=dtype_literal[dtype_q],
         dtype_kv=dtype_literal[dtype_kv],
         dtype_out=dtype_literal[dtype_out],
-        use_custom_mask="true" if int(mask_mode) == 2 else "false",
+        # use_custom_mask="true" if int(mask_mode) == 2 else "false",
     )
     return content
 
@@ -81,5 +84,4 @@ if __name__ == "__main__":
     path = Path(sys.argv[1])
     fname = path.name
     match = compiled_pattern.match(fname)
-    with open(path, "w") as f:
-        f.write(get_cu_file_str(*match.groups()))
+    path.write_text(get_cu_file_str(*match.groups()))

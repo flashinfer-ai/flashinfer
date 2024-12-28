@@ -18,12 +18,7 @@ import re
 import sys
 from pathlib import Path
 
-from .literal_map import (
-    dtype_literal,
-    idtype_literal,
-    mask_mode_literal,
-    pos_encoding_mode_literal,
-)
+from .literal_map import dtype_literal, idtype_literal, mask_mode_literal
 
 
 def get_cu_file_str(
@@ -36,32 +31,46 @@ def get_cu_file_str(
     dtype_out,
     idtype,
 ):
+    pos_encoding_mode = None
+    allow_fp16_qk_reduction = None
+
     def get_insts(attention_variant):
-        return "\n".join(
-            [
-                """template cudaError_t BatchPrefillWithPagedKVCacheDispatched<{head_dim}, {mask_mode}, /*USE_SWA=*/true, /*SAME_SCHEDULE_FOR_ALL_HEADS=*/true, {attention_variant}>(
-    Params& params,
-    cudaStream_t stream);
+        return """
+template cudaError_t BatchPrefillWithPagedKVCacheDispatched
+    <{head_dim},
+     {mask_mode},
+     /*USE_SWA=*/true,
+     /*SAME_SCHEDULE_FOR_ALL_HEADS=*/true,
+     {attention_variant}>
+    (Params& params, cudaStream_t stream);
 
-template cudaError_t BatchPrefillWithPagedKVCacheDispatched<{head_dim}, {mask_mode}, /*USE_SWA=*/false, /*SAME_SCHEDULE_FOR_ALL_HEADS=*/true, {attention_variant}>(
-    Params& params,
-    cudaStream_t stream);
+template cudaError_t BatchPrefillWithPagedKVCacheDispatched
+    <{head_dim},
+     {mask_mode},
+     /*USE_SWA=*/true,
+     /*SAME_SCHEDULE_FOR_ALL_HEADS=*/false,
+     {attention_variant}>
+    (Params& params, cudaStream_t stream);
 
-template cudaError_t BatchPrefillWithPagedKVCacheDispatched<{head_dim}, {mask_mode}, /*USE_SWA=*/true, /*SAME_SCHEDULE_FOR_ALL_HEADS=*/false, {attention_variant}>(
-    Params& params,
-    cudaStream_t stream);
+template cudaError_t BatchPrefillWithPagedKVCacheDispatched
+    <{head_dim},
+     {mask_mode},
+     /*USE_SWA=*/false,
+     /*SAME_SCHEDULE_FOR_ALL_HEADS=*/true,
+     {attention_variant}>
+    (Params& params, cudaStream_t stream);
 
-template cudaError_t BatchPrefillWithPagedKVCacheDispatched<{head_dim}, {mask_mode}, /*USE_SWA=*/false, /*SAME_SCHEDULE_FOR_ALL_HEADS=*/false, {attention_variant}>(
-    Params& params,
-    cudaStream_t stream);
+template cudaError_t BatchPrefillWithPagedKVCacheDispatched
+    <{head_dim},
+     {mask_mode},
+     /*USE_SWA=*/false,
+     /*SAME_SCHEDULE_FOR_ALL_HEADS=*/false,
+     {attention_variant}>
+    (Params& params, cudaStream_t stream);
     """.format(
-                    head_dim=head_dim,
-                    pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
-                    allow_fp16_qk_reduction=allow_fp16_qk_reduction,
-                    mask_mode=mask_mode_literal[int(mask_mode)],
-                    attention_variant=attention_variant,
-                )
-            ]
+        head_dim=head_dim,
+        mask_mode=mask_mode_literal[int(mask_mode)],
+        attention_variant=attention_variant,
         )
 
     dtype_q = dtype_literal[dtype_q]
@@ -69,7 +78,9 @@ template cudaError_t BatchPrefillWithPagedKVCacheDispatched<{head_dim}, {mask_mo
     dtype_out = dtype_literal[dtype_out]
     idtype = idtype_literal[idtype]
 
-    content = f"""#include <flashinfer/attention/hopper/prefill_sm90.cuh>
+    content = f""" // batch_paged_prefill_sm90 template inst
+#include <flashinfer/attention/hopper/params.cuh>
+#include <flashinfer/attention/hopper/prefill_sm90.cuh>
 #include <flashinfer/attention/hopper/variants.cuh>
 #include <flashinfer/cutlass_utils.cuh>
 
@@ -82,9 +93,9 @@ using DTypeO = cutlass_dtype_t<{dtype_out}>;
 
 using Params = BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO, {idtype}>;
 
-{get_insts("LogitsSoftCap")}
+{get_insts("LogitsSoftCap<Params>")}
 
-{get_insts("StandardAttention")}
+{get_insts("StandardAttention<Params>")}
 
 }}"""
     return content
@@ -93,12 +104,11 @@ using Params = BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO, {idtype}>;
 if __name__ == "__main__":
     pattern = (
         r"batch_paged_prefill_head_([0-9]+)_posenc_([0-9]+)_"
-        r"fp16qkred_([a-z]+)_mask_([0-9]+)_dtypeq_([a-z0-9]+)_dtypekv_([a-z0-9]+)_dtypeout_([a-z0-9]+)_idtype_([a-z0-9]+)_sm90\.cu"
+        r"fp16qkred_([a-z]+)_mask_([0-9]+)_dtypeq_([a-z0-9]+)_dtypekv_([a-z0-9]+)_"
+        r"dtypeout_([a-z0-9]+)_idtype_([a-z0-9]+)_sm90\.cu"
     )
     compiled_pattern = re.compile(pattern)
     path = Path(sys.argv[1])
     fname = path.name
     match = compiled_pattern.match(fname)
-
-    with open(path, "w") as f:
-        f.write(get_cu_file_str(*match.groups()))
+    path.write_text(get_cu_file_str(*match.groups()))

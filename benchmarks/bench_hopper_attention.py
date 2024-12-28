@@ -107,7 +107,13 @@ def bench_batch_ragged_prefill(batch_size, num_heads, seq_len, causal, head_dim)
 
 
 def bench_batch_paged_prefill(
-    page_size, batch_size, num_heads, seq_len, causal, head_dim
+    page_size: int,
+    batch_size: int,
+    num_heads: int,
+    seq_len: int,
+    causal: bool = True,
+    head_dim: int = 128,
+    xai_temperature_len: int = -1,
 ):
     num_qo_heads = num_kv_heads = num_heads
     q = torch.randn(
@@ -157,13 +163,14 @@ def bench_batch_paged_prefill(
             head_dim,
             page_size,  # page_size
             causal=causal,
+            xai_temperature_len=xai_temperature_len,
         )
 
     sm80_ms, sm90_ms = (
         triton.testing.do_bench(
             lambda: wrapper.run(q, (k, v)),
-            warmup=100,
-            rep=1000,
+            warmup=50,
+            rep=200,
         )
         for wrapper in [sm80_wrapper, sm90_wrapper]
     )
@@ -179,23 +186,35 @@ def bench_batch_paged_prefill(
             )
 
     print(
-        f"bench_batch_paged_prefill (page_size={page_size} batch_size={batch_size}, num_heads={num_heads}, seq_len={seq_len}, causal={causal}, head_dim={head_dim}), fa2-template: {flops(sm80_ms):.3f} TFLOPs/s, fa3-template: {flops(sm90_ms):.3f} TFLOPs/s"
+        "bench_batch_paged_prefill_"
+        f"{'causal' if causal else 'non_causal'} "
+        f"| page_size={page_size:<3d} "
+        f"batch_size={batch_size:<5d} "
+        f"num_heads={num_heads:<3d} "
+        f"seq_len={seq_len:<3d} "
+        f"head_dim={head_dim:<3d} "
+        "| TFLOPs: "
+        f"fa2={flops(sm80_ms):<8.3f} "
+        f"fa3={flops(sm90_ms):<8.3f}"
     )
 
 
 if __name__ == "__main__":
-    bench_batch_paged_prefill(1, 128, 32, 1024, True, 128)
-    bench_batch_paged_prefill(1, 64, 32, 2048, True, 128)
-    bench_batch_paged_prefill(1, 32, 32, 4096, True, 128)
-    bench_batch_paged_prefill(1, 16, 32, 8192, True, 128)
-    bench_batch_paged_prefill(1, 1, 32, 32768, True, 128)
-    bench_batch_paged_prefill(16, 128, 32, 1024, True, 128)
-    bench_batch_paged_prefill(16, 64, 32, 2048, True, 128)
-    bench_batch_paged_prefill(16, 32, 32, 4096, True, 128)
-    bench_batch_paged_prefill(16, 16, 32, 8192, True, 128)
-    bench_batch_paged_prefill(16, 1, 32, 32768, True, 128)
-    bench_batch_ragged_prefill(128, 32, 1024, True, 128)
-    bench_batch_ragged_prefill(64, 32, 2048, True, 128)
-    bench_batch_ragged_prefill(32, 32, 4096, True, 128)
-    bench_batch_ragged_prefill(16, 32, 8192, True, 128)
-    bench_batch_ragged_prefill(1, 32, 32768, True, 128)
+    bench_batch_paged_prefill(1, 1, 32, 1024, True, 128, xai_temperature_len=8192)
+    bench_batch_paged_prefill(1, 64, 32, 1024, True, 128, xai_temperature_len=8192)
+
+    # bench_batch_paged_prefill(1, 128, 32, 1024, True, 128)
+    # bench_batch_paged_prefill(1, 64, 32, 2048, True, 128)
+    # bench_batch_paged_prefill(1, 32, 32, 4096, True, 128)
+    # bench_batch_paged_prefill(1, 16, 32, 8192, True, 128)
+    # bench_batch_paged_prefill(1, 1, 32, 32768, True, 128)
+    # bench_batch_paged_prefill(16, 128, 32, 1024, True, 128)
+    # bench_batch_paged_prefill(16, 64, 32, 2048, True, 128)
+    # bench_batch_paged_prefill(16, 32, 32, 4096, True, 128)
+    # bench_batch_paged_prefill(16, 16, 32, 8192, True, 128)
+    # bench_batch_paged_prefill(16, 1, 32, 32768, True, 128)
+    # bench_batch_ragged_prefill(128, 32, 1024, True, 128)
+    # bench_batch_ragged_prefill(64, 32, 2048, True, 128)
+    # bench_batch_ragged_prefill(32, 32, 4096, True, 128)
+    # bench_batch_ragged_prefill(16, 32, 8192, True, 128)
+    # bench_batch_ragged_prefill(1, 32, 32768, True, 128)

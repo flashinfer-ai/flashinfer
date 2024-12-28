@@ -28,8 +28,8 @@
 namespace flashinfer {
 
 template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLINDING_WINDOW,
-          typename AttentionVariant, typename DTypeQ, typename DTypeKV, typename DTypeO>
-cudaError_t SinglePrefillWithKVCacheDispatched(SinglePrefillParams<DTypeQ, DTypeKV, DTypeO>& params,
+          typename AttentionVariant>
+cudaError_t SinglePrefillWithKVCacheDispatched(typename AttentionVariant::ParamsT& params,
                                                cudaStream_t stream);
 
 }  // namespace flashinfer
@@ -59,7 +59,8 @@ void single_prefill_with_kv_cache_sm90(unsigned int mask_mode_code, at::Tensor q
     using DTypeQ = cutlass_dtype_t<q_type>;
     using DTypeKV = DTypeQ;
     using DTypeO = DTypeQ;
-    SinglePrefillParams<DTypeQ, DTypeKV, DTypeO> params;
+    using SinglePrefillParams = SinglePrefillParams<DTypeQ, DTypeKV, DTypeO>;
+    SinglePrefillParams params;
     params.q_ptr = static_cast<DTypeQ*>(q.data_ptr());
     params.k_ptr = static_cast<DTypeKV*>(k.data_ptr());
     params.v_ptr = static_cast<DTypeKV*>(v.data_ptr());
@@ -96,7 +97,8 @@ void single_prefill_with_kv_cache_sm90(unsigned int mask_mode_code, at::Tensor q
         return DISPATCH_BOOL(use_logits_soft_cap, USE_LOGITS_SOFT_CAP, [&] {
           return DISPATCH_BOOL(use_swa, USE_SWA, [&] {
             using AttentionVariant =
-                std::conditional_t<USE_LOGITS_SOFT_CAP, LogitsSoftCap, StandardAttention>;
+                std::conditional_t<USE_LOGITS_SOFT_CAP, LogitsSoftCap<SinglePrefillParams>,
+                                   StandardAttention<SinglePrefillParams>>;
             cudaError_t status =
                 SinglePrefillWithKVCacheDispatched<HEAD_DIM, MASK_MODE, USE_SWA, AttentionVariant>(
                     params, stream);
