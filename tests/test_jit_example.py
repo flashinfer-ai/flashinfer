@@ -326,28 +326,34 @@ struct DebugPrintLogits {
 
   static constexpr auto use_softmax = true;
 
+  int qo_len;
+  int kv_len;
   float sm_scale_log2;
 
   // Init
   __device__ __host__ DebugPrintLogits(const ParamsT& params) {
     sm_scale_log2 = params.sm_scale * math::log2e;
+    qo_len = params.qo_len;
+    kv_len = params.kv_len;
   }
 
   template <typename MainloopParams, typename T>
   __device__ __forceinline__ T LogitsTransform(const MainloopParams& params, T logits,
                                                uint32_t batch_idx, uint32_t qo_idx, uint32_t kv_idx,
                                                uint32_t qo_head_idx, uint32_t kv_head_idx) {
-    printf(
-        "---> LOGITS DEBUG: "
-        "qo_idx=%-5d "
-        "kv_idx=%-5d "
-        "sm_scale_log2=%-12.5f "
-        "logits=%-12.5f "
-        "\n",
-        qo_idx,
-        kv_idx,
-        sm_scale_log2,
-        static_cast<float>(logits));
+    if (qo_idx < qo_len && kv_idx < kv_len) {
+      printf(
+          "---> LOGITS DEBUG: "
+          "qo_idx=%-5d "
+          "kv_idx=%-5d "
+          "sm_scale_log2=%-12.5f "
+          "logits=%-12.5f "
+          "\n",
+          qo_idx,
+          kv_idx,
+          sm_scale_log2,
+          static_cast<float>(logits));
+    }
     logits *= sm_scale_log2;
     return logits;
   }
