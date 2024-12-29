@@ -19,7 +19,6 @@ import pathlib
 from typing import List, Tuple
 
 import jinja2
-import rich.syntax
 import torch
 
 from .batch_decode_mla_templ import batch_decode_mla_suffix, batch_decode_mla_templ
