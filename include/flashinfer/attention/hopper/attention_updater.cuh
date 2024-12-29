@@ -10,6 +10,8 @@
 #include <cute/tensor.hpp>
 #include <cutlass/detail/helper_macros.hpp>
 
+#include "flashinfer/attention/hopper/utils.cuh"
+
 namespace flashinfer {
 
 using namespace cute;

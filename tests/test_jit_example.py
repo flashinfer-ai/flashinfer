@@ -7,6 +7,7 @@ from flashinfer.decode import single_decode_with_kv_cache_with_jit_module
 from flashinfer.jit.attention import (
     gen_customize_single_decode_module,
     gen_customize_single_prefill_module,
+    gen_customize_single_prefill_sm90_module,
     single_decode_suffix,
     single_prefill_suffix,
 )
@@ -302,6 +303,82 @@ struct DebugPrintLogits {
     k = torch.randn(1023, 32, 128, dtype=torch.float16, device="cuda")
     v = torch.randn(1023, 32, 128, dtype=torch.float16, device="cuda")
     sm_scale = 1.0 / math.sqrt(128)
+    o = f(q, k, v, sm_scale, mask_mode=MaskMode.NON_CAUSAL.value)
+
+    p = torch.einsum("mhd,nhd->hmn", q.float(), k.float()) * sm_scale
+    o_ref = torch.einsum("hmn,nhd->mhd", torch.softmax(p, dim=-1), v.float()).half()
+    torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
+
+
+def test_sm90_debug_print_logits():
+    torch.manual_seed(42)
+    variant_decl = r"""
+template <typename ParamsT_>
+struct DebugPrintLogits {
+  using ParamsT = ParamsT_;
+  using DTypeQ = typename ParamsT::DTypeQ;
+  using DTypeKV = typename ParamsT::DTypeKV;
+  using DTypeO = typename ParamsT::DTypeO;
+  using IdType = typename ParamsT::IdType;
+
+  template <int NUM_ROWS_PER_THREAD>
+  using Updater = OnlineSoftmaxWithoutScale<NUM_ROWS_PER_THREAD>;
+
+  static constexpr auto use_softmax = true;
+
+  int qo_len;
+  int kv_len;
+  float sm_scale_log2;
+
+  // Init
+  __device__ __host__ DebugPrintLogits(const ParamsT& params) {
+    sm_scale_log2 = params.sm_scale * math::log2e;
+    qo_len = params.qo_len;
+    kv_len = params.kv_len;
+  }
+
+  template <typename MainloopParams, typename T>
+  __device__ __forceinline__ T LogitsTransform(const MainloopParams& params, T logits,
+                                               uint32_t batch_idx, uint32_t qo_idx, uint32_t kv_idx,
+                                               uint32_t qo_head_idx, uint32_t kv_head_idx) {
+    if (qo_idx < qo_len && kv_idx < kv_len) {
+      printf(
+          "---> LOGITS DEBUG: "
+          "qo_idx=%-5d "
+          "kv_idx=%-5d "
+          "sm_scale_log2=%-12.5f "
+          "logits=%-12.5f "
+          "\n",
+          qo_idx,
+          kv_idx,
+          sm_scale_log2,
+          static_cast<float>(logits));
+    }
+    logits *= sm_scale_log2;
+    return logits;
+  }
+};
+"""
+    jit_module = gen_customize_single_prefill_sm90_module(
+        module_name="sm90_debug_print_logits",
+        dtype_q=torch.float16,  # dtype_q
+        dtype_kv=torch.float16,  # dtype_kv
+        dtype_o=torch.float16,  # dtype_o
+        head_dim=128,  # hidden_dim
+        additional_input_tensor_var_names=[],  # additional_input_tensor_var_names
+        additional_input_tensor_var_types=[],  # additional_input_tensor_var_types
+        additional_input_scalar_var_names=["sm_scale"],  # additional_input_scalar_var_names
+        additional_input_scalar_var_types=["float"],  # additional_input_scalar_var_types
+        variant_name="DebugPrintLogits",
+        variant_decl=variant_decl,
+    )
+
+    f = functools.partial(single_prefill_with_kv_cache_with_jit_module, jit_module)
+
+    q = torch.randn(16, 2, 128, dtype=torch.float16, device="cuda")
+    k = torch.randn(16, 1, 128, dtype=torch.float16, device="cuda")
+    v = torch.randn(16, 1, 128, dtype=torch.float16, device="cuda")
+    sm_scale = 1. / math.sqrt(128)
     o = f(q, k, v, sm_scale, mask_mode=MaskMode.NON_CAUSAL.value)
 
     p = torch.einsum("mhd,nhd->hmn", q.float(), k.float()) * sm_scale

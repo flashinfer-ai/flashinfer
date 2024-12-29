@@ -29,16 +29,14 @@
 namespace flashinfer {
 
 template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLINDING_WINDOW,
-          bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename DTypeQ,
-          typename DTypeKV, typename DTypeO, typename IdType>
-cudaError_t BatchPrefillWithRaggedKVCacheDispatched(
-    BatchPrefillRaggedParams<DTypeQ, DTypeKV, DTypeO, IdType>& params, cudaStream_t stream);
+          bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant>
+cudaError_t BatchPrefillWithRaggedKVCacheDispatched(typename AttentionVariant::ParamsT& params,
+                                                    cudaStream_t stream);
 
 template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLINDING_WINDOW,
-          bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename DTypeQ,
-          typename DTypeKV, typename DTypeO, typename IdType>
-cudaError_t BatchPrefillWithPagedKVCacheDispatched(
-    BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO, IdType>& params, cudaStream_t stream);
+          bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant>
+cudaError_t BatchPrefillWithPagedKVCacheDispatched(typename AttentionVariant::ParamsT& params,
+                                                   cudaStream_t stream);
 
 }  // namespace flashinfer
 
@@ -110,7 +108,8 @@ void BatchPrefillWithRaggedKVCacheSM90Run(
     using DTypeO = DTypeQ;
     using IdType = int32_t;
 
-    BatchPrefillRaggedParams<DTypeQ, DTypeKV, DTypeO, IdType> params;
+    using BatchPrefillRaggedParams = BatchPrefillRaggedParams<DTypeQ, DTypeKV, DTypeO, IdType>;
+    BatchPrefillRaggedParams params;
 
     params.q_ptr = static_cast<DTypeQ*>(q.data_ptr());
     params.k_ptr = static_cast<DTypeKV*>(k.data_ptr());
@@ -160,7 +159,8 @@ void BatchPrefillWithRaggedKVCacheSM90Run(
           return DISPATCH_BOOL(use_swa, USE_SWA, [&] {
             return DISPATCH_BOOL(same_schedule_for_all_heads, SAME_SCHEDULER_FOR_ALL_HEADS, [&] {
               using AttentionVariant =
-                  std::conditional_t<USE_LOGITS_SOFT_CAP, LogitsSoftCap, StandardAttention>;
+                  std::conditional_t<USE_LOGITS_SOFT_CAP, LogitsSoftCap<BatchPrefillRaggedParams>,
+                                     StandardAttention<BatchPrefillRaggedParams>>;
               cudaError_t status = BatchPrefillWithRaggedKVCacheDispatched<
                   HEAD_DIM, MASK_MODE, USE_SWA, SAME_SCHEDULER_FOR_ALL_HEADS, AttentionVariant>(
                   params, stream);
@@ -220,7 +220,8 @@ void BatchPrefillWithPagedKVCacheSM90Run(
     using DTypeO = DTypeQ;
     using IdType = int32_t;
 
-    BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO, IdType> params;
+    using BatchPrefillPagedParams = BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO, IdType>;
+    BatchPrefillPagedParams params;
 
     params.q_ptr = static_cast<DTypeQ*>(q.data_ptr());
     params.k_ptr = static_cast<DTypeKV*>(paged_k_cache.data_ptr());
@@ -272,7 +273,8 @@ void BatchPrefillWithPagedKVCacheSM90Run(
           return DISPATCH_BOOL(use_swa, USE_SWA, [&] {
             return DISPATCH_BOOL(same_schedule_for_all_heads, SAME_SCHEDULER_FOR_ALL_HEADS, [&] {
               using AttentionVariant =
-                  std::conditional_t<USE_LOGITS_SOFT_CAP, LogitsSoftCap, StandardAttention>;
+                  std::conditional_t<USE_LOGITS_SOFT_CAP, LogitsSoftCap<BatchPrefillPagedParams>,
+                                     StandardAttention<BatchPrefillPagedParams>>;
               cudaError_t status = BatchPrefillWithPagedKVCacheDispatched<
                   HEAD_DIM, MASK_MODE, USE_SWA, SAME_SCHEDULER_FOR_ALL_HEADS, AttentionVariant>(
                   params, stream);

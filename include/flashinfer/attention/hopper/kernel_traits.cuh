@@ -40,13 +40,14 @@ struct SharedStorageQKVO {
 };
 
 template <bool USE_TMA_LOAD_KV, int HEAD_DIM_, int CTA_Q_, int CTA_KV_, int NUM_STAGES_,
-          typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_,
           typename AttentionVariant_>
 struct AttentionKernelTraits {
-  using DTypeQ = DTypeQ_;
-  using DTypeKV = DTypeKV_;
-  using DTypeO = DTypeO_;
-  using IdType = IdType_;
+  using AttentionVariant = AttentionVariant_;
+
+  using DTypeQ = cutlass_dtype_t<typename AttentionVariant::DTypeQ>;
+  using DTypeKV = cutlass_dtype_t<typename AttentionVariant::DTypeKV>;
+  using DTypeO = cutlass_dtype_t<typename AttentionVariant::DTypeO>;
+  using IdType = cutlass_dtype_t<typename AttentionVariant::IdType>;
   using DTypeQKAccum = float;
 
   static constexpr int CTA_Q = CTA_Q_;
@@ -61,7 +62,6 @@ struct AttentionKernelTraits {
   // where only one warp inside a warp group is used for TMA.
   static constexpr int NUM_PRODUCER_THREADS = cutlass::NumThreadsPerWarp;
 
-  using AttentionVariant = AttentionVariant_;
   using TileShape_QKD = Shape<Int<CTA_Q>, Int<CTA_KV>, Int<HEAD_DIM>>;
 
   static constexpr int NUM_STAGES = NUM_STAGES_;

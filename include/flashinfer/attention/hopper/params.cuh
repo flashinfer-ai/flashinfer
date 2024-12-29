@@ -22,11 +22,12 @@
 
 namespace flashinfer {
 
-template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_>
+template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_ = int32_t>
 struct SinglePrefillParams {
   using DTypeQ = DTypeQ_;
   using DTypeKV = DTypeKV_;
   using DTypeO = DTypeO_;
+  using IdType = IdType_;
   // The QKV matrices.
   DTypeQ* q_ptr;
   DTypeKV* k_ptr;
