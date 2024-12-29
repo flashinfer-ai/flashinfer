@@ -651,7 +651,8 @@ struct BatchPrefillPagedParams {
 
 
 def customizable_paged_prefill_sm90_inst_templ(mask_mode: str) -> str:
-    return f"""#include <flashinfer/attention/hopper/prefill_sm90.cuh>
+    return f"""// sm90_batch_paged_prefill template inst
+#include <flashinfer/attention/hopper/prefill_sm90.cuh>
 #include <flashinfer/attention/hopper/variants.cuh>
 #include <flashinfer/cutlass_utils.cuh>
 #include <flashinfer/attention/mask.cuh>

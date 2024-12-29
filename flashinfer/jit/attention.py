@@ -19,6 +19,7 @@ import pathlib
 from typing import List, Tuple
 
 import jinja2
+import rich.syntax
 import torch
 
 from .batch_decode_mla_templ import batch_decode_mla_suffix, batch_decode_mla_templ
@@ -40,6 +41,8 @@ from .single_decode_templ import (
 from .single_prefill_sm90_templ import (
     single_prefill_sm90_suffix,
     single_prefill_sm90_templ,
+    customizable_single_prefill_sm90_suffix,
+    customizable_single_prefill_sm90_templ,
 )
 from .single_prefill_templ import (
     customizable_single_prefill_templ,
@@ -708,6 +711,82 @@ def gen_customize_batch_prefill_sm90_module(module_name, *args, **kwargs):
     sources = get_customize_batch_prefill_sm90_sources(*args, **kwargs)
     source_paths = []
     for suffix, source in zip(customizable_batch_prefill_sm90_suffix, sources):
+        path = gen_directory / f"{module_name}{suffix}"
+        source_paths.append(path)
+        write_if_different(path, source)
+    return load_cuda_ops(module_name, source_paths)
+
+
+def get_customize_single_prefill_sm90_sources(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    head_dim: int,
+    additional_input_tensor_var_names: List[str],
+    additional_input_tensor_var_types: List[str],
+    additional_input_scalar_var_names: List[str],
+    additional_input_scalar_var_types: List[str],
+    variant_name: str,
+    variant_decl: str,
+) -> List[str]:
+    additional_params_decl = ";\n  ".join(
+        [
+            f"{dtype}* {var}_ptr"
+            for dtype, var in zip(
+                additional_input_tensor_var_types, additional_input_tensor_var_names
+            )
+        ] +
+        [
+            f"{dtype} {var}"
+            for dtype, var in zip(
+                additional_input_scalar_var_types, additional_input_scalar_var_names
+            )
+        ]
+    )
+    additional_func_params = ",\n    ".join(
+        [f"at::Tensor {var}" for var in additional_input_tensor_var_names] +
+        [
+            f"{dtype} {var}"
+            for dtype, var in zip(
+                additional_input_scalar_var_types, additional_input_scalar_var_names
+            )
+        ]
+    )
+    additional_params_setter = ";\n  ".join(
+        [
+            f"params.{var}_ptr = static_cast<{dtype}*>({var}.data_ptr())"
+            for dtype, var in zip(
+                additional_input_tensor_var_types, additional_input_tensor_var_names
+            )
+        ] +
+        [f"params.{var} = {var}" for var in additional_input_scalar_var_names]
+    )
+
+    if additional_func_params:
+        additional_func_params += ","
+
+    return render_templates(
+        customizable_single_prefill_sm90_templ,
+        {
+            "dtype_q": dtype_map[dtype_q],
+            "dtype_kv": dtype_map[dtype_kv],
+            "dtype_o": dtype_map[dtype_o],
+            "head_dim": head_dim,
+            "variant_decl": variant_decl,
+            "variant_name": variant_name,
+            "use_sliding_window": "false",
+            "additional_params_decl": additional_params_decl,
+            "additional_params_setter": additional_params_setter,
+            "additional_func_params": additional_func_params,
+        },
+    )
+
+
+def gen_customize_single_prefill_sm90_module(module_name, *args, **kwargs):
+    gen_directory = FLASHINFER_GEN_SRC_DIR
+    sources = get_customize_single_prefill_sm90_sources(*args, **kwargs)
+    source_paths = []
+    for suffix, source in zip(customizable_single_prefill_sm90_suffix, sources):
         path = gen_directory / f"{module_name}{suffix}"
         source_paths.append(path)
         write_if_different(path, source)
