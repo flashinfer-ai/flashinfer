@@ -714,7 +714,11 @@ def gen_customize_batch_prefill_sm90_module(module_name, *args, **kwargs):
         path = gen_directory / f"{module_name}{suffix}"
         source_paths.append(path)
         write_if_different(path, source)
-    return load_cuda_ops(module_name, source_paths)
+    return load_cuda_ops(
+        module_name,
+        source_paths,
+        extra_cuda_cflags=["-gencode=arch=compute_90a,code=sm_90a"],
+    )
 
 
 def get_customize_single_prefill_sm90_sources(
@@ -790,4 +794,8 @@ def gen_customize_single_prefill_sm90_module(module_name, *args, **kwargs):
         path = gen_directory / f"{module_name}{suffix}"
         source_paths.append(path)
         write_if_different(path, source)
-    return load_cuda_ops(module_name, source_paths)
+    return load_cuda_ops(
+        module_name,
+        source_paths,
+        extra_cuda_cflags=["-gencode=arch=compute_90a,code=sm_90a"],
+    )

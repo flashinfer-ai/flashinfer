@@ -218,8 +218,6 @@ struct SinglePrefillParams {
   // these are bad arguments. we should remove them from default in prefill_sm90.cuh.
   float logits_soft_cap = 0.;
   float sm_scale_log2 = 0.;
-
-  struct AdditionalParams {};
 };
 """
 

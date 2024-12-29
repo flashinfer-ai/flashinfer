@@ -537,8 +537,6 @@ struct BatchPrefillRaggedParams {
   float logits_soft_cap;
   float sm_scale_log2;
   bool causal;
-
-  struct AdditionalParams {};
 };
 """
 
@@ -644,8 +642,6 @@ struct BatchPrefillPagedParams {
   float logits_soft_cap;
   float sm_scale_log2;
   bool causal;
-
-  struct AdditionalParams {};
 };
 """
 
