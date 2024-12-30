@@ -236,19 +236,24 @@ else:
         device_types: Optional[Union[str, Sequence[str]]] = None,
         schema: Optional[str] = None,
     ) -> Callable:
-        return torch.library.custom_op(
-            name,
-            fn,
-            mutates_args=mutates_args,
-            device_types=device_types,
-            schema=schema,
-        )
+        # NOTE(Zihao): torch.library.custom_op has significant overhead as mentioned in the following link
+        # https://github.com/vllm-project/vllm/blob/36e76700453924c8d421db99af70a88a1df835cd/vllm/utils.py#L1660-L1674
+
+        # return torch.library.custom_op(
+        #     name,
+        #     fn,
+        #     mutates_args=mutates_args,
+        #     device_types=device_types,
+        #     schema=schema,
+        # )
+        return lambda x: x
 
     def register_fake_op(
         name: str,
         fn: Optional[Callable] = None,
     ) -> Callable:
-        return torch.library.register_fake(name, fn)
+        # return torch.library.register_fake(name, fn)
+        return lambda x: x
 
 
 def get_cuda_stream(device: torch.device) -> int:
