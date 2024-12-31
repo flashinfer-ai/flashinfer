@@ -40,14 +40,15 @@ struct SharedStorageQKVO {
 };
 
 template <bool USE_TMA_LOAD_KV, int HEAD_DIM_, int CTA_Q_, int CTA_KV_, int NUM_STAGES_,
+          typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_,
           typename AttentionVariant_>
 struct AttentionKernelTraits {
   using AttentionVariant = AttentionVariant_;
 
-  using DTypeQ = cutlass_dtype_t<typename AttentionVariant::DTypeQ>;
-  using DTypeKV = cutlass_dtype_t<typename AttentionVariant::DTypeKV>;
-  using DTypeO = cutlass_dtype_t<typename AttentionVariant::DTypeO>;
-  using IdType = cutlass_dtype_t<typename AttentionVariant::IdType>;
+  using DTypeQ = DTypeQ_;
+  using DTypeKV = DTypeKV_;
+  using DTypeO = DTypeO_;
+  using IdType = IdType_;
   using DTypeQKAccum = float;
 
   static constexpr int CTA_Q = CTA_Q_;

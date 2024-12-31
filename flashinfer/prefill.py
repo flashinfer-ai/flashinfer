@@ -24,15 +24,11 @@ import torch
 
 from .jit import (
     gen_batch_prefill_module,
-    gen_batch_prefill_sm90_module,
+    gen_customize_batch_prefill_module,
     gen_single_prefill_module,
-    gen_single_prefill_sm90_module,
-    get_batch_prefill_sm90_uri,
     get_batch_prefill_uri,
-    get_single_prefill_sm90_uri,
     get_single_prefill_uri,
     has_prebuilt_ops,
-    load_cuda_ops,
     prebuilt_ops_uri,
 )
 from .page import block_sparse_indices_to_vector_sparse_offsets, get_seq_lens
@@ -62,570 +58,330 @@ _batch_prefill_modules = {}
 _batch_prefill_sm90_modules = {}
 _batch_prefill_jit_modules = {}
 
-def get_single_prefill_sm90_module(*args):
-    global _single_prefill_sm90_modules
-    if args not in _single_prefill_sm90_modules:
-        uri = get_single_prefill_sm90_uri(*args)
-        if has_prebuilt_ops and uri in prebuilt_ops_uri:
-            from . import _kernels_sm90
 
-            run_func = _kernels_sm90.single_prefill_with_kv_cache_sm90
-        else:
-            run_func = gen_single_prefill_sm90_module(*args).run
-
-        @register_custom_op(f"flashinfer::{uri}_run", mutates_args=("tmp", "maybe_lse"))
-        def run_single_prefill_sm90(
-            mask_mode: int,
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
-            maybe_packed_custom_mask: Optional[torch.Tensor],
-            tmp: torch.Tensor,
-            maybe_alibi_slopes: Optional[torch.Tensor],
-            layout: int,
-            window_left: int,
-            logits_soft_cap: float,
-            sm_scale: float,
-            rope_scale: float,
-            rope_theta: float,
-            maybe_lse: Optional[torch.Tensor],
-        ) -> torch.Tensor:
-            with q.device as device:  # device guard
-                o = torch.empty_like(q)
-                run_func(
-                    mask_mode,
-                    q,
-                    k,
-                    v,
-                    maybe_packed_custom_mask,
-                    # tmp,
-                    maybe_alibi_slopes,
-                    o,
-                    layout,
-                    window_left,
-                    logits_soft_cap,
-                    sm_scale,
-                    rope_scale,
-                    rope_theta,
-                    maybe_lse,
-                    get_cuda_stream(device),
-                )
-                return o
-
-        @register_fake_op(f"flashinfer::{uri}_run")
-        def _fake_run_single_prefill_sm90(
-            mask_mode: int,
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
-            maybe_packed_custom_mask: Optional[torch.Tensor],
-            tmp: torch.Tensor,
-            maybe_alibi_slopes: Optional[torch.Tensor],
-            layout: int,
-            window_left: int,
-            logits_soft_cap: float,
-            sm_scale: float,
-            rope_scale: float,
-            rope_theta: float,
-            maybe_lse: Optional[torch.Tensor],
-        ) -> torch.Tensor:
-            return torch.empty_like(q)
-
-        # Register the module
-        _single_prefill_sm90_modules[args] = SimpleNamespace(
-            run=run_single_prefill_sm90
+def get_single_prefill_module(backend):
+    def backend_module(*args):
+        global _single_prefill_modules, _single_prefill_sm90_modules
+        modules_dict = (
+            _single_prefill_modules
+            if backend == "fa2"
+            else _single_prefill_sm90_modules
         )
+        if args not in modules_dict:
+            uri = get_single_prefill_uri(backend, *args)
+            if has_prebuilt_ops and uri in prebuilt_ops_uri:
+                if backend == "fa2":
+                    from . import _kernels
 
-    return _single_prefill_sm90_modules[args]
+                    run_func = _kernels.single_prefill_with_kv_cache
+                else:
+                    from . import _kernels_sm90
 
+                    run_func = _kernels_sm90.single_prefill_with_kv_cache_sm90
+            else:
+                run_func = gen_single_prefill_module(backend, *args).run
 
-def get_single_prefill_module(*args):
-    global _single_prefill_modules
-    if args not in _single_prefill_modules:
-        uri = get_single_prefill_uri(*args)
-        if has_prebuilt_ops and uri in prebuilt_ops_uri:
-            from . import _kernels
+            # torch library for single_prefill_with_kv_cache
 
-            run_func = _kernels.single_prefill_with_kv_cache
-        else:
-            run_func = gen_single_prefill_module(*args).run
-
-        # torch library for single_prefill_with_kv_cache
-
-        @register_custom_op(f"flashinfer::{uri}_run", mutates_args=("tmp", "maybe_lse"))
-        def run_single_prefill(
-            mask_mode: int,
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
-            maybe_packed_custom_mask: Optional[torch.Tensor],
-            tmp: torch.Tensor,
-            maybe_alibi_slopes: Optional[torch.Tensor],
-            layout: int,
-            window_left: int,
-            logits_soft_cap: float,
-            sm_scale: float,
-            rope_scale: float,
-            rope_theta: float,
-            maybe_lse: Optional[torch.Tensor],
-        ) -> torch.Tensor:
-            with q.device as device:  # device guard
-                o = torch.empty_like(q)
-                run_func(
-                    mask_mode,
-                    q,
-                    k,
-                    v,
-                    maybe_packed_custom_mask,
-                    tmp,
-                    maybe_alibi_slopes,
-                    o,
-                    layout,
-                    window_left,
-                    logits_soft_cap,
-                    sm_scale,
-                    rope_scale,
-                    rope_theta,
-                    maybe_lse,
-                    get_cuda_stream(device),
-                )
-                return o
-
-        @register_fake_op(f"flashinfer::{uri}_run")
-        def _fake_run_single_prefill(
-            mask_mode: int,
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
-            maybe_packed_custom_mask: Optional[torch.Tensor],
-            tmp: torch.Tensor,
-            maybe_alibi_slopes: Optional[torch.Tensor],
-            layout: int,
-            window_left: int,
-            logits_soft_cap: float,
-            sm_scale: float,
-            rope_scale: float,
-            rope_theta: float,
-            maybe_lse: Optional[torch.Tensor],
-        ) -> torch.Tensor:
-            return torch.empty_like(q)
-
-        # Register the module
-        _single_prefill_modules[args] = SimpleNamespace(run=run_single_prefill)
-
-    return _single_prefill_modules[args]
-
-
-def get_batch_prefill_sm90_module(*args):
-    global _batch_prefill_sm90_modules
-    if args not in _batch_prefill_sm90_modules:
-        uri = get_batch_prefill_sm90_uri(*args)
-
-        if has_prebuilt_ops and uri in prebuilt_ops_uri:
-            from . import _kernels_sm90
-
-            head_dim = args[4]
-            plan_func = (
-                lambda *plan_args: _kernels_sm90.batch_prefill_with_kv_cache_sm90_plan(
-                    head_dim,
-                    *plan_args,
-                )
+            @register_custom_op(
+                f"flashinfer::{uri}_run", mutates_args=("tmp", "maybe_lse")
             )
-            ragged_run_func = _kernels_sm90.batch_prefill_with_ragged_kv_cache_sm90_run
-            paged_run_func = _kernels_sm90.batch_prefill_with_paged_kv_cache_sm90_run
-        else:
-            module = gen_batch_prefill_sm90_module(*args)
-            plan_func = module.plan
-            ragged_run_func = module.ragged_run
-            paged_run_func = module.paged_run
+            def run_single_prefill(
+                q: torch.Tensor,
+                k: torch.Tensor,
+                v: torch.Tensor,
+                tmp: torch.Tensor,
+                maybe_lse: Optional[torch.Tensor],
+                mask_mode: int,
+                layout: int,
+                window_left: int,
+                maybe_packed_custom_mask: Optional[torch.Tensor],
+                maybe_alibi_slopes: Optional[torch.Tensor],
+                logits_soft_cap: float,
+                sm_scale: float,
+                rope_scale: float,
+                rope_theta: float,
+            ) -> torch.Tensor:
+                with q.device as device:  # device guard
+                    o = torch.empty_like(q)
+                    if backend == "fa3":
+                        run_func(
+                            q,
+                            k,
+                            v,
+                            tmp,
+                            o,
+                            maybe_lse,
+                            mask_mode,
+                            layout,
+                            window_left,
+                            logits_soft_cap,
+                            sm_scale,
+                            get_cuda_stream(device),
+                        )
+                    else:
+                        run_func(
+                            q,
+                            k,
+                            v,
+                            tmp,
+                            o,
+                            maybe_lse,
+                            mask_mode,
+                            layout,
+                            window_left,
+                            maybe_packed_custom_mask,
+                            maybe_alibi_slopes,
+                            logits_soft_cap,
+                            sm_scale,
+                            rope_scale,
+                            rope_theta,
+                            get_cuda_stream(device),
+                        )
+                    return o
 
-        # torch library for ragged_run
+            @register_fake_op(f"flashinfer::{uri}_run")
+            def _fake_run_single_prefill(
+                q: torch.Tensor,
+                k: torch.Tensor,
+                v: torch.Tensor,
+                tmp: torch.Tensor,
+                maybe_lse: Optional[torch.Tensor],
+                mask_mode: int,
+                layout: int,
+                window_left: int,
+                maybe_packed_custom_mask: Optional[torch.Tensor],
+                maybe_alibi_slopes: Optional[torch.Tensor],
+                logits_soft_cap: float,
+                sm_scale: float,
+                rope_scale: float,
+                rope_theta: float,
+            ) -> torch.Tensor:
+                return torch.empty_like(q)
 
-        @register_custom_op(
-            f"flashinfer::{uri}_ragged_run",
-            mutates_args=(
-                "float_workspace_buffer",
-                "int_workspace_buffer",
-                "maybe_lse",
-            ),
+            # Register the module
+            modules_dict[args] = SimpleNamespace(run=run_single_prefill)
+
+        return modules_dict[args]
+
+    return backend_module
+
+
+def get_batch_prefill_module(backend):
+    def backend_module(*args):
+        global _batch_prefill_modules, _batch_prefill_sm90_modules
+        modules_dict = (
+            _batch_prefill_modules if backend == "fa2" else _batch_prefill_sm90_modules
         )
-        def ragged_run(
-            mask_mode: int,
-            float_workspace_buffer: torch.Tensor,
-            int_workspace_buffer: torch.Tensor,
-            plan_info_vec: List[int],
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
-            maybe_custom_mask: Optional[torch.Tensor],
-            maybe_alibi_slopes: Optional[torch.Tensor],
-            qo_indptr: torch.Tensor,
-            kv_indptr: torch.Tensor,
-            maybe_qk_indptr: Optional[torch.Tensor],
-            layout: int,
-            window_left: int,
-            logits_soft_cap: float,
-            sm_scale: float,
-            rope_scale: float,
-            rope_theta: float,
-            maybe_lse: Optional[torch.Tensor],
-        ) -> torch.Tensor:
-            with q.device as device:  # device guard
-                o = torch.empty_like(q)
-                ragged_run_func(
-                    mask_mode,
-                    float_workspace_buffer,
-                    int_workspace_buffer,
-                    plan_info_vec,
-                    q,
-                    k,
-                    v,
-                    maybe_custom_mask,
-                    maybe_alibi_slopes,
-                    qo_indptr,
-                    kv_indptr,
-                    maybe_qk_indptr,
-                    o,
-                    layout,
-                    window_left,
-                    logits_soft_cap,
-                    sm_scale,
-                    rope_scale,
-                    rope_theta,
-                    maybe_lse,
-                    get_cuda_stream(device),
-                )
-                return o
+        if args not in modules_dict:
+            uri = get_batch_prefill_uri(backend, *args)
+            if has_prebuilt_ops and uri in prebuilt_ops_uri:
+                if backend == "fa2":
+                    from . import _kernels
 
-        @register_fake_op(f"flashinfer::{uri}_ragged_run")
-        def _fake_ragged_run(
-            mask_mode: int,
-            float_workspace_buffer: torch.Tensor,
-            int_workspace_buffer: torch.Tensor,
-            plan_info_vec: List[int],
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
-            maybe_custom_mask: Optional[torch.Tensor],
-            maybe_alibi_slopes: Optional[torch.Tensor],
-            qo_indptr: torch.Tensor,
-            kv_indptr: torch.Tensor,
-            maybe_qk_indptr: Optional[torch.Tensor],
-            layout: int,
-            window_left: int,
-            logits_soft_cap: float,
-            sm_scale: float,
-            rope_scale: float,
-            rope_theta: float,
-            maybe_lse: Optional[torch.Tensor],
-        ) -> torch.Tensor:
-            return torch.empty_like(q)
+                    plan_func = _kernels.batch_prefill_with_kv_cache_plan
+                    ragged_run_func = _kernels.batch_prefill_with_ragged_kv_cache_run
+                    paged_run_func = _kernels.batch_prefill_with_paged_kv_cache_run
+                else:
+                    from . import _kernels_sm90
 
-        # torch library for paged_run
+                    plan_func = _kernels_sm90.batch_prefill_with_kv_cache_sm90_plan
+                    ragged_run_func = (
+                        _kernels_sm90.batch_prefill_with_ragged_kv_cache_sm90_run
+                    )
+                    paged_run_func = (
+                        _kernels_sm90.batch_prefill_with_paged_kv_cache_sm90_run
+                    )
+            else:
+                module = gen_batch_prefill_module(backend, *args)
+                plan_func = module.plan
+                ragged_run_func = module.ragged_run
+                paged_run_func = module.paged_run
 
-        @register_custom_op(
-            f"flashinfer::{uri}_paged_run",
-            mutates_args=(
-                "float_workspace_buffer",
-                "int_workspace_buffer",
-                "paged_k_cache",
-                "paged_v_cache",
-                "maybe_lse",
-            ),
-        )
-        def paged_run(
-            mask_mode: int,
-            float_workspace_buffer: torch.Tensor,
-            int_workspace_buffer: torch.Tensor,
-            plan_info_vec: List[int],
-            q: torch.Tensor,
-            paged_k_cache: torch.Tensor,
-            paged_v_cache: torch.Tensor,
-            maybe_custom_mask: Optional[torch.Tensor],
-            maybe_alibi_slopes: Optional[torch.Tensor],
-            qo_indptr: torch.Tensor,
-            paged_kv_indptr: torch.Tensor,
-            paged_kv_indices: torch.Tensor,
-            paged_kv_last_page_len: torch.Tensor,
-            maybe_qk_indptr: Optional[torch.Tensor],
-            layout: int,
-            window_left: int,
-            logits_soft_cap: float,
-            sm_scale: float,
-            rope_scale: float,
-            rope_theta: float,
-            maybe_lse: Optional[torch.Tensor],
-        ) -> torch.Tensor:
-            with q.device as device:  # device guard
-                o = torch.empty_like(q)
-                paged_run_func(
-                    mask_mode,
-                    float_workspace_buffer,
-                    int_workspace_buffer,
-                    plan_info_vec,
-                    q,
-                    paged_k_cache,
-                    paged_v_cache,
-                    maybe_custom_mask,
-                    maybe_alibi_slopes,
-                    qo_indptr,
-                    paged_kv_indptr,
-                    paged_kv_indices,
-                    paged_kv_last_page_len,
-                    maybe_qk_indptr,
-                    o,
-                    layout,
-                    window_left,
-                    logits_soft_cap,
-                    sm_scale,
-                    rope_scale,
-                    rope_theta,
-                    maybe_lse,
-                    get_cuda_stream(device),
-                )
-                return o
+            # torch library for ragged_run
 
-        @register_fake_op(f"flashinfer::{uri}_paged_run")
-        def _fake_paged_run(
-            mask_mode: int,
-            float_workspace_buffer: torch.Tensor,
-            int_workspace_buffer: torch.Tensor,
-            plan_info_vec: List[int],
-            q: torch.Tensor,
-            paged_k_cache: torch.Tensor,
-            paged_v_cache: torch.Tensor,
-            maybe_custom_mask: Optional[torch.Tensor],
-            maybe_alibi_slopes: Optional[torch.Tensor],
-            qo_indptr: torch.Tensor,
-            paged_kv_indptr: torch.Tensor,
-            paged_kv_indices: torch.Tensor,
-            paged_kv_last_page_len: torch.Tensor,
-            maybe_qk_indptr: Optional[torch.Tensor],
-            layout: int,
-            window_left: int,
-            logits_soft_cap: float,
-            sm_scale: float,
-            rope_scale: float,
-            rope_theta: float,
-            maybe_lse: Optional[torch.Tensor],
-        ) -> torch.Tensor:
-            return torch.empty_like(q)
-
-        # Register the module.
-        #
-        # Note that plan is not part of model logic. It should not be included in
-        # Cuda Graph or torch.compile. So, we don't provide a torch library for plan.
-        _batch_prefill_sm90_modules[args] = SimpleNamespace(
-            plan=plan_func,
-            ragged_run=ragged_run,
-            paged_run=paged_run,
-        )
-    return _batch_prefill_sm90_modules[args]
-
-
-def get_batch_prefill_module(*args):
-    global _batch_prefill_modules
-    if args not in _batch_prefill_modules:
-        uri = get_batch_prefill_uri(*args)
-        if has_prebuilt_ops and uri in prebuilt_ops_uri:
-            from . import _kernels
-
-            # NOTE(Zihao): we should avoid hard-coded index like this, refactor it later
-            head_dim = args[4]
-            plan_func = lambda *plan_args: _kernels.batch_prefill_with_kv_cache_plan(
-                head_dim,
-                *plan_args,
+            @register_custom_op(
+                f"flashinfer::{uri}_ragged_run",
+                mutates_args=(
+                    "float_workspace_buffer",
+                    "int_workspace_buffer",
+                    "maybe_lse",
+                ),
             )
-            ragged_run_func = _kernels.batch_prefill_with_ragged_kv_cache_run
-            paged_run_func = _kernels.batch_prefill_with_paged_kv_cache_run
-        else:
-            module = gen_batch_prefill_module(*args)
-            plan_func = module.plan
-            ragged_run_func = module.ragged_run
-            paged_run_func = module.paged_run
+            def ragged_run(
+                float_workspace_buffer: torch.Tensor,
+                int_workspace_buffer: torch.Tensor,
+                plan_info_vec: List[int],
+                q: torch.Tensor,
+                k: torch.Tensor,
+                v: torch.Tensor,
+                qo_indptr: torch.Tensor,
+                kv_indptr: torch.Tensor,
+                mask_mode: int,
+                layout: int,
+                window_left: int,
+                maybe_custom_mask: Optional[torch.Tensor],
+                maybe_mask_indptr: Optional[torch.Tensor],
+                maybe_alibi_slopes: Optional[torch.Tensor],
+                logits_soft_cap: float,
+                sm_scale: float,
+                rope_scale: float,
+                rope_theta: float,
+                maybe_lse: Optional[torch.Tensor],
+            ) -> torch.Tensor:
+                with q.device as device:  # device guard
+                    o = torch.empty_like(q)
+                    ragged_run_func(
+                        float_workspace_buffer,
+                        int_workspace_buffer,
+                        plan_info_vec,
+                        q,
+                        k,
+                        v,
+                        qo_indptr,
+                        kv_indptr,
+                        o,
+                        maybe_lse,
+                        mask_mode,
+                        layout,
+                        window_left,
+                        maybe_custom_mask,
+                        maybe_mask_indptr,
+                        maybe_alibi_slopes,
+                        logits_soft_cap,
+                        sm_scale,
+                        rope_scale,
+                        rope_theta,
+                        get_cuda_stream(device),
+                    )
+                    return o
 
-        # torch library for ragged_run
+            @register_fake_op(f"flashinfer::{uri}_ragged_run")
+            def _fake_ragged_run(
+                mask_mode: int,
+                float_workspace_buffer: torch.Tensor,
+                int_workspace_buffer: torch.Tensor,
+                plan_info_vec: List[int],
+                q: torch.Tensor,
+                k: torch.Tensor,
+                v: torch.Tensor,
+                maybe_custom_mask: Optional[torch.Tensor],
+                maybe_alibi_slopes: Optional[torch.Tensor],
+                qo_indptr: torch.Tensor,
+                kv_indptr: torch.Tensor,
+                maybe_mask_indptr: Optional[torch.Tensor],
+                layout: int,
+                window_left: int,
+                logits_soft_cap: float,
+                sm_scale: float,
+                rope_scale: float,
+                rope_theta: float,
+                maybe_lse: Optional[torch.Tensor],
+            ) -> torch.Tensor:
+                return torch.empty_like(q)
 
-        @register_custom_op(
-            f"flashinfer::{uri}_ragged_run",
-            mutates_args=(
-                "float_workspace_buffer",
-                "int_workspace_buffer",
-                "maybe_lse",
-            ),
-        )
-        def ragged_run(
-            mask_mode: int,
-            float_workspace_buffer: torch.Tensor,
-            int_workspace_buffer: torch.Tensor,
-            plan_info_vec: List[int],
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
-            maybe_custom_mask: Optional[torch.Tensor],
-            maybe_alibi_slopes: Optional[torch.Tensor],
-            qo_indptr: torch.Tensor,
-            kv_indptr: torch.Tensor,
-            maybe_qk_indptr: Optional[torch.Tensor],
-            layout: int,
-            window_left: int,
-            logits_soft_cap: float,
-            sm_scale: float,
-            rope_scale: float,
-            rope_theta: float,
-            maybe_lse: Optional[torch.Tensor],
-        ) -> torch.Tensor:
-            with q.device as device:  # device guard
-                o = torch.empty_like(q)
-                ragged_run_func(
-                    mask_mode,
-                    float_workspace_buffer,
-                    int_workspace_buffer,
-                    plan_info_vec,
-                    q,
-                    k,
-                    v,
-                    maybe_custom_mask,
-                    maybe_alibi_slopes,
-                    qo_indptr,
-                    kv_indptr,
-                    maybe_qk_indptr,
-                    o,
-                    layout,
-                    window_left,
-                    logits_soft_cap,
-                    sm_scale,
-                    rope_scale,
-                    rope_theta,
-                    maybe_lse,
-                    get_cuda_stream(device),
-                )
-                return o
+            # torch library for paged_run
 
-        @register_fake_op(f"flashinfer::{uri}_ragged_run")
-        def _fake_ragged_run(
-            mask_mode: int,
-            float_workspace_buffer: torch.Tensor,
-            int_workspace_buffer: torch.Tensor,
-            plan_info_vec: List[int],
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
-            maybe_custom_mask: Optional[torch.Tensor],
-            maybe_alibi_slopes: Optional[torch.Tensor],
-            qo_indptr: torch.Tensor,
-            kv_indptr: torch.Tensor,
-            maybe_qk_indptr: Optional[torch.Tensor],
-            layout: int,
-            window_left: int,
-            logits_soft_cap: float,
-            sm_scale: float,
-            rope_scale: float,
-            rope_theta: float,
-            maybe_lse: Optional[torch.Tensor],
-        ) -> torch.Tensor:
-            return torch.empty_like(q)
+            @register_custom_op(
+                f"flashinfer::{uri}_paged_run",
+                mutates_args=(
+                    "float_workspace_buffer",
+                    "int_workspace_buffer",
+                    "paged_k_cache",
+                    "paged_v_cache",
+                    "maybe_lse",
+                ),
+            )
+            def paged_run(
+                float_workspace_buffer: torch.Tensor,
+                int_workspace_buffer: torch.Tensor,
+                plan_info_vec: List[int],
+                q: torch.Tensor,
+                paged_k_cache: torch.Tensor,
+                paged_v_cache: torch.Tensor,
+                qo_indptr: torch.Tensor,
+                paged_kv_indptr: torch.Tensor,
+                paged_kv_indices: torch.Tensor,
+                paged_kv_last_page_len: torch.Tensor,
+                maybe_lse: Optional[torch.Tensor],
+                mask_mode: int,
+                layout: int,
+                window_left: int,
+                maybe_custom_mask: Optional[torch.Tensor],
+                maybe_mask_indptr: Optional[torch.Tensor],
+                maybe_alibi_slopes: Optional[torch.Tensor],
+                logits_soft_cap: float,
+                sm_scale: float,
+                rope_scale: float,
+                rope_theta: float,
+            ) -> torch.Tensor:
+                with q.device as device:  # device guard
+                    o = torch.empty_like(q)
+                    paged_run_func(
+                        float_workspace_buffer,
+                        int_workspace_buffer,
+                        plan_info_vec,
+                        q,
+                        paged_k_cache,
+                        paged_v_cache,
+                        qo_indptr,
+                        paged_kv_indptr,
+                        paged_kv_indices,
+                        paged_kv_last_page_len,
+                        o,
+                        maybe_lse,
+                        mask_mode,
+                        layout,
+                        window_left,
+                        maybe_custom_mask,
+                        maybe_mask_indptr,
+                        maybe_alibi_slopes,
+                        logits_soft_cap,
+                        sm_scale,
+                        rope_scale,
+                        rope_theta,
+                        get_cuda_stream(device),
+                    )
+                    return o
 
-        # torch library for paged_run
+            @register_fake_op(f"flashinfer::{uri}_paged_run")
+            def _fake_paged_run(
+                float_workspace_buffer: torch.Tensor,
+                int_workspace_buffer: torch.Tensor,
+                plan_info_vec: List[int],
+                q: torch.Tensor,
+                paged_k_cache: torch.Tensor,
+                paged_v_cache: torch.Tensor,
+                qo_indptr: torch.Tensor,
+                paged_kv_indptr: torch.Tensor,
+                paged_kv_indices: torch.Tensor,
+                paged_kv_last_page_len: torch.Tensor,
+                maybe_lse: Optional[torch.Tensor],
+                mask_mode: int,
+                layout: int,
+                window_left: int,
+                maybe_custom_mask: Optional[torch.Tensor],
+                maybe_mask_indptr: Optional[torch.Tensor],
+                maybe_alibi_slopes: Optional[torch.Tensor],
+                logits_soft_cap: float,
+                sm_scale: float,
+                rope_scale: float,
+                rope_theta: float,
+            ) -> torch.Tensor:
+                return torch.empty_like(q)
 
-        @register_custom_op(
-            f"flashinfer::{uri}_paged_run",
-            mutates_args=(
-                "float_workspace_buffer",
-                "int_workspace_buffer",
-                "paged_k_cache",
-                "paged_v_cache",
-                "maybe_lse",
-            ),
-        )
-        def paged_run(
-            mask_mode: int,
-            float_workspace_buffer: torch.Tensor,
-            int_workspace_buffer: torch.Tensor,
-            plan_info_vec: List[int],
-            q: torch.Tensor,
-            paged_k_cache: torch.Tensor,
-            paged_v_cache: torch.Tensor,
-            maybe_custom_mask: Optional[torch.Tensor],
-            maybe_alibi_slopes: Optional[torch.Tensor],
-            qo_indptr: torch.Tensor,
-            paged_kv_indptr: torch.Tensor,
-            paged_kv_indices: torch.Tensor,
-            paged_kv_last_page_len: torch.Tensor,
-            maybe_qk_indptr: Optional[torch.Tensor],
-            layout: int,
-            window_left: int,
-            logits_soft_cap: float,
-            sm_scale: float,
-            rope_scale: float,
-            rope_theta: float,
-            maybe_lse: Optional[torch.Tensor],
-        ) -> torch.Tensor:
-            with q.device as device:  # device guard
-                o = torch.empty_like(q)
-                paged_run_func(
-                    mask_mode,
-                    float_workspace_buffer,
-                    int_workspace_buffer,
-                    plan_info_vec,
-                    q,
-                    paged_k_cache,
-                    paged_v_cache,
-                    maybe_custom_mask,
-                    maybe_alibi_slopes,
-                    qo_indptr,
-                    paged_kv_indptr,
-                    paged_kv_indices,
-                    paged_kv_last_page_len,
-                    maybe_qk_indptr,
-                    o,
-                    layout,
-                    window_left,
-                    logits_soft_cap,
-                    sm_scale,
-                    rope_scale,
-                    rope_theta,
-                    maybe_lse,
-                    get_cuda_stream(device),
-                )
-                return o
+            # Register the module.
+            #
+            # Note that plan is not part of model logic. It should not be included in
+            # Cuda Graph or torch.compile. So, we don't provide a torch library for plan.
+            modules_dict[args] = SimpleNamespace(
+                plan=plan_func,
+                ragged_run=ragged_run,
+                paged_run=paged_run,
+            )
+        return modules_dict[args]
 
-        @register_fake_op(f"flashinfer::{uri}_paged_run")
-        def _fake_paged_run(
-            mask_mode: int,
-            float_workspace_buffer: torch.Tensor,
-            int_workspace_buffer: torch.Tensor,
-            plan_info_vec: List[int],
-            q: torch.Tensor,
-            paged_k_cache: torch.Tensor,
-            paged_v_cache: torch.Tensor,
-            maybe_custom_mask: Optional[torch.Tensor],
-            maybe_alibi_slopes: Optional[torch.Tensor],
-            qo_indptr: torch.Tensor,
-            paged_kv_indptr: torch.Tensor,
-            paged_kv_indices: torch.Tensor,
-            paged_kv_last_page_len: torch.Tensor,
-            maybe_qk_indptr: Optional[torch.Tensor],
-            layout: int,
-            window_left: int,
-            logits_soft_cap: float,
-            sm_scale: float,
-            rope_scale: float,
-            rope_theta: float,
-            maybe_lse: Optional[torch.Tensor],
-        ) -> torch.Tensor:
-            return torch.empty_like(q)
-
-        # Register the module.
-        #
-        # Note that plan is not part of model logic. It should not be included in
-        # Cuda Graph or torch.compile. So, we don't provide a torch library for plan.
-        _batch_prefill_modules[args] = SimpleNamespace(
-            plan=plan_func,
-            ragged_run=ragged_run,
-            paged_run=paged_run,
-        )
-    return _batch_prefill_modules[args]
+    return backend_module
 
 
 def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
@@ -647,74 +403,56 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
         ),
     )
     def ragged_run(
-        mask_mode: int,
         float_workspace_buffer: torch.Tensor,
         int_workspace_buffer: torch.Tensor,
         plan_info_vec: List[int],
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        maybe_custom_mask: Optional[torch.Tensor],
-        maybe_alibi_slopes: Optional[torch.Tensor],
         qo_indptr: torch.Tensor,
         kv_indptr: torch.Tensor,
-        maybe_qk_indptr: Optional[torch.Tensor],
+        maybe_lse: Optional[torch.Tensor],
+        mask_mode: int,
         layout: int,
         window_left: int,
-        logits_soft_cap: float,
-        sm_scale: float,
-        rope_scale: float,
-        rope_theta: float,
-        maybe_lse: Optional[torch.Tensor],
+        *args,
     ) -> torch.Tensor:
         with q.device as device:  # device guard
             o = torch.empty_like(q)
             ragged_run_func(
-                mask_mode,
                 float_workspace_buffer,
                 int_workspace_buffer,
                 plan_info_vec,
                 q,
                 k,
                 v,
-                maybe_custom_mask,
-                maybe_alibi_slopes,
                 qo_indptr,
                 kv_indptr,
-                maybe_qk_indptr,
                 o,
+                maybe_lse,
+                mask_mode,
                 layout,
                 window_left,
-                logits_soft_cap,
-                sm_scale,
-                rope_scale,
-                rope_theta,
-                maybe_lse,
+                *args,
                 get_cuda_stream(device),
             )
             return o
 
     @register_fake_op(f"flashinfer::{module_name}_ragged_run")
     def _fake_ragged_run(
-        mask_mode: int,
         float_workspace_buffer: torch.Tensor,
         int_workspace_buffer: torch.Tensor,
         plan_info_vec: List[int],
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        maybe_custom_mask: Optional[torch.Tensor],
-        maybe_alibi_slopes: Optional[torch.Tensor],
         qo_indptr: torch.Tensor,
         kv_indptr: torch.Tensor,
-        maybe_qk_indptr: Optional[torch.Tensor],
+        maybe_lse: Optional[torch.Tensor],
+        mask_mode: int,
         layout: int,
         window_left: int,
-        logits_soft_cap: float,
-        sm_scale: float,
-        rope_scale: float,
-        rope_theta: float,
-        maybe_lse: Optional[torch.Tensor],
+        *args,
     ) -> torch.Tensor:
         return torch.empty_like(q)
 
@@ -730,80 +468,62 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
         ),
     )
     def paged_run(
-        mask_mode: int,
         float_workspace_buffer: torch.Tensor,
         int_workspace_buffer: torch.Tensor,
         plan_info_vec: List[int],
         q: torch.Tensor,
         paged_k_cache: torch.Tensor,
         paged_v_cache: torch.Tensor,
-        maybe_custom_mask: Optional[torch.Tensor],
-        maybe_alibi_slopes: Optional[torch.Tensor],
         qo_indptr: torch.Tensor,
         paged_kv_indptr: torch.Tensor,
         paged_kv_indices: torch.Tensor,
         paged_kv_last_page_len: torch.Tensor,
-        maybe_qk_indptr: Optional[torch.Tensor],
+        maybe_lse: Optional[torch.Tensor],
+        mask_mode: int,
         layout: int,
         window_left: int,
-        logits_soft_cap: float,
-        sm_scale: float,
-        rope_scale: float,
-        rope_theta: float,
-        maybe_lse: Optional[torch.Tensor],
+        *args,
     ) -> torch.Tensor:
         with q.device as device:  # device guard
             o = torch.empty_like(q)
             paged_run_func(
-                mask_mode,
                 float_workspace_buffer,
                 int_workspace_buffer,
                 plan_info_vec,
                 q,
                 paged_k_cache,
                 paged_v_cache,
-                maybe_custom_mask,
-                maybe_alibi_slopes,
                 qo_indptr,
                 paged_kv_indptr,
                 paged_kv_indices,
                 paged_kv_last_page_len,
-                maybe_qk_indptr,
                 o,
+                maybe_lse,
+                mask_mode,
                 layout,
                 window_left,
-                logits_soft_cap,
-                sm_scale,
-                rope_scale,
-                rope_theta,
-                maybe_lse,
+                *args,
                 get_cuda_stream(device),
             )
             return o
 
     @register_fake_op(f"flashinfer::{module_name}_paged_run")
     def _fake_paged_run(
-        mask_mode: int,
         float_workspace_buffer: torch.Tensor,
         int_workspace_buffer: torch.Tensor,
         plan_info_vec: List[int],
         q: torch.Tensor,
         paged_k_cache: torch.Tensor,
         paged_v_cache: torch.Tensor,
-        maybe_custom_mask: Optional[torch.Tensor],
-        maybe_alibi_slopes: Optional[torch.Tensor],
         qo_indptr: torch.Tensor,
         paged_kv_indptr: torch.Tensor,
         paged_kv_indices: torch.Tensor,
         paged_kv_last_page_len: torch.Tensor,
-        maybe_qk_indptr: Optional[torch.Tensor],
+        maybe_lse: Optional[torch.Tensor],
+        mask_mode: int,
         layout: int,
         window_left: int,
-        logits_soft_cap: float,
-        sm_scale: float,
-        rope_scale: float,
-        rope_theta: float,
-        maybe_lse: Optional[torch.Tensor],
+        *args,
     ) -> torch.Tensor:
         return torch.empty_like(q)
 
@@ -812,120 +532,12 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
     # Note that plan is not part of model logic. It should not be included in
     # Cuda Graph or torch.compile. So, we don't provide a torch library for plan.
     _batch_prefill_jit_modules[module_name] = SimpleNamespace(
-        plan=plan_func, ragged_run=ragged_run, paged_run=paged_run,
+        plan=plan_func,
+        ragged_run=ragged_run,
+        paged_run=paged_run,
     )
 
     return _batch_prefill_jit_modules[module_name]
-
-
-def batch_prefill_with_ragged_kv_cache_with_jit_module(
-    jit_module: Any,
-    mask_mode: int,
-    float_workspace_buffer: torch.Tensor,
-    int_workspace_buffer: torch.Tensor,
-    plan_info_vec: List[int],
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    maybe_custom_mask: Optional[torch.Tensor],
-    maybe_alibi_slopes: Optional[torch.Tensor],
-    qo_indptr: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    maybe_qk_indptr: Optional[torch.Tensor],
-    layout: int,
-    window_left: int,
-    logits_soft_cap: float,
-    sm_scale: float,
-    rope_scale: float,
-    rope_theta: float,
-    maybe_lse: Optional[torch.Tensor],
-    *args,
-) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """Same arg list with jit_module.ragged_run, but with *args."""
-    with q.device as device:  # device guard
-        o = torch.empty_like(q)
-        jit_module.ragged_run(
-            mask_mode,
-            float_workspace_buffer,
-            int_workspace_buffer,
-            plan_info_vec,
-            q,
-            k,
-            v,
-            maybe_custom_mask,
-            maybe_alibi_slopes,
-            qo_indptr,
-            kv_indptr,
-            maybe_qk_indptr,
-            o,
-            layout,
-            window_left,
-            logits_soft_cap,
-            sm_scale,
-            rope_scale,
-            rope_theta,
-            maybe_lse,
-            *args,
-            get_cuda_stream(device),
-        )
-        return o
-
-
-def batch_prefill_with_paged_kv_cache_with_jit_module(
-    jit_module: Any,
-    mask_mode: int,
-    float_workspace_buffer: torch.Tensor,
-    int_workspace_buffer: torch.Tensor,
-    plan_info_vec: List[int],
-    q: torch.Tensor,
-    paged_k_cache: torch.Tensor,
-    paged_v_cache: torch.Tensor,
-    maybe_custom_mask: Optional[torch.Tensor],
-    maybe_alibi_slopes: Optional[torch.Tensor],
-    qo_indptr: torch.Tensor,
-    paged_kv_indptr: torch.Tensor,
-    paged_kv_indices: torch.Tensor,
-    paged_kv_last_page_len: torch.Tensor,
-    maybe_qk_indptr: Optional[torch.Tensor],
-    layout: int,
-    window_left: int,
-    logits_soft_cap: float,
-    sm_scale: float,
-    rope_scale: float,
-    rope_theta: float,
-    maybe_lse: Optional[torch.Tensor],
-    *args,
-) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """Same arg list with jit_module.paged_run, but with *args."""
-    with q.device as device:  # device guard
-        o = torch.empty_like(q)
-        jit_module.paged_run(
-            mask_mode,
-            float_workspace_buffer,
-            int_workspace_buffer,
-            plan_info_vec,
-            q,
-            paged_k_cache,
-            paged_v_cache,
-            maybe_custom_mask,
-            maybe_alibi_slopes,
-            qo_indptr,
-            paged_kv_indptr,
-            paged_kv_indices,
-            paged_kv_last_page_len,
-            maybe_qk_indptr,
-            o,
-            layout,
-            window_left,
-            logits_soft_cap,
-            sm_scale,
-            rope_scale,
-            rope_theta,
-            maybe_lse,
-            *args,
-            get_cuda_stream(device),
-        )
-        return o
 
 
 def single_prefill_with_kv_cache_with_jit_module(
@@ -950,15 +562,15 @@ def single_prefill_with_kv_cache_with_jit_module(
                 (q.size(0), q.size(1)), dtype=torch.float32, device=device
             )
         jit_module.run(
-            mask_mode,
             q,
             k,
             v,
             tmp,
             o,
+            lse,
+            mask_mode,
             TensorLayout[kv_layout].value,
             window_left,
-            lse,
             *args,
             get_cuda_stream(device),
         )
@@ -975,7 +587,7 @@ def single_prefill_with_kv_cache(
     causal: bool = False,
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
-    allow_fp16_qk_reduction: bool = False,
+    use_fp16_qk_reduction: bool = False,
     sm_scale: Optional[float] = None,
     window_left: int = -1,
     logits_soft_cap: Optional[float] = None,
@@ -995,7 +607,7 @@ def single_prefill_with_kv_cache(
     causal: bool = False,
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
-    allow_fp16_qk_reduction: bool = False,
+    use_fp16_qk_reduction: bool = False,
     sm_scale: Optional[float] = None,
     window_left: int = -1,
     logits_soft_cap: Optional[float] = None,
@@ -1014,7 +626,7 @@ def single_prefill_with_kv_cache(
     causal: bool = False,
     kv_layout: str = "NHD",
     pos_encoding_mode: str = "NONE",
-    allow_fp16_qk_reduction: bool = False,
+    use_fp16_qk_reduction: bool = False,
     sm_scale: Optional[float] = None,
     window_left: int = -1,
     logits_soft_cap: Optional[float] = None,
@@ -1059,7 +671,7 @@ def single_prefill_with_kv_cache(
         The position encoding applied inside attention kernels, could be
         ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
         Default is ``NONE``.
-    allow_fp16_qk_reduction : bool
+    use_fp16_qk_reduction : bool
         Whether to use f16 for qk reduction (faster at the cost of slight precision
         loss).
     window_left : int
@@ -1107,7 +719,7 @@ def single_prefill_with_kv_cache(
     >>> k = torch.randn(kv_len, num_kv_heads, head_dim).half().to("cuda:0")
     >>> v = torch.randn(kv_len, num_kv_heads, head_dim).half().to("cuda:0")
     >>> o = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=True,
-            allow_fp16_qk_reduction=True)
+            use_fp16_qk_reduction=True)
     >>> o.shape
     torch.Size([128, 32, 128])
     >>> mask = torch.tril(
@@ -1165,15 +777,12 @@ def single_prefill_with_kv_cache(
         backend = determine_attention_backend(
             q.device,
             PosEncodingMode[pos_encoding_mode].value,
-            allow_fp16_qk_reduction,
+            use_fp16_qk_reduction,
             packed_custom_mask is not None,  # use_custom_mask
             q.dtype,
             k.dtype,
         )
-    if backend == "fa2":
-        module_getter = get_single_prefill_module
-    elif backend == "fa3":
-        module_getter = get_single_prefill_sm90_module
+    module_getter = get_single_prefill_module(backend)
 
     out = module_getter(
         q.dtype,
@@ -1183,22 +792,22 @@ def single_prefill_with_kv_cache(
         PosEncodingMode[pos_encoding_mode].value,
         window_left >= 0,  # use_sliding_window
         logits_soft_cap > 0,  # use_logits_soft_cap
-        allow_fp16_qk_reduction,
+        use_fp16_qk_reduction,
     ).run(
-        mask_mode,
         q,
         k,
         v,
-        packed_custom_mask,
         tmp,
-        _get_cache_alibi_slopes_buf(q.shape[1], q.device),
+        lse,
+        mask_mode,
         TensorLayout[kv_layout].value,
         window_left,
+        packed_custom_mask,
+        _get_cache_alibi_slopes_buf(q.shape[1], q.device),
         logits_soft_cap,
         sm_scale,
         rope_scale,
         rope_theta,
-        lse,
     )
 
     return (out, lse) if return_lse else out
@@ -1209,7 +818,7 @@ single_prefill_with_kv_cache_return_lse = functools.partial(
 )
 
 
-def _compute_page_qk_indptr(
+def _compute_page_mask_indptr(
     qo_indptr: torch.Tensor,
     paged_kv_indptr: torch.Tensor,
     paged_kv_last_page_len: torch.Tensor,
@@ -1219,9 +828,9 @@ def _compute_page_qk_indptr(
         raise ValueError(
             "The length of qo_indptr and paged_kv_indptr should be the same."
         )
-    qk_indptr = torch.empty_like(qo_indptr)
-    qk_indptr[0] = 0
-    qk_indptr[1:] = torch.cumsum(
+    mask_indptr = torch.empty_like(qo_indptr)
+    mask_indptr[0] = 0
+    mask_indptr[1:] = torch.cumsum(
         (qo_indptr[1:] - qo_indptr[:-1])
         * (
             (paged_kv_indptr[1:] - paged_kv_indptr[:-1] - 1) * page_size
@@ -1229,7 +838,7 @@ def _compute_page_qk_indptr(
         ),
         0,
     )
-    return qk_indptr
+    return mask_indptr
 
 
 class BatchPrefillWithPagedKVCacheWrapper:
@@ -1344,9 +953,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         paged_kv_indices_buf: Optional[torch.Tensor] = None,
         paged_kv_last_page_len_buf: Optional[torch.Tensor] = None,
         custom_mask_buf: Optional[torch.Tensor] = None,
-        qk_indptr_buf: Optional[torch.Tensor] = None,
+        mask_indptr_buf: Optional[torch.Tensor] = None,
         backend: str = "auto",
-        jit_module: Any = None,
+        jit_args: Optional[List[Any]] = None,
     ) -> None:
         r"""Constructor of :class:`BatchPrefillWithPagedKVCacheWrapper`.
 
@@ -1392,34 +1001,32 @@ class BatchPrefillWithPagedKVCacheWrapper:
             the wrapper. This argument is only effective when ``use_cuda_graph`` is set to ``True``
             and the custom mask will be used in attention computation.
 
-        qk_indptr_buf : Optional[torch.Tensor]
-            The user reserved buffer to store the ``qk_indptr`` array, the size of the buffer
+        mask_indptr_buf : Optional[torch.Tensor]
+            The user reserved buffer to store the ``mask_indptr`` array, the size of the buffer
             should be ``[batch_size + 1]``.
             This argument is only effective when ``use_cuda_graph`` is ``True`` and the custom
             mask will be used in attention computation.
 
         backend : str
             The implementation backend, could be ``auto``/``fa2`` or ``fa3``. Defaults to ``auto``.
-            If set to ``auto``, the function will automatically choose the backend based on the
+            If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
+
+        jit_args : Optional[List[Any]]
+            If provided, the wrapper will use the provided arguments to create the JIT module,
+            otherwise, the wrapper will use default attention implementation.
         """
         _check_kv_layout(kv_layout)
-        if backend.startswith("jit"):
-            if jit_module is None:
-                raise ValueError("backend is `jit` but jit_module is not provided.")
-            self._jit_backend = True
-            self._jit_module = jit_module
-        else:
-            if jit_module is not None:
-                raise ValueError(f"backend is `{backend}` but jit_module is provided.")
-            self._jit_backend = False
+
+        if jit_args is not None:
+            self._jit_module = get_batch_prefill_jit_module(
+                jit_args[0],
+                gen_customize_batch_prefill_module(backend, *jit_args),
+            )
         self._kv_layout = kv_layout
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
-        if backend in ["fa3", "auto"] or self._jit_backend:
-            self._int_workspace_buffer = torch.empty(
-                (64 * 1024 * 1024,), dtype=torch.uint8, device=self.device
-            )
+        if backend in ["fa3", "auto"]:
             # NOTE(Zihao): assume maximum accumulate kv length is 16M
             self._vector_sparse_indices_buffer = torch.empty(
                 (16 * 1024 * 1024,), dtype=torch.int32, device=self.device
@@ -1428,13 +1035,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._vector_sparse_indptr_buffer = torch.empty(
                 (32768,), dtype=torch.int32, device=self.device
             )
-            self._kv_lens_buffer = torch.empty(
-                (32768,), dtype=torch.int32, device=self.device
-            )
-        else:
-            self._int_workspace_buffer = torch.empty(
-                (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
-            )
+
+        self._kv_lens_buffer = torch.empty(
+            (32768,), dtype=torch.int32, device=self.device
+        )
+        self._int_workspace_buffer = torch.empty(
+            (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
+        )
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
             dtype=self._int_workspace_buffer.dtype,
@@ -1467,7 +1074,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 raise ValueError(
                     "The length of paged_kv_last_page_len_buf should be batch_size."
                 )
-            # NOTE(Zihao): do not check custom_mask_buf and qk_indptr_buf here, as they are optional
+            # NOTE(Zihao): do not check custom_mask_buf and mask_indptr_buf here, as they are optional
         else:
             self._fixed_batch_size = 0
 
@@ -1476,7 +1083,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._paged_kv_indices_buf = paged_kv_indices_buf
         self._paged_kv_last_page_len_buf = paged_kv_last_page_len_buf
         self._custom_mask_buf = custom_mask_buf
-        self._qk_indptr_buf = qk_indptr_buf
+        self._mask_indptr_buf = mask_indptr_buf
         self._max_total_num_rows = None
         self._backend = backend
 
@@ -1521,7 +1128,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         packed_custom_mask: Optional[torch.Tensor] = None,
         causal: bool = False,
         pos_encoding_mode: str = "NONE",
-        allow_fp16_qk_reduction: bool = False,
+        use_fp16_qk_reduction: bool = False,
         sm_scale: Optional[float] = None,
         window_left: int = -1,
         logits_soft_cap: Optional[float] = None,
@@ -1575,7 +1182,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
             Default is ``NONE``.
-        allow_fp16_qk_reduction : bool
+        use_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
             loss).
         window_left : int
@@ -1625,7 +1232,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         batch_size = len(qo_indptr) - 1
         if custom_mask is not None or packed_custom_mask is not None:
-            qk_indptr = _compute_page_qk_indptr(
+            mask_indptr = _compute_page_mask_indptr(
                 qo_indptr,
                 paged_kv_indptr,
                 paged_kv_last_page_len,
@@ -1633,15 +1240,22 @@ class BatchPrefillWithPagedKVCacheWrapper:
             )
         if packed_custom_mask is None and custom_mask is not None:
             # create packed custom mask from custom mask
-            packed_custom_mask, qk_indptr = segment_packbits(
+            packed_custom_mask, mask_indptr = segment_packbits(
                 custom_mask.contiguous().view(-1),
-                qk_indptr,
+                mask_indptr,
                 bitorder="little",
             )
 
         # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
         qo_indptr_host = qo_indptr.to("cpu")
         paged_kv_indptr_host = paged_kv_indptr.to("cpu")
+        paged_kv_last_page_len_host = paged_kv_last_page_len.to("cpu")
+        kv_lens_arr_host = get_seq_lens(
+            paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
+        )
+        self._kv_lens_buffer[: len(kv_lens_arr_host)].copy_(
+            kv_lens_arr_host, non_blocking=non_blocking
+        )
 
         total_num_rows = qo_indptr_host[-1]
 
@@ -1683,15 +1297,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     raise ValueError(
                         "custom_mask_buf must be initialized with a torch.Tensor in cuda graph mode if we use custom mask in attention computation."
                     )
-                if not torch.is_tensor(self._qk_indptr_buf):
+                if not torch.is_tensor(self._mask_indptr_buf):
                     raise ValueError(
-                        "qk_indptr_buf must be initialized with a torch.Tensor in cuda graph mode if we use custom mask in attention computation."
+                        "mask_indptr_buf must be initialized with a torch.Tensor in cuda graph mode if we use custom mask in attention computation."
                     )
                 self._custom_mask_buf[: len(packed_custom_mask)].copy_(
                     packed_custom_mask, non_blocking=non_blocking
                 )
-                # NOTE(Zihao): qk_indptr has the same length as qo_indptr
-                self._qk_indptr_buf.copy_(qk_indptr, non_blocking=non_blocking)
+                # NOTE(Zihao): mask_indptr has the same length as qo_indptr
+                self._mask_indptr_buf.copy_(mask_indptr, non_blocking=non_blocking)
         else:
             self._qo_indptr_buf = qo_indptr.to(self.device, non_blocking=non_blocking)
             self._paged_kv_indptr_buf = paged_kv_indptr.to(
@@ -1707,59 +1321,21 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._custom_mask_buf = packed_custom_mask.to(
                     self.device, non_blocking=non_blocking
                 )
-                self._qk_indptr_buf = qk_indptr.to(
+                self._mask_indptr_buf = mask_indptr.to(
                     self.device, non_blocking=non_blocking
                 )
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
 
-        if self._jit_backend:
-            self._cached_module = get_batch_prefill_jit_module(self._backend, self._jit_module)
-            paged_kv_last_page_len_host = paged_kv_last_page_len.to("cpu")
-            kv_lens_arr_host = get_seq_lens(
-                paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
-            )
-            self._kv_lens_buffer[: len(kv_lens_arr_host)].copy_(
-                kv_lens_arr_host, non_blocking=non_blocking
-            )
-            if page_size != 1:
-                vector_sparse_indptr_host = torch.cat(
-                    [
-                        torch.tensor([0], dtype=torch.int32),
-                        torch.cumsum(kv_lens_arr_host, dim=0, dtype=torch.int32),
-                    ],
-                    dim=0,
-                )
-                self._vector_sparse_indptr_buffer[
-                    : len(vector_sparse_indptr_host)
-                ].copy_(vector_sparse_indptr_host, non_blocking=non_blocking)
-            else:
-                vector_sparse_indptr_host = paged_kv_indptr_host
-
-            with self.device as device:
-                self._plan_info = self._cached_module.plan(
-                    causal,
-                    self._float_workspace_buffer,
-                    self._int_workspace_buffer,
-                    self._pin_memory_int_workspace_buffer,
-                    qo_indptr_host,
-                    vector_sparse_indptr_host,
-                    kv_lens_arr_host,
-                    self._max_total_num_rows or total_num_rows,
-                    batch_size,
-                    num_qo_heads,
-                    num_kv_heads,
-                    page_size,
-                    self.is_cuda_graph_enabled,
-                    get_cuda_stream(device),
-                )
+        if self._jit_module is not None:
+            self._cached_module = self._jit_module
         else:
             if self._backend == "auto":
                 self._backend = determine_attention_backend(
                     self.device,
                     PosEncodingMode[pos_encoding_mode].value,
-                    allow_fp16_qk_reduction,
+                    use_fp16_qk_reduction,
                     self._custom_mask_buf is not None,  # use_custom_mask
                     q_data_type,
                     kv_data_type,
@@ -1774,69 +1350,49 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 PosEncodingMode[pos_encoding_mode].value,
                 window_left >= 0,  # use_sliding_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
-                allow_fp16_qk_reduction,
+                use_fp16_qk_reduction,
             )
-            if self._backend == "fa2":
-                self._cached_module = get_batch_prefill_module(*get_module_args)
-                with self.device as device:
-                    self._plan_info = self._cached_module.plan(
-                        self._float_workspace_buffer,
-                        self._int_workspace_buffer,
-                        self._pin_memory_int_workspace_buffer,
-                        qo_indptr_host,
-                        paged_kv_indptr_host,
-                        self._max_total_num_rows or total_num_rows,
-                        batch_size,
-                        num_qo_heads,
-                        num_kv_heads,
-                        page_size,
-                        self.is_cuda_graph_enabled,
-                        get_cuda_stream(device),
-                    )
-            else:
-                self._cached_module = get_batch_prefill_sm90_module(*get_module_args)
-                paged_kv_last_page_len_host = paged_kv_last_page_len.to("cpu")
-                kv_lens_arr_host = get_seq_lens(
-                    paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
-                )
-                self._kv_lens_buffer[: len(kv_lens_arr_host)].copy_(
-                    kv_lens_arr_host, non_blocking=non_blocking
-                )
-                if page_size != 1:
-                    vector_sparse_indptr_host = torch.cat(
-                        [
-                            torch.tensor([0], dtype=torch.int32),
-                            torch.cumsum(kv_lens_arr_host, dim=0, dtype=torch.int32),
-                        ],
-                        dim=0,
-                    )
-                    self._vector_sparse_indptr_buffer[
-                        : len(vector_sparse_indptr_host)
-                    ].copy_(vector_sparse_indptr_host, non_blocking=non_blocking)
-                else:
-                    vector_sparse_indptr_host = paged_kv_indptr_host
 
-                with self.device as device:
-                    self._plan_info = self._cached_module.plan(
-                        causal,
-                        self._float_workspace_buffer,
-                        self._int_workspace_buffer,
-                        self._pin_memory_int_workspace_buffer,
-                        qo_indptr_host,
-                        vector_sparse_indptr_host,
-                        kv_lens_arr_host,
-                        self._max_total_num_rows or total_num_rows,
-                        batch_size,
-                        num_qo_heads,
-                        num_kv_heads,
-                        page_size,
-                        self.is_cuda_graph_enabled,
-                        get_cuda_stream(device),
-                    )
+            self._cached_module = get_batch_prefill_module(self._backend)(
+                *get_module_args
+            )
+
+        if self._backend == "fa3":
+            if page_size != 1:
+                vector_sparse_indptr_host = torch.cat(
+                    [
+                        torch.tensor([0], dtype=torch.int32),
+                        torch.cumsum(kv_lens_arr_host, dim=0, dtype=torch.int32),
+                    ],
+                    dim=0,
+                )
+                self._vector_sparse_indptr_buffer[
+                    : len(vector_sparse_indptr_host)
+                ].copy_(vector_sparse_indptr_host, non_blocking=non_blocking)
+                paged_kv_indptr_host = vector_sparse_indptr_host
+
+        with self.device as device:
+            self._plan_info = self._cached_module.plan(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._pin_memory_int_workspace_buffer,
+                qo_indptr_host,
+                paged_kv_indptr_host,
+                kv_lens_arr_host,
+                self._max_total_num_rows or total_num_rows,
+                batch_size,
+                num_qo_heads,
+                num_kv_heads,
+                page_size,
+                self.is_cuda_graph_enabled,
+                head_dim,
+                causal,
+                get_cuda_stream(device),
+            )
 
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode
-        self._allow_fp16_qk_reduction = allow_fp16_qk_reduction
+        self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._window_left = window_left
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
@@ -1851,7 +1407,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         causal: bool = False,
         pos_encoding_mode: str = "NONE",
-        allow_fp16_qk_reduction: bool = False,
+        use_fp16_qk_reduction: bool = False,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         window_left: int = -1,
@@ -1863,7 +1419,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         r"""Warning: This function is deprecated, please use :meth:`run` instead."""
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode
-        self._allow_fp16_qk_reduction = allow_fp16_qk_reduction
+        self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._window_left = window_left
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
@@ -1978,7 +1534,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             else:
                 mask_mode = MaskMode.NON_CAUSAL.value
 
-        if self._jit_backend or self._backend == "fa3":
+        if self._backend == "fa3":
             # NOTE(Zihao): we divide both stride_block and stride_n by stride_n
             # because we will multiply stride_n back in the kernel
             sparse_indices = block_sparse_indices_to_vector_sparse_offsets(
@@ -1995,34 +1551,36 @@ class BatchPrefillWithPagedKVCacheWrapper:
             sparse_indices = self._paged_kv_indices_buf
 
         run_args = [
-            mask_mode,
             self._float_workspace_buffer,
             self._int_workspace_buffer,
             self._plan_info,
             q,
             k_cache,
             v_cache,
-            self._custom_mask_buf,
-            _get_cache_alibi_slopes_buf(q.shape[1], q.device),
             self._qo_indptr_buf,
             self._paged_kv_indptr_buf,
             sparse_indices,  # self._paged_kv_indices_buf,
             self._paged_kv_last_page_len_buf,
-            self._qk_indptr_buf,
+            lse,
+            mask_mode,
             TensorLayout[self._kv_layout].value,
             window_left,
-            logits_soft_cap,
-            sm_scale,
-            rope_scale,
-            rope_theta,
-            lse,
         ]
-        if self._jit_backend:
-            run_args.extend(list(args))
-            out = batch_prefill_with_paged_kv_cache_with_jit_module(self._jit_module, *run_args)
-        else:
-            out = self._cached_module.paged_run(*run_args)
 
+        if self._jit_module is not None:
+            run_args.extend(list(args))
+        else:
+            run_args += [
+                self._custom_mask_buf,
+                self._mask_indptr_buf,
+                _get_cache_alibi_slopes_buf(q.shape[1], q.device),
+                logits_soft_cap,
+                sm_scale,
+                rope_scale,
+                rope_theta,
+            ]
+
+        out = self._cached_module.paged_run(*run_args)
         if v_scale is not None:
             out *= v_scale
 
@@ -2036,7 +1594,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
         causal: bool = False,
         pos_encoding_mode: str = "NONE",
-        allow_fp16_qk_reduction: bool = False,
+        use_fp16_qk_reduction: bool = False,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         window_left: int = -1,
@@ -2048,7 +1606,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         r"""Warning: This function is deprecated, please use :meth:`run_return_lse` instead."""
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode
-        self._allow_fp16_qk_reduction = allow_fp16_qk_reduction
+        self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._window_left = window_left
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
@@ -2061,18 +1619,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
         pass
 
 
-def _compute_qk_indptr(
+def _compute_mask_indptr(
     qo_indptr: torch.Tensor, kv_indptr: torch.Tensor
 ) -> torch.Tensor:
     if len(qo_indptr) != len(kv_indptr):
         raise ValueError("The length of qo_indptr and kv_indptr should be the same.")
-    qk_indptr = torch.empty_like(qo_indptr)
-    qk_indptr[0] = 0
-    qk_indptr[1:] = torch.cumsum(
+    mask_indptr = torch.empty_like(qo_indptr)
+    mask_indptr[0] = 0
+    mask_indptr[1:] = torch.cumsum(
         (qo_indptr[1:] - qo_indptr[:-1]) * (kv_indptr[1:] - kv_indptr[:-1]),
         0,
     )
-    return qk_indptr
+    return mask_indptr
 
 
 class BatchPrefillWithRaggedKVCacheWrapper:
@@ -2174,9 +1732,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         qo_indptr_buf: Optional[torch.Tensor] = None,
         kv_indptr_buf: Optional[torch.Tensor] = None,
         custom_mask_buf: Optional[torch.Tensor] = None,
-        qk_indptr_buf: Optional[torch.Tensor] = None,
+        mask_indptr_buf: Optional[torch.Tensor] = None,
         backend: str = "auto",
-        jit_module: Any = None,
+        jit_args: Optional[List[Any]] = None,
     ) -> None:
         r"""Constructor of :class:`BatchPrefillWithRaggedKVCacheWrapper`.
 
@@ -2210,38 +1768,33 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             lifetime of the wrapper. This argument is only effective when ``use_cuda_graph``
             is ``True`` and custom mask will be used in attention computation.
 
-        qk_indptr_buf : Optional[torch.Tensor]
-            The user reserved GPU buffer to store the ``qk_indptr`` array, the size of the buffer
+        mask_indptr_buf : Optional[torch.Tensor]
+            The user reserved GPU buffer to store the ``mask_indptr`` array, the size of the buffer
             should be ``[batch_size]``.
             This argument is only effective when ``use_cuda_graph`` is ``True`` and custom mask
             will be used in attention computation.
 
         backend : str
             The implementation backend, could be ``auto``/``fa2`` or ``fa3``. Defaults to ``auto``.
-            If set to ``auto``, the function will automatically choose the backend based on the
+            If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
+
+        jit_args : Optional[List[Any]]
+            If provided, the wrapper will use the provided arguments to create the JIT module,
+            otherwise, the wrapper will use default attention implementation.
         """
         _check_kv_layout(kv_layout)
-        if backend.startswith("jit"):
-            if jit_module is None:
-                raise ValueError("backend is `jit` but jit_module is not provided.")
-            self._jit_backend = True
-            self._jit_module = jit_module
-        else:
-            if jit_module is not None:
-                raise ValueError(f"backend is `{backend}` but jit_module is provided.")
-            self._jit_backend = False
+        if jit_args is not None:
+            self._jit_module = get_batch_prefill_jit_module(
+                jit_args[0],
+                gen_customize_batch_prefill_module(backend, *jit_args),
+            )
         self._kv_layout = kv_layout
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
-        if backend in ["fa3", "auto"] or self._jit_backend:
-            self._int_workspace_buffer = torch.empty(
-                (64 * 1024 * 1024,), dtype=torch.uint8, device=self.device
-            )
-        else:
-            self._int_workspace_buffer = torch.empty(
-                (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
-            )
+        self._int_workspace_buffer = torch.empty(
+            (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
+        )
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape, dtype=torch.uint8, pin_memory=True
         )
@@ -2262,13 +1815,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                         len(kv_indptr_buf), self._fixed_batch_size
                     )
                 )
-            # NOTE(Zihao): do not check custom_mask_buf and qk_indptr_buf here,
+            # NOTE(Zihao): do not check custom_mask_buf and mask_indptr_buf here,
             # as they may not be used.
 
         self._qo_indptr_buf = qo_indptr_buf
         self._kv_indptr_buf = kv_indptr_buf
         self._custom_mask_buf = custom_mask_buf
-        self._qk_indptr_buf = qk_indptr_buf
+        self._mask_indptr_buf = mask_indptr_buf
         self._max_total_num_rows = None
         self._backend = backend
 
@@ -2310,7 +1863,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         packed_custom_mask: Optional[torch.Tensor] = None,
         causal: bool = False,
         pos_encoding_mode: str = "NONE",
-        allow_fp16_qk_reduction: bool = False,
+        use_fp16_qk_reduction: bool = False,
         window_left: int = -1,
         logits_soft_cap: Optional[float] = None,
         sm_scale: Optional[float] = None,
@@ -2358,7 +1911,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
             Default is ``NONE``.
-        allow_fp16_qk_reduction : bool
+        use_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
             loss).
         window_left : int
@@ -2406,15 +1959,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         batch_size = len(qo_indptr) - 1
         if len(kv_indptr) != batch_size + 1:
             raise ValueError(
-                "The kv_indptr length should be equal to qk_indptr length."
+                "The kv_indptr length should be equal to mask_indptr length."
             )
         if custom_mask is not None or packed_custom_mask is not None:
-            qk_indptr = _compute_qk_indptr(qo_indptr, kv_indptr)
+            mask_indptr = _compute_mask_indptr(qo_indptr, kv_indptr)
         if packed_custom_mask is None and custom_mask is not None:
             # create packed custom mask from custom mask
-            packed_custom_mask, qk_indptr = segment_packbits(
+            packed_custom_mask, mask_indptr = segment_packbits(
                 custom_mask.contiguous().view(-1),
-                qk_indptr,
+                mask_indptr,
                 bitorder="little",
             )
 
@@ -2449,50 +2002,31 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     raise ValueError(
                         "custom_mask_buf must be initialized with a torch.Tensor in cuda graph mode if we use custom mask in attention computation."
                     )
-                if not torch.is_tensor(self._qk_indptr_buf):
+                if not torch.is_tensor(self._mask_indptr_buf):
                     raise ValueError(
-                        "qk_indptr_buf must be initialized with a torch.Tensor in cuda graph mode if we use custom mask in the attention computation."
+                        "mask_indptr_buf must be initialized with a torch.Tensor in cuda graph mode if we use custom mask in the attention computation."
                     )
                 self._custom_mask_buf[: len(packed_custom_mask)] = packed_custom_mask
-                self._qk_indptr_buf.copy_(qk_indptr)
+                self._mask_indptr_buf.copy_(mask_indptr)
         else:
             self._qo_indptr_buf = qo_indptr.to(self.device)
             self._kv_indptr_buf = kv_indptr.to(self.device)
             if packed_custom_mask is not None:
                 self._custom_mask_buf = packed_custom_mask.to(self.device)
-                self._qk_indptr_buf = qk_indptr.to(self.device)
+                self._mask_indptr_buf = mask_indptr.to(self.device)
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
+        kv_len_arr = kv_indptr_host[1:] - kv_indptr_host[:-1]
 
-        if self._jit_backend:
-            self._cached_module = get_batch_prefill_jit_module(self._backend, self._jit_module)
-            kv_len_arr = kv_indptr_host[1:] - kv_indptr_host[:-1]
-            with self.device as device:
-                # NOTE(Zihao): there are some interface differences between fa2 and fa3
-                # we should align the interface in the future
-                self._plan_info = self._cached_module.plan(
-                    causal,
-                    self._float_workspace_buffer,
-                    self._int_workspace_buffer,
-                    self._pin_memory_int_workspace_buffer,
-                    qo_indptr_host,
-                    kv_indptr_host,
-                    kv_len_arr,
-                    self._max_total_num_rows or total_num_rows,
-                    batch_size,
-                    num_qo_heads,
-                    num_kv_heads,
-                    1,  # page_size
-                    self.is_cuda_graph_enabled,
-                    get_cuda_stream(device),
-                )
+        if self._jit_module is not None:
+            self._cached_module = self._jit_module
         else:
             if self._backend == "auto":
                 self._backend = determine_attention_backend(
                     self.device,
                     PosEncodingMode[pos_encoding_mode].value,
-                    allow_fp16_qk_reduction,
+                    use_fp16_qk_reduction,
                     self._custom_mask_buf is not None,  # use_custom_mask
                     q_data_type,
                     kv_data_type,
@@ -2507,51 +2041,34 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 PosEncodingMode[pos_encoding_mode].value,
                 window_left >= 0,  # use_sliding_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
-                allow_fp16_qk_reduction,
+                use_fp16_qk_reduction,
             )
-            if self._backend == "fa2":
-                self._cached_module = get_batch_prefill_module(*get_module_args)
-                with self.device as device:
-                    self._plan_info = self._cached_module.plan(
-                        self._float_workspace_buffer,
-                        self._int_workspace_buffer,
-                        self._pin_memory_int_workspace_buffer,
-                        qo_indptr_host,
-                        kv_indptr_host,
-                        self._max_total_num_rows or total_num_rows,
-                        batch_size,
-                        num_qo_heads,
-                        num_kv_heads,
-                        1,  # page_size
-                        self.is_cuda_graph_enabled,
-                        get_cuda_stream(device),
-                    )
-            else:
-                self._cached_module = get_batch_prefill_sm90_module(*get_module_args)
-                kv_len_arr = kv_indptr_host[1:] - kv_indptr_host[:-1]
-                with self.device as device:
-                    # NOTE(Zihao): there are some interface differences between fa2 and fa3
-                    # we should align the interface in the future
-                    self._plan_info = self._cached_module.plan(
-                        causal,
-                        self._float_workspace_buffer,
-                        self._int_workspace_buffer,
-                        self._pin_memory_int_workspace_buffer,
-                        qo_indptr_host,
-                        kv_indptr_host,
-                        kv_len_arr,
-                        self._max_total_num_rows or total_num_rows,
-                        batch_size,
-                        num_qo_heads,
-                        num_kv_heads,
-                        1,  # page_size
-                        self.is_cuda_graph_enabled,
-                        get_cuda_stream(device),
-                    )
+            self._cached_module = get_batch_prefill_module(self._backend)(
+                *get_module_args
+            )
+
+        with self.device as device:
+            self._plan_info = self._cached_module.plan(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._pin_memory_int_workspace_buffer,
+                qo_indptr_host,
+                kv_indptr_host,
+                kv_len_arr,
+                self._max_total_num_rows or total_num_rows,
+                batch_size,
+                num_qo_heads,
+                num_kv_heads,
+                1,  # page_size
+                self.is_cuda_graph_enabled,
+                head_dim,
+                causal,
+                get_cuda_stream(device),
+            )
 
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode
-        self._allow_fp16_qk_reduction = allow_fp16_qk_reduction
+        self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._window_left = window_left
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
@@ -2567,7 +2084,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         v: torch.Tensor,
         causal: bool = False,
         pos_encoding_mode: str = "NONE",
-        allow_fp16_qk_reduction: bool = False,
+        use_fp16_qk_reduction: bool = False,
         window_left: int = -1,
         logits_soft_cap: Optional[float] = None,
         sm_scale: Optional[float] = None,
@@ -2577,7 +2094,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         r"""Warning: This function is deprecated, please use :meth:`run` instead."""
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode
-        self._allow_fp16_qk_reduction = allow_fp16_qk_reduction
+        self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._window_left = window_left
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
@@ -2676,32 +2193,33 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 mask_mode = MaskMode.NON_CAUSAL.value
 
         run_args = [
-            mask_mode,
             self._float_workspace_buffer,
             self._int_workspace_buffer,
             self._plan_info,
             q,
             k,
             v,
-            self._custom_mask_buf,
-            _get_cache_alibi_slopes_buf(q.shape[1], self.device),
             self._qo_indptr_buf,
             self._kv_indptr_buf,
-            self._qk_indptr_buf,
+            lse,
+            mask_mode,
             TensorLayout[self._kv_layout].value,
             window_left,
-            logits_soft_cap,
-            sm_scale,
-            rope_scale,
-            rope_theta,
-            lse,
         ]
-        if self._jit_backend:
+        if self._jit_module is not None:
             run_args.extend(list(args))
-            out = batch_prefill_with_ragged_kv_cache_with_jit_module(self._jit_module, *run_args)
         else:
-            out = self._cached_module.ragged_run(*run_args)
+            run_args += [
+                self._custom_mask_buf,
+                self._mask_indptr_buf,
+                _get_cache_alibi_slopes_buf(q.shape[1], self.device),
+                logits_soft_cap,
+                sm_scale,
+                rope_scale,
+                rope_theta,
+            ]
 
+        out = self._cached_module.ragged_run(*run_args)
         return (out, lse) if return_lse else out
 
     run_return_lse = functools.partialmethod(run, return_lse=True)
@@ -2713,7 +2231,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         v: torch.Tensor,
         causal: bool = False,
         pos_encoding_mode: str = "NONE",
-        allow_fp16_qk_reduction: bool = False,
+        use_fp16_qk_reduction: bool = False,
         window_left: int = -1,
         logits_soft_cap: Optional[float] = None,
         sm_scale: Optional[float] = None,
@@ -2723,7 +2241,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         r"""Warning: This function is deprecated, please use :meth:`run_return_lse` instead."""
         self._causal = causal
         self._pos_encoding_mode = pos_encoding_mode
-        self._allow_fp16_qk_reduction = allow_fp16_qk_reduction
+        self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._window_left = window_left
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale

@@ -93,7 +93,7 @@ void bench_flashinfer_single_decode_with_prefill(nvbench::state& state) {
         /*qo_len=*/1,
         /*kv_len=*/seq_len, head_dim,
         /*causal=*/false, QKVLayout(kv_layout), PosEncodingMode(pos_encoding_mode),
-        /*allow_fp16_qk_reduction=*/false,
+        /*use_fp16_qk_reduction=*/false,
         /*maybe_sm_scale=*/std::nullopt,
         /*rope_scale=*/1.f,
         /*rope_theta=*/1e4, launch.get_stream());

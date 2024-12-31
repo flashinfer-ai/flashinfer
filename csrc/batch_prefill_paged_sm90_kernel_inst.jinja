@@ -1,0 +1,23 @@
+#include <flashinfer/attention/hopper/prefill_sm90.cuh>
+
+{% if jit %}
+#include "batch_prefill_sm90_generated_config.inc"
+{% else %}
+#include <flashinfer/attention/hopper/params.cuh>
+#include <flashinfer/attention/hopper/variants.cuh>
+
+using PagedParams = BatchPrefillPagedParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_out }}, {{ idtype }}>;
+{% endif %}
+
+namespace flashinfer {
+
+{% for same_scheduler_for_all_heads in ["true", "false"] %}
+template cudaError_t BatchPrefillWithPagedKVCacheDispatched
+    <{{ head_dim }},
+     {{ mask_mode }},
+     /*USE_SLIDING_WINDOW=*/{{ use_sliding_window }},
+     /*SAME_SCHEDULER_FOR_ALL_HEADS=*/{{ same_scheduler_for_all_heads }},
+     {{ variant_name }}, PagedParams>(PagedParams& params, cudaStream_t stream);
+{% endfor %}
+
+};  // namespace flashinfer

@@ -50,7 +50,7 @@ using namespace flashinfer;
 
 int _FlashInferSinglePrefillWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, DLTensor* tmp,
                                         bool causal, int64_t kv_layout, int64_t pos_encoding_mode,
-                                        bool allow_fp16_qk_reduction, double rope_scale,
+                                        bool use_fp16_qk_reduction, double rope_scale,
                                         double rope_theta, DLTensor* o) {
   // `tmp` is user-provided scratch space of at least 16MB, e.g. 4 * 1024 * 1024 float32.
   CHECK_EQ(q->device.device_type, kDLCUDA) << "The device of q matrix must be CUDA.";
@@ -92,7 +92,7 @@ int _FlashInferSinglePrefillWithKVCache(DLTensor* q, DLTensor* k, DLTensor* v, D
             (dtype_in*)q->data, (dtype_in*)k->data, (dtype_in*)v->data, (dtype_out*)o->data,
             (dtype_out*)tmp->data, /*lse=*/nullptr, num_qo_heads, num_kv_heads, qo_len, kv_len,
             head_dim, causal, QKVLayout(kv_layout), PosEncodingMode(pos_encoding_mode),
-            allow_fp16_qk_reduction, std::nullopt, rope_scale, rope_theta, 0);
+            use_fp16_qk_reduction, std::nullopt, rope_scale, rope_theta, 0);
         if (status != cudaSuccess) {
           LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
         }
@@ -265,7 +265,7 @@ void _FlashInferAttentionPrefillWithPagedKVCache(int64_t handler_id, DLTensor* q
                     cache, static_cast<dtype_out*>(output->data),
                     /*lse=*/static_cast<float*>(lse->data), nhead_qo,
                     /*causal=*/causal, PosEncodingMode(pos_encoding_mode),
-                    /*allow_fp16_qk_reduction=*/false, sm_scale, rope_scale, rope_theta,
+                    /*use_fp16_qk_reduction=*/false, sm_scale, rope_scale, rope_theta,
                     /*stream=*/0);
             if (status != cudaSuccess) {
               LOG(FATAL) << "FlashInfer CUDA kernel error " << cudaGetErrorString(status);
@@ -542,7 +542,7 @@ void _FlashInferAttentionPrefillWithRaggedKVCache(
                     static_cast<dtype_out*>(output->data),
                     /*lse=*/static_cast<float*>(lse->data), batch_size, nhead_qo, nhead_kv, nfeat,
                     /*causal=*/bool(causal), QKVLayout::kNHD, PosEncodingMode(pos_encoding_mode),
-                    /*allow_fp16_qk_reduction=*/false, sm_scale, rope_scale, rope_theta,
+                    /*use_fp16_qk_reduction=*/false, sm_scale, rope_scale, rope_theta,
                     /*sm_scale=*/0);
             if (status != cudaSuccess) {
               LOG(FATAL) << "FlashInfer AttentionPrefillWithRaggedKVCache error "

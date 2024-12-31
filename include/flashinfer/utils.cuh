@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <iostream>
+#include <type_traits>
 #include <vector>
 
 #include "exception.h"
@@ -31,8 +32,8 @@
 #define STR(x) STR_HELPER(x)
 
 // macro to turn off fp16 qk reduction to reduce binary
-#ifndef FLASHINFER_ALWAYS_DISALLOW_FP16_QK_REDUCTION
-#define FLASHINFER_ALWAYS_DISALLOW_FP16_QK_REDUCTION 0
+#ifndef FLASHINFER_ALWAYS_DISUSE_FP16_QK_REDUCTION
+#define FLASHINFER_ALWAYS_DISUSE_FP16_QK_REDUCTION 0
 #endif
 
 #ifndef NDEBUG
@@ -55,12 +56,12 @@
   }
 #endif
 
-#define DISPATCH_ALLOW_FP16_QK_REDUCTION(allow_fp16_qk_reduction, ALLOW_FP16_QK_REDUCTION, ...) \
-  if (allow_fp16_qk_reduction) {                                                                \
-    FLASHINFER_ERROR("FP16_QK_REDUCTION disabled at compile time");                             \
-  } else {                                                                                      \
-    constexpr bool ALLOW_FP16_QK_REDUCTION = false;                                             \
-    __VA_ARGS__                                                                                 \
+#define DISPATCH_USE_FP16_QK_REDUCTION(use_fp16_qk_reduction, USE_FP16_QK_REDUCTION, ...) \
+  if (use_fp16_qk_reduction) {                                                            \
+    FLASHINFER_ERROR("FP16_QK_REDUCTION disabled at compile time");                       \
+  } else {                                                                                \
+    constexpr bool USE_FP16_QK_REDUCTION = false;                                         \
+    __VA_ARGS__                                                                           \
   }
 
 #define DISPATCH_NUM_MMA_Q(num_mma_q, NUM_MMA_Q, ...)  \

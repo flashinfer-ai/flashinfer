@@ -392,7 +392,7 @@ void _TestTwoLevelSinglePrefixCascadeDecodeCorrectness(size_t batch_size,
       thrust::raw_pointer_cast(tmp_0_d.data()), thrust::raw_pointer_cast(lse_cascade_0_d.data()),
       num_qo_heads, num_kv_heads, /*qo_len=*/batch_size, /*kv_len=*/shared_prefix_length, head_dim,
       /*causal=*/false, /*kv_layout=*/QKVLayout::kNHD,
-      /*pos_encoding_mode=*/PosEncodingMode::kNone, /*allow_fp16_qk_reduction=*/false);
+      /*pos_encoding_mode=*/PosEncodingMode::kNone, /*use_fp16_qk_reduction=*/false);
 
   EXPECT_EQ(status, cudaSuccess) << "Cascade implementation prefill failed with error: "
                                  << cudaGetErrorString(status);
@@ -507,7 +507,7 @@ void _TestTwoLevelSinglePrefixCascadeAppendCorrectness(size_t batch_size,
       thrust::raw_pointer_cast(qo_indptr_d.data()),
       /*q_offset=*/nullptr, paged_kv_baseline_d, thrust::raw_pointer_cast(o_baseline_d.data()),
       /*lse=*/nullptr, num_qo_heads, /*causal=*/true, PosEncodingMode::kNone,
-      /*allow_fp16_qk_reduction=*/false);
+      /*use_fp16_qk_reduction=*/false);
 
   EXPECT_EQ(status, cudaSuccess) << "Baseline implementation failed with error: "
                                  << cudaGetErrorString(status);
@@ -519,7 +519,7 @@ void _TestTwoLevelSinglePrefixCascadeAppendCorrectness(size_t batch_size,
       num_qo_heads, num_kv_heads, /*qo_len=*/batch_size * qo_append_length,
       /*kv_len=*/shared_prefix_length, head_dim,
       /*causal=*/false, /*kv_layout=*/QKVLayout::kNHD,
-      /*pos_encoding_mode=*/PosEncodingMode::kNone, /*allow_fp16_qk_reduction=*/false);
+      /*pos_encoding_mode=*/PosEncodingMode::kNone, /*use_fp16_qk_reduction=*/false);
 
   EXPECT_EQ(status, cudaSuccess)
       << "Cascade implementation shared prefix prefill failed with error: "
@@ -531,7 +531,7 @@ void _TestTwoLevelSinglePrefixCascadeAppendCorrectness(size_t batch_size,
       /*r_rope_position=*/nullptr, paged_kv_casacde_d,
       thrust::raw_pointer_cast(o_cascade_1_d.data()),
       thrust::raw_pointer_cast(lse_cascade_1_d.data()), num_qo_heads, /*causal=*/true,
-      PosEncodingMode::kNone, /*allow_fp16_qk_reduction=*/false);
+      PosEncodingMode::kNone, /*use_fp16_qk_reduction=*/false);
 
   EXPECT_EQ(status, cudaSuccess) << "Cascade implementation unique kv prefill failed with error: "
                                  << cudaGetErrorString(status);

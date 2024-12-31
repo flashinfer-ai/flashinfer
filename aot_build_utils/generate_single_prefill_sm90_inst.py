@@ -24,7 +24,7 @@ from .literal_map import dtype_literal, mask_mode_literal, pos_encoding_mode_lit
 def get_cu_file_str(
     head_dim,
     pos_encoding_mode,
-    allow_fp16_qk_reduction,
+    use_fp16_qk_reduction,
     mask_mode,
     dtype_q,
     dtype_kv,
@@ -45,26 +45,26 @@ using DTypeO = cutlass_dtype_t<{dtype_out}>;
 using Params = SinglePrefillParams<DTypeQ, DTypeKV, DTypeO>;
 
 template cudaError_t SinglePrefillWithKVCacheDispatched
-    <{head_dim}, {mask_mode}, /*USE_SWA=*/true, LogitsSoftCap<Params>>
+    <{head_dim}, {mask_mode}, /*USE_SLIDING_WINDOW=*/true, LogitsSoftCap<Params>>
     (Params& params, cudaStream_t stream);
 
 template cudaError_t SinglePrefillWithKVCacheDispatched
-    <{head_dim}, {mask_mode}, /*USE_SWA=*/false, LogitsSoftCap<Params>>
+    <{head_dim}, {mask_mode}, /*USE_SLIDING_WINDOW=*/false, LogitsSoftCap<Params>>
     (Params& params, cudaStream_t stream);
 
 template cudaError_t SinglePrefillWithKVCacheDispatched
-    <{head_dim}, {mask_mode}, /*USE_SWA=*/true, StandardAttention<Params>>
+    <{head_dim}, {mask_mode}, /*USE_SLIDING_WINDOW=*/true, StandardAttention<Params>>
     (Params& params, cudaStream_t stream);
 
 template cudaError_t SinglePrefillWithKVCacheDispatched
-    <{head_dim}, {mask_mode}, /*USE_SWA=*/false, StandardAttention<Params>>
+    <{head_dim}, {mask_mode}, /*USE_SLIDING_WINDOW=*/false, StandardAttention<Params>>
     (Params& params, cudaStream_t stream);
 
 }}
     """.format(
         head_dim=head_dim,
         # pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
-        # allow_fp16_qk_reduction=allow_fp16_qk_reduction,
+        # use_fp16_qk_reduction=use_fp16_qk_reduction,
         mask_mode=mask_mode_literal[int(mask_mode)],
         dtype_q=dtype_literal[dtype_q],
         dtype_kv=dtype_literal[dtype_kv],

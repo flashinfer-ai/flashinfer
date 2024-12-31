@@ -22,11 +22,7 @@ import torch
 
 from .decode import get_batch_decode_module
 from .page import block_sparse_indices_to_vector_sparse_offsets, get_seq_lens
-from .prefill import (
-    _compute_page_qk_indptr,
-    get_batch_prefill_module,
-    get_batch_prefill_sm90_module,
-)
+from .prefill import _compute_page_mask_indptr, get_batch_prefill_module
 from .quantization import segment_packbits
 from .utils import (
     MaskMode,
@@ -157,7 +153,7 @@ class BlockSparseAttentionWrapper:
         self._paged_kv_indices_buf: Optional[torch.Tensor] = None
         self._paged_kv_last_page_len: Optional[torch.Tensor] = None
         self._packed_mask_buf: Optional[torch.Tensor] = None
-        self._qk_indptr_buf: Optional[torch.Tensor] = None
+        self._mask_indptr_buf: Optional[torch.Tensor] = None
         self.R: Optional[int] = None
         self.C: Optional[int] = None
         self.M: Optional[int] = None
@@ -202,7 +198,7 @@ class BlockSparseAttentionWrapper:
         packed_mask: Optional[torch.Tensor] = None,
         causal: bool = False,
         pos_encoding_mode: str = "NONE",
-        allow_fp16_qk_reduction: bool = False,
+        use_fp16_qk_reduction: bool = False,
         logits_soft_cap: Optional[float] = None,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
@@ -250,7 +246,7 @@ class BlockSparseAttentionWrapper:
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
             Default is ``NONE``.
-        allow_fp16_qk_reduction : bool
+        use_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
             loss).
         logits_soft_cap : Optional[float]
@@ -303,7 +299,7 @@ class BlockSparseAttentionWrapper:
         )
 
         if mask is not None or packed_mask is not None:
-            qk_indptr = _compute_page_qk_indptr(
+            mask_indptr = _compute_page_mask_indptr(
                 qo_indptr,
                 indptr,  # paged_kv_indptr
                 last_block_len,  # paged_kv_last_page_len
@@ -313,8 +309,8 @@ class BlockSparseAttentionWrapper:
             # first convert BSR mask to flashinfer layout
             mask = convert_bsr_mask_layout(mask, indptr)
             # create packed mask from mask
-            packed_mask, qk_indptr = segment_packbits(
-                mask.contiguous().view(-1), qk_indptr, bitorder="little"
+            packed_mask, mask_indptr = segment_packbits(
+                mask.contiguous().view(-1), mask_indptr, bitorder="little"
             )
 
         self._qo_indptr = qo_indptr.to(self.device, non_blocking=non_blocking)
@@ -327,11 +323,13 @@ class BlockSparseAttentionWrapper:
             self._packed_mask_buf = packed_mask.to(
                 self.device, non_blocking=non_blocking
             )
-            self._qk_indptr_buf = qk_indptr.to(self.device, non_blocking=non_blocking)
+            self._mask_indptr_buf = mask_indptr.to(
+                self.device, non_blocking=non_blocking
+            )
             mask_mode = MaskMode.CUSTOM.value
         else:
             self._packed_mask_buf = None
-            self._qk_indptr_buf = None
+            self._mask_indptr_buf = None
             mask_mode = MaskMode.CAUSAL.value if causal else MaskMode.NON_CAUSAL.value
         self._mask_mode = mask_mode
 
@@ -383,7 +381,7 @@ class BlockSparseAttentionWrapper:
                 self._backend = determine_attention_backend(
                     self.device,
                     PosEncodingMode[pos_encoding_mode].value,
-                    allow_fp16_qk_reduction,
+                    use_fp16_qk_reduction,
                     mask_mode == MaskMode.CUSTOM.value,  # use_custom_mask
                     q_data_type,
                     kv_data_type,
@@ -398,11 +396,12 @@ class BlockSparseAttentionWrapper:
                 PosEncodingMode[pos_encoding_mode].value,
                 False,  # use_sliding_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
-                allow_fp16_qk_reduction,
+                use_fp16_qk_reduction,
+            )
+            self._cached_module = get_batch_prefill_module(self._backend)(
+                *get_module_args
             )
             if self._backend == "fa2":
-                self._cached_module = get_batch_prefill_module(*get_module_args)
-
                 with self.device as device:
                     self._plan_info = self._cached_module.plan(
                         self._float_workspace_buffer,
@@ -419,7 +418,6 @@ class BlockSparseAttentionWrapper:
                         get_cuda_stream(device),
                     )
             else:
-                self._cached_module = get_batch_prefill_sm90_module(*get_module_args)
                 kv_lens_arr_host = (kv_indptr_host[1:] - kv_indptr_host[:-1]) * self.C
                 self._kv_lens_buffer[: len(kv_lens_arr_host)].copy_(
                     kv_lens_arr_host, non_blocking=non_blocking
@@ -457,7 +455,7 @@ class BlockSparseAttentionWrapper:
                     )
 
         self._pos_encoding_mode = pos_encoding_mode
-        self._allow_fp16_qk_reduction = allow_fp16_qk_reduction
+        self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
@@ -471,7 +469,7 @@ class BlockSparseAttentionWrapper:
         k: torch.Tensor,
         v: torch.Tensor,
         pos_encoding_mode: str = "NONE",
-        allow_fp16_qk_reduction: bool = False,
+        use_fp16_qk_reduction: bool = False,
         logits_soft_cap: Optional[float] = None,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
@@ -479,7 +477,7 @@ class BlockSparseAttentionWrapper:
     ) -> torch.Tensor:
         r"""Warning: This method is deprecated, please use :meth:`run` instead."""
         self._pos_encoding_mode = pos_encoding_mode
-        self._allow_fp16_qk_reduction = allow_fp16_qk_reduction
+        self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
@@ -516,7 +514,7 @@ class BlockSparseAttentionWrapper:
             * The logsumexp of attention output, shape: ``[M, num_qo_heads]``.
         """
         pos_encoding_mode = self._pos_encoding_mode
-        allow_fp16_qk_reduction = self._allow_fp16_qk_reduction
+        use_fp16_qk_reduction = self._use_fp16_qk_reduction
         logits_soft_cap = self._logits_soft_cap
         sm_scale = self._sm_scale
         rope_scale = self._rope_scale
@@ -573,7 +571,7 @@ class BlockSparseAttentionWrapper:
                 self._paged_kv_indptr_buf,
                 sparse_indices,  # self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len,
-                self._qk_indptr_buf,
+                self._mask_indptr_buf,
                 TensorLayout[self._kv_layout].value,
                 -1,  # window_left
                 logits_soft_cap,

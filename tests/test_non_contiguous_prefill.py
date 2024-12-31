@@ -35,7 +35,7 @@ def warmup_jit():
                     [0],  # pos_encoding_modes
                     [False],  # use_sliding_windows
                     [False],  # use_logits_soft_caps
-                    [False],  # allow_fp16_qk_reductions
+                    [False],  # use_fp16_qk_reductions
                 )
             )
         except Exception as e:

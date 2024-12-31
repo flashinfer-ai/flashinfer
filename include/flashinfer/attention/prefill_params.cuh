@@ -111,7 +111,7 @@ struct BatchPrefillRaggedParams {
   uint8_t* custom_mask;
   IdType* q_indptr;
   IdType* kv_indptr;
-  IdType* qk_indptr;
+  IdType* mask_indptr;
   IdType* q_offset;           // q_offset is only used for fused-rope attention
   IdType* k_rope_pos_offset;  // k_rope_pos_offset is only used for fused-rope attention
   DTypeO* o;
@@ -142,7 +142,7 @@ struct BatchPrefillRaggedParams {
   bool partition_kv;
 
   __host__ BatchPrefillRaggedParams(DTypeQ* q, DTypeKV* k, DTypeKV* v, uint8_t* custom_mask,
-                                    IdType* q_indptr, IdType* kv_indptr, IdType* qk_indptr,
+                                    IdType* q_indptr, IdType* kv_indptr, IdType* mask_indptr,
                                     IdType* q_offset, IdType* k_rope_pos_offset, DTypeO* o,
                                     float* lse, float* alibi_slopes, uint32_t num_qo_heads,
                                     uint32_t num_kv_heads, uint32_t q_stride_n, uint32_t q_stride_h,
@@ -155,7 +155,7 @@ struct BatchPrefillRaggedParams {
         custom_mask(custom_mask),
         q_indptr(q_indptr),
         kv_indptr(kv_indptr),
-        qk_indptr(qk_indptr),
+        mask_indptr(mask_indptr),
         q_offset(q_offset),
         k_rope_pos_offset(k_rope_pos_offset),
         o(o),
@@ -193,7 +193,7 @@ struct BatchPrefillRaggedParams {
   }
 
   __host__ __device__ __forceinline__ uint8_t* get_batch_local_mask_ptr(uint32_t batch_idx) const {
-    return this->custom_mask + qk_indptr[batch_idx];
+    return this->custom_mask + mask_indptr[batch_idx];
   }
 };
 
@@ -208,7 +208,7 @@ struct BatchPrefillPagedParams {
   paged_kv_t<DTypeKV, IdType> paged_kv;
   uint8_t* custom_mask;
   IdType* q_indptr;
-  IdType* qk_indptr;
+  IdType* mask_indptr;
   IdType* q_offset;  // q_offset is only used for fused-rope attention
   DTypeO* o;
   float* lse;
@@ -235,7 +235,7 @@ struct BatchPrefillPagedParams {
   bool partition_kv;
 
   __host__ BatchPrefillPagedParams(DTypeQ* q, paged_kv_t<DTypeKV, IdType> paged_kv,
-                                   uint8_t* custom_mask, IdType* q_indptr, IdType* qk_indptr,
+                                   uint8_t* custom_mask, IdType* q_indptr, IdType* mask_indptr,
                                    IdType* q_offset, DTypeO* o, float* lse, float* alibi_slopes,
                                    uint32_t num_qo_heads, IdType q_stride_n, IdType q_stride_h,
                                    int32_t window_left, float logits_soft_cap, float sm_scale,
@@ -244,7 +244,7 @@ struct BatchPrefillPagedParams {
         paged_kv(paged_kv),
         custom_mask(custom_mask),
         q_indptr(q_indptr),
-        qk_indptr(qk_indptr),
+        mask_indptr(mask_indptr),
         q_offset(q_offset),
         o(o),
         lse(lse),
@@ -278,7 +278,7 @@ struct BatchPrefillPagedParams {
   }
 
   __host__ __device__ __forceinline__ uint8_t* get_batch_local_mask_ptr(uint32_t batch_idx) const {
-    return this->custom_mask + qk_indptr[batch_idx];
+    return this->custom_mask + mask_indptr[batch_idx];
   }
 };
 

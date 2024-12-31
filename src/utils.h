@@ -29,8 +29,8 @@
 #include <random>
 #include <sstream>
 
-#include "generated/dispatch.inc"
 #include "flashinfer/exception.h"
+#include "generated/dispatch.inc"
 
 #define _DISPATCH_SWITCH(var_name, cond, ...)                                         \
   switch (cond) {                                                                     \
@@ -58,9 +58,9 @@
   _DISPATCH_SWITCH("positional encoding mode", expr,      \
                    _DISPATCH_CASES_pos_encoding_mode(const_expr, __VA_ARGS__))
 
-#define DISPATCH_allow_fp16_qk_reduction(expr, const_expr, ...) \
-  _DISPATCH_SWITCH("allow_fp16_qk_reduction", expr,             \
-                   _DISPATCH_CASES_allow_fp16_qk_reduction(const_expr, __VA_ARGS__))
+#define DISPATCH_use_fp16_qk_reduction(expr, const_expr, ...) \
+  _DISPATCH_SWITCH("use_fp16_qk_reduction", expr,             \
+                   _DISPATCH_CASES_use_fp16_qk_reduction(const_expr, __VA_ARGS__))
 
 #define DISPATCH_mask_mode(expr, const_expr, ...) \
   _DISPATCH_SWITCH("mask_mode", expr, _DISPATCH_CASES_mask_mode(const_expr, __VA_ARGS__))

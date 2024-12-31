@@ -16,73 +16,85 @@ limitations under the License.
 
 import os
 import pathlib
+from collections import namedtuple
 from typing import List, Tuple
 
 import jinja2
 import torch
 
-from .batch_decode_mla_templ import batch_decode_mla_suffix, batch_decode_mla_templ
-from .batch_decode_templ import batch_decode_suffix, batch_decode_templ
-from .batch_prefill_sm90_templ import (
-    batch_prefill_sm90_suffix,
-    batch_prefill_sm90_templ,
-    customizable_batch_prefill_sm90_suffix,
-    customizable_batch_prefill_sm90_templ,
-)
-from .batch_prefill_templ import batch_prefill_suffix, batch_prefill_templ
 from .core import load_cuda_ops, sm90a_nvcc_flags
-from .env import FLASHINFER_GEN_SRC_DIR
-from .single_decode_templ import (
-    customizable_single_decode_templ,
-    single_decode_suffix,
-    single_decode_templ,
-)
-from .single_prefill_sm90_templ import (
-    single_prefill_sm90_suffix,
-    single_prefill_sm90_templ,
-    customizable_single_prefill_sm90_suffix,
-    customizable_single_prefill_sm90_templ,
-)
-from .single_prefill_templ import (
-    customizable_single_prefill_templ,
-    single_prefill_suffix,
-    single_prefill_templ,
-)
+from .env import FLASHINFER_CSRC_DIR, FLASHINFER_GEN_SRC_DIR
 from .utils import (
     dtype_map,
     filename_safe_dtype_map,
+    mask_mode_literal,
     pos_encoding_mode_literal,
     write_if_different,
 )
 
 
-def render_templates(template_strs: List[str], context: dict) -> List[str]:
-    return [
-        template.render(**context) for template in map(jinja2.Template, template_strs)
-    ]
-
-
-def get_single_decode_sources(
-    dtype_q: torch.dtype,
-    dtype_kv: torch.dtype,
-    dtype_o: torch.dtype,
-    head_dim: int,
-    pos_encoding_mode: int,
-    use_sliding_window: bool,
-    use_logits_soft_cap: bool,
-) -> List[str]:
-    return render_templates(
-        single_decode_templ,
-        {
-            "dtype_q": dtype_map[dtype_q],
-            "dtype_kv": dtype_map[dtype_kv],
-            "dtype_o": dtype_map[dtype_o],
-            "head_dim": head_dim,
-            "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
-            "use_sliding_window": "true" if use_sliding_window else "false",
-            "use_logits_soft_cap": "true" if use_logits_soft_cap else "false",
-        },
+def generate_additional_params(
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+    is_sm90_template: bool = False,
+):
+    additional_params_decl = "".join(
+        [
+            f"{dtype}* {var};\n"
+            for dtype, var in zip(
+                additional_tensor_dtypes,
+                additional_tensor_names,
+            )
+        ]
+        + [
+            f"{dtype} {var};\n"
+            for dtype, var in zip(additional_scalar_dtypes, additional_scalar_names)
+        ]
     )
+    additional_func_params = "".join(
+        [
+            (
+                f", std::optional<at::Tensor> {var}"
+                if var.startswith("maybe")
+                else f", at::Tensor {var}"
+            )
+            for var in additional_tensor_names
+        ]
+        + [
+            f", {dtype} {var}"
+            for dtype, var in zip(additional_scalar_dtypes, additional_scalar_names)
+        ]
+    )
+    if is_sm90_template:
+        additional_params_setter = " \\\n".join(
+            [
+                (
+                    f"params.additional_params.{var}_ptr = {var} ? static_cast<{dtype}*>{var}->data_ptr(): nullptr;"
+                    if var.startswith("maybe")
+                    else f"params.additional_params.{var}_ptr = static_cast<{dtype}*>{var}.data_ptr();"
+                )
+                for dtype, var in zip(additional_tensor_dtypes, additional_tensor_names)
+            ]
+            + [
+                f"params.additional_params.{var} = {var};"
+                for var in additional_scalar_names
+            ]
+        )
+    else:
+        additional_params_setter = " \\\n".join(
+            [
+                (
+                    f"params.{var} = {var} ? static_cast<{dtype}*>({var}->data_ptr()): nullptr;"
+                    if var.startswith("maybe")
+                    else f"params.{var} = static_cast<{dtype}*>({var}.data_ptr());"
+                )
+                for dtype, var in zip(additional_tensor_dtypes, additional_tensor_names)
+            ]
+            + [f"params.{var} = {var};" for var in additional_scalar_names]
+        )
+    return (additional_params_decl, additional_func_params, additional_params_setter)
 
 
 def get_single_decode_uri(
@@ -102,44 +114,6 @@ def get_single_decode_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}"
-    )
-
-
-def gen_single_decode_module(*args, **kwargs):
-    gen_directory = FLASHINFER_GEN_SRC_DIR
-    os.makedirs(gen_directory, exist_ok=True)
-    uri = get_single_decode_uri(*args, **kwargs)
-    sources = get_single_decode_sources(*args, **kwargs)
-    source_paths = []
-    for suffix, source in zip(single_decode_suffix, sources):
-        path = gen_directory / f"{uri}{suffix}"
-        source_paths.append(path)
-        write_if_different(path, source)
-    return load_cuda_ops(uri, source_paths)
-
-
-def get_batch_decode_sources(
-    dtype_q: torch.dtype,
-    dtype_kv: torch.dtype,
-    dtype_o: torch.dtype,
-    dtype_idx: torch.dtype,
-    head_dim: int,
-    pos_encoding_mode: int,
-    use_sliding_window: bool,
-    use_logits_soft_cap: bool,
-) -> List[str]:
-    return render_templates(
-        batch_decode_templ,
-        {
-            "dtype_q": dtype_map[dtype_q],
-            "dtype_kv": dtype_map[dtype_kv],
-            "dtype_o": dtype_map[dtype_o],
-            "dtype_idx": dtype_map[dtype_idx],
-            "head_dim": head_dim,
-            "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
-            "use_sliding_window": "true" if use_sliding_window else "false",
-            "use_logits_soft_cap": "true" if use_logits_soft_cap else "false",
-        },
     )
 
 
@@ -165,19 +139,7 @@ def get_batch_decode_uri(
     )
 
 
-def gen_batch_decode_module(*args, **kwargs):
-    gen_directory = FLASHINFER_GEN_SRC_DIR
-    uri = get_batch_decode_uri(*args, **kwargs)
-    sources = get_batch_decode_sources(*args, **kwargs)
-    source_paths = []
-    for suffix, source in zip(batch_decode_suffix, sources):
-        path = gen_directory / f"{uri}{suffix}"
-        source_paths.append(path)
-        write_if_different(path, source)
-    return load_cuda_ops(uri, source_paths)
-
-
-def get_batch_decode_mla_sources(
+def get_mla_generated_config_str(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
@@ -185,21 +147,30 @@ def get_batch_decode_mla_sources(
     head_dim: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
-) -> List[str]:
-    return render_templates(
-        batch_decode_mla_templ,
-        {
-            "dtype_q": dtype_map[dtype_q],
-            "dtype_kv": dtype_map[dtype_kv],
-            "dtype_o": dtype_map[dtype_o],
-            "dtype_idx": dtype_map[dtype_idx],
-            "head_dim_ckv": head_dim,
-            "head_dim_kpe": head_dim
-            // 8,  # fixme: head_dim_ckv(kv_lora_rank) is 8 times the size of head_dim_kpe(qk_rope_head_dim) for all MLA model (DeepSeek-V2-Lite, DeepSeek-V2.5, MiniCPM3) at the time Oct.2024
-            "use_sliding_window": "true" if use_sliding_window else "false",
-            "use_logits_soft_cap": "true" if use_logits_soft_cap else "false",
-        },
-    )
+) -> str:
+    # step 0: generate the mla_generated_config.inc
+    return f"""#pragma once
+#include <flashinfer/attention/decode_params.cuh>
+#include <flashinfer/attention/variants.cuh>
+#include "pytorch_extension_utils.h"
+
+using namespace flashinfer;
+
+using DTypeQ = {dtype_map[dtype_q]};
+using DTypeKV = {dtype_map[dtype_kv]};
+using DTypeO = {dtype_map[dtype_o]};
+using IdType = {dtype_map[dtype_idx]};
+
+constexpr bool USE_SLIDING_WINDOW = {"true" if use_sliding_window else "false"};
+constexpr bool USE_LOGITS_SOFT_CAP = {"true" if use_logits_soft_cap else "false"};
+constexpr int HEAD_DIM_CKV = {head_dim};
+constexpr int HEAD_DIM_KPE = {head_dim // 8};  // fixme: head_dim_ckv(kv_lora_rank) is 8 times the size of head_dim_kpe(qk_rope_head_dim) for all MLA model (DeepSeek-V2-Lite, DeepSeek-V2.5, MiniCPM3) at the time Oct.2024
+
+using Params = BatchDecodeParamsMLA<DTypeQ, DTypeKV, DTypeO, IdType>;
+using AttentionVariant =
+    DefaultAttention</*use_custom_mask=*/false, USE_SLIDING_WINDOW,
+                                                USE_LOGITS_SOFT_CAP, /*use_alibi*/false>;
+    """
 
 
 def get_batch_decode_mla_uri(
@@ -223,72 +194,31 @@ def get_batch_decode_mla_uri(
 
 
 def gen_batch_decode_mla_module(*args, **kwargs):
-    gen_directory = FLASHINFER_GEN_SRC_DIR
     uri = get_batch_decode_mla_uri(*args, **kwargs)
-    sources = get_batch_decode_mla_sources(*args, **kwargs)
+    gen_directory = FLASHINFER_GEN_SRC_DIR / uri
+    generated_inc_str = get_mla_generated_config_str(*args, **kwargs)
+    os.makedirs(gen_directory, exist_ok=True)
+
     source_paths = []
-    for suffix, source in zip(batch_decode_mla_suffix, sources):
-        path = gen_directory / f"{uri}{suffix}"
-        source_paths.append(path)
-        write_if_different(path, source)
+    for filename in [
+        "batch_decode_mla_plan.cu",
+        "batch_decode_mla_run.cu",
+        "batch_decode_mla_pybind.cu",
+    ]:
+        src_path = FLASHINFER_CSRC_DIR / filename
+        dest_path = gen_directory / filename
+        source_paths.append(dest_path)
+        with open(src_path, "r") as f:
+            source = f.read()
+        write_if_different(dest_path, source)
+
+    generated_config_path = gen_directory / "mla_generated_config.inc"
+    write_if_different(generated_config_path, generated_inc_str)
     return load_cuda_ops(uri, source_paths)
 
 
-def get_single_prefill_sources(
-    dtype_q: torch.dtype,
-    dtype_kv: torch.dtype,
-    dtype_o: torch.dtype,
-    head_dim: int,
-    pos_encoding_mode: int,
-    use_sliding_window: bool,
-    use_logits_soft_cap: bool,
-    use_fp16_qk_reduction: bool,
-) -> List[str]:
-    return render_templates(
-        single_prefill_templ,
-        {
-            "dtype_q": dtype_map[dtype_q],
-            "dtype_kv": dtype_map[dtype_kv],
-            "dtype_o": dtype_map[dtype_o],
-            "head_dim": head_dim,
-            "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
-            "use_sliding_window": "true" if use_sliding_window else "false",
-            "use_logits_soft_cap": "true" if use_logits_soft_cap else "false",
-            "use_fp16_qk_reduction": "true" if use_fp16_qk_reduction else "false",
-        },
-    )
-
-
-def get_single_prefill_sm90_sources(
-    dtype_q: torch.dtype,
-    dtype_kv: torch.dtype,
-    dtype_o: torch.dtype,
-    head_dim: int,
-    pos_encoding_mode: int,
-    use_sliding_window: bool,
-    use_logits_soft_cap: bool,
-    use_fp16_qk_reduction: bool,
-) -> List[str]:
-    assert not use_fp16_qk_reduction, "fp16 qk reduction is not supported on sm90"
-    assert (
-        pos_encoding_mode == 0
-    ), "Currently we only support pos_encoding_mode=0 on sm90"
-    return render_templates(
-        single_prefill_sm90_templ,
-        {
-            "dtype_q": dtype_map[dtype_q],
-            "dtype_kv": dtype_map[dtype_kv],
-            "dtype_o": dtype_map[dtype_o],
-            "head_dim": head_dim,
-            "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
-            "use_sliding_window": "true" if use_sliding_window else "false",
-            "use_logits_soft_cap": "true" if use_logits_soft_cap else "false",
-            "use_fp16_qk_reduction": "true" if use_fp16_qk_reduction else "false",
-        },
-    )
-
-
 def get_single_prefill_uri(
+    backend: str,
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
@@ -299,7 +229,7 @@ def get_single_prefill_uri(
     use_fp16_qk_reduction: bool,
 ) -> str:
     return (
-        f"single_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
+        f"single_prefill_{backend}_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"head_dim_{head_dim}_"
@@ -310,95 +240,8 @@ def get_single_prefill_uri(
     )
 
 
-def get_single_prefill_sm90_uri(*args, **kwargs):
-    return get_single_prefill_uri(*args, **kwargs) + "_sm90"
-
-
-def gen_single_prefill_module(*args, **kwargs):
-    gen_directory = FLASHINFER_GEN_SRC_DIR
-    uri = get_single_prefill_uri(*args, **kwargs)
-    sources = get_single_prefill_sources(*args, **kwargs)
-    source_paths = []
-    for suffix, source in zip(single_prefill_suffix, sources):
-        path = gen_directory / f"{uri}{suffix}"
-        source_paths.append(path)
-        write_if_different(path, source)
-
-    return load_cuda_ops(uri, source_paths)
-
-
-def gen_single_prefill_sm90_module(*args, **kwargs):
-    gen_directory = FLASHINFER_GEN_SRC_DIR
-    uri = get_single_prefill_sm90_uri(*args, **kwargs)
-    sources = get_single_prefill_sm90_sources(*args, **kwargs)
-    source_paths = []
-    for suffix, source in zip(single_prefill_sm90_suffix, sources):
-        path = gen_directory / f"{uri}{suffix}"
-        source_paths.append(path)
-        write_if_different(path, source)
-
-    return load_cuda_ops(uri, source_paths, extra_cuda_cflags=sm90a_nvcc_flags)
-
-
-def get_batch_prefill_sources(
-    dtype_q: torch.dtype,
-    dtype_kv: torch.dtype,
-    dtype_o: torch.dtype,
-    dtype_idx: torch.dtype,
-    head_dim: int,
-    pos_encoding_mode: int,
-    use_sliding_window: bool,
-    use_logits_soft_cap: bool,
-    use_fp16_qk_reduction: bool,
-) -> List[str]:
-    return render_templates(
-        batch_prefill_templ,
-        {
-            "dtype_q": dtype_map[dtype_q],
-            "dtype_kv": dtype_map[dtype_kv],
-            "dtype_o": dtype_map[dtype_o],
-            "dtype_idx": dtype_map[dtype_idx],
-            "head_dim": head_dim,
-            "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
-            "use_sliding_window": "true" if use_sliding_window else "false",
-            "use_logits_soft_cap": "true" if use_logits_soft_cap else "false",
-            "use_fp16_qk_reduction": "true" if use_fp16_qk_reduction else "false",
-        },
-    )
-
-
-def get_batch_prefill_sm90_sources(
-    dtype_q: torch.dtype,
-    dtype_kv: torch.dtype,
-    dtype_o: torch.dtype,
-    dtype_idx: torch.dtype,
-    head_dim: int,
-    pos_encoding_mode: int,
-    use_sliding_window: bool,
-    use_logits_soft_cap: bool,
-    use_fp16_qk_reduction: bool,
-) -> List[str]:
-    assert not use_fp16_qk_reduction, "fp16 qk reduction is not supported on sm90"
-    assert (
-        pos_encoding_mode == 0
-    ), "Currently we only support pos_encoding_mode=0 on sm90"
-    return render_templates(
-        batch_prefill_sm90_templ,
-        {
-            "dtype_q": dtype_map[dtype_q],
-            "dtype_kv": dtype_map[dtype_kv],
-            "dtype_o": dtype_map[dtype_o],
-            "dtype_idx": dtype_map[dtype_idx],
-            "head_dim": head_dim,
-            "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
-            "use_sliding_window": "true" if use_sliding_window else "false",
-            "use_logits_soft_cap": "true" if use_logits_soft_cap else "false",
-            "use_fp16_qk_reduction": "true" if use_fp16_qk_reduction else "false",
-        },
-    )
-
-
 def get_batch_prefill_uri(
+    backend: str,
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
@@ -410,7 +253,7 @@ def get_batch_prefill_uri(
     use_fp16_qk_reduction: bool,
 ) -> str:
     return (
-        f"batch_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
+        f"batch_prefill_{backend}_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
@@ -422,379 +265,711 @@ def get_batch_prefill_uri(
     )
 
 
-def get_batch_prefill_sm90_uri(*args, **kwargs):
-    return get_batch_prefill_uri(*args, **kwargs) + "_sm90"
-
-
-def gen_batch_prefill_module(*args, **kwargs):
-    gen_directory = FLASHINFER_GEN_SRC_DIR
-    uri = get_batch_prefill_uri(*args, **kwargs)
-    sources = get_batch_prefill_sources(*args, **kwargs)
-    source_paths = []
-    for suffix, source in zip(batch_prefill_suffix, sources):
-        path = gen_directory / f"{uri}{suffix}"
-        source_paths.append(path)
-        write_if_different(path, source)
-
-    return load_cuda_ops(uri, source_paths)
-
-
-def gen_batch_prefill_sm90_module(*args, **kwargs):
-    gen_directory = FLASHINFER_GEN_SRC_DIR
-    uri = get_batch_prefill_sm90_uri(*args, **kwargs)
-    sources = get_batch_prefill_sm90_sources(*args, **kwargs)
-    source_paths = []
-    for suffix, source in zip(batch_prefill_sm90_suffix, sources):
-        path = gen_directory / f"{uri}{suffix}"
-        source_paths.append(path)
-        write_if_different(path, source)
-
-    return load_cuda_ops(uri, source_paths, extra_cuda_cflags=sm90a_nvcc_flags)
-
-
-def get_customize_single_decode_sources(
+def gen_single_decode_module(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
     head_dim: int,
-    additional_input_tensor_var_names: List[str],
-    additional_input_tensor_var_types: List[str],
-    additional_input_scalar_var_names: List[str],
-    additional_input_scalar_var_types: List[str],
-    variant_name: str,
-    variant_decl: str,
-) -> List[str]:
-    additional_params_decl = "".join(
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+):
+    uri = get_single_decode_uri(
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        head_dim,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+    )
+    return gen_customize_single_decode_module(
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        head_dim,
+        ["maybe_alibi_slopes"],  # additional_tensor_names
+        ["float"],  # additional_tensor_dtypes
         [
-            f"{dtype}* {var};\n"
-            for dtype, var in zip(
-                additional_input_tensor_var_types, additional_input_tensor_var_names
-            )
-        ]
-        + [
-            f"{dtype} {var};\n"
-            for dtype, var in zip(
-                additional_input_scalar_var_types, additional_input_scalar_var_names
-            )
-        ]
-    )
-    additional_params = "".join(
-        [
-            f", {dtype}* {var}"
-            for dtype, var in zip(
-                additional_input_tensor_var_types, additional_input_tensor_var_names
-            )
-        ]
-        + [
-            f", {dtype} {var}"
-            for dtype, var in zip(
-                additional_input_scalar_var_types, additional_input_scalar_var_names
-            )
-        ]
-    )
-    additional_params_init = "".join(
-        [f", {var}({var})" for var in additional_input_tensor_var_names]
-        + [f", {var}({var})" for var in additional_input_scalar_var_names]
-    )
-    additional_func_params = "".join(
-        [f", at::Tensor {var}" for var in additional_input_tensor_var_names]
-        + [
-            f", {dtype} {var}"
-            for dtype, var in zip(
-                additional_input_scalar_var_types, additional_input_scalar_var_names
-            )
-        ]
-    )
-    additional_params_data = "".join(
-        [
-            f", static_cast<{dtype}*>({var}.data_ptr())"
-            for dtype, var in zip(
-                additional_input_tensor_var_types, additional_input_tensor_var_names
-            )
-        ]
-        + [f", {var}" for var in additional_input_scalar_var_names]
-    )
-
-    return render_templates(
-        customizable_single_decode_templ,
-        {
-            "dtype_q": dtype_map[dtype_q],
-            "dtype_kv": dtype_map[dtype_kv],
-            "dtype_o": dtype_map[dtype_o],
-            "head_dim": head_dim,
-            "additional_params_decl": additional_params_decl,
-            "additional_params": additional_params,
-            "additional_params_init": additional_params_init,
-            "variant_decl": variant_decl,
-            "variant_name": variant_name,
-            "additional_func_params": additional_func_params,
-            "additional_params_data": additional_params_data,
-        },
+            "logits_soft_cap",
+            "sm_scale",
+            "rope_scale",
+            "rope_theta",
+        ],  # additional_scalar_names
+        ["float", "float", "float", "float"],  # additional_scalar_dtypes
+        f"DefaultAttention<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>",  # variant_name
+        f"#include<flashinfer/attention/variants.cuh>",  # variant_decl
+        pos_encoding_mode=pos_encoding_mode,
+        use_sliding_window=use_sliding_window,
+        use_logits_soft_cap=use_logits_soft_cap,
     )
 
 
-def get_customize_single_prefill_sources(
+def gen_single_prefill_module(
+    backend: str,
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
     head_dim: int,
-    additional_input_tensor_var_names: List[str],
-    additional_input_tensor_var_types: List[str],
-    additional_input_scalar_var_names: List[str],
-    additional_input_scalar_var_types: List[str],
-    variant_name: str,
-    variant_decl: str,
-) -> List[str]:
-    additional_params_decl = "".join(
-        [
-            f"{dtype}* {var};\n"
-            for dtype, var in zip(
-                additional_input_tensor_var_types, additional_input_tensor_var_names
-            )
-        ]
-        + [
-            f"{dtype} {var};\n"
-            for dtype, var in zip(
-                additional_input_scalar_var_types, additional_input_scalar_var_names
-            )
-        ]
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+    use_fp16_qk_reduction: bool,
+):
+    uri = get_single_prefill_uri(
+        backend,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        head_dim,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+        use_fp16_qk_reduction,
     )
-    additional_params = "".join(
-        [
-            f", {dtype}* {var}"
-            for dtype, var in zip(
-                additional_input_tensor_var_types, additional_input_tensor_var_names
-            )
+    if backend == "fa2":
+        additional_tensor_names = ["maybe_custom_mask", "maybe_alibi_slopes"]
+        additional_tensor_dtypes = ["uint8_t", "float"]
+        additional_scalar_names = [
+            "logits_soft_cap",
+            "sm_scale",
+            "log2_rope_rcp_scale",
+            "log2_rope_rcp_theta",
         ]
-        + [
-            f", {dtype} {var}"
-            for dtype, var in zip(
-                additional_input_scalar_var_types, additional_input_scalar_var_names
-            )
-        ]
-    )
-    additional_params_init = "".join(
-        [f", {var}({var})" for var in additional_input_tensor_var_names]
-        + [f", {var}({var})" for var in additional_input_scalar_var_names]
-    )
-    additional_func_params = "".join(
-        [f", at::Tensor {var}" for var in additional_input_tensor_var_names]
-        + [
-            f", {dtype} {var}"
-            for dtype, var in zip(
-                additional_input_scalar_var_types, additional_input_scalar_var_names
-            )
-        ]
-    )
-    additional_params_data = "".join(
-        [
-            f", static_cast<{dtype}*>({var}.data_ptr())"
-            for dtype, var in zip(
-                additional_input_tensor_var_types, additional_input_tensor_var_names
-            )
-        ]
-        + [f", {var}" for var in additional_input_scalar_var_names]
-    )
+        additional_scalar_dtypes = ["float", "float", "float", "float"]
+        variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
+        variant_decl = f"#include<flashinfer/attention/variants.cuh>"
+    else:
+        additional_tensor_names = []
+        additional_tensor_dtypes = []
+        additional_scalar_names = ["logits_soft_cap", "sm_scale"]
+        additional_scalar_dtypes = ["float", "float"]
+        variant_name = f"DefaultAttention<{str(use_logits_soft_cap).lower()}>"
+        variant_decl = f"#include<flashinfer/attention/hopper/variants.cuh>"
 
-    return render_templates(
-        customizable_single_prefill_templ,
-        {
-            "dtype_q": dtype_map[dtype_q],
-            "dtype_kv": dtype_map[dtype_kv],
-            "dtype_o": dtype_map[dtype_o],
-            "head_dim": head_dim,
-            "additional_params_decl": additional_params_decl,
-            "additional_params": additional_params,
-            "additional_params_init": additional_params_init,
-            "variant_decl": variant_decl,
-            "variant_name": variant_name,
-            "additional_func_params": additional_func_params,
-            "additional_params_data": additional_params_data,
-        },
+    return gen_customize_single_prefill_module(
+        backend,
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        head_dim,
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+        variant_name,
+        variant_decl,
+        pos_encoding_mode=pos_encoding_mode,
+        use_sliding_window=use_sliding_window,
+        use_logits_soft_cap=use_logits_soft_cap,
+        use_fp16_qk_reduction=use_fp16_qk_reduction,
     )
 
 
-def gen_customize_single_decode_module(module_name, *args, **kwargs):
-    gen_directory = FLASHINFER_GEN_SRC_DIR
-    sources = get_customize_single_decode_sources(*args, **kwargs)
-    source_paths = []
-    for suffix, source in zip(single_decode_suffix, sources):
-        path = gen_directory / f"{module_name}{suffix}"
-        source_paths.append(path)
-        write_if_different(path, source)
-
-    return load_cuda_ops(module_name, source_paths)
-
-
-def gen_customize_single_prefill_module(module_name, *args, **kwargs):
-    gen_directory = FLASHINFER_GEN_SRC_DIR
-    sources = get_customize_single_prefill_sources(*args, **kwargs)
-    source_paths = []
-    for suffix, source in zip(single_prefill_suffix, sources):
-        path = gen_directory / f"{module_name}{suffix}"
-        source_paths.append(path)
-        write_if_different(path, source)
-
-    return load_cuda_ops(module_name, source_paths)
-
-
-def get_customize_batch_prefill_sm90_sources(
+def gen_batch_decode_module(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
     dtype_idx: torch.dtype,
     head_dim: int,
-    additional_input_tensor_var_names: List[str],
-    additional_input_tensor_var_types: List[str],
-    additional_input_scalar_var_names: List[str],
-    additional_input_scalar_var_types: List[str],
-    variant_name: str,
-    variant_decl: str,
-) -> List[str]:
-    additional_params_decl = ";\n  ".join(
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+):
+    uri = get_batch_decode_uri(
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+    )
+    return gen_customize_batch_decode_module(
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim,
+        ["maybe_alibi_slopes"],  # additional_tensor_names
+        ["float"],  # additional_tensor_dtypes
         [
-            f"{dtype}* {var}_ptr"
-            for dtype, var in zip(
-                additional_input_tensor_var_types, additional_input_tensor_var_names
-            )
-        ] +
-        [
-            f"{dtype} {var}"
-            for dtype, var in zip(
-                additional_input_scalar_var_types, additional_input_scalar_var_names
-            )
-        ]
-    )
-    additional_func_params = ",\n    ".join(
-        [f"at::Tensor {var}" for var in additional_input_tensor_var_names] +
-        [
-            f"{dtype} {var}"
-            for dtype, var in zip(
-                additional_input_scalar_var_types, additional_input_scalar_var_names
-            )
-        ]
-    )
-    additional_params_setter = ";\n  ".join(
-        [
-            f"params.{var}_ptr = static_cast<{dtype}*>({var}.data_ptr())"
-            for dtype, var in zip(
-                additional_input_tensor_var_types, additional_input_tensor_var_names
-            )
-        ] +
-        [f"params.{var} = {var}" for var in additional_input_scalar_var_names]
-    )
-
-    if additional_func_params:
-        additional_func_params += ","
-
-    return render_templates(
-        customizable_batch_prefill_sm90_templ,
-        {
-            "dtype_q": dtype_map[dtype_q],
-            "dtype_kv": dtype_map[dtype_kv],
-            "dtype_o": dtype_map[dtype_o],
-            "dtype_idx": dtype_map[dtype_idx],
-            "head_dim": head_dim,
-            "variant_decl": variant_decl,
-            "variant_name": variant_name,
-            "use_sliding_window": "false",
-            "additional_params_decl": additional_params_decl,
-            "additional_params_setter": additional_params_setter,
-            "additional_func_params": additional_func_params,
-        },
+            "logits_soft_cap",
+            "sm_scale",
+            "rope_rope_scale",
+            "rope_rope_theta",
+        ],  # additional_scalar_names
+        ["float", "float", "float", "float"],  # additional_scalar_dtypes
+        f"DefaultAttention<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>",  # variant_name
+        f"#include<flashinfer/attention/variants.cuh>",  # variant_decl
+        pos_encoding_mode=pos_encoding_mode,
+        use_sliding_window=use_sliding_window,
+        use_logits_soft_cap=use_logits_soft_cap,
     )
 
 
-def gen_customize_batch_prefill_sm90_module(module_name, *args, **kwargs):
-    gen_directory = FLASHINFER_GEN_SRC_DIR
-    sources = get_customize_batch_prefill_sm90_sources(*args, **kwargs)
-    source_paths = []
-    for suffix, source in zip(customizable_batch_prefill_sm90_suffix, sources):
-        path = gen_directory / f"{module_name}{suffix}"
-        source_paths.append(path)
-        write_if_different(path, source)
-    return load_cuda_ops(
-        module_name,
-        source_paths,
-        extra_cuda_cflags=["-gencode=arch=compute_90a,code=sm_90a"],
+def gen_batch_prefill_module(
+    backend: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+    use_fp16_qk_reduction: bool,
+):
+    uri = get_batch_prefill_uri(
+        backend,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+        use_fp16_qk_reduction,
+        use_fp16_qk_reduction,
+    )
+
+    if backend == "fa2":
+        additional_tensor_names = None
+        additional_tensor_dtypes = None
+        additional_scalar_names = None
+        additional_scalar_dtypes = None
+        variant_name = None
+        variant_decl = None
+    else:
+        pass
+
+    return gen_customize_batch_prefill_module(
+        backend,
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim,
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+        variant_name,
+        variant_decl,
+        pos_encoding_mode=pos_encoding_mode,
+        use_sliding_window=use_sliding_window,
+        use_logits_soft_cap=use_logits_soft_cap,
+        use_fp16_qk_reduction=use_fp16_qk_reduction,
     )
 
 
-def get_customize_single_prefill_sm90_sources(
+def gen_customize_single_decode_module(
+    uri: str,
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
     head_dim: int,
-    additional_input_tensor_var_names: List[str],
-    additional_input_tensor_var_types: List[str],
-    additional_input_scalar_var_names: List[str],
-    additional_input_scalar_var_types: List[str],
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
     variant_name: str,
     variant_decl: str,
-) -> List[str]:
-    additional_params_decl = ";\n  ".join(
-        [
-            f"{dtype}* {var}_ptr"
-            for dtype, var in zip(
-                additional_input_tensor_var_types, additional_input_tensor_var_names
-            )
-        ] +
-        [
-            f"{dtype} {var}"
-            for dtype, var in zip(
-                additional_input_scalar_var_types, additional_input_scalar_var_names
-            )
-        ]
-    )
-    additional_func_params = ",\n    ".join(
-        [f"at::Tensor {var}" for var in additional_input_tensor_var_names] +
-        [
-            f"{dtype} {var}"
-            for dtype, var in zip(
-                additional_input_scalar_var_types, additional_input_scalar_var_names
-            )
-        ]
-    )
-    additional_params_setter = ";\n  ".join(
-        [
-            f"params.{var}_ptr = static_cast<{dtype}*>({var}.data_ptr())"
-            for dtype, var in zip(
-                additional_input_tensor_var_types, additional_input_tensor_var_names
-            )
-        ] +
-        [f"params.{var} = {var}" for var in additional_input_scalar_var_names]
+    pos_encoding_mode: int = 0,
+    use_sliding_window: bool = False,
+    use_logits_soft_cap: bool = False,
+):
+    gen_directory = FLASHINFER_GEN_SRC_DIR / uri
+
+    (
+        additional_params_decl,
+        additional_func_params,
+        additional_params_setter,
+    ) = generate_additional_params(
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
     )
 
-    if additional_func_params:
-        additional_func_params += ","
+    with open(FLASHINFER_CSRC_DIR / "single_decode_customize_config.jinja") as f:
+        config_templ = jinja2.Template(f.read())
 
-    return render_templates(
-        customizable_single_prefill_sm90_templ,
-        {
-            "dtype_q": dtype_map[dtype_q],
-            "dtype_kv": dtype_map[dtype_kv],
-            "dtype_o": dtype_map[dtype_o],
-            "head_dim": head_dim,
-            "variant_decl": variant_decl,
-            "variant_name": variant_name,
-            "use_sliding_window": "false",
+    with open(FLASHINFER_CSRC_DIR / "single_decode_kernel_inst.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+
+    kwargs = {
+        "additional_func_params": additional_func_params,
+        "additional_params_decl": additional_params_decl,
+        "additional_params_setter": additional_params_setter,
+        "variant_decl": variant_decl,
+        "variant_name": variant_name,
+        "dtype_q": dtype_map[dtype_q],
+        "dtype_kv": dtype_map[dtype_kv],
+        "dtype_o": dtype_map[dtype_o],
+        "head_dim": head_dim,
+        "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
+        "use_sliding_window": str(use_sliding_window).lower(),
+        "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
+    }
+
+    generated_inc_str = config_templ.render(
+        **kwargs,
+    )
+
+    os.makedirs(gen_directory, exist_ok=True)
+
+    source_paths = []
+
+    dest_path = gen_directory / "single_decode_kernel.cu"
+    source_paths.append(dest_path)
+    source = kernel_inst_templ.render(
+        jit=True,
+        **kwargs,
+    )
+    write_if_different(dest_path, source)
+
+    for filename in [
+        "single_decode.cu",
+        "single_decode_jit_pybind.cu",
+    ]:
+        src_path = FLASHINFER_CSRC_DIR / filename
+        dest_path = gen_directory / filename
+        source_paths.append(dest_path)
+        with open(src_path, "r") as f:
+            source = f.read()
+        write_if_different(dest_path, source)
+
+    generated_config_path = gen_directory / "single_decode_generated_config.inc"
+    write_if_different(generated_config_path, generated_inc_str)
+
+    return load_cuda_ops(uri, source_paths)
+
+
+def gen_customize_single_prefill_module(
+    backend: str,
+    uri: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    head_dim: int,
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+    variant_name: str,
+    variant_decl: str,
+    pos_encoding_mode: int = 0,
+    use_sliding_window: bool = False,
+    use_logits_soft_cap: bool = False,
+    use_fp16_qk_reduction: bool = False,
+):
+    kwargs = {
+        "variant_decl": variant_decl,
+        "variant_name": variant_name,
+        "dtype_q": dtype_map[dtype_q],
+        "dtype_kv": dtype_map[dtype_kv],
+        "dtype_o": dtype_map[dtype_o],
+        "head_dim": head_dim,
+        "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
+        "use_sliding_window": str(use_sliding_window).lower(),
+        "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
+        "use_fp16_qk_reduction": str(use_fp16_qk_reduction).lower(),
+    }
+    if backend == "auto":
+        raise ValueError("backend should not be auto when jit_args is provided")
+    elif backend == "fa2":
+        gen_directory = FLASHINFER_GEN_SRC_DIR / uri
+        additional_params_decl, additional_func_params, additional_params_setter = (
+            generate_additional_params(
+                additional_tensor_names,
+                additional_tensor_dtypes,
+                additional_scalar_names,
+                additional_scalar_dtypes,
+            )
+        )
+
+        with open(FLASHINFER_CSRC_DIR / "single_prefill_customize_config.jinja") as f:
+            config_templ = jinja2.Template(f.read())
+
+        with open(FLASHINFER_CSRC_DIR / "single_prefill_kernel_inst.jinja") as f:
+            kernel_inst_templ = jinja2.Template(f.read())
+
+        kwargs |= {
+            "additional_func_params": additional_func_params,
             "additional_params_decl": additional_params_decl,
             "additional_params_setter": additional_params_setter,
+        }
+
+        generated_inc_str = config_templ.render(
+            **kwargs,
+        )
+        os.makedirs(gen_directory, exist_ok=True)
+
+        source_paths = []
+        for mask_mode in [0, 1, 2]:
+            filename = f"single_prefill_kernel_mask_{mask_mode}.cu"
+            dest_path = gen_directory / filename
+            source_paths.append(dest_path)
+            source = kernel_inst_templ.render(
+                jit=True,
+                mask_mode=mask_mode_literal[mask_mode],
+                **kwargs,
+            )
+            write_if_different(dest_path, source)
+
+        for filename in [
+            "single_prefill.cu",
+            "single_prefill_jit_pybind.cu",
+        ]:
+            src_path = FLASHINFER_CSRC_DIR / filename
+            dest_path = gen_directory / filename
+            source_paths.append(dest_path)
+            with open(src_path, "r") as f:
+                source = f.read()
+            write_if_different(dest_path, source)
+
+        generated_config_path = gen_directory / "single_prefill_generated_config.inc"
+        write_if_different(generated_config_path, generated_inc_str)
+
+        return load_cuda_ops(uri, source_paths)
+    elif backend == "fa3":
+        gen_directory = FLASHINFER_GEN_SRC_DIR / uri
+
+        (additional_params_decl, additional_func_params, additional_params_setter) = (
+            generate_additional_params(
+                additional_tensor_names,
+                additional_tensor_dtypes,
+                additional_scalar_names,
+                additional_scalar_dtypes,
+                is_sm90_template=True,
+            )
+        )
+
+        with open(
+            FLASHINFER_CSRC_DIR / "single_prefill_sm90_customize_config.jinja"
+        ) as f:
+            config_templ = jinja2.Template(f.read())
+
+        with open(FLASHINFER_CSRC_DIR / "single_prefill_sm90_kernel_inst.jinja") as f:
+            kernel_inst_templ = jinja2.Template(f.read())
+
+        kwargs |= {
             "additional_func_params": additional_func_params,
-        },
+            "additional_params_decl": additional_params_decl,
+            "additional_params_setter": additional_params_setter,
+        }
+
+        generated_inc_str = config_templ.render(
+            **kwargs,
+        )
+        os.makedirs(gen_directory, exist_ok=True)
+
+        source_paths = []
+        for mask_mode in [0, 1, 2]:
+            filename = f"single_prefill_sm90_kernel_mask_{mask_mode}.cu"
+            dest_path = gen_directory / filename
+            source_paths.append(dest_path)
+            source = kernel_inst_templ.render(
+                jit=True,
+                mask_mode=mask_mode_literal[mask_mode],
+                **kwargs,
+            )
+            write_if_different(dest_path, source)
+
+        for filename in [
+            "single_prefill_sm90.cu",
+            "single_prefill_sm90_jit_pybind.cu",
+        ]:
+            src_path = FLASHINFER_CSRC_DIR / filename
+            dest_path = gen_directory / filename
+            source_paths.append(dest_path)
+            with open(src_path, "r") as f:
+                source = f.read()
+            write_if_different(dest_path, source)
+
+        generated_config_path = (
+            gen_directory / "single_prefill_sm90_generated_config.inc"
+        )
+        write_if_different(generated_config_path, generated_inc_str)
+        return load_cuda_ops(
+            uri,
+            source_paths,
+            extra_cuda_cflags=["-gencode=arch=compute_90a,code=sm_90a"],
+        )
+    else:
+        raise ValueError(f"Invalid backend: {backend}")
+
+
+def gen_customize_batch_decode_module(
+    uri: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    idtype: torch.dtype,
+    head_dim: int,
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+    variant_name: str,
+    variant_decl: str,
+    pos_encoding_mode: int = 0,
+    use_sliding_window: bool = False,
+    use_logits_soft_cap: bool = False,
+):
+    gen_directory = FLASHINFER_GEN_SRC_DIR / uri
+    (additional_params_decl, additional_func_params, additional_params_setter) = (
+        generate_additional_params(
+            additional_tensor_names,
+            additional_tensor_dtypes,
+            additional_scalar_names,
+            additional_scalar_dtypes,
+        )
     )
 
+    kwargs = {
+        "additional_params_decl": additional_params_decl,
+        "additional_func_params": additional_func_params,
+        "additional_params_setter": additional_params_setter,
+        "variant_decl": variant_decl,
+        "variant_name": variant_name,
+        "dtype_q": dtype_map[dtype_q],
+        "dtype_kv": dtype_map[dtype_kv],
+        "dtype_o": dtype_map[dtype_o],
+        "idtype": dtype_map[idtype],
+        "head_dim": head_dim,
+        "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
+        "use_sliding_window": str(use_sliding_window).lower(),
+        "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
+    }
 
-def gen_customize_single_prefill_sm90_module(module_name, *args, **kwargs):
-    gen_directory = FLASHINFER_GEN_SRC_DIR
-    sources = get_customize_single_prefill_sm90_sources(*args, **kwargs)
+    with open(FLASHINFER_CSRC_DIR / "batch_decode_customize_config.jinja") as f:
+        config_templ = jinja2.Template(f.read())
+
+    with open(FLASHINFER_CSRC_DIR / "batch_decode_kernel_inst.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+
+    generated_inc_str = config_templ.render(
+        **kwargs,
+    )
+
     source_paths = []
-    for suffix, source in zip(customizable_single_prefill_sm90_suffix, sources):
-        path = gen_directory / f"{module_name}{suffix}"
-        source_paths.append(path)
-        write_if_different(path, source)
-    return load_cuda_ops(
-        module_name,
-        source_paths,
-        extra_cuda_cflags=["-gencode=arch=compute_90a,code=sm_90a"],
+
+    dest_path = gen_directory / "batch_decode_kernel.cu"
+    source_paths.append(dest_path)
+    source = kernel_inst_templ.render(
+        jit=True,
+        **kwargs,
     )
+    write_if_different(dest_path, source)
+
+    for filename in [
+        "batch_decode.cu",
+        "batch_decode_jit_pybind.cu",
+    ]:
+        src_path = FLASHINFER_CSRC_DIR / filename
+        dest_path = gen_directory / filename
+        source_paths.append(dest_path)
+        with open(src_path, "r") as f:
+            source = f.read()
+        write_if_different(dest_path, source)
+
+    generated_config_path = gen_directory / "batch_decode_generated_config.inc"
+    write_if_different(generated_config_path, generated_inc_str)
+    return load_cuda_ops(
+        uri,
+        source_paths,
+    )
+
+
+def gen_customize_batch_prefill_module(
+    backend: str,
+    uri: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    idtype: torch.dtype,
+    head_dim: int,
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+    variant_name: str,
+    variant_decl: str,
+    pos_encoding_mode: int = 0,
+    use_sliding_window: bool = False,
+    use_logits_soft_cap: bool = False,
+    use_fp16_qk_reduction: bool = False,
+):
+    kwargs = {
+        "variant_decl": variant_decl,
+        "variant_name": variant_name,
+        "dtype_q": dtype_map[dtype_q],
+        "dtype_kv": dtype_map[dtype_kv],
+        "dtype_o": dtype_map[dtype_o],
+        "idtype": dtype_map[idtype],
+        "head_dim": head_dim,
+        "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
+        "use_sliding_window": str(use_sliding_window).lower(),
+        "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
+        "use_fp16_qk_reduction": str(use_fp16_qk_reduction).lower(),
+    }
+    if backend == "auto":
+        raise ValueError("backend should not be auto when jit_args is provided")
+    elif backend == "fa2":
+        gen_directory = FLASHINFER_GEN_SRC_DIR / uri
+        (additional_params_decl, additional_func_params, additional_params_setter) = (
+            generate_additional_params(
+                additional_tensor_names,
+                additional_tensor_dtypes,
+                additional_scalar_names,
+                additional_scalar_dtypes,
+            )
+        )
+
+        with open(FLASHINFER_CSRC_DIR / "batch_prefill_customize_config.jinja") as f:
+            config_templ = jinja2.Template(f.read())
+
+        with open(FLASHINFER_CSRC_DIR / "batch_prefill_paged_kernel_inst.jinja") as f:
+            paged_kernel_inst_templ = jinja2.Template(f.read())
+
+        with open(FLASHINFER_CSRC_DIR / "batch_prefill_ragged_kernel_inst.jinja") as f:
+            ragged_kernel_inst_templ = jinja2.Template(f.read())
+
+        kwargs |= {
+            "additional_params_decl": additional_params_decl,
+            "additional_func_params": additional_func_params,
+            "additional_params_setter": additional_params_setter,
+        }
+
+        generated_inc_str = config_templ.render(
+            **kwargs,
+        )
+        os.makedirs(gen_directory, exist_ok=True)
+
+        source_paths = []
+        for mask_mode in [0, 1, 2]:
+            dest_path = (
+                gen_directory / f"batch_prefill_paged_kernel_mask_{mask_mode}.cu"
+            )
+            source_paths.append(dest_path)
+            source = paged_kernel_inst_templ.render(
+                jit=True,
+                mask_mode=mask_mode_literal[mask_mode],
+                **kwargs,
+            )
+            write_if_different(dest_path, source)
+
+            dest_path = (
+                gen_directory / f"batch_prefill_ragged_kernel_mask_{mask_mode}.cu"
+            )
+            source_paths.append(dest_path)
+            source = ragged_kernel_inst_templ.render(
+                jit=True,
+                mask_mode=mask_mode_literal[mask_mode],
+                **kwargs,
+            )
+            write_if_different(dest_path, source)
+
+        for filename in [
+            "batch_prefill.cu",
+            "batch_prefill_jit_pybind.cu",
+        ]:
+            src_path = FLASHINFER_CSRC_DIR / filename
+            dest_path = gen_directory / filename
+            source_paths.append(dest_path)
+            with open(src_path, "r") as f:
+                source = f.read()
+            write_if_different(dest_path, source)
+
+        generated_config_path = gen_directory / "batch_prefill_generated_config.inc"
+        write_if_different(generated_config_path, generated_inc_str)
+        return load_cuda_ops(
+            uri,
+            source_paths,
+        )
+    elif backend == "fa3":
+        gen_directory = FLASHINFER_GEN_SRC_DIR / uri
+        (additional_params_decl, additional_func_params, additional_params_setter) = (
+            generate_additional_params(
+                additional_tensor_names,
+                additional_tensor_dtypes,
+                additional_scalar_names,
+                additional_scalar_dtypes,
+                is_sm90_template=True,
+            )
+        )
+
+        with open(
+            FLASHINFER_CSRC_DIR / "batch_prefill_sm90_customize_config.jinja"
+        ) as f:
+            config_templ = jinja2.Template(f.read())
+
+        with open(
+            FLASHINFER_CSRC_DIR / "batch_prefill_paged_sm90_kernel_inst.jinja"
+        ) as f:
+            paged_kernel_inst_templ = jinja2.Template(f.read())
+
+        with open(
+            FLASHINFER_CSRC_DIR / "batch_prefill_ragged_sm90_kernel_inst.jinja"
+        ) as f:
+            ragged_kernel_inst_templ = jinja2.Template(f.read())
+
+        kwargs |= {
+            "additional_params_decl": additional_params_decl,
+            "additional_func_params": additional_func_params,
+            "additional_params_setter": additional_params_setter,
+        }
+        generated_inc_str = config_templ.render(**kwargs)
+
+        source_paths = []
+        for mask_mode in [0, 1, 2]:
+            filename = f"batch_prefill_paged_sm90_kernel_mask_{mask_mode}.cu"
+            dest_path = gen_directory / filename
+            source_paths.append(dest_path)
+            source = paged_kernel_inst_templ.render(
+                jit=True,
+                mask_mode=mask_mode_literal[mask_mode],
+                **kwargs,
+            )
+            write_if_different(dest_path, source)
+
+            filename = f"batch_prefill_ragged_sm90_kernel_mask_{mask_mode}.cu"
+            dest_path = gen_directory / filename
+            source_paths.append(dest_path)
+            source = ragged_kernel_inst_templ.render(
+                jit=True,
+                mask_mode=mask_mode_literal[mask_mode],
+                **kwargs,
+            )
+            write_if_different(dest_path, source)
+
+        for filename in [
+            "batch_prefill_sm90.cu",
+            "batch_prefill_sm90_jit_pybind.cu",
+        ]:
+            src_path = FLASHINFER_CSRC_DIR / filename
+            dest_path = gen_directory / filename
+            source_paths.append(dest_path)
+            with open(src_path, "r") as f:
+                source = f.read()
+            write_if_different(dest_path, source)
+
+        generated_config_path = (
+            gen_directory / "batch_prefill_sm90_generated_config.inc"
+        )
+        write_if_different(generated_config_path, generated_inc_str)
+        return load_cuda_ops(
+            uri,
+            source_paths,
+            extra_cuda_cflags=["-gencode=arch=compute_90a,code=sm_90a"],
+        )
+    else:
+        raise ValueError(f"Invalid backend: {backend}")

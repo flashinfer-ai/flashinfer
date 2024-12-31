@@ -29,16 +29,16 @@ gen_dir = root / "csrc" / "generated"
 
 head_dims = os.environ.get("FLASHINFER_HEAD_DIMS", "64,128,256").split(",")
 pos_encoding_modes = os.environ.get("FLASHINFER_POS_ENCODING_MODES", "0").split(",")
-allow_fp16_qk_reductions = os.environ.get(
-    "FLASHINFER_ALLOW_FP16_QK_REDUCTION_OPTIONS", "0"
+use_fp16_qk_reductions = os.environ.get(
+    "FLASHINFER_USE_FP16_QK_REDUCTION_OPTIONS", "0"
 ).split(",")
 mask_modes = os.environ.get("FLASHINFER_MASK_MODES", "0,1,2").split(",")
 
 head_dims = list(map(int, head_dims))
 pos_encoding_modes = list(map(int, pos_encoding_modes))
 pos_encoding_modes_sm90 = [mode for mode in pos_encoding_modes if mode != 2]
-allow_fp16_qk_reductions = list(map(int, allow_fp16_qk_reductions))
-allow_fp16_qk_reductions_sm90 = [mode for mode in allow_fp16_qk_reductions if mode != 1]
+use_fp16_qk_reductions = list(map(int, use_fp16_qk_reductions))
+use_fp16_qk_reductions_sm90 = [mode for mode in use_fp16_qk_reductions if mode != 1]
 mask_modes = list(map(int, mask_modes))
 
 enable_aot = os.environ.get("FLASHINFER_ENABLE_AOT", "0") == "1"
@@ -78,7 +78,7 @@ def generate_cuda() -> None:
             path=gen_dir,
             head_dims=head_dims,
             pos_encoding_modes=pos_encoding_modes,
-            allow_fp16_qk_reductions=allow_fp16_qk_reductions,
+            use_fp16_qk_reductions=use_fp16_qk_reductions,
             mask_modes=mask_modes,
             enable_f16=enable_f16,
             enable_bf16=enable_bf16,
@@ -93,7 +93,7 @@ def generate_cuda() -> None:
                 path=gen_dir,
                 head_dims=head_dims,
                 pos_encoding_modes=pos_encoding_modes_sm90,
-                allow_fp16_qk_reductions=allow_fp16_qk_reductions_sm90,
+                use_fp16_qk_reductions=use_fp16_qk_reductions_sm90,
                 mask_modes=mask_modes,
                 enable_f16=enable_f16,
                 enable_bf16=enable_bf16,

@@ -86,7 +86,7 @@ def jit_prefill_attention_func_args(
     pos_encoding_modes,
     use_sliding_window_options,
     use_logits_soft_cap_options,
-    allow_fp16_qk_reduction_options,
+    use_fp16_qk_reduction_options,
 ):
     load_module_func_args = []
 
@@ -97,7 +97,7 @@ def jit_prefill_attention_func_args(
         pos_encoding_mode,
         use_sliding_window,
         use_logits_soft_cap,
-        allow_fp16_qk_reduction,
+        use_fp16_qk_reduction,
     ) in itertools.product(
         q_dtypes,
         kv_dtypes,
@@ -105,7 +105,7 @@ def jit_prefill_attention_func_args(
         pos_encoding_modes,
         use_sliding_window_options,
         use_logits_soft_cap_options,
-        allow_fp16_qk_reduction_options,
+        use_fp16_qk_reduction_options,
     ):
         load_module_func_args.append(
             (
@@ -118,7 +118,7 @@ def jit_prefill_attention_func_args(
                     pos_encoding_mode,
                     use_sliding_window,
                     use_logits_soft_cap,
-                    allow_fp16_qk_reduction,
+                    use_fp16_qk_reduction,
                 ),
             )
         )
@@ -134,7 +134,7 @@ def jit_prefill_attention_func_args(
                     pos_encoding_mode,
                     use_sliding_window,
                     use_logits_soft_cap,
-                    allow_fp16_qk_reduction,
+                    use_fp16_qk_reduction,
                 ),
             )
         )

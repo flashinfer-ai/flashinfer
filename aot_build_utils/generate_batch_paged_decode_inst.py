@@ -18,11 +18,7 @@ import re
 import sys
 from pathlib import Path
 
-from .literal_map import (
-    dtype_literal,
-    idtype_literal,
-    pos_encoding_mode_literal,
-)
+from .literal_map import dtype_literal, idtype_literal, pos_encoding_mode_literal
 
 
 def get_cu_file_str(
@@ -37,24 +33,24 @@ def get_cu_file_str(
 
 namespace flashinfer {{
 
-using ParamsT = BatchDecodeParams<{dtype_q}, {dtype_kv}, {dtype_out}, {idtype}>;
+using Params = BatchDecodeParams<{dtype_q}, {dtype_kv}, {dtype_out}, {idtype}>;
 
-template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{head_dim}, {pos_encoding_mode}, ComposedAttention<ParamsT, get_variant_code(
+template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{head_dim}, {pos_encoding_mode}, DefaultAttention<Params, get_variant_code(
     /*use_custom_mask=*/false, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false)>>(
-    ParamsT params,
+    Params params,
     {dtype_out}* tmp_v, float* tmp_s,
     cudaStream_t stream);
 
-template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{head_dim}, {pos_encoding_mode}, ComposedAttention<ParamsT, get_variant_code(
+template cudaError_t BatchDecodeWithPagedKVCacheDispatched<{head_dim}, {pos_encoding_mode}, DefaultAttention<Params, get_variant_code(
     /*use_custom_mask=*/false, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false)>>(
-    ParamsT params,
+    Params params,
     {dtype_out}* tmp_v, float* tmp_s,
     cudaStream_t stream);
 
 
 using ParamsMlaT = BatchDecodeParamsMLA<{dtype_q}, {dtype_kv}, {dtype_out}, {idtype}>;
 
-template cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA<{head_dim}, {head_dim_kpe}, ComposedAttention<ParamsMlaT, get_variant_code(
+template cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA<{head_dim}, {head_dim_kpe}, DefaultAttention<ParamsMlaT, get_variant_code(
     /*use_custom_mask=*/false, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false)>>(
     ParamsMlaT params,
     {dtype_out}* tmp_v, float* tmp_s,
