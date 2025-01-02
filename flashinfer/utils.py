@@ -262,7 +262,7 @@ def get_cuda_stream(device: torch.device) -> int:
 
 def determine_gemm_backend(device: torch.device) -> str:
     major, _ = get_compute_capability(device)
-    if major >= 9 and torch.version.cuda >= "12.3":
+    if major == 9 and torch.version.cuda >= "12.3":
         return "sm90"
     else:
         return "sm80"
@@ -349,7 +349,7 @@ def determine_attention_backend(
     major, _ = get_compute_capability(device)
 
     if (
-        major >= 9
+        major == 9
         and torch.version.cuda >= "12.3"
         and is_fa3_backend_supported(
             pos_encoding_mode,
