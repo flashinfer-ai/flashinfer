@@ -1226,7 +1226,7 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void SinglePrefillWithKV
         16 * NUM_WARPS_KV * NUM_MMA_KV);
 
     const uint32_t window_iteration =
-        ceil_div(sub_if_greater_or_zero(kv_len + (bx + 1) * num_rows_per_cta,
+        ceil_div(sub_if_greater_or_zero(kv_len + (bx + 1) * num_rows_per_cta / group_size,
                                         qo_len + window_left + chunk_start),
                  (16 * NUM_WARPS_KV * NUM_MMA_KV));
 
@@ -1652,7 +1652,7 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithRag
         16 * NUM_WARPS_KV * NUM_MMA_KV);
 
     const uint32_t window_iteration =
-        ceil_div(sub_if_greater_or_zero(kv_len + (qo_tile_idx + 1) * num_rows_per_cta,
+        ceil_div(sub_if_greater_or_zero(kv_len + (qo_tile_idx + 1) * num_rows_per_cta / group_size,
                                         qo_len + window_left + chunk_start),
                  (16 * NUM_WARPS_KV * NUM_MMA_KV));
 
@@ -1980,7 +1980,7 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPag
         16 * NUM_WARPS_KV * NUM_MMA_KV);
 
     const uint32_t window_iteration =
-        ceil_div(sub_if_greater_or_zero(kv_len + (qo_tile_idx + 1) * num_rows_per_cta,
+        ceil_div(sub_if_greater_or_zero(kv_len + (qo_tile_idx + 1) * num_rows_per_cta / group_size,
                                         qo_len + window_left + chunk_start),
                  (16 * NUM_WARPS_KV * NUM_MMA_KV));
 
