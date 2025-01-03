@@ -689,6 +689,11 @@ def min_p_sampling_from_probs(
     We encourage users to set ``max_rounds`` to a reasonable value, e.g., 32. The actual
     implementation usually use much fewer rounds for rejection sampling because of early stopping.
     """
+    # NOTE(Zihao): for backward compatiblity (https://github.com/flashinfer-ai/flashinfer/pull/713)
+    if uniform_samples.dim() == 2:
+        # Take the first row (round) of uniform_samples
+        uniform_samples = uniform_samples[0]
+
     if check_nan:
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
