@@ -141,3 +141,29 @@ We are thrilled to share that FlashInfer is being adopted by many cutting-edge p
 ## Acknowledgement
 
 FlashInfer is inspired by [FlashAttention 1&2](https://github.com/dao-AILab/flash-attention/), [vLLM](https://github.com/vllm-project/vllm), [stream-K](https://arxiv.org/abs/2301.03598), [cutlass](https://github.com/nvidia/cutlass) and [AITemplate](https://github.com/facebookincubator/AITemplate) projects.
+
+## Citation
+
+If you find FlashInfer helpful in your project or research, please consider citing our [paper](https://arxiv.org/abs/2501.01005):
+
+```bibtex
+@article{ye2025flashinfer,
+    title = {FlashInfer: Efficient and Customizable Attention Engine for LLM Inference Serving},
+    author = {
+      Ye, Zihao and
+      Chen, Lequn and
+      Lai, Ruihang and
+      Lin, Wuwei and
+      Zhang, Yineng and
+      Wang, Stephanie and
+      Chen, Tianqi and
+      Kasikci, Baris and
+      Grover, Vinod and
+      Krishnamurthy, Arvind and
+      Ceze, Luis
+    },
+    journal = {arXiv preprint arXiv:2501.01005},
+    year = {2025},
+    url = {https://arxiv.org/abs/2501.01005}
+}
+```
