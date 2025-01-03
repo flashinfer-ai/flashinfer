@@ -33,6 +33,8 @@ jobs:
             torch: "2.2"
           - cuda: "12.4"
             torch: "2.3"
+          - cuda: "12.1" # torch 2.5+ drops cuda 12.1
+            torch: "2.5"
 
     runs-on: [self-hosted]
     steps:
