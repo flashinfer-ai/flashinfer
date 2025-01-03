@@ -41,7 +41,7 @@ else
 fi
 
 echo "::group::Install PyTorch"
-pip install torch~=${FLASHINFER_CI_TORCH_VERSION}.0 --index-url "https://download.pytorch.org/whl/cu${CUDA_MAJOR}${CUDA_MINOR}"
+pip install torch==${FLASHINFER_CI_TORCH_VERSION}.* --index-url "https://download.pytorch.org/whl/cu${CUDA_MAJOR}${CUDA_MINOR}"
 echo "::endgroup::"
 
 echo "::group::Install build system"
