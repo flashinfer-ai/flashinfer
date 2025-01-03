@@ -459,8 +459,7 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
 __global__ void MinPSamplingFromProbKernel(DType* probs, DType* uniform_samples, DType* min_p_arr,
-                                           IdType* output, bool* success, float min_p_val,
-                                           uint32_t d, uint32_t max_min_p_rounds) {
+                                           IdType* output, float min_p_val, uint32_t d) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   DType p = (min_p_arr == nullptr) ? min_p_val : min_p_arr[bx];
@@ -472,9 +471,6 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
       SamplingTempStorage<DType, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>&>(smem_sampling);
 
   vec_t<DType, VEC_SIZE> probs_vec;
-  DType aggregate;
-  DType q = DType(1);
-  DType pivot = DType(0);
 
   DType max_p = 0;
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
@@ -495,70 +491,49 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
     temp_storage.block_aggregate.max_p = max_p;
   }
   __syncthreads();
-  DType scaled_p = temp_storage.block_aggregate.max_p * p;
+  DType pivot = temp_storage.block_aggregate.max_p * p;
+
+  DType aggregate_gt_pivot = DType(0);
+  for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+    probs_vec.fill(DType(0));
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+      probs_vec.load(probs + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+    }
+
+    DType probs_gt_pivot[VEC_SIZE];
+#pragma unroll
+    for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+      probs_gt_pivot[j] = (probs_vec[j] > pivot) ? probs_vec[j] : DType(0);
+    }
+
+    aggregate_gt_pivot += BlockReduce<DType, BLOCK_THREADS>(temp_storage.block_prim.reduce)
+                              .Sum<VEC_SIZE>(probs_gt_pivot);
+    if (tx == 0) {
+      temp_storage.block_aggregate.value = aggregate_gt_pivot;
+    }
+    __syncthreads();
+  }
+
+  DType aggregate(0);
+  DType q = temp_storage.block_aggregate.value;
 
   IdType sampled_id;
-  for (uint32_t round = 0; round < max_min_p_rounds; ++round) {
-    temp_storage.sampled_id = d - 1;
-    __syncthreads();
-    DType u = uniform_samples[round * batch_size + bx] * q;
-    aggregate = DType(0);
-    for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
-      probs_vec.fill(DType(0));
-      if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-        probs_vec.load(probs + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
-      }
-
-      DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
-                             DETERMINISTIC, DType>(i, d, pivot, u, probs_vec, aggregate,
-                                                   &temp_storage);
-      if (aggregate > u) {
-        break;
-      }
+  temp_storage.sampled_id = d - 1;
+  __syncthreads();
+  DType u = uniform_samples[bx] * q;
+  for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+    probs_vec.fill(DType(0));
+    if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
+      probs_vec.load(probs + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
     }
-    __syncthreads();
-    sampled_id = temp_storage.sampled_id;
-    pivot = max(pivot, probs[bx * d + sampled_id]);
-    if (pivot >= scaled_p) {
+
+    DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, DETERMINISTIC,
+                           DType>(i, d, pivot, u, probs_vec, aggregate, &temp_storage);
+    if (aggregate > u) {
       break;
     }
-
-    DType aggregate_gt_pivot = DType(0);
-    for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
-      probs_vec.fill(DType(0));
-      if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
-        probs_vec.load(probs + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
-      }
-
-      DType probs_gt_pivot[VEC_SIZE];
-#pragma unroll
-      for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-        probs_gt_pivot[j] = (probs_vec[j] > pivot) ? probs_vec[j] : DType(0);
-      }
-
-      aggregate_gt_pivot += BlockReduce<DType, BLOCK_THREADS>(temp_storage.block_prim.reduce)
-                                .Sum<VEC_SIZE>(probs_gt_pivot);
-      if (tx == 0) {
-        temp_storage.block_aggregate.value = aggregate_gt_pivot;
-      }
-      __syncthreads();
-    }
-    q = temp_storage.block_aggregate.value;
   }
-  __syncthreads();
-  if (tx == 0) {
-    output[bx] = sampled_id;
-    if (pivot < scaled_p) {
-      // failed to sample within MAX_ROUNDS
-      if (success != nullptr) {
-        success[bx] = false;
-      }
-    } else {
-      if (success != nullptr) {
-        success[bx] = true;
-      }
-    }
-  }
+  output[bx] = temp_storage.sampled_id;
 }
 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
@@ -749,16 +724,15 @@ cudaError_t TopPSamplingFromProb(T* probs, T* uniform_samples, IdType* output, b
 
 template <typename T, typename IdType>
 cudaError_t MinPSamplingFromProb(T* probs, T* uniform_samples, T* min_p_arr, IdType* output,
-                                 bool* success, uint32_t batch_size, float min_p_val, uint32_t d,
-                                 uint32_t max_rounds, bool deterministic, cudaStream_t stream = 0) {
+                                 uint32_t batch_size, float min_p_val, uint32_t d,
+                                 bool deterministic, cudaStream_t stream = 0) {
   constexpr uint32_t BLOCK_THREADS = 1024;
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   const uint32_t smem_size = sizeof(SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
   dim3 nblks(batch_size);
   dim3 nthrs(BLOCK_THREADS);
-  void* args[] = {&probs,   &uniform_samples, &min_p_arr, &output,
-                  &success, &min_p_val,       &d,         &max_rounds};
+  void* args[] = {&probs, &uniform_samples, &min_p_arr, &output, &min_p_val, &d};
 
   DISPATCH_ALIGNED_VEC_SIZE(
       vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
