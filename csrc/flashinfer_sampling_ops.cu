@@ -27,8 +27,8 @@ void top_k_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at:
                                unsigned int top_k_val, bool deterministic, int64_t cuda_stream);
 
 void min_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
-                               at::Tensor success, std::optional<at::Tensor> maybe_min_p_arr,
-                               double min_p_val, bool deterministic, int64_t cuda_stream);
+                               std::optional<at::Tensor> maybe_min_p_arr, double min_p_val,
+                               bool deterministic, int64_t cuda_stream);
 
 void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples,
                                      at::Tensor samples, at::Tensor success,

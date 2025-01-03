@@ -90,26 +90,25 @@ void top_k_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at:
 }
 
 void min_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
-                               at::Tensor success, std::optional<at::Tensor> maybe_min_p_arr,
-                               double min_p_val, bool deterministic, int64_t cuda_stream) {
+                               std::optional<at::Tensor> maybe_min_p_arr, double min_p_val,
+                               bool deterministic, int64_t cuda_stream) {
   CHECK_INPUT(probs);
   CHECK_INPUT(uniform_samples);
   auto device = probs.device();
   CHECK_EQ(uniform_samples.device(), device);
   CHECK_DIM(2, probs);            // probs: (batch_size, vocab_size)
-  CHECK_DIM(2, uniform_samples);  // uniform_samples: (max_rounds, batch_size)
+  CHECK_DIM(1, uniform_samples);  // uniform_samples: (batch_size)
   unsigned int batch_size = probs.size(0);
   unsigned int vocab_size = probs.size(1);
-  unsigned int max_rounds = uniform_samples.size(0);
-  CHECK_EQ(uniform_samples.size(1), batch_size);
+  CHECK_EQ(uniform_samples.size(0), batch_size);
   bool has_min_p_arr = maybe_min_p_arr.has_value();
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaError_t status = sampling::MinPSamplingFromProb<float, int>(
       static_cast<float*>(probs.data_ptr()), static_cast<float*>(uniform_samples.data_ptr()),
       has_min_p_arr ? static_cast<float*>(maybe_min_p_arr->data_ptr()) : nullptr,
-      static_cast<int*>(samples.data_ptr()), static_cast<bool*>(success.data_ptr()), batch_size,
-      min_p_val, vocab_size, max_rounds, deterministic, stream);
+      static_cast<int*>(samples.data_ptr()), batch_size, min_p_val, vocab_size, deterministic,
+      stream);
   TORCH_CHECK(status == cudaSuccess, "MinPSamplingFromProb failed with error code " +
                                          std::string(cudaGetErrorString(status)));
 }
