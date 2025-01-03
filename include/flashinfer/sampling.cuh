@@ -184,9 +184,9 @@ __device__ __forceinline__ void DeterministicInclusiveSum(
 }
 
 template <uint32_t VEC_SIZE, uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
-          BlockReduceAlgorithm REDUCE_ALGORITHM, bool DETERMINISTIC, typename T>
+          BlockReduceAlgorithm REDUCE_ALGORITHM, bool DETERMINISTIC, typename T, typename Predicate>
 __device__ __forceinline__ void DeviceSamplingFromProb(
-    uint32_t i, uint32_t d, T threshold, T u, vec_t<T, VEC_SIZE> prob_vec, T& aggregate,
+    uint32_t i, uint32_t d, Predicate pred, T u, vec_t<T, VEC_SIZE> prob_vec, T& aggregate,
     SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>* temp_storage) {
   const uint32_t tx = threadIdx.x;
   T prob_greater_than_threshold[VEC_SIZE];
@@ -194,8 +194,8 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
   bool greater_than_u[VEC_SIZE], valid[VEC_SIZE];
 #pragma unroll
   for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-    prob_greater_than_threshold[j] = (prob_vec[j] > threshold) ? prob_vec[j] : T(0);
-    valid[j] = prob_vec[j] > threshold && (i * BLOCK_THREADS + tx) * VEC_SIZE < d;
+    prob_greater_than_threshold[j] = pred(prob_vec[j]) ? prob_vec[j] : T(0);
+    valid[j] = pred(prob_vec[j]) && (i * BLOCK_THREADS + tx) * VEC_SIZE < d;
   }
   T aggregate_local =
       BlockReduce<T, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage->block_prim.reduce)
@@ -219,7 +219,7 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
 
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      greater_than_u[j] = inclusive_cdf[j] + aggregate > u;
+      greater_than_u[j] = (inclusive_cdf[j] + aggregate > u) && valid[j];
     }
 
     bool greater_than_u_diff[VEC_SIZE];
@@ -234,13 +234,8 @@ __device__ __forceinline__ void DeviceSamplingFromProb(
 
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      if (greater_than_u_diff[j] && valid[j]) {
-        if constexpr (DETERMINISTIC) {
-          temp_storage->sampled_id = (i * BLOCK_THREADS + tx) * VEC_SIZE + j;
-        } else {
-          // cub's block scan result might not be monotonic, so we need to find the first element
-          atomicMin(&(temp_storage->sampled_id), (i * BLOCK_THREADS + tx) * VEC_SIZE + j);
-        }
+      if (greater_than_u_diff[j]) {
+        atomicMin(&(temp_storage->sampled_id), (i * BLOCK_THREADS + tx) * VEC_SIZE + j);
       }
     }
     __syncthreads();
@@ -275,7 +270,8 @@ __global__ void SamplingFromProbKernel(DType* probs, DType* uniform_samples, IdT
     }
 
     DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, DETERMINISTIC,
-                           DType>(i, d, DType(0), u, probs_vec, aggregate, &temp_storage);
+                           DType>(
+        i, d, [](DType x) { return x > 0; }, u, probs_vec, aggregate, &temp_storage);
     if (float(aggregate) > u) {
       break;
     }
@@ -316,8 +312,8 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, DType* uniform_samples,
       }
 
       DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
-                             DETERMINISTIC, DType>(i, d, pivot, u, probs_vec, aggregate,
-                                                   &temp_storage);
+                             DETERMINISTIC, DType>(
+          i, d, [&](DType x) { return x > pivot; }, u, probs_vec, aggregate, &temp_storage);
       if (aggregate > u) {
         break;
       }
@@ -404,8 +400,8 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
       }
 
       DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
-                             DETERMINISTIC, DType>(i, d, pivot, u, probs_vec, aggregate,
-                                                   &temp_storage);
+                             DETERMINISTIC, DType>(
+          i, d, [&](DType x) { return x > pivot; }, u, probs_vec, aggregate, &temp_storage);
       if (aggregate > u) {
         break;
       }
@@ -503,7 +499,7 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
     DType probs_gt_pivot[VEC_SIZE];
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      probs_gt_pivot[j] = (probs_vec[j] > pivot) ? probs_vec[j] : DType(0);
+      probs_gt_pivot[j] = (probs_vec[j] >= pivot) ? probs_vec[j] : DType(0);
     }
 
     aggregate_gt_pivot += BlockReduce<DType, BLOCK_THREADS>(temp_storage.block_prim.reduce)
@@ -528,7 +524,8 @@ __global__ void MinPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
     }
 
     DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, DETERMINISTIC,
-                           DType>(i, d, pivot, u, probs_vec, aggregate, &temp_storage);
+                           DType>(
+        i, d, [&](DType x) { return x >= pivot; }, u, probs_vec, aggregate, &temp_storage);
     if (aggregate > u) {
       break;
     }
@@ -571,8 +568,8 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, DType* uniform_samp
       }
 
       DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
-                             DETERMINISTIC, DType>(i, d, pivot, u, probs_vec, aggregate,
-                                                   &temp_storage);
+                             DETERMINISTIC, DType>(
+          i, d, [&](DType x) { return x > pivot; }, u, probs_vec, aggregate, &temp_storage);
       if (aggregate > u) {
         break;
       }
@@ -1324,8 +1321,9 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
     }
 
     DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM, DETERMINISTIC,
-                           DType>(i, d, DType(0), u, relu_q_minus_p_vec, aggregate_relu_q_minus_p,
-                                  &temp_storage);
+                           DType>(
+        i, d, [&](DType x) { return x > 0; }, u, relu_q_minus_p_vec, aggregate_relu_q_minus_p,
+        &temp_storage);
     if (aggregate_relu_q_minus_p > u) {
       break;
     }
