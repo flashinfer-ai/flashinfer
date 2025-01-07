@@ -195,11 +195,13 @@ TEST(FlashInferCorrectnessTest, AppendPagedKVKernelCorrectnessTestBF16) {
 }
 #endif
 
-#ifdef FLASHINFER_ENABLE_FP8
+#ifdef FLASHINFER_ENABLE_FP8_E4M3
 TEST(FlashInferCorrectnessTest, AppendPagedKVKernelCorrectnessTestE4M3) {
   TestAppendPagedKVKernelCorrectness<__nv_fp8_e4m3>();
 }
+#endif
 
+#ifdef FLASHINFER_ENABLE_FP8_E5M2
 TEST(FlashInferCorrectnessTest, AppendPagedKVKernelCorrectnessTestE5M2) {
   TestAppendPagedKVKernelCorrectness<__nv_fp8_e5m2>();
 }

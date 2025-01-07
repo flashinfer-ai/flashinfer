@@ -251,21 +251,24 @@ TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelCorrectnessTestBF16) {
 }
 #endif
 
-#ifdef FLASHINFER_ENABLE_FP8
+#ifdef FLASHINFER_ENABLE_FP8_E4M3
 TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelShortContextCorrectnessE4M3) {
   TestSinglePrefillFP8KernelShortContextCorrectness<__nv_fp8_e4m3>(false);
-}
-TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelShortContextCorrectnessE5M2) {
-  TestSinglePrefillFP8KernelShortContextCorrectness<__nv_fp8_e5m2>(false);
 }
 TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelCorrectnessTestE4M3) {
   TestSinglePrefillFP8KernelCorrectness<__nv_fp8_e4m3>(false);
 }
-TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelCorrectnessTestE5M2) {
-  TestSinglePrefillFP8KernelCorrectness<__nv_fp8_e5m2>(false);
-}
 TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelLongContextCorrectnessE4M3) {
   TestSinglePrefillFP8KernelLongContextCorrectness<__nv_fp8_e4m3>(false);
+}
+#endif
+
+#ifdef FLASHINFER_ENABLE_FP8_E5M2
+TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelShortContextCorrectnessE5M2) {
+  TestSinglePrefillFP8KernelShortContextCorrectness<__nv_fp8_e5m2>(false);
+}
+TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelCorrectnessTestE5M2) {
+  TestSinglePrefillFP8KernelCorrectness<__nv_fp8_e5m2>(false);
 }
 TEST(FlashInferCorrectnessTest, TestSinglePrefillKernelLongContextCorrectnessE5M2) {
   TestSinglePrefillFP8KernelLongContextCorrectness<__nv_fp8_e5m2>(false);
