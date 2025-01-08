@@ -37,14 +37,19 @@ def get_sm90_instantiation_cu(args: argparse.Namespace) -> List[str]:
     pos_encoding_modes: List[int] = args.pos_encoding_modes
     allow_fp16_qk_reductions: List[int] = args.allow_fp16_qk_reductions
     mask_modes: List[int] = args.mask_modes
+    enable_f16: bool = args.enable_f16
     enable_bf16: bool = args.enable_bf16
 
     path.mkdir(parents=True, exist_ok=True)
 
     idtypes = ["i32"]
-    prefill_dtypes = ["f16"]
-    decode_dtypes = ["f16"]
-    fp16_dtypes = ["f16"]
+    prefill_dtypes = []
+    decode_dtypes = []
+    fp16_dtypes = []
+    if enable_f16:
+        prefill_dtypes.append("f16")
+        decode_dtypes.append("f16")
+        fp16_dtypes.append("f16")
     if enable_bf16:
         prefill_dtypes.append("bf16")
         decode_dtypes.append("bf16")
@@ -183,18 +188,18 @@ if __name__ == "__main__":
         help="Mask modes",
     )
     parser.add_argument(
+        "--enable_f16",
+        type=lambda x: x if isinstance(x, int) else x.lower() == "true",
+        required=True,
+        nargs="+",
+        help="Enable f16",
+    )
+    parser.add_argument(
         "--enable_bf16",
         type=lambda x: x if isinstance(x, int) else x.lower() == "true",
         required=True,
         nargs="+",
         help="Enable bf16",
-    )
-    parser.add_argument(
-        "--enable_fp8",
-        type=lambda x: x if isinstance(x, int) else x.lower() == "true",
-        default=True,
-        nargs="+",
-        help="Enable fp8",
     )
     args = parser.parse_args()
     get_sm90_instantiation_cu(args)

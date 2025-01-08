@@ -14,60 +14,79 @@
  * limitations under the License.
  */
 #pragma once
-// NOTE(Zihao): only include minimal headers to accelerate compilation
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
+
 #include <torch/csrc/utils/pybind.h>
 
 #ifdef FLASHINFER_ENABLE_BF16
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(pytorch_dtype, c_type, ...)                 \
-  [&]() -> bool {                                                                        \
-    switch (pytorch_dtype) {                                                             \
-      case at::ScalarType::Half: {                                                       \
-        using c_type = nv_half;                                                          \
-        return __VA_ARGS__();                                                            \
-      }                                                                                  \
-      case at::ScalarType::BFloat16: {                                                   \
-        using c_type = nv_bfloat16;                                                      \
-        return __VA_ARGS__();                                                            \
-      }                                                                                  \
-      default:                                                                           \
-        std::ostringstream oss;                                                          \
-        oss << __PRETTY_FUNCTION__ << " failed to dispatch data type " << pytorch_dtype; \
-        TORCH_CHECK(false, oss.str());                                                   \
-        return false;                                                                    \
-    }                                                                                    \
-  }()
-#else
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(pytorch_dtype, c_type, ...)                 \
-  [&]() -> bool {                                                                        \
-    switch (pytorch_dtype) {                                                             \
-      case at::ScalarType::Half: {                                                       \
-        using c_type = nv_half;                                                          \
-        return __VA_ARGS__();                                                            \
-      }                                                                                  \
-      default:                                                                           \
-        std::ostringstream oss;                                                          \
-        oss << __PRETTY_FUNCTION__ << " failed to dispatch data type " << pytorch_dtype; \
-        TORCH_CHECK(false, oss.str());                                                   \
-        return false;                                                                    \
-    }                                                                                    \
-  }()
+#include <cuda_bf16.h>
 #endif
 
-#ifdef FLASHINFER_ENABLE_FP8
+#ifdef FLASHINFER_ENABLE_F16
+#include <cuda_fp16.h>
+#endif
+
+#if defined(FLASHINFER_ENABLE_FP8_E4M3) || defined(FLASHINFER_ENABLE_FP8_E5M2)
+#include <cuda_fp8.h>
+#endif
+
+#ifdef FLASHINFER_ENABLE_F16
+#define _DISPATCH_CASE_F16(c_type, ...) \
+  case at::ScalarType::Half: {          \
+    using c_type = nv_half;             \
+    return __VA_ARGS__();               \
+  }
+#else
+#define _DISPATCH_CASE_F16(c_type, ...)
+#endif
+
+#ifdef FLASHINFER_ENABLE_BF16
+#define _DISPATCH_CASE_BF16(c_type, ...) \
+  case at::ScalarType::BFloat16: {       \
+    using c_type = nv_bfloat16;          \
+    return __VA_ARGS__();                \
+  }
+#else
+#define _DISPATCH_CASE_BF16(c_type, ...)
+#endif
+
+#ifdef FLASHINFER_ENABLE_FP8_E4M3
+#define _DISPATCH_CASE_FP8_E4M3(c_type, ...) \
+  case at::ScalarType::Float8_e4m3fn: {      \
+    using c_type = __nv_fp8_e4m3;            \
+    return __VA_ARGS__();                    \
+  }
+#else
+#define _DISPATCH_CASE_FP8_E4M3(c_type, ...)
+#endif
+
+#ifdef FLASHINFER_ENABLE_FP8_E5M2
+#define _DISPATCH_CASE_FP8_E5M2(c_type, ...) \
+  case at::ScalarType::Float8_e5m2: {        \
+    using c_type = __nv_fp8_e5m2;            \
+    return __VA_ARGS__();                    \
+  }
+#else
+#define _DISPATCH_CASE_FP8_E5M2(c_type, ...)
+#endif
+
+#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(pytorch_dtype, c_type, ...)                 \
+  [&]() -> bool {                                                                        \
+    switch (pytorch_dtype) {                                                             \
+      _DISPATCH_CASE_F16(c_type, __VA_ARGS__)                                            \
+      _DISPATCH_CASE_BF16(c_type, __VA_ARGS__)                                           \
+      default:                                                                           \
+        std::ostringstream oss;                                                          \
+        oss << __PRETTY_FUNCTION__ << " failed to dispatch data type " << pytorch_dtype; \
+        TORCH_CHECK(false, oss.str());                                                   \
+        return false;                                                                    \
+    }                                                                                    \
+  }()
+
 #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(pytorch_dtype, c_type, ...)                      \
   [&]() -> bool {                                                                            \
     switch (pytorch_dtype) {                                                                 \
-      case at::ScalarType::Float8_e4m3fn: {                                                  \
-        using c_type = __nv_fp8_e4m3;                                                        \
-        return __VA_ARGS__();                                                                \
-      }                                                                                      \
-      case at::ScalarType::Float8_e5m2: {                                                    \
-        using c_type = __nv_fp8_e5m2;                                                        \
-        return __VA_ARGS__();                                                                \
-      }                                                                                      \
+      _DISPATCH_CASE_FP8_E4M3(c_type, __VA_ARGS__)                                           \
+      _DISPATCH_CASE_FP8_E5M2(c_type, __VA_ARGS__)                                           \
       default:                                                                               \
         std::ostringstream oss;                                                              \
         oss << __PRETTY_FUNCTION__ << " failed to dispatch fp8 data type " << pytorch_dtype; \
@@ -75,36 +94,14 @@
         return false;                                                                        \
     }                                                                                        \
   }()
-#else
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP8(pytorch_dtype, c_type, ...)                  \
-  [&]() -> bool {                                                                        \
-    std::ostringstream oss;                                                              \
-    oss << __PRETTY_FUNCTION__ << " failed to dispatch fp8 data type " << pytorch_dtype; \
-    TORCH_CHECK(false, oss.str());                                                       \
-    return false;                                                                        \
-  }()
-#endif
 
-#if defined(FLASHINFER_ENABLE_BF16) && defined(FLASHINFER_ENABLE_FP8)
 #define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...)                      \
   [&]() -> bool {                                                                        \
     switch (pytorch_dtype) {                                                             \
-      case at::ScalarType::Half: {                                                       \
-        using c_type = nv_half;                                                          \
-        return __VA_ARGS__();                                                            \
-      }                                                                                  \
-      case at::ScalarType::BFloat16: {                                                   \
-        using c_type = nv_bfloat16;                                                      \
-        return __VA_ARGS__();                                                            \
-      }                                                                                  \
-      case at::ScalarType::Float8_e4m3fn: {                                              \
-        using c_type = __nv_fp8_e4m3;                                                    \
-        return __VA_ARGS__();                                                            \
-      }                                                                                  \
-      case at::ScalarType::Float8_e5m2: {                                                \
-        using c_type = __nv_fp8_e5m2;                                                    \
-        return __VA_ARGS__();                                                            \
-      }                                                                                  \
+      _DISPATCH_CASE_F16(c_type, __VA_ARGS__)                                            \
+      _DISPATCH_CASE_BF16(c_type, __VA_ARGS__)                                           \
+      _DISPATCH_CASE_FP8_E4M3(c_type, __VA_ARGS__)                                       \
+      _DISPATCH_CASE_FP8_E5M2(c_type, __VA_ARGS__)                                       \
       default:                                                                           \
         std::ostringstream oss;                                                          \
         oss << __PRETTY_FUNCTION__ << " failed to dispatch data type " << pytorch_dtype; \
@@ -112,64 +109,6 @@
         return false;                                                                    \
     }                                                                                    \
   }()
-#elif defined(FLASHINFER_ENABLE_BF16)
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...)                      \
-  [&]() -> bool {                                                                        \
-    switch (pytorch_dtype) {                                                             \
-      case at::ScalarType::Half: {                                                       \
-        using c_type = nv_half;                                                          \
-        return __VA_ARGS__();                                                            \
-      }                                                                                  \
-      case at::ScalarType::BFloat16: {                                                   \
-        using c_type = nv_bfloat16;                                                      \
-        return __VA_ARGS__();                                                            \
-      }                                                                                  \
-      default:                                                                           \
-        std::ostringstream oss;                                                          \
-        oss << __PRETTY_FUNCTION__ << " failed to dispatch data type " << pytorch_dtype; \
-        TORCH_CHECK(false, oss.str());                                                   \
-        return false;                                                                    \
-    }                                                                                    \
-  }()
-#elif defined(FLASHINFER_ENABLE_FP8)
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...)                          \
-  [&]() -> bool {                                                                            \
-    switch (pytorch_dtype) {                                                                 \
-      case at::ScalarType::Half: {                                                           \
-        using c_type = nv_half;                                                              \
-        return __VA_ARGS__();                                                                \
-      }                                                                                      \
-      case at::ScalarType::Float8_e4m3fn: {                                                  \
-        using c_type = __nv_fp8_e4m3;                                                        \
-        return __VA_ARGS__();                                                                \
-      }                                                                                      \
-      case at::ScalarType::Float8_e5m2: {                                                    \
-        using c_type = __nv_fp8_e5m2;                                                        \
-        return __VA_ARGS__();                                                                \
-      }                                                                                      \
-      default:                                                                               \
-        std::ostringstream oss;                                                              \
-        oss << __PRETTY_FUNCTION__ << " failed to dispatch fp8 data type " << pytorch_dtype; \
-        TORCH_CHECK(false, oss.str());                                                       \
-        return false;                                                                        \
-    }                                                                                        \
-  }()
-#else
-#define DISPATCH_PYTORCH_DTYPE_TO_CTYPE(pytorch_dtype, c_type, ...)                      \
-  [&]() -> bool {                                                                        \
-    switch (pytorch_dtype) {                                                             \
-      case at::ScalarType::Half: {                                                       \
-        using c_type = nv_half;                                                          \
-        return __VA_ARGS__();                                                            \
-      }                                                                                  \
-      default:                                                                           \
-        std::ostringstream oss;                                                          \
-        oss << __PRETTY_FUNCTION__ << " failed to dispatch data type " << pytorch_dtype; \
-        TORCH_CHECK(false, oss.str());                                                   \
-        return false;                                                                    \
-    }                                                                                    \
-  }()
-#endif
 
 #define _DISPATCH_SWITCH(var_name, cond, ...)                                           \
   [&]() -> bool {                                                                       \

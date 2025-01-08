@@ -456,7 +456,6 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           typename DType, typename IdType>
 __global__ void MinPSamplingFromProbKernel(DType* probs, DType* uniform_samples, DType* min_p_arr,
                                            IdType* output, float min_p_val, uint32_t d) {
-  const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   DType p = (min_p_arr == nullptr) ? min_p_val : min_p_arr[bx];
 

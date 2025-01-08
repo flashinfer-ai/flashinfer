@@ -24,6 +24,12 @@ endif()
 # options. Alernatively, use cmake -DOPTION=VALUE through command-line.
 flashinfer_option(FLASHINFER_ENABLE_FP8
                   "Whether to compile fp8 kernels or not." ON)
+flashinfer_option(FLASHINFER_ENABLE_FP8_E4M3
+                  "Whether to compile fp8_e4m3 kernels or not." ON)
+flashinfer_option(FLASHINFER_ENABLE_FP8_E5M2
+                  "Whether to compile fp8_e5m2 kernels or not." ON)
+flashinfer_option(FLASHINFER_ENABLE_F16
+                  "Whether to compile f16 kernels or not." ON)
 flashinfer_option(FLASHINFER_ENABLE_BF16
                   "Whether to compile bf16 kernels or not." ON)
 flashinfer_option(
@@ -98,9 +104,19 @@ find_package(Thrust REQUIRED)
 set(FLASHINFER_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/include)
 
 if(FLASHINFER_ENABLE_FP8)
-  message(STATUS "Compile fp8 kernels.")
-  add_definitions(-DFLASHINFER_ENABLE_FP8)
+  set(FLASHINFER_ENABLE_FP8_E4M3 ON)
+  set(FLASHINFER_ENABLE_FP8_E5M2 ON)
 endif(FLASHINFER_ENABLE_FP8)
+
+if(FLASHINFER_ENABLE_FP8_E4M3)
+  message(STATUS "Compile fp8_e4m3 kernels.")
+  add_definitions(-DFLASHINFER_ENABLE_FP8_E4M3)
+endif(FLASHINFER_ENABLE_FP8_E4M3)
+
+if(FLASHINFER_ENABLE_FP8_E5M2)
+  message(STATUS "Compile fp8_e5m2 kernels.")
+  add_definitions(-DFLASHINFER_ENABLE_FP8_E5M2)
+endif(FLASHINFER_ENABLE_FP8_E5M2)
 
 if(FLASHINFER_ENABLE_BF16)
   message(STATUS "Compile bf16 kernels.")
@@ -130,8 +146,10 @@ set(AOT_GENERATE_COMMAND
   --pos_encoding_modes ${POS_ENCODING_MODES}
   --allow_fp16_qk_reductions ${ALLOW_FP16_QK_REDUCTIONS}
   --mask_modes ${MASK_MODES}
+  --enable_f16 ${FLASHINFER_ENABLE_F16}
   --enable_bf16 ${FLASHINFER_ENABLE_BF16}
-  --enable_fp8 ${FLASHINFER_ENABLE_FP8})
+  --enable_fp8_e4m3 ${FLASHINFER_ENABLE_FP8_E4M3}
+  --enable_fp8_e5m2 ${FLASHINFER_ENABLE_FP8_E5M2})
 
 execute_process(
   COMMAND ${AOT_GENERATE_COMMAND}

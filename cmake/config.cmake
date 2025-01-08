@@ -1,5 +1,6 @@
 # Whether to compile fp8 kernels or not.
-set(FLASHINFER_ENABLE_FP8 ON)
+set(FLASHINFER_ENABLE_FP8_E4M3 ON)
+set(FLASHINFER_ENABLE_FP8_E5M2 ON)
 # Whether to compile bf16 kernels or not.
 set(FLASHINFER_ENABLE_BF16 ON)
 # Whether to compile tvm bindings or not.

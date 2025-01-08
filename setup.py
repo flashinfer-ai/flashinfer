@@ -42,8 +42,11 @@ allow_fp16_qk_reductions_sm90 = [mode for mode in allow_fp16_qk_reductions if mo
 mask_modes = list(map(int, mask_modes))
 
 enable_aot = os.environ.get("FLASHINFER_ENABLE_AOT", "0") == "1"
+enable_f16 = os.environ.get("FLASHINFER_ENABLE_F16", "1") == "1"
 enable_bf16 = os.environ.get("FLASHINFER_ENABLE_BF16", "1") == "1"
 enable_fp8 = os.environ.get("FLASHINFER_ENABLE_FP8", "1") == "1"
+enable_fp8_e4m3 = os.environ.get("FLASHINFER_ENABLE_FP8_E4M3", "1" if enable_fp8 else "0") == "1"
+enable_fp8_e5m2 = os.environ.get("FLASHINFER_ENABLE_FP8_E5M2", "1" if enable_fp8 else "0") == "1"
 enable_sm90 = os.environ.get("FLASHINFER_ENABLE_SM90", "1") == "1"
 
 
@@ -77,8 +80,10 @@ def generate_cuda() -> None:
             pos_encoding_modes=pos_encoding_modes,
             allow_fp16_qk_reductions=allow_fp16_qk_reductions,
             mask_modes=mask_modes,
+            enable_f16=enable_f16,
             enable_bf16=enable_bf16,
-            enable_fp8=enable_fp8,
+            enable_fp8_e4m3=enable_fp8_e4m3,
+            enable_fp8_e5m2=enable_fp8_e5m2,
         )
     )
 
@@ -90,6 +95,7 @@ def generate_cuda() -> None:
                 pos_encoding_modes=pos_encoding_modes_sm90,
                 allow_fp16_qk_reductions=allow_fp16_qk_reductions_sm90,
                 mask_modes=mask_modes,
+                enable_f16=enable_f16,
                 enable_bf16=enable_bf16,
             )
         )
@@ -145,10 +151,14 @@ if enable_aot:
     aot_build_meta["TORCH_CUDA_ARCH_LIST"] = os.environ.get("TORCH_CUDA_ARCH_LIST")
     generate_build_meta(aot_build_meta)
 
+    if enable_f16:
+        torch_cpp_ext.COMMON_NVCC_FLAGS.append("-DFLASHINFER_ENABLE_F16")
     if enable_bf16:
         torch_cpp_ext.COMMON_NVCC_FLAGS.append("-DFLASHINFER_ENABLE_BF16")
-    if enable_fp8:
-        torch_cpp_ext.COMMON_NVCC_FLAGS.append("-DFLASHINFER_ENABLE_FP8")
+    if enable_fp8_e4m3:
+        torch_cpp_ext.COMMON_NVCC_FLAGS.append("-DFLASHINFER_ENABLE_FP8_E4M3")
+    if enable_fp8_e5m2:
+        torch_cpp_ext.COMMON_NVCC_FLAGS.append("-DFLASHINFER_ENABLE_FP8_E5M2")
 
     for flag in [
         "-D__CUDA_NO_HALF_OPERATORS__",

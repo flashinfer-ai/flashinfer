@@ -108,10 +108,13 @@ TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestBF16) {
 }
 #endif
 
-#ifdef FLASHINFER_ENABLE_FP8
+#ifdef FLASHINFER_ENABLE_FP8_E4M3
 TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestE4M3) {
   TestSingleDecodeKernelCorrectness<half, __nv_fp8_e4m3>();
 }
+#endif
+
+#ifdef FLASHINFER_ENABLE_FP8_E5M2
 TEST(FlashInferCorrectnessTest, SingleDecodeKernelCorrectnessTestE5M2) {
   TestSingleDecodeKernelCorrectness<half, __nv_fp8_e5m2>();
 }

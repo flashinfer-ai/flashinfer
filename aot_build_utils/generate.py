@@ -40,8 +40,10 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
     pos_encoding_modes: List[int] = args.pos_encoding_modes
     allow_fp16_qk_reductions: List[int] = args.allow_fp16_qk_reductions
     mask_modes: List[int] = args.mask_modes
+    enable_f16: bool = args.enable_f16
     enable_bf16: bool = args.enable_bf16
-    enable_fp8: bool = args.enable_fp8
+    enable_fp8_e4m3: bool = args.enable_fp8_e4m3
+    enable_fp8_e5m2: bool = args.enable_fp8_e5m2
 
     path.mkdir(parents=True, exist_ok=True)
 
@@ -59,16 +61,24 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
     )
 
     idtypes = ["i32"]
-    prefill_dtypes = ["f16"]
-    decode_dtypes = ["f16"]
-    fp16_dtypes = ["f16"]
-    fp8_dtypes = ["e4m3", "e5m2"]
+    prefill_dtypes = []
+    decode_dtypes = []
+    fp16_dtypes = []
+    fp8_dtypes = []
+    if enable_f16:
+        prefill_dtypes.append("f16")
+        decode_dtypes.append("f16")
+        fp16_dtypes.append("f16")
     if enable_bf16:
         prefill_dtypes.append("bf16")
         decode_dtypes.append("bf16")
         fp16_dtypes.append("bf16")
-    if enable_fp8:
-        decode_dtypes.extend(fp8_dtypes)
+    if enable_fp8_e4m3:
+        fp8_dtypes.extend(["e4m3"])
+        decode_dtypes.extend(["e4m3"])
+    if enable_fp8_e5m2:
+        fp8_dtypes.extend(["e5m2"])
+        decode_dtypes.extend(["e5m2"])
 
     single_decode_uris = []
     # single decode files
@@ -277,6 +287,13 @@ if __name__ == "__main__":
         help="Mask modes",
     )
     parser.add_argument(
+        "--enable_fp16",
+        type=lambda x: x if isinstance(x, int) else x.lower() == "true",
+        required=True,
+        nargs="+",
+        help="Enable fp16",
+    )
+    parser.add_argument(
         "--enable_bf16",
         type=lambda x: x if isinstance(x, int) else x.lower() == "true",
         required=True,
@@ -284,11 +301,18 @@ if __name__ == "__main__":
         help="Enable bf16",
     )
     parser.add_argument(
-        "--enable_fp8",
+        "--enable_fp8_e4m3",
         type=lambda x: x if isinstance(x, int) else x.lower() == "true",
         default=True,
         nargs="+",
-        help="Enable fp8",
+        help="Enable fp8_e4m3",
+    )
+    parser.add_argument(
+        "--enable_fp8_e5m2",
+        type=lambda x: x if isinstance(x, int) else x.lower() == "true",
+        default=True,
+        nargs="+",
+        help="Enable fp8_e5m2",
     )
     args = parser.parse_args()
     get_instantiation_cu(args)

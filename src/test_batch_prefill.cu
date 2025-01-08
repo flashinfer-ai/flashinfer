@@ -787,19 +787,24 @@ TEST(FlashInferCorrectnessTest, BatchRaggedPrefillTestFP16QKHalfAccum) {
   TestBatchRaggedPrefillKernelCorrectness<half>(true);
 }
 
-#ifdef FLASHINFER_ENABLE_FP8
+#ifdef FLASHINFER_ENABLE_FP8_E4M3
 
 TEST(FlashInferCorrectnessTest, BatchPagedPrefillShortContextTestE4M3) {
   TestBatchPagedPrefillFP8KernelShortContextCorrectness<__nv_fp8_e4m3>(false);
 }
 
+TEST(FlashInferCorrectnessTest, BatchPagedPrefillLongContextTestE4M3) {
+  TestBatchPagedPrefillFP8KernelLongContextCorrectness<__nv_fp8_e4m3>(false);
+}
+
+#endif
+
+#ifdef FLASHINFER_ENABLE_FP8_E5M2
+
 TEST(FlashInferCorrectnessTest, BatchPagedPrefillShortContextTestE5M2) {
   TestBatchPagedPrefillFP8KernelShortContextCorrectness<__nv_fp8_e5m2>(false);
 }
 
-TEST(FlashInferCorrectnessTest, BatchPagedPrefillLongContextTestE4M3) {
-  TestBatchPagedPrefillFP8KernelLongContextCorrectness<__nv_fp8_e4m3>(false);
-}
 
 TEST(FlashInferCorrectnessTest, BatchPagedPrefillLongContextTestE5M2) {
   TestBatchPagedPrefillFP8KernelLongContextCorrectness<__nv_fp8_e5m2>(false);
