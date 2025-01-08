@@ -19,7 +19,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
+from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_kernels_aux, load_cuda_ops
 from .utils import get_cuda_stream, register_custom_op, register_fake_op
 
 _sampling_module = None
@@ -28,10 +28,10 @@ _sampling_module = None
 def get_sampling_module():
     global _sampling_module
     if _sampling_module is None:
-        if has_prebuilt_ops:
-            from . import _kernels
+        if has_prebuilt_kernels_aux:
+            from . import _kernels_aux
 
-            module = _kernels
+            module = _kernels_aux
         else:
             module = load_cuda_ops(
                 "sampling",

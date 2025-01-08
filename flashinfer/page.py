@@ -20,7 +20,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
+from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_kernels_aux, load_cuda_ops
 from .utils import (
     TensorLayout,
     _check_kv_layout,
@@ -36,10 +36,10 @@ _page_module = None
 def get_page_module():
     global _page_module
     if _page_module is None:
-        if has_prebuilt_ops:
-            from . import _kernels
+        if has_prebuilt_kernels_aux:
+            from . import _kernels_aux
 
-            _page_module = _kernels
+            _page_module = _kernels_aux
         else:
             _page_module = load_cuda_ops(
                 "page",

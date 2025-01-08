@@ -7,7 +7,7 @@ import flashinfer
 
 @pytest.fixture(autouse=True, scope="module")
 def warmup_jit():
-    if flashinfer.jit.has_prebuilt_ops:
+    if flashinfer.jit.has_prebuilt_kernels:
         yield
     else:
         try:

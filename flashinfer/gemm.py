@@ -21,7 +21,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
+from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_kernels_aux, has_prebuilt_kernels_sm90, load_cuda_ops
 from .utils import (
     _get_cache_buf,
     determine_gemm_backend,
@@ -38,10 +38,10 @@ _gemm_module_sm90 = None
 def get_gemm_module():
     global _gemm_module
     if _gemm_module is None:
-        if has_prebuilt_ops:
-            from . import _kernels
+        if has_prebuilt_kernels_aux:
+            from . import _kernels_aux
 
-            module = _kernels
+            module = _kernels_aux
         else:
             module = load_cuda_ops(
                 "gemm",
@@ -148,7 +148,7 @@ def get_gemm_module():
 def get_gemm_sm90_module():
     global _gemm_module_sm90
     if _gemm_module_sm90 is None:
-        if has_prebuilt_ops:
+        if has_prebuilt_kernels_sm90:
             from . import _kernels_sm90
 
             module = _kernels_sm90

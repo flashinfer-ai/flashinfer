@@ -48,6 +48,7 @@ enable_fp8 = os.environ.get("FLASHINFER_ENABLE_FP8", "1") == "1"
 enable_fp8_e4m3 = os.environ.get("FLASHINFER_ENABLE_FP8_E4M3", "1" if enable_fp8 else "0") == "1"
 enable_fp8_e5m2 = os.environ.get("FLASHINFER_ENABLE_FP8_E5M2", "1" if enable_fp8 else "0") == "1"
 enable_sm90 = os.environ.get("FLASHINFER_ENABLE_SM90", "1") == "1"
+enable_aux = os.environ.get("FLASHINFER_ENABLE_AUX", "1") == "1"
 
 
 def get_version():
@@ -191,6 +192,13 @@ if enable_aot:
     ]
     sm90a_flags = "-gencode arch=compute_90a,code=sm_90a".split()
     kernel_sources = [
+        "csrc/batch_decode.cu",
+        "csrc/batch_prefill.cu",
+        "csrc/single_decode.cu",
+        "csrc/single_prefill.cu",
+        "csrc/flashinfer_ops.cu",
+    ]
+    kernel_aux_sources = [
         "csrc/bmm_fp8.cu",
         "csrc/cascade.cu",
         "csrc/group_gemm.cu",
@@ -201,11 +209,7 @@ if enable_aot:
         "csrc/sampling.cu",
         "csrc/renorm.cu",
         "csrc/activation.cu",
-        "csrc/batch_decode.cu",
-        "csrc/batch_prefill.cu",
-        "csrc/single_decode.cu",
-        "csrc/single_prefill.cu",
-        "csrc/flashinfer_ops.cu",
+        "csrc/flashinfer_ops_aux.cu",
     ]
     kernel_sm90_sources = [
         "csrc/group_gemm_sm90.cu",
@@ -238,6 +242,18 @@ if enable_aot:
                 extra_compile_args={
                     "cxx": cxx_flags,
                     "nvcc": nvcc_flags + sm90a_flags,
+                },
+            ),
+        ]
+    if enable_aux:
+        ext_modules += [
+            torch_cpp_ext.CUDAExtension(
+                name="flashinfer._kernels_aux",
+                sources=kernel_aux_sources,
+                include_dirs=include_dirs,
+                extra_compile_args={
+                    "cxx": cxx_flags,
+                    "nvcc": nvcc_flags,
                 },
             ),
         ]
