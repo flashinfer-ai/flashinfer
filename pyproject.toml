@@ -13,7 +13,7 @@
 # limitations under the License.
 
 [project]
-name = "flashinfer"
+name = "flashinfer-python"
 description = "FlashInfer: Kernel Library for LLM Serving"
 requires-python = ">=3.8,<4.0"
 authors = [{ name = "FlashInfer team" }]
