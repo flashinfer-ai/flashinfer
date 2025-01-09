@@ -18,7 +18,7 @@ from types import SimpleNamespace
 
 import torch
 
-from .jit import gen_act_and_mul_module, has_prebuilt_ops, load_cuda_ops
+from .jit import gen_act_and_mul_module, has_prebuilt_kernels_aux, load_cuda_ops
 from .utils import get_cuda_stream, register_custom_op, register_fake_op
 
 silu_def_cu_str = r"""
@@ -55,10 +55,10 @@ _jit_modules = {}
 def get_act_and_mul_module(act_func_name: str):
     global _jit_modules
     if act_func_name not in _jit_modules:
-        if has_prebuilt_ops:
-            from . import _kernels  # type: ignore[attr-defined]
+        if has_prebuilt_kernels_aux:
+            from . import _kernels_aux  # type: ignore[attr-defined]
 
-            module = _kernels
+            module = _kernels_aux
         else:
             module = gen_act_and_mul_module(
                 act_func_name, act_func_def_str[act_func_name]

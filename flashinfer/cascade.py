@@ -19,7 +19,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from .decode import BatchDecodeWithPagedKVCacheWrapper
-from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
+from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_kernels_aux, load_cuda_ops
 from .prefill import BatchPrefillWithPagedKVCacheWrapper, single_prefill_with_kv_cache
 from .utils import get_cuda_stream, register_custom_op, register_fake_op
 
@@ -29,10 +29,10 @@ _cascade_module = None
 def get_cascade_module():
     global _cascade_module
     if _cascade_module is None:
-        if has_prebuilt_ops:
-            from . import _kernels
+        if has_prebuilt_kernels_aux:
+            from . import _kernels_aux
 
-            _cascade_module = _kernels
+            _cascade_module = _kernels_aux
         else:
             _cascade_module = load_cuda_ops(
                 "cascade",

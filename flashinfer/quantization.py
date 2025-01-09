@@ -18,7 +18,7 @@ from typing import Tuple
 
 import torch
 
-from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
+from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_kernels_aux, load_cuda_ops
 from .utils import get_cuda_stream, register_custom_op, register_fake_op
 
 _quantization_module = None
@@ -27,10 +27,10 @@ _quantization_module = None
 def get_quantization_module():
     global _quantization_module
     if _quantization_module is None:
-        if has_prebuilt_ops:
-            from . import _kernels
+        if has_prebuilt_kernels_aux:
+            from . import _kernels_aux
 
-            _quantization_module = _kernels
+            _quantization_module = _kernels_aux
         else:
             _quantization_module = load_cuda_ops(
                 "quantization",

@@ -28,7 +28,7 @@ from .jit import (
     get_batch_decode_mla_uri,
     get_batch_decode_uri,
     get_single_decode_uri,
-    has_prebuilt_ops,
+    has_prebuilt_kernels,
     prebuilt_ops_uri,
 )
 from .prefill import get_batch_prefill_module, get_single_prefill_module
@@ -58,7 +58,7 @@ def get_single_decode_module(*args):
     global _single_decode_modules
     if args not in _single_decode_modules:
         uri = get_single_decode_uri(*args)
-        if has_prebuilt_ops and uri in prebuilt_ops_uri:
+        if has_prebuilt_kernels and uri in prebuilt_ops_uri:
             from . import _kernels
 
             run_func = _kernels.single_decode_with_kv_cache
@@ -126,7 +126,7 @@ def get_batch_decode_module(*args):
     global _batch_decode_modules
     if args not in _batch_decode_modules:
         uri = get_batch_decode_uri(*args)
-        if has_prebuilt_ops and uri in prebuilt_ops_uri:
+        if has_prebuilt_kernels and uri in prebuilt_ops_uri:
             from . import _kernels
 
             # NOTE(Zihao): we should avoid hard-coded index like this, refactor it later

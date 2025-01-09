@@ -43,8 +43,23 @@ from .env import *
 from .utils import parallel_load_modules as parallel_load_modules
 
 try:
-    from .. import _kernels, _kernels_sm90
+    from .. import _kernels
 
-    has_prebuilt_ops = True
-except ImportError:
-    has_prebuilt_ops = False
+    has_prebuilt_kernels = True
+except ImportError as exn:
+    print(type(exn))
+    has_prebuilt_kernels = False
+
+try:
+    from .. import _kernels_sm90
+
+    has_prebuilt_kernels_sm90 = True
+except ImportError as exn:
+    has_prebuilt_kernels_sm90 = False
+
+try:
+    from .. import _kernels_aux
+
+    has_prebuilt_kernels_aux = True
+except ImportError as exn:
+    has_prebuilt_kernels_aux = False
