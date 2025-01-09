@@ -96,12 +96,13 @@ inline auto PrefillBinarySearchKVChunkSize(const bool enable_cuda_graph,
 
   int64_t low = min_kv_chunk_size;
   int64_t high = max_kv_len;
+  constexpr int64_t min_kv_len = 1;
   while (low < high) {
     const int64_t mid = (low + high) / 2;
     int64_t new_batch_size = 0;
     for (uint32_t i = 0; i < batch_size; ++i) {
       new_batch_size +=
-          ceil_div(packed_qo_len_arr[i], qo_chunk_size) * ceil_div(kv_len_arr[i], mid);
+          ceil_div(packed_qo_len_arr[i], qo_chunk_size) * ceil_div(std::max(kv_len_arr[i], min_kv_len), mid);
     }
     if (new_batch_size > max_batch_size_if_split) {
       low = mid + 1;
