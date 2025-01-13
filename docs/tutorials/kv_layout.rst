@@ -41,6 +41,9 @@ shape ``(indptr[-1], num_heads, head_dim)`` when the layout is ``NHD``.
 
 We can use ``data[indptr[i]:indptr[i+1]]`` to slice the keys (or values) of request ``i``.
 
+.. note::
+  ``indptr`` arrays across the flashinfer library should be of type ``int32``. Arrays of type ``int64`` can cause indexing errors. 
+
 FlashInfer APIs
 ~~~~~~~~~~~~~~~
 
@@ -136,6 +139,9 @@ when stored in a tuple of tensors, ``kv_data = (k_data, v_data)``, and each one 
 
 where ``max_num_pages`` is the maximum number of pages used by all requests, ``page_size`` is the number of tokens
 we fit into each page. ``2`` in single tensor storage means K/V (first one for keys, the second one for values).
+
+.. note::
+  ``indptr`` arrays across the flashinfer library should be of type ``int32``. Arrays of type ``int64`` can cause indexing errors. This is also true of the ``kv_page_indices`` and ``kv_last_page_lens`` arrays. 
 
 FlashInfer APIs
 ~~~~~~~~~~~~~~~
