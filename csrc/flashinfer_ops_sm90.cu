@@ -20,7 +20,7 @@ void CutlassSegmentGEMMSM90(at::Tensor float_workspace_buffer, at::Tensor int_wo
                             at::Tensor all_problems, at::Tensor x_ptr, at::Tensor w_ptr,
                             at::Tensor y_ptr, at::Tensor x_stride, at::Tensor weight_stride,
                             at::Tensor y_stride, at::Tensor empty_x_data, bool weight_column_major,
-                            int64_t cuda_stream);
+                            std::vector<int64_t> plan_info_vec, int64_t cuda_stream);
 
 void single_prefill_with_kv_cache_sm90(
     at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, std::optional<at::Tensor> maybe_lse,

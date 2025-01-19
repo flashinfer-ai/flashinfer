@@ -38,7 +38,7 @@ template <typename DType>
 cudaError_t CutlassSegmentGEMMRun(void* workspace_buffer, size_t workspace_buffer_size_in_bytes,
                                   void* all_problems, unsigned int batch_size, void* x, void* w,
                                   void* y, void* x_ld, void* w_ld, void* y_ld,
-                                  bool weight_column_major, cudaStream_t stream) {
+                                  bool weight_column_major, int num_ctas, cudaStream_t stream) {
   using cutlass::epilogue::thread::LinearCombination;
   using cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle;
   DISPATCH_WEIGHT_LAYOUT(weight_column_major, WEIGHT_LAYOUT, {
@@ -69,10 +69,10 @@ cudaError_t CutlassSegmentGEMMRun(void* workspace_buffer, size_t workspace_buffe
     using GemmGrouped = cutlass::gemm::device::GemmGrouped<GemmKernel>;
     typename GemmGrouped::Arguments args(
         reinterpret_cast<cutlass::gemm::GemmCoord*>(all_problems), (int)batch_size,
-        /*threadblock_count=*/4, epilogue_op, static_cast<DType**>(x), static_cast<DType**>(w),
-        static_cast<DType**>(y), static_cast<DType**>(y), reinterpret_cast<int64_t*>(x_ld),
-        reinterpret_cast<int64_t*>(w_ld), reinterpret_cast<int64_t*>(y_ld),
-        reinterpret_cast<int64_t*>(y_ld));
+        /*threadblock_count=*/num_ctas, epilogue_op, static_cast<DType**>(x),
+        static_cast<DType**>(w), static_cast<DType**>(y), static_cast<DType**>(y),
+        reinterpret_cast<int64_t*>(x_ld), reinterpret_cast<int64_t*>(w_ld),
+        reinterpret_cast<int64_t*>(y_ld), reinterpret_cast<int64_t*>(y_ld));
 
     GemmGrouped gemm;
     auto status = gemm.initialize(args, nullptr, stream);

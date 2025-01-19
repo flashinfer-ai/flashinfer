@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 from types import SimpleNamespace
-from typing import Optional
+from typing import List, Optional
 
 import torch
 import triton
@@ -104,6 +104,7 @@ def get_gemm_module():
             y: torch.Tensor,
             empty_x_data: torch.Tensor,
             weight_column_major: bool,
+            plan_info_vec: List[int],
         ) -> None:
             with x_data.device as device:
                 module.cutlass_segment_gemm(
@@ -117,6 +118,7 @@ def get_gemm_module():
                     y_ld,
                     empty_x_data,
                     weight_column_major,
+                    plan_info_vec,
                     get_cuda_stream(device),
                 )
 
@@ -139,6 +141,7 @@ def get_gemm_module():
         # Register the module
         _gemm_module = SimpleNamespace(
             bmm_fp8=bmm_fp8,
+            plan=module.cutlass_segment_gemm_plan,
             cutlass_segment_gemm=cutlass_segment_gemm,
         )
 
@@ -181,6 +184,7 @@ def get_gemm_sm90_module():
             y: torch.Tensor,
             empty_x_data: torch.Tensor,
             weight_column_major: bool,
+            plan_info_vec: List[int],
         ) -> None:
             with x_data.device as device:
                 module.cutlass_segment_gemm_sm90(
@@ -195,6 +199,7 @@ def get_gemm_sm90_module():
                     y_stride,
                     empty_x_data,
                     weight_column_major,
+                    plan_info_vec,
                     get_cuda_stream(device),
                 )
 
@@ -212,6 +217,7 @@ def get_gemm_sm90_module():
             y: torch.Tensor,
             empty_x_data: torch.Tensor,
             weight_column_major: bool,
+            plan_info_vec: List[int],
         ) -> None:
             pass
 
@@ -444,6 +450,8 @@ class SegmentGEMMWrapper:
     >>> x = torch.randn(10, 128, device="cuda", dtype=torch.float16)
     >>> # create weight tensor with 4 weights, each with 128 input and 256 output channels, column major
     >>> weights = torch.randn(4, 256, 128, device="cuda", dtype=torch.float16)
+    >>> # set the number of CTAs to 64
+    >>> segment_gemm.plan(64)
     >>> # compute the segment GEMM
     >>> y = segment_gemm.run(x, weights, 4, True, seg_lens=seq_lens)
     >>> y.shape
@@ -511,6 +519,29 @@ class SegmentGEMMWrapper:
         """
         self._float_workspace_buffer = float_workspace_buffer
         self._int_workspace_buffer = int_workspace_buffer
+
+    def plan(self, num_ctas: int = 0) -> None:
+        r"""Plan gemm for given num_ctas.
+
+        Parameters
+        ----------
+        num_ctas: int
+            The number of CTAs to run gemm kernel. If equal to 0 or greater than
+            the number of CTAs on device, it will be set to the number of CTAs on device.
+
+
+        Note
+        ----
+        The :meth:`plan` method should be called before any :meth:`run`.
+
+        The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
+        """
+        if num_ctas < 0:
+            raise ValueError("Num_ctas should be greater than or equal to 0.")
+
+        self._plan_info = get_gemm_module().plan(
+            num_ctas,
+        )
 
     def run(
         self,
@@ -629,6 +660,7 @@ class SegmentGEMMWrapper:
                     y,  # for torch compile mutates_args
                     empty_x_data,  # for kernel type dispatch
                     weight_column_major,
+                    self._plan_info,
                 )
             case "sm80":
                 (
@@ -660,6 +692,7 @@ class SegmentGEMMWrapper:
                     y,
                     empty_x_data,
                     weight_column_major,
+                    self._plan_info,
                 )
             case _:
                 raise ValueError(f"Unsupported gemm backend: {backend}")

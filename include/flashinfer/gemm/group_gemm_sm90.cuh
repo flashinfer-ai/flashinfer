@@ -53,7 +53,7 @@ cudaError_t CutlassSegmentGEMMSM90Run(void* float_buffer, size_t float_buffer_si
                                       void* int_buffer, size_t int_buffer_size_in_bytes,
                                       void* all_problems, unsigned int batch_size, void* x, void* w,
                                       void* y, void* x_stride, void* w_stride, void* y_stride,
-                                      bool weight_column_major, cudaStream_t stream) {
+                                      bool weight_column_major, int num_ctas, cudaStream_t stream) {
   auto compute_capacity = GetCudaComputeCapability();
   if (compute_capacity.first < 9) {
     std::cerr << "CutlassSegmentGEMMSM90Run requires compute capability of at least 9.0"
@@ -121,8 +121,7 @@ cudaError_t CutlassSegmentGEMMSM90Run(void* float_buffer, size_t float_buffer_si
 
       cutlass::KernelHardwareInfo hw_info;
       cudaGetDevice(&hw_info.device_id);
-      hw_info.sm_count =
-          cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+      hw_info.sm_count = num_ctas;
 
       typename Gemm::EpilogueOutputOp::Params params;
       params =

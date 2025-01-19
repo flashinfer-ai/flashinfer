@@ -33,6 +33,7 @@ CUDA_DEVICES = ["cuda:0"]
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @pytest.mark.parametrize("backend", ["auto", "sm90", "sm80"])
+@pytest.mark.parametrize("num_ctas", [0, 4, 16, 64])
 def test_segment_gemm(
     batch_size,
     num_rows_per_batch,
@@ -43,6 +44,7 @@ def test_segment_gemm(
     dtype,
     device,
     backend,
+    num_ctas,
 ):
     if batch_size * num_rows_per_batch > 8192:
         pytest.skip("batch_size * num_rows_per_batch too large for test.")
@@ -64,6 +66,7 @@ def test_segment_gemm(
             weight = torch.randn(batch_size, d_out, d_in, dtype=dtype).to(device)
         else:
             weight = torch.randn(batch_size, d_in, d_out, dtype=dtype).to(device)
+    segment_gemm.plan(num_ctas)
     y = segment_gemm.run(
         x,
         weight,
