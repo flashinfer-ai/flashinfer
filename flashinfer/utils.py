@@ -48,7 +48,7 @@ log2e = 1.44269504088896340736
 
 
 def _expand_5d(x: torch.Tensor, kv_layout: str) -> torch.Tensor:
-    if not x.ndim in [4, 5]:
+    if x.ndim not in [4, 5]:
         raise ValueError("x must be 4D or 5D")
     if x.ndim == 4:
         # page_size == 1
@@ -66,7 +66,7 @@ def _expand_5d(x: torch.Tensor, kv_layout: str) -> torch.Tensor:
 
 
 def _expand_4d(x: torch.Tensor, kv_layout: str) -> torch.Tensor:
-    if not x.ndim in [3, 4]:
+    if x.ndim not in [3, 4]:
         raise ValueError("x must be 3D or 4D")
     if x.ndim == 3:
         # page_size == 1

@@ -461,7 +461,6 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
 
     # compute ground truth and compare
     kv_indptr = kv_indptr_host.to(0)
-    kv_indices = kv_indices_host.to(0)
     kv_last_page_len = kv_last_page_len_host.to(0)
     for i in range(batch_size):
         perm_dims = [0, 2, 1, 3] if kv_layout == "HND" else [0, 1, 2, 3]

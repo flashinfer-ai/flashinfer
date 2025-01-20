@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import pytest
 import torch
 
 import flashinfer
@@ -22,7 +21,6 @@ import flashinfer
 
 def test_mlc_failed_case():
     kv_layout = "HND"
-    num_pages = 12
     kv_indptr_1 = torch.tensor([0, 0, 9]).int().to(0)
     kv_indices_1 = torch.tensor([3, 4, 5, 6, 7, 8, 9, 10, 11]).int().to(0)
     kv_last_page_len_1 = torch.tensor([0, 1]).int().to(0)

@@ -335,7 +335,7 @@ def test_chain_speculative_sampling(
         target_onehot_prob.scatter_(2, target_token_ids.unsqueeze(-1), 1)
 
     # NOTE(Zihao): this is a very simple test that only checks whether output is valid or not.
-    for trials in range(10):
+    for trials in range(10):    # noqa: B007
         uniform_samples.uniform_()
         accepted_num = torch.zeros(batch_size, dtype=torch.int32).to(0)
         emitted_num = torch.zeros(batch_size, dtype=torch.int32).to(0)

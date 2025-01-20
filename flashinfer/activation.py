@@ -18,7 +18,7 @@ from types import SimpleNamespace
 
 import torch
 
-from .jit import gen_act_and_mul_module, has_prebuilt_ops, load_cuda_ops
+from .jit import gen_act_and_mul_module, has_prebuilt_ops, load_cuda_ops    # noqa: F401
 from .utils import get_cuda_stream, register_custom_op, register_fake_op
 
 silu_def_cu_str = r"""

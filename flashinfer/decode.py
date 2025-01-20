@@ -27,7 +27,6 @@ from .jit import (
     gen_customize_batch_decode_module,
     gen_customize_batch_prefill_module,
     gen_single_decode_module,
-    get_batch_decode_mla_uri,
     get_batch_decode_uri,
     get_single_decode_uri,
     has_prebuilt_ops,

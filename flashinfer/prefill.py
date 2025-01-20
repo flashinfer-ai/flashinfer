@@ -47,7 +47,6 @@ from .utils import (
     determine_attention_backend,
     get_cuda_stream,
     is_float8,
-    log2e,
     register_custom_op,
     register_fake_op,
 )
