@@ -111,4 +111,6 @@ ignore = [
     "E731",
     # Loop control variable overrides iterable it iterates
     "B020",
+    # Return te negated condition directly
+    "SIM103",
 ]
