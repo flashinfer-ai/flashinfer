@@ -15,7 +15,7 @@
 #
 # FindThrust
 #
-# This module finds the Thrust header files and extrats their version.  It sets
+# This module finds the Thrust header files and extracts their version.  It sets
 # the following variables.
 #
 # THRUST_INCLUDE_DIR -  Include directory for thrust header files.  (All header

@@ -35,7 +35,7 @@ set(FLASHINFER_GEN_MASK_MODES 0 1 2)
 # "native" is a special value for CMAKE_CUDA_ARCHITECTURES which means use the
 # architectures of the host's GPU. it's new in CMake 3.24, if you are using an
 # older of CMake or you want to use a different value, you can set its value
-# here. Supported CUDA architctures include 80;86;89;90
+# here. Supported CUDA architectures include 80;86;89;90
 # NOTE(Zihao): using "native" might be slow because whenever compile a cuda file
 # with `-arch=native`, nvcc will spawn a `__nvcc_device_query` process to get
 # the architecture of the host's GPU, which could stall the compilation process.

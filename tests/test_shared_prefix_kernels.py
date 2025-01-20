@@ -318,5 +318,5 @@ if __name__ == "__main__":
         "decode", 12, 37, 128, 8, False, 128, 16
     )
     test_batch_attention_with_shared_prefix_paged_kv_cache(
-        "apppend", 12, 37, 128, 8, True, 128, 16
+        "append", 12, 37, 128, 8, True, 128, 16
     )

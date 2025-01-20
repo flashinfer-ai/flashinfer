@@ -1169,7 +1169,7 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper(BatchDecodeWithPagedKVCacheWra
 
     Note that this wrapper may not be as efficient as :class:`BatchDecodeWithPagedKVCacheWrapper`
     because we won't dispatch to different kernels for different batch sizes/sequence lengths/etc
-    to accomodate the CUDAGraph requirement.
+    to accommodate the CUDAGraph requirement.
 
     Check :ref:`our tutorial<page-layout>` for page table layout.
 

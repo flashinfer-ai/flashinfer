@@ -21,7 +21,7 @@ endif()
 
 # NOTE: do not modify this file to change option values. You can create a
 # config.cmake at build folder and add set(OPTION VALUE) to override these build
-# options. Alernatively, use cmake -DOPTION=VALUE through command-line.
+# options. Alternatively, use cmake -DOPTION=VALUE through command-line.
 flashinfer_option(FLASHINFER_ENABLE_FP8
                   "Whether to compile fp8 kernels or not." ON)
 flashinfer_option(FLASHINFER_ENABLE_FP8_E4M3

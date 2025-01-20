@@ -240,7 +240,7 @@ __global__ void MergeStatesKernel(DTypeIn* __restrict__ V, float* __restrict__ S
 
 /*!
  * \brief The CUDA kernel that merges self-attention states of a list of index sets,
- *   accelerated for larget number of index sets.
+ *   accelerated for larger number of index sets.
  * \tparam vec_size The vector size used in the kernel.
  * \tparam bdx The blockDim.x used in the kernel.
  * \tparam bdy The blockDim.y used in the kernel.

@@ -689,7 +689,7 @@ def min_p_sampling_from_probs(
     We encourage users to set ``max_rounds`` to a reasonable value, e.g., 32. The actual
     implementation usually use much fewer rounds for rejection sampling because of early stopping.
     """
-    # NOTE(Zihao): for backward compatiblity (https://github.com/flashinfer-ai/flashinfer/pull/713)
+    # NOTE(Zihao): for backward compatibility (https://github.com/flashinfer-ai/flashinfer/pull/713)
     if uniform_samples.dim() == 2:
         # Take the first row (round) of uniform_samples
         uniform_samples = uniform_samples[0]
@@ -1144,7 +1144,7 @@ def chain_speculative_sampling(
     maybe_output_accepted_token_num: Optional[torch.Tensor]
         The number of tokens that can be accepted if each token is considered independently for each request.
         This metric does not consider the fact that rejection sampling will stop at the first token that does not
-        satisfy the probablity requirement r < p/q.
+        satisfy the probability requirement r < p/q.
         It only evaluates the alignment of draft model and target model.
         Shape: ``(batch_size)``
         If specified, the number of accepted token number will be added to this tensor inplace. Default is ``None``.
@@ -1167,7 +1167,7 @@ def chain_speculative_sampling(
     output_accepted_token_num: torch.Tensor
         The number of tokens that can be accepted if each token is considered independently for each request.
         This metric does not consider the fact that rejection sampling will stop at the first token that does not
-        satisfy the probablity requirement r < p/q.
+        satisfy the probability requirement r < p/q.
         It only evaluates the alignment of draft model and target model.
         Shape: ``(batch_size)``
     output_emitted_token_num: torch.Tensor

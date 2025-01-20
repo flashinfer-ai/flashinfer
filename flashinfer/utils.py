@@ -90,7 +90,7 @@ def _check_pos_encoding_mode(pos_encoding_mode: str) -> None:
 
 def _check_kv_layout(kv_layout: str) -> None:
     if not hasattr(TensorLayout, kv_layout):
-        raise KeyError("Invalide kv_layout {}".format(kv_layout))
+        raise KeyError("Invalid kv_layout {}".format(kv_layout))
 
 
 def is_float8(x: torch.Tensor) -> bool:
@@ -121,7 +121,7 @@ def _unpack_paged_kv_cache(
         return paged_k_cache, paged_v_cache
     else:
         raise KeyError(
-            "Unrecongized paged_kv_cache type {}, expect a single tensor or a tuple of tensor.".format(
+            "Unrecognized paged_kv_cache type {}, expect a single tensor or a tuple of tensor.".format(
                 type(paged_kv_cache)
             )
         )

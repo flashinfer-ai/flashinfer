@@ -27,6 +27,15 @@ requires = ["setuptools"]
 build-backend = "custom_backend"
 backend-path = ["."]
 
+[tool.codespell]
+ignore-words-list = "3nd"
+skip = [
+    "build",
+    "3rdparty",
+    "dist",
+    ".venv"
+]
+
 [tool.setuptools]
 packages = [
     "flashinfer",
