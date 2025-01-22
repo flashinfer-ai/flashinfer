@@ -71,9 +71,9 @@ def generate_additional_params(
         additional_params_setter = " \\\n".join(
             [
                 (
-                    f"params.additional_params.{var}_ptr = {var} ? static_cast<{dtype}*>{var}->data_ptr(): nullptr;"
+                    f"params.additional_params.{var} = {var} ? static_cast<{dtype}*>({var}->data_ptr()): nullptr;"
                     if var.startswith("maybe")
-                    else f"params.additional_params.{var}_ptr = static_cast<{dtype}*>{var}.data_ptr();"
+                    else f"params.additional_params.{var} = static_cast<{dtype}*>({var}.data_ptr());"
                 )
                 for dtype, var in zip(additional_tensor_dtypes, additional_tensor_names)
             ]
@@ -435,18 +435,35 @@ def gen_batch_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
-        use_fp16_qk_reduction,
     )
 
     if backend == "fa2":
-        additional_tensor_names = None
-        additional_tensor_dtypes = None
-        additional_scalar_names = None
-        additional_scalar_dtypes = None
-        variant_name = None
-        variant_decl = None
+        additional_tensor_names = [
+            "maybe_custom_mask",
+            "maybe_qk_indptr",
+            "maybe_alibi_slopes",
+        ]
+        additional_tensor_dtypes = [
+            "uint8_t",
+            "int32_t",
+            "float",
+        ]  # NOTE(Zihao): int32_t should follow dtype_idx
+        additional_scalar_names = [
+            "logits_soft_cap",
+            "sm_scale",
+            "log2_rope_rcp_scale",
+            "log2_rope_rcp_theta",
+        ]
+        additional_scalar_dtypes = ["float", "float", "float", "float"]
+        variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
+        variant_decl = f"#include<flashinfer/attention/variants.cuh>"
     else:
-        pass
+        additional_tensor_names = ["maybe_alibi_slopes"]
+        additional_tensor_dtypes = ["float"]
+        additional_scalar_names = ["logits_soft_cap", "sm_scale"]
+        additional_scalar_dtypes = ["float", "float"]
+        variant_name = f"DefaultAttention<{str(use_logits_soft_cap).lower()}>"
+        variant_decl = f"#include<flashinfer/attention/hopper/variants.cuh>"
 
     return gen_customize_batch_prefill_module(
         backend,

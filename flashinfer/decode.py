@@ -640,6 +640,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._jit_module = get_batch_decode_jit_module(
                     jit_args[0], gen_customize_batch_decode_module(*jit_args)
                 )
+        else:
+            self._jit_module = None
 
         self._kv_layout = kv_layout
         self._float_workspace_buffer = float_workspace_buffer

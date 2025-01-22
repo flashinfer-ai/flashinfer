@@ -75,8 +75,6 @@ struct CustomMaskAttention {
   uint8_t* custom_mask_ptr;
   uint32_t window_left, qo_len, kv_len;
 
-  // if
-
   // Create closure
   template <typename Params>
   __device__ __host__ CustomMaskAttention(const Params& params, uint32_t batch_idx,

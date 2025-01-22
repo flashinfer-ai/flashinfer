@@ -102,8 +102,8 @@ inline auto PrefillBinarySearchKVChunkSize(const bool enable_cuda_graph,
     const int64_t mid = (low + high) / 2;
     int64_t new_batch_size = 0;
     for (uint32_t i = 0; i < batch_size; ++i) {
-      new_batch_size +=
-          ceil_div(packed_qo_len_arr[i], qo_chunk_size) * ceil_div(std::max(kv_len_arr[i], min_kv_len), mid);
+      new_batch_size += ceil_div(packed_qo_len_arr[i], qo_chunk_size) *
+                        ceil_div(std::max(kv_len_arr[i], min_kv_len), mid);
     }
     if (new_batch_size > max_batch_size_if_split) {
       low = mid + 1;
@@ -834,7 +834,7 @@ inline cudaError_t PrefillSM90Plan(void* float_buffer, size_t float_workspace_si
       cta_kv_len(num_sm90_ctas, std::vector<IdType>()),
       cta_head_indices(num_sm90_ctas, std::vector<IdType>());
 
-  int max_num_works_per_head = ceil_div(total_num_rows, cta_tile_q);
+  int max_num_works_per_head = ceil_div(total_num_rows, cta_tile_q) + batch_size - 1;
   plan_info.same_schedule_for_all_heads = max_num_works_per_head > 4096;
 
   for (int qo_head_idx = 0;
