@@ -59,15 +59,15 @@ struct StandardAttention {
   }
 };
 
-template <typename T, typename = void>
-struct has_custom_indptr : std::false_type {};
+#define DEFINE_HAS_MEMBER(member)                                                              \
+  template <typename T, typename = void>                                                       \
+  struct has_##member : std::false_type {};                                                    \
+  template <typename T>                                                                        \
+  struct has_##member<T, std::void_t<decltype(std::declval<T>().member)>> : std::true_type {}; \
+  template <typename T>                                                                        \
+  inline constexpr bool has_##member##_v = has_##member<T>::value;
 
-template <typename T>
-struct has_custom_indptr<T, std::void_t<decltype(std::declval<T>().maybe_custom_indptr)>>
-    : std::true_type {};
-
-template <typename T>
-inline constexpr bool has_custom_indptr_v = has_custom_indptr<T>::value;
+DEFINE_HAS_MEMBER(maybe_mask_indptr)
 
 struct CustomMaskAttention {
   static constexpr bool use_softmax = true;
@@ -79,8 +79,8 @@ struct CustomMaskAttention {
   template <typename Params>
   __device__ __host__ CustomMaskAttention(const Params& params, uint32_t batch_idx,
                                           uint8_t* smem_ptr) {
-    if constexpr (has_custom_indptr_v<Params>) {
-      custom_mask_ptr = params.maybe_custom_mask + params.maybe_custom_indptr[batch_idx];
+    if constexpr (has_maybe_mask_indptr_v<Params>) {
+      custom_mask_ptr = params.maybe_custom_mask + params.maybe_mask_indptr[batch_idx];
     } else {
       custom_mask_ptr = params.maybe_custom_mask;
     }
@@ -224,8 +224,8 @@ struct DefaultAttention {
     qo_len = params.get_qo_len(batch_idx);
     kv_len = params.get_kv_len(batch_idx);
     if constexpr (use_custom_mask) {
-      if constexpr (has_custom_indptr_v<Params>) {
-        custom_mask_ptr = params.maybe_custom_mask + params.maybe_custom_indptr[batch_idx];
+      if constexpr (has_maybe_mask_indptr_v<Params>) {
+        custom_mask_ptr = params.maybe_custom_mask + params.maybe_mask_indptr[batch_idx];
       } else {
         custom_mask_ptr = params.maybe_custom_mask;
       }

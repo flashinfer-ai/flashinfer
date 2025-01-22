@@ -139,40 +139,6 @@ def get_batch_decode_uri(
     )
 
 
-def get_mla_generated_config_str(
-    dtype_q: torch.dtype,
-    dtype_kv: torch.dtype,
-    dtype_o: torch.dtype,
-    dtype_idx: torch.dtype,
-    head_dim: int,
-    use_sliding_window: bool,
-    use_logits_soft_cap: bool,
-) -> str:
-    # step 0: generate the mla_generated_config.inc
-    return f"""#pragma once
-#include <flashinfer/attention/decode_params.cuh>
-#include <flashinfer/attention/variants.cuh>
-#include "pytorch_extension_utils.h"
-
-using namespace flashinfer;
-
-using DTypeQ = {dtype_map[dtype_q]};
-using DTypeKV = {dtype_map[dtype_kv]};
-using DTypeO = {dtype_map[dtype_o]};
-using IdType = {dtype_map[dtype_idx]};
-
-constexpr bool USE_SLIDING_WINDOW = {"true" if use_sliding_window else "false"};
-constexpr bool USE_LOGITS_SOFT_CAP = {"true" if use_logits_soft_cap else "false"};
-constexpr int HEAD_DIM_CKV = {head_dim};
-constexpr int HEAD_DIM_KPE = {head_dim // 8};  // fixme: head_dim_ckv(kv_lora_rank) is 8 times the size of head_dim_kpe(qk_rope_head_dim) for all MLA model (DeepSeek-V2-Lite, DeepSeek-V2.5, MiniCPM3) at the time Oct.2024
-
-using Params = BatchDecodeParamsMLA<DTypeQ, DTypeKV, DTypeO, IdType>;
-using AttentionVariant =
-    DefaultAttention</*use_custom_mask=*/false, USE_SLIDING_WINDOW,
-                                                USE_LOGITS_SOFT_CAP, /*use_alibi*/false>;
-    """
-
-
 def get_batch_decode_mla_uri(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
@@ -193,11 +159,43 @@ def get_batch_decode_mla_uri(
     )
 
 
-def gen_batch_decode_mla_module(*args, **kwargs):
-    uri = get_batch_decode_mla_uri(*args, **kwargs)
+def gen_batch_decode_mla_module(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+):
+    uri = get_batch_decode_mla_uri(
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim,
+        use_sliding_window,
+        use_logits_soft_cap,
+    )
     gen_directory = FLASHINFER_GEN_SRC_DIR / uri
-    generated_inc_str = get_mla_generated_config_str(*args, **kwargs)
     os.makedirs(gen_directory, exist_ok=True)
+
+    with open(FLASHINFER_CSRC_DIR / "batch_decode_mla_config.jinja") as f:
+        config_templ = jinja2.Template(f.read())
+    generated_config_path = gen_directory / "mla_generated_config.inc"
+    write_if_different(
+        generated_config_path,
+        config_templ.render(
+            dtype_q=dtype_map[dtype_q],
+            dtype_kv=dtype_map[dtype_kv],
+            dtype_o=dtype_map[dtype_o],
+            dtype_idx=dtype_map[dtype_idx],
+            head_dim_ckv=head_dim,
+            head_dim_kpe=head_dim // 8,
+            use_sliding_window=str(use_sliding_window).lower(),
+            use_logits_soft_cap=str(use_logits_soft_cap).lower(),
+        ),
+    )
 
     source_paths = []
     for filename in [
@@ -212,8 +210,6 @@ def gen_batch_decode_mla_module(*args, **kwargs):
             source = f.read()
         write_if_different(dest_path, source)
 
-    generated_config_path = gen_directory / "mla_generated_config.inc"
-    write_if_different(generated_config_path, generated_inc_str)
     return load_cuda_ops(uri, source_paths)
 
 
@@ -440,7 +436,7 @@ def gen_batch_prefill_module(
     if backend == "fa2":
         additional_tensor_names = [
             "maybe_custom_mask",
-            "maybe_custom_indptr",
+            "maybe_mask_indptr",
             "maybe_alibi_slopes",
         ]
         additional_tensor_dtypes = [
