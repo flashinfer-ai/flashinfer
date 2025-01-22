@@ -15,7 +15,7 @@
  */
 #include <flashinfer/activation.cuh>
 
-#include "aot_extension_utils.h"
+#include "pytorch_extension_utils.h"
 
 using namespace flashinfer;
 

@@ -45,7 +45,7 @@
 #else
 #define FLASHINFER_CUBLAS_CALL(EXPR)  \
   {                                   \
-    cudaError_t e = (EXPR);           \
+    cublasStatus_t e = (EXPR);        \
     if (e != CUBLAS_STATUS_SUCCESS) { \
       return e;                       \
     }                                 \
