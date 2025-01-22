@@ -112,7 +112,7 @@ struct BatchDecodeParams {
   using IdType = IdType_;
 
   DTypeQ* q;
-  IdType* q_offset;
+  IdType* q_rope_offset;
   paged_kv_t<DTypeKV, IdType> paged_kv;
   DTypeO* o;
   float* lse;
@@ -134,14 +134,14 @@ struct BatchDecodeParams {
   bool* block_valid_mask;
   bool partition_kv;
 
-  __device__ __host__ BatchDecodeParams(DTypeQ* q, IdType* q_offset,
+  __device__ __host__ BatchDecodeParams(DTypeQ* q, IdType* q_rope_offset,
                                         paged_kv_t<DTypeKV, IdType> paged_kv, DTypeO* o, float* lse,
                                         float* alibi_slopes, uint32_t num_qo_heads,
                                         IdType q_stride_n, IdType q_stride_h, int32_t window_left,
                                         float logits_soft_cap, float sm_scale, float rope_scale,
                                         float rope_theta)
       : q(q),
-        q_offset(q_offset),
+        q_rope_offset(q_rope_offset),
         paged_kv(paged_kv),
         o(o),
         lse(lse),
@@ -182,7 +182,7 @@ struct BatchDecodeParamsMLA {
   float* lse;
   float sm_scale;
 
-  IdType* q_offset;
+  IdType* q_rope_offset;
   paged_kv_mla_t<DTypeKV, IdType> paged_kv;
   uint32_t padded_batch_size;
   uint32_t num_qo_heads;
@@ -198,7 +198,7 @@ struct BatchDecodeParamsMLA {
   bool* block_valid_mask;
   bool partition_kv;
 
-  __device__ __host__ BatchDecodeParamsMLA(DTypeQ* q_nope, DTypeQ* q_pe, IdType* q_offset,
+  __device__ __host__ BatchDecodeParamsMLA(DTypeQ* q_nope, DTypeQ* q_pe, IdType* q_rope_offset,
                                            paged_kv_mla_t<DTypeKV, IdType> paged_kv, DTypeO* o,
                                            float* lse, uint32_t num_qo_heads, int32_t window_left,
                                            float logits_soft_cap, float sm_scale, float rope_scale,
@@ -208,7 +208,7 @@ struct BatchDecodeParamsMLA {
         o(o),
         lse(lse),
         sm_scale(sm_scale),
-        q_offset(q_offset),
+        q_rope_offset(q_rope_offset),
         paged_kv(paged_kv),
         padded_batch_size(0),
         num_qo_heads(num_qo_heads),

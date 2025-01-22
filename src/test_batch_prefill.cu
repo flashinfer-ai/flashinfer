@@ -118,7 +118,7 @@ void _TestBatchPagedPrefillKernelOneHotCorrectness(size_t num_kv_heads, size_t n
       auto status =
           flashinfer::BatchPrefillWithPagedKVCacheWrapper<DTypeQO, DTypeKV, DTypeQO, int32_t>(
               &handler, thrust::raw_pointer_cast(q_device.data()),
-              thrust::raw_pointer_cast(q_indptr_device.data()), /*q_offset=*/nullptr, paged_kv,
+              thrust::raw_pointer_cast(q_indptr_device.data()), /*q_rope_offset=*/nullptr, paged_kv,
               thrust::raw_pointer_cast(o_device.data()),
               /*lse=*/nullptr, num_qo_heads, causal, pos_encoding_mode, use_fp16_qk_reduction);
       EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
@@ -210,8 +210,8 @@ void _TestBatchRaggedPrefillKernelCorrectness(size_t num_kv_heads, size_t num_qo
       thrust::raw_pointer_cast(append_indptr_device.data()),
       thrust::raw_pointer_cast(keys_device.data()), thrust::raw_pointer_cast(values_device.data()),
       thrust::raw_pointer_cast(kv_indptr_device.data()),
-      /*q_offset=*/nullptr,
-      /*k_rope_pos_offset=*/nullptr, thrust::raw_pointer_cast(output_device.data()),
+      /*q_rope_offset=*/nullptr,
+      /*k_rope_offset=*/nullptr, thrust::raw_pointer_cast(output_device.data()),
       /*lse=*/nullptr, batch_size, num_qo_heads, num_kv_heads, head_dim, causal, kv_layout,
       pos_encoding_mode, use_fp16_qk_reduction);
 
@@ -343,7 +343,7 @@ void _TestBatchPagedPrefillKernelShortContextCorrectness(size_t num_kv_heads, si
   auto status = BatchPrefillWithPagedKVCacheWrapper<DTypeQO, DTypeKV, DTypeQO, int32_t>(
       &handler, thrust::raw_pointer_cast(q_device.data()),
       thrust::raw_pointer_cast(q_indptr_device.data()),
-      /*q_offset=*/nullptr, paged_kv, thrust::raw_pointer_cast(o_device.data()),
+      /*q_rope_offset=*/nullptr, paged_kv, thrust::raw_pointer_cast(o_device.data()),
       /*lse=*/nullptr, num_qo_heads, causal, pos_encoding_mode, use_fp16_qk_reduction);
   EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
 
@@ -472,7 +472,7 @@ void _TestBatchPagedPrefillKernelQMinMaxKVMinMaxCorrectness(
   auto status = BatchPrefillWithPagedKVCacheWrapper<DTypeQO, DTypeKV, DTypeQO, int32_t>(
       &handler, thrust::raw_pointer_cast(q_device.data()),
       thrust::raw_pointer_cast(q_indptr_device.data()),
-      /*q_offset=*/nullptr, paged_kv, thrust::raw_pointer_cast(o_device.data()),
+      /*q_rope_offset=*/nullptr, paged_kv, thrust::raw_pointer_cast(o_device.data()),
       /*lse=*/nullptr, num_qo_heads, /*causal=*/false,
       /*pos_encoding_mode*/ PosEncodingMode::kNone);
   EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
@@ -574,7 +574,7 @@ void _TestBatchPagedPrefillKernelLongContextCorrectness(size_t num_kv_heads, siz
   auto status = BatchPrefillWithPagedKVCacheWrapper<DTypeQO, DTypeKV, DTypeQO, int32_t>(
       &handler, thrust::raw_pointer_cast(q_device.data()),
       thrust::raw_pointer_cast(q_indptr_device.data()),
-      /*q_offset=*/nullptr, paged_kv, thrust::raw_pointer_cast(o_device.data()),
+      /*q_rope_offset=*/nullptr, paged_kv, thrust::raw_pointer_cast(o_device.data()),
       /*lse=*/nullptr, num_qo_heads, causal, pos_encoding_mode, use_fp16_qk_reduction);
   EXPECT_EQ(status, cudaSuccess) << "CUDA error: " + std::string(cudaGetErrorString(status));
 
@@ -804,7 +804,6 @@ TEST(FlashInferCorrectnessTest, BatchPagedPrefillLongContextTestE4M3) {
 TEST(FlashInferCorrectnessTest, BatchPagedPrefillShortContextTestE5M2) {
   TestBatchPagedPrefillFP8KernelShortContextCorrectness<__nv_fp8_e5m2>(false);
 }
-
 
 TEST(FlashInferCorrectnessTest, BatchPagedPrefillLongContextTestE5M2) {
   TestBatchPagedPrefillFP8KernelLongContextCorrectness<__nv_fp8_e5m2>(false);

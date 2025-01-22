@@ -379,7 +379,7 @@ void _TestTwoLevelSinglePrefixCascadeDecodeCorrectness(size_t batch_size,
   // Compute result using baseline implementation
   cudaError_t status = BatchDecodeWithPagedKVCacheWrapper<T, T, T, int32_t>(
       &baseline_handler, thrust::raw_pointer_cast(q_d.data()),
-      /*q_offset=*/nullptr, paged_kv_baseline_d, thrust::raw_pointer_cast(o_baseline_d.data()),
+      /*q_rope_offset=*/nullptr, paged_kv_baseline_d, thrust::raw_pointer_cast(o_baseline_d.data()),
       /*lse=*/nullptr, num_qo_heads, PosEncodingMode::kNone);
 
   EXPECT_EQ(status, cudaSuccess) << "Baseline implementation failed with error: "
@@ -399,7 +399,7 @@ void _TestTwoLevelSinglePrefixCascadeDecodeCorrectness(size_t batch_size,
 
   status = BatchDecodeWithPagedKVCacheWrapper<T, T, T, int32_t>(
       &cascade_handler, thrust::raw_pointer_cast(q_d.data()),
-      /*q_offset=*/nullptr, paged_kv_casacde_d, thrust::raw_pointer_cast(o_cascade_1_d.data()),
+      /*q_rope_offset=*/nullptr, paged_kv_casacde_d, thrust::raw_pointer_cast(o_cascade_1_d.data()),
       /*lse=*/thrust::raw_pointer_cast(lse_cascade_1_d.data()), num_qo_heads,
       PosEncodingMode::kNone);
 
@@ -505,7 +505,7 @@ void _TestTwoLevelSinglePrefixCascadeAppendCorrectness(size_t batch_size,
   cudaError_t status = BatchPrefillWithPagedKVCacheWrapper<T, T, T, int32_t>(
       &baseline_handler, thrust::raw_pointer_cast(q_d.data()),
       thrust::raw_pointer_cast(qo_indptr_d.data()),
-      /*q_offset=*/nullptr, paged_kv_baseline_d, thrust::raw_pointer_cast(o_baseline_d.data()),
+      /*q_rope_offset=*/nullptr, paged_kv_baseline_d, thrust::raw_pointer_cast(o_baseline_d.data()),
       /*lse=*/nullptr, num_qo_heads, /*causal=*/true, PosEncodingMode::kNone,
       /*use_fp16_qk_reduction=*/false);
 

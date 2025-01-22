@@ -87,7 +87,7 @@ void bench_flashinfer_batch_prefill_with_ragged_kv(nvbench::state& state) {
         &handler, thrust::raw_pointer_cast(Q.data()), thrust::raw_pointer_cast(qo_indptr_d.data()),
         thrust::raw_pointer_cast(K.data()), thrust::raw_pointer_cast(V.data()),
         thrust::raw_pointer_cast(kv_indptr_d.data()),
-        /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr, thrust::raw_pointer_cast(O.data()),
+        /*q_rope_offset=*/nullptr, /*k_rope_offset=*/nullptr, thrust::raw_pointer_cast(O.data()),
         /*lse=*/nullptr, batch_size, num_qo_heads, num_kv_heads, head_dim, causal,
         QKVLayout(kv_layout), PosEncodingMode(pos_encoding_mode), use_fp16_qk_reduction);
     if (status != cudaSuccess) {

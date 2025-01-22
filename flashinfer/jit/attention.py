@@ -294,8 +294,8 @@ def gen_single_decode_module(
         [
             "logits_soft_cap",
             "sm_scale",
-            "rope_scale",
-            "rope_theta",
+            "rope_rcp_scale",
+            "rope_rcp_theta",
         ],  # additional_scalar_names
         ["float", "float", "float", "float"],  # additional_scalar_dtypes
         f"DefaultAttention<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>",  # variant_name
@@ -334,8 +334,8 @@ def gen_single_prefill_module(
         additional_scalar_names = [
             "logits_soft_cap",
             "sm_scale",
-            "log2_rope_rcp_scale",
-            "log2_rope_rcp_theta",
+            "rope_rcp_scale",
+            "rope_rcp_theta",
         ]
         additional_scalar_dtypes = ["float", "float", "float", "float"]
         variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
@@ -400,8 +400,8 @@ def gen_batch_decode_module(
         [
             "logits_soft_cap",
             "sm_scale",
-            "rope_rope_scale",
-            "rope_rope_theta",
+            "rope_rcp_scale",
+            "rope_rcp_theta",
         ],  # additional_scalar_names
         ["float", "float", "float", "float"],  # additional_scalar_dtypes
         f"DefaultAttention<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>",  # variant_name
@@ -451,8 +451,8 @@ def gen_batch_prefill_module(
         additional_scalar_names = [
             "logits_soft_cap",
             "sm_scale",
-            "log2_rope_rcp_scale",
-            "log2_rope_rcp_theta",
+            "rope_rcp_scale",
+            "rope_rcp_theta",
         ]
         additional_scalar_dtypes = ["float", "float", "float", "float"]
         variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"

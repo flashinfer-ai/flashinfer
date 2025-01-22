@@ -50,8 +50,8 @@ struct SinglePrefillParams {
   int32_t window_left;
   float logits_soft_cap;
   float sm_scale;
-  float log2_rope_rcp_scale;
-  float log2_rope_rcp_theta;
+  float rope_rcp_scale;
+  float rope_rcp_theta;
 
   bool partition_kv;
 
@@ -81,8 +81,8 @@ struct SinglePrefillParams {
         window_left(window_left),
         logits_soft_cap(logits_soft_cap),
         sm_scale(sm_scale),
-        log2_rope_rcp_scale(-std::log2f(rope_scale)),
-        log2_rope_rcp_theta(-std::log2f(rope_theta)),
+        rope_rcp_scale(-std::log2f(rope_scale)),
+        rope_rcp_theta(-std::log2f(rope_theta)),
         partition_kv(false) {}
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
@@ -112,8 +112,8 @@ struct BatchPrefillRaggedParams {
   IdType* q_indptr;
   IdType* kv_indptr;
   IdType* mask_indptr;
-  IdType* q_offset;           // q_offset is only used for fused-rope attention
-  IdType* k_rope_pos_offset;  // k_rope_pos_offset is only used for fused-rope attention
+  IdType* q_rope_offset;  // q_rope_offset is only used for fused-rope attention
+  IdType* k_rope_offset;  // k_rope_offset is only used for fused-rope attention
   DTypeO* o;
   float* lse;
   float* alibi_slopes;
@@ -126,8 +126,8 @@ struct BatchPrefillRaggedParams {
   int32_t window_left;
   float logits_soft_cap;
   float sm_scale;
-  float log2_rope_rcp_scale;
-  float log2_rope_rcp_theta;
+  float rope_rcp_scale;
+  float rope_rcp_theta;
 
   IdType* request_indices;
   IdType* qo_tile_indices;
@@ -143,7 +143,7 @@ struct BatchPrefillRaggedParams {
 
   __host__ BatchPrefillRaggedParams(DTypeQ* q, DTypeKV* k, DTypeKV* v, uint8_t* custom_mask,
                                     IdType* q_indptr, IdType* kv_indptr, IdType* mask_indptr,
-                                    IdType* q_offset, IdType* k_rope_pos_offset, DTypeO* o,
+                                    IdType* q_rope_offset, IdType* k_rope_offset, DTypeO* o,
                                     float* lse, float* alibi_slopes, uint32_t num_qo_heads,
                                     uint32_t num_kv_heads, uint32_t q_stride_n, uint32_t q_stride_h,
                                     uint32_t kv_stride_n, uint32_t kv_stride_h, int32_t window_left,
@@ -156,8 +156,8 @@ struct BatchPrefillRaggedParams {
         q_indptr(q_indptr),
         kv_indptr(kv_indptr),
         mask_indptr(mask_indptr),
-        q_offset(q_offset),
-        k_rope_pos_offset(k_rope_pos_offset),
+        q_rope_offset(q_rope_offset),
+        k_rope_offset(k_rope_offset),
         o(o),
         lse(lse),
         alibi_slopes(alibi_slopes),
@@ -170,8 +170,8 @@ struct BatchPrefillRaggedParams {
         window_left(window_left),
         logits_soft_cap(logits_soft_cap),
         sm_scale(sm_scale),
-        log2_rope_rcp_scale(-std::log2f(rope_scale)),
-        log2_rope_rcp_theta(-std::log2f(rope_theta)),
+        rope_rcp_scale(1.f / rope_scale),
+        rope_rcp_theta(1.f / rope_theta),
         request_indices(nullptr),
         qo_tile_indices(nullptr),
         kv_tile_indices(nullptr),
@@ -209,7 +209,7 @@ struct BatchPrefillPagedParams {
   uint8_t* custom_mask;
   IdType* q_indptr;
   IdType* mask_indptr;
-  IdType* q_offset;  // q_offset is only used for fused-rope attention
+  IdType* q_rope_offset;  // q_rope_offset is only used for fused-rope attention
   DTypeO* o;
   float* lse;
   float* alibi_slopes;
@@ -219,8 +219,8 @@ struct BatchPrefillPagedParams {
   int32_t window_left;
   float logits_soft_cap;
   float sm_scale;
-  float log2_rope_rcp_scale;
-  float log2_rope_rcp_theta;
+  float rope_rcp_scale;
+  float rope_rcp_theta;
 
   IdType* request_indices;
   IdType* qo_tile_indices;
@@ -236,16 +236,16 @@ struct BatchPrefillPagedParams {
 
   __host__ BatchPrefillPagedParams(DTypeQ* q, paged_kv_t<DTypeKV, IdType> paged_kv,
                                    uint8_t* custom_mask, IdType* q_indptr, IdType* mask_indptr,
-                                   IdType* q_offset, DTypeO* o, float* lse, float* alibi_slopes,
-                                   uint32_t num_qo_heads, IdType q_stride_n, IdType q_stride_h,
-                                   int32_t window_left, float logits_soft_cap, float sm_scale,
-                                   float rope_scale, float rope_theta)
+                                   IdType* q_rope_offset, DTypeO* o, float* lse,
+                                   float* alibi_slopes, uint32_t num_qo_heads, IdType q_stride_n,
+                                   IdType q_stride_h, int32_t window_left, float logits_soft_cap,
+                                   float sm_scale, float rope_scale, float rope_theta)
       : q(q),
         paged_kv(paged_kv),
         custom_mask(custom_mask),
         q_indptr(q_indptr),
         mask_indptr(mask_indptr),
-        q_offset(q_offset),
+        q_rope_offset(q_rope_offset),
         o(o),
         lse(lse),
         alibi_slopes(alibi_slopes),
@@ -255,8 +255,8 @@ struct BatchPrefillPagedParams {
         window_left(window_left),
         logits_soft_cap(logits_soft_cap),
         sm_scale(sm_scale),
-        log2_rope_rcp_scale(-std::log2f(rope_scale)),
-        log2_rope_rcp_theta(-std::log2f(rope_theta)),
+        rope_rcp_scale(1.f / rope_scale),
+        rope_rcp_theta(1.f / rope_theta),
         request_indices(nullptr),
         qo_tile_indices(nullptr),
         kv_tile_indices(nullptr),

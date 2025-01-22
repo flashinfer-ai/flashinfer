@@ -111,6 +111,7 @@ def jit_prefill_attention_func_args(
             (
                 flashinfer.prefill.gen_single_prefill_module,
                 (
+                    "fa2",
                     q_dtype,
                     kv_dtype,
                     q_dtype,
@@ -126,6 +127,7 @@ def jit_prefill_attention_func_args(
             (
                 flashinfer.prefill.gen_batch_prefill_module,
                 (
+                    "fa2",
                     q_dtype,
                     kv_dtype,
                     q_dtype,

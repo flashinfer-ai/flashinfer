@@ -440,8 +440,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params
   const uint32_t q_stride_n = params.q_stride_n;
   const uint32_t q_stride_h = params.q_stride_h;
   if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
-    const IdType* q_offset = params.q_offset;
-    int32_t q_offset_val = q_offset == nullptr ? (kv_len - 1) : q_offset[batch_idx];
+    const IdType* q_rope_offset = nullptr;  // params.q_rope_offset;
+    int32_t q_rope_offset_val = q_rope_offset == nullptr ? (kv_len - 1) : q_rope_offset[batch_idx];
     const float rope_rcp_scale = params.rope_rcp_scale;
     const float rope_rcp_theta = params.rope_rcp_theta;
 #pragma unroll
@@ -452,7 +452,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params
     }
     // apply rotary embedding to q matrix
     q_vec = vec_apply_llama_rope<vec_size, bdx>(
-        q + batch_idx * q_stride_n + qo_head_idx * q_stride_h, freq, q_offset_val);
+        q + batch_idx * q_stride_n + qo_head_idx * q_stride_h, freq, q_rope_offset_val);
   } else {
     // do not apply rotary embedding to q matrix
     q_vec.cast_load(q + batch_idx * q_stride_n + qo_head_idx * q_stride_h + tx * vec_size);
@@ -852,7 +852,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
   DTypeO* o = params.o;
   float* lse = params.lse;
   const auto& paged_kv = params.paged_kv;
-  const IdType* q_offset = params.q_offset;
+  const IdType* q_rope_offset = params.q_rope_offset;
   const bool* block_valid_mask = params.block_valid_mask;
   const uint32_t num_qo_heads = params.num_qo_heads;
   const float rope_rcp_scale = params.rope_rcp_scale;
@@ -871,7 +871,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
   const uint32_t mapped_batch_idx = params.request_indices[batch_idx];
 
   const uint32_t orig_seq_len = paged_kv.get_length(mapped_batch_idx);
-  int32_t q_offset_val = q_offset == nullptr ? (orig_seq_len - 1) : q_offset[mapped_batch_idx];
+  int32_t q_rope_offset_val =
+      q_rope_offset == nullptr ? (orig_seq_len - 1) : q_rope_offset[mapped_batch_idx];
 
   const uint32_t kv_chunk_idx_in_orig_mapped_batch = params.kv_tile_indices[batch_idx];
   const uint32_t kv_chunk_size = *(params.kv_chunk_size_ptr);
@@ -921,7 +922,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
                               tx * vec_size_ckv);
       q_pe_vec[i] = vec_apply_llama_rope_interleave<vec_size_kpe, bdx>(
           q_pe + (mapped_batch_idx * num_qo_heads + qo_head_idx[i]) * head_dim_kpe, freq,
-          q_offset_val);
+          q_rope_offset_val);
     }
   }
 

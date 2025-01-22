@@ -79,7 +79,7 @@ void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::T
         params.q_stride_n = num_qo_heads * head_dim;
         params.q_stride_h = head_dim;
         params.kv_stride_n = (kv_layout == QKVLayout::kNHD) ? num_kv_heads * head_dim : head_dim;
-        params.kv_stride_h = (kv_layout == QKVLayout::kNHD) ? head_dim : num_kv_heads * head_dim;
+        params.kv_stride_h = (kv_layout == QKVLayout::kNHD) ? head_dim : kv_len * head_dim;
         params.head_dim = head_dim;
         params.window_left = window_left;
         params.kv_chunk_size = 0;

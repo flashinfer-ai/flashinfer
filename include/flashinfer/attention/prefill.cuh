@@ -153,9 +153,9 @@ __device__ __forceinline__ void q_frag_apply_llama_rope_with_pos(T* x_first_half
                                                                  const float* rope_freq,
                                                                  const uint32_t qo_packed_offset,
                                                                  const uint_fastdiv group_size,
-                                                                 const IdType* q_offset) {
-  float pos[2] = {static_cast<float>(q_offset[qo_packed_offset / group_size]),
-                  static_cast<float>(q_offset[(qo_packed_offset + 8) / group_size])};
+                                                                 const IdType* q_rope_offset) {
+  float pos[2] = {static_cast<float>(q_rope_offset[qo_packed_offset / group_size]),
+                  static_cast<float>(q_rope_offset[(qo_packed_offset + 8) / group_size])};
 #pragma unroll
   for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
     float cos, sin, tmp;
@@ -277,9 +277,8 @@ __device__ __forceinline__ void page_produce_kv(smem_t<swizzle_mode> smem, uint3
 }
 
 template <uint32_t NUM_MMA_D>
-__device__ __forceinline__ void init_rope_freq(float (*rope_freq)[4],
-                                               const float log2_rope_rcp_scale,
-                                               const float log2_rope_rcp_theta) {
+__device__ __forceinline__ void init_rope_freq(float (*rope_freq)[4], const float rope_rcp_scale,
+                                               const float rope_rcp_theta) {
   constexpr uint32_t head_dim = NUM_MMA_D * 16;
   const uint32_t lane_idx = threadIdx.x;
 #pragma unroll
@@ -287,11 +286,11 @@ __device__ __forceinline__ void init_rope_freq(float (*rope_freq)[4],
 #pragma unroll
     for (uint32_t j = 0; j < 4; ++j) {
       rope_freq[mma_d][j] =
-          math::ptx_exp2(log2_rope_rcp_scale +
-                         log2_rope_rcp_theta *
-                             float(2 * ((mma_d * 16 + (j / 2) * 8 + (lane_idx % 4) * 2 + (j % 2)) %
-                                        (head_dim / 2))) /
-                             float(head_dim));
+          rope_rcp_scale *
+          __powf(rope_rcp_theta,
+                 float(2 * ((mma_d * 16 + (j / 2) * 8 + (lane_idx % 4) * 2 + (j % 2)) %
+                            (head_dim / 2))) /
+                     float(head_dim));
     }
   }
 }
@@ -401,7 +400,7 @@ __device__ __forceinline__ void q_smem_inplace_apply_rotary(
 template <uint32_t NUM_WARPS_Q, uint32_t NUM_WARPS_KV, uint32_t NUM_MMA_Q, uint32_t NUM_MMA_D,
           SwizzleMode swizzle_mode, typename DTypeQ, typename IdType>
 __device__ __forceinline__ void q_smem_inplace_apply_rotary_with_pos(
-    const uint32_t q_packed_idx_base, const IdType* q_offset, smem_t<swizzle_mode>* q_smem,
+    const uint32_t q_packed_idx_base, const IdType* q_rope_offset, smem_t<swizzle_mode>* q_smem,
     const uint_fastdiv group_size, uint32_t* q_smem_offset_r, float (*rope_freq)[4]) {
   if (get_warp_idx_kv<NUM_WARPS_Q, NUM_WARPS_KV>() == 0) {
     constexpr uint32_t head_dim = NUM_MMA_D * 16;
@@ -420,7 +419,7 @@ __device__ __forceinline__ void q_smem_inplace_apply_rotary_with_pos(
         q_smem->ldmatrix_m8n8x4(q_smem_offset_r_last_half, q_frag_local[1]);
         q_frag_apply_llama_rope_with_pos<DTypeQ>(
             (DTypeQ*)q_frag_local[0], (DTypeQ*)q_frag_local[1], rope_freq[mma_di],
-            q_packed_idx_base + mma_q * 16 + lane_idx / 4, group_size, q_offset);
+            q_packed_idx_base + mma_q * 16 + lane_idx / 4, group_size, q_rope_offset);
         q_smem->stmatrix_m8n8x4(q_smem_offset_r_last_half, q_frag_local[1]);
         q_smem->stmatrix_m8n8x4(q_smem_offset_r_first_half, q_frag_local[0]);
         q_smem_offset_r_first_half =
@@ -1096,9 +1095,9 @@ __device__ __forceinline__ void write_o_reg_gmem(
  * \param o The output tensor.
  * \param tmp The temporary buffer (used when partition_kv is true).
  * \param lse The logsumexp value.
- * \param log2_rope_rcp_scale log2(1/(rope_scale)), where rope_scale is the scaling
+ * \param rope_rcp_scale 1/(rope_scale), where rope_scale is the scaling
  *   factor used in RoPE interpolation.
- * \param log2_rope_rcp_theta log2(1/(rope_theta)), where rope_theta is the theta
+ * \param rope_rcp_theta 1/(rope_theta), where rope_theta is the theta
  *   used in RoPE.
  */
 template <MaskMode MASK_MODE, PosEncodingMode POS_ENCODING_MODE, uint32_t NUM_MMA_Q,
@@ -1161,9 +1160,9 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void SinglePrefillWithKV
     float d[NUM_MMA_Q][2];
     float rope_freq[NUM_MMA_D / 2][4];
     if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
-      const float log2_rope_rcp_scale = params.log2_rope_rcp_scale;
-      const float log2_rope_rcp_theta = params.log2_rope_rcp_theta;
-      init_rope_freq<NUM_MMA_D>(rope_freq, log2_rope_rcp_scale, log2_rope_rcp_theta);
+      const float rope_rcp_scale = params.rope_rcp_scale;
+      const float rope_rcp_theta = params.rope_rcp_theta;
+      init_rope_freq<NUM_MMA_D>(rope_freq, rope_rcp_scale, rope_rcp_theta);
     }
     init_states<NUM_MMA_Q, NUM_MMA_D>(variant, o_frag, m, d);
 
@@ -1584,9 +1583,9 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithRag
     float rope_freq[NUM_MMA_D / 2][4];
 
     if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
-      const float log2_rope_rcp_scale = params.log2_rope_rcp_scale;
-      const float log2_rope_rcp_theta = params.log2_rope_rcp_theta;
-      init_rope_freq<NUM_MMA_D>(rope_freq, log2_rope_rcp_scale, log2_rope_rcp_theta);
+      const float rope_rcp_scale = params.rope_rcp_scale;
+      const float rope_rcp_theta = params.rope_rcp_theta;
+      init_rope_freq<NUM_MMA_D>(rope_freq, rope_rcp_scale, rope_rcp_theta);
     }
     init_states<NUM_MMA_Q, NUM_MMA_D>(variant, o_frag, m, d);
 
@@ -1620,15 +1619,15 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithRag
     block.sync();
 
     if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
-      IdType* q_offset = params.q_offset;
-      if (!q_offset) {
+      IdType* q_rope_offset = nullptr;  // params.q_rope_offset;
+      if (!q_rope_offset) {
         q_smem_inplace_apply_rotary<NUM_WARPS_Q, NUM_WARPS_KV, NUM_MMA_Q, NUM_MMA_D, swizzle_mode_q,
                                     DTypeQ>(qo_packed_idx_base, qo_len, kv_len, group_size,
                                             &qo_smem, &q_smem_offset_r, rope_freq);
       } else {
         q_smem_inplace_apply_rotary_with_pos<NUM_WARPS_Q, NUM_WARPS_KV, NUM_MMA_Q, NUM_MMA_D,
                                              swizzle_mode_q, DTypeQ>(
-            qo_packed_idx_base, q_offset + q_indptr[request_idx], &qo_smem, group_size,
+            qo_packed_idx_base, q_rope_offset + q_indptr[request_idx], &qo_smem, group_size,
             &q_smem_offset_r, rope_freq);
       }
       block.sync();
@@ -1702,10 +1701,10 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithRag
       block.sync();
 
       if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
-        IdType* k_rope_pos_offset = params.k_rope_pos_offset;
+        IdType* k_rope_offset = nullptr;  // params.k_rope_offset;
         k_smem_inplace_apply_rotary<NUM_WARPS_Q, NUM_WARPS_KV, NUM_MMA_D, NUM_MMA_KV,
                                     swizzle_mode_kv, DTypeKV>(
-            (k_rope_pos_offset == nullptr ? 0 : k_rope_pos_offset[request_idx]) + chunk_start +
+            (k_rope_offset == nullptr ? 0 : k_rope_offset[request_idx]) + chunk_start +
                 iter * 16 * NUM_WARPS_KV * NUM_MMA_KV,
             &k_smem, &k_smem_offset_r, rope_freq);
         block.sync();
@@ -1870,9 +1869,9 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPag
     float rope_freq[NUM_MMA_D / 2][4];
 
     if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
-      const float log2_rope_rcp_scale = params.log2_rope_rcp_scale;
-      const float log2_rope_rcp_theta = params.log2_rope_rcp_theta;
-      init_rope_freq<NUM_MMA_D>(rope_freq, log2_rope_rcp_scale, log2_rope_rcp_theta);
+      const float rope_rcp_scale = params.rope_rcp_scale;
+      const float rope_rcp_theta = params.rope_rcp_theta;
+      init_rope_freq<NUM_MMA_D>(rope_freq, rope_rcp_scale, rope_rcp_theta);
     }
     init_states<NUM_MMA_Q, NUM_MMA_D>(variant, o_frag, m, d);
 
@@ -1905,15 +1904,15 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPag
     block.sync();
 
     if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
-      IdType* q_offset = params.q_offset;
-      if (q_offset == nullptr) {
+      IdType* q_rope_offset = nullptr;  // params.q_rope_offset;
+      if (q_rope_offset == nullptr) {
         q_smem_inplace_apply_rotary<NUM_WARPS_Q, NUM_WARPS_KV, NUM_MMA_Q, NUM_MMA_D, swizzle_mode_q,
                                     DTypeQ>(qo_packed_idx_base, qo_len, kv_len, group_size,
                                             &qo_smem, &q_smem_offset_r, rope_freq);
       } else {
         q_smem_inplace_apply_rotary_with_pos<NUM_WARPS_Q, NUM_WARPS_KV, NUM_MMA_Q, NUM_MMA_D,
                                              swizzle_mode_q, DTypeQ>(
-            qo_packed_idx_base, q_offset + q_indptr[request_idx], &qo_smem, group_size,
+            qo_packed_idx_base, q_rope_offset + q_indptr[request_idx], &qo_smem, group_size,
             &q_smem_offset_r, rope_freq);
       }
       block.sync();

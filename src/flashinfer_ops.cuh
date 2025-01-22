@@ -379,7 +379,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeO* 
 template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType>
 cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
     BatchPrefillHandler* handler, DTypeQ* q, IdType* qo_indptr, DTypeKV* k, DTypeKV* v,
-    IdType* kv_indptr, IdType* q_offset, IdType* k_rope_pos_offset, DTypeO* o, float* lse,
+    IdType* kv_indptr, IdType* q_rope_offset, IdType* k_rope_offset, DTypeO* o, float* lse,
     const uint32_t batch_size, const uint32_t num_qo_heads, const uint32_t num_kv_heads,
     const uint32_t head_dim, bool causal = true, QKVLayout kv_layout = QKVLayout::kNHD,
     PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone, bool use_fp16_qk_reduction = false,
@@ -403,7 +403,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
                     /*use_sliding_window=*/true,
                     /*use_logits_soft_cap=*/false, /*use_alibi=*/false>;
                 Params params(q, k, v, /*custom_mask=*/nullptr, qo_indptr, kv_indptr,
-                              /*mask_indptr=*/nullptr, q_offset, k_rope_pos_offset, o, lse,
+                              /*mask_indptr=*/nullptr, q_rope_offset, k_rope_offset, o, lse,
                               /*alibi_slopes=*/nullptr, num_qo_heads, num_kv_heads, qo_stride_n,
                               qo_stride_h, kv_stride_n, kv_stride_h, /*window_left=*/-1,
                               /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta);
@@ -430,7 +430,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
 
 template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType>
 cudaError_t BatchPrefillWithPagedKVCacheWrapper(
-    BatchPrefillHandler* handler, DTypeQ* q, IdType* qo_indptr, IdType* q_offset,
+    BatchPrefillHandler* handler, DTypeQ* q, IdType* qo_indptr, IdType* q_rope_offset,
     paged_kv_t<DTypeKV, IdType> paged_kv, DTypeO* o, float* lse, uint32_t num_qo_heads,
     bool causal = true, PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
     bool use_fp16_qk_reduction = false, std::optional<float> maybe_sm_scale = std::nullopt,
@@ -454,7 +454,7 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
                     /*use_logits_soft_cap=*/false,
                     /*use_alibi=*/false>;
                 Params params(q, paged_kv, /*custom_mask=*/nullptr, qo_indptr,
-                              /*mask_indptr=*/nullptr, q_offset, o, lse,
+                              /*mask_indptr=*/nullptr, q_rope_offset, o, lse,
                               /*alibi_slopes=*/nullptr, num_qo_heads,
                               /*q_stride_n*/ num_qo_heads * HEAD_DIM, /*q_stride_h*/ HEAD_DIM,
                               /*window_left=*/-1, /*logits_soft_cap=*/0.f, sm_scale, rope_scale,
@@ -536,8 +536,8 @@ cudaError_t SingleDecodeWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeO* o
  */
 template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheWrapper(
-    BatchDecodeHandler* handler, DTypeQ* q, IdType* q_offset, paged_kv_t<DTypeKV, IdType> paged_kv,
-    DTypeO* o, float* lse, uint32_t num_qo_heads,
+    BatchDecodeHandler* handler, DTypeQ* q, IdType* q_rope_offset,
+    paged_kv_t<DTypeKV, IdType> paged_kv, DTypeO* o, float* lse, uint32_t num_qo_heads,
     PosEncodingMode pos_encoding_mode = PosEncodingMode::kNone,
     std::optional<float> maybe_sm_scale = std::nullopt, float rope_scale = 1.f,
     float rope_theta = 1e4, cudaStream_t stream = nullptr) {
@@ -557,7 +557,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapper(
         using AttentionVariant = DefaultAttention<
             /*use_custom_mask=*/false, /*use_sliding_window=*/true,
             /*use_logits_soft_cap=*/false, /*use_alibi=*/false>;
-        Params params(q, q_offset, paged_kv, o, lse, /*alibi_slopes=*/nullptr, num_qo_heads,
+        Params params(q, q_rope_offset, paged_kv, o, lse, /*alibi_slopes=*/nullptr, num_qo_heads,
                       /*q_stride_n*/ num_qo_heads * HEAD_DIM, /*q_stride_h*/ HEAD_DIM,
                       /*window_left=*/-1, /*logits_soft_cap=*/0.f, sm_scale, rope_scale,
                       rope_theta);
@@ -601,7 +601,7 @@ cudaError_t BatchDecodeHandlerPlan(BatchDecodeHandler* handler, void* float_buff
 
 template <typename DTypeQ, typename DTypeKV, typename DTypeO, typename IdType>
 cudaError_t BatchDecodeWithPagedKVCacheWrapperMLA(
-    BatchDecodeHandler* handler, DTypeQ* q_nope, DTypeQ* q_pe, IdType* q_offset,
+    BatchDecodeHandler* handler, DTypeQ* q_nope, DTypeQ* q_pe, IdType* q_rope_offset,
     paged_kv_mla_t<DTypeKV, IdType> paged_kv, DTypeO* o, float* lse, uint32_t num_qo_heads,
     float sm_scale, float rope_scale = 1.f, float rope_theta = 1e4, cudaStream_t stream = nullptr) {
   DISPATCH_head_dim(paged_kv.head_dim_ckv, HEAD_DIM_CKV, {
@@ -612,7 +612,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapperMLA(
     using AttentionVariant = DefaultAttention<
         /*use_custom_mask=*/false, /*use_sliding_window=*/true,
         /*use_logits_soft_cap=*/false, /*use_alibi=*/false>;
-    Params params(q_nope, q_pe, q_offset, paged_kv, o, lse, num_qo_heads,
+    Params params(q_nope, q_pe, q_rope_offset, paged_kv, o, lse, num_qo_heads,
                   /*window_left=*/-1, /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta);
     params.request_indices = handler->GetRequestIndices<IdType>();
     params.kv_tile_indices = handler->GetKVTileIndices<IdType>();

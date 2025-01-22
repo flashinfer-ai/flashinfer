@@ -97,8 +97,8 @@ void bench_flashinfer_batch_decode_mla(nvbench::state& state) {
   state.exec([&](nvbench::launch&) {
     cudaError_t status = flashinfer::BatchDecodeWithPagedKVCacheWrapperMLA<T, T, T, int32_t>(
         &handler, thrust::raw_pointer_cast(q_nope.data()), thrust::raw_pointer_cast(q_pe.data()),
-        /*q_offset=*/nullptr, paged_kv_mla, thrust::raw_pointer_cast(o.data()), /*lse=*/nullptr,
-        num_qo_heads, std::sqrt(192.0));
+        /*q_rope_offset=*/nullptr, paged_kv_mla, thrust::raw_pointer_cast(o.data()),
+        /*lse=*/nullptr, num_qo_heads, std::sqrt(192.0));
     if (status != cudaSuccess) {
       state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
     }

@@ -134,8 +134,8 @@ def get_single_prefill_module(backend):
                             maybe_alibi_slopes,
                             logits_soft_cap,
                             sm_scale,
-                            rope_scale,
-                            rope_theta,
+                            1.0 / rope_scale,  # rope_rcp_scale
+                            1.0 / rope_theta,  # rope_rcp_theta
                             get_cuda_stream(device),
                         )
                     return o
@@ -251,8 +251,8 @@ def get_batch_prefill_module(backend):
                             maybe_alibi_slopes,
                             logits_soft_cap,
                             sm_scale,
-                            rope_scale,
-                            rope_theta,
+                            1.0 / rope_scale,  # rope_rcp_scale
+                            1.0 / rope_theta,  # rope_rcp_theta
                             get_cuda_stream(device),
                         )
                     else:
@@ -360,8 +360,8 @@ def get_batch_prefill_module(backend):
                             maybe_alibi_slopes,
                             logits_soft_cap,
                             sm_scale,
-                            rope_scale,
-                            rope_theta,
+                            1.0 / rope_scale,  # rope_rcp_scale
+                            1.0 / rope_theta,  # rope_rcp_theta
                             get_cuda_stream(device),
                         )
                     else:

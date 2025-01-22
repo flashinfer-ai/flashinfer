@@ -102,8 +102,8 @@ def get_single_decode_module(*args):
                     alibi_slopes,
                     logits_soft_cap,
                     sm_scale,
-                    rope_scale,
-                    rope_theta,
+                    1.0 / rope_scale,  # rope_rcp_scale
+                    1.0 / rope_theta,  # rope_rcp_theta
                     get_cuda_stream(device),
                 )
 
@@ -273,8 +273,8 @@ def get_batch_decode_module(*args):
                     alibi_slopes,
                     logits_soft_cap,
                     sm_scale,
-                    rope_scale,
-                    rope_theta,
+                    1.0 / rope_scale,  # rope_rcp_scale
+                    1.0 / rope_theta,  # rope_rcp_theta
                     get_cuda_stream(device),
                 )
                 return o
@@ -466,20 +466,20 @@ def single_decode_with_kv_cache(
                 False,  # use_fp16_qk_reduction
             )
             .run(
-                MaskMode.NON_CAUSAL.value,
                 q.unsqueeze(0),
                 k,
                 v,
-                None,  # packed_custom_mask
                 tmp,
-                _get_cache_alibi_slopes_buf(num_qo_heads, q.device),
+                None,  # maybe_lse,
+                MaskMode.NON_CAUSAL.value,
                 TensorLayout[kv_layout].value,
                 window_left,
+                None,  # packed_custom_mask
+                _get_cache_alibi_slopes_buf(num_qo_heads, q.device),
                 logits_soft_cap,
                 sm_scale,
                 rope_scale,
                 rope_theta,
-                None,  # maybe_lse
             )[0]
             .squeeze(0)
         )
