@@ -458,8 +458,8 @@ def gen_batch_prefill_module(
         variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
         variant_decl = f"#include<flashinfer/attention/variants.cuh>"
     else:
-        additional_tensor_names = ["maybe_alibi_slopes"]
-        additional_tensor_dtypes = ["float"]
+        additional_tensor_names = []
+        additional_tensor_dtypes = []
         additional_scalar_names = ["logits_soft_cap", "sm_scale"]
         additional_scalar_dtypes = ["float", "float"]
         variant_name = f"DefaultAttention<{str(use_logits_soft_cap).lower()}>"
