@@ -1,4 +1,5 @@
 #include "mla_generated_config.inc"
+#include "pytorch_extension_utils.h"
 
 std::vector<int64_t> BatchDecodeWithPagedKVCachePlanMLA(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
