@@ -440,7 +440,7 @@ def gen_batch_prefill_module(
     if backend == "fa2":
         additional_tensor_names = [
             "maybe_custom_mask",
-            "maybe_qk_indptr",
+            "maybe_custom_indptr",
             "maybe_alibi_slopes",
         ]
         additional_tensor_dtypes = [
