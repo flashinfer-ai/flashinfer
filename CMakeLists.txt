@@ -138,17 +138,13 @@ message(STATUS "FLASHINFER_MASK_MODES=${MASK_MODES}")
 file(MAKE_DIRECTORY ${PROJECT_SOURCE_DIR}/src/generated)
 
 set(AOT_GENERATE_COMMAND
-  ${Python3_EXECUTABLE}
-  -m aot_build_utils.generate
-  --path ${PROJECT_SOURCE_DIR}/src/generated
-  --head_dims ${HEAD_DIMS}
-  --pos_encoding_modes ${POS_ENCODING_MODES}
-  --use_fp16_qk_reductions ${ALLOW_FP16_QK_REDUCTIONS}
-  --mask_modes ${MASK_MODES}
-  --enable_f16 ${FLASHINFER_ENABLE_F16}
-  --enable_bf16 ${FLASHINFER_ENABLE_BF16}
-  --enable_fp8_e4m3 ${FLASHINFER_ENABLE_FP8_E4M3}
-  --enable_fp8_e5m2 ${FLASHINFER_ENABLE_FP8_E5M2})
+    ${Python3_EXECUTABLE} -m aot_build_utils.generate --path
+    ${PROJECT_SOURCE_DIR}/src/generated --head_dims ${HEAD_DIMS}
+    --pos_encoding_modes ${POS_ENCODING_MODES} --use_fp16_qk_reductions
+    ${USE_FP16_QK_REDUCTIONS} --mask_modes ${MASK_MODES} --enable_f16
+    ${FLASHINFER_ENABLE_F16} --enable_bf16 ${FLASHINFER_ENABLE_BF16}
+    --enable_fp8_e4m3 ${FLASHINFER_ENABLE_FP8_E4M3} --enable_fp8_e5m2
+    ${FLASHINFER_ENABLE_FP8_E5M2})
 
 execute_process(COMMAND ${AOT_GENERATE_COMMAND}
                 WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})

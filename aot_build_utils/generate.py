@@ -293,7 +293,7 @@ if __name__ == "__main__":
         help="Mask modes",
     )
     parser.add_argument(
-        "--enable_fp16",
+        "--enable_f16",
         type=lambda x: x if isinstance(x, int) else x.lower() == "true",
         required=True,
         nargs="+",
