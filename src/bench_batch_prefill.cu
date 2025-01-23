@@ -42,7 +42,7 @@ void bench_flashinfer_batch_prefill_with_ragged_kv(nvbench::state& state) {
   size_t kv_layout = state.get_int64("kv_layout");
   bool causal = state.get_int64("causal");
   bool cooperative = state.get_int64("cooperative");
-  bool allow_fp16_qk_reduction = state.get_int64("allow_fp16_qk_reduction");
+  bool use_fp16_qk_reduction = state.get_int64("use_fp16_qk_reduction");
 
   // Allocate input data:
   thrust::device_vector<dtype_in> Q(batch_size * qo_len * num_qo_heads * head_dim);
@@ -87,9 +87,9 @@ void bench_flashinfer_batch_prefill_with_ragged_kv(nvbench::state& state) {
         &handler, thrust::raw_pointer_cast(Q.data()), thrust::raw_pointer_cast(qo_indptr_d.data()),
         thrust::raw_pointer_cast(K.data()), thrust::raw_pointer_cast(V.data()),
         thrust::raw_pointer_cast(kv_indptr_d.data()),
-        /*q_offset=*/nullptr, /*k_rope_pos_offset=*/nullptr, thrust::raw_pointer_cast(O.data()),
+        /*q_rope_offset=*/nullptr, /*k_rope_offset=*/nullptr, thrust::raw_pointer_cast(O.data()),
         /*lse=*/nullptr, batch_size, num_qo_heads, num_kv_heads, head_dim, causal,
-        QKVLayout(kv_layout), PosEncodingMode(pos_encoding_mode), allow_fp16_qk_reduction);
+        QKVLayout(kv_layout), PosEncodingMode(pos_encoding_mode), use_fp16_qk_reduction);
     if (status != cudaSuccess) {
       state.skip("CUDA error: " + std::string(cudaGetErrorString(status)));
     }
@@ -126,7 +126,7 @@ void bench_flashinfer_batch_prefill_with_ragged_kv(nvbench::state& state) {
       .add_int64_axis("causal", {0, 1})                                                        \
       .add_int64_axis("kv_layout", {0})                                                        \
       .add_int64_axis("pos_encoding_mode", {0})                                                \
-      .add_int64_axis("allow_fp16_qk_reduction", {0})                                          \
+      .add_int64_axis("use_fp16_qk_reduction", {0})                                            \
       .add_int64_axis("cooperative", {1})
 
 BENCH_FLASHINFER_BATCH_PREFILL_WITH_RAGGED_KV(half, half);

@@ -216,4 +216,4 @@ if __name__ == "__main__":
     # test_batch_prefill(1, 32767, 8, 8, True, 128)
     # test_single_prefill(64, 1, 1, False, 256)
     # test_batch_paged_prefill(2, 32768, 1, 1, 1, False, 128)
-    test_batch_paged_prefill(16, 32767, 1, 8, 8, True, 128)
+    test_batch_paged_prefill(16, 32767, 1, 8, 8, True, 128, 0)

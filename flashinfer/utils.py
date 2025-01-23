@@ -270,7 +270,7 @@ def determine_gemm_backend(device: torch.device) -> str:
 
 def is_fa3_backend_supported(
     pos_encoding_mode: int,
-    allow_fp16_qk_reductions: bool,
+    use_fp16_qk_reductions: bool,
     use_custom_mask: bool,
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
@@ -284,7 +284,7 @@ def is_fa3_backend_supported(
     ----------
     pos_encoding_mode : int
         The positional encoding mode.
-    allow_fp16_qk_reductions : bool
+    use_fp16_qk_reductions : bool
         Whether FP16 QK reductions are allowed.
     use_custom_mask : bool
         Whether a custom mask is used.
@@ -302,7 +302,7 @@ def is_fa3_backend_supported(
         return False
     if pos_encoding_mode != PosEncodingMode.NONE.value:
         return False
-    if allow_fp16_qk_reductions:
+    if use_fp16_qk_reductions:
         return False
     # NOTE: currently fp8 is not supported in our FA3 backend
     # will add support soon
@@ -316,7 +316,7 @@ def is_fa3_backend_supported(
 def determine_attention_backend(
     device: torch.device,
     pos_encoding_mode: int,
-    allow_fp16_qk_reductions: bool,
+    use_fp16_qk_reductions: bool,
     use_custom_mask: bool,
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
@@ -332,7 +332,7 @@ def determine_attention_backend(
         The mask mode.
     pos_encoding_mode : int
         The positional encoding mode.
-    allow_fp16_qk_reductions : bool
+    use_fp16_qk_reductions : bool
         Whether FP16 QK reductions are allowed.
     use_custom_mask : bool
         Whether a custom mask is used.
@@ -353,7 +353,7 @@ def determine_attention_backend(
         and torch.version.cuda >= "12.3"
         and is_fa3_backend_supported(
             pos_encoding_mode,
-            allow_fp16_qk_reductions,
+            use_fp16_qk_reductions,
             use_custom_mask,
             dtype_q,
             dtype_kv,

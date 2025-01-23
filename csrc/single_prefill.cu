@@ -14,32 +14,27 @@
  * limitations under the License.
  */
 #include <flashinfer/attention/mask.cuh>
-#include <flashinfer/attention/prefill_params.cuh>
-#include <flashinfer/attention/variants.cuh>
 #include <flashinfer/pos_enc.cuh>
 #include <optional>
 
-#include "aot_extension_utils.h"
+#include "pytorch_extension_utils.h"
+#include "single_prefill_config.inc"
 
 namespace flashinfer {
 
-template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, bool ALLOW_FP16_QK_REDUCTION,
-          MaskMode MASK_MODE, typename AttentionVariant>
-cudaError_t SinglePrefillWithKVCacheDispatched(typename AttentionVariant::ParamsT params,
-                                               typename AttentionVariant::DTypeO* tmp,
+template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION,
+          MaskMode MASK_MODE, typename AttentionVariant, typename Params>
+cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::DTypeO* tmp,
                                                cudaStream_t stream);
 
 }  // namespace flashinfer
 
 using namespace flashinfer;
 
-void single_prefill_with_kv_cache(unsigned int mask_mode_code, at::Tensor q, at::Tensor k,
-                                  at::Tensor v, std::optional<at::Tensor> maybe_packed_custom_mask,
-                                  at::Tensor tmp, std::optional<at::Tensor> maybe_alibi_slopes,
-                                  at::Tensor o, unsigned int layout, int32_t window_left,
-                                  float logits_soft_cap, float sm_scale, float rope_scale,
-                                  float rope_theta, std::optional<at::Tensor> maybe_lse,
-                                  int64_t cuda_stream) {
+void single_prefill_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor tmp,
+                                  at::Tensor o, std::optional<at::Tensor> maybe_lse,
+                                  unsigned int mask_mode_code, unsigned int layout,
+                                  int32_t window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream) {
   auto device = q.device();
   unsigned int head_dim = q.size(2);
   unsigned int kv_len, qo_len, num_kv_heads, num_qo_heads;
@@ -64,50 +59,44 @@ void single_prefill_with_kv_cache(unsigned int mask_mode_code, at::Tensor q, at:
     TORCH_CHECK(lse.size(1) == num_qo_heads, lse.size(1), q.size(1));
   }
 
-  constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;
   const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
-  bool use_logits_soft_cap = logits_soft_cap > 0.f;
 
   auto q_scalar_type = q.scalar_type();
   auto kv_scalar_type = k.scalar_type();
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-  DISPATCH_PYTORCH_QKV_DTYPE_TO_CTYPE(q_scalar_type, kv_scalar_type, q_type, kv_type, [&] {
-    using DTypeQ = q_type;
-    using DTypeKV = kv_type;
-    using DTypeO = DTypeQ;
-    return DISPATCH_mask_mode(mask_mode, MASK_MODE, [&] {
-      return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-        return DISPATCH_BOOL(use_logits_soft_cap, USE_LOGITS_SOFT_CAP, [&] {
-          using ParamsT = SinglePrefillParams<DTypeQ, DTypeKV, DTypeO>;
-          using AttentionVariant =
-              ComposedAttention<ParamsT, get_variant_code(
-                                             /*use_custom_mask=*/MASK_MODE == MaskMode::kCustom,
-                                             /*use_sliding_window=*/true, USE_LOGITS_SOFT_CAP,
-                                             /*use_alibi_slopes=*/false)>;
 
-          ParamsT params(static_cast<DTypeQ*>(q.data_ptr()), static_cast<DTypeKV*>(k.data_ptr()),
-                         static_cast<DTypeKV*>(v.data_ptr()),
-                         maybe_packed_custom_mask.has_value()
-                             ? static_cast<uint8_t*>(maybe_packed_custom_mask->data_ptr())
-                             : nullptr,
-                         static_cast<DTypeO*>(o.data_ptr()),
-                         /*lse=*/(maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr),
-                         /*alibi_slopes=*/nullptr, num_qo_heads, num_kv_heads, qo_len, kv_len,
-                         q_stride_n, q_stride_h, kv_stride_n, kv_stride_h, head_dim, window_left,
-                         logits_soft_cap, sm_scale, rope_scale, rope_theta);
+  DISPATCH_context(
+      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM, POS_ENCODING_MODE, USE_SLIDING_WINDOW,
+      USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, AttentionVariant, Params, [&] {
+        Params params;
 
-          cudaError_t status =
-              flashinfer::SinglePrefillWithKVCacheDispatched<HEAD_DIM, POS_ENCODING_MODE,
-                                                             /*use_fp16_qk_reduction=*/false,
-                                                             MASK_MODE, AttentionVariant>(
-                  params, static_cast<DTypeO*>(tmp.data_ptr()), stream);
-          TORCH_CHECK(status == cudaSuccess,
-                      "SinglePrefillWithKVCache kernel launch failed, error: " +
-                          std::string(cudaGetErrorString(status)));
-          return true;
-        });
+        params.q = static_cast<DTypeQ*>(q.data_ptr());
+        params.k = static_cast<DTypeKV*>(k.data_ptr());
+        params.v = static_cast<DTypeKV*>(v.data_ptr());
+        params.o = static_cast<DTypeO*>(o.data_ptr());
+        params.lse = maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
+        params.num_qo_heads = num_qo_heads;
+        params.num_kv_heads = num_kv_heads;
+        params.qo_len = qo_len;
+        params.kv_len = kv_len;
+        params.q_stride_n = q_stride_n;
+        params.q_stride_h = q_stride_h;
+        params.kv_stride_n = kv_stride_n;
+        params.kv_stride_h = kv_stride_h;
+        params.head_dim = head_dim;
+        params.window_left = window_left;
+        params.partition_kv = false;
+
+        ADDITIONAL_PARAMS_SETTER
+
+        cudaError_t status = flashinfer::SinglePrefillWithKVCacheDispatched<
+            HEAD_DIM, POS_ENCODING_MODE,
+            /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant>(
+            params, static_cast<DTypeO*>(tmp.data_ptr()), stream);
+        TORCH_CHECK(status == cudaSuccess,
+                    "SinglePrefillWithKVCache kernel launch failed, error: " +
+                        std::string(cudaGetErrorString(status)));
+        return true;
       });
-    });
-  });
 }

@@ -29,7 +29,7 @@ from .literal_map import (
 def get_cu_file_str(
     head_dim,
     pos_encoding_mode,
-    allow_fp16_qk_reduction,
+    use_fp16_qk_reduction,
     mask_mode,
     dtype_q,
     dtype_kv,
@@ -42,35 +42,39 @@ def get_cu_file_str(
 template cudaError_t BatchPrefillWithRaggedKVCacheDispatched
     <{head_dim},
      {mask_mode},
-     /*USE_SWA=*/true,
+     /*USE_SLIDING_WINDOW=*/true,
      /*SAME_SCHEDULE_FOR_ALL_HEADS=*/true,
-     {attention_variant}>(Params& params, cudaStream_t stream);
+     {attention_variant},
+     Params>(Params& params, cudaStream_t stream);
 
 template cudaError_t BatchPrefillWithRaggedKVCacheDispatched
     <{head_dim},
      {mask_mode},
-     /*USE_SWA=*/true,
+     /*USE_SLIDING_WINDOW=*/true,
      /*SAME_SCHEDULE_FOR_ALL_HEADS=*/false,
-     {attention_variant}>(Params& params, cudaStream_t stream);
+     {attention_variant},
+     Params>(Params& params, cudaStream_t stream);
 
 template cudaError_t BatchPrefillWithRaggedKVCacheDispatched
     <{head_dim},
      {mask_mode},
-     /*USE_SWA=*/false,
+     /*USE_SLIDING_WINDOW=*/false,
      /*SAME_SCHEDULE_FOR_ALL_HEADS=*/true,
-     {attention_variant}>(Params& params, cudaStream_t stream);
+     {attention_variant},
+     Params>(Params& params, cudaStream_t stream);
 
 template cudaError_t BatchPrefillWithRaggedKVCacheDispatched
     <{head_dim},
      {mask_mode},
-     /*USE_SWA=*/false,
+     /*USE_SLIDING_WINDOW=*/false,
      /*SAME_SCHEDULE_FOR_ALL_HEADS=*/false,
-     {attention_variant}>(Params& params, cudaStream_t stream);
+     {attention_variant},
+     Params>(Params& params, cudaStream_t stream);
         """.format(
-                    head_dim=head_dim,
-                    mask_mode=mask_mode_literal[int(mask_mode)],
-                    attention_variant=attention_variant,
-                )
+            head_dim=head_dim,
+            mask_mode=mask_mode_literal[int(mask_mode)],
+            attention_variant=attention_variant,
+        )
 
     dtype_q = dtype_literal[dtype_q]
     dtype_kv = dtype_literal[dtype_kv]
@@ -78,7 +82,7 @@ template cudaError_t BatchPrefillWithRaggedKVCacheDispatched
     idtype = idtype_literal[idtype]
 
     content = f""" // batch_ragged_prefill_sm90 template inst
-#include <flashinfer/attention/hopper/params.cuh>
+#include <flashinfer/attention/hopper/default_params.cuh>
 #include <flashinfer/attention/hopper/prefill_sm90.cuh>
 #include <flashinfer/attention/hopper/variants.cuh>
 #include <flashinfer/cutlass_utils.cuh>
@@ -92,9 +96,9 @@ using DTypeO = cutlass_dtype_t<{dtype_out}>;
 
 using Params = BatchPrefillRaggedParams<DTypeQ, DTypeKV, DTypeO, {idtype}>;
 
-{get_insts("LogitsSoftCap<Params>")}
+{get_insts("LogitsSoftCap")}
 
-{get_insts("StandardAttention<Params>")}
+{get_insts("StandardAttention")}
 
 }}
     """

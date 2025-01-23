@@ -1,0 +1,19 @@
+#pragma once
+#include <flashinfer/attention/default_decode_params.cuh>
+#include <flashinfer/attention/variants.cuh>
+
+using namespace flashinfer;
+
+using DTypeQ = {{ dtype_q }};
+using DTypeKV = {{ dtype_kv }};
+using DTypeO = {{ dtype_o }};
+using IdType = {{ dtype_idx }};
+
+constexpr bool USE_SLIDING_WINDOW = {{ use_sliding_window }};
+constexpr bool USE_LOGITS_SOFT_CAP = {{ use_logits_soft_cap }};
+constexpr int HEAD_DIM_CKV = {{ head_dim_ckv }};
+constexpr int HEAD_DIM_KPE = {{ head_dim_kpe }};
+
+using Params = BatchDecodeParamsMLA<DTypeQ, DTypeKV, DTypeO, IdType>;
+using AttentionVariant =
+    DefaultAttention</*use_custom_mask=*/false, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, /*use_alibi*/false>;

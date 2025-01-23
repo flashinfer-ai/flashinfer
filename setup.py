@@ -28,25 +28,19 @@ root = Path(__file__).parent.resolve()
 gen_dir = root / "csrc" / "generated"
 
 head_dims = os.environ.get("FLASHINFER_HEAD_DIMS", "64,128,256").split(",")
-pos_encoding_modes = os.environ.get("FLASHINFER_POS_ENCODING_MODES", "0").split(",")
-allow_fp16_qk_reductions = os.environ.get(
-    "FLASHINFER_ALLOW_FP16_QK_REDUCTION_OPTIONS", "0"
-).split(",")
-mask_modes = os.environ.get("FLASHINFER_MASK_MODES", "0,1,2").split(",")
-
 head_dims = list(map(int, head_dims))
-pos_encoding_modes = list(map(int, pos_encoding_modes))
-pos_encoding_modes_sm90 = [mode for mode in pos_encoding_modes if mode != 2]
-allow_fp16_qk_reductions = list(map(int, allow_fp16_qk_reductions))
-allow_fp16_qk_reductions_sm90 = [mode for mode in allow_fp16_qk_reductions if mode != 1]
-mask_modes = list(map(int, mask_modes))
+mask_modes = [0, 1, 2]
 
 enable_aot = os.environ.get("FLASHINFER_ENABLE_AOT", "0") == "1"
 enable_f16 = os.environ.get("FLASHINFER_ENABLE_F16", "1") == "1"
 enable_bf16 = os.environ.get("FLASHINFER_ENABLE_BF16", "1") == "1"
 enable_fp8 = os.environ.get("FLASHINFER_ENABLE_FP8", "1") == "1"
-enable_fp8_e4m3 = os.environ.get("FLASHINFER_ENABLE_FP8_E4M3", "1" if enable_fp8 else "0") == "1"
-enable_fp8_e5m2 = os.environ.get("FLASHINFER_ENABLE_FP8_E5M2", "1" if enable_fp8 else "0") == "1"
+enable_fp8_e4m3 = (
+    os.environ.get("FLASHINFER_ENABLE_FP8_E4M3", "1" if enable_fp8 else "0") == "1"
+)
+enable_fp8_e5m2 = (
+    os.environ.get("FLASHINFER_ENABLE_FP8_E5M2", "1" if enable_fp8 else "0") == "1"
+)
 enable_sm90 = os.environ.get("FLASHINFER_ENABLE_SM90", "1") == "1"
 
 
@@ -69,6 +63,9 @@ def generate_cuda() -> None:
     try:  # no aot_build_utils in sdist
         sys.path.append(str(root))
         from aot_build_utils.generate import get_instantiation_cu
+        from aot_build_utils.generate_aot_default_additional_params_header import (
+            get_aot_default_additional_params_header_str,
+        )
         from aot_build_utils.generate_sm90 import get_sm90_instantiation_cu
     except ImportError:
         return
@@ -77,8 +74,8 @@ def generate_cuda() -> None:
         argparse.Namespace(
             path=gen_dir,
             head_dims=head_dims,
-            pos_encoding_modes=pos_encoding_modes,
-            allow_fp16_qk_reductions=allow_fp16_qk_reductions,
+            pos_encoding_modes=[0],
+            use_fp16_qk_reductions=[0],
             mask_modes=mask_modes,
             enable_f16=enable_f16,
             enable_bf16=enable_bf16,
@@ -92,8 +89,8 @@ def generate_cuda() -> None:
             argparse.Namespace(
                 path=gen_dir,
                 head_dims=head_dims,
-                pos_encoding_modes=pos_encoding_modes_sm90,
-                allow_fp16_qk_reductions=allow_fp16_qk_reductions_sm90,
+                pos_encoding_modes=[0],
+                use_fp16_qk_reductions=[0],
                 mask_modes=mask_modes,
                 enable_f16=enable_f16,
                 enable_bf16=enable_bf16,
@@ -101,18 +98,22 @@ def generate_cuda() -> None:
         )
     aot_config_str = f"""prebuilt_ops_uri = set({aot_kernel_uris})"""
     (root / "flashinfer" / "jit" / "aot_config.py").write_text(aot_config_str)
+    (root / "csrc" / "aot_default_additional_params.h").write_text(
+        get_aot_default_additional_params_header_str()
+    )
 
 
 ext_modules = []
 cmdclass = {}
 install_requires = ["torch", "ninja"]
 generate_build_meta({})
-generate_cuda()
 
 if enable_aot:
     import torch
     import torch.utils.cpp_extension as torch_cpp_ext
     from packaging.version import Version
+
+    generate_cuda()
 
     def get_cuda_version() -> Version:
         if torch_cpp_ext.CUDA_HOME is None:

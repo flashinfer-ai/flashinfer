@@ -21,7 +21,12 @@ from .aot_config import prebuilt_ops_uri as prebuilt_ops_uri
 from .attention import gen_batch_decode_mla_module as gen_batch_decode_mla_module
 from .attention import gen_batch_decode_module as gen_batch_decode_module
 from .attention import gen_batch_prefill_module as gen_batch_prefill_module
-from .attention import gen_batch_prefill_sm90_module as gen_batch_prefill_sm90_module
+from .attention import (
+    gen_customize_batch_decode_module as gen_customize_batch_decode_module,
+)
+from .attention import (
+    gen_customize_batch_prefill_module as gen_customize_batch_prefill_module,
+)
 from .attention import (
     gen_customize_single_decode_module as gen_customize_single_decode_module,
 )
@@ -30,13 +35,10 @@ from .attention import (
 )
 from .attention import gen_single_decode_module as gen_single_decode_module
 from .attention import gen_single_prefill_module as gen_single_prefill_module
-from .attention import gen_single_prefill_sm90_module as gen_single_prefill_sm90_module
 from .attention import get_batch_decode_mla_uri as get_batch_decode_mla_uri
 from .attention import get_batch_decode_uri as get_batch_decode_uri
-from .attention import get_batch_prefill_sm90_uri as get_batch_prefill_sm90_uri
 from .attention import get_batch_prefill_uri as get_batch_prefill_uri
 from .attention import get_single_decode_uri as get_single_decode_uri
-from .attention import get_single_prefill_sm90_uri as get_single_prefill_sm90_uri
 from .attention import get_single_prefill_uri as get_single_prefill_uri
 from .core import clear_cache_dir, load_cuda_ops
 from .env import *

@@ -142,7 +142,8 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0>& tenso
 template <int NUM_ROWS_PER_THREAD>
 struct DefaultUpdater {
   using TensorT = decltype(make_tensor<float>(Shape<Int<NUM_ROWS_PER_THREAD>>{}));
-  CUTLASS_DEVICE DefaultUpdater(float scale_ = 1.f) {};
+  template <typename MainloopParams>
+  CUTLASS_DEVICE DefaultUpdater(MainloopParams params) {};
 
   __forceinline__ __device__ TensorT get_lse() { return TensorT(); }
 
@@ -166,9 +167,17 @@ template <int NUM_ROWS_PER_THREAD, bool WITH_SCALE>
 struct OnlineSoftmax {
   using TensorT = decltype(make_tensor<float>(Shape<Int<NUM_ROWS_PER_THREAD>>{}));
   TensorT row_max, row_sum, scores_scale;
-  const float sm_scale_log2;
+  float sm_scale_log2;
 
-  CUTLASS_DEVICE OnlineSoftmax(float scale_ = 1.f) : sm_scale_log2(scale_) { clear(scores_scale); };
+  template <typename MainloopParams>
+  CUTLASS_DEVICE OnlineSoftmax(MainloopParams params) {
+    if constexpr (WITH_SCALE) {
+      sm_scale_log2 = params.additional_params.sm_scale * math::log2e;
+    } else {
+      sm_scale_log2 = 0.f;
+    }
+    clear(scores_scale);
+  };
 
   __forceinline__ __device__ TensorT get_lse() const { return row_sum; }
 

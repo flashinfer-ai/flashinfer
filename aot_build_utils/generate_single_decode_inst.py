@@ -18,10 +18,7 @@ import re
 import sys
 from pathlib import Path
 
-from .literal_map import (
-    dtype_literal,
-    pos_encoding_mode_literal,
-)
+from .literal_map import dtype_literal, pos_encoding_mode_literal
 
 
 def get_cu_file_str(
@@ -35,17 +32,17 @@ def get_cu_file_str(
 
 namespace flashinfer {{
 
-using ParamsT = SingleDecodeParams<{dtype_q}, {dtype_kv}, {dtype_out}>;
+using Params = SingleDecodeParams<{dtype_q}, {dtype_kv}, {dtype_out}>;
 
-template cudaError_t SingleDecodeWithKVCacheDispatched<{head_dim}, {pos_encoding_mode}, ComposedAttention<ParamsT, get_variant_code(
-    /*use_custom_mask=*/false, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false)>>(
-    ParamsT params,
+template cudaError_t SingleDecodeWithKVCacheDispatched<{head_dim}, {pos_encoding_mode}, DefaultAttention<
+    /*use_custom_mask=*/false, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false>, Params>(
+    Params params,
     {dtype_out}* tmp,
     cudaStream_t stream);
 
-template cudaError_t SingleDecodeWithKVCacheDispatched<{head_dim}, {pos_encoding_mode}, ComposedAttention<ParamsT, get_variant_code(
-    /*use_custom_mask=*/false, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false)>>(
-    ParamsT params,
+template cudaError_t SingleDecodeWithKVCacheDispatched<{head_dim}, {pos_encoding_mode}, DefaultAttention<
+    /*use_custom_mask=*/false, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false>, Params>(
+    Params params,
     {dtype_out}* tmp,
     cudaStream_t stream);
 }}

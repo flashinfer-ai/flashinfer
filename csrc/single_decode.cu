@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 by FlashInfer team.
+ * Copyright (c) 2023-2025 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,30 +13,25 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <c10/cuda/CUDAGuard.h>
-
-#include <flashinfer/attention/decode_params.cuh>
-#include <flashinfer/attention/variants.cuh>
 #include <flashinfer/pos_enc.cuh>
 #include <optional>
 
-#include "aot_extension_utils.h"
+#include "pytorch_extension_utils.h"
+#include "single_decode_config.inc"
 
 namespace flashinfer {
 
-template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant>
-cudaError_t SingleDecodeWithKVCacheDispatched(typename AttentionVariant::ParamsT params,
-                                              typename AttentionVariant::DTypeO* tmp,
+template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
+          typename Params>
+cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DTypeO* tmp,
                                               cudaStream_t stream);
 }  // namespace flashinfer
 
 using namespace flashinfer;
 
 void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor tmp,
-                                 std::optional<at::Tensor> alibi_slopes, at::Tensor o,
-                                 unsigned int layout, int window_left, float logits_soft_cap,
-                                 float sm_scale, float rope_scale, float rope_theta,
-                                 int64_t cuda_stream) {
+                                 at::Tensor o, unsigned int layout,
+                                 int window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream) {
   CHECK_INPUT(q);
   CHECK_INPUT(k);
   CHECK_INPUT(v);
@@ -64,29 +59,34 @@ void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::T
   }
   CHECK_GQA_HEAD_DIVISIBLE(num_qo_heads, num_kv_heads);
 
-  TORCH_CHECK(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
-
   auto q_scalar_type = q.scalar_type();
   auto kv_scalar_type = k.scalar_type();
 
-  constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-  DISPATCH_PYTORCH_QKV_DTYPE_TO_CTYPE(q_scalar_type, kv_scalar_type, q_type, kv_type, [&] {
-    using DTypeQ = q_type;
-    using DTypeKV = kv_type;
-    using DTypeO = DTypeQ;
-    return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-      return DISPATCH_BOOL(logits_soft_cap > 0, USE_LOGITS_SOFT_CAP, [&] {
-        using ParamsT = SingleDecodeParams<DTypeQ, DTypeKV, DTypeO>;
-        using AttentionVariant =
-            ComposedAttention<ParamsT,
-                              get_variant_code(/*use_custom_mask=*/false,
-                                               /*use_sliding_window=*/true, USE_LOGITS_SOFT_CAP,
-                                               /*use_alibi=*/false)>;
-        ParamsT params(static_cast<DTypeQ*>(q.data_ptr()), static_cast<DTypeKV*>(k.data_ptr()),
-                       static_cast<DTypeKV*>(v.data_ptr()), static_cast<DTypeO*>(o.data_ptr()),
-                       /*alibi_slopes=*/nullptr, kv_len, num_qo_heads, num_kv_heads, kv_layout,
-                       head_dim, window_left, logits_soft_cap, sm_scale, rope_scale, rope_theta);
+
+  DISPATCH_context(
+      DTypeQ, DTypeKV, DTypeO, IdType, HEAD_DIM, POS_ENCODING_MODE, USE_SLIDING_WINDOW,
+      USE_LOGITS_SOFT_CAP, AttentionVariant, Params, [&] {
+        Params params;
+
+        params.q = static_cast<DTypeQ*>(q.data_ptr());
+        params.k = static_cast<DTypeKV*>(k.data_ptr());
+        params.v = static_cast<DTypeKV*>(v.data_ptr());
+        params.o = static_cast<DTypeO*>(o.data_ptr());
+        params.lse = nullptr;
+        params.kv_len = kv_len;
+        params.num_qo_heads = num_qo_heads;
+        params.num_kv_heads = num_kv_heads;
+        params.q_stride_n = num_qo_heads * head_dim;
+        params.q_stride_h = head_dim;
+        params.kv_stride_n = (kv_layout == QKVLayout::kNHD) ? num_kv_heads * head_dim : head_dim;
+        params.kv_stride_h = (kv_layout == QKVLayout::kNHD) ? head_dim : kv_len * head_dim;
+        params.head_dim = head_dim;
+        params.window_left = window_left;
+        params.kv_chunk_size = 0;
+
+        ADDITIONAL_PARAMS_SETTER
+
         cudaError_t status =
             flashinfer::SingleDecodeWithKVCacheDispatched<HEAD_DIM, POS_ENCODING_MODE,
                                                           AttentionVariant>(
@@ -95,6 +95,4 @@ void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::T
                                                std::string(cudaGetErrorString(status)));
         return true;
       });
-    });
-  });
 }

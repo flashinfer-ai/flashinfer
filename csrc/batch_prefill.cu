@@ -14,25 +14,25 @@
  * limitations under the License.
  */
 #include <flashinfer/attention/mask.cuh>
-#include <flashinfer/attention/prefill_params.cuh>
 #include <flashinfer/attention/scheduler.cuh>
-#include <flashinfer/attention/variants.cuh>
+#include <flashinfer/pos_enc.cuh>
 #include <optional>
 
-#include "aot_extension_utils.h"
+#include "batch_prefill_config.inc"
+#include "pytorch_extension_utils.h"
 
 namespace flashinfer {
 
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
-          bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant>
-cudaError_t BatchPrefillWithPagedKVCacheDispatched(typename AttentionVariant::ParamsT params,
-                                                   typename AttentionVariant::DTypeO* tmp_v,
+          bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant,
+          typename Params>
+cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
                                                    float* tmp_s, cudaStream_t stream);
 
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
-          bool ALLOW_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant>
-cudaError_t BatchPrefillWithRaggedKVCacheDispatched(typename AttentionVariant::ParamsT params,
-                                                    typename AttentionVariant::DTypeO* tmp_v,
+          bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant,
+          typename Params>
+cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
                                                     float* tmp_s, cudaStream_t stream);
 
 }  // namespace flashinfer
@@ -40,19 +40,17 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(typename AttentionVariant::P
 using namespace flashinfer;
 
 std::vector<int64_t> BatchPrefillWithKVCachePlan(
-    unsigned int head_dim, at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
+    at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr, at::Tensor kv_indptr,
-    unsigned int total_num_rows, unsigned int batch_size, unsigned int num_qo_heads,
-    unsigned int num_kv_heads, unsigned int page_size, bool enable_cuda_graph,
-    int64_t cuda_stream) {
+    at::Tensor kv_len_arr, unsigned total_num_rows, unsigned int batch_size,
+    unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int page_size,
+    bool enable_cuda_graph, unsigned int head_dim, bool causal, int64_t cuda_stream) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =
       int_workspace_buffer.size(0) * int_workspace_buffer.element_size();
 
   PrefillPlanInfo plan_info;
-
-  using IdType = int32_t;
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaError_t status = PrefillPlan<IdType>(
@@ -69,12 +67,11 @@ std::vector<int64_t> BatchPrefillWithKVCachePlan(
 }
 
 void BatchPrefillWithRaggedKVCacheRun(
-    unsigned int mask_mode_code, at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
+    at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     std::vector<int64_t> plan_info_vec, at::Tensor q, at::Tensor k, at::Tensor v,
-    std::optional<at::Tensor> maybe_custom_mask, std::optional<at::Tensor> maybe_alibi_slopes,
-    at::Tensor qo_indptr, at::Tensor kv_indptr, std::optional<at::Tensor> maybe_qk_indptr,
-    at::Tensor o, unsigned int layout, int32_t window_left, float logits_soft_cap, float sm_scale,
-    float rope_scale, float rope_theta, std::optional<at::Tensor> maybe_lse, int64_t cuda_stream) {
+    at::Tensor qo_indptr, at::Tensor kv_indptr, at::Tensor o, std::optional<at::Tensor> maybe_lse,
+    unsigned int mask_mode_code, unsigned int layout, int32_t window_left ADDITIONAL_FUNC_PARAMS,
+    int64_t cuda_stream) {
   PrefillPlanInfo plan_info;
   plan_info.FromVector(plan_info_vec);
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
@@ -100,101 +97,98 @@ void BatchPrefillWithRaggedKVCacheRun(
   void* float_buffer_ptr = float_workspace_buffer.data_ptr();
   void* int_buffer_ptr = int_workspace_buffer.data_ptr();
 
-  constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;
   const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
-  const bool use_logits_soft_cap = logits_soft_cap > 0.f;
-  using IdType = int32_t;
 
   auto q_scalar_type = q.scalar_type();
   auto kv_scalar_type = k.scalar_type();
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-  DISPATCH_PYTORCH_QKV_DTYPE_TO_CTYPE(q_scalar_type, kv_scalar_type, q_type, kv_type, [&] {
-    using DTypeQ = q_type;
-    using DTypeKV = kv_type;
-    using DTypeO = DTypeQ;
-    return DISPATCH_mask_mode(mask_mode, MASK_MODE, [&] {
-      return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-        return DISPATCH_BOOL(use_logits_soft_cap, USE_LOGITS_SOFT_CAP, [&] {
-          using RaggedParamsT = BatchPrefillRaggedParams<DTypeQ, DTypeKV, DTypeO, IdType>;
-          using RaggedAttentionVariant =
-              ComposedAttention<RaggedParamsT,
-                                get_variant_code(/*use_custom_mask=*/MASK_MODE == MaskMode::kCustom,
-                                                 /*use_sliding_window=*/true, USE_LOGITS_SOFT_CAP,
-                                                 /*use_alibi_slopes=*/false)>;
 
-          RaggedParamsT params(
-              static_cast<DTypeQ*>(q.data_ptr()), static_cast<DTypeKV*>(k.data_ptr()),
-              static_cast<DTypeKV*>(v.data_ptr()),
-              maybe_custom_mask.has_value() ? static_cast<uint8_t*>(maybe_custom_mask->data_ptr())
-                                            : nullptr,
-              static_cast<IdType*>(qo_indptr.data_ptr()),
-              static_cast<IdType*>(kv_indptr.data_ptr()),
-              maybe_qk_indptr.has_value() ? static_cast<IdType*>(maybe_qk_indptr->data_ptr())
-                                          : nullptr,
-              /*q_offset=*/nullptr,
-              /*k_rope_pos_offset=*/nullptr, static_cast<DTypeO*>(o.data_ptr()),
-              /*lse=*/(maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr),
-              /*alibi_slopes=*/nullptr, num_qo_heads, num_kv_heads, q_stride_n, q_stride_h,
-              kv_stride_n, kv_stride_h, window_left, logits_soft_cap, sm_scale, rope_scale,
-              rope_theta);
+  DISPATCH_context(
+      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM, POS_ENCODING_MODE, USE_SLIDING_WINDOW,
+      USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, AttentionVariant, RaggedParams, PagedParams, [&] {
+        RaggedParams params;
 
-          DTypeO* tmp_v = nullptr;
-          float* tmp_s = nullptr;
+        params.q = static_cast<DTypeQ*>(q.data_ptr());
+        params.k = static_cast<DTypeKV*>(k.data_ptr());
+        params.v = static_cast<DTypeKV*>(v.data_ptr());
+        params.o = static_cast<DTypeO*>(o.data_ptr());
+        params.lse = maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
+        params.q_indptr = static_cast<IdType*>(qo_indptr.data_ptr());
+        params.kv_indptr = static_cast<IdType*>(kv_indptr.data_ptr());
+        params.num_qo_heads = num_qo_heads;
+        params.num_kv_heads = num_kv_heads;
+        params.q_stride_n = q_stride_n;
+        params.q_stride_h = q_stride_h;
+        params.kv_stride_n = kv_stride_n;
+        params.kv_stride_h = kv_stride_h;
+        params.window_left = window_left;
 
-          params.request_indices =
-              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.request_indices_offset);
-          params.qo_tile_indices =
-              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_tile_indices_offset);
-          params.kv_tile_indices =
-              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_tile_indices_offset);
-          params.o_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.o_indptr_offset);
-          params.kv_chunk_size_ptr =
-              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_chunk_size_ptr_offset);
-          if (plan_info.split_kv) {
-            params.merge_indptr =
-                GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_indptr_offset);
-            tmp_v = GetPtrFromBaseOffset<DTypeO>(float_buffer_ptr, plan_info.v_offset);
-            tmp_s = GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.s_offset);
-            if (plan_info.enable_cuda_graph) {
-              params.block_valid_mask =
-                  GetPtrFromBaseOffset<bool>(int_buffer_ptr, plan_info.block_valid_mask_offset);
-            }
-          }
-          params.padded_batch_size = plan_info.padded_batch_size;
-          params.max_total_num_rows = plan_info.total_num_rows;
+        params.request_indices = nullptr;
+        params.qo_tile_indices = nullptr;
+        params.kv_tile_indices = nullptr;
+        params.merge_indptr = nullptr;
+        params.o_indptr = nullptr;
+        params.kv_chunk_size_ptr = nullptr;
+        params.block_valid_mask = nullptr;
+        params.total_num_rows = nullptr;
+        params.max_total_num_rows = 0;
+        params.padded_batch_size = 0;
+        params.partition_kv = false;
+
+        ADDITIONAL_PARAMS_SETTER
+
+        DTypeO* tmp_v = nullptr;
+        float* tmp_s = nullptr;
+
+        params.request_indices =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.request_indices_offset);
+        params.qo_tile_indices =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_tile_indices_offset);
+        params.kv_tile_indices =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_tile_indices_offset);
+        params.o_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.o_indptr_offset);
+        params.kv_chunk_size_ptr =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_chunk_size_ptr_offset);
+        if (plan_info.split_kv) {
+          params.merge_indptr =
+              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_indptr_offset);
+          tmp_v = GetPtrFromBaseOffset<DTypeO>(float_buffer_ptr, plan_info.v_offset);
+          tmp_s = GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.s_offset);
           if (plan_info.enable_cuda_graph) {
-            params.total_num_rows =
-                GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr, plan_info.total_num_rows_offset);
+            params.block_valid_mask =
+                GetPtrFromBaseOffset<bool>(int_buffer_ptr, plan_info.block_valid_mask_offset);
           }
+        }
+        params.padded_batch_size = plan_info.padded_batch_size;
+        params.max_total_num_rows = plan_info.total_num_rows;
+        if (plan_info.enable_cuda_graph) {
+          params.total_num_rows =
+              GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr, plan_info.total_num_rows_offset);
+        }
 
-          cudaError_t status = cudaSuccess;
+        cudaError_t status = cudaSuccess;
 
-          DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
-            status = flashinfer::BatchPrefillWithRaggedKVCacheDispatched<
-                CTA_TILE_Q, HEAD_DIM, POS_ENCODING_MODE,
-                /*use_fp16_qk_reduction=*/false, MASK_MODE, RaggedAttentionVariant>(params, tmp_v,
-                                                                                    tmp_s, stream);
-          });
-
-          TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithRaggedKVCache failed with error ",
-                      cudaGetErrorString(status));
-          return true;
+        DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
+          status = flashinfer::BatchPrefillWithRaggedKVCacheDispatched<
+              CTA_TILE_Q, HEAD_DIM, POS_ENCODING_MODE,
+              /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant,
+              RaggedParams>(params, tmp_v, tmp_s, stream);
         });
+
+        TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithRaggedKVCache failed with error ",
+                    cudaGetErrorString(status));
+        return true;
       });
-    });
-  });
 }
 
 void BatchPrefillWithPagedKVCacheRun(
-    unsigned int mask_mode_code, at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
+    at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     std::vector<int64_t> plan_info_vec, at::Tensor q, at::Tensor paged_k_cache,
-    at::Tensor paged_v_cache, std::optional<at::Tensor> maybe_custom_mask,
-    std::optional<at::Tensor> maybe_alibi_slopes, at::Tensor qo_indptr, at::Tensor paged_kv_indptr,
-    at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len,
-    std::optional<at::Tensor> maybe_qk_indptr, at::Tensor o, unsigned int layout,
-    int32_t window_left, float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta,
-    std::optional<at::Tensor> maybe_lse, int64_t cuda_stream) {
+    at::Tensor paged_v_cache, at::Tensor qo_indptr, at::Tensor paged_kv_indptr,
+    at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len, at::Tensor o,
+    std::optional<at::Tensor> maybe_lse, unsigned int mask_mode_code, unsigned int layout,
+    int32_t window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream) {
   PrefillPlanInfo plan_info;
   plan_info.FromVector(plan_info_vec);
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
@@ -220,10 +214,7 @@ void BatchPrefillWithPagedKVCacheRun(
   void* float_buffer_ptr = static_cast<void*>(float_workspace_buffer.data_ptr());
   void* int_buffer_ptr = static_cast<void*>(int_workspace_buffer.data_ptr());
 
-  constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;
   const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
-  using IdType = int32_t;
-  bool use_logits_soft_cap = logits_soft_cap > 0.f;
   auto q_scalar_type = q.scalar_type();
   auto kv_scalar_type = paged_k_cache.scalar_type();
 
@@ -240,82 +231,83 @@ void BatchPrefillWithPagedKVCacheRun(
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
 
-  DISPATCH_PYTORCH_QKV_DTYPE_TO_CTYPE(q_scalar_type, kv_scalar_type, q_type, kv_type, [&] {
-    using DTypeQ = q_type;
-    using DTypeKV = kv_type;
-    using DTypeO = DTypeQ;
-    return DISPATCH_mask_mode(mask_mode, MASK_MODE, [&] {
-      return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-        return DISPATCH_BOOL(use_logits_soft_cap, USE_LOGITS_SOFT_CAP, [&] {
-          paged_kv_t<DTypeKV, IdType> paged_kv(
-              num_kv_heads, page_size, HEAD_DIM, batch_size, kv_layout,
-              static_cast<DTypeKV*>(paged_k_cache.data_ptr()),
-              static_cast<DTypeKV*>(paged_v_cache.data_ptr()), kv_cache_strides,
-              static_cast<IdType*>(paged_kv_indices.data_ptr()),
-              static_cast<IdType*>(paged_kv_indptr.data_ptr()),
-              static_cast<IdType*>(paged_kv_last_page_len.data_ptr()));
+  DISPATCH_context(
+      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM, POS_ENCODING_MODE, USE_SLIDING_WINDOW,
+      USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, AttentionVariant, RaggedParams, PagedParams, [&] {
+        PagedParams params;
 
-          using PagedParamsT = BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO, IdType>;
-          using PagedAttentionVariant =
-              ComposedAttention<PagedParamsT,
-                                get_variant_code(/*use_custom_mask=*/MASK_MODE == MaskMode::kCustom,
-                                                 /*use_sliding_window=*/true, USE_LOGITS_SOFT_CAP,
-                                                 /*use_alibi_slopes=*/false)>;
-          PagedParamsT params(
-              static_cast<DTypeQ*>(q.data_ptr()), paged_kv,
-              maybe_custom_mask.has_value() ? static_cast<uint8_t*>(maybe_custom_mask->data_ptr())
-                                            : nullptr,
-              static_cast<IdType*>(qo_indptr.data_ptr()),
-              maybe_qk_indptr.has_value() ? static_cast<IdType*>(maybe_qk_indptr->data_ptr())
-                                          : nullptr,
-              /*q_offset=*/nullptr, static_cast<DTypeO*>(o.data_ptr()),
-              /*lse=*/(maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr),
-              /*alibi_slopes=*/nullptr, num_qo_heads, q_stride_n, q_stride_h, window_left,
-              logits_soft_cap, sm_scale, rope_scale, rope_theta);
+        params.q = static_cast<DTypeQ*>(q.data_ptr());
+        paged_kv_t<DTypeKV, IdType> paged_kv(
+            num_kv_heads, page_size, HEAD_DIM, batch_size, kv_layout,
+            static_cast<DTypeKV*>(paged_k_cache.data_ptr()),
+            static_cast<DTypeKV*>(paged_v_cache.data_ptr()), kv_cache_strides,
+            static_cast<IdType*>(paged_kv_indices.data_ptr()),
+            static_cast<IdType*>(paged_kv_indptr.data_ptr()),
+            static_cast<IdType*>(paged_kv_last_page_len.data_ptr()));
+        params.paged_kv = paged_kv;
+        params.q_indptr = static_cast<IdType*>(qo_indptr.data_ptr());
+        params.o = static_cast<DTypeO*>(o.data_ptr());
 
-          DTypeO* tmp_v = nullptr;
-          float* tmp_s = nullptr;
+        params.lse = maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
+        params.num_qo_heads = num_qo_heads;
+        params.q_stride_n = q_stride_n;
+        params.q_stride_h = q_stride_h;
+        params.window_left = window_left;
 
-          params.request_indices =
-              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.request_indices_offset);
-          params.qo_tile_indices =
-              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_tile_indices_offset);
-          params.kv_tile_indices =
-              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_tile_indices_offset);
-          params.o_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.o_indptr_offset);
-          params.kv_chunk_size_ptr =
-              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_chunk_size_ptr_offset);
-          if (plan_info.split_kv) {
-            params.merge_indptr =
-                GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_indptr_offset);
-            tmp_v = GetPtrFromBaseOffset<DTypeO>(float_buffer_ptr, plan_info.v_offset);
-            tmp_s = GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.s_offset);
-            if (plan_info.enable_cuda_graph) {
-              params.block_valid_mask =
-                  GetPtrFromBaseOffset<bool>(int_buffer_ptr, plan_info.block_valid_mask_offset);
-            }
-          }
-          params.padded_batch_size = plan_info.padded_batch_size;
-          params.max_total_num_rows = plan_info.total_num_rows;
+        params.request_indices = nullptr;
+        params.qo_tile_indices = nullptr;
+        params.kv_tile_indices = nullptr;
+        params.merge_indptr = nullptr;
+        params.o_indptr = nullptr;
+        params.kv_chunk_size_ptr = nullptr;
+        params.block_valid_mask = nullptr;
+        params.total_num_rows = nullptr;
+        params.max_total_num_rows = 0;
+        params.padded_batch_size = 0;
+        params.partition_kv = false;
+
+        ADDITIONAL_PARAMS_SETTER
+
+        DTypeO* tmp_v = nullptr;
+        float* tmp_s = nullptr;
+
+        params.request_indices =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.request_indices_offset);
+        params.qo_tile_indices =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.qo_tile_indices_offset);
+        params.kv_tile_indices =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_tile_indices_offset);
+        params.o_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.o_indptr_offset);
+        params.kv_chunk_size_ptr =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_chunk_size_ptr_offset);
+        if (plan_info.split_kv) {
+          params.merge_indptr =
+              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_indptr_offset);
+          tmp_v = GetPtrFromBaseOffset<DTypeO>(float_buffer_ptr, plan_info.v_offset);
+          tmp_s = GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.s_offset);
           if (plan_info.enable_cuda_graph) {
-            params.total_num_rows =
-                GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr, plan_info.total_num_rows_offset);
+            params.block_valid_mask =
+                GetPtrFromBaseOffset<bool>(int_buffer_ptr, plan_info.block_valid_mask_offset);
           }
+        }
+        params.padded_batch_size = plan_info.padded_batch_size;
+        params.max_total_num_rows = plan_info.total_num_rows;
+        if (plan_info.enable_cuda_graph) {
+          params.total_num_rows =
+              GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr, plan_info.total_num_rows_offset);
+        }
 
-          cudaError_t status = cudaSuccess;
+        cudaError_t status = cudaSuccess;
 
-          DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
-            status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
-                CTA_TILE_Q, HEAD_DIM, POS_ENCODING_MODE,
-                /*use_fp16_qk_reduction=*/false, MASK_MODE, PagedAttentionVariant>(params, tmp_v,
-                                                                                   tmp_s, stream);
-          });
-
-          TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithPagedKVCache failed with error ",
-                      cudaGetErrorString(status));
-          return true;
+        DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
+          status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
+              CTA_TILE_Q, HEAD_DIM, POS_ENCODING_MODE,
+              /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant,
+              PagedParams>(params, tmp_v, tmp_s, stream);
         });
+
+        TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithPagedKVCache failed with error ",
+                    cudaGetErrorString(status));
+        return true;
       });
-    });
-  });
 }

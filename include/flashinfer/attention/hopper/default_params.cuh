@@ -35,6 +35,11 @@ struct SinglePrefillParams {
   DTypeO* o_ptr;
   float* lse_ptr;
 
+  struct AdditionalParams {
+    float logits_soft_cap;
+    float sm_scale;
+  } additional_params;
+
   int64_t q_stride_n;
   int64_t k_stride_n;
   int64_t v_stride_n;
@@ -52,11 +57,7 @@ struct SinglePrefillParams {
   int group_size;
   int window_left;
 
-  float logits_soft_cap;
-  float sm_scale_log2;
   bool causal;
-
-  struct AdditionalParams {};
 };
 
 template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_>
@@ -80,6 +81,11 @@ struct BatchPrefillRaggedParams {
   IdType* head_indices;
   IdType* work_indptr;
 
+  struct AdditionalParams {
+    float logits_soft_cap;
+    float sm_scale;
+  } additional_params;
+
   int64_t q_stride_n;
   int64_t k_stride_n;
   int64_t v_stride_n;
@@ -97,11 +103,7 @@ struct BatchPrefillRaggedParams {
   int group_size;
   int window_left;
 
-  float logits_soft_cap;
-  float sm_scale_log2;
   bool causal;
-
-  struct AdditionalParams {};
 };
 
 template <typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_>
@@ -126,6 +128,11 @@ struct BatchPrefillPagedParams {
   IdType* head_indices;
   IdType* work_indptr;
 
+  struct AdditionalParams {
+    float logits_soft_cap;
+    float sm_scale;
+  } additional_params;
+
   int64_t q_stride_n;
   int64_t k_stride_n;
   int64_t v_stride_n;
@@ -143,11 +150,7 @@ struct BatchPrefillPagedParams {
   int page_size;
   int window_left;
 
-  float logits_soft_cap;
-  float sm_scale_log2;
   bool causal;
-
-  struct AdditionalParams {};
 };
 
 }  // namespace flashinfer

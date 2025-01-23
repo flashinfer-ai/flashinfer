@@ -1,0 +1,15 @@
+#include <flashinfer/attention/hopper/prefill_sm90.cuh>
+#include "batch_prefill_sm90_config.inc"
+
+namespace flashinfer {
+
+{% for same_scheduler_for_all_heads in ["true", "false"] %}
+template cudaError_t BatchPrefillWithRaggedKVCacheDispatched
+    <{{ head_dim }},
+     {{ mask_mode }},
+     /*USE_SLIDING_WINDOW=*/{{ use_sliding_window }},
+     /*SAME_SCHEDULER_FOR_ALL_HEADS=*/{{ same_scheduler_for_all_heads }},
+     {{ variant_name }}>(RaggedParams& params, cudaStream_t stream);
+{% endfor %}
+
+};  // namespace flashinfer

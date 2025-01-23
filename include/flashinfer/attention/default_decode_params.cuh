@@ -36,7 +36,7 @@ struct SingleDecodeParams {
   DTypeKV* v;
   DTypeO* o;
   float* lse;
-  float* alibi_slopes;
+  float* maybe_alibi_slopes;
   uint32_t kv_len;
   uint32_t num_qo_heads;
   uint32_t num_kv_heads;
@@ -52,8 +52,30 @@ struct SingleDecodeParams {
   float rope_rcp_theta;
   uint32_t kv_chunk_size;
 
+  __device__ __host__ SingleDecodeParams()
+      : q(nullptr),
+        k(nullptr),
+        v(nullptr),
+        o(nullptr),
+        lse(nullptr),
+        maybe_alibi_slopes(nullptr),
+        kv_len(0),
+        num_qo_heads(0),
+        num_kv_heads(0),
+        q_stride_n(0),
+        q_stride_h(0),
+        kv_stride_n(0),
+        kv_stride_h(0),
+        head_dim(0),
+        window_left(0),
+        logits_soft_cap(0.0f),
+        sm_scale(0.0f),
+        rope_rcp_scale(0.0f),
+        rope_rcp_theta(0.0f),
+        kv_chunk_size(0) {}
+
   __device__ __host__ SingleDecodeParams(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeO* o,
-                                         float* alibi_slopes, uint32_t seq_len,
+                                         float* maybe_alibi_slopes, uint32_t seq_len,
                                          uint32_t num_qo_heads, uint32_t num_kv_heads,
                                          QKVLayout kv_layout, uint32_t head_dim,
                                          int32_t window_left, float logits_soft_cap, float sm_scale,
@@ -63,7 +85,7 @@ struct SingleDecodeParams {
         v(v),
         o(o),
         lse(nullptr),
-        alibi_slopes(alibi_slopes),
+        maybe_alibi_slopes(maybe_alibi_slopes),
         kv_len(seq_len),
         num_qo_heads(num_qo_heads),
         num_kv_heads(num_kv_heads),
@@ -112,11 +134,11 @@ struct BatchDecodeParams {
   using IdType = IdType_;
 
   DTypeQ* q;
-  IdType* q_offset;
+  IdType* q_rope_offset;
   paged_kv_t<DTypeKV, IdType> paged_kv;
   DTypeO* o;
   float* lse;
-  float* alibi_slopes;
+  float* maybe_alibi_slopes;
   uint32_t padded_batch_size;
   uint32_t num_qo_heads;
   IdType q_stride_n;
@@ -134,18 +156,41 @@ struct BatchDecodeParams {
   bool* block_valid_mask;
   bool partition_kv;
 
-  __device__ __host__ BatchDecodeParams(DTypeQ* q, IdType* q_offset,
+  __device__ __host__ BatchDecodeParams()
+      : q(nullptr),
+        q_rope_offset(nullptr),
+        paged_kv(),
+        o(nullptr),
+        lse(nullptr),
+        maybe_alibi_slopes(nullptr),
+        padded_batch_size(0),
+        num_qo_heads(0),
+        q_stride_n(0),
+        q_stride_h(0),
+        window_left(0),
+        logits_soft_cap(0.0f),
+        sm_scale(0.0f),
+        rope_rcp_scale(0.0f),
+        rope_rcp_theta(0.0f),
+        request_indices(nullptr),
+        kv_tile_indices(nullptr),
+        o_indptr(nullptr),
+        kv_chunk_size_ptr(nullptr),
+        block_valid_mask(nullptr),
+        partition_kv(false) {}
+
+  __device__ __host__ BatchDecodeParams(DTypeQ* q, IdType* q_rope_offset,
                                         paged_kv_t<DTypeKV, IdType> paged_kv, DTypeO* o, float* lse,
-                                        float* alibi_slopes, uint32_t num_qo_heads,
+                                        float* maybe_alibi_slopes, uint32_t num_qo_heads,
                                         IdType q_stride_n, IdType q_stride_h, int32_t window_left,
                                         float logits_soft_cap, float sm_scale, float rope_scale,
                                         float rope_theta)
       : q(q),
-        q_offset(q_offset),
+        q_rope_offset(q_rope_offset),
         paged_kv(paged_kv),
         o(o),
         lse(lse),
-        alibi_slopes(alibi_slopes),
+        maybe_alibi_slopes(maybe_alibi_slopes),
         padded_batch_size(0),
         num_qo_heads(num_qo_heads),
         q_stride_n(q_stride_n),
@@ -182,7 +227,7 @@ struct BatchDecodeParamsMLA {
   float* lse;
   float sm_scale;
 
-  IdType* q_offset;
+  IdType* q_rope_offset;
   paged_kv_mla_t<DTypeKV, IdType> paged_kv;
   uint32_t padded_batch_size;
   uint32_t num_qo_heads;
@@ -198,7 +243,28 @@ struct BatchDecodeParamsMLA {
   bool* block_valid_mask;
   bool partition_kv;
 
-  __device__ __host__ BatchDecodeParamsMLA(DTypeQ* q_nope, DTypeQ* q_pe, IdType* q_offset,
+  __device__ __host__ BatchDecodeParamsMLA()
+      : q_nope(nullptr),
+        q_pe(nullptr),
+        o(nullptr),
+        lse(nullptr),
+        sm_scale(0.0f),
+        q_rope_offset(nullptr),
+        paged_kv(),
+        padded_batch_size(0),
+        num_qo_heads(0),
+        window_left(0),
+        logits_soft_cap(0.0f),
+        rope_rcp_scale(0.0f),
+        rope_rcp_theta(0.0f),
+        request_indices(nullptr),
+        kv_tile_indices(nullptr),
+        o_indptr(nullptr),
+        kv_chunk_size_ptr(nullptr),
+        block_valid_mask(nullptr),
+        partition_kv(false) {}
+
+  __device__ __host__ BatchDecodeParamsMLA(DTypeQ* q_nope, DTypeQ* q_pe, IdType* q_rope_offset,
                                            paged_kv_mla_t<DTypeKV, IdType> paged_kv, DTypeO* o,
                                            float* lse, uint32_t num_qo_heads, int32_t window_left,
                                            float logits_soft_cap, float sm_scale, float rope_scale,
@@ -208,7 +274,7 @@ struct BatchDecodeParamsMLA {
         o(o),
         lse(lse),
         sm_scale(sm_scale),
-        q_offset(q_offset),
+        q_rope_offset(q_rope_offset),
         paged_kv(paged_kv),
         padded_batch_size(0),
         num_qo_heads(num_qo_heads),

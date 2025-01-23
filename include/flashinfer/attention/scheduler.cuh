@@ -33,13 +33,14 @@
 namespace flashinfer {
 
 template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
-          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant>
-__global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__
-                                                  typename AttentionVariant::ParamsT params);
+          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
+          typename Params>
+__global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params params);
 
 template <uint32_t num_stages_smem, uint32_t vec_size_ckv, uint32_t vec_size_kpe, uint32_t bdx,
-          uint32_t bdy, uint32_t bdz, uint32_t tile_size_qo_heads, typename AttentionVariant>
-__global__ void BatchDecodeWithPagedKVCacheKernelMLA(typename AttentionVariant::ParamsT params);
+          uint32_t bdy, uint32_t bdz, uint32_t tile_size_qo_heads, typename AttentionVariant,
+          typename Params>
+__global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params);
 
 /*!
  * \brief Compute the maximum number of pages per batch and the new batch size
@@ -101,8 +102,8 @@ inline auto PrefillBinarySearchKVChunkSize(const bool enable_cuda_graph,
     const int64_t mid = (low + high) / 2;
     int64_t new_batch_size = 0;
     for (uint32_t i = 0; i < batch_size; ++i) {
-      new_batch_size +=
-          ceil_div(packed_qo_len_arr[i], qo_chunk_size) * ceil_div(std::max(kv_len_arr[i], min_kv_len), mid);
+      new_batch_size += ceil_div(packed_qo_len_arr[i], qo_chunk_size) *
+                        ceil_div(std::max(kv_len_arr[i], min_kv_len), mid);
     }
     if (new_batch_size > max_batch_size_if_split) {
       low = mid + 1;
@@ -130,14 +131,14 @@ inline auto PrefillBinarySearchKVChunkSize(const bool enable_cuda_graph,
  * \return status Indicates whether CUDA calls are successful
  */
 template <uint32_t GROUP_SIZE, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
-          typename AttentionVariant>
+          typename AttentionVariant, typename Params>
 inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     bool& split_kv, uint32_t& max_grid_size, uint32_t& max_num_pages_per_batch,
     uint32_t& new_batch_size, uint32_t& gdy, uint32_t batch_size,
-    typename AttentionVariant::IdType* kv_indptr_h, const uint32_t num_qo_heads,
-    const uint32_t page_size, bool enable_cuda_graph, cudaStream_t stream) {
-  using DTypeKV = typename AttentionVariant::DTypeKV;
-  using IdType = typename AttentionVariant::IdType;
+    typename Params::IdType* kv_indptr_h, const uint32_t num_qo_heads, const uint32_t page_size,
+    bool enable_cuda_graph, cudaStream_t stream) {
+  using DTypeKV = typename Params::DTypeKV;
+  using IdType = typename Params::IdType;
   constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL);
   auto compute_capacity = GetCudaComputeCapability();
   DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
@@ -155,7 +156,7 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
 
     auto kernel =
         BatchDecodeWithPagedKVCacheKernel<POS_ENCODING_MODE, NUM_STAGES_SMEM, tile_size_per_bdx,
-                                          vec_size, bdx, bdy, bdz, AttentionVariant>;
+                                          vec_size, bdx, bdy, bdz, AttentionVariant, Params>;
     int num_blocks_per_sm = 0;
     int num_sm = 0;
     int dev_id = 0;
@@ -193,14 +194,14 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
   })
 }
 
-template <uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename AttentionVariant>
-cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA(
+template <uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename AttentionVariant, typename Params>
+inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA(
     bool& split_kv, uint32_t& max_grid_size, uint32_t& max_num_pages_per_batch,
     uint32_t& new_batch_size, uint32_t& gdy, uint32_t batch_size,
-    typename AttentionVariant::IdType* kv_indptr_h, const uint32_t num_qo_heads,
-    const uint32_t page_size, bool enable_cuda_graph, cudaStream_t stream) {
-  using DTypeKV = typename AttentionVariant::DTypeKV;
-  using IdType = typename AttentionVariant::IdType;
+    typename Params::IdType* kv_indptr_h, const uint32_t num_qo_heads, const uint32_t page_size,
+    bool enable_cuda_graph, cudaStream_t stream) {
+  using DTypeKV = typename Params::DTypeKV;
+  using IdType = typename Params::IdType;
 
   auto compute_capacity = GetCudaComputeCapability();
   DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
@@ -221,7 +222,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA(
 
     auto kernel =
         BatchDecodeWithPagedKVCacheKernelMLA<NUM_STAGES_SMEM, vec_size_ckv, vec_size_kpe, bdx, bdy,
-                                             bdz, tile_size_qo_heads, AttentionVariant>;
+                                             bdz, tile_size_qo_heads, AttentionVariant, Params>;
     int num_blocks_per_sm = 0;
     int num_sm = 0;
     int dev_id = 0;
@@ -347,15 +348,15 @@ struct DecodePlanInfo {
 };
 
 template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
-          typename WorkEstimationFunc>
+          typename Params, typename WorkEstimationFunc>
 inline cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in_bytes,
                               void* int_buffer, void* page_locked_int_buffer,
                               size_t int_workspace_size_in_bytes, DecodePlanInfo& plan_info,
-                              typename AttentionVariant::IdType* indptr_h, uint32_t batch_size,
+                              typename Params::IdType* indptr_h, uint32_t batch_size,
                               uint32_t num_qo_heads, uint32_t page_size, bool enable_cuda_graph,
                               cudaStream_t stream, WorkEstimationFunc work_estimation_func) {
-  using DTypeO = typename AttentionVariant::DTypeO;
-  using IdType = typename AttentionVariant::IdType;
+  using DTypeO = typename Params::DTypeO;
+  using IdType = typename Params::IdType;
   bool split_kv;
   uint32_t max_grid_size, kv_chunk_size_in_pages, new_batch_size, gdy;
 
@@ -782,14 +783,15 @@ struct PrefillPlanSM90Info {
 };
 
 template <typename IdType>
-cudaError_t PrefillSM90Plan(void* float_buffer, size_t float_workspace_size_in_bytes,
-                            void* int_buffer, void* page_locked_int_buffer,
-                            size_t int_workspace_size_in_bytes, PrefillPlanSM90Info& plan_info,
-                            IdType* qo_indptr_h, IdType* kv_indptr_h, IdType* kv_len_arr_h,
-                            uint32_t total_num_rows, uint32_t batch_size, uint32_t num_qo_heads,
-                            uint32_t num_kv_heads, uint32_t head_dim, uint32_t page_size,
-                            bool causal, bool enable_cuda_graph, uint32_t sizeof_dtype_o,
-                            cudaStream_t stream) {
+inline cudaError_t PrefillSM90Plan(void* float_buffer, size_t float_workspace_size_in_bytes,
+                                   void* int_buffer, void* page_locked_int_buffer,
+                                   size_t int_workspace_size_in_bytes,
+                                   PrefillPlanSM90Info& plan_info, IdType* qo_indptr_h,
+                                   IdType* kv_indptr_h, IdType* kv_len_arr_h,
+                                   uint32_t total_num_rows, uint32_t batch_size,
+                                   uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
+                                   uint32_t page_size, bool causal, bool enable_cuda_graph,
+                                   uint32_t sizeof_dtype_o, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -832,7 +834,7 @@ cudaError_t PrefillSM90Plan(void* float_buffer, size_t float_workspace_size_in_b
       cta_kv_len(num_sm90_ctas, std::vector<IdType>()),
       cta_head_indices(num_sm90_ctas, std::vector<IdType>());
 
-  int max_num_works_per_head = ceil_div(total_num_rows, cta_tile_q);
+  int max_num_works_per_head = ceil_div(total_num_rows, cta_tile_q) + batch_size - 1;
   plan_info.same_schedule_for_all_heads = max_num_works_per_head > 4096;
 
   for (int qo_head_idx = 0;

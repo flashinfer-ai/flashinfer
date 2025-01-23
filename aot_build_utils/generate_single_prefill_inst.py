@@ -18,17 +18,13 @@ import re
 import sys
 from pathlib import Path
 
-from .literal_map import (
-    dtype_literal,
-    mask_mode_literal,
-    pos_encoding_mode_literal,
-)
+from .literal_map import dtype_literal, mask_mode_literal, pos_encoding_mode_literal
 
 
 def get_cu_file_str(
     head_dim,
     pos_encoding_mode,
-    allow_fp16_qk_reduction,
+    use_fp16_qk_reduction,
     mask_mode,
     dtype_q,
     dtype_kv,
@@ -38,17 +34,29 @@ def get_cu_file_str(
 
 namespace flashinfer {{
 
-using ParamsT = SinglePrefillParams<{dtype_q}, {dtype_kv}, {dtype_out}>;
+using Params = SinglePrefillParams<{dtype_q}, {dtype_kv}, {dtype_out}>;
 
-template cudaError_t SinglePrefillWithKVCacheDispatched<{head_dim}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, ComposedAttention<ParamsT, get_variant_code(
-    {use_custom_mask}, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false)>>(
-    ParamsT params,
+template cudaError_t SinglePrefillWithKVCacheDispatched<{head_dim}, {pos_encoding_mode}, {use_fp16_qk_reduction}, {mask_mode}, DefaultAttention<
+    {use_custom_mask}, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false>, Params>(
+    Params params,
     {dtype_out}* tmp,
     cudaStream_t stream);
 
-template cudaError_t SinglePrefillWithKVCacheDispatched<{head_dim}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, ComposedAttention<ParamsT, get_variant_code(
-    {use_custom_mask}, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false)>>(
-    ParamsT params,
+template cudaError_t SinglePrefillWithKVCacheDispatched<{head_dim}, {pos_encoding_mode}, {use_fp16_qk_reduction}, {mask_mode}, DefaultAttention<
+    {use_custom_mask}, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false>, Params>(
+    Params params,
+    {dtype_out}* tmp,
+    cudaStream_t stream);
+
+template cudaError_t SinglePrefillWithKVCacheDispatched<{head_dim}, {pos_encoding_mode}, {use_fp16_qk_reduction}, {mask_mode}, DefaultAttention<
+    {use_custom_mask}, /*use_sliding_window=*/false, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false>, Params>(
+    Params params,
+    {dtype_out}* tmp,
+    cudaStream_t stream);
+
+template cudaError_t SinglePrefillWithKVCacheDispatched<{head_dim}, {pos_encoding_mode}, {use_fp16_qk_reduction}, {mask_mode}, DefaultAttention<
+    {use_custom_mask}, /*use_sliding_window=*/false, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false>, Params>(
+    Params params,
     {dtype_out}* tmp,
     cudaStream_t stream);
 
@@ -56,7 +64,7 @@ template cudaError_t SinglePrefillWithKVCacheDispatched<{head_dim}, {pos_encodin
     """.format(
         head_dim=head_dim,
         pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
-        allow_fp16_qk_reduction=allow_fp16_qk_reduction,
+        use_fp16_qk_reduction=use_fp16_qk_reduction,
         mask_mode=mask_mode_literal[int(mask_mode)],
         dtype_q=dtype_literal[dtype_q],
         dtype_kv=dtype_literal[dtype_kv],

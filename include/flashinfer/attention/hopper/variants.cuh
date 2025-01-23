@@ -23,18 +23,12 @@
 
 namespace flashinfer {
 
-template <typename ParamsT_>
 struct StandardAttention {
-  using ParamsT = ParamsT_;
-  using DTypeQ = typename ParamsT::DTypeQ;
-  using DTypeKV = typename ParamsT::DTypeKV;
-  using DTypeO = typename ParamsT::DTypeO;
-  using IdType = typename ParamsT::IdType;
-
   template <int NUM_ROWS_PER_THREAD>
   using Updater = OnlineSoftmaxWithScale<NUM_ROWS_PER_THREAD>;
 
-  __device__ StandardAttention(const ParamsT& params) {}
+  template <typename MainloopParams, typename BlockCoord>
+  __device__ StandardAttention(const MainloopParams& params, const BlockCoord& block_coord) {}
 
   template <typename MainloopParams, typename T>
   __device__ __forceinline__ T LogitsTransform(const MainloopParams& params, T logits,
@@ -44,22 +38,18 @@ struct StandardAttention {
   }
 };
 
-template <typename ParamsT_>
 struct LogitsSoftCap {
-  using ParamsT = ParamsT_;
-  using DTypeQ = typename ParamsT::DTypeQ;
-  using DTypeKV = typename ParamsT::DTypeKV;
-  using DTypeO = typename ParamsT::DTypeO;
-  using IdType = typename ParamsT::IdType;
   float pre_tanh_scale;
   float post_tanh_scale;
 
   template <int NUM_ROWS_PER_THREAD>
   using Updater = OnlineSoftmaxWithoutScale<NUM_ROWS_PER_THREAD>;
 
-  __device__ LogitsSoftCap(const ParamsT& params) {
-    pre_tanh_scale = (params.sm_scale_log2 * math::loge2) * math::ptx_rcp(params.logits_soft_cap);
-    post_tanh_scale = math::log2e * params.logits_soft_cap;
+  template <typename MainloopParams, typename BlockCoord>
+  __device__ LogitsSoftCap(const MainloopParams& params, const BlockCoord& block_coord) {
+    pre_tanh_scale =
+        params.additional_params.sm_scale * math::ptx_rcp(params.additional_params.logits_soft_cap);
+    post_tanh_scale = math::log2e * params.additional_params.logits_soft_cap;
   }
 
   template <typename MainloopParams, typename T>
@@ -69,6 +59,9 @@ struct LogitsSoftCap {
     return math::tanh(logits * pre_tanh_scale) * post_tanh_scale;
   }
 };
+
+template <bool use_logits_soft_cap>
+using DefaultAttention = std::conditional_t<use_logits_soft_cap, LogitsSoftCap, StandardAttention>;
 
 }  // namespace flashinfer
 

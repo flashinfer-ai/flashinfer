@@ -43,7 +43,7 @@ def warmup_jit():
                     [0],  # pos_encoding_modes
                     [False, True],  # use_sliding_windows
                     [False],  # use_logits_soft_caps
-                    [False],  # allow_fp16_qk_reductions
+                    [False],  # use_fp16_qk_reductions
                 )
             )
         except Exception as e:
@@ -301,11 +301,7 @@ def test_batch_paged_prefill_sliding_window(
             dim=0,
         )
         o_ref_i = flashinfer.single_prefill_with_kv_cache(
-            qi,
-            ki,
-            vi,
-            window_left=window_left,
-            causal=True,
+            qi, ki, vi, window_left=window_left, causal=True, backend="fa2"
         )
         o_i = o[q_indptr[i] : q_indptr[i + 1]]
         torch.testing.assert_close(o_i, o_ref_i, rtol=1e-3, atol=1e-3)

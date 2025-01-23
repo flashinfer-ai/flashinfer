@@ -29,7 +29,7 @@ from .literal_map import (
 def get_cu_file_str(
     head_dim,
     pos_encoding_mode,
-    allow_fp16_qk_reduction,
+    use_fp16_qk_reduction,
     mask_mode,
     dtype_q,
     dtype_kv,
@@ -41,15 +41,15 @@ def get_cu_file_str(
     def get_insts(attention_variant, dtype_out):
         return "\n".join(
             [
-                """template cudaError_t BatchPrefillWithRaggedKVCacheDispatched<{cta_tile_q}, {head_dim}, {pos_encoding_mode}, {allow_fp16_qk_reduction}, {mask_mode}, {attention_variant}>(
-    ParamsT params,
+                """template cudaError_t BatchPrefillWithRaggedKVCacheDispatched<{cta_tile_q}, {head_dim}, {pos_encoding_mode}, {use_fp16_qk_reduction}, {mask_mode}, {attention_variant}, Params>(
+    Params params,
     {dtype_out}* tmp_v,
     float* tmp_s, cudaStream_t stream);
         """.format(
                     cta_tile_q=cta_tile_q,
                     head_dim=head_dim,
                     pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
-                    allow_fp16_qk_reduction=allow_fp16_qk_reduction,
+                    use_fp16_qk_reduction=use_fp16_qk_reduction,
                     mask_mode=mask_mode_literal[int(mask_mode)],
                     attention_variant=attention_variant,
                     dtype_out=dtype_out,
@@ -69,17 +69,23 @@ def get_cu_file_str(
 
 namespace flashinfer {{
 
-using ParamsT = BatchPrefillRaggedParams<{dtype_q}, {dtype_kv}, {dtype_out}, {idtype}>;
+using Params = BatchPrefillRaggedParams<{dtype_q}, {dtype_kv}, {dtype_out}, {idtype}>;
 
-using AttentionVariant1 = ComposedAttention<ParamsT, get_variant_code(
-    {use_custom_mask}, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false)>;
+using AttentionVariant1 = DefaultAttention<{use_custom_mask}, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false>;
 
 {get_insts("AttentionVariant1", dtype_out)}
 
-using AttentionVariant2 = ComposedAttention<ParamsT, get_variant_code(
-    {use_custom_mask}, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false)>;
+using AttentionVariant2 = DefaultAttention<{use_custom_mask}, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false>;
 
 {get_insts("AttentionVariant2", dtype_out)}
+
+using AttentionVariant3 = DefaultAttention<{use_custom_mask}, /*use_sliding_window=*/false, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false>;
+
+{get_insts("AttentionVariant3", dtype_out)}
+
+using AttentionVariant4 = DefaultAttention<{use_custom_mask}, /*use_sliding_window=*/false, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false>;
+
+{get_insts("AttentionVariant4", dtype_out)}
 
 }}
     """

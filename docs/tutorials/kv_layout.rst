@@ -72,10 +72,10 @@ variable sequence lengths of each request,
 ``kv_indptr[i+1]-kv_indptr[i]`` is the kv length of request ``i`` (``kv_len[i]``).
 
 The mask array of all requests are flattened (with query as the first dimension, and kv as last dimension)
-and concatenated into a single 1D array: ``mask_data``. FlashInfer will create a ``qk_indptr`` array implicitly
-to store the start offset of each request's mask in the flattened mask array: ``qk_indptr[1:] = cumsum(qo_len * kv_len)``.
+and concatenated into a single 1D array: ``mask_data``. FlashInfer will create a ``mask_indptr`` array implicitly
+to store the start offset of each request's mask in the flattened mask array: ``mask_indptr[1:] = cumsum(qo_len * kv_len)``.
 
-``mask_data`` has shape ``(qk_indptr[-1],)``, we can use ``mask_data[qk_indptr[i]:qk_indptr[i+1]]`` to slice the flattened
+``mask_data`` has shape ``(mask_indptr[-1],)``, we can use ``mask_data[mask_indptr[i]:mask_indptr[i+1]]`` to slice the flattened
 mask of request ``i``.
 
 To save memory, we can further packes the boolean flattened boolean mask array into a bit-packed array (1 bit per element, 8 elements

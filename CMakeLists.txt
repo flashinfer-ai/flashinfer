@@ -66,7 +66,7 @@ flashinfer_option(FLASHINFER_TVM_SOURCE_DIR
 flashinfer_option(FLASHINFER_GEN_HEAD_DIMS "Head dims to enable" 64 128 256)
 flashinfer_option(FLASHINFER_GEN_POS_ENCODING_MODES "Pos encodings to enable" 0
                   1 2)
-flashinfer_option(FLASHINFER_GEN_ALLOW_FP16_QK_REDUCTIONS
+flashinfer_option(FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS
                   "QK reductions to enable" "false" "true")
 flashinfer_option(FLASHINFER_GEN_MASK_MODES "Mask modes to enable" 0 1 2)
 
@@ -126,34 +126,28 @@ endif(FLASHINFER_ENABLE_BF16)
 # generate kernel inst
 set(HEAD_DIMS ${FLASHINFER_GEN_HEAD_DIMS})
 set(POS_ENCODING_MODES ${FLASHINFER_GEN_POS_ENCODING_MODES})
-set(ALLOW_FP16_QK_REDUCTIONS ${FLASHINFER_GEN_ALLOW_FP16_QK_REDUCTIONS})
+set(USE_FP16_QK_REDUCTIONS ${FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS})
 set(MASK_MODES ${FLASHINFER_GEN_MASK_MODES})
 
 # log options
 message(STATUS "FLASHINFER_HEAD_DIMS=${HEAD_DIMS}")
 message(STATUS "FLASHINFER_POS_ENCODING_MODES=${POS_ENCODING_MODES}")
-message(
-  STATUS "FLASHINFER_ALLOW_FP16_QK_REDUCTIONS=${ALLOW_FP16_QK_REDUCTIONS}")
+message(STATUS "FLASHINFER_USE_FP16_QK_REDUCTIONS=${USE_FP16_QK_REDUCTIONS}")
 message(STATUS "FLASHINFER_MASK_MODES=${MASK_MODES}")
 
 file(MAKE_DIRECTORY ${PROJECT_SOURCE_DIR}/src/generated)
 
 set(AOT_GENERATE_COMMAND
-  ${Python3_EXECUTABLE}
-  -m aot_build_utils.generate
-  --path ${PROJECT_SOURCE_DIR}/src/generated
-  --head_dims ${HEAD_DIMS}
-  --pos_encoding_modes ${POS_ENCODING_MODES}
-  --allow_fp16_qk_reductions ${ALLOW_FP16_QK_REDUCTIONS}
-  --mask_modes ${MASK_MODES}
-  --enable_f16 ${FLASHINFER_ENABLE_F16}
-  --enable_bf16 ${FLASHINFER_ENABLE_BF16}
-  --enable_fp8_e4m3 ${FLASHINFER_ENABLE_FP8_E4M3}
-  --enable_fp8_e5m2 ${FLASHINFER_ENABLE_FP8_E5M2})
+    ${Python3_EXECUTABLE} -m aot_build_utils.generate --path
+    ${PROJECT_SOURCE_DIR}/src/generated --head_dims ${HEAD_DIMS}
+    --pos_encoding_modes ${POS_ENCODING_MODES} --use_fp16_qk_reductions
+    ${USE_FP16_QK_REDUCTIONS} --mask_modes ${MASK_MODES} --enable_f16
+    ${FLASHINFER_ENABLE_F16} --enable_bf16 ${FLASHINFER_ENABLE_BF16}
+    --enable_fp8_e4m3 ${FLASHINFER_ENABLE_FP8_E4M3} --enable_fp8_e5m2
+    ${FLASHINFER_ENABLE_FP8_E5M2})
 
-execute_process(
-  COMMAND ${AOT_GENERATE_COMMAND}
-  WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+execute_process(COMMAND ${AOT_GENERATE_COMMAND}
+                WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 
 file(GLOB_RECURSE FLASHINFER_GENERATORS
      ${PROJECT_SOURCE_DIR}/aot_build_utils/*.py)
@@ -175,13 +169,13 @@ add_custom_target(dispatch_inc DEPENDS ${DISPATCH_INC_FILE})
 
 add_library(decode_kernels STATIC ${DECODE_KERNELS_SRCS})
 target_include_directories(decode_kernels PRIVATE ${FLASHINFER_INCLUDE_DIR})
-target_compile_options(decode_kernels PRIVATE
-  -Xcompiler=-fPIC --fatbin-options -compress-all)
+target_compile_options(decode_kernels PRIVATE -Xcompiler=-fPIC --fatbin-options
+                                              -compress-all)
 
 add_library(prefill_kernels STATIC ${PREFILL_KERNELS_SRCS})
 target_include_directories(prefill_kernels PRIVATE ${FLASHINFER_INCLUDE_DIR})
-target_compile_options(prefill_kernels PRIVATE
-  -Xcompiler=-fPIC --fatbin-options -compress-all)
+target_compile_options(prefill_kernels PRIVATE -Xcompiler=-fPIC
+                                               --fatbin-options -compress-all)
 
 if(FLASHINFER_DECODE)
   message(STATUS "Compile single decode kernel benchmarks.")

@@ -24,7 +24,7 @@ namespace flashinfer {
 
 using namespace cute;
 
-template <typename Ktraits, bool CAUSAL>
+template <typename AdditionalParams, typename Ktraits, bool CAUSAL>
 struct CollectiveMainloop {
   using DTypeQ = typename Ktraits::DTypeQ;
   using DTypeKV = typename Ktraits::DTypeKV;
@@ -96,8 +96,7 @@ struct CollectiveMainloop {
     DTypeKV const* V_ptr;
     LayoutT layout_V;
     int window_left;
-    float const logits_soft_cap;
-    float const sm_scale_log2;
+    AdditionalParams additional_params;
   };
 
   // Device side kernel params
@@ -109,8 +108,7 @@ struct CollectiveMainloop {
     TMA_K tma_load_K;
     TMA_V tma_load_V;
     int window_left;
-    float const logits_soft_cap;
-    float const sm_scale_log2;
+    AdditionalParams additional_params;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
@@ -123,8 +121,8 @@ struct CollectiveMainloop {
     Tensor mV = make_tensor(make_gmem_ptr(args.V_ptr), args.layout_V);
     TMA_V tma_load_V = make_tma_copy(GmemTiledCopyKV{}, mV, SmemLayoutV{}(_, _, _0{}),
                                      select<1, 2>(TileShape_QKD{}), _1{});  // no mcast
-    return {args.layout_Q, args.layout_K,    args.layout_V,        tma_load_Q,        tma_load_K,
-            tma_load_V,    args.window_left, args.logits_soft_cap, args.sm_scale_log2};
+    return {args.layout_Q, args.layout_K, args.layout_V,    tma_load_Q,
+            tma_load_K,    tma_load_V,    args.window_left, args.additional_params};
   }
 
   /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance

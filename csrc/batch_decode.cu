@@ -13,18 +13,19 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <flashinfer/attention/decode_params.cuh>
 #include <flashinfer/attention/scheduler.cuh>
-#include <flashinfer/attention/variants.cuh>
+#include <flashinfer/pos_enc.cuh>
+#include <flashinfer/utils.cuh>
 #include <optional>
 
-#include "aot_extension_utils.h"
+#include "batch_decode_config.inc"
+#include "pytorch_extension_utils.h"
 
 namespace flashinfer {
 
-template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant>
-cudaError_t BatchDecodeWithPagedKVCacheDispatched(typename AttentionVariant::ParamsT params,
-                                                  typename AttentionVariant::DTypeO* tmp_v,
+template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
+          typename Params>
+cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
                                                   float* tmp_s, cudaStream_t stream);
 
 }  // namespace flashinfer
@@ -32,11 +33,11 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(typename AttentionVariant::Par
 using namespace flashinfer;
 
 std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
-    bool use_logits_soft_cap, unsigned int head_dim, at::Tensor empty_q_data,
-    at::Tensor empty_kv_data, at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
+    at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     at::Tensor page_locked_int_workspace_buffer, at::Tensor indptr, unsigned int batch_size,
     unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int page_size,
-    bool enable_cuda_graph, int64_t cuda_stream) {
+    bool enable_cuda_graph, int window_left, float logits_soft_cap, unsigned int head_dim,
+    at::Tensor empty_q_data, at::Tensor empty_kv_data, int64_t cuda_stream) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =
@@ -44,28 +45,17 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
 
   DecodePlanInfo plan_info;
 
-  using IdType = int32_t;
-  constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;
-
   auto q_scalar_type = empty_q_data.scalar_type();
   auto kv_scalar_type = empty_kv_data.scalar_type();
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-  DISPATCH_PYTORCH_QKV_DTYPE_TO_CTYPE(q_scalar_type, kv_scalar_type, q_type, kv_type, [&] {
-    using DTypeQ = q_type;
-    using DTypeKV = kv_type;
-    using DTypeO = DTypeQ;
-    return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-      return DISPATCH_BOOL(use_logits_soft_cap, USE_LOGITS_SOFT_CAP, [&] {
-        using ParamsT = BatchDecodeParams<DTypeQ, DTypeKV, DTypeO, IdType>;
-        using AttentionVariant =
-            ComposedAttention<ParamsT, get_variant_code(/*use_custom_mask=*/false,
-                                                        /*use_sliding_window=*/true,
-                                                        USE_LOGITS_SOFT_CAP, /*use_alibi=*/false)>;
+  DISPATCH_context(
+      DTypeQ, DTypeKV, DTypeO, IdType, HEAD_DIM, POS_ENCODING_MODE, USE_SLIDING_WINDOW,
+      USE_LOGITS_SOFT_CAP, AttentionVariant, Params, [&] {
         DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
           auto work_estimation_func = BatchDecodeWithPagedKVCacheWorkEstimationDispatched<
-              GROUP_SIZE, HEAD_DIM, POS_ENCODING_MODE, AttentionVariant>;
-          cudaError_t status = DecodePlan<HEAD_DIM, POS_ENCODING_MODE, AttentionVariant>(
+              GROUP_SIZE, HEAD_DIM, POS_ENCODING_MODE, AttentionVariant, Params>;
+          cudaError_t status = DecodePlan<HEAD_DIM, POS_ENCODING_MODE, AttentionVariant, Params>(
               static_cast<void*>(float_workspace_buffer.data_ptr()), float_workspace_size_in_bytes,
               static_cast<void*>(int_workspace_buffer.data_ptr()),
               static_cast<void*>(page_locked_int_workspace_buffer.data_ptr()),
@@ -78,8 +68,6 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
           return true;
         });
       });
-    });
-  });
 
   return plan_info.ToVector();
 }
@@ -88,9 +76,8 @@ void BatchDecodeWithPagedKVCacheRun(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     std::vector<int64_t> plan_info_vec, at::Tensor q, at::Tensor paged_k_cache,
     at::Tensor paged_v_cache, at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices,
-    at::Tensor paged_kv_last_page_len, std::optional<at::Tensor> alibi_slopes, at::Tensor o,
-    unsigned int kv_layout_code, int window_left, float logits_soft_cap, float sm_scale,
-    float rope_scale, float rope_theta, std::optional<at::Tensor> maybe_lse, int64_t cuda_stream) {
+    at::Tensor paged_kv_last_page_len, at::Tensor o, std::optional<at::Tensor> maybe_lse,
+    unsigned int kv_layout_code, int window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream) {
   DecodePlanInfo plan_info;
   plan_info.FromVector(plan_info_vec);
   QKVLayout kv_layout = static_cast<QKVLayout>(kv_layout_code);
@@ -114,13 +101,8 @@ void BatchDecodeWithPagedKVCacheRun(
     TORCH_CHECK(lse.size(1) == num_qo_heads, lse.size(1), q.size(1));
   }
 
-  TORCH_CHECK(logits_soft_cap >= 0.f, "logits_soft_cap must be non-negative");
-
   void* float_buffer = static_cast<void*>(float_workspace_buffer.data_ptr());
   void* int_buffer = static_cast<void*>(int_workspace_buffer.data_ptr());
-
-  using IdType = int32_t;
-  constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;
 
   // get q_scalar_type and kv_scalar_type
   auto q_scalar_type = q.scalar_type();
@@ -139,18 +121,9 @@ void BatchDecodeWithPagedKVCacheRun(
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
 
-  DISPATCH_PYTORCH_QKV_DTYPE_TO_CTYPE(q_scalar_type, kv_scalar_type, q_type, kv_type, [&] {
-    using DTypeQ = q_type;
-    using DTypeKV = kv_type;
-    using DTypeO = DTypeQ;
-    return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {
-      return DISPATCH_BOOL(logits_soft_cap > 0, USE_LOGITS_SOFT_CAP, [&] {
-        using ParamsT = BatchDecodeParams<DTypeQ, DTypeKV, DTypeO, IdType>;
-        using AttentionVariant =
-            ComposedAttention<ParamsT, get_variant_code(/*use_custom_mask=*/false,
-                                                        /*use_sliding_window=*/true,
-                                                        USE_LOGITS_SOFT_CAP, /*use_alibi=*/false)>;
-
+  DISPATCH_context(
+      DTypeQ, DTypeKV, DTypeO, IdType, HEAD_DIM, POS_ENCODING_MODE, USE_SLIDING_WINDOW,
+      USE_LOGITS_SOFT_CAP, AttentionVariant, Params, [&] {
         paged_kv_t<DTypeKV, IdType> paged_kv(
             num_kv_heads, page_size, HEAD_DIM, batch_size, kv_layout,
             static_cast<DTypeKV*>(paged_k_cache.data_ptr()),
@@ -158,11 +131,25 @@ void BatchDecodeWithPagedKVCacheRun(
             static_cast<IdType*>(paged_kv_indices.data_ptr()),
             static_cast<IdType*>(paged_kv_indptr.data_ptr()),
             static_cast<IdType*>(paged_kv_last_page_len.data_ptr()));
-        ParamsT params(static_cast<DTypeQ*>(q.data_ptr()),
-                       /*q_offset=*/nullptr, paged_kv, static_cast<DTypeO*>(o.data_ptr()),
-                       /*lse=*/(maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr),
-                       /*alibi_slopes=*/nullptr, num_qo_heads, q_stride_n, q_stride_h, window_left,
-                       logits_soft_cap, sm_scale, rope_scale, rope_theta);
+
+        Params params;
+        params.q = static_cast<DTypeQ*>(q.data_ptr());
+        params.paged_kv = paged_kv;
+        params.o = static_cast<DTypeO*>(o.data_ptr());
+        params.lse = maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
+        params.padded_batch_size = 0;
+        params.num_qo_heads = num_qo_heads;
+        params.q_stride_n = q_stride_n;
+        params.q_stride_h = q_stride_h;
+        params.window_left = window_left;
+        params.request_indices = nullptr;
+        params.kv_tile_indices = nullptr;
+        params.o_indptr = nullptr;
+        params.kv_chunk_size_ptr = nullptr;
+        params.block_valid_mask = nullptr;
+        params.partition_kv = false;
+
+        ADDITIONAL_PARAMS_SETTER
 
         DTypeO* tmp_v = nullptr;
         float* tmp_s = nullptr;
@@ -185,12 +172,11 @@ void BatchDecodeWithPagedKVCacheRun(
 
         cudaError_t status =
             flashinfer::BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, POS_ENCODING_MODE,
-                                                              AttentionVariant>(
-                params, tmp_v, tmp_s, /*stream=*/stream);
+                                                              AttentionVariant>(params, tmp_v,
+                                                                                tmp_s,
+                                                                                /*stream=*/stream);
         TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
                     cudaGetErrorString(status));
         return true;
       });
-    });
-  });
 }

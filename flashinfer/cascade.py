@@ -421,7 +421,7 @@ class MultiLevelCascadeAttentionWrapper:
         page_size: int,
         causal: bool = False,
         pos_encoding_mode: str = "NONE",
-        allow_fp16_qk_reduction: bool = False,
+        use_fp16_qk_reduction: bool = False,
         sm_scale: Optional[float] = None,
         window_left: int = -1,
         logits_soft_cap: Optional[float] = None,
@@ -464,7 +464,7 @@ class MultiLevelCascadeAttentionWrapper:
             The position encoding applied inside attention kernels, could be
             ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
             Default is ``NONE``.
-        allow_fp16_qk_reduction : bool
+        use_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
             loss).
         window_left : int
@@ -513,7 +513,7 @@ class MultiLevelCascadeAttentionWrapper:
                 page_size,
                 causal=causal if i == self._num_levels - 1 else False,
                 pos_encoding_mode=pos_encoding_mode,
-                allow_fp16_qk_reduction=allow_fp16_qk_reduction,
+                use_fp16_qk_reduction=use_fp16_qk_reduction,
                 sm_scale=sm_scale,
                 window_left=window_left,
                 logits_soft_cap=logits_soft_cap,
@@ -994,7 +994,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
         v_shared: torch.Tensor,
         unique_kv_cache: torch.Tensor,
         causal: bool = False,
-        allow_fp16_qk_reduction: bool = False,
+        use_fp16_qk_reduction: bool = False,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
@@ -1032,7 +1032,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
 
         causal : bool
             Whether to apply causal mask on the attention matrix.
-        allow_fp16_qk_reduction : bool
+        use_fp16_qk_reduction : bool
             Whether to use f16 for qk reduction (faster at the cost of slight precision
             loss).
         sm_scale : Optional[float]
@@ -1059,7 +1059,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
             causal=False,
             pos_encoding_mode="NONE",
             kv_layout=self._kv_layout,
-            allow_fp16_qk_reduction=allow_fp16_qk_reduction,
+            use_fp16_qk_reduction=use_fp16_qk_reduction,
             sm_scale=sm_scale,
             rope_scale=rope_scale,
             rope_theta=rope_theta,
@@ -1070,7 +1070,7 @@ class BatchPrefillWithSharedPrefixPagedKVCacheWrapper:
             unique_kv_cache,
             causal=causal,
             pos_encoding_mode="NONE",
-            allow_fp16_qk_reduction=allow_fp16_qk_reduction,
+            use_fp16_qk_reduction=use_fp16_qk_reduction,
             sm_scale=sm_scale,
             rope_scale=rope_scale,
             rope_theta=rope_theta,

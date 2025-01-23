@@ -27,7 +27,7 @@ template <typename DTypeQ, typename DTypeKV, typename DTypeO>
 void _TestSinglePrefillKernelCorrectness(size_t qo_len, size_t kv_len, size_t num_qo_heads,
                                          size_t num_kv_heads, size_t head_dim, bool causal,
                                          QKVLayout kv_layout, PosEncodingMode pos_encoding_mode,
-                                         bool allow_fp16_qk_reduction, float rtol = 1e-3,
+                                         bool use_fp16_qk_reduction, float rtol = 1e-3,
                                          float atol = 1e-3) {
   std::vector<DTypeQ> q(qo_len * num_qo_heads * head_dim);
   std::vector<DTypeKV> k(kv_len * num_kv_heads * head_dim);
@@ -50,7 +50,7 @@ void _TestSinglePrefillKernelCorrectness(size_t qo_len, size_t kv_len, size_t nu
       thrust::raw_pointer_cast(v_d.data()), thrust::raw_pointer_cast(o_d.data()),
       thrust::raw_pointer_cast(tmp_d.data()),
       /*lse=*/nullptr, num_qo_heads, num_kv_heads, qo_len, kv_len, head_dim, causal, kv_layout,
-      pos_encoding_mode, allow_fp16_qk_reduction);
+      pos_encoding_mode, use_fp16_qk_reduction);
 
   EXPECT_EQ(status, cudaSuccess) << "SinglePrefillWithKVCache kernel launch failed, error message: "
                                  << cudaGetErrorString(status);
@@ -84,7 +84,7 @@ void _TestSinglePrefillKernelCorrectness(size_t qo_len, size_t kv_len, size_t nu
 }
 
 template <typename DTypeIn, typename DTypeO>
-void TestSinglePrefillKernelLongContextCorrectness(bool allow_fp16_qk_reduction) {
+void TestSinglePrefillKernelLongContextCorrectness(bool use_fp16_qk_reduction) {
   for (size_t qo_len : {1, 31, 63, 127}) {
     for (size_t kv_len : {31717}) {
       for (size_t num_heads : {1}) {
@@ -94,7 +94,7 @@ void TestSinglePrefillKernelLongContextCorrectness(bool allow_fp16_qk_reduction)
               for (size_t kv_layout : {0, 1}) {
                 _TestSinglePrefillKernelCorrectness<DTypeIn, DTypeIn, DTypeO>(
                     qo_len, kv_len, num_heads, num_heads, head_dim, causal, QKVLayout(kv_layout),
-                    PosEncodingMode(pos_encoding_mode), allow_fp16_qk_reduction);
+                    PosEncodingMode(pos_encoding_mode), use_fp16_qk_reduction);
               }
             }
           }
@@ -105,7 +105,7 @@ void TestSinglePrefillKernelLongContextCorrectness(bool allow_fp16_qk_reduction)
 }
 
 template <typename DTypeKV>
-void TestSinglePrefillFP8KernelLongContextCorrectness(bool allow_fp16_qk_reduction) {
+void TestSinglePrefillFP8KernelLongContextCorrectness(bool use_fp16_qk_reduction) {
   for (size_t qo_len : {1, 31, 63, 127}) {
     for (size_t kv_len : {31717}) {
       for (size_t num_heads : {1}) {
@@ -115,7 +115,7 @@ void TestSinglePrefillFP8KernelLongContextCorrectness(bool allow_fp16_qk_reducti
               for (size_t kv_layout : {0, 1}) {
                 _TestSinglePrefillKernelCorrectness<half, DTypeKV, half>(
                     qo_len, kv_len, num_heads, num_heads, head_dim, causal, QKVLayout(kv_layout),
-                    PosEncodingMode(pos_encoding_mode), allow_fp16_qk_reduction);
+                    PosEncodingMode(pos_encoding_mode), use_fp16_qk_reduction);
               }
             }
           }
@@ -126,7 +126,7 @@ void TestSinglePrefillFP8KernelLongContextCorrectness(bool allow_fp16_qk_reducti
 }
 
 template <typename DTypeIn, typename DTypeO>
-void TestSinglePrefillKernelShortContextCorrectness(bool allow_fp16_qk_reduction) {
+void TestSinglePrefillKernelShortContextCorrectness(bool use_fp16_qk_reduction) {
   float rtol = std::is_same<DTypeO, nv_bfloat16>::value ? 1e-2 : 1e-3;
   float atol = std::is_same<DTypeO, nv_bfloat16>::value ? 1e-2 : 1e-3;
   for (size_t qkv_len : {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37}) {
@@ -138,8 +138,8 @@ void TestSinglePrefillKernelShortContextCorrectness(bool allow_fp16_qk_reduction
               for (size_t kv_layout : {0, 1}) {
                 _TestSinglePrefillKernelCorrectness<DTypeIn, DTypeIn, DTypeO>(
                     qkv_len, qkv_len, num_qo_heads, num_kv_heads, head_dim, causal,
-                    QKVLayout(kv_layout), PosEncodingMode(pos_encoding_mode),
-                    allow_fp16_qk_reduction, rtol, atol);
+                    QKVLayout(kv_layout), PosEncodingMode(pos_encoding_mode), use_fp16_qk_reduction,
+                    rtol, atol);
               }
             }
           }
@@ -150,7 +150,7 @@ void TestSinglePrefillKernelShortContextCorrectness(bool allow_fp16_qk_reduction
 }
 
 template <typename DTypeKV>
-void TestSinglePrefillFP8KernelShortContextCorrectness(bool allow_fp16_qk_reduction) {
+void TestSinglePrefillFP8KernelShortContextCorrectness(bool use_fp16_qk_reduction) {
   float rtol = 1e-3;
   float atol = 1e-3;
   for (size_t qkv_len : {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37}) {
@@ -162,8 +162,8 @@ void TestSinglePrefillFP8KernelShortContextCorrectness(bool allow_fp16_qk_reduct
               for (size_t kv_layout : {0, 1}) {
                 _TestSinglePrefillKernelCorrectness<half, DTypeKV, half>(
                     qkv_len, qkv_len, num_qo_heads, num_kv_heads, head_dim, causal,
-                    QKVLayout(kv_layout), PosEncodingMode(pos_encoding_mode),
-                    allow_fp16_qk_reduction, rtol, atol);
+                    QKVLayout(kv_layout), PosEncodingMode(pos_encoding_mode), use_fp16_qk_reduction,
+                    rtol, atol);
               }
             }
           }
@@ -174,7 +174,7 @@ void TestSinglePrefillFP8KernelShortContextCorrectness(bool allow_fp16_qk_reduct
 }
 
 template <typename DTypeIn, typename DTypeO>
-void TestSinglePrefillKernelCorrectness(bool allow_fp16_qk_reduction) {
+void TestSinglePrefillKernelCorrectness(bool use_fp16_qk_reduction) {
   for (size_t qo_len : {399, 400, 401}) {
     for (size_t kv_len : {533, 534, 535}) {
       for (size_t num_heads : {12}) {
@@ -184,7 +184,7 @@ void TestSinglePrefillKernelCorrectness(bool allow_fp16_qk_reduction) {
               for (size_t kv_layout : {0, 1}) {
                 _TestSinglePrefillKernelCorrectness<DTypeIn, DTypeIn, DTypeO>(
                     qo_len, kv_len, num_heads, num_heads, head_dim, causal, QKVLayout(kv_layout),
-                    PosEncodingMode(pos_encoding_mode), allow_fp16_qk_reduction);
+                    PosEncodingMode(pos_encoding_mode), use_fp16_qk_reduction);
               }
             }
           }
@@ -195,7 +195,7 @@ void TestSinglePrefillKernelCorrectness(bool allow_fp16_qk_reduction) {
 }
 
 template <typename DTypeKV>
-void TestSinglePrefillFP8KernelCorrectness(bool allow_fp16_qk_reduction) {
+void TestSinglePrefillFP8KernelCorrectness(bool use_fp16_qk_reduction) {
   for (size_t qo_len : {399, 400, 401}) {
     for (size_t kv_len : {533, 534, 535}) {
       for (size_t num_heads : {12}) {
@@ -205,7 +205,7 @@ void TestSinglePrefillFP8KernelCorrectness(bool allow_fp16_qk_reduction) {
               for (size_t kv_layout : {0, 1}) {
                 _TestSinglePrefillKernelCorrectness<half, DTypeKV, half>(
                     qo_len, kv_len, num_heads, num_heads, head_dim, causal, QKVLayout(kv_layout),
-                    PosEncodingMode(pos_encoding_mode), allow_fp16_qk_reduction);
+                    PosEncodingMode(pos_encoding_mode), use_fp16_qk_reduction);
               }
             }
           }

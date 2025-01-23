@@ -33,7 +33,7 @@ namespace flashinfer {
 
 using namespace cute;
 
-template <typename Ktraits, bool CAUSAL>
+template <typename AdditionalParams, typename Ktraits, bool CAUSAL>
 struct SparseCollectiveMainloop {
   using DTypeQ = typename Ktraits::DTypeQ;
   using DTypeKV = typename Ktraits::DTypeKV;
@@ -99,8 +99,7 @@ struct SparseCollectiveMainloop {
     LayoutT layout_V;
     IdType const* kv_indices;
     int window_left;
-    float const logits_soft_cap;
-    float const sm_scale_log2;
+    AdditionalParams additional_params;
   };
 
   // Device side kernel params
@@ -113,8 +112,7 @@ struct SparseCollectiveMainloop {
     DTypeKV* V_ptr;
     IdType* kv_indices;
     int window_left;
-    float const logits_soft_cap;
-    float const sm_scale_log2;
+    AdditionalParams additional_params;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
@@ -129,8 +127,7 @@ struct SparseCollectiveMainloop {
             const_cast<DTypeKV*>(args.V_ptr),
             const_cast<IdType*>(args.kv_indices),
             args.window_left,
-            args.logits_soft_cap,
-            args.sm_scale_log2};
+            args.additional_params};
   }
 
   CUTLASS_DEVICE

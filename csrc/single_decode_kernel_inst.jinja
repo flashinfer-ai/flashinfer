@@ -1,0 +1,13 @@
+#include <flashinfer/attention/decode.cuh>
+#include "single_decode_config.inc"
+
+using namespace flashinfer;
+
+namespace flashinfer {
+
+template cudaError_t SingleDecodeWithKVCacheDispatched<
+    {{ head_dim }}, {{ pos_encoding_mode }}, {{ variant_name }}, Params>(
+    Params params, {{ dtype_o }}* tmp,
+    cudaStream_t stream);
+
+};

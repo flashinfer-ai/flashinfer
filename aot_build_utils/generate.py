@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import List
 
 from . import (
+    generate_aot_default_additional_params_header,
     generate_batch_paged_decode_inst,
     generate_batch_paged_prefill_inst,
     generate_batch_ragged_prefill_inst,
@@ -38,7 +39,7 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
     path: Path = args.path
     head_dims: List[int] = args.head_dims
     pos_encoding_modes: List[int] = args.pos_encoding_modes
-    allow_fp16_qk_reductions: List[int] = args.allow_fp16_qk_reductions
+    use_fp16_qk_reductions: List[int] = args.use_fp16_qk_reductions
     mask_modes: List[int] = args.mask_modes
     enable_f16: bool = args.enable_f16
     enable_bf16: bool = args.enable_bf16
@@ -54,10 +55,15 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
             argparse.Namespace(
                 head_dims=head_dims,
                 pos_encoding_modes=pos_encoding_modes,
-                allow_fp16_qk_reductions=allow_fp16_qk_reductions,
+                use_fp16_qk_reductions=use_fp16_qk_reductions,
                 mask_modes=mask_modes,
             )
         ),
+    )
+
+    write_if_different(
+        path / "aot_default_additional_params.h",
+        generate_aot_default_additional_params_header.get_aot_default_additional_params_header_str(),
     )
 
     idtypes = ["i32"]
@@ -150,22 +156,22 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
     for (
         head_dim,
         pos_encoding_mode,
-        allow_fp16_qk_reduction,
+        use_fp16_qk_reduction,
         mask_mode,
     ) in product(
         head_dims,
         pos_encoding_modes,
-        allow_fp16_qk_reductions,
+        use_fp16_qk_reductions,
         mask_modes,
     ):
         for dtype_q, dtype_kv in list(zip(prefill_dtypes, prefill_dtypes)) + list(
             product(prefill_dtypes, fp8_dtypes)
         ):
-            fname = f"single_prefill_head_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}.cu"
+            fname = f"single_prefill_head_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}.cu"
             content = generate_single_prefill_inst.get_cu_file_str(
                 head_dim,
                 pos_encoding_mode,
-                allow_fp16_qk_reduction,
+                use_fp16_qk_reduction,
                 mask_mode,
                 dtype_q,  # dtype_q
                 dtype_kv,  # dtype_kv
@@ -184,7 +190,7 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
                             f"posenc_{pos_encoding_mode}_"
                             f"use_swa_{use_sliding_window}_"
                             f"use_logits_cap_{use_logits_soft_cap}_"
-                            f"f16qk_{bool(allow_fp16_qk_reduction)}"
+                            f"f16qk_{bool(use_fp16_qk_reduction)}"
                         )
             write_if_different(path / fname, content)
 
@@ -193,24 +199,24 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
     for (
         head_dim,
         pos_encoding_mode,
-        allow_fp16_qk_reduction,
+        use_fp16_qk_reduction,
         mask_mode,
         idtype,
     ) in product(
         head_dims,
         pos_encoding_modes,
-        allow_fp16_qk_reductions,
+        use_fp16_qk_reductions,
         mask_modes,
         idtypes,
     ):
         for dtype_q, dtype_kv in list(zip(prefill_dtypes, prefill_dtypes)) + list(
             product(prefill_dtypes, fp8_dtypes)
         ):
-            fname = f"batch_paged_prefill_head_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}.cu"
+            fname = f"batch_paged_prefill_head_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}.cu"
             content = generate_batch_paged_prefill_inst.get_cu_file_str(
                 head_dim,
                 pos_encoding_mode,
-                allow_fp16_qk_reduction,
+                use_fp16_qk_reduction,
                 mask_mode,
                 dtype_q,  # dtype_q
                 dtype_kv,  # dtype_kv
@@ -219,11 +225,11 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
             )
             write_if_different(path / fname, content)
 
-            fname = f"batch_ragged_prefill_head_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{allow_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}.cu"
+            fname = f"batch_ragged_prefill_head_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}.cu"
             content = generate_batch_ragged_prefill_inst.get_cu_file_str(
                 head_dim,
                 pos_encoding_mode,
-                allow_fp16_qk_reduction,
+                use_fp16_qk_reduction,
                 mask_mode,
                 dtype_q,  # dtype_q
                 dtype_kv,  # dtype_kv
@@ -246,7 +252,7 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
                             f"posenc_{pos_encoding_mode}_"
                             f"use_swa_{sliding_window}_"
                             f"use_logits_cap_{logits_soft_cap}_"
-                            f"f16qk_{bool(allow_fp16_qk_reduction)}"
+                            f"f16qk_{bool(use_fp16_qk_reduction)}"
                         )
 
     return (
@@ -273,7 +279,7 @@ if __name__ == "__main__":
         help="Position encoding modes",
     )
     parser.add_argument(
-        "--allow_fp16_qk_reductions",
+        "--use_fp16_qk_reductions",
         type=lambda x: x if isinstance(x, int) else int(x.lower() == "true"),
         required=True,
         nargs="+",
@@ -287,7 +293,7 @@ if __name__ == "__main__":
         help="Mask modes",
     )
     parser.add_argument(
-        "--enable_fp16",
+        "--enable_f16",
         type=lambda x: x if isinstance(x, int) else x.lower() == "true",
         required=True,
         nargs="+",

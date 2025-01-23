@@ -127,7 +127,7 @@ void bench_two_level_single_prefix_cascade_decode(nvbench::state& state) {
           thrust::raw_pointer_cast(lse_cascade_0_d.data()), num_qo_heads, num_kv_heads,
           /*qo_len=*/batch_size, /*kv_len=*/shared_prefix_length, head_dim,
           /*causal=*/false, /*kv_layout=*/QKVLayout::kNHD,
-          /*pos_encoding_mode=*/PosEncodingMode::kNone, /*allow_fp16_qk_reduction=*/false);
+          /*pos_encoding_mode=*/PosEncodingMode::kNone, /*use_fp16_qk_reduction=*/false);
 
       if (status != cudaSuccess) {
         state.skip("Cascade implementation prefill failed with error: " +
@@ -136,7 +136,8 @@ void bench_two_level_single_prefix_cascade_decode(nvbench::state& state) {
 
       status = BatchDecodeWithPagedKVCacheWrapper<T, T, T, int32_t>(
           &cascade_handler, thrust::raw_pointer_cast(q_d.data()),
-          /*q_offset=*/nullptr, paged_kv_casacde_d, thrust::raw_pointer_cast(o_cascade_1_d.data()),
+          /*q_rope_offset=*/nullptr, paged_kv_casacde_d,
+          thrust::raw_pointer_cast(o_cascade_1_d.data()),
           /*lse=*/thrust::raw_pointer_cast(lse_cascade_1_d.data()), num_qo_heads,
           PosEncodingMode::kNone);
 
@@ -184,7 +185,8 @@ void bench_two_level_single_prefix_cascade_decode(nvbench::state& state) {
       timer.start();
       cudaError_t status = BatchDecodeWithPagedKVCacheWrapper<T, T, T, int32_t>(
           &baseline_handler, thrust::raw_pointer_cast(q_d.data()),
-          /*q_offset=*/nullptr, paged_kv_baseline_d, thrust::raw_pointer_cast(o_baseline_d.data()),
+          /*q_rope_offset=*/nullptr, paged_kv_baseline_d,
+          thrust::raw_pointer_cast(o_baseline_d.data()),
           /*lse=*/nullptr, num_qo_heads, PosEncodingMode::kNone);
       if (status != cudaSuccess) {
         state.skip("Cascade implementation decode failed with error: " +
@@ -269,7 +271,7 @@ void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
           /*qo_len=*/batch_size * qo_append_length,
           /*kv_len=*/shared_prefix_length, head_dim,
           /*causal=*/false, /*kv_layout=*/QKVLayout::kNHD,
-          /*pos_encoding_mode=*/PosEncodingMode::kNone, /*allow_fp16_qk_reduction=*/false);
+          /*pos_encoding_mode=*/PosEncodingMode::kNone, /*use_fp16_qk_reduction=*/false);
 
       if (status != cudaSuccess) {
         state.skip("Cascade implementation prefill failed with error: " +
@@ -279,9 +281,10 @@ void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
       status = BatchPrefillWithPagedKVCacheWrapper<T, T, T, int32_t>(
           &cascade_handler, thrust::raw_pointer_cast(q_d.data()),
           thrust::raw_pointer_cast(qo_indptr_d.data()),
-          /*q_offset=*/nullptr, paged_kv_casacde_d, thrust::raw_pointer_cast(o_cascade_1_d.data()),
+          /*q_rope_offset=*/nullptr, paged_kv_casacde_d,
+          thrust::raw_pointer_cast(o_cascade_1_d.data()),
           thrust::raw_pointer_cast(lse_cascade_1_d.data()), num_qo_heads, /*causal=*/true,
-          PosEncodingMode::kNone, /*allow_fp16_qk_reduction=*/false);
+          PosEncodingMode::kNone, /*use_fp16_qk_reduction=*/false);
 
       if (status != cudaSuccess) {
         state.skip("Cascade implementation unique kv prefill failed with error: " +
@@ -326,9 +329,10 @@ void bench_two_level_single_prefix_cascade_append(nvbench::state& state) {
       cudaError_t status = BatchPrefillWithPagedKVCacheWrapper<T, T, T, int32_t>(
           &baseline_handler, thrust::raw_pointer_cast(q_d.data()),
           thrust::raw_pointer_cast(qo_indptr_d.data()),
-          /*q_offset=*/nullptr, paged_kv_baseline_d, thrust::raw_pointer_cast(o_baseline_d.data()),
+          /*q_rope_offset=*/nullptr, paged_kv_baseline_d,
+          thrust::raw_pointer_cast(o_baseline_d.data()),
           /*lse=*/nullptr, num_qo_heads, /*causal=*/true, PosEncodingMode::kNone,
-          /*allow_fp16_qk_reduction=*/false);
+          /*use_fp16_qk_reduction=*/false);
 
       if (status != cudaSuccess) {
         state.skip("Baseline implementation failed with error: " +

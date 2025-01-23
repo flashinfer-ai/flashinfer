@@ -62,7 +62,7 @@ struct paged_kv_t {
    */
   __host__ __device__ __forceinline__ paged_kv_t()
       : num_heads(0),
-        page_size(0),
+        page_size(),
         head_dim(0),
         batch_size(0),
         stride_page(0),
