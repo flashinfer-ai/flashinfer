@@ -37,6 +37,9 @@
 
 namespace flashinfer {
 
+DEFINE_HAS_MEMBER(maybe_q_rope_offset)
+DEFINE_HAS_MEMBER(maybe_k_rope_offset)
+
 namespace cg = cooperative_groups;
 using cp_async::SharedMemFillMode;
 using mma::MMAMode;
@@ -1619,7 +1622,11 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithRag
     block.sync();
 
     if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
-      IdType* q_rope_offset = nullptr;  // params.q_rope_offset;
+      IdType* q_rope_offset = nullptr;
+
+      if constexpr (has_maybe_q_rope_offset_v<Params>) {
+        q_rope_offset = params.maybe_q_rope_offset;
+      }
       if (!q_rope_offset) {
         q_smem_inplace_apply_rotary<NUM_WARPS_Q, NUM_WARPS_KV, NUM_MMA_Q, NUM_MMA_D, swizzle_mode_q,
                                     DTypeQ>(qo_packed_idx_base, qo_len, kv_len, group_size,
@@ -1701,7 +1708,10 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithRag
       block.sync();
 
       if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
-        IdType* k_rope_offset = nullptr;  // params.k_rope_offset;
+        IdType* k_rope_offset = nullptr;
+        if constexpr (has_maybe_k_rope_offset_v<Params>) {
+          k_rope_offset = params.maybe_k_rope_offset;
+        }
         k_smem_inplace_apply_rotary<NUM_WARPS_Q, NUM_WARPS_KV, NUM_MMA_D, NUM_MMA_KV,
                                     swizzle_mode_kv, DTypeKV>(
             (k_rope_offset == nullptr ? 0 : k_rope_offset[request_idx]) + chunk_start +
@@ -1904,7 +1914,10 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPag
     block.sync();
 
     if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
-      IdType* q_rope_offset = nullptr;  // params.q_rope_offset;
+      IdType* q_rope_offset = nullptr;
+      if constexpr (has_maybe_q_rope_offset_v<Params>) {
+        q_rope_offset = params.maybe_q_rope_offset;
+      }
       if (q_rope_offset == nullptr) {
         q_smem_inplace_apply_rotary<NUM_WARPS_Q, NUM_WARPS_KV, NUM_MMA_Q, NUM_MMA_D, swizzle_mode_q,
                                     DTypeQ>(qo_packed_idx_base, qo_len, kv_len, group_size,

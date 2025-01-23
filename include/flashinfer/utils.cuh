@@ -320,6 +320,14 @@ __device__ __forceinline__ uint32_t dim4_offset(const uint32_t& dim_c, const uin
   return ((idx_d * dim_c + idx_c) * dim_b + idx_b) * dim_a + idx_a;
 }
 
+#define DEFINE_HAS_MEMBER(member)                                                              \
+  template <typename T, typename = void>                                                       \
+  struct has_##member : std::false_type {};                                                    \
+  template <typename T>                                                                        \
+  struct has_##member<T, std::void_t<decltype(std::declval<T>().member)>> : std::true_type {}; \
+  template <typename T>                                                                        \
+  inline constexpr bool has_##member##_v = has_##member<T>::value;
+
 }  // namespace flashinfer
 
 #endif  // FLASHINFER_UTILS_CUH_

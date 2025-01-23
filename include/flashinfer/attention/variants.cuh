@@ -21,6 +21,7 @@
 #include <type_traits>
 
 #include "../math.cuh"
+#include "../utils.cuh"
 
 namespace flashinfer {
 
@@ -58,14 +59,6 @@ struct StandardAttention {
     return true;
   }
 };
-
-#define DEFINE_HAS_MEMBER(member)                                                              \
-  template <typename T, typename = void>                                                       \
-  struct has_##member : std::false_type {};                                                    \
-  template <typename T>                                                                        \
-  struct has_##member<T, std::void_t<decltype(std::declval<T>().member)>> : std::true_type {}; \
-  template <typename T>                                                                        \
-  inline constexpr bool has_##member##_v = has_##member<T>::value;
 
 DEFINE_HAS_MEMBER(maybe_mask_indptr)
 
