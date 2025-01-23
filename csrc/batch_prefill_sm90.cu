@@ -13,11 +13,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <cutlass/numeric_types.h>
 
 #include <flashinfer/attention/mask.cuh>
 #include <flashinfer/attention/scheduler.cuh>
-#include <flashinfer/cutlass_utils.cuh>
 #include <flashinfer/layout.cuh>
 #include <flashinfer/math.cuh>
 #include <optional>
