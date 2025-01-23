@@ -88,31 +88,31 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
 
     single_decode_uris = []
     # single decode files
-    # for head_dim, pos_encoding_mode in product(head_dims, pos_encoding_modes):
-    #     for dtype_q, dtype_kv in list(zip(decode_dtypes, decode_dtypes)) + list(
-    #         product(fp16_dtypes, fp8_dtypes)
-    #     ):
-    #         dtype_out = dtype_q
-    #         fname = f"single_decode_head_{head_dim}_posenc_{pos_encoding_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_out}.cu"
-    #         content = generate_single_decode_inst.get_cu_file_str(
-    #             head_dim,
-    #             pos_encoding_mode,
-    #             dtype_q,
-    #             dtype_kv,
-    #             dtype_out,
-    #         )
-    #         for use_sliding_window in [True, False]:
-    #             for use_logits_soft_cap in [True, False]:
-    #                 single_decode_uris.append(
-    #                     f"single_decode_with_kv_cache_dtype_q_{dtype_q}_"
-    #                     f"dtype_kv_{dtype_kv}_"
-    #                     f"dtype_o_{dtype_out}_"
-    #                     f"head_dim_{head_dim}_"
-    #                     f"posenc_{pos_encoding_mode}_"
-    #                     f"use_swa_{use_sliding_window}_"
-    #                     f"use_logits_cap_{use_logits_soft_cap}"
-    #                 )
-    #         write_if_different(path / fname, content)
+    for head_dim, pos_encoding_mode in product(head_dims, pos_encoding_modes):
+        for dtype_q, dtype_kv in list(zip(decode_dtypes, decode_dtypes)) + list(
+            product(fp16_dtypes, fp8_dtypes)
+        ):
+            dtype_out = dtype_q
+            fname = f"single_decode_head_{head_dim}_posenc_{pos_encoding_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_out}.cu"
+            content = generate_single_decode_inst.get_cu_file_str(
+                head_dim,
+                pos_encoding_mode,
+                dtype_q,
+                dtype_kv,
+                dtype_out,
+            )
+            for use_sliding_window in [True, False]:
+                for use_logits_soft_cap in [True, False]:
+                    single_decode_uris.append(
+                        f"single_decode_with_kv_cache_dtype_q_{dtype_q}_"
+                        f"dtype_kv_{dtype_kv}_"
+                        f"dtype_o_{dtype_out}_"
+                        f"head_dim_{head_dim}_"
+                        f"posenc_{pos_encoding_mode}_"
+                        f"use_swa_{use_sliding_window}_"
+                        f"use_logits_cap_{use_logits_soft_cap}"
+                    )
+            write_if_different(path / fname, content)
 
     # batch decode files
     batch_decode_uris = []
@@ -153,107 +153,107 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
 
     # single prefill files
     single_prefill_uris = []
-    # for (
-    #     head_dim,
-    #     pos_encoding_mode,
-    #     use_fp16_qk_reduction,
-    #     mask_mode,
-    # ) in product(
-    #     head_dims,
-    #     pos_encoding_modes,
-    #     use_fp16_qk_reductions,
-    #     mask_modes,
-    # ):
-    #     for dtype_q, dtype_kv in list(zip(prefill_dtypes, prefill_dtypes)) + list(
-    #         product(prefill_dtypes, fp8_dtypes)
-    #     ):
-    #         fname = f"single_prefill_head_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}.cu"
-    #         content = generate_single_prefill_inst.get_cu_file_str(
-    #             head_dim,
-    #             pos_encoding_mode,
-    #             use_fp16_qk_reduction,
-    #             mask_mode,
-    #             dtype_q,  # dtype_q
-    #             dtype_kv,  # dtype_kv
-    #             dtype_q,  # dtype_out
-    #         )
-    #         for use_sliding_window in [True, False]:
-    #             for use_logits_soft_cap in [True, False]:
-    #                 if (
-    #                     mask_mode == 0
-    #                 ):  # NOTE(Zihao): uri do not contain mask, avoid duplicate uris
-    #                     single_prefill_uris.append(
-    #                         f"single_prefill_with_kv_cache_dtype_q_{dtype_q}_"
-    #                         f"dtype_kv_{dtype_kv}_"
-    #                         f"dtype_o_{dtype_q}_"
-    #                         f"head_dim_{head_dim}_"
-    #                         f"posenc_{pos_encoding_mode}_"
-    #                         f"use_swa_{use_sliding_window}_"
-    #                         f"use_logits_cap_{use_logits_soft_cap}_"
-    #                         f"f16qk_{bool(use_fp16_qk_reduction)}"
-    #                     )
-    #         write_if_different(path / fname, content)
+    for (
+        head_dim,
+        pos_encoding_mode,
+        use_fp16_qk_reduction,
+        mask_mode,
+    ) in product(
+        head_dims,
+        pos_encoding_modes,
+        use_fp16_qk_reductions,
+        mask_modes,
+    ):
+        for dtype_q, dtype_kv in list(zip(prefill_dtypes, prefill_dtypes)) + list(
+            product(prefill_dtypes, fp8_dtypes)
+        ):
+            fname = f"single_prefill_head_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}.cu"
+            content = generate_single_prefill_inst.get_cu_file_str(
+                head_dim,
+                pos_encoding_mode,
+                use_fp16_qk_reduction,
+                mask_mode,
+                dtype_q,  # dtype_q
+                dtype_kv,  # dtype_kv
+                dtype_q,  # dtype_out
+            )
+            for use_sliding_window in [True, False]:
+                for use_logits_soft_cap in [True, False]:
+                    if (
+                        mask_mode == 0
+                    ):  # NOTE(Zihao): uri do not contain mask, avoid duplicate uris
+                        single_prefill_uris.append(
+                            f"single_prefill_with_kv_cache_dtype_q_{dtype_q}_"
+                            f"dtype_kv_{dtype_kv}_"
+                            f"dtype_o_{dtype_q}_"
+                            f"head_dim_{head_dim}_"
+                            f"posenc_{pos_encoding_mode}_"
+                            f"use_swa_{use_sliding_window}_"
+                            f"use_logits_cap_{use_logits_soft_cap}_"
+                            f"f16qk_{bool(use_fp16_qk_reduction)}"
+                        )
+            write_if_different(path / fname, content)
 
     # batch prefill files
     batch_prefill_uris = []
-    # for (
-    #     head_dim,
-    #     pos_encoding_mode,
-    #     use_fp16_qk_reduction,
-    #     mask_mode,
-    #     idtype,
-    # ) in product(
-    #     head_dims,
-    #     pos_encoding_modes,
-    #     use_fp16_qk_reductions,
-    #     mask_modes,
-    #     idtypes,
-    # ):
-    #     for dtype_q, dtype_kv in list(zip(prefill_dtypes, prefill_dtypes)) + list(
-    #         product(prefill_dtypes, fp8_dtypes)
-    #     ):
-    #         fname = f"batch_paged_prefill_head_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}.cu"
-    #         content = generate_batch_paged_prefill_inst.get_cu_file_str(
-    #             head_dim,
-    #             pos_encoding_mode,
-    #             use_fp16_qk_reduction,
-    #             mask_mode,
-    #             dtype_q,  # dtype_q
-    #             dtype_kv,  # dtype_kv
-    #             dtype_q,  # dtype_out
-    #             idtype,
-    #         )
-    #         write_if_different(path / fname, content)
+    for (
+        head_dim,
+        pos_encoding_mode,
+        use_fp16_qk_reduction,
+        mask_mode,
+        idtype,
+    ) in product(
+        head_dims,
+        pos_encoding_modes,
+        use_fp16_qk_reductions,
+        mask_modes,
+        idtypes,
+    ):
+        for dtype_q, dtype_kv in list(zip(prefill_dtypes, prefill_dtypes)) + list(
+            product(prefill_dtypes, fp8_dtypes)
+        ):
+            fname = f"batch_paged_prefill_head_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}.cu"
+            content = generate_batch_paged_prefill_inst.get_cu_file_str(
+                head_dim,
+                pos_encoding_mode,
+                use_fp16_qk_reduction,
+                mask_mode,
+                dtype_q,  # dtype_q
+                dtype_kv,  # dtype_kv
+                dtype_q,  # dtype_out
+                idtype,
+            )
+            write_if_different(path / fname, content)
 
-    #         fname = f"batch_ragged_prefill_head_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}.cu"
-    #         content = generate_batch_ragged_prefill_inst.get_cu_file_str(
-    #             head_dim,
-    #             pos_encoding_mode,
-    #             use_fp16_qk_reduction,
-    #             mask_mode,
-    #             dtype_q,  # dtype_q
-    #             dtype_kv,  # dtype_kv
-    #             dtype_q,  # dtype_out
-    #             idtype,
-    #         )
-    #         write_if_different(path / fname, content)
+            fname = f"batch_ragged_prefill_head_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}.cu"
+            content = generate_batch_ragged_prefill_inst.get_cu_file_str(
+                head_dim,
+                pos_encoding_mode,
+                use_fp16_qk_reduction,
+                mask_mode,
+                dtype_q,  # dtype_q
+                dtype_kv,  # dtype_kv
+                dtype_q,  # dtype_out
+                idtype,
+            )
+            write_if_different(path / fname, content)
 
-    #         for sliding_window in [True, False]:
-    #             for logits_soft_cap in [True, False]:
-    #                 if (
-    #                     mask_mode == 0
-    #                 ):  # NOTE(Zihao): uri do not contain mask, avoid duplicate uris
-    #                     batch_prefill_uris.append(
-    #                         f"batch_prefill_with_kv_cache_dtype_q_{dtype_q}_"
-    #                         f"dtype_kv_{dtype_kv}_"
-    #                         f"dtype_o_{dtype_q}_"
-    #                         f"dtype_idx_{idtype}_"
-    #                         f"head_dim_{head_dim}_"
-    #                         f"posenc_{pos_encoding_mode}_"
-    #                         f"use_swa_{sliding_window}_"
-    #                         f"use_logits_cap_{logits_soft_cap}_"
-    #                         f"f16qk_{bool(use_fp16_qk_reduction)}"
-    #                     )
+            for sliding_window in [True, False]:
+                for logits_soft_cap in [True, False]:
+                    if (
+                        mask_mode == 0
+                    ):  # NOTE(Zihao): uri do not contain mask, avoid duplicate uris
+                        batch_prefill_uris.append(
+                            f"batch_prefill_with_kv_cache_dtype_q_{dtype_q}_"
+                            f"dtype_kv_{dtype_kv}_"
+                            f"dtype_o_{dtype_q}_"
+                            f"dtype_idx_{idtype}_"
+                            f"head_dim_{head_dim}_"
+                            f"posenc_{pos_encoding_mode}_"
+                            f"use_swa_{sliding_window}_"
+                            f"use_logits_cap_{logits_soft_cap}_"
+                            f"f16qk_{bool(use_fp16_qk_reduction)}"
+                        )
 
     return (
         single_decode_uris

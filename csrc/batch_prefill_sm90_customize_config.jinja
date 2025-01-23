@@ -3,13 +3,12 @@
 #include <flashinfer/math.cuh>
 #include <flashinfer/layout.cuh>
 #include <flashinfer/cutlass_utils.cuh>
-#include <flashinfer/pos_enc.cuh>
 #include "pytorch_extension_utils.h"
 
 #define ADDITIONAL_FUNC_PARAMS {{ additional_func_params }}
 #define ADDITIONAL_PARAMS_SETTER {{ additional_params_setter }}
 
-#define DISPATCH_context(DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM, POS_ENCODING_MODE, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, AttentionVariant, RaggedParams, PagedParams, ...) \
+#define DISPATCH_context(DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, AttentionVariant, RaggedParams, PagedParams, ...) \
   DISPATCH_MASK_MODE(mask_mode, MASK_MODE, { using AttentionVariant = {{ variant_name }}; __VA_ARGS__();})
 
 using namespace flashinfer;
@@ -21,7 +20,6 @@ using IdType = cutlass_dtype_t<{{ idtype }}>;
 
 constexpr int HEAD_DIM = {{ head_dim }};
 constexpr auto USE_LOGITS_SOFT_CAP = {{ use_logits_soft_cap }};
-constexpr auto POS_ENCODING_MODE = {{ pos_encoding_mode }};
 constexpr auto USE_SLIDING_WINDOW = {{ use_sliding_window }};
 
 struct RaggedParams {

@@ -13,10 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <cutlass/numeric_types.h>
-
 #include <flashinfer/attention/mask.cuh>
-#include <flashinfer/cutlass_utils.cuh>
 #include <flashinfer/layout.cuh>
 #include <flashinfer/math.cuh>
 #include <optional>
@@ -51,8 +48,8 @@ void single_prefill_with_kv_cache_sm90(at::Tensor q, at::Tensor k, at::Tensor v,
   const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
 
   DISPATCH_context(
-      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM, POS_ENCODING_MODE, USE_SLIDING_WINDOW,
-      USE_LOGITS_SOFT_CAP, AttentionVariant, Params, [&] {
+      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP,
+      AttentionVariant, Params, [&] {
         Params params;
         params.q_ptr = static_cast<DTypeQ*>(q.data_ptr());
         params.k_ptr = static_cast<DTypeKV*>(k.data_ptr());

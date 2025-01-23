@@ -172,8 +172,8 @@ void BatchPrefillWithRaggedKVCacheRun(
         DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
           status = flashinfer::BatchPrefillWithRaggedKVCacheDispatched<
               CTA_TILE_Q, HEAD_DIM, POS_ENCODING_MODE,
-              /*use_fp16_qk_reduction=*/false, MASK_MODE, AttentionVariant, RaggedParams>(
-              params, tmp_v, tmp_s, stream);
+              /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant,
+              RaggedParams>(params, tmp_v, tmp_s, stream);
         });
 
         TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithRaggedKVCache failed with error ",
@@ -302,8 +302,8 @@ void BatchPrefillWithPagedKVCacheRun(
         DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
           status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
               CTA_TILE_Q, HEAD_DIM, POS_ENCODING_MODE,
-              /*use_fp16_qk_reduction=*/false, MASK_MODE, AttentionVariant, PagedParams>(
-              params, tmp_v, tmp_s, stream);
+              /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant,
+              PagedParams>(params, tmp_v, tmp_s, stream);
         });
 
         TORCH_CHECK(status == cudaSuccess, "BatchPrefillWithPagedKVCache failed with error ",

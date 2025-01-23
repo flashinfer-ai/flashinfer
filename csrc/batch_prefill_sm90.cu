@@ -87,6 +87,7 @@ void BatchPrefillWithRaggedKVCacheSM90Run(
   unsigned int head_dim = q.size(2);
 
   auto q_scalar_type = q.scalar_type();
+  auto kv_scalar_type = k.scalar_type();
 
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
@@ -94,8 +95,8 @@ void BatchPrefillWithRaggedKVCacheSM90Run(
   bool use_swa = window_left != -1;
 
   DISPATCH_context(
-      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM, POS_ENCODING_MODE, USE_SLIDING_WINDOW,
-      USE_LOGITS_SOFT_CAP, AttentionVariant, RaggedParams, PagedParams, [&] {
+      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP,
+      AttentionVariant, RaggedParams, PagedParams, [&] {
         RaggedParams params;
 
         params.q_ptr = static_cast<DTypeQ*>(q.data_ptr());
@@ -183,14 +184,15 @@ void BatchPrefillWithPagedKVCacheSM90Run(
   void* int_buffer_ptr = int_workspace_buffer.data_ptr();
 
   auto q_scalar_type = q.scalar_type();
+  auto kv_scalar_type = paged_k_cache.scalar_type();
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
   bool use_swa = window_left != -1;
 
   DISPATCH_context(
-      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM, POS_ENCODING_MODE, USE_SLIDING_WINDOW,
-      USE_LOGITS_SOFT_CAP, AttentionVariant, RaggedParams, PagedParams, [&] {
+      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP,
+      AttentionVariant, RaggedParams, PagedParams, [&] {
         PagedParams params;
 
         params.q_ptr = static_cast<DTypeQ*>(q.data_ptr());

@@ -26,9 +26,9 @@
 
 #define SINGLE_PREFILL_SM90_ADDITIONAL_FUNC_PARAMS , float logits_soft_cap, float sm_scale
 
-#define SINGLE_PREFILL_SM90_ADDITIONAL_PARAMS_SETTER \
-  params.logits_soft_cap = logits_soft_cap;          \
-  params.sm_scale = sm_scale;
+#define SINGLE_PREFILL_SM90_ADDITIONAL_PARAMS_SETTER          \
+  params.additional_params.logits_soft_cap = logits_soft_cap; \
+  params.additional_params.sm_scale = sm_scale;
 
 #define BATCH_DECODE_ADDITIONAL_FUNC_PARAMS                                              \
   , std::optional<at::Tensor> maybe_alibi_slopes, float logits_soft_cap, float sm_scale, \
@@ -61,6 +61,6 @@
 
 #define BATCH_PREFILL_SM90_ADDITIONAL_FUNC_PARAMS , float logits_soft_cap, float sm_scale
 
-#define BATCH_PREFILL_SM90_ADDITIONAL_PARAMS_SETTER \
-  params.logits_soft_cap = logits_soft_cap;         \
-  params.sm_scale = sm_scale;
+#define BATCH_PREFILL_SM90_ADDITIONAL_PARAMS_SETTER           \
+  params.additional_params.logits_soft_cap = logits_soft_cap; \
+  params.additional_params.sm_scale = sm_scale;

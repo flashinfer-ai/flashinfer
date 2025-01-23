@@ -15,7 +15,6 @@
  */
 // NOTE(Zihao): this is the include file for AOT mode
 #pragma once
-#include <flashinfer/page.cuh>
 #include <flashinfer/pos_enc.cuh>
 #include <flashinfer/attention/default_decode_params.cuh>
 #include <flashinfer/attention/variants.cuh>
@@ -25,13 +24,13 @@
 
 using IdType = int32_t;
 
-#define ADDITIONAL_FUNC_PARAMS BATCH_DECODE_ADDITIONAL_FUNC_PARAMS
-#define ADDITIONAL_PARAMS_SETTER BATCH_DECODE_ADDITIONAL_PARAMS_SETTER
+#define ADDITIONAL_FUNC_PARAMS SINGLE_DECODE_ADDITIONAL_FUNC_PARAMS
+#define ADDITIONAL_PARAMS_SETTER SINGLE_DECODE_ADDITIONAL_PARAMS_SETTER
 
-#define DISPATCH_context(DTypeQ, DTypeKV, DTypeO, IdType, HEAD_DIM, POS_ENCODING_MODE, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, AttentionVariant, Params, ...) { \
+#define DISPATCH_context(DTypeQ, DTypeKV, DTypeO, IdType, HEAD_DIM, POS_ENCODING_MODE, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, AttentionVariant, Params, ...) {\
    DISPATCH_PYTORCH_QKV_DTYPE_TO_CTYPE(q_scalar_type, kv_scalar_type, DTypeQ, DTypeKV, [&] { \
      using DTypeO = DTypeQ; \
-     using Params = BatchDecodeParams<DTypeQ, DTypeKV, DTypeO, IdType>; \
+     using Params = SingleDecodeParams<DTypeQ, DTypeKV, DTypeO>; \
      constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone; \
      return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] { \
        return DISPATCH_BOOL(window_left > -1, USE_SLIDING_WINDOW, [&] { \

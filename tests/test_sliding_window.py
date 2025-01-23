@@ -301,11 +301,7 @@ def test_batch_paged_prefill_sliding_window(
             dim=0,
         )
         o_ref_i = flashinfer.single_prefill_with_kv_cache(
-            qi,
-            ki,
-            vi,
-            window_left=window_left,
-            causal=True,
+            qi, ki, vi, window_left=window_left, causal=True, backend="fa2"
         )
         o_i = o[q_indptr[i] : q_indptr[i + 1]]
         torch.testing.assert_close(o_i, o_ref_i, rtol=1e-3, atol=1e-3)

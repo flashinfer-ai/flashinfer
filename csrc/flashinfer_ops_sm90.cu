@@ -13,7 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "aot_extension_utils.h"
+#include "aot_default_additional_params.h"
+#include "pytorch_extension_utils.h"
 
 void CutlassSegmentGEMMSM90(at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
                             at::Tensor all_problems, at::Tensor x_ptr, at::Tensor w_ptr,
@@ -21,14 +22,10 @@ void CutlassSegmentGEMMSM90(at::Tensor float_workspace_buffer, at::Tensor int_wo
                             at::Tensor y_stride, at::Tensor empty_x_data, bool weight_column_major,
                             int64_t cuda_stream);
 
-#define SINGLE_PREFILL_AOT_ADDITIONAL_FUNC_PARAMS                                              \
-  , std::optional<at::Tensor> maybe_custom_mask, std::optional<at::Tensor> maybe_alibi_slopes, \
-      float logits_soft_cap, float sm_scale, float rope_scale, float rope_theta
-
 void single_prefill_with_kv_cache_sm90(
     at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, std::optional<at::Tensor> maybe_lse,
     unsigned int mask_mode_code, unsigned int layout,
-    int32_t window_left SINGLE_PREFILL_AOT_ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
+    int32_t window_left SINGLE_PREFILL_SM90_ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
 
 std::vector<int64_t> BatchPrefillWithKVCacheSM90Plan(
     unsigned int head_dim, bool causal, at::Tensor float_workspace_buffer,
@@ -37,17 +34,12 @@ std::vector<int64_t> BatchPrefillWithKVCacheSM90Plan(
     unsigned int batch_size, unsigned int num_qo_heads, unsigned int num_kv_heads,
     unsigned int page_size, bool enable_cuda_graph, int64_t cuda_stream);
 
-#define BATCH_PREFILL_AOT_ADDITIONAL_FUNC_PARAMS                                              \
-  , std::optional<at::Tensor> maybe_custom_mask, std::optional<at::Tensor> maybe_mask_indptr, \
-      std::optional<at::Tensor> maybe_alibi_slopes, float logits_soft_cap, float sm_scale,    \
-      float rope_scale, float rope_theta
-
 void BatchPrefillWithRaggedKVCacheSM90Run(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     std::vector<int64_t> plan_info_vec, at::Tensor q, at::Tensor k, at::Tensor v,
     at::Tensor qo_indptr, at::Tensor kv_indptr, at::Tensor o, std::optional<at::Tensor> maybe_lse,
     unsigned int mask_mode_code, unsigned int layout,
-    int32_t window_left BATCH_PREFILL_AOT_ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
+    int32_t window_left BATCH_PREFILL_SM90_ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
 
 void BatchPrefillWithPagedKVCacheSM90Run(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
@@ -55,7 +47,7 @@ void BatchPrefillWithPagedKVCacheSM90Run(
     at::Tensor paged_v_cache, at::Tensor qo_indptr, at::Tensor paged_kv_indptr,
     at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len, at::Tensor o,
     std::optional<at::Tensor> maybe_lse, unsigned int mask_mode_code, unsigned int layout,
-    int32_t window_left BATCH_PREFILL_AOT_ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
+    int32_t window_left BATCH_PREFILL_SM90_ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("cutlass_segment_gemm_sm90", &CutlassSegmentGEMMSM90,

@@ -28,18 +28,8 @@ root = Path(__file__).parent.resolve()
 gen_dir = root / "csrc" / "generated"
 
 head_dims = os.environ.get("FLASHINFER_HEAD_DIMS", "64,128,256").split(",")
-pos_encoding_modes = os.environ.get("FLASHINFER_POS_ENCODING_MODES", "0").split(",")
-use_fp16_qk_reductions = os.environ.get(
-    "FLASHINFER_USE_FP16_QK_REDUCTION_OPTIONS", "0"
-).split(",")
-mask_modes = os.environ.get("FLASHINFER_MASK_MODES", "0,1,2").split(",")
-
 head_dims = list(map(int, head_dims))
-pos_encoding_modes = list(map(int, pos_encoding_modes))
-pos_encoding_modes_sm90 = [mode for mode in pos_encoding_modes if mode != 2]
-use_fp16_qk_reductions = list(map(int, use_fp16_qk_reductions))
-use_fp16_qk_reductions_sm90 = [mode for mode in use_fp16_qk_reductions if mode != 1]
-mask_modes = list(map(int, mask_modes))
+mask_modes = [0, 1, 2]
 
 enable_aot = os.environ.get("FLASHINFER_ENABLE_AOT", "0") == "1"
 enable_f16 = os.environ.get("FLASHINFER_ENABLE_F16", "1") == "1"
@@ -84,8 +74,8 @@ def generate_cuda() -> None:
         argparse.Namespace(
             path=gen_dir,
             head_dims=head_dims,
-            pos_encoding_modes=pos_encoding_modes,
-            use_fp16_qk_reductions=use_fp16_qk_reductions,
+            pos_encoding_modes=[0],
+            use_fp16_qk_reductions=[0],
             mask_modes=mask_modes,
             enable_f16=enable_f16,
             enable_bf16=enable_bf16,
@@ -99,8 +89,8 @@ def generate_cuda() -> None:
             argparse.Namespace(
                 path=gen_dir,
                 head_dims=head_dims,
-                pos_encoding_modes=pos_encoding_modes_sm90,
-                use_fp16_qk_reductions=use_fp16_qk_reductions_sm90,
+                pos_encoding_modes=[0],
+                use_fp16_qk_reductions=[0],
                 mask_modes=mask_modes,
                 enable_f16=enable_f16,
                 enable_bf16=enable_bf16,
@@ -213,16 +203,16 @@ if enable_aot:
         "csrc/renorm.cu",
         "csrc/activation.cu",
         "csrc/batch_decode.cu",
-        # "csrc/batch_prefill.cu",
-        # "csrc/single_decode.cu",
-        # "csrc/single_prefill.cu",
-        # "csrc/flashinfer_ops.cu",
+        "csrc/batch_prefill.cu",
+        "csrc/single_decode.cu",
+        "csrc/single_prefill.cu",
+        "csrc/flashinfer_ops.cu",
     ]
     kernel_sm90_sources = [
-        # "csrc/group_gemm_sm90.cu",
-        # "csrc/single_prefill_sm90.cu",
-        # "csrc/batch_prefill_sm90.cu",
-        # "csrc/flashinfer_ops_sm90.cu",
+        "csrc/group_gemm_sm90.cu",
+        "csrc/single_prefill_sm90.cu",
+        "csrc/batch_prefill_sm90.cu",
+        "csrc/flashinfer_ops_sm90.cu",
     ]
     decode_sources = list(gen_dir.glob("*decode_head*.cu"))
     prefill_sources = [

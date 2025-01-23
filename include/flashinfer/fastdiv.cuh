@@ -29,6 +29,8 @@ struct uint_fastdiv {
   uint32_t s;
   uint32_t a;
 
+  __host__ __device__ uint_fastdiv() : d(0), m(0), s(0), a(0) {}
+
   __host__ uint_fastdiv(uint32_t d) : d(d) {
     unsigned int p, nc, delta, q1, r1, q2, r2;
     a = 0;

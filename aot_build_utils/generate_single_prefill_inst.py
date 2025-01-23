@@ -36,14 +36,26 @@ namespace flashinfer {{
 
 using Params = SinglePrefillParams<{dtype_q}, {dtype_kv}, {dtype_out}>;
 
-template cudaError_t SinglePrefillWithKVCacheDispatched<{head_dim}, {pos_encoding_mode}, {use_fp16_qk_reduction}, {mask_mode}, DefaultAttention<Params, get_variant_code(
-    {use_custom_mask}, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false)>>(
+template cudaError_t SinglePrefillWithKVCacheDispatched<{head_dim}, {pos_encoding_mode}, {use_fp16_qk_reduction}, {mask_mode}, DefaultAttention<
+    {use_custom_mask}, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false>, Params>(
     Params params,
     {dtype_out}* tmp,
     cudaStream_t stream);
 
-template cudaError_t SinglePrefillWithKVCacheDispatched<{head_dim}, {pos_encoding_mode}, {use_fp16_qk_reduction}, {mask_mode}, DefaultAttention<Params, get_variant_code(
-    {use_custom_mask}, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false)>>(
+template cudaError_t SinglePrefillWithKVCacheDispatched<{head_dim}, {pos_encoding_mode}, {use_fp16_qk_reduction}, {mask_mode}, DefaultAttention<
+    {use_custom_mask}, /*use_sliding_window=*/true, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false>, Params>(
+    Params params,
+    {dtype_out}* tmp,
+    cudaStream_t stream);
+
+template cudaError_t SinglePrefillWithKVCacheDispatched<{head_dim}, {pos_encoding_mode}, {use_fp16_qk_reduction}, {mask_mode}, DefaultAttention<
+    {use_custom_mask}, /*use_sliding_window=*/false, /*use_logits_soft_cap=*/false, /*use_alibi_bias=*/false>, Params>(
+    Params params,
+    {dtype_out}* tmp,
+    cudaStream_t stream);
+
+template cudaError_t SinglePrefillWithKVCacheDispatched<{head_dim}, {pos_encoding_mode}, {use_fp16_qk_reduction}, {mask_mode}, DefaultAttention<
+    {use_custom_mask}, /*use_sliding_window=*/false, /*use_logits_soft_cap=*/true, /*use_alibi_bias=*/false>, Params>(
     Params params,
     {dtype_out}* tmp,
     cudaStream_t stream);

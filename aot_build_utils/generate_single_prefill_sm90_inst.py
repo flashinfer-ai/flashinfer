@@ -31,7 +31,7 @@ def get_cu_file_str(
     dtype_out,
 ):
     content = """ // single_prefill_sm90 template inst
-#include <flashinfer/attention/hopper/params.cuh>
+#include <flashinfer/attention/hopper/default_params.cuh>
 #include <flashinfer/attention/hopper/prefill_sm90.cuh>
 #include <flashinfer/attention/hopper/variants.cuh>
 #include <flashinfer/cutlass_utils.cuh>
@@ -45,19 +45,19 @@ using DTypeO = cutlass_dtype_t<{dtype_out}>;
 using Params = SinglePrefillParams<DTypeQ, DTypeKV, DTypeO>;
 
 template cudaError_t SinglePrefillWithKVCacheDispatched
-    <{head_dim}, {mask_mode}, /*USE_SLIDING_WINDOW=*/true, LogitsSoftCap<Params>>
+    <{head_dim}, {mask_mode}, /*USE_SLIDING_WINDOW=*/true, LogitsSoftCap, Params>
     (Params& params, cudaStream_t stream);
 
 template cudaError_t SinglePrefillWithKVCacheDispatched
-    <{head_dim}, {mask_mode}, /*USE_SLIDING_WINDOW=*/false, LogitsSoftCap<Params>>
+    <{head_dim}, {mask_mode}, /*USE_SLIDING_WINDOW=*/false, LogitsSoftCap, Params>
     (Params& params, cudaStream_t stream);
 
 template cudaError_t SinglePrefillWithKVCacheDispatched
-    <{head_dim}, {mask_mode}, /*USE_SLIDING_WINDOW=*/true, StandardAttention<Params>>
+    <{head_dim}, {mask_mode}, /*USE_SLIDING_WINDOW=*/true, StandardAttention, Params>
     (Params& params, cudaStream_t stream);
 
 template cudaError_t SinglePrefillWithKVCacheDispatched
-    <{head_dim}, {mask_mode}, /*USE_SLIDING_WINDOW=*/false, StandardAttention<Params>>
+    <{head_dim}, {mask_mode}, /*USE_SLIDING_WINDOW=*/false, StandardAttention, Params>
     (Params& params, cudaStream_t stream);
 
 }}

@@ -107,6 +107,7 @@ def get_aot_default_additional_params_header_str() -> str:
         [],
         ["logits_soft_cap", "sm_scale"],
         ["float", "float"],
+        is_sm90_template=True,
     )
 
     ret += generate_macro_entry(
@@ -141,6 +142,7 @@ def get_aot_default_additional_params_header_str() -> str:
         [],
         ["logits_soft_cap", "sm_scale"],
         ["float", "float"],
+        is_sm90_template=True,
     )
 
     return ret
