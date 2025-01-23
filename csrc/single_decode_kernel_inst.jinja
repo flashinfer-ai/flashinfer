@@ -1,12 +1,5 @@
 #include <flashinfer/attention/decode.cuh>
-
-{% if jit %}
-#include "single_decode_generated_config.inc"
-{% else %}
-#include <flashinfer/attention/decode_params.cuh>
-#include <flashinfer/attention/variants.cuh>
-using Params = SingleDecodeParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_out }}>;
-{% endif %}
+#include "single_decode_config.inc"
 
 using namespace flashinfer;
 

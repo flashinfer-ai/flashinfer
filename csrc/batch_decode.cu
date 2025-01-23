@@ -18,7 +18,7 @@
 #include <flashinfer/utils.cuh>
 #include <optional>
 
-#include "batch_decode_generated_config.inc"
+#include "batch_decode_config.inc"
 #include "pytorch_extension_utils.h"
 
 namespace flashinfer {
@@ -36,7 +36,7 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     at::Tensor page_locked_int_workspace_buffer, at::Tensor indptr, unsigned int batch_size,
     unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int page_size,
-    bool enable_cuda_graph, bool use_logits_soft_cap, unsigned int head_dim,
+    bool enable_cuda_graph, int window_left, float logits_soft_cap, unsigned int head_dim,
     at::Tensor empty_q_data, at::Tensor empty_kv_data, int64_t cuda_stream) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();

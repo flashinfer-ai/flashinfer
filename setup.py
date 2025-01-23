@@ -45,8 +45,12 @@ enable_aot = os.environ.get("FLASHINFER_ENABLE_AOT", "0") == "1"
 enable_f16 = os.environ.get("FLASHINFER_ENABLE_F16", "1") == "1"
 enable_bf16 = os.environ.get("FLASHINFER_ENABLE_BF16", "1") == "1"
 enable_fp8 = os.environ.get("FLASHINFER_ENABLE_FP8", "1") == "1"
-enable_fp8_e4m3 = os.environ.get("FLASHINFER_ENABLE_FP8_E4M3", "1" if enable_fp8 else "0") == "1"
-enable_fp8_e5m2 = os.environ.get("FLASHINFER_ENABLE_FP8_E5M2", "1" if enable_fp8 else "0") == "1"
+enable_fp8_e4m3 = (
+    os.environ.get("FLASHINFER_ENABLE_FP8_E4M3", "1" if enable_fp8 else "0") == "1"
+)
+enable_fp8_e5m2 = (
+    os.environ.get("FLASHINFER_ENABLE_FP8_E5M2", "1" if enable_fp8 else "0") == "1"
+)
 enable_sm90 = os.environ.get("FLASHINFER_ENABLE_SM90", "1") == "1"
 
 
@@ -69,6 +73,9 @@ def generate_cuda() -> None:
     try:  # no aot_build_utils in sdist
         sys.path.append(str(root))
         from aot_build_utils.generate import get_instantiation_cu
+        from aot_build_utils.generate_aot_default_additional_params_header import (
+            get_aot_default_additional_params_header_str,
+        )
         from aot_build_utils.generate_sm90 import get_sm90_instantiation_cu
     except ImportError:
         return
@@ -101,18 +108,22 @@ def generate_cuda() -> None:
         )
     aot_config_str = f"""prebuilt_ops_uri = set({aot_kernel_uris})"""
     (root / "flashinfer" / "jit" / "aot_config.py").write_text(aot_config_str)
+    (root / "csrc" / "aot_default_additional_params.h").write_text(
+        get_aot_default_additional_params_header_str()
+    )
 
 
 ext_modules = []
 cmdclass = {}
 install_requires = ["torch", "ninja"]
 generate_build_meta({})
-generate_cuda()
 
 if enable_aot:
     import torch
     import torch.utils.cpp_extension as torch_cpp_ext
     from packaging.version import Version
+
+    generate_cuda()
 
     def get_cuda_version() -> Version:
         if torch_cpp_ext.CUDA_HOME is None:
@@ -202,16 +213,16 @@ if enable_aot:
         "csrc/renorm.cu",
         "csrc/activation.cu",
         "csrc/batch_decode.cu",
-        "csrc/batch_prefill.cu",
-        "csrc/single_decode.cu",
-        "csrc/single_prefill.cu",
-        "csrc/flashinfer_ops.cu",
+        # "csrc/batch_prefill.cu",
+        # "csrc/single_decode.cu",
+        # "csrc/single_prefill.cu",
+        # "csrc/flashinfer_ops.cu",
     ]
     kernel_sm90_sources = [
-        "csrc/group_gemm_sm90.cu",
-        "csrc/single_prefill_sm90.cu",
-        "csrc/batch_prefill_sm90.cu",
-        "csrc/flashinfer_ops_sm90.cu",
+        # "csrc/group_gemm_sm90.cu",
+        # "csrc/single_prefill_sm90.cu",
+        # "csrc/batch_prefill_sm90.cu",
+        # "csrc/flashinfer_ops_sm90.cu",
     ]
     decode_sources = list(gen_dir.glob("*decode_head*.cu"))
     prefill_sources = [

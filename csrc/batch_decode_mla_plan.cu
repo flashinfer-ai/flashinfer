@@ -2,7 +2,7 @@
 #include <flashinfer/attention/scheduler.cuh>
 #include <optional>
 
-#include "mla_generated_config.inc"
+#include "mla_config.inc"
 #include "pytorch_extension_utils.h"
 
 using namespace flashinfer;

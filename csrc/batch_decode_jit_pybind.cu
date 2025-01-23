@@ -13,14 +13,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "batch_decode_generated_config.inc"
+#include "batch_decode_config.inc"
 #include "pytorch_extension_utils.h"
 
 std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     at::Tensor page_locked_int_workspace_buffer, at::Tensor indptr, unsigned int batch_size,
     unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int page_size,
-    bool enable_cuda_graph, bool use_logits_soft_cap, unsigned int head_dim,
+    bool enable_cuda_graph, int window_left, float logits_soft_cap, unsigned int head_dim,
     at::Tensor empty_q_data, at::Tensor empty_kv_data, int64_t cuda_stream);
 
 void BatchDecodeWithPagedKVCacheRun(

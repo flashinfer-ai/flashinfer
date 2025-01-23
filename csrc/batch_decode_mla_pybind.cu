@@ -1,4 +1,4 @@
-#include "mla_generated_config.inc"
+#include "mla_config.inc"
 #include "pytorch_extension_utils.h"
 
 std::vector<int64_t> BatchDecodeWithPagedKVCachePlanMLA(

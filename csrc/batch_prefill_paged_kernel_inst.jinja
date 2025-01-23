@@ -1,12 +1,5 @@
 #include <flashinfer/attention/prefill.cuh>
-
-{% if jit %}
-#include "batch_prefill_generated_config.inc"
-{% else %}
-#include <flashinfer/attention/prefill_params.cuh>
-#include <flashinfer/attention/variants.cuh>
-using PagedParams = BatchPrefillPagedParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_out }}, {{ idtype }}>;
-{% endif %}
+#include "batch_prefill_config.inc"
 
 namespace flashinfer {
 

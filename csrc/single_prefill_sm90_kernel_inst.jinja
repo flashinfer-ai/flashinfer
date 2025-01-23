@@ -1,13 +1,5 @@
 #include <flashinfer/attention/hopper/prefill_sm90.cuh>
-
-{% if jit %}
-#include "single_prefill_sm90_generated_config.inc"
-{% else %}
-#include <flashinfer/attention/hopper/params.cuh>
-#include <flashinfer/attention/hopper/variants.cuh>
-
-using Params = SinglePrefillParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_out }}>;
-{% endif %}
+#include "single_prefill_sm90_config.inc"
 
 using namespace flashinfer;
 

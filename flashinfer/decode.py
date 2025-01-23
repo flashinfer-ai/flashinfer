@@ -910,7 +910,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     num_kv_heads,
                     page_size,
                     self.is_cuda_graph_enabled,
-                    logits_soft_cap > 0,  # use_logits_soft_cap
+                    window_left,
+                    logits_soft_cap,
                     head_dim,
                     torch.empty(0, dtype=q_data_type),
                     torch.empty(0, dtype=kv_data_type),

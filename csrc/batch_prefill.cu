@@ -18,7 +18,7 @@
 #include <flashinfer/pos_enc.cuh>
 #include <optional>
 
-#include "batch_prefill_generated_config.inc"
+#include "batch_prefill_config.inc"
 #include "pytorch_extension_utils.h"
 
 namespace flashinfer {

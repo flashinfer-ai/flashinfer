@@ -372,7 +372,8 @@ class BlockSparseAttentionWrapper:
                     num_kv_heads,
                     C,
                     False,  # is_cuda_graph_enabled
-                    False,  # use_logits_soft_cap
+                    -1,  # window_left
+                    logits_soft_cap,  # logits_soft_cap
                     head_dim,
                     torch.empty(0, dtype=q_data_type),
                     torch.empty(0, dtype=kv_data_type),

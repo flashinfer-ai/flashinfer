@@ -182,7 +182,7 @@ def gen_batch_decode_mla_module(
 
     with open(FLASHINFER_CSRC_DIR / "batch_decode_mla_config.jinja") as f:
         config_templ = jinja2.Template(f.read())
-    generated_config_path = gen_directory / "mla_generated_config.inc"
+    generated_config_path = gen_directory / "mla_config.inc"
     write_if_different(
         generated_config_path,
         config_templ.render(
@@ -225,14 +225,14 @@ def get_single_prefill_uri(
     use_fp16_qk_reduction: bool,
 ) -> str:
     return (
-        f"single_prefill_{backend}_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
+        f"single_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"head_dim_{head_dim}_"
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"f16qk_{use_fp16_qk_reduction}"
+        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
     )
 
 
@@ -257,7 +257,7 @@ def get_batch_prefill_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"f16qk_{use_fp16_qk_reduction}"
+        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
     )
 
 
@@ -543,7 +543,6 @@ def gen_customize_single_decode_module(
     dest_path = gen_directory / "single_decode_kernel.cu"
     source_paths.append(dest_path)
     source = kernel_inst_templ.render(
-        jit=True,
         **kwargs,
     )
     write_if_different(dest_path, source)
@@ -559,7 +558,7 @@ def gen_customize_single_decode_module(
             source = f.read()
         write_if_different(dest_path, source)
 
-    generated_config_path = gen_directory / "single_decode_generated_config.inc"
+    generated_config_path = gen_directory / "single_decode_config.inc"
     write_if_different(generated_config_path, generated_inc_str)
 
     return load_cuda_ops(uri, source_paths)
@@ -631,7 +630,6 @@ def gen_customize_single_prefill_module(
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
             source = kernel_inst_templ.render(
-                jit=True,
                 mask_mode=mask_mode_literal[mask_mode],
                 **kwargs,
             )
@@ -648,7 +646,7 @@ def gen_customize_single_prefill_module(
                 source = f.read()
             write_if_different(dest_path, source)
 
-        generated_config_path = gen_directory / "single_prefill_generated_config.inc"
+        generated_config_path = gen_directory / "single_prefill_config.inc"
         write_if_different(generated_config_path, generated_inc_str)
 
         return load_cuda_ops(uri, source_paths)
@@ -690,7 +688,6 @@ def gen_customize_single_prefill_module(
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
             source = kernel_inst_templ.render(
-                jit=True,
                 mask_mode=mask_mode_literal[mask_mode],
                 **kwargs,
             )
@@ -707,9 +704,7 @@ def gen_customize_single_prefill_module(
                 source = f.read()
             write_if_different(dest_path, source)
 
-        generated_config_path = (
-            gen_directory / "single_prefill_sm90_generated_config.inc"
-        )
+        generated_config_path = gen_directory / "single_prefill_sm90_config.inc"
         write_if_different(generated_config_path, generated_inc_str)
         return load_cuda_ops(
             uri,
@@ -778,7 +773,6 @@ def gen_customize_batch_decode_module(
     dest_path = gen_directory / "batch_decode_kernel.cu"
     source_paths.append(dest_path)
     source = kernel_inst_templ.render(
-        jit=True,
         **kwargs,
     )
     write_if_different(dest_path, source)
@@ -794,7 +788,7 @@ def gen_customize_batch_decode_module(
             source = f.read()
         write_if_different(dest_path, source)
 
-    generated_config_path = gen_directory / "batch_decode_generated_config.inc"
+    generated_config_path = gen_directory / "batch_decode_config.inc"
     write_if_different(generated_config_path, generated_inc_str)
     return load_cuda_ops(
         uri,
@@ -874,7 +868,6 @@ def gen_customize_batch_prefill_module(
             )
             source_paths.append(dest_path)
             source = paged_kernel_inst_templ.render(
-                jit=True,
                 mask_mode=mask_mode_literal[mask_mode],
                 **kwargs,
             )
@@ -885,7 +878,6 @@ def gen_customize_batch_prefill_module(
             )
             source_paths.append(dest_path)
             source = ragged_kernel_inst_templ.render(
-                jit=True,
                 mask_mode=mask_mode_literal[mask_mode],
                 **kwargs,
             )
@@ -902,7 +894,7 @@ def gen_customize_batch_prefill_module(
                 source = f.read()
             write_if_different(dest_path, source)
 
-        generated_config_path = gen_directory / "batch_prefill_generated_config.inc"
+        generated_config_path = gen_directory / "batch_prefill_config.inc"
         write_if_different(generated_config_path, generated_inc_str)
         return load_cuda_ops(
             uri,
@@ -948,7 +940,6 @@ def gen_customize_batch_prefill_module(
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
             source = paged_kernel_inst_templ.render(
-                jit=True,
                 mask_mode=mask_mode_literal[mask_mode],
                 **kwargs,
             )
@@ -958,7 +949,6 @@ def gen_customize_batch_prefill_module(
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
             source = ragged_kernel_inst_templ.render(
-                jit=True,
                 mask_mode=mask_mode_literal[mask_mode],
                 **kwargs,
             )
@@ -975,9 +965,7 @@ def gen_customize_batch_prefill_module(
                 source = f.read()
             write_if_different(dest_path, source)
 
-        generated_config_path = (
-            gen_directory / "batch_prefill_sm90_generated_config.inc"
-        )
+        generated_config_path = gen_directory / "batch_prefill_sm90_config.inc"
         write_if_different(generated_config_path, generated_inc_str)
         return load_cuda_ops(
             uri,

@@ -13,7 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "aot_extension_utils.h"
+#include "aot_default_additional_params.h"
+#include "pytorch_extension_utils.h"
 
 //========== activation ==========
 
@@ -34,24 +35,16 @@ void merge_states(at::Tensor v, at::Tensor s, at::Tensor v_merged, at::Tensor s_
 
 //========== decode ==========
 
-#define SINGLE_DECODE_AOT_ADDITIONAL_FUNC_PARAMS                                   \
-  , std::optional<at::Tensor> alibi_slopes, float logits_soft_cap, float sm_scale, \
-      float rope_scale, float rope_theta
-
 void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor tmp,
                                  at::Tensor o, unsigned int layout,
-                                 int window_left SINGLE_DECODE_AOT_ADDITIONAL_FUNC_PARAMS,
+                                 int window_left SINGLE_DECODE_ADDITIONAL_FUNC_PARAMS,
                                  int64_t cuda_stream);
-
-#define BATCH_DECODE_AOT_ADDITIONAL_FUNC_PARAMS                                    \
-  , std::optional<at::Tensor> alibi_slopes, float logits_soft_cap, float sm_scale, \
-      float rope_scale, float rope_theta
 
 std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     at::Tensor page_locked_int_workspace_buffer, at::Tensor indptr, unsigned int batch_size,
     unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int page_size,
-    bool enable_cuda_graph, bool use_logits_soft_cap, unsigned int head_dim,
+    bool enable_cuda_graph, int window_left, float logits_soft_cap, unsigned int head_dim,
     at::Tensor empty_q_data, at::Tensor empty_kv_data, int64_t cuda_stream);
 
 void BatchDecodeWithPagedKVCacheRun(
@@ -59,7 +52,7 @@ void BatchDecodeWithPagedKVCacheRun(
     std::vector<int64_t> plan_info_vec, at::Tensor q, at::Tensor paged_k_cache,
     at::Tensor paged_v_cache, at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices,
     at::Tensor paged_kv_last_page_len, at::Tensor o, std::optional<at::Tensor> maybe_lse,
-    unsigned int kv_layout_code, int window_left BATCH_DECODE_AOT_ADDITIONAL_FUNC_PARAMS,
+    unsigned int kv_layout_code, int window_left BATCH_DECODE_ADDITIONAL_FUNC_PARAMS,
     int64_t cuda_stream);
 
 //========== gemm ==========
@@ -103,14 +96,10 @@ void block_sparse_indices_to_vector_sparse_offsets(at::Tensor block_sparse_indic
 
 //========== prefill ==========
 
-#define SINGLE_PREFILL_AOT_ADDITIONAL_FUNC_PARAMS                                          \
-  , std::optional<at::Tensor> maybe_packed_custom_mask,                                    \
-      std::optional<at::Tensor> maybe_alibi_slopes, float logits_soft_cap, float sm_scale, \
-      float rope_scale, float rope_theta
 void single_prefill_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor tmp,
                                   at::Tensor o, std::optional<at::Tensor> maybe_lse,
                                   unsigned int mask_mode_code, unsigned int layout,
-                                  int32_t window_left SINGLE_PREFILL_AOT_ADDITIONAL_FUNC_PARAMS,
+                                  int32_t window_left SINGLE_PREFILL_ADDITIONAL_FUNC_PARAMS,
                                   int64_t cuda_stream);
 
 std::vector<int64_t> BatchPrefillWithKVCachePlan(
@@ -120,17 +109,12 @@ std::vector<int64_t> BatchPrefillWithKVCachePlan(
     unsigned int num_kv_heads, unsigned int page_size, bool enable_cuda_graph,
     unsigned int head_dim, bool causal, int64_t cuda_stream);
 
-#define BATCH_PREFILL_AOT_ADDITIONAL_FUNC_PARAMS                                              \
-  , std::optional<at::Tensor> maybe_custom_mask, std::optional<at::Tensor> maybe_mask_indptr, \
-      std::optional<at::Tensor> maybe_alibi_slopes, float logits_soft_cap, float sm_scale,    \
-      float rope_scale, float rope_theta
-
 void BatchPrefillWithRaggedKVCacheRun(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     std::vector<int64_t> plan_info_vec, at::Tensor q, at::Tensor k, at::Tensor v,
     at::Tensor qo_indptr, at::Tensor kv_indptr, at::Tensor o, std::optional<at::Tensor> maybe_lse,
     unsigned int mask_mode_code, unsigned int layout,
-    int32_t window_left BATCH_PREFILL_AOT_ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
+    int32_t window_left BATCH_PREFILL_ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
 
 void BatchPrefillWithPagedKVCacheRun(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
@@ -138,7 +122,7 @@ void BatchPrefillWithPagedKVCacheRun(
     at::Tensor paged_v_cache, at::Tensor qo_indptr, at::Tensor paged_kv_indptr,
     at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len, at::Tensor o,
     std::optional<at::Tensor> maybe_lse, unsigned int mask_mode_code, unsigned int layout,
-    int32_t window_left BATCH_PREFILL_AOT_ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
+    int32_t window_left BATCH_PREFILL_ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
 
 //========== quantization ==========
 

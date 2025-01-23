@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <flashinfer/attention/decode_params.cuh>
-#include <flashinfer/attention/prefill_params.cuh>
+#include <flashinfer/attention/default_decode_params.cuh>
+#include <flashinfer/attention/default_prefill_params.cuh>
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/attention/variants.cuh>
 #include <optional>

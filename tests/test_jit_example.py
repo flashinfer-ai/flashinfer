@@ -738,12 +738,12 @@ struct DebugPrintLogits {
 
 
 if __name__ == "__main__":
-    test_single_decode_mask()
-    test_flash_sigmoid()
-    test_dump_logits()
-    test_debug_print_logits()
-    test_sm90_debug_print_logits()
-    test_batch_decode_flash_sigmoid(False)
-    test_batch_decode_flash_sigmoid(True)
-    test_batch_prefill_flash_sigmoid()
+    # test_single_decode_mask()
+    # test_flash_sigmoid()
+    # test_dump_logits()
+    # test_debug_print_logits()
+    # test_sm90_debug_print_logits()
+    # test_batch_decode_flash_sigmoid(False)
+    # test_batch_decode_flash_sigmoid(True)
+    # test_batch_prefill_flash_sigmoid()
     test_batch_prefill_sm90_flash_sigmoid()

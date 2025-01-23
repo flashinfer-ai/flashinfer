@@ -1,12 +1,5 @@
 #include <flashinfer/attention/prefill.cuh>
-
-{% if jit %}
-#include "single_prefill_generated_config.inc"
-{% else %}
-#include <flashinfer/attention/prefill_params.cuh>
-#include <flashinfer/attention/variants.cuh>
-using Params = SinglePrefillParams<{{ dtype_q }}, {{ dtype_kv }}, {{ dtype_out }}>;
-{% endif %}
+#include "single_prefill_config.inc"
 
 using namespace flashinfer;
 

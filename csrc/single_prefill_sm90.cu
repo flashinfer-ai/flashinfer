@@ -22,7 +22,7 @@
 #include <optional>
 
 #include "pytorch_extension_utils.h"
-#include "single_prefill_sm90_generated_config.inc"
+#include "single_prefill_sm90_config.inc"
 
 namespace flashinfer {
 

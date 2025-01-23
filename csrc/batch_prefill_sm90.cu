@@ -22,7 +22,7 @@
 #include <flashinfer/math.cuh>
 #include <optional>
 
-#include "batch_prefill_sm90_generated_config.inc"
+#include "batch_prefill_sm90_config.inc"
 #include "pytorch_extension_utils.h"
 
 namespace flashinfer {
