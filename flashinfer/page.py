@@ -201,7 +201,7 @@ def get_batch_indices_positions(
     ----
     This function is similar to `CSR2COO <https://docs.nvidia.com/cuda/cusparse/#csr2coo>`_
     conversion in cuSPARSE library, with the difference that we are converting from a ragged
-    tensor (which don't require a column indices array) to a COUP format.
+    tensor (which don't require a column indices array) to a COO format.
 
     See Also
     --------
