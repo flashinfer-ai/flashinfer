@@ -532,6 +532,7 @@ class BlockSparseAttentionWrapper:
                 (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
             )
 
+        out = torch.empty_like(q)
         if self._use_tensor_cores:
             if self._backend == "fa3":
                 sparse_indices = block_sparse_indices_to_vector_sparse_offsets(
@@ -549,7 +550,7 @@ class BlockSparseAttentionWrapper:
                 sparse_indices = self._paged_kv_indices_buf
                 sparse_indptr = self._paged_kv_indptr_buf
 
-            out = self._cached_module.paged_run(
+            self._cached_module.paged_run(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._plan_info,
@@ -560,6 +561,7 @@ class BlockSparseAttentionWrapper:
                 sparse_indptr,
                 sparse_indices,
                 self._paged_kv_last_page_len,
+                out,
                 lse,
                 self._mask_mode,
                 TensorLayout[self._kv_layout].value,
@@ -573,7 +575,7 @@ class BlockSparseAttentionWrapper:
                 rope_theta,
             )
         else:
-            out = self._cached_module.run(
+            self._cached_module.run(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._plan_info,
@@ -584,6 +586,7 @@ class BlockSparseAttentionWrapper:
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len,
                 lse,
+                out,
                 TensorLayout[self._kv_layout].value,
                 -1,  # window_left
                 _get_cache_alibi_slopes_buf(q.shape[1], self.device),
