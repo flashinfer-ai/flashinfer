@@ -27,6 +27,15 @@ requires = ["setuptools"]
 build-backend = "custom_backend"
 backend-path = ["."]
 
+[tool.codespell]
+ignore-words-list = "3nd"
+skip = [
+    "build",
+    "3rdparty",
+    "dist",
+    ".venv"
+]
+
 [tool.setuptools]
 packages = [
     "flashinfer",
@@ -62,3 +71,46 @@ show_error_context = true
 follow_imports = "skip"
 ignore_errors = false
 strict_optional = false
+
+
+[tool.ruff.lint]
+select = [
+    # pycodestyle
+    "E",
+    # Pyflakes
+    "F",
+    # pyupgrade
+    # "UP",
+    # flake8-bugbear
+    "B",
+    # flake8-simplify
+    "SIM",
+    # isort
+    # "I",
+]
+ignore = [
+    # Module level import not at top of file
+    "E402",
+    # star imports
+    "F405", "F403",
+    # ambiguous name
+    "E741",
+    # line too long
+    "E501",
+    # key in dict.keys()
+    "SIM118",
+    # memory leaks
+    "B019",
+    # No such file or directory
+    "E902",
+    # nested `if` statements
+    "SIM102",
+    # `if`-`else`-block
+    "SIM108",
+    # assign `lambda` expressions
+    "E731",
+    # Loop control variable overrides iterable it iterates
+    "B020",
+    # Return te negated condition directly
+    "SIM103",
+]

@@ -57,7 +57,6 @@ def warmup_jit():
 
 def attention_logits_soft_cap_torch(q, k, v, soft_cap):
     q_len, num_heads, head_dim = q.shape
-    kv_len = k.shape[0]
     scores = torch.einsum("qhd,khd->qkh", q.float(), k.float())
     scores *= 1.0 / math.sqrt(head_dim)
     scores = soft_cap * torch.tanh(scores / soft_cap)

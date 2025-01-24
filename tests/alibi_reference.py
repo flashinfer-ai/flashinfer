@@ -13,10 +13,9 @@ Source:
 """
 
 import math
-from typing import List, Optional
+from typing import Optional
 
 import torch
-from torch import nn
 
 
 def get_slopes(n_heads: int):
@@ -98,7 +97,6 @@ def alibi_attention(
     mask: [q_len, kv_len]
     """
     q_len, num_heads, head_dim = query.shape
-    kv_len = key.shape[0]
 
     scores = torch.einsum("qhd,khd->qkh", query.float(), key.float())
     # Scale scores $\frac{Q K^\top}{\sqrt{d_k}}$

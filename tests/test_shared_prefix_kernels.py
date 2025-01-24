@@ -76,7 +76,7 @@ def test_batch_attention_with_shared_prefix_paged_kv_cache(
     head_dim,
     page_size,
 ):
-    if stage == "decode" and causal == True:
+    if stage == "decode" and causal:
         pytest.skip("Causal attention is not required in decode stage")
     assert shared_kv_len % page_size == 0
     kv_layout = "NHD"
@@ -318,5 +318,5 @@ if __name__ == "__main__":
         "decode", 12, 37, 128, 8, False, 128, 16
     )
     test_batch_attention_with_shared_prefix_paged_kv_cache(
-        "apppend", 12, 37, 128, 8, True, 128, 16
+        "append", 12, 37, 128, 8, True, 128, 16
     )

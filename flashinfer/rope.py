@@ -326,7 +326,7 @@ def apply_rope_inplace(
           we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
 
         * If ``False``, the last dimension of the query/key tensor is not interleaved, i.e.,
-          we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          we rotate the first half dimensions ``([..., :head_dim//2])`` and the second half
           dimensions ``([..., head_dim//2:])``.
 
     rope_scale : float
@@ -410,7 +410,7 @@ def apply_rope_pos_ids_inplace(
           we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
 
         * If ``False``, the last dimension of the query/key tensor is not interleaved, i.e.,
-          we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          we rotate the first half dimensions ``([..., :head_dim//2])`` and the second half
           dimensions ``([..., head_dim//2:])``.
 
     rope_scale : float
@@ -474,7 +474,7 @@ def apply_llama31_rope_inplace(
           we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
 
         * If ``False``, the last dimension of the query/key tensor is not interleaved, i.e.,
-          we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          we rotate the first half dimensions ``([..., :head_dim//2])`` and the second half
           dimensions ``([..., head_dim//2:])``.
 
     rope_scale : float
@@ -579,7 +579,7 @@ def apply_llama31_rope_pos_ids_inplace(
           we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
 
         * If ``False``, the last dimension of the query/key tensor is not interleaved, i.e.,
-          we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          we rotate the first half dimensions ``([..., :head_dim//2])`` and the second half
           dimensions ``([..., head_dim//2:])``.
 
     rope_scale : float
@@ -657,7 +657,7 @@ def apply_rope(
           we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
 
         * If ``False``, the last dimension of the query/key tensor is not interleaved, i.e.,
-          we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          we rotate the first half dimensions ``([..., :head_dim//2])`` and the second half
           dimensions ``([..., head_dim//2:])``.
 
     rope_scale : float
@@ -764,7 +764,7 @@ def apply_rope_pos_ids(
           we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
 
         * If ``False``, the last dimension of the query/key tensor is not interleaved, i.e.,
-          we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          we rotate the first half dimensions ``([..., :head_dim//2])`` and the second half
           dimensions ``([..., head_dim//2:])``.
 
     rope_scale : float
@@ -838,7 +838,7 @@ def apply_llama31_rope(
           we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
 
         * If ``False``, the last dimension of the query/key tensor is not interleaved, i.e.,
-          we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          we rotate the first half dimensions ``([..., :head_dim//2])`` and the second half
           dimensions ``([..., head_dim//2:])``.
 
     rope_scale : float
@@ -957,7 +957,7 @@ def apply_llama31_rope_pos_ids(
           we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
 
         * If ``False``, the last dimension of the query/key tensor is not interleaved, i.e.,
-          we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          we rotate the first half dimensions ``([..., :head_dim//2])`` and the second half
           dimensions ``([..., head_dim//2:])``
     rope_scale : float
         The scaling factor used in the rope embedding, default: ``8``.
@@ -1031,7 +1031,7 @@ def apply_rope_with_cos_sin_cache(
           we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
 
         * If ``False``, the last dimension of the query/key tensor is not interleaved, i.e.,
-          we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          we rotate the first half dimensions ``([..., :head_dim//2])`` and the second half
           dimensions ``([..., head_dim//2:])``.
 
     Returns
@@ -1087,7 +1087,7 @@ def apply_rope_with_cos_sin_cache_inplace(
           we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
 
         * If ``False``, the last dimension of the query/key tensor is not interleaved, i.e.,
-          we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
+          we rotate the first half dimensions ``([..., :head_dim//2])`` and the second half
           dimensions ``([..., head_dim//2:])``.
 
     Note

@@ -40,7 +40,7 @@ The above n-ary merge operator is consistent with the binary merge operator, and
 .. image:: https://raw.githubusercontent.com/flashinfer-ai/web-data/main/tutorials/recursive-attention.png
     :width: 600
     :align: center
-    :alt: Recurisve Attention
+    :alt: Recursive Attention
 
 .. note::
 

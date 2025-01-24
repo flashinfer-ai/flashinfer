@@ -14,14 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import logging
 import math
 from typing import Optional, Tuple, Union
 
 import torch
 
 from .decode import get_batch_decode_module
-from .page import block_sparse_indices_to_vector_sparse_offsets, get_seq_lens
+from .page import block_sparse_indices_to_vector_sparse_offsets
 from .prefill import _compute_page_mask_indptr, get_batch_prefill_module
 from .quantization import segment_packbits
 from .utils import (
@@ -506,7 +505,6 @@ class BlockSparseAttentionWrapper:
             * The logsumexp of attention output, shape: ``[M, num_qo_heads]``.
         """
         pos_encoding_mode = self._pos_encoding_mode
-        use_fp16_qk_reduction = self._use_fp16_qk_reduction
         logits_soft_cap = self._logits_soft_cap
         sm_scale = self._sm_scale
         rope_scale = self._rope_scale

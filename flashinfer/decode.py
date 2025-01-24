@@ -27,7 +27,6 @@ from .jit import (
     gen_customize_batch_decode_module,
     gen_customize_batch_prefill_module,
     gen_single_decode_module,
-    get_batch_decode_mla_uri,
     get_batch_decode_uri,
     get_single_decode_uri,
     has_prebuilt_ops,
@@ -1169,7 +1168,7 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper(BatchDecodeWithPagedKVCacheWra
 
     Note that this wrapper may not be as efficient as :class:`BatchDecodeWithPagedKVCacheWrapper`
     because we won't dispatch to different kernels for different batch sizes/sequence lengths/etc
-    to accomodate the CUDAGraph requirement.
+    to accommodate the CUDAGraph requirement.
 
     Check :ref:`our tutorial<page-layout>` for page table layout.
 

@@ -21,7 +21,7 @@
 * add gemma_rmsnorm and gemma_fused_add_rmsnorm ([#477](https://github.com/flashinfer-ai/flashinfer/issues/477)) ([1a6b17e](https://github.com/flashinfer-ai/flashinfer/commit/1a6b17e2b78fc811d50030b9326a4d01f1ff956f))
 * add group size 3 to GQA decode dispatch ([#558](https://github.com/flashinfer-ai/flashinfer/issues/558)) ([6227562](https://github.com/flashinfer-ai/flashinfer/commit/62275625f9332e40a69789467835cbb376f2940d))
 * add JIT compilation support for FA3 templates ([#672](https://github.com/flashinfer-ai/flashinfer/issues/672)) ([d4e8d79](https://github.com/flashinfer-ai/flashinfer/commit/d4e8d79b340589633943bebd827da17b3f4c29ad))
-* allow the cascade kernels to be executed using varying sequence lenghts ([#627](https://github.com/flashinfer-ai/flashinfer/issues/627)) ([92ac440](https://github.com/flashinfer-ai/flashinfer/commit/92ac4401d434e988ec8aeb769ecf3ff575c32983))
+* allow the cascade kernels to be executed using varying sequence lengths ([#627](https://github.com/flashinfer-ai/flashinfer/issues/627)) ([92ac440](https://github.com/flashinfer-ai/flashinfer/commit/92ac4401d434e988ec8aeb769ecf3ff575c32983))
 * CUDAGraph compatibility of multi-level cascade inference APIs ([#586](https://github.com/flashinfer-ai/flashinfer/issues/586)) ([2332e8a](https://github.com/flashinfer-ai/flashinfer/commit/2332e8ae477656b2be060465b30c30b5dee389b9))
 * fix the maximal grid dimension in prefill planning with CUDA graphs ([#639](https://github.com/flashinfer-ai/flashinfer/issues/639)) ([86ca89a](https://github.com/flashinfer-ai/flashinfer/commit/86ca89a60f1bf1eb566cb9e45d21e4c8f174c251))
 * improve the precision of the FusedAddRMSNormKernel function ([#587](https://github.com/flashinfer-ai/flashinfer/issues/587)) ([c7dc921](https://github.com/flashinfer-ai/flashinfer/commit/c7dc921f9323d2f767fd8e9d9d0ab4c1d95ad1b5))
@@ -62,7 +62,7 @@
 * reduce total_num_tiles_q by one ([#644](https://github.com/flashinfer-ai/flashinfer/issues/644)) ([553ace5](https://github.com/flashinfer-ai/flashinfer/commit/553ace5eb91fc07681fa9edf8b6c09827a72617a))
 * remove unnecessary contiguous operation in block sparse attention ([#561](https://github.com/flashinfer-ai/flashinfer/issues/561)) ([7a7ad46](https://github.com/flashinfer-ai/flashinfer/commit/7a7ad4659a7b7e1a78eebbb9bb8af6c21130f14e))
 * speedup jit compilation of prefill attention kernels ([#632](https://github.com/flashinfer-ai/flashinfer/issues/632)) ([a059586](https://github.com/flashinfer-ai/flashinfer/commit/a0595866db384b4a782c1ec70df72251b17de287))
-* use cuda-core implemention for io-bound block-sparse attention ([#560](https://github.com/flashinfer-ai/flashinfer/issues/560)) ([3fbf028](https://github.com/flashinfer-ai/flashinfer/commit/3fbf02800e6166d2bf9e1de1cfa6ac826fa4618d))
+* use cuda-core implementation for io-bound block-sparse attention ([#560](https://github.com/flashinfer-ai/flashinfer/issues/560)) ([3fbf028](https://github.com/flashinfer-ai/flashinfer/commit/3fbf02800e6166d2bf9e1de1cfa6ac826fa4618d))
 
 ## [0.1.6](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.5...v0.1.6) (2024-08-27)
 
@@ -91,7 +91,7 @@ Check [#466](https://github.com/flashinfer-ai/flashinfer/pull/466) for more deta
 Since [0.1.6](https://github.com/flashinfer-ai/flashinfer/compare/v0.1.5...v0.1.6) on, we introduce a new `MultiLevelCascadeAttentionWrapper` API for cascade inference,
 which supports multi-level cascade inference where all levels' KV-Cache can be managed in a unified Paged KV-Cache.
 
-See [documentation](https://docs.flashinfer.ai/api/python/cascade.html#flashinfer.cascade.MultiLevelCascadeAttentionWrapper) and [tutorial](https://docs.flashinfer.ai/tutorials/kv_layout.html#multi-level-cascade-inference-data-layout) on API usage and layout explaination.
+See [documentation](https://docs.flashinfer.ai/api/python/cascade.html#flashinfer.cascade.MultiLevelCascadeAttentionWrapper) and [tutorial](https://docs.flashinfer.ai/tutorials/kv_layout.html#multi-level-cascade-inference-data-layout) on API usage and layout explanation.
 
 The old `BatchDecodeWithSharedPrefixPagedKVCacheWrapper` and `BatchPrefillWithSharedPrefixPagedKVCacheWrapper` will be deprecated in future releases.
 

@@ -13,7 +13,7 @@ def check_dim(d, x: torch.Tensor):
 
 
 def check_shape(a: torch.Tensor, b: torch.Tensor):
-    assert a.dim() == b.dim(), f"tensors should have same dim"
+    assert a.dim() == b.dim(), "tensors should have same dim"
     for i in range(a.dim()):
         assert a.size(i) == b.size(
             i

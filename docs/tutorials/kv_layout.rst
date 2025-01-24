@@ -78,7 +78,7 @@ to store the start offset of each request's mask in the flattened mask array: ``
 ``mask_data`` has shape ``(mask_indptr[-1],)``, we can use ``mask_data[mask_indptr[i]:mask_indptr[i+1]]`` to slice the flattened
 mask of request ``i``.
 
-To save memory, we can further packes the boolean flattened boolean mask array into a bit-packed array (1 bit per element, 8 elements
+To save memory, we can further packed the boolean flattened boolean mask array into a bit-packed array (1 bit per element, 8 elements
 are packed together as a `uint8`) with "little" bit-order (see `numpy.packbits <https://numpy.org/doc/stable/reference/generated/numpy.packbits.html>`_
 for more details). FlashInfer accepts both boolean mask and bit-packed mask. If boolean mask is provided, FlashInfer will pack it into bit-packed
 array internally.
