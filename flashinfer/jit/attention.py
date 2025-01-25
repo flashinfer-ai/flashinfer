@@ -249,7 +249,7 @@ def get_batch_prefill_uri(
     use_fp16_qk_reduction: bool,
 ) -> str:
     return (
-        f"batch_prefill_{backend}_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
+        f"batch_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"

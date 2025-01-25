@@ -31,21 +31,23 @@ using IdType = int32_t;
                          USE_LOGITS_SOFT_CAP, AttentionVariant, Params, ...)                       \
   {                                                                                                \
     DISPATCH_mask_mode(mask_mode, MASK_MODE, [&] {                                                 \
-      return DISPATCH_PYTORCH_QKV_DTYPE_TO_CTYPE(                                                  \
-          q_scalar_type, kv_scalar_type, dtype_q, dtype_kv, [&] {                                  \
-            using DTypeQ = cutlass_dtype_t<dtype_q>;                                               \
-            using DTypeKV = cutlass_dtype_t<dtype_kv>;                                             \
-            using DTypeO = DTypeQ;                                                                 \
-            using Params = SinglePrefillParams<DTypeQ, DTypeKV, DTypeO>;                           \
-            return DISPATCH_head_dim(head_dim, HEAD_DIM, [&] {                                     \
-              return DISPATCH_BOOL(window_left > -1, USE_SLIDING_WINDOW, [&] {                     \
-                return DISPATCH_BOOL(logits_soft_cap > 0.f, USE_LOGITS_SOFT_CAP, [&] {             \
-                  using AttentionVariant = DefaultAttention<USE_LOGITS_SOFT_CAP>;                  \
-                  __VA_ARGS__();                                                                   \
-                  return true;                                                                     \
-                });                                                                                \
-              });                                                                                  \
+      if (q_scalar_type != kv_scalar_type) {                                                       \
+        return false;                                                                              \
+      }                                                                                            \
+      return DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q_scalar_type, dtype_q, [&] {                    \
+        using DTypeQ = cutlass_dtype_t<dtype_q>;                                                   \
+        using DTypeKV = DTypeQ;                                                                    \
+        using DTypeO = DTypeQ;                                                                     \
+        using Params = SinglePrefillParams<DTypeQ, DTypeKV, DTypeO>;                               \
+        return DISPATCH_head_dim_sm90(head_dim, HEAD_DIM, [&] {                                         \
+          return DISPATCH_BOOL(window_left > -1, USE_SLIDING_WINDOW, [&] {                         \
+            return DISPATCH_BOOL(logits_soft_cap > 0.f, USE_LOGITS_SOFT_CAP, [&] {                 \
+              using AttentionVariant = DefaultAttention<USE_LOGITS_SOFT_CAP>;                      \
+              __VA_ARGS__();                                                                       \
+              return true;                                                                         \
             });                                                                                    \
           });                                                                                      \
+        });                                                                                        \
+      });                                                                                          \
     });                                                                                            \
   }

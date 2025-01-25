@@ -29,6 +29,9 @@ gen_dir = root / "csrc" / "generated"
 
 head_dims = os.environ.get("FLASHINFER_HEAD_DIMS", "64,128,256").split(",")
 head_dims = list(map(int, head_dims))
+SM90_ALLOWED_HEAD_DIMS = {64, 128, 256}
+head_dims_sm90 = [d for d in head_dims if d in SM90_ALLOWED_HEAD_DIMS]
+
 mask_modes = [0, 1, 2]
 
 enable_aot = os.environ.get("FLASHINFER_ENABLE_AOT", "0") == "1"
@@ -44,6 +47,13 @@ enable_fp8_e5m2 = (
 enable_sm90 = os.environ.get("FLASHINFER_ENABLE_SM90", "1") == "1"
 
 
+def write_if_different(path: Path, content: str) -> None:
+    if path.exists() and path.read_text() == content:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+
+
 def get_version():
     package_version = (root / "version.txt").read_text().strip()
     local_version = os.environ.get("FLASHINFER_LOCAL_VERSION")
@@ -56,12 +66,13 @@ def generate_build_meta(aot_build_meta: dict) -> None:
     build_meta_str = f"__version__ = {get_version()!r}\n"
     if len(aot_build_meta) != 0:
         build_meta_str += f"build_meta = {aot_build_meta!r}\n"
-    (root / "flashinfer" / "_build_meta.py").write_text(build_meta_str)
+    write_if_different(root / "flashinfer" / "_build_meta.py", build_meta_str)
 
 
 def generate_cuda() -> None:
     try:  # no aot_build_utils in sdist
         sys.path.append(str(root))
+        from aot_build_utils import generate_dispatch_inc
         from aot_build_utils.generate import get_instantiation_cu
         from aot_build_utils.generate_aot_default_additional_params_header import (
             get_aot_default_additional_params_header_str,
@@ -70,6 +81,21 @@ def generate_cuda() -> None:
     except ImportError:
         return
 
+    # dispatch.inc
+    write_if_different(
+        gen_dir / "dispatch.inc",
+        generate_dispatch_inc.get_dispatch_inc_str(
+            argparse.Namespace(
+                head_dims=head_dims,
+                head_dims_sm90=head_dims_sm90,
+                pos_encoding_modes=[0],
+                use_fp16_qk_reductions=[0],
+                mask_modes=mask_modes,
+            )
+        ),
+    )
+
+    # _kernels
     aot_kernel_uris = get_instantiation_cu(
         argparse.Namespace(
             path=gen_dir,
@@ -84,13 +110,12 @@ def generate_cuda() -> None:
         )
     )
 
+    # _kernels_sm90
     if enable_sm90:
-        SM90_ALLOWED_HEAD_DIMS = {64, 128, 256}
-        sm90_head_dims = [d for d in head_dims if d in SM90_ALLOWED_HEAD_DIMS]
         aot_kernel_uris += get_sm90_instantiation_cu(
             argparse.Namespace(
                 path=gen_dir,
-                head_dims=sm90_head_dims,
+                head_dims=head_dims_sm90,
                 pos_encoding_modes=[0],
                 use_fp16_qk_reductions=[0],
                 mask_modes=mask_modes,
@@ -99,9 +124,10 @@ def generate_cuda() -> None:
             )
         )
     aot_config_str = f"""prebuilt_ops_uri = set({aot_kernel_uris})"""
-    (root / "flashinfer" / "jit" / "aot_config.py").write_text(aot_config_str)
-    (root / "csrc" / "aot_default_additional_params.h").write_text(
-        get_aot_default_additional_params_header_str()
+    write_if_different(root / "flashinfer" / "jit" / "aot_config.py", aot_config_str)
+    write_if_different(
+        root / "csrc" / "aot_default_additional_params.h",
+        get_aot_default_additional_params_header_str(),
     )
 
 
