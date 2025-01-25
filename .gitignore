@@ -12,6 +12,7 @@ flashinfer/_build_meta.py
 flashinfer/data/
 flashinfer/jit/aot_config.py
 src/generated/
+csrc/aot_default_additional_params.h
 
 # DS_Store files
 .DS_store

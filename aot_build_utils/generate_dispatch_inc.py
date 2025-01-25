@@ -32,6 +32,17 @@ def get_dispatch_inc_str(args: argparse.Namespace) -> str:
 {dispatch_head_dims_entries}
 // EOL
 """
+    # head dims for sm90
+    dispatch_head_dims_sm90_entries = "\n".join(
+        [
+            "  _DISPATCH_CASE({}, case_var, __VA_ARGS__) \\".format(_)
+            for _ in args.head_dims_sm90
+        ]
+    )
+    dispatch_head_dims_sm90_str = f"""#define _DISPATCH_CASES_head_dim_sm90(case_var, ...)         \\
+{dispatch_head_dims_sm90_entries}
+// EOL
+"""
     # positional encoding modes
     dispatch_pos_encoding_modes_entries = "\n".join(
         [
@@ -73,6 +84,7 @@ def get_dispatch_inc_str(args: argparse.Namespace) -> str:
     return "\n".join(
         [
             dispatch_head_dims_str,
+            dispatch_head_dims_sm90_str,
             dispatch_pos_encoding_modes_str,
             dispatch_use_fp16_qk_reductions_str,
             dispatch_mask_mode_str,
