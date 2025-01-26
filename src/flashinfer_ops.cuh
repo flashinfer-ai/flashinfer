@@ -49,7 +49,7 @@ class BatchDecodeHandler {
     float_buffer_ = float_buffer;
     using Params = BatchDecodeParams<DTypeQ, DTypeKV, DTypeO, IdType>;
     using AttentionVariant =
-        DefaultAttention</*use_custom_mask=*/false, /*use_sliding_window=*/true,
+        DefaultAttention</*use_custom_mask=*/false, /*use_sliding_window=*/false,
                          /*use_logits_soft_cap=*/false, /*use_alibi=*/false>;
 
     auto work_estimation_func =
@@ -71,7 +71,7 @@ class BatchDecodeHandler {
     float_buffer_ = float_buffer;
     using Params = BatchDecodeParamsMLA<DTypeQ, DTypeKV, DTypeO, IdType>;
     using AttentionVariant =
-        DefaultAttention</*use_custom_mask=*/false, /*use_sliding_window=*/true,
+        DefaultAttention</*use_custom_mask=*/false, /*use_sliding_window=*/false,
                          /*use_logits_soft_cap=*/false, /*use_alibi=*/false>;
 
     auto work_estimation_func =
@@ -299,7 +299,7 @@ cudaError_t SinglePrefillWithKVCacheCustomMask(
           head_dim, HEAD_DIM, {DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
             using Params = SinglePrefillParams<DTypeIn, DTypeIn, DTypeO>;
             using AttentionVariant = DefaultAttention<
-                /*use_custom_mask=*/true, /*use_sliding_window=*/true,
+                /*use_custom_mask=*/true, /*use_sliding_window=*/false,
                 /*use_logits_soft_cap=*/false, /*use_alibi=*/false>;
             Params params(q, k, v, custom_mask, o, lse,
                           /*alibi_slopes=*/nullptr, num_qo_heads, num_kv_heads, qo_len, kv_len,
@@ -361,7 +361,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeO* 
                 using Params = SinglePrefillParams<DTypeQ, DTypeKV, DTypeO>;
                 using AttentionVariant = DefaultAttention<
                     /*use_custom_mask=*/(MASK_MODE == MaskMode::kCustom),
-                    /*use_sliding_window=*/true,
+                    /*use_sliding_window=*/false,
                     /*use_logits_soft_cap=*/false, /*use_alibi=*/false>;
                 Params params(q, k, v, /*custom_mask=*/nullptr, o, lse,
                               /*alibi_slopes=*/nullptr, num_qo_heads, num_kv_heads, qo_len, kv_len,
@@ -400,7 +400,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
                 using Params = BatchPrefillRaggedParams<DTypeQ, DTypeKV, DTypeO, IdType>;
                 using AttentionVariant = DefaultAttention<
                     /*use_custom_mask=*/(MASK_MODE == MaskMode::kCustom),
-                    /*use_sliding_window=*/true,
+                    /*use_sliding_window=*/false,
                     /*use_logits_soft_cap=*/false, /*use_alibi=*/false>;
                 Params params(q, k, v, /*custom_mask=*/nullptr, qo_indptr, kv_indptr,
                               /*mask_indptr=*/nullptr, q_rope_offset, k_rope_offset, o, lse,
@@ -450,7 +450,7 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
                 using Params = BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO, IdType>;
                 using AttentionVariant = DefaultAttention<
                     /*use_custom_mask=*/(MASK_MODE == MaskMode::kCustom),
-                    /*use_sliding_window=*/true,
+                    /*use_sliding_window=*/false,
                     /*use_logits_soft_cap=*/false,
                     /*use_alibi=*/false>;
                 Params params(q, paged_kv, /*custom_mask=*/nullptr, qo_indptr,
@@ -504,7 +504,7 @@ cudaError_t SingleDecodeWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeO* o
       head_dim, HEAD_DIM, {DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
         using Params = SingleDecodeParams<DTypeQ, DTypeKV, DTypeO>;
         using AttentionVariant = DefaultAttention<
-            /*use_custom_mask=*/false, /*use_sliding_window=*/true,
+            /*use_custom_mask=*/false, /*use_sliding_window=*/false,
             /*use_logits_soft_cap=*/false, /*use_alibi=*/false>;
         Params params(q, k, v, o, /*alibi_slopes=*/nullptr, seq_len, num_qo_heads, num_kv_heads,
                       kv_layout, head_dim, /*window_left=*/-1, /*logits_soft_cap=*/0.f, sm_scale,
@@ -555,7 +555,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapper(
       {DISPATCH_pos_encoding_mode(pos_encoding_mode, POS_ENCODING_MODE, {
         using Params = BatchDecodeParams<DTypeQ, DTypeKV, DTypeO, IdType>;
         using AttentionVariant = DefaultAttention<
-            /*use_custom_mask=*/false, /*use_sliding_window=*/true,
+            /*use_custom_mask=*/false, /*use_sliding_window=*/false,
             /*use_logits_soft_cap=*/false, /*use_alibi=*/false>;
         Params params(q, q_rope_offset, paged_kv, o, lse, /*alibi_slopes=*/nullptr, num_qo_heads,
                       /*q_stride_n*/ num_qo_heads * HEAD_DIM, /*q_stride_h*/ HEAD_DIM,
@@ -610,7 +610,7 @@ cudaError_t BatchDecodeWithPagedKVCacheWrapperMLA(
     constexpr auto HEAD_DIM_KPE = HEAD_DIM_CKV / 8;
     using Params = BatchDecodeParamsMLA<DTypeQ, DTypeKV, DTypeO, IdType>;
     using AttentionVariant = DefaultAttention<
-        /*use_custom_mask=*/false, /*use_sliding_window=*/true,
+        /*use_custom_mask=*/false, /*use_sliding_window=*/false,
         /*use_logits_soft_cap=*/false, /*use_alibi=*/false>;
     Params params(q_nope, q_pe, q_rope_offset, paged_kv, o, lse, num_qo_heads,
                   /*window_left=*/-1, /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta);
