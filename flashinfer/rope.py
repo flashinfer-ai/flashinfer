@@ -196,8 +196,7 @@ def _apply_rope_pos_ids_cos_sin_cache(
     k: torch.Tensor,
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
-    cos_cache: torch.Tensor,
-    sin_cache: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
     pos_ids: torch.Tensor,
     interleave: bool,
 ) -> None:
@@ -208,8 +207,7 @@ def _apply_rope_pos_ids_cos_sin_cache(
             k,
             q_rope,
             k_rope,
-            cos_cache,
-            sin_cache,
+            cos_sin_cache,
             pos_ids,
             interleave,
             get_cuda_stream(device),
@@ -282,7 +280,6 @@ def _fake_apply_llama31_rope_pos_ids(
     old_context_len: float,
 ) -> None:
     pass
-
 
 def apply_rope_inplace(
     q: torch.Tensor,
@@ -1003,99 +1000,115 @@ def apply_llama31_rope_pos_ids(
 
 
 def apply_rope_with_cos_sin_cache(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos_cache: torch.Tensor,
-    sin_cache: torch.Tensor,
-    pos_ids: torch.Tensor,
-    interleave: bool = False,
+    positions: torch.Tensor,
+    query: torch.Tensor, 
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Apply rotary embedding to keys and queries with precomputed cos/sin values.
+    r"""
+    Apply rotary embedding to keys and queries with precomputed cos/sin values.
+    This is designed to be compatible with the SGL/vLLM implementation.
 
     Parameters
     ----------
-    q : torch.Tensor
-        Query tensor, shape: ``(nnz, num_q_heads, head_dim)``.
-    k : torch.Tensor
-        Key tensor, shape: ``(nnz, num_k_heads, head_dim)``.
-    cos_cache : torch.Tensor
-        Cosine cache tensor, shape: ``(max_seq_len, rotary_dim)``.
-    sin_cache : torch.Tensor
-        Sine cache tensor, shape: ``(max_seq_len, rotary_dim)``.
-    pos_ids : torch.Tensor
+    positions : torch.Tensor
         Position indices, shape: ``(nnz)``.
-    interleave : bool
-        Whether to use interleaved layout in the last dimension, default: ``False``.
+    query : torch.Tensor
+        Query tensor, shape: ``(nnz, num_q_heads * head_size)``.
+    key : torch.Tensor
+        Key tensor, shape: ``(nnz, num_k_heads * head_size)``.
+    cos_sin_cache : torch.Tensor
+        Cosine and Sine cache tensor, shape: ``(max_seq_len, rotary_dim)``.
+        Cosine is the first half and Sine is the second half on rotary_dim.
+    is_neox : bool
+        Whether to use Neox style RoPE, default: ``True``.
 
-        * If ``True``, the last dimension of the query/key tensor is interleaved, i.e.,
-          we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
-
-        * If ``False``, the last dimension of the query/key tensor is not interleaved, i.e.,
-          we rotate the first half dimensions ``([..., :head_dim//2])`` and the second half
+        * If ``True``, the last dimension of the query/key tensor is not interleaved, i.e.,
+          we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
           dimensions ``([..., head_dim//2:])``.
+
+        * If ``False``, the last dimension of the query/key tensor is interleaved, i.e.,
+          we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
 
     Returns
     -------
-    q_rope : torch.Tensor
-        The rotated query tensor, shape: ``(nnz, num_q_heads, head_dim)``.
-    k_rope : torch.Tensor
-        The rotated key tensor, shape: ``(nnz, num_k_heads, head_dim)``.
+    query_out : torch.Tensor
+        The rotated query tensor, shape: ``(nnz, num_q_heads * head_size)``.
+    key_out : torch.Tensor
+        The rotated key tensor, shape: ``(nnz, num_k_heads * head_size)``.
 
     Note
     ----
     The rotary dimension is determined by the cosine cache and sine cache.
     """
-    if cos_cache.dtype != torch.float32 or sin_cache.dtype != torch.float32:
-        raise ValueError("cos_cache and sin_cache should be float32")
-    q_rope = torch.empty_like(q)
-    k_rope = torch.empty_like(k)
-    _apply_rope_pos_ids_cos_sin_cache(
-        q, k, q_rope, k_rope, cos_cache, sin_cache, pos_ids, interleave
-    )
-    return q_rope, k_rope
+    if cos_sin_cache.dtype != torch.float32:
+        raise ValueError("cos_sin_cache should be float32")
+    
+    query_out = torch.empty_like(query)
+    key_out = torch.empty_like(key)
 
+    _apply_rope_pos_ids_cos_sin_cache(
+        q=query.view(query.shape[0], -1, head_size),
+        k=key.view(key.shape[0], -1, head_size),
+        q_rope=query_out.view(query_out.shape[0], -1, head_size),
+        k_rope=key_out.view(key_out.shape[0], -1, head_size),
+        cos_sin_cache=cos_sin_cache,
+        pos_ids=positions,
+        interleave=(not is_neox)
+    )
+
+    return query_out, key_out
 
 def apply_rope_with_cos_sin_cache_inplace(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos_cache: torch.Tensor,
-    sin_cache: torch.Tensor,
-    pos_ids: torch.Tensor,
-    interleave: bool = False,
+    positions: torch.Tensor,
+    query: torch.Tensor, 
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool = True,
 ) -> None:
-    r"""Apply rotary embedding to keys and queries with precomputed cos/sin values.
-    The result is stored in the input tensors inplace.
+    r"""
+    Apply rotary embedding to keys and queries with precomputed cos/sin values.
+    This is designed to be compatible with the SGL/vLLM implementation.
+    The result is inplace applied to the input tensors.
 
     Parameters
     ----------
-    q : torch.Tensor
-        Query tensor, shape: ``(nnz, num_q_heads, head_dim)``.
-    k : torch.Tensor
-        Key tensor, shape: ``(nnz, num_k_heads, head_dim)``.
-    cos_cache : torch.Tensor
-        Cosine cache tensor, shape: ``(max_seq_len, rotary_dim)``.
-        Expect float32 data type.
-    sin_cache : torch.Tensor
-        Sine cache tensor, shape: ``(max_seq_len, rotary_dim)``.
-        Expect float32 data type.
-    pos_ids : torch.Tensor
+    positions : torch.Tensor
         Position indices, shape: ``(nnz)``.
-    interleave : bool
-        Whether to use interleaved layout in the last dimension, default: ``False``.
+    query : torch.Tensor
+        Query tensor, shape: ``(nnz, num_q_heads * head_size)``.
+    key : torch.Tensor
+        Key tensor, shape: ``(nnz, num_k_heads * head_size)``.
+    cos_sin_cache : torch.Tensor
+        Cosine and Sine cache tensor, shape: ``(max_seq_len, rotary_dim)``.
+        Cosine is the first half and Sine is the second half on rotary_dim.
+    is_neox : bool
+        Whether to use Neox style RoPE, default: ``True``.
 
-        * If ``True``, the last dimension of the query/key tensor is interleaved, i.e.,
-          we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
-
-        * If ``False``, the last dimension of the query/key tensor is not interleaved, i.e.,
-          we rotate the first half dimensions ``([..., :head_dim//2])`` and the second half
+        * If ``True``, the last dimension of the query/key tensor is not interleaved, i.e.,
+          we rorate the first half dimensions ``([..., :head_dim//2])`` and the second half
           dimensions ``([..., head_dim//2:])``.
 
+        * If ``False``, the last dimension of the query/key tensor is interleaved, i.e.,
+          we rotate the even dimensions ``([..., ::2])`` and odd dimensions ``([..., 1::2])``.
     Note
     ----
     The rotary dimension is determined by the cosine cache and sine cache.
     """
-    if cos_cache.dtype != torch.float32 or sin_cache.dtype != torch.float32:
-        raise ValueError("cos_cache and sin_cache should be float32")
+    if cos_sin_cache.dtype != torch.float32:
+        raise ValueError("cos_sin_cache should be float32")
+    
+    # pass q_rope and k_rope as q and k to perform inplace operation
     _apply_rope_pos_ids_cos_sin_cache(
-        q, k, q, k, cos_cache, sin_cache, pos_ids, interleave
+        q=query.view(query.shape[0], -1, head_size),
+        k=key.view(key.shape[0], -1, head_size),
+        q_rope=query.view(query.shape[0], -1, head_size),
+        k_rope=key.view(key.shape[0], -1, head_size),
+        cos_sin_cache=cos_sin_cache,
+        pos_ids=positions,
+        interleave=(not is_neox)
     )
+

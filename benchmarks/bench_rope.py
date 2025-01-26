@@ -11,6 +11,7 @@ def generate_cos_sin_f32_cache(max_seq_len, head_dim, theta=1e4):
     position = torch.arange(max_seq_len).float().unsqueeze(1)
     freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
     freqs = torch.cat([freqs, freqs], dim=-1).contiguous()
+    
     args = position * freqs
     sin_cache = torch.sin(args)
     cos_cache = torch.cos(args)

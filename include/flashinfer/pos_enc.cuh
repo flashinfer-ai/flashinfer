@@ -110,6 +110,11 @@ __device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope_cos_sin(
     permuted_vec.cast_load(x + ((threadIdx.x * vec_size < rotary_dim / 2)
                                     ? threadIdx.x * vec_size + rotary_dim / 2
                                     : threadIdx.x * vec_size - rotary_dim / 2));
+
+// TODO: potential race condition for inplace mode?
+// (thread1, thread2) is a pair. However, thread1 and thread2 may be in different warp
+// thread1 writes the new result to vec, thread2 reads the new result from vec instead of the old one
+
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
       vec[i] =
@@ -162,7 +167,9 @@ __device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope_cos_sin_i
     vec_before = vec;
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
-      vec[i] = vec[i] * cos[i] + ((i % 2 == 0) ? -vec_before[i ^ 1] : vec_before[i ^ 1]) * sin[i];
+      // HACK (ByronHsu): in order for vectorization, we actually just use the first half of cos and sin for interleave mode
+      // We can also make cos and sin to be half the size of vec_size, but the code will be more complex
+      vec[i] = vec[i] * cos[i / 2] + ((i % 2 == 0) ? -vec_before[i ^ 1] : vec_before[i ^ 1]) * sin[i / 2];
     }
   }
   return vec;
@@ -171,8 +178,8 @@ __device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope_cos_sin_i
 template <bool interleave, uint32_t head_dim, uint32_t vec_size, uint32_t bdx, typename DType,
           typename IdType>
 __global__ void BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel(
-    DType* q, DType* k, DType* q_rope, DType* k_rope, float* __restrict__ cos_cache,
-    float* __restrict__ sin_cache, IdType* __restrict__ pos_ids, uint32_t nnz,
+    DType* q, DType* k, DType* q_rope, DType* k_rope, float* __restrict__ cos_sin_cache, 
+    IdType* __restrict__ pos_ids, uint32_t nnz,
     uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t rotary_dim, size_t q_stride_n,
     size_t q_stride_h, size_t k_stride_n, size_t k_stride_h, size_t q_rope_stride_n,
     size_t q_rope_stride_h, size_t k_rope_stride_n, size_t k_rope_stride_h) {
@@ -185,9 +192,24 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel(
     const uint32_t idx = bx * bdy + ty;
     const IdType pos = pos_ids[idx];
 
+    const int half_rotary_dim = rotary_dim / 2;
+
+    // 1. if interleave: 
+    //  - cos = cos_sin_cache[pos_id][tx * vec_size // 2]
+    //  - sin = cos_sin_cache[pos_id][(rot_dim // 2) + tx * vec_size // 2]
+    // 2. if not interleave
+    //  - cos = cos_cache[pos_id][(tx * vec_size) % (rot_dim // 2)]
+    //  - sin = sin_cache[pos_id][(rot_dim // 2) + (tx * vec_size) % (rot_dim // 2)]
     if (tx * vec_size < rotary_dim) {
-      cos.load(cos_cache + pos * rotary_dim + tx * vec_size);
-      sin.load(sin_cache + pos * rotary_dim + tx * vec_size);
+      int sin_offset = rotary_dim / 2;
+      int vec_idx;
+      if constexpr (interleave) {
+        vec_idx = (tx * vec_size) / 2;  // Force integer division
+      } else {
+        vec_idx = (tx * vec_size) % half_rotary_dim;  // Use half_rotary_dim
+      }
+      cos.load(cos_sin_cache + (pos * rotary_dim) + vec_idx);
+      sin.load(cos_sin_cache + (pos * rotary_dim) + (sin_offset + vec_idx));
     }
 
     if (by < num_qo_heads) {
@@ -221,8 +243,8 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel(
 template <bool interleave, uint32_t head_dim, uint32_t vec_size, uint32_t bdx, typename DType,
           typename IdType>
 __global__ void BatchQKApplyRotaryPosIdsCosSinCacheKernel(
-    DType* q, DType* k, DType* q_rope, DType* k_rope, float* __restrict__ cos_cache,
-    float* __restrict__ sin_cache, IdType* __restrict__ pos_ids, uint32_t nnz,
+    DType* q, DType* k, DType* q_rope, DType* k_rope, float* __restrict__ cos_sin_cache,
+    IdType* __restrict__ pos_ids, uint32_t nnz,
     uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t rotary_dim, size_t q_stride_n,
     size_t q_stride_h, size_t k_stride_n, size_t k_stride_h, size_t q_rope_stride_n,
     size_t q_rope_stride_h, size_t k_rope_stride_n, size_t k_rope_stride_h) {
@@ -233,12 +255,27 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheKernel(
   if (bx * bdy + ty < nnz) {
     const uint32_t idx = bx * bdy + ty;
     const IdType pos = pos_ids[idx];
+    const int half_rotary_dim = rotary_dim / 2;
 
+    // 1. if interleave: 
+    //  - cos = cos_sin_cache[pos_id][tx * vec_size // 2]
+    //  - sin = cos_sin_cache[pos_id][(rot_dim // 2) + tx * vec_size // 2]
+    // 2. if not interleave
+    //  - cos = cos_cache[pos_id][(tx * vec_size) % (rot_dim // 2)]
+    //  - sin = sin_cache[pos_id][(rot_dim // 2) + (tx * vec_size) % (rot_dim // 2)]
     if (tx * vec_size < rotary_dim) {
-      cos.load(cos_cache + pos * rotary_dim + tx * vec_size);
-      sin.load(sin_cache + pos * rotary_dim + tx * vec_size);
+      int sin_offset = rotary_dim / 2;
+      int vec_idx;
+      if constexpr (interleave) {
+        vec_idx = (tx * vec_size) / 2;  // Force integer division
+      } else {
+        vec_idx = (tx * vec_size) % half_rotary_dim;  // Use half_rotary_dim
+      }
+      cos.load(cos_sin_cache + (pos * rotary_dim) + vec_idx);
+      sin.load(cos_sin_cache + (pos * rotary_dim) + (sin_offset + vec_idx));
     }
-
+    
+  // not to unroll the loop, because num head might be large and might lead to worse performance
 #pragma unroll 1
     for (uint32_t qo_head_idx = 0; qo_head_idx < num_qo_heads; ++qo_head_idx) {
       DType* q_ptr = q + get_elem_offset_impl(idx, qo_head_idx, 0, q_stride_n, q_stride_h);
@@ -503,7 +540,7 @@ __global__ void BatchQKApplyRotaryKernel(
 
 template <typename DType, typename IdType>
 cudaError_t BatchQKApplyRotaryPosIdsCosSinCache(
-    DType* q, DType* k, DType* q_rope, DType* k_rope, float* cos_cache, float* sin_cache,
+    DType* q, DType* k, DType* q_rope, DType* k_rope, float* cos_sin_cache,
     IdType* pos_ids, uint32_t nnz, uint32_t num_qo_heads, uint32_t num_kv_heads,
     uint32_t rotary_dim, uint32_t head_dim, size_t q_stride_n, size_t q_stride_h, size_t k_stride_n,
     size_t k_stride_h, size_t q_rope_stride_n, size_t q_rope_stride_h, size_t k_rope_stride_n,
@@ -515,17 +552,21 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCache(
 
   DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+      // operate on 16 Bytes at a time
       constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
+      // how many threads needed per head_dim
       constexpr uint32_t bdx = HEAD_DIM / vec_size;
+      // how many threads needed per block
       uint32_t num_threads = std::max(128U, bdx);
+      // how many tokens can we process in a block
       uint32_t bdy = num_threads / bdx;
+      // how many blocks needed to process all tokens
       uint32_t nblks_x = (nnz + bdy - 1) / bdy;
       void* args[] = {(void*)&q,
                       (void*)&k,
                       (void*)&q_rope,
                       (void*)&k_rope,
-                      (void*)&cos_cache,
-                      (void*)&sin_cache,
+                      (void*)&cos_sin_cache,
                       (void*)&pos_ids,
                       (void*)&nnz,
                       (void*)&num_qo_heads,
