@@ -111,9 +111,7 @@ __device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope_cos_sin(
                                     ? threadIdx.x * vec_size + rotary_dim / 2
                                     : threadIdx.x * vec_size - rotary_dim / 2));
 
-// TODO: potential race condition for inplace mode?
-// (thread1, thread2) is a pair. However, thread1 and thread2 may be in different warp
-// thread1 writes the new result to vec, thread2 reads the new result from vec instead of the old one
+
 
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
