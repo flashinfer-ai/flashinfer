@@ -145,6 +145,7 @@ def test_rope(
 @pytest.mark.parametrize("llama_version", ["llama", "llama31"])
 @pytest.mark.parametrize("partial_rotary_factor", [0.25, 0.5, 0.75, 1.0])
 @pytest.mark.parametrize("inplace", [False, True])
+@pytest.mark.parametrize("interleave", [True, False])
 def test_rope_pos_ids(
     batch_size,
     qkv_len,
@@ -155,6 +156,7 @@ def test_rope_pos_ids(
     llama_version,
     partial_rotary_factor,
     inplace,
+    interleave,
 ):
     rotary_dim = int(head_dim * partial_rotary_factor)
     nnz = batch_size * qkv_len
@@ -189,7 +191,7 @@ def test_rope_pos_ids(
                 indptr,
                 offsets,
                 rotary_dim=rotary_dim,
-                interleave=True,
+                interleave=interleave,
                 rope_theta=1e4,
             )
             q_rope, k_rope = q, k
@@ -198,7 +200,7 @@ def test_rope_pos_ids(
                 k_clone,
                 pos_ids,
                 rotary_dim=rotary_dim,
-                interleave=True,
+                interleave=interleave,
                 rope_theta=1e4,
             )
             q_rope_pos_ids, k_rope_pos_ids = q_clone, k_clone
@@ -209,12 +211,12 @@ def test_rope_pos_ids(
                 indptr,
                 offsets,
                 rotary_dim=rotary_dim,
-                interleave=True,
+                interleave=interleave,
                 rope_theta=1e4,
             )
 
             q_rope_pos_ids, k_rope_pos_ids = flashinfer.apply_rope_pos_ids(
-                q, k, pos_ids, rotary_dim=rotary_dim, interleave=True, rope_theta=1e4
+                q, k, pos_ids, rotary_dim=rotary_dim, interleave=interleave, rope_theta=1e4
             )
     else:
         if inplace:
@@ -225,7 +227,7 @@ def test_rope_pos_ids(
                 indptr,
                 offsets,
                 rotary_dim=rotary_dim,
-                interleave=True,
+                interleave=interleave,
                 rope_theta=5e5,
             )
             q_rope, k_rope = q, k
@@ -234,7 +236,7 @@ def test_rope_pos_ids(
                 k_clone,
                 pos_ids,
                 rotary_dim=rotary_dim,
-                interleave=True,
+                interleave=interleave,
                 rope_theta=5e5,
             )
             q_rope_pos_ids, k_rope_pos_ids = q_clone, k_clone
@@ -245,12 +247,12 @@ def test_rope_pos_ids(
                 indptr,
                 offsets,
                 rotary_dim=rotary_dim,
-                interleave=True,
+                interleave=interleave,
                 rope_theta=5e5,
             )
 
             q_rope_pos_ids, k_rope_pos_ids = flashinfer.apply_llama31_rope_pos_ids(
-                q, k, pos_ids, rotary_dim=rotary_dim, interleave=True, rope_theta=5e5
+                q, k, pos_ids, rotary_dim=rotary_dim, interleave=interleave, rope_theta=5e5
             )
 
     # compare
