@@ -1099,6 +1099,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
             dtype=self._int_workspace_buffer.dtype,
+            device="cpu",
             pin_memory=True,
         )
         self._use_cuda_graph = use_cuda_graph
@@ -1165,6 +1166,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
             dtype=self._int_workspace_buffer.dtype,
+            device="cpu",
             pin_memory=True,
         )
 
@@ -1858,7 +1860,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
         )
         self._pin_memory_int_workspace_buffer = torch.empty(
-            self._int_workspace_buffer.shape, dtype=torch.uint8, pin_memory=True
+            self._int_workspace_buffer.shape, dtype=torch.uint8,
+            pin_memory=True, device="cpu",
         )
         self._use_cuda_graph = use_cuda_graph
         if use_cuda_graph:
@@ -1911,6 +1914,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
             dtype=self._int_workspace_buffer.dtype,
+            device="cpu",
             pin_memory=True,
         )
 
