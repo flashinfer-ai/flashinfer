@@ -153,7 +153,7 @@ void apply_llama31_rope_pos_ids(at::Tensor q, at::Tensor k, at::Tensor q_rope, a
                                 int64_t cuda_stream);
 
 void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_rope,
-                                      at::Tensor k_rope, at::Tensor cos_cache, at::Tensor sin_cache,
+                                      at::Tensor k_rope, at::Tensor cos_sin_cache,
                                       at::Tensor pos_ids, bool interleave, int64_t cuda_stream);
 
 //========== sampling ==========

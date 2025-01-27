@@ -166,6 +166,7 @@
     }                                                         \
   }
 
+// convert head_dim to compile-time constant
 #define DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, ...)     \
   switch (head_dim) {                                  \
     case 64: {                                         \

@@ -145,6 +145,7 @@ def test_rope(
 @pytest.mark.parametrize("llama_version", ["llama", "llama31"])
 @pytest.mark.parametrize("partial_rotary_factor", [0.25, 0.5, 0.75, 1.0])
 @pytest.mark.parametrize("inplace", [False, True])
+@pytest.mark.parametrize("interleave", [True, False])
 def test_rope_pos_ids(
     batch_size,
     qkv_len,
@@ -155,6 +156,7 @@ def test_rope_pos_ids(
     llama_version,
     partial_rotary_factor,
     inplace,
+    interleave,
 ):
     rotary_dim = int(head_dim * partial_rotary_factor)
     nnz = batch_size * qkv_len
@@ -189,7 +191,7 @@ def test_rope_pos_ids(
                 indptr,
                 offsets,
                 rotary_dim=rotary_dim,
-                interleave=True,
+                interleave=interleave,
                 rope_theta=1e4,
             )
             q_rope, k_rope = q, k
@@ -198,7 +200,7 @@ def test_rope_pos_ids(
                 k_clone,
                 pos_ids,
                 rotary_dim=rotary_dim,
-                interleave=True,
+                interleave=interleave,
                 rope_theta=1e4,
             )
             q_rope_pos_ids, k_rope_pos_ids = q_clone, k_clone
@@ -209,12 +211,12 @@ def test_rope_pos_ids(
                 indptr,
                 offsets,
                 rotary_dim=rotary_dim,
-                interleave=True,
+                interleave=interleave,
                 rope_theta=1e4,
             )
 
             q_rope_pos_ids, k_rope_pos_ids = flashinfer.apply_rope_pos_ids(
-                q, k, pos_ids, rotary_dim=rotary_dim, interleave=True, rope_theta=1e4
+                q, k, pos_ids, rotary_dim=rotary_dim, interleave=interleave, rope_theta=1e4
             )
     else:
         if inplace:
@@ -225,7 +227,7 @@ def test_rope_pos_ids(
                 indptr,
                 offsets,
                 rotary_dim=rotary_dim,
-                interleave=True,
+                interleave=interleave,
                 rope_theta=5e5,
             )
             q_rope, k_rope = q, k
@@ -234,7 +236,7 @@ def test_rope_pos_ids(
                 k_clone,
                 pos_ids,
                 rotary_dim=rotary_dim,
-                interleave=True,
+                interleave=interleave,
                 rope_theta=5e5,
             )
             q_rope_pos_ids, k_rope_pos_ids = q_clone, k_clone
@@ -245,109 +247,78 @@ def test_rope_pos_ids(
                 indptr,
                 offsets,
                 rotary_dim=rotary_dim,
-                interleave=True,
+                interleave=interleave,
                 rope_theta=5e5,
             )
 
             q_rope_pos_ids, k_rope_pos_ids = flashinfer.apply_llama31_rope_pos_ids(
-                q, k, pos_ids, rotary_dim=rotary_dim, interleave=True, rope_theta=5e5
+                q, k, pos_ids, rotary_dim=rotary_dim, interleave=interleave, rope_theta=5e5
             )
 
     # compare
     torch.testing.assert_close(q_rope_pos_ids, q_rope, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(k_rope_pos_ids, k_rope, rtol=1e-3, atol=1e-3)
 
-
-@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
-@pytest.mark.parametrize("qkv_len", [1, 4, 19, 204])
-@pytest.mark.parametrize("num_qo_heads", [8, 16])
-@pytest.mark.parametrize("num_kv_heads", [8])
-@pytest.mark.parametrize("offset", [0, 15, 99])
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
-@pytest.mark.parametrize("llama_version", ["llama", "llama31"])
-@pytest.mark.parametrize("partial_rotary_factor", [0.25, 0.5, 0.75, 1.0])
-@pytest.mark.parametrize("inplace", [False, True])
-def test_rope_cos_sin_cache(
-    batch_size,
-    qkv_len,
-    num_qo_heads,
-    num_kv_heads,
-    offset,
-    head_dim,
-    llama_version,
-    partial_rotary_factor,
-    inplace,
-):
-    rotary_dim = int(head_dim * partial_rotary_factor)
-    nnz = batch_size * qkv_len
-    qkv_packed = torch.randn(
-        nnz,
-        (num_qo_heads + 2 * num_kv_heads) * head_dim,
-        dtype=torch.float16,
-        device="cuda:0",
-    )
-    q = qkv_packed[:, : num_qo_heads * head_dim].reshape(nnz, num_qo_heads, head_dim)
-    k = qkv_packed[
-        :, num_qo_heads * head_dim : (num_qo_heads + num_kv_heads) * head_dim
-    ].reshape(nnz, num_kv_heads, head_dim)
-    pos_ids = torch.cat(
-        [
-            torch.arange(offset, qkv_len + offset, dtype=torch.int32)
-            for _ in range(batch_size)
-        ]
-    ).to("cuda:0")
-
-    if llama_version == "llama":
-        cos_cache, sin_cache = generate_cos_sin_f32_cache(4096, rotary_dim, theta=1e4)
-    else:
-        cos_cache, sin_cache = generate_cos_sin_f32_cache(
-            4096, rotary_dim, theta=5e5, use_scaled=True
-        )
-    cos_cache = cos_cache.to("cuda:0")
-    sin_cache = sin_cache.to("cuda:0")
-
-    if inplace:
-        q_clone, k_clone = q.clone(), k.clone()
-
-    if llama_version == "llama":
-        if inplace:
-            flashinfer.apply_rope_pos_ids_inplace(
-                q, k, pos_ids, rotary_dim=rotary_dim, interleave=False
-            )
-            q_rope, k_rope = q, k
-        else:
-            q_rope, k_rope = flashinfer.apply_rope_pos_ids(
-                q, k, pos_ids, rotary_dim=rotary_dim, interleave=False
-            )
-    else:
-        if inplace:
-            flashinfer.apply_llama31_rope_pos_ids_inplace(
-                q, k, pos_ids, rotary_dim=rotary_dim, interleave=False
-            )
-            q_rope, k_rope = q, k
-        else:
-            q_rope, k_rope = flashinfer.apply_llama31_rope_pos_ids(
-                q, k, pos_ids, rotary_dim=rotary_dim, interleave=False
-            )
-
-    if inplace:
+class FlashInferRotaryEmbedding(RotaryEmbedding):
+    
+    def forward_cuda(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         flashinfer.apply_rope_with_cos_sin_cache_inplace(
-            q_clone, k_clone, cos_cache, sin_cache, pos_ids, interleave=False
+            positions=positions,
+            query=query,
+            key=key,
+            head_size=self.head_size,
+            cos_sin_cache=self.cos_sin_cache,
+            is_neox=self.is_neox_style,
         )
-        q_rope_cos_sin_cache, k_rope_cos_sin_cache = q_clone, k_clone
-    else:
-        q_rope_cos_sin_cache, k_rope_cos_sin_cache = (
-            flashinfer.apply_rope_with_cos_sin_cache(
-                q, k, cos_cache, sin_cache, pos_ids, interleave=False
-            )
-        )
+        return query, key
+    
+@pytest.mark.parametrize(
+    "head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype, device, batch_size, seq_len, num_q_heads, num_kv_heads",
+    [
+        (64, 64, 32, 8000, True, torch.bfloat16, "cuda", 32, 32, 1, 1),
+        (256, 128, 4096, 10000, True, torch.bfloat16, "cuda", 2, 512, 4, 2),
+        (64, 32, 2048, 8432, True, torch.bfloat16, "cuda", 2, 199, 4, 1),
+        (64, 64, 32, 8000, False, torch.bfloat16, "cuda", 32, 32, 1, 1),
+        (64, 64, 32, 8000, False, torch.bfloat16, "cuda", 32, 32, 1, 1),
+        (256, 128, 4096, 9231, False, torch.bfloat16, "cuda", 3, 231, 4, 2),
+    ]
+)
+def test_rope_cos_sin_cache(
+    head_size: int,
+    rotary_dim: int,
+    max_position_embeddings: int,
+    base: int,
+    is_neox_style: bool,
+    dtype: torch.dtype,
+    device: str,
+    batch_size: int,
+    seq_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+):
+    rope_ref = RotaryEmbedding(head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype).to(device)
+    rope_flashinfer = FlashInferRotaryEmbedding(head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype).to(device)
 
-    # compare
-    torch.testing.assert_close(q_rope, q_rope_cos_sin_cache, rtol=1e-3, atol=1e-3)
-    torch.testing.assert_close(k_rope, k_rope_cos_sin_cache, rtol=1e-3, atol=1e-3)
+    pos_ids = torch.arange(seq_len, device=device).repeat(batch_size)
+    query = torch.randn(batch_size * seq_len, num_q_heads * head_size, dtype=dtype, device=device)
+    key = torch.randn(batch_size * seq_len, num_kv_heads * head_size, dtype=dtype, device=device)
 
+    query_ref, key_ref = query.clone(), key.clone() 
+    query_flashinfer, key_flashinfer = query.clone(), key.clone()
+
+    query_ref_out, key_ref_out = rope_ref.forward_native(pos_ids, query_ref, key_ref)
+    query_flashinfer_out, key_flashinfer_out = rope_flashinfer.forward_cuda(pos_ids, query_flashinfer, key_flashinfer)
+    
+    torch.testing.assert_close(query_ref_out, query_flashinfer_out, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(key_ref_out, key_flashinfer_out, atol=1e-2, rtol=1e-2)
 
 if __name__ == "__main__":
     test_rope(2, 1, 8, 8, 1, 128, "llama", 1.0, False)
-    # test_rope_pos_ids(2, 1, 8, 8, 1, 128, "llama31", 1.0, False)
-    # test_rope_cos_sin_cache(99, 19, 16, 8, 99, 256, "llama31", 0.5, False)
+    test_rope_pos_ids(2, 1, 8, 8, 1, 128, "llama31", 1.0, False)
+    test_rope_cos_sin_cache(64, 64, 32, 8000, True, torch.bfloat16, "cuda", 32, 32, 1, 1)

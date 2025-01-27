@@ -168,11 +168,48 @@ __device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope_cos_sin_i
   return vec;
 }
 
+
+/*
+HACK (ByronHsu): in the interleave mode with cos_sin_cache, we actually only use the first half of cos and sin
+
+For example,
+In the below example, the vec_size is 4
+the computation in the kernel is:
+    [x1, x2, x3, x4...] * [cos1, cos1, cos2, cos2] + [-x2, x1, -x4, x3...] * [sin1, sin1, sin2, sin2]
+the data we loaded are:
+    - loaded vec = [x1, x2, x3, x4]
+    - loaded cos = [cos1, cos2, cos3, cos4]
+    - loaded sin = [sin1, sin2, sin3, sin4]
+But only the first half of cos and sin is used in the computation.
+
+However, we argue the additional overhead is acceptable:
+    1. loading additional elements of cos and sin is not adding much overhead. The arithmetic intensity 
+       is the same as non-interleave mode. Each elements of cos and sin is load twice
+    2. we don't want two code paths of cos and sin vector for interleave and non-interleave mode.
+*/
+template <uint32_t vec_size, uint32_t bdx, typename T>
+__device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope_cos_sin_interleave_reuse_half(
+    const T* x, const vec_t<float, vec_size>& cos, const vec_t<float, vec_size>& sin,
+    const uint32_t rotary_dim = vec_size * bdx) {
+  vec_t<float, vec_size> vec, vec_before;
+  vec.cast_load(x + threadIdx.x * vec_size);
+
+  if (threadIdx.x * vec_size < rotary_dim) {
+    vec_before = vec;
+#pragma unroll
+    for (uint32_t i = 0; i < vec_size; ++i) {
+      // i / 2 is to get the index of the first half of cos and sin
+      vec[i] = vec[i] * cos[i / 2] + ((i % 2 == 0) ? -vec_before[i ^ 1] : vec_before[i ^ 1]) * sin[i / 2];
+    }
+  }
+  return vec;
+}
+
 template <bool interleave, uint32_t head_dim, uint32_t vec_size, uint32_t bdx, typename DType,
           typename IdType>
 __global__ void BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel(
-    DType* q, DType* k, DType* q_rope, DType* k_rope, float* __restrict__ cos_cache,
-    float* __restrict__ sin_cache, IdType* __restrict__ pos_ids, uint32_t nnz,
+    DType* q, DType* k, DType* q_rope, DType* k_rope, float* __restrict__ cos_sin_cache, 
+    IdType* __restrict__ pos_ids, uint32_t nnz,
     uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t rotary_dim, size_t q_stride_n,
     size_t q_stride_h, size_t k_stride_n, size_t k_stride_h, size_t q_rope_stride_n,
     size_t q_rope_stride_h, size_t k_rope_stride_n, size_t k_rope_stride_h) {
@@ -185,9 +222,24 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel(
     const uint32_t idx = bx * bdy + ty;
     const IdType pos = pos_ids[idx];
 
+    const int half_rotary_dim = rotary_dim / 2;
+
+    // 1. if interleave: 
+    //  - cos = cos_sin_cache[pos_id][tx * vec_size // 2]
+    //  - sin = cos_sin_cache[pos_id][(rot_dim // 2) + tx * vec_size // 2]
+    // 2. if not interleave
+    //  - cos = cos_cache[pos_id][(tx * vec_size) % (rot_dim // 2)]
+    //  - sin = sin_cache[pos_id][(rot_dim // 2) + (tx * vec_size) % (rot_dim // 2)]
     if (tx * vec_size < rotary_dim) {
-      cos.load(cos_cache + pos * rotary_dim + tx * vec_size);
-      sin.load(sin_cache + pos * rotary_dim + tx * vec_size);
+      int sin_offset = rotary_dim / 2;
+      int vec_idx;
+      if constexpr (interleave) {
+        vec_idx = (tx * vec_size) / 2;  // Force integer division
+      } else {
+        vec_idx = (tx * vec_size) % half_rotary_dim;  // Use half_rotary_dim
+      }
+      cos.load(cos_sin_cache + (pos * rotary_dim) + vec_idx);
+      sin.load(cos_sin_cache + (pos * rotary_dim) + (sin_offset + vec_idx));
     }
 
     if (by < num_qo_heads) {
@@ -197,7 +249,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel(
           q_rope + get_elem_offset_impl(idx, qo_head_idx, 0, q_rope_stride_n, q_rope_stride_h);
       vec_t<float, vec_size> q_vec;
       if constexpr (interleave) {
-        q_vec = vec_apply_llama_rope_cos_sin_interleave<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
+        q_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
       } else {
         q_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
       }
@@ -209,7 +261,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel(
           k_rope + get_elem_offset_impl(idx, kv_head_idx, 0, k_rope_stride_n, k_rope_stride_h);
       vec_t<float, vec_size> k_vec;
       if constexpr (interleave) {
-        k_vec = vec_apply_llama_rope_cos_sin_interleave<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
+        k_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
       } else {
         k_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
       }
@@ -221,8 +273,8 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel(
 template <bool interleave, uint32_t head_dim, uint32_t vec_size, uint32_t bdx, typename DType,
           typename IdType>
 __global__ void BatchQKApplyRotaryPosIdsCosSinCacheKernel(
-    DType* q, DType* k, DType* q_rope, DType* k_rope, float* __restrict__ cos_cache,
-    float* __restrict__ sin_cache, IdType* __restrict__ pos_ids, uint32_t nnz,
+    DType* q, DType* k, DType* q_rope, DType* k_rope, float* __restrict__ cos_sin_cache,
+    IdType* __restrict__ pos_ids, uint32_t nnz,
     uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t rotary_dim, size_t q_stride_n,
     size_t q_stride_h, size_t k_stride_n, size_t k_stride_h, size_t q_rope_stride_n,
     size_t q_rope_stride_h, size_t k_rope_stride_n, size_t k_rope_stride_h) {
@@ -233,12 +285,27 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheKernel(
   if (bx * bdy + ty < nnz) {
     const uint32_t idx = bx * bdy + ty;
     const IdType pos = pos_ids[idx];
+    const int half_rotary_dim = rotary_dim / 2;
 
+    // 1. if interleave: 
+    //  - cos = cos_sin_cache[pos_id][tx * vec_size // 2]
+    //  - sin = cos_sin_cache[pos_id][(rot_dim // 2) + tx * vec_size // 2]
+    // 2. if not interleave
+    //  - cos = cos_cache[pos_id][(tx * vec_size) % (rot_dim // 2)]
+    //  - sin = sin_cache[pos_id][(rot_dim // 2) + (tx * vec_size) % (rot_dim // 2)]
     if (tx * vec_size < rotary_dim) {
-      cos.load(cos_cache + pos * rotary_dim + tx * vec_size);
-      sin.load(sin_cache + pos * rotary_dim + tx * vec_size);
+      int sin_offset = rotary_dim / 2;
+      int vec_idx;
+      if constexpr (interleave) {
+        vec_idx = (tx * vec_size) / 2;  // Force integer division
+      } else {
+        vec_idx = (tx * vec_size) % half_rotary_dim;  // Use half_rotary_dim
+      }
+      cos.load(cos_sin_cache + (pos * rotary_dim) + vec_idx);
+      sin.load(cos_sin_cache + (pos * rotary_dim) + (sin_offset + vec_idx));
     }
-
+    
+  // not to unroll the loop, because num head might be large and might lead to worse performance
 #pragma unroll 1
     for (uint32_t qo_head_idx = 0; qo_head_idx < num_qo_heads; ++qo_head_idx) {
       DType* q_ptr = q + get_elem_offset_impl(idx, qo_head_idx, 0, q_stride_n, q_stride_h);
@@ -246,7 +313,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheKernel(
           q_rope + get_elem_offset_impl(idx, qo_head_idx, 0, q_rope_stride_n, q_rope_stride_h);
       vec_t<float, vec_size> q_vec;
       if constexpr (interleave) {
-        q_vec = vec_apply_llama_rope_cos_sin_interleave<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
+        q_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
       } else {
         q_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
       }
@@ -260,7 +327,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheKernel(
           k_rope + get_elem_offset_impl(idx, kv_head_idx, 0, k_rope_stride_n, k_rope_stride_h);
       vec_t<float, vec_size> k_vec;
       if constexpr (interleave) {
-        k_vec = vec_apply_llama_rope_cos_sin_interleave<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
+        k_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
       } else {
         k_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
       }
@@ -503,7 +570,7 @@ __global__ void BatchQKApplyRotaryKernel(
 
 template <typename DType, typename IdType>
 cudaError_t BatchQKApplyRotaryPosIdsCosSinCache(
-    DType* q, DType* k, DType* q_rope, DType* k_rope, float* cos_cache, float* sin_cache,
+    DType* q, DType* k, DType* q_rope, DType* k_rope, float* cos_sin_cache,
     IdType* pos_ids, uint32_t nnz, uint32_t num_qo_heads, uint32_t num_kv_heads,
     uint32_t rotary_dim, uint32_t head_dim, size_t q_stride_n, size_t q_stride_h, size_t k_stride_n,
     size_t k_stride_h, size_t q_rope_stride_n, size_t q_rope_stride_h, size_t k_rope_stride_n,
@@ -515,17 +582,21 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCache(
 
   DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+      // operate on 16 Bytes at a time
       constexpr uint32_t vec_size = std::max(16 / sizeof(DType), HEAD_DIM / 32);
+      // how many threads needed per head_dim
       constexpr uint32_t bdx = HEAD_DIM / vec_size;
+      // how many threads needed per block
       uint32_t num_threads = std::max(128U, bdx);
+      // how many tokens can we process in a block
       uint32_t bdy = num_threads / bdx;
+      // how many blocks needed to process all tokens
       uint32_t nblks_x = (nnz + bdy - 1) / bdy;
       void* args[] = {(void*)&q,
                       (void*)&k,
                       (void*)&q_rope,
                       (void*)&k_rope,
-                      (void*)&cos_cache,
-                      (void*)&sin_cache,
+                      (void*)&cos_sin_cache,
                       (void*)&pos_ids,
                       (void*)&nnz,
                       (void*)&num_qo_heads,
