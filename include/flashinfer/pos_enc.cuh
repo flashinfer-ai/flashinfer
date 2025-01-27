@@ -167,8 +167,43 @@ __device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope_cos_sin_i
     vec_before = vec;
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
-      // HACK (ByronHsu): in order for vectorization, we actually just use the first half of cos and sin for interleave mode
-      // We can also make cos and sin to be half the size of vec_size, but the code will be more complex
+      vec[i] = vec[i] * cos[i] + ((i % 2 == 0) ? -vec_before[i ^ 1] : vec_before[i ^ 1]) * sin[i];
+    }
+  }
+  return vec;
+}
+
+
+/*
+HACK (ByronHsu): in the interleave mode with cos_sin_cache, we actually only use the first half of cos and sin
+
+For example,
+In the below example, the vec_size is 4
+the computation in the kernel is:
+    [x1, x2, x3, x4...] * [cos1, cos1, cos2, cos2] + [-x2, x1, -x4, x3...] * [sin1, sin1, sin2, sin2]
+the data we loaded are:
+    - loaded vec = [x1, x2, x3, x4]
+    - loaded cos = [cos1, cos2, cos3, cos4]
+    - loaded sin = [sin1, sin2, sin3, sin4]
+But only the first half of cos and sin is used in the computation.
+
+However, we argue the additional overhead is acceptable:
+    1. loading additional elements of cos and sin is not adding much overhead. The arithmetic intensity 
+       is the same as non-interleave mode. Each elements of cos and sin is load twice
+    2. we don't want two code paths of cos and sin vector for interleave and non-interleave mode.
+*/
+template <uint32_t vec_size, uint32_t bdx, typename T>
+__device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope_cos_sin_interleave_reuse_half(
+    const T* x, const vec_t<float, vec_size>& cos, const vec_t<float, vec_size>& sin,
+    const uint32_t rotary_dim = vec_size * bdx) {
+  vec_t<float, vec_size> vec, vec_before;
+  vec.cast_load(x + threadIdx.x * vec_size);
+
+  if (threadIdx.x * vec_size < rotary_dim) {
+    vec_before = vec;
+#pragma unroll
+    for (uint32_t i = 0; i < vec_size; ++i) {
+      // i / 2 is to get the index of the first half of cos and sin
       vec[i] = vec[i] * cos[i / 2] + ((i % 2 == 0) ? -vec_before[i ^ 1] : vec_before[i ^ 1]) * sin[i / 2];
     }
   }
@@ -219,7 +254,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel(
           q_rope + get_elem_offset_impl(idx, qo_head_idx, 0, q_rope_stride_n, q_rope_stride_h);
       vec_t<float, vec_size> q_vec;
       if constexpr (interleave) {
-        q_vec = vec_apply_llama_rope_cos_sin_interleave<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
+        q_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
       } else {
         q_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
       }
@@ -231,7 +266,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheHeadParallelismKernel(
           k_rope + get_elem_offset_impl(idx, kv_head_idx, 0, k_rope_stride_n, k_rope_stride_h);
       vec_t<float, vec_size> k_vec;
       if constexpr (interleave) {
-        k_vec = vec_apply_llama_rope_cos_sin_interleave<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
+        k_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
       } else {
         k_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
       }
@@ -283,7 +318,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheKernel(
           q_rope + get_elem_offset_impl(idx, qo_head_idx, 0, q_rope_stride_n, q_rope_stride_h);
       vec_t<float, vec_size> q_vec;
       if constexpr (interleave) {
-        q_vec = vec_apply_llama_rope_cos_sin_interleave<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
+        q_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
       } else {
         q_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(q_ptr, cos, sin, rotary_dim);
       }
@@ -297,7 +332,7 @@ __global__ void BatchQKApplyRotaryPosIdsCosSinCacheKernel(
           k_rope + get_elem_offset_impl(idx, kv_head_idx, 0, k_rope_stride_n, k_rope_stride_h);
       vec_t<float, vec_size> k_vec;
       if constexpr (interleave) {
-        k_vec = vec_apply_llama_rope_cos_sin_interleave<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
+        k_vec = vec_apply_llama_rope_cos_sin_interleave_reuse_half<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
       } else {
         k_vec = vec_apply_llama_rope_cos_sin<vec_size, bdx>(k_ptr, cos, sin, rotary_dim);
       }

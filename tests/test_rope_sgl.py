@@ -6,6 +6,7 @@ import torch.nn as nn
 from flashinfer.rope import apply_rope_sgl
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding as vLLMRotaryEmbedding
 import pytest
+import triton
 from vllm.platforms import current_platform
 
 # TODO
@@ -90,7 +91,7 @@ def test_correctness(
     torch.testing.assert_close(query_ref_out, query_flashinfer_out, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(key_ref_out, key_flashinfer_out, atol=1e-2, rtol=1e-2)
 
-import triton
+
 
 """
 llama 3 8B
