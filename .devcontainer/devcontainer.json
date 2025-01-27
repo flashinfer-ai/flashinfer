@@ -1,0 +1,17 @@
+{
+    "name": "CUDA Development Container",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": "."
+    },
+    "runArgs": [
+        "--gpus=all"
+    ],
+    "customizations": {
+        "vscode": {
+            "extensions": [
+            ]
+        }
+    },
+    "remoteUser": "devuser"
+}

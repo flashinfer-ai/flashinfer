@@ -651,7 +651,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
         )
         self._pin_memory_int_workspace_buffer = torch.empty(
-            (8 * 1024 * 1024,), dtype=torch.uint8, pin_memory=True
+            (8 * 1024 * 1024,), dtype=torch.uint8,
+            pin_memory=True, device="cpu",
         )
 
         if use_cuda_graph:
@@ -718,6 +719,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
             dtype=self._int_workspace_buffer.dtype,
+            device="cpu",
             pin_memory=True,
         )
 
@@ -1277,7 +1279,8 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
         )
         self._pin_memory_int_workspace_buffer = torch.empty(
-            (8 * 1024 * 1024,), dtype=torch.uint8, pin_memory=True
+            (8 * 1024 * 1024,), dtype=torch.uint8,
+            pin_memory=True, device="cpu",
         )
 
         if use_cuda_graph:
@@ -1330,6 +1333,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
             dtype=self._int_workspace_buffer.dtype,
+            device="cpu",
             pin_memory=True,
         )
 
