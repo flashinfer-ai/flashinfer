@@ -110,9 +110,6 @@ __device__ __forceinline__ vec_t<float, vec_size> vec_apply_llama_rope_cos_sin(
     permuted_vec.cast_load(x + ((threadIdx.x * vec_size < rotary_dim / 2)
                                     ? threadIdx.x * vec_size + rotary_dim / 2
                                     : threadIdx.x * vec_size - rotary_dim / 2));
-
-
-
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
       vec[i] =
