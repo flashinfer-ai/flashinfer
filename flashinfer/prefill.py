@@ -1417,7 +1417,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if page_size != 1:
                 vector_sparse_indptr_host = torch.cat(
                     [
-                        torch.tensor([0], dtype=torch.int32),
+                        torch.tensor([0], dtype=torch.int32, device=kv_lens_arr_host.device),
                         torch.cumsum(kv_lens_arr_host, dim=0, dtype=torch.int32),
                     ],
                     dim=0,
