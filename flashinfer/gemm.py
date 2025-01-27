@@ -157,7 +157,7 @@ def get_gemm_sm90_module():
                 "gemm_sm90",
                 [
                     FLASHINFER_CSRC_DIR / "group_gemm_sm90.cu",
-                    FLASHINFER_CSRC_DIR / "flashinfer_gemm_sm90_ops.cu",
+                    FLASHINFER_CSRC_DIR / "flashinfer_ops_sm90.cu",
                 ],
                 extra_cuda_cflags=["-gencode", "arch=compute_90a,code=sm_90a"],
             )
@@ -597,72 +597,71 @@ class SegmentGEMMWrapper:
         else:
             backend = self.backend
 
-        match backend:
-            case "sm90":
-                (
-                    all_problems,
-                    x_data,
-                    w_data,
-                    y_data,
-                    x_stride_data,
-                    w_stride_data,
-                    y_stride_data,
-                ) = launch_compute_sm90_group_gemm_args(
-                    x,
-                    weights,
-                    y,
-                    weight_column_major,
-                    batch_size,
-                    seg_indptr,
-                    weight_indices,
-                )
-                get_gemm_sm90_module().cutlass_segment_gemm_sm90(
-                    self._float_workspace_buffer,
-                    self._int_workspace_buffer,
-                    all_problems,
-                    x_data,
-                    w_data,
-                    y_data,
-                    x_stride_data,
-                    w_stride_data,
-                    y_stride_data,
-                    y,  # for torch compile mutates_args
-                    empty_x_data,  # for kernel type dispatch
-                    weight_column_major,
-                )
-            case "sm80":
-                (
-                    all_problems,
-                    x_data,
-                    w_data,
-                    y_data,
-                    x_ld_data,
-                    w_ld_data,
-                    y_ld_data,
-                ) = launch_compute_sm80_group_gemm_args(
-                    x,
-                    weights,
-                    y,
-                    weight_column_major,
-                    batch_size,
-                    seg_indptr,
-                    weight_indices,
-                )
-                get_gemm_module().cutlass_segment_gemm(
-                    self._int_workspace_buffer,
-                    all_problems,
-                    x_data,
-                    w_data,
-                    y_data,
-                    x_ld_data,
-                    w_ld_data,
-                    y_ld_data,
-                    y,
-                    empty_x_data,
-                    weight_column_major,
-                )
-            case _:
-                raise ValueError(f"Unsupported gemm backend: {backend}")
+        if backend == "sm90":
+            (
+                all_problems,
+                x_data,
+                w_data,
+                y_data,
+                x_stride_data,
+                w_stride_data,
+                y_stride_data,
+            ) = launch_compute_sm90_group_gemm_args(
+                x,
+                weights,
+                y,
+                weight_column_major,
+                batch_size,
+                seg_indptr,
+                weight_indices,
+            )
+            get_gemm_sm90_module().cutlass_segment_gemm_sm90(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                all_problems,
+                x_data,
+                w_data,
+                y_data,
+                x_stride_data,
+                w_stride_data,
+                y_stride_data,
+                y,  # for torch compile mutates_args
+                empty_x_data,  # for kernel type dispatch
+                weight_column_major,
+            )
+        elif backend == "sm80":
+            (
+                all_problems,
+                x_data,
+                w_data,
+                y_data,
+                x_ld_data,
+                w_ld_data,
+                y_ld_data,
+            ) = launch_compute_sm80_group_gemm_args(
+                x,
+                weights,
+                y,
+                weight_column_major,
+                batch_size,
+                seg_indptr,
+                weight_indices,
+            )
+            get_gemm_module().cutlass_segment_gemm(
+                self._int_workspace_buffer,
+                all_problems,
+                x_data,
+                w_data,
+                y_data,
+                x_ld_data,
+                w_ld_data,
+                y_ld_data,
+                y,
+                empty_x_data,
+                weight_column_major,
+            )
+        else:
+            raise ValueError(f"Unsupported gemm backend: {backend}")
         return y
 
     forward = run
