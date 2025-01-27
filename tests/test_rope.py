@@ -21,8 +21,8 @@ from rope_reference import *
 import flashinfer
 
 
-@pytest.mark.parametrize("batch_size", [2, 19, 99, 989])
-@pytest.mark.parametrize("qkv_len", [4, 4, 19, 204])
+@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
+@pytest.mark.parametrize("qkv_len", [1, 4, 19, 204])
 @pytest.mark.parametrize("num_qo_heads", [8, 16])
 @pytest.mark.parametrize("num_kv_heads", [8])
 @pytest.mark.parametrize("offset", [0, 15, 99])
