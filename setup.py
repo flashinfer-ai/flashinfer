@@ -247,10 +247,11 @@ if enable_aot:
         f for f in gen_dir.glob("*prefill_head*.cu") if "_sm90" not in f.name
     ]
     prefill_sm90_sources = list(gen_dir.glob("*prefill_head*_sm90.cu"))
+    kernels_sources = list(map(str, kernel_sources + decode_sources + prefill_sources))
     ext_modules = [
         torch_cpp_ext.CUDAExtension(
             name="flashinfer._kernels",
-            sources=kernel_sources + decode_sources + prefill_sources,
+            sources=kernel_sources,
             include_dirs=include_dirs,
             extra_compile_args={
                 "cxx": cxx_flags,
@@ -259,10 +260,11 @@ if enable_aot:
         )
     ]
     if enable_sm90:
+        kernels_sm90_sources = list(map(str, kernel_sm90_sources + prefill_sm90_sources))
         ext_modules += [
             torch_cpp_ext.CUDAExtension(
                 name="flashinfer._kernels_sm90",
-                sources=kernel_sm90_sources + prefill_sm90_sources,
+                sources=kernels_sm90_sources,
                 include_dirs=include_dirs,
                 extra_compile_args={
                     "cxx": cxx_flags,

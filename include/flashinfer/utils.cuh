@@ -179,6 +179,11 @@
       __VA_ARGS__                                      \
       break;                                           \
     }                                                  \
+    case 192: {                                        \
+      constexpr size_t HEAD_DIM = 192;                 \
+      __VA_ARGS__                                      \
+      break;                                           \
+    }                                                  \
     case 256: {                                        \
       constexpr size_t HEAD_DIM = 256;                 \
       __VA_ARGS__                                      \
