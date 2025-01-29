@@ -146,6 +146,7 @@ __device__ __forceinline__ std::pair<vec_t<float, vec_size>, vec_t<float, vec_si
   if(threadIdx.x * vec_size < rotary_dim / 2){
   // TODO: unroll
     float tmp_i;
+    #pragma unroll
     for(uint32_t i = 0; i < vec_size / 2; i++){
       // each iteration processes a pair
       tmp_i = vec_first[2*i] * cos[i] - vec_first[2*i+1] * sin[i];
@@ -153,6 +154,7 @@ __device__ __forceinline__ std::pair<vec_t<float, vec_size>, vec_t<float, vec_si
       vec_first[2*i] = tmp_i;
     }
 
+    #pragma unroll
     for(uint32_t i = vec_size / 2; i < vec_size; i++){
       // each iteration processes a pair
       tmp_i = vec_second[2*i - vec_size] * cos[i] - vec_second[2*i+1 - vec_size] * sin[i];
@@ -191,6 +193,7 @@ __device__ __forceinline__ std::pair<vec_t<float, vec_size>, vec_t<float, vec_si
 
   if(threadIdx.x * vec_size < rotary_dim / 2){
     // TODO: can we vectorize add/sub, mul too
+    #pragma unroll
     for(uint32_t i = 0; i < vec_size; i++) {
       float tmp_first;
       tmp_first = vec_first[i] * cos[i] - vec_second[i] * sin[i];
