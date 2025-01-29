@@ -283,6 +283,7 @@ class FlashInferRotaryEmbedding(RotaryEmbedding):
     [
         (64, 64, 32, 8000, True, torch.bfloat16, "cuda", 32, 32, 1, 1),
         (256, 128, 4096, 10000, True, torch.bfloat16, "cuda", 2, 512, 4, 2),
+        (128, 128, 4096, 10000, True, torch.bfloat16, "cuda", 2, 512, 4, 2),
         (64, 32, 2048, 8432, True, torch.bfloat16, "cuda", 2, 199, 4, 1),
         (64, 64, 32, 8000, False, torch.bfloat16, "cuda", 32, 32, 1, 1),
         (64, 64, 32, 8000, False, torch.bfloat16, "cuda", 32, 32, 1, 1),
@@ -318,7 +319,32 @@ def test_rope_cos_sin_cache(
     torch.testing.assert_close(query_ref_out, query_flashinfer_out, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(key_ref_out, key_flashinfer_out, atol=1e-2, rtol=1e-2)
 
+
+def simple_forward():
+    head_size = 4096//32
+    rotary_dim = 4096//32
+    max_position_embeddings = 8192
+    base = 500000
+    is_neox_style = True
+    dtype = torch.bfloat16
+    device = "cuda"
+
+    rope = FlashInferRotaryEmbedding(head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype).to(device)
+
+    seq_len = 1024
+    batch_size = 8
+    num_q_heads = 32
+    num_kv_heads = 8
+
+    pos_ids = torch.arange(seq_len, device=device).repeat(batch_size)
+    query = torch.randn(batch_size * seq_len, num_q_heads * head_size, dtype=dtype, device=device)
+    key = torch.randn(batch_size * seq_len, num_kv_heads * head_size, dtype=dtype, device=device)
+
+    rope.forward_cuda(pos_ids, query, key)
+
+
 if __name__ == "__main__":
-    test_rope(2, 1, 8, 8, 1, 128, "llama", 1.0, False)
-    test_rope_pos_ids(2, 1, 8, 8, 1, 128, "llama31", 1.0, False)
-    test_rope_cos_sin_cache(64, 64, 32, 8000, True, torch.bfloat16, "cuda", 32, 32, 1, 1)
+    simple_forward()
+    # test_rope(2, 1, 8, 8, 1, 128, "llama", 1.0, False)
+    # test_rope_pos_ids(2, 1, 8, 8, 1, 128, "llama31", 1.0, False)
+    # test_rope_cos_sin_cache(64, 64, 32, 8000, True, torch.bfloat16, "cuda", 32, 32, 1, 1)
