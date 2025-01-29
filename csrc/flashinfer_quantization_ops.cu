@@ -20,7 +20,9 @@ void packbits(at::Tensor x, const std::string& bitorder, at::Tensor y, int64_t c
 void segment_packbits(at::Tensor x, at::Tensor input_indptr, at::Tensor output_indptr,
                       const std::string& bitorder, at::Tensor y, int64_t cuda_stream);
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("packbits", &packbits, "GPU packbits operator");
-  m.def("segment_packbits", &segment_packbits, "GPU segment packbits operator");
+TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) {
+  // GPU packbits operator
+  m.def("packbits", packbits);
+  // GPU segment packbits operator
+  m.def("segment_packbits", segment_packbits);
 }

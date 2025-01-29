@@ -15,8 +15,6 @@
  */
 #pragma once
 
-#include <torch/csrc/utils/pybind.h>
-
 #ifdef FLASHINFER_ENABLE_BF16
 #include <cuda_bf16.h>
 #endif

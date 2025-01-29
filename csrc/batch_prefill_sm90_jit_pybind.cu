@@ -38,11 +38,11 @@ void BatchPrefillWithPagedKVCacheSM90Run(
     std::optional<at::Tensor> maybe_lse, unsigned int mask_mode_code, unsigned int layout,
     int32_t window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("plan", &BatchPrefillWithKVCacheSM90Plan,
-        "Batch-request prefill attention with KV-Cache plan");
-  m.def("ragged_run", &BatchPrefillWithRaggedKVCacheSM90Run,
-        "Batch-request prefill attention with KV-Cache operator");
-  m.def("paged_run", &BatchPrefillWithPagedKVCacheSM90Run,
-        "Batch-request prefill attention with KV-Cache operator");
+TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) {
+  // Batch-request prefill attention with KV-Cache plan
+  m.def("plan", BatchPrefillWithKVCacheSM90Plan);
+  // Batch-request prefill attention with KV-Cache operator
+  m.def("ragged_run", BatchPrefillWithRaggedKVCacheSM90Run);
+  // Batch-request prefill attention with KV-Cache operator
+  m.def("paged_run", BatchPrefillWithPagedKVCacheSM90Run);
 }

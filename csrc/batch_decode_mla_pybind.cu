@@ -14,7 +14,7 @@ void BatchDecodeWithPagedKVCacheRunMLA(
     int window_left, float logits_soft_cap, float rope_scale, float rope_theta,
     std::optional<at::Tensor> maybe_lse, int64_t cuda_stream);
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("plan", &BatchDecodeWithPagedKVCachePlanMLA);
-  m.def("run", &BatchDecodeWithPagedKVCacheRunMLA);
+TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) {
+  m.def("plan", BatchDecodeWithPagedKVCachePlanMLA);
+  m.def("run", BatchDecodeWithPagedKVCacheRunMLA);
 }

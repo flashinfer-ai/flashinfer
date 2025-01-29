@@ -54,19 +54,23 @@ void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_i
                                 at::Tensor output_emitted_token_num, bool deterministic,
                                 int64_t cuda_stream);
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("sampling_from_probs", &sampling_from_probs, "Sample from probabilities");
-  m.def("top_k_sampling_from_probs", &top_k_sampling_from_probs,
-        "Top-k sampling from probabilities");
-  m.def("min_p_sampling_from_probs", &min_p_sampling_from_probs,
-        "Min-p sampling from probabilities");
-  m.def("top_p_sampling_from_probs", &top_p_sampling_from_probs,
-        "Top-p sampling from probabilities");
-  m.def("top_k_top_p_sampling_from_probs", &top_k_top_p_sampling_from_probs,
-        "Top-k and top-p sampling from probabilities");
-  m.def("top_k_renorm_probs", &top_k_renorm_probs, "Renormalize probabilities by top-k mask");
-  m.def("top_p_renorm_probs", &top_p_renorm_probs, "Renormalize probabilities by top-p mask");
-  m.def("top_k_mask_logits", &top_k_mask_logits, "Mask logits by top-k mask");
-  m.def("chain_speculative_sampling", &chain_speculative_sampling,
-        "Speculative sampling from sequence of probabilities");
+TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) {
+  // Sample from probabilities
+  m.def("sampling_from_probs", sampling_from_probs);
+  // Top-k sampling from probabilities
+  m.def("top_k_sampling_from_probs", top_k_sampling_from_probs);
+  // Min-p sampling from probabilities
+  m.def("min_p_sampling_from_probs", min_p_sampling_from_probs);
+  // Top-p sampling from probabilities
+  m.def("top_p_sampling_from_probs", top_p_sampling_from_probs);
+  // Top-k and top-p sampling from probabilities
+  m.def("top_k_top_p_sampling_from_probs", top_k_top_p_sampling_from_probs);
+  // Renormalize probabilities by top-k mask
+  m.def("top_k_renorm_probs", top_k_renorm_probs);
+  // Renormalize probabilities by top-p mask
+  m.def("top_p_renorm_probs", top_p_renorm_probs);
+  // Mask logits by top-k mask
+  m.def("top_k_mask_logits", top_k_mask_logits);
+  // Speculative sampling from sequence of probabilities
+  m.def("chain_speculative_sampling", chain_speculative_sampling);
 }

@@ -49,8 +49,8 @@ void {{ func_name }}(at::Tensor& out, at::Tensor& input, int64_t cuda_stream) {
   });
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("{{ func_name }}", &{{ func_name }}, "Fused {{ act_func_name }} and Mul");
+TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) {
+  m.def("{{ func_name }}", {{ func_name }});
 }
 """
 

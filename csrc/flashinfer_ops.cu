@@ -199,73 +199,94 @@ void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_i
 
 //========== pybind11 ==========
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) {
   // activation
-  m.def("silu_and_mul", &silu_and_mul, "Fused SiLU and Mul");
-  m.def("gelu_tanh_and_mul", &gelu_tanh_and_mul, "Fused GeLU Tanh and Mul");
-  m.def("gelu_and_mul", &gelu_and_mul, "Fused GeLU and Mul");
+  // Fused SiLU and Mul
+  m.def("silu_and_mul", silu_and_mul);
+  // Fused GeLU Tanh and Mul
+  m.def("gelu_tanh_and_mul", gelu_tanh_and_mul);
+  // Fused GeLU and Mul
+  m.def("gelu_and_mul", gelu_and_mul);
 
   // cascade
-  m.def("merge_state", &merge_state, "Merge two self-attention states");
-  m.def("merge_state_in_place", &merge_state_in_place,
-        "Merge another self-attention state in-place.");
-  m.def("merge_states", &merge_states, "Merge multiple self-attention states");
+  // Merge two self-attention states
+  m.def("merge_state", merge_state);
+  // Merge another self-attention state in-place.
+  m.def("merge_state_in_place", merge_state_in_place);
+  // "Merge multiple self-attention states"
+  m.def("merge_states", merge_states);
 
   // decode
-  m.def("single_decode_with_kv_cache", &single_decode_with_kv_cache,
-        "Single-request decode with KV-Cache operator");
-  m.def("batch_decode_with_paged_kv_cache_plan", &BatchDecodeWithPagedKVCachePlan);
-  m.def("batch_decode_with_paged_kv_cache_run", &BatchDecodeWithPagedKVCacheRun);
+  // "Single-request decode with KV-Cache operator"
+  m.def("single_decode_with_kv_cache", single_decode_with_kv_cache);
+  m.def("batch_decode_with_paged_kv_cache_plan", BatchDecodeWithPagedKVCachePlan);
+  m.def("batch_decode_with_paged_kv_cache_run", BatchDecodeWithPagedKVCacheRun);
 
   // gemm
-  m.def("bmm_fp8", &bmm_fp8, "BMM FP8");
-  m.def("cutlass_segment_gemm", &CutlassSegmentGEMM, "Cutlass Segment GEMM operator");
+  // BMM FP8
+  m.def("bmm_fp8", bmm_fp8);
+  // Cutlass Segment GEMM operator
+  m.def("cutlass_segment_gemm", CutlassSegmentGEMM);
 
   // norm
-  m.def("rmsnorm", &rmsnorm, "Root mean square normalization");
-  m.def("fused_add_rmsnorm", &fused_add_rmsnorm, "Fused add root mean square normalization");
-  m.def("gemma_rmsnorm", &gemma_rmsnorm, "Gemma Root mean square normalization");
-  m.def("gemma_fused_add_rmsnorm", &gemma_fused_add_rmsnorm,
-        "Gemma Fused add root mean square normalization");
+  // Root mean square normalization
+  m.def("rmsnorm", rmsnorm);
+  // Fused add root mean square normalization
+  m.def("fused_add_rmsnorm", fused_add_rmsnorm);
+  // Gemma Root mean square normalization
+  m.def("gemma_rmsnorm", gemma_rmsnorm);
+  // Gemma Fused add root mean square normalization
+  m.def("gemma_fused_add_rmsnorm", gemma_fused_add_rmsnorm);
 
   // page
-  m.def("append_paged_kv_cache", &append_paged_kv_cache, "Append paged KV-Cache operator");
+  // Append paged KV-Cache operator
+  m.def("append_paged_kv_cache", append_paged_kv_cache);
+  // Precompute block sparse offsets
   m.def("block_sparse_indices_to_vector_sparse_offsets",
-        &block_sparse_indices_to_vector_sparse_offsets, "Precompute block sparse offsets");
+        block_sparse_indices_to_vector_sparse_offsets);
 
   // prefill
-  m.def("single_prefill_with_kv_cache", &single_prefill_with_kv_cache,
-        "Single-request prefill attention with KV-Cache operator");
-  m.def("batch_prefill_with_kv_cache_plan", &BatchPrefillWithKVCachePlan);
-  m.def("batch_prefill_with_ragged_kv_cache_run", &BatchPrefillWithRaggedKVCacheRun);
-  m.def("batch_prefill_with_paged_kv_cache_run", &BatchPrefillWithPagedKVCacheRun);
+  // Single-request prefill attention with KV-Cache operator
+  m.def("single_prefill_with_kv_cache", single_prefill_with_kv_cache);
+  m.def("batch_prefill_with_kv_cache_plan", BatchPrefillWithKVCachePlan);
+  m.def("batch_prefill_with_ragged_kv_cache_run", BatchPrefillWithRaggedKVCacheRun);
+  m.def("batch_prefill_with_paged_kv_cache_run", BatchPrefillWithPagedKVCacheRun);
 
   // quantization
-  m.def("packbits", &packbits, "GPU packbits operator");
-  m.def("segment_packbits", &segment_packbits, "GPU segment packbits operator");
+  // GPU packbits operator
+  m.def("packbits", packbits);
+  // GPU segment packbits operator
+  m.def("segment_packbits", segment_packbits);
 
   // rope
-  m.def("apply_rope", &apply_rope, "Apply RoPE");
-  m.def("apply_llama31_rope", &apply_llama31_rope, "Apply Llama 3.1 style RoPE");
-  m.def("apply_rope_pos_ids", &apply_rope_pos_ids, "Apply RoPE with positional ids");
-  m.def("apply_llama31_rope_pos_ids", &apply_llama31_rope_pos_ids,
-        "Apply Llama 3.1 style RoPE with positional ids");
-  m.def("apply_rope_pos_ids_cos_sin_cache", &apply_rope_pos_ids_cos_sin_cache,
-        "Apply RoPE with positional ids and cosine/sine cache");
+  // "Apply RoPE"
+  m.def("apply_rope", apply_rope);
+  // "Apply Llama 3.1 style RoPE"
+  m.def("apply_llama31_rope", apply_llama31_rope);
+  // "Apply RoPE with positional ids"
+  m.def("apply_rope_pos_ids", apply_rope_pos_ids);
+  // "Apply Llama 3.1 style RoPE with positional ids"
+  m.def("apply_llama31_rope_pos_ids", apply_llama31_rope_pos_ids);
+  // "Apply RoPE with positional ids and cosine/sine cache"
+  m.def("apply_rope_pos_ids_cos_sin_cache", apply_rope_pos_ids_cos_sin_cache);
 
   // sampling
-  m.def("sampling_from_probs", &sampling_from_probs, "Sample from probabilities");
-  m.def("top_k_sampling_from_probs", &top_k_sampling_from_probs,
-        "Top-k sampling from probabilities");
-  m.def("min_p_sampling_from_probs", &min_p_sampling_from_probs,
-        "Min-p sampling from probabilities");
-  m.def("top_p_sampling_from_probs", &top_p_sampling_from_probs,
-        "Top-p sampling from probabilities");
-  m.def("top_k_top_p_sampling_from_probs", &top_k_top_p_sampling_from_probs,
-        "Top-k and top-p sampling from probabilities");
-  m.def("top_k_renorm_probs", &top_k_renorm_probs, "Renormalize probabilities by top-k mask");
-  m.def("top_p_renorm_probs", &top_p_renorm_probs, "Renormalize probabilities by top-p mask");
-  m.def("top_k_mask_logits", &top_k_mask_logits, "Mask logits by top-k mask");
-  m.def("chain_speculative_sampling", &chain_speculative_sampling,
-        "Speculative sampling from sequence of probabilities");
+  // Sample from probabilities
+  m.def("sampling_from_probs", sampling_from_probs);
+  // Top-k sampling from probabilities
+  m.def("top_k_sampling_from_probs", top_k_sampling_from_probs);
+  // Min-p sampling from probabilities
+  m.def("min_p_sampling_from_probs", min_p_sampling_from_probs);
+  // Top-p sampling from probabilities
+  m.def("top_p_sampling_from_probs", top_p_sampling_from_probs);
+  // Top-k and top-p sampling from probabilities
+  m.def("top_k_top_p_sampling_from_probs", top_k_top_p_sampling_from_probs);
+  // Renormalize probabilities by top-k mask
+  m.def("top_k_renorm_probs", top_k_renorm_probs);
+  // Renormalize probabilities by top-p mask
+  m.def("top_p_renorm_probs", top_p_renorm_probs);
+  // Mask logits by top-k mask
+  m.def("top_k_mask_logits", top_k_mask_logits);
+  // Speculative sampling from sequence of probabilities
+  m.def("chain_speculative_sampling", chain_speculative_sampling);
 }

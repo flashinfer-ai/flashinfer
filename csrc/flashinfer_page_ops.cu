@@ -28,8 +28,10 @@ void block_sparse_indices_to_vector_sparse_offsets(at::Tensor block_sparse_indic
                                                    unsigned int stride_n, unsigned int batch_size,
                                                    unsigned int block_size, int64_t cuda_stream);
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("append_paged_kv_cache", &append_paged_kv_cache, "Append paged KV-Cache operator");
+TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) {
+  // "Append paged KV-Cache operator"
+  m.def("append_paged_kv_cache", append_paged_kv_cache);
+  // "Precompute block sparse offsets"
   m.def("block_sparse_indices_to_vector_sparse_offsets",
-        &block_sparse_indices_to_vector_sparse_offsets, "Precompute block sparse offsets");
+        block_sparse_indices_to_vector_sparse_offsets);
 }

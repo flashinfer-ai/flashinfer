@@ -40,12 +40,15 @@ void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_r
                                       at::Tensor k_rope, at::Tensor cos_sin_cache,
                                       at::Tensor pos_ids, bool interleave, int64_t cuda_stream);
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("apply_rope", &apply_rope, "Apply RoPE");
-  m.def("apply_llama31_rope", &apply_llama31_rope, "Apply Llama 3.1 style RoPE");
-  m.def("apply_rope_pos_ids", &apply_rope_pos_ids, "Apply RoPE with positional ids");
-  m.def("apply_llama31_rope_pos_ids", &apply_llama31_rope_pos_ids,
-        "Apply Llama 3.1 style RoPE with positional ids");
-  m.def("apply_rope_pos_ids_cos_sin_cache", &apply_rope_pos_ids_cos_sin_cache,
-        "Apply RoPE with positional ids and cosine/sine cache");
+TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) {
+  // "Apply RoPE"
+  m.def("apply_rope", apply_rope);
+  // "Apply Llama 3.1 style RoPE"
+  m.def("apply_llama31_rope", apply_llama31_rope);
+  // "Apply RoPE with positional ids"
+  m.def("apply_rope_pos_ids", apply_rope_pos_ids);
+  // "Apply Llama 3.1 style RoPE with positional ids"
+  m.def("apply_llama31_rope_pos_ids", apply_llama31_rope_pos_ids);
+  // "Apply RoPE with positional ids and cosine/sine cache"
+  m.def("apply_rope_pos_ids_cos_sin_cache", apply_rope_pos_ids_cos_sin_cache);
 }
