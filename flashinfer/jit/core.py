@@ -53,6 +53,7 @@ def check_cuda_arch():
 
 
 def clear_cache_dir():
+    # import pdb; pdb.set_trace()
     if os.path.exists(FLASHINFER_JIT_DIR):
         for file in os.listdir(FLASHINFER_JIT_DIR):
             os.remove(os.path.join(FLASHINFER_JIT_DIR, file))

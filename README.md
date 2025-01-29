@@ -127,6 +127,16 @@ You can run `./bench_{single/batch}_{prefill/decode}` to benchmark the performan
 
 FlashInfer also provides C++ API and TVM bindings, please refer to [documentation](https://docs.flashinfer.ai/) for more details.
 
+## Development Tips
+
+jit 
+
+python -c "from flashinfer.jit import clear_cache_dir; clear_cache_dir()"
+
+aot
+
+rm *.so
+
 ## Adoption
 
 We are thrilled to share that FlashInfer is being adopted by many cutting-edge projects, including but not limited to:

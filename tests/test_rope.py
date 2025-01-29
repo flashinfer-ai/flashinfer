@@ -288,6 +288,7 @@ class FlashInferRotaryEmbedding(RotaryEmbedding):
         (64, 64, 32, 8000, False, torch.bfloat16, "cuda", 32, 32, 1, 1),
         (64, 64, 32, 8000, False, torch.bfloat16, "cuda", 32, 32, 1, 1),
         (256, 128, 4096, 9231, False, torch.bfloat16, "cuda", 3, 231, 4, 2),
+        (64, 32, 2048, 8432, False, torch.bfloat16, "cuda", 2, 199, 4, 1),
     ]
 )
 def test_rope_cos_sin_cache(
