@@ -37,7 +37,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, cudaStream_t 
 
 using namespace flashinfer;
 
-std::vector<int64_t> BatchPrefillWithKVCacheSM90Plan(
+at::Tensor BatchPrefillWithKVCacheSM90Plan(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr, at::Tensor kv_indptr,
     at::Tensor kv_len_arr, unsigned total_num_rows, unsigned int batch_size,
@@ -68,7 +68,7 @@ std::vector<int64_t> BatchPrefillWithKVCacheSM90Plan(
 
 void BatchPrefillWithRaggedKVCacheSM90Run(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-    std::vector<int64_t> plan_info_vec, at::Tensor q, at::Tensor k, at::Tensor v,
+    at::Tensor plan_info_vec, at::Tensor q, at::Tensor k, at::Tensor v,
     at::Tensor qo_indptr, at::Tensor kv_indptr, at::Tensor o, std::optional<at::Tensor> maybe_lse,
     unsigned int mask_mode_code, unsigned int layout, int32_t window_left ADDITIONAL_FUNC_PARAMS,
     int64_t cuda_stream) {
@@ -156,7 +156,7 @@ void BatchPrefillWithRaggedKVCacheSM90Run(
 
 void BatchPrefillWithPagedKVCacheSM90Run(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-    std::vector<int64_t> plan_info_vec, at::Tensor q, at::Tensor paged_k_cache,
+    at::Tensor plan_info_vec, at::Tensor q, at::Tensor paged_k_cache,
     at::Tensor paged_v_cache, at::Tensor qo_indptr, at::Tensor paged_kv_indptr,
     at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len, at::Tensor o,
     std::optional<at::Tensor> maybe_lse, unsigned int mask_mode_code, unsigned int layout,

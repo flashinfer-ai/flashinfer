@@ -40,7 +40,7 @@ void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::T
                                  int window_left SINGLE_DECODE_ADDITIONAL_FUNC_PARAMS,
                                  int64_t cuda_stream);
 
-std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
+at::Tensor BatchDecodeWithPagedKVCachePlan(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     at::Tensor page_locked_int_workspace_buffer, at::Tensor indptr, unsigned int batch_size,
     unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int page_size,
@@ -49,7 +49,7 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
 
 void BatchDecodeWithPagedKVCacheRun(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-    std::vector<int64_t> plan_info_vec, at::Tensor q, at::Tensor paged_k_cache,
+    at::Tensor plan_info_vec, at::Tensor q, at::Tensor paged_k_cache,
     at::Tensor paged_v_cache, at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices,
     at::Tensor paged_kv_last_page_len, at::Tensor o, std::optional<at::Tensor> maybe_lse,
     unsigned int kv_layout_code, int window_left BATCH_DECODE_ADDITIONAL_FUNC_PARAMS,
@@ -102,7 +102,7 @@ void single_prefill_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::
                                   int32_t window_left SINGLE_PREFILL_ADDITIONAL_FUNC_PARAMS,
                                   int64_t cuda_stream);
 
-std::vector<int64_t> BatchPrefillWithKVCachePlan(
+at::Tensor BatchPrefillWithKVCachePlan(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr, at::Tensor kv_indptr,
     at::Tensor kv_len_arr, unsigned total_num_rows, unsigned int batch_size,
@@ -111,14 +111,14 @@ std::vector<int64_t> BatchPrefillWithKVCachePlan(
 
 void BatchPrefillWithRaggedKVCacheRun(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-    std::vector<int64_t> plan_info_vec, at::Tensor q, at::Tensor k, at::Tensor v,
+    at::Tensor plan_info_vec, at::Tensor q, at::Tensor k, at::Tensor v,
     at::Tensor qo_indptr, at::Tensor kv_indptr, at::Tensor o, std::optional<at::Tensor> maybe_lse,
     unsigned int mask_mode_code, unsigned int layout,
     int32_t window_left BATCH_PREFILL_ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
 
 void BatchPrefillWithPagedKVCacheRun(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-    std::vector<int64_t> plan_info_vec, at::Tensor q, at::Tensor paged_k_cache,
+    at::Tensor plan_info_vec, at::Tensor q, at::Tensor paged_k_cache,
     at::Tensor paged_v_cache, at::Tensor qo_indptr, at::Tensor paged_kv_indptr,
     at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len, at::Tensor o,
     std::optional<at::Tensor> maybe_lse, unsigned int mask_mode_code, unsigned int layout,

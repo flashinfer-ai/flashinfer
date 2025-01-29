@@ -7,7 +7,7 @@
 
 using namespace flashinfer;
 
-std::vector<int64_t> BatchDecodeWithPagedKVCachePlanMLA(
+at::Tensor BatchDecodeWithPagedKVCachePlanMLA(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     at::Tensor page_locked_int_workspace_buffer, at::Tensor indptr, unsigned int batch_size,
     unsigned int num_qo_heads, unsigned int page_size, bool enable_cuda_graph,

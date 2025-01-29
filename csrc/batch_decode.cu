@@ -32,7 +32,7 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
 
 using namespace flashinfer;
 
-std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
+at::Tensor BatchDecodeWithPagedKVCachePlan(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     at::Tensor page_locked_int_workspace_buffer, at::Tensor indptr, unsigned int batch_size,
     unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int page_size,
@@ -74,7 +74,7 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
 
 void BatchDecodeWithPagedKVCacheRun(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-    std::vector<int64_t> plan_info_vec, at::Tensor q, at::Tensor paged_k_cache,
+    at::Tensor plan_info_vec, at::Tensor q, at::Tensor paged_k_cache,
     at::Tensor paged_v_cache, at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices,
     at::Tensor paged_kv_last_page_len, at::Tensor o, std::optional<at::Tensor> maybe_lse,
     unsigned int kv_layout_code, int window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream) {
