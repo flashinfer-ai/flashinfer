@@ -29,6 +29,7 @@
 #include "../pos_enc.cuh"
 #include "../utils.cuh"
 #include "heap.h"
+#include <torch/all.h>
 
 namespace flashinfer {
 

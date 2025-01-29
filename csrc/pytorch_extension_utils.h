@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 #pragma once
-
+#include <torch/all.h>
 #ifdef FLASHINFER_ENABLE_BF16
 #include <cuda_bf16.h>
 #endif
