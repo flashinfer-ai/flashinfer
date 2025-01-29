@@ -824,7 +824,11 @@ inline cudaError_t PrefillSM90Plan(void* float_buffer, size_t float_workspace_si
     cta_tile_q = 192;
   }
 
-  const int num_sm90_ctas = 132;  // for sm90, the num_ctas is fixed
+  int device = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
+  int num_sm90_ctas = 0;
+  FLASHINFER_CUDA_CALL(
+      cudaDeviceGetAttribute(&num_sm90_ctas, cudaDevAttrMultiProcessorCount, device));
 
   CTACostHeap cta_cost_heap(num_sm90_ctas);
   std::vector<std::vector<IdType>> cta_qo_tile_indices(num_sm90_ctas, std::vector<IdType>()),
