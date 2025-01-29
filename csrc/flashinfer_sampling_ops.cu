@@ -24,7 +24,7 @@ void top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at:
 
 void top_k_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
                                at::Tensor success, std::optional<at::Tensor> maybe_top_k_arr,
-                               unsigned int top_k_val, bool deterministic, int64_t cuda_stream);
+                               int64_t top_k_val, bool deterministic, int64_t cuda_stream);
 
 void min_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
                                std::optional<at::Tensor> maybe_min_p_arr, double min_p_val,
@@ -41,11 +41,11 @@ void top_p_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
                         int64_t cuda_stream);
 
 void top_k_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
-                        std::optional<at::Tensor> maybe_top_k_arr, unsigned int top_k_val,
+                        std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
                         int64_t cuda_stream);
 
 void top_k_mask_logits(at::Tensor logits, at::Tensor mask_logits,
-                       std::optional<at::Tensor> maybe_top_k_arr, unsigned int top_k_val,
+                       std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
                        int64_t cuda_stream);
 
 void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_ids,

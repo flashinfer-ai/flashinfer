@@ -40,9 +40,9 @@ using namespace flashinfer;
 at::Tensor BatchPrefillWithKVCacheSM90Plan(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr, at::Tensor kv_indptr,
-    at::Tensor kv_len_arr, unsigned total_num_rows, unsigned int batch_size,
-    unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int page_size,
-    bool enable_cuda_graph, unsigned int head_dim, bool causal, int64_t cuda_stream) {
+    at::Tensor kv_len_arr, unsigned total_num_rows, int64_t batch_size,
+    int64_t num_qo_heads, int64_t num_kv_heads, int64_t page_size,
+    bool enable_cuda_graph, int64_t head_dim, bool causal, int64_t cuda_stream) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =
@@ -70,7 +70,7 @@ void BatchPrefillWithRaggedKVCacheSM90Run(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     at::Tensor plan_info_vec, at::Tensor q, at::Tensor k, at::Tensor v,
     at::Tensor qo_indptr, at::Tensor kv_indptr, at::Tensor o, std::optional<at::Tensor> maybe_lse,
-    unsigned int mask_mode_code, unsigned int layout, int32_t window_left ADDITIONAL_FUNC_PARAMS,
+    int64_t mask_mode_code, int64_t layout, int32_t window_left ADDITIONAL_FUNC_PARAMS,
     int64_t cuda_stream) {
   PrefillPlanSM90Info plan_info;
   plan_info.FromVector(plan_info_vec);
@@ -84,7 +84,7 @@ void BatchPrefillWithRaggedKVCacheSM90Run(
   void* float_buffer_ptr = float_workspace_buffer.data_ptr();
   void* int_buffer_ptr = int_workspace_buffer.data_ptr();
 
-  unsigned int head_dim = q.size(2);
+  int64_t head_dim = q.size(2);
 
   auto q_scalar_type = q.scalar_type();
   auto kv_scalar_type = k.scalar_type();
@@ -159,7 +159,7 @@ void BatchPrefillWithPagedKVCacheSM90Run(
     at::Tensor plan_info_vec, at::Tensor q, at::Tensor paged_k_cache,
     at::Tensor paged_v_cache, at::Tensor qo_indptr, at::Tensor paged_kv_indptr,
     at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len, at::Tensor o,
-    std::optional<at::Tensor> maybe_lse, unsigned int mask_mode_code, unsigned int layout,
+    std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code, int64_t layout,
     int32_t window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream) {
   PrefillPlanSM90Info plan_info;
   plan_info.FromVector(plan_info_vec);
@@ -170,8 +170,8 @@ void BatchPrefillWithPagedKVCacheSM90Run(
     TORCH_CHECK(lse.size(1) == q.size(1), lse.size(1), q.size(1));
   }
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
-  unsigned int num_kv_heads, page_size;
-  unsigned int head_dim = q.size(2);
+  int64_t num_kv_heads, page_size;
+  int64_t head_dim = q.size(2);
   if (kv_layout == QKVLayout::kHND) {
     num_kv_heads = paged_k_cache.size(1);
     page_size = paged_k_cache.size(2);

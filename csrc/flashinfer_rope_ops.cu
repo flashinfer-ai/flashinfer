@@ -18,22 +18,22 @@
 #include "pytorch_extension_utils.h"
 
 void apply_rope(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope, at::Tensor indptr,
-                at::Tensor offsets, unsigned int rotary_dim, bool interleave, float rope_scale,
-                float rope_theta, int64_t cuda_stream);
+                at::Tensor offsets, int64_t rotary_dim, bool interleave, double rope_scale,
+                double rope_theta, int64_t cuda_stream);
 
 void apply_llama31_rope(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
-                        at::Tensor indptr, at::Tensor offsets, unsigned int rotary_dim,
-                        bool interleave, float rope_scale, float rope_theta, float low_freq_factor,
-                        float high_freq_factor, float old_context_length, int64_t cuda_stream);
+                        at::Tensor indptr, at::Tensor offsets, int64_t rotary_dim,
+                        bool interleave, double rope_scale, double rope_theta, double low_freq_factor,
+                        double high_freq_factor, double old_context_length, int64_t cuda_stream);
 
 void apply_rope_pos_ids(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
-                        at::Tensor pos_ids, unsigned int rotary_dim, bool interleave,
-                        float rope_scale, float rope_theta, int64_t cuda_stream);
+                        at::Tensor pos_ids, int64_t rotary_dim, bool interleave,
+                        double rope_scale, double rope_theta, int64_t cuda_stream);
 
 void apply_llama31_rope_pos_ids(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
-                                at::Tensor pos_ids, unsigned int rotary_dim, bool interleave,
-                                float rope_scale, float rope_theta, float low_freq_factor,
-                                float high_freq_factor, float old_context_length,
+                                at::Tensor pos_ids, int64_t rotary_dim, bool interleave,
+                                double rope_scale, double rope_theta, double low_freq_factor,
+                                double high_freq_factor, double old_context_length,
                                 int64_t cuda_stream);
 
 void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_rope,

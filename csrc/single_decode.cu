@@ -30,7 +30,7 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
 using namespace flashinfer;
 
 void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor tmp,
-                                 at::Tensor o, unsigned int layout,
+                                 at::Tensor o, int64_t layout,
                                  int window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream) {
   CHECK_INPUT(q);
   CHECK_INPUT(k);
