@@ -5,7 +5,8 @@ namespace flashinfer {
 
 {% for same_scheduler_for_all_heads in ["true", "false"] %}
 template cudaError_t BatchPrefillWithRaggedKVCacheDispatched
-    <{{ head_dim }},
+    <{{ head_dim_qk }},
+     {{ head_dim_vo }},
      {{ mask_mode }},
      /*USE_SLIDING_WINDOW=*/{{ use_sliding_window }},
      /*SAME_SCHEDULER_FOR_ALL_HEADS=*/{{ same_scheduler_for_all_heads }},

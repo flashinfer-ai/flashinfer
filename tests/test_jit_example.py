@@ -487,7 +487,8 @@ def test_batch_prefill_sm90_flash_sigmoid():
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
         torch.int32,  # idtype
-        128,  # hidden_dim
+        192,  # head_dim_qk
+        128,  # head_dim_vo
         [],  # additional_tensor_names
         [],  # additional_tensor_dtypes
         ["logits_scale", "sigmoid_bias"],  # additional_scalar_names
@@ -514,14 +515,15 @@ def test_batch_prefill_sm90_flash_sigmoid():
 
     num_qo_heads = 32
     num_kv_heads = 32
-    head_dim = 128
+    head_dim_qk = 192
+    head_dim_vo = 128
 
     wrapper.plan(
         qo_indptr_host,
         kv_indptr_host,
         num_qo_heads,
         num_kv_heads,
-        head_dim,
+        head_dim_qk,
         causal=False,
         q_data_type=torch.float16,
         kv_data_type=torch.float16,
@@ -530,21 +532,21 @@ def test_batch_prefill_sm90_flash_sigmoid():
     q = torch.randn(
         batch_size * seq_len_per_request,
         num_qo_heads,
-        head_dim,
+        head_dim_qk,
         dtype=torch.float16,
         device="cuda",
     )
     k = torch.randn(
         batch_size * seq_len_per_request,
         num_kv_heads,
-        head_dim,
+        head_dim_vo,
         dtype=torch.float16,
         device="cuda",
     )
     v = torch.randn(
         batch_size * seq_len_per_request,
         num_kv_heads,
-        head_dim,
+        head_dim_vo,
         dtype=torch.float16,
         device="cuda",
     )
@@ -568,7 +570,7 @@ def test_batch_prefill_sm90_flash_sigmoid():
         paged_kv_last_page_len_host,
         num_qo_heads,
         num_kv_heads,
-        head_dim,
+        head_dim_qk,
         1,
     )
     o_paged = wrapper_paged.run(q, (k, v), logits_scale, sigmoid_bias)
@@ -576,8 +578,8 @@ def test_batch_prefill_sm90_flash_sigmoid():
     p = torch.sigmoid(
         torch.einsum(
             "bmhd,bnhd->bhmn",
-            q.view(batch_size, seq_len_per_request, num_qo_heads, head_dim).float(),
-            k.view(batch_size, seq_len_per_request, num_kv_heads, head_dim).float(),
+            q.view(batch_size, seq_len_per_request, num_qo_heads, head_dim_qk).float(),
+            k.view(batch_size, seq_len_per_request, num_kv_heads, head_dim_qk).float(),
         )
         * logits_scale
         + sigmoid_bias
@@ -586,10 +588,10 @@ def test_batch_prefill_sm90_flash_sigmoid():
         torch.einsum(
             "bhmn,bnhd->bmhd",
             p,
-            v.view(batch_size, seq_len_per_request, num_kv_heads, head_dim).float(),
+            v.view(batch_size, seq_len_per_request, num_kv_heads, head_dim_vo).float(),
         )
         .half()
-        .reshape(batch_size * seq_len_per_request, num_qo_heads, head_dim)
+        .reshape(batch_size * seq_len_per_request, num_qo_heads, head_dim_vo)
     )
     torch.testing.assert_close(o, o_ref, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(o_paged, o_ref, rtol=2e-2, atol=2e-2)

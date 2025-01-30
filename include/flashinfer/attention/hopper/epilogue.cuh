@@ -68,8 +68,8 @@ struct CollectiveEpilogue {
   using DTypeO = typename Ktraits::DTypeO;
   static constexpr int CTA_Q = Ktraits::CTA_Q;
   static constexpr int CTA_KV = Ktraits::CTA_KV;
-  static constexpr int HEAD_DIM = Ktraits::HEAD_DIM;
-  using TileShape_QKD = Shape<Int<CTA_Q>, Int<CTA_KV>, Int<HEAD_DIM>>;
+  static constexpr int HEAD_DIM_VO = Ktraits::HEAD_DIM_VO;
+  using TileShape_PDV = Shape<Int<CTA_Q>, Int<HEAD_DIM_VO>, Int<CTA_KV>>;
 
   static constexpr int NUM_WARPS = Ktraits::NUM_WARPS;
   static constexpr int NUM_THREADS = NUM_WARPS * cutlass::NumThreadsPerWarp;
@@ -78,9 +78,9 @@ struct CollectiveEpilogue {
   static constexpr int NUM_MMA_THREADS = NUM_THREADS - NUM_COPY_THREADS;
 
   using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::ss_smem_selector<
-                                   GMMA::Major::K, DTypeO, decltype(cute::get<0>(TileShape_QKD{})),
-                                   decltype(cute::get<2>(TileShape_QKD{}))>());
-  using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtomO{}, select<0, 2>(TileShape_QKD{})));
+                                   GMMA::Major::K, DTypeO, decltype(cute::get<0>(TileShape_PDV{})),
+                                   decltype(cute::get<1>(TileShape_PDV{}))>());
+  using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtomO{}, select<0, 1>(TileShape_PDV{})));
 
   using SmemCopyAtomO = Copy_Atom<cute::SM90_U32x4_STSM_N, DTypeO>;
   using SharedStorage = cute::array_aligned<DTypeO, cute::cosize_v<SmemLayoutO>>;
@@ -97,11 +97,11 @@ struct CollectiveEpilogue {
   using TMA_O = decltype(make_tma_copy(
       GmemTiledCopyOTMA{},
       make_tensor(make_gmem_ptr(static_cast<DTypeO*>(nullptr)), ShapeT{}, StrideT{}), SmemLayoutO{},
-      select<0, 2>(TileShape_QKD{}), _1{}));  // no mcast for O
+      select<0, 1>(TileShape_PDV{}), _1{}));  // no mcast for O
 
   static constexpr int VEC_SIZE = cute::ceil_div(128, sizeof_bits_v<DTypeO>);
-  static_assert(HEAD_DIM % VEC_SIZE == 0);
-  static constexpr int NUM_THREADS_PER_ROW = HEAD_DIM / VEC_SIZE;
+  static_assert(HEAD_DIM_VO % VEC_SIZE == 0);
+  static constexpr int NUM_THREADS_PER_ROW = HEAD_DIM_VO / VEC_SIZE;
   static_assert(NUM_MMA_THREADS % NUM_THREADS_PER_ROW == 0);
   static constexpr int NUM_ROWS = NUM_MMA_THREADS / NUM_THREADS_PER_ROW;
   using TiledCopyOAtom = cute::Copy_Atom<cute::UniversalCopy<cutlass::uint128_t>, DTypeO>;
@@ -116,11 +116,11 @@ struct CollectiveEpilogue {
 
   // used for rmem -> smem O copy in fp8 kernel to undo column permutation
   using ThreadLayoutrO = Layout<Shape<_8, Int<CTA_Q / 16>, _4, _1>, Stride<_4, _32, _1, _0>>;
-  using ValueLayoutrO =
-      Layout<Shape<_1, _2, Shape<_2, _2>, Int<HEAD_DIM / 16>>, Stride<_0, _2, Stride<_4, _1>, _8>>;
+  using ValueLayoutrO = Layout<Shape<_1, _2, Shape<_2, _2>, Int<HEAD_DIM_VO / 16>>,
+                               Stride<_0, _2, Stride<_4, _1>, _8>>;
   using TiledCopyrO = decltype(make_tiled_copy(Copy_Atom<UniversalCopy<uint16_t>, DTypeO>{},
                                                ThreadLayoutrO{}, ValueLayoutrO{}));
-  using TiledCopyShaperO = Shape<_8, Int<CTA_Q / 8>, _16, Int<HEAD_DIM / 16>>;
+  using TiledCopyShaperO = Shape<_8, Int<CTA_Q / 8>, _16, Int<HEAD_DIM_VO / 16>>;
   using SmemLayoutrO = decltype(composition(SmemLayoutO{}, Layout<TiledCopyShaperO>{}));
 
   // Host side kernel arguments
@@ -174,7 +174,7 @@ struct CollectiveEpilogue {
     Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.lse_ptr), epilogue_params.layout_LSE);
     Tensor gLSE = get_lse_local_tile_tensor(mLSE, Shape<Int<CTA_Q>>{}, qo_head_idx, qo_indptr,
                                             qo_len)(_, qo_tile_idx);
-    Tensor caccO = cute::make_identity_tensor(select<0, 2>(TileShape_QKD{}));
+    Tensor caccO = cute::make_identity_tensor(select<0, 1>(TileShape_PDV{}));
     auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
     Tensor taccOcO = thread_mma.partition_C(caccO);  // (MMA,MMA_M,MMA_K)
     static_assert(decltype(size<0, 0>(taccOcO))::value == 2);
@@ -201,7 +201,7 @@ struct CollectiveEpilogue {
     }
     TiledCopyO gmem_tiled_copy_O;
     write_O<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O, epilogue_params.layout_O,
-                              select<0, 2>(TileShape_QKD{}), sO, thread_idx, qo_tile_idx,
+                              select<0, 1>(TileShape_PDV{}), sO, thread_idx, qo_tile_idx,
                               qo_head_idx, qo_indptr, qo_len, write_warp_idx);
   }
 
@@ -216,7 +216,7 @@ struct CollectiveEpilogue {
     auto [qo_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len] =
         block_coord;
     Tensor mO = make_tensor(make_gmem_ptr(epilogue_params.O_ptr), epilogue_params.layout_O);
-    Tensor gO = get_local_tile_tensor(mO, select<0, 2>(TileShape_QKD{}), qo_head_idx, qo_indptr,
+    Tensor gO = get_local_tile_tensor(mO, select<0, 1>(TileShape_PDV{}), qo_head_idx, qo_indptr,
                                       qo_len)(_, _, qo_tile_idx);  // (O, D)
     Tensor cO = cute::make_identity_tensor(gO.shape());            // (O, D) -> (o_idx, d_idx)
     Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.lse_ptr), epilogue_params.layout_LSE);
@@ -233,7 +233,7 @@ struct CollectiveEpilogue {
     Tensor tOrOGroup = flatten_1(tOrO);        // (CPY, (CPY_O, CPY_D))
     Tensor tOcOGroup = flatten_1(tOcO);        // (CPY, (CPY_O, CPY_D))
 
-    const int qo_tile_size = get<0>(TileShape_QKD{});
+    const int qo_tile_size = get<0>(TileShape_PDV{});
     int valid_qo_tile_size = std::min<int>(qo_len - qo_tile_idx * qo_tile_size, qo_tile_size);
     if (valid_qo_tile_size == qo_tile_size) {
       copy(tiled_copy_O, tOrOGroup, tOgOGroup);

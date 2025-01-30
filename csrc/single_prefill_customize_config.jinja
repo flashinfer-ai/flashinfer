@@ -8,7 +8,7 @@
 #define ADDITIONAL_PARAMS_SETTER {{ additional_params_setter }}
 
 
-#define DISPATCH_context(DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM, POS_ENCODING_MODE, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, AttentionVariant, Params, ...) \
+#define DISPATCH_context(DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, AttentionVariant, Params, ...) \
   DISPATCH_MASK_MODE(mask_mode, MASK_MODE, { \
     constexpr bool use_custom_mask = MASK_MODE == MaskMode::kCustom; \
     using AttentionVariant = {{ variant_name }}; \
@@ -22,7 +22,8 @@ using DTypeQ = {{ dtype_q }};
 using DTypeKV = {{ dtype_kv }};
 using DTypeO = {{ dtype_o }};
 using IdType = int32_t;
-constexpr int HEAD_DIM = {{ head_dim }};
+constexpr int HEAD_DIM_QK = {{ head_dim_qk }};
+constexpr int HEAD_DIM_VO = {{ head_dim_vo }};
 constexpr bool USE_FP16_QK_REDUCTION = {{ use_fp16_qk_reduction }};
 constexpr auto USE_LOGITS_SOFT_CAP = {{ use_logits_soft_cap }};
 constexpr auto POS_ENCODING_MODE = {{ pos_encoding_mode }};

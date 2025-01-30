@@ -29,12 +29,14 @@ struct CollectiveMainloop {
   using DTypeQ = typename Ktraits::DTypeQ;
   using DTypeKV = typename Ktraits::DTypeKV;
   using TileShape_QKD = typename Ktraits::TileShape_QKD;
+  using TileShape_PDV = typename Ktraits::TileShape_PDV;
   static constexpr int CTA_Q = get<0>(TileShape_QKD{});
   static constexpr int CTA_KV = get<1>(TileShape_QKD{});
 
   static constexpr int NUM_STAGES = Ktraits::NUM_STAGES;
   static constexpr int NUM_MMA_THREADS = Ktraits::NUM_MMA_THREADS;
-  static constexpr int HEAD_DIM = Ktraits::HEAD_DIM;
+  static constexpr int HEAD_DIM_QK = Ktraits::HEAD_DIM_QK;
+  static constexpr int HEAD_DIM_VO = Ktraits::HEAD_DIM_VO;
 
   using GmemTiledCopyQ = cute::SM90_TMA_LOAD;
   using GmemTiledCopyKV = cute::SM90_TMA_LOAD;
@@ -68,7 +70,7 @@ struct CollectiveMainloop {
       GmemTiledCopyKV{},
       make_tensor(make_gmem_ptr(static_cast<DTypeKV const*>(nullptr)),
                   repeat_like(StrideT{}, int32_t(0)), StrideT{}),
-      take<0, 2>(SmemLayoutV{}), select<1, 2>(TileShape_QKD{}), _1{}));  // no mcast
+      take<0, 2>(SmemLayoutV{}), select<2, 1>(TileShape_PDV{}), _1{}));  // no mcast
 
   static constexpr bool USE_TMA_LOAD_KV = true;
   using MainloopPipeline = typename Ktraits::MainloopPipeline;
@@ -84,7 +86,7 @@ struct CollectiveMainloop {
   // Whether use scheduler barrier or hardware warp scheduler, using heuristic based on data type
   // and head dim
   static constexpr bool UseSchedulerBarrier =
-      cutlass::sizeof_bits_v<DTypeQ> == 8 ? HEAD_DIM >= 128 : HEAD_DIM <= 128;
+      cutlass::sizeof_bits_v<DTypeQ> == 8 ? HEAD_DIM_VO >= 128 : HEAD_DIM_VO <= 128;
   using WarpScheduler = WarpScheduler<Ktraits, UseSchedulerBarrier>;
 
   // Host side kernel arguments
@@ -120,7 +122,7 @@ struct CollectiveMainloop {
                                      select<1, 2>(TileShape_QKD{}), _1{});  // no mcast
     Tensor mV = make_tensor(make_gmem_ptr(args.V_ptr), args.layout_V);
     TMA_V tma_load_V = make_tma_copy(GmemTiledCopyKV{}, mV, SmemLayoutV{}(_, _, _0{}),
-                                     select<1, 2>(TileShape_QKD{}), _1{});  // no mcast
+                                     select<2, 1>(TileShape_PDV{}), _1{});  // no mcast
     return {args.layout_Q, args.layout_K, args.layout_V,    tma_load_Q,
             tma_load_K,    tma_load_V,    args.window_left, args.additional_params};
   }
@@ -170,7 +172,7 @@ struct CollectiveMainloop {
                                       qo_len)(_, _, q_tile_idx);  // (Q, D)
     Tensor gK = get_local_tile_tensor(mK, select<1, 2>(TileShape_QKD{}), kv_head_idx, kv_indptr,
                                       kv_len);  // (K, D, _)
-    Tensor gV = get_local_tile_tensor(mV, select<1, 2>(TileShape_QKD{}), kv_head_idx, kv_indptr,
+    Tensor gV = get_local_tile_tensor(mV, select<2, 1>(TileShape_PDV{}), kv_head_idx, kv_indptr,
                                       kv_len);  // (K, D, _)
 
     Tensor sQ_x = make_tensor(sQ.data(), make_layout(sQ.layout(), Layout<_1>{}));

@@ -25,11 +25,11 @@
 
 namespace flashinfer {
 
-template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
+template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
           bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename Params>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, cudaStream_t stream);
 
-template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
+template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
           bool SAME_SCHEDULE_FOR_ALL_HEADS, typename AttentionVariant, typename Params>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, cudaStream_t stream);
 
@@ -84,7 +84,8 @@ void BatchPrefillWithRaggedKVCacheSM90Run(
   void* float_buffer_ptr = float_workspace_buffer.data_ptr();
   void* int_buffer_ptr = int_workspace_buffer.data_ptr();
 
-  unsigned int head_dim = q.size(2);
+  unsigned int head_dim_qk = q.size(2);
+  unsigned int head_dim_vo = v.size(2);
 
   auto q_scalar_type = q.scalar_type();
   auto kv_scalar_type = k.scalar_type();
@@ -95,8 +96,8 @@ void BatchPrefillWithRaggedKVCacheSM90Run(
   bool use_swa = window_left != -1;
 
   DISPATCH_context(
-      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP,
-      AttentionVariant, RaggedParams, PagedParams, [&] {
+      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, USE_SLIDING_WINDOW,
+      USE_LOGITS_SOFT_CAP, AttentionVariant, RaggedParams, PagedParams, [&] {
         RaggedParams params;
 
         params.q_ptr = static_cast<DTypeQ*>(q.data_ptr());
@@ -121,7 +122,6 @@ void BatchPrefillWithRaggedKVCacheSM90Run(
         }
         params.nnz_qo = q.size(0);
         params.nnz_kv = k.size(0);
-        params.head_dim = head_dim;
         params.num_qo_heads = q.size(1);
         params.num_kv_heads = k.size(1);
         params.group_size = params.num_qo_heads / params.num_kv_heads;
@@ -142,10 +142,9 @@ void BatchPrefillWithRaggedKVCacheSM90Run(
 
         bool same_schedule_for_all_heads = plan_info.same_schedule_for_all_heads;
         DISPATCH_BOOL(same_schedule_for_all_heads, SAME_SCHEDULER_FOR_ALL_HEADS, [&] {
-          cudaError_t status =
-              BatchPrefillWithRaggedKVCacheDispatched<HEAD_DIM, MASK_MODE, USE_SLIDING_WINDOW,
-                                                      SAME_SCHEDULER_FOR_ALL_HEADS,
-                                                      AttentionVariant>(params, stream);
+          cudaError_t status = BatchPrefillWithRaggedKVCacheDispatched<
+              HEAD_DIM_QK, HEAD_DIM_VO, MASK_MODE, USE_SLIDING_WINDOW, SAME_SCHEDULER_FOR_ALL_HEADS,
+              AttentionVariant>(params, stream);
           TORCH_CHECK(status == cudaSuccess,
                       "BatchPrefillWithRaggedKVCacheSM90Run failed with error: ",
                       cudaGetErrorString(status));
@@ -171,7 +170,8 @@ void BatchPrefillWithPagedKVCacheSM90Run(
   }
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
   unsigned int num_kv_heads, page_size;
-  unsigned int head_dim = q.size(2);
+  unsigned int head_dim_qk = q.size(2);
+  unsigned int head_dim_vo = paged_v_cache.size(3);
   if (kv_layout == QKVLayout::kHND) {
     num_kv_heads = paged_k_cache.size(1);
     page_size = paged_k_cache.size(2);
@@ -191,8 +191,8 @@ void BatchPrefillWithPagedKVCacheSM90Run(
   bool use_swa = window_left != -1;
 
   DISPATCH_context(
-      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP,
-      AttentionVariant, RaggedParams, PagedParams, [&] {
+      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QO, HEAD_DIM_VO, USE_SLIDING_WINDOW,
+      USE_LOGITS_SOFT_CAP, AttentionVariant, RaggedParams, PagedParams, [&] {
         PagedParams params;
 
         params.q_ptr = static_cast<DTypeQ*>(q.data_ptr());
@@ -218,7 +218,6 @@ void BatchPrefillWithPagedKVCacheSM90Run(
           params.v_stride_n = paged_v_cache.stride(2);
         }
         params.nnz_qo = q.size(0);
-        params.head_dim = head_dim;
         params.num_qo_heads = q.size(1);
         params.num_kv_heads = num_kv_heads;
         params.group_size = params.num_qo_heads / num_kv_heads;
@@ -241,10 +240,9 @@ void BatchPrefillWithPagedKVCacheSM90Run(
 
         bool same_schedule_for_all_heads = plan_info.same_schedule_for_all_heads;
         DISPATCH_BOOL(same_schedule_for_all_heads, SAME_SCHEDULER_FOR_ALL_HEADS, [&] {
-          cudaError_t status =
-              BatchPrefillWithPagedKVCacheDispatched<HEAD_DIM, MASK_MODE, USE_SLIDING_WINDOW,
-                                                     SAME_SCHEDULER_FOR_ALL_HEADS,
-                                                     AttentionVariant>(params, stream);
+          cudaError_t status = BatchPrefillWithPagedKVCacheDispatched<
+              HEAD_DIM_QK, HEAD_DIM_VO, MASK_MODE, USE_SLIDING_WINDOW, SAME_SCHEDULER_FOR_ALL_HEADS,
+              AttentionVariant>(params, stream);
           TORCH_CHECK(status == cudaSuccess,
                       "BatchPrefillWithPagedKVCacheSM90Run failed with error: ",
                       cudaGetErrorString(status));
