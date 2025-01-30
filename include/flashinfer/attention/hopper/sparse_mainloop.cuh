@@ -75,7 +75,8 @@ struct SparseCollectiveMainloop {
                decltype(cute::get<1>(TileShape_QKD{})), HEAD_DIM_QK_POWER2>());
   static_assert(HEAD_DIM_QK_REM == 0 || HEAD_DIM_QK_REM % AlignmentKV == 0);
   using GmemTiledCopyKRem =
-      std::conditional_t<decltype(cutlass::gemm::collective::detail::make_simt_gmem_tiled_copy<
+      std::conditional_t<(HEAD_DIM_QK_REM > 0),
+                         decltype(cutlass::gemm::collective::detail::make_simt_gmem_tiled_copy<
                                   GmemCopyAtomKV, NUM_COPY_THREADS, AlignmentKV,
                                   cutlass::detail::TagToStrideB_t<cutlass::layout::ColumnMajor>,
                                   decltype(cute::get<1>(TileShape_QKD{})), HEAD_DIM_QK_REM>()),
@@ -231,7 +232,7 @@ struct SparseCollectiveMainloop {
     Tensor cK = cute::make_identity_tensor(gK.shape());
     Tensor cV = cute::make_identity_tensor(gV.shape());
 
-    GmemTiledCopyKPower2 gmem_tiled_copy_k_power2;
+    GmemTiledCopyKPower2 gmem_tiled_copy_k;
     GmemTiledCopyKRem gmem_tiled_copy_k_rem;
     GmemTiledCopyV gmem_tiled_copy_v;
     auto gmem_thr_copy_k = gmem_tiled_copy_k.get_slice(thread_idx);

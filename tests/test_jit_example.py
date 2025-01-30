@@ -481,14 +481,17 @@ def test_batch_prefill_flash_sigmoid():
 def test_batch_prefill_sm90_flash_sigmoid():
     torch.manual_seed(42)
     variant_decl = flash_sigmoid_sm90_decl
+    head_dim_qk = 192
+    head_dim_vo = 128
+
     jit_args = (
         "batch_prefill_flash_sigmoid",  # uri
         torch.float16,  # dtype_q
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
         torch.int32,  # idtype
-        192,  # head_dim_qk
-        128,  # head_dim_vo
+        head_dim_qk,  # head_dim_qk
+        head_dim_vo,  # head_dim_vo
         [],  # additional_tensor_names
         [],  # additional_tensor_dtypes
         ["logits_scale", "sigmoid_bias"],  # additional_scalar_names
@@ -515,9 +518,6 @@ def test_batch_prefill_sm90_flash_sigmoid():
 
     num_qo_heads = 32
     num_kv_heads = 32
-    head_dim_qk = 192
-    head_dim_vo = 128
-
     wrapper.plan(
         qo_indptr_host,
         kv_indptr_host,
@@ -539,7 +539,7 @@ def test_batch_prefill_sm90_flash_sigmoid():
     k = torch.randn(
         batch_size * seq_len_per_request,
         num_kv_heads,
-        head_dim_vo,
+        head_dim_qk,
         dtype=torch.float16,
         device="cuda",
     )

@@ -604,7 +604,7 @@ def single_prefill_with_kv_cache_with_jit_module(
         tmp = _get_cache_buf(
             "single_prefill_with_kv_cache_tmp", 32 * 1024 * 1024, device=device
         )
-        o = torch.empty_like(q)
+        o = torch.empty(q.shape[:-1] + v.shape[-1:], dtype=q.dtype, device=device)
         lse = None
         if return_lse:
             lse = torch.empty(
@@ -833,7 +833,7 @@ def single_prefill_with_kv_cache(
         )
     module_getter = get_single_prefill_module(backend)
 
-    out = torch.empty_like(q)
+    out = torch.empty(q.shape[:-1] + v.shape[-1:], dtype=q.dtype, device=q.device)
     module_getter(
         q.dtype,
         k.dtype,
@@ -1417,7 +1417,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if page_size != 1:
                 vector_sparse_indptr_host = torch.cat(
                     [
-                        torch.tensor([0], dtype=torch.int32, device=kv_lens_arr_host.device),
+                        torch.tensor(
+                            [0], dtype=torch.int32, device=kv_lens_arr_host.device
+                        ),
                         torch.cumsum(kv_lens_arr_host, dim=0, dtype=torch.int32),
                     ],
                     dim=0,
@@ -1860,8 +1862,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
         )
         self._pin_memory_int_workspace_buffer = torch.empty(
-            self._int_workspace_buffer.shape, dtype=torch.uint8,
-            pin_memory=True, device="cpu",
+            self._int_workspace_buffer.shape,
+            dtype=torch.uint8,
+            pin_memory=True,
+            device="cpu",
         )
         self._use_cuda_graph = use_cuda_graph
         if use_cuda_graph:
@@ -2241,7 +2245,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             lse = torch.empty(
                 (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
             )
-        out = torch.empty_like(q)
+        out = torch.empty(q.shape[:-1] + v.shape[-1:], dtype=q.dtype, device=q.device)
 
         if is_float8(q):
             logging.warning(

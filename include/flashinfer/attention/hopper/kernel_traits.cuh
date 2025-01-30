@@ -97,7 +97,7 @@ struct AttentionKernelTraits {
                                    decltype(cute::get<1>(TileShape_PDV{}))>());
   using SmemLayoutV = decltype(tile_to_shape(
       SmemLayoutAtomV{},
-      make_shape(get<1>(TileShape_QKD{}), get<1>(TileShape_PDV{}), Int<NUM_STAGES>{})));
+      make_shape(get<2>(TileShape_PDV{}), get<1>(TileShape_PDV{}), Int<NUM_STAGES>{})));
 
   // Note this is the transpose in terms of the view, not in terms of memory.
   using SmemLayoutVt = decltype(composition(
@@ -106,9 +106,9 @@ struct AttentionKernelTraits {
                                          Step<_2, _1, _3>{})));
 
   using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::ss_smem_selector<
-                                   GMMA::Major::K, DTypeO, decltype(cute::get<0>(TileShape_QKD{})),
-                                   decltype(cute::get<2>(TileShape_QKD{}))>());
-  using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtomO{}, select<0, 2>(TileShape_QKD{})));
+                                   GMMA::Major::K, DTypeO, decltype(cute::get<0>(TileShape_PDV{})),
+                                   decltype(cute::get<1>(TileShape_PDV{}))>());
+  using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtomO{}, select<0, 1>(TileShape_PDV{})));
   using MainloopPipeline =
       std::conditional_t<USE_TMA_LOAD_KV, typename cutlass::PipelineTmaAsync<NUM_STAGES>,
                          typename cutlass::PipelineAsync<NUM_STAGES>>;
