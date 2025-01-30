@@ -518,37 +518,34 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params& params, cudaStream_t 
     return cudaErrorNotSupported;  // Not supported yet.
   }
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
-  // if constexpr (HEAD_DIM_VO == 64) {
-  //   // NOTE(Zihao): CTA_KV not tuned for HEAD_DIM == 64, need to optimize later
-  //   BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
-  //       AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM_QK, HEAD_DIM_VO,
-  //                             /*CTA_Q_=*/192,
-  //                             /*CTA_KV_=*/96,
-  //                             /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename
-  //                             Params::DTypeKV, typename Params::DTypeO, typename Params::IdType,
-  //                             AttentionVariant>,
-  //       LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
-  // } else if constexpr (HEAD_DIM_VO == 128) {
-  //   BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
-  //       AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM_QK, HEAD_DIM_VO,
-  //                             /*CTA_Q_=*/128,
-  //                             /*CTA_KV_=*/96,
-  //                             /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename
-  //                             Params::DTypeKV, typename Params::DTypeO, typename Params::IdType,
-  //                             AttentionVariant>,
-  //       LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
-  // } else {
-  //   // HEAD_DIM == 256;
-  //   // NOTE(Zihao): CTA_KV not tuned for HEAD_DIM == 256, need to optimize later
-  //   BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
-  //       AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM_QK, HEAD_DIM_VO,
-  //                             /*CTA_Q_=*/128,
-  //                             /*CTA_KV_=*/32,
-  //                             /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename
-  //                             Params::DTypeKV, typename Params::DTypeO, typename Params::IdType,
-  //                             AttentionVariant>,
-  //       LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
-  // }
+  if constexpr (HEAD_DIM_VO == 64) {
+    // NOTE(Zihao): CTA_KV not tuned for HEAD_DIM == 64, need to optimize later
+    BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
+        AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM_QK, HEAD_DIM_VO,
+                              /*CTA_Q_=*/192,
+                              /*CTA_KV_=*/96,
+                              /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
+                              typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
+        LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
+  } else if constexpr (HEAD_DIM_VO == 128) {
+    BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
+        AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM_QK, HEAD_DIM_VO,
+                              /*CTA_Q_=*/128,
+                              /*CTA_KV_=*/96,
+                              /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
+                              typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
+        LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
+  } else {
+    // HEAD_DIM == 256;
+    // NOTE(Zihao): CTA_KV not tuned for HEAD_DIM == 256, need to optimize later
+    BatchPrefillWithPagedKVCacheKernelTraitsDispatched<
+        AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM_QK, HEAD_DIM_VO,
+                              /*CTA_Q_=*/128,
+                              /*CTA_KV_=*/32,
+                              /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
+                              typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
+        LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
+  }
   cudaError_t status = cudaGetLastError();
   return status;
 };
