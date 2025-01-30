@@ -82,6 +82,8 @@ struct CollectiveMainloop {
       static_cast<uint32_t>(size(SmemLayoutQ{}) * cutlass::sizeof_bits_v<DTypeQ> / 8);
   static constexpr uint32_t TmaTransactionBytesK =
       static_cast<uint32_t>(size(take<0, 2>(SmemLayoutK{})) * cutlass::sizeof_bits_v<DTypeKV> / 8);
+  static constexpr uint32_t TmaTransactionBytesV =
+      static_cast<uint32_t>(size(take<0, 2>(SmemLayoutV{})) * cutlass::sizeof_bits_v<DTypeKV> / 8);
 
   // Whether use scheduler barrier or hardware warp scheduler, using heuristic based on data type
   // and head dim

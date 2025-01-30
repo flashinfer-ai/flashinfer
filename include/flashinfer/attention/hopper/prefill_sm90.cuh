@@ -86,7 +86,6 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   pipeline_params.role = warp_group_idx == 0 ? MainloopPipeline::ThreadCategory::Producer
                                              : MainloopPipeline::ThreadCategory::Consumer;
   if constexpr (use_tma_load_kv) {
-    pipeline_params.transaction_bytes = CollectiveMainloop::TmaTransactionBytesK;
     pipeline_params.is_leader = warp_group_thread_idx == 0;
     pipeline_params.num_consumers = NUM_MMA_THREADS;
   } else {
@@ -101,6 +100,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();
   MainloopPipeline pipeline_k = [&] {
     if constexpr (use_tma_load_kv) {
+      pipeline_params.transaction_bytes = CollectiveMainloop::TmaTransactionBytesK;
       return MainloopPipeline(shared_storage.pipeline_k, pipeline_params,
                               /*cluster_shape=*/Shape<_1, _1, _1>{});
     } else {
@@ -110,6 +110,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
 
   MainloopPipeline pipeline_v = [&] {
     if constexpr (use_tma_load_kv) {
+      pipeline_params.transaction_bytes = CollectiveMainloop::TmaTransactionBytesV;
       return MainloopPipeline(shared_storage.pipeline_v, pipeline_params,
                               /*cluster_shape=*/Shape<_1, _1, _1>{});
     } else {
