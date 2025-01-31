@@ -279,7 +279,6 @@ cudaError_t SinglePrefillWithKVCacheKernelTraitsDispatched(Params& params, cudaS
       (void*)PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
                                       LEFT_SLIDING_WINDOW, CAUSAL, Scheduler>;
   int smem_size = sizeof(typename KernelTraits::SharedStorage);
-  std::cout << smem_size << std::endl;
   FLASHINFER_CUDA_CALL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 

@@ -104,16 +104,16 @@ CUTLASS_DEVICE void mma_f16(const Params& mainloop_params, AttentionVariant& var
                                         qo_head_idx, kv_head_idx);
       if constexpr (!CAUSAL) {  // Just masking based on col
         if (kv_idx >= kv_len) {
-          tSrS(i) = -math::inf;
+          tSrS(i) = AttentionUpdater::fill_value;
         }
       } else {
         if (kv_idx >= std::min(kv_len, col_limit_right(qo_idx))) {
-          tSrS(i) = -math::inf;
+          tSrS(i) = AttentionUpdater::fill_value;
         }
       }
       if constexpr (LEFT_SLIDING_WINDOW) {
         if (kv_idx < col_limit_left(qo_idx)) {
-          tSrS(i) = -math::inf;
+          tSrS(i) = AttentionUpdater::fill_value;
         }
       }
     }
@@ -151,11 +151,11 @@ CUTLASS_DEVICE void mma_f16(const Params& mainloop_params, AttentionVariant& var
       tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
                                         qo_head_idx, kv_head_idx);
       if (kv_idx >= col_limit_right(qo_idx)) {
-        tSrS(i) = -math::inf;
+        tSrS(i) = AttentionUpdater::fill_value;
       }
       if constexpr (LEFT_SLIDING_WINDOW) {
         if (kv_idx < col_limit_left(qo_idx)) {
-          tSrS(i) = -math::inf;
+          tSrS(i) = AttentionUpdater::fill_value;
         }
       }
     }
@@ -227,7 +227,7 @@ CUTLASS_DEVICE void mma_f16(const Params& mainloop_params, AttentionVariant& var
         tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
                                           qo_head_idx, kv_head_idx);
         if (kv_idx < col_limit_left(qo_idx)) {
-          tSrS(i) = -math::inf;
+          tSrS(i) = AttentionUpdater::fill_value;
         }
       }
       attention_updater.update</*init=*/false>(tSrS);

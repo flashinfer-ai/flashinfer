@@ -2255,7 +2255,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             logits_soft_cap = 0.0
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
-        print(sm_scale)
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
