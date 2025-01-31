@@ -41,7 +41,7 @@ def get_cu_file_str(
     def get_insts(attention_variant, dtype_out):
         return "\n".join(
             [
-                """template cudaError_t BatchPrefillWithRaggedKVCacheDispatched<{cta_tile_q}, {head_dim}, {pos_encoding_mode}, {use_fp16_qk_reduction}, {mask_mode}, {attention_variant}, Params>(
+                """template cudaError_t BatchPrefillWithRaggedKVCacheDispatched<{cta_tile_q}, {head_dim}, {head_dim}, {pos_encoding_mode}, {use_fp16_qk_reduction}, {mask_mode}, {attention_variant}, Params>(
     Params params,
     {dtype_out}* tmp_v,
     float* tmp_s, cudaStream_t stream);

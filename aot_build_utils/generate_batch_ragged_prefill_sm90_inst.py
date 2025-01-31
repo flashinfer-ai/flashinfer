@@ -41,6 +41,7 @@ def get_cu_file_str(
         return """
 template cudaError_t BatchPrefillWithRaggedKVCacheDispatched
     <{head_dim},
+     {head_dim},
      {mask_mode},
      /*USE_SLIDING_WINDOW=*/true,
      /*SAME_SCHEDULE_FOR_ALL_HEADS=*/true,
@@ -49,6 +50,7 @@ template cudaError_t BatchPrefillWithRaggedKVCacheDispatched
 
 template cudaError_t BatchPrefillWithRaggedKVCacheDispatched
     <{head_dim},
+     {head_dim},
      {mask_mode},
      /*USE_SLIDING_WINDOW=*/true,
      /*SAME_SCHEDULE_FOR_ALL_HEADS=*/false,
@@ -57,6 +59,7 @@ template cudaError_t BatchPrefillWithRaggedKVCacheDispatched
 
 template cudaError_t BatchPrefillWithRaggedKVCacheDispatched
     <{head_dim},
+     {head_dim},
      {mask_mode},
      /*USE_SLIDING_WINDOW=*/false,
      /*SAME_SCHEDULE_FOR_ALL_HEADS=*/true,
@@ -65,6 +68,7 @@ template cudaError_t BatchPrefillWithRaggedKVCacheDispatched
 
 template cudaError_t BatchPrefillWithRaggedKVCacheDispatched
     <{head_dim},
+     {head_dim},
      {mask_mode},
      /*USE_SLIDING_WINDOW=*/false,
      /*SAME_SCHEDULE_FOR_ALL_HEADS=*/false,

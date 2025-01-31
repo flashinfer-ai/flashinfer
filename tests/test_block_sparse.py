@@ -127,3 +127,4 @@ def test_block_sparse_attention(
 
 if __name__ == "__main__":
     test_block_sparse_attention(1, 1, 64, 64, 1, 1, 128, False)
+    test_block_sparse_attention(16, 16, 256, 256, 16, 16, 256, True)

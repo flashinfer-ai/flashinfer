@@ -59,6 +59,7 @@ struct SparseCollectiveMainloop {
   static constexpr int NUM_STAGES = Ktraits::NUM_STAGES;
   static constexpr int HEAD_DIM_QK = Ktraits::HEAD_DIM_QK;
   static constexpr int HEAD_DIM_VO = Ktraits::HEAD_DIM_VO;
+  static_assert(HEAD_DIM_QK == HEAD_DIM_VO);
   static constexpr int NUM_COPY_THREADS = cutlass::NumThreadsPerWarpGroup;
 
   using GmemTiledCopyQ = cute::SM90_TMA_LOAD;
@@ -70,8 +71,9 @@ struct SparseCollectiveMainloop {
       decltype(cutlass::gemm::collective::detail::make_simt_gmem_tiled_copy<
                GmemCopyAtomKV, NUM_COPY_THREADS, AlignmentKV,
                cutlass::detail::TagToStrideB_t<cutlass::layout::ColumnMajor>,
-               decltype(cute::get<1>(TileShape_QKD{})), cute::Int<nextPowerOfTwo(HEAD_DIM_QK)>>());
+               decltype(cute::get<1>(TileShape_QKD{})), decltype(cute::get<2>(TileShape_QKD{}))>());
   static constexpr bool IsFullLoadK = nextPowerOfTwo(HEAD_DIM_QK) == HEAD_DIM_QK;
+  // static constexpr bool IsFullLoadK = false;
   static constexpr bool IsFullLoadV = true;
   using GmemTiledCopyV =
       decltype(cutlass::gemm::collective::detail::make_simt_gmem_tiled_copy<
@@ -212,15 +214,17 @@ struct SparseCollectiveMainloop {
     constexpr int CTA_KV = get<1>(TileShape_QKD{});
     auto indexed_gather = BlockSparseIndexedGather<IdType>(mainloop_params.kv_indices + kv_indptr);
 
-    Tensor mK = make_block_sparse_tensor(  // (kv_len, D)
+    Tensor mK = make_block_sparse_tensor(  // (kv_len, D_K)
         make_gmem_ptr(mainloop_params.K_ptr + kv_head_idx * stride<2>(mainloop_params.layout_K)),
         make_shape(kv_len, HEAD_DIM_QK), stride<0>(mainloop_params.layout_K), indexed_gather);
-    Tensor mV = make_block_sparse_tensor(  // (kv_len, D)
+    Tensor mV = make_block_sparse_tensor(  // (kv_len, D_V)
         make_gmem_ptr(mainloop_params.V_ptr + kv_head_idx * stride<2>(mainloop_params.layout_V)),
         make_shape(kv_len, HEAD_DIM_VO), stride<0>(mainloop_params.layout_V), indexed_gather);
 
-    Tensor gK = local_tile(mK, select<1, 2>(TileShape_QKD{}), make_coord(_, _0{}));  // (KV, D, kv)
-    Tensor gV = local_tile(mV, select<2, 1>(TileShape_PDV{}), make_coord(_, _0{}));  // (KV, D, kv)
+    Tensor gK =
+        local_tile(mK, select<1, 2>(TileShape_QKD{}), make_coord(_, _0{}));  // (KV, D_K, kv)
+    Tensor gV =
+        local_tile(mV, select<2, 1>(TileShape_PDV{}), make_coord(_, _0{}));  // (KV, D_V, kv)
     Tensor cK = cute::make_identity_tensor(gK.shape());
     Tensor cV = cute::make_identity_tensor(gV.shape());
 
@@ -241,10 +245,10 @@ struct SparseCollectiveMainloop {
     int valid_last_kv_tile_size = std::min<int>(kv_len - kv_tile_idx * CTA_KV, CTA_KV);
     auto k_predicate_fn = [&](auto coords) {
       auto s_coords = tKcKGroup(_0{}, coords);
-      if constexpr (!IsFullLoadK) {
-        return elem_less(get<0>(s_coords), valid_last_kv_tile_size) &&
-               elem_less(get<1>(s_coords), HEAD_DIM_QK);
-      }
+      // if constexpr (!IsFullLoadK) {
+      //   return elem_less(get<0>(s_coords), valid_last_kv_tile_size) &&
+      //          elem_less(get<1>(s_coords), HEAD_DIM_QK);
+      // }
       return elem_less(get<0>(s_coords), valid_last_kv_tile_size);
     };
     auto v_predicate_fn = [&](auto coords) {
@@ -252,8 +256,9 @@ struct SparseCollectiveMainloop {
       return elem_less(get<0>(s_coords), valid_last_kv_tile_size);
     };
     auto k_predicate_head_dim_fn = [&](auto coords) {
-      auto s_coords = tKcKGroup(_0{}, coords);
-      return elem_less(get<1>(s_coords), HEAD_DIM_QK);
+      // auto s_coords = tKcKGroup(_0{}, coords);
+      // return elem_less(get<1>(s_coords), HEAD_DIM_QK);
+      return true;
     };
 
     // load last k-tile

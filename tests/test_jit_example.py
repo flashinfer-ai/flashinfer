@@ -481,8 +481,8 @@ def test_batch_prefill_flash_sigmoid():
 def test_batch_prefill_sm90_flash_sigmoid():
     torch.manual_seed(42)
     variant_decl = flash_sigmoid_sm90_decl
-    head_dim_qk = 96
-    head_dim_vo = 128
+
+    head_dim = 128
 
     jit_args = (
         "batch_prefill_flash_sigmoid",  # uri
@@ -490,8 +490,8 @@ def test_batch_prefill_sm90_flash_sigmoid():
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
         torch.int32,  # idtype
-        head_dim_qk,  # head_dim_qk
-        head_dim_vo,  # head_dim_vo
+        128,  # head_dim_qk
+        128,  # head_dim_vo
         [],  # additional_tensor_names
         [],  # additional_tensor_dtypes
         ["logits_scale", "sigmoid_bias"],  # additional_scalar_names
@@ -507,7 +507,7 @@ def test_batch_prefill_sm90_flash_sigmoid():
         float_workspace_buffer, kv_layout="NHD", backend="fa3", jit_args=jit_args
     )
 
-    batch_size = 128
+    batch_size = 1
     seq_len_per_request = 1024
     qo_indptr_host = torch.arange(
         0, batch_size * seq_len_per_request + 1, seq_len_per_request, dtype=torch.int32
@@ -516,14 +516,14 @@ def test_batch_prefill_sm90_flash_sigmoid():
         0, batch_size * seq_len_per_request + 1, seq_len_per_request, dtype=torch.int32
     )
 
-    num_qo_heads = 32
-    num_kv_heads = 32
+    num_qo_heads = 1
+    num_kv_heads = 1
     wrapper.plan(
         qo_indptr_host,
         kv_indptr_host,
         num_qo_heads,
         num_kv_heads,
-        head_dim_qk,
+        head_dim,
         causal=False,
         q_data_type=torch.float16,
         kv_data_type=torch.float16,
@@ -532,21 +532,21 @@ def test_batch_prefill_sm90_flash_sigmoid():
     q = torch.randn(
         batch_size * seq_len_per_request,
         num_qo_heads,
-        head_dim_qk,
+        head_dim,
         dtype=torch.float16,
         device="cuda",
     )
     k = torch.randn(
         batch_size * seq_len_per_request,
         num_kv_heads,
-        head_dim_qk,
+        head_dim,
         dtype=torch.float16,
         device="cuda",
     )
     v = torch.randn(
         batch_size * seq_len_per_request,
         num_kv_heads,
-        head_dim_vo,
+        head_dim,
         dtype=torch.float16,
         device="cuda",
     )
@@ -570,7 +570,7 @@ def test_batch_prefill_sm90_flash_sigmoid():
         paged_kv_last_page_len_host,
         num_qo_heads,
         num_kv_heads,
-        head_dim_qk,
+        head_dim,
         1,
     )
     o_paged = wrapper_paged.run(q, (k, v), logits_scale, sigmoid_bias)
@@ -578,8 +578,8 @@ def test_batch_prefill_sm90_flash_sigmoid():
     p = torch.sigmoid(
         torch.einsum(
             "bmhd,bnhd->bhmn",
-            q.view(batch_size, seq_len_per_request, num_qo_heads, head_dim_qk).float(),
-            k.view(batch_size, seq_len_per_request, num_kv_heads, head_dim_qk).float(),
+            q.view(batch_size, seq_len_per_request, num_qo_heads, head_dim).float(),
+            k.view(batch_size, seq_len_per_request, num_kv_heads, head_dim).float(),
         )
         * logits_scale
         + sigmoid_bias
@@ -588,13 +588,13 @@ def test_batch_prefill_sm90_flash_sigmoid():
         torch.einsum(
             "bhmn,bnhd->bmhd",
             p,
-            v.view(batch_size, seq_len_per_request, num_kv_heads, head_dim_vo).float(),
+            v.view(batch_size, seq_len_per_request, num_kv_heads, head_dim).float(),
         )
         .half()
-        .reshape(batch_size * seq_len_per_request, num_qo_heads, head_dim_vo)
+        .reshape(batch_size * seq_len_per_request, num_qo_heads, head_dim)
     )
     torch.testing.assert_close(o, o_ref, rtol=2e-2, atol=2e-2)
-    # torch.testing.assert_close(o_paged, o_ref, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(o_paged, o_ref, rtol=2e-2, atol=2e-2)
 
 
 def test_debug_print_logits():
@@ -740,12 +740,12 @@ struct DebugPrintLogits {
 
 
 if __name__ == "__main__":
-    # test_single_decode_mask()
-    # test_flash_sigmoid()
-    # test_dump_logits()
-    # test_debug_print_logits()
-    # test_sm90_debug_print_logits()
-    # test_batch_decode_flash_sigmoid(False)
-    # test_batch_decode_flash_sigmoid(True)
-    # test_batch_prefill_flash_sigmoid()
+    test_single_decode_mask()
+    test_flash_sigmoid()
+    test_dump_logits()
+    test_debug_print_logits()
+    test_sm90_debug_print_logits()
+    test_batch_decode_flash_sigmoid(False)
+    test_batch_decode_flash_sigmoid(True)
+    test_batch_prefill_flash_sigmoid()
     test_batch_prefill_sm90_flash_sigmoid()

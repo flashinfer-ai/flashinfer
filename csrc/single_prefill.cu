@@ -22,8 +22,9 @@
 
 namespace flashinfer {
 
-template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION,
-          MaskMode MASK_MODE, typename AttentionVariant, typename Params>
+template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODING_MODE,
+          bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant,
+          typename Params>
 cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::DTypeO* tmp,
                                                cudaStream_t stream);
 
@@ -67,8 +68,9 @@ void single_prefill_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
 
   DISPATCH_context(
-      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM, POS_ENCODING_MODE, USE_SLIDING_WINDOW,
-      USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, AttentionVariant, Params, [&] {
+      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
+      USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, AttentionVariant, Params,
+      [&] {
         Params params;
 
         params.q = static_cast<DTypeQ*>(q.data_ptr());
@@ -91,7 +93,7 @@ void single_prefill_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::
         ADDITIONAL_PARAMS_SETTER
 
         cudaError_t status = flashinfer::SinglePrefillWithKVCacheDispatched<
-            HEAD_DIM, POS_ENCODING_MODE,
+            HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
             /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant>(
             params, static_cast<DTypeO*>(tmp.data_ptr()), stream);
         TORCH_CHECK(status == cudaSuccess,

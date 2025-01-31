@@ -23,15 +23,15 @@
 
 namespace flashinfer {
 
-template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
-          bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant,
-          typename Params>
+template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+          PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
+          typename AttentionVariant, typename Params>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
                                                    float* tmp_s, cudaStream_t stream);
 
-template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
-          bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant,
-          typename Params>
+template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+          PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
+          typename AttentionVariant, typename Params>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
                                                     float* tmp_s, cudaStream_t stream);
 
@@ -105,8 +105,9 @@ void BatchPrefillWithRaggedKVCacheRun(
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
 
   DISPATCH_context(
-      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM, POS_ENCODING_MODE, USE_SLIDING_WINDOW,
-      USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, AttentionVariant, RaggedParams, PagedParams, [&] {
+      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
+      USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, AttentionVariant,
+      RaggedParams, PagedParams, [&] {
         RaggedParams params;
 
         params.q = static_cast<DTypeQ*>(q.data_ptr());
@@ -171,7 +172,7 @@ void BatchPrefillWithRaggedKVCacheRun(
 
         DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
           status = flashinfer::BatchPrefillWithRaggedKVCacheDispatched<
-              CTA_TILE_Q, HEAD_DIM, POS_ENCODING_MODE,
+              CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
               /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant,
               RaggedParams>(params, tmp_v, tmp_s, stream);
         });
@@ -232,13 +233,14 @@ void BatchPrefillWithPagedKVCacheRun(
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
 
   DISPATCH_context(
-      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM, POS_ENCODING_MODE, USE_SLIDING_WINDOW,
-      USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, AttentionVariant, RaggedParams, PagedParams, [&] {
+      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
+      USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, AttentionVariant,
+      RaggedParams, PagedParams, [&] {
         PagedParams params;
 
         params.q = static_cast<DTypeQ*>(q.data_ptr());
         paged_kv_t<DTypeKV, IdType> paged_kv(
-            num_kv_heads, page_size, HEAD_DIM, batch_size, kv_layout,
+            num_kv_heads, page_size, HEAD_DIM_VO, batch_size, kv_layout,
             static_cast<DTypeKV*>(paged_k_cache.data_ptr()),
             static_cast<DTypeKV*>(paged_v_cache.data_ptr()), kv_cache_strides,
             static_cast<IdType*>(paged_kv_indices.data_ptr()),
@@ -301,7 +303,7 @@ void BatchPrefillWithPagedKVCacheRun(
 
         DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
           status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
-              CTA_TILE_Q, HEAD_DIM, POS_ENCODING_MODE,
+              CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
               /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant,
               PagedParams>(params, tmp_v, tmp_s, stream);
         });

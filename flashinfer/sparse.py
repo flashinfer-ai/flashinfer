@@ -397,7 +397,8 @@ class BlockSparseAttentionWrapper:
                 kv_data_type,
                 q_data_type,
                 indptr.dtype,
-                head_dim,
+                head_dim,  # head_dim_qk
+                head_dim,  # head_dim_vo
                 PosEncodingMode[pos_encoding_mode].value,
                 False,  # use_sliding_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
@@ -583,8 +584,8 @@ class BlockSparseAttentionWrapper:
                 self._paged_kv_indptr_buf,
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len,
-                lse,
                 out,
+                lse,
                 TensorLayout[self._kv_layout].value,
                 -1,  # window_left
                 _get_cache_alibi_slopes_buf(q.shape[1], self.device),

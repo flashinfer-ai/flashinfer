@@ -306,7 +306,7 @@ cudaError_t SinglePrefillWithKVCacheCustomMask(
                           qo_stride_n, qo_stride_h, kv_stride_n, kv_stride_h, head_dim,
                           /*window_left=*/-1,
                           /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta);
-            return SinglePrefillWithKVCacheDispatched<HEAD_DIM, POS_ENCODING_MODE,
+            return SinglePrefillWithKVCacheDispatched<HEAD_DIM, HEAD_DIM, POS_ENCODING_MODE,
                                                       USE_FP16_QK_REDUCTION, MaskMode::kCustom,
                                                       AttentionVariant>(params, tmp, stream);
           })})});
@@ -368,7 +368,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeO* 
                               qo_stride_n, qo_stride_h, kv_stride_n, kv_stride_h, head_dim,
                               /*window_left=*/-1,
                               /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta);
-                return SinglePrefillWithKVCacheDispatched<HEAD_DIM, POS_ENCODING_MODE,
+                return SinglePrefillWithKVCacheDispatched<HEAD_DIM, HEAD_DIM, POS_ENCODING_MODE,
                                                           USE_FP16_QK_REDUCTION, MASK_MODE,
                                                           AttentionVariant, Params>(params, tmp,
                                                                                     stream);
