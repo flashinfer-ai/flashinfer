@@ -1290,6 +1290,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
+        if head_dim_vo is None:
+            head_dim_vo = head_dim_qk
 
         batch_size = len(qo_indptr) - 1
         if custom_mask is not None or packed_custom_mask is not None:

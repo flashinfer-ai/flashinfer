@@ -435,6 +435,27 @@ cudaError_t BatchPrefillWithRaggedKVCacheKernelTraitsDispatched(Params& params,
   return cudaSuccess;
 }
 
+template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, bool CAUSAL>
+constexpr auto getCTATileSize() {
+  if constexpr (HEAD_DIM_QK == HEAD_DIM_VO) {
+    if constexpr (HEAD_DIM_QK == 64) {
+      return std::make_tuple(192, 128);
+    } else if constexpr (HEAD_DIM_QK == 128) {
+      if constexpr (CAUSAL) {
+        return std::make_tuple(128, 128);
+      } else {
+        return std::make_tuple(128, 192);
+      }
+    } else {
+      return std::make_tuple(128, 64);
+    }
+  }
+
+  // NOTE(Zihao) hack for deepseek prefill
+  static_assert(HEAD_DIM_QK == 192 && HEAD_DIM_VO == 128);
+  return std::make_tuple(128, 128);
+}
+
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
           typename AttentionVariant, typename Params>
 cudaError_t SinglePrefillWithKVCacheDispatched(Params& params, cudaStream_t stream) {
@@ -443,32 +464,14 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params& params, cudaStream_t stre
     return cudaErrorNotSupported;  // Not supported yet.
   }
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
-  if constexpr (HEAD_DIM_VO == 64) {
-    SinglePrefillWithKVCacheKernelTraitsDispatched<
-        AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
-                              /*CTA_Q_=*/192,
-                              /*CTA_KV_=*/128,
-                              /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
-                              typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
-        LEFT_SLIDING_WINDOW, CAUSAL>(params, stream);
-  } else if constexpr (HEAD_DIM_VO == 128) {
-    SinglePrefillWithKVCacheKernelTraitsDispatched<
-        AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
-                              /*CTA_Q_=*/128,
-                              /*CTA_KV_=*/128,
-                              /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
-                              typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
-        LEFT_SLIDING_WINDOW, CAUSAL>(params, stream);
-  } else {
-    // HEAD_DIM == 256;
-    SinglePrefillWithKVCacheKernelTraitsDispatched<
-        AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
-                              /*CTA_Q_=*/128,
-                              /*CTA_KV_=*/64,
-                              /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
-                              typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
-        LEFT_SLIDING_WINDOW, CAUSAL>(params, stream);
-  }
+  constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL>();
+  SinglePrefillWithKVCacheKernelTraitsDispatched<
+      AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
+                            /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
+                            /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
+                            /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
+                            typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
+      LEFT_SLIDING_WINDOW, CAUSAL>(params, stream);
   cudaError_t status = cudaGetLastError();
   return status;
 }
@@ -481,32 +484,14 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params& params, cudaStream_t
     return cudaErrorNotSupported;  // Not supported yet.
   }
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
-  if constexpr (HEAD_DIM_VO == 64) {
-    BatchPrefillWithRaggedKVCacheKernelTraitsDispatched<
-        AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
-                              /*CTA_Q_=*/192,
-                              /*CTA_KV_=*/128,
-                              /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
-                              typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
-        LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
-  } else if constexpr (HEAD_DIM_VO == 128) {
-    BatchPrefillWithRaggedKVCacheKernelTraitsDispatched<
-        AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
-                              /*CTA_Q_=*/128,
-                              /*CTA_KV_=*/128,
-                              /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
-                              typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
-        LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
-  } else {
-    // HEAD_DIM == 256;
-    BatchPrefillWithRaggedKVCacheKernelTraitsDispatched<
-        AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
-                              /*CTA_Q_=*/128,
-                              /*CTA_KV_=*/64,
-                              /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
-                              typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
-        LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
-  }
+  constexpr auto CTA_TILE_SIZE = getCTATileSize<HEAD_DIM_QK, HEAD_DIM_VO, CAUSAL>();
+  BatchPrefillWithRaggedKVCacheKernelTraitsDispatched<
+      AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM_QK, HEAD_DIM_VO,
+                            /*CTA_Q_=*/get<0>(CTA_TILE_SIZE),
+                            /*CTA_KV_=*/get<1>(CTA_TILE_SIZE),
+                            /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
+                            typename Params::DTypeO, typename Params::IdType, AttentionVariant>,
+      LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
   cudaError_t status = cudaGetLastError();
   return status;
 }
