@@ -60,7 +60,8 @@ struct SingleDecodeWithCustomMask {
         torch.float16,  # dtype_q
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
-        128,  # head_dim
+        128,  # head_dim_qk
+        128,  # head_dim_vo
         ["custom_mask"],  # additional_tensor_names
         ["uint8_t"],  # additional_tensor_dtypes
         ["sm_scale"],  # # additional_scalar_names
@@ -158,7 +159,8 @@ def test_flash_sigmoid():
         torch.float16,  # dtype_q
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
-        128,  # hidden_dim
+        128,  # head_dim_qk
+        128,  # head_dim_vo
         [],  # additional_tensor_names
         [],  # additional_tensor_dtypes
         ["logits_scale", "sigmoid_bias"],  # additional_scalar_names
@@ -229,7 +231,8 @@ struct DumpLogits {
         torch.float16,  # dtype_q
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
-        128,  # hidden_dim
+        128,  # head_dim_qk
+        128,  # head_dim_vo
         ["output_logits"],  # additional_tensor_names
         ["float"],  # additional_tensor_dtypes
         ["sm_scale"],  # additional_scalar_names
@@ -263,7 +266,8 @@ def test_batch_decode_flash_sigmoid(use_tensor_cores):
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
         torch.int32,  # idtype
-        128,  # hidden_dim
+        128,  # hidden_dim_qk
+        128,  # hidden_dim_vo
         [],  # additional_tensor_names
         [],  # additional_tensor_dtypes
         ["logits_scale", "sigmoid_bias"],  # additional_scalar_names
@@ -369,7 +373,8 @@ def test_batch_prefill_flash_sigmoid():
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
         torch.int32,  # idtype
-        128,  # hidden_dim
+        128,  # hidden_dim_qk
+        128,  # hidden_dim_vo
         [],  # additional_tensor_names
         [],  # additional_tensor_dtypes
         ["logits_scale", "sigmoid_bias"],  # additional_scalar_names
@@ -487,7 +492,8 @@ def test_batch_prefill_sm90_flash_sigmoid():
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
         torch.int32,  # idtype
-        128,  # hidden_dim
+        128,  # hidden_dim_qk
+        128,  # hidden_dim_vo
         [],  # additional_tensor_names
         [],  # additional_tensor_dtypes
         ["logits_scale", "sigmoid_bias"],  # additional_scalar_names
@@ -552,6 +558,7 @@ def test_batch_prefill_sm90_flash_sigmoid():
     sigmoid_bias = 0.25
 
     o = wrapper.run(q, k, v, logits_scale, sigmoid_bias)
+    print(o)
     wrapper_paged = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         float_workspace_buffer, kv_layout="NHD", backend="fa3", jit_args=jit_args
     )
@@ -642,7 +649,8 @@ struct DebugPrintLogits {
         torch.float16,  # dtype_q
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
-        128,  # hidden_dim
+        128,  # hidden_dim_qk
+        128,  # hidden_dim_vo
         [],  # additional_tensor_names
         [],  # additional_tensor_dtypes
         ["sm_scale"],  # additional_scalar_names
@@ -715,7 +723,8 @@ struct DebugPrintLogits {
         torch.float16,  # dtype_q
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
-        128,  # hidden_dim
+        128,  # hidden_dim_qk
+        128,  # hidden_dim_vo
         [],  # additional_tensor_names
         [],  # additional_tensor_dtypes
         ["sm_scale"],  # additional_scalar_names

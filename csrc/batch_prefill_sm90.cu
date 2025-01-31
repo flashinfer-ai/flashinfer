@@ -42,7 +42,8 @@ std::vector<int64_t> BatchPrefillWithKVCacheSM90Plan(
     at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr, at::Tensor kv_indptr,
     at::Tensor kv_len_arr, unsigned total_num_rows, unsigned int batch_size,
     unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int page_size,
-    bool enable_cuda_graph, unsigned int head_dim, bool causal, int64_t cuda_stream) {
+    bool enable_cuda_graph, unsigned int head_dim_qk, unsigned int head_dim_vo, bool causal,
+    int64_t cuda_stream) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =
@@ -57,8 +58,8 @@ std::vector<int64_t> BatchPrefillWithKVCacheSM90Plan(
                       int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
                       int_workspace_size_in_bytes, plan_info, qo_indptr.data_ptr<IdType>(),
                       kv_indptr.data_ptr<IdType>(), kv_len_arr.data_ptr<IdType>(), total_num_rows,
-                      batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, causal,
-                      enable_cuda_graph, /*sizeof_dtype_o=*/2, stream);
+                      batch_size, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
+                      causal, enable_cuda_graph, /*sizeof_dtype_o=*/2, stream);
 
   TORCH_CHECK(status == cudaSuccess,
               "PrefillSM90Plan failed with error: ", cudaGetErrorString(status));

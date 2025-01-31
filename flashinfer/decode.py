@@ -489,7 +489,8 @@ def single_decode_with_kv_cache(
             q.dtype,
             k.dtype,
             q.dtype,
-            head_dim,
+            head_dim,  # head_dim_qk
+            head_dim,  # head_dim_vo
             PosEncodingMode[pos_encoding_mode].value,
             window_left != -1,  # use_sliding_window
             logits_soft_cap > 0,  # use_logits_soft_cap
@@ -889,6 +890,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     page_size,
                     self.is_cuda_graph_enabled,
                     head_dim,
+                    head_dim,
                     False,  # causal
                     get_cuda_stream(device),
                 )
@@ -902,6 +904,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     q_data_type,
                     indptr.dtype,
                     head_dim,  # head_dim_qk
+                    head_dim,  # head_dim_vo
                     PosEncodingMode[pos_encoding_mode].value,
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
@@ -919,6 +922,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     self.is_cuda_graph_enabled,
                     window_left,
                     logits_soft_cap,
+                    head_dim,
                     head_dim,
                     torch.empty(0, dtype=q_data_type),
                     torch.empty(0, dtype=kv_data_type),

@@ -1451,6 +1451,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 num_kv_heads,
                 page_size,
                 self.is_cuda_graph_enabled,
+                head_dim_qk,
                 head_dim_vo,
                 causal,
                 get_cuda_stream(device),
@@ -2148,6 +2149,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 num_kv_heads,
                 1,  # page_size
                 self.is_cuda_graph_enabled,
+                head_dim_qk,
                 head_dim_vo,
                 causal,
                 get_cuda_stream(device),
@@ -2253,6 +2255,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             logits_soft_cap = 0.0
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.size(-1))
+        print(sm_scale)
         if rope_scale is None:
             rope_scale = 1.0
         if rope_theta is None:
