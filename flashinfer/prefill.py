@@ -1179,8 +1179,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         paged_kv_last_page_len: torch.Tensor,
         num_qo_heads: int,
         num_kv_heads: int,
-        head_dim: int,
+        head_dim_qk: int,
         page_size: int,
+        head_dim_vo: Optional[int] = None,
         custom_mask: Optional[torch.Tensor] = None,
         packed_custom_mask: Optional[torch.Tensor] = None,
         causal: bool = False,
@@ -1212,10 +1213,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The number of query/output heads.
         num_kv_heads : int
             The number of key/value heads.
-        head_dim : int
-            The dimension of the heads.
+        head_dim_qk : int
+            The dimension of the query/key heads.
         page_size : int
             The size of each page in the paged kv-cache.
+        head_dim_vo : Optional[int]
+            The dimension of the value/output heads, if not provided, will be set to
+            ``head_dim_qk``.
         custom_mask : Optional[torch.Tensor]
             The flattened boolean mask tensor, shape: ``(sum(q_len[i] * k_len[i] for i in range(batch_size))``.
             The elements in the mask tensor should be either ``True`` or ``False``,
@@ -1403,7 +1407,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 kv_data_type,
                 q_data_type,
                 paged_kv_indptr.dtype,
-                head_dim,
+                head_dim_qk,
+                head_dim_vo,
                 PosEncodingMode[pos_encoding_mode].value,
                 window_left >= 0,  # use_sliding_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
@@ -1444,7 +1449,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 num_kv_heads,
                 page_size,
                 self.is_cuda_graph_enabled,
-                head_dim,
+                head_dim_vo,
                 causal,
                 get_cuda_stream(device),
             )
@@ -2029,6 +2034,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        if head_dim_vo is None:
+            head_dim_vo = head_dim_qk
 
         if logits_soft_cap is None:
             logits_soft_cap = 0.0

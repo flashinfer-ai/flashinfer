@@ -20,13 +20,69 @@ import torch
 import flashinfer
 
 
+@pytest.mark.parametrize("kv_len", [5532, 7563])
+@pytest.mark.parametrize("qo_len", [1832, 3928])
+@pytest.mark.parametrize("num_kv_heads", [4, 32])
+@pytest.mark.parametrize("num_qo_heads", [32])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+def test_single_prefill_with_kv_cache(
+    kv_len,
+    qo_len,
+    num_kv_heads,
+    num_qo_heads,
+    causal,
+    backend,
+):
+    head_dim_qk = 192
+    head_dim_vo = 128
+    q = torch.randn(qo_len, num_qo_heads, head_dim_qk).to(0).half()
+    k = torch.zeros(kv_len, num_kv_heads, head_dim_qk).to(0).half()
+    v = torch.randn(kv_len, num_kv_heads, head_dim_vo).to(0).half()
+
+    o = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=causal, backend=backend)
+
+    sm_scale = 1.0 / (head_dim_qk**0.5)
+
+    if num_qo_heads != num_kv_heads:
+        k = k.repeat_interleave(num_qo_heads // num_kv_heads, dim=1)
+        v = v.repeat_interleave(num_qo_heads // num_kv_heads, dim=1)
+
+    logits = (
+        torch.einsum(
+            "mhd,nhd->mn",
+            q.float(),
+            k.float(),
+        )
+        * sm_scale
+    )
+
+    if causal:
+        mask = (
+            torch.arange(kv_len - qo_len, kv_len).unsqueeze(1)
+            >= torch.arange(0, kv_len).unsqueeze(0)
+        ).to(q.device)
+    else:
+        mask = torch.ones(qo_len, kv_len).to(q.device)
+
+    logits = logits.masked_fill(mask.unsqueeze(0) == 0, float("-inf"))
+    p = torch.softmax(logits, dim=-1)
+    o_ref = torch.einsum(
+        "hmn,nhd->mhd",
+        p,
+        v.float(),
+    ).to(q)
+
+    torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
+
+
 @pytest.mark.parametrize("batch_size", [12, 17])
 @pytest.mark.parametrize("kv_len", [54, 97])
 @pytest.mark.parametrize("qo_len", [37, 17])
-@pytest.mark.parametrize("num_kv_heads", [4])
-@pytest.mark.parametrize("num_qo_heads", [4, 32])
+@pytest.mark.parametrize("num_kv_heads", [4, 32])
+@pytest.mark.parametrize("num_qo_heads", [32])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("backend", ["fa2"])  # ["fa2", "fa3"])
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
 def test_batch_prefill_with_ragged_kv_cache(
     batch_size,
     kv_len,
@@ -62,11 +118,14 @@ def test_batch_prefill_with_ragged_kv_cache(
     o = wrapper.run(q, k, v)
 
     sm_scale = 1.0 / (head_dim_qk**0.5)
+    if num_qo_heads != num_kv_heads:
+        k = k.repeat_interleave(num_qo_heads // num_kv_heads, dim=1)
+        v = v.repeat_interleave(num_qo_heads // num_kv_heads, dim=1)
     logits = (
         torch.einsum(
             "bmhd,bnhd->bhmn",
             q.view(batch_size, qo_len, num_qo_heads, head_dim_qk).float(),
-            k.view(batch_size, kv_len, num_kv_heads, head_dim_qk).float(),
+            k.view(batch_size, kv_len, num_qo_heads, head_dim_qk).float(),
         )
         * sm_scale
     )
@@ -85,16 +144,16 @@ def test_batch_prefill_with_ragged_kv_cache(
         torch.einsum(
             "bhmn,bnhd->bmhd",
             p,
-            v.view(batch_size, kv_len, num_kv_heads, head_dim_vo).float(),
+            v.view(batch_size, kv_len, num_qo_heads, head_dim_vo).float(),
         )
         .contiguous()
         .view(batch_size * qo_len, num_qo_heads, head_dim_vo)
         .to(q)
     )
 
-    print(o, o_ref)
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":
     test_batch_prefill_with_ragged_kv_cache(12, 54, 37, 4, 4, False, "fa2")
+    test_single_prefill_with_kv_cache(54, 37, 4, 32, False, "fa2")

@@ -91,6 +91,8 @@ void single_prefill_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::
         params.q_stride_h = q_stride_h;
         params.k_stride_n = k_stride_n;
         params.k_stride_h = k_stride_h;
+        params.v_stride_n = v_stride_n;
+        params.v_stride_h = v_stride_h;
 
         params.head_dim = head_dim;
         params.window_left = window_left;

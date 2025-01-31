@@ -1220,7 +1220,7 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void SinglePrefillWithKV
     smem_t<swizzle_mode_kv> k_smem(smem +
                                    (NUM_WARPS_Q * NUM_MMA_Q * sizeof(DTypeQ)) * 16 * head_dim_qk),
         v_smem(smem + (NUM_WARPS_Q * NUM_MMA_Q * sizeof(DTypeQ) * 16 * head_dim_qk) +
-               (NUM_WARPS_KV * NUM_MMA_KV * sizeof(DTypeKV) * 16 * head_dim_vo));
+               (NUM_WARPS_KV * NUM_MMA_KV * sizeof(DTypeKV) * 16 * head_dim_qk));
 
     const uint32_t num_iterations = ceil_div(
         MASK_MODE == MaskMode::kCausal
@@ -1684,7 +1684,7 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithRag
     smem_t<swizzle_mode_kv> k_smem(smem +
                                    (NUM_WARPS_Q * NUM_MMA_Q * sizeof(DTypeQ)) * 16 * head_dim_qk),
         v_smem(smem + (NUM_WARPS_Q * NUM_MMA_Q * sizeof(DTypeQ) * 16 * head_dim_qk) +
-               (NUM_WARPS_KV * NUM_MMA_KV * sizeof(DTypeKV) * 16 * head_dim_vo));
+               (NUM_WARPS_KV * NUM_MMA_KV * sizeof(DTypeKV) * 16 * head_dim_qk));
 
     uint32_t k_smem_offset_r = k_smem.get_permuted_offset<upcast_head_dim_k>(
                  get_warp_idx_kv<NUM_WARPS_Q, NUM_WARPS_KV>() * NUM_MMA_KV * 16 +
@@ -1954,9 +1954,8 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPag
     constexpr uint32_t kv_frag_cols = swizzle_mode_kv == SwizzleMode::k128B ? 8 : 4;
     smem_t<swizzle_mode_kv> k_smem(smem +
                                    (NUM_WARPS_Q * NUM_MMA_Q * sizeof(DTypeQ)) * 16 * head_dim_qk),
-        v_smem(smem + (NUM_WARPS_Q * NUM_MMA_Q * sizeof(DTypeQ) +
-                       NUM_WARPS_KV * NUM_MMA_KV * sizeof(DTypeKV)) *
-                          16 * head_dim_qk);
+        v_smem(smem + (NUM_WARPS_Q * NUM_MMA_Q * sizeof(DTypeQ) * 16 * head_dim_qk) +
+               (NUM_WARPS_KV * NUM_MMA_KV * sizeof(DTypeKV) * 16 * head_dim_qk));
     size_t kv_offset[NUM_MMA_KV * (swizzle_mode_kv == SwizzleMode::k128B ? 4 : 2) / NUM_WARPS_Q];
 
     uint32_t k_smem_offset_r = k_smem.get_permuted_offset<upcast_head_dim_k>(
