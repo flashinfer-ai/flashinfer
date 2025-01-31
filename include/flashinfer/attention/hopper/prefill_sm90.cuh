@@ -449,11 +449,11 @@ constexpr auto getCTATileSize() {
     } else {
       return std::make_tuple(128, 64);
     }
+  } else {
+    // NOTE(Zihao) hack for deepseek prefill
+    static_assert(HEAD_DIM_QK == 192 && HEAD_DIM_VO == 128);
+    return std::make_tuple(128, 128);
   }
-
-  // NOTE(Zihao) hack for deepseek prefill
-  static_assert(HEAD_DIM_QK == 192 && HEAD_DIM_VO == 128);
-  return std::make_tuple(128, 128);
 }
 
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
