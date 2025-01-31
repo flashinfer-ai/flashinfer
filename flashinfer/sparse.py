@@ -583,8 +583,8 @@ class BlockSparseAttentionWrapper:
                 self._paged_kv_indptr_buf,
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len,
-                lse,
                 out,
+                lse,
                 TensorLayout[self._kv_layout].value,
                 -1,  # window_left
                 _get_cache_alibi_slopes_buf(q.shape[1], self.device),
