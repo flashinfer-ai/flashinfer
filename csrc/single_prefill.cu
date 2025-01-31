@@ -37,7 +37,7 @@ void single_prefill_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::
                                   unsigned int mask_mode_code, unsigned int layout,
                                   int32_t window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream) {
   auto device = q.device();
-  unsigned int head_dim = q.size(2);
+  unsigned int head_dim_qk = q.size(2);
   unsigned int kv_len, qo_len, num_kv_heads, num_qo_heads;
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
   qo_len = q.size(0);
@@ -94,7 +94,6 @@ void single_prefill_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::
         params.v_stride_n = v_stride_n;
         params.v_stride_h = v_stride_h;
 
-        params.head_dim = head_dim;
         params.window_left = window_left;
         params.partition_kv = false;
 

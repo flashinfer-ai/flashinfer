@@ -42,7 +42,7 @@ using IdType = int32_t;
         using RaggedParams = BatchPrefillRaggedParams<DTypeQ, DTypeKV, DTypeO, IdType>;           \
         using PagedParams = BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO, IdType>;             \
         return DISPATCH_head_dim_sm90(head_dim_qk, HEAD_DIM_QK, [&] {                             \
-          constexpr int HEAD_DIM_VO = HEAD_DIM_QK;                                                \
+          [[maybe_unused]] constexpr int HEAD_DIM_VO = HEAD_DIM_QK;                                                \
           return DISPATCH_BOOL(window_left > -1, USE_SLIDING_WINDOW, [&] {                        \
             return DISPATCH_BOOL(logits_soft_cap > 0.f, USE_LOGITS_SOFT_CAP, [&] {                \
               using AttentionVariant = DefaultAttention<USE_LOGITS_SOFT_CAP>;                     \

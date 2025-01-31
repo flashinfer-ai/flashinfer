@@ -78,7 +78,7 @@ void BatchPrefillWithRaggedKVCacheRun(
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
 
   int64_t num_qo_heads = q.size(1);
-  int64_t head_dim = q.size(2);
+  int64_t head_dim_qk = q.size(2);
   int64_t num_kv_heads = (kv_layout == QKVLayout::kNHD) ? k.size(1) : k.size(0);
   uint32_t q_stride_n = q.stride(0), q_stride_h = q.stride(1), k_stride_n, k_stride_h, v_stride_n,
            v_stride_h;
@@ -205,7 +205,7 @@ void BatchPrefillWithPagedKVCacheRun(
   int64_t batch_size = paged_kv_indptr.size(0) - 1;
   int64_t num_qo_heads = q.size(1);
   int64_t num_kv_heads, page_size;
-  uint32_t head_dim = q.size(2);
+  uint32_t head_dim_qk = q.size(2);
   if (kv_layout == QKVLayout::kHND) {
     num_kv_heads = paged_k_cache.size(1);
     page_size = paged_k_cache.size(2);

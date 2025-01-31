@@ -192,7 +192,7 @@ void BatchPrefillWithPagedKVCacheSM90Run(
   bool use_swa = window_left != -1;
 
   DISPATCH_context(
-      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QO, HEAD_DIM_VO, USE_SLIDING_WINDOW,
+      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, USE_SLIDING_WINDOW,
       USE_LOGITS_SOFT_CAP, AttentionVariant, RaggedParams, PagedParams, [&] {
         PagedParams params;
 
