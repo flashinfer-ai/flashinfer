@@ -22,7 +22,8 @@ from .literal_map import dtype_literal, mask_mode_literal, pos_encoding_mode_lit
 
 
 def get_cu_file_str(
-    head_dim,
+    head_dim_qk,
+    head_dim_vo,
     pos_encoding_mode,
     use_fp16_qk_reduction,
     mask_mode,
@@ -45,24 +46,25 @@ using DTypeO = cutlass_dtype_t<{dtype_out}>;
 using Params = SinglePrefillParams<DTypeQ, DTypeKV, DTypeO>;
 
 template cudaError_t SinglePrefillWithKVCacheDispatched
-    <{head_dim}, {head_dim}, {mask_mode}, /*USE_SLIDING_WINDOW=*/true, LogitsSoftCap, Params>
+    <{head_dim_qk}, {head_dim_vo}, {mask_mode}, /*USE_SLIDING_WINDOW=*/true, LogitsSoftCap, Params>
     (Params& params, cudaStream_t stream);
 
 template cudaError_t SinglePrefillWithKVCacheDispatched
-    <{head_dim}, {head_dim}, {mask_mode}, /*USE_SLIDING_WINDOW=*/false, LogitsSoftCap, Params>
+    <{head_dim_qk}, {head_dim_vo}, {mask_mode}, /*USE_SLIDING_WINDOW=*/false, LogitsSoftCap, Params>
     (Params& params, cudaStream_t stream);
 
 template cudaError_t SinglePrefillWithKVCacheDispatched
-    <{head_dim}, {head_dim}, {mask_mode}, /*USE_SLIDING_WINDOW=*/true, StandardAttention, Params>
+    <{head_dim_qk}, {head_dim_vo}, {mask_mode}, /*USE_SLIDING_WINDOW=*/true, StandardAttention, Params>
     (Params& params, cudaStream_t stream);
 
 template cudaError_t SinglePrefillWithKVCacheDispatched
-    <{head_dim}, {head_dim}, {mask_mode}, /*USE_SLIDING_WINDOW=*/false, StandardAttention, Params>
+    <{head_dim_qk}, {head_dim_vo}, {mask_mode}, /*USE_SLIDING_WINDOW=*/false, StandardAttention, Params>
     (Params& params, cudaStream_t stream);
 
 }}
     """.format(
-        head_dim=head_dim,
+        head_dim_qk=head_dim_qk,
+        head_dim_vo=head_dim_vo,
         # pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
         # use_fp16_qk_reduction=use_fp16_qk_reduction,
         mask_mode=mask_mode_literal[int(mask_mode)],
@@ -76,7 +78,7 @@ template cudaError_t SinglePrefillWithKVCacheDispatched
 
 if __name__ == "__main__":
     pattern = (
-        r"single_prefill_head_([0-9]+)_posenc_([0-9]+)_"
+        r"single_prefill_head_qk_([0-9]+)_head_vo_([0-9]+)_posenc_([0-9]+)_"
         r"fp16qkred_([a-z]+)_mask_([0-9]+)_dtypeq_([a-z0-9]+)_dtypekv_([a-z0-9]+)_dtypeout_([a-z0-9]+)_sm90\.cu"
     )
 

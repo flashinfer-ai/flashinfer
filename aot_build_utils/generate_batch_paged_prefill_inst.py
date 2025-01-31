@@ -27,7 +27,8 @@ from .literal_map import (
 
 
 def get_cu_file_str(
-    head_dim,
+    head_dim_qk,
+    head_dim_vo,
     pos_encoding_mode,
     use_fp16_qk_reduction,
     mask_mode,
@@ -41,13 +42,14 @@ def get_cu_file_str(
     def get_insts(attention_variant, dtype_out):
         return "\n".join(
             [
-                """template cudaError_t BatchPrefillWithPagedKVCacheDispatched<{cta_tile_q}, {head_dim}, {pos_encoding_mode}, {use_fp16_qk_reduction}, {mask_mode}, {attention_variant}, Params>(
+                """template cudaError_t BatchPrefillWithPagedKVCacheDispatched<{cta_tile_q}, {head_dim_qk}, {head_dim_vo}, {pos_encoding_mode}, {use_fp16_qk_reduction}, {mask_mode}, {attention_variant}, Params>(
     Params params,
     {dtype_out}* tmp_v,
     float* tmp_s, cudaStream_t stream);
     """.format(
                     cta_tile_q=cta_tile_q,
-                    head_dim=head_dim,
+                    head_dim_qk=head_dim_qk,
+                    head_dim_vo=head_dim_vo,
                     pos_encoding_mode=pos_encoding_mode_literal[int(pos_encoding_mode)],
                     use_fp16_qk_reduction=use_fp16_qk_reduction,
                     mask_mode=mask_mode_literal[int(mask_mode)],
@@ -92,7 +94,7 @@ using AttentionVariant4 = DefaultAttention<{use_custom_mask}, /*use_sliding_wind
 
 if __name__ == "__main__":
     pattern = (
-        r"batch_paged_prefill_head_([0-9]+)_posenc_([0-9]+)_"
+        r"batch_paged_prefill_head_qk_([0-9]+)_head_vo_([0-9]+)_posenc_([0-9]+)_"
         r"fp16qkred_([a-z]+)_mask_([0-9]+)_dtypeq_([a-z0-9]+)_dtypekv_([a-z0-9]+)_dtypeout_([a-z0-9]+)_idtype_([a-z0-9]+)\.cu"
     )
     compiled_pattern = re.compile(pattern)
