@@ -481,17 +481,13 @@ def test_batch_prefill_flash_sigmoid():
 def test_batch_prefill_sm90_flash_sigmoid():
     torch.manual_seed(42)
     variant_decl = flash_sigmoid_sm90_decl
-
-    head_dim = 128
-
     jit_args = (
         "batch_prefill_flash_sigmoid",  # uri
         torch.float16,  # dtype_q
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
         torch.int32,  # idtype
-        128,  # head_dim_qk
-        128,  # head_dim_vo
+        128,  # hidden_dim
         [],  # additional_tensor_names
         [],  # additional_tensor_dtypes
         ["logits_scale", "sigmoid_bias"],  # additional_scalar_names
@@ -507,7 +503,7 @@ def test_batch_prefill_sm90_flash_sigmoid():
         float_workspace_buffer, kv_layout="NHD", backend="fa3", jit_args=jit_args
     )
 
-    batch_size = 1
+    batch_size = 128
     seq_len_per_request = 1024
     qo_indptr_host = torch.arange(
         0, batch_size * seq_len_per_request + 1, seq_len_per_request, dtype=torch.int32
@@ -516,8 +512,10 @@ def test_batch_prefill_sm90_flash_sigmoid():
         0, batch_size * seq_len_per_request + 1, seq_len_per_request, dtype=torch.int32
     )
 
-    num_qo_heads = 1
-    num_kv_heads = 1
+    num_qo_heads = 32
+    num_kv_heads = 32
+    head_dim = 128
+
     wrapper.plan(
         qo_indptr_host,
         kv_indptr_host,
@@ -748,5 +746,4 @@ if __name__ == "__main__":
     # test_batch_decode_flash_sigmoid(False)
     # test_batch_decode_flash_sigmoid(True)
     # test_batch_prefill_flash_sigmoid()
-    # test_batch_prefill_sm90_flash_sigmoid()
-    test_chain_matmul()
+    test_batch_prefill_sm90_flash_sigmoid()
