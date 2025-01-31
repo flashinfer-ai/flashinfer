@@ -79,13 +79,18 @@ void BatchPrefillWithRaggedKVCacheRun(
   int64_t num_qo_heads = q.size(1);
   int64_t head_dim = q.size(2);
   int64_t num_kv_heads = (kv_layout == QKVLayout::kNHD) ? k.size(1) : k.size(0);
-  uint32_t q_stride_n = q.stride(0), q_stride_h = q.stride(1), kv_stride_n, kv_stride_h;
+  uint32_t q_stride_n = q.stride(0), q_stride_h = q.stride(1), k_stride_n, k_stride_h, v_stride_n,
+           v_stride_h;
   if (kv_layout == QKVLayout::kNHD) {
-    kv_stride_n = k.stride(0);
-    kv_stride_h = k.stride(1);
+    k_stride_n = k.stride(0);
+    k_stride_h = k.stride(1);
+    v_stride_n = v.stride(0);
+    v_stride_h = v.stride(1);
   } else {
-    kv_stride_h = k.stride(0);
-    kv_stride_n = k.stride(1);
+    k_stride_h = k.stride(0);
+    k_stride_n = k.stride(1);
+    v_stride_h = v.stride(0);
+    v_stride_n = v.stride(1);
   }
 
   if (maybe_lse) {
@@ -121,8 +126,10 @@ void BatchPrefillWithRaggedKVCacheRun(
         params.num_kv_heads = num_kv_heads;
         params.q_stride_n = q_stride_n;
         params.q_stride_h = q_stride_h;
-        params.kv_stride_n = kv_stride_n;
-        params.kv_stride_h = kv_stride_h;
+        params.k_stride_n = k_stride_n;
+        params.k_stride_h = k_stride_h;
+        params.v_stride_n = v_stride_n;
+        params.v_stride_h = v_stride_h;
         params.window_left = window_left;
 
         params.request_indices = nullptr;

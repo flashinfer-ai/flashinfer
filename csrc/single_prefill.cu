@@ -42,17 +42,22 @@ void single_prefill_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
   qo_len = q.size(0);
   num_qo_heads = q.size(1);
-  uint32_t q_stride_n = q.stride(0), q_stride_h = q.stride(1), kv_stride_n, kv_stride_h;
+  uint32_t q_stride_n = q.stride(0), q_stride_h = q.stride(1), k_stride_n, k_stride_h, v_stride_n,
+           v_stride_h;
   if (kv_layout == QKVLayout::kNHD) {
     kv_len = k.size(0);
     num_kv_heads = k.size(1);
-    kv_stride_n = k.stride(0);
-    kv_stride_h = k.stride(1);
+    k_stride_n = k.stride(0);
+    k_stride_h = k.stride(1);
+    v_stride_n = v.stride(0);
+    v_stride_h = v.stride(1);
   } else {
     kv_len = k.size(1);
     num_kv_heads = k.size(0);
-    kv_stride_h = k.stride(0);
-    kv_stride_n = k.stride(1);
+    k_stride_h = k.stride(0);
+    k_stride_n = k.stride(1);
+    v_stride_h = v.stride(0);
+    v_stride_n = v.stride(1);
   }
   if (maybe_lse) {
     const auto& lse = *maybe_lse;
@@ -84,8 +89,9 @@ void single_prefill_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::
         params.kv_len = kv_len;
         params.q_stride_n = q_stride_n;
         params.q_stride_h = q_stride_h;
-        params.kv_stride_n = kv_stride_n;
-        params.kv_stride_h = kv_stride_h;
+        params.k_stride_n = k_stride_n;
+        params.k_stride_h = k_stride_h;
+
         params.head_dim = head_dim;
         params.window_left = window_left;
         params.partition_kv = false;

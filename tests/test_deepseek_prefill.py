@@ -26,6 +26,7 @@ import flashinfer
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
 @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("backend", ["fa2"])  # ["fa2", "fa3"])
 def test_batch_prefill_with_ragged_kv_cache(
     batch_size,
     kv_len,
@@ -33,6 +34,7 @@ def test_batch_prefill_with_ragged_kv_cache(
     num_kv_heads,
     num_qo_heads,
     causal,
+    backend,
 ):
     kv_layout = "NHD"
     head_dim_qk = 192
@@ -40,13 +42,13 @@ def test_batch_prefill_with_ragged_kv_cache(
     q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim_qk).to(0).half()
     q_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
 
-    k = torch.randn(batch_size * kv_len, num_kv_heads, head_dim_qk).to(0).half()
+    k = torch.zeros(batch_size * kv_len, num_kv_heads, head_dim_qk).to(0).half()
     v = torch.randn(batch_size * kv_len, num_kv_heads, head_dim_vo).to(0).half()
     kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len
 
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
     wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
-        workspace_buffer, kv_layout
+        workspace_buffer, kv_layout, backend=backend
     )
     wrapper.plan(
         q_indptr,
@@ -90,4 +92,9 @@ def test_batch_prefill_with_ragged_kv_cache(
         .to(q)
     )
 
+    print(o, o_ref)
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
+
+
+if __name__ == "__main__":
+    test_batch_prefill_with_ragged_kv_cache(12, 54, 37, 4, 4, False, "fa2")

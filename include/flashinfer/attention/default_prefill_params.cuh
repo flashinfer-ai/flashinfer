@@ -44,8 +44,10 @@ struct SinglePrefillParams {
   uint32_t num_kv_heads;
   uint32_t q_stride_n;
   uint32_t q_stride_h;
-  uint32_t kv_stride_n;
-  uint32_t kv_stride_h;
+  uint32_t k_stride_n;
+  uint32_t k_stride_h;
+  uint32_t v_stride_n;
+  uint32_t v_stride_h;
   uint32_t head_dim;
   int32_t window_left;
   float logits_soft_cap;
@@ -69,8 +71,10 @@ struct SinglePrefillParams {
         num_kv_heads(0),
         q_stride_n(0),
         q_stride_h(0),
-        kv_stride_n(0),
-        kv_stride_h(0),
+        k_stride_n(0),
+        k_stride_h(0),
+        v_stride_n(0),
+        v_stride_h(0),
         head_dim(0),
         window_left(0),
         logits_soft_cap(0.0f),
@@ -99,8 +103,10 @@ struct SinglePrefillParams {
         kv_len(kv_len),
         q_stride_n(q_stride_n),
         q_stride_h(q_stride_h),
-        kv_stride_n(kv_stride_n),
-        kv_stride_h(kv_stride_h),
+        k_stride_n(kv_stride_n),
+        k_stride_h(kv_stride_h),
+        v_stride_n(kv_stride_n),
+        v_stride_h(kv_stride_h),
         head_dim(head_dim),
         window_left(window_left),
         logits_soft_cap(logits_soft_cap),
@@ -141,8 +147,10 @@ struct BatchPrefillRaggedParams {
   uint32_t num_kv_heads;
   uint32_t q_stride_n;
   uint32_t q_stride_h;
-  uint32_t kv_stride_n;
-  uint32_t kv_stride_h;
+  uint32_t k_stride_n;
+  uint32_t k_stride_h;
+  uint32_t v_stride_n;
+  uint32_t v_stride_h;
   int32_t window_left;
   float logits_soft_cap;
   float sm_scale;
@@ -178,8 +186,10 @@ struct BatchPrefillRaggedParams {
         num_kv_heads(0),
         q_stride_n(0),
         q_stride_h(0),
-        kv_stride_n(0),
-        kv_stride_h(0),
+        k_stride_n(0),
+        k_stride_h(0),
+        v_stride_n(0),
+        v_stride_h(0),
         window_left(0),
         logits_soft_cap(0.0f),
         sm_scale(0.0f),
@@ -222,8 +232,10 @@ struct BatchPrefillRaggedParams {
         num_kv_heads(num_kv_heads),
         q_stride_n(q_stride_n),
         q_stride_h(q_stride_h),
-        kv_stride_n(kv_stride_n),
-        kv_stride_h(kv_stride_h),
+        k_stride_n(kv_stride_n),
+        k_stride_h(kv_stride_h),
+        v_stride_n(kv_stride_n),
+        v_stride_h(kv_stride_h),
         window_left(window_left),
         logits_soft_cap(logits_soft_cap),
         sm_scale(sm_scale),
