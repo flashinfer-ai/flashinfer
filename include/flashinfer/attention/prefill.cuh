@@ -1171,11 +1171,11 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void SinglePrefillWithKV
     alignas(16) float o_frag[NUM_MMA_Q][NUM_MMA_D_VO][8];
     DTypeQKAccum m[NUM_MMA_Q][2];
     float d[NUM_MMA_Q][2];
-    float rope_freq[NUM_MMA_D_VO / 2][4];
+    float rope_freq[NUM_MMA_D_QK / 2][4];
     if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
       const float rope_rcp_scale = params.rope_rcp_scale;
       const float rope_rcp_theta = params.rope_rcp_theta;
-      init_rope_freq<NUM_MMA_D_VO>(rope_freq, rope_rcp_scale, rope_rcp_theta);
+      init_rope_freq<NUM_MMA_D_QK>(rope_freq, rope_rcp_scale, rope_rcp_theta);
     }
     init_states<NUM_MMA_Q, NUM_MMA_D_VO>(variant, o_frag, m, d);
 
@@ -1466,7 +1466,8 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
                                            DTypeQKAccum, AttentionVariant, Params>;
         // TODO(Zihao): fix the following computation
         uint32_t smem_size = (NUM_MMA_Q * NUM_WARPS_Q * sizeof(DTypeQ)) * 16 * HEAD_DIM_QK +
-                             (NUM_MMA_KV * NUM_WARPS_KV * 2 * sizeof(DTypeQ)) * 16 * HEAD_DIM_VO;
+                             (NUM_MMA_KV * NUM_WARPS_KV * sizeof(DTypeKV)) * 16 * HEAD_DIM_QK +
+                             (NUM_MMA_KV * NUM_WARPS_KV * sizeof(DTypeKV)) * 16 * HEAD_DIM_VO;
         FLASHINFER_CUDA_CALL(
             cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         int num_blocks_per_sm = 0;
@@ -1595,12 +1596,12 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithRag
     alignas(16) float o_frag[NUM_MMA_Q][NUM_MMA_D_VO][8];
     DTypeQKAccum m[NUM_MMA_Q][2];
     float d[NUM_MMA_Q][2];
-    float rope_freq[NUM_MMA_D_VO / 2][4];
+    float rope_freq[NUM_MMA_D_QK / 2][4];
 
     if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
       const float rope_rcp_scale = params.rope_rcp_scale;
       const float rope_rcp_theta = params.rope_rcp_theta;
-      init_rope_freq<NUM_MMA_D_VO>(rope_freq, rope_rcp_scale, rope_rcp_theta);
+      init_rope_freq<NUM_MMA_D_QK>(rope_freq, rope_rcp_scale, rope_rcp_theta);
     }
     init_states<NUM_MMA_Q, NUM_MMA_D_VO>(variant, o_frag, m, d);
 
@@ -1705,8 +1706,8 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithRag
     DTypeKV* v_ptr =
         v +
         (kv_indptr[request_idx] + chunk_start + warp_idx * kv_frag_rows + lane_idx / kv_frag_cols) *
-            k_stride_n +
-        kv_head_idx * k_stride_h + (lane_idx % kv_frag_cols) * upcast_size<DTypeKV>();
+            v_stride_n +
+        kv_head_idx * v_stride_h + (lane_idx % kv_frag_cols) * upcast_size<DTypeKV>();
 
     produce_kv<SharedMemFillMode::kNoFill, NUM_WARPS_Q, NUM_WARPS_KV, NUM_MMA_D_QK, NUM_MMA_KV>(
         k_smem, &k_smem_offset_w, &k_ptr, k_stride_n, 0, chunk_size);
@@ -1891,12 +1892,12 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void BatchPrefillWithPag
     alignas(16) float o_frag[NUM_MMA_Q][NUM_MMA_D_VO][8];
     DTypeQKAccum m[NUM_MMA_Q][2];
     float d[NUM_MMA_Q][2];
-    float rope_freq[NUM_MMA_D_VO / 2][4];
+    float rope_freq[NUM_MMA_D_QK / 2][4];
 
     if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
       const float rope_rcp_scale = params.rope_rcp_scale;
       const float rope_rcp_theta = params.rope_rcp_theta;
-      init_rope_freq<NUM_MMA_D_VO>(rope_freq, rope_rcp_scale, rope_rcp_theta);
+      init_rope_freq<NUM_MMA_D_QK>(rope_freq, rope_rcp_scale, rope_rcp_theta);
     }
     init_states<NUM_MMA_Q, NUM_MMA_D_VO>(variant, o_frag, m, d);
 
@@ -2197,7 +2198,8 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
     } else {
       // TODO(Zihao): fix the following computation
       uint32_t smem_size = (NUM_MMA_Q * NUM_WARPS_Q * sizeof(DTypeQ)) * 16 * HEAD_DIM_QK +
-                           (NUM_MMA_KV * NUM_WARPS_KV * 2 * sizeof(DTypeQ)) * 16 * HEAD_DIM_VO;
+                           (NUM_MMA_KV * NUM_WARPS_KV * sizeof(DTypeKV)) * 16 * HEAD_DIM_QK +
+                           (NUM_MMA_KV * NUM_WARPS_KV * sizeof(DTypeKV)) * 16 * HEAD_DIM_VO;
       auto kernel =
           BatchPrefillWithRaggedKVCacheKernel<MASK_MODE, POS_ENCODING_MODE, NUM_MMA_Q, NUM_MMA_D_QK,
                                               NUM_MMA_D_VO, NUM_MMA_KV, NUM_WARPS_Q, NUM_WARPS_KV,
@@ -2301,7 +2303,8 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
     } else {
       // TODO(Zihao): fix the following computation
       uint32_t smem_size = (NUM_MMA_Q * NUM_WARPS_Q * sizeof(DTypeQ)) * 16 * HEAD_DIM_QK +
-                           (NUM_MMA_KV * NUM_WARPS_KV * 2 * sizeof(DTypeQ)) * 16 * HEAD_DIM_VO;
+                           (NUM_MMA_KV * NUM_WARPS_KV * sizeof(DTypeKV)) * 16 * HEAD_DIM_QK +
+                           (NUM_MMA_KV * NUM_WARPS_KV * sizeof(DTypeKV)) * 16 * HEAD_DIM_VO;
       auto kernel =
           BatchPrefillWithPagedKVCacheKernel<MASK_MODE, POS_ENCODING_MODE, NUM_MMA_Q, NUM_MMA_D_QK,
                                              NUM_MMA_D_VO, NUM_MMA_KV, NUM_WARPS_Q, NUM_WARPS_KV,
