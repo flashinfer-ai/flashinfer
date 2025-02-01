@@ -7,7 +7,7 @@
 #define ADDITIONAL_FUNC_PARAMS {{ additional_func_params }}
 #define ADDITIONAL_PARAMS_SETTER {{ additional_params_setter }}
 
-#define DISPATCH_context(DTypeQ, DTypeKV, DTypeO, IdType, HEAD_DIM, POS_ENCODING_MODE, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, AttentionVariant, Params, ...) { \
+#define DISPATCH_context(DTypeQ, DTypeKV, DTypeO, IdType, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, AttentionVariant, Params, ...) { \
   using AttentionVariant = {{ variant_name }}; \
   __VA_ARGS__(); \
 }
@@ -18,7 +18,8 @@ using DTypeQ = {{ dtype_q }};
 using DTypeKV = {{ dtype_kv }};
 using DTypeO = {{ dtype_o }};
 using IdType = {{ idtype }};
-constexpr int HEAD_DIM = {{ head_dim }};
+constexpr int HEAD_DIM_QK = {{ head_dim_qk }};
+constexpr int HEAD_DIM_VO = {{ head_dim_vo }};
 constexpr auto USE_LOGITS_SOFT_CAP = {{ use_logits_soft_cap }};
 constexpr auto POS_ENCODING_MODE = {{ pos_encoding_mode }};
 constexpr auto USE_SLIDING_WINDOW = {{ use_sliding_window }};

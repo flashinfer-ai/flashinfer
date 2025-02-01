@@ -219,6 +219,10 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
   const DTypeQ* q = params.q;
   const DTypeKV* k = params.k;
   const DTypeKV* v = params.v;
+  const uint32_t q_stride_n = params.q_stride_n;
+  const uint32_t q_stride_h = params.q_stride_h;
+  const uint32_t kv_stride_n = params.kv_stride_n;
+  const uint32_t kv_stride_h = params.kv_stride_h;
   DTypeO* o = params.o;
   float* lse = params.lse;
   uint32_t kv_chunk_size = params.kv_chunk_size;
@@ -254,11 +258,10 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
                        float(2 * ((tx * vec_size + i) % (head_dim / 2))) / float(head_dim));
     }
     // apply rotary embedding to q matrix
-    q_vec = vec_apply_llama_rope<vec_size, bdx>(q + params.get_q_elem_offset(0, qo_head_idx, 0),
-                                                freq, seq_len - 1);
+    q_vec = vec_apply_llama_rope<vec_size, bdx>(q + qo_head_idx * q_stride_h, freq, seq_len - 1);
   } else {
     // do not apply rotary embedding to q matrix
-    q_vec.cast_load(q + params.get_q_elem_offset(0, qo_head_idx, tx * vec_size));
+    q_vec.cast_load(q + qo_head_idx * q_stride_h + tx * vec_size);
   }
   // multiple q_vec by sm_scale
 #pragma unroll
@@ -280,9 +283,8 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
           k_smem + (((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
-          k + params.get_kv_elem_offset(
-                  producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j, kv_head_idx,
-                  tx * vec_size),
+          k + (producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j) * kv_stride_n +
+              kv_head_idx * kv_stride_h + tx * vec_size,
           producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end);
     }
     cp_async::commit_group();
@@ -290,9 +292,8 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
           v_smem + (((iter * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
-          v + params.get_kv_elem_offset(
-                  producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j, kv_head_idx,
-                  tx * vec_size),
+          v + (producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j) * kv_stride_n +
+              kv_head_idx * kv_stride_h + tx * vec_size,
           producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end);
     }
     cp_async::commit_group();
@@ -320,9 +321,8 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kNoFill>(
           k_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
-          k + params.get_kv_elem_offset(
-                  producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j, kv_head_idx,
-                  tx * vec_size),
+          k + (producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j) * kv_stride_n +
+              kv_head_idx * kv_stride_h + tx * vec_size,
           producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end);
     }
     cp_async::commit_group();
@@ -340,9 +340,8 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
       cp_async::pred_load<vec_bits, PrefetchMode::kPrefetch, SharedMemFillMode::kFillZero>(
           v_smem + (((stage_idx * bdz + tz) * bdy + ty) * tile_size_per_bdx + j) * head_dim +
               tx * vec_size,
-          v + params.get_kv_elem_offset(
-                  producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j, kv_head_idx,
-                  tx * vec_size),
+          v + (producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j) * kv_stride_n +
+              kv_head_idx * kv_stride_h + tx * vec_size,
           producer_kv_idx_base + (tz * bdy + ty) * tile_size_per_bdx + j < chunk_end);
     }
     cp_async::commit_group();

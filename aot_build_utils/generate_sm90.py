@@ -71,7 +71,8 @@ def get_sm90_instantiation_cu(args: argparse.Namespace) -> List[str]:
         for dtype_q, dtype_kv in list(zip(prefill_dtypes, prefill_dtypes)):
             fname = f"single_prefill_head_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_sm90.cu"
             content = generate_single_prefill_sm90_inst.get_cu_file_str(
-                head_dim,
+                head_dim,  # head_dim_qk
+                head_dim,  # head_dim_vo
                 pos_encoding_mode,
                 use_fp16_qk_reduction,
                 mask_mode,
@@ -88,7 +89,8 @@ def get_sm90_instantiation_cu(args: argparse.Namespace) -> List[str]:
                             f"single_prefill_with_kv_cache_dtype_q_{dtype_q}_"
                             f"dtype_kv_{dtype_kv}_"
                             f"dtype_o_{dtype_q}_"
-                            f"head_dim_{head_dim}_"
+                            f"head_dim_qk_{head_dim}_"
+                            f"head_dim_vo_{head_dim}_"
                             f"posenc_{pos_encoding_mode}_"
                             f"use_swa_{use_sliding_window}_"
                             f"use_logits_cap_{use_logits_soft_cap}_"
@@ -112,9 +114,10 @@ def get_sm90_instantiation_cu(args: argparse.Namespace) -> List[str]:
         idtypes,
     ):
         for dtype_q, dtype_kv in list(zip(prefill_dtypes, prefill_dtypes)):
-            fname = f"batch_paged_prefill_head_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}_sm90.cu"
+            fname = f"batch_paged_prefill_head_qk_{head_dim}_head_vo_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}_sm90.cu"
             content = generate_batch_paged_prefill_sm90_inst.get_cu_file_str(
-                head_dim,
+                head_dim,  # head_dim_qk
+                head_dim,  # head_dim_vo
                 pos_encoding_mode,
                 use_fp16_qk_reduction,
                 mask_mode,
@@ -125,9 +128,10 @@ def get_sm90_instantiation_cu(args: argparse.Namespace) -> List[str]:
             )
             write_if_different(path / fname, content)
 
-            fname = f"batch_ragged_prefill_head_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}_sm90.cu"
+            fname = f"batch_ragged_prefill_head_qk_{head_dim}_head_vo_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}_sm90.cu"
             content = generate_batch_ragged_prefill_sm90_inst.get_cu_file_str(
-                head_dim,
+                head_dim,  # head_dim_qk
+                head_dim,  # head_dim_vo
                 pos_encoding_mode,
                 use_fp16_qk_reduction,
                 mask_mode,
@@ -148,7 +152,8 @@ def get_sm90_instantiation_cu(args: argparse.Namespace) -> List[str]:
                             f"dtype_kv_{dtype_kv}_"
                             f"dtype_o_{dtype_q}_"
                             f"dtype_idx_{idtype}_"
-                            f"head_dim_{head_dim}_"
+                            f"head_dim_qk_{head_dim}_"
+                            f"head_dim_vo_{head_dim}_"
                             f"posenc_{pos_encoding_mode}_"
                             f"use_swa_{sliding_window}_"
                             f"use_logits_cap_{logits_soft_cap}_"

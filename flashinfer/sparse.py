@@ -397,7 +397,8 @@ class BlockSparseAttentionWrapper:
                 kv_data_type,
                 q_data_type,
                 indptr.dtype,
-                head_dim,
+                head_dim,  # head_dim_qk
+                head_dim,  # head_dim_vo
                 PosEncodingMode[pos_encoding_mode].value,
                 False,  # use_sliding_window
                 logits_soft_cap > 0,  # use_logits_soft_cap

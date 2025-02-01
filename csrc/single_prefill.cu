@@ -22,8 +22,9 @@
 
 namespace flashinfer {
 
-template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION,
-          MaskMode MASK_MODE, typename AttentionVariant, typename Params>
+template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODING_MODE,
+          bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant,
+          typename Params>
 cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::DTypeO* tmp,
                                                cudaStream_t stream);
 
@@ -36,22 +37,27 @@ void single_prefill_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::
                                   unsigned int mask_mode_code, unsigned int layout,
                                   int32_t window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream) {
   auto device = q.device();
-  unsigned int head_dim = q.size(2);
+  unsigned int head_dim_qk = q.size(2);
   unsigned int kv_len, qo_len, num_kv_heads, num_qo_heads;
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
   qo_len = q.size(0);
   num_qo_heads = q.size(1);
-  uint32_t q_stride_n = q.stride(0), q_stride_h = q.stride(1), kv_stride_n, kv_stride_h;
+  uint32_t q_stride_n = q.stride(0), q_stride_h = q.stride(1), k_stride_n, k_stride_h, v_stride_n,
+           v_stride_h;
   if (kv_layout == QKVLayout::kNHD) {
     kv_len = k.size(0);
     num_kv_heads = k.size(1);
-    kv_stride_n = k.stride(0);
-    kv_stride_h = k.stride(1);
+    k_stride_n = k.stride(0);
+    k_stride_h = k.stride(1);
+    v_stride_n = v.stride(0);
+    v_stride_h = v.stride(1);
   } else {
     kv_len = k.size(1);
     num_kv_heads = k.size(0);
-    kv_stride_h = k.stride(0);
-    kv_stride_n = k.stride(1);
+    k_stride_h = k.stride(0);
+    k_stride_n = k.stride(1);
+    v_stride_h = v.stride(0);
+    v_stride_n = v.stride(1);
   }
   if (maybe_lse) {
     const auto& lse = *maybe_lse;
@@ -67,8 +73,9 @@ void single_prefill_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
 
   DISPATCH_context(
-      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM, POS_ENCODING_MODE, USE_SLIDING_WINDOW,
-      USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, AttentionVariant, Params, [&] {
+      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
+      USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, AttentionVariant, Params,
+      [&] {
         Params params;
 
         params.q = static_cast<DTypeQ*>(q.data_ptr());
@@ -82,16 +89,18 @@ void single_prefill_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::
         params.kv_len = kv_len;
         params.q_stride_n = q_stride_n;
         params.q_stride_h = q_stride_h;
-        params.kv_stride_n = kv_stride_n;
-        params.kv_stride_h = kv_stride_h;
-        params.head_dim = head_dim;
+        params.k_stride_n = k_stride_n;
+        params.k_stride_h = k_stride_h;
+        params.v_stride_n = v_stride_n;
+        params.v_stride_h = v_stride_h;
+
         params.window_left = window_left;
         params.partition_kv = false;
 
         ADDITIONAL_PARAMS_SETTER
 
         cudaError_t status = flashinfer::SinglePrefillWithKVCacheDispatched<
-            HEAD_DIM, POS_ENCODING_MODE,
+            HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
             /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant>(
             params, static_cast<DTypeO*>(tmp.data_ptr()), stream);
         TORCH_CHECK(status == cudaSuccess,

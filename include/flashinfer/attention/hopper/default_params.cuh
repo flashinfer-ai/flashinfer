@@ -51,7 +51,6 @@ struct SinglePrefillParams {
 
   int qo_len;
   int kv_len;
-  int head_dim;
   int num_qo_heads;
   int num_kv_heads;
   int group_size;
@@ -97,7 +96,6 @@ struct BatchPrefillRaggedParams {
   int64_t nnz_qo;
   int64_t nnz_kv;
 
-  int head_dim;
   int num_qo_heads;
   int num_kv_heads;
   int group_size;
@@ -143,7 +141,6 @@ struct BatchPrefillPagedParams {
   int64_t o_stride_h;
   int64_t nnz_qo;
 
-  int head_dim;
   int num_qo_heads;
   int num_kv_heads;
   int group_size;

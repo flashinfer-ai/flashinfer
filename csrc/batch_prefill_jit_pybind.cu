@@ -21,7 +21,8 @@ std::vector<int64_t> BatchPrefillWithKVCachePlan(
     at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr, at::Tensor kv_indptr,
     at::Tensor kv_len_arr, unsigned total_num_rows, unsigned int batch_size,
     unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int page_size,
-    bool enable_cuda_graph, unsigned int head_dim, bool causal, int64_t cuda_stream);
+    bool enable_cuda_graph, unsigned int head_dim_qk, unsigned int head_dim_vo, bool causal,
+    int64_t cuda_stream);
 
 void BatchPrefillWithRaggedKVCacheRun(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,

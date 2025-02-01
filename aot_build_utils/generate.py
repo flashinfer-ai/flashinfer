@@ -24,6 +24,7 @@ from . import (
     generate_batch_paged_decode_inst,
     generate_batch_paged_prefill_inst,
     generate_batch_ragged_prefill_inst,
+    generate_dispatch_inc,
     generate_single_decode_inst,
     generate_single_prefill_inst,
 )
@@ -46,6 +47,19 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
     enable_fp8_e5m2: bool = args.enable_fp8_e5m2
 
     path.mkdir(parents=True, exist_ok=True)
+
+    write_if_different(
+        path / "dispatch.inc",
+        generate_dispatch_inc.get_dispatch_inc_str(
+            argparse.Namespace(
+                head_dims=head_dims,
+                head_dims_sm90=head_dims,
+                pos_encoding_modes=[0],
+                use_fp16_qk_reductions=[0],
+                mask_modes=mask_modes,
+            )
+        ),
+    )
 
     write_if_different(
         path / "aot_default_additional_params.h",
@@ -79,9 +93,10 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
             product(fp16_dtypes, fp8_dtypes)
         ):
             dtype_out = dtype_q
-            fname = f"single_decode_head_{head_dim}_posenc_{pos_encoding_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_out}.cu"
+            fname = f"single_decode_head_qk_{head_dim}_head_vo_{head_dim}_posenc_{pos_encoding_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_out}.cu"
             content = generate_single_decode_inst.get_cu_file_str(
-                head_dim,
+                head_dim,  # head_dim_qk
+                head_dim,  # head_dim_vo
                 pos_encoding_mode,
                 dtype_q,
                 dtype_kv,
@@ -93,7 +108,8 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
                         f"single_decode_with_kv_cache_dtype_q_{dtype_q}_"
                         f"dtype_kv_{dtype_kv}_"
                         f"dtype_o_{dtype_out}_"
-                        f"head_dim_{head_dim}_"
+                        f"head_dim_qk_{head_dim}_"
+                        f"head_dim_vo_{head_dim}_"
                         f"posenc_{pos_encoding_mode}_"
                         f"use_swa_{use_sliding_window}_"
                         f"use_logits_cap_{use_logits_soft_cap}"
@@ -114,9 +130,10 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
                 product(fp16_dtypes, fp8_dtypes)
             ):
                 dtype_out = dtype_q
-                fname = f"batch_paged_decode_head_{head_dim}_posenc_{pos_encoding_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_out}_idtype_{idtype}.cu"
+                fname = f"batch_paged_decode_head_qk_{head_dim}_head_vo_{head_dim}_posenc_{pos_encoding_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_out}_idtype_{idtype}.cu"
                 content = generate_batch_paged_decode_inst.get_cu_file_str(
-                    head_dim,
+                    head_dim,  # head_dim_qk
+                    head_dim,  # head_dim_vo
                     pos_encoding_mode,
                     dtype_q,
                     dtype_kv,
@@ -130,7 +147,8 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
                             f"dtype_kv_{dtype_kv}_"
                             f"dtype_o_{dtype_out}_"
                             f"dtype_idx_{idtype}_"
-                            f"head_dim_{head_dim}_"
+                            f"head_dim_qk_{head_dim}_"
+                            f"head_dim_vo_{head_dim}_"
                             f"posenc_{pos_encoding_mode}_"
                             f"use_swa_{use_sliding_window}_"
                             f"use_logits_cap_{use_logits_soft_cap}"
@@ -153,9 +171,10 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
         for dtype_q, dtype_kv in list(zip(prefill_dtypes, prefill_dtypes)) + list(
             product(prefill_dtypes, fp8_dtypes)
         ):
-            fname = f"single_prefill_head_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}.cu"
+            fname = f"single_prefill_head_qk_{head_dim}_head_vo_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}.cu"
             content = generate_single_prefill_inst.get_cu_file_str(
-                head_dim,
+                head_dim,  # head_dim_qk
+                head_dim,  # head_dim_vo
                 pos_encoding_mode,
                 use_fp16_qk_reduction,
                 mask_mode,
@@ -172,7 +191,8 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
                             f"single_prefill_with_kv_cache_dtype_q_{dtype_q}_"
                             f"dtype_kv_{dtype_kv}_"
                             f"dtype_o_{dtype_q}_"
-                            f"head_dim_{head_dim}_"
+                            f"head_dim_qk_{head_dim}_"
+                            f"head_dim_vo_{head_dim}_"
                             f"posenc_{pos_encoding_mode}_"
                             f"use_swa_{use_sliding_window}_"
                             f"use_logits_cap_{use_logits_soft_cap}_"
@@ -198,9 +218,10 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
         for dtype_q, dtype_kv in list(zip(prefill_dtypes, prefill_dtypes)) + list(
             product(prefill_dtypes, fp8_dtypes)
         ):
-            fname = f"batch_paged_prefill_head_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}.cu"
+            fname = f"batch_paged_prefill_head_qk_{head_dim}_head_vo_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}.cu"
             content = generate_batch_paged_prefill_inst.get_cu_file_str(
-                head_dim,
+                head_dim,  # head_dim_qk
+                head_dim,  # head_dim_vo
                 pos_encoding_mode,
                 use_fp16_qk_reduction,
                 mask_mode,
@@ -211,9 +232,10 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
             )
             write_if_different(path / fname, content)
 
-            fname = f"batch_ragged_prefill_head_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}.cu"
+            fname = f"batch_ragged_prefill_head_qk_{head_dim}_head_vo_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}.cu"
             content = generate_batch_ragged_prefill_inst.get_cu_file_str(
-                head_dim,
+                head_dim,  # head_dim_qk
+                head_dim,  # head_dim_vo
                 pos_encoding_mode,
                 use_fp16_qk_reduction,
                 mask_mode,
@@ -234,7 +256,8 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
                             f"dtype_kv_{dtype_kv}_"
                             f"dtype_o_{dtype_q}_"
                             f"dtype_idx_{idtype}_"
-                            f"head_dim_{head_dim}_"
+                            f"head_dim_qk_{head_dim}_"
+                            f"head_dim_vo_{head_dim}_"
                             f"posenc_{pos_encoding_mode}_"
                             f"use_swa_{sliding_window}_"
                             f"use_logits_cap_{logits_soft_cap}_"

@@ -459,7 +459,8 @@ def single_decode_with_kv_cache(
             q.dtype,
             k.dtype,
             q.dtype,
-            head_dim,
+            head_dim,  # head_dim_qk
+            head_dim,  # head_dim_vo
             PosEncodingMode[pos_encoding_mode].value,
             window_left != -1,  # use_sliding_window
             logits_soft_cap > 0,  # use_logits_soft_cap
@@ -488,7 +489,8 @@ def single_decode_with_kv_cache(
             q.dtype,
             k.dtype,
             q.dtype,
-            head_dim,
+            head_dim,  # head_dim_qk
+            head_dim,  # head_dim_vo
             PosEncodingMode[pos_encoding_mode].value,
             window_left != -1,  # use_sliding_window
             logits_soft_cap > 0,  # use_logits_soft_cap
@@ -651,8 +653,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
         )
         self._pin_memory_int_workspace_buffer = torch.empty(
-            (8 * 1024 * 1024,), dtype=torch.uint8,
-            pin_memory=True, device="cpu",
+            (8 * 1024 * 1024,),
+            dtype=torch.uint8,
+            pin_memory=True,
+            device="cpu",
         )
 
         if use_cuda_graph:
@@ -864,7 +868,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     kv_data_type,
                     q_data_type,
                     indptr.dtype,
-                    head_dim,
+                    head_dim,  # head_dim_qk
+                    head_dim,  # head_dim_vo
                     PosEncodingMode[pos_encoding_mode].value,
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
@@ -885,6 +890,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     page_size,
                     self.is_cuda_graph_enabled,
                     head_dim,
+                    head_dim,
                     False,  # causal
                     get_cuda_stream(device),
                 )
@@ -897,7 +903,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     kv_data_type,
                     q_data_type,
                     indptr.dtype,
-                    head_dim,
+                    head_dim,  # head_dim_qk
+                    head_dim,  # head_dim_vo
                     PosEncodingMode[pos_encoding_mode].value,
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
@@ -915,6 +922,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     self.is_cuda_graph_enabled,
                     window_left,
                     logits_soft_cap,
+                    head_dim,
                     head_dim,
                     torch.empty(0, dtype=q_data_type),
                     torch.empty(0, dtype=kv_data_type),
@@ -1279,8 +1287,10 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
         )
         self._pin_memory_int_workspace_buffer = torch.empty(
-            (8 * 1024 * 1024,), dtype=torch.uint8,
-            pin_memory=True, device="cpu",
+            (8 * 1024 * 1024,),
+            dtype=torch.uint8,
+            pin_memory=True,
+            device="cpu",
         )
 
         if use_cuda_graph:

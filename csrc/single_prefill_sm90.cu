@@ -23,7 +23,7 @@
 
 namespace flashinfer {
 
-template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLINDING_WINDOW,
+template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLINDING_WINDOW,
           typename AttentionVariant, typename Params>
 cudaError_t SinglePrefillWithKVCacheDispatched(Params& params, cudaStream_t stream);
 
@@ -36,7 +36,8 @@ void single_prefill_with_kv_cache_sm90(at::Tensor q, at::Tensor k, at::Tensor v,
                                        unsigned int mask_mode_code, unsigned int layout,
                                        int32_t window_left ADDITIONAL_FUNC_PARAMS,
                                        int64_t cuda_stream) {
-  unsigned int head_dim = q.size(2);
+  unsigned int head_dim_qk = q.size(2);
+  unsigned int head_dim_vo = v.size(2);
   unsigned int num_qo_heads = q.size(1);
   unsigned int qo_len = q.size(0);
 
@@ -48,8 +49,8 @@ void single_prefill_with_kv_cache_sm90(at::Tensor q, at::Tensor k, at::Tensor v,
   const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
 
   DISPATCH_context(
-      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM, USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP,
-      AttentionVariant, Params, [&] {
+      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, USE_SLIDING_WINDOW,
+      USE_LOGITS_SOFT_CAP, AttentionVariant, Params, [&] {
         Params params;
         params.q_ptr = static_cast<DTypeQ*>(q.data_ptr());
         params.k_ptr = static_cast<DTypeKV*>(k.data_ptr());
@@ -73,7 +74,6 @@ void single_prefill_with_kv_cache_sm90(at::Tensor q, at::Tensor k, at::Tensor v,
         }
         params.qo_len = q.size(0);
         params.kv_len = k.size(0);
-        params.head_dim = head_dim;
         params.num_qo_heads = q.size(1);
         params.num_kv_heads = k.size(1);
         params.causal = mask_mode == MaskMode::kCausal;
@@ -83,8 +83,9 @@ void single_prefill_with_kv_cache_sm90(at::Tensor q, at::Tensor k, at::Tensor v,
         ADDITIONAL_PARAMS_SETTER
 
         cudaError_t status =
-            SinglePrefillWithKVCacheDispatched<HEAD_DIM, MASK_MODE, USE_SLIDING_WINDOW,
-                                               AttentionVariant>(params, stream);
+            SinglePrefillWithKVCacheDispatched<HEAD_DIM_QK, HEAD_DIM_VO, MASK_MODE,
+                                               USE_SLIDING_WINDOW, AttentionVariant>(params,
+                                                                                     stream);
         TORCH_CHECK(status == cudaSuccess, "single_prefill_with_kv_cache_sm90 failed with error: " +
                                                std::string(cudaGetErrorString(status)));
         return true;

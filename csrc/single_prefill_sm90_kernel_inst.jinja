@@ -6,7 +6,7 @@ using namespace flashinfer;
 namespace flashinfer {
 
 template cudaError_t SinglePrefillWithKVCacheDispatched
-    <{{ head_dim }}, {{ mask_mode }}, /*USE_SLIDING_WINDOW=*/{{ use_sliding_window }}, {{ variant_name }}, Params>(
+    <{{ head_dim_qk }}, {{ head_dim_vo }}, {{ mask_mode }}, /*USE_SLIDING_WINDOW=*/{{ use_sliding_window }}, {{ variant_name }}, Params>(
     Params& params, cudaStream_t stream);
 
 };

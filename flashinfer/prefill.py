@@ -604,7 +604,7 @@ def single_prefill_with_kv_cache_with_jit_module(
         tmp = _get_cache_buf(
             "single_prefill_with_kv_cache_tmp", 32 * 1024 * 1024, device=device
         )
-        o = torch.empty_like(q)
+        o = torch.empty(q.shape[:-1] + v.shape[-1:], dtype=q.dtype, device=device)
         lse = None
         if return_lse:
             lse = torch.empty(
@@ -690,14 +690,14 @@ def single_prefill_with_kv_cache(
     Parameters
     ----------
     q : torch.Tensor
-        The query tensor, shape: ``[qo_len, num_qo_heads, head_dim]``.
+        The query tensor, shape: ``[qo_len, num_qo_heads, head_dim_qk]``.
     k : torch.Tensor
-        The key tensor, shape: ``[kv_len, num_kv_heads, head_dim]`` if :attr:`kv_layout`
-        is ``NHD``, or ``[num_kv_heads, kv_len, head_dim]`` if :attr:`kv_layout` is
+        The key tensor, shape: ``[kv_len, num_kv_heads, head_dim_qk]`` if :attr:`kv_layout`
+        is ``NHD``, or ``[num_kv_heads, kv_len, head_dim_qk]`` if :attr:`kv_layout` is
         ``HND``.
     v : torch.Tensor
-        The key tensor, shape: ``[kv_len, num_kv_heads, head_dim]`` if :attr:`kv_layout`
-        is ``NHD``, ``[num_kv_heads, kv_len, head_dim]`` if :attr:`kv_layout` is
+        The key tensor, shape: ``[kv_len, num_kv_heads, head_dim_vo]`` if :attr:`kv_layout`
+        is ``NHD``, ``[num_kv_heads, kv_len, head_dim_vo]`` if :attr:`kv_layout` is
         ``HND``.
     custom_mask : Optional[torch.Tensor]
         The custom boolean mask tensor, shape: ``[qo_len, kv_len]``.
@@ -733,7 +733,7 @@ def single_prefill_with_kv_cache(
         :math:`\texttt{logits_soft_cap} \times \mathrm{tanh}(x / \texttt{logits_soft_cap})`,
         where :math:`x` is the input logits.
     sm_scale : Optional[float]
-        The scale used in softmax, if not provided, will be set to ``1.0 / sqrt(head_dim)``.
+        The scale used in softmax, if not provided, will be set to ``1.0 / sqrt(head_dim_qk)``.
     rope_scale : Optional[float]
         The scale used in RoPE interpolation, if not provided, will be set to 1.0.
     rope_theta : Optional[float]
@@ -748,10 +748,10 @@ def single_prefill_with_kv_cache(
     Returns
     -------
     Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-        If :attr:`return_lse` is ``False``, the attention output, shape: ``[qo_len, num_qo_heads, head_dim]``.
+        If :attr:`return_lse` is ``False``, the attention output, shape: ``[qo_len, num_qo_heads, head_dim_vo]``.
         If :attr:`return_lse` is ``True``, a tuple of two tensors:
 
-        * The attention output, shape: ``[qo_len, num_qo_heads, head_dim]``.
+        * The attention output, shape: ``[qo_len, num_qo_heads, head_dim_vo]``.
         * The log sum exp value, shape: ``[qo_len, num_qo_heads]``.
 
     Examples
@@ -833,12 +833,13 @@ def single_prefill_with_kv_cache(
         )
     module_getter = get_single_prefill_module(backend)
 
-    out = torch.empty_like(q)
+    out = torch.empty(q.shape[:-1] + v.shape[-1:], dtype=q.dtype, device=q.device)
     module_getter(
         q.dtype,
         k.dtype,
         q.dtype,
-        q.shape[-1],
+        q.shape[-1],  # head_dim_qk
+        v.shape[-1],  # head_dim_vo
         PosEncodingMode[pos_encoding_mode].value,
         window_left >= 0,  # use_sliding_window
         logits_soft_cap > 0,  # use_logits_soft_cap
@@ -1178,8 +1179,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         paged_kv_last_page_len: torch.Tensor,
         num_qo_heads: int,
         num_kv_heads: int,
-        head_dim: int,
+        head_dim_qk: int,
         page_size: int,
+        head_dim_vo: Optional[int] = None,
         custom_mask: Optional[torch.Tensor] = None,
         packed_custom_mask: Optional[torch.Tensor] = None,
         causal: bool = False,
@@ -1211,10 +1213,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The number of query/output heads.
         num_kv_heads : int
             The number of key/value heads.
-        head_dim : int
-            The dimension of the heads.
+        head_dim_qk : int
+            The dimension of the query/key heads.
         page_size : int
             The size of each page in the paged kv-cache.
+        head_dim_vo : Optional[int]
+            The dimension of the value/output heads, if not provided, will be set to
+            ``head_dim_qk``.
         custom_mask : Optional[torch.Tensor]
             The flattened boolean mask tensor, shape: ``(sum(q_len[i] * k_len[i] for i in range(batch_size))``.
             The elements in the mask tensor should be either ``True`` or ``False``,
@@ -1285,6 +1290,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
+        if head_dim_vo is None:
+            head_dim_vo = head_dim_qk
 
         batch_size = len(qo_indptr) - 1
         if custom_mask is not None or packed_custom_mask is not None:
@@ -1402,7 +1409,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 kv_data_type,
                 q_data_type,
                 paged_kv_indptr.dtype,
-                head_dim,
+                head_dim_qk,
+                head_dim_vo,
                 PosEncodingMode[pos_encoding_mode].value,
                 window_left >= 0,  # use_sliding_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
@@ -1417,7 +1425,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if page_size != 1:
                 vector_sparse_indptr_host = torch.cat(
                     [
-                        torch.tensor([0], dtype=torch.int32, device=kv_lens_arr_host.device),
+                        torch.tensor(
+                            [0], dtype=torch.int32, device=kv_lens_arr_host.device
+                        ),
                         torch.cumsum(kv_lens_arr_host, dim=0, dtype=torch.int32),
                     ],
                     dim=0,
@@ -1441,7 +1451,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 num_kv_heads,
                 page_size,
                 self.is_cuda_graph_enabled,
-                head_dim,
+                head_dim_qk,
+                head_dim_vo,
                 causal,
                 get_cuda_stream(device),
             )
@@ -1582,7 +1593,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
             )
 
-        out = torch.empty_like(q)
+        out = torch.empty(
+            q.shape[:-1] + v_cache.shape[-1:], dtype=q.dtype, device=q.device
+        )
 
         if self._custom_mask_buf is not None:
             mask_mode = MaskMode.CUSTOM.value
@@ -1860,8 +1873,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
         )
         self._pin_memory_int_workspace_buffer = torch.empty(
-            self._int_workspace_buffer.shape, dtype=torch.uint8,
-            pin_memory=True, device="cpu",
+            self._int_workspace_buffer.shape,
+            dtype=torch.uint8,
+            pin_memory=True,
+            device="cpu",
         )
         self._use_cuda_graph = use_cuda_graph
         if use_cuda_graph:
@@ -1924,7 +1939,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         kv_indptr: torch.Tensor,
         num_qo_heads: int,
         num_kv_heads: int,
-        head_dim: int,
+        head_dim_qk: int,
+        head_dim_vo: Optional[int] = None,
         custom_mask: Optional[torch.Tensor] = None,
         packed_custom_mask: Optional[torch.Tensor] = None,
         causal: bool = False,
@@ -1950,8 +1966,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The number of query/output heads.
         num_kv_heads : int
             The number of key/value heads.
-        head_dim : int
-            The dimension of the heads.
+        head_dim_qk : int
+            The dimension of the heads on query/key tensor.
+        head_dim_vo : Optional[int]
+            The dimension of the heads on value/output tensor.
+            If not provided, will be set to ``head_dim_vo``.
         custom_mask : Optional[torch.Tensor]
             The flattened boolean mask tensor, shape: ``(sum(q_len[i] * k_len[i] for i in range(batch_size))``.
             The elements in the mask tensor should be either ``True`` or ``False``,
@@ -1991,7 +2010,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             where :math:`x` is the input logits.
         sm_scale : Optional[float]
             The scale used in softmax, if not provided, will be set to
-            ``1.0 / sqrt(head_dim)``.
+            ``1.0 / sqrt(head_dim_qk)``.
         rope_scale : Optional[float]
             The scale used in RoPE interpolation, if not provided, will be set to
             ``1.0``.
@@ -2018,6 +2037,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         if kv_data_type is None:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        if head_dim_vo is None:
+            head_dim_vo = head_dim_qk
 
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
@@ -2103,7 +2124,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 kv_data_type,
                 q_data_type,
                 kv_indptr.dtype,
-                head_dim,
+                head_dim_qk,
+                head_dim_vo,
                 PosEncodingMode[pos_encoding_mode].value,
                 window_left >= 0,  # use_sliding_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
@@ -2127,7 +2149,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 num_kv_heads,
                 1,  # page_size
                 self.is_cuda_graph_enabled,
-                head_dim,
+                head_dim_qk,
+                head_dim_vo,
                 causal,
                 get_cuda_stream(device),
             )
@@ -2202,21 +2225,21 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         Parameters
         ----------
         q : torch.Tensor
-            The query tensor, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``
+            The query tensor, shape: ``[qo_indptr[-1], num_qo_heads, head_dim_qk]``
         k : torch.Tensor
-            The key tensor, shape: ``[kv_indptr[-1], num_kv_heads, head_dim]``
+            The key tensor, shape: ``[kv_indptr[-1], num_kv_heads, head_dim_qk]``
         v : torch.Tensor
-            The value tensor, shape: ``[kv_indptr[-1], num_kv_heads, head_dim]``
+            The value tensor, shape: ``[kv_indptr[-1], num_kv_heads, head_dim_vo]``
         return_lse : bool
             Whether to return the logsumexp of attention output
 
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-            If :attr:`return_lse` is ``False``, the attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
+            If :attr:`return_lse` is ``False``, the attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim_vo]``.
             If :attr:`return_lse` is ``True``, a tuple of two tensors:
 
-            * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
+            * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim_vo]``.
             * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``.
         """
         _check_cached_qkv_data_type(
@@ -2241,7 +2264,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             lse = torch.empty(
                 (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
             )
-        out = torch.empty_like(q)
+        out = torch.empty(q.shape[:-1] + v.shape[-1:], dtype=q.dtype, device=q.device)
 
         if is_float8(q):
             logging.warning(

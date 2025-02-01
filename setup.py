@@ -133,7 +133,7 @@ def generate_cuda() -> None:
 
 ext_modules = []
 cmdclass = {}
-install_requires = ["torch", "ninja"]
+install_requires = ["numpy", "torch", "ninja"]
 generate_build_meta({})
 
 if enable_aot:

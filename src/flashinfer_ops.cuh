@@ -159,15 +159,15 @@ class BatchDecodeHandler {
   cudaStream_t stream_;
 };
 
-template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
-          bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant,
-          typename Params>
+template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+          PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
+          typename AttentionVariant, typename Params>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
                                                     float* tmp_s, cudaStream_t stream);
 
-template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE,
-          bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant,
-          typename Params>
+template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+          PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
+          typename AttentionVariant, typename Params>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
                                                    float* tmp_s, cudaStream_t stream);
 
@@ -188,7 +188,7 @@ class BatchPrefillHandler {
     return PrefillPlan<IdType>(float_buffer, float_workspace_size_in_bytes, int_buffer,
                                page_locked_buffer_, int_workspace_size_in_bytes, plan_info_,
                                qo_indptr_h, kv_indptr_h, total_num_rows, batch_size, num_qo_heads,
-                               num_kv_heads, head_dim, page_size, enable_cuda_graph_,
+                               num_kv_heads, head_dim, head_dim, page_size, enable_cuda_graph_,
                                sizeof(DTypeO), stream_);
   }
 
@@ -277,8 +277,9 @@ class BatchPrefillHandler {
   cudaStream_t stream_;
 };
 
-template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION,
-          MaskMode MASK_MODE, typename AttentionVariant, typename Params>
+template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODING_MODE,
+          bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant,
+          typename Params>
 cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::DTypeO* tmp,
                                                cudaStream_t stream);
 
@@ -306,7 +307,7 @@ cudaError_t SinglePrefillWithKVCacheCustomMask(
                           qo_stride_n, qo_stride_h, kv_stride_n, kv_stride_h, head_dim,
                           /*window_left=*/-1,
                           /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta);
-            return SinglePrefillWithKVCacheDispatched<HEAD_DIM, POS_ENCODING_MODE,
+            return SinglePrefillWithKVCacheDispatched<HEAD_DIM, HEAD_DIM, POS_ENCODING_MODE,
                                                       USE_FP16_QK_REDUCTION, MaskMode::kCustom,
                                                       AttentionVariant>(params, tmp, stream);
           })})});
@@ -368,7 +369,7 @@ cudaError_t SinglePrefillWithKVCache(DTypeQ* q, DTypeKV* k, DTypeKV* v, DTypeO* 
                               qo_stride_n, qo_stride_h, kv_stride_n, kv_stride_h, head_dim,
                               /*window_left=*/-1,
                               /*logits_soft_cap=*/0.f, sm_scale, rope_scale, rope_theta);
-                return SinglePrefillWithKVCacheDispatched<HEAD_DIM, POS_ENCODING_MODE,
+                return SinglePrefillWithKVCacheDispatched<HEAD_DIM, HEAD_DIM, POS_ENCODING_MODE,
                                                           USE_FP16_QK_REDUCTION, MASK_MODE,
                                                           AttentionVariant, Params>(params, tmp,
                                                                                     stream);
@@ -419,9 +420,9 @@ cudaError_t BatchPrefillWithRaggedKVCacheWrapper(
                 params.padded_batch_size = plan_info.padded_batch_size;
 
                 DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
-                  BatchPrefillWithRaggedKVCacheDispatched<CTA_TILE_Q, HEAD_DIM, POS_ENCODING_MODE,
-                                                          USE_FP16_QK_REDUCTION, MASK_MODE,
-                                                          AttentionVariant>(
+                  BatchPrefillWithRaggedKVCacheDispatched<CTA_TILE_Q, HEAD_DIM, HEAD_DIM,
+                                                          POS_ENCODING_MODE, USE_FP16_QK_REDUCTION,
+                                                          MASK_MODE, AttentionVariant>(
                       params, handler->GetTmpV<DTypeO>(), handler->GetTmpS(), stream);
                 });
               })})})});
@@ -471,9 +472,9 @@ cudaError_t BatchPrefillWithPagedKVCacheWrapper(
                 params.padded_batch_size = plan_info.padded_batch_size;
                 DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
                   return BatchPrefillWithPagedKVCacheDispatched<
-                      CTA_TILE_Q, HEAD_DIM, POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE,
-                      AttentionVariant>(params, handler->GetTmpV<DTypeO>(), handler->GetTmpS(),
-                                        stream);
+                      CTA_TILE_Q, HEAD_DIM, HEAD_DIM, POS_ENCODING_MODE, USE_FP16_QK_REDUCTION,
+                      MASK_MODE, AttentionVariant>(params, handler->GetTmpV<DTypeO>(),
+                                                   handler->GetTmpS(), stream);
                 })
               })})})});
   return cudaSuccess;

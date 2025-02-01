@@ -142,6 +142,7 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0>& tenso
 template <int NUM_ROWS_PER_THREAD>
 struct DefaultUpdater {
   using TensorT = decltype(make_tensor<float>(Shape<Int<NUM_ROWS_PER_THREAD>>{}));
+  constexpr static float fill_value = 0.f;
   template <typename MainloopParams>
   CUTLASS_DEVICE DefaultUpdater(MainloopParams params) {};
 
@@ -165,6 +166,7 @@ struct DefaultUpdater {
 
 template <int NUM_ROWS_PER_THREAD, bool WITH_SCALE>
 struct OnlineSoftmax {
+  constexpr static float fill_value = -math::inf;
   using TensorT = decltype(make_tensor<float>(Shape<Int<NUM_ROWS_PER_THREAD>>{}));
   TensorT row_max, row_sum, scores_scale;
   float sm_scale_log2;
