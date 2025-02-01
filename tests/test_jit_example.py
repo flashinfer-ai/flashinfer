@@ -128,15 +128,18 @@ struct FlashSigmoid {
 
 flash_sigmoid_sm90_decl = r"""
 struct FlashSigmoid {
-  template <int NUM_ROWS_PER_THREAD>
-  using Updater = DefaultUpdater<NUM_ROWS_PER_THREAD>;
-
   float logits_scale_log2, sigmoid_bias_log2e;
   // Init
   template <typename MainloopParams, typename BlockCoord>
   __device__ __host__ FlashSigmoid(const MainloopParams& params, const BlockCoord& block_coord) {
     logits_scale_log2 = params.additional_params.logits_scale * math::log2e;
     sigmoid_bias_log2e = params.additional_params.sigmoid_bias * math::log2e;
+  }
+
+
+  template <int NUM_ROWS_PER_THREAD>
+  __device__ auto GetAttentionUpdater() {
+    return DefaultUpdater<NUM_ROWS_PER_THREAD>();
   }
 
   template <typename MainloopParams, typename T>
@@ -676,10 +679,6 @@ def test_sm90_debug_print_logits():
     torch.manual_seed(42)
     variant_decl = r"""
 struct DebugPrintLogits {
-
-  template <int NUM_ROWS_PER_THREAD>
-  using Updater = OnlineSoftmaxWithoutScale<NUM_ROWS_PER_THREAD>;
-
   float sm_scale_log2;
   int qo_len, kv_len;
 
@@ -693,6 +692,13 @@ struct DebugPrintLogits {
     qo_len = qo_len_;
     kv_len = kv_len_;
   }
+
+
+  template <int NUM_ROWS_PER_THREAD>
+  __device__ auto GetAttentionUpdater() {
+    return OnlineSoftmax<NUM_ROWS_PER_THREAD, /*WITH_SCALE*/true>(sm_scale_log2);
+  }
+
 
   template <typename MainloopParams, typename T>
   __device__ __forceinline__ T LogitsTransform(const MainloopParams& params, T logits,

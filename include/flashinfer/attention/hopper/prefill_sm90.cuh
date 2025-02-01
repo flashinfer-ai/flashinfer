@@ -14,7 +14,6 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
-#include <driver_types.h>
 
 #include <type_traits>
 #include <vector>
@@ -60,8 +59,6 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
 
   static constexpr bool use_tma_load_kv = CollectiveMainloop::USE_TMA_LOAD_KV;
 
-  using AttentionUpdater =
-      typename AttentionVariant::template Updater<2 * (2 * CTA_Q / NUM_MMA_THREADS)>;
   using MainloopPipeline = typename CollectiveMainloop::MainloopPipeline;
   using PipelineParams = typename MainloopPipeline::Params;
   using PipelineState = typename MainloopPipeline::PipelineState;
@@ -191,13 +188,14 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
                                                                                   work_tile_info)) {
       // Attention output (GEMM-II) accumulator.
       Tensor tOrO = partition_fragment_C(tiled_mma_pv, select<0, 1>(TileShape_PDV{}));
-      AttentionUpdater attention_updater(mainloop_params);
 
       auto block_coord = work_tile_info.get_block_coord(scheduler_params);
       auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len] =
           block_coord;
 
       AttentionVariant variant(mainloop_params, block_coord);
+      auto attention_updater =
+          variant.template GetAttentionUpdater<2 * (2 * CTA_Q / NUM_MMA_THREADS)>();
 
       if (q_tile_idx * CTA_Q >= qo_len) {
         continue;
