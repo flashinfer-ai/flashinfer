@@ -39,11 +39,10 @@ FlashInfer support PyTorch, TVM and C++ (header-only) APIs, and can be easily in
 ## Getting Started
 
 Using our PyTorch API is the easiest way to get started:
-### Installation
 
-#### Install from PIP
+### Install from PIP
 
-We provide prebuilt wheels for Linux. Install FlashInfer with the following command:
+We provide prebuilt python wheels for Linux. Install FlashInfer with the following command:
 
 ```bash
 # For CUDA 12.4 & torch 2.5
@@ -63,7 +62,7 @@ For a JIT version (compiling every kernel from scratch, [NVCC](https://developer
 pip install flashinfer-python
 ```
 
-#### Install from Source
+### Install from Source
 
 Alternatively, build FlashInfer from source:
 
