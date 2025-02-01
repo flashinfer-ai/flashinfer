@@ -36,7 +36,8 @@ def test_warmpup_llama():
                     torch.float16,
                     torch.float16,
                     torch.int32,
-                    128,
+                    128,  # head_dim_qk
+                    128,  # head_dim_vo
                     PosEncodingMode.NONE.value,
                     False,  # use_sliding_window
                     False,  # use_logits_soft_cap
@@ -45,11 +46,13 @@ def test_warmpup_llama():
             (
                 flashinfer.prefill.gen_batch_prefill_module,
                 [
+                    "fa2",  # backend
                     torch.float16,
                     torch.float16,
                     torch.float16,
                     torch.int32,
-                    128,
+                    128,  # head_dim_qk
+                    128,  # head_dim_vo
                     PosEncodingMode.NONE.value,
                     False,  # use_sliding_window
                     False,  # use_logits_soft_cap
@@ -75,7 +78,8 @@ def test_warmpup_llama_sm90():
                     torch.float16,
                     torch.float16,
                     torch.int32,
-                    128,
+                    128,  # head_dim_qk
+                    128,  # head_dim_vo
                     PosEncodingMode.NONE.value,
                     False,  # use_sliding_window
                     False,  # use_logits_soft_cap
@@ -84,11 +88,13 @@ def test_warmpup_llama_sm90():
             (
                 flashinfer.prefill.gen_batch_prefill_module,
                 [
+                    "fa2",  # backend
                     torch.float16,
                     torch.float16,
                     torch.float16,
                     torch.int32,
-                    128,
+                    128,  # head_dim_qk
+                    128,  # head_dim_vo
                     PosEncodingMode.NONE.value,
                     False,  # use_sliding_window
                     False,  # use_logits_soft_cap
@@ -96,13 +102,15 @@ def test_warmpup_llama_sm90():
                 ],
             ),
             (
-                flashinfer.prefill.gen_batch_prefill_sm90_module,
+                flashinfer.prefill.gen_batch_prefill_module,
                 [
+                    "fa3",  # backend
                     torch.float16,
                     torch.float16,
                     torch.float16,
                     torch.int32,
-                    128,
+                    128,  # head_dim_qk
+                    128,  # head_dim_vo
                     PosEncodingMode.NONE.value,
                     False,  # use_sliding_window
                     False,  # use_logits_soft_cap
