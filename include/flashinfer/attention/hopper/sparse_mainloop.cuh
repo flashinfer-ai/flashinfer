@@ -33,19 +33,6 @@ namespace flashinfer {
 
 using namespace cute;
 
-constexpr int nextPowerOfTwo(int x) {
-  if (x <= 1) {
-    return 1;
-  }
-  --x;
-  x |= (x >> 1);
-  x |= (x >> 2);
-  x |= (x >> 4);
-  x |= (x >> 8);
-  x |= (x >> 16);
-  return x + 1;
-}
-
 template <typename AdditionalParams, typename Ktraits, bool CAUSAL>
 struct SparseCollectiveMainloop {
   using DTypeQ = typename Ktraits::DTypeQ;
@@ -72,9 +59,6 @@ struct SparseCollectiveMainloop {
                GmemCopyAtomKV, NUM_COPY_THREADS, AlignmentKV,
                cutlass::detail::TagToStrideB_t<cutlass::layout::ColumnMajor>,
                decltype(cute::get<1>(TileShape_QKD{})), decltype(cute::get<2>(TileShape_QKD{}))>());
-  static constexpr bool IsFullLoadK = nextPowerOfTwo(HEAD_DIM_QK) == HEAD_DIM_QK;
-  // static constexpr bool IsFullLoadK = false;
-  static constexpr bool IsFullLoadV = true;
   using GmemTiledCopyV =
       decltype(cutlass::gemm::collective::detail::make_simt_gmem_tiled_copy<
                GmemCopyAtomKV, NUM_COPY_THREADS, AlignmentKV,
@@ -245,20 +229,11 @@ struct SparseCollectiveMainloop {
     int valid_last_kv_tile_size = std::min<int>(kv_len - kv_tile_idx * CTA_KV, CTA_KV);
     auto k_predicate_fn = [&](auto coords) {
       auto s_coords = tKcKGroup(_0{}, coords);
-      // if constexpr (!IsFullLoadK) {
-      //   return elem_less(get<0>(s_coords), valid_last_kv_tile_size) &&
-      //          elem_less(get<1>(s_coords), HEAD_DIM_QK);
-      // }
       return elem_less(get<0>(s_coords), valid_last_kv_tile_size);
     };
     auto v_predicate_fn = [&](auto coords) {
       auto s_coords = tVcVGroup(_0{}, coords);
       return elem_less(get<0>(s_coords), valid_last_kv_tile_size);
-    };
-    auto k_predicate_head_dim_fn = [&](auto coords) {
-      // auto s_coords = tKcKGroup(_0{}, coords);
-      // return elem_less(get<1>(s_coords), HEAD_DIM_QK);
-      return true;
     };
 
     // load last k-tile
@@ -305,11 +280,7 @@ struct SparseCollectiveMainloop {
       pipeline_k.producer_acquire(smem_pipe_write_k);
       Tensor tKgKi = tKgK(_, _, _, kv_tile_idx - 1);            // (CPY, CPY_KV, CPY_D)
       Tensor tKsKi = tKsK(_, _, _, smem_pipe_write_k.index());  // (CPY, CPY_KV, CPY_D)
-      if constexpr (IsFullLoadK) {
-        copy(gmem_tiled_copy_k, tKgKi, tKsKi);
-      } else {
-        copy_if(gmem_tiled_copy_k, k_predicate_head_dim_fn, tKgKi, tKsKi);
-      }
+      copy(gmem_tiled_copy_k, tKgKi, tKsKi);
 
       pipeline_k.producer_commit(smem_pipe_write_k, cutlass::arch::cpasync_barrier_arrive);
       ++smem_pipe_write_k;
@@ -331,11 +302,7 @@ struct SparseCollectiveMainloop {
 
         Tensor tKgKi = tKgK(_, _, _, kv_tile_idx - 1);            // (CPY, CPY_KV, CPY_D)
         Tensor tKsKi = tKsK(_, _, _, smem_pipe_write_k.index());  // (CPY, CPY_KV, CPY_D)
-        if constexpr (IsFullLoadK) {
-          copy(gmem_tiled_copy_k, tKgKi, tKsKi);
-        } else {
-          copy_if(gmem_tiled_copy_k, k_predicate_head_dim_fn, tKgKi, tKsKi);
-        }
+        copy(gmem_tiled_copy_k, tKgKi, tKsKi);
 
         pipeline_k.producer_commit(smem_pipe_write_k, cutlass::arch::cpasync_barrier_arrive);
         ++smem_pipe_write_k;
