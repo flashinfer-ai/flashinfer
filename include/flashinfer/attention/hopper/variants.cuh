@@ -28,7 +28,7 @@ struct StandardAttention {
 
   template <typename MainloopParams, typename BlockCoord>
   __device__ StandardAttention(const MainloopParams& params, const BlockCoord& block_coord) {
-    sm_scale_log2 = params.sm_scale * math::log2e;
+    sm_scale_log2 = params.additional_params.sm_scale * math::log2e;
   }
 
   template <int NUM_ROWS_PER_THREAD>
