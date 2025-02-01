@@ -252,12 +252,6 @@ struct OnlineSoftmax {
   };
 };
 
-template <int NUM_ROWS_PER_THREAD>
-using OnlineSoftmaxWithScale = OnlineSoftmax<NUM_ROWS_PER_THREAD, /*WITH_SCALE=*/true>;
-
-template <int NUM_ROWS_PER_THREAD>
-using OnlineSoftmaxWithoutScale = OnlineSoftmax<NUM_ROWS_PER_THREAD, /*WITH_SCALE=*/false>;
-
 }  // namespace flashinfer
 
 #endif  // FLASHINFER_ATTENTION_HOPPER_ATTENTION_UPDATER_CUH_

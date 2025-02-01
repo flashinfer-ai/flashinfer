@@ -32,7 +32,7 @@ struct StandardAttention {
   }
 
   template <int NUM_ROWS_PER_THREAD>
-  auto GetAttentionUpdater() {
+  __device__ auto GetAttentionUpdater() {
     return OnlineSoftmax<NUM_ROWS_PER_THREAD, /*WITH_SCALE=*/true>(sm_scale_log2);
   }
 
@@ -56,7 +56,7 @@ struct LogitsSoftCap {
   }
 
   template <int NUM_ROWS_PER_THREAD>
-  auto GetAttentionUpdater() {
+  __device__ auto GetAttentionUpdater() {
     return OnlineSoftmax<NUM_ROWS_PER_THREAD, /*WITH_SCALE=*/false>(0.);
   }
 

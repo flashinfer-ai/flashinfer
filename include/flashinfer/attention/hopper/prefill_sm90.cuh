@@ -194,7 +194,8 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
           block_coord;
 
       AttentionVariant variant(mainloop_params, block_coord);
-      auto attention_updater = variant.GetAttentionUpdater<2 * (2 * CTA_Q / NUM_MMA_THREADS)>();
+      auto attention_updater =
+          variant.template GetAttentionUpdater<2 * (2 * CTA_Q / NUM_MMA_THREADS)>();
 
       if (q_tile_idx * CTA_Q >= qo_len) {
         continue;
