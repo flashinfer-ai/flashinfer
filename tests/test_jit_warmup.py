@@ -36,8 +36,8 @@ def test_warmpup_llama():
                     torch.float16,
                     torch.float16,
                     torch.int32,
-                    128,
-                    128,
+                    128,  # head_dim_qk
+                    128,  # head_dim_vo
                     PosEncodingMode.NONE.value,
                     False,  # use_sliding_window
                     False,  # use_logits_soft_cap
@@ -51,8 +51,8 @@ def test_warmpup_llama():
                     torch.float16,
                     torch.float16,
                     torch.int32,
-                    128,
-                    128,
+                    128,  # head_dim_qk
+                    128,  # head_dim_vo
                     PosEncodingMode.NONE.value,
                     False,  # use_sliding_window
                     False,  # use_logits_soft_cap
@@ -78,8 +78,8 @@ def test_warmpup_llama_sm90():
                     torch.float16,
                     torch.float16,
                     torch.int32,
-                    128,
-                    128,
+                    128,  # head_dim_qk
+                    128,  # head_dim_vo
                     PosEncodingMode.NONE.value,
                     False,  # use_sliding_window
                     False,  # use_logits_soft_cap
@@ -93,8 +93,8 @@ def test_warmpup_llama_sm90():
                     torch.float16,
                     torch.float16,
                     torch.int32,
-                    128,
-                    128,
+                    128,  # head_dim_qk
+                    128,  # head_dim_vo
                     PosEncodingMode.NONE.value,
                     False,  # use_sliding_window
                     False,  # use_logits_soft_cap
@@ -109,8 +109,8 @@ def test_warmpup_llama_sm90():
                     torch.float16,
                     torch.float16,
                     torch.int32,
-                    128,
-                    128,
+                    128,  # head_dim_qk
+                    128,  # head_dim_vo
                     PosEncodingMode.NONE.value,
                     False,  # use_sliding_window
                     False,  # use_logits_soft_cap
