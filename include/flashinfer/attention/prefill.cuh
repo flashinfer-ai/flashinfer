@@ -895,6 +895,17 @@ __device__ __forceinline__ void normalize_d(AttentionVariant variant,
   }
 }
 
+template <uint32_t NUM_WARPS_Q, uint32_t NUM_WARPS_KV, uint32_t NUM_MMA_Q, uint32_t HEAD_DIM_VO,
+          typename DTypeO>
+constexpr size_t SmemSizeThreadBlockAttnSync() {
+  if constexpr (NUM_WARPS_KV == 1) {
+    return 0;
+  } else {
+    return (NUM_WARPS_Q * NUM_WARPS_KV) * (NUM_MMA_Q * 16) * HEAD_DIM_VO * sizeof(float) +
+           (NUM_WARPS_Q * NUM_WARPS_KV) * (NUM_MMA_Q * 16) * 2 * sizeof(float);
+  }
+}
+
 /*!
  * \brief Synchronize the states of the MDO kernel across the threadblock along threadIdx.z.
  */
@@ -908,7 +919,7 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(
     float2* smem_md = (float2*)(smem_workspace + NUM_MMA_Q * NUM_MMA_D_VO * NUM_WARPS_Q *
                                                      NUM_WARPS_KV * WARP_SIZE * 8);
     // o: [num_warps, NUM_MMA_Q, NUM_MMA_D_VO, WARP_SIZE(32), 8]
-    // md: [num_warps, NUM_MMA_Q, 2, WARP_SIZE(32), 2 (m/d)]
+    // md: [num_warps, NUM_MMA_Q, 16, 2 (m/d)]
 #pragma unroll
     for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
 #pragma unroll
@@ -926,7 +937,7 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(
       for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
 #pragma unroll
         for (uint32_t j = 0; j < 2; ++j) {
-          smem_md[((warp_idx * NUM_MMA_Q + mma_q) * 2 + j) * WARP_SIZE + lane_idx] =
+          smem_md[((warp_idx * NUM_MMA_Q + mma_q) * 2 + j) * 8 + lane_idx / 4] =
               make_float2(float(m[mma_q][j]), d[mma_q][j]);
         }
       }
@@ -946,8 +957,8 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(
                                   mma_q) *
                                      2 +
                                  j) *
-                                    WARP_SIZE +
-                                lane_idx];
+                                    8 +
+                                lane_idx / 4];
             float m_prev = m_new, d_prev = d_new;
             m_new = max(m_new, md.x);
             d_new = d_prev * math::ptx_exp2(m_prev - m_new) + md.y * math::ptx_exp2(md.x - m_new);
@@ -960,8 +971,8 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(
                                   mma_q) *
                                      2 +
                                  j) *
-                                    WARP_SIZE +
-                                lane_idx];
+                                    8 +
+                                lane_idx / 4];
             float mi = md.x;
             o_scale[j][i] = math::ptx_exp2(float(mi - m_new));
           }
@@ -1465,9 +1476,11 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
                                            NUM_MMA_D_VO, NUM_MMA_KV, NUM_WARPS_Q, NUM_WARPS_KV,
                                            DTypeQKAccum, AttentionVariant, Params>;
         // TODO(Zihao): fix the following computation
-        uint32_t smem_size = (NUM_MMA_Q * NUM_WARPS_Q * sizeof(DTypeQ)) * 16 * HEAD_DIM_QK +
-                             (NUM_MMA_KV * NUM_WARPS_KV * sizeof(DTypeKV)) * 16 * HEAD_DIM_QK +
-                             (NUM_MMA_KV * NUM_WARPS_KV * sizeof(DTypeKV)) * 16 * HEAD_DIM_VO;
+        size_t smem_size =
+            max(SmemSizeThreadBlockAttnSync<NUM_WARPS_Q, NUM_WARPS_KV, NUM_MMA_Q, HEAD_DIM_VO,
+                                            DTypeO>(),
+                NUM_MMA_Q * NUM_WARPS_Q * 16 * HEAD_DIM_QK * sizeof(DTypeQ) +
+                    NUM_MMA_KV * NUM_WARPS_KV * 16 * (HEAD_DIM_QK + HEAD_DIM_VO) * sizeof(DTypeKV));
         FLASHINFER_CUDA_CALL(
             cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         int num_blocks_per_sm = 0;
@@ -2139,6 +2152,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
                                                     float* tmp_s, cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
+  using DTypeO = typename Params::DTypeO;
   const uint32_t padded_batch_size = params.padded_batch_size;
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.num_kv_heads;
@@ -2196,9 +2210,10 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
       FLASHINFER_ERROR(err_msg.str());
     } else {
       // TODO(Zihao): fix the following computation
-      uint32_t smem_size = (NUM_MMA_Q * NUM_WARPS_Q * sizeof(DTypeQ)) * 16 * HEAD_DIM_QK +
-                           (NUM_MMA_KV * NUM_WARPS_KV * sizeof(DTypeKV)) * 16 * HEAD_DIM_QK +
-                           (NUM_MMA_KV * NUM_WARPS_KV * sizeof(DTypeKV)) * 16 * HEAD_DIM_VO;
+      size_t smem_size = max(
+          SmemSizeThreadBlockAttnSync<NUM_WARPS_Q, NUM_WARPS_KV, NUM_MMA_Q, HEAD_DIM_VO, DTypeO>(),
+          NUM_MMA_Q * NUM_WARPS_Q * 16 * HEAD_DIM_QK * sizeof(DTypeQ) +
+              NUM_MMA_KV * NUM_WARPS_KV * 16 * (HEAD_DIM_QK + HEAD_DIM_VO) * sizeof(DTypeKV));
       auto kernel =
           BatchPrefillWithRaggedKVCacheKernel<MASK_MODE, POS_ENCODING_MODE, NUM_MMA_Q, NUM_MMA_D_QK,
                                               NUM_MMA_D_VO, NUM_MMA_KV, NUM_WARPS_Q, NUM_WARPS_KV,
@@ -2243,6 +2258,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
                                                    float* tmp_s, cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
+  using DTypeO = typename Params::DTypeO;
   const uint32_t padded_batch_size = params.padded_batch_size;
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.paged_kv.num_heads;
@@ -2301,9 +2317,10 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
       FLASHINFER_ERROR(err_msg.str());
     } else {
       // TODO(Zihao): fix the following computation
-      uint32_t smem_size = (NUM_MMA_Q * NUM_WARPS_Q * sizeof(DTypeQ)) * 16 * HEAD_DIM_QK +
-                           (NUM_MMA_KV * NUM_WARPS_KV * sizeof(DTypeKV)) * 16 * HEAD_DIM_QK +
-                           (NUM_MMA_KV * NUM_WARPS_KV * sizeof(DTypeKV)) * 16 * HEAD_DIM_VO;
+      size_t smem_size = max(
+          SmemSizeThreadBlockAttnSync<NUM_WARPS_Q, NUM_WARPS_KV, NUM_MMA_Q, HEAD_DIM_VO, DTypeO>(),
+          NUM_MMA_Q * NUM_WARPS_Q * 16 * HEAD_DIM_QK * sizeof(DTypeQ) +
+              NUM_MMA_KV * NUM_WARPS_KV * 16 * (HEAD_DIM_QK + HEAD_DIM_VO) * sizeof(DTypeKV));
       auto kernel =
           BatchPrefillWithPagedKVCacheKernel<MASK_MODE, POS_ENCODING_MODE, NUM_MMA_Q, NUM_MMA_D_QK,
                                              NUM_MMA_D_VO, NUM_MMA_KV, NUM_WARPS_Q, NUM_WARPS_KV,
