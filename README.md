@@ -39,24 +39,33 @@ FlashInfer support PyTorch, TVM and C++ (header-only) APIs, and can be easily in
 ## Getting Started
 
 Using our PyTorch API is the easiest way to get started:
-
 ### Installation
 
-We provide prebuilt wheels for Linux. You can install FlashInfer with the following command:
+#### Install from PIP
+
+We provide prebuilt wheels for Linux. Install FlashInfer with the following command:
 
 ```bash
-# For CUDA 12.4 & torch 2.4
-pip install flashinfer -i https://flashinfer.ai/whl/cu124/torch2.4
-# For other CUDA & torch versions, please check https://docs.flashinfer.ai/installation.html
+# For CUDA 12.4 & torch 2.5
+pip install flashinfer-python -i https://flashinfer.ai/whl/cu124/torch2.5
+# For other CUDA & torch versions, check https://docs.flashinfer.ai/installation.html
 ```
 
-We also offer nightly-built wheels to try the latest features from the main branch:
+To try the latest features from the main branch, use our nightly-built wheels:
 
 ```bash
-pip install flashinfer -i https://flashinfer.ai/whl/nightly/cu124/torch2.4
+pip install flashinfer-python -i https://flashinfer.ai/whl/nightly/cu124/torch2.4
 ```
 
-Alternatively, you can build FlashInfer from source:
+For a JIT version (compiling every kernel from scratch, [NVCC](https://developer.nvidia.com/cuda-downloads) is required), install from [PyPI](https://pypi.org/project/flashinfer-python/):
+
+```bash
+pip install flashinfer-python
+```
+
+#### Install from Source
+
+Alternatively, build FlashInfer from source:
 
 ```bash
 git clone https://github.com/flashinfer-ai/flashinfer.git --recursive
@@ -64,7 +73,7 @@ cd flashinfer
 pip install -e . -v
 ```
 
-By default, FlashInfer uses Just-In-Time (JIT) compilation for its kernels. To pre-compile essential kernels, set the environment variable `FLASHINFER_ENABLE_AOT=1` before running the installation command:
+To pre-compile essential kernels, set the environment variable `FLASHINFER_ENABLE_AOT=1` before running the installation command:
 
 ```bash
 FLASHINFER_ENABLE_AOT=1 pip install -e . -v
@@ -108,6 +117,10 @@ o = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=False) # prefill att
 ```
 
 Check out [documentation](https://docs.flashinfer.ai/) for usage of batch decode/append/prefill kernels and shared-prefix cascading kernels.
+
+## Custom Attention Variants
+
+Starting from FlashInfer v0.2, users can customize their own attention variants with additional parameters. For more details, refer to our [JIT examples](https://github.com/flashinfer-ai/flashinfer/blob/main/tests/test_jit_example.py).
 
 ## Run Benchmarks
 
