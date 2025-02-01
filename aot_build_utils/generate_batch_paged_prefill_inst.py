@@ -37,7 +37,6 @@ def get_cu_file_str(
     dtype_out,
     idtype,
 ):
-    print(head_dim_qk, head_dim_vo)
     cta_tile_q_choice = [128, 64, 16]
 
     def get_insts(attention_variant, dtype_out):
