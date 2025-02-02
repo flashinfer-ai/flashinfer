@@ -390,7 +390,10 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
 template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
           uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
           typename Params>
-__global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params params) {
+__device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params &params, 
+    uint8_t smem[], const uint32_t bx = blockIdx.x, const uint32_t by = blockIdx.y, 
+    const uint32_t tx = threadIdx.x, const uint32_t ty = threadIdx.y, 
+    const uint32_t tz = threadIdx.z) {
   auto block = cg::this_thread_block();
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
@@ -406,7 +409,6 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params
   const bool partition_kv = params.partition_kv;
 
   constexpr uint32_t head_dim = bdx * vec_size;
-  const uint32_t bx = blockIdx.x, by = blockIdx.y;
   const uint32_t batch_idx = params.request_indices[bx];
   const uint32_t kv_tile_idx = params.kv_tile_indices[bx];
   const uint32_t kv_head_idx = by;
@@ -422,7 +424,6 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params
       partition_kv ? min((kv_tile_idx + 1) * max_chunk_size, kv_len) : kv_len;
   const uint32_t chunk_size = chunk_end - chunk_start;
 
-  extern __shared__ uint8_t smem[];
   AttentionVariant variant(params, batch_idx, smem);
   DTypeKV* k_smem = (DTypeKV*)smem;
   DTypeKV* v_smem = (DTypeKV*)(smem + num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
@@ -432,7 +433,6 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params
   float* smem_md = (float*)(smem + 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
                                        sizeof(DTypeKV));
 
-  const uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
   vec_t<float, vec_size> q_vec;
   vec_t<float, vec_size> freq;
   const uint32_t q_stride_n = params.q_stride_n;
@@ -583,6 +583,16 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params
       lse[bx * num_qo_heads + qo_head_idx] = st.get_lse();
     }
   }
+}
+
+template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
+          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
+          typename Params>
+__global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params params) {
+  extern __shared__ uint8_t smem[];
+  BatchDecodeWithPagedKVCacheDevice<POS_ENCODING_MODE, num_stages_smem, tile_size_per_bdx,
+          vec_size, bdx, bdy, bdz, AttentionVariant>
+        (params, smem);
 }
 
 /*!
