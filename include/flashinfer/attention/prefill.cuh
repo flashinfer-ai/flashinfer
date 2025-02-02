@@ -811,9 +811,9 @@ __device__ __forceinline__ void compute_sfm_v(AttentionVariant variant,
 #pragma unroll
       for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV; ++mma_kv) {
         if constexpr (std::is_same_v<DTypeQKAccum, float>) {
-          mma::rowsum_f16f16f32(d[mma_q], s_frag_f16[mma_q][mma_kv]);
+          mma::m16k16_rowsum_f16f16f32(d[mma_q], s_frag_f16[mma_q][mma_kv]);
         } else {
-          mma::rowsum_f16f16f32(d[mma_q], s_frag[mma_q][mma_kv]);
+          mma::m16k16_rowsum_f16f16f32(d[mma_q], s_frag[mma_q][mma_kv]);
         }
       }
     }
