@@ -35,12 +35,14 @@ from .attention import (
 )
 from .attention import gen_single_decode_module as gen_single_decode_module
 from .attention import gen_single_prefill_module as gen_single_prefill_module
+from .attention import gen_pod_module as gen_pod_module
 from .attention import get_batch_decode_mla_uri as get_batch_decode_mla_uri
 from .attention import get_batch_decode_uri as get_batch_decode_uri
 from .attention import get_batch_mla_uri as get_batch_mla_uri
 from .attention import get_batch_prefill_uri as get_batch_prefill_uri
 from .attention import get_single_decode_uri as get_single_decode_uri
 from .attention import get_single_prefill_uri as get_single_prefill_uri
+from .attention import get_pod_uri as get_pod_uri
 from .core import clear_cache_dir, load_cuda_ops  # noqa: F401
 from .env import *
 from .utils import parallel_load_modules as parallel_load_modules

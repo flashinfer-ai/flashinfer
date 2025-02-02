@@ -313,6 +313,28 @@ def get_single_prefill_uri(
     )
 
 
+def get_pod_uri(
+    backend: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    head_dim: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+    use_fp16_qk_reduction: bool,
+) -> str:
+    return (
+        f"pod_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
+        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
+        f"head_dim_{head_dim}_"
+        f"posenc_{pos_encoding_mode}_"
+        f"use_swa_{use_sliding_window}_"
+        f"use_logits_cap_{use_logits_soft_cap}_"
+        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+    )
+
 def get_batch_prefill_uri(
     backend: str,
     dtype_q: torch.dtype,
@@ -448,6 +470,67 @@ def gen_single_prefill_module(
         use_fp16_qk_reduction=use_fp16_qk_reduction,
     )
 
+
+def gen_pod_module(
+    backend: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    head_dim: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+    use_fp16_qk_reduction: bool,
+):
+    uri = get_pod_uri(
+        backend,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        head_dim,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_logits_soft_cap,
+        use_fp16_qk_reduction,
+    )
+    if backend == "fa2":
+        additional_tensor_names = ["maybe_custom_mask", "maybe_alibi_slopes"]
+        additional_tensor_dtypes = ["uint8_t", "float"]
+        additional_scalar_names = [
+            "logits_soft_cap",
+            "sm_scale",
+            "rope_rcp_scale",
+            "rope_rcp_theta",
+        ]
+        additional_scalar_dtypes = ["float", "float", "float", "float"]
+        variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
+        variant_decl = f"#include<flashinfer/attention/variants.cuh>"
+    else:
+        additional_tensor_names = []
+        additional_tensor_dtypes = []
+        additional_scalar_names = ["logits_soft_cap", "sm_scale"]
+        additional_scalar_dtypes = ["float", "float"]
+        variant_name = f"DefaultAttention<{str(use_logits_soft_cap).lower()}>"
+        variant_decl = f"#include<flashinfer/attention/hopper/variants.cuh>"
+
+    return gen_customize_pod_module(
+        backend,
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        head_dim,
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+        variant_name,
+        variant_decl,
+        pos_encoding_mode=pos_encoding_mode,
+        use_sliding_window=use_sliding_window,
+        use_logits_soft_cap=use_logits_soft_cap,
+        use_fp16_qk_reduction=use_fp16_qk_reduction,
+    )
 
 def gen_batch_decode_module(
     dtype_q: torch.dtype,
