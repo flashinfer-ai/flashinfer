@@ -56,7 +56,7 @@ struct SinglePrefillParams {
   float rope_rcp_scale;
   float rope_rcp_theta;
 
-  bool partition_kv;
+  uint32_t partition_kv;
 
   __host__ SinglePrefillParams()
       : q(nullptr),
