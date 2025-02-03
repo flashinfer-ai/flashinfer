@@ -24,7 +24,6 @@ from . import (
     generate_batch_paged_decode_inst,
     generate_batch_paged_prefill_inst,
     generate_batch_ragged_prefill_inst,
-    generate_dispatch_inc,
     generate_single_decode_inst,
     generate_single_prefill_inst,
 )
@@ -47,19 +46,6 @@ def get_instantiation_cu(args: argparse.Namespace) -> List[str]:
     enable_fp8_e5m2: bool = args.enable_fp8_e5m2
 
     path.mkdir(parents=True, exist_ok=True)
-
-    write_if_different(
-        path / "dispatch.inc",
-        generate_dispatch_inc.get_dispatch_inc_str(
-            argparse.Namespace(
-                head_dims=head_dims,
-                head_dims_sm90=head_dims,
-                pos_encoding_modes=[0],
-                use_fp16_qk_reductions=[0],
-                mask_modes=mask_modes,
-            )
-        ),
-    )
 
     write_if_different(
         path / "aot_default_additional_params.h",
