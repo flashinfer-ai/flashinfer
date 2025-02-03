@@ -364,6 +364,8 @@ def test_batch_decode_flash_sigmoid(use_tensor_cores):
         .reshape(batch_size, num_qo_heads, head_dim)
     )
 
+    print(o, o_ref)
+
     torch.testing.assert_close(o, o_ref, rtol=2e-2, atol=2e-2)
 
 
@@ -561,7 +563,6 @@ def test_batch_prefill_sm90_flash_sigmoid():
     sigmoid_bias = 0.25
 
     o = wrapper.run(q, k, v, logits_scale, sigmoid_bias)
-    print(o)
     wrapper_paged = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         float_workspace_buffer, kv_layout="NHD", backend="fa3", jit_args=jit_args
     )
@@ -696,7 +697,7 @@ struct DebugPrintLogits {
 
   template <int NUM_ROWS_PER_THREAD>
   __device__ auto GetAttentionUpdater() {
-    return OnlineSoftmax<NUM_ROWS_PER_THREAD, /*WITH_SCALE*/true>(sm_scale_log2);
+    return OnlineSoftmax<NUM_ROWS_PER_THREAD, /*WITH_SCALE*/false>(sm_scale_log2);
   }
 
 
@@ -749,6 +750,7 @@ struct DebugPrintLogits {
 
     p = torch.einsum("mhd,nhd->hmn", q.float(), k.float()) * sm_scale
     o_ref = torch.einsum("hmn,nhd->mhd", torch.softmax(p, dim=-1), v.float()).half()
+    print(o, o_ref)
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
 
 
@@ -759,6 +761,6 @@ if __name__ == "__main__":
     # test_debug_print_logits()
     # test_sm90_debug_print_logits()
     # test_batch_decode_flash_sigmoid(False)
-    # test_batch_decode_flash_sigmoid(True)
+    test_batch_decode_flash_sigmoid(True)
     # test_batch_prefill_flash_sigmoid()
-    test_batch_prefill_sm90_flash_sigmoid()
+    # test_batch_prefill_sm90_flash_sigmoid()
