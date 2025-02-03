@@ -85,10 +85,11 @@ struct SharedStorageQKVO {
   };
 };
 
-template <MaskMode MASK_MODE_, uint32_t NUM_MMA_Q_, uint32_t NUM_MMA_KV_, uint32_t NUM_MMA_D_QK_,
-          uint32_t NUM_MMA_D_VO_, uint32_t NUM_WARPS_Q_, uint32_t NUM_WARPS_KV_,
-          PosEncodingMode POS_ENCODING_MODE_, typename DTypeQ_, typename DTypeKV_, typename DTypeO_,
-          typename DTypeQKAccum_, typename IdType_, typename AttentionVariant_>
+template <MaskMode MASK_MODE_, uint32_t CTA_TILE_Q_, uint32_t NUM_MMA_Q_, uint32_t NUM_MMA_KV_,
+          uint32_t NUM_MMA_D_QK_, uint32_t NUM_MMA_D_VO_, uint32_t NUM_WARPS_Q_,
+          uint32_t NUM_WARPS_KV_, PosEncodingMode POS_ENCODING_MODE_, typename DTypeQ_,
+          typename DTypeKV_, typename DTypeO_, typename DTypeQKAccum_, typename IdType_,
+          typename AttentionVariant_>
 struct KernelTraits {
   static constexpr MaskMode MASK_MODE = MASK_MODE_;
   static constexpr uint32_t NUM_MMA_Q = NUM_MMA_Q_;
@@ -105,7 +106,7 @@ struct KernelTraits {
   static constexpr uint32_t UPCAST_HEAD_DIM_K = HEAD_DIM_QK / upcast_size<DTypeKV_>();
   static constexpr uint32_t UPCAST_HEAD_DIM_V = HEAD_DIM_VO / upcast_size<DTypeKV_>();
   static constexpr uint32_t UPCAST_HEAD_DIM_O = HEAD_DIM_VO / upcast_size<DTypeO_>();
-  static constexpr uint32_t CTA_TILE_Q = NUM_MMA_Q * NUM_WARPS_Q * 16;
+  static constexpr uint32_t CTA_TILE_Q = CTA_TILE_Q_;
   static constexpr uint32_t CTA_TILE_KV = NUM_MMA_KV * NUM_WARPS_KV * 16;
 
   static constexpr SwizzleMode SWIZZLE_MODE_Q = SwizzleMode::k128B;
@@ -249,8 +250,11 @@ __device__ __forceinline__ void produce_kv(smem_t<KTraits::SWIZZLE_MODE_KV> smem
                                            const uint32_t kv_len) {
   // NOTE: for fp8, this function doesn't work for head_dim = 64 at the moment
   using DTypeKV = typename KTraits::DTypeKV;
+  constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
   constexpr uint32_t NUM_WARPS = KTraits::NUM_WARPS;
+  constexpr uint32_t NUM_WARPS_Q = KTraits::NUM_WARPS_Q;
   constexpr uint32_t NUM_MMA_D = produce_v ? KTraits::NUM_MMA_D_VO : KTraits::NUM_MMA_D_QK;
+  constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
   constexpr uint32_t UPCAST_HEAD_DIM =
       produce_v ? KTraits::UPCAST_HEAD_DIM_V : KTraits::UPCAST_HEAD_DIM_K;
   const uint32_t warp_idx = get_warp_idx<KTraits>(), lane_idx = threadIdx.x;
@@ -258,9 +262,9 @@ __device__ __forceinline__ void produce_kv(smem_t<KTraits::SWIZZLE_MODE_KV> smem
   if constexpr (KTraits::SWIZZLE_MODE_KV == SwizzleMode::k128B) {
     uint32_t kv_idx = kv_idx_base + warp_idx * 4 + lane_idx / 8;
     // NOTE: NUM_MMA_KV * 4 / NUM_WARPS_Q = NUM_WARPS_KV * NUM_MMA_KV * 4 / num_warps
-    static_assert(KTraits::NUM_MMA_KV * 4 % KTraits::NUM_WARPS_Q == 0);
+    static_assert(NUM_MMA_KV * 4 % NUM_WARPS_Q == 0);
 #pragma unroll
-    for (uint32_t i = 0; i < KTraits::NUM_MMA_KV * 4 / KTraits::NUM_WARPS_Q; ++i) {
+    for (uint32_t i = 0; i < NUM_MMA_KV * 4 / NUM_WARPS_Q; ++i) {
 #pragma unroll
       for (uint32_t j = 0; j < NUM_MMA_D / (8 / sizeof(DTypeKV)); ++j) {
         smem.load_128b_async<fill_mode>(*smem_offset, *gptr, kv_idx < kv_len);
@@ -273,13 +277,13 @@ __device__ __forceinline__ void produce_kv(smem_t<KTraits::SWIZZLE_MODE_KV> smem
           sizeof(DTypeKV) * NUM_MMA_D;
       *gptr += NUM_WARPS * 4 * stride_n - sizeof(DTypeKV) * NUM_MMA_D * upcast_size<DTypeKV>();
     }
-    *smem_offset -= KTraits::CTA_TILE_KV * UPCAST_HEAD_DIM;
+    *smem_offset -= CTA_TILE_KV * UPCAST_HEAD_DIM;
   } else {
     uint32_t kv_idx = kv_idx_base + warp_idx * 8 + lane_idx / 4;
     // NOTE: NUM_MMA_KV * 2 / NUM_WARPS_Q = NUM_WARPS_KV * NUM_MMA_KV * 2 / num_warps
-    static_assert(KTraits::NUM_MMA_KV * 2 % KTraits::NUM_WARPS_Q == 0);
+    static_assert(NUM_MMA_KV * 2 % NUM_WARPS_Q == 0);
 #pragma unroll
-    for (uint32_t i = 0; i < KTraits::NUM_MMA_KV * 2 / KTraits::NUM_WARPS_Q; ++i) {
+    for (uint32_t i = 0; i < NUM_MMA_KV * 2 / NUM_WARPS_Q; ++i) {
       smem.load_128b_async<fill_mode>(*smem_offset, *gptr, kv_idx < kv_len);
       *smem_offset =
           smem.template advance_offset_by_row<NUM_WARPS * 8, UPCAST_HEAD_DIM>(*smem_offset);
@@ -564,8 +568,8 @@ __device__ __forceinline__ void k_smem_inplace_apply_rotary(
     // horizontal axis: y
     // vertical axis: z
     // | (warp_idx_z, warp_idx_x)       | 1-16   | 16-32  | 32-48  | 48-64  | ...
-    // | 1-16*NUM_MMA_KV               | (0, 0) | (0, 1) | (0, 2) | (0, 3) | ...
-    // | 16*NUM_MMA_KV-32*NUM_MMA_KV  | (1, 0) | (1, 1) | (1, 2) | (1, 3) | ...
+    // | 1-16*NUM_MMA_KV                | (0, 0) | (0, 1) | (0, 2) | (0, 3) | ...
+    // | 16*NUM_MMA_KV-32*NUM_MMA_KV    | (1, 0) | (1, 1) | (1, 2) | (1, 3) | ...
     // ...
     uint32_t kv_idx = kv_idx_base + (warp_idx_z * KTraits::NUM_MMA_KV * 16) + lane_idx / 4;
     *k_smem_offset_r = *k_smem_offset_r ^ (0x2 * warp_idx_x);
@@ -1447,26 +1451,8 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
   const uint_fastdiv group_size_fastdiv(group_size);
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
-  uint32_t cta_tile_q = 0;
   int64_t unpacked_qo_len = qo_len * group_size;
-  if (unpacked_qo_len > 64 && HEAD_DIM_VO < 256) {
-    cta_tile_q = 128;
-  } else {
-    auto compute_capacity = GetCudaComputeCapability();
-    if (compute_capacity.first >= 8) {
-      // Ampere or newer
-      if (unpacked_qo_len > 16) {
-        // avg_packed_qo_len <= 64
-        cta_tile_q = 64;
-      } else {
-        // avg_packed_qo_len <= 16
-        cta_tile_q = 16;
-      }
-    } else {
-      // NOTE(Zihao): not enough shared memory on Turing for 1x4 warp layout
-      cta_tile_q = 64;
-    }
-  }
+  uint32_t cta_tile_q = FA2DetermineCtaTileQ(unpacked_qo_len, HEAD_DIM_VO);
 
   DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, {
     constexpr uint32_t NUM_WARPS_Q = get_num_warps_q(CTA_TILE_Q);
@@ -1499,9 +1485,10 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
 
     // control NUM_MMA_KV for maximum warp occupancy
     DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
-      using KTraits = KernelTraits<MASK_MODE, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
-                                   NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV,
-                                   DTypeO, DTypeQKAccum, typename Params::IdType, AttentionVariant>;
+      using KTraits =
+          KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
+                       NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
+                       DTypeQKAccum, typename Params::IdType, AttentionVariant>;
       if constexpr (KTraits::IsInvalid()) {
         // Invalid configuration, skip
         std::ostringstream err_msg;
@@ -2209,9 +2196,10 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
       (2 * NUM_WARPS_KV);
 
   DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
-    using KTraits = KernelTraits<MASK_MODE, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
-                                 NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV,
-                                 DTypeO, DTypeQKAccum, typename Params::IdType, AttentionVariant>;
+    using KTraits =
+        KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
+                     NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
+                     DTypeQKAccum, typename Params::IdType, AttentionVariant>;
     if constexpr (KTraits::IsInvalid()) {
       // Invalid configuration, skip
       std::ostringstream err_msg;
@@ -2310,9 +2298,10 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
       (2 * NUM_WARPS_KV);
 
   DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
-    using KTraits = KernelTraits<MASK_MODE, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
-                                 NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV,
-                                 DTypeO, DTypeQKAccum, typename Params::IdType, AttentionVariant>;
+    using KTraits =
+        KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
+                     NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
+                     DTypeQKAccum, typename Params::IdType, AttentionVariant>;
     if constexpr (KTraits::IsInvalid()) {
       // Invalid configuration, skip
       std::ostringstream err_msg;
