@@ -643,7 +643,7 @@ __device__ __forceinline__ void mma_sync_m8n16k16_row_col_f16f16f32(float* C, ui
  * \brief Use mma instructions to compute rowsum.
  */
 template <typename DType>
-__device__ __forceinline__ void m16k16_rowsum_f8f8f32(float* d, DType* s) {
+__device__ __forceinline__ void m16k32_rowsum_f8f8f32(float* d, DType* s) {
   static_assert(sizeof(DType) == 1, "DType must be 8bit floating data type");
   uint32_t* s_u32 = (uint32_t*)(s);
 #if defined(FLASHINFER_MMA_F8F8F32_M16N8K32_ENABLED)
@@ -691,6 +691,69 @@ __device__ __forceinline__ void m16k16_rowsum_f16f16f32(float* d, DType* s) {
         "{\n"
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
         "{%0,  _,  %1,  _},"
+        "{%2,  %3,  %4,  %5},"
+        "{%6,  %7},"
+        "{%8,  0.,  %9,  0.};\n"
+        "}\n"
+        : "=f"(d[0]), "=f"(d[1])
+        : "r"(s_u32[0]), "r"(s_u32[1]), "r"(s_u32[2]), "r"(s_u32[3]), "r"(1006648320),
+          "r"(1006648320), "f"(d[0]), "f"(d[1]));
+  } else {
+    asm volatile(
+        "{\n"
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,  _,  %1,  _},"
+        "{%2,  %3,  %4,  %5},"
+        "{%6,  %7},"
+        "{%8,  0.,  %9,  0.};\n"
+        "}\n"
+        : "=f"(d[0]), "=f"(d[1])
+        : "r"(s_u32[0]), "r"(s_u32[1]), "r"(s_u32[2]), "r"(s_u32[3]), "r"(1065369472),
+          "r"(1065369472), "f"(d[0]), "f"(d[1]));
+  }
+#elif defined(FLASHINFER_MMA_F16F16F32_M16N8K8_ENABLED)
+  if constexpr (std::is_same_v<DType, half>) {
+    asm volatile(
+        "{\n"
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,  _,  %1,  _},"
+        "{%2,  %3},"
+        "{%4},"
+        "{%5,  0.,  %6,  0.};\n"
+        "}\n"
+        : "=f"(d[0]), "=f"(d[1])
+        : "r"(s_u32[0]), "r"(s_u32[1]), "r"(1006648320), "f"(d[0]), "f"(d[1]));
+    asm volatile(
+        "{\n"
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,  _,  %1,  _},"
+        "{%2,  %3},"
+        "{%4},"
+        "{%5,  0.,  %6,  0.};\n"
+        "}\n"
+        : "=f"(d[0]), "=f"(d[1])
+        : "r"(s_u32[2]), "r"(s_u32[3]), "r"(1006648320), "f"(d[0]), "f"(d[1]));
+  } else {
+    FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
+  }
+#else
+  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
+#endif
+}
+
+/*!
+ * \brief Use mma instructions to compute rowsum, only executed on upper half of "m".
+ */
+template <typename DType>
+__device__ __forceinline__ void m8k16_rowsum_f16f16f32(float* d, DType* s) {
+  static_assert(sizeof(DType) == 2, "DType must be 16bit floating data type");
+  uint32_t* s_u32 = (uint32_t*)(s);
+#if defined(FLASHINFER_MMA_F16F16F32_M16N8K16_ENABLED)
+  if constexpr (std::is_same_v<DType, half>) {
+    asm volatile(
+        "{\n"
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,  _,  _,  _},"
         "{%2,  %3,  %4,  %5},"
         "{%6,  %7},"
         "{%8,  0.,  %9,  0.};\n"
