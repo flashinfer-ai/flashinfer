@@ -561,6 +561,7 @@ def test_batch_prefill_sm90_flash_sigmoid():
     sigmoid_bias = 0.25
 
     o = wrapper.run(q, k, v, logits_scale, sigmoid_bias)
+    print(o)
     wrapper_paged = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         float_workspace_buffer, kv_layout="NHD", backend="fa3", jit_args=jit_args
     )
@@ -695,7 +696,7 @@ struct DebugPrintLogits {
 
   template <int NUM_ROWS_PER_THREAD>
   __device__ auto GetAttentionUpdater() {
-    return OnlineSoftmax<NUM_ROWS_PER_THREAD, /*WITH_SCALE*/false>(sm_scale_log2);
+    return OnlineSoftmax<NUM_ROWS_PER_THREAD, /*WITH_SCALE*/true>(sm_scale_log2);
   }
 
 
@@ -752,12 +753,12 @@ struct DebugPrintLogits {
 
 
 if __name__ == "__main__":
-    test_single_decode_mask()
-    test_flash_sigmoid()
-    test_dump_logits()
-    test_debug_print_logits()
-    test_sm90_debug_print_logits()
-    test_batch_decode_flash_sigmoid(False)
-    test_batch_decode_flash_sigmoid(True)
-    test_batch_prefill_flash_sigmoid()
+    # test_single_decode_mask()
+    # test_flash_sigmoid()
+    # test_dump_logits()
+    # test_debug_print_logits()
+    # test_sm90_debug_print_logits()
+    # test_batch_decode_flash_sigmoid(False)
+    # test_batch_decode_flash_sigmoid(True)
+    # test_batch_prefill_flash_sigmoid()
     test_batch_prefill_sm90_flash_sigmoid()

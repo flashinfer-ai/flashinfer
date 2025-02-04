@@ -108,11 +108,6 @@
       __VA_ARGS__                                          \
       break;                                               \
     }                                                      \
-    case 32: {                                             \
-      constexpr uint32_t CTA_TILE_Q = 32;                  \
-      __VA_ARGS__                                          \
-      break;                                               \
-    }                                                      \
     case 16: {                                             \
       constexpr uint32_t CTA_TILE_Q = 16;                  \
       __VA_ARGS__                                          \
@@ -293,30 +288,6 @@ inline void DebugPrintCUDAArray(T* device_ptr, size_t size, std::string prefix =
     std::cout << host_array[i] << " ";
   }
   std::cout << std::endl;
-}
-
-inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim) {
-  if (avg_packed_qo_len > 64 && head_dim < 256) {
-    return 128;
-  } else {
-    auto compute_capacity = GetCudaComputeCapability();
-    if (compute_capacity.first >= 8) {
-      // Ampere or newer
-      if (avg_packed_qo_len > 32) {
-        // avg_packed_qo_len <= 64
-        return 64;
-      } else if (avg_packed_qo_len > 16) {
-        // avg_packed_qo_len <= 32
-        return 32;
-      } else {
-        // avg_packed_qo_len <= 16
-        return 16;
-      }
-    } else {
-      // NOTE(Zihao): not enough shared memory on Turing for 1x4 warp layout
-      return 64;
-    }
-  }
 }
 
 /*!

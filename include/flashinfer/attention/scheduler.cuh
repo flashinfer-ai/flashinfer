@@ -418,6 +418,27 @@ inline cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in
   return cudaSuccess;
 }
 
+inline uint32_t DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim) {
+  if (avg_packed_qo_len > 64 && head_dim < 256) {
+    return 128;
+  } else {
+    auto compute_capacity = GetCudaComputeCapability();
+    if (compute_capacity.first >= 8) {
+      // Ampere or newer
+      if (avg_packed_qo_len > 16) {
+        // avg_packed_qo_len <= 64
+        return 64;
+      } else {
+        // avg_packed_qo_len <= 16
+        return 16;
+      }
+    } else {
+      // NOTE(Zihao): not enough shared memory on Turing for 1x4 warp layout
+      return 64;
+    }
+  }
+}
+
 template <typename IdType>
 inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
                                    uint32_t total_num_rows, uint32_t batch_size,
@@ -459,7 +480,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
     // the CUDA graph is created fixes the maximum number of tokens.
     const uint64_t max_seq_len = total_num_rows - batch_size + 1;
     uint64_t max_qo_len = uint64_t(max_seq_len) * gqa_group_size;
-    cta_tile_q = FA2DetermineCtaTileQ(max_qo_len, head_dim);
+    cta_tile_q = DetermineCtaTileQ(max_qo_len, head_dim);
 
     // Find an upper bound for the number of tiles, derived from the total
     // number of rows and the batch size.  The sum of qo lengths rounded
@@ -472,7 +493,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
       sum_packed_qo_len += packed_qo_len_arr[i];
     }
     const int64_t avg_packed_qo_len = sum_packed_qo_len / batch_size;
-    cta_tile_q = FA2DetermineCtaTileQ(avg_packed_qo_len, head_dim);
+    cta_tile_q = DetermineCtaTileQ(avg_packed_qo_len, head_dim);
 
     total_num_tiles_q = 0;
     for (uint32_t i = 0; i < batch_size; ++i) {
