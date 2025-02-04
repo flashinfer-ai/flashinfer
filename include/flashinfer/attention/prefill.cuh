@@ -1456,7 +1456,6 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
   uint32_t cta_tile_q = FA2DetermineCtaTileQ(unpacked_qo_len, HEAD_DIM_VO);
 
   DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, {
-    constexpr uint32_t CTA_TILE_Q = 8;
     constexpr uint32_t NUM_WARPS_Q = get_num_warps_q(CTA_TILE_Q);
     constexpr uint32_t NUM_WARPS_KV = get_num_warps_kv(CTA_TILE_Q);
     constexpr uint32_t NUM_MMA_Q = get_num_mma_q(CTA_TILE_Q);
