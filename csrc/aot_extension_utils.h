@@ -19,8 +19,9 @@
 #define DISPATCH_head_dim(expr, const_expr, ...) \
   _DISPATCH_SWITCH("head_dim", expr, _DISPATCH_CASES_head_dim(const_expr, __VA_ARGS__))
 
-#define DISPATCH_head_dim_sm90(expr, const_expr, ...) \
-  _DISPATCH_SWITCH("head_dim", expr, _DISPATCH_CASES_head_dim_sm90(const_expr, __VA_ARGS__))
+#define DISPATCH_head_dim_sm90(expr1, expr2, const_expr1, const_expr2, ...) \
+  _DISPATCH_SWITCH_U16x2("head_dim_qk", "head_dim_vo", expr1, expr2,        \
+                         _DISPATCH_CASES_head_dim_sm90(const_expr1, const_expr2, __VA_ARGS__))
 
 #define DISPATCH_pos_encoding_mode(expr, const_expr, ...) \
   _DISPATCH_SWITCH("positional encoding mode", expr,      \

@@ -35,11 +35,13 @@ def get_dispatch_inc_str(args: argparse.Namespace) -> str:
     # head dims for sm90
     dispatch_head_dims_sm90_entries = "\n".join(
         [
-            "  _DISPATCH_CASE({}, case_var, __VA_ARGS__) \\".format(_)
-            for _ in args.head_dims_sm90
+            "  _DISPATCH_CASE_U16x2({}, {}, case_var1, case_var2, __VA_ARGS__) \\".format(
+                qk, vo
+            )
+            for qk, vo in args.head_dims_sm90
         ]
     )
-    dispatch_head_dims_sm90_str = f"""#define _DISPATCH_CASES_head_dim_sm90(case_var, ...)         \\
+    dispatch_head_dims_sm90_str = f"""#define _DISPATCH_CASES_head_dim_sm90(case_var1, case_var2, ...)         \\
 {dispatch_head_dims_sm90_entries}
 // EOL
 """
