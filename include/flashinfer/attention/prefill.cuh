@@ -626,7 +626,11 @@ __device__ __forceinline__ void compute_qk(
   for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_QK; ++mma_d) {
 #pragma unroll
     for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
-      q_smem->ldmatrix_m8n8x4(*q_smem_offset_r, a_frag[mma_q]);
+      if constexpr (KTraits::HALF_MMA) {
+        q_smem->ldmatrix_m8n8x4_upper_half(*q_smem_offset_r, a_frag[mma_q]);
+      } else {
+        q_smem->ldmatrix_m8n8x4(*q_smem_offset_r, a_frag[mma_q]);
+      }
       *q_smem_offset_r =
           q_smem->template advance_offset_by_row<16, UPCAST_HEAD_DIM_Q>(*q_smem_offset_r);
     }
@@ -657,13 +661,24 @@ __device__ __forceinline__ void compute_qk(
       for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
         if constexpr (std::is_same_v<typename KTraits::DTypeQKAccum, float>) {
           if (mma_d == 0) {
-            mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ, MMAMode::kInit>(
-                s_frag[mma_q][mma_kv], a_frag[mma_q], b_frag);
+            if constexpr (KTraits::HALF_MMA) {
+              mma::mma_sync_m8n16k16_row_col_f16f16f32<typename KTraits::DTypeQ, MMAMode::kInit>(
+                  s_frag[mma_q][mma_kv], a_frag[mma_q], b_frag);
+            } else {
+              mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ, MMAMode::kInit>(
+                  s_frag[mma_q][mma_kv], a_frag[mma_q], b_frag);
+            }
           } else {
-            mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ>(
-                s_frag[mma_q][mma_kv], a_frag[mma_q], b_frag);
+            if constexpr (KTraits::HALF_MMA) {
+              mma::mma_sync_m8n16k16_row_col_f16f16f32<typename KTraits::DTypeQ>(
+                  s_frag[mma_q][mma_kv], a_frag[mma_q], b_frag);
+            } else {
+              mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ>(
+                  s_frag[mma_q][mma_kv], a_frag[mma_q], b_frag);
+            }
           }
         } else if (std::is_same_v<typename KTraits::DTypeQKAccum, half>) {
+          static_assert(!KTraits::HALF_MMA, "Half-mma not supported for fp16 qk accumulator yet.");
           if (mma_d == 0) {
             mma::mma_sync_m16n16k16_row_col_f16f16f16<MMAMode::kInit>(
                 (uint32_t*)s_frag[mma_q][mma_kv], a_frag[mma_q], b_frag);
@@ -953,9 +968,17 @@ __device__ __forceinline__ void compute_sfm_v(
 #pragma unroll
       for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
         if constexpr (std::is_same_v<typename KTraits::DTypeQKAccum, float>) {
-          mma::m16k16_rowsum_f16f16f32(d[mma_q], s_frag_f16[mma_q][mma_kv]);
+          if constexpr (KTraits::HALF_MMA) {
+            mma::m8k16_rowsum_f16f16f32(d[mma_q], s_frag_f16[mma_q][mma_kv]);
+          } else {
+            mma::m16k16_rowsum_f16f16f32(d[mma_q], s_frag_f16[mma_q][mma_kv]);
+          }
         } else {
-          mma::m16k16_rowsum_f16f16f32(d[mma_q], s_frag[mma_q][mma_kv]);
+          if constexpr (KTraits::HALF_MMA) {
+            mma::m8k16_rowsum_f16f16f32(d[mma_q], s_frag[mma_q][mma_kv]);
+          } else {
+            mma::m16k16_rowsum_f16f16f32(d[mma_q], s_frag[mma_q][mma_kv]);
+          }
         }
       }
     }
@@ -965,9 +988,9 @@ __device__ __forceinline__ void compute_sfm_v(
   for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
 #pragma unroll
     for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
-      uint32_t b_frag[KTraits::FRAG_IN];
+      uint32_t b_frag[4];
       if constexpr (sizeof(typename KTraits::DTypeKV) == 1) {
-        uint32_t b_frag_f8[KTraits::FRAG_IN / 2];
+        uint32_t b_frag_f8[2];
         if (mma_d % 2 == 0) {
           v_smem->ldmatrix_m8n8x4_trans_left_half(*v_smem_offset_r, b_frag_f8);
         } else {
@@ -984,11 +1007,21 @@ __device__ __forceinline__ void compute_sfm_v(
 #pragma unroll
       for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
         if constexpr (std::is_same_v<typename KTraits::DTypeQKAccum, float>) {
-          mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ>(
-              o_frag[mma_q][mma_d], (uint32_t*)(s_frag_f16[mma_q][mma_kv]), b_frag);
+          if constexpr (KTraits::HALF_MMA) {
+            mma::mma_sync_m8n16k16_row_col_f16f16f32<typename KTraits::DTypeQ>(
+                o_frag[mma_q][mma_d], (uint32_t*)s_frag_f16[mma_q][mma_kv], b_frag);
+          } else {
+            mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ>(
+                o_frag[mma_q][mma_d], (uint32_t*)s_frag_f16[mma_q][mma_kv], b_frag);
+          }
         } else {
-          mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ>(
-              o_frag[mma_q][mma_d], (uint32_t*)s_frag[mma_q][mma_kv], b_frag);
+          if constexpr (KTraits::HALF_MMA) {
+            mma::mma_sync_m8n16k16_row_col_f16f16f32<typename KTraits::DTypeQ>(
+                o_frag[mma_q][mma_d], (uint32_t*)s_frag[mma_q][mma_kv], b_frag);
+          } else {
+            mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ>(
+                o_frag[mma_q][mma_d], (uint32_t*)s_frag[mma_q][mma_kv], b_frag);
+          }
         }
       }
       if constexpr (sizeof(typename KTraits::DTypeKV) == 1) {
@@ -1065,11 +1098,11 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(
     for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
 #pragma unroll
       for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
-        vec_t<float, 8>::memcpy(
+        vec_t<float, KTraits::FRAG_OUT>::memcpy(
             smem_o + (((warp_idx * KTraits::NUM_MMA_Q + mma_q) * KTraits::NUM_MMA_D_VO + mma_d) *
                           WARP_SIZE +
                       lane_idx) *
-                         8,
+                         KTraits::FRAG_OUT,
             o_frag[mma_q][mma_d]);
       }
     }
@@ -1079,8 +1112,8 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(
       for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
 #pragma unroll
         for (uint32_t j = 0; j < KTraits::NUM_HALF_MMA; ++j) {
-          smem_md[((warp_idx * KTraits::NUM_MMA_Q + mma_q) * 2 + j) * 8 + lane_idx / 4] =
-              make_float2(float(m[mma_q][j]), d[mma_q][j]);
+          smem_md[((warp_idx * KTraits::NUM_MMA_Q + mma_q) * KTraits::NUM_HALF_MMA + j) * 8 +
+                  lane_idx / 4] = make_float2(float(m[mma_q][j]), d[mma_q][j]);
         }
       }
 
@@ -1088,16 +1121,16 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(
       __syncthreads();
 #pragma unroll
       for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
-        float o_scale[2][KTraits::NUM_WARPS_KV];
+        float o_scale[KTraits::NUM_HALF_MMA][KTraits::NUM_WARPS_KV];
 #pragma unroll
-        for (uint32_t j = 0; j < 2; ++j) {
+        for (uint32_t j = 0; j < KTraits::NUM_HALF_MMA; ++j) {
           float m_new = -math::inf, d_new = 1.f;
 #pragma unroll
           for (uint32_t i = 0; i < KTraits::NUM_WARPS_KV; ++i) {
             float2 md = smem_md[(((i * KTraits::NUM_WARPS_Q + get_warp_idx_q<KTraits>()) *
                                       KTraits::NUM_MMA_Q +
                                   mma_q) *
-                                     2 +
+                                     KTraits::NUM_HALF_MMA +
                                  j) *
                                     8 +
                                 lane_idx / 4];
@@ -1111,7 +1144,7 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(
             float2 md = smem_md[(((i * KTraits::NUM_WARPS_Q + get_warp_idx_q<KTraits>()) *
                                       KTraits::NUM_MMA_Q +
                                   mma_q) *
-                                     2 +
+                                     KTraits::NUM_HALF_MMA +
                                  j) *
                                     8 +
                                 lane_idx / 4];
@@ -1124,11 +1157,11 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(
 
 #pragma unroll
         for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
-          vec_t<float, 8> o_new;
+          vec_t<float, KTraits::FRAG_OUT> o_new;
           o_new.fill(0.f);
 #pragma unroll
           for (uint32_t i = 0; i < KTraits::NUM_WARPS_KV; ++i) {
-            vec_t<float, 8> oi;
+            vec_t<float, KTraits::FRAG_OUT> oi;
             oi.load(smem_o +
                     ((((i * KTraits::NUM_WARPS_Q + get_warp_idx_q<KTraits>()) * KTraits::NUM_MMA_Q +
                        mma_q) *
@@ -1136,10 +1169,17 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(
                       mma_d) *
                          WARP_SIZE +
                      lane_idx) *
-                        8);
+                        KTraits::FRAG_OUT);
+            if constexpr (KTraits::HALF_MMA) {
 #pragma unroll
-            for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
-              o_new[reg_id] += oi[reg_id] * o_scale[(reg_id % 4) / 2][i];
+              for (uint32_t reg_id = 0; reg_id < 4; ++reg_id) {
+                o_new[reg_id] += oi[reg_id] * o_scale[0][i];
+              }
+            } else {
+#pragma unroll
+              for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+                o_new[reg_id] += oi[reg_id] * o_scale[(reg_id % 4) / 2][i];
+              }
             }
           }
           o_new.store(o_frag[mma_q][mma_d]);
@@ -1152,11 +1192,11 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(
       for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
 #pragma unroll
         for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
-          vec_t<float, 8> o_new;
+          vec_t<float, KTraits::FRAG_OUT> o_new;
           o_new.fill(0.f);
 #pragma unroll
           for (uint32_t i = 0; i < KTraits::NUM_WARPS_KV; ++i) {
-            vec_t<float, 8> oi;
+            vec_t<float, KTraits::FRAG_OUT> oi;
             oi.load(smem_o +
                     ((((i * KTraits::NUM_WARPS_Q + get_warp_idx_q<KTraits>()) * KTraits::NUM_MMA_Q +
                        mma_q) *
@@ -1164,9 +1204,9 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(
                       mma_d) *
                          WARP_SIZE +
                      lane_idx) *
-                        8);
+                        KTraits::FRAG_OUT);
 #pragma unroll
-            for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+            for (uint32_t reg_id = 0; reg_id < KTraits::FRAG_OUT; ++reg_id) {
               o_new[reg_id] += oi[reg_id];
             }
           }
@@ -1179,10 +1219,10 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(
 
 template <typename KTraits>
 __device__ __forceinline__ void write_o_reg_gmem(
-    float (*o_frag)[KTraits::NUM_MMA_D_VO][8], smem_t<KTraits::SWIZZLE_MODE_Q>* o_smem,
-    typename KTraits::DTypeO* o_ptr_base, const uint32_t o_packed_idx_base,
-    const uint32_t qo_upper_bound, const uint32_t o_stride_n, const uint32_t o_stride_h,
-    const uint_fastdiv group_size) {
+    float (*o_frag)[KTraits::NUM_MMA_D_VO][KTraits::FRAG_OUT],
+    smem_t<KTraits::SWIZZLE_MODE_Q>* o_smem, typename KTraits::DTypeO* o_ptr_base,
+    const uint32_t o_packed_idx_base, const uint32_t qo_upper_bound, const uint32_t o_stride_n,
+    const uint32_t o_stride_h, const uint_fastdiv group_size) {
   constexpr uint32_t UPCAST_HEAD_DIM_O = KTraits::UPCAST_HEAD_DIM_O;
   const uint32_t warp_idx_x = get_warp_idx_q<KTraits>();
   const uint32_t lane_idx = threadIdx.x;
@@ -1192,24 +1232,32 @@ __device__ __forceinline__ void write_o_reg_gmem(
     for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
 #pragma unroll
       for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
-        uint32_t o_frag_f16[4];
-        vec_cast<typename KTraits::DTypeO, float>::cast<8>((typename KTraits::DTypeO*)o_frag_f16,
-                                                           o_frag[mma_q][mma_d]);
+        uint32_t o_frag_f16[KTraits::FRAG_OUT / 2];
+        vec_cast<typename KTraits::DTypeO, float>::cast<KTraits::FRAG_OUT>(
+            (typename KTraits::DTypeO*)o_frag_f16, o_frag[mma_q][mma_d]);
+        if constexpr (KTraits::HALF_MMA) {
+          // TODO(Zihao): use stmatrix
+          uint32_t o_smem_offset_w = o_smem->get_permuted_offset<UPCAST_HEAD_DIM_O>(
+              (warp_idx_x * KTraits::NUM_MMA_Q + mma_q) * 16 + lane_idx / 4, mma_d * 2);
+          ((uint32_t*)(o_smem->base + o_smem_offset_w))[lane_idx % 4] = o_frag_f16[0];
+          ((uint32_t*)(o_smem->base + (o_smem_offset_w ^ 0x1)))[lane_idx % 4] = o_frag_f16[1];
+        } else {
 #ifdef FLASHINFER_STMATRIX_M8N8X4_ENABLED
-        uint32_t o_smem_offset_w = o_smem->get_permuted_offset<UPCAST_HEAD_DIM_O>(
-            (warp_idx_x * KTraits::NUM_MMA_Q + mma_q) * 16 + lane_idx % 16,
-            mma_d * 2 + lane_idx / 16);
-        o_smem->stmatrix_m8n8x4(o_smem_offset_w, o_frag_f16);
+          uint32_t o_smem_offset_w = o_smem->get_permuted_offset<UPCAST_HEAD_DIM_O>(
+              (warp_idx_x * KTraits::NUM_MMA_Q + mma_q) * 16 + lane_idx % 16,
+              mma_d * 2 + lane_idx / 16);
+          o_smem->stmatrix_m8n8x4(o_smem_offset_w, o_frag_f16);
 #else
-        uint32_t o_smem_offset_w = o_smem->get_permuted_offset<UPCAST_HEAD_DIM_O>(
-            (warp_idx_x * KTraits::NUM_MMA_Q + mma_q) * 16 + lane_idx / 4, mma_d * 2);
-        ((uint32_t*)(o_smem->base + o_smem_offset_w))[lane_idx % 4] = o_frag_f16[0];
-        ((uint32_t*)(o_smem->base + o_smem_offset_w + 8 * UPCAST_HEAD_DIM_O))[lane_idx % 4] =
-            o_frag_f16[1];
-        ((uint32_t*)(o_smem->base + (o_smem_offset_w ^ 0x1)))[lane_idx % 4] = o_frag_f16[2];
-        ((uint32_t*)(o_smem->base + (o_smem_offset_w ^ 0x1) +
-                     8 * UPCAST_HEAD_DIM_O))[lane_idx % 4] = o_frag_f16[3];
+          uint32_t o_smem_offset_w = o_smem->get_permuted_offset<UPCAST_HEAD_DIM_O>(
+              (warp_idx_x * KTraits::NUM_MMA_Q + mma_q) * 16 + lane_idx / 4, mma_d * 2);
+          ((uint32_t*)(o_smem->base + o_smem_offset_w))[lane_idx % 4] = o_frag_f16[0];
+          ((uint32_t*)(o_smem->base + o_smem_offset_w + 8 * UPCAST_HEAD_DIM_O))[lane_idx % 4] =
+              o_frag_f16[1];
+          ((uint32_t*)(o_smem->base + (o_smem_offset_w ^ 0x1)))[lane_idx % 4] = o_frag_f16[2];
+          ((uint32_t*)(o_smem->base + (o_smem_offset_w ^ 0x1) +
+                       8 * UPCAST_HEAD_DIM_O))[lane_idx % 4] = o_frag_f16[3];
 #endif
+        }
       }
     }
 
@@ -1219,7 +1267,7 @@ __device__ __forceinline__ void write_o_reg_gmem(
 #pragma unroll
     for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
 #pragma unroll
-      for (uint32_t j = 0; j < 4; ++j) {
+      for (uint32_t j = 0; j < KTraits::NUM_HALF_MMA * 2; ++j) {
         uint32_t q, r;
         group_size.divmod(o_packed_idx_base + lane_idx / 8 + mma_q * 16 + j * 4, q, r);
         const uint32_t o_idx = q;

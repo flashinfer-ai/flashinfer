@@ -86,6 +86,25 @@ __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
  * \param smem_ptr pointer to the shared memory
  */
 template <typename T>
+__device__ __forceinline__ void ldmatrix_m8n8x4_upper_half(uint32_t* R, T* smem_ptr) {
+#ifdef FLASHINFER_LDMATRIX_M8N8X4_ENABLED
+  uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, _, _}, [%2];\n"
+               : "=r"(R[0]), "=r"(R[1])
+               : "r"(smem_int_ptr));
+#else
+  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
+#endif
+}
+
+/*!
+ * \brief Wrapper of PTX ldmatrix m8n8.x4 instruction, loads data from shared memory
+ *   to fragment
+ * \tparam T data type of the fragment
+ * \param R pointer to the fragment
+ * \param smem_ptr pointer to the shared memory
+ */
+template <typename T>
 __device__ __forceinline__ void ldmatrix_m8n8x4_left_half(uint32_t* R, T* smem_ptr) {
 #ifdef FLASHINFER_LDMATRIX_M8N8X4_ENABLED
   uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
