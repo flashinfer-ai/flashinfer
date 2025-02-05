@@ -180,6 +180,7 @@ def gen_batch_decode_mla_module(
         dtype_o,
         dtype_idx,
         head_dim,
+        head_dim,
         use_sliding_window,
         use_logits_soft_cap,
     )
