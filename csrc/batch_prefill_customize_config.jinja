@@ -4,6 +4,7 @@
 #include <flashinfer/layout.cuh>
 #include <flashinfer/utils.cuh>
 #include <flashinfer/pos_enc.cuh>
+#include <flashinfer/fastdiv.cuh>
 
 #define ADDITIONAL_FUNC_PARAMS {{ additional_func_params }}
 #define ADDITIONAL_PARAMS_SETTER {{ additional_params_setter }}
@@ -42,6 +43,8 @@ struct RaggedParams {
   IdType* kv_indptr;
   DTypeO* o;
   float* lse;
+  uint_fastdiv group_size;
+
   {{ additional_params_decl }}
   uint32_t num_qo_heads;
   uint32_t num_kv_heads;
@@ -85,6 +88,8 @@ struct PagedParams {
   IdType* q_indptr;
   DTypeO* o;
   float* lse;
+  uint_fastdiv group_size;
+
   {{ additional_params_decl }}
   uint32_t num_qo_heads;
   IdType q_stride_n;

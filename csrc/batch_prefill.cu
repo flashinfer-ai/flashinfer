@@ -125,6 +125,7 @@ void BatchPrefillWithRaggedKVCacheRun(
         params.kv_indptr = static_cast<IdType*>(kv_indptr.data_ptr());
         params.num_qo_heads = num_qo_heads;
         params.num_kv_heads = num_kv_heads;
+        params.group_size = uint_fastdiv(num_qo_heads / num_kv_heads);
         params.q_stride_n = q_stride_n;
         params.q_stride_h = q_stride_h;
         params.k_stride_n = k_stride_n;
@@ -260,6 +261,7 @@ void BatchPrefillWithPagedKVCacheRun(
 
         params.lse = maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
         params.num_qo_heads = num_qo_heads;
+        params.group_size = uint_fastdiv(num_qo_heads / paged_kv.num_heads);
         params.q_stride_n = q_stride_n;
         params.q_stride_h = q_stride_h;
         params.window_left = window_left;

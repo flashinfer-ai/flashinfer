@@ -1180,7 +1180,7 @@ __device__ __forceinline__ void write_o_reg_gmem(
  */
 template <typename KTraits, typename Params>
 __global__ __launch_bounds__(KTraits::NUM_THREADS) void SinglePrefillWithKVCacheKernel(
-    const uint_fastdiv group_size, const __grid_constant__ Params params) {
+    const __grid_constant__ Params params) {
   using DTypeQ = typename Params::DTypeQ;
 #if (__CUDA_ARCH__ < 800)
   if constexpr (std::is_same_v<DTypeQ, nv_bfloat16>) {
@@ -1226,6 +1226,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void SinglePrefillWithKVCache
     const uint32_t v_stride_n = params.v_stride_n;
     const uint32_t v_stride_h = params.v_stride_h;
     const int32_t maybe_window_left = params.window_left;
+    const uint_fastdiv& group_size = params.group_size;
 
     static_assert(sizeof(DTypeQ) == 2);
     static_assert(sizeof(DTypeO) == 2);
@@ -1449,7 +1450,6 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
   }
 
   const uint32_t group_size = num_qo_heads / num_kv_heads;
-  const uint_fastdiv group_size_fastdiv(group_size);
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
   int64_t unpacked_qo_len = qo_len * group_size;
@@ -1525,7 +1525,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
         if (num_chunks <= 1 || tmp == nullptr) {
           // Enough parallelism, do not split-kv
           params.partition_kv = false;
-          void* args[] = {(void*)&group_size_fastdiv, (void*)&params};
+          void* args[] = {(void*)&params};
           dim3 nblks(ceil_div(qo_len * group_size, CTA_TILE_Q), 1, num_kv_heads);
           dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
           FLASHINFER_CUDA_CALL(
@@ -1538,7 +1538,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
           auto lse = params.lse;
           params.o = tmp;
           params.lse = tmp_lse;
-          void* args[] = {(void*)&group_size_fastdiv, (void*)&params};
+          void* args[] = {(void*)&params};
           dim3 nblks(ceil_div(qo_len * group_size, CTA_TILE_Q), num_chunks, num_kv_heads);
           dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
           FLASHINFER_CUDA_CALL(
@@ -1559,7 +1559,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
 
 template <typename KTraits, typename Params>
 __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKVCacheKernel(
-    const uint_fastdiv group_size, const __grid_constant__ Params params) {
+    const __grid_constant__ Params params) {
   using DTypeQ = typename Params::DTypeQ;
 #if (__CUDA_ARCH__ < 800)
   if constexpr (std::is_same_v<DTypeQ, nv_bfloat16>) {
@@ -1611,6 +1611,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     const uint32_t v_stride_n = params.v_stride_n;
     const uint32_t v_stride_h = params.v_stride_h;
     const int32_t maybe_window_left = params.window_left;
+    const uint_fastdiv& group_size = params.group_size;
 
     static_assert(sizeof(DTypeQ) == 2);
     static_assert(sizeof(DTypeO) == 2);
@@ -1853,7 +1854,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
 
 template <typename KTraits, typename Params>
 __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVCacheKernel(
-    const uint_fastdiv group_size, const __grid_constant__ Params params) {
+    const __grid_constant__ Params params) {
   using DTypeQ = typename Params::DTypeQ;
 #if (__CUDA_ARCH__ < 800)
   if constexpr (std::is_same_v<DTypeQ, nv_bfloat16>) {
@@ -1897,6 +1898,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVC
     const paged_kv_t<DTypeKV, IdType>& paged_kv = params.paged_kv;
     const bool partition_kv = params.partition_kv;
     const int32_t maybe_window_left = params.window_left;
+    const uint_fastdiv& group_size = params.group_size;
 
     static_assert(sizeof(DTypeQ) == 2);
     static_assert(sizeof(DTypeO) == 2);
@@ -2158,7 +2160,6 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
   const uint32_t padded_batch_size = params.padded_batch_size;
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.num_kv_heads;
-  const uint_fastdiv group_size_fastdiv(num_qo_heads / num_kv_heads);
   constexpr uint32_t NUM_MMA_Q = get_num_mma_q(CTA_TILE_Q);
   constexpr uint32_t NUM_WARPS_Q = get_num_warps_q(CTA_TILE_Q);
   constexpr uint32_t NUM_WARPS_KV = get_num_warps_kv(CTA_TILE_Q);
@@ -2220,7 +2221,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
       if (tmp_v == nullptr) {
         // do not partition kv
         params.partition_kv = false;
-        void* args[] = {(void*)&group_size_fastdiv, (void*)&params};
+        void* args[] = {(void*)&params};
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
       } else {
@@ -2230,7 +2231,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
         auto lse = params.lse;
         params.o = tmp_v;
         params.lse = tmp_s;
-        void* args[] = {(void*)&group_size_fastdiv, (void*)&params};
+        void* args[] = {(void*)&params};
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         if constexpr (AttentionVariant::use_softmax) {
@@ -2259,7 +2260,6 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   const uint32_t padded_batch_size = params.padded_batch_size;
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t num_kv_heads = params.paged_kv.num_heads;
-  const uint_fastdiv group_size_fastdiv(num_qo_heads / num_kv_heads);
   constexpr uint32_t NUM_MMA_Q = get_num_mma_q(CTA_TILE_Q);
   constexpr uint32_t NUM_WARPS_Q = get_num_warps_q(CTA_TILE_Q);
   constexpr uint32_t NUM_WARPS_KV = get_num_warps_kv(CTA_TILE_Q);
@@ -2322,7 +2322,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
       if (tmp_v == nullptr) {
         // do not partition kv
         params.partition_kv = false;
-        void* args[] = {(void*)&group_size_fastdiv, (void*)&params};
+        void* args[] = {(void*)&params};
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
       } else {
@@ -2331,7 +2331,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
         auto lse = params.lse;
         params.o = tmp_v;
         params.lse = tmp_s;
-        void* args[] = {(void*)&group_size_fastdiv, (void*)&params};
+        void* args[] = {(void*)&params};
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
         if constexpr (AttentionVariant::use_softmax) {

@@ -38,6 +38,7 @@ struct SinglePrefillParams {
   DTypeO* o;
   float* lse;
   float* maybe_alibi_slopes;
+  uint_fastdiv group_size;
   uint32_t qo_len;
   uint32_t kv_len;
   uint32_t num_qo_heads;
@@ -65,6 +66,7 @@ struct SinglePrefillParams {
         o(nullptr),
         lse(nullptr),
         maybe_alibi_slopes(nullptr),
+        group_size(),
         qo_len(0),
         kv_len(0),
         num_qo_heads(0),
@@ -97,6 +99,7 @@ struct SinglePrefillParams {
         o(o),
         lse(lse),
         maybe_alibi_slopes(maybe_alibi_slopes),
+        group_size(num_qo_heads / num_kv_heads),
         num_qo_heads(num_qo_heads),
         num_kv_heads(num_kv_heads),
         qo_len(qo_len),
@@ -143,6 +146,7 @@ struct BatchPrefillRaggedParams {
   DTypeO* o;
   float* lse;
   float* maybe_alibi_slopes;
+  uint_fastdiv group_size;
   uint32_t num_qo_heads;
   uint32_t num_kv_heads;
   uint32_t q_stride_n;
@@ -182,6 +186,7 @@ struct BatchPrefillRaggedParams {
         o(nullptr),
         lse(nullptr),
         maybe_alibi_slopes(nullptr),
+        group_size(),
         num_qo_heads(0),
         num_kv_heads(0),
         q_stride_n(0),
@@ -228,6 +233,7 @@ struct BatchPrefillRaggedParams {
         o(o),
         lse(lse),
         maybe_alibi_slopes(maybe_alibi_slopes),
+        group_size(num_qo_heads / num_kv_heads),
         num_qo_heads(num_qo_heads),
         num_kv_heads(num_kv_heads),
         q_stride_n(q_stride_n),
@@ -278,6 +284,7 @@ struct BatchPrefillPagedParams {
   DTypeO* o;
   float* lse;
   float* maybe_alibi_slopes;
+  uint_fastdiv group_size;
   uint32_t num_qo_heads;
   IdType q_stride_n;
   IdType q_stride_h;
@@ -309,6 +316,7 @@ struct BatchPrefillPagedParams {
         o(nullptr),
         lse(nullptr),
         maybe_alibi_slopes(nullptr),
+        group_size(),
         num_qo_heads(0),
         q_stride_n(0),
         q_stride_h(0),
@@ -345,6 +353,7 @@ struct BatchPrefillPagedParams {
         o(o),
         lse(lse),
         maybe_alibi_slopes(maybe_alibi_slopes),
+        group_size(num_qo_heads / paged_kv.num_heads),
         num_qo_heads(num_qo_heads),
         q_stride_n(q_stride_n),
         q_stride_h(q_stride_h),
