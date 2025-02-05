@@ -27,6 +27,25 @@
 #include <cuda_fp8.h>
 #endif
 
+/* Creates a dummy empty module that can be imported from Python.
+   The import from Python will load the .so consisting of the file
+   in this extension, so that the TORCH_LIBRARY_FRAGMENT static initializers
+   are run. */
+#define MODULE_INIT(name) \
+extern "C" { \
+  PyObject* PyInit_##name(void) { \
+    static struct PyModuleDef module_def = { \
+      PyModuleDef_HEAD_INIT, \
+      #name,    /* name of module */ \
+      NULL,     /* module documentation, may be NULL */ \
+      -1,       /* size of per-interpreter state of the module, \
+                   or -1 if the module keeps state in global variables. */ \
+      NULL,     /* methods */ \
+    }; \
+    return PyModule_Create(&module_def); \
+  } \
+}
+
 #ifdef FLASHINFER_ENABLE_F16
 #define _DISPATCH_CASE_F16(c_type, ...) \
   case at::ScalarType::Half: {          \

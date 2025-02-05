@@ -16,6 +16,10 @@
 #include "aot_default_additional_params.h"
 #include "pytorch_extension_utils.h"
 
+#include "Python.h"
+
+MODULE_INIT(_kernels)
+
 //========== activation ==========
 
 void silu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
