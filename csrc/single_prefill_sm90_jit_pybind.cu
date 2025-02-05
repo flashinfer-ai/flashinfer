@@ -19,7 +19,7 @@
 void single_prefill_with_kv_cache_sm90(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor tmp,
                                        at::Tensor o, std::optional<at::Tensor> maybe_lse,
                                        int64_t mask_mode_code, int64_t layout,
-                                       int32_t window_left ADDITIONAL_FUNC_PARAMS,
+                                       int64_t window_left ADDITIONAL_FUNC_PARAMS,
                                        int64_t cuda_stream);
 
 TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) {

@@ -34,7 +34,7 @@ using namespace flashinfer;
 void single_prefill_with_kv_cache_sm90(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor tmp,
                                        at::Tensor o, std::optional<at::Tensor> maybe_lse,
                                        int64_t mask_mode_code, int64_t layout,
-                                       int32_t window_left ADDITIONAL_FUNC_PARAMS,
+                                       int64_t window_left ADDITIONAL_FUNC_PARAMS,
                                        int64_t cuda_stream) {
   unsigned int head_dim = q.size(2);
   unsigned int num_qo_heads = q.size(1);

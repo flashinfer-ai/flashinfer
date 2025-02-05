@@ -12,7 +12,7 @@ void BatchDecodeWithPagedKVCacheRunMLA(
     std::vector<int64_t> plan_info_vec, at::Tensor q_nope, at::Tensor q_pe,
     at::Tensor paged_ckv_cache, at::Tensor paged_kpe_cache, at::Tensor paged_kv_indptr,
     at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len, at::Tensor o, double sm_scale,
-    int window_left, double logits_soft_cap, double rope_scale, double rope_theta,
+    int64_t window_left, double logits_soft_cap, double rope_scale, double rope_theta,
     std::optional<at::Tensor> maybe_lse, int64_t cuda_stream) {
   DecodePlanInfo plan_info;
   plan_info.FromVector(plan_info_vec);
