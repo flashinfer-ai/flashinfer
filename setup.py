@@ -218,6 +218,10 @@ if enable_aot:
         "-compress-all",
         "-use_fast_math",
     ]
+    libraries = [
+        "cublas",
+        "cublasLt",
+    ]
     sm90a_flags = "-gencode arch=compute_90a,code=sm_90a".split()
     kernel_sources = [
         "csrc/bmm_fp8.cu",
@@ -252,6 +256,7 @@ if enable_aot:
             name="flashinfer._kernels",
             sources=kernel_sources + decode_sources + prefill_sources,
             include_dirs=include_dirs,
+            libraries=libraries,
             extra_compile_args={
                 "cxx": cxx_flags,
                 "nvcc": nvcc_flags,
@@ -264,6 +269,7 @@ if enable_aot:
                 name="flashinfer._kernels_sm90",
                 sources=kernel_sm90_sources + prefill_sm90_sources,
                 include_dirs=include_dirs,
+                libraries=libraries,
                 extra_compile_args={
                     "cxx": cxx_flags,
                     "nvcc": nvcc_flags + sm90a_flags,
