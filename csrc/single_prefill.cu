@@ -17,6 +17,7 @@
 #include <flashinfer/pos_enc.cuh>
 #include <optional>
 
+#include "flashinfer/fastdiv.cuh"
 #include "pytorch_extension_utils.h"
 #include "single_prefill_config.inc"
 
@@ -85,6 +86,7 @@ void single_prefill_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::
         params.lse = maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
         params.num_qo_heads = num_qo_heads;
         params.num_kv_heads = num_kv_heads;
+        params.group_size = uint_fastdiv(num_qo_heads / num_kv_heads);
         params.qo_len = qo_len;
         params.kv_len = kv_len;
         params.q_stride_n = q_stride_n;

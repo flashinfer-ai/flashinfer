@@ -3,6 +3,7 @@
 #include <flashinfer/layout.cuh>
 #include <flashinfer/utils.cuh>
 #include <flashinfer/pos_enc.cuh>
+#include <flashinfer/fastdiv.cuh>
 
 #define ADDITIONAL_FUNC_PARAMS {{ additional_func_params }}
 #define ADDITIONAL_PARAMS_SETTER {{ additional_params_setter }}
@@ -39,6 +40,7 @@ struct Params {
   DTypeKV* v;
   DTypeO* o;
   float* lse;
+  uint_fastdiv group_size;
 
   {{ additional_params_decl }}
 
