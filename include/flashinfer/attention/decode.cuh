@@ -857,6 +857,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
   const float rope_rcp_scale = params.rope_rcp_scale;
   const float rope_rcp_theta = params.rope_rcp_theta;
   const bool partition_kv = params.partition_kv;
+  params.sm_scale *= math::log2e;
 
   constexpr uint32_t head_dim_ckv = bdx * vec_size_ckv;
   constexpr uint32_t head_dim_kpe = bdx * vec_size_kpe;
