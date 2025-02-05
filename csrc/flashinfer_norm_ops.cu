@@ -27,7 +27,7 @@ void gemma_rmsnorm(at::Tensor& out, at::Tensor& input, at::Tensor& weight, doubl
 void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight,
                              double eps, int64_t cuda_stream);
 
-TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) {
+TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // Root mean square normalization
   m.def("rmsnorm", rmsnorm);
   // Fused add root mean square normalization

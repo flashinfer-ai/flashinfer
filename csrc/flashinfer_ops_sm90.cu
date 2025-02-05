@@ -49,7 +49,7 @@ void BatchPrefillWithPagedKVCacheSM90Run(
     std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code, int64_t layout,
     int64_t window_left BATCH_PREFILL_SM90_ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
 
-TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) {
+TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // "Cutlass Segment GEMM operator for SM90"
   m.def("cutlass_segment_gemm_sm90", CutlassSegmentGEMMSM90);
   m.def("single_prefill_with_kv_cache_sm90", single_prefill_with_kv_cache_sm90);

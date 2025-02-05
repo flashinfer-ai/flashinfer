@@ -38,7 +38,7 @@ void BatchPrefillWithPagedKVCacheSM90Run(
     std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code, int64_t layout,
     int64_t window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
 
-TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) {
+TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // Batch-request prefill attention with KV-Cache plan
   m.def("plan", BatchPrefillWithKVCacheSM90Plan);
   // Batch-request prefill attention with KV-Cache operator

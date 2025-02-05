@@ -199,7 +199,7 @@ void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_i
 
 //========== Torch Library ==========
 
-TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) {
+TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // activation
   // Fused SiLU and Mul
   m.def("silu_and_mul", silu_and_mul);

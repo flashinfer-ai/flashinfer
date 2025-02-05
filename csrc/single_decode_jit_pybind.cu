@@ -21,7 +21,7 @@ void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::T
                                  at::Tensor o, int64_t layout,
                                  int64_t window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
 
-TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) {
+TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // Single-request decode with KV-Cache operator
   m.def("run", single_decode_with_kv_cache);
 }

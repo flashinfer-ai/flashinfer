@@ -23,7 +23,7 @@ void CutlassSegmentGEMM(at::Tensor workspace_buffer, at::Tensor all_problems, at
                         at::Tensor y_ld, at::Tensor empty_x_data, bool weight_column_major,
                         int64_t cuda_stream);
 
-TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) {
+TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // "Cutlass Segment GEMM"
   m.def("cutlass_segment_gemm", CutlassSegmentGEMM);
   // "BMM FP8"

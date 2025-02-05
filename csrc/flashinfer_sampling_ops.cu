@@ -54,7 +54,7 @@ void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_i
                                 at::Tensor output_emitted_token_num, bool deterministic,
                                 int64_t cuda_stream);
 
-TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) {
+TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // Sample from probabilities
   m.def("sampling_from_probs", sampling_from_probs);
   // Top-k sampling from probabilities

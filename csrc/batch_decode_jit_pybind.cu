@@ -30,7 +30,7 @@ void BatchDecodeWithPagedKVCacheRun(
     at::Tensor paged_kv_last_page_len, at::Tensor o, std::optional<at::Tensor> maybe_lse,
     int64_t kv_layout_code, int64_t window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
 
-TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) {
+TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // Batched decode with paged KV-Cache plan
   m.def("plan", BatchDecodeWithPagedKVCachePlan);
   // Batched decode with paged KV-Cache run

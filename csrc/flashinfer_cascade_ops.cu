@@ -24,7 +24,7 @@ void merge_state_in_place(at::Tensor v, at::Tensor s, at::Tensor v_other, at::Te
 void merge_states(at::Tensor v, at::Tensor s, at::Tensor v_merged, at::Tensor s_merged,
                   int64_t cuda_stream);
 
-TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) {
+TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // Merge two self-attention states
   m.def("merge_state", merge_state);
   // Merge another self-attention state in-place.

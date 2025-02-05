@@ -40,7 +40,7 @@ void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_r
                                       at::Tensor k_rope, at::Tensor cos_sin_cache,
                                       at::Tensor pos_ids, bool interleave, int64_t cuda_stream);
 
-TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) {
+TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // "Apply RoPE"
   m.def("apply_rope", apply_rope);
   // "Apply Llama 3.1 style RoPE"

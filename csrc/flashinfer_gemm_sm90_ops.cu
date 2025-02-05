@@ -21,7 +21,7 @@ void CutlassSegmentGEMMSM90(at::Tensor float_workspace_buffer, at::Tensor int_wo
                             at::Tensor y_stride, at::Tensor empty_x_data, bool weight_column_major,
                             std::vector<int64_t> plan_info_vec, int64_t cuda_stream);
 
-TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) {
+TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // "Cutlass Segment GEMM operator for SM90"
   m.def("cutlass_segment_gemm_sm90", CutlassSegmentGEMMSM90);
 }

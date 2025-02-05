@@ -49,7 +49,7 @@ void {{ func_name }}(at::Tensor& out, at::Tensor& input, int64_t cuda_stream) {
   });
 }
 
-TORCH_LIBRARY(TORCH_EXTENSION_NAME, m) {
+TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("{{ func_name }}", {{ func_name }});
 }
 """
