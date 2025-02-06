@@ -56,7 +56,7 @@ def get_act_and_mul_module(act_func_name: str):
     global _jit_modules
     if act_func_name not in _jit_modules:
         if has_prebuilt_ops:
-            from . import _kernels  # type: ignore[attr-defined]
+            _kernels = torch.ops._kernels
 
             module = _kernels
         else:
