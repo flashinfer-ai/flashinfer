@@ -318,7 +318,8 @@ struct DecodePlanInfo {
   at::Tensor ToVector() const {
     return torch::tensor({padded_batch_size, v_offset, s_offset, request_indices_offset,
                           kv_tile_indices_offset, o_indptr_offset, block_valid_mask_offset,
-                          kv_chunk_size_ptr_offset, enable_cuda_graph, split_kv},
+                          kv_chunk_size_ptr_offset, static_cast<int64_t>(enable_cuda_graph), 
+                          static_cast<int64_t>(split_kv)},
                          torch::dtype(torch::kInt64));
   }
 
@@ -578,7 +579,8 @@ struct PrefillPlanInfo {
     return torch::tensor({padded_batch_size, total_num_rows, total_num_rows_offset, cta_tile_q,
                           request_indices_offset, qo_tile_indices_offset, kv_tile_indices_offset,
                           merge_indptr_offset, o_indptr_offset, kv_chunk_size_ptr_offset, v_offset,
-                          s_offset, block_valid_mask_offset, enable_cuda_graph, split_kv},
+                          s_offset, block_valid_mask_offset,
+                          static_cast<int64_t>(enable_cuda_graph), static_cast<int64_t>(split_kv)},
                          torch::dtype(torch::kInt64));
   }
 
@@ -748,7 +750,7 @@ struct PrefillPlanSM90Info {
   at::Tensor ToVector() const {
     return torch::tensor({qo_tile_indices_offset, qo_indptr_offset, kv_indptr_offset, qo_len_offset,
                           kv_len_offset, head_indices_offset, work_indptr_offset,
-                          same_schedule_for_all_heads},
+                          static_cast<int64_t>(same_schedule_for_all_heads)},
                          torch::dtype(torch::kInt64));
   }
 
