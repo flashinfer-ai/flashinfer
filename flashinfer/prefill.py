@@ -74,7 +74,7 @@ def get_single_prefill_module(backend):
 
                     run_func = _kernels.single_prefill_with_kv_cache
                 else:
-                    _kernels = torch.ops._kernels_sm90
+                    _kernels_sm90 = torch.ops._kernels_sm90
 
                     run_func = _kernels_sm90.single_prefill_with_kv_cache_sm90
             else:
@@ -183,7 +183,7 @@ def get_batch_prefill_module(backend):
                     ragged_run_func = _kernels.batch_prefill_with_ragged_kv_cache_run
                     paged_run_func = _kernels.batch_prefill_with_paged_kv_cache_run
                 else:
-                    _kernels = torch.ops._kernels_sm90
+                    _kernels_sm90 = torch.ops._kernels_sm90
 
                     plan_func = _kernels_sm90.batch_prefill_with_kv_cache_sm90_plan
                     ragged_run_func = (
