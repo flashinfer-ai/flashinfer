@@ -27,7 +27,7 @@ void BatchPrefillWithRaggedKVCacheRun(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     at::Tensor plan_info_vec, at::Tensor q, at::Tensor k, at::Tensor v,
     at::Tensor qo_indptr, at::Tensor kv_indptr, at::Tensor o, std::optional<at::Tensor> maybe_lse,
-    int64_t mask_mode_code, int64_t layout, int32_t window_left ADDITIONAL_FUNC_PARAMS,
+    int64_t mask_mode_code, int64_t layout, int64_t window_left ADDITIONAL_FUNC_PARAMS,
     int64_t cuda_stream);
 
 void BatchPrefillWithPagedKVCacheRun(
@@ -36,7 +36,7 @@ void BatchPrefillWithPagedKVCacheRun(
     at::Tensor paged_v_cache, at::Tensor qo_indptr, at::Tensor paged_kv_indptr,
     at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len, at::Tensor o,
     std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code, int64_t layout,
-    int32_t window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
+    int64_t window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // Batch-request prefill attention with KV-Cache plan
