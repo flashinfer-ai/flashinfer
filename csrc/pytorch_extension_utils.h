@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #pragma once
+#include <Python.h>
 #include <torch/all.h>
 #ifdef FLASHINFER_ENABLE_BF16
 #include <cuda_bf16.h>
@@ -27,24 +28,37 @@
 #include <cuda_fp8.h>
 #endif
 
+#ifndef FLASHINFER_EXT_MODULE_INITED
+#define FLASHINFER_EXT_MODULE_INITED
+
+// To expand macros in #name
+#define FLASHINFER_EXT_MODULE_INIT_EXPAND(name) FLASHINFER_EXT_MODULE_INIT(name)
+
 /* Creates a dummy empty module that can be imported from Python.
    The import from Python will load the .so consisting of the file
    in this extension, so that the TORCH_LIBRARY_FRAGMENT static initializers
    are run. */
-#define MODULE_INIT(name) \
+#define FLASHINFER_EXT_MODULE_INIT(name) \
 extern "C" { \
-  PyObject* PyInit_##name(void) { \
+  __attribute__((weak)) PyObject *PyInit_##name(void) { \
     static struct PyModuleDef module_def = { \
       PyModuleDef_HEAD_INIT, \
-      #name,    /* name of module */ \
-      NULL,     /* module documentation, may be NULL */ \
-      -1,       /* size of per-interpreter state of the module, \
-                   or -1 if the module keeps state in global variables. */ \
-      NULL,     /* methods */ \
+      #name,  /* name of module */ \
+      NULL,   /* module documentation, may be NULL */ \
+      -1,     /* size of per-interpreter state of the module, \
+                 or -1 if the module keeps state in global variables. */ \
+      NULL,   /* methods */ \
     }; \
     return PyModule_Create(&module_def); \
   } \
 }
+
+FLASHINFER_EXT_MODULE_INIT_EXPAND(TORCH_EXTENSION_NAME)
+
+#undef FLASHINFER_EXT_MODULE_INIT
+#undef FLASHINFER_EXT_MODULE_INIT_EXPAND
+
+#endif
 
 #ifdef FLASHINFER_ENABLE_F16
 #define _DISPATCH_CASE_F16(c_type, ...) \

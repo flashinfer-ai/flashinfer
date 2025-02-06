@@ -16,10 +16,6 @@
 #include "aot_default_additional_params.h"
 #include "pytorch_extension_utils.h"
 
-#include "Python.h"
-
-MODULE_INIT(_kernels_sm90)
-
 void CutlassSegmentGEMMSM90(at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
                             at::Tensor all_problems, at::Tensor x_ptr, at::Tensor w_ptr,
                             at::Tensor y_ptr, at::Tensor x_stride, at::Tensor weight_stride,
