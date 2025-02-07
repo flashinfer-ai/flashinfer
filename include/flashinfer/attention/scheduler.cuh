@@ -416,27 +416,6 @@ inline cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in
   return cudaSuccess;
 }
 
-inline uint32_t DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim) {
-  if (avg_packed_qo_len > 64 && head_dim < 256) {
-    return 128;
-  } else {
-    auto compute_capacity = GetCudaComputeCapability();
-    if (compute_capacity.first >= 8) {
-      // Ampere or newer
-      if (avg_packed_qo_len > 16) {
-        // avg_packed_qo_len <= 64
-        return 64;
-      } else {
-        // avg_packed_qo_len <= 16
-        return 16;
-      }
-    } else {
-      // NOTE(Zihao): not enough shared memory on Turing for 1x4 warp layout
-      return 64;
-    }
-  }
-}
-
 template <typename IdType>
 inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
                                    uint32_t total_num_rows, uint32_t batch_size,
@@ -478,7 +457,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
     // the CUDA graph is created fixes the maximum number of tokens.
     const uint64_t max_seq_len = total_num_rows - batch_size + 1;
     uint64_t max_qo_len = uint64_t(max_seq_len) * gqa_group_size;
-    cta_tile_q = DetermineCtaTileQ(max_qo_len, head_dim);
+    cta_tile_q = FA2DetermineCtaTileQ(max_qo_len, head_dim);
 
     // Find an upper bound for the number of tiles, derived from the total
     // number of rows and the batch size.  The sum of qo lengths rounded
@@ -491,7 +470,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
       sum_packed_qo_len += packed_qo_len_arr[i];
     }
     const int64_t avg_packed_qo_len = sum_packed_qo_len / batch_size;
-    cta_tile_q = DetermineCtaTileQ(avg_packed_qo_len, head_dim);
+    cta_tile_q = FA2DetermineCtaTileQ(avg_packed_qo_len, head_dim);
 
     total_num_tiles_q = 0;
     for (uint32_t i = 0; i < batch_size; ++i) {
@@ -616,8 +595,9 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
                                size_t int_workspace_size_in_bytes, PrefillPlanInfo& plan_info,
                                IdType* qo_indptr_h, IdType* kv_indptr_h, uint32_t total_num_rows,
                                uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
-                               uint32_t head_dim, uint32_t page_size, bool enable_cuda_graph,
-                               uint32_t sizeof_dtype_o, cudaStream_t stream) {
+                               uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
+                               bool enable_cuda_graph, uint32_t sizeof_dtype_o,
+                               cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -638,7 +618,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
   auto [split_kv, new_batch_size, padded_batch_size, cta_tile_q, kv_chunk_size, request_indices_vec,
         qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec, o_indptr_vec] =
       PrefillSplitQOKVIndptr(qo_indptr_h, kv_indptr_h, total_num_rows, batch_size, num_qo_heads,
-                             num_kv_heads, head_dim, page_size, max_batch_size_if_split,
+                             num_kv_heads, head_dim_vo, page_size, max_batch_size_if_split,
                              enable_cuda_graph);
 
   plan_info.cta_tile_q = cta_tile_q;
@@ -686,7 +666,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
   if (split_kv) {
     AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
     plan_info.v_offset = float_allocator.aligned_alloc_offset(
-        num_qo_heads * padded_batch_size * cta_tile_q * head_dim * sizeof_dtype_o, 16,
+        num_qo_heads * padded_batch_size * cta_tile_q * head_dim_vo * sizeof_dtype_o, 16,
         "batch_prefill_tmp_v");
     plan_info.s_offset = float_allocator.aligned_alloc_offset(
         num_qo_heads * padded_batch_size * cta_tile_q * sizeof(float), 16, "batch_prefill_tmp_s");
@@ -774,15 +754,13 @@ struct PrefillPlanSM90Info {
 };
 
 template <typename IdType>
-inline cudaError_t PrefillSM90Plan(void* float_buffer, size_t float_workspace_size_in_bytes,
-                                   void* int_buffer, void* page_locked_int_buffer,
-                                   size_t int_workspace_size_in_bytes,
-                                   PrefillPlanSM90Info& plan_info, IdType* qo_indptr_h,
-                                   IdType* kv_indptr_h, IdType* kv_len_arr_h,
-                                   uint32_t total_num_rows, uint32_t batch_size,
-                                   uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
-                                   uint32_t page_size, bool causal, bool enable_cuda_graph,
-                                   uint32_t sizeof_dtype_o, cudaStream_t stream) {
+inline cudaError_t PrefillSM90Plan(
+    void* float_buffer, size_t float_workspace_size_in_bytes, void* int_buffer,
+    void* page_locked_int_buffer, size_t int_workspace_size_in_bytes,
+    PrefillPlanSM90Info& plan_info, IdType* qo_indptr_h, IdType* kv_indptr_h, IdType* kv_len_arr_h,
+    uint32_t total_num_rows, uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
+    uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size, bool causal,
+    bool enable_cuda_graph, uint32_t sizeof_dtype_o, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -811,7 +789,7 @@ inline cudaError_t PrefillSM90Plan(void* float_buffer, size_t float_workspace_si
   std::sort(idx_qo_kv_len_vec.begin(), idx_qo_kv_len_vec.end(),
             [](const auto& a, const auto& b) { return std::get<2>(a) > std::get<2>(b); });
   int cta_tile_q = 128;
-  if (head_dim == 64) {
+  if (head_dim_vo == 64) {
     cta_tile_q = 192;
   }
 

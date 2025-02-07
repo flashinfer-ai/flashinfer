@@ -547,7 +547,7 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
         num_kv_heads,
         head_dim,
         page_size,
-        custom_mask,
+        custom_mask=custom_mask,
         pos_encoding_mode=pos_encoding_mode,
         logits_soft_cap=logits_soft_cap,
     )

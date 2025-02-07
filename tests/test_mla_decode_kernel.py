@@ -316,6 +316,16 @@ class DeepseekV2AttentionMatAbsorbDecode(nn.Module):
                 raise ValueError(
                     "For simplicity, kv_len should be multiple of page_size."
                 )
+            freqs_cis = precompute_freqs_cis(
+                self.qk_rope_head_dim, kv_len, self.rope_theta, use_scaled=False
+            ).to(k_pe_cache.device)
+            q_pe, k_pe_cache = apply_rotary_emb(
+                q_pe.unsqueeze(1).repeat(1, kv_len, 1, 1),
+                k_pe_cache.unsqueeze(2),
+                freqs_cis,
+            )
+            q_pe = q_pe[:, -1:, :, :].squeeze(1).contiguous()
+            k_pe_cache = k_pe_cache.squeeze(2)
             num_pages_per_seq = kv_len // page_size
             total_num_pages = num_pages_per_seq * bsz
 

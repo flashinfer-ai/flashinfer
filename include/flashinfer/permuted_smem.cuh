@@ -40,7 +40,7 @@ using b128_t = uint4;
  * \tparam T The data type of the elements.
  */
 template <typename T>
-constexpr __host__ __device__ __forceinline__ uint32_t num_elems_per_128b() {
+constexpr __host__ __device__ __forceinline__ uint32_t upcast_size() {
   return sizeof(b128_t) / sizeof(T);
 }
 

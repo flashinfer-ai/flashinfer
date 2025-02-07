@@ -60,7 +60,8 @@ struct SingleDecodeWithCustomMask {
         torch.float16,  # dtype_q
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
-        128,  # head_dim
+        128,  # head_dim_qk
+        128,  # head_dim_vo
         ["custom_mask"],  # additional_tensor_names
         ["uint8_t"],  # additional_tensor_dtypes
         ["sm_scale"],  # # additional_scalar_names
@@ -127,15 +128,18 @@ struct FlashSigmoid {
 
 flash_sigmoid_sm90_decl = r"""
 struct FlashSigmoid {
-  template <int NUM_ROWS_PER_THREAD>
-  using Updater = DefaultUpdater<NUM_ROWS_PER_THREAD>;
-
   float logits_scale_log2, sigmoid_bias_log2e;
   // Init
   template <typename MainloopParams, typename BlockCoord>
   __device__ __host__ FlashSigmoid(const MainloopParams& params, const BlockCoord& block_coord) {
     logits_scale_log2 = params.additional_params.logits_scale * math::log2e;
     sigmoid_bias_log2e = params.additional_params.sigmoid_bias * math::log2e;
+  }
+
+
+  template <int NUM_ROWS_PER_THREAD>
+  __device__ auto GetAttentionUpdater() {
+    return DefaultUpdater<NUM_ROWS_PER_THREAD>();
   }
 
   template <typename MainloopParams, typename T>
@@ -158,7 +162,8 @@ def test_flash_sigmoid():
         torch.float16,  # dtype_q
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
-        128,  # hidden_dim
+        128,  # head_dim_qk
+        128,  # head_dim_vo
         [],  # additional_tensor_names
         [],  # additional_tensor_dtypes
         ["logits_scale", "sigmoid_bias"],  # additional_scalar_names
@@ -229,7 +234,8 @@ struct DumpLogits {
         torch.float16,  # dtype_q
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
-        128,  # hidden_dim
+        128,  # head_dim_qk
+        128,  # head_dim_vo
         ["output_logits"],  # additional_tensor_names
         ["float"],  # additional_tensor_dtypes
         ["sm_scale"],  # additional_scalar_names
@@ -263,7 +269,8 @@ def test_batch_decode_flash_sigmoid(use_tensor_cores):
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
         torch.int32,  # idtype
-        128,  # hidden_dim
+        128,  # hidden_dim_qk
+        128,  # hidden_dim_vo
         [],  # additional_tensor_names
         [],  # additional_tensor_dtypes
         ["logits_scale", "sigmoid_bias"],  # additional_scalar_names
@@ -369,7 +376,8 @@ def test_batch_prefill_flash_sigmoid():
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
         torch.int32,  # idtype
-        128,  # hidden_dim
+        128,  # hidden_dim_qk
+        128,  # hidden_dim_vo
         [],  # additional_tensor_names
         [],  # additional_tensor_dtypes
         ["logits_scale", "sigmoid_bias"],  # additional_scalar_names
@@ -487,7 +495,8 @@ def test_batch_prefill_sm90_flash_sigmoid():
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
         torch.int32,  # idtype
-        128,  # hidden_dim
+        128,  # hidden_dim_qk
+        128,  # hidden_dim_vo
         [],  # additional_tensor_names
         [],  # additional_tensor_dtypes
         ["logits_scale", "sigmoid_bias"],  # additional_scalar_names
@@ -642,7 +651,8 @@ struct DebugPrintLogits {
         torch.float16,  # dtype_q
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
-        128,  # hidden_dim
+        128,  # hidden_dim_qk
+        128,  # hidden_dim_vo
         [],  # additional_tensor_names
         [],  # additional_tensor_dtypes
         ["sm_scale"],  # additional_scalar_names
@@ -668,10 +678,6 @@ def test_sm90_debug_print_logits():
     torch.manual_seed(42)
     variant_decl = r"""
 struct DebugPrintLogits {
-
-  template <int NUM_ROWS_PER_THREAD>
-  using Updater = OnlineSoftmaxWithoutScale<NUM_ROWS_PER_THREAD>;
-
   float sm_scale_log2;
   int qo_len, kv_len;
 
@@ -685,6 +691,13 @@ struct DebugPrintLogits {
     qo_len = qo_len_;
     kv_len = kv_len_;
   }
+
+
+  template <int NUM_ROWS_PER_THREAD>
+  __device__ auto GetAttentionUpdater() {
+    return OnlineSoftmax<NUM_ROWS_PER_THREAD, /*WITH_SCALE*/false>(sm_scale_log2);
+  }
+
 
   template <typename MainloopParams, typename T>
   __device__ __forceinline__ T LogitsTransform(const MainloopParams& params, T logits,
@@ -715,7 +728,8 @@ struct DebugPrintLogits {
         torch.float16,  # dtype_q
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
-        128,  # hidden_dim
+        128,  # hidden_dim_qk
+        128,  # hidden_dim_vo
         [],  # additional_tensor_names
         [],  # additional_tensor_dtypes
         ["sm_scale"],  # additional_scalar_names
@@ -738,12 +752,12 @@ struct DebugPrintLogits {
 
 
 if __name__ == "__main__":
-    # test_single_decode_mask()
-    # test_flash_sigmoid()
-    # test_dump_logits()
-    # test_debug_print_logits()
-    # test_sm90_debug_print_logits()
-    # test_batch_decode_flash_sigmoid(False)
-    # test_batch_decode_flash_sigmoid(True)
-    # test_batch_prefill_flash_sigmoid()
+    test_single_decode_mask()
+    test_flash_sigmoid()
+    test_dump_logits()
+    test_debug_print_logits()
+    test_sm90_debug_print_logits()
+    test_batch_decode_flash_sigmoid(False)
+    test_batch_decode_flash_sigmoid(True)
+    test_batch_prefill_flash_sigmoid()
     test_batch_prefill_sm90_flash_sigmoid()

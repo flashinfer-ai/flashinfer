@@ -36,8 +36,8 @@ at::Tensor BatchDecodeWithPagedKVCachePlan(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     at::Tensor page_locked_int_workspace_buffer, at::Tensor indptr, int64_t batch_size,
     int64_t num_qo_heads, int64_t num_kv_heads, int64_t page_size,
-    bool enable_cuda_graph, int64_t window_left, double logits_soft_cap, int64_t head_dim,
-    at::Tensor empty_q_data, at::Tensor empty_kv_data, int64_t cuda_stream) {
+    bool enable_cuda_graph, int64_t window_left, double logits_soft_cap, int64_t head_dim_qk,
+    int64_t head_dim_vo, at::Tensor empty_q_data, at::Tensor empty_kv_data, int64_t cuda_stream) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =
@@ -48,14 +48,18 @@ at::Tensor BatchDecodeWithPagedKVCachePlan(
   auto q_scalar_type = empty_q_data.scalar_type();
   auto kv_scalar_type = empty_kv_data.scalar_type();
 
+  TORCH_CHECK(head_dim_qk == head_dim_vo,
+              "CUDA cores template only supports equal head dim for QK and VO, please use tensor "
+              "cores template for different head dim");
+
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   DISPATCH_context(
-      DTypeQ, DTypeKV, DTypeO, IdType, HEAD_DIM, POS_ENCODING_MODE, USE_SLIDING_WINDOW,
-      USE_LOGITS_SOFT_CAP, AttentionVariant, Params, [&] {
+      DTypeQ, DTypeKV, DTypeO, IdType, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
+      USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, AttentionVariant, Params, [&] {
         DISPATCH_GQA_GROUP_SIZE(num_qo_heads / num_kv_heads, GROUP_SIZE, {
           auto work_estimation_func = BatchDecodeWithPagedKVCacheWorkEstimationDispatched<
-              GROUP_SIZE, HEAD_DIM, POS_ENCODING_MODE, AttentionVariant, Params>;
-          cudaError_t status = DecodePlan<HEAD_DIM, POS_ENCODING_MODE, AttentionVariant, Params>(
+              GROUP_SIZE, HEAD_DIM_QK, POS_ENCODING_MODE, AttentionVariant, Params>;
+          cudaError_t status = DecodePlan<HEAD_DIM_QK, POS_ENCODING_MODE, AttentionVariant, Params>(
               static_cast<void*>(float_workspace_buffer.data_ptr()), float_workspace_size_in_bytes,
               static_cast<void*>(int_workspace_buffer.data_ptr()),
               static_cast<void*>(page_locked_int_workspace_buffer.data_ptr()),
@@ -93,7 +97,12 @@ void BatchDecodeWithPagedKVCacheRun(
     page_size = paged_k_cache.size(1);
     num_kv_heads = paged_k_cache.size(2);
   }
-  uint32_t head_dim = q.size(2);
+  uint32_t head_dim_qk = q.size(2);
+  uint32_t head_dim_vo = paged_v_cache.size(3);
+
+  TORCH_CHECK(head_dim_qk == head_dim_vo,
+              "CUDA cores template only supports equal head dim for QK and VO, please use tensor "
+              "cores template for different head dim");
 
   if (maybe_lse) {
     const auto& lse = *maybe_lse;
@@ -122,10 +131,10 @@ void BatchDecodeWithPagedKVCacheRun(
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
 
   DISPATCH_context(
-      DTypeQ, DTypeKV, DTypeO, IdType, HEAD_DIM, POS_ENCODING_MODE, USE_SLIDING_WINDOW,
-      USE_LOGITS_SOFT_CAP, AttentionVariant, Params, [&] {
+      DTypeQ, DTypeKV, DTypeO, IdType, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
+      USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, AttentionVariant, Params, [&] {
         paged_kv_t<DTypeKV, IdType> paged_kv(
-            num_kv_heads, page_size, HEAD_DIM, batch_size, kv_layout,
+            num_kv_heads, page_size, HEAD_DIM_QK, batch_size, kv_layout,
             static_cast<DTypeKV*>(paged_k_cache.data_ptr()),
             static_cast<DTypeKV*>(paged_v_cache.data_ptr()), kv_cache_strides,
             static_cast<IdType*>(paged_kv_indices.data_ptr()),
@@ -171,7 +180,7 @@ void BatchDecodeWithPagedKVCacheRun(
         params.padded_batch_size = plan_info.padded_batch_size;
 
         cudaError_t status =
-            flashinfer::BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM, POS_ENCODING_MODE,
+            flashinfer::BatchDecodeWithPagedKVCacheDispatched<HEAD_DIM_QK, POS_ENCODING_MODE,
                                                               AttentionVariant>(params, tmp_v,
                                                                                 tmp_s,
                                                                                 /*stream=*/stream);

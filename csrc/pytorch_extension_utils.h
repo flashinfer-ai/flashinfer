@@ -153,10 +153,30 @@ FLASHINFER_EXT_MODULE_INIT_EXPAND(TORCH_EXTENSION_NAME)
     }                                                                                   \
   }()
 
+#define _DISPATCH_SWITCH_U16x2(var1_name, var2_name, cond1, cond2, ...)                       \
+  [&]() -> bool {                                                                             \
+    switch (pack_u16(cond1, cond2)) {                                                         \
+      __VA_ARGS__                                                                             \
+      default:                                                                                \
+        std::ostringstream oss;                                                               \
+        oss << __PRETTY_FUNCTION__ << " failed to dispatch (" var1_name ", " var2_name "): (" \
+            << int(cond1) << ", " << int(cond2) << ")";                                       \
+        TORCH_CHECK(false, oss.str());                                                        \
+        return false;                                                                         \
+    }                                                                                         \
+  }()
+
 #define _DISPATCH_CASE(case_expr, case_var, ...) \
   case case_expr: {                              \
     constexpr auto case_var = case_expr;         \
     return __VA_ARGS__();                        \
+  }
+
+#define _DISPATCH_CASE_U16x2(case_expr1, case_expr2, case_var1, case_var2, ...) \
+  case pack_u16(case_expr1, case_expr2): {                                      \
+    constexpr auto case_var1 = case_expr1;                                      \
+    constexpr auto case_var2 = case_expr2;                                      \
+    return __VA_ARGS__();                                                       \
   }
 
 #define DISPATCH_BOOL(expr, const_expr, ...) \

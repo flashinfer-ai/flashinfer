@@ -290,6 +290,27 @@ inline void DebugPrintCUDAArray(T* device_ptr, size_t size, std::string prefix =
   std::cout << std::endl;
 }
 
+inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim) {
+  if (avg_packed_qo_len > 64 && head_dim < 256) {
+    return 128;
+  } else {
+    auto compute_capacity = GetCudaComputeCapability();
+    if (compute_capacity.first >= 8) {
+      // Ampere or newer
+      if (avg_packed_qo_len > 16) {
+        // avg_packed_qo_len <= 64
+        return 64;
+      } else {
+        // avg_packed_qo_len <= 16
+        return 16;
+      }
+    } else {
+      // NOTE(Zihao): not enough shared memory on Turing for 1x4 warp layout
+      return 64;
+    }
+  }
+}
+
 /*!
  * \brief Return x - y if x > y, otherwise return 0.
  */

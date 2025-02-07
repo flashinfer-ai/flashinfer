@@ -44,8 +44,8 @@ at::Tensor BatchDecodeWithPagedKVCachePlan(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     at::Tensor page_locked_int_workspace_buffer, at::Tensor indptr, int64_t batch_size,
     int64_t num_qo_heads, int64_t num_kv_heads, int64_t page_size,
-    bool enable_cuda_graph, int64_t window_left, double logits_soft_cap, int64_t head_dim,
-    at::Tensor empty_q_data, at::Tensor empty_kv_data, int64_t cuda_stream);
+    bool enable_cuda_graph, int64_t window_left, double logits_soft_cap, int64_t head_dim_qk,
+    int64_t head_dim_vo, at::Tensor empty_q_data, at::Tensor empty_kv_data, int64_t cuda_stream);
 
 void BatchDecodeWithPagedKVCacheRun(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
@@ -107,7 +107,8 @@ at::Tensor BatchPrefillWithKVCachePlan(
     at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr, at::Tensor kv_indptr,
     at::Tensor kv_len_arr, int64_t total_num_rows, int64_t batch_size,
     int64_t num_qo_heads, int64_t num_kv_heads, int64_t page_size,
-    bool enable_cuda_graph, int64_t head_dim, bool causal, int64_t cuda_stream);
+    bool enable_cuda_graph, int64_t head_dim_qk, int64_t head_dim_vo, bool causal,
+    int64_t cuda_stream);
 
 void BatchPrefillWithRaggedKVCacheRun(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,

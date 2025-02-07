@@ -24,11 +24,17 @@
 namespace flashinfer {
 
 struct StandardAttention {
-  template <int NUM_ROWS_PER_THREAD>
-  using Updater = OnlineSoftmaxWithScale<NUM_ROWS_PER_THREAD>;
+  float sm_scale_log2;
 
   template <typename MainloopParams, typename BlockCoord>
-  __device__ StandardAttention(const MainloopParams& params, const BlockCoord& block_coord) {}
+  __device__ StandardAttention(const MainloopParams& params, const BlockCoord& block_coord) {
+    sm_scale_log2 = params.additional_params.sm_scale * math::log2e;
+  }
+
+  template <int NUM_ROWS_PER_THREAD>
+  __device__ auto GetAttentionUpdater() {
+    return OnlineSoftmax<NUM_ROWS_PER_THREAD, /*WITH_SCALE=*/true>(sm_scale_log2);
+  }
 
   template <typename MainloopParams, typename T>
   __device__ __forceinline__ T LogitsTransform(const MainloopParams& params, T logits,
@@ -42,14 +48,16 @@ struct LogitsSoftCap {
   float pre_tanh_scale;
   float post_tanh_scale;
 
-  template <int NUM_ROWS_PER_THREAD>
-  using Updater = OnlineSoftmaxWithoutScale<NUM_ROWS_PER_THREAD>;
-
   template <typename MainloopParams, typename BlockCoord>
   __device__ LogitsSoftCap(const MainloopParams& params, const BlockCoord& block_coord) {
     pre_tanh_scale =
         params.additional_params.sm_scale * math::ptx_rcp(params.additional_params.logits_soft_cap);
     post_tanh_scale = math::log2e * params.additional_params.logits_soft_cap;
+  }
+
+  template <int NUM_ROWS_PER_THREAD>
+  __device__ auto GetAttentionUpdater() {
+    return OnlineSoftmax<NUM_ROWS_PER_THREAD, /*WITH_SCALE=*/false>(0.);
   }
 
   template <typename MainloopParams, typename T>

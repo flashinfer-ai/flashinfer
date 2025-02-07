@@ -101,7 +101,8 @@ def get_single_decode_uri(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
-    head_dim: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
@@ -110,7 +111,8 @@ def get_single_decode_uri(
         f"single_decode_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
-        f"head_dim_{head_dim}_"
+        f"head_dim_qk_{head_dim_qk}_"
+        f"head_dim_vo_{head_dim_vo}_"
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}"
@@ -122,7 +124,8 @@ def get_batch_decode_uri(
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
     dtype_idx: torch.dtype,
-    head_dim: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
@@ -132,7 +135,8 @@ def get_batch_decode_uri(
         f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
-        f"head_dim_{head_dim}_"
+        f"head_dim_qk_{head_dim_qk}_"
+        f"head_dim_vo_{head_dim_vo}_"
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}"
@@ -144,7 +148,8 @@ def get_batch_decode_mla_uri(
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
     dtype_idx: torch.dtype,
-    head_dim: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
 ) -> str:
@@ -153,7 +158,8 @@ def get_batch_decode_mla_uri(
         f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
-        f"head_dim_{head_dim}_"
+        f"head_dim_qk_{head_dim_qk}_"
+        f"head_dim_vo_{head_dim_vo}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}"
     )
@@ -173,6 +179,7 @@ def gen_batch_decode_mla_module(
         dtype_kv,
         dtype_o,
         dtype_idx,
+        head_dim,
         head_dim,
         use_sliding_window,
         use_logits_soft_cap,
@@ -218,7 +225,8 @@ def get_single_prefill_uri(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
-    head_dim: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
@@ -228,7 +236,8 @@ def get_single_prefill_uri(
         f"single_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
-        f"head_dim_{head_dim}_"
+        f"head_dim_qk_{head_dim_qk}_"
+        f"head_dim_vo_{head_dim_vo}_"
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
@@ -242,7 +251,8 @@ def get_batch_prefill_uri(
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
     dtype_idx: torch.dtype,
-    head_dim: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
@@ -253,7 +263,8 @@ def get_batch_prefill_uri(
         f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
-        f"head_dim_{head_dim}_"
+        f"head_dim_qk_{head_dim_qk}_"
+        f"head_dim_vo_{head_dim_vo}_"
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
@@ -265,7 +276,8 @@ def gen_single_decode_module(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
-    head_dim: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
@@ -274,7 +286,8 @@ def gen_single_decode_module(
         dtype_q,
         dtype_kv,
         dtype_o,
-        head_dim,
+        head_dim_qk,
+        head_dim_vo,
         pos_encoding_mode,
         use_sliding_window,
         use_logits_soft_cap,
@@ -284,7 +297,8 @@ def gen_single_decode_module(
         dtype_q,
         dtype_kv,
         dtype_o,
-        head_dim,
+        head_dim_qk,
+        head_dim_vo,
         ["maybe_alibi_slopes"],  # additional_tensor_names
         ["float"],  # additional_tensor_dtypes
         [
@@ -307,7 +321,8 @@ def gen_single_prefill_module(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
-    head_dim: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
@@ -318,7 +333,8 @@ def gen_single_prefill_module(
         dtype_q,
         dtype_kv,
         dtype_o,
-        head_dim,
+        head_dim_qk,
+        head_dim_vo,
         pos_encoding_mode,
         use_sliding_window,
         use_logits_soft_cap,
@@ -350,7 +366,8 @@ def gen_single_prefill_module(
         dtype_q,
         dtype_kv,
         dtype_o,
-        head_dim,
+        head_dim_qk,
+        head_dim_vo,
         additional_tensor_names,
         additional_tensor_dtypes,
         additional_scalar_names,
@@ -369,7 +386,8 @@ def gen_batch_decode_module(
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
     dtype_idx: torch.dtype,
-    head_dim: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
@@ -379,7 +397,8 @@ def gen_batch_decode_module(
         dtype_kv,
         dtype_o,
         dtype_idx,
-        head_dim,
+        head_dim_qk,
+        head_dim_vo,
         pos_encoding_mode,
         use_sliding_window,
         use_logits_soft_cap,
@@ -390,7 +409,8 @@ def gen_batch_decode_module(
         dtype_kv,
         dtype_o,
         dtype_idx,
-        head_dim,
+        head_dim_qk,
+        head_dim_vo,
         ["maybe_alibi_slopes"],  # additional_tensor_names
         ["float"],  # additional_tensor_dtypes
         [
@@ -414,7 +434,8 @@ def gen_batch_prefill_module(
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
     dtype_idx: torch.dtype,
-    head_dim: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
     pos_encoding_mode: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
@@ -426,7 +447,8 @@ def gen_batch_prefill_module(
         dtype_kv,
         dtype_o,
         dtype_idx,
-        head_dim,
+        head_dim_qk,
+        head_dim_vo,
         pos_encoding_mode,
         use_sliding_window,
         use_logits_soft_cap,
@@ -468,7 +490,8 @@ def gen_batch_prefill_module(
         dtype_kv,
         dtype_o,
         dtype_idx,
-        head_dim,
+        head_dim_qk,
+        head_dim_vo,
         additional_tensor_names,
         additional_tensor_dtypes,
         additional_scalar_names,
@@ -487,7 +510,8 @@ def gen_customize_single_decode_module(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
-    head_dim: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
     additional_tensor_names: List[str],
     additional_tensor_dtypes: List[str],
     additional_scalar_names: List[str],
@@ -526,7 +550,8 @@ def gen_customize_single_decode_module(
         "dtype_q": dtype_map[dtype_q],
         "dtype_kv": dtype_map[dtype_kv],
         "dtype_o": dtype_map[dtype_o],
-        "head_dim": head_dim,
+        "head_dim_qk": head_dim_qk,
+        "head_dim_vo": head_dim_vo,
         "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
         "use_sliding_window": str(use_sliding_window).lower(),
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
@@ -570,7 +595,8 @@ def gen_customize_single_prefill_module(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
-    head_dim: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
     additional_tensor_names: List[str],
     additional_tensor_dtypes: List[str],
     additional_scalar_names: List[str],
@@ -588,7 +614,8 @@ def gen_customize_single_prefill_module(
         "dtype_q": dtype_map[dtype_q],
         "dtype_kv": dtype_map[dtype_kv],
         "dtype_o": dtype_map[dtype_o],
-        "head_dim": head_dim,
+        "head_dim_qk": head_dim_qk,
+        "head_dim_vo": head_dim_vo,
         "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
         "use_sliding_window": str(use_sliding_window).lower(),
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
@@ -721,7 +748,8 @@ def gen_customize_batch_decode_module(
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
     idtype: torch.dtype,
-    head_dim: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
     additional_tensor_names: List[str],
     additional_tensor_dtypes: List[str],
     additional_scalar_names: List[str],
@@ -752,7 +780,8 @@ def gen_customize_batch_decode_module(
         "dtype_kv": dtype_map[dtype_kv],
         "dtype_o": dtype_map[dtype_o],
         "idtype": dtype_map[idtype],
-        "head_dim": head_dim,
+        "head_dim_qk": head_dim_qk,
+        "head_dim_vo": head_dim_vo,
         "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
         "use_sliding_window": str(use_sliding_window).lower(),
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
@@ -803,7 +832,8 @@ def gen_customize_batch_prefill_module(
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
     idtype: torch.dtype,
-    head_dim: int,
+    head_dim_qk: int,
+    head_dim_vo: int,
     additional_tensor_names: List[str],
     additional_tensor_dtypes: List[str],
     additional_scalar_names: List[str],
@@ -822,7 +852,8 @@ def gen_customize_batch_prefill_module(
         "dtype_kv": dtype_map[dtype_kv],
         "dtype_o": dtype_map[dtype_o],
         "idtype": dtype_map[idtype],
-        "head_dim": head_dim,
+        "head_dim_qk": head_dim_qk,
+        "head_dim_vo": head_dim_vo,
         "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
         "use_sliding_window": str(use_sliding_window).lower(),
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),

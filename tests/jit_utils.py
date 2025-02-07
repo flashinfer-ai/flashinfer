@@ -53,7 +53,8 @@ def jit_decode_attention_func_args(
                     q_dtype,
                     kv_dtype,
                     q_dtype,
-                    head_dim,
+                    head_dim,  # head_dim_qk
+                    head_dim,  # head_dim_vo
                     pos_encoding_mode,
                     use_sliding_window,
                     use_logits_soft_cap,
@@ -68,7 +69,8 @@ def jit_decode_attention_func_args(
                     kv_dtype,
                     q_dtype,
                     torch.int32,
-                    head_dim,
+                    head_dim,  # head_dim_qk
+                    head_dim,  # head_dim_vo
                     pos_encoding_mode,
                     use_sliding_window,
                     use_logits_soft_cap,
@@ -115,7 +117,8 @@ def jit_prefill_attention_func_args(
                     q_dtype,
                     kv_dtype,
                     q_dtype,
-                    head_dim,
+                    head_dim,  # head_dim_qk
+                    head_dim,  # head_dim_vo
                     pos_encoding_mode,
                     use_sliding_window,
                     use_logits_soft_cap,
@@ -132,7 +135,8 @@ def jit_prefill_attention_func_args(
                     kv_dtype,
                     q_dtype,
                     torch.int32,
-                    head_dim,
+                    head_dim,  # head_dim_qk
+                    head_dim,  # head_dim_vo
                     pos_encoding_mode,
                     use_sliding_window,
                     use_logits_soft_cap,

@@ -480,7 +480,7 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
  * \brief Use mma instructions to compute rowsum.
  */
 template <typename DType>
-__device__ __forceinline__ void rowsum_f8f8f32(float* d, DType* s) {
+__device__ __forceinline__ void m16k32_rowsum_f8f8f32(float* d, DType* s) {
   static_assert(sizeof(DType) == 1, "DType must be 8bit floating data type");
   uint32_t* s_u32 = (uint32_t*)(s);
 #if defined(FLASHINFER_MMA_F8F8F32_M16N8K32_ENABLED)
@@ -519,7 +519,7 @@ __device__ __forceinline__ void rowsum_f8f8f32(float* d, DType* s) {
  * \brief Use mma instructions to compute rowsum.
  */
 template <typename DType>
-__device__ __forceinline__ void rowsum_f16f16f32(float* d, DType* s) {
+__device__ __forceinline__ void m16k16_rowsum_f16f16f32(float* d, DType* s) {
   static_assert(sizeof(DType) == 2, "DType must be 16bit floating data type");
   uint32_t* s_u32 = (uint32_t*)(s);
 #if defined(FLASHINFER_MMA_F16F16F32_M16N8K16_ENABLED)

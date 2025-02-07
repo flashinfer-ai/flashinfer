@@ -44,7 +44,6 @@ struct SingleDecodeParams {
   uint32_t q_stride_h;
   uint32_t kv_stride_n;
   uint32_t kv_stride_h;
-  uint32_t head_dim;
   int32_t window_left;
   float logits_soft_cap;
   float sm_scale;
@@ -66,7 +65,6 @@ struct SingleDecodeParams {
         q_stride_h(0),
         kv_stride_n(0),
         kv_stride_h(0),
-        head_dim(0),
         window_left(0),
         logits_soft_cap(0.0f),
         sm_scale(0.0f),
@@ -93,31 +91,12 @@ struct SingleDecodeParams {
         q_stride_h(head_dim),
         kv_stride_n((kv_layout == QKVLayout::kNHD) ? num_kv_heads * head_dim : head_dim),
         kv_stride_h((kv_layout == QKVLayout::kNHD) ? head_dim : seq_len * head_dim),
-        head_dim(head_dim),
         window_left(window_left),
         logits_soft_cap(logits_soft_cap),
         sm_scale(sm_scale),
         rope_rcp_scale(1.f / rope_scale),
         rope_rcp_theta(1.f / rope_theta),
         kv_chunk_size(0) {}
-
-  __host__ __device__ __forceinline__ size_t get_q_elem_offset(uint32_t qo_idx,
-                                                               uint32_t qo_head_idx,
-                                                               uint32_t feat_idx) const {
-    return get_elem_offset_impl(qo_idx, qo_head_idx, feat_idx, q_stride_n, q_stride_h);
-  }
-
-  __host__ __device__ __forceinline__ size_t get_o_elem_offset(uint32_t qo_idx,
-                                                               uint32_t qo_head_idx,
-                                                               uint32_t feat_idx) const {
-    return get_elem_offset_impl(qo_idx, qo_head_idx, feat_idx, num_qo_heads * head_dim, head_dim);
-  }
-
-  __host__ __device__ __forceinline__ size_t get_kv_elem_offset(uint32_t kv_idx,
-                                                                uint32_t kv_head_idx,
-                                                                uint32_t feat_idx) const {
-    return get_elem_offset_impl(kv_idx, kv_head_idx, feat_idx, kv_stride_n, kv_stride_h);
-  }
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const { return 1; }
 

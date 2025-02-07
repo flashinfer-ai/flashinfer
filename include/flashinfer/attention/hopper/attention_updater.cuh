@@ -142,8 +142,8 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0>& tenso
 template <int NUM_ROWS_PER_THREAD>
 struct DefaultUpdater {
   using TensorT = decltype(make_tensor<float>(Shape<Int<NUM_ROWS_PER_THREAD>>{}));
-  template <typename MainloopParams>
-  CUTLASS_DEVICE DefaultUpdater(MainloopParams params) {};
+  constexpr static float fill_value = 0.f;
+  CUTLASS_DEVICE DefaultUpdater() {};
 
   __forceinline__ __device__ TensorT get_lse() { return TensorT(); }
 
@@ -165,17 +165,12 @@ struct DefaultUpdater {
 
 template <int NUM_ROWS_PER_THREAD, bool WITH_SCALE>
 struct OnlineSoftmax {
+  constexpr static float fill_value = -math::inf;
   using TensorT = decltype(make_tensor<float>(Shape<Int<NUM_ROWS_PER_THREAD>>{}));
   TensorT row_max, row_sum, scores_scale;
   float sm_scale_log2;
 
-  template <typename MainloopParams>
-  CUTLASS_DEVICE OnlineSoftmax(MainloopParams params) {
-    if constexpr (WITH_SCALE) {
-      sm_scale_log2 = params.additional_params.sm_scale * math::log2e;
-    } else {
-      sm_scale_log2 = 0.f;
-    }
+  CUTLASS_DEVICE OnlineSoftmax(float sm_scale_log2) : sm_scale_log2(sm_scale_log2) {
     clear(scores_scale);
   };
 
@@ -256,12 +251,6 @@ struct OnlineSoftmax {
     }
   };
 };
-
-template <int NUM_ROWS_PER_THREAD>
-using OnlineSoftmaxWithScale = OnlineSoftmax<NUM_ROWS_PER_THREAD, /*WITH_SCALE=*/true>;
-
-template <int NUM_ROWS_PER_THREAD>
-using OnlineSoftmaxWithoutScale = OnlineSoftmax<NUM_ROWS_PER_THREAD, /*WITH_SCALE=*/false>;
 
 }  // namespace flashinfer
 

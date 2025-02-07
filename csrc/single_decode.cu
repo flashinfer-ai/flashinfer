@@ -47,7 +47,8 @@ void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::T
   CHECK_EQ(q.size(1), k.size(2));
   CHECK_EQ(v.scalar_type(), k.scalar_type());
   unsigned int num_qo_heads = q.size(0);
-  unsigned int head_dim = q.size(1);
+  unsigned int head_dim_qk = q.size(1);
+  unsigned int head_dim_vo = v.size(2);
   unsigned int kv_len, num_kv_heads;
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
   if (kv_layout == QKVLayout::kNHD) {
@@ -64,9 +65,13 @@ void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::T
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
 
+  TORCH_CHECK(head_dim_qk == head_dim_vo,
+              "CUDA cores template only supports equal head dim for QK and VO, please use tensor "
+              "cores template for different head dim");
+
   DISPATCH_context(
-      DTypeQ, DTypeKV, DTypeO, IdType, HEAD_DIM, POS_ENCODING_MODE, USE_SLIDING_WINDOW,
-      USE_LOGITS_SOFT_CAP, AttentionVariant, Params, [&] {
+      DTypeQ, DTypeKV, DTypeO, IdType, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
+      USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, AttentionVariant, Params, [&] {
         Params params;
 
         params.q = static_cast<DTypeQ*>(q.data_ptr());
@@ -77,18 +82,18 @@ void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::T
         params.kv_len = kv_len;
         params.num_qo_heads = num_qo_heads;
         params.num_kv_heads = num_kv_heads;
-        params.q_stride_n = num_qo_heads * head_dim;
-        params.q_stride_h = head_dim;
-        params.kv_stride_n = (kv_layout == QKVLayout::kNHD) ? num_kv_heads * head_dim : head_dim;
-        params.kv_stride_h = (kv_layout == QKVLayout::kNHD) ? head_dim : kv_len * head_dim;
-        params.head_dim = head_dim;
+        params.q_stride_n = num_qo_heads * head_dim_qk;
+        params.q_stride_h = head_dim_qk;
+        params.kv_stride_n =
+            (kv_layout == QKVLayout::kNHD) ? num_kv_heads * head_dim_vo : head_dim_vo;
+        params.kv_stride_h = (kv_layout == QKVLayout::kNHD) ? head_dim_vo : kv_len * head_dim_vo;
         params.window_left = window_left;
         params.kv_chunk_size = 0;
 
         ADDITIONAL_PARAMS_SETTER
 
         cudaError_t status =
-            flashinfer::SingleDecodeWithKVCacheDispatched<HEAD_DIM, POS_ENCODING_MODE,
+            flashinfer::SingleDecodeWithKVCacheDispatched<HEAD_DIM_QK, POS_ENCODING_MODE,
                                                           AttentionVariant>(
                 params, static_cast<DTypeO*>(tmp.data_ptr()), stream);
         TORCH_CHECK(status == cudaSuccess, "SingleDecodeWithKVCache kernel launch failed, error: " +

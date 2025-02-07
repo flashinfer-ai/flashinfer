@@ -15,7 +15,7 @@ Prerequisites
 
 - Python: 3.8, 3.9, 3.10, 3.11, 3.12
 
-- PyTorch: 2.2/2.3/2.4 with CUDA 11.8/12.1/12.4 (only for torch 2.4)
+- PyTorch: 2.2/2.3/2.4/2.5 with CUDA 11.8/12.1/12.4 (only for torch 2.4 or later)
 
   - Use ``python -c "import torch; print(torch.version.cuda)"`` to check your PyTorch CUDA version.
 
@@ -24,9 +24,31 @@ Prerequisites
 Quick Start
 ^^^^^^^^^^^
 
-The easiest way to install FlashInfer is via pip:
+The easiest way to install FlashInfer is via pip, we hosted wheels with indexed URL for different PyTorch versions and CUDA versions.
 
 .. tabs::
+
+    .. tab:: PyTorch 2.5
+
+        .. tabs::
+
+            .. tab:: CUDA 12.4
+
+                .. code-block:: bash
+
+                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu124/torch2.5/
+
+            .. tab:: CUDA 12.1
+
+                .. code-block:: bash
+
+                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu121/torch2.5/
+
+            .. tab:: CUDA 11.8
+
+                .. code-block:: bash
+
+                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu118/torch2.5/
 
     .. tab:: PyTorch 2.4
 
@@ -36,19 +58,20 @@ The easiest way to install FlashInfer is via pip:
 
                 .. code-block:: bash
 
-                    pip install flashinfer -i https://flashinfer.ai/whl/cu124/torch2.4/
+                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu124/torch2.4/
+
 
             .. tab:: CUDA 12.1
 
                 .. code-block:: bash
 
-                    pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
+                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu121/torch2.4/
 
             .. tab:: CUDA 11.8
 
                 .. code-block:: bash
 
-                    pip install flashinfer -i https://flashinfer.ai/whl/cu118/torch2.4/
+                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu118/torch2.4/
 
     .. tab:: PyTorch 2.3
 
@@ -58,48 +81,14 @@ The easiest way to install FlashInfer is via pip:
 
                 .. code-block:: bash
 
-                    pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.3/
+                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu121/torch2.3/
 
             .. tab:: CUDA 11.8
 
                 .. code-block:: bash
 
-                    pip install flashinfer -i https://flashinfer.ai/whl/cu118/torch2.3/
+                    pip install flashinfer-python -i https://flashinfer.ai/whl/cu118/torch2.3/
 
-    .. tab:: PyTorch 2.2
-
-        .. tabs::
-
-            .. tab:: CUDA 12.1
-
-                .. code-block:: bash
-
-                    pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.2/
-
-            .. tab:: CUDA 11.8
-
-                .. code-block:: bash
-
-                    pip install flashinfer -i https://flashinfer.ai/whl/cu118/torch2.2/
-
-    .. tab:: PyTorch 2.1
-
-        Since FlashInfer version 0.1.2, support for PyTorch 2.1 has been ended. Users are encouraged to upgrade to a newer
-        PyTorch version or :ref:`install FlashInfer from source code. <install-from-source>` .
-
-        .. tabs::
-
-            .. tab:: CUDA 12.1
-
-                .. code-block:: bash
-
-                    pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.1/
-
-            .. tab:: CUDA 11.8
-
-                .. code-block:: bash
-
-                    pip install flashinfer -i https://flashinfer.ai/whl/cu118/torch2.1/
 
 .. _install-from-source:
 
@@ -113,6 +102,7 @@ FlashInfer offers two installation modes:
 JIT mode
    - CUDA kernels are compiled at runtime using PyTorch's JIT, with compiled kernels cached for future use.
    - JIT mode allows fast installation, as no CUDA kernels are pre-compiled, making it ideal for development and testing.
+   - JIT version is also available as a sdist in `PyPI <https://pypi.org/project/flashinfer-python/>`_.
 
 AOT mode
    - Core CUDA kernels are pre-compiled and included in the library, reducing runtime compilation overhead.

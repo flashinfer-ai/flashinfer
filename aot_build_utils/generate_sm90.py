@@ -17,7 +17,7 @@ limitations under the License.
 import argparse
 from itertools import product
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 from . import (
     generate_batch_paged_prefill_sm90_inst,
@@ -33,7 +33,7 @@ def get_sm90_instantiation_cu(args: argparse.Namespace) -> List[str]:
         path.write_text(content)
 
     path: Path = args.path
-    head_dims: List[int] = args.head_dims
+    head_dims: List[Tuple[int, int]] = args.head_dims
     pos_encoding_modes: List[int] = args.pos_encoding_modes
     use_fp16_qk_reductions: List[int] = args.use_fp16_qk_reductions
     mask_modes: List[int] = args.mask_modes
@@ -58,7 +58,7 @@ def get_sm90_instantiation_cu(args: argparse.Namespace) -> List[str]:
     # single prefill files
     single_prefill_sm90_uris = []
     for (
-        head_dim,
+        (head_dim_qk, head_dim_vo),
         pos_encoding_mode,
         use_fp16_qk_reduction,
         mask_mode,
@@ -69,14 +69,15 @@ def get_sm90_instantiation_cu(args: argparse.Namespace) -> List[str]:
         mask_modes,
     ):
         for dtype_q, dtype_kv in list(zip(prefill_dtypes, prefill_dtypes)):
-            fname = f"single_prefill_head_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_sm90.cu"
+            fname = f"single_prefill_head_qk_{head_dim_qk}_head_vo_{head_dim_vo}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_sm90.cu"
             content = generate_single_prefill_sm90_inst.get_cu_file_str(
-                head_dim,
+                head_dim_qk,
+                head_dim_vo,
                 pos_encoding_mode,
                 use_fp16_qk_reduction,
                 mask_mode,
-                dtype_q,  # dtype_q
-                dtype_kv,  # dtype_kv
+                dtype_q,
+                dtype_kv,
                 dtype_q,  # dtype_out
             )
             for use_sliding_window in [True, False]:
@@ -88,7 +89,8 @@ def get_sm90_instantiation_cu(args: argparse.Namespace) -> List[str]:
                             f"single_prefill_with_kv_cache_dtype_q_{dtype_q}_"
                             f"dtype_kv_{dtype_kv}_"
                             f"dtype_o_{dtype_q}_"
-                            f"head_dim_{head_dim}_"
+                            f"head_dim_qk_{head_dim_qk}_"
+                            f"head_dim_vo_{head_dim_vo}_"
                             f"posenc_{pos_encoding_mode}_"
                             f"use_swa_{use_sliding_window}_"
                             f"use_logits_cap_{use_logits_soft_cap}_"
@@ -99,7 +101,7 @@ def get_sm90_instantiation_cu(args: argparse.Namespace) -> List[str]:
     # batch prefill files
     batch_prefill_sm90_uris = []
     for (
-        head_dim,
+        (head_dim_qk, head_dim_vo),
         pos_encoding_mode,
         use_fp16_qk_reduction,
         mask_mode,
@@ -112,27 +114,29 @@ def get_sm90_instantiation_cu(args: argparse.Namespace) -> List[str]:
         idtypes,
     ):
         for dtype_q, dtype_kv in list(zip(prefill_dtypes, prefill_dtypes)):
-            fname = f"batch_paged_prefill_head_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}_sm90.cu"
+            fname = f"batch_paged_prefill_head_qk_{head_dim_qk}_head_vo_{head_dim_vo}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}_sm90.cu"
             content = generate_batch_paged_prefill_sm90_inst.get_cu_file_str(
-                head_dim,
+                head_dim_qk,
+                head_dim_vo,
                 pos_encoding_mode,
                 use_fp16_qk_reduction,
                 mask_mode,
-                dtype_q,  # dtype_q
-                dtype_kv,  # dtype_kv
+                dtype_q,
+                dtype_kv,
                 dtype_q,  # dtype_out
                 idtype,
             )
             write_if_different(path / fname, content)
 
-            fname = f"batch_ragged_prefill_head_{head_dim}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}_sm90.cu"
+            fname = f"batch_ragged_prefill_head_qk_{head_dim_qk}_head_vo_{head_dim_vo}_posenc_{pos_encoding_mode}_fp16qkred_{use_fp16_qk_reduction}_mask_{mask_mode}_dtypeq_{dtype_q}_dtypekv_{dtype_kv}_dtypeout_{dtype_q}_idtype_{idtype}_sm90.cu"
             content = generate_batch_ragged_prefill_sm90_inst.get_cu_file_str(
-                head_dim,
+                head_dim_qk,
+                head_dim_vo,
                 pos_encoding_mode,
                 use_fp16_qk_reduction,
                 mask_mode,
-                dtype_q,  # dtype_q
-                dtype_kv,  # dtype_kv
+                dtype_q,
+                dtype_kv,
                 dtype_q,  # dtype_out
                 idtype,
             )
@@ -148,7 +152,8 @@ def get_sm90_instantiation_cu(args: argparse.Namespace) -> List[str]:
                             f"dtype_kv_{dtype_kv}_"
                             f"dtype_o_{dtype_q}_"
                             f"dtype_idx_{idtype}_"
-                            f"head_dim_{head_dim}_"
+                            f"head_dim_qk_{head_dim_qk}_"
+                            f"head_dim_vo_{head_dim_vo}_"
                             f"posenc_{pos_encoding_mode}_"
                             f"use_swa_{sliding_window}_"
                             f"use_logits_cap_{logits_soft_cap}_"
@@ -164,7 +169,11 @@ if __name__ == "__main__":
         "--path", type=Path, required=True, help="Path to the dispatch inc file"
     )
     parser.add_argument(
-        "--head_dims", type=int, required=True, nargs="+", help="Head dimensions"
+        "--head_dims",
+        type=str,
+        required=True,
+        nargs="+",
+        help="Head dimensions in format of 'head_dim_qk,head_dim_vo'",
     )
     parser.add_argument(
         "--pos_encoding_modes",
@@ -202,4 +211,5 @@ if __name__ == "__main__":
         help="Enable bf16",
     )
     args = parser.parse_args()
+    args.head_dims = [tuple(map(int, x.split(","))) for x in args.head_dims]
     get_sm90_instantiation_cu(args)
