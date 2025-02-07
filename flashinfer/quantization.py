@@ -28,7 +28,7 @@ def get_quantization_module():
     global _quantization_module
     if _quantization_module is None:
         if has_prebuilt_ops:
-            _kernels = torch.ops._kernels
+            _kernels = torch.ops.flashinfer_kernels
 
             _quantization_module = _kernels
         else:

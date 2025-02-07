@@ -37,7 +37,7 @@ def get_page_module():
     global _page_module
     if _page_module is None:
         if has_prebuilt_ops:
-            _kernels = torch.ops._kernels
+            _kernels = torch.ops.flashinfer_kernels
 
             _page_module = _kernels
         else:
