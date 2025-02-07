@@ -264,7 +264,7 @@ def test_batch_decode_flash_sigmoid(use_tensor_cores):
     torch.manual_seed(42)
     variant_decl = flash_sigmoid_sm80_decl
     jit_args = (
-        "batch_decode_flash_sigmoid_sm80",  # uri
+        f"batch_decode_flash_sigmoid_sm80_{use_tensor_cores}",  # uri
         torch.float16,  # dtype_q
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
