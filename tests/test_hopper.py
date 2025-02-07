@@ -117,6 +117,78 @@ def test_batch_ragged_prefill(
 
 
 @pytest.mark.parametrize("batch_size", [1, 4, 8, 16])
+@pytest.mark.parametrize("seq_len", [11, 99, 1763, 9999, 32767])
+@pytest.mark.parametrize("num_heads", [4, 32, 128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+def test_deepseek_prefill(
+    batch_size,
+    seq_len,
+    num_heads,
+    causal,
+    dtype,
+):
+    if batch_size * seq_len > 131072:
+        pytest.skip()
+    head_dim_qk = 192
+    head_dim_vo = 128
+    torch.random.manual_seed(42)
+    q = torch.randn(
+        batch_size * seq_len, num_heads, head_dim_qk, dtype=dtype, device="cuda"
+    )
+    k = torch.randn(
+        batch_size * seq_len, num_heads, head_dim_qk, dtype=dtype, device="cuda"
+    )
+    v = torch.randn(
+        batch_size * seq_len, num_heads, head_dim_vo, dtype=dtype, device="cuda"
+    )
+
+    workspace_buffer = torch.empty(
+        256 * 1024 * 1024, dtype=torch.uint8, device="cuda:0"
+    )
+
+    wrapper_sm80 = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace_buffer, backend="fa2"
+    )
+
+    wrapper_sm90 = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace_buffer, backend="fa3"
+    )
+
+    qo_indptr = torch.arange(0, batch_size * seq_len + 1, seq_len).int()
+    kv_indptr = torch.arange(0, batch_size * seq_len + 1, seq_len).int()
+
+    wrapper_sm80.plan(
+        qo_indptr,
+        kv_indptr,
+        num_heads,
+        num_heads,
+        head_dim_qk,
+        causal=causal,
+        head_dim_vo=head_dim_vo,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+    o_sm80, lse_sm80 = wrapper_sm80.run_return_lse(q, k, v)
+
+    wrapper_sm90.plan(
+        qo_indptr,
+        kv_indptr,
+        num_heads,
+        num_heads,
+        head_dim_qk,
+        causal=causal,
+        head_dim_vo=head_dim_vo,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+    o_sm90, lse_sm90 = wrapper_sm90.run_return_lse(q, k, v)
+
+    torch.testing.assert_close(lse_sm80, lse_sm90, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(o_sm80, o_sm90, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4, 8, 16])
 @pytest.mark.parametrize("seq_len", [11, 12, 99, 1763, 9999, 32767])
 @pytest.mark.parametrize("page_size", [1])  # [1, 16])
 @pytest.mark.parametrize("num_qo_heads", [1, 4, 8])

@@ -117,17 +117,11 @@ def test_batch_prefill_with_ragged_kv_cache(
     kv_layout = "NHD"
     head_dim_qk = 192
     head_dim_vo = 128
-    q = (
-        torch.randn(batch_size * qo_len, num_qo_heads, head_dim_qk).to(0).bfloat16()
-    )  # half()
+    q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim_qk).to(0).half()
     q_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
 
-    k = (
-        torch.zeros(batch_size * kv_len, num_kv_heads, head_dim_qk).to(0).bfloat16()
-    )  # half()
-    v = (
-        torch.randn(batch_size * kv_len, num_kv_heads, head_dim_vo).to(0).bfloat16()
-    )  # half()
+    k = torch.zeros(batch_size * kv_len, num_kv_heads, head_dim_qk).to(0).half()
+    v = torch.randn(batch_size * kv_len, num_kv_heads, head_dim_vo).to(0).half()
     kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len
 
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
@@ -142,8 +136,6 @@ def test_batch_prefill_with_ragged_kv_cache(
         head_dim_qk,
         head_dim_vo=head_dim_vo,
         causal=causal,
-        q_data_type=q.dtype,
-        kv_data_type=k.dtype,
     )
     o = wrapper.run(q, k, v)
 
