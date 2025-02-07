@@ -794,8 +794,8 @@ __device__ __forceinline__ void compute_qk_and_update_local_stat_mla(
     ckv_vec.cast_load(ckv_smem + j * head_dim_ckv + tx * vec_size_ckv);
 
     vec_t<float, vec_size_kpe> kpe_vec;
-    kpe_vec = vec_apply_llama_rope_interleave<vec_size_kpe, bdx>(kpe_smem + j * head_dim_kpe, freq,
-                                                                 kv_idx_base + tz * tile_size + j);
+    kpe_vec.cast_load(kpe_smem + j * head_dim_kpe + tx * vec_size_kpe);
+
     s[j] = 0.f;
 #pragma unroll
     for (uint32_t i = 0; i < vec_size_ckv; ++i) {
@@ -920,9 +920,9 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
       q_nope_vec[i].cast_load(q_nope +
                               (mapped_batch_idx * num_qo_heads + qo_head_idx[i]) * head_dim_ckv +
                               tx * vec_size_ckv);
-      q_pe_vec[i] = vec_apply_llama_rope_interleave<vec_size_kpe, bdx>(
-          q_pe + (mapped_batch_idx * num_qo_heads + qo_head_idx[i]) * head_dim_kpe, freq,
-          q_rope_offset_val);
+      q_pe_vec[i].cast_load(q_pe +
+                            (mapped_batch_idx * num_qo_heads + qo_head_idx[i]) * head_dim_kpe +
+                            tx * vec_size_kpe);
     }
   }
 
