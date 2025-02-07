@@ -149,7 +149,7 @@ def get_gemm_sm90_module():
     global _gemm_module_sm90
     if _gemm_module_sm90 is None:
         if has_prebuilt_ops:
-            _kernels = torch.ops._kernels_sm90
+            _kernels_sm90 = torch.ops._kernels_sm90
 
             module = _kernels_sm90
         else:
