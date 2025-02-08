@@ -24,12 +24,13 @@
 #include <sstream>
 #include <vector>
 
+#include <torch/types.h>
+
 #include "../allocator.h"
 #include "../exception.h"
 #include "../pos_enc.cuh"
 #include "../utils.cuh"
 #include "heap.h"
-#include <torch/all.h>
 
 namespace flashinfer {
 

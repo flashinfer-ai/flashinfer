@@ -15,7 +15,9 @@
  */
 #pragma once
 #include <Python.h>
-#include <torch/all.h>
+
+#include <torch/library.h>
+
 #ifdef FLASHINFER_ENABLE_BF16
 #include <cuda_bf16.h>
 #endif
