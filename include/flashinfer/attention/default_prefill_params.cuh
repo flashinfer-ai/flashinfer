@@ -38,8 +38,6 @@ struct SinglePrefillParams {
   DTypeO* o;
   float* lse;
   float* maybe_alibi_slopes;
-  float* tmp_o;
-  float* tmp_lse;
   uint_fastdiv group_size;
   uint32_t qo_len;
   uint32_t kv_len;
