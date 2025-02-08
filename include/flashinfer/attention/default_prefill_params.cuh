@@ -114,8 +114,8 @@ struct SinglePrefillParams {
         window_left(window_left),
         logits_soft_cap(logits_soft_cap),
         sm_scale(sm_scale),
-        rope_rcp_scale(-std::log2f(rope_scale)),
-        rope_rcp_theta(-std::log2f(rope_theta)),
+        rope_rcp_scale(1. / rope_scale),
+        rope_rcp_theta(1. / rope_theta),
         partition_kv(false) {}
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {

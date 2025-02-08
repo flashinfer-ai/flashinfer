@@ -417,7 +417,8 @@ __device__ __forceinline__ void load_q_global_smem(
         uint32_t q, r;
         group_size.divmod(packed_offset + lane_idx / 8 + mma_q * 16 + j * 4, q, r);
         const uint32_t q_idx = q;
-        DTypeQ* q_ptr = q_ptr_base + q * q_stride_n + r * q_stride_h;
+        DTypeQ* q_ptr =
+            q_ptr_base + q * q_stride_n + r * q_stride_h + (lane_idx % 8) * upcast_size<DTypeQ>();
 #pragma unroll
         for (uint32_t mma_do = 0; mma_do < KTraits::NUM_MMA_D_QK / 4; ++mma_do) {
           // load q fragment from gmem to smem
@@ -1095,59 +1096,83 @@ __device__ __forceinline__ void write_o_reg_gmem(
     typename KTraits::DTypeO* o_ptr_base, const uint32_t o_packed_idx_base,
     const uint32_t qo_upper_bound, const uint32_t o_stride_n, const uint32_t o_stride_h,
     const uint_fastdiv group_size) {
+  using DTypeO = typename KTraits::DTypeO;
   constexpr uint32_t UPCAST_HEAD_DIM_O = KTraits::UPCAST_HEAD_DIM_O;
   const uint32_t warp_idx_x = get_warp_idx_q<KTraits>();
   const uint32_t lane_idx = threadIdx.x;
 
-  if (get_warp_idx_kv<KTraits>() == 0) {
+  if constexpr (sizeof(DTypeO) == 4) {
 #pragma unroll
     for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
 #pragma unroll
-      for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
-        uint32_t o_frag_f16[8 / 2];
-        vec_cast<typename KTraits::DTypeO, float>::cast<8>((typename KTraits::DTypeO*)o_frag_f16,
-                                                           o_frag[mma_q][mma_d]);
-
-#ifdef FLASHINFER_STMATRIX_M8N8X4_ENABLED
-        uint32_t o_smem_offset_w = o_smem->get_permuted_offset<UPCAST_HEAD_DIM_O>(
-            (warp_idx_x * KTraits::NUM_MMA_Q + mma_q) * 16 + lane_idx % 16,
-            mma_d * 2 + lane_idx / 16);
-        o_smem->stmatrix_m8n8x4(o_smem_offset_w, o_frag_f16);
-#else
-        uint32_t o_smem_offset_w = o_smem->get_permuted_offset<UPCAST_HEAD_DIM_O>(
-            (warp_idx_x * KTraits::NUM_MMA_Q + mma_q) * 16 + lane_idx / 4, mma_d * 2);
-        ((uint32_t*)(o_smem->base + o_smem_offset_w))[lane_idx % 4] = o_frag_f16[0];
-        ((uint32_t*)(o_smem->base + o_smem_offset_w + 8 * UPCAST_HEAD_DIM_O))[lane_idx % 4] =
-            o_frag_f16[1];
-        ((uint32_t*)(o_smem->base + (o_smem_offset_w ^ 0x1)))[lane_idx % 4] = o_frag_f16[2];
-        ((uint32_t*)(o_smem->base + (o_smem_offset_w ^ 0x1) +
-                     8 * UPCAST_HEAD_DIM_O))[lane_idx % 4] = o_frag_f16[3];
-#endif
+      for (uint32_t j = 0; j < 2; ++j) {
+        uint32_t q, r;
+        group_size.divmod(o_packed_idx_base + lane_idx / 4 + mma_q * 16 + j * 8, q, r);
+        const uint32_t o_idx = q;
+#pragma unroll
+        for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
+          if (o_idx < qo_upper_bound) {
+            *reinterpret_cast<float2*>(o_ptr_base + q * o_stride_n + r * o_stride_h + mma_d * 16 +
+                                       (lane_idx % 4) * 2) =
+                *reinterpret_cast<float2*>(&o_frag[mma_q][mma_d][j * 2]);
+            *reinterpret_cast<float2*>(o_ptr_base + q * o_stride_n + r * o_stride_h + mma_d * 16 +
+                                       8 + (lane_idx % 4) * 2) =
+                *reinterpret_cast<float2*>(&o_frag[mma_q][mma_d][4 + j * 2]);
+          }
+        }
       }
     }
+  } else {
+    if (get_warp_idx_kv<KTraits>() == 0) {
+#pragma unroll
+      for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+        for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
+          uint32_t o_frag_f16[8 / 2];
+          vec_cast<DTypeO, float>::cast<8>((DTypeO*)o_frag_f16, o_frag[mma_q][mma_d]);
 
-    uint32_t o_smem_offset_w = o_smem->get_permuted_offset<UPCAST_HEAD_DIM_O>(
-        warp_idx_x * KTraits::NUM_MMA_Q * 16 + lane_idx / 8, lane_idx % 8);
-
-#pragma unroll
-    for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
-#pragma unroll
-      for (uint32_t j = 0; j < 2 * 2; ++j) {
-        uint32_t q, r;
-        group_size.divmod(o_packed_idx_base + lane_idx / 8 + mma_q * 16 + j * 4, q, r);
-        const uint32_t o_idx = q;
-        typename KTraits::DTypeO* o_ptr = o_ptr_base + q * o_stride_n + r * o_stride_h;
-#pragma unroll
-        for (uint32_t mma_do = 0; mma_do < KTraits::NUM_MMA_D_VO / 4; ++mma_do) {
-          if (o_idx < qo_upper_bound) {
-            o_smem->store_128b(o_smem_offset_w, o_ptr);
-          }
-          o_ptr += 8 * upcast_size<typename KTraits::DTypeO>();
-          o_smem_offset_w = o_smem->template advance_offset_by_column<8>(o_smem_offset_w, mma_do);
+#ifdef FLASHINFER_STMATRIX_M8N8X4_ENABLED
+          uint32_t o_smem_offset_w = o_smem->get_permuted_offset<UPCAST_HEAD_DIM_O>(
+              (warp_idx_x * KTraits::NUM_MMA_Q + mma_q) * 16 + lane_idx % 16,
+              mma_d * 2 + lane_idx / 16);
+          o_smem->stmatrix_m8n8x4(o_smem_offset_w, o_frag_f16);
+#else
+          uint32_t o_smem_offset_w = o_smem->get_permuted_offset<UPCAST_HEAD_DIM_O>(
+              (warp_idx_x * KTraits::NUM_MMA_Q + mma_q) * 16 + lane_idx / 4, mma_d * 2);
+          ((uint32_t*)(o_smem->base + o_smem_offset_w))[lane_idx % 4] = o_frag_f16[0];
+          ((uint32_t*)(o_smem->base + o_smem_offset_w + 8 * UPCAST_HEAD_DIM_O))[lane_idx % 4] =
+              o_frag_f16[1];
+          ((uint32_t*)(o_smem->base + (o_smem_offset_w ^ 0x1)))[lane_idx % 4] = o_frag_f16[2];
+          ((uint32_t*)(o_smem->base + (o_smem_offset_w ^ 0x1) +
+                       8 * UPCAST_HEAD_DIM_O))[lane_idx % 4] = o_frag_f16[3];
+#endif
         }
-        o_smem_offset_w =
-            o_smem->template advance_offset_by_row<4, UPCAST_HEAD_DIM_O>(o_smem_offset_w) -
-            2 * KTraits::NUM_MMA_D_VO;
+      }
+
+      uint32_t o_smem_offset_w = o_smem->get_permuted_offset<UPCAST_HEAD_DIM_O>(
+          warp_idx_x * KTraits::NUM_MMA_Q * 16 + lane_idx / 8, lane_idx % 8);
+
+#pragma unroll
+      for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+        for (uint32_t j = 0; j < 2 * 2; ++j) {
+          uint32_t q, r;
+          group_size.divmod(o_packed_idx_base + lane_idx / 8 + mma_q * 16 + j * 4, q, r);
+          const uint32_t o_idx = q;
+          DTypeO* o_ptr =
+              o_ptr_base + q * o_stride_n + r * o_stride_h + (lane_idx % 8) * upcast_size<DTypeO>();
+#pragma unroll
+          for (uint32_t mma_do = 0; mma_do < KTraits::NUM_MMA_D_VO / 4; ++mma_do) {
+            if (o_idx < qo_upper_bound) {
+              o_smem->store_128b(o_smem_offset_w, o_ptr);
+            }
+            o_ptr += 8 * upcast_size<DTypeO>();
+            o_smem_offset_w = o_smem->template advance_offset_by_column<8>(o_smem_offset_w, mma_do);
+          }
+          o_smem_offset_w =
+              o_smem->template advance_offset_by_row<4, UPCAST_HEAD_DIM_O>(o_smem_offset_w) -
+              2 * KTraits::NUM_MMA_D_VO;
+        }
       }
     }
   }
@@ -1229,7 +1254,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void SinglePrefillWithKVCache
     const uint_fastdiv& group_size = params.group_size;
 
     static_assert(sizeof(DTypeQ) == 2);
-    static_assert(sizeof(DTypeO) == 2);
     const uint32_t lane_idx = threadIdx.x, warp_idx = get_warp_idx<KTraits>();
     const uint32_t bx = blockIdx.x, chunk_idx = blockIdx.y, kv_head_idx = blockIdx.z;
     const uint32_t num_kv_heads = gridDim.z, num_qo_heads = num_kv_heads * group_size;
@@ -1264,13 +1288,10 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void SinglePrefillWithKVCache
         (bx * NUM_WARPS_Q + get_warp_idx_q<KTraits>()) * NUM_MMA_Q * 16;
     smem_t<SWIZZLE_MODE_Q> qo_smem(smem_storage.q_smem);
     const uint32_t o_stride_n = num_qo_heads * HEAD_DIM_VO, o_stride_h = HEAD_DIM_VO;
-    DTypeQ* q_ptr_base =
-        q + (kv_head_idx * group_size) * q_stride_h + (lane_idx % 8) * upcast_size<DTypeQ>();
-    DTypeO* o_ptr_base =
-        partition_kv
-            ? o + chunk_idx * o_stride_n + (kv_head_idx * group_size) * o_stride_h +
-                  (lane_idx % 8) * upcast_size<DTypeO>()
-            : o + (kv_head_idx * group_size) * o_stride_h + (lane_idx % 8) * upcast_size<DTypeO>();
+    DTypeQ* q_ptr_base = q + (kv_head_idx * group_size) * q_stride_h;
+    DTypeO* o_ptr_base = partition_kv
+                             ? o + chunk_idx * o_stride_n + (kv_head_idx * group_size) * o_stride_h
+                             : o + (kv_head_idx * group_size) * o_stride_h;
 
     uint32_t q_smem_offset_r = qo_smem.get_permuted_offset<UPCAST_HEAD_DIM_Q>(
         get_warp_idx_q<KTraits>() * NUM_MMA_Q * 16 + lane_idx % 16, lane_idx / 16);
@@ -1614,7 +1635,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     const uint_fastdiv& group_size = params.group_size;
 
     static_assert(sizeof(DTypeQ) == 2);
-    static_assert(sizeof(DTypeO) == 2);
     const uint32_t kv_chunk_size = *(params.kv_chunk_size_ptr);
 
     auto block = cg::this_thread_block();
@@ -1658,16 +1678,13 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     smem_t<SWIZZLE_MODE_Q> qo_smem(smem_storage.q_smem);
     const uint32_t o_stride_n = num_qo_heads * HEAD_DIM_VO, o_stride_h = HEAD_DIM_VO;
 
-    DTypeQ* q_ptr_base = q + q_indptr[request_idx] * q_stride_n +
-                         kv_head_idx * group_size * q_stride_h +
-                         (lane_idx % 8) * upcast_size<DTypeQ>();
+    DTypeQ* q_ptr_base =
+        q + q_indptr[request_idx] * q_stride_n + kv_head_idx * group_size * q_stride_h;
 
-    DTypeO* o_ptr_base =
-        partition_kv
-            ? o + (o_indptr[request_idx] + kv_tile_idx) * o_stride_n +
-                  (kv_head_idx * group_size) * o_stride_h + (lane_idx % 8) * upcast_size<DTypeO>()
-            : o + o_indptr[request_idx] * o_stride_n + (kv_head_idx * group_size) * o_stride_h +
-                  (lane_idx % 8) * upcast_size<DTypeO>();
+    DTypeO* o_ptr_base = partition_kv ? o + (o_indptr[request_idx] + kv_tile_idx) * o_stride_n +
+                                            (kv_head_idx * group_size) * o_stride_h
+                                      : o + o_indptr[request_idx] * o_stride_n +
+                                            (kv_head_idx * group_size) * o_stride_h;
 
     uint32_t q_smem_offset_r = qo_smem.get_permuted_offset<UPCAST_HEAD_DIM_Q>(
         get_warp_idx_q<KTraits>() * NUM_MMA_Q * 16 + lane_idx % 16, lane_idx / 16);
@@ -1901,7 +1918,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVC
     const uint_fastdiv& group_size = params.group_size;
 
     static_assert(sizeof(DTypeQ) == 2);
-    static_assert(sizeof(DTypeO) == 2);
     auto block = cg::this_thread_block();
     const uint32_t kv_chunk_size = *(params.kv_chunk_size_ptr);
 
@@ -1945,15 +1961,12 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVC
     const uint32_t q_stride_n = params.q_stride_n, q_stride_h = params.q_stride_h;
     smem_t<SWIZZLE_MODE_Q> qo_smem(smem_storage.q_smem);
     const uint32_t o_stride_n = num_qo_heads * HEAD_DIM_VO, o_stride_h = HEAD_DIM_VO;
-    DTypeQ* q_ptr_base = q + q_indptr[request_idx] * q_stride_n +
-                         (kv_head_idx * group_size) * q_stride_h +
-                         (lane_idx % 8) * upcast_size<DTypeQ>();
-    DTypeO* o_ptr_base =
-        partition_kv
-            ? o + (o_indptr[request_idx] + kv_tile_idx) * o_stride_n +
-                  (kv_head_idx * group_size) * o_stride_h + (lane_idx % 8) * upcast_size<DTypeO>()
-            : o + o_indptr[request_idx] * o_stride_n + (kv_head_idx * group_size) * o_stride_h +
-                  (lane_idx % 8) * upcast_size<DTypeO>();
+    DTypeQ* q_ptr_base =
+        q + q_indptr[request_idx] * q_stride_n + (kv_head_idx * group_size) * q_stride_h;
+    DTypeO* o_ptr_base = partition_kv ? o + (o_indptr[request_idx] + kv_tile_idx) * o_stride_n +
+                                            (kv_head_idx * group_size) * o_stride_h
+                                      : o + o_indptr[request_idx] * o_stride_n +
+                                            (kv_head_idx * group_size) * o_stride_h;
 
     uint32_t q_smem_offset_r = qo_smem.get_permuted_offset<UPCAST_HEAD_DIM_Q>(
         get_warp_idx_q<KTraits>() * NUM_MMA_Q * 16 + lane_idx % 16, lane_idx / 16);
