@@ -20,6 +20,7 @@
 
 #include "../../math.cuh"
 #include "attention_updater.cuh"
+#include "variant_helper.cuh"
 
 namespace flashinfer {
 
@@ -36,12 +37,8 @@ struct StandardAttention {
     return OnlineSoftmax<NUM_ROWS_PER_THREAD, /*WITH_SCALE=*/true>(sm_scale_log2);
   }
 
-  template <typename MainloopParams, typename T>
-  __device__ __forceinline__ T LogitsTransform(const MainloopParams& params, T logits,
-                                               uint32_t batch_idx, uint32_t qo_idx, uint32_t kv_idx,
-                                               uint32_t qo_head_idx, uint32_t kv_head_idx) {
-    return logits;
-  }
+  REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx,
+                            { return logits; })
 };
 
 struct LogitsSoftCap {
@@ -60,12 +57,8 @@ struct LogitsSoftCap {
     return OnlineSoftmax<NUM_ROWS_PER_THREAD, /*WITH_SCALE=*/false>(0.);
   }
 
-  template <typename MainloopParams, typename T>
-  __device__ __forceinline__ T LogitsTransform(const MainloopParams& params, T logits,
-                                               uint32_t batch_idx, uint32_t qo_idx, uint32_t kv_idx,
-                                               uint32_t qo_head_idx, uint32_t kv_head_idx) {
-    return math::tanh(logits * pre_tanh_scale) * post_tanh_scale;
-  }
+  REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx,
+                            { return math::tanh(logits * pre_tanh_scale) * post_tanh_scale; })
 };
 
 template <bool use_logits_soft_cap>

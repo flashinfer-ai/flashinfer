@@ -22,193 +22,21 @@
 
 #include "../math.cuh"
 #include "../utils.cuh"
+#include "variant_helper.cuh"
 
 namespace flashinfer {
 
-// Query Transform function that multiplies the query matrix by sm_scale
-struct StandardAttention {
-  static constexpr bool use_softmax = true;
-
-  uint32_t window_left, qo_len, kv_len;
-
-  // Create closure
-  template <typename Params>
-  __device__ __host__ StandardAttention(const Params& params, uint32_t batch_idx,
-                                        uint8_t* smem_ptr) {
-    qo_len = params.get_qo_len(batch_idx);
-    kv_len = params.get_kv_len(batch_idx);
-    window_left = kv_len;
-  }
-
-  template <typename Params, typename T>
-  __device__ __forceinline__ T QueryTransform(const Params& params, T q) {
-    return float(q) * params.sm_scale * math::log2e;
-  }
-
-  template <typename Params, typename T>
-  __device__ __forceinline__ T LogitsTransform(const Params& params, T logits, uint32_t batch_idx,
-                                               uint32_t qo_idx, uint32_t kv_idx,
-                                               uint32_t qo_head_idx, uint32_t kv_head_idx) {
-    return logits;
-  }
-
-  template <typename Params>
-  __device__ __forceinline__ bool LogitsMask(const Params& params, uint32_t batch_idx,
-                                             uint32_t qo_idx, uint32_t kv_idx, uint32_t qo_head_idx,
-                                             uint32_t kv_head_idx) {
-    return true;
-  }
-};
-
 DEFINE_HAS_MEMBER(maybe_mask_indptr)
 
-struct CustomMaskAttention {
-  static constexpr bool use_softmax = true;
-
-  uint8_t* custom_mask_ptr;
-  uint32_t window_left, qo_len, kv_len;
-
-  // Create closure
-  template <typename Params>
-  __device__ __host__ CustomMaskAttention(const Params& params, uint32_t batch_idx,
-                                          uint8_t* smem_ptr) {
-    if constexpr (has_maybe_mask_indptr_v<Params>) {
-      custom_mask_ptr = params.maybe_custom_mask + params.maybe_mask_indptr[batch_idx];
-    } else {
-      custom_mask_ptr = params.maybe_custom_mask;
-    }
-    qo_len = params.get_qo_len(batch_idx);
-    kv_len = params.get_kv_len(batch_idx);
-    window_left = kv_len;
-  }
-
-  template <typename Params, typename T>
-  __device__ __forceinline__ T QueryTransform(const Params& params, T q) {
-    return float(q) * params.sm_scale * math::log2e;
-  }
-
-  template <typename Params, typename T>
-  __device__ __forceinline__ T LogitsTransform(const Params& params, T logits, uint32_t batch_idx,
-                                               uint32_t qo_idx, uint32_t kv_idx,
-                                               uint32_t qo_head_idx, uint32_t kv_head_idx) {
-    return logits;
-  }
-
-  template <typename Params>
-  __device__ __forceinline__ bool LogitsMask(const Params& params, uint32_t batch_idx,
-                                             uint32_t qo_idx, uint32_t kv_idx, uint32_t qo_head_idx,
-                                             uint32_t kv_head_idx) {
-    const uint32_t offset = qo_idx * kv_len + kv_idx;
-    return ((custom_mask_ptr[offset / 8] >> (offset % 8)) & 1);
-  }
-};
-
-struct SlidingWindowAttention {
-  static constexpr bool use_softmax = true;
-
-  uint32_t window_left, qo_len, kv_len;
-
-  // Create closure
-  template <typename Params>
-  __device__ __host__ __forceinline__ SlidingWindowAttention(const Params& params,
-                                                             uint32_t batch_idx,
-                                                             uint8_t* smem_ptr) {
-    qo_len = params.get_qo_len(batch_idx);
-    kv_len = params.get_kv_len(batch_idx);
-    window_left = (params.window_left >= 0) ? params.window_left : kv_len;
-  }
-
-  template <typename Params, typename T>
-  __device__ __forceinline__ T QueryTransform(const Params& params, T q) {
-    return float(q) * params.sm_scale * math::log2e;
-  }
-
-  template <typename Params, typename T>
-  __device__ __forceinline__ T LogitsTransform(const Params& params, T logits, uint32_t batch_idx,
-                                               uint32_t qo_idx, uint32_t kv_idx,
-                                               uint32_t qo_head_idx, uint32_t kv_head_idx) {
-    return logits;
-  }
-
-  template <typename Params>
-  __device__ __forceinline__ bool LogitsMask(const Params& params, uint32_t batch_idx,
-                                             uint32_t qo_idx, uint32_t kv_idx, uint32_t qo_head_idx,
-                                             uint32_t kv_head_idx) {
-    return (kv_idx + qo_len + window_left >= kv_len + qo_idx);
-  }
-};
-
-struct LogitsSoftCap {
-  static constexpr bool use_softmax = true;
-
-  uint32_t window_left, qo_len, kv_len;
-
-  template <typename Params>
-  __device__ __host__ LogitsSoftCap(const Params& params, uint32_t batch_idx, uint8_t* smem_ptr) {
-    qo_len = params.get_qo_len(batch_idx);
-    kv_len = params.get_kv_len(batch_idx);
-    window_left = kv_len;
-  }
-
-  template <typename Params, typename T>
-  __device__ __forceinline__ T QueryTransform(const Params& params, T q) {
-    return float(q) * params.sm_scale * math::ptx_rcp(params.logits_soft_cap);
-  }
-
-  template <typename Params, typename T>
-  __device__ __forceinline__ T LogitsTransform(const Params& params, T logits, uint32_t batch_idx,
-                                               uint32_t qo_idx, uint32_t kv_idx,
-                                               uint32_t qo_head_idx, uint32_t kv_head_idx) {
-    return params.logits_soft_cap * math::log2e * float(math::tanh(logits));
-  }
-
-  template <typename Params>
-  __device__ __forceinline__ bool LogitsMask(const Params& params, uint32_t batch_idx,
-                                             uint32_t qo_idx, uint32_t kv_idx, uint32_t qo_head_idx,
-                                             uint32_t kv_head_idx) {
-    return true;
-  }
-};
-
-struct ALIBIAttention {
-  static constexpr bool use_softmax = true;
-
-  uint32_t window_left, qo_len, kv_len;
-
-  template <typename Params>
-  __device__ __host__ ALIBIAttention(const Params& params, uint32_t batch_idx, uint8_t* smem_ptr) {
-    qo_len = params.get_qo_len(batch_idx);
-    kv_len = params.get_kv_len(batch_idx);
-    window_left = kv_len;
-  }
-
-  template <typename Params, typename T>
-  __device__ __forceinline__ T QueryTransform(const Params& params, T q) {
-    return float(q) * params.sm_scale * math::log2e;
-  }
-
-  template <typename Params, typename T>
-  __device__ __forceinline__ T LogitsTransform(const Params& params, T logits, uint32_t batch_idx,
-                                               uint32_t qo_idx, uint32_t kv_idx,
-                                               uint32_t qo_head_idx, uint32_t kv_head_idx) {
-    return logits + params.maybe_alibi_slopes[qo_head_idx] * float(int(kv_idx) - int(qo_idx));
-  }
-
-  template <typename Params>
-  __device__ __forceinline__ bool LogitsMask(const Params& params, uint32_t batch_idx,
-                                             uint32_t qo_idx, uint32_t kv_idx, uint32_t qo_head_idx,
-                                             uint32_t kv_head_idx) {
-    return true;
-  }
-};
-
 template <bool use_custom_mask, bool use_sliding_window, bool use_logits_soft_cap, bool use_alibi>
-struct DefaultAttention {
+struct DefaultAttention : AttentionVariantBase {
   static constexpr bool use_softmax = true;
 
-  uint32_t qo_len, kv_len;
   uint8_t* custom_mask_ptr;
+  uint32_t qo_len, kv_len;
   uint32_t window_left;
+  float sm_scale_log2;
+  float soft_cap_pre_tanh_scale;
 
   // Create closure
   template <typename Params>
@@ -216,6 +44,12 @@ struct DefaultAttention {
                                        uint8_t* smem_ptr) {
     qo_len = params.get_qo_len(batch_idx);
     kv_len = params.get_kv_len(batch_idx);
+    if constexpr (use_logits_soft_cap) {
+      soft_cap_pre_tanh_scale = params.sm_scale * math::ptx_rcp(params.logits_soft_cap);
+      sm_scale_log2 = math::log2e * params.logits_soft_cap;
+    } else {
+      sm_scale_log2 = params.sm_scale * math::log2e;
+    }
     if constexpr (use_custom_mask) {
       if constexpr (has_maybe_mask_indptr_v<Params>) {
         custom_mask_ptr = params.maybe_custom_mask + params.maybe_mask_indptr[batch_idx];
@@ -228,32 +62,17 @@ struct DefaultAttention {
     }
   }
 
-  template <typename Params, typename T>
-  __device__ __forceinline__ T QueryTransform(const Params& params, T q) {
-    if constexpr (use_logits_soft_cap) {
-      return float(q) * params.sm_scale * math::ptx_rcp(params.logits_soft_cap);
-    } else {
-      return float(q) * params.sm_scale * math::log2e;
-    }
-  }
-
-  template <typename Params, typename T>
-  __device__ __forceinline__ T LogitsTransform(const Params& params, T logits, uint32_t batch_idx,
-                                               uint32_t qo_idx, uint32_t kv_idx,
-                                               uint32_t qo_head_idx, uint32_t kv_head_idx) {
+  REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
     if constexpr (use_alibi) {
       logits = logits + params.maybe_alibi_slopes[qo_head_idx] * float(int(kv_idx) - int(qo_idx));
     }
     if constexpr (use_logits_soft_cap) {
-      logits = params.logits_soft_cap * math::log2e * float(math::tanh(logits));
+      logits = float(math::tanh(logits * soft_cap_pre_tanh_scale));
     }
     return logits;
-  }
+  })
 
-  template <typename Params>
-  __device__ __forceinline__ bool LogitsMask(const Params& params, uint32_t batch_idx,
-                                             uint32_t qo_idx, uint32_t kv_idx, uint32_t qo_head_idx,
-                                             uint32_t kv_head_idx) {
+  REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
     bool mask = true;
     if constexpr (use_custom_mask) {
       const uint32_t offset = qo_idx * kv_len + kv_idx;
@@ -263,9 +82,9 @@ struct DefaultAttention {
       mask &= (kv_idx + qo_len + window_left >= kv_len + qo_idx);
     }
     return mask;
-  }
+  })
 };
 
-}  // namespace flashinfer
+};  // namespace flashinfer
 
 #endif  // FLASHINFER_ATTENTION_VARIANTS_CUH_

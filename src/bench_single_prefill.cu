@@ -182,19 +182,18 @@ void bench_flashinfer_single_prefill(nvbench::state& state) {
       .add_int64_axis("custom_mask", {0})                                                   \
       .add_int64_axis("cooperative", {1})
 
-auto bench_flashinfer_single_prefill_fp8_kv = bench_flashinfer_single_prefill_fp8<false>;
-NVBENCH_BENCH(bench_flashinfer_single_prefill_fp8_kv)
-    .set_name(("bench_flashinfer_single_prefill_fp8_kv"))
-    .add_int64_axis("kv_len", {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536})
-    .add_int64_axis("num_qo_heads", {32})
-    .add_int64_axis("num_kv_heads", {32})
-    .add_int64_axis("head_dim", {128})
-    .add_int64_axis("causal", {0, 1})
-    .add_int64_axis("kv_layout", {0, 1})
-    .add_int64_axis("pos_encoding_mode", {0, 1})
-    .add_int64_axis("use_fp16_qk_reduction", {0, 1})
-    .add_int64_axis("custom_mask", {0})
-    .add_int64_axis("cooperative", {1});
+// auto bench_flashinfer_single_prefill_fp8_kv = bench_flashinfer_single_prefill_fp8<false>;
+// NVBENCH_BENCH(bench_flashinfer_single_prefill_fp8_kv)
+//     .set_name(("bench_flashinfer_single_prefill_fp8_kv"))
+//     .add_int64_axis("kv_len", {32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
+//     65536}) .add_int64_axis("num_qo_heads", {32}) .add_int64_axis("num_kv_heads", {32})
+//     .add_int64_axis("head_dim", {128})
+//     .add_int64_axis("causal", {0, 1})
+//     .add_int64_axis("kv_layout", {0, 1})
+//     .add_int64_axis("pos_encoding_mode", {0, 1})
+//     .add_int64_axis("use_fp16_qk_reduction", {0, 1})
+//     .add_int64_axis("custom_mask", {0})
+//     .add_int64_axis("cooperative", {1});
 
 #define BENCH_FLASHINFER_APPEND_PREFILL(dtype_in, dtype_out)                                  \
   auto bench_flashinfer_single_append_prefill_##dtype_in##_##dtype_out##_ =                   \
@@ -213,5 +212,5 @@ NVBENCH_BENCH(bench_flashinfer_single_prefill_fp8_kv)
       .add_int64_axis("custom_mask", {0})                                                     \
       .add_int64_axis("cooperative", {0, 1})
 
-BENCH_FLASHINFER_PREFILL(half, half);
-BENCH_FLASHINFER_APPEND_PREFILL(half, half);
+BENCH_FLASHINFER_PREFILL(half, float);
+// BENCH_FLASHINFER_APPEND_PREFILL(half, half);

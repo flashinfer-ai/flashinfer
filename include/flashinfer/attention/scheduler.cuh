@@ -398,7 +398,7 @@ inline cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in
   if (split_kv) {
     AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
     plan_info.v_offset = float_allocator.aligned_alloc_offset(
-        num_qo_heads * padded_batch_size * HEAD_DIM * sizeof(DTypeO), 16, "batch_decode_tmp_v");
+        num_qo_heads * padded_batch_size * HEAD_DIM * sizeof(float), 16, "batch_decode_tmp_v");
     plan_info.s_offset = float_allocator.aligned_alloc_offset(
         num_qo_heads * padded_batch_size * sizeof(float), 16, "batch_decode_tmp_s");
 
@@ -676,7 +676,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
   if (split_kv) {
     AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
     plan_info.v_offset = float_allocator.aligned_alloc_offset(
-        num_qo_heads * padded_batch_size * cta_tile_q * head_dim_vo * sizeof_dtype_o, 16,
+        num_qo_heads * padded_batch_size * cta_tile_q * head_dim_vo * sizeof(float), 16,
         "batch_prefill_tmp_v");
     plan_info.s_offset = float_allocator.aligned_alloc_offset(
         num_qo_heads * padded_batch_size * cta_tile_q * sizeof(float), 16, "batch_prefill_tmp_s");

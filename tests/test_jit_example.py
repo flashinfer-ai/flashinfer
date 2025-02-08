@@ -18,11 +18,12 @@ from flashinfer.utils import MaskMode
 def test_single_decode_mask():
     torch.manual_seed(42)
     variant_decl = r"""
-struct SingleDecodeWithCustomMask {
+struct SingleDecodeWithCustomMask : AttentionVariantBase {
   static constexpr bool use_softmax = true;
 
   uint8_t* custom_mask_ptr;
   uint32_t window_left, qo_len, kv_len;
+  float sm_scale_log2;
 
   // Create closure
   template <typename Params>
@@ -32,18 +33,7 @@ struct SingleDecodeWithCustomMask {
     qo_len = 1;
     kv_len = params.get_kv_len(batch_idx);
     window_left = kv_len;
-  }
-
-  template <typename Params, typename T>
-  __device__ __forceinline__ T QueryTransform(const Params& params, T q) {
-    return float(q) * params.sm_scale * math::log2e;
-  }
-
-  template <typename Params, typename T>
-  __device__ __forceinline__ T LogitsTransform(const Params& params, T logits, uint32_t batch_idx,
-                                               uint32_t qo_idx, uint32_t kv_idx,
-                                               uint32_t qo_head_idx, uint32_t kv_head_idx) {
-    return logits;
+    sm_scale_log2 = params.sm_scale * math::log2e;
   }
 
   template <typename Params>
@@ -89,11 +79,12 @@ struct SingleDecodeWithCustomMask {
 
 
 flash_sigmoid_sm80_decl = r"""
-struct FlashSigmoid {
+struct FlashSigmoid : AttentionVariantBase {
   static constexpr bool use_softmax = false;
 
   uint32_t window_left, qo_len, kv_len;
-  float sigmoid_bias_log2e;
+  float sigmoid_scale_log2;
+  float sigmoid_bias_log2;
 
   // Create closure
   template <typename Params>
@@ -102,32 +93,21 @@ struct FlashSigmoid {
     qo_len = params.get_qo_len(batch_idx);
     kv_len = params.get_kv_len(batch_idx);
     window_left = kv_len;
-    sigmoid_bias_log2e = params.sigmoid_bias * math::log2e;
-  }
-
-  template <typename Params, typename T>
-  __device__ __forceinline__ T QueryTransform(const Params& params, T q) {
-    return float(q) * params.logits_scale * math::log2e;
+    sigmoid_bias_log2 = params.sigmoid_bias * math::log2e;
+    sigmoid_scale_log2 = params.logits_scale * math::log2e;
   }
 
   template <typename Params, typename T>
   __device__ __forceinline__ T LogitsTransform(const Params& params, T logits, uint32_t batch_idx,
                                                uint32_t qo_idx, uint32_t kv_idx,
                                                uint32_t qo_head_idx, uint32_t kv_head_idx) {
-    return math::ptx_rcp(1.f + math::ptx_exp2(-float(logits + sigmoid_bias_log2e)));
-  }
-
-  template <typename Params>
-  __device__ __forceinline__ bool LogitsMask(const Params& params, uint32_t batch_idx,
-                                             uint32_t qo_idx, uint32_t kv_idx, uint32_t qo_head_idx,
-                                             uint32_t kv_head_idx) {
-    return true;
+    return math::ptx_rcp(1.f + math::ptx_exp2(-float(logits * sigmoid_scale_log2 + sigmoid_bias_log2)));
   }
 };
 """
 
 flash_sigmoid_sm90_decl = r"""
-struct FlashSigmoid {
+struct FlashSigmoid : AttentionVariantBase {
   float logits_scale_log2, sigmoid_bias_log2e;
   // Init
   template <typename MainloopParams, typename BlockCoord>
@@ -191,10 +171,11 @@ def test_flash_sigmoid():
 def test_dump_logits():
     torch.manual_seed(42)
     variant_decl = r"""
-struct DumpLogits {
+struct DumpLogits : AttentionVariantBase {
   static constexpr bool use_softmax = true;
 
   uint32_t window_left, qo_len, kv_len;
+  float sm_scale_log2;
 
   // Create closure
   template <typename Params>
@@ -203,11 +184,7 @@ struct DumpLogits {
     qo_len = params.get_qo_len(batch_idx);
     kv_len = params.get_kv_len(batch_idx);
     window_left = kv_len;
-  }
-
-  template <typename Params, typename T>
-  __device__ __forceinline__ T QueryTransform(const Params& params, T q) {
-    return float(q) * params.sm_scale * math::log2e;
+    sm_scale_log2 = params.sm_scale * math::log2e;
   }
 
   template <typename Params, typename T>
@@ -218,13 +195,6 @@ struct DumpLogits {
       params.output_logits[qo_head_idx * (qo_len * kv_len) + qo_idx * kv_len + kv_idx] = logits * math::loge2;
     }
     return logits;
-  }
-
-  template <typename Params>
-  __device__ __forceinline__ bool LogitsMask(const Params& params, uint32_t batch_idx,
-                                             uint32_t qo_idx, uint32_t kv_idx, uint32_t qo_head_idx,
-                                             uint32_t kv_head_idx) {
-    return true;
   }
 };
 """
@@ -607,10 +577,11 @@ def test_batch_prefill_sm90_flash_sigmoid():
 def test_debug_print_logits():
     torch.manual_seed(42)
     variant_decl = r"""
-struct DebugPrintLogits {
+struct DebugPrintLogits : AttentionVariantBase {
   static constexpr bool use_softmax = true;
 
   uint32_t window_left, qo_len, kv_len;
+  float sm_scale_log2;
 
   // Create closure
   template <typename Params>
@@ -619,11 +590,7 @@ struct DebugPrintLogits {
     qo_len = params.get_qo_len(batch_idx);
     kv_len = params.get_kv_len(batch_idx);
     window_left = kv_len;
-  }
-
-  template <typename Params, typename T>
-  __device__ __forceinline__ T QueryTransform(const Params& params, T q) {
-    return float(q) * params.sm_scale * math::log2e;
+    sm_scale_log2 = params.sm_scale * math::log2e;
   }
 
   template <typename Params, typename T>
@@ -635,13 +602,6 @@ struct DebugPrintLogits {
              qo_idx, kv_idx, qo_head_idx, kv_head_idx, float(logits));
     }
     return logits;
-  }
-
-  template <typename Params>
-  __device__ __forceinline__ bool LogitsMask(const Params& params, uint32_t batch_idx,
-                                             uint32_t qo_idx, uint32_t kv_idx, uint32_t qo_head_idx,
-                                             uint32_t kv_head_idx) {
-    return true;
   }
 };
 """
@@ -677,7 +637,7 @@ struct DebugPrintLogits {
 def test_sm90_debug_print_logits():
     torch.manual_seed(42)
     variant_decl = r"""
-struct DebugPrintLogits {
+struct DebugPrintLogits : AttentionVariantBase {
   float sm_scale_log2;
   int qo_len, kv_len;
 
@@ -752,7 +712,7 @@ struct DebugPrintLogits {
 
 
 if __name__ == "__main__":
-    test_single_decode_mask()
+    # test_single_decode_mask()
     test_flash_sigmoid()
     test_dump_logits()
     test_debug_print_logits()
