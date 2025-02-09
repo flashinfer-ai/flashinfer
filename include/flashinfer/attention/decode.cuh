@@ -67,7 +67,6 @@ __device__ __forceinline__ void compute_qk(const Params& params, AttentionVarian
                                            uint32_t qo_head_idx, uint32_t kv_head_idx, float* s,
                                            state_t<vec_size>& st) {
   uint32_t tx = threadIdx.x, tz = threadIdx.z;
-  const float sm_scale_log2 = variant.sm_scale_log2;
   float m_prev = st.m;
 #pragma unroll
   for (uint32_t j = 0; j < tile_size; ++j) {
@@ -92,7 +91,9 @@ __device__ __forceinline__ void compute_qk(const Params& params, AttentionVarian
     const uint32_t pos = kv_idx_base + tz * tile_size + j;
     s[j] = variant.LogitsTransform(params, s[j], batch_idx, /*qo_idx=*/0, /*kv_idx=*/pos,
                                    qo_head_idx, kv_head_idx);
-    s[j] *= variant.sm_scale_log2;
+    if constexpr (variant.use_softmax) {
+      s[j] *= variant.sm_scale_log2;
+    }
     bool mask = variant.LogitsMask(params, batch_idx, /*qo_idx=*/0, /*kv_idx=*/pos, qo_head_idx,
                                    kv_head_idx);
     s[j] = (iter_base + tz * tile_size + j < iter_bound && mask) ? s[j] : -math::inf;

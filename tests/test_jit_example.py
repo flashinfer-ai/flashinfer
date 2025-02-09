@@ -192,7 +192,7 @@ struct DumpLogits : AttentionVariantBase {
                                                uint32_t qo_idx, uint32_t kv_idx,
                                                uint32_t qo_head_idx, uint32_t kv_head_idx) {
     if (qo_idx < qo_len && kv_idx < kv_len) {
-      params.output_logits[qo_head_idx * (qo_len * kv_len) + qo_idx * kv_len + kv_idx] = logits * math::loge2;
+      params.output_logits[qo_head_idx * (qo_len * kv_len) + qo_idx * kv_len + kv_idx] = logits * params.sm_scale;
     }
     return logits;
   }
@@ -712,7 +712,7 @@ struct DebugPrintLogits : AttentionVariantBase {
 
 
 if __name__ == "__main__":
-    # test_single_decode_mask()
+    test_single_decode_mask()
     test_flash_sigmoid()
     test_dump_logits()
     test_debug_print_logits()
