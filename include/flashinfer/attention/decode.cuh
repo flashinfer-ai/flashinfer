@@ -92,19 +92,19 @@ __device__ __forceinline__ void compute_qk(const Params& params, AttentionVarian
     const uint32_t pos = kv_idx_base + tz * tile_size + j;
     s[j] = variant.LogitsTransform(params, s[j], batch_idx, /*qo_idx=*/0, /*kv_idx=*/pos,
                                    qo_head_idx, kv_head_idx);
-    bool mask = iter_base + tz * tile_size + j < iter_bound;
-    mask &= variant.LogitsMask(params, batch_idx, /*qo_idx=*/0, /*kv_idx=*/pos, qo_head_idx,
-                               kv_head_idx);
-    s[j] = mask ? s[j] : -math::inf;
+    s[j] *= variant.sm_scale_log2;
+    bool mask = variant.LogitsMask(params, batch_idx, /*qo_idx=*/0, /*kv_idx=*/pos, qo_head_idx,
+                                   kv_head_idx);
+    s[j] = (iter_base + tz * tile_size + j < iter_bound && mask) ? s[j] : -math::inf;
     st.m = max(st.m, s[j]);
   }
 
   if constexpr (variant.use_softmax) {
-    float o_scale = math::ptx_exp2(m_prev * sm_scale_log2 - st.m * sm_scale_log2);
+    float o_scale = math::ptx_exp2(m_prev - st.m);
     st.d *= o_scale;
 #pragma unroll
     for (uint32_t j = 0; j < tile_size; ++j) {
-      s[j] = math::ptx_exp2(s[j] * sm_scale_log2 - st.m * sm_scale_log2);
+      s[j] = math::ptx_exp2(s[j] - st.m);
       st.d += s[j];
     }
 #pragma unroll
@@ -139,18 +139,6 @@ __device__ __forceinline__ void update_local_state(const T* smem, const float* s
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
       st.o[i] = st.o[i] + s[j] * v_vec[i];
-    }
-  }
-}
-
-template <uint32_t vec_size, typename AttentionVariant>
-__device__ __forceinline__ void finalize_m(AttentionVariant variant, state_t<vec_size>& st) {
-  if constexpr (variant.use_softmax) {
-#pragma unroll
-    for (uint32_t j = 0; j < vec_size; ++j) {
-      if (st.m != -math::inf) {
-        st.m *= variant.sm_scale_log2;
-      }
     }
   }
 }
@@ -277,6 +265,7 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
     // do not apply rotary embedding to q matrix
     q_vec.cast_load(q + qo_head_idx * q_stride_h + tx * vec_size);
   }
+  block.sync();
 
   uint32_t chunk_start = kv_chunk_idx * kv_chunk_size;
   kv_chunk_size = min(kv_chunk_size, seq_len - chunk_start);
@@ -360,8 +349,6 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
   }
   cp_async::wait_group<0>();
   block.sync();
-
-  finalize_m<vec_size>(variant, st_local);
 
   // sync local state of all warps inside a threadblock
   sync_state<vec_size, bdx, bdy, bdz>(variant, st_local, reinterpret_cast<float*>(smem), smem_md);
@@ -580,8 +567,6 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params
   }
   cp_async::wait_group<0>();
   block.sync();
-
-  finalize_m<vec_size>(variant, st);
 
   // sync local state of all warps inside a threadblock
   sync_state<vec_size, bdx, bdy, bdz>(variant, st, reinterpret_cast<float*>(smem), smem_md);
