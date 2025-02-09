@@ -143,6 +143,18 @@ __device__ __forceinline__ void update_local_state(const T* smem, const float* s
   }
 }
 
+template <uint32_t vec_size, typename AttentionVariant>
+__device__ __forceinline__ void finalize_m(AttentionVariant variant, state_t<vec_size>& st) {
+  if constexpr (variant.use_softmax) {
+#pragma unroll
+    for (uint32_t j = 0; j < vec_size; ++j) {
+      if (st.m != -math::inf) {
+        st.m *= variant.sm_scale_log2;
+      }
+    }
+  }
+}
+
 /*!
  * \brief Synchronize the state of all warps inside a threadblock.
  * \tparam vec_size A template integer indicates the vector size
@@ -349,6 +361,8 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
   cp_async::wait_group<0>();
   block.sync();
 
+  finalize_m<vec_size>(variant, st_local);
+
   // sync local state of all warps inside a threadblock
   sync_state<vec_size, bdx, bdy, bdz>(variant, st_local, reinterpret_cast<float*>(smem), smem_md);
   if constexpr (variant.use_softmax) {
@@ -357,7 +371,6 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
 
   st_local.o.cast_store(o + (kv_chunk_idx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
   if (lse != nullptr) {
-    st_local.m *= variant.sm_scale_log2;
     lse[kv_chunk_idx * num_qo_heads + qo_head_idx] = st_local.get_lse();
   }
 }
@@ -568,6 +581,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params
   cp_async::wait_group<0>();
   block.sync();
 
+  finalize_m<vec_size>(variant, st);
+
   // sync local state of all warps inside a threadblock
   sync_state<vec_size, bdx, bdy, bdz>(variant, st, reinterpret_cast<float*>(smem), smem_md);
   if constexpr (variant.use_softmax) {
@@ -578,7 +593,6 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params
     st.o.cast_store(o + (bx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
     // write lse
     if (lse != nullptr) {
-      st.m *= variant.sm_scale_log2;
       lse[bx * num_qo_heads + qo_head_idx] = st.get_lse();
     }
   }
