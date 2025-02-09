@@ -36,13 +36,10 @@ struct SingleDecodeWithCustomMask : AttentionVariantBase {
     sm_scale_log2 = params.sm_scale * math::log2e;
   }
 
-  template <typename Params>
-  __device__ __forceinline__ bool LogitsMask(const Params& params, uint32_t batch_idx,
-                                             uint32_t qo_idx, uint32_t kv_idx, uint32_t qo_head_idx,
-                                             uint32_t kv_head_idx) {
+  REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
     const uint32_t offset = kv_idx;
     return ((custom_mask_ptr[offset / 8] >> (offset % 8)) & 1);
-  }
+  })
 };
 """
     jit_module = gen_customize_single_decode_module(
@@ -97,12 +94,9 @@ struct FlashSigmoid : AttentionVariantBase {
     sigmoid_scale_log2 = params.logits_scale * math::log2e;
   }
 
-  template <typename Params, typename T>
-  __device__ __forceinline__ T LogitsTransform(const Params& params, T logits, uint32_t batch_idx,
-                                               uint32_t qo_idx, uint32_t kv_idx,
-                                               uint32_t qo_head_idx, uint32_t kv_head_idx) {
+  REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
     return math::ptx_rcp(1.f + math::ptx_exp2(-float(logits * sigmoid_scale_log2 + sigmoid_bias_log2)));
-  }
+  });
 };
 """
 
@@ -122,13 +116,9 @@ struct FlashSigmoid : AttentionVariantBase {
     return DefaultUpdater<NUM_ROWS_PER_THREAD>();
   }
 
-  template <typename MainloopParams, typename T>
-  __device__ __forceinline__ T LogitsTransform(const MainloopParams& params, T logits,
-                                               int batch_idx,
-                                               int qo_idx, int kv_idx,
-                                               int qo_head_idx, int kv_head_idx) {
+  REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
     return math::ptx_rcp(1.f + math::ptx_exp2(-float(logits * logits_scale_log2 + sigmoid_bias_log2e)));
-  }
+  });
 };
 """
 
@@ -187,15 +177,12 @@ struct DumpLogits : AttentionVariantBase {
     sm_scale_log2 = params.sm_scale * math::log2e;
   }
 
-  template <typename Params, typename T>
-  __device__ __forceinline__ T LogitsTransform(const Params& params, T logits, uint32_t batch_idx,
-                                               uint32_t qo_idx, uint32_t kv_idx,
-                                               uint32_t qo_head_idx, uint32_t kv_head_idx) {
+  REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
     if (qo_idx < qo_len && kv_idx < kv_len) {
       params.output_logits[qo_head_idx * (qo_len * kv_len) + qo_idx * kv_len + kv_idx] = logits * params.sm_scale;
     }
     return logits;
-  }
+  });
 };
 """
     jit_module = gen_customize_single_prefill_module(
@@ -593,16 +580,13 @@ struct DebugPrintLogits : AttentionVariantBase {
     sm_scale_log2 = params.sm_scale * math::log2e;
   }
 
-  template <typename Params, typename T>
-  __device__ __forceinline__ T LogitsTransform(const Params& params, T logits, uint32_t batch_idx,
-                                               uint32_t qo_idx, uint32_t kv_idx,
-                                               uint32_t qo_head_idx, uint32_t kv_head_idx) {
+  REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
     if (logits >= 5) {
       printf("Large logits at qo_idx=%d, kv_idx=%d, qo_head_idx=%d, kv_head_idx=%d: %.3f\n",
-             qo_idx, kv_idx, qo_head_idx, kv_head_idx, float(logits));
+              qo_idx, kv_idx, qo_head_idx, kv_head_idx, float(logits));
     }
     return logits;
-  }
+  });
 };
 """
     jit_module = gen_customize_single_prefill_module(
@@ -659,27 +643,23 @@ struct DebugPrintLogits : AttentionVariantBase {
   }
 
 
-  template <typename MainloopParams, typename T>
-  __device__ __forceinline__ T LogitsTransform(const MainloopParams& params, T logits,
-                                               int batch_idx,
-                                               int qo_idx, int kv_idx,
-                                               int qo_head_idx, int kv_head_idx) {
+  REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
     if (qo_idx < qo_len && kv_idx < kv_len) {
-      printf(
-          "---> LOGITS DEBUG: "
-          "qo_idx=%-5d "
-          "kv_idx=%-5d "
-          "sm_scale_log2=%-12.5f "
-          "logits=%-12.5f "
-          "\n",
-          qo_idx,
-          kv_idx,
-          sm_scale_log2,
-          static_cast<float>(logits));
+        printf(
+            "---> LOGITS DEBUG: "
+            "qo_idx=%-5d "
+            "kv_idx=%-5d "
+            "sm_scale_log2=%-12.5f "
+            "logits=%-12.5f "
+            "\n",
+            qo_idx,
+            kv_idx,
+            sm_scale_log2,
+            static_cast<float>(logits));
     }
     logits *= sm_scale_log2;
     return logits;
-  }
+  })
 };
 """
     jit_module = gen_customize_single_prefill_module(
