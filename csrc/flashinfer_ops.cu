@@ -126,10 +126,22 @@ void BatchPrefillWithPagedKVCacheRun(
     int64_t window_left BATCH_PREFILL_ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
 
 //========== pod-attention =========
-void pod_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor tmp,
-    at::Tensor o, std::optional<at::Tensor> maybe_lse,
-    unsigned int mask_mode_code, unsigned int layout,
-    int32_t window_left SINGLE_PREFILL_ADDITIONAL_FUNC_PARAMS,
+void pod_with_kv_cache(
+    // Prefill params
+    at::Tensor q_p, at::Tensor k_p, at::Tensor v_p, at::Tensor tmp_p,
+    at::Tensor o_p, std::optional<at::Tensor> maybe_lse_p,
+    unsigned int mask_mode_code, unsigned int layout, int32_t window_left_p,
+    std::optional<at::Tensor> maybe_custom_mask_p, std::optional<at::Tensor> maybe_alibi_slopes_p, 
+    float logits_soft_cap_p, float sm_scale_p, float rope_rcp_scale_p, float rope_rcp_theta_p,
+    // Decode params
+    at::Tensor float_workspace_buffer_d, at::Tensor int_workspace_buffer_d,
+    std::vector<int64_t> plan_info_vec, at::Tensor q_d, at::Tensor paged_k_cache_d,
+    at::Tensor paged_v_cache_d, at::Tensor paged_kv_indptr_d, at::Tensor paged_kv_indices_d,
+    at::Tensor paged_kv_last_page_len_d, at::Tensor o_d, std::optional<at::Tensor> maybe_lse_d,
+    unsigned int kv_layout_code, int window_left_d,
+    std::optional<at::Tensor> maybe_alibi_slopes_d, float logits_soft_cap_d, 
+    float sm_scale_d, float rope_rcp_scale_d, float rope_rcp_theta_d,
+    // Shared params
     int64_t cuda_stream);
 
 //========== quantization ==========

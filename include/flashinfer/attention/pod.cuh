@@ -60,7 +60,7 @@ enum Operation {
  */
 template <MaskMode MASK_MODE, PosEncodingMode POS_ENCODING_MODE, uint32_t NUM_MMA_Q,
           uint32_t NUM_MMA_D_QK, uint32_t NUM_MMA_D_VO, uint32_t NUM_MMA_KV, uint32_t NUM_WARPS_Q,
-          uint32_t NUM_WARPS_KV, typename DTypeQKAccum, typename AttentionVariant, typename Params>
+          uint32_t NUM_WARPS_KV, typename DTypeQKAccum, typename PrefillAttentionVariant, typename Params>
 __global__
 __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void PODWithKVCacheKernel(
     const uint_fastdiv group_size, const __grid_constant__ Params prefill_params) {
@@ -91,7 +91,7 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void PODWithKVCacheKerne
         const uint32_t chunk_idx = 0;
         const uint32_t kv_head_idx = linear_blk_id / xsize;
         SinglePrefillWithKVCacheDevice<MASK_MODE, POS_ENCODING_MODE, NUM_MMA_Q, NUM_MMA_D_QK,
-          NUM_MMA_D_VO, NUM_MMA_KV, NUM_WARPS_Q, NUM_WARPS_KV, DTypeQKAccum, AttentionVariant>
+          NUM_MMA_D_VO, NUM_MMA_KV, NUM_WARPS_Q, NUM_WARPS_KV, DTypeQKAccum, PrefillAttentionVariant>
           (group_size, prefill_params, smem, lane_idx, warp_idx, bx, chunk_idx, kv_head_idx, num_kv_heads);
       } else {
         const uint32_t lane_idx = threadIdx.x, warp_idx = get_warp_idx<NUM_WARPS_Q, NUM_WARPS_KV>();
@@ -103,19 +103,25 @@ __launch_bounds__(NUM_WARPS_Q* NUM_WARPS_KV* WARP_SIZE) void PODWithKVCacheKerne
         const uint32_t chunk_idx = (linear_blk_id / xsize) % num_chunks;
         const uint32_t kv_head_idx = linear_blk_id / (xsize * num_chunks);
         SinglePrefillWithKVCacheDevice<MASK_MODE, POS_ENCODING_MODE, NUM_MMA_Q, NUM_MMA_D_QK,
-          NUM_MMA_D_VO, NUM_MMA_KV, NUM_WARPS_Q, NUM_WARPS_KV, DTypeQKAccum, AttentionVariant>
+          NUM_MMA_D_VO, NUM_MMA_KV, NUM_WARPS_Q, NUM_WARPS_KV, DTypeQKAccum, PrefillAttentionVariant>
           (group_size, prefill_params, smem, lane_idx, warp_idx, bx, chunk_idx, kv_head_idx, num_kv_heads);
     }
   }
 }
 
-
-template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODING_MODE, 
-          bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant, 
-          typename PrefillParams>
+template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODING_MODE,
+          bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename PrefillAttentionVariant,
+          typename DecodeAttentionVariant, typename PrefillParams, typename DecodeParams>
 cudaError_t PODWithKVCacheDispatched(PrefillParams prefill_params, 
-                                     typename PrefillParams::DTypeO* prefill_tmp,
-                                     cudaStream_t stream) {
+                                     typename PrefillParams::DTypeO* tmp_p,
+                                     DecodeParams decode_params,
+                                     typename DecodeParams::DTypeO* tmp_v,
+                                     float *tmp_s, cudaStream_t stream) {
+  /***********************************************************************/
+  BatchDecodeWithPagedKVCacheDispatched
+    <HEAD_DIM_QK, POS_ENCODING_MODE, DecodeAttentionVariant>
+    (decode_params, tmp_v, tmp_s, stream);
+  /***********************************************************************/
   using DTypeQ = typename PrefillParams::DTypeQ;
   using DTypeKV = typename PrefillParams::DTypeKV;
   using DTypeO = typename PrefillParams::DTypeO;
@@ -205,7 +211,7 @@ cudaError_t PODWithKVCacheDispatched(PrefillParams prefill_params,
         auto kernel =
             PODWithKVCacheKernel<MASK_MODE, POS_ENCODING_MODE, NUM_MMA_Q, NUM_MMA_D_QK,
                                            NUM_MMA_D_VO, NUM_MMA_KV, NUM_WARPS_Q, 
-                                           NUM_WARPS_KV, DTypeQKAccum, AttentionVariant, 
+                                           NUM_WARPS_KV, DTypeQKAccum, PrefillAttentionVariant, 
                                            PrefillParams>;
 
         // TODO(Zihao): fix the following computation
@@ -233,7 +239,7 @@ cudaError_t PODWithKVCacheDispatched(PrefillParams prefill_params,
           num_chunks = 0;
         }
 
-        if (num_chunks <= 1 || prefill_tmp == nullptr) {
+        if (num_chunks <= 1 || tmp_p == nullptr) {
           // Enough parallelism, do not split-kv
           prefill_params.partition_kv = 0;
           void* args[] = {(void*)&group_size_fastdiv, (void*)&prefill_params};
@@ -245,22 +251,22 @@ cudaError_t PODWithKVCacheDispatched(PrefillParams prefill_params,
         } else {
           // Use cooperative groups to increase occupancy
           prefill_params.partition_kv = num_chunks;
-          float* tmp_lse = (float*)(prefill_tmp + num_chunks * qo_len * num_qo_heads * HEAD_DIM_VO);
+          float* tmp_lse = (float*)(tmp_p + num_chunks * qo_len * num_qo_heads * HEAD_DIM_VO);
           auto o = prefill_params.o;
           auto lse = prefill_params.lse;
-          prefill_params.o = prefill_tmp;
+          prefill_params.o = tmp_p;
           prefill_params.lse = tmp_lse;
           void* args[] = {(void*)&group_size_fastdiv, (void*)&prefill_params};
           dim3 nblks(ceil_div(qo_len * group_size, num_rows_per_cta), num_chunks, num_kv_heads);
           dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
           FLASHINFER_CUDA_CALL(
               cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-          if constexpr (AttentionVariant::use_softmax) {
-            FLASHINFER_CUDA_CALL(MergeStates(prefill_tmp, tmp_lse, o, lse, num_chunks, qo_len, num_qo_heads,
+          if constexpr (PrefillAttentionVariant::use_softmax) {
+            FLASHINFER_CUDA_CALL(MergeStates(tmp_p, tmp_lse, o, lse, num_chunks, qo_len, num_qo_heads,
                                              HEAD_DIM_VO, stream));
           } else {
             FLASHINFER_CUDA_CALL(
-                AttentionSum(prefill_tmp, o, num_chunks, qo_len, num_qo_heads, HEAD_DIM_VO, stream));
+                AttentionSum(tmp_p, o, num_chunks, qo_len, num_qo_heads, HEAD_DIM_VO, stream));
           }
         }
       }

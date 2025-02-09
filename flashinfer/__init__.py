@@ -57,7 +57,6 @@ from .prefill import single_prefill_with_kv_cache as single_prefill_with_kv_cach
 from .prefill import (
     single_prefill_with_kv_cache_return_lse as single_prefill_with_kv_cache_return_lse,
 )
-from .pod import pod_with_kv_cache as pod_with_kv_cache
 from .pod import (
     PODWithPagedKVCacheWrapper as PODWithPagedKVCacheWrapper,
 )

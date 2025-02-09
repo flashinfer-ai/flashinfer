@@ -48,9 +48,9 @@ def warmup_jit():
         finally:
             yield
 
-@pytest.mark.parametrize("batch_size", [12, 17])
-@pytest.mark.parametrize("kv_len", [54, 97])
-@pytest.mark.parametrize("qo_len", [37, 17])
+@pytest.mark.parametrize("batch_size_d", [12, 17])
+@pytest.mark.parametrize("kv_len_p", [54, 97])
+@pytest.mark.parametrize("qo_len_p", [37, 17])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
 @pytest.mark.parametrize("head_dim", [128, 256])
@@ -58,58 +58,6 @@ def warmup_jit():
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
 @pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
 @pytest.mark.parametrize("return_lse", [True, False])
-def test_pod_with_kv_cache(
-    batch_size,
-    kv_len,
-    qo_len,
-    num_kv_heads,
-    num_qo_heads,
-    head_dim,
-    causal,
-    pos_encoding_mode,
-    logits_soft_cap,
-    return_lse,
-):
-    kv_layout = "NHD"
-    q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
-    q_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
-
-    k = torch.randn(batch_size * kv_len, num_kv_heads, head_dim).to(0).half()
-    v = torch.randn(batch_size * kv_len, num_kv_heads, head_dim).to(0).half()
-    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len
-
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
-
-    wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
-        workspace_buffer, kv_layout
-    )
-    wrapper.plan(
-        q_indptr,
-        kv_indptr,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim,
-        causal=causal,
-        pos_encoding_mode=pos_encoding_mode,
-        logits_soft_cap=logits_soft_cap,
-    )
-    if return_lse:
-        o, _ = wrapper.run(q, k, v, return_lse=True)
-    else:
-        o = wrapper.run(q, k, v)
-
-    for i in range(batch_size):
-        o_ref_i = flashinfer.pod_with_kv_cache(
-            q[q_indptr[i] : q_indptr[i + 1]],
-            k[kv_indptr[i] : kv_indptr[i + 1]],
-            v[kv_indptr[i] : kv_indptr[i + 1]],
-            causal=causal,
-            pos_encoding_mode=pos_encoding_mode,
-            logits_soft_cap=logits_soft_cap,
-        )
-        o_i = o[q_indptr[i] : q_indptr[i + 1]]
-        torch.testing.assert_close(o_i, o_ref_i, rtol=1e-3, atol=1e-3)
-
 def test_pod_with_paged_kv_cache(
     # Prefill params
     kv_len_p,
@@ -126,12 +74,10 @@ def test_pod_with_paged_kv_cache(
     head_dim,
     pos_encoding_mode,
     logits_soft_cap,
-    return_lse,
     q_dtype,
     kv_dtype,
     contiguous_kv,
 ):
-    
     batch_size_p = 1
     kv_layout_p = "NHD"
     q_p = torch.randn(batch_size_p * qo_len_p, num_qo_heads, head_dim).to(0).half()
@@ -157,21 +103,9 @@ def test_pod_with_paged_kv_cache(
         logits_soft_cap=logits_soft_cap,
     )
     if return_lse:
-        o, _ = wrapper.run(q_p, k_p, v_p, return_lse=True)
+        o_ref_p, _ = wrapper.run(q_p, k_p, v_p, return_lse=True)
     else:
-        o = wrapper.run(q_p, k_p, v_p)
-
-    for i in range(batch_size_p):
-        o_ref_i = flashinfer.pod_with_kv_cache(
-            q_p[q_indptr_p[i] : q_indptr_p[i + 1]],
-            k_p[kv_indptr_p[i] : kv_indptr_p[i + 1]],
-            v_p[kv_indptr_p[i] : kv_indptr_p[i + 1]],
-            causal=causal,
-            pos_encoding_mode=pos_encoding_mode,
-            logits_soft_cap=logits_soft_cap,
-        )
-        o_i = o[q_indptr_p[i] : q_indptr_p[i + 1]]
-        torch.testing.assert_close(o_i, o_ref_i, rtol=1e-3, atol=1e-3)
+        o_ref_p = wrapper.run(q_p, k_p, v_p)
     
     q_d = torch.randn(batch_size_d, num_qo_heads, head_dim).to(0).to(q_dtype)
     num_pages_per_seq = (kv_len_d + page_size_d - 1) // page_size_d
@@ -221,63 +155,64 @@ def test_pod_with_paged_kv_cache(
         data_type=kv_dtype,
         q_data_type=q_dtype,
     )
-    if return_lse:
-        o, _ = wrapper.run(None, None, None, q_d, kv_data, return_lse=True)
-    else:
-        o = wrapper.run(None, None, None, q_d, kv_data)
 
-    for i in range(batch_size_d):
-        perm_dims = [0, 2, 1, 3] if kv_layout_d == "HND" else [0, 1, 2, 3]
-        perm_dims_last = [1, 0, 2] if kv_layout_d == "HND" else [0, 1, 2]
-        qi = q_d[i]
-        ki = torch.cat(
-            [
-                kv_data_fp32[kv_indptr_d[i] : kv_indptr_d[i + 1] - 1, 0]
-                .permute(*perm_dims)
-                .reshape(-1, num_kv_heads, head_dim),
-                (
-                    kv_data_fp32[kv_indptr_d[i + 1] - 1, 0, :, : kv_last_page_len[i]]
-                    if kv_layout_d == "HND"
-                    else kv_data_fp32[kv_indptr_d[i + 1] - 1, 0, : kv_last_page_len[i], :]
-                )
-                .permute(*perm_dims_last)
-                .reshape(-1, num_kv_heads, head_dim),
-            ],
-            dim=0,
-        ).to(kv_dtype)
-        vi = torch.cat(
-            [
-                kv_data_fp32[kv_indptr_d[i] : kv_indptr_d[i + 1] - 1, 1]
-                .permute(*perm_dims)
-                .reshape(-1, num_kv_heads, head_dim),
-                (
-                    kv_data_fp32[kv_indptr_d[i + 1] - 1, 1, :, : kv_last_page_len[i]]
-                    if kv_layout_d == "HND"
-                    else kv_data_fp32[kv_indptr_d[i + 1] - 1, 1, : kv_last_page_len[i], :]
-                )
-                .permute(*perm_dims_last)
-                .reshape(-1, num_kv_heads, head_dim),
-            ],
-            dim=0,
-        ).to(kv_dtype)
-        o_ref_i = flashinfer.decode.single_decode_with_kv_cache(
-            qi,
-            ki,
-            vi,
-            pos_encoding_mode=pos_encoding_mode,
-            logits_soft_cap=logits_soft_cap,
-        )
-        torch.testing.assert_close(o[i], o_ref_i, rtol=1e-3, atol=1e-3)
+    # Generate decode reference output
+    new_workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+    decode_wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        new_workspace_buffer, kv_layout_d
+    )
+    decode_wrapper.plan(
+        kv_indptr_d,
+        kv_indices_d,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size_d,
+        logits_soft_cap=logits_soft_cap,
+        pos_encoding_mode=pos_encoding_mode,
+        data_type=kv_dtype,
+        q_data_type=q_dtype,
+    )
+    if return_lse:
+        o_ref_d, _ = decode_wrapper.run(q_d, kv_data, return_lse=True)
+    else:
+        o_ref_d = decode_wrapper.run(q_d, kv_data)
+
+    for i in range(batch_size_p):
+        if return_lse:
+            o_i_p, o_i_d = wrapper.run(
+                q_p[q_indptr_p[i] : q_indptr_p[i + 1]],
+                k_p[kv_indptr_p[i] : kv_indptr_p[i + 1]],
+                v_p[kv_indptr_p[i] : kv_indptr_p[i + 1]],
+                q_d, kv_data,
+                causal_p=causal,
+                pos_encoding_mode_d=pos_encoding_mode,
+                logits_soft_cap_d=logits_soft_cap,
+                pos_encoding_mode_p=pos_encoding_mode,
+                logits_soft_cap_p=logits_soft_cap,
+                return_lse_p=True)
+        else:
+            o_i_p, o_i_d = wrapper.run(
+                q_p[q_indptr_p[i] : q_indptr_p[i + 1]],
+                k_p[kv_indptr_p[i] : kv_indptr_p[i + 1]],
+                v_p[kv_indptr_p[i] : kv_indptr_p[i + 1]], 
+                q_d, kv_data,
+                pos_encoding_mode_p=pos_encoding_mode,
+                logits_soft_cap_p=logits_soft_cap,
+                causal_p=causal)
+        # Prefill is run with batch size 1
+        o_ref_i_p = o_ref_p[q_indptr_p[i] : q_indptr_p[i + 1]]
+        torch.testing.assert_close(o_i_p, o_ref_i_p, rtol=1e-3, atol=1e-3)
+        # Decode uses all batches at once.
+        torch.testing.assert_close(o_i_d, o_ref_d, rtol=1e-3, atol=1e-3)
 
 if __name__ == "__main__":
-    #test_pod_with_kv_cache(
-    #    12, 54, 37, 8, 8, 128, True, "NONE", 0.0, False
-    #)
     test_pod_with_paged_kv_cache(
         # Prefill params
         54, 37, True, 
         # Decode params
         12, 54, 1, "HND",
         # Other shared params
-        8, 8, 128, "NONE", 0.0, True, torch.float16, torch.float16, True,
+        8, 8, 128, "NONE", 0.0, torch.float16, torch.float16, True,
     )

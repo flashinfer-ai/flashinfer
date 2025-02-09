@@ -72,59 +72,81 @@ def get_pod_module(backend):
                 f"flashinfer::{uri}_run", mutates_args=("tmp", "o", "maybe_lse")
             )
             def run_pod(
-                q: torch.Tensor,
-                k: torch.Tensor,
-                v: torch.Tensor,
-                tmp: torch.Tensor,
-                o: torch.Tensor,
-                maybe_lse: Optional[torch.Tensor],
-                mask_mode: int,
-                layout: int,
-                window_left: int,
-                maybe_packed_custom_mask: Optional[torch.Tensor],
-                maybe_alibi_slopes: Optional[torch.Tensor],
-                logits_soft_cap: float,
-                sm_scale: float,
-                rope_scale: float,
-                rope_theta: float,
+                q_p: torch.Tensor,
+                k_p: torch.Tensor,
+                v_p: torch.Tensor,
+                tmp_p: torch.Tensor,
+                o_p: torch.Tensor,
+                maybe_lse_p: Optional[torch.Tensor],
+                mask_mode_p: int,
+                layout_p: int,
+                window_left_p: int,
+                maybe_packed_custom_mask_p: Optional[torch.Tensor],
+                maybe_alibi_slopes_p: Optional[torch.Tensor],
+                logits_soft_cap_p: float,
+                sm_scale_p: float,
+                rope_scale_p: float,
+                rope_theta_p: float,
+                # Decode params
+                float_workspace_buffer_d: torch.Tensor,
+                int_workspace_buffer_d: torch.Tensor,
+                plan_info_vec_d: List[int],
+                q_d: torch.Tensor,
+                paged_k_cache_d: Optional[torch.Tensor],
+                paged_v_cache_d: Optional[torch.Tensor],
+                paged_kv_indptr_d: torch.Tensor,
+                paged_kv_indices_d: torch.Tensor,
+                paged_kv_last_page_len_d: torch.Tensor,
+                o_d: torch.Tensor,
+                maybe_lse_d: Optional[torch.Tensor],
+                kv_layout_code_d: int,
+                window_left_d: int,
+                alibi_slopes_d: Optional[torch.Tensor],
+                logits_soft_cap_d: float,
+                sm_scale_d: float,
+                rope_scale_d: float,
+                rope_theta_d: float,
             ) -> None:
-                with q.device as device:  # device guard
-                    if backend == "fa3":
-                        run_func(
-                            q,
-                            k,
-                            v,
-                            tmp,
-                            o,
-                            maybe_lse,
-                            mask_mode,
-                            layout,
-                            window_left,
-                            logits_soft_cap,
-                            sm_scale,
-                            get_cuda_stream(device),
-                        )
-                    else:
-                        run_func(
-                            q,
-                            k,
-                            v,
-                            tmp,
-                            o,
-                            maybe_lse,
-                            mask_mode,
-                            layout,
-                            window_left,
-                            maybe_packed_custom_mask,
-                            maybe_alibi_slopes,
-                            logits_soft_cap,
-                            sm_scale,
-                            1.0 / rope_scale,  # rope_rcp_scale
-                            1.0 / rope_theta,  # rope_rcp_theta
-                            get_cuda_stream(device),
-                        )
-                    return o
+                with q_p.device as device:  # device guard
+                    run_func(
+                        q_p,
+                        k_p,
+                        v_p,
+                        tmp_p,
+                        o_p,
+                        maybe_lse_p,
+                        mask_mode_p,
+                        layout_p,
+                        window_left_p,
+                        maybe_packed_custom_mask_p,
+                        maybe_alibi_slopes_p,
+                        logits_soft_cap_p,
+                        sm_scale_p,
+                        1.0 / rope_scale_p,  # rope_rcp_scale
+                        1.0 / rope_theta_p,  # rope_rcp_theta
 
+                        float_workspace_buffer_d,
+                        int_workspace_buffer_d,
+                        plan_info_vec_d,
+                        q_d,
+                        paged_k_cache_d,
+                        paged_v_cache_d,
+                        paged_kv_indptr_d,
+                        paged_kv_indices_d,
+                        paged_kv_last_page_len_d,
+                        o_d,
+                        maybe_lse_d,
+                        kv_layout_code_d,
+                        window_left_d,
+                        alibi_slopes_d,
+                        logits_soft_cap_d,
+                        sm_scale_d,
+                        1.0 / rope_scale_d,  # rope_rcp_scale
+                        1.0 / rope_theta_d,  # rope_rcp_theta
+                        get_cuda_stream(device),
+                    )
+                    return o_p, o_d
+            '''
             @register_fake_op(f"flashinfer::{uri}_run")
             def _fake_run_pod(
                 q: torch.Tensor,
@@ -144,315 +166,13 @@ def get_pod_module(backend):
                 rope_theta: float,
             ) -> None:
                 pass
-
+            '''
             # Register the module
             modules_dict[args] = SimpleNamespace(run=run_pod)
 
         return modules_dict[args]
 
     return backend_module
-
-def pod_with_kv_cache_with_jit_module(
-    jit_module: Any,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    *args,
-    kv_layout: str = "NHD",
-    mask_mode: int = MaskMode.NON_CAUSAL.value,
-    window_left: int = -1,
-    return_lse: bool = False,
-) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    with q.device as device:  # device guard
-        tmp = _get_cache_buf(
-            "pod_with_kv_cache_tmp", 32 * 1024 * 1024, device=device
-        )
-        o = torch.empty_like(q)
-        lse = None
-        if return_lse:
-            lse = torch.empty(
-                (q.size(0), q.size(1)), dtype=torch.float32, device=device
-            )
-        jit_module.run(
-            q,
-            k,
-            v,
-            tmp,
-            o,
-            lse,
-            mask_mode,
-            TensorLayout[kv_layout].value,
-            window_left,
-            *args,
-            get_cuda_stream(device),
-        )
-        return (o, lse) if return_lse else o
-
-
-@overload
-def pod_with_kv_cache(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    custom_mask: Optional[torch.Tensor] = None,
-    packed_custom_mask: Optional[torch.Tensor] = None,
-    causal: bool = False,
-    kv_layout: str = "NHD",
-    pos_encoding_mode: str = "NONE",
-    use_fp16_qk_reduction: bool = False,
-    sm_scale: Optional[float] = None,
-    window_left: int = -1,
-    logits_soft_cap: Optional[float] = None,
-    rope_scale: Optional[float] = None,
-    rope_theta: Optional[float] = None,
-    return_lse: Literal[False] = False,
-) -> torch.Tensor: ...
-
-
-@overload
-def pod_with_kv_cache(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    custom_mask: Optional[torch.Tensor] = None,
-    packed_custom_mask: Optional[torch.Tensor] = None,
-    causal: bool = False,
-    kv_layout: str = "NHD",
-    pos_encoding_mode: str = "NONE",
-    use_fp16_qk_reduction: bool = False,
-    sm_scale: Optional[float] = None,
-    window_left: int = -1,
-    logits_soft_cap: Optional[float] = None,
-    rope_scale: Optional[float] = None,
-    rope_theta: Optional[float] = None,
-    return_lse: Literal[True] = True,
-) -> Tuple[torch.Tensor, torch.Tensor]: ...
-
-
-def pod_with_kv_cache(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    custom_mask: Optional[torch.Tensor] = None,
-    packed_custom_mask: Optional[torch.Tensor] = None,
-    causal: bool = False,
-    kv_layout: str = "NHD",
-    pos_encoding_mode: str = "NONE",
-    use_fp16_qk_reduction: bool = False,
-    sm_scale: Optional[float] = None,
-    window_left: int = -1,
-    logits_soft_cap: Optional[float] = None,
-    rope_scale: Optional[float] = None,
-    rope_theta: Optional[float] = None,
-    return_lse: bool = False,
-    backend: str = "auto",
-) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    r"""Prefill/Append attention with KV cache for single request, return the attention
-    output.
-
-    Parameters
-    ----------
-    q : torch.Tensor
-        The query tensor, shape: ``[qo_len, num_qo_heads, head_dim]``.
-    k : torch.Tensor
-        The key tensor, shape: ``[kv_len, num_kv_heads, head_dim]`` if :attr:`kv_layout`
-        is ``NHD``, or ``[num_kv_heads, kv_len, head_dim]`` if :attr:`kv_layout` is
-        ``HND``.
-    v : torch.Tensor
-        The key tensor, shape: ``[kv_len, num_kv_heads, head_dim]`` if :attr:`kv_layout`
-        is ``NHD``, ``[num_kv_heads, kv_len, head_dim]`` if :attr:`kv_layout` is
-        ``HND``.
-    custom_mask : Optional[torch.Tensor]
-        The custom boolean mask tensor, shape: ``[qo_len, kv_len]``.
-        The elements in the mask tensor should be either ``True`` or ``False``,
-        where ``False`` means the corresponding element in the attention matrix will be
-        masked out.
-
-        When :attr:`custom_mask` is provided, and :attr:`packed_custom_mask` is not, the
-        function will pack the custom mask tensor into a 1D packed mask tensor, which introduces
-        additional overhead.
-    packed_custom_mask : Optional[torch.Tensor]
-        The 1D packed uint8 mask tensor, if provided, the :attr:`custom_mask` will be ignored.
-        The packed mask tensor is generated by :func:`flashinfer.quantization.packbits`.
-    causal : bool
-        Whether to apply causal mask to the attention matrix.
-        This is only effective when :attr:`custom_mask` is not provided.
-    kv_layout : str
-        The layout of the input k/v tensors, could be either ``NHD`` or ``HND``.
-    pos_encoding_mode : str
-        The position encoding applied inside attention kernels, could be
-        ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
-        Default is ``NONE``.
-    use_fp16_qk_reduction : bool
-        Whether to use f16 for qk reduction (faster at the cost of slight precision
-        loss).
-    window_left : int
-        The left (inclusive) window size for the attention window, when set to ``-1``, the window
-        size will be set to the full length of the sequence. Defaults to ``-1``.
-    logits_soft_cap : Optional[float]
-        The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
-        provided, will be set to ``0``. If greater than 0, the logits will be capped according to
-        formula:
-        :math:`\texttt{logits_soft_cap} \times \mathrm{tanh}(x / \texttt{logits_soft_cap})`,
-        where :math:`x` is the input logits.
-    sm_scale : Optional[float]
-        The scale used in softmax, if not provided, will be set to ``1.0 / sqrt(head_dim)``.
-    rope_scale : Optional[float]
-        The scale used in RoPE interpolation, if not provided, will be set to 1.0.
-    rope_theta : Optional[float]
-        The theta used in RoPE, if not provided, will be set to 1e4.
-    return_lse : bool
-        Whether to return the log sum exp value of the attention logits.
-    backend : str
-        The implementation backend, could be ``auto``/``fa2`` or ``fa3``. Defaults to ``auto``.
-        If set to ``auto``, the function will automatically choose the backend based on the
-        device architecture and kernel availability.
-
-    Returns
-    -------
-    Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-        If :attr:`return_lse` is ``False``, the attention output, shape: ``[qo_len, num_qo_heads, head_dim]``.
-        If :attr:`return_lse` is ``True``, a tuple of two tensors:
-
-        * The attention output, shape: ``[qo_len, num_qo_heads, head_dim]``.
-        * The log sum exp value, shape: ``[qo_len, num_qo_heads]``.
-
-    Examples
-    --------
-
-    >>> import torch
-    >>> import flashinfer
-    >>> qo_len = 128
-    >>> kv_len = 4096
-    >>> num_qo_heads = 32
-    >>> num_kv_heads = 4
-    >>> head_dim = 128
-    >>> q = torch.randn(qo_len, num_qo_heads, head_dim).half().to("cuda:0")
-    >>> k = torch.randn(kv_len, num_kv_heads, head_dim).half().to("cuda:0")
-    >>> v = torch.randn(kv_len, num_kv_heads, head_dim).half().to("cuda:0")
-    >>> o = flashinfer.pod_with_kv_cache(q, k, v, causal=True,
-            use_fp16_qk_reduction=True)
-    >>> o.shape
-    torch.Size([128, 32, 128])
-    >>> mask = torch.tril(
-    >>>     torch.full((qo_len, kv_len), True, device="cuda:0"),
-    >>>     diagonal=(kv_len - qo_len),
-    >>> )
-    >>> mask
-    tensor([[ True,  True,  True,  ..., False, False, False],
-            [ True,  True,  True,  ..., False, False, False],
-            [ True,  True,  True,  ..., False, False, False],
-            ...,
-            [ True,  True,  True,  ...,  True, False, False],
-            [ True,  True,  True,  ...,  True,  True, False],
-            [ True,  True,  True,  ...,  True,  True,  True]], device='cuda:0')
-    >>> o_custom = flashinfer.pod_with_kv_cache(q, k, v, custom_mask=mask)
-    >>> torch.allclose(o, o_custom, rtol=1e-3, atol=1e-3)
-    True
-
-    Note
-    ----
-    The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads`` is
-    not equal to ``num_kv_heads``, the function will use
-    `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
-    """
-    _check_pos_encoding_mode(pos_encoding_mode)
-    _check_kv_layout(kv_layout)
-    tmp = _get_cache_buf("pod_with_kv_cache_tmp", 32 * 1024 * 1024, q.device)
-    if logits_soft_cap is None:
-        logits_soft_cap = 0.0
-    if sm_scale is None:
-        sm_scale = 1.0 / math.sqrt(q.size(-1))
-    if rope_scale is None:
-        rope_scale = 1.0
-    if rope_theta is None:
-        rope_theta = 1e4
-    if custom_mask is not None and packed_custom_mask is None:
-        # create packed custom mask from custom mask
-        packed_custom_mask = packbits(
-            custom_mask.contiguous().view(-1), bitorder="little"
-        )
-
-    if packed_custom_mask is not None:
-        mask_mode = MaskMode.CUSTOM.value
-    else:
-        if causal:
-            mask_mode = MaskMode.CAUSAL.value
-        else:
-            mask_mode = MaskMode.NON_CAUSAL.value
-
-    lse = None
-    if return_lse:
-        lse = torch.empty((q.size(0), q.size(1)), dtype=torch.float32, device=q.device)
-
-    if backend == "auto":
-        backend = determine_attention_backend(
-            q.device,
-            PosEncodingMode[pos_encoding_mode].value,
-            use_fp16_qk_reduction,
-            packed_custom_mask is not None,  # use_custom_mask
-            q.dtype,
-            k.dtype,
-        )
-    module_getter = get_pod_module(backend)
-
-    out = torch.empty_like(q)
-    module_getter(
-        q.dtype,
-        k.dtype,
-        q.dtype,
-        q.shape[-1],
-        PosEncodingMode[pos_encoding_mode].value,
-        window_left >= 0,  # use_sliding_window
-        logits_soft_cap > 0,  # use_logits_soft_cap
-        use_fp16_qk_reduction,
-    ).run(
-        q,
-        k,
-        v,
-        tmp,
-        out,
-        lse,
-        mask_mode,
-        TensorLayout[kv_layout].value,
-        window_left,
-        packed_custom_mask,
-        _get_cache_alibi_slopes_buf(q.shape[1], q.device),
-        logits_soft_cap,
-        sm_scale,
-        rope_scale,
-        rope_theta,
-    )
-
-    return (out, lse) if return_lse else out
-
-
-pod_with_kv_cache_return_lse = functools.partial(
-    pod_with_kv_cache, return_lse=True
-)
-
-
-def _compute_page_mask_indptr(
-    qo_indptr: torch.Tensor,
-    paged_kv_indptr: torch.Tensor,
-    paged_kv_last_page_len: torch.Tensor,
-    page_size: int,
-) -> torch.Tensor:
-    if len(qo_indptr) != len(paged_kv_indptr):
-        raise ValueError(
-            "The length of qo_indptr and paged_kv_indptr should be the same."
-        )
-    mask_indptr = torch.empty_like(qo_indptr)
-    mask_indptr[0] = 0
-    mask_indptr[1:] = torch.cumsum(
-        (qo_indptr[1:] - qo_indptr[:-1])
-        * (
-            (paged_kv_indptr[1:] - paged_kv_indptr[:-1] - 1) * page_size
-            + paged_kv_last_page_len
-        ),
-        0,
-    )
-    return mask_indptr
 
 class PODWithPagedKVCacheWrapper:
     r"""Wrapper class for POD-Attention with paged kv-cache (first proposed in
@@ -472,7 +192,7 @@ class PODWithPagedKVCacheWrapper:
     >>> page_size = 16
     >>> # allocate 128MB workspace buffer
     >>> workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
-    >>> decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+    >>> decode_wrapper = flashinfer.PODWithPagedKVCacheWrapper(
     ...     workspace_buffer, "NHD"
     ... )
     >>> batch_size = 7
@@ -506,7 +226,7 @@ class PODWithPagedKVCacheWrapper:
     ...     q = torch.randn(batch_size, num_qo_heads, head_dim).half().to("cuda:0")
     ...     kv_cache = kv_cache_at_layer[i]
     ...     # compute batch decode attention, reuse auxiliary data structures for all layers
-    ...     o = decode_wrapper.run(q, kv_cache)
+    ...     # TODO: DEMONSTRATE USAGE OF POD
     ...     outputs.append(o)
     ...
     >>> outputs[0].shape
@@ -514,7 +234,7 @@ class PODWithPagedKVCacheWrapper:
 
     Note
     ----
-    To accelerate computation, FlashInfer's batch decode attention creates some
+    To accelerate computation, FlashInfer's POD-Attention creates some
     auxiliary data structures, these data structures can be reused across multiple
     batch decode attention calls (e.g. different Transformer layers). This wrapper class
     manages the lifecycle of these data structures.
@@ -531,7 +251,7 @@ class PODWithPagedKVCacheWrapper:
         paged_kv_last_page_len_buffer: Optional[torch.Tensor] = None,
         jit_args: Optional[List[Any]] = None,
     ) -> None:
-        r"""Constructor of :class:`BatchDecodeWithPagedKVCacheWrapper`.
+        r"""Constructor of :class:`PODWithPagedKVCacheWrapper`.
 
         Parameters
         ----------
@@ -877,251 +597,183 @@ class PODWithPagedKVCacheWrapper:
         self._rope_theta = rope_theta
 
     begin_forward = plan
-    '''
-    def forward(
-        self,
-        q: torch.Tensor,
-        paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-        pos_encoding_mode: str = "NONE",
-        q_scale: Optional[float] = None,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
-        window_left: int = -1,
-        logits_soft_cap: Optional[float] = None,
-        sm_scale: Optional[float] = None,
-        rope_scale: Optional[float] = None,
-        rope_theta: Optional[float] = None,
-    ) -> torch.Tensor:
-        r"""Warning: this function is deprecated, please use :meth:`run` instead."""
-        self._pos_encoding_mode = pos_encoding_mode
-        self._window_left = window_left
-        self._logits_soft_cap = logits_soft_cap
-        self._sm_scale = sm_scale
-        self._rope_scale = rope_scale
-        self._rope_theta = rope_theta
-        return self.run(
-            q, paged_kv_cache, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
-        )
 
-    @overload
     def run(
         self,
-        q: torch.Tensor,
-        paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-        *args,
-        q_scale: Optional[float] = None,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
-        return_lse: Literal[False] = False,
-    ) -> torch.Tensor: ...
-
-    @overload
-    def run(
-        self,
-        q: torch.Tensor,
-        paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-        *args,
-        q_scale: Optional[float] = None,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
-        return_lse: Literal[True] = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor]: ...
-    '''
-    def run(
-        self,
+        # Main params (prefill and decode)
         q_p: torch.Tensor,
         k_p: torch.Tensor,
         v_p: torch.Tensor,
         q_d: torch.Tensor,
         paged_kv_cache_d: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-        custom_mask: Optional[torch.Tensor] = None,
-        packed_custom_mask: Optional[torch.Tensor] = None,
-        causal: bool = False,
-        kv_layout: str = "NHD",
-        pos_encoding_mode: str = "NONE",
-        use_fp16_qk_reduction: bool = False,
-        sm_scale: Optional[float] = None,
-        window_left: int = -1,
-        logits_soft_cap: Optional[float] = None,
-        rope_scale: Optional[float] = None,
-        rope_theta: Optional[float] = None,
+        # Prefill options
+        custom_mask_p: Optional[torch.Tensor] = None,
+        packed_custom_mask_p: Optional[torch.Tensor] = None,
+        causal_p: bool = False,
+        kv_layout_p: str = "NHD",
+        pos_encoding_mode_p: str = "NONE",
+        use_fp16_qk_reduction_p: bool = False,
+        sm_scale_p: Optional[float] = None,
+        window_left_p: int = -1,
+        logits_soft_cap_p: Optional[float] = None,
+        rope_scale_p: Optional[float] = None,
+        rope_theta_p: Optional[float] = None,
+        return_lse_p: bool = False,
+        # Decode options
+        custom_mask_d: Optional[torch.Tensor] = None,
+        packed_custom_mask_d: Optional[torch.Tensor] = None,
+        causal_d: bool = False,
+        kv_layout_d: str = "NHD",
+        pos_encoding_mode_d: str = "NONE",
+        use_fp16_qk_reduction_d: bool = False,
+        sm_scale_d: Optional[float] = None,
+        window_left_d: int = -1,
+        logits_soft_cap_d: Optional[float] = None,
+        rope_scale_d: Optional[float] = None,
+        rope_theta_d: Optional[float] = None,
         backend: str = "auto",
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
-        return_lse: bool = False,
+        return_lse_d: bool = False,
         *args,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        r"""Compute batch decode attention between query and paged kv cache.
-
-        Parameters
-        ----------
-        q : torch.Tensor
-            The query tensor, shape: ``[batch_size, num_qo_heads, head_dim]``
-        paged_kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-            The paged KV-Cache stored as a tuple of tensors or a single tensor:
-
-            * a tuple ``(k_cache, v_cache)`` of 4-D tensors, each with shape:
-              ``[max_num_pages, page_size, num_kv_heads, head_dim]`` if :attr:`kv_layout` is ``NHD``,
-              and ``[max_num_pages, num_kv_heads, page_size, head_dim]`` if :attr:`kv_layout` is ``HND``.
-
-            * a single 5-D tensor with shape:
-              ``[max_num_pages, 2, page_size, num_kv_heads, head_dim]`` if
-              :attr:`kv_layout` is ``NHD``, and
-              ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
-              :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
-              ``paged_kv_cache[:, 1]`` is the value-cache.
-
-        q_scale : Optional[float]
-            The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
-        k_scale : Optional[float]
-            The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
-        v_scale : Optional[float]
-            The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
-        return_lse : bool
-            Whether to return the logsumexp of attention scores, defaults to ``False``.
-
-        Returns
-        -------
-        Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-            If :attr:`return_lse` is ``False``, the attention output, shape: ``[batch_size, num_qo_heads, head_dim]``.
-            If :attr:`return_lse` is ``True``, a tuple of two tensors:
-
-            * attention output, shape: ``[batch_size, num_qo_heads, head_dim]``
-            * logsumexp of attention scores, shape: ``[batch_size, num_qo_heads]``.
+        r"""Compute...
         """
-        k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache_d, self._kv_layout)
-        _check_cached_qkv_data_type(
-            q_d, k_cache, self._cached_q_data_type, self._cached_kv_data_type
-        )
-
-        pos_encoding_mode = self._pos_encoding_mode
-        window_left = self._window_left
-        logits_soft_cap = self._logits_soft_cap
-        sm_scale = self._sm_scale
-        rope_scale = self._rope_scale
-        rope_theta = self._rope_theta
-        _check_pos_encoding_mode(pos_encoding_mode)
-        if logits_soft_cap is None:
-            logits_soft_cap = 0.0
-        if sm_scale is None:
-            head_dim = q_d.shape[-1]
-            sm_scale = 1.0 / math.sqrt(head_dim)
-        if q_scale is not None:
-            sm_scale *= q_scale
-        if k_scale is not None:
-            sm_scale *= k_scale
-        if rope_scale is None:
-            rope_scale = 1.0
-        if rope_theta is None:
-            rope_theta = 1e4
-
-        lse = None
-        if return_lse:
-            lse = torch.empty(
-                (q_d.size(0), q_d.size(1)), dtype=torch.float32, device=q_d.device
+        # Prefill setup
+        _check_pos_encoding_mode(pos_encoding_mode_p)
+        _check_kv_layout(kv_layout_p)
+        tmp_p = _get_cache_buf("pod_with_kv_cache_tmp", 32 * 1024 * 1024, q_p.device)
+        if logits_soft_cap_p is None:
+            logits_soft_cap_p = 0.0
+        if sm_scale_p is None:
+            sm_scale_p = 1.0 / math.sqrt(q_p.size(-1))
+        if rope_scale_p is None:
+            rope_scale_p = 1.0
+        if rope_theta_p is None:
+            rope_theta_p = 1e4
+        if custom_mask_p is not None and packed_custom_mask_p is None:
+            # create packed custom mask from custom mask
+            packed_custom_mask_p = packbits(
+                custom_mask_p.contiguous().view(-1), bitorder="little"
             )
 
-        out = torch.empty_like(q_d)
-        if self.use_tensor_cores:
-            run_args = [
-                self._float_workspace_buffer,
-                self._int_workspace_buffer,
-                self._plan_info,
-                q_d,
-                k_cache,
-                v_cache,
-                self._qo_indptr_buf,
-                self._paged_kv_indptr_buf,
-                self._paged_kv_indices_buf,
-                self._paged_kv_last_page_len_buf,
-                out,
-                lse,
-                MaskMode.NON_CAUSAL.value,
-                TensorLayout[self._kv_layout].value,
-                window_left,
-            ]
-
-            if self._jit_module is not None:
-                run_args.extend(list(args))
-            else:
-                run_args += [
-                    None,  # packed_custom_mask
-                    None,  # mask_indptr_buf
-                    _get_cache_alibi_slopes_buf(q.shape[1], q.device),
-                    logits_soft_cap,
-                    sm_scale,
-                    rope_scale,
-                    rope_theta,
-                ]
-
-            self._cached_module.paged_run(*run_args)
+        if packed_custom_mask_p is not None:
+            mask_mode_p = MaskMode.CUSTOM.value
         else:
-            run_args = [
-                self._float_workspace_buffer,
-                self._int_workspace_buffer,
-                self._plan_info,
-                q_d,
-                k_cache,
-                v_cache,
-                self._paged_kv_indptr_buf,
-                self._paged_kv_indices_buf,
-                self._paged_kv_last_page_len_buf,
-                out,
-                lse,
-                TensorLayout[self._kv_layout].value,
-                window_left,
-            ]
-
-            if self._jit_module is not None:
-                run_args.extend(list(args))
+            if causal_p:
+                mask_mode_p = MaskMode.CAUSAL.value
             else:
-                run_args += [
-                    _get_cache_alibi_slopes_buf(q_d.shape[1], q_d.device),
-                    logits_soft_cap,
-                    sm_scale,
-                    rope_scale,
-                    rope_theta,
-                ]
+                mask_mode_p = MaskMode.NON_CAUSAL.value
 
-            self._cached_module.run(*run_args)
-        if v_scale is not None:
-            out *= v_scale
+        lse_p = None
+        if return_lse_p:
+            lse_p = torch.empty((q_p.size(0), q_p.size(1)), dtype=torch.float32, device=q_p.device)
 
-        return (out, lse) if return_lse else out
+        # FA2 only backend currently supported
+        backend = "fa2"
 
-    def forward_return_lse(
-        self,
-        q: torch.Tensor,
-        paged_kv_cache: torch.Tensor,
-        pos_encoding_mode: str = "NONE",
-        q_scale: Optional[float] = None,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
-        window_left: int = -1,
-        logits_soft_cap: Optional[float] = None,
-        sm_scale: Optional[float] = None,
-        rope_scale: Optional[float] = None,
-        rope_theta: Optional[float] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        r"""Warning: this function is deprecated, please use :meth:`run_return_lse` instead."""
-        self._pos_encoding_mode = pos_encoding_mode
-        self._window_left = window_left
-        self._logits_soft_cap = logits_soft_cap
-        self._sm_scale = sm_scale
-        self._rope_scale = rope_scale
-        self._rope_theta = rope_theta
-        return self.run(
-            q,
-            paged_kv_cache,
-            q_scale=q_scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            return_lse=True,
+        out_p = torch.empty_like(q_p)
+
+        # Decode setup
+        
+        k_cache_d, v_cache_d = _unpack_paged_kv_cache(paged_kv_cache_d, self._kv_layout)
+        print(k_cache_d.shape, paged_kv_cache_d.shape, self._kv_layout)
+        _check_cached_qkv_data_type(
+            q_d, k_cache_d, self._cached_q_data_type, self._cached_kv_data_type
+        )
+        # TODO: Where are these coming from?
+        pos_encoding_mode_d = self._pos_encoding_mode
+        window_left_d = self._window_left
+        logits_soft_cap_d = self._logits_soft_cap
+        sm_scale_d = self._sm_scale
+        rope_scale_d = self._rope_scale
+        rope_theta_d = self._rope_theta
+        _check_pos_encoding_mode(pos_encoding_mode_d)
+        # What are the above for and what are the below?
+        if logits_soft_cap_d is None:
+            logits_soft_cap_d = 0.0
+        if sm_scale_d is None:
+            head_dim = q_d.shape[-1]
+            sm_scale_d = 1.0 / math.sqrt(head_dim)
+        if q_scale is not None:
+            sm_scale_d *= q_scale
+        if k_scale is not None:
+            sm_scale_d *= k_scale
+        if rope_scale_d is None:
+            rope_scale_d = 1.0
+        if rope_theta_d is None:
+            rope_theta_d = 1e4
+
+        lse_d = None
+        if return_lse_d:
+            lse_d= torch.empty(
+                (q_d.size(0), q_d.size(1)), dtype=torch.float32, device=q_d.device
+            )
+        out_d = torch.empty_like(q_d)
+
+        module_getter = get_pod_module(backend)
+        module_getter(
+            q_p.dtype,
+            k_p.dtype,
+            q_p.dtype,
+            q_p.shape[-1],
+            PosEncodingMode[pos_encoding_mode_p].value,
+            window_left_p >= 0,  # use_sliding_window
+            logits_soft_cap_p > 0,  # use_logits_soft_cap
+            use_fp16_qk_reduction_p,
+            # TODO: Add the decode stuff to module getter as well
+            #q_d.dtype,
+            #self._cached_kv_data_type,
+            #self._cached_q_data_type,
+            #indptr.dtype,
+            #head_dim,  # head_dim_qk
+            #head_dim,  # head_dim_vo
+            #PosEncodingMode[pos_encoding_mode_d].value,
+            #window_left_d != -1,  # use_sliding_window
+            #logits_soft_cap_d > 0,  # use_logits_soft_cap
+        ).run(
+            # Prefill params
+            q_p,
+            k_p,
+            v_p,
+            tmp_p,
+            out_p,
+            lse_p,
+            mask_mode_p,
+            TensorLayout[kv_layout_p].value,
+            window_left_p,
+            packed_custom_mask_p,
+            _get_cache_alibi_slopes_buf(q_p.shape[1], q_p.device),
+            logits_soft_cap_p,
+            sm_scale_p,
+            rope_scale_p,
+            rope_theta_p,
+            # Decode params
+            self._float_workspace_buffer,
+            self._int_workspace_buffer,
+            self._plan_info,
+            q_d,
+            k_cache_d,
+            v_cache_d,
+            self._paged_kv_indptr_buf,
+            self._paged_kv_indices_buf,
+            self._paged_kv_last_page_len_buf,
+            out_d,
+            lse_d,
+            TensorLayout[self._kv_layout].value,
+            window_left_d,
+            _get_cache_alibi_slopes_buf(q_d.shape[1], q_d.device),
+            logits_soft_cap_d,
+            sm_scale_d,
+            rope_scale_d,
+            rope_theta_d,
         )
 
-    run_return_lse = functools.partialmethod(run, return_lse=True)
+        if v_scale is not None:
+            out_d *= v_scale
 
+        return (out_p, out_d)
     def end_forward(self) -> None:
         r"""Warning: this function is deprecated and has no effect."""
         pass
