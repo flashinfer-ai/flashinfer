@@ -16,21 +16,14 @@
 
 #pragma once
 #include <ATen/ATen.h>
-#include <c10/util/Exception.h>
-
-namespace {
 
 inline at::Tensor vec_to_tensor(const std::vector<int64_t>& vec) {
-  return at::tensor(vec);
+  return at::tensor(vec, at::dtype(at::kLong).device(at::kCPU));
 }
 
 inline std::vector<int64_t> tensor_to_vec(const at::Tensor& tensor) {
-  TORCH_CHECK(tensor.scalar_type() == at::ScalarType::Long, "tensor must be int64");
-
   const size_t size = tensor.numel();
-  const int64_t* first = tensor.cpu().contiguous().const_data_ptr<int64_t>();
+  const int64_t* first = tensor.const_data_ptr<int64_t>();
   const int64_t* last = first + size;
   return std::vector(first, last);
-}
-
 }
