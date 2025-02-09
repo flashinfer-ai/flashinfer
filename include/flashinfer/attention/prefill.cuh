@@ -506,26 +506,6 @@ __device__ __forceinline__ void q_smem_inplace_apply_rotary_with_pos(
   }
 }
 
-template <typename KTraits, typename Params>
-__device__ __forceinline__ void q_smem_inplace_transform(const Params& params,
-                                                         typename KTraits::AttentionVariant variant,
-                                                         smem_t<KTraits::SWIZZLE_MODE_Q>* q_smem) {
-  using DTypeQ = typename KTraits::DTypeQ;
-  const uint32_t warp_idx = get_warp_idx<KTraits>(), lane_idx = threadIdx.x;
-  constexpr uint32_t HEAD_DIM_QK = KTraits::HEAD_DIM_QK;
-  constexpr uint32_t NUM_WARPS = KTraits::NUM_WARPS;
-#pragma unroll
-  for (uint32_t i = 0; i < KTraits::CTA_TILE_Q * HEAD_DIM_QK / (NUM_WARPS * 256); ++i) {
-    vec_t<DTypeQ, 8> tmp;
-    tmp.load((DTypeQ*)(q_smem->base) + (i * NUM_WARPS + warp_idx) * 256 + lane_idx * 8);
-#pragma unroll
-    for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
-      tmp[reg_id] = variant.QueryTransform(params, tmp[reg_id]);
-    }
-    tmp.store((DTypeQ*)(q_smem->base) + (i * NUM_WARPS + warp_idx) * 256 + lane_idx * 8);
-  }
-}
-
 template <typename KTraits>
 __device__ __forceinline__ void k_smem_inplace_apply_rotary(
     const uint32_t kv_idx_base, smem_t<KTraits::SWIZZLE_MODE_KV>* k_smem, uint32_t* k_smem_offset_r,
@@ -760,6 +740,7 @@ __device__ __forceinline__ void logits_mask(
 
 template <typename KTraits>
 __device__ __forceinline__ void update_mdo_states(
+    typename KTraits::AttentionVariant variant,
     typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8],
     float (*o_frag)[KTraits::NUM_MMA_D_VO][8], typename KTraits::DTypeQKAccum (*m)[2],
     float (*d)[2]) {
@@ -768,6 +749,7 @@ __device__ __forceinline__ void update_mdo_states(
   constexpr bool use_softmax = AttentionVariant::use_softmax;
 
   if constexpr (use_softmax) {
+    const float sm_scale = variant.sm_scale_log2;
     if constexpr (std::is_same_v<DTypeQKAccum, float>) {
 #pragma unroll
       for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
@@ -784,7 +766,7 @@ __device__ __forceinline__ void update_mdo_states(
           m[mma_q][j] = max(m[mma_q][j], math::shfl_xor_sync(m[mma_q][j], 0x2));
           m[mma_q][j] = max(m[mma_q][j], math::shfl_xor_sync(m[mma_q][j], 0x1));
 
-          float o_scale = math::ptx_exp2(m_prev - m[mma_q][j]);
+          float o_scale = math::ptx_exp2(m_prev * sm_scale - m[mma_q][j] * sm_scale);
           d[mma_q][j] *= o_scale;
 #pragma unroll
           for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
@@ -795,18 +777,19 @@ __device__ __forceinline__ void update_mdo_states(
           }
 #pragma unroll
           for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
-            s_frag[mma_q][mma_kv][j * 2 + 0] =
-                math::ptx_exp2(s_frag[mma_q][mma_kv][j * 2 + 0] - m[mma_q][j]);
-            s_frag[mma_q][mma_kv][j * 2 + 1] =
-                math::ptx_exp2(s_frag[mma_q][mma_kv][j * 2 + 1] - m[mma_q][j]);
-            s_frag[mma_q][mma_kv][j * 2 + 4] =
-                math::ptx_exp2(s_frag[mma_q][mma_kv][j * 2 + 4] - m[mma_q][j]);
-            s_frag[mma_q][mma_kv][j * 2 + 5] =
-                math::ptx_exp2(s_frag[mma_q][mma_kv][j * 2 + 5] - m[mma_q][j]);
+            s_frag[mma_q][mma_kv][j * 2 + 0] = math::ptx_exp2(
+                s_frag[mma_q][mma_kv][j * 2 + 0] * sm_scale - m[mma_q][j] * sm_scale);
+            s_frag[mma_q][mma_kv][j * 2 + 1] = math::ptx_exp2(
+                s_frag[mma_q][mma_kv][j * 2 + 1] * sm_scale - m[mma_q][j] * sm_scale);
+            s_frag[mma_q][mma_kv][j * 2 + 4] = math::ptx_exp2(
+                s_frag[mma_q][mma_kv][j * 2 + 4] * sm_scale - m[mma_q][j] * sm_scale);
+            s_frag[mma_q][mma_kv][j * 2 + 5] = math::ptx_exp2(
+                s_frag[mma_q][mma_kv][j * 2 + 5] * sm_scale - m[mma_q][j] * sm_scale);
           }
         }
       }
     } else if constexpr (std::is_same_v<DTypeQKAccum, half>) {
+      const half2 sm_scale = __float2half2_rn(variant.sm_scale_log2);
 #pragma unroll
       for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
         half m_prev[2];
@@ -826,7 +809,7 @@ __device__ __forceinline__ void update_mdo_states(
             __hmax2(*(half2*)&m[mma_q], math::shfl_xor_sync(*(half2*)&m[mma_q], 0x1));
 #pragma unroll
         for (uint32_t j = 0; j < 2; ++j) {
-          float o_scale = math::ptx_exp2(float(m_prev[j] - m[mma_q][j]));
+          float o_scale = math::ptx_exp2(float(m_prev[j] * sm_scale.x - m[mma_q][j] * sm_scale.x));
           d[mma_q][j] *= o_scale;
 #pragma unroll
           for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
@@ -839,9 +822,9 @@ __device__ __forceinline__ void update_mdo_states(
 #pragma unroll
           for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
             *(half2*)&s_frag[mma_q][mma_kv][j * 2] =
-                math::ptx_exp2(*(half2*)&s_frag[mma_q][mma_kv][j * 2] - m2);
-            *(half2*)&s_frag[mma_q][mma_kv][j * 2 + 4] =
-                math::ptx_exp2(*(half2*)&s_frag[mma_q][mma_kv][j * 2 + 4] - m2);
+                math::ptx_exp2(*(half2*)&s_frag[mma_q][mma_kv][j * 2] * sm_scale - m2 * sm_scale);
+            *(half2*)&s_frag[mma_q][mma_kv][j * 2 + 4] = math::ptx_exp2(
+                *(half2*)&s_frag[mma_q][mma_kv][j * 2 + 4] * sm_scale - m2 * sm_scale);
           }
         }
       }
@@ -953,6 +936,22 @@ __device__ __forceinline__ void normalize_d(float (*o_frag)[KTraits::NUM_MMA_D_V
         for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
           o_frag[mma_q][mma_d][reg_id] =
               o_frag[mma_q][mma_d][reg_id] * d_rcp[mma_q][(reg_id % 4) / 2];
+        }
+      }
+    }
+  }
+}
+
+template <typename KTraits>
+__device__ __forceinline__ void finalize_m(typename KTraits::AttentionVariant variant,
+                                           typename KTraits::DTypeQKAccum (*m)[2]) {
+  if constexpr (variant.use_softmax) {
+#pragma unroll
+    for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+      for (uint32_t j = 0; j < 2; ++j) {
+        if (m[mma_q][j] != typename KTraits::DTypeQKAccum(-math::inf)) {
+          m[mma_q][j] *= variant.sm_scale_log2;
         }
       }
     }
@@ -1300,15 +1299,14 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void SinglePrefillWithKVCache
                                 group_size, &qo_smem);
 
     cp_async::commit_group();
-    cp_async::wait_group<0>();
-    block.sync();
 
     if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
+      cp_async::wait_group<0>();
+      block.sync();
       q_smem_inplace_apply_rotary<KTraits>(qo_packed_idx_base, qo_len, kv_len, group_size, &qo_smem,
                                            &q_smem_offset_r, rope_freq);
       block.sync();
     }
-    q_smem_inplace_transform<KTraits>(params, variant, &qo_smem);
 
     smem_t<SWIZZLE_MODE_KV> k_smem(smem_storage.k_smem), v_smem(smem_storage.v_smem);
 
@@ -1387,7 +1385,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void SinglePrefillWithKVCache
       }
 
       // compute m,d states in online softmax
-      update_mdo_states<KTraits>(s_frag, o_frag, m, d);
+      update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
 
       block.sync();
       produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(
@@ -1406,6 +1404,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void SinglePrefillWithKVCache
     }
     cp_async::wait_group<0>();
     block.sync();
+
+    finalize_m<KTraits>(variant, m);
 
     // threadblock synchronization
     threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx);
@@ -1693,10 +1693,10 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
                                 q_stride_h, group_size, &qo_smem);
 
     cp_async::commit_group();
-    cp_async::wait_group<0>();
-    block.sync();
 
     if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
+      cp_async::wait_group<0>();
+      block.sync();
       IdType* q_rope_offset = nullptr;
 
       if constexpr (has_maybe_q_rope_offset_v<Params>) {
@@ -1712,7 +1712,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       }
       block.sync();
     }
-    q_smem_inplace_transform<KTraits>(params, variant, &qo_smem);
 
     const uint32_t num_iterations = ceil_div(
         (MASK_MODE == MaskMode::kCausal
@@ -1803,7 +1802,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       }
 
       // compute m,d states in online softmax
-      update_mdo_states<KTraits>(s_frag, o_frag, m, d);
+      update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
 
       block.sync();
       produce_kv<false, SharedMemFillMode::kNoFill, KTraits>(
@@ -1822,6 +1821,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     }
     cp_async::wait_group<0>();
     block.sync();
+
+    finalize_m<KTraits>(variant, m);
 
     // threadblock synchronization
     threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx);
@@ -1975,10 +1976,10 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVC
                                 q_stride_h, group_size, &qo_smem);
 
     cp_async::commit_group();
-    cp_async::wait_group<0>();
-    block.sync();
 
     if constexpr (KTraits::POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
+      cp_async::wait_group<0>();
+      block.sync();
       IdType* q_rope_offset = nullptr;
       if constexpr (has_maybe_q_rope_offset_v<Params>) {
         q_rope_offset = params.maybe_q_rope_offset;
@@ -1993,7 +1994,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVC
       }
       block.sync();
     }
-    q_smem_inplace_transform<KTraits>(params, variant, &qo_smem);
 
     smem_t<SWIZZLE_MODE_KV> k_smem(smem_storage.k_smem), v_smem(smem_storage.v_smem);
     size_t thr_local_kv_offset[NUM_MMA_KV * KV_THR_LAYOUT_COL / 2 / NUM_WARPS_Q];
@@ -2096,7 +2096,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVC
       }
 
       // compute m,d states in online softmax
-      update_mdo_states<KTraits>(s_frag, o_frag, m, d);
+      update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
 
       block.sync();
       page_produce_kv<false, KTraits>(k_smem, &k_smem_offset_w, paged_kv, (iter + 1) * CTA_TILE_KV,
@@ -2115,6 +2115,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVC
     }
     cp_async::wait_group<0>();
     block.sync();
+
+    finalize_m<KTraits>(variant, m);
 
     // threadblock synchronization
     threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx);

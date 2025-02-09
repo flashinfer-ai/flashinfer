@@ -91,6 +91,10 @@ __device__ __forceinline__ void compute_qk(const Params& params, AttentionVarian
     const uint32_t pos = kv_idx_base + tz * tile_size + j;
     s[j] = variant.LogitsTransform(params, s[j], batch_idx, /*qo_idx=*/0, /*kv_idx=*/pos,
                                    qo_head_idx, kv_head_idx);
+    if constexpr (variant.use_softmax) {
+      s[j] *= variant.sm_scale_log2;
+    }
+
     bool mask = variant.LogitsMask(params, batch_idx, /*qo_idx=*/0, /*kv_idx=*/pos, qo_head_idx,
                                    kv_head_idx);
     s[j] = (iter_base + tz * tile_size + j < iter_bound && mask) ? s[j] : -math::inf;
@@ -262,11 +266,6 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
   } else {
     // do not apply rotary embedding to q matrix
     q_vec.cast_load(q + qo_head_idx * q_stride_h + tx * vec_size);
-  }
-  // multiple q_vec by sm_scale
-#pragma unroll
-  for (uint32_t i = 0; i < vec_size; ++i) {
-    q_vec[i] = variant.QueryTransform(params, q_vec[i]);
   }
   block.sync();
 
@@ -456,11 +455,6 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params
     // do not apply rotary embedding to q matrix
     q_vec.cast_load(q + batch_idx * q_stride_n + qo_head_idx * q_stride_h + tx * vec_size);
   }
-#pragma unroll
-  for (uint32_t i = 0; i < vec_size; ++i) {
-    q_vec[i] = variant.QueryTransform(params, q_vec[i]);
-  }
-  block.sync();
 
   // preload k/v tiles
   uint32_t stage_idx = 0;
