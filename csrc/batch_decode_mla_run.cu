@@ -4,6 +4,7 @@
 
 #include "mla_config.inc"
 #include "pytorch_extension_utils.h"
+#include "pytorch_conversion_utils.h"
 
 using namespace flashinfer;
 
@@ -15,7 +16,7 @@ void BatchDecodeWithPagedKVCacheRunMLA(
     int64_t window_left, double logits_soft_cap, double rope_scale, double rope_theta,
     std::optional<at::Tensor> maybe_lse, int64_t cuda_stream) {
   DecodePlanInfo plan_info;
-  plan_info.FromVector(plan_info_vec);
+  plan_info.FromVector(tensor_to_vec(plan_info_vec));
 
   auto device = q_nope.device();
   int64_t batch_size = q_nope.size(0);

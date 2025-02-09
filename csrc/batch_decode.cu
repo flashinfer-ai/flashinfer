@@ -20,6 +20,7 @@
 
 #include "batch_decode_config.inc"
 #include "pytorch_extension_utils.h"
+#include "pytorch_conversion_utils.h"
 
 namespace flashinfer {
 
@@ -73,7 +74,7 @@ at::Tensor BatchDecodeWithPagedKVCachePlan(
         });
       });
 
-  return plan_info.ToVector();
+  return vec_to_tensor(plan_info.ToVector());
 }
 
 void BatchDecodeWithPagedKVCacheRun(
@@ -83,7 +84,7 @@ void BatchDecodeWithPagedKVCacheRun(
     at::Tensor paged_kv_last_page_len, at::Tensor o, std::optional<at::Tensor> maybe_lse,
     int64_t kv_layout_code, int64_t window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream) {
   DecodePlanInfo plan_info;
-  plan_info.FromVector(plan_info_vec);
+  plan_info.FromVector(tensor_to_vec(plan_info_vec));
   QKVLayout kv_layout = static_cast<QKVLayout>(kv_layout_code);
   auto device = q.device();
   int64_t batch_size = q.size(0);

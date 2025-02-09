@@ -20,6 +20,7 @@
 
 #include "batch_prefill_config.inc"
 #include "pytorch_extension_utils.h"
+#include "pytorch_conversion_utils.h"
 
 namespace flashinfer {
 
@@ -64,7 +65,7 @@ at::Tensor BatchPrefillWithKVCachePlan(
   TORCH_CHECK(status == cudaSuccess,
               "Failed to plan prefill with error: ", cudaGetErrorString(status));
 
-  return plan_info.ToVector();
+  return vec_to_tensor(plan_info.ToVector());
 }
 
 void BatchPrefillWithRaggedKVCacheRun(
@@ -74,7 +75,7 @@ void BatchPrefillWithRaggedKVCacheRun(
     int64_t mask_mode_code, int64_t layout, int64_t window_left ADDITIONAL_FUNC_PARAMS,
     int64_t cuda_stream) {
   PrefillPlanInfo plan_info;
-  plan_info.FromVector(plan_info_vec);
+  plan_info.FromVector(tensor_to_vec(plan_info_vec));
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
 
   int64_t num_qo_heads = q.size(1);
@@ -200,7 +201,7 @@ void BatchPrefillWithPagedKVCacheRun(
     std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code, int64_t layout,
     int64_t window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream) {
   PrefillPlanInfo plan_info;
-  plan_info.FromVector(plan_info_vec);
+  plan_info.FromVector(tensor_to_vec(plan_info_vec));
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
   auto device = q.device();
   int64_t batch_size = paged_kv_indptr.size(0) - 1;

@@ -4,6 +4,7 @@
 
 #include "mla_config.inc"
 #include "pytorch_extension_utils.h"
+#include "pytorch_conversion_utils.h"
 
 using namespace flashinfer;
 
@@ -35,5 +36,5 @@ at::Tensor BatchDecodeWithPagedKVCachePlanMLA(
   TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCachePlanMLA failed with error ",
               cudaGetErrorString(status));
 
-  return plan_info.ToVector();
+  return vec_to_tensor(plan_info.ToVector());
 }

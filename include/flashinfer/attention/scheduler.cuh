@@ -24,8 +24,6 @@
 #include <sstream>
 #include <vector>
 
-#include <torch/types.h>
-
 #include "../allocator.h"
 #include "../exception.h"
 #include "../pos_enc.cuh"
@@ -315,24 +313,27 @@ struct DecodePlanInfo {
         enable_cuda_graph(false),
         split_kv(false) {}
 
-  // convert to pytorch CPU tensor with dtype torch.int64
-  at::Tensor ToVector() const {
-    return torch::tensor({padded_batch_size, v_offset, s_offset, request_indices_offset,
-                          kv_tile_indices_offset, o_indptr_offset, block_valid_mask_offset,
-                          kv_chunk_size_ptr_offset, static_cast<int64_t>(enable_cuda_graph), 
-                          static_cast<int64_t>(split_kv)},
-                         torch::dtype(torch::kInt64));
+  // convert DecodePlanInfo to std::vector<int64_t>
+  std::vector<int64_t> ToVector() const {
+    return {padded_batch_size,
+            v_offset,
+            s_offset,
+            request_indices_offset,
+            kv_tile_indices_offset,
+            o_indptr_offset,
+            block_valid_mask_offset,
+            kv_chunk_size_ptr_offset,
+            enable_cuda_graph,
+            split_kv};
   }
 
-  // From pytorch CPU tensor with dtype torch.int64
-  void FromVector(const at::Tensor& vec_tensor) {
-    if (vec_tensor.numel() != 10) {
+  // From std::vector<int64_t> to DecodePlanInfo
+  void FromVector(const std::vector<int64_t>& vec) {
+    if (vec.size() != 10) {
       std::ostringstream err_msg;
-      err_msg << "DecodePlanInfo::FromVector: vec_tensor.numel() should be 10, but got " << vec_tensor.numel();
+      err_msg << "DecodePlanInfo::FromVector: vec.size() should be 10, but got " << vec.size();
       FLASHINFER_ERROR(err_msg.str());
     }
-    // view as int64_t*
-    auto vec = vec_tensor.data_ptr<int64_t>();
     padded_batch_size = vec[0];
     v_offset = vec[1];
     s_offset = vec[2];
@@ -554,24 +555,32 @@ struct PrefillPlanInfo {
         enable_cuda_graph(false),
         split_kv(false) {}
 
-  // convert to pytorch CPU tensor with dtype torch.int64
-  at::Tensor ToVector() const {
-    return torch::tensor({padded_batch_size, total_num_rows, total_num_rows_offset, cta_tile_q,
-                          request_indices_offset, qo_tile_indices_offset, kv_tile_indices_offset,
-                          merge_indptr_offset, o_indptr_offset, kv_chunk_size_ptr_offset, v_offset,
-                          s_offset, block_valid_mask_offset,
-                          static_cast<int64_t>(enable_cuda_graph), static_cast<int64_t>(split_kv)},
-                         torch::dtype(torch::kInt64));
+  // convert PrefillPlanInfo to std::vector<int64_t>
+  std::vector<int64_t> ToVector() const {
+    return {padded_batch_size,
+            total_num_rows,
+            total_num_rows_offset,
+            cta_tile_q,
+            request_indices_offset,
+            qo_tile_indices_offset,
+            kv_tile_indices_offset,
+            merge_indptr_offset,
+            o_indptr_offset,
+            kv_chunk_size_ptr_offset,
+            v_offset,
+            s_offset,
+            block_valid_mask_offset,
+            enable_cuda_graph,
+            split_kv};
   }
 
-  // From pytorch CPU tensor with dtype torch.int64
-  void FromVector(const at::Tensor& vec_tensor) {
-    if (vec_tensor.numel() != 15) {
+  // From std::vector<int64_t> to PrefillPlanInfo
+  void FromVector(const std::vector<int64_t>& vec) {
+    if (vec.size() != 15) {
       std::ostringstream err_msg;
-      err_msg << "PrefillPlanInfo::FromVector: vec_tensor.numel() should be 14, but got " << vec_tensor.numel();
+      err_msg << "PrefillPlanInfo::FromVector: vec.size() should be 15, but got " << vec.size();
       FLASHINFER_ERROR(err_msg.str());
     }
-    auto vec = vec_tensor.data_ptr<int64_t>();
     padded_batch_size = vec[0];
     total_num_rows = vec[1];
     total_num_rows_offset = vec[2];
@@ -726,23 +735,22 @@ struct PrefillPlanSM90Info {
         head_indices_offset(0),
         work_indptr_offset(0),
         same_schedule_for_all_heads(false) {}
-
-  // convert to pytorch CPU tensor with dtype torch.int64
-  at::Tensor ToVector() const {
-    return torch::tensor({qo_tile_indices_offset, qo_indptr_offset, kv_indptr_offset, qo_len_offset,
-                          kv_len_offset, head_indices_offset, work_indptr_offset,
-                          static_cast<int64_t>(same_schedule_for_all_heads)},
-                         torch::dtype(torch::kInt64));
+  
+  // convert PrefillPlanSM90Info to std::vector<int64_t>
+  std::vector<int64_t> ToVector() const {
+    return {qo_tile_indices_offset, qo_indptr_offset,
+            kv_indptr_offset,       qo_len_offset,
+            kv_len_offset,          head_indices_offset,
+            work_indptr_offset,     same_schedule_for_all_heads};
   }
 
-  // From pytorch CPU tensor with dtype torch.int64
-  void FromVector(const at::Tensor& vec_tensor) {
-    if (vec_tensor.numel() != 8) {
+  // From std::vector<int64_t> to PrefillPlanSM90Info
+  void FromVector(const std::vector<int64_t>& vec) {
+    if (vec.size() != 8) {
       std::ostringstream err_msg;
-      err_msg << "PrefillPlanSM90Info::FromVector: vec_tensor.numel() should be 8, but got " << vec_tensor.numel();
+      err_msg << "PrefillPlanSM90Info::FromVector: vec.size() should be 8, but got " << vec.size();
       FLASHINFER_ERROR(err_msg.str());
     }
-    auto vec = vec_tensor.data_ptr<int64_t>();
     qo_tile_indices_offset = vec[0];
     qo_indptr_offset = vec[1];
     kv_indptr_offset = vec[2];

@@ -22,6 +22,7 @@
 
 #include "batch_prefill_sm90_config.inc"
 #include "pytorch_extension_utils.h"
+#include "pytorch_conversion_utils.h"
 
 namespace flashinfer {
 
@@ -64,7 +65,7 @@ at::Tensor BatchPrefillWithKVCacheSM90Plan(
   TORCH_CHECK(status == cudaSuccess,
               "PrefillSM90Plan failed with error: ", cudaGetErrorString(status));
 
-  return plan_info.ToVector();
+  return vec_to_tensor(plan_info.ToVector());
 }
 
 void BatchPrefillWithRaggedKVCacheSM90Run(
@@ -74,7 +75,7 @@ void BatchPrefillWithRaggedKVCacheSM90Run(
     int64_t mask_mode_code, int64_t layout, int64_t window_left ADDITIONAL_FUNC_PARAMS,
     int64_t cuda_stream) {
   PrefillPlanSM90Info plan_info;
-  plan_info.FromVector(plan_info_vec);
+  plan_info.FromVector(tensor_to_vec(plan_info_vec));
 
   if (maybe_lse) {
     const auto& lse = *maybe_lse;
@@ -162,7 +163,7 @@ void BatchPrefillWithPagedKVCacheSM90Run(
     std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code, int64_t layout,
     int64_t window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream) {
   PrefillPlanSM90Info plan_info;
-  plan_info.FromVector(plan_info_vec);
+  plan_info.FromVector(tensor_to_vec(plan_info_vec));
 
   if (maybe_lse) {
     const auto& lse = *maybe_lse;
