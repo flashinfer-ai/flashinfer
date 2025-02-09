@@ -20,9 +20,10 @@
 #include <flashinfer/math.cuh>
 #include <optional>
 
-#include "batch_prefill_sm90_config.inc"
 #include "pytorch_extension_utils.h"
 #include "pytorch_conversion_utils.h"
+
+#include "batch_prefill_sm90_config.inc"
 
 namespace flashinfer {
 
@@ -50,7 +51,7 @@ at::Tensor BatchPrefillWithKVCacheSM90Plan(
   size_t int_workspace_size_in_bytes =
       int_workspace_buffer.size(0) * int_workspace_buffer.element_size();
 
-  PrefillPlanSM90Info plan_info;
+  flashinfer::PrefillPlanSM90Info plan_info;
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
 
