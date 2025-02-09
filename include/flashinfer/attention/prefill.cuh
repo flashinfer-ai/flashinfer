@@ -789,6 +789,7 @@ __device__ __forceinline__ void update_mdo_states(
         }
       }
     } else if constexpr (std::is_same_v<DTypeQKAccum, half>) {
+      const half2 sm_scale = __float2half2_rn(variant.sm_scale_log2);
 #pragma unroll
       for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
         half m_prev[2];
@@ -808,7 +809,7 @@ __device__ __forceinline__ void update_mdo_states(
             __hmax2(*(half2*)&m[mma_q], math::shfl_xor_sync(*(half2*)&m[mma_q], 0x1));
 #pragma unroll
         for (uint32_t j = 0; j < 2; ++j) {
-          float o_scale = math::ptx_exp2(float(m_prev[j] - m[mma_q][j]));
+          float o_scale = math::ptx_exp2(float(m_prev[j] * sm_scale.x - m[mma_q][j] * sm_scale.x));
           d[mma_q][j] *= o_scale;
 #pragma unroll
           for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
@@ -821,9 +822,9 @@ __device__ __forceinline__ void update_mdo_states(
 #pragma unroll
           for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
             *(half2*)&s_frag[mma_q][mma_kv][j * 2] =
-                math::ptx_exp2(*(half2*)&s_frag[mma_q][mma_kv][j * 2] - m2);
-            *(half2*)&s_frag[mma_q][mma_kv][j * 2 + 4] =
-                math::ptx_exp2(*(half2*)&s_frag[mma_q][mma_kv][j * 2 + 4] - m2);
+                math::ptx_exp2(*(half2*)&s_frag[mma_q][mma_kv][j * 2] * sm_scale - m2 * sm_scale);
+            *(half2*)&s_frag[mma_q][mma_kv][j * 2 + 4] = math::ptx_exp2(
+                *(half2*)&s_frag[mma_q][mma_kv][j * 2 + 4] * sm_scale - m2 * sm_scale);
           }
         }
       }
@@ -935,6 +936,22 @@ __device__ __forceinline__ void normalize_d(float (*o_frag)[KTraits::NUM_MMA_D_V
         for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
           o_frag[mma_q][mma_d][reg_id] =
               o_frag[mma_q][mma_d][reg_id] * d_rcp[mma_q][(reg_id % 4) / 2];
+        }
+      }
+    }
+  }
+}
+
+template <typename KTraits>
+__device__ __forceinline__ void finalize_m(typename KTraits::AttentionVariant variant,
+                                           typename KTraits::DTypeQKAccum (*m)[2]) {
+  if constexpr (variant.use_softmax) {
+#pragma unroll
+    for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+      for (uint32_t j = 0; j < 2; ++j) {
+        if (m[mma_q][j] != typename KTraits::DTypeQKAccum(-math::inf)) {
+          m[mma_q][j] *= variant.sm_scale_log2;
         }
       }
     }
@@ -1388,6 +1405,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void SinglePrefillWithKVCache
     cp_async::wait_group<0>();
     block.sync();
 
+    finalize_m<KTraits>(variant, m);
+
     // threadblock synchronization
     threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx);
 
@@ -1415,10 +1434,10 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void SinglePrefillWithKVCache
               if (qo_idx < qo_len) {
                 if (partition_kv) {
                   lse[(qo_idx * num_chunks + chunk_idx) * num_qo_heads + qo_head_idx] =
-                      math::ptx_log2(d[mma_q][j]) + float(m[mma_q][j]) * variant.sm_scale_log2;
+                      math::ptx_log2(d[mma_q][j]) + float(m[mma_q][j]);
                 } else {
                   lse[qo_idx * num_qo_heads + qo_head_idx] =
-                      math::ptx_log2(d[mma_q][j]) + float(m[mma_q][j]) * variant.sm_scale_log2;
+                      math::ptx_log2(d[mma_q][j]) + float(m[mma_q][j]);
                 }
               }
             }
@@ -1803,6 +1822,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     cp_async::wait_group<0>();
     block.sync();
 
+    finalize_m<KTraits>(variant, m);
+
     // threadblock synchronization
     threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx);
 
@@ -1833,11 +1854,10 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
                 if (partition_kv) {
                   lse[(o_indptr[request_idx] + qo_idx * num_kv_chunks + kv_tile_idx) *
                           num_qo_heads +
-                      qo_head_idx] =
-                      math::ptx_log2(d[mma_q][j]) + float(m[mma_q][j]) * variant.sm_scale_log2;
+                      qo_head_idx] = math::ptx_log2(d[mma_q][j]) + float(m[mma_q][j]);
                 } else {
                   lse[(o_indptr[request_idx] + qo_idx) * num_qo_heads + qo_head_idx] =
-                      math::ptx_log2(d[mma_q][j]) + float(m[mma_q][j]) * variant.sm_scale_log2;
+                      math::ptx_log2(d[mma_q][j]) + float(m[mma_q][j]);
                 }
               }
             }
@@ -2096,6 +2116,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVC
     cp_async::wait_group<0>();
     block.sync();
 
+    finalize_m<KTraits>(variant, m);
+
     // threadblock synchronization
     threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx);
 
@@ -2126,11 +2148,10 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVC
                 if (partition_kv) {
                   lse[(o_indptr[request_idx] + qo_idx * num_kv_chunks + kv_tile_idx) *
                           num_qo_heads +
-                      qo_head_idx] =
-                      math::ptx_log2(d[mma_q][j]) + float(m[mma_q][j]) * variant.sm_scale_log2;
+                      qo_head_idx] = math::ptx_log2(d[mma_q][j]) + float(m[mma_q][j]);
                 } else {
                   lse[(o_indptr[request_idx] + qo_idx) * num_qo_heads + qo_head_idx] =
-                      math::ptx_log2(d[mma_q][j]) + float(m[mma_q][j]) * variant.sm_scale_log2;
+                      math::ptx_log2(d[mma_q][j]) + float(m[mma_q][j]);
                 }
               }
             }
