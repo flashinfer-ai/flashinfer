@@ -54,11 +54,11 @@ struct LogitsSoftCap {
 
   template <int NUM_ROWS_PER_THREAD>
   __device__ auto GetAttentionUpdater() {
-    return OnlineSoftmax<NUM_ROWS_PER_THREAD, /*WITH_SCALE=*/false>(0.);
+    return OnlineSoftmax<NUM_ROWS_PER_THREAD, /*WITH_SCALE=*/true>(post_tanh_scale);
   }
 
   REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx,
-                            { return math::tanh(logits * pre_tanh_scale) * post_tanh_scale; })
+                            { return math::tanh(logits * pre_tanh_scale); })
 };
 
 template <bool use_logits_soft_cap>

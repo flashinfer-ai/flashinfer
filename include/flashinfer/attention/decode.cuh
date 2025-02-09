@@ -94,6 +94,7 @@ __device__ __forceinline__ void compute_qk(const Params& params, AttentionVarian
     if constexpr (variant.use_softmax) {
       s[j] *= variant.sm_scale_log2;
     }
+
     bool mask = variant.LogitsMask(params, batch_idx, /*qo_idx=*/0, /*kv_idx=*/pos, qo_head_idx,
                                    kv_head_idx);
     s[j] = (iter_base + tz * tile_size + j < iter_bound && mask) ? s[j] : -math::inf;

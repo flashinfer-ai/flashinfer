@@ -48,7 +48,11 @@ struct DefaultAttention : AttentionVariantBase {
       soft_cap_pre_tanh_scale = params.sm_scale * math::ptx_rcp(params.logits_soft_cap);
       sm_scale_log2 = math::log2e * params.logits_soft_cap;
     } else {
-      sm_scale_log2 = params.sm_scale * math::log2e;
+      if constexpr (use_alibi) {
+        sm_scale_log2 = math::log2e;
+      } else {
+        sm_scale_log2 = params.sm_scale * math::log2e;
+      }
     }
     if constexpr (use_custom_mask) {
       if constexpr (has_maybe_mask_indptr_v<Params>) {
@@ -64,7 +68,8 @@ struct DefaultAttention : AttentionVariantBase {
 
   REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
     if constexpr (use_alibi) {
-      logits = logits + params.maybe_alibi_slopes[qo_head_idx] * float(int(kv_idx) - int(qo_idx));
+      logits = logits * params.sm_scale +
+               params.maybe_alibi_slopes[qo_head_idx] * float(int(kv_idx) - int(qo_idx));
     }
     if constexpr (use_logits_soft_cap) {
       logits = float(math::tanh(logits * soft_cap_pre_tanh_scale));
