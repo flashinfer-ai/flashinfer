@@ -120,7 +120,6 @@ class BatchMLAPageAttentionWrapper:
                 if return_lse
                 else None
             )
-            print(self._kv_indices_buf)
             self._cached_module.run(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,

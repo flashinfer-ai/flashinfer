@@ -189,6 +189,7 @@ def test_batch_mla_page_attention(
     q = torch.cat([q_nope, q_pe], dim=-1)
     o_ref = attention_ref(batch_size, q, k, v, causal, sm_scale)
 
+    print(o, o_ref)
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
 
 
@@ -196,4 +197,4 @@ if __name__ == "__main__":
     # test_single_prefill_with_kv_cache(54, 37, 4, 32, False, "fa2")
     # test_batch_prefill_with_ragged_kv_cache(12, 54, 37, 4, 4, False, "fa2")
     # test_batch_mla_page_attention(12, 54, 37, 128, False, "fa2")
-    test_batch_mla_page_attention(1, 19, 1, 64, False, "fa2")
+    test_batch_mla_page_attention(1, 33, 5, 127, False, "fa2")

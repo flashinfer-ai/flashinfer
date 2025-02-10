@@ -634,113 +634,107 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionKer
     cp_async::wait_group<0>();
     __syncthreads();
 
-    int kv_tile_idx = ceil_div(
+    int kv_tile_idx =
         (CAUSAL ? min(kv_end, kv_len - q_len + (packed_qo_start + cluster_tile_q) / num_heads)
-                : kv_end),
-        CTA_TILE_KV);
+                : kv_end) /
+        CTA_TILE_KV;
+    // CTA_TILE_KV);
 
-    int mask_tile_idx = ceil_div(
-        (CAUSAL ? min(kv_end, kv_len - q_len + packed_qo_start / num_heads) : kv_end), CTA_TILE_KV);
+    int mask_tile_idx =  // ceil_div(
+        (CAUSAL ? min(kv_end, kv_len - q_len + packed_qo_start / num_heads) : kv_end) / CTA_TILE_KV;
 
-    int start_tile_idx = ceil_div(kv_start, CTA_TILE_KV);
+    int start_tile_idx = kv_start / CTA_TILE_KV;  // ceil_div(kv_start, CTA_TILE_KV);
     uint32_t block_iter_base = (kv_indptr + kv_start) * block_size;
 
-    // load_mla_kv_global_smem<KTraits>();  // last kv tile
+    // last kv tile
     load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
-                     kpe_stride_n, kpe_stride_page, kv_len, block_iter_base + 0 * CTA_TILE_KV,
-                     block_size, 0 % NUM_STAGES);
+                     kpe_stride_n, kpe_stride_page, kv_len,
+                     block_iter_base + kv_tile_idx * CTA_TILE_KV, block_size,
+                     kv_tile_idx % NUM_STAGES);
     cp_async::commit_group();
-    // if (kv_tile_idx > start_tile_idx) {
-    //   // load_mla_kv_global_smem<KTraits>();  // second last kv tile
-    //   cp_async::commit_group();
-    // }
+    if (kv_tile_idx - 1 >= start_tile_idx) {
+      load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
+                       kpe_stride_n, kpe_stride_page, kv_len,
+                       block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV, block_size,
+                       (kv_tile_idx - 1) % NUM_STAGES);
+      cp_async::commit_group();
+    }
 
+#pragma unroll 1
+    for (; kv_tile_idx >= mask_tile_idx; --kv_tile_idx) {
+      cp_async::wait_group<1>();
+      __syncthreads();
+
+      // compute mla qk
+      compute_mla_qk<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, s_frag);
+
+      // logits mask
+      logits_mask_<KTraits>(qo_packed_idx_base, kv_start + kv_tile_idx * CTA_TILE_KV, q_len, kv_len,
+                            kv_end, num_heads, s_frag);
+
+      // compute m,d states in online softmax
+      update_mdo_states_<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, variant, s_frag, o_frag,
+                                  m, d);
+      store_p_smem<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, s_frag, d);
+
+      // compute sfm * v
+      compute_mla_pk<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, o_frag);
+
+      if (kv_tile_idx - 2 >= start_tile_idx) {
+        __syncthreads();
+        load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
+                         kpe_stride_n, kpe_stride_page, kv_len,
+                         block_iter_base + (kv_tile_idx - 2) * CTA_TILE_KV, block_size,
+                         (kv_tile_idx - 2) % NUM_STAGES);
+        cp_async::commit_group();
+      }
+    }
+
+#pragma unroll 1
+    for (; kv_tile_idx > start_tile_idx + 1; --kv_tile_idx) {
+      cp_async::wait_group<1>();
+      __syncthreads();
+
+      // compute mla qk
+      compute_mla_qk<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, s_frag);
+
+      // compute m,d states in online softmax
+      update_mdo_states_<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, variant, s_frag, o_frag,
+                                  m, d);
+      store_p_smem<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, s_frag, d);
+
+      // compute sfm * v
+      compute_mla_pk<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, o_frag);
+
+      __syncthreads();
+      load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
+                       kpe_stride_n, kpe_stride_page, kv_len,
+                       block_iter_base + (kv_tile_idx - 2) * CTA_TILE_KV, block_size,
+                       (kv_tile_idx - 2) % NUM_STAGES);
+      cp_async::commit_group();
+    }
     cp_async::wait_group<0>();
     __syncthreads();
 
-    compute_mla_qk<KTraits>(&smem_storage, 0 % NUM_STAGES, s_frag);
+#pragma unroll
+    for (; kv_tile_idx >= start_tile_idx; --kv_tile_idx) {
+      // compute mla qk
+      compute_mla_qk<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, s_frag);
 
-    logits_mask_<KTraits>(qo_packed_idx_base, kv_start + 0 * CTA_TILE_KV, q_len, kv_len, kv_end,
-                          num_heads, s_frag);
+      // compute m,d states in online softmax
+      update_mdo_states_<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, variant, s_frag, o_frag,
+                                  m, d);
+      store_p_smem<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, s_frag, d);
 
-    update_mdo_states_<KTraits>(&smem_storage, 0 % NUM_STAGES, variant, s_frag, o_frag, m, d);
+      // compute sfm * v
+      compute_mla_pk<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, o_frag);
+    }
 
-    store_p_smem<KTraits>(&smem_storage, 0 % NUM_STAGES, s_frag, d);
-
-    compute_mla_pk<KTraits>(&smem_storage, 0 % NUM_STAGES, o_frag);
-
+    // normalize and write back
     normalize_d_<KTraits>(&smem_storage, 0 % NUM_STAGES, o_frag, m, d);
-
     write_o<KTraits>(&smem_storage, final_o + q_indptr * o_stride_n, final_lse, partial_o,
                      partial_lse, o_frag, m, d, o_stride_n, o_stride_h, q_len, qo_packed_idx_base,
                      num_heads);
-
-    // #pragma unroll
-    //     for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV / 2; ++mma_kv) {
-    // #pragma unroll
-    //       for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
-    //         uint32_t lane_idx = threadIdx.x, warp_idx_in_wg = threadIdx.y, warpgroup_idx =
-    //         threadIdx.z; uint32_t q_idx = packed_qo_start + warp_idx_in_wg * 16 + lane_idx / 4 +
-    //         8 * (reg_id / 4); uint32_t kv_idx = kv_start + mma_kv * 16 + 2 * (lane_idx % 4) + 8 *
-    //         (reg_id / 4) +
-    //                           reg_id % 2 + warpgroup_idx * (NUM_MMA_KV / 2) * 16;
-    //         printf("%d %d %.4f\n", q_idx, kv_idx, s_frag[mma_kv][reg_id]);
-    //       }
-    //     }
-
-    // store_p_smem;
-
-#pragma unroll 1
-    for (; kv_tile_idx > mask_tile_idx; --kv_tile_idx) {
-      // cp_async::wait_group<1>();
-      // block.sync();
-
-      // compute qk
-
-      // logits_transform
-
-      // logits mask
-
-      // compute m,d states in online softmax
-
-      // compute sfm * v
-
-      // block.sync();
-      // load_mla_kv_global_smem<KTraits>();
-      // cp_async::commit_group();
-    }
-
-    // #pragma unroll 1
-    //     for (; kv_tile_idx > kv_start; --iter) {
-    //       uint32_t packed_block_iter_base = kv_indptr * block_size + kv_tile_idx * CTA_TILE_KV;
-
-    //       cp_async::wait_group<1>();
-    //       block.sync();
-
-    //       // compute qk
-
-    //       // logits transform
-
-    //       // compute m,d states in online softmax
-
-    //       // compute sfm * v
-
-    //       block.sync();
-    //       load_mla_kv_global_smem<KTraits>();
-    //       cp_async::commit_group();
-    //     }
-    //     cp_async::wait_group<0>();
-    //     block.sync();
-
-    //     // compute qk
-
-    //     // logits transform
-
-    //     // compute m,d states in online softmax
-
-    //     // compute sfm * v
-
-    //     // write back
   }
 }
 
