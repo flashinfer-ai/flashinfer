@@ -78,6 +78,7 @@ def test_single_prefill_with_kv_cache(
     causal,
     backend,
 ):
+    torch.manual_seed(42)
     head_dim_qk = 192
     head_dim_vo = 128
     q = torch.randn(qo_len, num_heads, head_dim_qk).to(0).half()
@@ -104,6 +105,7 @@ def test_batch_prefill_with_ragged_kv_cache(
     causal,
     backend,
 ):
+    torch.manual_seed(42)
     kv_layout = "NHD"
     head_dim_qk = 192
     head_dim_vo = 128
@@ -135,17 +137,27 @@ def test_batch_prefill_with_ragged_kv_cache(
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("batch_size", [1, 17, 77])
+@pytest.mark.parametrize("kv_len", [17, 33, 96, 97, 114, 514, 1024])
+@pytest.mark.parametrize("qo_len", [1, 17, 37])
+@pytest.mark.parametrize("num_heads", [4, 32, 128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("backend", ["fa2"])
 def test_batch_mla_page_attention(
     batch_size,
     kv_len,
     qo_len,
     num_heads,
     causal,
+    page_size,
     backend,
 ):
+    torch.manual_seed(42)
+    if kv_len % page_size != 0:
+        pytest.skip("kv_len not divisible by page_size")
     head_dim_ckv = 512
     head_dim_kpe = 64
-    page_size = 1
     q_nope = torch.randn(
         batch_size * qo_len, num_heads, head_dim_ckv, dtype=torch.half, device="cuda"
     )
@@ -153,10 +165,18 @@ def test_batch_mla_page_attention(
         batch_size * qo_len, num_heads, head_dim_kpe, dtype=torch.half, device="cuda"
     )
     ckv = torch.randn(
-        batch_size * kv_len, 1, head_dim_ckv, dtype=torch.half, device="cuda"
+        batch_size * kv_len // page_size,
+        page_size,
+        head_dim_ckv,
+        dtype=torch.half,
+        device="cuda",
     )
     kpe = torch.randn(
-        batch_size * kv_len, 1, head_dim_kpe, dtype=torch.half, device="cuda"
+        batch_size * kv_len // page_size,
+        page_size,
+        head_dim_kpe,
+        dtype=torch.half,
+        device="cuda",
     )
     sm_scale = 1.0 / ((head_dim_ckv + head_dim_kpe) ** 0.5)
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
@@ -164,8 +184,8 @@ def test_batch_mla_page_attention(
         workspace_buffer, backend=backend
     )
     q_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
-    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len
-    kv_indices = torch.arange(0, batch_size * kv_len).to(0).int()
+    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len // page_size
+    kv_indices = torch.arange(0, batch_size * kv_len // page_size).to(0).int()
     kv_lens = torch.full((batch_size,), kv_len, dtype=torch.int32).to(0)
     wrapper.plan(
         q_indptr,
@@ -183,7 +203,11 @@ def test_batch_mla_page_attention(
     )
     o = wrapper.run(q_nope, q_pe, ckv, kpe)
 
-    k = torch.cat([ckv, kpe], dim=-1).repeat_interleave(num_heads, dim=1)
+    k = (
+        torch.cat([ckv, kpe], dim=-1)
+        .view(-1, 1, head_dim_ckv + head_dim_kpe)
+        .repeat_interleave(num_heads, dim=1)
+    )
     v = ckv.repeat_interleave(num_heads, dim=1)
 
     q = torch.cat([q_nope, q_pe], dim=-1)
@@ -197,4 +221,4 @@ if __name__ == "__main__":
     # test_single_prefill_with_kv_cache(54, 37, 4, 32, False, "fa2")
     # test_batch_prefill_with_ragged_kv_cache(12, 54, 37, 4, 4, False, "fa2")
     # test_batch_mla_page_attention(12, 54, 37, 128, False, "fa2")
-    test_batch_mla_page_attention(1, 33, 5, 127, False, "fa2")
+    test_batch_mla_page_attention(1, 33, 1, 1, False, 1, "fa2")
