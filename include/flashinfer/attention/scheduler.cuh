@@ -42,6 +42,13 @@ template <uint32_t num_stages_smem, uint32_t vec_size_ckv, uint32_t vec_size_kpe
           typename Params>
 __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params);
 
+template <uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, uint32_t QO_TILE_LEN, typename DTypeKV>
+std::tuple<uint32_t, uint32_t, uint32_t> LaunchSpecForDecodeKernelMlaCuteSM80(const uint32_t num_qo_heads);
+
+template <uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, uint32_t QO_TILE_LEN,
+      typename Params>
+__global__ void BatchDecodeWithPagedKVCacheKernelMlaCuteSM80(Params params);
+
 /*!
  * \brief Compute the maximum number of pages per batch and the new batch size
  *   after we partition Paged KV-Cache into multiple chunks on KV sequence length
@@ -260,6 +267,64 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA(
     return cudaSuccess;
   });
 }
+
+template <uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, uint32_t QO_TILE_LEN, typename AttentionVariant, typename Params>
+inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMlaCuteSM80(
+  bool& split_kv, uint32_t& max_grid_size, uint32_t& max_num_pages_per_batch,
+  uint32_t& new_batch_size, uint32_t& gdy_, uint32_t batch_size,
+  typename Params::IdType* kv_indptr_h, const uint32_t num_qo_heads, const uint32_t page_size,
+  bool enable_cuda_graph, cudaStream_t stream) {
+  using DTypeKV = typename Params::DTypeKV;
+  using IdType = typename Params::IdType;
+
+  auto [smem_size, gdy, k_warps] = LaunchSpecForDecodeKernelMlaCuteSM80<HEAD_DIM_CKV, HEAD_DIM_KPE, QO_TILE_LEN , DTypeKV>(num_qo_heads);
+  gdy_ = gdy;
+  const uint32_t num_threads = k_warps * 32;
+  auto kernel =
+    BatchDecodeWithPagedKVCacheKernelMlaCuteSM80<HEAD_DIM_CKV, HEAD_DIM_KPE, QO_TILE_LEN, Params>;
+  int num_blocks_per_sm = 1;
+  int num_sm = 0;
+  int dev_id = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
+
+  FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
+                                    num_threads, smem_size));
+  // fixme: num_blocks_per_sm is 0 derived from cudaOccupancyMaxActiveBlocksPerMultiprocessor at times, 
+  // and we fill smem with q-heads as many as possible, so num_blocks_per_sm should be 1
+  num_blocks_per_sm = 1;
+  
+  max_grid_size = num_blocks_per_sm * num_sm;
+  if (batch_size * gdy >= max_grid_size) {
+    split_kv = false;
+    max_num_pages_per_batch = 1;
+    for (uint32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+      max_num_pages_per_batch = std::max<uint32_t>(
+        max_num_pages_per_batch, kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx]);
+    }
+    new_batch_size = batch_size;
+  } 
+  else {
+    // compute max_num_pages_per_batch and new_batch_size
+    std::vector<IdType> num_pages(batch_size);
+    for (uint32_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+      num_pages[batch_idx] = kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx];
+    }
+    std::tie(max_num_pages_per_batch, new_batch_size) =
+      PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(max_grid_size, gdy, num_pages,
+                                                            std::max(128 / page_size, 1U));
+    if (new_batch_size == batch_size && !enable_cuda_graph) {
+      // do not use partition-kv kernel for short sequence, when not using CUDAGraph
+      split_kv = false;
+    } else {
+      // when using CUDAGraph, we always use partition-kv kernel
+      split_kv = true;
+    }
+  }
+  
+  return cudaSuccess;
+}
+
 
 /*!
  * \brief Partition Paged KV-Cache into multiple chunks on KV sequence length

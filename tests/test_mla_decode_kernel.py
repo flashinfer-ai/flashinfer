@@ -345,7 +345,10 @@ class DeepseekV2AttentionMatAbsorbDecode(nn.Module):
             workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(
                 dev_id
             )
-            wrapper = flashinfer.BatchDecodeMlaWithPagedKVCacheWrapper(workspace_buffer)
+            wrapper = flashinfer.BatchDecodeMlaWithPagedKVCacheWrapper(
+                workspace_buffer,
+                use_tensor_cores=True,
+            )
             wrapper.plan(
                 kv_indptr,
                 kv_indices,
