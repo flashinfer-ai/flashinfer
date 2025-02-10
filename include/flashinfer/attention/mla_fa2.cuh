@@ -46,8 +46,8 @@ struct SharedStorageQKVO {
       union {
         alignas(16) DTypeKV kpe[CTA_TILE_KV * HEAD_DIM_KPE];
         alignas(16) DTypeKV p[CTA_TILE_Q * HEAD_DIM_KPE];
-        alignas(16) float m_wg[2][CTA_TILE_Q];
-        alignas(16) float d_wg[2][CTA_TILE_Q];
+        alignas(16) float m_wg[2][CTA_TILE_Q];  // cross warpgroup synchronization
+        alignas(16) float d_wg[2][CTA_TILE_Q];  // cross warpgroup synchronization
       } aux_smem[NUM_STAGES];
     };
     alignas(16) DTypeO o_smem[CTA_TILE_Q * HEAD_DIM_CKV];
@@ -672,7 +672,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionKer
     normalize_d_<KTraits>(&smem_storage, 0 % NUM_STAGES, o_frag, m, d);
 
     write_o<KTraits>(&smem_storage, final_o + q_indptr * o_stride_n, final_lse, partial_o,
-                     partial_lse, o_frag, m, d, o_stride_n, o_stride_h, q_len, packed_qo_start,
+                     partial_lse, o_frag, m, d, o_stride_n, o_stride_h, q_len, qo_packed_idx_base,
                      num_heads);
 
     // #pragma unroll
