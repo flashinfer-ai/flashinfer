@@ -267,7 +267,7 @@ __device__ __forceinline__ void compute_qk_(smem_t<SWIZZLE_MODE_Q> q_smem, uint3
 template <typename KTraits>
 __device__ __forceinline__ void logits_mask_(const uint32_t qo_packed_idx_base,
                                              const uint32_t kv_idx_base, const uint32_t qo_len,
-                                             const uint32_t kv_len, const uint32_t chunk_end,
+                                             const uint32_t kv_len, const uint32_t kv_end,
                                              const uint_fastdiv num_heads,
                                              typename KTraits::DTypeQKAccum (*s_frag)[8]) {
   const uint32_t lane_idx = threadIdx.x, warpgroup_idx = threadIdx.z, warp_idx_in_wg = threadIdx.y;
@@ -287,8 +287,8 @@ __device__ __forceinline__ void logits_mask_(const uint32_t qo_packed_idx_base,
                      kv_idx = kv_idx_base + warpgroup_idx * (NUM_MMA_KV / 2) * 16 + mma_kv * 16 +
                               2 * (lane_idx % 4) + 8 * (reg_id / 4) + reg_id % 2;
       const bool mask =
-          (!(KTraits::CAUSAL ? (kv_idx + qo_len > kv_len + q_idx || (kv_idx >= chunk_end))
-                             : kv_idx >= chunk_end));
+          (!(KTraits::CAUSAL ? (kv_idx + qo_len > kv_len + q_idx || (kv_idx >= kv_end))
+                             : kv_idx >= kv_end));
       s_frag[mma_kv][reg_id] = (mask) ? s_frag[mma_kv][reg_id] : (KTraits::MaskFillValue);
     }
   }
@@ -359,7 +359,7 @@ __device__ __forceinline__ void store_p_smem(typename KTraits::SharedStorage* sm
                                              typename KTraits::DTypeQKAccum (*s_frag)[8],
                                              typename KTraits::DTypeQKAccum* d) {
   const uint32_t lane_idx = threadIdx.x, warpgroup_idx = threadIdx.z, warp_idx_in_wg = threadIdx.y;
-  typename KTraits::DTypeKV p_f16[KTraits::NUM_MMA_KV][8];
+  typename KTraits::DTypeKV p_f16[KTraits::NUM_MMA_KV / 2][8];
 #pragma unroll
   for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV / 2; ++mma_kv) {
     vec_cast<typename KTraits::DTypeKV, float>::cast<8>(p_f16[mma_kv], s_frag[mma_kv]);
@@ -466,9 +466,9 @@ __device__ __forceinline__ void normalize_d_(typename KTraits::SharedStorage* sm
   __syncthreads();
 #pragma unroll
   for (uint32_t j = 0; j < 2; ++j) {
-    d[j] = max(smem_storage->aux_smem[stage_idx]
-                   .d_wg[1 - warpgroup_idx][warp_idx_in_wg * 16 + j * 8 + lane_idx / 4],
-               d[j]);
+    d[j] = smem_storage->aux_smem[stage_idx]
+               .d_wg[1 - warpgroup_idx][warp_idx_in_wg * 16 + j * 8 + lane_idx / 4] +
+           d[j];
   }
 
   float d_rcp[2];
@@ -731,7 +731,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionKer
     }
 
     // normalize and write back
-    normalize_d_<KTraits>(&smem_storage, 0 % NUM_STAGES, o_frag, m, d);
+    normalize_d_<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, o_frag, m, d);
     write_o<KTraits>(&smem_storage, final_o + q_indptr * o_stride_n, final_lse, partial_o,
                      partial_lse, o_frag, m, d, o_stride_n, o_stride_h, q_len, qo_packed_idx_base,
                      num_heads);
