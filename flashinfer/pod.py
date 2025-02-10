@@ -245,7 +245,6 @@ class PODWithPagedKVCacheWrapper:
         float_workspace_buffer: torch.Tensor,
         kv_layout: str = "NHD",
         use_cuda_graph: bool = False,
-        use_tensor_cores: bool = False,
         paged_kv_indptr_buffer: Optional[torch.Tensor] = None,
         paged_kv_indices_buffer: Optional[torch.Tensor] = None,
         paged_kv_last_page_len_buffer: Optional[torch.Tensor] = None,
@@ -268,10 +267,6 @@ class PODWithPagedKVCacheWrapper:
             auxiliary data structures will be stored as the provided buffers. The ``batch_size``
             cannot change during the lifecycle of this wrapper when CUDAGraph is enabled.
 
-        use_tensor_cores : bool
-            Whether to use tensor cores for the computation. Will be faster for large group
-            size in grouped query attention. Defaults to ``False``.
-
         indptr_buffer : Optional[torch.Tensor]
             The user reserved buffer on GPU to store the indptr of the paged kv cache, the size
             of the buffer should be ``[batch_size + 1]``.
@@ -292,8 +287,9 @@ class PODWithPagedKVCacheWrapper:
             If provided, the wrapper will use the provided arguments to create the JIT module,
             otherwise, the wrapper will use default attention implementation.
         """
+        use_tensor_cores = False
         _check_kv_layout(kv_layout)
-
+        '''
         if jit_args is not None:
             if use_tensor_cores:
                 self._jit_module = get_batch_prefill_jit_module(
@@ -304,7 +300,8 @@ class PODWithPagedKVCacheWrapper:
                     jit_args[0], gen_customize_batch_decode_module(*jit_args)
                 )
         else:
-            self._jit_module = None
+        '''
+        self._jit_module = None
 
         self._kv_layout = kv_layout
         self._float_workspace_buffer = float_workspace_buffer
@@ -676,9 +673,7 @@ class PODWithPagedKVCacheWrapper:
         out_p = torch.empty_like(q_p)
 
         # Decode setup
-        
         k_cache_d, v_cache_d = _unpack_paged_kv_cache(paged_kv_cache_d, self._kv_layout)
-        print(k_cache_d.shape, paged_kv_cache_d.shape, self._kv_layout)
         _check_cached_qkv_data_type(
             q_d, k_cache_d, self._cached_q_data_type, self._cached_kv_data_type
         )
