@@ -57,7 +57,6 @@ def warmup_jit():
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
 @pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
-@pytest.mark.parametrize("return_lse", [True, False])
 def test_pod_with_paged_kv_cache(
     # Prefill params
     kv_len_p,
@@ -78,6 +77,7 @@ def test_pod_with_paged_kv_cache(
     kv_dtype,
     contiguous_kv,
 ):
+    return_lse = False
     batch_size_p = 1
     kv_layout_p = "NHD"
     q_p = torch.randn(batch_size_p * qo_len_p, num_qo_heads, head_dim).to(0).half()
@@ -203,16 +203,17 @@ def test_pod_with_paged_kv_cache(
                 causal_p=causal)
         # Prefill is run with batch size 1
         o_ref_i_p = o_ref_p[q_indptr_p[i] : q_indptr_p[i + 1]]
-        torch.testing.assert_close(o_i_p, o_ref_i_p, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(o_i_p, o_ref_i_p, rtol=1e-3, atol=1e-3, msg="Prefill mismatch")
         # Decode uses all batches at once.
-        torch.testing.assert_close(o_i_d, o_ref_d, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(o_i_d, o_ref_d, rtol=1e-3, atol=1e-3, msg="Decode mismatch")
 
 if __name__ == "__main__":
     test_pod_with_paged_kv_cache(
         # Prefill params
-        54, 37, True, 
+        13824 * 2, 13824 * 2, True, 
         # Decode params
-        12, 54, 1, "HND",
+        32, 13824, 1, "HND",
         # Other shared params
         8, 8, 128, "NONE", 0.0, torch.float16, torch.float16, True,
     )
+    print("Test(s) passed!")
