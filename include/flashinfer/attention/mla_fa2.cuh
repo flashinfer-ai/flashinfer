@@ -306,7 +306,6 @@ __device__ __forceinline__ void update_mdo_states_(typename KTraits::SharedStora
   const float sm_scale = variant.sm_scale_log2;
   const uint32_t warpgroup_idx = threadIdx.z, lane_idx = threadIdx.x, warp_idx_in_wg = threadIdx.y;
   float m_prev[2];
-  __syncthreads();
 #pragma unroll
   for (uint32_t j = 0; j < 2; ++j) {
     m_prev[j] = m[j];
