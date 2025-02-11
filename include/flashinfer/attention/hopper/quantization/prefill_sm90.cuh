@@ -26,11 +26,11 @@
 #include "../../mask.cuh"
 #include "../epilogue.cuh"
 #include "../kernel_traits.cuh"
-#include "../mainloop.cuh"
 #include "../sparse_mainloop.cuh"
 #include "../tile_scheduler.cuh"
 #include "../utils.cuh"
 #include "kernel_traits.cuh"
+#include "mainloop_load.cuh"
 #include "mainloop_mma.cuh"
 
 namespace flashinfer {
@@ -194,7 +194,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       auto block_coord = work_tile_info.get_block_coord(scheduler_params);
       auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len] =
           block_coord;
-      
+
       AttentionUpdater attention_updater(mainloop_params, block_coord);
       AttentionVariant variant(mainloop_params, block_coord);
 
@@ -241,7 +241,7 @@ cudaError_t SingleFP8PrefillWithKVCacheKernelTraitsDispatched(Params& params, cu
   using TileShape_QKD = typename KernelTraits::TileShape_QKD;
 
   using CollectiveMainloop =
-      CollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL>;
+      FP8CollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL>;
   using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
   using Scheduler = SingleTileScheduler;
   typename CollectiveMainloop::Params mainloop_params = CollectiveMainloop::to_underlying_arguments(
