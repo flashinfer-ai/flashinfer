@@ -100,6 +100,28 @@ class BatchMLAPageAttentionWrapper:
                 get_cuda_stream(device),
             )
 
+    @overload
+    def run(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        ckv_cache: torch.Tensor,
+        kpe_cache: torch.Tensor,
+        return_lse: Literal[False] = False,
+    ) -> torch.Tensor:
+        ...
+    
+    @overload
+    def run(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        ckv_cache: torch.Tensor,
+        kpe_cache: torch.Tensor,
+        return_lse: Literal[True] = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        ...
+
     def run(
         self,
         q_nope: torch.Tensor,
