@@ -55,7 +55,7 @@ using namespace cute;
   using LayoutQnope = Layout< Shape< Int<QO_TILE_LEN>, Int<HEAD_DIM_CKV>>, Stride<Int<HEAD_DIM_CKV>, _1>>;
   using LayoutQpe = Layout< Shape< Int<QO_TILE_LEN>, Int<HEAD_DIM_KPE>>, Stride<Int<HEAD_DIM_KPE>, _1>>;
 
-  using LayoutAtt = Layout< Shape< Int<QO_TILE_LEN>, Int<k_kv_tile_len>>, Stride<Int<k_kv_tile_len>, _1>>;
+  using LayoutAtt = Layout< Shape< Int<QO_TILE_LEN>, Int<k_kv_tile_len>>, Stride<Int<k_kv_tile_len + 2>, _1>>;
 
   using LayoutOScaleVec = Layout<Shape<Int<QO_TILE_LEN>>>;
 
@@ -104,11 +104,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMlaCuteSM80(Params params) {
   DTypeKV* output_ptr = params.o;
   float* lse = params.lse;
   const auto& paged_kv = params.paged_kv;
-  // const IdType* q_rope_offset = params.q_rope_offset;
   const bool* block_valid_mask = params.block_valid_mask;
   const uint32_t num_qo_heads = params.num_qo_heads;
-  // const float rope_rcp_scale = params.rope_rcp_scale;
-  // const float rope_rcp_theta = params.rope_rcp_theta;
   const bool partition_kv = params.partition_kv;
 
   const uint32_t batch_idx = blockIdx.x;
@@ -120,8 +117,6 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMlaCuteSM80(Params params) {
   const uint32_t mapped_batch_idx = params.request_indices[batch_idx];
 
   const uint32_t orig_seq_len = paged_kv.get_length(mapped_batch_idx);
-  // int32_t q_rope_offset_val =
-  //   q_rope_offset == nullptr ? (orig_seq_len - 1) : q_rope_offset[mapped_batch_idx];
 
   const uint32_t kv_chunk_idx_in_orig_mapped_batch = params.kv_tile_indices[batch_idx];
   const uint32_t kv_chunk_size = *(params.kv_chunk_size_ptr);
@@ -147,7 +142,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMlaCuteSM80(Params params) {
   using LayoutQnope = Layout< Shape< Int<QO_TILE_LEN>, Int<HEAD_DIM_CKV>>, Stride<Int<HEAD_DIM_CKV>, _1>>;
   using LayoutQpe = Layout< Shape< Int<QO_TILE_LEN>, Int<HEAD_DIM_KPE>>, Stride<Int<HEAD_DIM_KPE>, _1>>;
 
-  using LayoutAtt = Layout< Shape< Int<QO_TILE_LEN>, Int<k_kv_tile_len>>, Stride<Int<k_kv_tile_len>, _1>>;
+  using LayoutAtt = Layout< Shape< Int<QO_TILE_LEN>, Int<k_kv_tile_len>>, Stride<Int<k_kv_tile_len + 2>, _1>>;
 
   using LayoutOScaleVec = Layout<Shape<Int<QO_TILE_LEN>>>;
 
@@ -230,7 +225,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMlaCuteSM80(Params params) {
 
   constexpr uint32_t k_mma_att_tile_k = 16;
   using TiledMmaAtt = decltype(make_tiled_mma(MMA_Atom<MMA_Traits<SM80_16x8x16_F32F16F16F32_TN>>{}, 
-                make_layout(Shape<Int<k_warps>, _1, _1>{}, LayoutRight{})// , Tile<_32, _8, _16>{}
+                make_layout(Shape<Int<k_warps>, _1, _1>{}, LayoutRight{})
                 ) );             
   TiledMmaAtt tiled_mma_att;
   auto thr_mma = tiled_mma_att.get_slice(tx);
@@ -263,7 +258,6 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMlaCuteSM80(Params params) {
 
   Tensor smem_kpe_tiles_part = s2r_thr_copy_b.partition_S(smem_kpe_local_tiles);
   Tensor reg_kpe_tile_part_view = s2r_thr_copy_b.retile_D(reg_kpe_tile_part);
-
 
   Tensor smem_att_part_c = thr_mma.partition_C(smem_att);
   Tensor reg_att_part_c = make_fragment_like(smem_att_part_c);
@@ -346,10 +340,6 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMlaCuteSM80(Params params) {
     cp_async::wait_group<1 * k_smem_stages - 1>();
     block.sync();
 
-    // const int32_t kv_idx_base =
-    //   (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[mapped_batch_idx]) +
-    //   cur_chunk_start + iter * k_kv_tile_len;
-
     clear(reg_att_part_c);
 #pragma unroll
     for (int k_tile=0; k_tile < size<3>(smem_q_nope_tiles_part); ++k_tile) {
@@ -405,6 +395,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMlaCuteSM80(Params params) {
 #pragma unroll
     for (int i=0; i<cute::size(reg_output_part); ++i)
         reg_output_part(i) = reg_output_part(i) * o_scale_mat_part(i);
+    
     cute::copy(smem_att_part_a, reg_att_part_a);
     cute::copy(s2r_tiled_copy_b_ckv, smem_v_part(_, _, _, stage_idx), reg_v_part_view);
     cute::gemm(tiled_mma_output, reg_output_part, reg_att_part_a, reg_v_part, reg_output_part);
@@ -505,10 +496,6 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatchedMlaCuteSM80(Params params, type
   
   return cudaSuccess;
 }
-
-
-
-
 
 }  // namespace flashinfer
 
