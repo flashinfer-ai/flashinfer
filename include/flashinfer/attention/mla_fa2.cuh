@@ -642,7 +642,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionKer
     const uint32_t kv_end = params.kv_end[work_idx];
 
     const uint32_t qo_packed_idx_base = packed_qo_start + blockIdx.x * KTraits::CTA_TILE_Q;
-    const uint32_t qo_upperbound = min(q_len, (qo_packed_idx_base + cluster_tile_q) / num_heads);
+    const uint32_t qo_upperbound =
+        min(q_len, ceil_div(qo_packed_idx_base + KTraits::CTA_TILE_Q, num_heads));
 
     init_states_<KTraits>(o_frag, m, d);
 
