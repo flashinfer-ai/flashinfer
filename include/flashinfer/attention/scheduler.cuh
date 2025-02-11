@@ -214,7 +214,7 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA(
     constexpr uint32_t qo_heads_per_block = bdy * tile_size_qo_heads;
     constexpr uint32_t num_threads = std::max(128U, bdx * bdy);
     constexpr uint32_t bdz = num_threads / (bdx * bdy);
-    const uint32_t gdy = ceil_div(num_qo_heads, qo_heads_per_block);
+    gdy = ceil_div(num_qo_heads, qo_heads_per_block);
 
     const uint32_t smem_size =
         NUM_STAGES_SMEM * bdy * bdz * (HEAD_DIM_CKV + HEAD_DIM_KPE) * sizeof(DTypeKV) +
