@@ -57,7 +57,7 @@ class BatchMLAPageAttentionWrapper:
         kv_indptr: torch.Tensor,
         kv_indices: torch.Tensor,
         kv_len_arr: torch.Tensor,
-        num_heads: torch.Tensor,
+        num_heads: int,
         head_dim_ckv: int,
         head_dim_kpe: int,
         page_size: int,
@@ -108,9 +108,8 @@ class BatchMLAPageAttentionWrapper:
         ckv_cache: torch.Tensor,
         kpe_cache: torch.Tensor,
         return_lse: Literal[False] = False,
-    ) -> torch.Tensor:
-        ...
-    
+    ) -> torch.Tensor: ...
+
     @overload
     def run(
         self,
@@ -119,8 +118,7 @@ class BatchMLAPageAttentionWrapper:
         ckv_cache: torch.Tensor,
         kpe_cache: torch.Tensor,
         return_lse: Literal[True] = True,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        ...
+    ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     def run(
         self,
