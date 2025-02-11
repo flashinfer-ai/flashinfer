@@ -36,17 +36,16 @@ namespace flashinfer {
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODING_MODE,
           bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename PrefillAttentionVariant,
           typename DecodeAttentionVariant, typename PrefillParams, typename DecodeParams>
-cudaError_t PODWithKVCacheDispatched(PrefillParams prefill_params, 
+cudaError_t PODWithKVCacheNoTensorDispatched(PrefillParams prefill_params, 
                                      typename PrefillParams::DTypeO* tmp,
                                      DecodeParams decode_params,
                                      typename DecodeParams::DTypeO* tmp_v,
                                      float *tmp_s, cudaStream_t stream);
-
 }  // namespace flashinfer
 
 using namespace flashinfer;
 
-void pod_with_kv_cache(
+void pod_with_kv_cache_no_tensor(
                       // Prefill params
                       at::Tensor q_p, at::Tensor k_p, at::Tensor v_p, at::Tensor tmp_p,
                       at::Tensor o_p, std::optional<at::Tensor> maybe_lse_p,
@@ -104,7 +103,7 @@ void pod_with_kv_cache(
   int64_t batch_size_d = q_d.size(0);
   int64_t num_qo_heads_d = q_d.size(1);
   TORCH_CHECK(num_qo_heads == num_qo_heads_d,
-              "POD currently supports same # Query heads for prefill and decode");
+              "POD currently requires same # Query heads for prefill and decode");
 
   int64_t num_kv_heads_d, page_size;
 
@@ -117,15 +116,15 @@ void pod_with_kv_cache(
   }
 
   TORCH_CHECK(num_kv_heads == num_kv_heads_d,
-    "POD currently supports same # KV heads for prefill and decode; Prefill: ", 
+    "POD currently requires same # KV heads for prefill and decode; Prefill: ", 
     num_kv_heads, ", Decode: ", num_kv_heads_d);
   uint32_t head_dim_qk_d = q_d.size(2);
   TORCH_CHECK(head_dim_qk == head_dim_qk_d,
-    "POD currently supports same head dim for prefill and decode");
+    "POD currently requires same head dim for prefill and decode");
   uint32_t head_dim_vo_d = paged_v_cache_d.size(3);
 
   TORCH_CHECK(head_dim_qk_d == head_dim_vo_d,
-              "CUDA cores template only supports equal head dim for QK and VO, please use tensor "
+              "CUDA cores template only requires equal head dim for QK and VO, please use tensor "
               "cores template for different head dim");
 
   if (maybe_lse_d) {
@@ -205,7 +204,6 @@ void pod_with_kv_cache(
                 DecodeParams decode_params;
                 DTypeO* tmp_v = nullptr;
                 float* tmp_s = nullptr;
-                // TODO: Decode params here
                 {
                   paged_kv_t<DTypeKV, IdType> paged_kv(
                     num_kv_heads, page_size, HEAD_DIM_QK, batch_size_d, kv_layout_d,
@@ -262,7 +260,7 @@ void pod_with_kv_cache(
                 using DecodeAttentionVariant =
                     DefaultAttention</*use_custom_mask=*/false, USE_SLIDING_WINDOW_D,
                                 USE_LOGITS_SOFT_CAP, /*use_alibi_bias=*/false>;
-                cudaError_t status = flashinfer::PODWithKVCacheDispatched<
+                cudaError_t status = flashinfer::PODWithKVCacheNoTensorDispatched<
                     HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
                     /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, 
                     PrefillAttentionVariant, DecodeAttentionVariant>(

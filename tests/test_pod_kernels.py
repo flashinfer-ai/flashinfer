@@ -67,6 +67,7 @@ def test_pod_with_paged_kv_cache(
     kv_len_d,
     page_size_d,
     kv_layout_d,
+    use_tensor,
     # Shared params
     num_kv_heads,
     num_qo_heads,
@@ -140,7 +141,7 @@ def test_pod_with_paged_kv_cache(
 
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
     wrapper = flashinfer.PODWithPagedKVCacheWrapper(
-        workspace_buffer, kv_layout_d
+        workspace_buffer, kv_layout_d, use_tensor_cores=use_tensor,
     )
     wrapper.plan(
         kv_indptr_d,
@@ -159,7 +160,7 @@ def test_pod_with_paged_kv_cache(
     # Generate decode reference output
     new_workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
     decode_wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
-        new_workspace_buffer, kv_layout_d
+        new_workspace_buffer, kv_layout_d, use_tensor_cores = True
     )
     decode_wrapper.plan(
         kv_indptr_d,
@@ -210,10 +211,51 @@ def test_pod_with_paged_kv_cache(
 if __name__ == "__main__":
     test_pod_with_paged_kv_cache(
         # Prefill params
-        13824 * 2, 13824 * 2, True, 
+        12288, 1024, True, 
         # Decode params
-        32, 13824, 1, "HND",
+        80, 12288, 16, "NHD", False,
         # Other shared params
-        8, 8, 128, "NONE", 0.0, torch.float16, torch.float16, True,
+        4, 16, 128, "NONE", 0.0, torch.float16, torch.float16, True,
     )
-    print("Test(s) passed!")
+    test_pod_with_paged_kv_cache(
+        # Prefill params
+        12288, 12288, True, 
+        # Decode params
+        220, 12288, 16, "NHD", False,
+        # Other shared params
+        4, 16, 128, "NONE", 0.0, torch.float16, torch.float16, True,
+    )
+    test_pod_with_paged_kv_cache(
+        # Prefill params
+        16384, 16384, True, 
+        # Decode params
+        250, 12288, 16, "NHD", False,
+        # Other shared params
+        4, 16, 128, "NONE", 0.0, torch.float16, torch.float16, True,
+    )
+    print("No tensor test(s) passed!")
+    test_pod_with_paged_kv_cache(
+        # Prefill params
+        12288, 1024, True, 
+        # Decode params
+        80, 12288, 16, "NHD", True,
+        # Other shared params
+        4, 16, 128, "NONE", 0.0, torch.float16, torch.float16, True,
+    )
+    test_pod_with_paged_kv_cache(
+        # Prefill params
+        12288, 12288, True, 
+        # Decode params
+        220, 12288, 16, "NHD", True,
+        # Other shared params
+        4, 16, 128, "NONE", 0.0, torch.float16, torch.float16, True,
+    )
+    test_pod_with_paged_kv_cache(
+        # Prefill params
+        16384, 16384, True, 
+        # Decode params
+        250, 12288, 16, "NHD", True,
+        # Other shared params
+        4, 16, 128, "NONE", 0.0, torch.float16, torch.float16, True,
+    )
+    print("Tensor test(s) passed!")

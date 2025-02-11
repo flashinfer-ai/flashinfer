@@ -126,7 +126,7 @@ void BatchPrefillWithPagedKVCacheRun(
     int64_t window_left BATCH_PREFILL_ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
 
 //========== pod-attention =========
-void pod_with_kv_cache(
+void pod_with_kv_cache_no_tensor(
     // Prefill params
     at::Tensor q_p, at::Tensor k_p, at::Tensor v_p, at::Tensor tmp_p,
     at::Tensor o_p, std::optional<at::Tensor> maybe_lse_p,
@@ -143,7 +143,24 @@ void pod_with_kv_cache(
     float sm_scale_d, float rope_rcp_scale_d, float rope_rcp_theta_d,
     // Shared params
     int64_t cuda_stream);
-
+void pod_with_kv_cache_tensor(
+    // Prefill params
+    at::Tensor q_p, at::Tensor k_p, at::Tensor v_p, at::Tensor tmp_p,
+    at::Tensor o_p, std::optional<at::Tensor> maybe_lse_p,
+    unsigned int mask_mode_code_p, unsigned int layout_p, int32_t window_left_p,
+    std::optional<at::Tensor> maybe_custom_mask_p, std::optional<at::Tensor> maybe_alibi_slopes_p, 
+    float logits_soft_cap_p, float sm_scale_p, float rope_rcp_scale_p, float rope_rcp_theta_p,
+    // Decode params
+    at::Tensor float_workspace_buffer_d, at::Tensor int_workspace_buffer_d,
+    std::vector<int64_t> plan_info_vec, at::Tensor q_d, at::Tensor paged_k_cache_d,
+    at::Tensor paged_v_cache_d, at::Tensor qo_indptr_d, at::Tensor paged_kv_indptr_d,
+    at::Tensor paged_kv_indices_d, at::Tensor paged_kv_last_page_len_d, at::Tensor o_d,
+    std::optional<at::Tensor> maybe_lse_d, unsigned int mask_mode_code_d, unsigned int layout_d,
+    int32_t window_left, std::optional<at::Tensor> maybe_custom_mask_d, 
+    std::optional<at::Tensor> maybe_mask_indptr_d, std::optional<at::Tensor> maybe_alibi_slopes_d, 
+    float logits_soft_cap_d, float sm_scale_d, float rope_rcp_scale_d, float rope_rcp_theta_d,
+    // Shared params
+    int64_t cuda_stream);
 //========== quantization ==========
 
 void packbits(at::Tensor x, const std::string& bitorder, at::Tensor y, int64_t cuda_stream);
@@ -273,7 +290,9 @@ TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("batch_prefill_with_paged_kv_cache_run", BatchPrefillWithPagedKVCacheRun);
 
   // pod
-  m.def("pod_with_kv_cache", &pod_with_kv_cache,
+  m.def("pod_with_kv_cache_no_tensor", &pod_with_kv_cache_no_tensor,
+        "Hybrid batch POD-Attention with KV-Cache operator");
+  m.def("pod_with_kv_cache_tensor", &pod_with_kv_cache_tensor,
         "Hybrid batch POD-Attention with KV-Cache operator");
 
   // quantization

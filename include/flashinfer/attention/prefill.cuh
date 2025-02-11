@@ -1885,8 +1885,10 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
 }
 
 template <typename KTraits, typename Params>
-__global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVCacheKernel(
-    const __grid_constant__ Params params) {
+__device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
+    const Params params, uint8_t smem[],
+    const dim3 tid = threadIdx, const uint32_t bx = blockIdx.x, 
+    const uint32_t kv_head_idx = blockIdx.z, const uint32_t num_kv_heads = gridDim.z) {
   using DTypeQ = typename Params::DTypeQ;
 #if (__CUDA_ARCH__ < 800)
   if constexpr (std::is_same_v<DTypeQ, nv_bfloat16>) {
@@ -1936,15 +1938,14 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVC
     auto block = cg::this_thread_block();
     const uint32_t kv_chunk_size = *(params.kv_chunk_size_ptr);
 
-    const uint32_t bx = blockIdx.x, lane_idx = threadIdx.x, kv_head_idx = blockIdx.z,
-                   warp_idx = get_warp_idx<KTraits>(threadIdx.y, threadIdx.z);
+    const uint32_t lane_idx = tid.x, warp_idx = get_warp_idx<KTraits>(tid.y, tid.z);
     if (block_valid_mask && !block_valid_mask[bx]) {
       return;
     }
-    const uint32_t num_kv_heads = gridDim.z, num_qo_heads = num_kv_heads * group_size;
+    const uint32_t num_qo_heads = num_kv_heads * group_size;
+
     const uint32_t request_idx = request_indices[bx], qo_tile_idx = qo_tile_indices[bx],
                    kv_tile_idx = kv_tile_indices[bx];
-    extern __shared__ uint8_t smem[];
     auto& smem_storage = reinterpret_cast<typename KTraits::SharedStorage&>(smem);
     AttentionVariant variant(params, /*batch_idx=*/request_idx, smem);
     const uint32_t qo_len = variant.qo_len, kv_len = variant.kv_len,
@@ -1972,7 +1973,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVC
     init_states<KTraits>(variant, o_frag, m, d);
 
     const uint32_t qo_packed_idx_base =
-        (qo_tile_idx * NUM_WARPS_Q + get_warp_idx_q<KTraits>(threadIdx.y)) * NUM_MMA_Q * 16;
+        (qo_tile_idx * NUM_WARPS_Q + get_warp_idx_q<KTraits>(tid.y)) * NUM_MMA_Q * 16;
     const uint32_t q_stride_n = params.q_stride_n, q_stride_h = params.q_stride_h;
     constexpr SwizzleMode swizzle_mode_q = SwizzleMode::k128B;
     smem_t<SWIZZLE_MODE_Q> qo_smem(smem_storage.q_smem);
@@ -1981,13 +1982,13 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVC
         q + q_indptr[request_idx] * q_stride_n + (kv_head_idx * group_size) * q_stride_h;
     DTypeO* o_ptr_base = partition_kv ? o + (o_indptr[request_idx] + kv_tile_idx) * o_stride_n +
                                             (kv_head_idx * group_size) * o_stride_h
-                                      : o + o_indptr[request_idx] * o_stride_n +
+                                      : o + o_indptr[request_idx] * o_stride_n + 
                                             (kv_head_idx * group_size) * o_stride_h;
     uint32_t q_smem_offset_r = qo_smem.get_permuted_offset<UPCAST_STRIDE_Q>(
-        get_warp_idx_q<KTraits>(threadIdx.y) * NUM_MMA_Q * 16 + lane_idx % 16, lane_idx / 16);
+        get_warp_idx_q<KTraits>(tid.y) * NUM_MMA_Q * 16 + lane_idx % 16, lane_idx / 16);
 
     load_q_global_smem<KTraits>(qo_packed_idx_base, qo_upper_bound, q_ptr_base, q_stride_n, 
-                                q_stride_h, group_size, &qo_smem, threadIdx);
+                                q_stride_h, group_size, &qo_smem, tid);
 
     cp_async::commit_group();
 
@@ -2013,11 +2014,11 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVC
     size_t thr_local_kv_offset[NUM_MMA_KV * KV_THR_LAYOUT_COL / 2 / NUM_WARPS_Q];
 
     uint32_t k_smem_offset_r = k_smem.template get_permuted_offset<UPCAST_STRIDE_K>(
-                 get_warp_idx_kv<KTraits>(threadIdx.z) * NUM_MMA_KV * 16 +
+                 get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 +
                      8 * (lane_idx / 16) + lane_idx % 8,
                  (lane_idx % 16) / 8),
              v_smem_offset_r = v_smem.template get_permuted_offset<UPCAST_STRIDE_V>(
-                 get_warp_idx_kv<KTraits>(threadIdx.z) * NUM_MMA_KV * 16 + lane_idx % 16,
+                 get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + lane_idx % 16,
                  lane_idx / 16),
              k_smem_offset_w = k_smem.template get_permuted_offset<UPCAST_STRIDE_K>(
                  warp_idx * KV_THR_LAYOUT_ROW + lane_idx / KV_THR_LAYOUT_COL, 
@@ -2041,11 +2042,11 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVC
           page_iter, kv_head_idx, entry_idx,
           (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>(), last_indptr);
     }
-    page_produce_kv<false, KTraits>(k_smem, &k_smem_offset_w, paged_kv, 0, thr_local_kv_offset, 
-                                    chunk_size, threadIdx);
+    page_produce_kv<false, KTraits>(k_smem, &k_smem_offset_w, paged_kv, 0, thr_local_kv_offset,
+                                    chunk_size, tid);
     cp_async::commit_group();
     page_produce_kv<true, KTraits>(v_smem, &v_smem_offset_w, paged_kv, 0, thr_local_kv_offset,
-                                   chunk_size, threadIdx);
+                                   chunk_size, tid);
     cp_async::commit_group();
 
     const uint32_t num_iterations = ceil_div(
@@ -2100,15 +2101,15 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVC
 
       logits_transform<KTraits>(
           params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-          chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(threadIdx.z)) * NUM_MMA_KV * 16,
-          qo_len, kv_len, group_size, s_frag, threadIdx);
+          chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
+          qo_len, kv_len, group_size, s_frag, tid);
 
       // apply mask
       if (MASK_MODE == MaskMode::kCustom || (iter >= mask_iteration || iter < window_iteration)) {
         logits_mask<KTraits>(
             params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
-            chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(threadIdx.z)) * NUM_MMA_KV * 16,
-            qo_len, kv_len, chunk_end, group_size, s_frag, threadIdx);
+            chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16,
+            qo_len, kv_len, chunk_end, group_size, s_frag, kv_head_idx, tid);
       }
 
       // compute m,d states in online softmax
@@ -2116,7 +2117,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVC
 
       block.sync();
       page_produce_kv<false, KTraits>(k_smem, &k_smem_offset_w, paged_kv, (iter + 1) * CTA_TILE_KV,
-                                      thr_local_kv_offset, chunk_size, threadIdx);
+                                      thr_local_kv_offset, chunk_size, tid);
       cp_async::commit_group();
       cp_async::wait_group<1>();
       block.sync();
@@ -2126,7 +2127,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVC
 
       block.sync();
       page_produce_kv<true, KTraits>(v_smem, &v_smem_offset_w, paged_kv, (iter + 1) * CTA_TILE_KV,
-                                     thr_local_kv_offset, chunk_size, threadIdx);
+                                     thr_local_kv_offset, chunk_size, tid);
       cp_async::commit_group();
     }
     cp_async::wait_group<0>();
@@ -2135,7 +2136,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVC
     finalize_m<KTraits>(variant, m);
 
     // threadblock synchronization
-    threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, threadIdx);
+    threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
 
     // normalize d
     normalize_d<KTraits>(o_frag, m, d);
@@ -2146,12 +2147,12 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVC
     write_o_reg_gmem<KTraits>(o_frag, &qo_smem, o_ptr_base, qo_packed_idx_base, qo_len,
                               /*o_stride_n=*/
                               partition_kv ? num_kv_chunks * o_stride_n : o_stride_n,
-                              /*o_stride_h=*/o_stride_h, group_size, threadIdx);
+                              /*o_stride_h=*/o_stride_h, group_size, tid);
 
     // write lse
     if constexpr (variant.use_softmax) {
       if (lse != nullptr) {
-        if (get_warp_idx_kv<KTraits>(threadIdx.z) == 0) {
+        if (get_warp_idx_kv<KTraits>(tid.z) == 0) {
 #pragma unroll
           for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
 #pragma unroll
@@ -2178,6 +2179,14 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVC
 #if (__CUDA_ARCH__ < 800)
   }
 #endif
+}
+
+template <typename KTraits, typename Params>
+__global__
+__launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVCacheKernel(
+    const __grid_constant__ Params params) {
+  extern __shared__ uint8_t smem[];
+  BatchPrefillWithPagedKVCacheDevice<KTraits, Params> (params, smem);
 }
 
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
