@@ -138,4 +138,4 @@ class BatchMLAPageAttentionWrapper:
                 get_cuda_stream(device),
             )
 
-        return tuple(o, maybe_lse) if return_lse else o
+        return o, maybe_lse if return_lse else o

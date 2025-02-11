@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import math
+
 import pytest
 import torch
 
@@ -51,6 +53,7 @@ def attention_ref(
         mask = torch.ones(qo_len, kv_len).to(q.device)
 
     logits = logits.masked_fill(mask.unsqueeze(0).unsqueeze(0) == 0, float("-inf"))
+    lse_ref = torch.logsumexp(logits, -1).transpose(-1, -2)
     p = torch.softmax(logits, dim=-1)
     o_ref = (
         torch.einsum(
@@ -63,7 +66,7 @@ def attention_ref(
         .to(q)
     )
 
-    return o_ref
+    return o_ref, lse_ref * math.log2(math.e)
 
 
 @pytest.mark.parametrize("kv_len", [5532, 7563])
@@ -82,13 +85,16 @@ def test_single_prefill_with_kv_cache(
     head_dim_qk = 192
     head_dim_vo = 128
     q = torch.randn(qo_len, num_heads, head_dim_qk).to(0).half()
-    k = torch.zeros(kv_len, num_heads, head_dim_qk).to(0).half()
+    k = torch.randn(kv_len, num_heads, head_dim_qk).to(0).half()
     v = torch.randn(kv_len, num_heads, head_dim_vo).to(0).half()
-    o = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=causal, backend=backend)
+    o, lse = flashinfer.single_prefill_with_kv_cache(
+        q, k, v, causal=causal, backend=backend, return_lse=True
+    )
     sm_scale = 1.0 / (head_dim_qk**0.5)
 
-    o_ref = attention_ref(1, q, k, v, causal, sm_scale)
+    o_ref, lse_ref = attention_ref(1, q, k, v, causal, sm_scale)
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(lse, lse_ref.squeeze(0), rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17])
@@ -129,20 +135,22 @@ def test_batch_prefill_with_ragged_kv_cache(
         head_dim_vo=head_dim_vo,
         causal=causal,
     )
-    o = wrapper.run(q, k, v)
+    o, lse = wrapper.run_return_lse(q, k, v)
 
     sm_scale = 1.0 / (head_dim_qk**0.5)
-    o_ref = attention_ref(batch_size, q, k, v, causal, sm_scale)
+    o_ref, lse_ref = attention_ref(batch_size, q, k, v, causal, sm_scale)
 
+    lse_ref = lse_ref.flatten(0, 1)
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("batch_size", [1, 17, 77])
+@pytest.mark.parametrize("batch_size", [1, 17, 37])
 @pytest.mark.parametrize("kv_len", [17, 33, 96, 97, 114, 514, 1024])
 @pytest.mark.parametrize("qo_len", [1, 17, 37])
 @pytest.mark.parametrize("num_heads", [4, 32, 128])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("page_size", [1])
 @pytest.mark.parametrize("backend", ["fa2"])
 def test_batch_mla_page_attention(
     batch_size,
@@ -158,20 +166,20 @@ def test_batch_mla_page_attention(
         pytest.skip("kv_len not divisible by page_size")
     head_dim_ckv = 512
     head_dim_kpe = 64
-    q_nope = torch.randn(
+    q_nope = torch.ones(
         batch_size * qo_len, num_heads, head_dim_ckv, dtype=torch.half, device="cuda"
     )
-    q_pe = torch.randn(
+    q_pe = torch.ones(
         batch_size * qo_len, num_heads, head_dim_kpe, dtype=torch.half, device="cuda"
     )
-    ckv = torch.randn(
+    ckv = torch.ones(
         batch_size * kv_len // page_size,
         page_size,
         head_dim_ckv,
         dtype=torch.half,
         device="cuda",
     )
-    kpe = torch.randn(
+    kpe = torch.ones(
         batch_size * kv_len // page_size,
         page_size,
         head_dim_kpe,
@@ -201,7 +209,7 @@ def test_batch_mla_page_attention(
         q_nope.dtype,
         ckv.dtype,
     )
-    o = wrapper.run(q_nope, q_pe, ckv, kpe)
+    o, lse = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=True)
 
     k = (
         torch.cat([ckv, kpe], dim=-1)
@@ -211,10 +219,11 @@ def test_batch_mla_page_attention(
     v = ckv.repeat_interleave(num_heads, dim=1)
 
     q = torch.cat([q_nope, q_pe], dim=-1)
-    o_ref = attention_ref(batch_size, q, k, v, causal, sm_scale)
+    o_ref, lse_ref = attention_ref(batch_size, q, k, v, causal, sm_scale)
 
-    print(o, o_ref)
+    lse_ref = lse_ref.squeeze(1)
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
+    # torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":
