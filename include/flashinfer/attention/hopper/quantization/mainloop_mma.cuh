@@ -34,8 +34,10 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
   static constexpr int NUM_MMA_THREADS = Ktraits::NUM_MMA_THREADS;
   using SmemLayoutQ = typename Ktraits::SmemLayoutQ;
   using SmemLayoutK = typename Ktraits::SmemLayoutK;
-  using SmemLayoutV = typename Ktraits::SmemLayoutV;
-  using SmemLayoutVt = typename Ktraits::SmemLayoutVt;
+  // HACK: V is head_dim major while MMA needs seq_len major
+  // We directly change the layout. however, a transpose op is needed
+  using SmemLayoutV = typename Ktraits::CSmemLayoutV;
+  using SmemLayoutVt = typename Ktraits::CSmemLayoutVt;
   static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
 
   static constexpr int CTA_Q = get<0>(TileShape_QKD{});
@@ -120,8 +122,13 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
   }
 
   attention_updater.update</*init=*/true>(tSrS);
-  Tensor tOrP = make_tensor(convert_type<DTypeKV>(tSrS).data(),
-                            convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout()));
+  // Re-quantize P after softmax
+  variant.PQuantize(tSrS);
+
+  // Cast back to FP8
+  Tensor tOrP =
+      make_tensor(convert_type<DTypeKV>(tSrS).data(), convert_layout_acc_Aregs_fp8(tSrS.layout()));
+  permute_regs_A_to_C(tOrP);
 
   constexpr int n_masking_steps = CAUSAL ? cute::ceil_div(CTA_Q, CTA_KV) : 0;
   // masking loops
@@ -160,13 +167,17 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
       }
     }
     attention_updater.update</*init=*/false>(tSrS);
+    // Re-quantize P after softmax
+    variant.PQuantize(tSrS);
+
     warpgroup_wait<0>();
     pipeline_v.consumer_release(smem_pipe_read_v);  // release V
     ++smem_pipe_read_k;
     ++smem_pipe_read_v;
     cute::copy(make_tensor(convert_type<DTypeKV>(tSrS).data(),
-                           convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout())),
+                           convert_layout_acc_Aregs_fp8(tSrS.layout())),
                tOrP);
+    permute_regs_A_to_C(tOrP);
   }
 
 #pragma unroll 1
@@ -193,52 +204,19 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
       tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
                                         qo_head_idx, kv_head_idx);
     }
+
     attention_updater.update</*init=*/false>(tSrS);
+    // Re-quantize P after softmax
+    variant.PQuantize(tSrS);
+
     warpgroup_wait<0>();
     pipeline_v.consumer_release(smem_pipe_read_v);  // release V
     ++smem_pipe_read_k;
     ++smem_pipe_read_v;
     cute::copy(make_tensor(convert_type<DTypeKV>(tSrS).data(),
-                           convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout())),
+                           convert_layout_acc_Aregs_fp8(tSrS.layout())),
                tOrP);
-  }
-
-  if constexpr (LEFT_SLIDING_WINDOW) {
-#pragma unroll 1
-    for (; kv_tile_idx > swa_begin_kv_tile_idx; --kv_tile_idx) {
-      Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_QKD{}));
-      consumer_wait(pipeline_k, smem_pipe_read_k);
-      WarpScheduler::barrier_sync();
-      gemm</*init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ,
-                                          tSrK(_, _, _, smem_pipe_read_k.index()), tSrS);
-      attention_updater.rescale_o(tOrO);
-      consumer_wait(pipeline_v, smem_pipe_read_v);
-      gemm</*init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, tOrP,
-                                           tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
-      WarpScheduler::barrier_arrive();
-      warpgroup_wait<1>();
-      pipeline_k.consumer_release(smem_pipe_read_k);  // release K
-      Tensor cS = cute::make_identity_tensor(select<0, 1>(TileShape_QKD{}));
-      Tensor tScS = threadMmaQK.partition_C(cS);
-#pragma unroll
-      for (int i = 0; i < size(tSrS); ++i) {
-        int qo_idx = get<0>(tScS(i)) + q_tile_idx * CTA_Q;
-        int kv_idx = get<1>(tScS(i)) + (kv_tile_idx - 1) * CTA_KV;
-        tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/0, qo_idx, kv_idx,
-                                          qo_head_idx, kv_head_idx);
-        if (kv_idx < col_limit_left(qo_idx)) {
-          tSrS(i) = -math::inf;
-        }
-      }
-      attention_updater.update</*init=*/false>(tSrS);
-      warpgroup_wait<0>();
-      pipeline_v.consumer_release(smem_pipe_read_v);  // release V
-      ++smem_pipe_read_k;
-      ++smem_pipe_read_v;
-      cute::copy(make_tensor(convert_type<DTypeKV>(tSrS).data(),
-                             convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout())),
-                 tOrP);
-    }
+    permute_regs_A_to_C(tOrP);
   }
 
   // Tell warp 0 that smem_q is ready
@@ -254,6 +232,11 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
   ++smem_pipe_read_v;
 
   attention_updater.rescale_o(tOrO);
+  // Dequantize output o with P/V scale
+#pragma unroll
+  for (int i = 0; i < size(tOrO); ++i) {
+    tOrO(i) = variant.ODequantize(mainloop_params, tOrO(i), qo_head_idx, kv_head_idx);
+  }
   return;
 }
 

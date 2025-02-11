@@ -61,8 +61,47 @@ struct LogitsSoftCap {
                             { return math::tanh(logits * pre_tanh_scale); })
 };
 
+struct StandardFP8Attention {
+  float scale_qk, scale_pv;
+
+  template <int NUM_ROWS_PER_THREAD>
+  using Updater = OnlineSoftmaxWithScale<NUM_ROWS_PER_THREAD>;
+
+  template <typename MainloopParams, typename BlockCoord>
+  __device__ StandardFP8Attention(const MainloopParams& params, const BlockCoord& block_coord) {
+    auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len] = block_coord;
+    scale_qk = params.additional_params.scale_q[qo_head_idx] *
+               params.additional_params.scale_k[kv_head_idx] * params.additional_params.sm_scale;
+    scale_pv = params.additional_params.scale_v[kv_head_idx] / 448;
+  }
+
+  template <typename MainloopParams, typename T>
+  __device__ __forceinline__ T LogitsTransform(const MainloopParams& params, T logits,
+                                               uint32_t batch_idx, uint32_t qo_idx, uint32_t kv_idx,
+                                               uint32_t qo_head_idx, uint32_t kv_head_idx) {
+    // we fuse sm_scale and qk scale into one FMA in attention updater
+    // instead of this separate calculation, which cause ~100 TFlops degrade
+    return logits;
+  }
+
+  template <typename Tensor0>
+  __device__ __forceinline__ void PQuantize(Tensor0& tSrS) {
+#pragma unroll
+    for (int i = 0; i < size(tSrS); ++i) {
+      tSrS(i) *= 448.f;
+    }
+  }
+
+  template <typename MainloopParams, typename T>
+  __device__ __forceinline__ T ODequantize(const MainloopParams& params, T out,
+                                           uint32_t qo_head_idx, uint32_t kv_head_idx) {
+    return out * scale_pv;
+  }
+};
+
 template <bool use_logits_soft_cap>
 using DefaultAttention = std::conditional_t<use_logits_soft_cap, LogitsSoftCap, StandardAttention>;
+using DefaultFP8Attention = StandardFP8Attention;
 
 }  // namespace flashinfer
 

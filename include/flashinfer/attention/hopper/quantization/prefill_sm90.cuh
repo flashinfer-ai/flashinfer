@@ -14,10 +14,10 @@
 #include <cutlass/cutlass.h>
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
-#include <cute/tensor.hpp>
-#include <cutlass/pipeline/pipeline.hpp>
 #include <driver_types.h>
 
+#include <cute/tensor.hpp>
+#include <cutlass/pipeline/pipeline.hpp>
 #include <type_traits>
 #include <vector>
 
@@ -25,11 +25,11 @@
 #include "../../../exception.h"
 #include "../../mask.cuh"
 #include "../epilogue.cuh"
+#include "../kernel_traits.cuh"
+#include "../mainloop.cuh"
 #include "../sparse_mainloop.cuh"
 #include "../tile_scheduler.cuh"
 #include "../utils.cuh"
-#include "../kernel_traits.cuh"
-
 #include "kernel_traits.cuh"
 #include "mainloop_mma.cuh"
 
@@ -190,12 +190,12 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
                                                                                   work_tile_info)) {
       // Attention output (GEMM-II) accumulator.
       Tensor tOrO = partition_fragment_C(tiled_mma_pv, select<0, 2>(TileShape_QKD{}));
-      AttentionUpdater attention_updater(mainloop_params);
 
       auto block_coord = work_tile_info.get_block_coord(scheduler_params);
       auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len] =
           block_coord;
-
+      
+      AttentionUpdater attention_updater(mainloop_params, block_coord);
       AttentionVariant variant(mainloop_params, block_coord);
 
       if (q_tile_idx * CTA_Q >= qo_len) {
@@ -231,6 +231,106 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
     }
     collective_epilogue.store_tail();
   }
+}
+
+template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, typename Params>
+cudaError_t SingleFP8PrefillWithKVCacheKernelTraitsDispatched(Params& params, cudaStream_t stream) {
+  using DTypeQ = typename KernelTraits::DTypeQ;
+  using DTypeKV = typename KernelTraits::DTypeKV;
+  using DTypeO = typename KernelTraits::DTypeO;
+  using TileShape_QKD = typename KernelTraits::TileShape_QKD;
+
+  using CollectiveMainloop =
+      CollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL>;
+  using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
+  using Scheduler = SingleTileScheduler;
+  typename CollectiveMainloop::Params mainloop_params = CollectiveMainloop::to_underlying_arguments(
+      {params.q_ptr,
+       get_gmem_layout(params.qo_len, params.num_qo_heads, params.head_dim, params.q_stride_n,
+                       params.q_stride_h),  // layout_Q
+       params.k_ptr,
+       get_gmem_layout(params.kv_len, params.num_kv_heads, params.head_dim, params.k_stride_n,
+                       params.k_stride_h),  // layout_K
+       params.v_ptr,
+       get_gmem_layout(params.kv_len, params.num_kv_heads, params.head_dim, params.v_stride_n,
+                       params.v_stride_h),  // layout_V
+       params.window_left, params.additional_params});
+  typename CollectiveEpilogue::Params epilogue_params =
+      CollectiveEpilogue::to_underlying_arguments({
+          static_cast<DTypeO*>(params.o_ptr),
+          get_gmem_layout(params.qo_len, params.num_qo_heads, params.head_dim, params.o_stride_n,
+                          params.o_stride_h),  // layout_O
+          static_cast<float*>(params.lse_ptr),
+          get_lse_gmem_layout(params.qo_len, params.num_qo_heads),  // layout_LSE
+      });
+
+  int num_tiles_q = cutlass::ceil_div(params.qo_len, KernelTraits::CTA_Q);
+  // TODO(Zihao): also support kv-head major
+  typename Scheduler::Arguments scheduler_args = {
+      num_tiles_q, params.num_qo_heads, params.qo_len, params.kv_len,
+      cutlass::FastDivmod(params.num_qo_heads / params.num_kv_heads)};
+  typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
+
+  auto kernel =
+      (void*)FP8PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
+                                         LEFT_SLIDING_WINDOW, CAUSAL, Scheduler>;
+  int smem_size = sizeof(typename KernelTraits::SharedStorage);
+  FLASHINFER_CUDA_CALL(
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+  int device;
+  cudaGetDevice(&device);
+  int multiprocessor_count;
+  FLASHINFER_CUDA_CALL(
+      cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
+  dim3 grid_dims = Scheduler::get_grid_dim(scheduler_args, multiprocessor_count);
+  static constexpr int num_ctas = KernelTraits::NUM_WARPS * 32;
+  dim3 block_dims(num_ctas);
+  void* args[] = {&mainloop_params, &epilogue_params, &scheduler_params};
+  FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, grid_dims, block_dims, args, smem_size, stream));
+
+  return cudaSuccess;
+}
+
+template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
+          typename AttentionVariant, typename Params>
+cudaError_t SingleFP8PrefillWithKVCacheDispatched(Params& params, cudaStream_t stream) {
+  static_assert(HEAD_DIM == 64 || HEAD_DIM == 128 || HEAD_DIM == 256);
+  if (MASK_MODE == MaskMode::kCustom) {
+    return cudaErrorNotSupported;  // Not supported yet.
+  }
+  constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
+  if constexpr (HEAD_DIM == 64) {
+    SingleFP8PrefillWithKVCacheKernelTraitsDispatched<
+        FP8AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM,
+                                 /*CTA_Q_=*/192,
+                                 /*CTA_KV_=*/128,
+                                 /*NUM_STAGES_=*/4, typename Params::DTypeQ,
+                                 typename Params::DTypeKV, typename Params::DTypeO,
+                                 typename Params::IdType, AttentionVariant>,
+        LEFT_SLIDING_WINDOW, CAUSAL>(params, stream);
+  } else if constexpr (HEAD_DIM == 128) {
+    SingleFP8PrefillWithKVCacheKernelTraitsDispatched<
+        FP8AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM,
+                                 /*CTA_Q_=*/128,
+                                 /*CTA_KV_=*/CAUSAL ? 128 : 192,
+                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
+                                 typename Params::DTypeKV, typename Params::DTypeO,
+                                 typename Params::IdType, AttentionVariant>,
+        LEFT_SLIDING_WINDOW, CAUSAL>(params, stream);
+  } else {
+    // HEAD_DIM == 256;
+    SingleFP8PrefillWithKVCacheKernelTraitsDispatched<
+        FP8AttentionKernelTraits</*USE_TMA_LOAD_KV=*/true, HEAD_DIM,
+                                 /*CTA_Q_=*/128,
+                                 /*CTA_KV_=*/64,
+                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
+                                 typename Params::DTypeKV, typename Params::DTypeO,
+                                 typename Params::IdType, AttentionVariant>,
+        LEFT_SLIDING_WINDOW, CAUSAL>(params, stream);
+  }
+  cudaError_t status = cudaGetLastError();
+  return status;
 }
 
 }  // namespace flashinfer

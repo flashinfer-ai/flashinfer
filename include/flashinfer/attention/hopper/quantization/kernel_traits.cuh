@@ -11,7 +11,6 @@
 
 #include "../../../cutlass_utils.cuh"
 #include "../kernel_traits.cuh"
-
 #include "cute/algorithm/copy.hpp"
 #include "cute/atom/mma_atom.hpp"
 #include "cutlass/cutlass.h"
@@ -23,7 +22,6 @@
 namespace flashinfer {
 
 using namespace cute;
-
 
 template <bool USE_TMA_LOAD_KV, int HEAD_DIM_, int CTA_Q_, int CTA_KV_, int NUM_STAGES_,
           typename DTypeQ_, typename DTypeKV_, typename DTypeO_, typename IdType_,
@@ -56,10 +54,12 @@ struct FP8AttentionKernelTraits {
   using AtomLayoutQKD = Layout<Shape<Int<CTA_Q / 64>, _1, _1>>;
   using TiledMmaQK = decltype(cute::make_tiled_mma(
       cute::GMMA::ss_op_selector<DTypeQ, DTypeKV, DTypeQKAccum, TileShape_QKD>(), AtomLayoutQKD{}));
+
+  // FP8 needs K-major for both P / V
   using TiledMmaPV = decltype(cute::make_tiled_mma(
       cute::GMMA::rs_op_selector<DTypeKV, DTypeKV, /*ElementAccum=*/float,
                                  decltype(select<0, 2, 1>(TileShape_QKD{})), GMMA::Major::K,
-                                 GMMA::Major::MN>(),
+                                 GMMA::Major::K>(),
       AtomLayoutQKD{}));
 
   static constexpr int NUM_MMA_THREADS = size(TiledMmaQK{});
@@ -76,6 +76,8 @@ struct FP8AttentionKernelTraits {
       SmemLayoutAtomK{},
       make_shape(shape<1>(TileShape_QKD{}), shape<2>(TileShape_QKD{}), Int<NUM_STAGES>{})));
 
+  // Assume V is directly kv_len major
+  // In fact, we need first load head_dim major from gmem, then transpose into kv_len major
   using SmemLayoutAtomV = decltype(cutlass::gemm::collective::detail::ss_smem_selector<
                                    GMMA::Major::K, DTypeKV, decltype(cute::get<1>(TileShape_QKD{})),
                                    decltype(cute::get<2>(TileShape_QKD{}))>());
@@ -88,6 +90,21 @@ struct FP8AttentionKernelTraits {
       SmemLayoutV{}, make_ordered_layout(make_shape(get<2>(TileShape_QKD{}),
                                                     get<1>(TileShape_QKD{}), Int<NUM_STAGES>{}),
                                          Step<_2, _1, _3>{})));
+
+  // Use different layout for loading & computation
+  // KV-Cache is stored in head_dim major. though computation needs kv_len major
+  using CSmemLayoutAtomV =
+      decltype(cutlass::gemm::collective::detail::ss_smem_selector<
+               GMMA::Major::MN, DTypeKV, decltype(cute::get<1>(TileShape_QKD{})),
+               decltype(cute::get<2>(TileShape_QKD{}))>());
+  using CSmemLayoutV = decltype(tile_to_shape(
+      CSmemLayoutAtomV{},
+      make_shape(get<1>(TileShape_QKD{}), get<2>(TileShape_QKD{}), Int<NUM_STAGES>{})));
+
+  using CSmemLayoutVt = decltype(composition(
+      CSmemLayoutV{}, make_ordered_layout(make_shape(get<2>(TileShape_QKD{}),
+                                                     get<1>(TileShape_QKD{}), Int<NUM_STAGES>{}),
+                                          Step<_2, _1, _3>{})));
 
   using SmemLayoutAtomO = decltype(cutlass::gemm::collective::detail::ss_smem_selector<
                                    GMMA::Major::K, DTypeO, decltype(cute::get<0>(TileShape_QKD{})),
