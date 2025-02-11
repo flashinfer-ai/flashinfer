@@ -16,7 +16,7 @@ limitations under the License.
 
 import functools
 from types import SimpleNamespace
-from typing import List, Optional, Tuple, Union
+from typing import List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
@@ -99,6 +99,28 @@ class BatchMLAPageAttentionWrapper:
                 causal,
                 get_cuda_stream(device),
             )
+
+    @overload
+    def run(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        ckv_cache: torch.Tensor,
+        kpe_cache: torch.Tensor,
+        return_lse: Literal[False] = False,
+    ) -> torch.Tensor:
+        ...
+    
+    @overload
+    def run(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        ckv_cache: torch.Tensor,
+        kpe_cache: torch.Tensor,
+        return_lse: Literal[True] = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        ...
 
     def run(
         self,
