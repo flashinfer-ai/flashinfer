@@ -47,8 +47,10 @@ struct SharedStorageQKVO {
         alignas(16) DTypeKV kpe[CTA_TILE_KV * HEAD_DIM_KPE];
         alignas(16) DTypeKV p[CTA_TILE_Q * CTA_TILE_KV];
       } aux_smem[NUM_STAGES];
-      alignas(16) float m_wg[2][CTA_TILE_Q];  // cross warpgroup synchronization
-      alignas(16) float d_wg[2][CTA_TILE_Q];  // cross warpgroup synchronization
+      union {
+        alignas(16) float m_wg[2][CTA_TILE_Q];  // cross warpgroup synchronization
+        alignas(16) float d_wg[2][CTA_TILE_Q];  // cross warpgroup synchronization
+      };
     };
     alignas(16) DTypeO o_smem[CTA_TILE_Q * HEAD_DIM_CKV];
   };
@@ -75,7 +77,7 @@ struct KernelTraits {
   static constexpr SwizzleMode SWIZZLE_MODE_CKV = SwizzleMode::k128B;
   static constexpr SwizzleMode SWIZZLE_MODE_KPE = SwizzleMode::k128B;
   static constexpr SwizzleMode SWIZZLE_MODE_P =
-      CTA_TILE_KV == 4 ? SwizzleMode::k128B : SwizzleMode::k64B;
+      CTA_TILE_KV >= 64 ? SwizzleMode::k128B : SwizzleMode::k64B;
   static constexpr SwizzleMode SWIZZLE_MODE_O = SwizzleMode::k128B;
   static constexpr uint32_t UPCAST_STRIDE_Q_NOPE = HEAD_DIM_CKV / upcast_size<DTypeQ_>();
   static constexpr uint32_t UPCAST_STRIDE_Q_PE = HEAD_DIM_KPE / upcast_size<DTypeQ_>();
@@ -763,6 +765,17 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
   }
 }
 
+#define DISPATCH_SMEM_CONFIG(smem_limit_per_sm, NUM_STAGES, CTA_TILE_KV, ...) \
+  if (smem_limit_per_sm >= 221696) {                                          \
+    constexpr uint32_t NUM_STAGES = 2;                                        \
+    constexpr uint32_t CTA_TILE_KV = 64;                                      \
+    __VA_ARGS__;                                                              \
+  } else {                                                                    \
+    constexpr uint32_t NUM_STAGES = 1;                                        \
+    constexpr uint32_t CTA_TILE_KV = 32;                                      \
+    __VA_ARGS__;                                                              \
+  }
+
 template <MaskMode MASK_MODE, uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename Params>
 cudaError_t BatchMLAPagedAttention(Params params, uint32_t num_blks_x, uint32_t num_blks_y,
                                    cudaStream_t stream) {
@@ -782,17 +795,25 @@ cudaError_t BatchMLAPagedAttention(Params params, uint32_t num_blks_x, uint32_t 
   dim3 nblks(num_blks_x, num_blks_y);
   dim3 nthrs(32, 4, 2);
 
-  using KTraits =
-      KernelTraits<CAUSAL, /*NUM_STAGES_=*/1, HEAD_DIM_CKV, HEAD_DIM_KPE, /*CTA_TILE_Q_=*/64,
-                   /*CTA_TILE_KV_=*/32, DTypeQ, DTypeKV, DTypeO, IdType>;
-  size_t smem_size = sizeof(typename KTraits::SharedStorage);
+  // get GPU shared memory size
+  int device;
+  int smem_limit_per_sm;
+  cudaGetDevice(&device);
+  cudaDeviceGetAttribute(&smem_limit_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device);
 
-  auto kernel = BatchMLAPagedAttentionKernel<KTraits, Params>;
-  void* args[] = {(void*)&params};
+  DISPATCH_SMEM_CONFIG(smem_limit_per_sm, NUM_STAGES, CTA_TILE_KV, {
+    using KTraits = KernelTraits<CAUSAL, NUM_STAGES, HEAD_DIM_CKV, HEAD_DIM_KPE, /*CTA_TILE_Q_=*/64,
+                                 CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType>;
+    size_t smem_size = sizeof(typename KTraits::SharedStorage);
 
-  FLASHINFER_CUDA_CALL(
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-  FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+    auto kernel = BatchMLAPagedAttentionKernel<KTraits, Params>;
+    void* args[] = {(void*)&params};
+
+    FLASHINFER_CUDA_CALL(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  });
+
   return cudaSuccess;
 }
 
