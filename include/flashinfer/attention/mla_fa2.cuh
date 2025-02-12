@@ -649,14 +649,15 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionKer
 
     // last kv tile
     __syncthreads();
+    uint32_t kv_bound = kv_indptr + (kv_len + block_size - 1) / block_size;  // ceil_div
     load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
-                     kpe_stride_n, kpe_stride_page, kv_indptr + kv_end,
+                     kpe_stride_n, kpe_stride_page, kv_bound,
                      block_iter_base + kv_tile_idx * CTA_TILE_KV, block_size,
                      kv_tile_idx % NUM_STAGES);
     cp_async::commit_group();
     if (kv_tile_idx > start_tile_idx) {
       load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
-                       kpe_stride_n, kpe_stride_page, kv_indptr + kv_end,
+                       kpe_stride_n, kpe_stride_page, kv_bound,
                        block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV, block_size,
                        (kv_tile_idx - 1) % NUM_STAGES);
       cp_async::commit_group();
@@ -686,7 +687,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionKer
       if (kv_tile_idx - 2 >= start_tile_idx) {
         __syncthreads();
         load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
-                         kpe_stride_n, kpe_stride_page, kv_indptr + kv_end,
+                         kpe_stride_n, kpe_stride_page, kv_bound,
                          block_iter_base + (kv_tile_idx - 2) * CTA_TILE_KV, block_size,
                          (kv_tile_idx - 2) % NUM_STAGES);
         cp_async::commit_group();
@@ -712,7 +713,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionKer
 
       __syncthreads();
       load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
-                       kpe_stride_n, kpe_stride_page, kv_indptr + kv_end,
+                       kpe_stride_n, kpe_stride_page, kv_bound,
                        block_iter_base + (kv_tile_idx - 2) * CTA_TILE_KV, block_size,
                        (kv_tile_idx - 2) % NUM_STAGES);
       cp_async::commit_group();
