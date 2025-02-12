@@ -74,10 +74,9 @@ struct KernelTraits {
   static constexpr SwizzleMode SWIZZLE_MODE_Q_PE = SwizzleMode::k128B;
   static constexpr SwizzleMode SWIZZLE_MODE_CKV = SwizzleMode::k128B;
   static constexpr SwizzleMode SWIZZLE_MODE_KPE = SwizzleMode::k128B;
-  static constexpr SwizzleMode SWIZZLE_MODE_P = SwizzleMode::k128B;
+  static constexpr SwizzleMode SWIZZLE_MODE_P =
+      CTA_TILE_KV == 4 ? SwizzleMode::k128B : SwizzleMode::k64B;
   static constexpr SwizzleMode SWIZZLE_MODE_O = SwizzleMode::k128B;
-  static constexpr uint32_t KV_THR_LAYOUT_ROW = 4;
-  static constexpr uint32_t KV_THR_LAYOUT_COL = 8;
   static constexpr uint32_t UPCAST_STRIDE_Q_NOPE = HEAD_DIM_CKV / upcast_size<DTypeQ_>();
   static constexpr uint32_t UPCAST_STRIDE_Q_PE = HEAD_DIM_KPE / upcast_size<DTypeQ_>();
   static constexpr uint32_t UPCAST_STRIDE_CKV = HEAD_DIM_CKV / upcast_size<DTypeKV_>();
@@ -582,8 +581,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
   [[maybe_unused]] constexpr SwizzleMode SWIZZLE_MODE_Q_PE = KTraits::SWIZZLE_MODE_Q_PE;
   [[maybe_unused]] constexpr SwizzleMode SWIZZLE_MODE_CKV = KTraits::SWIZZLE_MODE_CKV;
   [[maybe_unused]] constexpr SwizzleMode SWIZZLE_MODE_KPE = KTraits::SWIZZLE_MODE_KPE;
-  [[maybe_unused]] constexpr uint32_t KV_THR_LAYOUT_ROW = KTraits::KV_THR_LAYOUT_ROW;
-  [[maybe_unused]] constexpr uint32_t KV_THR_LAYOUT_COL = KTraits::KV_THR_LAYOUT_COL;
   [[maybe_unused]] constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
   [[maybe_unused]] constexpr uint32_t NUM_MMA_D_CKV = KTraits::NUM_MMA_D_CKV;
   [[maybe_unused]] constexpr uint32_t CTA_TILE_Q = KTraits::CTA_TILE_Q;
@@ -789,7 +786,6 @@ cudaError_t BatchMLAPagedAttention(Params params, uint32_t num_blks_x, uint32_t 
       KernelTraits<CAUSAL, /*NUM_STAGES_=*/1, HEAD_DIM_CKV, HEAD_DIM_KPE, /*CTA_TILE_Q_=*/64,
                    /*CTA_TILE_KV_=*/32, DTypeQ, DTypeKV, DTypeO, IdType>;
   size_t smem_size = sizeof(typename KTraits::SharedStorage);
-  std::cout << smem_size << std::endl;
 
   auto kernel = BatchMLAPagedAttentionKernel<KTraits, Params>;
   void* args[] = {(void*)&params};
