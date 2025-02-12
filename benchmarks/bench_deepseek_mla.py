@@ -69,8 +69,14 @@ def bench_deepseek_mla_decode(batch_size, seq_len, num_heads):
 
     io = sum([_.numel() * _.element_size() for _ in [q_nope, q_pe, ckv, kpe, o]])
 
-    print("Peak bandwidth: {:.2f} GB/s".format(io * 1e-6 / ms))
+    print(f"Config: batch_size={batch_size}, seq_len={seq_len}, num_heads={num_heads}")
+    print(f"Memory bandwidth: {io * 1e-6 / ms:.2f} GB/s")
 
 
 if __name__ == "__main__":
+    bench_deepseek_mla_decode(768, 1024, 16)
+    bench_deepseek_mla_decode(768, 1024, 32)
+    bench_deepseek_mla_decode(768, 1024, 64)
     bench_deepseek_mla_decode(768, 2048, 16)
+    bench_deepseek_mla_decode(768, 2048, 32)
+    bench_deepseek_mla_decode(768, 2048, 64)
