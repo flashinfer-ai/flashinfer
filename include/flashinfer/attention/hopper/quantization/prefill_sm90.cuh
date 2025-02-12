@@ -24,11 +24,10 @@
 #include "../../../cutlass_utils.cuh"
 #include "../../../exception.h"
 #include "../../mask.cuh"
-#include "../epilogue.cuh"
-#include "../kernel_traits.cuh"
 #include "../sparse_mainloop.cuh"
 #include "../tile_scheduler.cuh"
 #include "../utils.cuh"
+#include "epilogue.cuh"
 #include "kernel_traits.cuh"
 #include "mainloop_load.cuh"
 #include "mainloop_mma.cuh"
@@ -54,6 +53,8 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   using AttentionVariant = typename Ktraits::AttentionVariant;
 
   static constexpr int NUM_MMA_THREADS = Ktraits::NUM_MMA_THREADS;
+  // We always assign one WG as producer
+  // For FP8 kernel, all 4 warps collectively process ldmatrix with ldmatrix
   static constexpr int NUM_COPY_THREADS = cutlass::NumThreadsPerWarpGroup;
   static constexpr int CTA_Q = Ktraits::CTA_Q;
   static constexpr int CTA_KV = Ktraits::CTA_KV;
@@ -62,9 +63,14 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
 
   using AttentionUpdater =
       typename AttentionVariant::template Updater<2 * (2 * CTA_Q / NUM_MMA_THREADS)>;
+  // Pipeline for loading K/V
   using MainloopPipeline = typename CollectiveMainloop::MainloopPipeline;
   using PipelineParams = typename MainloopPipeline::Params;
   using PipelineState = typename MainloopPipeline::PipelineState;
+
+  // Pipeline for transposing V
+  using MainloopPipelineVt = typename CollectiveMainloop::MainloopPipelineVt;
+  using PipelineParamsVt = typename MainloopPipelineVt::Params;
 
   extern __shared__ char shared_memory[];
   auto& shared_storage = *reinterpret_cast<typename Ktraits::SharedStorage*>(shared_memory);
@@ -109,6 +115,8 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   }();
 
   MainloopPipeline pipeline_v = [&] {
+    pipeline_params.role = MainloopPipeline::ThreadCategory::ProducerConsumer;
+    pipeline_params.num_consumers = Ktraits::NUM_PRODUCER_THREADS;
     if constexpr (use_tma_load_kv) {
       return MainloopPipeline(shared_storage.pipeline_v, pipeline_params,
                               /*cluster_shape=*/Shape<_1, _1, _1>{});
@@ -116,6 +124,12 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       return MainloopPipeline(shared_storage.pipeline_v, pipeline_params);
     }
   }();
+
+  // Init pipeline_vt for transpose and consumed by mma
+  PipelineParamsVt pipeline_params_vt;
+  pipeline_params_vt.producer_arv_count = Ktraits::NUM_PRODUCER_THREADS;
+  pipeline_params_vt.consumer_arv_count = NUM_MMA_THREADS;
+  MainloopPipelineVt pipeline_vt(shared_storage.pipeline_vt, pipeline_params_vt);
 
   CollectiveMainloop collective_mainloop;
   CollectiveEpilogue collective_epilogue;
@@ -131,10 +145,9 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       cutlass::arch::warpgroup_reg_dealloc<72>();
     }
 
-    int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
-    if (!use_tma_load_kv || warp_idx_in_warpgroup == 0) {  // Load Q, K, V
-      PipelineState smem_pipe_write_k = cutlass::make_producer_start_state<MainloopPipeline>();
-      PipelineState smem_pipe_write_v = cutlass::make_producer_start_state<MainloopPipeline>();
+    if constexpr (use_tma_load_kv) {  // Load Q, K, V
+      PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipeline>();
+      PipelineState smem_pipe_read;
 
       int work_idx = 0;
 
@@ -158,11 +171,11 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
           continue;
         }
         collective_mainloop.load<LEFT_SLIDING_WINDOW>(
-            mainloop_params, pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v,
+            mainloop_params, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, smem_pipe_read,
             shared_storage, scheduler, scheduler_params, work_tile_info, block_coord, work_idx);
         ++work_idx;
       }
-      collective_mainloop.load_tail(pipeline_k, pipeline_v, smem_pipe_write_k, smem_pipe_write_v);
+      collective_mainloop.load_tail(pipeline_k, pipeline_v, smem_pipe_write);
     }
   } else {  // Consumer
     if constexpr (use_tma_load_kv) {
@@ -220,10 +233,11 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
 
       mma_fp8<Ktraits, /*LEFT_SLIDING_WINDOW=*/LEFT_SLIDING_WINDOW, CAUSAL,
               CollectiveMainloop::WarpScheduler>(
-          mainloop_params, variant, pipeline_k, pipeline_v, smem_pipe_read_k, smem_pipe_read_v,
+          mainloop_params, variant, pipeline_k, pipeline_vt, smem_pipe_read_k, smem_pipe_read_v,
           tOrO, attention_updater, num_kv_tiles, swa_begin_kv_tile_idx, swa_end_kv_tile_idx,
           threadIdx.x - NUM_COPY_THREADS, work_idx, q_tile_idx, shared_storage, qo_len, kv_len,
           qo_head_idx, kv_head_idx);
+
       collective_epilogue.store(epilogue_params, tOrO, attention_updater.get_lse(), shared_storage,
                                 tiled_mma_pv, threadIdx.x - NUM_COPY_THREADS, block_coord);
 
@@ -242,7 +256,7 @@ cudaError_t SingleFP8PrefillWithKVCacheKernelTraitsDispatched(Params& params, cu
 
   using CollectiveMainloop =
       FP8CollectiveMainloop<typename Params::AdditionalParams, KernelTraits, CAUSAL>;
-  using CollectiveEpilogue = CollectiveEpilogue<KernelTraits>;
+  using CollectiveEpilogue = FP8CollectiveEpilogue<KernelTraits>;
   using Scheduler = SingleTileScheduler;
   typename CollectiveMainloop::Params mainloop_params = CollectiveMainloop::to_underlying_arguments(
       {params.q_ptr,
@@ -295,6 +309,8 @@ cudaError_t SingleFP8PrefillWithKVCacheKernelTraitsDispatched(Params& params, cu
 template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
           typename AttentionVariant, typename Params>
 cudaError_t SingleFP8PrefillWithKVCacheDispatched(Params& params, cudaStream_t stream) {
+  static_assert(cutlass::sizeof_bits_v<typename Params::DTypeQ> == 8);
+  static_assert(cutlass::sizeof_bits_v<typename Params::DTypeKV> == 8);
   static_assert(HEAD_DIM == 64 || HEAD_DIM == 128 || HEAD_DIM == 256);
   if (MASK_MODE == MaskMode::kCustom) {
     return cudaErrorNotSupported;  // Not supported yet.

@@ -112,21 +112,24 @@ struct FP8CollectiveEpilogue {
                             TiledMma tiled_mma, int thread_idx, BlockCoord const& block_coord) {
     auto [qo_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len] =
         block_coord;
-    Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutO{});
-    auto smem_tiled_copy_O = make_tiled_copy_C(SmemCopyAtomO{}, tiled_mma);
-    auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(thread_idx);
 
+    TiledCopyrO rmem_tiled_copy_O;
+    Tensor sOacc = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutrO{});
+    auto rmem_thr_copy_O = rmem_tiled_copy_O.get_thread_slice(thread_idx);
+
+    Tensor taccOsO = rmem_thr_copy_O.partition_D(sOacc);
     Tensor tOrO_out = convert_type<DTypeO>(tOrO);
-    Tensor taccOrO = smem_thr_copy_O.retile_S(tOrO_out);  // ((Atom,AtomNum), MMA_M, MMA_N)
-    Tensor taccOsO = smem_thr_copy_O.partition_D(sO);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
+    Tensor taccOrO = make_tensor(tOrO_out.data(), shape(taccOsO));
 
     // Make sure all WGs have finished reading V
     cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS,
                                       /*id=*/static_cast<int>(NamedBarriers::kValueEmpty));
-    cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
+    cute::copy(rmem_tiled_copy_O, taccOrO, taccOsO);
     cutlass::arch::fence_view_async_shared();  // ensure smem writes are visible to TMA
-    cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
-                                        cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+
+    // TODO(Yilong) : This is not useful as we do not use TMA, right?
+    // cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + cutlass::NumThreadsPerWarp,
+    //                                     cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
 
     Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.lse_ptr), epilogue_params.layout_LSE);
     Tensor gLSE = get_lse_local_tile_tensor(mLSE, Shape<Int<CTA_Q>>{}, qo_head_idx, qo_indptr,
@@ -152,11 +155,12 @@ struct FP8CollectiveEpilogue {
     }
 
     int write_warp_idx = NUM_WARPS - 1;
-    if (cutlass::canonical_warp_idx_sync() == write_warp_idx) {
-      cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
-                                        cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
-    }
+    // if (cutlass::canonical_warp_idx_sync() == write_warp_idx) {
+    //   cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + cutlass::NumThreadsPerWarp,
+    //                                     cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+    // }
     TiledCopyO gmem_tiled_copy_O;
+    Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutO{});
     write_O<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O, epilogue_params.layout_O,
                               select<0, 2>(TileShape_QKD{}), sO, thread_idx, qo_tile_idx,
                               qo_head_idx, qo_indptr, qo_len, write_warp_idx);

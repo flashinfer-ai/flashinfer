@@ -23,6 +23,82 @@ namespace flashinfer {
 
 using namespace cute;
 
+/*
+  In-kernel Transpose of smemV into smemVt with ldmatrix.trans & stmatrix.
+  Note that all magic number corresponds to the /quantization/kernel_traits.cuh setup.
+  This transpose is not a general transpose, but a specific one for the FP8 MMA_PV:
+    1. K-dimension: (2,2,4,4):(1,8,2,16), which adheres to the accum_P's layout
+    2. N-dimension: (8,2,4):(2,1,16), which needs repermutation when rmemO -> smemO
+*/
+template <typename Ktraits>
+struct SmemTransposeFP8_64x64 {
+  using Element = typename Ktraits::DTypeKV;
+  using SmemLayoutVTransposeSrc = typename Ktraits::SmemLayoutVTransposeSrc;
+  using SmemLayoutVtTransposeTgt = typename Ktraits::SmemLayoutVtTransposeTgt;
+  static_assert(cutlass::sizeof_bits_v<Element> == 8);
+
+  using ldsm_thread_shape = Shape<_4, _1, _8, _4>;
+  using ldsm_value_shape = Shape<_2, _8, _2, _1>;
+  using ldsm_value_stride = Stride<_2, _4, _1, _0>;
+  // use trans to do 16bits transpose
+  // which needs permutation to separate 8bits row and column
+  using TiledCopyLDSM =
+      decltype(make_tiled_copy(Copy_Atom<SM75_U16x8_LDSM_T, Element>{}, Layout<ldsm_thread_shape>{},
+                               Layout<ldsm_value_shape, ldsm_value_stride>{}));
+  TiledCopyLDSM tiled_copy_ldsm;
+
+  using stsm_thread_shape = Shape<_4, _1, _8, _4>;
+  using stsm_value_shape = Shape<_4, _4, _1, _2>;
+  using stsm_value_stride = Stride<_1, _8, _0, _4>;
+
+  using TiledCopySTSM =
+      decltype(make_tiled_copy(Copy_Atom<SM90_U32x4_STSM_N, Element>{}, Layout<stsm_thread_shape>{},
+                               Layout<stsm_value_shape, stsm_value_stride>{}));
+  TiledCopySTSM tiled_copy_stsm;
+
+  template <class SmemTensor, class SmemTensorOut>
+  CUTLASS_DEVICE void _tranpose(SmemTensor&& s_in, SmemTensorOut&& s_out) {
+    using namespace cute;
+
+    auto tid = threadIdx.x;
+    auto thr_copy_ldsm = tiled_copy_ldsm.get_thread_slice(tid);
+    auto thr_copy_stsm = tiled_copy_stsm.get_thread_slice(tid);
+
+    auto tXsX = thr_copy_ldsm.partition_S(s_in);
+    auto tXrX = make_tensor<Element>(shape(tXsX));
+    auto tXsX_out = thr_copy_stsm.partition_D(s_out);
+
+    cute::copy(tiled_copy_ldsm, tXsX, tXrX);
+    auto data = tXrX.data();
+    CUTLASS_PRAGMA_UNROLL
+    for (int n = 0; n < size(tXrX); n += 8) {
+      uint32_t* data_32bit = reinterpret_cast<uint32_t*>(&data[n]);
+      auto upper = data_32bit[0];
+      auto lower = data_32bit[1];
+      // select row-major elements.
+      // from (0 1 16 17) (128 129 144 145) to (0 16 128 144) (1 17 129 145)
+      // which is (0 1 8 9)
+      data_32bit[0] = __byte_perm(upper, lower, 0x6420);
+      data_32bit[1] = __byte_perm(upper, lower, 0x7531);
+    }
+    cute::copy(tiled_copy_stsm, tXrX, tXsX_out);
+  }
+
+  template <class SmemTensor, class SmemTensorOut>
+  CUTLASS_DEVICE void do_transpose(SmemTensor& s_in, SmemTensorOut& s_out, int stage_idx) {
+    CUTLASS_PRAGMA_UNROLL
+    for (int j = 0; j < shape<2>(SmemLayoutVTransposeSrc{}); ++j) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < shape<1>(SmemLayoutVTransposeSrc{}); ++i) {
+        this->_tranpose(flatten(s_in(_, i, j, stage_idx)), flatten(s_out(_, i, j, stage_idx)));
+      }
+    }
+    // For FP8 kernel, all WG threads will arrive for issuing ldmatrix
+    cutlass::arch::NamedBarrier::sync(Ktraits::NUM_PRODUCER_THREADS,
+                                      static_cast<int>(NamedBarriers::kProducerWG) /*id*/);
+  }
+};
+
 template <typename AdditionalParams, typename Ktraits, bool CAUSAL>
 struct FP8CollectiveMainloop {
   using DTypeQ = typename Ktraits::DTypeQ;
@@ -73,6 +149,8 @@ struct FP8CollectiveMainloop {
   using MainloopPipeline = typename Ktraits::MainloopPipeline;
   using PipelineParams = typename MainloopPipeline::Params;
   using PipelineState = typename MainloopPipeline::PipelineState;
+  using MainloopPipelineVt = typename Ktraits::MainloopPipelineNoTMA;
+  using PipelineParamsVt = typename MainloopPipelineVt::Params;
 
   // Set the bytes transferred in this TMA transaction (may involve multiple issues)
   static constexpr uint32_t TmaTransactionBytesQ =
@@ -149,9 +227,10 @@ struct FP8CollectiveMainloop {
   template <bool LEFT_SLIDING_WINDOW, typename BlockCoord, typename Scheduler,
             typename SharedStorage>
   CUTLASS_DEVICE void load(Params const& mainloop_params, MainloopPipeline pipeline_k,
-                           MainloopPipeline pipeline_v, PipelineState& smem_pipe_write_k,
-                           PipelineState& smem_pipe_write_v, SharedStorage& shared_storage,
-                           Scheduler& scheduler, typename Scheduler::Params const& scheduler_params,
+                           MainloopPipeline pipeline_v, MainloopPipelineVt pipeline_vt,
+                           PipelineState& smem_pipe_write, PipelineState& smem_pipe_read,
+                           SharedStorage& shared_storage, Scheduler& scheduler,
+                           typename Scheduler::Params const& scheduler_params,
                            typename Scheduler::WorkTileInfo& work_tile_info,
                            BlockCoord const& block_coord, int work_idx) {
     Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{});
@@ -161,6 +240,16 @@ struct FP8CollectiveMainloop {
     Tensor mQ = mainloop_params.tma_load_Q.get_tma_tensor(mainloop_params.layout_Q.shape());
     Tensor mK = mainloop_params.tma_load_K.get_tma_tensor(mainloop_params.layout_K.shape());
     Tensor mV = mainloop_params.tma_load_V.get_tma_tensor(mainloop_params.layout_V.shape());
+
+    // *** Prepare In-kernel V Transpose ***
+    using SmemLayoutVTransposeSrc = typename Ktraits::SmemLayoutVTransposeSrc;
+    using SmemLayoutVtTransposeTgt = typename Ktraits::SmemLayoutVtTransposeTgt;
+
+    Tensor sV_src = as_position_independent_swizzle_tensor(
+        make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutVTransposeSrc{}));
+    Tensor sVt_tgt = as_position_independent_swizzle_tensor(
+        make_tensor(make_smem_ptr(shared_storage.smem_vt.data()), SmemLayoutVtTransposeTgt{}));
+    auto v_tranposer = SmemTransposeFP8_64x64<Ktraits>();
 
     auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len] = block_coord;
 
@@ -192,26 +281,34 @@ struct FP8CollectiveMainloop {
                                                                        q_tile_idx, qo_len, kv_len);
     }
 
+    // All WG proceeds here, only one thread in each WG will issue TMA load
     int lane_predicate = cute::elect_one_sync();
-    if (lane_predicate) {
-      pipeline_k.producer_acquire(smem_pipe_write_k);
-      copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k),
+    int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
+    bool issue_tma_thread = (warp_idx_in_warpgroup == 0) && (lane_predicate == 1);
+
+    if (issue_tma_thread) {
+      pipeline_k.producer_acquire(smem_pipe_write);
+      copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write),
                                            /*mcast_mask=*/0),
-           tKgK(_, kv_tile_idx), tKsK(_, smem_pipe_write_k.index()));
-      ++smem_pipe_write_k;
+           tKgK(_, kv_tile_idx), tKsK(_, smem_pipe_write.index()));
     }
 
     // Wait for the MMA warpgroups to say that smem_q is ready
     cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
                                       static_cast<int>(NamedBarriers::kQueryEmpty));
 
-    if (lane_predicate) {
+    if (issue_tma_thread) {
       shared_storage.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
       copy(mainloop_params.tma_load_Q.with(
                reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(
                    shared_storage.barrier_Q),
                /*mcast_mask=*/0),
            tQgQ, tQsQ);
+
+      pipeline_v.producer_acquire(smem_pipe_write);
+      copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write),
+                                           /*mcast_mask=*/0),
+           tVgV(_, kv_tile_idx), tVsV(_, smem_pipe_write.index()));
     }
 
     // Wait for warp 1 to signal that smem_v are ready and V can be copied from gmem
@@ -220,40 +317,74 @@ struct FP8CollectiveMainloop {
     // O.
     shared_storage.barrier_O.wait((work_idx + 1) % 2);
 
-    if (lane_predicate) {
+    pipeline_v.consumer_wait(smem_pipe_read);
+    // pipeline_vt.producer_acquire(smem_pipe_write);
+    v_tranposer.do_transpose(sV_src, sVt_tgt, smem_pipe_read.index());
+    pipeline_vt.producer_commit(smem_pipe_write);
+    pipeline_v.consumer_release(smem_pipe_read);
+    ++smem_pipe_read;
+    ++smem_pipe_write;
+    --kv_tile_idx;
+
+    constexpr int num_left_iter = Ktraits::NUM_STAGES - 1;
 #pragma unroll 2
-      for (; kv_tile_idx > swa_begin_kv_tile_idx; --kv_tile_idx) {
-        pipeline_k.producer_acquire(smem_pipe_write_k);
-        copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write_k),
+    for (int iter = 0; iter < num_left_iter && kv_tile_idx >= swa_begin_kv_tile_idx;
+         --kv_tile_idx, ++iter) {
+      if (issue_tma_thread) {
+        pipeline_k.producer_acquire(smem_pipe_write);
+        copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write),
                                              /*mcast_mask=*/0),
-             tKgK(_, kv_tile_idx - 1), tKsK(_, smem_pipe_write_k.index()));
-        ++smem_pipe_write_k;
-        pipeline_v.producer_acquire(smem_pipe_write_v);
-        copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v),
+             tKgK(_, kv_tile_idx), tKsK(_, smem_pipe_write.index()));
+
+        pipeline_v.producer_acquire(smem_pipe_write);
+        copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write),
                                              /*mcast_mask=*/0),
-             tVgV(_, kv_tile_idx), tVsV(_, smem_pipe_write_v.index()));
-        ++smem_pipe_write_v;
+             tVgV(_, kv_tile_idx), tVsV(_, smem_pipe_write.index()));
       }
+
+      pipeline_v.consumer_wait(smem_pipe_read);
+      // pipeline_vt.producer_acquire(smem_pipe_write);
+      v_tranposer.do_transpose(sV_src, sVt_tgt, smem_pipe_read.index());
+      pipeline_vt.producer_commit(smem_pipe_write);
+      pipeline_v.consumer_release(smem_pipe_read);
+      ++smem_pipe_read;
+      ++smem_pipe_write;
+    }
+
+#pragma unroll 2
+    for (; kv_tile_idx >= swa_begin_kv_tile_idx; --kv_tile_idx) {
+      if (issue_tma_thread) {
+        pipeline_k.producer_acquire(smem_pipe_write);
+        copy(mainloop_params.tma_load_K.with(*pipeline_k.producer_get_barrier(smem_pipe_write),
+                                             /*mcast_mask=*/0),
+             tKgK(_, kv_tile_idx), tKsK(_, smem_pipe_write.index()));
+
+        pipeline_v.producer_acquire(smem_pipe_write);
+        copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write),
+                                             /*mcast_mask=*/0),
+             tVgV(_, kv_tile_idx), tVsV(_, smem_pipe_write.index()));
+      }
+      pipeline_v.consumer_wait(smem_pipe_read);
+      pipeline_vt.producer_acquire(smem_pipe_write);
+      v_tranposer.do_transpose(sV_src, sVt_tgt, smem_pipe_read.index());
+      pipeline_vt.producer_commit(smem_pipe_write);
+      pipeline_v.consumer_release(smem_pipe_read);
+      ++smem_pipe_read;
+      ++smem_pipe_write;
     }
     scheduler.prefetch_next_work(scheduler_params, work_tile_info);
-    if (lane_predicate) {
-      pipeline_v.producer_acquire(smem_pipe_write_v);
-      copy(mainloop_params.tma_load_V.with(*pipeline_v.producer_get_barrier(smem_pipe_write_v),
-                                           /*mcast_mask=*/0),
-           tVgV(_, kv_tile_idx), tVsV(_, smem_pipe_write_v.index()));
-      ++smem_pipe_write_v;
-    }
     scheduler.broadcast_next_work(work_tile_info);
   }
 
   CUTLASS_DEVICE void load_tail(MainloopPipeline pipeline_k, MainloopPipeline pipeline_v,
-                                PipelineState& smem_pipe_write_k,
-                                PipelineState& smem_pipe_write_v) {
+                                PipelineState& smem_pipe_write) {
+    // This func is not useful as blocking transpose is enabled
+    // WG will not early exit
     int lane_predicate = cute::elect_one_sync();
     int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
     if (warp_idx_in_warpgroup == 0 && lane_predicate) {
-      pipeline_k.producer_tail(smem_pipe_write_k);
-      pipeline_v.producer_tail(smem_pipe_write_v);
+      pipeline_k.producer_tail(smem_pipe_write);
+      pipeline_v.producer_tail(smem_pipe_write);
     }
   }
 };

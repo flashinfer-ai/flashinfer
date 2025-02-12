@@ -16,10 +16,10 @@ namespace flashinfer {
 
 template <typename Ktraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, typename WarpScheduler,
           typename AttentionVariant, typename Params, typename MainloopPipeline,
-          typename PipelineState, typename SharedStorage, typename FrgTensorO,
-          typename AttentionUpdater>
+          typename MainloopPipelineVt, typename PipelineState, typename SharedStorage,
+          typename FrgTensorO, typename AttentionUpdater>
 CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& variant,
-                            MainloopPipeline pipeline_k, MainloopPipeline pipeline_v,
+                            MainloopPipeline pipeline_k, MainloopPipelineVt pipeline_vt,
                             PipelineState& smem_pipe_read_k, PipelineState& smem_pipe_read_v,
                             FrgTensorO& tOrO, AttentionUpdater& attention_updater,
                             int kv_tile_idx_count, int swa_begin_kv_tile_idx,
@@ -34,10 +34,8 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
   static constexpr int NUM_MMA_THREADS = Ktraits::NUM_MMA_THREADS;
   using SmemLayoutQ = typename Ktraits::SmemLayoutQ;
   using SmemLayoutK = typename Ktraits::SmemLayoutK;
-  // HACK: V is head_dim major while MMA needs seq_len major
-  // We directly change the layout. however, a transpose op is needed
-  using SmemLayoutV = typename Ktraits::CSmemLayoutV;
-  using SmemLayoutVt = typename Ktraits::CSmemLayoutVt;
+  using SmemLayoutV = typename Ktraits::SmemLayoutV;
+  using SmemLayoutVt = typename Ktraits::SmemLayoutVt;
   static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
 
   static constexpr int CTA_Q = get<0>(TileShape_QKD{});
@@ -45,7 +43,7 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
 
   Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), SmemLayoutQ{});
   Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{});
-  Tensor sVt = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutVt{});
+  Tensor sVt = make_tensor(make_smem_ptr(shared_storage.smem_vt.data()), SmemLayoutVt{});
 
   typename Ktraits::TiledMmaQK tiled_mma_qk;
   typename Ktraits::TiledMmaPV tiled_mma_pv;
@@ -143,7 +141,7 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
     if (masking_step > 0) {
       attention_updater.rescale_o(tOrO);
     }
-    consumer_wait(pipeline_v, smem_pipe_read_v);
+    consumer_wait(pipeline_vt, smem_pipe_read_v);
     gemm</*init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, tOrP,
                                          tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
     WarpScheduler::barrier_arrive();
@@ -171,7 +169,7 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
     variant.PQuantize(tSrS);
 
     warpgroup_wait<0>();
-    pipeline_v.consumer_release(smem_pipe_read_v);  // release V
+    pipeline_vt.consumer_release(smem_pipe_read_v);  // release V
     ++smem_pipe_read_k;
     ++smem_pipe_read_v;
     cute::copy(make_tensor(convert_type<DTypeKV>(tSrS).data(),
@@ -188,7 +186,7 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
     gemm</*init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read_k.index()),
                                         tSrS);
     attention_updater.rescale_o(tOrO);
-    consumer_wait(pipeline_v, smem_pipe_read_v);
+    consumer_wait(pipeline_vt, smem_pipe_read_v);
     gemm</*init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, tOrP,
                                          tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
     WarpScheduler::barrier_arrive();
@@ -210,7 +208,7 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
     variant.PQuantize(tSrS);
 
     warpgroup_wait<0>();
-    pipeline_v.consumer_release(smem_pipe_read_v);  // release V
+    pipeline_vt.consumer_release(smem_pipe_read_v);  // release V
     ++smem_pipe_read_k;
     ++smem_pipe_read_v;
     cute::copy(make_tensor(convert_type<DTypeKV>(tSrS).data(),
@@ -223,16 +221,17 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
   cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
                                       /*id=*/static_cast<int>(NamedBarriers::kQueryEmpty));
   attention_updater.rescale_o(tOrO);
-  consumer_wait(pipeline_v, smem_pipe_read_v);
+  consumer_wait(pipeline_vt, smem_pipe_read_v);
   gemm</*init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()),
                                        tOrO);
   attention_updater.finalize(tSrS);
   warpgroup_wait<0>();
-  pipeline_v.consumer_release(smem_pipe_read_v);  // release V, otherwise producers will hang
+  pipeline_vt.consumer_release(smem_pipe_read_v);  // release V, otherwise producers will hang
   ++smem_pipe_read_v;
 
   attention_updater.rescale_o(tOrO);
   // Dequantize output o with P/V scale
+  // Note that column is permutated. Be careful with per-channel quantization
 #pragma unroll
   for (int i = 0; i < size(tOrO); ++i) {
     tOrO(i) = variant.ODequantize(mainloop_params, tOrO(i), qo_head_idx, kv_head_idx);
