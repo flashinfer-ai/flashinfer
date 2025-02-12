@@ -99,6 +99,11 @@ class BatchMLAPagedAttentionWrapper:
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
+        use_cuda_graph: bool = False,
+        qo_indptr: Optional[torch.Tensor] = None,
+        kv_indptr: Optional[torch.Tensor] = None,
+        kv_indices: Optional[torch.Tensor] = None,
+        kv_len_arr: Optional[torch.Tensor] = None,
         backend: str = "fa2",
     ) -> None:
         r"""Constructor for BatchMLAPagedAttentionWrapper.
@@ -122,6 +127,11 @@ class BatchMLAPagedAttentionWrapper:
             dtype=self._int_workspace_buffer.dtype,
             pin_memory=True,
         )
+        self._use_cuda_graph = use_cuda_graph
+        self._qo_indptr_buf = qo_indptr
+        self._kv_indptr_buf = kv_indptr
+        self._kv_indices_buf = kv_indices
+        self._kv_len_arr_buf = kv_len_arr
 
     def plan(
         self,
@@ -181,10 +191,16 @@ class BatchMLAPagedAttentionWrapper:
         kv_indptr_host = kv_indptr.to("cpu")
         kv_len_arr_host = kv_len_arr.to("cpu")
 
-        self._qo_indptr_buf = qo_indptr
-        self._kv_indptr_buf = kv_indptr
-        self._kv_indices_buf = kv_indices
-        self._kv_len_arr_buf = kv_len_arr
+        if self._use_cuda_graph:
+            self._qo_indptr_buf.copy_(qo_indptr, non_blocking=True)
+            self._kv_indptr_buf.copy_(kv_indptr, non_blocking=True)
+            self._kv_indices_buf[: len(kv_indices)].copy_(kv_indices, non_blocking=True)
+            self._kv_len_arr_buf.copy_(kv_len_arr, non_blocking=True)
+        else:
+            self._qo_indptr_buf = qo_indptr
+            self._kv_indptr_buf = kv_indptr
+            self._kv_indices_buf = kv_indices
+            self._kv_len_arr_buf = kv_len_arr
         self._causal = causal
         self._page_size = page_size
         self._sm_scale = sm_scale
