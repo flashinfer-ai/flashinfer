@@ -147,7 +147,7 @@ def test_batch_prefill_with_ragged_kv_cache(
 
 @pytest.mark.parametrize("batch_size", [1, 17, 37])
 @pytest.mark.parametrize("kv_len", [17, 33, 96, 97, 114, 514, 1024])
-@pytest.mark.parametrize("qo_len", [1, 17, 37])
+@pytest.mark.parametrize("qo_len", [1, 17, 37, 77])
 @pytest.mark.parametrize("num_heads", [4, 32, 128])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("page_size", [1])
@@ -168,13 +168,13 @@ def test_batch_mla_page_attention(
         pytest.skip("kv_len not divisible by page_size")
     head_dim_ckv = 512
     head_dim_kpe = 64
-    q_nope = torch.ones(
+    q_nope = torch.randn(
         batch_size * qo_len, num_heads, head_dim_ckv, dtype=torch.half, device="cuda"
     )
     q_pe = torch.randn(
         batch_size * qo_len, num_heads, head_dim_kpe, dtype=torch.half, device="cuda"
     )
-    ckv = torch.ones(
+    ckv = torch.randn(
         batch_size * kv_len // page_size,
         page_size,
         head_dim_ckv,
@@ -222,10 +222,9 @@ def test_batch_mla_page_attention(
 
     q = torch.cat([q_nope, q_pe], dim=-1)
     o_ref, lse_ref = attention_ref(batch_size, q, k, v, causal, sm_scale)
-
     lse_ref = lse_ref.flatten(0, 1)
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
-    # torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":
@@ -234,5 +233,7 @@ if __name__ == "__main__":
     # test_batch_mla_page_attention(12, 54, 37, 128, False, "fa2")
     # test_batch_mla_page_attention(1, 320, 1, 1, False, 1, "fa2")
     # test_batch_mla_page_attention(3, 32, 1, 4, False, 1, "fa2")
-    test_batch_mla_page_attention(37, 33, 1, 128, True, 1, "fa2")
-    # test_batch_mla_page_attention(1, 17, 37, 4, True, 1, "fa2")
+    # test_batch_mla_page_attention(37, 33, 1, 128, True, 1, "fa2")
+    # test_batch_mla_page_attention(33, 2, 1, 1, False, 1, "fa2")
+    # test_batch_mla_page_attention(17, 64, 17, 128, False, 1, "fa2")
+    test_batch_mla_page_attention(4, 64, 17, 32, False, 1, "fa2")

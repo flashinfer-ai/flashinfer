@@ -27,13 +27,13 @@ def bench_deepseek_mla_decode(batch_size, seq_len, num_heads):
     q_nope = torch.randn(
         batch_size * 1, num_heads, head_dim_ckv, dtype=torch.half, device="cuda"
     )
-    q_pe = torch.randn(
+    q_pe = torch.zeros(
         batch_size * 1, num_heads, head_dim_kpe, dtype=torch.half, device="cuda"
     )
     ckv = torch.randn(
         batch_size * seq_len, 1, head_dim_ckv, dtype=torch.half, device="cuda"
     )
-    kpe = torch.randn(
+    kpe = torch.zeros(
         batch_size * seq_len, 1, head_dim_kpe, dtype=torch.half, device="cuda"
     )
     sm_scale = 1.0 / ((head_dim_ckv + head_dim_kpe) ** 0.5)
@@ -59,7 +59,7 @@ def bench_deepseek_mla_decode(batch_size, seq_len, num_heads):
         q_nope.dtype,
         ckv.dtype,
     )
-    o = wrapper.run(q_nope, q_pe, ckv, kpe)
+    o = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
 
     ms = triton.testing.do_bench(
         lambda: wrapper.run(q_nope, q_pe, ckv, kpe),
@@ -73,4 +73,4 @@ def bench_deepseek_mla_decode(batch_size, seq_len, num_heads):
 
 
 if __name__ == "__main__":
-    bench_deepseek_mla_decode(128, 2048, 64)
+    bench_deepseek_mla_decode(768, 2048, 16)
