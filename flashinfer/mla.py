@@ -99,6 +99,11 @@ class BatchMLAPagedAttentionWrapper:
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
+        use_cuda_graph: bool = False,
+        qo_indptr: Optional[torch.Tensor] = None,
+        kv_indptr: Optional[torch.Tensor] = None,
+        kv_indices: Optional[torch.Tensor] = None,
+        kv_len_arr: Optional[torch.Tensor] = None,
         backend: str = "fa2",
     ) -> None:
         r"""Constructor for BatchMLAPagedAttentionWrapper.
@@ -109,6 +114,25 @@ class BatchMLAPagedAttentionWrapper:
             The user reserved workspace buffer used to store intermediate attention results in
             split-k algorithm. The recommended size is 128MB, the device of the workspace buffer
             should be the same as the device of the input tensors.
+        use_cuda_graph : bool, optional
+            Whether to enable CUDA graph capture for the prefill kernels, if enabled, the
+            auxiliary data structures will be stored in provided buffers. The ``batch_size``
+            cannot change during the lifecycle of this wrapper when CUDAGraph is enabled.
+        qo_indptr_buf : Optional[torch.Tensor]
+            The user reserved buffer to store the ``qo_indptr`` array, the size of the buffer
+            should be ``[batch_size + 1]``.
+            This argument is only effective when ``use_cuda_graph`` is ``True``.
+        kv_indptr_buf : Optional[torch.Tensor]
+            The user reserved buffer to store the ``kv_indptr`` array, the size of the buffer
+            should be ``[batch_size + 1]``.
+            This argument is only effective when ``use_cuda_graph`` is ``True``.
+        kv_indices_buf : Optional[torch.Tensor]
+            The user reserved buffer to store the ``kv_indices`` array.
+            This argument is only effective when ``use_cuda_graph`` is ``True``.
+        kv_len_arr_buf : Optional[torch.Tensor]
+            The user reserved buffer to store the ``kv_len_arr`` array, the size of the buffer
+            should be ``[batch_size]``.
+            This argument is only effective when ``use_cuda_graph`` is ``True``.
         backend : str
             The implementation backend, default is "fa2".
         """
@@ -122,6 +146,11 @@ class BatchMLAPagedAttentionWrapper:
             dtype=self._int_workspace_buffer.dtype,
             pin_memory=True,
         )
+        self._use_cuda_graph = use_cuda_graph
+        self._qo_indptr_buf = qo_indptr
+        self._kv_indptr_buf = kv_indptr
+        self._kv_indices_buf = kv_indices
+        self._kv_len_arr_buf = kv_len_arr
 
     def plan(
         self,
@@ -181,10 +210,16 @@ class BatchMLAPagedAttentionWrapper:
         kv_indptr_host = kv_indptr.to("cpu")
         kv_len_arr_host = kv_len_arr.to("cpu")
 
-        self._qo_indptr_buf = qo_indptr
-        self._kv_indptr_buf = kv_indptr
-        self._kv_indices_buf = kv_indices
-        self._kv_len_arr_buf = kv_len_arr
+        if self._use_cuda_graph:
+            self._qo_indptr_buf.copy_(qo_indptr, non_blocking=True)
+            self._kv_indptr_buf.copy_(kv_indptr, non_blocking=True)
+            self._kv_indices_buf[: len(kv_indices)].copy_(kv_indices, non_blocking=True)
+            self._kv_len_arr_buf.copy_(kv_len_arr, non_blocking=True)
+        else:
+            self._qo_indptr_buf = qo_indptr
+            self._kv_indptr_buf = kv_indptr
+            self._kv_indices_buf = kv_indices
+            self._kv_len_arr_buf = kv_len_arr
         self._causal = causal
         self._page_size = page_size
         self._sm_scale = sm_scale
