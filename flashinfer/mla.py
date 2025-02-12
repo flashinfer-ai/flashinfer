@@ -216,10 +216,10 @@ class BatchMLAPagedAttentionWrapper:
             self._kv_indices_buf[: len(kv_indices)].copy_(kv_indices, non_blocking=True)
             self._kv_len_arr_buf.copy_(kv_len_arr, non_blocking=True)
         else:
-            self._qo_indptr_buf = qo_indptr
-            self._kv_indptr_buf = kv_indptr
-            self._kv_indices_buf = kv_indices
-            self._kv_len_arr_buf = kv_len_arr
+            self._qo_indptr_buf = qo_indptr.to(self.device, non_blocking=True)
+            self._kv_indptr_buf = kv_indptr.to(self.device, non_blocking=True)
+            self._kv_indices_buf = kv_indices.to(self.device, non_blocking=True)
+            self._kv_len_arr_buf = kv_len_arr.to(self.device, non_blocking=True)
         self._causal = causal
         self._page_size = page_size
         self._sm_scale = sm_scale
