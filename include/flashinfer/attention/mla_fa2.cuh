@@ -15,6 +15,8 @@
  */
 #ifndef FLASHINFER_MLA_FA2_CUH_
 #define FLASHINFER_MLA_FA2_CUH_
+#include <driver_types.h>
+
 #include <cstdint>
 
 #include "mla_params.cuh"
@@ -861,15 +863,25 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
   }
 }
 
-#define DISPATCH_SMEM_CONFIG(smem_limit_per_sm, NUM_STAGES, CTA_TILE_KV, ...) \
-  if (smem_limit_per_sm >= 221696) {                                          \
-    constexpr uint32_t NUM_STAGES = 2;                                        \
-    constexpr uint32_t CTA_TILE_KV = 64;                                      \
-    __VA_ARGS__;                                                              \
-  } else {                                                                    \
-    constexpr uint32_t NUM_STAGES = 1;                                        \
-    constexpr uint32_t CTA_TILE_KV = 32;                                      \
-    __VA_ARGS__;                                                              \
+#define DISPATCH_SMEM_CONFIG(smem_limit_per_sm, NUM_STAGES, CTA_TILE_KV, QK_SHARD, ...) \
+  if (smem_limit_per_sm >= 221696) {                                                    \
+    constexpr uint32_t NUM_STAGES = 2;                                                  \
+    constexpr uint32_t CTA_TILE_KV = 64;                                                \
+    constexpr bool QK_SHARD = true;                                                     \
+    __VA_ARGS__;                                                                        \
+  } else if (smem_limit_per_sm >= 147968) {                                             \
+    constexpr uint32_t NUM_STAGES = 2;                                                  \
+    constexpr uint32_t CTA_TILE_KV = 32;                                                \
+    constexpr bool QK_SHARD = true;                                                     \
+    __VA_ARGS__;                                                                        \
+  } else if (smem_limit_per_sm >= 92672) {                                              \
+    constexpr uint32_t NUM_STAGES = 1;                                                  \
+    constexpr uint32_t CTA_TILE_KV = 16;                                                \
+    constexpr bool QK_SHARD = false;                                                    \
+    __VA_ARGS__;                                                                        \
+  } else {                                                                              \
+    FLASHINFER_ERROR("Unsupported shared memory size: " << smem_limit_per_sm);          \
+    return cudaErrorNotSupported;                                                       \
   }
 
 template <MaskMode MASK_MODE, uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename Params>
@@ -896,12 +908,12 @@ cudaError_t BatchMLAPagedAttention(Params params, uint32_t num_blks_x, uint32_t 
   int smem_limit_per_sm;
   cudaGetDevice(&device);
   cudaDeviceGetAttribute(&smem_limit_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device);
+  smem_limit_per_sm = 0;
 
-  DISPATCH_SMEM_CONFIG(smem_limit_per_sm, NUM_STAGES, CTA_TILE_KV, {
-    using KTraits = KernelTraits<CAUSAL, NUM_STAGES, /*QK_SHARD=*/true, HEAD_DIM_CKV, HEAD_DIM_KPE,
+  DISPATCH_SMEM_CONFIG(smem_limit_per_sm, NUM_STAGES, CTA_TILE_KV, QK_SHARD, {
+    using KTraits = KernelTraits<CAUSAL, NUM_STAGES, QK_SHARD, HEAD_DIM_CKV, HEAD_DIM_KPE,
                                  /*CTA_TILE_Q_=*/64, CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType>;
     size_t smem_size = sizeof(typename KTraits::SharedStorage);
-
     auto kernel = BatchMLAPagedAttentionKernel<KTraits, Params>;
     void* args[] = {(void*)&params};
 
