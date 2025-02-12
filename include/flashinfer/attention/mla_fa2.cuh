@@ -15,8 +15,6 @@
  */
 #ifndef FLASHINFER_MLA_FA2_CUH_
 #define FLASHINFER_MLA_FA2_CUH_
-#include <driver_types.h>
-
 #include <cstdint>
 #include <sstream>
 
