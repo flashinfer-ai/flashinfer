@@ -47,8 +47,10 @@ struct SharedStorageQKVO {
         alignas(16) DTypeKV kpe[CTA_TILE_KV * HEAD_DIM_KPE];
         alignas(16) DTypeKV p[CTA_TILE_Q * CTA_TILE_KV];
       } aux_smem[NUM_STAGES];
-      alignas(16) float m_wg[2][CTA_TILE_Q];  // cross warpgroup synchronization
-      alignas(16) float d_wg[2][CTA_TILE_Q];  // cross warpgroup synchronization
+      union {
+        alignas(16) float m_wg[2][CTA_TILE_Q];  // cross warpgroup synchronization
+        alignas(16) float d_wg[2][CTA_TILE_Q];  // cross warpgroup synchronization
+      };
     };
     alignas(16) DTypeO o_smem[CTA_TILE_Q * HEAD_DIM_CKV];
   };
@@ -74,16 +76,15 @@ struct KernelTraits {
   static constexpr SwizzleMode SWIZZLE_MODE_Q_PE = SwizzleMode::k128B;
   static constexpr SwizzleMode SWIZZLE_MODE_CKV = SwizzleMode::k128B;
   static constexpr SwizzleMode SWIZZLE_MODE_KPE = SwizzleMode::k128B;
-  static constexpr SwizzleMode SWIZZLE_MODE_P = SwizzleMode::k128B;
+  static constexpr SwizzleMode SWIZZLE_MODE_P =
+      CTA_TILE_KV >= 64 ? SwizzleMode::k128B : SwizzleMode::k64B;
   static constexpr SwizzleMode SWIZZLE_MODE_O = SwizzleMode::k128B;
-  static constexpr uint32_t KV_THR_LAYOUT_ROW = 4;
-  static constexpr uint32_t KV_THR_LAYOUT_COL = 8;
   static constexpr uint32_t UPCAST_STRIDE_Q_NOPE = HEAD_DIM_CKV / upcast_size<DTypeQ_>();
   static constexpr uint32_t UPCAST_STRIDE_Q_PE = HEAD_DIM_KPE / upcast_size<DTypeQ_>();
   static constexpr uint32_t UPCAST_STRIDE_CKV = HEAD_DIM_CKV / upcast_size<DTypeKV_>();
   static constexpr uint32_t UPCAST_STRIDE_KPE = HEAD_DIM_KPE / upcast_size<DTypeKV_>();
   static constexpr uint32_t UPCAST_STRIDE_FINAL_O = HEAD_DIM_CKV / upcast_size<DTypeO_>();
-  static constexpr uint32_t UPCAST_STRIDE_P = CTA_TILE_KV_ / upcast_size<DTypeKV_>();
+  static constexpr uint32_t UPCAST_STRIDE_P = CTA_TILE_KV / upcast_size<DTypeKV_>();
   static constexpr uint32_t UPCAST_STRIDE_PARTIAL_O = HEAD_DIM_CKV / upcast_size<float>();
 
   using DTypeQ = DTypeQ_;
@@ -350,24 +351,34 @@ __device__ __forceinline__ void store_p_smem(typename KTraits::SharedStorage* sm
                                              typename KTraits::DTypeQKAccum (*s_frag)[8],
                                              typename KTraits::DTypeQKAccum* d) {
   const uint32_t lane_idx = threadIdx.x, warpgroup_idx = threadIdx.z, warp_idx_in_wg = threadIdx.y;
-  alignas(16) typename KTraits::DTypeKV p_f16[KTraits::NUM_MMA_KV / 2][8];
+  constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
+  alignas(16) typename KTraits::DTypeKV p_f16[NUM_MMA_KV / 2][8];
 #pragma unroll
-  for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV / 2; ++mma_kv) {
+  for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV / 2; ++mma_kv) {
     vec_cast<typename KTraits::DTypeKV, float>::cast<8>(p_f16[mma_kv], s_frag[mma_kv]);
     mma::m16k16_rowsum_f16f16f32(d, p_f16[mma_kv]);
   }
 
   __syncthreads();
   smem_t<KTraits::SWIZZLE_MODE_P> p_smem(smem_storage->aux_smem[stage_idx].p);
+  constexpr uint32_t UPCAST_STRIDE_P = KTraits::UPCAST_STRIDE_P;
 #pragma unroll
-  for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV / 2; ++mma_kv) {
+  for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV / 2; ++mma_kv) {
 #ifdef FLASHINFER_STMATRIX_M8N8X4_ENABLED
-    uint32_t p_smem_offset_w = p_smem.template get_permuted_offset<KTraits::UPCAST_STRIDE_P>(
+    uint32_t p_smem_offset_w = p_smem.template get_permuted_offset<UPCAST_STRIDE_P>(
         warp_idx_in_wg * 16 + lane_idx % 16,
-        warpgroup_idx * KTraits::NUM_MMA_KV + mma_kv * 2 + lane_idx / 16);
+        warpgroup_idx * NUM_MMA_KV + mma_kv * 2 + lane_idx / 16);
     p_smem.stmatrix_m8n8x4(p_smem_offset_w, (uint32_t*)p_f16[mma_kv]);
 #else
-    static_assert(false, "Not implemented yet");
+    uint32_t p_smem_offset_w = p_smem.template get_permuted_offset<UPCAST_STRIDE_P>(
+        warp_idx_in_wg * 16 + lane_idx / 4, warpgroup_idx * NUM_MMA_KV + mma_kv * 2);
+    ((uint32_t*)(p_smem.base + p_smem_offset_w))[lane_idx % 4] = *(uint32_t*)&p_f16[mma_kv][0];
+    ((uint32_t*)(p_smem.base + p_smem_offset_w + 8 * UPCAST_STRIDE_P))[lane_idx % 4] =
+        *(uint32_t*)&p_f16[mma_kv][2];
+    ((uint32_t*)(p_smem.base + (p_smem_offset_w ^ 0x1)))[lane_idx % 4] =
+        *(uint32_t*)&p_f16[mma_kv][4];
+    ((uint32_t*)(p_smem.base + (p_smem_offset_w ^ 0x1) + 8 * UPCAST_STRIDE_P))[lane_idx % 4] =
+        *(uint32_t*)&p_f16[mma_kv][6];
 #endif
   }
 }
@@ -572,8 +583,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
   [[maybe_unused]] constexpr SwizzleMode SWIZZLE_MODE_Q_PE = KTraits::SWIZZLE_MODE_Q_PE;
   [[maybe_unused]] constexpr SwizzleMode SWIZZLE_MODE_CKV = KTraits::SWIZZLE_MODE_CKV;
   [[maybe_unused]] constexpr SwizzleMode SWIZZLE_MODE_KPE = KTraits::SWIZZLE_MODE_KPE;
-  [[maybe_unused]] constexpr uint32_t KV_THR_LAYOUT_ROW = KTraits::KV_THR_LAYOUT_ROW;
-  [[maybe_unused]] constexpr uint32_t KV_THR_LAYOUT_COL = KTraits::KV_THR_LAYOUT_COL;
   [[maybe_unused]] constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
   [[maybe_unused]] constexpr uint32_t NUM_MMA_D_CKV = KTraits::NUM_MMA_D_CKV;
   [[maybe_unused]] constexpr uint32_t CTA_TILE_Q = KTraits::CTA_TILE_Q;
@@ -655,18 +664,21 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
                      block_iter_base + kv_tile_idx * CTA_TILE_KV, block_size,
                      kv_tile_idx % NUM_STAGES);
     cp_async::commit_group();
-    if (kv_tile_idx > start_tile_idx) {
-      load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
-                       kpe_stride_n, kpe_stride_page, kv_bound,
-                       block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV, block_size,
-                       (kv_tile_idx - 1) % NUM_STAGES);
-      cp_async::commit_group();
+#pragma unroll
+    for (uint32_t stage_idx = 1; stage_idx < NUM_STAGES; ++stage_idx) {
+      if (kv_tile_idx - stage_idx >= start_tile_idx) {
+        load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
+                         kpe_stride_n, kpe_stride_page, kv_bound,
+                         block_iter_base + (kv_tile_idx - stage_idx) * CTA_TILE_KV, block_size,
+                         (kv_tile_idx - stage_idx) % NUM_STAGES);
+        cp_async::commit_group();
+      }
     }
 
     // loop with mask
 #pragma unroll 1
     for (; kv_tile_idx >= mask_tile_idx && kv_tile_idx > start_tile_idx; --kv_tile_idx) {
-      cp_async::wait_group<1>();
+      cp_async::wait_group<NUM_STAGES - 1>();
       __syncthreads();
 
       // compute mla qk
@@ -684,20 +696,20 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
       // compute sfm * v
       compute_mla_pv<KTraits>(&smem_storage, kv_tile_idx % NUM_STAGES, o_frag);
 
-      if (kv_tile_idx - 2 >= start_tile_idx) {
+      if (kv_tile_idx - NUM_STAGES >= start_tile_idx) {
         __syncthreads();
         load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
                          kpe_stride_n, kpe_stride_page, kv_bound,
-                         block_iter_base + (kv_tile_idx - 2) * CTA_TILE_KV, block_size,
-                         (kv_tile_idx - 2) % NUM_STAGES);
+                         block_iter_base + (kv_tile_idx - NUM_STAGES) * CTA_TILE_KV, block_size,
+                         (kv_tile_idx - NUM_STAGES) % NUM_STAGES);
         cp_async::commit_group();
       }
     }
 
     // loop without mask
 #pragma unroll 1
-    for (; kv_tile_idx > start_tile_idx + 1; --kv_tile_idx) {
-      cp_async::wait_group<1>();
+    for (; kv_tile_idx > start_tile_idx + NUM_STAGES - 1; --kv_tile_idx) {
+      cp_async::wait_group<NUM_STAGES - 1>();
       __syncthreads();
 
       // compute mla qk
@@ -714,8 +726,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
       __syncthreads();
       load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
                        kpe_stride_n, kpe_stride_page, kv_bound,
-                       block_iter_base + (kv_tile_idx - 2) * CTA_TILE_KV, block_size,
-                       (kv_tile_idx - 2) % NUM_STAGES);
+                       block_iter_base + (kv_tile_idx - NUM_STAGES) * CTA_TILE_KV, block_size,
+                       (kv_tile_idx - NUM_STAGES) % NUM_STAGES);
       cp_async::commit_group();
     }
     cp_async::wait_group<0>();
@@ -753,6 +765,17 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
   }
 }
 
+#define DISPATCH_SMEM_CONFIG(smem_limit_per_sm, NUM_STAGES, CTA_TILE_KV, ...) \
+  if (smem_limit_per_sm >= 221696) {                                          \
+    constexpr uint32_t NUM_STAGES = 2;                                        \
+    constexpr uint32_t CTA_TILE_KV = 64;                                      \
+    __VA_ARGS__;                                                              \
+  } else {                                                                    \
+    constexpr uint32_t NUM_STAGES = 1;                                        \
+    constexpr uint32_t CTA_TILE_KV = 32;                                      \
+    __VA_ARGS__;                                                              \
+  }
+
 template <MaskMode MASK_MODE, uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename Params>
 cudaError_t BatchMLAPagedAttention(Params params, uint32_t num_blks_x, uint32_t num_blks_y,
                                    cudaStream_t stream) {
@@ -772,17 +795,25 @@ cudaError_t BatchMLAPagedAttention(Params params, uint32_t num_blks_x, uint32_t 
   dim3 nblks(num_blks_x, num_blks_y);
   dim3 nthrs(32, 4, 2);
 
-  using KTraits =
-      KernelTraits<CAUSAL, /*NUM_STAGES_=*/2, HEAD_DIM_CKV, HEAD_DIM_KPE, /*CTA_TILE_Q_=*/64,
-                   /*CTA_TILE_KV_=*/64, DTypeQ, DTypeKV, DTypeO, IdType>;
-  size_t smem_size = sizeof(typename KTraits::SharedStorage);
+  // get GPU shared memory size
+  int device;
+  int smem_limit_per_sm;
+  cudaGetDevice(&device);
+  cudaDeviceGetAttribute(&smem_limit_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device);
 
-  auto kernel = BatchMLAPagedAttentionKernel<KTraits, Params>;
-  void* args[] = {(void*)&params};
+  DISPATCH_SMEM_CONFIG(smem_limit_per_sm, NUM_STAGES, CTA_TILE_KV, {
+    using KTraits = KernelTraits<CAUSAL, NUM_STAGES, HEAD_DIM_CKV, HEAD_DIM_KPE, /*CTA_TILE_Q_=*/64,
+                                 CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType>;
+    size_t smem_size = sizeof(typename KTraits::SharedStorage);
 
-  FLASHINFER_CUDA_CALL(
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-  FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+    auto kernel = BatchMLAPagedAttentionKernel<KTraits, Params>;
+    void* args[] = {(void*)&params};
+
+    FLASHINFER_CUDA_CALL(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+  });
+
   return cudaSuccess;
 }
 
