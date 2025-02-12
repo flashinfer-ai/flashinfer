@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 by FlashInfer team.
+ * Copyright (c) 2025 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -52,6 +52,7 @@ namespace flashinfer {
   }
 
 struct AttentionVariantBase {
+  constexpr static bool use_softmax = true;
   REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx,
                             { return logits; })
 

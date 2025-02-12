@@ -143,6 +143,74 @@ def get_batch_decode_uri(
     )
 
 
+def get_batch_mla_uri(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_ckv: int,
+    head_dim_kpe: int,
+) -> str:
+    return (
+        f"batch_mla_attention_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
+        f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
+        f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
+        f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
+        f"head_dim_ckv_{head_dim_ckv}_"
+        f"head_dim_kpe_{head_dim_kpe}"
+    )
+
+
+def gen_batch_mla_module(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_ckv: int,
+    head_dim_kpe: int,
+):
+    uri = get_batch_mla_uri(
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_ckv,
+        head_dim_kpe,
+    )
+    gen_directory = FLASHINFER_GEN_SRC_DIR / uri
+    os.makedirs(gen_directory, exist_ok=True)
+
+    with open(FLASHINFER_CSRC_DIR / "batch_mla_config.jinja") as f:
+        config_templ = jinja2.Template(f.read())
+    generated_config_path = gen_directory / "batch_mla_config.inc"
+    write_if_different(
+        generated_config_path,
+        config_templ.render(
+            dtype_q=dtype_map[dtype_q],
+            dtype_kv=dtype_map[dtype_kv],
+            dtype_o=dtype_map[dtype_o],
+            dtype_idx=dtype_map[dtype_idx],
+            head_dim_ckv=head_dim_ckv,
+            head_dim_kpe=head_dim_kpe,
+        ),
+    )
+
+    source_paths = []
+    for filename in [
+        "batch_mla_plan.cu",
+        "batch_mla_run.cu",
+        "batch_mla_pybind.cu",
+    ]:
+        src_path = FLASHINFER_CSRC_DIR / filename
+        dest_path = gen_directory / filename
+        source_paths.append(dest_path)
+        with open(src_path, "r") as f:
+            source = f.read()
+        write_if_different(dest_path, source)
+
+    return load_cuda_ops(uri, source_paths)
+
+
 def get_batch_decode_mla_uri(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
