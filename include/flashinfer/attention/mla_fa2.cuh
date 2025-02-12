@@ -18,6 +18,7 @@
 #include <driver_types.h>
 
 #include <cstdint>
+#include <sstream>
 
 #include "mla_params.cuh"
 #include "prefill.cuh"
@@ -880,7 +881,9 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
     constexpr bool QK_SHARD = false;                                                    \
     __VA_ARGS__;                                                                        \
   } else {                                                                              \
-    FLASHINFER_ERROR("Unsupported shared memory size: " << smem_limit_per_sm);          \
+    std::ostringstream err;                                                             \
+    err << "Unsupported shared memory size: " << smem_limit_per_sm;                     \
+    FLASHINFER_ERROR(err.str());                                                        \
     return cudaErrorNotSupported;                                                       \
   }
 
@@ -908,7 +911,6 @@ cudaError_t BatchMLAPagedAttention(Params params, uint32_t num_blks_x, uint32_t 
   int smem_limit_per_sm;
   cudaGetDevice(&device);
   cudaDeviceGetAttribute(&smem_limit_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device);
-  smem_limit_per_sm = 0;
 
   DISPATCH_SMEM_CONFIG(smem_limit_per_sm, NUM_STAGES, CTA_TILE_KV, QK_SHARD, {
     using KTraits = KernelTraits<CAUSAL, NUM_STAGES, QK_SHARD, HEAD_DIM_CKV, HEAD_DIM_KPE,
