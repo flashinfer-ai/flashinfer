@@ -211,6 +211,7 @@ cudaError_t PODWithKVCacheNoTensorDispatched(PrefillParams prefill_params,
                                      DecodeParams decode_params,
                                      typename DecodeParams::DTypeO* tmp_v,
                                      float *tmp_s, cudaStream_t stream) {
+  TORCH_WARN_ONCE("Warning: Using tensor cores for POD's decode is more performant. Set use_tensor_cores=True to use.");
   // Ensure KV heads match
   assert(prefill_params.num_kv_heads == decode_params.paged_kv.num_heads);
   // Prefill variable setup
