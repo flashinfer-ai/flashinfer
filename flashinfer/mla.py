@@ -114,6 +114,25 @@ class BatchMLAPagedAttentionWrapper:
             The user reserved workspace buffer used to store intermediate attention results in
             split-k algorithm. The recommended size is 128MB, the device of the workspace buffer
             should be the same as the device of the input tensors.
+        use_cuda_graph : bool, optional
+            Whether to enable CUDA graph capture for the prefill kernels, if enabled, the
+            auxiliary data structures will be stored in provided buffers. The ``batch_size``
+            cannot change during the lifecycle of this wrapper when CUDAGraph is enabled.
+        qo_indptr_buf : Optional[torch.Tensor]
+            The user reserved buffer to store the ``qo_indptr`` array, the size of the buffer
+            should be ``[batch_size + 1]``.
+            This argument is only effective when ``use_cuda_graph`` is ``True``.
+        kv_indptr_buf : Optional[torch.Tensor]
+            The user reserved buffer to store the ``kv_indptr`` array, the size of the buffer
+            should be ``[batch_size + 1]``.
+            This argument is only effective when ``use_cuda_graph`` is ``True``.
+        kv_indices_buf : Optional[torch.Tensor]
+            The user reserved buffer to store the ``kv_indices`` array.
+            This argument is only effective when ``use_cuda_graph`` is ``True``.
+        kv_len_arr_buf : Optional[torch.Tensor]
+            The user reserved buffer to store the ``kv_len_arr`` array, the size of the buffer
+            should be ``[batch_size]``.
+            This argument is only effective when ``use_cuda_graph`` is ``True``.
         backend : str
             The implementation backend, default is "fa2".
         """
