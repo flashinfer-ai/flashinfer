@@ -25,12 +25,12 @@
 
 using namespace flashinfer;
 
-void BatchMLAPageAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-                              std::vector<int64_t> plan_info_vec, at::Tensor q_nope,
-                              at::Tensor q_pe, at::Tensor ckv_cache, at::Tensor kpe_cache,
-                              at::Tensor kv_indices, at::Tensor o,
-                              std::optional<at::Tensor> maybe_lse, int mask_mode_code,
-                              int num_heads, int page_size, float sm_scale, int64_t cuda_stream) {
+void BatchMLAPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
+                               std::vector<int64_t> plan_info_vec, at::Tensor q_nope,
+                               at::Tensor q_pe, at::Tensor ckv_cache, at::Tensor kpe_cache,
+                               at::Tensor kv_indices, at::Tensor o,
+                               std::optional<at::Tensor> maybe_lse, int mask_mode_code,
+                               int num_heads, int page_size, float sm_scale, int64_t cuda_stream) {
   // q_nope: [n, num_heads, head_dim_ckv]
   // q_pe: [n, num_heads, head_dim_kpe]
   // ckv_cache: [num_pages, page_size, head_dim_ckv]
@@ -105,7 +105,7 @@ void BatchMLAPageAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_
 
         params.sm_scale = sm_scale;
 
-        cudaError_t status = mla::BatchMLAPageAttention<MASK_MODE, HEAD_DIM_CKV, HEAD_DIM_KPE>(
+        cudaError_t status = mla::BatchMLAPagedAttention<MASK_MODE, HEAD_DIM_CKV, HEAD_DIM_KPE>(
             params, plan_info.num_blks_x, plan_info.num_blks_y, stream);
 
         TORCH_CHECK(status == cudaSuccess,

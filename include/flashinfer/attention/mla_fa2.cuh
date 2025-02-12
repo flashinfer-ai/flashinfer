@@ -556,7 +556,7 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
 }
 
 template <typename KTraits, typename Params>
-__global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionKernel(
+__global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKernel(
     const __grid_constant__ Params params) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
@@ -754,8 +754,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionKer
 }
 
 template <MaskMode MASK_MODE, uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename Params>
-cudaError_t BatchMLAPageAttention(Params params, uint32_t num_blks_x, uint32_t num_blks_y,
-                                  cudaStream_t stream) {
+cudaError_t BatchMLAPagedAttention(Params params, uint32_t num_blks_x, uint32_t num_blks_y,
+                                   cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
   using DTypeO = typename Params::DTypeO;
@@ -777,7 +777,7 @@ cudaError_t BatchMLAPageAttention(Params params, uint32_t num_blks_x, uint32_t n
                    /*CTA_TILE_KV_=*/64, DTypeQ, DTypeKV, DTypeO, IdType>;
   size_t smem_size = sizeof(typename KTraits::SharedStorage);
 
-  auto kernel = BatchMLAPageAttentionKernel<KTraits, Params>;
+  auto kernel = BatchMLAPagedAttentionKernel<KTraits, Params>;
   void* args[] = {(void*)&params};
 
   FLASHINFER_CUDA_CALL(

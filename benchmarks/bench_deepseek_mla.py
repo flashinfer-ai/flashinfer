@@ -38,7 +38,7 @@ def bench_deepseek_mla_decode(batch_size, seq_len, num_heads):
     )
     sm_scale = 1.0 / ((head_dim_ckv + head_dim_kpe) ** 0.5)
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
-    wrapper = flashinfer.mla.BatchMLAPageAttentionWrapper(
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
         workspace_buffer, backend="fa2"
     )
     q_indptr = torch.arange(0, batch_size + 1).to(0).int()

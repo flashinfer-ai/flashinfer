@@ -21,13 +21,13 @@
 
 using namespace flashinfer;
 
-std::vector<int64_t> BatchMLAPageAttentionPlan(at::Tensor float_workspace_buffer,
-                                               at::Tensor int_workspace_buffer,
-                                               at::Tensor page_locked_int_workspace_buffer,
-                                               at::Tensor qo_indptr, at::Tensor kv_indptr,
-                                               at::Tensor kv_len, unsigned int num_heads,
-                                               unsigned int head_dim_o, bool causal,
-                                               int64_t cuda_stream) {
+std::vector<int64_t> BatchMLAPagedAttentionPlan(at::Tensor float_workspace_buffer,
+                                                at::Tensor int_workspace_buffer,
+                                                at::Tensor page_locked_int_workspace_buffer,
+                                                at::Tensor qo_indptr, at::Tensor kv_indptr,
+                                                at::Tensor kv_len, unsigned int num_heads,
+                                                unsigned int head_dim_o, bool causal,
+                                                int64_t cuda_stream) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =

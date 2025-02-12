@@ -150,7 +150,7 @@ def test_batch_prefill_with_ragged_kv_cache(
 @pytest.mark.parametrize("qo_len", [1, 17, 37, 77])
 @pytest.mark.parametrize("num_heads", [4, 32, 128])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("page_size", [1])
+@pytest.mark.parametrize("page_size", [1, 2, 16])
 @pytest.mark.parametrize("backend", ["fa2"])
 def test_batch_mla_page_attention(
     batch_size,
@@ -190,7 +190,7 @@ def test_batch_mla_page_attention(
     )
     sm_scale = 1.0 / ((head_dim_ckv + head_dim_kpe) ** 0.5)
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
-    wrapper = flashinfer.mla.BatchMLAPageAttentionWrapper(
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
         workspace_buffer, backend=backend
     )
     q_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
