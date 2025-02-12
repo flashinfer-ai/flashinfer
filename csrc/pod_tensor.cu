@@ -229,6 +229,13 @@ void pod_with_kv_cache_tensor(
                 params.padded_batch_size = 0;
                 params.partition_kv = false;
 
+                params.maybe_mask_indptr = maybe_mask_indptr_d ? static_cast<int32_t*>(maybe_mask_indptr_d->data_ptr()): nullptr;
+                params.maybe_alibi_slopes = maybe_alibi_slopes_d ? static_cast<float*>(maybe_alibi_slopes_d->data_ptr()): nullptr;
+                params.logits_soft_cap = logits_soft_cap_d;
+                params.sm_scale = sm_scale_d;
+                params.rope_rcp_scale = rope_rcp_scale_d;
+                params.rope_rcp_theta = rope_rcp_theta_d;
+
                 params.request_indices =
                     GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.request_indices_offset);
                 params.qo_tile_indices =
