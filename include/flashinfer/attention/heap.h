@@ -27,12 +27,12 @@ namespace flashinfer {
  * \brief Heap data structure for (index, value) pairs
  * \note minimal element on top
  */
-class CTACostHeap {
+class MinHeap {
  public:
   // first: index, second: cost
   using Element = std::pair<int, float>;
 
-  CTACostHeap(int capacity) : heap_(capacity) {
+  MinHeap(int capacity) : heap_(capacity) {
     for (int i = 0; i < capacity; ++i) {
       heap_[i] = std::make_pair(i, 0.f);
     }
@@ -49,6 +49,8 @@ class CTACostHeap {
     heap_.pop_back();
     return minElement;
   }
+
+  std::vector<Element> getHeap() const { return heap_; }
 
  private:
   // Custom comparator for the min-heap: compare based on 'val' in the pair

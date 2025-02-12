@@ -355,6 +355,7 @@ class BlockSparseAttentionWrapper:
                 q_data_type,
                 indptr.dtype,
                 head_dim,
+                head_dim,
                 PosEncodingMode[pos_encoding_mode].value,
                 False,  # use_sliding_window
                 logits_soft_cap > 0,  # use_logits_soft_cap
@@ -373,6 +374,7 @@ class BlockSparseAttentionWrapper:
                     False,  # is_cuda_graph_enabled
                     -1,  # window_left
                     logits_soft_cap,  # logits_soft_cap
+                    head_dim,
                     head_dim,
                     torch.empty(0, dtype=q_data_type),
                     torch.empty(0, dtype=kv_data_type),
@@ -441,6 +443,7 @@ class BlockSparseAttentionWrapper:
                     num_kv_heads,
                     self.C,  # page_size
                     False,  # is_cuda_graph_enabled,
+                    head_dim,
                     head_dim,
                     causal,
                     get_cuda_stream(device),

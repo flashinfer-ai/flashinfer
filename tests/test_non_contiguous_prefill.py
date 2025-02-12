@@ -177,7 +177,7 @@ def test_batch_paged_prefill_packed_input(
         paged_kv_last_page_len=paged_kv_last_page_len,
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
+        head_dim_qk=head_dim,
         page_size=page_size,
         causal=causal,
     )

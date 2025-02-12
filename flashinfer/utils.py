@@ -171,7 +171,7 @@ def _get_cache_alibi_slopes_buf(
     key = (f"alibi_slopes_{num_qo_heads}", device)
     buf = _cache_buf.get(key)
     if buf is None:
-        buf = (get_alibi_slopes(num_qo_heads) * log2e).to(device)
+        buf = get_alibi_slopes(num_qo_heads).to(device)
         _cache_buf[key] = buf
     return buf
 
