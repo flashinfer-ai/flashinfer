@@ -1,5 +1,92 @@
 # Changelog
 
+## [0.2.1](https://github.com/flashinfer-ai/flashinfer/compare/v0.2.0.post2...v0.2.1)
+
+### What's Changed
+* misc: addressing the package renaming issues by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/770
+* feat: support deepseek prefill attention shape by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/765
+* refactor: change the structure of attention updater by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/772
+* hotfix: follow up of #772 by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/773
+* bugfix: Ensure Loop Termination by Enforcing IEEE-754 Compliance in Sampling Kernels by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/774
+* bugfix: fix the JIT warmup arguments in unittests by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/775
+* ci: change whl folder to flashinfer-python by @abcdabcd987 in https://github.com/flashinfer-ai/flashinfer/pull/779
+* perf: refactor fa2 prefill template by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/776
+* feat: Separate QK/VO head dim dispatch for sm90 AOT by @abcdabcd987 in https://github.com/flashinfer-ai/flashinfer/pull/778
+* bugfix: fix batch prefill attention kernel unittests by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/781
+* misc: remove head dimension 64 from AOT by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/782
+* misc: allow head_dim=64 for sm90 AOT by @abcdabcd987 in https://github.com/flashinfer-ai/flashinfer/pull/783
+* bugfix: drop CTA_TILE_Q=32 by @abcdabcd987 in https://github.com/flashinfer-ai/flashinfer/pull/785
+* refactor: make `group_size` a part of params by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/786
+* bugfix: MLA decode should multiply sm_scale by math::log2e by @tsu-bin in https://github.com/flashinfer-ai/flashinfer/pull/787
+* fix rope logic in mla decoding by @zhyncs in https://github.com/flashinfer-ai/flashinfer/pull/793
+* Fix arguments of `plan` for split QK/VO head dims by @abmfy in https://github.com/flashinfer-ai/flashinfer/pull/795
+* test: add unittest comparing deepseek prefill fa2 & 3 implementation by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/797
+* bugfix: fix aot build not compatible with cmake command by @tsu-bin in https://github.com/flashinfer-ai/flashinfer/pull/796
+* Fix the type annotation of q_dtype and kv_dtype on ragged prefill by @nandor in https://github.com/flashinfer-ai/flashinfer/pull/798
+* feat: support f32 attention output in FA2 template by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/799
+* feat: apply sm_scale at logits instead of q in FA2 template by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/801
+* bugfix: mla decode failed under cuda graph mode, and update test case by @tsu-bin in https://github.com/flashinfer-ai/flashinfer/pull/803
+* perf: memory efficient deepseek mla fused page-attention kernel by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/804
+* bugfix: mla page-attention kernel for different page sizes by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/810
+* doc: add documentation to new MLA interface by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/811
+* feat: unlocking MLA for A100 by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/812
+* feat: cudagraph-compatible MLA API by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/813
+* feat: unlock MLA attention for sm89 (L40/L40s/4090) by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/814
+* misc: fix sphinx by @abcdabcd987 in https://github.com/flashinfer-ai/flashinfer/pull/815
+* bugfix: fix the behavior of mla plan function when provided with host tensors by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/816
+* doc: improve mla related documentation by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/818
+
+### New Contributors
+* @abmfy made their first contribution in https://github.com/flashinfer-ai/flashinfer/pull/795
+
+## [0.2.0.post2](https://github.com/flashinfer-ai/flashinfer/compare/v0.2.0.post1...v0.2.0.post2)
+
+### What's Changed
+* ci: fix the update_whl_index script to regonize version number with "post" and add torch2.5 by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/694
+* bugfix: casting int array to int32 for rope input arguments by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/697
+* bugfix: only use sm90 group gemm when torch cuda >= 12.3 by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/699
+* misc: remove release-please workflow by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/705
+* Customizable SM90 prefill kernels. by @hyhieu in https://github.com/flashinfer-ai/flashinfer/pull/704
+* hotfix: revert torch.library register by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/709
+* Improve compatibility with pytorch 2.5 by @zifeitong in https://github.com/flashinfer-ai/flashinfer/pull/711
+* misc: add bibtex reference by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/712
+* sampling: simplify min-p sampling by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/713
+* perf: fix the iteration bound of SWA in FA2 prefill template by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/714
+* bugfix: fix min-p AOT compilation in #713 by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/717
+* Triton implementation of `silu_and_mul` by @nandor in https://github.com/flashinfer-ai/flashinfer/pull/716
+* bugfix: FusedAddRMSNorm kernels might require more than 48KB shared memory when d is large. by @bobboli in https://github.com/flashinfer-ai/flashinfer/pull/718
+* bugfix: Choose sm90 kernels only for Hopper GPUs. by @bobboli in https://github.com/flashinfer-ai/flashinfer/pull/719
+* Finer-grained control over fp16/fp8 builds by @nandor in https://github.com/flashinfer-ai/flashinfer/pull/722
+* Align KV chunk size binary search with actual KV chunk splitting. by @timzsu in https://github.com/flashinfer-ai/flashinfer/pull/728
+* ci: rename python package name to `flashinfer-python` by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/729
+* Add a note about int32/int64 datatypes to the `kv_layout` tutorial by @fergusfinn in https://github.com/flashinfer-ai/flashinfer/pull/737
+* fix return type of cuBLAS by @zhyncs in https://github.com/flashinfer-ai/flashinfer/pull/749
+* [Refactor] Unify JIT/Customization/AOT mode by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/748
+* Move allocations out of torch ops by @nandor in https://github.com/flashinfer-ai/flashinfer/pull/740
+* [Lint] Fix some linting issues and provide automatic format check script  by @LeiWang1999 in https://github.com/flashinfer-ai/flashinfer/pull/743
+* Filter out unsupported head dim for sm90 by @abcdabcd987 in https://github.com/flashinfer-ai/flashinfer/pull/751
+* bugfix: various AOT issues by @abcdabcd987 in https://github.com/flashinfer-ai/flashinfer/pull/752
+* [bugfix] Fix cpp tests/benchmarks by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/753
+* fix pin memory device by @youkaichao in https://github.com/flashinfer-ai/flashinfer/pull/755
+* Add dev container for easier development by @ByronHsu in https://github.com/flashinfer-ai/flashinfer/pull/680
+* hotfix: bugfix to #756 by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/757
+* Change `apply_rope_with_cos_sin_cache` to accept `cos_sin_cache` by @ByronHsu in https://github.com/flashinfer-ai/flashinfer/pull/754
+* fix: match statement not supported in Python 3.8 by @xslingcn in https://github.com/flashinfer-ai/flashinfer/pull/759
+* bugfix: use actual sm count for num_sm90_ctas by @LLLLKKKK in https://github.com/flashinfer-ai/flashinfer/pull/762
+* bugfix: Fix block-sparse attention API by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/767
+* Version bump: v0.2.0.post2 by @yzh119 in https://github.com/flashinfer-ai/flashinfer/pull/768
+
+### New Contributors
+* @hyhieu made their first contribution in https://github.com/flashinfer-ai/flashinfer/pull/704
+* @zifeitong made their first contribution in https://github.com/flashinfer-ai/flashinfer/pull/711
+* @bobboli made their first contribution in https://github.com/flashinfer-ai/flashinfer/pull/718
+* @timzsu made their first contribution in https://github.com/flashinfer-ai/flashinfer/pull/728
+* @fergusfinn made their first contribution in https://github.com/flashinfer-ai/flashinfer/pull/737
+* @LeiWang1999 made their first contribution in https://github.com/flashinfer-ai/flashinfer/pull/743
+* @youkaichao made their first contribution in https://github.com/flashinfer-ai/flashinfer/pull/755
+* @LLLLKKKK made their first contribution in https://github.com/flashinfer-ai/flashinfer/pull/762
+
+
 ## [0.2.0.post1](https://github.com/flashinfer-ai/flashinfer/compare/v0.2.0...v0.2.0.post1) (2024-12-22)
 
 ### Bug Fixes
