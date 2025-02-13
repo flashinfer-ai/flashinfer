@@ -212,6 +212,7 @@ if enable_aot:
     cxx_flags = [
         "-O3",
         "-Wno-switch-bool",
+        "-DPy_LIMITED_API=0x03080000",
     ]
     nvcc_flags = [
         "-O3",
@@ -220,6 +221,7 @@ if enable_aot:
         "-Xfatbin",
         "-compress-all",
         "-use_fast_math",
+        "-DPy_LIMITED_API=0x03080000",
     ]
     libraries = [
         "cublas",
@@ -264,6 +266,7 @@ if enable_aot:
                 "cxx": cxx_flags,
                 "nvcc": nvcc_flags,
             },
+            py_limited_api=True,
         )
     ]
     if enable_sm90:
@@ -277,6 +280,7 @@ if enable_aot:
                     "cxx": cxx_flags,
                     "nvcc": nvcc_flags + sm90a_flags,
                 },
+                py_limited_api=True,
             ),
         ]
 
@@ -285,4 +289,5 @@ setuptools.setup(
     ext_modules=ext_modules,
     cmdclass=cmdclass,
     install_requires=install_requires,
+    options={"bdist_wheel": {"py_limited_api": "cp38"}},
 )
