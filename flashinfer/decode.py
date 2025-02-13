@@ -612,18 +612,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
             Whether to use tensor cores for the computation. Will be faster for large group
             size in grouped query attention. Defaults to ``False``.
 
-        indptr_buffer : Optional[torch.Tensor]
+        paged_kv_indptr_buffer : Optional[torch.Tensor]
             The user reserved buffer on GPU to store the indptr of the paged kv cache, the size
             of the buffer should be ``[batch_size + 1]``.
             Only needed when ``use_cuda_graph`` is ``True``.
 
-        indices_buffer : Optional[torch.Tensor]
+        paged_kv_indices_buffer : Optional[torch.Tensor]
             The user reserved buffer on GPU to store the page indices of the paged kv cache,
             should be large enough to store the maximum number of page indices
             (``max_num_pages``) during the lifecycle of this wrapper.
             Only needed when ``use_cuda_graph`` is ``True``.
 
-        last_page_len_buffer : Optional[torch.Tensor]
+        paged_kv_last_page_len_buffer : Optional[torch.Tensor]
             The user reserved buffer on GPU to store the number of entries in the last page, the
             size of the buffer should be ``[batch_size]``.
             Only needed when ``use_cuda_graph`` is ``True``.
