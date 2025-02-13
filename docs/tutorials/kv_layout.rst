@@ -24,16 +24,14 @@ by default).
 Ragged Tensor
 -------------
 
-In batched inference/serving, the input sequence length may vary across different samples.
-When there is no need to change the sequence length (e.g. in prefilling stage), we can use ``RaggedTensor``
-with a single ragged (variable length) dimension to store the key/value tensors in KV-Cache:
+We use Ragged Tensor to store the variable length Q/K/V tensors in FlashInfer for batch prefill self-attention:
 
 .. image:: https://raw.githubusercontent.com/flashinfer-ai/web-data/main/tutorials/ragged.png
   :width: 400
   :align: center
   :alt: Data structure of Ragged KV-Cache.
 
-The keys (or values) of all requests are packed into a single ``data`` tensor without padding,
+In Ragged Tensor, all requests's Q/K/V are packed into a single ``data`` tensor without padding,
 we use a ``indptr`` array (``num_requests+1`` elements, the first element is always zero)
 to store the information of variable sequence lengths of each request
 (``indptr[i+1]-indptr[i]`` is the sequence length of request ``i``), the ``data`` tensor has
@@ -42,7 +40,7 @@ shape ``(indptr[-1], num_heads, head_dim)`` when the layout is ``NHD``.
 We can use ``data[indptr[i]:indptr[i+1]]`` to slice the keys (or values) of request ``i``.
 
 .. note::
-  ``indptr`` arrays across the flashinfer library should be of type ``int32``. Arrays of type ``int64`` can cause indexing errors. 
+  ``indptr`` arrays across the flashinfer library should be of type ``int32``. Arrays of type ``int64`` can cause indexing errors.
 
 FlashInfer APIs
 ~~~~~~~~~~~~~~~
@@ -127,21 +125,48 @@ when stored in a single tensor, ``kv_data`` has shape:
 
 .. code:: python
 
-  (max_num_pages, 2, page_size, num_heads, head_dim) # NHD layout
-  (max_num_pages, 2, num_heads, page_size, head_dim) # HND layout
+  kv_cache_nhd = torch.empty(max_num_pages, 2, page_size, num_heads, head_dim, dtype=torch.bfloat16) # NHD layout
+  kv_cache_hnd = torch.empty(max_num_pages, 2, num_heads, page_size, head_dim, dtype=torch.bfloat16) # HND layout
 
 when stored in a tuple of tensors, ``kv_data = (k_data, v_data)``, and each one of them has shape:
 
 .. code:: python
 
-  (max_num_pages, page_size, num_heads, head_dim) # NHD layout
-  (max_num_pages, num_heads, page_size, head_dim) # HND layout
+  k_cache_nhd = torch.empty(max_num_pages, page_size, num_heads, head_dim, dtype=torch.bfloat16) # NHD layout
+  k_cache_nhd = torch.empty(max_num_pages, num_heads, page_size, head_dim, dtype=torch.bfloat16) # HND layout
+  v_cache_nhd = torch.empty(max_num_pages, page_size, num_heads, head_dim, dtype=torch.bfloat16) # NHD layout
+  v_cache_nhd = torch.empty(max_num_pages, num_heads, page_size, head_dim, dtype=torch.bfloat16) # HND layout
+
 
 where ``max_num_pages`` is the maximum number of pages used by all requests, ``page_size`` is the number of tokens
 we fit into each page. ``2`` in single tensor storage means K/V (first one for keys, the second one for values).
 
 .. note::
-  ``indptr`` arrays across the flashinfer library should be of type ``int32``. Arrays of type ``int64`` can cause indexing errors. This is also true of the ``kv_page_indices`` and ``kv_last_page_lens`` arrays. 
+  ``indptr`` arrays across the flashinfer library should be of type ``int32``. Arrays of type ``int64`` can cause indexing errors. This is also true of the ``kv_page_indices`` and ``kv_last_page_lens`` arrays.
+
+.. _mla-page-layout:
+
+Multi-head Latent Attention Page Layout
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Multi-head Latent Attention (MLA) is a new attention mechanism proposed in `DeepSeek v2 <https://arxiv.org/abs/2405.04434>`_ and was
+used in later DeepSeek models. MLA unifies key cache and value cache into a single tensor, so there is no need to store them seperately.
+Compared to multi-head atteniton or grouped query attention, the KV-Cache of MLA do not have the ``num_heads`` dimension,
+so there is no distinction like ``NHD`` and ``HND`` layout.
+
+MLA separates RoPE (Rotary Positional Encoding) dimensions and other head dimensions. We use ``kpe`` (key w/ positional encoding) and ``ckv`` (compressed key/value)
+to name these two components. User can store them in a single Paged KV-Cache:
+
+.. code:: python
+
+  head_dim_ckv = 512
+  head_dim_kpe = 64
+  mla_paged_kv_cache = torch.empty(max_num_pages, page_size, head_dim_ckv + head_dim_kpe, dtype=torch.bfloat16)
+  ckv = mla_paged_kv_cache[:, :, :head_dim_ckv]  # Slicing here does not copy or move data
+  kpe = mla_paged_kv_cache[:, :, head_dim_ckv:]  # Slicing here does not copy or move data
+
+
+and ``ckv`` and ``kpe`` can then be fed into the MLA attention kernel :class:`flashinfer.mla.BatchMLAPagedAttentionWrapper`.
 
 FlashInfer APIs
 ~~~~~~~~~~~~~~~

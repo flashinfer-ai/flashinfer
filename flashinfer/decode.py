@@ -1243,6 +1243,11 @@ class CUDAGraphBatchDecodeWithPagedKVCacheWrapper(BatchDecodeWithPagedKVCacheWra
 
 
 class BatchDecodeMlaWithPagedKVCacheWrapper:
+    r"""Warning: this class is deprecated and will be removed in a future release.
+    Please use :class:`flashinfer.mla.BatchMLAPagedAttentionWrapper` instead, which provides
+    a more efficient and general MLA implementation that supports decode and incremental prefill.
+    """
+
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
