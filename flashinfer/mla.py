@@ -42,7 +42,10 @@ class BatchMLAPagedAttentionWrapper:
     absorbed with :math:`W_{O}`.
     For MLA attention without Matrix Absorption (``head_dim_qk=192`` and ``head_dim_vo=128``, which is
     used in prefilling self-attention stage), please use
-    :class:`flashinfer.prefill.BatchPrefillWithRaggedAttentionWrapper`.
+    :class:`flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper`.
+
+    More information about The Paged KV-Cache layout in MLA is explained in our tutorial
+    :ref:`MLA Page Layout <mla-page-layout>`.
 
     For more details about the MLA computation, Matrix Absorption and FlashInfer's MLA implementation,
     please refer to our `blog post <http://flashinfer.ai/2025/02/10/flashinfer-deepseek-mla.html>`_.
@@ -76,7 +79,7 @@ class BatchMLAPagedAttentionWrapper:
     >>> kpe = torch.zeros(
     ...     batch_size * 999, 1, head_dim_kpe, dtype=torch.bfloat16, device="cuda"
     ... )
-    >>> sm_scale = 1.0 / ((head_dim_ckv + head_dim_kpe) ** 0.5)
+    >>> sm_scale = 1.0 / ((128 + 64) ** 0.5)  # use head dimension before matrix absorption
     >>> mla_wrapper.plan(
     ...     q_indptr,
     ...     kv_indptr,

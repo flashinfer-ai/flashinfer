@@ -188,7 +188,7 @@ def test_batch_mla_page_attention(
         dtype=torch.half,
         device="cuda",
     )
-    sm_scale = 1.0 / ((head_dim_ckv + head_dim_kpe) ** 0.5)
+    sm_scale = 1.0 / ((128 + 64) ** 0.5)  # use head dimension before matrix absorption
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
     wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
         workspace_buffer, backend=backend

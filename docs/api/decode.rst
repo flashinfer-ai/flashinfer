@@ -26,8 +26,3 @@ Batch Decoding
     :members:
 
     .. automethod:: __init__
-
-.. autoclass:: BatchDecodeMlaWithPagedKVCacheWrapper
-    :members:
-
-    .. automethod:: __init__
