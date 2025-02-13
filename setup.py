@@ -212,6 +212,7 @@ if enable_aot:
     cxx_flags = [
         "-O3",
         "-Wno-switch-bool",
+        "-DPy_LIMITED_API=0x03080000",
     ]
     nvcc_flags = [
         "-O3",
@@ -220,6 +221,7 @@ if enable_aot:
         "-Xfatbin",
         "-compress-all",
         "-use_fast_math",
+        "-DPy_LIMITED_API=0x03080000",
     ]
     libraries = [
         "cublas",
