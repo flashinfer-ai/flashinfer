@@ -264,6 +264,7 @@ if enable_aot:
                 "cxx": cxx_flags,
                 "nvcc": nvcc_flags,
             },
+            py_limited_api=True,
         )
     ]
     if enable_sm90:
@@ -277,6 +278,7 @@ if enable_aot:
                     "cxx": cxx_flags,
                     "nvcc": nvcc_flags + sm90a_flags,
                 },
+                py_limited_api=True,
             ),
         ]
 
@@ -285,4 +287,5 @@ setuptools.setup(
     ext_modules=ext_modules,
     cmdclass=cmdclass,
     install_requires=install_requires,
+    options={"bdist_wheel": {"py_limited_api": "cp38"}},
 )
