@@ -40,7 +40,7 @@ jobs:
               -e FLASHINFER_CI_CACHE=/ci-cache \
               -e FLASHINFER_CI_CUDA_VERSION=${{ matrix.cuda }} \
               -e FLASHINFER_CI_TORCH_VERSION=${{ matrix.torch }} \
-              -e FLASHINFER_CI_PYTHON_VERSION="3.10" \
+              -e FLASHINFER_CI_PYTHON_VERSION=3.10 \
               -e TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" \
               -e MAX_JOBS=128 \
               --user $CI_UID:$CI_GID \
