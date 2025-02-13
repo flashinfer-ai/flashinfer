@@ -66,7 +66,7 @@ def get_single_decode_module(*args):
     if args not in _single_decode_modules:
         uri = get_single_decode_uri(*args)
         if has_prebuilt_ops and uri in prebuilt_ops_uri:
-            from . import _kernels
+            _kernels = torch.ops.flashinfer_kernels
 
             run_func = _kernels.single_decode_with_kv_cache
         else:
@@ -213,7 +213,7 @@ def get_batch_decode_module(*args):
     if args not in _batch_decode_modules:
         uri = get_batch_decode_uri(*args)
         if has_prebuilt_ops and uri in prebuilt_ops_uri:
-            from . import _kernels
+            _kernels = torch.ops.flashinfer_kernels
 
             plan_func = _kernels.batch_decode_with_paged_kv_cache_plan
             run_func = _kernels.batch_decode_with_paged_kv_cache_run

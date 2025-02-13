@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023 by FlashInfer team.
+ * Copyright (c) 2025 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,16 +13,17 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "pytorch_extension_utils.h"
 
-void packbits(at::Tensor x, const std::string& bitorder, at::Tensor y, int64_t cuda_stream);
+#pragma once
+#include <ATen/ATen.h>
 
-void segment_packbits(at::Tensor x, at::Tensor input_indptr, at::Tensor output_indptr,
-                      const std::string& bitorder, at::Tensor y, int64_t cuda_stream);
+inline at::Tensor vec_to_tensor(const std::vector<int64_t>& vec) {
+  return at::tensor(vec, at::dtype(at::kLong).device(at::kCPU));
+}
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  // GPU packbits operator
-  m.def("packbits", packbits);
-  // GPU segment packbits operator
-  m.def("segment_packbits", segment_packbits);
+inline std::vector<int64_t> tensor_to_vec(const at::Tensor& tensor) {
+  const size_t size = tensor.numel();
+  const int64_t* first = tensor.const_data_ptr<int64_t>();
+  const int64_t* last = first + size;
+  return std::vector(first, last);
 }

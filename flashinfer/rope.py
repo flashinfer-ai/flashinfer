@@ -28,7 +28,7 @@ def get_rope_module():
     global _rope_module
     if _rope_module is None:
         if has_prebuilt_ops:
-            from . import _kernels
+            _kernels = torch.ops.flashinfer_kernels
 
             _rope_module = _kernels
         else:

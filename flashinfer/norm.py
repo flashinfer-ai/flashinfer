@@ -28,7 +28,7 @@ def get_norm_module():
     global _norm_module
     if _norm_module is None:
         if has_prebuilt_ops:
-            from . import _kernels
+            _kernels = torch.ops.flashinfer_kernels
 
             _norm_module = _kernels
         else:

@@ -22,7 +22,7 @@ using namespace flashinfer;
 void append_paged_kv_cache(at::Tensor append_key, at::Tensor append_value, at::Tensor batch_indices,
                            at::Tensor positions, at::Tensor paged_k_cache, at::Tensor paged_v_cache,
                            at::Tensor kv_indices, at::Tensor kv_indptr, at::Tensor kv_last_page_len,
-                           unsigned int layout, int64_t cuda_stream) {
+                           int64_t layout, int64_t cuda_stream) {
   CHECK_LAST_DIM_CONTIGUOUS(append_key);
   CHECK_LAST_DIM_CONTIGUOUS(append_value);
   CHECK_INPUT(batch_indices);
@@ -115,9 +115,9 @@ void block_sparse_indices_to_vector_sparse_offsets(at::Tensor block_sparse_indic
                                                    at::Tensor block_sparse_indptr,
                                                    at::Tensor vector_sparse_offsets,
                                                    at::Tensor vector_sparse_indptr,
-                                                   at::Tensor kv_len_arr, unsigned int stride_block,
-                                                   unsigned int stride_n, unsigned int batch_size,
-                                                   unsigned int block_size, int64_t cuda_stream) {
+                                                   at::Tensor kv_len_arr, int64_t stride_block,
+                                                   int64_t stride_n, int64_t batch_size,
+                                                   int64_t block_size, int64_t cuda_stream) {
   CHECK_INPUT(block_sparse_indices);
   CHECK_INPUT(block_sparse_indptr);
   CHECK_INPUT(vector_sparse_offsets);

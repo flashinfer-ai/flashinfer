@@ -66,7 +66,7 @@ void top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at:
 
 void top_k_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
                                at::Tensor success, std::optional<at::Tensor> maybe_top_k_arr,
-                               unsigned int top_k_val, bool deterministic, int64_t cuda_stream) {
+                               int64_t top_k_val, bool deterministic, int64_t cuda_stream) {
   CHECK_INPUT(probs);
   CHECK_INPUT(uniform_samples);
   auto device = probs.device();

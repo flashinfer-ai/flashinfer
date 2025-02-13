@@ -29,7 +29,7 @@ def get_sampling_module():
     global _sampling_module
     if _sampling_module is None:
         if has_prebuilt_ops:
-            from . import _kernels
+            _kernels = torch.ops.flashinfer_kernels
 
             module = _kernels
         else:

@@ -51,7 +51,7 @@ using namespace cute;
 template <typename DTypeIn, typename DTypeOut>
 cudaError_t CutlassSegmentGEMMSM90Run(void* float_buffer, size_t float_buffer_size_in_bytes,
                                       void* int_buffer, size_t int_buffer_size_in_bytes,
-                                      void* all_problems, unsigned int batch_size, void* x, void* w,
+                                      void* all_problems, int64_t batch_size, void* x, void* w,
                                       void* y, void* x_stride, void* w_stride, void* y_stride,
                                       bool weight_column_major, cudaStream_t stream) {
   auto compute_capacity = GetCudaComputeCapability();

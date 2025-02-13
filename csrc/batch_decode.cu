@@ -20,6 +20,7 @@
 
 #include "batch_decode_config.inc"
 #include "pytorch_extension_utils.h"
+#include "pytorch_conversion_utils.h"
 
 namespace flashinfer {
 
@@ -32,13 +33,12 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
 
 using namespace flashinfer;
 
-std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
+at::Tensor BatchDecodeWithPagedKVCachePlan(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-    at::Tensor page_locked_int_workspace_buffer, at::Tensor indptr, unsigned int batch_size,
-    unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int page_size,
-    bool enable_cuda_graph, int window_left, float logits_soft_cap, unsigned int head_dim_qk,
-    unsigned int head_dim_vo, at::Tensor empty_q_data, at::Tensor empty_kv_data,
-    int64_t cuda_stream) {
+    at::Tensor page_locked_int_workspace_buffer, at::Tensor indptr, int64_t batch_size,
+    int64_t num_qo_heads, int64_t num_kv_heads, int64_t page_size,
+    bool enable_cuda_graph, int64_t window_left, double logits_soft_cap, int64_t head_dim_qk,
+    int64_t head_dim_vo, at::Tensor empty_q_data, at::Tensor empty_kv_data, int64_t cuda_stream) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =
@@ -74,17 +74,17 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlan(
         });
       });
 
-  return plan_info.ToVector();
+  return vec_to_tensor(plan_info.ToVector());
 }
 
 void BatchDecodeWithPagedKVCacheRun(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-    std::vector<int64_t> plan_info_vec, at::Tensor q, at::Tensor paged_k_cache,
+    at::Tensor plan_info_vec, at::Tensor q, at::Tensor paged_k_cache,
     at::Tensor paged_v_cache, at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices,
     at::Tensor paged_kv_last_page_len, at::Tensor o, std::optional<at::Tensor> maybe_lse,
-    unsigned int kv_layout_code, int window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream) {
+    int64_t kv_layout_code, int64_t window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream) {
   DecodePlanInfo plan_info;
-  plan_info.FromVector(plan_info_vec);
+  plan_info.FromVector(tensor_to_vec(plan_info_vec));
   QKVLayout kv_layout = static_cast<QKVLayout>(kv_layout_code);
   auto device = q.device();
   int64_t batch_size = q.size(0);
