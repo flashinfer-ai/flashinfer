@@ -796,7 +796,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
     cp_async::commit_group();
 #pragma unroll
     for (int stage_idx = 1; stage_idx < NUM_STAGES; ++stage_idx) {
-      if (kv_tile_idx - start_idx >= stage_idx) {
+      if (kv_tile_idx - start_idx >= start_tile_idx) {
         load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
                          kpe_stride_n, kpe_stride_page, kv_bound,
                          block_iter_base + (kv_tile_idx - stage_idx) * CTA_TILE_KV, block_size,
