@@ -52,7 +52,7 @@ struct SingleDecodeWithCustomMask : AttentionVariantBase {
         ["custom_mask"],  # additional_tensor_names
         ["uint8_t"],  # additional_tensor_dtypes
         ["sm_scale"],  # # additional_scalar_names
-        ["double"],  # additional_scalar_dtypes
+        ["float"],  # additional_scalar_dtypes
         "SingleDecodeWithCustomMask",
         variant_decl,
     )
@@ -137,7 +137,7 @@ def test_flash_sigmoid():
         [],  # additional_tensor_names
         [],  # additional_tensor_dtypes
         ["logits_scale", "sigmoid_bias"],  # additional_scalar_names
-        ["double", "double"],  # additional_scalar_dtypes
+        ["float", "float"],  # additional_scalar_dtypes
         "FlashSigmoid",
         variant_decl,
     )
@@ -196,7 +196,7 @@ struct DumpLogits : AttentionVariantBase {
         ["output_logits"],  # additional_tensor_names
         ["float"],  # additional_tensor_dtypes
         ["sm_scale"],  # additional_scalar_names
-        ["double"],  # additional_scalar_dtypes
+        ["float"],  # additional_scalar_dtypes
         "DumpLogits",
         variant_decl,
     )
@@ -221,7 +221,7 @@ def test_batch_decode_flash_sigmoid(use_tensor_cores):
     torch.manual_seed(42)
     variant_decl = flash_sigmoid_sm80_decl
     jit_args = (
-        f"batch_decode_flash_sigmoid_sm80_{use_tensor_cores}",  # uri
+        "batch_decode_flash_sigmoid_sm80",  # uri
         torch.float16,  # dtype_q
         torch.float16,  # dtype_kv
         torch.float16,  # dtype_o
@@ -231,7 +231,7 @@ def test_batch_decode_flash_sigmoid(use_tensor_cores):
         [],  # additional_tensor_names
         [],  # additional_tensor_dtypes
         ["logits_scale", "sigmoid_bias"],  # additional_scalar_names
-        ["double", "double"],  # additional_scalar_dtypes
+        ["float", "float"],  # additional_scalar_dtypes
         "FlashSigmoid",
         variant_decl,
     )
@@ -338,7 +338,7 @@ def test_batch_prefill_flash_sigmoid():
         [],  # additional_tensor_names
         [],  # additional_tensor_dtypes
         ["logits_scale", "sigmoid_bias"],  # additional_scalar_names
-        ["double", "double"],  # additional_scalar_dtypes
+        ["float", "float"],  # additional_scalar_dtypes
         "FlashSigmoid",
         variant_decl,
     )
@@ -457,7 +457,7 @@ def test_batch_prefill_sm90_flash_sigmoid():
         [],  # additional_tensor_names
         [],  # additional_tensor_dtypes
         ["logits_scale", "sigmoid_bias"],  # additional_scalar_names
-        ["double", "double"],  # additional_scalar_dtypes
+        ["float", "float"],  # additional_scalar_dtypes
         "FlashSigmoid",
         variant_decl,
     )
@@ -600,7 +600,7 @@ struct DebugPrintLogits : AttentionVariantBase {
         [],  # additional_tensor_names
         [],  # additional_tensor_dtypes
         ["sm_scale"],  # additional_scalar_names
-        ["double"],  # additional_scalar_dtypes
+        ["float"],  # additional_scalar_dtypes
         "DebugPrintLogits",
         variant_decl,
     )
@@ -673,7 +673,7 @@ struct DebugPrintLogits : AttentionVariantBase {
         [],  # additional_tensor_names
         [],  # additional_tensor_dtypes
         ["sm_scale"],  # additional_scalar_names
-        ["double"],  # additional_scalar_dtypes
+        ["float"],  # additional_scalar_dtypes
         "DebugPrintLogits",
         variant_decl,
     )

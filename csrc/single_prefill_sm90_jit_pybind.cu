@@ -18,11 +18,11 @@
 
 void single_prefill_with_kv_cache_sm90(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor tmp,
                                        at::Tensor o, std::optional<at::Tensor> maybe_lse,
-                                       int64_t mask_mode_code, int64_t layout,
-                                       int64_t window_left ADDITIONAL_FUNC_PARAMS,
+                                       unsigned int mask_mode_code, unsigned int layout,
+                                       int32_t window_left ADDITIONAL_FUNC_PARAMS,
                                        int64_t cuda_stream);
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  // Single-request prefill attention with KV-Cache operator
-  m.def("run", single_prefill_with_kv_cache_sm90);
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("run", &single_prefill_with_kv_cache_sm90,
+        "Single-request prefill attention with KV-Cache operator");
 }

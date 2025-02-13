@@ -20,7 +20,6 @@
 
 #include "batch_prefill_config.inc"
 #include "pytorch_extension_utils.h"
-#include "pytorch_conversion_utils.h"
 
 namespace flashinfer {
 
@@ -40,12 +39,12 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
 
 using namespace flashinfer;
 
-at::Tensor BatchPrefillWithKVCachePlan(
+std::vector<int64_t> BatchPrefillWithKVCachePlan(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr, at::Tensor kv_indptr,
-    at::Tensor kv_len_arr, int64_t total_num_rows, int64_t batch_size,
-    int64_t num_qo_heads, int64_t num_kv_heads, int64_t page_size,
-    bool enable_cuda_graph, int64_t head_dim_qk, int64_t head_dim_vo, bool causal,
+    at::Tensor kv_len_arr, unsigned total_num_rows, unsigned int batch_size,
+    unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int page_size,
+    bool enable_cuda_graph, unsigned int head_dim_qk, unsigned int head_dim_vo, bool causal,
     int64_t cuda_stream) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
@@ -65,17 +64,17 @@ at::Tensor BatchPrefillWithKVCachePlan(
   TORCH_CHECK(status == cudaSuccess,
               "Failed to plan prefill with error: ", cudaGetErrorString(status));
 
-  return vec_to_tensor(plan_info.ToVector());
+  return plan_info.ToVector();
 }
 
 void BatchPrefillWithRaggedKVCacheRun(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-    at::Tensor plan_info_vec, at::Tensor q, at::Tensor k, at::Tensor v,
+    std::vector<int64_t> plan_info_vec, at::Tensor q, at::Tensor k, at::Tensor v,
     at::Tensor qo_indptr, at::Tensor kv_indptr, at::Tensor o, std::optional<at::Tensor> maybe_lse,
-    int64_t mask_mode_code, int64_t layout, int64_t window_left ADDITIONAL_FUNC_PARAMS,
+    unsigned int mask_mode_code, unsigned int layout, int32_t window_left ADDITIONAL_FUNC_PARAMS,
     int64_t cuda_stream) {
   PrefillPlanInfo plan_info;
-  plan_info.FromVector(tensor_to_vec(plan_info_vec));
+  plan_info.FromVector(plan_info_vec);
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
 
   int64_t num_qo_heads = q.size(1);
@@ -195,13 +194,13 @@ void BatchPrefillWithRaggedKVCacheRun(
 
 void BatchPrefillWithPagedKVCacheRun(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-    at::Tensor plan_info_vec, at::Tensor q, at::Tensor paged_k_cache,
+    std::vector<int64_t> plan_info_vec, at::Tensor q, at::Tensor paged_k_cache,
     at::Tensor paged_v_cache, at::Tensor qo_indptr, at::Tensor paged_kv_indptr,
     at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len, at::Tensor o,
-    std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code, int64_t layout,
-    int64_t window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream) {
+    std::optional<at::Tensor> maybe_lse, unsigned int mask_mode_code, unsigned int layout,
+    int32_t window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream) {
   PrefillPlanInfo plan_info;
-  plan_info.FromVector(tensor_to_vec(plan_info_vec));
+  plan_info.FromVector(plan_info_vec);
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
   auto device = q.device();
   int64_t batch_size = paged_kv_indptr.size(0) - 1;

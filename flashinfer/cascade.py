@@ -30,7 +30,7 @@ def get_cascade_module():
     global _cascade_module
     if _cascade_module is None:
         if has_prebuilt_ops:
-            _kernels = torch.ops.flashinfer_kernels
+            from . import _kernels
 
             _cascade_module = _kernels
         else:
