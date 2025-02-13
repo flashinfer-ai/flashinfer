@@ -1,9 +1,10 @@
 import logging
 import os
 import re
-from pathlib import Path
-from typing import List, Union, Optional
 from contextlib import suppress
+from pathlib import Path
+from typing import List, Optional, Union
+
 import torch
 import torch.utils.cpp_extension as torch_cpp_ext
 from filelock import FileLock
@@ -55,8 +56,9 @@ def check_cuda_arch():
 
 def clear_cache_dir():
     if os.path.exists(FLASHINFER_JIT_DIR):
-        for file in os.listdir(FLASHINFER_JIT_DIR):
-            os.remove(os.path.join(FLASHINFER_JIT_DIR, file))
+        import shutil
+
+        shutil.rmtree(FLASHINFER_JIT_DIR)
 
 
 def remove_unwanted_pytorch_nvcc_flags():
