@@ -14,7 +14,7 @@ from pathlib import Path
 root = Path(__file__).parents[1].resolve()
 sys.path.append(str(root))
 os.environ["BUILD_DOC"] = "1"
-autodoc_mock_imports = ["torch", "triton", "flashinfer.jit.aot_config"]
+autodoc_mock_imports = ["torch", "triton", "flashinfer.jit.aot_config", "flashinfer._build_meta"]
 
 project = "FlashInfer"
 author = "FlashInfer Contributors"
