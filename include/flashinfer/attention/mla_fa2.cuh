@@ -837,7 +837,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
 
     // loop without mask
 #pragma unroll 1
-    for (; kv_tile_idx > start_tile_idx + NUM_STAGES - 1; --kv_tile_idx) {
+    for (; kv_tile_idx + 1 > start_tile_idx + NUM_STAGES; --kv_tile_idx) {
       cp_async::wait_group<NUM_STAGES - 1>();
       __syncthreads();
 
