@@ -1,4 +1,3 @@
-# Adapted from https://github.com/punica-ai/punica/blob/591b59899f0a20760821785d06b331c8a2e5cb86/.github/workflows/release_wheel.yml
 name: Release
 on:
   workflow_dispatch:
@@ -14,8 +13,6 @@ on:
     secrets:
       WHL_TOKEN:
         required: true
-      # PYPI_TEST_TOKEN:
-      #   required: true
 
 env:
   TORCH_CUDA_ARCH_LIST: "7.5 8.0 8.9 9.0+PTX"
@@ -25,17 +22,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cuda: ["11.8", "12.1", "12.4"]
-        torch: ["2.3", "2.4", "2.5"]
-        exclude: # for cuda 12.4, we only support torch 2.4+
-          - cuda: "12.4"
-            torch: "2.2"
-          - cuda: "12.4"
-            torch: "2.3"
-          - python: "3.8" # torch 2.5+ drops python 3.8
-            torch: "2.5"
-          - cuda: "12.4"
-            torch: "2.5"
+        cuda: ["12.4"]
+        torch: ["2.5"]
 
     runs-on: [self-hosted]
     steps:
@@ -105,10 +93,3 @@ jobs:
           git add -A
           git commit -m "update whl"
           git push
-
-      # - name: Upload sdist to pypi
-      #   run: |
-      #     pip install twine
-      #     python -m twine upload --repository testpypi --username=__token__ dist/*.tar.gz
-      #   env:
-      #     TWINE_PASSWORD: ${{ secrets.PYPI_TEST_TOKEN }}
