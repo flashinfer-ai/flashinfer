@@ -39,7 +39,7 @@ def get_gemm_module():
     global _gemm_module
     if _gemm_module is None:
         if has_prebuilt_ops:
-            _kernels = torch.ops.flashinfer_kernels
+            from . import _kernels
 
             module = _kernels
         else:
@@ -149,7 +149,7 @@ def get_gemm_sm90_module():
     global _gemm_module_sm90
     if _gemm_module_sm90 is None:
         if has_prebuilt_ops:
-            _kernels_sm90 = torch.ops.flashinfer_kernels_sm90
+            from . import _kernels_sm90
 
             module = _kernels_sm90
         else:

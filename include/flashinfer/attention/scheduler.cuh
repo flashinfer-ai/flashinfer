@@ -579,7 +579,7 @@ struct PrefillPlanInfo {
   void FromVector(const std::vector<int64_t>& vec) {
     if (vec.size() != 15) {
       std::ostringstream err_msg;
-      err_msg << "PrefillPlanInfo::FromVector: vec.size() should be 15, but got " << vec.size();
+      err_msg << "PrefillPlanInfo::FromVector: vec.size() should be 14, but got " << vec.size();
       FLASHINFER_ERROR(err_msg.str());
     }
     padded_batch_size = vec[0];
@@ -734,7 +734,7 @@ struct PrefillPlanSM90Info {
         head_indices_offset(0),
         work_indptr_offset(0),
         same_schedule_for_all_heads(false) {}
-  
+
   // convert PrefillPlanSM90Info to std::vector<int64_t>
   std::vector<int64_t> ToVector() const {
     return {qo_tile_indices_offset, qo_indptr_offset,

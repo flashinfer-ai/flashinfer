@@ -18,20 +18,18 @@
 void append_paged_kv_cache(at::Tensor append_key, at::Tensor append_value, at::Tensor batch_indices,
                            at::Tensor positions, at::Tensor paged_k_cache, at::Tensor paged_v_cache,
                            at::Tensor kv_indices, at::Tensor kv_indptr, at::Tensor kv_last_page_len,
-                           int64_t layout, int64_t cuda_stream);
+                           unsigned int layout, int64_t cuda_stream);
 
 void block_sparse_indices_to_vector_sparse_offsets(at::Tensor block_sparse_indices,
                                                    at::Tensor block_sparse_indptr,
                                                    at::Tensor vector_sparse_offsets,
                                                    at::Tensor vector_sparse_indptr,
-                                                   at::Tensor kv_len_arr, int64_t stride_block,
-                                                   int64_t stride_n, int64_t batch_size,
-                                                   int64_t block_size, int64_t cuda_stream);
+                                                   at::Tensor kv_len_arr, unsigned int stride_block,
+                                                   unsigned int stride_n, unsigned int batch_size,
+                                                   unsigned int block_size, int64_t cuda_stream);
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
-  // "Append paged KV-Cache operator"
-  m.def("append_paged_kv_cache", append_paged_kv_cache);
-  // "Precompute block sparse offsets"
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("append_paged_kv_cache", &append_paged_kv_cache, "Append paged KV-Cache operator");
   m.def("block_sparse_indices_to_vector_sparse_offsets",
-        block_sparse_indices_to_vector_sparse_offsets);
+        &block_sparse_indices_to_vector_sparse_offsets, "Precompute block sparse offsets");
 }

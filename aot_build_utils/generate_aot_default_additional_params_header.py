@@ -85,7 +85,7 @@ def get_aot_default_additional_params_header_str() -> str:
             "rope_rcp_scale",
             "rope_rcp_theta",
         ],  # additional_scalar_names
-        ["double", "double", "double", "double"],  # additional_scalar_dtypes
+        ["float", "float", "float", "float"],  # additional_scalar_dtypes
     )
 
     ret += generate_macro_entry(
@@ -98,7 +98,7 @@ def get_aot_default_additional_params_header_str() -> str:
             "rope_rcp_scale",
             "rope_rcp_theta",
         ],
-        ["double", "double", "double", "double"],
+        ["float", "float", "float", "float"],
     )
 
     ret += generate_macro_entry(
@@ -106,7 +106,7 @@ def get_aot_default_additional_params_header_str() -> str:
         [],
         [],
         ["logits_soft_cap", "sm_scale"],
-        ["double", "double"],
+        ["float", "float"],
         is_sm90_template=True,
     )
 
@@ -120,7 +120,7 @@ def get_aot_default_additional_params_header_str() -> str:
             "rope_rcp_scale",
             "rope_rcp_theta",
         ],  # additional_scalar_names
-        ["double", "double", "double", "double"],  # additional_scalar_dtypes
+        ["float", "float", "float", "float"],  # additional_scalar_dtypes
     )
 
     ret += generate_macro_entry(
@@ -133,7 +133,7 @@ def get_aot_default_additional_params_header_str() -> str:
             "rope_rcp_scale",
             "rope_rcp_theta",
         ],
-        ["double", "double", "double", "double"],
+        ["float", "float", "float", "float"],
     )
 
     ret += generate_macro_entry(
@@ -141,7 +141,7 @@ def get_aot_default_additional_params_header_str() -> str:
         [],
         [],
         ["logits_soft_cap", "sm_scale"],
-        ["double", "double"],
+        ["float", "float"],
         is_sm90_template=True,
     )
 

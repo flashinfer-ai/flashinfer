@@ -13,29 +13,30 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <driver_types.h>
+
 #include <flashinfer/attention/mla_fa2.cuh>
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/fastdiv.cuh>
 #include <optional>
 
 #include "batch_mla_config.inc"
-#include "pytorch_conversion_utils.h"
 #include "pytorch_extension_utils.h"
 
 using namespace flashinfer;
 
 void BatchMLAPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-                               at::Tensor plan_info_vec, at::Tensor q_nope, at::Tensor q_pe,
-                               at::Tensor ckv_cache, at::Tensor kpe_cache, at::Tensor kv_indices,
-                               at::Tensor o, std::optional<at::Tensor> maybe_lse,
-                               int64_t mask_mode_code, int64_t num_heads, int64_t page_size,
-                               double sm_scale, int64_t cuda_stream) {
+                               std::vector<int64_t> plan_info_vec, at::Tensor q_nope,
+                               at::Tensor q_pe, at::Tensor ckv_cache, at::Tensor kpe_cache,
+                               at::Tensor kv_indices, at::Tensor o,
+                               std::optional<at::Tensor> maybe_lse, int mask_mode_code,
+                               int num_heads, int page_size, float sm_scale, int64_t cuda_stream) {
   // q_nope: [n, num_heads, head_dim_ckv]
   // q_pe: [n, num_heads, head_dim_kpe]
   // ckv_cache: [num_pages, page_size, head_dim_ckv]
   // kpe_cache: [num_pages, page_size, head_dim_kpe]
   MLAPlanInfo plan_info;
-  plan_info.FromVector(tensor_to_vec(plan_info_vec));
+  plan_info.FromVector(plan_info_vec);
 
   auto device = q_nope.device();
 
