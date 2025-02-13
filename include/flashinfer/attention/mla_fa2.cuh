@@ -795,7 +795,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
                      kv_tile_idx % NUM_STAGES);
     cp_async::commit_group();
 #pragma unroll
-    for (uint32_t stage_idx = 1; stage_idx < NUM_STAGES; ++stage_idx) {
+    for (int stage_idx = 1; stage_idx < NUM_STAGES; ++stage_idx) {
       if (kv_tile_idx - stage_idx >= start_tile_idx) {
         load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
                          kpe_stride_n, kpe_stride_page, kv_bound,
@@ -837,7 +837,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
 
     // loop without mask
 #pragma unroll 1
-    for (; kv_tile_idx > start_tile_idx + NUM_STAGES - 1; --kv_tile_idx) {
+    for (; kv_tile_idx + 1 > start_tile_idx + NUM_STAGES; --kv_tile_idx) {
       cp_async::wait_group<NUM_STAGES - 1>();
       __syncthreads();
 
