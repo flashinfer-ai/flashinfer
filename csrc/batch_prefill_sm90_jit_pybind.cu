@@ -16,34 +16,34 @@
 #include "batch_prefill_sm90_config.inc"
 #include "pytorch_extension_utils.h"
 
-std::vector<int64_t> BatchPrefillWithKVCacheSM90Plan(
+at::Tensor BatchPrefillWithKVCacheSM90Plan(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr, at::Tensor kv_indptr,
-    at::Tensor kv_len_arr, unsigned total_num_rows, unsigned int batch_size,
-    unsigned int num_qo_heads, unsigned int num_kv_heads, unsigned int page_size,
-    bool enable_cuda_graph, unsigned int head_dim_qk, unsigned int head_dim_vo, bool causal,
+    at::Tensor kv_len_arr, int64_t total_num_rows, int64_t batch_size,
+    int64_t num_qo_heads, int64_t num_kv_heads, int64_t page_size,
+    bool enable_cuda_graph, int64_t head_dim_qk, int64_t head_dim_vo, bool causal,
     int64_t cuda_stream);
 
 void BatchPrefillWithRaggedKVCacheSM90Run(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-    std::vector<int64_t> plan_info_vec, at::Tensor q, at::Tensor k, at::Tensor v,
+    at::Tensor plan_info_vec, at::Tensor q, at::Tensor k, at::Tensor v,
     at::Tensor qo_indptr, at::Tensor kv_indptr, at::Tensor o, std::optional<at::Tensor> maybe_lse,
-    unsigned int mask_mode_code, unsigned int layout, int32_t window_left ADDITIONAL_FUNC_PARAMS,
+    int64_t mask_mode_code, int64_t layout, int64_t window_left ADDITIONAL_FUNC_PARAMS,
     int64_t cuda_stream);
 
 void BatchPrefillWithPagedKVCacheSM90Run(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-    std::vector<int64_t> plan_info_vec, at::Tensor q, at::Tensor paged_k_cache,
+    at::Tensor plan_info_vec, at::Tensor q, at::Tensor paged_k_cache,
     at::Tensor paged_v_cache, at::Tensor qo_indptr, at::Tensor paged_kv_indptr,
     at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len, at::Tensor o,
-    std::optional<at::Tensor> maybe_lse, unsigned int mask_mode_code, unsigned int layout,
-    int32_t window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
+    std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code, int64_t layout,
+    int64_t window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("plan", &BatchPrefillWithKVCacheSM90Plan,
-        "Batch-request prefill attention with KV-Cache plan");
-  m.def("ragged_run", &BatchPrefillWithRaggedKVCacheSM90Run,
-        "Batch-request prefill attention with KV-Cache operator");
-  m.def("paged_run", &BatchPrefillWithPagedKVCacheSM90Run,
-        "Batch-request prefill attention with KV-Cache operator");
+TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
+  // Batch-request prefill attention with KV-Cache plan
+  m.def("plan", BatchPrefillWithKVCacheSM90Plan);
+  // Batch-request prefill attention with KV-Cache operator
+  m.def("ragged_run", BatchPrefillWithRaggedKVCacheSM90Run);
+  // Batch-request prefill attention with KV-Cache operator
+  m.def("paged_run", BatchPrefillWithPagedKVCacheSM90Run);
 }

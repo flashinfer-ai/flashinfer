@@ -375,7 +375,7 @@ def gen_single_decode_module(
             "rope_rcp_scale",
             "rope_rcp_theta",
         ],  # additional_scalar_names
-        ["float", "float", "float", "float"],  # additional_scalar_dtypes
+        ["double", "double", "double", "double"],  # additional_scalar_dtypes
         f"DefaultAttention<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>",  # variant_name
         f"#include<flashinfer/attention/variants.cuh>",  # variant_decl
         pos_encoding_mode=pos_encoding_mode,
@@ -417,14 +417,14 @@ def gen_single_prefill_module(
             "rope_rcp_scale",
             "rope_rcp_theta",
         ]
-        additional_scalar_dtypes = ["float", "float", "float", "float"]
+        additional_scalar_dtypes = ["double", "double", "double", "double"]
         variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
         variant_decl = f"#include<flashinfer/attention/variants.cuh>"
     else:
         additional_tensor_names = []
         additional_tensor_dtypes = []
         additional_scalar_names = ["logits_soft_cap", "sm_scale"]
-        additional_scalar_dtypes = ["float", "float"]
+        additional_scalar_dtypes = ["double", "double"]
         variant_name = f"DefaultAttention<{str(use_logits_soft_cap).lower()}>"
         variant_decl = f"#include<flashinfer/attention/hopper/variants.cuh>"
 
@@ -487,7 +487,7 @@ def gen_batch_decode_module(
             "rope_rcp_scale",
             "rope_rcp_theta",
         ],  # additional_scalar_names
-        ["float", "float", "float", "float"],  # additional_scalar_dtypes
+        ["double", "double", "double", "double"],  # additional_scalar_dtypes
         f"DefaultAttention<false, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>",  # variant_name
         f"#include<flashinfer/attention/variants.cuh>",  # variant_decl
         pos_encoding_mode=pos_encoding_mode,
@@ -540,14 +540,14 @@ def gen_batch_prefill_module(
             "rope_rcp_scale",
             "rope_rcp_theta",
         ]
-        additional_scalar_dtypes = ["float", "float", "float", "float"]
+        additional_scalar_dtypes = ["double", "double", "double", "double"]
         variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
         variant_decl = f"#include<flashinfer/attention/variants.cuh>"
     else:
         additional_tensor_names = []
         additional_tensor_dtypes = []
         additional_scalar_names = ["logits_soft_cap", "sm_scale"]
-        additional_scalar_dtypes = ["float", "float"]
+        additional_scalar_dtypes = ["double", "double"]
         variant_name = f"DefaultAttention<{str(use_logits_soft_cap).lower()}>"
         variant_decl = f"#include<flashinfer/attention/hopper/variants.cuh>"
 

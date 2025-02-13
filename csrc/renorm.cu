@@ -39,7 +39,7 @@ void top_p_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
 }
 
 void top_k_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
-                        std::optional<at::Tensor> maybe_top_k_arr, unsigned int top_k_val,
+                        std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
                         int64_t cuda_stream) {
   CHECK_INPUT(probs);
   auto device = probs.device();
@@ -59,7 +59,7 @@ void top_k_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
 }
 
 void top_k_mask_logits(at::Tensor logits, at::Tensor mask_logits,
-                       std::optional<at::Tensor> maybe_top_k_arr, unsigned int top_k_val,
+                       std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
                        int64_t cuda_stream) {
   CHECK_INPUT(logits);
   auto device = logits.device();
