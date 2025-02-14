@@ -3,7 +3,7 @@
 flashinfer.page
 ===============
 
-Kernels to manipulte paged kv-cache.
+Kernels to manipulate paged kv-cache.
 
 .. currentmodule:: flashinfer.page
 
