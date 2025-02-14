@@ -149,6 +149,7 @@ We are thrilled to share that FlashInfer is being adopted by many cutting-edge p
 - [vLLM](https://github.com/vllm-project/vllm)
 - [TGI](https://github.com/huggingface/text-generation-inference)
 - [lorax](https://github.com/predibase/lorax)
+- [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)
 
 ## Acknowledgement
 
