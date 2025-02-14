@@ -282,14 +282,14 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMlaCuteSM8
   const uint32_t num_threads = k_warps * 32;
   auto kernel =
     BatchDecodeWithPagedKVCacheKernelMlaCuteSM80<HEAD_DIM_CKV, HEAD_DIM_KPE, QO_TILE_LEN, Params>;
-  int num_blocks_per_sm = 1;
+  int num_blocks_per_sm;
   int num_sm = 0;
   int dev_id = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
 
-  FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
-                                    num_threads, smem_size));
+  // FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
+  //                                   num_threads, smem_size));
   // fixme: num_blocks_per_sm is 0 derived from cudaOccupancyMaxActiveBlocksPerMultiprocessor at times, 
   // and we fill smem with q-heads as many as possible, so num_blocks_per_sm should be 1
   num_blocks_per_sm = 1;
@@ -321,7 +321,7 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMlaCuteSM8
       split_kv = true;
     }
   }
-  
+
   return cudaSuccess;
 }
 
