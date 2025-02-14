@@ -1252,6 +1252,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         self,
         float_workspace_buffer: torch.Tensor,
         use_cuda_graph: bool = False,
+        use_tensor_cores: bool = False,
         paged_kv_indptr_buffer: Optional[torch.Tensor] = None,
         paged_kv_indices_buffer: Optional[torch.Tensor] = None,
         paged_kv_last_page_len_buffer: Optional[torch.Tensor] = None,
@@ -1269,7 +1270,11 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             Whether to enable CUDAGraph for batch decode attention, if enabled, the
             auxiliary data structures will be stored as the provided buffers. The ``batch_size``
             cannot change during the lifecycle of this wrapper when CUDAGraph is enabled.
-
+        
+        use_tensor_cores : bool
+            Whether to use tensor cores for the computation. Will be faster for large group
+            size in grouped query attention. Defaults to ``False``.
+        
         paged_kv_indptr_buffer : Optional[torch.Tensor]
             The user reserved buffer on GPU to store the indptr of the paged kv cache, the size
             of the buffer should be ``[batch_size + 1]``.
@@ -1319,6 +1324,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         else:
             self._fixed_batch_size = 0
 
+        self._use_tensor_cores = use_tensor_cores
         self._paged_kv_indptr_buf = paged_kv_indptr_buffer
         self._paged_kv_indices_buf = paged_kv_indices_buffer
         self._paged_kv_last_page_len_buf = paged_kv_last_page_len_buffer
@@ -1327,6 +1333,10 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
     @property
     def is_cuda_graph_enabled(self) -> bool:
         return self._use_cuda_graph
+
+    @property
+    def use_tensor_cores(self) -> bool:
+        return self._use_tensor_cores
 
     def reset_workspace_buffer(
         self, float_workspace_buffer: torch.Tensor, int_workspace_buffer: torch.Tensor
@@ -1445,8 +1455,10 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             q_data_type,
             indptr.dtype,
             head_dim_compressed_kv,
+            num_qo_heads,
             window_left != -1,  # use_sliding_window
             logits_soft_cap > 0,  # use_logits_soft_cap
+            self._use_tensor_cores,
         )
         with self.device as device:
             self._plan_info = self._cached_module.plan(

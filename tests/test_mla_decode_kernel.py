@@ -348,11 +348,11 @@ class DeepseekV2AttentionMatAbsorbDecode(nn.Module):
             wrapper = flashinfer.BatchDecodeMlaWithPagedKVCacheWrapper(
                 workspace_buffer, 
                 use_cuda_graph=True,
+                use_tensor_cores=True,
                 paged_kv_indptr_buffer=kv_indptr,
                 paged_kv_indices_buffer=kv_indices,
                 paged_kv_last_page_len_buffer=kv_last_page_len,
             )
-            
             wrapper.plan(
                 kv_indptr,
                 kv_indices,
