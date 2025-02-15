@@ -79,21 +79,20 @@ def test_pod_with_paged_kv_cache(
     contiguous_kv,
 ):
     return_lse = False
-    batch_size_p = 1
     kv_layout_p = "NHD"
-    q_p = torch.randn(batch_size_p * qo_len_p, num_qo_heads, head_dim).to(0).half()
-    q_indptr_p = torch.arange(0, batch_size_p + 1).to(0).int() * qo_len_p
+    q_p = torch.randn(qo_len_p, num_qo_heads, head_dim).to(0).half()
+    q_indptr_p = torch.arange(0, 1).to(0).int() * qo_len_p
 
-    k_p = torch.randn(batch_size_p * kv_len_p, num_kv_heads, head_dim).to(0).half()
-    v_p = torch.randn(batch_size_p * kv_len_p, num_kv_heads, head_dim).to(0).half()
-    kv_indptr_p = torch.arange(0, batch_size_p + 1).to(0).int() * kv_len_p
+    k_p = torch.randn(kv_len_p, num_kv_heads, head_dim).to(0).half()
+    v_p = torch.randn(kv_len_p, num_kv_heads, head_dim).to(0).half()
+    kv_indptr_p = torch.arange(0, 1).to(0).int() * kv_len_p
 
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
+    prefill_workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
 
-    wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
-        workspace_buffer, kv_layout_p
+    prefill_wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
+        prefill_workspace_buffer, kv_layout_p
     )
-    wrapper.plan(
+    prefill_wrapper.plan(
         q_indptr_p,
         kv_indptr_p,
         num_qo_heads,
@@ -103,10 +102,7 @@ def test_pod_with_paged_kv_cache(
         pos_encoding_mode=pos_encoding_mode,
         logits_soft_cap=logits_soft_cap,
     )
-    if return_lse:
-        o_ref_p, _ = wrapper.run(q_p, k_p, v_p, return_lse=True)
-    else:
-        o_ref_p = wrapper.run(q_p, k_p, v_p)
+    o_ref_p = prefill_wrapper.run(q_p, k_p, v_p)
     
     q_d = torch.randn(batch_size_d, num_qo_heads, head_dim).to(0).to(q_dtype)
     num_pages_per_seq = (kv_len_d + page_size_d - 1) // page_size_d
@@ -139,28 +135,10 @@ def test_pod_with_paged_kv_cache(
         (batch_size_d,), (kv_len_d - 1) % page_size_d + 1, dtype=torch.int32
     ).to(0)
 
-    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
-    wrapper = flashinfer.PODWithPagedKVCacheWrapper(
-        workspace_buffer, kv_layout_d, use_tensor_cores=use_tensor,
-    )
-    wrapper.plan(
-        kv_indptr_d,
-        kv_indices_d,
-        kv_last_page_len,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim,
-        page_size_d,
-        logits_soft_cap=logits_soft_cap,
-        pos_encoding_mode=pos_encoding_mode,
-        data_type=kv_dtype,
-        q_data_type=q_dtype,
-    )
-
     # Generate decode reference output
-    new_workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+    decode_workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
     decode_wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
-        new_workspace_buffer, kv_layout_d, use_tensor_cores = True
+        decode_workspace_buffer, kv_layout_d, use_tensor_cores = True
     )
     decode_wrapper.plan(
         kv_indptr_d,
@@ -175,65 +153,41 @@ def test_pod_with_paged_kv_cache(
         data_type=kv_dtype,
         q_data_type=q_dtype,
     )
-    if return_lse:
-        o_ref_d, _ = decode_wrapper.run(q_d, kv_data, return_lse=True)
-    else:
-        o_ref_d = decode_wrapper.run(q_d, kv_data)
+    o_ref_d = decode_wrapper.run(q_d, kv_data)
 
-    for i in range(batch_size_p):
-        if return_lse:
-            o_i_p, o_i_d = wrapper.run(
-                q_p[q_indptr_p[i] : q_indptr_p[i + 1]],
-                k_p[kv_indptr_p[i] : kv_indptr_p[i + 1]],
-                v_p[kv_indptr_p[i] : kv_indptr_p[i + 1]],
-                q_d, kv_data,
-                causal_p=causal,
-                pos_encoding_mode_d=pos_encoding_mode,
-                logits_soft_cap_d=logits_soft_cap,
-                pos_encoding_mode_p=pos_encoding_mode,
-                logits_soft_cap_p=logits_soft_cap,
-                return_lse_p=True)
-        else:
-            o_i_p, o_i_d = wrapper.run(
-                q_p[q_indptr_p[i] : q_indptr_p[i + 1]],
-                k_p[kv_indptr_p[i] : kv_indptr_p[i + 1]],
-                v_p[kv_indptr_p[i] : kv_indptr_p[i + 1]], 
-                q_d, kv_data,
-                pos_encoding_mode_p=pos_encoding_mode,
-                logits_soft_cap_p=logits_soft_cap,
-                causal_p=causal)
-        # Prefill is run with batch size 1
-        o_ref_i_p = o_ref_p[q_indptr_p[i] : q_indptr_p[i + 1]]
-        torch.testing.assert_close(o_i_p, o_ref_i_p, rtol=1e-3, atol=1e-3, msg="Prefill mismatch")
-        # Decode uses all batches at once.
-        torch.testing.assert_close(o_i_d, o_ref_d, rtol=1e-3, atol=1e-3, msg="Decode mismatch")
+    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+    pod_wrapper = flashinfer.PODWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout_d, use_tensor_cores=use_tensor,
+    )
+    pod_wrapper.plan(
+        kv_indptr_d,
+        kv_indices_d,
+        kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size_d,
+        logits_soft_cap=logits_soft_cap,
+        pos_encoding_mode=pos_encoding_mode,
+        data_type=kv_dtype,
+        q_data_type=q_dtype,
+    )
+
+    o_i_p, o_i_d = pod_wrapper.run(
+        q_p[q_indptr_p[i] : q_indptr_p[i + 1]],
+        k_p[kv_indptr_p[i] : kv_indptr_p[i + 1]],
+        v_p[kv_indptr_p[i] : kv_indptr_p[i + 1]], 
+        q_d, kv_data,
+        pos_encoding_mode_p=pos_encoding_mode,
+        logits_soft_cap_p=logits_soft_cap,
+        causal_p=causal)
+    # Prefill is run with batch size 1
+    o_ref_i_p = o_ref_p[q_indptr_p[i] : q_indptr_p[i + 1]]
+    torch.testing.assert_close(o_i_p, o_ref_i_p, rtol=1e-3, atol=1e-3, msg="Prefill mismatch")
+    # Decode uses all batches at once.
+    torch.testing.assert_close(o_i_d, o_ref_d, rtol=1e-3, atol=1e-3, msg="Decode mismatch")
 
 if __name__ == "__main__":
-    test_pod_with_paged_kv_cache(
-        # Prefill params
-        12288, 1024, True, 
-        # Decode params
-        80, 12288, 16, "NHD", False,
-        # Other shared params
-        4, 16, 128, "NONE", 0.0, torch.float16, torch.float16, True,
-    )
-    test_pod_with_paged_kv_cache(
-        # Prefill params
-        12288, 12288, True, 
-        # Decode params
-        220, 12288, 16, "NHD", False,
-        # Other shared params
-        4, 16, 128, "NONE", 0.0, torch.float16, torch.float16, True,
-    )
-    test_pod_with_paged_kv_cache(
-        # Prefill params
-        16384, 16384, True, 
-        # Decode params
-        250, 12288, 16, "NHD", False,
-        # Other shared params
-        4, 16, 128, "NONE", 0.0, torch.float16, torch.float16, True,
-    )
-    print("No tensor test(s) passed!")
     test_pod_with_paged_kv_cache(
         # Prefill params
         12288, 1024, True, 
@@ -258,4 +212,4 @@ if __name__ == "__main__":
         # Other shared params
         4, 16, 128, "NONE", 0.0, torch.float16, torch.float16, True,
     )
-    print("Tensor test(s) passed!")
+    print("POD test(s) passed!")

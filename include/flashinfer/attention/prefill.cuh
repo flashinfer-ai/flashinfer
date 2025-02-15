@@ -161,7 +161,7 @@ __device__ __forceinline__ uint32_t get_warp_idx_kv(const uint32_t tid_z = threa
 template <typename KTraits>
 __device__ __forceinline__ uint32_t get_warp_idx(const uint32_t tid_y = threadIdx.y, 
                                                  const uint32_t tid_z = threadIdx.z) {
-  return get_warp_idx_kv<KTraits>(tid_z) * NUM_WARPS_Q + get_warp_idx_q<KTraits>(tid_y);
+  return get_warp_idx_kv<KTraits>(tid_z) * KTraits::NUM_WARPS_Q + get_warp_idx_q<KTraits>(tid_y);
 }
 
 /*!
@@ -252,7 +252,7 @@ __device__ __forceinline__ void produce_kv(smem_t<KTraits::SWIZZLE_MODE_KV> smem
                                            uint32_t* smem_offset, typename KTraits::DTypeKV** gptr,
                                            const uint32_t stride_n, const uint32_t kv_idx_base, 
                                            const uint32_t kv_len, const dim3 tid = threadIdx) {
-  // NOTE(Zihao): for fp8, this function doesn't work for head_dim = 64 at the moment
+  // NOTE: for fp8, this function doesn't work for head_dim = 64 at the moment
   using DTypeKV = typename KTraits::DTypeKV;
   constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
   constexpr uint32_t NUM_WARPS = KTraits::NUM_WARPS;
@@ -304,16 +304,17 @@ __device__ __forceinline__ void page_produce_kv(
     const paged_kv_t<typename KTraits::DTypeKV, typename KTraits::IdType>& paged_kv,
     const uint32_t kv_idx_base, const size_t* thr_local_kv_offset, 
     const uint32_t kv_len, const dim3 tid = threadIdx) {
-      using DType = typename KTraits::DTypeKV;
-      using IdType = typename KTraits::IdType;
-      constexpr SharedMemFillMode fill_mode =
-          produce_v ? SharedMemFillMode::kFillZero : SharedMemFillMode::kNoFill;
-      constexpr uint32_t NUM_WARPS = KTraits::NUM_WARPS;
-      constexpr uint32_t NUM_WARPS_Q = KTraits::NUM_WARPS_Q;
-      constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
-      constexpr uint32_t NUM_MMA_D = produce_v ? KTraits::NUM_MMA_D_VO : KTraits::NUM_MMA_D_QK;
-      constexpr uint32_t UPCAST_STRIDE =
-          produce_v ? KTraits::UPCAST_STRIDE_V : KTraits::UPCAST_STRIDE_K;
+  // NOTE: for fp8, this function doesn't work for head_dim = 64 at the moment
+  using DType = typename KTraits::DTypeKV;
+  using IdType = typename KTraits::IdType;
+  constexpr SharedMemFillMode fill_mode =
+      produce_v ? SharedMemFillMode::kFillZero : SharedMemFillMode::kNoFill;
+  constexpr uint32_t NUM_WARPS = KTraits::NUM_WARPS;
+  constexpr uint32_t NUM_WARPS_Q = KTraits::NUM_WARPS_Q;
+  constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
+  constexpr uint32_t NUM_MMA_D = produce_v ? KTraits::NUM_MMA_D_VO : KTraits::NUM_MMA_D_QK;
+  constexpr uint32_t UPCAST_STRIDE =
+      produce_v ? KTraits::UPCAST_STRIDE_V : KTraits::UPCAST_STRIDE_K;
   const uint32_t warp_idx = get_warp_idx<KTraits>(tid.y, tid.z), lane_idx = tid.x;
   if constexpr (KTraits::SWIZZLE_MODE_KV == SwizzleMode::k128B) {
     uint32_t kv_idx = kv_idx_base + warp_idx * 4 + lane_idx / 8;
@@ -356,7 +357,7 @@ template <typename KTraits>
 __device__ __forceinline__ void init_rope_freq(float (*rope_freq)[4], const float rope_rcp_scale,
                                                const float rope_rcp_theta, 
                                                const uint32_t tid_x = threadIdx.x) {
-  constexpr uint32_t head_dim = KTraits::NUM_MMA_D_QK * 16;
+  constexpr uint32_t HEAD_DIM = KTraits::NUM_MMA_D_QK * 16;
   const uint32_t lane_idx = tid_x;
 #pragma unroll
   for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO / 2; ++mma_d) {
@@ -703,7 +704,7 @@ __device__ __forceinline__ void logits_mask(
     const Params& params, typename KTraits::AttentionVariant variant, const uint32_t batch_idx,
     const uint32_t qo_packed_idx_base, const uint32_t kv_idx_base, const uint32_t qo_len,
     const uint32_t kv_len, const uint32_t chunk_end, const uint_fastdiv group_size,
-    typename KTraits::DTypeQKAccum (*s_frag)[NUM_MMA_KV][8],
+    typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8],
     const uint32_t kv_head_idx = blockIdx.z, const dim3 tid = threadIdx) {
   const uint32_t lane_idx = tid.x;//, kv_head_idx = blockIdx.z;
   constexpr uint32_t NUM_MMA_Q = KTraits::NUM_MMA_Q;
@@ -1261,6 +1262,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
     const uint_fastdiv& group_size = params.group_size;
 
     static_assert(sizeof(DTypeQ) == 2);
+    const uint32_t lane_idx = tid.x, warp_idx = get_warp_idx<KTraits>(tid.y, tid.z);
     const uint32_t num_qo_heads = num_kv_heads * group_size;
 
     const uint32_t max_chunk_size = partition_kv ? ceil_div(kv_len, num_chunks) : kv_len;
@@ -1402,7 +1404,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
       compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r, s_frag, o_frag, d);
 
       block.sync();
-      produce_kv<SharedMemFillMode::kFillZero, KTraits>(
+      produce_kv<true, SharedMemFillMode::kFillZero, KTraits>(
           v_smem, &v_smem_offset_w, &v_ptr, v_stride_n, (iter + 1) * CTA_TILE_KV,
           chunk_size, tid);
       cp_async::commit_group();
@@ -1459,7 +1461,7 @@ template <typename KTraits, typename Params>
 __global__
 __launch_bounds__(KTraits::NUM_THREADS) void SinglePrefillWithKVCacheKernel(
     const __grid_constant__ Params params) {
-    extern __shared__ uint8_t smem[];
+  extern __shared__ uint8_t smem[];
   SinglePrefillWithKVCacheDevice<KTraits> (params, smem);
 }
 
@@ -1975,7 +1977,6 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     const uint32_t qo_packed_idx_base =
         (qo_tile_idx * NUM_WARPS_Q + get_warp_idx_q<KTraits>(tid.y)) * NUM_MMA_Q * 16;
     const uint32_t q_stride_n = params.q_stride_n, q_stride_h = params.q_stride_h;
-    constexpr SwizzleMode swizzle_mode_q = SwizzleMode::k128B;
     smem_t<SWIZZLE_MODE_Q> qo_smem(smem_storage.q_smem);
     const uint32_t o_stride_n = num_qo_heads * HEAD_DIM_VO, o_stride_h = HEAD_DIM_VO;
     DTypeQ* q_ptr_base = 
