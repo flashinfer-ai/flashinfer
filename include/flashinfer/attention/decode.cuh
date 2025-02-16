@@ -442,7 +442,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params
   if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
     const IdType* q_rope_offset = nullptr;
     if constexpr (has_decode_maybe_q_rope_offset_v<Params>) {
-      q_rope_offset = params.maybe_q_rope_offset;
+      q_rope_offset = params.decode_maybe_q_rope_offset;
     }
     int32_t q_rope_offset_val = q_rope_offset == nullptr ? (kv_len - 1) : q_rope_offset[batch_idx];
     const float rope_rcp_scale = params.rope_rcp_scale;
