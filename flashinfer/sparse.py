@@ -28,7 +28,7 @@ from .utils import (
     PosEncodingMode,
     TensorLayout,
     _check_pos_encoding_mode,
-    _check_shape,
+    _check_shape_dtype_device,
     _get_cache_alibi_slopes_buf,
     canonicalize_torch_dtype,
     determine_attention_backend,
@@ -541,12 +541,14 @@ class BlockSparseAttentionWrapper:
                     (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
                 )
             else:
-                _check_shape(lse, (q.size(0), q.size(1)), "lse")
+                _check_shape_dtype_device(
+                    lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
+                )
 
         if out is None:
             out = torch.empty_like(q)
         else:
-            _check_shape(out, q.shape, "out")
+            _check_shape_dtype_device(out, q.shape, q.dtype, q.device, "out")
         if self._use_tensor_cores:
             if self._backend == "fa3":
                 sparse_indices = block_sparse_indices_to_vector_sparse_offsets(

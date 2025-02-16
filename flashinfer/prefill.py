@@ -40,7 +40,7 @@ from .utils import (
     _check_cached_qkv_data_type,
     _check_kv_layout,
     _check_pos_encoding_mode,
-    _check_shape,
+    _check_shape_dtype_device,
     _get_cache_alibi_slopes_buf,
     _get_cache_buf,
     _unpack_paged_kv_cache,
@@ -1606,14 +1606,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
                 )
             else:
-                _check_shape(lse, (q.size(0), q.size(1)))
+                _check_shape_dtype_device(
+                    lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
+                )
 
         if out is None:
             out = torch.empty(
                 q.shape[:-1] + v_cache.shape[-1:], dtype=q.dtype, device=q.device
             )
         else:
-            _check_shape(out, q.shape[:-1] + v_cache.shape[-1:])
+            _check_shape_dtype_device(
+                out, q.shape[:-1] + v_cache.shape[-1:], q.dtype, q.device, "out"
+            )
 
         if self._custom_mask_buf is not None:
             mask_mode = MaskMode.CUSTOM.value
@@ -2295,13 +2299,17 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
                 )
             else:
-                _check_shape(lse, (q.size(0), q.size(1)), "lse")
+                _check_shape_dtype_device(
+                    lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
+                )
         if out is None:
             out = torch.empty(
                 q.shape[:-1] + v.shape[-1:], dtype=q.dtype, device=q.device
             )
         else:
-            _check_shape(out, q.shape[:-1] + v.shape[-1:], "out")
+            _check_shape_dtype_device(
+                out, q.shape[:-1] + v.shape[-1:], q.dtype, q.device, "out"
+            )
 
         if is_float8(q):
             logging.warning(

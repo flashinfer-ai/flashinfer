@@ -364,12 +364,22 @@ def determine_attention_backend(
         return "fa2"
 
 
-def _check_shape(
+def _check_shape_dtype_device(
     x: torch.Tensor,
     expected_shape: Sequence[int],
+    expected_dtype: torch.dtype,
+    expected_device: torch.device,
     name: str,
 ) -> None:
     if x.shape != torch.Size(expected_shape):
         raise ValueError(
             f"Invalid shape of {name}: expected {expected_shape}, got {x.shape}"
+        )
+    if x.dtype != expected_dtype:
+        raise ValueError(
+            f"Invalid dtype of {name}: expected {expected_dtype}, got {x.dtype}"
+        )
+    if x.device != expected_device:
+        raise ValueError(
+            f"Invalid device of {name}: expected {expected_device}, got {x.device}"
         )

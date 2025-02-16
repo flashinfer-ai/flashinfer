@@ -23,7 +23,7 @@ import torch
 from .jit import gen_batch_mla_module, get_batch_mla_uri
 from .utils import (
     MaskMode,
-    _check_shape,
+    _check_shape_dtype_device,
     get_cuda_stream,
     register_custom_op,
     register_fake_op,
@@ -307,7 +307,9 @@ class BatchMLAPagedAttentionWrapper:
             if out is None:
                 out = torch.empty_like(q_nope)
             else:
-                _check_shape(out, q_nope.shape, "out")
+                _check_shape_dtype_device(
+                    out, q_nope.shape, q_nope.dtype, q_nope.device, "out"
+                )
 
             if return_lse:
                 if lse is None:
@@ -315,7 +317,9 @@ class BatchMLAPagedAttentionWrapper:
                         q_nope.shape[:2], dtype=torch.float32, device=device
                     )
                 else:
-                    _check_shape(lse, q_nope.shape[:2], "lse")
+                    _check_shape_dtype_device(
+                        lse, q_nope.shape[:2], torch.float32, q_nope.device, "lse"
+                    )
             self._cached_module.run(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,

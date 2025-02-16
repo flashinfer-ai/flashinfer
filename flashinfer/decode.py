@@ -45,7 +45,7 @@ from .utils import (
     _check_cached_qkv_data_type,
     _check_kv_layout,
     _check_pos_encoding_mode,
-    _check_shape,
+    _check_shape_dtype_device,
     _get_cache_alibi_slopes_buf,
     _get_cache_buf,
     _get_range_buf,
@@ -1079,12 +1079,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
                 )
             else:
-                _check_shape(lse, (q.size(0), q.size(1)), "lse")
+                _check_shape_dtype_device(
+                    lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
+                )
 
         if out is None:
             out = torch.empty_like(q)
         else:
-            _check_shape(out, q.shape, "out")
+            _check_shape_dtype_device(out, q.shape, q.dtype, q.device, "out")
 
         if self.use_tensor_cores:
             run_args = [
@@ -1566,7 +1568,9 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             if out is None:
                 out = torch.empty_like(q_nope, device=device)
             else:
-                _check_shape(out, q_nope.shape, "out")
+                _check_shape_dtype_device(
+                    out, q_nope.shape, q_nope.dtype, q_nope.device, "out"
+                )
 
             if return_lse:
                 if lse is None:
@@ -1576,7 +1580,13 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
                         device=device,
                     )
                 else:
-                    _check_shape(lse, (q_nope.size(0), q_nope.size(1)), "lse")
+                    _check_shape_dtype_device(
+                        lse,
+                        (q_nope.size(0), q_nope.size(1)),
+                        q_nope.dtype,
+                        q_nope.device,
+                        "lse",
+                    )
             self._cached_module.run(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
