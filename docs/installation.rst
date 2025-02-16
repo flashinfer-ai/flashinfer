@@ -24,7 +24,7 @@ Prerequisites
 Quick Start
 ^^^^^^^^^^^
 
-The easiest way to install FlashInfer is via pip, we hosted wheels with indexed URL for different PyTorch versions and CUDA versions. Please note that the package currently used by FlashInfer is named ``flashinfer-python``, not ``flashinfer``.
+The easiest way to install FlashInfer is via pip, we host wheels with indexed URL for different PyTorch versions and CUDA versions. Please note that the package currently used by FlashInfer is named ``flashinfer-python``, not ``flashinfer``.
 
 .. tabs::
 
@@ -95,7 +95,7 @@ The easiest way to install FlashInfer is via pip, we hosted wheels with indexed 
 Install from Source
 ^^^^^^^^^^^^^^^^^^^
 
-In certain cases, you may want to install FlashInfer from source code to trying out the latest features in the main branch, or to customize the library for your specific needs.
+In certain cases, you may want to install FlashInfer from source code to try out the latest features in the main branch, or to customize the library for your specific needs.
 
 FlashInfer offers two installation modes:
 
