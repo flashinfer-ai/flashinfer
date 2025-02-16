@@ -500,9 +500,9 @@ class BlockSparseAttentionWrapper:
         v : torch.Tensor
             The value tensor with shape ``(N, num_kv_heads, head_dim)``.
         out : Optional[torch.Tensor]
-            The output tensor, if not provided, a new tensor will be allocated.
+            The output tensor, if not provided, will be allocated internally.
         lse : Optional[torch.Tensor]
-            The log-sum-exp tensor, if not provided, a new tensor will be allocated.
+            The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
             Whether to return the log-sum-exp of attention logits
 

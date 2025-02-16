@@ -292,9 +292,9 @@ class BatchMLAPagedAttentionWrapper:
             The rope part of the kv-cache tensor, shape: ``[num_pages, page_size, head_dim_kpe]``.
             ``head_dim_kpe`` is 64 in DeepSeek v2/v3 models.
         out : Optional[torch.Tensor]
-            The output tensor, if not provided, a new tensor will be allocated.
+            The output tensor, if not provided, will be allocated internally.
         lse : Optional[torch.Tensor]
-            The log-sum-exp value tensor, if not provided, a new tensor will be allocated.
+            The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool, optional
             Whether to return the log-sum-exp value, default is False.
         """

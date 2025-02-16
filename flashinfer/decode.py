@@ -1034,7 +1034,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         out : Optional[torch.Tensor]
             The output tensor, if not provided, will be allocated internally.
         lse : Optional[torch.Tensor]
-            The logsumexp of attention scores, if not provided, will be allocated internally.
+            The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
             Whether to return the logsumexp of attention scores, defaults to ``False``.
 
@@ -1535,7 +1535,7 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         out : Optional[torch.Tensor]
             The output tensor, if not provided, will be allocated internally.
         lse : Optional[torch.Tensor]
-            The logsumexp of attention scores, if not provided, will be allocated internally.
+            The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
             Whether to return the logsumexp of attention scores, defaults to ``False``.
 

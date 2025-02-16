@@ -1559,9 +1559,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         v_scale : Optional[float]
             The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
         out : Optional[torch.Tensor]
-            The output tensor, if not provided, a new tensor will be allocated.
+            The output tensor, if not provided, will be allocated internally.
         lse : Optional[torch.Tensor]
-            The logsumexp of attention output, if not provided, a new tensor will be allocated.
+            The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
             Whether to return the logsumexp of attention output
 
@@ -2263,7 +2263,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         out : Optional[torch.Tensor]
             The output tensor, if not provided, will be allocated internally.
         lse : Optional[torch.Tensor]
-            The logsumexp of attention output, if not provided, will be allocated internally.
+            The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
             Whether to return the logsumexp of attention output
 
