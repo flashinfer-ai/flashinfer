@@ -104,7 +104,7 @@ def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
         Input tensor, shape (..., 2 * hidden_size).
 
     out: Optional[torch.Tensor]
-        The the output tensor, if specified, the kernel will update this tensor inplace.
+        The output tensor, if specified, the kernel will update this tensor inplace.
 
     Returns
     -------
@@ -139,7 +139,7 @@ def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Te
         Input tensor, shape (..., 2 * hidden_size).
 
     out: Optional[torch.Tensor]
-        The the output tensor, if specified, the kernel will update this tensor inplace.
+        The output tensor, if specified, the kernel will update this tensor inplace.
 
     Returns
     -------
@@ -171,7 +171,7 @@ def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
         Input tensor, shape (..., 2 * hidden_size).
 
     out: Optional[torch.Tensor]
-        The the output tensor, if specified, the kernel will update this tensor inplace.
+        The output tensor, if specified, the kernel will update this tensor inplace.
 
     Returns
     -------
