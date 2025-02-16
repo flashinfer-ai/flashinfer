@@ -144,6 +144,13 @@ def test_batch_prefill_with_ragged_kv_cache(
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
 
+    # test with pre-allocated output
+    o_buffer = torch.empty_like(o)
+    lse_buffer = torch.empty_like(lse)
+    wrapper.run(q, k, v, out=o_buffer, lse=lse_buffer)
+    torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(lse, lse_buffer, rtol=1e-3, atol=1e-3)
+
 
 @pytest.mark.parametrize("batch_size", [1, 17, 37])
 @pytest.mark.parametrize("kv_len", [17, 33, 96, 97, 114, 514, 1024])
@@ -225,6 +232,13 @@ def test_batch_mla_page_attention(
     lse_ref = lse_ref.flatten(0, 1)
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
+
+    # test with pre-allocated output
+    o_buffer = torch.empty_like(o)
+    lse_buffer = torch.empty_like(lse)
+    wrapper.run(q_nope, q_pe, ckv, kpe, out=o_buffer, lse=lse_buffer)
+    torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(lse, lse_buffer, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":

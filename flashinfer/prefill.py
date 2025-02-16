@@ -40,6 +40,7 @@ from .utils import (
     _check_cached_qkv_data_type,
     _check_kv_layout,
     _check_pos_encoding_mode,
+    _check_shape_dtype_device,
     _get_cache_alibi_slopes_buf,
     _get_cache_buf,
     _unpack_paged_kv_cache,
@@ -1503,6 +1504,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         *args,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
     ) -> torch.Tensor: ...
 
@@ -1514,6 +1517,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         *args,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
@@ -1524,6 +1529,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         *args,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
@@ -1546,10 +1553,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
               :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
               ``paged_kv_cache[:, 1]`` is the value-cache.
 
+        *args
+            Additional arguments for custom kernels.
         k_scale : Optional[float]
             The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
         v_scale : Optional[float]
             The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
+        out : Optional[torch.Tensor]
+            The output tensor, if not provided, will be allocated internally.
+        lse : Optional[torch.Tensor]
+            The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
             Whether to return the logsumexp of attention output
 
@@ -1588,15 +1601,24 @@ class BatchPrefillWithPagedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
-        lse = None
         if return_lse:
-            lse = torch.empty(
-                (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
-            )
+            if lse is None:
+                lse = torch.empty(
+                    (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
+                )
+            else:
+                _check_shape_dtype_device(
+                    lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
+                )
 
-        out = torch.empty(
-            q.shape[:-1] + v_cache.shape[-1:], dtype=q.dtype, device=q.device
-        )
+        if out is None:
+            out = torch.empty(
+                q.shape[:-1] + v_cache.shape[-1:], dtype=q.dtype, device=q.device
+            )
+        else:
+            _check_shape_dtype_device(
+                out, q.shape[:-1] + v_cache.shape[-1:], q.dtype, q.device, "out"
+            )
 
         if self._custom_mask_buf is not None:
             mask_mode = MaskMode.CUSTOM.value
@@ -2200,6 +2222,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         k: torch.Tensor,
         v: torch.Tensor,
         *args,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
     ) -> torch.Tensor: ...
 
@@ -2210,6 +2234,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         k: torch.Tensor,
         v: torch.Tensor,
         *args,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
@@ -2219,6 +2245,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         k: torch.Tensor,
         v: torch.Tensor,
         *args,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and kv-cache stored as
@@ -2232,6 +2260,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The key tensor, shape: ``[kv_indptr[-1], num_kv_heads, head_dim_qk]``
         v : torch.Tensor
             The value tensor, shape: ``[kv_indptr[-1], num_kv_heads, head_dim_vo]``
+        *args
+            Additional arguments for the custom kernel.
+        out : Optional[torch.Tensor]
+            The output tensor, if not provided, will be allocated internally.
+        lse : Optional[torch.Tensor]
+            The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
             Whether to return the logsumexp of attention output
 
@@ -2261,12 +2295,23 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
-        lse = None
         if return_lse:
-            lse = torch.empty(
-                (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
+            if lse is None:
+                lse = torch.empty(
+                    (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
+                )
+            else:
+                _check_shape_dtype_device(
+                    lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
+                )
+        if out is None:
+            out = torch.empty(
+                q.shape[:-1] + v.shape[-1:], dtype=q.dtype, device=q.device
             )
-        out = torch.empty(q.shape[:-1] + v.shape[-1:], dtype=q.dtype, device=q.device)
+        else:
+            _check_shape_dtype_device(
+                out, q.shape[:-1] + v.shape[-1:], q.dtype, q.device, "out"
+            )
 
         if is_float8(q):
             logging.warning(

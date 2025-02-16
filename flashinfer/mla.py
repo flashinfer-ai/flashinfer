@@ -21,7 +21,13 @@ from typing import List, Literal, Optional, Tuple, Union, overload
 import torch
 
 from .jit import gen_batch_mla_module, get_batch_mla_uri
-from .utils import MaskMode, get_cuda_stream, register_custom_op, register_fake_op
+from .utils import (
+    MaskMode,
+    _check_shape_dtype_device,
+    get_cuda_stream,
+    register_custom_op,
+    register_fake_op,
+)
 
 _batch_mla_modules = {}
 
@@ -267,6 +273,8 @@ class BatchMLAPagedAttentionWrapper:
         q_pe: torch.Tensor,
         ckv_cache: torch.Tensor,
         kpe_cache: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Run the MLA attention computation.
@@ -283,6 +291,10 @@ class BatchMLAPagedAttentionWrapper:
         kpe_cache : torch.Tensor
             The rope part of the kv-cache tensor, shape: ``[num_pages, page_size, head_dim_kpe]``.
             ``head_dim_kpe`` is 64 in DeepSeek v2/v3 models.
+        out : Optional[torch.Tensor]
+            The output tensor, if not provided, will be allocated internally.
+        lse : Optional[torch.Tensor]
+            The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool, optional
             Whether to return the log-sum-exp value, default is False.
         """
@@ -292,12 +304,22 @@ class BatchMLAPagedAttentionWrapper:
         causal = self._causal
         mask_mode = MaskMode.CAUSAL.value if causal else MaskMode.NON_CAUSAL.value
         with self.device as device:
-            o = torch.empty_like(q_nope)
-            maybe_lse = (
-                torch.empty(q_nope.shape[:2], dtype=torch.float32, device=device)
-                if return_lse
-                else None
-            )
+            if out is None:
+                out = torch.empty_like(q_nope)
+            else:
+                _check_shape_dtype_device(
+                    out, q_nope.shape, q_nope.dtype, q_nope.device, "out"
+                )
+
+            if return_lse:
+                if lse is None:
+                    lse = torch.empty(
+                        q_nope.shape[:2], dtype=torch.float32, device=device
+                    )
+                else:
+                    _check_shape_dtype_device(
+                        lse, q_nope.shape[:2], torch.float32, q_nope.device, "lse"
+                    )
             self._cached_module.run(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
@@ -307,8 +329,8 @@ class BatchMLAPagedAttentionWrapper:
                 ckv_cache,
                 kpe_cache,
                 self._kv_indices_buf,
-                o,
-                maybe_lse,
+                out,
+                lse,
                 mask_mode,
                 num_heads,
                 page_size,
@@ -316,4 +338,4 @@ class BatchMLAPagedAttentionWrapper:
                 get_cuda_stream(device),
             )
 
-        return (o, maybe_lse) if return_lse else o
+        return (out, lse) if return_lse else out

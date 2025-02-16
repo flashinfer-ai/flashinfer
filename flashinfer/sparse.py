@@ -28,6 +28,7 @@ from .utils import (
     PosEncodingMode,
     TensorLayout,
     _check_pos_encoding_mode,
+    _check_shape_dtype_device,
     _get_cache_alibi_slopes_buf,
     canonicalize_torch_dtype,
     determine_attention_backend,
@@ -484,6 +485,8 @@ class BlockSparseAttentionWrapper:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute block-sparse attention between Q/K/V tensors.
@@ -496,8 +499,12 @@ class BlockSparseAttentionWrapper:
             The key tensor with shape ``(N, num_kv_heads, head_dim)``.
         v : torch.Tensor
             The value tensor with shape ``(N, num_kv_heads, head_dim)``.
+        out : Optional[torch.Tensor]
+            The output tensor, if not provided, will be allocated internally.
+        lse : Optional[torch.Tensor]
+            The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
-            Whether to return the logsumexp of attention output
+            Whether to return the log-sum-exp of attention logits
 
         Returns
         -------
@@ -528,13 +535,20 @@ class BlockSparseAttentionWrapper:
         stride_block = k.stride(0)
         stride_n = k.stride(1)
 
-        lse = None
         if return_lse:
-            lse = torch.empty(
-                (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
-            )
+            if lse is None:
+                lse = torch.empty(
+                    (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
+                )
+            else:
+                _check_shape_dtype_device(
+                    lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
+                )
 
-        out = torch.empty_like(q)
+        if out is None:
+            out = torch.empty_like(q)
+        else:
+            _check_shape_dtype_device(out, q.shape, q.dtype, q.device, "out")
         if self._use_tensor_cores:
             if self._backend == "fa3":
                 sparse_indices = block_sparse_indices_to_vector_sparse_offsets(

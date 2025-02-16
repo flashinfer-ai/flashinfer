@@ -137,6 +137,11 @@ def test_batch_prefill_with_paged_kv_cache(
             o, _ = wrapper.run(q, kv_data, return_lse=True)
         else:
             o = wrapper.run(q, kv_data)
+
+        # test with pre-allocated output
+        o_buffer = torch.empty_like(o)
+        wrapper.run(q, kv_data, out=o_buffer)
+        torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
     else:
         q_indptr_buffer = torch.empty(batch_size + 1).int().to(0)
         kv_indptr_buffer = torch.empty(batch_size + 1).int().to(0)
