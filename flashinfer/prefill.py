@@ -990,7 +990,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
     Note
     ----
     To accelerate computation, FlashInfer's batch prefill/append attention operators
-    creates some auxiliary data structures, these data structures can be reused across
+    create some auxiliary data structures, these data structures can be reused across
     multiple prefill/append attention calls (e.g. different Transformer layers). This
     wrapper class manages the lifecycle of these data structures.
     """
@@ -1794,7 +1794,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
     Note
     ----
     To accelerate computation, FlashInfer's batch prefill/append attention operators
-    creates some auxiliary data structures, these data structures can be reused across
+    create some auxiliary data structures, these data structures can be reused across
     multiple prefill/append attention calls (e.g. different Transformer layers). This
     wrapper class manages the lifecycle of these data structures.
     """
