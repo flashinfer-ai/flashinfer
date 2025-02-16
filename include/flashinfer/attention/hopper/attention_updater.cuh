@@ -145,6 +145,9 @@ struct DefaultUpdater {
   constexpr static float fill_value = 0.f;
   CUTLASS_DEVICE DefaultUpdater() {};
 
+  template <typename MainloopParams, typename BlockCoord>
+  CUTLASS_DEVICE DefaultUpdater(const MainloopParams& params, const BlockCoord& block_coord) {};
+
   __forceinline__ __device__ TensorT get_lse() { return TensorT(); }
 
   template <bool init, typename Tensor0>
@@ -153,7 +156,7 @@ struct DefaultUpdater {
   };
 
   template <typename Tensor1>
-  __forceinline__ __device__ void finalize(Tensor1& acc_s) {
+  __forceinline__ __device__ void finalize(Tensor1& acc_s, float pv_scale = 1.f) {
     // NOTE(Zihao): nothing to do here
   };
 
@@ -182,8 +185,7 @@ struct OnlineSoftmax {
       auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len] =
           block_coord;
       auto scale_qk = params.additional_params.scale_q[qo_head_idx] *
-                      params.additional_params.scale_k[kv_head_idx] *
-                      params.additional_params.sm_scale;
+                      params.additional_params.scale_k[kv_head_idx];
       sm_scale_log2 = scale_qk * params.additional_params.sm_scale * math::log2e;
     } else {
       sm_scale_log2 = 0.f;
@@ -235,8 +237,9 @@ struct OnlineSoftmax {
   };
 
   template <typename Tensor0>
-  __forceinline__ __device__ void finalize(Tensor0& acc_s) {
+  __forceinline__ __device__ void finalize(Tensor0& acc_s, float pv_scale = 1.f) {
     // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
+    // Note (Yilong): use pv_scale to dequantize the output
     Tensor scores = make_tensor(acc_s.data(), convert_layout_acc_rowcol(acc_s.layout()));
     static_assert(decltype(size<0>(scores))::value == NUM_ROWS_PER_THREAD);
     SumOp<float> sum_op;
@@ -244,7 +247,7 @@ struct OnlineSoftmax {
 #pragma unroll
     for (int mi = 0; mi < size(row_max); ++mi) {
       float sum = row_sum(mi);
-      float inv_sum = 1.f / sum;
+      float inv_sum = pv_scale / sum;
       scores_scale(mi) = inv_sum;
       if constexpr (WITH_SCALE) {
         row_sum(mi) = row_max(mi) * sm_scale_log2 + math::ptx_log2(sum);

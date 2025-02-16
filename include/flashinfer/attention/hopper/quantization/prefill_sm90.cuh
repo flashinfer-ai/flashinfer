@@ -203,6 +203,7 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
                                                                                   work_tile_info)) {
       // Attention output (GEMM-II) accumulator.
       Tensor tOrO = partition_fragment_C(tiled_mma_pv, select<0, 2>(TileShape_QKD{}));
+      clear(tOrO);
 
       auto block_coord = work_tile_info.get_block_coord(scheduler_params);
       auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len] =

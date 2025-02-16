@@ -224,18 +224,14 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
   consumer_wait(pipeline_vt, smem_pipe_read_v);
   gemm</*init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, tOrP, tOrV(_, _, _, smem_pipe_read_v.index()),
                                        tOrO);
-  attention_updater.finalize(tSrS);
+  attention_updater.finalize(tSrS, variant.scale_pv);
   warpgroup_wait<0>();
   pipeline_vt.consumer_release(smem_pipe_read_v);  // release V, otherwise producers will hang
   ++smem_pipe_read_v;
 
   attention_updater.rescale_o(tOrO);
   // Dequantize output o with P/V scale
-  // Note that column is permutated. Be careful with per-channel quantization
-#pragma unroll
-  for (int i = 0; i < size(tOrO); ++i) {
-    tOrO(i) = variant.ODequantize(mainloop_params, tOrO(i), qo_head_idx, kv_head_idx);
-  }
+  variant.ODequantize(mainloop_params, tOrO, qo_head_idx, kv_head_idx);
   return;
 }
 

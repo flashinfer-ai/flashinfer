@@ -126,11 +126,6 @@ struct FP8CollectiveEpilogue {
                                       /*id=*/static_cast<int>(NamedBarriers::kValueEmpty));
     cute::copy(rmem_tiled_copy_O, taccOrO, taccOsO);
     cutlass::arch::fence_view_async_shared();  // ensure smem writes are visible to TMA
-
-    // TODO(Yilong) : This is not useful as we do not use TMA, right?
-    // cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + cutlass::NumThreadsPerWarp,
-    //                                     cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
-
     Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.lse_ptr), epilogue_params.layout_LSE);
     Tensor gLSE = get_lse_local_tile_tensor(mLSE, Shape<Int<CTA_Q>>{}, qo_head_idx, qo_indptr,
                                             qo_len)(_, qo_tile_idx);
@@ -155,10 +150,6 @@ struct FP8CollectiveEpilogue {
     }
 
     int write_warp_idx = NUM_WARPS - 1;
-    // if (cutlass::canonical_warp_idx_sync() == write_warp_idx) {
-    //   cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + cutlass::NumThreadsPerWarp,
-    //                                     cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
-    // }
     TiledCopyO gmem_tiled_copy_O;
     Tensor sO = make_tensor(make_smem_ptr(shared_storage.smem_o.data()), SmemLayoutO{});
     write_O<NUM_COPY_THREADS>(epilogue_params.O_ptr, gmem_tiled_copy_O, epilogue_params.layout_O,

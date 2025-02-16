@@ -186,6 +186,7 @@ struct FP8CollectiveMainloop {
     TMA_V tma_load_V;
     int window_left;
     AdditionalParams additional_params;
+    using DTypeKV = typename Ktraits::DTypeKV;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {

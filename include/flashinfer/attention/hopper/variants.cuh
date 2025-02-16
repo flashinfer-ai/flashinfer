@@ -62,7 +62,7 @@ struct LogitsSoftCap {
 };
 
 struct StandardFP8Attention {
-  float scale_qk, scale_pv;
+  float p_scale, scale_pv;
 
   template <int NUM_ROWS_PER_THREAD>
   using Updater = OnlineSoftmaxWithScale<NUM_ROWS_PER_THREAD>;
@@ -70,9 +70,9 @@ struct StandardFP8Attention {
   template <typename MainloopParams, typename BlockCoord>
   __device__ StandardFP8Attention(const MainloopParams& params, const BlockCoord& block_coord) {
     auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len] = block_coord;
-    scale_qk = params.additional_params.scale_q[qo_head_idx] *
-               params.additional_params.scale_k[kv_head_idx] * params.additional_params.sm_scale;
-    scale_pv = params.additional_params.scale_v[kv_head_idx] / 448;
+    // 448 for e4m3; 57344 for e5m2
+    p_scale = std::numeric_limits<typename MainloopParams::DTypeKV>::max();
+    scale_pv = params.additional_params.scale_v[kv_head_idx] / p_scale;
   }
 
   template <typename MainloopParams, typename T>
@@ -88,14 +88,14 @@ struct StandardFP8Attention {
   __device__ __forceinline__ void PQuantize(Tensor0& tSrS) {
 #pragma unroll
     for (int i = 0; i < size(tSrS); ++i) {
-      tSrS(i) *= 448.f;
+      tSrS(i) *= p_scale;
     }
   }
 
-  template <typename MainloopParams, typename T>
-  __device__ __forceinline__ T ODequantize(const MainloopParams& params, T out,
-                                           uint32_t qo_head_idx, uint32_t kv_head_idx) {
-    return out * scale_pv;
+  template <typename MainloopParams, typename Tensor0>
+  __device__ __forceinline__ void ODequantize(const MainloopParams& params, Tensor0& tOrO,
+                                              uint32_t qo_head_idx, uint32_t kv_head_idx) {
+    // we fuse the PV dequantization into online_softmax.finalize
   }
 };
 

@@ -145,7 +145,9 @@ template <typename To_type, typename Engine, typename Layout>
 __forceinline__ __device__ auto convert_type(Tensor<Engine, Layout> const& tensor) {
   using From_type = typename Engine::value_type;
   constexpr int numel = decltype(size(tensor))::value;
-  cutlass::NumericArrayConverter<To_type, From_type, numel> convert_op;
+  cutlass::NumericArrayConverter<To_type, From_type, numel,
+                                 cutlass::FloatRoundStyle::round_to_nearest>
+      convert_op;
   // HACK: this requires tensor to be "contiguous"
   auto frag = convert_op(*reinterpret_cast<const cutlass::Array<From_type, numel>*>(tensor.data()));
   return make_tensor(make_rmem_ptr<To_type>(&frag), tensor.layout());
