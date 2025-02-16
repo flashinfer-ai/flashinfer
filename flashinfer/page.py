@@ -201,7 +201,7 @@ def get_batch_indices_positions(
     ----
     This function is similar to `CSR2COO <https://docs.nvidia.com/cuda/cusparse/#csr2coo>`_
     conversion in cuSPARSE library, with the difference that we are converting from a ragged
-    tensor (which don't require a column indices array) to a COO format.
+    tensor (which doesn't require a column indices array) to a COO format.
 
     See Also
     --------
@@ -349,7 +349,7 @@ def append_paged_kv_cache(
 
     Note
     ----
-    The function assumes that the space for appended k/v have already been allocated,
+    The function assumes that the space for appended k/v has already been allocated,
     which means :attr:`kv_indices`, :attr:`kv_indptr`, :attr:`kv_last_page_len` has
     incorporated appended k/v.
 
