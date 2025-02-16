@@ -187,6 +187,11 @@ def test_batch_decode_with_paged_kv_cache(
         )
         torch.testing.assert_close(o[i], o_ref_i, rtol=1e-3, atol=1e-3)
 
+    # test user-allocated output
+    o_buffer = torch.empty_like(o)
+    wrapper.run(q, kv_data, out=o_buffer)
+    torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
+
 
 @pytest.mark.parametrize("batch_size", [12, 17])
 @pytest.mark.parametrize("kv_len", [54, 97, 512])
