@@ -20,12 +20,19 @@ from .activation import get_act_and_mul_cu_str as get_act_and_mul_cu_str
 from .attention import gen_batch_decode_mla_module as gen_batch_decode_mla_module
 from .attention import gen_batch_decode_module as gen_batch_decode_module
 from .attention import gen_batch_mla_module as gen_batch_mla_module
+from .attention import gen_batch_mla_tvm_binding as gen_batch_mla_tvm_binding
 from .attention import gen_batch_prefill_module as gen_batch_prefill_module
 from .attention import (
     gen_customize_batch_decode_module as gen_customize_batch_decode_module,
 )
 from .attention import (
+    gen_customize_batch_decode_tvm_binding as gen_customize_batch_decode_tvm_binding,
+)
+from .attention import (
     gen_customize_batch_prefill_module as gen_customize_batch_prefill_module,
+)
+from .attention import (
+    gen_customize_batch_prefill_tvm_binding as gen_customize_batch_prefill_tvm_binding,
 )
 from .attention import (
     gen_customize_single_decode_module as gen_customize_single_decode_module,

@@ -56,10 +56,6 @@ flashinfer_option(FLASHINFER_FASTDIV_TEST
                   "Whether to compile fastdiv kernel tests or not." OFF)
 flashinfer_option(FLASHINFER_FASTDEQAUNT_TEST
                   "Whether to compile fast dequant kernel tests or not." OFF)
-flashinfer_option(FLASHINFER_TVM_BINDING
-                  "Whether to compile tvm binding or not." OFF)
-flashinfer_option(FLASHINFER_TVM_SOURCE_DIR
-                  "The path to tvm for building tvm binding." "")
 
 # The following configurations can impact the binary size of the generated
 # library
@@ -375,39 +371,6 @@ if(FLASHINFER_NORM)
   target_link_libraries(test_norm PRIVATE gtest gtest_main)
   target_compile_options(test_norm PRIVATE -Wno-switch-bool)
 endif(FLASHINFER_NORM)
-
-if(FLASHINFER_TVM_BINDING)
-  message(STATUS "Compile tvm binding.")
-  if(NOT FLASHINFER_TVM_SOURCE_DIR STREQUAL "")
-    set(TVM_SOURCE_DIR_SET ${FLASHINFER_TVM_SOURCE_DIR})
-  elseif(DEFINED ENV{TVM_SOURCE_DIR})
-    set(TVM_SOURCE_DIR_SET $ENV{TVM_SOURCE_DIR})
-  elseif(DEFINED ENV{TVM_HOME}) # for backward compatibility
-    set(TVM_SOURCE_DIR_SET $ENV{TVM_HOME})
-  else()
-    message(
-      FATAL_ERROR
-        "Error: Cannot find TVM. Please set the path to TVM by 1) adding `-DFLASHINFER_TVM_SOURCE_DIR=path/to/tvm` in the cmake command, or 2) setting the environment variable `TVM_SOURCE_DIR` to the tvm path."
-    )
-  endif()
-  message(STATUS "FlashInfer uses TVM home ${TVM_SOURCE_DIR_SET}.")
-
-  file(GLOB_RECURSE TVM_BINDING_SRCS ${PROJECT_SOURCE_DIR}/src/tvm_wrapper.cu)
-  add_library(flashinfer_tvm OBJECT ${TVM_BINDING_SRCS})
-  target_compile_definitions(flashinfer_tvm PRIVATE -DDMLC_USE_LOGGING_LIBRARY=
-                                                    \<tvm/runtime/logging.h\>)
-  target_link_libraries(flashinfer_tvm PRIVATE decode_kernels prefill_kernels)
-  target_include_directories(flashinfer_tvm PRIVATE ${FLASHINFER_INCLUDE_DIR})
-  target_include_directories(flashinfer_tvm
-                             PRIVATE ${TVM_SOURCE_DIR_SET}/include)
-  target_include_directories(
-    flashinfer_tvm PRIVATE ${TVM_SOURCE_DIR_SET}/3rdparty/dlpack/include)
-  target_include_directories(
-    flashinfer_tvm PRIVATE ${TVM_SOURCE_DIR_SET}/3rdparty/dmlc-core/include)
-  add_dependencies(flashinfer_tvm dispatch_inc)
-  target_compile_options(flashinfer_tvm PRIVATE -Xcompiler=-fPIC -diag-suppress
-                                                "1305" -Wno-switch-bool)
-endif(FLASHINFER_TVM_BINDING)
 
 if(FLASHINFER_FASTDIV_TEST)
   message(STATUS "Compile fastdiv test.")
