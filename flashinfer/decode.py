@@ -45,6 +45,7 @@ from .utils import (
     _check_cached_qkv_data_type,
     _check_kv_layout,
     _check_pos_encoding_mode,
+    _check_shape,
     _get_cache_alibi_slopes_buf,
     _get_cache_buf,
     _get_range_buf,
@@ -972,6 +973,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
     ) -> torch.Tensor: ...
 
@@ -984,6 +987,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
@@ -995,6 +1000,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
@@ -1016,13 +1023,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
               ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
               :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
               ``paged_kv_cache[:, 1]`` is the value-cache.
-
+        *args
+            Additional arguments for the custom kernel.
         q_scale : Optional[float]
             The calibration scale of query for fp8 input, if not provided, will be set to ``1.0``.
         k_scale : Optional[float]
             The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
         v_scale : Optional[float]
             The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
+        out : Optional[torch.Tensor]
+            The output tensor, if not provided, will be allocated internally.
+        lse : Optional[torch.Tensor]
+            The logsumexp of attention scores, if not provided, will be allocated internally.
         return_lse : bool
             Whether to return the logsumexp of attention scores, defaults to ``False``.
 
@@ -1061,13 +1073,19 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if rope_theta is None:
             rope_theta = 1e4
 
-        lse = None
         if return_lse:
-            lse = torch.empty(
-                (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
-            )
+            if lse is None:
+                lse = torch.empty(
+                    (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
+                )
+            else:
+                _check_shape(lse, (q.size(0), q.size(1)), "lse")
 
-        out = torch.empty_like(q)
+        if out is None:
+            out = torch.empty_like(q)
+        else:
+            _check_shape(out, q.shape, "out")
+
         if self.use_tensor_cores:
             run_args = [
                 self._float_workspace_buffer,
@@ -1270,11 +1288,11 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             Whether to enable CUDAGraph for batch decode attention, if enabled, the
             auxiliary data structures will be stored as the provided buffers. The ``batch_size``
             cannot change during the lifecycle of this wrapper when CUDAGraph is enabled.
-        
+
         use_tensor_cores : bool
             Whether to use tensor cores for the computation. Will be faster for large group
             size in grouped query attention. Defaults to ``False``.
-        
+
         paged_kv_indptr_buffer : Optional[torch.Tensor]
             The user reserved buffer on GPU to store the indptr of the paged kv cache, the size
             of the buffer should be ``[batch_size + 1]``.
@@ -1488,6 +1506,8 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
+        out: Optional[torch.Tensor] = None,
+        lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch decode attention between query and paged kv cache.
@@ -1510,6 +1530,10 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             The calibration scale of key for fp8 input, if not provided, will be set to ``1.0``.
         v_scale : Optional[float]
             The calibration scale of value for fp8 input, if not provided, will be set to ``1.0``.
+        out : Optional[torch.Tensor]
+            The output tensor, if not provided, will be allocated internally.
+        lse : Optional[torch.Tensor]
+            The logsumexp of attention scores, if not provided, will be allocated internally.
         return_lse : bool
             Whether to return the logsumexp of attention scores, defaults to ``False``.
 
@@ -1539,14 +1563,20 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
             rope_theta = 1e4
 
         with self.device as device:
-            o = torch.empty_like(q_nope, device=device)
-            maybe_lse = (
-                torch.empty(
-                    (q_nope.size(0), q_nope.size(1)), dtype=torch.float32, device=device
-                )
-                if return_lse
-                else None
-            )
+            if out is None:
+                out = torch.empty_like(q_nope, device=device)
+            else:
+                _check_shape(out, q_nope.shape, "out")
+
+            if return_lse:
+                if lse is None:
+                    lse = torch.empty(
+                        (q_nope.size(0), q_nope.size(1)),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                else:
+                    _check_shape(lse, (q_nope.size(0), q_nope.size(1)), "lse")
             self._cached_module.run(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
@@ -1558,16 +1588,16 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
                 self._paged_kv_indptr_buf,
                 self._paged_kv_indices_buf,
                 self._paged_kv_last_page_len_buf,
-                o,
+                out,
                 sm_scale,
                 window_left,
                 logits_soft_cap,
                 rope_scale,
                 rope_theta,
-                maybe_lse,
+                lse,
                 get_cuda_stream(device),
             )
-            out = [o, maybe_lse] if return_lse else [o]
+            out = [out, lse] if return_lse else [out]
         if v_scale is not None:
             out[0] *= v_scale
 

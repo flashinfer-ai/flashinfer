@@ -362,3 +362,14 @@ def determine_attention_backend(
         return "fa3"
     else:
         return "fa2"
+
+
+def _check_shape(
+    x: torch.Tensor,
+    expected_shape: Sequence[int],
+    name: str,
+) -> None:
+    if x.shape != torch.Size(expected_shape):
+        raise ValueError(
+            f"Invalid shape of {name}: expected {expected_shape}, got {x.shape}"
+        )
