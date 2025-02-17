@@ -972,6 +972,15 @@ inline cudaError_t PrefillSM90Plan(
   return cudaSuccess;
 }
 
+inline int packed_causal_kv_len(int qo_len, int kv_len, int qo_tile_idx, int cluster_tile_q,
+                                int num_qo_tiles, int group_size) {
+  if (qo_tile_idx + 1 == num_qo_tiles) {
+    return kv_len;
+  }
+  int kv_len_init = kv_len - (qo_len / group_size);
+  return kv_len_init + ((qo_tile_idx + 1) * cluster_tile_q) / group_size;
+}
+
 struct MLAPlanInfo {
   int64_t num_blks_x;
   int64_t num_blks_y;
@@ -1083,12 +1092,13 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
     int packed_qo_len = qo_len * num_heads;
     int num_qo_tiles = ceil_div(packed_qo_len, cluster_tile_q);
     for (int qo_tile_idx = num_qo_tiles - 1; qo_tile_idx >= 0; --qo_tile_idx) {
-      int effective_kv_len =
-          causal ? kv_len - (num_qo_tiles - qo_tile_idx - 1) * cluster_tile_q : kv_len;
+      int effective_kv_len = causal ? packed_causal_kv_len(qo_len, kv_len, qo_tile_idx,
+                                                           cluster_tile_q, num_qo_tiles, num_heads)
+                                    : kv_len;
       total_kv_lens += effective_kv_len;
     }
   }
-  int kv_len_limit = std::max(ceil_div(total_kv_lens, num_clusters), 64L);
+  int kv_len_limit = ceil_div(ceil_div(total_kv_lens, num_clusters), 512L) * 512L;
 
   // step 1. load-balancing scheduling algorithm
   MinHeap cluster_cost_heap(num_clusters);
@@ -1111,15 +1121,18 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
     int packed_qo_len = qo_len * num_heads;
     int num_qo_tiles = ceil_div(packed_qo_len, cluster_tile_q);
     for (int qo_tile_idx = num_qo_tiles - 1; qo_tile_idx >= 0; --qo_tile_idx) {
-      int remaining_len =
-          causal ? kv_len - (num_qo_tiles - qo_tile_idx - 1) * cluster_tile_q : kv_len;
+      int remaining_len = causal ? packed_causal_kv_len(qo_len, kv_len, qo_tile_idx, cluster_tile_q,
+                                                        num_qo_tiles, num_heads)
+                                 : kv_len;
       int kv_start = 0;
       bool split_kv = remaining_len > kv_len_limit;
       if (split_kv) {
         merge_indptr[split_kv_count] = partial_o_nnz;
-        merge_packed_offset_start[split_kv_count] = qo_indptr_h[i] + qo_tile_idx * cluster_tile_q;
+        merge_packed_offset_start[split_kv_count] =
+            qo_indptr_h[i] * num_heads + qo_tile_idx * cluster_tile_q;
         merge_packed_offset_end[split_kv_count] =
-            qo_indptr_h[i] + std::min((qo_tile_idx + 1) * cluster_tile_q, qo_len);
+            qo_indptr_h[i] * num_heads +
+            std::min((qo_tile_idx + 1) * cluster_tile_q, packed_qo_len);
       }
       while (remaining_len > 0) {
         auto [cluster_idx, accum_cost] = cluster_cost_heap.pop();
@@ -1132,7 +1145,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
         cluster_kv_indptr[cluster_idx].push_back(kv_indptr_h[i]);
         if (split_kv) {
           cluster_partial_indptr[cluster_idx].push_back(partial_o_nnz);
-          partial_o_nnz += std::min(qo_len - qo_tile_idx * cluster_tile_q, cluster_tile_q);
+          partial_o_nnz += std::min(packed_qo_len - qo_tile_idx * cluster_tile_q, cluster_tile_q);
         } else {
           cluster_partial_indptr[cluster_idx].push_back(-1);
         }
