@@ -1134,7 +1134,8 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
             qo_indptr_h[i] * num_heads +
             std::min((qo_tile_idx + 1) * cluster_tile_q, packed_qo_len);
       }
-      while (remaining_len > 0) {
+      bool zero_kv_len = (remaining_len == 0);
+      while (remaining_len > 0 || zero_kv_len) {
         auto [cluster_idx, accum_cost] = cluster_cost_heap.pop();
         int actual_len = std::min(remaining_len, kv_len_limit);
         cluster_cost_heap.insert(
@@ -1154,6 +1155,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
         cluster_kv_end[cluster_idx].push_back(kv_start + actual_len);
         remaining_len -= actual_len;
         kv_start += actual_len;
+        if (zero_kv_len) break;
       }
       split_kv_count += int(split_kv);
     }

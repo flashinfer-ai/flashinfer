@@ -171,7 +171,7 @@ def generate_kv_from_cache(ckv, kpe, kv_len, batch_size, num_heads):
 
 
 @pytest.mark.parametrize("batch_size", [1, 17, 37])
-@pytest.mark.parametrize("kv_len", [17, 33, 96, 97, 114, 514, 1024])
+@pytest.mark.parametrize("kv_len", [0, 17, 33, 96, 97, 114, 514, 1024])
 @pytest.mark.parametrize("qo_len", [1, 17, 37, 77])
 @pytest.mark.parametrize("num_heads", [4, 32, 128])
 @pytest.mark.parametrize("causal", [False, True])
@@ -243,7 +243,8 @@ def test_batch_mla_page_attention(
     o_ref, lse_ref = attention_ref(batch_size, q, k, v, causal, sm_scale)
     lse_ref = lse_ref.flatten(0, 1)
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
-    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
+    if kv_len != 0:
+        torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
 
     # test with pre-allocated output
     o_buffer = torch.empty_like(o)
