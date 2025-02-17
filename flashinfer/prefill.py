@@ -1196,7 +1196,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
         q_data_type: Union[str, torch.dtype] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
         non_blocking: bool = False,
-        backend: str = "auto",
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1396,7 +1395,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
-            if backend == "auto":
+            if self._backend == "auto":
                 self._backend = determine_attention_backend(
                     self.device,
                     PosEncodingMode[pos_encoding_mode].value,
@@ -1976,7 +1975,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         rope_theta: Optional[float] = None,
         q_data_type: Union[str, torch.dtype] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
-        backend: str = "auto",
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -2133,7 +2131,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         if self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
-            if backend == "auto":
+            if self._backend == "auto":
                 self._backend = determine_attention_backend(
                     self.device,
                     PosEncodingMode[pos_encoding_mode].value,
