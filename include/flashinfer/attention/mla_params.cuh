@@ -39,6 +39,10 @@ struct MLAParams {
 
   IdType* q_indptr;
   IdType* kv_indptr;
+  IdType* partial_indptr;
+  IdType* merge_packed_offset_start;
+  IdType* merge_packed_offset_end;
+  IdType* merge_indptr;
   IdType* kv_indices;
   IdType* q_len;
   IdType* kv_len;

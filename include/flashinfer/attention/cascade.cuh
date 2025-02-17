@@ -16,8 +16,6 @@
 #ifndef FLASHINFER_CASCADE_CUH_
 #define FLASHINFER_CASCADE_CUH_
 
-#include <cooperative_groups.h>
-
 #include "../cp_async.cuh"
 #include "../math.cuh"
 #include "../utils.cuh"
@@ -25,7 +23,6 @@
 
 namespace flashinfer {
 
-namespace cg = cooperative_groups;
 using cp_async::PrefetchMode;
 using cp_async::SharedMemFillMode;
 
@@ -323,8 +320,8 @@ __global__ void MergeStatesLargeNumIndexSetsKernel(DTypeIn* __restrict__ V, floa
 }
 
 /*!
- * \brief The CUDA kernel to merge self-attention states of multiple index sets, the number of index
- *   sets at each position might vary.
+ * \brief The CUDA kernel to merge self-attention states of multiple index sets, the number of
+ * index sets at each position might vary.
  *
  * For CUDA graph support, the kernel can be built with a maximum sequence length and executed
  * using a truncated, dynamic sequence length passed through `seq_len_ptr`.

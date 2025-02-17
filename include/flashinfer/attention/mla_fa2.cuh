@@ -15,6 +15,8 @@
  */
 #ifndef FLASHINFER_MLA_FA2_CUH_
 #define FLASHINFER_MLA_FA2_CUH_
+#include <cooperative_groups.h>
+
 #include <cstdint>
 #include <sstream>
 
@@ -90,7 +92,6 @@ struct KernelTraits {
   static constexpr uint32_t UPCAST_STRIDE_KPE = HEAD_DIM_KPE / upcast_size<DTypeKV_>();
   static constexpr uint32_t UPCAST_STRIDE_FINAL_O = HEAD_DIM_CKV / upcast_size<DTypeO_>();
   static constexpr uint32_t UPCAST_STRIDE_P = CTA_TILE_KV / upcast_size<DTypeKV_>();
-  static constexpr uint32_t UPCAST_STRIDE_PARTIAL_O = HEAD_DIM_CKV / upcast_size<float>();
 
   using DTypeQ = DTypeQ_;
   using DTypeKV = DTypeKV_;
@@ -618,6 +619,45 @@ __device__ __forceinline__ void finalize_m_(typename KTraits::AttentionVariant v
   }
 }
 
+template <uint32_t HEAD_DIM, typename IdType, typename DTypeO>
+__device__ void DevicePersistentMergeStates(IdType* merge_packed_offset_start,
+                                            IdType* merge_packed_offset_end, IdType* merge_indptr,
+                                            float* partial_o, float* partial_lse, DTypeO* final_o,
+                                            float* final_lse, const uint32_t o_stride_n,
+                                            const uint32_t o_stride_h,
+                                            const uint32_t cluster_tile_q,
+                                            const uint_fastdiv& num_heads) {
+  constexpr uint32_t vec_size = 4;  // partial o has data type float
+  constexpr uint32_t num_threads_per_row = HEAD_DIM / vec_size;
+  const uint32_t cta_id = (blockIdx.z * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x;
+  const uint32_t thread_id = (threadIdx.z * blockDim.y + threadIdx.y) * blockDim.x + threadIdx.x;
+#pragma unroll 1
+  for (uint32_t final_packed_offset =
+           merge_packed_offset_start[cta_id] + thread_id / num_threads_per_row;
+       final_packed_offset < merge_packed_offset_end[cta_id]; ++final_packed_offset) {
+    uint32_t q, r;
+    num_heads.divmod(final_packed_offset, q, r);
+    state_t<vec_size> st;
+#pragma unroll 2
+    for (uint32_t partial_packed_offset = merge_indptr[cta_id] + thread_id / num_threads_per_row;
+         partial_packed_offset < merge_indptr[cta_id + 1];
+         partial_packed_offset += cluster_tile_q) {
+      vec_t<float, vec_size> o_partial;
+      float lse_partial;
+      o_partial.load(partial_o + partial_packed_offset * HEAD_DIM +
+                     (thread_id % num_threads_per_row) * vec_size);
+      lse_partial = partial_lse[partial_packed_offset];
+      st.merge(o_partial, lse_partial, 1);
+    }
+    st.normalize();
+    st.o.cast_store(
+        final_o + (q * o_stride_n + r * o_stride_h + (thread_id % num_threads_per_row) * vec_size));
+    if (final_lse) {
+      final_lse[q * num_heads + r] = st.get_lse();
+    }
+  }
+}
+
 template <typename KTraits>
 __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_storage,
                                         typename KTraits::DTypeO* final_o, float* final_lse,
@@ -631,12 +671,38 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
   constexpr uint32_t HEAD_DIM_CKV = KTraits::HEAD_DIM_CKV;
   constexpr uint32_t UPCAST_STRIDE_FINAL_O = KTraits::UPCAST_STRIDE_FINAL_O;
   const uint32_t lane_idx = threadIdx.x, warpgroup_idx = threadIdx.z, warp_idx_in_wg = threadIdx.y;
+  smem_t<KTraits::SWIZZLE_MODE_O> o_smem(smem_storage->o_smem);
 
-  if (false) {
-    // TOOD(Zihao): write to partial
+  if (partial_o != nullptr) {
+    // write to partial_o
+#pragma unroll
+    for (uint32_t j = 0; j < 2; ++j) {
+      uint32_t q_idx = (packed_offset + warp_idx_in_wg * 16 + 8 * j + lane_idx / 4) / num_heads;
+      if (lane_idx % 4 == 0 && q_idx < q_len) {
+        partial_lse[warp_idx_in_wg * 16 + 8 * j + lane_idx / 4] =
+            math::ptx_log2(d[j]) + float(m[j]);
+      }
+    }
+
+#pragma unroll
+    for (uint32_t j = 0; j < 2; ++j) {
+      uint32_t q_idx = (packed_offset + warp_idx_in_wg * 16 + 8 * j + lane_idx / 4) / num_heads;
+#pragma unroll
+      for (uint32_t mma_d = 0; mma_d < NUM_MMA_D_CKV / 2; ++mma_d) {
+        if (q_idx < q_len) {
+          *reinterpret_cast<float2*>(
+              partial_o + (warp_idx_in_wg * 16 + 8 * j + lane_idx / 4) * HEAD_DIM_CKV +
+              warpgroup_idx * (HEAD_DIM_CKV / 2) + mma_d * 16 + (lane_idx % 4) * 2) =
+              *reinterpret_cast<float2*>(&o_frag[mma_d][j * 2]);
+          *reinterpret_cast<float2*>(
+              partial_o + (warp_idx_in_wg * 16 + 8 * j + lane_idx / 4) * HEAD_DIM_CKV +
+              warpgroup_idx * (HEAD_DIM_CKV / 2) + mma_d * 16 + 8 + (lane_idx % 4) * 2) =
+              *reinterpret_cast<float2*>(&o_frag[mma_d][4 + j * 2]);
+        }
+      }
+    }
   } else {
     // write to final_o
-    smem_t<KTraits::SWIZZLE_MODE_O> o_smem(smem_storage->o_smem);
 
     if (final_lse) {
 #pragma unroll
@@ -755,6 +821,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
        ++work_idx) {
     const uint32_t q_indptr = params.q_indptr[work_idx];
     const uint32_t kv_indptr = params.kv_indptr[work_idx];
+    const int32_t partial_indptr = params.partial_indptr[work_idx];
     const uint32_t q_len = params.q_len[work_idx];
     const uint32_t kv_len = params.kv_len[work_idx];
     const uint32_t packed_qo_start = params.q_start[work_idx];
@@ -884,11 +951,22 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
 
     finalize_m_<KTraits>(variant, m);
 
-    write_o<KTraits>(&smem_storage, final_o + q_indptr * o_stride_n,
-                     final_lse ? final_lse + q_indptr * num_heads : nullptr, partial_o, partial_lse,
-                     o_frag, m, d, o_stride_n, o_stride_h, qo_upperbound, qo_packed_idx_base,
-                     num_heads);
+    write_o<KTraits>(
+        &smem_storage, final_o + q_indptr * o_stride_n,
+        final_lse ? final_lse + q_indptr * num_heads : nullptr,
+        (partial_indptr == -1) ? nullptr : partial_o + partial_indptr * KTraits::HEAD_DIM_CKV,
+        (partial_indptr == -1) ? nullptr : partial_lse + partial_indptr, o_frag, m, d, o_stride_n,
+        o_stride_h, qo_upperbound, qo_packed_idx_base, num_heads);
   }
+
+  auto grid = cg::this_grid();
+  grid.sync();
+
+  // the second stage, merge partial outputs
+  DevicePersistentMergeStates<KTraits::HEAD_DIM_CKV>(
+      params.merge_packed_offset_start, params.merge_packed_offset_end, params.merge_indptr,
+      partial_o, partial_lse, final_o, final_lse, o_stride_n, o_stride_h, cluster_tile_q,
+      num_heads);
 }
 
 #define DISPATCH_SMEM_CONFIG(smem_limit_per_sm, NUM_STAGES, CTA_TILE_KV, QK_SHARD, ...) \
@@ -948,7 +1026,8 @@ cudaError_t BatchMLAPagedAttention(Params params, uint32_t num_blks_x, uint32_t 
 
     FLASHINFER_CUDA_CALL(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+    FLASHINFER_CUDA_CALL(
+        cudaLaunchCooperativeKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
   });
 
   return cudaSuccess;

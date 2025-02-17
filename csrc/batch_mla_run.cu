@@ -72,6 +72,8 @@ void BatchMLAPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int
 
         params.q_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.q_indptr_offset);
         params.kv_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_indptr_offset);
+        params.partial_indptr =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.partial_indptr_offset);
         params.kv_indices = static_cast<IdType*>(kv_indices.data_ptr());
         params.q_len = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.q_len_offset);
         params.kv_len = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_len_offset);
@@ -80,6 +82,12 @@ void BatchMLAPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int
         params.kv_end = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_end_offset);
         params.work_indptr =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.work_indptr_offset);
+        params.merge_packed_offset_start = GetPtrFromBaseOffset<IdType>(
+            int_buffer_ptr, plan_info.merge_packed_offset_start_offset);
+        params.merge_packed_offset_end =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_packed_offset_end_offset);
+        params.merge_indptr =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_indptr_offset);
         params.final_o = static_cast<DTypeO*>(o.data_ptr());
         params.final_lse =
             maybe_lse.has_value() ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;

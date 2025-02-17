@@ -59,10 +59,21 @@ def bench_deepseek_mla_decode(batch_size, seq_len, num_heads):
         q_nope.dtype,
         ckv.dtype,
     )
-    o = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            o = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
+
+    torch.cuda.current_stream().wait_stream(s)
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        o = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
 
     ms = triton.testing.do_bench(
-        lambda: wrapper.run(q_nope, q_pe, ckv, kpe),
+        # lambda: wrapper.run(q_nope, q_pe, ckv, kpe),
+        lambda: g.replay(),
         warmup=100,
         rep=1000,
     )
@@ -74,9 +85,19 @@ def bench_deepseek_mla_decode(batch_size, seq_len, num_heads):
 
 
 if __name__ == "__main__":
-    bench_deepseek_mla_decode(768, 1024, 16)
-    bench_deepseek_mla_decode(768, 1024, 32)
-    bench_deepseek_mla_decode(768, 1024, 64)
-    bench_deepseek_mla_decode(768, 2048, 16)
-    bench_deepseek_mla_decode(768, 2048, 32)
-    bench_deepseek_mla_decode(768, 2048, 64)
+    # bench_deepseek_mla_decode(768, 1024, 16)
+    # bench_deepseek_mla_decode(768, 1024, 32)
+    # bench_deepseek_mla_decode(768, 1024, 64)
+    # bench_deepseek_mla_decode(768, 2048, 16)
+    # bench_deepseek_mla_decode(768, 2048, 32)
+    # bench_deepseek_mla_decode(768, 2048, 64)
+    bench_deepseek_mla_decode(1, 1024, 16)
+    bench_deepseek_mla_decode(1, 1024, 32)
+    bench_deepseek_mla_decode(1, 1024, 64)
+    bench_deepseek_mla_decode(1, 2048, 16)
+    bench_deepseek_mla_decode(1, 2048, 32)
+    bench_deepseek_mla_decode(1, 2048, 64)
+    bench_deepseek_mla_decode(132, 1024, 16)
+    bench_deepseek_mla_decode(1, 32768, 64)
+    bench_deepseek_mla_decode(32, 32768, 16)
+    bench_deepseek_mla_decode(64, 32768, 16)
