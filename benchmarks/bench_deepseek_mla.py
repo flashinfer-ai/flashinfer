@@ -59,6 +59,7 @@ def bench_deepseek_mla_decode(batch_size, seq_len, num_heads):
         q_nope.dtype,
         ckv.dtype,
     )
+    o = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
 
     ms = triton.testing.do_bench(
         lambda: wrapper.run(q_nope, q_pe, ckv, kpe),
