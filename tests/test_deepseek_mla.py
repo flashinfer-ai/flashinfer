@@ -151,18 +151,24 @@ def test_batch_prefill_with_ragged_kv_cache(
     torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(lse, lse_buffer, rtol=1e-3, atol=1e-3)
 
+
 def generate_kv_from_cache(ckv, kpe, kv_len, batch_size, num_heads):
     bs_page_num, page_size, ckv_dim = ckv.shape
     page_num = bs_page_num // batch_size
-    _,_,kpe_dim = kpe.shape
+    _, _, kpe_dim = kpe.shape
     ckv = ckv.view(batch_size, page_num * page_size, ckv_dim)
     kpe = kpe.view(batch_size, page_num * page_size, kpe_dim)
     ckv = ckv[:, :kv_len, :]
     kpe = kpe[:, :kv_len, :]
-    k = (torch.cat([ckv, kpe], dim = -1).view(-1, 1, ckv_dim + kpe_dim).repeat_interleave(num_heads, dim = 1))
-    v = ckv.repeat_interleave(num_heads, dim = 1)
+    k = (
+        torch.cat([ckv, kpe], dim=-1)
+        .view(-1, 1, ckv_dim + kpe_dim)
+        .repeat_interleave(num_heads, dim=1)
+    )
+    v = ckv.repeat_interleave(num_heads, dim=1)
 
     return k, v
+
 
 @pytest.mark.parametrize("batch_size", [1, 17, 37])
 @pytest.mark.parametrize("kv_len", [17, 33, 96, 97, 114, 514, 1024])
@@ -190,8 +196,8 @@ def test_batch_mla_page_attention(
     )
     q_pe = torch.randn(
         batch_size * qo_len, num_heads, head_dim_kpe, dtype=torch.half, device="cuda"
-    )   
-    pages_num = math.ceil(kv_len // page_size)
+    )
+    pages_num = math.ceil(kv_len / page_size)
     ckv = torch.randn(
         batch_size * pages_num,
         page_size,
