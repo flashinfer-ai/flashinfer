@@ -856,11 +856,10 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
             CTA_TILE_KV) -
         1 - (kv_start / CTA_TILE_KV);
 
-    // int mask_tile_idx =
-    //     (CAUSAL ? min(kv_end, kv_len - q_len + packed_qo_start / num_heads) : kv_end) /
-    //         CTA_TILE_KV -
-    //     (kv_start / CTA_TILE_KV);
-    int mask_tile_idx = 0;
+    int mask_tile_idx =
+        (CAUSAL ? min(kv_end, kv_len - q_len + packed_qo_start / num_heads) : kv_end) /
+            CTA_TILE_KV -
+        (kv_start / CTA_TILE_KV);
 
     uint32_t block_iter_base = kv_indptr * block_size + kv_start;
     // last kv tile

@@ -972,13 +972,13 @@ inline cudaError_t PrefillSM90Plan(
   return cudaSuccess;
 }
 
-inline int packed_causal_kv_len(int qo_len, int kv_len, int qo_tile_idx, int cluster_tile_q,
+inline int packed_causal_kv_end(int qo_len, int kv_len, int qo_tile_idx, int cluster_tile_q,
                                 int num_qo_tiles, int group_size) {
   if (qo_tile_idx + 1 == num_qo_tiles) {
     return kv_len;
   }
-  int kv_len_init = kv_len - (qo_len / group_size);
-  return kv_len_init + ((qo_tile_idx + 1) * cluster_tile_q) / group_size;
+  int kv_len_init = kv_len - qo_len;
+  return kv_len_init + (qo_tile_idx + 1) * cluster_tile_q / group_size;
 }
 
 struct MLAPlanInfo {
@@ -1092,7 +1092,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
     int packed_qo_len = qo_len * num_heads;
     int num_qo_tiles = ceil_div(packed_qo_len, cluster_tile_q);
     for (int qo_tile_idx = num_qo_tiles - 1; qo_tile_idx >= 0; --qo_tile_idx) {
-      int effective_kv_len = causal ? packed_causal_kv_len(qo_len, kv_len, qo_tile_idx,
+      int effective_kv_len = causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx,
                                                            cluster_tile_q, num_qo_tiles, num_heads)
                                     : kv_len;
       total_kv_lens += effective_kv_len;
@@ -1121,7 +1121,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
     int packed_qo_len = qo_len * num_heads;
     int num_qo_tiles = ceil_div(packed_qo_len, cluster_tile_q);
     for (int qo_tile_idx = num_qo_tiles - 1; qo_tile_idx >= 0; --qo_tile_idx) {
-      int remaining_len = causal ? packed_causal_kv_len(qo_len, kv_len, qo_tile_idx, cluster_tile_q,
+      int remaining_len = causal ? packed_causal_kv_end(qo_len, kv_len, qo_tile_idx, cluster_tile_q,
                                                         num_qo_tiles, num_heads)
                                  : kv_len;
       int kv_start = 0;
