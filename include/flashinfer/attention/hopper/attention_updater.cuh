@@ -145,9 +145,6 @@ struct DefaultUpdater {
   constexpr static float fill_value = 0.f;
   CUTLASS_DEVICE DefaultUpdater() {};
 
-  template <typename MainloopParams, typename BlockCoord>
-  CUTLASS_DEVICE DefaultUpdater(const MainloopParams& params, const BlockCoord& block_coord) {};
-
   __forceinline__ __device__ TensorT get_lse() { return TensorT(); }
 
   template <bool init, typename Tensor0>
@@ -174,22 +171,6 @@ struct OnlineSoftmax {
   float sm_scale_log2;
 
   CUTLASS_DEVICE OnlineSoftmax(float sm_scale_log2) : sm_scale_log2(sm_scale_log2) {
-    clear(scores_scale);
-  };
-
-  template <typename MainloopParams, typename BlockCoord>
-  CUTLASS_DEVICE OnlineSoftmax(const MainloopParams& params, const BlockCoord& block_coord) {
-    // Used for block-wise quantization
-    // fused sm_scale w/ dequantization
-    if constexpr (WITH_SCALE) {
-      auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len] =
-          block_coord;
-      auto scale_qk = params.additional_params.scale_q[qo_head_idx] *
-                      params.additional_params.scale_k[kv_head_idx];
-      sm_scale_log2 = scale_qk * params.additional_params.sm_scale * math::log2e;
-    } else {
-      sm_scale_log2 = 0.f;
-    }
     clear(scores_scale);
   };
 

@@ -60,9 +60,6 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   static constexpr int CTA_KV = Ktraits::CTA_KV;
 
   static constexpr bool use_tma_load_kv = CollectiveMainloop::USE_TMA_LOAD_KV;
-
-  using AttentionUpdater =
-      typename AttentionVariant::template Updater<2 * (2 * CTA_Q / NUM_MMA_THREADS)>;
   // Pipeline for loading K/V
   using MainloopPipeline = typename CollectiveMainloop::MainloopPipeline;
   using PipelineParams = typename MainloopPipeline::Params;
@@ -209,8 +206,9 @@ __global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp
       auto [q_tile_idx, qo_head_idx, kv_head_idx, qo_indptr, kv_indptr, qo_len, kv_len] =
           block_coord;
 
-      AttentionUpdater attention_updater(mainloop_params, block_coord);
       AttentionVariant variant(mainloop_params, block_coord);
+      auto attention_updater =
+          variant.template GetAttentionUpdater<2 * (2 * CTA_Q / NUM_MMA_THREADS)>();
 
       if (q_tile_idx * CTA_Q >= qo_len) {
         continue;
@@ -261,19 +259,19 @@ cudaError_t SingleFP8PrefillWithKVCacheKernelTraitsDispatched(Params& params, cu
   using Scheduler = SingleTileScheduler;
   typename CollectiveMainloop::Params mainloop_params = CollectiveMainloop::to_underlying_arguments(
       {params.q_ptr,
-       get_gmem_layout(params.qo_len, params.num_qo_heads, params.head_dim, params.q_stride_n,
+       get_gmem_layout(params.qo_len, params.num_qo_heads, KernelTraits::HEAD_DIM, params.q_stride_n,
                        params.q_stride_h),  // layout_Q
        params.k_ptr,
-       get_gmem_layout(params.kv_len, params.num_kv_heads, params.head_dim, params.k_stride_n,
+       get_gmem_layout(params.kv_len, params.num_kv_heads, KernelTraits::HEAD_DIM, params.k_stride_n,
                        params.k_stride_h),  // layout_K
        params.v_ptr,
-       get_gmem_layout(params.kv_len, params.num_kv_heads, params.head_dim, params.v_stride_n,
+       get_gmem_layout(params.kv_len, params.num_kv_heads, KernelTraits::HEAD_DIM, params.v_stride_n,
                        params.v_stride_h),  // layout_V
        params.window_left, params.additional_params});
   typename CollectiveEpilogue::Params epilogue_params =
       CollectiveEpilogue::to_underlying_arguments({
           static_cast<DTypeO*>(params.o_ptr),
-          get_gmem_layout(params.qo_len, params.num_qo_heads, params.head_dim, params.o_stride_n,
+          get_gmem_layout(params.qo_len, params.num_qo_heads, KernelTraits::HEAD_DIM, params.o_stride_n,
                           params.o_stride_h),  // layout_O
           static_cast<float*>(params.lse_ptr),
           get_lse_gmem_layout(params.qo_len, params.num_qo_heads),  // layout_LSE

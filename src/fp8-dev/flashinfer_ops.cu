@@ -51,7 +51,6 @@ void run_fwd_flashinfer(thrust::device_vector<DTypeQ>& q_d, thrust::device_vecto
   }
   params.qo_len = qo_len;
   params.kv_len = kv_len;
-  params.head_dim = head_dim;
   params.num_qo_heads = num_qo_heads;
   params.num_kv_heads = num_kv_heads;
   params.causal = (mask_mode == MaskMode::kCausal);
@@ -124,7 +123,6 @@ void run_fwd_flashinfer(thrust::device_vector<DTypeQ>& q_d, thrust::device_vecto
   }
   params.qo_len = qo_len;
   params.kv_len = kv_len;
-  params.head_dim = head_dim;
   params.num_qo_heads = num_qo_heads;
   params.num_kv_heads = num_kv_heads;
   params.causal = (mask_mode == MaskMode::kCausal);
@@ -136,7 +134,7 @@ void run_fwd_flashinfer(thrust::device_vector<DTypeQ>& q_d, thrust::device_vecto
   cudaStream_t stream = 0;
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
     DISPATCH_MASK_MODE(mask_mode, MASK_MODE, {
-      status = SinglePrefillWithKVCacheDispatched<HEAD_DIM, MASK_MODE, USE_SLIDING_WINDOW,
+      status = SinglePrefillWithKVCacheDispatched<HEAD_DIM, HEAD_DIM, MASK_MODE, USE_SLIDING_WINDOW,
                                                   AttentionVariant, Params>(params, stream);
     });
   });

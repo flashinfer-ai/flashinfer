@@ -39,7 +39,7 @@ template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLINDING_WINDOW,
           typename AttentionVariant, typename Params>
 cudaError_t SingleFP8PrefillWithKVCacheDispatched(Params& params, cudaStream_t stream);
 
-template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLINDING_WINDOW,
+template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
           typename AttentionVariant, typename Params>
 cudaError_t SinglePrefillWithKVCacheDispatched(Params& params, cudaStream_t stream);
 }  // namespace flashinfer
@@ -103,7 +103,6 @@ void single_fp8_prefill_with_kv_cache_sm90(nvbench::state& state) {
   }
   params.qo_len = qo_len;
   params.kv_len = kv_len;
-  params.head_dim = head_dim;
   params.num_qo_heads = num_qo_heads;
   params.num_kv_heads = num_kv_heads;
   params.causal = mask_mode == MaskMode::kCausal;
@@ -204,7 +203,6 @@ void single_fp16_prefill_with_kv_cache_sm90(nvbench::state& state) {
   }
   params.qo_len = qo_len;
   params.kv_len = kv_len;
-  params.head_dim = head_dim;
   params.num_qo_heads = num_qo_heads;
   params.num_kv_heads = num_kv_heads;
   params.causal = mask_mode == MaskMode::kCausal;
@@ -222,9 +220,9 @@ void single_fp16_prefill_with_kv_cache_sm90(nvbench::state& state) {
     cudaError_t status;
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
       DISPATCH_MASK_MODE(mask_mode, MASK_MODE, {
-        status = SinglePrefillWithKVCacheDispatched<HEAD_DIM, MASK_MODE, USE_SLIDING_WINDOW,
-                                                    AttentionVariant, Params>(params,
-                                                                              launch.get_stream());
+        status = SinglePrefillWithKVCacheDispatched<HEAD_DIM, HEAD_DIM, MASK_MODE,
+                                                    USE_SLIDING_WINDOW, AttentionVariant, Params>(
+            params, launch.get_stream());
       });
     });
 

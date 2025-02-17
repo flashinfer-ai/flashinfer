@@ -62,10 +62,7 @@ struct LogitsSoftCap {
 };
 
 struct StandardFP8Attention {
-  float p_scale, scale_pv;
-
-  template <int NUM_ROWS_PER_THREAD>
-  using Updater = OnlineSoftmaxWithScale<NUM_ROWS_PER_THREAD>;
+  float p_scale, scale_pv, sm_scale_with_qk_log2;
 
   template <typename MainloopParams, typename BlockCoord>
   __device__ StandardFP8Attention(const MainloopParams& params, const BlockCoord& block_coord) {
@@ -73,15 +70,14 @@ struct StandardFP8Attention {
     // 448 for e4m3; 57344 for e5m2
     p_scale = std::numeric_limits<typename MainloopParams::DTypeKV>::max();
     scale_pv = params.additional_params.scale_v[kv_head_idx] / p_scale;
+    sm_scale_with_qk_log2 = params.additional_params.scale_q[qo_head_idx] *
+                            params.additional_params.scale_k[kv_head_idx] *
+                            params.additional_params.sm_scale * math::log2e;
   }
 
-  template <typename MainloopParams, typename T>
-  __device__ __forceinline__ T LogitsTransform(const MainloopParams& params, T logits,
-                                               uint32_t batch_idx, uint32_t qo_idx, uint32_t kv_idx,
-                                               uint32_t qo_head_idx, uint32_t kv_head_idx) {
-    // we fuse sm_scale and qk scale into one FMA in attention updater
-    // instead of this separate calculation, which cause ~100 TFlops degrade
-    return logits;
+  template <int NUM_ROWS_PER_THREAD>
+  __device__ auto GetAttentionUpdater() {
+    return OnlineSoftmax<NUM_ROWS_PER_THREAD, /*WITH_SCALE=*/true>(sm_scale_with_qk_log2);
   }
 
   template <typename Tensor0>
@@ -97,6 +93,9 @@ struct StandardFP8Attention {
                                               uint32_t qo_head_idx, uint32_t kv_head_idx) {
     // we fuse the PV dequantization into online_softmax.finalize
   }
+
+  REGISTER_LOGITS_TRANSFORM(params, logits, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx,
+                            { return logits; })
 };
 
 template <bool use_logits_soft_cap>
