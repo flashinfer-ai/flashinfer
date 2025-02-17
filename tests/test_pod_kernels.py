@@ -79,31 +79,21 @@ def test_pod_with_paged_kv_cache(
     contiguous_kv,
 ):
     return_lse = False
+    # Prefill inputs
     kv_layout_p = "NHD"
     q_p = torch.randn(qo_len_p, num_qo_heads, head_dim).to(0).half()
-    q_indptr_p = torch.arange(0, 1).to(0).int() * qo_len_p
-
     k_p = torch.randn(kv_len_p, num_kv_heads, head_dim).to(0).half()
     v_p = torch.randn(kv_len_p, num_kv_heads, head_dim).to(0).half()
-    kv_indptr_p = torch.arange(0, 1).to(0).int() * kv_len_p
-
-    prefill_workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
-
-    prefill_wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
-        prefill_workspace_buffer, kv_layout_p
-    )
-    prefill_wrapper.plan(
-        q_indptr_p,
-        kv_indptr_p,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim,
-        causal=causal,
-        pos_encoding_mode=pos_encoding_mode,
-        logits_soft_cap=logits_soft_cap,
-    )
-    o_ref_p = prefill_wrapper.run(q_p, k_p, v_p)
-    
+    # Generate prefill reference output
+    o_ref_p = flashinfer.prefill.single_prefill_with_kv_cache(
+            q_p,
+            k_p,
+            v_p,
+            causal=causal,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=logits_soft_cap,
+        )
+    # Decode inputs
     q_d = torch.randn(batch_size_d, num_qo_heads, head_dim).to(0).to(q_dtype)
     num_pages_per_seq = (kv_len_d + page_size_d - 1) // page_size_d
     total_num_pages = num_pages_per_seq * batch_size_d
@@ -173,28 +163,25 @@ def test_pod_with_paged_kv_cache(
         q_data_type=q_dtype,
     )
 
-    o_i_p, o_i_d = pod_wrapper.run(
-        q_p[q_indptr_p[i] : q_indptr_p[i + 1]],
-        k_p[kv_indptr_p[i] : kv_indptr_p[i + 1]],
-        v_p[kv_indptr_p[i] : kv_indptr_p[i + 1]], 
+    o_p, o_d = pod_wrapper.run(
+        q_p, k_p, v_p, 
         q_d, kv_data,
         pos_encoding_mode_p=pos_encoding_mode,
         logits_soft_cap_p=logits_soft_cap,
         causal_p=causal)
     # Prefill is run with batch size 1
-    o_ref_i_p = o_ref_p[q_indptr_p[i] : q_indptr_p[i + 1]]
-    torch.testing.assert_close(o_i_p, o_ref_i_p, rtol=1e-3, atol=1e-3, msg="Prefill mismatch")
+    torch.testing.assert_close(o_p, o_ref_p, rtol=1e-3, atol=1e-3, msg="Prefill mismatch")
     # Decode uses all batches at once.
-    torch.testing.assert_close(o_i_d, o_ref_d, rtol=1e-3, atol=1e-3, msg="Decode mismatch")
+    torch.testing.assert_close(o_d, o_ref_d, rtol=1e-3, atol=1e-3, msg="Decode mismatch")
 
 if __name__ == "__main__":
     test_pod_with_paged_kv_cache(
         # Prefill params
-        12288, 1024, True, 
+        128, 128, True, 
         # Decode params
         80, 12288, 16, "NHD", True,
         # Other shared params
-        4, 16, 128, "NONE", 0.0, torch.float16, torch.float16, True,
+        8, 8, 128, "NONE", 0.0, torch.float16, torch.float16, True,
     )
     test_pod_with_paged_kv_cache(
         # Prefill params

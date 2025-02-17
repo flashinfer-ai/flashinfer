@@ -39,7 +39,7 @@ template <typename KTraits_P, typename KTraits_D, bool PartitionKV_P,
           typename PrefillParams, typename DecodeParams>
 __global__
 __launch_bounds__(std::max(KTraits_P::NUM_THREADS, KTraits_D::NUM_THREADS))
-void PODWithKVCacheTensorKernel(const uint_fastdiv group_size,
+void PODWithKVCacheTensorKernel(const uint32_t xsize,
     const __grid_constant__ PrefillParams prefill_params,
     const __grid_constant__ DecodeParams decode_params, int *tbAssign) {
   extern __shared__ uint8_t smem[];
@@ -47,7 +47,6 @@ void PODWithKVCacheTensorKernel(const uint_fastdiv group_size,
   const uint32_t num_kv_heads_p = prefill_params.num_kv_heads;
   const uint32_t num_chunks = prefill_params.partition_kv;
   const uint32_t qo_len = prefill_params.qo_len;
-  const uint32_t xsize = ceil_div(qo_len * group_size, KTraits_P::CTA_TILE_Q);
 
   // DECODE VARS
   const uint32_t padded_bsize = decode_params.padded_batch_size;
@@ -135,19 +134,21 @@ void PODWithKVCacheTensorKernel(const uint_fastdiv group_size,
     if(linear_bid >= prefill_blocks) return;
 
     const uint32_t bx = linear_bid % xsize;
+    auto& smem_storage = reinterpret_cast<typename KTraits_P::SharedStorage&>(smem);
     // Not partition_kv
     if constexpr(!PartitionKV_P) {
       const uint32_t chunk_idx = 0;
       const uint32_t kv_head_idx = linear_bid / xsize;
-      //SinglePrefillWithKVCacheDevice<KTraits_P>(prefill_params, smem, tid, bx, chunk_idx, 
-      //                                          kv_head_idx, 1, num_kv_heads_p);
+      SinglePrefillWithKVCacheDevice<KTraits_P>(prefill_params, smem_storage, tid, bx, chunk_idx, 
+                                                kv_head_idx, 1, num_kv_heads_p);
     } else {
       const uint32_t chunk_idx = (linear_bid / xsize) % num_chunks;
       const uint32_t kv_head_idx = linear_bid / (xsize * num_chunks);
-      //SinglePrefillWithKVCacheDevice<KTraits_P>(prefill_params, smem, tid, bx, chunk_idx, 
-      //                                          kv_head_idx, num_chunks, num_kv_heads_p);
+      SinglePrefillWithKVCacheDevice<KTraits_P>(prefill_params, smem_storage, tid, bx, chunk_idx, 
+                                                kv_head_idx, num_chunks, num_kv_heads_p);
     }
   } else /* OP == DECODE */ {
+    auto& smem_storage = reinterpret_cast<typename KTraits_D::SharedStorage&>(smem);
     //dim3 nblks_d(padded_batch_size_d, 1, num_kv_heads);
     if(linear_bid >= decode_blocks)
       return;
@@ -164,7 +165,8 @@ void PODWithKVCacheTensorKernel(const uint_fastdiv group_size,
     const dim3 tid = dim3(linear_tid % 32, (linear_tid / 32) % KTraits_D::NUM_WARPS_Q, 
                           (linear_tid / 32) / KTraits_D::NUM_WARPS_Q);
 
-    //BatchPrefillWithPagedKVCacheDevice<KTraits_D> (decode_params, smem); 
+    BatchPrefillWithPagedKVCacheDevice<KTraits_D>(decode_params, smem_storage,
+      tid, bx, kv_head_idx, num_kv_heads_d); 
   }
 }
 
@@ -265,9 +267,7 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
       (max_smem_per_threadblock / (16 * HEAD_DIM_QK * sizeof(DTypeQ_D)) - NUM_MMA_Q_D * NUM_WARPS_Q_D) /
       (2 * NUM_WARPS_KV_D);
 
-  //DISPATCH_CTA_TILE_Q(cta_tile_q_p, CTA_TILE_Q_P, {
-    // TODO_AK: Delete the below and uncomment above
-    constexpr uint32_t CTA_TILE_Q_P = 128;
+  DISPATCH_CTA_TILE_Q(cta_tile_q_p, CTA_TILE_Q_P, {
     constexpr uint32_t NUM_WARPS_Q_P = get_num_warps_q(CTA_TILE_Q_P);
     constexpr uint32_t NUM_WARPS_KV_P = get_num_warps_kv(CTA_TILE_Q_P);
     constexpr uint32_t NUM_MMA_Q_P = get_num_mma_q(CTA_TILE_Q_P);
@@ -292,9 +292,7 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
         (2 * NUM_WARPS_KV_P);
 
     // control NUM_MMA_KV for maximum warp occupancy
-    //DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem_p, max_num_mma_kv_reg_p), NUM_MMA_KV_P, {
-      // TODO_AK: Delete the below and uncomment above
-      constexpr size_t NUM_MMA_KV_P = 2;
+    DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem_p, max_num_mma_kv_reg_p), NUM_MMA_KV_P, {
       using KTraits_P =
           KernelTraits<MASK_MODE_P, CTA_TILE_Q_P, NUM_MMA_Q_P, NUM_MMA_KV_P, NUM_MMA_D_QK, NUM_MMA_D_VO,
                        NUM_WARPS_Q_P, NUM_WARPS_KV_P, POS_ENCODING_MODE, DTypeQ_P, DTypeKV_P, DTypeO_P,
@@ -312,9 +310,7 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
         FLASHINFER_ERROR(err_msg.str());
       } else {
         // Decode stuff
-        //DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem_d, max_num_mma_kv_reg_d), NUM_MMA_KV_D, {
-          // TODO_AK: Delete the below and uncomment above
-          constexpr size_t NUM_MMA_KV_D = 2;
+        DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem_d, max_num_mma_kv_reg_d), NUM_MMA_KV_D, {
           using KTraits_D =
               KernelTraits<MASK_MODE_D, CTA_TILE_Q_D, NUM_MMA_Q_D, NUM_MMA_KV_D, NUM_MMA_D_QK, NUM_MMA_D_VO,
                            NUM_WARPS_Q_D, NUM_WARPS_KV_D, POS_ENCODING_MODE, DTypeQ_D, DTypeKV_D, DTypeO_D,
@@ -384,9 +380,8 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
               decode_params.o = tmp_v;
               decode_params.lse = tmp_s;
             }
-
-            int nblks_p(ceil_div(qo_len * group_size, KTraits_P::CTA_TILE_Q) * 
-              (prefill_params.partition_kv ? prefill_params.partition_kv : 1) * num_kv_heads);
+            uint32_t xsize = ceil_div(qo_len * group_size, KTraits_P::CTA_TILE_Q);
+            int nblks_p(xsize * (prefill_params.partition_kv ? prefill_params.partition_kv : 1) * num_kv_heads);
             int nthrs_p(32 * NUM_WARPS_Q_P * NUM_WARPS_KV_P);
 
             int nblks_d(padded_batch_size_d * 1 * num_kv_heads);
@@ -408,7 +403,7 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
             cudaMemset(tbAssign, 0, sizeof(int) * (num_sm + 2));
 
             // Setup kernel arguments
-            void* args[] = {(void*)&group_size_fastdiv, (void*)&prefill_params, (void*)&decode_params, (void*)&tbAssign};
+            void* args[] = {(void*)&xsize, (void*)&prefill_params, (void*)&decode_params, (void*)&tbAssign};
             FLASHINFER_CUDA_CALL(
               cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
             // Launch kernel
@@ -440,10 +435,10 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
               }
             }
           }
-        //});
+        });
       }
-    //});
-  //});
+    });
+  });
   return cudaSuccess;
 }
 

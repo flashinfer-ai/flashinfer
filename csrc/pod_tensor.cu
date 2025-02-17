@@ -25,6 +25,7 @@
 #include <flashinfer/utils.cuh>
 #include <flashinfer/page.cuh>
 
+#include "pytorch_conversion_utils.h"
 #include "pytorch_extension_utils.h"
 #include "aot_default_additional_params.h"
 #include "aot_extension_utils.h"
@@ -55,7 +56,7 @@ void pod_with_kv_cache_tensor(
                   double logits_soft_cap_p, double sm_scale_p, double rope_rcp_scale_p, double rope_rcp_theta_p,
                   // Decode params
                   at::Tensor float_workspace_buffer_d, at::Tensor int_workspace_buffer_d,
-                  std::vector<int64_t> plan_info_vec, at::Tensor q_d, at::Tensor paged_k_cache_d,
+                  at::Tensor plan_info_vec, at::Tensor q_d, at::Tensor paged_k_cache_d,
                   at::Tensor paged_v_cache_d, at::Tensor qo_indptr_d, at::Tensor paged_kv_indptr_d,
                   at::Tensor paged_kv_indices_d, at::Tensor paged_kv_last_page_len_d, at::Tensor o_d,
                   std::optional<at::Tensor> maybe_lse_d, int64_t mask_mode_code_d, int64_t layout_d,
@@ -100,7 +101,7 @@ void pod_with_kv_cache_tensor(
 
   // Decode setup (Tensor decode = batched prefill)
   PrefillPlanInfo plan_info;
-  plan_info.FromVector(plan_info_vec);
+  plan_info.FromVector(tensor_to_vec(plan_info_vec));
   QKVLayout kv_layout_d = static_cast<QKVLayout>(layout_d);
   auto device = q_d.device();
   int64_t batch_size = paged_kv_indptr_d.size(0) - 1;
@@ -172,6 +173,7 @@ void pod_with_kv_cache_tensor(
                 params.lse = maybe_lse_p ? static_cast<float*>(maybe_lse_p->data_ptr()) : nullptr;
                 params.num_qo_heads = num_qo_heads;
                 params.num_kv_heads = num_kv_heads;
+                params.group_size = uint_fastdiv(num_qo_heads / num_kv_heads);
                 params.qo_len = qo_len_p;
                 params.kv_len = kv_len_p;
                 params.q_stride_n = q_stride_n_p;
@@ -213,6 +215,7 @@ void pod_with_kv_cache_tensor(
 
                 params.lse = maybe_lse_d ? static_cast<float*>(maybe_lse_d->data_ptr()) : nullptr;
                 params.num_qo_heads = num_qo_heads;
+                params.group_size = uint_fastdiv(num_qo_heads / paged_kv.num_heads);
                 params.q_stride_n = q_stride_n_d;
                 params.q_stride_h = q_stride_h_d;
                 params.window_left = window_left_d;

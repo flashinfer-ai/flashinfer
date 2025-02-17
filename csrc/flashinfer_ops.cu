@@ -135,7 +135,7 @@ void pod_with_kv_cache_tensor(
     double logits_soft_cap_p, double sm_scale_p, double rope_rcp_scale_p, double rope_rcp_theta_p,
     // Decode params
     at::Tensor float_workspace_buffer_d, at::Tensor int_workspace_buffer_d,
-    std::vector<int64_t> plan_info_vec, at::Tensor q_d, at::Tensor paged_k_cache_d,
+    at::Tensor plan_info_vec, at::Tensor q_d, at::Tensor paged_k_cache_d,
     at::Tensor paged_v_cache_d, at::Tensor qo_indptr_d, at::Tensor paged_kv_indptr_d,
     at::Tensor paged_kv_indices_d, at::Tensor paged_kv_last_page_len_d, at::Tensor o_d,
     std::optional<at::Tensor> maybe_lse_d, int64_t mask_mode_code_d, int64_t layout_d,
