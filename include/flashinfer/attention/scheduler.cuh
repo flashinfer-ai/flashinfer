@@ -777,7 +777,7 @@ std::vector<T> flatten(const std::vector<std::vector<T>>& vec, int size_after_fl
   for (const auto& inner_vec : vec) {
     result.insert(result.end(), inner_vec.begin(), inner_vec.end());
   }
-  return std::move(result);
+  return result;
 }
 
 struct PrefillPlanSM90Info {
@@ -1050,7 +1050,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
   } else {
     cluster_size = 1;  // one cta in a cluster
   }
-  int num_clusters = num_sm / cluster_size;
+  uint32_t num_clusters = num_sm / cluster_size;
   plan_info.num_blks_x = cluster_size;
   plan_info.num_blks_y = num_clusters;
   const int cta_tile_q = 64;
