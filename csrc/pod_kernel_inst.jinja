@@ -1,0 +1,16 @@
+#include <flashinfer/attention/decode.cuh>
+#include "single_decode_config.inc"
+
+using namespace flashinfer;
+
+namespace flashinfer {
+
+template cudaError_t PODWithKVCacheTensorDispatched<
+    {{ head_dim_qk }}, {{ head_dim_vo }}, {{ pos_encoding_mode }},
+    {{ use_fp16_qk_reduction }}, {{ mask_mode_p }}, 16, 
+    {{ mask_mode_d }}, {{ variant_name_p }}, 
+    {{ variant_name_d }}, PrefillParams, DecodeParams>(
+            PrefillParams prefill_params, {{ dtype_o }}* tmp
+            DecodeParams decode_params, {{ dtype_o }}* tmp_v,
+            float *tmp_s, cudaStream_t stream);
+};

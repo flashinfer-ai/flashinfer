@@ -314,7 +314,6 @@ def get_single_prefill_uri(
 
 
 def get_pod_uri(
-    backend: str,
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
@@ -332,7 +331,7 @@ def get_pod_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+        f"f16qk_{use_fp16_qk_reduction}"
     )
 
 def get_batch_prefill_uri(
@@ -472,7 +471,6 @@ def gen_single_prefill_module(
 
 
 def gen_pod_module(
-    backend: str,
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
@@ -483,7 +481,6 @@ def gen_pod_module(
     use_fp16_qk_reduction: bool,
 ):
     uri = get_pod_uri(
-        backend,
         dtype_q,
         dtype_kv,
         dtype_o,
@@ -493,28 +490,19 @@ def gen_pod_module(
         use_logits_soft_cap,
         use_fp16_qk_reduction,
     )
-    if backend == "fa2":
-        additional_tensor_names = ["maybe_custom_mask", "maybe_alibi_slopes"]
-        additional_tensor_dtypes = ["uint8_t", "float"]
-        additional_scalar_names = [
-            "logits_soft_cap",
-            "sm_scale",
-            "rope_rcp_scale",
-            "rope_rcp_theta",
-        ]
-        additional_scalar_dtypes = ["float", "float", "float", "float"]
-        variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
-        variant_decl = f"#include<flashinfer/attention/variants.cuh>"
-    else:
-        additional_tensor_names = []
-        additional_tensor_dtypes = []
-        additional_scalar_names = ["logits_soft_cap", "sm_scale"]
-        additional_scalar_dtypes = ["float", "float"]
-        variant_name = f"DefaultAttention<{str(use_logits_soft_cap).lower()}>"
-        variant_decl = f"#include<flashinfer/attention/hopper/variants.cuh>"
-
+    additional_tensor_names = ["maybe_custom_mask", "maybe_alibi_slopes"]
+    additional_tensor_dtypes = ["uint8_t", "float"]
+    additional_scalar_names = [
+        "logits_soft_cap",
+        "sm_scale",
+        "rope_rcp_scale",
+        "rope_rcp_theta",
+    ]
+    additional_scalar_dtypes = ["float", "float", "float", "float"]
+    variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
+    variant_decl = f"#include<flashinfer/attention/variants.cuh>"
+    
     return gen_customize_pod_module(
-        backend,
         uri,
         dtype_q,
         dtype_kv,
@@ -531,6 +519,89 @@ def gen_pod_module(
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
     )
+
+def gen_customize_pod_module(
+    uri: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    head_dim: int,
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+    variant_name: str,
+    variant_decl: str,
+    pos_encoding_mode: int = 0,
+    use_sliding_window: bool = False,
+    use_logits_soft_cap: bool = False,
+    use_fp16_qk_reduction: bool = False,
+):
+    gen_directory = FLASHINFER_GEN_SRC_DIR / uri
+
+    (
+        additional_params_decl,
+        additional_func_params,
+        additional_params_setter,
+    ) = generate_additional_params(
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+    )
+
+    #with open(FLASHINFER_CSRC_DIR / "pod_customize_config.jinja") as f:
+    #    config_templ = jinja2.Template(f.read())
+
+    with open(FLASHINFER_CSRC_DIR / "pod_kernel_inst.jinja") as f:
+        kernel_inst_templ = jinja2.Template(f.read())
+
+    kwargs = {
+        "additional_func_params": additional_func_params,
+        "additional_params_decl": additional_params_decl,
+        "additional_params_setter": additional_params_setter,
+        "variant_decl": variant_decl,
+        "variant_name": variant_name,
+        "dtype_q": dtype_map[dtype_q],
+        "dtype_kv": dtype_map[dtype_kv],
+        "dtype_o": dtype_map[dtype_o],
+        "head_dim_qk": head_dim,
+        "head_dim_vo": head_dim,
+        "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
+        "use_sliding_window": str(use_sliding_window).lower(),
+        "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
+        "use_fp16_qk_reduction": str(use_fp16_qk_reduction).lower(),
+    }
+
+    #generated_inc_str = config_templ.render(
+    #    **kwargs,
+    #)
+
+    os.makedirs(gen_directory, exist_ok=True)
+
+    source_paths = []
+
+    dest_path = gen_directory / "pod_kernel.cu"
+    source_paths.append(dest_path)
+    source = kernel_inst_templ.render(
+        **kwargs,
+    )
+    write_if_different(dest_path, source)
+
+    for filename in [
+        "pod_tensor.cu",
+    ]:
+        src_path = FLASHINFER_CSRC_DIR / filename
+        dest_path = gen_directory / filename
+        source_paths.append(dest_path)
+        with open(src_path, "r") as f:
+            source = f.read()
+        write_if_different(dest_path, source)
+
+    #generated_config_path = gen_directory / "pod_config.inc"
+    #write_if_different(generated_config_path, generated_inc_str)
+
+    return load_cuda_ops(uri, source_paths)
 
 def gen_batch_decode_module(
     dtype_q: torch.dtype,

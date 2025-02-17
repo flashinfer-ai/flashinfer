@@ -257,7 +257,7 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
   const int num_ctas_per_sm = max_smem_per_sm > (16 * HEAD_DIM_QK * sizeof(DTypeQ_D) * 16) ? 2 : 1;
   const int max_smem_per_threadblock = max_smem_per_sm / num_ctas_per_sm;
 
-  const uint32_t max_num_mma_kv_reg_d =
+  constexpr uint32_t max_num_mma_kv_reg_d =
       (HEAD_DIM_VO >= 128 && NUM_MMA_Q_D == 2 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
        !USE_FP16_QK_REDUCTION)
           ? 2
@@ -267,7 +267,8 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
       (max_smem_per_threadblock / (16 * HEAD_DIM_QK * sizeof(DTypeQ_D)) - NUM_MMA_Q_D * NUM_WARPS_Q_D) /
       (2 * NUM_WARPS_KV_D);
 
-  DISPATCH_CTA_TILE_Q(cta_tile_q_p, CTA_TILE_Q_P, {
+  //DISPATCH_CTA_TILE_Q(cta_tile_q_p, CTA_TILE_Q_P, {
+    constexpr size_t CTA_TILE_Q_P = 128;
     constexpr uint32_t NUM_WARPS_Q_P = get_num_warps_q(CTA_TILE_Q_P);
     constexpr uint32_t NUM_WARPS_KV_P = get_num_warps_kv(CTA_TILE_Q_P);
     constexpr uint32_t NUM_MMA_Q_P = get_num_mma_q(CTA_TILE_Q_P);
@@ -281,7 +282,7 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
     const int num_ctas_per_sm_p = max_smem_per_sm > (16 * HEAD_DIM_QK * sizeof(DTypeQ_P) * 16) ? 2 : 1;
     const int max_smem_per_threadblock_p = max_smem_per_sm / num_ctas_per_sm_p;
 
-    const uint32_t max_num_mma_kv_reg_p =
+    constexpr uint32_t max_num_mma_kv_reg_p =
         (HEAD_DIM_VO >= 128 && NUM_MMA_Q_P == 2 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
          !USE_FP16_QK_REDUCTION)
             ? 2
@@ -310,7 +311,9 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
         FLASHINFER_ERROR(err_msg.str());
       } else {
         // Decode stuff
-        DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem_d, max_num_mma_kv_reg_d), NUM_MMA_KV_D, {
+        //DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem_d, max_num_mma_kv_reg_d), NUM_MMA_KV_D, {
+          // TODO: Is there a better way to avoid this nested dispatch?
+          constexpr uint32_t NUM_MMA_KV_D = NUM_MMA_KV_P;
           using KTraits_D =
               KernelTraits<MASK_MODE_D, CTA_TILE_Q_D, NUM_MMA_Q_D, NUM_MMA_KV_D, NUM_MMA_D_QK, NUM_MMA_D_VO,
                            NUM_WARPS_Q_D, NUM_WARPS_KV_D, POS_ENCODING_MODE, DTypeQ_D, DTypeKV_D, DTypeO_D,
@@ -435,10 +438,10 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
               }
             }
           }
-        });
+        //});
       }
     });
-  });
+  //});
   return cudaSuccess;
 }
 

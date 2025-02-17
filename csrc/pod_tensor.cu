@@ -274,7 +274,8 @@ void pod_with_kv_cache_tensor(
               using DecodeAttentionVariant =
                 DefaultAttention</*use_custom_mask=*/use_custom_mask_d, USE_SLIDING_WINDOW_D,
                                 USE_LOGITS_SOFT_CAP, /*use_alibi_bias=*/false>;
-              DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
+              //DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
+                constexpr size_t CTA_TILE_Q = 16;
                 cudaError_t status = flashinfer::PODWithKVCacheTensorDispatched<
                   HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
                   USE_FP16_QK_REDUCTION, MASK_MODE_P, CTA_TILE_Q, MASK_MODE_D,
@@ -285,7 +286,7 @@ void pod_with_kv_cache_tensor(
                         "PODWithKVCache kernel launch failed, error: " +
                             std::string(cudaGetErrorString(status)));
                 return true;
-              });
+              //});
             });
           });
         });
