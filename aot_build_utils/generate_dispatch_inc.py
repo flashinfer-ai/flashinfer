@@ -100,6 +100,9 @@ if __name__ == "__main__":
         "--path", type=str, required=True, help="Path to the dispatch inc file"
     )
     parser.add_argument(
+        "--head_dims_sm90", type=str, required=True, nargs="+", help="Head dimensions in format of 'head_dim_qk,head_dim_vo'",
+    )
+    parser.add_argument(
         "--head_dims", type=int, required=True, nargs="+", help="Head dimensions"
     )
     parser.add_argument(
@@ -124,6 +127,7 @@ if __name__ == "__main__":
         help="Mask modes",
     )
     args = parser.parse_args()
+    args.head_dims_sm90 = [tuple(map(int, x.split(","))) for x in args.head_dims_sm90]
     print(args)
     with open(Path(args.path), "w") as f:
         f.write(get_dispatch_inc_str(args))
