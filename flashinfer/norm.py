@@ -61,7 +61,7 @@ def rmsnorm(
     eps: float
         Epsilon for numerical stability.
     out: Optional[torch.Tensor]
-        The the output tensor, if specified, the kernel will update this tensor inplace.
+        The output tensor, if specified, the kernel will update this tensor inplace.
 
     Returns
     -------
@@ -144,7 +144,7 @@ def gemma_rmsnorm(
     eps: float
         Epsilon for numerical stability.
     out: Optional[torch.Tensor]
-        The the output tensor, if specified, the kernel will update this tensor inplace.
+        The output tensor, if specified, the kernel will update this tensor inplace.
 
     Returns
     -------
