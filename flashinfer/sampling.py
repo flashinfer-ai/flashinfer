@@ -703,7 +703,7 @@ def min_p_sampling_from_probs(
 
 
 def top_k_top_p_sampling_from_logits(
-    probs: torch.Tensor,
+    logits: torch.Tensor,
     uniform_samples: torch.Tensor,
     top_k: Union[torch.Tensor, int],
     top_p: Union[torch.Tensor, float],
@@ -798,13 +798,13 @@ def top_k_top_p_sampling_from_logits(
     top_p_sampling_from_probs
     """
     if filter_apply_order == "top_k_first":
-        masked_logits = top_k_mask_logits(probs, top_k)
+        masked_logits = top_k_mask_logits(logits, top_k)
         probs = torch.softmax(masked_logits, dim=-1)
         return top_p_sampling_from_probs(
             probs, uniform_samples, top_p, deterministic, check_nan=check_nan
         )
     elif filter_apply_order == "joint":
-        probs = torch.softmax(probs, dim=-1)
+        probs = torch.softmax(logits, dim=-1)
         if check_nan:
             if torch.any(torch.isnan(probs)):
                 raise ValueError("Input probs contains NaN.")
