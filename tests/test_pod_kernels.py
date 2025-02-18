@@ -38,7 +38,6 @@ def warmup_jit():
                     [128, 256],  # head_dims
                     [0, 1, 2],  # pos_encoding_modes
                     [False],  # use_sliding_windows
-                    [False, True],  # use_logits_soft_caps
                     [False],  # use_fp16_qk_reductions
                 )
             )
@@ -73,7 +72,6 @@ def test_pod_with_paged_kv_cache(
     num_qo_heads,
     head_dim,
     pos_encoding_mode,
-    logits_soft_cap,
     q_dtype,
     kv_dtype,
     contiguous_kv,
@@ -91,7 +89,6 @@ def test_pod_with_paged_kv_cache(
             v_p,
             causal=causal,
             pos_encoding_mode=pos_encoding_mode,
-            logits_soft_cap=logits_soft_cap,
         )
     # Decode inputs
     q_d = torch.randn(batch_size_d, num_qo_heads, head_dim).to(0).to(q_dtype)
@@ -138,7 +135,6 @@ def test_pod_with_paged_kv_cache(
         num_kv_heads,
         head_dim,
         page_size_d,
-        logits_soft_cap=logits_soft_cap,
         pos_encoding_mode=pos_encoding_mode,
         data_type=kv_dtype,
         q_data_type=q_dtype,
@@ -157,7 +153,6 @@ def test_pod_with_paged_kv_cache(
         num_kv_heads,
         head_dim,
         page_size_d,
-        logits_soft_cap=logits_soft_cap,
         pos_encoding_mode=pos_encoding_mode,
         data_type=kv_dtype,
         q_data_type=q_dtype,
@@ -167,7 +162,6 @@ def test_pod_with_paged_kv_cache(
         q_p, k_p, v_p, 
         q_d, kv_data,
         pos_encoding_mode_p=pos_encoding_mode,
-        logits_soft_cap_p=logits_soft_cap,
         causal_p=causal)
     # Prefill is run with batch size 1
     torch.testing.assert_close(o_p, o_ref_p, rtol=1e-3, atol=1e-3, msg="Prefill mismatch")
@@ -181,7 +175,7 @@ if __name__ == "__main__":
         # Decode params
         80, 12288, 16, "NHD", True,
         # Other shared params
-        8, 8, 128, "NONE", 0.0, torch.float16, torch.float16, True,
+        8, 8, 128, "NONE", torch.float16, torch.float16, True,
     )
     test_pod_with_paged_kv_cache(
         # Prefill params
@@ -189,7 +183,7 @@ if __name__ == "__main__":
         # Decode params
         220, 12288, 16, "NHD", True,
         # Other shared params
-        4, 16, 128, "NONE", 0.0, torch.float16, torch.float16, True,
+        4, 16, 128, "NONE", torch.float16, torch.float16, True,
     )
     test_pod_with_paged_kv_cache(
         # Prefill params
@@ -197,6 +191,6 @@ if __name__ == "__main__":
         # Decode params
         250, 12288, 16, "NHD", True,
         # Other shared params
-        4, 16, 128, "NONE", 0.0, torch.float16, torch.float16, True,
+        4, 16, 128, "NONE", torch.float16, torch.float16, True,
     )
     print("POD test(s) passed!")

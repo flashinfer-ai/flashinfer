@@ -61,8 +61,7 @@ def get_pod_module(*args):
     if args not in _pod_modules:
         uri = get_pod_uri(*args)
         
-        #if has_prebuilt_ops and uri in prebuilt_ops_uri:
-        if 1:
+        if has_prebuilt_ops and uri in prebuilt_ops_uri:
             _kernels = torch.ops.flashinfer_kernels
             # torch library for pod_with_kv_cache
             # No tensor deprecated due to poor performance. Just use tensor cores for both.
@@ -299,7 +298,6 @@ class PODWithPagedKVCacheWrapper:
         page_size: int,
         pos_encoding_mode: str = "NONE",
         window_left: int = -1,
-        logits_soft_cap: Optional[float] = None,
         q_data_type: Optional[Union[str, torch.dtype]] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
         data_type: Optional[Union[str, torch.dtype]] = None,
@@ -308,7 +306,7 @@ class PODWithPagedKVCacheWrapper:
         rope_theta: Optional[float] = None,
         non_blocking: bool = False,
     ) -> None:
-        r"""Plan batch decode for given problem specification.
+        r"""Plan POD's batch decode for given problem specification.
 
         Parameters
         ----------
@@ -334,12 +332,6 @@ class PODWithPagedKVCacheWrapper:
         window_left : int
             The left (inclusive) window size for the attention window, when set to ``-1``, the window
             size will be set to the full length of the sequence. Defaults to ``-1``.
-        logits_soft_cap : Optional[float]
-            The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
-            provided, will be set to ``0``. If greater than 0, the logits will be capped according to
-            formula:
-            :math:`\texttt{logits_soft_cap} \times \mathrm{tanh}(x / \texttt{logits_soft_cap})`,
-            where :math:`x` is the input logits.
         q_data_type : Optional[Union[str, torch.dtype]]
             The data type of the query tensor, defaults torch.float16.
         kv_data_type : Optional[Union[str, torch.dtype]]
@@ -365,6 +357,8 @@ class PODWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        # Logits soft cap is not supported currently
+        logits_soft_cap = False
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
@@ -489,7 +483,7 @@ class PODWithPagedKVCacheWrapper:
                     torch.empty(0, dtype=kv_data_type),
                     get_cuda_stream(device),
                 )
-
+        self._indptr_type = indptr.dtype
         self._pos_encoding_mode = pos_encoding_mode
         self._window_left = window_left
         self._logits_soft_cap = logits_soft_cap
@@ -513,10 +507,8 @@ class PODWithPagedKVCacheWrapper:
         causal_p: bool = False,
         kv_layout_p: str = "NHD",
         pos_encoding_mode_p: str = "NONE",
-        use_fp16_qk_reduction_p: bool = False,
         sm_scale_p: Optional[float] = None,
         window_left_p: int = -1,
-        logits_soft_cap_p: Optional[float] = None,
         rope_scale_p: Optional[float] = None,
         rope_theta_p: Optional[float] = None,
         return_lse_p: bool = False,
@@ -526,20 +518,22 @@ class PODWithPagedKVCacheWrapper:
         causal_d: bool = False,
         kv_layout_d: str = "NHD",
         pos_encoding_mode_d: str = "NONE",
-        use_fp16_qk_reduction_d: bool = False,
         sm_scale_d: Optional[float] = None,
         window_left_d: int = -1,
-        logits_soft_cap_d: Optional[float] = None,
         rope_scale_d: Optional[float] = None,
         rope_theta_d: Optional[float] = None,
         q_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         return_lse_d: bool = False,
+        use_fp16_qk_reduction: bool = False,
         *args,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        r"""Compute...
+        r"""Compute POD-attention for a batch of requests.
         """
+        # Currently unsupported
+        logits_soft_cap_p = None
+        logits_soft_cap_d = None
         # Prefill setup
         _check_pos_encoding_mode(pos_encoding_mode_p)
         _check_kv_layout(kv_layout_p)
@@ -609,6 +603,7 @@ class PODWithPagedKVCacheWrapper:
 
         with q_p.device as device:  # device guard
             module_getter = get_pod_module(
+                # Prefill params
                 q_p.dtype,
                 k_p.dtype,
                 q_p.dtype,
@@ -616,17 +611,17 @@ class PODWithPagedKVCacheWrapper:
                 PosEncodingMode[pos_encoding_mode_p].value,
                 window_left_p >= 0,  # use_sliding_window
                 logits_soft_cap_p > 0,  # use_logits_soft_cap
-                use_fp16_qk_reduction_p
-                # TODO_AK: Add the decode stuff to module getter as well
+                use_fp16_qk_reduction,
+                # Decode params
                 #q_d.dtype,
                 #self._cached_kv_data_type,
                 #self._cached_q_data_type,
-                #indptr.dtype,
+                self._indptr_type,
                 #head_dim,  # head_dim_qk
                 #head_dim,  # head_dim_vo
-                #PosEncodingMode[pos_encoding_mode_d].value,
-                #window_left_d != -1,  # use_sliding_window
-                #logits_soft_cap_d > 0,  # use_logits_soft_cap
+                PosEncodingMode[pos_encoding_mode_d].value,
+                window_left_d != -1,  # use_sliding_window
+                logits_soft_cap_d > 0,  # use_logits_soft_cap
                 )
             module_getter.run_tensor(
                 # Prefill params

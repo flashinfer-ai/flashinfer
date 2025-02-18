@@ -254,6 +254,7 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
                                               cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
   // we expect each sm execute two threadblocks
   // TODO(Zihao): fix the following computation
+  /*
   const int num_ctas_per_sm = max_smem_per_sm > (16 * HEAD_DIM_QK * sizeof(DTypeQ_D) * 16) ? 2 : 1;
   const int max_smem_per_threadblock = max_smem_per_sm / num_ctas_per_sm;
 
@@ -266,6 +267,7 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
   const uint32_t max_num_mma_kv_smem_d =
       (max_smem_per_threadblock / (16 * HEAD_DIM_QK * sizeof(DTypeQ_D)) - NUM_MMA_Q_D * NUM_WARPS_Q_D) /
       (2 * NUM_WARPS_KV_D);
+  */
 
   //DISPATCH_CTA_TILE_Q(cta_tile_q_p, CTA_TILE_Q_P, {
     constexpr size_t CTA_TILE_Q_P = 128;
