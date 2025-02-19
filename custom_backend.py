@@ -38,4 +38,5 @@ def build_editable(wheel_directory, config_settings=None, metadata_directory=Non
     ln("3rdparty/cutlass", "cutlass")
     ln("csrc", "csrc")
     ln("include", "include")
+    ln("tvm_binding", "tvm_binding")
     return orig.build_editable(wheel_directory, config_settings, metadata_directory)
