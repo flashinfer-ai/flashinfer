@@ -210,7 +210,6 @@ __device__ __forceinline__ void load_kv(
             warp_idx_in_wg * 4 + lane_idx / 8, 8 * mma_d + lane_idx % 8);
         ckv_smem.load_128b_async<SharedMemFillMode::kFillZero>(ckv_smem_offset_w, ckv_ptr,
                                                                q < kv_bound);
-        ckv_smem_offset_w = ckv_smem.template advance_offset_by_column<8>(ckv_smem_offset_w, mma_d);
         ckv_ptr += 8 * upcast_size<DTypeKV>();
       }
 
@@ -220,7 +219,6 @@ __device__ __forceinline__ void load_kv(
             warp_idx_in_wg * 4 + lane_idx / 8, 8 * mma_d + lane_idx % 8);
         kpe_smem.load_128b_async<SharedMemFillMode::kFillZero>(kpe_smem_offset_w, kpe_ptr,
                                                                q < kv_bound);
-        kpe_smem_offset_w = kpe_smem.template advance_offset_by_column<8>(kpe_smem_offset_w, mma_d);
         kpe_ptr += 8 * upcast_size<DTypeKV>();
       }
     }
@@ -245,7 +243,6 @@ __device__ __forceinline__ void load_kv(
             8 * mma_d + lane_idx % 8);
         ckv_smem.load_128b_async<SharedMemFillMode::kFillZero>(ckv_smem_offset_w, ckv_ptr,
                                                                q < kv_bound);
-        ckv_smem_offset_w = ckv_smem.template advance_offset_by_column<8>(ckv_smem_offset_w, mma_d);
         ckv_ptr += 8 * upcast_size<DTypeKV>();
       }
 
@@ -256,7 +253,6 @@ __device__ __forceinline__ void load_kv(
             8 * mma_d + lane_idx % 8);
         kpe_smem.load_128b_async<SharedMemFillMode::kFillZero>(kpe_smem_offset_w, kpe_ptr,
                                                                q < kv_bound);
-        kpe_smem_offset_w = kpe_smem.template advance_offset_by_column<8>(kpe_smem_offset_w, mma_d);
         kpe_ptr += 8 * upcast_size<DTypeKV>();
       }
     }
