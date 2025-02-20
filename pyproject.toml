@@ -44,6 +44,7 @@ packages = [
     "flashinfer.data.cutlass",
     "flashinfer.data.include",
     "flashinfer.jit",
+    "flashinfer.jit.attention",
     "flashinfer.triton",
     "flashinfer.triton.kernels",
 ]
