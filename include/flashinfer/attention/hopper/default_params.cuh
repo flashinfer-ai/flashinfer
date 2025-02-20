@@ -38,6 +38,9 @@ struct SinglePrefillParams {
   struct AdditionalParams {
     float logits_soft_cap;
     float sm_scale;
+    float* scale_q;
+    float* scale_k;
+    float* scale_v;
   } additional_params;
 
   int64_t q_stride_n;
