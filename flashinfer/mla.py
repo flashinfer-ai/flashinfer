@@ -20,7 +20,7 @@ from typing import List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
-from .jit import gen_batch_mla_module, get_batch_mla_uri
+from .jit import gen_batch_mla_module
 from .utils import (
     MaskMode,
     _check_shape_dtype_device,
@@ -30,13 +30,20 @@ from .utils import (
 )
 
 _batch_mla_modules = {}
+_batch_mla_sm90_modules = {}
 
 
-def get_batch_mla_module(*args):
-    global _batch_mla_modules
-    if args not in _batch_mla_modules:
-        _batch_mla_modules[args] = gen_batch_mla_module(*args)
-    return _batch_mla_modules[args]
+def get_batch_mla_module(backend):
+    def backend_module(*args):
+        global _batch_mla_modules, _batch_mla_sm90_modules
+        modules_dict = (
+            _batch_mla_modules if backend == "fa2" else _batch_mla_sm90_modules
+        )
+        if args not in modules_dict:
+            modules_dict[args] = gen_batch_mla_module(backend, *args)
+        return modules_dict[args]
+
+    return backend_module
 
 
 class BatchMLAPagedAttentionWrapper:
@@ -160,6 +167,7 @@ class BatchMLAPagedAttentionWrapper:
         self._kv_indptr_buf = kv_indptr
         self._kv_indices_buf = kv_indices
         self._kv_len_arr_buf = kv_len_arr
+        self._backend = backend
 
     def plan(
         self,
@@ -207,7 +215,7 @@ class BatchMLAPagedAttentionWrapper:
         kv_data_type : torch.dtype
             The data type of the kv-cache tensor.
         """
-        self._cached_module = get_batch_mla_module(
+        self._cached_module = get_batch_mla_module(self._backend)(
             q_data_type,
             kv_data_type,
             q_data_type,

@@ -24,27 +24,27 @@ namespace flashinfer {
 
 using namespace cute;
 
-template <typename AdditionalParams, typename Ktraits, bool CAUSAL>
+template <typename AdditionalParams, typename KTraits, bool CAUSAL>
 struct CollectiveMainloop {
-  using DTypeQ = typename Ktraits::DTypeQ;
-  using DTypeKV = typename Ktraits::DTypeKV;
-  using TileShape_QKD = typename Ktraits::TileShape_QKD;
-  using TileShape_PDV = typename Ktraits::TileShape_PDV;
+  using DTypeQ = typename KTraits::DTypeQ;
+  using DTypeKV = typename KTraits::DTypeKV;
+  using TileShape_QKD = typename KTraits::TileShape_QKD;
+  using TileShape_PDV = typename KTraits::TileShape_PDV;
   static constexpr int CTA_Q = get<0>(TileShape_QKD{});
   static constexpr int CTA_KV = get<1>(TileShape_QKD{});
 
-  static constexpr int NUM_STAGES = Ktraits::NUM_STAGES;
-  static constexpr int NUM_MMA_THREADS = Ktraits::NUM_MMA_THREADS;
-  static constexpr int HEAD_DIM_QK = Ktraits::HEAD_DIM_QK;
-  static constexpr int HEAD_DIM_VO = Ktraits::HEAD_DIM_VO;
+  static constexpr int NUM_STAGES = KTraits::NUM_STAGES;
+  static constexpr int NUM_MMA_THREADS = KTraits::NUM_MMA_THREADS;
+  static constexpr int HEAD_DIM_QK = KTraits::HEAD_DIM_QK;
+  static constexpr int HEAD_DIM_VO = KTraits::HEAD_DIM_VO;
 
   using GmemTiledCopyQ = cute::SM90_TMA_LOAD;
   using GmemTiledCopyKV = cute::SM90_TMA_LOAD;
 
-  using SmemLayoutQ = typename Ktraits::SmemLayoutQ;
-  using SmemLayoutK = typename Ktraits::SmemLayoutK;
-  using SmemLayoutV = typename Ktraits::SmemLayoutV;
-  using SmemLayoutVt = typename Ktraits::SmemLayoutVt;
+  using SmemLayoutQ = typename KTraits::SmemLayoutQ;
+  using SmemLayoutK = typename KTraits::SmemLayoutK;
+  using SmemLayoutV = typename KTraits::SmemLayoutV;
+  using SmemLayoutVt = typename KTraits::SmemLayoutVt;
 
   using ShapeT = cute::Shape<int32_t, int32_t, int32_t>;
   using StrideT = cute::Shape<int64_t, _1, int64_t>;  // (N, D, H)
@@ -73,7 +73,7 @@ struct CollectiveMainloop {
       take<0, 2>(SmemLayoutV{}), select<2, 1>(TileShape_PDV{}), _1{}));  // no mcast
 
   static constexpr bool USE_TMA_LOAD_KV = true;
-  using MainloopPipeline = typename Ktraits::MainloopPipeline;
+  using MainloopPipeline = typename KTraits::MainloopPipeline;
   using PipelineParams = typename MainloopPipeline::Params;
   using PipelineState = typename MainloopPipeline::PipelineState;
 
@@ -89,7 +89,7 @@ struct CollectiveMainloop {
   // and head dim
   static constexpr bool UseSchedulerBarrier =
       cutlass::sizeof_bits_v<DTypeQ> == 8 ? HEAD_DIM_VO >= 128 : HEAD_DIM_VO <= 128;
-  using WarpScheduler = WarpScheduler<Ktraits, UseSchedulerBarrier>;
+  using WarpScheduler = WarpScheduler<KTraits, UseSchedulerBarrier>;
 
   // Host side kernel arguments
   struct Arguments {
@@ -207,7 +207,7 @@ struct CollectiveMainloop {
     }
 
     // Wait for the MMA warpgroups to say that smem_q is ready
-    cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
+    cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + KTraits::NUM_PRODUCER_THREADS,
                                       static_cast<int>(NamedBarriers::kQueryEmpty));
 
     if (lane_predicate) {

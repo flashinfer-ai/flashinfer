@@ -44,12 +44,11 @@ struct SharedStorageQKVO {
   union {
     struct {
       alignas(16) DTypeQ q_smem_nope[CTA_TILE_Q * HEAD_DIM_CKV];
-      alignas(16) DTypeKV ckv_smem[NUM_STAGES][CTA_TILE_KV * HEAD_DIM_CKV];
       alignas(16) DTypeQ q_smem_pe[CTA_TILE_Q * HEAD_DIM_KPE];
-      union {
-        alignas(16) DTypeKV kpe[CTA_TILE_KV * HEAD_DIM_KPE];
-        alignas(16) DTypeKV p[CTA_TILE_Q * CTA_TILE_KV];
-      } aux_smem[NUM_STAGES];
+      alignas(16) DTypeKV ckv_smem[NUM_STAGES][CTA_TILE_KV * HEAD_DIM_CKV];
+      alignas(16) DTypeKV
+          kpe_p_smem[NUM_STAGES]
+                    [CTA_TILE_KV * (HEAD_DIM_KPE > CTA_TILE_Q ? HEAD_DIM_KPE : CTA_TILE_Q)];
       union {
         alignas(16) float m_wg[2][CTA_TILE_Q];  // cross warpgroup synchronization
         alignas(16) float d_wg[2][CTA_TILE_Q];  // cross warpgroup synchronization
@@ -191,7 +190,7 @@ __device__ __forceinline__ void load_kv(
   const uint32_t warp_idx_in_wg = threadIdx.y;
 
   smem_t<KTraits::SWIZZLE_MODE_CKV> ckv_smem(smem_storage->ckv_smem[stage_idx]);
-  smem_t<KTraits::SWIZZLE_MODE_KPE> kpe_smem(smem_storage->aux_smem[stage_idx].kpe);
+  smem_t<KTraits::SWIZZLE_MODE_KPE> kpe_smem(smem_storage->kpe_p_smem[stage_idx]);
 
   if constexpr (KTraits::NUM_MMA_KV == 1) {
     if (warpgroup_idx == 0) {
@@ -465,7 +464,7 @@ __device__ __forceinline__ void compute_mla_qk(typename KTraits::SharedStorage* 
   smem_t<KTraits::SWIZZLE_MODE_Q_NOPE> q_smem_nope(smem_storage->q_smem_nope);
   smem_t<KTraits::SWIZZLE_MODE_Q_PE> q_smem_pe(smem_storage->q_smem_pe);
   smem_t<KTraits::SWIZZLE_MODE_CKV> ckv_smem(smem_storage->ckv_smem[stage_idx]);
-  smem_t<KTraits::SWIZZLE_MODE_KPE> kpe_smem(smem_storage->aux_smem[stage_idx].kpe);
+  smem_t<KTraits::SWIZZLE_MODE_KPE> kpe_smem(smem_storage->kpe_p_smem[stage_idx]);
   const uint32_t lane_idx = threadIdx.x, warpgroup_idx = threadIdx.z, warp_idx_in_wg = threadIdx.y;
   compute_qk_</*init=*/true, KTraits, KTraits::NUM_MMA_D_KPE, KTraits::UPCAST_STRIDE_Q_PE,
               KTraits::UPCAST_STRIDE_KPE>(q_smem_pe, kpe_smem, s_frag);
@@ -496,7 +495,7 @@ __device__ __forceinline__ void compute_mla_pv(typename KTraits::SharedStorage* 
     }
 
     __syncthreads();
-    smem_t<KTraits::SWIZZLE_MODE_P> p_smem(smem_storage->aux_smem[stage_idx].p);
+    smem_t<KTraits::SWIZZLE_MODE_P> p_smem(smem_storage->kpe_p_smem[stage_idx]);
     constexpr uint32_t UPCAST_STRIDE_P = KTraits::UPCAST_STRIDE_P;
 #pragma unroll
     for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV / 2; ++mma_kv) {
@@ -1008,10 +1007,6 @@ cudaError_t BatchMLAPagedAttention(Params params, uint32_t num_blks_x, uint32_t 
     return cudaErrorNotSupported;
   }
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
-
-  using DTypeQ = typename Params::DTypeQ;
-  using DTypeKV = typename Params::DTypeKV;
-  using DTypeO = typename Params::DTypeO;
 
   dim3 nblks(num_blks_x, num_blks_y);
   dim3 nthrs(32, 4, 2);

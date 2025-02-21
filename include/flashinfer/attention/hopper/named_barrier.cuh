@@ -57,9 +57,9 @@ __device__ __forceinline__ int get_prev_consumer_warp_group_idx() {
   }
 }
 
-template <typename Ktraits, bool UseSchedulerBarrier>
+template <typename KTraits, bool UseSchedulerBarrier>
 struct WarpScheduler {
-  constexpr static int NUM_MMA_THREADS = Ktraits::NUM_MMA_THREADS;
+  constexpr static int NUM_MMA_THREADS = KTraits::NUM_MMA_THREADS;
   static CUTLASS_DEVICE void barrier_sync() {
     if constexpr (UseSchedulerBarrier) {
       cutlass::arch::NamedBarrier::sync(
@@ -86,7 +86,7 @@ struct WarpScheduler {
 
   static CUTLASS_DEVICE void mma_init() {
     // Tell producer (warp 0) that smem_q is ready
-    cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
+    cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + KTraits::NUM_PRODUCER_THREADS,
                                         /*id=*/static_cast<int>(NamedBarriers::kQueryEmpty));
     if constexpr (!UseSchedulerBarrier) {
       return;

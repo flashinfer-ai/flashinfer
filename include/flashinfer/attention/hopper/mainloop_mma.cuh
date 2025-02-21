@@ -14,7 +14,7 @@
 
 namespace flashinfer {
 
-template <typename Ktraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, typename WarpScheduler,
+template <typename KTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, typename WarpScheduler,
           typename AttentionVariant, typename Params, typename MainloopPipeline,
           typename PipelineState, typename SharedStorage, typename FrgTensorO,
           typename AttentionUpdater>
@@ -27,15 +27,15 @@ CUTLASS_DEVICE void mma_f16(const Params& mainloop_params, AttentionVariant& var
                             SharedStorage& shared_storage, const int32_t qo_len,
                             const int32_t kv_len, const int32_t qo_head_idx,
                             const int32_t kv_head_idx) {
-  using DTypeQ = typename Ktraits::DTypeQ;
-  using DTypeKV = typename Ktraits::DTypeKV;
-  using IdType = typename Ktraits::IdType;
-  using TileShape_QKD = typename Ktraits::TileShape_QKD;
-  static constexpr int NUM_MMA_THREADS = Ktraits::NUM_MMA_THREADS;
-  using SmemLayoutQ = typename Ktraits::SmemLayoutQ;
-  using SmemLayoutK = typename Ktraits::SmemLayoutK;
-  using SmemLayoutV = typename Ktraits::SmemLayoutV;
-  using SmemLayoutVt = typename Ktraits::SmemLayoutVt;
+  using DTypeQ = typename KTraits::DTypeQ;
+  using DTypeKV = typename KTraits::DTypeKV;
+  using IdType = typename KTraits::IdType;
+  using TileShape_QKD = typename KTraits::TileShape_QKD;
+  static constexpr int NUM_MMA_THREADS = KTraits::NUM_MMA_THREADS;
+  using SmemLayoutQ = typename KTraits::SmemLayoutQ;
+  using SmemLayoutK = typename KTraits::SmemLayoutK;
+  using SmemLayoutV = typename KTraits::SmemLayoutV;
+  using SmemLayoutVt = typename KTraits::SmemLayoutVt;
   static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
 
   static constexpr int CTA_Q = get<0>(TileShape_QKD{});
@@ -45,8 +45,8 @@ CUTLASS_DEVICE void mma_f16(const Params& mainloop_params, AttentionVariant& var
   Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), SmemLayoutK{});
   Tensor sVt = make_tensor(make_smem_ptr(shared_storage.smem_v.data()), SmemLayoutVt{});
 
-  typename Ktraits::TiledMmaQK tiled_mma_qk;
-  typename Ktraits::TiledMmaPV tiled_mma_pv;
+  typename KTraits::TiledMmaQK tiled_mma_qk;
+  typename KTraits::TiledMmaPV tiled_mma_pv;
   auto threadMmaQK = tiled_mma_qk.get_thread_slice(thread_idx);
   auto threadMmaPV = tiled_mma_pv.get_thread_slice(thread_idx);
 
@@ -78,7 +78,7 @@ CUTLASS_DEVICE void mma_f16(const Params& mainloop_params, AttentionVariant& var
 
   if (work_idx != 0) {
     int lane_predicate = cute::elect_one_sync();
-    if (cutlass::canonical_warp_idx_sync() == Ktraits::NUM_WARPS - 1 && lane_predicate) {
+    if (cutlass::canonical_warp_idx_sync() == KTraits::NUM_WARPS - 1 && lane_predicate) {
 #pragma unroll
       for (uint32_t cta_id = 0; cta_id < 1; ++cta_id) {
         shared_storage.barrier_O.arrive(cta_id, lane_predicate);
@@ -121,7 +121,7 @@ CUTLASS_DEVICE void mma_f16(const Params& mainloop_params, AttentionVariant& var
 
   attention_updater.update</*init=*/true>(tSrS);
   Tensor tOrP = make_tensor(convert_type<DTypeKV>(tSrS).data(),
-                            convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout()));
+                            convert_layout_acc_Aregs<typename KTraits::TiledMmaPV>(tSrS.layout()));
 
   constexpr int n_masking_steps = CAUSAL ? cute::ceil_div(CTA_Q, CTA_KV) : 0;
   // masking loops
@@ -165,7 +165,7 @@ CUTLASS_DEVICE void mma_f16(const Params& mainloop_params, AttentionVariant& var
     ++smem_pipe_read_k;
     ++smem_pipe_read_v;
     cute::copy(make_tensor(convert_type<DTypeKV>(tSrS).data(),
-                           convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout())),
+                           convert_layout_acc_Aregs<typename KTraits::TiledMmaPV>(tSrS.layout())),
                tOrP);
   }
 
@@ -199,7 +199,7 @@ CUTLASS_DEVICE void mma_f16(const Params& mainloop_params, AttentionVariant& var
     ++smem_pipe_read_k;
     ++smem_pipe_read_v;
     cute::copy(make_tensor(convert_type<DTypeKV>(tSrS).data(),
-                           convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout())),
+                           convert_layout_acc_Aregs<typename KTraits::TiledMmaPV>(tSrS.layout())),
                tOrP);
   }
 
@@ -236,13 +236,13 @@ CUTLASS_DEVICE void mma_f16(const Params& mainloop_params, AttentionVariant& var
       ++smem_pipe_read_k;
       ++smem_pipe_read_v;
       cute::copy(make_tensor(convert_type<DTypeKV>(tSrS).data(),
-                             convert_layout_acc_Aregs<typename Ktraits::TiledMmaPV>(tSrS.layout())),
+                             convert_layout_acc_Aregs<typename KTraits::TiledMmaPV>(tSrS.layout())),
                  tOrP);
     }
   }
 
   // Tell warp 0 that smem_q is ready
-  cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
+  cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + KTraits::NUM_PRODUCER_THREADS,
                                       /*id=*/static_cast<int>(NamedBarriers::kQueryEmpty));
   attention_updater.rescale_o(tOrO);
   consumer_wait(pipeline_v, smem_pipe_read_v);

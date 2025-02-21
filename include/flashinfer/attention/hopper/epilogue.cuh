@@ -63,15 +63,15 @@ __forceinline__ __device__ void write_O(ElemO* O, const TiledCopyO& tiled_copy_O
                                 qo_tile_idx, qo_head_idx, qo_indptr, qo_len);
 }
 
-template <typename Ktraits>
+template <typename KTraits>
 struct CollectiveEpilogue {
-  using DTypeO = typename Ktraits::DTypeO;
-  static constexpr int CTA_Q = Ktraits::CTA_Q;
-  static constexpr int CTA_KV = Ktraits::CTA_KV;
-  static constexpr int HEAD_DIM_VO = Ktraits::HEAD_DIM_VO;
+  using DTypeO = typename KTraits::DTypeO;
+  static constexpr int CTA_Q = KTraits::CTA_Q;
+  static constexpr int CTA_KV = KTraits::CTA_KV;
+  static constexpr int HEAD_DIM_VO = KTraits::HEAD_DIM_VO;
   using TileShape_PDV = Shape<Int<CTA_Q>, Int<HEAD_DIM_VO>, Int<CTA_KV>>;
 
-  static constexpr int NUM_WARPS = Ktraits::NUM_WARPS;
+  static constexpr int NUM_WARPS = KTraits::NUM_WARPS;
   static constexpr int NUM_THREADS = NUM_WARPS * cutlass::NumThreadsPerWarp;
 
   static constexpr int NUM_COPY_THREADS = cutlass::NumThreadsPerWarpGroup;
@@ -160,33 +160,33 @@ struct CollectiveEpilogue {
     auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(thread_idx);
 
     Tensor tOrO_out = convert_type<DTypeO>(tOrO);
-    Tensor taccOrO = smem_thr_copy_O.retile_S(tOrO_out);  // ((Atom,AtomNum), MMA_M, MMA_N)
-    Tensor taccOsO = smem_thr_copy_O.partition_D(sO);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
+    Tensor tOrO_retile = smem_thr_copy_O.retile_S(tOrO_out);  // ((Atom,AtomNum), MMA_M, MMA_N)
+    Tensor tOsO = smem_thr_copy_O.partition_D(sO);            // ((Atom,AtomNum),PIPE_M,PIPE_N)
 
     // Make sure all WGs have finished reading V
     cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS,
                                       /*id=*/static_cast<int>(NamedBarriers::kValueEmpty));
-    cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
+    cute::copy(smem_tiled_copy_O, tOrO_retile, tOsO);
     cutlass::arch::fence_view_async_shared();  // ensure smem writes are visible to TMA
-    cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
+    cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + KTraits::NUM_PRODUCER_THREADS,
                                         cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
 
     Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.lse_ptr), epilogue_params.layout_LSE);
     Tensor gLSE = get_lse_local_tile_tensor(mLSE, Shape<Int<CTA_Q>>{}, qo_head_idx, qo_indptr,
                                             qo_len)(_, qo_tile_idx);
-    Tensor caccO = cute::make_identity_tensor(select<0, 1>(TileShape_PDV{}));
+    Tensor cO = cute::make_identity_tensor(select<0, 1>(TileShape_PDV{}));
     auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
-    Tensor taccOcO = thread_mma.partition_C(caccO);  // (MMA,MMA_M,MMA_K)
-    static_assert(decltype(size<0, 0>(taccOcO))::value == 2);
-    static_assert(decltype(size<0, 1>(taccOcO))::value == 2);
-    // taccOcO has shape ((2, 2, V), MMA_M, MMA_K), we only take only the row indices.
-    Tensor taccOcO_row = taccOcO(make_coord(_0{}, _, _0{}), _, _0{});
-    CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));  // MMA_M
-    if (epilogue_params.lse_ptr) {                         // don't write to LSE if it's nullptr
-      if (get<1>(taccOcO_row(_0{})) == 0) {
+    Tensor tOcO = thread_mma.partition_C(cO);  // (MMA,MMA_M,MMA_K)
+    static_assert(decltype(size<0, 0>(tOcO))::value == 2);
+    static_assert(decltype(size<0, 1>(tOcO))::value == 2);
+    // tOcO has shape ((2, 2, V), MMA_M, MMA_K), we only take only the row indices.
+    Tensor tOcO_row = tOcO(make_coord(_0{}, _, _0{}), _, _0{});
+    CUTE_STATIC_ASSERT_V(size(lse) == size(tOcO_row));  // MMA_M
+    if (epilogue_params.lse_ptr) {                      // don't write to LSE if it's nullptr
+      if (get<1>(tOcO_row(_0{})) == 0) {
 #pragma unroll
         for (int mi = 0; mi < size(lse); ++mi) {
-          const int row = get<0>(taccOcO_row(mi));
+          const int row = get<0>(tOcO_row(mi));
           if (row < qo_len - qo_tile_idx * CTA_Q) {
             gLSE(row) = lse(mi);
           }
@@ -196,7 +196,7 @@ struct CollectiveEpilogue {
 
     int write_warp_idx = NUM_WARPS - 1;
     if (cutlass::canonical_warp_idx_sync() == write_warp_idx) {
-      cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
+      cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + KTraits::NUM_PRODUCER_THREADS,
                                         cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
     }
     TiledCopyO gmem_tiled_copy_O;
