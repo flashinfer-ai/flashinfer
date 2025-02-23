@@ -239,15 +239,16 @@ __device__ __forceinline__ uint64_t matrix_descriptor_encode(uint64_t x) {
   return (((x) & 0x3FFFF) >> 0x4);
 }
 
-template <SwizzleMode swizzle_mode, int stride, typename T>
+template <SwizzleMode swizzle_mode, uint64_t leading_byte_offset, uint64_t stride_byte_offset,
+          typename T>
 __device__ uint64_t make_smem_desc(T* ptr) {
   uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
   uint64_t desc = 0x0000000000000000;
   desc |= matrix_descriptor_encode(addr);
   // leading byte offset
-  desc |= matrix_descriptor_encode((uint64_t)16) << 16;
+  desc |= matrix_descriptor_encode(leading_byte_offset) << 16;
   // stride byte offset
-  desc |= matrix_descriptor_encode((uint64_t)(8 * stride)) << 32;
+  desc |= matrix_descriptor_encode(stride_byte_offset) << 32;
   desc |= ((swizzle_mode == SwizzleMode::k128B)  ? 1llu
            : (swizzle_mode == SwizzleMode::k64B) ? 2llu
                                                  : 3llu)

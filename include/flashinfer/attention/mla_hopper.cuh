@@ -216,12 +216,15 @@ template <typename KTraits>
 __device__ __forceinline__ void compute_mla_qk(typename KTraits::SharedStorage* smem_storage,
                                                const uint32_t stage_idx, float* s_frag) {
   const uint32_t warp_group_idx = cutlass::canonical_warp_group_idx();
-  auto desc_q_pe = make_smem_desc<KTraits::SWIZZLE_MODE_Q_PE, KTraits::HEAD_DIM_KPE * 2,
-                                  typename KTraits::DTypeQ>(smem_storage->q_smem.pe);
-  auto desc_k_pe = make_smem_desc<KTraits::SWIZZLE_MODE_KPE, KTraits::HEAD_DIM_KPE * 2,
-                                  typename KTraits::DTypeKV>(
-      smem_storage->kv_o_smem[stage_idx].kpe +
-      (warp_group_idx - 1) * (KTraits::CTA_TILE_KV / 2) * KTraits::HEAD_DIM_KPE);
+  auto desc_q_pe =
+      make_smem_desc<KTraits::SWIZZLE_MODE_Q_PE, /*leading_byte_offset=*/16,
+                     /*stride_byte_offset=*/KTraits::HEAD_DIM_KPE * 16, typename KTraits::DTypeQ>(
+          smem_storage->q_smem.pe);
+  auto desc_k_pe =
+      make_smem_desc<KTraits::SWIZZLE_MODE_KPE, /*leading_byte_offset=*/16,
+                     /*stride_byte_offset=*/KTraits::HEAD_DIM_KPE * 16, typename KTraits::DTypeKV>(
+          smem_storage->kv_o_smem[stage_idx].kpe +
+          (warp_group_idx - 1) * (KTraits::CTA_TILE_KV / 2) * KTraits::HEAD_DIM_KPE);
   using wgmma = WGMMA_ASYNC_SS<typename KTraits::DTypeKV, float, 64, KTraits::CTA_TILE_KV / 2, 16,
                                Major::K, Major::K, ScaleIn::One, ScaleIn::One>;
 
@@ -242,12 +245,15 @@ __device__ __forceinline__ void compute_mla_qk(typename KTraits::SharedStorage* 
       desc_k_pe += 2;
     }
   }
-  auto desc_q_nope = make_smem_desc<KTraits::SWIZZLE_MODE_Q_NOPE, KTraits::HEAD_DIM_CKV * 2,
-                                    typename KTraits::DTypeQ>(smem_storage->q_smem.nope);
-  auto desc_ckv = make_smem_desc<KTraits::SWIZZLE_MODE_CKV, KTraits::HEAD_DIM_CKV * 2,
-                                 typename KTraits::DTypeKV>(
-      smem_storage->kv_o_smem[stage_idx].ckv +
-      (warp_group_idx - 1) * (KTraits::CTA_TILE_KV / 2) * KTraits::HEAD_DIM_CKV);
+  auto desc_q_nope =
+      make_smem_desc<KTraits::SWIZZLE_MODE_Q_NOPE, /*leading_byte_offset=*/16,
+                     /*stride_byte_offset=*/KTraits::HEAD_DIM_CKV * 16, typename KTraits::DTypeQ>(
+          smem_storage->q_smem.nope);
+  auto desc_ckv =
+      make_smem_desc<KTraits::SWIZZLE_MODE_CKV, /*leading_byte_offset=*/16,
+                     /*stride_byte_offset=*/KTraits::HEAD_DIM_CKV * 16, typename KTraits::DTypeKV>(
+          smem_storage->kv_o_smem[stage_idx].ckv +
+          (warp_group_idx - 1) * (KTraits::CTA_TILE_KV / 2) * KTraits::HEAD_DIM_CKV);
 
 #pragma unroll
   for (uint32_t mma_d_ckv = 0; mma_d_ckv < KTraits::NUM_MMA_D_CKV; ++mma_d_ckv) {
@@ -265,33 +271,20 @@ __device__ __forceinline__ void compute_mla_qk(typename KTraits::SharedStorage* 
   warpgroup_fence_frag<KTraits::NUM_REGS_S_FRAG>(s_frag);
 }
 
-template <typename T>
-__device__ uint64_t make_ckv_smem_desc(T* ptr) {
-  uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
-  uint64_t desc = 0x0000000000000000;
-  desc |= matrix_descriptor_encode(addr);
-  // leading byte offset
-  desc |= matrix_descriptor_encode((uint64_t)8 * 8 * 16) << 16;
-  // stride byte offset
-  desc |= matrix_descriptor_encode((uint64_t)8 * 512 * 2) << 32;
-  desc |= 1llu << 62;
-  return desc;
-}
-
 template <typename KTraits>
 __device__ __forceinline__ void compute_mla_pv(typename KTraits::SharedStorage* smem_storage,
                                                const uint32_t stage_idx, float* o_frag) {
   const uint32_t lane_idx = cutlass::canonical_lane_idx();
   const uint32_t warp_idx_in_wg = cutlass::canonical_warp_idx() % 4;
   const uint32_t warp_group_idx = cutlass::canonical_warp_group_idx();
-  auto desc_p = make_smem_desc<KTraits::SWIZZLE_MODE_P, KTraits::CTA_TILE_KV * 2, KTraits::DTypeKV>(
+  auto desc_p = make_smem_desc<KTraits::SWIZZLE_MODE_P, /*leading_byte_offset=*/16,
+                               /*stride_byte_offset=*/KTraits::CTA_TILE_KV * 16, KTraits::DTypeKV>(
       smem_storage->kv_o_smem[stage_idx].p);
-  //   // auto desc_ckv =
-  //   //     make_smem_desc<KTraits::SWIZZLE_MODE_CKV, KTraits::HEAD_DIM_CKV * 2,
-  //   KTraits::DTypeKV>(
-  //   //         smem_storage->kv_o_smem[stage_idx].ckv);
-  auto desc_ckv = make_ckv_smem_desc(smem_storage->kv_o_smem[stage_idx].ckv +
-                                     (warp_group_idx - 1) * 8 * (KTraits::HEAD_DIM_CKV / 2));
+  auto desc_ckv =
+      make_smem_desc<KTraits::SWIZZLE_MODE_CKV, /*leading_byte_offset=*/KTraits::CTA_TILE_KV * 32,
+                     /*stride_byte_offset=*/KTraits::HEAD_DIM_CKV * 16, KTraits::DTypeKV>(
+          smem_storage->kv_o_smem[stage_idx].ckv +
+          (warp_group_idx - 1) * 8 * (KTraits::HEAD_DIM_CKV / 2));
   warpgroup_fence_frag<KTraits::NUM_REGS_O_FRAG>(o_frag);
   warpgroup_arrive();
   using wgmma = WGMMA_ASYNC_SS<typename KTraits::DTypeKV, float, 64, KTraits::HEAD_DIM_CKV / 2, 16,
@@ -464,6 +457,7 @@ __device__ __forceinline__ void write_o(
   o_smem[1] = smem_storage->kv_o_smem[(stage_counter + 1) % KTraits::NUM_STAGES].o;
 
   if (partial_o != nullptr) {
+    // NOTE(Zihao): o_smem is not used if write to partial_o, and we can avoid the barrier
     barrier_arrive(KTraits::NUM_COPY_THREADS + KTraits::NUM_MMA_THREADS, NamedBarriers::kBarrierO);
     // write to partial_o
 #pragma unroll
