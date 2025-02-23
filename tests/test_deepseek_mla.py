@@ -397,7 +397,7 @@ def test_batch_mla_page_attention(
     o_buffer = torch.empty_like(o)
     lse_buffer = torch.empty_like(lse)
     wrapper.run(q_nope, q_pe, ckv, kpe, out=o_buffer, lse=lse_buffer)
-    torch.testing.assert_close(o, o_buffer, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(lse, lse_buffer, rtol=1e-3, atol=1e-3)
 
 
