@@ -153,7 +153,7 @@ struct DefaultUpdater {
   };
 
   template <typename Tensor1>
-  __forceinline__ __device__ void finalize(Tensor1& acc_s) {
+  __forceinline__ __device__ void finalize(Tensor1& acc_s, float pv_scale = 1.f) {
     // NOTE(Zihao): nothing to do here
   };
 
@@ -218,8 +218,9 @@ struct OnlineSoftmax {
   };
 
   template <typename Tensor0>
-  __forceinline__ __device__ void finalize(Tensor0& acc_s) {
+  __forceinline__ __device__ void finalize(Tensor0& acc_s, float pv_scale = 1.f) {
     // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
+    // Note (Yilong): use pv_scale to dequantize the output
     Tensor scores = make_tensor(acc_s.data(), convert_layout_acc_rowcol(acc_s.layout()));
     static_assert(decltype(size<0>(scores))::value == NUM_ROWS_PER_THREAD);
     SumOp<float> sum_op;
@@ -227,7 +228,7 @@ struct OnlineSoftmax {
 #pragma unroll
     for (int mi = 0; mi < size(row_max); ++mi) {
       float sum = row_sum(mi);
-      float inv_sum = 1.f / sum;
+      float inv_sum = pv_scale / sum;
       scores_scale(mi) = inv_sum;
       if constexpr (WITH_SCALE) {
         row_sum(mi) = row_max(mi) * sm_scale_log2 + math::ptx_log2(sum);
