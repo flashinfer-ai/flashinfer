@@ -1098,7 +1098,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
       total_kv_lens += effective_kv_len;
     }
   }
-  int kv_len_limit = ceil_div(ceil_div(total_kv_lens, num_clusters), 512L) * 512L;
+  int kv_len_limit = ceil_div(std::max(ceil_div(total_kv_lens, num_clusters), 1L), 512L) * 512L;
 
   // step 1. load-balancing scheduling algorithm
   MinHeap cluster_cost_heap(num_clusters);
