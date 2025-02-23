@@ -52,19 +52,10 @@ CUTLASS_HOST_DEVICE auto flatten_1(TensorT tensor) {
   return cute::group_modes<1, rank(tensor_flatten)>(tensor_flatten);
 }
 
-CUTLASS_HOST_DEVICE auto gmem_packed_gmem_layout(int nnz_num_heads, int head_dim,
-                                                 int64_t h_stride) {
-  return make_layout(make_shape(nnz_num_heads, head_dim), make_stride(h_stride, cute::_1{}));
-}
-
 CUTLASS_HOST_DEVICE auto get_gmem_layout(int nnz, int num_heads, int head_dim, int64_t n_stride,
                                          int64_t h_stride) {
   return make_layout(make_shape(nnz, head_dim, num_heads),
                      make_stride(n_stride, cute::_1{}, h_stride));
-}
-
-CUTLASS_HOST_DEVICE auto get_packed_lse_gmem_layout(int nnz_num_heads) {
-  return make_layout(make_shape(nnz_num_heads), make_stride(cute::_1{}));
 }
 
 CUTLASS_HOST_DEVICE auto get_lse_gmem_layout(int nnz, int num_heads) {
