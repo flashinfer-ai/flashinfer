@@ -185,7 +185,7 @@ def generate_kv_from_cache(ckv, kpe, kv_len, batch_size, num_heads):
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("page_size", [1])
 @pytest.mark.parametrize("backend", ["fa2"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.half])
 def test_batch_mla_varlen_page_attention(
     batch_size,
     kv_len_0,
@@ -313,7 +313,7 @@ def test_batch_mla_varlen_page_attention(
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("page_size", [1])
 @pytest.mark.parametrize("backend", ["fa2"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.half])
 def test_batch_mla_page_attention(
     batch_size,
     kv_len,
