@@ -787,7 +787,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
   [[maybe_unused]] constexpr uint32_t NUM_MMA_D_CKV = KTraits::NUM_MMA_D_CKV;
   [[maybe_unused]] constexpr uint32_t CTA_TILE_Q = KTraits::CTA_TILE_Q;
   [[maybe_unused]] constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
-  [[maybe_unused]] constexpr uint32_t NUM_STAGES = KTraits::NUM_STAGES;
+  [[maybe_unused]] constexpr int32_t NUM_STAGES = KTraits::NUM_STAGES;
   [[maybe_unused]] constexpr bool CAUSAL = KTraits::CAUSAL;
 
   DTypeQ* q_nope = params.q_nope;

@@ -89,7 +89,7 @@ struct HopperKernelTraits
 };
 
 template <typename KTraits>
-__device__ __forceinline__ void init_states_(float* o_frag, float* m, float* d) {
+__device__ __forceinline__ void init_states_(float* o_frag, float* m, float* d, float* o_scale) {
 #pragma unroll
   for (uint32_t reg_id = 0; reg_id < KTraits::NUM_REGS_O_FRAG; ++reg_id) {
     o_frag[reg_id] = 0.f;
@@ -99,6 +99,7 @@ __device__ __forceinline__ void init_states_(float* o_frag, float* m, float* d) 
   for (uint32_t j = 0; j < 2; ++j) {
     m[j] = -math::inf;
     d[j] = 1.f;
+    o_scale[j] = 1.f;
   }
 }
 
@@ -575,7 +576,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
   [[maybe_unused]] constexpr uint32_t HEAD_DIM_CKV = KTraits::HEAD_DIM_CKV;
   [[maybe_unused]] constexpr uint32_t CTA_TILE_Q = KTraits::CTA_TILE_Q;
   [[maybe_unused]] constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
-  [[maybe_unused]] constexpr uint32_t NUM_STAGES = KTraits::NUM_STAGES;
+  [[maybe_unused]] constexpr int32_t NUM_STAGES = KTraits::NUM_STAGES;
   [[maybe_unused]] constexpr uint32_t NUM_COPY_THREADS = KTraits::NUM_COPY_THREADS;
   [[maybe_unused]] constexpr uint32_t NUM_MMA_THREADS = KTraits::NUM_MMA_THREADS;
   [[maybe_unused]] constexpr bool CAUSAL = KTraits::CAUSAL;
@@ -660,6 +661,13 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
       kv_tile_idx -= 1;
       ++smem_pipe_write_kv;
 
+      if (!is_first_tile) {
+        barrier_sync(KTraits::NUM_COPY_THREADS + KTraits::NUM_MMA_THREADS,
+                     NamedBarriers::kBarrierO);
+      } else {
+        is_first_tile = false;
+      }
+
       pipeline_q.producer_acquire(smem_pipe_write_q);
       load_q<KTraits>(&smem_storage, q_nope + q_indptr * q_nope_stride_n,
                       q_pe + q_indptr * q_pe_stride_n, q_nope_stride_n, q_nope_stride_h,
@@ -707,7 +715,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
       const uint32_t qo_upperbound =
           min(q_len, ceil_div(qo_packed_idx_base + KTraits::CTA_TILE_Q, num_heads));
 
-      init_states_<KTraits>(o_frag, m, d);
+      init_states_<KTraits>(o_frag, m, d, o_scale);
 
       int kv_tile_idx =
           ceil_div(
