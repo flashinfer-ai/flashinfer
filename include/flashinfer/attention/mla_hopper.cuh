@@ -785,6 +785,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         rescale_o_<KTraits>(o_scale, o_frag);
         compute_mla_pv<KTraits>(&smem_storage, smem_pipe_read_kv_cur.index(), o_frag);
         warpgroup_wait<1>();
+        logits_mask_<KTraits>(qo_packed_idx_base, kv_start + (kv_tile_idx - 1) * CTA_TILE_KV, q_len,
+                              kv_len, kv_end, num_heads, s_frag);
         update_md_<KTraits>(&smem_storage, variant, s_frag, m, d, o_scale);
         convert_s_to_p<KTraits>(s_frag, p_frag);
         warpgroup_wait<0>();
