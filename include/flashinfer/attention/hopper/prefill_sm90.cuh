@@ -35,27 +35,27 @@ namespace flashinfer {
 
 using namespace cute;
 
-template <typename CollectiveMainloop, typename CollectiveEpilogue, typename KTraits,
+template <typename CollectiveMainloop, typename CollectiveEpilogue, typename Ktraits,
           bool LEFT_SLIDING_WINDOW, bool CAUSAL, typename TileScheduler>
-__global__ void __launch_bounds__(KTraits::NUM_WARPS* cutlass::NumThreadsPerWarp, 1)
+__global__ void __launch_bounds__(Ktraits::NUM_WARPS* cutlass::NumThreadsPerWarp, 1)
     PrefillWithKVCacheKernel(CUTE_GRID_CONSTANT
                              typename CollectiveMainloop::Params const mainloop_params,
                              CUTE_GRID_CONSTANT
                              typename CollectiveEpilogue::Params const epilogue_params,
                              CUTE_GRID_CONSTANT
                              typename TileScheduler::Params const scheduler_params) {
-  using DTypeQ = typename KTraits::DTypeQ;
-  using DTypeKV = typename KTraits::DTypeKV;
-  using DTypeO = typename KTraits::DTypeO;
-  using DTypeQKAccum = typename KTraits::DTypeQKAccum;
-  using TileShape_QKD = typename KTraits::TileShape_QKD;
-  using TileShape_PDV = typename KTraits::TileShape_PDV;
-  using AttentionVariant = typename KTraits::AttentionVariant;
+  using DTypeQ = typename Ktraits::DTypeQ;
+  using DTypeKV = typename Ktraits::DTypeKV;
+  using DTypeO = typename Ktraits::DTypeO;
+  using DTypeQKAccum = typename Ktraits::DTypeQKAccum;
+  using TileShape_QKD = typename Ktraits::TileShape_QKD;
+  using TileShape_PDV = typename Ktraits::TileShape_PDV;
+  using AttentionVariant = typename Ktraits::AttentionVariant;
 
-  static constexpr int NUM_MMA_THREADS = KTraits::NUM_MMA_THREADS;
+  static constexpr int NUM_MMA_THREADS = Ktraits::NUM_MMA_THREADS;
   static constexpr int NUM_COPY_THREADS = cutlass::NumThreadsPerWarpGroup;
-  static constexpr int CTA_Q = KTraits::CTA_Q;
-  static constexpr int CTA_KV = KTraits::CTA_KV;
+  static constexpr int CTA_Q = Ktraits::CTA_Q;
+  static constexpr int CTA_KV = Ktraits::CTA_KV;
 
   static constexpr bool use_tma_load_kv = CollectiveMainloop::USE_TMA_LOAD_KV;
 
@@ -64,7 +64,7 @@ __global__ void __launch_bounds__(KTraits::NUM_WARPS* cutlass::NumThreadsPerWarp
   using PipelineState = typename MainloopPipeline::PipelineState;
 
   extern __shared__ char shared_memory[];
-  auto& shared_storage = *reinterpret_cast<typename KTraits::SharedStorage*>(shared_memory);
+  auto& shared_storage = *reinterpret_cast<typename Ktraits::SharedStorage*>(shared_memory);
 
   int const lane_predicate = cute::elect_one_sync();
   int const warp_idx = cutlass::canonical_warp_idx_sync();
@@ -124,7 +124,7 @@ __global__ void __launch_bounds__(KTraits::NUM_WARPS* cutlass::NumThreadsPerWarp
 
   if (warp_group_idx == 0) {  // Producer
     if constexpr (use_tma_load_kv) {
-      cutlass::arch::warpgroup_reg_dealloc<KTraits::NUM_WARPS == 12 ? 24 : 32>();
+      cutlass::arch::warpgroup_reg_dealloc<Ktraits::NUM_WARPS == 12 ? 24 : 32>();
     } else {
       cutlass::arch::warpgroup_reg_dealloc<72>();
     }
@@ -164,14 +164,14 @@ __global__ void __launch_bounds__(KTraits::NUM_WARPS* cutlass::NumThreadsPerWarp
     }
   } else {  // Consumer
     if constexpr (use_tma_load_kv) {
-      cutlass::arch::warpgroup_reg_alloc<KTraits::NUM_WARPS == 12 ? 240 : 160>();
+      cutlass::arch::warpgroup_reg_alloc<Ktraits::NUM_WARPS == 12 ? 240 : 160>();
     } else {
-      cutlass::arch::warpgroup_reg_alloc<KTraits::NUM_WARPS == 12 ? 216 : 144>();
+      cutlass::arch::warpgroup_reg_alloc<Ktraits::NUM_WARPS == 12 ? 216 : 144>();
     }
 
     TileScheduler scheduler;
     // Initialize matmul objects.
-    typename KTraits::TiledMmaPV tiled_mma_pv;
+    typename Ktraits::TiledMmaPV tiled_mma_pv;
 
     PipelineState smem_pipe_read_k, smem_pipe_read_v;
     // We don't need separate variables smem_pipe_release_k and smem_pipe_release_v
@@ -217,7 +217,7 @@ __global__ void __launch_bounds__(KTraits::NUM_WARPS* cutlass::NumThreadsPerWarp
                                                                      q_tile_idx, qo_len, kv_len);
       }
 
-      mma_f16<KTraits, /*LEFT_SLIDING_WINDOW=*/LEFT_SLIDING_WINDOW, CAUSAL,
+      mma_f16<Ktraits, /*LEFT_SLIDING_WINDOW=*/LEFT_SLIDING_WINDOW, CAUSAL,
               CollectiveMainloop::WarpScheduler>(
           mainloop_params, variant, pipeline_k, pipeline_v, smem_pipe_read_k, smem_pipe_read_v,
           tOrO, attention_updater, num_kv_tiles, swa_begin_kv_tile_idx, swa_end_kv_tile_idx,

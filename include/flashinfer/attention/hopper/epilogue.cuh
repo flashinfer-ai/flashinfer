@@ -63,15 +63,15 @@ __forceinline__ __device__ void write_O(ElemO* O, const TiledCopyO& tiled_copy_O
                                 qo_tile_idx, qo_head_idx, qo_indptr, qo_len);
 }
 
-template <typename KTraits>
+template <typename Ktraits>
 struct CollectiveEpilogue {
-  using DTypeO = typename KTraits::DTypeO;
-  static constexpr int CTA_Q = KTraits::CTA_Q;
-  static constexpr int CTA_KV = KTraits::CTA_KV;
-  static constexpr int HEAD_DIM_VO = KTraits::HEAD_DIM_VO;
+  using DTypeO = typename Ktraits::DTypeO;
+  static constexpr int CTA_Q = Ktraits::CTA_Q;
+  static constexpr int CTA_KV = Ktraits::CTA_KV;
+  static constexpr int HEAD_DIM_VO = Ktraits::HEAD_DIM_VO;
   using TileShape_PDV = Shape<Int<CTA_Q>, Int<HEAD_DIM_VO>, Int<CTA_KV>>;
 
-  static constexpr int NUM_WARPS = KTraits::NUM_WARPS;
+  static constexpr int NUM_WARPS = Ktraits::NUM_WARPS;
   static constexpr int NUM_THREADS = NUM_WARPS * cutlass::NumThreadsPerWarp;
 
   static constexpr int NUM_COPY_THREADS = cutlass::NumThreadsPerWarpGroup;
@@ -168,7 +168,7 @@ struct CollectiveEpilogue {
                                       /*id=*/static_cast<int>(NamedBarriers::kValueEmpty));
     cute::copy(smem_tiled_copy_O, tOrO_retile, tOsO);
     cutlass::arch::fence_view_async_shared();  // ensure smem writes are visible to TMA
-    cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + KTraits::NUM_PRODUCER_THREADS,
+    cutlass::arch::NamedBarrier::arrive(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
                                         cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
 
     Tensor mLSE = make_tensor(make_gmem_ptr(epilogue_params.lse_ptr), epilogue_params.layout_LSE);
@@ -196,7 +196,7 @@ struct CollectiveEpilogue {
 
     int write_warp_idx = NUM_WARPS - 1;
     if (cutlass::canonical_warp_idx_sync() == write_warp_idx) {
-      cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + KTraits::NUM_PRODUCER_THREADS,
+      cutlass::arch::NamedBarrier::sync(NUM_MMA_THREADS + Ktraits::NUM_PRODUCER_THREADS,
                                         cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
     }
     TiledCopyO gmem_tiled_copy_O;
