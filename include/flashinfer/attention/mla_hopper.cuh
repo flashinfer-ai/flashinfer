@@ -32,7 +32,7 @@ namespace mla {
 
 namespace hopper {
 
-enum class NamedBarriers { kBarrierO = 2, kConsumerSync = 3 };
+enum class NamedBarriers { kBarrierQ = 1, kBarrierO = 2, kConsumerSync = 3 };
 
 __device__ __forceinline__ void barrier_arrive(int num_threads, NamedBarriers barrier) {
   cutlass::arch::NamedBarrier::arrive(num_threads, static_cast<int>(barrier));
@@ -663,9 +663,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
 
       if (!is_first_tile) {
         barrier_sync(KTraits::NUM_COPY_THREADS + KTraits::NUM_MMA_THREADS,
-                     NamedBarriers::kBarrierO);
-      } else {
-        is_first_tile = false;
+                     NamedBarriers::kBarrierQ);
       }
 
       pipeline_q.producer_acquire(smem_pipe_write_q);
@@ -675,6 +673,22 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
                       params.num_heads);
       pipeline_q.producer_commit(smem_pipe_write_q, cutlass::arch::cpasync_barrier_arrive);
       ++smem_pipe_write_q;
+
+      if (kv_tile_idx >= 1) {
+        pipeline_kv.producer_acquire(smem_pipe_write_kv);
+        load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
+                         kpe_stride_n, kpe_stride_page, kv_bound,
+                         block_iter_base + kv_tile_idx * CTA_TILE_KV, block_size,
+                         smem_pipe_write_kv.index());
+        pipeline_kv.producer_commit(smem_pipe_write_kv, cutlass::arch::cpasync_barrier_arrive);
+        ++smem_pipe_write_kv;
+        --kv_tile_idx;
+      }
+
+      if (!is_first_tile) {
+        barrier_sync(KTraits::NUM_COPY_THREADS + KTraits::NUM_MMA_THREADS,
+                     NamedBarriers::kBarrierO);
+      }
 
 #pragma unroll 1
       for (; kv_tile_idx >= 0; --kv_tile_idx) {
@@ -686,6 +700,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         pipeline_kv.producer_commit(smem_pipe_write_kv, cutlass::arch::cpasync_barrier_arrive);
         ++smem_pipe_write_kv;
       }
+
+      is_first_tile = false;
     }
   } else {
     // consumer
@@ -794,6 +810,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         write_p_rmem_smem<KTraits>(&smem_storage, smem_pipe_read_kv.index(), p_frag);
       }
 
+      barrier_arrive(KTraits::NUM_COPY_THREADS + KTraits::NUM_MMA_THREADS,
+                     NamedBarriers::kBarrierQ);
       pipeline_q.consumer_release(smem_pipe_read_q);
       ++smem_pipe_read_q;
 
