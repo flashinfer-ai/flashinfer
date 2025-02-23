@@ -464,6 +464,7 @@ __device__ __forceinline__ void write_o(
   o_smem[1] = smem_storage->kv_o_smem[(stage_counter + 1) % KTraits::NUM_STAGES].o;
 
   if (partial_o != nullptr) {
+    barrier_arrive(KTraits::NUM_COPY_THREADS + KTraits::NUM_MMA_THREADS, NamedBarriers::kBarrierO);
     // write to partial_o
 #pragma unroll
     for (uint32_t j = 0; j < 2; ++j) {
@@ -525,18 +526,19 @@ __device__ __forceinline__ void write_o(
       DTypeO* o_final_ptr = final_o + q * o_stride_n + r * o_stride_h +
                             (warp_group_idx - 1) * (HEAD_DIM_CKV / 2) +
                             (lane_idx % 8) * upcast_size<DTypeO>();
+      uint32_t o_smem_offset_w = get_swizzle_offset<KTraits::SWIZZLE_MODE_O, UPCAST_STRIDE_FINAL_O>(
+          (warp_idx_in_wg % 2) * 16 + 4 * j + lane_idx / 8,
+          (warp_group_idx - 1) * NUM_MMA_D_CKV + lane_idx % 8);
 #pragma unroll
       for (uint32_t k = 0; k < HEAD_DIM_CKV / 128; ++k) {
-        uint32_t o_smem_offset_w =
-            get_swizzle_offset<KTraits::SWIZZLE_MODE_O, UPCAST_STRIDE_FINAL_O>(
-                (warp_idx_in_wg % 2) * 16 + 4 * j + lane_idx / 8,
-                (warp_group_idx - 1) * NUM_MMA_D_CKV + 8 * k + lane_idx % 8);
         if (q < q_len) {
           o_smem[warp_idx_in_wg / 2].template store_128b(o_smem_offset_w, o_final_ptr);
         }
         o_final_ptr += 8 * upcast_size<DTypeO>();
+        o_smem_offset_w += 64;
       }
     }
+    barrier_arrive(KTraits::NUM_COPY_THREADS + KTraits::NUM_MMA_THREADS, NamedBarriers::kBarrierO);
   }
 }
 
