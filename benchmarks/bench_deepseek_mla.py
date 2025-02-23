@@ -20,7 +20,7 @@ import triton
 import flashinfer
 
 
-def bench_deepseek_mla_decode(batch_size, seq_len, num_heads):
+def bench_deepseek_mla_decode(batch_size, seq_len, num_heads, backend):
     head_dim_ckv = 512
     head_dim_kpe = 64
     page_size = 1
@@ -39,7 +39,7 @@ def bench_deepseek_mla_decode(batch_size, seq_len, num_heads):
     sm_scale = 1.0 / ((head_dim_ckv + head_dim_kpe) ** 0.5)
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
     wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
-        workspace_buffer, backend="fa2"
+        workspace_buffer, backend=backend
     )
     q_indptr = torch.arange(0, batch_size + 1).to(0).int()
     kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * seq_len
@@ -74,6 +74,6 @@ def bench_deepseek_mla_decode(batch_size, seq_len, num_heads):
 
 
 if __name__ == "__main__":
-    for seq_len in [1024, 2048, 4096, 8192, 16384, 32768]:
-        for batch_size in [1, 16, 32, 64]:
-            bench_deepseek_mla_decode(batch_size, seq_len, 16)
+    for seq_len in [1024, 2048]:
+        for batch_size in [64, 128, 768]:
+            bench_deepseek_mla_decode(batch_size, seq_len, 64, "auto")

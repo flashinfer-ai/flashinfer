@@ -364,6 +364,15 @@ def determine_attention_backend(
         return "fa2"
 
 
+def mla_is_fa3_supported(device: torch.device) -> bool:
+    major, _ = get_compute_capability(device)
+    return major == 9 and torch.version.cuda >= "12.3"
+
+
+def determine_mla_backend(device: torch.device) -> str:
+    return "fa3" if mla_is_fa3_supported(device) else "fa2"
+
+
 def _check_shape_dtype_device(
     x: torch.Tensor,
     expected_shape: Sequence[int],

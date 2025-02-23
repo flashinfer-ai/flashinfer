@@ -20,23 +20,31 @@ from typing import List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
-from .jit import gen_batch_mla_module, get_batch_mla_uri
+from .jit import gen_batch_mla_module
 from .utils import (
     MaskMode,
     _check_shape_dtype_device,
+    determine_mla_backend,
     get_cuda_stream,
     register_custom_op,
     register_fake_op,
 )
 
 _batch_mla_modules = {}
+_batch_mla_sm90_modules = {}
 
 
-def get_batch_mla_module(*args):
-    global _batch_mla_modules
-    if args not in _batch_mla_modules:
-        _batch_mla_modules[args] = gen_batch_mla_module(*args)
-    return _batch_mla_modules[args]
+def get_batch_mla_module(backend):
+    def backend_module(*args):
+        global _batch_mla_modules, _batch_mla_sm90_modules
+        modules_dict = (
+            _batch_mla_modules if backend == "fa2" else _batch_mla_sm90_modules
+        )
+        if args not in modules_dict:
+            modules_dict[args] = gen_batch_mla_module(backend, *args)
+        return modules_dict[args]
+
+    return backend_module
 
 
 class BatchMLAPagedAttentionWrapper:
@@ -113,7 +121,7 @@ class BatchMLAPagedAttentionWrapper:
         kv_indptr: Optional[torch.Tensor] = None,
         kv_indices: Optional[torch.Tensor] = None,
         kv_len_arr: Optional[torch.Tensor] = None,
-        backend: str = "fa2",
+        backend: str = "auto",
     ) -> None:
         r"""Constructor for BatchMLAPagedAttentionWrapper.
 
@@ -143,7 +151,9 @@ class BatchMLAPagedAttentionWrapper:
             should be ``[batch_size]``.
             This argument is only effective when ``use_cuda_graph`` is ``True``.
         backend : str
-            The implementation backend, default is "fa2".
+            The implementation backend, could be ``auto``/``fa2`` or ``fa3``. Defaults to ``auto``.
+            If set to ``auto``, the function will automatically choose the backend based on the
+            device architecture and kernel availability.
         """
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
@@ -160,6 +170,10 @@ class BatchMLAPagedAttentionWrapper:
         self._kv_indptr_buf = kv_indptr
         self._kv_indices_buf = kv_indices
         self._kv_len_arr_buf = kv_len_arr
+        if backend == "auto":
+            self._backend = determine_mla_backend(self.device)
+        else:
+            self._backend = backend
 
     def plan(
         self,
@@ -207,7 +221,7 @@ class BatchMLAPagedAttentionWrapper:
         kv_data_type : torch.dtype
             The data type of the kv-cache tensor.
         """
-        self._cached_module = get_batch_mla_module(
+        self._cached_module = get_batch_mla_module(self._backend)(
             q_data_type,
             kv_data_type,
             q_data_type,

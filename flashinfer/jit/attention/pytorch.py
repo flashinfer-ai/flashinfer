@@ -20,7 +20,7 @@ from typing import List
 import jinja2
 import torch
 
-from ..core import load_cuda_ops, logger
+from ..core import load_cuda_ops, logger, sm90a_nvcc_flags
 from ..env import FLASHINFER_CSRC_DIR, FLASHINFER_GEN_SRC_DIR
 from ..utils import (
     dtype_map,
@@ -79,6 +79,7 @@ def get_batch_decode_uri(
 
 
 def get_batch_mla_uri(
+    backend: str,
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
@@ -93,10 +94,11 @@ def get_batch_mla_uri(
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_ckv_{head_dim_ckv}_"
         f"head_dim_kpe_{head_dim_kpe}"
-    )
+    ) + ("_sm90" if backend == "fa3" else "")
 
 
 def gen_batch_mla_module(
+    backend: str,
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
@@ -104,7 +106,10 @@ def gen_batch_mla_module(
     head_dim_ckv: int,
     head_dim_kpe: int,
 ):
+    if backend == "auto":
+        raise ValueError("backend should not be auto when jit_args is provided")
     uri = get_batch_mla_uri(
+        backend,
         dtype_q,
         dtype_kv,
         dtype_o,
@@ -115,35 +120,71 @@ def gen_batch_mla_module(
     gen_directory = FLASHINFER_GEN_SRC_DIR / uri
     os.makedirs(gen_directory, exist_ok=True)
 
-    with open(FLASHINFER_CSRC_DIR / "batch_mla_config.jinja") as f:
-        config_templ = jinja2.Template(f.read())
-    generated_config_path = gen_directory / "batch_mla_config.inc"
-    write_if_different(
-        generated_config_path,
-        config_templ.render(
-            dtype_q=dtype_map[dtype_q],
-            dtype_kv=dtype_map[dtype_kv],
-            dtype_o=dtype_map[dtype_o],
-            dtype_idx=dtype_map[dtype_idx],
-            head_dim_ckv=head_dim_ckv,
-            head_dim_kpe=head_dim_kpe,
+    if backend == "fa2":
+        with open(FLASHINFER_CSRC_DIR / "batch_mla_config.jinja") as f:
+            config_templ = jinja2.Template(f.read())
+        generated_config_path = gen_directory / "batch_mla_config.inc"
+        write_if_different(
+            generated_config_path,
+            config_templ.render(
+                dtype_q=dtype_map[dtype_q],
+                dtype_kv=dtype_map[dtype_kv],
+                dtype_o=dtype_map[dtype_o],
+                dtype_idx=dtype_map[dtype_idx],
+                head_dim_ckv=head_dim_ckv,
+                head_dim_kpe=head_dim_kpe,
+            ),
+        )
+
+        source_paths = []
+        for filename in [
+            "batch_mla_plan.cu",
+            "batch_mla_run.cu",
+            "batch_mla_pybind.cu",
+        ]:
+            src_path = FLASHINFER_CSRC_DIR / filename
+            dest_path = gen_directory / filename
+            source_paths.append(dest_path)
+            with open(src_path, "r") as f:
+                source = f.read()
+            write_if_different(dest_path, source)
+    elif backend == "fa3":
+        with open(FLASHINFER_CSRC_DIR / "batch_mla_config.jinja") as f:
+            config_templ = jinja2.Template(f.read())
+        generated_config_path = gen_directory / "batch_mla_sm90_config.inc"
+        write_if_different(
+            generated_config_path,
+            config_templ.render(
+                dtype_q=dtype_map[dtype_q],
+                dtype_kv=dtype_map[dtype_kv],
+                dtype_o=dtype_map[dtype_o],
+                dtype_idx=dtype_map[dtype_idx],
+                head_dim_ckv=head_dim_ckv,
+                head_dim_kpe=head_dim_kpe,
+            ),
+        )
+        source_paths = []
+        for filename in [
+            "batch_mla_sm90_plan.cu",
+            "batch_mla_sm90_run.cu",
+            "batch_mla_sm90_pybind.cu",
+        ]:
+            src_path = FLASHINFER_CSRC_DIR / filename
+            dest_path = gen_directory / filename
+            source_paths.append(dest_path)
+            with open(src_path, "r") as f:
+                source = f.read()
+            write_if_different(dest_path, source)
+    else:
+        raise ValueError(f"Unsupported backend: {backend}")
+
+    return load_cuda_ops(
+        uri,
+        source_paths,
+        extra_cuda_cflags=(
+            ["-gencode=arch=compute_90a,code=sm_90a"] if backend == "fa3" else []
         ),
     )
-
-    source_paths = []
-    for filename in [
-        "batch_mla_plan.cu",
-        "batch_mla_run.cu",
-        "batch_mla_pybind.cu",
-    ]:
-        src_path = FLASHINFER_CSRC_DIR / filename
-        dest_path = gen_directory / filename
-        source_paths.append(dest_path)
-        with open(src_path, "r") as f:
-            source = f.read()
-        write_if_different(dest_path, source)
-
-    return load_cuda_ops(uri, source_paths)
 
 
 def get_batch_decode_mla_uri(
