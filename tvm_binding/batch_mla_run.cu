@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <flashinfer/attention/mla_fa2.cuh>
+#include <flashinfer/attention/mla.cuh>
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/fastdiv.cuh>
 #include <optional>
