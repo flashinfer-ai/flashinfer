@@ -20,9 +20,9 @@ from typing import List
 import jinja2
 import torch
 
-from .core import load_cuda_ops, logger, sm90a_nvcc_flags
-from .env import FLASHINFER_CSRC_DIR, FLASHINFER_GEN_SRC_DIR
-from .utils import (
+from ..core import load_cuda_ops, logger, sm90a_nvcc_flags
+from ..env import FLASHINFER_CSRC_DIR, FLASHINFER_GEN_SRC_DIR
+from ..utils import (
     dtype_map,
     filename_safe_dtype_map,
     mask_mode_literal,
