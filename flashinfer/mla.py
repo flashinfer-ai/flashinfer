@@ -24,6 +24,7 @@ from .jit import gen_batch_mla_module
 from .utils import (
     MaskMode,
     _check_shape_dtype_device,
+    determine_mla_backend,
     get_cuda_stream,
     register_custom_op,
     register_fake_op,
@@ -120,7 +121,7 @@ class BatchMLAPagedAttentionWrapper:
         kv_indptr: Optional[torch.Tensor] = None,
         kv_indices: Optional[torch.Tensor] = None,
         kv_len_arr: Optional[torch.Tensor] = None,
-        backend: str = "fa2",
+        backend: str = "auto",
     ) -> None:
         r"""Constructor for BatchMLAPagedAttentionWrapper.
 
@@ -150,7 +151,9 @@ class BatchMLAPagedAttentionWrapper:
             should be ``[batch_size]``.
             This argument is only effective when ``use_cuda_graph`` is ``True``.
         backend : str
-            The implementation backend, default is "fa2".
+            The implementation backend, could be ``auto``/``fa2`` or ``fa3``. Defaults to ``auto``.
+            If set to ``auto``, the function will automatically choose the backend based on the
+            device architecture and kernel availability.
         """
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
@@ -167,7 +170,10 @@ class BatchMLAPagedAttentionWrapper:
         self._kv_indptr_buf = kv_indptr
         self._kv_indices_buf = kv_indices
         self._kv_len_arr_buf = kv_len_arr
-        self._backend = backend
+        if backend == "auto":
+            self._backend = determine_mla_backend(self.device)
+        else:
+            self._backend = backend
 
     def plan(
         self,

@@ -74,6 +74,6 @@ def bench_deepseek_mla_decode(batch_size, seq_len, num_heads, backend):
 
 
 if __name__ == "__main__":
-    for seq_len in [1024, 2048]:  # [1024, 2048, 4096, 8192, 16384, 32768]:
-        for batch_size in [64, 128, 768]:  # [1, 16, 32, 64]:
-            bench_deepseek_mla_decode(batch_size, seq_len, 64, "fa3")
+    for seq_len in [1024, 2048]:
+        for batch_size in [64, 128, 768]:
+            bench_deepseek_mla_decode(batch_size, seq_len, 64, "auto")

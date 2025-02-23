@@ -20,6 +20,7 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.utils import mla_is_fa3_supported
 
 
 def attention_ref(
@@ -83,6 +84,8 @@ def test_single_prefill_with_kv_cache(
     backend,
     dtype,
 ):
+    if not mla_is_fa3_supported(torch.device("cuda")):
+        pytest.skip("FA3 is not supported on this device")
     torch.manual_seed(42)
     head_dim_qk = 192
     head_dim_vo = 128
@@ -115,6 +118,8 @@ def test_batch_prefill_with_ragged_kv_cache(
     backend,
     dtype,
 ):
+    if not mla_is_fa3_supported(torch.device("cuda")):
+        pytest.skip("FA3 is not supported on this device")
     torch.manual_seed(42)
     kv_layout = "NHD"
     head_dim_qk = 192
@@ -198,6 +203,8 @@ def test_batch_mla_varlen_page_attention(
     backend,
     dtype,
 ):
+    if not mla_is_fa3_supported(torch.device("cuda")):
+        pytest.skip("FA3 is not supported on this device")
     if causal and qo_len > min(kv_len_0, kv_len_1, kv_len_2):
         pytest.skip("qo_len > kv_len not supported for causal attention")
     num_different_kv_len = 3
@@ -324,6 +331,8 @@ def test_batch_mla_page_attention(
     backend,
     dtype,
 ):
+    if not mla_is_fa3_supported(torch.device("cuda")):
+        pytest.skip("FA3 is not supported on this device")
     if causal and qo_len > kv_len:
         pytest.skip("qo_len > kv_len not supported for causal attention")
     torch.manual_seed(42)
@@ -394,5 +403,8 @@ def test_batch_mla_page_attention(
 
 if __name__ == "__main__":
     test_batch_mla_varlen_page_attention(
-        155, 8, 8, 8, 4, 16, False, 1, "fa3", torch.half
+        155, 0, 8, 8, 128, 16, False, 1, "fa3", torch.half
+    )
+    test_batch_mla_varlen_page_attention(
+        155, 1024, 8, 128, 128, 16, False, 1, "fa3", torch.half
     )
