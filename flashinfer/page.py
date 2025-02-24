@@ -88,6 +88,7 @@ def block_sparse_indices_to_vector_sparse_offsets(
         )
     return vector_sparse_offsets
 
+
 @register_custom_op(
     "flashinfer::append_paged_mla_kv_cache",
     mutates_args=("ckv_cache", "kpe_cache"),
@@ -108,7 +109,7 @@ def _append_paged_mla_kv_cache_kernel(
         positions = positions.int()
         kv_indices = kv_indices.int()
         kv_indptr = kv_indptr.int()
-        kv_last_page_len = kv_last_page_len.int()        
+        kv_last_page_len = kv_last_page_len.int()
         get_page_module().append_paged_mla_kv_cache(
             append_ckv,
             append_kpe,
@@ -119,8 +120,9 @@ def _append_paged_mla_kv_cache_kernel(
             kv_indices,
             kv_indptr,
             kv_last_page_len,
-            get_cuda_stream(device)
+            get_cuda_stream(device),
         )
+
 
 @register_custom_op(
     "flashinfer::append_paged_kv_cache",
@@ -286,7 +288,7 @@ def append_paged_mla_kv_cache(
     kv_indptr: torch.Tensor,
     kv_last_page_len: torch.Tensor,
 ) -> None:
-    r"""Append a batch of key-value pairs to a paged key-value cache, 
+    r"""Append a batch of key-value pairs to a paged key-value cache,
     Note: current only support ckv=512 and kpe=64
 
     Parameters
@@ -320,7 +322,7 @@ def append_paged_mla_kv_cache(
         kpe_cache,
         kv_indices,
         kv_indptr,
-        kv_last_page_len
+        kv_last_page_len,
     )
 
 

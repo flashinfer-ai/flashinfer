@@ -138,10 +138,10 @@ void block_sparse_indices_to_vector_sparse_offsets(at::Tensor block_sparse_indic
               cudaGetErrorString(status));
 }
 
-void append_paged_mla_kv_cache(at::Tensor append_ckv, at::Tensor append_kpe, at::Tensor batch_indices,
-                           at::Tensor positions, at::Tensor ckv_cache, at::Tensor kpe_cache,
-                           at::Tensor kv_indices, at::Tensor kv_indptr, at::Tensor kv_last_page_len,
-                           int64_t cuda_stream) {
+void append_paged_mla_kv_cache(at::Tensor append_ckv, at::Tensor append_kpe,
+                               at::Tensor batch_indices, at::Tensor positions, at::Tensor ckv_cache,
+                               at::Tensor kpe_cache, at::Tensor kv_indices, at::Tensor kv_indptr,
+                               at::Tensor kv_last_page_len, int64_t cuda_stream) {
   CHECK_LAST_DIM_CONTIGUOUS(append_ckv);
   CHECK_LAST_DIM_CONTIGUOUS(append_kpe);
   CHECK_INPUT(batch_indices);
@@ -170,7 +170,7 @@ void append_paged_mla_kv_cache(at::Tensor append_ckv, at::Tensor append_kpe, at:
   CHECK_EQ(append_ckv.device(), device);
   CHECK_EQ(append_kpe.device(), device);
   CHECK_EQ(ckv_cache.device(), device);
-  
+
   CHECK_EQ(kv_indices.device(), device);
   CHECK_EQ(kv_indptr.device(), device);
   CHECK_EQ(kv_last_page_len.device(), device);
@@ -183,7 +183,7 @@ void append_paged_mla_kv_cache(at::Tensor append_ckv, at::Tensor append_kpe, at:
   // get kv_cache_strides
   const int64_t* ckv_strides = ckv_cache.strides().data();
   const int64_t* kpe_strides = kpe_cache.strides().data();
- 
+
   auto append_ckv_strides = append_ckv.strides();
   auto append_ckv_stride_n = append_ckv_strides[0];
   auto append_kpe_strides = append_kpe.strides();
@@ -197,18 +197,16 @@ void append_paged_mla_kv_cache(at::Tensor append_ckv, at::Tensor append_kpe, at:
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(kv_scalar_dtype, c_type, [&] {
     paged_kv_mla_t<c_type, int32_t> paged_mla_kv(
-        page_size, ckv_dim, kpe_dim, batch_size, 
-        static_cast<c_type*>(ckv_cache.data_ptr()),
-        ckv_strides,
-        static_cast<c_type*>(kpe_cache.data_ptr()), kpe_strides,
+        page_size, ckv_dim, kpe_dim, batch_size, static_cast<c_type*>(ckv_cache.data_ptr()),
+        ckv_strides, static_cast<c_type*>(kpe_cache.data_ptr()), kpe_strides,
         static_cast<int32_t*>(kv_indices.data_ptr()), static_cast<int32_t*>(kv_indptr.data_ptr()),
         static_cast<int32_t*>(kv_last_page_len.data_ptr()));
     cudaError_t status =
         AppendPagedKVMlaCache(paged_mla_kv, static_cast<c_type*>(append_ckv.data_ptr()),
-                           static_cast<c_type*>(append_kpe.data_ptr()),
-                           static_cast<int32_t*>(batch_indices.data_ptr()),
-                           static_cast<int32_t*>(positions.data_ptr()), nnz, append_ckv_stride_n,
-                           append_kpe_stride_n, stream);
+                              static_cast<c_type*>(append_kpe.data_ptr()),
+                              static_cast<int32_t*>(batch_indices.data_ptr()),
+                              static_cast<int32_t*>(positions.data_ptr()), nnz, append_ckv_stride_n,
+                              append_kpe_stride_n, stream);
     TORCH_CHECK(status == cudaSuccess,
                 "AppendPagedKVMlaCache failed with error: ", cudaGetErrorString(status));
     return true;
