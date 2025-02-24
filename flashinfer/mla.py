@@ -164,6 +164,7 @@ class BatchMLAPagedAttentionWrapper:
             self._int_workspace_buffer.shape,
             dtype=self._int_workspace_buffer.dtype,
             pin_memory=True,
+            device="cpu"
         )
         self._use_cuda_graph = use_cuda_graph
         self._qo_indptr_buf = qo_indptr

@@ -146,6 +146,7 @@ class BlockSparseAttentionWrapper:
             self._int_workspace_buffer.shape,
             dtype=torch.uint8,
             pin_memory=True,
+            device="cpu"
         )
         self._use_cuda_graph = False
         self._kv_layout = "NHD"
