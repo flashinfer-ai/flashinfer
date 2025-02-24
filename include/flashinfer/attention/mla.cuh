@@ -623,7 +623,7 @@ __device__ void DevicePersistentMergeStates(typename KTraits::IdType* merge_pack
                                             const uint32_t o_stride_n, const uint32_t o_stride_h,
                                             const uint32_t cluster_tile_q,
                                             const uint_fastdiv& num_heads) {
-  constexpr uint32_t VEC_SIZE = 4;  // partial o has data type float
+  constexpr uint32_t VEC_SIZE = 8;  // partial o has data type float
   constexpr uint32_t NUM_THRS_PER_ROW = KTraits::HEAD_DIM_CKV / VEC_SIZE;
   constexpr uint32_t ROWS_PER_ITERATION = (KTraits::NUM_THREADS) / NUM_THRS_PER_ROW;
   const uint32_t cluster_id = blockIdx.y;
@@ -641,7 +641,7 @@ __device__ void DevicePersistentMergeStates(typename KTraits::IdType* merge_pack
     uint32_t q, r;
     num_heads.divmod(final_packed_offset, q, r);
     state_t<VEC_SIZE> st;
-#pragma unroll 2
+#pragma unroll 8
     for (uint32_t partial_packed_offset = partial_offset_start + local_packed_offset;
          partial_packed_offset < partial_offset_end; partial_packed_offset += stride) {
       vec_t<float, VEC_SIZE> o_partial;
