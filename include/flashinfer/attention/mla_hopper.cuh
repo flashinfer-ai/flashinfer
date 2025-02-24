@@ -626,7 +626,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
 
   if (warp_group_idx == 0) {
     // producer
-    cutlass::arch::warpgroup_reg_dealloc<72>();
+    cutlass::arch::warpgroup_reg_dealloc<56>();
     const uint32_t warp_idx_in_warpgroup = __shfl_sync(0xffffffff, warp_idx % 4, 0);
     PipelineState smem_pipe_write_q = cutlass::make_producer_start_state<MainloopPipeline>();
     PipelineState smem_pipe_write_kv = cutlass::make_producer_start_state<MainloopPipeline>();
@@ -705,7 +705,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
     }
   } else {
     // consumer
-    cutlass::arch::warpgroup_reg_alloc<216>();
+    cutlass::arch::warpgroup_reg_alloc<224>();
     const uint32_t warp_idx_in_warpgroup = __shfl_sync(0xffffffff, warp_idx % 4, 0);
 
     PipelineState smem_pipe_read_q;
