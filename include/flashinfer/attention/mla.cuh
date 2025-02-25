@@ -621,27 +621,25 @@ __device__ void DevicePersistentMergeStates(typename KTraits::IdType* merge_pack
                                             float* partial_o, float* partial_lse,
                                             typename KTraits::DTypeO* final_o, float* final_lse,
                                             const uint32_t o_stride_n, const uint32_t o_stride_h,
-                                            const uint32_t cluster_tile_q,
                                             const uint_fastdiv& num_heads) {
   constexpr uint32_t VEC_SIZE = 8;  // partial o has data type float
   constexpr uint32_t NUM_THRS_PER_ROW = KTraits::HEAD_DIM_CKV / VEC_SIZE;
   constexpr uint32_t ROWS_PER_ITERATION = (KTraits::NUM_THREADS) / NUM_THRS_PER_ROW;
-  const uint32_t cluster_id = blockIdx.y;
+  const uint32_t cta_idx = (gridDim.x * blockIdx.y + blockIdx.x);
   const uint32_t thread_id = (threadIdx.z * blockDim.y + threadIdx.y) * blockDim.x + threadIdx.x;
-  const uint32_t offset_start = merge_packed_offset_start[cluster_id];
-  const uint32_t offset_end = merge_packed_offset_end[cluster_id];
-  const uint32_t partial_offset_start = merge_indptr[cluster_id];
-  const uint32_t partial_offset_end = merge_indptr[cluster_id + 1];
+  const uint32_t offset_start = merge_packed_offset_start[cta_idx];
+  const uint32_t offset_end = merge_packed_offset_end[cta_idx];
+  const uint32_t partial_offset_start = merge_indptr[cta_idx];
+  const uint32_t partial_offset_end = merge_indptr[cta_idx + 1];
   const uint32_t stride = offset_end - offset_start;
 #pragma unroll 1
-  for (uint32_t local_packed_offset =
-           blockIdx.x * ROWS_PER_ITERATION + thread_id / NUM_THRS_PER_ROW;
-       local_packed_offset < stride; local_packed_offset += gridDim.x * ROWS_PER_ITERATION) {
+  for (uint32_t local_packed_offset = ROWS_PER_ITERATION + thread_id / NUM_THRS_PER_ROW;
+       local_packed_offset < stride; local_packed_offset += ROWS_PER_ITERATION) {
     uint32_t final_packed_offset = offset_start + local_packed_offset;
     uint32_t q, r;
     num_heads.divmod(final_packed_offset, q, r);
     state_t<VEC_SIZE> st;
-#pragma unroll 8
+#pragma unroll 4
     for (uint32_t partial_packed_offset = partial_offset_start + local_packed_offset;
          partial_packed_offset < partial_offset_end; partial_packed_offset += stride) {
       vec_t<float, VEC_SIZE> o_partial;
@@ -967,10 +965,9 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
   grid.sync();
 
   // the second stage, merge partial outputs
-  DevicePersistentMergeStates<KTraits>(params.merge_packed_offset_start,
-                                       params.merge_packed_offset_end, params.merge_indptr,
-                                       partial_o, partial_lse, final_o, final_lse, o_stride_n,
-                                       o_stride_h, cluster_tile_q, num_heads);
+  DevicePersistentMergeStates<KTraits>(
+      params.merge_packed_offset_start, params.merge_packed_offset_end, params.merge_indptr,
+      partial_o, partial_lse, final_o, final_lse, o_stride_n, o_stride_h, num_heads);
 }
 
 #define DISPATCH_SMEM_CONFIG(smem_limit_per_sm, NUM_STAGES, CTA_TILE_KV, QK_SHARD, ...) \
