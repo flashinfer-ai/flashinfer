@@ -839,8 +839,10 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
   __syncthreads();
   // the second stage, merge partial outputs
   DevicePersistentMergeStates<KTraits>(
-      params.merge_packed_offset_start, params.merge_packed_offset_end, params.merge_indptr,
-      partial_o, partial_lse, final_o, final_lse, o_stride_n, o_stride_h, num_heads);
+      params.merge_packed_offset_start, params.merge_packed_offset_end,
+      params.merge_partial_packed_offset_start, params.merge_partial_packed_offset_end,
+      params.merge_partial_stride, partial_o, partial_lse, final_o, final_lse, o_stride_n,
+      o_stride_h, num_heads);
 }
 
 }  // namespace hopper
