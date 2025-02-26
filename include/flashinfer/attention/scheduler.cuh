@@ -1117,9 +1117,9 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
       cluster_kv_end(num_clusters, std::vector<IdType>()),
       cluster_partial_indptr(num_clusters, std::vector<IdType>());
 
-  std::vector<IdType> merge_packed_offset_start(num_clusters, 0),
-      merge_packed_offset_end(num_clusters, 0), merge_partial_packed_offset_start(num_clusters, 0),
-      merge_partial_packed_offset_end(num_clusters, 0), merge_partial_stride(num_clusters, 0);
+  std::vector<IdType> merge_packed_offset_start(num_sm, 0), merge_packed_offset_end(num_sm, 0),
+      merge_partial_packed_offset_start(num_sm, 0), merge_partial_packed_offset_end(num_sm, 0),
+      merge_partial_stride(num_sm, 0);
 
   int merge_cta_counter = 0;
   int partial_o_nnz = 0;
