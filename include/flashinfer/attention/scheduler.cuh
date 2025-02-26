@@ -1151,7 +1151,8 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
         int num_qo_chunks = std::max(remaining_len * cluster_size / kv_len_limit, 1);
         // row_chunk_size * num_qo_chunks >= row_tile_size
         int row_chunk_size = ceil_div(row_tile_size, num_qo_chunks);
-        int current_q_tile_end = std::min((qo_tile_idx + 1) * cluster_tile_q, packed_qo_len);
+        int current_q_tile_end =
+            std::min(cluster_tile_q, packed_qo_len - qo_tile_idx * cluster_tile_q);
         for (int offset_start = 0; offset_start < row_tile_size; offset_start += row_chunk_size) {
           merge_packed_offset_start[merge_cta_counter] =
               qo_indptr_h[i] * num_heads + qo_tile_idx * cluster_tile_q + offset_start;
