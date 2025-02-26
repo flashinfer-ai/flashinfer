@@ -449,9 +449,9 @@ def test_batch_mla_page_attention(
 
 if __name__ == "__main__":
     test_batch_mla_varlen_page_attention(
-        155, 0, 8, 8, 128, 16, False, 1, "fa3", torch.half
+        155, 64, 8, 8, 128, 16, False, 1, "fa3", torch.half
     )
-    test_batch_mla_varlen_page_attention(
-        155, 1024, 8, 128, 128, 16, False, 1, "fa3", torch.half
-    )
-    test_batch_mla_page_attention(1, 1024, 128, 128, False, 1, "fa2", True, torch.half)
+    # test_batch_mla_varlen_page_attention(
+    #     155, 1024, 8, 128, 128, 16, False, 1, "fa3", torch.half
+    # )
+    # test_batch_mla_page_attention(1, 1024, 128, 128, False, 1, "fa2", True, torch.half)

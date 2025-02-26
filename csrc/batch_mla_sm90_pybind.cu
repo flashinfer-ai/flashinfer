@@ -28,8 +28,8 @@ void BatchMLAPagedAttentionSM90Run(at::Tensor float_workspace_buffer,
                                    at::Tensor q_nope, at::Tensor q_pe, at::Tensor ckv_cache,
                                    at::Tensor kpe_cache, at::Tensor kv_indices, at::Tensor o,
                                    std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code,
-                                   int64_t num_heads, int64_t page_size, double sm_scale,
-                                   int64_t cuda_stream);
+                                   int64_t num_heads, int64_t page_size,
+                                   double sm_scale ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("plan", &BatchMLAPagedAttentionSM90Plan);
