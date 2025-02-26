@@ -41,6 +41,7 @@ struct StandardAttention : AttentionVariantBase {
 template <uint32_t NUM_STAGES, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV, uint32_t HEAD_DIM_CKV,
           uint32_t HEAD_DIM_KPE, typename DTypeQ, typename DTypeKV, typename DTypeO>
 struct SharedStorageQKVO {
+  static constexpr uint32_t MERGE_SMEM_STAGES = 8;
   union {
     struct {
       alignas(16) DTypeQ q_smem_nope[CTA_TILE_Q * HEAD_DIM_CKV];
@@ -55,6 +56,10 @@ struct SharedStorageQKVO {
       };
     };
     alignas(16) DTypeO o_smem[CTA_TILE_Q * HEAD_DIM_CKV];
+    struct {
+      DTypeO merge_o_smem[MERGE_SMEM_STAGES][HEAD_DIM_CKV];
+      float merge_lse_smem[];
+    };
   };
 };
 
@@ -620,9 +625,9 @@ __device__ void DevicePersistentMergeStates(
     typename KTraits::IdType* merge_packed_offset_end,
     typename KTraits::IdType* merge_partial_packed_offset_start,
     typename KTraits::IdType* merge_partial_packed_offset_end,
-    typename KTraits::IdType* merge_partial_stride, float* partial_o, float* partial_lse,
-    typename KTraits::DTypeO* final_o, float* final_lse, const uint32_t o_stride_n,
-    const uint32_t o_stride_h, const uint_fastdiv& num_heads) {
+    typename KTraits::IdType* merge_partial_stride, typename KTraits::DTypeO* partial_o,
+    float* partial_lse, typename KTraits::DTypeO* final_o, float* final_lse,
+    const uint32_t o_stride_n, const uint32_t o_stride_h, const uint_fastdiv& num_heads) {
   constexpr uint32_t VEC_SIZE = 4;  // partial o has data type float
   constexpr uint32_t NUM_THRS_PER_ROW = KTraits::HEAD_DIM_CKV / VEC_SIZE;
   constexpr uint32_t ROWS_PER_ITERATION = (KTraits::NUM_THREADS) / NUM_THRS_PER_ROW;
@@ -640,17 +645,17 @@ __device__ void DevicePersistentMergeStates(
     uint32_t q, r;
     num_heads.divmod(final_packed_offset, q, r);
     state_t<VEC_SIZE> st;
-#pragma unroll 8
+#pragma unroll 4
     for (uint32_t partial_packed_offset = partial_offset_start + local_packed_offset;
          partial_packed_offset < partial_offset_end; partial_packed_offset += stride) {
       vec_t<float, VEC_SIZE> o_partial;
       float lse_partial;
-      o_partial.load(partial_o + partial_packed_offset * KTraits::HEAD_DIM_CKV +
-                     (thread_id % NUM_THRS_PER_ROW) * VEC_SIZE);
+      o_partial.cast_load(partial_o + partial_packed_offset * KTraits::HEAD_DIM_CKV +
+                          (thread_id % NUM_THRS_PER_ROW) * VEC_SIZE);
       lse_partial = partial_lse[partial_packed_offset];
       st.merge(o_partial, lse_partial, 1);
     }
-    st.normalize();
+    // st.normalize();
     st.o.cast_store(final_o +
                     (q * o_stride_n + r * o_stride_h + (thread_id % NUM_THRS_PER_ROW) * VEC_SIZE));
     if (final_lse) {
@@ -662,10 +667,11 @@ __device__ void DevicePersistentMergeStates(
 template <typename KTraits>
 __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_storage,
                                         typename KTraits::DTypeO* final_o, float* final_lse,
-                                        float* partial_o, float* partial_lse, float (*o_frag)[8],
-                                        typename KTraits::DTypeQKAccum* m, float* d,
-                                        const uint32_t o_stride_n, const uint32_t o_stride_h,
-                                        const uint32_t q_len, const uint32_t packed_offset,
+                                        typename KTraits::DTypeO* partial_o, float* partial_lse,
+                                        float (*o_frag)[8], typename KTraits::DTypeQKAccum* m,
+                                        float* d, const uint32_t o_stride_n,
+                                        const uint32_t o_stride_h, const uint32_t q_len,
+                                        const uint32_t packed_offset,
                                         const uint_fastdiv& num_heads) {
   using DTypeO = typename KTraits::DTypeO;
   constexpr uint32_t NUM_MMA_D_CKV = KTraits::NUM_MMA_D_CKV;
@@ -673,6 +679,26 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
   constexpr uint32_t UPCAST_STRIDE_FINAL_O = KTraits::UPCAST_STRIDE_FINAL_O;
   const uint32_t lane_idx = threadIdx.x, warpgroup_idx = threadIdx.z, warp_idx_in_wg = threadIdx.y;
   smem_t<KTraits::SWIZZLE_MODE_O> o_smem(smem_storage->o_smem);
+#pragma unroll
+  for (uint32_t mma_d = 0; mma_d < NUM_MMA_D_CKV / 2; ++mma_d) {
+    uint32_t o_frag_f16[8 / 2];
+    vec_cast<DTypeO, float>::cast<8>((DTypeO*)o_frag_f16, o_frag[mma_d]);
+#ifdef FLASHINFER_STMATRIX_M8N8X4_ENABLED
+    uint32_t o_smem_offset_w = o_smem.template get_permuted_offset<UPCAST_STRIDE_FINAL_O>(
+        warp_idx_in_wg * 16 + lane_idx % 16,
+        warpgroup_idx * NUM_MMA_D_CKV + mma_d * 2 + lane_idx / 16);
+    o_smem.template stmatrix_m8n8x4(o_smem_offset_w, o_frag_f16);
+#else
+    uint32_t o_smem_offset_w = o_smem.template get_permuted_offset<UPCAST_STRIDE_FINAL_O>(
+        warp_idx_in_wg * 16 + lane_idx / 4, warpgroup_idx * NUM_MMA_D_CKV + mma_d * 2);
+    ((uint32_t*)(o_smem.base + o_smem_offset_w))[lane_idx % 4] = o_frag_f16[0];
+    ((uint32_t*)(o_smem.base + o_smem_offset_w + 8 * UPCAST_STRIDE_FINAL_O))[lane_idx % 4] =
+        o_frag_f16[1];
+    ((uint32_t*)(o_smem.base + (o_smem_offset_w ^ 0x1)))[lane_idx % 4] = o_frag_f16[2];
+    ((uint32_t*)(o_smem.base + (o_smem_offset_w ^ 0x1) + 8 * UPCAST_STRIDE_FINAL_O))[lane_idx % 4] =
+        o_frag_f16[3];
+#endif
+  }
 
   if (partial_o != nullptr) {
     // write to partial_o
@@ -685,24 +711,26 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
       }
     }
 
+    // step 1. smem to gmem
+    uint32_t o_smem_offset_w = o_smem.template get_permuted_offset<UPCAST_STRIDE_FINAL_O>(
+        warp_idx_in_wg * 16 + lane_idx / 8, warpgroup_idx * NUM_MMA_D_CKV + lane_idx % 8);
 #pragma unroll
-    for (uint32_t j = 0; j < 2; ++j) {
-      uint32_t q_idx = (packed_offset + warp_idx_in_wg * 16 + 8 * j + lane_idx / 4) / num_heads;
+    for (uint32_t j = 0; j < 4; ++j) {
+      uint32_t q_idx = (packed_offset + warp_idx_in_wg * 16 + 4 * j + lane_idx / 8) / num_heads;
+      DTypeO* o_partial_ptr =
+          partial_o + (packed_offset + warp_idx_in_wg * 16 + 4 * j + lane_idx / 8) * HEAD_DIM_CKV +
+          warpgroup_idx * (HEAD_DIM_CKV / 2) + (lane_idx % 8) * upcast_size<DTypeO>();
 #pragma unroll
-      for (uint32_t mma_d = 0; mma_d < NUM_MMA_D_CKV / 2; ++mma_d) {
+      for (uint32_t mma_d = 0; mma_d < NUM_MMA_D_CKV / 8; ++mma_d) {
         if (q_idx < q_len) {
-          *reinterpret_cast<float2*>(
-              partial_o +
-              ((blockIdx.x * 4 + warp_idx_in_wg) * 16 + 8 * j + lane_idx / 4) * HEAD_DIM_CKV +
-              warpgroup_idx * (HEAD_DIM_CKV / 2) + mma_d * 16 + (lane_idx % 4) * 2) =
-              *reinterpret_cast<float2*>(&o_frag[mma_d][j * 2]);
-          *reinterpret_cast<float2*>(
-              partial_o +
-              ((blockIdx.x * 4 + warp_idx_in_wg) * 16 + 8 * j + lane_idx / 4) * HEAD_DIM_CKV +
-              warpgroup_idx * (HEAD_DIM_CKV / 2) + mma_d * 16 + 8 + (lane_idx % 4) * 2) =
-              *reinterpret_cast<float2*>(&o_frag[mma_d][4 + j * 2]);
+          o_smem.template store_128b(o_smem_offset_w, o_partial_ptr);
         }
+        o_partial_ptr += 8 * upcast_size<DTypeO>();
+        o_smem_offset_w = o_smem.template advance_offset_by_column<8>(o_smem_offset_w, mma_d);
       }
+      o_smem_offset_w =
+          o_smem.template advance_offset_by_row<4, UPCAST_STRIDE_FINAL_O>(o_smem_offset_w) -
+          NUM_MMA_D_CKV;
     }
   } else {
     // write to final_o
@@ -716,28 +744,6 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
           final_lse[q * num_heads + r] = math::ptx_log2(d[j]) + float(m[j]);
         }
       }
-    }
-
-    // step 0. rmem to smem
-#pragma unroll
-    for (uint32_t mma_d = 0; mma_d < NUM_MMA_D_CKV / 2; ++mma_d) {
-      uint32_t o_frag_f16[8 / 2];
-      vec_cast<DTypeO, float>::cast<8>((DTypeO*)o_frag_f16, o_frag[mma_d]);
-#ifdef FLASHINFER_STMATRIX_M8N8X4_ENABLED
-      uint32_t o_smem_offset_w = o_smem.template get_permuted_offset<UPCAST_STRIDE_FINAL_O>(
-          warp_idx_in_wg * 16 + lane_idx % 16,
-          warpgroup_idx * NUM_MMA_D_CKV + mma_d * 2 + lane_idx / 16);
-      o_smem.template stmatrix_m8n8x4(o_smem_offset_w, o_frag_f16);
-#else
-      uint32_t o_smem_offset_w = o_smem.template get_permuted_offset<UPCAST_STRIDE_FINAL_O>(
-          warp_idx_in_wg * 16 + lane_idx / 4, warpgroup_idx * NUM_MMA_D_CKV + mma_d * 2);
-      ((uint32_t*)(o_smem.base + o_smem_offset_w))[lane_idx % 4] = o_frag_f16[0];
-      ((uint32_t*)(o_smem.base + o_smem_offset_w + 8 * UPCAST_STRIDE_FINAL_O))[lane_idx % 4] =
-          o_frag_f16[1];
-      ((uint32_t*)(o_smem.base + (o_smem_offset_w ^ 0x1)))[lane_idx % 4] = o_frag_f16[2];
-      ((uint32_t*)(o_smem.base + (o_smem_offset_w ^ 0x1) +
-                   8 * UPCAST_STRIDE_FINAL_O))[lane_idx % 4] = o_frag_f16[3];
-#endif
     }
 
     // step 1. smem to gmem
@@ -794,7 +800,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
   DTypeKV* ckv = params.ckv;
   DTypeKV* kpe = params.kpe;
   IdType* kv_indices = params.kv_indices;
-  float* partial_o = params.partial_o;
+  DTypeO* partial_o = params.partial_o;
   float* partial_lse = params.partial_lse;
   DTypeO* final_o = params.final_o;
   float* final_lse = params.final_lse;

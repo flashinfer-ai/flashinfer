@@ -441,11 +441,14 @@ __device__ __forceinline__ void normalize_d_(typename KTraits::SharedStorage* sm
 }
 
 template <typename KTraits>
-__device__ __forceinline__ void write_o(
-    typename KTraits::SharedStorage* smem_storage, const uint32_t stage_counter,
-    typename KTraits::DTypeO* final_o, float* final_lse, float* partial_o, float* partial_lse,
-    float(*o_frag), float* m, float* d, const uint32_t o_stride_n, const uint32_t o_stride_h,
-    const uint32_t q_len, const uint32_t packed_offset, const uint_fastdiv& num_heads) {
+__device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_storage,
+                                        const uint32_t stage_counter,
+                                        typename KTraits::DTypeO* final_o, float* final_lse,
+                                        typename KTraits::DTypeO* partial_o, float* partial_lse,
+                                        float(*o_frag), float* m, float* d,
+                                        const uint32_t o_stride_n, const uint32_t o_stride_h,
+                                        const uint32_t q_len, const uint32_t packed_offset,
+                                        const uint_fastdiv& num_heads) {
   using DTypeO = typename KTraits::DTypeO;
   constexpr uint32_t NUM_MMA_D_CKV = KTraits::NUM_MMA_D_CKV;
   constexpr uint32_t HEAD_DIM_CKV = KTraits::HEAD_DIM_CKV;
@@ -457,10 +460,41 @@ __device__ __forceinline__ void write_o(
   o_smem[0] = smem_storage->kv_o_smem[stage_counter % KTraits::NUM_STAGES].o;
   o_smem[1] = smem_storage->kv_o_smem[(stage_counter + 1) % KTraits::NUM_STAGES].o;
 
+  // step 0. rmem to smem
+#pragma unroll
+  for (uint32_t k = 0; k < HEAD_DIM_CKV / 32; ++k) {
+    uint32_t o_frag_f16[8 / 2];
+    vec_cast<DTypeO, float>::cast<8>((DTypeO*)o_frag_f16, &o_frag[k * 8]);
+    uint32_t o_smem_offset_w = get_swizzle_offset<KTraits::SWIZZLE_MODE_O, UPCAST_STRIDE_FINAL_O>(
+        (warp_idx_in_wg % 2) * 16 + lane_idx % 16,
+        (warp_group_idx - 1) * NUM_MMA_D_CKV + k * 2 + lane_idx / 16);
+    o_smem[warp_idx_in_wg / 2].template stmatrix_m8n8x4(o_smem_offset_w, o_frag_f16);
+  }
+
   if (partial_o != nullptr) {
     // NOTE(Zihao): o_smem is not used if write to partial_o, and we can avoid the barrier
-    barrier_arrive(KTraits::NUM_COPY_THREADS + KTraits::NUM_MMA_THREADS, NamedBarriers::kBarrierO);
     // write to partial_o
+
+#pragma unroll
+    for (uint32_t j = 0; j < 4; ++j) {
+      uint32_t q_idx = (packed_offset + warp_idx_in_wg * 16 + 4 * j + lane_idx / 8) / num_heads;
+      DTypeO* o_final_ptr =
+          final_o + (packed_offset + warp_idx_in_wg * 16 + 4 * j + lane_idx / 8) * HEAD_DIM_CKV +
+          (warp_group_idx - 1) * (HEAD_DIM_CKV / 2) + (lane_idx % 8) * upcast_size<DTypeO>();
+      uint32_t o_smem_offset_w = get_swizzle_offset<KTraits::SWIZZLE_MODE_O, UPCAST_STRIDE_FINAL_O>(
+          (warp_idx_in_wg % 2) * 16 + 4 * j + lane_idx / 8,
+          (warp_group_idx - 1) * NUM_MMA_D_CKV + lane_idx % 8);
+#pragma unroll
+      for (uint32_t k = 0; k < HEAD_DIM_CKV / 128; ++k) {
+        if (q_idx < q_len) {
+          o_smem[warp_idx_in_wg / 2].template store_128b(o_smem_offset_w, o_final_ptr);
+        }
+        o_final_ptr += 8 * upcast_size<DTypeO>();
+        o_smem_offset_w += 64;
+      }
+    }
+    barrier_arrive(KTraits::NUM_COPY_THREADS + KTraits::NUM_MMA_THREADS, NamedBarriers::kBarrierO);
+
 #pragma unroll
     for (uint32_t j = 0; j < 2; ++j) {
       uint32_t q_idx = (packed_offset + warp_idx_in_wg * 16 + 8 * j + lane_idx / 4) / num_heads;
@@ -469,49 +503,8 @@ __device__ __forceinline__ void write_o(
             math::ptx_log2(d[j]) + float(m[j]);
       }
     }
-
-#pragma unroll
-    for (uint32_t j = 0; j < 2; ++j) {
-      uint32_t q_idx = (packed_offset + warp_idx_in_wg * 16 + 8 * j + lane_idx / 4) / num_heads;
-#pragma unroll
-      for (uint32_t k = 0; k < HEAD_DIM_CKV / 32; ++k) {
-        if (q_idx < q_len) {
-          *reinterpret_cast<float2*>(
-              partial_o +
-              ((blockIdx.x * 4 + warp_idx_in_wg) * 16 + 8 * j + lane_idx / 4) * HEAD_DIM_CKV +
-              (warp_group_idx - 1) * (HEAD_DIM_CKV / 2) + k * 16 + (lane_idx % 4) * 2) =
-              *reinterpret_cast<float2*>(&o_frag[k * 8 + j * 2]);
-          *reinterpret_cast<float2*>(
-              partial_o +
-              ((blockIdx.x * 4 + warp_idx_in_wg) * 16 + 8 * j + lane_idx / 4) * HEAD_DIM_CKV +
-              (warp_group_idx - 1) * (HEAD_DIM_CKV / 2) + k * 16 + 8 + (lane_idx % 4) * 2) =
-              *reinterpret_cast<float2*>(&o_frag[k * 8 + 4 + j * 2]);
-        }
-      }
-    }
   } else {
     // write to final_o
-    if (final_lse) {
-#pragma unroll
-      for (uint32_t j = 0; j < 2; ++j) {
-        uint32_t q, r;
-        num_heads.divmod(packed_offset + warp_idx_in_wg * 16 + 8 * j + lane_idx / 4, q, r);
-        if (lane_idx % 4 == 0 && q < q_len) {
-          final_lse[q * num_heads + r] = math::ptx_log2(d[j]) + float(m[j]);
-        }
-      }
-    }
-
-    // step 0. rmem to smem
-#pragma unroll
-    for (uint32_t k = 0; k < HEAD_DIM_CKV / 32; ++k) {
-      uint32_t o_frag_f16[8 / 2];
-      vec_cast<DTypeO, float>::cast<8>((DTypeO*)o_frag_f16, &o_frag[k * 8]);
-      uint32_t o_smem_offset_w = get_swizzle_offset<KTraits::SWIZZLE_MODE_O, UPCAST_STRIDE_FINAL_O>(
-          (warp_idx_in_wg % 2) * 16 + lane_idx % 16,
-          (warp_group_idx - 1) * NUM_MMA_D_CKV + k * 2 + lane_idx / 16);
-      o_smem[warp_idx_in_wg / 2].template stmatrix_m8n8x4(o_smem_offset_w, o_frag_f16);
-    }
 
 // step 1. smem to gmem
 #pragma unroll
@@ -534,6 +527,16 @@ __device__ __forceinline__ void write_o(
       }
     }
     barrier_arrive(KTraits::NUM_COPY_THREADS + KTraits::NUM_MMA_THREADS, NamedBarriers::kBarrierO);
+    if (final_lse) {
+#pragma unroll
+      for (uint32_t j = 0; j < 2; ++j) {
+        uint32_t q, r;
+        num_heads.divmod(packed_offset + warp_idx_in_wg * 16 + 8 * j + lane_idx / 4, q, r);
+        if (lane_idx % 4 == 0 && q < q_len) {
+          final_lse[q * num_heads + r] = math::ptx_log2(d[j]) + float(m[j]);
+        }
+      }
+    }
   }
 }
 
@@ -586,7 +589,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
   DTypeKV* ckv = params.ckv;
   DTypeKV* kpe = params.kpe;
   IdType* kv_indices = params.kv_indices;
-  float* partial_o = params.partial_o;
+  DTypeO* partial_o = params.partial_o;
   float* partial_lse = params.partial_lse;
   DTypeO* final_o = params.final_o;
   float* final_lse = params.final_lse;

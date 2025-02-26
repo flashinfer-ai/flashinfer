@@ -435,6 +435,7 @@ def test_batch_mla_page_attention(
     q = torch.cat([q_nope, q_pe], dim=-1)
     o_ref, lse_ref = attention_ref(batch_size, q, k, v, causal, sm_scale)
     lse_ref = lse_ref.flatten(0, 1)
+    print(o, o_ref)
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
     if kv_len != 0:
         torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)

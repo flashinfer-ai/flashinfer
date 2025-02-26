@@ -95,7 +95,7 @@ void BatchMLAPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int
         params.final_lse =
             maybe_lse.has_value() ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
         params.partial_o =
-            GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.partial_o_offset);
+            GetPtrFromBaseOffset<DTypeO>(float_buffer_ptr, plan_info.partial_o_offset);
         params.partial_lse =
             GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.partial_lse_offset);
 
