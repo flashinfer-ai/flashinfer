@@ -989,7 +989,9 @@ struct MLAPlanInfo {
   int64_t partial_indptr_offset;
   int64_t merge_packed_offset_start_offset;
   int64_t merge_packed_offset_end_offset;
-  int64_t merge_indptr_offset;
+  int64_t merge_partial_packed_offset_start_offset;
+  int64_t merge_partial_packed_offset_end_offset;
+  int64_t merge_partial_stride_offset;
   int64_t q_len_offset;
   int64_t kv_len_offset;
   int64_t q_start_offset;
@@ -1007,7 +1009,9 @@ struct MLAPlanInfo {
             partial_indptr_offset,
             merge_packed_offset_start_offset,
             merge_packed_offset_end_offset,
-            merge_indptr_offset,
+            merge_partial_packed_offset_start_offset,
+            merge_partial_packed_offset_end_offset,
+            merge_partial_stride_offset,
             q_len_offset,
             kv_len_offset,
             q_start_offset,
@@ -1019,9 +1023,9 @@ struct MLAPlanInfo {
   }
 
   void FromVector(const std::vector<int64_t>& vec) {
-    if (vec.size() != 16) {
+    if (vec.size() != 18) {
       std::ostringstream err_msg;
-      err_msg << "MLAPlanInfo::FromVector: vec.size() should be 12, but got " << vec.size();
+      err_msg << "MLAPlanInfo::FromVector: vec.size() should be 18, but got " << vec.size();
       FLASHINFER_ERROR(err_msg.str());
     }
     num_blks_x = vec[0];
@@ -1031,15 +1035,17 @@ struct MLAPlanInfo {
     partial_indptr_offset = vec[4];
     merge_packed_offset_start_offset = vec[5];
     merge_packed_offset_end_offset = vec[6];
-    merge_indptr_offset = vec[7];
-    q_len_offset = vec[8];
-    kv_len_offset = vec[9];
-    q_start_offset = vec[10];
-    kv_start_offset = vec[11];
-    kv_end_offset = vec[12];
-    work_indptr_offset = vec[13];
-    partial_o_offset = vec[14];
-    partial_lse_offset = vec[15];
+    merge_partial_packed_offset_start_offset = vec[7];
+    merge_partial_packed_offset_end_offset = vec[8];
+    merge_partial_stride_offset = vec[9];
+    q_len_offset = vec[10];
+    kv_len_offset = vec[11];
+    q_start_offset = vec[12];
+    kv_start_offset = vec[13];
+    kv_end_offset = vec[14];
+    work_indptr_offset = vec[15];
+    partial_o_offset = vec[16];
+    partial_lse_offset = vec[17];
   }
 };
 
@@ -1098,7 +1104,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
       total_kv_lens += effective_kv_len;
     }
   }
-  int kv_len_limit = ceil_div(std::max(ceil_div(total_kv_lens, num_clusters), 1L), 512L) * 512L;
+  int kv_len_limit = ceil_div(std::max(ceil_div(total_kv_lens, num_clusters), 1L), 256L) * 256L;
 
   // step 1. load-balancing scheduling algorithm
   MinHeap cluster_cost_heap(num_clusters);
@@ -1111,11 +1117,12 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
       cluster_kv_end(num_clusters, std::vector<IdType>()),
       cluster_partial_indptr(num_clusters, std::vector<IdType>());
 
-  std::vector<IdType> merge_packed_offset_start(num_clusters, 0),
-      merge_packed_offset_end(num_clusters, 0), merge_indptr(num_clusters + 1, 0);
+  std::vector<IdType> merge_packed_offset_start(num_sm, 0), merge_packed_offset_end(num_sm, 0),
+      merge_partial_packed_offset_start(num_sm, 0), merge_partial_packed_offset_end(num_sm, 0),
+      merge_partial_stride(num_sm, 0);
 
+  int merge_cta_counter = 0;
   int partial_o_nnz = 0;
-  int split_kv_count = 0;
 
   for (auto& [i, qo_len, kv_len] : idx_qo_kv_len_vec) {
     int packed_qo_len = qo_len * num_heads;
@@ -1126,13 +1133,38 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
                                  : kv_len;
       int kv_start = 0;
       bool split_kv = remaining_len > kv_len_limit;
+      int row_tile_size = std::min(cluster_tile_q, packed_qo_len - qo_tile_idx * cluster_tile_q);
       if (split_kv) {
-        merge_indptr[split_kv_count] = partial_o_nnz;
-        merge_packed_offset_start[split_kv_count] =
-            qo_indptr_h[i] * num_heads + qo_tile_idx * cluster_tile_q;
-        merge_packed_offset_end[split_kv_count] =
-            qo_indptr_h[i] * num_heads +
-            std::min((qo_tile_idx + 1) * cluster_tile_q, packed_qo_len);
+        /*
+         * Proof(Zihao): merge_cta_counter <= num_sm (num_sm == num_clusters * cluster_size)
+         *
+         * Precondition:
+         * 1. kv_len_limit * num_clusters >= total_kv_lens == sum(remaining_len)
+         * 2. num_qo_chunks <= max((remaining_len * cluster_size) // kv_len_limit, 1)
+         * 3. num_qo_tiles_requires_split <= num_clusters
+
+         * Implication:
+         * 1. sum(num_qo_chunks) <= max(sum(remaining_len) * cluster_size / kv_len_limit,
+         num_qo_tiles_requires_split)
+         * 2. sum(num_qo_chunks) <= max(cluster_size * num_clusters, num_qo_tiles_requires_split)
+         */
+        int num_qo_chunks = std::max(remaining_len * cluster_size / kv_len_limit, 1);
+        // row_chunk_size * num_qo_chunks >= row_tile_size
+        int row_chunk_size = ceil_div(row_tile_size, num_qo_chunks);
+        int current_q_tile_end =
+            std::min(cluster_tile_q, packed_qo_len - qo_tile_idx * cluster_tile_q);
+        for (int offset_start = 0; offset_start < row_tile_size; offset_start += row_chunk_size) {
+          merge_packed_offset_start[merge_cta_counter] =
+              qo_indptr_h[i] * num_heads + qo_tile_idx * cluster_tile_q + offset_start;
+          merge_packed_offset_end[merge_cta_counter] =
+              qo_indptr_h[i] * num_heads + qo_tile_idx * cluster_tile_q +
+              std::min(offset_start + row_chunk_size, current_q_tile_end);
+          merge_partial_packed_offset_start[merge_cta_counter] = partial_o_nnz + offset_start;
+          merge_partial_packed_offset_end[merge_cta_counter] =
+              partial_o_nnz + ceil_div(remaining_len, kv_len_limit) * row_tile_size;
+          merge_partial_stride[merge_cta_counter] = row_tile_size;
+          merge_cta_counter++;
+        }
       }
       bool zero_kv_len = (remaining_len == 0);
       while (remaining_len > 0 || zero_kv_len) {
@@ -1146,7 +1178,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
         cluster_kv_indptr[cluster_idx].push_back(kv_indptr_h[i]);
         if (split_kv) {
           cluster_partial_indptr[cluster_idx].push_back(partial_o_nnz);
-          partial_o_nnz += std::min(packed_qo_len - qo_tile_idx * cluster_tile_q, cluster_tile_q);
+          partial_o_nnz += row_tile_size;
         } else {
           cluster_partial_indptr[cluster_idx].push_back(-1);
         }
@@ -1157,10 +1189,12 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
         kv_start += actual_len;
         if (zero_kv_len) break;
       }
-      split_kv_count += int(split_kv);
     }
   }
-  merge_indptr[split_kv_count] = partial_o_nnz;
+
+  FLASHINFER_CHECK(merge_cta_counter <= num_sm,
+                   "Internal Error: merge_cta_counter should be less than or equal to num_sm, "
+                   "please report this bug to the developers");
 
   int max_total_num_works = 16384;  // NOTE(Zihao): adjust it later
 
@@ -1186,11 +1220,15 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
   plan_info.partial_indptr_offset = int_allocator.aligned_alloc_offset(
       sizeof(IdType) * max_total_num_works, 16, "mla_partial_indptr");
   plan_info.merge_packed_offset_start_offset = int_allocator.aligned_alloc_offset(
-      sizeof(IdType) * num_clusters, 16, "mla_merge_packed_offset_start");
+      sizeof(IdType) * num_sm, 16, "mla_merge_packed_offset_start");
   plan_info.merge_packed_offset_end_offset = int_allocator.aligned_alloc_offset(
-      sizeof(IdType) * num_clusters, 16, "mla_merge_packed_offset_end");
-  plan_info.merge_indptr_offset = int_allocator.aligned_alloc_offset(
-      sizeof(IdType) * (num_clusters + 1), 16, "mla_merge_indptr");
+      sizeof(IdType) * num_sm, 16, "mla_merge_packed_offset_end");
+  plan_info.merge_partial_packed_offset_start_offset = int_allocator.aligned_alloc_offset(
+      sizeof(IdType) * num_sm, 16, "mla_merge_partial_packed_offset_start");
+  plan_info.merge_partial_packed_offset_end_offset = int_allocator.aligned_alloc_offset(
+      sizeof(IdType) * num_sm, 16, "mla_merge_partial_packed_offset_end");
+  plan_info.merge_partial_stride_offset =
+      int_allocator.aligned_alloc_offset(sizeof(IdType) * num_sm, 16, "mla_merge_partial_stride");
   plan_info.q_len_offset =
       int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "mla_q_len");
   plan_info.kv_len_offset =
@@ -1214,8 +1252,12 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
       page_locked_int_buffer, plan_info.merge_packed_offset_start_offset);
   IdType* cluster_merge_packed_offset_end_h = GetPtrFromBaseOffset<IdType>(
       page_locked_int_buffer, plan_info.merge_packed_offset_end_offset);
-  IdType* cluster_merge_indptr_h =
-      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.merge_indptr_offset);
+  IdType* cluster_merge_partial_packed_offset_start_h = GetPtrFromBaseOffset<IdType>(
+      page_locked_int_buffer, plan_info.merge_partial_packed_offset_start_offset);
+  IdType* cluster_merge_partial_packed_offset_end_h = GetPtrFromBaseOffset<IdType>(
+      page_locked_int_buffer, plan_info.merge_partial_packed_offset_end_offset);
+  IdType* cluster_merge_partial_stride_h =
+      GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.merge_partial_stride_offset);
   IdType* cluster_q_len_h =
       GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.q_len_offset);
   IdType* cluster_kv_len_h =
@@ -1236,7 +1278,12 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
             cluster_merge_packed_offset_start_h);
   std::copy(merge_packed_offset_end.begin(), merge_packed_offset_end.end(),
             cluster_merge_packed_offset_end_h);
-  std::copy(merge_indptr.begin(), merge_indptr.end(), cluster_merge_indptr_h);
+  std::copy(merge_partial_packed_offset_start.begin(), merge_partial_packed_offset_start.end(),
+            cluster_merge_partial_packed_offset_start_h);
+  std::copy(merge_partial_packed_offset_end.begin(), merge_partial_packed_offset_end.end(),
+            cluster_merge_partial_packed_offset_end_h);
+  std::copy(merge_partial_stride.begin(), merge_partial_stride.end(),
+            cluster_merge_partial_stride_h);
   std::copy(q_len_vec.begin(), q_len_vec.end(), cluster_q_len_h);
   std::copy(kv_len_vec.begin(), kv_len_vec.end(), cluster_kv_len_h);
   std::copy(q_start_vec.begin(), q_start_vec.end(), cluster_q_start_h);

@@ -86,8 +86,12 @@ void BatchMLAPagedAttentionSM90Run(at::Tensor float_workspace_buffer,
             int_buffer_ptr, plan_info.merge_packed_offset_start_offset);
         params.merge_packed_offset_end =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_packed_offset_end_offset);
-        params.merge_indptr =
-            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_indptr_offset);
+        params.merge_partial_packed_offset_start = GetPtrFromBaseOffset<IdType>(
+            int_buffer_ptr, plan_info.merge_partial_packed_offset_start_offset);
+        params.merge_partial_packed_offset_end = GetPtrFromBaseOffset<IdType>(
+            int_buffer_ptr, plan_info.merge_partial_packed_offset_end_offset);
+        params.merge_partial_stride =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_partial_stride_offset);
         params.final_o = static_cast<DTypeO*>(o.data_ptr());
         params.final_lse =
             maybe_lse.has_value() ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
