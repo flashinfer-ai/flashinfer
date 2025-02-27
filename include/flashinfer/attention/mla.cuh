@@ -713,7 +713,8 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
     for (uint32_t j = 0; j < 4; ++j) {
       uint32_t q_idx = (packed_offset + warp_idx_in_wg * 16 + 4 * j + lane_idx / 8) / num_heads;
       DTypeO* o_partial_ptr =
-          partial_o + (packed_offset + warp_idx_in_wg * 16 + 4 * j + lane_idx / 8) * HEAD_DIM_CKV +
+          partial_o +
+          ((blockIdx.x * 4 + warp_idx_in_wg) * 16 + 4 * j + lane_idx / 8) * HEAD_DIM_CKV +
           warpgroup_idx * (HEAD_DIM_CKV / 2) + (lane_idx % 8) * upcast_size<DTypeO>();
 #pragma unroll
       for (uint32_t mma_d = 0; mma_d < NUM_MMA_D_CKV / 8; ++mma_d) {

@@ -479,7 +479,8 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
     for (uint32_t j = 0; j < 4; ++j) {
       uint32_t q_idx = (packed_offset + warp_idx_in_wg * 16 + 4 * j + lane_idx / 8) / num_heads;
       DTypeO* o_partial_ptr =
-          partial_o + (packed_offset + warp_idx_in_wg * 16 + 4 * j + lane_idx / 8) * HEAD_DIM_CKV +
+          partial_o +
+          ((blockIdx.x * 4 + warp_idx_in_wg) * 16 + 4 * j + lane_idx / 8) * HEAD_DIM_CKV +
           (warp_group_idx - 1) * (HEAD_DIM_CKV / 2) + (lane_idx % 8) * upcast_size<DTypeO>();
       uint32_t o_smem_offset_w = get_swizzle_offset<KTraits::SWIZZLE_MODE_O, UPCAST_STRIDE_FINAL_O>(
           (warp_idx_in_wg % 2) * 16 + 4 * j + lane_idx / 8,
