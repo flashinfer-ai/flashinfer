@@ -498,7 +498,7 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
     for (uint32_t j = 0; j < 2; ++j) {
       uint32_t q_idx = (packed_offset + warp_idx_in_wg * 16 + 8 * j + lane_idx / 4) / num_heads;
       if (lane_idx % 4 == 0 && q_idx < q_len) {
-        partial_lse[packed_offset + warp_idx_in_wg * 16 + 8 * j + lane_idx / 4] =
+        partial_lse[(blockIdx.x * 4 + warp_idx_in_wg) * 16 + 8 * j + lane_idx / 4] =
             math::ptx_log2(d[j]) + float(m[j]);
       }
     }
