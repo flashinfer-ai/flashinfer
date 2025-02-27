@@ -494,6 +494,7 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
         o_smem_offset_w += 64;
       }
     }
+    barrier_arrive(KTraits::NUM_COPY_THREADS + KTraits::NUM_MMA_THREADS, NamedBarriers::kBarrierO);
 
 #pragma unroll
     for (uint32_t j = 0; j < 2; ++j) {
@@ -503,8 +504,6 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
             math::ptx_log2(d[j]) + float(m[j]);
       }
     }
-
-    barrier_arrive(KTraits::NUM_COPY_THREADS + KTraits::NUM_MMA_THREADS, NamedBarriers::kBarrierO);
   } else {
     // write to final_o
 
@@ -528,6 +527,8 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
         o_smem_offset_w += 64;
       }
     }
+    barrier_arrive(KTraits::NUM_COPY_THREADS + KTraits::NUM_MMA_THREADS, NamedBarriers::kBarrierO);
+
     if (final_lse) {
 #pragma unroll
       for (uint32_t j = 0; j < 2; ++j) {
@@ -538,8 +539,6 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
         }
       }
     }
-
-    barrier_arrive(KTraits::NUM_COPY_THREADS + KTraits::NUM_MMA_THREADS, NamedBarriers::kBarrierO);
   }
 }
 
