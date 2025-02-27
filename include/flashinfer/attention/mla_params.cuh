@@ -32,7 +32,7 @@ struct MLAParams {
   DTypeQ* q_pe;
   DTypeKV* ckv;
   DTypeKV* kpe;
-  float* partial_o;
+  DTypeO* partial_o;
   float* partial_lse;
   DTypeO* final_o;
   float* final_lse;
