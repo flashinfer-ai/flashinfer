@@ -275,6 +275,7 @@ __device__ __forceinline__ void compute_mla_qk(typename KTraits::SharedStorage* 
 template <typename KTraits>
 __device__ __forceinline__ void compute_mla_pv(typename KTraits::SharedStorage* smem_storage,
                                                const uint32_t stage_idx, float* o_frag) {
+  barrier_sync(KTraits::NUM_MMA_THREADS, NamedBarriers::kConsumerSync);
   const uint32_t lane_idx = cutlass::canonical_lane_idx();
   const uint32_t warp_idx_in_wg = cutlass::canonical_warp_idx() % 4;
   const uint32_t warp_group_idx = cutlass::canonical_warp_group_idx();
@@ -400,7 +401,6 @@ __device__ __forceinline__ void write_p_rmem_smem(typename KTraits::SharedStorag
             (warp_group_idx - 1) * NUM_MMA_KV + mma_kv * 2 + lane_idx / 16);
     p_smem.stmatrix_m8n8x4(p_smem_offset_w, p_frag + mma_kv * 4);
   }
-  barrier_sync(KTraits::NUM_MMA_THREADS, NamedBarriers::kConsumerSync);
 }
 
 template <typename KTraits>
@@ -780,7 +780,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
       }
 
       // loop without mask
-#pragma unroll 1
+#pragma unroll 2
       for (; kv_tile_idx > NUM_STAGES; --kv_tile_idx) {
         auto smem_pipe_read_kv_cur = smem_pipe_read_kv;
         ++smem_pipe_read_kv;
