@@ -17,8 +17,8 @@
 
 #include <cuda_fp8.h>
 
-#include <stdexcept>
 #include <algorithm>
+#include <stdexcept>
 
 #include "utils.h"
 
