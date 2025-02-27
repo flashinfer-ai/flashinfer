@@ -478,8 +478,8 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
 #pragma unroll
     for (uint32_t j = 0; j < 4; ++j) {
       uint32_t q_idx = (packed_offset + warp_idx_in_wg * 16 + 4 * j + lane_idx / 8) / num_heads;
-      DTypeO* o_final_ptr =
-          final_o + (packed_offset + warp_idx_in_wg * 16 + 4 * j + lane_idx / 8) * HEAD_DIM_CKV +
+      DTypeO* o_partial_ptr =
+          partial_o + (packed_offset + warp_idx_in_wg * 16 + 4 * j + lane_idx / 8) * HEAD_DIM_CKV +
           (warp_group_idx - 1) * (HEAD_DIM_CKV / 2) + (lane_idx % 8) * upcast_size<DTypeO>();
       uint32_t o_smem_offset_w = get_swizzle_offset<KTraits::SWIZZLE_MODE_O, UPCAST_STRIDE_FINAL_O>(
           (warp_idx_in_wg % 2) * 16 + 4 * j + lane_idx / 8,
@@ -487,13 +487,12 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
 #pragma unroll
       for (uint32_t k = 0; k < HEAD_DIM_CKV / 128; ++k) {
         if (q_idx < q_len) {
-          o_smem[warp_idx_in_wg / 2].template store_128b(o_smem_offset_w, o_final_ptr);
+          o_smem[warp_idx_in_wg / 2].template store_128b(o_smem_offset_w, o_partial_ptr);
         }
-        o_final_ptr += 8 * upcast_size<DTypeO>();
+        o_partial_ptr += 8 * upcast_size<DTypeO>();
         o_smem_offset_w += 64;
       }
     }
-    barrier_arrive(KTraits::NUM_COPY_THREADS + KTraits::NUM_MMA_THREADS, NamedBarriers::kBarrierO);
 
 #pragma unroll
     for (uint32_t j = 0; j < 2; ++j) {
@@ -503,6 +502,8 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
             math::ptx_log2(d[j]) + float(m[j]);
       }
     }
+
+    barrier_arrive(KTraits::NUM_COPY_THREADS + KTraits::NUM_MMA_THREADS, NamedBarriers::kBarrierO);
   } else {
     // write to final_o
 
@@ -526,7 +527,6 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
         o_smem_offset_w += 64;
       }
     }
-    barrier_arrive(KTraits::NUM_COPY_THREADS + KTraits::NUM_MMA_THREADS, NamedBarriers::kBarrierO);
     if (final_lse) {
 #pragma unroll
       for (uint32_t j = 0; j < 2; ++j) {
@@ -537,6 +537,8 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
         }
       }
     }
+
+    barrier_arrive(KTraits::NUM_COPY_THREADS + KTraits::NUM_MMA_THREADS, NamedBarriers::kBarrierO);
   }
 }
 

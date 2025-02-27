@@ -41,7 +41,6 @@ struct StandardAttention : AttentionVariantBase {
 template <uint32_t NUM_STAGES, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV, uint32_t HEAD_DIM_CKV,
           uint32_t HEAD_DIM_KPE, typename DTypeQ, typename DTypeKV, typename DTypeO>
 struct SharedStorageQKVO {
-  static constexpr uint32_t MERGE_SMEM_STAGES = 8;
   union {
     struct {
       alignas(16) DTypeQ q_smem_nope[CTA_TILE_Q * HEAD_DIM_CKV];
@@ -56,10 +55,6 @@ struct SharedStorageQKVO {
       };
     };
     alignas(16) DTypeO o_smem[CTA_TILE_Q * HEAD_DIM_CKV];
-    struct {
-      DTypeO merge_o_smem[MERGE_SMEM_STAGES][HEAD_DIM_CKV];
-      float merge_lse_smem[];
-    };
   };
 };
 
@@ -645,7 +640,7 @@ __device__ void DevicePersistentMergeStates(
     uint32_t q, r;
     num_heads.divmod(final_packed_offset, q, r);
     state_t<VEC_SIZE> st;
-#pragma unroll 4
+#pragma unroll 8
     for (uint32_t partial_packed_offset = partial_offset_start + local_packed_offset;
          partial_packed_offset < partial_offset_end; partial_packed_offset += stride) {
       vec_t<float, VEC_SIZE> o_partial;
@@ -655,7 +650,7 @@ __device__ void DevicePersistentMergeStates(
       lse_partial = partial_lse[partial_packed_offset];
       st.merge(o_partial, lse_partial, 1);
     }
-    // st.normalize();
+    st.normalize();
     st.o.cast_store(final_o +
                     (q * o_stride_n + r * o_stride_h + (thread_id % NUM_THRS_PER_ROW) * VEC_SIZE));
     if (final_lse) {
