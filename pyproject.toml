@@ -23,7 +23,7 @@ urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 dynamic = ["dependencies", "version"]
 
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools", "versioneer[toml]==0.29"]
 build-backend = "custom_backend"
 backend-path = ["."]
 
@@ -58,7 +58,6 @@ include-package-data = false
 "flashinfer.data" = [
     "csrc/**",
     "include/**",
-    "version.txt"
 ]
 "flashinfer.data.cutlass" = [
     "include/**",
@@ -115,3 +114,14 @@ ignore = [
     # Return te negated condition directly
     "SIM103",
 ]
+
+[tool.versioneer]
+VCS = "git"
+parentdir_prefix = "flashinfer-"
+style = "pep440"
+tag_prefix = "v"
+versionfile_build = "flashinfer/_version.py"
+versionfile_source = "flashinfer/_version.py"
+
+[tool.black]
+exclude = "flashinfer/_version.py"
