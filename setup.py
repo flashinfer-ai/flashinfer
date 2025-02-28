@@ -23,6 +23,7 @@ import sys
 from pathlib import Path
 
 import setuptools
+import versioneer
 
 root = Path(__file__).parent.resolve()
 gen_dir = root / "csrc" / "generated"
@@ -58,11 +59,7 @@ def write_if_different(path: Path, content: str) -> None:
 
 
 def get_version():
-    package_version = (root / "version.txt").read_text().strip()
-    local_version = os.environ.get("FLASHINFER_LOCAL_VERSION")
-    if local_version is None:
-        return package_version
-    return f"{package_version}+{local_version}"
+    return versioneer.get_version()
 
 
 def generate_build_meta(aot_build_meta: dict) -> None:
@@ -285,9 +282,9 @@ if enable_aot:
         ]
 
 setuptools.setup(
-    version=get_version(),
+    version=versioneer.get_version(),
+    cmdclass=versioneer.get_cmdclass(cmdclass),
     ext_modules=ext_modules,
-    cmdclass=cmdclass,
     install_requires=install_requires,
     options={"bdist_wheel": {"py_limited_api": "cp38"}},
 )
