@@ -551,7 +551,7 @@ __device__ __forceinline__ auto get_block_coord(const Params& params, const uint
 }
 
 template <typename KTraits>
-__device__ __forceinline__ convert_s_to_p(float* s_frag, uint32_t* p_frag) {
+__device__ __forceinline__ void convert_s_to_p(float* s_frag, uint32_t* p_frag) {
 #pragma unroll
   for (uint32_t i = 0; i < KTraits::NUM_REGS_S_FRAG / 8; ++i) {
     vec_cast<typename KTraits::DTypeKV, float>::cast<8>(
