@@ -1,0 +1,19 @@
+FROM nvidia/cuda:12.8.0-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Update package lists and install system dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    git
+
+# Install python
+COPY install/install_python.sh /install/install_python.sh
+RUN bash /install/install_python.sh
+
+# Install torch
+COPY install/install_torch.sh /install/install_torch.sh
+RUN bash /install/install_torch.sh
+
+# Set home directory
+WORKDIR /workspace
