@@ -19,22 +19,21 @@ void sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tenso
                          bool deterministic, int64_t cuda_stream);
 
 void top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
-                               at::Tensor success, std::optional<at::Tensor> maybe_top_p_arr,
-                               double top_p_val, bool deterministic, int64_t cuda_stream);
+                               std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
+                               bool deterministic, int64_t cuda_stream);
 
 void top_k_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
-                               at::Tensor success, std::optional<at::Tensor> maybe_top_k_arr,
-                               int64_t top_k_val, bool deterministic, int64_t cuda_stream);
+                               std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
+                               bool deterministic, int64_t cuda_stream);
 
 void min_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
                                std::optional<at::Tensor> maybe_min_p_arr, double min_p_val,
                                bool deterministic, int64_t cuda_stream);
 
 void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples,
-                                     at::Tensor samples, at::Tensor success,
-                                     std::optional<at::Tensor> maybe_top_k_arr, double top_k_val,
-                                     std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
-                                     bool deterministic, int64_t cuda_stream);
+                                     at::Tensor samples, std::optional<at::Tensor> maybe_top_k_arr,
+                                     double top_k_val, std::optional<at::Tensor> maybe_top_p_arr,
+                                     double top_p_val, bool deterministic, int64_t cuda_stream);
 
 void top_p_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
                         std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,

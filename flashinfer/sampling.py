@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 from types import SimpleNamespace
-from typing import Optional, Tuple, Union
+from typing import Optional, Union
 
 import torch
 
@@ -80,7 +80,7 @@ def get_sampling_module():
             maybe_top_p_arr: Optional[torch.Tensor],
             top_p_val: float,
             deterministic: bool,
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        ) -> torch.Tensor:
             with probs.device as device:
                 probs = probs.float()
                 uniform_samples = uniform_samples.float()
@@ -88,18 +88,16 @@ def get_sampling_module():
                     maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
                 )
                 samples = torch.empty(probs.size(0), dtype=torch.int32, device=device)
-                success = torch.empty(probs.size(0), dtype=torch.bool, device=device)
                 module.top_p_sampling_from_probs(
                     probs,
                     uniform_samples,
                     samples,
-                    success,
                     maybe_top_p_arr,
                     top_p_val,
                     deterministic,
                     get_cuda_stream(device),
                 )
-                return samples, success
+                return samples
 
         @register_fake_op("flashinfer::top_p_sampling_from_probs")
         def _fake_top_p_sampling_from_probs(
@@ -108,10 +106,9 @@ def get_sampling_module():
             maybe_top_p_arr: Optional[torch.Tensor],
             top_p_val: float,
             deterministic: bool,
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        ) -> torch.Tensor:
             sample = torch.empty(probs.size(0), dtype=torch.int32, device=probs.device)
-            success = torch.empty(probs.size(0), dtype=torch.bool, device=probs.device)
-            return sample, success
+            return sample
 
         # torch library for top_k_sampling_from_probs
 
@@ -122,7 +119,7 @@ def get_sampling_module():
             maybe_top_k_arr: Optional[torch.Tensor],
             top_k_val: int,
             deterministic: bool,
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        ) -> torch.Tensor:
             with probs.device as device:
                 probs = probs.float()
                 uniform_samples = uniform_samples.float()
@@ -130,18 +127,16 @@ def get_sampling_module():
                     maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
                 )
                 samples = torch.empty(probs.size(0), dtype=torch.int32, device=device)
-                success = torch.empty(probs.size(0), dtype=torch.bool, device=device)
                 module.top_k_sampling_from_probs(
                     probs,
                     uniform_samples,
                     samples,
-                    success,
                     maybe_top_k_arr,
                     top_k_val,
                     deterministic,
                     get_cuda_stream(device),
                 )
-                return samples, success
+                return samples
 
         @register_fake_op("flashinfer::top_k_sampling_from_probs")
         def _fake_top_k_sampling_from_probs(
@@ -150,10 +145,9 @@ def get_sampling_module():
             maybe_top_k_arr: Optional[torch.Tensor],
             top_k_val: int,
             deterministic: bool,
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        ) -> torch.Tensor:
             sample = torch.empty(probs.size(0), dtype=torch.int32, device=probs.device)
-            success = torch.empty(probs.size(0), dtype=torch.bool, device=probs.device)
-            return sample, success
+            return sample
 
         # torch library for min_p_sampling_from_probs
 
@@ -196,7 +190,7 @@ def get_sampling_module():
             maybe_top_p_arr: Optional[torch.Tensor],
             top_p_val: float,
             deterministic: bool,
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        ) -> torch.Tensor:
             with probs.device as device:
                 probs = probs.float()
                 uniform_samples = uniform_samples.float()
@@ -207,12 +201,10 @@ def get_sampling_module():
                     maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
                 )
                 samples = torch.empty(probs.size(0), dtype=torch.int32, device=device)
-                success = torch.empty(probs.size(0), dtype=torch.bool, device=device)
                 module.top_k_top_p_sampling_from_probs(
                     probs,
                     uniform_samples,
                     samples,
-                    success,
                     maybe_top_k_arr,
                     top_k_val,
                     maybe_top_p_arr,
@@ -220,7 +212,7 @@ def get_sampling_module():
                     deterministic,
                     get_cuda_stream(device),
                 )
-                return samples, success
+                return samples
 
         @register_fake_op("flashinfer::top_k_top_p_sampling_from_probs")
         def _fake_top_k_top_p_sampling_from_probs(
@@ -231,10 +223,9 @@ def get_sampling_module():
             maybe_top_p_arr: Optional[torch.Tensor],
             top_p_val: float,
             deterministic: bool,
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        ) -> torch.Tensor:
             sample = torch.empty(probs.size(0), dtype=torch.int32, device=probs.device)
-            success = torch.empty(probs.size(0), dtype=torch.bool, device=probs.device)
-            return sample, success
+            return sample
 
         # torch library for top_p_renorm_probs
 
@@ -468,7 +459,7 @@ def top_p_sampling_from_probs(
     top_p: Union[torch.Tensor, float],
     deterministic: bool = True,
     check_nan: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     r"""Fused GPU kernel for top-p sampling (nucleus sampling) from probabilities,
     this operator implements GPU-based rejection sampling without explicit sorting.
 
@@ -496,9 +487,6 @@ def top_p_sampling_from_probs(
     -------
     samples: torch.Tensor
         Sampled categories, shape ``(batch_size,)``.
-    success: torch.Tensor
-        Whether the sampling is successful within ``max_top_p_rounds`` rounds,
-        shape ``(batch_size,)``.
 
     Examples
     --------
@@ -518,11 +506,10 @@ def top_p_sampling_from_probs(
             [0.2522, 0.1602, 0.2346, 0.1532, 0.2000],
             [0.1543, 0.3182, 0.2062, 0.0958, 0.2255]], device='cuda:0')
     >>> uniform_samples = torch.rand(max_top_p_rounds, batch_size).to(0)
-    >>> samples, success = flashinfer.sampling.top_p_sampling_from_probs(norm_prob, uniform_samples, top_p)
+    >>> samples = flashinfer.sampling.top_p_sampling_from_probs(norm_prob, uniform_samples, top_p)
     >>> samples
     tensor([1, 2, 0, 4], device='cuda:0', dtype=torch.int32)
-    >>> success
-    tensor([True, True, True, True], device='cuda:0')
+
 
     Note
     ----
@@ -550,7 +537,7 @@ def top_k_sampling_from_probs(
     top_k: Union[torch.Tensor, int],
     deterministic: bool = True,
     check_nan: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     r"""Fused GPU kernel for top-k sampling from probabilities,
     this operator implements GPU-based rejection sampling without explicit sorting.
 
@@ -578,9 +565,6 @@ def top_k_sampling_from_probs(
     -------
     samples: torch.Tensor
         Sampled categories, shape ``(batch_size,)``.
-    success: torch.Tensor
-        Whether the sampling is successful within ``max_top_k_rounds`` rounds,
-        shape ``(batch_size,)``.
 
     Examples
     --------
@@ -600,11 +584,10 @@ def top_k_sampling_from_probs(
             [0.2522, 0.1602, 0.2346, 0.1532, 0.2000],
             [0.1543, 0.3182, 0.2062, 0.0958, 0.2255]], device='cuda:0')
     >>> uniform_samples = torch.rand(max_top_k_rounds, batch_size).to(0)
-    >>> samples, success = flashinfer.sampling.top_k_sampling_from_probs(norm_prob, uniform_samples, top_k)
+    >>> samples = flashinfer.sampling.top_k_sampling_from_probs(norm_prob, uniform_samples, top_k)
     >>> samples
     tensor([3, 3, 0, 1], device='cuda:0', dtype=torch.int32)
-    >>> success
-    tensor([True, True, True, True], device='cuda:0')
+
 
     Note
     ----
@@ -710,7 +693,7 @@ def top_k_top_p_sampling_from_logits(
     filter_apply_order: str = "top_k_first",
     deterministic: bool = True,
     check_nan: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     r"""Fused GPU kernel for top-k and top-p sampling from pre-softmax logits,
 
     this operator implements GPU-based rejection sampling without explicit sorting.
@@ -747,9 +730,6 @@ def top_k_top_p_sampling_from_logits(
     -------
     samples: torch.Tensor
         Sampled categories, shape ``(batch_size,)``.
-    success: torch.Tensor
-        Whether the sampling is successful within ``max_top_k_rounds`` rounds,
-        shape ``(batch_size,)``.
 
     Examples
     --------
@@ -769,11 +749,9 @@ def top_k_top_p_sampling_from_logits(
             [-0.4934,  0.2415, -0.2316,  0.0418, -0.2516],
             [ 0.8599, -0.3097, -0.3957,  0.8034, -0.6216]], device='cuda:0')
     >>> uniform_samples = torch.rand(max_rounds, batch_size).to(0)
-    >>> samples, success = flashinfer.sampling.top_k_top_p_sampling_from_logits(logits, uniform_samples, top_k, top_p)
+    >>> samples = flashinfer.sampling.top_k_top_p_sampling_from_logits(logits, uniform_samples, top_k, top_p)
     >>> samples
     tensor([0, 2, 1, 3], device='cuda:0', dtype=torch.int32
-    >>> success
-    tensor([True, True, True, True], device='cuda:0')
     >>> probs = torch.softmax(logits, dim=-1)
     >>> probs
     tensor([[0.4788, 0.3085, 0.1716, 0.0085, 0.0327],
@@ -782,8 +760,6 @@ def top_k_top_p_sampling_from_logits(
         [0.3613, 0.1122, 0.1029, 0.3415, 0.0821]], device='cuda:0')
     >>> samples
     tensor([0, 2, 1, 3], device='cuda:0', dtype=torch.int32)
-    >>> success
-    tensor([True, True, True, True], device='cuda:0')
 
     Note
     ----
@@ -827,7 +803,7 @@ def top_k_top_p_sampling_from_probs(
     filter_apply_order: str = "top_k_first",
     deterministic: bool = True,
     check_nan: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     r"""Fused GPU kernel for top-k and top-p sampling from probabilities,
 
     this operator implements GPU-based rejection sampling without explicit sorting.
@@ -864,9 +840,6 @@ def top_k_top_p_sampling_from_probs(
     -------
     samples: torch.Tensor
         Sampled categories, shape ``(batch_size,)``.
-    success: torch.Tensor
-        Whether the sampling is successful within ``max_top_k_rounds`` rounds,
-        shape ``(batch_size,)``.
 
     Examples
     --------
@@ -887,11 +860,9 @@ def top_k_top_p_sampling_from_probs(
             [0.2522, 0.1602, 0.2346, 0.1532, 0.2000],
             [0.1543, 0.3182, 0.2062, 0.0958, 0.2255]], device='cuda:0')
     >>> uniform_samples = torch.rand(max_rounds, batch_size).to(0)
-    >>> samples, success = flashinfer.sampling.top_k_top_p_sampling_from_probs(norm_prob, uniform_samples, top_k, top_p)
+    >>> samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(norm_prob, uniform_samples, top_k, top_p)
     >>> samples
     tensor([3, 3, 0, 1], device='cuda:0', dtype=torch.int32)
-    >>> success
-    tensor([True, True, True, True], device='cuda:0')
 
     Note
     ----

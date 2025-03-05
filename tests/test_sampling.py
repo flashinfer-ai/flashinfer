@@ -57,10 +57,9 @@ def test_top_p_sampling(batch_size, vocab_size, p):
     num_trails = 1000
     for _ in range(num_trails):
         uniform_samples.uniform_()
-        samples, success = flashinfer.sampling.top_p_sampling_from_probs(
+        samples = flashinfer.sampling.top_p_sampling_from_probs(
             normalized_prob, uniform_samples, p
         )
-        assert torch.all(success)
         assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
         assert torch.all(mask[torch.arange(batch_size), samples] == 1)
 
@@ -85,10 +84,9 @@ def test_top_k_sampling(batch_size, vocab_size, k):
     num_trails = 1000
     for _ in range(num_trails):
         uniform_samples.uniform_()
-        samples, success = flashinfer.sampling.top_k_sampling_from_probs(
+        samples = flashinfer.sampling.top_k_sampling_from_probs(
             normalized_prob, uniform_samples, k
         )
-        assert torch.all(success)
         assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
         assert torch.all(mask[torch.arange(batch_size), samples] == 1), normalized_prob[
             torch.arange(batch_size), samples
@@ -161,14 +159,13 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
     num_trails = 1000
     for _ in range(num_trails):
         uniform_samples.uniform_()
-        samples, success = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+        samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
             normalized_prob,
             uniform_samples,
             top_k_tensor,
             top_p_tensor,
             filter_apply_order="joint",
         )
-        assert torch.all(success)
         assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
         assert torch.all(mask[torch.arange(batch_size), samples] == 1), normalized_prob[
             torch.arange(batch_size), samples
@@ -183,21 +180,17 @@ def test_top_k_top_p_sampling_from_probs_logits_alignment(batch_size, vocab_size
     torch.manual_seed(42)
     logits = torch.randn(batch_size, vocab_size).to(0) * 5
     uniform_samples = torch.empty(32, batch_size).to(0)
-    samples, success = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+    samples = flashinfer.sampling.top_k_top_p_sampling_from_logits(
         logits, uniform_samples, k, p, filter_apply_order="top_k_first"
     )
-    samples_ref, success_ref = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+    samples_ref = flashinfer.sampling.top_k_top_p_sampling_from_probs(
         torch.softmax(logits, dim=-1),
         uniform_samples,
         k,
         p,
         filter_apply_order="top_k_first",
     )
-    assert torch.all(
-        samples == samples_ref
-    ), f"{samples} != {samples_ref}, {success}, {success_ref}"
-    assert torch.all(success)
-    assert torch.all(success_ref)
+    assert torch.all(samples == samples_ref)
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
@@ -214,16 +207,14 @@ def test_top_k_top_p_joint_sampling_from_logits(batch_size, vocab_size, p):
     else:
         raise ValueError("p not recognized")
 
-    samples, success = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+    samples = flashinfer.sampling.top_k_top_p_sampling_from_logits(
         logits, uniform_samples, k, p, filter_apply_order="joint"
     )
 
-    samples_ref, success_ref = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+    samples_ref = flashinfer.sampling.top_k_top_p_sampling_from_probs(
         torch.softmax(logits, dim=-1), uniform_samples, k, p, filter_apply_order="joint"
     )
     assert torch.all(samples == samples_ref)
-    assert torch.all(success)
-    assert torch.all(success_ref)
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
@@ -335,7 +326,7 @@ def test_chain_speculative_sampling(
         target_onehot_prob.scatter_(2, target_token_ids.unsqueeze(-1), 1)
 
     # NOTE(Zihao): this is a very simple test that only checks whether output is valid or not.
-    for trials in range(10):    # noqa: B007
+    for trials in range(10):  # noqa: B007
         uniform_samples.uniform_()
         accepted_num = torch.zeros(batch_size, dtype=torch.int32).to(0)
         emitted_num = torch.zeros(batch_size, dtype=torch.int32).to(0)

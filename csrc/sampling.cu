@@ -40,8 +40,8 @@ void sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tenso
 }
 
 void top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
-                               at::Tensor success, std::optional<at::Tensor> maybe_top_p_arr,
-                               double top_p_val, bool deterministic, int64_t cuda_stream) {
+                               std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
+                               bool deterministic, int64_t cuda_stream) {
   CHECK_INPUT(probs);
   CHECK_INPUT(uniform_samples);
   auto device = probs.device();
@@ -57,7 +57,7 @@ void top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at:
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaError_t status = sampling::TopPSamplingFromProb<float, int>(
       static_cast<float*>(probs.data_ptr()), static_cast<float*>(uniform_samples.data_ptr()),
-      static_cast<int*>(samples.data_ptr()), static_cast<bool*>(success.data_ptr()),
+      static_cast<int*>(samples.data_ptr()),
       has_top_p_arr ? static_cast<float*>(maybe_top_p_arr->data_ptr()) : nullptr, batch_size,
       top_p_val, vocab_size, max_top_p_rounds, deterministic, stream);
   TORCH_CHECK(status == cudaSuccess, "TopPSamplingFromProbs failed with error code " +
@@ -65,8 +65,8 @@ void top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at:
 }
 
 void top_k_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
-                               at::Tensor success, std::optional<at::Tensor> maybe_top_k_arr,
-                               int64_t top_k_val, bool deterministic, int64_t cuda_stream) {
+                               std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
+                               bool deterministic, int64_t cuda_stream) {
   CHECK_INPUT(probs);
   CHECK_INPUT(uniform_samples);
   auto device = probs.device();
@@ -82,7 +82,7 @@ void top_k_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at:
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaError_t status = sampling::TopKSamplingFromProb<float, int>(
       static_cast<float*>(probs.data_ptr()), static_cast<float*>(uniform_samples.data_ptr()),
-      static_cast<int*>(samples.data_ptr()), static_cast<bool*>(success.data_ptr()),
+      static_cast<int*>(samples.data_ptr()),
       has_top_k_arr ? static_cast<float*>(maybe_top_k_arr->data_ptr()) : nullptr, batch_size,
       top_k_val, vocab_size, max_top_k_rounds, deterministic, stream);
   TORCH_CHECK(status == cudaSuccess, "TopKSamplingFromProbs failed with error code " +
@@ -114,10 +114,9 @@ void min_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at:
 }
 
 void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples,
-                                     at::Tensor samples, at::Tensor success,
-                                     std::optional<at::Tensor> maybe_top_k_arr, double top_k_val,
-                                     std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
-                                     bool deterministic, int64_t cuda_stream) {
+                                     at::Tensor samples, std::optional<at::Tensor> maybe_top_k_arr,
+                                     double top_k_val, std::optional<at::Tensor> maybe_top_p_arr,
+                                     double top_p_val, bool deterministic, int64_t cuda_stream) {
   CHECK_INPUT(probs);
   CHECK_INPUT(uniform_samples);
   auto device = probs.device();
@@ -136,8 +135,8 @@ void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_sample
       static_cast<float*>(probs.data_ptr()), static_cast<float*>(uniform_samples.data_ptr()),
       has_top_k_arr ? static_cast<int*>(maybe_top_k_arr->data_ptr()) : nullptr,
       has_top_p_arr ? static_cast<float*>(maybe_top_p_arr->data_ptr()) : nullptr,
-      static_cast<int*>(samples.data_ptr()), static_cast<bool*>(success.data_ptr()), batch_size,
-      top_k_val, top_p_val, vocab_size, max_rounds, deterministic, stream);
+      static_cast<int*>(samples.data_ptr()), batch_size, top_k_val, top_p_val, vocab_size,
+      max_rounds, deterministic, stream);
   TORCH_CHECK(status == cudaSuccess, "TopKTopPSamplingFromProbs failed with error code " +
                                          std::string(cudaGetErrorString(status)));
 }

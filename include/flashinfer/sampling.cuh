@@ -283,8 +283,8 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
 __global__ void TopKSamplingFromProbKernel(DType* probs, DType* uniform_samples, IdType* output,
-                                           bool* success, IdType* top_k_arr, uint32_t top_k_val,
-                                           uint32_t d, uint32_t max_top_k_rounds) {
+                                           IdType* top_k_arr, uint32_t top_k_val, uint32_t d,
+                                           uint32_t max_top_k_rounds) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[bx];
@@ -296,14 +296,14 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, DType* uniform_samples,
       SamplingTempStorage<DType, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>&>(smem_sampling);
 
   vec_t<DType, VEC_SIZE> probs_vec;
-  DType aggregate;
-  DType q = DType(1);
-  DType pivot = DType(0);
+  float aggregate;
+  float q = 1;
+  double low = 0, high = 1;
   IdType sampled_id;
   for (uint32_t round = 0; round < max_top_k_rounds; ++round) {
     temp_storage.sampled_id = d - 1;
     __syncthreads();
-    DType u = uniform_samples[round * batch_size + bx] * q;
+    float u = uniform_samples[round * batch_size + bx] * q;
     aggregate = DType(0);
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
       probs_vec.fill(DType(0));
@@ -313,55 +313,70 @@ __global__ void TopKSamplingFromProbKernel(DType* probs, DType* uniform_samples,
 
       DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
                              DETERMINISTIC, DType>(
-          i, d, [&](DType x) { return x > pivot; }, u, probs_vec, aggregate, &temp_storage);
+          i, d, [&](DType x) { return x > low; }, u, probs_vec, aggregate, &temp_storage);
       if (aggregate > u) {
         break;
       }
     }
     __syncthreads();
     sampled_id = temp_storage.sampled_id;
-    pivot = max(pivot, probs[bx * d + sampled_id]);
+    double pivot_0 = probs[bx * d + sampled_id];
+    double pivot_1 = (pivot_0 + high) / 2;
 
-    Pair<DType> aggregate_gt_pivot{DType(0), 0};
+    Pair<DType> aggregate_gt_pivot_0{DType(0), 0}, aggregate_gt_pivot_1{DType(0), 0};
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
       probs_vec.fill(DType(0));
       if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
         probs_vec.load(probs + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
       }
 
-      Pair<DType> probs_gt_pivot[VEC_SIZE];
+      Pair<DType> probs_gt_pivot_0[VEC_SIZE], probs_gt_pivot_1[VEC_SIZE];
 #pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-        probs_gt_pivot[j] = {(probs_vec[j] > pivot) ? probs_vec[j] : DType(0),
-                             (probs_vec[j] > pivot && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
+        probs_gt_pivot_0[j] = {
+            (probs_vec[j] > pivot_0) ? probs_vec[j] : DType(0),
+            (probs_vec[j] > pivot_0 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
+        probs_gt_pivot_1[j] = {
+            (probs_vec[j] > pivot_1) ? probs_vec[j] : DType(0),
+            (probs_vec[j] > pivot_1 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
       }
 
-      aggregate_gt_pivot += BlockReduce<Pair<DType>, BLOCK_THREADS, REDUCE_ALGORITHM>(
-                                temp_storage.block_prim.reduce_pair)
-                                .Sum<VEC_SIZE>(probs_gt_pivot);
+      aggregate_gt_pivot_0 += BlockReduce<Pair<DType>, BLOCK_THREADS, REDUCE_ALGORITHM>(
+                                  temp_storage.block_prim.reduce_pair)
+                                  .Sum<VEC_SIZE>(probs_gt_pivot_0);
       if (tx == 0) {
-        temp_storage.block_aggregate.pair = aggregate_gt_pivot;
+        temp_storage.block_aggregate.pair = aggregate_gt_pivot_0;
       }
       __syncthreads();
+      aggregate_gt_pivot_0 = temp_storage.block_aggregate.pair;
+
+      aggregate_gt_pivot_1 += BlockReduce<Pair<DType>, BLOCK_THREADS, REDUCE_ALGORITHM>(
+                                  temp_storage.block_prim.reduce_pair)
+                                  .Sum<VEC_SIZE>(probs_gt_pivot_1);
+      if (tx == 0) {
+        temp_storage.block_aggregate.pair = aggregate_gt_pivot_1;
+      }
+      __syncthreads();
+      aggregate_gt_pivot_1 = temp_storage.block_aggregate.pair;
     }
-    q = temp_storage.block_aggregate.pair.value;
-    if (temp_storage.block_aggregate.pair.count < k) {
+    if (aggregate_gt_pivot_0.count < k) {
+      // case 1: pivot_0 accepted
       break;
+    }
+    if (aggregate_gt_pivot_1.count < k) {
+      // case 2: pivot_0 rejected, pivot_1 accepted
+      low = pivot_0;
+      high = pivot_1;
+      q = aggregate_gt_pivot_0.value;
+    } else {
+      // case 3: pivot_0 rejected, pivot_1 rejected
+      low = pivot_1;
+      q = aggregate_gt_pivot_1.value;
     }
   }
   __syncthreads();
   if (tx == 0) {
     output[bx] = sampled_id;
-    if (temp_storage.block_aggregate.pair.count >= k) {
-      // failed to sample within MAX_TOP_P_ROUNDS
-      if (success != nullptr) {
-        success[bx] = false;
-      }
-    } else {
-      if (success != nullptr) {
-        success[bx] = true;
-      }
-    }
   }
 }
 
@@ -369,8 +384,8 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
 __global__ void TopPSamplingFromProbKernel(DType* probs, DType* uniform_samples, IdType* output,
-                                           bool* success, IdType* row_indices, float* top_p_arr,
-                                           float top_p_val, uint32_t d, uint32_t max_top_p_rounds) {
+                                           IdType* row_indices, float* top_p_arr, float top_p_val,
+                                           uint32_t d, uint32_t max_top_p_rounds) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   float top_p = (top_p_arr == nullptr) ? top_p_val : top_p_arr[bx];
@@ -386,7 +401,7 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
   vec_t<DType, VEC_SIZE> probs_vec;
   DType aggregate;
   DType q = DType(1);
-  DType pivot = DType(0);
+  double low = 0, high = 1;
   IdType sampled_id;
   for (uint32_t round = 0; round < max_top_p_rounds; ++round) {
     temp_storage.sampled_id = d - 1;
@@ -401,53 +416,64 @@ __global__ void TopPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
 
       DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
                              DETERMINISTIC, DType>(
-          i, d, [&](DType x) { return x > pivot; }, u, probs_vec, aggregate, &temp_storage);
+          i, d, [&](DType x) { return x > low; }, u, probs_vec, aggregate, &temp_storage);
       if (aggregate > u) {
         break;
       }
     }
     __syncthreads();
     sampled_id = temp_storage.sampled_id;
-    pivot = max(pivot, probs[row_idx * d + sampled_id]);
+    double pivot_0 = probs[row_idx * d + sampled_id];
+    double pivot_1 = (pivot_0 + high) / 2;
 
-    DType aggregate_gt_pivot = DType(0);
+    float aggregate_gt_pivot_0 = 0, aggregate_gt_pivot_1 = 0;
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
       probs_vec.fill(DType(0));
       if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
         probs_vec.load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
       }
 
-      DType probs_gt_pivot[VEC_SIZE];
+      DType probs_gt_pivot_0[VEC_SIZE], probs_gt_pivot_1[VEC_SIZE];
 #pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-        probs_gt_pivot[j] = (probs_vec[j] > pivot) ? probs_vec[j] : DType(0);
+        probs_gt_pivot_0[j] = (probs_vec[j] > pivot_0) ? probs_vec[j] : DType(0);
+        probs_gt_pivot_1[j] = (probs_vec[j] > pivot_1) ? probs_vec[j] : DType(0);
       }
 
-      aggregate_gt_pivot += BlockReduce<DType, BLOCK_THREADS>(temp_storage.block_prim.reduce)
-                                .Sum<VEC_SIZE>(probs_gt_pivot);
+      aggregate_gt_pivot_0 += BlockReduce<DType, BLOCK_THREADS>(temp_storage.block_prim.reduce)
+                                  .Sum<VEC_SIZE>(probs_gt_pivot_0);
       if (tx == 0) {
-        temp_storage.block_aggregate.value = aggregate_gt_pivot;
+        temp_storage.block_aggregate.value = aggregate_gt_pivot_0;
       }
       __syncthreads();
+      aggregate_gt_pivot_0 = temp_storage.block_aggregate.value;
+
+      aggregate_gt_pivot_1 += BlockReduce<DType, BLOCK_THREADS>(temp_storage.block_prim.reduce)
+                                  .Sum<VEC_SIZE>(probs_gt_pivot_1);
+      if (tx == 0) {
+        temp_storage.block_aggregate.value = aggregate_gt_pivot_1;
+      }
+      __syncthreads();
+      aggregate_gt_pivot_1 = temp_storage.block_aggregate.value;
     }
-    q = temp_storage.block_aggregate.value;
-    if (float(q) < top_p) {
+    if (aggregate_gt_pivot_0 < top_p) {
+      // case 1: pivot_0 accepted
       break;
+    }
+    if (aggregate_gt_pivot_1 < top_p) {
+      // case 2: pivot_0 rejected, pivot_1 accepted
+      low = pivot_0;
+      high = pivot_1;
+      q = aggregate_gt_pivot_0;
+    } else {
+      // case 3: pivot_0 rejected, pivot_1 rejected
+      low = pivot_1;
+      q = aggregate_gt_pivot_1;
     }
   }
   __syncthreads();
   if (tx == 0) {
     output[bx] = sampled_id;
-    if (float(q) >= top_p) {
-      // failed to sample within MAX_TOP_P_ROUNDS
-      if (success != nullptr) {
-        success[bx] = false;
-      }
-    } else {
-      if (success != nullptr) {
-        success[bx] = true;
-      }
-    }
   }
 }
 
@@ -537,8 +563,8 @@ template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           typename DType, typename IdType>
 __global__ void TopKTopPSamplingFromProbKernel(DType* probs, DType* uniform_samples,
                                                IdType* top_k_arr, DType* top_p_arr, IdType* output,
-                                               bool* success, IdType top_k_val, DType top_p_val,
-                                               uint32_t d, uint32_t max_rounds) {
+                                               IdType top_k_val, DType top_p_val, uint32_t d,
+                                               uint32_t max_rounds) {
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   IdType k = top_k_arr == nullptr ? top_k_val : top_k_arr[bx];
@@ -551,15 +577,15 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, DType* uniform_samp
       SamplingTempStorage<DType, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>&>(smem_sampling);
 
   vec_t<DType, VEC_SIZE> probs_vec;
-  DType aggregate;
-  DType q = DType(1);
-  DType pivot = DType(0);
+  float aggregate;
+  float q = 1;
+  double low = 0, high = 1;
   IdType sampled_id;
   for (uint32_t round = 0; round < max_rounds; ++round) {
     temp_storage.sampled_id = d - 1;
     __syncthreads();
-    DType u = uniform_samples[round * batch_size + bx] * q;
-    aggregate = DType(0);
+    float u = uniform_samples[round * batch_size + bx] * q;
+    aggregate = 0;
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
       probs_vec.fill(DType(0));
       if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
@@ -568,55 +594,64 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, DType* uniform_samp
 
       DeviceSamplingFromProb<VEC_SIZE, BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM,
                              DETERMINISTIC, DType>(
-          i, d, [&](DType x) { return x > pivot; }, u, probs_vec, aggregate, &temp_storage);
+          i, d, [&](DType x) { return x > low; }, u, probs_vec, aggregate, &temp_storage);
       if (aggregate > u) {
         break;
       }
     }
     __syncthreads();
     sampled_id = temp_storage.sampled_id;
-    pivot = max(pivot, probs[bx * d + sampled_id]);
+    double pivot_0 = probs[bx * d + sampled_id];
+    double pivot_1 = (pivot_0 + high) / 2;
 
-    Pair<DType> aggregate_gt_pivot{DType(0), 0};
+    float aggregate_gt_pivot_0 = 0, aggregate_gt_pivot_1 = 0;
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
       probs_vec.fill(DType(0));
       if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
         probs_vec.load(probs + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
       }
 
-      Pair<DType> probs_gt_pivot[VEC_SIZE];
+      float probs_gt_pivot_0[VEC_SIZE], probs_gt_pivot_1[VEC_SIZE];
 #pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-        probs_gt_pivot[j] = {(probs_vec[j] > pivot) ? probs_vec[j] : DType(0),
-                             (probs_vec[j] > pivot && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
+        probs_gt_pivot_0[j] = (probs_vec[j] > pivot_0) ? probs_vec[j] : DType(0);
+        probs_gt_pivot_1[j] = (probs_vec[j] > pivot_1) ? probs_vec[j] : DType(0);
       }
 
-      aggregate_gt_pivot += BlockReduce<Pair<DType>, BLOCK_THREADS, REDUCE_ALGORITHM>(
-                                temp_storage.block_prim.reduce_pair)
-                                .Sum<VEC_SIZE>(probs_gt_pivot);
+      aggregate_gt_pivot_0 += BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce)
+                                  .Sum<VEC_SIZE>(probs_gt_pivot_0);
       if (tx == 0) {
-        temp_storage.block_aggregate.pair = aggregate_gt_pivot;
+        temp_storage.block_aggregate.value = aggregate_gt_pivot_0;
       }
       __syncthreads();
+      aggregate_gt_pivot_0 = temp_storage.block_aggregate.value;
+
+      aggregate_gt_pivot_1 += BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce)
+                                  .Sum<VEC_SIZE>(probs_gt_pivot_1);
+      if (tx == 0) {
+        temp_storage.block_aggregate.value = aggregate_gt_pivot_1;
+      }
+      __syncthreads();
+      aggregate_gt_pivot_1 = temp_storage.block_aggregate.value;
     }
-    q = temp_storage.block_aggregate.pair.value;
-    if (temp_storage.block_aggregate.pair.count < k && float(q) < p) {
+    if (aggregate_gt_pivot_0 < k) {
+      // case 1: pivot_0 accepted
       break;
+    }
+    if (aggregate_gt_pivot_1 < k) {
+      // case 2: pivot_0 rejected, pivot_1 accepted
+      low = pivot_0;
+      high = pivot_1;
+      q = aggregate_gt_pivot_0;
+    } else {
+      // case 3: pivot_0 rejected, pivot_1 rejected
+      low = pivot_1;
+      q = aggregate_gt_pivot_1;
     }
   }
   __syncthreads();
   if (tx == 0) {
     output[bx] = sampled_id;
-    if (temp_storage.block_aggregate.pair.count >= k || float(q) >= p) {
-      // failed to sample within MAX_TOP_P_ROUNDS
-      if (success != nullptr) {
-        success[bx] = false;
-      }
-    } else {
-      if (success != nullptr) {
-        success[bx] = true;
-      }
-    }
   }
 }
 
@@ -663,8 +698,8 @@ cudaError_t ParallelSamplingFromProb(T* probs, T* uniform_samples, IdType* outpu
 }
 
 template <typename T, typename IdType>
-cudaError_t TopKSamplingFromProb(T* probs, T* uniform_samples, IdType* output, bool* success,
-                                 T* top_k_arr, uint32_t batch_size, uint32_t top_k_val, uint32_t d,
+cudaError_t TopKSamplingFromProb(T* probs, T* uniform_samples, IdType* output, T* top_k_arr,
+                                 uint32_t batch_size, uint32_t top_k_val, uint32_t d,
                                  uint32_t max_top_k_rounds, bool deterministic,
                                  cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
@@ -675,8 +710,8 @@ cudaError_t TopKSamplingFromProb(T* probs, T* uniform_samples, IdType* output, b
         sizeof(SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs,     &uniform_samples, &output, &success,
-                    &top_k_arr, &top_k_val,       &d,      &max_top_k_rounds};
+    void* args[] = {&probs, &uniform_samples, &output, &top_k_arr, &top_k_val,
+                    &d,     &max_top_k_rounds};
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
@@ -692,8 +727,8 @@ cudaError_t TopKSamplingFromProb(T* probs, T* uniform_samples, IdType* output, b
 }
 
 template <typename T, typename IdType>
-cudaError_t TopPSamplingFromProb(T* probs, T* uniform_samples, IdType* output, bool* success,
-                                 T* top_p_arr, uint32_t batch_size, T top_p_val, uint32_t d,
+cudaError_t TopPSamplingFromProb(T* probs, T* uniform_samples, IdType* output, T* top_p_arr,
+                                 uint32_t batch_size, T top_p_val, uint32_t d,
                                  uint32_t max_top_p_rounds, bool deterministic,
                                  cudaStream_t stream = 0) {
   constexpr uint32_t BLOCK_THREADS = 1024;
@@ -703,7 +738,7 @@ cudaError_t TopPSamplingFromProb(T* probs, T* uniform_samples, IdType* output, b
   dim3 nblks(batch_size);
   dim3 nthrs(BLOCK_THREADS);
   IdType* row_indices_placeholder = nullptr;
-  void* args[] = {&probs,     &uniform_samples, &output, &success,         &row_indices_placeholder,
+  void* args[] = {&probs,     &uniform_samples, &output, &row_indices_placeholder,
                   &top_p_arr, &top_p_val,       &d,      &max_top_p_rounds};
 
   DISPATCH_ALIGNED_VEC_SIZE(
@@ -744,8 +779,8 @@ cudaError_t MinPSamplingFromProb(T* probs, T* uniform_samples, T* min_p_arr, IdT
 
 template <typename T, typename IdType>
 cudaError_t TopKTopPSamplingFromProb(T* probs, T* uniform_samples, IdType* top_k_arr, T* top_p_arr,
-                                     IdType* output, bool* success, uint32_t batch_size,
-                                     IdType top_k_val, T top_p_val, uint32_t d, uint32_t max_rounds,
+                                     IdType* output, uint32_t batch_size, IdType top_k_val,
+                                     T top_p_val, uint32_t d, uint32_t max_rounds,
                                      bool deterministic, cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
@@ -755,8 +790,8 @@ cudaError_t TopKTopPSamplingFromProb(T* probs, T* uniform_samples, IdType* top_k
         sizeof(SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
     dim3 nblks(batch_size);
     dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs,   &uniform_samples, &top_k_arr, &top_p_arr, &output,
-                    &success, &top_k_val,       &top_p_val, &d,         &max_rounds};
+    void* args[] = {&probs,     &uniform_samples, &top_k_arr, &top_p_arr, &output,
+                    &top_k_val, &top_p_val,       &d,         &max_rounds};
 
     DISPATCH_ALIGNED_VEC_SIZE(
         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
@@ -1341,9 +1376,9 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
 
 template <typename T, typename IdType>
 cudaError_t ParallelTopPSamplingFromProb(T* probs, T* uniform_samples, IdType* output,
-                                         bool* success, IdType* row_indices, T* top_p_arr,
-                                         uint32_t batch_size, uint32_t d, uint32_t max_top_p_rounds,
-                                         bool deterministic, cudaStream_t stream = 0) {
+                                         IdType* row_indices, T* top_p_arr, uint32_t batch_size,
+                                         uint32_t d, uint32_t max_top_p_rounds, bool deterministic,
+                                         cudaStream_t stream = 0) {
   constexpr uint32_t BLOCK_THREADS = 1024;
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
@@ -1351,7 +1386,7 @@ cudaError_t ParallelTopPSamplingFromProb(T* probs, T* uniform_samples, IdType* o
   dim3 nblks(batch_size);
   dim3 nthrs(BLOCK_THREADS);
   T top_p_placeholder = 0;
-  void* args[] = {&probs,     &uniform_samples,   &output, &success,         &row_indices,
+  void* args[] = {&probs,     &uniform_samples,   &output, &row_indices,
                   &top_p_arr, &top_p_placeholder, &d,      &max_top_p_rounds};
 
   DISPATCH_ALIGNED_VEC_SIZE(
