@@ -604,49 +604,55 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, DType* uniform_samp
     double pivot_0 = probs[bx * d + sampled_id];
     double pivot_1 = (pivot_0 + high) / 2;
 
-    float aggregate_gt_pivot_0 = 0, aggregate_gt_pivot_1 = 0;
+    Pair<DType> aggregate_gt_pivot_0{DType(0), 0}, aggregate_gt_pivot_1{DType(0), 0};
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
       probs_vec.fill(DType(0));
       if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
         probs_vec.load(probs + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
       }
 
-      float probs_gt_pivot_0[VEC_SIZE], probs_gt_pivot_1[VEC_SIZE];
+      Pair<DType> probs_gt_pivot_0[VEC_SIZE], probs_gt_pivot_1[VEC_SIZE];
 #pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-        probs_gt_pivot_0[j] = (probs_vec[j] > pivot_0) ? probs_vec[j] : DType(0);
-        probs_gt_pivot_1[j] = (probs_vec[j] > pivot_1) ? probs_vec[j] : DType(0);
+        probs_gt_pivot_0[j] = {
+            (probs_vec[j] > pivot_0) ? probs_vec[j] : DType(0),
+            (probs_vec[j] > pivot_0 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
+        probs_gt_pivot_1[j] = {
+            (probs_vec[j] > pivot_1) ? probs_vec[j] : DType(0),
+            (probs_vec[j] > pivot_1 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
       }
 
-      aggregate_gt_pivot_0 += BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce)
-                                  .Sum<VEC_SIZE>(probs_gt_pivot_0);
+      aggregate_gt_pivot_0 +=
+          BlockReduce<Pair<DType>, BLOCK_THREADS>(temp_storage.block_prim.reduce_pair)
+              .Sum<VEC_SIZE>(probs_gt_pivot_0);
       if (tx == 0) {
-        temp_storage.block_aggregate.value = aggregate_gt_pivot_0;
+        temp_storage.block_aggregate.pair = aggregate_gt_pivot_0;
       }
       __syncthreads();
-      aggregate_gt_pivot_0 = temp_storage.block_aggregate.value;
+      aggregate_gt_pivot_0 = temp_storage.block_aggregate.pair;
 
-      aggregate_gt_pivot_1 += BlockReduce<float, BLOCK_THREADS>(temp_storage.block_prim.reduce)
-                                  .Sum<VEC_SIZE>(probs_gt_pivot_1);
+      aggregate_gt_pivot_1 +=
+          BlockReduce<Pair<DType>, BLOCK_THREADS>(temp_storage.block_prim.reduce_pair)
+              .Sum<VEC_SIZE>(probs_gt_pivot_1);
       if (tx == 0) {
-        temp_storage.block_aggregate.value = aggregate_gt_pivot_1;
+        temp_storage.block_aggregate.pair = aggregate_gt_pivot_1;
       }
       __syncthreads();
-      aggregate_gt_pivot_1 = temp_storage.block_aggregate.value;
+      aggregate_gt_pivot_1 = temp_storage.block_aggregate.pair;
     }
-    if (aggregate_gt_pivot_0 < k) {
+    if (aggregate_gt_pivot_0.count < k && aggregate_gt_pivot_0.value < p) {
       // case 1: pivot_0 accepted
       break;
     }
-    if (aggregate_gt_pivot_1 < k) {
+    if (aggregate_gt_pivot_1.count < k && aggregate_gt_pivot_1.value < p) {
       // case 2: pivot_0 rejected, pivot_1 accepted
       low = pivot_0;
       high = pivot_1;
-      q = aggregate_gt_pivot_0;
+      q = aggregate_gt_pivot_0.value;
     } else {
       // case 3: pivot_0 rejected, pivot_1 rejected
       low = pivot_1;
-      q = aggregate_gt_pivot_1;
+      q = aggregate_gt_pivot_1.value;
     }
   }
   __syncthreads();
