@@ -39,41 +39,27 @@
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils
 // These are set at runtime from data in ci/jenkins/docker-images.yml, update
 // image tags in that file
-ci_lint = ''
-ci_gpu = ''
+ci_image = 'flashinfer/flashinfer-ci:latest'
 
-// Parameters to allow overriding (in Jenkins UI), the images
+// Parameters to allow overriding (in Jenkins UI), the image
 // to be used by a given build. When provided, they take precedence
 // over default values above.
 properties([
   parameters([
-    string(name: 'ci_gpu_param', defaultValue: ''),
-    string(name: 'ci_lint_param', defaultValue: ''),
+    string(name: 'ci_image_param', defaultValue: ''),
   ])
 ])
-
-// Placeholders for newly built Docker image names (if rebuild_docker_images
-// is used)
-  built_ci_gpu = null;
-  built_ci_lint = null;
 
 // Global variable assigned during Sanity Check that holds the sha1 which should be
 // merged into the PR in all branches.
 upstream_revision = null
 
 // command to start a docker container
-docker_run = 'docker/bash.sh --env CI --env PLATFORM --env TVM_SHARD_INDEX --env TVM_NUM_SHARDS --env RUN_DISPLAY_URL --env PLATFORM --env SKIP_SLOW_TESTS --env TEST_STEP_NAME'
-docker_build = 'docker/build.sh'
+docker_run = 'docker/bash.sh'
 // timeout in minutes
 max_time = 180
-rebuild_docker_images = false
-
-// s3_bucket = 'tvm-jenkins-artifacts-prod'
-// s3_prefix = "tvm/${env.BRANCH_NAME}/${env.BUILD_NUMBER}"
-
 // Jenkins script root directory
 jenkins_scripts_root = "ci/scripts/jenkins"
-
 
 // General note: Jenkins has limits on the size of a method (or top level code)
 // that are pretty strict, so most usage of groovy methods in these templates
@@ -87,12 +73,6 @@ def init_git() {
   retry(5) {
     checkout scm
   }
-
-  // Add more info about job node
-//   sh (
-//     script: './tests/scripts/task_show_node_info.sh',
-//     label: 'Show executor node info',
-//   )
 
   // Determine merge commit to use for all stages
   if (env.BRANCH_NAME == 'main') {
@@ -111,7 +91,6 @@ def init_git() {
     """,
     label: 'Update git submodules',
   )
-  checkout_trusted_files()
 }
 
 def update_upstream_revision(git_ref) {
@@ -152,76 +131,14 @@ def docker_init(image) {
     label: 'Clean old Docker images',
   )
 
-  if (image.contains("amazonaws.com")) {
-    // If this string is in the image name it's from ECR and needs to be pulled
-    // with the right credentials
-    ecr_pull(image)
-  } else {
-    sh(
-      script: """
-      set -eux
-      . ${jenkins_scripts_root}/retry.sh
-      retry 5 docker pull ${image}
-      """,
-      label: 'Pull docker image',
-    )
-  }
-}
-
-def ecr_pull(full_name) {
-  aws_account_id = sh(
-    returnStdout: true,
-    script: 'aws sts get-caller-identity | grep Account | cut -f4 -d\\"',
-    label: 'Get AWS ID'
-  ).trim()
-
-  try {
-    withEnv([
-      "AWS_ACCOUNT_ID=${aws_account_id}",
-      'AWS_DEFAULT_REGION=us-west-2',
-      "AWS_ECR_REPO=${aws_account_id}.dkr.ecr.us-west-2.amazonaws.com"]) {
-      sh(
-        script: '''
-          set -eux
-          aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ECR_REPO
-        ''',
-        label: 'Log in to ECR'
-      )
-      sh(
-        script: """
-          set -eux
-          . ${jenkins_scripts_root}/retry.sh
-          retry 5 docker pull ${full_name}
-        """,
-        label: 'Pull image from ECR'
-      )
-    }
-  } finally {
-    withEnv([
-      "AWS_ACCOUNT_ID=${aws_account_id}",
-      'AWS_DEFAULT_REGION=us-west-2',
-      "AWS_ECR_REPO=${aws_account_id}.dkr.ecr.us-west-2.amazonaws.com"]) {
-      sh(
-        script: 'docker logout $AWS_ECR_REPO',
-        label: 'Clean up login credentials'
-      )
-    }
-  }
-}
-
-def should_skip_slow_tests(pr_number) {
-  withCredentials([string(
-    credentialsId: 'tvm-bot-jenkins-reader',
-    variable: 'GITHUB_TOKEN',
-  )]) {
-    // Exit code of 1 means run slow tests, exit code of 0 means skip slow tests
-    result = sh (
-      returnStatus: true,
-      script: "./${jenkins_scripts_root}/should_run_slow_tests.py --pr '${pr_number}'",
-      label: 'Check if CI should run slow tests',
-    )
-  }
-  return result == 0
+  sh(
+    script: """
+    set -eux
+    . ${jenkins_scripts_root}/retry.sh
+    retry 5 docker pull ${image}
+    """,
+    label: 'Pull docker image',
+  )
 }
 
 def cancel_previous_build() {
@@ -240,30 +157,6 @@ def is_last_build() {
   def job = Jenkins.instance.getItem(env.JOB_NAME)
   def lastBuild = job.getLastBuild()
   return lastBuild.getNumber() == env.BUILD_NUMBER
-}
-
-def checkout_trusted_files() {
-  // trust everything from branch builds
-  if (env.BRANCH_NAME == null || !env.BRANCH_NAME.startsWith('PR-')) {
-    return;
-  }
-
-  // trust peoople listed in CONTRIBUTING.md
-  grep_code = sh(
-    returnStatus: true,
-    script: "git show '${upstream_revision}:CONTRIBUTORS.md' | grep '@${env.CHANGE_AUTHOR}'",
-    label: 'Check if change is from a contributor',
-  )
-
-  if (grep_code == 1) {
-    // Any scripts that run on the bare host and not inside a Docker container
-    // (especially those that access secrets) should be checked out here so
-    // only trusted versions are used in CI
-    sh(
-      script: "git checkout ${upstream_revision} ${jenkins_scripts_root}/.",
-      label: 'Check out trusted files',
-    )
-  }
 }
 
 def should_skip_ci(pr_number) {
@@ -314,37 +207,16 @@ def check_pr(pr_number) {
 def prepare(node_type) {
   stage('Prepare') {
     node(node_type) {
-      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/prepare") {
+      ws("workspace/exec_${env.EXECUTOR_NUMBER}/flashinfer/prepare") {
         init_git()
 
-        check_pr(env.CHANGE_ID)
-
-        if (env.DETERMINE_DOCKER_IMAGES == 'yes') {
-          sh(
-            script: "./${jenkins_scripts_root}/determine_docker_images.py ci_arm ci_cpu ci_gpu ci_hexagon ci_i386 ci_lint ci_wasm ",
-            label: 'Decide whether to use tlcpack or tlcpackstaging for Docker images',
-          )
-          // Pull image names from the results of should_rebuild_docker.py
-          ci_gpu = sh(
-            script: "cat .docker-image-names/ci_gpu",
-            label: "Find docker image name for ci_gpu",
-            returnStdout: true,
-          ).trim()
-          ci_lint = sh(
-            script: "cat .docker-image-names/ci_lint",
-            label: "Find docker image name for ci_lint",
-            returnStdout: true,
-          ).trim()
-        }
-
-        ci_gpu = params.ci_gpu_param ?: ci_gpu
-        ci_lint = params.ci_lint_param ?: ci_lint
+        // Get image parameter if specified
+        ci_image = params.ci_image_param ?: ci_image
 
         sh (script: """
-          echo "Docker images being used in this build:"
-          echo " ci_gpu = ${ci_gpu}"
-          echo " ci_lint = ${ci_lint}"
-        """, label: 'Docker image names')
+          echo "Docker image being used in this build:"
+          echo " ci_image = ${ci_image}"
+        """, label: 'Docker image name')
 
         is_docs_only_build = sh (
           returnStatus: true,
@@ -352,21 +224,11 @@ def prepare(node_type) {
           label: 'Check for docs only changes',
         )
         skip_ci = should_skip_ci(env.CHANGE_ID)
-        skip_slow_tests = should_skip_slow_tests(env.CHANGE_ID)
-        rebuild_docker_images = sh (
-          returnStatus: true,
-          script: "./${jenkins_scripts_root}/git_change_docker.sh",
-          label: 'Check for any docker changes',
-        )
-
-        if (skip_ci) {
-          // Don't rebuild when skipping CI
-          rebuild_docker_images = false
-        }
       }
     }
   }
 }
+
 def ci_setup(image) {
   sh (
     script: "${docker_run} ${image} ./tests/scripts/task_clear_pytest.sh",
@@ -374,304 +236,193 @@ def ci_setup(image) {
   )
 }
 
-def python_unittest(image) {
-  sh (
-    script: "${docker_run} ${image} ./tests/scripts/task_python_unittest.sh",
-    label: 'Run Python unit tests',
-  )
-}
-
-def make_cpp_tests(image, build_dir) {
-  sh (
-    script: """
-      set -eux
-      ${docker_run} ${image} python3 ./tests/scripts/task_build.py \
-        --sccache-bucket tvm-sccache-prod \
-        --sccache-region us-west-2 \
-        --cmake-target cpptest \
-        --build-dir ${build_dir}
-      """,
-    label: 'Make C++ tests',
-  )
-}
-
-def cpp_unittest(image) {
-  sh (
-    script: "${docker_run} --env CI_NUM_EXECUTORS ${image} ./tests/scripts/task_cpp_unittest.sh",
-    label: 'Run C++ tests',
-  )
-}
-
-cancel_previous_build()
-
-try {
-    prepare('CPU-SMALL-SPOT')
-} catch(Exception ex) {
-  prepare('CPU-SMALL')
-}
 def run_build(node_type) {
   if (!skip_ci) {
     echo 'Begin running node_type ' + node_type
     node(node_type) {
-      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/build-gpu") {
+      ws("workspace/exec_${env.EXECUTOR_NUMBER}/flashinfer/build") {
         init_git()
-        docker_init(ci_gpu)
+        docker_init(ci_image)
         timeout(time: max_time, unit: 'MINUTES') {
-
           withEnv([
             'PLATFORM=gpu',
-            ], {
-            sh "${docker_run} --no-gpu ${ci_gpu} ./tests/scripts/task_config_build_gpu.sh build"
-        sh(
-            script: "./${jenkins_scripts_root}/s3.py --action upload --bucket ${s3_bucket} --prefix ${s3_prefix}/gpu --items build/libtvm.so build/libtvm_runtime.so build/config.cmake build/libtvm_allvisible.so build/3rdparty/libflash_attn/src/libflash_attn.so build/3rdparty/cutlass_fpA_intB_gemm/cutlass_kernels/libfpA_intB_gemm.so",
-            label: 'Upload artifacts to S3',
-          )
-
-
-        // compiler test
-        sh "rm -rf build"
-        sh "${docker_run} --no-gpu ${ci_gpu} ./tests/scripts/task_config_build_gpu_other.sh build"
-        sh(
-            script: "./${jenkins_scripts_root}/s3.py --action upload --bucket ${s3_bucket} --prefix ${s3_prefix}/gpu2 --items build/libtvm.so build/libtvm_runtime.so build/config.cmake",
-            label: 'Upload artifacts to S3',
-          )
+          ], {
+            sh "${docker_run} --no-gpu ${ci_image} ./scripts/build.sh"
           })
         }
       }
     }
     echo 'End running node_type ' + node_type
   } else {
-    Utils.markStageSkippedForConditional('BUILD: GPU')
+    Utils.markStageSkippedForConditional('BUILD')
   }
 }
+
 def build() {
   stage('Build') {
     try {
-        run_build('CPU-SPOT')
+      run_build('CPU-SPOT')
     } catch (Throwable ex) {
-        if (is_last_build()) {
-          // retry if we are currently at last build
-          // mark the current stage as success
-          // and try again via on demand node
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          run_build('CPU')
-        } else {
-          echo 'Exception during SPOT run ' + ex.toString() + ' exit since it is not last build'
-          throw ex
-        }
+      if (is_last_build()) {
+        // retry if we are currently at last build
+        // mark the current stage as success
+        // and try again via on demand node
+        echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
+        currentBuild.result = 'SUCCESS'
+        run_build('CPU')
+      } else {
+        echo 'Exception during SPOT run ' + ex.toString() + ' exit since it is not last build'
+        throw ex
+      }
     }
   }
 }
-build()
 
-
-
-def shard_run_unittest_GPU_1_of_2(node_type) {
-  echo 'Begin running on node_type ' + node_type
+def run_tests(node_type) {
+  echo 'Begin running tests on node_type ' + node_type
   if (!skip_ci && is_docs_only_build != 1) {
     node(node_type) {
-      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/ut-python-gpu") {
-        // NOTE: if exception happens, it will be caught outside
+      ws("workspace/exec_${env.EXECUTOR_NUMBER}/flashinfer/tests") {
         init_git()
-        docker_init(ci_gpu)
+        docker_init(ci_image)
         timeout(time: max_time, unit: 'MINUTES') {
           withEnv([
             'PLATFORM=gpu',
-            'TEST_STEP_NAME=unittest: GPU',
-            'TVM_NUM_SHARDS=2',
-            'TVM_SHARD_INDEX=0',
-            "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
-            sh(
-                  script: "./${jenkins_scripts_root}/s3.py --action download --bucket ${s3_bucket} --prefix ${s3_prefix}/gpu",
-                  label: 'Download artifacts from S3',
-                )
-
-              ci_setup(ci_gpu)
-              sh (
-                script: "${docker_run} ${ci_gpu} ./tests/scripts/task_python_unittest_gpuonly.sh",
-                label: 'Run Python GPU unit tests',
-              )
-              sh (
-                script: "${docker_run} ${ci_gpu} ./tests/scripts/task_python_integration_gpuonly.sh",
-                label: 'Run Python GPU integration tests',
-              )
+            'TEST_STEP_NAME=unittest',
+        ], {
+            ci_setup(ci_image)
+            sh (
+              script: "${docker_run} ${ci_image} ./tests/run_tests.sh",
+              label: 'Run tests',
+            )
           })
         }
         // only run upload if things are successful
         try {
-          sh(
-            script: "./${jenkins_scripts_root}/s3.py --action upload --bucket ${s3_bucket} --prefix ${s3_prefix}/pytest-results/unittest_GPU --items build/pytest-results",
-            label: 'Upload JUnits to S3',
-          )
-
           junit 'build/pytest-results/*.xml'
         } catch (Exception e) {
           echo 'Exception during JUnit upload: ' + e.toString()
         }
       }
     }
-    echo 'End running on node_type ' + node_type
+    echo 'End running tests on node_type ' + node_type
   } else {
-    Utils.markStageSkippedForConditional('unittest: GPU 1 of 2')
+    Utils.markStageSkippedForConditional('TESTS')
   }
 }
-
-def shard_run_unittest_GPU_2_of_2(node_type) {
-  echo 'Begin running on node_type ' + node_type
-  if (!skip_ci && is_docs_only_build != 1) {
-    node(node_type) {
-      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/ut-python-gpu") {
-        // NOTE: if exception happens, it will be caught outside
-        init_git()
-        docker_init(ci_gpu)
-        timeout(time: max_time, unit: 'MINUTES') {
-          withEnv([
-            'PLATFORM=gpu',
-            'TEST_STEP_NAME=unittest: GPU',
-            'TVM_NUM_SHARDS=2',
-            'TVM_SHARD_INDEX=1',
-            "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
-            sh(
-                  script: "./${jenkins_scripts_root}/s3.py --action download --bucket ${s3_bucket} --prefix ${s3_prefix}/gpu",
-                  label: 'Download artifacts from S3',
-                )
-
-              ci_setup(ci_gpu)
-              sh (
-                script: "${docker_run} ${ci_gpu} ./tests/scripts/task_java_unittest.sh",
-                label: 'Run Java unit tests',
-              )
-              sh (
-                script: "${docker_run} ${ci_gpu} ./tests/scripts/task_python_unittest_gpuonly.sh",
-                label: 'Run Python GPU unit tests',
-              )
-              sh (
-                script: "${docker_run} ${ci_gpu} ./tests/scripts/task_python_integration_gpuonly.sh",
-                label: 'Run Python GPU integration tests',
-              )
-          })
-        }
-        // only run upload if things are successful
-        try {
-          sh(
-            script: "./${jenkins_scripts_root}/s3.py --action upload --bucket ${s3_bucket} --prefix ${s3_prefix}/pytest-results/unittest_GPU --items build/pytest-results",
-            label: 'Upload JUnits to S3',
-          )
-
-          junit 'build/pytest-results/*.xml'
-        } catch (Exception e) {
-          echo 'Exception during JUnit upload: ' + e.toString()
-        }
-      }
-    }
-    echo 'End running on node_type ' + node_type
-  } else {
-    Utils.markStageSkippedForConditional('unittest: GPU 2 of 2')
-  }
-}
-
-
-
-
-def shard_run_docs_GPU_1_of_1(node_type) {
-  echo 'Begin running on node_type ' + node_type
-  if (!skip_ci) {
-    node(node_type) {
-      ws("workspace/exec_${env.EXECUTOR_NUMBER}/tvm/docs-python-gpu") {
-        // NOTE: if exception happens, it will be caught outside
-        init_git()
-        docker_init(ci_gpu)
-        timeout(time: max_time, unit: 'MINUTES') {
-          withEnv([
-            'PLATFORM=gpu',
-            'TEST_STEP_NAME=docs: GPU',
-            'TVM_NUM_SHARDS=1',
-            'TVM_SHARD_INDEX=0',
-            "SKIP_SLOW_TESTS=${skip_slow_tests}"], {
-            sh(
-                  script: "./${jenkins_scripts_root}/s3.py --action download --bucket ${s3_bucket} --prefix ${s3_prefix}/gpu",
-                  label: 'Download artifacts from S3',
-                )
-
-              ci_setup(ci_gpu)
-              sh (
-                script: "${docker_run} ${ci_gpu} ./tests/scripts/task_python_docs.sh",
-                label: 'Build docs',
-              )
-              sh(
-                  script: "./${jenkins_scripts_root}/s3.py --action upload --bucket ${s3_bucket} --prefix ${s3_prefix}/docs --items docs.tgz",
-                  label: 'Upload artifacts to S3',
-                )
-
-              sh(
-                script: "aws s3 cp --no-progress _docs s3://${s3_bucket}/${s3_prefix}/docs --recursive",
-                label: 'Upload docs to S3',
-              )
-          })
-        }
-        // only run upload if things are successful
-        try {
-          sh(
-            script: "./${jenkins_scripts_root}/s3.py --action upload --bucket ${s3_bucket} --prefix ${s3_prefix}/pytest-results/docs_GPU --items build/pytest-results",
-            label: 'Upload JUnits to S3',
-          )
-
-          junit 'build/pytest-results/*.xml'
-        } catch (Exception e) {
-          echo 'Exception during JUnit upload: ' + e.toString()
-        }
-      }
-    }
-    echo 'End running on node_type ' + node_type
-  } else {
-    Utils.markStageSkippedForConditional('docs: GPU 1 of 1')
-  }
-}
-
-
 
 def test() {
   stage('Test') {
-    environment {
-      SKIP_SLOW_TESTS = "${skip_slow_tests}"
+    try {
+      run_tests('GPU-SPOT')
+    } catch (Throwable ex) {
+      if (is_last_build()) {
+        // retry if at last build
+        // mark the current stage as success
+        // and try again via on demand node
+        echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
+        currentBuild.result = 'SUCCESS'
+        run_tests('GPU')
+      } else {
+        echo 'Exception during SPOT run ' + ex.toString() + ' exit since it is not last build'
+        throw ex
+      }
     }
-    parallel(
-    'unittest: GPU 1 of 2': {
-      try {
-      shard_run_unittest_GPU_1_of_2('GPU-SPOT')
-      } catch (Throwable ex) {
-        if (is_last_build()) {
-          // retry if at last build
-          // mark the current stage as success
-          // and try again via on demand node
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          shard_run_unittest_GPU_1_of_2('GPU')
-        } else {
-          echo 'Exception during SPOT run ' + ex.toString() + ' exit since it is not last build'
-          throw ex
-        }
-      }
-    },
-    'docs: GPU 1 of 1': {
-      try {
-      shard_run_docs_GPU_1_of_1('GPU-SPOT')
-      } catch (Throwable ex) {
-        if (is_last_build()) {
-          // retry if at last build
-          // mark the current stage as success
-          // and try again via on demand node
-          echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
-          currentBuild.result = 'SUCCESS'
-          shard_run_docs_GPU_1_of_1('GPU')
-        } else {
-          echo 'Exception during SPOT run ' + ex.toString() + ' exit since it is not last build'
-          throw ex
-        }
-      }
-    },
-    )
   }
 }
-test()
+
+def run_lint(node_type) {
+  echo 'Begin running lint on node_type ' + node_type
+  if (!skip_ci) {
+    node(node_type) {
+      ws("workspace/exec_${env.EXECUTOR_NUMBER}/flashinfer/lint") {
+        init_git()
+        docker_init(ci_image)
+        timeout(time: max_time, unit: 'MINUTES') {
+          withEnv([
+            'PLATFORM=gpu',
+            'TEST_STEP_NAME=lint'], {
+            ci_setup(ci_image)
+            sh (
+              script: "${docker_run} ${ci_image} ./tests/task_lint.sh",
+              label: 'Run lint',
+            )
+          })
+        }
+      }
+    }
+    echo 'End running lint on node_type ' + node_type
+  } else {
+    Utils.markStageSkippedForConditional('LINT')
+  }
+}
+
+def lint() {
+  stage('Lint') {
+    try {
+      run_lint('CPU-SPOT')
+    } catch (Throwable ex) {
+      if (is_last_build()) {
+        echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
+        currentBuild.result = 'SUCCESS'
+        run_lint('CPU')
+      } else {
+        echo 'Exception during SPOT run ' + ex.toString() + ' exit since it is not last build'
+        throw ex
+      }
+    }
+  }
+}
+
+def run_unittest(node_type) {
+  echo 'Begin running unittest on node_type ' + node_type
+  if (!skip_ci && is_docs_only_build != 1) {
+    node(node_type) {
+      ws("workspace/exec_${env.EXECUTOR_NUMBER}/flashinfer/unittest") {
+        init_git()
+        docker_init(ci_image)
+        timeout(time: max_time, unit: 'MINUTES') {
+          withEnv([
+            'PLATFORM=gpu',
+            'TEST_STEP_NAME=unittest'
+          ], {
+            ci_setup(ci_image)
+            sh (
+              script: "${docker_run} ${ci_image} ./tests/task_unittests.sh",
+              label: 'Run unit tests',
+            )
+          })
+        }
+        try {
+          junit 'build/pytest-results/*.xml'
+        } catch (Exception e) {
+          echo 'Exception during JUnit upload: ' + e.toString()
+        }
+      }
+    }
+    echo 'End running unittest on node_type ' + node_type
+  } else {
+    Utils.markStageSkippedForConditional('UNITTEST')
+  }
+}
+
+def unittest() {
+  stage('Unit Test') {
+    try {
+      run_unittest('GPU-SPOT')
+    } catch (Throwable ex) {
+      if (is_last_build()) {
+        echo 'Exception during SPOT run ' + ex.toString() + ' retry on-demand'
+        currentBuild.result = 'SUCCESS'
+        run_unittest('GPU')
+      } else {
+        echo 'Exception during SPOT run ' + ex.toString() + ' exit since it is not last build'
+        throw ex
+      }
+    }
+  }
+}
+
+build()
+lint()
+unittest()
