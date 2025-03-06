@@ -1,6 +1,7 @@
 import os
 import sys
 from pathlib import Path
+import flashinfer
 
 # import tlcpack_sphinx_addon
 # Configuration file for the Sphinx documentation builder.
@@ -20,9 +21,9 @@ project = "FlashInfer"
 author = "FlashInfer Contributors"
 copyright = f"2023-2024, {author}"
 
-package_version = (root / "version.txt").read_text().strip()
+package_version = flashinfer.__version__.strip(".dirty")
 version = package_version
-release = package_version
+release = flashinfer.__version__.strip(".dirty").split("+")[0]
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
