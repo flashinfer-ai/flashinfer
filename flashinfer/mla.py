@@ -164,7 +164,7 @@ class BatchMLAPagedAttentionWrapper:
             self._int_workspace_buffer.shape,
             dtype=self._int_workspace_buffer.dtype,
             pin_memory=True,
-            device="cpu"
+            device="cpu",
         )
         self._use_cuda_graph = use_cuda_graph
         self._qo_indptr_buf = qo_indptr
@@ -190,6 +190,7 @@ class BatchMLAPagedAttentionWrapper:
         sm_scale: float,
         q_data_type: torch.dtype,
         kv_data_type: torch.dtype,
+        use_profiler: bool = False,
     ) -> None:
         r"""Plan the MLA attention computation.
 
@@ -221,6 +222,8 @@ class BatchMLAPagedAttentionWrapper:
             The data type of the query tensor.
         kv_data_type : torch.dtype
             The data type of the kv-cache tensor.
+        use_profiler : bool, optional
+            Whether to enable intra-kernel profiler, default is False.
         """
         self._cached_module = get_batch_mla_module(self._backend)(
             q_data_type,
@@ -229,6 +232,7 @@ class BatchMLAPagedAttentionWrapper:
             qo_indptr.dtype,
             head_dim_ckv,
             head_dim_kpe,
+            use_profiler,
         )
         qo_indptr_host = qo_indptr.to("cpu")
         kv_indptr_host = kv_indptr.to("cpu")
@@ -247,6 +251,7 @@ class BatchMLAPagedAttentionWrapper:
         self._causal = causal
         self._page_size = page_size
         self._sm_scale = sm_scale
+        self._use_profiler = use_profiler
 
         with self.device as device:
             self._plan_info = self._cached_module.plan(
@@ -291,6 +296,7 @@ class BatchMLAPagedAttentionWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
+        profiler_buffer: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Run the MLA attention computation.
 
@@ -312,7 +318,14 @@ class BatchMLAPagedAttentionWrapper:
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool, optional
             Whether to return the log-sum-exp value, default is False.
+        profiler_buffer : Optional[torch.Tensor]
+            The buffer to store the profiler data.
         """
+        if profiler_buffer is None:
+            if self._use_profiler:
+                raise ValueError(
+                    "Profiler is enabled, profiler_buffer must be provided"
+                )
         num_heads = q_nope.shape[1]
         page_size = self._page_size
         sm_scale = self._sm_scale
@@ -335,6 +348,7 @@ class BatchMLAPagedAttentionWrapper:
                     _check_shape_dtype_device(
                         lse, q_nope.shape[:2], torch.float32, q_nope.device, "lse"
                     )
+            profiler_args = (profiler_buffer,) if self._use_profiler else ()
             self._cached_module.run(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
@@ -350,6 +364,7 @@ class BatchMLAPagedAttentionWrapper:
                 num_heads,
                 page_size,
                 sm_scale,
+                *profiler_args,
                 get_cuda_stream(device),
             )
 

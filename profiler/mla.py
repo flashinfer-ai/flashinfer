@@ -14,13 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import argparse
+
 import torch
-import triton
 
 import flashinfer
+from flashinfer.profiler import export_to_perfetto_trace
 
 
-def bench_deepseek_mla_decode(batch_size, seq_len, num_heads, backend):
+def profile_deepseek_mla_decode(
+    batch_size, seq_len, num_heads, profiler_buffer_size, backend
+):
     head_dim_ckv = 512
     head_dim_kpe = 64
     page_size = 1
@@ -58,24 +62,48 @@ def bench_deepseek_mla_decode(batch_size, seq_len, num_heads, backend):
         sm_scale,
         q_nope.dtype,
         ckv.dtype,
+        use_profiler=True,
     )
-    o = wrapper.run(q_nope, q_pe, ckv, kpe, return_lse=False)
+    profiler_buffer = torch.zeros(
+        (profiler_buffer_size,), dtype=torch.uint64, device="cuda"
+    )
+    # warmup run
+    o = wrapper.run(
+        q_nope, q_pe, ckv, kpe, return_lse=False, profiler_buffer=profiler_buffer
+    )
+    profiler_buffer.zero_()
 
-    ms = triton.testing.do_bench(
-        lambda: wrapper.run(q_nope, q_pe, ckv, kpe),
-        warmup=100,
-        rep=1000,
+    # run
+    wrapper.run(
+        q_nope, q_pe, ckv, kpe, return_lse=False, profiler_buffer=profiler_buffer
     )
 
-    io = sum([_.numel() * _.element_size() for _ in [q_nope, q_pe, ckv, kpe, o]])
-    flops = 2 * batch_size * num_heads * (2 * head_dim_ckv + head_dim_kpe) * seq_len
-
-    print(f"Config: batch_size={batch_size}, seq_len={seq_len}, num_heads={num_heads}")
-    print(f"Memory bandwidth: {io * 1e-6 / ms:.2f} GB/s")
-    print(f"FLOPs: {flops * 1e-9 / ms:.2f} TFLOPs")
+    export_to_perfetto_trace(
+        profiler_buffer,
+        [
+            "issue-load-q",
+            "issue-load-kv",
+            "write-o",
+            "softmax-update",
+            "gemm-qk",
+            "gemm-pv",
+            "rescale-o",
+            "write-p-smem",
+            "split-k",
+        ],
+        f"mla-{backend}-{batch_size}-{seq_len}-{num_heads}.perfetto-trace",
+    )
 
 
 if __name__ == "__main__":
-    for seq_len in [1024, 2048]:
-        for batch_size in [64, 128, 768]:
-            bench_deepseek_mla_decode(batch_size, seq_len, 64, "auto")
+    parser = argparse.ArgumentParser(
+        "Intra-kernel profiling for FlashInfer MLA kernels"
+    )
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--seq-len", type=int, default=1024)
+    parser.add_argument("--num-heads", type=int, default=128)
+    parser.add_argument("--profiler-buffer-size", type=int, default=1024 * 1024)
+    args = parser.parse_args()
+    profile_deepseek_mla_decode(
+        args.batch_size, args.seq_len, args.num_heads, args.profiler_buffer_size, "fa3"
+    )

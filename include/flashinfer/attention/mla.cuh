@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <sstream>
 
+#include "../profiler.cuh"
 #include "mla_params.cuh"
 #include "prefill.cuh"
 #include "variant_helper.cuh"
@@ -30,6 +31,8 @@ namespace mla {
 
 struct StandardAttention : AttentionVariantBase {
   float sm_scale_log2;
+
+  PROFILER_CLOSURE_PARAMS_DECL
 
   template <typename Params>
   __device__ __host__ StandardAttention(const Params& params, uint32_t batch_idx,

@@ -86,6 +86,7 @@ def get_batch_mla_uri(
     dtype_idx: torch.dtype,
     head_dim_ckv: int,
     head_dim_kpe: int,
+    use_profiler: bool,
 ) -> str:
     return (
         f"batch_mla_attention_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -93,7 +94,8 @@ def get_batch_mla_uri(
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_ckv_{head_dim_ckv}_"
-        f"head_dim_kpe_{head_dim_kpe}"
+        f"head_dim_kpe_{head_dim_kpe}_"
+        f"profiler_{use_profiler}"
     ) + ("_sm90" if backend == "fa3" else "")
 
 
@@ -105,6 +107,7 @@ def gen_batch_mla_module(
     dtype_idx: torch.dtype,
     head_dim_ckv: int,
     head_dim_kpe: int,
+    use_profiler: bool,
 ):
     if backend == "auto":
         raise ValueError("backend should not be auto when jit_args is provided")
@@ -116,6 +119,7 @@ def gen_batch_mla_module(
         dtype_idx,
         head_dim_ckv,
         head_dim_kpe,
+        use_profiler,
     )
     gen_directory = FLASHINFER_GEN_SRC_DIR / uri
     os.makedirs(gen_directory, exist_ok=True)
@@ -183,7 +187,8 @@ def gen_batch_mla_module(
         source_paths,
         extra_cuda_cflags=(
             ["-gencode=arch=compute_90a,code=sm_90a"] if backend == "fa3" else []
-        ),
+        )
+        + (["-DFLASHINFER_ENABLE_PROFILER"] if use_profiler else []),
     )
 
 
