@@ -48,6 +48,7 @@ def get_sampling_module():
         def sampling_from_probs(
             probs: torch.Tensor,
             deterministic: bool,
+            generator: Optional[torch.Generator],
         ) -> torch.Tensor:
             with probs.device as device:
                 probs = probs.float()
@@ -56,7 +57,7 @@ def get_sampling_module():
                     probs,
                     samples,
                     deterministic,
-                    None,
+                    generator,
                     get_cuda_stream(device),
                 )
                 return samples
@@ -65,6 +66,7 @@ def get_sampling_module():
         def _fake_sampling_from_probs(
             probs: torch.Tensor,
             deterministic: bool,
+            generator: Optional[torch.Generator],
         ) -> torch.Tensor:
             return torch.empty(probs.size(0), dtype=torch.int32, device=probs.device)
 
@@ -76,6 +78,7 @@ def get_sampling_module():
             maybe_top_p_arr: Optional[torch.Tensor],
             top_p_val: float,
             deterministic: bool,
+            generator: Optional[torch.Generator],
         ) -> torch.Tensor:
             with probs.device as device:
                 probs = probs.float()
@@ -89,7 +92,7 @@ def get_sampling_module():
                     maybe_top_p_arr,
                     top_p_val,
                     deterministic,
-                    None,
+                    generator,
                     get_cuda_stream(device),
                 )
                 return samples
@@ -100,6 +103,7 @@ def get_sampling_module():
             maybe_top_p_arr: Optional[torch.Tensor],
             top_p_val: float,
             deterministic: bool,
+            generator: Optional[torch.Generator],
         ) -> torch.Tensor:
             sample = torch.empty(probs.size(0), dtype=torch.int32, device=probs.device)
             return sample
@@ -112,6 +116,7 @@ def get_sampling_module():
             maybe_top_k_arr: Optional[torch.Tensor],
             top_k_val: int,
             deterministic: bool,
+            generator: Optional[torch.Generator],
         ) -> torch.Tensor:
             with probs.device as device:
                 probs = probs.float()
@@ -125,7 +130,7 @@ def get_sampling_module():
                     maybe_top_k_arr,
                     top_k_val,
                     deterministic,
-                    None,
+                    generator,
                     get_cuda_stream(device),
                 )
                 return samples
@@ -136,6 +141,7 @@ def get_sampling_module():
             maybe_top_k_arr: Optional[torch.Tensor],
             top_k_val: int,
             deterministic: bool,
+            generator: Optional[torch.Generator],
         ) -> torch.Tensor:
             sample = torch.empty(probs.size(0), dtype=torch.int32, device=probs.device)
             return sample
@@ -148,6 +154,7 @@ def get_sampling_module():
             maybe_min_p_arr: Optional[torch.Tensor],
             min_p_val: float,
             deterministic: bool,
+            generator: Optional[torch.Generator],
         ) -> torch.Tensor:
             with probs.device as device:
                 probs = probs.float()
@@ -161,7 +168,7 @@ def get_sampling_module():
                     maybe_min_p_arr,
                     min_p_val,
                     deterministic,
-                    None,
+                    generator,
                     get_cuda_stream(device),
                 )
                 return samples
@@ -178,6 +185,7 @@ def get_sampling_module():
             maybe_top_p_arr: Optional[torch.Tensor],
             top_p_val: float,
             deterministic: bool,
+            generator: Optional[torch.Generator],
         ) -> torch.Tensor:
             with probs.device as device:
                 probs = probs.float()
@@ -196,7 +204,7 @@ def get_sampling_module():
                     maybe_top_p_arr,
                     top_p_val,
                     deterministic,
-                    None,
+                    generator,
                     get_cuda_stream(device),
                 )
                 return samples
@@ -209,6 +217,7 @@ def get_sampling_module():
             maybe_top_p_arr: Optional[torch.Tensor],
             top_p_val: float,
             deterministic: bool,
+            generator: Optional[torch.Generator],
         ) -> torch.Tensor:
             sample = torch.empty(probs.size(0), dtype=torch.int32, device=probs.device)
             return sample
@@ -319,6 +328,7 @@ def get_sampling_module():
             output_accepted_token_num: torch.Tensor,
             output_emitted_token_num: torch.Tensor,
             deterministic: bool,
+            generator: Optional[torch.Generator],
         ) -> torch.Tensor:
             with draft_probs.device as device:
                 draft_probs = draft_probs.float()
@@ -338,7 +348,7 @@ def get_sampling_module():
                     output_accepted_token_num,
                     output_emitted_token_num,
                     deterministic,
-                    None,
+                    generator,
                     get_cuda_stream(device),
                 )
                 return output_token_ids
@@ -351,6 +361,7 @@ def get_sampling_module():
             output_accepted_token_num: torch.Tensor,
             output_emitted_token_num: torch.Tensor,
             deterministic: bool,
+            generator: Optional[torch.Generator],
         ) -> torch.Tensor:
             b, n = draft_token_ids.shape
             device = draft_token_ids.device
@@ -382,6 +393,7 @@ def _to_tensor_scalar_tuple(x):
 def sampling_from_probs(
     probs: torch.Tensor,
     deterministic: bool = True,
+    generator: Optional[torch.Generator] = None,
     check_nan: bool = False,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for category sampling from probabilities.
@@ -392,6 +404,8 @@ def sampling_from_probs(
         Probabilities, shape ``(batch_size, num_classes)``.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
+    generator: Optional[torch.Generator]
+        A random number generator for the operation.
     check_nan: bool
         Whether to check nan in :attr:`probs`, default is ``False``.
 
@@ -426,13 +440,14 @@ def sampling_from_probs(
     if check_nan:
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
-    return get_sampling_module().sampling_from_probs(probs, deterministic)
+    return get_sampling_module().sampling_from_probs(probs, deterministic, generator)
 
 
 def top_p_sampling_from_probs(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
     deterministic: bool = True,
+    generator: Optional[torch.Generator] = None,
     check_nan: bool = False,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for top-p sampling (nucleus sampling) from probabilities,
@@ -451,6 +466,8 @@ def top_p_sampling_from_probs(
         If a tensor, each request has its own threshold.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
+    generator: Optional[torch.Generator]
+        A random number generator for the operation.
     check_nan: bool
         Whether to check nan in :attr:`probs`, default is ``False``.
 
@@ -497,7 +514,7 @@ def top_p_sampling_from_probs(
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
     return get_sampling_module().top_p_sampling_from_probs(
-        probs, *_to_tensor_scalar_tuple(top_p), deterministic
+        probs, *_to_tensor_scalar_tuple(top_p), deterministic, generator
     )
 
 
@@ -505,6 +522,7 @@ def top_k_sampling_from_probs(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
     deterministic: bool = True,
+    generator: Optional[torch.Generator] = None,
     check_nan: bool = False,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for top-k sampling from probabilities,
@@ -523,6 +541,8 @@ def top_k_sampling_from_probs(
         If a tensor, each request has its own threshold.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
+    generator: Optional[torch.Generator]
+        A random number generator for the operation.
     check_nan: bool
         Whether to check nan in :attr:`probs`, default is ``False``.
 
@@ -569,7 +589,7 @@ def top_k_sampling_from_probs(
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
     return get_sampling_module().top_k_sampling_from_probs(
-        probs, *_to_tensor_scalar_tuple(top_k), deterministic
+        probs, *_to_tensor_scalar_tuple(top_k), deterministic, generator
     )
 
 
@@ -577,6 +597,7 @@ def min_p_sampling_from_probs(
     probs: torch.Tensor,
     min_p: Union[torch.Tensor, float],
     deterministic: bool = True,
+    generator: Optional[torch.Generator] = None,
     check_nan: bool = False,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for `min_p sampling <https://arxiv.org/abs/2407.01082>`_ from probabilities,
@@ -596,6 +617,8 @@ def min_p_sampling_from_probs(
         If a tensor, each request has its own threshold.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
+    generator: Optional[torch.Generator]
+        A random number generator for the operation.
     check_nan: bool
         Whether to check nan in :attr:`probs`, default is ``False``.
 
@@ -636,7 +659,7 @@ def min_p_sampling_from_probs(
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
     return get_sampling_module().min_p_sampling_from_probs(
-        probs, *_to_tensor_scalar_tuple(min_p), deterministic
+        probs, *_to_tensor_scalar_tuple(min_p), deterministic, generator
     )
 
 
@@ -646,6 +669,7 @@ def top_k_top_p_sampling_from_logits(
     top_p: Union[torch.Tensor, float],
     filter_apply_order: str = "top_k_first",
     deterministic: bool = True,
+    generator: Optional[torch.Generator] = None,
     check_nan: bool = False,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for top-k and top-p sampling from pre-softmax logits,
@@ -675,6 +699,8 @@ def top_k_top_p_sampling_from_logits(
         If ``"joint"``, we apply top-k and top-p filter simultaneously in each round. Default is ``"top_k_first"``.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
+    generator: Optional[torch.Generator]
+        A random number generator for the operation.
     check_nan: bool
         Whether to check nan in :attr:`probs`, default is ``False``.
 
@@ -728,7 +754,7 @@ def top_k_top_p_sampling_from_logits(
         masked_logits = top_k_mask_logits(logits, top_k)
         probs = torch.softmax(masked_logits, dim=-1)
         return top_p_sampling_from_probs(
-            probs, top_p, deterministic, check_nan=check_nan
+            probs, top_p, deterministic, check_nan=check_nan, generator=generator
         )
     elif filter_apply_order == "joint":
         probs = torch.softmax(logits, dim=-1)
@@ -740,6 +766,7 @@ def top_k_top_p_sampling_from_logits(
             *_to_tensor_scalar_tuple(top_k),
             *_to_tensor_scalar_tuple(top_p),
             deterministic,
+            generator,
         )
     else:
         raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
@@ -751,6 +778,7 @@ def top_k_top_p_sampling_from_probs(
     top_p: Union[torch.Tensor, float],
     filter_apply_order: str = "top_k_first",
     deterministic: bool = True,
+    generator: Optional[torch.Generator] = None,
     check_nan: bool = False,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for top-k and top-p sampling from probabilities,
@@ -780,6 +808,8 @@ def top_k_top_p_sampling_from_probs(
         If ``"joint"``, we apply top-k and top-p filter simultaneously in each round. Default is ``"top_k_first"``.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
+    generator: Optional[torch.Generator]
+        A random number generator for the operation.
     check_nan: bool
         Whether to check nan in :attr:`probs`, default is ``False``.
 
@@ -827,7 +857,7 @@ def top_k_top_p_sampling_from_probs(
     if filter_apply_order == "top_k_first":
         renorm_probs = top_k_renorm_probs(probs, top_k)
         return top_p_sampling_from_probs(
-            renorm_probs, top_p, deterministic, check_nan=check_nan
+            renorm_probs, top_p, deterministic, check_nan=check_nan, generator=generator
         )
     elif filter_apply_order == "joint":
         if check_nan:
@@ -838,6 +868,7 @@ def top_k_top_p_sampling_from_probs(
             *_to_tensor_scalar_tuple(top_k),
             *_to_tensor_scalar_tuple(top_p),
             deterministic,
+            generator,
         )
     else:
         raise ValueError(f"Invalid filter_apply_order: {filter_apply_order}")
@@ -1035,6 +1066,7 @@ def chain_speculative_sampling(
     maybe_output_accepted_token_num: Optional[torch.Tensor] = None,
     maybe_output_emitted_token_num: Optional[torch.Tensor] = None,
     deterministic: bool = True,
+    generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
     r"""Fused-GPU kernel for speculative sampling for sequence generation (proposed in
     paper `Accelerating Large Language Model Decoding with Speculative Sampling <https://arxiv.org/pdf/2302.01318>`_),
@@ -1068,6 +1100,8 @@ def chain_speculative_sampling(
         If specified, the number of emitted token number will be added to this tensor inplace. Default is ``None``.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
+    generator: Optional[torch.Generator]
+        A random number generator for the operation.
 
     Returns
     -------
@@ -1132,5 +1166,6 @@ def chain_speculative_sampling(
         output_accepted_token_num,
         output_emitted_token_num,
         deterministic,
+        generator,
     )
     return output_token_ids, output_accepted_token_num, output_emitted_token_num

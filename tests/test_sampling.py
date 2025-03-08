@@ -154,14 +154,17 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
 def test_top_k_top_p_sampling_from_probs_logits_alignment(batch_size, vocab_size, k, p):
     torch.manual_seed(42)
     logits = torch.randn(batch_size, vocab_size).to(0) * 5
+    generator_logits = torch.Generator("cuda:0")
+    generator_probs = generator_logits.clone_state()
     samples = flashinfer.sampling.top_k_top_p_sampling_from_logits(
-        logits, k, p, filter_apply_order="top_k_first"
+        logits, k, p, filter_apply_order="top_k_first", generator=generator_logits
     )
     samples_ref = flashinfer.sampling.top_k_top_p_sampling_from_probs(
         torch.softmax(logits, dim=-1),
         k,
         p,
         filter_apply_order="top_k_first",
+        generator=generator_probs,
     )
     assert torch.all(samples == samples_ref)
 
@@ -172,6 +175,8 @@ def test_top_k_top_p_sampling_from_probs_logits_alignment(batch_size, vocab_size
 def test_top_k_top_p_joint_sampling_from_logits(batch_size, vocab_size, p):
     torch.manual_seed(42)
     logits = torch.rand(batch_size, vocab_size).to(0) * 5
+    generator_logits = torch.Generator("cuda:0")
+    generator_probs = generator_logits.clone_state()
     if p == 0.1:
         k = int(vocab_size * 0.5)
     elif p == 0.5:
@@ -180,11 +185,15 @@ def test_top_k_top_p_joint_sampling_from_logits(batch_size, vocab_size, p):
         raise ValueError("p not recognized")
 
     samples = flashinfer.sampling.top_k_top_p_sampling_from_logits(
-        logits, k, p, filter_apply_order="joint"
+        logits, k, p, filter_apply_order="joint", generator=generator_logits
     )
 
     samples_ref = flashinfer.sampling.top_k_top_p_sampling_from_probs(
-        torch.softmax(logits, dim=-1), k, p, filter_apply_order="joint"
+        torch.softmax(logits, dim=-1),
+        k,
+        p,
+        filter_apply_order="joint",
+        generator=generator_probs,
     )
     assert torch.all(samples == samples_ref)
 
