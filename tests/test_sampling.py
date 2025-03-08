@@ -347,21 +347,15 @@ def test_chain_speculative_sampling(
         selected_target_probs = target_onehot_prob[
             batch_indices, probs_indicies, draft_token_ids
         ]
-        capped_ratio = torch.minimum(
-            selected_target_probs / selected_draft_probs,
-            torch.full((1,), 1, device=normalized_draft_prob.device),
-        )
-        # ref_accepted = (uniform_samples[:, :-1] < capped_ratio).sum(dim=1)
-        # assert torch.all(accepted_num == ref_accepted)
 
 
 if __name__ == "__main__":
     test_sampling(19, 500)
-    # test_sampling(1, 111)
-    # test_top_p_sampling(3, 111, 0.9)
-    # test_top_k_sampling(3, 111, 10)
-    # test_top_p_renorm_probs(3, 111, 0.9)
-    # test_top_k_renorm_probs(3, 111, 10)
-    # test_top_k_mask_logits(99, 989, 10)
-    # test_chain_speculative_sampling(3, 111, 3, False)
-    # test_chain_speculative_sampling(3, 111, 3, True)
+    test_sampling(1, 111)
+    test_top_p_sampling(3, 111, 0.9)
+    test_top_k_sampling(3, 111, 10)
+    test_top_p_renorm_probs(3, 111, 0.9)
+    test_top_k_renorm_probs(3, 111, 10)
+    test_top_k_mask_logits(99, 989, 10)
+    test_chain_speculative_sampling(3, 111, 3, False)
+    test_chain_speculative_sampling(3, 111, 3, True)
