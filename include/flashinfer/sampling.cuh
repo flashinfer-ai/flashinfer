@@ -1399,16 +1399,17 @@ __global__ void ChainSpeculativeSampling(DType* draft_probs, IdType* draft_token
 
 template <typename T, typename IdType>
 cudaError_t ParallelTopPSamplingFromProb(T* probs, IdType* output, IdType* row_indices,
-                                         float* top_p_arr, uint32_t batch_size, uint64_t seed,
-                                         uint64_t offset, float top_p_val, uint32_t d,
-                                         bool deterministic, cudaStream_t stream = 0) {
+                                         float* top_p_arr, uint32_t batch_size, float top_p_val,
+                                         uint32_t d, bool deterministic, uint64_t philox_seed,
+                                         uint64_t philox_offset, cudaStream_t stream = 0) {
   constexpr uint32_t BLOCK_THREADS = 1024;
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   const uint32_t smem_size = sizeof(SamplingTempStorage<T, BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
   dim3 nblks(batch_size);
   dim3 nthrs(BLOCK_THREADS);
-  void* args[] = {&probs, &output, &row_indices, &seed, &offset, &top_p_arr, &top_p_val, &d};
+  void* args[] = {&probs,     &output, &row_indices, &top_p_arr,
+                  &top_p_val, &d,      &philox_seed, &philox_offset};
 
   DISPATCH_ALIGNED_VEC_SIZE(
       vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
