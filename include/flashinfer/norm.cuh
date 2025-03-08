@@ -122,7 +122,7 @@ template <uint32_t VEC_SIZE, typename T>
 __global__ void FusedAddRMSNormKernel(T* __restrict__ input, T* __restrict__ residual,
                                       T* __restrict__ weight, const uint32_t d,
                                       const uint32_t stride_input, const uint32_t stride_residual,
-                                      const uint32_t stride_output, float weight_bias, float eps) {
+                                      float weight_bias, float eps) {
   const uint32_t bx = blockIdx.x;
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
   constexpr uint32_t warp_size = 32;
@@ -207,8 +207,8 @@ __global__ void FusedAddRMSNormKernel(T* __restrict__ input, T* __restrict__ res
 
 template <typename T>
 cudaError_t FusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batch_size, uint32_t d,
-                            uint32_t stride_input, uint32_t stride_residual, uint32_t stride_output,
-                            float eps = 1e-5, cudaStream_t stream = 0) {
+                            uint32_t stride_input, uint32_t stride_residual, float eps = 1e-5,
+                            cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
   const uint32_t block_size = std::min<uint32_t>(1024, d / vec_size);
@@ -217,8 +217,8 @@ cudaError_t FusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batch_siz
   dim3 nthrs(32, num_warps);
   const uint32_t smem_size = (ceil_div(num_warps, 4) * 4 + d) * sizeof(float);
   float weight_bias = 0.f;
-  void* args[] = {&input,           &residual,      &weight,      &d,  &stride_input,
-                  &stride_residual, &stride_output, &weight_bias, &eps};
+  void* args[] = {&input,        &residual,        &weight,      &d,
+                  &stride_input, &stride_residual, &weight_bias, &eps};
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
     auto kernel = FusedAddRMSNormKernel<VEC_SIZE, T>;
@@ -253,8 +253,7 @@ cudaError_t GemmaRMSNorm(T* input, T* weight, T* output, uint32_t batch_size, ui
 
 template <typename T>
 cudaError_t GemmaFusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batch_size, uint32_t d,
-                                 uint32_t stride_input, uint32_t stride_residual,
-                                 uint32_t stride_output, float eps = 1e-5,
+                                 uint32_t stride_input, uint32_t stride_residual, float eps = 1e-5,
                                  cudaStream_t stream = 0) {
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
 
@@ -265,8 +264,8 @@ cudaError_t GemmaFusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batc
   // NOTE(Zihao): use ceil_div(num_warps, 4) * 4 for address alignment to 16 bytes
   const uint32_t smem_size = (ceil_div(num_warps, 4) * 4 + d) * sizeof(float);
   float weight_bias = 1.f;
-  void* args[] = {&input,           &residual,      &weight,      &d,  &stride_input,
-                  &stride_residual, &stride_output, &weight_bias, &eps};
+  void* args[] = {&input,        &residual,        &weight,      &d,
+                  &stride_input, &stride_residual, &weight_bias, &eps};
 
   DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
     auto kernel = FusedAddRMSNormKernel<VEC_SIZE, T>;
