@@ -25,11 +25,6 @@
 
 using namespace flashinfer;
 
-// NOTE(Zihao): currently these functions are not cuda graph-safe,
-// we will fix this in the future.
-// More specifically, cuda graph-safe functions should unpack
-// https://github.com/pytorch/pytorch/blob/3f069e7679588d5ee4b1d5b2492ca0e20f9320b5/aten/src/ATen/cuda/detail/UnpackRaw.cuh
-
 void sampling_from_probs(at::Tensor probs, at::Tensor samples, bool deterministic,
                          std::optional<at::Generator> gen_, int64_t cuda_stream) {
   CHECK_INPUT(probs);
