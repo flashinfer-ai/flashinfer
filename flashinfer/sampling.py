@@ -484,7 +484,6 @@ def top_p_sampling_from_probs(
     >>> torch.manual_seed(42)
     >>> batch_size = 4
     >>> vocab_size = 5
-    >>> max_top_p_rounds = 3
     >>> top_p = 0.5
     >>> pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
     >>> norm_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
@@ -501,8 +500,6 @@ def top_p_sampling_from_probs(
     Note
     ----
     This function expects float32 inputs, and the output is int32.
-    We encourage users to set ``max_top_p_rounds`` to a reasonable value, e.g., 32. The actual
-    implementation usually use much fewer rounds for rejection sampling because of early stopping.
 
     See Also
     --------
@@ -559,7 +556,6 @@ def top_k_sampling_from_probs(
     >>> torch.manual_seed(42)
     >>> batch_size = 4
     >>> vocab_size = 5
-    >>> max_top_k_rounds = 3
     >>> top_k = 1
     >>> pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
     >>> norm_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
@@ -576,8 +572,6 @@ def top_k_sampling_from_probs(
     Note
     ----
     This function expects float32 inputs, and the output is int32.
-    We encourage users to set ``max_top_k_rounds`` to a reasonable value, e.g., 32. The actual
-    implementation usually use much fewer rounds for rejection sampling because of early stopping.
 
     See Also
     --------
@@ -651,8 +645,6 @@ def min_p_sampling_from_probs(
     Note
     ----
     This function expects float32 inputs, and the output is int32.
-    We encourage users to set ``max_rounds`` to a reasonable value, e.g., 32. The actual
-    implementation usually use much fewer rounds for rejection sampling because of early stopping.
     """
 
     if check_nan:
@@ -717,7 +709,6 @@ def top_k_top_p_sampling_from_logits(
     >>> torch.manual_seed(42)
     >>> batch_size = 4
     >>> vocab_size = 5
-    >>> max_rounds = 3
     >>> top_p = 0.5
     >>> top_k = 3
     >>> logits = torch.rand(batch_size, vocab_size).to(0)
@@ -741,8 +732,6 @@ def top_k_top_p_sampling_from_logits(
     Note
     ----
     This function expects float32 inputs, and the output is int32.
-    We encourage users to set ``max_rounds`` to a reasonable value, e.g., 32. The actual
-    implementation usually use much fewer rounds for rejection sampling because of early stopping.
 
     See Also
     --------
@@ -826,7 +815,6 @@ def top_k_top_p_sampling_from_probs(
     >>> torch.manual_seed(42)
     >>> batch_size = 4
     >>> vocab_size = 5
-    >>> max_rounds = 3
     >>> top_p = torch.full((batch_size,), 0.2).to(0)
     >>> top_k = torch.full((batch_size,), 2).to(0)
     >>> pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
@@ -843,8 +831,6 @@ def top_k_top_p_sampling_from_probs(
     Note
     ----
     This function expects float32 inputs, and the output is int32.
-    We encourage users to set ``max_rounds`` to a reasonable value, e.g., 32. The actual
-    implementation usually use much fewer rounds for rejection sampling because of early stopping.
 
     See Also
     --------
