@@ -26,14 +26,10 @@ def test_sampling(batch_size, vocab_size):
     torch.manual_seed(42)
     pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
-    uniform_samples = torch.empty(batch_size, dtype=torch.float32).to(0)
 
     num_trails = 5000
     for _ in range(num_trails):
-        uniform_samples.uniform_()
-        samples = flashinfer.sampling.sampling_from_probs(
-            normalized_prob, uniform_samples
-        )
+        samples = flashinfer.sampling.sampling_from_probs(normalized_prob)
         assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
 
 
@@ -50,17 +46,10 @@ def test_top_p_sampling(batch_size, vocab_size, p):
     cdf = torch.cumsum(sorted_prob, dim=-1)
     mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32).to(0)
     mask.scatter_add_(1, indices, (cdf > (1 - p) - eps).int())
-    uniform_samples = torch.empty(max_top_p_trails, batch_size, dtype=torch.float32).to(
-        0
-    )
 
     num_trails = 1000
     for _ in range(num_trails):
-        uniform_samples.uniform_()
-        samples, success = flashinfer.sampling.top_p_sampling_from_probs(
-            normalized_prob, uniform_samples, p
-        )
-        assert torch.all(success)
+        samples = flashinfer.sampling.top_p_sampling_from_probs(normalized_prob, p)
         assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
         assert torch.all(mask[torch.arange(batch_size), samples] == 1)
 
@@ -72,23 +61,15 @@ def test_top_k_sampling(batch_size, vocab_size, k):
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
     torch.manual_seed(42)
-    max_top_k_trails = 32
     pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
     sorted_prob, _ = torch.sort(normalized_prob, descending=True)
     pivot = sorted_prob[:, k - 1]
     mask = (normalized_prob >= pivot.unsqueeze(-1)).int()
-    uniform_samples = torch.empty(max_top_k_trails, batch_size, dtype=torch.float32).to(
-        0
-    )
 
     num_trails = 1000
     for _ in range(num_trails):
-        uniform_samples.uniform_()
-        samples, success = flashinfer.sampling.top_k_sampling_from_probs(
-            normalized_prob, uniform_samples, k
-        )
-        assert torch.all(success)
+        samples = flashinfer.sampling.top_k_sampling_from_probs(normalized_prob, k)
         assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
         assert torch.all(mask[torch.arange(batch_size), samples] == 1), normalized_prob[
             torch.arange(batch_size), samples
@@ -109,15 +90,12 @@ def test_min_p_sampling(batch_size, vocab_size, p):
     # min-p mask
     mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32).to(0)
     mask.scatter_add_(1, indices, (sorted_prob >= scaled_p).int())
-    uniform_samples = torch.empty(batch_size, dtype=torch.float32).to(0)
     min_p_tensor = torch.full((batch_size,), p).to(0)
 
     num_trails = 1000
     for _ in range(num_trails):
-        uniform_samples.uniform_()
         samples = flashinfer.sampling.min_p_sampling_from_probs(
             normalized_prob,
-            uniform_samples,
             min_p_tensor,
         )
 
@@ -152,23 +130,17 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
     mask_top_k = (normalized_prob >= pivot.unsqueeze(-1)).int()
     # overall mask
     mask = torch.minimum(mask_top_p, mask_top_k)
-    uniform_samples = torch.empty(max_top_k_trails, batch_size, dtype=torch.float32).to(
-        0
-    )
     top_p_tensor = torch.full((batch_size,), p).to(0)
     top_k_tensor = torch.full((batch_size,), k).to(0)
 
     num_trails = 1000
     for _ in range(num_trails):
-        uniform_samples.uniform_()
-        samples, success = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+        samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
             normalized_prob,
-            uniform_samples,
             top_k_tensor,
             top_p_tensor,
             filter_apply_order="joint",
         )
-        assert torch.all(success)
         assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
         assert torch.all(mask[torch.arange(batch_size), samples] == 1), normalized_prob[
             torch.arange(batch_size), samples
@@ -182,22 +154,19 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
 def test_top_k_top_p_sampling_from_probs_logits_alignment(batch_size, vocab_size, k, p):
     torch.manual_seed(42)
     logits = torch.randn(batch_size, vocab_size).to(0) * 5
-    uniform_samples = torch.empty(32, batch_size).to(0)
-    samples, success = flashinfer.sampling.top_k_top_p_sampling_from_logits(
-        logits, uniform_samples, k, p, filter_apply_order="top_k_first"
+    generator_logits = torch.Generator("cuda:0")
+    generator_probs = generator_logits.clone_state()
+    samples = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+        logits, k, p, filter_apply_order="top_k_first", generator=generator_logits
     )
-    samples_ref, success_ref = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+    samples_ref = flashinfer.sampling.top_k_top_p_sampling_from_probs(
         torch.softmax(logits, dim=-1),
-        uniform_samples,
         k,
         p,
         filter_apply_order="top_k_first",
+        generator=generator_probs,
     )
-    assert torch.all(
-        samples == samples_ref
-    ), f"{samples} != {samples_ref}, {success}, {success_ref}"
-    assert torch.all(success)
-    assert torch.all(success_ref)
+    assert torch.all(samples == samples_ref)
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
@@ -206,7 +175,8 @@ def test_top_k_top_p_sampling_from_probs_logits_alignment(batch_size, vocab_size
 def test_top_k_top_p_joint_sampling_from_logits(batch_size, vocab_size, p):
     torch.manual_seed(42)
     logits = torch.rand(batch_size, vocab_size).to(0) * 5
-    uniform_samples = torch.empty(32, batch_size).to(0)
+    generator_logits = torch.Generator("cuda:0")
+    generator_probs = generator_logits.clone_state()
     if p == 0.1:
         k = int(vocab_size * 0.5)
     elif p == 0.5:
@@ -214,16 +184,18 @@ def test_top_k_top_p_joint_sampling_from_logits(batch_size, vocab_size, p):
     else:
         raise ValueError("p not recognized")
 
-    samples, success = flashinfer.sampling.top_k_top_p_sampling_from_logits(
-        logits, uniform_samples, k, p, filter_apply_order="joint"
+    samples = flashinfer.sampling.top_k_top_p_sampling_from_logits(
+        logits, k, p, filter_apply_order="joint", generator=generator_logits
     )
 
-    samples_ref, success_ref = flashinfer.sampling.top_k_top_p_sampling_from_probs(
-        torch.softmax(logits, dim=-1), uniform_samples, k, p, filter_apply_order="joint"
+    samples_ref = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+        torch.softmax(logits, dim=-1),
+        k,
+        p,
+        filter_apply_order="joint",
+        generator=generator_probs,
     )
     assert torch.all(samples == samples_ref)
-    assert torch.all(success)
-    assert torch.all(success_ref)
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
@@ -316,7 +288,6 @@ def test_chain_speculative_sampling(
     draft_token_ids = torch.randint(vocab_size, (batch_size, num_speculate_tokens)).to(
         0
     )
-    uniform_samples = torch.empty(batch_size, num_speculate_tokens + 1).to(0)
     if not onehot_target:
         pre_norm_target_prob = torch.rand(
             batch_size, num_speculate_tokens + 1, vocab_size
@@ -335,8 +306,7 @@ def test_chain_speculative_sampling(
         target_onehot_prob.scatter_(2, target_token_ids.unsqueeze(-1), 1)
 
     # NOTE(Zihao): this is a very simple test that only checks whether output is valid or not.
-    for trials in range(10):    # noqa: B007
-        uniform_samples.uniform_()
+    for trials in range(10):  # noqa: B007
         accepted_num = torch.zeros(batch_size, dtype=torch.int32).to(0)
         emitted_num = torch.zeros(batch_size, dtype=torch.int32).to(0)
         (
@@ -346,7 +316,6 @@ def test_chain_speculative_sampling(
         ) = flashinfer.sampling.chain_speculative_sampling(
             normalized_draft_prob,
             draft_token_ids,
-            uniform_samples,
             target_onehot_prob,
             accepted_num,
             emitted_num,
@@ -378,15 +347,10 @@ def test_chain_speculative_sampling(
         selected_target_probs = target_onehot_prob[
             batch_indices, probs_indicies, draft_token_ids
         ]
-        capped_ratio = torch.minimum(
-            selected_target_probs / selected_draft_probs,
-            torch.full((1,), 1, device=normalized_draft_prob.device),
-        )
-        ref_accepted = (uniform_samples[:, :-1] < capped_ratio).sum(dim=1)
-        assert torch.all(accepted_num == ref_accepted)
 
 
 if __name__ == "__main__":
+    test_sampling(19, 500)
     test_sampling(1, 111)
     test_top_p_sampling(3, 111, 0.9)
     test_top_k_sampling(3, 111, 10)
