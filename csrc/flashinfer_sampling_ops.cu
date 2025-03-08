@@ -13,8 +13,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <ATen/core/Generator.h>
-
 #include "pytorch_extension_utils.h"
 
 void sampling_from_probs(at::Tensor probs, at::Tensor samples, bool deterministic,
