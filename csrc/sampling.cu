@@ -25,12 +25,13 @@
 
 using namespace flashinfer;
 
-void sampling_from_probs(at::Tensor probs, at::Tensor samples, bool deterministic,
+void sampling_from_probs(at::Tensor probs, at::Tensor output,
+                         std::optional<at::Tensor> maybe_indices, bool deterministic,
                          std::optional<at::Generator> gen_, int64_t cuda_stream) {
   CHECK_INPUT(probs);
   auto device = probs.device();
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
-  unsigned int batch_size = probs.size(0);
+  unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
 
   uint64_t philox_seed, philox_offset;
@@ -43,20 +44,22 @@ void sampling_from_probs(at::Tensor probs, at::Tensor samples, bool deterministi
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaError_t status = sampling::SamplingFromProb(
-      static_cast<float*>(probs.data_ptr()), static_cast<int*>(samples.data_ptr()), batch_size,
-      vocab_size, deterministic, philox_seed, philox_offset, stream);
+      static_cast<float*>(probs.data_ptr()), static_cast<int*>(output.data_ptr()),
+      maybe_indices.has_value() ? static_cast<int*>(maybe_indices->data_ptr()) : nullptr,
+      batch_size, vocab_size, deterministic, philox_seed, philox_offset, stream);
   TORCH_CHECK(status == cudaSuccess, "SamplingFromProbs failed with error code " +
                                          std::string(cudaGetErrorString(status)));
 }
 
-void top_p_sampling_from_probs(at::Tensor probs, at::Tensor samples,
+void top_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
+                               std::optional<at::Tensor> maybe_indices,
                                std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
                                bool deterministic, std::optional<at::Generator> gen_,
                                int64_t cuda_stream) {
   CHECK_INPUT(probs);
   auto device = probs.device();
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
-  unsigned int batch_size = probs.size(0);
+  unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
   bool has_top_p_arr = maybe_top_p_arr.has_value();
   uint64_t philox_seed, philox_offset;
@@ -69,25 +72,26 @@ void top_p_sampling_from_probs(at::Tensor probs, at::Tensor samples,
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaError_t status = sampling::TopPSamplingFromProb<float, int>(
-      static_cast<float*>(probs.data_ptr()), static_cast<int*>(samples.data_ptr()),
+      static_cast<float*>(probs.data_ptr()), static_cast<int*>(output.data_ptr()),
+      maybe_indices.has_value() ? static_cast<int*>(maybe_indices->data_ptr()) : nullptr,
       has_top_p_arr ? static_cast<float*>(maybe_top_p_arr->data_ptr()) : nullptr, batch_size,
       top_p_val, vocab_size, deterministic, philox_seed, philox_offset, stream);
   TORCH_CHECK(status == cudaSuccess, "TopPSamplingFromProbs failed with error code " +
                                          std::string(cudaGetErrorString(status)));
 }
 
-void top_k_sampling_from_probs(at::Tensor probs, at::Tensor samples,
+void top_k_sampling_from_probs(at::Tensor probs, at::Tensor output,
+                               std::optional<at::Tensor> maybe_indices,
                                std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
                                bool deterministic, std::optional<at::Generator> gen_,
                                int64_t cuda_stream) {
   CHECK_INPUT(probs);
-  CHECK_INPUT(samples);
+  CHECK_INPUT(output);
   auto device = probs.device();
-  CHECK_EQ(samples.device(), device);
-  CHECK_DIM(2, probs);    // probs: (batch_size, vocab_size)
-  CHECK_DIM(1, samples);  // samples: (batch_size)
-  CHECK_EQ(probs.size(0), samples.size(0));
-  unsigned int batch_size = probs.size(0);
+  CHECK_EQ(output.device(), device);
+  CHECK_DIM(2, probs);   // probs: (batch_size, vocab_size)
+  CHECK_DIM(1, output);  // output: (batch_size)
+  unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
   bool has_top_k_arr = maybe_top_k_arr.has_value();
   uint64_t philox_seed, philox_offset;
@@ -100,24 +104,26 @@ void top_k_sampling_from_probs(at::Tensor probs, at::Tensor samples,
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaError_t status = sampling::TopKSamplingFromProb<float, int>(
-      static_cast<float*>(probs.data_ptr()), static_cast<int*>(samples.data_ptr()),
+      static_cast<float*>(probs.data_ptr()), static_cast<int*>(output.data_ptr()),
+      maybe_indices.has_value() ? static_cast<int*>(maybe_indices->data_ptr()) : nullptr,
       has_top_k_arr ? static_cast<float*>(maybe_top_k_arr->data_ptr()) : nullptr, batch_size,
       top_k_val, vocab_size, deterministic, philox_seed, philox_offset, stream);
   TORCH_CHECK(status == cudaSuccess, "TopKSamplingFromProbs failed with error code " +
                                          std::string(cudaGetErrorString(status)));
 }
 
-void min_p_sampling_from_probs(at::Tensor probs, at::Tensor samples,
+void min_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
+                               std::optional<at::Tensor> maybe_indices,
                                std::optional<at::Tensor> maybe_min_p_arr, double min_p_val,
                                bool deterministic, std::optional<at::Generator> gen_,
                                int64_t cuda_stream) {
   CHECK_INPUT(probs);
-  CHECK_INPUT(samples);
+  CHECK_INPUT(output);
   auto device = probs.device();
-  CHECK_EQ(samples.device(), device);
-  CHECK_DIM(2, probs);    // probs: (batch_size, vocab_size)
-  CHECK_DIM(1, samples);  // samples: (batch_size)
-  unsigned int batch_size = probs.size(0);
+  CHECK_EQ(output.device(), device);
+  CHECK_DIM(2, probs);   // probs: (batch_size, vocab_size)
+  CHECK_DIM(1, output);  // output: (batch_size)
+  unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
   bool has_min_p_arr = maybe_min_p_arr.has_value();
   uint64_t philox_seed, philox_offset;
@@ -132,24 +138,26 @@ void min_p_sampling_from_probs(at::Tensor probs, at::Tensor samples,
   cudaError_t status = sampling::MinPSamplingFromProb<float, int>(
       static_cast<float*>(probs.data_ptr()),
       has_min_p_arr ? static_cast<float*>(maybe_min_p_arr->data_ptr()) : nullptr,
-      static_cast<int*>(samples.data_ptr()), batch_size, min_p_val, vocab_size, deterministic,
-      philox_seed, philox_offset, stream);
+      static_cast<int*>(output.data_ptr()),
+      maybe_indices.has_value() ? static_cast<int*>(maybe_indices->data_ptr()) : nullptr,
+      batch_size, min_p_val, vocab_size, deterministic, philox_seed, philox_offset, stream);
   TORCH_CHECK(status == cudaSuccess, "MinPSamplingFromProb failed with error code " +
                                          std::string(cudaGetErrorString(status)));
 }
 
-void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor samples,
+void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
+                                     std::optional<at::Tensor> maybe_indices,
                                      std::optional<at::Tensor> maybe_top_k_arr, double top_k_val,
                                      std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
                                      bool deterministic, std::optional<at::Generator> gen_,
                                      int64_t cuda_stream) {
   CHECK_INPUT(probs);
-  CHECK_INPUT(samples);
+  CHECK_INPUT(output);
   auto device = probs.device();
-  CHECK_EQ(samples.device(), device);
-  CHECK_DIM(2, probs);    // probs: (batch_size, vocab_size)
-  CHECK_DIM(1, samples);  // samples: (batch_size)
-  unsigned int batch_size = probs.size(0);
+  CHECK_EQ(output.device(), device);
+  CHECK_DIM(2, probs);   // probs: (batch_size, vocab_size)
+  CHECK_DIM(1, output);  // output: (batch_size)
+  unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
   bool has_top_k_arr = maybe_top_k_arr.has_value();
   bool has_top_p_arr = maybe_top_p_arr.has_value();
@@ -166,8 +174,10 @@ void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor samples,
       static_cast<float*>(probs.data_ptr()),
       has_top_k_arr ? static_cast<int*>(maybe_top_k_arr->data_ptr()) : nullptr,
       has_top_p_arr ? static_cast<float*>(maybe_top_p_arr->data_ptr()) : nullptr,
-      static_cast<int*>(samples.data_ptr()), batch_size, top_k_val, top_p_val, vocab_size,
-      deterministic, philox_seed, philox_offset, stream);
+      static_cast<int*>(output.data_ptr()),
+      maybe_indices.has_value() ? static_cast<int*>(maybe_indices->data_ptr()) : nullptr,
+      batch_size, top_k_val, top_p_val, vocab_size, deterministic, philox_seed, philox_offset,
+      stream);
   TORCH_CHECK(status == cudaSuccess, "TopKTopPSamplingFromProbs failed with error code " +
                                          std::string(cudaGetErrorString(status)));
 }

@@ -20,6 +20,28 @@ import torch
 import flashinfer
 
 
+@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize("zero_ratio", [0.0, 0.5, 0.9])
+def test_sampling_counter(vocab_size, zero_ratio):
+    torch.manual_seed(42)
+    batch_size = 5000000
+    pre_norm_prob = torch.rand(1, vocab_size).to(0)
+    zero_indices = torch.randperm(vocab_size)[: int(vocab_size * zero_ratio)]
+    pre_norm_prob[:, zero_indices] = 0
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    counter = torch.zeros(vocab_size, dtype=torch.int32).to(0)
+
+    samples = flashinfer.sampling.sampling_from_probs(
+        normalized_prob, indices=torch.zeros(batch_size, dtype=torch.int32).to(0)
+    )
+    counter.scatter_add_(0, samples.long(), torch.ones_like(samples))
+    counter_normalized = counter.float() / batch_size
+
+    assert torch.all(counter[zero_indices] == 0)
+    similarity = torch.cosine_similarity(counter_normalized, normalized_prob)
+    assert similarity > 0.99, f"similarity: {similarity}"
+
+
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
 def test_sampling(batch_size, vocab_size):
@@ -350,12 +372,14 @@ def test_chain_speculative_sampling(
 
 
 if __name__ == "__main__":
-    test_sampling(19, 500)
-    test_sampling(1, 111)
-    test_top_p_sampling(3, 111, 0.9)
-    test_top_k_sampling(3, 111, 10)
-    test_top_p_renorm_probs(3, 111, 0.9)
-    test_top_k_renorm_probs(3, 111, 10)
-    test_top_k_mask_logits(99, 989, 10)
-    test_chain_speculative_sampling(3, 111, 3, False)
-    test_chain_speculative_sampling(3, 111, 3, True)
+    test_sampling_counter(1, 128256)
+    # test_top_k_sampling(1, 128256, 10)
+    # test_sampling(19, 500)
+    # test_sampling(1, 111)
+    # test_top_p_sampling(3, 111, 0.9)
+    # test_top_k_sampling(3, 111, 10)
+    # test_top_p_renorm_probs(3, 111, 0.9)
+    # test_top_k_renorm_probs(3, 111, 10)
+    # test_top_k_mask_logits(99, 989, 10)
+    # test_chain_speculative_sampling(3, 111, 3, False)
+    # test_chain_speculative_sampling(3, 111, 3, True)
