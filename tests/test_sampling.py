@@ -87,7 +87,7 @@ def test_top_p_sampling_freq(vocab_size, distribution, p):
     sorted_prob, indices = torch.sort(probs, descending=False)
     cdf = torch.cumsum(sorted_prob, dim=-1)
     mask = torch.zeros(1, vocab_size, dtype=torch.int32).to(0)
-    mask.scatter_add_(1, indices, (cdf >= (1 - p)).int())
+    mask.scatter_add_(1, indices, (cdf > (1 - p)).int())
 
     renorm_probs = flashinfer.sampling.top_p_renorm_probs(probs, p)
     counter = torch.zeros(vocab_size, dtype=torch.int32).to(0)
@@ -154,12 +154,13 @@ def test_sampling(batch_size, vocab_size):
 @pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
 def test_top_p_sampling(batch_size, vocab_size, p):
     torch.manual_seed(42)
+    eps = 1e-4
     pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
     sorted_prob, indices = torch.sort(normalized_prob, descending=False)
     cdf = torch.cumsum(sorted_prob, dim=-1)
     mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32).to(0)
-    mask.scatter_add_(1, indices, (cdf >= (1 - p)).int())
+    mask.scatter_add_(1, indices, (cdf > (1 - p) - eps).int())
 
     num_trails = 1000
     for _ in range(num_trails):
@@ -229,13 +230,14 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
         k = int(vocab_size * 0.1)
     else:
         raise ValueError("p not recognized")
+    eps = 1e-4
     pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
     # top-p mask
     sorted_prob, indices = torch.sort(normalized_prob, descending=False)
     cdf = torch.cumsum(sorted_prob, dim=-1)
     mask_top_p = torch.zeros(batch_size, vocab_size, dtype=torch.int32).to(0)
-    mask_top_p.scatter_add_(1, indices, (cdf >= (1 - p)).int())
+    mask_top_p.scatter_add_(1, indices, (cdf > (1 - p) - eps).int())
     # top-k mask
     sorted_prob, _ = torch.sort(normalized_prob, descending=True)
     pivot = sorted_prob[:, k - 1]
