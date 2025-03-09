@@ -1010,7 +1010,7 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   const uint32_t row_idx = bx;
   uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[bx];
-  float pivot = -cuda::std::numeric_limits<float>::infinity();
+  double pivot = -cuda::std::numeric_limits<float>::infinity();
   vec_t<float, VEC_SIZE> logits_vec;
   if (k < d) {
     extern __shared__ __align__(alignof(RenormTempStorage<BLOCK_THREADS, REDUCE_ALGO>))
@@ -1134,7 +1134,7 @@ __global__ void TopKRenormProbKernel(DType* probs, DType* renormed_prob, IdType*
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
   const uint32_t row_idx = bx;
   uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[bx];
-  float pivot = -cuda::std::numeric_limits<float>::infinity(), normalizer = 1;
+  double pivot = -cuda::std::numeric_limits<float>::infinity(), normalizer = 1;
   vec_t<float, VEC_SIZE> probs_vec;
   if (k < d) {
     extern __shared__ __align__(alignof(RenormTempStorage<BLOCK_THREADS, REDUCE_ALGO>))

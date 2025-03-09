@@ -711,7 +711,7 @@ def min_p_sampling_from_probs(
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
     return get_sampling_module().min_p_sampling_from_probs(
-        probs, *_to_tensor_scalar_tuple(min_p), indices, deterministic, generator
+        probs, indices, *_to_tensor_scalar_tuple(min_p), deterministic, generator
     )
 
 
@@ -924,8 +924,8 @@ def top_k_top_p_sampling_from_probs(
         renorm_probs = top_k_renorm_probs(probs, top_k)
         return top_p_sampling_from_probs(
             renorm_probs,
-            indices,
             top_p,
+            indices,
             deterministic,
             check_nan=check_nan,
             generator=generator,
@@ -936,9 +936,9 @@ def top_k_top_p_sampling_from_probs(
                 raise ValueError("Input probs contains NaN.")
         return get_sampling_module().top_k_top_p_sampling_from_probs(
             probs,
+            indices,
             *_to_tensor_scalar_tuple(top_k),
             *_to_tensor_scalar_tuple(top_p),
-            indices,
             deterministic,
             generator,
         )
