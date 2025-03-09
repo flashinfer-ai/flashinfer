@@ -114,6 +114,8 @@ def test_top_p_sampling_counter(vocab_size, distribution, p):
 )
 @pytest.mark.parametrize("k", [10, 100, 500])
 def test_top_k_sampling_counter(vocab_size, distribution, k):
+    if k > vocab_size:
+        pytest.skip("k should be less than vocab_size")
     torch.manual_seed(42)
     logits = distribution((1, vocab_size), "cuda:0")
     probs = torch.softmax(logits, dim=-1)
