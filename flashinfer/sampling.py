@@ -47,15 +47,18 @@ def get_sampling_module():
         @register_custom_op("flashinfer::sampling_from_probs", mutates_args=())
         def sampling_from_probs(
             probs: torch.Tensor,
+            indices: Optional[torch.Tensor],
             deterministic: bool,
             generator: Optional[torch.Generator],
         ) -> torch.Tensor:
             with probs.device as device:
                 probs = probs.float()
-                samples = torch.empty(probs.size(0), dtype=torch.int32, device=device)
+                batch_size = indices.size(0) if indices is not None else probs.size(0)
+                samples = torch.empty(batch_size, dtype=torch.int32, device=device)
                 module.sampling_from_probs(
                     probs,
                     samples,
+                    indices,
                     deterministic,
                     generator,
                     get_cuda_stream(device),
@@ -65,16 +68,19 @@ def get_sampling_module():
         @register_fake_op("flashinfer::sampling_from_probs")
         def _fake_sampling_from_probs(
             probs: torch.Tensor,
+            indices: Optional[torch.Tensor],
             deterministic: bool,
             generator: Optional[torch.Generator],
         ) -> torch.Tensor:
-            return torch.empty(probs.size(0), dtype=torch.int32, device=probs.device)
+            batch_size = indices.size(0) if indices is not None else probs.size(0)
+            return torch.empty(batch_size, dtype=torch.int32, device=probs.device)
 
         # torch library for top_p_sampling_from_probs
 
         @register_custom_op("flashinfer::top_p_sampling_from_probs", mutates_args=())
         def top_p_sampling_from_probs(
             probs: torch.Tensor,
+            indices: Optional[torch.Tensor],
             maybe_top_p_arr: Optional[torch.Tensor],
             top_p_val: float,
             deterministic: bool,
@@ -85,10 +91,12 @@ def get_sampling_module():
                 maybe_top_p_arr = (
                     maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
                 )
-                samples = torch.empty(probs.size(0), dtype=torch.int32, device=device)
+                batch_size = indices.size(0) if indices is not None else probs.size(0)
+                samples = torch.empty(batch_size, dtype=torch.int32, device=device)
                 module.top_p_sampling_from_probs(
                     probs,
                     samples,
+                    indices,
                     maybe_top_p_arr,
                     top_p_val,
                     deterministic,
@@ -100,6 +108,7 @@ def get_sampling_module():
         @register_fake_op("flashinfer::top_p_sampling_from_probs")
         def _fake_top_p_sampling_from_probs(
             probs: torch.Tensor,
+            indices: Optional[torch.Tensor],
             maybe_top_p_arr: Optional[torch.Tensor],
             top_p_val: float,
             deterministic: bool,
@@ -113,6 +122,7 @@ def get_sampling_module():
         @register_custom_op("flashinfer::top_k_sampling_from_probs", mutates_args=())
         def top_k_sampling_from_probs(
             probs: torch.Tensor,
+            indices: Optional[torch.Tensor],
             maybe_top_k_arr: Optional[torch.Tensor],
             top_k_val: int,
             deterministic: bool,
@@ -120,13 +130,15 @@ def get_sampling_module():
         ) -> torch.Tensor:
             with probs.device as device:
                 probs = probs.float()
+                batch_size = indices.size(0) if indices is not None else probs.size(0)
                 maybe_top_k_arr = (
                     maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
                 )
-                samples = torch.empty(probs.size(0), dtype=torch.int32, device=device)
+                samples = torch.empty(batch_size, dtype=torch.int32, device=device)
                 module.top_k_sampling_from_probs(
                     probs,
                     samples,
+                    indices,
                     maybe_top_k_arr,
                     top_k_val,
                     deterministic,
@@ -138,12 +150,14 @@ def get_sampling_module():
         @register_fake_op("flashinfer::top_k_sampling_from_probs")
         def _fake_top_k_sampling_from_probs(
             probs: torch.Tensor,
+            indices: Optional[torch.Tensor],
             maybe_top_k_arr: Optional[torch.Tensor],
             top_k_val: int,
             deterministic: bool,
             generator: Optional[torch.Generator],
         ) -> torch.Tensor:
-            sample = torch.empty(probs.size(0), dtype=torch.int32, device=probs.device)
+            batch_size = indices.size(0) if indices is not None else probs.size(0)
+            sample = torch.empty(batch_size, dtype=torch.int32, device=probs.device)
             return sample
 
         # torch library for min_p_sampling_from_probs
@@ -151,6 +165,7 @@ def get_sampling_module():
         @register_custom_op("flashinfer::min_p_sampling_from_probs", mutates_args=())
         def min_p_sampling_from_probs(
             probs: torch.Tensor,
+            indices: Optional[torch.Tensor],
             maybe_min_p_arr: Optional[torch.Tensor],
             min_p_val: float,
             deterministic: bool,
@@ -161,10 +176,12 @@ def get_sampling_module():
                 maybe_min_p_arr = (
                     maybe_min_p_arr.float() if maybe_min_p_arr is not None else None
                 )
-                samples = torch.empty(probs.size(0), dtype=torch.int32, device=device)
+                batch_size = indices.size(0) if indices is not None else probs.size(0)
+                samples = torch.empty(batch_size, dtype=torch.int32, device=device)
                 module.min_p_sampling_from_probs(
                     probs,
                     samples,
+                    indices,
                     maybe_min_p_arr,
                     min_p_val,
                     deterministic,
@@ -180,6 +197,7 @@ def get_sampling_module():
         )
         def top_k_top_p_sampling_from_probs(
             probs: torch.Tensor,
+            indices: Optional[torch.Tensor],
             maybe_top_k_arr: Optional[torch.Tensor],
             top_k_val: int,
             maybe_top_p_arr: Optional[torch.Tensor],
@@ -195,10 +213,12 @@ def get_sampling_module():
                 maybe_top_p_arr = (
                     maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
                 )
-                samples = torch.empty(probs.size(0), dtype=torch.int32, device=device)
+                batch_size = indices.size(0) if indices is not None else probs.size(0)
+                samples = torch.empty(batch_size, dtype=torch.int32, device=device)
                 module.top_k_top_p_sampling_from_probs(
                     probs,
                     samples,
+                    indices,
                     maybe_top_k_arr,
                     top_k_val,
                     maybe_top_p_arr,
@@ -212,6 +232,7 @@ def get_sampling_module():
         @register_fake_op("flashinfer::top_k_top_p_sampling_from_probs")
         def _fake_top_k_top_p_sampling_from_probs(
             probs: torch.Tensor,
+            indices: Optional[torch.Tensor],
             maybe_top_k_arr: Optional[torch.Tensor],
             top_k_val: int,
             maybe_top_p_arr: Optional[torch.Tensor],
@@ -219,7 +240,8 @@ def get_sampling_module():
             deterministic: bool,
             generator: Optional[torch.Generator],
         ) -> torch.Tensor:
-            sample = torch.empty(probs.size(0), dtype=torch.int32, device=probs.device)
+            batch_size = indices.size(0) if indices is not None else probs.size(0)
+            sample = torch.empty(batch_size, dtype=torch.int32, device=probs.device)
             return sample
 
         # torch library for top_p_renorm_probs
@@ -392,6 +414,7 @@ def _to_tensor_scalar_tuple(x):
 
 def sampling_from_probs(
     probs: torch.Tensor,
+    indices: Optional[torch.Tensor] = None,
     deterministic: bool = True,
     generator: Optional[torch.Generator] = None,
     check_nan: bool = False,
@@ -401,7 +424,15 @@ def sampling_from_probs(
     Parameters
     ----------
     probs: torch.Tensor
-        Probabilities, shape ``(batch_size, num_classes)``.
+        Probabilities for sampling. When indices is not provided, shape should be ``(batch_size, num_classes)``
+        and the i-th output will be sampled from the i-th row of probabilities. When indices is provided,
+        shape should be ``(unique_batch_size, num_classes)`` where unique_batch_size is the number of unique
+        probability distributions.
+    indices: Optional[torch.Tensor]
+        Optional indices tensor of shape ``(batch_size,)`` that maps each output to a row in probs.
+        For example, if indices[i] = j, then the i-th output will be sampled from probs[j].
+        This allows reusing the same probability distribution for multiple outputs.
+        If indices is not provided, the i-th output will be sampled from the i-th row of probs.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
     generator: Optional[torch.Generator]
@@ -440,12 +471,15 @@ def sampling_from_probs(
     if check_nan:
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
-    return get_sampling_module().sampling_from_probs(probs, deterministic, generator)
+    return get_sampling_module().sampling_from_probs(
+        probs, indices, deterministic, generator
+    )
 
 
 def top_p_sampling_from_probs(
     probs: torch.Tensor,
     top_p: Union[torch.Tensor, float],
+    indices: Optional[torch.Tensor] = None,
     deterministic: bool = True,
     generator: Optional[torch.Generator] = None,
     check_nan: bool = False,
@@ -459,11 +493,19 @@ def top_p_sampling_from_probs(
     Parameters
     ----------
     probs: torch.Tensor
-        Probabilities, shape ``(batch_size, num_classes)``.
+        Probabilities for sampling. When indices is not provided, shape should be ``(batch_size, num_classes)``
+        and the i-th output will be sampled from the i-th row of probabilities. When indices is provided,
+        shape should be ``(unique_batch_size, num_classes)`` where unique_batch_size is the number of unique
+        probability distributions.
     top_p: Union[torch.Tensor, float]
         Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for top-p sampling.
         If a scalar, the same threshold is used for all requests.
         If a tensor, each request has its own threshold.
+    indices: Optional[torch.Tensor]
+        Optional indices tensor of shape ``(batch_size,)`` that maps each output to a row in probs.
+        For example, if indices[i] = j, then the i-th output will be sampled from probs[j].
+        This allows reusing the same probability distribution for multiple outputs.
+        If indices is not provided, the i-th output will be sampled from the i-th row of probs.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
     generator: Optional[torch.Generator]
@@ -511,13 +553,14 @@ def top_p_sampling_from_probs(
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
     return get_sampling_module().top_p_sampling_from_probs(
-        probs, *_to_tensor_scalar_tuple(top_p), deterministic, generator
+        probs, indices, *_to_tensor_scalar_tuple(top_p), deterministic, generator
     )
 
 
 def top_k_sampling_from_probs(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
+    indices: Optional[torch.Tensor] = None,
     deterministic: bool = True,
     generator: Optional[torch.Generator] = None,
     check_nan: bool = False,
@@ -531,11 +574,19 @@ def top_k_sampling_from_probs(
     Parameters
     ----------
     probs: torch.Tensor
-        Probabilities, shape ``(batch_size, num_classes)``.
+        Probabilities for sampling. When indices is not provided, shape should be ``(batch_size, num_classes)``
+        and the i-th output will be sampled from the i-th row of probabilities. When indices is provided,
+        shape should be ``(unique_batch_size, num_classes)`` where unique_batch_size is the number of unique
+        probability distributions.
     top_k: Union[torch.Tensor, int]
         Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for top-k sampling.
         If a scalar, the same threshold is used for all requests.
         If a tensor, each request has its own threshold.
+    indices: Optional[torch.Tensor]
+        Optional indices tensor of shape ``(batch_size,)`` that maps each output to a row in probs.
+        For example, if indices[i] = j, then the i-th output will be sampled from probs[j].
+        This allows reusing the same probability distribution for multiple outputs.
+        If indices is not provided, the i-th output will be sampled from the i-th row of probs.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
     generator: Optional[torch.Generator]
@@ -583,13 +634,14 @@ def top_k_sampling_from_probs(
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
     return get_sampling_module().top_k_sampling_from_probs(
-        probs, *_to_tensor_scalar_tuple(top_k), deterministic, generator
+        probs, indices, *_to_tensor_scalar_tuple(top_k), deterministic, generator
     )
 
 
 def min_p_sampling_from_probs(
     probs: torch.Tensor,
     min_p: Union[torch.Tensor, float],
+    indices: Optional[torch.Tensor] = None,
     deterministic: bool = True,
     generator: Optional[torch.Generator] = None,
     check_nan: bool = False,
@@ -604,11 +656,19 @@ def min_p_sampling_from_probs(
     Parameters
     ----------
     probs: torch.Tensor
-        Probabilities, shape ``(batch_size, num_classes)``.
-    min_p: torch.Tensor
+        Probabilities for sampling. When indices is not provided, shape should be ``(batch_size, num_classes)``
+        and the i-th output will be sampled from the i-th row of probabilities. When indices is provided,
+        shape should be ``(unique_batch_size, num_classes)`` where unique_batch_size is the number of unique
+        probability distributions.
+    min_p: Union[torch.Tensor, float]
         Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for min-p sampling.
         If a scalar, the same threshold is used for all requests.
         If a tensor, each request has its own threshold.
+    indices: Optional[torch.Tensor]
+        Optional indices tensor of shape ``(batch_size,)`` that maps each output to a row in probs.
+        For example, if indices[i] = j, then the i-th output will be sampled from probs[j].
+        This allows reusing the same probability distribution for multiple outputs.
+        If indices is not provided, the i-th output will be sampled from the i-th row of probs.
     deterministic: bool
         Whether to use deterministic kernel implementation, default is ``True``.
     generator: Optional[torch.Generator]
@@ -651,7 +711,7 @@ def min_p_sampling_from_probs(
         if torch.any(torch.isnan(probs)):
             raise ValueError("Input probs contains NaN.")
     return get_sampling_module().min_p_sampling_from_probs(
-        probs, *_to_tensor_scalar_tuple(min_p), deterministic, generator
+        probs, indices, *_to_tensor_scalar_tuple(min_p), deterministic, generator
     )
 
 
@@ -659,6 +719,7 @@ def top_k_top_p_sampling_from_logits(
     logits: torch.Tensor,
     top_k: Union[torch.Tensor, int],
     top_p: Union[torch.Tensor, float],
+    indices: Optional[torch.Tensor] = None,
     filter_apply_order: str = "top_k_first",
     deterministic: bool = True,
     generator: Optional[torch.Generator] = None,
@@ -674,9 +735,10 @@ def top_k_top_p_sampling_from_logits(
     Parameters
     ----------
     logits: torch.Tensor
-        Pre-softmax logits, shape ``(batch_size, num_classes)``.
-    top_k: Union[torch.Tensor, int]
-        Expected to be uniformly distributed in ``[0, 1)``.
+        Pre-softmax logits for sampling. When indices is not provided, shape should be ``(batch_size, num_classes)``
+        and the i-th output will be sampled from the i-th row of logits. When indices is provided,
+        shape should be ``(unique_batch_size, num_classes)`` where unique_batch_size is the number of unique
+        probability distributions.
     top_k: Union[torch.Tensor, int]
         Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for top-k sampling.
         If a scalar, the same threshold is used for all requests.
@@ -685,6 +747,11 @@ def top_k_top_p_sampling_from_logits(
         Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for top-p sampling.
         If a scalar, the same threshold is used for all requests.
         If a tensor, each request has its own threshold.
+    indices: Optional[torch.Tensor]
+        Optional indices tensor of shape ``(batch_size,)`` that maps each output to a row in probs.
+        For example, if indices[i] = j, then the i-th output will be sampled from probs[j].
+        This allows reusing the same probability distribution for multiple outputs.
+        If indices is not provided, the i-th output will be sampled from the i-th row of probs.
     filter_apply_order: str
         The order of applying top-k and top-p sampling, should be either ``"top_k_first"`` or ``"joint"``.
         If ``"top_k_first"``, we first apply top-k filter, then apply top-p sampling on the top-k results.
@@ -743,7 +810,12 @@ def top_k_top_p_sampling_from_logits(
         masked_logits = top_k_mask_logits(logits, top_k)
         probs = torch.softmax(masked_logits, dim=-1)
         return top_p_sampling_from_probs(
-            probs, top_p, deterministic, check_nan=check_nan, generator=generator
+            probs,
+            top_p,
+            indices,
+            deterministic,
+            check_nan=check_nan,
+            generator=generator,
         )
     elif filter_apply_order == "joint":
         probs = torch.softmax(logits, dim=-1)
@@ -752,6 +824,7 @@ def top_k_top_p_sampling_from_logits(
                 raise ValueError("Input probs contains NaN.")
         return get_sampling_module().top_k_top_p_sampling_from_probs(
             probs,
+            indices,
             *_to_tensor_scalar_tuple(top_k),
             *_to_tensor_scalar_tuple(top_p),
             deterministic,
@@ -765,6 +838,7 @@ def top_k_top_p_sampling_from_probs(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
     top_p: Union[torch.Tensor, float],
+    indices: Optional[torch.Tensor] = None,
     filter_apply_order: str = "top_k_first",
     deterministic: bool = True,
     generator: Optional[torch.Generator] = None,
@@ -780,9 +854,10 @@ def top_k_top_p_sampling_from_probs(
     Parameters
     ----------
     probs: torch.Tensor
-        Probabilities, shape ``(batch_size, num_classes)``.
-    top_k: Union[torch.Tensor, int]
-        Expected to be uniformly distributed in ``[0, 1)``.
+        Probabilities for sampling. When indices is not provided, shape should be ``(batch_size, num_classes)``
+        and the i-th output will be sampled from the i-th row of probabilities. When indices is provided,
+        shape should be ``(unique_batch_size, num_classes)`` where unique_batch_size is the number of unique
+        probability distributions.
     top_k: Union[torch.Tensor, int]
         Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for top-k sampling.
         If a scalar, the same threshold is used for all requests.
@@ -791,6 +866,11 @@ def top_k_top_p_sampling_from_probs(
         Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for top-p sampling.
         If a scalar, the same threshold is used for all requests.
         If a tensor, each request has its own threshold.
+    indices: Optional[torch.Tensor]
+        Optional indices tensor of shape ``(batch_size,)`` that maps each output to a row in probs.
+        For example, if indices[i] = j, then the i-th output will be sampled from probs[j].
+        This allows reusing the same probability distribution for multiple outputs.
+        If indices is not provided, the i-th output will be sampled from the i-th row of probs.
     filter_apply_order: str
         The order of applying top-k and top-p sampling, should be either ``"top_k_first"`` or ``"joint"``.
         If ``"top_k_first"``, we first apply top-k filter, then apply top-p sampling on the top-k results.
@@ -843,7 +923,12 @@ def top_k_top_p_sampling_from_probs(
     if filter_apply_order == "top_k_first":
         renorm_probs = top_k_renorm_probs(probs, top_k)
         return top_p_sampling_from_probs(
-            renorm_probs, top_p, deterministic, check_nan=check_nan, generator=generator
+            renorm_probs,
+            top_p,
+            indices,
+            deterministic,
+            check_nan=check_nan,
+            generator=generator,
         )
     elif filter_apply_order == "joint":
         if check_nan:
@@ -851,6 +936,7 @@ def top_k_top_p_sampling_from_probs(
                 raise ValueError("Input probs contains NaN.")
         return get_sampling_module().top_k_top_p_sampling_from_probs(
             probs,
+            indices,
             *_to_tensor_scalar_tuple(top_k),
             *_to_tensor_scalar_tuple(top_p),
             deterministic,

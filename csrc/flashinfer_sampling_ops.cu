@@ -15,25 +15,30 @@
  */
 #include "pytorch_extension_utils.h"
 
-void sampling_from_probs(at::Tensor probs, at::Tensor samples, bool deterministic,
+void sampling_from_probs(at::Tensor probs, at::Tensor output,
+                         std::optional<at::Tensor> maybe_indices, bool deterministic,
                          std::optional<at::Generator> gen, int64_t cuda_stream);
 
-void top_p_sampling_from_probs(at::Tensor probs, at::Tensor samples,
+void top_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
+                               std::optional<at::Tensor> maybe_indices,
                                std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
                                bool deterministic, std::optional<at::Generator> gen,
                                int64_t cuda_stream);
 
-void top_k_sampling_from_probs(at::Tensor probs, at::Tensor samples,
+void top_k_sampling_from_probs(at::Tensor probs, at::Tensor output,
+                               std::optional<at::Tensor> maybe_indices,
                                std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
                                bool deterministic, std::optional<at::Generator> gen,
                                int64_t cuda_stream);
 
-void min_p_sampling_from_probs(at::Tensor probs, at::Tensor samples,
+void min_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
+                               std::optional<at::Tensor> maybe_indices,
                                std::optional<at::Tensor> maybe_min_p_arr, double min_p_val,
                                bool deterministic, std::optional<at::Generator> gen,
                                int64_t cuda_stream);
 
-void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor samples,
+void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
+                                     std::optional<at::Tensor> maybe_indices,
                                      std::optional<at::Tensor> maybe_top_k_arr, double top_k_val,
                                      std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
                                      bool deterministic, std::optional<at::Generator> gen,

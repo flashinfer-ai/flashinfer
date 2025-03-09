@@ -20,6 +20,122 @@ import torch
 import flashinfer
 
 
+def normal_distribution(std):
+    def normal_noise(shape, device):
+        return torch.randn(shape, device=device) * std
+
+    normal_noise.__name__ = f"normal_distribution(std={std})"
+    return normal_noise
+
+
+def gumbel_distribution(beta):
+    def gumbel_noise(shape, device):
+        U = torch.rand(shape, device=device)
+        eps = 1e-20
+        return torch.log(-torch.log(U + eps) + eps) / beta
+
+    gumbel_noise.__name__ = f"gumbel_distribution(beta={beta})"
+    return gumbel_noise
+
+
+@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize(
+    "distribution",
+    [
+        normal_distribution(1),
+        normal_distribution(5),
+        gumbel_distribution(0.1),
+        gumbel_distribution(1),
+    ],
+)
+@pytest.mark.parametrize("zero_ratio", [0.0, 0.5, 0.9])
+def test_sampling_freq(vocab_size, distribution, zero_ratio):
+    torch.manual_seed(42)
+    num_trials = 5000000
+    logits = distribution((1, vocab_size), "cuda:0")
+    zero_indices = torch.randperm(vocab_size)[: int(vocab_size * zero_ratio)]
+    logits[:, zero_indices] = -float("inf")
+    probs = torch.softmax(logits, dim=-1)
+    counter = torch.zeros(vocab_size, dtype=torch.int32).to(0)
+
+    samples = flashinfer.sampling.sampling_from_probs(
+        probs, indices=torch.zeros(num_trials, dtype=torch.int32).to(0)
+    )
+    counter.scatter_add_(0, samples.long(), torch.ones_like(samples))
+    freq = counter.float() / num_trials
+
+    assert torch.all(counter[zero_indices] == 0)
+    similarity = torch.cosine_similarity(freq, probs)
+    assert similarity > 0.99, f"similarity: {similarity}"
+
+
+@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize(
+    "distribution",
+    [
+        normal_distribution(1),
+        normal_distribution(5),
+        gumbel_distribution(0.1),
+        gumbel_distribution(1),
+    ],
+)
+@pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
+def test_top_p_sampling_freq(vocab_size, distribution, p):
+    torch.manual_seed(42)
+    logits = distribution((1, vocab_size), "cuda:0")
+    probs = torch.softmax(logits, dim=-1)
+    sorted_prob, indices = torch.sort(probs, descending=False)
+    cdf = torch.cumsum(sorted_prob, dim=-1)
+    mask = torch.zeros(1, vocab_size, dtype=torch.int32).to(0)
+    mask.scatter_add_(1, indices, (cdf > (1 - p)).int())
+
+    renorm_probs = flashinfer.sampling.top_p_renorm_probs(probs, p)
+    counter = torch.zeros(vocab_size, dtype=torch.int32).to(0)
+    num_trials = 5000000
+    samples = flashinfer.sampling.top_p_sampling_from_probs(
+        probs, p, indices=torch.zeros(num_trials, dtype=torch.int32).to(0)
+    )
+    counter.scatter_add_(0, samples.long(), torch.ones_like(samples))
+    freq = counter.float() / num_trials
+    assert torch.all(mask[torch.arange(1), samples] == 1)
+    similarity = torch.cosine_similarity(freq, renorm_probs)
+    assert similarity > 0.99, f"similarity: {similarity}"
+
+
+@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize(
+    "distribution",
+    [
+        normal_distribution(1),
+        normal_distribution(5),
+        gumbel_distribution(0.1),
+        gumbel_distribution(1),
+    ],
+)
+@pytest.mark.parametrize("k", [10, 100, 500])
+def test_top_k_sampling_freq(vocab_size, distribution, k):
+    if k > vocab_size:
+        pytest.skip("k should be less than vocab_size")
+    torch.manual_seed(42)
+    logits = distribution((1, vocab_size), "cuda:0")
+    probs = torch.softmax(logits, dim=-1)
+    sorted_prob, _ = torch.sort(probs, descending=True)
+    pivot = sorted_prob[:, k - 1]
+    mask = (probs >= pivot.unsqueeze(-1)).int()
+
+    renorm_probs = flashinfer.sampling.top_k_renorm_probs(probs, k)
+    counter = torch.zeros(vocab_size, dtype=torch.int32).to(0)
+    num_trials = 5000000
+    samples = flashinfer.sampling.top_k_sampling_from_probs(
+        probs, k, indices=torch.zeros(num_trials, dtype=torch.int32).to(0)
+    )
+    counter.scatter_add_(0, samples.long(), torch.ones_like(samples))
+    freq = counter.float() / num_trials
+    assert torch.all(mask[torch.arange(1), samples] == 1)
+    similarity = torch.cosine_similarity(freq, renorm_probs)
+    assert similarity > 0.99, f"similarity: {similarity}"
+
+
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
 def test_sampling(batch_size, vocab_size):
@@ -39,7 +155,6 @@ def test_sampling(batch_size, vocab_size):
 def test_top_p_sampling(batch_size, vocab_size, p):
     torch.manual_seed(42)
     eps = 1e-4
-    max_top_p_trails = 32
     pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
     sorted_prob, indices = torch.sort(normalized_prob, descending=False)
@@ -115,7 +230,6 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
         k = int(vocab_size * 0.1)
     else:
         raise ValueError("p not recognized")
-    max_top_k_trails = 32
     eps = 1e-4
     pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
@@ -208,7 +322,7 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
     cdf = torch.cumsum(sorted_prob, dim=-1)
     mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32).to(0)
     mask.scatter_add_(1, indices, (cdf >= (1 - p)).int())
-    renorm_prob_ground_truth = normalized_prob
+    renorm_prob_ground_truth = normalized_prob.clone()
     renorm_prob_ground_truth[mask == 0] = 0
     renorm_prob_ground_truth = renorm_prob_ground_truth / renorm_prob_ground_truth.sum(
         dim=-1, keepdim=True
@@ -235,19 +349,20 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k):
     sorted_prob, _ = torch.sort(normalized_prob, descending=True)
     pivot = sorted_prob[:, k - 1]
     mask = (normalized_prob >= pivot.unsqueeze(-1)).int()
-    renorm_prob_ground_truth = normalized_prob
+    renorm_prob_ground_truth = normalized_prob.clone()
     renorm_prob_ground_truth[mask == 0] = 0
     renorm_prob_ground_truth = renorm_prob_ground_truth / renorm_prob_ground_truth.sum(
         dim=-1, keepdim=True
     )
 
     renorm_prob = flashinfer.sampling.top_k_renorm_probs(normalized_prob, k)
-    torch.testing.assert_close(
-        renorm_prob_ground_truth,
-        renorm_prob,
-        rtol=1e-3,
-        atol=1e-3,
-    )
+    for i in range(batch_size):
+        torch.testing.assert_close(
+            renorm_prob_ground_truth[i],
+            renorm_prob[i],
+            rtol=1e-3,
+            atol=1e-3,
+        )
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
@@ -350,6 +465,9 @@ def test_chain_speculative_sampling(
 
 
 if __name__ == "__main__":
+    test_sampling_freq(128256, gumbel_distribution(0.1), 0.5)
+    test_top_p_sampling_freq(128256, gumbel_distribution(0.1), 0.5)
+    test_top_k_sampling_freq(1, 128256, 10)
     test_sampling(19, 500)
     test_sampling(1, 111)
     test_top_p_sampling(3, 111, 0.9)
