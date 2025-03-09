@@ -84,6 +84,10 @@ def test_top_p_sampling_counter(vocab_size, distribution, p):
     torch.manual_seed(42)
     logits = distribution((1, vocab_size), "cuda:0")
     probs = torch.softmax(logits, dim=-1)
+    sorted_prob, indices = torch.sort(probs, descending=False)
+    cdf = torch.cumsum(sorted_prob, dim=-1)
+    mask = torch.zeros(1, vocab_size, dtype=torch.int32).to(0)
+    mask.scatter_add_(1, indices, (cdf > (1 - p)).int())
 
     renorm_probs = flashinfer.sampling.top_p_renorm_probs(probs, p)
     counter = torch.zeros(vocab_size, dtype=torch.int32).to(0)
@@ -93,6 +97,7 @@ def test_top_p_sampling_counter(vocab_size, distribution, p):
     )
     counter.scatter_add_(0, samples.long(), torch.ones_like(samples))
     freq = counter.float() / num_trials
+    assert torch.all(mask[torch.arange(1), samples] == 1)
     similarity = torch.cosine_similarity(freq, renorm_probs)
     assert similarity > 0.99, f"similarity: {similarity}"
 
@@ -112,9 +117,11 @@ def test_top_k_sampling_counter(vocab_size, distribution, k):
     torch.manual_seed(42)
     logits = distribution((1, vocab_size), "cuda:0")
     probs = torch.softmax(logits, dim=-1)
+    sorted_prob, _ = torch.sort(probs, descending=True)
+    pivot = sorted_prob[:, k - 1]
+    mask = (probs >= pivot.unsqueeze(-1)).int()
 
     renorm_probs = flashinfer.sampling.top_k_renorm_probs(probs, k)
-
     counter = torch.zeros(vocab_size, dtype=torch.int32).to(0)
     num_trials = 5000000
     samples = flashinfer.sampling.top_k_sampling_from_probs(
@@ -122,6 +129,7 @@ def test_top_k_sampling_counter(vocab_size, distribution, k):
     )
     counter.scatter_add_(0, samples.long(), torch.ones_like(samples))
     freq = counter.float() / num_trials
+    assert torch.all(mask[torch.arange(1), samples] == 1)
     similarity = torch.cosine_similarity(freq, renorm_probs)
     assert similarity > 0.99, f"similarity: {similarity}"
 
