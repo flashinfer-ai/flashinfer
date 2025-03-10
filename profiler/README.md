@@ -8,6 +8,7 @@ The Chrome tracing do not support overlapping events inside a single thread (the
 
 ```bash
 # pip install from github
+pip install protobuf==3.20.0
 pip install git+https://github.com/ihavnoid/tg4perfetto.git
 ```
 
