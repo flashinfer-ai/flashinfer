@@ -55,11 +55,9 @@ from .utils import parallel_load_modules as parallel_load_modules
 
 import os
 import ctypes
-if os.path.exists("/usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.12"):
-    ctypes.CDLL(
-        "/usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.12",
-        mode=ctypes.RTLD_GLOBAL,
-    )
+cuda_lib_path = os.environ.get('CUDA_LIB_PATH', '/usr/local/cuda/targets/x86_64-linux/lib/')
+if os.path.exists(f"{cuda_lib_path}/libcudart.so.12"):
+    ctypes.CDLL(f"{cuda_lib_path}/libcudart.so.12", mode=ctypes.RTLD_GLOBAL)
 
 
 try:
