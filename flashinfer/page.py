@@ -88,6 +88,41 @@ def block_sparse_indices_to_vector_sparse_offsets(
 
 
 @register_custom_op(
+    "flashinfer::append_paged_mla_kv_cache",
+    mutates_args=("ckv_cache", "kpe_cache"),
+)
+def _append_paged_mla_kv_cache_kernel(
+    append_ckv: torch.Tensor,
+    append_kpe: torch.Tensor,
+    batch_indices: torch.Tensor,
+    positions: torch.Tensor,
+    ckv_cache: Optional[torch.Tensor],
+    kpe_cache: Optional[torch.Tensor],
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
+) -> None:
+    with append_ckv.device as device:
+        batch_indices = batch_indices.int()
+        positions = positions.int()
+        kv_indices = kv_indices.int()
+        kv_indptr = kv_indptr.int()
+        kv_last_page_len = kv_last_page_len.int()
+        get_page_module().append_paged_mla_kv_cache(
+            append_ckv,
+            append_kpe,
+            batch_indices,
+            positions,
+            ckv_cache,
+            kpe_cache,
+            kv_indices,
+            kv_indptr,
+            kv_last_page_len,
+            get_cuda_stream(device),
+        )
+
+
+@register_custom_op(
     "flashinfer::append_paged_kv_cache",
     mutates_args=("paged_k_cache", "paged_v_cache"),
 )
@@ -218,6 +253,55 @@ def get_seq_lens(
     return (
         torch.clamp(kv_indptr[1:] - kv_indptr[:-1] - 1, min=0) * page_size
         + kv_last_page_len
+    )
+
+
+def append_paged_mla_kv_cache(
+    append_ckv: torch.Tensor,
+    append_kpe: torch.Tensor,
+    batch_indices: torch.Tensor,
+    positions: torch.Tensor,
+    ckv_cache: Optional[torch.Tensor],
+    kpe_cache: Optional[torch.Tensor],
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
+) -> None:
+    r"""Append a batch of key-value pairs to a paged key-value cache,
+    Note: current only support ckv=512 and kpe=64
+
+    Parameters
+    ----------
+    append_ckv : torch.Tensor
+        The compressed kv tensor to append in ragged tensor format, shape:
+        ``[append_indptr[-1], ckv_dim]``.
+    append_kpe : torch.Tensor
+        The value tensor to append in ragged tensor format, shape:
+        ``[append_indptr[-1], kpe_dim]``.
+    batch_indices : torch.Tensor
+        The batch indices of the each entry in the appended key-value pairs, shape: ``[append_indptr[-1]]``.
+    positions : torch.Tensor
+        The positions of the each entry in the appended key-value pairs, shape: ``[append_indptr[-1]]``.
+    ckv_cache : cache for compressed kv, torch.Tensor, shape: [page_num, page_size, ckv_dim]
+    kpe_cache : cache for key position embedding, torch.Tensor, shape: [page_num, page_size, kpe_dim]
+    kv_indices : torch.Tensor
+        The page indices of the paged kv-cache, shape: ``[kv_indptr[-1]]``.
+    kv_indptr : torch.Tensor
+        The indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
+    kv_last_page_len : torch.Tensor
+        The number of entries in the last page of each request in the paged kv cache,
+        shape: ``[batch_size]``.
+    """
+    _append_paged_mla_kv_cache_kernel(
+        append_ckv,
+        append_kpe,
+        batch_indices,
+        positions,
+        ckv_cache,
+        kpe_cache,
+        kv_indices,
+        kv_indptr,
+        kv_last_page_len,
     )
 
 
