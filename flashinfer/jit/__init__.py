@@ -52,6 +52,16 @@ from .core import clear_cache_dir, load_cuda_ops  # noqa: F401
 from .env import *
 from .utils import parallel_load_modules as parallel_load_modules
 
+
+import os
+import ctypes
+if os.path.exists("/usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.12"):
+    ctypes.CDLL(
+        "/usr/local/cuda/targets/x86_64-linux/lib/libcudart.so.12",
+        mode=ctypes.RTLD_GLOBAL,
+    )
+
+
 try:
     from .. import flashinfer_kernels, flashinfer_kernels_sm90  # noqa: F401
     from .aot_config import prebuilt_ops_uri as prebuilt_ops_uri
