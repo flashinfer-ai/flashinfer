@@ -83,7 +83,7 @@ stage("Build AOT Wheel") {
         ws(per_exec_ws('flashinfer-aot-wheel')) {
           init_git(true)
           sh(script: "ls -alh", label: 'Show work directory')
-          sh(script: '${docker_run} -e FLASHINFER_ENABLE_AOT=1 -e TORCH_CUDA_ARCH_LIST=8.9 python3 -m build --no-isolation --wheel')
+          sh(script: '${docker_run} -e FLASHINFER_ENABLE_AOT 1 -e TORCH_CUDA_ARCH_LIST 8.9 python3 -m build --no-isolation --wheel')
         }
       }
     }
