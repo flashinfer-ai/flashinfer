@@ -51,10 +51,13 @@ void silu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl, int64_t c
     config.numAttrs = 1;
     config.attrs = attrs;
 
-    using kernel = flashinfer::activation::act_and_mul_kernel<c_type, silu>;
+    auto kernel = flashinfer::activation::act_and_mul_kernel<c_type, silu>;
 
-    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out.data_ptr()),
-                                            static_cast<c_type*>(input.data_ptr()), d));
+    cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out.data_ptr()),
+                       static_cast<c_type*>(input.data_ptr()), d);
+
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "Failed to launch kernel: ", cudaGetErrorString(err));
 
     return true;
   });
@@ -78,10 +81,13 @@ void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl, int6
     config.numAttrs = 1;
     config.attrs = attrs;
 
-    using kernel = flashinfer::activation::act_and_mul_kernel<c_type, gelu_tanh>;
+    auto kernel = flashinfer::activation::act_and_mul_kernel<c_type, gelu_tanh>;
 
-    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out.data_ptr()),
-                                            static_cast<c_type*>(input.data_ptr()), d));
+    cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out.data_ptr()),
+                       static_cast<c_type*>(input.data_ptr()), d);
+
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "Failed to launch kernel: ", cudaGetErrorString(err));
 
     return true;
   });
@@ -106,10 +112,13 @@ void gelu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl, int64_t c
     config.numAttrs = 1;
     config.attrs = attrs;
 
-    using kernel = flashinfer::activation::act_and_mul_kernel<c_type, gelu>;
+    auto kernel = flashinfer::activation::act_and_mul_kernel<c_type, gelu>;
 
-    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out.data_ptr()),
-                                            static_cast<c_type*>(input.data_ptr()), d));
+    cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out.data_ptr()),
+                       static_cast<c_type*>(input.data_ptr()), d);
+
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "Failed to launch kernel: ", cudaGetErrorString(err));
 
     return true;
   });
