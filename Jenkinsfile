@@ -423,6 +423,6 @@ def unittest() {
   }
 }
 
-// build()
+build()
 // lint()
 // unittest()
