@@ -63,10 +63,11 @@ def init_git(submodule = false) {
 stage('Unittest') {
   parallel(
     'CUDA': {
-      node('') {
+      node('GPU-SPOT') {
         ws(per_exec_ws('flashinfer-unittest')) {
-          init_git(true)
-          sh(script: "ls -alh", label: 'Show work directory')
+          sh(script: "nvidia-smi", label: 'Show GPU info')
+          // init_git(true)
+          // sh(script: "ls -alh", label: 'Show work directory')
           // sh(script: "ls -alh", label: 'Show work directory')
           // unpack_lib('mlc_wheel_cuda', 'wheels/*.whl')
           // sh(script: "${run_cuda} conda env export --name ci-unittest", label: 'Checkout version')
