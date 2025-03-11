@@ -18,9 +18,9 @@
 
 //========== activation ==========
 
-void silu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
-void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
-void gelu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream);
+void silu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl, int64_t cuda_stream);
+void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl, int64_t cuda_stream);
+void gelu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl, int64_t cuda_stream);
 
 //========== cascade ==========
 
@@ -66,17 +66,17 @@ void CutlassSegmentGEMM(at::Tensor workspace_buffer, at::Tensor all_problems, at
 
 //========== norm ==========
 
-void rmsnorm(at::Tensor& out, at::Tensor& input, at::Tensor& weight, double eps,
+void rmsnorm(at::Tensor& out, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl,
              int64_t cuda_stream);
 
 void fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps,
-                       int64_t cuda_stream);
+                       bool enable_pdl, int64_t cuda_stream);
 
 void gemma_rmsnorm(at::Tensor& out, at::Tensor& input, at::Tensor& weight, double eps,
-                   int64_t cuda_stream);
+                   bool enable_pdl, int64_t cuda_stream);
 
 void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight,
-                             double eps, int64_t cuda_stream);
+                             double eps, bool enable_pdl, int64_t cuda_stream);
 
 //========== page ==========
 
