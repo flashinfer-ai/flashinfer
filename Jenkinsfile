@@ -39,10 +39,26 @@
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils
 // These are set at runtime from data in ci/jenkins/docker-images.yml, update
 // image tags in that file
-run_cuda = "bash ci/bash.sh flashinfer/flashinfer-ci:latest"
+docker_run = "bash ci/bash.sh flashinfer/flashinfer-ci:latest"
 
 def per_exec_ws(folder) {
   return "workspace/exec_${env.EXECUTOR_NUMBER}/" + folder
+}
+
+def pack_lib(name, libs) {
+  sh """
+     echo "Packing ${libs} into ${name}"
+     echo ${libs} | sed -e 's/,/ /g' | xargs md5sum
+     """
+  stash includes: libs, name: name
+}
+
+def unpack_lib(name, libs) {
+  unstash name
+  sh """
+     echo "Unpacked ${libs} from ${name}"
+     echo ${libs} | sed -e 's/,/ /g' | xargs md5sum
+     """
 }
 
 def init_git(submodule = false) {
@@ -67,6 +83,7 @@ stage("Build AOT Wheel") {
         ws(per_exec_ws('flashinfer-aot-wheel')) {
           init_git(true)
           sh(script: "ls -alh", label: 'Show work directory')
+          sh(script: "${docker_run} nvidia-smi")
         }
       }
     }
