@@ -63,7 +63,7 @@ def init_git(submodule = false) {
 stage('Unittest') {
   parallel(
     'CUDA': {
-      node('GPU-SPOT') {
+      node('GPU-G5-SPOT') {
         ws(per_exec_ws('flashinfer-unittest')) {
           sh(script: "nvidia-smi", label: 'Show GPU info')
           // init_git(true)
