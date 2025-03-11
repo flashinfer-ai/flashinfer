@@ -40,6 +40,7 @@ import org.jenkinsci.plugins.pipeline.modeldefinition.Utils
 // These are set at runtime from data in ci/jenkins/docker-images.yml, update
 // image tags in that file
 docker_run = "bash ci/bash.sh flashinfer/flashinfer-ci:latest"
+torch_cuda_arch_list = "7.5 8.0 8.9 9.0+PTX"
 
 def per_exec_ws(folder) {
   return "workspace/exec_${env.EXECUTOR_NUMBER}/" + folder
@@ -83,7 +84,7 @@ stage("Build AOT Wheel") {
         ws(per_exec_ws('flashinfer-aot-wheel')) {
           init_git(true)
           sh(script: "ls -alh", label: 'Show work directory')
-          sh(script: "${docker_run} -e FLASHINFER_ENABLE_AOT=1 -e TORCH_CUDA_ARCH_LIST=8.9 python3 -m build --no-isolation --wheel")
+          sh(script: "${docker_run} -e 'FLASHINFER_ENABLE_AOT=1' -e 'TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}' python3 -m build --no-isolation --wheel")
         }
       }
     }
