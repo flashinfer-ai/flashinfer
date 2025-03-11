@@ -344,7 +344,7 @@ def run_lint(node_type) {
             'TEST_STEP_NAME=lint'], {
             ci_setup(ci_image)
             sh (
-              script: "${docker_run} ${ci_image} ./tests/task_lint.sh",
+              script: "${docker_run} ${ci_image} ./tests/scripts/task_lint.sh",
               label: 'Run lint',
             )
           })
@@ -423,6 +423,6 @@ def unittest() {
   }
 }
 
-build()
-// lint()
+// build()
+lint()
 // unittest()
