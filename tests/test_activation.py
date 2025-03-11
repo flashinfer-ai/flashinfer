@@ -18,36 +18,49 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.utils import get_compute_capability
 
 
 @pytest.mark.parametrize("dim", [128, 256, 512, 2048, 4096, 11008, 16384])
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
 @pytest.mark.parametrize("seq_len", [1, 2, 4, 8, 16, 32, 64, 128, 512])
-def test_fused_silu_mul(dim, batch_size, seq_len):
+@pytest.mark.parametrize("enable_pdl", [True, False])
+def test_fused_silu_mul(dim, batch_size, seq_len, enable_pdl):
     x = torch.randn(batch_size, seq_len, 2 * dim).to(0).to(torch.float16)
+    major, _ = get_compute_capability(x.device)
+    if major < 9 and enable_pdl:
+        pytest.skip("PDL is only available for Hopper and later GPUs")
     y_ref = x[..., dim:] * torch.nn.functional.silu(x[..., :dim])
-    y = flashinfer.activation.silu_and_mul(x)
+    y = flashinfer.activation.silu_and_mul(x, enable_pdl=enable_pdl)
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("dim", [128, 256, 512, 2048, 4096, 11008, 16384])
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
 @pytest.mark.parametrize("seq_len", [1, 2, 4, 8, 16, 32, 64, 128, 512])
-def test_fused_gelu_tanh_mul(dim, batch_size, seq_len):
+@pytest.mark.parametrize("enable_pdl", [True, False])
+def test_fused_gelu_tanh_mul(dim, batch_size, seq_len, enable_pdl):
     x = torch.randn(batch_size, seq_len, 2 * dim).to(0).to(torch.float16)
+    major, _ = get_compute_capability(x.device)
+    if major < 9 and enable_pdl:
+        pytest.skip("PDL is only available for Hopper and later GPUs")
     y_ref = x[..., dim:] * torch.nn.functional.gelu(x[..., :dim], approximate="tanh")
-    y = flashinfer.activation.gelu_tanh_and_mul(x)
+    y = flashinfer.activation.gelu_tanh_and_mul(x, enable_pdl=enable_pdl)
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("dim", [128, 256, 512, 2048, 4096, 11008, 16384])
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
 @pytest.mark.parametrize("seq_len", [1, 2, 4, 8, 16, 32, 64, 128, 512])
-def test_fused_gelu_mul(dim, batch_size, seq_len):
+@pytest.mark.parametrize("enable_pdl", [True, False])
+def test_fused_gelu_mul(dim, batch_size, seq_len, enable_pdl):
     x = torch.randn(batch_size, seq_len, 2 * dim).to(0).to(torch.float16)
+    major, _ = get_compute_capability(x.device)
+    if major < 9 and enable_pdl:
+        pytest.skip("PDL is only available for Hopper and later GPUs")
     y_ref = x[..., dim:] * torch.nn.functional.gelu(x[..., :dim], approximate="none")
-    y = flashinfer.activation.gelu_and_mul(x)
+    y = flashinfer.activation.gelu_and_mul(x, enable_pdl=enable_pdl)
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
 
-test_fused_silu_mul(128, 1, 1)
+test_fused_silu_mul(128, 1, 1, True)

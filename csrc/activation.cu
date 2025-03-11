@@ -32,39 +32,62 @@ __device__ __forceinline__ float gelu_tanh(const float& val) {
   return val * cdf;
 }
 
-void silu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream) {
+void silu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl, int64_t cuda_stream) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
-  dim3 grid(num_tokens);
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
-    dim3 block(std::min(d / vec_size, 1024U));
-    flashinfer::activation::act_and_mul_kernel<c_type, silu><<<grid, block, 0, stream>>>(
-        static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
+    cudaLaunchConfig_t config;
+    config.gridDim = num_tokens;
+    config.blockDim = std::min(d / vec_size, 1024U);
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+    config.numAttrs = 1;
+    config.attrs = attrs;
+
+    using kernel = flashinfer::activation::act_and_mul_kernel<c_type, silu>;
+
+    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out.data_ptr()),
+                                            static_cast<c_type*>(input.data_ptr()), d));
 
     return true;
   });
 }
 
-void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream) {
+void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl, int64_t cuda_stream) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
-  dim3 grid(num_tokens);
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
-    dim3 block(std::min(d / vec_size, 1024U));
-    flashinfer::activation::act_and_mul_kernel<c_type, gelu_tanh><<<grid, block, 0, stream>>>(
-        static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
+    cudaLaunchConfig_t config;
+    config.gridDim = num_tokens;
+    config.blockDim = std::min(d / vec_size, 1024U);
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+    config.numAttrs = 1;
+    config.attrs = attrs;
+
+    using kernel = flashinfer::activation::act_and_mul_kernel<c_type, gelu_tanh>;
+
+    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out.data_ptr()),
+                                            static_cast<c_type*>(input.data_ptr()), d));
 
     return true;
   });
 }
 
-void gelu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream) {
+void gelu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl, int64_t cuda_stream) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
   dim3 grid(num_tokens);
@@ -72,9 +95,21 @@ void gelu_and_mul(at::Tensor& out, at::Tensor& input, int64_t cuda_stream) {
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
-    dim3 block(std::min(d / vec_size, 1024U));
-    flashinfer::activation::act_and_mul_kernel<c_type, gelu><<<grid, block, 0, stream>>>(
-        static_cast<c_type*>(out.data_ptr()), static_cast<c_type*>(input.data_ptr()), d);
+    cudaLaunchConfig_t config;
+    config.gridDim = num_tokens;
+    config.blockDim = std::min(d / vec_size, 1024U);
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+    config.numAttrs = 1;
+    config.attrs = attrs;
+
+    using kernel = flashinfer::activation::act_and_mul_kernel<c_type, gelu>;
+
+    FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out.data_ptr()),
+                                            static_cast<c_type*>(input.data_ptr()), d));
 
     return true;
   });
