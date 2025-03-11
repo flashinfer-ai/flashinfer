@@ -113,7 +113,7 @@ def silu_and_mul(
         The output tensor, if specified, the kernel will update this tensor inplace.
 
     enable_pdl: bool
-        Whether to enable `programmatic dependency loading
+        Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
 
     Returns
@@ -155,7 +155,7 @@ def gelu_tanh_and_mul(
         The output tensor, if specified, the kernel will update this tensor inplace.
 
     enable_pdl: bool
-        Whether to enable `programmatic dependency loading
+        Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
 
     Returns
@@ -193,7 +193,7 @@ def gelu_and_mul(
         The output tensor, if specified, the kernel will update this tensor inplace.
 
     enable_pdl: bool
-        Whether to enable `programmatic dependency loading
+        Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
 
     Returns
