@@ -64,7 +64,7 @@ def rmsnorm(
     out: Optional[torch.Tensor]
         The output tensor, if specified, the kernel will update this tensor inplace.
     enable_pdl: bool
-        Whether to enable `programmatic dependency loading
+        Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
 
     Returns
@@ -130,7 +130,7 @@ def fused_add_rmsnorm(
     eps: float
         Epsilon for numerical stability.
     enable_pdl: bool
-        Whether to enable `programmatic dependency loading
+        Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
     """
     with input.device as device:  # device guard
@@ -172,7 +172,7 @@ def gemma_rmsnorm(
     out: Optional[torch.Tensor]
         The output tensor, if specified, the kernel will update this tensor inplace.
     enable_pdl: bool
-        Whether to enable `programmatic dependency loading
+        Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
 
     Returns
@@ -240,7 +240,7 @@ def gemma_fused_add_rmsnorm(
     eps: float
         Epsilon for numerical stability.
     enable_pdl: bool
-        Whether to enable `programmatic dependency loading
+        Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
     """
     with input.device as device:
