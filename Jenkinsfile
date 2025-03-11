@@ -60,20 +60,33 @@ def init_git(submodule = false) {
   }
 }
 
-stage('Unittest') {
+stage("Build AOT Wheel") {
   parallel(
-    'CUDA': {
-      node('GPU-G5-SPOT') {
-        ws(per_exec_ws('flashinfer-unittest')) {
-          sh(script: "nvidia-smi", label: 'Show GPU info')
-          // init_git(true)
-          // sh(script: "ls -alh", label: 'Show work directory')
-          // sh(script: "ls -alh", label: 'Show work directory')
-          // unpack_lib('mlc_wheel_cuda', 'wheels/*.whl')
-          // sh(script: "${run_cuda} conda env export --name ci-unittest", label: 'Checkout version')
-          // sh(script: "${run_cuda} conda run -n ci-unittest ./ci/task/test_unittest.sh", label: 'Testing')
+    'CPU': {
+      node("CPU-SPOT") {
+        ws(per_exec_ws('flashinfer-aot-wheel')) {
+          init_git(true)
+          sh(script: "ls -alh", label: 'Show work directory')
         }
       }
     }
   )
 }
+
+// stage('Unittest') {
+//   parallel(
+//     'CUDA': {
+//       node('GPU-G6-SPOT') {
+//         ws(per_exec_ws('flashinfer-unittest')) {
+//           // sh(script: "nvidia-smi", label: 'Show GPU info')
+//           // init_git(true)
+//           sh(script: "ls -alh", label: 'Show work directory')
+//           // sh(script: "ls -alh", label: 'Show work directory')
+//           // unpack_lib('mlc_wheel_cuda', 'wheels/*.whl')
+//           // sh(script: "${run_cuda} conda env export --name ci-unittest", label: 'Checkout version')
+//           // sh(script: "${run_cuda} conda run -n ci-unittest ./ci/task/test_unittest.sh", label: 'Testing')
+//         }
+//       }
+//     }
+//   )
+// }
