@@ -100,7 +100,11 @@ if __name__ == "__main__":
         "--path", type=str, required=True, help="Path to the dispatch inc file"
     )
     parser.add_argument(
-        "--head_dims_sm90", type=str, required=True, nargs="+", help="Head dimensions in format of 'head_dim_qk,head_dim_vo'",
+        "--head_dims_sm90",
+        type=str,
+        required=True,
+        nargs="+",
+        help="Head dimensions in format of 'head_dim_qk,head_dim_vo'",
     )
     parser.add_argument(
         "--head_dims", type=int, required=True, nargs="+", help="Head dimensions"
