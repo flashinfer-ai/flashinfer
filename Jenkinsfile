@@ -78,8 +78,8 @@ def init_git(submodule = false) {
 
 stage('JIT Unittest') {
   parallel(
-    'L4-SM_89': {
-      node('GPU-G6-SPOT') {
+    'G5-SM_80': {
+      node('GPU-G5-SPOT') {
         ws(per_exec_ws('flashinfer-unittest')) {
           init_git(false)
           sh(script: "ls -alh", label: 'Show work directory')
