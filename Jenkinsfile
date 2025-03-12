@@ -76,6 +76,14 @@ def init_git(submodule = false) {
   }
 }
 
+stage('Lint') {
+  node('CPU-SPOT') {
+    ws(per_exec_ws('flashinfer-lint')) {
+      init_git(false)
+    }
+  }
+}
+
 stage('JIT Unittest') {
   parallel(
     'G5-SM_80': {
