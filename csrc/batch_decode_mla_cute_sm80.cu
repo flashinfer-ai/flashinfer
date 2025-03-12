@@ -1,11 +1,9 @@
-#include <optional>
-
-#include "pytorch_extension_utils.h"
-
-#include "mla_config.inc"
-
 #include <flashinfer/attention/decode_mla_cute_sm80.cuh>
 #include <flashinfer/attention/scheduler.cuh>
+#include <optional>
+
+#include "mla_config.inc"
+#include "pytorch_extension_utils.h"
 
 using namespace flashinfer;
 
@@ -22,9 +20,8 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlanMLA(
   DecodePlanInfo plan_info;
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
 
-  auto work_estimation_func =
-      BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMlaCuteSM80<HEAD_DIM_CKV, HEAD_DIM_KPE, QO_TILE_LEN,
-                                                             AttentionVariant, Params>;
+  auto work_estimation_func = BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMlaCuteSM80<
+      HEAD_DIM_CKV, HEAD_DIM_KPE, QO_TILE_LEN, AttentionVariant, Params>;
   cudaError_t status =
       DecodePlan<HEAD_DIM_CKV, flashinfer::PosEncodingMode::kNone, AttentionVariant, Params>(
           static_cast<void*>(float_workspace_buffer.data_ptr()), float_workspace_size_in_bytes,
@@ -39,7 +36,6 @@ std::vector<int64_t> BatchDecodeWithPagedKVCachePlanMLA(
 
   return plan_info.ToVector();
 }
-
 
 void BatchDecodeWithPagedKVCacheRunMLA(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
@@ -99,9 +95,9 @@ void BatchDecodeWithPagedKVCacheRunMLA(
   params.padded_batch_size = plan_info.padded_batch_size;
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-  cudaError_t status =
-      BatchDecodeWithPagedKVCacheDispatchedMlaCuteSM80<HEAD_DIM_CKV, HEAD_DIM_KPE, QO_TILE_LEN, 
-                                               Params>(params, tmp_v, tmp_s, /*stream=*/stream);
+  cudaError_t status = BatchDecodeWithPagedKVCacheDispatchedMlaCuteSM80<HEAD_DIM_CKV, HEAD_DIM_KPE,
+                                                                        QO_TILE_LEN, Params>(
+      params, tmp_v, tmp_s, /*stream=*/stream);
   TORCH_CHECK(status == cudaSuccess, "BatchDecodeWithPagedKVCache failed with error ",
               cudaGetErrorString(status));
 }

@@ -14,6 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import ctypes
+import os
+
 # Re-export
 from .activation import gen_act_and_mul_module as gen_act_and_mul_module
 from .activation import get_act_and_mul_cu_str as get_act_and_mul_cu_str
@@ -52,10 +55,9 @@ from .core import clear_cache_dir, load_cuda_ops  # noqa: F401
 from .env import *
 from .utils import parallel_load_modules as parallel_load_modules
 
-
-import os
-import ctypes
-cuda_lib_path = os.environ.get('CUDA_LIB_PATH', '/usr/local/cuda/targets/x86_64-linux/lib/')
+cuda_lib_path = os.environ.get(
+    "CUDA_LIB_PATH", "/usr/local/cuda/targets/x86_64-linux/lib/"
+)
 if os.path.exists(f"{cuda_lib_path}/libcudart.so.12"):
     ctypes.CDLL(f"{cuda_lib_path}/libcudart.so.12", mode=ctypes.RTLD_GLOBAL)
 

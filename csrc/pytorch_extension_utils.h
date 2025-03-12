@@ -15,7 +15,6 @@
  */
 #pragma once
 #include <Python.h>
-
 #include <torch/library.h>
 
 #ifdef FLASHINFER_ENABLE_BF16
@@ -40,20 +39,20 @@
    The import from Python will load the .so consisting of the file
    in this extension, so that the TORCH_LIBRARY_FRAGMENT static initializers
    are run. */
-#define FLASHINFER_EXT_MODULE_INIT(name) \
-extern "C" { \
-  __attribute__((weak)) PyObject *PyInit_##name(void) { \
-    static struct PyModuleDef module_def = { \
-      PyModuleDef_HEAD_INIT, \
-      #name,  /* name of module */ \
-      NULL,   /* module documentation, may be NULL */ \
-      -1,     /* size of per-interpreter state of the module, \
-                 or -1 if the module keeps state in global variables. */ \
-      NULL,   /* methods */ \
-    }; \
-    return PyModule_Create(&module_def); \
-  } \
-}
+#define FLASHINFER_EXT_MODULE_INIT(name)                                  \
+  extern "C" {                                                            \
+  __attribute__((weak)) PyObject* PyInit_##name(void) {                   \
+    static struct PyModuleDef module_def = {                              \
+        PyModuleDef_HEAD_INIT,                                            \
+        #name, /* name of module */                                       \
+        NULL,  /* module documentation, may be NULL */                    \
+        -1,    /* size of per-interpreter state of the module,            \
+                  or -1 if the module keeps state in global variables. */ \
+        NULL,  /* methods */                                              \
+    };                                                                    \
+    return PyModule_Create(&module_def);                                  \
+  }                                                                       \
+  }
 
 FLASHINFER_EXT_MODULE_INIT_EXPAND(TORCH_EXTENSION_NAME)
 

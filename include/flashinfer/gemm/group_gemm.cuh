@@ -36,9 +36,9 @@ namespace group_gemm {
 
 template <typename DType>
 cudaError_t CutlassSegmentGEMMRun(void* workspace_buffer, size_t workspace_buffer_size_in_bytes,
-                                  void* all_problems, int64_t batch_size, void* x, void* w,
-                                  void* y, void* x_ld, void* w_ld, void* y_ld,
-                                  bool weight_column_major, cudaStream_t stream) {
+                                  void* all_problems, int64_t batch_size, void* x, void* w, void* y,
+                                  void* x_ld, void* w_ld, void* y_ld, bool weight_column_major,
+                                  cudaStream_t stream) {
   using cutlass::epilogue::thread::LinearCombination;
   using cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle;
   DISPATCH_WEIGHT_LAYOUT(weight_column_major, WEIGHT_LAYOUT, {

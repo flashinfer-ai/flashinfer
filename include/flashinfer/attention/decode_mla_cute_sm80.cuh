@@ -375,7 +375,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMlaCuteSM80(Params params) {
       cp_async::wait_group<1 * k_smem_stages - 1>();
     }
     block.sync();
-    
+
     if (tx < k_warp_rows * 32) {
       clear(reg_att_part_c);
 #pragma unroll
@@ -408,20 +408,20 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMlaCuteSM80(Params params) {
     if (tx < QO_TILE_LEN) {
       uint32_t valid_kv_len = cur_chunk_len - iter * k_kv_tile_len;
       valid_kv_len = (valid_kv_len < k_kv_tile_len) ? valid_kv_len : k_kv_tile_len;
-      
+
       float row_max_prev = row_max;
 #pragma unroll
-      for (int i=0; i<k_kv_tile_len; ++i) {
+      for (int i = 0; i < k_kv_tile_len; ++i) {
         if (i >= valid_kv_len) smem_att(tx, i) = -flashinfer::math::inf;
         row_max = max(row_max, smem_att(tx, i));
       }
-      
+
       float row_o_scale = math::ptx_exp2(row_max_prev - row_max);
       smem_o_scale(tx) = row_o_scale;
-      
+
       row_denom *= row_o_scale;
 #pragma unroll
-      for (int i=0; i<k_kv_tile_len; ++i) {
+      for (int i = 0; i < k_kv_tile_len; ++i) {
         smem_att(tx, i) = math::ptx_exp2(smem_att(tx, i) - row_max);
         row_denom += smem_att(tx, i);
       }
@@ -430,7 +430,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMlaCuteSM80(Params params) {
     block.sync();
 
     // Phase3 compute output
-    
+
     // below code block is executed by all 8 warps
     {
 #pragma unroll
@@ -441,7 +441,6 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMlaCuteSM80(Params params) {
       cute::copy(s2r_tiled_copy_b_ckv, smem_v_part(_, _, _, stage_idx), reg_v_part_view);
       cute::gemm(tiled_mma_output, reg_output_part, reg_att_part_a, reg_v_part, reg_output_part);
     }
-
 
     if (tx < k_warp_rows * 32) {
       // refill offset_smem

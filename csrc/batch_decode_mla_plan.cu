@@ -3,16 +3,17 @@
 #include <optional>
 
 #include "mla_config.inc"
-#include "pytorch_extension_utils.h"
 #include "pytorch_conversion_utils.h"
+#include "pytorch_extension_utils.h"
 
 using namespace flashinfer;
 
-at::Tensor BatchDecodeWithPagedKVCachePlanMLA(
-    at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
-    at::Tensor page_locked_int_workspace_buffer, at::Tensor indptr, int64_t batch_size,
-    int64_t num_qo_heads, int64_t page_size, bool enable_cuda_graph,
-    int64_t cuda_stream) {
+at::Tensor BatchDecodeWithPagedKVCachePlanMLA(at::Tensor float_workspace_buffer,
+                                              at::Tensor int_workspace_buffer,
+                                              at::Tensor page_locked_int_workspace_buffer,
+                                              at::Tensor indptr, int64_t batch_size,
+                                              int64_t num_qo_heads, int64_t page_size,
+                                              bool enable_cuda_graph, int64_t cuda_stream) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =

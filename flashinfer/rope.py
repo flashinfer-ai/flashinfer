@@ -281,6 +281,7 @@ def _fake_apply_llama31_rope_pos_ids(
 ) -> None:
     pass
 
+
 def apply_rope_inplace(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1001,7 +1002,7 @@ def apply_llama31_rope_pos_ids(
 
 def apply_rope_with_cos_sin_cache(
     positions: torch.Tensor,
-    query: torch.Tensor, 
+    query: torch.Tensor,
     key: torch.Tensor,
     head_size: int,
     cos_sin_cache: torch.Tensor,
@@ -1045,7 +1046,7 @@ def apply_rope_with_cos_sin_cache(
     """
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")
-    
+
     query_out = torch.empty_like(query)
     key_out = torch.empty_like(key)
 
@@ -1056,14 +1057,15 @@ def apply_rope_with_cos_sin_cache(
         k_rope=key_out.view(key_out.shape[0], -1, head_size),
         cos_sin_cache=cos_sin_cache,
         pos_ids=positions,
-        interleave=(not is_neox)
+        interleave=(not is_neox),
     )
 
     return query_out, key_out
 
+
 def apply_rope_with_cos_sin_cache_inplace(
     positions: torch.Tensor,
-    query: torch.Tensor, 
+    query: torch.Tensor,
     key: torch.Tensor,
     head_size: int,
     cos_sin_cache: torch.Tensor,
@@ -1100,7 +1102,7 @@ def apply_rope_with_cos_sin_cache_inplace(
     """
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")
-    
+
     # pass q_rope and k_rope as q and k to perform inplace operation
     _apply_rope_pos_ids_cos_sin_cache(
         q=query.view(query.shape[0], -1, head_size),
@@ -1109,6 +1111,5 @@ def apply_rope_with_cos_sin_cache_inplace(
         k_rope=key.view(key.shape[0], -1, head_size),
         cos_sin_cache=cos_sin_cache,
         pos_ids=positions,
-        interleave=(not is_neox)
+        interleave=(not is_neox),
     )
-

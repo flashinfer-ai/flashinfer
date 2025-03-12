@@ -16,8 +16,9 @@
 #ifndef FLASHINFER_CP_ASYNC_CUH_
 #define FLASHINFER_CP_ASYNC_CUH_
 
-#include <cstdint>
 #include <cuda_runtime.h>
+
+#include <cstdint>
 
 namespace flashinfer {
 
