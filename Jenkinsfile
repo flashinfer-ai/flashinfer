@@ -91,8 +91,7 @@ stage('JIT Unittest') {
         ws(per_exec_ws('flashinfer-unittest')) {
           init_git(false)
           sh(script: "ls -alh", label: 'Show work directory')
-          sh(script: "${docker_run} pip install -e . -v", label: 'Install flashinfer in JIT mode')
-          sh(script: "${docker_run} ./scripts/task_run_tests.sh", label: 'Testing')
+          sh(script: "${docker_run} ./scripts/task_jit_run_tests.sh", label: 'JIT Unittest')
         }
       }
     }
