@@ -83,7 +83,7 @@ stage("Build AOT Wheel") {
         ws(per_exec_ws('flashinfer-aot-wheel')) {
           init_git(true)
           sh(script: "ls -alh", label: 'Show work directory')
-          sh(script: "${docker_run} -e FLASHINFER_ENABLE_AOT 1 python3 -m build --no-isolation --wheel")
+          sh(script: "${docker_run} --no-gpu -e FLASHINFER_ENABLE_AOT 1 python3 -m build --no-isolation --wheel")
           pack_lib('flashinfer-aot-wheel', 'dist/*.whl')
         }
       }
@@ -93,9 +93,10 @@ stage("Build AOT Wheel") {
 
 stage('Unittest') {
   parallel(
-    'CUDA': {
+    'L4-SM_89': {
       node('GPU-G6-SPOT') {
         ws(per_exec_ws('flashinfer-unittest')) {
+          init_git(false)
           sh(script: "ls -alh", label: 'Show work directory')
           unpack_lib('flashinfer-aot-wheel', 'dist/*.whl')
           sh(script: "${docker_run} ./scripts/task_run_tests.sh", label: 'Testing')
