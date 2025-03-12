@@ -76,29 +76,14 @@ def init_git(submodule = false) {
   }
 }
 
-stage("Build AOT Wheel") {
-  parallel(
-    'CPU': {
-      node("CPU-SPOT") {
-        ws(per_exec_ws('flashinfer-aot-wheel')) {
-          init_git(true)
-          sh(script: "ls -alh", label: 'Show work directory')
-          sh(script: "${docker_run} --no-gpu -e FLASHINFER_ENABLE_AOT 1 python3 -m build --no-isolation --wheel")
-          pack_lib('flashinfer-aot-wheel', 'dist/*.whl')
-        }
-      }
-    }
-  )
-}
-
-stage('Unittest') {
+stage('JIT Unittest') {
   parallel(
     'L4-SM_89': {
       node('GPU-G6-SPOT') {
         ws(per_exec_ws('flashinfer-unittest')) {
           init_git(false)
           sh(script: "ls -alh", label: 'Show work directory')
-          unpack_lib('flashinfer-aot-wheel', 'dist/*.whl')
+          sh(script: "${docker_run} pip install -e . -v", label: 'Install flashinfer in JIT mode')
           sh(script: "${docker_run} ./scripts/task_run_tests.sh", label: 'Testing')
         }
       }
