@@ -18,6 +18,7 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.utils import is_sm90a_supported
 
 
 @pytest.mark.parametrize("seq_len", [11, 99, 1763, 9999, 32767])
@@ -29,6 +30,9 @@ import flashinfer
 def test_single_prefill(
     seq_len, num_qo_heads, num_kv_heads, causal, head_dim, logits_soft_cap
 ):
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("SM90A is not supported")
+
     if num_qo_heads % num_kv_heads != 0:
         pytest.skip("num_qo_heads must be divisible by num_kv_heads")
     torch.random.manual_seed(123)
@@ -62,6 +66,9 @@ def test_single_prefill(
 def test_batch_ragged_prefill(
     batch_size, seq_len, num_qo_heads, num_kv_heads, causal, head_dim, logits_soft_cap
 ):
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("SM90A is not supported")
+
     if num_qo_heads % num_kv_heads != 0:
         pytest.skip("num_qo_heads must be divisible by num_kv_heads")
     torch.random.manual_seed(42)
@@ -128,6 +135,9 @@ def test_deepseek_prefill(
     causal,
     dtype,
 ):
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("SM90A is not supported")
+
     if batch_size * seq_len > 131072:
         pytest.skip()
     head_dim_qk = 192
@@ -206,6 +216,9 @@ def test_batch_paged_prefill(
     head_dim,
     logits_soft_cap,
 ):
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("SM90A is not supported")
+
     if num_qo_heads % num_kv_heads != 0:
         pytest.skip("num_qo_heads must be divisible by num_kv_heads")
     torch.random.manual_seed(42)

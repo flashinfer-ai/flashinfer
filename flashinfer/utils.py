@@ -346,31 +346,25 @@ def determine_attention_backend(
     str
         The name of the attention backend to be used.
     """
-    major, _ = get_compute_capability(device)
-
-    if (
-        major == 9
-        and torch.version.cuda >= "12.3"
-        and is_fa3_backend_supported(
-            pos_encoding_mode,
-            use_fp16_qk_reductions,
-            use_custom_mask,
-            dtype_q,
-            dtype_kv,
-        )
+    if is_sm90a_supported(device) and is_fa3_backend_supported(
+        pos_encoding_mode,
+        use_fp16_qk_reductions,
+        use_custom_mask,
+        dtype_q,
+        dtype_kv,
     ):
         return "fa3"
     else:
         return "fa2"
 
 
-def mla_is_fa3_supported(device: torch.device) -> bool:
+def is_sm90a_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 9 and torch.version.cuda >= "12.3"
 
 
 def determine_mla_backend(device: torch.device) -> str:
-    return "fa3" if mla_is_fa3_supported(device) else "fa2"
+    return "fa3" if is_sm90a_supported(device) else "fa2"
 
 
 def _check_shape_dtype_device(

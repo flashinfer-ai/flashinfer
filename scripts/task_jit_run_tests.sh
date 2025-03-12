@@ -7,6 +7,7 @@ set -x
 
 pip install -e . -v
 
+pytest -s tests/test_block_sparse.py
 pytest -s tests/test_norm.py
 pytest -s tests/test_sampling.py
 pytest -s tests/test_jit_example.py

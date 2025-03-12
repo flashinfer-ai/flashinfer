@@ -48,6 +48,7 @@ def warmup_jit():
                     [False],  # use_fp16_qk_reductions
                 )
             )
+
         except Exception as e:
             # abort the test session if warmup fails
             pytest.exit(str(e))

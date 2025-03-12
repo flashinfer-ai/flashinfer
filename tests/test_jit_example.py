@@ -12,7 +12,7 @@ from flashinfer.jit.attention import (
     gen_customize_single_prefill_module,
 )
 from flashinfer.prefill import single_prefill_with_kv_cache_with_jit_module
-from flashinfer.utils import MaskMode
+from flashinfer.utils import MaskMode, is_sm90a_supported
 
 
 def test_single_decode_mask():
@@ -444,6 +444,9 @@ def test_batch_prefill_flash_sigmoid():
 
 
 def test_batch_prefill_sm90_flash_sigmoid():
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("SM90A is not supported")
+
     torch.manual_seed(42)
     variant_decl = flash_sigmoid_sm90_decl
     jit_args = (
@@ -619,6 +622,9 @@ struct DebugPrintLogits : AttentionVariantBase {
 
 
 def test_sm90_debug_print_logits():
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("SM90A is not supported")
+
     torch.manual_seed(42)
     variant_decl = r"""
 struct DebugPrintLogits : AttentionVariantBase {
