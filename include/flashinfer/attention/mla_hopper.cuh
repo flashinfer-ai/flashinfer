@@ -84,6 +84,36 @@ struct HopperSharedStorageQKVO {
   };
 };
 
+template <typename MainloopPipeline, uint32_t NUM_STAGES, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV,
+          uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename DTypeQ, typename DTypeKV,
+          typename DTypeO>
+struct Hopper2WGSharedStorageQKVO {
+  struct {
+    struct {
+      struct {
+        alignas(16) DTypeQ nope[CTA_TILE_Q * HEAD_DIM_CKV];
+        alignas(16) DTypeQ pe[CTA_TILE_Q * HEAD_DIM_KPE];
+      } q_smem;
+      union {
+        struct {
+          alignas(16) DTypeKV ckv[CTA_TILE_KV * HEAD_DIM_CKV];
+          union {
+            alignas(16) DTypeKV kpe[CTA_TILE_KV * HEAD_DIM_KPE];
+            alignas(16) DTypeKV p[CTA_TILE_Q * CTA_TILE_KV];
+          };
+        };
+        alignas(16) DTypeO o[CTA_TILE_Q * HEAD_DIM_CKV];
+      } kv_o_smem[NUM_STAGES];
+      union {
+        alignas(16) float o_scale[CTA_TILE_Q];
+        alignas(16) float d[CTA_TILE_Q];
+      };
+    };
+
+    typename MainloopPipeline::SharedStorage pipeline_q, pipeline_kv;
+  };
+};
+
 template <bool CAUSAL_, uint32_t NUM_STAGES_, uint32_t HEAD_DIM_CKV_, uint32_t HEAD_DIM_KPE_,
           uint32_t CTA_TILE_Q_, uint32_t CTA_TILE_KV_, typename DTypeQ_, typename DTypeKV_,
           typename DTypeO_, typename IdType_>
@@ -100,6 +130,23 @@ struct HopperKernelTraits
   using SharedStorage =
       HopperSharedStorageQKVO<MainloopPipeline, NUM_STAGES_, CTA_TILE_Q_, CTA_TILE_KV_,
                               HEAD_DIM_CKV_, HEAD_DIM_KPE_, DTypeQ_, DTypeKV_, DTypeO_>;
+};
+
+template <bool CAUSAL_, uint32_t NUM_STAGES_, uint32_t HEAD_DIM_CKV_, uint32_t HEAD_DIM_KPE_,
+          uint32_t CTA_TILE_Q_, uint32_t CTA_TILE_KV_, typename DTypeQ_, typename DTypeKV_,
+          typename DTypeO_, typename IdType_>
+struct HopperKernel2WGTraits
+    : KernelTraits<CAUSAL_, NUM_STAGES_, /*QK_SHARD_=*/false, HEAD_DIM_CKV_, HEAD_DIM_KPE_,
+                   CTA_TILE_Q_, CTA_TILE_KV_, DTypeQ_, DTypeKV_, DTypeO_, IdType_> {
+  static constexpr uint32_t NUM_THREADS = 128;
+  static constexpr uint32_t NUM_COPY_THREADS = 128;
+  static constexpr uint32_t NUM_REGS_S_FRAG = CTA_TILE_KV_ / 2;
+  static constexpr uint32_t NUM_REGS_O_FRAG = HEAD_DIM_CKV_ / 4;
+  static constexpr uint32_t NUM_REGS_P_FRAG = CTA_TILE_KV_ / 4;
+  using MainloopPipeline = cutlass::PipelineAsync<NUM_STAGES_>;
+  using SharedStorage =
+      Hopper2WGSharedStorageQKVO<MainloopPipeline, NUM_STAGES_, CTA_TILE_Q_, CTA_TILE_KV_,
+                                 HEAD_DIM_CKV_, HEAD_DIM_KPE_, DTypeQ_, DTypeKV_, DTypeO_>;
 };
 
 template <typename KTraits>
@@ -586,6 +633,97 @@ __device__ __forceinline__ void convert_s_to_p(float* s_frag, uint32_t* p_frag) 
 }
 
 template <typename KTraits, typename Params>
+__global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLA2WGPageAttentionHopperKernel(
+    const __grid_constant__ Params params) {
+  using DTypeQ = typename Params::DTypeQ;
+  using DTypeKV = typename Params::DTypeKV;
+  using DTypeO = typename Params::DTypeO;
+  using IdType = typename Params::IdType;
+
+  extern __shared__ __align__(alignof(typename KTraits::SharedStorage)) uint8_t smem[];
+  auto& smem_storage = reinterpret_cast<typename KTraits::SharedStorage&>(smem);
+
+  typename KTraits::AttentionVariant variant(params, blockIdx.y, smem);
+  [[maybe_unused]] constexpr SwizzleMode SWIZZLE_MODE_Q_NOPE = KTraits::SWIZZLE_MODE_Q_NOPE;
+  [[maybe_unused]] constexpr SwizzleMode SWIZZLE_MODE_Q_PE = KTraits::SWIZZLE_MODE_Q_PE;
+  [[maybe_unused]] constexpr SwizzleMode SWIZZLE_MODE_CKV = KTraits::SWIZZLE_MODE_CKV;
+  [[maybe_unused]] constexpr SwizzleMode SWIZZLE_MODE_KPE = KTraits::SWIZZLE_MODE_KPE;
+  [[maybe_unused]] constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
+  [[maybe_unused]] constexpr uint32_t NUM_MMA_D_CKV = KTraits::NUM_MMA_D_CKV;
+  [[maybe_unused]] constexpr uint32_t HEAD_DIM_CKV = KTraits::HEAD_DIM_CKV;
+  [[maybe_unused]] constexpr uint32_t CTA_TILE_Q = KTraits::CTA_TILE_Q;
+  [[maybe_unused]] constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
+  [[maybe_unused]] constexpr int32_t NUM_STAGES = KTraits::NUM_STAGES;
+  [[maybe_unused]] constexpr uint32_t NUM_COPY_THREADS = KTraits::NUM_COPY_THREADS;
+  [[maybe_unused]] constexpr bool CAUSAL = KTraits::CAUSAL;
+
+  DTypeQ* q_nope = params.q_nope;
+  DTypeQ* q_pe = params.q_pe;
+  DTypeKV* ckv = params.ckv;
+  DTypeKV* kpe = params.kpe;
+  IdType* kv_indices = params.kv_indices;
+  DTypeO* partial_o = params.partial_o;
+  float* partial_lse = params.partial_lse;
+  DTypeO* final_o = params.final_o;
+  float* final_lse = params.final_lse;
+  IdType* work_indptr = params.work_indptr;
+
+  const uint_fastdiv& num_heads = params.num_heads;
+  const uint_fastdiv& block_size = params.block_size;
+  const uint32_t q_nope_stride_n = params.q_nope_stride_n;
+  const uint32_t q_nope_stride_h = params.q_nope_stride_h;
+  const uint32_t q_pe_stride_n = params.q_pe_stride_n;
+  const uint32_t q_pe_stride_h = params.q_pe_stride_h;
+  const uint32_t ckv_stride_page = params.ckv_stride_page;
+  const uint32_t ckv_stride_n = params.ckv_stride_n;
+  const uint32_t kpe_stride_page = params.kpe_stride_page;
+  const uint32_t kpe_stride_n = params.kpe_stride_n;
+  const uint32_t o_stride_n = params.o_stride_n;
+  const uint32_t o_stride_h = params.o_stride_h;
+  const uint32_t cluster_tile_q = gridDim.x * KTraits::CTA_TILE_Q;
+
+  const uint32_t lane_predicate = cute::elect_one_sync();
+  const uint32_t lane_idx = cutlass::canonical_lane_idx();
+  const uint32_t warp_group_idx = cutlass::canonical_warp_group_idx();
+  const uint32_t warp_idx = cutlass::canonical_warp_idx();
+
+  using MainloopPipeline = typename KTraits::MainloopPipeline;
+  using PipelineParams = typename MainloopPipeline::Params;
+  using PipelineState = typename MainloopPipeline::PipelineState;
+  PipelineParams pipeline_params;
+  pipeline_params.role = warp_group_idx == 0 ? MainloopPipeline::ThreadCategory::Producer
+                                             : MainloopPipeline::ThreadCategory::Consumer;
+  pipeline_params.producer_arv_count = NUM_COPY_THREADS;
+  pipeline_params.consumer_arv_count = NUM_MMA_THREADS;
+  MainloopPipeline pipeline_q(smem_storage.pipeline_q, pipeline_params);
+  MainloopPipeline pipeline_kv(smem_storage.pipeline_kv, pipeline_params);
+
+  __syncthreads();
+
+  if (warp_group_idx == 0) {
+    // load q & kv, compute pv1
+
+  } else {
+    // compute qk, pv2
+  }
+
+  auto grid = cg::this_grid();
+  grid.sync();
+
+  PROFILER_EVENT_START(variant, ProfileEventType::kSplitK);
+
+  __syncthreads();
+  // the second stage, merge partial outputs
+  DevicePersistentMergeStates<KTraits>(
+      params.merge_packed_offset_start, params.merge_packed_offset_end,
+      params.merge_partial_packed_offset_start, params.merge_partial_packed_offset_end,
+      params.merge_partial_stride, partial_o, partial_lse, final_o, final_lse, o_stride_n,
+      o_stride_h, num_heads);
+
+  PROFILER_EVENT_END(variant, ProfileEventType::kSplitK);
+}
+
+template <typename KTraits, typename Params>
 __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHopperKernel(
     const __grid_constant__ Params params) {
   using DTypeQ = typename Params::DTypeQ;
@@ -967,6 +1105,47 @@ cudaError_t BatchMLAPageAttentionHopper(Params params, uint32_t num_blks_x, uint
   size_t smem_size = sizeof(typename KTraits::SharedStorage);
 
   auto kernel = hopper::BatchMLAPageAttentionHopperKernel<KTraits, Params>;
+  void* args[] = {(void*)&params};
+
+  FLASHINFER_CUDA_CALL(
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+  FLASHINFER_CUDA_CALL(
+      cudaLaunchCooperativeKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+
+  return cudaSuccess;
+}
+
+template <MaskMode MASK_MODE, uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename Params>
+cudaError_t BatchMLAPageAttention2WGHopper(Params params, uint32_t num_blks_x, uint32_t num_blks_y,
+                                           cudaStream_t stream) {
+  using DTypeQ = typename Params::DTypeQ;
+  using DTypeKV = typename Params::DTypeKV;
+  using DTypeO = typename Params::DTypeO;
+  using IdType = typename Params::IdType;
+
+  if (MASK_MODE == MaskMode::kCustom) {
+    return cudaErrorNotSupported;
+  }
+  constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
+
+  // get GPU shared memory size
+  int device;
+  int smem_limit_per_sm;
+  cudaGetDevice(&device);
+  cudaDeviceGetAttribute(&smem_limit_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device);
+
+  constexpr uint32_t NUM_STAGES = 2;
+  constexpr uint32_t CTA_TILE_Q = 64;
+  constexpr uint32_t CTA_TILE_KV = 64;
+
+  using KTraits =
+      hopper::HopperKernel2WGTraits<CAUSAL, NUM_STAGES, HEAD_DIM_CKV, HEAD_DIM_KPE, CTA_TILE_Q,
+                                    CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType>;
+  dim3 nblks(num_blks_x, num_blks_y);
+  dim3 nthrs(KTraits::NUM_THREADS);
+  size_t smem_size = sizeof(typename KTraits::SharedStorage);
+
+  auto kernel = hopper::BatchMLAPageAttentionHopper2WGKernel<KTraits, Params>;
   void* args[] = {(void*)&params};
 
   FLASHINFER_CUDA_CALL(
