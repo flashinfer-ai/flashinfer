@@ -1207,7 +1207,6 @@ def chain_speculative_sampling(
     >>> # token 2 was sampled from draft model for the first token, and
     >>> # token 1 was sampled from draft model for the second token
     >>> draft_token_ids = torch.tensor([[2, 1]], dtype=torch.int32).to(0)
-    >>> # uniform samples for rejection sampling
     >>> target_probs = torch.tensor([[[0.0, 0.1, 0.6, 0.3], [1.0, 0.0, 0.0, 0.0], [0.7, 0.1, 0.1, 0.1]]]).to(0)
     >>> output_token_ids, output_accepted_token_num, output_accepted_token_num =\
     ...     flashinfer.sampling.chain_speculative_sampling(
