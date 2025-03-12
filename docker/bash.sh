@@ -315,6 +315,8 @@ while (( $# )); do
     esac
 done
 
+
+
 if [[ -z "${DOCKER_IMAGE_NAME}" ]]; then
     echo "Error: Missing DOCKER_IMAGE_NAME" >&2
     show_usage >&2
@@ -325,8 +327,6 @@ if [[ ${COMMAND[@]+"${COMMAND[@]}"} = bash ]]; then
     TTY=true
     USE_NET_HOST=true
 fi
-
-
 
 ###############################
 ### End of argument parsing ###
@@ -412,6 +412,7 @@ done
 # Use nvidia-docker for GPU container.  If nvidia-docker is not
 # available, fall back to using "--gpus all" flag, requires docker
 # version 19.03 or higher.
+
 if [[ "$USE_GPU" == "true" ]] && [[ "${DOCKER_IMAGE_NAME}" == *"gpu"* || "${DOCKER_IMAGE_NAME}" == *"cuda"* ]]; then
     if type nvidia-docker 1> /dev/null 2> /dev/null; then
         DOCKER_BINARY=nvidia-docker

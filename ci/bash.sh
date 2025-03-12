@@ -11,6 +11,7 @@ WORKSPACE="$(pwd)"
 DOCKER_BINARY="docker"
 DOCKER_ENV="-e ENV_USER_ID=$(id -u) -e ENV_GROUP_ID=$(id -g)"
 DOCKER_VOLUMNS="-v ${WORKSPACE}:/workspace -v ${SCRIPT_DIR}:/docker"
+USE_GPU=true
 
 shift 1
 while [[ $# -gt 0 ]]; do
@@ -29,6 +30,9 @@ while [[ $# -gt 0 ]]; do
         num_threads=$2
         shift 2
         DOCKER_ENV="${DOCKER_ENV} -e NUM_THREADS=${num_threads} --cpus ${num_threads}"
+    elif [[ $cmd == "--no-gpu" ]]; then
+        USE_GPU=false
+        shift
     else
         break
     fi
@@ -47,12 +51,8 @@ else
     COMMAND=("$@")
 fi
 
-if [[ -n ${MLC_CI_SETUP_DEPS:-} ]]; then
-    DOCKER_ENV="${DOCKER_ENV} -e MLC_CI_SETUP_DEPS=${MLC_CI_SETUP_DEPS}"
-fi
-
 # Use nvidia-docker if the container is GPU.
-if [[ -n ${CUDA_VISIBLE_DEVICES:-} ]]; then
+if [[ ${USE_GPU} == "true" ]]; then
     DOCKER_ENV="${DOCKER_ENV} -e CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
     if type nvidia-docker 1> /dev/null 2> /dev/null; then
         DOCKER_BINARY=nvidia-docker

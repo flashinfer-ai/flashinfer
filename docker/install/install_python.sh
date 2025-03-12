@@ -21,29 +21,8 @@ set -u
 set -o pipefail
 
 
-cleanup() {
-  rm -rf base-requirements.txt
-}
-
-trap cleanup 0
-
 # Install python and pip. Don't modify this to add Python package dependencies,
-# instead modify install_python_package.sh
-apt-get update
-apt-get install -y software-properties-common
-apt-get install -y python3.12 python3.12-dev python3-pip
-update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
+wget -O Miniforge3.sh "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh"
+bash Miniforge3.sh -b -p /opt/conda
 
-# Pin pip and setuptools versions
-# Hashes generated via:
-#   $ pip download <package>==<version>
-#   $ pip hash --algorithm sha256 <package>.whl
-cat <<EOF > base-requirements.txt
-pip==24.0
-setuptools==68.1.2
-ninja==1.11.1
-pytest==8.1.1
-numpy==1.26.4
-scipy==1.12.0
-EOF
-pip3 install --break-system-packages -r base-requirements.txt
+/opt/conda/bin/conda create -n $1 python=3.12

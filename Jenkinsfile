@@ -40,7 +40,6 @@ import org.jenkinsci.plugins.pipeline.modeldefinition.Utils
 // These are set at runtime from data in ci/jenkins/docker-images.yml, update
 // image tags in that file
 docker_run = "bash ci/bash.sh flashinfer/flashinfer-ci:latest"
-torch_cuda_arch_list = "7.5 8.0 8.9 9.0+PTX"
 
 def per_exec_ws(folder) {
   return "workspace/exec_${env.EXECUTOR_NUMBER}/" + folder
@@ -84,27 +83,24 @@ stage("Build AOT Wheel") {
         ws(per_exec_ws('flashinfer-aot-wheel')) {
           init_git(true)
           sh(script: "ls -alh", label: 'Show work directory')
-          sh(script: "${docker_run} -e 'FLASHINFER_ENABLE_AOT=1' -e 'TORCH_CUDA_ARCH_LIST=${torch_cuda_arch_list}' python3 -m build --no-isolation --wheel")
+          sh(script: "${docker_run} -e FLASHINFER_ENABLE_AOT 1 python3 -m build --no-isolation --wheel")
+          pack_lib('flashinfer-aot-wheel', 'dist/*.whl')
         }
       }
     }
   )
 }
 
-// stage('Unittest') {
-//   parallel(
-//     'CUDA': {
-//       node('GPU-G6-SPOT') {
-//         ws(per_exec_ws('flashinfer-unittest')) {
-//           // sh(script: "nvidia-smi", label: 'Show GPU info')
-//           // init_git(true)
-//           sh(script: "ls -alh", label: 'Show work directory')
-//           // sh(script: "ls -alh", label: 'Show work directory')
-//           // unpack_lib('mlc_wheel_cuda', 'wheels/*.whl')
-//           // sh(script: "${run_cuda} conda env export --name ci-unittest", label: 'Checkout version')
-//           // sh(script: "${run_cuda} conda run -n ci-unittest ./ci/task/test_unittest.sh", label: 'Testing')
-//         }
-//       }
-//     }
-//   )
-// }
+stage('Unittest') {
+  parallel(
+    'CUDA': {
+      node('GPU-G6-SPOT') {
+        ws(per_exec_ws('flashinfer-unittest')) {
+          sh(script: "ls -alh", label: 'Show work directory')
+          unpack_lib('flashinfer-aot-wheel', 'dist/*.whl')
+          sh(script: "${docker_run} ./scripts/task_run_tests.sh", label: 'Testing')
+        }
+      }
+    }
+  )
+}
