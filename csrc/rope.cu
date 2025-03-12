@@ -65,8 +65,8 @@ void apply_rope(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope
 }
 
 void apply_rope_pos_ids(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
-                        at::Tensor pos_ids, int64_t rotary_dim, bool interleave,
-                        double rope_scale, double rope_theta, int64_t cuda_stream) {
+                        at::Tensor pos_ids, int64_t rotary_dim, bool interleave, double rope_scale,
+                        double rope_theta, int64_t cuda_stream) {
   CHECK_LAST_DIM_CONTIGUOUS(q);
   CHECK_LAST_DIM_CONTIGUOUS(k);
   CHECK_INPUT(pos_ids);
@@ -115,8 +115,8 @@ void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_r
   CHECK_EQ(k.device(), device);
   CHECK_EQ(cos_sin_cache.device(), device);
   CHECK_EQ(pos_ids.device(), device);
-  CHECK_DIM(3, q);          // q: (nnz, H_Q, D)
-  CHECK_DIM(3, k);          // k: (nnz, H_K, D)
+  CHECK_DIM(3, q);  // q: (nnz, H_Q, D)
+  CHECK_DIM(3, k);  // k: (nnz, H_K, D)
   // cos_sin_cache: (max_seq_len, R)
   // First half of R is cos, second half is sin
   CHECK_DIM(2, cos_sin_cache);
@@ -141,10 +141,10 @@ void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_r
     cudaError_t status = BatchQKApplyRotaryPosIdsCosSinCache(
         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
         static_cast<c_type*>(q_rope.data_ptr()), static_cast<c_type*>(k_rope.data_ptr()),
-        static_cast<float*>(cos_sin_cache.data_ptr()),
-        static_cast<int32_t*>(pos_ids.data_ptr()), nnz, num_qo_heads, num_kv_heads, rotary_dim,
-        head_dim, q_stride_n, q_stride_h, k_stride_n, k_stride_h, q_rope_stride_n, q_rope_stride_h,
-        k_rope_stride_n, k_rope_stride_h, interleave, stream);
+        static_cast<float*>(cos_sin_cache.data_ptr()), static_cast<int32_t*>(pos_ids.data_ptr()),
+        nnz, num_qo_heads, num_kv_heads, rotary_dim, head_dim, q_stride_n, q_stride_h, k_stride_n,
+        k_stride_h, q_rope_stride_n, q_rope_stride_h, k_rope_stride_n, k_rope_stride_h, interleave,
+        stream);
     TORCH_CHECK(status == cudaSuccess,
                 "BatchQKApplyRotaryPosIdsCosSinCache failed with error code " +
                     std::string(cudaGetErrorString(status)));
@@ -153,8 +153,8 @@ void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_r
 }
 
 void apply_llama31_rope(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
-                        at::Tensor indptr, at::Tensor offsets, int64_t rotary_dim,
-                        bool interleave, double rope_scale, double rope_theta, double low_freq_factor,
+                        at::Tensor indptr, at::Tensor offsets, int64_t rotary_dim, bool interleave,
+                        double rope_scale, double rope_theta, double low_freq_factor,
                         double high_freq_factor, double old_context_length, int64_t cuda_stream) {
   CHECK_CUDA(q);  // not necessarily contiguous
   CHECK_CUDA(k);  // not necessarily contiguous
