@@ -127,6 +127,9 @@ def pytest_runtest_call(item):
     try:
         item.runtest()
     except (torch.OutOfMemoryError, RuntimeError) as e:
-        if isinstance(e, RuntimeError) and "CUDA error: out of memory" not in str(e):
+        if isinstance(e, torch.OutOfMemoryError) or "CUDA error: out of memory" in str(
+            e
+        ):
+            pytest.skip("Skipping due to OOM")
+        else:
             raise
-        pytest.skip("Skipping due to OOM")
