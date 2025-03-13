@@ -16,11 +16,11 @@
 #ifndef FLASHINFER_PAGE_CUH_
 #define FLASHINFER_PAGE_CUH_
 
-#include <assert.h>
 #include <driver_types.h>
 
 #include <vector>
 
+#include "exception.h"
 #include "fastdiv.cuh"
 #include "layout.cuh"
 #include "utils.cuh"
@@ -616,8 +616,8 @@ cudaError_t AppendPagedKVMlaCache(paged_kv_mla_t<DType, IdType> paged_kv, DType*
   uint32_t head_dim_kpe = paged_kv.head_dim_kpe;
   constexpr uint32_t HEAD_CKV_DIM = 512;
   constexpr uint32_t HEAD_KPE_DIM = 64;
-  assert(head_dim_ckv == HEAD_CKV_DIM);
-  assert(head_dim_kpe == HEAD_KPE_DIM);
+  FLASHINFER_CHECK(head_dim_ckv == HEAD_CKV_DIM, "head_dim_ckv must be equal to 512");
+  FLASHINFER_CHECK(head_dim_kpe == HEAD_KPE_DIM, "head_dim_kpe must be equal to 64");
   constexpr uint32_t vec_size = 2;
 
   uint32_t bdx = HEAD_CKV_DIM / vec_size;
