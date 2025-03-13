@@ -102,7 +102,7 @@ pipeline {
           def response = sh(script: "curl -s -H 'Authorization: token ${GITHUB_TOKEN}' ${apiUrl}", returnStdout: true)
 
           // Parse JSON response (requires Jenkins pipeline utility steps plugin)
-          def comments = readJSON text: response
+          def comments = readJSON(text: response).collect { it -> [body: it.body] }
 
           // Check if any comment contains "/ci-ready"
           def ciReadyFound = comments.any { comment ->
