@@ -106,8 +106,8 @@ pipeline {
 
           // Check if any comment contains "/ci-ready"
           def ciReadyFound = comments.any { comment ->
-            // Access comment body field safely
-            def body = comment.get('body')
+            // Access comment body field safely using array access syntax
+            def body = comment['body']
             body != null && body.contains("/ci-ready")
           }
 
