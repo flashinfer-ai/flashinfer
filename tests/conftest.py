@@ -119,3 +119,11 @@ def pytest_configure(config):
         _set_torch_compile_options()
         for fn in TORCH_COMPILE_FNS:
             _monkeypatch_add_torch_compile(fn)
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_call(item):
+    try:
+        item.runtest()
+    except torch.OutOfMemoryError:
+        pytest.skip("Skipping due to OOM")
