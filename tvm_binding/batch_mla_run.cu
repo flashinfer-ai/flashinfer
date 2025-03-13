@@ -97,12 +97,16 @@ void BatchMLAPagedAttentionRun(DLTensor* float_workspace_buffer, DLTensor* int_w
             int_buffer_ptr, plan_info.merge_packed_offset_start_offset);
         params.merge_packed_offset_end =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_packed_offset_end_offset);
-        params.merge_indptr =
-            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_indptr_offset);
+        params.merge_partial_packed_offset_start = GetPtrFromBaseOffset<IdType>(
+            int_buffer_ptr, plan_info.merge_partial_packed_offset_start_offset);
+        params.merge_partial_packed_offset_end = GetPtrFromBaseOffset<IdType>(
+            int_buffer_ptr, plan_info.merge_partial_packed_offset_end_offset);
+        params.merge_partial_stride =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_partial_stride_offset);
         params.final_o = static_cast<DTypeO*>(o->data) + o->byte_offset / sizeof(DTypeO);
         params.final_lse = static_cast<float*>(lse->data) + lse->byte_offset / sizeof(float);
         params.partial_o =
-            GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.partial_o_offset);
+            GetPtrFromBaseOffset<DTypeO>(float_buffer_ptr, plan_info.partial_o_offset);
         params.partial_lse =
             GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.partial_lse_offset);
 
