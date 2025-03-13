@@ -1,6 +1,7 @@
 import math
 from typing import List
 
+import pytest
 import torch
 
 import flashinfer
@@ -13,10 +14,22 @@ def calculate_last_page_len(kv_len: List[int], page_size: int):
     return [len % page_size if len % page_size != 0 else page_size for len in kv_len]
 
 
-def test_append_mla_paged_kv_cache(kv_len: List[int], page_size: int = 64):
+kv_len_configs = [
+    [45],
+    [4096],
+    [45, 8, 25],
+    [45, 8, 25, 22],
+    [45, 8, 25, 22, 400],
+    [45, 8, 25, 22, 100],
+]
+
+
+@pytest.mark.parametrize("kv_len", kv_len_configs)
+@pytest.mark.parametrize("page_size", [1, 16, 64])
+def test_append_mla_paged_kv_cache(kv_len, page_size):
     nnz_kv = sum(kv_len)
-    ckv_append = torch.randn(nnz_kv, CKV_DIM).half().to(0)
-    kpe_append = torch.randn(nnz_kv, KPE_DIM).half().to(0)
+    ckv_append = torch.randn(nnz_kv, CKV_DIM, dtype=torch.float16, device="cuda:0")
+    kpe_append = torch.randn(nnz_kv, KPE_DIM, dtype=torch.float16, device="cuda:0")
     num_pages_per_req = torch.tensor(
         [math.ceil(len / page_size) for len in kv_len],
         dtype=torch.int32,
@@ -28,8 +41,12 @@ def test_append_mla_paged_kv_cache(kv_len: List[int], page_size: int = 64):
     ).int()
 
     max_num_pages = sum(num_pages_per_req)
-    ckv_cache = torch.zeros(max_num_pages, page_size, CKV_DIM).half().to(0)
-    kpe_cache = torch.zeros(max_num_pages, page_size, KPE_DIM).half().to(0)
+    ckv_cache = torch.zeros(
+        max_num_pages, page_size, CKV_DIM, dtype=torch.float16, device="cuda:0"
+    )
+    kpe_cache = torch.zeros(
+        max_num_pages, page_size, KPE_DIM, dtype=torch.float16, device="cuda:0"
+    )
     kv_page_indptr = torch.cat(
         [torch.zeros(1).int().to(0), torch.cumsum(num_pages_per_req, dim=0)]
     ).int()
@@ -99,9 +116,9 @@ def test_append_mla_paged_kv_cache(kv_len: List[int], page_size: int = 64):
 
 
 if __name__ == "__main__":
-    test_append_mla_paged_kv_cache([45])
-    test_append_mla_paged_kv_cache([4096])
-    test_append_mla_paged_kv_cache([45, 8, 25])
-    test_append_mla_paged_kv_cache([45, 8, 25, 22])
+    test_append_mla_paged_kv_cache([45], 64)
+    test_append_mla_paged_kv_cache([4096], 64)
+    test_append_mla_paged_kv_cache([45, 8, 25], 64)
+    test_append_mla_paged_kv_cache([45, 8, 25, 22], 64)
     test_append_mla_paged_kv_cache([45, 8, 25, 22, 400], 128)
     test_append_mla_paged_kv_cache([45, 8, 25, 22, 100], 16)

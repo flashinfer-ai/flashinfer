@@ -14,4 +14,5 @@ Append new K/V tensors to Paged KV-Cache
   :toctree: ../generated
 
   append_paged_kv_cache
+  append_paged_mla_kv_cache
   get_batch_indices_positions
