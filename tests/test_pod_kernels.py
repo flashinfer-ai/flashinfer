@@ -115,9 +115,15 @@ def test_pod_with_paged_kv_cache(
     return_lse = False
     # Prefill inputs
     kv_layout_p = "NHD"
-    q_p = torch.randn(qo_len_p, num_qo_heads, head_dim).to(0).half()
-    k_p = torch.randn(kv_len_p, num_kv_heads, head_dim).to(0).half()
-    v_p = torch.randn(kv_len_p, num_kv_heads, head_dim).to(0).half()
+    q_p = torch.randn(
+        qo_len_p, num_qo_heads, head_dim, device="cuda:0", dtype=torch.float16
+    )
+    k_p = torch.randn(
+        kv_len_p, num_kv_heads, head_dim, device="cuda:0", dtype=torch.float16
+    )
+    v_p = torch.randn(
+        kv_len_p, num_kv_heads, head_dim, device="cuda:0", dtype=torch.float16
+    )
     # Generate prefill reference output
     o_ref_p = flashinfer.prefill.single_prefill_with_kv_cache(
         q_p,
@@ -127,7 +133,9 @@ def test_pod_with_paged_kv_cache(
         pos_encoding_mode=pos_encoding_mode,
     )
     # Decode inputs
-    q_d = torch.randn(batch_size_d, num_qo_heads, head_dim).to(0).to(q_dtype)
+    q_d = torch.randn(
+        batch_size_d, num_qo_heads, head_dim, device="cuda:0", dtype=torch.float16
+    )
     num_pages_per_seq = (kv_len_d + page_size_d - 1) // page_size_d
     total_num_pages = num_pages_per_seq * batch_size_d
     if kv_layout_d == "HND":
@@ -140,7 +148,7 @@ def test_pod_with_paged_kv_cache(
             tmp.append(2)
             tmp.append(v_d)
         kv_shape = tmp
-        kv_data_fp32 = torch.randn(*kv_shape, dtype=torch.float32).to(0)
+        kv_data_fp32 = torch.randn(*kv_shape, device="cuda:0", dtype=torch.float32)
         kv_data = kv_data_fp32.to(kv_dtype)
         kv_data = kv_data[:, 1, :, 1, :, 1, :, 1, :]
         kv_data_fp32 = kv_data_fp32[:, 1, :, 1, :, 1, :, 1, :]
@@ -150,16 +158,24 @@ def test_pod_with_paged_kv_cache(
             != kv_data.shape[-3] * kv_data.shape[-2] * kv_data.shape[-1]
         )
     else:
-        kv_data_fp32 = torch.randn(*kv_shape, dtype=torch.float32).to(0)
+        kv_data_fp32 = torch.randn(*kv_shape, device="cuda:0", dtype=torch.float32)
         kv_data = kv_data_fp32.to(kv_dtype)
-    kv_indptr_d = torch.arange(0, batch_size_d + 1).to(0).int() * num_pages_per_seq
-    kv_indices_d = torch.arange(0, total_num_pages).to(0).int()
+    kv_indptr_d = (
+        torch.arange(0, batch_size_d + 1, device="cuda:0", dtype=torch.int32)
+        * num_pages_per_seq
+    )
+    kv_indices_d = torch.arange(0, total_num_pages, device="cuda:0", dtype=torch.int32)
     kv_last_page_len = torch.full(
-        (batch_size_d,), (kv_len_d - 1) % page_size_d + 1, dtype=torch.int32
-    ).to(0)
+        (batch_size_d,),
+        (kv_len_d - 1) % page_size_d + 1,
+        device="cuda:0",
+        dtype=torch.int32,
+    )
 
     # Generate decode reference output
-    decode_workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+    decode_workspace_buffer = torch.empty(
+        32 * 1024 * 1024, device="cuda:0", dtype=torch.int8
+    )
     decode_wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
         decode_workspace_buffer, kv_layout_d, use_tensor_cores=True
     )
@@ -177,7 +193,7 @@ def test_pod_with_paged_kv_cache(
     )
     o_ref_d = decode_wrapper.run(q_d, kv_data)
 
-    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+    workspace_buffer = torch.empty(32 * 1024 * 1024, device="cuda:0", dtype=torch.int8)
     pod_wrapper = flashinfer.PODWithPagedKVCacheWrapper(
         workspace_buffer,
         kv_layout_d,
