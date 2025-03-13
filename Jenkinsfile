@@ -84,34 +84,30 @@ def init_git(submodule = false) {
 //   }
 // }
 
-pipeline {
-  agent any
-
-  stage('JIT Unittest') {
-    steps {
-      parallel(
-        failFast: true,
-        'GPU-G5-Test-1': {
-          node('GPU-G5-SPOT') {
-            ws(per_exec_ws('flashinfer-unittest')) {
-              init_git(true) // we need cutlass submodule
-              sh(script: "ls -alh", label: 'Show work directory')
-              sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
-              sh(script: "${docker_run} ./scripts/task_jit_run_tests_part1.sh", label: 'JIT Unittest Part 1')
-            }
-          }
-        },
-        'GPU-G5-Test-2': {
-          node('GPU-G5-SPOT') {
-            ws(per_exec_ws('flashinfer-unittest')) {
-              init_git(true) // we need cutlass submodule
-              sh(script: "ls -alh", label: 'Show work directory')
-              sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
-              sh(script: "${docker_run} ./scripts/task_jit_run_tests_part2.sh", label: 'JIT Unittest Part 2')
-            }
+stage('JIT Unittest') {
+  steps {
+    parallel(
+      failFast: true,
+      'GPU-G5-Test-1': {
+        node('GPU-G5-SPOT') {
+          ws(per_exec_ws('flashinfer-unittest')) {
+            init_git(true) // we need cutlass submodule
+            sh(script: "ls -alh", label: 'Show work directory')
+            sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
+            sh(script: "${docker_run} ./scripts/task_jit_run_tests_part1.sh", label: 'JIT Unittest Part 1')
           }
         }
-      )
-    }
+      },
+      'GPU-G5-Test-2': {
+        node('GPU-G5-SPOT') {
+          ws(per_exec_ws('flashinfer-unittest')) {
+            init_git(true) // we need cutlass submodule
+            sh(script: "ls -alh", label: 'Show work directory')
+            sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
+            sh(script: "${docker_run} ./scripts/task_jit_run_tests_part2.sh", label: 'JIT Unittest Part 2')
+          }
+        }
+      }
+    )
   }
 }
