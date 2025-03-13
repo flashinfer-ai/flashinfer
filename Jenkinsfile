@@ -86,8 +86,8 @@ def init_git(submodule = false) {
 
 stage('JIT Unittest') {
   parallel(
-    'G6-SM_89': {
-      node('GPU-G6') {
+    'G5-SM_80': {
+      node('GPU-G5') {
         ws(per_exec_ws('flashinfer-unittest')) {
           init_git(true) // we need cutlass submodule
           sh(script: "ls -alh", label: 'Show work directory')
