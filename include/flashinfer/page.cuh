@@ -16,6 +16,7 @@
 #ifndef FLASHINFER_PAGE_CUH_
 #define FLASHINFER_PAGE_CUH_
 
+#include <assert.h>
 #include <driver_types.h>
 
 #include <vector>
@@ -559,7 +560,86 @@ struct paged_kv_mla_t {
       return 0;
     }
   }
+
+  __device__ __forceinline__ DType* get_ckv_ptr(size_t page_idx, size_t entry_idx,
+                                                size_t feat_idx) const {
+    return ckv_data + get_elem_offset_ckv(__ldg(indices + page_idx), entry_idx, feat_idx);
+  }
+
+  __device__ __forceinline__ DType* get_kpe_ptr(size_t page_idx, size_t entry_idx,
+                                                size_t feat_idx) const {
+    return kpe_data + get_elem_offset_kpe(__ldg(indices + page_idx), entry_idx, feat_idx);
+  }
 };
+
+template <uint32_t head_dim_ckv, uint32_t head_dim_kpe, uint32_t vec_size, typename DType,
+          typename IdType>
+__global__ void AppendPagedKVMlaCacheKernel(paged_kv_mla_t<DType, IdType> paged_kv_mla,
+                                            DType* __restrict__ append_ckv,
+                                            DType* __restrict__ append_kpe,
+                                            IdType* __restrict__ batch_indices,
+                                            IdType* __restrict__ positions, uint32_t nnz,
+                                            size_t append_ckv_stride_n,
+                                            size_t append_kpe_stride_n) {
+  uint32_t tx = threadIdx.x;
+  uint32_t cta_id = blockIdx.x;
+  uint32_t num_ctas = gridDim.x;
+
+#pragma unroll 4
+  for (uint32_t i = cta_id; i < nnz; i += num_ctas) {
+    uint32_t page_iter, entry_idx;
+    paged_kv_mla.page_size.divmod(
+        paged_kv_mla.indptr[batch_indices[i]] * paged_kv_mla.page_size + positions[i], page_iter,
+        entry_idx);
+    DType* ckv_ptr = paged_kv_mla.get_ckv_ptr(page_iter, entry_idx, tx * vec_size);
+    vec_t<DType, vec_size>::memcpy(ckv_ptr, append_ckv + i * append_ckv_stride_n + tx * vec_size);
+
+    if (tx * vec_size < head_dim_kpe) {
+      DType* kpe_ptr = paged_kv_mla.get_kpe_ptr(page_iter, entry_idx, tx * vec_size);
+      vec_t<DType, vec_size>::memcpy(kpe_ptr, append_kpe + i * append_kpe_stride_n + tx * vec_size);
+    }
+  }
+}
+
+template <typename DType, typename IdType>
+cudaError_t AppendPagedKVMlaCache(paged_kv_mla_t<DType, IdType> paged_kv, DType* append_ckv,
+                                  DType* append_kpe, IdType* batch_indices, IdType* positions,
+                                  uint32_t nnz, size_t append_ckv_stride_n,
+                                  size_t append_kpe_stride_n, cudaStream_t stream = nullptr) {
+  int dev_id = 0;
+  int num_sms = 0;
+  int num_blocks_per_sm = 0;
+  FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, dev_id));
+
+  uint32_t head_dim_ckv = paged_kv.head_dim_ckv;
+  uint32_t head_dim_kpe = paged_kv.head_dim_kpe;
+  constexpr uint32_t HEAD_CKV_DIM = 512;
+  constexpr uint32_t HEAD_KPE_DIM = 64;
+  assert(head_dim_ckv == HEAD_CKV_DIM);
+  assert(head_dim_kpe == HEAD_KPE_DIM);
+  constexpr uint32_t vec_size = 2;
+
+  uint32_t bdx = HEAD_CKV_DIM / vec_size;
+  uint32_t num_threads = bdx;
+  uint32_t smem_size = 0;
+  auto kernel = AppendPagedKVMlaCacheKernel<HEAD_CKV_DIM, HEAD_KPE_DIM, vec_size, DType, IdType>;
+  FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel,
+                                                                     num_threads, smem_size));
+  num_blocks_per_sm = min(num_blocks_per_sm, ceil_div(int(nnz), num_sms));
+  dim3 nblks(num_blocks_per_sm * num_sms);
+  dim3 nthrs(bdx);
+  void* args[] = {(void*)&paged_kv,
+                  (void*)&append_ckv,
+                  (void*)&append_kpe,
+                  (void*)&batch_indices,
+                  (void*)&positions,
+                  (void*)&nnz,
+                  (void*)&append_ckv_stride_n,
+                  (void*)&append_kpe_stride_n};
+  FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, 0, stream));
+  return cudaSuccess;
+}
 
 }  // namespace flashinfer
 
