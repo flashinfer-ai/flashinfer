@@ -356,6 +356,7 @@ def get_pod_uri(
         f"f16qk_{use_fp16_qk_reduction}"
     )
 
+
 def get_batch_prefill_uri(
     backend: str,
     dtype_q: torch.dtype,
@@ -532,7 +533,7 @@ def gen_pod_module(
     variant_name_p = f"DefaultAttention<use_custom_mask_p, {str(use_sliding_window_p).lower()}, {str(use_logits_soft_cap_p).lower()}, {str(pos_encoding_mode_p == 2).lower()}>"
     variant_name_d = f"DefaultAttention<use_custom_mask_d, {str(use_sliding_window_d).lower()}, {str(use_logits_soft_cap_d).lower()}, {str(pos_encoding_mode_d == 2).lower()}>"
     variant_decl = f"#include<flashinfer/attention/variants.cuh>"
-    
+
     return gen_customize_pod_module(
         uri,
         dtype_q,
@@ -555,6 +556,7 @@ def gen_pod_module(
         use_logits_soft_cap_d=use_logits_soft_cap_d,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
     )
+
 
 def gen_customize_pod_module(
     uri: str,
@@ -593,7 +595,7 @@ def gen_customize_pod_module(
 
     with open(FLASHINFER_CSRC_DIR / "pod_customize_config.jinja") as f:
         config_templ = jinja2.Template(f.read())
-    
+
     with open(FLASHINFER_CSRC_DIR / "pod_kernel_inst.jinja") as f:
         kernel_inst_templ = jinja2.Template(f.read())
 
@@ -631,7 +633,7 @@ def gen_customize_pod_module(
         for mask_mode_d in [0, 1, 2]:
             kwargs["mask_mode_p"] = mask_mode_literal[mask_mode_p]
             kwargs["mask_mode_d"] = mask_mode_literal[mask_mode_d]
-            
+
             filename = f"pod_kernel_mask_{mask_mode_p}p_{mask_mode_d}d.cu"
             dest_path = gen_directory / filename
             source_paths.append(dest_path)
@@ -639,7 +641,7 @@ def gen_customize_pod_module(
                 **kwargs,
             )
             write_if_different(dest_path, source)
-    
+
     for filename in [
         "pod_tensor.cu",
         "pod_jit_pybind.cu",
@@ -654,6 +656,7 @@ def gen_customize_pod_module(
     generated_config_path = gen_directory / "pod_config.inc"
     write_if_different(generated_config_path, generated_inc_str)
     return load_cuda_ops(uri, source_paths)
+
 
 def gen_batch_decode_module(
     dtype_q: torch.dtype,

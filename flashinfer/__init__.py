@@ -47,6 +47,7 @@ from .norm import rmsnorm as rmsnorm
 from .page import append_paged_kv_cache as append_paged_kv_cache
 from .page import get_batch_indices_positions as get_batch_indices_positions
 from .page import get_seq_lens as get_seq_lens
+from .pod import PODWithPagedKVCacheWrapper as PODWithPagedKVCacheWrapper
 from .prefill import (
     BatchPrefillWithPagedKVCacheWrapper as BatchPrefillWithPagedKVCacheWrapper,
 )
@@ -56,9 +57,6 @@ from .prefill import (
 from .prefill import single_prefill_with_kv_cache as single_prefill_with_kv_cache
 from .prefill import (
     single_prefill_with_kv_cache_return_lse as single_prefill_with_kv_cache_return_lse,
-)
-from .pod import (
-    PODWithPagedKVCacheWrapper as PODWithPagedKVCacheWrapper,
 )
 from .quantization import packbits as packbits
 from .quantization import segment_packbits as segment_packbits

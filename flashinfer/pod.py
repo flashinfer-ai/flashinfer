@@ -21,17 +21,20 @@ from types import SimpleNamespace
 from typing import Any, List, Literal, Optional, Tuple, Union, overload
 
 import torch
+
+from .decode import get_batch_decode_module
 from .jit import (
-    gen_batch_prefill_module,
     gen_batch_decode_module,
-    gen_pod_module,
+    gen_batch_prefill_module,
     gen_customize_batch_prefill_module,
+    gen_pod_module,
     gen_single_prefill_module,
     get_pod_uri,
     has_prebuilt_ops,
     prebuilt_ops_uri,
 )
 from .page import block_sparse_indices_to_vector_sparse_offsets, get_seq_lens
+from .prefill import get_batch_prefill_module
 from .quantization import packbits, segment_packbits
 from .utils import (
     MaskMode,
@@ -51,29 +54,31 @@ from .utils import (
     register_custom_op,
     register_fake_op,
 )
-from .decode import get_batch_decode_module
-from .prefill import get_batch_prefill_module
 
 _pod_modules = {}
+
 
 def get_pod_module(*args):
     global _pod_modules
     if args not in _pod_modules:
         uri = get_pod_uri(*args)
-        
+
         if has_prebuilt_ops and uri in prebuilt_ops_uri:
             _kernels = torch.ops.flashinfer_kernels
             # torch library for pod_with_kv_cache
             # No tensor deprecated due to poor performance. Just use tensor cores for both.
-            #run_no_tensor = _kernels.pod_with_kv_cache_no_tensor
+            # run_no_tensor = _kernels.pod_with_kv_cache_no_tensor
             run_no_tensor = _kernels.pod_with_kv_cache_tensor
-            run_tensor =  _kernels.pod_with_kv_cache_tensor
+            run_tensor = _kernels.pod_with_kv_cache_tensor
         else:
             run_no_tensor = gen_pod_module(*args).pod_with_kv_cache_tensor
             run_tensor = run_no_tensor
         # Register the module
-        _pod_modules[args] = SimpleNamespace(run_no_tensor=run_no_tensor, run_tensor=run_tensor)
+        _pod_modules[args] = SimpleNamespace(
+            run_no_tensor=run_no_tensor, run_tensor=run_tensor
+        )
     return _pod_modules[args]
+
 
 class PODWithPagedKVCacheWrapper:
     r"""Wrapper class for POD-Attention with paged kv-cache (first proposed in
@@ -190,7 +195,7 @@ class PODWithPagedKVCacheWrapper:
             otherwise, the wrapper will use default attention implementation.
         """
         _check_kv_layout(kv_layout)
-        '''
+        """
         if jit_args is not None:
             if use_tensor_cores:
                 self._jit_module = get_batch_prefill_jit_module(
@@ -201,7 +206,7 @@ class PODWithPagedKVCacheWrapper:
                     jit_args[0], gen_customize_batch_decode_module(*jit_args)
                 )
         else:
-        '''
+        """
         # Override options. Only tensor core version is performant.
         use_tensor_cores = True
         self._jit_module = None
@@ -529,8 +534,7 @@ class PODWithPagedKVCacheWrapper:
         use_fp16_qk_reduction: bool = False,
         *args,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        r"""Compute POD-attention for a batch of requests.
-        """
+        r"""Compute POD-attention for a batch of requests."""
         # Currently unsupported
         logits_soft_cap_p = None
         logits_soft_cap_d = None
@@ -562,7 +566,9 @@ class PODWithPagedKVCacheWrapper:
 
         lse_p = None
         if return_lse_p:
-            lse_p = torch.empty((q_p.size(0), q_p.size(1)), dtype=torch.float32, device=q_p.device)
+            lse_p = torch.empty(
+                (q_p.size(0), q_p.size(1)), dtype=torch.float32, device=q_p.device
+            )
 
         out_p = torch.empty_like(q_p)
 
@@ -596,7 +602,7 @@ class PODWithPagedKVCacheWrapper:
 
         lse_d = None
         if return_lse_d:
-            lse_d= torch.empty(
+            lse_d = torch.empty(
                 (q_d.size(0), q_d.size(1)), dtype=torch.float32, device=q_d.device
             )
         out_d = torch.empty_like(q_d)
@@ -613,16 +619,16 @@ class PODWithPagedKVCacheWrapper:
                 logits_soft_cap_p > 0,  # use_logits_soft_cap
                 use_fp16_qk_reduction,
                 # Decode params
-                #q_d.dtype,
-                #self._cached_kv_data_type,
-                #self._cached_q_data_type,
+                # q_d.dtype,
+                # self._cached_kv_data_type,
+                # self._cached_q_data_type,
                 self._indptr_type,
-                #head_dim,  # head_dim_qk
-                #head_dim,  # head_dim_vo
+                # head_dim,  # head_dim_qk
+                # head_dim,  # head_dim_vo
                 PosEncodingMode[pos_encoding_mode_d].value,
                 window_left_d != -1,  # use_sliding_window
                 logits_soft_cap_d > 0,  # use_logits_soft_cap
-                )
+            )
             module_getter.run_tensor(
                 # Prefill params
                 q_p,
@@ -663,13 +669,14 @@ class PODWithPagedKVCacheWrapper:
                 sm_scale_d,
                 1.0 / rope_scale_d,
                 1.0 / rope_theta_d,
-                get_cuda_stream(device)
+                get_cuda_stream(device),
             )
 
         if v_scale is not None:
             out_d *= v_scale
 
         return (out_p, out_d)
+
     def end_forward(self) -> None:
         r"""Warning: this function is deprecated and has no effect."""
         pass

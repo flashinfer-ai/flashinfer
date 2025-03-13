@@ -21,12 +21,12 @@ namespace flashinfer {
 constexpr auto use_custom_mask_p = {{ mask_mode_p }} == MaskMode::kCustom;
 constexpr auto use_custom_mask_d = {{ mask_mode_d }} == MaskMode::kCustom;
 // Not sure about the below declaration
-constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone; 
+constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;
 
 template cudaError_t PODWithKVCacheTensorDispatched<
     {{ head_dim_qk }}, {{ head_dim_vo }}, POS_ENCODING_MODE,
-    {{ use_fp16_qk_reduction }}, {{ mask_mode_p }}, 16, 
-    {{ mask_mode_d }}, {{ variant_name_p }}, 
+    {{ use_fp16_qk_reduction }}, {{ mask_mode_p }}, 16,
+    {{ mask_mode_d }}, {{ variant_name_p }},
     {{ variant_name_d }}, PrefillParams, DecodeParams>(
             PrefillParams prefill_params, {{ dtype_o }}* tmp,
             DecodeParams decode_params, {{ dtype_o }}* tmp_v,
