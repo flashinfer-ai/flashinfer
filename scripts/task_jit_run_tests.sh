@@ -2,7 +2,7 @@
 
 set -eo pipefail
 set -x
-: ${NUM_THREADS:=$(nproc)}
+: ${MAX_JOBS:=$(nproc)}
 : ${CUDA_VISIBLE_DEVICES:=0}
 
 pip install -e . -v
