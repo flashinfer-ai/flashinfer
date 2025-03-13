@@ -90,9 +90,8 @@ stage('JIT Unittest') {
       node('GPU-G5-SPOT') {
         ws(per_exec_ws('flashinfer-unittest')) {
           init_git(true) // we need cutlass submodule
-          sh(script: "free -h", label: "Show RAM size")
-          sh(script: "nproc", label: "Number of CPU Cores")
           sh(script: "ls -alh", label: 'Show work directory')
+          sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
           sh(script: "${docker_run} ./scripts/task_jit_run_tests.sh", label: 'JIT Unittest')
         }
       }
