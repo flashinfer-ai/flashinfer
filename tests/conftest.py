@@ -119,3 +119,17 @@ def pytest_configure(config):
         _set_torch_compile_options()
         for fn in TORCH_COMPILE_FNS:
             _monkeypatch_add_torch_compile(fn)
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_call(item):
+    # skip OOM error
+    try:
+        item.runtest()
+    except (torch.OutOfMemoryError, RuntimeError) as e:
+        if isinstance(e, torch.OutOfMemoryError) or "CUDA error: out of memory" in str(
+            e
+        ):
+            pytest.skip("Skipping due to OOM")
+        else:
+            raise

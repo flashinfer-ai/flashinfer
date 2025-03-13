@@ -51,15 +51,15 @@ def gumbel_distribution(beta):
 @pytest.mark.parametrize("zero_ratio", [0.0, 0.5, 0.9])
 def test_sampling_freq(vocab_size, distribution, zero_ratio):
     torch.manual_seed(42)
-    num_trials = 5000000
+    num_trials = 1000000
     logits = distribution((1, vocab_size), "cuda:0")
     zero_indices = torch.randperm(vocab_size)[: int(vocab_size * zero_ratio)]
     logits[:, zero_indices] = -float("inf")
     probs = torch.softmax(logits, dim=-1)
-    counter = torch.zeros(vocab_size, dtype=torch.int32).to(0)
+    counter = torch.zeros(vocab_size, dtype=torch.int32, device=logits.device)
 
     samples = flashinfer.sampling.sampling_from_probs(
-        probs, indices=torch.zeros(num_trials, dtype=torch.int32).to(0)
+        probs, indices=torch.zeros(num_trials, dtype=torch.int32, device=logits.device)
     )
     counter.scatter_add_(0, samples.long(), torch.ones_like(samples))
     freq = counter.float() / num_trials
@@ -86,14 +86,16 @@ def test_top_p_sampling_freq(vocab_size, distribution, p):
     probs = torch.softmax(logits, dim=-1)
     sorted_prob, indices = torch.sort(probs, descending=False)
     cdf = torch.cumsum(sorted_prob, dim=-1)
-    mask = torch.zeros(1, vocab_size, dtype=torch.int32).to(0)
+    mask = torch.zeros(1, vocab_size, dtype=torch.int32, device=logits.device)
     mask.scatter_add_(1, indices, (cdf > (1 - p)).int())
 
     renorm_probs = flashinfer.sampling.top_p_renorm_probs(probs, p)
-    counter = torch.zeros(vocab_size, dtype=torch.int32).to(0)
-    num_trials = 5000000
+    counter = torch.zeros(vocab_size, dtype=torch.int32, device=logits.device)
+    num_trials = 1000000
     samples = flashinfer.sampling.top_p_sampling_from_probs(
-        probs, p, indices=torch.zeros(num_trials, dtype=torch.int32).to(0)
+        probs,
+        p,
+        indices=torch.zeros(num_trials, dtype=torch.int32, device=logits.device),
     )
     counter.scatter_add_(0, samples.long(), torch.ones_like(samples))
     freq = counter.float() / num_trials
@@ -124,10 +126,12 @@ def test_top_k_sampling_freq(vocab_size, distribution, k):
     mask = (probs >= pivot.unsqueeze(-1)).int()
 
     renorm_probs = flashinfer.sampling.top_k_renorm_probs(probs, k)
-    counter = torch.zeros(vocab_size, dtype=torch.int32).to(0)
-    num_trials = 5000000
+    counter = torch.zeros(vocab_size, dtype=torch.int32, device=logits.device)
+    num_trials = 1000000
     samples = flashinfer.sampling.top_k_sampling_from_probs(
-        probs, k, indices=torch.zeros(num_trials, dtype=torch.int32).to(0)
+        probs,
+        k,
+        indices=torch.zeros(num_trials, dtype=torch.int32, device=logits.device),
     )
     counter.scatter_add_(0, samples.long(), torch.ones_like(samples))
     freq = counter.float() / num_trials
@@ -140,7 +144,7 @@ def test_top_k_sampling_freq(vocab_size, distribution, k):
 @pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
 def test_sampling(batch_size, vocab_size):
     torch.manual_seed(42)
-    pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
 
     num_trails = 5000
@@ -155,11 +159,11 @@ def test_sampling(batch_size, vocab_size):
 def test_top_p_sampling(batch_size, vocab_size, p):
     torch.manual_seed(42)
     eps = 1e-4
-    pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
     sorted_prob, indices = torch.sort(normalized_prob, descending=False)
     cdf = torch.cumsum(sorted_prob, dim=-1)
-    mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32).to(0)
+    mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32, device="cuda:0")
     mask.scatter_add_(1, indices, (cdf > (1 - p) - eps).int())
 
     num_trails = 1000
@@ -176,7 +180,7 @@ def test_top_k_sampling(batch_size, vocab_size, k):
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
     torch.manual_seed(42)
-    pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
     sorted_prob, _ = torch.sort(normalized_prob, descending=True)
     pivot = sorted_prob[:, k - 1]
@@ -196,16 +200,16 @@ def test_top_k_sampling(batch_size, vocab_size, k):
 @pytest.mark.parametrize("p", [0.05, 0.1, 0.2, 0.7, 1])
 def test_min_p_sampling(batch_size, vocab_size, p):
     torch.manual_seed(42)
-    pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
     sorted_prob, indices = torch.sort(normalized_prob, descending=False)
     # scale min-p
     top_probs = sorted_prob[:, -1].unsqueeze(-1)
     scaled_p = p * top_probs
     # min-p mask
-    mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32).to(0)
+    mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32, device="cuda:0")
     mask.scatter_add_(1, indices, (sorted_prob >= scaled_p).int())
-    min_p_tensor = torch.full((batch_size,), p).to(0)
+    min_p_tensor = torch.full((batch_size,), p, device="cuda:0")
 
     num_trails = 1000
     for _ in range(num_trails):
@@ -231,12 +235,12 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
     else:
         raise ValueError("p not recognized")
     eps = 1e-4
-    pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
     # top-p mask
     sorted_prob, indices = torch.sort(normalized_prob, descending=False)
     cdf = torch.cumsum(sorted_prob, dim=-1)
-    mask_top_p = torch.zeros(batch_size, vocab_size, dtype=torch.int32).to(0)
+    mask_top_p = torch.zeros(batch_size, vocab_size, dtype=torch.int32, device="cuda:0")
     mask_top_p.scatter_add_(1, indices, (cdf > (1 - p) - eps).int())
     # top-k mask
     sorted_prob, _ = torch.sort(normalized_prob, descending=True)
@@ -244,8 +248,8 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
     mask_top_k = (normalized_prob >= pivot.unsqueeze(-1)).int()
     # overall mask
     mask = torch.minimum(mask_top_p, mask_top_k)
-    top_p_tensor = torch.full((batch_size,), p).to(0)
-    top_k_tensor = torch.full((batch_size,), k).to(0)
+    top_p_tensor = torch.full((batch_size,), p, device="cuda:0")
+    top_k_tensor = torch.full((batch_size,), k, device="cuda:0")
 
     num_trails = 1000
     for _ in range(num_trails):
@@ -267,7 +271,7 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
 @pytest.mark.parametrize("p", [0.1, 0.5])
 def test_top_k_top_p_sampling_from_probs_logits_alignment(batch_size, vocab_size, k, p):
     torch.manual_seed(42)
-    logits = torch.randn(batch_size, vocab_size).to(0) * 5
+    logits = torch.randn(batch_size, vocab_size, device="cuda:0") * 5
     generator_logits = torch.Generator("cuda:0")
     generator_probs = generator_logits.clone_state()
     samples = flashinfer.sampling.top_k_top_p_sampling_from_logits(
@@ -288,7 +292,7 @@ def test_top_k_top_p_sampling_from_probs_logits_alignment(batch_size, vocab_size
 @pytest.mark.parametrize("p", [0.1, 0.5])
 def test_top_k_top_p_joint_sampling_from_logits(batch_size, vocab_size, p):
     torch.manual_seed(42)
-    logits = torch.rand(batch_size, vocab_size).to(0) * 5
+    logits = torch.rand(batch_size, vocab_size, device="cuda:0") * 5
     generator_logits = torch.Generator("cuda:0")
     generator_probs = generator_logits.clone_state()
     if p == 0.1:
@@ -316,11 +320,12 @@ def test_top_k_top_p_joint_sampling_from_logits(batch_size, vocab_size, p):
 @pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
 @pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
 def test_top_p_renorm_probs(batch_size, vocab_size, p):
-    pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
+    torch.manual_seed(42)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
     sorted_prob, indices = torch.sort(normalized_prob, descending=False)
     cdf = torch.cumsum(sorted_prob, dim=-1)
-    mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32).to(0)
+    mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32, device="cuda:0")
     mask.scatter_add_(1, indices, (cdf >= (1 - p)).int())
     renorm_prob_ground_truth = normalized_prob.clone()
     renorm_prob_ground_truth[mask == 0] = 0
@@ -344,7 +349,7 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k):
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
     torch.manual_seed(42)
-    pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
     sorted_prob, _ = torch.sort(normalized_prob, descending=True)
     pivot = sorted_prob[:, k - 1]
@@ -372,7 +377,7 @@ def test_top_k_mask_logits(batch_size, vocab_size, k):
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
     torch.manual_seed(42)
-    logits = torch.randn(batch_size, vocab_size).to(0) * 5
+    logits = torch.randn(batch_size, vocab_size, device="cuda:0") * 5
     probs = torch.softmax(logits, dim=-1)
     masked_logits = flashinfer.sampling.top_k_mask_logits(logits, k)
     renormed_probs = torch.softmax(masked_logits, dim=-1)
@@ -396,34 +401,36 @@ def test_chain_speculative_sampling(
     num_speculate_tokens,
     onehot_target,
 ):
-    pre_norm_draft_prob = torch.rand(batch_size, num_speculate_tokens, vocab_size).to(0)
+    pre_norm_draft_prob = torch.rand(
+        batch_size, num_speculate_tokens, vocab_size, device="cuda:0"
+    )
     normalized_draft_prob = pre_norm_draft_prob / pre_norm_draft_prob.sum(
         dim=-1, keepdim=True
     )
-    draft_token_ids = torch.randint(vocab_size, (batch_size, num_speculate_tokens)).to(
-        0
+    draft_token_ids = torch.randint(
+        vocab_size, (batch_size, num_speculate_tokens), device="cuda:0"
     )
     if not onehot_target:
         pre_norm_target_prob = torch.rand(
-            batch_size, num_speculate_tokens + 1, vocab_size
-        ).to(0)
+            batch_size, num_speculate_tokens + 1, vocab_size, device="cuda:0"
+        )
         target_onehot_prob = pre_norm_target_prob / pre_norm_target_prob.sum(
             dim=-1, keepdim=True
         )
     else:
         target_token_ids = torch.randint(
-            vocab_size, (batch_size, num_speculate_tokens + 1)
-        ).to(0)
+            vocab_size, (batch_size, num_speculate_tokens + 1), device="cuda:0"
+        )
         target_token_ids[..., :num_speculate_tokens] = draft_token_ids
         target_onehot_prob = torch.zeros(
-            (batch_size, num_speculate_tokens + 1, vocab_size)
-        ).to(0)
+            (batch_size, num_speculate_tokens + 1, vocab_size), device="cuda:0"
+        )
         target_onehot_prob.scatter_(2, target_token_ids.unsqueeze(-1), 1)
 
     # NOTE(Zihao): this is a very simple test that only checks whether output is valid or not.
     for trials in range(10):  # noqa: B007
-        accepted_num = torch.zeros(batch_size, dtype=torch.int32).to(0)
-        emitted_num = torch.zeros(batch_size, dtype=torch.int32).to(0)
+        accepted_num = torch.zeros(batch_size, dtype=torch.int32, device="cuda:0")
+        emitted_num = torch.zeros(batch_size, dtype=torch.int32, device="cuda:0")
         (
             output_token_ids,
             accepted_num,

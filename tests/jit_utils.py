@@ -19,6 +19,7 @@ import itertools
 import torch
 
 import flashinfer
+from flashinfer.utils import is_fa3_backend_supported, is_sm90a_supported
 
 
 def jit_decode_attention_func_args(
@@ -109,6 +110,49 @@ def jit_prefill_attention_func_args(
         use_logits_soft_cap_options,
         use_fp16_qk_reduction_options,
     ):
+        if is_sm90a_supported(torch.device("cuda")) and is_fa3_backend_supported(
+            pos_encoding_mode,
+            use_fp16_qk_reduction,
+            use_custom_mask=False,
+            dtype_q=q_dtype,
+            dtype_kv=kv_dtype,
+        ):
+            load_module_func_args.append(
+                [
+                    flashinfer.prefill.gen_single_prefill_module,
+                    (
+                        "fa3",
+                        q_dtype,
+                        kv_dtype,
+                        q_dtype,
+                        head_dim,  # head_dim_qk
+                        head_dim,  # head_dim_vo
+                        pos_encoding_mode,
+                        use_sliding_window,
+                        use_logits_soft_cap,
+                        use_fp16_qk_reduction,
+                    ),
+                ]
+            )
+
+            load_module_func_args.append(
+                [
+                    flashinfer.prefill.gen_batch_prefill_module,
+                    (
+                        "fa3",
+                        q_dtype,
+                        kv_dtype,
+                        q_dtype,
+                        torch.int32,
+                        head_dim,  # head_dim_qk
+                        head_dim,  # head_dim_vo
+                        pos_encoding_mode,
+                        use_sliding_window,
+                        use_logits_soft_cap,
+                        use_fp16_qk_reduction,
+                    ),
+                ]
+            )
         load_module_func_args.append(
             (
                 flashinfer.prefill.gen_single_prefill_module,
@@ -150,6 +194,13 @@ def jit_prefill_attention_func_args(
             flashinfer.quantization.get_quantization_module,
             [],
         )  # required for attention with custom mask
+    )
+
+    load_module_func_args.append(
+        (
+            flashinfer.page.get_page_module,
+            [],
+        )
     )
 
     return load_module_func_args

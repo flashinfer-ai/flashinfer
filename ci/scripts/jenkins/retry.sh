@@ -1,4 +1,5 @@
-#!/bin/bash
+#!/usr/bin/env bash
+
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -16,13 +17,23 @@
 # specific language governing permissions and limitations
 # under the License.
 
-set -e
-set -u
-set -o pipefail
+set -eux
 
+retry() {
+  local max_retries=$1
+  shift
+  local n=0
+  until [ "$n" -ge "$max_retries" ]
+  do
+      "$@" && break
+      n=$((n+1))
+      if [ "$n" -eq "$max_retries" ]; then
+          echo "failed to update after attempt $n / $max_retries, giving up"
+          exit 1
+      fi
 
-# Install python and pip. Don't modify this to add Python package dependencies,
-wget -O Miniforge3.sh "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh"
-bash Miniforge3.sh -b -p /opt/conda
-
-/opt/conda/bin/conda create -n $1 python=3.12
+      WAIT=$(python3 -c 'import random; print(random.randint(30, 200))')
+      echo "failed to update $n / $max_retries, waiting $WAIT to try again"
+      sleep "$WAIT"
+  done
+}

@@ -5,15 +5,20 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Update package lists and install system dependencies
 RUN apt-get update && apt-get install -y \
     curl \
-    git
+    git \
+    wget
 
 # Install python
 COPY install/install_python.sh /install/install_python.sh
-RUN bash /install/install_python.sh
-
-# Install torch
-COPY install/install_torch.sh /install/install_torch.sh
-RUN bash /install/install_torch.sh
+RUN bash /install/install_python.sh py312
 
 # Set home directory
 WORKDIR /workspace
+
+RUN echo "source activate py312" >> ~/.bashrc
+ENV PATH="/opt/conda/bin:$PATH"
+ENV PATH="/opt/conda/envs/py312/bin:$PATH"
+
+# Install torch
+COPY install/install_python_packages.sh /install/install_python_packages.sh
+RUN bash /install/install_python_packages.sh

@@ -19,4 +19,5 @@
 set -e
 set -u
 
-pip3 install --break-system-packages torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+pip3 install ninja pytest numpy scipy build

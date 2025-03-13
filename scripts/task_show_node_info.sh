@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -16,13 +16,29 @@
 # specific language governing permissions and limitations
 # under the License.
 
-set -e
-set -u
-set -o pipefail
+set -euxo pipefail
 
+echo "===== JENKINS INFO ====="
+echo "NODE_NAME=$NODE_NAME"
+echo "EXECUTOR_NUMBER=$EXECUTOR_NUMBER"
+echo "WORKSPACE=$WORKSPACE"
+echo "BUILD_NUMBER=$BUILD_NUMBER"
+echo "WORKSPACE=$WORKSPACE"
 
-# Install python and pip. Don't modify this to add Python package dependencies,
-wget -O Miniforge3.sh "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh"
-bash Miniforge3.sh -b -p /opt/conda
+echo "===== EC2 INFO ====="
+function ec2_metadata() {
+    # See https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instancedata-data-retrieval.html
+    curl -w '\n' -fsSL "http://169.254.169.254/latest/meta-data/$1" || echo failed
+}
 
-/opt/conda/bin/conda create -n $1 python=3.12
+ec2_metadata ami-id
+ec2_metadata instance-id
+ec2_metadata instance-type
+ec2_metadata hostname
+ec2_metadata public-hostname
+
+echo "===== RUNNER INFO ====="
+df --human-readable
+lscpu
+free
+nvidia-smi 2>/dev/null || echo "cuda not found"

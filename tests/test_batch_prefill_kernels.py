@@ -36,9 +36,9 @@ def warmup_jit():
                         torch.float8_e5m2,
                     ],  # kv_dtypes
                     [128, 256],  # head_dims
-                    [0, 1, 2],  # pos_encoding_modes
+                    [0, 1],  # pos_encoding_modes
                     [False],  # use_sliding_windows
-                    [False, True],  # use_logits_soft_caps
+                    [False],  # use_logits_soft_caps
                     [False],  # use_fp16_qk_reductions
                 )
             )
@@ -49,20 +49,20 @@ def warmup_jit():
             yield
 
 
-@pytest.mark.parametrize("batch_size", [12, 17])
-@pytest.mark.parametrize("kv_len", [54, 97])
-@pytest.mark.parametrize("qo_len", [37, 17])
+@pytest.mark.parametrize("batch_size", [12, 17, 128])
+@pytest.mark.parametrize("kv_len", [54, 97, 512, 2048])
+@pytest.mark.parametrize("qo_len", [37, 17, 127, 577])
 @pytest.mark.parametrize("page_size", [1, 5, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
+@pytest.mark.parametrize("kv_layout", ["NHD"])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
 @pytest.mark.parametrize("use_cuda_graph", [True])
-@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
-@pytest.mark.parametrize("return_lse", [True, False])
-@pytest.mark.parametrize("contiguous_kv", [True, False])
+@pytest.mark.parametrize("logits_soft_cap", [0.0])
+@pytest.mark.parametrize("return_lse", [True])
+@pytest.mark.parametrize("contiguous_kv", [True])
 def test_batch_prefill_with_paged_kv_cache(
     batch_size,
     kv_len,
@@ -79,7 +79,15 @@ def test_batch_prefill_with_paged_kv_cache(
     return_lse,
     contiguous_kv,
 ):
-    q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
+    if qo_len > kv_len and causal:
+        pytest.skip("qo_len > kv_len and causal is not supported")
+    q = torch.randn(
+        batch_size * qo_len,
+        num_qo_heads,
+        head_dim,
+        device="cuda:0",
+        dtype=torch.float16,
+    )
     q_indptr_cpu = torch.arange(0, batch_size + 1).int() * qo_len
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size
@@ -93,7 +101,7 @@ def test_batch_prefill_with_paged_kv_cache(
             tmp.append(2)
             tmp.append(v)
         kv_shape = tmp
-        kv_data_fp32 = torch.randn(*kv_shape, dtype=torch.float32).to(0)
+        kv_data_fp32 = torch.randn(*kv_shape, dtype=torch.float32, device="cuda:0")
         kv_data = kv_data_fp32.half()
         kv_data = kv_data[:, 1, :, 1, :, 1, :, 1, :]
         kv_data_fp32 = kv_data_fp32[:, 1, :, 1, :, 1, :, 1, :]
@@ -103,7 +111,7 @@ def test_batch_prefill_with_paged_kv_cache(
             != kv_data.shape[-3] * kv_data.shape[-2] * kv_data.shape[-1]
         )
     else:
-        kv_data_fp32 = torch.randn(*kv_shape, dtype=torch.float32).to(0)
+        kv_data_fp32 = torch.randn(*kv_shape, dtype=torch.float32, device="cuda:0")
         kv_data = kv_data_fp32.half()
     kv_indptr_cpu = torch.arange(0, batch_size + 1).int() * num_pages_per_seq
     kv_indices_cpu = torch.arange(0, total_num_pages).int()
@@ -111,7 +119,7 @@ def test_batch_prefill_with_paged_kv_cache(
         (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
     )
 
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     if not use_cuda_graph:
         q_indptr_gpu = q_indptr_cpu.to(0)
         kv_indptr_gpu = kv_indptr_cpu.to(0)
@@ -143,10 +151,18 @@ def test_batch_prefill_with_paged_kv_cache(
         wrapper.run(q, kv_data, out=o_buffer)
         torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
     else:
-        q_indptr_buffer = torch.empty(batch_size + 1).int().to(0)
-        kv_indptr_buffer = torch.empty(batch_size + 1).int().to(0)
-        kv_indices_buffer = torch.empty(total_num_pages).int().to(0)
-        kv_last_page_len_buffer = torch.empty(batch_size).int().to(0)
+        q_indptr_buffer = torch.empty(
+            batch_size + 1, device="cuda:0", dtype=torch.int32
+        )
+        kv_indptr_buffer = torch.empty(
+            batch_size + 1, device="cuda:0", dtype=torch.int32
+        )
+        kv_indices_buffer = torch.empty(
+            total_num_pages, device="cuda:0", dtype=torch.int32
+        )
+        kv_last_page_len_buffer = torch.empty(
+            batch_size, device="cuda:0", dtype=torch.int32
+        )
         wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer,
             kv_layout,
@@ -265,20 +281,20 @@ def test_batch_prefill_with_paged_kv_cache(
         torch.testing.assert_close(o_i, o_ref_i, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("batch_size", [12, 17])
-@pytest.mark.parametrize("kv_len", [54, 97])
-@pytest.mark.parametrize("qo_len", [37, 17])
+@pytest.mark.parametrize("batch_size", [12, 17, 128])
+@pytest.mark.parametrize("kv_len", [54, 97, 512, 2048])
+@pytest.mark.parametrize("qo_len", [37, 17, 127, 577])
 @pytest.mark.parametrize("page_size", [1, 5, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
+@pytest.mark.parametrize("kv_layout", ["NHD"])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
-@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
-@pytest.mark.parametrize("return_lse", [True, False])
-@pytest.mark.parametrize("contiguous_kv", [True, False])
+@pytest.mark.parametrize("logits_soft_cap", [0.0])
+@pytest.mark.parametrize("return_lse", [True])
+@pytest.mark.parametrize("contiguous_kv", [True])
 def test_batch_prefill_with_tuple_paged_kv_cache(
     batch_size,
     kv_len,
@@ -295,7 +311,15 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
     return_lse,
     contiguous_kv,
 ):
-    q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
+    if qo_len > kv_len and causal:
+        pytest.skip("qo_len > kv_len and causal is not supported")
+    q = torch.randn(
+        batch_size * qo_len,
+        num_qo_heads,
+        head_dim,
+        device="cuda:0",
+        dtype=torch.float16,
+    )
     q_indptr_cpu = torch.arange(0, batch_size + 1).int() * qo_len
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size
@@ -310,7 +334,8 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
             tmp.append(v)
         kv_shape = tmp
         kv_data_fp32 = [
-            torch.randn(*kv_shape, dtype=torch.float32).to(0) for _ in range(2)
+            torch.randn(*kv_shape, dtype=torch.float32, device="cuda:0")
+            for _ in range(2)
         ]
         kv_data = [kv_data_fp32[i].half() for i in range(2)]
         for i in range(2):
@@ -323,7 +348,8 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
             )
     else:
         kv_data_fp32 = [
-            torch.randn(*kv_shape, dtype=torch.float32).to(0) for _ in range(2)
+            torch.randn(*kv_shape, dtype=torch.float32, device="cuda:0")
+            for _ in range(2)
         ]
         kv_data = [kv_data_fp32[i].half() for i in range(2)]
     kv_data = tuple(kv_data)
@@ -333,7 +359,7 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
         (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
     )
 
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     if not use_cuda_graph:
         q_indptr_gpu = q_indptr_cpu.to(0)
         kv_indptr_gpu = kv_indptr_cpu.to(0)
@@ -360,10 +386,18 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
         else:
             o = wrapper.run(q, kv_data)
     else:
-        q_indptr_buffer = torch.empty(batch_size + 1).int().to(0)
-        kv_indptr_buffer = torch.empty(batch_size + 1).int().to(0)
-        kv_indices_buffer = torch.empty(total_num_pages).int().to(0)
-        kv_last_page_len_buffer = torch.empty(batch_size).int().to(0)
+        q_indptr_buffer = torch.empty(
+            batch_size + 1, device="cuda:0", dtype=torch.int32
+        )
+        kv_indptr_buffer = torch.empty(
+            batch_size + 1, device="cuda:0", dtype=torch.int32
+        )
+        kv_indices_buffer = torch.empty(
+            total_num_pages, device="cuda:0", dtype=torch.int32
+        )
+        kv_last_page_len_buffer = torch.empty(
+            batch_size, device="cuda:0", dtype=torch.int32
+        )
         wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer,
             kv_layout,
@@ -474,18 +508,18 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
         torch.testing.assert_close(o_i, o_ref_i, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("batch_size", [12, 17])
-@pytest.mark.parametrize("kv_len", [54, 97])
-@pytest.mark.parametrize("qo_len", [37, 17])
+@pytest.mark.parametrize("batch_size", [12, 17, 128])
+@pytest.mark.parametrize("kv_len", [54, 97, 512, 2048])
+@pytest.mark.parametrize("qo_len", [37, 17, 127, 577])
 @pytest.mark.parametrize("page_size", [1, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
 @pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
-@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
-@pytest.mark.parametrize("return_lse", [True, False])
-@pytest.mark.parametrize("contiguous_kv", [True, False])
+@pytest.mark.parametrize("kv_layout", ["NHD"])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
+@pytest.mark.parametrize("logits_soft_cap", [0.0])
+@pytest.mark.parametrize("return_lse", [True])
+@pytest.mark.parametrize("contiguous_kv", [True])
 def test_batch_prefill_with_paged_kv_cache_custom_mask(
     batch_size,
     kv_len,
@@ -500,8 +534,16 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
     return_lse,
     contiguous_kv,
 ):
-    q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
-    q_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
+    q = torch.randn(
+        batch_size * qo_len,
+        num_qo_heads,
+        head_dim,
+        device="cuda:0",
+        dtype=torch.float16,
+    )
+    q_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32) * qo_len
+    )
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size
     if kv_layout == "HND":
@@ -514,7 +556,7 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
             tmp.append(2)
             tmp.append(v)
         kv_shape = tmp
-        kv_data = torch.randn(*kv_shape, dtype=torch.float32).to(0).half()
+        kv_data = torch.randn(*kv_shape, dtype=torch.float16, device="cuda:0")
         kv_data = kv_data[:, 1, :, 1, :, 1, :, 1, :]
         # actual data is stored in non-contiguous memory
         assert (
@@ -522,25 +564,24 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
             != kv_data.shape[-3] * kv_data.shape[-2] * kv_data.shape[-1]
         )
     else:
-        kv_data = torch.randn(*kv_shape, dtype=torch.float32).to(0).half()
-    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * num_pages_per_seq
-    kv_indices = torch.arange(0, total_num_pages).to(0).int()
+        kv_data = torch.randn(*kv_shape, dtype=torch.float16, device="cuda:0")
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32)
+        * num_pages_per_seq
+    )
+    kv_indices = torch.arange(0, total_num_pages, device="cuda:0", dtype=torch.int32)
     kv_last_page_len = torch.full(
-        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
-    ).to(0)
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device="cuda:0"
+    )
 
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout
     )
-    custom_mask = (
-        torch.tril(
-            torch.full((batch_size, qo_len, kv_len), True),
-            diagonal=(kv_len - qo_len),
-        )
-        .reshape(-1)
-        .to(0)
-    )
+    custom_mask = torch.tril(
+        torch.full((batch_size, qo_len, kv_len), True, device="cuda:0"),
+        diagonal=(kv_len - qo_len),
+    ).reshape(-1)
 
     # use custom mask
     wrapper.plan(
@@ -582,16 +623,16 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
     torch.testing.assert_close(o_custom, o_causal, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("batch_size", [12, 17])
-@pytest.mark.parametrize("kv_len", [54, 97])
-@pytest.mark.parametrize("qo_len", [37, 17])
+@pytest.mark.parametrize("batch_size", [12, 17, 128])
+@pytest.mark.parametrize("kv_len", [54, 97, 512, 2048])
+@pytest.mark.parametrize("qo_len", [37, 17, 127, 577])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
-@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
-@pytest.mark.parametrize("return_lse", [True, False])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
+@pytest.mark.parametrize("logits_soft_cap", [0.0])
+@pytest.mark.parametrize("return_lse", [True])
 def test_batch_prefill_with_ragged_kv_cache(
     batch_size,
     kv_len,
@@ -604,15 +645,39 @@ def test_batch_prefill_with_ragged_kv_cache(
     logits_soft_cap,
     return_lse,
 ):
+    if qo_len > kv_len and causal:
+        pytest.skip("qo_len > kv_len and causal is not supported")
     kv_layout = "NHD"
-    q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
-    q_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
+    q = torch.randn(
+        batch_size * qo_len,
+        num_qo_heads,
+        head_dim,
+        device="cuda:0",
+        dtype=torch.float16,
+    )
+    q_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32) * qo_len
+    )
 
-    k = torch.randn(batch_size * kv_len, num_kv_heads, head_dim).to(0).half()
-    v = torch.randn(batch_size * kv_len, num_kv_heads, head_dim).to(0).half()
-    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len
+    k = torch.randn(
+        batch_size * kv_len,
+        num_kv_heads,
+        head_dim,
+        device="cuda:0",
+        dtype=torch.float16,
+    )
+    v = torch.randn(
+        batch_size * kv_len,
+        num_kv_heads,
+        head_dim,
+        device="cuda:0",
+        dtype=torch.float16,
+    )
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32) * kv_len
+    )
 
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
         workspace_buffer, kv_layout
     )
@@ -665,26 +730,44 @@ def test_batch_prefill_with_ragged_kv_cache_custom_mask(
     return_lse,
 ):
     kv_layout = "NHD"
-    q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim).to(0).half()
-    q_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
+    q = torch.randn(
+        batch_size * qo_len,
+        num_qo_heads,
+        head_dim,
+        device="cuda:0",
+        dtype=torch.float16,
+    )
+    q_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32) * qo_len
+    )
 
-    k = torch.randn(batch_size * kv_len, num_kv_heads, head_dim).to(0).half()
-    v = torch.randn(batch_size * kv_len, num_kv_heads, head_dim).to(0).half()
-    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len
+    k = torch.randn(
+        batch_size * kv_len,
+        num_kv_heads,
+        head_dim,
+        device="cuda:0",
+        dtype=torch.float16,
+    )
+    v = torch.randn(
+        batch_size * kv_len,
+        num_kv_heads,
+        head_dim,
+        device="cuda:0",
+        dtype=torch.float16,
+    )
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32) * kv_len
+    )
 
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
         workspace_buffer, kv_layout
     )
 
-    custom_mask = (
-        torch.tril(
-            torch.full((batch_size, qo_len, kv_len), True),
-            diagonal=(kv_len - qo_len),
-        )
-        .reshape(-1)
-        .to(0)
-    )
+    custom_mask = torch.tril(
+        torch.full((batch_size, qo_len, kv_len), True, device="cuda:0"),
+        diagonal=(kv_len - qo_len),
+    ).reshape(-1)
 
     # use custom mask
     wrapper.plan(

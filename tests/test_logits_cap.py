@@ -74,9 +74,9 @@ def test_single_decode_logits_soft_cap(
     head_dim,
     soft_cap,
 ):
-    q = torch.randn(num_heads, head_dim).to(0).half()
-    k = torch.randn(seq_len, num_heads, head_dim).to(0).half()
-    v = torch.randn(seq_len, num_heads, head_dim).to(0).half()
+    q = torch.randn(num_heads, head_dim, device="cuda:0", dtype=torch.float16)
+    k = torch.randn(seq_len, num_heads, head_dim, device="cuda:0", dtype=torch.float16)
+    v = torch.randn(seq_len, num_heads, head_dim, device="cuda:0", dtype=torch.float16)
 
     o = flashinfer.single_decode_with_kv_cache(q, k, v, logits_soft_cap=soft_cap)
     o_ref = attention_logits_soft_cap_torch(q.unsqueeze(0), k, v, soft_cap).squeeze(0)
@@ -95,9 +95,9 @@ def test_single_prefill_logits_soft_cap(
     head_dim,
     soft_cap,
 ):
-    q = torch.randn(q_len, num_heads, head_dim).to(0).half()
-    k = torch.randn(kv_len, num_heads, head_dim).to(0).half()
-    v = torch.randn(kv_len, num_heads, head_dim).to(0).half()
+    q = torch.randn(q_len, num_heads, head_dim, device="cuda:0", dtype=torch.float16)
+    k = torch.randn(kv_len, num_heads, head_dim, device="cuda:0", dtype=torch.float16)
+    v = torch.randn(kv_len, num_heads, head_dim, device="cuda:0", dtype=torch.float16)
 
     o = flashinfer.single_prefill_with_kv_cache(q, k, v, logits_soft_cap=soft_cap)
     o_ref = attention_logits_soft_cap_torch(q, k, v, soft_cap)
