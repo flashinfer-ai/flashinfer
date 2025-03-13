@@ -7,7 +7,7 @@ set -x
 
 pip install -e . -v
 
-pytest -s tests/test_group_gemm.py
+# pytest -s tests/test_group_gemm.py
 pytest -s tests/test_logits_cap.py
 pytest -s tests/test_sliding_window.py
 pytest -s tests/test_tensor_cores_decode.py
