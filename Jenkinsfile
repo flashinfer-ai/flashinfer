@@ -86,10 +86,12 @@ def init_git(submodule = false) {
 
 stage('JIT Unittest') {
   parallel(
-    'G5-SM_80': {
-      node('GPU-G5-SPOT') {
+    'G6-SM_89': {
+      node('GPU-G6-SPOT') {
         ws(per_exec_ws('flashinfer-unittest')) {
           init_git(true) // we need cutlass submodule
+          sh(script: "free -h", label: "Show RAM size")
+          sh(script: "nproc", label: "Number of CPU Cores")
           sh(script: "ls -alh", label: 'Show work directory')
           sh(script: "${docker_run} ./scripts/task_jit_run_tests.sh", label: 'JIT Unittest')
         }
