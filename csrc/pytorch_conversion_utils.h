@@ -15,7 +15,7 @@
  */
 
 #pragma once
-#include <ATen/ATen.h>
+#include <ATen/ops/tensor.h>
 
 inline at::Tensor vec_to_tensor(const std::vector<int64_t>& vec) {
   return at::tensor(vec, at::dtype(at::kLong).device(at::kCPU));
