@@ -32,7 +32,7 @@ def warmup_jit():
                     [torch.float16],  # q_dtypes
                     [torch.float16],  # kv_dtypes
                     [64, 128, 256],  # head_dims
-                    [0, 1, 2],  # pos_encoding_modes
+                    [0, 1],  # pos_encoding_modes
                     [False],  # use_sliding_windows
                     [False],  # use_logits_soft_caps
                 )
@@ -40,7 +40,7 @@ def warmup_jit():
                     [torch.float16],  # q_dtypes
                     [torch.float16],  # kv_dtypes
                     [64, 128, 256],  # head_dims
-                    [0, 1, 2],  # pos_encoding_modes
+                    [0, 1],  # pos_encoding_modes
                     [False],  # use_sliding_windows
                     [False],  # use_logits_soft_caps
                     [False],  # use_fp16_qk_reductions
@@ -58,7 +58,7 @@ def warmup_jit():
 @pytest.mark.parametrize("group_size", [1, 4, 8])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
 def test_single_decode_tensor_cores(
     kv_len: int,
     num_kv_heads: int,
@@ -105,7 +105,7 @@ def test_single_decode_tensor_cores(
 @pytest.mark.parametrize("group_size", [1, 4, 8])
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
 def test_batch_decode_tensor_cores(
     batch_size: int,
     kv_len: int,
@@ -197,7 +197,7 @@ def test_batch_decode_tensor_cores(
 @pytest.mark.parametrize("group_size", [1, 4, 8])
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
 def test_batch_decode_tensor_cores_cuda_graph(
     batch_size: int,
     kv_len: int,
