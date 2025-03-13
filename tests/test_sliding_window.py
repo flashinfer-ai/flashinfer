@@ -109,13 +109,16 @@ def test_batch_decode_sliding_window(
         dtype=torch.float16,
         device="cuda:0",
     )
-    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * num_pages_per_seq
-    kv_indices = torch.arange(0, total_num_pages).to(0).int()
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32)
+        * num_pages_per_seq
+    )
+    kv_indices = torch.arange(0, total_num_pages, device="cuda:0", dtype=torch.int32)
     kv_last_page_len = torch.full(
-        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
-    ).to(0)
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device="cuda:0"
+    )
 
-    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, "NHD")
     wrapper.plan(
         kv_indptr,
@@ -236,7 +239,9 @@ def test_batch_paged_prefill_sliding_window(
         dtype=torch.float16,
         device="cuda:0",
     )
-    q_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
+    q_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32) * qo_len
+    )
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size
     k_data = torch.randn(
@@ -255,13 +260,16 @@ def test_batch_paged_prefill_sliding_window(
         dtype=torch.float16,
         device="cuda:0",
     )
-    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * num_pages_per_seq
-    kv_indices = torch.arange(0, total_num_pages).to(0).int()
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32)
+        * num_pages_per_seq
+    )
+    kv_indices = torch.arange(0, total_num_pages, device="cuda:0", dtype=torch.int32)
     kv_last_page_len = torch.full(
-        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
-    ).to(0)
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device="cuda:0"
+    )
 
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(workspace_buffer, "NHD")
     wrapper.plan(
         q_indptr,
@@ -324,7 +332,9 @@ def test_batch_ragged_prefill_sliding_window(
         dtype=torch.float16,
         device="cuda:0",
     )
-    q_indptr = torch.arange(0, batch_size + 1).to(0).int() * qo_len
+    q_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32) * qo_len
+    )
     k = torch.randn(
         batch_size * kv_len,
         num_kv_heads,
@@ -339,8 +349,10 @@ def test_batch_ragged_prefill_sliding_window(
         dtype=torch.float16,
         device="cuda:0",
     )
-    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * kv_len
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32) * kv_len
+    )
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(workspace_buffer, "NHD")
     wrapper.plan(
         q_indptr,

@@ -68,16 +68,24 @@ def test_single_decode_tensor_cores(
     pos_encoding_mode: str,
 ):
     num_qo_heads = num_kv_heads * group_size
-    q = torch.randn(num_qo_heads, head_dim).to(0).half()
+    q = torch.randn(num_qo_heads, head_dim, device="cuda:0", dtype=torch.float16)
     k = (
-        torch.randn(num_kv_heads, kv_len, head_dim).to(0).half()
+        torch.randn(
+            num_kv_heads, kv_len, head_dim, device="cuda:0", dtype=torch.float16
+        )
         if kv_layout == "HND"
-        else torch.randn(kv_len, num_kv_heads, head_dim).to(0).half()
+        else torch.randn(
+            kv_len, num_kv_heads, head_dim, device="cuda:0", dtype=torch.float16
+        )
     )
     v = (
-        torch.randn(num_kv_heads, kv_len, head_dim).to(0).half()
+        torch.randn(
+            num_kv_heads, kv_len, head_dim, device="cuda:0", dtype=torch.float16
+        )
         if kv_layout == "HND"
-        else torch.randn(kv_len, num_kv_heads, head_dim).to(0).half()
+        else torch.randn(
+            kv_len, num_kv_heads, head_dim, device="cuda:0", dtype=torch.float16
+        )
     )
 
     o = flashinfer.single_decode_with_kv_cache(
@@ -109,22 +117,44 @@ def test_batch_decode_tensor_cores(
     pos_encoding_mode: str,
 ):
     num_qo_heads = num_kv_heads * group_size
-    q = torch.randn(batch_size, num_qo_heads, head_dim).to(0).to(torch.float16)
+    q = torch.randn(
+        batch_size, num_qo_heads, head_dim, device="cuda:0", dtype=torch.float16
+    )
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size
     kv_data = (
-        torch.randn(total_num_pages, 2, num_kv_heads, page_size, head_dim).to(0) / 10
-        if kv_layout == "HND"
-        else torch.randn(total_num_pages, 2, page_size, num_kv_heads, head_dim).to(0)
+        torch.randn(
+            total_num_pages,
+            2,
+            num_kv_heads,
+            page_size,
+            head_dim,
+            device="cuda:0",
+            dtype=torch.float16,
+        )
         / 10
-    ).to(torch.float16)
-    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * num_pages_per_seq
-    kv_indices = torch.arange(0, total_num_pages).to(0).int()
+        if kv_layout == "HND"
+        else torch.randn(
+            total_num_pages,
+            2,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            device="cuda:0",
+            dtype=torch.float16,
+        )
+        / 10
+    )
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32)
+        * num_pages_per_seq
+    )
+    kv_indices = torch.arange(0, total_num_pages, device="cuda:0", dtype=torch.int32)
     kv_last_page_len = torch.full(
-        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
-    ).to(0)
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device="cuda:0"
+    )
 
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace_buffer, kv_layout)
     wrapper.plan(
         kv_indptr,
@@ -179,22 +209,44 @@ def test_batch_decode_tensor_cores_cuda_graph(
     pos_encoding_mode: str,
 ):
     num_qo_heads = num_kv_heads * group_size
-    q = torch.randn(batch_size, num_qo_heads, head_dim).to(0).to(torch.float16)
+    q = torch.randn(
+        batch_size, num_qo_heads, head_dim, device="cuda:0", dtype=torch.float16
+    )
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size
     kv_data = (
-        torch.randn(total_num_pages, 2, num_kv_heads, page_size, head_dim).to(0) / 10
-        if kv_layout == "HND"
-        else torch.randn(total_num_pages, 2, page_size, num_kv_heads, head_dim).to(0)
+        torch.randn(
+            total_num_pages,
+            2,
+            num_kv_heads,
+            page_size,
+            head_dim,
+            device="cuda:0",
+            dtype=torch.float16,
+        )
         / 10
-    ).to(torch.float16)
-    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * num_pages_per_seq
-    kv_indices = torch.arange(0, total_num_pages).to(0).int()
+        if kv_layout == "HND"
+        else torch.randn(
+            total_num_pages,
+            2,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            device="cuda:0",
+            dtype=torch.float16,
+        )
+        / 10
+    )
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32)
+        * num_pages_per_seq
+    )
+    kv_indices = torch.arange(0, total_num_pages, device="cuda:0", dtype=torch.int32)
     kv_last_page_len = torch.full(
-        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
-    ).to(0)
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device="cuda:0"
+    )
 
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
 
     # cuda cores wrapper
     wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(

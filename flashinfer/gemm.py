@@ -48,6 +48,7 @@ def get_gemm_module():
                     FLASHINFER_CSRC_DIR / "group_gemm.cu",
                     FLASHINFER_CSRC_DIR / "flashinfer_gemm_ops.cu",
                 ],
+                extra_ldflags=["-lcublas", "-lcublasLt"],
             )
 
         # torch library for bmm_fp8
