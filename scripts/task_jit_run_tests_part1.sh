@@ -7,9 +7,9 @@ set -x
 
 pip install -e . -v
 
-pytest -s tests/test_oom.py
-# pytest -s tests/test_block_sparse.py
-# pytest -s tests/test_norm.py
-# pytest -s tests/test_sampling.py
-# pytest -s tests/test_jit_example.py
-# pytest -s tests/test_jit_warmup.py
+pytest -s tests/test_group_gemm.py
+pytest -s tests/test_logits_cap.py
+pytest -s tests/test_mla_decode_kernel.py
+pytest -s tests/test_sliding_window.py
+pytest -s tests/test_tensor_cores_decode.py
+pytest -s tests/test_alibi.py
