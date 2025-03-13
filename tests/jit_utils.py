@@ -19,7 +19,7 @@ import itertools
 import torch
 
 import flashinfer
-from flashinfer.utils import is_fa3_backend_supported
+from flashinfer.utils import is_fa3_backend_supported, is_sm90a_supported
 
 
 def jit_decode_attention_func_args(
@@ -110,7 +110,7 @@ def jit_prefill_attention_func_args(
         use_logits_soft_cap_options,
         use_fp16_qk_reduction_options,
     ):
-        if is_fa3_backend_supported(
+        if is_sm90a_supported(torch.device("cuda")) and is_fa3_backend_supported(
             pos_encoding_mode,
             use_fp16_qk_reduction,
             use_custom_mask=False,
