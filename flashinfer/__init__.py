@@ -48,6 +48,7 @@ from .page import append_paged_kv_cache as append_paged_kv_cache
 from .page import append_paged_mla_kv_cache as append_paged_mla_kv_cache
 from .page import get_batch_indices_positions as get_batch_indices_positions
 from .page import get_seq_lens as get_seq_lens
+from .pod import PODWithPagedKVCacheWrapper as PODWithPagedKVCacheWrapper
 from .prefill import (
     BatchPrefillWithPagedKVCacheWrapper as BatchPrefillWithPagedKVCacheWrapper,
 )

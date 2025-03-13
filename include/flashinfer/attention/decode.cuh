@@ -61,14 +61,11 @@ namespace {
  */
 template <PosEncodingMode pos_encoding_mode, uint32_t vec_size, uint32_t bdx, uint32_t tile_size,
           typename AttentionVariant, typename Params, typename T>
-__device__ __forceinline__ void compute_qk(const Params& params, AttentionVariant variant,
-                                           const uint32_t batch_idx, const T* smem,
-                                           const vec_t<float, vec_size>& q_vec,
-                                           const vec_t<float, vec_size>& freq, uint32_t kv_idx_base,
-                                           uint32_t iter_base, uint32_t iter_bound,
-                                           uint32_t qo_head_idx, uint32_t kv_head_idx, float* s,
-                                           state_t<vec_size>& st) {
-  uint32_t tx = threadIdx.x, tz = threadIdx.z;
+__device__ __forceinline__ void compute_qk(
+    const Params& params, AttentionVariant variant, const uint32_t batch_idx, const T* smem,
+    const vec_t<float, vec_size>& q_vec, const vec_t<float, vec_size>& freq, uint32_t kv_idx_base,
+    uint32_t iter_base, uint32_t iter_bound, uint32_t qo_head_idx, uint32_t kv_head_idx, float* s,
+    state_t<vec_size>& st, const uint32_t tx, const uint32_t ty, const uint32_t tz) {
   float m_prev = st.m;
 #pragma unroll
   for (uint32_t j = 0; j < tile_size; ++j) {
@@ -134,8 +131,7 @@ __device__ __forceinline__ void compute_qk(const Params& params, AttentionVarian
 template <uint32_t vec_size, uint32_t bdx, uint32_t tile_size, typename T>
 __device__ __forceinline__ void update_local_state(const T* smem, const float* s,
                                                    uint32_t compute_stage_idx,
-                                                   state_t<vec_size>& st) {
-  uint32_t tx = threadIdx.x;
+                                                   state_t<vec_size>& st, uint32_t tx) {
 #pragma unroll
   for (uint32_t j = 0; j < tile_size; ++j) {
     vec_t<float, vec_size> v_vec;
@@ -158,11 +154,11 @@ __device__ __forceinline__ void update_local_state(const T* smem, const float* s
  */
 template <uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant>
 __device__ __forceinline__ void sync_state(AttentionVariant variant, state_t<vec_size>& st,
-                                           float* smem, float* smem_md) {
+                                           float* smem, float* smem_md, const uint32_t tx,
+                                           const uint32_t ty, const uint32_t tz) {
   if constexpr (bdz > 1) {
     constexpr uint32_t head_dim = bdx * vec_size;
     auto block = cg::this_thread_block();
-    uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
     st.o.store(smem + (tz * bdy + ty) * head_dim + tx * vec_size);
     if constexpr (variant.use_softmax) {
       smem_md[(tz * bdy + ty) * 2] = st.m;
@@ -315,7 +311,7 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
         params, variant, /*batch_idx=*/0,
         k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, q_vec, freq,
         consumer_kv_idx_base, iter * bdy * tile_size_per_bdx * bdz, kv_chunk_size, qo_head_idx,
-        kv_head_idx, s, st_local);
+        kv_head_idx, s, st_local, tx, ty, tz);
     block.sync();
     // load k
     for (uint32_t j = 0; j < tile_size_per_bdx; ++j) {
@@ -333,7 +329,7 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
     block.sync();
     update_local_state<vec_size, bdx, bdy * tile_size_per_bdx>(
         v_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, s, stage_idx,
-        st_local);
+        st_local, tx);
     block.sync();
 
     // load v
@@ -355,7 +351,8 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
   block.sync();
 
   // sync local state of all warps inside a threadblock
-  sync_state<vec_size, bdx, bdy, bdz>(variant, st_local, reinterpret_cast<float*>(smem), smem_md);
+  sync_state<vec_size, bdx, bdy, bdz>(variant, st_local, reinterpret_cast<float*>(smem), smem_md,
+                                      tx, ty, tz);
   if constexpr (variant.use_softmax) {
     st_local.normalize();
   }
@@ -392,7 +389,12 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
 template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
           uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
           typename Params>
-__global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params params) {
+__device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& params, uint8_t smem[],
+                                                             const uint32_t bx = blockIdx.x,
+                                                             const uint32_t by = blockIdx.y,
+                                                             const uint32_t tx = threadIdx.x,
+                                                             const uint32_t ty = threadIdx.y,
+                                                             const uint32_t tz = threadIdx.z) {
   auto block = cg::this_thread_block();
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
@@ -408,11 +410,10 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params
   const bool partition_kv = params.partition_kv;
 
   constexpr uint32_t head_dim = bdx * vec_size;
-  const uint32_t bx = blockIdx.x, by = blockIdx.y;
   const uint32_t batch_idx = params.request_indices[bx];
   const uint32_t kv_tile_idx = params.kv_tile_indices[bx];
   const uint32_t kv_head_idx = by;
-  const uint32_t qo_head_idx = kv_head_idx * bdy + threadIdx.y;
+  const uint32_t qo_head_idx = kv_head_idx * bdy + ty;
   // NOTE(Zihao): when CUDAGraph is enabled, we will launch more blocks than
   // the actual batch size, so we need to check if the current batch is valid
   if (block_valid_mask && !block_valid_mask[bx]) return;
@@ -424,7 +425,6 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params
       partition_kv ? min((kv_tile_idx + 1) * max_chunk_size, kv_len) : kv_len;
   const uint32_t chunk_size = chunk_end - chunk_start;
 
-  extern __shared__ uint8_t smem[];
   AttentionVariant variant(params, batch_idx, smem);
   DTypeKV* k_smem = (DTypeKV*)smem;
   DTypeKV* v_smem = (DTypeKV*)(smem + num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
@@ -434,7 +434,6 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params
   float* smem_md = (float*)(smem + 2 * num_stages_smem * tile_size_per_bdx * bdy * bdz * head_dim *
                                        sizeof(DTypeKV));
 
-  const uint32_t tx = threadIdx.x, ty = threadIdx.y, tz = threadIdx.z;
   vec_t<float, vec_size> q_vec;
   vec_t<float, vec_size> freq;
   const uint32_t q_stride_n = params.q_stride_n;
@@ -531,7 +530,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params
         k_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, q_vec, freq,
         (paged_kv.rope_pos_offset == nullptr ? 0 : paged_kv.rope_pos_offset[batch_idx]) +
             chunk_start + iter * tile_size_per_bdx * bdy * bdz,
-        iter * tile_size_per_bdx * bdy * bdz, chunk_size, qo_head_idx, kv_head_idx, s, st);
+        iter * tile_size_per_bdx * bdy * bdz, chunk_size, qo_head_idx, kv_head_idx, s, st, tx, ty,
+        tz);
     block.sync();
 
 #pragma unroll
@@ -557,7 +557,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params
     cp_async::wait_group<2 * num_stages_smem - 1>();
     block.sync();
     update_local_state<vec_size, bdx, bdy * tile_size_per_bdx>(
-        v_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, s, stage_idx, st);
+        v_smem + (stage_idx * bdz + tz) * bdy * tile_size_per_bdx * head_dim, s, stage_idx, st, tx);
     block.sync();
 
     // load v tiles
@@ -576,7 +576,8 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params
   block.sync();
 
   // sync local state of all warps inside a threadblock
-  sync_state<vec_size, bdx, bdy, bdz>(variant, st, reinterpret_cast<float*>(smem), smem_md);
+  sync_state<vec_size, bdx, bdy, bdz>(variant, st, reinterpret_cast<float*>(smem), smem_md, tx, ty,
+                                      tz);
   if constexpr (variant.use_softmax) {
     st.normalize();
   }
@@ -588,6 +589,15 @@ __global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params
       lse[bx * num_qo_heads + qo_head_idx] = st.get_lse();
     }
   }
+}
+
+template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
+          uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
+          typename Params>
+__global__ void BatchDecodeWithPagedKVCacheKernel(const __grid_constant__ Params params) {
+  extern __shared__ uint8_t smem[];
+  BatchDecodeWithPagedKVCacheDevice<POS_ENCODING_MODE, num_stages_smem, tile_size_per_bdx, vec_size,
+                                    bdx, bdy, bdz, AttentionVariant>(params, smem);
 }
 
 /*!
@@ -1013,7 +1023,7 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
 #pragma unroll
     for (int i = 0; i < tile_size_qo_heads; ++i) {
       if (qo_head_idx[i] < num_qo_heads)
-        sync_state<vec_size_ckv, bdx, bdy, bdz>(variant, st[i], (float*)smem, smem_md);
+        sync_state<vec_size_ckv, bdx, bdy, bdz>(variant, st[i], (float*)smem, smem_md, tx, ty, tz);
     }
   }
 
