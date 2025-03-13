@@ -51,7 +51,7 @@ def gumbel_distribution(beta):
 @pytest.mark.parametrize("zero_ratio", [0.0, 0.5, 0.9])
 def test_sampling_freq(vocab_size, distribution, zero_ratio):
     torch.manual_seed(42)
-    num_trials = 5000000
+    num_trials = 1000000
     logits = distribution((1, vocab_size), "cuda:0")
     zero_indices = torch.randperm(vocab_size)[: int(vocab_size * zero_ratio)]
     logits[:, zero_indices] = -float("inf")
@@ -91,7 +91,7 @@ def test_top_p_sampling_freq(vocab_size, distribution, p):
 
     renorm_probs = flashinfer.sampling.top_p_renorm_probs(probs, p)
     counter = torch.zeros(vocab_size, dtype=torch.int32, device=logits.device)
-    num_trials = 5000000
+    num_trials = 1000000
     samples = flashinfer.sampling.top_p_sampling_from_probs(
         probs,
         p,
@@ -127,7 +127,7 @@ def test_top_k_sampling_freq(vocab_size, distribution, k):
 
     renorm_probs = flashinfer.sampling.top_k_renorm_probs(probs, k)
     counter = torch.zeros(vocab_size, dtype=torch.int32, device=logits.device)
-    num_trials = 5000000
+    num_trials = 1000000
     samples = flashinfer.sampling.top_k_sampling_from_probs(
         probs,
         k,

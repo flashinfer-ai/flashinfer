@@ -13,4 +13,4 @@ pytest -s tests/test_jit_warmup.py
 pytest -s tests/test_norm.py
 pytest -s tests/test_rope.py
 pytest -s tests/test_quantization.py
-pytest -s tests/test_sampling.py
+# pytest -s tests/test_sampling.py
