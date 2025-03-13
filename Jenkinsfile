@@ -87,72 +87,31 @@ def init_git(submodule = false) {
 pipeline {
   agent any
 
-  environment {
-    GITHUB_REPO = "flashinfer-ai/flashinfer"  // e.g., myorg/myrepo
-    GITHUB_PR_ID = "${env.CHANGE_ID}"   // Provided by Jenkins for PR builds
-    GITHUB_TOKEN = credentials('flashinfer-ci-token') // Jenkins credential ID for your GitHub token
-  }
-
-  stages {
-    stage('Check /ci-ready Comment') {
-      steps {
-        script {
-          // Query GitHub API to get PR comments. Adjust API URL if needed.
-          def apiUrl = "https://api.github.com/repos/${GITHUB_REPO}/issues/${GITHUB_PR_ID}/comments"
-          def response = sh(script: "curl -s -H 'Authorization: token ${GITHUB_TOKEN}' ${apiUrl}", returnStdout: true)
-
-          // Parse JSON response (requires Jenkins pipeline utility steps plugin)
-          def comments = new groovy.json.JsonSlurper().parseText(response)
-
-          // Check if any comment contains "/ci-ready"
-          def ciReadyFound = comments.any { comment ->
-            // Access comment body field safely using array access syntax
-            def body = comment['body']
-            body != null && body.contains("/ci-ready")
+  stage('JIT Unittest') {
+    steps {
+      parallel(
+        failFast: true,
+        'GPU-G5-Test-1': {
+          node('GPU-G5-SPOT') {
+            ws(per_exec_ws('flashinfer-unittest')) {
+              init_git(true) // we need cutlass submodule
+              sh(script: "ls -alh", label: 'Show work directory')
+              sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
+              sh(script: "${docker_run} ./scripts/task_jit_run_tests_part1.sh", label: 'JIT Unittest Part 1')
+            }
           }
-
-          if (ciReadyFound) {
-            echo "Trigger comment found. Proceeding with tests."
-            currentBuild.description = "CI Ready: Testing"
-            // Mark a flag so later stages know to run tests.
-            env.RUN_TESTS = "true"
-          } else {
-            echo "No trigger comment found. Skipping tests."
-            env.RUN_TESTS = "false"
+        },
+        'GPU-G5-Test-2': {
+          node('GPU-G5-SPOT') {
+            ws(per_exec_ws('flashinfer-unittest')) {
+              init_git(true) // we need cutlass submodule
+              sh(script: "ls -alh", label: 'Show work directory')
+              sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
+              sh(script: "${docker_run} ./scripts/task_jit_run_tests_part2.sh", label: 'JIT Unittest Part 2')
+            }
           }
         }
-      }
-    }
-
-    stage('JIT Unittest') {
-      when {
-        expression { env.RUN_TESTS == "true" }
-      }
-      steps {
-        parallel(
-          failFast: true,
-          'GPU-G5-Test-1': {
-            node('GPU-G5-SPOT') {
-              ws(per_exec_ws('flashinfer-unittest')) {
-                init_git(true) // we need cutlass submodule
-                sh(script: "ls -alh", label: 'Show work directory')
-                sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
-                sh(script: "${docker_run} ./scripts/task_jit_run_tests_part1.sh", label: 'JIT Unittest Part 1')
-              }
-            }
-          },
-          'GPU-G5-Test-2': {
-            node('GPU-G5-SPOT') {
-              ws(per_exec_ws('flashinfer-unittest')) {
-                init_git(true) // we need cutlass submodule
-                sh(script: "ls -alh", label: 'Show work directory')
-                sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
-                sh(script: "${docker_run} ./scripts/task_jit_run_tests_part2.sh", label: 'JIT Unittest Part 2')
-              }
-            }
-          }
-        )
-      }
+      )
     }
   }
 }
