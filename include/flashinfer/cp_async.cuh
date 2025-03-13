@@ -18,6 +18,8 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
+
 namespace flashinfer {
 
 namespace cp_async {

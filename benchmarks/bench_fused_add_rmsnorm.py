@@ -6,12 +6,20 @@ from triton.testing import do_bench
 
 import flashinfer
 
+
 @torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--batch-sizes", nargs='+', type=int, default=[1, 19, 99, 989])
-    parser.add_argument("--hidden-sizes", nargs='+', type=int, default=[111, 500, 1024, 3072, 4096, 8192])
-    parser.add_argument("--dtypes", nargs='+', choices=["float16", "bfloat16"], default=["float16"])
+    parser.add_argument("--batch-sizes", nargs="+", type=int, default=[1, 19, 99, 989])
+    parser.add_argument(
+        "--hidden-sizes",
+        nargs="+",
+        type=int,
+        default=[111, 500, 1024, 3072, 4096, 8192],
+    )
+    parser.add_argument(
+        "--dtypes", nargs="+", choices=["float16", "bfloat16"], default=["float16"]
+    )
     args = parser.parse_args()
 
     eps = 1e-6
@@ -27,18 +35,19 @@ def main():
                 residual = torch.randn_like(x)
                 weight = torch.randn(hidden_size, dtype=dtype, device="cuda")
 
-                @torch.cuda.nvtx.range(f"fused_add_rmsnorm batch_size={batch_size}, hidden_size={hidden_size}, dtype={dtype_str}")
+                @torch.cuda.nvtx.range(
+                    f"fused_add_rmsnorm batch_size={batch_size}, hidden_size={hidden_size}, dtype={dtype_str}"
+                )
                 def fn() -> None:
                     flashinfer.fused_add_rmsnorm(x, residual, weight, eps)
 
                 # Run benchmarking
                 latency_ms = cast(float, do_bench(fn))
                 throughput = (
-                    (x.numel() * x.element_size() * 2
-                     + residual.numel() * residual.element_size() * 2
-                     + weight.numel() * weight.element_size())
-                    / (latency_ms * 1e-3)
-                )
+                    x.numel() * x.element_size() * 2
+                    + residual.numel() * residual.element_size() * 2
+                    + weight.numel() * weight.element_size()
+                ) / (latency_ms * 1e-3)
                 print(
                     f"batch_size: {batch_size:3},",
                     f"hidden_size: {hidden_size:5},",
@@ -50,6 +59,7 @@ def main():
         print("---")
 
     torch.cuda.profiler.stop()
+
 
 if __name__ == "__main__":
     main()

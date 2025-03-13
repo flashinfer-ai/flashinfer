@@ -18,7 +18,7 @@ from types import SimpleNamespace
 
 import torch
 
-from .jit import gen_act_and_mul_module, has_prebuilt_ops, load_cuda_ops    # noqa: F401
+from .jit import gen_act_and_mul_module, has_prebuilt_ops, load_cuda_ops  # noqa: F401
 from .utils import get_cuda_stream, register_custom_op, register_fake_op
 
 silu_def_cu_str = r"""
@@ -69,12 +69,16 @@ def get_act_and_mul_module(act_func_name: str):
         fn = getattr(module, fname)
 
         @register_custom_op(f"flashinfer::{fname}", mutates_args=("out",))
-        def _act_and_mul(out: torch.Tensor, input: torch.Tensor) -> None:
+        def _act_and_mul(
+            out: torch.Tensor, input: torch.Tensor, enable_pdl: bool = False
+        ) -> None:
             with input.device as device:  # device guard
-                fn(out, input, get_cuda_stream(device))
+                fn(out, input, enable_pdl, get_cuda_stream(device))
 
         @register_fake_op(f"flashinfer::{fname}")
-        def _fake_act_and_mul(out: torch.Tensor, input: torch.Tensor) -> None:
+        def _fake_act_and_mul(
+            out: torch.Tensor, input: torch.Tensor, enable_pdl: bool = False
+        ) -> None:
             pass
 
         # Register the module
@@ -93,7 +97,9 @@ def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
     ), f"{input.shape[-1]} != {2 * output.shape[-1]}"
 
 
-def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+def silu_and_mul(
+    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: bool = False
+) -> torch.Tensor:
     r"""Fused SiLU and Mul operation.
 
     ``silu(input[..., :hidden_size]) * input[..., hidden_size:]``
@@ -104,7 +110,11 @@ def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
         Input tensor, shape (..., 2 * hidden_size).
 
     out: Optional[torch.Tensor]
-        The the output tensor, if specified, the kernel will update this tensor inplace.
+        The output tensor, if specified, the kernel will update this tensor inplace.
+
+    enable_pdl: bool
+        Whether to enable `programmatic dependent launch
+        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
 
     Returns
     -------
@@ -124,11 +134,14 @@ def silu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
     get_act_and_mul_module("silu").silu_and_mul(
         out,
         input,
+        enable_pdl,
     )
     return out
 
 
-def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+def gelu_tanh_and_mul(
+    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: bool = False
+) -> torch.Tensor:
     r"""Fused GeLU Tanh and Mul operation.
 
     ``gelu(tanh(input[..., :hidden_size])) * input[..., hidden_size:]``
@@ -139,7 +152,11 @@ def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Te
         Input tensor, shape (..., 2 * hidden_size).
 
     out: Optional[torch.Tensor]
-        The the output tensor, if specified, the kernel will update this tensor inplace.
+        The output tensor, if specified, the kernel will update this tensor inplace.
+
+    enable_pdl: bool
+        Whether to enable `programmatic dependent launch
+        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
 
     Returns
     -------
@@ -156,11 +173,13 @@ def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Te
             device=input.device,
             dtype=input.dtype,
         )
-    get_act_and_mul_module("gelu_tanh").gelu_tanh_and_mul(out, input)
+    get_act_and_mul_module("gelu_tanh").gelu_tanh_and_mul(out, input, enable_pdl)
     return out
 
 
-def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+def gelu_and_mul(
+    input: torch.Tensor, out: torch.Tensor = None, enable_pdl: bool = False
+) -> torch.Tensor:
     r"""Fused GeLU and Mul operation.
 
     ``gelu(input[..., :hidden_size]) * input[..., hidden_size:]``
@@ -171,7 +190,11 @@ def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
         Input tensor, shape (..., 2 * hidden_size).
 
     out: Optional[torch.Tensor]
-        The the output tensor, if specified, the kernel will update this tensor inplace.
+        The output tensor, if specified, the kernel will update this tensor inplace.
+
+    enable_pdl: bool
+        Whether to enable `programmatic dependent launch
+        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
 
     Returns
     -------
@@ -188,5 +211,5 @@ def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
             device=input.device,
             dtype=input.dtype,
         )
-    get_act_and_mul_module("gelu").gelu_and_mul(out, input)
+    get_act_and_mul_module("gelu").gelu_and_mul(out, input, enable_pdl)
     return out

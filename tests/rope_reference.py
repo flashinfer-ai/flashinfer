@@ -6,11 +6,12 @@
 # the top-level of this source tree.
 
 import math
-from typing import Tuple, Optional, Union
+from typing import Optional, Tuple, Union
 
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # This software may be used and distributed in accordance with the terms of the Llama 3 Community License Agreement.
 import torch
+
 
 def apply_scaling(freqs: torch.Tensor):
     # Values obtained from grid search
@@ -97,9 +98,11 @@ def generate_cos_sin_f32_cache(
     cos_cache = torch.cos(args)
     return cos_cache, sin_cache
 
+
 # The following code is from the vLLM's implementation of RoPE.
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/rotary_embedding.py
-    
+
+
 class RotaryEmbedding(torch.nn.Module):
     def __init__(
         self,
@@ -123,8 +126,12 @@ class RotaryEmbedding(torch.nn.Module):
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
-        inv_freq = 1.0 / (base**(torch.arange(
-            0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim))
+        inv_freq = 1.0 / (
+            base
+            ** (
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim
+            )
+        )
         return inv_freq
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
@@ -186,24 +193,23 @@ class RotaryEmbedding(torch.nn.Module):
         # We added float32 conversion because float32 is required for the rotary embedding to work correctly for long contexts
         query = query.to(torch.float32)
         key = key.to(torch.float32)
-        
+
         cos, sin = cos_sin.chunk(2, dim=-1)
 
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_size)
-        query_rot = query[..., :self.rotary_dim]
-        query_pass = query[..., self.rotary_dim:]
+        query_rot = query[..., : self.rotary_dim]
+        query_pass = query[..., self.rotary_dim :]
         query_rot = self._apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
         key_shape = key.shape
         key = key.view(num_tokens, -1, self.head_size)
-        key_rot = key[..., :self.rotary_dim]
-        key_pass = key[..., self.rotary_dim:]
+        key_rot = key[..., : self.rotary_dim]
+        key_pass = key[..., self.rotary_dim :]
         key_rot = self._apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
 
         query = query.to(self.dtype)
         key = key.to(self.dtype)
         return query, key
-    

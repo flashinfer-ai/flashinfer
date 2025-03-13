@@ -1,5 +1,5 @@
 """
-Copyright (c) 2024 by FlashInfer team.
+Copyright (c) 2025 by FlashInfer team.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,86 +15,21 @@ limitations under the License.
 """
 
 import os
-import pathlib
-from collections import namedtuple
-from typing import List, Tuple
+from typing import List
 
 import jinja2
 import torch
 
-from .core import load_cuda_ops, sm90a_nvcc_flags
-from .env import FLASHINFER_CSRC_DIR, FLASHINFER_GEN_SRC_DIR
-from .utils import (
+from ..core import load_cuda_ops, logger, sm90a_nvcc_flags
+from ..env import FLASHINFER_CSRC_DIR, FLASHINFER_GEN_SRC_DIR
+from ..utils import (
     dtype_map,
     filename_safe_dtype_map,
     mask_mode_literal,
     pos_encoding_mode_literal,
     write_if_different,
 )
-
-
-def generate_additional_params(
-    additional_tensor_names: List[str],
-    additional_tensor_dtypes: List[str],
-    additional_scalar_names: List[str],
-    additional_scalar_dtypes: List[str],
-    is_sm90_template: bool = False,
-):
-    additional_params_decl = "".join(
-        [
-            f"{dtype}* {var};\n"
-            for dtype, var in zip(
-                additional_tensor_dtypes,
-                additional_tensor_names,
-            )
-        ]
-        + [
-            f"{dtype} {var};\n"
-            for dtype, var in zip(additional_scalar_dtypes, additional_scalar_names)
-        ]
-    )
-    additional_func_params = "".join(
-        [
-            (
-                f", std::optional<at::Tensor> {var}"
-                if var.startswith("maybe")
-                else f", at::Tensor {var}"
-            )
-            for var in additional_tensor_names
-        ]
-        + [
-            f", {dtype} {var}"
-            for dtype, var in zip(additional_scalar_dtypes, additional_scalar_names)
-        ]
-    )
-    if is_sm90_template:
-        additional_params_setter = " \\\n".join(
-            [
-                (
-                    f"params.additional_params.{var} = {var} ? static_cast<{dtype}*>({var}->data_ptr()): nullptr;"
-                    if var.startswith("maybe")
-                    else f"params.additional_params.{var} = static_cast<{dtype}*>({var}.data_ptr());"
-                )
-                for dtype, var in zip(additional_tensor_dtypes, additional_tensor_names)
-            ]
-            + [
-                f"params.additional_params.{var} = {var};"
-                for var in additional_scalar_names
-            ]
-        )
-    else:
-        additional_params_setter = " \\\n".join(
-            [
-                (
-                    f"params.{var} = {var} ? static_cast<{dtype}*>({var}->data_ptr()): nullptr;"
-                    if var.startswith("maybe")
-                    else f"params.{var} = static_cast<{dtype}*>({var}.data_ptr());"
-                )
-                for dtype, var in zip(additional_tensor_dtypes, additional_tensor_names)
-            ]
-            + [f"params.{var} = {var};" for var in additional_scalar_names]
-        )
-    return (additional_params_decl, additional_func_params, additional_params_setter)
+from .utils import generate_additional_params
 
 
 def get_single_decode_uri(
@@ -144,12 +79,14 @@ def get_batch_decode_uri(
 
 
 def get_batch_mla_uri(
+    backend: str,
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
     dtype_idx: torch.dtype,
     head_dim_ckv: int,
     head_dim_kpe: int,
+    use_profiler: bool,
 ) -> str:
     return (
         f"batch_mla_attention_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -157,58 +94,102 @@ def get_batch_mla_uri(
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_ckv_{head_dim_ckv}_"
-        f"head_dim_kpe_{head_dim_kpe}"
-    )
+        f"head_dim_kpe_{head_dim_kpe}_"
+        f"profiler_{use_profiler}"
+    ) + ("_sm90" if backend == "fa3" else "")
 
 
 def gen_batch_mla_module(
+    backend: str,
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
     dtype_idx: torch.dtype,
     head_dim_ckv: int,
     head_dim_kpe: int,
+    use_profiler: bool,
 ):
+    if backend == "auto":
+        raise ValueError("backend should not be auto when jit_args is provided")
     uri = get_batch_mla_uri(
+        backend,
         dtype_q,
         dtype_kv,
         dtype_o,
         dtype_idx,
         head_dim_ckv,
         head_dim_kpe,
+        use_profiler,
     )
     gen_directory = FLASHINFER_GEN_SRC_DIR / uri
     os.makedirs(gen_directory, exist_ok=True)
 
-    with open(FLASHINFER_CSRC_DIR / "batch_mla_config.jinja") as f:
-        config_templ = jinja2.Template(f.read())
-    generated_config_path = gen_directory / "batch_mla_config.inc"
-    write_if_different(
-        generated_config_path,
-        config_templ.render(
-            dtype_q=dtype_map[dtype_q],
-            dtype_kv=dtype_map[dtype_kv],
-            dtype_o=dtype_map[dtype_o],
-            dtype_idx=dtype_map[dtype_idx],
-            head_dim_ckv=head_dim_ckv,
-            head_dim_kpe=head_dim_kpe,
-        ),
+    if backend == "fa2":
+        with open(FLASHINFER_CSRC_DIR / "batch_mla_config.jinja") as f:
+            config_templ = jinja2.Template(f.read())
+        generated_config_path = gen_directory / "batch_mla_config.inc"
+        write_if_different(
+            generated_config_path,
+            config_templ.render(
+                dtype_q=dtype_map[dtype_q],
+                dtype_kv=dtype_map[dtype_kv],
+                dtype_o=dtype_map[dtype_o],
+                dtype_idx=dtype_map[dtype_idx],
+                head_dim_ckv=head_dim_ckv,
+                head_dim_kpe=head_dim_kpe,
+            ),
+        )
+
+        source_paths = []
+        for filename in [
+            "batch_mla_plan.cu",
+            "batch_mla_run.cu",
+            "batch_mla_pybind.cu",
+        ]:
+            src_path = FLASHINFER_CSRC_DIR / filename
+            dest_path = gen_directory / filename
+            source_paths.append(dest_path)
+            with open(src_path, "r") as f:
+                source = f.read()
+            write_if_different(dest_path, source)
+    elif backend == "fa3":
+        with open(FLASHINFER_CSRC_DIR / "batch_mla_config.jinja") as f:
+            config_templ = jinja2.Template(f.read())
+        generated_config_path = gen_directory / "batch_mla_sm90_config.inc"
+        write_if_different(
+            generated_config_path,
+            config_templ.render(
+                dtype_q=dtype_map[dtype_q],
+                dtype_kv=dtype_map[dtype_kv],
+                dtype_o=dtype_map[dtype_o],
+                dtype_idx=dtype_map[dtype_idx],
+                head_dim_ckv=head_dim_ckv,
+                head_dim_kpe=head_dim_kpe,
+            ),
+        )
+        source_paths = []
+        for filename in [
+            "batch_mla_sm90_plan.cu",
+            "batch_mla_sm90_run.cu",
+            "batch_mla_sm90_pybind.cu",
+        ]:
+            src_path = FLASHINFER_CSRC_DIR / filename
+            dest_path = gen_directory / filename
+            source_paths.append(dest_path)
+            with open(src_path, "r") as f:
+                source = f.read()
+            write_if_different(dest_path, source)
+    else:
+        raise ValueError(f"Unsupported backend: {backend}")
+
+    return load_cuda_ops(
+        uri,
+        source_paths,
+        extra_cuda_cflags=(
+            ["-gencode=arch=compute_90a,code=sm_90a"] if backend == "fa3" else []
+        )
+        + (["-DFLASHINFER_ENABLE_PROFILER"] if use_profiler else []),
     )
-
-    source_paths = []
-    for filename in [
-        "batch_mla_plan.cu",
-        "batch_mla_run.cu",
-        "batch_mla_pybind.cu",
-    ]:
-        src_path = FLASHINFER_CSRC_DIR / filename
-        dest_path = gen_directory / filename
-        source_paths.append(dest_path)
-        with open(src_path, "r") as f:
-            source = f.read()
-        write_if_different(dest_path, source)
-
-    return load_cuda_ops(uri, source_paths)
 
 
 def get_batch_decode_mla_uri(
@@ -216,20 +197,20 @@ def get_batch_decode_mla_uri(
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
     dtype_idx: torch.dtype,
-    head_dim_qk: int,
-    head_dim_vo: int,
+    head_dim_ckv: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    arc: str,
 ) -> str:
     return (
         f"batch_decode_mla_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map[dtype_kv]}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
-        f"head_dim_qk_{head_dim_qk}_"
-        f"head_dim_vo_{head_dim_vo}_"
+        f"head_dim_ckv{head_dim_ckv}_"
         f"use_swa_{use_sliding_window}_"
-        f"use_logits_cap_{use_logits_soft_cap}"
+        f"use_logits_cap_{use_logits_soft_cap}_"
+        f"arc_{arc}"
     )
 
 
@@ -239,18 +220,41 @@ def gen_batch_decode_mla_module(
     dtype_o: torch.dtype,
     dtype_idx: torch.dtype,
     head_dim: int,
+    num_qo_heads: int,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    use_tensor_cores: bool,
 ):
+    cuda_arch_major = torch.cuda.get_device_properties(0).major
+
+    if cuda_arch_major >= 9:  # smem size of SM90 can accommodate all 128 qo-heads data
+        qo_tile_len = 128
+    else:
+        qo_tile_len = 64
+
+    if (
+        use_tensor_cores
+        and cuda_arch_major >= 8
+        and num_qo_heads % qo_tile_len == 0
+        and dtype_q == torch.float16
+        and dtype_kv == torch.float16
+        and dtype_o == torch.float16
+    ):
+        logger.info(f"Use tensor-core SM80 version of MLA decode kernel.")
+        arc = "sm80"
+    else:
+        logger.info(f"Fall back to cuda-core version of MLA decode kernel.")
+        arc = "cuda_core"
+
     uri = get_batch_decode_mla_uri(
         dtype_q,
         dtype_kv,
         dtype_o,
         dtype_idx,
         head_dim,
-        head_dim,
         use_sliding_window,
         use_logits_soft_cap,
+        arc,
     )
     gen_directory = FLASHINFER_GEN_SRC_DIR / uri
     os.makedirs(gen_directory, exist_ok=True)
@@ -267,17 +271,27 @@ def gen_batch_decode_mla_module(
             dtype_idx=dtype_map[dtype_idx],
             head_dim_ckv=head_dim,
             head_dim_kpe=head_dim // 8,
+            qo_tile_len=qo_tile_len,
             use_sliding_window=str(use_sliding_window).lower(),
             use_logits_soft_cap=str(use_logits_soft_cap).lower(),
         ),
     )
 
+    filenames = []
+    if arc == "sm80":
+        filenames = [
+            "batch_decode_mla_cute_sm80.cu",
+            "batch_decode_mla_pybind.cu",
+        ]
+    else:
+        filenames = [
+            "batch_decode_mla_plan.cu",
+            "batch_decode_mla_run.cu",
+            "batch_decode_mla_pybind.cu",
+        ]
+
     source_paths = []
-    for filename in [
-        "batch_decode_mla_plan.cu",
-        "batch_decode_mla_run.cu",
-        "batch_decode_mla_pybind.cu",
-    ]:
+    for filename in filenames:
         src_path = FLASHINFER_CSRC_DIR / filename
         dest_path = gen_directory / filename
         source_paths.append(dest_path)

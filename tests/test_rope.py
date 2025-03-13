@@ -216,7 +216,12 @@ def test_rope_pos_ids(
             )
 
             q_rope_pos_ids, k_rope_pos_ids = flashinfer.apply_rope_pos_ids(
-                q, k, pos_ids, rotary_dim=rotary_dim, interleave=interleave, rope_theta=1e4
+                q,
+                k,
+                pos_ids,
+                rotary_dim=rotary_dim,
+                interleave=interleave,
+                rope_theta=1e4,
             )
     else:
         if inplace:
@@ -252,15 +257,21 @@ def test_rope_pos_ids(
             )
 
             q_rope_pos_ids, k_rope_pos_ids = flashinfer.apply_llama31_rope_pos_ids(
-                q, k, pos_ids, rotary_dim=rotary_dim, interleave=interleave, rope_theta=5e5
+                q,
+                k,
+                pos_ids,
+                rotary_dim=rotary_dim,
+                interleave=interleave,
+                rope_theta=5e5,
             )
 
     # compare
     torch.testing.assert_close(q_rope_pos_ids, q_rope, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(k_rope_pos_ids, k_rope, rtol=1e-3, atol=1e-3)
 
+
 class FlashInferRotaryEmbedding(RotaryEmbedding):
-    
+
     def forward_cuda(
         self,
         positions: torch.Tensor,
@@ -277,7 +288,8 @@ class FlashInferRotaryEmbedding(RotaryEmbedding):
             is_neox=self.is_neox_style,
         )
         return query, key
-    
+
+
 @pytest.mark.parametrize(
     "head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype, device, batch_size, seq_len, num_q_heads, num_kv_heads",
     [
@@ -287,7 +299,7 @@ class FlashInferRotaryEmbedding(RotaryEmbedding):
         (64, 64, 32, 8000, False, torch.bfloat16, "cuda", 32, 32, 1, 1),
         (64, 64, 32, 8000, False, torch.bfloat16, "cuda", 32, 32, 1, 1),
         (256, 128, 4096, 9231, False, torch.bfloat16, "cuda", 3, 231, 4, 2),
-    ]
+    ],
 )
 def test_rope_cos_sin_cache(
     head_size: int,
@@ -302,23 +314,38 @@ def test_rope_cos_sin_cache(
     num_q_heads: int,
     num_kv_heads: int,
 ):
-    rope_ref = RotaryEmbedding(head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype).to(device)
-    rope_flashinfer = FlashInferRotaryEmbedding(head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype).to(device)
+    rope_ref = RotaryEmbedding(
+        head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
+    ).to(device)
+    rope_flashinfer = FlashInferRotaryEmbedding(
+        head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
+    ).to(device)
 
     pos_ids = torch.arange(seq_len, device=device).repeat(batch_size)
-    query = torch.randn(batch_size * seq_len, num_q_heads * head_size, dtype=dtype, device=device)
-    key = torch.randn(batch_size * seq_len, num_kv_heads * head_size, dtype=dtype, device=device)
+    query = torch.randn(
+        batch_size * seq_len, num_q_heads * head_size, dtype=dtype, device=device
+    )
+    key = torch.randn(
+        batch_size * seq_len, num_kv_heads * head_size, dtype=dtype, device=device
+    )
 
-    query_ref, key_ref = query.clone(), key.clone() 
+    query_ref, key_ref = query.clone(), key.clone()
     query_flashinfer, key_flashinfer = query.clone(), key.clone()
 
     query_ref_out, key_ref_out = rope_ref.forward_native(pos_ids, query_ref, key_ref)
-    query_flashinfer_out, key_flashinfer_out = rope_flashinfer.forward_cuda(pos_ids, query_flashinfer, key_flashinfer)
-    
-    torch.testing.assert_close(query_ref_out, query_flashinfer_out, atol=1e-2, rtol=1e-2)
+    query_flashinfer_out, key_flashinfer_out = rope_flashinfer.forward_cuda(
+        pos_ids, query_flashinfer, key_flashinfer
+    )
+
+    torch.testing.assert_close(
+        query_ref_out, query_flashinfer_out, atol=1e-2, rtol=1e-2
+    )
     torch.testing.assert_close(key_ref_out, key_flashinfer_out, atol=1e-2, rtol=1e-2)
+
 
 if __name__ == "__main__":
     test_rope(2, 1, 8, 8, 1, 128, "llama", 1.0, False)
     test_rope_pos_ids(2, 1, 8, 8, 1, 128, "llama31", 1.0, False)
-    test_rope_cos_sin_cache(64, 64, 32, 8000, True, torch.bfloat16, "cuda", 32, 32, 1, 1)
+    test_rope_cos_sin_cache(
+        64, 64, 32, 8000, True, torch.bfloat16, "cuda", 32, 32, 1, 1
+    )

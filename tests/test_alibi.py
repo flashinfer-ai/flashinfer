@@ -62,12 +62,12 @@ def test_single_decode_alibi(
     num_heads,
     head_dim,
 ):
-    q = torch.randn(num_heads, head_dim).to(0).half()
-    k = torch.randn(seq_len, num_heads, head_dim).to(0).half()
-    v = torch.randn(seq_len, num_heads, head_dim).to(0).half()
+    q = torch.randn(num_heads, head_dim, device="cuda:0", dtype=torch.float16)
+    k = torch.randn(seq_len, num_heads, head_dim, device="cuda:0", dtype=torch.float16)
+    v = torch.randn(seq_len, num_heads, head_dim, device="cuda:0", dtype=torch.float16)
 
     o = flashinfer.single_decode_with_kv_cache(q, k, v, pos_encoding_mode="ALIBI")
-    mask = torch.ones(1, seq_len, dtype=torch.bool).to(0)
+    mask = torch.ones(1, seq_len, dtype=torch.bool, device="cuda:0")
     o_ref = alibi_attention(q.unsqueeze(0), k, v, mask).squeeze(0)
     torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
 
@@ -86,14 +86,14 @@ def test_single_prefill_alibi(
 ):
     if causal and q_len > kv_len:
         pytest.skip("Causal attention requires q_len <= kv_len")
-    q = torch.randn(q_len, num_heads, head_dim).to(0).half()
-    k = torch.randn(kv_len, num_heads, head_dim).to(0).half()
-    v = torch.randn(kv_len, num_heads, head_dim).to(0).half()
+    q = torch.randn(q_len, num_heads, head_dim, device="cuda:0", dtype=torch.float16)
+    k = torch.randn(kv_len, num_heads, head_dim, device="cuda:0", dtype=torch.float16)
+    v = torch.randn(kv_len, num_heads, head_dim, device="cuda:0", dtype=torch.float16)
 
     o = flashinfer.single_prefill_with_kv_cache(
         q, k, v, causal=causal, pos_encoding_mode="ALIBI"
     )
-    mask = torch.ones(q_len, kv_len, dtype=torch.bool).to(0)
+    mask = torch.ones(q_len, kv_len, dtype=torch.bool, device="cuda:0")
     if causal:
         mask = torch.tril(mask, diagonal=kv_len - q_len)
     o_ref = alibi_attention(q, k, v, mask)

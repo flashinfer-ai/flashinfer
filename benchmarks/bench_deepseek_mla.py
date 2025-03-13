@@ -20,7 +20,7 @@ import triton
 import flashinfer
 
 
-def bench_deepseek_mla_decode(batch_size, seq_len, num_heads):
+def bench_deepseek_mla_decode(batch_size, seq_len, num_heads, backend):
     head_dim_ckv = 512
     head_dim_kpe = 64
     page_size = 1
@@ -39,7 +39,7 @@ def bench_deepseek_mla_decode(batch_size, seq_len, num_heads):
     sm_scale = 1.0 / ((head_dim_ckv + head_dim_kpe) ** 0.5)
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
     wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
-        workspace_buffer, backend="fa2"
+        workspace_buffer, backend=backend
     )
     q_indptr = torch.arange(0, batch_size + 1).to(0).int()
     kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * seq_len
@@ -68,15 +68,14 @@ def bench_deepseek_mla_decode(batch_size, seq_len, num_heads):
     )
 
     io = sum([_.numel() * _.element_size() for _ in [q_nope, q_pe, ckv, kpe, o]])
+    flops = 2 * batch_size * num_heads * (2 * head_dim_ckv + head_dim_kpe) * seq_len
 
     print(f"Config: batch_size={batch_size}, seq_len={seq_len}, num_heads={num_heads}")
     print(f"Memory bandwidth: {io * 1e-6 / ms:.2f} GB/s")
+    print(f"FLOPs: {flops * 1e-9 / ms:.2f} TFLOPs")
 
 
 if __name__ == "__main__":
-    bench_deepseek_mla_decode(768, 1024, 16)
-    bench_deepseek_mla_decode(768, 1024, 32)
-    bench_deepseek_mla_decode(768, 1024, 64)
-    bench_deepseek_mla_decode(768, 2048, 16)
-    bench_deepseek_mla_decode(768, 2048, 32)
-    bench_deepseek_mla_decode(768, 2048, 64)
+    for seq_len in [1024, 2048]:
+        for batch_size in [64, 128, 768]:
+            bench_deepseek_mla_decode(batch_size, seq_len, 64, "auto")

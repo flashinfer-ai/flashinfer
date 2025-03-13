@@ -18,6 +18,7 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.utils import get_compute_capability
 
 
 def llama_rms_norm(x, w, eps=1e-6):
@@ -68,16 +69,27 @@ def fused_add_rms_norm(x, residual, weight, eps):
 @pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384])
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("specify_out", [True, False])
-def test_norm(batch_size, hidden_size, dtype, specify_out):
-    x = torch.randn(batch_size, hidden_size).to(0).to(dtype)
+@pytest.mark.parametrize("enable_pdl", [True, False])
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_norm(batch_size, hidden_size, dtype, specify_out, enable_pdl, contiguous):
+    if contiguous:
+        x = torch.randn(batch_size, hidden_size).to(0).to(dtype)
+    else:
+        x = torch.randn(batch_size, hidden_size * 2, device="cuda").to(dtype)
+        x = x[:, :hidden_size]
+
+    major, _ = get_compute_capability(x.device)
+    if major < 9 and enable_pdl:
+        pytest.skip("PDL is only available for Hopper and later GPUs")
+
     w = torch.randn(hidden_size).to(0).to(dtype)
 
     y_ref = llama_rms_norm(x, w)
     if specify_out:
         y = torch.empty_like(x)
-        flashinfer.norm.rmsnorm(x, w, out=y)
+        flashinfer.norm.rmsnorm(x, w, out=y, enable_pdl=enable_pdl)
     else:
-        y = flashinfer.norm.rmsnorm(x, w)
+        y = flashinfer.norm.rmsnorm(x, w, enable_pdl=enable_pdl)
 
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
@@ -85,10 +97,21 @@ def test_norm(batch_size, hidden_size, dtype, specify_out):
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384])
 @pytest.mark.parametrize("dtype", [torch.float16])
-def test_fused_add_rmsnorm(batch_size, hidden_size, dtype):
+@pytest.mark.parametrize("enable_pdl", [True, False])
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_fused_add_rmsnorm(batch_size, hidden_size, dtype, enable_pdl, contiguous):
     eps = 1e-6
 
-    x = torch.randn(batch_size, hidden_size, dtype=dtype, device="cuda")
+    if contiguous:
+        x = torch.randn(batch_size, hidden_size, dtype=dtype, device="cuda")
+    else:
+        x = torch.randn(batch_size, hidden_size * 2, device="cuda").to(dtype)
+        x = x[:, :hidden_size]
+
+    major, _ = get_compute_capability(x.device)
+    if major < 9 and enable_pdl:
+        pytest.skip("PDL is only available for Hopper and later GPUs")
+
     residual = torch.randn_like(x)
     weight = torch.randn(hidden_size, dtype=dtype, device="cuda")
 
@@ -98,7 +121,9 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype):
 
     x_fused = x.clone()
     residual_fused = residual.clone()
-    flashinfer.fused_add_rmsnorm(x_fused, residual_fused, weight, eps)
+    flashinfer.fused_add_rmsnorm(
+        x_fused, residual_fused, weight, eps, enable_pdl=enable_pdl
+    )
 
     torch.testing.assert_close(x_fused, x_native, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
@@ -108,16 +133,29 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype):
 @pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384])
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("specify_out", [True, False])
-def test_gemma_norm(batch_size, hidden_size, dtype, specify_out):
-    x = torch.randn(batch_size, hidden_size).to(0).to(dtype)
+@pytest.mark.parametrize("enable_pdl", [True, False])
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_gemma_norm(
+    batch_size, hidden_size, dtype, specify_out, enable_pdl, contiguous
+):
+    if contiguous:
+        x = torch.randn(batch_size, hidden_size).to(0).to(dtype)
+    else:
+        x = torch.randn(batch_size, hidden_size * 2, device="cuda").to(dtype)
+        x = x[:, :hidden_size]
+
+    major, _ = get_compute_capability(x.device)
+    if major < 9 and enable_pdl:
+        pytest.skip("PDL is only available for Hopper and later GPUs")
+
     w = torch.randn(hidden_size).to(0).to(dtype)
 
     y_ref = gemma_rms_norm(x, w)
     if specify_out:
         y = torch.empty_like(x)
-        flashinfer.norm.gemma_rmsnorm(x, w, out=y)
+        flashinfer.norm.gemma_rmsnorm(x, w, out=y, enable_pdl=enable_pdl)
     else:
-        y = flashinfer.norm.gemma_rmsnorm(x, w)
+        y = flashinfer.norm.gemma_rmsnorm(x, w, enable_pdl=enable_pdl)
 
     torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
 
@@ -125,10 +163,23 @@ def test_gemma_norm(batch_size, hidden_size, dtype, specify_out):
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384])
 @pytest.mark.parametrize("dtype", [torch.float16])
-def test_gemma_fused_add_rmsnorm(batch_size, hidden_size, dtype):
+@pytest.mark.parametrize("enable_pdl", [True, False])
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_gemma_fused_add_rmsnorm(
+    batch_size, hidden_size, dtype, enable_pdl, contiguous
+):
     eps = 1e-6
 
-    x = torch.randn(batch_size, hidden_size, dtype=dtype, device="cuda")
+    if contiguous:
+        x = torch.randn(batch_size, hidden_size, dtype=dtype, device="cuda")
+    else:
+        x = torch.randn(batch_size, hidden_size * 2, device="cuda").to(dtype)
+        x = x[:, :hidden_size]
+
+    major, _ = get_compute_capability(x.device)
+    if major < 9 and enable_pdl:
+        pytest.skip("PDL is only available for Hopper and later GPUs")
+
     residual = torch.randn_like(x)
     weight = torch.randn(hidden_size, dtype=dtype, device="cuda")
 
@@ -138,7 +189,14 @@ def test_gemma_fused_add_rmsnorm(batch_size, hidden_size, dtype):
 
     x_fused = x.clone()
     residual_fused = residual.clone()
-    flashinfer.gemma_fused_add_rmsnorm(x_fused, residual_fused, weight, eps)
+    flashinfer.gemma_fused_add_rmsnorm(
+        x_fused, residual_fused, weight, eps, enable_pdl=enable_pdl
+    )
 
     torch.testing.assert_close(x_fused, x_native, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
+
+
+if __name__ == "__main__":
+    # test_norm(1, 1024, torch.float16, False, True)
+    test_fused_add_rmsnorm(1, 16384, torch.float16, True, True)

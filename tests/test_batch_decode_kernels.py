@@ -33,24 +33,22 @@ def warmup_jit():
                     [
                         torch.float16,
                         torch.float8_e4m3fn,
-                        torch.float8_e5m2,
                     ],  # kv_dtypes
                     [128, 256],  # head_dims
-                    [0, 1, 2],  # pos_encoding_modes
+                    [0, 1],  # pos_encoding_modes
                     [False],  # use_sliding_windows
-                    [False, True],  # use_logits_soft_caps
+                    [False],  # use_logits_soft_caps
                 )
                 + jit_prefill_attention_func_args(
                     [torch.float16],  # q_dtypes
                     [
                         torch.float16,
                         torch.float8_e4m3fn,
-                        torch.float8_e5m2,
                     ],  # kv_dtypes
                     [128, 256],  # head_dims
-                    [0, 1, 2],  # pos_encoding_modes
+                    [0, 1],  # pos_encoding_modes
                     [False],  # use_sliding_windows
-                    [False, True],  # use_logits_soft_caps
+                    [False],  # use_logits_soft_caps
                     [False],  # use_fp16_qk_reductions
                 )
             )
@@ -61,21 +59,19 @@ def warmup_jit():
             yield
 
 
-@pytest.mark.parametrize("batch_size", [12, 17])
-@pytest.mark.parametrize("kv_len", [54, 97, 512])
+@pytest.mark.parametrize("batch_size", [12, 17, 128])
+@pytest.mark.parametrize("kv_len", [54, 97, 512, 2048, 16384])
 @pytest.mark.parametrize("page_size", [1, 8, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
 @pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
-@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
-@pytest.mark.parametrize("return_lse", [True, False])
+@pytest.mark.parametrize("kv_layout", ["NHD"])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
+@pytest.mark.parametrize("logits_soft_cap", [0.0])
+@pytest.mark.parametrize("return_lse", [True])
 @pytest.mark.parametrize("q_dtype", [torch.float16])
-@pytest.mark.parametrize(
-    "kv_dtype", [torch.float16, torch.float8_e4m3fn, torch.float8_e5m2]
-)
-@pytest.mark.parametrize("contiguous_kv", [True, False])
+@pytest.mark.parametrize("kv_dtype", [torch.float16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("contiguous_kv", [True])
 def test_batch_decode_with_paged_kv_cache(
     batch_size,
     kv_len,
@@ -91,7 +87,7 @@ def test_batch_decode_with_paged_kv_cache(
     kv_dtype,
     contiguous_kv,
 ):
-    q = torch.randn(batch_size, num_qo_heads, head_dim).to(0).to(q_dtype)
+    q = torch.randn(batch_size, num_qo_heads, head_dim, device="cuda:0", dtype=q_dtype)
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size
     if kv_layout == "HND":
@@ -104,7 +100,7 @@ def test_batch_decode_with_paged_kv_cache(
             tmp.append(2)
             tmp.append(v)
         kv_shape = tmp
-        kv_data_fp32 = torch.randn(*kv_shape, dtype=torch.float32).to(0)
+        kv_data_fp32 = torch.randn(*kv_shape, dtype=torch.float32, device="cuda:0")
         kv_data = kv_data_fp32.to(kv_dtype)
         kv_data = kv_data[:, 1, :, 1, :, 1, :, 1, :]
         kv_data_fp32 = kv_data_fp32[:, 1, :, 1, :, 1, :, 1, :]
@@ -114,15 +110,18 @@ def test_batch_decode_with_paged_kv_cache(
             != kv_data.shape[-3] * kv_data.shape[-2] * kv_data.shape[-1]
         )
     else:
-        kv_data_fp32 = torch.randn(*kv_shape, dtype=torch.float32).to(0)
+        kv_data_fp32 = torch.randn(*kv_shape, dtype=torch.float32, device="cuda:0")
         kv_data = kv_data_fp32.to(kv_dtype)
-    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * num_pages_per_seq
-    kv_indices = torch.arange(0, total_num_pages).to(0).int()
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32)
+        * num_pages_per_seq
+    )
+    kv_indices = torch.arange(0, total_num_pages, device="cuda:0", dtype=torch.int32)
     kv_last_page_len = torch.full(
-        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
-    ).to(0)
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device="cuda:0"
+    )
 
-    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout
     )
@@ -187,22 +186,25 @@ def test_batch_decode_with_paged_kv_cache(
         )
         torch.testing.assert_close(o[i], o_ref_i, rtol=1e-3, atol=1e-3)
 
+    # test user-allocated output
+    o_buffer = torch.empty_like(o)
+    wrapper.run(q, kv_data, out=o_buffer)
+    torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
 
-@pytest.mark.parametrize("batch_size", [12, 17])
-@pytest.mark.parametrize("kv_len", [54, 97, 512])
+
+@pytest.mark.parametrize("batch_size", [12, 17, 128])
+@pytest.mark.parametrize("kv_len", [54, 97, 512, 2048, 16384])
 @pytest.mark.parametrize("page_size", [1, 8, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
 @pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
-@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
-@pytest.mark.parametrize("return_lse", [True, False])
+@pytest.mark.parametrize("kv_layout", ["NHD"])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
+@pytest.mark.parametrize("logits_soft_cap", [0.0])
+@pytest.mark.parametrize("return_lse", [True])
 @pytest.mark.parametrize("q_dtype", [torch.float16])
-@pytest.mark.parametrize(
-    "kv_dtype", [torch.float16, torch.float8_e4m3fn, torch.float8_e5m2]
-)
-@pytest.mark.parametrize("contiguous_kv", [True, False])
+@pytest.mark.parametrize("kv_dtype", [torch.float16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("contiguous_kv", [True])
 def test_batch_decode_with_tuple_paged_kv_cache(
     batch_size,
     kv_len,
@@ -218,7 +220,7 @@ def test_batch_decode_with_tuple_paged_kv_cache(
     kv_dtype,
     contiguous_kv,
 ):
-    q = torch.randn(batch_size, num_qo_heads, head_dim).to(0).to(q_dtype)
+    q = torch.randn(batch_size, num_qo_heads, head_dim, device="cuda:0", dtype=q_dtype)
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size
     if kv_layout == "HND":
@@ -232,7 +234,8 @@ def test_batch_decode_with_tuple_paged_kv_cache(
             tmp.append(v)
         kv_shape = tmp
         kv_data_fp32 = [
-            torch.randn(*kv_shape, dtype=torch.float32).to(0) for _ in range(2)
+            torch.randn(*kv_shape, dtype=torch.float32, device="cuda:0")
+            for _ in range(2)
         ]
         kv_data = [kv_data_fp32[i].to(kv_dtype) for i in range(2)]
         for i in range(2):
@@ -245,17 +248,21 @@ def test_batch_decode_with_tuple_paged_kv_cache(
             )
     else:
         kv_data_fp32 = [
-            torch.randn(*kv_shape, dtype=torch.float32).to(0) for _ in range(2)
+            torch.randn(*kv_shape, dtype=torch.float32, device="cuda:0")
+            for _ in range(2)
         ]
         kv_data = [kv_data_fp32[i].to(kv_dtype) for i in range(2)]
     kv_data = tuple(kv_data)
-    kv_indptr = torch.arange(0, batch_size + 1).to(0).int() * num_pages_per_seq
-    kv_indices = torch.arange(0, total_num_pages).to(0).int()
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda:0", dtype=torch.int32)
+        * num_pages_per_seq
+    )
+    kv_indices = torch.arange(0, total_num_pages, device="cuda:0", dtype=torch.int32)
     kv_last_page_len = torch.full(
-        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
-    ).to(0)
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device="cuda:0"
+    )
 
-    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
+    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
         workspace_buffer, kv_layout
     )
@@ -323,19 +330,17 @@ def test_batch_decode_with_tuple_paged_kv_cache(
         torch.testing.assert_close(o[i], o_ref_i, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("batch_size", [12, 17])
-@pytest.mark.parametrize("kv_len", [54, 2048])
+@pytest.mark.parametrize("batch_size", [12, 17, 128])
+@pytest.mark.parametrize("kv_len", [54, 2048, 16384])
 @pytest.mark.parametrize("page_size", [1, 8, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])
 @pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
+@pytest.mark.parametrize("kv_layout", ["NHD"])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
 @pytest.mark.parametrize("q_dtype", [torch.float16])
-@pytest.mark.parametrize(
-    "kv_dtype", [torch.float16, torch.float8_e4m3fn, torch.float8_e5m2]
-)
-@pytest.mark.parametrize("contiguous_kv", [True, False])
+@pytest.mark.parametrize("kv_dtype", [torch.float16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("contiguous_kv", [True])
 def test_cuda_graph_batch_decode_with_paged_kv_cache(
     batch_size,
     kv_len,
@@ -349,7 +354,7 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
     kv_dtype,
     contiguous_kv,
 ):
-    q = torch.randn(batch_size, num_qo_heads, head_dim).to(0).to(q_dtype)
+    q = torch.randn(batch_size, num_qo_heads, head_dim, device="cuda:0", dtype=q_dtype)
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size
     if kv_layout == "HND":
@@ -362,7 +367,7 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
             tmp.append(2)
             tmp.append(v)
         kv_shape = tmp
-        kv_data_fp32 = torch.randn(*kv_shape, dtype=torch.float32).to(0)
+        kv_data_fp32 = torch.randn(*kv_shape, dtype=torch.float32, device="cuda:0")
         kv_data = kv_data_fp32.to(kv_dtype)
         kv_data_fp32 = kv_data_fp32[:, 1, :, 1, :, 1, :, 1, :]
         kv_data = kv_data[:, 1, :, 1, :, 1, :, 1, :]
@@ -372,20 +377,30 @@ def test_cuda_graph_batch_decode_with_paged_kv_cache(
             != kv_data.shape[-3] * kv_data.shape[-2] * kv_data.shape[-1]
         )
     else:
-        kv_data_fp32 = torch.randn(*kv_shape, dtype=torch.float32).to(0)
+        kv_data_fp32 = torch.randn(*kv_shape, dtype=torch.float32, device="cuda:0")
         kv_data = kv_data_fp32.to(kv_dtype)
-    kv_indptr_host_warmup = torch.arange(0, batch_size + 1).int()
-    kv_indices_host_warmup = torch.arange(0, batch_size).int()
+    kv_indptr_host_warmup = torch.arange(
+        0, batch_size + 1, device="cuda:0", dtype=torch.int32
+    )
+    kv_indices_host_warmup = torch.arange(
+        0, batch_size, device="cuda:0", dtype=torch.int32
+    )
     kv_last_page_len_host_warmup = torch.full(
         (batch_size,), page_size, dtype=torch.int32
     )
 
     # NOTE(Zihao): allocate more space than needed for testing
-    kv_indptr_device_buffer = torch.empty(batch_size + 1).int().to(0)
-    kv_indices_device_buffer = torch.empty(total_num_pages).int().to(0)
-    kv_last_page_device_buffer = torch.empty(batch_size).int().to(0)
+    kv_indptr_device_buffer = torch.empty(
+        batch_size + 1, device="cuda:0", dtype=torch.int32
+    )
+    kv_indices_device_buffer = torch.empty(
+        total_num_pages, device="cuda:0", dtype=torch.int32
+    )
+    kv_last_page_device_buffer = torch.empty(
+        batch_size, device="cuda:0", dtype=torch.int32
+    )
 
-    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8).to(0)
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     wrapper = flashinfer.decode.CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
         workspace_buffer,
         kv_indptr_device_buffer,

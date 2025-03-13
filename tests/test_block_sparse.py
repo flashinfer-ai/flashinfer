@@ -48,6 +48,7 @@ def warmup_jit():
                     [False],  # use_fp16_qk_reductions
                 )
             )
+
         except Exception as e:
             # abort the test session if warmup fails
             pytest.exit(str(e))
@@ -123,6 +124,11 @@ def test_block_sparse_attention(
 
     o = sparse_attention_wrapper.run(q, k, v)
     torch.testing.assert_close(o_ref, o, atol=1e-2, rtol=1e-3)
+
+    # test with pre-allocated output
+    o_buffer = torch.empty_like(o)
+    sparse_attention_wrapper.run(q, k, v, out=o_buffer)
+    torch.testing.assert_close(o_ref, o_buffer, atol=1e-2, rtol=1e-3)
 
 
 if __name__ == "__main__":

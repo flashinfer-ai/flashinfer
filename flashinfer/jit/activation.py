@@ -25,6 +25,7 @@ from .utils import write_if_different
 activation_templ = r"""
 #include <flashinfer/activation.cuh>
 #include "pytorch_extension_utils.h"
+#include <cuda_runtime.h>
 
 {% set func_name = act_func_name ~ '_and_mul' %}
 
@@ -32,7 +33,7 @@ using namespace flashinfer;
 
 {{ act_func_def }}
 
-void {{ func_name }}(at::Tensor& out, at::Tensor& input, int64_t cuda_stream) {
+void {{ func_name }}(at::Tensor& out, at::Tensor& input, bool enable_pdl, int64_t cuda_stream) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
   dim3 grid(num_tokens);
@@ -40,10 +41,24 @@ void {{ func_name }}(at::Tensor& out, at::Tensor& input, int64_t cuda_stream) {
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
-    dim3 block(std::min(d / vec_size, 1024U));
-    flashinfer::activation::act_and_mul_kernel<c_type, {{ act_func_name }}>
-        <<<grid, block, 0, stream>>>(static_cast<c_type*>(out.data_ptr()),
-                                     static_cast<c_type*>(input.data_ptr()), d);
+    cudaLaunchConfig_t config;
+    config.gridDim = num_tokens;
+    config.blockDim = std::min(d / vec_size, 1024U);
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+    config.numAttrs = 1;
+    config.attrs = attrs;
+
+    auto kernel = flashinfer::activation::act_and_mul_kernel<c_type, {{ act_func_name }}>;
+
+    cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out.data_ptr()),
+                       static_cast<c_type*>(input.data_ptr()), d);
+
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "Failed to launch kernel: ", cudaGetErrorString(err));
 
     return true;
   });

@@ -15,26 +15,34 @@
  */
 #include "pytorch_extension_utils.h"
 
-void sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
-                         bool deterministic, int64_t cuda_stream);
+void sampling_from_probs(at::Tensor probs, at::Tensor output,
+                         std::optional<at::Tensor> maybe_indices, bool deterministic,
+                         std::optional<at::Generator> gen, int64_t cuda_stream);
 
-void top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
-                               at::Tensor success, std::optional<at::Tensor> maybe_top_p_arr,
-                               double top_p_val, bool deterministic, int64_t cuda_stream);
+void top_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
+                               std::optional<at::Tensor> maybe_indices,
+                               std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
+                               bool deterministic, std::optional<at::Generator> gen,
+                               int64_t cuda_stream);
 
-void top_k_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
-                               at::Tensor success, std::optional<at::Tensor> maybe_top_k_arr,
-                               int64_t top_k_val, bool deterministic, int64_t cuda_stream);
+void top_k_sampling_from_probs(at::Tensor probs, at::Tensor output,
+                               std::optional<at::Tensor> maybe_indices,
+                               std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
+                               bool deterministic, std::optional<at::Generator> gen,
+                               int64_t cuda_stream);
 
-void min_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples, at::Tensor samples,
+void min_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
+                               std::optional<at::Tensor> maybe_indices,
                                std::optional<at::Tensor> maybe_min_p_arr, double min_p_val,
-                               bool deterministic, int64_t cuda_stream);
+                               bool deterministic, std::optional<at::Generator> gen,
+                               int64_t cuda_stream);
 
-void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor uniform_samples,
-                                     at::Tensor samples, at::Tensor success,
+void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
+                                     std::optional<at::Tensor> maybe_indices,
                                      std::optional<at::Tensor> maybe_top_k_arr, double top_k_val,
                                      std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
-                                     bool deterministic, int64_t cuda_stream);
+                                     bool deterministic, std::optional<at::Generator> gen,
+                                     int64_t cuda_stream);
 
 void top_p_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
                         std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
@@ -49,10 +57,10 @@ void top_k_mask_logits(at::Tensor logits, at::Tensor mask_logits,
                        int64_t cuda_stream);
 
 void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_ids,
-                                at::Tensor uniform_samples, at::Tensor target_probs,
-                                at::Tensor output_token_ids, at::Tensor output_accepted_token_num,
+                                at::Tensor target_probs, at::Tensor output_token_ids,
+                                at::Tensor output_accepted_token_num,
                                 at::Tensor output_emitted_token_num, bool deterministic,
-                                int64_t cuda_stream);
+                                std::optional<at::Generator> gen, int64_t cuda_stream);
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // Sample from probabilities

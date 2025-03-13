@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <flashinfer/attention/mla_fa2.cuh>
+#include <flashinfer/attention/mla.cuh>
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/fastdiv.cuh>
 #include <optional>
@@ -68,10 +68,11 @@ void BatchMLAPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int
         params.q_pe = static_cast<DTypeQ*>(q_pe.data_ptr());
         params.ckv = static_cast<DTypeKV*>(ckv_cache.data_ptr());
         params.kpe = static_cast<DTypeKV*>(kpe_cache.data_ptr());
-        params.kv_indices = static_cast<IdType*>(kv_indices.data_ptr());
 
         params.q_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.q_indptr_offset);
         params.kv_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_indptr_offset);
+        params.partial_indptr =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.partial_indptr_offset);
         params.kv_indices = static_cast<IdType*>(kv_indices.data_ptr());
         params.q_len = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.q_len_offset);
         params.kv_len = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_len_offset);
@@ -80,11 +81,21 @@ void BatchMLAPagedAttentionRun(at::Tensor float_workspace_buffer, at::Tensor int
         params.kv_end = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_end_offset);
         params.work_indptr =
             GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.work_indptr_offset);
+        params.merge_packed_offset_start = GetPtrFromBaseOffset<IdType>(
+            int_buffer_ptr, plan_info.merge_packed_offset_start_offset);
+        params.merge_packed_offset_end =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_packed_offset_end_offset);
+        params.merge_partial_packed_offset_start = GetPtrFromBaseOffset<IdType>(
+            int_buffer_ptr, plan_info.merge_partial_packed_offset_start_offset);
+        params.merge_partial_packed_offset_end = GetPtrFromBaseOffset<IdType>(
+            int_buffer_ptr, plan_info.merge_partial_packed_offset_end_offset);
+        params.merge_partial_stride =
+            GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_partial_stride_offset);
         params.final_o = static_cast<DTypeO*>(o.data_ptr());
         params.final_lse =
             maybe_lse.has_value() ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
         params.partial_o =
-            GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.partial_o_offset);
+            GetPtrFromBaseOffset<DTypeO>(float_buffer_ptr, plan_info.partial_o_offset);
         params.partial_lse =
             GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.partial_lse_offset);
 

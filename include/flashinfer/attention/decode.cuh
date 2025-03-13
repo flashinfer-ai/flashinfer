@@ -33,6 +33,8 @@
 
 namespace flashinfer {
 
+DEFINE_HAS_MEMBER(decode_maybe_q_rope_offset)
+
 namespace cg = cooperative_groups;
 using cp_async::PrefetchMode;
 using cp_async::SharedMemFillMode;
@@ -437,7 +439,10 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params &param
   const uint32_t q_stride_n = params.q_stride_n;
   const uint32_t q_stride_h = params.q_stride_h;
   if constexpr (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama) {
-    const IdType* q_rope_offset = nullptr;  // params.q_rope_offset;
+    const IdType* q_rope_offset = nullptr;
+    if constexpr (has_decode_maybe_q_rope_offset_v<Params>) {
+      q_rope_offset = params.decode_maybe_q_rope_offset;
+    }
     int32_t q_rope_offset_val = q_rope_offset == nullptr ? (kv_len - 1) : q_rope_offset[batch_idx];
     const float rope_rcp_scale = params.rope_rcp_scale;
     const float rope_rcp_theta = params.rope_rcp_theta;

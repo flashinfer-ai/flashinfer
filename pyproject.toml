@@ -42,8 +42,10 @@ packages = [
     "flashinfer.data",
     "flashinfer.data.csrc",
     "flashinfer.data.cutlass",
+    "flashinfer.data.tvm_binding",
     "flashinfer.data.include",
     "flashinfer.jit",
+    "flashinfer.jit.attention",
     "flashinfer.triton",
     "flashinfer.triton.kernels",
 ]
@@ -57,6 +59,7 @@ include-package-data = false
 "flashinfer.data" = [
     "csrc/**",
     "include/**",
+    "tvm_binding/**",
     "version.txt"
 ]
 "flashinfer.data.cutlass" = [

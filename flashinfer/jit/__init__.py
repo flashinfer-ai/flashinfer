@@ -14,18 +14,28 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import ctypes
+import os
+
 # Re-export
 from .activation import gen_act_and_mul_module as gen_act_and_mul_module
 from .activation import get_act_and_mul_cu_str as get_act_and_mul_cu_str
 from .attention import gen_batch_decode_mla_module as gen_batch_decode_mla_module
 from .attention import gen_batch_decode_module as gen_batch_decode_module
 from .attention import gen_batch_mla_module as gen_batch_mla_module
+from .attention import gen_batch_mla_tvm_binding as gen_batch_mla_tvm_binding
 from .attention import gen_batch_prefill_module as gen_batch_prefill_module
 from .attention import (
     gen_customize_batch_decode_module as gen_customize_batch_decode_module,
 )
 from .attention import (
+    gen_customize_batch_decode_tvm_binding as gen_customize_batch_decode_tvm_binding,
+)
+from .attention import (
     gen_customize_batch_prefill_module as gen_customize_batch_prefill_module,
+)
+from .attention import (
+    gen_customize_batch_prefill_tvm_binding as gen_customize_batch_prefill_tvm_binding,
 )
 from .attention import (
     gen_customize_single_decode_module as gen_customize_single_decode_module,
@@ -46,6 +56,13 @@ from .attention import get_pod_uri as get_pod_uri
 from .core import clear_cache_dir, load_cuda_ops  # noqa: F401
 from .env import *
 from .utils import parallel_load_modules as parallel_load_modules
+
+cuda_lib_path = os.environ.get(
+    "CUDA_LIB_PATH", "/usr/local/cuda/targets/x86_64-linux/lib/"
+)
+if os.path.exists(f"{cuda_lib_path}/libcudart.so.12"):
+    ctypes.CDLL(f"{cuda_lib_path}/libcudart.so.12", mode=ctypes.RTLD_GLOBAL)
+
 
 try:
     from .. import flashinfer_kernels, flashinfer_kernels_sm90  # noqa: F401
