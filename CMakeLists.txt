@@ -21,4 +21,16 @@ endif()
 file(GLOB_RECURSE FLASHINFER_GENERATORS
      ${PROJECT_SOURCE_DIR}/aot_build_utils/*.py)
 
+# NOTE: do not modify this file to change option values. You can create a
+# config.cmake at build folder and add set(OPTION VALUE) to override these build
+# options. Alternatively, use cmake -DOPTION=VALUE through command-line.
+flashinfer_option(FLASHINFER_TVM_BINDING
+                  "Whether to compile tvm binding or not." OFF)
+flashinfer_option(FLASHINFER_TVM_SOURCE_DIR
+                  "The path to tvm for building tvm binding." "")
+
 add_subdirectory(libflashinfer)
+
+if(FLASHINFER_TVM_BINDING)
+  add_subdirectory(tvm_bindings)
+endif(FLASHINFER_TVM_BINDING)

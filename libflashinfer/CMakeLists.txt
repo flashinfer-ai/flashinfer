@@ -43,8 +43,6 @@ flashinfer_option(FLASHINFER_ENABLE_BF16     "Whether to compile bf16 kernels or
 flashinfer_option(FLASHINFER_UNITTESTS       "Whether to configure libflashinfer unit tests" OFF)
 flashinfer_option(FLASHINFER_DIST_UNITTESTS  "Whether to configure libflashinfer distributed unit tests" OFF)
 flashinfer_option(FLASHINFER_CXX_BENCHMARKS  "Whether to configure libflashinfer cxx benchmarks" OFF)
-flashinfer_option(FLASHINFER_TVM_BINDING     "Whether to compile tvm binding or not."     OFF)
-flashinfer_option(FLASHINFER_TVM_SOURCE_DIR  "The path to tvm for building tvm binding."   "")
 # The following configurations can impact the binary size of the generated library
 flashinfer_option(FLASHINFER_GEN_HEAD_DIMS              "Head dims to enable" 128 256)
 flashinfer_option(FLASHINFER_GEN_POS_ENCODING_MODES     "Pos encodings to enable" 0)
@@ -61,8 +59,8 @@ else(DEFINED FLASHINFER_CUDA_ARCHITECTURES)
   message(STATUS "CMAKE_CUDA_ARCHITECTURES is ${CMAKE_CUDA_ARCHITECTURES}")
 endif(DEFINED FLASHINFER_CUDA_ARCHITECTURES)
 
-set(FLASHINFER_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/include)
-set(FLASHINFER_UTILS_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/utils)
+set(FLASHINFER_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set(FLASHINFER_UTILS_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/utils)
 
 if(FLASHINFER_ENABLE_FP8)
   set(FLASHINFER_ENABLE_FP8_E4M3 ON)
@@ -195,37 +193,3 @@ endif(FLASHINFER_UNITTESTS)
 if(FLASHINFER_CXX_BENCHMARKS)
   add_subdirectory(benchmarks)
 endif(FLASHINFER_CXX_BENCHMARKS)
-
-if(FLASHINFER_TVM_BINDING)
-  message(STATUS "Compile tvm binding.")
-  if(NOT FLASHINFER_TVM_SOURCE_DIR STREQUAL "")
-    set(TVM_SOURCE_DIR_SET ${FLASHINFER_TVM_SOURCE_DIR})
-  elseif(DEFINED ENV{TVM_SOURCE_DIR})
-    set(TVM_SOURCE_DIR_SET $ENV{TVM_SOURCE_DIR})
-  elseif(DEFINED ENV{TVM_HOME}) # for backward compatibility
-    set(TVM_SOURCE_DIR_SET $ENV{TVM_HOME})
-  else()
-    message(
-      FATAL_ERROR
-        "Error: Cannot find TVM. Please set the path to TVM by                       \
-        1) adding `-DFLASHINFER_TVM_SOURCE_DIR=path/to/tvm` in the cmake command, or \
-        2) setting the environment variable `TVM_SOURCE_DIR` to the tvm path.")
-  endif()
-  message(STATUS "FlashInfer uses TVM home ${TVM_SOURCE_DIR_SET}.")
-
-  file(GLOB_RECURSE TVM_BINDING_SRCS ${PROJECT_SOURCE_DIR}/src/tvm_wrapper.cu)
-  add_library(flashinfer_tvm OBJECT ${TVM_BINDING_SRCS})
-  target_compile_definitions(flashinfer_tvm PRIVATE -DDMLC_USE_LOGGING_LIBRARY=
-                                                    \<tvm/runtime/logging.h\>)
-  target_link_libraries(flashinfer_tvm PRIVATE decode_kernels prefill_kernels)
-  target_include_directories(flashinfer_tvm PRIVATE ${FLASHINFER_INCLUDE_DIR})
-  target_include_directories(flashinfer_tvm
-                             PRIVATE ${TVM_SOURCE_DIR_SET}/include)
-  target_include_directories(
-    flashinfer_tvm PRIVATE ${TVM_SOURCE_DIR_SET}/3rdparty/dlpack/include)
-  target_include_directories(
-    flashinfer_tvm PRIVATE ${TVM_SOURCE_DIR_SET}/3rdparty/dmlc-core/include)
-  add_dependencies(flashinfer_tvm dispatch_inc)
-  target_compile_options(flashinfer_tvm PRIVATE -Xcompiler=-fPIC -diag-suppress
-                                                "1305" -Wno-switch-bool)
-endif(FLASHINFER_TVM_BINDING)
