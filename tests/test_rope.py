@@ -61,11 +61,11 @@ def test_rope(
     # reference implementation
     if llama_version == "llama":
         freqs_cis = precompute_freqs_cis(
-            rotary_dim, qkv_len + offset, 10000.0, use_scaled=False
+            rotary_dim, qkv_len + offset, 10000.0, use_scaled=False, device="cuda:0"
         ).to("cuda:0")
     else:
         freqs_cis = precompute_freqs_cis(
-            rotary_dim, qkv_len + offset, 5e5, use_scaled=True
+            rotary_dim, qkv_len + offset, 5e5, use_scaled=True, device="cuda:0"
         ).to("cuda:0")
     q_rot_ref, k_rot_ref = apply_rotary_emb(
         q.reshape(batch_size, qkv_len, num_qo_heads, head_dim)[..., :rotary_dim],
@@ -315,11 +315,23 @@ def test_rope_cos_sin_cache(
     num_kv_heads: int,
 ):
     rope_ref = RotaryEmbedding(
-        head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
-    ).to(device)
+        head_size,
+        rotary_dim,
+        max_position_embeddings,
+        base,
+        is_neox_style,
+        dtype,
+        device,
+    )
     rope_flashinfer = FlashInferRotaryEmbedding(
-        head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
-    ).to(device)
+        head_size,
+        rotary_dim,
+        max_position_embeddings,
+        base,
+        is_neox_style,
+        dtype,
+        device,
+    )
 
     pos_ids = torch.arange(seq_len, device=device).repeat(batch_size)
     query = torch.randn(
