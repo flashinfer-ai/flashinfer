@@ -39,9 +39,15 @@ def apply_scaling(freqs: torch.Tensor):
 
 
 def precompute_freqs_cis(
-    dim: int, end: int, theta: float = 10000.0, use_scaled: bool = False
+    dim: int,
+    end: int,
+    theta: float = 10000.0,
+    use_scaled: bool = False,
+    device: str = "cuda:0",
 ):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    freqs = 1.0 / (
+        theta ** (torch.arange(0, dim, 2, device=device)[: (dim // 2)].float() / dim)
+    )
     t = torch.arange(end, device=freqs.device, dtype=torch.float32)
     if use_scaled:
         freqs = apply_scaling(freqs)
@@ -86,10 +92,15 @@ def rotate_half(x):
 
 
 def generate_cos_sin_f32_cache(
-    max_seq_len, head_dim, theta=1e4, use_scaled: bool = False
+    max_seq_len, head_dim, theta=1e4, use_scaled: bool = False, device: str = "cuda:0"
 ):
-    position = torch.arange(max_seq_len).float().unsqueeze(1)
-    freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    position = torch.arange(max_seq_len, device=device, dtype=torch.float32).unsqueeze(
+        1
+    )
+    freqs = 1.0 / (
+        theta
+        ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim)
+    )
     freqs = torch.cat([freqs, freqs], dim=-1).contiguous()
     if use_scaled:
         freqs = apply_scaling(freqs)
@@ -112,6 +123,7 @@ class RotaryEmbedding(torch.nn.Module):
         base: int,
         is_neox_style: bool,
         dtype: torch.dtype,
+        device: str = "cuda:0",
     ) -> None:
         super().__init__()
         self.head_size = head_size
@@ -120,7 +132,7 @@ class RotaryEmbedding(torch.nn.Module):
         self.base = base
         self.is_neox_style = is_neox_style
         self.dtype = dtype
-
+        self.device = device
         cache = self._compute_cos_sin_cache()
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
@@ -129,7 +141,10 @@ class RotaryEmbedding(torch.nn.Module):
         inv_freq = 1.0 / (
             base
             ** (
-                torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim
+                torch.arange(
+                    0, self.rotary_dim, 2, dtype=torch.float, device=self.device
+                )
+                / self.rotary_dim
             )
         )
         return inv_freq
@@ -137,7 +152,9 @@ class RotaryEmbedding(torch.nn.Module):
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         """Compute the cos and sin cache."""
         inv_freq = self._compute_inv_freq(self.base)
-        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+        t = torch.arange(
+            self.max_position_embeddings, dtype=torch.float, device=self.device
+        )
 
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos()

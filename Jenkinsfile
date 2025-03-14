@@ -61,6 +61,17 @@ def unpack_lib(name, libs) {
      """
 }
 
+def cancel_previous_build() {
+  // cancel previous build if it is not on main.
+  if (env.BRANCH_NAME != 'main') {
+    def buildNumber = env.BUILD_NUMBER as int
+    // Milestone API allows us to cancel previous build
+    // with the same milestone number
+    if (buildNumber > 1) milestone(buildNumber - 1)
+    milestone(buildNumber)
+  }
+}
+
 def init_git(submodule = false) {
   cleanWs()
   // add retry in case checkout timeouts
@@ -85,10 +96,11 @@ def init_git(submodule = false) {
 // }
 
 stage('JIT Unittest') {
+  cancel_previous_build()
   parallel(
     failFast: true,
-    'GPU-G5-Test-1': {
-      node('GPU-G5-SPOT') {
+    'GPU-G6-Test-1': {
+      node('GPU-G6-SPOT') {
         ws(per_exec_ws('flashinfer-unittest')) {
           init_git(true) // we need cutlass submodule
           sh(script: "ls -alh", label: 'Show work directory')
@@ -97,13 +109,23 @@ stage('JIT Unittest') {
         }
       }
     },
-    'GPU-G5-Test-2': {
-      node('GPU-G5-SPOT') {
+    'GPU-G6-Test-2': {
+      node('GPU-G6-SPOT') {
         ws(per_exec_ws('flashinfer-unittest')) {
           init_git(true) // we need cutlass submodule
           sh(script: "ls -alh", label: 'Show work directory')
           sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
           sh(script: "${docker_run} ./scripts/task_jit_run_tests_part2.sh", label: 'JIT Unittest Part 2')
+        }
+      }
+    },
+    'GPU-G6-Test-3': {
+      node('GPU-G6-SPOT') {
+        ws(per_exec_ws('flashinfer-unittest')) {
+          init_git(true) // we need cutlass submodule
+          sh(script: "ls -alh", label: 'Show work directory')
+          sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
+          sh(script: "${docker_run} ./scripts/task_jit_run_tests_part3.sh", label: 'JIT Unittest Part 3')
         }
       }
     },
