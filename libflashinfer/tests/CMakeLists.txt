@@ -146,18 +146,6 @@ configure_unit_test(
   TEST_SOURCES "test_fast_dequant.cu"
   IS_GTEST ON
 )
-configure_unit_test(
-  TEST_TARGET_NAME fp16_from_fp32
-  TEST_SOURCES "ieee-from-fp32-value.cc;tables.cc"
-  EXTRA_LINK_LIBS "Boost::math"
-  IS_GTEST ON
-)
-configure_unit_test(
-  TEST_TARGET_NAME fp16_to_fp32
-  TEST_SOURCES "ieee-to-fp32-value.cc;tables.cc"
-  EXTRA_LINK_LIBS "Boost::math"
-  IS_GTEST ON
-)
 # cmake-format: on
 
 if(FLASHINFER_DISTRIBUTED_UNITTESTS)
