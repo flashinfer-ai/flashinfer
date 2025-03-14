@@ -33,6 +33,11 @@ function(configure_benchmark)
     target_link_libraries(${arg_BENCHMARK_TARGET_NAME}
                           PRIVATE ${extra_link_lib})
   endforeach(extra_link_lib)
+
+  # Add the target to the ALL_BENCHMARK_TARGETS list so that it gets built when
+  # the build_benchmarks target is invoked.
+  list(APPEND ALL_BENCHMARK_TARGETS "${arg_BENCHMARK_TARGET_NAME}")
+  set(ALL_BENCHMARK_TARGETS "${ALL_BENCHMARK_TARGETS}" PARENT_SCOPE)
   message(STATUS "Configured ${arg_BENCHMARK_TARGET_NAME} benchmark")
 
 endfunction(configure_benchmark)
