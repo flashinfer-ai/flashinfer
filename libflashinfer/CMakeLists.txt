@@ -34,30 +34,24 @@ find_package(Thrust REQUIRED)
 # NOTE: do not modify this file to change option values. You can create a
 # config.cmake at build folder and add set(OPTION VALUE) to override these build
 # options. Alternatively, use cmake -DOPTION=VALUE through command-line.
-flashinfer_option(FLASHINFER_ENABLE_FP8
-                  "Whether to compile fp8 kernels or not." ON)
-flashinfer_option(FLASHINFER_ENABLE_FP8_E4M3
-                  "Whether to compile fp8_e4m3 kernels or not." ON)
-flashinfer_option(FLASHINFER_ENABLE_FP8_E5M2
-                  "Whether to compile fp8_e5m2 kernels or not." ON)
-flashinfer_option(FLASHINFER_ENABLE_F16
-                  "Whether to compile f16 kernels or not." ON)
-flashinfer_option(FLASHINFER_ENABLE_BF16
-                  "Whether to compile bf16 kernels or not." ON)
-flashinfer_option(FLASHINFER_UNITTESTS "Build libflashinfer unit tests" OFF)
-flashinfer_option(FLASHINFER_DISTRIBUTED_UNITTESTS
-                  "Build libflashinfer distributed unit tests" OFF)
-flashinfer_option(FLASHINFER_TVM_BINDING
-                  "Whether to compile tvm binding or not." OFF)
-flashinfer_option(FLASHINFER_TVM_SOURCE_DIR
-                  "The path to tvm for building tvm binding." "")
-# The following configurations can impact the binary size of the generated
-# library
-flashinfer_option(FLASHINFER_GEN_HEAD_DIMS "Head dims to enable" 128 256)
-flashinfer_option(FLASHINFER_GEN_POS_ENCODING_MODES "Pos encodings to enable" 0)
-flashinfer_option(FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS
-                  "QK reductions to enable" ON)
-flashinfer_option(FLASHINFER_GEN_MASK_MODES "Mask modes to enable" 0 1 2)
+# cmake-format: off
+flashinfer_option(FLASHINFER_ENABLE_FP8      "Whether to compile fp8 kernels or not."         ON)
+flashinfer_option(FLASHINFER_ENABLE_FP8_E4M3 "Whether to compile fp8_e4m3 kernels or not."    ON)
+flashinfer_option(FLASHINFER_ENABLE_FP8_E5M2 "Whether to compile fp8_e5m2 kernels or not."    ON)
+flashinfer_option(FLASHINFER_ENABLE_F16      "Whether to compile f16 kernels or not."         ON)
+flashinfer_option(FLASHINFER_ENABLE_BF16     "Whether to compile bf16 kernels or not."        ON)
+flashinfer_option(FLASHINFER_UNITTESTS       "Whether to configure libflashinfer unit tests" OFF)
+flashinfer_option(FLASHINFER_DIST_UNITTESTS  "Whether to configure libflashinfer distributed unit tests" OFF)
+flashinfer_option(FLASHINFER_CXX_BENCHMARKS  "Whether to configure libflashinfer cxx benchmarks" OFF)
+flashinfer_option(FLASHINFER_TVM_BINDING     "Whether to compile tvm binding or not."     OFF)
+flashinfer_option(FLASHINFER_TVM_SOURCE_DIR  "The path to tvm for building tvm binding."   "")
+# The following configurations can impact the binary size of the generated library
+flashinfer_option(FLASHINFER_GEN_HEAD_DIMS              "Head dims to enable" 128 256)
+flashinfer_option(FLASHINFER_GEN_POS_ENCODING_MODES     "Pos encodings to enable" 0)
+# FIXME: CAUTION!!! Turning on this option will cause build failures. (refer #806, #936)
+flashinfer_option(FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS "QK reductions to enable" OFF)
+flashinfer_option(FLASHINFER_GEN_MASK_MODES             "Mask modes to enable" 0 1 2)
+# cmake-format: on
 
 if(DEFINED FLASHINFER_CUDA_ARCHITECTURES)
   message(
@@ -123,7 +117,7 @@ set(AOT_GENERATE_COMMAND
 set(AOT_GENERATE_DISPATCH_INC_COMMAND
     ${Python3_EXECUTABLE} -m aot_build_utils.generate_dispatch_inc --path
     "${GENERATED_SOURCE_DIR}/dispatch.inc" --head_dims ${HEAD_DIMS}
-    --head_dims_sm90 "64,64" # FIXME
+    --head_dims_sm90 "64,64" # FIXME Make this configurable.
     --pos_encoding_modes ${POS_ENCODING_MODES} --use_fp16_qk_reductions
     ${USE_FP16_QK_REDUCTIONS} --mask_modes ${MASK_MODES})
 
@@ -198,116 +192,9 @@ if(FLASHINFER_UNITTESTS)
   add_subdirectory(tests)
 endif(FLASHINFER_UNITTESTS)
 
-if(FLASHINFER_DECODE)
-  message(STATUS "Compile single decode kernel benchmarks.")
-  file(GLOB_RECURSE BENCH_DECODE_SRCS
-       ${PROJECT_SOURCE_DIR}/src/bench_single_decode.cu)
-  add_executable(bench_single_decode ${BENCH_DECODE_SRCS})
-  target_include_directories(bench_single_decode
-                             PRIVATE ${FLASHINFER_INCLUDE_DIR})
-  target_include_directories(bench_single_decode
-                             PRIVATE ${PROJECT_SOURCE_DIR}/3rdparty/nvbench)
-  add_dependencies(bench_single_decode dispatch_inc)
-  target_link_libraries(bench_single_decode
-                        PRIVATE nvbench::main decode_kernels prefill_kernels)
-  target_compile_options(bench_single_decode PRIVATE -Wno-switch-bool)
-
-  message(STATUS "Compile batch decode kernel benchmarks.")
-  file(GLOB_RECURSE BENCH_DECODE_SRCS
-       ${PROJECT_SOURCE_DIR}/src/bench_batch_decode.cu)
-  add_executable(bench_batch_decode ${BENCH_DECODE_SRCS})
-  target_include_directories(bench_batch_decode
-                             PRIVATE ${FLASHINFER_INCLUDE_DIR})
-  target_include_directories(bench_batch_decode
-                             PRIVATE ${PROJECT_SOURCE_DIR}/3rdparty/nvbench)
-  add_dependencies(bench_batch_decode dispatch_inc)
-  target_link_libraries(bench_batch_decode PRIVATE nvbench::main decode_kernels
-                                                   prefill_kernels)
-  target_compile_options(bench_batch_decode PRIVATE -Wno-switch-bool)
-
-  message(STATUS "Compile batch mla decode kernel benchmarks.")
-  file(GLOB_RECURSE BENCH_DECODE_MLA_SRCS
-       ${PROJECT_SOURCE_DIR}/src/bench_batch_decode_mla.cu)
-  add_executable(bench_batch_decode_mla ${BENCH_DECODE_MLA_SRCS})
-  target_include_directories(bench_batch_decode_mla
-                             PRIVATE ${FLASHINFER_INCLUDE_DIR})
-  target_include_directories(bench_batch_decode_mla
-                             PRIVATE ${PROJECT_SOURCE_DIR}/3rdparty/nvbench)
-  add_dependencies(bench_batch_decode_mla dispatch_inc)
-  target_link_libraries(bench_batch_decode_mla PRIVATE nvbench::main
-                                                       decode_kernels)
-  target_compile_options(bench_batch_decode_mla PRIVATE -Wno-switch-bool)
-
-endif(FLASHINFER_DECODE)
-
-if(FLASHINFER_PREFILL)
-  message(STATUS "Compile single prefill kernel benchmarks")
-  file(GLOB_RECURSE BENCH_PREFILL_SRCS
-       ${PROJECT_SOURCE_DIR}/src/bench_single_prefill.cu)
-  add_executable(bench_single_prefill ${BENCH_PREFILL_SRCS})
-  target_include_directories(bench_single_prefill
-                             PRIVATE ${FLASHINFER_INCLUDE_DIR})
-  target_include_directories(bench_single_prefill
-                             PRIVATE ${PROJECT_SOURCE_DIR}/3rdparty/nvbench)
-  add_dependencies(bench_single_prefill dispatch_inc)
-  target_link_libraries(bench_single_prefill PRIVATE nvbench::main
-                                                     prefill_kernels)
-  target_compile_options(bench_single_prefill PRIVATE -Wno-switch-bool)
-
-  message(STATUS "Compile batch prefill kernel benchmarks.")
-  file(GLOB_RECURSE BENCH_PREFILL_SRCS
-       ${PROJECT_SOURCE_DIR}/src/bench_batch_prefill.cu)
-  add_executable(bench_batch_prefill ${BENCH_PREFILL_SRCS})
-  target_include_directories(bench_batch_prefill
-                             PRIVATE ${FLASHINFER_INCLUDE_DIR})
-  target_include_directories(bench_batch_prefill
-                             PRIVATE ${PROJECT_SOURCE_DIR}/3rdparty/nvbench)
-  add_dependencies(bench_batch_prefill dispatch_inc)
-  target_link_libraries(bench_batch_prefill PRIVATE nvbench::main
-                                                    prefill_kernels)
-  target_compile_options(bench_batch_prefill PRIVATE -Wno-switch-bool)
-
-endif(FLASHINFER_PREFILL)
-
-if(FLASHINFER_CASCADE)
-  message(STATUS "Compile cascade kernel benchmarks.")
-  file(GLOB_RECURSE BENCH_CASCADE_SRCS
-       ${PROJECT_SOURCE_DIR}/src/bench_cascade.cu)
-  add_executable(bench_cascade ${BENCH_CASCADE_SRCS})
-  target_include_directories(bench_cascade PRIVATE ${FLASHINFER_INCLUDE_DIR})
-  target_include_directories(bench_cascade
-                             PRIVATE ${PROJECT_SOURCE_DIR}/3rdparty/nvbench)
-  add_dependencies(bench_cascade dispatch_inc)
-  target_link_libraries(bench_cascade PRIVATE nvbench::main decode_kernels
-                                              prefill_kernels)
-  target_compile_options(bench_cascade PRIVATE -Wno-switch-bool)
-
-endif(FLASHINFER_CASCADE)
-
-if(FLASHINFER_SAMPLING)
-  message(STATUS "Compile sampling kernel benchmarks.")
-  file(GLOB_RECURSE BENCH_SAMPLING_SRCS
-       ${PROJECT_SOURCE_DIR}/src/bench_sampling.cu)
-  add_executable(bench_sampling ${BENCH_SAMPLING_SRCS})
-  target_include_directories(bench_sampling PRIVATE ${FLASHINFER_INCLUDE_DIR})
-  target_include_directories(bench_sampling
-                             PRIVATE ${PROJECT_SOURCE_DIR}/3rdparty/nvbench)
-  target_link_libraries(bench_sampling PRIVATE nvbench::main)
-  target_compile_options(bench_sampling PRIVATE -Wno-switch-bool)
-
-endif(FLASHINFER_SAMPLING)
-
-if(FLASHINFER_NORM)
-  message(STATUS "Compile normalization kernel benchmarks.")
-  file(GLOB_RECURSE BENCH_NORM_SRCS ${PROJECT_SOURCE_DIR}/src/bench_norm.cu)
-  add_executable(bench_norm ${BENCH_NORM_SRCS})
-  target_include_directories(bench_norm PRIVATE ${FLASHINFER_INCLUDE_DIR})
-  target_include_directories(bench_norm
-                             PRIVATE ${PROJECT_SOURCE_DIR}/3rdparty/nvbench)
-  target_link_libraries(bench_norm PRIVATE nvbench::main)
-  target_compile_options(bench_norm PRIVATE -Wno-switch-bool)
-
-endif(FLASHINFER_NORM)
+if(FLASHINFER_CXX_BENCHMARKS)
+  add_subdirectory(benchmarks)
+endif(FLASHINFER_CXX_BENCHMARKS)
 
 if(FLASHINFER_TVM_BINDING)
   message(STATUS "Compile tvm binding.")

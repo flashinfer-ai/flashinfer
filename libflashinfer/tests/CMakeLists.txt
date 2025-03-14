@@ -24,7 +24,6 @@ function(configure_unit_test)
                         "${multiValueArgs}")
 
   message(STATUS "Configure ${arg_TEST_TARGET_NAME} unit test")
-  message(STATUS "Test Sources: ${arg_TEST_SOURCES}")
 
   add_executable(${arg_TEST_TARGET_NAME} EXCLUDE_FROM_ALL ${arg_TEST_SOURCES})
   target_include_directories(
@@ -148,9 +147,9 @@ configure_unit_test(
 )
 # cmake-format: on
 
-if(FLASHINFER_DISTRIBUTED_UNITTESTS)
+if(FLASHINFER_DIST_UNITTESTS)
   configure_distributed_unit_tests()
-endif(FLASHINFER_DISTRIBUTED_UNITTESTS)
+endif(FLASHINFER_DIST_UNITTESTS)
 
 # A top-level target to build all unit tests
 add_custom_target(build_tests)
