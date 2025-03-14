@@ -182,7 +182,7 @@ __device__ __forceinline__ void load_kv(
     typename KTraits::DTypeKV* kpe, typename KTraits::IdType* indices, const uint32_t ckv_stride_n,
     const uint32_t ckv_stride_page, const uint32_t kpe_stride_n, const uint32_t kpe_stride_page,
     const uint32_t kv_bound, const uint32_t packed_block_iter_base, const uint_fastdiv& block_size,
-    const uint32_t stage_idx) {
+    const uint32_t stage_idx, const uint32_t last_page_kv_idx) {
   using DTypeKV = typename KTraits::DTypeKV;
   constexpr uint32_t UPCAST_STRIDE_CKV = KTraits::UPCAST_STRIDE_CKV;
   constexpr uint32_t UPCAST_STRIDE_KPE = KTraits::UPCAST_STRIDE_KPE;
@@ -210,8 +210,9 @@ __device__ __forceinline__ void load_kv(
       for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_CKV / 4; ++mma_d) {
         uint32_t ckv_smem_offset_w = ckv_smem.template get_permuted_offset<UPCAST_STRIDE_CKV>(
             warp_idx_in_wg * 4 + lane_idx / 8, 8 * mma_d + lane_idx % 8);
-        ckv_smem.load_128b_async<SharedMemFillMode::kFillZero>(ckv_smem_offset_w, ckv_ptr,
-                                                               q < kv_bound);
+        ckv_smem.load_128b_async<SharedMemFillMode::kFillZero>(
+            ckv_smem_offset_w, ckv_ptr,
+            (q < kv_bound - 1) || ((q == kv_bound - 1) && (r <= last_page_kv_idx)));
         ckv_ptr += 8 * upcast_size<DTypeKV>();
       }
 
@@ -243,8 +244,9 @@ __device__ __forceinline__ void load_kv(
         uint32_t ckv_smem_offset_w = ckv_smem.template get_permuted_offset<UPCAST_STRIDE_CKV>(
             32 * mma_kv + warpgroup_idx * 16 + warp_idx_in_wg * 4 + lane_idx / 8,
             8 * mma_d + lane_idx % 8);
-        ckv_smem.load_128b_async<SharedMemFillMode::kFillZero>(ckv_smem_offset_w, ckv_ptr,
-                                                               q < kv_bound);
+        ckv_smem.load_128b_async<SharedMemFillMode::kFillZero>(
+            ckv_smem_offset_w, ckv_ptr,
+            (q < kv_bound - 1) || ((q == kv_bound - 1) && (r <= last_page_kv_idx)));
         ckv_ptr += 8 * upcast_size<DTypeKV>();
       }
 
@@ -836,6 +838,9 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
     const uint32_t kv_start = params.kv_start[work_idx];
     const uint32_t kv_end = params.kv_end[work_idx];
 
+    uint32_t total_page_idx, last_page_kv_idx;
+    block_size.divmod(kv_end - 1, total_page_idx, last_page_kv_idx);
+
     const uint32_t qo_packed_idx_base = packed_qo_start + blockIdx.x * KTraits::CTA_TILE_Q;
     const uint32_t qo_upperbound =
         min(q_len, ceil_div(qo_packed_idx_base + KTraits::CTA_TILE_Q, num_heads));
@@ -867,7 +872,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
     load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
                      kpe_stride_n, kpe_stride_page, kv_bound,
                      block_iter_base + kv_tile_idx * CTA_TILE_KV, block_size,
-                     kv_tile_idx % NUM_STAGES);
+                     kv_tile_idx % NUM_STAGES, last_page_kv_idx);
     cp_async::commit_group();
 #pragma unroll
     for (int stage_idx = 1; stage_idx < NUM_STAGES; ++stage_idx) {
@@ -875,7 +880,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
         load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
                          kpe_stride_n, kpe_stride_page, kv_bound,
                          block_iter_base + (kv_tile_idx - stage_idx) * CTA_TILE_KV, block_size,
-                         (kv_tile_idx - stage_idx) % NUM_STAGES);
+                         (kv_tile_idx - stage_idx) % NUM_STAGES, last_page_kv_idx);
         cp_async::commit_group();
       }
     }
@@ -905,7 +910,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
         load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
                          kpe_stride_n, kpe_stride_page, kv_bound,
                          block_iter_base + (kv_tile_idx - NUM_STAGES) * CTA_TILE_KV, block_size,
-                         (kv_tile_idx - NUM_STAGES) % NUM_STAGES);
+                         (kv_tile_idx - NUM_STAGES) % NUM_STAGES, last_page_kv_idx);
         cp_async::commit_group();
       }
     }
@@ -929,7 +934,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPagedAttentionKe
       load_kv<KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
                        kpe_stride_n, kpe_stride_page, kv_bound,
                        block_iter_base + (kv_tile_idx - NUM_STAGES) * CTA_TILE_KV, block_size,
-                       (kv_tile_idx - NUM_STAGES) % NUM_STAGES);
+                       (kv_tile_idx - NUM_STAGES) % NUM_STAGES, last_page_kv_idx);
       cp_async::commit_group();
     }
     cp_async::wait_group<0>();
