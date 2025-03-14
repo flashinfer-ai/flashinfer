@@ -1,0 +1,92 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+# TODO: Public dependencies to use flashinfer headers should be added here.
+# E.g.,
+# find_dependency(CUDA)
+# find_dependency(Thrust)
+
+# Define a variable indicating if this is a header-only installation
+set(FLASHINFER_HEADER_ONLY @FLASHINFER_INSTALL_ONLY_HEADERS@)
+
+# Include the exported targets file if it exists
+if(NOT FLASHINFER_HEADER_ONLY AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/libflashinferTargets.cmake")
+  include("${CMAKE_CURRENT_LIST_DIR}/libflashinferTargets.cmake")
+endif()
+
+# Define components
+set(_supported_components libflashinfer tvm_bindings distributed)
+
+# Set header-only component as always found
+set(flashinfer_header_only_FOUND TRUE)
+
+# Check for required components
+foreach(_comp ${flashinfer_FIND_COMPONENTS})
+  if (NOT ";${_supported_components};" MATCHES ";${_comp};")
+    set(flashinfer_FOUND False)
+    set(flashinfer_NOT_FOUND_MESSAGE "Unsupported component: ${_comp}")
+    return()
+  endif()
+endforeach()
+
+# Check if libflashinfer component is requested
+if("libflashinfer" IN_LIST flashinfer_FIND_COMPONENTS)
+  if(FLASHINFER_HEADER_ONLY)
+    # For header-only installation, we indicate it's found but warn the user
+    set(flashinfer_libflashinfer_FOUND TRUE)
+    message(STATUS "flashinfer was installed as header-only - compiled libraries are not available")
+  else()
+    # For normal installation, check if the targets exist
+    if(TARGET flashinfer::decode_kernels AND TARGET flashinfer::prefill_kernels)
+      set(flashinfer_libflashinfer_FOUND TRUE)
+    else()
+      set(flashinfer_libflashinfer_FOUND FALSE)
+      if(flashinfer_FIND_REQUIRED_libflashinfer)
+        set(flashinfer_FOUND FALSE)
+        set(flashinfer_NOT_FOUND_MESSAGE "Required component libflashinfer was not found")
+      endif()
+    endif()
+  endif()
+endif()
+
+# Check if TVM bindings are requested
+if("tvm_bindings" IN_LIST flashinfer_FIND_COMPONENTS)
+  if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/flashinferTVMBindingsTargets.cmake")
+    include("${CMAKE_CURRENT_LIST_DIR}/flashinferTVMBindingsTargets.cmake")
+    set(flashinfer_tvm_bindings_FOUND TRUE)
+  else()
+    set(flashinfer_tvm_bindings_FOUND FALSE)
+    if(flashinfer_FIND_REQUIRED_tvm_bindings)
+      set(flashinfer_FOUND FALSE)
+      set(flashinfer_NOT_FOUND_MESSAGE "Required component tvm_bindings was not found")
+    endif()
+  endif()
+endif()
+
+# Check if distributed component is requested
+if("distributed" IN_LIST flashinfer_FIND_COMPONENTS)
+  # Find MPI which is required for distributed functionality
+  find_dependency(MPI REQUIRED)
+
+  # Find mscclpp package
+  find_package(mscclpp REQUIRED)
+
+  # Create aliases to make usage consistent
+  if(NOT TARGET flashinfer::dist)
+    add_library(flashinfer::dist INTERFACE IMPORTED)
+    set_target_properties(flashinfer::dist PROPERTIES
+      INTERFACE_LINK_LIBRARIES mscclpp)
+  endif()
+
+  include("${CMAKE_CURRENT_LIST_DIR}/flashinferDistTargets.cmake")
+  set(flashinfer_distributed_FOUND TRUE)
+endif()
+
+# Set include directories
+set(FLASHINFER_INCLUDE_DIRS "${PACKAGE_PREFIX_DIR}/include")
+
+if(NOT flashinfer_FIND_QUIETLY)
+  message(STATUS "Found flashinfer: ${PACKAGE_PREFIX_DIR} (version: ${flashinfer_VERSION})")
+endif()
+
+check_required_components(flashinfer)
