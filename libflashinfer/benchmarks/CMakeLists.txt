@@ -37,7 +37,9 @@ function(configure_benchmark)
   # Add the target to the ALL_BENCHMARK_TARGETS list so that it gets built when
   # the build_benchmarks target is invoked.
   list(APPEND ALL_BENCHMARK_TARGETS "${arg_BENCHMARK_TARGET_NAME}")
-  set(ALL_BENCHMARK_TARGETS "${ALL_BENCHMARK_TARGETS}" PARENT_SCOPE)
+  set(ALL_BENCHMARK_TARGETS
+      "${ALL_BENCHMARK_TARGETS}"
+      PARENT_SCOPE)
   message(STATUS "Configured ${arg_BENCHMARK_TARGET_NAME} benchmark")
 
 endfunction(configure_benchmark)
@@ -98,7 +100,7 @@ foreach(benchmark IN LISTS ALL_BENCHMARK_TARGETS)
     TARGET run_all_benchmarks
     POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E echo "Running ${benchmark}..."
-    COMMAND ${CMAKE_CURRENT_BINARY_DIR}/${benchmark} DEPENDS ${benchmark})
+    COMMAND ${CMAKE_CURRENT_BINARY_DIR}/${benchmark})
 endforeach()
 
 # Ensure the run_all_benchmarks target depends on all benchmark executables
