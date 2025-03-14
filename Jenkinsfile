@@ -99,6 +99,16 @@ stage('Unittest') {
   cancel_previous_build()
   parallel(
     failFast: true,
+    'AOT-Build-Import': {
+      node('CPU-SPOT') {
+        ws(per_exec_ws('flashinfer-aot')) {
+          init_git(true)
+          sh(script: "ls -alh", label: 'Show work directory')
+          sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
+          sh(script: "${docker_run} --no-gpu ./scripts/task_test_aot_build_import.sh", label: 'Test AOT Build and Import')
+        }
+      }
+    },
     'JIT-Unittest-1': {
       node('GPU-G5-SPOT') {
         ws(per_exec_ws('flashinfer-unittest')) {
