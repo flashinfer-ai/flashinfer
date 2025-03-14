@@ -95,12 +95,12 @@ def init_git(submodule = false) {
 //   }
 // }
 
-stage('JIT Unittest') {
+stage('Unittest') {
   cancel_previous_build()
   parallel(
     failFast: true,
-    'GPU-G6-Test-1': {
-      node('GPU-G6-SPOT') {
+    'JIT-Unittest-1': {
+      node('GPU-G5-SPOT') {
         ws(per_exec_ws('flashinfer-unittest')) {
           init_git(true) // we need cutlass submodule
           sh(script: "ls -alh", label: 'Show work directory')
@@ -109,8 +109,8 @@ stage('JIT Unittest') {
         }
       }
     },
-    'GPU-G6-Test-2': {
-      node('GPU-G6-SPOT') {
+    'JIT-Unittest-2': {
+      node('GPU-G5-SPOT') {
         ws(per_exec_ws('flashinfer-unittest')) {
           init_git(true) // we need cutlass submodule
           sh(script: "ls -alh", label: 'Show work directory')
@@ -119,8 +119,8 @@ stage('JIT Unittest') {
         }
       }
     },
-    'GPU-G6-Test-3': {
-      node('GPU-G6-SPOT') {
+    'JIT-Unittest-3': {
+      node('GPU-G5-SPOT') {
         ws(per_exec_ws('flashinfer-unittest')) {
           init_git(true) // we need cutlass submodule
           sh(script: "ls -alh", label: 'Show work directory')
