@@ -100,7 +100,7 @@ stage('Unittest') {
   parallel(
     failFast: true,
     'AOT-Build-Import': {
-      node('CPU-LARGE-SPOT') {
+      node('CPU-Large-SPOT') {
         ws(per_exec_ws('flashinfer-aot')) {
           init_git(true)
           sh(script: "ls -alh", label: 'Show work directory')
