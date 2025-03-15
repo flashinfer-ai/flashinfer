@@ -14,4 +14,3 @@ pytest -s tests/test_norm.py
 pytest -s tests/test_rope.py
 pytest -s tests/test_mla_page.py
 pytest -s tests/test_quantization.py
-# pytest -s tests/test_sampling.py

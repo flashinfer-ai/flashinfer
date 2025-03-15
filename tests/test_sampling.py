@@ -51,7 +51,7 @@ def gumbel_distribution(beta):
 @pytest.mark.parametrize("zero_ratio", [0.0, 0.5, 0.9])
 def test_sampling_freq(vocab_size, distribution, zero_ratio):
     torch.manual_seed(42)
-    num_trials = 1000000
+    num_trials = 5000000
     logits = distribution((1, vocab_size), "cuda:0")
     zero_indices = torch.randperm(vocab_size)[: int(vocab_size * zero_ratio)]
     logits[:, zero_indices] = -float("inf")
@@ -81,6 +81,7 @@ def test_sampling_freq(vocab_size, distribution, zero_ratio):
 )
 @pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
 def test_top_p_sampling_freq(vocab_size, distribution, p):
+    # use torch profiler to check the performance of the code
     torch.manual_seed(42)
     logits = distribution((1, vocab_size), "cuda:0")
     probs = torch.softmax(logits, dim=-1)
@@ -91,7 +92,7 @@ def test_top_p_sampling_freq(vocab_size, distribution, p):
 
     renorm_probs = flashinfer.sampling.top_p_renorm_probs(probs, p)
     counter = torch.zeros(vocab_size, dtype=torch.int32, device=logits.device)
-    num_trials = 1000000
+    num_trials = 5000000
     samples = flashinfer.sampling.top_p_sampling_from_probs(
         probs,
         p,
@@ -127,7 +128,7 @@ def test_top_k_sampling_freq(vocab_size, distribution, k):
 
     renorm_probs = flashinfer.sampling.top_k_renorm_probs(probs, k)
     counter = torch.zeros(vocab_size, dtype=torch.int32, device=logits.device)
-    num_trials = 1000000
+    num_trials = 5000000
     samples = flashinfer.sampling.top_k_sampling_from_probs(
         probs,
         k,
@@ -472,15 +473,15 @@ def test_chain_speculative_sampling(
 
 
 if __name__ == "__main__":
-    test_sampling_freq(128256, gumbel_distribution(0.1), 0.5)
+    # test_sampling_freq(128256, gumbel_distribution(0.1), 0.5)
     test_top_p_sampling_freq(128256, gumbel_distribution(0.1), 0.5)
-    test_top_k_sampling_freq(1, 128256, 10)
-    test_sampling(19, 500)
-    test_sampling(1, 111)
-    test_top_p_sampling(3, 111, 0.9)
-    test_top_k_sampling(3, 111, 10)
-    test_top_p_renorm_probs(3, 111, 0.9)
-    test_top_k_renorm_probs(3, 111, 10)
-    test_top_k_mask_logits(99, 989, 10)
-    test_chain_speculative_sampling(3, 111, 3, False)
-    test_chain_speculative_sampling(3, 111, 3, True)
+    # test_top_k_sampling_freq(1, 128256, 10)
+    # test_sampling(19, 500)
+    # test_sampling(1, 111)
+    # test_top_p_sampling(3, 111, 0.9)
+    # test_top_k_sampling(3, 111, 10)
+    # test_top_p_renorm_probs(3, 111, 0.9)
+    # test_top_k_renorm_probs(3, 111, 10)
+    # test_top_k_mask_logits(99, 989, 10)
+    # test_chain_speculative_sampling(3, 111, 3, False)
+    # test_chain_speculative_sampling(3, 111, 3, True)
