@@ -58,40 +58,41 @@ cudaError_t CutlassSegmentGEMMRun(void* workspace_buffer, size_t workspace_buffe
   DISPATCH_WEIGHT_LAYOUT(weight_column_major, WEIGHT_LAYOUT, {
     DISPATCH_SMEM_CONFIG(smem_limit_per_sm, NUM_STAGES, {
       using ShapeMMAThreadBlock =  // TODO: cutlass::gemm::GemmShape<CTA_M, CTA_N, CTA_K>;
-      using ShapeMMAWarp = // TODO:cutlass::gemm::GemmShape<WARP_M, WARP_N, WARP_K>;
-      using ShapeMMAOp = //TODO: cutlass::gemm::GemmShape<16, 8, 16>;
+          using ShapeMMAWarp =     // TODO:cutlass::gemm::GemmShape<WARP_M, WARP_N, WARP_K>;
+          using ShapeMMAOp =       // TODO: cutlass::gemm::GemmShape<16, 8, 16>;
 
-      using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
-          DType,                      // Element A
-          cutlass::layout::RowMajor,  // Layout A
-          cutlass::ComplexTransform::kNone,  //
-          8,                          // Granularity A
-          DType,                      // Element B
-          WEIGHT_LAYOUT,              // Layout B
-          cutlass::ComplexTransform::kNone,  //
-          8,                          // Granularity B
-          DType,                      // Element C&D
-          cutlass::layout::RowMajor,  // Layout C&D
-          float,                      // Element Accumulator
-          cutlass::arch::OpClassTensorOp,  // Operator Class Tag
-          cutlass::arch::Sm80,        // Architecture
-          ShapeMMAThreadBlock,        // Thread Block Shape
-          ShapeMMAWarp,               // Warp Shape
-          ShapeMMAOp,                 // Instruction Shape
-          cutlass::epilogue::thread::LinearCombination<DType, 8, float, float>,  // Epilogue
-          cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,  // Swizzling Operator
-          NUM_STAGES                  // Stages
-          >::GemmKernel;
+          using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
+              DType,                             // Element A
+              cutlass::layout::RowMajor,         // Layout A
+              cutlass::ComplexTransform::kNone,  //
+              8,                                 // Granularity A
+              DType,                             // Element B
+              WEIGHT_LAYOUT,                     // Layout B
+              cutlass::ComplexTransform::kNone,  //
+              8,                                 // Granularity B
+              DType,                             // Element C&D
+              cutlass::layout::RowMajor,         // Layout C&D
+              float,                             // Element Accumulator
+              cutlass::arch::OpClassTensorOp,    // Operator Class Tag
+              cutlass::arch::Sm80,               // Architecture
+              ShapeMMAThreadBlock,               // Thread Block Shape
+              ShapeMMAWarp,                      // Warp Shape
+              ShapeMMAOp,                        // Instruction Shape
+              cutlass::epilogue::thread::LinearCombination<DType, 8, float, float>,  // Epilogue
+              cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,     // Swizzling
+                                                                                     // Operator
+              NUM_STAGES                                                             // Stages
+              >::GemmKernel;
 
       using EpilogueOutputOp = typename GemmKernel::Epilogue::OutputOp;
       typename EpilogueOutputOp::Params epilogue_op(1.0, 1.0);
       using GemmGrouped = cutlass::gemm::device::GemmGrouped<GemmKernel>;
       typename GemmGrouped::Arguments args(
           reinterpret_cast<cutlass::gemm::GemmCoord*>(all_problems), (int)batch_size,
-          /*threadblock_count=*/cta_count, epilogue_op, static_cast<DType**>(x), static_cast<DType**>(w),
-          static_cast<DType**>(y), static_cast<DType**>(y), reinterpret_cast<int64_t*>(x_ld),
-          reinterpret_cast<int64_t*>(w_ld), reinterpret_cast<int64_t*>(y_ld),
-          reinterpret_cast<int64_t*>(y_ld));
+          /*threadblock_count=*/cta_count, epilogue_op, static_cast<DType**>(x),
+          static_cast<DType**>(w), static_cast<DType**>(y), static_cast<DType**>(y),
+          reinterpret_cast<int64_t*>(x_ld), reinterpret_cast<int64_t*>(w_ld),
+          reinterpret_cast<int64_t*>(y_ld), reinterpret_cast<int64_t*>(y_ld));
 
       GemmGrouped gemm;
       auto status = gemm.initialize(args, nullptr, stream);
