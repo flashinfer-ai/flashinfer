@@ -37,7 +37,7 @@ void CutlassSegmentGEMMSM90(at::Tensor float_workspace_buffer, at::Tensor int_wo
         int_workspace_buffer.data_ptr(),
         int_workspace_buffer.element_size() * int_workspace_buffer.size(0), all_problems.data_ptr(),
         batch_size, x_ptr.data_ptr(), w_ptr.data_ptr(), y_ptr.data_ptr(), x_stride.data_ptr(),
-        weight_stride.data_ptr(), y_stride.data_ptr(), weight_column_major, sm_count, stream);
+        weight_stride.data_ptr(), y_stride.data_ptr(), weight_column_major, cta_count, stream);
     TORCH_CHECK(status == cudaSuccess,
                 "Failed to run CutlassSegmentGEMM: ", cudaGetErrorString(status));
     return true;
