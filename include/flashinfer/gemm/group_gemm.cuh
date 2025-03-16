@@ -47,7 +47,7 @@ template <typename DType>
 cudaError_t CutlassSegmentGEMMRun(void* workspace_buffer, size_t workspace_buffer_size_in_bytes,
                                   void* all_problems, int64_t batch_size, void* x, void* w, void* y,
                                   void* x_ld, void* w_ld, void* y_ld, bool weight_column_major,
-                                  cudaStream_t stream) {
+                                  int64_t cta_count, cudaStream_t stream) {
   using cutlass::epilogue::thread::LinearCombination;
   using cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle;
   int device;
@@ -57,26 +57,30 @@ cudaError_t CutlassSegmentGEMMRun(void* workspace_buffer, size_t workspace_buffe
 
   DISPATCH_WEIGHT_LAYOUT(weight_column_major, WEIGHT_LAYOUT, {
     DISPATCH_SMEM_CONFIG(smem_limit_per_sm, NUM_STAGES, {
+      using ShapeMMAThreadBlock =  // TODO: cutlass::gemm::GemmShape<CTA_M, CTA_N, CTA_K>;
+      using ShapeMMAWarp = // TODO:cutlass::gemm::GemmShape<WARP_M, WARP_N, WARP_K>;
+      using ShapeMMAOp = //TODO: cutlass::gemm::GemmShape<16, 8, 16>;
+
       using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
-          DType,                                   // Element A
-          cutlass::layout::RowMajor,               // Layout A
-          cutlass::ComplexTransform::kNone,        //
-          8,                                       // Granularity A
-          DType,                                   // Element B
-          WEIGHT_LAYOUT,                           // Layout B
-          cutlass::ComplexTransform::kNone,        //
-          8,                                       // Granularity B
-          DType,                                   // Element C&D
-          cutlass::layout::RowMajor,               // Layout C&D
-          float,                                   // Element Accumulator
-          cutlass::arch::OpClassTensorOp,          // Operator Class Tag
-          cutlass::arch::Sm80,                     // Architecture
-          cutlass::gemm::GemmShape<128, 128, 32>,  // Thread Block Shape
-          cutlass::gemm::GemmShape<64, 64, 32>,    // Warp Shape
-          cutlass::gemm::GemmShape<16, 8, 16>,     // Instruction Shape
+          DType,                      // Element A
+          cutlass::layout::RowMajor,  // Layout A
+          cutlass::ComplexTransform::kNone,  //
+          8,                          // Granularity A
+          DType,                      // Element B
+          WEIGHT_LAYOUT,              // Layout B
+          cutlass::ComplexTransform::kNone,  //
+          8,                          // Granularity B
+          DType,                      // Element C&D
+          cutlass::layout::RowMajor,  // Layout C&D
+          float,                      // Element Accumulator
+          cutlass::arch::OpClassTensorOp,  // Operator Class Tag
+          cutlass::arch::Sm80,        // Architecture
+          ShapeMMAThreadBlock,        // Thread Block Shape
+          ShapeMMAWarp,               // Warp Shape
+          ShapeMMAOp,                 // Instruction Shape
           cutlass::epilogue::thread::LinearCombination<DType, 8, float, float>,  // Epilogue
           cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,  // Swizzling Operator
-          NUM_STAGES                                                          // Stages
+          NUM_STAGES                  // Stages
           >::GemmKernel;
 
       using EpilogueOutputOp = typename GemmKernel::Epilogue::OutputOp;
@@ -84,7 +88,7 @@ cudaError_t CutlassSegmentGEMMRun(void* workspace_buffer, size_t workspace_buffe
       using GemmGrouped = cutlass::gemm::device::GemmGrouped<GemmKernel>;
       typename GemmGrouped::Arguments args(
           reinterpret_cast<cutlass::gemm::GemmCoord*>(all_problems), (int)batch_size,
-          /*threadblock_count=*/4, epilogue_op, static_cast<DType**>(x), static_cast<DType**>(w),
+          /*threadblock_count=*/cta_count, epilogue_op, static_cast<DType**>(x), static_cast<DType**>(w),
           static_cast<DType**>(y), static_cast<DType**>(y), reinterpret_cast<int64_t*>(x_ld),
           reinterpret_cast<int64_t*>(w_ld), reinterpret_cast<int64_t*>(y_ld),
           reinterpret_cast<int64_t*>(y_ld));

@@ -103,6 +103,7 @@ def get_gemm_module():
             y: torch.Tensor,
             empty_x_data: torch.Tensor,
             weight_column_major: bool,
+            cta_count: int,
         ) -> None:
             with x_data.device as device:
                 module.cutlass_segment_gemm(
@@ -116,6 +117,7 @@ def get_gemm_module():
                     y_ld,
                     empty_x_data,
                     weight_column_major,
+                    cta_count,
                     get_cuda_stream(device),
                 )
 
@@ -132,6 +134,7 @@ def get_gemm_module():
             y: torch.Tensor,
             empty_x_data: torch.Tensor,
             weight_column_major: bool,
+            cta_count: int,
         ) -> None:
             pass
 
@@ -180,6 +183,7 @@ def get_gemm_sm90_module():
             y: torch.Tensor,
             empty_x_data: torch.Tensor,
             weight_column_major: bool,
+            cta_count: int,
         ) -> None:
             with x_data.device as device:
                 module.cutlass_segment_gemm_sm90(
@@ -194,6 +198,7 @@ def get_gemm_sm90_module():
                     y_stride,
                     empty_x_data,
                     weight_column_major,
+                    cta_count,
                     get_cuda_stream(device),
                 )
 
@@ -211,6 +216,7 @@ def get_gemm_sm90_module():
             y: torch.Tensor,
             empty_x_data: torch.Tensor,
             weight_column_major: bool,
+            cta_count: int,
         ) -> None:
             pass
 
@@ -361,6 +367,8 @@ class SegmentGEMMWrapper:
     >>> x = torch.randn(10, 128, device="cuda", dtype=torch.float16)
     >>> # create weight tensor with 4 weights, each with 128 input and 256 output channels, column major
     >>> weights = torch.randn(4, 256, 128, device="cuda", dtype=torch.float16)
+    >>> # plan the ctas to run the segment GEMM kernel
+    >>> segment_gemm.plan(16)
     >>> # compute the segment GEMM
     >>> y = segment_gemm.run(x, weights, 4, True, seg_lens=seq_lens)
     >>> y.shape
@@ -428,6 +436,19 @@ class SegmentGEMMWrapper:
         """
         self._float_workspace_buffer = float_workspace_buffer
         self._int_workspace_buffer = int_workspace_buffer
+    
+    def plan(self, cta_count: int) -> None:
+        r"""Plan the segment GEMM kernel.
+
+        Parameters
+        ----------
+        cta_count : int
+            The number of SMs to use for the GEMM operation.
+            Call this function before running the segment GEMM kernel.
+        """
+        if cta_count <= 0:
+            raise ValueError("cta_count must be greater than 0")
+        self.cta_count = cta_count
 
     def run(
         self,
@@ -545,6 +566,7 @@ class SegmentGEMMWrapper:
                 y,  # for torch compile mutates_args
                 empty_x_data,  # for kernel type dispatch
                 weight_column_major,
+                self.cta_count,
             )
         elif backend == "sm80":
             (
@@ -576,6 +598,7 @@ class SegmentGEMMWrapper:
                 y,
                 empty_x_data,
                 weight_column_major,
+                self.cta_count,
             )
         else:
             raise ValueError(f"Unsupported gemm backend: {backend}")
