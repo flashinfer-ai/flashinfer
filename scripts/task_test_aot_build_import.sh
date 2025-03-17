@@ -11,4 +11,8 @@ python -m build --wheel
 pip install dist/*.whl
 
 # test import
+mkdir -p tmp
+cd tmp
+python -c "import flashinfer.flashinfer_kernels"
+python -c "import flashinfer.flashinfer_kernels_sm90"
 python -c "import flashinfer"

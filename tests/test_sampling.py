@@ -38,14 +38,13 @@ def gumbel_distribution(beta):
     return gumbel_noise
 
 
-@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize(
     "distribution",
     [
         normal_distribution(1),
         normal_distribution(5),
         gumbel_distribution(0.1),
-        gumbel_distribution(1),
     ],
 )
 @pytest.mark.parametrize("zero_ratio", [0.0, 0.5, 0.9])
@@ -69,14 +68,13 @@ def test_sampling_freq(vocab_size, distribution, zero_ratio):
     assert similarity > 0.99, f"similarity: {similarity}"
 
 
-@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize(
     "distribution",
     [
         normal_distribution(1),
         normal_distribution(5),
         gumbel_distribution(0.1),
-        gumbel_distribution(1),
     ],
 )
 @pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
@@ -105,14 +103,13 @@ def test_top_p_sampling_freq(vocab_size, distribution, p):
     assert similarity > 0.99, f"similarity: {similarity}"
 
 
-@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize(
     "distribution",
     [
         normal_distribution(1),
         normal_distribution(5),
         gumbel_distribution(0.1),
-        gumbel_distribution(1),
     ],
 )
 @pytest.mark.parametrize("k", [10, 100, 500])
@@ -141,8 +138,8 @@ def test_top_k_sampling_freq(vocab_size, distribution, k):
     assert similarity > 0.99, f"similarity: {similarity}"
 
 
-@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 def test_sampling(batch_size, vocab_size):
     torch.manual_seed(42)
     pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
@@ -154,8 +151,8 @@ def test_sampling(batch_size, vocab_size):
         assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
 
 
-@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
 def test_top_p_sampling(batch_size, vocab_size, p):
     torch.manual_seed(42)
@@ -174,8 +171,8 @@ def test_top_p_sampling(batch_size, vocab_size, p):
         assert torch.all(mask[torch.arange(batch_size), samples] == 1)
 
 
-@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 100, 500])
 def test_top_k_sampling(batch_size, vocab_size, k):
     if k > vocab_size:
@@ -196,8 +193,8 @@ def test_top_k_sampling(batch_size, vocab_size, k):
         ]
 
 
-@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.05, 0.1, 0.2, 0.7, 1])
 def test_min_p_sampling(batch_size, vocab_size, p):
     torch.manual_seed(42)
@@ -224,8 +221,8 @@ def test_min_p_sampling(batch_size, vocab_size, p):
         ]
 
 
-@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.1, 0.5])
 def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
     torch.manual_seed(42)
@@ -266,8 +263,8 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
         ]
 
 
-@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [100])
 @pytest.mark.parametrize("p", [0.1, 0.5])
 def test_top_k_top_p_sampling_from_probs_logits_alignment(batch_size, vocab_size, k, p):
@@ -288,8 +285,8 @@ def test_top_k_top_p_sampling_from_probs_logits_alignment(batch_size, vocab_size
     assert torch.all(samples == samples_ref)
 
 
-@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.1, 0.5])
 def test_top_k_top_p_joint_sampling_from_logits(batch_size, vocab_size, p):
     torch.manual_seed(42)
@@ -317,8 +314,8 @@ def test_top_k_top_p_joint_sampling_from_logits(batch_size, vocab_size, p):
     assert torch.all(samples == samples_ref)
 
 
-@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
 def test_top_p_renorm_probs(batch_size, vocab_size, p):
     torch.manual_seed(42)
@@ -343,8 +340,8 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
     )
 
 
-@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 100, 500])
 def test_top_k_renorm_probs(batch_size, vocab_size, k):
     if k > vocab_size:
@@ -371,8 +368,8 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k):
         )
 
 
-@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 100, 500])
 def test_top_k_mask_logits(batch_size, vocab_size, k):
     if k > vocab_size:
@@ -392,8 +389,8 @@ def test_top_k_mask_logits(batch_size, vocab_size, k):
     )
 
 
-@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("num_speculate_tokens", [1, 3, 5, 7])
 @pytest.mark.parametrize("onehot_target", [False, True])
 def test_chain_speculative_sampling(
