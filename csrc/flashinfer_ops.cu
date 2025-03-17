@@ -284,7 +284,8 @@ TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("batch_prefill_with_paged_kv_cache_run", BatchPrefillWithPagedKVCacheRun);
 
   // pod-attention
-  m.def("pod_with_kv_cache_tensor", pod_with_kv_cache_tensor);
+  // Temporarily disabled because we don't generate the implementation yet.
+  // m.def("pod_with_kv_cache_tensor", pod_with_kv_cache_tensor);
 
   // quantization
   // GPU packbits operator
