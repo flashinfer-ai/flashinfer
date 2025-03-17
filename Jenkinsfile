@@ -139,7 +139,7 @@ stage('Unittest') {
         }
       }
     },
-    'GPU-G5-Test-4': {
+    'JIT-Unittest-4': {
       node('GPU-G5-SPOT') {
         ws(per_exec_ws('flashinfer-unittest')) {
           init_git(true) // we need cutlass submodule
