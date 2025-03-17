@@ -1503,7 +1503,6 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
     int max_smem_per_sm = 0;
     FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
         &max_smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
-    max_smem_per_sm = 100000;
     // we expect each sm execute two threadblocks
     const int num_ctas_per_sm =
         max_smem_per_sm >= 2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) +
