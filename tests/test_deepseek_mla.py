@@ -278,7 +278,7 @@ def generate_kv_from_cache(ckv, kpe, kv_len, batch_size, num_heads):
 @pytest.mark.parametrize("num_heads", [16, 64])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("page_size", [1])
-@pytest.mark.parametrize("backend", ["fa3"])
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
 @pytest.mark.parametrize("dtype", [torch.half])
 def test_batch_mla_varlen_page_attention(
     batch_size,
@@ -292,7 +292,7 @@ def test_batch_mla_varlen_page_attention(
     backend,
     dtype,
 ):
-    if "backend" == "fa3" and not is_sm90a_supported(torch.device("cuda")):
+    if backend == "fa3" and not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("FA3 is not supported on this device")
     if causal and qo_len > min(kv_len_0, kv_len_1, kv_len_2):
         pytest.skip("qo_len > kv_len not supported for causal attention")
