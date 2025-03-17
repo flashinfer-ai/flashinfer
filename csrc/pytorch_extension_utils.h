@@ -49,6 +49,10 @@
         -1,    /* size of per-interpreter state of the module,            \
                   or -1 if the module keeps state in global variables. */ \
         NULL,  /* methods */                                              \
+        NULL,  /* slots */                                                \
+        NULL,  /* traverse */                                             \
+        NULL,  /* clear */                                                \
+        NULL,  /* free */                                                 \
     };                                                                    \
     return PyModule_Create(&module_def);                                  \
   }                                                                       \
