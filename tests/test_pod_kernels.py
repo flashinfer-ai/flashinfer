@@ -82,7 +82,6 @@ def warmup_jit():
 @pytest.mark.parametrize("kv_len_d", [127, 12288])
 @pytest.mark.parametrize("page_size_d", [1, 16])
 @pytest.mark.parametrize("kv_layout_d", ["NHD"])
-@pytest.mark.parametrize("use_tensor", [True])
 @pytest.mark.parametrize("num_kv_heads", [8])
 @pytest.mark.parametrize("num_qo_heads", [8, 32])
 @pytest.mark.parametrize("head_dim", [128])
@@ -100,7 +99,6 @@ def test_pod_with_paged_kv_cache(
     kv_len_d,
     page_size_d,
     kv_layout_d,
-    use_tensor,
     # Shared params
     num_kv_heads,
     num_qo_heads,
@@ -177,7 +175,7 @@ def test_pod_with_paged_kv_cache(
         32 * 1024 * 1024, device="cuda:0", dtype=torch.int8
     )
     decode_wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
-        decode_workspace_buffer, kv_layout_d, use_tensor_cores=True
+        decode_workspace_buffer, kv_layout_d
     )
     decode_wrapper.plan(
         kv_indptr_d,
@@ -197,7 +195,6 @@ def test_pod_with_paged_kv_cache(
     pod_wrapper = flashinfer.PODWithPagedKVCacheWrapper(
         workspace_buffer,
         kv_layout_d,
-        use_tensor_cores=use_tensor,
     )
     pod_wrapper.plan(
         kv_indptr_d,
@@ -242,7 +239,6 @@ if __name__ == "__main__":
         12288,
         16,
         "NHD",
-        True,
         # Other shared params
         8,
         8,
@@ -262,7 +258,6 @@ if __name__ == "__main__":
         12288,
         16,
         "NHD",
-        True,
         # Other shared params
         4,
         16,
@@ -282,7 +277,6 @@ if __name__ == "__main__":
         12288,
         16,
         "NHD",
-        True,
         # Other shared params
         4,
         16,

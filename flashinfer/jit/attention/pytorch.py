@@ -643,7 +643,7 @@ def gen_customize_pod_module(
             write_if_different(dest_path, source)
 
     for filename in [
-        "pod_tensor.cu",
+        "pod.cu",
         "pod_jit_pybind.cu",
     ]:
         src_path = FLASHINFER_CSRC_DIR / filename
