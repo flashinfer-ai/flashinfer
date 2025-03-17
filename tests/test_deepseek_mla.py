@@ -486,7 +486,7 @@ def test_batch_mla_oob_kv_nan(
 
 
 @pytest.mark.parametrize("batch_size", [1, 3, 5, 7, 157])
-@pytest.mark.parametrize("kv_len", [0, 17, 33, 97, 114, 514, 1024])
+@pytest.mark.parametrize("kv_len", [0, 17, 33, 96, 97, 114, 514, 1024])
 @pytest.mark.parametrize("qo_len", [1, 3, 5, 7, 9, 11, 13, 15, 17])
 @pytest.mark.parametrize("num_heads", [16])
 @pytest.mark.parametrize("causal", [False, True])
