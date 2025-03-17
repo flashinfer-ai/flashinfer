@@ -198,8 +198,7 @@ __device__ __forceinline__ void load_kv(
   if constexpr (KTraits::NUM_MMA_KV == 1) {
     if (warpgroup_idx == 0) {
       uint32_t q, r;
-      uint32_t packed_block_iter =
-          packed_block_iter_base + lane_idx / 8 + lane_idx / 8 + warp_idx_in_wg * 4;
+      uint32_t packed_block_iter = packed_block_iter_base + lane_idx / 8 + warp_idx_in_wg * 4;
       block_size.divmod(packed_block_iter, q, r);
 
       DTypeKV* ckv_ptr = ckv +

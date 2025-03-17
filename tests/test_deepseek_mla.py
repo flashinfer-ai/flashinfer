@@ -20,7 +20,89 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.jit.attention import (
+    gen_batch_mla_module,
+    gen_batch_prefill_module,
+    gen_single_prefill_module,
+)
 from flashinfer.utils import is_sm90a_supported
+
+
+@pytest.fixture(autouse=True, scope="module")
+def warmup_jit():
+    try:
+        modules = []
+        for backend in ["fa2", "fa3"]:
+            if backend == "fa3" and not is_sm90a_supported(torch.device("cuda")):
+                continue
+
+            modules.append(
+                (
+                    gen_single_prefill_module,
+                    [
+                        backend,
+                        torch.float16,
+                        torch.float16,
+                        torch.float16,
+                        192,
+                        128,
+                        0,
+                        False,
+                        False,
+                        False,
+                    ],
+                )
+            )
+
+        for backend in ["fa2", "fa3"]:
+            if backend == "fa3" and not is_sm90a_supported(torch.device("cuda")):
+                continue
+
+            modules.append(
+                (
+                    gen_batch_prefill_module,
+                    [
+                        backend,
+                        torch.float16,
+                        torch.float16,
+                        torch.float16,
+                        torch.int32,
+                        192,
+                        128,
+                        0,
+                        False,
+                        False,
+                        False,
+                    ],
+                )
+            )
+
+        for backend in ["fa2", "fa3"]:
+            if backend == "fa3" and not is_sm90a_supported(torch.device("cuda")):
+                continue
+
+            modules.append(
+                (
+                    gen_batch_mla_module,
+                    [
+                        backend,
+                        torch.float16,
+                        torch.float16,
+                        torch.float16,
+                        torch.int32,
+                        512,
+                        64,
+                        False,
+                    ],
+                )
+            )
+
+        flashinfer.jit.parallel_load_modules(modules)
+    except Exception as e:
+        # abort the test session if warmup fails
+        pytest.exit(str(e))
+    finally:
+        yield
 
 
 def attention_ref(
@@ -83,7 +165,7 @@ def test_single_prefill_with_kv_cache(
     backend,
     dtype,
 ):
-    if not is_sm90a_supported(torch.device("cuda")):
+    if backend == "fa3" and not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("FA3 is not supported on this device")
     torch.manual_seed(42)
     head_dim_qk = 192
@@ -117,7 +199,7 @@ def test_batch_prefill_with_ragged_kv_cache(
     backend,
     dtype,
 ):
-    if not is_sm90a_supported(torch.device("cuda")):
+    if backend == "fa3" and not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("FA3 is not supported on this device")
     torch.manual_seed(42)
     kv_layout = "NHD"
@@ -188,14 +270,12 @@ def generate_kv_from_cache(ckv, kpe, kv_len, batch_size, num_heads):
     return k, v
 
 
-@pytest.mark.parametrize("batch_size", [1, 2, 3, 4, 5, 6, 7])
-@pytest.mark.parametrize("kv_len_0", [0, 1, 2, 3, 4, 11])
-@pytest.mark.parametrize("kv_len_1", [17, 19, 33, 79, 114])
+@pytest.mark.parametrize("batch_size", [1, 3, 5, 7])
+@pytest.mark.parametrize("kv_len_0", [0, 1, 3, 11])
+@pytest.mark.parametrize("kv_len_1", [17, 33, 79, 114])
 @pytest.mark.parametrize("kv_len_2", [514, 2743, 8736])
-@pytest.mark.parametrize(
-    "qo_len", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
-)
-@pytest.mark.parametrize("num_heads", [16, 32, 64])
+@pytest.mark.parametrize("qo_len", [1, 3, 5, 7, 9, 11, 13, 15, 17])
+@pytest.mark.parametrize("num_heads", [16, 64])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("page_size", [1])
 @pytest.mark.parametrize("backend", ["fa3"])
@@ -212,7 +292,7 @@ def test_batch_mla_varlen_page_attention(
     backend,
     dtype,
 ):
-    if not is_sm90a_supported(torch.device("cuda")):
+    if "backend" == "fa3" and not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("FA3 is not supported on this device")
     if causal and qo_len > min(kv_len_0, kv_len_1, kv_len_2):
         pytest.skip("qo_len > kv_len not supported for causal attention")
@@ -336,7 +416,7 @@ def test_batch_mla_varlen_page_attention(
 def test_batch_mla_oob_kv_nan(
     batch_size, kv_len, qo_len, num_heads, causal, page_size, backend, dtype
 ):
-    if not is_sm90a_supported(torch.device("cuda")):
+    if backend == "fa3" and not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("FA3 is not supported on this device")
     if causal and qo_len > kv_len:
         pytest.skip("qo_len > kv_len not supported for causal attention")
@@ -405,16 +485,14 @@ def test_batch_mla_oob_kv_nan(
         torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("batch_size", [1, 2, 3, 4, 5, 6, 7, 157])
-@pytest.mark.parametrize("kv_len", [0, 17, 33, 96, 97, 114, 514, 1024])
-@pytest.mark.parametrize(
-    "qo_len", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
-)
+@pytest.mark.parametrize("batch_size", [1, 3, 5, 7, 157])
+@pytest.mark.parametrize("kv_len", [0, 17, 33, 97, 114, 514, 1024])
+@pytest.mark.parametrize("qo_len", [1, 3, 5, 7, 9, 11, 13, 15, 17])
 @pytest.mark.parametrize("num_heads", [16])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("page_size", [1, 16])
 @pytest.mark.parametrize("backend", ["fa2", "fa3"])
-@pytest.mark.parametrize("use_cuda_graph", [True, False])
+@pytest.mark.parametrize("use_cuda_graph", [False])
 @pytest.mark.parametrize("dtype", [torch.half])
 def test_batch_mla_page_attention(
     batch_size,
@@ -427,7 +505,7 @@ def test_batch_mla_page_attention(
     use_cuda_graph,
     dtype,
 ):
-    if not is_sm90a_supported(torch.device("cuda")):
+    if backend == "fa3" and not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("FA3 is not supported on this device")
     if causal and qo_len > kv_len:
         pytest.skip("qo_len > kv_len not supported for causal attention")

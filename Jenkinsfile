@@ -106,6 +106,16 @@ stage('JIT Unittest') {
           sh(script: "${docker_run} ./scripts/task_jit_run_tests_part2.sh", label: 'JIT Unittest Part 2')
         }
       }
+    },
+    'GPU-G5-Test-4': {
+      node('GPU-G5-SPOT') {
+        ws(per_exec_ws('flashinfer-unittest')) {
+          init_git(true) // we need cutlass submodule
+          sh(script: "ls -alh", label: 'Show work directory')
+          sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
+          sh(script: "${docker_run} ./scripts/task_jit_run_tests_part4.sh", label: 'JIT Unittest Part 4')
+        }
+      }
     }
   )
 }
