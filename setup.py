@@ -244,7 +244,6 @@ if enable_aot:
         "csrc/single_decode.cu",
         "csrc/single_prefill.cu",
         "csrc/flashinfer_ops.cu",
-        "csrc/pod_tensor.cu",
     ]
     kernel_sm90_sources = [
         "csrc/group_gemm_sm90.cu",

@@ -67,16 +67,11 @@ def get_pod_module(*args):
             _kernels = torch.ops.flashinfer_kernels
             # torch library for pod_with_kv_cache
             # No tensor deprecated due to poor performance. Just use tensor cores for both.
-            # run_no_tensor = _kernels.pod_with_kv_cache_no_tensor
-            run_no_tensor = _kernels.pod_with_kv_cache_tensor
             run_tensor = _kernels.pod_with_kv_cache_tensor
         else:
-            run_no_tensor = gen_pod_module(*args).pod_with_kv_cache_tensor
-            run_tensor = run_no_tensor
+            run_tensor = gen_pod_module(*args).pod_with_kv_cache_tensor
         # Register the module
-        _pod_modules[args] = SimpleNamespace(
-            run_no_tensor=run_no_tensor, run_tensor=run_tensor
-        )
+        _pod_modules[args] = SimpleNamespace(run_tensor=run_tensor)
     return _pod_modules[args]
 
 
@@ -150,7 +145,6 @@ class PODWithPagedKVCacheWrapper:
         self,
         float_workspace_buffer: torch.Tensor,
         kv_layout: str = "NHD",
-        use_tensor_cores: bool = True,
         use_cuda_graph: bool = False,
         paged_kv_indptr_buffer: Optional[torch.Tensor] = None,
         paged_kv_indices_buffer: Optional[torch.Tensor] = None,
@@ -251,18 +245,13 @@ class PODWithPagedKVCacheWrapper:
         self._use_tensor_cores = use_tensor_cores
         self._use_cuda_graph = use_cuda_graph
 
-        if use_tensor_cores:
-            if use_cuda_graph:
-                # NOTE(Zihao): if once created, no need to update it in plan/run
-                self._qo_indptr_buf = torch.arange(
-                    self._fixed_batch_size + 1,
-                    dtype=torch.int32,
-                    device=float_workspace_buffer.device,
-                )
-
-    @property
-    def use_tensor_cores(self) -> bool:
-        return self._use_tensor_cores
+        if use_cuda_graph:
+            # NOTE(Zihao): if once created, no need to update it in plan/run
+            self._qo_indptr_buf = torch.arange(
+                self._fixed_batch_size + 1,
+                dtype=torch.int32,
+                device=float_workspace_buffer.device,
+            )
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -418,76 +407,42 @@ class PODWithPagedKVCacheWrapper:
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
-        if self._use_tensor_cores:
-            kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
-            if self._jit_module is not None:
-                self._cached_module = self._jit_module
-            else:
-                self._cached_module = get_batch_prefill_module("fa2")(
-                    q_data_type,
-                    kv_data_type,
-                    q_data_type,
-                    indptr.dtype,
-                    head_dim,  # head_dim_qk
-                    head_dim,  # head_dim_vo
-                    PosEncodingMode[pos_encoding_mode].value,
-                    window_left != -1,  # use_sliding_window
-                    logits_soft_cap > 0,  # use_logits_soft_cap
-                    False,  # use_fp16_qk_reduction
-                )
-            with self.device as device:
-                self._plan_info = self._cached_module.plan(
-                    self._float_workspace_buffer,
-                    self._int_workspace_buffer,
-                    self._pin_memory_int_workspace_buffer,
-                    qo_indptr_host,
-                    indptr_host,
-                    kv_lens_arr_host,
-                    batch_size,  # total_num_rows
-                    batch_size,
-                    num_qo_heads,
-                    num_kv_heads,
-                    page_size,
-                    self.is_cuda_graph_enabled,
-                    head_dim,
-                    head_dim,
-                    False,  # causal
-                    get_cuda_stream(device),
-                )
+        kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
+        if self._jit_module is not None:
+            self._cached_module = self._jit_module
         else:
-            if self._jit_module is not None:
-                self._cached_module = self._jit_module
-            else:
-                self._cached_module = get_batch_decode_module(
-                    q_data_type,
-                    kv_data_type,
-                    q_data_type,
-                    indptr.dtype,
-                    head_dim,  # head_dim_qk
-                    head_dim,  # head_dim_vo
-                    PosEncodingMode[pos_encoding_mode].value,
-                    window_left != -1,  # use_sliding_window
-                    logits_soft_cap > 0,  # use_logits_soft_cap
-                )
-            with self.device as device:
-                self._plan_info = self._cached_module.plan(
-                    self._float_workspace_buffer,
-                    self._int_workspace_buffer,
-                    self._pin_memory_int_workspace_buffer,
-                    indptr_host,
-                    batch_size,
-                    num_qo_heads,
-                    num_kv_heads,
-                    page_size,
-                    self.is_cuda_graph_enabled,
-                    window_left,
-                    logits_soft_cap,
-                    head_dim,
-                    head_dim,
-                    torch.empty(0, dtype=q_data_type),
-                    torch.empty(0, dtype=kv_data_type),
-                    get_cuda_stream(device),
-                )
+            self._cached_module = get_batch_prefill_module("fa2")(
+                q_data_type,
+                kv_data_type,
+                q_data_type,
+                indptr.dtype,
+                head_dim,  # head_dim_qk
+                head_dim,  # head_dim_vo
+                PosEncodingMode[pos_encoding_mode].value,
+                window_left != -1,  # use_sliding_window
+                logits_soft_cap > 0,  # use_logits_soft_cap
+                False,  # use_fp16_qk_reduction
+            )
+        with self.device as device:
+            self._plan_info = self._cached_module.plan(
+                self._float_workspace_buffer,
+                self._int_workspace_buffer,
+                self._pin_memory_int_workspace_buffer,
+                qo_indptr_host,
+                indptr_host,
+                kv_lens_arr_host,
+                batch_size,  # total_num_rows
+                batch_size,
+                num_qo_heads,
+                num_kv_heads,
+                page_size,
+                self.is_cuda_graph_enabled,
+                head_dim,
+                head_dim,
+                False,  # causal
+                get_cuda_stream(device),
+            )
+
         self._indptr_type = indptr.dtype
         self._pos_encoding_mode = pos_encoding_mode
         self._window_left = window_left

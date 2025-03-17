@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <flashinfer/attention/pod.cuh>
+#include <flashinfer/attention/variants.cuh>
 #include <flashinfer/pos_enc.cuh>
 #include <optional>
 
