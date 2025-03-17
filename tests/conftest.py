@@ -124,10 +124,9 @@ def pytest_configure(config):
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_call(item):
     # skip OOM error
-    assert False, "Debug here"
     try:
         item.runtest()
-    except (torch.OutOfMemoryError, RuntimeError) as e:
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
         if isinstance(e, torch.OutOfMemoryError) or "CUDA error: out of memory" in str(
             e
         ):
