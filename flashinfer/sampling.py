@@ -486,6 +486,7 @@ def top_p_sampling_from_probs(
 ) -> torch.Tensor:
     r"""Fused GPU kernel for top-p sampling (nucleus sampling) from probabilities,
     this operator implements GPU-based rejection sampling without explicit sorting.
+    Check the `blog post <https://flashinfer.ai/2025/03/10/sampling.html>`_ for more details.
 
     The multiple rounds of rejection sampling are implemented in a single CUDA kernel,
     which is more efficient than the naive implementation that launches a series of kernels.
@@ -567,6 +568,7 @@ def top_k_sampling_from_probs(
 ) -> torch.Tensor:
     r"""Fused GPU kernel for top-k sampling from probabilities,
     this operator implements GPU-based rejection sampling without explicit sorting.
+    Check the `blog post <https://flashinfer.ai/2025/03/10/sampling.html>`_ for more details.
 
     The multiple rounds of rejection sampling are implemented in a single CUDA kernel,
     which is more efficient than the naive implementation that launches a series of kernels.
@@ -649,6 +651,7 @@ def min_p_sampling_from_probs(
     r"""Fused GPU kernel for `min_p sampling <https://arxiv.org/abs/2407.01082>`_ from probabilities,
 
     this operator implements GPU-based rejection sampling without explicit sorting.
+    Check the `blog post <https://flashinfer.ai/2025/03/10/sampling.html>`_ for more details.
 
     The multiple rounds of rejection sampling are implemented in a single CUDA kernel,
     which is more efficient than the naive implementation that launches a series of kernels.
@@ -728,6 +731,7 @@ def top_k_top_p_sampling_from_logits(
     r"""Fused GPU kernel for top-k and top-p sampling from pre-softmax logits,
 
     this operator implements GPU-based rejection sampling without explicit sorting.
+    Check the `blog post <https://flashinfer.ai/2025/03/10/sampling.html>`_ for more details.
 
     The multiple rounds of rejection sampling are implemented in a single CUDA kernel,
     which is more efficient than the naive implementation that launches a series of kernels.
@@ -847,6 +851,7 @@ def top_k_top_p_sampling_from_probs(
     r"""Fused GPU kernel for top-k and top-p sampling from probabilities,
 
     this operator implements GPU-based rejection sampling without explicit sorting.
+    Check the `blog post <https://flashinfer.ai/2025/03/10/sampling.html>`_ for more details.
 
     The multiple rounds of rejection sampling are implemented in a single CUDA kernel,
     which is more efficient than the naive implementation that launches a series of kernels.
