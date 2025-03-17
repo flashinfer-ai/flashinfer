@@ -243,7 +243,7 @@ if enable_aot:
         "csrc/batch_prefill.cu",
         "csrc/single_decode.cu",
         "csrc/single_prefill.cu",
-        "csrc/pod.cu",
+        # "csrc/pod.cu",  # Temporarily disabled
         "csrc/flashinfer_ops.cu",
     ]
     kernel_sm90_sources = [
