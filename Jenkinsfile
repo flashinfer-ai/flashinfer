@@ -61,6 +61,17 @@ def unpack_lib(name, libs) {
      """
 }
 
+def cancel_previous_build() {
+  // cancel previous build if it is not on main.
+  if (env.BRANCH_NAME != 'main') {
+    def buildNumber = env.BUILD_NUMBER as int
+    // Milestone API allows us to cancel previous build
+    // with the same milestone number
+    if (buildNumber > 1) milestone(buildNumber - 1)
+    milestone(buildNumber)
+  }
+}
+
 def init_git(submodule = false) {
   cleanWs()
   // add retry in case checkout timeouts
@@ -84,10 +95,21 @@ def init_git(submodule = false) {
 //   }
 // }
 
-stage('JIT Unittest') {
+stage('Unittest') {
+  cancel_previous_build()
   parallel(
     failFast: true,
-    'GPU-G5-Test-1': {
+    'AOT-Build-Import': {
+      node('CPU-LARGE-SPOT') {
+        ws(per_exec_ws('flashinfer-aot')) {
+          init_git(true)
+          sh(script: "ls -alh", label: 'Show work directory')
+          sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
+          sh(script: "${docker_run} --no-gpu ./scripts/task_test_aot_build_import.sh", label: 'Test AOT Build and Import')
+        }
+      }
+    },
+    'JIT-Unittest-1': {
       node('GPU-G5-SPOT') {
         ws(per_exec_ws('flashinfer-unittest')) {
           init_git(true) // we need cutlass submodule
@@ -97,7 +119,7 @@ stage('JIT Unittest') {
         }
       }
     },
-    'GPU-G5-Test-2': {
+    'JIT-Unittest-2': {
       node('GPU-G5-SPOT') {
         ws(per_exec_ws('flashinfer-unittest')) {
           init_git(true) // we need cutlass submodule
@@ -107,7 +129,17 @@ stage('JIT Unittest') {
         }
       }
     },
-    'GPU-G5-Test-4': {
+    'JIT-Unittest-3': {
+      node('GPU-G5-SPOT') {
+        ws(per_exec_ws('flashinfer-unittest')) {
+          init_git(true) // we need cutlass submodule
+          sh(script: "ls -alh", label: 'Show work directory')
+          sh(script: "./scripts/task_show_node_info.sh", label: 'Show node info')
+          sh(script: "${docker_run} ./scripts/task_jit_run_tests_part3.sh", label: 'JIT Unittest Part 3')
+        }
+      }
+    },
+    'JIT-Unittest-4': {
       node('GPU-G5-SPOT') {
         ws(per_exec_ws('flashinfer-unittest')) {
           init_git(true) // we need cutlass submodule
