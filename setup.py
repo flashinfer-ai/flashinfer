@@ -169,6 +169,8 @@ if enable_aot:
         if arch < 75:
             raise RuntimeError("FlashInfer requires sm75+")
 
+    use_cxx11_abi = torch._C._GLIBCXX_USE_CXX11_ABI
+
     cuda_version = get_cuda_version()
     torch_full_version = Version(torch.__version__)
     torch_version = f"{torch_full_version.major}.{torch_full_version.minor}"
@@ -214,6 +216,8 @@ if enable_aot:
         "-Wno-switch-bool",
         "-DPy_LIMITED_API=0x03080000",
     ]
+    if use_cxx11_abi:
+        cxx_flags.append("-D_GLIBCXX_USE_CXX11_ABI=1")
     nvcc_flags = [
         "-O3",
         "-std=c++17",
@@ -223,6 +227,8 @@ if enable_aot:
         "-use_fast_math",
         "-DPy_LIMITED_API=0x03080000",
     ]
+    if use_cxx11_abi:
+        nvcc_flags.append("-D_GLIBCXX_USE_CXX11_ABI=1")
     libraries = [
         "cublas",
         "cublasLt",
