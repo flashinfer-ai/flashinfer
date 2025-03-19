@@ -34,15 +34,13 @@ void BatchPrefillWithRaggedKVCacheRun(DLTensor* float_workspace_buffer,
                                       int64_t layout, int64_t window_left ADDITIONAL_FUNC_PARAMS,
                                       TVMStreamHandle cuda_stream);
 
-void BatchPrefillWithPagedKVCacheRun(DLTensor* float_workspace_buffer,
-                                     DLTensor* int_workspace_buffer, IntTuple plan_info_vec,
-                                     DLTensor* q, DLTensor* paged_kv_cache, DLTensor* qo_indptr,
-                                     DLTensor* paged_kv_indptr, DLTensor* paged_kv_indices,
-                                     DLTensor* paged_kv_last_page_len, DLTensor* q_rope_offset,
-                                     DLTensor* paged_kv_rope_pos_offset, DLTensor* o, DLTensor* lse,
-                                     int64_t mask_mode_code, int64_t pos_encoding_mode_code,
-                                     int64_t layout, int64_t window_left ADDITIONAL_FUNC_PARAMS,
-                                     TVMStreamHandle cuda_stream);
+void BatchPrefillWithPagedKVCacheRun(
+    DLTensor* float_workspace_buffer, DLTensor* int_workspace_buffer, IntTuple plan_info_vec,
+    DLTensor* q, DLTensor* paged_kv_cache, DLTensor* qo_start_ptr, DLTensor* qo_len_ptr,
+    DLTensor* paged_kv_indptr, DLTensor* paged_kv_indices, DLTensor* paged_kv_last_page_len,
+    DLTensor* q_rope_offset, DLTensor* paged_kv_rope_pos_offset, DLTensor* o, DLTensor* lse,
+    int64_t mask_mode_code, int64_t pos_encoding_mode_code, int64_t layout,
+    int64_t window_left ADDITIONAL_FUNC_PARAMS, TVMStreamHandle cuda_stream);
 
 TVM_DLL_EXPORT_TYPED_FUNC(batch_prefill_with_kv_cache_plan, BatchPrefillWithKVCachePlan);
 TVM_DLL_EXPORT_TYPED_FUNC(batch_prefill_with_ragged_kv_cache_run, BatchPrefillWithRaggedKVCacheRun);

@@ -325,6 +325,7 @@ def get_batch_prefill_module(backend):
                 paged_k_cache: torch.Tensor,
                 paged_v_cache: torch.Tensor,
                 qo_indptr: torch.Tensor,
+                qo_len_ptr: Optional[torch.Tensor],
                 paged_kv_indptr: torch.Tensor,
                 paged_kv_indices: torch.Tensor,
                 paged_kv_last_page_len: torch.Tensor,
@@ -351,6 +352,7 @@ def get_batch_prefill_module(backend):
                             paged_k_cache,
                             paged_v_cache,
                             qo_indptr,
+                            qo_len_ptr,
                             paged_kv_indptr,
                             paged_kv_indices,
                             paged_kv_last_page_len,
@@ -1372,6 +1374,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._mask_indptr_buf.copy_(mask_indptr, non_blocking=non_blocking)
         else:
             self._qo_indptr_buf = qo_indptr.to(self.device, non_blocking=non_blocking)
+            # NOTE(Yilong): Not implemented for CUDA graph mode yet
+            # only used in FA2
+            self._qo_len_ptr_buf = torch.diff(self._qo_indptr_buf)
+
             self._paged_kv_indptr_buf = paged_kv_indptr.to(
                 self.device, non_blocking=non_blocking
             )
@@ -1653,6 +1659,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             k_cache,
             v_cache,
             self._qo_indptr_buf,
+            self._qo_len_ptr_buf,
             sparse_indptr,
             sparse_indices,
             self._paged_kv_last_page_len_buf,

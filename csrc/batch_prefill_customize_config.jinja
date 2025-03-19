@@ -86,7 +86,10 @@ struct PagedParams {
 
   DTypeQ* q;
   paged_kv_t<DTypeKV, IdType> paged_kv;
-  IdType* q_indptr;
+
+  IdType* q_start_ptr;
+  uint32_t* qo_len_ptr;
+
   DTypeO* o;
   float* lse;
   uint_fastdiv group_size;
@@ -110,7 +113,7 @@ struct PagedParams {
   bool partition_kv;
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
-    return q_indptr[batch_idx + 1] - q_indptr[batch_idx];
+    return qo_len_ptr[batch_idx];
   }
 
   __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {
