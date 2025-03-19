@@ -721,8 +721,8 @@ __device__ __forceinline__ void logits_transform(
         }
 #else
         static_assert(!std::is_same<DTypeQKAccum, __half>::value,
-          "Set -DFP16_QK_REDUCTION_SUPPORTED and install boost_math "
-          "then recompile to support fp16 reduction");
+                      "Set -DFP16_QK_REDUCTION_SUPPORTED and install boost_math "
+                      "then recompile to support fp16 reduction");
         logits = s_frag[mma_q][mma_kv][reg_id];
 #endif
         logitsTransformed = variant.LogitsTransform(params, logits, batch_idx, q_idx, kv_idx,
