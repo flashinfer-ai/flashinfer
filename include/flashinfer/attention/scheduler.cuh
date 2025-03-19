@@ -486,11 +486,11 @@ inline cudaError_t DecodePlan(void* float_buffer, size_t float_workspace_size_in
 }
 
 template <typename IdType>
-inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
-                                   uint32_t total_num_rows, uint32_t batch_size,
-                                   uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
-                                   uint32_t page_size, uint32_t max_batch_size_if_split,
-                                   bool enable_cuda_graph) {
+inline auto PrefillSplitQOKVIndptr(IdType* qo_start_ptr_h, uint32_t* qo_len_ptr_h,
+                                   IdType* kv_indptr_h, uint32_t total_num_rows,
+                                   uint32_t batch_size, uint32_t num_qo_heads,
+                                   uint32_t num_kv_heads, uint32_t head_dim, uint32_t page_size,
+                                   uint32_t max_batch_size_if_split, bool enable_cuda_graph) {
   std::vector<IdType> request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr;
   merge_indptr.push_back(0);
   o_indptr.push_back(0);
@@ -500,11 +500,10 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
   // step 1: determine packed_qo_len_arr and verify qo_indptr contents.
   std::vector<int64_t> packed_qo_len_arr(batch_size), kv_len_arr(batch_size);
   for (uint32_t i = 0; i < batch_size; ++i) {
-    packed_qo_len_arr[i] = int64_t(qo_indptr_h[i + 1] - qo_indptr_h[i]) * int64_t(gqa_group_size);
+    packed_qo_len_arr[i] = int64_t(qo_len_ptr_h[i]) * int64_t(gqa_group_size);
     if (packed_qo_len_arr[i] < 0) {
       std::ostringstream err_msg;
-      err_msg << "qo_indptr[" << i + 1 << "]" << qo_indptr_h[i + 1] << " - qo_indptr[" << i << "]"
-              << qo_indptr_h[i] << " should be non-negative";
+      err_msg << "qo_len_ptr_h[" << i << "]: " << qo_len_ptr_h[i] << " should be non-negative";
       FLASHINFER_ERROR(err_msg.str());
     }
     kv_len_arr[i] = int64_t(kv_indptr_h[i + 1] - kv_indptr_h[i]);
@@ -692,11 +691,16 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
   uint32_t max_batch_size_if_split = max_grid_size / num_kv_heads;
 
   // step 2: determine kv_chunk_size
+  // get qo_len_ptr, which is torch.diff(qo_indptr_h) in batch prefill
+  std::vector<uint32_t> qo_len_ptr;
+  for (uint32_t i = 0; i < batch_size; ++i) {
+    qo_len_ptr.push_back(qo_indptr_h[i + 1] - qo_indptr_h[i]);
+  }
   auto [split_kv, new_batch_size, padded_batch_size, cta_tile_q, kv_chunk_size, request_indices_vec,
         qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec, o_indptr_vec] =
-      PrefillSplitQOKVIndptr(qo_indptr_h, kv_indptr_h, total_num_rows, batch_size, num_qo_heads,
-                             num_kv_heads, head_dim_vo, page_size, max_batch_size_if_split,
-                             enable_cuda_graph);
+      PrefillSplitQOKVIndptr(qo_indptr_h, qo_len_ptr.data(), kv_indptr_h, total_num_rows,
+                             batch_size, num_qo_heads, num_kv_heads, head_dim_vo, page_size,
+                             max_batch_size_if_split, enable_cuda_graph);
 
   plan_info.cta_tile_q = cta_tile_q;
   plan_info.total_num_rows = total_num_rows;
