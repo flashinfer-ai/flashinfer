@@ -15,6 +15,7 @@
  */
 #ifndef FLASHINFER_PREFILL_CUH_
 #define FLASHINFER_PREFILL_CUH_
+
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -23,6 +24,9 @@
 
 #include "../cp_async.cuh"
 #include "../fastdiv.cuh"
+#ifdef FP16_QK_REDUCTION_SUPPORTED
+#include "../fp16.h"
+#endif
 #include "../frag_layout_swizzle.cuh"
 #include "../math.cuh"
 #include "../mma.cuh"
@@ -33,7 +37,6 @@
 #include "cascade.cuh"
 #include "mask.cuh"
 #include "variants.cuh"
-
 namespace flashinfer {
 
 DEFINE_HAS_MEMBER(maybe_q_rope_offset)
@@ -133,9 +136,25 @@ struct KernelTraits {
 
   using SharedStorage = SharedStorageQKVO<NUM_WARPS_KV, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_QK,
                                           HEAD_DIM_VO, DTypeQ, DTypeKV, DTypeO>;
+#ifdef FP16_QK_REDUCTION_SUPPORTED
+  template <typename DT>
+  static constexpr DT getNegInf() {
+    if constexpr (std::is_same<DT, __half>::value) {
+      return std::bit_cast<half>(fp16_ieee_from_fp32_value(-math::inf));
+    } else {
+      return static_cast<DTypeQKAccum>(-math::inf);
+    }
+  }
 
   static constexpr DTypeQKAccum MaskFillValue =
+      AttentionVariant::use_softmax ? getNegInf<DTypeQKAccum>() : DTypeQKAccum(0.f);
+#else
+  static_assert(!std::is_same<DTypeQKAccum, __half>::value,
+                "Set -DFP16_QK_REDUCTION_SUPPORTED and install boost_math "
+                "then recompile to support fp16 reduction");
+  static constexpr DTypeQKAccum MaskFillValue =
       AttentionVariant::use_softmax ? DTypeQKAccum(-math::inf) : DTypeQKAccum(0.f);
+#endif
 };
 
 namespace {
@@ -672,6 +691,8 @@ __device__ __forceinline__ void logits_transform(
     const uint32_t kv_head_idx = blockIdx.z) {
   const uint32_t lane_idx = tid.x;
   uint32_t q[KTraits::NUM_MMA_Q][2], r[KTraits::NUM_MMA_Q][2];
+  float logits = 0., logitsTransformed = 0.;
+
 #pragma unroll
   for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
 #pragma unroll
@@ -691,9 +712,31 @@ __device__ __forceinline__ void logits_transform(
                                                                     2 * (lane_idx % 4) +
                                                                     8 * (reg_id / 4) + reg_id % 2;
         const uint32_t qo_head_idx = kv_head_idx * group_size + r[mma_q][(reg_id % 4) / 2];
-        s_frag[mma_q][mma_kv][reg_id] =
-            variant.LogitsTransform(params, s_frag[mma_q][mma_kv][reg_id], batch_idx, q_idx, kv_idx,
-                                    qo_head_idx, kv_head_idx);
+
+#ifdef FP16_QK_REDUCTION_SUPPORTED
+        if constexpr (std::is_same<DTypeQKAccum, __half>::value) {
+          logits = std::bit_cast<float>(fp16_ieee_to_fp32_value(s_frag[mma_q][mma_kv][reg_id]));
+        } else if constexpr (!std::is_same<DTypeQKAccum, __half>::value) {
+          logits = s_frag[mma_q][mma_kv][reg_id];
+        }
+#else
+        static_assert(!std::is_same<DTypeQKAccum, __half>::value,
+                      "Set -DFP16_QK_REDUCTION_SUPPORTED and install boost_math "
+                      "then recompile to support fp16 reduction");
+        logits = s_frag[mma_q][mma_kv][reg_id];
+#endif
+        logitsTransformed = variant.LogitsTransform(params, logits, batch_idx, q_idx, kv_idx,
+                                                    qo_head_idx, kv_head_idx);
+#ifdef FP16_QK_REDUCTION_SUPPORTED
+        if constexpr (std::is_same<DTypeQKAccum, __half>::value) {
+          s_frag[mma_q][mma_kv][reg_id] =
+              std::bit_cast<half>(fp16_ieee_from_fp32_value(logitsTransformed));
+        } else if constexpr (!std::is_same<DTypeQKAccum, __half>::value) {
+          s_frag[mma_q][mma_kv][reg_id] = logitsTransformed;
+        }
+#else
+        s_frag[mma_q][mma_kv][reg_id] = logitsTransformed;
+#endif
       }
     }
   }

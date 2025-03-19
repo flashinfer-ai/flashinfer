@@ -3,8 +3,8 @@ project(flashinfer CUDA CXX)
 
 include(cmake/utils/Utils.cmake)
 
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CUDA_STANDARD 20)
 
 if(EXISTS ${CMAKE_BINARY_DIR}/config.cmake)
   include(${CMAKE_BINARY_DIR}/config.cmake)
@@ -63,7 +63,7 @@ flashinfer_option(FLASHINFER_GEN_HEAD_DIMS "Head dims to enable" 64 128 256)
 flashinfer_option(FLASHINFER_GEN_POS_ENCODING_MODES "Pos encodings to enable" 0
                   1 2)
 flashinfer_option(FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS
-                  "QK reductions to enable" "false" "true")
+                  "QK reductions to enable" OFF)
 flashinfer_option(FLASHINFER_GEN_MASK_MODES "Mask modes to enable" 0 1 2)
 
 if(DEFINED FLASHINFER_CUDA_ARCHITECTURES)
@@ -125,24 +125,76 @@ set(POS_ENCODING_MODES ${FLASHINFER_GEN_POS_ENCODING_MODES})
 set(USE_FP16_QK_REDUCTIONS ${FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS})
 set(MASK_MODES ${FLASHINFER_GEN_MASK_MODES})
 
+set(SM90_ALLOWED_HEAD_DIMS "64,64" "128,128" "256,256" "192,128")
+set(HEAD_DIMS_SM90 "")
+
+foreach(DIM_VAL ${HEAD_DIMS})
+  string(CONCAT TUPLE_VAL "${DIM_VAL}" "," "${DIM_VAL}")
+  list(FIND SM90_ALLOWED_HEAD_DIMS ${TUPLE_VAL} RESULT)
+  if(NOT ${RESULT} EQUAL -1)
+    list(APPEND HEAD_DIMS_SM90 ${TUPLE_VAL})
+  endif(NOT ${RESULT} EQUAL -1)
+endforeach(DIM_VAL)
+
+foreach(TUPLE_VAL ${SM90_ALLOWED_HEAD_DIMS})
+  string(REPLACE "," ";" HEAD_DIMS_LIST ${TUPLE_VAL})
+  list(GET HEAD_DIMS_LIST 0 K)
+  list(GET HEAD_DIMS_LIST 1 V)
+  if(NOT K EQUAL V)
+    list(APPEND HEAD_DIMS_SM90 ${TUPLE_VAL})
+  endif(NOT K EQUAL V)
+endforeach(TUPLE_VAL)
+
+list(REMOVE_DUPLICATES HEAD_DIMS_SM90)
+
 # log options
 message(STATUS "FLASHINFER_HEAD_DIMS=${HEAD_DIMS}")
 message(STATUS "FLASHINFER_POS_ENCODING_MODES=${POS_ENCODING_MODES}")
 message(STATUS "FLASHINFER_USE_FP16_QK_REDUCTIONS=${USE_FP16_QK_REDUCTIONS}")
 message(STATUS "FLASHINFER_MASK_MODES=${MASK_MODES}")
 
+# Log SM90_ALLOWED_HEAD_DIMS and HEAD_DIMS_SM90
+message(STATUS "SM90_ALLOWED_HEAD_DIMS=${SM90_ALLOWED_HEAD_DIMS}")
+message(STATUS "HEAD_DIMS_SM90=${HEAD_DIMS_SM90}")
+
+set(GENERATED_SOURCE_DIR ${PROJECT_SOURCE_DIR}/src/generated)
 file(MAKE_DIRECTORY ${PROJECT_SOURCE_DIR}/src/generated)
+
+if(FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS)
+  # ----------------------------- Dependencies -------------------------------#
+  include(FetchContent)
+
+  set(BOOST_ENABLE_CMAKE ON)
+  FetchContent_Declare(boost_math
+                       GIT_REPOSITORY https://github.com/boostorg/math.git)
+  FetchContent_MakeAvailable(boost_math)
+  # --------------------------------------------------------------------------#
+  set(USE_FP16_QK_REDUCTIONS "true")
+  message(STATUS "USE_FP16_QK_REDUCTIONS=${USE_FP16_QK_REDUCTIONS}")
+else(FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS)
+  set(USE_FP16_QK_REDUCTIONS "false")
+  message(STATUS "USE_FP16_QK_REDUCTIONS=${USE_FP16_QK_REDUCTIONS}")
+endif(FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS)
 
 set(AOT_GENERATE_COMMAND
     ${Python3_EXECUTABLE} -m aot_build_utils.generate --path
-    ${PROJECT_SOURCE_DIR}/src/generated --head_dims ${HEAD_DIMS}
-    --pos_encoding_modes ${POS_ENCODING_MODES} --use_fp16_qk_reductions
-    ${USE_FP16_QK_REDUCTIONS} --mask_modes ${MASK_MODES} --enable_f16
-    ${FLASHINFER_ENABLE_F16} --enable_bf16 ${FLASHINFER_ENABLE_BF16}
-    --enable_fp8_e4m3 ${FLASHINFER_ENABLE_FP8_E4M3} --enable_fp8_e5m2
+    ${GENERATED_SOURCE_DIR} --head_dims ${HEAD_DIMS} --pos_encoding_modes
+    ${POS_ENCODING_MODES} --use_fp16_qk_reductions ${USE_FP16_QK_REDUCTIONS}
+    --mask_modes ${MASK_MODES} --enable_f16 ${FLASHINFER_ENABLE_F16}
+    --enable_bf16 ${FLASHINFER_ENABLE_BF16} --enable_fp8_e4m3
+    ${FLASHINFER_ENABLE_FP8_E4M3} --enable_fp8_e5m2
     ${FLASHINFER_ENABLE_FP8_E5M2})
 
+set(AOT_GENERATE_DISPATCH_INC_COMMAND
+    ${Python3_EXECUTABLE} -m aot_build_utils.generate_dispatch_inc --path
+    "${GENERATED_SOURCE_DIR}/dispatch.inc" --head_dims ${HEAD_DIMS}
+    --head_dims_sm90 ${HEAD_DIMS_SM90} --pos_encoding_modes
+    ${POS_ENCODING_MODES} --use_fp16_qk_reductions ${USE_FP16_QK_REDUCTIONS}
+    --mask_modes ${MASK_MODES})
+
 execute_process(COMMAND ${AOT_GENERATE_COMMAND}
+                WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+execute_process(COMMAND ${AOT_GENERATE_DISPATCH_INC_COMMAND}
                 WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 
 file(GLOB_RECURSE FLASHINFER_GENERATORS
@@ -157,21 +209,33 @@ file(GLOB_RECURSE DISPATCH_INC_FILE
 add_custom_command(
   OUTPUT ${DECODE_KERNELS_SRCS} ${PREFILL_KERNELS_SRCS} ${DISPATCH_INC_FILE}
   COMMAND ${AOT_GENERATE_COMMAND}
+  COMMAND ${AOT_GENERATE_DISPATCH_INC_COMMAND}
   DEPENDS ${FLASHINFER_GENERATORS}
   WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
   COMMENT "Generating kernel sources"
   VERBATIM)
 add_custom_target(dispatch_inc DEPENDS ${DISPATCH_INC_FILE})
 
+string(CONCAT CXX_FLAGS "-fpic " "-fPIC ")
+
+string(CONCAT NVCC_FLAGS "-O3 " "--threads=1 " "-Xfatbin=-compress-all "
+              "-use_fast_math " "--expt-relaxed-constexpr ")
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CXX_FLAGS}")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} ${NVCC_FLAGS}")
+
 add_library(decode_kernels STATIC ${DECODE_KERNELS_SRCS})
 target_include_directories(decode_kernels PRIVATE ${FLASHINFER_INCLUDE_DIR})
-target_compile_options(decode_kernels PRIVATE -Xcompiler=-fPIC --fatbin-options
-                                              -compress-all)
+if(FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS)
+  target_link_libraries(decode_kernels PRIVATE Boost::math)
+endif(FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS)
 
 add_library(prefill_kernels STATIC ${PREFILL_KERNELS_SRCS})
 target_include_directories(prefill_kernels PRIVATE ${FLASHINFER_INCLUDE_DIR})
-target_compile_options(prefill_kernels PRIVATE -Xcompiler=-fPIC
-                                               --fatbin-options -compress-all)
+if(FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS)
+  add_definitions(-DFP16_QK_REDUCTION_SUPPORTED)
+  target_link_libraries(prefill_kernels PRIVATE Boost::math)
+endif(FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS)
 
 if(FLASHINFER_DECODE)
   message(STATUS "Compile single decode kernel benchmarks.")
