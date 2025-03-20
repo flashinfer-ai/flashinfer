@@ -1425,8 +1425,13 @@ struct PoDPlanInfo {
     }
     // Append boundary element
     // used in produce_kv_page
-    kv_start_ptr_h_p.push_back(kv_start_ptr_h_p.back() + kv_len_ptr_h_p.back());
-    kv_start_ptr_h_d.push_back(kv_start_ptr_h_d.back() + kv_len_ptr_h_d.back());
+    if (!kv_start_ptr_h_p.empty()) {
+      kv_start_ptr_h_p.push_back(kv_start_ptr_h_p.back() + kv_len_ptr_h_p.back());
+    }
+    if (!kv_start_ptr_h_d.empty()) {
+      kv_start_ptr_h_d.push_back(kv_start_ptr_h_d.back() + kv_len_ptr_h_d.back());
+    }
+
     return std::make_tuple(partition_bitmask, qo_start_ptr_h_p, qo_len_ptr_h_p, kv_start_ptr_h_p,
                            kv_len_ptr_h_p, kv_last_page_len_h_p, qo_start_ptr_h_d, qo_len_ptr_h_d,
                            kv_start_ptr_h_d, kv_len_ptr_h_d, kv_last_page_len_h_d);

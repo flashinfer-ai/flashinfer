@@ -174,9 +174,7 @@ void PODWithPagedKVCacheRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
           params.paged_kv = paged_kv;
 
           if (plan_info.split_kv) {
-            params.partition_kv = true;
-            params.merge_indptr =
-                GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_indptr_offset);
+            params.partition_kv = true;  // used in prefill kernel
             tmp_v = GetPtrFromBaseOffset<DTypeO>(float_buffer_ptr, plan_info.v_offset);
             tmp_s = GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.s_offset);
             if (plan_info.enable_cuda_graph) {
@@ -194,6 +192,13 @@ void PODWithPagedKVCacheRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
 
         _configureParams(params_p, pod_plan_info.plan_info_p, pod_plan_info.batch_size_vec_p);
         _configureParams(params_d, pod_plan_info.plan_info_d, pod_plan_info.batch_size_vec_d);
+
+        if (pod_plan_info.plan_info_p.split_kv || pod_plan_info.plan_info_d.split_kv) {
+          params_p.merge_indptr = GetPtrFromBaseOffset<IdType>(
+              int_buffer_ptr, pod_plan_info.plan_info_p.merge_indptr_offset);
+          params_d.merge_indptr = GetPtrFromBaseOffset<IdType>(
+              int_buffer_ptr, pod_plan_info.plan_info_d.merge_indptr_offset);
+        }
 
         cudaError_t status = cudaSuccess;
 

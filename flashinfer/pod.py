@@ -665,6 +665,7 @@ class PODWithPagedKVCacheWrapper:
                 sm_scale,
                 rope_scale,
                 rope_theta,
+                get_cuda_stream(q.device),
             ]
 
         self._cached_module.paged_run(*run_args)
