@@ -65,7 +65,6 @@ at::Tensor PODWithPagedKVCachePlan(at::Tensor float_workspace_buffer,
   return vec_to_tensor(plan_info.ToVector());
 }
 
-// pod_with_kv_cache_tensor
 void PODWithPagedKVCacheRun(at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
                             at::Tensor plan_info_vec, at::Tensor q, at::Tensor paged_k_cache,
                             at::Tensor paged_v_cache, at::Tensor paged_kv_indices, at::Tensor o,
