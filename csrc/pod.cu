@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/attention/variants.cuh>
 #include <flashinfer/pos_enc.cuh>
 #include <optional>
@@ -23,184 +24,115 @@
 #include "pytorch_extension_utils.h"
 
 namespace flashinfer {
-template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODING_MODE,
-          bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE_P, uint32_t CTA_TILE_Q,
-          MaskMode MASK_MODE_D, typename PrefillAttentionVariant, typename DecodeAttentionVariant,
-          typename PrefillParams, typename DecodeParams>
-cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
-                                           typename PrefillParams::DTypeO* tmp,
-                                           DecodeParams decode_params,
-                                           typename DecodeParams::DTypeO* tmp_v, float* tmp_s,
-                                           cudaStream_t stream);
+template <uint32_t CTA_TILE_Q_P, uint32_t CTA_TILE_Q_D, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+          PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
+          typename AttentionVariant, typename PrefillParams, typename DecodeParams>
+cudaError_t PODWithPagedKVCacheDispatched(PrefillParams prefill_params, DecodeParams decode_params,
+                                          typename DecodeParams::DTypeO* tmp_v, float* tmp_s,
+                                          cudaStream_t stream);
 
 }  // namespace flashinfer
 
 using namespace flashinfer;
 
-void pod_with_kv_cache_tensor(
-    // Prefill params
-    at::Tensor q_p, at::Tensor k_p, at::Tensor v_p, at::Tensor tmp_p, at::Tensor o_p,
-    std::optional<at::Tensor> maybe_lse_p, int64_t mask_mode_code_p, int64_t layout_p,
-    int64_t window_left_p, std::optional<at::Tensor> maybe_custom_mask_p,
-    std::optional<at::Tensor> maybe_alibi_slopes_p, double logits_soft_cap_p, double sm_scale_p,
-    double rope_rcp_scale_p, double rope_rcp_theta_p,
-    // Decode params
-    at::Tensor float_workspace_buffer_d, at::Tensor int_workspace_buffer_d,
-    at::Tensor plan_info_vec, at::Tensor q_d, at::Tensor paged_k_cache_d,
-    at::Tensor paged_v_cache_d, at::Tensor qo_indptr_d, at::Tensor paged_kv_indptr_d,
-    at::Tensor paged_kv_indices_d, at::Tensor paged_kv_last_page_len_d, at::Tensor o_d,
-    std::optional<at::Tensor> maybe_lse_d, int64_t mask_mode_code_d, int64_t layout_d,
-    int64_t window_left_d, std::optional<at::Tensor> maybe_custom_mask_d,
-    std::optional<at::Tensor> maybe_mask_indptr_d, std::optional<at::Tensor> maybe_alibi_slopes_d,
-    double logits_soft_cap_d, double sm_scale_d, double rope_rcp_scale_d, double rope_rcp_theta_d,
-    // Shared params
-    int64_t cuda_stream) {
-  // Prefill setup
-  unsigned int head_dim_qk = q_p.size(2);
-  unsigned int kv_len_p, qo_len_p, num_kv_heads, num_qo_heads;
-  QKVLayout kv_layout_p = static_cast<QKVLayout>(layout_p);
-  qo_len_p = q_p.size(0);
-  num_qo_heads = q_p.size(1);
-  uint32_t q_stride_n_p = q_p.stride(0), q_stride_h_p = q_p.stride(1), k_stride_n_p, k_stride_h_p,
-           v_stride_n_p, v_stride_h_p;
-  if (kv_layout_p == QKVLayout::kNHD) {
-    kv_len_p = k_p.size(0);
-    num_kv_heads = k_p.size(1);
-    k_stride_n_p = k_p.stride(0);
-    k_stride_h_p = k_p.stride(1);
-    v_stride_n_p = v_p.stride(0);
-    v_stride_h_p = v_p.stride(1);
-  } else {
-    kv_len_p = k_p.size(1);
-    num_kv_heads = k_p.size(0);
-    k_stride_h_p = k_p.stride(0);
-    k_stride_n_p = k_p.stride(1);
-    v_stride_h_p = v_p.stride(0);
-    v_stride_n_p = v_p.stride(1);
-  }
-  if (maybe_lse_p) {
-    const auto& lse = *maybe_lse_p;
-    TORCH_CHECK(lse.size(0) == qo_len_p, lse.size(0), q_p.size(0));
-    TORCH_CHECK(lse.size(1) == num_qo_heads, lse.size(1), q_p.size(1));
-  }
+at::Tensor PODWithPagedKVCachePlan(at::Tensor float_workspace_buffer,
+                                   at::Tensor int_workspace_buffer,
+                                   at::Tensor page_locked_int_workspace_buffer,
+                                   at::Tensor qo_indptr, at::Tensor kv_indptr,
+                                   at::Tensor kv_last_page_len, int64_t total_num_rows,
+                                   int64_t batch_size, int64_t num_qo_heads, int64_t num_kv_heads,
+                                   int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
+                                   int64_t head_dim_vo, bool causal, int64_t cuda_stream) {
+  size_t float_workspace_size_in_bytes =
+      float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
+  size_t int_workspace_size_in_bytes =
+      int_workspace_buffer.size(0) * int_workspace_buffer.element_size();
 
-  const MaskMode mask_mode_p = static_cast<MaskMode>(mask_mode_code_p);
-
-  auto q_scalar_type = q_p.scalar_type();
-  auto kv_scalar_type = k_p.scalar_type();
-
-  // Decode setup (Tensor decode = batched prefill)
-  PrefillPlanInfo plan_info;
-  plan_info.FromVector(tensor_to_vec(plan_info_vec));
-  QKVLayout kv_layout_d = static_cast<QKVLayout>(layout_d);
-  auto device = q_d.device();
-  int64_t batch_size = paged_kv_indptr_d.size(0) - 1;
-  int64_t num_qo_heads_d = q_d.size(1);
-
-  TORCH_CHECK(num_qo_heads == num_qo_heads_d,
-              "POD currently requires same # Query heads for prefill and decode");
-
-  int64_t num_kv_heads_d, page_size_d;
-  uint32_t head_dim_qk_d = q_d.size(2);
-  if (kv_layout_d == QKVLayout::kHND) {
-    num_kv_heads_d = paged_k_cache_d.size(1);
-    page_size_d = paged_k_cache_d.size(2);
-  } else {
-    page_size_d = paged_k_cache_d.size(1);
-    num_kv_heads_d = paged_k_cache_d.size(2);
-  }
-  TORCH_CHECK(num_kv_heads == num_kv_heads_d,
-              "POD currently requires same # KV heads for prefill and decode; Prefill: ",
-              num_kv_heads, ", Decode: ", num_kv_heads_d);
-
-  if (maybe_lse_d) {
-    const auto& lse = *maybe_lse_d;
-    TORCH_CHECK(lse.size(0) == q_d.size(0), lse.size(0), q_d.size(0));
-    TORCH_CHECK(lse.size(1) == q_d.size(1), lse.size(1), q_d.size(1));
-  }
-
-  void* float_buffer_ptr = static_cast<void*>(float_workspace_buffer_d.data_ptr());
-  void* int_buffer_ptr = static_cast<void*>(int_workspace_buffer_d.data_ptr());
-
-  const MaskMode mask_mode_d = static_cast<MaskMode>(mask_mode_code_d);
-  auto q_scalar_type_d = q_d.scalar_type();
-  auto kv_scalar_type_d = paged_k_cache_d.scalar_type();
-
-  // get q_stride_n and q_stride_h
-  const auto q_stride_n_d = q_d.stride(0);
-  const auto q_stride_h_d = q_d.stride(1);
-
-  // get kv_cache_strides
-  const int64_t* kv_cache_strides_d = nullptr;
-  auto k_strides_d = paged_k_cache_d.strides();
-  auto v_strides_d = paged_v_cache_d.strides();
-  TORCH_CHECK(k_strides_d == v_strides_d, "k/v strides must be identical");
-  kv_cache_strides_d = k_strides_d.data();
+  PoDPlanInfo plan_info;
 
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  cudaError_t status =
+      PoDPlan<IdType>(float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
+                      int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
+                      int_workspace_size_in_bytes, plan_info, qo_indptr.data_ptr<IdType>(),
+                      kv_indptr.data_ptr<IdType>(), kv_last_page_len.data_ptr<IdType>(),
+                      total_num_rows, batch_size, num_qo_heads, num_kv_heads, head_dim_qk,
+                      head_dim_vo, page_size, enable_cuda_graph, /*sizeof_dtype_o=*/2, stream);
 
+  TORCH_CHECK(status == cudaSuccess,
+              "Failed to plan PoD Attention with error: ", cudaGetErrorString(status));
+
+  return vec_to_tensor(plan_info.ToVector());
+}
+
+// pod_with_kv_cache_tensor
+void PODWithPagedKVCacheRun(at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
+                            at::Tensor plan_info_vec, at::Tensor q, at::Tensor paged_k_cache,
+                            at::Tensor paged_v_cache, at::Tensor paged_kv_indices, at::Tensor o,
+                            std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code,
+                            int64_t layout, int64_t window_left ADDITIONAL_FUNC_PARAMS,
+                            int64_t cuda_stream) {
+  PoDPlanInfo pod_plan_info;
+  pod_plan_info.FromVector(tensor_to_vec(plan_info_vec));
+
+  QKVLayout kv_layout = static_cast<QKVLayout>(layout);
+  const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
+  auto device = q.device();
+
+  int64_t num_qo_heads = q.size(1);
+  int64_t num_kv_heads, page_size;
+  uint32_t head_dim_qk = q.size(2);
+  if (kv_layout == QKVLayout::kHND) {
+    num_kv_heads = paged_k_cache.size(1);
+    page_size = paged_k_cache.size(2);
+  } else {
+    page_size = paged_k_cache.size(1);
+    num_kv_heads = paged_k_cache.size(2);
+  }
+
+  if (maybe_lse) {
+    const auto& lse = *maybe_lse;
+    TORCH_CHECK(lse.size(0) == q.size(0), lse.size(0), q.size(0));
+    TORCH_CHECK(lse.size(1) == q.size(1), lse.size(1), q.size(1));
+  }
+
+  void* float_buffer_ptr = static_cast<void*>(float_workspace_buffer.data_ptr());
+  void* int_buffer_ptr = static_cast<void*>(int_workspace_buffer.data_ptr());
+  auto q_scalar_type = q.scalar_type();
+  auto kv_scalar_type = paged_k_cache.scalar_type();
+
+  // get q_stride_n and q_stride_h
+  const auto q_stride_n = q.stride(0);
+  const auto q_stride_h = q.stride(1);
+
+  // get kv_cache_strides
+  const int64_t* kv_cache_strides = nullptr;
+  auto k_strides = paged_k_cache.strides();
+  auto v_strides = paged_v_cache.strides();
+  TORCH_CHECK(k_strides == v_strides, "k/v strides must be identical");
+  kv_cache_strides = k_strides.data();
+
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   DISPATCH_context(
-      MASK_MODE_P, MASK_MODE_D, DTypeQ, DTypeKV, HEAD_DIM_QK, USE_SLIDING_WINDOW_P,
-      USE_SLIDING_WINDOW_D, USE_LOGITS_SOFT_CAP, [&] {
-        PrefillParams prefill_params;
-        {
-          // Make params a reference to prefill_params to set values
-          PrefillParams& params = prefill_params;
-          params.q = static_cast<DTypeQ*>(q_p.data_ptr());
-          params.k = static_cast<DTypeKV*>(k_p.data_ptr());
-          params.v = static_cast<DTypeKV*>(v_p.data_ptr());
-          params.o = static_cast<DTypeO*>(o_p.data_ptr());
-          params.lse = maybe_lse_p ? static_cast<float*>(maybe_lse_p->data_ptr()) : nullptr;
-          params.num_qo_heads = num_qo_heads;
-          params.num_kv_heads = num_kv_heads;
-          params.group_size = uint_fastdiv(num_qo_heads / num_kv_heads);
-          params.qo_len = qo_len_p;
-          params.kv_len = kv_len_p;
-          params.q_stride_n = q_stride_n_p;
-          params.q_stride_h = q_stride_h_p;
-          params.k_stride_n = k_stride_n_p;
-          params.k_stride_h = k_stride_h_p;
-          params.v_stride_n = v_stride_n_p;
-          params.v_stride_h = v_stride_h_p;
-
-          params.window_left = window_left_p;
-          params.partition_kv = false;
-
-          params.maybe_custom_mask = maybe_custom_mask_p
-                                         ? static_cast<uint8_t*>(maybe_custom_mask_p->data_ptr())
-                                         : nullptr;
-          params.maybe_alibi_slopes = maybe_alibi_slopes_p
-                                          ? static_cast<float*>(maybe_alibi_slopes_p->data_ptr())
-                                          : nullptr;
-          params.logits_soft_cap = logits_soft_cap_p;
-          params.sm_scale = sm_scale_p;
-          params.rope_rcp_scale = rope_rcp_scale_p;
-          params.rope_rcp_theta = rope_rcp_theta_p;
-        }
-
-        DecodeParams decode_params;
+      DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
+      USE_SLIDING_WINDOW, USE_LOGITS_SOFT_CAP, USE_FP16_QK_REDUCTION, AttentionVariant,
+      RaggedParams, PagedParams, [&] {
+        PagedParams params_p, params_d;
         DTypeO* tmp_v = nullptr;
         float* tmp_s = nullptr;
-        {
-          DecodeParams& params = decode_params;
-          params.q = static_cast<DTypeQ*>(q_d.data_ptr());
-          paged_kv_t<DTypeKV, IdType> paged_kv(
-              num_kv_heads, page_size_d, HEAD_DIM_VO, batch_size, kv_layout_d,
-              static_cast<DTypeKV*>(paged_k_cache_d.data_ptr()),
-              static_cast<DTypeKV*>(paged_v_cache_d.data_ptr()), kv_cache_strides_d,
-              static_cast<IdType*>(paged_kv_indices_d.data_ptr()),
-              static_cast<IdType*>(paged_kv_indptr_d.data_ptr()),
-              static_cast<IdType*>(paged_kv_last_page_len_d.data_ptr()));
-          params.paged_kv = paged_kv;
-          params.q_indptr = static_cast<IdType*>(qo_indptr_d.data_ptr());
-          params.o = static_cast<DTypeO*>(o_d.data_ptr());
 
-          params.lse = maybe_lse_d ? static_cast<float*>(maybe_lse_d->data_ptr()) : nullptr;
+        auto _configureParams = [&](PagedParams& params, const PrefillPlanInfo& plan_info,
+                                    int64_t batch_size) {
+          params.q = static_cast<DTypeQ*>(q.data_ptr());
+          params.o = static_cast<DTypeO*>(o.data_ptr());
+          params.q_start_ptr = nullptr;
+          params.qo_len_ptr = nullptr;
+          params.lse = maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
           params.num_qo_heads = num_qo_heads;
-          params.group_size = uint_fastdiv(num_qo_heads / paged_kv.num_heads);
-          params.q_stride_n = q_stride_n_d;
-          params.q_stride_h = q_stride_h_d;
-          params.window_left = window_left_d;
+          params.group_size = uint_fastdiv(num_qo_heads / num_kv_heads);
+          params.q_stride_n = q_stride_n;
+          params.q_stride_h = q_stride_h;
+          params.window_left = window_left;
 
           params.request_indices = nullptr;
           params.qo_tile_indices = nullptr;
@@ -214,16 +146,13 @@ void pod_with_kv_cache_tensor(
           params.padded_batch_size = 0;
           params.partition_kv = false;
 
-          params.maybe_mask_indptr = maybe_mask_indptr_d
-                                         ? static_cast<int32_t*>(maybe_mask_indptr_d->data_ptr())
-                                         : nullptr;
-          params.maybe_alibi_slopes = maybe_alibi_slopes_d
-                                          ? static_cast<float*>(maybe_alibi_slopes_d->data_ptr())
-                                          : nullptr;
-          params.logits_soft_cap = logits_soft_cap_d;
-          params.sm_scale = sm_scale_d;
-          params.rope_rcp_scale = rope_rcp_scale_d;
-          params.rope_rcp_theta = rope_rcp_theta_d;
+          ADDITIONAL_PARAMS_SETTER
+
+          paged_kv_t<DTypeKV, IdType> paged_kv(
+              num_kv_heads, page_size, HEAD_DIM_VO, batch_size, kv_layout,
+              static_cast<DTypeKV*>(paged_k_cache.data_ptr()),
+              static_cast<DTypeKV*>(paged_v_cache.data_ptr()), kv_cache_strides,
+              static_cast<IdType*>(paged_kv_indices.data_ptr()), nullptr, nullptr);
 
           params.request_indices =
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.request_indices_offset);
@@ -234,7 +163,20 @@ void pod_with_kv_cache_tensor(
           params.o_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.o_indptr_offset);
           params.kv_chunk_size_ptr =
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_chunk_size_ptr_offset);
+          params.q_start_ptr =
+              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.q_start_ptr_offset);
+          params.qo_len_ptr =
+              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.q_len_ptr_offset);
+          paged_kv.indptr =
+              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_start_ptr_offset);
+          paged_kv.len_ptr =
+              GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr, plan_info.kv_len_ptr_offset);
+          paged_kv.last_page_len =
+              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_last_page_len_ptr_offset);
+          params.paged_kv = paged_kv;
+
           if (plan_info.split_kv) {
+            params.partition_kv = true;
             params.merge_indptr =
                 GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_indptr_offset);
             tmp_v = GetPtrFromBaseOffset<DTypeO>(float_buffer_ptr, plan_info.v_offset);
@@ -250,25 +192,24 @@ void pod_with_kv_cache_tensor(
             params.total_num_rows =
                 GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr, plan_info.total_num_rows_offset);
           }
-        }
+        };
 
-        constexpr bool use_custom_mask_p = MASK_MODE_P == MaskMode::kCustom;
-        using PrefillAttentionVariant =
-            DefaultAttention</*use_custom_mask=*/use_custom_mask_p, USE_SLIDING_WINDOW_P,
-                             USE_LOGITS_SOFT_CAP, /*use_alibi_bias=*/false>;
-        constexpr bool use_custom_mask_d = MASK_MODE_D == MaskMode::kCustom;
-        using DecodeAttentionVariant =
-            DefaultAttention</*use_custom_mask=*/use_custom_mask_d, USE_SLIDING_WINDOW_D,
-                             USE_LOGITS_SOFT_CAP, /*use_alibi_bias=*/false>;
-        // DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
-        constexpr size_t CTA_TILE_Q = 16;
-        cudaError_t status = flashinfer::PODWithKVCacheTensorDispatched<
-            HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE_P,
-            CTA_TILE_Q, MASK_MODE_D, PrefillAttentionVariant, DecodeAttentionVariant>(
-            prefill_params, static_cast<DTypeO*>(tmp_p.data_ptr()), decode_params, tmp_v, tmp_s,
-            stream);
-        TORCH_CHECK(status == cudaSuccess, "PODWithKVCache kernel launch failed, error: " +
-                                               std::string(cudaGetErrorString(status)));
-        //});
+        _configureParams(params_p, pod_plan_info.plan_info_p, pod_plan_info.batch_size_p);
+        _configureParams(params_d, pod_plan_info.plan_info_d, pod_plan_info.batch_size_d);
+
+        cudaError_t status = cudaSuccess;
+
+        DISPATCH_CTA_TILE_Q(pod_plan_info.plan_info_p.cta_tile_q, CTA_TILE_Q_P, {
+          DISPATCH_CTA_TILE_Q(pod_plan_info.plan_info_d.cta_tile_q, CTA_TILE_Q_D, {
+            status = flashinfer::PODWithPagedKVCacheDispatched<
+                CTA_TILE_Q_P, CTA_TILE_Q_D, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
+                USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant, PagedParams, PagedParams>(
+                params_p, params_d, tmp_v, tmp_s, stream);
+          });
+        });
+
+        TORCH_CHECK(status == cudaSuccess, "PODWithPagedKVCacheDispatched failed with error ",
+                    cudaGetErrorString(status));
+        return true;
       });
 }
