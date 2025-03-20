@@ -13,12 +13,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <flashinfer/attention/mask.cuh>
 #include <flashinfer/attention/scheduler.cuh>
-#include <flashinfer/attention/variants.cuh>
 #include <flashinfer/pos_enc.cuh>
 #include <optional>
 
-#include "aot_extension_utils.h"
 #include "pod_config.inc"
 #include "pytorch_conversion_utils.h"
 #include "pytorch_extension_utils.h"
@@ -165,13 +164,13 @@ void PODWithPagedKVCacheRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
           params.q_start_ptr =
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.q_start_ptr_offset);
           params.qo_len_ptr =
-              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.q_len_ptr_offset);
+              GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr, plan_info.q_len_ptr_offset);
           paged_kv.indptr =
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_start_ptr_offset);
           paged_kv.len_ptr =
               GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr, plan_info.kv_len_ptr_offset);
           paged_kv.last_page_len =
-              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_last_page_len_ptr_offset);
+              GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_last_page_offset);
           params.paged_kv = paged_kv;
 
           if (plan_info.split_kv) {
@@ -193,8 +192,8 @@ void PODWithPagedKVCacheRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
           }
         };
 
-        _configureParams(params_p, pod_plan_info.plan_info_p, pod_plan_info.batch_size_p);
-        _configureParams(params_d, pod_plan_info.plan_info_d, pod_plan_info.batch_size_d);
+        _configureParams(params_p, pod_plan_info.plan_info_p, pod_plan_info.batch_size_vec_p);
+        _configureParams(params_d, pod_plan_info.plan_info_d, pod_plan_info.batch_size_vec_d);
 
         cudaError_t status = cudaSuccess;
 

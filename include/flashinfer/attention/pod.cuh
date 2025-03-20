@@ -42,8 +42,8 @@ __global__ __launch_bounds__(std::max(
   extern __shared__ uint8_t smem[];
   // Metadata
   const uint32_t padded_bsz_p = prefill_params.padded_batch_size;
-  const uint32_t num_kv_heads_p = prefill_params.paged_kv.num_heads const uint32_t padded_bsz_d =
-      decode_params.padded_batch_size;
+  const uint32_t num_kv_heads_p = prefill_params.paged_kv.num_heads;
+  const uint32_t padded_bsz_d = decode_params.padded_batch_size;
   const uint32_t num_kv_heads_d = decode_params.paged_kv.num_heads;
 
   const uint32_t num_blk_p = padded_bsz_p * num_kv_heads_p;
@@ -95,15 +95,15 @@ __global__ __launch_bounds__(std::max(
       linear_bid = atomicAdd(&tbAssign[num_sm + PoDOp::PREFILL], 1);
     }
     // Write the blockId and operation to shared memory
-    (static_cast<int*>(smem))[0] = linear_bid;
-    (static_cast<int*>(smem))[1] = op;
+    (reinterpret_cast<int*>(smem))[0] = linear_bid;
+    (reinterpret_cast<int*>(smem))[1] = op;
   }
   // Sync to wait for dynamic scheduler to finish
   __syncthreads();
 
   // Fetch from shared memory the assigned blockId and operation.
-  linear_bid = (static_cast<int*>(smem))[0];
-  op = (static_cast<int*>(smem))[1];
+  linear_bid = (reinterpret_cast<int*>(smem))[0];
+  op = (reinterpret_cast<int*>(smem))[1];
   __syncthreads();
 
   if (op == PoDOp::PREFILL) {
@@ -167,14 +167,6 @@ cudaError_t PODWithPagedKVCacheDispatched(PrefillParams prefill_params, DecodePa
     return cudaSuccess;
   }
 
-  int nblks_p(padded_bsz_p * 1 * num_kv_heads);
-  int nthrs_p(32 * NUM_WARPS_Q_P * NUM_WARPS_KV_P);
-  int nblks_d(padded_bsz_d * 1 * num_kv_heads);
-  int nthrs_d(32 * NUM_WARPS_Q_D * NUM_WARPS_KV_D);
-
-  int nblks = nblks_p + nblks_d;
-  int nthrs = max(nthrs_p, nthrs_d);
-
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
   using DTypeQKAccum =
@@ -190,6 +182,14 @@ cudaError_t PODWithPagedKVCacheDispatched(PrefillParams prefill_params, DecodePa
   constexpr uint32_t NUM_MMA_Q_D = get_num_mma_q(CTA_TILE_Q_D);
   constexpr uint32_t NUM_WARPS_Q_D = get_num_warps_q(CTA_TILE_Q_D);
   constexpr uint32_t NUM_WARPS_KV_D = get_num_warps_kv(CTA_TILE_Q_D);
+
+  int nblks_p(padded_bsz_p * 1 * num_kv_heads);
+  int nthrs_p(32 * NUM_WARPS_Q_P * NUM_WARPS_KV_P);
+  int nblks_d(padded_bsz_d * 1 * num_kv_heads);
+  int nthrs_d(32 * NUM_WARPS_Q_D * NUM_WARPS_KV_D);
+
+  int nblks = nblks_p + nblks_d;
+  int nthrs = max(nthrs_p, nthrs_d);
 
   // Calculate occupancy
   // we expect each sm execute two threadblocks
@@ -292,7 +292,6 @@ cudaError_t PODWithPagedKVCacheDispatched(PrefillParams prefill_params, DecodePa
         // Post-kernel stuff for split-kv
         if (prefill_params.partition_kv || decode_params.partition_kv) {
           assert(prefill_params.merge_indptr == decode_params.merge_indptr);
-          assert(prefill_params.enable_cuda_graph == false);  // not supported
           if constexpr (AttentionVariant::use_softmax) {
             FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
                 tmp_v, tmp_s, prefill_params.merge_indptr, o, lse,

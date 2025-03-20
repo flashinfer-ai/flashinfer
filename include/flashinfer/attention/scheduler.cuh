@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <numeric>
 #include <sstream>
 #include <vector>
 
@@ -1483,8 +1484,8 @@ inline cudaError_t PoDPlan(void* float_buffer, size_t float_workspace_size_in_by
   uint32_t batch_size_d = qo_start_ptr_vec_d.size();
   assert(batch_size_p + batch_size_d == batch_size);
   assert(partition_bitmask.size() == batch_size);
-  batch_size_vec_p = batch_size_p;
-  batch_size_vec_d = batch_size_d;
+  plan_info.batch_size_vec_p = batch_size_p;
+  plan_info.batch_size_vec_d = batch_size_d;
 
   uint32_t total_num_rows_p = std::accumulate(qo_len_ptr_vec_p.begin(), qo_len_ptr_vec_p.end(), 0);
   uint32_t total_num_rows_d = std::accumulate(qo_len_ptr_vec_d.begin(), qo_len_ptr_vec_d.end(), 0);
@@ -1576,7 +1577,7 @@ inline cudaError_t PoDPlan(void* float_buffer, size_t float_workspace_size_in_by
       sizeof(IdType) * batch_size_p, 16, "batch_prefill_q_start_ptr_p");
   plan_info.plan_info_p.q_len_ptr_offset = int_allocator.aligned_alloc_offset(
       sizeof(uint32_t) * batch_size_p, 16, "batch_prefill_q_len_ptr_p");
-  plan_info.plan_info_p.kv_last_page_len_ptr_offset = int_allocator.aligned_alloc_offset(
+  plan_info.plan_info_p.kv_last_page_offset = int_allocator.aligned_alloc_offset(
       sizeof(IdType) * batch_size_p, 16, "batch_prefill_kv_last_page_len_ptr_p");
 
   if (plan_info.plan_info_p.enable_cuda_graph) {
@@ -1606,7 +1607,7 @@ inline cudaError_t PoDPlan(void* float_buffer, size_t float_workspace_size_in_by
   uint32_t* q_len_ptr_h_p = GetPtrFromBaseOffset<uint32_t>(page_locked_int_buffer,
                                                            plan_info.plan_info_p.q_len_ptr_offset);
   IdType* kv_last_page_len_ptr_h_p = GetPtrFromBaseOffset<IdType>(
-      page_locked_int_buffer, plan_info.plan_info_p.kv_last_page_len_ptr_offset);
+      page_locked_int_buffer, plan_info.plan_info_p.kv_last_page_offset);
 
   std::copy(request_indices_vec_p.begin(), request_indices_vec_p.end(), request_indices_h_p);
   std::copy(qo_tile_indices_vec_p.begin(), qo_tile_indices_vec_p.end(), qo_tile_indices_h_p);
@@ -1644,7 +1645,7 @@ inline cudaError_t PoDPlan(void* float_buffer, size_t float_workspace_size_in_by
       sizeof(IdType) * batch_size_d, 16, "batch_prefill_q_start_ptr_d");
   plan_info.plan_info_d.q_len_ptr_offset = int_allocator.aligned_alloc_offset(
       sizeof(uint32_t) * batch_size_d, 16, "batch_prefill_q_len_ptr_d");
-  plan_info.plan_info_d.kv_last_page_len_ptr_offset = int_allocator.aligned_alloc_offset(
+  plan_info.plan_info_d.kv_last_page_offset = int_allocator.aligned_alloc_offset(
       sizeof(IdType) * batch_size_d, 16, "batch_prefill_kv_last_page_len_ptr_d");
 
   if (plan_info.plan_info_d.enable_cuda_graph) {
@@ -1674,7 +1675,7 @@ inline cudaError_t PoDPlan(void* float_buffer, size_t float_workspace_size_in_by
   uint32_t* q_len_ptr_h_d = GetPtrFromBaseOffset<uint32_t>(page_locked_int_buffer,
                                                            plan_info.plan_info_d.q_len_ptr_offset);
   IdType* kv_last_page_len_ptr_h_d = GetPtrFromBaseOffset<IdType>(
-      page_locked_int_buffer, plan_info.plan_info_d.kv_last_page_len_ptr_offset);
+      page_locked_int_buffer, plan_info.plan_info_d.kv_last_page_offset);
 
   std::copy(request_indices_vec_d.begin(), request_indices_vec_d.end(), request_indices_h_d);
   std::copy(qo_tile_indices_vec_d.begin(), qo_tile_indices_vec_d.end(), qo_tile_indices_h_d);

@@ -63,7 +63,7 @@ def get_pod_module(backend):
     def backend_module(*args):
         global _pod_modules
         if args not in _pod_modules:
-            uri = get_pod_uri(*args)
+            uri = get_pod_uri(backend, *args)
 
             if has_prebuilt_ops and uri in prebuilt_ops_uri:
                 assert False, "Prebuilt ops are not supported for POD module"
