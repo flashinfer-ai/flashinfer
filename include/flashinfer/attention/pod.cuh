@@ -37,10 +37,9 @@ __global__ __launch_bounds__(std::max(
     KTraits_D::NUM_THREADS)) void PODWithPagedKVCacheKernel(const __grid_constant__ PrefillParams
                                                                 prefill_params,
                                                             const __grid_constant__ DecodeParams
-                                                                decode_params,
-                                                            int* tbAssign) {
+                                                                decode_params) {
   extern __shared__ uint8_t smem[];
-  // Metadata
+
   const uint32_t padded_bsz_p = prefill_params.padded_batch_size;
   const uint32_t num_kv_heads_p = prefill_params.paged_kv.num_heads;
   const uint32_t padded_bsz_d = decode_params.padded_batch_size;
@@ -48,96 +47,41 @@ __global__ __launch_bounds__(std::max(
 
   const uint32_t num_blk_p = padded_bsz_p * num_kv_heads_p;
   const uint32_t num_blk_d = padded_bsz_d * num_kv_heads_d;
+  const uint32_t physical_bid = blockIdx.x;
 
-  int op, linear_bid;
-  // SM-aware threadblock scheduler code
-  // Find out which SM this threadblock is scheduled on
-  if (threadIdx.x == 0) {
-    // TODO_AK: If num_threads dont match, use virtual sub-CTAs.
-    // Requires changing block-level sync in main prefill/decode kernels.
-    constexpr int blk_factor_p = 1;
-    constexpr int blk_factor_d = 1;
-
-    int num_sm;
-    // WARNING: nsmid has only been tested on A100/H100, and matches SM count
-    // No guarantee this will work on other GPUs
-    asm volatile("mov.u32 %0, %nsmid;" : "=r"(num_sm));
-    asm volatile("mov.u32 %0, %smid;" : "=r"(linear_bid));
-    const int prefill_slots = (num_blk_p + blk_factor_p - 1) / blk_factor_p;
-    const int decode_slots = (num_blk_d + blk_factor_d - 1) / blk_factor_d;
-
-    if (prefill_slots <= decode_slots) {
-      // Total tags = (decode + prefill) / min(decode, prefill)
-      // = 1 + decode / prefill; when prefill < decode
-      const int total_tags = decode_slots / prefill_slots + 1;
-      op = (atomicAdd(&tbAssign[linear_bid], 1) % total_tags);
-      if (op > 0) {
-        op = PoDOp::DECODE;
-      }
-    } else {
-      const int total_tags = prefill_slots / decode_slots + 1;
-      op = (atomicAdd(&tbAssign[linear_bid], 1) % total_tags);
-      if (op < total_tags - 1) {
-        op = PoDOp::PREFILL;
-      } else {
-        op = PoDOp::DECODE;
-      }
-    }
-
-    // Get the next blockId for that operation
-    linear_bid = atomicAdd(&tbAssign[num_sm + op], 1);
-    // If the blockId obtained exceeds the max blockIds for that op, switch to the other op
-    if (op == PoDOp::PREFILL && linear_bid >= prefill_slots) {
-      op = !op;
-      linear_bid = atomicAdd(&tbAssign[num_sm + PoDOp::DECODE], 1);
-    } else if (op == PoDOp::DECODE && linear_bid >= decode_slots) {
-      op = !op;
-      linear_bid = atomicAdd(&tbAssign[num_sm + PoDOp::PREFILL], 1);
-    }
-    // Write the blockId and operation to shared memory
-    (reinterpret_cast<int*>(smem))[0] = linear_bid;
-    (reinterpret_cast<int*>(smem))[1] = op;
-  }
-  // Sync to wait for dynamic scheduler to finish
-  __syncthreads();
-
-  // Fetch from shared memory the assigned blockId and operation.
-  linear_bid = (reinterpret_cast<int*>(smem))[0];
-  op = (reinterpret_cast<int*>(smem))[1];
-  __syncthreads();
-
-  if (op == PoDOp::PREFILL) {
+  if (physical_bid < num_blk_p) {
+    /* OP == PREFILL */
     auto& smem_storage = reinterpret_cast<typename KTraits_P::SharedStorage&>(smem);
-    if (linear_bid >= num_blk_p) return;
 
-    const uint32_t bx = linear_bid % padded_bsz_p;
-    const uint32_t kv_head_idx = linear_bid / padded_bsz_p;
-    const uint32_t linear_tid = threadIdx.x;
+    const uint32_t logical_bid = physical_bid % padded_bsz_p;
+    const uint32_t kv_head_idx = physical_bid / padded_bsz_p;
+    const uint32_t physical_tid = threadIdx.x;
 
     // Return if threadId exceeds number of threads for this op
-    if (linear_tid >= WARP_SIZE * KTraits_P::NUM_WARPS_Q * KTraits_P::NUM_WARPS_KV) return;
+    if (physical_tid >= WARP_SIZE * KTraits_P::NUM_WARPS_Q * KTraits_P::NUM_WARPS_KV) return;
 
-    const dim3 tid = dim3(linear_tid % WARP_SIZE, (linear_tid / WARP_SIZE) % KTraits_P::NUM_WARPS_Q,
-                          (linear_tid / WARP_SIZE) / KTraits_P::NUM_WARPS_Q);
+    const dim3 tid =
+        dim3(physical_tid % WARP_SIZE, (physical_tid / WARP_SIZE) % KTraits_P::NUM_WARPS_Q,
+             (physical_tid / WARP_SIZE) / KTraits_P::NUM_WARPS_Q);
 
-    BatchPrefillWithPagedKVCacheDevice<KTraits_P>(prefill_params, smem_storage, tid, bx,
+    BatchPrefillWithPagedKVCacheDevice<KTraits_P>(prefill_params, smem_storage, tid, logical_bid,
                                                   kv_head_idx, num_kv_heads_p);
   } else /* OP == DECODE */ {
     auto& smem_storage = reinterpret_cast<typename KTraits_D::SharedStorage&>(smem);
-    if (linear_bid >= num_blk_d) return;
 
-    const uint32_t bx = linear_bid % padded_bsz_d;
-    const uint32_t kv_head_idx = linear_bid / padded_bsz_d;
+    const uint32_t logical_bid = (physical_bid - num_blk_p) % padded_bsz_d;
+    const uint32_t kv_head_idx = (physical_bid - num_blk_p) / padded_bsz_d;
+    const uint32_t physical_tid = threadIdx.x;
 
-    const uint32_t linear_tid = threadIdx.x;
     // Return if threadId exceeds number of threads for this op
-    if (linear_tid >= WARP_SIZE * KTraits_D::NUM_WARPS_Q * KTraits_D::NUM_WARPS_KV) return;
+    if (physical_tid >= WARP_SIZE * KTraits_D::NUM_WARPS_Q * KTraits_D::NUM_WARPS_KV) return;
 
-    const dim3 tid = dim3(linear_tid % WARP_SIZE, (linear_tid / WARP_SIZE) % KTraits_D::NUM_WARPS_Q,
-                          (linear_tid / WARP_SIZE) / KTraits_D::NUM_WARPS_Q);
+    const dim3 tid =
+        dim3(physical_tid % WARP_SIZE, (physical_tid / WARP_SIZE) % KTraits_D::NUM_WARPS_Q,
+             (physical_tid / WARP_SIZE) / KTraits_D::NUM_WARPS_Q);
 
-    BatchPrefillWithPagedKVCacheDevice<KTraits_D>(decode_params, smem_storage, tid, bx, kv_head_idx,
-                                                  num_kv_heads_d);
+    BatchPrefillWithPagedKVCacheDevice<KTraits_D>(decode_params, smem_storage, tid, logical_bid,
+                                                  kv_head_idx, num_kv_heads_d);
   }
 }
 
@@ -279,13 +223,8 @@ cudaError_t PODWithPagedKVCacheDispatched(PrefillParams prefill_params, DecodePa
           decode_params.lse = tmp_s;
         }
 
-        // setup SM scheduler metadata
-        static int* tbAssign = nullptr;
-        if (tbAssign == nullptr) cudaMalloc(&tbAssign, sizeof(int) * (num_sm + PoDOp::NUM_OPS));
-        cudaMemset(tbAssign, 0, sizeof(int) * (num_sm + PoDOp::NUM_OPS));
-
         // Launch kernel
-        void* args[] = {(void*)&prefill_params, (void*)&decode_params, (void*)&tbAssign};
+        void* args[] = {(void*)&prefill_params, (void*)&decode_params};
         FLASHINFER_CUDA_CALL(
             cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
 
