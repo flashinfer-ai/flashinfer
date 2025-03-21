@@ -278,7 +278,12 @@ struct BatchPrefillPagedParams {
   DTypeQ* q;
   paged_kv_t<DTypeKV, IdType> paged_kv;
   uint8_t* maybe_custom_mask;
+
+  // Add q_lenptr for non-continous qo layout
+  // which is used in PoD Attention
   IdType* q_indptr;
+  uint32_t* q_lenptr;
+
   IdType* maybe_mask_indptr;
   IdType* maybe_q_rope_offset;  // maybe_q_rope_offset is only used for fused-rope attention
   DTypeO* o;
@@ -311,6 +316,7 @@ struct BatchPrefillPagedParams {
         paged_kv(),
         maybe_custom_mask(nullptr),
         q_indptr(nullptr),
+        q_lenptr(nullptr),
         maybe_mask_indptr(nullptr),
         maybe_q_rope_offset(nullptr),
         o(nullptr),
@@ -348,6 +354,7 @@ struct BatchPrefillPagedParams {
         paged_kv(paged_kv),
         maybe_custom_mask(maybe_custom_mask),
         q_indptr(q_indptr),
+        q_lenptr(nullptr),
         maybe_mask_indptr(maybe_mask_indptr),
         maybe_q_rope_offset(maybe_q_rope_offset),
         o(o),
@@ -375,6 +382,9 @@ struct BatchPrefillPagedParams {
         partition_kv(false) {}
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
+    if (q_lenptr) {
+      return q_lenptr[batch_idx];
+    }
     return q_indptr[batch_idx + 1] - q_indptr[batch_idx];
   }
 

@@ -58,6 +58,9 @@ struct paged_kv_t {
   // [batch_size] The start position of each request in the batch.
   IdType* rope_pos_offset;
 
+  // [batch_size, ] The page lenptr array, used when indptr is not contiguous (PoD implementation)
+  uint32_t* len_ptr;
+
   /*!
    * \brief Construct an empty paged key-value cache
    */
@@ -74,7 +77,8 @@ struct paged_kv_t {
         indices(nullptr),
         indptr(nullptr),
         last_page_len(nullptr),
-        rope_pos_offset(nullptr) {}
+        rope_pos_offset(nullptr),
+        len_ptr(nullptr) {}
 
   /*!
    * \brief Construct a paged key-value cache
@@ -101,7 +105,8 @@ struct paged_kv_t {
         indices(indices),
         indptr(indptr),
         last_page_len(last_page_len),
-        rope_pos_offset(rope_pos_offset) {
+        rope_pos_offset(rope_pos_offset),
+        len_ptr(nullptr) {
     stride_page = num_heads * page_size * head_dim;
     this->k_data = k_data;
     this->v_data = v_data;
@@ -136,7 +141,8 @@ struct paged_kv_t {
         indices(indices),
         indptr(indptr),
         last_page_len(last_page_len),
-        rope_pos_offset(rope_pos_offset) {
+        rope_pos_offset(rope_pos_offset),
+        len_ptr(nullptr) {
     stride_page = kv_strides[0];
     this->k_data = k_data;
     this->v_data = v_data;
@@ -145,6 +151,9 @@ struct paged_kv_t {
   }
 
   __host__ __device__ __forceinline__ uint32_t get_length(uint32_t batch_idx) const {
+    if (len_ptr) {
+      return (len_ptr[batch_idx] - 1) * page_size + last_page_len[batch_idx];
+    }
     if (indptr[batch_idx + 1] == indptr[batch_idx]) {
       return 0;
     }

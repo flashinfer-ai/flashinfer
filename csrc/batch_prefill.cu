@@ -257,6 +257,7 @@ void BatchPrefillWithPagedKVCacheRun(
             static_cast<IdType*>(paged_kv_last_page_len.data_ptr()));
         params.paged_kv = paged_kv;
         params.q_indptr = static_cast<IdType*>(qo_indptr.data_ptr());
+        params.q_lenptr = nullptr;  // disable incontinous qo
         params.o = static_cast<DTypeO*>(o.data_ptr());
 
         params.lse = maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
