@@ -207,7 +207,7 @@ class BlockSparseAttentionWrapper:
         rope_theta: Optional[float] = None,
         q_data_type: Union[str, torch.dtype] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
-        non_blocking: bool = False,
+        non_blocking: bool = True,
     ) -> None:
         r"""Create auxiliary data structures for block sparse attention.
 
@@ -270,8 +270,7 @@ class BlockSparseAttentionWrapper:
         kv_data_type : Optional[Union[str, torch.dtype]]
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
         non_blocking : bool
-            Whether to copy the input tensors to the device asynchronously, defaults to ``False``.
-            If ``True``, user should synchronize before calling :meth:`run` or cuda graph replay.
+            Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
 
 
         The :meth:`plan` method should be called before any :meth:`run` or

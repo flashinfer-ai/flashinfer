@@ -746,7 +746,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
-        non_blocking: bool = False,
+        non_blocking: bool = True,
     ) -> None:
         r"""Plan batch decode for given problem specification.
 
@@ -789,8 +789,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The data type of both the query and key/value tensors. Defaults to torch.float16.
             data_type is deprecated, please use q_data_type and kv_data_type instead.
         non_blocking : bool
-            Whether to copy the input tensors to the device asynchronously, defaults to ``False``.
-            If ``True``, user should synchronize before calling :meth:`run` or cuda graph replay.
+            Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
 
 
         Note
