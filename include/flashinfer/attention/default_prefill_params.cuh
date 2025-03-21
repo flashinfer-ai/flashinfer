@@ -279,11 +279,10 @@ struct BatchPrefillPagedParams {
   paged_kv_t<DTypeKV, IdType> paged_kv;
   uint8_t* maybe_custom_mask;
 
-  // Instead of qo_indptr
-  // we use start idx and len to represent the qo sequence
-  // to support discontinuous qo sequence
-  IdType* q_start_ptr;   // [bsz, ]
-  uint32_t* qo_len_ptr;  // [bsz, ]
+  // Add q_lenptr for non-continous qo layout
+  // which is used in PoD Attention
+  IdType* q_indptr;
+  uint32_t* q_lenptr;
 
   IdType* maybe_mask_indptr;
   IdType* maybe_q_rope_offset;  // maybe_q_rope_offset is only used for fused-rope attention
@@ -316,8 +315,8 @@ struct BatchPrefillPagedParams {
       : q(nullptr),
         paged_kv(),
         maybe_custom_mask(nullptr),
-        q_start_ptr(nullptr),
-        qo_len_ptr(nullptr),
+        q_indptr(nullptr),
+        q_lenptr(nullptr),
         maybe_mask_indptr(nullptr),
         maybe_q_rope_offset(nullptr),
         o(nullptr),
@@ -345,18 +344,17 @@ struct BatchPrefillPagedParams {
         partition_kv(false) {}
 
   __host__ BatchPrefillPagedParams(DTypeQ* q, paged_kv_t<DTypeKV, IdType> paged_kv,
-                                   uint8_t* maybe_custom_mask, IdType* q_start_ptr,
-                                   uint32_t* qo_len_ptr, IdType* maybe_mask_indptr,
-                                   IdType* maybe_q_rope_offset, DTypeO* o, float* lse,
-                                   float* maybe_alibi_slopes, uint32_t num_qo_heads,
-                                   IdType q_stride_n, IdType q_stride_h, int32_t window_left,
-                                   float logits_soft_cap, float sm_scale, float rope_scale,
-                                   float rope_theta)
+                                   uint8_t* maybe_custom_mask, IdType* q_indptr,
+                                   IdType* maybe_mask_indptr, IdType* maybe_q_rope_offset,
+                                   DTypeO* o, float* lse, float* maybe_alibi_slopes,
+                                   uint32_t num_qo_heads, IdType q_stride_n, IdType q_stride_h,
+                                   int32_t window_left, float logits_soft_cap, float sm_scale,
+                                   float rope_scale, float rope_theta)
       : q(q),
         paged_kv(paged_kv),
         maybe_custom_mask(maybe_custom_mask),
-        q_start_ptr(q_start_ptr),
-        qo_len_ptr(qo_len_ptr),
+        q_indptr(q_indptr),
+        q_lenptr(nullptr),
         maybe_mask_indptr(maybe_mask_indptr),
         maybe_q_rope_offset(maybe_q_rope_offset),
         o(o),
@@ -384,7 +382,10 @@ struct BatchPrefillPagedParams {
         partition_kv(false) {}
 
   __host__ __device__ __forceinline__ uint32_t get_qo_len(uint32_t batch_idx) const {
-    return qo_len_ptr[batch_idx];
+    if (q_lenptr) {
+      return q_lenptr[batch_idx];
+    }
+    return q_indptr[batch_idx + 1] - q_indptr[batch_idx];
   }
 
   __host__ __device__ __forceinline__ uint32_t get_kv_len(uint32_t batch_idx) const {

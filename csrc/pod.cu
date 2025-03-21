@@ -123,8 +123,8 @@ void PODWithPagedKVCacheRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
                                     int64_t batch_size) {
           params.q = static_cast<DTypeQ*>(q.data_ptr());
           params.o = static_cast<DTypeO*>(o.data_ptr());
-          params.q_start_ptr = nullptr;
-          params.qo_len_ptr = nullptr;
+          params.q_indptr = nullptr;
+          params.q_lenptr = nullptr;
           params.lse = maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
           params.num_qo_heads = num_qo_heads;
           params.group_size = uint_fastdiv(num_qo_heads / num_kv_heads);
@@ -161,9 +161,9 @@ void PODWithPagedKVCacheRun(at::Tensor float_workspace_buffer, at::Tensor int_wo
           params.o_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.o_indptr_offset);
           params.kv_chunk_size_ptr =
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_chunk_size_ptr_offset);
-          params.q_start_ptr =
+          params.q_indptr =
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.q_start_ptr_offset);
-          params.qo_len_ptr =
+          params.q_lenptr =
               GetPtrFromBaseOffset<uint32_t>(int_buffer_ptr, plan_info.q_len_ptr_offset);
           paged_kv.indptr =
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_start_ptr_offset);

@@ -1927,7 +1927,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     IdType* qo_tile_indices = params.qo_tile_indices;
     IdType* kv_tile_indices = params.kv_tile_indices;
     DTypeQ* q = params.q;
-    IdType* q_start_ptr = params.q_start_ptr;
+    IdType* q_indptr = params.q_indptr;
     IdType* o_indptr = params.o_indptr;
     DTypeO* o = params.o;
     float* lse = params.lse;
@@ -1981,7 +1981,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     smem_t<SWIZZLE_MODE_Q> qo_smem(smem_storage.q_smem);
     const uint32_t o_stride_n = num_qo_heads * HEAD_DIM_VO, o_stride_h = HEAD_DIM_VO;
     DTypeQ* q_ptr_base =
-        q + q_start_ptr[request_idx] * q_stride_n + (kv_head_idx * group_size) * q_stride_h;
+        q + q_indptr[request_idx] * q_stride_n + (kv_head_idx * group_size) * q_stride_h;
     DTypeO* o_ptr_base = partition_kv ? o + (o_indptr[request_idx] + kv_tile_idx) * o_stride_n +
                                             (kv_head_idx * group_size) * o_stride_h
                                       : o + o_indptr[request_idx] * o_stride_n +
@@ -2006,7 +2006,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                              &qo_smem, &q_smem_offset_r, rope_freq, tid);
       } else {
         q_smem_inplace_apply_rotary_with_pos<KTraits>(
-            qo_packed_idx_base, q_rope_offset + q_start_ptr[request_idx], &qo_smem, group_size,
+            qo_packed_idx_base, q_rope_offset + q_indptr[request_idx], &qo_smem, group_size,
             &q_smem_offset_r, rope_freq, tid);
       }
       block.sync();

@@ -195,11 +195,10 @@ void BatchPrefillWithRaggedKVCacheRun(at::Tensor float_workspace_buffer,
 
 void BatchPrefillWithPagedKVCacheRun(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer, at::Tensor plan_info_vec,
-    at::Tensor q, at::Tensor paged_k_cache, at::Tensor paged_v_cache, at::Tensor qo_start_ptr,
-    at::Tensor qo_len_ptr, at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices,
-    at::Tensor paged_kv_last_page_len, at::Tensor o, std::optional<at::Tensor> maybe_lse,
-    int64_t mask_mode_code, int64_t layout, int64_t window_left ADDITIONAL_FUNC_PARAMS,
-    int64_t cuda_stream) {
+    at::Tensor q, at::Tensor paged_k_cache, at::Tensor paged_v_cache, at::Tensor qo_indptr,
+    at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len,
+    at::Tensor o, std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code, int64_t layout,
+    int64_t window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream) {
   PrefillPlanInfo plan_info;
   plan_info.FromVector(tensor_to_vec(plan_info_vec));
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
@@ -257,11 +256,8 @@ void BatchPrefillWithPagedKVCacheRun(
             static_cast<IdType*>(paged_kv_indptr.data_ptr()),
             static_cast<IdType*>(paged_kv_last_page_len.data_ptr()));
         params.paged_kv = paged_kv;
-
-        // support non-continous qo layout
-        params.q_start_ptr = static_cast<IdType*>(qo_start_ptr.data_ptr());
-        params.qo_len_ptr = static_cast<uint32_t*>(qo_len_ptr.data_ptr());
-
+        params.q_indptr = static_cast<IdType*>(qo_indptr.data_ptr());
+        params.q_lenptr = nullptr;  // disable incontinous qo
         params.o = static_cast<DTypeO*>(o.data_ptr());
 
         params.lse = maybe_lse ? static_cast<float*>(maybe_lse->data_ptr()) : nullptr;
