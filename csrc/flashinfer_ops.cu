@@ -16,6 +16,49 @@
 #include "aot_default_additional_params.h"
 #include "pytorch_extension_utils.h"
 
+// MSVC compiler only allows to link with a single
+// PyInit_flashinfer_kernels defined per .pyd, define here
+
+#ifdef _WIN32
+#ifndef FLASHINFER_EXT_MODULE_INITED
+#define FLASHINFER_EXT_MODULE_INITED
+
+// To expand macros in #name
+#define FLASHINFER_EXT_MODULE_INIT_EXPAND(name) FLASHINFER_EXT_MODULE_INIT(name)
+
+/* Creates a dummy empty module that can be imported from Python.
+   The import from Python will load the .so consisting of the file
+   in this extension, so that the TORCH_LIBRARY_FRAGMENT static initializers
+   are run. */
+#ifdef _WIN32
+#define FLASHINFER_EXT_MODULE_INIT(name)                                  \
+  extern "C" {                                                            \
+  PyObject* PyInit_##name(void) {                                         \
+    static struct PyModuleDef module_def = {                              \
+        PyModuleDef_HEAD_INIT,                                            \
+        #name, /* name of module */                                       \
+        NULL,  /* module documentation, may be NULL */                    \
+        -1,    /* size of per-interpreter state of the module,            \
+                  or -1 if the module keeps state in global variables. */ \
+        NULL,  /* methods */                                              \
+        NULL,  /* slots */                                                \
+        NULL,  /* traverse */                                             \
+        NULL,  /* clear */                                                \
+        NULL,  /* free */                                                 \
+    };                                                                    \
+    return PyModule_Create(&module_def);                                  \
+  }                                                                       \
+  }
+#endif
+
+FLASHINFER_EXT_MODULE_INIT_EXPAND(TORCH_EXTENSION_NAME)
+
+#undef FLASHINFER_EXT_MODULE_INIT
+#undef FLASHINFER_EXT_MODULE_INIT_EXPAND
+
+#endif
+#endif
+
 //========== activation ==========
 
 void silu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl, int64_t cuda_stream);

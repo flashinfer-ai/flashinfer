@@ -18,6 +18,7 @@ import argparse
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -139,6 +140,23 @@ cmdclass = {}
 install_requires = ["numpy", "torch", "ninja"]
 generate_build_meta({})
 
+IS_WINDOWS = platform.system() == "Windows"
+win_build_dir = "C:\\_fib"  # short build dir to allow linker command stay below Windows PowerShell limit
+
+if IS_WINDOWS:
+    gen_dir = Path(
+        "./csrc/generated"
+    )  # make path relative to avoid project path to be appended to the generated sources, generating larger link command
+    import distutils.command.build
+
+    class BuildCommand(distutils.command.build.build):
+        def initialize_options(self):
+            distutils.command.build.build.initialize_options(self)
+            self.build_base = win_build_dir
+            self.build_temp = os.path.join(self.build_base, "t")
+
+    cmdclass["build"] = BuildCommand
+
 if enable_aot:
     import torch
     import torch.utils.cpp_extension as torch_cpp_ext
@@ -162,6 +180,22 @@ if enable_aot:
                 os.environ["MAX_JOBS"] = str(max_num_jobs_cores)
 
             super().__init__(*args, **kwargs)
+
+        def finalize_options(self) -> None:
+            super().finalize_options()
+            if IS_WINDOWS:
+                self.build_temp = os.path.join(win_build_dir, "t")
+
+    # Custom clean step to remove short build dir
+    if IS_WINDOWS:
+        import distutils.command.clean
+
+        class WindowsCleanCommand(distutils.command.clean.clean):
+            def run(self):
+                super().run()
+                shutil.rmtree(win_build_dir, ignore_errors=True)
+
+        cmdclass["clean"] = WindowsCleanCommand
 
     # cuda arch check for fp8 at the moment.
     for cuda_arch_flags in torch_cpp_ext._get_cuda_arch_flags():
@@ -214,12 +248,12 @@ if enable_aot:
         cutlass.resolve() / "tools" / "util" / "include",
     ]
     cxx_flags = [
-        "-O3",
+        "-O2" if IS_WINDOWS else "-O3",
         "-Wno-switch-bool",
         "-DPy_LIMITED_API=0x03080000",
     ]
     nvcc_flags = [
-        "-O3",
+        "-O2" if IS_WINDOWS else "-O3",
         "-std=c++17",
         "--threads=1",
         "-Xfatbin",
@@ -227,6 +261,9 @@ if enable_aot:
         "-use_fast_math",
         "-DPy_LIMITED_API=0x03080000",
     ]
+    # excessive warnings on Windows increases compile time
+    if IS_WINDOWS:
+        nvcc_flags.append("--disable-warnings")
     libraries = [
         "cublas",
         "cublasLt",

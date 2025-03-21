@@ -29,6 +29,7 @@
 #include <cuda_fp8.h>
 #endif
 
+#ifndef _WIN32
 #ifndef FLASHINFER_EXT_MODULE_INITED
 #define FLASHINFER_EXT_MODULE_INITED
 
@@ -63,6 +64,7 @@ FLASHINFER_EXT_MODULE_INIT_EXPAND(TORCH_EXTENSION_NAME)
 #undef FLASHINFER_EXT_MODULE_INIT
 #undef FLASHINFER_EXT_MODULE_INIT_EXPAND
 
+#endif
 #endif
 
 #ifdef FLASHINFER_ENABLE_F16
@@ -173,26 +175,26 @@ FLASHINFER_EXT_MODULE_INIT_EXPAND(TORCH_EXTENSION_NAME)
 
 #define _DISPATCH_CASE(case_expr, case_var, ...) \
   case case_expr: {                              \
-    constexpr auto case_var = case_expr;         \
+    static constexpr auto case_var = case_expr;  \
     return __VA_ARGS__();                        \
   }
 
 #define _DISPATCH_CASE_U16x2(case_expr1, case_expr2, case_var1, case_var2, ...) \
   case pack_u16(case_expr1, case_expr2): {                                      \
-    constexpr auto case_var1 = case_expr1;                                      \
-    constexpr auto case_var2 = case_expr2;                                      \
+    static constexpr auto case_var1 = case_expr1;                               \
+    static constexpr auto case_var2 = case_expr2;                               \
     return __VA_ARGS__();                                                       \
   }
 
-#define DISPATCH_BOOL(expr, const_expr, ...) \
-  [&]() -> bool {                            \
-    if (expr) {                              \
-      constexpr bool const_expr = true;      \
-      return __VA_ARGS__();                  \
-    } else {                                 \
-      constexpr bool const_expr = false;     \
-      return __VA_ARGS__();                  \
-    }                                        \
+#define DISPATCH_BOOL(expr, const_expr, ...)    \
+  [&]() -> bool {                               \
+    if (expr) {                                 \
+      static constexpr bool const_expr = true;  \
+      return __VA_ARGS__();                     \
+    } else {                                    \
+      static constexpr bool const_expr = false; \
+      return __VA_ARGS__();                     \
+    }                                           \
   }()
 
 inline void check_shape(const at::Tensor& a, const at::Tensor& b, const char* a_name,

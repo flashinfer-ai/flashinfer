@@ -21,10 +21,10 @@ using DTypeKV = cutlass_dtype_t<{{ dtype_kv }}>;
 using DTypeO = cutlass_dtype_t<{{ dtype_o }}>;
 using IdType = cutlass_dtype_t<int32_t>;
 
-constexpr int HEAD_DIM_QK = {{ head_dim_qk }};
-constexpr int HEAD_DIM_VO = {{ head_dim_vo }};
-constexpr auto USE_LOGITS_SOFT_CAP = {{ use_logits_soft_cap }};
-constexpr auto USE_SLIDING_WINDOW = {{ use_sliding_window }};
+static constexpr int HEAD_DIM_QK = {{ head_dim_qk }};
+static constexpr int HEAD_DIM_VO = {{ head_dim_vo }};
+static constexpr auto USE_LOGITS_SOFT_CAP = {{ use_logits_soft_cap }};
+static constexpr auto USE_SLIDING_WINDOW = {{ use_sliding_window }};
 
 struct Params {
   using DTypeQ = DTypeQ;

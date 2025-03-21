@@ -147,7 +147,12 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
     bool enable_cuda_graph, cudaStream_t stream) {
   using DTypeKV = typename Params::DTypeKV;
   using IdType = typename Params::IdType;
+#ifdef _WIN32
+  constexpr uint32_t vec_size =
+      std::max(16UL / sizeof(DTypeKV), (unsigned long long)HEAD_DIM / 32UL);
+#else
   constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL);
+#endif
   auto compute_capacity = GetCudaComputeCapability();
   DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
     constexpr uint32_t bdx = HEAD_DIM / vec_size;
@@ -188,8 +193,9 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatched(
         num_pages[batch_idx] = kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx];
       }
       std::tie(max_num_pages_per_batch, new_batch_size) =
-          PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(max_grid_size, gdy, num_pages,
-                                                              std::max(128 / page_size, 1U));
+          PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(
+              max_grid_size, gdy, num_pages,
+              std::max((unsigned int)128 / (unsigned int)page_size, (unsigned int)1U));
       if (new_batch_size == batch_size && !enable_cuda_graph) {
         // do not use partition-kv kernel for short sequence, when not using CUDAGraph
         split_kv = false;
@@ -211,9 +217,14 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA(
   using DTypeKV = typename Params::DTypeKV;
   using IdType = typename Params::IdType;
 
+#ifdef _WIN32
+  constexpr uint32_t vec_size_ckv =
+      std::max(16UL / sizeof(DTypeKV), (unsigned long long)HEAD_DIM_CKV / 32UL);
+#else
+  constexpr uint32_t vec_size_ckv = std::max(16UL / sizeof(DTypeKV), HEAD_DIM_CKV / 32UL);
+#endif
   auto compute_capacity = GetCudaComputeCapability();
   DISPATCH_COMPUTE_CAP_DECODE_NUM_STAGES_SMEM(compute_capacity, NUM_STAGES_SMEM, {
-    constexpr uint32_t vec_size_ckv = std::max(16UL / sizeof(DTypeKV), HEAD_DIM_CKV / 32UL);
     constexpr uint32_t bdx = HEAD_DIM_CKV / vec_size_ckv;
     constexpr uint32_t vec_size_kpe = HEAD_DIM_KPE / bdx;
 
@@ -254,8 +265,9 @@ inline cudaError_t BatchDecodeWithPagedKVCacheWorkEstimationDispatchedMLA(
         num_pages[batch_idx] = kv_indptr_h[batch_idx + 1] - kv_indptr_h[batch_idx];
       }
       std::tie(max_num_pages_per_batch, new_batch_size) =
-          PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(max_grid_size, gdy, num_pages,
-                                                              std::max(128 / page_size, 1U));
+          PartitionPagedKVCacheBinarySearchMinNumPagePerBatch(
+              max_grid_size, gdy, num_pages,
+              std::max((unsigned int)128 / (unsigned int)page_size, (unsigned int)1U));
       if (new_batch_size == batch_size && !enable_cuda_graph) {
         // do not use partition-kv kernel for short sequence, when not using CUDAGraph
         split_kv = false;
@@ -1117,8 +1129,11 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
     }
     return ceil_div(x, 256) * 256;
   };
-
+#ifdef _WIN32
+  int kv_len_limit = f(std::max(ceil_div(total_kv_lens, num_clusters), (int64_t)1L));
+#else
   int kv_len_limit = f(std::max(ceil_div(total_kv_lens, num_clusters), 1L));
+#endif
 
   // step 1. load-balancing scheduling algorithm
   MinHeap cluster_cost_heap(num_clusters);

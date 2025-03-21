@@ -7,6 +7,7 @@
 #include <flashinfer/fastdiv.cuh>
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/attention/mask.cuh>
+#include <flashinfer/attention/pod.cuh>
 #include <flashinfer/attention/variant_helper.cuh>
 #include <flashinfer/attention/default_prefill_params.cuh>
 
@@ -16,19 +17,19 @@ using DTypeQ = {{ dtype_q }};
 using DTypeKV = {{ dtype_kv }};
 using DTypeO = {{ dtype_o }};
 using IdType = {{ idtype }};
-constexpr int HEAD_DIM_QK = {{ head_dim_qk }};
-constexpr int HEAD_DIM_VO = {{ head_dim_vo }};
-constexpr bool USE_FP16_QK_REDUCTION = {{ use_fp16_qk_reduction }};
-constexpr auto USE_LOGITS_SOFT_CAP_P = {{ use_logits_soft_cap_p }};
-constexpr auto POS_ENCODING_MODE_P = {{ pos_encoding_mode_p }};
-constexpr auto USE_SLIDING_WINDOW_P = {{ use_sliding_window_p }};
+static constexpr int HEAD_DIM_QK = {{ head_dim_qk }};
+static constexpr int HEAD_DIM_VO = {{ head_dim_vo }};
+static constexpr bool USE_FP16_QK_REDUCTION = {{ use_fp16_qk_reduction }};
+static constexpr auto USE_LOGITS_SOFT_CAP_P = {{ use_logits_soft_cap_p }};
+static constexpr auto POS_ENCODING_MODE_P = {{ pos_encoding_mode_p }};
+static constexpr auto USE_SLIDING_WINDOW_P = {{ use_sliding_window_p }};
 
-constexpr auto USE_LOGITS_SOFT_CAP_D = {{ use_logits_soft_cap_d }};
-constexpr auto POS_ENCODING_MODE_D = {{ pos_encoding_mode_d }};
-constexpr auto USE_SLIDING_WINDOW_D = {{ use_sliding_window_d }};
+static constexpr auto USE_LOGITS_SOFT_CAP_D = {{ use_logits_soft_cap_d }};
+static constexpr auto POS_ENCODING_MODE_D = {{ pos_encoding_mode_d }};
+static constexpr auto USE_SLIDING_WINDOW_D = {{ use_sliding_window_d }};
 
-constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;
-constexpr bool USE_LOGITS_SOFT_CAP = false;
+static constexpr auto POS_ENCODING_MODE = PosEncodingMode::kNone;
+static constexpr bool USE_LOGITS_SOFT_CAP = false;
 
 using PrefillParams = SinglePrefillParams<DTypeQ, DTypeKV, DTypeO>;
 using DecodeParams = BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO, IdType>;

@@ -650,7 +650,12 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
   const uint32_t num_kv_heads = params.num_kv_heads;
   const uint32_t seq_len = params.kv_len;
 
+#ifdef _WIN32
+  constexpr uint32_t vec_size =
+      std::max(16UL / sizeof(DTypeKV), (unsigned long long)HEAD_DIM / 32UL);
+#else
   constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL);
+#endif
   constexpr uint32_t bdx = HEAD_DIM / vec_size;
   auto compute_capacity = GetCudaComputeCapability();
   static_assert(bdx <= 32U);
@@ -730,7 +735,12 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatched(Params params, typename Params
   const uint32_t num_kv_heads = params.paged_kv.num_heads;
   const uint32_t padded_batch_size = params.padded_batch_size;
 
+#ifdef _WIN32
+  constexpr uint32_t vec_size =
+      std::max(16UL / sizeof(DTypeKV), (unsigned long long)HEAD_DIM / 32UL);
+#else
   constexpr uint32_t vec_size = std::max(16UL / sizeof(DTypeKV), HEAD_DIM / 32UL);
+#endif
   auto compute_capacity = GetCudaComputeCapability();
   constexpr uint32_t bdx = HEAD_DIM / vec_size;
   static_assert(bdx <= 32);
@@ -899,7 +909,11 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMLA(Params params) {
   constexpr uint32_t kv_iter_len = bdy * bdz;
   constexpr uint32_t compute_qk_tile = bdy;
 
+#ifdef _WIN32
+  extern __shared__ uint8_t smem[];
+#else
   extern __attribute__((shared)) uint8_t smem[];
+#endif
   DTypeKV* ckv_smem = (DTypeKV*)smem;
   DTypeKV* kpe_smem = (DTypeKV*)((uint8_t*)ckv_smem +
                                  num_stages_smem * kv_iter_len * head_dim_ckv * sizeof(DTypeKV));
@@ -1053,7 +1067,12 @@ cudaError_t BatchDecodeWithPagedKVCacheDispatchedMLA(Params params, typename Par
   const uint32_t num_qo_heads = params.num_qo_heads;
   const uint32_t padded_batch_size = params.padded_batch_size;
 
+#ifdef _WIN32
+  constexpr uint32_t vec_size_ckv =
+      std::max(16UL / sizeof(DTypeKV), (unsigned long long)HEAD_DIM_CKV / 32UL);
+#else
   constexpr uint32_t vec_size_ckv = std::max(16UL / sizeof(DTypeKV), HEAD_DIM_CKV / 32UL);
+#endif
   constexpr uint32_t bdx = HEAD_DIM_CKV / vec_size_ckv;
   constexpr uint32_t vec_size_kpe = HEAD_DIM_KPE / bdx;
 
