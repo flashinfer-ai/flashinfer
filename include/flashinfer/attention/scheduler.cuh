@@ -503,13 +503,13 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_start_ptr_h, uint32_t* qo_len_ptr_
   std::vector<int64_t> packed_qo_len_arr(batch_size), kv_len_arr(batch_size);
   for (uint32_t i = 0; i < batch_size; ++i) {
     packed_qo_len_arr[i] = int64_t(qo_len_ptr_h[i]) * int64_t(gqa_group_size);
-    if (packed_qo_len_arr[i] <= 0) {
+    if (packed_qo_len_arr[i] < 0) {
       std::ostringstream err_msg;
       err_msg << "qo_len_ptr_h[" << i << "]: " << qo_len_ptr_h[i] << " should be non-negative";
       FLASHINFER_ERROR(err_msg.str());
     }
     kv_len_arr[i] = int64_t(kv_len_ptr_h[i]);
-    if (kv_len_arr[i] <= 0) {
+    if (kv_len_arr[i] < 0) {
       std::ostringstream err_msg;
       err_msg << "kv_len_ptr_h[" << i << "]: " << kv_len_ptr_h[i] << " should be positive";
       FLASHINFER_ERROR(err_msg.str());
