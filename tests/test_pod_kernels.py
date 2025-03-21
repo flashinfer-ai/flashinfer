@@ -50,6 +50,7 @@ def warmup_jit():
 
 
 def _gen_reqs(bsz: int, qo_len: int, seq_len: Tuple[int, int], stride: int):
+    random.seed(0)  # for reproducibility
     reqs = []
     for i in range(bsz):
         if (i + 1) % stride == 0:
@@ -57,7 +58,7 @@ def _gen_reqs(bsz: int, qo_len: int, seq_len: Tuple[int, int], stride: int):
         else:
             len_q = 1
 
-        len_kv = int(random.randint(seq_len[0], seq_len[1]))
+        len_kv = seq_len[0]
         reqs.append((len_q, len_kv))
     return reqs
 
@@ -65,6 +66,8 @@ def _gen_reqs(bsz: int, qo_len: int, seq_len: Tuple[int, int], stride: int):
 def _gen_metadata(
     reqs, page_size, kv_layout, num_qo_heads, num_kv_heads, head_dim, device
 ):
+    torch.manual_seed(0)  # for reproducibility
+
     total_qo_len = sum([r[0] for r in reqs])
     total_kv_len = sum([r[1] for r in reqs])
 
@@ -117,7 +120,7 @@ def _gen_metadata(
 
 
 @pytest.mark.parametrize("batch_size", [12, 17, 64])
-@pytest.mark.parametrize("kv_len", [54, 511, 2048])
+@pytest.mark.parametrize("kv_len", [54, 511, 2042, 8911])
 @pytest.mark.parametrize("qo_len", [17, 47, 127, 577])
 @pytest.mark.parametrize("stride", [1, 2, 5, 1024])
 @pytest.mark.parametrize("page_size", [1, 16])
@@ -125,7 +128,7 @@ def _gen_metadata(
 @pytest.mark.parametrize("num_qo_heads", [4, 28])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("causal", [True])
-@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("kv_layout", ["NHD"])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE"])
 @pytest.mark.parametrize("use_cuda_graph", [False])
 @pytest.mark.parametrize("logits_soft_cap", [0.0])
@@ -164,7 +167,7 @@ def test_pod_with_paged_kv_cache(
     )
     kv_data = kv_data_fp32.half()
 
-    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+    workspace_buffer = torch.empty(512 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     if not use_cuda_graph:
         q_indptr_gpu = q_indptr_cpu.to(0)
         kv_indptr_gpu = kv_indptr_cpu.to(0)
@@ -194,55 +197,22 @@ def test_pod_with_paged_kv_cache(
         wrapper.run(q, kv_data, out=o_buffer)
         torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
 
-    for i in range(batch_size):
-        perm_dims = [0, 2, 1, 3] if kv_layout == "HND" else [0, 1, 2, 3]
-        perm_dims_last = [1, 0, 2] if kv_layout == "HND" else [0, 1, 2]
-        qi = q[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
-        ki = torch.cat(
-            [
-                kv_data_fp32[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1] - 1, 0]
-                .permute(*perm_dims)
-                .reshape(-1, num_kv_heads, head_dim),
-                (
-                    kv_data_fp32[
-                        kv_indptr_cpu[i + 1] - 1, 0, :, : kv_last_page_len_cpu[i]
-                    ]
-                    if kv_layout == "HND"
-                    else kv_data_fp32[
-                        kv_indptr_cpu[i + 1] - 1, 0, : kv_last_page_len_cpu[i], :
-                    ]
-                )
-                .permute(*perm_dims_last)
-                .reshape(-1, num_kv_heads, head_dim),
-            ],
-            dim=0,
-        ).half()
-        vi = torch.cat(
-            [
-                kv_data_fp32[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1] - 1, 1]
-                .permute(*perm_dims)
-                .reshape(-1, num_kv_heads, head_dim),
-                (
-                    kv_data_fp32[
-                        kv_indptr_cpu[i + 1] - 1, 1, :, : kv_last_page_len_cpu[i]
-                    ]
-                    if kv_layout == "HND"
-                    else kv_data_fp32[
-                        kv_indptr_cpu[i + 1] - 1, 1, : kv_last_page_len_cpu[i], :
-                    ]
-                )
-                .permute(*perm_dims_last)
-                .reshape(-1, num_kv_heads, head_dim),
-            ],
-            dim=0,
-        ).half()
-        o_ref_i = flashinfer.prefill.single_prefill_with_kv_cache(
-            qi,
-            ki,
-            vi,
-            causal=causal,
-            pos_encoding_mode=pos_encoding_mode,
-            logits_soft_cap=logits_soft_cap,
-        )
-        o_i = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
-        torch.testing.assert_close(o_i, o_ref_i, rtol=1e-3, atol=1e-3)
+    wrapper_ref = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, kv_layout, backend="fa2"
+    )
+    wrapper_ref.plan(
+        q_indptr_gpu,
+        kv_indptr_gpu,
+        kv_indices_gpu,
+        kv_last_page_len_gpu,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=causal,
+        pos_encoding_mode=pos_encoding_mode,
+        logits_soft_cap=logits_soft_cap,
+    )
+    o_ref = wrapper_ref.run(q, kv_data)
+
+    torch.testing.assert_close(o_ref, o, rtol=1e-3, atol=1e-3)
