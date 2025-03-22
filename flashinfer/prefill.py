@@ -1195,7 +1195,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         rope_theta: Optional[float] = None,
         q_data_type: Union[str, torch.dtype] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
-        non_blocking: bool = False,
+        non_blocking: bool = True,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1269,8 +1269,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         kv_data_type : Optional[Union[str, torch.dtype]]
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
         non_blocking : bool
-            Whether to copy the input tensors to the device asynchronously, defaults to ``False``.
-            If ``True``, user should synchronize before calling :meth:`run` or cuda graph replay.
+            Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
 
         Note
         ----
@@ -1349,11 +1348,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
             self._qo_indptr_buf.copy_(qo_indptr, non_blocking=non_blocking)
             self._paged_kv_indptr_buf.copy_(paged_kv_indptr, non_blocking=non_blocking)
-            self._paged_kv_indices_buf[: len(paged_kv_indices)].copy_(
-                paged_kv_indices, non_blocking=non_blocking
-            )
             self._paged_kv_last_page_len_buf.copy_(
                 paged_kv_last_page_len, non_blocking=non_blocking
+            )
+            self._paged_kv_indices_buf[: len(paged_kv_indices)].copy_(
+                paged_kv_indices,
+                non_blocking=(paged_kv_indices.device == self.device) and non_blocking,
             )
 
             if packed_custom_mask is not None:
@@ -1366,7 +1366,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         "mask_indptr_buf must be initialized with a torch.Tensor in cuda graph mode if we use custom mask in attention computation."
                     )
                 self._custom_mask_buf[: len(packed_custom_mask)].copy_(
-                    packed_custom_mask, non_blocking=non_blocking
+                    packed_custom_mask,
+                    non_blocking=(packed_custom_mask.device == self.device)
+                    and non_blocking,
                 )
                 # NOTE(Zihao): mask_indptr has the same length as qo_indptr
                 self._mask_indptr_buf.copy_(mask_indptr, non_blocking=non_blocking)
