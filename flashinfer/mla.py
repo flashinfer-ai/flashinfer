@@ -254,7 +254,7 @@ class BatchMLAPagedAttentionWrapper:
         self._use_profiler = use_profiler
 
         with self.device as device:
-            self._plan_info = self._cached_module.plan(
+            self._plan_info = self._cached_module.plan.default(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._pin_memory_int_workspace_buffer,
@@ -349,7 +349,7 @@ class BatchMLAPagedAttentionWrapper:
                         lse, q_nope.shape[:2], torch.float32, q_nope.device, "lse"
                     )
             profiler_args = (profiler_buffer,) if self._use_profiler else ()
-            self._cached_module.run(
+            self._cached_module.run.default(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
                 self._plan_info,

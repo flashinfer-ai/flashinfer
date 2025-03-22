@@ -73,13 +73,13 @@ def get_single_prefill_module(backend):
                 if backend == "fa2":
                     _kernels = torch.ops.flashinfer_kernels
 
-                    run_func = _kernels.single_prefill_with_kv_cache
+                    run_func = _kernels.single_prefill_with_kv_cache.default
                 else:
                     _kernels_sm90 = torch.ops.flashinfer_kernels_sm90
 
-                    run_func = _kernels_sm90.single_prefill_with_kv_cache_sm90
+                    run_func = _kernels_sm90.single_prefill_with_kv_cache_sm90.default
             else:
-                run_func = gen_single_prefill_module(backend, *args).run
+                run_func = gen_single_prefill_module(backend, *args).run.default
 
             # torch library for single_prefill_with_kv_cache
 
@@ -180,24 +180,30 @@ def get_batch_prefill_module(backend):
                 if backend == "fa2":
                     _kernels = torch.ops.flashinfer_kernels
 
-                    plan_func = _kernels.batch_prefill_with_kv_cache_plan
-                    ragged_run_func = _kernels.batch_prefill_with_ragged_kv_cache_run
-                    paged_run_func = _kernels.batch_prefill_with_paged_kv_cache_run
+                    plan_func = _kernels.batch_prefill_with_kv_cache_plan.default
+                    ragged_run_func = (
+                        _kernels.batch_prefill_with_ragged_kv_cache_run.default
+                    )
+                    paged_run_func = (
+                        _kernels.batch_prefill_with_paged_kv_cache_run.default
+                    )
                 else:
                     _kernels_sm90 = torch.ops.flashinfer_kernels_sm90
 
-                    plan_func = _kernels_sm90.batch_prefill_with_kv_cache_sm90_plan
+                    plan_func = (
+                        _kernels_sm90.batch_prefill_with_kv_cache_sm90_plan.default
+                    )
                     ragged_run_func = (
-                        _kernels_sm90.batch_prefill_with_ragged_kv_cache_sm90_run
+                        _kernels_sm90.batch_prefill_with_ragged_kv_cache_sm90_run.default
                     )
                     paged_run_func = (
-                        _kernels_sm90.batch_prefill_with_paged_kv_cache_sm90_run
+                        _kernels_sm90.batch_prefill_with_paged_kv_cache_sm90_run.default
                     )
             else:
                 module = gen_batch_prefill_module(backend, *args)
-                plan_func = module.plan
-                ragged_run_func = module.ragged_run
-                paged_run_func = module.paged_run
+                plan_func = module.plan.default
+                ragged_run_func = module.ragged_run.default
+                paged_run_func = module.paged_run.default
 
             # torch library for ragged_run
 
@@ -437,9 +443,9 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
     if module_name in _batch_prefill_jit_modules:
         return _batch_prefill_jit_modules[module_name]
 
-    plan_func = jit_module.plan
-    ragged_run_func = jit_module.ragged_run
-    paged_run_func = jit_module.paged_run
+    plan_func = jit_module.plan.default
+    ragged_run_func = jit_module.ragged_run.default
+    paged_run_func = jit_module.paged_run.default
 
     # torch library for ragged_run
     @register_custom_op(
@@ -611,7 +617,7 @@ def single_prefill_with_kv_cache_with_jit_module(
             lse = torch.empty(
                 (q.size(0), q.size(1)), dtype=torch.float32, device=device
             )
-        jit_module.run(
+        jit_module.run.default(
             q,
             k,
             v,

@@ -66,7 +66,7 @@ def get_gemm_module():
         ) -> None:
             with A.device as device:
                 cublas_handle = torch.cuda.current_blas_handle()
-                module.bmm_fp8(
+                module.bmm_fp8.default(
                     A,
                     B,
                     D,
@@ -105,7 +105,7 @@ def get_gemm_module():
             weight_column_major: bool,
         ) -> None:
             with x_data.device as device:
-                module.cutlass_segment_gemm(
+                module.cutlass_segment_gemm.default(
                     workspace_buffer,
                     all_problems,
                     x_data,
@@ -182,7 +182,7 @@ def get_gemm_sm90_module():
             weight_column_major: bool,
         ) -> None:
             with x_data.device as device:
-                module.cutlass_segment_gemm_sm90(
+                module.cutlass_segment_gemm_sm90.default(
                     workspace_buffer,
                     int_workspace_buffer,
                     all_problems,

@@ -55,7 +55,7 @@ def get_sampling_module():
                 probs = probs.float()
                 batch_size = indices.size(0) if indices is not None else probs.size(0)
                 samples = torch.empty(batch_size, dtype=torch.int32, device=device)
-                module.sampling_from_probs(
+                module.sampling_from_probs.default(
                     probs,
                     samples,
                     indices,
@@ -93,7 +93,7 @@ def get_sampling_module():
                 )
                 batch_size = indices.size(0) if indices is not None else probs.size(0)
                 samples = torch.empty(batch_size, dtype=torch.int32, device=device)
-                module.top_p_sampling_from_probs(
+                module.top_p_sampling_from_probs.default(
                     probs,
                     samples,
                     indices,
@@ -135,7 +135,7 @@ def get_sampling_module():
                     maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
                 )
                 samples = torch.empty(batch_size, dtype=torch.int32, device=device)
-                module.top_k_sampling_from_probs(
+                module.top_k_sampling_from_probs.default(
                     probs,
                     samples,
                     indices,
@@ -178,7 +178,7 @@ def get_sampling_module():
                 )
                 batch_size = indices.size(0) if indices is not None else probs.size(0)
                 samples = torch.empty(batch_size, dtype=torch.int32, device=device)
-                module.min_p_sampling_from_probs(
+                module.min_p_sampling_from_probs.default(
                     probs,
                     samples,
                     indices,
@@ -215,7 +215,7 @@ def get_sampling_module():
                 )
                 batch_size = indices.size(0) if indices is not None else probs.size(0)
                 samples = torch.empty(batch_size, dtype=torch.int32, device=device)
-                module.top_k_top_p_sampling_from_probs(
+                module.top_k_top_p_sampling_from_probs.default(
                     probs,
                     samples,
                     indices,
@@ -258,7 +258,7 @@ def get_sampling_module():
                     maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
                 )
                 renorm_probs = torch.empty_like(probs)
-                module.top_p_renorm_probs(
+                module.top_p_renorm_probs.default(
                     probs,
                     renorm_probs,
                     maybe_top_p_arr,
@@ -289,7 +289,7 @@ def get_sampling_module():
                     maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
                 )
                 renorm_probs = torch.empty_like(probs)
-                module.top_k_renorm_probs(
+                module.top_k_renorm_probs.default(
                     probs,
                     renorm_probs,
                     maybe_top_k_arr,
@@ -320,7 +320,7 @@ def get_sampling_module():
                     maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
                 )
                 mask_logits = torch.empty_like(logits)
-                module.top_k_mask_logits(
+                module.top_k_mask_logits.default(
                     logits,
                     mask_logits,
                     maybe_top_k_arr,
@@ -362,7 +362,7 @@ def get_sampling_module():
                 output_token_ids = torch.empty(
                     (b, n + 1), dtype=torch.int32, device=device
                 )
-                module.chain_speculative_sampling(
+                module.chain_speculative_sampling.default(
                     draft_probs,
                     draft_token_ids,
                     target_probs,

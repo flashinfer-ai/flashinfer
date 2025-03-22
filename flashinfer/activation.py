@@ -66,7 +66,7 @@ def get_act_and_mul_module(act_func_name: str):
 
         # torch library for act_and_mul
         fname = f"{act_func_name}_and_mul"
-        fn = getattr(module, fname)
+        fn = getattr(module, fname).default
 
         @register_custom_op(f"flashinfer::{fname}", mutates_args=("out",))
         def _act_and_mul(
