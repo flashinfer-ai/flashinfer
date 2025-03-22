@@ -413,7 +413,7 @@ class BlockSparseAttentionWrapper:
 
             kv_lens_arr_host = (kv_indptr_host[1:] - kv_indptr_host[:-1]) * self.C
             self._kv_lens_buffer[: len(kv_lens_arr_host)].copy_(
-                kv_lens_arr_host, non_blocking=non_blocking
+                kv_lens_arr_host,
             )
 
             if self._backend == "fa3":

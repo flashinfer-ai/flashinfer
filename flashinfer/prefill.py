@@ -1348,11 +1348,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
             self._qo_indptr_buf.copy_(qo_indptr, non_blocking=non_blocking)
             self._paged_kv_indptr_buf.copy_(paged_kv_indptr, non_blocking=non_blocking)
-            self._paged_kv_indices_buf[: len(paged_kv_indices)].copy_(
-                paged_kv_indices, non_blocking=non_blocking
-            )
             self._paged_kv_last_page_len_buf.copy_(
                 paged_kv_last_page_len, non_blocking=non_blocking
+            )
+            self._paged_kv_indices_buf[: len(paged_kv_indices)].copy_(
+                paged_kv_indices,
+                non_blocking=(paged_kv_indices.device == self.device) and non_blocking,
             )
 
             if packed_custom_mask is not None:
@@ -1365,7 +1366,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         "mask_indptr_buf must be initialized with a torch.Tensor in cuda graph mode if we use custom mask in attention computation."
                     )
                 self._custom_mask_buf[: len(packed_custom_mask)].copy_(
-                    packed_custom_mask, non_blocking=non_blocking
+                    packed_custom_mask,
+                    non_blocking=(packed_custom_mask.device == self.device)
+                    and non_blocking,
                 )
                 # NOTE(Zihao): mask_indptr has the same length as qo_indptr
                 self._mask_indptr_buf.copy_(mask_indptr, non_blocking=non_blocking)

@@ -370,11 +370,11 @@ class PODWithPagedKVCacheWrapper:
                     "The size of indices should be less than or equal to the allocated buffer"
                 )
             self._paged_kv_indptr_buf.copy_(indptr, non_blocking=non_blocking)
-            self._paged_kv_indices_buf[: len(indices)].copy_(
-                indices, non_blocking=non_blocking
-            )
             self._paged_kv_last_page_len_buf.copy_(
                 last_page_len, non_blocking=non_blocking
+            )
+            self._paged_kv_indices_buf[: len(indices)].copy_(
+                indices, non_blocking=(indices.device == self.device) and non_blocking
             )
         else:
             self._paged_kv_indptr_buf = indptr.to(
