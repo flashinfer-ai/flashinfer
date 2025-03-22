@@ -17,6 +17,10 @@
 
 #include "pytorch_extension_utils.h"
 
+#ifdef _WIN32
+#define M_SQRT1_2 0.707106781186547524401
+#endif
+
 using namespace flashinfer;
 
 __device__ __forceinline__ float silu(const float& val) { return val / (1.0f + __expf(-val)); }
