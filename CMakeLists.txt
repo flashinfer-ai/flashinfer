@@ -34,10 +34,29 @@ file(GLOB_RECURSE FLASHINFER_GENERATORS
 # NOTE: do not modify this file to change option values. You can create a
 # config.cmake at build folder and add set(OPTION VALUE) to override these build
 # options. Alternatively, use cmake -DOPTION=VALUE through command-line.
+
+# Individual C++ components of flashinfer
 flashinfer_option(FLASHINFER_TVM_BINDING
                   "Whether to compile tvm binding or not." OFF)
-flashinfer_option(FLASHINFER_TVM_SOURCE_DIR
-                  "The path to tvm for building tvm binding." "")
+flashinfer_option(FLASHINFER_BUILD_KERNELS
+                  "Build and install kernel libraries." OFF)
+flashinfer_option(FLASHINFER_DISTRIBUTED
+                  "Whether to install distributed all_reduce kernel." OFF)
+
+# Define available components before config setup
+set(FLASHINFER_COMPONENTS "Headers")
+if(FLASHINFER_BUILD_KERNELS)
+  list(APPEND FLASHINFER_COMPONENTS "Kernels")
+
+  # Only add TVMBinding if kernels are built and TVM binding is enabled
+  if(FLASHINFER_TVM_BINDING)
+    list(APPEND FLASHINFER_COMPONENTS "TVMBinding")
+  endif()
+endif()
+
+if(FLASHINFER_DISTRIBUTED)
+  list(APPEND FLASHINFER_COMPONENTS "Distributed")
+endif()
 
 add_subdirectory(libflashinfer)
 
@@ -52,13 +71,12 @@ write_basic_package_version_file(
   VERSION ${PROJECT_VERSION}
   COMPATIBILITY SameMajorVersion)
 
-# Pass the FLASHINFER_INSTALL_ONLY_HEADERS variable to the config template
-configure_package_config_file(
-  "${CMAKE_CURRENT_SOURCE_DIR}/cmake/flashinferConfig.cmake.in"
-  "${CMAKE_CURRENT_BINARY_DIR}/flashinferConfig.cmake"
-  INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/flashinfer)
+# Pass component information to the config template
+set(FLASHINFER_CONFIG_COMPONENTS "${FLASHINFER_COMPONENTS}")
 
-# Install the config files
-install(FILES "${CMAKE_CURRENT_BINARY_DIR}/flashinferConfig.cmake"
-              "${CMAKE_CURRENT_BINARY_DIR}/flashinferConfigVersion.cmake"
-        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/flashinfer)
+# Install the config files with Headers component
+install(
+  FILES "${CMAKE_CURRENT_BINARY_DIR}/flashinferConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/flashinferConfigVersion.cmake"
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/flashinfer
+  COMPONENT Headers)

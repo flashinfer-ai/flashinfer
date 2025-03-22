@@ -14,27 +14,33 @@ find_package(Thrust REQUIRED)
 # NOTE: do not modify this file to change option values. You can create a
 # config.cmake at build folder and add set(OPTION VALUE) to override these build
 # options. Alternatively, use cmake -DOPTION=VALUE through command-line.
-# cmake-format: off
-flashinfer_option(FLASHINFER_ENABLE_FP8      "Whether to compile fp8 kernels or not."         ON)
-flashinfer_option(FLASHINFER_ENABLE_FP8_E4M3 "Whether to compile fp8_e4m3 kernels or not."    ON)
-flashinfer_option(FLASHINFER_ENABLE_FP8_E5M2 "Whether to compile fp8_e5m2 kernels or not."    ON)
-flashinfer_option(FLASHINFER_ENABLE_F16      "Whether to compile f16 kernels or not."         ON)
-flashinfer_option(FLASHINFER_ENABLE_BF16     "Whether to compile bf16 kernels or not."        ON)
-flashinfer_option(FLASHINFER_ENABLE_DIST     "Whether to compile distributed all_reduce"      OFF)
-flashinfer_option(FLASHINFER_UNITTESTS       "Whether to configure libflashinfer unit tests" OFF)
-flashinfer_option(FLASHINFER_DIST_UNITTESTS  "Whether to configure libflashinfer distributed unit tests" OFF)
-flashinfer_option(FLASHINFER_CXX_BENCHMARKS  "Whether to configure libflashinfer cxx benchmarks" OFF)
-# The following configurations can impact the binary size of the generated library
-flashinfer_option(FLASHINFER_GEN_HEAD_DIMS              "Head dims to enable" 128 256)
-flashinfer_option(FLASHINFER_GEN_POS_ENCODING_MODES     "Pos encodings to enable" 0)
-# FIXME: CAUTION!!! Turning on this option will cause build failures. (refer #806, #936)
-flashinfer_option(FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS "QK reductions to enable" OFF)
-flashinfer_option(FLASHINFER_GEN_MASK_MODES             "Mask modes to enable" 0 1 2)
 
-# Install options
-flashinfer_option(FLASHINFER_INSTALL_ONLY_HEADERS  "Whether to install only header files" ON)
-
-# cmake-format: on
+flashinfer_option(FLASHINFER_ENABLE_FP8
+                  "Whether to compile fp8 kernels or not." ON)
+flashinfer_option(FLASHINFER_ENABLE_FP8_E4M3
+                  "Whether to compile fp8_e4m3 kernels or not." ON)
+flashinfer_option(FLASHINFER_ENABLE_FP8_E5M2
+                  "Whether to compile fp8_e5m2 kernels or not." ON)
+flashinfer_option(FLASHINFER_ENABLE_F16
+                  "Whether to compile f16 kernels or not." ON)
+flashinfer_option(FLASHINFER_ENABLE_BF16
+                  "Whether to compile bf16 kernels or not." ON)
+flashinfer_option(FLASHINFER_UNITTESTS
+                  "Whether to configure libflashinfer unit tests" OFF)
+flashinfer_option(
+  FLASHINFER_DIST_UNITTESTS
+  "Whether to configure libflashinfer distributed unit tests" OFF)
+flashinfer_option(FLASHINFER_CXX_BENCHMARKS
+                  "Whether to configure libflashinfer cxx benchmarks" OFF)
+# The following configurations can impact the binary size of the generated
+# library
+flashinfer_option(FLASHINFER_GEN_HEAD_DIMS "Head dims to enable" 128 256)
+flashinfer_option(FLASHINFER_GEN_POS_ENCODING_MODES "Pos encodings to enable" 0)
+# FIXME: CAUTION!!! Turning on this option will cause build failures. (refer
+# #806, #936)
+flashinfer_option(FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS
+                  "QK reductions to enable" OFF)
+flashinfer_option(FLASHINFER_GEN_MASK_MODES "Mask modes to enable" 0 1 2)
 
 if(DEFINED FLASHINFER_CUDA_ARCHITECTURES)
   message(
@@ -205,19 +211,17 @@ set(CMAKE_CXX_FLAGS_DEBUG
     "${CMAKE_CXX_FLAGS_DEBUG} ${FLASHINFER_CXXFLAGS} -O0 -ggdb3 -DDEBUG")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} ${NVCC_FLAGS}")
 
-# Build decode_kernels and prefill_kernels if FLASHINFER_INSTALL_ONLY_HEADERS is
-# OFF or if tests or benchmarks are enabled
-if(NOT FLASHINFER_INSTALL_ONLY_HEADERS
+# Build decode_kernels and prefill_kernels if FLASHINFER_BUILD_KERNELS is ON or
+# if tests or benchmarks are enabled
+if(FLASHINFER_BUILD_KERNELS
    OR FLASHINFER_UNITTESTS
    OR FLASHINFER_CXX_BENCHMARKS)
-
   add_library(decode_kernels STATIC ${DECODE_KERNELS_SRCS})
   add_library(flashinfer::decode_kernels ALIAS decode_kernels)
   target_include_directories(decode_kernels PRIVATE ${FLASHINFER_INCLUDE_DIR})
   if(FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS)
     target_link_libraries(decode_kernels PRIVATE Boost::math)
   endif(FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS)
-  install(TARGETS decode_kernels EXPORT libflashinferTargets)
 
   add_library(prefill_kernels STATIC ${PREFILL_KERNELS_SRCS})
   add_library(flashinfer::prefill_kernels ALIAS prefill_kernels)
@@ -226,7 +230,16 @@ if(NOT FLASHINFER_INSTALL_ONLY_HEADERS
     add_definitions(-DFP16_QK_REDUCTION_SUPPORTED)
     target_link_libraries(prefill_kernels PRIVATE Boost::math)
   endif(FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS)
-  install(TARGETS prefill_kernels EXPORT libflashinferTargets)
+
+  # Add targets to export set
+  install(
+    TARGETS decode_kernels
+    EXPORT libflashinferTargets
+    COMPONENT Kernels)
+  install(
+    TARGETS prefill_kernels
+    EXPORT libflashinferTargets
+    COMPONENT Kernels)
 
   # Export targets from the build tree
   export(
@@ -239,89 +252,90 @@ if(NOT FLASHINFER_INSTALL_ONLY_HEADERS
     EXPORT libflashinferTargets
     FILE libflashinferTargets.cmake
     NAMESPACE flashinfer::
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/flashinfer)
-endif(
-  NOT FLASHINFER_INSTALL_ONLY_HEADERS
-  OR FLASHINFER_UNITTESTS
-  OR FLASHINFER_CXX_BENCHMARKS)
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/flashinfer
+    COMPONENT Kernels)
+endif()
 
 # Defines CMAKE_INSTALL_xxx: LIBDIR, INCLUDEDIR
 include(GNUInstallDirs)
 
-# Install all headers EXCEPT distributed ones that are conditional on
-# FLASHINFER_ENABLE_DIST as we want to install mscclpp headers too in that case
+# Install all headers (always installed) with Headers component except the
+# distributed directory as it is installed separately using the FLASHINFER_DIST
+# option.
 install(
   DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+  COMPONENT Headers
   FILES_MATCHING
   REGEX "\\.(cuh|h|hpp)$"
   PATTERN "distributed" EXCLUDE # Exclude the entire distributed directory
 )
 
-# Install Boost::math headers if FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS is ON
+# Install Boost::math headers with Headers component
 if(FLASHINFER_GEN_USE_FP16_QK_REDUCTIONS)
   install(
     DIRECTORY ${boost_math_SOURCE_DIR}/include/
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/
+    COMPONENT Headers
     FILES_MATCHING
     REGEX "\\.(h|hpp)$")
 endif()
 
-if(NOT FLASHINFER_INSTALL_ONLY_HEADERS)
+# Install libraries if kernels are built
+if(FLASHINFER_BUILD_KERNELS)
   # Install libraries
   install(
     TARGETS decode_kernels prefill_kernels
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT Kernels)
 endif()
 
-if(FLASHINFER_ENABLE_DIST OR FLASHINFER_DIST_UNITTESTS)
-  # ------------------------------ Dependencies
-  # ---------------------------------#
+if(FLASHINFER_DISTRIBUTED OR FLASHINFER_DIST_UNITTESTS)
+  # ------------------------------ Dependencies ------------------------------#
   FetchContent_Declare(
     mscclpp
     GIT_REPOSITORY https://github.com/microsoft/mscclpp.git
     GIT_TAG 11e62024d3eb190e005b4689f8c8443d91a6c82e)
-  # -----------------------------------------------------------------------------#
+  # --------------------------------------------------------------------------#
   FetchContent_MakeAvailable(mscclpp)
 
-  # Install the headers in thedistributed directory only if
-  # FLASHINFER_ENABLE_DIST is set.
-  install(
-    DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/flashinfer/distributed/
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/flashinfer/distributed
-    FILES_MATCHING
-    REGEX "\\.(cuh|h|hpp)$")
+  # Only install if FLASHINFER_DISTRIBUTED is enabled
+  if(FLASHINFER_DISTRIBUTED)
+    # Install the headers in the distributed directory
+    install(
+      DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/flashinfer/distributed/
+      DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/flashinfer/distributed
+      COMPONENT Distributed
+      FILES_MATCHING
+      REGEX "\\.(cuh|h|hpp)$")
 
-  # Install mscclpp headers
-  install(
-    DIRECTORY ${mscclpp_SOURCE_DIR}/include/
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-    FILES_MATCHING
-    REGEX "\\.(h|hpp|cuh)$")
+    # Install mscclpp headers with Distributed component
+    install(
+      DIRECTORY ${mscclpp_SOURCE_DIR}/include/
+      DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+      COMPONENT Distributed
+      FILES_MATCHING
+      REGEX "\\.(h|hpp|cuh)$")
 
-  # Create a wrapper interface library that doesn't depend on mscclpp but
-  # provides the same functionality via find_package
-  add_library(flashinfer_dist_wrapper INTERFACE)
-  add_library(flashinfer::dist_wrapper ALIAS flashinfer_dist_wrapper)
+    # Export the target files
+    export(
+      EXPORT flashinferDistTargets
+      FILE "${CMAKE_CURRENT_BINARY_DIR}/flashinferDistTargets.cmake"
+      NAMESPACE flashinfer::)
 
-  # Install this lightweight interface target
-  install(TARGETS flashinfer_dist_wrapper EXPORT flashinferDistTargets)
+    # Install the export set with proper component
+    install(
+      EXPORT flashinferDistTargets
+      FILE flashinferDistTargets.cmake
+      NAMESPACE flashinfer::
+      DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/flashinfer
+      COMPONENT Distributed)
+  endif()
 
-  # Install the export set
-  install(
-    EXPORT flashinferDistTargets
-    FILE flashinferDistTargets.cmake
-    NAMESPACE flashinfer::
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/flashinfer)
-
-  # For use within the project, create the regular interface
-  add_library(flashinfer_dist INTERFACE)
-  target_link_libraries(flashinfer_dist INTERFACE mscclpp)
-  add_library(flashinfer::dist ALIAS flashinfer_dist)
+  # Always define the alias for project use
   add_library(flashinfer::mscclpp ALIAS mscclpp)
-endif(FLASHINFER_ENABLE_DIST OR FLASHINFER_DIST_UNITTESTS)
+endif()
 
 if(FLASHINFER_UNITTESTS)
   add_subdirectory(tests)

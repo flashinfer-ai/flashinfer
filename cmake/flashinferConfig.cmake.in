@@ -6,65 +6,46 @@ include(CMakeFindDependencyMacro)
 # find_dependency(CUDA)
 # find_dependency(Thrust)
 
-# Define a variable indicating if this is a header-only installation
-set(FLASHINFER_HEADER_ONLY @FLASHINFER_INSTALL_ONLY_HEADERS@)
+# Define available components passed from main CMakeLists.txt
+set(_flashinfer_available_components @FLASHINFER_COMPONENTS@)
 
-# Include the exported targets file if it exists
-if(NOT FLASHINFER_HEADER_ONLY AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/libflashinferTargets.cmake")
-  include("${CMAKE_CURRENT_LIST_DIR}/libflashinferTargets.cmake")
-endif()
+# Initialize component found status
+foreach(_comp Headers Kernels TVMBinding Distributed)
+  set(flashinfer_${_comp}_FOUND FALSE)
+endforeach()
 
-# Define components
-set(_supported_components libflashinfer tvm_bindings distributed)
+# Mark available components as found
+foreach(_comp ${_flashinfer_available_components})
+  set(flashinfer_${_comp}_FOUND TRUE)
+endforeach()
 
-# Set header-only component as always found
-set(flashinfer_header_only_FOUND TRUE)
-
-# Check for required components
+# Check for requested components
 foreach(_comp ${flashinfer_FIND_COMPONENTS})
-  if (NOT ";${_supported_components};" MATCHES ";${_comp};")
+  if(NOT _comp IN_LIST _flashinfer_available_components)
     set(flashinfer_FOUND False)
-    set(flashinfer_NOT_FOUND_MESSAGE "Unsupported component: ${_comp}")
+    set(flashinfer_NOT_FOUND_MESSAGE "Requested component: ${_comp} is not available")
     return()
   endif()
 endforeach()
 
-# Check if libflashinfer component is requested
-if("libflashinfer" IN_LIST flashinfer_FIND_COMPONENTS)
-  if(FLASHINFER_HEADER_ONLY)
-    # For header-only installation, we indicate it's found but warn the user
-    set(flashinfer_libflashinfer_FOUND TRUE)
-    message(STATUS "flashinfer was installed as header-only - compiled libraries are not available")
-  else()
-    # For normal installation, check if the targets exist
-    if(TARGET flashinfer::decode_kernels AND TARGET flashinfer::prefill_kernels)
-      set(flashinfer_libflashinfer_FOUND TRUE)
-    else()
-      set(flashinfer_libflashinfer_FOUND FALSE)
-      if(flashinfer_FIND_REQUIRED_libflashinfer)
-        set(flashinfer_FOUND FALSE)
-        set(flashinfer_NOT_FOUND_MESSAGE "Required component libflashinfer was not found")
-      endif()
-    endif()
-  endif()
+# Headers component is always available and included
+set(flashinfer_Headers_FOUND TRUE)
+
+# Include kernel targets if available and requested
+if(flashinfer_Kernels_FOUND AND
+   ("Kernels" IN_LIST flashinfer_FIND_COMPONENTS OR NOT flashinfer_FIND_COMPONENTS))
+  include("${CMAKE_CURRENT_LIST_DIR}/libflashinferTargets.cmake" OPTIONAL)
 endif()
 
-# Check if TVM bindings are requested
-if("tvm_bindings" IN_LIST flashinfer_FIND_COMPONENTS)
-  if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/flashinferTVMBindingsTargets.cmake")
-    include("${CMAKE_CURRENT_LIST_DIR}/flashinferTVMBindingsTargets.cmake")
-    set(flashinfer_tvm_bindings_FOUND TRUE)
-  else()
-    set(flashinfer_tvm_bindings_FOUND FALSE)
-    if(flashinfer_FIND_REQUIRED_tvm_bindings)
-      set(flashinfer_FOUND FALSE)
-      set(flashinfer_NOT_FOUND_MESSAGE "Required component tvm_bindings was not found")
-    endif()
-  endif()
+# Include TVM binding targets if available and requested
+if(flashinfer_TVMBinding_FOUND AND
+   "TVMBinding" IN_LIST flashinfer_FIND_COMPONENTS)
+  include("${CMAKE_CURRENT_LIST_DIR}/flashinferTVMBindingTargets.cmake" OPTIONAL)
 endif()
 
-# Check if distributed component is requested
-if("distributed" IN_LIST flashinfer_FIND_COMPONENTS)
+# Include Distributed targets if available and requested
+if(flashinfer_Distributed_FOUND AND
+   "Distributed" IN_LIST flashinfer_FIND_COMPONENTS)
   # Find MPI which is required for distributed functionality
   find_dependency(MPI REQUIRED)
 
@@ -79,14 +60,15 @@ if("distributed" IN_LIST flashinfer_FIND_COMPONENTS)
   endif()
 
   include("${CMAKE_CURRENT_LIST_DIR}/flashinferDistTargets.cmake")
-  set(flashinfer_distributed_FOUND TRUE)
 endif()
 
 # Set include directories
 set(FLASHINFER_INCLUDE_DIRS "${PACKAGE_PREFIX_DIR}/include")
 
+# Print status message
 if(NOT flashinfer_FIND_QUIETLY)
   message(STATUS "Found flashinfer: ${PACKAGE_PREFIX_DIR} (version: ${flashinfer_VERSION})")
+  message(STATUS "Available components: ${_flashinfer_available_components}")
 endif()
 
 check_required_components(flashinfer)
