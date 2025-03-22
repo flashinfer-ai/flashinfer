@@ -67,9 +67,9 @@ def get_pod_module(*args):
             _kernels = torch.ops.flashinfer_kernels
             # torch library for pod_with_kv_cache
             # No tensor deprecated due to poor performance. Just use tensor cores for both.
-            run_tensor = _kernels.pod_with_kv_cache_tensor
+            run_tensor = _kernels.pod_with_kv_cache_tensor.default
         else:
-            run_tensor = gen_pod_module(*args).pod_with_kv_cache_tensor
+            run_tensor = gen_pod_module(*args).pod_with_kv_cache_tensor.default
         # Register the module
         _pod_modules[args] = SimpleNamespace(run_tensor=run_tensor)
     return _pod_modules[args]

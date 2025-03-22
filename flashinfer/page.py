@@ -72,7 +72,7 @@ def block_sparse_indices_to_vector_sparse_offsets(
         assert vector_sparse_indptr.dtype == torch.int32
         assert kv_lens.dtype == torch.int32
         batch_size = block_sparse_indptr.size(0) - 1
-        get_page_module().block_sparse_indices_to_vector_sparse_offsets(
+        get_page_module().block_sparse_indices_to_vector_sparse_offsets.default(
             block_sparse_indices,
             block_sparse_indptr,
             vector_sparse_offsets,
@@ -108,7 +108,7 @@ def _append_paged_mla_kv_cache_kernel(
         kv_indices = kv_indices.int()
         kv_indptr = kv_indptr.int()
         kv_last_page_len = kv_last_page_len.int()
-        get_page_module().append_paged_mla_kv_cache(
+        get_page_module().append_paged_mla_kv_cache.default(
             append_ckv,
             append_kpe,
             batch_indices,
@@ -144,7 +144,7 @@ def _append_paged_kv_cache_kernel(
         kv_indices = kv_indices.int()
         kv_indptr = kv_indptr.int()
         kv_last_page_len = kv_last_page_len.int()
-        get_page_module().append_paged_kv_cache(
+        get_page_module().append_paged_kv_cache.default(
             append_key,
             append_value,
             batch_indices,

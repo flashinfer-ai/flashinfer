@@ -87,7 +87,7 @@ def _rmsnorm(
     enable_pdl: bool,
 ) -> None:
     with input.device as device:  # device guard
-        get_norm_module().rmsnorm(
+        get_norm_module().rmsnorm.default(
             out, input, weight, eps, enable_pdl, get_cuda_stream(device)
         )
 
@@ -134,7 +134,7 @@ def fused_add_rmsnorm(
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
     """
     with input.device as device:  # device guard
-        get_norm_module().fused_add_rmsnorm(
+        get_norm_module().fused_add_rmsnorm.default(
             input, residual, weight, eps, enable_pdl, get_cuda_stream(device)
         )
 
@@ -195,7 +195,7 @@ def _gemma_rmsnorm(
     enable_pdl: bool,
 ) -> None:
     with input.device as device:  # device guard
-        get_norm_module().gemma_rmsnorm(
+        get_norm_module().gemma_rmsnorm.default(
             out, input, weight, eps, enable_pdl, get_cuda_stream(device)
         )
 
@@ -244,7 +244,7 @@ def gemma_fused_add_rmsnorm(
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
     """
     with input.device as device:
-        get_norm_module().gemma_fused_add_rmsnorm(
+        get_norm_module().gemma_fused_add_rmsnorm.default(
             input, residual, weight, eps, enable_pdl, get_cuda_stream(device)
         )
 

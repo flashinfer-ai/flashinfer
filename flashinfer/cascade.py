@@ -98,7 +98,7 @@ def merge_state(
         s_b = s_b.to(torch.float32)
         v_merged = torch.empty_like(v_a)
         s_merged = torch.empty_like(s_a)
-        get_cascade_module().merge_state(
+        get_cascade_module().merge_state.default(
             v_a, s_a, v_b, s_b, v_merged, s_merged, get_cuda_stream(device)
         )
         return v_merged, s_merged
@@ -160,7 +160,7 @@ def merge_state_in_place(
     with v.device as device:  # device guard
         s = s.to(torch.float32)
         s_other = s_other.to(torch.float32)
-        get_cascade_module().merge_state_in_place(
+        get_cascade_module().merge_state_in_place.default(
             v, s, v_other, s_other, mask, get_cuda_stream(device)
         )
 
@@ -221,7 +221,7 @@ def merge_states(v: torch.Tensor, s: torch.Tensor) -> Tuple[torch.Tensor, torch.
             seq_len, num_heads, head_dim, dtype=v.dtype, device=device
         )
         s_merged = torch.empty(seq_len, num_heads, dtype=torch.float32, device=device)
-        get_cascade_module().merge_states(
+        get_cascade_module().merge_states.default(
             v, s, v_merged, s_merged, get_cuda_stream(device)
         )
         return v_merged, s_merged

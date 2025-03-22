@@ -58,7 +58,7 @@ def _apply_rope(
     with q.device as device:
         indptr = indptr.int()
         offsets = offsets.int()
-        get_rope_module().apply_rope(
+        get_rope_module().apply_rope.default(
             q,
             k,
             q_rope,
@@ -108,7 +108,7 @@ def _apply_llama31_rope(
     with q.device as device:
         indptr = indptr.int()
         offsets = offsets.int()
-        get_rope_module().apply_llama31_rope(
+        get_rope_module().apply_llama31_rope.default(
             q,
             k,
             q_rope,
@@ -159,7 +159,7 @@ def _apply_rope_pos_ids(
 ) -> None:
     with q.device as device:
         pos_ids = pos_ids.int()
-        get_rope_module().apply_rope_pos_ids(
+        get_rope_module().apply_rope_pos_ids.default(
             q,
             k,
             q_rope,
@@ -202,7 +202,7 @@ def _apply_rope_pos_ids_cos_sin_cache(
 ) -> None:
     with q.device as device:
         pos_ids = pos_ids.int()
-        get_rope_module().apply_rope_pos_ids_cos_sin_cache(
+        get_rope_module().apply_rope_pos_ids_cos_sin_cache.default(
             q,
             k,
             q_rope,
@@ -247,7 +247,7 @@ def _apply_llama31_rope_pos_ids(
 ) -> None:
     with q.device as device:
         pos_ids = pos_ids.int()
-        get_rope_module().apply_llama31_rope_pos_ids(
+        get_rope_module().apply_llama31_rope_pos_ids.default(
             q,
             k,
             q_rope,
