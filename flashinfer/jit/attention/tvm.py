@@ -47,9 +47,8 @@ def gen_sampling_tvm_binding(uri: str):
         with open(src_path, "r") as f:
             source = f.read()
         write_if_different(dest_path, source)
-    
-    return uri, source_paths
 
+    return uri, source_paths
 
 
 def gen_customize_batch_prefill_tvm_binding(
