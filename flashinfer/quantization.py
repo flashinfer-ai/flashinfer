@@ -47,7 +47,9 @@ def _packbits(x: torch.Tensor, bitorder: str) -> torch.Tensor:
     with x.device as device:  # device guard
         x = x.to(torch.bool)
         y = torch.empty((x.size(0) + 7) // 8, dtype=torch.uint8, device=device)
-        get_quantization_module().packbits(x, bitorder, y, get_cuda_stream(device))
+        get_quantization_module().packbits.default(
+            x, bitorder, y, get_cuda_stream(device)
+        )
         return y
 
 
@@ -146,7 +148,7 @@ def segment_packbits(
         indptr = indptr.to(torch.int32)
         indptr_new = indptr_new.to(torch.int32)
         y = torch.empty(output_nnzs, dtype=torch.uint8, device=device)
-        get_quantization_module().segment_packbits(
+        get_quantization_module().segment_packbits.default(
             x, indptr, indptr_new, bitorder, y, get_cuda_stream(device)
         )
         return (

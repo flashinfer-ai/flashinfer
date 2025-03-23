@@ -73,13 +73,13 @@ def get_single_prefill_module(backend):
                 if backend == "fa2":
                     _kernels = torch.ops.flashinfer_kernels
 
-                    run_func = _kernels.single_prefill_with_kv_cache
+                    run_func = _kernels.single_prefill_with_kv_cache.default
                 else:
                     _kernels_sm90 = torch.ops.flashinfer_kernels_sm90
 
-                    run_func = _kernels_sm90.single_prefill_with_kv_cache_sm90
+                    run_func = _kernels_sm90.single_prefill_with_kv_cache_sm90.default
             else:
-                run_func = gen_single_prefill_module(backend, *args).run
+                run_func = gen_single_prefill_module(backend, *args).run.default
 
             # torch library for single_prefill_with_kv_cache
 
@@ -180,24 +180,30 @@ def get_batch_prefill_module(backend):
                 if backend == "fa2":
                     _kernels = torch.ops.flashinfer_kernels
 
-                    plan_func = _kernels.batch_prefill_with_kv_cache_plan
-                    ragged_run_func = _kernels.batch_prefill_with_ragged_kv_cache_run
-                    paged_run_func = _kernels.batch_prefill_with_paged_kv_cache_run
+                    plan_func = _kernels.batch_prefill_with_kv_cache_plan.default
+                    ragged_run_func = (
+                        _kernels.batch_prefill_with_ragged_kv_cache_run.default
+                    )
+                    paged_run_func = (
+                        _kernels.batch_prefill_with_paged_kv_cache_run.default
+                    )
                 else:
                     _kernels_sm90 = torch.ops.flashinfer_kernels_sm90
 
-                    plan_func = _kernels_sm90.batch_prefill_with_kv_cache_sm90_plan
+                    plan_func = (
+                        _kernels_sm90.batch_prefill_with_kv_cache_sm90_plan.default
+                    )
                     ragged_run_func = (
-                        _kernels_sm90.batch_prefill_with_ragged_kv_cache_sm90_run
+                        _kernels_sm90.batch_prefill_with_ragged_kv_cache_sm90_run.default
                     )
                     paged_run_func = (
-                        _kernels_sm90.batch_prefill_with_paged_kv_cache_sm90_run
+                        _kernels_sm90.batch_prefill_with_paged_kv_cache_sm90_run.default
                     )
             else:
                 module = gen_batch_prefill_module(backend, *args)
-                plan_func = module.plan
-                ragged_run_func = module.ragged_run
-                paged_run_func = module.paged_run
+                plan_func = module.plan.default
+                ragged_run_func = module.ragged_run.default
+                paged_run_func = module.paged_run.default
 
             # torch library for ragged_run
 
@@ -437,9 +443,9 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
     if module_name in _batch_prefill_jit_modules:
         return _batch_prefill_jit_modules[module_name]
 
-    plan_func = jit_module.plan
-    ragged_run_func = jit_module.ragged_run
-    paged_run_func = jit_module.paged_run
+    plan_func = jit_module.plan.default
+    ragged_run_func = jit_module.ragged_run.default
+    paged_run_func = jit_module.paged_run.default
 
     # torch library for ragged_run
     @register_custom_op(
@@ -611,7 +617,7 @@ def single_prefill_with_kv_cache_with_jit_module(
             lse = torch.empty(
                 (q.size(0), q.size(1)), dtype=torch.float32, device=device
             )
-        jit_module.run(
+        jit_module.run.default(
             q,
             k,
             v,
@@ -1195,7 +1201,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         rope_theta: Optional[float] = None,
         q_data_type: Union[str, torch.dtype] = "float16",
         kv_data_type: Optional[Union[str, torch.dtype]] = None,
-        non_blocking: bool = False,
+        non_blocking: bool = True,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1269,8 +1275,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         kv_data_type : Optional[Union[str, torch.dtype]]
             The data type of the key/value tensor. If None, will be set to :attr:`q_data_type`.
         non_blocking : bool
-            Whether to copy the input tensors to the device asynchronously, defaults to ``False``.
-            If ``True``, user should synchronize before calling :meth:`run` or cuda graph replay.
+            Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
 
         Note
         ----
@@ -1349,11 +1354,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
             self._qo_indptr_buf.copy_(qo_indptr, non_blocking=non_blocking)
             self._paged_kv_indptr_buf.copy_(paged_kv_indptr, non_blocking=non_blocking)
-            self._paged_kv_indices_buf[: len(paged_kv_indices)].copy_(
-                paged_kv_indices, non_blocking=non_blocking
-            )
             self._paged_kv_last_page_len_buf.copy_(
                 paged_kv_last_page_len, non_blocking=non_blocking
+            )
+            self._paged_kv_indices_buf[: len(paged_kv_indices)].copy_(
+                paged_kv_indices,
+                non_blocking=(paged_kv_indices.device == self.device) and non_blocking,
             )
 
             if packed_custom_mask is not None:
@@ -1366,7 +1372,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         "mask_indptr_buf must be initialized with a torch.Tensor in cuda graph mode if we use custom mask in attention computation."
                     )
                 self._custom_mask_buf[: len(packed_custom_mask)].copy_(
-                    packed_custom_mask, non_blocking=non_blocking
+                    packed_custom_mask,
+                    non_blocking=(packed_custom_mask.device == self.device)
+                    and non_blocking,
                 )
                 # NOTE(Zihao): mask_indptr has the same length as qo_indptr
                 self._mask_indptr_buf.copy_(mask_indptr, non_blocking=non_blocking)

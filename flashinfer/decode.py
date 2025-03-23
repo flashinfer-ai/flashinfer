@@ -69,9 +69,9 @@ def get_single_decode_module(*args):
         if has_prebuilt_ops and uri in prebuilt_ops_uri:
             _kernels = torch.ops.flashinfer_kernels
 
-            run_func = _kernels.single_decode_with_kv_cache
+            run_func = _kernels.single_decode_with_kv_cache.default
         else:
-            run_func = gen_single_decode_module(*args).run
+            run_func = gen_single_decode_module(*args).run.default
 
         # torch library for single_decode_with_kv_cache
 
@@ -134,8 +134,8 @@ def get_batch_decode_jit_module(module_name: str, jit_module: Any):
     if module_name in _batch_decode_jit_modules:
         return _batch_decode_jit_modules[module_name]
 
-    plan_func = jit_module.plan
-    run_func = jit_module.run
+    plan_func = jit_module.plan.default
+    run_func = jit_module.run.default
 
     @register_custom_op(
         f"flashinfer::{module_name}_run",
@@ -216,12 +216,12 @@ def get_batch_decode_module(*args):
         if has_prebuilt_ops and uri in prebuilt_ops_uri:
             _kernels = torch.ops.flashinfer_kernels
 
-            plan_func = _kernels.batch_decode_with_paged_kv_cache_plan
-            run_func = _kernels.batch_decode_with_paged_kv_cache_run
+            plan_func = _kernels.batch_decode_with_paged_kv_cache_plan.default
+            run_func = _kernels.batch_decode_with_paged_kv_cache_run.default
         else:
             mod = gen_batch_decode_module(*args)
-            plan_func = mod.plan
-            run_func = mod.run
+            plan_func = mod.plan.default
+            run_func = mod.run.default
 
         # torch library for batch_decode_with_paged_kv_cache_run
 
@@ -327,7 +327,7 @@ def single_decode_with_kv_cache_with_jit_module(
             "single_decode_with_kv_cache_tmp", 32 * 1024 * 1024, device
         )
         o = torch.empty_like(q)
-        jit_module.run(
+        jit_module.run.default(
             q,
             k,
             v,
@@ -746,7 +746,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
-        non_blocking: bool = False,
+        non_blocking: bool = True,
     ) -> None:
         r"""Plan batch decode for given problem specification.
 
@@ -789,8 +789,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The data type of both the query and key/value tensors. Defaults to torch.float16.
             data_type is deprecated, please use q_data_type and kv_data_type instead.
         non_blocking : bool
-            Whether to copy the input tensors to the device asynchronously, defaults to ``False``.
-            If ``True``, user should synchronize before calling :meth:`run` or cuda graph replay.
+            Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
 
 
         Note
@@ -823,11 +822,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     "The size of indices should be less than or equal to the allocated buffer"
                 )
             self._paged_kv_indptr_buf.copy_(indptr, non_blocking=non_blocking)
-            self._paged_kv_indices_buf[: len(indices)].copy_(
-                indices, non_blocking=non_blocking
-            )
             self._paged_kv_last_page_len_buf.copy_(
                 last_page_len, non_blocking=non_blocking
+            )
+            self._paged_kv_indices_buf[: len(indices)].copy_(
+                indices, non_blocking=(indices.device == self.device) and non_blocking
             )
         else:
             self._paged_kv_indptr_buf = indptr.to(
