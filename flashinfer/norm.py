@@ -103,6 +103,9 @@ def _rmsnorm_fake(
     pass
 
 
+_fused_add_rmsnorm_kernel = None
+
+
 @register_custom_op("flashinfer::fused_add_rmsnorm", mutates_args=("input", "residual"))
 def fused_add_rmsnorm(
     input: torch.Tensor,
@@ -133,10 +136,12 @@ def fused_add_rmsnorm(
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
     """
-    with input.device as device:  # device guard
-        get_norm_module().fused_add_rmsnorm(
-            input, residual, weight, eps, enable_pdl, get_cuda_stream(device)
-        )
+    global _fused_add_rmsnorm_kernel
+    if _fused_add_rmsnorm_kernel is None:
+        _fused_add_rmsnorm_kernel = get_norm_module().fused_add_rmsnorm
+    _fused_add_rmsnorm_kernel(
+        input, residual, weight, eps, enable_pdl, get_cuda_stream(input.device)
+    )
 
 
 @register_fake_op("flashinfer::fused_add_rmsnorm")
