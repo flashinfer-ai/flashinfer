@@ -20,8 +20,8 @@
 
 using namespace flashinfer;
 
-void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl,
-             int64_t cuda_stream) {
+void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps,
+             bool enable_pdl) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
   auto device = input.device();
@@ -34,7 +34,8 @@ void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double e
   CHECK_EQ(output.size(0), batch_size);
   CHECK_EQ(output.size(1), hidden_size);
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(device);
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
     cudaError_t status = norm::RMSNorm(
         static_cast<c_type*>(input.data_ptr()), static_cast<c_type*>(weight.data_ptr()),
@@ -47,7 +48,7 @@ void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double e
 }
 
 void fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps,
-                       bool enable_pdl, int64_t cuda_stream) {
+                       bool enable_pdl) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(residual);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
@@ -63,7 +64,8 @@ void fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weig
   unsigned int batch_size = input.size(0);
   unsigned int hidden_size = input.size(1);
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(device);
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
     cudaError_t status = norm::FusedAddRMSNorm(
         static_cast<c_type*>(input.data_ptr()), static_cast<c_type*>(residual.data_ptr()),
@@ -76,7 +78,7 @@ void fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weig
 }
 
 void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps,
-                   bool enable_pdl, int64_t cuda_stream) {
+                   bool enable_pdl) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
   auto device = input.device();
@@ -89,7 +91,8 @@ void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, do
   CHECK_EQ(output.size(0), batch_size);
   CHECK_EQ(output.size(1), hidden_size);
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(device);
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
     cudaError_t status = norm::GemmaRMSNorm(
         static_cast<c_type*>(input.data_ptr()), static_cast<c_type*>(weight.data_ptr()),
@@ -102,7 +105,7 @@ void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, do
 }
 
 void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight,
-                             double eps, bool enable_pdl, int64_t cuda_stream) {
+                             double eps, bool enable_pdl) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(residual);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
@@ -118,7 +121,8 @@ void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor
   unsigned int batch_size = input.size(0);
   unsigned int hidden_size = input.size(1);
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(device);
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
     cudaError_t status = norm::GemmaFusedAddRMSNorm(
         static_cast<c_type*>(input.data_ptr()), static_cast<c_type*>(residual.data_ptr()),
