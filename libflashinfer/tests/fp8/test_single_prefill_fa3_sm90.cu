@@ -23,9 +23,9 @@
 #include <flashinfer/attention/mask.cuh>
 #include <flashinfer/layout.cuh>
 
-#include "cpu_reference.h"
-#include "flashattention_ops.h"
-#include "utils.h"
+#include "flashinfer/utils/fp8/cpu_reference.h"
+#include "flashinfer/utils/fp8/flashattention_ops.h"
+#include "flashinfer/utils/fp8/utils.h"
 using namespace flashinfer;
 
 void run_fwd(thrust::device_vector<cutlass::float_e4m3_t>& q_d,
