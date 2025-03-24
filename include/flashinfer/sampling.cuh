@@ -966,19 +966,13 @@ struct RenormTempStorage {
     float min_val;
     union {
       struct {
-        float value0;
-        float value1;
-        float value2;
+        float value0, value1, value2;
       } values;
       struct {
-        int count0;
-        int count1;
-        int count2;
+        int count0, count1, count2;
       } counts;
       struct {
-        ValueCount<float> pair0;
-        ValueCount<float> pair1;
-        ValueCount<float> pair2;
+        ValueCount<float> pair0, pair1, pair2;
       } pairs;
     } block_aggregate;
   };
@@ -1144,9 +1138,11 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
     // stopping condition: min_gt_low == max_le_high
     // - f(low) >= k, f(min_gt_low) == f(max_le_high) == f(high) < k
     do {
-      int threadlocal_count_sum = 0;
-      int probs_greater_than_pivot_count[VEC_SIZE];  // pivot initialized to 0
-      double mid = (low + high) / 2;
+      double pivot_0 = (high + 3 * low) / 4;
+      double pivot_1 = (high + low) / 2;
+      double pivot_2 = (low + 3 * high) / 4;
+
+      int aggregate_gt_pivot_0 = 0, aggregate_gt_pivot_1 = 0, aggregate_gt_pivot_2 = 0;
       min_gt_low = high;
       max_le_high = low;
 #pragma unroll 2
@@ -1155,10 +1151,17 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
         if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
           logits_vec.cast_load(logits + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
         }
+        int probs_gt_pivot_0_count[VEC_SIZE], probs_gt_pivot_1_count[VEC_SIZE],
+            probs_gt_pivot_2_count[VEC_SIZE];
 #pragma unroll
         for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-          probs_greater_than_pivot_count[j] =
-              logits_vec[j] > mid && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d;
+          probs_gt_pivot_0_count[j] =
+              logits_vec[j] > pivot_0 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d;
+          probs_gt_pivot_1_count[j] =
+              logits_vec[j] > pivot_1 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d;
+          probs_gt_pivot_2_count[j] =
+              logits_vec[j] > pivot_2 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d;
+
           if (logits_vec[j] > low && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d) {
             min_gt_low = min(min_gt_low, logits_vec[j]);
           }
@@ -1166,9 +1169,20 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
             max_le_high = max(max_le_high, logits_vec[j]);
           }
         }
-        threadlocal_count_sum +=
+
+        aggregate_gt_pivot_0 +=
             BlockReduce<int, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce_int)
-                .Sum<VEC_SIZE>(probs_greater_than_pivot_count);
+                .Sum<VEC_SIZE>(probs_gt_pivot_0_count);
+        __syncthreads();
+
+        aggregate_gt_pivot_1 +=
+            BlockReduce<int, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce_int)
+                .Sum<VEC_SIZE>(probs_gt_pivot_1_count);
+        __syncthreads();
+
+        aggregate_gt_pivot_2 +=
+            BlockReduce<int, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce_int)
+                .Sum<VEC_SIZE>(probs_gt_pivot_2_count);
         __syncthreads();
       }
       min_gt_low =
@@ -1179,18 +1193,29 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
           BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
               .Reduce(max_le_high, cub::Max());
       if (tx == 0) {
-        temp_storage.block_aggregate.counts.count0 = threadlocal_count_sum;
+        temp_storage.block_aggregate.counts.count0 = aggregate_gt_pivot_0;
+        temp_storage.block_aggregate.counts.count1 = aggregate_gt_pivot_1;
+        temp_storage.block_aggregate.counts.count2 = aggregate_gt_pivot_2;
         temp_storage.min_val = min_gt_low;
         temp_storage.max_val = max_le_high;
       }
       __syncthreads();
-      threadlocal_count_sum = temp_storage.block_aggregate.counts.count0;
+      aggregate_gt_pivot_0 = temp_storage.block_aggregate.counts.count0;
+      aggregate_gt_pivot_1 = temp_storage.block_aggregate.counts.count1;
+      aggregate_gt_pivot_2 = temp_storage.block_aggregate.counts.count2;
       min_gt_low = temp_storage.min_val;
       max_le_high = temp_storage.max_val;
-      if (threadlocal_count_sum >= k) {
-        low = mid;
+
+      if (aggregate_gt_pivot_2 >= k) {
+        low = pivot_2;
+      } else if (aggregate_gt_pivot_1 >= k) {
+        low = pivot_1;
+        high = min(pivot_2, max_le_high);
+      } else if (aggregate_gt_pivot_0 >= k) {
+        low = pivot_0;
+        high = min(pivot_1, max_le_high);
       } else {
-        high = min(mid, max_le_high);
+        high = min(pivot_0, max_le_high);
       }
     } while (min_gt_low != max_le_high);
     pivot = low;
