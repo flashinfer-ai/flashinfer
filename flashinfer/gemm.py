@@ -23,7 +23,6 @@ from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
 from .utils import (
     _get_cache_buf,
     determine_gemm_backend,
-    get_cuda_stream,
     get_indptr,
     register_custom_op,
     register_fake_op,

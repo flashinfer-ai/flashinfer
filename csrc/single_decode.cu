@@ -31,7 +31,7 @@ using namespace flashinfer;
 
 void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor tmp,
                                  at::Tensor o, int64_t layout,
-                                 int64_t window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream) {
+                                 int64_t window_left ADDITIONAL_FUNC_PARAMS) {
   CHECK_INPUT(q);
   CHECK_INPUT(k);
   CHECK_INPUT(v);
@@ -63,7 +63,8 @@ void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::T
   auto q_scalar_type = q.scalar_type();
   auto kv_scalar_type = k.scalar_type();
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(device);
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
   TORCH_CHECK(head_dim_qk == head_dim_vo,
               "CUDA cores template only supports equal head dim for QK and VO, please use tensor "

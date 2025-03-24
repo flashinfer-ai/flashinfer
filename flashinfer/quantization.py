@@ -20,7 +20,7 @@ from typing import Any, Tuple
 import torch
 
 from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
-from .utils import get_cuda_stream, register_custom_op, register_fake_op
+from .utils import register_custom_op, register_fake_op
 
 _quantization_module = None
 

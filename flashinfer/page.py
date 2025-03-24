@@ -24,7 +24,6 @@ from .utils import (
     TensorLayout,
     _check_kv_layout,
     _unpack_paged_kv_cache,
-    get_cuda_stream,
     register_custom_op,
     register_fake_op,
 )

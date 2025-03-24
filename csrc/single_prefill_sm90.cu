@@ -34,8 +34,7 @@ using namespace flashinfer;
 void single_prefill_with_kv_cache_sm90(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor tmp,
                                        at::Tensor o, std::optional<at::Tensor> maybe_lse,
                                        int64_t mask_mode_code, int64_t layout,
-                                       int64_t window_left ADDITIONAL_FUNC_PARAMS,
-                                       int64_t cuda_stream) {
+                                       int64_t window_left ADDITIONAL_FUNC_PARAMS) {
   unsigned int head_dim_qk = q.size(2);
   unsigned int head_dim_vo = v.size(2);
   unsigned int num_qo_heads = q.size(1);
@@ -45,7 +44,8 @@ void single_prefill_with_kv_cache_sm90(at::Tensor q, at::Tensor k, at::Tensor v,
   auto kv_scalar_type = k.scalar_type();
 
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(q.device());
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
   const MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
 
   DISPATCH_context(

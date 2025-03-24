@@ -63,6 +63,7 @@ def test_segment_gemm(
     device,
     backend,
 ):
+    torch.manual_seed(42)
     if batch_size * num_rows_per_batch > 8192:
         pytest.skip("batch_size * num_rows_per_batch too large for test.")
     latest_supported_backend = determine_gemm_backend(torch.device(device))
