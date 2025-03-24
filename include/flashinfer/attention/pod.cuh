@@ -205,7 +205,8 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
   const uint_fastdiv group_size_fastdiv(group_size);
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
-  uint32_t cta_tile_q_p = 0;
+
+  /*uint32_t cta_tile_q_p = 0;
   int64_t unpacked_qo_len = qo_len * group_size;
   if (unpacked_qo_len > 64 && HEAD_DIM_VO < 256) {
     cta_tile_q_p = 128;
@@ -224,7 +225,7 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
       // NOTE(Zihao): not enough shared memory on Turing for 1x4 warp layout
       cta_tile_q_p = 64;
     }
-  }
+  }*/
 
   // Decode vars setup
   using DTypeQ_D = typename DecodeParams::DTypeQ;
