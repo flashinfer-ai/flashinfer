@@ -285,22 +285,23 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
     const int max_smem_per_threadblock_p = max_smem_per_sm / num_ctas_per_sm_p;
 
     constexpr uint32_t max_num_mma_kv_reg_p =
-        (HEAD_DIM_VO >= 128 && NUM_MMA_Q_P == 2 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
-          !USE_FP16_QK_REDUCTION)
+        (HEAD_DIM_VO >= 128 && NUM_MMA_Q_P == 2 &&
+         POS_ENCODING_MODE == PosEncodingMode::kRoPELlama && !USE_FP16_QK_REDUCTION)
             ? 2
             : (8 / NUM_MMA_Q_P);
     // TODO(Zihao): fix the following computation
     const uint32_t max_num_mma_kv_smem_p =
         (max_smem_per_threadblock_p / (16 * HEAD_DIM_QK * sizeof(DTypeQ_P)) -
-          NUM_MMA_Q_P * NUM_WARPS_Q_P) /
+         NUM_MMA_Q_P * NUM_WARPS_Q_P) /
         (2 * NUM_WARPS_KV_P);
 
     // control NUM_MMA_KV for maximum warp occupancy
     DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem_p, max_num_mma_kv_reg_p), NUM_MMA_KV_P, {
-      using KTraits_P = KernelTraits<MASK_MODE_P, CTA_TILE_Q_P, NUM_MMA_Q_P, NUM_MMA_KV_P,
-                                      NUM_MMA_D_QK, NUM_MMA_D_VO, NUM_WARPS_Q_P, NUM_WARPS_KV_P,
-                                      POS_ENCODING_MODE, DTypeQ_P, DTypeKV_P, DTypeO_P, DTypeQKAccum_P,
-                                      typename PrefillParams::IdType, PrefillAttentionVariant>;
+      using KTraits_P =
+          KernelTraits<MASK_MODE_P, CTA_TILE_Q_P, NUM_MMA_Q_P, NUM_MMA_KV_P, NUM_MMA_D_QK,
+                       NUM_MMA_D_VO, NUM_WARPS_Q_P, NUM_WARPS_KV_P, POS_ENCODING_MODE, DTypeQ_P,
+                       DTypeKV_P, DTypeO_P, DTypeQKAccum_P, typename PrefillParams::IdType,
+                       PrefillAttentionVariant>;
 
       if constexpr (KTraits_P::IsInvalid()) {
         // Invalid configuration, skip
@@ -310,7 +311,7 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
                 << " NUM_MMA_KV=" << NUM_MMA_KV_P << " NUM_WARPS_Q=" << NUM_WARPS_Q_P
                 << " NUM_WARPS_KV=" << NUM_WARPS_KV_P
                 << " please create an issue (https://github.com/flashinfer-ai/flashinfer/issues)"
-                    " and report the issue to the developers.";
+                   " and report the issue to the developers.";
         FLASHINFER_ERROR(err_msg.str());
       } else {
         // Decode stuff
@@ -318,18 +319,19 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
         DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem_d, max_num_mma_kv_reg_d), NUM_MMA_KV_D, {
           using KTraits_D =
               KernelTraits<MASK_MODE_D, CTA_TILE_Q_D, NUM_MMA_Q_D, NUM_MMA_KV_D, NUM_MMA_D_QK,
-                            NUM_MMA_D_VO, NUM_WARPS_Q_D, NUM_WARPS_KV_D, POS_ENCODING_MODE, DTypeQ_D,
-                            DTypeKV_D, DTypeO_D, DTypeQKAccum_D, typename DecodeParams::IdType,
-                            DecodeAttentionVariant>;
+                           NUM_MMA_D_VO, NUM_WARPS_Q_D, NUM_WARPS_KV_D, POS_ENCODING_MODE, DTypeQ_D,
+                           DTypeKV_D, DTypeO_D, DTypeQKAccum_D, typename DecodeParams::IdType,
+                           DecodeAttentionVariant>;
           if constexpr (KTraits_D::IsInvalid()) {
             // Invalid configuration, skip
             std::ostringstream err_msg;
-            err_msg << "FlashInfer Internal Error: Invalid configuration : NUM_MMA_Q=" << NUM_MMA_Q_D
-                    << " NUM_MMA_D_QK=" << NUM_MMA_D_QK << " NUM_MMA_D_VO=" << NUM_MMA_D_VO
-                    << " NUM_MMA_KV=" << NUM_MMA_KV_D << " NUM_WARPS_Q=" << NUM_WARPS_Q_D
-                    << " NUM_WARPS_KV=" << NUM_WARPS_KV_D
-                    << " please create an issue (https://github.com/flashinfer-ai/flashinfer/issues)"
-                        " and report the issue to the developers.";
+            err_msg
+                << "FlashInfer Internal Error: Invalid configuration : NUM_MMA_Q=" << NUM_MMA_Q_D
+                << " NUM_MMA_D_QK=" << NUM_MMA_D_QK << " NUM_MMA_D_VO=" << NUM_MMA_D_VO
+                << " NUM_MMA_KV=" << NUM_MMA_KV_D << " NUM_WARPS_Q=" << NUM_WARPS_Q_D
+                << " NUM_WARPS_KV=" << NUM_WARPS_KV_D
+                << " please create an issue (https://github.com/flashinfer-ai/flashinfer/issues)"
+                   " and report the issue to the developers.";
             FLASHINFER_ERROR(err_msg.str());
           } else {
             // End decode stuff
@@ -371,8 +373,8 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
               prefill_params.partition_kv = num_chunks;
               prefill_params.o = tmp_p;
               prefill_params.lse = tmp_lse;
-              kernel =
-                  PODWithKVCacheTensorKernel<KTraits_P, KTraits_D, true, PrefillParams, DecodeParams>;
+              kernel = PODWithKVCacheTensorKernel<KTraits_P, KTraits_D, true, PrefillParams,
+                                                  DecodeParams>;
             }
 
             // Setup new decode params if (not) split
@@ -401,7 +403,8 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
 
             // printf("Smem: prefill %zu, decode %zu, total %zu\n", smem_size_p, smem_size_d,
             // smem_size); printf("Blocks: prefill %d, decode %d, total %d\n", nblks_p, nblks_d,
-            // nblks); printf("Threads: prefill %d, decode %d, total %d\n", nthrs_p, nthrs_d, nthrs);
+            // nblks); printf("Threads: prefill %d, decode %d, total %d\n", nthrs_p, nthrs_d,
+            // nthrs);
             //  ************************************************ /
 
             static int* tbAssign = nullptr;
@@ -411,8 +414,8 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
             // Setup kernel arguments
             void* args[] = {(void*)&xsize, (void*)&prefill_params, (void*)&decode_params,
                             (void*)&tbAssign};
-            FLASHINFER_CUDA_CALL(
-                cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
             // Launch kernel
             FLASHINFER_CUDA_CALL(
                 cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
@@ -421,10 +424,10 @@ cudaError_t PODWithKVCacheTensorDispatched(PrefillParams prefill_params,
             if (!(num_chunks <= 1 || tmp_p == nullptr)) {
               if constexpr (PrefillAttentionVariant::use_softmax) {
                 FLASHINFER_CUDA_CALL(MergeStates(tmp_p, tmp_lse, o_p, lse_p, num_chunks, qo_len,
-                                                  num_qo_heads, HEAD_DIM_VO, stream));
+                                                 num_qo_heads, HEAD_DIM_VO, stream));
               } else {
-                FLASHINFER_CUDA_CALL(
-                    AttentionSum(tmp_p, o_p, num_chunks, qo_len, num_qo_heads, HEAD_DIM_VO, stream));
+                FLASHINFER_CUDA_CALL(AttentionSum(tmp_p, o_p, num_chunks, qo_len, num_qo_heads,
+                                                  HEAD_DIM_VO, stream));
               }
             }
             // Post-kernel stuff for split-kv decode
