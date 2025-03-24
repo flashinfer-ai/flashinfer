@@ -48,3 +48,4 @@ from .tvm import (
 from .tvm import (
     gen_customize_batch_prefill_tvm_binding as gen_customize_batch_prefill_tvm_binding,
 )
+from .tvm import gen_sampling_tvm_binding as gen_sampling_tvm_binding
