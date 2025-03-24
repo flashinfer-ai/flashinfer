@@ -20,7 +20,7 @@ from typing import Optional, Union
 import torch
 
 from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
-from .utils import get_cuda_stream, register_custom_op, register_fake_op
+from .utils import register_custom_op, register_fake_op
 
 _sampling_module = None
 
@@ -51,19 +51,18 @@ def get_sampling_module():
             deterministic: bool,
             generator: Optional[torch.Generator],
         ) -> torch.Tensor:
-            with probs.device as device:
-                probs = probs.float()
-                batch_size = indices.size(0) if indices is not None else probs.size(0)
-                samples = torch.empty(batch_size, dtype=torch.int32, device=device)
-                module.sampling_from_probs.default(
-                    probs,
-                    samples,
-                    indices,
-                    deterministic,
-                    generator,
-                    get_cuda_stream(device),
-                )
-                return samples
+            device = probs.device
+            probs = probs.float()
+            batch_size = indices.size(0) if indices is not None else probs.size(0)
+            samples = torch.empty(batch_size, dtype=torch.int32, device=device)
+            module.sampling_from_probs.default(
+                probs,
+                samples,
+                indices,
+                deterministic,
+                generator,
+            )
+            return samples
 
         @register_fake_op("flashinfer::sampling_from_probs")
         def _fake_sampling_from_probs(
@@ -86,24 +85,23 @@ def get_sampling_module():
             deterministic: bool,
             generator: Optional[torch.Generator],
         ) -> torch.Tensor:
-            with probs.device as device:
-                probs = probs.float()
-                maybe_top_p_arr = (
-                    maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
-                )
-                batch_size = indices.size(0) if indices is not None else probs.size(0)
-                samples = torch.empty(batch_size, dtype=torch.int32, device=device)
-                module.top_p_sampling_from_probs.default(
-                    probs,
-                    samples,
-                    indices,
-                    maybe_top_p_arr,
-                    top_p_val,
-                    deterministic,
-                    generator,
-                    get_cuda_stream(device),
-                )
-                return samples
+            device = probs.device
+            probs = probs.float()
+            maybe_top_p_arr = (
+                maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
+            )
+            batch_size = indices.size(0) if indices is not None else probs.size(0)
+            samples = torch.empty(batch_size, dtype=torch.int32, device=device)
+            module.top_p_sampling_from_probs.default(
+                probs,
+                samples,
+                indices,
+                maybe_top_p_arr,
+                top_p_val,
+                deterministic,
+                generator,
+            )
+            return samples
 
         @register_fake_op("flashinfer::top_p_sampling_from_probs")
         def _fake_top_p_sampling_from_probs(
@@ -128,24 +126,23 @@ def get_sampling_module():
             deterministic: bool,
             generator: Optional[torch.Generator],
         ) -> torch.Tensor:
-            with probs.device as device:
-                probs = probs.float()
-                batch_size = indices.size(0) if indices is not None else probs.size(0)
-                maybe_top_k_arr = (
-                    maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
-                )
-                samples = torch.empty(batch_size, dtype=torch.int32, device=device)
-                module.top_k_sampling_from_probs.default(
-                    probs,
-                    samples,
-                    indices,
-                    maybe_top_k_arr,
-                    top_k_val,
-                    deterministic,
-                    generator,
-                    get_cuda_stream(device),
-                )
-                return samples
+            device = probs.device
+            probs = probs.float()
+            batch_size = indices.size(0) if indices is not None else probs.size(0)
+            maybe_top_k_arr = (
+                maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
+            )
+            samples = torch.empty(batch_size, dtype=torch.int32, device=device)
+            module.top_k_sampling_from_probs.default(
+                probs,
+                samples,
+                indices,
+                maybe_top_k_arr,
+                top_k_val,
+                deterministic,
+                generator,
+            )
+            return samples
 
         @register_fake_op("flashinfer::top_k_sampling_from_probs")
         def _fake_top_k_sampling_from_probs(
@@ -171,24 +168,23 @@ def get_sampling_module():
             deterministic: bool,
             generator: Optional[torch.Generator],
         ) -> torch.Tensor:
-            with probs.device as device:
-                probs = probs.float()
-                maybe_min_p_arr = (
-                    maybe_min_p_arr.float() if maybe_min_p_arr is not None else None
-                )
-                batch_size = indices.size(0) if indices is not None else probs.size(0)
-                samples = torch.empty(batch_size, dtype=torch.int32, device=device)
-                module.min_p_sampling_from_probs.default(
-                    probs,
-                    samples,
-                    indices,
-                    maybe_min_p_arr,
-                    min_p_val,
-                    deterministic,
-                    generator,
-                    get_cuda_stream(device),
-                )
-                return samples
+            device = probs.device
+            probs = probs.float()
+            maybe_min_p_arr = (
+                maybe_min_p_arr.float() if maybe_min_p_arr is not None else None
+            )
+            batch_size = indices.size(0) if indices is not None else probs.size(0)
+            samples = torch.empty(batch_size, dtype=torch.int32, device=device)
+            module.min_p_sampling_from_probs.default(
+                probs,
+                samples,
+                indices,
+                maybe_min_p_arr,
+                min_p_val,
+                deterministic,
+                generator,
+            )
+            return samples
 
         # torch library for top_k_top_p_sampling_from_probs
 
@@ -205,29 +201,28 @@ def get_sampling_module():
             deterministic: bool,
             generator: Optional[torch.Generator],
         ) -> torch.Tensor:
-            with probs.device as device:
-                probs = probs.float()
-                maybe_top_k_arr = (
-                    maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
-                )
-                maybe_top_p_arr = (
-                    maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
-                )
-                batch_size = indices.size(0) if indices is not None else probs.size(0)
-                samples = torch.empty(batch_size, dtype=torch.int32, device=device)
-                module.top_k_top_p_sampling_from_probs.default(
-                    probs,
-                    samples,
-                    indices,
-                    maybe_top_k_arr,
-                    top_k_val,
-                    maybe_top_p_arr,
-                    top_p_val,
-                    deterministic,
-                    generator,
-                    get_cuda_stream(device),
-                )
-                return samples
+            device = probs.device
+            probs = probs.float()
+            maybe_top_k_arr = (
+                maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
+            )
+            maybe_top_p_arr = (
+                maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
+            )
+            batch_size = indices.size(0) if indices is not None else probs.size(0)
+            samples = torch.empty(batch_size, dtype=torch.int32, device=device)
+            module.top_k_top_p_sampling_from_probs.default(
+                probs,
+                samples,
+                indices,
+                maybe_top_k_arr,
+                top_k_val,
+                maybe_top_p_arr,
+                top_p_val,
+                deterministic,
+                generator,
+            )
+            return samples
 
         @register_fake_op("flashinfer::top_k_top_p_sampling_from_probs")
         def _fake_top_k_top_p_sampling_from_probs(
@@ -252,20 +247,19 @@ def get_sampling_module():
             maybe_top_p_arr: Optional[torch.Tensor],
             top_p_val: float,
         ) -> torch.Tensor:
-            with probs.device as device:
-                probs = probs.float()
-                maybe_top_p_arr = (
-                    maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
-                )
-                renorm_probs = torch.empty_like(probs)
-                module.top_p_renorm_probs.default(
-                    probs,
-                    renorm_probs,
-                    maybe_top_p_arr,
-                    top_p_val,
-                    get_cuda_stream(device),
-                )
-                return renorm_probs
+            device = probs.device
+            probs = probs.float()
+            maybe_top_p_arr = (
+                maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
+            )
+            renorm_probs = torch.empty_like(probs)
+            module.top_p_renorm_probs.default(
+                probs,
+                renorm_probs,
+                maybe_top_p_arr,
+                top_p_val,
+            )
+            return renorm_probs
 
         @register_fake_op("flashinfer::top_p_renorm_probs")
         def _fake_top_p_renorm_probs(
@@ -283,20 +277,19 @@ def get_sampling_module():
             maybe_top_k_arr: Optional[torch.Tensor],
             top_k_val: int,
         ) -> torch.Tensor:
-            with probs.device as device:
-                probs = probs.float()
-                maybe_top_k_arr = (
-                    maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
-                )
-                renorm_probs = torch.empty_like(probs)
-                module.top_k_renorm_probs.default(
-                    probs,
-                    renorm_probs,
-                    maybe_top_k_arr,
-                    top_k_val,
-                    get_cuda_stream(device),
-                )
-                return renorm_probs
+            device = probs.device
+            probs = probs.float()
+            maybe_top_k_arr = (
+                maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
+            )
+            renorm_probs = torch.empty_like(probs)
+            module.top_k_renorm_probs.default(
+                probs,
+                renorm_probs,
+                maybe_top_k_arr,
+                top_k_val,
+            )
+            return renorm_probs
 
         @register_fake_op("flashinfer::top_k_renorm_probs")
         def _fake_top_k_renorm_probs(
@@ -314,20 +307,19 @@ def get_sampling_module():
             maybe_top_k_arr: Optional[torch.Tensor],
             top_k_val: int,
         ) -> torch.Tensor:
-            with logits.device as device:
-                logits = logits.float()
-                maybe_top_k_arr = (
-                    maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
-                )
-                mask_logits = torch.empty_like(logits)
-                module.top_k_mask_logits.default(
-                    logits,
-                    mask_logits,
-                    maybe_top_k_arr,
-                    top_k_val,
-                    get_cuda_stream(device),
-                )
-                return mask_logits
+            device = logits.device
+            logits = logits.float()
+            maybe_top_k_arr = (
+                maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
+            )
+            mask_logits = torch.empty_like(logits)
+            module.top_k_mask_logits.default(
+                logits,
+                mask_logits,
+                maybe_top_k_arr,
+                top_k_val,
+            )
+            return mask_logits
 
         @register_fake_op("flashinfer::top_k_mask_logits")
         def _fake_top_k_mask_logits(
@@ -352,28 +344,25 @@ def get_sampling_module():
             deterministic: bool,
             generator: Optional[torch.Generator],
         ) -> torch.Tensor:
-            with draft_probs.device as device:
-                draft_probs = draft_probs.float()
-                draft_token_ids = draft_token_ids.int()
-                target_probs = target_probs.float()
-                output_accepted_token_num = output_accepted_token_num.int()
-                output_emitted_token_num = output_emitted_token_num.int()
-                b, n = draft_token_ids.shape
-                output_token_ids = torch.empty(
-                    (b, n + 1), dtype=torch.int32, device=device
-                )
-                module.chain_speculative_sampling.default(
-                    draft_probs,
-                    draft_token_ids,
-                    target_probs,
-                    output_token_ids,
-                    output_accepted_token_num,
-                    output_emitted_token_num,
-                    deterministic,
-                    generator,
-                    get_cuda_stream(device),
-                )
-                return output_token_ids
+            device = draft_probs.device
+            draft_probs = draft_probs.float()
+            draft_token_ids = draft_token_ids.int()
+            target_probs = target_probs.float()
+            output_accepted_token_num = output_accepted_token_num.int()
+            output_emitted_token_num = output_emitted_token_num.int()
+            b, n = draft_token_ids.shape
+            output_token_ids = torch.empty((b, n + 1), dtype=torch.int32, device=device)
+            module.chain_speculative_sampling.default(
+                draft_probs,
+                draft_token_ids,
+                target_probs,
+                output_token_ids,
+                output_accepted_token_num,
+                output_emitted_token_num,
+                deterministic,
+                generator,
+            )
+            return output_token_ids
 
         @register_fake_op("flashinfer::chain_speculative_sampling")
         def _fake_chain_speculative_sampling(

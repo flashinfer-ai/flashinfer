@@ -14,12 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from typing import Optional, Tuple
+from functools import cache
+from typing import Any, Optional, Tuple
 
 import torch
 
 from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
-from .utils import get_cuda_stream, register_custom_op, register_fake_op
+from .utils import register_custom_op, register_fake_op
 
 _rope_module = None
 
@@ -42,6 +43,14 @@ def get_rope_module():
     return _rope_module
 
 
+@cache
+def get_module_attr(attr: str) -> Any:
+    global _rope_module
+    if _rope_module is None:
+        get_rope_module()
+    return getattr(_rope_module, attr).default
+
+
 @register_custom_op("flashinfer::apply_rope", mutates_args=("q_rope", "k_rope"))
 def _apply_rope(
     q: torch.Tensor,
@@ -55,22 +64,20 @@ def _apply_rope(
     rope_scale: float,
     rope_theta: float,
 ) -> None:
-    with q.device as device:
-        indptr = indptr.int()
-        offsets = offsets.int()
-        get_rope_module().apply_rope.default(
-            q,
-            k,
-            q_rope,
-            k_rope,
-            indptr,
-            offsets,
-            rotary_dim,
-            interleave,
-            rope_scale,
-            rope_theta,
-            get_cuda_stream(device),
-        )
+    indptr = indptr.int()
+    offsets = offsets.int()
+    get_module_attr("apply_rope")(
+        q,
+        k,
+        q_rope,
+        k_rope,
+        indptr,
+        offsets,
+        rotary_dim,
+        interleave,
+        rope_scale,
+        rope_theta,
+    )
 
 
 @register_fake_op("flashinfer::apply_rope")
@@ -105,25 +112,23 @@ def _apply_llama31_rope(
     high_freq_factor: float,
     old_context_len: float,
 ) -> None:
-    with q.device as device:
-        indptr = indptr.int()
-        offsets = offsets.int()
-        get_rope_module().apply_llama31_rope.default(
-            q,
-            k,
-            q_rope,
-            k_rope,
-            indptr,
-            offsets,
-            rotary_dim,
-            interleave,
-            rope_scale,
-            rope_theta,
-            low_freq_factor,
-            high_freq_factor,
-            old_context_len,
-            get_cuda_stream(device),
-        )
+    indptr = indptr.int()
+    offsets = offsets.int()
+    get_module_attr("apply_llama31_rope")(
+        q,
+        k,
+        q_rope,
+        k_rope,
+        indptr,
+        offsets,
+        rotary_dim,
+        interleave,
+        rope_scale,
+        rope_theta,
+        low_freq_factor,
+        high_freq_factor,
+        old_context_len,
+    )
 
 
 @register_fake_op("flashinfer::apply_llama31_rope")
@@ -157,20 +162,18 @@ def _apply_rope_pos_ids(
     rope_scale: float,
     rope_theta: float,
 ) -> None:
-    with q.device as device:
-        pos_ids = pos_ids.int()
-        get_rope_module().apply_rope_pos_ids.default(
-            q,
-            k,
-            q_rope,
-            k_rope,
-            pos_ids,
-            rotary_dim,
-            interleave,
-            rope_scale,
-            rope_theta,
-            get_cuda_stream(device),
-        )
+    pos_ids = pos_ids.int()
+    get_module_attr("apply_rope_pos_ids")(
+        q,
+        k,
+        q_rope,
+        k_rope,
+        pos_ids,
+        rotary_dim,
+        interleave,
+        rope_scale,
+        rope_theta,
+    )
 
 
 @register_fake_op("flashinfer::apply_rope_pos_ids")
@@ -200,18 +203,16 @@ def _apply_rope_pos_ids_cos_sin_cache(
     pos_ids: torch.Tensor,
     interleave: bool,
 ) -> None:
-    with q.device as device:
-        pos_ids = pos_ids.int()
-        get_rope_module().apply_rope_pos_ids_cos_sin_cache.default(
-            q,
-            k,
-            q_rope,
-            k_rope,
-            cos_sin_cache,
-            pos_ids,
-            interleave,
-            get_cuda_stream(device),
-        )
+    pos_ids = pos_ids.int()
+    get_module_attr("apply_rope_pos_ids_cos_sin_cache")(
+        q,
+        k,
+        q_rope,
+        k_rope,
+        cos_sin_cache,
+        pos_ids,
+        interleave,
+    )
 
 
 @register_fake_op("flashinfer::apply_rope_pos_ids_cos_sin_cache")
@@ -245,23 +246,21 @@ def _apply_llama31_rope_pos_ids(
     high_freq_factor: float,
     old_context_len: float,
 ) -> None:
-    with q.device as device:
-        pos_ids = pos_ids.int()
-        get_rope_module().apply_llama31_rope_pos_ids.default(
-            q,
-            k,
-            q_rope,
-            k_rope,
-            pos_ids,
-            rotary_dim,
-            interleave,
-            rope_scale,
-            rope_theta,
-            low_freq_factor,
-            high_freq_factor,
-            old_context_len,
-            get_cuda_stream(device),
-        )
+    pos_ids = pos_ids.int()
+    get_module_attr("apply_llama31_rope_pos_ids")(
+        q,
+        k,
+        q_rope,
+        k_rope,
+        pos_ids,
+        rotary_dim,
+        interleave,
+        rope_scale,
+        rope_theta,
+        low_freq_factor,
+        high_freq_factor,
+        old_context_len,
+    )
 
 
 @register_fake_op("flashinfer::apply_llama31_rope_pos_ids")

@@ -49,7 +49,6 @@ from .utils import (
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
     determine_attention_backend,
-    get_cuda_stream,
     is_float8,
     register_custom_op,
     register_fake_op,
@@ -422,25 +421,23 @@ class PODWithPagedKVCacheWrapper:
                 logits_soft_cap > 0,  # use_logits_soft_cap
                 False,  # use_fp16_qk_reduction
             )
-        with self.device as device:
-            self._plan_info = self._cached_module.plan(
-                self._float_workspace_buffer,
-                self._int_workspace_buffer,
-                self._pin_memory_int_workspace_buffer,
-                qo_indptr_host,
-                indptr_host,
-                kv_lens_arr_host,
-                batch_size,  # total_num_rows
-                batch_size,
-                num_qo_heads,
-                num_kv_heads,
-                page_size,
-                self.is_cuda_graph_enabled,
-                head_dim,
-                head_dim,
-                False,  # causal
-                get_cuda_stream(device),
-            )
+        self._plan_info = self._cached_module.plan(
+            self._float_workspace_buffer,
+            self._int_workspace_buffer,
+            self._pin_memory_int_workspace_buffer,
+            qo_indptr_host,
+            indptr_host,
+            kv_lens_arr_host,
+            batch_size,  # total_num_rows
+            batch_size,
+            num_qo_heads,
+            num_kv_heads,
+            page_size,
+            self.is_cuda_graph_enabled,
+            head_dim,
+            head_dim,
+            False,  # causal
+        )
 
         self._indptr_type = indptr.dtype
         self._pos_encoding_mode = pos_encoding_mode
@@ -561,70 +558,68 @@ class PODWithPagedKVCacheWrapper:
             )
         out_d = torch.empty_like(q_d)
 
-        with q_p.device as device:  # device guard
-            module_getter = get_pod_module(
-                # Prefill params
-                q_p.dtype,
-                k_p.dtype,
-                q_p.dtype,
-                q_p.shape[-1],
-                PosEncodingMode[pos_encoding_mode_p].value,
-                window_left_p >= 0,  # use_sliding_window
-                logits_soft_cap_p > 0,  # use_logits_soft_cap
-                use_fp16_qk_reduction,
-                # Decode params
-                # q_d.dtype,
-                # self._cached_kv_data_type,
-                # self._cached_q_data_type,
-                self._indptr_type,
-                # head_dim,  # head_dim_qk
-                # head_dim,  # head_dim_vo
-                PosEncodingMode[pos_encoding_mode_d].value,
-                window_left_d != -1,  # use_sliding_window
-                logits_soft_cap_d > 0,  # use_logits_soft_cap
-            )
-            module_getter.run_tensor(
-                # Prefill params
-                q_p,
-                k_p,
-                v_p,
-                tmp_p,
-                out_p,
-                lse_p,
-                mask_mode_p,
-                TensorLayout[kv_layout_p].value,
-                window_left_p,
-                packed_custom_mask_p,
-                _get_cache_alibi_slopes_buf(q_p.shape[1], q_p.device),
-                logits_soft_cap_p,
-                sm_scale_p,
-                1.0 / rope_scale_p,
-                1.0 / rope_theta_p,
-                # Decode params
-                self._float_workspace_buffer,
-                self._int_workspace_buffer,
-                self._plan_info,
-                q_d,
-                k_cache_d,
-                v_cache_d,
-                self._qo_indptr_buf,
-                self._paged_kv_indptr_buf,
-                self._paged_kv_indices_buf,
-                self._paged_kv_last_page_len_buf,
-                out_d,
-                lse_d,
-                MaskMode.NON_CAUSAL.value,
-                TensorLayout[self._kv_layout].value,
-                window_left_d,
-                None,  # packed_custom_mask
-                None,  # mask_indptr_buf
-                _get_cache_alibi_slopes_buf(q_d.shape[1], q_d.device),
-                logits_soft_cap_d,
-                sm_scale_d,
-                1.0 / rope_scale_d,
-                1.0 / rope_theta_d,
-                get_cuda_stream(device),
-            )
+        module_getter = get_pod_module(
+            # Prefill params
+            q_p.dtype,
+            k_p.dtype,
+            q_p.dtype,
+            q_p.shape[-1],
+            PosEncodingMode[pos_encoding_mode_p].value,
+            window_left_p >= 0,  # use_sliding_window
+            logits_soft_cap_p > 0,  # use_logits_soft_cap
+            use_fp16_qk_reduction,
+            # Decode params
+            # q_d.dtype,
+            # self._cached_kv_data_type,
+            # self._cached_q_data_type,
+            self._indptr_type,
+            # head_dim,  # head_dim_qk
+            # head_dim,  # head_dim_vo
+            PosEncodingMode[pos_encoding_mode_d].value,
+            window_left_d != -1,  # use_sliding_window
+            logits_soft_cap_d > 0,  # use_logits_soft_cap
+        )
+        module_getter.run_tensor(
+            # Prefill params
+            q_p,
+            k_p,
+            v_p,
+            tmp_p,
+            out_p,
+            lse_p,
+            mask_mode_p,
+            TensorLayout[kv_layout_p].value,
+            window_left_p,
+            packed_custom_mask_p,
+            _get_cache_alibi_slopes_buf(q_p.shape[1], q_p.device),
+            logits_soft_cap_p,
+            sm_scale_p,
+            1.0 / rope_scale_p,
+            1.0 / rope_theta_p,
+            # Decode params
+            self._float_workspace_buffer,
+            self._int_workspace_buffer,
+            self._plan_info,
+            q_d,
+            k_cache_d,
+            v_cache_d,
+            self._qo_indptr_buf,
+            self._paged_kv_indptr_buf,
+            self._paged_kv_indices_buf,
+            self._paged_kv_last_page_len_buf,
+            out_d,
+            lse_d,
+            MaskMode.NON_CAUSAL.value,
+            TensorLayout[self._kv_layout].value,
+            window_left_d,
+            None,  # packed_custom_mask
+            None,  # mask_indptr_buf
+            _get_cache_alibi_slopes_buf(q_d.shape[1], q_d.device),
+            logits_soft_cap_d,
+            sm_scale_d,
+            1.0 / rope_scale_d,
+            1.0 / rope_theta_d,
+        )
 
         if v_scale is not None:
             out_d *= v_scale

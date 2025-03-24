@@ -16,13 +16,12 @@
 #include "pytorch_extension_utils.h"
 
 void merge_state(at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b,
-                 at::Tensor v_merged, at::Tensor s_merged, int64_t cuda_stream);
+                 at::Tensor v_merged, at::Tensor s_merged);
 
 void merge_state_in_place(at::Tensor v, at::Tensor s, at::Tensor v_other, at::Tensor s_other,
-                          std::optional<at::Tensor> mask, int64_t cuda_stream);
+                          std::optional<at::Tensor> mask);
 
-void merge_states(at::Tensor v, at::Tensor s, at::Tensor v_merged, at::Tensor s_merged,
-                  int64_t cuda_stream);
+void merge_states(at::Tensor v, at::Tensor s, at::Tensor v_merged, at::Tensor s_merged);
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   // Merge two self-attention states

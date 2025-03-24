@@ -14,12 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from typing import Optional
+from functools import cache
+from typing import Any, Optional
 
 import torch
 
 from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
-from .utils import get_cuda_stream, register_custom_op, register_fake_op
+from .utils import register_custom_op, register_fake_op
 
 _norm_module = None
 
@@ -40,6 +41,14 @@ def get_norm_module():
                 ],
             )
     return _norm_module
+
+
+@cache
+def get_module_attr(attr: str) -> Any:
+    global _norm_module
+    if _norm_module is None:
+        get_norm_module()
+    return getattr(_norm_module, attr).default
 
 
 def rmsnorm(
@@ -86,10 +95,7 @@ def _rmsnorm(
     eps: float,
     enable_pdl: bool,
 ) -> None:
-    with input.device as device:  # device guard
-        get_norm_module().rmsnorm.default(
-            out, input, weight, eps, enable_pdl, get_cuda_stream(device)
-        )
+    get_module_attr("rmsnorm")(out, input, weight, eps, enable_pdl)
 
 
 @register_fake_op("flashinfer::rmsnorm")
@@ -133,10 +139,7 @@ def fused_add_rmsnorm(
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
     """
-    with input.device as device:  # device guard
-        get_norm_module().fused_add_rmsnorm.default(
-            input, residual, weight, eps, enable_pdl, get_cuda_stream(device)
-        )
+    get_module_attr("fused_add_rmsnorm")(input, residual, weight, eps, enable_pdl)
 
 
 @register_fake_op("flashinfer::fused_add_rmsnorm")
@@ -194,10 +197,7 @@ def _gemma_rmsnorm(
     eps: float,
     enable_pdl: bool,
 ) -> None:
-    with input.device as device:  # device guard
-        get_norm_module().gemma_rmsnorm.default(
-            out, input, weight, eps, enable_pdl, get_cuda_stream(device)
-        )
+    get_module_attr("gemma_rmsnorm")(out, input, weight, eps, enable_pdl)
 
 
 @register_fake_op("flashinfer::gemma_rmsnorm")
@@ -243,10 +243,7 @@ def gemma_fused_add_rmsnorm(
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
     """
-    with input.device as device:
-        get_norm_module().gemma_fused_add_rmsnorm.default(
-            input, residual, weight, eps, enable_pdl, get_cuda_stream(device)
-        )
+    get_module_attr("gemma_fused_add_rmsnorm")(input, residual, weight, eps, enable_pdl)
 
 
 @register_fake_op("flashinfer::gemma_fused_add_rmsnorm")

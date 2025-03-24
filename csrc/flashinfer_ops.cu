@@ -18,113 +18,109 @@
 
 //========== activation ==========
 
-void silu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl, int64_t cuda_stream);
-void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl, int64_t cuda_stream);
-void gelu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl, int64_t cuda_stream);
+void silu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl);
+void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl);
+void gelu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl);
 
 //========== cascade ==========
 
 void merge_state(at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b,
-                 at::Tensor v_merged, at::Tensor s_merged, int64_t cuda_stream);
+                 at::Tensor v_merged, at::Tensor s_merged);
 
 void merge_state_in_place(at::Tensor v, at::Tensor s, at::Tensor v_other, at::Tensor s_other,
-                          std::optional<at::Tensor> mask, int64_t cuda_stream);
+                          std::optional<at::Tensor> mask);
 
-void merge_states(at::Tensor v, at::Tensor s, at::Tensor v_merged, at::Tensor s_merged,
-                  int64_t cuda_stream);
+void merge_states(at::Tensor v, at::Tensor s, at::Tensor v_merged, at::Tensor s_merged);
 
 //========== decode ==========
 
 void single_decode_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor tmp,
                                  at::Tensor o, int64_t layout,
-                                 int64_t window_left SINGLE_DECODE_ADDITIONAL_FUNC_PARAMS,
-                                 int64_t cuda_stream);
+                                 int64_t window_left SINGLE_DECODE_ADDITIONAL_FUNC_PARAMS);
 
 at::Tensor BatchDecodeWithPagedKVCachePlan(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     at::Tensor page_locked_int_workspace_buffer, at::Tensor indptr, int64_t batch_size,
     int64_t num_qo_heads, int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph,
     int64_t window_left, double logits_soft_cap, int64_t head_dim_qk, int64_t head_dim_vo,
-    at::Tensor empty_q_data, at::Tensor empty_kv_data, int64_t cuda_stream);
+    at::Tensor empty_q_data, at::Tensor empty_kv_data);
 
-void BatchDecodeWithPagedKVCacheRun(
-    at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer, at::Tensor plan_info_vec,
-    at::Tensor q, at::Tensor paged_k_cache, at::Tensor paged_v_cache, at::Tensor paged_kv_indptr,
-    at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len, at::Tensor o,
-    std::optional<at::Tensor> maybe_lse, int64_t kv_layout_code,
-    int64_t window_left BATCH_DECODE_ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
+void BatchDecodeWithPagedKVCacheRun(at::Tensor float_workspace_buffer,
+                                    at::Tensor int_workspace_buffer, at::Tensor plan_info_vec,
+                                    at::Tensor q, at::Tensor paged_k_cache,
+                                    at::Tensor paged_v_cache, at::Tensor paged_kv_indptr,
+                                    at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len,
+                                    at::Tensor o, std::optional<at::Tensor> maybe_lse,
+                                    int64_t kv_layout_code,
+                                    int64_t window_left BATCH_DECODE_ADDITIONAL_FUNC_PARAMS);
 
 //========== gemm ==========
 
 void bmm_fp8(at::Tensor A, at::Tensor B, at::Tensor D, at::Tensor A_scale, at::Tensor B_scale,
-             at::Tensor workspace_buffer, int64_t cublas_handle, int64_t cuda_stream);
+             at::Tensor workspace_buffer, int64_t cublas_handle);
 
 void CutlassSegmentGEMM(at::Tensor workspace_buffer, at::Tensor all_problems, at::Tensor x_ptr,
                         at::Tensor w_ptr, at::Tensor y_ptr, at::Tensor x_ld, at::Tensor w_ld,
-                        at::Tensor y_ld, at::Tensor empty_x_data, bool weight_column_major,
-                        int64_t cuda_stream);
+                        at::Tensor y_ld, at::Tensor empty_x_data, bool weight_column_major);
 
 //========== norm ==========
 
-void rmsnorm(at::Tensor& out, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl,
-             int64_t cuda_stream);
+void rmsnorm(at::Tensor& out, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
 
 void fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps,
-                       bool enable_pdl, int64_t cuda_stream);
+                       bool enable_pdl);
 
 void gemma_rmsnorm(at::Tensor& out, at::Tensor& input, at::Tensor& weight, double eps,
-                   bool enable_pdl, int64_t cuda_stream);
+                   bool enable_pdl);
 
 void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight,
-                             double eps, bool enable_pdl, int64_t cuda_stream);
+                             double eps, bool enable_pdl);
 
 //========== page ==========
 
 void append_paged_kv_cache(at::Tensor append_key, at::Tensor append_value, at::Tensor batch_indices,
                            at::Tensor positions, at::Tensor paged_k_cache, at::Tensor paged_v_cache,
                            at::Tensor kv_indices, at::Tensor kv_indptr, at::Tensor kv_last_page_len,
-                           int64_t layout, int64_t cuda_stream);
+                           int64_t layout);
 
 void append_paged_mla_kv_cache(at::Tensor append_ckv, at::Tensor append_kpe,
                                at::Tensor batch_indices, at::Tensor positions, at::Tensor ckv_cache,
                                at::Tensor kpe_cache, at::Tensor kv_indices, at::Tensor kv_indptr,
-                               at::Tensor kv_last_page_len, int64_t cuda_stream);
+                               at::Tensor kv_last_page_len);
 
-void block_sparse_indices_to_vector_sparse_offsets(at::Tensor block_sparse_indices,
-                                                   at::Tensor block_sparse_indptr,
-                                                   at::Tensor vector_sparse_offsets,
-                                                   at::Tensor vector_sparse_indptr,
-                                                   at::Tensor kv_len_arr, int64_t stride_block,
-                                                   int64_t stride_n, int64_t batch_size,
-                                                   int64_t block_size, int64_t cuda_stream);
+void block_sparse_indices_to_vector_sparse_offsets(
+    at::Tensor block_sparse_indices, at::Tensor block_sparse_indptr,
+    at::Tensor vector_sparse_offsets, at::Tensor vector_sparse_indptr, at::Tensor kv_len_arr,
+    int64_t stride_block, int64_t stride_n, int64_t batch_size, int64_t block_size);
 
 //========== prefill ==========
 
 void single_prefill_with_kv_cache(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor tmp,
                                   at::Tensor o, std::optional<at::Tensor> maybe_lse,
                                   int64_t mask_mode_code, int64_t layout,
-                                  int64_t window_left SINGLE_PREFILL_ADDITIONAL_FUNC_PARAMS,
-                                  int64_t cuda_stream);
+                                  int64_t window_left SINGLE_PREFILL_ADDITIONAL_FUNC_PARAMS);
 
 at::Tensor BatchPrefillWithKVCachePlan(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer,
     at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr, at::Tensor kv_indptr,
     at::Tensor kv_len_arr, int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads,
     int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
-    int64_t head_dim_vo, bool causal, int64_t cuda_stream);
+    int64_t head_dim_vo, bool causal);
 
-void BatchPrefillWithRaggedKVCacheRun(
-    at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer, at::Tensor plan_info_vec,
-    at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor qo_indptr, at::Tensor kv_indptr,
-    at::Tensor o, std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code, int64_t layout,
-    int64_t window_left BATCH_PREFILL_ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
+void BatchPrefillWithRaggedKVCacheRun(at::Tensor float_workspace_buffer,
+                                      at::Tensor int_workspace_buffer, at::Tensor plan_info_vec,
+                                      at::Tensor q, at::Tensor k, at::Tensor v,
+                                      at::Tensor qo_indptr, at::Tensor kv_indptr, at::Tensor o,
+                                      std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code,
+                                      int64_t layout,
+                                      int64_t window_left BATCH_PREFILL_ADDITIONAL_FUNC_PARAMS);
 
 void BatchPrefillWithPagedKVCacheRun(
     at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer, at::Tensor plan_info_vec,
     at::Tensor q, at::Tensor paged_k_cache, at::Tensor paged_v_cache, at::Tensor qo_indptr,
     at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len,
     at::Tensor o, std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code, int64_t layout,
-    int64_t window_left BATCH_PREFILL_ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream);
+    int64_t window_left BATCH_PREFILL_ADDITIONAL_FUNC_PARAMS);
 
 //========== pod-attention =========
 void pod_with_kv_cache_tensor(
@@ -142,89 +138,79 @@ void pod_with_kv_cache_tensor(
     std::optional<at::Tensor> maybe_lse_d, int64_t mask_mode_code_d, int64_t layout_d,
     int64_t window_left, std::optional<at::Tensor> maybe_custom_mask_d,
     std::optional<at::Tensor> maybe_mask_indptr_d, std::optional<at::Tensor> maybe_alibi_slopes_d,
-    double logits_soft_cap_d, double sm_scale_d, double rope_rcp_scale_d, double rope_rcp_theta_d,
-    // Shared params
-    int64_t cuda_stream);
+    double logits_soft_cap_d, double sm_scale_d, double rope_rcp_scale_d, double rope_rcp_theta_d);
 //========== quantization ==========
 
-void packbits(at::Tensor x, const std::string& bitorder, at::Tensor y, int64_t cuda_stream);
+void packbits(at::Tensor x, const std::string& bitorder, at::Tensor y);
 
 void segment_packbits(at::Tensor x, at::Tensor input_indptr, at::Tensor output_indptr,
-                      const std::string& bitorder, at::Tensor y, int64_t cuda_stream);
+                      const std::string& bitorder, at::Tensor y);
 
 //========== rope ==========
 
 void apply_rope(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope, at::Tensor indptr,
                 at::Tensor offsets, int64_t rotary_dim, bool interleave, double rope_scale,
-                double rope_theta, int64_t cuda_stream);
+                double rope_theta);
 
 void apply_llama31_rope(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
                         at::Tensor indptr, at::Tensor offsets, int64_t rotary_dim, bool interleave,
                         double rope_scale, double rope_theta, double low_freq_factor,
-                        double high_freq_factor, double old_context_length, int64_t cuda_stream);
+                        double high_freq_factor, double old_context_length);
 
 void apply_rope_pos_ids(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
                         at::Tensor pos_ids, int64_t rotary_dim, bool interleave, double rope_scale,
-                        double rope_theta, int64_t cuda_stream);
+                        double rope_theta);
 
 void apply_llama31_rope_pos_ids(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
                                 at::Tensor pos_ids, int64_t rotary_dim, bool interleave,
                                 double rope_scale, double rope_theta, double low_freq_factor,
-                                double high_freq_factor, double old_context_length,
-                                int64_t cuda_stream);
+                                double high_freq_factor, double old_context_length);
 
 void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_rope,
                                       at::Tensor k_rope, at::Tensor cos_sin_cache,
-                                      at::Tensor pos_ids, bool interleave, int64_t cuda_stream);
+                                      at::Tensor pos_ids, bool interleave);
 
 //========== sampling ==========
 
 void sampling_from_probs(at::Tensor probs, at::Tensor output,
                          std::optional<at::Tensor> maybe_indices, bool deterministic,
-                         std::optional<at::Generator> gen, int64_t cuda_stream);
+                         std::optional<at::Generator> gen);
 
 void top_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
                                std::optional<at::Tensor> maybe_indices,
                                std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
-                               bool deterministic, std::optional<at::Generator> gen,
-                               int64_t cuda_stream);
+                               bool deterministic, std::optional<at::Generator> gen);
 
 void top_k_sampling_from_probs(at::Tensor probs, at::Tensor output,
                                std::optional<at::Tensor> maybe_indices,
                                std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
-                               bool deterministic, std::optional<at::Generator> gen,
-                               int64_t cuda_stream);
+                               bool deterministic, std::optional<at::Generator> gen);
 
 void min_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
                                std::optional<at::Tensor> maybe_indices,
                                std::optional<at::Tensor> maybe_min_p_arr, double min_p_val,
-                               bool deterministic, std::optional<at::Generator> gen,
-                               int64_t cuda_stream);
+                               bool deterministic, std::optional<at::Generator> gen);
 
 void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
                                      std::optional<at::Tensor> maybe_indices,
                                      std::optional<at::Tensor> maybe_top_k_arr, double top_k_val,
                                      std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
-                                     bool deterministic, std::optional<at::Generator> gen,
-                                     int64_t cuda_stream);
+                                     bool deterministic, std::optional<at::Generator> gen);
 
 void top_p_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
-                        std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
-                        int64_t cuda_stream);
+                        std::optional<at::Tensor> maybe_top_p_arr, double top_p_val);
 
 void top_k_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
-                        std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
-                        int64_t cuda_stream);
+                        std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val);
 
 void top_k_mask_logits(at::Tensor logits, at::Tensor mask_logits,
-                       std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
-                       int64_t cuda_stream);
+                       std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val);
 
 void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_ids,
                                 at::Tensor target_probs, at::Tensor output_token_ids,
                                 at::Tensor output_accepted_token_num,
                                 at::Tensor output_emitted_token_num, bool deterministic,
-                                std::optional<at::Generator> gen, int64_t cuda_stream);
+                                std::optional<at::Generator> gen);
 
 //========== Torch Library ==========
 

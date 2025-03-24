@@ -45,7 +45,7 @@ at::Tensor BatchPrefillWithKVCachePlan(
     at::Tensor page_locked_int_workspace_buffer, at::Tensor qo_indptr, at::Tensor kv_indptr,
     at::Tensor kv_len_arr, int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads,
     int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
-    int64_t head_dim_vo, bool causal, int64_t cuda_stream) {
+    int64_t head_dim_vo, bool causal) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * float_workspace_buffer.element_size();
   size_t int_workspace_size_in_bytes =
@@ -53,7 +53,8 @@ at::Tensor BatchPrefillWithKVCachePlan(
 
   PrefillPlanInfo plan_info;
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
   cudaError_t status = PrefillPlan<IdType>(
       float_workspace_buffer.data_ptr(), float_workspace_size_in_bytes,
       int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
@@ -72,8 +73,7 @@ void BatchPrefillWithRaggedKVCacheRun(at::Tensor float_workspace_buffer,
                                       at::Tensor q, at::Tensor k, at::Tensor v,
                                       at::Tensor qo_indptr, at::Tensor kv_indptr, at::Tensor o,
                                       std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code,
-                                      int64_t layout, int64_t window_left ADDITIONAL_FUNC_PARAMS,
-                                      int64_t cuda_stream) {
+                                      int64_t layout, int64_t window_left ADDITIONAL_FUNC_PARAMS) {
   PrefillPlanInfo plan_info;
   plan_info.FromVector(tensor_to_vec(plan_info_vec));
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
@@ -109,7 +109,8 @@ void BatchPrefillWithRaggedKVCacheRun(at::Tensor float_workspace_buffer,
   auto q_scalar_type = q.scalar_type();
   auto kv_scalar_type = k.scalar_type();
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
   DISPATCH_context(
       DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
@@ -193,12 +194,14 @@ void BatchPrefillWithRaggedKVCacheRun(at::Tensor float_workspace_buffer,
       });
 }
 
-void BatchPrefillWithPagedKVCacheRun(
-    at::Tensor float_workspace_buffer, at::Tensor int_workspace_buffer, at::Tensor plan_info_vec,
-    at::Tensor q, at::Tensor paged_k_cache, at::Tensor paged_v_cache, at::Tensor qo_indptr,
-    at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices, at::Tensor paged_kv_last_page_len,
-    at::Tensor o, std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code, int64_t layout,
-    int64_t window_left ADDITIONAL_FUNC_PARAMS, int64_t cuda_stream) {
+void BatchPrefillWithPagedKVCacheRun(at::Tensor float_workspace_buffer,
+                                     at::Tensor int_workspace_buffer, at::Tensor plan_info_vec,
+                                     at::Tensor q, at::Tensor paged_k_cache,
+                                     at::Tensor paged_v_cache, at::Tensor qo_indptr,
+                                     at::Tensor paged_kv_indptr, at::Tensor paged_kv_indices,
+                                     at::Tensor paged_kv_last_page_len, at::Tensor o,
+                                     std::optional<at::Tensor> maybe_lse, int64_t mask_mode_code,
+                                     int64_t layout, int64_t window_left ADDITIONAL_FUNC_PARAMS) {
   PrefillPlanInfo plan_info;
   plan_info.FromVector(tensor_to_vec(plan_info_vec));
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
@@ -239,7 +242,8 @@ void BatchPrefillWithPagedKVCacheRun(
   TORCH_CHECK(k_strides == v_strides, "k/v strides must be identical");
   kv_cache_strides = k_strides.data();
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(float_workspace_buffer.device());
+  const cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
   DISPATCH_context(
       DTypeQ, DTypeKV, DTypeO, IdType, MASK_MODE, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,

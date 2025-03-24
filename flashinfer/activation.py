@@ -14,12 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from functools import cache
 from types import SimpleNamespace
 
 import torch
 
 from .jit import gen_act_and_mul_module, has_prebuilt_ops, load_cuda_ops  # noqa: F401
-from .utils import get_cuda_stream, register_custom_op, register_fake_op
+from .utils import register_custom_op, register_fake_op
 
 silu_def_cu_str = r"""
 __device__ __forceinline__ float silu(const float& val) {
@@ -72,8 +73,7 @@ def get_act_and_mul_module(act_func_name: str):
         def _act_and_mul(
             out: torch.Tensor, input: torch.Tensor, enable_pdl: bool = False
         ) -> None:
-            with input.device as device:  # device guard
-                fn(out, input, enable_pdl, get_cuda_stream(device))
+            fn(out, input, enable_pdl)
 
         @register_fake_op(f"flashinfer::{fname}")
         def _fake_act_and_mul(

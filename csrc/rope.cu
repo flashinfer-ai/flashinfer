@@ -21,7 +21,7 @@ using namespace flashinfer;
 
 void apply_rope(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope, at::Tensor indptr,
                 at::Tensor offsets, int64_t rotary_dim, bool interleave, double rope_scale,
-                double rope_theta, int64_t cuda_stream) {
+                double rope_theta) {
   CHECK_LAST_DIM_CONTIGUOUS(q);
   CHECK_LAST_DIM_CONTIGUOUS(k);
   CHECK_INPUT(indptr);
@@ -49,7 +49,8 @@ void apply_rope(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope
   size_t k_rope_stride_n = k_rope.stride(0);
   size_t k_rope_stride_h = k_rope.stride(1);
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(q.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     cudaError_t status = BatchQKApplyRotary(
         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
@@ -66,7 +67,7 @@ void apply_rope(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope
 
 void apply_rope_pos_ids(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
                         at::Tensor pos_ids, int64_t rotary_dim, bool interleave, double rope_scale,
-                        double rope_theta, int64_t cuda_stream) {
+                        double rope_theta) {
   CHECK_LAST_DIM_CONTIGUOUS(q);
   CHECK_LAST_DIM_CONTIGUOUS(k);
   CHECK_INPUT(pos_ids);
@@ -90,7 +91,8 @@ void apply_rope_pos_ids(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tenso
   size_t k_rope_stride_n = k_rope.stride(0);
   size_t k_rope_stride_h = k_rope.stride(1);
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(q.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     cudaError_t status = BatchQKApplyRotaryPosIds(
         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
@@ -106,7 +108,7 @@ void apply_rope_pos_ids(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tenso
 
 void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_rope,
                                       at::Tensor k_rope, at::Tensor cos_sin_cache,
-                                      at::Tensor pos_ids, bool interleave, int64_t cuda_stream) {
+                                      at::Tensor pos_ids, bool interleave) {
   CHECK_LAST_DIM_CONTIGUOUS(q);
   CHECK_LAST_DIM_CONTIGUOUS(k);
   CHECK_INPUT(cos_sin_cache);
@@ -136,7 +138,8 @@ void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_r
   size_t k_rope_stride_n = k_rope.stride(0);
   size_t k_rope_stride_h = k_rope.stride(1);
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(q.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     cudaError_t status = BatchQKApplyRotaryPosIdsCosSinCache(
         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
@@ -155,7 +158,7 @@ void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_r
 void apply_llama31_rope(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
                         at::Tensor indptr, at::Tensor offsets, int64_t rotary_dim, bool interleave,
                         double rope_scale, double rope_theta, double low_freq_factor,
-                        double high_freq_factor, double old_context_length, int64_t cuda_stream) {
+                        double high_freq_factor, double old_context_length) {
   CHECK_CUDA(q);  // not necessarily contiguous
   CHECK_CUDA(k);  // not necessarily contiguous
   CHECK_INPUT(indptr);
@@ -183,7 +186,8 @@ void apply_llama31_rope(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tenso
   size_t k_rope_stride_n = k_rope.stride(0);
   size_t k_rope_stride_h = k_rope.stride(1);
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(q.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     cudaError_t status = BatchQKApplyLlama31Rotary(
         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),
@@ -202,8 +206,7 @@ void apply_llama31_rope(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tenso
 void apply_llama31_rope_pos_ids(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
                                 at::Tensor pos_ids, int64_t rotary_dim, bool interleave,
                                 double rope_scale, double rope_theta, double low_freq_factor,
-                                double high_freq_factor, double old_context_length,
-                                int64_t cuda_stream) {
+                                double high_freq_factor, double old_context_length) {
   CHECK_CUDA(q);  // not necessarily contiguous
   CHECK_CUDA(k);  // not necessarily contiguous
   CHECK_INPUT(pos_ids);
@@ -227,7 +230,8 @@ void apply_llama31_rope_pos_ids(at::Tensor q, at::Tensor k, at::Tensor q_rope, a
   size_t k_rope_stride_n = k_rope.stride(0);
   size_t k_rope_stride_h = k_rope.stride(1);
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(q.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(q.scalar_type(), c_type, [&] {
     cudaError_t status = BatchQKApplyLlama31RotaryPosIds(
         static_cast<c_type*>(q.data_ptr()), static_cast<c_type*>(k.data_ptr()),

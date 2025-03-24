@@ -22,7 +22,7 @@ using namespace flashinfer;
 void append_paged_kv_cache(at::Tensor append_key, at::Tensor append_value, at::Tensor batch_indices,
                            at::Tensor positions, at::Tensor paged_k_cache, at::Tensor paged_v_cache,
                            at::Tensor kv_indices, at::Tensor kv_indptr, at::Tensor kv_last_page_len,
-                           int64_t layout, int64_t cuda_stream) {
+                           int64_t layout) {
   CHECK_LAST_DIM_CONTIGUOUS(append_key);
   CHECK_LAST_DIM_CONTIGUOUS(append_value);
   CHECK_INPUT(batch_indices);
@@ -89,7 +89,8 @@ void append_paged_kv_cache(at::Tensor append_key, at::Tensor append_value, at::T
 
   auto kv_scalar_dtype = paged_k_cache.scalar_type();
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(device);
+  auto stream = at::cuda::getCurrentCUDAStream();
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(kv_scalar_dtype, c_type, [&] {
     paged_kv_t<c_type, int32_t> paged_kv(
         num_heads, page_size, head_dim, batch_size, kv_layout,
@@ -111,20 +112,18 @@ void append_paged_kv_cache(at::Tensor append_key, at::Tensor append_value, at::T
   TORCH_CHECK(success, "AppendPagedKVCache failed to dispatch with dtype ", kv_scalar_dtype);
 }
 
-void block_sparse_indices_to_vector_sparse_offsets(at::Tensor block_sparse_indices,
-                                                   at::Tensor block_sparse_indptr,
-                                                   at::Tensor vector_sparse_offsets,
-                                                   at::Tensor vector_sparse_indptr,
-                                                   at::Tensor kv_len_arr, int64_t stride_block,
-                                                   int64_t stride_n, int64_t batch_size,
-                                                   int64_t block_size, int64_t cuda_stream) {
+void block_sparse_indices_to_vector_sparse_offsets(
+    at::Tensor block_sparse_indices, at::Tensor block_sparse_indptr,
+    at::Tensor vector_sparse_offsets, at::Tensor vector_sparse_indptr, at::Tensor kv_len_arr,
+    int64_t stride_block, int64_t stride_n, int64_t batch_size, int64_t block_size) {
   CHECK_INPUT(block_sparse_indices);
   CHECK_INPUT(block_sparse_indptr);
   CHECK_INPUT(vector_sparse_offsets);
   CHECK_INPUT(vector_sparse_indptr);
   CHECK_INPUT(kv_len_arr);
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(block_sparse_indices.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
 
   cudaError_t status = BlockSparseIndicesToVectorSparseOffset(
       static_cast<int32_t*>(block_sparse_indices.data_ptr()),
@@ -141,7 +140,7 @@ void block_sparse_indices_to_vector_sparse_offsets(at::Tensor block_sparse_indic
 void append_paged_mla_kv_cache(at::Tensor append_ckv, at::Tensor append_kpe,
                                at::Tensor batch_indices, at::Tensor positions, at::Tensor ckv_cache,
                                at::Tensor kpe_cache, at::Tensor kv_indices, at::Tensor kv_indptr,
-                               at::Tensor kv_last_page_len, int64_t cuda_stream) {
+                               at::Tensor kv_last_page_len) {
   CHECK_LAST_DIM_CONTIGUOUS(append_ckv);
   CHECK_LAST_DIM_CONTIGUOUS(append_kpe);
   CHECK_INPUT(batch_indices);
@@ -194,7 +193,8 @@ void append_paged_mla_kv_cache(at::Tensor append_ckv, at::Tensor append_kpe,
 
   auto kv_scalar_dtype = ckv_cache.scalar_type();
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(device);
+  auto stream = at::cuda::getCurrentCUDAStream();
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(kv_scalar_dtype, c_type, [&] {
     paged_kv_mla_t<c_type, int32_t> paged_mla_kv(
         page_size, ckv_dim, kpe_dim, batch_size, static_cast<c_type*>(ckv_cache.data_ptr()),
