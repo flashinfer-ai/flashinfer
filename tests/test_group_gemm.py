@@ -101,13 +101,13 @@ def test_segment_gemm(
             torch.testing.assert_close(
                 y[i * num_rows_per_batch : (i + 1) * num_rows_per_batch],
                 torch.matmul(
-                    x[i * num_rows_per_batch : (i + 1) * num_rows_per_batch],
+                    x[i * num_rows_per_batch : (i + 1) * num_rows_per_batch].float(),
                     (
-                        weight[i % num_weights].T
+                        weight[i % num_weights].float().T
                         if column_major
-                        else weight[i % num_weights]
+                        else weight[i % num_weights].float()
                     ),
-                ),
+                ).to(dtype),
                 rtol=1e-3,
                 atol=1e-3,
             )
@@ -115,9 +115,11 @@ def test_segment_gemm(
         torch.testing.assert_close(
             y,
             torch.matmul(
-                x.view(batch_size, num_rows_per_batch, d_in),
-                weight.transpose(-1, -2) if column_major else weight,
-            ).view(batch_size * num_rows_per_batch, d_out),
+                x.view(batch_size, num_rows_per_batch, d_in).float(),
+                weight.float().transpose(-1, -2) if column_major else weight.float(),
+            )
+            .view(batch_size * num_rows_per_batch, d_out)
+            .to(dtype),
             rtol=1e-3,
             atol=1e-3,
         )

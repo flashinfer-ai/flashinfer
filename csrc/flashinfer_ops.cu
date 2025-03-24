@@ -56,12 +56,11 @@ void BatchDecodeWithPagedKVCacheRun(
 //========== gemm ==========
 
 void bmm_fp8(at::Tensor A, at::Tensor B, at::Tensor D, at::Tensor A_scale, at::Tensor B_scale,
-             at::Tensor workspace_buffer, int64_t cublas_handle, int64_t cuda_stream);
+             at::Tensor workspace_buffer, int64_t cublas_handle);
 
 void CutlassSegmentGEMM(at::Tensor workspace_buffer, at::Tensor all_problems, at::Tensor x_ptr,
                         at::Tensor w_ptr, at::Tensor y_ptr, at::Tensor x_ld, at::Tensor w_ld,
-                        at::Tensor y_ld, at::Tensor empty_x_data, bool weight_column_major,
-                        int64_t cuda_stream);
+                        at::Tensor y_ld, at::Tensor empty_x_data, bool weight_column_major);
 
 //========== norm ==========
 
