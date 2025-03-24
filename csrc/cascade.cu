@@ -20,7 +20,7 @@
 using namespace flashinfer;
 
 void merge_state(at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b,
-                 at::Tensor v_merged, at::Tensor s_merged, int64_t cuda_stream) {
+                 at::Tensor v_merged, at::Tensor s_merged) {
   CHECK_INPUT(v_a);
   CHECK_INPUT(s_a);
   CHECK_INPUT(v_b);
@@ -41,7 +41,8 @@ void merge_state(at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b,
   unsigned int num_heads = v_a.size(1);
   unsigned int head_dim = v_a.size(2);
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(v_a.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
 
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(v_a.scalar_type(), c_type, [&] {
     cudaError_t status =
@@ -58,7 +59,7 @@ void merge_state(at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b,
 }
 
 void merge_state_in_place(at::Tensor v, at::Tensor s, at::Tensor v_other, at::Tensor s_other,
-                          std::optional<at::Tensor> mask, int64_t cuda_stream) {
+                          std::optional<at::Tensor> mask) {
   CHECK_INPUT(v);
   CHECK_INPUT(s);
   CHECK_INPUT(v_other);
@@ -86,7 +87,8 @@ void merge_state_in_place(at::Tensor v, at::Tensor s, at::Tensor v_other, at::Te
   unsigned int num_heads = v.size(1);
   unsigned int head_dim = v.size(2);
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(v.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(v.scalar_type(), c_type, [&] {
     cudaError_t status = MergeStateInPlace(
         static_cast<c_type*>(v.data_ptr()), static_cast<float*>(s.data_ptr()),
@@ -100,8 +102,7 @@ void merge_state_in_place(at::Tensor v, at::Tensor s, at::Tensor v_other, at::Te
   TORCH_CHECK(success, "MergeStateInPlace kernel launch failed: unsupported data type");
 }
 
-void merge_states(at::Tensor v, at::Tensor s, at::Tensor v_merged, at::Tensor s_merged,
-                  int64_t cuda_stream) {
+void merge_states(at::Tensor v, at::Tensor s, at::Tensor v_merged, at::Tensor s_merged) {
   CHECK_INPUT(v);
   CHECK_INPUT(s);
   auto device = v.device();
@@ -116,7 +117,8 @@ void merge_states(at::Tensor v, at::Tensor s, at::Tensor v_merged, at::Tensor s_
   unsigned int num_heads = v.size(2);
   unsigned int head_dim = v.size(3);
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(v.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
   bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(v.scalar_type(), c_type, [&] {
     cudaError_t status = MergeStates(
         static_cast<c_type*>(v.data_ptr()), static_cast<float*>(s.data_ptr()),

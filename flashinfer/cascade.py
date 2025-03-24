@@ -14,14 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from typing import List, Optional, Tuple
+from functools import cache
+from typing import Any, List, Optional, Tuple
 
 import torch
 
 from .decode import BatchDecodeWithPagedKVCacheWrapper
 from .jit import FLASHINFER_CSRC_DIR, has_prebuilt_ops, load_cuda_ops
 from .prefill import BatchPrefillWithPagedKVCacheWrapper, single_prefill_with_kv_cache
-from .utils import get_cuda_stream, register_custom_op, register_fake_op
+from .utils import register_custom_op, register_fake_op
 
 _cascade_module = None
 
@@ -42,6 +43,14 @@ def get_cascade_module():
                 ],
             )
     return _cascade_module
+
+
+@cache
+def get_module_attr(attr: str) -> Any:
+    global _cascade_module
+    if _cascade_module is None:
+        get_cascade_module()
+    return getattr(_cascade_module, attr).default
 
 
 @register_custom_op("flashinfer::merge_state", mutates_args=())
@@ -93,15 +102,13 @@ def merge_state(
     >>> s_merged.shape
     torch.Size([2048, 32])
     """
-    with v_a.device as device:  # device guard
-        s_a = s_a.to(torch.float32)
-        s_b = s_b.to(torch.float32)
-        v_merged = torch.empty_like(v_a)
-        s_merged = torch.empty_like(s_a)
-        get_cascade_module().merge_state.default(
-            v_a, s_a, v_b, s_b, v_merged, s_merged, get_cuda_stream(device)
-        )
-        return v_merged, s_merged
+    device = v_a.device
+    s_a = s_a.to(torch.float32)
+    s_b = s_b.to(torch.float32)
+    v_merged = torch.empty_like(v_a)
+    s_merged = torch.empty_like(s_a)
+    get_module_attr("merge_state")(v_a, s_a, v_b, s_b, v_merged, s_merged)
+    return v_merged, s_merged
 
 
 @register_fake_op("flashinfer::merge_state")
@@ -157,12 +164,9 @@ def merge_state_in_place(
     >>> s_other = torch.randn(seq_len, num_heads, dtype=torch.float32).to("cuda:0")
     >>> flashinfer.merge_state_in_place(v, s, v_other, s_other)
     """
-    with v.device as device:  # device guard
-        s = s.to(torch.float32)
-        s_other = s_other.to(torch.float32)
-        get_cascade_module().merge_state_in_place.default(
-            v, s, v_other, s_other, mask, get_cuda_stream(device)
-        )
+    s = s.to(torch.float32)
+    s_other = s_other.to(torch.float32)
+    get_module_attr("merge_state_in_place")(v, s, v_other, s_other, mask)
 
 
 @register_fake_op("flashinfer::merge_state_in_place")
@@ -214,17 +218,13 @@ def merge_states(v: torch.Tensor, s: torch.Tensor) -> Tuple[torch.Tensor, torch.
     >>> s_merged.shape
     torch.Size([2048, 32])
     """
-    with v.device as device:  # device guard
-        s = s.to(torch.float32)
-        seq_len, _, num_heads, head_dim = v.size()
-        v_merged = torch.empty(
-            seq_len, num_heads, head_dim, dtype=v.dtype, device=device
-        )
-        s_merged = torch.empty(seq_len, num_heads, dtype=torch.float32, device=device)
-        get_cascade_module().merge_states.default(
-            v, s, v_merged, s_merged, get_cuda_stream(device)
-        )
-        return v_merged, s_merged
+    device = v.device
+    s = s.to(torch.float32)
+    seq_len, _, num_heads, head_dim = v.size()
+    v_merged = torch.empty(seq_len, num_heads, head_dim, dtype=v.dtype, device=device)
+    s_merged = torch.empty(seq_len, num_heads, dtype=torch.float32, device=device)
+    get_module_attr("merge_states")(v, s, v_merged, s_merged)
+    return v_merged, s_merged
 
 
 @register_fake_op("flashinfer::merge_states")

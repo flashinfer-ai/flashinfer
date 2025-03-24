@@ -25,13 +25,12 @@ void gelu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl);
 //========== cascade ==========
 
 void merge_state(at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b,
-                 at::Tensor v_merged, at::Tensor s_merged, int64_t cuda_stream);
+                 at::Tensor v_merged, at::Tensor s_merged);
 
 void merge_state_in_place(at::Tensor v, at::Tensor s, at::Tensor v_other, at::Tensor s_other,
-                          std::optional<at::Tensor> mask, int64_t cuda_stream);
+                          std::optional<at::Tensor> mask);
 
-void merge_states(at::Tensor v, at::Tensor s, at::Tensor v_merged, at::Tensor s_merged,
-                  int64_t cuda_stream);
+void merge_states(at::Tensor v, at::Tensor s, at::Tensor v_merged, at::Tensor s_merged);
 
 //========== decode ==========
 
@@ -82,20 +81,17 @@ void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor
 void append_paged_kv_cache(at::Tensor append_key, at::Tensor append_value, at::Tensor batch_indices,
                            at::Tensor positions, at::Tensor paged_k_cache, at::Tensor paged_v_cache,
                            at::Tensor kv_indices, at::Tensor kv_indptr, at::Tensor kv_last_page_len,
-                           int64_t layout, int64_t cuda_stream);
+                           int64_t layout);
 
 void append_paged_mla_kv_cache(at::Tensor append_ckv, at::Tensor append_kpe,
                                at::Tensor batch_indices, at::Tensor positions, at::Tensor ckv_cache,
                                at::Tensor kpe_cache, at::Tensor kv_indices, at::Tensor kv_indptr,
-                               at::Tensor kv_last_page_len, int64_t cuda_stream);
+                               at::Tensor kv_last_page_len);
 
-void block_sparse_indices_to_vector_sparse_offsets(at::Tensor block_sparse_indices,
-                                                   at::Tensor block_sparse_indptr,
-                                                   at::Tensor vector_sparse_offsets,
-                                                   at::Tensor vector_sparse_indptr,
-                                                   at::Tensor kv_len_arr, int64_t stride_block,
-                                                   int64_t stride_n, int64_t batch_size,
-                                                   int64_t block_size, int64_t cuda_stream);
+void block_sparse_indices_to_vector_sparse_offsets(
+    at::Tensor block_sparse_indices, at::Tensor block_sparse_indptr,
+    at::Tensor vector_sparse_offsets, at::Tensor vector_sparse_indptr, at::Tensor kv_len_arr,
+    int64_t stride_block, int64_t stride_n, int64_t batch_size, int64_t block_size);
 
 //========== prefill ==========
 
@@ -146,84 +142,79 @@ void pod_with_kv_cache_tensor(
     int64_t cuda_stream);
 //========== quantization ==========
 
-void packbits(at::Tensor x, const std::string& bitorder, at::Tensor y, int64_t cuda_stream);
+void packbits(at::Tensor x, const std::string& bitorder, at::Tensor y);
 
 void segment_packbits(at::Tensor x, at::Tensor input_indptr, at::Tensor output_indptr,
-                      const std::string& bitorder, at::Tensor y, int64_t cuda_stream);
+                      const std::string& bitorder, at::Tensor y);
 
 //========== rope ==========
 
 void apply_rope(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope, at::Tensor indptr,
                 at::Tensor offsets, int64_t rotary_dim, bool interleave, double rope_scale,
-                double rope_theta, int64_t cuda_stream);
+                double rope_theta);
 
 void apply_llama31_rope(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
                         at::Tensor indptr, at::Tensor offsets, int64_t rotary_dim, bool interleave,
                         double rope_scale, double rope_theta, double low_freq_factor,
-                        double high_freq_factor, double old_context_length, int64_t cuda_stream);
+                        double high_freq_factor, double old_context_length);
 
 void apply_rope_pos_ids(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
                         at::Tensor pos_ids, int64_t rotary_dim, bool interleave, double rope_scale,
-                        double rope_theta, int64_t cuda_stream);
+                        double rope_theta);
 
 void apply_llama31_rope_pos_ids(at::Tensor q, at::Tensor k, at::Tensor q_rope, at::Tensor k_rope,
                                 at::Tensor pos_ids, int64_t rotary_dim, bool interleave,
                                 double rope_scale, double rope_theta, double low_freq_factor,
-                                double high_freq_factor, double old_context_length,
-                                int64_t cuda_stream);
+                                double high_freq_factor, double old_context_length);
 
 void apply_rope_pos_ids_cos_sin_cache(at::Tensor q, at::Tensor k, at::Tensor q_rope,
                                       at::Tensor k_rope, at::Tensor cos_sin_cache,
-                                      at::Tensor pos_ids, bool interleave, int64_t cuda_stream);
+                                      at::Tensor pos_ids, bool interleave);
 
 //========== sampling ==========
 
 void sampling_from_probs(at::Tensor probs, at::Tensor output,
                          std::optional<at::Tensor> maybe_indices, bool deterministic,
-                         std::optional<at::Generator> gen, int64_t cuda_stream);
+                         std::optional<at::Generator> gen);
 
 void top_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
                                std::optional<at::Tensor> maybe_indices,
                                std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
-                               bool deterministic, std::optional<at::Generator> gen,
-                               int64_t cuda_stream);
+                               bool deterministic, std::optional<at::Generator> gen);
 
 void top_k_sampling_from_probs(at::Tensor probs, at::Tensor output,
                                std::optional<at::Tensor> maybe_indices,
                                std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
-                               bool deterministic, std::optional<at::Generator> gen,
-                               int64_t cuda_stream);
+                               bool deterministic, std::optional<at::Generator> gen);
 
 void min_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
                                std::optional<at::Tensor> maybe_indices,
                                std::optional<at::Tensor> maybe_min_p_arr, double min_p_val,
-                               bool deterministic, std::optional<at::Generator> gen,
-                               int64_t cuda_stream);
+                               bool deterministic, std::optional<at::Generator> gen);
 
 void top_k_top_p_sampling_from_probs(at::Tensor probs, at::Tensor output,
                                      std::optional<at::Tensor> maybe_indices,
                                      std::optional<at::Tensor> maybe_top_k_arr, double top_k_val,
                                      std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
-                                     bool deterministic, std::optional<at::Generator> gen,
-                                     int64_t cuda_stream);
+                                     bool deterministic, std::optional<at::Generator> gen);
 
 void top_p_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
                         std::optional<at::Tensor> maybe_top_p_arr, double top_p_val,
-                        int64_t cuda_stream);
+                        bool deterministic, std::optional<at::Generator> gen);
 
 void top_k_renorm_probs(at::Tensor probs, at::Tensor renorm_probs,
                         std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
-                        int64_t cuda_stream);
+                        bool deterministic, std::optional<at::Generator> gen);
 
 void top_k_mask_logits(at::Tensor logits, at::Tensor mask_logits,
                        std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val,
-                       int64_t cuda_stream);
+                       bool deterministic, std::optional<at::Generator> gen);
 
 void chain_speculative_sampling(at::Tensor draft_probs, at::Tensor draft_token_ids,
                                 at::Tensor target_probs, at::Tensor output_token_ids,
                                 at::Tensor output_accepted_token_num,
                                 at::Tensor output_emitted_token_num, bool deterministic,
-                                std::optional<at::Generator> gen, int64_t cuda_stream);
+                                std::optional<at::Generator> gen);
 
 //========== Torch Library ==========
 
