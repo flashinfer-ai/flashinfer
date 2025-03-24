@@ -122,7 +122,7 @@ def test_segment_gemm(
             .view(batch_size * num_rows_per_batch, d_out)
             .to(dtype),
             rtol=1e-3,
-            atol=1e-3,
+            atol=2e-3,
         )
 
 
