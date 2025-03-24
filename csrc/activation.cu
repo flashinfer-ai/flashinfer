@@ -32,11 +32,12 @@ __device__ __forceinline__ float gelu_tanh(const float& val) {
   return val * cdf;
 }
 
-void silu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl, int64_t cuda_stream) {
+void silu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(out.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
@@ -63,11 +64,13 @@ void silu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl, int64_t c
   });
 }
 
-void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl, int64_t cuda_stream) {
+void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  const c10::cuda::OptionalCUDAGuard device_guard(out.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
     cudaLaunchConfig_t config;
@@ -93,12 +96,12 @@ void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl, int6
   });
 }
 
-void gelu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl, int64_t cuda_stream) {
+void gelu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);
-  dim3 grid(num_tokens);
+  const c10::cuda::OptionalCUDAGuard device_guard(out.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
 
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
     uint32_t vec_size = 16 / sizeof(c_type);
     cudaLaunchConfig_t config;
