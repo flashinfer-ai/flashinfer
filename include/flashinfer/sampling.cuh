@@ -965,9 +965,21 @@ struct RenormTempStorage {
     float max_val;
     float min_val;
     union {
-      float value, value0, value1, value2;
-      int count, count0, count1, count2;
-      ValueCount<float> pair;
+      struct {
+        float value0;
+        float value1;
+        float value2;
+      } values;
+      struct {
+        int count0;
+        int count1;
+        int count2;
+      } counts;
+      struct {
+        ValueCount<float> pair0;
+        ValueCount<float> pair1;
+        ValueCount<float> pair2;
+      } pairs;
     } block_aggregate;
   };
 };
@@ -986,7 +998,6 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
       reinterpret_cast<RenormTempStorage<BLOCK_THREADS, REDUCE_ALGO>&>(smem_renorm);
   temp_storage.max_val = 0;
   vec_t<float, VEC_SIZE> probs_vec;
-  // float probs_greater_than_pivot[VEC_SIZE];  // pivot initialized to 0
 
   float max_val = GetMaxValue<VEC_SIZE, BLOCK_THREADS, REDUCE_ALGORITHM,
                               RenormTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM>>(probs, row_idx, d,
@@ -1003,14 +1014,11 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
   // stopping condition
   // - f(low) >= p, f(min_gt_low) == f(max_le_high) == f(high) < p
   do {
-    // float threadlocal_sum = 0;
-    double interval = (high - low) / 4;
-    double pivot_0 = low + interval;
-    double pivot_1 = pivot_0 + interval;
-    double pivot_2 = pivot_1 + interval;
+    double pivot_0 = (high + 3 * low) / 4;
+    double pivot_1 = (high + low) / 2;
+    double pivot_2 = (low + 3 * high) / 4;
 
     float aggregate_gt_pivot_0 = 0, aggregate_gt_pivot_1 = 0, aggregate_gt_pivot_2 = 0;
-    // double mid = (low + high) / 2;
     min_gt_low = high;
     max_le_high = low;
 #pragma unroll 2
@@ -1027,7 +1035,6 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
         probs_gt_pivot_1[j] = (probs_vec[j] > pivot_1) ? probs_vec[j] : 0;
         probs_gt_pivot_2[j] = (probs_vec[j] > pivot_2) ? probs_vec[j] : 0;
 
-        // probs_greater_than_pivot[j] = (probs_vec[j] > mid) ? probs_vec[j] : 0;
         if (probs_vec[j] > low && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d) {
           min_gt_low = min(min_gt_low, probs_vec[j]);
         }
@@ -1039,17 +1046,17 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
       aggregate_gt_pivot_0 +=
           BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
               .Sum<VEC_SIZE>(probs_gt_pivot_0);
+      __syncthreads();
+
       aggregate_gt_pivot_1 +=
           BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
               .Sum<VEC_SIZE>(probs_gt_pivot_1);
+      __syncthreads();
+
       aggregate_gt_pivot_2 +=
           BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
               .Sum<VEC_SIZE>(probs_gt_pivot_2);
       __syncthreads();
-      // threadlocal_sum +=
-      //     BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-      //         .Sum<VEC_SIZE>(probs_greater_than_pivot);
-      // __syncthreads();
     }
     min_gt_low = BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
                      .Reduce(min_gt_low, cub::Min());
@@ -1058,16 +1065,16 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
         BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
             .Reduce(max_le_high, cub::Max());
     if (tx == 0) {
-      temp_storage.block_aggregate.value0 = aggregate_gt_pivot_0;
-      temp_storage.block_aggregate.value1 = aggregate_gt_pivot_1;
-      temp_storage.block_aggregate.value2 = aggregate_gt_pivot_2;
+      temp_storage.block_aggregate.values.value0 = aggregate_gt_pivot_0;
+      temp_storage.block_aggregate.values.value1 = aggregate_gt_pivot_1;
+      temp_storage.block_aggregate.values.value2 = aggregate_gt_pivot_2;
       temp_storage.min_val = min_gt_low;
       temp_storage.max_val = max_le_high;
     }
     __syncthreads();
-    aggregate_gt_pivot_0 = temp_storage.block_aggregate.value0;
-    aggregate_gt_pivot_1 = temp_storage.block_aggregate.value1;
-    aggregate_gt_pivot_2 = temp_storage.block_aggregate.value2;
+    aggregate_gt_pivot_0 = temp_storage.block_aggregate.values.value0;
+    aggregate_gt_pivot_1 = temp_storage.block_aggregate.values.value1;
+    aggregate_gt_pivot_2 = temp_storage.block_aggregate.values.value2;
     min_gt_low = temp_storage.min_val;
     max_le_high = temp_storage.max_val;
 
@@ -1077,18 +1084,14 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
     } else if (aggregate_gt_pivot_1 >= p) {
       low = pivot_1;
       high = min(pivot_2, max_le_high);
+      sum_low = aggregate_gt_pivot_1;
     } else if (aggregate_gt_pivot_0 >= p) {
       low = pivot_0;
       high = min(pivot_1, max_le_high);
+      sum_low = aggregate_gt_pivot_0;
     } else {
       high = min(pivot_0, max_le_high);
     }
-    printf(
-        "low: %f, high: %f, min_gt_low: %f, max_le_high: %f, pivot_0: %f, pivot_1: %f, "
-        "pivot_2: %f, aggregate_gt_pivot_0: %f, aggregate_gt_pivot_1: %f, aggregate_gt_pivot_2: "
-        "%f\n",
-        low, high, min_gt_low, max_le_high, pivot_0, pivot_1, pivot_2, aggregate_gt_pivot_0,
-        aggregate_gt_pivot_1, aggregate_gt_pivot_2);
   } while (min_gt_low != max_le_high);
 
   float normalizer = math::ptx_rcp(max(sum_low, 1e-8));
@@ -1176,12 +1179,12 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
           BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
               .Reduce(max_le_high, cub::Max());
       if (tx == 0) {
-        temp_storage.block_aggregate.count = threadlocal_count_sum;
+        temp_storage.block_aggregate.counts.count0 = threadlocal_count_sum;
         temp_storage.min_val = min_gt_low;
         temp_storage.max_val = max_le_high;
       }
       __syncthreads();
-      threadlocal_count_sum = temp_storage.block_aggregate.count;
+      threadlocal_count_sum = temp_storage.block_aggregate.counts.count0;
       min_gt_low = temp_storage.min_val;
       max_le_high = temp_storage.max_val;
       if (threadlocal_count_sum >= k) {
@@ -1226,7 +1229,6 @@ __global__ void TopKRenormProbKernel(DType* probs, DType* renormed_prob, IdType*
     auto& temp_storage =
         reinterpret_cast<RenormTempStorage<BLOCK_THREADS, REDUCE_ALGO>&>(smem_renorm);
     temp_storage.max_val = 0;
-    float probs_greater_than_pivot[VEC_SIZE];  // pivot initialized to 0
 
     float max_val = GetMaxValue<VEC_SIZE, BLOCK_THREADS, REDUCE_ALGORITHM,
                                 RenormTempStorage<BLOCK_THREADS, REDUCE_ALGORITHM>>(
@@ -1243,9 +1245,12 @@ __global__ void TopKRenormProbKernel(DType* probs, DType* renormed_prob, IdType*
     // stopping condition: min_gt_low == max_le_high
     // - f(low) >= k, f(min_gt_low) == f(max_le_high) == f(high) < k
     do {
-      ValueCount<float> threadlocal_sum{0, 0};
-      ValueCount<float> probs_greater_than_pivot_pair[VEC_SIZE];  // pivot initialized to 0
-      double mid = (low + high) / 2;
+      double pivot_0 = (high + 3 * low) / 4;
+      double pivot_1 = (high + low) / 2;
+      double pivot_2 = (low + 3 * high) / 4;
+
+      ValueCount<float> aggregate_gt_pivot_0{0, 0}, aggregate_gt_pivot_1{0, 0},
+          aggregate_gt_pivot_2{0, 0};
       min_gt_low = high;
       max_le_high = low;
 #pragma unroll 2
@@ -1254,11 +1259,20 @@ __global__ void TopKRenormProbKernel(DType* probs, DType* renormed_prob, IdType*
         if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
           probs_vec.cast_load(probs + row_idx * d + i * BLOCK_THREADS * VEC_SIZE + tx * VEC_SIZE);
         }
+        ValueCount<float> probs_gt_pivot_0_pair[VEC_SIZE], probs_gt_pivot_1_pair[VEC_SIZE],
+            probs_gt_pivot_2_pair[VEC_SIZE];
 #pragma unroll
         for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-          probs_greater_than_pivot_pair[j] = {
-              (probs_vec[j] > mid) ? probs_vec[j] : 0,
-              (probs_vec[j] > mid && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
+          probs_gt_pivot_0_pair[j] = {
+              (probs_vec[j] > pivot_0) ? probs_vec[j] : 0,
+              (probs_vec[j] > pivot_0 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
+          probs_gt_pivot_1_pair[j] = {
+              (probs_vec[j] > pivot_1) ? probs_vec[j] : 0,
+              (probs_vec[j] > pivot_1 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
+          probs_gt_pivot_2_pair[j] = {
+              (probs_vec[j] > pivot_2) ? probs_vec[j] : 0,
+              (probs_vec[j] > pivot_2 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
+
           if (probs_vec[j] > low && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d) {
             min_gt_low = min(min_gt_low, probs_vec[j]);
           }
@@ -1266,9 +1280,20 @@ __global__ void TopKRenormProbKernel(DType* probs, DType* renormed_prob, IdType*
             max_le_high = max(max_le_high, probs_vec[j]);
           }
         }
-        threadlocal_sum += BlockReduce<ValueCount<float>, BLOCK_THREADS, REDUCE_ALGORITHM>(
-                               temp_storage.block_prim.reduce_value_count)
-                               .Sum<VEC_SIZE>(probs_greater_than_pivot_pair);
+
+        aggregate_gt_pivot_0 += BlockReduce<ValueCount<float>, BLOCK_THREADS, REDUCE_ALGORITHM>(
+                                    temp_storage.block_prim.reduce_value_count)
+                                    .Sum<VEC_SIZE>(probs_gt_pivot_0_pair);
+        __syncthreads();
+
+        aggregate_gt_pivot_1 += BlockReduce<ValueCount<float>, BLOCK_THREADS, REDUCE_ALGORITHM>(
+                                    temp_storage.block_prim.reduce_value_count)
+                                    .Sum<VEC_SIZE>(probs_gt_pivot_1_pair);
+        __syncthreads();
+
+        aggregate_gt_pivot_2 += BlockReduce<ValueCount<float>, BLOCK_THREADS, REDUCE_ALGORITHM>(
+                                    temp_storage.block_prim.reduce_value_count)
+                                    .Sum<VEC_SIZE>(probs_gt_pivot_2_pair);
         __syncthreads();
       }
       min_gt_low =
@@ -1279,19 +1304,32 @@ __global__ void TopKRenormProbKernel(DType* probs, DType* renormed_prob, IdType*
           BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
               .Reduce(max_le_high, cub::Max());
       if (tx == 0) {
-        temp_storage.block_aggregate.pair = threadlocal_sum;
+        temp_storage.block_aggregate.pairs.pair0 = aggregate_gt_pivot_0;
+        temp_storage.block_aggregate.pairs.pair1 = aggregate_gt_pivot_1;
+        temp_storage.block_aggregate.pairs.pair2 = aggregate_gt_pivot_2;
         temp_storage.min_val = min_gt_low;
         temp_storage.max_val = max_le_high;
       }
       __syncthreads();
-      threadlocal_sum = temp_storage.block_aggregate.pair;
+      aggregate_gt_pivot_0 = temp_storage.block_aggregate.pairs.pair0;
+      aggregate_gt_pivot_1 = temp_storage.block_aggregate.pairs.pair1;
+      aggregate_gt_pivot_2 = temp_storage.block_aggregate.pairs.pair2;
       min_gt_low = temp_storage.min_val;
       max_le_high = temp_storage.max_val;
-      if (threadlocal_sum.count >= k) {
-        low = mid;
-        sum_low = float(threadlocal_sum.value);
+
+      if (aggregate_gt_pivot_2.count >= k) {
+        low = pivot_2;
+        sum_low = float(aggregate_gt_pivot_2.value);
+      } else if (aggregate_gt_pivot_1.count >= k) {
+        low = pivot_1;
+        high = min(pivot_2, max_le_high);
+        sum_low = float(aggregate_gt_pivot_1.value);
+      } else if (aggregate_gt_pivot_0.count >= k) {
+        low = pivot_0;
+        high = min(pivot_1, max_le_high);
+        sum_low = float(aggregate_gt_pivot_0.value);
       } else {
-        high = min(mid, max_le_high);
+        high = min(pivot_0, max_le_high);
       }
     } while (min_gt_low != max_le_high);
 
