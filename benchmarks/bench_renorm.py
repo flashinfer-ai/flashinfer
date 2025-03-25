@@ -77,7 +77,6 @@ def main():
 
     print("---")
     print("top-k mask logits")
-
     for vocab_size in [128512]:
         for batch_size in [1, 16, 32, 64, 128, 256, 512]:
             for distrib in [
