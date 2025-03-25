@@ -30,8 +30,8 @@
 #include <nvbench/nvbench.cuh>
 #include <optional>
 
-#include "flashattention_ops.h"
-#include "utils.h"
+#include "flashinfer/utils/fp8/flashattention_ops.h"
+#include "flashinfer/utils/fp8/utils.h"
 
 namespace flashinfer {
 
