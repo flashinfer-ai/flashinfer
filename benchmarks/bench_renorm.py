@@ -22,23 +22,9 @@ def gumbel_distribution(beta):
     return gumbel_noise
 
 
-def init_seed_top_p_renorm(*args, **kwargs):
-    torch.manual_seed(42)
-    return flashinfer.sampling.top_p_renorm_probs(*args, **kwargs)
-
-
-def init_seed_top_k_renorm(*args, **kwargs):
-    torch.manual_seed(42)
-    return flashinfer.sampling.top_k_renorm_probs(*args, **kwargs)
-
-
-def init_seed_top_k_mask_logits(*args, **kwargs):
-    torch.manual_seed(42)
-    return flashinfer.sampling.top_k_mask_logits(*args, **kwargs)
-
-
 @torch.inference_mode()
 def main():
+    torch.manual_seed(42)
     print("---")
     print("top-p renorm")
     for vocab_size in [128512]:
@@ -53,7 +39,7 @@ def main():
                     logits = distrib((batch_size, vocab_size), device="cuda")
                     probs = torch.softmax(logits, dim=-1)
                     ms = do_bench(
-                        lambda: init_seed_top_p_renorm(probs, p),
+                        lambda: flashinfer.sampling.top_p_renorm_probs(probs, p),
                         warmup=100,
                         rep=1000,
                     )
@@ -78,7 +64,7 @@ def main():
                     logits = distrib((batch_size, vocab_size), device="cuda")
                     probs = torch.softmax(logits, dim=-1)
                     ms = do_bench(
-                        lambda: init_seed_top_k_renorm(probs, k),
+                        lambda: flashinfer.sampling.top_k_renorm_probs(probs, k),
                         warmup=100,
                         rep=1000,
                     )
@@ -103,7 +89,7 @@ def main():
                 for k in [10, 100, 1000, 5000]:
                     logits = distrib((batch_size, vocab_size), device="cuda")
                     ms = do_bench(
-                        lambda: init_seed_top_k_mask_logits(logits, k),
+                        lambda: flashinfer.sampling.top_k_mask_logits(logits, k),
                         warmup=100,
                         rep=1000,
                     )
