@@ -17,7 +17,6 @@
 #include <flashinfer/pos_enc.cuh>
 #include <optional>
 
-#include "aot_extension_utils.h"
 #include "pod_config.inc"
 #include "pytorch_conversion_utils.h"
 #include "pytorch_extension_utils.h"

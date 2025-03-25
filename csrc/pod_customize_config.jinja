@@ -35,9 +35,8 @@ using DecodeParams = BatchPrefillPagedParams<DTypeQ, DTypeKV, DTypeO, IdType>;
 
 #define DISPATCH_context(MASK_MODE_P, MASK_MODE_D, DTypeQ, DTypeKV, HEAD_DIM_QK,    \
             USE_SLIDING_WINDOW_P, USE_SLIDING_WINDOW_D, USE_LOGITS_SOFT_CAP, ...)   \
-  DISPATCH_mask_mode(mask_mode_p, MASK_MODE_P, [&] {                                \
-    return DISPATCH_mask_mode(mask_mode_d, MASK_MODE_D, [&] {                       \
+  DISPATCH_MASK_MODE(mask_mode_p, MASK_MODE_P, {                                    \
+    DISPATCH_MASK_MODE(mask_mode_d, MASK_MODE_D, {                                  \
       __VA_ARGS__();                                                                \
-      return true;                                                                  \
     });                                                                             \
 });
