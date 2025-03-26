@@ -599,6 +599,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
   const uint32_t lane_idx = cutlass::canonical_lane_idx();
   const uint32_t warp_group_idx = cutlass::canonical_warp_group_idx();
   const uint32_t warp_idx = cutlass::canonical_warp_idx();
+  const uint32_t warp_idx_in_wg = cutlass::canonical_warp_idx() % 4;
 
   using MainloopPipeline = typename KTraits::MainloopPipeline;
   using PipelineParams = typename MainloopPipeline::Params;
@@ -606,13 +607,15 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
   PipelineParams pipeline_params;
   pipeline_params.role = warp_group_idx == 0 ? MainloopPipeline::ThreadCategory::Producer
                                              : MainloopPipeline::ThreadCategory::Consumer;
-  pipeline_params.producer_arv_count = NUM_COPY_THREADS;
-  pipeline_params.consumer_arv_count = NUM_MMA_THREADS;
+  pipeline_params.producer_arv_count = 128;
+  pipeline_params.consumer_arv_count = 128;
   MainloopPipeline pipeline_q(smem_storage.pipeline_q, pipeline_params);
   MainloopPipeline pipeline_kv(smem_storage.pipeline_kv, pipeline_params);
 
   __syncthreads();
   alignas(16) float o_frag[KTraits::NUM_REGS_O_FRAG];
+  float m[2];
+  float d[2];
   float o_scale[2];
 
   if (warp_group_idx == 0) {
@@ -686,6 +689,11 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
       compute_mla_pv<KTraits>(&smem_storage, smem_pipe_write_kv.index() - 1, o_frag);
 
       barrier_sync(KTraits::NUM_THREADS, NamedBarriers::kMDReady);
+#pragma unroll
+      for (uint32_t j = 0; j < 2; ++j) {
+        m[j] = smem_storage.m[warp_idx_in_wg * 16 + j * 8 + lane_idx / 4];
+        d[j] = smem_storage.d[warp_idx_in_wg * 16 + j * 8 + lane_idx / 4];
+      }
       normalize_d_<KTraits>(&smem_storage, o_frag, m, d);
       finalize_m_<KTraits>(variant, m);
       write_o<KTraits>(
@@ -705,9 +713,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
     };
     float s_frag[KTraits::NUM_REGS_S_FRAG];
     uint32_t p_frag[KTraits::NUM_REGS_P_FRAG];
-    float m[2];
-    float d[2];
-    float o_scale[2];
 
 #pragma unroll 1
     for (IdType work_idx = work_indptr[blockIdx.y]; work_idx < work_indptr[blockIdx.y + 1];
