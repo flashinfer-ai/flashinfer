@@ -44,7 +44,7 @@ enum class ProfileEventType {
   kSplitK = 8U,
 };
 
-enum class NamedBarriers { kBarrierQ = 1, kBarrierO = 2, kConsumerSync = 3 };
+enum class NamedBarriers { kSReady = 1U };
 
 __device__ __forceinline__ void barrier_arrive(int num_threads, NamedBarriers barrier) {
   cutlass::arch::NamedBarrier::arrive(num_threads, static_cast<int>(barrier));
@@ -72,40 +72,11 @@ struct HopperSharedStorageQKVO {
             alignas(16) DTypeKV p[CTA_TILE_Q * CTA_TILE_KV];
           };
         };
-        alignas(16) DTypeO o[(CTA_TILE_Q / 2) * HEAD_DIM_CKV];
-      } kv_o_smem[NUM_STAGES];
-      union {
-        alignas(16) float m_wg[2][CTA_TILE_Q];  // cross warpgroup synchronization
-        alignas(16) float d_wg[2][CTA_TILE_Q];  // cross warpgroup synchronization
-      };
-    };
-
-    typename MainloopPipeline::SharedStorage pipeline_q, pipeline_kv;
-  };
-};
-
-template <typename MainloopPipeline, uint32_t NUM_STAGES, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV,
-          uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename DTypeQ, typename DTypeKV,
-          typename DTypeO>
-struct Hopper2WGSharedStorageQKVO {
-  struct {
-    struct {
-      struct {
-        alignas(16) DTypeQ nope[CTA_TILE_Q * HEAD_DIM_CKV];
-        alignas(16) DTypeQ pe[CTA_TILE_Q * HEAD_DIM_KPE];
-      } q_smem;
-      union {
-        struct {
-          alignas(16) DTypeKV ckv[CTA_TILE_KV * HEAD_DIM_CKV];
-          union {
-            alignas(16) DTypeKV kpe[CTA_TILE_KV * HEAD_DIM_KPE];
-            alignas(16) DTypeKV p[CTA_TILE_Q * CTA_TILE_KV];
-          };
-        };
         alignas(16) DTypeO o[CTA_TILE_Q * HEAD_DIM_CKV];
       } kv_o_smem[NUM_STAGES];
       union {
         alignas(16) float o_scale[CTA_TILE_Q];
+        alignas(16) float m[CTA_TILE_Q];
         alignas(16) float d[CTA_TILE_Q];
       };
     };
@@ -120,33 +91,16 @@ template <bool CAUSAL_, uint32_t NUM_STAGES_, uint32_t HEAD_DIM_CKV_, uint32_t H
 struct HopperKernelTraits
     : KernelTraits<CAUSAL_, NUM_STAGES_, /*QK_SHARD_=*/false, HEAD_DIM_CKV_, HEAD_DIM_KPE_,
                    CTA_TILE_Q_, CTA_TILE_KV_, DTypeQ_, DTypeKV_, DTypeO_, IdType_> {
-  static constexpr uint32_t NUM_THREADS = 384;
+  static constexpr uint32_t NUM_THREADS = 256;
   static constexpr uint32_t NUM_COPY_THREADS = 128;
-  static constexpr uint32_t NUM_MMA_THREADS = 256;
-  static constexpr uint32_t NUM_REGS_S_FRAG = CTA_TILE_KV_ / 4;
-  static constexpr uint32_t NUM_REGS_O_FRAG = HEAD_DIM_CKV_ / 4;
-  static constexpr uint32_t NUM_REGS_P_FRAG = CTA_TILE_KV_ / 8;
-  using MainloopPipeline = cutlass::PipelineAsync<NUM_STAGES_>;
-  using SharedStorage =
-      HopperSharedStorageQKVO<MainloopPipeline, NUM_STAGES_, CTA_TILE_Q_, CTA_TILE_KV_,
-                              HEAD_DIM_CKV_, HEAD_DIM_KPE_, DTypeQ_, DTypeKV_, DTypeO_>;
-};
-
-template <bool CAUSAL_, uint32_t NUM_STAGES_, uint32_t HEAD_DIM_CKV_, uint32_t HEAD_DIM_KPE_,
-          uint32_t CTA_TILE_Q_, uint32_t CTA_TILE_KV_, typename DTypeQ_, typename DTypeKV_,
-          typename DTypeO_, typename IdType_>
-struct HopperKernel2WGTraits
-    : KernelTraits<CAUSAL_, NUM_STAGES_, /*QK_SHARD_=*/false, HEAD_DIM_CKV_, HEAD_DIM_KPE_,
-                   CTA_TILE_Q_, CTA_TILE_KV_, DTypeQ_, DTypeKV_, DTypeO_, IdType_> {
-  static constexpr uint32_t NUM_THREADS = 128;
-  static constexpr uint32_t NUM_COPY_THREADS = 128;
+  static constexpr uint32_t NUM_QK_THREADS = 128;
   static constexpr uint32_t NUM_REGS_S_FRAG = CTA_TILE_KV_ / 2;
   static constexpr uint32_t NUM_REGS_O_FRAG = HEAD_DIM_CKV_ / 4;
   static constexpr uint32_t NUM_REGS_P_FRAG = CTA_TILE_KV_ / 4;
   using MainloopPipeline = cutlass::PipelineAsync<NUM_STAGES_>;
   using SharedStorage =
-      Hopper2WGSharedStorageQKVO<MainloopPipeline, NUM_STAGES_, CTA_TILE_Q_, CTA_TILE_KV_,
-                                 HEAD_DIM_CKV_, HEAD_DIM_KPE_, DTypeQ_, DTypeKV_, DTypeO_>;
+      HopperSharedStorageQKVO<MainloopPipeline, NUM_STAGES_, CTA_TILE_Q_, CTA_TILE_KV_,
+                              HEAD_DIM_CKV_, HEAD_DIM_KPE_, DTypeQ_, DTypeKV_, DTypeO_>;
 };
 
 template <typename KTraits>
@@ -287,7 +241,6 @@ __device__ __forceinline__ void load_kv(
 template <typename KTraits>
 __device__ __forceinline__ void compute_mla_qk(typename KTraits::SharedStorage* smem_storage,
                                                const uint32_t stage_idx, float* s_frag) {
-  const uint32_t warp_group_idx = cutlass::canonical_warp_group_idx();
   auto desc_q_pe =
       make_smem_desc<KTraits::SWIZZLE_MODE_Q_PE, /*leading_byte_offset=*/16,
                      /*stride_byte_offset=*/KTraits::HEAD_DIM_KPE * 16, typename KTraits::DTypeQ>(
@@ -295,9 +248,8 @@ __device__ __forceinline__ void compute_mla_qk(typename KTraits::SharedStorage* 
   auto desc_k_pe =
       make_smem_desc<KTraits::SWIZZLE_MODE_KPE, /*leading_byte_offset=*/16,
                      /*stride_byte_offset=*/KTraits::HEAD_DIM_KPE * 16, typename KTraits::DTypeKV>(
-          smem_storage->kv_o_smem[stage_idx].kpe +
-          (warp_group_idx - 1) * (KTraits::CTA_TILE_KV / 2) * KTraits::HEAD_DIM_KPE);
-  using wgmma = WGMMA_ASYNC_SS<typename KTraits::DTypeKV, float, 64, KTraits::CTA_TILE_KV / 2, 16,
+          smem_storage->kv_o_smem[stage_idx].kpe);
+  using wgmma = WGMMA_ASYNC_SS<typename KTraits::DTypeKV, float, 64, KTraits::CTA_TILE_KV, 16,
                                Major::K, Major::K, ScaleIn::One, ScaleIn::One>;
 
   warpgroup_fence_frag<KTraits::NUM_REGS_S_FRAG>(s_frag);
@@ -381,7 +333,6 @@ __device__ __forceinline__ void logits_mask_(const uint32_t qo_packed_idx_base,
                                              const uint32_t kv_len, const uint32_t kv_end,
                                              const uint_fastdiv num_heads, float* s_frag) {
   const uint32_t lane_idx = cutlass::canonical_lane_idx();
-  const uint32_t warp_group_idx = cutlass::canonical_warp_group_idx();
   const uint32_t warp_idx_in_wg = cutlass::canonical_warp_idx() % 4;
   constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
   uint32_t q[2];
@@ -393,8 +344,7 @@ __device__ __forceinline__ void logits_mask_(const uint32_t qo_packed_idx_base,
 #pragma unroll
   for (uint32_t reg_id = 0; reg_id < KTraits::NUM_REGS_S_FRAG; ++reg_id) {
     const uint32_t q_idx = q[(reg_id % 4) / 2],
-                   kv_idx = kv_idx_base + (warp_group_idx - 1) * (NUM_MMA_KV / 2) * 16 +
-                            2 * (lane_idx % 4) + 8 * (reg_id / 4) + reg_id % 2;
+                   kv_idx = kv_idx_base + 2 * (lane_idx % 4) + 8 * (reg_id / 4) + reg_id % 2;
     const bool mask = (!(KTraits::CAUSAL ? (kv_idx + qo_len > kv_len + q_idx || (kv_idx >= kv_end))
                                          : kv_idx >= kv_end));
     s_frag[reg_id] = (mask) ? s_frag[reg_id] : (KTraits::MaskFillValue);
@@ -404,7 +354,6 @@ __device__ __forceinline__ void logits_mask_(const uint32_t qo_packed_idx_base,
 template <typename KTraits>
 __device__ __forceinline__ void rescale_o_(float* o_scale, float* o_frag) {
   const uint32_t lane_idx = cutlass::canonical_lane_idx();
-  const uint32_t warp_group_idx = cutlass::canonical_warp_group_idx();
   const uint32_t warp_idx_in_wg = cutlass::canonical_warp_idx() % 4;
 #pragma unroll
   for (uint32_t reg_id = 0; reg_id < KTraits::NUM_REGS_O_FRAG; ++reg_id) {
@@ -419,34 +368,26 @@ __device__ __forceinline__ void update_md_(typename KTraits::SharedStorage* smem
   using AttentionVariant = typename KTraits::AttentionVariant;
   const float sm_scale = variant.sm_scale_log2;
   const uint32_t lane_idx = cutlass::canonical_lane_idx();
-  const uint32_t warp_group_idx = cutlass::canonical_warp_group_idx();
   const uint32_t warp_idx_in_wg = cutlass::canonical_warp_idx() % 4;
   float m_prev[2];
 #pragma unroll
   for (uint32_t j = 0; j < 2; ++j) {
     m_prev[j] = m[j];
 #pragma unroll
-    for (uint32_t k = 0; k < KTraits::CTA_TILE_KV / 16; ++k) {
+    for (uint32_t k = 0; k < NUM_REGS_S_FRAG / 4; ++k) {
       float m_local = max(s_frag[k * 4 + j * 2 + 0], s_frag[k * 4 + j * 2 + 1]);
       m[j] = max(m[j], m_local);
     }
     m[j] = max(m[j], math::shfl_xor_sync(m[j], 0x2));
     m[j] = max(m[j], math::shfl_xor_sync(m[j], 0x1));
-    if (lane_idx % 4 == 0) {
-      smem_storage->m_wg[warp_group_idx - 1][warp_idx_in_wg * 16 + j * 8 + lane_idx / 4] = m[j];
-    }
   }
-
-  barrier_sync(KTraits::NUM_MMA_THREADS, NamedBarriers::kConsumerSync);
 
 #pragma unroll
   for (uint32_t j = 0; j < 2; ++j) {
-    m[j] = max(smem_storage->m_wg[0][warp_idx_in_wg * 16 + j * 8 + lane_idx / 4],
-               smem_storage->m_wg[1][warp_idx_in_wg * 16 + j * 8 + lane_idx / 4]);
     o_scale[j] = math::ptx_exp2(m_prev[j] * sm_scale - m[j] * sm_scale);
     float d_local = 0.f;
 #pragma unroll
-    for (uint32_t k = 0; k < KTraits::CTA_TILE_KV / 16; ++k) {
+    for (uint32_t k = 0; k < NUM_REGS_S_FRAG / 4; ++k) {
       s_frag[k * 4 + j * 2 + 0] =
           math::ptx_exp2(s_frag[k * 4 + j * 2 + 0] * sm_scale - m[j] * sm_scale);
       s_frag[k * 4 + j * 2 + 1] =
@@ -463,55 +404,53 @@ __device__ __forceinline__ void write_p_rmem_smem(typename KTraits::SharedStorag
                                                   const uint32_t stage_idx, uint32_t* p_frag) {
   static constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
   const uint32_t lane_idx = cutlass::canonical_lane_idx();
-  const uint32_t warp_group_idx = cutlass::canonical_warp_group_idx();
   const uint32_t warp_idx_in_wg = cutlass::canonical_warp_idx() % 4;
   smem_t<KTraits::SWIZZLE_MODE_P> p_smem(smem_storage->kv_o_smem[stage_idx].p);
 #pragma unroll
-  for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV / 2; ++mma_kv) {
+  for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV; ++mma_kv) {
     uint32_t p_smem_offset_w =
         get_swizzle_offset<KTraits::SWIZZLE_MODE_P, KTraits::UPCAST_STRIDE_P>(
-            warp_idx_in_wg * 16 + lane_idx % 16,
-            (warp_group_idx - 1) * NUM_MMA_KV + mma_kv * 2 + lane_idx / 16);
+            warp_idx_in_wg * 16 + lane_idx % 16, mma_kv * 2 + lane_idx / 16);
     p_smem.stmatrix_m8n8x4(p_smem_offset_w, p_frag + mma_kv * 4);
   }
 }
 
-template <typename KTraits>
-__device__ __forceinline__ void normalize_d_(typename KTraits::SharedStorage* smem_storage,
-                                             float* o_frag, float* m, float* d) {
-  const uint32_t lane_idx = cutlass::canonical_lane_idx();
-  const uint32_t warp_group_idx = cutlass::canonical_warp_group_idx();
-  const uint32_t warp_idx_in_wg = cutlass::canonical_warp_idx() % 4;
+// template <typename KTraits>
+// __device__ __forceinline__ void normalize_d_(typename KTraits::SharedStorage* smem_storage,
+//                                              float* o_frag, float* m, float* d) {
+//   const uint32_t lane_idx = cutlass::canonical_lane_idx();
+//   const uint32_t warp_group_idx = cutlass::canonical_warp_group_idx();
+//   const uint32_t warp_idx_in_wg = cutlass::canonical_warp_idx() % 4;
 
-#pragma unroll
-  for (uint32_t j = 0; j < 2; ++j) {
-    d[j] += __shfl_xor_sync(0x11111111, d[j], 0x2);
-    d[j] += __shfl_xor_sync(0x11111111, d[j], 0x1);
-    if (lane_idx % 4 == 0) {
-      smem_storage->d_wg[warp_group_idx - 1][warp_idx_in_wg * 16 + j * 8 + lane_idx / 4] = d[j];
-    }
-  }
+// #pragma unroll
+//   for (uint32_t j = 0; j < 2; ++j) {
+//     d[j] += __shfl_xor_sync(0x11111111, d[j], 0x2);
+//     d[j] += __shfl_xor_sync(0x11111111, d[j], 0x1);
+//     if (lane_idx % 4 == 0) {
+//       smem_storage->d_wg[warp_group_idx - 1][warp_idx_in_wg * 16 + j * 8 + lane_idx / 4] = d[j];
+//     }
+//   }
 
-  barrier_sync(KTraits::NUM_MMA_THREADS, NamedBarriers::kConsumerSync);
+//   barrier_sync(KTraits::NUM_MMA_THREADS, NamedBarriers::kConsumerSync);
 
-#pragma unroll
-  for (uint32_t j = 0; j < 2; ++j) {
-    d[j] = smem_storage->d_wg[0][warp_idx_in_wg * 16 + j * 8 + lane_idx / 4] +
-           smem_storage->d_wg[1][warp_idx_in_wg * 16 + j * 8 + lane_idx / 4];
-  }
+// #pragma unroll
+//   for (uint32_t j = 0; j < 2; ++j) {
+//     d[j] = smem_storage->d_wg[0][warp_idx_in_wg * 16 + j * 8 + lane_idx / 4] +
+//            smem_storage->d_wg[1][warp_idx_in_wg * 16 + j * 8 + lane_idx / 4];
+//   }
 
-  float d_rcp[2];
-  // compute reciprocal of d
-#pragma unroll
-  for (uint32_t j = 0; j < 2; ++j) {
-    d_rcp[j] = (m[j] != -math::inf) ? math::ptx_rcp(d[j]) : 0.f;
-  }
+//   float d_rcp[2];
+//   // compute reciprocal of d
+// #pragma unroll
+//   for (uint32_t j = 0; j < 2; ++j) {
+//     d_rcp[j] = (m[j] != -math::inf) ? math::ptx_rcp(d[j]) : 0.f;
+//   }
 
-#pragma unroll
-  for (uint32_t reg_id = 0; reg_id < KTraits::NUM_REGS_O_FRAG; ++reg_id) {
-    o_frag[reg_id] = o_frag[reg_id] * d_rcp[(reg_id % 4) / 2];
-  }
-}
+// #pragma unroll
+//   for (uint32_t reg_id = 0; reg_id < KTraits::NUM_REGS_O_FRAG; ++reg_id) {
+//     o_frag[reg_id] = o_frag[reg_id] * d_rcp[(reg_id % 4) / 2];
+//   }
+// }
 
 template <typename KTraits>
 __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_storage,
@@ -529,9 +468,8 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
   const uint32_t lane_idx = cutlass::canonical_lane_idx();
   const uint32_t warp_group_idx = cutlass::canonical_warp_group_idx();
   const uint32_t warp_idx_in_wg = cutlass::canonical_warp_idx() % 4;
-  smem_t<KTraits::SWIZZLE_MODE_O> o_smem[2];
-  o_smem[0] = smem_storage->kv_o_smem[stage_counter % KTraits::NUM_STAGES].o;
-  o_smem[1] = smem_storage->kv_o_smem[(stage_counter + 1) % KTraits::NUM_STAGES].o;
+  smem_t<KTraits::SWIZZLE_MODE_O> o_smem;
+  o_smem = smem_storage->kv_o_smem[stage_counter % KTraits::NUM_STAGES].o;
 
   // step 0. rmem to smem
 #pragma unroll
@@ -539,9 +477,9 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
     uint32_t o_frag_f16[8 / 2];
     vec_cast<DTypeO, float>::cast<8>((DTypeO*)o_frag_f16, &o_frag[k * 8]);
     uint32_t o_smem_offset_w = get_swizzle_offset<KTraits::SWIZZLE_MODE_O, UPCAST_STRIDE_FINAL_O>(
-        (warp_idx_in_wg % 2) * 16 + lane_idx % 16,
+        warp_idx_in_wg * 16 + lane_idx % 16,
         (warp_group_idx - 1) * NUM_MMA_D_CKV + k * 2 + lane_idx / 16);
-    o_smem[warp_idx_in_wg / 2].template stmatrix_m8n8x4(o_smem_offset_w, o_frag_f16);
+    o_smem.template stmatrix_m8n8x4(o_smem_offset_w, o_frag_f16);
   }
 
   if (partial_o != nullptr) {
@@ -556,18 +494,17 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
           ((blockIdx.x * 4 + warp_idx_in_wg) * 16 + 4 * j + lane_idx / 8) * HEAD_DIM_CKV +
           (warp_group_idx - 1) * (HEAD_DIM_CKV / 2) + (lane_idx % 8) * upcast_size<DTypeO>();
       uint32_t o_smem_offset_w = get_swizzle_offset<KTraits::SWIZZLE_MODE_O, UPCAST_STRIDE_FINAL_O>(
-          (warp_idx_in_wg % 2) * 16 + 4 * j + lane_idx / 8,
+          warp_idx_in_wg * 16 + 4 * j + lane_idx / 8,
           (warp_group_idx - 1) * NUM_MMA_D_CKV + lane_idx % 8);
 #pragma unroll
       for (uint32_t k = 0; k < HEAD_DIM_CKV / 128; ++k) {
         if (q_idx < q_len) {
-          o_smem[warp_idx_in_wg / 2].template store_128b(o_smem_offset_w, o_partial_ptr);
+          o_smem.template store_128b(o_smem_offset_w, o_partial_ptr);
         }
         o_partial_ptr += 8 * upcast_size<DTypeO>();
         o_smem_offset_w += 64;
       }
     }
-    barrier_arrive(KTraits::NUM_COPY_THREADS + KTraits::NUM_MMA_THREADS, NamedBarriers::kBarrierO);
 
 #pragma unroll
     for (uint32_t j = 0; j < 2; ++j) {
@@ -589,18 +526,17 @@ __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_st
                             (warp_group_idx - 1) * (HEAD_DIM_CKV / 2) +
                             (lane_idx % 8) * upcast_size<DTypeO>();
       uint32_t o_smem_offset_w = get_swizzle_offset<KTraits::SWIZZLE_MODE_O, UPCAST_STRIDE_FINAL_O>(
-          (warp_idx_in_wg % 2) * 16 + 4 * j + lane_idx / 8,
+          warp_idx_in_wg * 16 + 4 * j + lane_idx / 8,
           (warp_group_idx - 1) * NUM_MMA_D_CKV + lane_idx % 8);
 #pragma unroll
       for (uint32_t k = 0; k < HEAD_DIM_CKV / 128; ++k) {
         if (q < q_len) {
-          o_smem[warp_idx_in_wg / 2].template store_128b(o_smem_offset_w, o_final_ptr);
+          o_smem.template store_128b(o_smem_offset_w, o_final_ptr);
         }
         o_final_ptr += 8 * upcast_size<DTypeO>();
         o_smem_offset_w += 64;
       }
     }
-    barrier_arrive(KTraits::NUM_COPY_THREADS + KTraits::NUM_MMA_THREADS, NamedBarriers::kBarrierO);
 
     if (final_lse) {
 #pragma unroll
@@ -633,97 +569,6 @@ __device__ __forceinline__ void convert_s_to_p(float* s_frag, uint32_t* p_frag) 
 }
 
 template <typename KTraits, typename Params>
-__global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLA2WGPageAttentionHopperKernel(
-    const __grid_constant__ Params params) {
-  using DTypeQ = typename Params::DTypeQ;
-  using DTypeKV = typename Params::DTypeKV;
-  using DTypeO = typename Params::DTypeO;
-  using IdType = typename Params::IdType;
-
-  extern __shared__ __align__(alignof(typename KTraits::SharedStorage)) uint8_t smem[];
-  auto& smem_storage = reinterpret_cast<typename KTraits::SharedStorage&>(smem);
-
-  typename KTraits::AttentionVariant variant(params, blockIdx.y, smem);
-  [[maybe_unused]] constexpr SwizzleMode SWIZZLE_MODE_Q_NOPE = KTraits::SWIZZLE_MODE_Q_NOPE;
-  [[maybe_unused]] constexpr SwizzleMode SWIZZLE_MODE_Q_PE = KTraits::SWIZZLE_MODE_Q_PE;
-  [[maybe_unused]] constexpr SwizzleMode SWIZZLE_MODE_CKV = KTraits::SWIZZLE_MODE_CKV;
-  [[maybe_unused]] constexpr SwizzleMode SWIZZLE_MODE_KPE = KTraits::SWIZZLE_MODE_KPE;
-  [[maybe_unused]] constexpr uint32_t NUM_MMA_KV = KTraits::NUM_MMA_KV;
-  [[maybe_unused]] constexpr uint32_t NUM_MMA_D_CKV = KTraits::NUM_MMA_D_CKV;
-  [[maybe_unused]] constexpr uint32_t HEAD_DIM_CKV = KTraits::HEAD_DIM_CKV;
-  [[maybe_unused]] constexpr uint32_t CTA_TILE_Q = KTraits::CTA_TILE_Q;
-  [[maybe_unused]] constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
-  [[maybe_unused]] constexpr int32_t NUM_STAGES = KTraits::NUM_STAGES;
-  [[maybe_unused]] constexpr uint32_t NUM_COPY_THREADS = KTraits::NUM_COPY_THREADS;
-  [[maybe_unused]] constexpr bool CAUSAL = KTraits::CAUSAL;
-
-  DTypeQ* q_nope = params.q_nope;
-  DTypeQ* q_pe = params.q_pe;
-  DTypeKV* ckv = params.ckv;
-  DTypeKV* kpe = params.kpe;
-  IdType* kv_indices = params.kv_indices;
-  DTypeO* partial_o = params.partial_o;
-  float* partial_lse = params.partial_lse;
-  DTypeO* final_o = params.final_o;
-  float* final_lse = params.final_lse;
-  IdType* work_indptr = params.work_indptr;
-
-  const uint_fastdiv& num_heads = params.num_heads;
-  const uint_fastdiv& block_size = params.block_size;
-  const uint32_t q_nope_stride_n = params.q_nope_stride_n;
-  const uint32_t q_nope_stride_h = params.q_nope_stride_h;
-  const uint32_t q_pe_stride_n = params.q_pe_stride_n;
-  const uint32_t q_pe_stride_h = params.q_pe_stride_h;
-  const uint32_t ckv_stride_page = params.ckv_stride_page;
-  const uint32_t ckv_stride_n = params.ckv_stride_n;
-  const uint32_t kpe_stride_page = params.kpe_stride_page;
-  const uint32_t kpe_stride_n = params.kpe_stride_n;
-  const uint32_t o_stride_n = params.o_stride_n;
-  const uint32_t o_stride_h = params.o_stride_h;
-  const uint32_t cluster_tile_q = gridDim.x * KTraits::CTA_TILE_Q;
-
-  const uint32_t lane_predicate = cute::elect_one_sync();
-  const uint32_t lane_idx = cutlass::canonical_lane_idx();
-  const uint32_t warp_group_idx = cutlass::canonical_warp_group_idx();
-  const uint32_t warp_idx = cutlass::canonical_warp_idx();
-
-  using MainloopPipeline = typename KTraits::MainloopPipeline;
-  using PipelineParams = typename MainloopPipeline::Params;
-  using PipelineState = typename MainloopPipeline::PipelineState;
-  PipelineParams pipeline_params;
-  pipeline_params.role = warp_group_idx == 0 ? MainloopPipeline::ThreadCategory::Producer
-                                             : MainloopPipeline::ThreadCategory::Consumer;
-  pipeline_params.producer_arv_count = NUM_COPY_THREADS;
-  pipeline_params.consumer_arv_count = NUM_MMA_THREADS;
-  MainloopPipeline pipeline_q(smem_storage.pipeline_q, pipeline_params);
-  MainloopPipeline pipeline_kv(smem_storage.pipeline_kv, pipeline_params);
-
-  __syncthreads();
-
-  if (warp_group_idx == 0) {
-    // load q & kv, compute pv1
-
-  } else {
-    // compute qk, pv2
-  }
-
-  auto grid = cg::this_grid();
-  grid.sync();
-
-  PROFILER_EVENT_START(variant, ProfileEventType::kSplitK);
-
-  __syncthreads();
-  // the second stage, merge partial outputs
-  DevicePersistentMergeStates<KTraits>(
-      params.merge_packed_offset_start, params.merge_packed_offset_end,
-      params.merge_partial_packed_offset_start, params.merge_partial_packed_offset_end,
-      params.merge_partial_stride, partial_o, partial_lse, final_o, final_lse, o_stride_n,
-      o_stride_h, num_heads);
-
-  PROFILER_EVENT_END(variant, ProfileEventType::kSplitK);
-}
-
-template <typename KTraits, typename Params>
 __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHopperKernel(
     const __grid_constant__ Params params) {
   using DTypeQ = typename Params::DTypeQ;
@@ -735,7 +580,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
   auto& smem_storage = reinterpret_cast<typename KTraits::SharedStorage&>(smem);
 
   typename KTraits::AttentionVariant variant(params, blockIdx.y, smem);
-
   [[maybe_unused]] constexpr SwizzleMode SWIZZLE_MODE_Q_NOPE = KTraits::SWIZZLE_MODE_Q_NOPE;
   [[maybe_unused]] constexpr SwizzleMode SWIZZLE_MODE_Q_PE = KTraits::SWIZZLE_MODE_Q_PE;
   [[maybe_unused]] constexpr SwizzleMode SWIZZLE_MODE_CKV = KTraits::SWIZZLE_MODE_CKV;
@@ -747,7 +591,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
   [[maybe_unused]] constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
   [[maybe_unused]] constexpr int32_t NUM_STAGES = KTraits::NUM_STAGES;
   [[maybe_unused]] constexpr uint32_t NUM_COPY_THREADS = KTraits::NUM_COPY_THREADS;
-  [[maybe_unused]] constexpr uint32_t NUM_MMA_THREADS = KTraits::NUM_MMA_THREADS;
   [[maybe_unused]] constexpr bool CAUSAL = KTraits::CAUSAL;
 
   DTypeQ* q_nope = params.q_nope;
@@ -780,8 +623,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
   const uint32_t warp_group_idx = cutlass::canonical_warp_group_idx();
   const uint32_t warp_idx = cutlass::canonical_warp_idx();
 
-  PROFILER_INIT(params, smem_storage, variant, warp_group_idx, 3, (threadIdx.x % 128 == 0));
-
   using MainloopPipeline = typename KTraits::MainloopPipeline;
   using PipelineParams = typename MainloopPipeline::Params;
   using PipelineState = typename MainloopPipeline::PipelineState;
@@ -794,21 +635,20 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
   MainloopPipeline pipeline_kv(smem_storage.pipeline_kv, pipeline_params);
 
   __syncthreads();
+  alignas(16) float o_frag[KTraits::NUM_REGS_O_FRAG];
+  float o_scale[2];
 
   if (warp_group_idx == 0) {
-    // producer
-    cutlass::arch::warpgroup_reg_dealloc<56>();
-    const uint32_t warp_idx_in_warpgroup = __shfl_sync(0xffffffff, warp_idx % 4, 0);
+    // load q & kv, compute pv1
     PipelineState smem_pipe_write_q = cutlass::make_producer_start_state<MainloopPipeline>();
     PipelineState smem_pipe_write_kv = cutlass::make_producer_start_state<MainloopPipeline>();
-
-    bool is_first_tile = true;
 
 #pragma unroll 1
     for (IdType work_idx = work_indptr[blockIdx.y]; work_idx < work_indptr[blockIdx.y + 1];
          ++work_idx) {
       auto [q_indptr, kv_indptr, partial_indptr, q_len, kv_len, packed_qo_start, kv_start, kv_end] =
           get_block_coord(params, work_idx);
+
       const uint32_t qo_packed_idx_base = packed_qo_start + blockIdx.x * KTraits::CTA_TILE_Q;
       const uint32_t qo_upperbound =
           min(q_len, ceil_div(qo_packed_idx_base + KTraits::CTA_TILE_Q, num_heads));
@@ -823,82 +663,71 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
 
       const uint32_t block_iter_base = kv_indptr * block_size + kv_start;
 
-      pipeline_kv.producer_acquire(smem_pipe_write_kv);
-
-      PROFILER_EVENT_START(variant, ProfileEventType::kIssueLoadKV);
-      load_kv<true, KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
-                             kpe_stride_n, kpe_stride_page, packed_kv_bound,
-                             block_iter_base + kv_tile_idx * CTA_TILE_KV, block_size,
-                             smem_pipe_write_kv.index());
-
-      PROFILER_EVENT_END(variant, ProfileEventType::kIssueLoadKV);
-      pipeline_kv.producer_commit(smem_pipe_write_kv, cutlass::arch::cpasync_barrier_arrive);
-      kv_tile_idx -= 1;
-      ++smem_pipe_write_kv;
-
-      if (!is_first_tile) {
-        barrier_sync(KTraits::NUM_COPY_THREADS + KTraits::NUM_MMA_THREADS,
-                     NamedBarriers::kBarrierQ);
-      }
-
       pipeline_q.producer_acquire(smem_pipe_write_q);
-      PROFILER_EVENT_START(variant, ProfileEventType::kIssueLoadQ);
+      pipeline_kv.producer_acquire(smem_pipe_write_kv);
       load_q<KTraits>(&smem_storage, q_nope + q_indptr * q_nope_stride_n,
                       q_pe + q_indptr * q_pe_stride_n, q_nope_stride_n, q_nope_stride_h,
                       q_pe_stride_n, q_pe_stride_h, qo_upperbound, qo_packed_idx_base,
                       params.num_heads);
       pipeline_q.producer_commit(smem_pipe_write_q, cutlass::arch::cpasync_barrier_arrive);
-      PROFILER_EVENT_END(variant, ProfileEventType::kIssueLoadQ);
       ++smem_pipe_write_q;
 
-      if (kv_tile_idx >= 1) {
+      load_kv<true, KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
+                             kpe_stride_n, kpe_stride_page, packed_kv_bound,
+                             block_iter_base + kv_tile_idx * CTA_TILE_KV, block_size,
+                             smem_pipe_write_kv.index());
+      pipeline_kv.producer_commit(smem_pipe_write_kv, cutlass::arch::cpasync_barrier_arrive);
+      kv_tile_idx -= 1;
+      ++smem_pipe_write_kv;
+
+#pragma unroll
+      for (; kv_tile_idx >= 1; --kv_tile_idx) {
         pipeline_kv.producer_acquire(smem_pipe_write_kv);
-        PROFILER_EVENT_START(variant, ProfileEventType::kIssueLoadKV);
         load_kv<false, KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
                                 kpe_stride_n, kpe_stride_page, packed_kv_bound,
                                 block_iter_base + kv_tile_idx * CTA_TILE_KV, block_size,
                                 smem_pipe_write_kv.index());
-        PROFILER_EVENT_END(variant, ProfileEventType::kIssueLoadKV);
         pipeline_kv.producer_commit(smem_pipe_write_kv, cutlass::arch::cpasync_barrier_arrive);
-        ++smem_pipe_write_kv;
-        --kv_tile_idx;
-      }
 
-      if (!is_first_tile) {
-        barrier_sync(KTraits::NUM_COPY_THREADS + KTraits::NUM_MMA_THREADS,
-                     NamedBarriers::kBarrierO);
-      }
-
-#pragma unroll 1
-      for (; kv_tile_idx >= 0; --kv_tile_idx) {
-        pipeline_kv.producer_acquire(smem_pipe_write_kv);
-        PROFILER_EVENT_START(variant, ProfileEventType::kIssueLoadKV);
-        load_kv<false, KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
-                                kpe_stride_n, kpe_stride_page, packed_kv_bound,
-                                block_iter_base + kv_tile_idx * CTA_TILE_KV, block_size,
-                                smem_pipe_write_kv.index());
-        PROFILER_EVENT_END(variant, ProfileEventType::kIssueLoadKV);
-        pipeline_kv.producer_commit(smem_pipe_write_kv, cutlass::arch::cpasync_barrier_arrive);
+        barrier_sync(KTraits::NUM_THREADS, NamedBarriers::kSReady);
+#pragma unroll
+        for (uint32_t j = 0; j < 2; ++j) {
+          o_scale[j] = smem_storage.o_scale[warp_idx_in_wg * 16 + j * 8 + lane_idx / 4];
+        }
+        rescale_o_<KTraits>(o_scale, o_frag);
+        compute_mla_pv<KTraits>(&smem_storage, smem_pipe_write_kv.index() - 1, o_frag);
+        warpgroup_wait<0>();
         ++smem_pipe_write_kv;
       }
 
-      is_first_tile = false;
+      barrier_sync(KTraits::NUM_THREADS, NamedBarriers::kSReady);
+#pragma unroll
+      for (uint32_t j = 0; j < 2; ++j) {
+        o_scale[j] = smem_storage.o_scale[warp_idx_in_wg * 16 + j * 8 + lane_idx / 4];
+      }
+      rescale_o_<KTraits>(o_scale, o_frag);
+      compute_mla_pv<KTraits>(&smem_storage, smem_pipe_write_kv.index() - 1, o_frag);
+
+      // TODO(Zihao): wait softmax ready
+      normalize_d_<KTraits>(&smem_storage, o_frag, m, d);
+      finalize_m_<KTraits>(variant, m);
+      write_o<KTraits>(
+          &smem_storage, smem_pipe_write_kv.count() - 1, final_o + q_indptr * o_stride_n,
+          final_lse ? final_lse + q_indptr * num_heads : nullptr,
+          (partial_indptr == -1) ? nullptr : partial_o + partial_indptr * KTraits::HEAD_DIM_CKV,
+          (partial_indptr == -1) ? nullptr : partial_lse + partial_indptr, o_frag, m, d, o_stride_n,
+          o_stride_h, qo_upperbound, qo_packed_idx_base, num_heads);
     }
   } else {
-    // consumer
-    cutlass::arch::warpgroup_reg_alloc<224>();
-    const uint32_t warp_idx_in_warpgroup = __shfl_sync(0xffffffff, warp_idx % 4, 0);
-
+    // compute qk, pv2
     PipelineState smem_pipe_read_q;
     PipelineState smem_pipe_read_kv;
     auto consumer_wait = [](auto& pipeline, auto& smem_pipe_read) {
       auto barrier_token = pipeline.consumer_try_wait(smem_pipe_read);
       pipeline.consumer_wait(smem_pipe_read, barrier_token);
     };
-
     float s_frag[KTraits::NUM_REGS_S_FRAG];
     uint32_t p_frag[KTraits::NUM_REGS_P_FRAG];
-    alignas(16) float o_frag[KTraits::NUM_REGS_O_FRAG];
     float m[2];
     float d[2];
     float o_scale[2];
@@ -927,234 +756,109 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
           (kv_start / CTA_TILE_KV);
 
       consumer_wait(pipeline_q, smem_pipe_read_q);
-      consumer_wait(pipeline_kv, smem_pipe_read_kv);
-      PROFILER_EVENT_START(variant, ProfileEventType::kGemmQK);
-      compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag);
-      warpgroup_wait<0>();
-      PROFILER_EVENT_END(variant, ProfileEventType::kGemmQK);
-      PROFILER_EVENT_START(variant, ProfileEventType::kSoftmaxUpdate);
-      logits_mask_<KTraits>(qo_packed_idx_base, kv_start + kv_tile_idx * CTA_TILE_KV, q_len, kv_len,
-                            kv_end, num_heads, s_frag);
-      update_md_<KTraits>(&smem_storage, variant, s_frag, m, d, o_scale);
-      PROFILER_EVENT_END(variant, ProfileEventType::kSoftmaxUpdate);
-      PROFILER_EVENT_START(variant, ProfileEventType::kWritePSmem);
-      convert_s_to_p<KTraits>(s_frag, p_frag);
-      write_p_rmem_smem<KTraits>(&smem_storage, smem_pipe_read_kv.index(), p_frag);
-      PROFILER_EVENT_END(variant, ProfileEventType::kWritePSmem);
-
-      // loop with mask
 #pragma unroll 1
-      for (; kv_tile_idx > mask_tile_idx && kv_tile_idx > 1; --kv_tile_idx) {
-        auto smem_pipe_read_kv_cur = smem_pipe_read_kv;
-        ++smem_pipe_read_kv;
+      for (; kv_tile_idx > mask_tile_idx; --kv_tile_idx) {
         consumer_wait(pipeline_kv, smem_pipe_read_kv);
-        PROFILER_EVENT_START(variant, ProfileEventType::kGemmQK);
         compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag);
-        PROFILER_EVENT_START(variant, ProfileEventType::kRescaleO);
-        rescale_o_<KTraits>(o_scale, o_frag);
-        PROFILER_EVENT_END(variant, ProfileEventType::kRescaleO);
-        PROFILER_EVENT_START(variant, ProfileEventType::kGemmPV);
-        compute_mla_pv<KTraits>(&smem_storage, smem_pipe_read_kv_cur.index(), o_frag);
-        warpgroup_wait<1>();
-        PROFILER_EVENT_END(variant, ProfileEventType::kGemmQK);
-        PROFILER_EVENT_START(variant, ProfileEventType::kSoftmaxUpdate);
-        logits_mask_<KTraits>(qo_packed_idx_base, kv_start + (kv_tile_idx - 1) * CTA_TILE_KV, q_len,
+        warpgroup_wait<0>();
+        logits_mask_<KTraits>(qo_packed_idx_base, kv_start + kv_tile_idx * CTA_TILE_KV, q_len,
                               kv_len, kv_end, num_heads, s_frag);
         update_md_<KTraits>(&smem_storage, variant, s_frag, m, d, o_scale);
-        PROFILER_EVENT_END(variant, ProfileEventType::kSoftmaxUpdate);
-        warpgroup_wait<0>();
-        PROFILER_EVENT_END(variant, ProfileEventType::kGemmPV);
-        pipeline_kv.consumer_release(smem_pipe_read_kv_cur);
-        PROFILER_EVENT_START(variant, ProfileEventType::kWritePSmem);
-        convert_s_to_p<KTraits>(s_frag, p_frag);
-        write_p_rmem_smem<KTraits>(&smem_storage, smem_pipe_read_kv.index(), p_frag);
-        PROFILER_EVENT_END(variant, ProfileEventType::kWritePSmem);
-      }
-
-      // loop without mask
-#pragma unroll 2
-      for (; kv_tile_idx > NUM_STAGES; --kv_tile_idx) {
-        auto smem_pipe_read_kv_cur = smem_pipe_read_kv;
-        ++smem_pipe_read_kv;
-        consumer_wait(pipeline_kv, smem_pipe_read_kv);
-        PROFILER_EVENT_START(variant, ProfileEventType::kGemmQK);
-        compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag);
-        PROFILER_EVENT_START(variant, ProfileEventType::kRescaleO);
         rescale_o_<KTraits>(o_scale, o_frag);
-        PROFILER_EVENT_END(variant, ProfileEventType::kRescaleO);
-        PROFILER_EVENT_START(variant, ProfileEventType::kGemmPV);
-        compute_mla_pv<KTraits>(&smem_storage, smem_pipe_read_kv_cur.index(), o_frag);
-        warpgroup_wait<1>();
-        PROFILER_EVENT_END(variant, ProfileEventType::kGemmQK);
-        PROFILER_EVENT_START(variant, ProfileEventType::kSoftmaxUpdate);
-        update_md_<KTraits>(&smem_storage, variant, s_frag, m, d, o_scale);
-        PROFILER_EVENT_END(variant, ProfileEventType::kSoftmaxUpdate);
-        warpgroup_wait<0>();
-        PROFILER_EVENT_END(variant, ProfileEventType::kGemmPV);
-        pipeline_kv.consumer_release(smem_pipe_read_kv_cur);
-        PROFILER_EVENT_START(variant, ProfileEventType::kWritePSmem);
         convert_s_to_p<KTraits>(s_frag, p_frag);
         write_p_rmem_smem<KTraits>(&smem_storage, smem_pipe_read_kv.index(), p_frag);
-        PROFILER_EVENT_END(variant, ProfileEventType::kWritePSmem);
+        barrier_arrive(KTraits::NUM_QK_THREADS, NamedBarriers::kSReady);
+        compute_mla_pv<KTraits>(&smem_storage, smem_pipe_read_kv.index(), o_frag);
+        warpgroup_wait<0>();
+        pipeline_kv.consumer_release(smem_pipe_read_kv);
+        ++smem_pipe_read_kv;
       }
 
-      // last tiles
-#pragma unroll
+#pragma unroll 1
       for (; kv_tile_idx > 0; --kv_tile_idx) {
-        auto smem_pipe_read_kv_cur = smem_pipe_read_kv;
-        ++smem_pipe_read_kv;
         consumer_wait(pipeline_kv, smem_pipe_read_kv);
-        PROFILER_EVENT_START(variant, ProfileEventType::kGemmQK);
         compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag);
-        PROFILER_EVENT_START(variant, ProfileEventType::kRescaleO);
-        rescale_o_<KTraits>(o_scale, o_frag);
-        PROFILER_EVENT_END(variant, ProfileEventType::kRescaleO);
-        PROFILER_EVENT_START(variant, ProfileEventType::kGemmPV);
-        compute_mla_pv<KTraits>(&smem_storage, smem_pipe_read_kv_cur.index(), o_frag);
-        warpgroup_wait<1>();
-        PROFILER_EVENT_END(variant, ProfileEventType::kGemmQK);
-        PROFILER_EVENT_START(variant, ProfileEventType::kSoftmaxUpdate);
-        logits_mask_<KTraits>(qo_packed_idx_base, kv_start + (kv_tile_idx - 1) * CTA_TILE_KV, q_len,
-                              kv_len, kv_end, num_heads, s_frag);
-        update_md_<KTraits>(&smem_storage, variant, s_frag, m, d, o_scale);
-        PROFILER_EVENT_END(variant, ProfileEventType::kSoftmaxUpdate);
         warpgroup_wait<0>();
-        PROFILER_EVENT_END(variant, ProfileEventType::kGemmPV);
-        pipeline_kv.consumer_release(smem_pipe_read_kv_cur);
-        PROFILER_EVENT_START(variant, ProfileEventType::kWritePSmem);
+        update_md_<KTraits>(&smem_storage, variant, s_frag, m, d, o_scale);
+        rescale_o_<KTraits>(o_scale, o_frag);
         convert_s_to_p<KTraits>(s_frag, p_frag);
         write_p_rmem_smem<KTraits>(&smem_storage, smem_pipe_read_kv.index(), p_frag);
-        PROFILER_EVENT_END(variant, ProfileEventType::kWritePSmem);
+        barrier_arrive(KTraits::NUM_QK_THREADS, NamedBarriers::kSReady);
+        compute_mla_pv<KTraits>(&smem_storage, smem_pipe_read_kv.index(), o_frag);
+        warpgroup_wait<0>();
+        pipeline_kv.consumer_release(smem_pipe_read_kv);
+        ++smem_pipe_read_kv;
       }
-
-      barrier_arrive(KTraits::NUM_COPY_THREADS + KTraits::NUM_MMA_THREADS,
-                     NamedBarriers::kBarrierQ);
       pipeline_q.consumer_release(smem_pipe_read_q);
       ++smem_pipe_read_q;
 
-      PROFILER_EVENT_START(variant, ProfileEventType::kRescaleO);
-      rescale_o_<KTraits>(o_scale, o_frag);
-      PROFILER_EVENT_END(variant, ProfileEventType::kRescaleO);
-      PROFILER_EVENT_START(variant, ProfileEventType::kGemmPV);
-      compute_mla_pv<KTraits>(&smem_storage, smem_pipe_read_kv.index(), o_frag);
-      warpgroup_wait<0>();
-      PROFILER_EVENT_END(variant, ProfileEventType::kGemmPV);
-      pipeline_kv.consumer_release(smem_pipe_read_kv);
-      ++smem_pipe_read_kv;
-
+      // TODO(Zihao): wait softmax ready
       normalize_d_<KTraits>(&smem_storage, o_frag, m, d);
       finalize_m_<KTraits>(variant, m);
-
-      PROFILER_EVENT_START(variant, ProfileEventType::kWriteO);
       write_o<KTraits>(
-          &smem_storage, smem_pipe_read_kv.count() - 2, final_o + q_indptr * o_stride_n,
+          &smem_storage, smem_pipe_read_kv.count() - 1, final_o + q_indptr * o_stride_n,
           final_lse ? final_lse + q_indptr * num_heads : nullptr,
           (partial_indptr == -1) ? nullptr : partial_o + partial_indptr * KTraits::HEAD_DIM_CKV,
           (partial_indptr == -1) ? nullptr : partial_lse + partial_indptr, o_frag, m, d, o_stride_n,
           o_stride_h, qo_upperbound, qo_packed_idx_base, num_heads);
-      PROFILER_EVENT_END(variant, ProfileEventType::kWriteO);
     }
+
+    auto grid = cg::this_grid();
+    grid.sync();
+
+    PROFILER_EVENT_START(variant, ProfileEventType::kSplitK);
+
+    __syncthreads();
+    // the second stage, merge partial outputs
+    DevicePersistentMergeStates<KTraits>(
+        params.merge_packed_offset_start, params.merge_packed_offset_end,
+        params.merge_partial_packed_offset_start, params.merge_partial_packed_offset_end,
+        params.merge_partial_stride, partial_o, partial_lse, final_o, final_lse, o_stride_n,
+        o_stride_h, num_heads);
+
+    PROFILER_EVENT_END(variant, ProfileEventType::kSplitK);
   }
 
-  auto grid = cg::this_grid();
-  grid.sync();
+  template <MaskMode MASK_MODE, uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename Params>
+  cudaError_t BatchMLAPageAttentionHopper(Params params, uint32_t num_blks_x, uint32_t num_blks_y,
+                                          cudaStream_t stream) {
+    using DTypeQ = typename Params::DTypeQ;
+    using DTypeKV = typename Params::DTypeKV;
+    using DTypeO = typename Params::DTypeO;
+    using IdType = typename Params::IdType;
 
-  PROFILER_EVENT_START(variant, ProfileEventType::kSplitK);
+    if (MASK_MODE == MaskMode::kCustom) {
+      return cudaErrorNotSupported;
+    }
+    constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
 
-  __syncthreads();
-  // the second stage, merge partial outputs
-  DevicePersistentMergeStates<KTraits>(
-      params.merge_packed_offset_start, params.merge_packed_offset_end,
-      params.merge_partial_packed_offset_start, params.merge_partial_packed_offset_end,
-      params.merge_partial_stride, partial_o, partial_lse, final_o, final_lse, o_stride_n,
-      o_stride_h, num_heads);
+    // get GPU shared memory size
+    int device;
+    int smem_limit_per_sm;
+    cudaGetDevice(&device);
+    cudaDeviceGetAttribute(&smem_limit_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device);
 
-  PROFILER_EVENT_END(variant, ProfileEventType::kSplitK);
-}
+    constexpr uint32_t NUM_STAGES = 2;
+    constexpr uint32_t CTA_TILE_Q = 64;
+    constexpr uint32_t CTA_TILE_KV = 64;
 
-}  // namespace hopper
+    using KTraits =
+        hopper::HopperKernelTraits<CAUSAL, NUM_STAGES, HEAD_DIM_CKV, HEAD_DIM_KPE, CTA_TILE_Q,
+                                   CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType>;
+    dim3 nblks(num_blks_x, num_blks_y);
+    dim3 nthrs(KTraits::NUM_THREADS);
+    size_t smem_size = sizeof(typename KTraits::SharedStorage);
 
-template <MaskMode MASK_MODE, uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename Params>
-cudaError_t BatchMLAPageAttentionHopper(Params params, uint32_t num_blks_x, uint32_t num_blks_y,
-                                        cudaStream_t stream) {
-  using DTypeQ = typename Params::DTypeQ;
-  using DTypeKV = typename Params::DTypeKV;
-  using DTypeO = typename Params::DTypeO;
-  using IdType = typename Params::IdType;
+    auto kernel = hopper::BatchMLAPageAttentionHopperKernel<KTraits, Params>;
+    void* args[] = {(void*)&params};
 
-  if (MASK_MODE == MaskMode::kCustom) {
-    return cudaErrorNotSupported;
+    FLASHINFER_CUDA_CALL(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    FLASHINFER_CUDA_CALL(
+        cudaLaunchCooperativeKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+
+    return cudaSuccess;
   }
-  constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
-
-  // get GPU shared memory size
-  int device;
-  int smem_limit_per_sm;
-  cudaGetDevice(&device);
-  cudaDeviceGetAttribute(&smem_limit_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device);
-
-  constexpr uint32_t NUM_STAGES = 4;
-  constexpr uint32_t CTA_TILE_Q = 64;
-  constexpr uint32_t CTA_TILE_KV = 32;
-
-  using KTraits =
-      hopper::HopperKernelTraits<CAUSAL, NUM_STAGES, HEAD_DIM_CKV, HEAD_DIM_KPE, CTA_TILE_Q,
-                                 CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType>;
-  dim3 nblks(num_blks_x, num_blks_y);
-  dim3 nthrs(KTraits::NUM_THREADS);
-  size_t smem_size = sizeof(typename KTraits::SharedStorage);
-
-  auto kernel = hopper::BatchMLAPageAttentionHopperKernel<KTraits, Params>;
-  void* args[] = {(void*)&params};
-
-  FLASHINFER_CUDA_CALL(
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-  FLASHINFER_CUDA_CALL(
-      cudaLaunchCooperativeKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-
-  return cudaSuccess;
-}
-
-template <MaskMode MASK_MODE, uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename Params>
-cudaError_t BatchMLAPageAttention2WGHopper(Params params, uint32_t num_blks_x, uint32_t num_blks_y,
-                                           cudaStream_t stream) {
-  using DTypeQ = typename Params::DTypeQ;
-  using DTypeKV = typename Params::DTypeKV;
-  using DTypeO = typename Params::DTypeO;
-  using IdType = typename Params::IdType;
-
-  if (MASK_MODE == MaskMode::kCustom) {
-    return cudaErrorNotSupported;
-  }
-  constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
-
-  // get GPU shared memory size
-  int device;
-  int smem_limit_per_sm;
-  cudaGetDevice(&device);
-  cudaDeviceGetAttribute(&smem_limit_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device);
-
-  constexpr uint32_t NUM_STAGES = 2;
-  constexpr uint32_t CTA_TILE_Q = 64;
-  constexpr uint32_t CTA_TILE_KV = 64;
-
-  using KTraits =
-      hopper::HopperKernel2WGTraits<CAUSAL, NUM_STAGES, HEAD_DIM_CKV, HEAD_DIM_KPE, CTA_TILE_Q,
-                                    CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType>;
-  dim3 nblks(num_blks_x, num_blks_y);
-  dim3 nthrs(KTraits::NUM_THREADS);
-  size_t smem_size = sizeof(typename KTraits::SharedStorage);
-
-  auto kernel = hopper::BatchMLAPageAttentionHopper2WGKernel<KTraits, Params>;
-  void* args[] = {(void*)&params};
-
-  FLASHINFER_CUDA_CALL(
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-  FLASHINFER_CUDA_CALL(
-      cudaLaunchCooperativeKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-
-  return cudaSuccess;
-}
 
 }  // namespace mla
 
