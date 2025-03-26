@@ -277,8 +277,7 @@ __device__ __forceinline__ void compute_mla_qk(typename KTraits::SharedStorage* 
   auto desc_ckv =
       make_smem_desc<KTraits::SWIZZLE_MODE_CKV, /*leading_byte_offset=*/16,
                      /*stride_byte_offset=*/KTraits::HEAD_DIM_CKV * 16, typename KTraits::DTypeKV>(
-          smem_storage->kv_o_smem[stage_idx].ckv +
-          (warp_group_idx - 1) * (KTraits::CTA_TILE_KV / 2) * KTraits::HEAD_DIM_CKV);
+          smem_storage->kv_o_smem[stage_idx].ckv);
 
 #pragma unroll
   for (uint32_t mma_d_ckv = 0; mma_d_ckv < KTraits::NUM_MMA_D_CKV; ++mma_d_ckv) {
@@ -299,7 +298,6 @@ __device__ __forceinline__ void compute_mla_qk(typename KTraits::SharedStorage* 
 template <typename KTraits>
 __device__ __forceinline__ void compute_mla_pv(typename KTraits::SharedStorage* smem_storage,
                                                const uint32_t stage_idx, float* o_frag) {
-  barrier_sync(KTraits::NUM_MMA_THREADS, NamedBarriers::kConsumerSync);
   const uint32_t lane_idx = cutlass::canonical_lane_idx();
   const uint32_t warp_idx_in_wg = cutlass::canonical_warp_idx() % 4;
   const uint32_t warp_group_idx = cutlass::canonical_warp_group_idx();
@@ -374,7 +372,7 @@ __device__ __forceinline__ void update_md_(typename KTraits::SharedStorage* smem
   for (uint32_t j = 0; j < 2; ++j) {
     m_prev[j] = m[j];
 #pragma unroll
-    for (uint32_t k = 0; k < NUM_REGS_S_FRAG / 4; ++k) {
+    for (uint32_t k = 0; k < KTraits::NUM_REGS_S_FRAG / 4; ++k) {
       float m_local = max(s_frag[k * 4 + j * 2 + 0], s_frag[k * 4 + j * 2 + 1]);
       m[j] = max(m[j], m_local);
     }
@@ -387,7 +385,7 @@ __device__ __forceinline__ void update_md_(typename KTraits::SharedStorage* smem
     o_scale[j] = math::ptx_exp2(m_prev[j] * sm_scale - m[j] * sm_scale);
     float d_local = 0.f;
 #pragma unroll
-    for (uint32_t k = 0; k < NUM_REGS_S_FRAG / 4; ++k) {
+    for (uint32_t k = 0; k < KTraits::NUM_REGS_S_FRAG / 4; ++k) {
       s_frag[k * 4 + j * 2 + 0] =
           math::ptx_exp2(s_frag[k * 4 + j * 2 + 0] * sm_scale - m[j] * sm_scale);
       s_frag[k * 4 + j * 2 + 1] =
