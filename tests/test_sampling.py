@@ -38,15 +38,15 @@ def gumbel_distribution(beta):
     return gumbel_noise
 
 
-@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
-@pytest.mark.parametrize(
-    "distribution",
-    [
-        normal_distribution(1),
-        normal_distribution(5),
-        gumbel_distribution(0.1),
-    ],
-)
+# @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+# @pytest.mark.parametrize(
+#     "distribution",
+#     [
+#         normal_distribution(1),
+#         normal_distribution(5),
+#         gumbel_distribution(0.1),
+#     ],
+# )
 # @pytest.mark.parametrize("zero_ratio", [0.0, 0.5, 0.9])
 # def test_sampling_freq(vocab_size, distribution, zero_ratio):
 #     torch.manual_seed(42)
