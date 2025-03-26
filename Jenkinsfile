@@ -140,7 +140,7 @@ stage('Unittest') {
       }
     },
     'JIT-Unittest-3 (sm75)': {
-      node('GPU-G4-SPOT') {
+      node('GPU-SPOT') {
         ws(per_exec_ws('flashinfer-unittest')) {
           init_git(true) // we need cutlass submodule
           sh(script: "ls -alh", label: 'Show work directory')
