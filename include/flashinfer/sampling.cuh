@@ -979,8 +979,8 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
   float min_gt_low, max_le_high;
   float sum_low = 1;
   // f(x) = sum(probs[probs > x]), f(x) is non-increasing
-  // min_gt_low = min{p \in probs |> low}, max_le_high = max{p \in probs | p <= high}
-  // loop invariant: p
+  // min_gt_low = min{p \in probs | p > low}, max_le_high = max{p \in probs | p <= high}
+  // loop invariant:
   // - f(low) >= p, f(high) < p
   // - f(low) > f(min_gt_low) >= f(max_le_high) == f(high)
   // stopping condition
