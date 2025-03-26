@@ -44,7 +44,7 @@ enum class ProfileEventType {
   kSplitK = 8U,
 };
 
-enum class NamedBarriers { kSReady = 1U };
+enum class NamedBarriers { kSReady = 1U, kMDReady = 2U };
 
 __device__ __forceinline__ void barrier_arrive(int num_threads, NamedBarriers barrier) {
   cutlass::arch::NamedBarrier::arrive(num_threads, static_cast<int>(barrier));
@@ -415,42 +415,21 @@ __device__ __forceinline__ void write_p_rmem_smem(typename KTraits::SharedStorag
   }
 }
 
-// template <typename KTraits>
-// __device__ __forceinline__ void normalize_d_(typename KTraits::SharedStorage* smem_storage,
-//                                              float* o_frag, float* m, float* d) {
-//   const uint32_t lane_idx = cutlass::canonical_lane_idx();
-//   const uint32_t warp_group_idx = cutlass::canonical_warp_group_idx();
-//   const uint32_t warp_idx_in_wg = cutlass::canonical_warp_idx() % 4;
+template <typename KTraits>
+__device__ __forceinline__ void normalize_d_(typename KTraits::SharedStorage* smem_storage,
+                                             float* o_frag, float* m, float* d) {
+  float d_rcp[2];
+  // compute reciprocal of d
+#pragma unroll
+  for (uint32_t j = 0; j < 2; ++j) {
+    d_rcp[j] = (m[j] != -math::inf) ? math::ptx_rcp(d[j]) : 0.f;
+  }
 
-// #pragma unroll
-//   for (uint32_t j = 0; j < 2; ++j) {
-//     d[j] += __shfl_xor_sync(0x11111111, d[j], 0x2);
-//     d[j] += __shfl_xor_sync(0x11111111, d[j], 0x1);
-//     if (lane_idx % 4 == 0) {
-//       smem_storage->d_wg[warp_group_idx - 1][warp_idx_in_wg * 16 + j * 8 + lane_idx / 4] = d[j];
-//     }
-//   }
-
-//   barrier_sync(KTraits::NUM_MMA_THREADS, NamedBarriers::kConsumerSync);
-
-// #pragma unroll
-//   for (uint32_t j = 0; j < 2; ++j) {
-//     d[j] = smem_storage->d_wg[0][warp_idx_in_wg * 16 + j * 8 + lane_idx / 4] +
-//            smem_storage->d_wg[1][warp_idx_in_wg * 16 + j * 8 + lane_idx / 4];
-//   }
-
-//   float d_rcp[2];
-//   // compute reciprocal of d
-// #pragma unroll
-//   for (uint32_t j = 0; j < 2; ++j) {
-//     d_rcp[j] = (m[j] != -math::inf) ? math::ptx_rcp(d[j]) : 0.f;
-//   }
-
-// #pragma unroll
-//   for (uint32_t reg_id = 0; reg_id < KTraits::NUM_REGS_O_FRAG; ++reg_id) {
-//     o_frag[reg_id] = o_frag[reg_id] * d_rcp[(reg_id % 4) / 2];
-//   }
-// }
+#pragma unroll
+  for (uint32_t reg_id = 0; reg_id < KTraits::NUM_REGS_O_FRAG; ++reg_id) {
+    o_frag[reg_id] = o_frag[reg_id] * d_rcp[(reg_id % 4) / 2];
+  }
+}
 
 template <typename KTraits>
 __device__ __forceinline__ void write_o(typename KTraits::SharedStorage* smem_storage,
@@ -708,7 +687,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
       rescale_o_<KTraits>(o_scale, o_frag);
       compute_mla_pv<KTraits>(&smem_storage, smem_pipe_write_kv.index() - 1, o_frag);
 
-      // TODO(Zihao): wait softmax ready
+      barrier_sync(KTraits::NUM_THREADS, NamedBarriers::kMDReady);
       normalize_d_<KTraits>(&smem_storage, o_frag, m, d);
       finalize_m_<KTraits>(variant, m);
       write_o<KTraits>(
@@ -792,7 +771,17 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
       pipeline_q.consumer_release(smem_pipe_read_q);
       ++smem_pipe_read_q;
 
-      // TODO(Zihao): wait softmax ready
+#pragma unroll
+      for (uint32_t j = 0; j < 2; ++j) {
+        d[j] += __shfl_xor_sync(0x11111111, d[j], 0x2);
+        d[j] += __shfl_xor_sync(0x11111111, d[j], 0x1);
+        if (lane_idx % 4 == 0) {
+          smem_storage.m[warp_idx_in_wg * 16 + j * 8 + lane_idx / 4] = m[j];
+          smem_storage.d[warp_idx_in_wg * 16 + j * 8 + lane_idx / 4] = d[j];
+        }
+      }
+
+      barrier_arrive(KTraits::NUM_QK_THREADS, NamedBarriers::kMDReady);
       normalize_d_<KTraits>(&smem_storage, o_frag, m, d);
       finalize_m_<KTraits>(variant, m);
       write_o<KTraits>(
@@ -802,63 +791,64 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
           (partial_indptr == -1) ? nullptr : partial_lse + partial_indptr, o_frag, m, d, o_stride_n,
           o_stride_h, qo_upperbound, qo_packed_idx_base, num_heads);
     }
-
-    auto grid = cg::this_grid();
-    grid.sync();
-
-    PROFILER_EVENT_START(variant, ProfileEventType::kSplitK);
-
-    __syncthreads();
-    // the second stage, merge partial outputs
-    DevicePersistentMergeStates<KTraits>(
-        params.merge_packed_offset_start, params.merge_packed_offset_end,
-        params.merge_partial_packed_offset_start, params.merge_partial_packed_offset_end,
-        params.merge_partial_stride, partial_o, partial_lse, final_o, final_lse, o_stride_n,
-        o_stride_h, num_heads);
-
-    PROFILER_EVENT_END(variant, ProfileEventType::kSplitK);
   }
 
-  template <MaskMode MASK_MODE, uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename Params>
-  cudaError_t BatchMLAPageAttentionHopper(Params params, uint32_t num_blks_x, uint32_t num_blks_y,
-                                          cudaStream_t stream) {
-    using DTypeQ = typename Params::DTypeQ;
-    using DTypeKV = typename Params::DTypeKV;
-    using DTypeO = typename Params::DTypeO;
-    using IdType = typename Params::IdType;
+  auto grid = cg::this_grid();
+  grid.sync();
 
-    if (MASK_MODE == MaskMode::kCustom) {
-      return cudaErrorNotSupported;
-    }
-    constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
+  PROFILER_EVENT_START(variant, ProfileEventType::kSplitK);
 
-    // get GPU shared memory size
-    int device;
-    int smem_limit_per_sm;
-    cudaGetDevice(&device);
-    cudaDeviceGetAttribute(&smem_limit_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device);
+  __syncthreads();
+  // the second stage, merge partial outputs
+  DevicePersistentMergeStates<KTraits>(
+      params.merge_packed_offset_start, params.merge_packed_offset_end,
+      params.merge_partial_packed_offset_start, params.merge_partial_packed_offset_end,
+      params.merge_partial_stride, partial_o, partial_lse, final_o, final_lse, o_stride_n,
+      o_stride_h, num_heads);
 
-    constexpr uint32_t NUM_STAGES = 2;
-    constexpr uint32_t CTA_TILE_Q = 64;
-    constexpr uint32_t CTA_TILE_KV = 64;
+  PROFILER_EVENT_END(variant, ProfileEventType::kSplitK);
+}
 
-    using KTraits =
-        hopper::HopperKernelTraits<CAUSAL, NUM_STAGES, HEAD_DIM_CKV, HEAD_DIM_KPE, CTA_TILE_Q,
-                                   CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType>;
-    dim3 nblks(num_blks_x, num_blks_y);
-    dim3 nthrs(KTraits::NUM_THREADS);
-    size_t smem_size = sizeof(typename KTraits::SharedStorage);
+template <MaskMode MASK_MODE, uint32_t HEAD_DIM_CKV, uint32_t HEAD_DIM_KPE, typename Params>
+cudaError_t BatchMLAPageAttentionHopper(Params params, uint32_t num_blks_x, uint32_t num_blks_y,
+                                        cudaStream_t stream) {
+  using DTypeQ = typename Params::DTypeQ;
+  using DTypeKV = typename Params::DTypeKV;
+  using DTypeO = typename Params::DTypeO;
+  using IdType = typename Params::IdType;
 
-    auto kernel = hopper::BatchMLAPageAttentionHopperKernel<KTraits, Params>;
-    void* args[] = {(void*)&params};
-
-    FLASHINFER_CUDA_CALL(
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    FLASHINFER_CUDA_CALL(
-        cudaLaunchCooperativeKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-
-    return cudaSuccess;
+  if (MASK_MODE == MaskMode::kCustom) {
+    return cudaErrorNotSupported;
   }
+  constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
+
+  // get GPU shared memory size
+  int device;
+  int smem_limit_per_sm;
+  cudaGetDevice(&device);
+  cudaDeviceGetAttribute(&smem_limit_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device);
+
+  constexpr uint32_t NUM_STAGES = 2;
+  constexpr uint32_t CTA_TILE_Q = 64;
+  constexpr uint32_t CTA_TILE_KV = 64;
+
+  using KTraits =
+      hopper::HopperKernelTraits<CAUSAL, NUM_STAGES, HEAD_DIM_CKV, HEAD_DIM_KPE, CTA_TILE_Q,
+                                 CTA_TILE_KV, DTypeQ, DTypeKV, DTypeO, IdType>;
+  dim3 nblks(num_blks_x, num_blks_y);
+  dim3 nthrs(KTraits::NUM_THREADS);
+  size_t smem_size = sizeof(typename KTraits::SharedStorage);
+
+  auto kernel = hopper::BatchMLAPageAttentionHopperKernel<KTraits, Params>;
+  void* args[] = {(void*)&params};
+
+  FLASHINFER_CUDA_CALL(
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+  FLASHINFER_CUDA_CALL(
+      cudaLaunchCooperativeKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
+
+  return cudaSuccess;
+}
 
 }  // namespace mla
 
