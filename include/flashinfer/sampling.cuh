@@ -741,12 +741,9 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
       sampled_id = temp_storage.last_valid_id;
     }
     double pivot_0 = probs[row_idx * d + sampled_id];
-    double interval = (high - pivot_0) / 3;
-    double pivot_1 = pivot_0 + interval;
-    double pivot_2 = pivot_1 + interval;
+    double pivot_1 = (pivot_0 + high) / 2;
 
-    ValueCount<float> aggregate_gt_pivot_0{0, 0}, aggregate_gt_pivot_1{0, 0},
-        aggregate_gt_pivot_2{0, 0};
+    ValueCount<float> aggregate_gt_pivot_0{0, 0}, aggregate_gt_pivot_1{0, 0};
 #pragma unroll 2
     for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
       probs_vec.fill(0);
@@ -754,8 +751,7 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
         probs_vec.cast_load(probs + row_idx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
       }
 
-      ValueCount<float> probs_gt_pivot_0[VEC_SIZE], probs_gt_pivot_1[VEC_SIZE],
-          probs_gt_pivot_2[VEC_SIZE];
+      ValueCount<float> probs_gt_pivot_0[VEC_SIZE], probs_gt_pivot_1[VEC_SIZE];
 #pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; ++j) {
         probs_gt_pivot_0[j] = {
@@ -764,9 +760,6 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
         probs_gt_pivot_1[j] = {
             (probs_vec[j] > pivot_1) ? probs_vec[j] : 0,
             (probs_vec[j] > pivot_1 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
-        probs_gt_pivot_2[j] = {
-            (probs_vec[j] > pivot_2) ? probs_vec[j] : 0,
-            (probs_vec[j] > pivot_2 && (i * BLOCK_THREADS + tx) * VEC_SIZE + j < d)};
       }
 
       aggregate_gt_pivot_0 +=
@@ -786,35 +779,20 @@ __global__ void TopKTopPSamplingFromProbKernel(DType* probs, IdType* top_k_arr, 
       }
       __syncthreads();
       aggregate_gt_pivot_1 = temp_storage.block_aggregate.pair;
-
-      aggregate_gt_pivot_2 +=
-          BlockReduce<ValueCount<float>, BLOCK_THREADS>(temp_storage.block_prim.reduce_value_count)
-              .Sum<VEC_SIZE>(probs_gt_pivot_2);
-      if (tx == 0) {
-        temp_storage.block_aggregate.pair = aggregate_gt_pivot_2;
-      }
-      __syncthreads();
-      aggregate_gt_pivot_2 = temp_storage.block_aggregate.pair;
     }
-
     if (aggregate_gt_pivot_0.count < k && aggregate_gt_pivot_0.value < p) {
       // case 1: pivot_0 accepted
       break;
     }
     if (aggregate_gt_pivot_1.count < k && aggregate_gt_pivot_1.value < p) {
-      // case 2: pivot_0 rejected, pivot_1 accepted, pivot_2 accepted
+      // case 2: pivot_0 rejected, pivot_1 accepted
       low = pivot_0;
       high = pivot_1;
       q = aggregate_gt_pivot_0.value;
-    } else if (aggregate_gt_pivot_2.count < k && aggregate_gt_pivot_2.value < p) {
-      // case 3: pivot_0 rejected, pivot_1 rejected, pivot_2 accepted
-      low = pivot_1;
-      high = pivot_2;
-      q = aggregate_gt_pivot_1.value;
     } else {
-      // case 4: pivot_0 rejected, pivot_1 rejected, pivot_2 rejected
-      low = pivot_2;
-      q = aggregate_gt_pivot_2.value;
+      // case 3: pivot_0 rejected, pivot_1 rejected
+      low = pivot_1;
+      q = aggregate_gt_pivot_1.value;
     }
   } while (low < high);
   __syncthreads();
