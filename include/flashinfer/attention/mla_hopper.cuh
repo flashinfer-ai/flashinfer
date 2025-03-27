@@ -659,7 +659,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
       ++smem_pipe_write_kv;
 
 #pragma unroll
-      for (; kv_tile_idx > 0; --kv_tile_idx) {
+      for (; kv_tile_idx >= 0; --kv_tile_idx) {
         pipeline_kv.producer_acquire(smem_pipe_write_kv);
         load_kv<false, KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
                                 kpe_stride_n, kpe_stride_page, packed_kv_bound,
@@ -759,7 +759,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
       }
 
 #pragma unroll 1
-      for (; kv_tile_idx > 0; --kv_tile_idx) {
+      for (; kv_tile_idx >= 0; --kv_tile_idx) {
         consumer_wait(pipeline_kv, smem_pipe_read_kv);
         compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag);
         warpgroup_wait<0>();
