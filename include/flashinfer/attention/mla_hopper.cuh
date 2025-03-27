@@ -644,21 +644,24 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
       const uint32_t block_iter_base = kv_indptr * block_size + kv_start;
 
       pipeline_q.producer_acquire(smem_pipe_write_q);
-      pipeline_kv.producer_acquire(smem_pipe_write_kv);
       load_q<KTraits>(&smem_storage, q_nope + q_indptr * q_nope_stride_n,
                       q_pe + q_indptr * q_pe_stride_n, q_nope_stride_n, q_nope_stride_h,
                       q_pe_stride_n, q_pe_stride_h, qo_upperbound, qo_packed_idx_base,
                       params.num_heads);
       pipeline_q.producer_commit(smem_pipe_write_q, cutlass::arch::cpasync_barrier_arrive);
       ++smem_pipe_write_q;
+      bool has_kv = kv_tile_idx >= 0;
 
-      load_kv<true, KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
-                             kpe_stride_n, kpe_stride_page, packed_kv_bound,
-                             block_iter_base + kv_tile_idx * CTA_TILE_KV, block_size,
-                             smem_pipe_write_kv.index());
-      pipeline_kv.producer_commit(smem_pipe_write_kv, cutlass::arch::cpasync_barrier_arrive);
-      kv_tile_idx -= 1;
-      ++smem_pipe_write_kv;
+      if (has_kv) {
+        pipeline_kv.producer_acquire(smem_pipe_write_kv);
+        load_kv<true, KTraits>(&smem_storage, ckv, kpe, kv_indices, ckv_stride_n, ckv_stride_page,
+                               kpe_stride_n, kpe_stride_page, packed_kv_bound,
+                               block_iter_base + kv_tile_idx * CTA_TILE_KV, block_size,
+                               smem_pipe_write_kv.index());
+        pipeline_kv.producer_commit(smem_pipe_write_kv, cutlass::arch::cpasync_barrier_arrive);
+        kv_tile_idx -= 1;
+        ++smem_pipe_write_kv;
+      }
 
 #pragma unroll 1
       for (; kv_tile_idx >= 0; --kv_tile_idx) {
@@ -680,14 +683,16 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         ++smem_pipe_write_kv;
       }
 
-      barrier_sync(KTraits::NUM_THREADS, NamedBarriers::kSReady);
+      if (has_kv) {
+        barrier_sync(KTraits::NUM_THREADS, NamedBarriers::kSReady);
 #pragma unroll
-      for (uint32_t j = 0; j < 2; ++j) {
-        o_scale[j] = smem_storage.o_scale[warp_idx_in_wg * 16 + j * 8 + lane_idx / 4];
+        for (uint32_t j = 0; j < 2; ++j) {
+          o_scale[j] = smem_storage.o_scale[warp_idx_in_wg * 16 + j * 8 + lane_idx / 4];
+        }
+        rescale_o_<KTraits>(o_scale, o_frag);
+        compute_mla_pv<KTraits>(&smem_storage, smem_pipe_write_kv.index() ^ 1, o_frag);
+        warpgroup_wait<0>();
       }
-      rescale_o_<KTraits>(o_scale, o_frag);
-      compute_mla_pv<KTraits>(&smem_storage, smem_pipe_write_kv.index() ^ 1, o_frag);
-      warpgroup_wait<0>();
 
       barrier_sync(KTraits::NUM_THREADS, NamedBarriers::kMDReady);
 #pragma unroll
@@ -766,8 +771,6 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         consumer_wait(pipeline_kv, smem_pipe_read_kv);
         compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag);
         warpgroup_wait<0>();
-        logits_mask_<KTraits>(qo_packed_idx_base, kv_start + kv_tile_idx * CTA_TILE_KV, q_len,
-                              kv_len, kv_end, num_heads, s_frag);
         update_md_<KTraits>(&smem_storage, variant, s_frag, m, d, o_scale);
         rescale_o_<KTraits>(o_scale, o_frag);
         convert_s_to_p<KTraits>(s_frag, p_frag);
