@@ -304,7 +304,7 @@ __device__ __forceinline__ void compute_mla_pv(typename KTraits::SharedStorage* 
                                /*stride_byte_offset=*/KTraits::CTA_TILE_KV * 16, KTraits::DTypeKV>(
       smem_storage->kv_o_smem[stage_idx].p);
   auto desc_ckv =
-      make_smem_desc<KTraits::SWIZZLE_MODE_CKV, /*leading_byte_offset=*/KTraits::CTA_TILE_KV * 32,
+      make_smem_desc<KTraits::SWIZZLE_MODE_CKV, /*leading_byte_offset=*/KTraits::CTA_TILE_KV * 16,
                      /*stride_byte_offset=*/KTraits::HEAD_DIM_CKV * 16, KTraits::DTypeKV>(
           smem_storage->kv_o_smem[stage_idx].ckv +
           warp_group_idx * 8 * (KTraits::HEAD_DIM_CKV / 2));
@@ -344,6 +344,7 @@ __device__ __forceinline__ void logits_mask_(const uint32_t qo_packed_idx_base,
     const bool mask = (!(KTraits::CAUSAL ? (kv_idx + qo_len > kv_len + q_idx || (kv_idx >= kv_end))
                                          : kv_idx >= kv_end));
     s_frag[reg_id] = (mask) ? s_frag[reg_id] : (KTraits::MaskFillValue);
+    // s_frag[reg_id] = (q_idx == kv_idx) ? 0.f : (KTraits::MaskFillValue);
   }
 }
 
@@ -743,8 +744,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         consumer_wait(pipeline_kv, smem_pipe_read_kv);
         compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag);
         warpgroup_wait<0>();
-        // logits_mask_<KTraits>(qo_packed_idx_base, kv_start + kv_tile_idx * CTA_TILE_KV, q_len,
-        //                       kv_len, kv_end, num_heads, s_frag);
+        logits_mask_<KTraits>(qo_packed_idx_base, kv_start + kv_tile_idx * CTA_TILE_KV, q_len,
+                              kv_len, kv_end, num_heads, s_frag);
         update_md_<KTraits>(&smem_storage, variant, s_frag, m, d, o_scale);
         rescale_o_<KTraits>(o_scale, o_frag);
         convert_s_to_p<KTraits>(s_frag, p_frag);
@@ -765,6 +766,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         consumer_wait(pipeline_kv, smem_pipe_read_kv);
         compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag);
         warpgroup_wait<0>();
+        logits_mask_<KTraits>(qo_packed_idx_base, kv_start + kv_tile_idx * CTA_TILE_KV, q_len,
+                              kv_len, kv_end, num_heads, s_frag);
         update_md_<KTraits>(&smem_storage, variant, s_frag, m, d, o_scale);
         rescale_o_<KTraits>(o_scale, o_frag);
         convert_s_to_p<KTraits>(s_frag, p_frag);
