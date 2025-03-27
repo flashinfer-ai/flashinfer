@@ -74,11 +74,9 @@ struct HopperSharedStorageQKVO {
         };
         alignas(16) DTypeO o[CTA_TILE_Q * HEAD_DIM_CKV];
       } kv_o_smem[NUM_STAGES];
-      union {
-        alignas(16) float o_scale[CTA_TILE_Q];
-        alignas(16) float m[CTA_TILE_Q];
-        alignas(16) float d[CTA_TILE_Q];
-      };
+      alignas(16) float o_scale[CTA_TILE_Q];
+      alignas(16) float m[CTA_TILE_Q];
+      alignas(16) float d[CTA_TILE_Q];
     };
 
     typename MainloopPipeline::SharedStorage pipeline_q, pipeline_kv;
@@ -749,6 +747,10 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         rescale_o_<KTraits>(o_scale, o_frag);
         convert_s_to_p<KTraits>(s_frag, p_frag);
         write_p_rmem_smem<KTraits>(&smem_storage, smem_pipe_read_kv.index(), p_frag);
+#pragma unroll
+        for (uint32_t j = 0; j < 2; ++j) {
+          smem_storage.o_scale[warp_idx_in_wg * 16 + j * 8 + lane_idx / 4] = o_scale[j];
+        }
         barrier_arrive(KTraits::NUM_THREADS, NamedBarriers::kSReady);
         compute_mla_pv<KTraits>(&smem_storage, smem_pipe_read_kv.index(), o_frag);
         warpgroup_wait<0>();
@@ -765,6 +767,10 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
         rescale_o_<KTraits>(o_scale, o_frag);
         convert_s_to_p<KTraits>(s_frag, p_frag);
         write_p_rmem_smem<KTraits>(&smem_storage, smem_pipe_read_kv.index(), p_frag);
+#pragma unroll
+        for (uint32_t j = 0; j < 2; ++j) {
+          smem_storage.o_scale[warp_idx_in_wg * 16 + j * 8 + lane_idx / 4] = o_scale[j];
+        }
         barrier_arrive(KTraits::NUM_THREADS, NamedBarriers::kSReady);
         compute_mla_pv<KTraits>(&smem_storage, smem_pipe_read_kv.index(), o_frag);
         warpgroup_wait<0>();
