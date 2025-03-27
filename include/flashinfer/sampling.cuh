@@ -944,14 +944,14 @@ struct RenormTempStorage {
     float min_val;
     union {
       struct {
-        float value0, value1;
-      } values;
+        float values[2];
+      };
       struct {
-        int count0, count1;
-      } counts;
+        int counts[2];
+      };
       struct {
-        ValueCount<float> pair0, pair1;
-      } pairs;
+        ValueCount<float> pairs[2];
+      };
     } block_aggregate;
   };
 };
@@ -1030,14 +1030,14 @@ __global__ void TopPRenormProbKernel(DType* probs, DType* renormed_prob, float* 
         BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
             .Reduce(max_le_high, cub::Max());
     if (tx == 0) {
-      temp_storage.block_aggregate.values.value0 = aggregate_gt_pivot_0;
-      temp_storage.block_aggregate.values.value1 = aggregate_gt_pivot_1;
+      temp_storage.block_aggregate.values[0] = aggregate_gt_pivot_0;
+      temp_storage.block_aggregate.values[1] = aggregate_gt_pivot_1;
       temp_storage.min_val = min_gt_low;
       temp_storage.max_val = max_le_high;
     }
     __syncthreads();
-    aggregate_gt_pivot_0 = temp_storage.block_aggregate.values.value0;
-    aggregate_gt_pivot_1 = temp_storage.block_aggregate.values.value1;
+    aggregate_gt_pivot_0 = temp_storage.block_aggregate.values[0];
+    aggregate_gt_pivot_1 = temp_storage.block_aggregate.values[1];
     min_gt_low = temp_storage.min_val;
     max_le_high = temp_storage.max_val;
 
@@ -1149,14 +1149,14 @@ __global__ void TopKMaskLogitsKernel(DType* logits, DType* masked_logits, IdType
           BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
               .Reduce(max_le_high, cub::Max());
       if (tx == 0) {
-        temp_storage.block_aggregate.counts.count0 = aggregate_gt_pivot_0;
-        temp_storage.block_aggregate.counts.count1 = aggregate_gt_pivot_1;
+        temp_storage.block_aggregate.counts[0] = aggregate_gt_pivot_0;
+        temp_storage.block_aggregate.counts[1] = aggregate_gt_pivot_1;
         temp_storage.min_val = min_gt_low;
         temp_storage.max_val = max_le_high;
       }
       __syncthreads();
-      aggregate_gt_pivot_0 = temp_storage.block_aggregate.counts.count0;
-      aggregate_gt_pivot_1 = temp_storage.block_aggregate.counts.count1;
+      aggregate_gt_pivot_0 = temp_storage.block_aggregate.counts[0];
+      aggregate_gt_pivot_1 = temp_storage.block_aggregate.counts[1];
       min_gt_low = temp_storage.min_val;
       max_le_high = temp_storage.max_val;
 
@@ -1269,14 +1269,14 @@ __global__ void TopKRenormProbKernel(DType* probs, DType* renormed_prob, IdType*
           BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
               .Reduce(max_le_high, cub::Max());
       if (tx == 0) {
-        temp_storage.block_aggregate.pairs.pair0 = aggregate_gt_pivot_0;
-        temp_storage.block_aggregate.pairs.pair1 = aggregate_gt_pivot_1;
+        temp_storage.block_aggregate.pairs[0] = aggregate_gt_pivot_0;
+        temp_storage.block_aggregate.pairs[1] = aggregate_gt_pivot_1;
         temp_storage.min_val = min_gt_low;
         temp_storage.max_val = max_le_high;
       }
       __syncthreads();
-      aggregate_gt_pivot_0 = temp_storage.block_aggregate.pairs.pair0;
-      aggregate_gt_pivot_1 = temp_storage.block_aggregate.pairs.pair1;
+      aggregate_gt_pivot_0 = temp_storage.block_aggregate.pairs[0];
+      aggregate_gt_pivot_1 = temp_storage.block_aggregate.pairs[1];
       min_gt_low = temp_storage.min_val;
       max_le_high = temp_storage.max_val;
 
