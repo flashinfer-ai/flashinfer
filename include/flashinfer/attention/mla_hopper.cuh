@@ -566,9 +566,7 @@ __device__ __forceinline__ void load_o_scale_smem(typename KTraits::SharedStorag
   const uint32_t warp_idx_in_wg = cutlass::canonical_warp_idx() % 4;
 #pragma unroll
   for (uint32_t j = 0; j < 2; ++j) {
-    if (lane_idx % 4 == 0) {
-      o_scale[j] = smem_storage->o_scale[warp_idx_in_wg * 16 + j * 8 + lane_idx / 4];
-    }
+    o_scale[j] = smem_storage->o_scale[warp_idx_in_wg * 16 + j * 8 + lane_idx / 4];
   }
 }
 
@@ -702,6 +700,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
                                 smem_pipe_write_kv.index());
         pipeline_kv.producer_commit(smem_pipe_write_kv, cutlass::arch::cpasync_barrier_arrive);
 
+        __syncthreads();
         barrier_sync(KTraits::NUM_THREADS, NamedBarriers::kOScaleReady);
         load_o_scale_smem<KTraits>(&smem_storage, o_scale);
         rescale_o_<KTraits>(o_scale, o_frag);
@@ -712,6 +711,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
       }
 
       if (has_kv) {
+        __syncthreads();
         barrier_sync(KTraits::NUM_THREADS, NamedBarriers::kOScaleReady);
         load_o_scale_smem<KTraits>(&smem_storage, o_scale);
         rescale_o_<KTraits>(o_scale, o_frag);
@@ -773,6 +773,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
 #pragma unroll 1
       for (; kv_tile_idx >= mask_tile_idx && kv_tile_idx > 0; --kv_tile_idx) {
         consumer_wait(pipeline_kv, smem_pipe_read_kv);
+        __syncthreads();
         compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag);
         warpgroup_wait<0>();
         logits_mask_<KTraits>(qo_packed_idx_base, kv_start + kv_tile_idx * CTA_TILE_KV, q_len,
@@ -793,6 +794,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
 #pragma unroll 1
       for (; kv_tile_idx + 1 > NUM_STAGES; --kv_tile_idx) {
         consumer_wait(pipeline_kv, smem_pipe_read_kv);
+        __syncthreads();
         compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag);
         warpgroup_wait<0>();
         update_md_<KTraits>(&smem_storage, variant, s_frag, m, d, o_scale);
@@ -811,6 +813,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchMLAPageAttentionHop
 #pragma unroll 1
       for (; kv_tile_idx >= 0; --kv_tile_idx) {
         consumer_wait(pipeline_kv, smem_pipe_read_kv);
+        __syncthreads();
         compute_mla_qk<KTraits>(&smem_storage, smem_pipe_read_kv.index(), s_frag);
         warpgroup_wait<0>();
         logits_mask_<KTraits>(qo_packed_idx_base, kv_start + kv_tile_idx * CTA_TILE_KV, q_len,
